@@ -4,7 +4,7 @@
 
 PostgreSQL · MySQL · MSSQL · SQLite · MariaDB · Oracle — all in one place, never leaving your editor.
 
-[![Marketplace](https://img.shields.io/visual-studio-marketplace/v/DmitriiKholkin.rapidb?style=flat-square&label=VS%20Marketplace&logo=visualstudiocode&color=60f5d4&labelColor=333333)](https://marketplace.visualstudio.com/items?itemName=DmitriiKholkin.rapidb)
+[![Marketplace](https://img.shields.io/visual-studio-marketplace/v/DmitriiKholkin.rapidb?style=flat-square&label=VS%20Marketplace&logo=visualstudiocode&color=007ACC&labelColor=555555)](https://marketplace.visualstudio.com/items?itemName=DmitriiKholkin.rapidb)
 [![GitHub](https://img.shields.io/badge/GitHub-RapiDB-007ACC?style=flat-square&labelColor=555555)](https://github.com/DmitriiKholkin/RapiDB)
 [![License](https://img.shields.io/badge/License-MIT-007ACC?style=flat-square&labelColor=555555)](https://opensource.org/licenses/MIT)
 <br/> 
@@ -37,6 +37,11 @@ The **Database Explorer** tree expands into databases → schemas → tables, vi
 
 <img src="media/img-market-5.png" width="320" alt="Database Explorer tree" />
 
+### Query History & Bookmarks
+
+Every query you run lands in **Query History** — click any entry to reopen it in the editor. Queries you want to keep forever go into **Bookmarks** with a single button press. History and bookmark limits are configurable in settings.
+
+
 ### A real SQL editor, not a textarea
 
 The query editor is Monaco — same engine as VS Code itself. You get syntax highlighting, auto-formatting, and schema-aware autocompletion that knows your actual table and column names. Hit **Ctrl+Enter** (or **F5**) to run. Select a fragment to run just that part. Drag the divider to resize editor vs results however you like.
@@ -60,10 +65,6 @@ Double-click any table → the **Table Data Viewer** opens with full pagination 
 Right-click → **Open Schema** to see every column with its type, nullability, default value, and PK / FK badges. Indexes and foreign keys get their own sections. Everything you'd normally Google `information_schema` for is one click away.
 
 ![Schema inspector — columns, indexes, foreign keys](media/img-market-4.png)
-
-### Query History & Bookmarks
-
-Every query you run lands in **Query History** — click any entry to reopen it in the editor. Queries you want to keep forever go into **Bookmarks** with a single button press. History and bookmark limits are configurable in settings.
 
 ---
 
