@@ -108,6 +108,8 @@ Click any table → the **Table Data Viewer** opens:
 | Deletion | Select rows and delete |
 | Safety | Every write goes through a transaction — nothing half-applied |
 
+<br/>
+
 <img src="media/img-market-1.png" alt="Table Data Viewer" width="700"/>
 
 <br/>
