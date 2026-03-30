@@ -1,0 +1,518 @@
+{
+  "name": "rapidb",
+  "displayName": "RapiDB",
+  "description": "Database management tool inside VSCode — PostgreSQL, MSSQL, MySQL/MariaDB, SQLite, Oracle",
+  "version": "0.1.0",
+  "publisher": "DmitriiKholkin",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DmitriiKholkin/RapiDB"
+  },
+  "icon": "./media/icon-market.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Data Science",
+    "Other"
+  ],
+  "keywords": [
+    "sql",
+    "database",
+    "db",
+    "postgresql",
+    "postgres",
+    "mysql",
+    "sqlite",
+    "mssql",
+    "sql server",
+    "mariadb",
+    "oracle",
+    "oracledb",
+    "query",
+    "data",
+    "explorer",
+    "database manager",
+    "db client"
+  ],
+  "activationEvents": [
+    "onView:rapidb-explorer",
+    "onView:rapidb-history",
+    "onView:rapidb-bookmarks",
+    "onCommand:rapidb.addConnection",
+    "onCommand:rapidb.newQuery",
+    "onCommand:rapidb.disconnectAll",
+    "onCommand:rapidb.refresh"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "rapidb.addConnection",
+        "title": "Add Connection",
+        "category": "RapiDB",
+        "icon": "$(add)"
+      },
+      {
+        "command": "rapidb.editConnection",
+        "title": "Edit Connection",
+        "category": "RapiDB",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "rapidb.deleteConnection",
+        "title": "Delete Connection",
+        "category": "RapiDB",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "rapidb.newQuery",
+        "title": "New Query",
+        "category": "RapiDB",
+        "icon": "$(code)"
+      },
+      {
+        "command": "rapidb.disconnectAll",
+        "title": "Disconnect All",
+        "category": "RapiDB",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "rapidb.refresh",
+        "title": "Refresh",
+        "category": "RapiDB",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "rapidb.connect",
+        "title": "Connect",
+        "category": "RapiDB",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "rapidb.disconnect",
+        "title": "Disconnect",
+        "category": "RapiDB",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "rapidb.openTableData",
+        "title": "Open Data",
+        "category": "RapiDB",
+        "icon": "$(table)"
+      },
+      {
+        "command": "rapidb.showDDL",
+        "title": "Show DDL",
+        "category": "RapiDB",
+        "icon": "$(file-code)"
+      },
+      {
+        "command": "rapidb.copyNodeName",
+        "title": "Copy Name",
+        "category": "RapiDB",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "rapidb.openSchema",
+        "title": "Open Schema",
+        "category": "RapiDB",
+        "icon": "$(symbol-namespace)"
+      },
+      {
+        "command": "rapidb.openRoutine",
+        "title": "Open Definition",
+        "category": "RapiDB"
+      },
+      {
+        "command": "rapidb.openHistoryEntry",
+        "title": "Open in SQL Editor",
+        "category": "RapiDB",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "rapidb.clearHistory",
+        "title": "Clear History",
+        "category": "RapiDB",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "rapidb.openBookmarkEntry",
+        "title": "Open in SQL Editor",
+        "category": "RapiDB",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "rapidb.deleteBookmark",
+        "title": "Delete Bookmark",
+        "category": "RapiDB",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "rapidb.clearBookmarks",
+        "title": "Clear Bookmarks",
+        "category": "RapiDB",
+        "icon": "$(trash)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "rapidb-container",
+          "title": "RapiDB",
+          "icon": "./media/icon-app.png"
+        }
+      ]
+    },
+    "views": {
+      "rapidb-container": [
+        {
+          "id": "rapidb-explorer",
+          "name": "Database Explorer",
+          "type": "tree"
+        },
+        {
+          "id": "rapidb-history",
+          "name": "Query History",
+          "type": "tree"
+        },
+        {
+          "id": "rapidb-bookmarks",
+          "name": "Bookmarks",
+          "type": "tree"
+        }
+      ]
+    },
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "rapidb.openSchema",
+          "when": "false"
+        },
+        {
+          "command": "rapidb.showDDL",
+          "when": "false"
+        },
+        {
+          "command": "rapidb.openHistoryEntry",
+          "when": "false"
+        },
+        {
+          "command": "rapidb.openRoutine",
+          "when": "false"
+        },
+        {
+          "command": "rapidb.openTableData",
+          "when": "false"
+        },
+        {
+          "command": "rapidb.copyNodeName",
+          "when": "false"
+        },
+        {
+          "command": "rapidb.openBookmarkEntry",
+          "when": "false"
+        },
+        {
+          "command": "rapidb.deleteBookmark",
+          "when": "false"
+        },
+        {
+          "command": "rapidb.clearBookmarks",
+          "when": "false"
+        },
+        {
+          "command": "rapidb.clearHistory",
+          "when": "false"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "rapidb.addConnection",
+          "when": "view == rapidb-explorer",
+          "group": "navigation"
+        },
+        {
+          "command": "rapidb.refresh",
+          "when": "view == rapidb-explorer",
+          "group": "navigation"
+        },
+        {
+          "command": "rapidb.disconnectAll",
+          "when": "view == rapidb-explorer",
+          "group": "navigation"
+        },
+        {
+          "command": "rapidb.clearHistory",
+          "when": "view == rapidb-history",
+          "group": "navigation"
+        },
+        {
+          "command": "rapidb.clearBookmarks",
+          "when": "view == rapidb-bookmarks",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "rapidb.connect",
+          "when": "view == rapidb-explorer && viewItem == connectionNode_disconnected",
+          "group": "2_conn"
+        },
+        {
+          "command": "rapidb.editConnection",
+          "when": "view == rapidb-explorer && viewItem == connectionNode_disconnected",
+          "group": "3_manage"
+        },
+        {
+          "command": "rapidb.deleteConnection",
+          "when": "view == rapidb-explorer && viewItem == connectionNode_disconnected",
+          "group": "3_manage"
+        },
+        {
+          "command": "rapidb.refresh",
+          "when": "view == rapidb-explorer && viewItem == connectionNode_disconnected",
+          "group": "4_refresh"
+        },
+        {
+          "command": "rapidb.newQuery",
+          "when": "view == rapidb-explorer && viewItem == connectionNode_disconnected",
+          "group": "inline"
+        },
+        {
+          "command": "rapidb.disconnect",
+          "when": "view == rapidb-explorer && viewItem == connectionNode_connected",
+          "group": "2_conn"
+        },
+        {
+          "command": "rapidb.editConnection",
+          "when": "view == rapidb-explorer && viewItem == connectionNode_connected",
+          "group": "3_manage"
+        },
+        {
+          "command": "rapidb.deleteConnection",
+          "when": "view == rapidb-explorer && viewItem == connectionNode_connected",
+          "group": "3_manage"
+        },
+        {
+          "command": "rapidb.refresh",
+          "when": "view == rapidb-explorer && viewItem == connectionNode_connected",
+          "group": "4_refresh"
+        },
+        {
+          "command": "rapidb.newQuery",
+          "when": "view == rapidb-explorer && viewItem == connectionNode_connected",
+          "group": "inline"
+        },
+        {
+          "command": "rapidb.openSchema",
+          "when": "view == rapidb-explorer && viewItem == table",
+          "group": "1_open"
+        },
+        {
+          "command": "rapidb.showDDL",
+          "when": "view == rapidb-explorer && viewItem == table",
+          "group": "1_open"
+        },
+        {
+          "command": "rapidb.copyNodeName",
+          "when": "view == rapidb-explorer && viewItem == table",
+          "group": "2_copy"
+        },
+        {
+          "command": "rapidb.copyNodeName",
+          "when": "view == rapidb-explorer && viewItem == view",
+          "group": "2_copy"
+        },
+        {
+          "command": "rapidb.showDDL",
+          "when": "view == rapidb-explorer && viewItem == view",
+          "group": "1_open"
+        },
+        {
+          "command": "rapidb.copyNodeName",
+          "when": "view == rapidb-explorer && viewItem == function",
+          "group": "2_copy"
+        },
+        {
+          "command": "rapidb.copyNodeName",
+          "when": "view == rapidb-explorer && viewItem == procedure",
+          "group": "2_copy"
+        },
+        {
+          "command": "rapidb.copyNodeName",
+          "when": "view == rapidb-explorer && viewItem == database",
+          "group": "2_copy"
+        },
+        {
+          "command": "rapidb.copyNodeName",
+          "when": "view == rapidb-explorer && viewItem == schema",
+          "group": "2_copy"
+        },
+        {
+          "command": "rapidb.deleteBookmark",
+          "when": "view == rapidb-bookmarks && viewItem == bookmarkEntry",
+          "group": "1_manage"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "RapiDB",
+      "properties": {
+        "rapidb.connections": {
+          "type": "array",
+          "default": [],
+          "description": "List of saved database connections",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Unique connection identifier (auto-generated)"
+              },
+              "name": {
+                "type": "string",
+                "description": "Display name shown in the explorer tree"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "mysql",
+                  "pg",
+                  "sqlite",
+                  "mssql",
+                  "oracle"
+                ],
+                "description": "Database engine type"
+              },
+              "host": {
+                "type": "string",
+                "description": "Hostname or IP address"
+              },
+              "port": {
+                "type": "number",
+                "description": "TCP port (defaults: pg=5432, mysql=3306, mssql=1433, oracle=1521)"
+              },
+              "database": {
+                "type": "string",
+                "description": "Database name. For Oracle used as service name when oracleSettings.serviceName is not set."
+              },
+              "username": {
+                "type": "string",
+                "description": "Login username"
+              },
+              "password": {
+                "type": "string",
+                "description": "Login password (stored in plaintext in settings.json)"
+              },
+              "filePath": {
+                "type": "string",
+                "description": "SQLite only: absolute path to the .db file"
+              },
+              "ssl": {
+                "type": "boolean",
+                "default": false,
+                "description": "Enable SSL/TLS encryption. Not applicable to SQLite."
+              },
+              "rejectUnauthorized": {
+                "type": "boolean",
+                "default": true,
+                "description": "When ssl is true: reject self-signed or untrusted certificates. Set to false to allow self-signed certs."
+              },
+              "folder": {
+                "type": "string",
+                "description": "Optional folder name for grouping connections in the explorer tree"
+              },
+              "serviceName": {
+                "type": "string",
+                "description": "Oracle service name (e.g. XEPDB1). Preferred over SID. If omitted, the database field is used."
+              },
+              "thickMode": {
+                "type": "boolean",
+                "default": false,
+                "description": "Enable Oracle thick mode. Requires Oracle Instant Client installed on the host machine."
+              },
+              "clientPath": {
+                "type": "string",
+                "description": "Path to Oracle Instant Client libraries directory. Only used when thickMode is true."
+              }
+            }
+          }
+        },
+        "rapidb.queryRowLimit": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 100,
+          "maximum": 100000,
+          "description": "Maximum number of rows returned by a query in the SQL editor. If the result exceeds this limit, rows are trimmed and a warning is shown. Range: 100–100 000. Set to 100000 to effectively disable the limit."
+        },
+        "rapidb.queryHistoryLimit": {
+          "type": "number",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 10000,
+          "description": "Maximum number of queries stored in history (shared across all connections). Must be between 1 and 10000. If you lower this value, excess entries are trimmed immediately."
+        },
+        "rapidb.defaultPageSize": {
+          "type": "number",
+          "default": 25,
+          "enum": [
+            25,
+            100,
+            500,
+            1000
+          ],
+          "description": "Default number of rows per page in the Table Data Viewer. Allowed values: 25, 100, 500, 1000. Any other value will be ignored and 25 will be used."
+        }
+      }
+    },
+    "viewsWelcome": [
+      {
+        "view": "rapidb-explorer",
+        "contents": "No database connections yet.\n[Add Connection](command:rapidb.addConnection)\n\nLearn how to use [RapiDB](https://github.com/rapidb/rapidb)."
+      },
+      {
+        "view": "rapidb-history",
+        "contents": "No query history yet.\nExecute a query in the SQL editor to see it here."
+      },
+      {
+        "view": "rapidb-bookmarks",
+        "contents": "No bookmarks yet.\nClick the bookmark button in the SQL editor to save a query here."
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "node esbuild.config.mjs --production",
+    "build": "node esbuild.config.mjs",
+    "watch": "node esbuild.config.mjs --watch",
+    "compile": "node esbuild.config.mjs",
+    "package": "vsce package",
+    "lint": "eslint src --ext ts,tsx"
+  },
+  "devDependencies": {
+    "@types/mssql": "^9.1.9",
+    "@types/node": "^25.5.0",
+    "@types/oracledb": "^6.10.2",
+    "@types/pg": "^8.18.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.27.4",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@tanstack/react-table": "^8.21.3",
+    "@tanstack/react-virtual": "^3.13.23",
+    "@vscode/codicons": "^0.0.45",
+    "monaco-editor": "^0.55.1",
+    "mssql": "^12.2.0",
+    "mysql2": "^3.20.0",
+    "oracledb": "^6.10.0",
+    "pg": "^8.20.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "sql-formatter": "^15.7.2",
+    "zustand": "^5.0.12",
+    "node-sqlite3-wasm": "^0.8.55"
+  }
+}

@@ -1,0 +1,18 @@
+# Source & build tooling — not needed at runtime
+src/
+esbuild.config.mjs
+tsconfig*.json
+biome.json
+compose.yaml
+
+# Dev environment
+.vscode/
+.git/
+.gitignore
+
+# All node_modules — esbuild has already bundled everything into dist/
+node_modules/
+
+# Misc
+**/*.map
+**/.DS_Store

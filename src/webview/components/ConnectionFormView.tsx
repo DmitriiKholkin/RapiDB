@@ -1,0 +1,662 @@
+// biome-ignore lint/style/useImportType: <explanation>
+import React, { useCallback, useEffect, useState } from "react";
+import { onMessage, postMessage } from "../utils/messaging";
+import { Icon } from "./Icon";
+
+type ConnType = "mysql" | "pg" | "sqlite" | "mssql" | "oracle";
+
+interface ConnectionConfig {
+  id: string;
+  name: string;
+  type: ConnType;
+  host?: string;
+  port?: number;
+  database?: string;
+  username?: string;
+  password?: string;
+  filePath?: string;
+  ssl?: boolean;
+  rejectUnauthorized?: boolean;
+  folder?: string;
+  serviceName?: string;
+  thickMode?: boolean;
+  clientPath?: string;
+}
+
+interface Props {
+  existing?: ConnectionConfig | null;
+}
+
+const DEFAULT_PORTS: Record<ConnType, number> = {
+  pg: 5432,
+  mysql: 3306,
+  mssql: 1433,
+  sqlite: 0,
+  oracle: 1521,
+};
+const TYPE_LABELS: Record<ConnType, string> = {
+  pg: "PostgreSQL",
+  mysql: "MySQL / MariaDB",
+  sqlite: "SQLite",
+  mssql: "SQL Server (MSSQL)",
+  oracle: "Oracle",
+};
+
+const s = {
+  input: {
+    width: "100%",
+    padding: "5px 8px",
+    fontSize: "13px",
+    background: "var(--vscode-input-background)",
+    color: "var(--vscode-input-foreground)",
+    border: "1px solid var(--vscode-input-border, var(--vscode-widget-border))",
+    borderRadius: 2,
+    outline: "none",
+    fontFamily: "inherit",
+  } as React.CSSProperties,
+  label: {
+    display: "block",
+    fontSize: "11px",
+    fontWeight: 500,
+    marginBottom: 4,
+    opacity: 0.8,
+  } as React.CSSProperties,
+  btnPrimary: {
+    padding: "5px 14px",
+    fontSize: "13px",
+    background: "var(--vscode-button-background)",
+    color: "var(--vscode-button-foreground)",
+    border: "none",
+    borderRadius: 2,
+    cursor: "pointer",
+    fontFamily: "inherit",
+  } as React.CSSProperties,
+  btnSecondary: {
+    padding: "5px 14px",
+    fontSize: "13px",
+    background: "var(--vscode-button-secondaryBackground, transparent)",
+    color: "var(--vscode-button-secondaryForeground, var(--vscode-foreground))",
+    border:
+      "1px solid var(--vscode-button-border, var(--vscode-widget-border))",
+    borderRadius: 2,
+    cursor: "pointer",
+    fontFamily: "inherit",
+  } as React.CSSProperties,
+  btnGhost: {
+    padding: "5px 14px",
+    fontSize: "13px",
+    background: "transparent",
+    color: "var(--vscode-foreground)",
+    border: "none",
+    borderRadius: 2,
+    cursor: "pointer",
+    opacity: 0.7,
+    fontFamily: "inherit",
+  } as React.CSSProperties,
+};
+
+function FocusInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
+  const [focused, setFocused] = useState(false);
+  return (
+    <input
+      {...props}
+      style={{
+        ...s.input,
+        ...(focused ? { borderColor: "var(--vscode-focusBorder)" } : {}),
+        ...(props.style ?? {}),
+      }}
+      onFocus={(e) => {
+        setFocused(true);
+        props.onFocus?.(e);
+      }}
+      onBlur={(e) => {
+        setFocused(false);
+        props.onBlur?.(e);
+      }}
+    />
+  );
+}
+
+function FocusSelect(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
+  const [focused, setFocused] = useState(false);
+  return (
+    <select
+      {...props}
+      style={{
+        ...s.input,
+        ...(focused ? { borderColor: "var(--vscode-focusBorder)" } : {}),
+        ...(props.style ?? {}),
+      }}
+      onFocus={(e) => {
+        setFocused(true);
+        props.onFocus?.(e);
+      }}
+      onBlur={(e) => {
+        setFocused(false);
+        props.onBlur?.(e);
+      }}
+    />
+  );
+}
+
+function Field({
+  label,
+  hint,
+  error,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  error?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <label style={s.label}>{label}</label>
+      {children}
+      {error && (
+        <div
+          style={{
+            fontSize: 11,
+            color: "var(--vscode-errorForeground)",
+            marginTop: 3,
+          }}
+        >
+          {error}
+        </div>
+      )}
+      {hint && !error && (
+        <div style={{ fontSize: 11, opacity: 0.5, marginTop: 3 }}>{hint}</div>
+      )}
+    </div>
+  );
+}
+
+function Divider({ label }: { label: string }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
+        margin: "16px 0 12px",
+      }}
+    >
+      <div
+        style={{ flex: 1, height: 1, background: "var(--vscode-panel-border)" }}
+      />
+      <span style={{ fontSize: 11, opacity: 0.5, whiteSpace: "nowrap" }}>
+        {label}
+      </span>
+      <div
+        style={{ flex: 1, height: 1, background: "var(--vscode-panel-border)" }}
+      />
+    </div>
+  );
+}
+
+function Toggle({
+  label,
+  hint,
+  checked,
+  onChange,
+}: {
+  label: string;
+  hint?: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <label
+      style={{
+        display: "flex",
+        alignItems: "flex-start",
+        gap: 8,
+        cursor: "pointer",
+        userSelect: "none",
+        marginBottom: 10,
+      }}
+    >
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        style={{
+          marginTop: 2,
+          accentColor: "var(--vscode-button-background)",
+          cursor: "pointer",
+        }}
+      />
+      <span style={{ fontSize: 13 }}>
+        {label}
+        {hint && (
+          <span
+            style={{
+              display: "block",
+              fontSize: 11,
+              opacity: 0.55,
+              marginTop: 1,
+            }}
+          >
+            {hint}
+          </span>
+        )}
+      </span>
+    </label>
+  );
+}
+
+export function ConnectionFormView({ existing }: Props): React.ReactElement {
+  const isEdit = !!existing;
+
+  const [name, setName] = useState(existing?.name ?? "");
+  const [type, setType] = useState<ConnType>(existing?.type ?? "pg");
+  const [host, setHost] = useState(existing?.host ?? "localhost");
+  const [port, setPort] = useState(
+    String(existing?.port ?? DEFAULT_PORTS[existing?.type ?? "pg"]),
+  );
+  const [database, setDatabase] = useState(existing?.database ?? "");
+  const [user, setUser] = useState(existing?.username ?? "");
+  const [password, setPassword] = useState(existing?.password ?? "");
+  const [filePath, setFilePath] = useState(existing?.filePath ?? "");
+  const [folder, setFolder] = useState(existing?.folder ?? "");
+
+  const [oracleServiceName, setOracleServiceName] = useState(
+    existing?.serviceName ?? "",
+  );
+  const [oracleThickMode, setOracleThickMode] = useState(
+    existing?.thickMode ?? false,
+  );
+  const [oracleClientPath, setOracleClientPath] = useState(
+    existing?.clientPath ?? "",
+  );
+
+  const [sslEnabled, setSslEnabled] = useState(existing?.ssl ?? false);
+  const [rejectUnauth, setRejectUnauth] = useState(
+    existing?.rejectUnauthorized ?? true,
+  );
+
+  const [testState, setTestState] = useState<
+    "idle" | "testing" | "ok" | "fail"
+  >("idle");
+  const [testError, setTestError] = useState("");
+  const [nameError, setNameError] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const isSQLite = type === "sqlite";
+  const isOracle = type === "oracle";
+  const supportsSsl = type !== "sqlite";
+
+  useEffect(
+    () =>
+      onMessage<{ success: boolean; error?: string }>("testResult", (p) => {
+        setTestState(p.success ? "ok" : "fail");
+        setTestError(p.error ?? "Connection failed");
+      }),
+    [],
+  );
+
+  const handleTypeChange = (t: ConnType) => {
+    setType(t);
+    setPort(String(DEFAULT_PORTS[t] || ""));
+    setTestState("idle");
+    setSslEnabled(false);
+    setRejectUnauth(true);
+  };
+
+  const buildPayload = useCallback(
+    (): ConnectionConfig => ({
+      id: existing?.id ?? crypto.randomUUID(),
+      name: name.trim(),
+      type,
+      folder: folder.trim() || undefined,
+      ...(isSQLite
+        ? { filePath: filePath.trim() }
+        : {
+            host: host.trim(),
+            port: Number(port) || DEFAULT_PORTS[type],
+            database: database.trim(),
+            username: user.trim(),
+            password,
+            ssl: supportsSsl ? sslEnabled : undefined,
+            rejectUnauthorized:
+              supportsSsl && sslEnabled ? rejectUnauth : undefined,
+            ...(isOracle
+              ? {
+                  serviceName: oracleServiceName.trim() || undefined,
+                  thickMode: oracleThickMode || undefined,
+                  clientPath:
+                    oracleThickMode && oracleClientPath.trim()
+                      ? oracleClientPath.trim()
+                      : undefined,
+                }
+              : {}),
+          }),
+    }),
+    [
+      existing,
+      name,
+      type,
+      folder,
+      isSQLite,
+      filePath,
+      host,
+      port,
+      database,
+      user,
+      password,
+      sslEnabled,
+      rejectUnauth,
+      supportsSsl,
+      isOracle,
+      oracleServiceName,
+      oracleThickMode,
+      oracleClientPath,
+    ],
+  );
+
+  const handleTest = () => {
+    setTestState("testing");
+    setTestError("");
+    postMessage("testConnection", buildPayload());
+  };
+
+  const handleSave = () => {
+    if (!name.trim()) {
+      setNameError("Name is required");
+      return;
+    }
+    setSaving(true);
+    postMessage("saveConnection", buildPayload());
+  };
+
+  return (
+    <div style={{ maxWidth: 520, margin: "0 auto", padding: "24px 24px 40px" }}>
+      {}
+      <h2 style={{ fontSize: 15, fontWeight: 600, marginBottom: 4 }}>
+        {isEdit ? `Edit — ${existing!.name}` : "New Connection"}
+      </h2>
+      <div
+        style={{
+          height: 1,
+          background: "var(--vscode-panel-border)",
+          marginBottom: 20,
+        }}
+      />
+
+      {}
+      <Field label="Name" error={nameError}>
+        <FocusInput
+          value={name}
+          onChange={(e) => {
+            setName(e.target.value);
+            setNameError("");
+          }}
+          placeholder="My Database"
+          autoFocus
+        />
+      </Field>
+
+      {}
+      <Field
+        label="Folder"
+        hint="Group this connection under a folder in the explorer. Leave empty to show at the root."
+      >
+        <FocusInput
+          value={folder}
+          onChange={(e) => setFolder(e.target.value)}
+          placeholder="Production"
+        />
+      </Field>
+
+      {}
+      <Field label="Database Type">
+        <FocusSelect
+          value={type}
+          onChange={(e) => handleTypeChange(e.target.value as ConnType)}
+        >
+          {(Object.keys(TYPE_LABELS) as ConnType[]).map((t) => (
+            <option key={t} value={t}>
+              {TYPE_LABELS[t]}
+            </option>
+          ))}
+        </FocusSelect>
+      </Field>
+
+      {}
+      {isSQLite ? (
+        <Field label="Database File Path">
+          <FocusInput
+            value={filePath}
+            onChange={(e) => setFilePath(e.target.value)}
+            placeholder="/absolute/path/to/database.db"
+          />
+        </Field>
+      ) : (
+        <>
+          {}
+          <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+            <div style={{ flex: 1 }}>
+              <label style={s.label}>Host</label>
+              <FocusInput
+                value={host}
+                onChange={(e) => setHost(e.target.value)}
+                placeholder="localhost"
+              />
+            </div>
+            <div style={{ width: 90 }}>
+              <label style={s.label}>Port</label>
+              <FocusInput
+                value={port}
+                onChange={(e) => setPort(e.target.value)}
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                style={
+                  {
+                    ...s.input,
+                    fontFamily: "var(--vscode-editor-font-family, monospace)",
+                    MozAppearance: "textfield",
+                  } as React.CSSProperties
+                }
+              />
+            </div>
+          </div>
+
+          <Field label="Database">
+            <FocusInput
+              value={database}
+              onChange={(e) => setDatabase(e.target.value)}
+              placeholder="mydb"
+            />
+          </Field>
+
+          <Field label="Username">
+            <FocusInput
+              value={user}
+              onChange={(e) => setUser(e.target.value)}
+              placeholder="admin"
+            />
+          </Field>
+
+          <Field label="Password" hint="Stored in plaintext in settings.json">
+            <FocusInput
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              type="password"
+              placeholder="••••••••"
+              style={{
+                ...s.input,
+                fontFamily: "var(--vscode-editor-font-family, monospace)",
+              }}
+            />
+          </Field>
+
+          {}
+          {isOracle && (
+            <>
+              <Divider label="Oracle Connection" />
+              <Field
+                label="Service Name"
+                hint="e.g. XEPDB1, ORCL, or your PDB service name. Recommended over SID. Leave empty to use the Database field above."
+              >
+                <FocusInput
+                  value={oracleServiceName}
+                  onChange={(e) => setOracleServiceName(e.target.value)}
+                  placeholder="XEPDB1"
+                />
+              </Field>
+
+              <Toggle
+                label="Use thick mode (requires Oracle Instant Client)"
+                hint="Enable only if thin mode doesn't work. Requires Oracle Instant Client installed on this machine."
+                checked={oracleThickMode}
+                onChange={setOracleThickMode}
+              />
+
+              {oracleThickMode && (
+                <div
+                  style={{
+                    paddingLeft: 24,
+                    borderLeft: "2px solid var(--vscode-panel-border)",
+                    marginBottom: 10,
+                  }}
+                >
+                  <Field
+                    label="Oracle Instant Client path"
+                    hint="Directory containing libclntsh.so / oci.dll. Leave empty to use system default."
+                  >
+                    <FocusInput
+                      value={oracleClientPath}
+                      onChange={(e) => setOracleClientPath(e.target.value)}
+                      placeholder="/opt/oracle/instantclient_21_9"
+                    />
+                  </Field>
+                </div>
+              )}
+            </>
+          )}
+
+          {}
+          <Divider label="SSL / TLS" />
+
+          <Toggle
+            label="Enable SSL"
+            hint={
+              type === "mssql"
+                ? "Enables connection encryption (recommended for production)"
+                : "Encrypt connection with SSL/TLS"
+            }
+            checked={sslEnabled}
+            onChange={setSslEnabled}
+          />
+
+          {sslEnabled && (
+            <div
+              style={{
+                paddingLeft: 24,
+                borderLeft: "2px solid var(--vscode-panel-border)",
+              }}
+            >
+              <Toggle
+                label="Verify server certificate"
+                hint="Uncheck to accept self-signed certificates"
+                checked={rejectUnauth}
+                onChange={setRejectUnauth}
+              />
+            </div>
+          )}
+        </>
+      )}
+
+      {}
+      {testState !== "idle" && (
+        <div
+          style={{
+            marginBottom: 12,
+            padding: "7px 10px",
+            borderRadius: 3,
+            fontSize: 12,
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            ...(testState === "ok"
+              ? {
+                  background: "rgba(50,180,50,0.12)",
+                  color: "var(--vscode-testing-iconPassed, #4ec94e)",
+                  border: "1px solid rgba(50,180,50,0.3)",
+                }
+              : testState === "fail"
+                ? {
+                    background: "var(--vscode-inputValidation-errorBackground)",
+                    color: "var(--vscode-errorForeground)",
+                    border:
+                      "1px solid var(--vscode-inputValidation-errorBorder)",
+                  }
+                : { opacity: 0.6 }),
+          }}
+        >
+          {testState === "testing" && (
+            <>
+              <SpinIcon /> Testing connection…
+            </>
+          )}
+          {testState === "ok" && (
+            <>
+              <Icon
+                name="check"
+                size={13}
+                color="var(--vscode-testing-iconPassed)"
+                style={{ marginRight: 4 }}
+              />
+              Connection successful
+            </>
+          )}
+          {testState === "fail" && <>✗ {testError}</>}
+        </div>
+      )}
+
+      {}
+      <div
+        style={{ display: "flex", gap: 6, alignItems: "center", marginTop: 4 }}
+      >
+        <button
+          style={{
+            ...s.btnPrimary,
+            ...(!name.trim() || saving
+              ? { opacity: 0.5, cursor: "default" }
+              : {}),
+          }}
+          disabled={!name.trim() || saving}
+          onClick={handleSave}
+        >
+          {saving ? "Saving…" : "Save"}
+        </button>
+        <button
+          style={{
+            ...s.btnSecondary,
+            ...(testState === "testing"
+              ? { opacity: 0.5, cursor: "default" }
+              : {}),
+          }}
+          disabled={testState === "testing"}
+          onClick={handleTest}
+        >
+          {testState === "testing" ? "Testing…" : "Test Connection"}
+        </button>
+        <button style={s.btnGhost} onClick={() => postMessage("cancel")}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SpinIcon() {
+  const [deg, setDeg] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setDeg((d) => (d + 20) % 360), 50);
+    return () => clearInterval(id);
+  }, []);
+  return <Icon name="sync" size={14} spin />;
+}
