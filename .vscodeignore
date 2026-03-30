@@ -10,8 +10,9 @@ compose.yaml
 .git/
 .gitignore
 
-# All node_modules — esbuild has already bundled everything into dist/
-node_modules/
+node_modules/**
+!node_modules/oracledb/**
+!node_modules/node-sqlite3-wasm/**
 
 # Misc
 **/*.map
