@@ -180,7 +180,12 @@ export class QueryPanel {
             const normalised: Record<string, unknown> = {};
             for (const [k, v] of Object.entries(row)) {
               if (Buffer.isBuffer(v)) {
-                normalised[k] = v.length === 0 ? 0 : v.readUIntBE(0, v.length);
+                normalised[k] =
+                  v.length === 0
+                    ? 0
+                    : v.length <= 6
+                      ? v.readUIntBE(0, v.length)
+                      : v.toString("hex");
               } else if (
                 v !== null &&
                 typeof v === "object" &&

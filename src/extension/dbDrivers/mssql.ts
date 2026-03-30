@@ -39,6 +39,8 @@ function mssqlFullType(
   return typeName;
 }
 
+const escapeMssqlId = (s: string) => s.replace(/]/g, "]]");
+
 export class MSSQLDriver implements IDBDriver {
   private pool: mssql.ConnectionPool | null = null;
   private readonly config: ConnectionConfig;
@@ -95,7 +97,7 @@ export class MSSQLDriver implements IDBDriver {
 
   async listSchemas(database: string): Promise<SchemaInfo[]> {
     const res = await this.pool!.request().query(
-      `SELECT SCHEMA_NAME AS name FROM [${database}].INFORMATION_SCHEMA.SCHEMATA
+      `SELECT SCHEMA_NAME AS name FROM [${escapeMssqlId(database)}].INFORMATION_SCHEMA.SCHEMATA
        WHERE SCHEMA_NAME NOT IN ('sys','INFORMATION_SCHEMA','db_accessadmin','db_backupoperator',
          'db_datareader','db_datawriter','db_ddladmin','db_denydatareader','db_denydatawriter',
          'db_owner','db_securityadmin','guest')
@@ -109,7 +111,7 @@ export class MSSQLDriver implements IDBDriver {
     const esc = (s: string) => s.replace(/'/g, "''");
     const tableRes = await this.pool!.request().query(
       `SELECT TABLE_NAME AS name, TABLE_TYPE AS type
-       FROM [${database}].INFORMATION_SCHEMA.TABLES
+       FROM [${escapeMssqlId(database)}].INFORMATION_SCHEMA.TABLES
        WHERE TABLE_SCHEMA = '${esc(schema)}' ORDER BY TABLE_NAME`,
     );
     for (const r of tableRes.recordset) {
@@ -128,8 +130,8 @@ export class MSSQLDriver implements IDBDriver {
                             WHEN 'FN' THEN 'function'  WHEN 'IF' THEN 'function'
                             WHEN 'TF' THEN 'function'  WHEN 'AF' THEN 'function'
                             ELSE 'function' END AS type
-         FROM [${database}].sys.objects o
-         JOIN [${database}].sys.schemas s ON s.schema_id = o.schema_id
+         FROM [${escapeMssqlId(database)}].sys.objects o
+         JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = o.schema_id
          WHERE s.name = '${esc(schema)}' AND o.type IN ('P','PC','FN','IF','TF','AF')
          ORDER BY o.name`,
       );
@@ -162,19 +164,19 @@ export class MSSQLDriver implements IDBDriver {
          OBJECT_DEFINITION(c.default_object_id)               AS COLUMN_DEFAULT,
          CASE WHEN pk.column_id IS NOT NULL THEN 1 ELSE 0 END AS IS_PK,
          CASE WHEN fk.parent_column_id IS NOT NULL THEN 1 ELSE 0 END AS IS_FK
-       FROM [${database}].sys.columns c
-       JOIN [${database}].sys.objects  o ON o.object_id = c.object_id
-       JOIN [${database}].sys.schemas  s ON s.schema_id  = o.schema_id
+       FROM [${escapeMssqlId(database)}].sys.columns c
+       JOIN [${escapeMssqlId(database)}].sys.objects  o ON o.object_id = c.object_id
+       JOIN [${escapeMssqlId(database)}].sys.schemas  s ON s.schema_id  = o.schema_id
        LEFT JOIN (
          SELECT ic.object_id, ic.column_id
-         FROM [${database}].sys.index_columns ic
-         JOIN [${database}].sys.indexes       i
+         FROM [${escapeMssqlId(database)}].sys.index_columns ic
+         JOIN [${escapeMssqlId(database)}].sys.indexes       i
            ON i.object_id = ic.object_id AND i.index_id = ic.index_id
          WHERE i.is_primary_key = 1
        ) pk ON pk.object_id = c.object_id AND pk.column_id = c.column_id
        LEFT JOIN (
          SELECT DISTINCT fkc.parent_object_id, fkc.parent_column_id
-         FROM [${database}].sys.foreign_key_columns fkc
+         FROM [${escapeMssqlId(database)}].sys.foreign_key_columns fkc
        ) fk ON fk.parent_object_id = c.object_id AND fk.parent_column_id = c.column_id
        WHERE s.name = '${esc(schema)}' AND o.name = '${esc(table)}'
        ORDER BY c.column_id`,
@@ -306,11 +308,11 @@ export class MSSQLDriver implements IDBDriver {
     const res = await this.pool!.request().query(
       `SELECT i.name AS idx_name, c.name AS col_name,
               i.is_unique AS is_unique, i.is_primary_key AS is_pk
-       FROM [${database}].sys.indexes i
-       JOIN [${database}].sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
-       JOIN [${database}].sys.columns c ON c.object_id = i.object_id AND c.column_id = ic.column_id
-       JOIN [${database}].sys.objects o ON o.object_id = i.object_id
-       JOIN [${database}].sys.schemas s ON s.schema_id = o.schema_id
+       FROM [${escapeMssqlId(database)}].sys.indexes i
+       JOIN [${escapeMssqlId(database)}].sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+       JOIN [${escapeMssqlId(database)}].sys.columns c ON c.object_id = i.object_id AND c.column_id = ic.column_id
+       JOIN [${escapeMssqlId(database)}].sys.objects o ON o.object_id = i.object_id
+       JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = o.schema_id
        WHERE s.name = '${esc(schema)}' AND o.name = '${esc(table)}'
        ORDER BY i.name, ic.key_ordinal`,
     );
@@ -341,14 +343,14 @@ export class MSSQLDriver implements IDBDriver {
               rs.name AS ref_schema,
               ro.name AS ref_table,
               rc.name AS ref_column
-       FROM [${database}].sys.foreign_keys fk
-       JOIN [${database}].sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
-       JOIN [${database}].sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id
-       JOIN [${database}].sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id
-       JOIN [${database}].sys.objects ro ON ro.object_id = fkc.referenced_object_id
-       JOIN [${database}].sys.schemas rs ON rs.schema_id = ro.schema_id
-       JOIN [${database}].sys.objects po ON po.object_id = fkc.parent_object_id
-       JOIN [${database}].sys.schemas ps ON ps.schema_id = po.schema_id
+       FROM [${escapeMssqlId(database)}].sys.foreign_keys fk
+       JOIN [${escapeMssqlId(database)}].sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
+       JOIN [${escapeMssqlId(database)}].sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id
+       JOIN [${escapeMssqlId(database)}].sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id
+       JOIN [${escapeMssqlId(database)}].sys.objects ro ON ro.object_id = fkc.referenced_object_id
+       JOIN [${escapeMssqlId(database)}].sys.schemas rs ON rs.schema_id = ro.schema_id
+       JOIN [${escapeMssqlId(database)}].sys.objects po ON po.object_id = fkc.parent_object_id
+       JOIN [${escapeMssqlId(database)}].sys.schemas ps ON ps.schema_id = po.schema_id
        WHERE ps.name = '${esc(schema)}' AND po.name = '${esc(table)}'`,
     );
     return res.recordset.map((r: any) => ({
@@ -368,7 +370,7 @@ export class MSSQLDriver implements IDBDriver {
     const esc = (s: string) => s.replace(/'/g, "''");
     try {
       const res = await this.pool!.request().query(
-        `SELECT OBJECT_DEFINITION(OBJECT_ID('[${database}].[${schema}].[${table}]')) AS ddl`,
+        `SELECT OBJECT_DEFINITION(OBJECT_ID('[${escapeMssqlId(database)}].[${schema}].[${table}]')) AS ddl`,
       );
       if (res.recordset[0]?.ddl) {
         return res.recordset[0].ddl as string;
@@ -386,13 +388,13 @@ export class MSSQLDriver implements IDBDriver {
          c.is_identity,
          OBJECT_DEFINITION(c.default_object_id) AS COLUMN_DEFAULT,
          CASE WHEN pk.column_id IS NOT NULL THEN 1 ELSE 0 END AS IS_PK
-       FROM [${database}].sys.columns c
-       JOIN [${database}].sys.objects  o ON o.object_id = c.object_id
-       JOIN [${database}].sys.schemas  s ON s.schema_id  = o.schema_id
+       FROM [${escapeMssqlId(database)}].sys.columns c
+       JOIN [${escapeMssqlId(database)}].sys.objects  o ON o.object_id = c.object_id
+       JOIN [${escapeMssqlId(database)}].sys.schemas  s ON s.schema_id  = o.schema_id
        LEFT JOIN (
          SELECT ic.object_id, ic.column_id
-         FROM [${database}].sys.index_columns ic
-         JOIN [${database}].sys.indexes       i
+         FROM [${escapeMssqlId(database)}].sys.index_columns ic
+         JOIN [${escapeMssqlId(database)}].sys.indexes       i
            ON i.object_id = ic.object_id AND i.index_id = ic.index_id
          WHERE i.is_primary_key = 1
        ) pk ON pk.object_id = c.object_id AND pk.column_id = c.column_id
@@ -432,7 +434,7 @@ export class MSSQLDriver implements IDBDriver {
     _kind: "function" | "procedure",
   ): Promise<string> {
     const res = await this.pool!.request().query(
-      `SELECT OBJECT_DEFINITION(OBJECT_ID('[${database}].[${schema}].[${name}]')) AS def`,
+      `SELECT OBJECT_DEFINITION(OBJECT_ID('[${escapeMssqlId(database)}].[${schema}].[${name}]')) AS def`,
     );
     const def = (res.recordset[0] as Record<string, unknown>)?.def as
       | string

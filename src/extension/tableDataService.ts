@@ -750,7 +750,11 @@ export class TableDataService {
 
         if (Buffer.isBuffer(val)) {
           newRow[colName] =
-            val.length === 0 ? 0 : val.readUIntBE(0, val.length);
+            val.length === 0
+              ? 0
+              : val.length <= 6
+                ? val.readUIntBE(0, val.length)
+                : val.toString("hex");
           return;
         }
 

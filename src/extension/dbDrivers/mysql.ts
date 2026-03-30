@@ -268,7 +268,6 @@ export class MySQLDriver implements IDBDriver {
     return this._executeScript(stmts, start);
   }
 
-  
   private _parseQueryResult(
     rawRows: any,
     fields: any[],
@@ -320,7 +319,6 @@ export class MySQLDriver implements IDBDriver {
     };
   }
 
-  
   private async _executeScript(
     stmts: string[],
     start: number,
@@ -418,7 +416,7 @@ export class MySQLDriver implements IDBDriver {
     table: string,
   ): Promise<string> {
     const [rows] = await this.pool!.query<any[]>(
-      `SHOW CREATE TABLE \`${database}\`.\`${table.replace(/`/g, "``")}\``,
+      `SHOW CREATE TABLE \`${database.replace(/`/g, "``")}\`.\`${table.replace(/`/g, "``")}\``,
     );
     return (
       (rows[0] as any)["Create Table"] ?? (rows[0] as any)["Create View"] ?? ""
