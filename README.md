@@ -5,7 +5,8 @@
 PostgreSQL · MySQL · MSSQL · SQLite · MariaDB · Oracle — all in one place, never leaving your editor.
 
 [![Marketplace](https://img.shields.io/visual-studio-marketplace/v/DmitriiKholkin.rapidb?style=flat-square&label=VS%20Marketplace&logo=visualstudiocode&color=007ACC&labelColor=555555)](https://marketplace.visualstudio.com/items?itemName=DmitriiKholkin.rapidb)
-[![GitHub](https://img.shields.io/badge/GitHub-RapiDB-007ACC?style=flat-square&labelColor=555555)](https://github.com/DmitriiKholkin/RapiDB)
+[![Open VSX](https://img.shields.io/open-vsx/v/DmitriiKholkin/rapidb?style=flat-square&label=Open%20VSX&logo=visualstudiocode&color=007ACC&labelColor=555555)](https://open-vsx.org/extension/DmitriiKholkin/rapidb)
+[![GitHub](https://img.shields.io/github/v/tag/DmitriiKholkin/RapiDB?style=flat-square&label=GitHub&color=007ACC&labelColor=555555)](https://github.com/DmitriiKholkin/RapiDB)
 [![License](https://img.shields.io/badge/License-MIT-007ACC?style=flat-square&labelColor=555555)](https://opensource.org/licenses/MIT)
 <br/> 
  
