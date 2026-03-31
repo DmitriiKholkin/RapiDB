@@ -28,7 +28,20 @@ export class ConnectionFormPanel {
     };
 
     this.panel.webview.html = this.buildHtml(context, existing);
-    this.panel.webview.onDidReceiveMessage((msg) => this.handleMessage(msg));
+    this.panel.webview.onDidReceiveMessage(async (msg) => {
+      try {
+        await this.handleMessage(msg);
+      } catch (err: any) {
+        console.error(
+          "[RapiDB] ConnectionFormPanel unhandled error:",
+          err?.message ?? err,
+        );
+        this.panel.webview.postMessage({
+          type: "testResult",
+          payload: { success: false, error: err?.message ?? String(err) },
+        });
+      }
+    });
     this.panel.onDidDispose(() => {
       this.resolveFn?.(undefined);
     });

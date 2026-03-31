@@ -9,6 +9,20 @@ import type {
   TableInfo,
 } from "./types";
 
+function classifySql(sql: string): "select" | "dml" {
+  const stripped = sql
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/--[^\n]*/g, " ")
+    .trim()
+    .toUpperCase();
+
+  const SELECT_STARTERS = ["SELECT", "PRAGMA", "WITH", "EXPLAIN", "VALUES"];
+
+  return SELECT_STARTERS.some((kw) => stripped.startsWith(kw))
+    ? "select"
+    : "dml";
+}
+
 export class SQLiteDriver implements IDBDriver {
   private db: Database | null = null;
   private readonly config: ConnectionConfig;
@@ -96,14 +110,9 @@ export class SQLiteDriver implements IDBDriver {
   async query(sql: string, params?: unknown[]): Promise<QueryResult> {
     const start = Date.now();
 
-    const trimmed = sql.trim().toUpperCase();
-    const isSelect =
-      trimmed.startsWith("SELECT") ||
-      trimmed.startsWith("PRAGMA") ||
-      trimmed.startsWith("WITH") ||
-      trimmed.startsWith("EXPLAIN");
+    const kind = classifySql(sql);
 
-    if (isSelect) {
+    if (kind === "select") {
       const bindValues = (params ??
         []) as import("node-sqlite3-wasm").BindValues;
       const rawRows = this.db!.all(sql, bindValues) as Record<
@@ -122,23 +131,45 @@ export class SQLiteDriver implements IDBDriver {
       };
     }
 
-    let affectedRows = 0;
     if (params && params.length > 0) {
-      const info = this.db!.run(
-        sql,
-        params as import("node-sqlite3-wasm").BindValues,
-      );
-      affectedRows = info.changes;
-    } else {
-      this.db!.exec(sql);
+      const bindValues = params as import("node-sqlite3-wasm").BindValues;
+      try {
+        const returningRows = this.db!.all(sql, bindValues) as Record<
+          string,
+          unknown
+        >[];
+        if (returningRows.length > 0) {
+          const columns = Object.keys(returningRows[0]);
+          const rows = returningRows.map((row) =>
+            Object.fromEntries(
+              columns.map((col, i) => [`__col_${i}`, row[col]]),
+            ),
+          );
+          return {
+            columns,
+            rows,
+            rowCount: rows.length,
+            executionTimeMs: Date.now() - start,
+          };
+        }
+      } catch {}
+      const info = this.db!.run(sql, bindValues);
+      return {
+        columns: [],
+        rows: [],
+        rowCount: info.changes,
+        executionTimeMs: Date.now() - start,
+        affectedRows: info.changes,
+      };
     }
 
+    this.db!.exec(sql);
     return {
       columns: [],
       rows: [],
-      rowCount: affectedRows,
+      rowCount: 0,
       executionTimeMs: Date.now() - start,
-      affectedRows,
+      affectedRows: 0,
     };
   }
 

@@ -403,7 +403,7 @@
               },
               "password": {
                 "type": "string",
-                "description": "Login password (stored in plaintext in settings.json)"
+                "description": "Login password for the database connection."
               },
               "filePath": {
                 "type": "string",
@@ -437,21 +437,24 @@
                 "description": "Path to Oracle Instant Client libraries directory. Only used when thickMode is true."
               }
             }
-          }
+          },
+          "scope": "machine"
         },
         "rapidb.queryRowLimit": {
           "type": "number",
           "default": 10000,
           "minimum": 100,
           "maximum": 100000,
-          "description": "Maximum number of rows returned by a query in the SQL editor. If the result exceeds this limit, rows are trimmed and a warning is shown. Range: 100–100 000. Set to 100000 to effectively disable the limit."
+          "description": "Maximum number of rows returned by a query in the SQL editor. If the result exceeds this limit, rows are trimmed and a warning is shown. Range: 100–100 000. Set to 100000 to effectively disable the limit.",
+          "scope": "machine"
         },
         "rapidb.queryHistoryLimit": {
           "type": "number",
           "default": 100,
           "minimum": 1,
           "maximum": 10000,
-          "description": "Maximum number of queries stored in history (shared across all connections). Must be between 1 and 10000. If you lower this value, excess entries are trimmed immediately."
+          "description": "Maximum number of queries stored in history (shared across all connections). Must be between 1 and 10000. If you lower this value, excess entries are trimmed immediately.",
+          "scope": "machine"
         },
         "rapidb.defaultPageSize": {
           "type": "number",
@@ -462,7 +465,8 @@
             500,
             1000
           ],
-          "description": "Default number of rows per page in the Table Data Viewer. Allowed values: 25, 100, 500, 1000. Any other value will be ignored and 25 will be used."
+          "description": "Default number of rows per page in the Table Data Viewer. Allowed values: 25, 100, 500, 1000. Any other value will be ignored and 25 will be used.",
+          "scope": "machine"
         }
       }
     },

@@ -36,6 +36,9 @@ function oracleFullType(
   return dataType;
 }
 
+oracledb.fetchAsString = [oracledb.CLOB];
+oracledb.fetchAsBuffer = [oracledb.BLOB];
+
 let _thickInitDone = false;
 
 function ensureThickMode(libDir?: string): void {
@@ -262,27 +265,6 @@ export class OracleDriver implements IDBDriver {
     const connectString = serviceName
       ? `${host}:${port}/${serviceName}`
       : `${host}:${port}`;
-
-    oracledb.autoCommit = true;
-
-    oracledb.fetchTypeHandler = (metaData) => {
-      if (metaData.dbType === oracledb.DB_TYPE_NUMBER) {
-        return { type: oracledb.NUMBER };
-      }
-      if (
-        metaData.dbType === oracledb.DB_TYPE_TIMESTAMP ||
-        metaData.dbType === oracledb.DB_TYPE_TIMESTAMP_TZ ||
-        metaData.dbType === oracledb.DB_TYPE_TIMESTAMP_LTZ
-      ) {
-        return { type: oracledb.DB_TYPE_TIMESTAMP_LTZ };
-      }
-      return undefined;
-    };
-
-    oracledb.fetchAsString = [oracledb.CLOB];
-    oracledb.fetchAsBuffer = [oracledb.BLOB];
-
-    oracledb.outFormat = oracledb.OUT_FORMAT_OBJECT;
 
     this.pool = (await oracledb.createPool({
       user: this.config.username ?? "",
@@ -878,6 +860,22 @@ export class OracleDriver implements IDBDriver {
     };
   }
 
+  private _fetchTypeHandler(
+    metaData: oracledb.Metadata<unknown>,
+  ): oracledb.FetchTypeResponse | undefined {
+    if (metaData.dbType === oracledb.DB_TYPE_NUMBER) {
+      return { type: oracledb.NUMBER };
+    }
+    if (
+      metaData.dbType === oracledb.DB_TYPE_TIMESTAMP ||
+      metaData.dbType === oracledb.DB_TYPE_TIMESTAMP_TZ ||
+      metaData.dbType === oracledb.DB_TYPE_TIMESTAMP_LTZ
+    ) {
+      return { type: oracledb.DB_TYPE_TIMESTAMP_LTZ };
+    }
+    return undefined;
+  }
+
   private async _execOne(
     sql: string,
     params: unknown[] | undefined,
@@ -898,6 +896,7 @@ export class OracleDriver implements IDBDriver {
         outFormat: oracledb.OUT_FORMAT_ARRAY,
         fetchArraySize: 100,
         autoCommit: true,
+        fetchTypeHandler: this._fetchTypeHandler.bind(this),
       };
 
       const res = await conn.execute(finalSql, binds, options);

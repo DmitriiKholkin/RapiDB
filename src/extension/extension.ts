@@ -377,6 +377,10 @@ export function activate(context: vscode.ExtensionContext): void {
 export function deactivate(): void {
   _activated = false;
 
+  QueryPanel.disposeAll();
+  TablePanel.disposeAll();
+  SchemaPanel.disposeAll();
+
   try {
     _connectionManager?.disconnectAll().catch(() => {});
   } catch {}

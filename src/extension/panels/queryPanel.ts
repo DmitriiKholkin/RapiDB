@@ -64,6 +64,15 @@ export class QueryPanel {
     this.panel.onDidDispose(() => cfgWatcher.dispose());
   }
 
+  static disposeAll(): void {
+    for (const panel of QueryPanel.panels.values()) {
+      try {
+        panel.panel.dispose();
+      } catch {}
+    }
+    QueryPanel.panels.clear();
+  }
+
   static createOrShow(
     context: vscode.ExtensionContext,
     connectionManager: ConnectionManager,

@@ -222,6 +222,15 @@ export class MSSQLDriver implements IDBDriver {
       };
     }
 
+    // FIX #3: параметры несовместимы с multi-batch (GO) скриптами.
+    // Раньше params молча дропались — теперь бросаем явную ошибку.
+    if (batches.length > 1 && params && params.length > 0) {
+      throw new Error(
+        "[RapiDB] MSSQL:parameters are not supported in multi-batch scripts (GO). " +
+          "Use parameters only in single queries without the GO separator.",
+      );
+    }
+
     let lastResult: QueryResult = {
       columns: [],
       rows: [],

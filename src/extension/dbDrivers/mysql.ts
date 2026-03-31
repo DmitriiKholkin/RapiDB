@@ -136,6 +136,7 @@ export class MySQLDriver implements IDBDriver {
       this.pool = null;
     }
     const sslEnabled = this.config.ssl ?? false;
+
     this.pool = mysql.createPool({
       host: this.config.host,
       port: this.config.port,
@@ -145,7 +146,6 @@ export class MySQLDriver implements IDBDriver {
       waitForConnections: true,
       connectionLimit: 5,
       connectTimeout: 10000,
-      multipleStatements: true,
       idleTimeout: 30000,
       dateStrings: true,
       ssl: sslEnabled
@@ -323,7 +323,20 @@ export class MySQLDriver implements IDBDriver {
     stmts: string[],
     start: number,
   ): Promise<QueryResult> {
-    const conn = await this.pool!.getConnection();
+    const scriptConn = await mysql.createConnection({
+      host: this.config.host,
+      port: this.config.port,
+      database: this.config.database,
+      user: this.config.username,
+      password: this.config.password,
+      connectTimeout: 10000,
+      dateStrings: true,
+      multipleStatements: true,
+      ssl: this.config.ssl
+        ? { rejectUnauthorized: this.config.rejectUnauthorized ?? true }
+        : undefined,
+    });
+
     let lastResult: QueryResult = {
       columns: [],
       rows: [],
@@ -333,7 +346,7 @@ export class MySQLDriver implements IDBDriver {
     let totalAffected = 0;
     try {
       for (const stmt of stmts) {
-        const [rawRows, fields] = await conn.query<any[]>({
+        const [rawRows, fields] = await scriptConn.query<any[]>({
           sql: stmt,
           rowsAsArray: true,
         } as any);
@@ -346,7 +359,7 @@ export class MySQLDriver implements IDBDriver {
         }
       }
     } finally {
-      conn.release();
+      await scriptConn.end().catch(() => {});
     }
     lastResult.executionTimeMs = Date.now() - start;
     if (lastResult.columns.length === 0) {

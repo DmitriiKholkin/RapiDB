@@ -36,11 +36,33 @@ export class SchemaPanel {
 
     const key = SchemaPanel.key(connectionId, database, schema, table);
     this.panel.onDidDispose(() => SchemaPanel.panels.delete(key));
-    this.panel.webview.onDidReceiveMessage((msg) => this.handleMessage(msg));
+    this.panel.webview.onDidReceiveMessage(async (msg) => {
+      try {
+        await this.handleMessage(msg);
+      } catch (err: any) {
+        console.error(
+          "[RapiDB] SchemaPanel unhandled error:",
+          err?.message ?? err,
+        );
+        this.panel.webview.postMessage({
+          type: "schemaError",
+          payload: { error: err?.message ?? String(err) },
+        });
+      }
+    });
   }
 
   private static key(c: string, d: string, s: string, t: string) {
     return `${c}::${d}::${s}::${t}`;
+  }
+
+  static disposeAll(): void {
+    for (const panel of SchemaPanel.panels.values()) {
+      try {
+        panel.panel.dispose();
+      } catch {}
+    }
+    SchemaPanel.panels.clear();
   }
 
   static createOrShow(

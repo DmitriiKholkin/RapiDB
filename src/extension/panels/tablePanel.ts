@@ -57,7 +57,20 @@ export class TablePanel {
 
       this.svc.clearForConnection(connectionId);
     });
-    this.panel.webview.onDidReceiveMessage((msg) => this.handleMessage(msg));
+
+    this.panel.webview.onDidReceiveMessage(async (msg) => {
+      try {
+        await this.handleMessage(msg);
+      } catch (err: any) {
+        console.error(
+          "[RapiDB] TablePanel unhandled error:",
+          err?.message ?? err,
+        );
+        vscode.window.showErrorMessage(
+          `[RapiDB] Unexpected error: ${err?.message ?? String(err)}`,
+        );
+      }
+    });
   }
 
   private static panelKey(
@@ -67,6 +80,15 @@ export class TablePanel {
     table: string,
   ): string {
     return `${connectionId}::${database}::${schema}::${table}`;
+  }
+
+  static disposeAll(): void {
+    for (const panel of TablePanel.panels.values()) {
+      try {
+        panel.panel.dispose();
+      } catch {}
+    }
+    TablePanel.panels.clear();
   }
 
   static createOrShow(
@@ -156,12 +178,14 @@ export class TablePanel {
       }
 
       case "fetchPage": {
-        const {
-          page = 1,
-          pageSize = 50,
-          filters = [],
-          sort = null,
-        } = msg.payload ?? {};
+        const raw = msg.payload ?? {};
+        const page = Math.max(1, Math.floor(Number(raw.page) || 1));
+        const pageSize = Math.min(
+          10000,
+          Math.max(1, Math.floor(Number(raw.pageSize) || 50)),
+        );
+        const filters = Array.isArray(raw.filters) ? raw.filters : [];
+        const sort = raw.sort ?? null;
         try {
           const result = await this.svc.getPage(
             this.connectionId,
@@ -255,62 +279,69 @@ export class TablePanel {
           break;
         }
 
-        await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: `RapiDB: Exporting ${this.table}…`,
-            cancellable: false,
-          },
-          async () => {
-            const writeStream = fs.createWriteStream(saveUri.fsPath, {
-              encoding: "utf8",
-            });
-            let headerWritten = false;
-            const { sort: csvSort = null, filters: csvFilters = [] } =
-              msg.payload ?? {};
-            try {
-              for await (const chunk of this.svc.exportAll(
-                this.connectionId,
-                this.database,
-                this.schema,
-                this.table,
-                500,
-                csvSort as SortConfig | null,
-                (csvFilters as { column: string; value: string }[]).map(
-                  (f) => ({
-                    column: f.column,
-                    value: f.value,
-                  }),
-                ),
-              )) {
-                if (!headerWritten) {
-                  writeStream.write(
-                    chunk.columns.map((c) => csvCell(c.name)).join(",") + "\n",
-                  );
-                  headerWritten = true;
-                }
-                for (const row of chunk.rows) {
-                  writeStream.write(
-                    chunk.columns.map((c) => csvCell(row[c.name])).join(",") +
-                      "\n",
-                  );
-                }
-              }
-              await new Promise<void>((res, rej) => {
-                writeStream.end((err?: Error | null) =>
-                  err ? rej(err) : res(),
-                );
+        try {
+          await vscode.window.withProgress(
+            {
+              location: vscode.ProgressLocation.Notification,
+              title: `RapiDB: Exporting ${this.table}…`,
+              cancellable: false,
+            },
+            async () => {
+              const writeStream = fs.createWriteStream(saveUri.fsPath, {
+                encoding: "utf8",
               });
-            } catch (err) {
-              writeStream.destroy();
-              throw err;
-            }
-          },
-        );
+              let headerWritten = false;
+              const { sort: csvSort = null, filters: csvFilters = [] } =
+                msg.payload ?? {};
+              try {
+                for await (const chunk of this.svc.exportAll(
+                  this.connectionId,
+                  this.database,
+                  this.schema,
+                  this.table,
+                  500,
+                  csvSort as SortConfig | null,
+                  (csvFilters as { column: string; value: string }[]).map(
+                    (f) => ({
+                      column: f.column,
+                      value: f.value,
+                    }),
+                  ),
+                )) {
+                  if (!headerWritten) {
+                    writeStream.write(
+                      chunk.columns.map((c) => csvCell(c.name)).join(",") +
+                        "\n",
+                    );
+                    headerWritten = true;
+                  }
+                  for (const row of chunk.rows) {
+                    writeStream.write(
+                      chunk.columns.map((c) => csvCell(row[c.name])).join(",") +
+                        "\n",
+                    );
+                  }
+                }
+                await new Promise<void>((res, rej) => {
+                  writeStream.end((err?: Error | null) =>
+                    err ? rej(err) : res(),
+                  );
+                });
+              } catch (err) {
+                writeStream.destroy();
+                throw err;
+              }
+            },
+          );
 
-        vscode.window.showInformationMessage(
-          `[RapiDB] Exported ${this.table} → ${path.basename(saveUri.fsPath)}`,
-        );
+          vscode.window.showInformationMessage(
+            `[RapiDB] Exported ${this.table} → ${path.basename(saveUri.fsPath)}`,
+          );
+        } catch (err: any) {
+          vscode.window.showErrorMessage(
+            `[RapiDB] CSV export failed: ${err?.message ?? String(err)}`,
+          );
+        }
         break;
       }
 
@@ -326,62 +357,68 @@ export class TablePanel {
           break;
         }
 
-        await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: `RapiDB: Exporting ${this.table} as JSON…`,
-            cancellable: false,
-          },
-          async () => {
-            const writeStream = fs.createWriteStream(saveUri.fsPath, {
-              encoding: "utf8",
-            });
-            writeStream.write("[\n");
-            let first = true;
-            try {
-              for await (const chunk of this.svc.exportAll(
-                this.connectionId,
-                this.database,
-                this.schema,
-                this.table,
-                500,
-                sort as SortConfig | null,
-                (jsonFilters as { column: string; value: string }[]).map(
-                  (f) => ({
-                    column: f.column,
-                    value: f.value,
-                  }),
-                ),
-              )) {
-                for (const row of chunk.rows) {
-                  const formatted = Object.fromEntries(
-                    Object.entries(row).map(([k, v]) => [
-                      k,
-                      formatCellValue(v) || null,
-                    ]),
-                  );
-                  writeStream.write(
-                    (first ? "" : ",\n") + JSON.stringify(formatted),
-                  );
-                  first = false;
-                }
-              }
-              writeStream.write("\n]\n");
-              await new Promise<void>((res, rej) => {
-                writeStream.end((err?: Error | null) =>
-                  err ? rej(err) : res(),
-                );
+        try {
+          await vscode.window.withProgress(
+            {
+              location: vscode.ProgressLocation.Notification,
+              title: `RapiDB: Exporting ${this.table} as JSON…`,
+              cancellable: false,
+            },
+            async () => {
+              const writeStream = fs.createWriteStream(saveUri.fsPath, {
+                encoding: "utf8",
               });
-            } catch (err) {
-              writeStream.destroy();
-              throw err;
-            }
-          },
-        );
+              writeStream.write("[\n");
+              let first = true;
+              try {
+                for await (const chunk of this.svc.exportAll(
+                  this.connectionId,
+                  this.database,
+                  this.schema,
+                  this.table,
+                  500,
+                  sort as SortConfig | null,
+                  (jsonFilters as { column: string; value: string }[]).map(
+                    (f) => ({
+                      column: f.column,
+                      value: f.value,
+                    }),
+                  ),
+                )) {
+                  for (const row of chunk.rows) {
+                    const formatted = Object.fromEntries(
+                      Object.entries(row).map(([k, v]) => [
+                        k,
+                        formatCellValue(v) || null,
+                      ]),
+                    );
+                    writeStream.write(
+                      (first ? "" : ",\n") + JSON.stringify(formatted),
+                    );
+                    first = false;
+                  }
+                }
+                writeStream.write("\n]\n");
+                await new Promise<void>((res, rej) => {
+                  writeStream.end((err?: Error | null) =>
+                    err ? rej(err) : res(),
+                  );
+                });
+              } catch (err) {
+                writeStream.destroy();
+                throw err;
+              }
+            },
+          );
 
-        vscode.window.showInformationMessage(
-          `[RapiDB] Exported ${this.table} → ${path.basename(saveUri.fsPath)}`,
-        );
+          vscode.window.showInformationMessage(
+            `[RapiDB] Exported ${this.table} → ${path.basename(saveUri.fsPath)}`,
+          );
+        } catch (err: any) {
+          vscode.window.showErrorMessage(
+            `[RapiDB] JSON export failed: ${err?.message ?? String(err)}`,
+          );
+        }
         break;
       }
 
