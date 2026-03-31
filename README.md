@@ -49,7 +49,7 @@ Your database lives in the sidebar — same window, same shortcuts, same theme.
 
 ### 🔌 Connect to anything
 
-PostgreSQL, MySQL, MSSQL, SQL Server, SQLite, MariaDB, Oracle — all supported out of the box. SSL, self-signed certs, Oracle service names and Thick Mode with Instant Client, connection folders to keep things organized.
+PostgreSQL, MySQL, MS SQL Server, SQLite, MariaDB, Oracle — all supported out of the box. SSL, self-signed certs, Oracle service names and Thick Mode with Instant Client, connection folders to keep things organized.
 
 <img src="media/img-market-3.png" alt="Connection Form" width="600"/>
 
