@@ -445,6 +445,14 @@ export class TablePanel {
       vscode.Uri.joinPath(context.extensionUri, "dist", "webview.css"),
     );
 
+    function escapeHtml(str: string): string {
+      return str
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
     const nonce = crypto.randomUUID();
 
     return `<!DOCTYPE html>
@@ -455,12 +463,12 @@ export class TablePanel {
   <meta http-equiv="Content-Security-Policy"
     content="default-src 'none';
              script-src 'nonce-${nonce}' ${webview.cspSource};
-             style-src ${webview.cspSource} 'unsafe-inline';
+             style-src ${webview.cspSource} 'nonce-${nonce}';
              font-src ${webview.cspSource} data:;
              img-src ${webview.cspSource} https: data:;" />
-  <title>${this.isView ? "View" : "Table"} — ${this.table}</title>
+  <title>${this.isView ? "View" : "Table"} — ${escapeHtml(this.table)}</title>
   <link rel="stylesheet" href="${webviewCss}" />
-  <style>
+  <style nonce="${nonce}">
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { height: 100%; overflow: hidden; }
     body {

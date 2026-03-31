@@ -530,12 +530,12 @@ export class QueryPanel {
     content="default-src 'none';
              worker-src blob:;
              script-src 'nonce-${nonce}' ${webview.cspSource};
-             style-src ${webview.cspSource} 'unsafe-inline';
+             style-src ${webview.cspSource} 'nonce-${nonce}';
              font-src ${webview.cspSource} data:;
              img-src ${webview.cspSource} https: data:;" /> 
   <title>RapiDB Query</title>
   <link rel="stylesheet" href="${webviewCss}" />
-  <style>
+  <style nonce="${nonce}">
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { height: 100%; overflow: hidden; }
     body {
