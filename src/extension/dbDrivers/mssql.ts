@@ -379,7 +379,7 @@ export class MSSQLDriver implements IDBDriver {
     const esc = (s: string) => s.replace(/'/g, "''");
     try {
       const res = await this.pool!.request().query(
-        `SELECT OBJECT_DEFINITION(OBJECT_ID('[${escapeMssqlId(database)}].[${schema}].[${table}]')) AS ddl`,
+        `SELECT OBJECT_DEFINITION(OBJECT_ID('[${escapeMssqlId(database)}].[${escapeMssqlId(schema)}].[${escapeMssqlId(table)}]')) AS ddl`,
       );
       if (res.recordset[0]?.ddl) {
         return res.recordset[0].ddl as string;
@@ -443,7 +443,7 @@ export class MSSQLDriver implements IDBDriver {
     _kind: "function" | "procedure",
   ): Promise<string> {
     const res = await this.pool!.request().query(
-      `SELECT OBJECT_DEFINITION(OBJECT_ID('[${escapeMssqlId(database)}].[${schema}].[${name}]')) AS def`,
+      `SELECT OBJECT_DEFINITION(OBJECT_ID('[${escapeMssqlId(database)}].[${escapeMssqlId(schema)}].[${escapeMssqlId(name)}]')) AS def`,
     );
     const def = (res.recordset[0] as Record<string, unknown>)?.def as
       | string

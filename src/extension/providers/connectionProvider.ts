@@ -100,6 +100,7 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     this._subscriptions.push(
       connectionManager.onDidConnect(() => scheduleRefresh()),
       connectionManager.onDidDisconnect(() => scheduleRefresh()),
+      connectionManager.onDidChangeConnections(() => scheduleRefresh()),
     );
   }
 

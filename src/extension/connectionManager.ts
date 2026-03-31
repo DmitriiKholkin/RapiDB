@@ -54,6 +54,9 @@ export class ConnectionManager {
   private readonly context: vscode.ExtensionContext;
   private driverMap = new Map<string, IDBDriver>();
 
+  readonly onDidChangeConnections: vscode.Event<void>;
+  private readonly _onDidChangeConnections = new vscode.EventEmitter<void>();
+
   readonly onDidChangeHistory: vscode.Event<void>;
   private readonly _onDidChangeHistory = new vscode.EventEmitter<void>();
 
@@ -70,6 +73,7 @@ export class ConnectionManager {
 
   constructor(context: vscode.ExtensionContext) {
     this.context = context;
+    this.onDidChangeConnections = this._onDidChangeConnections.event;
     this.onDidChangeHistory = this._onDidChangeHistory.event;
     this.onDidChangeBookmarks = this._onDidChangeBookmarks.event;
     this.onDidConnect = this._onDidConnect.event;
@@ -161,7 +165,7 @@ export class ConnectionManager {
       await this.disconnectFrom(config.id);
     }
 
-    this._onDidChangeHistory.fire();
+    this._onDidChangeConnections.fire();
   }
 
   async deleteConnection(id: string): Promise<boolean> {

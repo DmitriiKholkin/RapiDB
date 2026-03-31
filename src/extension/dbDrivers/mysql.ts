@@ -323,19 +323,7 @@ export class MySQLDriver implements IDBDriver {
     stmts: string[],
     start: number,
   ): Promise<QueryResult> {
-    const scriptConn = await mysql.createConnection({
-      host: this.config.host,
-      port: this.config.port,
-      database: this.config.database,
-      user: this.config.username,
-      password: this.config.password,
-      connectTimeout: 10000,
-      dateStrings: true,
-      multipleStatements: true,
-      ssl: this.config.ssl
-        ? { rejectUnauthorized: this.config.rejectUnauthorized ?? true }
-        : undefined,
-    });
+    const conn = await this.pool!.getConnection();
 
     let lastResult: QueryResult = {
       columns: [],
@@ -346,7 +334,7 @@ export class MySQLDriver implements IDBDriver {
     let totalAffected = 0;
     try {
       for (const stmt of stmts) {
-        const [rawRows, fields] = await scriptConn.query<any[]>({
+        const [rawRows, fields] = await conn.query({
           sql: stmt,
           rowsAsArray: true,
         } as any);
@@ -359,7 +347,7 @@ export class MySQLDriver implements IDBDriver {
         }
       }
     } finally {
-      await scriptConn.end().catch(() => {});
+      conn.release();
     }
     lastResult.executionTimeMs = Date.now() - start;
     if (lastResult.columns.length === 0) {
