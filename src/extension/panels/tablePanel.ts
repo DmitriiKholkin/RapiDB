@@ -386,14 +386,18 @@ export class TablePanel {
                   ),
                 )) {
                   for (const row of chunk.rows) {
-                    const formatted = Object.fromEntries(
+                    const serialisable = Object.fromEntries(
                       Object.entries(row).map(([k, v]) => [
                         k,
-                        formatCellValue(v) || null,
+                        v instanceof Date
+                          ? isNaN(v.getTime())
+                            ? null
+                            : formatCellValue(v)
+                          : (v ?? null),
                       ]),
                     );
                     writeStream.write(
-                      (first ? "" : ",\n") + JSON.stringify(formatted),
+                      (first ? "" : ",\n") + JSON.stringify(serialisable),
                     );
                     first = false;
                   }
@@ -532,7 +536,10 @@ function csvCell(value: unknown): string {
   if (s === "") {
     return "";
   }
-  return s.includes(",") || s.includes('"') || s.includes("\n")
+  return s.includes(",") ||
+    s.includes('"') ||
+    s.includes("\n") ||
+    s.includes("\r")
     ? `"${s.replace(/"/g, '""')}"`
     : s;
 }

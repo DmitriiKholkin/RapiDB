@@ -36,7 +36,7 @@ function oracleFullType(
   return dataType;
 }
 
-oracledb.fetchAsString = [oracledb.CLOB];
+oracledb.fetchAsString = [oracledb.CLOB, oracledb.DATE];
 oracledb.fetchAsBuffer = [oracledb.BLOB];
 
 let _thickInitDone = false;
@@ -275,6 +275,17 @@ export class OracleDriver implements IDBDriver {
       poolIncrement: 1,
       poolTimeout: 30,
       poolPingInterval: 60,
+      sessionCallback: async (connection: oracledb.Connection) => {
+        await connection.execute(
+          `ALTER SESSION SET NLS_DATE_FORMAT      = 'YYYY-MM-DD HH24:MI:SS'`,
+        );
+        await connection.execute(
+          `ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF3'`,
+        );
+        await connection.execute(
+          `ALTER SESSION SET NLS_TIMESTAMP_TZ_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF3 TZH:TZM'`,
+        );
+      },
     })) as unknown as oracledb.Pool;
 
     const conn = await this.pool.getConnection();
@@ -865,13 +876,6 @@ export class OracleDriver implements IDBDriver {
   ): oracledb.FetchTypeResponse | undefined {
     if (metaData.dbType === oracledb.DB_TYPE_NUMBER) {
       return { type: oracledb.NUMBER };
-    }
-    if (
-      metaData.dbType === oracledb.DB_TYPE_TIMESTAMP ||
-      metaData.dbType === oracledb.DB_TYPE_TIMESTAMP_TZ ||
-      metaData.dbType === oracledb.DB_TYPE_TIMESTAMP_LTZ
-    ) {
-      return { type: oracledb.DB_TYPE_TIMESTAMP_LTZ };
     }
     return undefined;
   }

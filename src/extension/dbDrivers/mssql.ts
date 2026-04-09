@@ -1,6 +1,6 @@
 import * as mssql from "mssql";
 import type { ConnectionConfig } from "../connectionManager";
-import { ISO_DATETIME_RE } from "../tableDataService";
+import { DATETIME_SQL_RE, ISO_DATETIME_RE } from "../tableDataService";
 import type {
   ColumnMeta,
   DatabaseInfo,
@@ -299,11 +299,17 @@ export class MSSQLDriver implements IDBDriver {
   }
 
   private guessMssqlType(value: any) {
-    if (typeof value === "number") return mssql.TYPES.Int;
+    if (typeof value === "number") {
+      // Use Decimal for non-integers to avoid precision loss (e.g. 3.14 → Int = 3)
+      return Number.isInteger(value) ? mssql.TYPES.Int : mssql.TYPES.Decimal;
+    }
     if (typeof value === "boolean") return mssql.TYPES.Bit;
     if (value instanceof Date) return mssql.TYPES.DateTime2;
-    if (typeof value === "string" && ISO_DATETIME_RE.test(value)) {
-      return mssql.TYPES.DateTimeOffset;
+    if (typeof value === "string") {
+      if (ISO_DATETIME_RE.test(value)) return mssql.TYPES.DateTimeOffset;
+      if (DATETIME_SQL_RE.test(value)) return mssql.TYPES.DateTime2;
+      // date-only string like "2024-01-15" — bind as Date type, not NVarChar
+      if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return mssql.TYPES.Date;
     }
     return mssql.TYPES.NVarChar;
   }

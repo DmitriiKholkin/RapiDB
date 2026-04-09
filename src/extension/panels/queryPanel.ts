@@ -300,7 +300,10 @@ export class QueryPanel {
               return "";
             }
             const s = String(v);
-            return s.includes(",") || s.includes('"') || s.includes("\n")
+            return s.includes(",") ||
+              s.includes('"') ||
+              s.includes("\n") ||
+              s.includes("\r")
               ? `"${s.replace(/"/g, '""')}"`
               : s;
           };

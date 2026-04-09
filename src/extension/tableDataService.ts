@@ -32,7 +32,7 @@ export const ISO_DATETIME_RE =
 
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-const DATETIME_SQL_RE =
+export const DATETIME_SQL_RE =
   /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2})?$/;
 
 const PG_GEOMETRIC_TYPES = new Set([
@@ -74,7 +74,13 @@ function isOracleNonFilterable(colType: string): boolean {
 
 function isMssqlNonFilterable(colType: string): boolean {
   const ct = colType.toLowerCase().split("(")[0].trim();
-  return ct === "image" || ct === "binary" || ct === "varbinary";
+  return (
+    ct === "image" ||
+    ct === "binary" ||
+    ct === "varbinary" ||
+    ct === "geography" ||
+    ct === "geometry"
+  );
 }
 
 export function isBooleanLikeType(
@@ -176,7 +182,8 @@ function isDatetimeWithTime(
     return (
       ct.startsWith("timestamp") ||
       ct === "timetz" ||
-      ct === "time with time zone"
+      ct === "time with time zone" ||
+      ct === "time"
     );
   }
   if (dbType === "mysql") {
@@ -193,6 +200,14 @@ function isDatetimeWithTime(
   }
   if (dbType === "oracle") {
     return ct === "date" || ct.startsWith("timestamp");
+  }
+  if (dbType === "sqlite") {
+    return (
+      ct === "datetime" ||
+      ct === "timestamp" ||
+      ct.startsWith("datetime") ||
+      ct.startsWith("timestamp")
+    );
   }
   return false;
 }
@@ -213,7 +228,7 @@ export function formatDatetimeForDisplay(val: unknown): string | null {
 
   if (typeof val === "string") {
     const m =
-      /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}:\d{2}|Z)?$/.exec(
+      /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}(:\d{2})?|Z)?$/.exec(
         val,
       );
     if (m) {
@@ -238,9 +253,9 @@ function isoToLocalDateStr(iso: string): string | null {
   if (isNaN(d.getTime())) {
     return null;
   }
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
 }
 
@@ -321,8 +336,11 @@ function coerceValue(
     if (dbType === "oracle" && colType) {
       const ct = colType.toLowerCase();
       if (ct === "date" || ct.startsWith("timestamp")) {
-        const d = new Date(value);
-        if (!isNaN(d.getTime())) return d;
+        const sqlStr = value
+          .replace("T", " ")
+          .replace(/Z$/, "")
+          .replace(/([+-]\d{2}):(\d{2})$/, " $1:$2");
+        return sqlStr;
       }
     }
 
@@ -345,16 +363,14 @@ function coerceValue(
   if (DATE_ONLY_RE.test(value) && dbType === "oracle" && colType) {
     const ct = colType.toLowerCase();
     if (ct === "date" || ct.startsWith("timestamp")) {
-      const d = new Date(`${value}T00:00:00.000Z`);
-      if (!isNaN(d.getTime())) return d;
+      return `${value} 00:00:00`;
     }
   }
 
   if (DATETIME_SQL_RE.test(value) && colType) {
     const ct = colType.toLowerCase();
     if (dbType === "oracle" && (ct === "date" || ct.startsWith("timestamp"))) {
-      const d = new Date(value.replace(" ", "T") + "Z");
-      if (!isNaN(d.getTime())) return d;
+      return value;
     }
     if (dbType === "mysql" || dbType === "mssql") {
       return value;
@@ -473,11 +489,18 @@ function buildWhere(
       const isDateCol = colType === "date";
       const isTextual =
         colType.includes("json") ||
-        colType.includes("text") ||
-        colType.includes("char") ||
-        colType.includes("clob") ||
+        colType.includes("text") || // text, ntext, tinytext, mediumtext, longtext, citext
+        colType.includes("char") || // char, varchar, nchar, nvarchar
+        colType.includes("clob") || // clob, nclob
         colType.includes("string") ||
-        colType === "xml";
+        colType === "xml" ||
+        // MySQL ENUM/SET store string values — numeric filter would match by ordinal position
+        colType.startsWith("enum") ||
+        colType.startsWith("set(") ||
+        // MySQL BLOB family — stored as binary, LIKE on hex repr is more useful than numeric =
+        colType.includes("blob") ||
+        // MSSQL uniqueidentifier (GUID) — looks like UUID, never numeric
+        colType === "uniqueidentifier";
       const isPgGeometric =
         type === "pg" && PG_GEOMETRIC_TYPES.has(colType.split("(")[0].trim());
 
@@ -553,12 +576,13 @@ function buildWhere(
         if (isOraDateTime) {
           if (colType === "date") {
             if (DATE_ONLY_RE.test(val)) {
-              const lower = new Date(`${val}T00:00:00.000Z`);
-              if (!isNaN(lower.getTime())) {
-                const upper = new Date(lower.getTime() + 86_400_000);
-                params.push(lower, upper);
-                return `(${col} >= ? AND ${col} < ?)`;
-              }
+              const nextDay = (() => {
+                const [y, mo, d] = val.split("-").map(Number);
+                const dt = new Date(Date.UTC(y, mo - 1, d + 1));
+                return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-${String(dt.getUTCDate()).padStart(2, "0")}`;
+              })();
+              params.push(val, nextDay);
+              return `(${col} >= TO_DATE(?, 'YYYY-MM-DD') AND ${col} < TO_DATE(?, 'YYYY-MM-DD'))`;
             } else if (ISO_DATETIME_RE.test(val)) {
               const d = new Date(val);
               if (!isNaN(d.getTime())) {
@@ -566,7 +590,8 @@ function buildWhere(
                 return `${col} = ?`;
               }
             } else if (DATETIME_SQL_RE.test(val)) {
-              const d = new Date(val.replace(" ", "T") + "Z");
+              const wallClock = val.replace(" ", "T");
+              const d = new Date(wallClock);
               if (!isNaN(d.getTime())) {
                 params.push(d);
                 return `${col} = ?`;
@@ -600,6 +625,31 @@ function buildWhere(
         return `UPPER(CAST(${col} AS VARCHAR2(4000))) LIKE ?`;
       }
       if (type === "mssql") {
+        // For date/datetime columns, CAST(col AS NVARCHAR) is locale-dependent
+        // (e.g. produces 'Jan 15 2024' instead of '2024-01-15'). Use CONVERT
+        // with explicit ISO style codes so the string is predictable.
+        if (isDateCol) {
+          let dateStr: string | null = null;
+          if (DATE_ONLY_RE.test(val)) {
+            dateStr = val;
+          } else if (ISO_DATETIME_RE.test(val)) {
+            dateStr = isoToLocalDateStr(val);
+          }
+          if (dateStr) {
+            params.push(dateStr);
+            // Style 23 → 'yyyy-mm-dd', always ISO regardless of server locale
+            return `CONVERT(NVARCHAR(10), ${col}, 23) = ?`;
+          }
+          // Non-date-like input: fall through to LIKE below
+        }
+        if (isDatetimeWithTime(colType, "mssql")) {
+          // Style 121 → 'yyyy-mm-dd hh:mi:ss.mmm' (24h, always ISO)
+          const mssqlDtVal = DATETIME_SQL_RE.test(finalVal)
+            ? `${finalVal}%`
+            : `%${finalVal}%`;
+          params.push(mssqlDtVal);
+          return `CONVERT(NVARCHAR(23), ${col}, 121) LIKE ?`;
+        }
         const mssqlVal = DATETIME_SQL_RE.test(finalVal)
           ? `${finalVal}%`
           : `%${finalVal}%`;

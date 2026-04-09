@@ -458,17 +458,7 @@ const VirtualRow = React.memo(function VirtualRow({
 
 function CellValue({ value }: { value: unknown }) {
   if (value === null || value === undefined) {
-    return (
-      <span
-        style={{
-          fontStyle: "italic",
-          color: "var(--vscode-disabledForeground)",
-          opacity: 0.7,
-        }}
-      >
-        NULL
-      </span>
-    );
+    return <span style={{ fontStyle: "italic", opacity: 0.45 }}>NULL</span>;
   }
   if (typeof value === "boolean") {
     return (

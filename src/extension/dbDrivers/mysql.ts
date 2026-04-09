@@ -148,6 +148,8 @@ export class MySQLDriver implements IDBDriver {
       connectTimeout: 10000,
       idleTimeout: 30000,
       dateStrings: true,
+      bigNumberStrings: true,
+      supportBigNumbers: true,
       ssl: sslEnabled
         ? {
             rejectUnauthorized: this.config.rejectUnauthorized ?? true,

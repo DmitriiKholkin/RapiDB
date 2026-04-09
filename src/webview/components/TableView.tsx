@@ -856,7 +856,13 @@ export function TableView({
                     onChange={(e) =>
                       setNewRow({ ...newRow, [col.name]: e.target.value })
                     }
-                    placeholder={isNull ? "NULL" : undefined}
+                    placeholder={
+                      isNull
+                        ? "NULL"
+                        : col.isBoolean
+                          ? "true / false"
+                          : undefined
+                    }
                     style={{
                       width: 120,
                       padding: "3px 6px",
@@ -1087,7 +1093,13 @@ export function TableView({
                               [h.column.id]: e.target.value,
                             }))
                           }
-                          placeholder={isNullFilter ? "NULL" : "filter"}
+                          placeholder={
+                            isNullFilter
+                              ? "NULL"
+                              : col?.isBoolean
+                                ? "true / false"
+                                : "filter"
+                          }
                           style={{
                             flex: 1,
                             minWidth: 0,
@@ -1386,6 +1398,40 @@ function EditInput({
 
   const commit = () => onCommit(isNull ? NULL_SENTINEL : val);
 
+  const inputStyle: React.CSSProperties = {
+    flex: 1,
+    minWidth: 0,
+    height: ROW_H - 4,
+    padding: "0 4px",
+    fontSize: 12,
+    fontFamily: "inherit",
+    background: "var(--vscode-input-background)",
+    color: isNull
+      ? "var(--vscode-disabledForeground)"
+      : "var(--vscode-input-foreground)",
+    border: "1px solid var(--vscode-focusBorder)",
+    borderRadius: 2,
+    outline: "none",
+    boxSizing: "border-box",
+    opacity: isNull ? 0.5 : 1,
+  };
+
+  const nullBtnStyle: React.CSSProperties = {
+    flexShrink: 0,
+    height: "100%",
+    padding: "0 5px",
+    fontSize: 9,
+    fontStyle: "italic",
+    fontFamily: "inherit",
+    background: "transparent",
+    color: "var(--vscode-badge-foreground)",
+    border: "none",
+    borderRadius: 2,
+    cursor: "pointer",
+    letterSpacing: "0.02em",
+    opacity: 0.5,
+  };
+
   return (
     <div
       style={{ display: "flex", alignItems: "center", gap: 2, width: "100%" }}
@@ -1407,47 +1453,15 @@ function EditInput({
         }}
         onBlur={commit}
         onClick={(e) => e.stopPropagation()}
-        style={{
-          flex: 1,
-          minWidth: 0,
-          height: ROW_H - 4,
-          padding: "0 4px",
-          fontSize: 12,
-          fontFamily: "inherit",
-          background: isNull
-            ? "var(--vscode-input-background)"
-            : "var(--vscode-input-background)",
-          color: isNull
-            ? "var(--vscode-disabledForeground)"
-            : "var(--vscode-input-foreground)",
-          border: "1px solid var(--vscode-focusBorder)",
-          borderRadius: 2,
-          outline: "none",
-          boxSizing: "border-box",
-          opacity: isNull ? 0.5 : 1,
-        }}
+        style={inputStyle}
       />
       {nullable && (
         <button
           data-null-btn="1"
           onMouseDown={(e) => e.preventDefault()}
-          onClick={() => onCommit(null as any)}
+          onClick={() => onCommit(NULL_SENTINEL)}
           title="Set field to NULL"
-          style={{
-            flexShrink: 0,
-            height: "100%",
-            padding: "0 5px",
-            fontSize: 9,
-            fontStyle: "italic",
-            fontFamily: "inherit",
-            background: "transparent",
-            color: "var(--vscode-badge-foreground)",
-            border: "none",
-            borderRadius: 2,
-            cursor: "pointer",
-            letterSpacing: "0.02em",
-            opacity: 0.5,
-          }}
+          style={nullBtnStyle}
         >
           NULL
         </button>
@@ -1474,7 +1488,12 @@ function CellDisplay({
   const isBoolVal =
     typeof value === "boolean" ||
     (isBoolean &&
-      (value === 0 || value === 1 || value === "0" || value === "1"));
+      (value === 0 ||
+        value === 1 ||
+        value === "0" ||
+        value === "1" ||
+        value === "true" ||
+        value === "false"));
   if (isBoolVal) {
     const boolVal =
       value === true || value === 1 || value === "1" || value === "true";
