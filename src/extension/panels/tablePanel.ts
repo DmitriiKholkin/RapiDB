@@ -467,7 +467,7 @@ export class TablePanel {
   <meta http-equiv="Content-Security-Policy"
     content="default-src 'none';
              script-src 'nonce-${nonce}' ${webview.cspSource};
-             style-src ${webview.cspSource} 'nonce-${nonce}';
+             style-src ${webview.cspSource} 'unsafe-inline';
              font-src ${webview.cspSource} data:;
              img-src ${webview.cspSource} https: data:;" />
   <title>${this.isView ? "View" : "Table"} — ${escapeHtml(this.table)}</title>

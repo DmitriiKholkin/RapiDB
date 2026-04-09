@@ -533,7 +533,7 @@ export class QueryPanel {
     content="default-src 'none';
              worker-src blob:;
              script-src 'nonce-${nonce}' ${webview.cspSource};
-             style-src ${webview.cspSource} 'nonce-${nonce}';
+             style-src ${webview.cspSource} 'unsafe-inline';
              font-src ${webview.cspSource} data:;
              img-src ${webview.cspSource} https: data:;" /> 
   <title>RapiDB Query</title>
