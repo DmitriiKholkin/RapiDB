@@ -195,6 +195,7 @@ function isDatetimeWithTime(
       ct === "datetime2" ||
       ct === "smalldatetime" ||
       ct === "datetimeoffset" ||
+      ct === "time" ||
       ct.startsWith("datetime")
     );
   }
@@ -257,6 +258,45 @@ function isoToLocalDateStr(iso: string): string | null {
   const m = String(d.getUTCMonth() + 1).padStart(2, "0");
   const day = String(d.getUTCDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
+}
+
+function normalizeCidrValue(val: string): string {
+  const m = val
+    .trim()
+    .match(/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\/(\d{1,2})$/);
+  if (!m) return val;
+  const prefix = parseInt(m[2], 10);
+  if (prefix < 0 || prefix > 32) return val;
+  const parts = m[1].split(".").map(Number);
+  if (parts.some((p) => p < 0 || p > 255)) return val;
+  const mask =
+    prefix === 0 ? 0 : ((0xffffffff << (32 - prefix)) & 0xffffffff) >>> 0;
+  const ipNum =
+    (((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0) &
+    mask;
+  const masked = [
+    (ipNum >>> 24) & 0xff,
+    (ipNum >>> 16) & 0xff,
+    (ipNum >>> 8) & 0xff,
+    ipNum & 0xff,
+  ].join(".");
+  return `${masked}/${prefix}`;
+}
+
+function jsonToPgCircle(val: string): string {
+  const trimmed = val.trim();
+  if (!trimmed.startsWith("{")) return trimmed;
+  try {
+    const obj = JSON.parse(trimmed) as Record<string, unknown>;
+    if (
+      typeof obj.x === "number" &&
+      typeof obj.y === "number" &&
+      typeof obj.radius === "number"
+    ) {
+      return `<(${obj.x},${obj.y}),${obj.radius}>`;
+    }
+  } catch {}
+  return trimmed;
 }
 
 function coerceValue(
@@ -378,7 +418,71 @@ function coerceValue(
     return value;
   }
 
+  if (dbType === "pg" && colType) {
+    const ct = colType.toLowerCase().split("(")[0].trim();
+    if (ct === "cidr") {
+      return normalizeCidrValue(value);
+    }
+    if (ct === "circle") {
+      return jsonToPgCircle(value);
+    }
+  }
+
   return value;
+}
+
+function isNumericCompareUnsafe(
+  colType: string,
+  dbType: ConnectionConfig["type"],
+): boolean {
+  const ct = colType.toLowerCase().split("(")[0].trim();
+
+  if (dbType === "pg") {
+    return (
+      ct === "date" ||
+      ct === "time" ||
+      ct === "timetz" ||
+      ct === "boolean" ||
+      ct === "bool" ||
+      ct === "uuid" ||
+      ct === "inet" ||
+      ct === "cidr" ||
+      ct === "macaddr" ||
+      ct === "macaddr8" ||
+      ct === "bit" ||
+      ct === "varbit" ||
+      ct === "oid" ||
+      ct === "xid" ||
+      ct === "cid" ||
+      colType.toLowerCase().endsWith("[]") ||
+      colType.toLowerCase().startsWith("_") ||
+      colType.toLowerCase() === "array"
+    );
+  }
+
+  if (dbType === "mssql") {
+    return (
+      ct === "bit" ||
+      ct === "date" ||
+      ct === "time" ||
+      ct === "datetime" ||
+      ct === "datetime2" ||
+      ct === "smalldatetime" ||
+      ct === "datetimeoffset"
+    );
+  }
+
+  if (dbType === "mysql") {
+    return (
+      ct === "date" || ct === "datetime" || ct === "timestamp" || ct === "year"
+    );
+  }
+
+  if (dbType === "oracle") {
+    return ct === "date" || ct.startsWith("timestamp");
+  }
+
+  return false;
 }
 
 function buildEffectiveOrderBy(
@@ -489,17 +593,14 @@ function buildWhere(
       const isDateCol = colType === "date";
       const isTextual =
         colType.includes("json") ||
-        colType.includes("text") || // text, ntext, tinytext, mediumtext, longtext, citext
-        colType.includes("char") || // char, varchar, nchar, nvarchar
-        colType.includes("clob") || // clob, nclob
+        colType.includes("text") ||
+        colType.includes("char") ||
+        colType.includes("clob") ||
         colType.includes("string") ||
         colType === "xml" ||
-        // MySQL ENUM/SET store string values — numeric filter would match by ordinal position
         colType.startsWith("enum") ||
         colType.startsWith("set(") ||
-        // MySQL BLOB family — stored as binary, LIKE on hex repr is more useful than numeric =
         colType.includes("blob") ||
-        // MSSQL uniqueidentifier (GUID) — looks like UUID, never numeric
         colType === "uniqueidentifier";
       const isPgGeometric =
         type === "pg" && PG_GEOMETRIC_TYPES.has(colType.split("(")[0].trim());
@@ -545,7 +646,15 @@ function buildWhere(
         }
       }
 
-      if (!isTextual && !isPgGeometric && !isNaN(Number(val)) && val !== "") {
+      const numericUnsafe = isNumericCompareUnsafe(colType, type);
+
+      if (
+        !isTextual &&
+        !isPgGeometric &&
+        !numericUnsafe &&
+        !isNaN(Number(val)) &&
+        val !== ""
+      ) {
         params.push(val);
         if (type === "pg") {
           return `${col} = $${startIndex + params.length - 1}`;
@@ -625,9 +734,6 @@ function buildWhere(
         return `UPPER(CAST(${col} AS VARCHAR2(4000))) LIKE ?`;
       }
       if (type === "mssql") {
-        // For date/datetime columns, CAST(col AS NVARCHAR) is locale-dependent
-        // (e.g. produces 'Jan 15 2024' instead of '2024-01-15'). Use CONVERT
-        // with explicit ISO style codes so the string is predictable.
         if (isDateCol) {
           let dateStr: string | null = null;
           if (DATE_ONLY_RE.test(val)) {
@@ -637,13 +743,10 @@ function buildWhere(
           }
           if (dateStr) {
             params.push(dateStr);
-            // Style 23 → 'yyyy-mm-dd', always ISO regardless of server locale
             return `CONVERT(NVARCHAR(10), ${col}, 23) = ?`;
           }
-          // Non-date-like input: fall through to LIKE below
         }
         if (isDatetimeWithTime(colType, "mssql")) {
-          // Style 121 → 'yyyy-mm-dd hh:mi:ss.mmm' (24h, always ISO)
           const mssqlDtVal = DATETIME_SQL_RE.test(finalVal)
             ? `${finalVal}%`
             : `%${finalVal}%`;

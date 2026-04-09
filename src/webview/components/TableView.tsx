@@ -118,6 +118,7 @@ export function TableView({
   const [totalCount, setTotalCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [filterError, setFilterError] = useState<string | null>(null);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(initialPageSize);
   const [filters, setFilters] = useState<Record<string, string>>({});
@@ -222,6 +223,7 @@ export function TableView({
         setRows(r);
         setTotalCount(t);
         setLoading(false);
+        setFilterError(null);
         setSelected(new Set());
         setPending(new Map());
         setEditCell(null);
@@ -238,10 +240,16 @@ export function TableView({
         setApplyErr(null);
       },
     );
-    const unError = onMessage<{ error: string }>(
+    const unError = onMessage<{ error: string; isFilterError?: boolean }>(
       "tableError",
-      ({ error: e }) => {
-        setError(e);
+      ({ error: e, isFilterError }) => {
+        if (isFilterError) {
+          setFilterError(e);
+          setRows([]);
+          setTotalCount(0);
+        } else {
+          setError(e);
+        }
         setLoading(false);
       },
     );
@@ -326,6 +334,7 @@ export function TableView({
       return;
     }
     const t = setTimeout(() => {
+      setFilterError(null);
       setPage(1);
       setDebFilters(filters);
     }, DEBOUNCE);
@@ -615,6 +624,42 @@ export function TableView({
         overflow: "hidden",
       }}
     >
+      {filterError && (
+        <div
+          style={{
+            flexShrink: 0,
+            padding: "6px 12px",
+            fontSize: 12,
+            background:
+              "var(--vscode-inputValidation-warningBackground, rgba(180,120,0,0.15))",
+            borderBottom:
+              "1px solid var(--vscode-inputValidation-warningBorder, rgba(180,120,0,0.4))",
+            color: "var(--vscode-editorWarning-foreground, #CCA700)",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+          }}
+        >
+          <span style={{ fontWeight: 600 }}>⚠ Filter:</span>
+          <span style={{ flex: 1 }}>{filterError}</span>
+          <button
+            style={{
+              background: "none",
+              border: "none",
+              cursor: "pointer",
+              color: "inherit",
+              opacity: 0.7,
+              fontSize: 14,
+              lineHeight: 1,
+              padding: "0 2px",
+            }}
+            title="Dismiss"
+            onClick={() => setFilterError(null)}
+          >
+            ×
+          </button>
+        </div>
+      )}
       {}
       <div
         style={{
