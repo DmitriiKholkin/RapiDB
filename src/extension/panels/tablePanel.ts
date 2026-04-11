@@ -215,6 +215,12 @@ export class TablePanel {
       case "applyChanges": {
         const { updates } = msg.payload ?? {};
         try {
+          const cols = await this.svc.getColumns(
+            this.connectionId,
+            this.database,
+            this.schema,
+            this.table,
+          );
           const result = await applyChangesTransactional(
             this.cm,
             this.connectionId,
@@ -222,6 +228,7 @@ export class TablePanel {
             this.schema,
             this.table,
             (updates ?? []) as RowUpdate[],
+            cols,
           );
           send("applyResult", result);
         } catch (err: any) {

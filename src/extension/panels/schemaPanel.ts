@@ -7,6 +7,7 @@ export class SchemaPanel {
 
   private readonly panel: vscode.WebviewPanel;
   private readonly cm: ConnectionManager;
+  private readonly context: vscode.ExtensionContext;
   private readonly connectionId: string;
   private readonly database: string;
   private readonly schema: string;
@@ -22,6 +23,7 @@ export class SchemaPanel {
     table: string,
   ) {
     this.panel = panel;
+    this.context = context;
     this.cm = cm;
     this.connectionId = connectionId;
     this.database = database;
@@ -152,7 +154,7 @@ export class SchemaPanel {
       case "openRelatedSchema": {
         const { table, schema, database } = msg.payload ?? {};
         SchemaPanel.createOrShow(
-          (this as any)._context,
+          this.context,
           this.cm,
           this.connectionId,
           database ?? this.database,
@@ -165,8 +167,6 @@ export class SchemaPanel {
   }
 
   private buildHtml(context: vscode.ExtensionContext): string {
-    (this as any)._context = context;
-
     const webview = this.panel.webview;
 
     const webviewJs = webview.asWebviewUri(

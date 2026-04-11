@@ -88,18 +88,18 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
   private _refreshTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly connectionManager: ConnectionManager) {
-    const scheduleRefresh = () => {
+    const scheduleRefresh = (clearConnectionId?: string) => {
       if (this._refreshTimer !== null) {
         clearTimeout(this._refreshTimer);
       }
       this._refreshTimer = setTimeout(() => {
         this._refreshTimer = null;
-        this.refresh();
+        this.refresh(undefined, clearConnectionId);
       }, 50);
     };
     this._subscriptions.push(
       connectionManager.onDidConnect(() => scheduleRefresh()),
-      connectionManager.onDidDisconnect(() => scheduleRefresh()),
+      connectionManager.onDidDisconnect((id) => scheduleRefresh(id)),
       connectionManager.onDidChangeConnections(() => scheduleRefresh()),
     );
   }
@@ -119,8 +119,16 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     };
   }
 
-  refresh(node?: RapiDBNode): void {
-    this._objectsCache.clear();
+  refresh(node?: RapiDBNode, clearConnectionId?: string): void {
+    if (clearConnectionId) {
+      for (const key of this._objectsCache.keys()) {
+        if (key.startsWith(`${clearConnectionId}::`)) {
+          this._objectsCache.delete(key);
+        }
+      }
+    } else {
+      this._objectsCache.clear();
+    }
     this._onDidChangeTreeData.fire(node ?? undefined);
   }
 

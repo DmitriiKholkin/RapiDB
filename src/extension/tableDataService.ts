@@ -773,10 +773,10 @@ function buildWhere(
   return { clause: `WHERE ${conditions.join(" AND ")}`, params };
 }
 
+const _colCache = new Map<string, ColumnDef[]>();
+
 export class TableDataService {
   constructor(private readonly cm: ConnectionManager) {}
-
-  private readonly _colCache = new Map<string, ColumnDef[]>();
 
   private colCacheKey(
     connectionId: string,
@@ -788,9 +788,9 @@ export class TableDataService {
   }
 
   clearForConnection(connectionId: string): void {
-    for (const key of this._colCache.keys()) {
+    for (const key of _colCache.keys()) {
       if (key.startsWith(`${connectionId}::`)) {
-        this._colCache.delete(key);
+        _colCache.delete(key);
       }
     }
   }
@@ -811,7 +811,7 @@ export class TableDataService {
     table: string,
   ): Promise<ColumnDef[]> {
     const key = this.colCacheKey(connectionId, database, schema, table);
-    const cached = this._colCache.get(key);
+    const cached = _colCache.get(key);
     if (cached) {
       return cached;
     }
@@ -827,7 +827,7 @@ export class TableDataService {
       defaultValue: c.defaultValue,
       isBoolean: isBooleanLikeType(c.type, cfg.type),
     }));
-    this._colCache.set(key, result);
+    _colCache.set(key, result);
     return result;
   }
 
@@ -840,6 +840,7 @@ export class TableDataService {
     pageSize: number,
     filters: Filter[],
     sort: SortConfig | null = null,
+    skipCount = false,
   ): Promise<TablePage> {
     const { cfg, drv } = this.conn(connectionId);
     const t = cfg.type;
@@ -856,20 +857,24 @@ export class TableDataService {
     const effectiveOrderBy = buildEffectiveOrderBy(sort, cols, t);
 
     let totalCount = 0;
-    try {
-      const countSql = `SELECT COUNT(*) AS cnt FROM ${qt} ${where}`;
-      const countRes = await drv.query(countSql, whereParams);
+    if (!skipCount) {
+      try {
+        const countSql = `SELECT COUNT(*) AS cnt FROM ${qt} ${where}`;
+        const countRes = await drv.query(countSql, whereParams);
 
-      const countRow = countRes.rows[0] as Record<string, unknown> | undefined;
+        const countRow = countRes.rows[0] as
+          | Record<string, unknown>
+          | undefined;
 
-      totalCount = Number(
-        countRow?.__col_0 ??
-          countRow?.cnt ??
-          countRow?.CNT ??
-          countRow?.count ??
-          0,
-      );
-    } catch {}
+        totalCount = Number(
+          countRow?.__col_0 ??
+            countRow?.cnt ??
+            countRow?.CNT ??
+            countRow?.count ??
+            0,
+        );
+      } catch {}
+    }
 
     let dataSql: string;
     let dataParams: unknown[];
@@ -1071,12 +1076,52 @@ export class TableDataService {
       table,
     );
 
-    for (const rawPkValues of pkValuesList) {
-      const pkValues = coerceRecord(rawPkValues, t, colsDef);
-      const pkCols = Object.keys(pkValues);
-      if (pkCols.length === 0) {
-        continue;
+    const coercedList = pkValuesList
+      .map((raw) => coerceRecord(raw, t, colsDef))
+      .filter((r) => Object.keys(r).length > 0);
+
+    if (coercedList.length === 0) {
+      return;
+    }
+
+    const firstPkCols = Object.keys(coercedList[0]);
+    const isSinglePk =
+      firstPkCols.length === 1 &&
+      coercedList.every(
+        (r) =>
+          Object.keys(r).length === 1 && Object.keys(r)[0] === firstPkCols[0],
+      );
+
+    if (isSinglePk) {
+      const pkCol = firstPkCols[0];
+      const values = coercedList.map((r) => r[pkCol]);
+
+      const CHUNK = t === "oracle" ? 1000 : values.length;
+
+      for (let i = 0; i < values.length; i += CHUNK) {
+        const chunk = values.slice(i, i + CHUNK);
+
+        if (t === "pg") {
+          const placeholders = chunk.map((_, j) => `$${j + 1}`).join(", ");
+          await drv.query(
+            `DELETE FROM ${qt} WHERE ${quoteId(pkCol, t)} IN (${placeholders})`,
+            chunk,
+          );
+        } else {
+          const placeholders = chunk.map(() => "?").join(", ");
+          await drv.query(
+            `DELETE FROM ${qt} WHERE ${quoteId(pkCol, t)} IN (${placeholders})`,
+            chunk,
+          );
+        }
       }
+      return;
+    }
+
+    const operations: import("./dbDrivers/types").TransactionOperation[] = [];
+
+    for (const pkValues of coercedList) {
+      const pkCols = Object.keys(pkValues);
       const params: unknown[] = [];
       let whereParts: string[];
 
@@ -1092,16 +1137,13 @@ export class TableDataService {
         });
       }
 
-      const result = await drv.query(
-        `DELETE FROM ${qt} WHERE ${whereParts.join(" AND ")}`,
+      operations.push({
+        sql: `DELETE FROM ${qt} WHERE ${whereParts.join(" AND ")}`,
         params,
-      );
-      if (result.affectedRows === 0) {
-        throw new Error(
-          "Row not found — the row may have been modified or deleted by another user",
-        );
-      }
+      });
     }
+
+    await drv.runTransaction(operations);
   }
 
   async *exportAll(
@@ -1124,6 +1166,7 @@ export class TableDataService {
         chunkSize,
         filters,
         sort,
+        true,
       );
       if (result.rows.length === 0) {
         break;
@@ -1219,6 +1262,7 @@ export async function applyChangesTransactional(
   schema: string,
   table: string,
   updates: RowUpdate[],
+  cols?: ColumnDef[],
 ): Promise<ApplyResult> {
   if (updates.length === 0) {
     return { success: true };
@@ -1231,8 +1275,12 @@ export async function applyChangesTransactional(
   }
 
   const operations: import("./dbDrivers/types").TransactionOperation[] = [];
-  const svc = new TableDataService(cm);
-  const cols = await svc.getColumns(connectionId, database, schema, table);
+
+  let resolvedCols = cols;
+  if (!resolvedCols) {
+    const svc = new TableDataService(cm);
+    resolvedCols = await svc.getColumns(connectionId, database, schema, table);
+  }
 
   for (const { primaryKeys, changes } of updates) {
     const op = buildUpdateRowSql(
@@ -1242,7 +1290,7 @@ export async function applyChangesTransactional(
       table,
       primaryKeys,
       changes,
-      cols,
+      resolvedCols,
     );
     if (op) {
       operations.push({

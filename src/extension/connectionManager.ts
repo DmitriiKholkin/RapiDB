@@ -44,6 +44,38 @@ export interface BookmarkEntry {
   savedAt: string;
 }
 
+export interface SchemaTableEntry {
+  schema: string;
+  table: string;
+  columns: { name: string; type: string }[];
+}
+
+interface SchemaCacheEntry {
+  tables: SchemaTableEntry[];
+  loading: Promise<void> | null;
+}
+
+async function pMapWithLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  const indexed = items.map((item, i) => ({ item, i }));
+  const workers = Array.from(
+    { length: Math.min(limit, indexed.length) },
+    async () => {
+      while (indexed.length > 0) {
+        const next = indexed.shift();
+        if (!next) break;
+        results[next.i] = await fn(next.item).catch(() => [] as unknown as R);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return results;
+}
+
 const HISTORY_STATE_KEY = "rapidb.queryHistory";
 const BOOKMARKS_STATE_KEY = "rapidb.bookmarks";
 const HISTORY_LIMIT_DEFAULT = 100;
@@ -69,7 +101,11 @@ export class ConnectionManager {
   readonly onDidConnect: vscode.Event<void>;
   private readonly _onDidConnect = new vscode.EventEmitter<void>();
 
+  readonly onDidSchemaLoad: vscode.Event<string>;
+  private readonly _onDidSchemaLoad = new vscode.EventEmitter<string>();
+
   private _connectionsCache: ConnectionConfig[] | null = null;
+  private readonly _schemaCacheMap = new Map<string, SchemaCacheEntry>();
 
   constructor(context: vscode.ExtensionContext) {
     this.context = context;
@@ -78,6 +114,7 @@ export class ConnectionManager {
     this.onDidChangeBookmarks = this._onDidChangeBookmarks.event;
     this.onDidConnect = this._onDidConnect.event;
     this.onDidDisconnect = this._onDidDisconnect.event;
+    this.onDidSchemaLoad = this._onDidSchemaLoad.event;
 
     vscode.workspace.onDidChangeConfiguration(
       async (e) => {
@@ -243,6 +280,8 @@ export class ConnectionManager {
       throw err;
     }
     this.driverMap.set(id, driver);
+    this._schemaCacheMap.delete(id);
+    this._startSchemaLoad(id);
     this._onDidConnect.fire();
   }
 
@@ -253,6 +292,7 @@ export class ConnectionManager {
         await driver.disconnect();
       } catch {}
       this.driverMap.delete(id);
+      this._schemaCacheMap.delete(id);
       this._onDidDisconnect.fire(id);
     }
   }
@@ -263,6 +303,116 @@ export class ConnectionManager {
 
   getDriver(id: string): IDBDriver | undefined {
     return this.driverMap.get(id);
+  }
+
+  getSchema(connectionId: string): SchemaTableEntry[] {
+    return this._schemaCacheMap.get(connectionId)?.tables ?? [];
+  }
+
+  async reloadSchema(connectionId: string): Promise<void> {
+    const entry = this._schemaCacheMap.get(connectionId);
+    if (entry) {
+      entry.tables = [];
+      entry.loading = null;
+    }
+    this._startSchemaLoad(connectionId);
+    const fresh = this._schemaCacheMap.get(connectionId);
+    if (fresh?.loading) {
+      await fresh.loading;
+    }
+  }
+
+  private _startSchemaLoad(connectionId: string): void {
+    const driver = this.getDriver(connectionId);
+    const config = this.getConnection(connectionId);
+    if (!driver || !config) {
+      return;
+    }
+
+    let entry = this._schemaCacheMap.get(connectionId);
+    if (!entry) {
+      entry = { tables: [], loading: null };
+      this._schemaCacheMap.set(connectionId, entry);
+    }
+    if (entry.loading) {
+      return;
+    }
+
+    const capturedEntry = entry;
+    capturedEntry.loading = this._loadSchemaInternal(driver, config)
+      .then((tables) => {
+        const live = this._schemaCacheMap.get(connectionId);
+        if (live === capturedEntry) {
+          live.tables = tables;
+          live.loading = null;
+        }
+        this._onDidSchemaLoad.fire(connectionId);
+      })
+      .catch(() => {
+        const live = this._schemaCacheMap.get(connectionId);
+        if (live === capturedEntry) {
+          live.loading = null;
+        }
+      });
+  }
+
+  private async _loadSchemaInternal(
+    driver: IDBDriver,
+    config: ConnectionConfig,
+  ): Promise<SchemaTableEntry[]> {
+    const result: SchemaTableEntry[] = [];
+    const configuredDb = config.database || (config.filePath ? "main" : "");
+    const allDbs = await driver.listDatabases().catch(() => []);
+    const primaryDb = configuredDb || allDbs[0]?.name || "";
+    if (!primaryDb) {
+      return result;
+    }
+
+    const primarySchemas = await driver
+      .listSchemas(primaryDb)
+      .catch(() => [{ name: primaryDb }]);
+
+    for (const schema of primarySchemas.slice(0, 10)) {
+      const schemaLabel = primarySchemas.length <= 1 ? primaryDb : schema.name;
+      const objects = await driver
+        .listObjects(primaryDb, schema.name)
+        .catch(() => []);
+      const tables = objects
+        .filter((o) => o.type === "table" || o.type === "view")
+        .slice(0, 100);
+
+      const allCols = await pMapWithLimit(tables, 5, (tbl) =>
+        driver.describeTable(primaryDb, schema.name, tbl.name).catch(() => []),
+      );
+
+      tables.forEach((tbl, i) => {
+        result.push({
+          schema: schemaLabel,
+          table: tbl.name,
+          columns: allCols[i].map((c) => ({ name: c.name, type: c.type })),
+        });
+      });
+    }
+
+    const otherDbs = allDbs.filter((d) => d.name !== primaryDb);
+    for (const db of otherDbs.slice(0, 20)) {
+      const schemas = await driver
+        .listSchemas(db.name)
+        .catch(() => [{ name: db.name }]);
+      for (const schema of schemas.slice(0, 5)) {
+        const objects = await driver
+          .listObjects(db.name, schema.name)
+          .catch(() => []);
+        const tables = objects.filter(
+          (o) => o.type === "table" || o.type === "view",
+        );
+        for (const tbl of tables.slice(0, 50)) {
+          result.push({ schema: db.name, table: tbl.name, columns: [] });
+        }
+      }
+    }
+
+    return result;
   }
 
   async testConnection(

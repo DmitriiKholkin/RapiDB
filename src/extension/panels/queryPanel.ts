@@ -61,7 +61,19 @@ export class QueryPanel {
       this.pushConnections();
       this.syncTitle();
     });
-    this.panel.onDidDispose(() => cfgWatcher.dispose());
+
+    const schemaWatcher = connectionManager.onDidSchemaLoad((cid) => {
+      if (
+        cid === this.activeConnectionId ||
+        cid === this.originalConnectionId
+      ) {
+        this._pushSchemaAsync(cid);
+      }
+    });
+    this.panel.onDidDispose(() => {
+      cfgWatcher.dispose();
+      schemaWatcher.dispose();
+    });
   }
 
   static disposeAll(): void {
@@ -119,6 +131,14 @@ export class QueryPanel {
   private syncTitle(): void {
     const conn = this.connectionManager.getConnection(this.activeConnectionId);
     this.panel.title = `Query — ${conn?.name ?? this.activeConnectionId}`;
+  }
+
+  private _pushSchemaAsync(connectionId: string): void {
+    const tables = this.connectionManager.getSchema(connectionId);
+    this.panel.webview.postMessage({
+      type: "schema",
+      payload: { connectionId, tables },
+    });
   }
 
   private pushConnections(): void {
@@ -247,27 +267,23 @@ export class QueryPanel {
           break;
         }
 
-        const driver = this.connectionManager.getDriver(connectionId);
-        if (!driver) {
-          this.panel.webview.postMessage({
-            type: "schema",
-            payload: { connectionId, tables: [] },
-          });
-          break;
-        }
+        this._pushSchemaAsync(connectionId);
+        break;
+      }
 
-        try {
-          const schema = await this.buildSchema(driver, connectionId);
+      case "refreshSchema": {
+        const connectionId: string =
+          msg.payload?.connectionId || this.activeConnectionId;
 
-          this.panel.webview.postMessage({
-            type: "schema",
-            payload: { connectionId, tables: schema },
-          });
-        } catch {
-          this.panel.webview.postMessage({
-            type: "schema",
-            payload: { connectionId, tables: [] },
-          });
+        await this.connectionManager.reloadSchema(connectionId);
+
+        for (const p of QueryPanel.panels.values()) {
+          if (
+            p.activeConnectionId === connectionId ||
+            p.originalConnectionId === connectionId
+          ) {
+            p._pushSchemaAsync(connectionId);
+          }
         }
         break;
       }
@@ -422,86 +438,6 @@ export class QueryPanel {
         break;
       }
     }
-  }
-
-  private async buildSchema(
-    driver: import("../dbDrivers/types").IDBDriver,
-    connectionId: string,
-  ): Promise<
-    {
-      schema: string;
-      table: string;
-      columns: { name: string; type: string }[];
-    }[]
-  > {
-    const result: {
-      schema: string;
-      table: string;
-      columns: { name: string; type: string }[];
-    }[] = [];
-
-    const config = this.connectionManager.getConnection(connectionId);
-    const configuredDb = config?.database || (config?.filePath ? "main" : "");
-
-    const allDbs = await driver.listDatabases().catch(() => []);
-
-    const primaryDb = configuredDb || allDbs[0]?.name || "";
-    if (!primaryDb) {
-      return result;
-    }
-
-    const primarySchemas = await driver
-      .listSchemas(primaryDb)
-      .catch(() => [{ name: primaryDb }]);
-    for (const schema of primarySchemas.slice(0, 10)) {
-      const schemaLabel = primarySchemas.length <= 1 ? primaryDb : schema.name;
-      const objects = await driver
-        .listObjects(primaryDb, schema.name)
-        .catch(() => []);
-      const tables = objects
-        .filter((o) => o.type === "table" || o.type === "view")
-        .slice(0, 100);
-
-      const allCols = await Promise.all(
-        tables.map((tbl) =>
-          driver
-            .describeTable(primaryDb, schema.name, tbl.name)
-            .catch(() => []),
-        ),
-      );
-
-      tables.forEach((tbl, i) => {
-        result.push({
-          schema: schemaLabel,
-          table: tbl.name,
-          columns: allCols[i].map((c) => ({ name: c.name, type: c.type })),
-        });
-      });
-    }
-
-    const otherDbs = allDbs.filter((d) => d.name !== primaryDb);
-    for (const db of otherDbs.slice(0, 20)) {
-      const schemas = await driver
-        .listSchemas(db.name)
-        .catch(() => [{ name: db.name }]);
-      for (const schema of schemas.slice(0, 5)) {
-        const objects = await driver
-          .listObjects(db.name, schema.name)
-          .catch(() => []);
-        const tables = objects.filter(
-          (o) => o.type === "table" || o.type === "view",
-        );
-        for (const tbl of tables.slice(0, 50)) {
-          result.push({
-            schema: db.name,
-            table: tbl.name,
-            columns: [],
-          });
-        }
-      }
-    }
-
-    return result;
   }
 
   private buildHtml(

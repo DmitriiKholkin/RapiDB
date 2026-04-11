@@ -1,3 +1,4 @@
+// biome-ignore lint/style/useImportType: <explanation>
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   type QueryResult,
@@ -95,6 +96,8 @@ export function QueryView({
   } = useConnectionStore();
   const { setSchema, schemaByConnection } = useSchemaStore();
 
+  const schemaFetchedRef = useRef<Set<string>>(new Set());
+
   const [editorHeight, setEditorHeight] = useState(DEFAULT_EDITOR_H);
   const [isResizing, setIsResizing] = useState(false);
   const [bookmarked, setBookmarked] = useState(initialIsBookmarked);
@@ -137,11 +140,20 @@ export function QueryView({
   }, [connectionId]);
 
   useEffect(() => {
-    if (!activeConnectionId) {
+    const id = activeConnectionId || connectionId;
+    if (!id) {
       return;
     }
-
-    postMessage("getSchema", { connectionId: activeConnectionId });
+    if (schemaFetchedRef.current.has(id)) {
+      return;
+    }
+    const already = useSchemaStore.getState().schemaByConnection[id];
+    if (already !== undefined) {
+      schemaFetchedRef.current.add(id);
+      return;
+    }
+    schemaFetchedRef.current.add(id);
+    postMessage("getSchema", { connectionId: id });
   }, [activeConnectionId]);
 
   useEffect(() => {
@@ -188,10 +200,12 @@ export function QueryView({
   const handleConnectionChange = useCallback(
     (newId: string) => {
       setActiveConnection(newId);
-
       postMessage("activeConnectionChanged", { connectionId: newId });
 
-      postMessage("getSchema", { connectionId: newId });
+      const already = useSchemaStore.getState().schemaByConnection[newId];
+      if (already === undefined) {
+        schemaFetchedRef.current.delete(newId);
+      }
     },
     [setActiveConnection],
   );
@@ -397,6 +411,22 @@ export function QueryView({
         </button>
 
         <div style={{ flex: 1 }} />
+
+        <button
+          style={btnGhostStyle(false)}
+          onClick={() => {
+            const id = activeConnectionId || connectionId;
+            schemaFetchedRef.current.delete(id);
+            postMessage("refreshSchema", { connectionId: id });
+          }}
+          title="Refresh schema for SQL autocomplete"
+        >
+          <>
+            <Icon name="refresh" size={13} style={{ marginRight: 4 }} />
+            Refresh schema
+          </>
+        </button>
+
         <span style={{ fontSize: 11, opacity: 0.35 }}>Ctrl+Enter</span>
       </div>
 
