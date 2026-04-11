@@ -773,9 +773,9 @@ function buildWhere(
   return { clause: `WHERE ${conditions.join(" AND ")}`, params };
 }
 
-const _colCache = new Map<string, ColumnDef[]>();
-
 export class TableDataService {
+  private static readonly _colCache = new Map<string, ColumnDef[]>();
+
   constructor(private readonly cm: ConnectionManager) {}
 
   private colCacheKey(
@@ -788,9 +788,9 @@ export class TableDataService {
   }
 
   clearForConnection(connectionId: string): void {
-    for (const key of _colCache.keys()) {
+    for (const key of TableDataService._colCache.keys()) {
       if (key.startsWith(`${connectionId}::`)) {
-        _colCache.delete(key);
+        TableDataService._colCache.delete(key);
       }
     }
   }
@@ -811,7 +811,7 @@ export class TableDataService {
     table: string,
   ): Promise<ColumnDef[]> {
     const key = this.colCacheKey(connectionId, database, schema, table);
-    const cached = _colCache.get(key);
+    const cached = TableDataService._colCache.get(key);
     if (cached) {
       return cached;
     }
@@ -827,7 +827,7 @@ export class TableDataService {
       defaultValue: c.defaultValue,
       isBoolean: isBooleanLikeType(c.type, cfg.type),
     }));
-    _colCache.set(key, result);
+    TableDataService._colCache.set(key, result);
     return result;
   }
 
@@ -873,7 +873,12 @@ export class TableDataService {
             countRow?.count ??
             0,
         );
-      } catch {}
+      } catch (err: any) {
+        console.error(
+          "[RapiDB] COUNT query failed, totalCount will be 0:",
+          err?.message ?? err,
+        );
+      }
     }
 
     let dataSql: string;
@@ -1096,7 +1101,7 @@ export class TableDataService {
       const pkCol = firstPkCols[0];
       const values = coercedList.map((r) => r[pkCol]);
 
-      const CHUNK = t === "oracle" ? 1000 : values.length;
+      const CHUNK = 1000;
 
       for (let i = 0; i < values.length; i += CHUNK) {
         const chunk = values.slice(i, i + CHUNK);
@@ -1262,7 +1267,7 @@ export async function applyChangesTransactional(
   schema: string,
   table: string,
   updates: RowUpdate[],
-  cols?: ColumnDef[],
+  cols: ColumnDef[],
 ): Promise<ApplyResult> {
   if (updates.length === 0) {
     return { success: true };
@@ -1276,12 +1281,6 @@ export async function applyChangesTransactional(
 
   const operations: import("./dbDrivers/types").TransactionOperation[] = [];
 
-  let resolvedCols = cols;
-  if (!resolvedCols) {
-    const svc = new TableDataService(cm);
-    resolvedCols = await svc.getColumns(connectionId, database, schema, table);
-  }
-
   for (const { primaryKeys, changes } of updates) {
     const op = buildUpdateRowSql(
       config.type,
@@ -1290,7 +1289,7 @@ export async function applyChangesTransactional(
       table,
       primaryKeys,
       changes,
-      resolvedCols,
+      cols,
     );
     if (op) {
       operations.push({

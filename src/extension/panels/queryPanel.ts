@@ -51,7 +51,17 @@ export class QueryPanel {
     this.isBookmarked = isBookmarked ?? false;
     this.panel.webview.html = this.buildHtml(context, initialSql);
     this.panel.webview.onDidReceiveMessage(async (msg) => {
-      await this.handleMessage(msg);
+      try {
+        await this.handleMessage(msg);
+      } catch (err: any) {
+        console.error(
+          "[RapiDB] QueryPanel unhandled error:",
+          err?.message ?? err,
+        );
+        vscode.window.showErrorMessage(
+          `[RapiDB] Unexpected error: ${err?.message ?? String(err)}`,
+        );
+      }
     });
 
     const cfgWatcher = vscode.workspace.onDidChangeConfiguration((e) => {
