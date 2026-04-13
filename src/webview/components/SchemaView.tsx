@@ -1,7 +1,7 @@
+// biome-ignore lint/style/useImportType: <explanation>
+import React, { useEffect, useState } from "react";
+import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
-
-import React, { useState, useEffect } from "react";
-import { postMessage, onMessage } from "../utils/messaging";
 
 interface ColumnMeta {
   name: string;
@@ -10,6 +10,7 @@ interface ColumnMeta {
   defaultValue?: string;
   isPrimaryKey: boolean;
   isForeignKey: boolean;
+  isAutoIncrement?: boolean;
 }
 interface IndexMeta {
   name: string;
@@ -73,10 +74,13 @@ export function SchemaView({ connectionId, database, schema, table }: Props) {
       setData(d);
       setLoading(false);
     });
-    const unErr = onMessage<{ error: string }>("schemaError", ({ error: e }) => {
-      setError(e);
-      setLoading(false);
-    });
+    const unErr = onMessage<{ error: string }>(
+      "schemaError",
+      ({ error: e }) => {
+        setError(e);
+        setLoading(false);
+      },
+    );
     postMessage("ready");
     return () => {
       unData();
@@ -136,19 +140,26 @@ export function SchemaView({ connectionId, database, schema, table }: Props) {
 
       {}
       <Section title="Columns" count={columns.length}>
-        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+        <table
+          style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}
+        >
           <thead>
             <tr>
               <th style={th}>Name</th>
               <th style={th}>Type</th>
               <th style={th}>Nullable</th>
               <th style={th}>Default</th>
-              <th style={th}>Keys</th>
+              <th style={th}>Flags</th>
             </tr>
           </thead>
           <tbody>
             {columns.map((col, i) => (
-              <ColRow key={col.name} col={col} index={i} foreignKeys={foreignKeys} />
+              <ColRow
+                key={col.name}
+                col={col}
+                index={i}
+                foreignKeys={foreignKeys}
+              />
             ))}
           </tbody>
         </table>
@@ -157,7 +168,9 @@ export function SchemaView({ connectionId, database, schema, table }: Props) {
       {}
       {foreignKeys.length > 0 && (
         <Section title="Foreign Keys" count={foreignKeys.length}>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+          <table
+            style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}
+          >
             <thead>
               <tr>
                 <th style={th}>Column</th>
@@ -182,7 +195,9 @@ export function SchemaView({ connectionId, database, schema, table }: Props) {
       {}
       {indexes.length > 0 && (
         <Section title="Indexes" count={indexes.length}>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+          <table
+            style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}
+          >
             <thead>
               <tr>
                 <th style={th}>Name</th>
@@ -277,11 +292,34 @@ function ColRow({
 
   const badges: React.ReactNode[] = [];
   if (col.isPrimaryKey) {
-    badges.push(<Badge key="pk" label="PK" color="var(--vscode-charts-yellow, #cca700)" />);
+    badges.push(
+      <Badge
+        key="pk"
+        label="PK"
+        color="var(--vscode-charts-yellow, #cca700)"
+      />,
+    );
   }
   if (col.isForeignKey || foreignKeys.some((fk) => fk.column === col.name)) {
-    badges.push(<Badge key="fk" label="FK" color="var(--vscode-charts-blue, #4fc3f7)" />);
+    badges.push(
+      <Badge key="fk" label="FK" color="var(--vscode-charts-blue, #4fc3f7)" />,
+    );
   }
+  if (col.isAutoIncrement) {
+    badges.push(
+      <Badge
+        key="ai"
+        label="AI"
+        color="var(--vscode-charts-purple, #b48ead)"
+      />,
+    );
+  }
+
+  const rawDefault = col.defaultValue;
+  const displayDefault =
+    rawDefault != null
+      ? rawDefault.replace(/::[A-Za-z_][\w. ]*/g, "").trim()
+      : null;
 
   return (
     <tr
@@ -289,21 +327,39 @@ function ColRow({
       onMouseEnter={() => setHov(true)}
       onMouseLeave={() => setHov(false)}
     >
-      <td style={{ ...td(), fontWeight: col.isPrimaryKey ? 600 : 400 }}>{col.name}</td>
-      <td style={td({ color: "var(--vscode-charts-green, #4ec94e)", opacity: 0.85 })}>
+      <td style={{ ...td(), fontWeight: col.isPrimaryKey ? 600 : 400 }}>
+        {col.name}
+      </td>
+      <td
+        style={td({
+          color: "var(--vscode-charts-green, #4ec94e)",
+          opacity: 0.85,
+        })}
+      >
         {col.type}
       </td>
       <td style={td({ textAlign: "center" })}>
         {col.nullable ? (
           <span style={{ opacity: 0.45, fontSize: 11 }}>NULL</span>
         ) : (
-          <span style={{ color: "var(--vscode-errorForeground)", fontSize: 11, fontWeight: 600 }}>
+          <span
+            style={{
+              color: "var(--vscode-errorForeground)",
+              fontSize: 11,
+              fontWeight: 600,
+            }}
+          >
             NOT NULL
           </span>
         )}
       </td>
-      <td style={td({ opacity: 0.6 })}>
-        {col.defaultValue ?? <span style={{ opacity: 0.3 }}>—</span>}
+      <td
+        style={td({
+          opacity: displayDefault ? 0.85 : 0.3,
+          fontStyle: displayDefault ? "normal" : "italic",
+        })}
+      >
+        {displayDefault ?? "—"}
       </td>
       <td style={td()}>
         <div style={{ display: "flex", gap: 4 }}>{badges}</div>
@@ -359,11 +415,24 @@ function IdxRow({ idx, isEven }: { idx: IndexMeta; isEven: boolean }) {
   const typeBadges: React.ReactNode[] = [];
   if (idx.primary)
     typeBadges.push(
-      <Badge key="pk" label="PRIMARY" color="var(--vscode-charts-yellow, #cca700)" />,
+      <Badge
+        key="pk"
+        label="PRIMARY"
+        color="var(--vscode-charts-yellow, #cca700)"
+      />,
     );
   else if (idx.unique)
-    typeBadges.push(<Badge key="u" label="UNIQUE" color="var(--vscode-charts-blue, #4fc3f7)" />);
-  else typeBadges.push(<Badge key="i" label="INDEX" color="var(--vscode-disabledForeground)" />);
+    typeBadges.push(
+      <Badge
+        key="u"
+        label="UNIQUE"
+        color="var(--vscode-charts-blue, #4fc3f7)"
+      />,
+    );
+  else
+    typeBadges.push(
+      <Badge key="i" label="INDEX" color="var(--vscode-disabledForeground)" />,
+    );
 
   return (
     <tr

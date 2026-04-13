@@ -168,6 +168,8 @@ export function TableView({
   const pendingCount = pendingEdits.size;
 
   const initializedRef = useRef(false);
+  const fetchEpochRef = useRef(0);
+  const [initTick, setInitTick] = useState(0);
 
   const pageRef = useRef(page);
   const pageSizeRef = useRef(pageSize);
@@ -178,11 +180,13 @@ export function TableView({
 
   const fetchPage = useCallback(() => {
     if (!initializedRef.current) return;
+    const epoch = ++fetchEpochRef.current;
     setLoading(true);
     const activeFilters = Object.entries(debFilRef.current)
       .filter(([, v]) => v.trim())
       .map(([column, value]) => ({ column, value }));
     postMessage("fetchPage", {
+      fetchId: epoch,
       page: pageRef.current,
       pageSize: pageSizeRef.current,
       filters: activeFilters,
@@ -201,58 +205,62 @@ export function TableView({
       setColumns(cols);
       setPkCols(primaryKeyColumns);
 
-      fetchPage();
+      setInitTick((t) => t + 1);
     });
-    const unData = onMessage<{ rows: Row[]; totalCount: number }>(
-      "tableData",
-      ({ rows: r, totalCount: t }) => {
-        if (!colSizesInitedRef.current && columnsRef.current.length > 0) {
-          colSizesInitedRef.current = true;
-          setColSizes(
-            calcColWidths(
-              columnsRef.current.map((c): Column => {
-                return {
-                  name: c.name,
-                  isPrimaryKey: c.isPrimaryKey,
-                };
-              }),
-              r,
-            ),
-          );
-        }
-        setRows(r);
-        setTotalCount(t);
-        setLoading(false);
-        setFilterError(null);
-        setSelected(new Set());
-        setPending(new Map());
-        setEditCell(null);
+    const unData = onMessage<{
+      fetchId?: number;
+      rows: Row[];
+      totalCount: number;
+    }>("tableData", ({ fetchId, rows: r, totalCount: t }) => {
+      if (fetchId !== undefined && fetchId !== fetchEpochRef.current) return;
+      if (!colSizesInitedRef.current && columnsRef.current.length > 0) {
+        colSizesInitedRef.current = true;
+        setColSizes(
+          calcColWidths(
+            columnsRef.current.map((c): Column => {
+              return {
+                name: c.name,
+                isPrimaryKey: c.isPrimaryKey,
+              };
+            }),
+            r,
+          ),
+        );
+      }
+      setRows(r);
+      setTotalCount(t);
+      setLoading(false);
+      setFilterError(null);
+      setSelected(new Set());
+      setPending(new Map());
+      setEditCell(null);
 
-        const savedScroll = scrollPreserveRef.current;
-        scrollPreserveRef.current = null;
-        if (savedScroll !== null && savedScroll > 0) {
-          requestAnimationFrame(() => {
-            scrollRef.current?.scrollTo({ top: savedScroll });
-          });
-        } else {
-          scrollRef.current?.scrollTo({ top: 0 });
-        }
-        setApplyErr(null);
-      },
-    );
-    const unError = onMessage<{ error: string; isFilterError?: boolean }>(
-      "tableError",
-      ({ error: e, isFilterError }) => {
-        if (isFilterError) {
-          setFilterError(e);
-          setRows([]);
-          setTotalCount(0);
-        } else {
-          setError(e);
-        }
-        setLoading(false);
-      },
-    );
+      const savedScroll = scrollPreserveRef.current;
+      scrollPreserveRef.current = null;
+      if (savedScroll !== null && savedScroll > 0) {
+        requestAnimationFrame(() => {
+          scrollRef.current?.scrollTo({ top: savedScroll });
+        });
+      } else {
+        scrollRef.current?.scrollTo({ top: 0 });
+      }
+      setApplyErr(null);
+    });
+    const unError = onMessage<{
+      fetchId?: number;
+      error: string;
+      isFilterError?: boolean;
+    }>("tableError", ({ fetchId, error: e, isFilterError }) => {
+      if (fetchId !== undefined && fetchId !== fetchEpochRef.current) return;
+      if (isFilterError) {
+        setFilterError(e);
+        setRows([]);
+        setTotalCount(0);
+      } else {
+        setError(e);
+      }
+      setLoading(false);
+    });
 
     const unApply = onMessage<{ success: boolean; error?: string }>(
       "applyResult",
@@ -324,8 +332,9 @@ export function TableView({
   }, [fetchPage]);
 
   useEffect(() => {
+    if (!initializedRef.current) return;
     fetchPage();
-  }, [page, pageSize, debFilters, sort]);
+  }, [page, pageSize, debFilters, sort, initTick, fetchPage]);
 
   const filtersMountedRef = useRef(false);
   useEffect(() => {

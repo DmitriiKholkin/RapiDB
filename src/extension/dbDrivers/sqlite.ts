@@ -97,6 +97,21 @@ export class SQLiteDriver implements IDBDriver {
     }[];
     const fkCols = new Set(fkRows.map((r) => r.from));
 
+    const autoIncrementCols = new Set<string>();
+    try {
+      const master = this.db!.all(
+        `SELECT sql FROM sqlite_master WHERE type='table' AND name=?`,
+        [table],
+      ) as { sql: string }[];
+      const createSql = master[0]?.sql ?? "";
+      const re =
+        /[`"[]?(\w+)[`"\]]?\s+INTEGER\b[^,)]*\bPRIMARY\s+KEY\b[^,)]*\bAUTOINCREMENT\b/gi;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(createSql)) !== null) {
+        autoIncrementCols.add(m[1].toLowerCase());
+      }
+    } catch {}
+
     return rows.map((r) => ({
       name: r.name,
       type: r.type || "TEXT",
@@ -104,6 +119,7 @@ export class SQLiteDriver implements IDBDriver {
       defaultValue: r.dflt_value ?? undefined,
       isPrimaryKey: r.pk > 0,
       isForeignKey: fkCols.has(r.name),
+      isAutoIncrement: autoIncrementCols.has(r.name.toLowerCase()),
     }));
   }
 

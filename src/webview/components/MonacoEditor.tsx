@@ -162,7 +162,7 @@ function ensureCompletionProvider() {
   }
 
   providerDisposable = monaco.languages.registerCompletionItemProvider("sql", {
-    triggerCharacters: [" ", ".", "\n", "(", ","],
+    triggerCharacters: [" ", ".", "(", ","],
 
     provideCompletionItems(model, position) {
       const schema = getActiveSchema();

@@ -168,14 +168,20 @@ export class PostgresDriver implements IDBDriver {
        ORDER BY a.attnum`,
       [schema, table],
     );
-    return res.rows.map((r) => ({
-      name: r.column_name as string,
-      type: r.data_type as string,
-      nullable: r.is_nullable === true || r.is_nullable === "true",
-      defaultValue: r.column_default ?? undefined,
-      isPrimaryKey: r.is_pk === true || r.is_pk === "true",
-      isForeignKey: r.is_fk === true || r.is_fk === "true",
-    }));
+    return res.rows.map((r) => {
+      const rawDefault = r.column_default as string | null | undefined;
+      const isAutoIncrement =
+        typeof rawDefault === "string" && rawDefault.startsWith("nextval(");
+      return {
+        name: r.column_name as string,
+        type: r.data_type as string,
+        nullable: r.is_nullable === true || r.is_nullable === "true",
+        defaultValue: isAutoIncrement ? undefined : (rawDefault ?? undefined),
+        isPrimaryKey: r.is_pk === true || r.is_pk === "true",
+        isForeignKey: r.is_fk === true || r.is_fk === "true",
+        isAutoIncrement,
+      };
+    });
   }
 
   async query(sql: string, params?: unknown[]): Promise<QueryResult> {

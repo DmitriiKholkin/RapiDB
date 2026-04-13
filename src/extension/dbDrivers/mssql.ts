@@ -39,6 +39,17 @@ function mssqlFullType(
   return typeName;
 }
 
+function cleanMssqlDefault(raw: string): string {
+  let s = raw.trim();
+  while (s.startsWith("(") && s.endsWith(")")) {
+    s = s.slice(1, -1).trim();
+  }
+  if (s.startsWith("N'") && s.endsWith("'")) {
+    s = s.slice(1);
+  }
+  return s;
+}
+
 const escapeMssqlId = (s: string) => s.replace(/]/g, "]]");
 
 export class MSSQLDriver implements IDBDriver {
@@ -185,9 +196,13 @@ export class MSSQLDriver implements IDBDriver {
       name: r.COLUMN_NAME as string,
       type: mssqlFullType(r.DATA_TYPE, r.max_length, r.precision, r.scale),
       nullable: r.IS_NULLABLE === true || r.IS_NULLABLE === 1,
-      defaultValue: r.COLUMN_DEFAULT ?? undefined,
+      defaultValue:
+        r.COLUMN_DEFAULT != null
+          ? cleanMssqlDefault(r.COLUMN_DEFAULT as string)
+          : undefined,
       isPrimaryKey: r.IS_PK === 1,
       isForeignKey: r.IS_FK === 1,
+      isAutoIncrement: r.is_identity === true || r.is_identity === 1,
     }));
   }
 
@@ -222,8 +237,6 @@ export class MSSQLDriver implements IDBDriver {
       };
     }
 
-    // FIX #3: параметры несовместимы с multi-batch (GO) скриптами.
-    // Раньше params молча дропались — теперь бросаем явную ошибку.
     if (batches.length > 1 && params && params.length > 0) {
       throw new Error(
         "[RapiDB] MSSQL:parameters are not supported in multi-batch scripts (GO). " +
@@ -273,7 +286,7 @@ export class MSSQLDriver implements IDBDriver {
 
     const columnEntries = Object.entries(
       (res.recordset as any)?.columns ?? {},
-    ) as [string, unknown][];
+    ) as [string, any][];
 
     if (columnEntries.length === 0 && (res.rowsAffected?.[0] ?? 0) > 0) {
       return {
@@ -284,10 +297,64 @@ export class MSSQLDriver implements IDBDriver {
       };
     }
 
+    const pad = (n: number) => String(n).padStart(2, "0");
+
     const columns = columnEntries.map(([name]) => (name === "" ? " " : name));
     const rows = (res.recordset ?? []).map((row: any) =>
       Object.fromEntries(
-        columnEntries.map(([name], i) => [`__col_${i}`, row[name]]),
+        columnEntries.map(([name, colMeta], i) => {
+          let v = row[name];
+          const typeName: string = (colMeta as any)?.type?.name ?? "";
+
+          if (
+            typeName === "Real" &&
+            typeof v === "number" &&
+            !Number.isInteger(v)
+          ) {
+            v = parseFloat((v as number).toPrecision(7));
+          }
+
+          if (
+            typeName === "Date" &&
+            v instanceof Date &&
+            !isNaN((v as Date).getTime())
+          ) {
+            const d = v as Date;
+            v = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+          }
+
+          if (
+            typeName === "Time" &&
+            v instanceof Date &&
+            !isNaN((v as Date).getTime())
+          ) {
+            const d = v as Date;
+            const ms = d.getUTCMilliseconds();
+            const frac =
+              ms > 0
+                ? `.${String(ms).padStart(3, "0").replace(/0+$/, "")}`
+                : "";
+            v = `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}${frac}`;
+          }
+
+          if (
+            typeName === "DateTimeOffset" &&
+            v instanceof Date &&
+            !isNaN((v as Date).getTime())
+          ) {
+            const d = v as Date;
+            const ms = d.getUTCMilliseconds();
+            const frac =
+              ms > 0
+                ? `.${String(ms).padStart(3, "0").replace(/0+$/, "")}`
+                : "";
+            v =
+              `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +
+              `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}${frac} +00:00`;
+          }
+
+          return [`__col_${i}`, v];
+        }),
       ),
     );
     return {
@@ -299,17 +366,17 @@ export class MSSQLDriver implements IDBDriver {
   }
 
   private guessMssqlType(value: any) {
+    if (Buffer.isBuffer(value)) return mssql.TYPES.VarBinary;
     if (typeof value === "number") {
-      // Use Decimal for non-integers to avoid precision loss (e.g. 3.14 → Int = 3)
-      return Number.isInteger(value) ? mssql.TYPES.Int : mssql.TYPES.Decimal;
+      return Number.isInteger(value) ? mssql.TYPES.Int : mssql.TYPES.Float;
     }
     if (typeof value === "boolean") return mssql.TYPES.Bit;
     if (value instanceof Date) return mssql.TYPES.DateTime2;
     if (typeof value === "string") {
       if (ISO_DATETIME_RE.test(value)) return mssql.TYPES.DateTimeOffset;
       if (DATETIME_SQL_RE.test(value)) return mssql.TYPES.DateTime2;
-      // date-only string like "2024-01-15" — bind as Date type, not NVarChar
       if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return mssql.TYPES.Date;
+      if (/^\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(value)) return mssql.TYPES.Time;
     }
     return mssql.TYPES.NVarChar;
   }

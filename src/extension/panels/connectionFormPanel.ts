@@ -54,6 +54,16 @@ export class ConnectionFormPanel {
   ): Promise<ConnectionConfig | undefined> {
     const title = existing ? `Edit — ${existing.name}` : "New Connection";
 
+    let existingForForm = existing;
+    if (existing?.useSecretStorage && existing.id) {
+      try {
+        const stored = await context.secrets.get(existing.id);
+        if (stored !== undefined) {
+          existingForForm = { ...existing, password: stored };
+        }
+      } catch {}
+    }
+
     const panel = vscode.window.createWebviewPanel(
       ConnectionFormPanel.viewType,
       title,
@@ -65,7 +75,7 @@ export class ConnectionFormPanel {
       panel,
       context,
       connectionManager,
-      existing,
+      existingForForm,
     );
 
     return new Promise<ConnectionConfig | undefined>((resolve) => {
@@ -79,9 +89,34 @@ export class ConnectionFormPanel {
   }): Promise<void> {
     switch (msg.type) {
       case "saveConnection": {
-        const config: ConnectionConfig = msg.payload;
-        await this.connectionManager.saveConnection(config);
-        this.resolveFn?.(config);
+        const raw: ConnectionConfig = msg.payload;
+
+        if (raw.useSecretStorage) {
+          const password = raw.password ?? "";
+          try {
+            await this.context.secrets.store(raw.id, password);
+          } catch (err: any) {
+            this.panel.webview.postMessage({
+              type: "testResult",
+              payload: {
+                success: false,
+                error: `SecretStorage unavailable: ${err?.message ?? String(err)}. Password was not saved.`,
+              },
+            });
+            return;
+          }
+          const { password: _pw, ...configWithoutPassword } = raw;
+          const config = configWithoutPassword as ConnectionConfig;
+          await this.connectionManager.saveConnection(config);
+          this.resolveFn?.(config);
+        } else {
+          try {
+            await this.context.secrets.delete(raw.id);
+          } catch {}
+          await this.connectionManager.saveConnection(raw);
+          this.resolveFn?.(raw);
+        }
+
         this.resolveFn = undefined;
         this.panel.dispose();
         break;
@@ -127,7 +162,7 @@ export class ConnectionFormPanel {
   <meta http-equiv="Content-Security-Policy"
     content="default-src 'none';
              script-src 'nonce-${nonce}' ${webview.cspSource};
-             style-src ${webview.cspSource} 'nonce-${nonce}';
+             style-src ${webview.cspSource} 'unsafe-inline';
              font-src ${webview.cspSource} data:;
              img-src ${webview.cspSource} https: data:;" />
   <title>RapiDB — Connection</title>

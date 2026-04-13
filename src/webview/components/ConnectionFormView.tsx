@@ -21,6 +21,7 @@ interface ConnectionConfig {
   serviceName?: string;
   thickMode?: boolean;
   clientPath?: string;
+  useSecretStorage?: boolean;
 }
 
 interface Props {
@@ -275,6 +276,9 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
   const [rejectUnauth, setRejectUnauth] = useState(
     existing?.rejectUnauthorized ?? true,
   );
+  const [useSecretStorage, setUseSecretStorage] = useState(
+    existing?.useSecretStorage ?? false,
+  );
 
   const [testState, setTestState] = useState<
     "idle" | "testing" | "ok" | "fail"
@@ -310,6 +314,7 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
       name: name.trim(),
       type,
       folder: folder.trim() || undefined,
+      useSecretStorage: useSecretStorage || undefined,
       ...(isSQLite
         ? { filePath: filePath.trim() }
         : {
@@ -338,6 +343,7 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
       name,
       type,
       folder,
+      useSecretStorage,
       isSQLite,
       filePath,
       host,
@@ -479,17 +485,61 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
             />
           </Field>
 
-          <Field label="Password" hint="Stored in plaintext in settings.json">
-            <FocusInput
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              type="password"
-              placeholder="••••••••"
-              style={{
-                ...s.input,
-                fontFamily: "var(--vscode-editor-font-family, monospace)",
-              }}
-            />
+          <Divider label="Password & Security" />
+
+          <Toggle
+            label="Store password in VS Code Secret Storage"
+            hint={
+              useSecretStorage
+                ? "Password will be saved in your OS keychain via VS Code SecretStorage — it will NOT appear in settings.json."
+                : "Password will be saved in plaintext in settings.json. Enable this option to store it securely."
+            }
+            checked={useSecretStorage}
+            onChange={setUseSecretStorage}
+          />
+
+          <Field
+            label="Password"
+            hint={
+              useSecretStorage
+                ? "🔒 Will be stored securely in VS Code Secret Storage (OS keychain)"
+                : "⚠ Will be stored in plaintext in settings.json"
+            }
+          >
+            <div style={{ position: "relative" }}>
+              <FocusInput
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                type="password"
+                placeholder="••••••••"
+                style={{
+                  ...s.input,
+                  fontFamily: "var(--vscode-editor-font-family, monospace)",
+                  paddingRight: 34,
+                  borderColor: useSecretStorage
+                    ? "var(--vscode-testing-iconPassed, #4ec94e)"
+                    : undefined,
+                }}
+              />
+              <span
+                title={
+                  useSecretStorage
+                    ? "Stored in OS keychain"
+                    : "Stored in plaintext"
+                }
+                style={{
+                  position: "absolute",
+                  right: 8,
+                  top: "50%",
+                  transform: "translateY(-50%)",
+                  fontSize: 14,
+                  pointerEvents: "none",
+                  opacity: 0.75,
+                }}
+              >
+                {useSecretStorage ? "🔒" : "⚠️"}
+              </span>
+            </div>
           </Field>
 
           {}

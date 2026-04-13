@@ -412,21 +412,6 @@ export function QueryView({
 
         <div style={{ flex: 1 }} />
 
-        <button
-          style={btnGhostStyle(false)}
-          onClick={() => {
-            const id = activeConnectionId || connectionId;
-            schemaFetchedRef.current.delete(id);
-            postMessage("refreshSchema", { connectionId: id });
-          }}
-          title="Refresh schema for SQL autocomplete"
-        >
-          <>
-            <Icon name="refresh" size={13} style={{ marginRight: 4 }} />
-            Refresh schema
-          </>
-        </button>
-
         <span style={{ fontSize: 11, opacity: 0.35 }}>Ctrl+Enter</span>
       </div>
 

@@ -25,6 +25,8 @@ export class TablePanel {
   private readonly table: string;
   private readonly isView: boolean;
 
+  private cachedColumns: import("../tableDataService").ColumnDef[] = [];
+
   private constructor(
     panel: vscode.WebviewPanel,
     context: vscode.ExtensionContext,
@@ -165,6 +167,7 @@ export class TablePanel {
             this.schema,
             this.table,
           );
+          this.cachedColumns = cols;
           const pkCols = cols.filter((c) => c.isPrimaryKey).map((c) => c.name);
           send("tableInit", {
             columns: cols,
@@ -179,6 +182,7 @@ export class TablePanel {
 
       case "fetchPage": {
         const raw = msg.payload ?? {};
+        const fetchId: number | undefined = raw.fetchId;
         const page = Math.max(1, Math.floor(Number(raw.page) || 1));
         const pageSize = Math.min(
           10000,
@@ -198,6 +202,7 @@ export class TablePanel {
             sort as SortConfig | null,
           );
           send("tableData", {
+            fetchId,
             rows: result.rows,
             totalCount: result.totalCount,
           });
@@ -207,7 +212,7 @@ export class TablePanel {
             /invalid input syntax|invalid cidr|malformed array|not a valid (binary|hex|uuid)|syntax error in input|invalid value for type|conversion failed|arithmetic overflow|ORA-0(1841|1843|1858|1861|6502)|incorrect (date|datetime|time)|data truncat/i.test(
               errMsg,
             );
-          send("tableError", { error: errMsg, isFilterError });
+          send("tableError", { fetchId, error: errMsg, isFilterError });
         }
         break;
       }
@@ -215,12 +220,6 @@ export class TablePanel {
       case "applyChanges": {
         const { updates } = msg.payload ?? {};
         try {
-          const cols = await this.svc.getColumns(
-            this.connectionId,
-            this.database,
-            this.schema,
-            this.table,
-          );
           const result = await applyChangesTransactional(
             this.cm,
             this.connectionId,
@@ -228,7 +227,7 @@ export class TablePanel {
             this.schema,
             this.table,
             (updates ?? []) as RowUpdate[],
-            cols,
+            this.cachedColumns,
           );
           send("applyResult", result);
         } catch (err: any) {
@@ -296,9 +295,13 @@ export class TablePanel {
             {
               location: vscode.ProgressLocation.Notification,
               title: `RapiDB: Exporting ${this.table}…`,
-              cancellable: false,
+              cancellable: true,
             },
-            async () => {
+            async (_progress, token) => {
+              const abortCtrl = new AbortController();
+              const cancelSub = token.onCancellationRequested(() =>
+                abortCtrl.abort(),
+              );
               const writeStream = fs.createWriteStream(saveUri.fsPath, {
                 encoding: "utf8",
               });
@@ -314,11 +317,9 @@ export class TablePanel {
                   500,
                   csvSort as SortConfig | null,
                   (csvFilters as { column: string; value: string }[]).map(
-                    (f) => ({
-                      column: f.column,
-                      value: f.value,
-                    }),
+                    (f) => ({ column: f.column, value: f.value }),
                   ),
+                  abortCtrl.signal,
                 )) {
                   if (!headerWritten) {
                     writeStream.write(
@@ -342,6 +343,8 @@ export class TablePanel {
               } catch (err) {
                 writeStream.destroy();
                 throw err;
+              } finally {
+                cancelSub.dispose();
               }
             },
           );
@@ -350,9 +353,11 @@ export class TablePanel {
             `[RapiDB] Exported ${this.table} → ${path.basename(saveUri.fsPath)}`,
           );
         } catch (err: any) {
-          vscode.window.showErrorMessage(
-            `[RapiDB] CSV export failed: ${err?.message ?? String(err)}`,
-          );
+          if (err?.name !== "AbortError") {
+            vscode.window.showErrorMessage(
+              `[RapiDB] CSV export failed: ${err?.message ?? String(err)}`,
+            );
+          }
         }
         break;
       }
@@ -374,9 +379,13 @@ export class TablePanel {
             {
               location: vscode.ProgressLocation.Notification,
               title: `RapiDB: Exporting ${this.table} as JSON…`,
-              cancellable: false,
+              cancellable: true,
             },
-            async () => {
+            async (_progress, token) => {
+              const abortCtrl = new AbortController();
+              const cancelSub = token.onCancellationRequested(() =>
+                abortCtrl.abort(),
+              );
               const writeStream = fs.createWriteStream(saveUri.fsPath, {
                 encoding: "utf8",
               });
@@ -391,11 +400,9 @@ export class TablePanel {
                   500,
                   sort as SortConfig | null,
                   (jsonFilters as { column: string; value: string }[]).map(
-                    (f) => ({
-                      column: f.column,
-                      value: f.value,
-                    }),
+                    (f) => ({ column: f.column, value: f.value }),
                   ),
+                  abortCtrl.signal,
                 )) {
                   for (const row of chunk.rows) {
                     const serialisable = Object.fromEntries(
@@ -423,6 +430,8 @@ export class TablePanel {
               } catch (err) {
                 writeStream.destroy();
                 throw err;
+              } finally {
+                cancelSub.dispose();
               }
             },
           );
@@ -431,9 +440,11 @@ export class TablePanel {
             `[RapiDB] Exported ${this.table} → ${path.basename(saveUri.fsPath)}`,
           );
         } catch (err: any) {
-          vscode.window.showErrorMessage(
-            `[RapiDB] JSON export failed: ${err?.message ?? String(err)}`,
-          );
+          if (err?.name !== "AbortError") {
+            vscode.window.showErrorMessage(
+              `[RapiDB] JSON export failed: ${err?.message ?? String(err)}`,
+            );
+          }
         }
         break;
       }

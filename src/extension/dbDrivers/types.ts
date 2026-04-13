@@ -5,6 +5,7 @@ export interface ColumnMeta {
   defaultValue?: string;
   isPrimaryKey: boolean;
   isForeignKey: boolean;
+  isAutoIncrement?: boolean;
 }
 
 export interface IndexMeta {

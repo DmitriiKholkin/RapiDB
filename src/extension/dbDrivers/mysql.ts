@@ -16,6 +16,23 @@ export function splitMySQLScript(sql: string): string[] {
   let i = 0;
   const n = sql.length;
   let buf = "";
+  let compoundDepth = 0;
+
+  function isWordChar(p: number): boolean {
+    if (p < 0 || p >= n) return false;
+    const ch = sql[p];
+    return /[A-Za-z0-9_]/.test(ch);
+  }
+
+  function consumeKeyword(kw: string): boolean {
+    if (isWordChar(i - 1)) return false;
+    const len = kw.length;
+    if (sql.slice(i, i + len).toUpperCase() !== kw) return false;
+    if (isWordChar(i + len)) return false;
+    buf += sql.slice(i, i + len);
+    i += len;
+    return true;
+  }
 
   while (i < n) {
     const atLineStart = i === 0 || sql[i - 1] === "\n";
@@ -95,7 +112,36 @@ export function splitMySQLScript(sql: string): string[] {
       continue;
     }
 
-    if (sql.startsWith(delim, i)) {
+    if (consumeKeyword("BEGIN")) {
+      compoundDepth++;
+      continue;
+    }
+    if (consumeKeyword("CASE")) {
+      compoundDepth++;
+      continue;
+    }
+    if (consumeKeyword("IF")) {
+      compoundDepth++;
+      continue;
+    }
+    if (consumeKeyword("LOOP")) {
+      compoundDepth++;
+      continue;
+    }
+    if (consumeKeyword("REPEAT")) {
+      compoundDepth++;
+      continue;
+    }
+    if (consumeKeyword("WHILE")) {
+      compoundDepth++;
+      continue;
+    }
+    if (consumeKeyword("END")) {
+      if (compoundDepth > 0) compoundDepth--;
+      continue;
+    }
+
+    if (compoundDepth === 0 && sql.startsWith(delim, i)) {
       const s = buf.trim();
       if (s) stmts.push(s);
       buf = "";
@@ -219,7 +265,7 @@ export class MySQLDriver implements IDBDriver {
     table: string,
   ): Promise<ColumnMeta[]> {
     const [rows] = await this.pool!.query<any[]>(
-      `SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY
+      `SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY, EXTRA
        FROM information_schema.COLUMNS
        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`,
       [database, table],
@@ -231,6 +277,8 @@ export class MySQLDriver implements IDBDriver {
       defaultValue: r.COLUMN_DEFAULT ?? undefined,
       isPrimaryKey: r.COLUMN_KEY === "PRI",
       isForeignKey: r.COLUMN_KEY === "MUL",
+      isAutoIncrement:
+        (r.EXTRA as string)?.toLowerCase().includes("auto_increment") ?? false,
     }));
   }
 
@@ -284,12 +332,19 @@ export class MySQLDriver implements IDBDriver {
       const columns = fieldList.map((f: any) => f.name as string);
 
       const boolCols = new Set<number>();
+      const floatCols = new Set<number>();
+      const bitIntCols = new Set<number>();
       fieldList.forEach((f: any, i: number) => {
         if (
           (f.type === 1 && f.length === 1) ||
           (f.type === 16 && f.length === 1)
         ) {
           boolCols.add(i);
+        } else if (f.type === 16 && f.length > 1) {
+          bitIntCols.add(i);
+        }
+        if (f.type === 4) {
+          floatCols.add(i);
         }
       });
 
@@ -303,6 +358,22 @@ export class MySQLDriver implements IDBDriver {
               } else {
                 v = v === 1 || v === "1";
               }
+            }
+            if (bitIntCols.has(i) && v !== null && v !== undefined) {
+              if (Buffer.isBuffer(v)) {
+                const buf = v as Buffer;
+                v =
+                  buf.length === 0
+                    ? 0
+                    : buf.readUIntBE(0, Math.min(buf.length, 6));
+              }
+            }
+            if (
+              floatCols.has(i) &&
+              typeof v === "number" &&
+              !Number.isInteger(v)
+            ) {
+              v = parseFloat((v as number).toPrecision(7));
             }
             return [`__col_${i}`, v];
           }),

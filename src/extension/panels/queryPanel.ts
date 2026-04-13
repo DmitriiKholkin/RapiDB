@@ -219,12 +219,7 @@ export class QueryPanel {
             const normalised: Record<string, unknown> = {};
             for (const [k, v] of Object.entries(row)) {
               if (Buffer.isBuffer(v)) {
-                normalised[k] =
-                  v.length === 0
-                    ? 0
-                    : v.length <= 6
-                      ? v.readUIntBE(0, v.length)
-                      : v.toString("hex");
+                normalised[k] = v.length === 0 ? "" : "\\x" + v.toString("hex");
               } else if (
                 v !== null &&
                 typeof v === "object" &&
@@ -277,24 +272,12 @@ export class QueryPanel {
           break;
         }
 
-        this._pushSchemaAsync(connectionId);
-        break;
-      }
-
-      case "refreshSchema": {
-        const connectionId: string =
-          msg.payload?.connectionId || this.activeConnectionId;
-
-        await this.connectionManager.reloadSchema(connectionId);
-
-        for (const p of QueryPanel.panels.values()) {
-          if (
-            p.activeConnectionId === connectionId ||
-            p.originalConnectionId === connectionId
-          ) {
-            p._pushSchemaAsync(connectionId);
-          }
-        }
+        const tables =
+          await this.connectionManager.getSchemaAsync(connectionId);
+        this.panel.webview.postMessage({
+          type: "schema",
+          payload: { connectionId, tables },
+        });
         break;
       }
 

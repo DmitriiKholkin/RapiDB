@@ -23,6 +23,7 @@ export interface ConnectionConfig {
   serviceName?: string;
   thickMode?: boolean;
   clientPath?: string;
+  useSecretStorage?: boolean;
 }
 
 export interface TestConnectionResult {
@@ -222,10 +223,26 @@ export class ConnectionManager {
       this.getConnections().filter((c) => c.id !== id),
     );
 
+    try {
+      await this.context.secrets.delete(id);
+    } catch {}
+
     await this._purgeHistoryForConnection(id);
 
     await this._purgeBookmarksForConnection(id);
     return true;
+  }
+
+  async _hydratePassword(config: ConnectionConfig): Promise<ConnectionConfig> {
+    if (!config.useSecretStorage) {
+      return config;
+    }
+    try {
+      const stored = await this.context.secrets.get(config.id);
+      return { ...config, password: stored ?? "" };
+    } catch {
+      return { ...config, password: "" };
+    }
   }
 
   private async _purgeHistoryForConnection(
@@ -270,7 +287,8 @@ export class ConnectionManager {
     if (!config) {
       throw new Error(`[RapiDB] Connection "${id}" not found`);
     }
-    const driver = this.createDriver(config);
+    const fullConfig = await this._hydratePassword(config);
+    const driver = this.createDriver(fullConfig);
     try {
       await driver.connect();
     } catch (err) {
@@ -309,17 +327,14 @@ export class ConnectionManager {
     return this._schemaCacheMap.get(connectionId)?.tables ?? [];
   }
 
-  async reloadSchema(connectionId: string): Promise<void> {
+  async getSchemaAsync(connectionId: string): Promise<SchemaTableEntry[]> {
     const entry = this._schemaCacheMap.get(connectionId);
-    if (entry) {
-      entry.tables = [];
-      entry.loading = null;
+    if (entry?.loading) {
+      try {
+        await entry.loading;
+      } catch {}
     }
-    this._startSchemaLoad(connectionId);
-    const fresh = this._schemaCacheMap.get(connectionId);
-    if (fresh?.loading) {
-      await fresh.loading;
-    }
+    return this._schemaCacheMap.get(connectionId)?.tables ?? [];
   }
 
   private _startSchemaLoad(connectionId: string): void {

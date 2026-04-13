@@ -74,13 +74,7 @@ function isOracleNonFilterable(colType: string): boolean {
 
 function isMssqlNonFilterable(colType: string): boolean {
   const ct = colType.toLowerCase().split("(")[0].trim();
-  return (
-    ct === "image" ||
-    ct === "binary" ||
-    ct === "varbinary" ||
-    ct === "geography" ||
-    ct === "geometry"
-  );
+  return ct === "image" || ct === "geography" || ct === "geometry";
 }
 
 export function isBooleanLikeType(
@@ -368,6 +362,105 @@ function coerceValue(
     return value;
   }
 
+  if (dbType === "mssql" && colType) {
+    const sct = colType.toLowerCase().split("(")[0].trim();
+    if (sct === "binary" || sct === "varbinary") {
+      if (
+        value.startsWith("\\x") ||
+        value.startsWith("\\X") ||
+        value.startsWith("0x") ||
+        value.startsWith("0X")
+      ) {
+        const hex = value.slice(2);
+        if (/^[0-9a-fA-F]*$/.test(hex)) {
+          if (hex.length % 2 !== 0) {
+            throw new Error(
+              `Invalid hex value: odd number of hex digits in "${value}". ` +
+                `Each byte requires exactly 2 hex digits (e.g. \\xDE not \\xD).`,
+            );
+          }
+          return Buffer.from(hex, "hex");
+        }
+      }
+      if (/^[0-9a-fA-F]+$/.test(value) && value.length % 2 === 0) {
+        return Buffer.from(value, "hex");
+      }
+      return value;
+    }
+  }
+
+  if (dbType === "mysql" && colType) {
+    const mct = colType.toLowerCase().split("(")[0].trim();
+    if (
+      mct === "binary" ||
+      mct === "varbinary" ||
+      mct === "blob" ||
+      mct === "tinyblob" ||
+      mct === "mediumblob" ||
+      mct === "longblob"
+    ) {
+      if (
+        value.startsWith("\\x") ||
+        value.startsWith("\\X") ||
+        value.startsWith("0x") ||
+        value.startsWith("0X")
+      ) {
+        const hex = value.slice(2);
+        if (/^[0-9a-fA-F]*$/.test(hex)) {
+          if (hex.length % 2 !== 0) {
+            throw new Error(
+              `Invalid hex value: odd number of hex digits in "${value}". ` +
+                `Each byte requires exactly 2 hex digits (e.g. \\xDE not \\xD).`,
+            );
+          }
+          return Buffer.from(hex, "hex");
+        }
+      }
+      if (/^[0-9a-fA-F]+$/.test(value) && value.length % 2 === 0) {
+        return Buffer.from(value, "hex");
+      }
+      return value;
+    }
+  }
+
+  if (dbType === "pg" && colType && colType.toLowerCase() === "bytea") {
+    if (
+      value.startsWith("\\x") ||
+      value.startsWith("\\X") ||
+      value.startsWith("0x") ||
+      value.startsWith("0X")
+    ) {
+      const hex = value.slice(2);
+      if (/^[0-9a-fA-F]*$/.test(hex)) {
+        if (hex.length % 2 !== 0) {
+          throw new Error(
+            `Invalid bytea hex value: odd number of hex digits in "${value}". ` +
+              `Each byte requires exactly 2 hex digits (e.g. \\x33 not \\x3).`,
+          );
+        }
+        return Buffer.from(hex, "hex");
+      }
+    }
+    if (/^[0-9a-fA-F]+$/.test(value) && value.length % 2 === 0) {
+      return Buffer.from(value, "hex");
+    }
+    return value;
+  }
+
+  if (dbType === "mssql" && colType) {
+    const ct = colType.toLowerCase().split("(")[0].trim();
+    if (ct === "time") {
+      const timeMatch = /^(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d+))?$/.exec(value);
+      if (timeMatch) {
+        const [, h, m, s, frac] = timeMatch;
+        const ms = frac ? parseInt(frac.slice(0, 3).padEnd(3, "0"), 10) : 0;
+        const d = new Date(0);
+        d.setUTCHours(+h, +m, +s, ms);
+        return d;
+      }
+    }
+  }
+
   if (ISO_DATETIME_RE.test(value)) {
     if (dbType === "pg" && colType && colType === "date") {
       return isoToLocalDateStr(value) ?? value;
@@ -384,7 +477,31 @@ function coerceValue(
       }
     }
 
-    if (dbType === "mysql" || dbType === "mssql") {
+    if (dbType === "mssql" && colType) {
+      const ct = colType.toLowerCase().split("(")[0].trim();
+      if (ct === "date") {
+        return isoToLocalDateStr(value) ?? value;
+      }
+      if (ct === "datetimeoffset") {
+        return value;
+      }
+      const d = new Date(value);
+      if (!isNaN(d.getTime())) {
+        if (ct === "time") {
+          const td = new Date(0);
+          td.setUTCHours(
+            d.getUTCHours(),
+            d.getUTCMinutes(),
+            d.getUTCSeconds(),
+            d.getUTCMilliseconds(),
+          );
+          return td;
+        }
+        return d;
+      }
+    }
+
+    if (dbType === "mysql") {
       const d = new Date(value);
       if (!isNaN(d.getTime())) {
         const pad = (n: number) => String(n).padStart(2, "0");
@@ -400,19 +517,50 @@ function coerceValue(
     return value;
   }
 
-  if (DATE_ONLY_RE.test(value) && dbType === "oracle" && colType) {
-    const ct = colType.toLowerCase();
-    if (ct === "date" || ct.startsWith("timestamp")) {
-      return `${value} 00:00:00`;
+  if (DATE_ONLY_RE.test(value) && colType) {
+    if (dbType === "oracle") {
+      const ct = colType.toLowerCase();
+      if (ct === "date" || ct.startsWith("timestamp")) {
+        return `${value} 00:00:00`;
+      }
+    }
+    if (dbType === "mssql") {
+      return value;
     }
   }
 
   if (DATETIME_SQL_RE.test(value) && colType) {
-    const ct = colType.toLowerCase();
+    const ct = colType.toLowerCase().split("(")[0].trim();
     if (dbType === "oracle" && (ct === "date" || ct.startsWith("timestamp"))) {
       return value;
     }
-    if (dbType === "mysql" || dbType === "mssql") {
+    if (dbType === "mssql") {
+      if (ct === "time") {
+        const timePart = value.includes(" ")
+          ? (value.split(" ")[1] ?? value)
+          : value;
+        const timeMatch = /^(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d+))?$/.exec(
+          timePart,
+        );
+        if (timeMatch) {
+          const [, h, m, s, frac] = timeMatch;
+          const ms = frac ? parseInt(frac.slice(0, 3).padEnd(3, "0"), 10) : 0;
+          const td = new Date(0);
+          td.setUTCHours(+h, +m, +s, ms);
+          return td;
+        }
+        return timePart;
+      }
+      const utcIso = value.replace(" ", "T");
+      const d = new Date(
+        /Z$|[+-]\d{2}:\d{2}$/.test(utcIso) ? utcIso : utcIso + "Z",
+      );
+      if (!isNaN(d.getTime())) {
+        return d;
+      }
+      return value;
+    }
+    if (dbType === "mysql") {
       return value;
     }
     return value;
@@ -454,6 +602,11 @@ function isNumericCompareUnsafe(
       ct === "oid" ||
       ct === "xid" ||
       ct === "cid" ||
+      ct === "interval" ||
+      colType.toLowerCase().startsWith("interval") ||
+      ct === "bytea" ||
+      ct === "tsvector" ||
+      ct === "tsquery" ||
       colType.toLowerCase().endsWith("[]") ||
       colType.toLowerCase().startsWith("_") ||
       colType.toLowerCase() === "array"
@@ -468,13 +621,21 @@ function isNumericCompareUnsafe(
       ct === "datetime" ||
       ct === "datetime2" ||
       ct === "smalldatetime" ||
-      ct === "datetimeoffset"
+      ct === "datetimeoffset" ||
+      ct === "real" ||
+      ct === "float"
     );
   }
 
   if (dbType === "mysql") {
     return (
-      ct === "date" || ct === "datetime" || ct === "timestamp" || ct === "year"
+      ct === "date" ||
+      ct === "datetime" ||
+      ct === "timestamp" ||
+      ct === "year" ||
+      ct === "time" ||
+      ct === "float" ||
+      ct === "real"
     );
   }
 
@@ -590,6 +751,15 @@ function buildWhere(
         return null;
       }
 
+      if (type === "mssql") {
+        const mssqlBase = colType.split("(")[0].trim();
+        if (mssqlBase === "binary" || mssqlBase === "varbinary") {
+          const hexVal = val.replace(/^(0x|\\x)/i, "").toUpperCase();
+          params.push(`%${hexVal}%`);
+          return `CONVERT(VARCHAR(MAX), ${col}, 2) LIKE ?`;
+        }
+      }
+
       const isDateCol = colType === "date";
       const isTextual =
         colType.includes("json") ||
@@ -655,7 +825,7 @@ function buildWhere(
         !isNaN(Number(val)) &&
         val !== ""
       ) {
-        params.push(val);
+        params.push(Number(val));
         if (type === "pg") {
           return `${col} = $${startIndex + params.length - 1}`;
         }
@@ -734,6 +904,21 @@ function buildWhere(
         return `UPPER(CAST(${col} AS VARCHAR2(4000))) LIKE ?`;
       }
       if (type === "mssql") {
+        const mssqlBase = colType.split("(")[0].trim();
+        if (mssqlBase === "real") {
+          const num = Number(val);
+          if (!isNaN(num)) {
+            params.push(num);
+            return `${col} = CAST(? AS REAL)`;
+          }
+        }
+        if (mssqlBase === "float") {
+          const num = Number(val);
+          if (!isNaN(num)) {
+            params.push(num);
+            return `${col} = ?`;
+          }
+        }
         if (isDateCol) {
           let dateStr: string | null = null;
           if (DATE_ONLY_RE.test(val)) {
@@ -758,6 +943,14 @@ function buildWhere(
           : `%${finalVal}%`;
         params.push(mssqlVal);
         return `CAST(${col} AS NVARCHAR(MAX)) LIKE ?`;
+      }
+      if (type === "mysql") {
+        const mysqlBase = colType.split("(")[0].trim();
+        if (mysqlBase === "binary" || mysqlBase === "varbinary") {
+          const hexVal = val.replace(/^(0x|\\x)/i, "").toUpperCase();
+          params.push(`%${hexVal}%`);
+          return `HEX(${col}) LIKE ?`;
+        }
       }
       const mysqlVal = DATETIME_SQL_RE.test(finalVal)
         ? `${finalVal}%`
@@ -912,12 +1105,7 @@ export class TableDataService {
         const val = row[`__col_${i}`];
 
         if (Buffer.isBuffer(val)) {
-          newRow[colName] =
-            val.length === 0
-              ? 0
-              : val.length <= 6
-                ? val.readUIntBE(0, val.length)
-                : val.toString("hex");
+          newRow[colName] = val.length === 0 ? "" : "\\x" + val.toString("hex");
           return;
         }
 
@@ -1159,9 +1347,13 @@ export class TableDataService {
     chunkSize = 500,
     sort: SortConfig | null = null,
     filters: Filter[] = [],
+    signal?: AbortSignal,
   ): AsyncGenerator<{ columns: ColumnDef[]; rows: Record<string, unknown>[] }> {
     let page = 1;
     while (true) {
+      if (signal?.aborted) {
+        throw new DOMException("Export cancelled by user", "AbortError");
+      }
       const result = await this.getPage(
         connectionId,
         database,

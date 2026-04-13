@@ -1,6 +1,7 @@
-// biome-ignore lint/style/useImportType: <explanation>
+// biome-ignore lint/style/useImportType: React needed for JSX
 import React from "react";
 import { ConnectionFormView } from "./ConnectionFormView";
+import { ErrorBoundary } from "./ErrorBoundary";
 import { QueryView } from "./QueryView";
 import { SchemaView } from "./SchemaView";
 import { TableView } from "./TableView";
@@ -31,36 +32,46 @@ export function App(): React.ReactElement {
   switch (state.view) {
     case "query":
       return (
-        <QueryView
-          connectionId={state.connectionId ?? ""}
-          connectionType={state.connectionType ?? ""}
-          initialSql={state.initialSql ?? ""}
-          formatOnOpen={state.formatOnOpen ?? false}
-          isBookmarked={state.isBookmarked ?? false}
-        />
+        <ErrorBoundary context="QueryView">
+          <QueryView
+            connectionId={state.connectionId ?? ""}
+            connectionType={state.connectionType ?? ""}
+            initialSql={state.initialSql ?? ""}
+            formatOnOpen={state.formatOnOpen ?? false}
+            isBookmarked={state.isBookmarked ?? false}
+          />
+        </ErrorBoundary>
       );
     case "table":
       return (
-        <TableView
-          connectionId={state.connectionId ?? ""}
-          database={state.database ?? ""}
-          schema={state.schema ?? ""}
-          table={state.table ?? ""}
-          isView={state.isView ?? false}
-          defaultPageSize={state.defaultPageSize}
-        />
+        <ErrorBoundary context="TableView">
+          <TableView
+            connectionId={state.connectionId ?? ""}
+            database={state.database ?? ""}
+            schema={state.schema ?? ""}
+            table={state.table ?? ""}
+            isView={state.isView ?? false}
+            defaultPageSize={state.defaultPageSize}
+          />
+        </ErrorBoundary>
       );
     case "schema":
       return (
-        <SchemaView
-          connectionId={state.connectionId ?? ""}
-          database={state.database ?? ""}
-          schema={state.schema ?? ""}
-          table={state.table ?? ""}
-        />
+        <ErrorBoundary context="SchemaView">
+          <SchemaView
+            connectionId={state.connectionId ?? ""}
+            database={state.database ?? ""}
+            schema={state.schema ?? ""}
+            table={state.table ?? ""}
+          />
+        </ErrorBoundary>
       );
     case "connection":
-      return <ConnectionFormView existing={state.existing} />;
+      return (
+        <ErrorBoundary context="ConnectionFormView">
+          <ConnectionFormView existing={state.existing} />
+        </ErrorBoundary>
+      );
 
     default:
       return (
