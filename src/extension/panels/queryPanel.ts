@@ -218,7 +218,9 @@ export class QueryPanel {
           const rows = rawRows.map((row) => {
             const normalised: Record<string, unknown> = {};
             for (const [k, v] of Object.entries(row)) {
-              if (Buffer.isBuffer(v)) {
+              if (typeof v === "bigint") {
+                normalised[k] = v.toString();
+              } else if (Buffer.isBuffer(v)) {
                 normalised[k] = v.length === 0 ? "" : "\\x" + v.toString("hex");
               } else if (
                 v !== null &&

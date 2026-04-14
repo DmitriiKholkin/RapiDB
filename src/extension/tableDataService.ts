@@ -825,6 +825,15 @@ function buildWhere(
         !isNaN(Number(val)) &&
         val !== ""
       ) {
+        if (
+          type === "sqlite" &&
+          /^-?\d+$/.test(val) &&
+          (BigInt(val) > BigInt(Number.MAX_SAFE_INTEGER) ||
+            BigInt(val) < BigInt(Number.MIN_SAFE_INTEGER))
+        ) {
+          params.push(BigInt(val));
+          return `${col} = ?`;
+        }
         params.push(Number(val));
         if (type === "pg") {
           return `${col} = $${startIndex + params.length - 1}`;
@@ -1106,6 +1115,11 @@ export class TableDataService {
 
         if (Buffer.isBuffer(val)) {
           newRow[colName] = val.length === 0 ? "" : "\\x" + val.toString("hex");
+          return;
+        }
+
+        if (typeof val === "bigint") {
+          newRow[colName] = val.toString();
           return;
         }
 

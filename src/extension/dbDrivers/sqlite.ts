@@ -23,6 +23,65 @@ function classifySql(sql: string): "select" | "dml" {
     : "dml";
 }
 
+function splitSQLiteScript(sql: string): string[] {
+  const stmts: string[] = [];
+  let buf = "";
+  let i = 0;
+  const n = sql.length;
+
+  while (i < n) {
+    if (sql[i] === "-" && sql[i + 1] === "-") {
+      while (i < n && sql[i] !== "\n") buf += sql[i++];
+      continue;
+    }
+
+    if (sql[i] === "/" && sql[i + 1] === "*") {
+      buf += sql[i++] + sql[i++];
+      while (i < n) {
+        if (sql[i] === "*" && sql[i + 1] === "/") {
+          buf += sql[i++] + sql[i++];
+          break;
+        }
+        buf += sql[i++];
+      }
+      continue;
+    }
+
+    if (sql[i] === "'" || sql[i] === '"' || sql[i] === "`") {
+      const q = sql[i];
+      buf += sql[i++];
+      while (i < n) {
+        const c = sql[i];
+        buf += c;
+        i++;
+        if (c === q) {
+          if (sql[i] === q) {
+            buf += sql[i++];
+          } else {
+            break;
+          }
+        }
+      }
+      continue;
+    }
+
+    if (sql[i] === ";") {
+      i++;
+      const stmt = buf.trim();
+      if (stmt) stmts.push(stmt);
+      buf = "";
+      continue;
+    }
+
+    buf += sql[i++];
+  }
+
+  const tail = buf.trim();
+  if (tail) stmts.push(tail);
+
+  return stmts;
+}
+
 export class SQLiteDriver implements IDBDriver {
   private db: Database | null = null;
   private readonly config: ConnectionConfig;
@@ -126,11 +185,32 @@ export class SQLiteDriver implements IDBDriver {
   async query(sql: string, params?: unknown[]): Promise<QueryResult> {
     const start = Date.now();
 
+    if (params && params.length > 0) {
+      return this._executeSingle(sql, params, start);
+    }
+
+    const stmts = splitSQLiteScript(sql);
+
+    if (stmts.length === 0) {
+      return { columns: [], rows: [], rowCount: 0, executionTimeMs: 0 };
+    }
+
+    if (stmts.length === 1) {
+      return this._executeSingle(stmts[0], [], start);
+    }
+
+    return this._executeScript(stmts, start);
+  }
+
+  private _executeSingle(
+    sql: string,
+    params: unknown[],
+    start: number,
+  ): QueryResult {
     const kind = classifySql(sql);
+    const bindValues = params as import("node-sqlite3-wasm").BindValues;
 
     if (kind === "select") {
-      const bindValues = (params ??
-        []) as import("node-sqlite3-wasm").BindValues;
       const rawRows = this.db!.all(sql, bindValues) as Record<
         string,
         unknown
@@ -147,46 +227,60 @@ export class SQLiteDriver implements IDBDriver {
       };
     }
 
-    if (params && params.length > 0) {
-      const bindValues = params as import("node-sqlite3-wasm").BindValues;
-      try {
-        const returningRows = this.db!.all(sql, bindValues) as Record<
-          string,
-          unknown
-        >[];
-        if (returningRows.length > 0) {
-          const columns = Object.keys(returningRows[0]);
-          const rows = returningRows.map((row) =>
-            Object.fromEntries(
-              columns.map((col, i) => [`__col_${i}`, row[col]]),
-            ),
-          );
-          return {
-            columns,
-            rows,
-            rowCount: rows.length,
-            executionTimeMs: Date.now() - start,
-          };
-        }
-      } catch {}
-      const info = this.db!.run(sql, bindValues);
-      return {
-        columns: [],
-        rows: [],
-        rowCount: info.changes,
-        executionTimeMs: Date.now() - start,
-        affectedRows: info.changes,
-      };
-    }
+    try {
+      const returningRows = this.db!.all(sql, bindValues) as Record<
+        string,
+        unknown
+      >[];
+      if (returningRows.length > 0) {
+        const columns = Object.keys(returningRows[0]);
+        const rows = returningRows.map((row) =>
+          Object.fromEntries(columns.map((col, i) => [`__col_${i}`, row[col]])),
+        );
+        return {
+          columns,
+          rows,
+          rowCount: rows.length,
+          executionTimeMs: Date.now() - start,
+        };
+      }
+    } catch {}
 
-    this.db!.exec(sql);
+    const info = this.db!.run(sql, bindValues);
     return {
       columns: [],
       rows: [],
-      rowCount: 0,
+      rowCount: info.changes,
       executionTimeMs: Date.now() - start,
-      affectedRows: 0,
+      affectedRows: info.changes,
     };
+  }
+
+  private _executeScript(stmts: string[], start: number): QueryResult {
+    let lastResult: QueryResult = {
+      columns: [],
+      rows: [],
+      rowCount: 0,
+      executionTimeMs: 0,
+    };
+    let totalAffected = 0;
+
+    for (const stmt of stmts) {
+      const r = this._executeSingle(stmt, [], start);
+      totalAffected += r.affectedRows ?? 0;
+      if (r.columns.length > 0) {
+        lastResult = r;
+      } else if (lastResult.columns.length === 0) {
+        lastResult = r;
+      }
+    }
+
+    lastResult.executionTimeMs = Date.now() - start;
+    if (lastResult.columns.length === 0) {
+      lastResult.rowCount = totalAffected;
+      lastResult.affectedRows = totalAffected;
+    }
+    return lastResult;
   }
 
   async getIndexes(
