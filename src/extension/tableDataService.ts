@@ -825,6 +825,10 @@ function buildWhere(
         !isNaN(Number(val)) &&
         val !== ""
       ) {
+        if (type === "mssql" && colType.split("(")[0].trim() === "bigint") {
+          params.push(BigInt(val));
+          return `${col} = ?`;
+        }
         if (
           type === "sqlite" &&
           /^-?\d+$/.test(val) &&
@@ -927,6 +931,10 @@ function buildWhere(
             params.push(num);
             return `${col} = ?`;
           }
+        }
+        if (mssqlBase === "bigint" && /^-?\d+$/.test(val)) {
+          params.push(BigInt(val));
+          return `${col} = ?`;
         }
         if (isDateCol) {
           let dateStr: string | null = null;

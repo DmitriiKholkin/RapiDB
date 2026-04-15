@@ -490,6 +490,7 @@
     "build": "npm i && node esbuild.config.mjs",
     "watch": "node esbuild.config.mjs --watch",
     "compile": "node esbuild.config.mjs",
+    "test:db": "tsc -p tsconfig.test.json && node esbuild.test.mjs && node dist/test/db-smoke.cjs",
     "package": "vsce package",
     "lint": "eslint src --ext ts,tsx"
   },

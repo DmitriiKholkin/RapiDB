@@ -367,6 +367,7 @@ export class MSSQLDriver implements IDBDriver {
 
   private guessMssqlType(value: any) {
     if (Buffer.isBuffer(value)) return mssql.TYPES.VarBinary;
+    if (typeof value === "bigint") return mssql.TYPES.BigInt;
     if (typeof value === "number") {
       return Number.isInteger(value) ? mssql.TYPES.Int : mssql.TYPES.Float;
     }
