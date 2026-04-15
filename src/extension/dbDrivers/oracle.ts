@@ -36,7 +36,7 @@ function oracleFullType(
   return dataType;
 }
 
-oracledb.fetchAsString = [oracledb.CLOB, oracledb.DATE];
+oracledb.fetchAsString = [oracledb.CLOB];
 oracledb.fetchAsBuffer = [oracledb.BLOB];
 
 let _thickInitDone = false;
@@ -275,17 +275,6 @@ export class OracleDriver implements IDBDriver {
       poolIncrement: 1,
       poolTimeout: 30,
       poolPingInterval: 60,
-      sessionCallback: async (connection: oracledb.Connection) => {
-        await connection.execute(
-          `ALTER SESSION SET NLS_DATE_FORMAT      = 'YYYY-MM-DD HH24:MI:SS'`,
-        );
-        await connection.execute(
-          `ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF3'`,
-        );
-        await connection.execute(
-          `ALTER SESSION SET NLS_TIMESTAMP_TZ_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF3 TZH:TZM'`,
-        );
-      },
     })) as unknown as oracledb.Pool;
 
     const conn = await this.pool.getConnection();
@@ -319,6 +308,7 @@ export class OracleDriver implements IDBDriver {
       const res = await conn.execute<{ ORA_DATABASE_NAME: string }>(
         `SELECT ora_database_name FROM dual`,
         {},
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
       const name =
         res.rows?.[0]?.ORA_DATABASE_NAME ??
@@ -347,11 +337,15 @@ export class OracleDriver implements IDBDriver {
         WHERE oracle_maintained = 'N'
             OR username = 'SYSTEM'
         ORDER BY username`,
+        {},
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
       return (res.rows ?? []).map((r) => ({ name: r.OWNER }));
     } catch {
       const res2 = await conn.execute<{ USERNAME: string }>(
         `SELECT sys_context('USERENV','SESSION_USER') AS username FROM dual`,
+        {},
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
       const owner = res2.rows?.[0]?.USERNAME ?? this.config.username ?? "";
       return owner ? [{ name: owner }] : [];
@@ -376,6 +370,7 @@ export class OracleDriver implements IDBDriver {
            AND status = 'VALID'
          ORDER BY object_type, object_name`,
         [schema.toUpperCase()],
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
 
       for (const r of tableRes.rows ?? []) {
@@ -424,6 +419,7 @@ export class OracleDriver implements IDBDriver {
          WHERE owner = :1 AND table_name = :2
          ORDER BY column_id`,
         [schema.toUpperCase(), table.toUpperCase()],
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
 
       const pkRes = await conn.execute<{ COLUMN_NAME: string }>(
@@ -436,6 +432,7 @@ export class OracleDriver implements IDBDriver {
            AND cons.owner = :1
            AND cons.table_name = :2`,
         [schema.toUpperCase(), table.toUpperCase()],
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
       const pkCols = new Set((pkRes.rows ?? []).map((r) => r.COLUMN_NAME));
 
@@ -449,6 +446,7 @@ export class OracleDriver implements IDBDriver {
            AND cons.owner = :1
            AND cons.table_name = :2`,
         [schema.toUpperCase(), table.toUpperCase()],
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
       const fkCols = new Set((fkRes.rows ?? []).map((r) => r.COLUMN_NAME));
 
@@ -465,6 +463,7 @@ export class OracleDriver implements IDBDriver {
            FROM all_tab_identity_cols
            WHERE owner = :1 AND table_name = :2`,
           [schema.toUpperCase(), table.toUpperCase()],
+          { outFormat: oracledb.OUT_FORMAT_OBJECT },
         );
         for (const r of idRes.rows ?? []) {
           identityMap.set(
@@ -527,6 +526,7 @@ export class OracleDriver implements IDBDriver {
          WHERE i.owner = :1 AND i.table_name = :2
          ORDER BY i.index_name, c.column_position`,
         [schema.toUpperCase(), table.toUpperCase()],
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
 
       const map = new Map<string, IndexMeta>();
@@ -578,6 +578,7 @@ export class OracleDriver implements IDBDriver {
            AND fk.owner = :1 AND fk.table_name = :2
          ORDER BY fk.constraint_name, fkcol.position`,
         [schema.toUpperCase(), table.toUpperCase()],
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
 
       return (res.rows ?? []).map((r) => ({
@@ -613,6 +614,7 @@ export class OracleDriver implements IDBDriver {
           const res = await conn.execute<{ DDL: string }>(
             `SELECT DBMS_METADATA.GET_DDL('VIEW', :2, :1) AS ddl FROM dual`,
             [schema.toUpperCase(), table.toUpperCase()],
+            { outFormat: oracledb.OUT_FORMAT_OBJECT },
           );
           const ddl = res.rows?.[0]?.DDL;
           if (typeof ddl === "string" && ddl.trim()) {
@@ -819,6 +821,7 @@ export class OracleDriver implements IDBDriver {
            AND type IN ('FUNCTION','PROCEDURE','PACKAGE','PACKAGE BODY')
          ORDER BY type, line`,
         [schema.toUpperCase(), name.toUpperCase()],
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
       const lines = (res.rows ?? []).map((r) => r.TEXT);
       if (lines.length === 0) {
@@ -902,7 +905,17 @@ export class OracleDriver implements IDBDriver {
       if (res.metaData && res.rows && res.rows.length > 0) {
         const columns = res.metaData.map((m) => m.name);
         const rows = (res.rows as unknown[][]).map((row) =>
-          Object.fromEntries(row.map((val, i) => [`__col_${i}`, val])),
+          Object.fromEntries(
+            row.map((val, i) => {
+              let finalVal = val;
+
+              if (val instanceof Date) {
+                finalVal = `${val.toISOString().replace("T", " ").substring(0, 19)} +00`;
+              }
+
+              return [`__col_${i}`, finalVal];
+            }),
+          ),
         );
         return { columns, rows, rowCount: rows.length, executionTimeMs };
       }

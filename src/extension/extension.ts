@@ -52,6 +52,50 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(bookmarksView, bookmarksProvider.disposable);
 
   const refresh = () => connectionProvider.refresh();
+  const connectionProgressMap = new Map<string, Promise<boolean>>();
+
+  async function connectIfNeeded(
+    connectionId: string,
+    title: string,
+    waitForExisting: boolean,
+  ): Promise<boolean> {
+    if (connectionManager.isConnected(connectionId)) {
+      return true;
+    }
+
+    const existingProgress = connectionProgressMap.get(connectionId);
+    if (existingProgress) {
+      if (!waitForExisting) {
+        return false;
+      }
+      return existingProgress;
+    }
+
+    if (connectionManager.isConnecting(connectionId)) {
+      if (!waitForExisting) {
+        return false;
+      }
+      await connectionManager.connectTo(connectionId);
+      return connectionManager.isConnected(connectionId);
+    }
+
+    const progressPromise = Promise.resolve(
+      vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Window,
+          title,
+        },
+        () => connectionManager.connectTo(connectionId),
+      ),
+    ).then(() => connectionManager.isConnected(connectionId));
+
+    connectionProgressMap.set(connectionId, progressPromise);
+    try {
+      return await progressPromise;
+    } finally {
+      connectionProgressMap.delete(connectionId);
+    }
+  }
 
   function reg(
     command: string,
@@ -112,18 +156,19 @@ export function activate(context: vscode.ExtensionContext): void {
     if (!id) {
       return;
     }
-    if (connectionManager.isConnected(id)) {
+    if (
+      connectionManager.isConnected(id) ||
+      connectionManager.isConnecting(id)
+    ) {
       refresh();
       return;
     }
     const conn = connectionManager.getConnection(id);
     try {
-      await vscode.window.withProgress(
-        {
-          location: vscode.ProgressLocation.Window,
-          title: `RapiDB: Connecting to "${conn?.name ?? id}"…`,
-        },
-        () => connectionManager.connectTo(id),
+      await connectIfNeeded(
+        id,
+        `RapiDB: Connecting to "${conn?.name ?? id}"…`,
+        false,
       );
       refresh();
     } catch (err: any) {
@@ -158,13 +203,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     if (!connectionManager.isConnected(connectionId)) {
       try {
-        await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Window,
-            title: "RapiDB: Connecting…",
-          },
-          () => connectionManager.connectTo(connectionId),
-        );
+        await connectIfNeeded(connectionId, "RapiDB: Connecting…", true);
         refresh();
       } catch (err: any) {
         vscode.window.showErrorMessage(
@@ -263,13 +302,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
     if (!connectionManager.isConnected(node.connectionId)) {
       try {
-        await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Window,
-            title: "RapiDB: Connecting…",
-          },
-          () => connectionManager.connectTo(node.connectionId!),
-        );
+        await connectIfNeeded(node.connectionId, "RapiDB: Connecting…", true);
         refresh();
       } catch (err: any) {
         vscode.window.showErrorMessage(

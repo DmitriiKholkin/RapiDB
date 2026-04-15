@@ -4,6 +4,7 @@ import type { TableInfo } from "../dbDrivers/types";
 
 export type NodeKind =
   | "connectionNode_disconnected"
+  | "connectionNode_connecting"
   | "connectionNode_connected"
   | "folder"
   | "database"
@@ -19,6 +20,7 @@ export type NodeKind =
 
 const ICON_MAP: Record<NodeKind, string> = {
   connectionNode_disconnected: "server",
+  connectionNode_connecting: "sync~spin",
   connectionNode_connected: "server",
   folder: "folder",
   database: "database",
@@ -320,9 +322,13 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
 
   private makeConnectionNode(config: ConnectionConfig): RapiDBNode {
     const connected = this.connectionManager.isConnected(config.id);
+    const connecting =
+      !connected && this.connectionManager.isConnecting(config.id);
     const kind: NodeKind = connected
       ? "connectionNode_connected"
-      : "connectionNode_disconnected";
+      : connecting
+        ? "connectionNode_connecting"
+        : "connectionNode_disconnected";
 
     const node = new RapiDBNode(
       config.name,
@@ -337,35 +343,33 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     node.description = config.type;
 
     if (config.type === "sqlite") {
-      node.tooltip = new vscode.MarkdownString(
-        [
-          `**${config.name}**`,
-          ``,
-          `Type: \`sqlite\``,
-          `File: \`${config.filePath ?? "—"}\``,
-        ].join("\n"),
-      );
+      const tooltipLines = [
+        `**${config.name}**`,
+        ``,
+        `Type: \`sqlite\``,
+        `File: \`${config.filePath ?? "—"}\``,
+      ];
+      node.tooltip = new vscode.MarkdownString(tooltipLines.join("\n"));
     } else {
       const sslStatus = config.ssl
         ? config.rejectUnauthorized !== false
           ? "enabled"
           : "enabled (allow self-signed)"
         : "disabled";
-      node.tooltip = new vscode.MarkdownString(
-        [
-          `**${config.name}**`,
-          ``,
-          `Type: \`${config.type}\``,
-          `Host: \`${config.host ?? "—"}\``,
-          `Port: \`${config.port ?? "—"}\``,
-          `Database: \`${config.database ?? "—"}\``,
-          `User: \`${config.username ?? "—"}\``,
-          `SSL: \`${sslStatus}\``,
-        ].join("\n"),
-      );
+      const tooltipLines = [
+        `**${config.name}**`,
+        ``,
+        `Type: \`${config.type}\``,
+        `Host: \`${config.host ?? "—"}\``,
+        `Port: \`${config.port ?? "—"}\``,
+        `Database: \`${config.database ?? "—"}\``,
+        `User: \`${config.username ?? "—"}\``,
+        `SSL: \`${sslStatus}\``,
+      ];
+      node.tooltip = new vscode.MarkdownString(tooltipLines.join("\n"));
     }
 
-    if (!connected) {
+    if (!connected && !connecting) {
       node.command = {
         command: "rapidb.connect",
         title: "Connect",

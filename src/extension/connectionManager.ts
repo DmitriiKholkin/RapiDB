@@ -86,6 +86,7 @@ const VALID_PAGE_SIZES = [25, 100, 500, 1000] as const;
 export class ConnectionManager {
   private readonly context: vscode.ExtensionContext;
   private driverMap = new Map<string, IDBDriver>();
+  private readonly _connectingMap = new Map<string, Promise<void>>();
 
   readonly onDidChangeConnections: vscode.Event<void>;
   private readonly _onDidChangeConnections = new vscode.EventEmitter<void>();
@@ -277,30 +278,63 @@ export class ConnectionManager {
   }
 
   async connectTo(id: string): Promise<void> {
-    if (this.driverMap.has(id)) {
-      if (this.isConnected(id)) {
-        return;
-      }
-      await this.disconnectFrom(id);
+    const pending = this._connectingMap.get(id);
+    if (pending) {
+      await pending;
+      return;
     }
-    const config = this.getConnection(id);
-    if (!config) {
-      throw new Error(`[RapiDB] Connection "${id}" not found`);
+
+    if (this.isConnected(id)) {
+      return;
     }
-    const fullConfig = await this._hydratePassword(config);
-    const driver = this.createDriver(fullConfig);
-    try {
-      await driver.connect();
-    } catch (err) {
+
+    let resolveAttempt!: () => void;
+    let rejectAttempt!: (err: unknown) => void;
+    const attempt = new Promise<void>((resolve, reject) => {
+      resolveAttempt = resolve;
+      rejectAttempt = reject;
+    });
+
+    this._connectingMap.set(id, attempt);
+    this._onDidChangeConnections.fire();
+
+    void (async () => {
       try {
-        await driver.disconnect();
-      } catch {}
-      throw err;
-    }
-    this.driverMap.set(id, driver);
-    this._schemaCacheMap.delete(id);
-    this._startSchemaLoad(id);
-    this._onDidConnect.fire();
+        if (this.driverMap.has(id)) {
+          await this.disconnectFrom(id);
+        }
+
+        const config = this.getConnection(id);
+        if (!config) {
+          throw new Error(`[RapiDB] Connection "${id}" not found`);
+        }
+
+        const fullConfig = await this._hydratePassword(config);
+        const driver = this.createDriver(fullConfig);
+
+        try {
+          await driver.connect();
+        } catch (err) {
+          try {
+            await driver.disconnect();
+          } catch {}
+          throw err;
+        }
+
+        this.driverMap.set(id, driver);
+        this._schemaCacheMap.delete(id);
+        this._startSchemaLoad(id);
+        this._onDidConnect.fire();
+        resolveAttempt();
+      } catch (err) {
+        rejectAttempt(err);
+      } finally {
+        this._connectingMap.delete(id);
+        this._onDidChangeConnections.fire();
+      }
+    })();
+
+    await attempt;
   }
 
   async disconnectFrom(id: string): Promise<void> {
@@ -317,6 +351,10 @@ export class ConnectionManager {
 
   isConnected(id: string): boolean {
     return this.driverMap.get(id)?.isConnected() ?? false;
+  }
+
+  isConnecting(id: string): boolean {
+    return this._connectingMap.has(id);
   }
 
   getDriver(id: string): IDBDriver | undefined {
