@@ -8,23 +8,25 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import React, {
   useCallback,
   useEffect,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
+import {
+  type ColumnMeta,
+  isNumericCategory,
+  NULL_SENTINEL,
+  type PendingEdits,
+  placeholderForCategory,
+  type Row,
+} from "../types";
 import { type Column, calcColWidths } from "../utils/columnSizing";
 import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
+import { CellDisplay } from "./table/CellDisplay";
+import { EditInput, valueToEditString } from "./table/EditInput";
+import { NewRowForm } from "./table/NewRowForm";
 
-interface ColDef {
-  name: string;
-  type: string;
-  nullable: boolean;
-  isPrimaryKey: boolean;
-  isForeignKey: boolean;
-  isBoolean?: boolean;
-}
 interface Props {
   connectionId: string;
   database: string;
@@ -33,8 +35,6 @@ interface Props {
   isView?: boolean;
   defaultPageSize?: number;
 }
-type Row = Record<string, unknown>;
-type PendingEdits = Map<number, Map<string, unknown>>;
 
 const PAGE_SIZES = [25, 100, 500, 1000];
 const DEBOUNCE = 400;
@@ -51,11 +51,11 @@ if (
   const s = document.createElement("style");
   s.id = TABLE_ROW_STYLE_ID;
   s.textContent = [
-    `.hdb-trow { transition: background 60ms; }`,
-    `.hdb-trow[data-even="true"]  { background: var(--vscode-editor-background); }`,
-    `.hdb-trow[data-even="false"] { background: var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.04)); }`,
+    `.rdb-trow { transition: background 60ms; }`,
+    `.rdb-trow[data-even="true"]  { background: var(--vscode-editor-background); }`,
+    `.rdb-trow[data-even="false"] { background: var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.04)); }`,
 
-    `.hdb-trow:not([data-selected="true"]):hover { background: var(--vscode-list-hoverBackground); }`,
+    `.rdb-trow:not([data-selected="true"]):hover { background: var(--vscode-list-hoverBackground); }`,
   ].join("\n");
   document.head.appendChild(s);
 }
@@ -112,7 +112,7 @@ export function TableView({
       ? defaultPageSize
       : 25;
 
-  const [columns, setColumns] = useState<ColDef[]>([]);
+  const [columns, setColumns] = useState<ColumnMeta[]>([]);
   const [pkCols, setPkCols] = useState<string[]>([]);
   const [rows, setRows] = useState<Row[]>([]);
   const [totalCount, setTotalCount] = useState(0);
@@ -144,7 +144,7 @@ export function TableView({
 
   const colSizesInitedRef = useRef(false);
 
-  const columnsRef = useRef<ColDef[]>([]);
+  const columnsRef = useRef<ColumnMeta[]>([]);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const scrollPreserveRef = useRef<number | null>(null);
@@ -196,7 +196,7 @@ export function TableView({
 
   useEffect(() => {
     const unInit = onMessage<{
-      columns: ColDef[];
+      columns: ColumnMeta[];
       primaryKeyColumns: string[];
     }>("tableInit", ({ columns: cols, primaryKeyColumns }) => {
       columnsRef.current = cols;
@@ -422,7 +422,7 @@ export function TableView({
   );
 
   const handleStartEdit = useCallback(
-    (rowIdx: number, col: ColDef) => {
+    (rowIdx: number, col: ColumnMeta) => {
       if (isView) {
         return;
       }
@@ -549,21 +549,13 @@ export function TableView({
               const startVal = hasPending
                 ? (pe.get(rowIdx)!.get(col.name) ?? "")
                 : (getValue() ?? "");
-              const startStr =
-                col.isBoolean && startVal !== null && startVal !== undefined
-                  ? startVal === true || startVal === 1 || startVal === "1"
-                    ? "true"
-                    : startVal === false || startVal === 0 || startVal === "0"
-                      ? "false"
-                      : String(startVal)
-                  : startVal == null
-                    ? NULL_SENTINEL
-                    : String(startVal);
+              const startStr = valueToEditString(startVal, col.isBoolean);
               return (
                 <EditInput
                   initial={startStr}
                   nullable={col.nullable}
                   isBoolean={col.isBoolean}
+                  category={col.category}
                   onCommit={(v) =>
                     commitCellEdit(rowIdx, col.name, v, getValue())
                   }
@@ -574,9 +566,9 @@ export function TableView({
             return (
               <CellDisplay
                 value={displayVal}
-                isPk={col.isPrimaryKey}
                 isPending={hasPending}
                 isBoolean={col.isBoolean}
+                category={col.category}
               />
             );
           },
@@ -859,135 +851,14 @@ export function TableView({
 
       {}
       {!isView && newRow && (
-        <div
-          style={{
-            flexShrink: 0,
-            padding: "8px 12px",
-            borderBottom: "1px solid var(--vscode-panel-border)",
-            background:
-              "var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.1))",
-            display: "flex",
-            flexWrap: "wrap",
-            gap: 8,
-            alignItems: "flex-end",
-          }}
-        >
-          <span
-            style={{
-              fontSize: 11,
-              opacity: 0.6,
-              alignSelf: "center",
-              marginRight: 4,
-            }}
-          >
-            New row:
-          </span>
-          {columns.map((col) => {
-            const isNull = newRow[col.name] === NULL_SENTINEL;
-            const rawVal = newRow[col.name];
-
-            return (
-              <div
-                key={col.name}
-                style={{ display: "flex", flexDirection: "column", gap: 2 }}
-              >
-                <label style={{ fontSize: 10, opacity: 0.6 }}>
-                  {col.name}
-                  {col.isPrimaryKey && (
-                    <Icon
-                      name="key"
-                      size={10}
-                      color="var(--vscode-charts-yellow, #cca700)"
-                      style={{ marginLeft: 3 }}
-                      title="Primary Key"
-                    />
-                  )}
-                </label>
-                <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-                  <input
-                    value={isNull ? "" : String(rawVal ?? "")}
-                    disabled={isNull}
-                    onChange={(e) =>
-                      setNewRow({ ...newRow, [col.name]: e.target.value })
-                    }
-                    placeholder={
-                      isNull
-                        ? "NULL"
-                        : col.isBoolean
-                          ? "true / false"
-                          : undefined
-                    }
-                    style={{
-                      width: 120,
-                      padding: "3px 6px",
-                      fontSize: 12,
-                      background: "var(--vscode-input-background)",
-                      color: isNull
-                        ? "var(--vscode-disabledForeground)"
-                        : "var(--vscode-input-foreground)",
-                      border: "1px solid var(--vscode-input-border)",
-                      borderRadius: 2,
-                      fontFamily: "inherit",
-                      opacity: isNull ? 0.55 : 1,
-                      fontStyle: isNull ? "italic" : "normal",
-                      boxSizing: "border-box",
-                    }}
-                  />
-                  {col.nullable && (
-                    <button
-                      onMouseDown={(e) => e.preventDefault()}
-                      onClick={() =>
-                        setNewRow({
-                          ...newRow,
-                          [col.name]: isNull ? "" : NULL_SENTINEL,
-                        })
-                      }
-                      title={
-                        isNull
-                          ? "Remove NULL — set to empty"
-                          : "Set field to NULL"
-                      }
-                      style={{
-                        flexShrink: 0,
-                        height: 24,
-                        padding: "0 5px",
-                        fontSize: 9,
-                        fontStyle: "italic",
-                        fontFamily: "inherit",
-                        background: isNull
-                          ? "var(--vscode-button-background)"
-                          : "transparent",
-                        color: isNull
-                          ? "var(--vscode-button-foreground)"
-                          : "var(--vscode-badge-foreground)",
-                        border: "none",
-                        borderRadius: 2,
-                        cursor: "pointer",
-                        letterSpacing: "0.02em",
-                        opacity: isNull ? 1 : 0.5,
-                      }}
-                    >
-                      NULL
-                    </button>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-          <button
-            style={{ ...btn("primary", inserting), alignSelf: "flex-end" }}
-            disabled={inserting}
-            onClick={commitNewRow}
-          >
-            {inserting ? "Inserting…" : "Insert"}
-          </button>
-          <button
-            style={{ ...btn("ghost"), alignSelf: "flex-end" }}
-            onClick={() => setNewRow(null)}
-          >
-            Cancel
-          </button>
-        </div>
+        <NewRowForm
+          columns={columns}
+          newRow={newRow}
+          setNewRow={setNewRow}
+          inserting={inserting}
+          onInsert={commitNewRow}
+          onCancel={() => setNewRow(null)}
+        />
       )}
 
       {}
@@ -1150,8 +1021,11 @@ export function TableView({
                           placeholder={
                             isNullFilter
                               ? "NULL"
-                              : col?.isBoolean
-                                ? "true / false"
+                              : col
+                                ? placeholderForCategory(
+                                    col.category,
+                                    col.isBoolean,
+                                  )
                                 : "filter"
                           }
                           style={{
@@ -1355,16 +1229,16 @@ const TableRow = React.memo(function TableRow({
   isSelected: boolean;
   pendingCols?: Map<string, unknown>;
 
-  columnsMap: Map<string, ColDef>;
+  columnsMap: Map<string, ColumnMeta>;
 
   editingCol: string | null;
   isView: boolean;
 
-  onStartEdit: (rowIndex: number, col: ColDef) => void;
+  onStartEdit: (rowIndex: number, col: ColumnMeta) => void;
 }) {
   return (
     <tr
-      className="hdb-trow"
+      className="rdb-trow"
       data-even={String(index % 2 === 0)}
       data-selected={String(isSelected)}
       style={{
@@ -1388,7 +1262,11 @@ const TableRow = React.memo(function TableRow({
               width: cell.column.getSize(),
               height: ROW_H,
               padding: isSel ? "0 6px" : "0 0 0 8px",
-              textAlign: isSel ? "center" : "left",
+              textAlign: isSel
+                ? "center"
+                : colDef && isNumericCategory(colDef.category)
+                  ? "right"
+                  : "left",
               borderBottom: "1px solid var(--vscode-panel-border)",
               borderRight: "1px solid var(--vscode-panel-border)",
               borderLeft: isCellPending
@@ -1422,158 +1300,3 @@ const TableRow = React.memo(function TableRow({
     </tr>
   );
 });
-
-export const NULL_SENTINEL = "\x00__NULL__\x00";
-
-function EditInput({
-  initial,
-  nullable,
-  isBoolean,
-  onCommit,
-  onCancel,
-}: {
-  initial: string;
-  nullable: boolean;
-  isBoolean?: boolean;
-  onCommit: (v: string) => void;
-  onCancel: () => void;
-}) {
-  const isInitiallyNull = initial === NULL_SENTINEL;
-  const [isNull, setIsNull] = useState(isInitiallyNull);
-  const [val, setVal] = useState(isInitiallyNull ? "" : initial);
-  const ref = useRef<HTMLInputElement>(null);
-
-  useLayoutEffect(() => {
-    if (!isNull) {
-      ref.current?.focus();
-      ref.current?.select();
-    }
-  }, [isNull]);
-
-  const commit = () => onCommit(isNull ? NULL_SENTINEL : val);
-
-  const inputStyle: React.CSSProperties = {
-    flex: 1,
-    minWidth: 0,
-    height: ROW_H - 4,
-    padding: "0 4px",
-    fontSize: 12,
-    fontFamily: "inherit",
-    background: "var(--vscode-input-background)",
-    color: isNull
-      ? "var(--vscode-disabledForeground)"
-      : "var(--vscode-input-foreground)",
-    border: "1px solid var(--vscode-focusBorder)",
-    borderRadius: 2,
-    outline: "none",
-    boxSizing: "border-box",
-    opacity: isNull ? 0.5 : 1,
-  };
-
-  const nullBtnStyle: React.CSSProperties = {
-    flexShrink: 0,
-    height: "100%",
-    padding: "0 5px",
-    fontSize: 9,
-    fontStyle: "italic",
-    fontFamily: "inherit",
-    background: "transparent",
-    color: "var(--vscode-badge-foreground)",
-    border: "none",
-    borderRadius: 2,
-    cursor: "pointer",
-    letterSpacing: "0.02em",
-    opacity: 0.5,
-  };
-
-  return (
-    <div
-      style={{ display: "flex", alignItems: "center", gap: 2, width: "100%" }}
-    >
-      <input
-        ref={ref}
-        value={val}
-        disabled={isNull}
-        onChange={(e) => setVal(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            commit();
-          }
-          if (e.key === "Escape") {
-            e.preventDefault();
-            onCancel();
-          }
-        }}
-        onBlur={commit}
-        onClick={(e) => e.stopPropagation()}
-        style={inputStyle}
-      />
-      {nullable && (
-        <button
-          data-null-btn="1"
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={() => onCommit(NULL_SENTINEL)}
-          title="Set field to NULL"
-          style={nullBtnStyle}
-        >
-          NULL
-        </button>
-      )}
-    </div>
-  );
-}
-
-function CellDisplay({
-  value,
-  isPk,
-  isPending,
-  isBoolean,
-}: {
-  value: unknown;
-  isPk: boolean;
-  isPending: boolean;
-  isBoolean?: boolean;
-}) {
-  if (value === null || value === undefined) {
-    return <span style={{ fontStyle: "italic", opacity: 0.45 }}>NULL</span>;
-  }
-
-  const isBoolVal =
-    typeof value === "boolean" ||
-    (isBoolean &&
-      (value === 0 ||
-        value === 1 ||
-        value === "0" ||
-        value === "1" ||
-        value === "true" ||
-        value === "false"));
-  if (isBoolVal) {
-    const boolVal =
-      value === true || value === 1 || value === "1" || value === "true";
-    return (
-      <span
-        style={{
-          color: boolVal
-            ? "var(--vscode-testing-iconPassed, #4ec94e)"
-            : "var(--vscode-errorForeground)",
-          fontWeight: 500,
-        }}
-      >
-        {boolVal ? "true" : "false"}
-      </span>
-    );
-  }
-
-  return (
-    <span
-      style={{
-        color: isPending
-          ? "var(--vscode-editorWarning-foreground, #cca700)"
-          : undefined,
-      }}
-    >
-      {String(value)}
-    </span>
-  );
-}

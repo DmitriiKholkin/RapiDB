@@ -4,18 +4,24 @@
     "module": "Node16",
     "moduleResolution": "Node16",
     "lib": [
-      "ES2022"
+      "ES2022",
+      "DOM"
     ],
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "sourceMap": true,
     "resolveJsonModule": true,
-    "noEmit": true
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "react"
   },
   "include": [
     "test/**/*.ts",
-    "src/extension/**/*.ts"
+    "test/**/*.tsx",
+    "src/extension/**/*.ts",
+    "src/webview/**/*.ts",
+    "src/webview/**/*.tsx"
   ],
   "exclude": [
     "node_modules",

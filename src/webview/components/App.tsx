@@ -23,7 +23,7 @@ interface InitialState {
   defaultPageSize?: number;
 }
 
-const state: InitialState = (window as any).__HAPPYDB_INITIAL_STATE__ ?? {
+const state: InitialState = (window as any).__RAPIDB_INITIAL_STATE__ ?? {
   view: "query",
   connectionId: "",
 };

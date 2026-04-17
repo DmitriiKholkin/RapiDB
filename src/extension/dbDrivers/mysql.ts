@@ -1,14 +1,20 @@
 import type { Pool } from "mysql2/promise";
 import * as mysql from "mysql2/promise";
 import type { ConnectionConfig } from "../connectionManager";
+import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
 import type {
   ColumnMeta,
+  ColumnTypeMeta,
   DatabaseInfo,
-  IDBDriver,
+  FilterConditionResult,
+  FilterOperator,
+  PaginationResult,
   QueryResult,
   SchemaInfo,
   TableInfo,
+  TypeCategory,
 } from "./types";
+import { DATETIME_SQL_RE, ISO_DATETIME_RE, NULL_SENTINEL } from "./types";
 
 export function splitMySQLScript(sql: string): string[] {
   const stmts: string[] = [];
@@ -166,11 +172,79 @@ export function splitMySQLScript(sql: string): string[] {
   return stmts;
 }
 
-export class MySQLDriver implements IDBDriver {
+const MYSQL_SPATIAL_TYPES = new Set([
+  "point",
+  "linestring",
+  "polygon",
+  "multipoint",
+  "multilinestring",
+  "multipolygon",
+  "geometrycollection",
+  "geometry",
+]);
+
+function isMysqlSpatialType(colType: string): boolean {
+  return MYSQL_SPATIAL_TYPES.has(colType.toLowerCase().split("(")[0].trim());
+}
+
+function parseMysqlSpatialToWkt(val: string): string {
+  const trimmed = val.trim();
+  if (
+    /^(POINT|LINESTRING|POLYGON|MULTI\w+|GEOMETRYCOLLECTION|GEOMETRY)\s*\(/i.test(
+      trimmed,
+    )
+  ) {
+    return trimmed;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    throw new Error(
+      "Cannot parse spatial value. Use WKT, e.g. POINT(1 2) or POLYGON((0 0, 1 0, 1 1, 0 0)).",
+    );
+  }
+  try {
+    return mysqlSpatialJsonToWkt(parsed);
+  } catch (e: any) {
+    throw new Error(
+      `Cannot convert spatial value to WKT: ${e?.message ?? String(e)}. Use WKT, e.g. POINT(1 2).`,
+    );
+  }
+}
+
+function mysqlSpatialJsonToWkt(obj: unknown): string {
+  if (obj === null || typeof obj !== "object")
+    throw new Error("Invalid spatial JSON");
+  if (!Array.isArray(obj)) {
+    const o = obj as Record<string, unknown>;
+    if (typeof o.x === "number" && typeof o.y === "number")
+      return `POINT(${o.x} ${o.y})`;
+    throw new Error("Unknown spatial object format");
+  }
+  const arr = obj as unknown[];
+  if (arr.length === 0) throw new Error("Empty spatial array");
+  const first = arr[0];
+  if (
+    first !== null &&
+    typeof first === "object" &&
+    !Array.isArray(first) &&
+    typeof (first as any).x === "number"
+  ) {
+    return `LINESTRING(${(arr as Array<{ x: number; y: number }>).map((p) => `${p.x} ${p.y}`).join(", ")})`;
+  }
+  if (Array.isArray(first)) {
+    return `POLYGON(${(arr as Array<Array<{ x: number; y: number }>>).map((ring) => `(${ring.map((p) => `${p.x} ${p.y}`).join(", ")})`).join(", ")})`;
+  }
+  throw new Error("Unrecognised spatial JSON structure");
+}
+
+export class MySQLDriver extends BaseDBDriver {
   private pool: Pool | null = null;
   private readonly config: ConnectionConfig;
 
   constructor(config: ConnectionConfig) {
+    super();
     this.config = config;
   }
 
@@ -540,5 +614,317 @@ export class MySQLDriver implements IDBDriver {
     } finally {
       conn.release();
     }
+  }
+
+  // ─── MySQL type system ───
+
+  mapTypeCategory(nativeType: string): TypeCategory {
+    const ct = nativeType.toLowerCase();
+    const base = ct.split("(")[0].trim();
+    // Boolean
+    if (
+      base === "bool" ||
+      base === "boolean" ||
+      (base === "tinyint" && ct.includes("(1)")) ||
+      (base === "bit" && ct.includes("(1)"))
+    )
+      return "boolean";
+    // Integer
+    if (
+      ["tinyint", "smallint", "mediumint", "int", "integer", "bigint"].includes(
+        base,
+      )
+    )
+      return "integer";
+    if (base === "bit") return "integer";
+    if (base === "year") return "integer";
+    // Float
+    if (base === "float" || base === "double" || base === "real")
+      return "float";
+    // Decimal
+    if (base === "decimal" || base === "numeric") return "decimal";
+    // Date/time
+    if (base === "date") return "date";
+    if (base === "time") return "time";
+    if (base === "datetime" || base === "timestamp") return "datetime";
+    // Binary
+    if (
+      [
+        "binary",
+        "varbinary",
+        "tinyblob",
+        "blob",
+        "mediumblob",
+        "longblob",
+      ].includes(base)
+    )
+      return "binary";
+    // JSON
+    if (base === "json") return "json";
+    // Spatial
+    if (MYSQL_SPATIAL_TYPES.has(base)) return "spatial";
+    // Enum/Set
+    if (ct.startsWith("enum") || ct.startsWith("set")) return "enum";
+    // Text
+    if (
+      [
+        "char",
+        "varchar",
+        "tinytext",
+        "text",
+        "mediumtext",
+        "longtext",
+      ].includes(base)
+    )
+      return "text";
+    return "other";
+  }
+
+  isBooleanType(nativeType: string): boolean {
+    const ct = nativeType.toLowerCase();
+    const base = ct.split("(")[0].trim();
+    if (base === "bool" || base === "boolean") return true;
+    if (base === "tinyint" && ct.includes("(1)")) return true;
+    if (base === "bit" && ct.includes("(1)")) return true;
+    return false;
+  }
+
+  isDatetimeWithTime(nativeType: string): boolean {
+    const ct = nativeType.toLowerCase();
+    return ct === "datetime" || ct === "timestamp";
+  }
+
+  // ─── MySQL SQL helpers ───
+
+  override quoteIdentifier(name: string): string {
+    return `\`${name.replace(/`/g, "``")}\``;
+  }
+
+  override qualifiedTableName(
+    database: string,
+    _schema: string,
+    table: string,
+  ): string {
+    return database
+      ? `${this.quoteIdentifier(database)}.${this.quoteIdentifier(table)}`
+      : this.quoteIdentifier(table);
+  }
+
+  override buildInsertValueExpr(
+    column: ColumnTypeMeta,
+    _paramIndex: number,
+  ): string {
+    if (isMysqlSpatialType(column.nativeType)) return "ST_GeomFromText(?)";
+    return "?";
+  }
+
+  override buildSetExpr(column: ColumnTypeMeta, _paramIndex: number): string {
+    if (isMysqlSpatialType(column.nativeType)) {
+      return `${this.quoteIdentifier(column.name)} = ST_GeomFromText(?)`;
+    }
+    return `${this.quoteIdentifier(column.name)} = ?`;
+  }
+
+  protected override coerceBooleanTrue(): unknown {
+    return 1;
+  }
+  protected override coerceBooleanFalse(): unknown {
+    return 0;
+  }
+
+  // ─── MySQL type-aware data helpers ───
+
+  override coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (value === null || value === undefined || value === "") return value;
+    if (value === NULL_SENTINEL) return null;
+    if (typeof value !== "string") return value;
+
+    if (column.isBoolean) {
+      const lower = value.toLowerCase();
+      if (lower === "true" || lower === "1") return 1;
+      if (lower === "false" || lower === "0") return 0;
+    }
+
+    // Bit columns
+    if (column.nativeType.toLowerCase().startsWith("bit")) {
+      const n = parseInt(value, 10);
+      if (!Number.isNaN(n)) return n;
+    }
+
+    // Binary
+    if (column.category === "binary")
+      return super.coerceInputValue(value, column);
+
+    // Spatial
+    if (column.category === "spatial") return parseMysqlSpatialToWkt(value);
+
+    // ISO datetime → MySQL format
+    if (ISO_DATETIME_RE.test(value)) {
+      const d = new Date(value);
+      if (!Number.isNaN(d.getTime())) {
+        const pad = (n: number) => String(n).padStart(2, "0");
+        const ms = d.getUTCMilliseconds();
+        const fracSec = ms > 0 ? `.${String(ms).padStart(3, "0")}` : "";
+        return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}${fracSec}`;
+      }
+    }
+
+    return value;
+  }
+
+  override formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (value === null || value === undefined) return value;
+    if (Buffer.isBuffer(value)) return super.formatOutputValue(value, column);
+    if (typeof value === "bigint") return value.toString();
+    if (
+      value !== null &&
+      typeof value === "object" &&
+      !(value instanceof Date)
+    ) {
+      return JSON.stringify(value);
+    }
+    if (this.isDatetimeWithTime(column.nativeType)) {
+      const formatted = formatDatetimeForDisplay(value);
+      if (formatted !== null) return formatted;
+    }
+    return value;
+  }
+
+  // ─── MySQL filter building ───
+
+  override buildFilterCondition(
+    column: ColumnTypeMeta,
+    operator: FilterOperator,
+    value: string | [string, string],
+    paramIndex: number,
+  ): FilterConditionResult | null {
+    if (!column.filterable) return null;
+    const col = this.quoteIdentifier(column.name);
+    const val = typeof value === "string" ? value.trim() : value;
+
+    if (operator === "is_null") return { sql: `${col} IS NULL`, params: [] };
+    if (operator === "is_not_null")
+      return { sql: `${col} IS NOT NULL`, params: [] };
+
+    // Boolean
+    if (column.isBoolean && (operator === "eq" || operator === "neq")) {
+      const strVal = (typeof val === "string" ? val : val[0]).toLowerCase();
+      if (strVal === "true" || strVal === "false") {
+        const boolVal = strVal === "true" ? 1 : 0;
+        const op = operator === "neq" ? "!=" : "=";
+        return { sql: `${col} ${op} ?`, params: [boolVal] };
+      }
+    }
+
+    // Spatial: ST_AsText LIKE
+    if (column.category === "spatial") {
+      const v = typeof val === "string" ? val : val[0];
+      return { sql: `ST_AsText(${col}) LIKE ?`, params: [`%${v}%`] };
+    }
+
+    // Binary: HEX LIKE
+    if (column.category === "binary") {
+      const v = typeof val === "string" ? val : val[0];
+      const hexVal = v.replace(/^(0x|\\x)/i, "").toUpperCase();
+      return { sql: `HEX(${col}) LIKE ?`, params: [`%${hexVal}%`] };
+    }
+
+    // Numeric
+    if (
+      this.isNumericCategory(column.category) &&
+      typeof val === "string" &&
+      !Number.isNaN(Number(val)) &&
+      val !== ""
+    ) {
+      const sqlOp = this.sqlOperator(operator);
+      return { sql: `${col} ${sqlOp} ?`, params: [Number(val)] };
+    }
+
+    // Between
+    if (operator === "between" && Array.isArray(val)) {
+      return { sql: `${col} BETWEEN ? AND ?`, params: [val[0], val[1]] };
+    }
+
+    // In
+    if (operator === "in" && typeof val === "string") {
+      const parts = val.split(",").map((s) => s.trim());
+      return {
+        sql: `${col} IN (${parts.map(() => "?").join(", ")})`,
+        params: parts,
+      };
+    }
+
+    // Datetime text search
+    const v = typeof val === "string" ? val : val[0];
+    let finalVal = v;
+    if (ISO_DATETIME_RE.test(v)) {
+      finalVal = v
+        .replace(/(\.\d*?[1-9])0+(?=[Z+-]|$)/, "$1")
+        .replace(/\.0+(?=[Z+-]|$)/, "")
+        .replace("T", "%")
+        .replace("Z", "%")
+        .replace(/[+-]\d{2}:\d{2}$/, "%");
+    }
+    const mysqlVal = DATETIME_SQL_RE.test(finalVal)
+      ? `${finalVal}%`
+      : `%${finalVal}%`;
+    return { sql: `CAST(${col} AS CHAR) LIKE ?`, params: [mysqlVal] };
+  }
+
+  override buildLegacyFilter(
+    column: ColumnTypeMeta,
+    rawValue: string,
+    paramIndex: number,
+  ): FilterConditionResult | null {
+    const val = rawValue.trim();
+    if (val === "") return null;
+    if (val === NULL_SENTINEL)
+      return this.buildFilterCondition(column, "is_null", val, paramIndex);
+
+    if (column.isBoolean) {
+      const lower = val.toLowerCase();
+      if (lower === "true" || lower === "false") {
+        return this.buildFilterCondition(column, "eq", val, paramIndex);
+      }
+    }
+
+    // Numeric (but not for datetime-like types)
+    const numericUnsafe = this.isNumericCompareUnsafe(column.nativeType);
+    if (
+      !numericUnsafe &&
+      !Number.isNaN(Number(val)) &&
+      val !== "" &&
+      !this.isTextualType(column.nativeType) &&
+      !column.isBoolean
+    ) {
+      return this.buildFilterCondition(column, "eq", val, paramIndex);
+    }
+
+    return this.buildFilterCondition(column, "like", val, paramIndex);
+  }
+
+  private isNumericCompareUnsafe(nativeType: string): boolean {
+    const ct = nativeType.toLowerCase().split("(")[0].trim();
+    return (
+      ct === "date" ||
+      ct === "datetime" ||
+      ct === "timestamp" ||
+      ct === "year" ||
+      ct === "time" ||
+      ct === "float" ||
+      ct === "real"
+    );
+  }
+
+  private isTextualType(nativeType: string): boolean {
+    const ct = nativeType.toLowerCase();
+    return (
+      ct.includes("json") ||
+      ct.includes("text") ||
+      ct.includes("char") ||
+      ct.startsWith("enum") ||
+      ct.startsWith("set(") ||
+      ct.includes("blob")
+    );
   }
 }

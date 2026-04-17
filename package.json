@@ -490,11 +490,14 @@
     "build": "npm i && node esbuild.config.mjs",
     "watch": "node esbuild.config.mjs --watch",
     "compile": "node esbuild.config.mjs",
+    "test:unit": "vitest run",
     "test:db": "tsc -p tsconfig.test.json && node esbuild.test.mjs && node dist/test/db-smoke.cjs",
     "package": "vsce package",
     "lint": "eslint src --ext ts,tsx"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
     "@types/mssql": "^9.1.9",
     "@types/node": "^25.5.0",
     "@types/oracledb": "^6.10.2",
@@ -503,7 +506,9 @@
     "@types/react-dom": "^19.2.3",
     "@types/vscode": "^1.85.0",
     "esbuild": "^0.27.4",
-    "typescript": "^5.9.3"
+    "jsdom": "^29.0.2",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.4"
   },
   "dependencies": {
     "@tanstack/react-table": "^8.21.3",

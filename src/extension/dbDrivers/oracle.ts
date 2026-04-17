@@ -1,15 +1,21 @@
 import oracledb from "oracledb";
 import type { ConnectionConfig } from "../connectionManager";
+import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
 import type {
   ColumnMeta,
+  ColumnTypeMeta,
   DatabaseInfo,
+  FilterConditionResult,
+  FilterOperator,
   ForeignKeyMeta,
-  IDBDriver,
   IndexMeta,
+  PaginationResult,
   QueryResult,
   SchemaInfo,
   TableInfo,
+  TypeCategory,
 } from "./types";
+import { ISO_DATETIME_RE, NULL_SENTINEL } from "./types";
 
 function oracleFullType(
   dataType: string,
@@ -238,11 +244,26 @@ function splitOracleStatements(src: string): string[] {
   return stmts.filter((s) => s.length > 0);
 }
 
-export class OracleDriver implements IDBDriver {
+const ORACLE_NON_FILTERABLE = new Set([
+  "blob",
+  "clob",
+  "nclob",
+  "bfile",
+  "raw",
+  "long raw",
+  "long",
+  "xmltype",
+  "sdo_geometry",
+  "anydata",
+  "anytype",
+]);
+
+export class OracleDriver extends BaseDBDriver {
   private pool: oracledb.Pool | null = null;
   private readonly config: ConnectionConfig;
 
   constructor(config: ConnectionConfig) {
+    super();
     this.config = config;
   }
 
@@ -981,5 +1002,201 @@ export class OracleDriver implements IDBDriver {
     } finally {
       await conn.close();
     }
+  }
+
+  // ─── Oracle type system ───
+
+  mapTypeCategory(nativeType: string): TypeCategory {
+    const ct = nativeType.toUpperCase().split("(")[0].trim();
+    if (
+      [
+        "NUMBER",
+        "INTEGER",
+        "SMALLINT",
+        "PLS_INTEGER",
+        "BINARY_INTEGER",
+      ].includes(ct)
+    )
+      return "integer";
+    if (ct === "FLOAT" || ct === "BINARY_FLOAT" || ct === "BINARY_DOUBLE")
+      return "float";
+    if (ct === "DATE") return "datetime";
+    if (ct.startsWith("TIMESTAMP")) return "datetime";
+    if (ct.startsWith("INTERVAL")) return "text";
+    if (["BLOB", "RAW", "LONG RAW"].includes(ct)) return "binary";
+    if (["CLOB", "NCLOB", "LONG"].includes(ct)) return "text";
+    if (ct === "XMLTYPE") return "text";
+    if (ct === "SDO_GEOMETRY") return "spatial";
+    if (ct === "ROWID" || ct === "UROWID") return "text";
+    // VARCHAR2, NVARCHAR2, CHAR, NCHAR
+    if (ct.includes("CHAR") || ct.includes("VARCHAR")) return "text";
+    return "other";
+  }
+
+  isBooleanType(_nativeType: string): boolean {
+    return false;
+  }
+
+  isDatetimeWithTime(nativeType: string): boolean {
+    const ct = nativeType.toUpperCase().split("(")[0].trim();
+    return ct === "DATE" || ct.startsWith("TIMESTAMP");
+  }
+
+  override isFilterable(nativeType: string): boolean {
+    return !ORACLE_NON_FILTERABLE.has(
+      nativeType.toLowerCase().split("(")[0].trim(),
+    );
+  }
+
+  // ─── Oracle SQL helpers ───
+
+  override quoteIdentifier(name: string): string {
+    return `"${name.replace(/"/g, '""')}"`;
+  }
+
+  override qualifiedTableName(
+    _database: string,
+    schema: string,
+    table: string,
+  ): string {
+    return `${this.quoteIdentifier(schema)}.${this.quoteIdentifier(table)}`;
+  }
+
+  override buildPagination(
+    offset: number,
+    limit: number,
+    paramIndex: number,
+  ): PaginationResult {
+    return {
+      sql: `OFFSET :${paramIndex} ROWS FETCH NEXT :${paramIndex + 1} ROWS ONLY`,
+      params: [offset, limit],
+    };
+  }
+
+  override buildInsertValueExpr(
+    column: ColumnTypeMeta,
+    paramIndex: number,
+  ): string {
+    return `:${paramIndex}`;
+  }
+
+  override buildSetExpr(column: ColumnTypeMeta, paramIndex: number): string {
+    return `${this.quoteIdentifier(column.name)} = :${paramIndex}`;
+  }
+
+  // ─── Oracle type-aware data helpers ───
+
+  override coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (value === null || value === undefined || value === "") return value;
+    if (value === NULL_SENTINEL) return null;
+    if (typeof value !== "string") return value;
+
+    // Binary
+    if (column.category === "binary")
+      return super.coerceInputValue(value, column);
+
+    // ISO datetime → Oracle-friendly
+    if (
+      ISO_DATETIME_RE.test(value) &&
+      this.isDatetimeWithTime(column.nativeType)
+    ) {
+      const d = new Date(value);
+      if (!Number.isNaN(d.getTime())) return d;
+    }
+
+    return value;
+  }
+
+  override formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (value === null || value === undefined) return value;
+    if (Buffer.isBuffer(value)) return super.formatOutputValue(value, column);
+    if (typeof value === "bigint") return value.toString();
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+      return `${value.toISOString().replace("T", " ").substring(0, 19)} +00`;
+    }
+    // LOB-like values already consumed as string/Buffer via fetchAsString/fetchAsBuffer
+    return value;
+  }
+
+  // ─── Oracle filter building ───
+
+  override buildFilterCondition(
+    column: ColumnTypeMeta,
+    operator: FilterOperator,
+    value: string | [string, string],
+    paramIndex: number,
+  ): FilterConditionResult | null {
+    if (!column.filterable) return null;
+    const col = this.quoteIdentifier(column.name);
+    const val = typeof value === "string" ? value.trim() : value;
+
+    if (operator === "is_null") return { sql: `${col} IS NULL`, params: [] };
+    if (operator === "is_not_null")
+      return { sql: `${col} IS NOT NULL`, params: [] };
+
+    // Numeric
+    if (
+      this.isNumericCategory(column.category) &&
+      typeof val === "string" &&
+      !Number.isNaN(Number(val)) &&
+      val !== ""
+    ) {
+      const sqlOp = this.sqlOperator(operator);
+      return { sql: `${col} ${sqlOp} :${paramIndex}`, params: [Number(val)] };
+    }
+
+    // Between
+    if (operator === "between" && Array.isArray(val)) {
+      return {
+        sql: `${col} BETWEEN :${paramIndex} AND :${paramIndex + 1}`,
+        params: [val[0], val[1]],
+      };
+    }
+
+    // In
+    if (operator === "in" && typeof val === "string") {
+      const parts = val.split(",").map((s) => s.trim());
+      return {
+        sql: `${col} IN (${parts.map((_, i) => `:${paramIndex + i}`).join(", ")})`,
+        params: parts,
+      };
+    }
+
+    // Datetime: TO_CHAR LIKE
+    if (this.isDatetimeWithTime(column.nativeType)) {
+      const v = typeof val === "string" ? val : val[0];
+      return {
+        sql: `TO_CHAR(${col}, 'YYYY-MM-DD HH24:MI:SS') LIKE :${paramIndex}`,
+        params: [`%${v}%`],
+      };
+    }
+
+    // Default text LIKE (case-insensitive)
+    const v = typeof val === "string" ? val : val[0];
+    return {
+      sql: `UPPER(${col}) LIKE UPPER(:${paramIndex})`,
+      params: [`%${v}%`],
+    };
+  }
+
+  override buildLegacyFilter(
+    column: ColumnTypeMeta,
+    rawValue: string,
+    paramIndex: number,
+  ): FilterConditionResult | null {
+    const val = rawValue.trim();
+    if (val === "") return null;
+    if (val === NULL_SENTINEL)
+      return this.buildFilterCondition(column, "is_null", val, paramIndex);
+
+    if (
+      !Number.isNaN(Number(val)) &&
+      val !== "" &&
+      this.isNumericCategory(column.category)
+    ) {
+      return this.buildFilterCondition(column, "eq", val, paramIndex);
+    }
+
+    return this.buildFilterCondition(column, "like", val, paramIndex);
   }
 }

@@ -404,10 +404,10 @@ if (
   const s = document.createElement("style");
   s.id = RESULTS_ROW_STYLE_ID;
   s.textContent = [
-    `.hdb-rrow { transition: background 60ms; }`,
-    `.hdb-rrow[data-even="true"]  { background: var(--vscode-editor-background); }`,
-    `.hdb-rrow[data-even="false"] { background: var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.04)); }`,
-    `.hdb-rrow:hover { background: var(--vscode-list-hoverBackground); }`,
+    `.rdb-rrow { transition: background 60ms; }`,
+    `.rdb-rrow[data-even="true"]  { background: var(--vscode-editor-background); }`,
+    `.rdb-rrow[data-even="false"] { background: var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.04)); }`,
+    `.rdb-rrow:hover { background: var(--vscode-list-hoverBackground); }`,
   ].join("\n");
   document.head.appendChild(s);
 }
@@ -421,7 +421,7 @@ const VirtualRow = React.memo(function VirtualRow({
 }) {
   return (
     <tr
-      className="hdb-rrow"
+      className="rdb-rrow"
       data-even={String(index % 2 === 0)}
       style={{ height: ROW_H }}
     >

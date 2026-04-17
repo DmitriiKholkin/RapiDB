@@ -1,14 +1,19 @@
 import * as mssql from "mssql";
 import type { ConnectionConfig } from "../connectionManager";
-import { DATETIME_SQL_RE, ISO_DATETIME_RE } from "../tableDataService";
+import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
 import type {
   ColumnMeta,
+  ColumnTypeMeta,
   DatabaseInfo,
-  IDBDriver,
+  FilterConditionResult,
+  FilterOperator,
+  PaginationResult,
   QueryResult,
   SchemaInfo,
   TableInfo,
+  TypeCategory,
 } from "./types";
+import { DATETIME_SQL_RE, ISO_DATETIME_RE, NULL_SENTINEL } from "./types";
 
 function mssqlFullType(
   typeName: string,
@@ -52,11 +57,23 @@ function cleanMssqlDefault(raw: string): string {
 
 const escapeMssqlId = (s: string) => s.replace(/]/g, "]]");
 
-export class MSSQLDriver implements IDBDriver {
+const MSSQL_NON_FILTERABLE = new Set([
+  "image",
+  "text",
+  "ntext",
+  "xml",
+  "geography",
+  "geometry",
+  "hierarchyid",
+  "sql_variant",
+]);
+
+export class MSSQLDriver extends BaseDBDriver {
   private pool: mssql.ConnectionPool | null = null;
   private readonly config: ConnectionConfig;
 
   constructor(config: ConnectionConfig) {
+    super();
     this.config = config;
   }
 
@@ -560,5 +577,254 @@ export class MSSQLDriver implements IDBDriver {
       } catch {}
       throw e;
     }
+  }
+
+  // ─── MSSQL type system ───
+
+  mapTypeCategory(nativeType: string): TypeCategory {
+    const ct = nativeType.toLowerCase().split("(")[0].trim();
+    if (ct === "bit") return "boolean";
+    if (["tinyint", "smallint", "int", "bigint"].includes(ct)) return "integer";
+    if (["real", "float"].includes(ct)) return "float";
+    if (["decimal", "numeric", "money", "smallmoney"].includes(ct))
+      return "decimal";
+    if (ct === "date" || ct === "smalldatetime") return "date";
+    if (ct === "time") return "time";
+    if (["datetime", "datetime2", "datetimeoffset"].includes(ct))
+      return "datetime";
+    if (["binary", "varbinary", "image"].includes(ct)) return "binary";
+    if (ct === "uniqueidentifier") return "uuid";
+    if (["text", "ntext", "xml"].includes(ct)) return "text";
+    if (["geography", "geometry"].includes(ct)) return "spatial";
+    if (ct === "hierarchyid" || ct === "sql_variant") return "other";
+    // char, varchar, nchar, nvarchar
+    if (ct.includes("char") || ct.includes("varchar")) return "text";
+    return "other";
+  }
+
+  isBooleanType(nativeType: string): boolean {
+    return nativeType.toLowerCase().split("(")[0].trim() === "bit";
+  }
+
+  isDatetimeWithTime(nativeType: string): boolean {
+    const ct = nativeType.toLowerCase().split("(")[0].trim();
+    return (
+      ct === "datetime" ||
+      ct === "datetime2" ||
+      ct === "datetimeoffset" ||
+      ct === "smalldatetime"
+    );
+  }
+
+  override isFilterable(_nativeType: string): boolean {
+    return !MSSQL_NON_FILTERABLE.has(
+      _nativeType.toLowerCase().split("(")[0].trim(),
+    );
+  }
+
+  // ─── MSSQL SQL helpers ───
+
+  override quoteIdentifier(name: string): string {
+    return `[${name.replace(/]/g, "]]")}]`;
+  }
+
+  override qualifiedTableName(
+    database: string,
+    schema: string,
+    table: string,
+  ): string {
+    return `${this.quoteIdentifier(schema)}.${this.quoteIdentifier(table)}`;
+  }
+
+  override buildPagination(
+    offset: number,
+    limit: number,
+    paramIndex: number,
+  ): PaginationResult {
+    return {
+      sql: `OFFSET ? ROWS FETCH NEXT ? ROWS ONLY`,
+      params: [offset, limit],
+    };
+  }
+
+  override buildOrderByDefault(columns: ColumnTypeMeta[]): string {
+    const pk = columns.find((c) => c.isPrimaryKey);
+    if (pk) return `ORDER BY ${this.quoteIdentifier(pk.name)}`;
+    if (columns.length > 0)
+      return `ORDER BY ${this.quoteIdentifier(columns[0].name)}`;
+    return "ORDER BY (SELECT NULL)";
+  }
+
+  // ─── MSSQL type-aware data helpers ───
+
+  override coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (value === null || value === undefined || value === "") return value;
+    if (value === NULL_SENTINEL) return null;
+    if (typeof value !== "string") return value;
+
+    if (column.isBoolean) {
+      const lower = value.toLowerCase();
+      if (lower === "true" || lower === "1") return true;
+      if (lower === "false" || lower === "0") return false;
+    }
+
+    // Binary
+    if (column.category === "binary")
+      return super.coerceInputValue(value, column);
+
+    // Time → Date object for mssql
+    if (column.category === "time" && /^\d{2}:\d{2}/.test(value)) {
+      const d = new Date(`1970-01-01T${value}Z`);
+      if (!Number.isNaN(d.getTime())) return d;
+    }
+
+    // Date/datetime → ISO string
+    if (ISO_DATETIME_RE.test(value) || DATETIME_SQL_RE.test(value)) {
+      return value;
+    }
+
+    return value;
+  }
+
+  override formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (value === null || value === undefined) return value;
+    if (Buffer.isBuffer(value)) return super.formatOutputValue(value, column);
+    if (typeof value === "bigint") return value.toString();
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+      const ct = column.nativeType.toLowerCase().split("(")[0].trim();
+      const pad = (n: number) => String(n).padStart(2, "0");
+      if (ct === "date") {
+        return `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())}`;
+      }
+      if (ct === "time") {
+        const ms = value.getUTCMilliseconds();
+        const frac =
+          ms > 0 ? `.${String(ms).padStart(3, "0").replace(/0+$/, "")}` : "";
+        return `${pad(value.getUTCHours())}:${pad(value.getUTCMinutes())}:${pad(value.getUTCSeconds())}${frac}`;
+      }
+      if (ct === "datetimeoffset") {
+        const ms = value.getUTCMilliseconds();
+        const frac =
+          ms > 0 ? `.${String(ms).padStart(3, "0").replace(/0+$/, "")}` : "";
+        return `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())} ${pad(value.getUTCHours())}:${pad(value.getUTCMinutes())}:${pad(value.getUTCSeconds())}${frac} +00:00`;
+      }
+      const formatted = formatDatetimeForDisplay(value);
+      if (formatted !== null) return formatted;
+    }
+    return value;
+  }
+
+  // ─── MSSQL filter building ───
+
+  override buildFilterCondition(
+    column: ColumnTypeMeta,
+    operator: FilterOperator,
+    value: string | [string, string],
+    paramIndex: number,
+  ): FilterConditionResult | null {
+    if (!column.filterable) return null;
+    const col = this.quoteIdentifier(column.name);
+    const val = typeof value === "string" ? value.trim() : value;
+
+    if (operator === "is_null") return { sql: `${col} IS NULL`, params: [] };
+    if (operator === "is_not_null")
+      return { sql: `${col} IS NOT NULL`, params: [] };
+
+    // Boolean
+    if (column.isBoolean && (operator === "eq" || operator === "neq")) {
+      const strVal = (typeof val === "string" ? val : val[0]).toLowerCase();
+      if (strVal === "true" || strVal === "false") {
+        const boolVal = strVal === "true" ? 1 : 0;
+        const op = operator === "neq" ? "<>" : "=";
+        return { sql: `${col} ${op} ?`, params: [boolVal] };
+      }
+    }
+
+    // Binary: CONVERT(VARCHAR, col, 2) LIKE
+    if (column.category === "binary") {
+      const v = typeof val === "string" ? val : val[0];
+      const hexVal = v.replace(/^(0x|\\x)/i, "").toUpperCase();
+      return {
+        sql: `CONVERT(VARCHAR(MAX), ${col}, 2) LIKE ?`,
+        params: [`%${hexVal}%`],
+      };
+    }
+
+    // Numeric
+    if (
+      this.isNumericCategory(column.category) &&
+      typeof val === "string" &&
+      !Number.isNaN(Number(val)) &&
+      val !== ""
+    ) {
+      const sqlOp = this.sqlOperator(operator);
+      return { sql: `${col} ${sqlOp} ?`, params: [Number(val)] };
+    }
+
+    // Between
+    if (operator === "between" && Array.isArray(val)) {
+      return { sql: `${col} BETWEEN ? AND ?`, params: [val[0], val[1]] };
+    }
+
+    // In
+    if (operator === "in" && typeof val === "string") {
+      const parts = val.split(",").map((s) => s.trim());
+      return {
+        sql: `${col} IN (${parts.map(() => "?").join(", ")})`,
+        params: parts,
+      };
+    }
+
+    // Datetime
+    if (this.isDatetimeWithTime(column.nativeType)) {
+      const v = typeof val === "string" ? val : val[0];
+      return {
+        sql: `CONVERT(VARCHAR, ${col}, 120) LIKE ?`,
+        params: [`%${v}%`],
+      };
+    }
+
+    // Default text
+    const v = typeof val === "string" ? val : val[0];
+    return { sql: `${col} LIKE ?`, params: [`%${v}%`] };
+  }
+
+  override buildLegacyFilter(
+    column: ColumnTypeMeta,
+    rawValue: string,
+    paramIndex: number,
+  ): FilterConditionResult | null {
+    const val = rawValue.trim();
+    if (val === "") return null;
+    if (val === NULL_SENTINEL)
+      return this.buildFilterCondition(column, "is_null", val, paramIndex);
+
+    if (column.isBoolean) {
+      const lower = val.toLowerCase();
+      if (lower === "true" || lower === "false") {
+        return this.buildFilterCondition(column, "eq", val, paramIndex);
+      }
+    }
+
+    if (
+      !Number.isNaN(Number(val)) &&
+      val !== "" &&
+      !this.isTextualType(column.nativeType) &&
+      !column.isBoolean
+    ) {
+      return this.buildFilterCondition(column, "eq", val, paramIndex);
+    }
+
+    return this.buildFilterCondition(column, "like", val, paramIndex);
+  }
+
+  private isTextualType(nativeType: string): boolean {
+    const ct = nativeType.toLowerCase();
+    return (
+      ct.includes("char") ||
+      ct.includes("varchar") ||
+      ct.includes("text") ||
+      ct.includes("xml")
+    );
   }
 }

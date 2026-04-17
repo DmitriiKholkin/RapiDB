@@ -519,7 +519,7 @@ export class TablePanel {
 <body>
   <div id="root"></div>
   <script nonce="${nonce}">
-    window.__HAPPYDB_INITIAL_STATE__ = {
+    window.__RAPIDB_INITIAL_STATE__ = {
       view:            'table',
       connectionId:    ${JSON.stringify(this.connectionId)},
       database:        ${JSON.stringify(this.database)},

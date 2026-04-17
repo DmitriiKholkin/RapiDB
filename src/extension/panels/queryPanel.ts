@@ -3,7 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 import type { ConnectionManager } from "../connectionManager";
-import { formatDatetimeForDisplay } from "../tableDataService";
+import { formatDatetimeForDisplay } from "../dbDrivers/BaseDBDriver";
 
 export class QueryPanel {
   private static readonly viewType = "rapidb.queryPanel";
@@ -490,7 +490,7 @@ export class QueryPanel {
 <body>
   <div id="root"></div>
   <script nonce="${nonce}">
-    window.__HAPPYDB_INITIAL_STATE__ = {
+    window.__RAPIDB_INITIAL_STATE__ = {
       view:           'query',
       connectionId:   ${JSON.stringify(this.originalConnectionId)},
       connectionType: ${JSON.stringify(connType)},

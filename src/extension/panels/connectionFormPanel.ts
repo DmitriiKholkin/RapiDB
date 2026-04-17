@@ -178,7 +178,7 @@ export class ConnectionFormPanel {
 <body>
   <div id="root"></div>
   <script nonce="${nonce}">
-    window.__HAPPYDB_INITIAL_STATE__ = ${initialState};
+    window.__RAPIDB_INITIAL_STATE__ = ${initialState};
   </script>
   <script nonce="${nonce}" src="${webviewJs}"></script>
 </body>

@@ -1,30 +1,10 @@
 // biome-ignore lint/style/useImportType: <explanation>
 import React, { useEffect, useState } from "react";
+import type { ColumnMeta, ForeignKeyMeta, IndexMeta } from "../types";
+import { categoryColor, categoryLabel } from "../types";
 import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
 
-interface ColumnMeta {
-  name: string;
-  type: string;
-  nullable: boolean;
-  defaultValue?: string;
-  isPrimaryKey: boolean;
-  isForeignKey: boolean;
-  isAutoIncrement?: boolean;
-}
-interface IndexMeta {
-  name: string;
-  columns: string[];
-  unique: boolean;
-  primary: boolean;
-}
-interface ForeignKeyMeta {
-  constraintName: string;
-  column: string;
-  referencedSchema: string;
-  referencedTable: string;
-  referencedColumn: string;
-}
 interface SchemaData {
   columns: ColumnMeta[];
   indexes: IndexMeta[];
@@ -311,6 +291,15 @@ function ColRow({
         key="ai"
         label="AI"
         color="var(--vscode-charts-purple, #b48ead)"
+      />,
+    );
+  }
+  if (col.category) {
+    badges.push(
+      <Badge
+        key="cat"
+        label={categoryLabel(col.category)}
+        color={categoryColor(col.category)}
       />,
     );
   }

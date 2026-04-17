@@ -1,4 +1,5 @@
 import * as monaco from "monaco-editor";
+// biome-ignore lint/correctness/noUnusedImports: <explanation>
 import React, {
   forwardRef,
   useEffect,
@@ -25,7 +26,7 @@ if (!(window as any).__monacoEnvSet) {
   };
 }
 
-const HAPPYDB_THEME = "rapidb-vscode";
+const RAPIDB_THEME = "rapidb-vscode";
 
 function cssVar(name: string): string {
   return getComputedStyle(document.body).getPropertyValue(name).trim();
@@ -49,7 +50,7 @@ function applyVSCodeTheme(): void {
   const base = themeBase();
   const isLight = base === "vs" || base === "hc-light";
 
-  monaco.editor.defineTheme(HAPPYDB_THEME, {
+  monaco.editor.defineTheme(RAPIDB_THEME, {
     base,
     inherit: true,
 
@@ -65,7 +66,7 @@ function applyVSCodeTheme(): void {
     },
   });
 
-  monaco.editor.setTheme(HAPPYDB_THEME);
+  monaco.editor.setTheme(RAPIDB_THEME);
 }
 
 const SQL_KEYWORDS = [
@@ -503,7 +504,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       const editor = monaco.editor.create(containerRef.current, {
         value: initialValue,
         language: "sql",
-        theme: HAPPYDB_THEME,
+        theme: RAPIDB_THEME,
         fontSize: parseInt(
           getComputedStyle(document.body).getPropertyValue(
             "--vscode-editor-font-size",

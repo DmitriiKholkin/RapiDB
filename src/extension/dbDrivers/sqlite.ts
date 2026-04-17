@@ -1,13 +1,18 @@
 import { Database } from "node-sqlite3-wasm";
 import type { ConnectionConfig } from "../connectionManager";
+import { BaseDBDriver } from "./BaseDBDriver";
 import type {
   ColumnMeta,
+  ColumnTypeMeta,
   DatabaseInfo,
-  IDBDriver,
+  FilterConditionResult,
+  FilterOperator,
   QueryResult,
   SchemaInfo,
   TableInfo,
+  TypeCategory,
 } from "./types";
+import { NULL_SENTINEL } from "./types";
 
 function classifySql(sql: string): "select" | "dml" {
   const stripped = sql
@@ -82,11 +87,12 @@ function splitSQLiteScript(sql: string): string[] {
   return stmts;
 }
 
-export class SQLiteDriver implements IDBDriver {
+export class SQLiteDriver extends BaseDBDriver {
   private db: Database | null = null;
   private readonly config: ConnectionConfig;
 
   constructor(config: ConnectionConfig) {
+    super();
     this.config = config;
   }
 
@@ -382,5 +388,155 @@ export class SQLiteDriver implements IDBDriver {
       }
       throw e;
     }
+  }
+
+  // ─── SQLite type system ───
+
+  mapTypeCategory(nativeType: string): TypeCategory {
+    const ct = nativeType.toUpperCase().trim();
+    if (ct === "" || ct === "TEXT") return "text";
+    if (
+      ct === "INTEGER" ||
+      ct === "INT" ||
+      ct === "BIGINT" ||
+      ct === "SMALLINT" ||
+      ct === "TINYINT" ||
+      ct === "MEDIUMINT"
+    )
+      return "integer";
+    if (ct === "REAL" || ct === "DOUBLE" || ct === "FLOAT") return "float";
+    if (ct === "NUMERIC" || ct === "DECIMAL") return "decimal";
+    if (ct === "BOOLEAN" || ct === "BOOL") return "boolean";
+    if (ct === "BLOB") return "binary";
+    if (ct === "DATE") return "date";
+    if (ct === "TIME") return "time";
+    if (ct === "DATETIME" || ct === "TIMESTAMP") return "datetime";
+    if (ct.includes("INT")) return "integer";
+    if (ct.includes("CHAR") || ct.includes("TEXT") || ct.includes("CLOB"))
+      return "text";
+    if (ct.includes("REAL") || ct.includes("FLOA") || ct.includes("DOUB"))
+      return "float";
+    if (ct.includes("BLOB")) return "binary";
+    return "other";
+  }
+
+  isBooleanType(nativeType: string): boolean {
+    const ct = nativeType.toUpperCase().trim();
+    return ct === "BOOLEAN" || ct === "BOOL";
+  }
+
+  isDatetimeWithTime(nativeType: string): boolean {
+    const ct = nativeType.toUpperCase().trim();
+    return ct === "DATETIME" || ct === "TIMESTAMP";
+  }
+
+  // ─── SQLite SQL helpers ───
+
+  override quoteIdentifier(name: string): string {
+    return `"${name.replace(/"/g, '""')}"`;
+  }
+
+  override coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (value === null || value === undefined || value === "") return value;
+    if (value === NULL_SENTINEL) return null;
+    if (typeof value !== "string") return value;
+
+    if (column.isBoolean) {
+      const lower = value.toLowerCase();
+      if (lower === "true" || lower === "1") return 1;
+      if (lower === "false" || lower === "0") return 0;
+    }
+
+    return value;
+  }
+
+  override formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (value === null || value === undefined) return value;
+    if (typeof value === "bigint") return value.toString();
+    return value;
+  }
+
+  // ─── SQLite filter building ───
+
+  override buildFilterCondition(
+    column: ColumnTypeMeta,
+    operator: FilterOperator,
+    value: string | [string, string],
+    paramIndex: number,
+  ): FilterConditionResult | null {
+    if (!column.filterable) return null;
+    const col = this.quoteIdentifier(column.name);
+    const val = typeof value === "string" ? value.trim() : value;
+
+    if (operator === "is_null") return { sql: `${col} IS NULL`, params: [] };
+    if (operator === "is_not_null")
+      return { sql: `${col} IS NOT NULL`, params: [] };
+
+    // Boolean
+    if (column.isBoolean && (operator === "eq" || operator === "neq")) {
+      const strVal = (typeof val === "string" ? val : val[0]).toLowerCase();
+      if (strVal === "true" || strVal === "false") {
+        const boolVal = strVal === "true" ? 1 : 0;
+        const op = operator === "neq" ? "!=" : "=";
+        return { sql: `${col} ${op} ?`, params: [boolVal] };
+      }
+    }
+
+    // Numeric
+    if (
+      this.isNumericCategory(column.category) &&
+      typeof val === "string" &&
+      !Number.isNaN(Number(val)) &&
+      val !== ""
+    ) {
+      const sqlOp = this.sqlOperator(operator);
+      return { sql: `${col} ${sqlOp} ?`, params: [Number(val)] };
+    }
+
+    // Between
+    if (operator === "between" && Array.isArray(val)) {
+      return { sql: `${col} BETWEEN ? AND ?`, params: [val[0], val[1]] };
+    }
+
+    // In
+    if (operator === "in" && typeof val === "string") {
+      const parts = val.split(",").map((s) => s.trim());
+      return {
+        sql: `${col} IN (${parts.map(() => "?").join(", ")})`,
+        params: parts,
+      };
+    }
+
+    // Default text LIKE
+    const v = typeof val === "string" ? val : val[0];
+    return { sql: `${col} LIKE ?`, params: [`%${v}%`] };
+  }
+
+  override buildLegacyFilter(
+    column: ColumnTypeMeta,
+    rawValue: string,
+    paramIndex: number,
+  ): FilterConditionResult | null {
+    const val = rawValue.trim();
+    if (val === "") return null;
+    if (val === NULL_SENTINEL)
+      return this.buildFilterCondition(column, "is_null", val, paramIndex);
+
+    if (column.isBoolean) {
+      const lower = val.toLowerCase();
+      if (lower === "true" || lower === "false") {
+        return this.buildFilterCondition(column, "eq", val, paramIndex);
+      }
+    }
+
+    if (
+      !Number.isNaN(Number(val)) &&
+      val !== "" &&
+      this.isNumericCategory(column.category)
+    ) {
+      return this.buildFilterCondition(column, "eq", val, paramIndex);
+    }
+
+    return this.buildFilterCondition(column, "like", val, paramIndex);
   }
 }
