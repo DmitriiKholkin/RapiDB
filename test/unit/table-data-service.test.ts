@@ -206,10 +206,10 @@ describe("TableDataService", () => {
       expect(page.rows[0]).toEqual({ id: 1, name: "Alice", active: true });
     });
 
-    it("passes filters through buildLegacyFilter", async () => {
+    it("passes filters through buildFilterCondition with inferred operators", async () => {
       const cols = makeTestColumns();
       (driver.describeColumns as any).mockResolvedValue(cols);
-      (driver.buildLegacyFilter as any).mockReturnValue({
+      (driver.buildFilterCondition as any).mockReturnValue({
         sql: '"name" LIKE ?',
         params: ["%alice%"],
       });
@@ -231,10 +231,43 @@ describe("TableDataService", () => {
       const filters: Filter[] = [{ column: "name", value: "alice" }];
       await svc.getPage("conn1", "testdb", "public", "users", 1, 25, filters);
 
-      expect(driver.buildLegacyFilter).toHaveBeenCalled();
+      expect(driver.buildFilterCondition).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "name" }),
+        "like",
+        "alice",
+        1,
+      );
+      expect(driver.buildLegacyFilter).not.toHaveBeenCalled();
       // The COUNT query should include WHERE
       const countCall = (driver.query as any).mock.calls[0];
       expect(countCall[0]).toContain("WHERE");
+    });
+
+    it("skips non-filterable columns", async () => {
+      const cols = makeTestColumns();
+      cols[1] = { ...cols[1], filterable: false };
+      (driver.describeColumns as any).mockResolvedValue(cols);
+      (driver.query as any)
+        .mockResolvedValueOnce({
+          columns: ["cnt"],
+          rows: [{ __col_0: 0 }],
+          rowCount: 1,
+          executionTimeMs: 0,
+        })
+        .mockResolvedValueOnce({
+          columns: [],
+          rows: [],
+          rowCount: 0,
+          executionTimeMs: 0,
+        });
+
+      await svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
+        { column: "name", value: "alice" },
+      ]);
+
+      expect(driver.buildFilterCondition).not.toHaveBeenCalled();
+      const countCall = (driver.query as any).mock.calls[0];
+      expect(countCall[0]).not.toContain("WHERE");
     });
 
     it("skips COUNT when skipCount=true", async () => {
@@ -285,7 +318,216 @@ describe("TableDataService", () => {
       ];
       await svc.getPage("conn1", "testdb", "public", "users", 1, 25, filters);
 
-      expect(driver.buildLegacyFilter).not.toHaveBeenCalled();
+      expect(driver.buildFilterCondition).not.toHaveBeenCalled();
+    });
+
+    it("throws a filter error for invalid numeric input", async () => {
+      const cols = makeTestColumns();
+      (driver.describeColumns as any).mockResolvedValue(cols);
+
+      await expect(
+        svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
+          { column: "id", value: "not-a-number" },
+        ]),
+      ).rejects.toThrow("Column id expects a number");
+
+      expect(driver.query).not.toHaveBeenCalled();
+    });
+
+    it("throws a filter error for non-finite numeric input", async () => {
+      const cols = makeTestColumns();
+      (driver.describeColumns as any).mockResolvedValue(cols);
+
+      await expect(
+        svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
+          { column: "id", value: "Infinity" },
+        ]),
+      ).rejects.toThrow("Column id expects a number");
+
+      expect(driver.query).not.toHaveBeenCalled();
+    });
+
+    it("throws a filter error for invalid boolean input", async () => {
+      const cols = makeTestColumns();
+      (driver.describeColumns as any).mockResolvedValue(cols);
+
+      await expect(
+        svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
+          { column: "active", value: "maybe" },
+        ]),
+      ).rejects.toThrow("Column active expects true or false");
+
+      expect(driver.query).not.toHaveBeenCalled();
+    });
+
+    it("normalizes SQL datetime text to a date-only equality filter for date columns", async () => {
+      const cols = [
+        {
+          ...makeTestColumns()[1],
+          name: "created_on",
+          type: "date",
+          category: "date",
+          nativeType: "date",
+          filterOperators: ["eq", "like"],
+        },
+      ];
+      (driver.describeColumns as any).mockResolvedValue(cols);
+      (driver.buildFilterCondition as any).mockReturnValue({
+        sql: '"created_on" = ?',
+        params: ["2026-04-15"],
+      });
+      (driver.query as any)
+        .mockResolvedValueOnce({
+          columns: ["cnt"],
+          rows: [{ __col_0: 0 }],
+          rowCount: 1,
+          executionTimeMs: 0,
+        })
+        .mockResolvedValueOnce({
+          columns: [],
+          rows: [],
+          rowCount: 0,
+          executionTimeMs: 0,
+        });
+
+      await svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
+        { column: "created_on", value: "2026-04-15 00:00:00" },
+      ]);
+
+      expect(driver.buildFilterCondition).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "created_on" }),
+        "eq",
+        "2026-04-15",
+        1,
+      );
+    });
+
+    it("accepts displayed SQL datetimeoffset text with a spaced offset for date columns", async () => {
+      const cols = [
+        {
+          ...makeTestColumns()[1],
+          name: "created_on",
+          type: "date",
+          category: "date",
+          nativeType: "date",
+          filterOperators: ["eq", "like"],
+        },
+      ];
+      (driver.describeColumns as any).mockResolvedValue(cols);
+      (driver.buildFilterCondition as any).mockReturnValue({
+        sql: '"created_on" = ?',
+        params: ["2026-04-15"],
+      });
+      (driver.query as any)
+        .mockResolvedValueOnce({
+          columns: ["cnt"],
+          rows: [{ __col_0: 0 }],
+          rowCount: 1,
+          executionTimeMs: 0,
+        })
+        .mockResolvedValueOnce({
+          columns: [],
+          rows: [],
+          rowCount: 0,
+          executionTimeMs: 0,
+        });
+
+      await svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
+        { column: "created_on", value: "2026-04-15 00:00:00 +00:00" },
+      ]);
+
+      expect(driver.buildFilterCondition).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "created_on" }),
+        "eq",
+        "2026-04-15",
+        1,
+      );
+    });
+
+    it("normalizes offset-bearing ISO datetimes to the resulting UTC date for date columns", async () => {
+      const cols = [
+        {
+          ...makeTestColumns()[1],
+          name: "created_on",
+          type: "date",
+          category: "date",
+          nativeType: "date",
+          filterOperators: ["eq", "like"],
+        },
+      ];
+      (driver.describeColumns as any).mockResolvedValue(cols);
+      (driver.buildFilterCondition as any).mockReturnValue({
+        sql: '"created_on" = ?',
+        params: ["2026-04-16"],
+      });
+      (driver.query as any)
+        .mockResolvedValueOnce({
+          columns: ["cnt"],
+          rows: [{ __col_0: 0 }],
+          rowCount: 1,
+          executionTimeMs: 0,
+        })
+        .mockResolvedValueOnce({
+          columns: [],
+          rows: [],
+          rowCount: 0,
+          executionTimeMs: 0,
+        });
+
+      await svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
+        { column: "created_on", value: "2026-04-15T23:00:00-02:00" },
+      ]);
+
+      expect(driver.buildFilterCondition).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "created_on" }),
+        "eq",
+        "2026-04-16",
+        1,
+      );
+    });
+
+    it("throws a filter error for impossible calendar dates", async () => {
+      const cols = [
+        {
+          ...makeTestColumns()[1],
+          name: "created_on",
+          type: "date",
+          category: "date",
+          nativeType: "date",
+          filterOperators: ["eq", "like"],
+        },
+      ];
+      (driver.describeColumns as any).mockResolvedValue(cols);
+
+      await expect(
+        svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
+          { column: "created_on", value: "2026-02-31" },
+        ]),
+      ).rejects.toThrow("Column created_on expects a valid date");
+
+      expect(driver.query).not.toHaveBeenCalled();
+    });
+
+    it("throws a filter error for impossible offset-bearing datetime input on date columns", async () => {
+      const cols = [
+        {
+          ...makeTestColumns()[1],
+          name: "created_on",
+          type: "date",
+          category: "date",
+          nativeType: "date",
+          filterOperators: ["eq", "like"],
+        },
+      ];
+      (driver.describeColumns as any).mockResolvedValue(cols);
+
+      await expect(
+        svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
+          { column: "created_on", value: "2026-02-31 12:00:00 +00:00" },
+        ]),
+      ).rejects.toThrow("Column created_on expects a valid date");
+
+      expect(driver.query).not.toHaveBeenCalled();
     });
 
     it("applies sort when provided", async () => {
@@ -349,7 +591,7 @@ describe("TableDataService", () => {
       ).rejects.toThrow("no values provided");
     });
 
-    it("skips undefined and empty string values", async () => {
+    it("omits only undefined values", async () => {
       const cols = makeTestColumns();
       (driver.describeColumns as any).mockResolvedValue(cols);
       (driver.query as any).mockResolvedValue({
@@ -367,6 +609,51 @@ describe("TableDataService", () => {
 
       const [, params] = (driver.query as any).mock.calls[0];
       expect(params.length).toBe(1);
+    });
+
+    it("preserves explicit empty string values", async () => {
+      const cols = makeTestColumns();
+      (driver.describeColumns as any).mockResolvedValue(cols);
+      (driver.query as any).mockResolvedValue({
+        columns: [],
+        rows: [],
+        rowCount: 1,
+        affectedRows: 1,
+        executionTimeMs: 0,
+      });
+
+      await svc.insertRow("conn1", "testdb", "public", "users", {
+        name: "",
+        active: "true",
+      });
+
+      const [, params] = (driver.query as any).mock.calls[0];
+      expect(params).toEqual(["", "true"]);
+    });
+
+    it("ignores non-editable and auto increment columns on insert", async () => {
+      const cols = makeTestColumns();
+      cols[0] = { ...cols[0], isAutoIncrement: true };
+      cols[1] = { ...cols[1], editable: false };
+      (driver.describeColumns as any).mockResolvedValue(cols);
+      (driver.query as any).mockResolvedValue({
+        columns: [],
+        rows: [],
+        rowCount: 1,
+        affectedRows: 1,
+        executionTimeMs: 0,
+      });
+
+      await svc.insertRow("conn1", "testdb", "public", "users", {
+        id: 99,
+        name: "Bob",
+        active: "true",
+      });
+
+      const [sql, params] = (driver.query as any).mock.calls[0];
+      expect(sql).not.toContain('"id"');
+      expect(sql).not.toContain('"name"');
+      expect(params).toEqual(["true"]);
     });
 
     it("throws when 0 rows affected", async () => {
@@ -434,6 +721,36 @@ describe("TableDataService", () => {
           { name: "X" },
         ),
       ).rejects.toThrow("Row not found");
+    });
+
+    it("ignores non-editable and auto increment columns on update", async () => {
+      const cols = makeTestColumns();
+      cols[0] = { ...cols[0], isAutoIncrement: true };
+      cols[1] = { ...cols[1], editable: false };
+      (driver.describeColumns as any).mockResolvedValue(cols);
+      (driver.query as any).mockResolvedValue({
+        columns: [],
+        rows: [],
+        rowCount: 1,
+        affectedRows: 1,
+        executionTimeMs: 0,
+      });
+
+      await svc.updateRow(
+        "conn1",
+        "testdb",
+        "public",
+        "users",
+        { id: 1 },
+        { id: 2, name: "Updated", active: false },
+      );
+
+      const [sql, params] = (driver.query as any).mock.calls[0];
+      const setClause = sql.split(" WHERE ")[0];
+      expect(setClause).toContain('SET "active" = ?');
+      expect(setClause).not.toContain('"id" = ?');
+      expect(setClause).not.toContain('"name" = ?');
+      expect(params).toEqual([false, 1]);
     });
   });
 

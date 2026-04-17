@@ -829,10 +829,33 @@ export class MySQLDriver extends BaseDBDriver {
       return { sql: `HEX(${col}) LIKE ?`, params: [`%${hexVal}%`] };
     }
 
+    if (
+      this.isNumericCategory(column.category) &&
+      this.isNumericCompareUnsafe(column.nativeType) &&
+      typeof val === "string" &&
+      Number.isFinite(Number(val)) &&
+      val !== ""
+    ) {
+      const numericValue = Number(val);
+      const tolerance = this.approximateNumericTolerance(val);
+      const comparisonTolerance = `GREATEST(?, ABS(?) * ?)`;
+      if (operator === "neq") {
+        return {
+          sql: `ABS(${col} - ?) >= ${comparisonTolerance}`,
+          params: [numericValue, tolerance, numericValue, tolerance],
+        };
+      }
+      return {
+        sql: `ABS(${col} - ?) < ${comparisonTolerance}`,
+        params: [numericValue, tolerance, numericValue, tolerance],
+      };
+    }
+
     // Numeric
     if (
       this.isNumericCategory(column.category) &&
       typeof val === "string" &&
+      !this.isNumericCompareUnsafe(column.nativeType) &&
       !Number.isNaN(Number(val)) &&
       val !== ""
     ) {
@@ -912,8 +935,15 @@ export class MySQLDriver extends BaseDBDriver {
       ct === "year" ||
       ct === "time" ||
       ct === "float" ||
-      ct === "real"
+      ct === "real" ||
+      ct === "double"
     );
+  }
+
+  private approximateNumericTolerance(rawValue: string): number {
+    const fraction = /\.(\d+)/.exec(rawValue)?.[1].length ?? 0;
+    const precision = Math.min(Math.max(fraction + 2, 6), 12);
+    return 10 ** -precision;
   }
 
   private isTextualType(nativeType: string): boolean {

@@ -98,11 +98,19 @@ const btn = (
           }),
 });
 
+function canFilterColumn(column?: ColumnMeta): column is ColumnMeta {
+  return !!column && column.filterable;
+}
+
+function canEditColumn(column?: ColumnMeta): column is ColumnMeta {
+  return !!column && column.editable && !column.isAutoIncrement;
+}
+
 export function TableView({
-  connectionId,
-  database,
-  schema,
-  table,
+  connectionId: _connectionId,
+  database: _database,
+  schema: _schema,
+  table: _table,
   isView = false,
   defaultPageSize,
 }: Props) {
@@ -183,7 +191,13 @@ export function TableView({
     const epoch = ++fetchEpochRef.current;
     setLoading(true);
     const activeFilters = Object.entries(debFilRef.current)
-      .filter(([, v]) => v.trim())
+      .filter(
+        ([column, value]) =>
+          value.trim() &&
+          canFilterColumn(
+            columnsRef.current.find((candidate) => candidate.name === column),
+          ),
+      )
       .map(([column, value]) => ({ column, value }));
     postMessage("fetchPage", {
       fetchId: epoch,
@@ -423,7 +437,7 @@ export function TableView({
 
   const handleStartEdit = useCallback(
     (rowIdx: number, col: ColumnMeta) => {
-      if (isView) {
+      if (isView || !canEditColumn(col)) {
         return;
       }
       setEditCell({ rowIdx, col: col.name });
@@ -540,15 +554,13 @@ export function TableView({
             const ec = editCellRef.current;
             const pe = pendingEditsRef.current;
             const isEditing = ec?.rowIdx === rowIdx && ec.col === col.name;
-            const hasPending = pe.get(rowIdx)?.has(col.name) ?? false;
-            const displayVal = hasPending
-              ? pe.get(rowIdx)!.get(col.name)
-              : getValue();
+            const pendingRow = pe.get(rowIdx);
+            const hasPending = pendingRow?.has(col.name) ?? false;
+            const pendingValue = pendingRow?.get(col.name);
+            const displayVal = hasPending ? pendingValue : getValue();
 
             if (isEditing) {
-              const startVal = hasPending
-                ? (pe.get(rowIdx)!.get(col.name) ?? "")
-                : (getValue() ?? "");
+              const startVal = hasPending ? pendingValue : getValue();
               const startStr = valueToEditString(startVal, col.isBoolean);
               return (
                 <EditInput
@@ -576,7 +588,7 @@ export function TableView({
       ),
     ],
 
-    [columns, colSizes],
+    [columns, colSizes, commitCellEdit, isView],
   );
 
   const tanTable = useReactTable({
@@ -680,7 +692,7 @@ export function TableView({
               style={btn("primary", busy || !!newRow)}
               disabled={busy || !!newRow}
               onClick={() => {
-                setNewRow(Object.fromEntries(columns.map((c) => [c.name, ""])));
+                setNewRow({});
                 setMutErr(null);
               }}
             >
@@ -716,7 +728,10 @@ export function TableView({
           style={btn("ghost")}
           onClick={() => {
             const activeFilters = Object.entries(debFilters)
-              .filter(([, v]) => v.trim())
+              .filter(
+                ([column, value]) =>
+                  value.trim() && canFilterColumn(columnsMap.get(column)),
+              )
               .map(([column, value]) => ({ column, value }));
             postMessage("exportCSV", { sort, filters: activeFilters });
           }}
@@ -728,7 +743,10 @@ export function TableView({
           style={btn("ghost")}
           onClick={() => {
             const activeFilters = Object.entries(debFilters)
-              .filter(([, v]) => v.trim())
+              .filter(
+                ([column, value]) =>
+                  value.trim() && canFilterColumn(columnsMap.get(column)),
+              )
               .map(([column, value]) => ({ column, value }));
             postMessage("exportJSON", { sort, filters: activeFilters });
           }}
@@ -882,7 +900,7 @@ export function TableView({
                   const isSel = h.column.id === "__sel";
                   const colId = h.column.id;
                   const isSorted = sort?.column === colId;
-                  const sortDir = isSorted ? sort!.direction : null;
+                  const sortDir = isSorted ? (sort?.direction ?? null) : null;
                   return (
                     <th
                       key={h.id}
@@ -977,7 +995,9 @@ export function TableView({
               {tanTable.getHeaderGroups()[0]?.headers.map((h) => {
                 const isSel = h.column.id === "__sel";
                 const col = columns.find((c) => c.name === h.column.id);
-                const isNullFilter = filters[h.column.id] === NULL_SENTINEL;
+                const canFilter = canFilterColumn(col);
+                const isNullFilter =
+                  canFilter && filters[h.column.id] === NULL_SENTINEL;
                 return (
                   <th
                     key={h.id + "_f"}
@@ -1009,10 +1029,15 @@ export function TableView({
                       >
                         <input
                           value={
-                            isNullFilter ? "" : (filters[h.column.id] ?? "")
+                            isNullFilter
+                              ? ""
+                              : canFilter
+                                ? (filters[h.column.id] ?? "")
+                                : ""
                           }
-                          disabled={isNullFilter}
+                          disabled={!canFilter || isNullFilter}
                           onChange={(e) =>
+                            canFilter &&
                             setFilters((f) => ({
                               ...f,
                               [h.column.id]: e.target.value,
@@ -1035,19 +1060,21 @@ export function TableView({
                             padding: "0 4px",
                             fontSize: 11,
                             background: "var(--vscode-input-background)",
-                            color: isNullFilter
-                              ? "var(--vscode-disabledForeground)"
-                              : "var(--vscode-input-foreground)",
+                            color:
+                              !canFilter || isNullFilter
+                                ? "var(--vscode-disabledForeground)"
+                                : "var(--vscode-input-foreground)",
                             border: "1px solid transparent",
                             borderRadius: 2,
                             fontFamily: "inherit",
                             outline: "none",
                             boxSizing: "border-box",
-                            opacity: isNullFilter ? 0.55 : 1,
-                            fontStyle: isNullFilter ? "italic" : "normal",
+                            opacity: !canFilter || isNullFilter ? 0.55 : 1,
+                            fontStyle:
+                              !canFilter || isNullFilter ? "italic" : "normal",
                           }}
                           onFocus={(e) => {
-                            if (!isNullFilter) {
+                            if (canFilter && !isNullFilter) {
                               e.target.style.borderColor =
                                 "var(--vscode-focusBorder)";
                             }
@@ -1058,7 +1085,10 @@ export function TableView({
                         />
                         {col?.nullable && (
                           <button
+                            type="button"
+                            disabled={!canFilter}
                             onClick={() =>
+                              canFilter &&
                               setFilters((f) => ({
                                 ...f,
                                 [h.column.id]: isNullFilter
@@ -1067,9 +1097,11 @@ export function TableView({
                               }))
                             }
                             title={
-                              isNullFilter
-                                ? "Remove NULL filter"
-                                : "Filter by NULL"
+                              !canFilter
+                                ? "Filtering is not available for this column"
+                                : isNullFilter
+                                  ? "Remove NULL filter"
+                                  : "Filter by NULL"
                             }
                             style={{
                               flexShrink: 0,
@@ -1081,14 +1113,20 @@ export function TableView({
                               background: isNullFilter
                                 ? "var(--vscode-button-background)"
                                 : "transparent",
-                              color: isNullFilter
-                                ? "var(--vscode-button-foreground)"
-                                : "var(--vscode-badge-foreground)",
+                              color: !canFilter
+                                ? "var(--vscode-disabledForeground)"
+                                : isNullFilter
+                                  ? "var(--vscode-button-foreground)"
+                                  : "var(--vscode-badge-foreground)",
                               border: "none",
                               borderRadius: 2,
-                              cursor: "pointer",
+                              cursor: canFilter ? "pointer" : "default",
                               letterSpacing: "0.02em",
-                              opacity: isNullFilter ? 1 : 0.5,
+                              opacity: !canFilter
+                                ? 0.35
+                                : isNullFilter
+                                  ? 1
+                                  : 0.5,
                             }}
                           >
                             NULL
@@ -1230,7 +1268,6 @@ const TableRow = React.memo(function TableRow({
   pendingCols?: Map<string, unknown>;
 
   columnsMap: Map<string, ColumnMeta>;
-
   editingCol: string | null;
   isView: boolean;
 
@@ -1240,6 +1277,7 @@ const TableRow = React.memo(function TableRow({
     <tr
       className="rdb-trow"
       data-even={String(index % 2 === 0)}
+      data-editing-col={editingCol ?? ""}
       data-selected={String(isSelected)}
       style={{
         height: ROW_H,
@@ -1277,7 +1315,10 @@ const TableRow = React.memo(function TableRow({
               textOverflow: "ellipsis",
               boxSizing: "border-box",
               verticalAlign: "middle",
-              cursor: isSel || isView ? "default" : "pointer",
+              cursor:
+                isSel || isView || !canEditColumn(colDef)
+                  ? "default"
+                  : "pointer",
 
               userSelect: isSel ? "auto" : "none",
               background: isPk
@@ -1288,7 +1329,7 @@ const TableRow = React.memo(function TableRow({
             }}
             title={isPk ? `PK: ${String(cell.getValue())}` : undefined}
             onDoubleClick={() => {
-              if (colDef && !isSel && !isView) {
+              if (colDef && !isSel && !isView && canEditColumn(colDef)) {
                 onStartEdit(index, colDef);
               }
             }}

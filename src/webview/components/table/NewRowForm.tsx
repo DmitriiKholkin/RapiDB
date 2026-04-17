@@ -4,6 +4,25 @@ import type { ColumnMeta } from "../../types";
 import { NULL_SENTINEL, placeholderForCategory } from "../../types";
 import { Icon } from "../Icon";
 
+function omitKey(
+  row: Record<string, unknown>,
+  columnName: string,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(row).filter(([key]) => key !== columnName),
+  );
+}
+
+function clearsNullToEmptyString(column: ColumnMeta): boolean {
+  const nativeType = column.nativeType.toLowerCase();
+  return (
+    column.category === "text" ||
+    nativeType.startsWith("set") ||
+    column.type.toLowerCase().startsWith("set") ||
+    (nativeType.startsWith("enum") && nativeType.includes("''"))
+  );
+}
+
 export function NewRowForm({
   columns,
   newRow,
@@ -27,7 +46,6 @@ export function NewRowForm({
     fontFamily: "inherit",
     whiteSpace: "nowrap",
   };
-
   return (
     <div
       style={{
@@ -53,6 +71,7 @@ export function NewRowForm({
         New row:
       </span>
       {columns.map((col) => {
+        const canInsert = col.editable && !col.isAutoIncrement;
         const isNull = newRow[col.name] === NULL_SENTINEL;
         const rawVal = newRow[col.name];
 
@@ -61,7 +80,7 @@ export function NewRowForm({
             key={col.name}
             style={{ display: "flex", flexDirection: "column", gap: 2 }}
           >
-            <span style={{ fontSize: 10, opacity: 0.6 }}>
+            <span style={{ fontSize: 10, opacity: canInsert ? 0.6 : 0.35 }}>
               {col.name}
               {col.isPrimaryKey && (
                 <Icon
@@ -76,36 +95,52 @@ export function NewRowForm({
             <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
               {col.isBoolean || col.category === "boolean" ? (
                 <select
-                  value={isNull ? "" : String(rawVal ?? "false")}
-                  disabled={isNull}
-                  onChange={(e) =>
-                    setNewRow({ ...newRow, [col.name]: e.target.value })
+                  value={
+                    isNull ? "" : rawVal === undefined ? "" : String(rawVal)
                   }
+                  disabled={isNull || !canInsert}
+                  onChange={(e) => {
+                    if (!canInsert) return;
+                    const next = e.target.value;
+                    if (next === "") {
+                      setNewRow(omitKey(newRow, col.name));
+                      return;
+                    }
+                    setNewRow({ ...newRow, [col.name]: next });
+                  }}
                   style={{
                     width: 120,
                     padding: "3px 6px",
                     fontSize: 12,
                     background: "var(--vscode-input-background)",
-                    color: isNull
-                      ? "var(--vscode-disabledForeground)"
-                      : "var(--vscode-input-foreground)",
+                    color:
+                      isNull || !canInsert
+                        ? "var(--vscode-disabledForeground)"
+                        : "var(--vscode-input-foreground)",
                     border: "1px solid var(--vscode-input-border)",
                     borderRadius: 2,
                     fontFamily: "inherit",
-                    opacity: isNull ? 0.55 : 1,
+                    opacity: isNull || !canInsert ? 0.55 : 1,
                     boxSizing: "border-box" as const,
                   }}
                 >
+                  <option value="" />
                   <option value="false">false</option>
                   <option value="true">true</option>
                 </select>
               ) : (
                 <input
                   value={isNull ? "" : String(rawVal ?? "")}
-                  disabled={isNull}
-                  onChange={(e) =>
-                    setNewRow({ ...newRow, [col.name]: e.target.value })
-                  }
+                  disabled={isNull || !canInsert}
+                  onChange={(e) => {
+                    if (!canInsert) return;
+                    const next = e.target.value;
+                    if (next === "" && !clearsNullToEmptyString(col)) {
+                      setNewRow(omitKey(newRow, col.name));
+                      return;
+                    }
+                    setNewRow({ ...newRow, [col.name]: next });
+                  }}
                   placeholder={
                     isNull
                       ? "NULL"
@@ -116,14 +151,15 @@ export function NewRowForm({
                     padding: "3px 6px",
                     fontSize: 12,
                     background: "var(--vscode-input-background)",
-                    color: isNull
-                      ? "var(--vscode-disabledForeground)"
-                      : "var(--vscode-input-foreground)",
+                    color:
+                      isNull || !canInsert
+                        ? "var(--vscode-disabledForeground)"
+                        : "var(--vscode-input-foreground)",
                     border: "1px solid var(--vscode-input-border)",
                     borderRadius: 2,
                     fontFamily: "inherit",
-                    opacity: isNull ? 0.55 : 1,
-                    fontStyle: isNull ? "italic" : "normal",
+                    opacity: isNull || !canInsert ? 0.55 : 1,
+                    fontStyle: isNull || !canInsert ? "italic" : "normal",
                     boxSizing: "border-box" as const,
                   }}
                 />
@@ -131,15 +167,25 @@ export function NewRowForm({
               {col.nullable && (
                 <button
                   type="button"
+                  disabled={!canInsert}
                   onMouseDown={(e) => e.preventDefault()}
                   onClick={() =>
-                    setNewRow({
-                      ...newRow,
-                      [col.name]: isNull ? "" : NULL_SENTINEL,
-                    })
+                    canInsert &&
+                    setNewRow(
+                      isNull
+                        ? omitKey(newRow, col.name)
+                        : {
+                            ...newRow,
+                            [col.name]: NULL_SENTINEL,
+                          },
+                    )
                   }
                   title={
-                    isNull ? "Remove NULL — set to empty" : "Set field to NULL"
+                    !canInsert
+                      ? "This column is read-only"
+                      : isNull
+                        ? "Remove NULL"
+                        : "Set field to NULL"
                   }
                   style={{
                     flexShrink: 0,
@@ -151,14 +197,16 @@ export function NewRowForm({
                     background: isNull
                       ? "var(--vscode-button-background)"
                       : "transparent",
-                    color: isNull
-                      ? "var(--vscode-button-foreground)"
-                      : "var(--vscode-badge-foreground)",
+                    color: !canInsert
+                      ? "var(--vscode-disabledForeground)"
+                      : isNull
+                        ? "var(--vscode-button-foreground)"
+                        : "var(--vscode-badge-foreground)",
                     border: "none",
                     borderRadius: 2,
-                    cursor: "pointer",
+                    cursor: canInsert ? "pointer" : "default",
                     letterSpacing: "0.02em",
-                    opacity: isNull ? 1 : 0.5,
+                    opacity: !canInsert ? 0.35 : isNull ? 1 : 0.5,
                   }}
                 >
                   NULL

@@ -1,8 +1,15 @@
 import type { ConnectionManager } from "./connectionManager";
+import { isoToLocalDateStr } from "./dbDrivers/BaseDBDriver";
 import type {
   ColumnTypeMeta,
   IDBDriver,
   TransactionOperation,
+} from "./dbDrivers/types";
+import {
+  DATE_ONLY_RE,
+  DATETIME_SQL_RE,
+  ISO_DATETIME_RE,
+  NULL_SENTINEL,
 } from "./dbDrivers/types";
 
 // Re-export formatDatetimeForDisplay for consumers that imported it from here
@@ -208,9 +215,7 @@ export class TableDataService {
     const cols = await this.getColumns(connectionId, database, schema, table);
     const colMap = new Map(cols.map((c) => [c.name, c]));
 
-    const entries = Object.entries(values).filter(
-      ([, v]) => v !== undefined && v !== "",
-    );
+    const entries = writableEntries(values, colMap);
     if (entries.length === 0) {
       throw new Error(
         "Insert failed: no values provided. Fill in at least one field or explicitly set a field to NULL.",
@@ -368,7 +373,7 @@ function buildWhere(
     const meta = colMap.get(f.column);
     if (!meta) continue;
 
-    const result = drv.buildLegacyFilter(meta, val, params.length + 1);
+    const result = inferFilterCondition(drv, meta, val, params.length + 1);
     if (result) {
       conditions.push(result.sql);
       params.push(...result.params);
@@ -392,6 +397,161 @@ function coerceRecord(
   );
 }
 
+function writableEntries(
+  values: Record<string, unknown>,
+  colMap: Map<string, ColumnDef>,
+): Array<[string, unknown]> {
+  return Object.entries(values).filter(([columnName, value]) => {
+    if (value === undefined) return false;
+    return isWritableColumn(colMap.get(columnName));
+  });
+}
+
+function filterWritableRecord(
+  record: Record<string, unknown>,
+  colMap: Map<string, ColumnDef>,
+): Record<string, unknown> {
+  return Object.fromEntries(writableEntries(record, colMap));
+}
+
+function isWritableColumn(column: ColumnDef | undefined): column is ColumnDef {
+  return !!column && column.editable && !column.isAutoIncrement;
+}
+
+function inferFilterCondition(
+  drv: IDBDriver,
+  column: ColumnDef,
+  rawValue: string,
+  paramIndex: number,
+) {
+  if (!column.filterable) return null;
+
+  const value = rawValue.trim();
+  if (value === "") return null;
+  if (value === NULL_SENTINEL) {
+    return drv.buildFilterCondition(column, "is_null", value, paramIndex);
+  }
+
+  if (column.isBoolean) {
+    const normalized = normalizeBooleanFilterValue(value);
+    if (!normalized) {
+      throw invalidFilterInputError(column.name, "true or false");
+    }
+    return drv.buildFilterCondition(column, "eq", normalized, paramIndex);
+  }
+
+  if (isNumericCategory(column.category)) {
+    const numericValue = Number(value);
+    if (Number.isNaN(numericValue) || !Number.isFinite(numericValue)) {
+      throw invalidFilterInputError(column.name, "a number");
+    }
+    return drv.buildFilterCondition(column, "eq", value, paramIndex);
+  }
+
+  if (column.category === "date") {
+    const normalizedDate = normalizeDateFilterValue(value);
+    if (normalizedDate) {
+      return drv.buildFilterCondition(column, "eq", normalizedDate, paramIndex);
+    }
+    if (looksLikeDateInput(value)) {
+      throw invalidFilterInputError(column.name, "a valid date");
+    }
+    return drv.buildFilterCondition(column, "like", value, paramIndex);
+  }
+
+  if (column.category === "time" || column.category === "datetime") {
+    return drv.buildFilterCondition(column, "like", value, paramIndex);
+  }
+
+  return drv.buildFilterCondition(column, "like", value, paramIndex);
+}
+
+function normalizeBooleanFilterValue(value: string): "true" | "false" | null {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "true" || normalized === "1") return "true";
+  if (normalized === "false" || normalized === "0") return "false";
+  return null;
+}
+
+function isNumericCategory(category: ColumnDef["category"]): boolean {
+  return (
+    category === "integer" || category === "float" || category === "decimal"
+  );
+}
+
+function normalizeDateFilterValue(value: string): string | null {
+  const normalized = value.trim();
+  const normalizedSql = normalizeSqlDatetimeOffsetSpacing(normalized);
+  if (DATE_ONLY_RE.test(normalized)) {
+    return isValidDateOnly(normalized) ? normalized : null;
+  }
+  if (ISO_DATETIME_RE.test(normalized)) {
+    if (!hasValidDateTimeParts(normalized)) {
+      return null;
+    }
+    if (!hasExplicitTimezone(normalized)) {
+      const dateOnly = normalized.slice(0, 10);
+      return isValidDateOnly(dateOnly) ? dateOnly : null;
+    }
+    return isoToLocalDateStr(normalized);
+  }
+  if (DATETIME_SQL_RE.test(normalizedSql)) {
+    if (!hasValidDateTimeParts(normalizedSql)) {
+      return null;
+    }
+    if (hasExplicitTimezone(normalizedSql)) {
+      return isoToLocalDateStr(normalizedSql.replace(" ", "T"));
+    }
+    const dateOnly = normalizedSql.slice(0, 10);
+    return isValidDateOnly(dateOnly) ? dateOnly : null;
+  }
+  return null;
+}
+
+function looksLikeDateInput(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}(?:[ T].*)?$/.test(value.trim());
+}
+
+function hasExplicitTimezone(value: string): boolean {
+  return /[zZ]|[+-]\d{2}:\d{2}$/.test(value);
+}
+
+function normalizeSqlDatetimeOffsetSpacing(value: string): string {
+  return value.replace(/ ([+-]\d{2}:\d{2})$/, "$1");
+}
+
+function isValidDateOnly(value: string): boolean {
+  if (!DATE_ONLY_RE.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) return false;
+
+  const [year, month, day] = value.split("-").map(Number);
+  return (
+    parsed.getUTCFullYear() === year &&
+    parsed.getUTCMonth() + 1 === month &&
+    parsed.getUTCDate() === day
+  );
+}
+
+function hasValidDateTimeParts(value: string): boolean {
+  const match =
+    /^(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?: ?(?:Z|[+-]\d{2}:\d{2}))?$/i.exec(
+      value,
+    );
+  if (!match) return false;
+
+  const [, date, rawHours, rawMinutes, rawSeconds] = match;
+  const hours = Number(rawHours);
+  const minutes = Number(rawMinutes);
+  const seconds = Number(rawSeconds);
+
+  return isValidDateOnly(date) && hours < 24 && minutes < 60 && seconds < 60;
+}
+
+function invalidFilterInputError(columnName: string, expected: string): Error {
+  return new Error(`[RapiDB Filter] Column ${columnName} expects ${expected}.`);
+}
+
 function buildUpdateRowSql(
   drv: IDBDriver,
   database: string,
@@ -404,7 +564,11 @@ function buildUpdateRowSql(
   const qt = drv.qualifiedTableName(database, schema, table);
   const colMap = new Map(cols.map((c) => [c.name, c]));
 
-  const coercedChanges = coerceRecord(drv, changes, colMap);
+  const coercedChanges = coerceRecord(
+    drv,
+    filterWritableRecord(changes, colMap),
+    colMap,
+  );
   const coercedPk = coerceRecord(drv, pkValues, colMap);
 
   const setCols = Object.keys(coercedChanges);

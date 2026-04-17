@@ -209,7 +209,8 @@ export class TablePanel {
         } catch (err: any) {
           const errMsg = err?.message ?? String(err);
           const isFilterError =
-            /invalid input syntax|invalid cidr|malformed array|not a valid (binary|hex|uuid)|syntax error in input|invalid value for type|conversion failed|arithmetic overflow|ORA-0(1841|1843|1858|1861|6502)|incorrect (date|datetime|time)|data truncat/i.test(
+            /^\[RapiDB Filter\]/.test(errMsg) ||
+            /invalid input syntax|invalid cidr|malformed array|not a valid (binary|hex|uuid)|syntax error in input|invalid value for type|invalid number|operator does not exist|conversion failed|arithmetic overflow|ORA-0(1841|1843|1858|1861|6502)|ORA-01722|incorrect (date|datetime|time)|Incorrect integer value|Truncated incorrect|data truncat/i.test(
               errMsg,
             );
           send("tableError", { fetchId, error: errMsg, isFilterError });

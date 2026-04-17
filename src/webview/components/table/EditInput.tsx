@@ -24,18 +24,16 @@ export function EditInput({
   onCancel: () => void;
 }) {
   const isInitiallyNull = initial === NULL_SENTINEL;
-  const [isNull] = useState(isInitiallyNull);
+  const [isNull, setIsNull] = useState(isInitiallyNull);
   const [val, setVal] = useState(isInitiallyNull ? "" : initial);
   const ref = useRef<HTMLInputElement | HTMLSelectElement>(null);
 
   useLayoutEffect(() => {
-    if (!isNull) {
-      ref.current?.focus();
-      if (ref.current instanceof HTMLInputElement) {
-        ref.current.select();
-      }
+    ref.current?.focus();
+    if (ref.current instanceof HTMLInputElement) {
+      ref.current.select();
     }
-  }, [isNull]);
+  }, []);
 
   const commit = () => onCommit(isNull ? NULL_SENTINEL : val);
 
@@ -55,6 +53,7 @@ export function EditInput({
     outline: "none",
     boxSizing: "border-box" as const,
     opacity: isNull ? 0.5 : 1,
+    fontStyle: isNull ? "italic" : "normal",
   };
 
   const nullBtnStyle: React.CSSProperties = {
@@ -82,21 +81,27 @@ export function EditInput({
         <select
           ref={ref as React.RefObject<HTMLSelectElement>}
           value={isNull ? "" : val}
-          disabled={isNull}
           onChange={(e) => {
-            setVal(e.target.value);
+            const next = e.target.value;
+            if (next === "") {
+              setIsNull(true);
+              setVal("");
+              return;
+            }
+            setIsNull(false);
+            setVal(next);
           }}
           onKeyDown={(e) => {
             if (e.key === "Enter") {
               e.preventDefault();
-              onCommit(isNull ? NULL_SENTINEL : val || "false");
+              commit();
             }
             if (e.key === "Escape") {
               e.preventDefault();
               onCancel();
             }
           }}
-          onBlur={() => onCommit(isNull ? NULL_SENTINEL : val || "false")}
+          onBlur={commit}
           onClick={(e) => e.stopPropagation()}
           style={{
             ...inputStyle,
@@ -104,6 +109,7 @@ export function EditInput({
             WebkitAppearance: "none",
           }}
         >
+          {nullable && <option value="" />}
           <option value="false">false</option>
           <option value="true">true</option>
         </select>
@@ -131,8 +137,12 @@ export function EditInput({
       <input
         ref={ref as React.RefObject<HTMLInputElement>}
         value={val}
-        disabled={isNull}
-        onChange={(e) => setVal(e.target.value)}
+        onChange={(e) => {
+          if (isNull) {
+            setIsNull(false);
+          }
+          setVal(e.target.value);
+        }}
         onKeyDown={(e) => {
           if (e.key === "Enter") {
             e.preventDefault();
@@ -146,7 +156,11 @@ export function EditInput({
         onBlur={commit}
         onClick={(e) => e.stopPropagation()}
         placeholder={
-          category ? placeholderForCategory(category, false) : undefined
+          isNull
+            ? "NULL"
+            : category
+              ? placeholderForCategory(category, false)
+              : undefined
         }
         style={inputStyle}
       />

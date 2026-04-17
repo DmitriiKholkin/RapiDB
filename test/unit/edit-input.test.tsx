@@ -176,7 +176,7 @@ describe("EditInput", () => {
     expect(select).not.toBeNull();
   });
 
-  it("renders input disabled when initial is NULL_SENTINEL", () => {
+  it("keeps NULL when a null text editor blurs without changes", () => {
     const onCommit = vi.fn();
     const onCancel = vi.fn();
     const { container } = render(
@@ -189,6 +189,59 @@ describe("EditInput", () => {
     );
     const input = container.querySelector("input") as HTMLInputElement;
     expect(input).not.toBeNull();
-    expect(input.disabled).toBe(true);
+    fireEvent.blur(input);
+    expect(onCommit).toHaveBeenCalledWith(NULL_SENTINEL);
+  });
+
+  it("allows typing a value into a null text editor", () => {
+    const onCommit = vi.fn();
+    const onCancel = vi.fn();
+    const { container } = render(
+      <EditInput
+        initial={NULL_SENTINEL}
+        nullable={true}
+        onCommit={onCommit}
+        onCancel={onCancel}
+      />,
+    );
+    const input = container.querySelector("input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "hello" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onCommit).toHaveBeenCalledWith("hello");
+  });
+
+  it("keeps NULL for a null boolean editor on blur without selection", () => {
+    const onCommit = vi.fn();
+    const onCancel = vi.fn();
+    const { container } = render(
+      <EditInput
+        initial={NULL_SENTINEL}
+        nullable={true}
+        isBoolean={true}
+        onCommit={onCommit}
+        onCancel={onCancel}
+      />,
+    );
+    const select = container.querySelector("select") as HTMLSelectElement;
+    fireEvent.blur(select);
+    expect(onCommit).toHaveBeenCalledWith(NULL_SENTINEL);
+  });
+
+  it("commits an explicit boolean value after starting from NULL", () => {
+    const onCommit = vi.fn();
+    const onCancel = vi.fn();
+    const { container } = render(
+      <EditInput
+        initial={NULL_SENTINEL}
+        nullable={true}
+        isBoolean={true}
+        onCommit={onCommit}
+        onCancel={onCancel}
+      />,
+    );
+    const select = container.querySelector("select") as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "true" } });
+    fireEvent.blur(select);
+    expect(onCommit).toHaveBeenCalledWith("true");
   });
 });

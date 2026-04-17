@@ -15,7 +15,7 @@ import type {
   TableInfo,
   TypeCategory,
 } from "./types";
-import { ISO_DATETIME_RE, NULL_SENTINEL } from "./types";
+import { DATETIME_SQL_RE, NULL_SENTINEL } from "./types";
 
 function oracleFullType(
   dataType: string,
@@ -46,6 +46,8 @@ oracledb.fetchAsString = [oracledb.CLOB];
 oracledb.fetchAsBuffer = [oracledb.BLOB];
 
 let _thickInitDone = false;
+
+const pad2 = (n: number) => String(n).padStart(2, "0");
 
 function ensureThickMode(libDir?: string): void {
   if (_thickInitDone) {
@@ -132,6 +134,10 @@ function replacePositionalParams(
     i++;
   }
 
+  if (idx === 0) {
+    return { sql, binds: params };
+  }
+
   if (idx !== params.length) {
     throw new Error(
       `[RapiDB] Oracle parameter mismatch: SQL has ${idx} placeholder(s) but ${params.length} value(s) were supplied.`,
@@ -139,6 +145,213 @@ function replacePositionalParams(
   }
 
   return { sql: resultSql, binds: params };
+}
+
+function parseOracleNumberScale(nativeType: string): number | null {
+  const match = /^NUMBER\s*\(\s*\d+\s*,\s*(-?\d+)\s*\)$/i.exec(
+    nativeType.trim(),
+  );
+  if (!match) return null;
+  return Number(match[1]);
+}
+
+function oracleTypeName(nativeType: string): string {
+  return nativeType
+    .toUpperCase()
+    .replace(/\(\s*\d+(?:\s*,\s*-?\d+)?\s*\)/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isTimezoneAwareOracleTemporal(nativeType: string): boolean {
+  const typeName = oracleTypeName(nativeType);
+  return (
+    typeName === "TIMESTAMP WITH TIME ZONE" ||
+    typeName === "TIMESTAMP WITH LOCAL TIME ZONE"
+  );
+}
+
+function parseOracleTemporalInput(
+  value: string,
+  options: { assumeUtcWhenMissingTimezone?: boolean } = {},
+): Date | null {
+  const trimmed = value.trim();
+  const match =
+    /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2}(?:\.\d+)?)(?: ?(Z|[+-]\d{2}(?::\d{2})?))?$/i.exec(
+      trimmed,
+    );
+  if (!match) return null;
+
+  const [, date, time, rawTz] = match;
+  if (!isValidDateOnly(date) || !isValidTimeValue(time)) {
+    return null;
+  }
+  const tz = !rawTz
+    ? options.assumeUtcWhenMissingTimezone === false
+      ? ""
+      : "Z"
+    : rawTz === "Z"
+      ? "Z"
+      : rawTz.includes(":")
+        ? rawTz
+        : `${rawTz}:00`;
+  const parsed = new Date(`${date}T${time}${tz}`);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function normalizeOracleTemporalText(value: string): {
+  text: string;
+  hasExplicitTimezone: boolean;
+} | null {
+  const trimmed = value.trim();
+  const match =
+    /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(\.\d+)?(?: ?(Z|[+-]\d{2}(?::\d{2})?))?$/i.exec(
+      trimmed,
+    );
+  if (!match) return null;
+
+  const [, date, time, rawFrac, rawTimezone] = match;
+  if (!rawFrac || rawFrac.length <= 1) {
+    return {
+      text: `${date} ${time}`,
+      hasExplicitTimezone: !!rawTimezone,
+    };
+  }
+
+  const digits = rawFrac.slice(1).slice(0, 3).padEnd(3, "0");
+  const ms = Number.parseInt(digits, 10);
+  const frac =
+    ms > 0 ? `.${String(ms).padStart(3, "0").replace(/0+$/, "")}` : "";
+  return {
+    text: `${date} ${time}${frac}`,
+    hasExplicitTimezone: !!rawTimezone,
+  };
+}
+
+function stripOracleTemporalTimezone(value: string): string {
+  return value.replace(/[ ]?(Z|[+-]\d{2}(?::\d{2})?)$/i, "").trim();
+}
+
+function trimOracleTemporalFraction(value: string): string {
+  return value.replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.0+$/, "");
+}
+
+function formatOracleWallClockDate(value: Date): string | null {
+  if (Number.isNaN(value.getTime())) return null;
+  const ms = value.getMilliseconds();
+  const frac =
+    ms > 0 ? `.${String(ms).padStart(3, "0").replace(/0+$/, "")}` : "";
+  return (
+    `${value.getFullYear()}-${pad2(value.getMonth() + 1)}-${pad2(value.getDate())} ` +
+    `${pad2(value.getHours())}:${pad2(value.getMinutes())}:${pad2(value.getSeconds())}${frac}`
+  );
+}
+
+function isValidDateOnly(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) return false;
+
+  const [year, month, day] = value.split("-").map(Number);
+  return (
+    parsed.getUTCFullYear() === year &&
+    parsed.getUTCMonth() + 1 === month &&
+    parsed.getUTCDate() === day
+  );
+}
+
+function isValidTimeValue(value: string): boolean {
+  const match = /^(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?$/.exec(value);
+  if (!match) return false;
+
+  const [, rawHours, rawMinutes, rawSeconds] = match;
+  const hours = Number(rawHours);
+  const minutes = Number(rawMinutes);
+  const seconds = Number(rawSeconds);
+  return hours < 24 && minutes < 60 && seconds < 60;
+}
+
+function normalizeOracleTemporalValue(
+  value: unknown,
+  options: { preserveExplicitTimezoneText?: boolean } = {},
+): string | null {
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) return null;
+    return trimOracleTemporalFraction(
+      stripOracleTemporalTimezone(formatDatetimeForDisplay(value) ?? ""),
+    );
+  }
+
+  if (typeof value === "string") {
+    const normalizedText = normalizeOracleTemporalText(value);
+    if (
+      normalizedText &&
+      (!normalizedText.hasExplicitTimezone ||
+        options.preserveExplicitTimezoneText)
+    ) {
+      return normalizedText.text;
+    }
+
+    const parsed = parseOracleTemporalInput(value);
+    if (parsed) {
+      const formatted = formatDatetimeForDisplay(parsed);
+      return formatted
+        ? trimOracleTemporalFraction(stripOracleTemporalTimezone(formatted))
+        : null;
+    }
+
+    const formatted = formatDatetimeForDisplay(value);
+    if (formatted)
+      return trimOracleTemporalFraction(stripOracleTemporalTimezone(formatted));
+
+    if (DATETIME_SQL_RE.test(value.trim())) {
+      return trimOracleTemporalFraction(
+        stripOracleTemporalTimezone(value.trim()),
+      );
+    }
+  }
+
+  return null;
+}
+
+function oracleTemporalFilterExpr(column: ColumnTypeMeta): string {
+  const typeName = oracleTypeName(column.nativeType);
+  const col = `"${column.name.replace(/"/g, '""')}"`;
+
+  if (typeName === "DATE") {
+    return `TO_CHAR(${col}, 'YYYY-MM-DD HH24:MI:SS')`;
+  }
+
+  if (isTimezoneAwareOracleTemporal(column.nativeType)) {
+    return `RTRIM(RTRIM(TO_CHAR(SYS_EXTRACT_UTC(CAST(${col} AS TIMESTAMP WITH TIME ZONE)), 'YYYY-MM-DD HH24:MI:SS.FF3'), '0'), '.')`;
+  }
+
+  return `RTRIM(RTRIM(TO_CHAR(${col}, 'YYYY-MM-DD HH24:MI:SS.FF3'), '0'), '.')`;
+}
+
+function formatOracleQueryValue(
+  value: unknown,
+  meta: oracledb.Metadata<unknown>,
+): unknown {
+  if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
+    return value;
+  }
+
+  if (
+    meta.dbType === oracledb.DB_TYPE_DATE ||
+    meta.dbType === oracledb.DB_TYPE_TIMESTAMP
+  ) {
+    return formatOracleWallClockDate(value) ?? value;
+  }
+
+  if (
+    meta.dbType === oracledb.DB_TYPE_TIMESTAMP_TZ ||
+    meta.dbType === oracledb.DB_TYPE_TIMESTAMP_LTZ
+  ) {
+    return normalizeOracleTemporalValue(value) ?? value;
+  }
+
+  return value;
 }
 
 function isPLSQLBlock(stmt: string): boolean {
@@ -924,18 +1137,14 @@ export class OracleDriver extends BaseDBDriver {
       const executionTimeMs = Date.now() - start;
 
       if (res.metaData && res.rows && res.rows.length > 0) {
-        const columns = res.metaData.map((m) => m.name);
+        const metaData = res.metaData;
+        const columns = metaData.map((m) => m.name);
         const rows = (res.rows as unknown[][]).map((row) =>
           Object.fromEntries(
-            row.map((val, i) => {
-              let finalVal = val;
-
-              if (val instanceof Date) {
-                finalVal = `${val.toISOString().replace("T", " ").substring(0, 19)} +00`;
-              }
-
-              return [`__col_${i}`, finalVal];
-            }),
+            row.map((val, i) => [
+              `__col_${i}`,
+              formatOracleQueryValue(val, metaData[i]),
+            ]),
           ),
         );
         return { columns, rows, rowCount: rows.length, executionTimeMs };
@@ -1007,7 +1216,8 @@ export class OracleDriver extends BaseDBDriver {
   // ─── Oracle type system ───
 
   mapTypeCategory(nativeType: string): TypeCategory {
-    const ct = nativeType.toUpperCase().split("(")[0].trim();
+    const normalizedType = nativeType.toUpperCase().trim();
+    const ct = normalizedType.split("(")[0].trim();
     if (
       [
         "NUMBER",
@@ -1016,8 +1226,13 @@ export class OracleDriver extends BaseDBDriver {
         "PLS_INTEGER",
         "BINARY_INTEGER",
       ].includes(ct)
-    )
+    ) {
+      const scale = parseOracleNumberScale(normalizedType);
+      if (ct === "NUMBER" && scale !== null && scale > 0) {
+        return "decimal";
+      }
       return "integer";
+    }
     if (ct === "FLOAT" || ct === "BINARY_FLOAT" || ct === "BINARY_DOUBLE")
       return "float";
     if (ct === "DATE") return "datetime";
@@ -1096,12 +1311,24 @@ export class OracleDriver extends BaseDBDriver {
       return super.coerceInputValue(value, column);
 
     // ISO datetime → Oracle-friendly
-    if (
-      ISO_DATETIME_RE.test(value) &&
-      this.isDatetimeWithTime(column.nativeType)
-    ) {
-      const d = new Date(value);
-      if (!Number.isNaN(d.getTime())) return d;
+    if (this.isDatetimeWithTime(column.nativeType)) {
+      const normalizedText = normalizeOracleTemporalText(value);
+      if (
+        normalizedText?.hasExplicitTimezone &&
+        !isTimezoneAwareOracleTemporal(column.nativeType)
+      ) {
+        const parsedLocal = parseOracleTemporalInput(normalizedText.text, {
+          assumeUtcWhenMissingTimezone: false,
+        });
+        if (parsedLocal) return parsedLocal;
+      }
+
+      const parsed = parseOracleTemporalInput(value, {
+        assumeUtcWhenMissingTimezone: isTimezoneAwareOracleTemporal(
+          column.nativeType,
+        ),
+      });
+      if (parsed) return parsed;
     }
 
     return value;
@@ -1111,8 +1338,16 @@ export class OracleDriver extends BaseDBDriver {
     if (value === null || value === undefined) return value;
     if (Buffer.isBuffer(value)) return super.formatOutputValue(value, column);
     if (typeof value === "bigint") return value.toString();
-    if (value instanceof Date && !Number.isNaN(value.getTime())) {
-      return `${value.toISOString().replace("T", " ").substring(0, 19)} +00`;
+    if (this.isDatetimeWithTime(column.nativeType)) {
+      if (
+        value instanceof Date &&
+        !isTimezoneAwareOracleTemporal(column.nativeType)
+      ) {
+        const formatted = formatOracleWallClockDate(value);
+        if (formatted !== null) return formatted;
+      }
+      const formatted = normalizeOracleTemporalValue(value);
+      if (formatted !== null) return formatted;
     }
     // LOB-like values already consumed as string/Buffer via fetchAsString/fetchAsBuffer
     return value;
@@ -1165,9 +1400,19 @@ export class OracleDriver extends BaseDBDriver {
     // Datetime: TO_CHAR LIKE
     if (this.isDatetimeWithTime(column.nativeType)) {
       const v = typeof val === "string" ? val : val[0];
+      const normalized =
+        normalizeOracleTemporalValue(v, {
+          preserveExplicitTimezoneText: !isTimezoneAwareOracleTemporal(
+            column.nativeType,
+          ),
+        }) ?? v.trim();
+      const comparable =
+        oracleTypeName(column.nativeType) === "DATE"
+          ? normalized.replace(/\.\d+$/, "")
+          : normalized;
       return {
-        sql: `TO_CHAR(${col}, 'YYYY-MM-DD HH24:MI:SS') LIKE :${paramIndex}`,
-        params: [`%${v}%`],
+        sql: `${oracleTemporalFilterExpr(column)} LIKE :${paramIndex}`,
+        params: [`%${comparable}%`],
       };
     }
 

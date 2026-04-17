@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import oracledb from "oracledb";
+import { describe, expect, it, vi } from "vitest";
 import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
 import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
 import { OracleDriver } from "../../src/extension/dbDrivers/oracle";
@@ -485,6 +486,43 @@ describe("MySQLDriver", () => {
       expect(r?.sql).toContain("CHAR");
       expect(r?.sql).toContain("LIKE");
     });
+
+    it("keeps FLOAT filters on the textual fallback path", () => {
+      const c = col({
+        name: "score",
+        type: "float",
+        category: "float",
+        nativeType: "float",
+      });
+      const r = my.buildFilterCondition(c, "eq", "0.1", 1);
+      expect(r?.sql).toContain("ABS");
+      expect(r?.sql).toContain("GREATEST");
+      expect(r?.params).toEqual([0.1, 0.000001, 0.1, 0.000001]);
+    });
+
+    it("keeps DOUBLE filters on the textual fallback path", () => {
+      const c = col({
+        name: "score",
+        type: "double",
+        category: "float",
+        nativeType: "double",
+      });
+      const r = my.buildFilterCondition(c, "eq", "0.1", 1);
+      expect(r?.sql).toContain("ABS");
+      expect(r?.sql).toContain("GREATEST");
+      expect(r?.params).toEqual([0.1, 0.000001, 0.1, 0.000001]);
+    });
+
+    it("normalizes equivalent FLOAT inputs before textual matching", () => {
+      const c = col({
+        name: "score",
+        type: "float",
+        category: "float",
+        nativeType: "float",
+      });
+      const r = my.buildFilterCondition(c, "eq", "1.250", 1);
+      expect(r?.params).toEqual([1.25, 0.000001, 1.25, 0.000001]);
+    });
   });
 });
 
@@ -513,6 +551,7 @@ describe("MSSQLDriver", () => {
       ["datetime", "datetime"],
       ["datetime2(7)", "datetime"],
       ["datetimeoffset(7)", "datetime"],
+      ["smalldatetime", "datetime"],
       ["time(7)", "time"],
       ["geography", "spatial"],
       ["geometry", "spatial"],
@@ -683,6 +722,18 @@ describe("MSSQLDriver", () => {
       const r = ms.buildFilterCondition(c, "like", "2024", 1);
       expect(r?.sql).toContain("CONVERT");
     });
+
+    it("uses CONVERT(date, col) for typed date equality filters", () => {
+      const c = col({
+        name: "d",
+        type: "date",
+        category: "date",
+        nativeType: "date",
+      });
+      const r = ms.buildFilterCondition(c, "eq", "2026-04-15", 1);
+      expect(r?.sql).toContain("CONVERT(date");
+      expect(r?.params).toEqual(["2026-04-15"]);
+    });
   });
 });
 
@@ -694,7 +745,7 @@ describe("OracleDriver", () => {
   describe("mapTypeCategory", () => {
     it.each([
       ["NUMBER", "integer"],
-      ["NUMBER(10,2)", "integer"],
+      ["NUMBER(10,2)", "decimal"],
       ["INTEGER", "integer"],
       ["FLOAT", "float"],
       ["BINARY_FLOAT", "float"],
@@ -741,6 +792,80 @@ describe("OracleDriver", () => {
     });
   });
 
+  describe("query bind handling", () => {
+    it("passes through native Oracle bind placeholders", async () => {
+      const execute = vi.fn(async () => ({
+        metaData: [],
+        rows: [],
+        rowsAffected: 0,
+      }));
+      const close = vi.fn(async () => {});
+      const pool = {
+        getConnection: vi.fn(async () => ({ execute, close })),
+      };
+      (ora as unknown as { pool: typeof pool }).pool = pool;
+
+      const sql = 'SELECT * FROM "T" OFFSET :1 ROWS FETCH NEXT :2 ROWS ONLY';
+      const result = await ora.query(sql, [10, 25]);
+
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(execute).toHaveBeenCalledWith(
+        sql,
+        [10, 25],
+        expect.objectContaining({
+          autoCommit: true,
+          fetchArraySize: 100,
+        }),
+      );
+      expect(result.rows).toEqual([]);
+      expect(close).toHaveBeenCalledTimes(1);
+    });
+
+    it("rewrites legacy qmark placeholders to Oracle binds", async () => {
+      const execute = vi.fn(async () => ({
+        metaData: [],
+        rows: [],
+        rowsAffected: 0,
+      }));
+      const close = vi.fn(async () => {});
+      const pool = {
+        getConnection: vi.fn(async () => ({ execute, close })),
+      };
+      (ora as unknown as { pool: typeof pool }).pool = pool;
+
+      await ora.query("SELECT ? FROM dual", [1]);
+
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(execute).toHaveBeenCalledWith(
+        "SELECT :1 FROM dual",
+        [1],
+        expect.objectContaining({
+          autoCommit: true,
+          fetchArraySize: 100,
+        }),
+      );
+      expect(close).toHaveBeenCalledTimes(1);
+    });
+
+    it("formats Oracle DATE query results before returning rows", async () => {
+      const execute = vi.fn(async () => ({
+        metaData: [{ name: "D", dbType: oracledb.DB_TYPE_DATE }],
+        rows: [[new Date(2024, 5, 15, 10, 30, 0)]],
+        rowsAffected: 0,
+      }));
+      const close = vi.fn(async () => {});
+      const pool = {
+        getConnection: vi.fn(async () => ({ execute, close })),
+      };
+      (ora as unknown as { pool: typeof pool }).pool = pool;
+
+      const result = await ora.query("SELECT CURRENT_DATE AS D FROM dual");
+
+      expect(result.rows).toEqual([{ __col_0: "2024-06-15 10:30:00" }]);
+      expect(close).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe("buildInsertValueExpr (:N)", () => {
     it("returns :N", () => {
       expect(
@@ -769,6 +894,68 @@ describe("OracleDriver", () => {
       expect(r).toBeInstanceOf(Date);
     });
 
+    it("accepts SQL datetime display strings for datetime columns", () => {
+      const c = col({
+        name: "d",
+        type: "DATE",
+        category: "datetime",
+        nativeType: "DATE",
+      });
+      const r = ora.coerceInputValue("2024-06-15 10:30:00", c);
+      expect(r).toBeInstanceOf(Date);
+      expect((r as Date).getFullYear()).toBe(2024);
+      expect((r as Date).getMonth()).toBe(5);
+      expect((r as Date).getDate()).toBe(15);
+      expect((r as Date).getHours()).toBe(10);
+      expect((r as Date).getMinutes()).toBe(30);
+      expect((r as Date).getSeconds()).toBe(0);
+    });
+
+    it("treats offset-bearing input for plain Oracle DATE columns as wall-clock text", () => {
+      const c = col({
+        name: "d",
+        type: "DATE",
+        category: "datetime",
+        nativeType: "DATE",
+      });
+      const r = ora.coerceInputValue("2024-06-15T10:30:00+02:00", c);
+      expect(r).toBeInstanceOf(Date);
+      expect((r as Date).getFullYear()).toBe(2024);
+      expect((r as Date).getMonth()).toBe(5);
+      expect((r as Date).getDate()).toBe(15);
+      expect((r as Date).getHours()).toBe(10);
+      expect((r as Date).getMinutes()).toBe(30);
+      expect((r as Date).getSeconds()).toBe(0);
+    });
+
+    it("treats timezone-aware ISO input without an explicit offset as UTC", () => {
+      const c = col({
+        name: "d",
+        type: "TIMESTAMP WITH TIME ZONE",
+        category: "datetime",
+        nativeType: "TIMESTAMP WITH TIME ZONE",
+      });
+      const r = ora.coerceInputValue("2024-06-15T10:30:00", c);
+      expect(r).toBeInstanceOf(Date);
+      expect((r as Date).getUTCFullYear()).toBe(2024);
+      expect((r as Date).getUTCMonth()).toBe(5);
+      expect((r as Date).getUTCDate()).toBe(15);
+      expect((r as Date).getUTCHours()).toBe(10);
+      expect((r as Date).getUTCMinutes()).toBe(30);
+      expect((r as Date).getUTCSeconds()).toBe(0);
+    });
+
+    it("does not coerce impossible Oracle datetime input into a different real timestamp", () => {
+      const c = col({
+        name: "d",
+        type: "DATE",
+        category: "datetime",
+        nativeType: "DATE",
+      });
+      const r = ora.coerceInputValue("2026-02-31T10:00:00+02:00", c);
+      expect(r).toBe("2026-02-31T10:00:00+02:00");
+    });
+
     it("passes plain strings through for text", () => {
       const c = col({
         name: "s",
@@ -781,15 +968,52 @@ describe("OracleDriver", () => {
   });
 
   describe("formatOutputValue", () => {
-    it("formats Date as 'YYYY-MM-DD HH:MM:SS +00'", () => {
+    it("formats Oracle DATE values with their local wall-clock components", () => {
       const c = col({ name: "d", type: "DATE", category: "datetime" });
+      const result = ora.formatOutputValue(
+        new Date(2024, 5, 15, 10, 30, 0),
+        c,
+      ) as string;
+      expect(result).toBe("2024-06-15 10:30:00");
+    });
+
+    it("trims trailing zeroes in Oracle wall-clock fractional seconds", () => {
+      const c = col({ name: "d", type: "DATE", category: "datetime" });
+      const result = ora.formatOutputValue(
+        new Date(2024, 5, 15, 10, 30, 0, 120),
+        c,
+      ) as string;
+      expect(result).toBe("2024-06-15 10:30:00.12");
+    });
+
+    it("formats timezone-aware Oracle values as canonical display text", () => {
+      const c = col({
+        name: "d",
+        type: "TIMESTAMP WITH TIME ZONE",
+        category: "datetime",
+        nativeType: "TIMESTAMP WITH TIME ZONE",
+      });
       const result = ora.formatOutputValue(
         new Date("2024-06-15T10:30:00Z"),
         c,
       ) as string;
       expect(result).toContain("2024-06-15");
       expect(result).toContain("10:30:00");
-      expect(result).toContain("+00");
+      expect(result).not.toContain("+00");
+    });
+
+    it("trims trailing zeroes for timezone-aware Oracle fractional seconds", () => {
+      const c = col({
+        name: "d",
+        type: "TIMESTAMP WITH TIME ZONE",
+        category: "datetime",
+        nativeType: "TIMESTAMP WITH TIME ZONE",
+      });
+      const result = ora.formatOutputValue(
+        new Date("2024-06-15T10:30:00.120Z"),
+        c,
+      ) as string;
+      expect(result).toBe("2024-06-15 10:30:00.12");
     });
 
     it("converts bigint to string", () => {
@@ -826,6 +1050,40 @@ describe("OracleDriver", () => {
       });
       const r = ora.buildFilterCondition(c, "like", "2024", 1);
       expect(r?.sql).toContain("TO_CHAR");
+      expect(r?.params).toEqual(["%2024%"]);
+    });
+
+    it("preserves wall-clock text for offset-bearing non-timezone datetime filters", () => {
+      const c = col({
+        name: "dt",
+        type: "TIMESTAMP(6)",
+        category: "datetime",
+        nativeType: "TIMESTAMP(6)",
+      });
+      const r = ora.buildFilterCondition(
+        c,
+        "like",
+        "2024-06-15T10:30:00+02:00",
+        1,
+      );
+      expect(r?.params).toEqual(["%2024-06-15 10:30:00%"]);
+    });
+
+    it("normalizes timezone-aware datetime filters to the UTC display basis", () => {
+      const c = col({
+        name: "dt",
+        type: "TIMESTAMP WITH TIME ZONE",
+        category: "datetime",
+        nativeType: "TIMESTAMP WITH TIME ZONE",
+      });
+      const r = ora.buildFilterCondition(
+        c,
+        "like",
+        "2024-06-15T10:30:00+02:00",
+        1,
+      );
+      expect(r?.sql).toContain("SYS_EXTRACT_UTC");
+      expect(r?.params).toEqual(["%2024-06-15 08:30:00%"]);
     });
   });
 });

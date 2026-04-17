@@ -1,0 +1,156 @@
+/**
+ * @vitest-environment jsdom
+ */
+
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import React from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TableView } from "../../src/webview/components/TableView";
+import type { ColumnMeta } from "../../src/webview/types";
+
+afterEach(cleanup);
+
+const postMessage = vi.fn();
+
+function makeColumn(
+  overrides: Partial<ColumnMeta> & { name: string; type: string },
+): ColumnMeta {
+  return {
+    name: overrides.name,
+    type: overrides.type,
+    nullable: true,
+    isPrimaryKey: false,
+    isForeignKey: false,
+    isAutoIncrement: false,
+    category: "text",
+    nativeType: overrides.type,
+    filterable: true,
+    editable: true,
+    filterOperators: ["like"],
+    isBoolean: false,
+    ...overrides,
+  };
+}
+
+function emit(type: string, payload: unknown): void {
+  window.dispatchEvent(
+    new MessageEvent("message", { data: { type, payload } }),
+  );
+}
+
+describe("TableView", () => {
+  beforeEach(() => {
+    postMessage.mockReset();
+    (
+      window as Window & { __vscode?: { postMessage: typeof postMessage } }
+    ).__vscode = {
+      postMessage,
+    };
+  });
+
+  it("renders filter controls only for filterable columns", async () => {
+    render(
+      <TableView
+        connectionId="conn1"
+        database="db"
+        schema="public"
+        table="users"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(postMessage).toHaveBeenCalledWith({
+        type: "ready",
+        payload: undefined,
+      });
+    });
+
+    emit("tableInit", {
+      columns: [
+        makeColumn({
+          name: "id",
+          type: "integer",
+          category: "integer",
+          isPrimaryKey: true,
+          filterable: false,
+          editable: false,
+          isAutoIncrement: true,
+        }),
+        makeColumn({ name: "name", type: "text" }),
+      ],
+      primaryKeyColumns: ["id"],
+    });
+    emit("tableData", {
+      rows: [{ id: 1, name: "Alice" }],
+      totalCount: 1,
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Alice")).toBeDefined();
+    });
+
+    const inputs = screen.getAllByRole("textbox");
+    expect(inputs).toHaveLength(2);
+    expect((inputs[0] as HTMLInputElement).disabled).toBe(true);
+    expect((inputs[1] as HTMLInputElement).disabled).toBe(false);
+    expect(screen.getByPlaceholderText("filter")).toBeDefined();
+  });
+
+  it("blocks editing for read-only auto-increment cells but allows editable cells", async () => {
+    const { container } = render(
+      <TableView
+        connectionId="conn1"
+        database="db"
+        schema="public"
+        table="users"
+      />,
+    );
+
+    await waitFor(() => {
+      expect(postMessage).toHaveBeenCalledWith({
+        type: "ready",
+        payload: undefined,
+      });
+    });
+
+    emit("tableInit", {
+      columns: [
+        makeColumn({
+          name: "id",
+          type: "integer",
+          category: "integer",
+          isPrimaryKey: true,
+          filterable: false,
+          editable: false,
+          isAutoIncrement: true,
+        }),
+        makeColumn({ name: "name", type: "text" }),
+      ],
+      primaryKeyColumns: ["id"],
+    });
+    emit("tableData", {
+      rows: [{ id: 1, name: "Alice" }],
+      totalCount: 1,
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Alice")).toBeDefined();
+    });
+
+    const pkCell = container.querySelector('td[title="PK: 1"]');
+    expect(pkCell).not.toBeNull();
+    fireEvent.doubleClick(pkCell as HTMLElement);
+    expect(container.querySelector('td[title="PK: 1"] input')).toBeNull();
+
+    fireEvent.doubleClick(
+      screen.getByText("Alice").closest("td") as HTMLElement,
+    );
+    expect(screen.getByDisplayValue("Alice")).toBeDefined();
+  });
+});

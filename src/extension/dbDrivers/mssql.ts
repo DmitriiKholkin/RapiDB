@@ -588,9 +588,11 @@ export class MSSQLDriver extends BaseDBDriver {
     if (["real", "float"].includes(ct)) return "float";
     if (["decimal", "numeric", "money", "smallmoney"].includes(ct))
       return "decimal";
-    if (ct === "date" || ct === "smalldatetime") return "date";
+    if (ct === "date") return "date";
     if (ct === "time") return "time";
-    if (["datetime", "datetime2", "datetimeoffset"].includes(ct))
+    if (
+      ["datetime", "datetime2", "datetimeoffset", "smalldatetime"].includes(ct)
+    )
       return "datetime";
     if (["binary", "varbinary", "image"].includes(ct)) return "binary";
     if (ct === "uniqueidentifier") return "uuid";
@@ -759,6 +761,18 @@ export class MSSQLDriver extends BaseDBDriver {
     ) {
       const sqlOp = this.sqlOperator(operator);
       return { sql: `${col} ${sqlOp} ?`, params: [Number(val)] };
+    }
+
+    if (column.category === "date") {
+      const v = typeof val === "string" ? val : val[0];
+      if (operator === "eq" || operator === "neq") {
+        const sqlOp = operator === "neq" ? "<>" : "=";
+        return { sql: `CONVERT(date, ${col}) ${sqlOp} ?`, params: [v] };
+      }
+      return {
+        sql: `CONVERT(VARCHAR, ${col}, 23) LIKE ?`,
+        params: [`%${v}%`],
+      };
     }
 
     // Between

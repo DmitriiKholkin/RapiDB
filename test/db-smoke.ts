@@ -7,7 +7,10 @@ import { MSSQLDriver } from "../src/extension/dbDrivers/mssql";
 import { MySQLDriver } from "../src/extension/dbDrivers/mysql";
 import { OracleDriver } from "../src/extension/dbDrivers/oracle";
 import { PostgresDriver } from "../src/extension/dbDrivers/postgres";
-import type { IDBDriver } from "../src/extension/dbDrivers/types";
+import {
+  type IDBDriver,
+  NULL_SENTINEL,
+} from "../src/extension/dbDrivers/types";
 import {
   formatDatetimeForDisplay,
   TableDataService,
@@ -201,6 +204,19 @@ function assertCellValue(
   assert.equal(actualText, expectedText, `${context}: values differ`);
 }
 
+function assertOptionalExactValue(
+  actual: unknown,
+  expected: unknown,
+  context: string,
+): void {
+  if (expected === null || expected === undefined) {
+    assert.equal(actual ?? null, expected ?? null, `${context}: values differ`);
+    return;
+  }
+
+  assertCellValue(actual, expected, "exact", context);
+}
+
 function assertRowMatchesColumns(
   row: Record<string, unknown>,
   columns: DbFixture["columns"],
@@ -229,6 +245,51 @@ function assertColumnNames(
     ...fixture.columns.map((column) => column.name),
   ];
   assert.deepEqual(actual, expected, `${label}: column order mismatch`);
+}
+
+function assertColumnMetadata(
+  columns: Awaited<ReturnType<TableDataService["getColumns"]>>,
+  fixture: DbFixture,
+): void {
+  const columnMap = new Map(columns.map((column) => [column.name, column]));
+
+  for (const expectation of fixture.metadataChecks) {
+    const column = columnMap.get(expectation.column);
+    assert.ok(
+      column,
+      `${fixture.displayName}: missing metadata for ${expectation.column}`,
+    );
+    if (!column) {
+      continue;
+    }
+
+    assert.equal(
+      column.category,
+      expectation.category,
+      `${fixture.displayName}: unexpected category for ${expectation.column}`,
+    );
+    if (expectation.filterable !== undefined) {
+      assert.equal(
+        column.filterable,
+        expectation.filterable,
+        `${fixture.displayName}: unexpected filterable for ${expectation.column}`,
+      );
+    }
+    if (expectation.isAutoIncrement !== undefined) {
+      assert.equal(
+        column.isAutoIncrement ?? false,
+        expectation.isAutoIncrement,
+        `${fixture.displayName}: unexpected isAutoIncrement for ${expectation.column}`,
+      );
+    }
+    if (expectation.isBoolean !== undefined) {
+      assert.equal(
+        column.isBoolean,
+        expectation.isBoolean,
+        `${fixture.displayName}: unexpected isBoolean for ${expectation.column}`,
+      );
+    }
+  }
 }
 
 function execSql(driver: IDBDriver, sql: string): Promise<unknown> {
@@ -317,6 +378,7 @@ async function runFixture(fixture: DbFixture, runId: string): Promise<void> {
       fixture,
       `${fixture.displayName} describeTable`,
     );
+    assertColumnMetadata(colMeta, fixture);
 
     console.log(`[${fixture.displayName}] inserting seed row`);
     await service.insertRow(
@@ -351,42 +413,6 @@ async function runFixture(fixture: DbFixture, runId: string): Promise<void> {
 
     const pkName = idColumnName(fixture);
     const pkValue = (page.rows[0] as Record<string, unknown>)[pkName];
-
-    console.log(`[${fixture.displayName}] verifying filters`);
-    for (const filterCase of fixture.filterCases) {
-      const filtered = await service.getPage(
-        connectionId,
-        fixture.database,
-        fixture.schema,
-        fixture.table,
-        1,
-        25,
-        [{ column: filterCase.column, value: filterCase.value }],
-        null,
-      );
-      assert.equal(
-        filtered.rows.length,
-        1,
-        `${fixture.displayName}: filter on ${filterCase.column} should return one row`,
-      );
-      const row = filtered.rows[0] as Record<string, unknown>;
-      const column = fixture.columns.find(
-        (entry) => entry.name === filterCase.column,
-      );
-      assert.notEqual(
-        column,
-        undefined,
-        `${fixture.displayName}: missing column ${filterCase.column}`,
-      );
-      if (column) {
-        assertCellValue(
-          row[column.name],
-          fixture.seedValues[column.name],
-          column.comparison ?? "exact",
-          `${fixture.displayName} filter ${column.name}`,
-        );
-      }
-    }
 
     console.log(`[${fixture.displayName}] verifying view and function`);
     const viewResult = await mainDriver.query(
@@ -524,6 +550,147 @@ async function runFixture(fixture: DbFixture, runId: string): Promise<void> {
       );
     }
 
+    console.log(
+      `[${fixture.displayName}] restoring seed row after update checks`,
+    );
+    for (const column of fixture.columns) {
+      if (column.updatable === false) {
+        continue;
+      }
+
+      await service.updateRow(
+        connectionId,
+        fixture.database,
+        fixture.schema,
+        fixture.table,
+        { [pkName]: pkValue },
+        { [column.name]: fixture.seedValues[column.name] },
+      );
+    }
+
+    page = await service.getPage(
+      connectionId,
+      fixture.database,
+      fixture.schema,
+      fixture.table,
+      1,
+      25,
+      [],
+      null,
+    );
+    assert.equal(
+      page.rows.length,
+      1,
+      `${fixture.displayName}: restoring the seed row should keep one row`,
+    );
+    assertRowMatchesColumns(
+      page.rows[0] as Record<string, unknown>,
+      fixture.columns,
+      fixture.seedValues,
+      `${fixture.displayName} restored seed row`,
+    );
+
+    console.log(
+      `[${fixture.displayName}] verifying explicit empty-string update`,
+    );
+    await service.updateRow(
+      connectionId,
+      fixture.database,
+      fixture.schema,
+      fixture.table,
+      { [pkName]: pkValue },
+      { [fixture.emptyStringColumn]: "" },
+    );
+
+    page = await service.getPage(
+      connectionId,
+      fixture.database,
+      fixture.schema,
+      fixture.table,
+      1,
+      25,
+      [],
+      null,
+    );
+    assert.equal(
+      page.rows.length,
+      1,
+      `${fixture.displayName}: empty-string update should keep one row`,
+    );
+    const updatedRow = page.rows[0] as Record<string, unknown>;
+    assert.ok(
+      Object.hasOwn(updatedRow, fixture.emptyStringColumn),
+      `${fixture.displayName}: updated row should include ${fixture.emptyStringColumn}`,
+    );
+    assertOptionalExactValue(
+      updatedRow[fixture.emptyStringColumn],
+      fixture.emptyStringReadback,
+      `${fixture.displayName} empty-string update ${fixture.emptyStringColumn}`,
+    );
+
+    await service.updateRow(
+      connectionId,
+      fixture.database,
+      fixture.schema,
+      fixture.table,
+      { [pkName]: pkValue },
+      {
+        [fixture.emptyStringColumn]:
+          fixture.seedValues[fixture.emptyStringColumn],
+      },
+    );
+
+    console.log(
+      `[${fixture.displayName}] verifying explicit empty-string insert`,
+    );
+    await service.insertRow(
+      connectionId,
+      fixture.database,
+      fixture.schema,
+      fixture.table,
+      {
+        [pkName]: 999999,
+        [fixture.emptyStringLabelColumn]: fixture.emptyStringLabelValue,
+        [fixture.emptyStringColumn]: "",
+      },
+    );
+
+    const emptyStringPage = await service.getPage(
+      connectionId,
+      fixture.database,
+      fixture.schema,
+      fixture.table,
+      1,
+      25,
+      [
+        {
+          column: fixture.emptyStringLabelColumn,
+          value: fixture.emptyStringLabelValue,
+        },
+      ],
+      null,
+    );
+    assert.equal(
+      emptyStringPage.rows.length,
+      1,
+      `${fixture.displayName}: explicit empty-string insert should be queryable`,
+    );
+    const emptyStringRow = emptyStringPage.rows[0] as Record<string, unknown>;
+    assert.ok(
+      Object.hasOwn(emptyStringRow, fixture.emptyStringColumn),
+      `${fixture.displayName}: explicit empty-string row should include ${fixture.emptyStringColumn}`,
+    );
+    assert.notEqual(
+      emptyStringRow[pkName],
+      999999,
+      `${fixture.displayName}: auto-increment PK should ignore explicit insert values`,
+    );
+    assertOptionalExactValue(
+      emptyStringRow[fixture.emptyStringColumn],
+      fixture.emptyStringReadback,
+      `${fixture.displayName} empty-string insert ${fixture.emptyStringColumn}`,
+    );
+
     console.log(`[${fixture.displayName}] calling procedure`);
     await execSql(mainDriver, fixture.procedureCallSql);
 
@@ -556,6 +723,75 @@ async function runFixture(fixture: DbFixture, runId: string): Promise<void> {
       `${fixture.displayName} procedure insert`,
     );
 
+    console.log(`[${fixture.displayName}] verifying NULL filters`);
+    const nullFilterPage = await service.getPage(
+      connectionId,
+      fixture.database,
+      fixture.schema,
+      fixture.table,
+      1,
+      25,
+      [{ column: fixture.nullFilterColumn, value: NULL_SENTINEL }],
+      null,
+    );
+    assert.equal(
+      nullFilterPage.rows.length,
+      1,
+      `${fixture.displayName}: NULL filter should return exactly the procedure row`,
+    );
+    const nullFilterRow = nullFilterPage.rows[0] as Record<string, unknown>;
+    assert.ok(
+      Object.hasOwn(nullFilterRow, fixture.nullFilterColumn),
+      `${fixture.displayName}: NULL filter row should include ${fixture.nullFilterColumn}`,
+    );
+    assert.equal(
+      nullFilterRow[fixture.nullFilterColumn],
+      null,
+      `${fixture.displayName}: NULL filter row should contain NULL in ${fixture.nullFilterColumn}`,
+    );
+    assertCellValue(
+      nullFilterRow[fixture.procedureColumn],
+      fixture.procedureValue,
+      "exact",
+      `${fixture.displayName} NULL filter procedure row`,
+    );
+
+    console.log(`[${fixture.displayName}] verifying filters`);
+    for (const filterCase of fixture.filterCases) {
+      const filtered = await service.getPage(
+        connectionId,
+        fixture.database,
+        fixture.schema,
+        fixture.table,
+        1,
+        25,
+        [{ column: filterCase.column, value: filterCase.value }],
+        null,
+      );
+      assert.equal(
+        filtered.rows.length,
+        1,
+        `${fixture.displayName}: filter on ${filterCase.column} should return one row`,
+      );
+      const row = filtered.rows[0] as Record<string, unknown>;
+      const column = fixture.columns.find(
+        (entry) => entry.name === filterCase.column,
+      );
+      assert.notEqual(
+        column,
+        undefined,
+        `${fixture.displayName}: missing column ${filterCase.column}`,
+      );
+      if (column) {
+        assertCellValue(
+          row[column.name],
+          fixture.seedValues[column.name],
+          column.comparison ?? "exact",
+          `${fixture.displayName} filter ${column.name}`,
+        );
+      }
+    }
+
     const allRows = await service.getPage(
       connectionId,
       fixture.database,
@@ -568,8 +804,8 @@ async function runFixture(fixture: DbFixture, runId: string): Promise<void> {
     );
     assert.equal(
       allRows.rows.length,
-      2,
-      `${fixture.displayName}: expected two rows before delete`,
+      3,
+      `${fixture.displayName}: expected three rows before delete`,
     );
 
     const primaryKeys = allRows.rows.map((row) => ({

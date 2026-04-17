@@ -1,4 +1,5 @@
 import type { ConnectionConfig } from "../src/extension/connectionManager";
+import type { TypeCategory } from "../src/extension/dbDrivers/types";
 
 export type DbKind = "pg" | "mysql" | "mssql" | "oracle";
 
@@ -13,6 +14,14 @@ export interface ColumnSpec {
   comparison?: ComparisonMode;
   filterable?: boolean;
   updatable?: boolean;
+}
+
+export interface MetadataExpectation {
+  column: string;
+  category: TypeCategory;
+  filterable?: boolean;
+  isAutoIncrement?: boolean;
+  isBoolean?: boolean;
 }
 
 export interface DbFixture {
@@ -30,8 +39,14 @@ export interface DbFixture {
   procedureColumn: string;
   procedureValue: unknown;
   columns: ColumnSpec[];
+  metadataChecks: MetadataExpectation[];
   seedValues: Record<string, unknown>;
   updateValues: Record<string, unknown>;
+  nullFilterColumn: string;
+  emptyStringColumn: string;
+  emptyStringLabelColumn: string;
+  emptyStringLabelValue: string;
+  emptyStringReadback: unknown;
   filterCases: Array<{
     column: string;
     value: string;
@@ -339,8 +354,18 @@ function buildPgFixture(runId: string): DbFixture {
     procedureColumn: "varchar_col",
     procedureValue: "proc row",
     columns,
+    metadataChecks: [
+      { column: "id", category: "integer", isAutoIncrement: true },
+      { column: "numeric_col", category: "decimal" },
+      { column: "bool_col", category: "boolean", isBoolean: true },
+    ],
     seedValues: buildSeedValues(columns),
     updateValues: buildUpdateValues(columns),
+    nullFilterColumn: "text_col",
+    emptyStringColumn: "varchar_col",
+    emptyStringLabelColumn: "text_col",
+    emptyStringLabelValue: "pg empty insert",
+    emptyStringReadback: "",
     filterCases: buildFilterCases(columns),
     createTableSql: buildTableSql("pg", schema, table, columns),
     createViewSql: `CREATE OR REPLACE VIEW ${dbObjectName("pg", schema, view)} AS
@@ -626,8 +651,19 @@ function buildMySqlFixture(runId: string): DbFixture {
     procedureColumn: "varchar_col",
     procedureValue: "proc row",
     columns,
+    metadataChecks: [
+      { column: "id", category: "integer", isAutoIncrement: true },
+      { column: "dec_col", category: "decimal" },
+      { column: "bit_col", category: "boolean", isBoolean: true },
+      { column: "double_col", category: "float", filterable: true },
+    ],
     seedValues: buildSeedValues(columns),
     updateValues: buildUpdateValues(columns),
+    nullFilterColumn: "text_col",
+    emptyStringColumn: "varchar_col",
+    emptyStringLabelColumn: "text_col",
+    emptyStringLabelValue: "mysql empty insert",
+    emptyStringReadback: "",
     filterCases: buildFilterCases(columns),
     createTableSql: buildTableSql("mysql", schema, table, columns),
     createViewSql: `CREATE OR REPLACE VIEW ${dbObjectName("mysql", schema, view)} AS
@@ -891,8 +927,19 @@ function buildMssqlFixture(runId: string): DbFixture {
     procedureColumn: "varchar_col",
     procedureValue: "proc row",
     columns,
+    metadataChecks: [
+      { column: "id", category: "integer", isAutoIncrement: true },
+      { column: "dec_col", category: "decimal" },
+      { column: "bit_col", category: "boolean", isBoolean: true },
+      { column: "smalldatetime_col", category: "datetime", filterable: true },
+    ],
     seedValues: buildSeedValues(columns),
     updateValues: buildUpdateValues(columns),
+    nullFilterColumn: "text_col",
+    emptyStringColumn: "varchar_col",
+    emptyStringLabelColumn: "text_col",
+    emptyStringLabelValue: "mssql empty insert",
+    emptyStringReadback: "",
     filterCases: buildFilterCases(columns),
     createTableSql: buildTableSql("mssql", schema, table, columns),
     createViewSql: `CREATE OR ALTER VIEW ${dbObjectName("mssql", schema, view)}
@@ -997,20 +1044,16 @@ function buildOracleFixture(runId: string): DbFixture {
     {
       name: "D_COL",
       typeSql: "DATE",
-      seedValue: new Date("2026-04-15T00:00:00Z"),
-      updateValue: new Date("2026-04-16T00:00:00Z"),
+      seedValue: "2026-04-15 00:00:00",
+      updateValue: "2026-04-16 00:00:00",
       filterValue: "2026-04-15",
-      comparison: "presence",
-      filterable: false,
     },
     {
       name: "TS_COL",
       typeSql: "TIMESTAMP",
-      seedValue: new Date("2026-04-15T12:34:56Z"),
-      updateValue: new Date("2026-04-16T01:02:03Z"),
+      seedValue: "2026-04-15 12:34:56",
+      updateValue: "2026-04-16 01:02:03",
       filterValue: "2026-04-15 12:34:56",
-      comparison: "presence",
-      filterable: false,
     },
     {
       name: "TSTZ_COL",
@@ -1018,8 +1061,6 @@ function buildOracleFixture(runId: string): DbFixture {
       seedValue: new Date("2026-04-15T12:34:56Z"),
       updateValue: new Date("2026-04-16T01:02:03Z"),
       filterValue: "2026-04-15 12:34:56",
-      comparison: "presence",
-      filterable: false,
     },
     {
       name: "TSLTZ_COL",
@@ -1027,8 +1068,6 @@ function buildOracleFixture(runId: string): DbFixture {
       seedValue: new Date("2026-04-15T12:34:56Z"),
       updateValue: new Date("2026-04-16T01:02:03Z"),
       filterValue: "2026-04-15 12:34:56",
-      comparison: "presence",
-      filterable: false,
     },
     {
       name: "RAW_COL",
@@ -1044,6 +1083,7 @@ function buildOracleFixture(runId: string): DbFixture {
       seedValue: "clob body",
       updateValue: "clob body upd",
       filterValue: "clob body",
+      filterable: false,
     },
     {
       name: "NCLOB_COL",
@@ -1051,6 +1091,7 @@ function buildOracleFixture(runId: string): DbFixture {
       seedValue: "текст",
       updateValue: "текст upd",
       filterValue: "текст",
+      filterable: false,
     },
     {
       name: "BLOB_COL",
@@ -1084,8 +1125,22 @@ function buildOracleFixture(runId: string): DbFixture {
     procedureColumn: "VC_COL",
     procedureValue: "proc row",
     columns,
+    metadataChecks: [
+      { column: "ID", category: "integer", isAutoIncrement: true },
+      { column: "N_PRC", category: "decimal" },
+      { column: "RAW_COL", category: "binary", filterable: false },
+      { column: "D_COL", category: "datetime", filterable: true },
+      { column: "TS_COL", category: "datetime", filterable: true },
+      { column: "TSTZ_COL", category: "datetime", filterable: true },
+      { column: "TSLTZ_COL", category: "datetime", filterable: true },
+    ],
     seedValues: buildSeedValues(columns),
     updateValues: buildUpdateValues(columns),
+    nullFilterColumn: "NVC_COL",
+    emptyStringColumn: "VC_COL",
+    emptyStringLabelColumn: "NVC_COL",
+    emptyStringLabelValue: "oracle empty insert",
+    emptyStringReadback: null,
     filterCases: buildFilterCases(columns),
     createTableSql: buildTableSql("oracle", schema, table, columns),
     createViewSql: `CREATE OR REPLACE VIEW ${dbObjectName("oracle", schema, view)} AS
