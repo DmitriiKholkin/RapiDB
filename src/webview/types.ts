@@ -45,6 +45,22 @@ export type FilterOperator =
   | "is_null"
   | "is_not_null";
 
+export type FilterExpression =
+  | {
+      column: string;
+      operator: Exclude<FilterOperator, "between" | "is_null" | "is_not_null">;
+      value: string;
+    }
+  | {
+      column: string;
+      operator: "between";
+      value: [string, string];
+    }
+  | {
+      column: string;
+      operator: "is_null" | "is_not_null";
+    };
+
 // ─── Column metadata (matches backend ColumnTypeMeta sent via messages) ───
 
 export interface ColumnMeta {
@@ -127,6 +143,35 @@ export function placeholderForCategory(
 /** Returns true for categories that represent numeric values. */
 export function isNumericCategory(cat: TypeCategory): boolean {
   return cat === "integer" || cat === "float" || cat === "decimal";
+}
+
+export function defaultFilterOperator(
+  column: Pick<ColumnMeta, "category" | "isBoolean">,
+): "eq" | "like" {
+  if (
+    column.isBoolean ||
+    isNumericCategory(column.category) ||
+    column.category === "date"
+  ) {
+    return "eq";
+  }
+  return "like";
+}
+
+export function buildFilterExpression(
+  column: ColumnMeta,
+  rawValue: string,
+): FilterExpression | null {
+  const value = rawValue.trim();
+  if (!column.filterable || value === "") return null;
+  if (value === NULL_SENTINEL) {
+    return { column: column.name, operator: "is_null" };
+  }
+  return {
+    column: column.name,
+    operator: defaultFilterOperator(column),
+    value,
+  };
 }
 
 /** Category display label for badges. */

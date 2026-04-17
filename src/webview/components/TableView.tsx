@@ -13,7 +13,9 @@ import React, {
   useState,
 } from "react";
 import {
+  buildFilterExpression,
   type ColumnMeta,
+  type FilterExpression,
   isNumericCategory,
   NULL_SENTINEL,
   type PendingEdits,
@@ -190,15 +192,10 @@ export function TableView({
     if (!initializedRef.current) return;
     const epoch = ++fetchEpochRef.current;
     setLoading(true);
-    const activeFilters = Object.entries(debFilRef.current)
-      .filter(
-        ([column, value]) =>
-          value.trim() &&
-          canFilterColumn(
-            columnsRef.current.find((candidate) => candidate.name === column),
-          ),
-      )
-      .map(([column, value]) => ({ column, value }));
+    const activeFilters = serializeFilters(
+      debFilRef.current,
+      columnsRef.current,
+    );
     postMessage("fetchPage", {
       fetchId: epoch,
       page: pageRef.current,
@@ -725,14 +722,10 @@ export function TableView({
           Refresh
         </button>
         <button
+          type="button"
           style={btn("ghost")}
           onClick={() => {
-            const activeFilters = Object.entries(debFilters)
-              .filter(
-                ([column, value]) =>
-                  value.trim() && canFilterColumn(columnsMap.get(column)),
-              )
-              .map(([column, value]) => ({ column, value }));
+            const activeFilters = serializeFilters(debFilters, columns);
             postMessage("exportCSV", { sort, filters: activeFilters });
           }}
         >
@@ -740,14 +733,10 @@ export function TableView({
           Export CSV
         </button>
         <button
+          type="button"
           style={btn("ghost")}
           onClick={() => {
-            const activeFilters = Object.entries(debFilters)
-              .filter(
-                ([column, value]) =>
-                  value.trim() && canFilterColumn(columnsMap.get(column)),
-              )
-              .map(([column, value]) => ({ column, value }));
+            const activeFilters = serializeFilters(debFilters, columns);
             postMessage("exportJSON", { sort, filters: activeFilters });
           }}
         >
@@ -1341,3 +1330,17 @@ const TableRow = React.memo(function TableRow({
     </tr>
   );
 });
+
+function serializeFilters(
+  filters: Record<string, string>,
+  columns: ColumnMeta[],
+): FilterExpression[] {
+  const columnMap = new Map(columns.map((column) => [column.name, column]));
+
+  return Object.entries(filters)
+    .map(([columnName, rawValue]) => {
+      const column = columnMap.get(columnName);
+      return column ? buildFilterExpression(column, rawValue) : null;
+    })
+    .filter((filter): filter is FilterExpression => filter !== null);
+}

@@ -45,11 +45,26 @@ export type FilterOperator =
   | "is_null"
   | "is_not_null";
 
-export interface FilterExpression {
-  column: string;
-  operator: FilterOperator;
-  value: string | [string, string];
-}
+export type ScalarFilterOperator = Exclude<
+  FilterOperator,
+  "between" | "is_null" | "is_not_null"
+>;
+
+export type FilterExpression =
+  | {
+      column: string;
+      operator: ScalarFilterOperator;
+      value: string;
+    }
+  | {
+      column: string;
+      operator: "between";
+      value: [string, string];
+    }
+  | {
+      column: string;
+      operator: "is_null" | "is_not_null";
+    };
 
 // ─── Core metadata interfaces ───
 
@@ -187,18 +202,11 @@ export interface IDBDriver {
   buildFilterCondition(
     column: ColumnTypeMeta,
     operator: FilterOperator,
-    value: string | [string, string],
+    value: string | [string, string] | undefined,
     paramIndex: number,
   ): FilterConditionResult | null;
   buildInsertValueExpr(column: ColumnTypeMeta, paramIndex: number): string;
   buildSetExpr(column: ColumnTypeMeta, paramIndex: number): string;
-
-  // ── Legacy plain-text filter (auto-detect operator) ──
-  buildLegacyFilter(
-    column: ColumnTypeMeta,
-    rawValue: string,
-    paramIndex: number,
-  ): FilterConditionResult | null;
 }
 
 export interface TransactionOperation {
@@ -221,56 +229,49 @@ const NUMERIC_OPS: FilterOperator[] = [
   "is_null",
   "is_not_null",
 ];
-const TEXT_OPS: FilterOperator[] = [
+const FLOAT_OPS: FilterOperator[] = [
   "eq",
   "neq",
-  "like",
-  "ilike",
+  "between",
   "in",
   "is_null",
   "is_not_null",
 ];
-const DATE_OPS: FilterOperator[] = [
-  "eq",
-  "neq",
-  "gt",
-  "gte",
-  "lt",
-  "lte",
-  "between",
-  "is_null",
-  "is_not_null",
-];
+const TEXT_OPS: FilterOperator[] = ["like", "in", "is_null", "is_not_null"];
+const DATE_OPS: FilterOperator[] = ["eq", "like", "is_null", "is_not_null"];
+const TEMPORAL_OPS: FilterOperator[] = ["like", "is_null", "is_not_null"];
 const BOOL_OPS: FilterOperator[] = ["eq", "neq", "is_null", "is_not_null"];
-const NO_OPS: FilterOperator[] = ["is_null", "is_not_null"];
+const SEARCH_OPS: FilterOperator[] = ["like", "is_null", "is_not_null"];
 
 export function filterOperatorsForCategory(
   cat: TypeCategory,
 ): FilterOperator[] {
   switch (cat) {
     case "integer":
-    case "float":
     case "decimal":
       return NUMERIC_OPS;
+    case "float":
+      return FLOAT_OPS;
     case "text":
     case "json":
     case "uuid":
     case "enum":
       return TEXT_OPS;
     case "date":
+      return DATE_OPS;
     case "time":
     case "datetime":
     case "interval":
-      return DATE_OPS;
+      return TEMPORAL_OPS;
     case "boolean":
       return BOOL_OPS;
     case "binary":
     case "spatial":
-    case "lob":
     case "array":
     case "other":
-      return NO_OPS;
+      return SEARCH_OPS;
+    case "lob":
     default:
-      return NO_OPS;
+      return [];
   }
 }

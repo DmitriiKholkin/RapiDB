@@ -153,4 +153,38 @@ describe("TableView", () => {
     );
     expect(screen.getByDisplayValue("Alice")).toBeDefined();
   });
+
+  it("serializes plain-text filters as structured filter expressions", async () => {
+    render(
+      <TableView
+        connectionId="conn1"
+        database="db"
+        schema="public"
+        table="users"
+      />,
+    );
+
+    emit("tableInit", {
+      columns: [makeColumn({ name: "name", type: "text" })],
+      primaryKeyColumns: [],
+    });
+    emit("tableData", {
+      rows: [{ name: "Alice" }],
+      totalCount: 1,
+    });
+
+    const input = await screen.findByPlaceholderText("filter");
+    fireEvent.change(input, { target: { value: "Alice" } });
+
+    await waitFor(() => {
+      expect(postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "fetchPage",
+          payload: expect.objectContaining({
+            filters: [{ column: "name", operator: "like", value: "Alice" }],
+          }),
+        }),
+      );
+    });
+  });
 });

@@ -14,13 +14,7 @@ import type {
   TransactionOperation,
   TypeCategory,
 } from "./types";
-import {
-  DATE_ONLY_RE,
-  DATETIME_SQL_RE,
-  filterOperatorsForCategory,
-  ISO_DATETIME_RE,
-  NULL_SENTINEL,
-} from "./types";
+import { filterOperatorsForCategory, NULL_SENTINEL } from "./types";
 
 // ─── Shared datetime formatting helper ───
 
@@ -187,7 +181,7 @@ export abstract class BaseDBDriver implements IDBDriver {
     return `"${name.replace(/"/g, '""')}"`;
   }
 
-  qualifiedTableName(database: string, schema: string, table: string): string {
+  qualifiedTableName(_database: string, schema: string, table: string): string {
     const parts: string[] = [];
     if (schema) parts.push(this.quoteIdentifier(schema));
     parts.push(this.quoteIdentifier(table));
@@ -197,7 +191,7 @@ export abstract class BaseDBDriver implements IDBDriver {
   buildPagination(
     offset: number,
     limit: number,
-    paramIndex: number,
+    _paramIndex: number,
   ): PaginationResult {
     return {
       sql: `LIMIT ? OFFSET ?`,
@@ -276,10 +270,11 @@ export abstract class BaseDBDriver implements IDBDriver {
   buildFilterCondition(
     column: ColumnTypeMeta,
     operator: FilterOperator,
-    value: string | [string, string],
+    value: string | [string, string] | undefined,
     paramIndex: number,
   ): FilterConditionResult | null {
     if (!column.filterable) return null;
+    if (value === undefined) return null;
 
     const col = this.quoteIdentifier(column.name);
     const val = typeof value === "string" ? value.trim() : value;
@@ -335,7 +330,7 @@ export abstract class BaseDBDriver implements IDBDriver {
     col: string,
     operator: FilterOperator,
     isTrue: boolean,
-    paramIndex: number,
+    _paramIndex: number,
   ): FilterConditionResult {
     const op = operator === "neq" ? "!=" : "=";
     return { sql: `${col} ${op} ?`, params: [isTrue ? 1 : 0] };
@@ -406,40 +401,5 @@ export abstract class BaseDBDriver implements IDBDriver {
       default:
         return "=";
     }
-  }
-
-  // ─── Legacy filter support: auto-detect operator from plain text value ───
-
-  buildLegacyFilter(
-    column: ColumnTypeMeta,
-    rawValue: string,
-    paramIndex: number,
-  ): FilterConditionResult | null {
-    const val = rawValue.trim();
-    if (val === "") return null;
-
-    if (val === NULL_SENTINEL) {
-      return this.buildFilterCondition(column, "is_null", val, paramIndex);
-    }
-
-    // Boolean
-    if (column.isBoolean) {
-      const lower = val.toLowerCase();
-      if (lower === "true" || lower === "false") {
-        return this.buildFilterCondition(column, "eq", val, paramIndex);
-      }
-    }
-
-    // Numeric exact match for numeric columns
-    if (
-      this.isNumericCategory(column.category) &&
-      !Number.isNaN(Number(val)) &&
-      val !== ""
-    ) {
-      return this.buildFilterCondition(column, "eq", val, paramIndex);
-    }
-
-    // Default: contains/like
-    return this.buildFilterCondition(column, "like", val, paramIndex);
   }
 }

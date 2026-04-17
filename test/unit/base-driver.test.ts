@@ -491,49 +491,4 @@ describe("BaseDBDriver defaults", () => {
       expect(r?.params).toEqual(["%john%"]);
     });
   });
-
-  describe("buildLegacyFilter", () => {
-    it("returns null for empty value", () => {
-      const c = col({ name: "a", type: "text" });
-      expect(drv.buildLegacyFilter(c, "", 1)).toBeNull();
-      expect(drv.buildLegacyFilter(c, "   ", 1)).toBeNull();
-    });
-
-    it("generates IS NULL for NULL_SENTINEL", () => {
-      const c = col({ name: "a", type: "text" });
-      const r = drv.buildLegacyFilter(c, NULL_SENTINEL, 1);
-      expect(r?.sql).toBe('"a" IS NULL');
-    });
-
-    it("detects boolean true/false", () => {
-      const c = col({
-        name: "active",
-        type: "boolean",
-        category: "boolean",
-        isBoolean: true,
-      });
-      const r = drv.buildLegacyFilter(c, "true", 1);
-      expect(r?.params).toEqual([1]);
-    });
-
-    it("detects numeric value on integer column", () => {
-      const c = col({ name: "age", type: "integer", category: "integer" });
-      const r = drv.buildLegacyFilter(c, "42", 1);
-      expect(r?.sql).toBe('"age" = ?');
-      expect(r?.params).toEqual([42]);
-    });
-
-    it("falls back to LIKE for text on text column", () => {
-      const c = col({ name: "name", type: "text" });
-      const r = drv.buildLegacyFilter(c, "john", 1);
-      expect(r?.sql).toContain("LIKE");
-      expect(r?.params).toEqual(["%john%"]);
-    });
-
-    it("uses LIKE even for numeric-looking values on text columns", () => {
-      const c = col({ name: "name", type: "text" });
-      const r = drv.buildLegacyFilter(c, "42", 1);
-      expect(r?.sql).toContain("LIKE");
-    });
-  });
 });

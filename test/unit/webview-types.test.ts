@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildFilterExpression,
   categoryColor,
   categoryLabel,
+  defaultFilterOperator,
   isNumericCategory,
   NULL_SENTINEL,
   placeholderForCategory,
@@ -78,6 +80,64 @@ describe("isNumericCategory", () => {
     for (const cat of nonNumeric) {
       expect(isNumericCategory(cat)).toBe(false);
     }
+  });
+});
+
+describe("defaultFilterOperator", () => {
+  it("uses equality for typed boolean/numeric/date filters", () => {
+    expect(
+      defaultFilterOperator({ category: "boolean", isBoolean: true }),
+    ).toBe("eq");
+    expect(
+      defaultFilterOperator({ category: "integer", isBoolean: false }),
+    ).toBe("eq");
+    expect(defaultFilterOperator({ category: "date", isBoolean: false })).toBe(
+      "eq",
+    );
+  });
+
+  it("uses like for text-like filters", () => {
+    expect(defaultFilterOperator({ category: "text", isBoolean: false })).toBe(
+      "like",
+    );
+    expect(
+      defaultFilterOperator({ category: "datetime", isBoolean: false }),
+    ).toBe("like");
+  });
+});
+
+describe("buildFilterExpression", () => {
+  const column = {
+    name: "name",
+    type: "text",
+    nullable: true,
+    isPrimaryKey: false,
+    isForeignKey: false,
+    category: "text" as const,
+    nativeType: "text",
+    filterable: true,
+    editable: true,
+    filterOperators: ["like"],
+    isBoolean: false,
+  };
+
+  it("builds a structured value filter", () => {
+    expect(buildFilterExpression(column, " alice ")).toEqual({
+      column: "name",
+      operator: "like",
+      value: "alice",
+    });
+  });
+
+  it("builds a NULL filter", () => {
+    expect(buildFilterExpression(column, NULL_SENTINEL)).toEqual({
+      column: "name",
+      operator: "is_null",
+    });
+  });
+
+  it("skips empty values", () => {
+    expect(buildFilterExpression(column, "   ")).toBeNull();
   });
 });
 

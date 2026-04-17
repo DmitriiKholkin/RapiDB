@@ -721,10 +721,11 @@ export class MSSQLDriver extends BaseDBDriver {
   override buildFilterCondition(
     column: ColumnTypeMeta,
     operator: FilterOperator,
-    value: string | [string, string],
+    value: string | [string, string] | undefined,
     paramIndex: number,
   ): FilterConditionResult | null {
     if (!column.filterable) return null;
+    if (value === undefined) return null;
     const col = this.quoteIdentifier(column.name);
     const val = typeof value === "string" ? value.trim() : value;
 
@@ -801,35 +802,6 @@ export class MSSQLDriver extends BaseDBDriver {
     // Default text
     const v = typeof val === "string" ? val : val[0];
     return { sql: `${col} LIKE ?`, params: [`%${v}%`] };
-  }
-
-  override buildLegacyFilter(
-    column: ColumnTypeMeta,
-    rawValue: string,
-    paramIndex: number,
-  ): FilterConditionResult | null {
-    const val = rawValue.trim();
-    if (val === "") return null;
-    if (val === NULL_SENTINEL)
-      return this.buildFilterCondition(column, "is_null", val, paramIndex);
-
-    if (column.isBoolean) {
-      const lower = val.toLowerCase();
-      if (lower === "true" || lower === "false") {
-        return this.buildFilterCondition(column, "eq", val, paramIndex);
-      }
-    }
-
-    if (
-      !Number.isNaN(Number(val)) &&
-      val !== "" &&
-      !this.isTextualType(column.nativeType) &&
-      !column.isBoolean
-    ) {
-      return this.buildFilterCondition(column, "eq", val, paramIndex);
-    }
-
-    return this.buildFilterCondition(column, "like", val, paramIndex);
   }
 
   private isTextualType(nativeType: string): boolean {

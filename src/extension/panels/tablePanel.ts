@@ -3,6 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 import type { ConnectionManager } from "../connectionManager";
+import { NULL_SENTINEL } from "../dbDrivers/types";
 import {
   applyChangesTransactional,
   type Filter,
@@ -188,7 +189,10 @@ export class TablePanel {
           10000,
           Math.max(1, Math.floor(Number(raw.pageSize) || 50)),
         );
-        const filters = Array.isArray(raw.filters) ? raw.filters : [];
+        const filters = normalizeFilters(
+          Array.isArray(raw.filters) ? raw.filters : [],
+          this.cachedColumns,
+        );
         const sort = raw.sort ?? null;
         try {
           const result = await this.svc.getPage(
@@ -317,9 +321,7 @@ export class TablePanel {
                   this.table,
                   500,
                   csvSort as SortConfig | null,
-                  (csvFilters as { column: string; value: string }[]).map(
-                    (f) => ({ column: f.column, value: f.value }),
-                  ),
+                  normalizeFilters(csvFilters, this.cachedColumns),
                   abortCtrl.signal,
                 )) {
                   if (!headerWritten) {
@@ -400,9 +402,7 @@ export class TablePanel {
                   this.table,
                   500,
                   sort as SortConfig | null,
-                  (jsonFilters as { column: string; value: string }[]).map(
-                    (f) => ({ column: f.column, value: f.value }),
-                  ),
+                  normalizeFilters(jsonFilters, this.cachedColumns),
                   abortCtrl.signal,
                 )) {
                   for (const row of chunk.rows) {
@@ -566,4 +566,96 @@ function csvCell(value: unknown): string {
     s.includes("\r")
     ? `"${s.replace(/"/g, '""')}"`
     : s;
+}
+
+function normalizeFilters(
+  rawFilters: unknown,
+  columns: import("../tableDataService").ColumnDef[],
+): Filter[] {
+  if (!Array.isArray(rawFilters)) return [];
+
+  const columnMap = new Map(columns.map((column) => [column.name, column]));
+
+  return rawFilters.flatMap((rawFilter) => {
+    if (!rawFilter || typeof rawFilter !== "object") {
+      return [];
+    }
+
+    const filter = rawFilter as Record<string, unknown>;
+    const columnName = typeof filter.column === "string" ? filter.column : null;
+    if (!columnName) return [];
+
+    if (filter.operator === "is_null" || filter.operator === "is_not_null") {
+      return [{ column: columnName, operator: filter.operator }];
+    }
+
+    if (filter.operator === "between") {
+      const value = filter.value;
+      if (
+        Array.isArray(value) &&
+        value.length === 2 &&
+        typeof value[0] === "string" &&
+        typeof value[1] === "string"
+      ) {
+        return [
+          {
+            column: columnName,
+            operator: "between",
+            value: [value[0], value[1]],
+          },
+        ];
+      }
+      return [];
+    }
+
+    if (
+      typeof filter.operator === "string" &&
+      typeof filter.value === "string"
+    ) {
+      return [
+        {
+          column: columnName,
+          operator: filter.operator as Exclude<
+            Filter["operator"],
+            "between" | "is_null" | "is_not_null"
+          >,
+          value: filter.value,
+        },
+      ];
+    }
+
+    if (typeof filter.value !== "string") {
+      return [];
+    }
+
+    const value = filter.value.trim();
+    if (value === "") return [];
+    if (value === NULL_SENTINEL) {
+      return [{ column: columnName, operator: "is_null" }];
+    }
+
+    return [
+      {
+        column: columnName,
+        operator: defaultLegacyFilterOperator(columnMap.get(columnName)),
+        value,
+      },
+    ];
+  });
+}
+
+function defaultLegacyFilterOperator(
+  column: import("../tableDataService").ColumnDef | undefined,
+): "eq" | "like" {
+  if (!column) return "like";
+  if (column.isBoolean) return "eq";
+  if (
+    column.category === "integer" ||
+    column.category === "float" ||
+    column.category === "decimal" ||
+    column.category === "date"
+  ) {
+    return "eq";
+  }
+  return "like";
 }

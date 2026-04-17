@@ -37,7 +37,7 @@ describe("filterOperatorsForCategory", () => {
   it("returns numeric ops for float", () => {
     const ops = filterOperatorsForCategory("float");
     expect(ops).toContain("between");
-    expect(ops).toContain("lte");
+    expect(ops).not.toContain("lte");
   });
 
   it("returns numeric ops for decimal", () => {
@@ -48,7 +48,8 @@ describe("filterOperatorsForCategory", () => {
   it("returns text ops for text", () => {
     const ops = filterOperatorsForCategory("text");
     expect(ops).toContain("like");
-    expect(ops).toContain("ilike");
+    expect(ops).toContain("in");
+    expect(ops).not.toContain("eq");
     expect(ops).not.toContain("gt");
     expect(ops).not.toContain("between");
   });
@@ -60,7 +61,6 @@ describe("filterOperatorsForCategory", () => {
 
   it("returns text ops for uuid", () => {
     const ops = filterOperatorsForCategory("uuid");
-    expect(ops).toContain("eq");
     expect(ops).toContain("like");
   });
 
@@ -69,12 +69,22 @@ describe("filterOperatorsForCategory", () => {
     expect(ops).toContain("in");
   });
 
-  it("returns date ops for date/time/datetime/interval", () => {
-    for (const cat of ["date", "time", "datetime", "interval"] as const) {
-      const ops = filterOperatorsForCategory(cat);
-      expect(ops).toContain("between");
-      expect(ops).toContain("gt");
-      expect(ops).not.toContain("like");
+  it("returns conservative ops for date", () => {
+    expect(filterOperatorsForCategory("date")).toEqual([
+      "eq",
+      "like",
+      "is_null",
+      "is_not_null",
+    ]);
+  });
+
+  it("returns text-search ops for time/datetime/interval", () => {
+    for (const cat of ["time", "datetime", "interval"] as const) {
+      expect(filterOperatorsForCategory(cat)).toEqual([
+        "like",
+        "is_null",
+        "is_not_null",
+      ]);
     }
   });
 
@@ -83,13 +93,18 @@ describe("filterOperatorsForCategory", () => {
     expect(ops).toEqual(["eq", "neq", "is_null", "is_not_null"]);
   });
 
-  it("returns only null ops for binary/spatial/lob/array/other", () => {
-    for (const cat of ["binary", "spatial", "lob", "array", "other"] as const) {
+  it("returns search ops for binary/spatial/array/other", () => {
+    for (const cat of ["binary", "spatial", "array", "other"] as const) {
       expect(filterOperatorsForCategory(cat)).toEqual([
+        "like",
         "is_null",
         "is_not_null",
       ]);
     }
+  });
+
+  it("returns no ops for lob", () => {
+    expect(filterOperatorsForCategory("lob")).toEqual([]);
   });
 });
 

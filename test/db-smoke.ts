@@ -8,6 +8,8 @@ import { MySQLDriver } from "../src/extension/dbDrivers/mysql";
 import { OracleDriver } from "../src/extension/dbDrivers/oracle";
 import { PostgresDriver } from "../src/extension/dbDrivers/postgres";
 import {
+  type ColumnTypeMeta,
+  type FilterExpression,
   type IDBDriver,
   NULL_SENTINEL,
 } from "../src/extension/dbDrivers/types";
@@ -158,6 +160,24 @@ function normalizePrefix(value: unknown): string {
     .replace(/[ ]?[+-]\d{2}:\d{2}$/, "")
     .replace(/[ ]?[+-]\d{2}$/, "")
     .trim();
+}
+
+function defaultFilterExpression(
+  columns: ColumnTypeMeta[],
+  columnName: string,
+  value: string,
+): FilterExpression {
+  const column = columns.find((entry) => entry.name === columnName);
+  if (
+    column?.isBoolean ||
+    column?.category === "integer" ||
+    column?.category === "float" ||
+    column?.category === "decimal" ||
+    column?.category === "date"
+  ) {
+    return { column: columnName, operator: "eq", value };
+  }
+  return { column: columnName, operator: "like", value };
 }
 
 function assertCellValue(
@@ -663,10 +683,11 @@ async function runFixture(fixture: DbFixture, runId: string): Promise<void> {
       1,
       25,
       [
-        {
-          column: fixture.emptyStringLabelColumn,
-          value: fixture.emptyStringLabelValue,
-        },
+        defaultFilterExpression(
+          colMeta,
+          fixture.emptyStringLabelColumn,
+          fixture.emptyStringLabelValue,
+        ),
       ],
       null,
     );
@@ -702,10 +723,11 @@ async function runFixture(fixture: DbFixture, runId: string): Promise<void> {
       1,
       25,
       [
-        {
-          column: fixture.procedureColumn,
-          value: String(fixture.procedureValue),
-        },
+        defaultFilterExpression(
+          colMeta,
+          fixture.procedureColumn,
+          String(fixture.procedureValue),
+        ),
       ],
       null,
     );
@@ -731,7 +753,7 @@ async function runFixture(fixture: DbFixture, runId: string): Promise<void> {
       fixture.table,
       1,
       25,
-      [{ column: fixture.nullFilterColumn, value: NULL_SENTINEL }],
+      [{ column: fixture.nullFilterColumn, operator: "is_null" }],
       null,
     );
     assert.equal(
@@ -765,7 +787,7 @@ async function runFixture(fixture: DbFixture, runId: string): Promise<void> {
         fixture.table,
         1,
         25,
-        [{ column: filterCase.column, value: filterCase.value }],
+        [defaultFilterExpression(colMeta, filterCase.column, filterCase.value)],
         null,
       );
       assert.equal(

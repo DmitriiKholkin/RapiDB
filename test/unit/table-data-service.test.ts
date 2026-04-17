@@ -56,7 +56,6 @@ function makeMockDriver(overrides: Partial<IDBDriver> = {}): IDBDriver {
     buildFilterCondition: vi.fn().mockReturnValue(null),
     buildInsertValueExpr: () => "?",
     buildSetExpr: (c: ColumnTypeMeta) => `"${c.name}" = ?`,
-    buildLegacyFilter: vi.fn().mockReturnValue(null),
     ...overrides,
   } as unknown as IDBDriver;
 }
@@ -228,7 +227,9 @@ describe("TableDataService", () => {
           executionTimeMs: 0,
         });
 
-      const filters: Filter[] = [{ column: "name", value: "alice" }];
+      const filters: Filter[] = [
+        { column: "name", operator: "like", value: "alice" },
+      ];
       await svc.getPage("conn1", "testdb", "public", "users", 1, 25, filters);
 
       expect(driver.buildFilterCondition).toHaveBeenCalledWith(
@@ -237,7 +238,6 @@ describe("TableDataService", () => {
         "alice",
         1,
       );
-      expect(driver.buildLegacyFilter).not.toHaveBeenCalled();
       // The COUNT query should include WHERE
       const countCall = (driver.query as any).mock.calls[0];
       expect(countCall[0]).toContain("WHERE");
@@ -262,7 +262,7 @@ describe("TableDataService", () => {
         });
 
       await svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
-        { column: "name", value: "alice" },
+        { column: "name", operator: "like", value: "alice" },
       ]);
 
       expect(driver.buildFilterCondition).not.toHaveBeenCalled();
@@ -313,12 +313,12 @@ describe("TableDataService", () => {
         });
 
       const filters: Filter[] = [
-        { column: "name", value: "" },
-        { column: "name", value: "  " },
+        { column: "name", operator: "like", value: "" },
+        { column: "name", operator: "like", value: "  " },
       ];
-      await svc.getPage("conn1", "testdb", "public", "users", 1, 25, filters);
-
-      expect(driver.buildFilterCondition).not.toHaveBeenCalled();
+      await expect(
+        svc.getPage("conn1", "testdb", "public", "users", 1, 25, filters),
+      ).rejects.toThrow("Column name expects a filter value");
     });
 
     it("throws a filter error for invalid numeric input", async () => {
@@ -327,7 +327,7 @@ describe("TableDataService", () => {
 
       await expect(
         svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
-          { column: "id", value: "not-a-number" },
+          { column: "id", operator: "eq", value: "not-a-number" },
         ]),
       ).rejects.toThrow("Column id expects a number");
 
@@ -340,7 +340,7 @@ describe("TableDataService", () => {
 
       await expect(
         svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
-          { column: "id", value: "Infinity" },
+          { column: "id", operator: "eq", value: "Infinity" },
         ]),
       ).rejects.toThrow("Column id expects a number");
 
@@ -353,7 +353,7 @@ describe("TableDataService", () => {
 
       await expect(
         svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
-          { column: "active", value: "maybe" },
+          { column: "active", operator: "eq", value: "maybe" },
         ]),
       ).rejects.toThrow("Column active expects true or false");
 
@@ -391,7 +391,7 @@ describe("TableDataService", () => {
         });
 
       await svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
-        { column: "created_on", value: "2026-04-15 00:00:00" },
+        { column: "created_on", operator: "eq", value: "2026-04-15 00:00:00" },
       ]);
 
       expect(driver.buildFilterCondition).toHaveBeenCalledWith(
@@ -433,7 +433,11 @@ describe("TableDataService", () => {
         });
 
       await svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
-        { column: "created_on", value: "2026-04-15 00:00:00 +00:00" },
+        {
+          column: "created_on",
+          operator: "eq",
+          value: "2026-04-15 00:00:00 +00:00",
+        },
       ]);
 
       expect(driver.buildFilterCondition).toHaveBeenCalledWith(
@@ -475,7 +479,11 @@ describe("TableDataService", () => {
         });
 
       await svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
-        { column: "created_on", value: "2026-04-15T23:00:00-02:00" },
+        {
+          column: "created_on",
+          operator: "eq",
+          value: "2026-04-15T23:00:00-02:00",
+        },
       ]);
 
       expect(driver.buildFilterCondition).toHaveBeenCalledWith(
@@ -501,7 +509,7 @@ describe("TableDataService", () => {
 
       await expect(
         svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
-          { column: "created_on", value: "2026-02-31" },
+          { column: "created_on", operator: "eq", value: "2026-02-31" },
         ]),
       ).rejects.toThrow("Column created_on expects a valid date");
 
@@ -523,7 +531,11 @@ describe("TableDataService", () => {
 
       await expect(
         svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
-          { column: "created_on", value: "2026-02-31 12:00:00 +00:00" },
+          {
+            column: "created_on",
+            operator: "eq",
+            value: "2026-02-31 12:00:00 +00:00",
+          },
         ]),
       ).rejects.toThrow("Column created_on expects a valid date");
 

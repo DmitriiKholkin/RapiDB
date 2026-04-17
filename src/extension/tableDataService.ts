@@ -2,6 +2,7 @@ import type { ConnectionManager } from "./connectionManager";
 import { isoToLocalDateStr } from "./dbDrivers/BaseDBDriver";
 import type {
   ColumnTypeMeta,
+  FilterExpression,
   IDBDriver,
   TransactionOperation,
 } from "./dbDrivers/types";
@@ -9,7 +10,6 @@ import {
   DATE_ONLY_RE,
   DATETIME_SQL_RE,
   ISO_DATETIME_RE,
-  NULL_SENTINEL,
 } from "./dbDrivers/types";
 
 // Re-export formatDatetimeForDisplay for consumers that imported it from here
@@ -21,11 +21,7 @@ export { DATETIME_SQL_RE, ISO_DATETIME_RE } from "./dbDrivers/types";
 // ─── Public types ───
 
 export type ColumnDef = ColumnTypeMeta;
-
-export interface Filter {
-  column: string;
-  value: string;
-}
+export type Filter = FilterExpression;
 
 export interface SortConfig {
   column: string;
@@ -139,10 +135,10 @@ export class TableDataService {
             countRow?.count ??
             0,
         );
-      } catch (err: any) {
+      } catch (err: unknown) {
         console.error(
           "[RapiDB] COUNT query failed, totalCount will be 0:",
-          err?.message ?? err,
+          err instanceof Error ? err.message : err,
         );
       }
     }
@@ -368,12 +364,10 @@ function buildWhere(
   const conditions: string[] = [];
 
   for (const f of filters) {
-    const val = f.value.trim();
-    if (val === "") continue;
     const meta = colMap.get(f.column);
     if (!meta) continue;
 
-    const result = inferFilterCondition(drv, meta, val, params.length + 1);
+    const result = normalizeFilterCondition(drv, meta, f, params.length + 1);
     if (result) {
       conditions.push(result.sql);
       params.push(...result.params);
@@ -418,18 +412,64 @@ function isWritableColumn(column: ColumnDef | undefined): column is ColumnDef {
   return !!column && column.editable && !column.isAutoIncrement;
 }
 
-function inferFilterCondition(
+function normalizeFilterCondition(
   drv: IDBDriver,
   column: ColumnDef,
-  rawValue: string,
+  filter: Filter,
   paramIndex: number,
 ) {
   if (!column.filterable) return null;
 
+  if (!column.filterOperators.includes(filter.operator)) {
+    throw unsupportedFilterOperatorError(column.name, filter.operator);
+  }
+
+  if (filter.operator === "is_null" || filter.operator === "is_not_null") {
+    return drv.buildFilterCondition(
+      column,
+      filter.operator,
+      undefined,
+      paramIndex,
+    );
+  }
+
+  if (filter.operator === "between") {
+    return drv.buildFilterCondition(
+      column,
+      filter.operator,
+      [
+        normalizeScalarFilterValue(column, filter.value[0], filter.operator),
+        normalizeScalarFilterValue(column, filter.value[1], filter.operator),
+      ],
+      paramIndex,
+    );
+  }
+
+  if (!("value" in filter)) {
+    return null;
+  }
+
+  const normalizedValue = normalizeScalarFilterValue(
+    column,
+    filter.value,
+    filter.operator,
+  );
+  return drv.buildFilterCondition(
+    column,
+    filter.operator,
+    normalizedValue,
+    paramIndex,
+  );
+}
+
+function normalizeScalarFilterValue(
+  column: ColumnDef,
+  rawValue: string,
+  operator: Filter["operator"],
+): string {
   const value = rawValue.trim();
-  if (value === "") return null;
-  if (value === NULL_SENTINEL) {
-    return drv.buildFilterCondition(column, "is_null", value, paramIndex);
+  if (value === "") {
+    throw invalidFilterInputError(column.name, "a filter value");
   }
 
   if (column.isBoolean) {
@@ -437,33 +477,64 @@ function inferFilterCondition(
     if (!normalized) {
       throw invalidFilterInputError(column.name, "true or false");
     }
-    return drv.buildFilterCondition(column, "eq", normalized, paramIndex);
+    return normalized;
   }
 
   if (isNumericCategory(column.category)) {
+    if (operator === "in") {
+      const values = value
+        .split(",")
+        .map((part) => part.trim())
+        .filter(Boolean);
+      if (
+        values.length === 0 ||
+        values.some((part) => !Number.isFinite(Number(part)))
+      ) {
+        throw invalidFilterInputError(column.name, "comma-separated numbers");
+      }
+      return values.join(", ");
+    }
+
     const numericValue = Number(value);
     if (Number.isNaN(numericValue) || !Number.isFinite(numericValue)) {
       throw invalidFilterInputError(column.name, "a number");
     }
-    return drv.buildFilterCondition(column, "eq", value, paramIndex);
+    return value;
   }
 
   if (column.category === "date") {
+    if (operator === "like") {
+      return value;
+    }
+
+    if (operator === "in") {
+      const values = value
+        .split(",")
+        .map((part) => part.trim())
+        .filter(Boolean);
+      if (values.length === 0) {
+        throw invalidFilterInputError(column.name, "comma-separated dates");
+      }
+      const normalizedValues = values.map((part) => {
+        const normalizedDate = normalizeDateFilterValue(part);
+        if (!normalizedDate) {
+          throw invalidFilterInputError(column.name, "a valid date");
+        }
+        return normalizedDate;
+      });
+      return normalizedValues.join(", ");
+    }
+
     const normalizedDate = normalizeDateFilterValue(value);
     if (normalizedDate) {
-      return drv.buildFilterCondition(column, "eq", normalizedDate, paramIndex);
+      return normalizedDate;
     }
     if (looksLikeDateInput(value)) {
       throw invalidFilterInputError(column.name, "a valid date");
     }
-    return drv.buildFilterCondition(column, "like", value, paramIndex);
   }
 
-  if (column.category === "time" || column.category === "datetime") {
-    return drv.buildFilterCondition(column, "like", value, paramIndex);
-  }
-
-  return drv.buildFilterCondition(column, "like", value, paramIndex);
+  return value;
 }
 
 function normalizeBooleanFilterValue(value: string): "true" | "false" | null {
@@ -550,6 +621,15 @@ function hasValidDateTimeParts(value: string): boolean {
 
 function invalidFilterInputError(columnName: string, expected: string): Error {
   return new Error(`[RapiDB Filter] Column ${columnName} expects ${expected}.`);
+}
+
+function unsupportedFilterOperatorError(
+  columnName: string,
+  operator: Filter["operator"],
+): Error {
+  return new Error(
+    `[RapiDB Filter] Column ${columnName} does not support ${operator} filters.`,
+  );
 }
 
 function buildUpdateRowSql(
@@ -640,7 +720,10 @@ export async function applyChangesTransactional(
   try {
     await driver.runTransaction(operations);
     return { success: true };
-  } catch (err: any) {
-    return { success: false, error: err?.message ?? String(err) };
+  } catch (err: unknown) {
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
   }
 }
