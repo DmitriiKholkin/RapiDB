@@ -1,7 +1,11 @@
 import type { Pool } from "mysql2/promise";
 import * as mysql from "mysql2/promise";
 import type { ConnectionConfig } from "../connectionManager";
-import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
+import {
+  BaseDBDriver,
+  formatDatetimeForDisplay,
+  isoToLocalDateStr,
+} from "./BaseDBDriver";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -237,6 +241,55 @@ function mysqlSpatialJsonToWkt(obj: unknown): string {
     return `POLYGON(${(arr as Array<Array<{ x: number; y: number }>>).map((ring) => `(${ring.map((p) => `${p.x} ${p.y}`).join(", ")})`).join(", ")})`;
   }
   throw new Error("Unrecognised spatial JSON structure");
+}
+
+function mysqlTypeName(nativeType: string): string {
+  return nativeType.toLowerCase().split("(")[0].trim();
+}
+
+function formatMysqlDatetimeUtc(value: Date): string | null {
+  if (Number.isNaN(value.getTime())) return null;
+
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const ms = value.getUTCMilliseconds();
+  const frac = ms > 0 ? `.${String(ms).padStart(3, "0")}` : "";
+  return (
+    `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())} ` +
+    `${pad(value.getUTCHours())}:${pad(value.getUTCMinutes())}:${pad(value.getUTCSeconds())}${frac}`
+  );
+}
+
+function normalizeMysqlDateInput(value: string): string | null {
+  const trimmed = value.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    return trimmed;
+  }
+  if (ISO_DATETIME_RE.test(trimmed)) {
+    return isoToLocalDateStr(trimmed);
+  }
+  if (DATETIME_SQL_RE.test(trimmed)) {
+    if (/[+-]\d{2}:\d{2}$/.test(trimmed)) {
+      return isoToLocalDateStr(trimmed.replace(" ", "T"));
+    }
+    return trimmed.slice(0, 10);
+  }
+  return null;
+}
+
+function normalizeMysqlDatetimeInput(value: string): string | null {
+  const trimmed = value.trim();
+  if (ISO_DATETIME_RE.test(trimmed)) {
+    return formatMysqlDatetimeUtc(new Date(trimmed));
+  }
+  if (!DATETIME_SQL_RE.test(trimmed)) {
+    return null;
+  }
+
+  if (/[+-]\d{2}:\d{2}$/.test(trimmed)) {
+    return formatMysqlDatetimeUtc(new Date(trimmed.replace(" ", "T")));
+  }
+
+  return formatDatetimeForDisplay(trimmed) ?? trimmed;
 }
 
 export class MySQLDriver extends BaseDBDriver {
@@ -758,15 +811,13 @@ export class MySQLDriver extends BaseDBDriver {
     // Spatial
     if (column.category === "spatial") return parseMysqlSpatialToWkt(value);
 
-    // ISO datetime → MySQL format
-    if (ISO_DATETIME_RE.test(value)) {
-      const d = new Date(value);
-      if (!Number.isNaN(d.getTime())) {
-        const pad = (n: number) => String(n).padStart(2, "0");
-        const ms = d.getUTCMilliseconds();
-        const fracSec = ms > 0 ? `.${String(ms).padStart(3, "0")}` : "";
-        return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}${fracSec}`;
-      }
+    const typeName = mysqlTypeName(column.nativeType);
+    if (typeName === "date") {
+      return normalizeMysqlDateInput(value) ?? value;
+    }
+
+    if (typeName === "datetime" || typeName === "timestamp") {
+      return normalizeMysqlDatetimeInput(value) ?? value;
     }
 
     return value;
@@ -796,7 +847,7 @@ export class MySQLDriver extends BaseDBDriver {
     column: ColumnTypeMeta,
     operator: FilterOperator,
     value: string | [string, string] | undefined,
-    paramIndex: number,
+    _paramIndex: number,
   ): FilterConditionResult | null {
     if (!column.filterable) return null;
     if (value === undefined) return null;
@@ -828,6 +879,18 @@ export class MySQLDriver extends BaseDBDriver {
       const v = typeof val === "string" ? val : val[0];
       const hexVal = v.replace(/^(0x|\\x)/i, "").toUpperCase();
       return { sql: `HEX(${col}) LIKE ?`, params: [`%${hexVal}%`] };
+    }
+
+    if (
+      column.category === "date" &&
+      typeof val === "string" &&
+      (operator === "eq" || operator === "neq")
+    ) {
+      const sqlOp = operator === "neq" ? "!=" : "=";
+      return {
+        sql: `${col} ${sqlOp} CAST(? AS DATE)`,
+        params: [normalizeMysqlDateInput(val) ?? val],
+      };
     }
 
     if (
@@ -913,17 +976,5 @@ export class MySQLDriver extends BaseDBDriver {
     const fraction = /\.(\d+)/.exec(rawValue)?.[1].length ?? 0;
     const precision = Math.min(Math.max(fraction + 2, 6), 12);
     return 10 ** -precision;
-  }
-
-  private isTextualType(nativeType: string): boolean {
-    const ct = nativeType.toLowerCase();
-    return (
-      ct.includes("json") ||
-      ct.includes("text") ||
-      ct.includes("char") ||
-      ct.startsWith("enum") ||
-      ct.startsWith("set(") ||
-      ct.includes("blob")
-    );
   }
 }

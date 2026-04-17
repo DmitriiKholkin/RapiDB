@@ -659,3 +659,8 @@ function defaultLegacyFilterOperator(
   }
   return "like";
 }
+
+export const __testOnly = {
+  normalizeFilters,
+  defaultLegacyFilterOperator,
+};

@@ -66,7 +66,11 @@ const MSSQL_NON_FILTERABLE = new Set([
   "geometry",
   "hierarchyid",
   "sql_variant",
+  "timestamp",
+  "rowversion",
 ]);
+
+const MSSQL_NON_EDITABLE = new Set(MSSQL_NON_FILTERABLE);
 
 export class MSSQLDriver extends BaseDBDriver {
   private pool: mssql.ConnectionPool | null = null;
@@ -594,6 +598,7 @@ export class MSSQLDriver extends BaseDBDriver {
       ["datetime", "datetime2", "datetimeoffset", "smalldatetime"].includes(ct)
     )
       return "datetime";
+    if (ct === "timestamp" || ct === "rowversion") return "binary";
     if (["binary", "varbinary", "image"].includes(ct)) return "binary";
     if (ct === "uniqueidentifier") return "uuid";
     if (["text", "ntext", "xml"].includes(ct)) return "text";
@@ -618,9 +623,23 @@ export class MSSQLDriver extends BaseDBDriver {
     );
   }
 
-  override isFilterable(_nativeType: string): boolean {
-    return !MSSQL_NON_FILTERABLE.has(
-      _nativeType.toLowerCase().split("(")[0].trim(),
+  protected override isFilterable(
+    nativeType: string,
+    category: TypeCategory,
+  ): boolean {
+    return (
+      super.isFilterable(nativeType, category) &&
+      !MSSQL_NON_FILTERABLE.has(nativeType.toLowerCase().split("(")[0].trim())
+    );
+  }
+
+  protected override isEditable(
+    nativeType: string,
+    category: TypeCategory,
+  ): boolean {
+    return (
+      super.isEditable(nativeType, category) &&
+      !MSSQL_NON_EDITABLE.has(nativeType.toLowerCase().split("(")[0].trim())
     );
   }
 
@@ -631,7 +650,7 @@ export class MSSQLDriver extends BaseDBDriver {
   }
 
   override qualifiedTableName(
-    database: string,
+    _database: string,
     schema: string,
     table: string,
   ): string {
@@ -641,7 +660,7 @@ export class MSSQLDriver extends BaseDBDriver {
   override buildPagination(
     offset: number,
     limit: number,
-    paramIndex: number,
+    _paramIndex: number,
   ): PaginationResult {
     return {
       sql: `OFFSET ? ROWS FETCH NEXT ? ROWS ONLY`,
@@ -722,7 +741,7 @@ export class MSSQLDriver extends BaseDBDriver {
     column: ColumnTypeMeta,
     operator: FilterOperator,
     value: string | [string, string] | undefined,
-    paramIndex: number,
+    _paramIndex: number,
   ): FilterConditionResult | null {
     if (!column.filterable) return null;
     if (value === undefined) return null;
@@ -802,15 +821,5 @@ export class MSSQLDriver extends BaseDBDriver {
     // Default text
     const v = typeof val === "string" ? val : val[0];
     return { sql: `${col} LIKE ?`, params: [`%${v}%`] };
-  }
-
-  private isTextualType(nativeType: string): boolean {
-    const ct = nativeType.toLowerCase();
-    return (
-      ct.includes("char") ||
-      ct.includes("varchar") ||
-      ct.includes("text") ||
-      ct.includes("xml")
-    );
   }
 }

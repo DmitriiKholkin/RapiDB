@@ -471,6 +471,23 @@ const ORACLE_NON_FILTERABLE = new Set([
   "anytype",
 ]);
 
+const ORACLE_NON_EDITABLE = new Set([
+  "blob",
+  "clob",
+  "nclob",
+  "bfile",
+  "long raw",
+  "long",
+  "xmltype",
+  "sdo_geometry",
+  "anydata",
+  "anytype",
+  "anydataset",
+  "object",
+  "ref",
+  "opaque",
+]);
+
 export class OracleDriver extends BaseDBDriver {
   private pool: oracledb.Pool | null = null;
   private readonly config: ConnectionConfig;
@@ -1257,9 +1274,23 @@ export class OracleDriver extends BaseDBDriver {
     return ct === "DATE" || ct.startsWith("TIMESTAMP");
   }
 
-  override isFilterable(nativeType: string): boolean {
-    return !ORACLE_NON_FILTERABLE.has(
-      nativeType.toLowerCase().split("(")[0].trim(),
+  protected override isFilterable(
+    nativeType: string,
+    category: TypeCategory,
+  ): boolean {
+    return (
+      super.isFilterable(nativeType, category) &&
+      !ORACLE_NON_FILTERABLE.has(oracleTypeName(nativeType).toLowerCase())
+    );
+  }
+
+  protected override isEditable(
+    nativeType: string,
+    category: TypeCategory,
+  ): boolean {
+    return (
+      super.isEditable(nativeType, category) &&
+      !ORACLE_NON_EDITABLE.has(oracleTypeName(nativeType).toLowerCase())
     );
   }
 
@@ -1289,7 +1320,7 @@ export class OracleDriver extends BaseDBDriver {
   }
 
   override buildInsertValueExpr(
-    column: ColumnTypeMeta,
+    _column: ColumnTypeMeta,
     paramIndex: number,
   ): string {
     return `:${paramIndex}`;

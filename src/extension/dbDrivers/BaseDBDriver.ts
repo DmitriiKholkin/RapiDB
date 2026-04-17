@@ -368,6 +368,10 @@ export abstract class BaseDBDriver implements IDBDriver {
     if (operator === "like" || operator === "ilike") {
       return { sql: `CAST(${col} AS CHAR) LIKE ?`, params: [`%${val}%`] };
     }
+    // NOTE: `eq` and `neq` are not in TEXT_OPS so they will never appear as
+    // filter-operator choices for text columns in the UI.  These branches are
+    // a defensive fallback for callers that invoke buildFilterCondition
+    // directly with an arbitrary operator (e.g. unit-tests, future drivers).
     if (operator === "eq") {
       return { sql: `CAST(${col} AS CHAR) LIKE ?`, params: [`%${val}%`] };
     }

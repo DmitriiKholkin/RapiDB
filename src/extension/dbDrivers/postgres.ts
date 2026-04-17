@@ -11,7 +11,6 @@ import type {
   DatabaseInfo,
   FilterConditionResult,
   FilterOperator,
-  IDBDriver,
   PaginationResult,
   QueryResult,
   SchemaInfo,
@@ -542,6 +541,15 @@ export class PostgresDriver extends BaseDBDriver {
     return super.isFilterable(nativeType, category);
   }
 
+  protected override isEditable(
+    nativeType: string,
+    category: TypeCategory,
+  ): boolean {
+    if (PG_GEOMETRIC_TYPES.has(nativeType.toLowerCase().split("(")[0].trim()))
+      return false;
+    return super.isEditable(nativeType, category);
+  }
+
   // ─── PG SQL helpers ───
 
   override buildPagination(
@@ -769,46 +777,5 @@ export class PostgresDriver extends BaseDBDriver {
       sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex}`,
       params: [`%${finalVal}%`],
     };
-  }
-
-  private isNumericCompareUnsafe(nativeType: string): boolean {
-    const ct = nativeType.toLowerCase().split("(")[0].trim();
-    return (
-      ct === "date" ||
-      ct === "time" ||
-      ct === "timetz" ||
-      ct === "boolean" ||
-      ct === "bool" ||
-      ct === "uuid" ||
-      ct === "inet" ||
-      ct === "cidr" ||
-      ct === "macaddr" ||
-      ct === "macaddr8" ||
-      ct === "bit" ||
-      ct === "varbit" ||
-      ct === "oid" ||
-      ct === "xid" ||
-      ct === "cid" ||
-      ct === "interval" ||
-      nativeType.toLowerCase().startsWith("interval") ||
-      ct === "bytea" ||
-      ct === "tsvector" ||
-      ct === "tsquery" ||
-      nativeType.toLowerCase().endsWith("[]") ||
-      nativeType.toLowerCase().startsWith("_") ||
-      nativeType.toLowerCase() === "array"
-    );
-  }
-
-  private isTextualType(nativeType: string): boolean {
-    const ct = nativeType.toLowerCase();
-    return (
-      ct.includes("json") ||
-      ct.includes("text") ||
-      ct.includes("char") ||
-      ct === "xml" ||
-      ct === "uuid" ||
-      PG_GEOMETRIC_TYPES.has(ct.split("(")[0].trim())
-    );
   }
 }

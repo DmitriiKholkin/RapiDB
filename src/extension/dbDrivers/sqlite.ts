@@ -12,7 +12,6 @@ import type {
   TableInfo,
   TypeCategory,
 } from "./types";
-import { NULL_SENTINEL } from "./types";
 
 function classifySql(sql: string): "select" | "dml" {
   const stripped = sql
@@ -36,7 +35,8 @@ function splitSQLiteScript(sql: string): string[] {
 
   while (i < n) {
     if (sql[i] === "-" && sql[i + 1] === "-") {
-      while (i < n && sql[i] !== "\n") buf += sql[i++];
+      // Skip over the comment line without adding it to the statement buffer.
+      while (i < n && sql[i] !== "\n") i++;
       continue;
     }
 
@@ -394,23 +394,28 @@ export class SQLiteDriver extends BaseDBDriver {
 
   mapTypeCategory(nativeType: string): TypeCategory {
     const ct = nativeType.toUpperCase().trim();
-    if (ct === "" || ct === "TEXT") return "text";
+    // Strip precision/scale specifiers for initial matching, e.g. DECIMAL(10,2) → DECIMAL
+    const base = ct.split("(")[0].trim();
+    if (base === "" || base === "TEXT") return "text";
     if (
-      ct === "INTEGER" ||
-      ct === "INT" ||
-      ct === "BIGINT" ||
-      ct === "SMALLINT" ||
-      ct === "TINYINT" ||
-      ct === "MEDIUMINT"
+      base === "INTEGER" ||
+      base === "INT" ||
+      base === "BIGINT" ||
+      base === "SMALLINT" ||
+      base === "TINYINT" ||
+      base === "MEDIUMINT"
     )
       return "integer";
-    if (ct === "REAL" || ct === "DOUBLE" || ct === "FLOAT") return "float";
-    if (ct === "NUMERIC" || ct === "DECIMAL") return "decimal";
-    if (ct === "BOOLEAN" || ct === "BOOL") return "boolean";
-    if (ct === "BLOB") return "binary";
-    if (ct === "DATE") return "date";
-    if (ct === "TIME") return "time";
-    if (ct === "DATETIME" || ct === "TIMESTAMP") return "datetime";
+    if (base === "REAL" || base === "DOUBLE" || base === "FLOAT")
+      return "float";
+    if (base === "NUMERIC" || base === "DECIMAL") return "decimal";
+    if (base === "BOOLEAN" || base === "BOOL") return "boolean";
+    if (base === "BLOB") return "binary";
+    if (base === "DATE") return "date";
+    if (base === "TIME") return "time";
+    if (base === "DATETIME" || base === "TIMESTAMP") return "datetime";
+    // SQLite type-affinity fallbacks (covers e.g. VARCHAR, NVARCHAR, CHAR, CLOB,
+    // INT2, INT8, DOUBLE PRECISION, FLOAT4, etc.)
     if (ct.includes("INT")) return "integer";
     if (ct.includes("CHAR") || ct.includes("TEXT") || ct.includes("CLOB"))
       return "text";
@@ -437,23 +442,17 @@ export class SQLiteDriver extends BaseDBDriver {
   }
 
   override coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
-    if (value === null || value === undefined || value === "") return value;
-    if (value === NULL_SENTINEL) return null;
-    if (typeof value !== "string") return value;
-
-    if (column.isBoolean) {
+    if (typeof value === "string" && column.isBoolean) {
       const lower = value.toLowerCase();
       if (lower === "true" || lower === "1") return 1;
       if (lower === "false" || lower === "0") return 0;
     }
 
-    return value;
+    return super.coerceInputValue(value, column);
   }
 
   override formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
-    if (value === null || value === undefined) return value;
-    if (typeof value === "bigint") return value.toString();
-    return value;
+    return super.formatOutputValue(value, column);
   }
 
   // ─── SQLite filter building ───
@@ -462,7 +461,7 @@ export class SQLiteDriver extends BaseDBDriver {
     column: ColumnTypeMeta,
     operator: FilterOperator,
     value: string | [string, string] | undefined,
-    paramIndex: number,
+    _paramIndex: number,
   ): FilterConditionResult | null {
     if (!column.filterable) return null;
     if (value === undefined) return null;
@@ -492,6 +491,15 @@ export class SQLiteDriver extends BaseDBDriver {
     ) {
       const sqlOp = this.sqlOperator(operator);
       return { sql: `${col} ${sqlOp} ?`, params: [Number(val)] };
+    }
+
+    if (
+      column.category === "date" &&
+      typeof val === "string" &&
+      (operator === "eq" || operator === "neq")
+    ) {
+      const sqlOp = operator === "neq" ? "!=" : "=";
+      return { sql: `DATE(${col}) ${sqlOp} DATE(?)`, params: [val] };
     }
 
     // Between

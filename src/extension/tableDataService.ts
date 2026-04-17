@@ -155,7 +155,7 @@ export class TableDataService {
 
     const colMetaMap = new Map(cols.map((c) => [c.name, c]));
 
-    const formattedRows = dataRes.rows.map((row) => {
+    console.log("DATARES ROWS:", dataRes.rows); const formattedRows = dataRes.rows.map((row) => {
       const newRow: Record<string, unknown> = {};
       dataColumns.forEach((colName, i) => {
         const val = row[`__col_${i}`];

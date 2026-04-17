@@ -360,6 +360,81 @@ describe("TableDataService", () => {
       expect(driver.query).not.toHaveBeenCalled();
     });
 
+    it("rejects unsupported operators before delegating to the driver", async () => {
+      const cols = makeTestColumns();
+      (driver.describeColumns as any).mockResolvedValue(cols);
+
+      await expect(
+        svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
+          { column: "name", operator: "eq", value: "alice" },
+        ]),
+      ).rejects.toThrow("Column name does not support eq filters");
+
+      expect(driver.buildFilterCondition).not.toHaveBeenCalled();
+      expect(driver.query).not.toHaveBeenCalled();
+    });
+
+    it("normalizes numeric IN filters before delegating to the driver", async () => {
+      const cols = [
+        {
+          ...makeTestColumns()[0],
+          filterOperators: ["eq", "in"],
+        },
+      ];
+      (driver.describeColumns as any).mockResolvedValue(cols);
+      (driver.buildFilterCondition as any).mockReturnValue({
+        sql: '"id" IN (?, ?, ?)',
+        params: [1, 2, 3],
+      });
+      (driver.query as any)
+        .mockResolvedValueOnce({
+          columns: ["cnt"],
+          rows: [{ __col_0: 0 }],
+          rowCount: 1,
+          executionTimeMs: 0,
+        })
+        .mockResolvedValueOnce({
+          columns: [],
+          rows: [],
+          rowCount: 0,
+          executionTimeMs: 0,
+        });
+
+      await svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
+        { column: "id", operator: "in", value: "1,  2 ,3" },
+      ]);
+
+      expect(driver.buildFilterCondition).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "id" }),
+        "in",
+        "1, 2, 3",
+        1,
+      );
+    });
+
+    it("rejects unsupported date IN filters before querying", async () => {
+      const cols = [
+        {
+          ...makeTestColumns()[1],
+          name: "created_on",
+          type: "date",
+          category: "date",
+          nativeType: "date",
+          filterOperators: ["eq", "like", "is_null", "is_not_null"],
+        },
+      ];
+      (driver.describeColumns as any).mockResolvedValue(cols);
+
+      await expect(
+        svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
+          { column: "created_on", operator: "in", value: "2026-04-15" },
+        ]),
+      ).rejects.toThrow("Column created_on does not support in filters");
+
+      expect(driver.buildFilterCondition).not.toHaveBeenCalled();
+      expect(driver.query).not.toHaveBeenCalled();
+    });
+
     it("normalizes SQL datetime text to a date-only equality filter for date columns", async () => {
       const cols = [
         {

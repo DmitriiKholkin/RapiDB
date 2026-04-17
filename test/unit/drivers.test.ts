@@ -70,34 +70,57 @@ describe("PostgresDriver", () => {
     it.each([
       ["boolean", "boolean"],
       ["bool", "boolean"],
-      ["serial", "integer"],
-      ["bigserial", "integer"],
       ["smallint", "integer"],
       ["integer", "integer"],
       ["bigint", "integer"],
+      ["serial", "integer"],
+      ["smallserial", "integer"],
+      ["bigserial", "integer"],
       ["oid", "integer"],
+      ["xid", "integer"],
+      ["cid", "integer"],
       ["numeric", "decimal"],
       ["numeric(10,2)", "decimal"],
+      ["decimal", "decimal"],
       ["money", "decimal"],
       ["real", "float"],
       ["double precision", "float"],
+      ["float4", "float"],
+      ["float8", "float"],
+      ["date", "date"],
+      ["time", "time"],
+      ["timetz", "time"],
+      ["time with time zone", "time"],
+      ["time without time zone", "time"],
+      ["timestamp", "datetime"],
+      ["timestamp with time zone", "datetime"],
+      ["timestamp without time zone", "datetime"],
       ["bytea", "binary"],
       ["json", "json"],
       ["jsonb", "json"],
       ["uuid", "uuid"],
       ["point", "spatial"],
+      ["line", "spatial"],
+      ["lseg", "spatial"],
+      ["box", "spatial"],
+      ["path", "spatial"],
       ["polygon", "spatial"],
       ["circle", "spatial"],
-      ["line", "spatial"],
       ["interval", "interval"],
       ["integer[]", "array"],
       ["_int4", "array"],
       ["text", "text"],
       ["varchar(50)", "text"],
+      ["character varying(50)", "text"],
+      ["character(10)", "text"],
+      ["name", "text"],
+      ["xml", "text"],
       ["inet", "text"],
       ["cidr", "text"],
       ["macaddr", "text"],
+      ["macaddr8", "text"],
       ["tsvector", "text"],
+      ["tsquery", "text"],
       ["bit", "other"],
       ["varbit", "other"],
     ] as const)("maps %s → %s", (input, expected) => {
@@ -278,6 +301,35 @@ describe("PostgresDriver", () => {
       expect(r?.sql).toContain("::date");
     });
   });
+
+  describe("enrichColumn", () => {
+    it.each([
+      "point",
+      "line",
+      "polygon",
+      "circle",
+    ])("marks geometric %s columns as read-only", (type) => {
+      const result = (pg as any).enrichColumn({
+        name: "geom_col",
+        type,
+        nullable: true,
+        isPrimaryKey: false,
+        isForeignKey: false,
+      });
+      expect(result.editable).toBe(false);
+    });
+
+    it("keeps interval columns editable", () => {
+      const result = (pg as any).enrichColumn({
+        name: "duration_col",
+        type: "interval",
+        nullable: true,
+        isPrimaryKey: false,
+        isForeignKey: false,
+      });
+      expect(result.editable).toBe(true);
+    });
+  });
 });
 
 // ────────────────────────────────────────────
@@ -289,23 +341,37 @@ describe("MySQLDriver", () => {
     it.each([
       ["tinyint(1)", "boolean"],
       ["bit(1)", "boolean"],
+      ["bool", "boolean"],
+      ["boolean", "boolean"],
       ["tinyint(4)", "integer"],
       ["bit(8)", "integer"],
       ["year", "integer"],
       ["int", "integer"],
+      ["integer", "integer"],
+      ["mediumint", "integer"],
       ["bigint", "integer"],
       ["decimal(10,2)", "decimal"],
+      ["numeric(5,3)", "decimal"],
       ["float", "float"],
       ["double", "float"],
+      ["real", "float"],
       ["json", "json"],
       ["point", "spatial"],
       ["geometry", "spatial"],
       ["enum('a','b')", "enum"],
       ["set('x','y')", "enum"],
       ["text", "text"],
+      ["tinytext", "text"],
+      ["mediumtext", "text"],
+      ["longtext", "text"],
       ["varchar(100)", "text"],
+      ["char(10)", "text"],
       ["binary(4)", "binary"],
+      ["varbinary(16)", "binary"],
+      ["tinyblob", "binary"],
       ["blob", "binary"],
+      ["mediumblob", "binary"],
+      ["longblob", "binary"],
       ["date", "date"],
       ["datetime", "datetime"],
       ["timestamp", "datetime"],
@@ -411,6 +477,35 @@ describe("MySQLDriver", () => {
       });
       const result = my.coerceInputValue("2024-06-15T10:30:45.123Z", c);
       expect(result).toBe("2024-06-15 10:30:45.123");
+    });
+
+    it("normalizes ISO datetime input to date-only text for date columns", () => {
+      const c = col({
+        name: "d",
+        type: "date",
+        category: "date",
+        nativeType: "date",
+      });
+      expect(my.coerceInputValue("2024-06-15T10:30:45Z", c)).toBe("2024-06-15");
+    });
+
+    it.each([
+      ["text", "text"],
+      ["json", "json"],
+      ["kind", "enum('a','b')"],
+    ] as const)("does not rewrite ISO-looking strings for %s columns", (name, nativeType) => {
+      const category = nativeType.startsWith("enum")
+        ? "enum"
+        : (name as "text" | "json");
+      const c = col({
+        name,
+        type: nativeType,
+        category,
+        nativeType,
+      });
+      expect(my.coerceInputValue("2024-06-15T10:30:45Z", c)).toBe(
+        "2024-06-15T10:30:45Z",
+      );
     });
 
     it("parses bit values", () => {
@@ -523,6 +618,18 @@ describe("MySQLDriver", () => {
       const r = my.buildFilterCondition(c, "eq", "1.250", 1);
       expect(r?.params).toEqual([1.25, 0.000001, 1.25, 0.000001]);
     });
+
+    it("uses typed comparison for date equality filters", () => {
+      const c = col({
+        name: "created_on",
+        type: "date",
+        category: "date",
+        nativeType: "date",
+      });
+      const r = my.buildFilterCondition(c, "eq", "2026-04-15", 1);
+      expect(r?.sql).toBe("`created_on` = CAST(? AS DATE)");
+      expect(r?.params).toEqual(["2026-04-15"]);
+    });
   });
 });
 
@@ -534,29 +641,40 @@ describe("MSSQLDriver", () => {
   describe("mapTypeCategory", () => {
     it.each([
       ["bit", "boolean"],
-      ["money", "decimal"],
-      ["smallmoney", "decimal"],
-      ["uniqueidentifier", "uuid"],
+      ["tinyint", "integer"],
+      ["smallint", "integer"],
       ["int", "integer"],
       ["bigint", "integer"],
+      ["decimal(10,2)", "decimal"],
+      ["numeric(5,3)", "decimal"],
+      ["money", "decimal"],
+      ["smallmoney", "decimal"],
+      ["real", "float"],
+      ["float", "float"],
+      ["date", "date"],
+      ["time(7)", "time"],
+      ["datetime", "datetime"],
+      ["datetime2(7)", "datetime"],
+      ["datetimeoffset(7)", "datetime"],
+      ["smalldatetime", "datetime"],
+      ["char(10)", "text"],
+      ["nchar(10)", "text"],
+      ["varchar(50)", "text"],
       ["nvarchar(50)", "text"],
       ["varchar(max)", "text"],
       ["text", "text"],
       ["ntext", "text"],
       ["xml", "text"],
-      ["image", "binary"],
       ["binary(16)", "binary"],
       ["varbinary(max)", "binary"],
-      ["date", "date"],
-      ["datetime", "datetime"],
-      ["datetime2(7)", "datetime"],
-      ["datetimeoffset(7)", "datetime"],
-      ["smalldatetime", "datetime"],
-      ["time(7)", "time"],
+      ["image", "binary"],
+      ["timestamp", "binary"],
+      ["rowversion", "binary"],
+      ["uniqueidentifier", "uuid"],
       ["geography", "spatial"],
       ["geometry", "spatial"],
-      ["float", "float"],
-      ["real", "float"],
+      ["hierarchyid", "other"],
+      ["sql_variant", "other"],
     ] as const)("maps %s → %s", (input, expected) => {
       expect(ms.mapTypeCategory(input)).toBe(expected);
     });
@@ -689,6 +807,22 @@ describe("MSSQLDriver", () => {
     });
   });
 
+  describe("enrichColumn", () => {
+    it("marks timestamp/rowversion as read-only and non-filterable", () => {
+      const result = (ms as any).enrichColumn({
+        name: "rv",
+        type: "timestamp",
+        nullable: false,
+        isPrimaryKey: false,
+        isForeignKey: false,
+      });
+
+      expect(result.category).toBe("binary");
+      expect(result.filterable).toBe(false);
+      expect(result.editable).toBe(false);
+    });
+  });
+
   describe("buildFilterCondition", () => {
     it("uses <> for boolean neq (not !=)", () => {
       const c = col({
@@ -735,6 +869,28 @@ describe("MSSQLDriver", () => {
       expect(r?.params).toEqual(["2026-04-15"]);
     });
   });
+
+  describe("enrichColumn", () => {
+    it.each([
+      "geography",
+      "geometry",
+      "hierarchyid",
+      "sql_variant",
+      "image",
+      "text",
+      "ntext",
+      "xml",
+    ])("marks %s as read-only", (type) => {
+      const result = (ms as any).enrichColumn({
+        name: "unsupported_col",
+        type,
+        nullable: true,
+        isPrimaryKey: false,
+        isForeignKey: false,
+      });
+      expect(result.editable).toBe(false);
+    });
+  });
 });
 
 // ────────────────────────────────────────────
@@ -745,22 +901,37 @@ describe("OracleDriver", () => {
   describe("mapTypeCategory", () => {
     it.each([
       ["NUMBER", "integer"],
+      ["NUMBER(10)", "integer"],
+      ["NUMBER(10,0)", "integer"],
       ["NUMBER(10,2)", "decimal"],
       ["INTEGER", "integer"],
+      ["SMALLINT", "integer"],
+      ["PLS_INTEGER", "integer"],
+      ["BINARY_INTEGER", "integer"],
       ["FLOAT", "float"],
+      ["FLOAT(24)", "float"],
       ["BINARY_FLOAT", "float"],
       ["BINARY_DOUBLE", "float"],
       ["DATE", "datetime"],
       ["TIMESTAMP(6)", "datetime"],
       ["TIMESTAMP(6) WITH TIME ZONE", "datetime"],
+      ["TIMESTAMP(6) WITH LOCAL TIME ZONE", "datetime"],
+      ["INTERVAL YEAR TO MONTH", "text"],
+      ["INTERVAL DAY TO SECOND", "text"],
       ["VARCHAR2(100)", "text"],
       ["NVARCHAR2(100)", "text"],
       ["CHAR(10)", "text"],
+      ["NCHAR(10)", "text"],
       ["CLOB", "text"],
       ["NCLOB", "text"],
+      ["LONG", "text"],
+      ["XMLTYPE", "text"],
+      ["ROWID", "text"],
+      ["UROWID", "text"],
       ["BLOB", "binary"],
       ["RAW(16)", "binary"],
-      ["XMLTYPE", "text"],
+      ["LONG RAW", "binary"],
+      ["SDO_GEOMETRY", "spatial"],
     ] as const)("maps %s → %s", (input, expected) => {
       expect(ora.mapTypeCategory(input)).toBe(expected);
     });
@@ -879,6 +1050,36 @@ describe("OracleDriver", () => {
       expect(ora.buildSetExpr(col({ name: "AGE", type: "NUMBER" }), 2)).toBe(
         '"AGE" = :2',
       );
+    });
+  });
+
+  describe("enrichColumn", () => {
+    it.each([
+      "SDO_GEOMETRY",
+      "BLOB",
+      "CLOB",
+      "XMLTYPE",
+      "OBJECT",
+    ])("marks %s as read-only", (type) => {
+      const result = (ora as any).enrichColumn({
+        name: "unsupported_col",
+        type,
+        nullable: true,
+        isPrimaryKey: false,
+        isForeignKey: false,
+      });
+      expect(result.editable).toBe(false);
+    });
+
+    it("keeps RAW columns editable", () => {
+      const result = (ora as any).enrichColumn({
+        name: "raw_col",
+        type: "RAW(16)",
+        nullable: true,
+        isPrimaryKey: false,
+        isForeignKey: false,
+      });
+      expect(result.editable).toBe(true);
     });
   });
 
@@ -1095,23 +1296,35 @@ describe("OracleDriver", () => {
 describe("SQLiteDriver", () => {
   describe("mapTypeCategory", () => {
     it.each([
+      // Explicit well-known types
       ["", "text"],
       ["TEXT", "text"],
       ["VARCHAR(50)", "text"],
+      ["NVARCHAR(100)", "text"],
+      ["CLOB", "text"],
+      ["CHARACTER VARYING(50)", "text"],
       ["BOOLEAN", "boolean"],
       ["BOOL", "boolean"],
       ["INTEGER", "integer"],
       ["INT", "integer"],
       ["BIGINT", "integer"],
+      ["SMALLINT", "integer"],
+      ["TINYINT", "integer"],
+      ["MEDIUMINT", "integer"],
+      ["INT2", "integer"],
+      ["INT8", "integer"],
       ["REAL", "float"],
       ["FLOAT", "float"],
       ["DOUBLE", "float"],
+      ["DOUBLE PRECISION", "float"],
       ["BLOB", "binary"],
       ["DATE", "date"],
       ["TIME", "time"],
       ["DATETIME", "datetime"],
       ["TIMESTAMP", "datetime"],
       ["NUMERIC", "decimal"],
+      ["DECIMAL", "decimal"],
+      ["DECIMAL(10,2)", "decimal"],
     ] as const)("maps %s → %s", (input, expected) => {
       expect(lite.mapTypeCategory(input)).toBe(expected);
     });
@@ -1154,6 +1367,13 @@ describe("SQLiteDriver", () => {
       const c = col({ name: "s", type: "TEXT", category: "text" });
       expect(lite.coerceInputValue("hello", c)).toBe("hello");
     });
+
+    it("restores shared binary hex parsing", () => {
+      const c = col({ name: "blob_col", type: "BLOB", category: "binary" });
+      const result = lite.coerceInputValue("0xdeadbeef", c);
+      expect(Buffer.isBuffer(result)).toBe(true);
+      expect((result as Buffer).toString("hex")).toBe("deadbeef");
+    });
   });
 
   describe("formatOutputValue", () => {
@@ -1170,6 +1390,13 @@ describe("SQLiteDriver", () => {
     it("passes null through", () => {
       const c = col({ name: "n", type: "TEXT", category: "text" });
       expect(lite.formatOutputValue(null, c)).toBeNull();
+    });
+
+    it("restores shared binary hex formatting", () => {
+      const c = col({ name: "blob_col", type: "BLOB", category: "binary" });
+      expect(lite.formatOutputValue(Buffer.from([0xde, 0xad]), c)).toBe(
+        "\\xdead",
+      );
     });
   });
 
@@ -1203,6 +1430,18 @@ describe("SQLiteDriver", () => {
       expect(r?.sql).toBe('"age" = ?');
       expect(r?.params).toEqual([25]);
     });
+
+    it("uses typed comparison for date equality filters", () => {
+      const c = col({
+        name: "created_on",
+        type: "DATE",
+        category: "date",
+        nativeType: "DATE",
+      });
+      const r = lite.buildFilterCondition(c, "eq", "2026-04-15", 1);
+      expect(r?.sql).toBe('DATE("created_on") = DATE(?)');
+      expect(r?.params).toEqual(["2026-04-15"]);
+    });
   });
 
   describe("buildPagination (uses base default)", () => {
@@ -1210,6 +1449,58 @@ describe("SQLiteDriver", () => {
       const r = lite.buildPagination(5, 10, 1);
       expect(r.sql).toBe("LIMIT ? OFFSET ?");
       expect(r.params).toEqual([10, 5]);
+    });
+  });
+
+  describe("splitSQLiteScript (comment handling)", () => {
+    // Access the private export indirectly by importing the module.
+    // The function is not exported so we test it through the query path
+    // via a stub, OR we import the tested symbol directly if it were exported.
+    // Since it is a module-level private function we verify observable
+    // behaviour: comments must NOT appear as statements and must not
+    // corrupt the surrounding SQL.
+
+    it("strips line comments and still executes the real statement", () => {
+      // We call the driver's internal script splitter indirectly by
+      // verifying that a comment-only script produces no statements.
+      // Construct a mock db.all / db.run that records calls.
+      const calls: string[] = [];
+      const mockDb = {
+        isOpen: true,
+        all: (sql: string) => {
+          calls.push(sql);
+          return [];
+        },
+        run: (sql: string) => {
+          calls.push(sql);
+          return { changes: 0 };
+        },
+      };
+      (lite as any).db = mockDb;
+
+      // A script with only a comment must result in no actual query calls.
+      lite.query("-- just a comment\n");
+      expect(calls).toHaveLength(0);
+    });
+
+    it("does not inject comment text into the statement that follows it", () => {
+      const executed: string[] = [];
+      const mockDb = {
+        isOpen: true,
+        all: (sql: string) => {
+          executed.push(sql);
+          return [];
+        },
+        run: (sql: string) => {
+          executed.push(sql);
+          return { changes: 0 };
+        },
+      };
+      (lite as any).db = mockDb;
+
+      lite.query("-- ignore me\nSELECT 1");
+      expect(executed).toHaveLength(1);
+      expect(executed[0]).toBe("SELECT 1");
     });
   });
 });
