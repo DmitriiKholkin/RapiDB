@@ -396,22 +396,32 @@ export function TableView({
   }, []);
 
   const commitCellEdit = useCallback(
-    (rowIdx: number, colName: string, newVal: string, originalVal: unknown) => {
+    (
+      rowIdx: number,
+      column: ColumnMeta,
+      newVal: string,
+      originalVal: unknown,
+    ) => {
       setEditCell(null);
 
       const coerced: unknown = newVal === NULL_SENTINEL ? null : newVal;
 
-      const origStr = originalVal == null ? NULL_SENTINEL : String(originalVal);
+      const origStr = valueToEditString(
+        originalVal,
+        column.isBoolean,
+        column.category,
+        column.nativeType,
+      );
 
       if (newVal === origStr) {
         setPending((prev) => {
           const rowMap = prev.get(rowIdx);
-          if (!rowMap || !rowMap.has(colName)) {
+          if (!rowMap?.has(column.name)) {
             return prev;
           }
           const next = new Map(prev);
           const newRow = new Map(rowMap);
-          newRow.delete(colName);
+          newRow.delete(column.name);
           if (newRow.size === 0) {
             next.delete(rowIdx);
           } else {
@@ -424,7 +434,7 @@ export function TableView({
       setPending((prev) => {
         const next = new Map(prev);
         const row = new Map(next.get(rowIdx) ?? []);
-        row.set(colName, coerced);
+        row.set(column.name, coerced);
         next.set(rowIdx, row);
         return next;
       });
@@ -558,16 +568,19 @@ export function TableView({
 
             if (isEditing) {
               const startVal = hasPending ? pendingValue : getValue();
-              const startStr = valueToEditString(startVal, col.isBoolean);
+              const startStr = valueToEditString(
+                startVal,
+                col.isBoolean,
+                col.category,
+                col.nativeType,
+              );
               return (
                 <EditInput
                   initial={startStr}
                   nullable={col.nullable}
                   isBoolean={col.isBoolean}
                   category={col.category}
-                  onCommit={(v) =>
-                    commitCellEdit(rowIdx, col.name, v, getValue())
-                  }
+                  onCommit={(v) => commitCellEdit(rowIdx, col, v, getValue())}
                   onCancel={() => setEditCell(null)}
                 />
               );
@@ -578,6 +591,7 @@ export function TableView({
                 isPending={hasPending}
                 isBoolean={col.isBoolean}
                 category={col.category}
+                nativeType={col.nativeType}
               />
             );
           },

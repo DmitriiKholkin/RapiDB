@@ -3,7 +3,6 @@
  */
 
 import { cleanup, render, screen } from "@testing-library/react";
-import React from "react";
 import { afterEach, describe, expect, it } from "vitest";
 import { CellDisplay } from "../../src/webview/components/table/CellDisplay";
 
@@ -47,6 +46,18 @@ describe("CellDisplay", () => {
   it("renders float numbers", () => {
     render(<CellDisplay value={3.14} isPending={false} category="float" />);
     expect(screen.getByText("3.14")).toBeDefined();
+  });
+
+  it("normalizes Oracle BINARY_FLOAT artifacts for display", () => {
+    render(
+      <CellDisplay
+        value={1.2000000476837158}
+        isPending={false}
+        category="float"
+        nativeType="BINARY_FLOAT"
+      />,
+    );
+    expect(screen.getByText("1.2")).toBeDefined();
   });
 
   it("renders JSON strings", () => {

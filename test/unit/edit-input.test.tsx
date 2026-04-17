@@ -3,7 +3,6 @@
  */
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   EditInput,
@@ -44,6 +43,12 @@ describe("valueToEditString", () => {
 
   it("converts numbers as-is for non-boolean", () => {
     expect(valueToEditString(42, false)).toBe("42");
+  });
+
+  it("normalizes Oracle BINARY_FLOAT values for editing", () => {
+    expect(
+      valueToEditString(1.2300000190734863, false, "float", "BINARY_FLOAT"),
+    ).toBe("1.23");
   });
 });
 

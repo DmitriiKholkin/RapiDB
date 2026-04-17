@@ -1337,6 +1337,14 @@ export class OracleDriver extends BaseDBDriver {
     if (value === NULL_SENTINEL) return null;
     if (typeof value !== "string") return value;
 
+    if (column.category === "float") {
+      const trimmed = value.trim();
+      if (trimmed !== "") {
+        const parsed = Number(trimmed);
+        if (Number.isFinite(parsed)) return parsed;
+      }
+    }
+
     // Binary
     if (column.category === "binary")
       return super.coerceInputValue(value, column);

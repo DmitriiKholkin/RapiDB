@@ -5,6 +5,7 @@ import {
   placeholderForCategory,
   type TypeCategory,
 } from "../../types";
+import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
 
 const ROW_H = 26;
 
@@ -183,12 +184,17 @@ export function EditInput({
 /**
  * Convert a cell value to an initial string for the edit input.
  */
-export function valueToEditString(value: unknown, isBoolean: boolean): string {
+export function valueToEditString(
+  value: unknown,
+  isBoolean: boolean,
+  category?: TypeCategory,
+  nativeType?: string,
+): string {
   if (isBoolean && value !== null && value !== undefined) {
     if (value === true || value === 1 || value === "1") return "true";
     if (value === false || value === 0 || value === "0") return "false";
     return String(value);
   }
   if (value == null) return NULL_SENTINEL;
-  return String(value);
+  return formatScalarValueForDisplay(value, category, nativeType);
 }

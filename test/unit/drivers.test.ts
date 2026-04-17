@@ -1084,6 +1084,20 @@ describe("OracleDriver", () => {
   });
 
   describe("coerceInputValue", () => {
+    it.each([
+      "BINARY_FLOAT",
+      "BINARY_DOUBLE",
+      "FLOAT",
+    ])("coerces %s string input to number", (nativeType) => {
+      const c = col({
+        name: "n",
+        type: nativeType,
+        category: "float",
+        nativeType,
+      });
+      expect(ora.coerceInputValue("1.25", c)).toBe(1.25);
+    });
+
     it("converts ISO datetime to Date object for datetime columns", () => {
       const c = col({
         name: "d",
