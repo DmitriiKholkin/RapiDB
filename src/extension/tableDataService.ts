@@ -418,19 +418,23 @@ function normalizeFilterCondition(
   filter: Filter,
   paramIndex: number,
 ) {
-  if (!column.filterable) return null;
-
-  if (!column.filterOperators.includes(filter.operator)) {
-    throw unsupportedFilterOperatorError(column.name, filter.operator);
-  }
-
   if (filter.operator === "is_null" || filter.operator === "is_not_null") {
+    if (!column.filterOperators.includes(filter.operator)) {
+      throw unsupportedFilterOperatorError(column.name, filter.operator);
+    }
+
     return drv.buildFilterCondition(
       column,
       filter.operator,
       undefined,
       paramIndex,
     );
+  }
+
+  if (!column.filterable) return null;
+
+  if (!column.filterOperators.includes(filter.operator)) {
+    throw unsupportedFilterOperatorError(column.name, filter.operator);
   }
 
   if (filter.operator === "between") {

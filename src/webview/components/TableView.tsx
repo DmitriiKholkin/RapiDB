@@ -104,6 +104,12 @@ function canFilterColumn(column?: ColumnMeta): column is ColumnMeta {
   return !!column && column.filterable;
 }
 
+function canNullFilterColumn(column?: ColumnMeta): column is ColumnMeta {
+  return (
+    !!column && column.nullable && column.filterOperators.includes("is_null")
+  );
+}
+
 function canEditColumn(column?: ColumnMeta): column is ColumnMeta {
   return !!column && column.editable && !column.isAutoIncrement;
 }
@@ -998,9 +1004,11 @@ export function TableView({
               {tanTable.getHeaderGroups()[0]?.headers.map((h) => {
                 const isSel = h.column.id === "__sel";
                 const col = columns.find((c) => c.name === h.column.id);
-                const canFilter = canFilterColumn(col);
+                const canValueFilter = canFilterColumn(col);
+                const canNullFilter = canNullFilterColumn(col);
+                const isNullOnlyFilter = !canValueFilter && canNullFilter;
                 const isNullFilter =
-                  canFilter && filters[h.column.id] === NULL_SENTINEL;
+                  canNullFilter && filters[h.column.id] === NULL_SENTINEL;
                 return (
                   <th
                     key={h.id + "_f"}
@@ -1034,27 +1042,29 @@ export function TableView({
                           value={
                             isNullFilter
                               ? ""
-                              : canFilter
+                              : canValueFilter
                                 ? (filters[h.column.id] ?? "")
                                 : ""
                           }
-                          disabled={!canFilter || isNullFilter}
+                          disabled={!canValueFilter || isNullFilter}
                           onChange={(e) =>
-                            canFilter &&
+                            canValueFilter &&
                             setFilters((f) => ({
                               ...f,
                               [h.column.id]: e.target.value,
                             }))
                           }
                           placeholder={
-                            isNullFilter
-                              ? "NULL"
-                              : col
-                                ? placeholderForCategory(
-                                    col.category,
-                                    col.isBoolean,
-                                  )
-                                : "filter"
+                            isNullOnlyFilter
+                              ? ""
+                              : isNullFilter
+                                ? "NULL"
+                                : col
+                                  ? placeholderForCategory(
+                                      col.category,
+                                      col.isBoolean,
+                                    )
+                                  : "filter"
                           }
                           style={{
                             flex: 1,
@@ -1064,7 +1074,7 @@ export function TableView({
                             fontSize: 11,
                             background: "var(--vscode-input-background)",
                             color:
-                              !canFilter || isNullFilter
+                              !canValueFilter || isNullFilter
                                 ? "var(--vscode-disabledForeground)"
                                 : "var(--vscode-input-foreground)",
                             border: "1px solid transparent",
@@ -1072,12 +1082,14 @@ export function TableView({
                             fontFamily: "inherit",
                             outline: "none",
                             boxSizing: "border-box",
-                            opacity: !canFilter || isNullFilter ? 0.55 : 1,
+                            opacity: !canValueFilter || isNullFilter ? 0.55 : 1,
                             fontStyle:
-                              !canFilter || isNullFilter ? "italic" : "normal",
+                              !canValueFilter || isNullFilter
+                                ? "italic"
+                                : "normal",
                           }}
                           onFocus={(e) => {
-                            if (canFilter && !isNullFilter) {
+                            if (canValueFilter && !isNullFilter) {
                               e.target.style.borderColor =
                                 "var(--vscode-focusBorder)";
                             }
@@ -1089,9 +1101,9 @@ export function TableView({
                         {col?.nullable && (
                           <button
                             type="button"
-                            disabled={!canFilter}
+                            disabled={!canNullFilter}
                             onClick={() =>
-                              canFilter &&
+                              canNullFilter &&
                               setFilters((f) => ({
                                 ...f,
                                 [h.column.id]: isNullFilter
@@ -1100,7 +1112,7 @@ export function TableView({
                               }))
                             }
                             title={
-                              !canFilter
+                              !canNullFilter
                                 ? "Filtering is not available for this column"
                                 : isNullFilter
                                   ? "Remove NULL filter"
@@ -1116,16 +1128,16 @@ export function TableView({
                               background: isNullFilter
                                 ? "var(--vscode-button-background)"
                                 : "transparent",
-                              color: !canFilter
+                              color: !canNullFilter
                                 ? "var(--vscode-disabledForeground)"
                                 : isNullFilter
                                   ? "var(--vscode-button-foreground)"
                                   : "var(--vscode-badge-foreground)",
                               border: "none",
                               borderRadius: 2,
-                              cursor: canFilter ? "pointer" : "default",
+                              cursor: canNullFilter ? "pointer" : "default",
                               letterSpacing: "0.02em",
-                              opacity: !canFilter
+                              opacity: !canNullFilter
                                 ? 0.35
                                 : isNullFilter
                                   ? 1

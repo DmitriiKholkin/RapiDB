@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   formatDatetimeForDisplay,
   hexFromBuffer,
@@ -397,12 +397,57 @@ describe("BaseDBDriver defaults", () => {
         "is_not_null",
       ]);
     });
+
+    it("exposes null-only operators for nullable non-filterable columns", () => {
+      const isFilterable = vi
+        .spyOn(drv as any, "isFilterable")
+        .mockReturnValue(false);
+
+      const result = (drv as any).enrichColumn({
+        name: "notes",
+        type: "text",
+        nullable: true,
+        isPrimaryKey: false,
+        isForeignKey: false,
+      });
+
+      expect(result.filterable).toBe(false);
+      expect(result.filterOperators).toEqual(["is_null", "is_not_null"]);
+
+      isFilterable.mockRestore();
+    });
   });
 
   describe("buildFilterCondition", () => {
     it("returns null for non-filterable columns", () => {
       const c = col({ name: "a", type: "text", filterable: false });
       expect(drv.buildFilterCondition(c, "eq", "x", 1)).toBeNull();
+    });
+
+    it("generates IS NULL for non-filterable nullable columns", () => {
+      const c = col({
+        name: "a",
+        type: "text",
+        filterable: false,
+        nullable: true,
+        filterOperators: ["is_null", "is_not_null"],
+      });
+      const r = drv.buildFilterCondition(c, "is_null", undefined, 1);
+      expect(r?.sql).toBe('"a" IS NULL');
+      expect(r?.params).toEqual([]);
+    });
+
+    it("generates IS NOT NULL for non-filterable nullable columns", () => {
+      const c = col({
+        name: "a",
+        type: "text",
+        filterable: false,
+        nullable: true,
+        filterOperators: ["is_null", "is_not_null"],
+      });
+      const r = drv.buildFilterCondition(c, "is_not_null", undefined, 1);
+      expect(r?.sql).toBe('"a" IS NOT NULL');
+      expect(r?.params).toEqual([]);
     });
 
     it("generates IS NULL", () => {

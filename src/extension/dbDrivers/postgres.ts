@@ -673,14 +673,16 @@ export class PostgresDriver extends BaseDBDriver {
     value: string | [string, string] | undefined,
     paramIndex: number,
   ): FilterConditionResult | null {
-    if (!column.filterable) return null;
-    if (value === undefined) return null;
     const col = this.quoteIdentifier(column.name);
-    const val = typeof value === "string" ? value.trim() : value;
 
     if (operator === "is_null") return { sql: `${col} IS NULL`, params: [] };
     if (operator === "is_not_null")
       return { sql: `${col} IS NOT NULL`, params: [] };
+
+    if (!column.filterable) return null;
+    if (value === undefined) return null;
+
+    const val = typeof value === "string" ? value.trim() : value;
 
     // Boolean
     if (column.isBoolean && (operator === "eq" || operator === "neq")) {

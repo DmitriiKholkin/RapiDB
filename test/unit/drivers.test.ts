@@ -61,6 +61,63 @@ const ms = new MSSQLDriver(msConfig);
 const ora = new OracleDriver(oraConfig);
 const lite = new SQLiteDriver(sqliteConfig);
 
+describe("null-only filter support", () => {
+  it.each([
+    ["Postgres", pg, '"payload"'],
+    ["MySQL", my, "`payload`"],
+    ["MSSQL", ms, '"payload"'],
+    ["Oracle", ora, '"payload"'],
+    ["SQLite", lite, '"payload"'],
+  ] as const)("allows IS NULL for non-filterable nullable columns in %s", (_name, driver, quotedColumn) => {
+    const column = col({
+      name: "payload",
+      type: "json",
+      category: "json",
+      nativeType: "json",
+      filterable: false,
+      nullable: true,
+      filterOperators: ["is_null", "is_not_null"],
+    });
+
+    const result = driver.buildFilterCondition(column, "is_null", undefined, 1);
+
+    expect(result).toEqual({
+      sql: `${quotedColumn} IS NULL`,
+      params: [],
+    });
+  });
+
+  it.each([
+    ["Postgres", pg, '"payload"'],
+    ["MySQL", my, "`payload`"],
+    ["MSSQL", ms, '"payload"'],
+    ["Oracle", ora, '"payload"'],
+    ["SQLite", lite, '"payload"'],
+  ] as const)("allows IS NOT NULL for non-filterable nullable columns in %s", (_name, driver, quotedColumn) => {
+    const column = col({
+      name: "payload",
+      type: "json",
+      category: "json",
+      nativeType: "json",
+      filterable: false,
+      nullable: true,
+      filterOperators: ["is_null", "is_not_null"],
+    });
+
+    const result = driver.buildFilterCondition(
+      column,
+      "is_not_null",
+      undefined,
+      1,
+    );
+
+    expect(result).toEqual({
+      sql: `${quotedColumn} IS NOT NULL`,
+      params: [],
+    });
+  });
+});
+
 // ────────────────────────────────────────────
 // PostgreSQL Driver
 // ────────────────────────────────────────────

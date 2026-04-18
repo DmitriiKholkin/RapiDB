@@ -270,6 +270,108 @@ describe("TableDataService", () => {
       expect(countCall[0]).not.toContain("WHERE");
     });
 
+    it("allows null-only filters for nullable non-filterable columns", async () => {
+      const cols = makeTestColumns();
+      cols[1] = {
+        ...cols[1],
+        filterable: false,
+        nullable: true,
+        filterOperators: ["is_null", "is_not_null"],
+      };
+      (driver.describeColumns as any).mockResolvedValue(cols);
+      (driver.buildFilterCondition as any).mockReturnValue({
+        sql: '"name" IS NULL',
+        params: [],
+      });
+      (driver.query as any)
+        .mockResolvedValueOnce({
+          columns: ["cnt"],
+          rows: [{ __col_0: 0 }],
+          rowCount: 1,
+          executionTimeMs: 0,
+        })
+        .mockResolvedValueOnce({
+          columns: [],
+          rows: [],
+          rowCount: 0,
+          executionTimeMs: 0,
+        });
+
+      await svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
+        { column: "name", operator: "is_null" },
+      ]);
+
+      expect(driver.buildFilterCondition).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "name", filterable: false }),
+        "is_null",
+        undefined,
+        1,
+      );
+      const countCall = (driver.query as any).mock.calls[0];
+      expect(countCall[0]).toContain("WHERE");
+    });
+
+    it("allows IS NOT NULL filters for nullable non-filterable columns", async () => {
+      const cols = makeTestColumns();
+      cols[1] = {
+        ...cols[1],
+        filterable: false,
+        nullable: true,
+        filterOperators: ["is_null", "is_not_null"],
+      };
+      (driver.describeColumns as any).mockResolvedValue(cols);
+      (driver.buildFilterCondition as any).mockReturnValue({
+        sql: '"name" IS NOT NULL',
+        params: [],
+      });
+      (driver.query as any)
+        .mockResolvedValueOnce({
+          columns: ["cnt"],
+          rows: [{ __col_0: 0 }],
+          rowCount: 1,
+          executionTimeMs: 0,
+        })
+        .mockResolvedValueOnce({
+          columns: [],
+          rows: [],
+          rowCount: 0,
+          executionTimeMs: 0,
+        });
+
+      await svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
+        { column: "name", operator: "is_not_null" },
+      ]);
+
+      expect(driver.buildFilterCondition).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "name", filterable: false }),
+        "is_not_null",
+        undefined,
+        1,
+      );
+      const countCall = (driver.query as any).mock.calls[0];
+      expect(countCall[0]).toContain("WHERE");
+    });
+
+    it("rejects null filters when the column does not expose is_null", async () => {
+      const cols = makeTestColumns();
+      cols[1] = {
+        ...cols[1],
+        filterable: false,
+        nullable: true,
+        filterOperators: ["is_not_null"],
+      };
+      (driver.describeColumns as any).mockResolvedValue(cols);
+
+      await expect(
+        svc.getPage("conn1", "testdb", "public", "users", 1, 25, [
+          { column: "name", operator: "is_null" },
+        ]),
+      ).rejects.toThrow("Column name does not support is_null filters");
+
+      expect(driver.buildFilterCondition).not.toHaveBeenCalled();
+      expect(driver.query).not.toHaveBeenCalled();
+    });
+
     it("skips COUNT when skipCount=true", async () => {
       const cols = makeTestColumns();
       (driver.describeColumns as any).mockResolvedValue(cols);

@@ -156,13 +156,18 @@ export abstract class BaseDBDriver implements IDBDriver {
     const category = this.mapTypeCategory(col.type);
     const filterable = this.isFilterable(col.type, category);
     const editable = this.isEditable(col.type, category);
+    const filterOperators = filterable
+      ? filterOperatorsForCategory(category)
+      : col.nullable
+        ? ["is_null", "is_not_null"]
+        : [];
     return {
       ...col,
       category,
       nativeType: col.type,
       filterable,
       editable,
-      filterOperators: filterable ? filterOperatorsForCategory(category) : [],
+      filterOperators,
       isBoolean: this.isBooleanType(col.type),
     };
   }
@@ -273,16 +278,17 @@ export abstract class BaseDBDriver implements IDBDriver {
     value: string | [string, string] | undefined,
     paramIndex: number,
   ): FilterConditionResult | null {
-    if (!column.filterable) return null;
-    if (value === undefined) return null;
-
     const col = this.quoteIdentifier(column.name);
-    const val = typeof value === "string" ? value.trim() : value;
 
     // Null checks
     if (operator === "is_null") return { sql: `${col} IS NULL`, params: [] };
     if (operator === "is_not_null")
       return { sql: `${col} IS NOT NULL`, params: [] };
+
+    if (!column.filterable) return null;
+    if (value === undefined) return null;
+
+    const val = typeof value === "string" ? value.trim() : value;
 
     // Boolean
     if (column.isBoolean && (operator === "eq" || operator === "neq")) {

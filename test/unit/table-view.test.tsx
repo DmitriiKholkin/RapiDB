@@ -9,7 +9,6 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TableView } from "../../src/webview/components/TableView";
 import type { ColumnMeta } from "../../src/webview/types";
@@ -186,5 +185,91 @@ describe("TableView", () => {
         }),
       );
     });
+  });
+
+  it("allows NULL-only filters while keeping the value input disabled", async () => {
+    render(
+      <TableView
+        connectionId="conn1"
+        database="db"
+        schema="public"
+        table="users"
+      />,
+    );
+
+    emit("tableInit", {
+      columns: [
+        makeColumn({
+          name: "payload",
+          type: "jsonb",
+          filterable: false,
+          editable: false,
+          filterOperators: ["is_null"],
+        }),
+      ],
+      primaryKeyColumns: [],
+    });
+    emit("tableData", {
+      rows: [{ payload: null }],
+      totalCount: 1,
+    });
+
+    const input = (await screen.findByRole("textbox")) as HTMLInputElement;
+    expect(input.disabled).toBe(true);
+    expect(input.placeholder).toBe("");
+
+    const nullButton = screen.getByRole("button", { name: "NULL" });
+    expect(nullButton).toBeEnabled();
+
+    fireEvent.click(nullButton);
+
+    await waitFor(() => {
+      expect(postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "fetchPage",
+          payload: expect.objectContaining({
+            filters: [{ column: "payload", operator: "is_null" }],
+          }),
+        }),
+      );
+    });
+
+    expect(input.disabled).toBe(true);
+    expect(input.placeholder).toBe("");
+  });
+
+  it("keeps NULL toggle disabled when is_null is unsupported", async () => {
+    render(
+      <TableView
+        connectionId="conn1"
+        database="db"
+        schema="public"
+        table="users"
+      />,
+    );
+
+    emit("tableInit", {
+      columns: [
+        makeColumn({
+          name: "notes",
+          type: "text",
+          filterable: false,
+          editable: false,
+          filterOperators: [],
+        }),
+      ],
+      primaryKeyColumns: [],
+    });
+    emit("tableData", {
+      rows: [{ notes: null }],
+      totalCount: 1,
+    });
+
+    const input = (await screen.findByRole("textbox")) as HTMLInputElement;
+    expect(input.disabled).toBe(true);
+    expect(input.placeholder).toBe("");
+
+    const nullButton = screen.getByRole("button", { name: "NULL" });
+    expect(nullButton).toBeDisabled();
   });
 });

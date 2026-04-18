@@ -158,18 +158,33 @@ export function defaultFilterOperator(
   return "like";
 }
 
+export function valueFilterOperator(
+  column: Pick<
+    ColumnMeta,
+    "category" | "filterable" | "filterOperators" | "isBoolean"
+  >,
+): "eq" | "like" | null {
+  if (!column.filterable) return null;
+  const operator = defaultFilterOperator(column);
+  return column.filterOperators.includes(operator) ? operator : null;
+}
+
 export function buildFilterExpression(
   column: ColumnMeta,
   rawValue: string,
 ): FilterExpression | null {
   const value = rawValue.trim();
-  if (!column.filterable || value === "") return null;
+  if (value === "") return null;
   if (value === NULL_SENTINEL) {
-    return { column: column.name, operator: "is_null" };
+    return column.filterOperators.includes("is_null")
+      ? { column: column.name, operator: "is_null" }
+      : null;
   }
+  const operator = valueFilterOperator(column);
+  if (!operator) return null;
   return {
     column: column.name,
-    operator: defaultFilterOperator(column),
+    operator,
     value,
   };
 }

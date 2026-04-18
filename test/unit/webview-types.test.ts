@@ -8,6 +8,7 @@ import {
   NULL_SENTINEL,
   placeholderForCategory,
   type TypeCategory,
+  valueFilterOperator,
 } from "../../src/webview/types";
 
 describe("NULL_SENTINEL", () => {
@@ -130,14 +131,66 @@ describe("buildFilterExpression", () => {
   });
 
   it("builds a NULL filter", () => {
-    expect(buildFilterExpression(column, NULL_SENTINEL)).toEqual({
+    expect(
+      buildFilterExpression(
+        { ...column, filterOperators: ["like", "is_null"] },
+        NULL_SENTINEL,
+      ),
+    ).toEqual({
       column: "name",
       operator: "is_null",
     });
   });
 
+  it("skips NULL filters when is_null is not supported", () => {
+    expect(buildFilterExpression(column, NULL_SENTINEL)).toBeNull();
+  });
+
+  it("skips value filters when the default operator is not supported", () => {
+    expect(
+      buildFilterExpression({ ...column, filterOperators: ["eq"] }, "alice"),
+    ).toBeNull();
+  });
+
+  it("skips value filters for non-filterable columns", () => {
+    expect(
+      buildFilterExpression(
+        {
+          ...column,
+          filterable: false,
+          filterOperators: ["like", "is_null"],
+        },
+        "alice",
+      ),
+    ).toBeNull();
+  });
+
   it("skips empty values", () => {
     expect(buildFilterExpression(column, "   ")).toBeNull();
+  });
+});
+
+describe("valueFilterOperator", () => {
+  it("returns the default operator when value filtering is supported", () => {
+    expect(
+      valueFilterOperator({
+        category: "text",
+        filterable: true,
+        filterOperators: ["like", "is_null"],
+        isBoolean: false,
+      }),
+    ).toBe("like");
+  });
+
+  it("returns null when the default operator is unavailable", () => {
+    expect(
+      valueFilterOperator({
+        category: "text",
+        filterable: true,
+        filterOperators: ["eq", "is_null"],
+        isBoolean: false,
+      }),
+    ).toBeNull();
   });
 });
 
