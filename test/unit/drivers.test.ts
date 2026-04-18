@@ -1,10 +1,16 @@
+import * as mssql from "mssql";
 import oracledb from "oracledb";
 import { describe, expect, it, vi } from "vitest";
+import type { BaseDBDriver } from "../../src/extension/dbDrivers/BaseDBDriver";
 import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
 import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
 import { OracleDriver } from "../../src/extension/dbDrivers/oracle";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
+import type {
+  ColumnMeta,
+  ColumnTypeMeta,
+} from "../../src/extension/dbDrivers/types";
 import { col } from "./helpers";
 
 // Minimal configs for instantiation (no connection needed for pure methods)
@@ -60,6 +66,41 @@ const my = new MySQLDriver(myConfig);
 const ms = new MSSQLDriver(msConfig);
 const ora = new OracleDriver(oraConfig);
 const lite = new SQLiteDriver(sqliteConfig);
+
+function mssqlTypeName(sqlType: unknown): string {
+  if (typeof sqlType === "function") {
+    return sqlType.name;
+  }
+
+  if (sqlType && typeof sqlType === "object" && "type" in sqlType) {
+    const nestedType = (sqlType as { type?: unknown }).type;
+    return typeof nestedType === "function" ? nestedType.name : "";
+  }
+
+  return "";
+}
+
+function enrichTestColumn(
+  driver: BaseDBDriver,
+  column: ColumnMeta,
+): ColumnTypeMeta {
+  return (
+    driver as unknown as {
+      enrichColumn: (value: ColumnMeta) => ColumnTypeMeta;
+    }
+  ).enrichColumn(column);
+}
+
+function setSqliteDb(
+  driver: SQLiteDriver,
+  db: {
+    isOpen: boolean;
+    all: (sql: string) => unknown;
+    run: (sql: string) => { changes: number };
+  },
+): void {
+  (driver as unknown as { db: typeof db }).db = db;
+}
 
 const oraInternals = ora as unknown as {
   _fallbackDDL: (
@@ -319,6 +360,32 @@ describe("PostgresDriver", () => {
       });
       expect(pg.coerceInputValue("2024-06-15T10:30:00Z", c)).toBe("2024-06-15");
     });
+
+    it("normalizes cidr values for insert and update operations", () => {
+      const c = col({
+        name: "network",
+        type: "cidr",
+        category: "text",
+        nativeType: "cidr",
+      });
+
+      expect(pg.coerceInputValue("192.168.10.42/24", c)).toBe(
+        "192.168.10.0/24",
+      );
+    });
+
+    it("converts circle JSON payloads to PostgreSQL circle literals", () => {
+      const c = col({
+        name: "coverage",
+        type: "circle",
+        category: "spatial",
+        nativeType: "circle",
+      });
+
+      expect(pg.coerceInputValue('{"x":10.5,"y":-3.25,"radius":7}', c)).toBe(
+        "<(10.5,-3.25),7>",
+      );
+    });
   });
 
   describe("formatOutputValue", () => {
@@ -335,6 +402,19 @@ describe("PostgresDriver", () => {
     it("converts bigint to string", () => {
       const c = col({ name: "n", type: "bigint", category: "integer" });
       expect(pg.formatOutputValue(BigInt(42), c)).toBe("42");
+    });
+
+    it("normalizes timestamp display strings for schema and grid rendering", () => {
+      const c = col({
+        name: "created_at",
+        type: "timestamp with time zone",
+        category: "datetime",
+        nativeType: "timestamp with time zone",
+      });
+
+      expect(pg.formatOutputValue("2024-06-15 10:30:45.123456+00:00", c)).toBe(
+        "2024-06-15 10:30:45.123+00:00",
+      );
     });
   });
 
@@ -368,6 +448,57 @@ describe("PostgresDriver", () => {
       const r = pg.buildFilterCondition(c, "eq", "2024-06-15", 1);
       expect(r?.sql).toContain("::date");
     });
+
+    it("uses bigint params for bigint equality filters", () => {
+      const c = col({
+        name: "id",
+        type: "bigint",
+        category: "integer",
+        nativeType: "bigint",
+      });
+
+      expect(
+        pg.buildFilterCondition(c, "eq", "9223372036854775807", 1),
+      ).toEqual({
+        sql: '"id" = $1',
+        params: [BigInt("9223372036854775807")],
+      });
+    });
+
+    it("uses textual ILIKE matching for time equality filters", () => {
+      const c = col({
+        name: "starts_at",
+        type: "time with time zone",
+        category: "time",
+        nativeType: "time with time zone",
+      });
+
+      expect(pg.buildFilterCondition(c, "eq", "10:30", 3)).toEqual({
+        sql: 'CAST("starts_at" AS TEXT) ILIKE $3',
+        params: ["%10:30%"],
+      });
+    });
+
+    it("uses typed timestamp bounds for datetime range filters", () => {
+      const c = col({
+        name: "created_at",
+        type: "timestamp with time zone",
+        category: "datetime",
+        nativeType: "timestamp with time zone",
+      });
+
+      expect(
+        pg.buildFilterCondition(
+          c,
+          "between",
+          ["2024-06-01T00:00:00Z", "2024-06-30T23:59:59Z"],
+          2,
+        ),
+      ).toEqual({
+        sql: '"created_at" BETWEEN $2::timestamp AND $3::timestamp',
+        params: ["2024-06-01T00:00:00Z", "2024-06-30T23:59:59Z"],
+      });
+    });
   });
 
   describe("enrichColumn", () => {
@@ -377,7 +508,7 @@ describe("PostgresDriver", () => {
       "polygon",
       "circle",
     ])("marks geometric %s columns as read-only", (type) => {
-      const result = (pg as any).enrichColumn({
+      const result = enrichTestColumn(pg, {
         name: "geom_col",
         type,
         nullable: true,
@@ -388,7 +519,7 @@ describe("PostgresDriver", () => {
     });
 
     it("keeps interval columns editable", () => {
-      const result = (pg as any).enrichColumn({
+      const result = enrichTestColumn(pg, {
         name: "duration_col",
         type: "interval",
         nullable: true,
@@ -396,6 +527,403 @@ describe("PostgresDriver", () => {
         isForeignKey: false,
       });
       expect(result.editable).toBe(true);
+    });
+  });
+
+  describe("describeColumns", () => {
+    it("keeps schema metadata aligned with filter and edit capabilities", async () => {
+      const describeTableSpy = vi.spyOn(pg, "describeTable").mockResolvedValue([
+        {
+          name: "tags",
+          type: "text[]",
+          nullable: true,
+          isPrimaryKey: false,
+          isForeignKey: false,
+        },
+        {
+          name: "duration",
+          type: "interval",
+          nullable: true,
+          isPrimaryKey: false,
+          isForeignKey: false,
+        },
+        {
+          name: "location",
+          type: "point",
+          nullable: true,
+          isPrimaryKey: false,
+          isForeignKey: false,
+        },
+        {
+          name: "payload",
+          type: "jsonb",
+          nullable: true,
+          isPrimaryKey: false,
+          isForeignKey: false,
+        },
+      ]);
+
+      const result = await pg.describeColumns("appdb", "public", "events");
+
+      expect(result).toEqual([
+        expect.objectContaining({
+          name: "tags",
+          category: "array",
+          filterable: false,
+          editable: true,
+        }),
+        expect.objectContaining({
+          name: "duration",
+          category: "interval",
+          filterable: false,
+          editable: true,
+        }),
+        expect.objectContaining({
+          name: "location",
+          category: "spatial",
+          filterable: false,
+          editable: false,
+        }),
+        expect.objectContaining({
+          name: "payload",
+          category: "json",
+          filterable: true,
+          editable: true,
+        }),
+      ]);
+
+      describeTableSpy.mockRestore();
+    });
+  });
+
+  describe("describeTable", () => {
+    it("preserves composite PK ordinals and auto-increment metadata", async () => {
+      const query = vi.fn().mockResolvedValue({
+        rows: [
+          {
+            column_name: "tenant_id",
+            data_type: "integer",
+            is_nullable: false,
+            column_default: null,
+            identity_kind: null,
+            is_pk: true,
+            pk_ordinal: 2,
+            is_fk: true,
+          },
+          {
+            column_name: "user_id",
+            data_type: "integer",
+            is_nullable: false,
+            column_default:
+              "nextval('public.user_roles_user_id_seq'::regclass)",
+            identity_kind: null,
+            is_pk: true,
+            pk_ordinal: 1,
+            is_fk: false,
+          },
+          {
+            column_name: "payload",
+            data_type: "jsonb",
+            is_nullable: true,
+            column_default: null,
+            identity_kind: null,
+            is_pk: false,
+            pk_ordinal: null,
+            is_fk: false,
+          },
+        ],
+      });
+
+      (pg as unknown as { pool: { query: typeof query } }).pool = { query };
+
+      const result = await pg.describeTable("appdb", "public", "user_roles");
+      const [sql, params] = query.mock.calls[0] ?? [];
+
+      expect(sql).toContain("WITH ORDINALITY");
+      expect(sql).toContain("pk.pk_ordinal");
+      expect(params).toEqual(["public", "user_roles"]);
+      expect(result).toEqual([
+        {
+          name: "tenant_id",
+          type: "integer",
+          nullable: false,
+          defaultValue: undefined,
+          isPrimaryKey: true,
+          primaryKeyOrdinal: 2,
+          isForeignKey: true,
+          isAutoIncrement: false,
+        },
+        {
+          name: "user_id",
+          type: "integer",
+          nullable: false,
+          defaultValue: undefined,
+          isPrimaryKey: true,
+          primaryKeyOrdinal: 1,
+          isForeignKey: false,
+          isAutoIncrement: true,
+        },
+        {
+          name: "payload",
+          type: "jsonb",
+          nullable: true,
+          defaultValue: undefined,
+          isPrimaryKey: false,
+          primaryKeyOrdinal: undefined,
+          isForeignKey: false,
+          isAutoIncrement: false,
+        },
+      ]);
+    });
+
+    it("treats GENERATED AS IDENTITY columns as auto-increment", async () => {
+      const query = vi.fn().mockResolvedValue({
+        rows: [
+          {
+            column_name: "id",
+            data_type: "bigint",
+            is_nullable: false,
+            column_default: null,
+            identity_kind: "d",
+            is_pk: true,
+            pk_ordinal: 1,
+            is_fk: false,
+          },
+        ],
+      });
+
+      (pg as unknown as { pool: { query: typeof query } }).pool = { query };
+
+      await expect(
+        pg.describeTable("appdb", "public", "events"),
+      ).resolves.toEqual([
+        {
+          name: "id",
+          type: "bigint",
+          nullable: false,
+          defaultValue: undefined,
+          isPrimaryKey: true,
+          primaryKeyOrdinal: 1,
+          isForeignKey: false,
+          isAutoIncrement: true,
+        },
+      ]);
+    });
+  });
+
+  describe("getIndexes", () => {
+    it("preserves actual index key order from catalog ordinality", async () => {
+      const query = vi.fn().mockResolvedValue({
+        rows: [
+          {
+            name: "user_roles_lookup_idx",
+            unique: false,
+            primary: false,
+            column: "user_id",
+          },
+          {
+            name: "user_roles_lookup_idx",
+            unique: false,
+            primary: false,
+            column: "tenant_id",
+          },
+          {
+            name: "user_roles_pkey",
+            unique: true,
+            primary: true,
+            column: "tenant_id",
+          },
+          {
+            name: "user_roles_pkey",
+            unique: true,
+            primary: true,
+            column: "user_id",
+          },
+        ],
+      });
+
+      (pg as unknown as { pool: { query: typeof query } }).pool = { query };
+
+      const result = await pg.getIndexes("appdb", "public", "user_roles");
+      const [sql, params] = query.mock.calls[0] ?? [];
+
+      expect(sql).toContain("WITH ORDINALITY");
+      expect(sql).toContain("idx.key_ordinal");
+      expect(params).toEqual(["public", "user_roles"]);
+      expect(result).toEqual([
+        {
+          name: "user_roles_lookup_idx",
+          columns: ["user_id", "tenant_id"],
+          unique: false,
+          primary: false,
+        },
+        {
+          name: "user_roles_pkey",
+          columns: ["tenant_id", "user_id"],
+          unique: true,
+          primary: true,
+        },
+      ]);
+    });
+
+    it("keeps expression index entries visible in schema metadata", async () => {
+      const query = vi.fn().mockResolvedValue({
+        rows: [
+          {
+            name: "users_email_lower_idx",
+            unique: true,
+            primary: false,
+            column: "lower(email)",
+          },
+        ],
+      });
+
+      (pg as unknown as { pool: { query: typeof query } }).pool = { query };
+
+      const result = await pg.getIndexes("appdb", "public", "users");
+      const [sql] = query.mock.calls[0] ?? [];
+
+      expect(sql).toContain("pg_get_indexdef");
+      expect(result).toEqual([
+        {
+          name: "users_email_lower_idx",
+          columns: ["lower(email)"],
+          unique: true,
+          primary: false,
+        },
+      ]);
+    });
+  });
+
+  describe("getForeignKeys", () => {
+    it("pairs local and referenced columns by ordinality", async () => {
+      const query = vi.fn().mockResolvedValue({
+        rows: [
+          {
+            constraint_name: "user_roles_account_fk",
+            column_name: "tenant_id",
+            ref_schema: "public",
+            ref_table: "accounts",
+            ref_column: "tenant_id",
+          },
+          {
+            constraint_name: "user_roles_account_fk",
+            column_name: "account_id",
+            ref_schema: "public",
+            ref_table: "accounts",
+            ref_column: "id",
+          },
+        ],
+      });
+
+      (pg as unknown as { pool: { query: typeof query } }).pool = { query };
+
+      const result = await pg.getForeignKeys("appdb", "public", "user_roles");
+      const [sql, params] = query.mock.calls[0] ?? [];
+
+      expect(sql).toContain("unnest(con.conkey, con.confkey) WITH ORDINALITY");
+      expect(params).toEqual(["public", "user_roles"]);
+      expect(result).toEqual([
+        {
+          constraintName: "user_roles_account_fk",
+          column: "tenant_id",
+          referencedSchema: "public",
+          referencedTable: "accounts",
+          referencedColumn: "tenant_id",
+        },
+        {
+          constraintName: "user_roles_account_fk",
+          column: "account_id",
+          referencedSchema: "public",
+          referencedTable: "accounts",
+          referencedColumn: "id",
+        },
+      ]);
+    });
+  });
+
+  describe("getCreateTableDDL", () => {
+    it("emits a table-level PRIMARY KEY clause for composite keys", async () => {
+      const query = vi
+        .fn()
+        .mockResolvedValueOnce({ rows: [{ table_type: "BASE TABLE" }] })
+        .mockResolvedValueOnce({
+          rows: [
+            {
+              column_name: "tenant_id",
+              data_type: "integer",
+              is_nullable: false,
+              column_default: null,
+              identity_kind: null,
+            },
+            {
+              column_name: "user_id",
+              data_type: "integer",
+              is_nullable: false,
+              column_default: null,
+              identity_kind: null,
+            },
+            {
+              column_name: "display_name",
+              data_type: '"DisplayNameDomain"',
+              is_nullable: false,
+              column_default: "'guest'::text",
+              identity_kind: null,
+            },
+          ],
+        })
+        .mockResolvedValueOnce({
+          rows: [
+            { column_name: "tenant_id", key_ordinal: 1 },
+            { column_name: "user_id", key_ordinal: 2 },
+          ],
+        });
+
+      (pg as unknown as { pool: { query: typeof query } }).pool = { query };
+
+      const ddl = await pg.getCreateTableDDL("appdb", "public", "user_roles");
+
+      expect(ddl).toBe(
+        `CREATE TABLE "public"."user_roles" (\n  "tenant_id" integer,\n  "user_id" integer,\n  "display_name" "DisplayNameDomain" NOT NULL DEFAULT 'guest'::text,\n  PRIMARY KEY ("tenant_id", "user_id")\n);`,
+      );
+      expect(ddl).not.toContain('"tenant_id" integer PRIMARY KEY');
+      expect(ddl).not.toContain('"user_id" integer PRIMARY KEY');
+      expect(query).toHaveBeenCalledTimes(3);
+    });
+
+    it("preserves PostgreSQL identity clauses in generated DDL", async () => {
+      const query = vi
+        .fn()
+        .mockResolvedValueOnce({ rows: [{ table_type: "BASE TABLE" }] })
+        .mockResolvedValueOnce({
+          rows: [
+            {
+              column_name: "id",
+              data_type: "bigint",
+              is_nullable: false,
+              column_default: null,
+              identity_kind: "a",
+            },
+            {
+              column_name: "title",
+              data_type: "text",
+              is_nullable: false,
+              column_default: null,
+              identity_kind: null,
+            },
+          ],
+        })
+        .mockResolvedValueOnce({
+          rows: [{ column_name: "id", key_ordinal: 1 }],
+        });
+
+      (pg as unknown as { pool: { query: typeof query } }).pool = { query };
+
+      await expect(
+        pg.getCreateTableDDL("appdb", "public", "articles"),
+      ).resolves.toBe(
+        `CREATE TABLE "public"."articles" (\n  "id" bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n  "title" text NOT NULL\n);`,
+      );
     });
   });
 });
@@ -415,12 +943,15 @@ describe("MySQLDriver", () => {
       ["bit(8)", "integer"],
       ["year", "integer"],
       ["int", "integer"],
+      ["int unsigned", "integer"],
+      ["bigint unsigned zerofill", "integer"],
       ["integer", "integer"],
       ["mediumint", "integer"],
       ["bigint", "integer"],
       ["decimal(10,2)", "decimal"],
       ["numeric(5,3)", "decimal"],
       ["float", "float"],
+      ["double unsigned", "float"],
       ["double", "float"],
       ["real", "float"],
       ["json", "json"],
@@ -442,7 +973,9 @@ describe("MySQLDriver", () => {
       ["longblob", "binary"],
       ["date", "date"],
       ["datetime", "datetime"],
+      ["datetime(6)", "datetime"],
       ["timestamp", "datetime"],
+      ["timestamp(6)", "datetime"],
       ["time", "time"],
     ] as const)("maps %s → %s", (input, expected) => {
       expect(my.mapTypeCategory(input)).toBe(expected);
@@ -452,6 +985,7 @@ describe("MySQLDriver", () => {
   describe("isBooleanType", () => {
     it("true for tinyint(1), bit(1), boolean", () => {
       expect(my.isBooleanType("tinyint(1)")).toBe(true);
+      expect(my.isBooleanType("tinyint(1) unsigned")).toBe(true);
       expect(my.isBooleanType("bit(1)")).toBe(true);
       expect(my.isBooleanType("boolean")).toBe(true);
     });
@@ -464,7 +998,9 @@ describe("MySQLDriver", () => {
   describe("isDatetimeWithTime", () => {
     it("true for datetime, timestamp", () => {
       expect(my.isDatetimeWithTime("datetime")).toBe(true);
+      expect(my.isDatetimeWithTime("datetime(6)")).toBe(true);
       expect(my.isDatetimeWithTime("timestamp")).toBe(true);
+      expect(my.isDatetimeWithTime("timestamp(6)")).toBe(true);
     });
     it("false for date, time", () => {
       expect(my.isDatetimeWithTime("date")).toBe(false);
@@ -547,6 +1083,28 @@ describe("MySQLDriver", () => {
       expect(result).toBe("2024-06-15 10:30:45.123");
     });
 
+    it("preserves up to 6 fractional digits for datetime conversion", () => {
+      const c = col({
+        name: "dt",
+        type: "datetime(6)",
+        category: "datetime",
+        nativeType: "datetime(6)",
+      });
+      const result = my.coerceInputValue("2024-06-15T10:30:45.123456Z", c);
+      expect(result).toBe("2024-06-15 10:30:45.123456");
+    });
+
+    it("normalizes pre-epoch timezone-aware datetimes without corrupting microseconds", () => {
+      const c = col({
+        name: "dt",
+        type: "datetime(6)",
+        category: "datetime",
+        nativeType: "datetime(6)",
+      });
+      const result = my.coerceInputValue("1969-12-31T23:59:59.999999Z", c);
+      expect(result).toBe("1969-12-31 23:59:59.999999");
+    });
+
     it("normalizes ISO datetime input to date-only text for date columns", () => {
       const c = col({
         name: "d",
@@ -555,6 +1113,32 @@ describe("MySQLDriver", () => {
         nativeType: "date",
       });
       expect(my.coerceInputValue("2024-06-15T10:30:45Z", c)).toBe("2024-06-15");
+    });
+
+    it("rejects impossible DATE inputs instead of normalizing them", () => {
+      const c = col({
+        name: "d",
+        type: "date",
+        category: "date",
+        nativeType: "date",
+      });
+
+      expect(() => my.coerceInputValue("2024-02-30", c)).toThrow(
+        "expects a valid DATE value",
+      );
+    });
+
+    it("rejects impossible DATETIME inputs instead of normalizing them", () => {
+      const c = col({
+        name: "dt",
+        type: "datetime(6)",
+        category: "datetime",
+        nativeType: "datetime(6)",
+      });
+
+      expect(() =>
+        my.coerceInputValue("2024-02-30 25:30:45.123456", c),
+      ).toThrow("expects a valid DATETIME value");
     });
 
     it.each([
@@ -604,6 +1188,18 @@ describe("MySQLDriver", () => {
     it("JSON.stringify for objects", () => {
       const c = col({ name: "j", type: "json", category: "json" });
       expect(my.formatOutputValue({ x: 1 }, c)).toBe('{"x":1}');
+    });
+
+    it("preserves 6-digit datetime strings for display", () => {
+      const c = col({
+        name: "dt",
+        type: "datetime(6)",
+        category: "datetime",
+        nativeType: "datetime(6)",
+      });
+      expect(my.formatOutputValue("2024-06-15 10:30:45.123456", c)).toBe(
+        "2024-06-15 10:30:45.123456",
+      );
     });
   });
 
@@ -687,6 +1283,34 @@ describe("MySQLDriver", () => {
       expect(r?.params).toEqual([1.25, 0.000001, 1.25, 0.000001]);
     });
 
+    it("uses typed numeric comparisons for YEAR range filters", () => {
+      const c = col({
+        name: "release_year",
+        type: "year",
+        category: "integer",
+        nativeType: "year",
+      });
+      const r = my.buildFilterCondition(c, "gt", "2024", 1);
+      expect(r).toEqual({
+        sql: "`release_year` > ?",
+        params: [2024],
+      });
+    });
+
+    it("limits approximate float tolerance handling to eq/neq", () => {
+      const c = col({
+        name: "score",
+        type: "float",
+        category: "float",
+        nativeType: "float",
+      });
+      const r = my.buildFilterCondition(c, "gt", "0.1", 1);
+      expect(r).toEqual({
+        sql: "`score` > ?",
+        params: [0.1],
+      });
+    });
+
     it("uses typed comparison for date equality filters", () => {
       const c = col({
         name: "created_on",
@@ -697,6 +1321,82 @@ describe("MySQLDriver", () => {
       const r = my.buildFilterCondition(c, "eq", "2026-04-15", 1);
       expect(r?.sql).toBe("`created_on` = CAST(? AS DATE)");
       expect(r?.params).toEqual(["2026-04-15"]);
+    });
+  });
+
+  describe("describeTable", () => {
+    it("uses constraint metadata instead of COLUMN_KEY=MUL and preserves PK ordinals", async () => {
+      const query = vi.fn().mockResolvedValue([
+        [
+          {
+            COLUMN_NAME: "lookup_id",
+            COLUMN_TYPE: "int unsigned",
+            IS_NULLABLE: "NO",
+            COLUMN_DEFAULT: null,
+            COLUMN_KEY: "MUL",
+            EXTRA: "",
+            IS_PRIMARY_KEY: 0,
+            PRIMARY_KEY_ORDINAL: null,
+            IS_FOREIGN_KEY: 0,
+          },
+          {
+            COLUMN_NAME: "tenant_id",
+            COLUMN_TYPE: "int",
+            IS_NULLABLE: "NO",
+            COLUMN_DEFAULT: null,
+            EXTRA: "auto_increment",
+            IS_PRIMARY_KEY: 1,
+            PRIMARY_KEY_ORDINAL: 2,
+            IS_FOREIGN_KEY: 1,
+          },
+        ],
+      ]);
+
+      (my as unknown as { pool: { query: typeof query } }).pool = { query };
+
+      const result = await my.describeTable("appdb", "", "orders");
+
+      expect(query).toHaveBeenCalledWith(
+        expect.stringContaining("TABLE_CONSTRAINTS"),
+        ["appdb", "orders", "appdb", "orders", "appdb", "orders"],
+      );
+      expect(result).toEqual([
+        expect.objectContaining({
+          name: "lookup_id",
+          isPrimaryKey: false,
+          primaryKeyOrdinal: undefined,
+          isForeignKey: false,
+        }),
+        expect.objectContaining({
+          name: "tenant_id",
+          isPrimaryKey: true,
+          primaryKeyOrdinal: 2,
+          isForeignKey: true,
+          isAutoIncrement: true,
+        }),
+      ]);
+    });
+  });
+
+  describe("query parsing", () => {
+    it("decodes BIT values wider than 48 bits to bigint without truncation", () => {
+      const result = (
+        my as unknown as {
+          _parseQueryResult: (
+            rawRows: unknown,
+            fields: unknown[],
+            executionTimeMs: number,
+          ) => {
+            rows: Array<Record<string, unknown>>;
+          };
+        }
+      )._parseQueryResult(
+        [[Buffer.from([0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef])]],
+        [{ name: "flags", type: 16, length: 64 }],
+        1,
+      );
+
+      expect(result.rows[0]?.__col_0).toBe(BigInt("0x0123456789abcdef"));
     });
   });
 });
@@ -783,6 +1483,20 @@ describe("MSSQLDriver", () => {
     });
   });
 
+  describe("mutation placeholders", () => {
+    it("casts decimal inserts to the declared MSSQL type", () => {
+      const c = col({
+        name: "amount",
+        type: "decimal(10,2)",
+        category: "decimal",
+        nativeType: "decimal(10,2)",
+      });
+
+      expect(ms.buildInsertValueExpr(c, 1)).toBe("CAST(? AS decimal(10,2))");
+      expect(ms.buildSetExpr(c, 1)).toBe("[amount] = CAST(? AS decimal(10,2))");
+    });
+  });
+
   describe("buildOrderByDefault", () => {
     it("falls back to (SELECT NULL) when no columns", () => {
       expect(ms.buildOrderByDefault([])).toBe("ORDER BY (SELECT NULL)");
@@ -793,6 +1507,27 @@ describe("MSSQLDriver", () => {
         col({ name: "name", type: "text" }),
       ];
       expect(ms.buildOrderByDefault(cols)).toContain("[id]");
+    });
+
+    it("uses all PK columns in ordinal order for composite keys", () => {
+      const cols = [
+        col({
+          name: "tenant_id",
+          type: "int",
+          isPrimaryKey: true,
+          primaryKeyOrdinal: 2,
+        }),
+        col({
+          name: "user_id",
+          type: "int",
+          isPrimaryKey: true,
+          primaryKeyOrdinal: 1,
+        }),
+      ];
+
+      expect(ms.buildOrderByDefault(cols)).toBe(
+        "ORDER BY [user_id], [tenant_id]",
+      );
     });
   });
 
@@ -819,7 +1554,7 @@ describe("MSSQLDriver", () => {
       expect(Buffer.isBuffer(r)).toBe(true);
     });
 
-    it("converts time string to Date for time columns", () => {
+    it("keeps time strings for time columns", () => {
       const c = col({
         name: "t",
         type: "time(7)",
@@ -827,7 +1562,102 @@ describe("MSSQLDriver", () => {
         nativeType: "time(7)",
       });
       const r = ms.coerceInputValue("10:30:00", c);
-      expect(r).toBeInstanceOf(Date);
+      expect(r).toBe("10:30:00");
+    });
+
+    it("coerces bigint strings using column metadata", () => {
+      const c = col({
+        name: "id",
+        type: "bigint",
+        category: "integer",
+        nativeType: "bigint",
+      });
+
+      expect(ms.coerceInputValue("9223372036854775807", c)).toBe(
+        BigInt("9223372036854775807"),
+      );
+    });
+
+    it("normalizes date inputs for date columns", () => {
+      const c = col({
+        name: "d",
+        type: "date",
+        category: "date",
+        nativeType: "date",
+      });
+
+      expect(ms.coerceInputValue("2026-04-15 00:00:00 +00:00", c)).toBe(
+        "2026-04-15",
+      );
+    });
+
+    it("preserves leading and trailing whitespace for plain text values", () => {
+      const c = col({
+        name: "display_name",
+        type: "nvarchar(100)",
+        category: "text",
+        nativeType: "nvarchar(100)",
+      });
+
+      expect(ms.coerceInputValue("  Alice  ", c)).toBe("  Alice  ");
+    });
+  });
+
+  describe("describeTable", () => {
+    it("preserves composite primary key ordinals from metadata", async () => {
+      const request = {
+        query: vi.fn().mockResolvedValue({
+          recordset: [
+            {
+              COLUMN_NAME: "tenant_id",
+              DATA_TYPE: "int",
+              max_length: 4,
+              precision: 10,
+              scale: 0,
+              IS_NULLABLE: 0,
+              is_identity: 0,
+              COLUMN_DEFAULT: null,
+              IS_PK: 1,
+              PK_ORDINAL: 2,
+              IS_FK: 0,
+            },
+            {
+              COLUMN_NAME: "user_id",
+              DATA_TYPE: "int",
+              max_length: 4,
+              precision: 10,
+              scale: 0,
+              IS_NULLABLE: 0,
+              is_identity: 0,
+              COLUMN_DEFAULT: null,
+              IS_PK: 1,
+              PK_ORDINAL: 1,
+              IS_FK: 1,
+            },
+          ],
+        }),
+      };
+
+      (ms as unknown as { pool: { request: () => typeof request } }).pool = {
+        request: () => request,
+      };
+
+      const result = await ms.describeTable("appdb", "dbo", "user_roles");
+
+      expect(result).toEqual([
+        expect.objectContaining({
+          name: "tenant_id",
+          isPrimaryKey: true,
+          primaryKeyOrdinal: 2,
+          isForeignKey: false,
+        }),
+        expect.objectContaining({
+          name: "user_id",
+          isPrimaryKey: true,
+          primaryKeyOrdinal: 1,
+          isForeignKey: true,
+        }),
+      ]);
     });
   });
 
@@ -875,9 +1705,213 @@ describe("MSSQLDriver", () => {
     });
   });
 
+  describe("query execution", () => {
+    it("creates a dedicated ConnectionPool per driver instance", async () => {
+      const fakeConnectedPool = {
+        connected: true,
+        close: vi.fn(),
+      } as unknown as mssql.ConnectionPool;
+      const connectInstances: mssql.ConnectionPool[] = [];
+      const connectSpy = vi
+        .spyOn(mssql.ConnectionPool.prototype, "connect")
+        .mockImplementation(async function (this: mssql.ConnectionPool) {
+          connectInstances.push(this);
+          return fakeConnectedPool;
+        });
+      const onSpy = vi
+        .spyOn(mssql.ConnectionPool.prototype, "on")
+        .mockImplementation(function (this: mssql.ConnectionPool) {
+          return this;
+        });
+
+      try {
+        const firstDriver = new MSSQLDriver(msConfig);
+        const secondDriver = new MSSQLDriver({ ...msConfig, id: "t-2" });
+
+        await firstDriver.connect();
+        await secondDriver.connect();
+
+        expect(connectSpy).toHaveBeenCalledTimes(2);
+        expect(connectInstances).toHaveLength(2);
+        expect(connectInstances[0]).not.toBe(connectInstances[1]);
+        expect(onSpy).toHaveBeenCalledWith("error", expect.any(Function));
+        expect(firstDriver.isConnected()).toBe(true);
+        expect(secondDriver.isConnected()).toBe(true);
+      } finally {
+        connectSpy.mockRestore();
+        onSpy.mockRestore();
+      }
+    });
+
+    it("uses arrayRowMode and preserves duplicate column names", async () => {
+      const query = vi.fn().mockResolvedValue({
+        recordset: [[1, "Alice", 2]],
+        rowsAffected: [1],
+        columns: [
+          [
+            {
+              index: 0,
+              name: "id",
+              type: mssql.Int,
+              nullable: false,
+              identity: false,
+              readOnly: false,
+            },
+            {
+              index: 1,
+              name: "name",
+              type: mssql.NVarChar,
+              nullable: false,
+              identity: false,
+              readOnly: false,
+            },
+            {
+              index: 2,
+              name: "id",
+              type: mssql.Int,
+              nullable: false,
+              identity: false,
+              readOnly: false,
+            },
+          ],
+        ],
+      });
+      const request = {
+        arrayRowMode: false,
+        input: vi.fn(),
+        query,
+      };
+
+      (ms as unknown as { pool: { request: () => typeof request } }).pool = {
+        request: () => request,
+      };
+
+      const result = await (
+        ms as unknown as {
+          _executeBatch: (
+            sql: string,
+            params?: unknown[],
+          ) => Promise<{
+            columns: string[];
+            rows: Array<Record<string, unknown>>;
+          }>;
+        }
+      )._executeBatch("SELECT 1", []);
+
+      expect(request.arrayRowMode).toBe(true);
+      expect(result.columns).toEqual(["id", "name", "id"]);
+      expect(result.rows).toEqual([
+        { __col_0: 1, __col_1: "Alice", __col_2: 2 },
+      ]);
+    });
+
+    it("binds temporal strings using explicit MSSQL parameter types", async () => {
+      const input = vi.fn();
+      const query = vi.fn().mockResolvedValue({
+        recordset: [],
+        rowsAffected: [0],
+        columns: [[]],
+      });
+      const request = {
+        arrayRowMode: false,
+        input,
+        query,
+      };
+
+      (ms as unknown as { pool: { request: () => typeof request } }).pool = {
+        request: () => request,
+      };
+
+      await (
+        ms as unknown as {
+          _executeBatch: (sql: string, params?: unknown[]) => Promise<unknown>;
+        }
+      )._executeBatch("SELECT ?, ?, ?", [
+        "2026-04-15",
+        "10:30:00.1234",
+        "2026-04-15T10:30:00+02:00",
+      ]);
+
+      expect(input).toHaveBeenNthCalledWith(
+        1,
+        "p1",
+        expect.anything(),
+        "2026-04-15",
+      );
+      expect(input).toHaveBeenNthCalledWith(
+        2,
+        "p2",
+        expect.anything(),
+        "10:30:00.1234",
+      );
+      expect(input).toHaveBeenNthCalledWith(
+        3,
+        "p3",
+        expect.anything(),
+        "2026-04-15T10:30:00+02:00",
+      );
+      expect(
+        input.mock.calls.map(([, sqlType]) => mssqlTypeName(sqlType)),
+      ).toEqual(["Date", "Time", "DateTimeOffset"]);
+    });
+  });
+
+  describe("getCreateTableDDL", () => {
+    it("builds composite primary keys in ordinal order with escaped identifiers", async () => {
+      const request = {
+        query: vi.fn().mockResolvedValue({
+          recordset: [
+            {
+              COLUMN_NAME: "tenant_id",
+              DATA_TYPE: "int",
+              max_length: 4,
+              precision: 10,
+              scale: 0,
+              IS_NULLABLE: 0,
+              is_identity: 0,
+              COLUMN_DEFAULT: null,
+              IS_PK: 1,
+              PK_ORDINAL: 2,
+            },
+            {
+              COLUMN_NAME: "user_id",
+              DATA_TYPE: "int",
+              max_length: 4,
+              precision: 10,
+              scale: 0,
+              IS_NULLABLE: 0,
+              is_identity: 0,
+              COLUMN_DEFAULT: null,
+              IS_PK: 1,
+              PK_ORDINAL: 1,
+            },
+          ],
+        }),
+      };
+
+      (ms as unknown as { pool: { request: () => typeof request } }).pool = {
+        request: () => request,
+      };
+
+      const ddl = await ms.getCreateTableDDL(
+        "appdb",
+        "dbo]sales",
+        "user]roles",
+      );
+
+      expect(ddl).toBe(
+        "CREATE TABLE [dbo]]sales].[user]]roles] (\n" +
+          "  [tenant_id] int NOT NULL,\n" +
+          "  [user_id] int NOT NULL,\n" +
+          "  PRIMARY KEY ([user_id], [tenant_id])\n" +
+          ");",
+      );
+    });
+  });
+
   describe("enrichColumn", () => {
     it("marks timestamp/rowversion as read-only and non-filterable", () => {
-      const result = (ms as any).enrichColumn({
+      const result = enrichTestColumn(ms, {
         name: "rv",
         type: "timestamp",
         nullable: false,
@@ -925,6 +1959,17 @@ describe("MSSQLDriver", () => {
       expect(r?.sql).toContain("CONVERT");
     });
 
+    it("uses CONVERT for time filters", () => {
+      const c = col({
+        name: "t",
+        type: "time(7)",
+        category: "time",
+        nativeType: "time(7)",
+      });
+      const r = ms.buildFilterCondition(c, "like", "10:30", 1);
+      expect(r?.sql).toContain("CONVERT(VARCHAR(16)");
+    });
+
     it("uses CONVERT(date, col) for typed date equality filters", () => {
       const c = col({
         name: "d",
@@ -949,7 +1994,7 @@ describe("MSSQLDriver", () => {
       "ntext",
       "xml",
     ])("marks %s as read-only", (type) => {
-      const result = (ms as any).enrichColumn({
+      const result = enrichTestColumn(ms, {
         name: "unsupported_col",
         type,
         nullable: true,
@@ -1314,7 +2359,7 @@ describe("OracleDriver", () => {
       "XMLTYPE",
       "OBJECT",
     ])("marks %s as read-only", (type) => {
-      const result = (ora as any).enrichColumn({
+      const result = enrichTestColumn(ora, {
         name: "unsupported_col",
         type,
         nullable: true,
@@ -1325,7 +2370,7 @@ describe("OracleDriver", () => {
     });
 
     it("keeps RAW columns editable", () => {
-      const result = (ora as any).enrichColumn({
+      const result = enrichTestColumn(ora, {
         name: "raw_col",
         type: "RAW(16)",
         nullable: true,
@@ -1557,7 +2602,7 @@ describe("OracleDriver", () => {
     it("normalizes IntervalYM values at fetch time", () => {
       const response = oraInternals._fetchTypeHandler({
         dbType: oracledb.DB_TYPE_INTERVAL_YM,
-      } as oracledb.Metadata<unknown>);
+      } as unknown as oracledb.Metadata<unknown>);
 
       expect(response?.converter?.({ years: 1, months: 14 })).toBe("2-02");
     });
@@ -1565,7 +2610,7 @@ describe("OracleDriver", () => {
     it("normalizes IntervalDS values at fetch time", () => {
       const response = oraInternals._fetchTypeHandler({
         dbType: oracledb.DB_TYPE_INTERVAL_DS,
-      } as oracledb.Metadata<unknown>);
+      } as unknown as oracledb.Metadata<unknown>);
 
       expect(
         response?.converter?.({
@@ -1655,6 +2700,8 @@ describe("SQLiteDriver", () => {
       // Explicit well-known types
       ["", "text"],
       ["TEXT", "text"],
+      ["JSON", "json"],
+      ["UUID", "uuid"],
       ["VARCHAR(50)", "text"],
       ["NVARCHAR(100)", "text"],
       ["CLOB", "text"],
@@ -1676,7 +2723,9 @@ describe("SQLiteDriver", () => {
       ["BLOB", "binary"],
       ["DATE", "date"],
       ["TIME", "time"],
+      ["DATETIME(3)", "datetime"],
       ["DATETIME", "datetime"],
+      ["TIMESTAMP(6)", "datetime"],
       ["TIMESTAMP", "datetime"],
       ["NUMERIC", "decimal"],
       ["DECIMAL", "decimal"],
@@ -1700,7 +2749,9 @@ describe("SQLiteDriver", () => {
   describe("isDatetimeWithTime", () => {
     it("true for DATETIME, TIMESTAMP", () => {
       expect(lite.isDatetimeWithTime("DATETIME")).toBe(true);
+      expect(lite.isDatetimeWithTime("DATETIME(3)")).toBe(true);
       expect(lite.isDatetimeWithTime("TIMESTAMP")).toBe(true);
+      expect(lite.isDatetimeWithTime("TIMESTAMP(6)")).toBe(true);
     });
     it("false for DATE", () => {
       expect(lite.isDatetimeWithTime("DATE")).toBe(false);
@@ -1832,7 +2883,7 @@ describe("SQLiteDriver", () => {
           return { changes: 0 };
         },
       };
-      (lite as any).db = mockDb;
+      setSqliteDb(lite, mockDb);
 
       // A script with only a comment must result in no actual query calls.
       lite.query("-- just a comment\n");
@@ -1852,7 +2903,7 @@ describe("SQLiteDriver", () => {
           return { changes: 0 };
         },
       };
-      (lite as any).db = mockDb;
+      setSqliteDb(lite, mockDb);
 
       lite.query("-- ignore me\nSELECT 1");
       expect(executed).toHaveLength(1);

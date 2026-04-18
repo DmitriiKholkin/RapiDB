@@ -300,7 +300,13 @@ export abstract class BaseDBDriver implements IDBDriver {
   }
 
   buildOrderByDefault(cols: ColumnTypeMeta[]): string {
-    const pkCols = cols.filter((c) => c.isPrimaryKey);
+    const pkCols = cols
+      .filter((c) => c.isPrimaryKey)
+      .sort((left, right) => {
+        const leftOrdinal = left.primaryKeyOrdinal ?? Number.MAX_SAFE_INTEGER;
+        const rightOrdinal = right.primaryKeyOrdinal ?? Number.MAX_SAFE_INTEGER;
+        return leftOrdinal - rightOrdinal;
+      });
     if (pkCols.length === 0) return "";
     return `ORDER BY ${pkCols.map((c) => this.quoteIdentifier(c.name)).join(", ")}`;
   }

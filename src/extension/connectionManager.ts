@@ -421,7 +421,6 @@ export class ConnectionManager {
       .catch(() => [{ name: primaryDb }]);
 
     for (const schema of primarySchemas.slice(0, 10)) {
-      const schemaLabel = primarySchemas.length <= 1 ? primaryDb : schema.name;
       const objects = await driver
         .listObjects(primaryDb, schema.name)
         .catch(() => []);
@@ -435,29 +434,11 @@ export class ConnectionManager {
 
       tables.forEach((tbl, i) => {
         result.push({
-          schema: schemaLabel,
+          schema: schema.name,
           table: tbl.name,
           columns: allCols[i].map((c) => ({ name: c.name, type: c.type })),
         });
       });
-    }
-
-    const otherDbs = allDbs.filter((d) => d.name !== primaryDb);
-    for (const db of otherDbs.slice(0, 20)) {
-      const schemas = await driver
-        .listSchemas(db.name)
-        .catch(() => [{ name: db.name }]);
-      for (const schema of schemas.slice(0, 5)) {
-        const objects = await driver
-          .listObjects(db.name, schema.name)
-          .catch(() => []);
-        const tables = objects.filter(
-          (o) => o.type === "table" || o.type === "view",
-        );
-        for (const tbl of tables.slice(0, 50)) {
-          result.push({ schema: db.name, table: tbl.name, columns: [] });
-        }
-      }
     }
 
     return result;

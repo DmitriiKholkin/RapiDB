@@ -13,18 +13,51 @@ import type {
   TypeCategory,
 } from "./types";
 
+type SqlStatementKind = "select" | "dml";
+
+interface SQLiteTableXInfoRow {
+  name: string;
+  type: string;
+  notnull: number;
+  dflt_value: string | null;
+  pk: number;
+  hidden: number;
+}
+
+interface SQLiteTableMetadata {
+  rows: SQLiteTableXInfoRow[];
+  foreignKeyColumns: Set<string>;
+  autoIncrementColumns: Set<string>;
+  generatedColumns: Set<string>;
+}
+
+const SQLITE_SELECT_STARTERS = new Set([
+  "SELECT",
+  "PRAGMA",
+  "EXPLAIN",
+  "VALUES",
+]);
+
+const SQLITE_DML_STARTERS = new Set(["INSERT", "UPDATE", "DELETE", "REPLACE"]);
+
+const SQLITE_TIME_LITERAL_RE = /^\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
+const SQLITE_DATETIME_LITERAL_RE =
+  /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?: ?(?:Z|[+-]\d{2}:\d{2}))?$/i;
+
+function sqliteDeclaredTypeBase(typeName: string): string {
+  return typeName.toUpperCase().trim().split("(")[0].trim();
+}
+
 function classifySql(sql: string): "select" | "dml" {
-  const stripped = sql
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .replace(/--[^\n]*/g, " ")
-    .trim()
-    .toUpperCase();
+  const start = skipSqlTrivia(sql, 0);
+  const leadingKeyword = readSqlKeyword(sql, start);
+  if (!leadingKeyword) return "dml";
 
-  const SELECT_STARTERS = ["SELECT", "PRAGMA", "WITH", "EXPLAIN", "VALUES"];
+  if (leadingKeyword.keyword === "WITH") {
+    return classifyWithStatement(sql, leadingKeyword.next);
+  }
 
-  return SELECT_STARTERS.some((kw) => stripped.startsWith(kw))
-    ? "select"
-    : "dml";
+  return SQLITE_SELECT_STARTERS.has(leadingKeyword.keyword) ? "select" : "dml";
 }
 
 function splitSQLiteScript(sql: string): string[] {
@@ -41,26 +74,28 @@ function splitSQLiteScript(sql: string): string[] {
     }
 
     if (sql[i] === "/" && sql[i + 1] === "*") {
-      buf += sql[i++] + sql[i++];
+      i += 2;
       while (i < n) {
         if (sql[i] === "*" && sql[i + 1] === "/") {
-          buf += sql[i++] + sql[i++];
+          i += 2;
           break;
         }
-        buf += sql[i++];
+        i++;
       }
+      buf += " ";
       continue;
     }
 
-    if (sql[i] === "'" || sql[i] === '"' || sql[i] === "`") {
+    if (sql[i] === "'" || sql[i] === '"' || sql[i] === "`" || sql[i] === "[") {
       const q = sql[i];
+      const closing = q === "[" ? "]" : q;
       buf += sql[i++];
       while (i < n) {
         const c = sql[i];
         buf += c;
         i++;
-        if (c === q) {
-          if (sql[i] === q) {
+        if (c === closing) {
+          if (closing !== "]" && sql[i] === closing) {
             buf += sql[i++];
           } else {
             break;
@@ -87,6 +122,291 @@ function splitSQLiteScript(sql: string): string[] {
   return stmts;
 }
 
+function skipSqlTrivia(sql: string, start: number): number {
+  let index = start;
+
+  while (index < sql.length) {
+    if (/\s/.test(sql[index])) {
+      index++;
+      continue;
+    }
+
+    if (sql[index] === "-" && sql[index + 1] === "-") {
+      index += 2;
+      while (index < sql.length && sql[index] !== "\n") {
+        index++;
+      }
+      continue;
+    }
+
+    if (sql[index] === "/" && sql[index + 1] === "*") {
+      index += 2;
+      while (index < sql.length) {
+        if (sql[index] === "*" && sql[index + 1] === "/") {
+          index += 2;
+          break;
+        }
+        index++;
+      }
+      continue;
+    }
+
+    break;
+  }
+
+  return index;
+}
+
+function readSqlKeyword(
+  sql: string,
+  start: number,
+): { keyword: string; next: number } | null {
+  const index = skipSqlTrivia(sql, start);
+  const match = /^[A-Za-z_][A-Za-z0-9_]*/.exec(sql.slice(index));
+  if (!match) return null;
+  return {
+    keyword: match[0].toUpperCase(),
+    next: index + match[0].length,
+  };
+}
+
+function nextSqlKeyword(
+  sql: string,
+  start: number,
+): { keyword: string; next: number } | null {
+  let index = start;
+
+  while (index < sql.length) {
+    index = skipSqlTrivia(sql, index);
+    if (index >= sql.length) return null;
+
+    const current = sql[index];
+    if (
+      current === '"' ||
+      current === "'" ||
+      current === "`" ||
+      current === "["
+    ) {
+      index = skipQuotedSql(sql, index);
+      continue;
+    }
+
+    const keyword = readSqlKeyword(sql, index);
+    if (keyword) return keyword;
+
+    index++;
+  }
+
+  return null;
+}
+
+function skipQuotedSql(sql: string, start: number): number {
+  const opener = sql[start];
+  const closer = opener === "[" ? "]" : opener;
+  let index = start + 1;
+
+  while (index < sql.length) {
+    const current = sql[index];
+    if (current === closer) {
+      if (closer !== "]" && sql[index + 1] === closer) {
+        index += 2;
+        continue;
+      }
+      return index + 1;
+    }
+    index++;
+  }
+
+  return sql.length;
+}
+
+function skipBalancedParens(sql: string, start: number): number {
+  if (sql[start] !== "(") return start;
+
+  let depth = 0;
+  let index = start;
+
+  while (index < sql.length) {
+    const current = sql[index];
+
+    if (
+      current === "'" ||
+      current === '"' ||
+      current === "`" ||
+      current === "["
+    ) {
+      index = skipQuotedSql(sql, index);
+      continue;
+    }
+
+    if (current === "-" && sql[index + 1] === "-") {
+      index = skipSqlTrivia(sql, index);
+      continue;
+    }
+
+    if (current === "/" && sql[index + 1] === "*") {
+      index = skipSqlTrivia(sql, index);
+      continue;
+    }
+
+    if (current === "(") {
+      depth++;
+    } else if (current === ")") {
+      depth--;
+      if (depth === 0) {
+        return index + 1;
+      }
+    }
+
+    index++;
+  }
+
+  return sql.length;
+}
+
+function skipSqlIdentifier(sql: string, start: number): number {
+  const index = skipSqlTrivia(sql, start);
+  const current = sql[index];
+
+  if (
+    current === '"' ||
+    current === "'" ||
+    current === "`" ||
+    current === "["
+  ) {
+    return skipQuotedSql(sql, index);
+  }
+
+  const match = /^[A-Za-z_][A-Za-z0-9_]*/.exec(sql.slice(index));
+  return match ? index + match[0].length : index;
+}
+
+function classifyWithStatement(sql: string, start: number): SqlStatementKind {
+  let index = skipSqlTrivia(sql, start);
+  const maybeRecursive = readSqlKeyword(sql, index);
+  if (maybeRecursive?.keyword === "RECURSIVE") {
+    index = maybeRecursive.next;
+  }
+
+  while (index < sql.length) {
+    index = skipSqlIdentifier(sql, index);
+    if (index >= sql.length) return "dml";
+
+    index = skipSqlTrivia(sql, index);
+    if (sql[index] === "(") {
+      index = skipBalancedParens(sql, index);
+      index = skipSqlTrivia(sql, index);
+    }
+
+    const asKeyword = readSqlKeyword(sql, index);
+    if (!asKeyword || asKeyword.keyword !== "AS") return "dml";
+    index = skipSqlTrivia(sql, asKeyword.next);
+
+    const materializedKeyword = readSqlKeyword(sql, index);
+    if (materializedKeyword?.keyword === "NOT") {
+      const nextKeyword = readSqlKeyword(sql, materializedKeyword.next);
+      if (nextKeyword?.keyword === "MATERIALIZED") {
+        index = skipSqlTrivia(sql, nextKeyword.next);
+      }
+    } else if (materializedKeyword?.keyword === "MATERIALIZED") {
+      index = skipSqlTrivia(sql, materializedKeyword.next);
+    }
+
+    if (sql[index] !== "(") return "dml";
+
+    index = skipBalancedParens(sql, index);
+    index = skipSqlTrivia(sql, index);
+
+    if (sql[index] === ",") {
+      index++;
+      continue;
+    }
+
+    break;
+  }
+
+  const mainKeyword = readSqlKeyword(sql, index);
+  if (!mainKeyword) return "dml";
+  if (SQLITE_SELECT_STARTERS.has(mainKeyword.keyword)) return "select";
+  return SQLITE_DML_STARTERS.has(mainKeyword.keyword) ? "dml" : "dml";
+}
+
+function isUnsafeSQLiteScript(sql: string): boolean {
+  let keyword = nextSqlKeyword(sql, 0);
+  while (keyword) {
+    if (keyword.keyword === "CREATE") {
+      let nextKeyword = nextSqlKeyword(sql, keyword.next);
+      if (
+        nextKeyword?.keyword === "TEMP" ||
+        nextKeyword?.keyword === "TEMPORARY"
+      ) {
+        nextKeyword = nextSqlKeyword(sql, nextKeyword.next);
+      }
+      if (nextKeyword?.keyword === "TRIGGER") {
+        return true;
+      }
+    }
+
+    keyword = nextSqlKeyword(sql, keyword.next);
+  }
+
+  return false;
+}
+
+function canSQLiteStatementReturnRows(sql: string): boolean {
+  let keyword = nextSqlKeyword(sql, 0);
+  while (keyword) {
+    if (keyword.keyword === "RETURNING") {
+      return true;
+    }
+    keyword = nextSqlKeyword(sql, keyword.next);
+  }
+
+  return false;
+}
+
+function normalizeSqliteTimeLiteral(value: string): string | null {
+  const trimmed = value.trim();
+  if (!SQLITE_TIME_LITERAL_RE.test(trimmed)) return null;
+
+  const parts = trimmed.split(":");
+  const hours = Number(parts[0]);
+  const minutes = Number(parts[1]);
+  const secondsPart = parts[2] ?? "00";
+  const seconds = Number(secondsPart.split(".")[0]);
+
+  if (hours > 23 || minutes > 59 || seconds > 59) return null;
+  return parts.length === 2 ? `${trimmed}:00` : trimmed;
+}
+
+function normalizeSqliteDatetimeLiteral(value: string): string | null {
+  const trimmed = value.trim().replace(/ ([+-]\d{2}:\d{2})$/, "$1");
+  if (!SQLITE_DATETIME_LITERAL_RE.test(trimmed)) return null;
+
+  const normalized = trimmed.replace("T", " ");
+  const match =
+    /^(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?: ?(?:Z|[+-]\d{2}:\d{2}))?$/i.exec(
+      normalized,
+    );
+  if (!match) return null;
+
+  const hours = Number(match[2]);
+  const minutes = Number(match[3]);
+  const seconds = Number(match[4] ?? "00");
+  if (hours > 23 || minutes > 59 || seconds > 59) return null;
+
+  return normalized;
+}
+
+function invalidSqliteTemporalFilterError(
+  columnName: string,
+  typeName: "time" | "datetime",
+): Error {
+  return new Error(
+    `[RapiDB Filter] Column ${columnName} expects a valid ${typeName} value.`,
+  );
+}
+
 export class SQLiteDriver extends BaseDBDriver {
   private db: Database | null = null;
   private readonly config: ConnectionConfig;
@@ -109,13 +429,82 @@ export class SQLiteDriver extends BaseDBDriver {
     this.db = new Database(this.config.filePath);
   }
 
+  private requireDb(): Database {
+    if (!this.db?.isOpen) {
+      throw new Error("[RapiDB] SQLite connection is not open");
+    }
+    return this.db;
+  }
+
+  private readTableMetadata(table: string): SQLiteTableMetadata {
+    const db = this.requireDb();
+    const safeName = table.replace(/"/g, '""');
+    const rows = (
+      db.all(
+        `PRAGMA table_xinfo("${safeName}")`,
+      ) as unknown as SQLiteTableXInfoRow[]
+    ).filter((row) => row.hidden !== 1);
+
+    const fkRows = db.all(`PRAGMA foreign_key_list("${safeName}")`) as {
+      from: string;
+    }[];
+
+    const generatedColumns = new Set(
+      rows
+        .filter((row) => row.hidden === 2 || row.hidden === 3)
+        .map((row) => row.name),
+    );
+
+    const autoIncrementColumns = new Set<string>();
+    try {
+      const master = db.all(
+        `SELECT sql FROM sqlite_master WHERE type='table' AND name=?`,
+        [table],
+      ) as { sql: string }[];
+      const createSql = master[0]?.sql ?? "";
+      const re =
+        /[`"[]?(\w+)[`"\]]?\s+INTEGER\b[^,)]*\bPRIMARY\s+KEY\b[^,)]*\bAUTOINCREMENT\b/gi;
+      let match: RegExpExecArray | null;
+      match = re.exec(createSql);
+      while (match !== null) {
+        autoIncrementColumns.add(match[1].toLowerCase());
+        match = re.exec(createSql);
+      }
+    } catch {}
+
+    return {
+      rows,
+      foreignKeyColumns: new Set(fkRows.map((row) => row.from)),
+      autoIncrementColumns,
+      generatedColumns,
+    };
+  }
+
+  private toColumnMeta(
+    row: SQLiteTableXInfoRow,
+    metadata: SQLiteTableMetadata,
+  ): ColumnMeta {
+    return {
+      name: row.name,
+      type: row.type || "TEXT",
+      nullable: row.notnull === 0,
+      defaultValue: row.dflt_value ?? undefined,
+      isPrimaryKey: row.pk > 0,
+      primaryKeyOrdinal: row.pk > 0 ? row.pk : undefined,
+      isForeignKey: metadata.foreignKeyColumns.has(row.name),
+      isAutoIncrement: metadata.autoIncrementColumns.has(
+        row.name.toLowerCase(),
+      ),
+    };
+  }
+
   async disconnect(): Promise<void> {
     this.db?.close();
     this.db = null;
   }
 
   isConnected(): boolean {
-    return this.db !== null && this.db.isOpen;
+    return this.db?.isOpen ?? false;
   }
 
   async listDatabases(): Promise<DatabaseInfo[]> {
@@ -127,7 +516,7 @@ export class SQLiteDriver extends BaseDBDriver {
   }
 
   async listObjects(_database: string, _schema: string): Promise<TableInfo[]> {
-    const rows = this.db!.all(
+    const rows = this.requireDb().all(
       `SELECT name, type
        FROM sqlite_master
        WHERE type IN ('table','view')
@@ -147,45 +536,35 @@ export class SQLiteDriver extends BaseDBDriver {
     _schema: string,
     table: string,
   ): Promise<ColumnMeta[]> {
-    const safeName = table.replace(/"/g, '""');
+    const metadata = this.readTableMetadata(table);
+    return metadata.rows.map((row) => this.toColumnMeta(row, metadata));
+  }
 
-    const rows = this.db!.all(`PRAGMA table_info("${safeName}")`) as {
-      name: string;
-      type: string;
-      notnull: number;
-      dflt_value: string | null;
-      pk: number;
-    }[];
+  override async describeColumns(
+    _database: string,
+    _schema: string,
+    table: string,
+  ): Promise<ColumnTypeMeta[]> {
+    const metadata = this.readTableMetadata(table);
 
-    const fkRows = this.db!.all(`PRAGMA foreign_key_list("${safeName}")`) as {
-      from: string;
-    }[];
-    const fkCols = new Set(fkRows.map((r) => r.from));
+    return metadata.rows.map((row) => {
+      const column = this.enrichColumn(this.toColumnMeta(row, metadata));
+      const declaredType = sqliteDeclaredTypeBase(row.type);
+      const isExplicitTemporal =
+        declaredType === "TIME" ||
+        declaredType === "DATETIME" ||
+        declaredType === "TIMESTAMP";
 
-    const autoIncrementCols = new Set<string>();
-    try {
-      const master = this.db!.all(
-        `SELECT sql FROM sqlite_master WHERE type='table' AND name=?`,
-        [table],
-      ) as { sql: string }[];
-      const createSql = master[0]?.sql ?? "";
-      const re =
-        /[`"[]?(\w+)[`"\]]?\s+INTEGER\b[^,)]*\bPRIMARY\s+KEY\b[^,)]*\bAUTOINCREMENT\b/gi;
-      let m: RegExpExecArray | null;
-      while ((m = re.exec(createSql)) !== null) {
-        autoIncrementCols.add(m[1].toLowerCase());
-      }
-    } catch {}
-
-    return rows.map((r) => ({
-      name: r.name,
-      type: r.type || "TEXT",
-      nullable: r.notnull === 0,
-      defaultValue: r.dflt_value ?? undefined,
-      isPrimaryKey: r.pk > 0,
-      isForeignKey: fkCols.has(r.name),
-      isAutoIncrement: autoIncrementCols.has(r.name.toLowerCase()),
-    }));
+      return {
+        ...column,
+        editable: metadata.generatedColumns.has(row.name)
+          ? false
+          : column.editable,
+        filterOperators: isExplicitTemporal
+          ? ["eq", "neq", "between", "like", "is_null", "is_not_null"]
+          : column.filterOperators,
+      };
+    });
   }
 
   async query(sql: string, params?: unknown[]): Promise<QueryResult> {
@@ -193,6 +572,16 @@ export class SQLiteDriver extends BaseDBDriver {
 
     if (params && params.length > 0) {
       return this._executeSingle(sql, params, start);
+    }
+
+    if (isUnsafeSQLiteScript(sql)) {
+      this.requireDb().exec(sql);
+      return {
+        columns: [],
+        rows: [],
+        rowCount: 0,
+        executionTimeMs: Date.now() - start,
+      };
     }
 
     const stmts = splitSQLiteScript(sql);
@@ -215,12 +604,10 @@ export class SQLiteDriver extends BaseDBDriver {
   ): QueryResult {
     const kind = classifySql(sql);
     const bindValues = params as import("node-sqlite3-wasm").BindValues;
+    const db = this.requireDb();
 
     if (kind === "select") {
-      const rawRows = this.db!.all(sql, bindValues) as Record<
-        string,
-        unknown
-      >[];
+      const rawRows = db.all(sql, bindValues) as Record<string, unknown>[];
       const columns = rawRows.length > 0 ? Object.keys(rawRows[0]) : [];
       const rows = rawRows.map((row) =>
         Object.fromEntries(columns.map((col, i) => [`__col_${i}`, row[col]])),
@@ -233,8 +620,8 @@ export class SQLiteDriver extends BaseDBDriver {
       };
     }
 
-    try {
-      const returningRows = this.db!.all(sql, bindValues) as Record<
+    if (canSQLiteStatementReturnRows(sql)) {
+      const returningRows = db.all(sql, bindValues) as Record<
         string,
         unknown
       >[];
@@ -250,9 +637,15 @@ export class SQLiteDriver extends BaseDBDriver {
           executionTimeMs: Date.now() - start,
         };
       }
-    } catch {}
+      return {
+        columns: [],
+        rows: [],
+        rowCount: 0,
+        executionTimeMs: Date.now() - start,
+      };
+    }
 
-    const info = this.db!.run(sql, bindValues);
+    const info = db.run(sql, bindValues);
     return {
       columns: [],
       rows: [],
@@ -296,7 +689,8 @@ export class SQLiteDriver extends BaseDBDriver {
   ): Promise<import("./types").IndexMeta[]> {
     const safeTable = table.replace(/"/g, '""');
 
-    const idxList = this.db!.all(`PRAGMA index_list("${safeTable}")`) as {
+    const db = this.requireDb();
+    const idxList = db.all(`PRAGMA index_list("${safeTable}")`) as {
       name: string;
       unique: number;
       origin: string;
@@ -305,7 +699,7 @@ export class SQLiteDriver extends BaseDBDriver {
     const result: import("./types").IndexMeta[] = [];
     for (const idx of idxList) {
       const safeName = idx.name.replace(/"/g, '""');
-      const cols = this.db!.all(`PRAGMA index_info("${safeName}")`) as {
+      const cols = db.all(`PRAGMA index_info("${safeName}")`) as {
         seqno: number;
         cid: number;
         name: string;
@@ -326,7 +720,9 @@ export class SQLiteDriver extends BaseDBDriver {
     table: string,
   ): Promise<import("./types").ForeignKeyMeta[]> {
     const safeTable = table.replace(/"/g, '""');
-    const rows = this.db!.all(`PRAGMA foreign_key_list("${safeTable}")`) as {
+    const rows = this.requireDb().all(
+      `PRAGMA foreign_key_list("${safeTable}")`,
+    ) as {
       from: string;
       table: string;
       to: string;
@@ -347,7 +743,7 @@ export class SQLiteDriver extends BaseDBDriver {
     _schema: string,
     table: string,
   ): Promise<string> {
-    const row = this.db!.get(
+    const row = this.requireDb().get(
       `SELECT sql FROM sqlite_master WHERE type IN ('table','view') AND name = ?`,
       [table],
     ) as { sql: string } | null;
@@ -366,7 +762,7 @@ export class SQLiteDriver extends BaseDBDriver {
   async runTransaction(
     operations: import("./types").TransactionOperation[],
   ): Promise<void> {
-    const db = this.db!;
+    const db = this.requireDb();
     db.exec("BEGIN TRANSACTION");
     try {
       for (const op of operations) {
@@ -395,8 +791,10 @@ export class SQLiteDriver extends BaseDBDriver {
   mapTypeCategory(nativeType: string): TypeCategory {
     const ct = nativeType.toUpperCase().trim();
     // Strip precision/scale specifiers for initial matching, e.g. DECIMAL(10,2) → DECIMAL
-    const base = ct.split("(")[0].trim();
+    const base = sqliteDeclaredTypeBase(nativeType);
     if (base === "" || base === "TEXT") return "text";
+    if (base === "JSON") return "json";
+    if (base === "UUID") return "uuid";
     if (
       base === "INTEGER" ||
       base === "INT" ||
@@ -426,19 +824,13 @@ export class SQLiteDriver extends BaseDBDriver {
   }
 
   isBooleanType(nativeType: string): boolean {
-    const ct = nativeType.toUpperCase().trim();
-    return ct === "BOOLEAN" || ct === "BOOL";
+    const base = sqliteDeclaredTypeBase(nativeType);
+    return base === "BOOLEAN" || base === "BOOL";
   }
 
   isDatetimeWithTime(nativeType: string): boolean {
-    const ct = nativeType.toUpperCase().trim();
-    return ct === "DATETIME" || ct === "TIMESTAMP";
-  }
-
-  // ─── SQLite SQL helpers ───
-
-  override quoteIdentifier(name: string): string {
-    return `"${name.replace(/"/g, '""')}"`;
+    const base = sqliteDeclaredTypeBase(nativeType);
+    return base === "DATETIME" || base === "TIMESTAMP";
   }
 
   override coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
@@ -451,8 +843,54 @@ export class SQLiteDriver extends BaseDBDriver {
     return super.coerceInputValue(value, column);
   }
 
-  override formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
-    return super.formatOutputValue(value, column);
+  override normalizeFilterValue(
+    column: ColumnTypeMeta,
+    operator: FilterOperator,
+    value: string | [string, string] | undefined,
+  ): string | [string, string] | undefined {
+    const normalized = super.normalizeFilterValue(column, operator, value);
+
+    if (normalized === undefined) {
+      return normalized;
+    }
+
+    if (column.category === "time") {
+      if (operator === "between" && Array.isArray(normalized)) {
+        const startLiteral = normalizeSqliteTimeLiteral(normalized[0]);
+        const endLiteral = normalizeSqliteTimeLiteral(normalized[1]);
+        if (!startLiteral || !endLiteral) {
+          throw invalidSqliteTemporalFilterError(column.name, "time");
+        }
+        return [startLiteral, endLiteral];
+      }
+
+      if (
+        (operator === "eq" || operator === "neq") &&
+        typeof normalized === "string"
+      ) {
+        return normalizeSqliteTimeLiteral(normalized) ?? normalized;
+      }
+    }
+
+    if (column.category === "datetime") {
+      if (operator === "between" && Array.isArray(normalized)) {
+        const startLiteral = normalizeSqliteDatetimeLiteral(normalized[0]);
+        const endLiteral = normalizeSqliteDatetimeLiteral(normalized[1]);
+        if (!startLiteral || !endLiteral) {
+          throw invalidSqliteTemporalFilterError(column.name, "datetime");
+        }
+        return [startLiteral, endLiteral];
+      }
+
+      if (
+        (operator === "eq" || operator === "neq") &&
+        typeof normalized === "string"
+      ) {
+        return normalizeSqliteDatetimeLiteral(normalized) ?? normalized;
+      }
+    }
+
+    return normalized;
   }
 
   // ─── SQLite filter building ───
@@ -473,6 +911,10 @@ export class SQLiteDriver extends BaseDBDriver {
     if (value === undefined) return null;
 
     const val = typeof value === "string" ? value.trim() : value;
+    const fallbackTemporalLike = (rawValue: string, negate = false) => ({
+      sql: `${col} ${negate ? "NOT LIKE" : "LIKE"} ?`,
+      params: [`%${rawValue}%`],
+    });
 
     // Boolean
     if (column.isBoolean && (operator === "eq" || operator === "neq")) {
@@ -502,6 +944,61 @@ export class SQLiteDriver extends BaseDBDriver {
     ) {
       const sqlOp = operator === "neq" ? "!=" : "=";
       return { sql: `DATE(${col}) ${sqlOp} DATE(?)`, params: [val] };
+    }
+
+    if (column.category === "time") {
+      if (operator === "between" && Array.isArray(val)) {
+        const startLiteral = normalizeSqliteTimeLiteral(val[0]);
+        const endLiteral = normalizeSqliteTimeLiteral(val[1]);
+        if (!startLiteral || !endLiteral) {
+          throw invalidSqliteTemporalFilterError(column.name, "time");
+        }
+        return {
+          sql: `TIME(${col}) BETWEEN TIME(?) AND TIME(?)`,
+          params: [startLiteral, endLiteral],
+        };
+      }
+
+      if (
+        (operator === "eq" || operator === "neq") &&
+        typeof val === "string"
+      ) {
+        const literal = normalizeSqliteTimeLiteral(val);
+        if (literal) {
+          const sqlOp = operator === "neq" ? "!=" : "=";
+          return { sql: `TIME(${col}) ${sqlOp} TIME(?)`, params: [literal] };
+        }
+        return fallbackTemporalLike(val, operator === "neq");
+      }
+    }
+
+    if (column.category === "datetime") {
+      if (operator === "between" && Array.isArray(val)) {
+        const startLiteral = normalizeSqliteDatetimeLiteral(val[0]);
+        const endLiteral = normalizeSqliteDatetimeLiteral(val[1]);
+        if (!startLiteral || !endLiteral) {
+          throw invalidSqliteTemporalFilterError(column.name, "datetime");
+        }
+        return {
+          sql: `DATETIME(${col}) BETWEEN DATETIME(?) AND DATETIME(?)`,
+          params: [startLiteral, endLiteral],
+        };
+      }
+
+      if (
+        (operator === "eq" || operator === "neq") &&
+        typeof val === "string"
+      ) {
+        const literal = normalizeSqliteDatetimeLiteral(val);
+        if (literal) {
+          const sqlOp = operator === "neq" ? "!=" : "=";
+          return {
+            sql: `DATETIME(${col}) ${sqlOp} DATETIME(?)`,
+            params: [literal],
+          };
+        }
+        return fallbackTemporalLike(val, operator === "neq");
+      }
     }
 
     // Between

@@ -1,18 +1,13 @@
 import type { Pool } from "mysql2/promise";
 import * as mysql from "mysql2/promise";
 import type { ConnectionConfig } from "../connectionManager";
-import {
-  BaseDBDriver,
-  formatDatetimeForDisplay,
-  isoToLocalDateStr,
-} from "./BaseDBDriver";
+import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
   DatabaseInfo,
   FilterConditionResult,
   FilterOperator,
-  PaginationResult,
   QueryResult,
   SchemaInfo,
   TableInfo,
@@ -244,52 +239,260 @@ function mysqlSpatialJsonToWkt(obj: unknown): string {
 }
 
 function mysqlTypeName(nativeType: string): string {
-  return nativeType.toLowerCase().split("(")[0].trim();
+  const match = /^[a-z]+/i.exec(nativeType.trim());
+  return match?.[0]?.toLowerCase() ?? nativeType.toLowerCase().trim();
 }
 
-function formatMysqlDatetimeUtc(value: Date): string | null {
-  if (Number.isNaN(value.getTime())) return null;
+function isValidMysqlDateParts(
+  year: number,
+  month: number,
+  day: number,
+): boolean {
+  if (month < 1 || month > 12 || day < 1 || day > 31) {
+    return false;
+  }
 
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+  return (
+    parsed.getUTCFullYear() === year &&
+    parsed.getUTCMonth() + 1 === month &&
+    parsed.getUTCDate() === day
+  );
+}
+
+function parseMysqlDateParts(
+  value: string,
+): { year: number; month: number; day: number } | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
+  if (!match) {
+    return null;
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (!isValidMysqlDateParts(year, month, day)) {
+    return null;
+  }
+
+  return { year, month, day };
+}
+
+type ParsedMysqlDatetimeInput = {
+  year: number;
+  month: number;
+  day: number;
+  hours: number;
+  minutes: number;
+  seconds: number;
+  fractionMicros: number;
+  fractionDigits: number;
+  timezoneOffsetMinutes: number | null;
+};
+
+function parseMysqlTimezoneOffset(token: string): number {
+  if (token === "Z" || token === "z") {
+    return 0;
+  }
+
+  const sign = token.startsWith("-") ? -1 : 1;
+  const hours = Number(token.slice(1, 3));
+  const minutes = Number(token.slice(4, 6));
+  return sign * (hours * 60 + minutes);
+}
+
+function parseMysqlDatetimeParts(
+  value: string,
+): ParsedMysqlDatetimeInput | null {
+  const normalized = value.trim().replace(/ ([+-]\d{2}:\d{2})$/, "$1");
+  const match =
+    /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})?$/i.exec(
+      normalized,
+    );
+  if (!match) {
+    return null;
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hours = Number(match[4]);
+  const minutes = Number(match[5]);
+  const seconds = Number(match[6]);
+  const rawFraction = match[7] ?? "";
+  const timezoneToken = match[8] ?? null;
+
+  if (!isValidMysqlDateParts(year, month, day)) {
+    return null;
+  }
+
+  if (hours > 23 || minutes > 59 || seconds > 59) {
+    return null;
+  }
+
+  return {
+    year,
+    month,
+    day,
+    hours,
+    minutes,
+    seconds,
+    fractionMicros: rawFraction
+      ? Number(rawFraction.slice(0, 6).padEnd(6, "0"))
+      : 0,
+    fractionDigits: Math.min(rawFraction.length, 6),
+    timezoneOffsetMinutes: timezoneToken
+      ? parseMysqlTimezoneOffset(timezoneToken)
+      : null,
+  };
+}
+
+function formatMysqlDateParts(parts: {
+  year: number;
+  month: number;
+  day: number;
+}): string {
   const pad = (n: number) => String(n).padStart(2, "0");
-  const ms = value.getUTCMilliseconds();
-  const frac = ms > 0 ? `.${String(ms).padStart(3, "0")}` : "";
+  return `${parts.year}-${pad(parts.month)}-${pad(parts.day)}`;
+}
+
+function formatMysqlFraction(
+  fractionMicros: number,
+  fractionDigits: number,
+): string {
+  if (fractionDigits === 0) {
+    return "";
+  }
+
+  return `.${String(fractionMicros).padStart(6, "0").slice(0, fractionDigits)}`;
+}
+
+function formatMysqlDatetimeParts(parts: ParsedMysqlDatetimeInput): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return (
+    `${formatMysqlDateParts(parts)} ` +
+    `${pad(parts.hours)}:${pad(parts.minutes)}:${pad(parts.seconds)}` +
+    formatMysqlFraction(parts.fractionMicros, parts.fractionDigits)
+  );
+}
+
+function formatMysqlDatetimeUtc(
+  parts: ParsedMysqlDatetimeInput,
+): string | null {
+  if (parts.timezoneOffsetMinutes === null) {
+    return formatMysqlDatetimeParts(parts);
+  }
+
+  const totalMicros =
+    BigInt(
+      Date.UTC(
+        parts.year,
+        parts.month - 1,
+        parts.day,
+        parts.hours,
+        parts.minutes,
+        parts.seconds,
+        Math.floor(parts.fractionMicros / 1000),
+      ),
+    ) *
+      1000n +
+    BigInt(parts.fractionMicros % 1000) -
+    BigInt(parts.timezoneOffsetMinutes) * 60n * 1_000_000n;
+
+  let epochMillis = totalMicros / 1000n;
+  let extraMicros = totalMicros % 1000n;
+  if (extraMicros < 0n) {
+    epochMillis -= 1n;
+    extraMicros += 1000n;
+  }
+
+  const value = new Date(Number(epochMillis));
+  if (Number.isNaN(value.getTime())) {
+    return null;
+  }
+
+  const utcFractionMicros =
+    value.getUTCMilliseconds() * 1000 + Number(extraMicros);
+  const pad = (n: number) => String(n).padStart(2, "0");
   return (
     `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())} ` +
-    `${pad(value.getUTCHours())}:${pad(value.getUTCMinutes())}:${pad(value.getUTCSeconds())}${frac}`
+    `${pad(value.getUTCHours())}:${pad(value.getUTCMinutes())}:${pad(value.getUTCSeconds())}` +
+    formatMysqlFraction(utcFractionMicros, parts.fractionDigits)
   );
+}
+
+function looksLikeMysqlDateInput(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}(?:[ T].*)?$/.test(value.trim());
+}
+
+function looksLikeMysqlDatetimeInput(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}[ T]/.test(value.trim());
 }
 
 function normalizeMysqlDateInput(value: string): string | null {
   const trimmed = value.trim();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
-    return trimmed;
+  const dateOnly = parseMysqlDateParts(trimmed);
+  if (dateOnly) {
+    return formatMysqlDateParts(dateOnly);
   }
-  if (ISO_DATETIME_RE.test(trimmed)) {
-    return isoToLocalDateStr(trimmed);
+
+  if (!ISO_DATETIME_RE.test(trimmed) && !DATETIME_SQL_RE.test(trimmed)) {
+    return null;
   }
-  if (DATETIME_SQL_RE.test(trimmed)) {
-    if (/[+-]\d{2}:\d{2}$/.test(trimmed)) {
-      return isoToLocalDateStr(trimmed.replace(" ", "T"));
-    }
-    return trimmed.slice(0, 10);
+
+  const parsed = parseMysqlDatetimeParts(trimmed);
+  if (!parsed) {
+    return null;
   }
-  return null;
+
+  if (parsed.timezoneOffsetMinutes === null) {
+    return formatMysqlDateParts(parsed);
+  }
+
+  return formatMysqlDatetimeUtc(parsed)?.slice(0, 10) ?? null;
 }
 
 function normalizeMysqlDatetimeInput(value: string): string | null {
   const trimmed = value.trim();
-  if (ISO_DATETIME_RE.test(trimmed)) {
-    return formatMysqlDatetimeUtc(new Date(trimmed));
-  }
-  if (!DATETIME_SQL_RE.test(trimmed)) {
+  if (!ISO_DATETIME_RE.test(trimmed) && !DATETIME_SQL_RE.test(trimmed)) {
     return null;
   }
 
-  if (/[+-]\d{2}:\d{2}$/.test(trimmed)) {
-    return formatMysqlDatetimeUtc(new Date(trimmed.replace(" ", "T")));
+  const parsed = parseMysqlDatetimeParts(trimmed);
+  if (!parsed) {
+    return null;
   }
 
-  return formatDatetimeForDisplay(trimmed) ?? trimmed;
+  if (parsed.timezoneOffsetMinutes === null) {
+    return formatMysqlDatetimeParts(parsed);
+  }
+
+  return formatMysqlDatetimeUtc(parsed);
+}
+
+function invalidMysqlTemporalInputError(
+  columnName: string,
+  typeName: string,
+): Error {
+  return new Error(
+    `[RapiDB] Column ${columnName} expects a valid ${typeName.toUpperCase()} value.`,
+  );
+}
+
+function decodeMysqlBitBuffer(
+  buffer: Buffer,
+  declaredBits: number,
+): number | bigint {
+  if (buffer.length === 0) {
+    return 0;
+  }
+
+  let result = 0n;
+  for (const byte of buffer.values()) {
+    result = (result << 8n) | BigInt(byte);
+  }
+
+  return declaredBits > 48 ? result : Number(result);
 }
 
 export class MySQLDriver extends BaseDBDriver {
@@ -392,18 +595,55 @@ export class MySQLDriver extends BaseDBDriver {
     table: string,
   ): Promise<ColumnMeta[]> {
     const [rows] = await this.pool!.query<any[]>(
-      `SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY, EXTRA
-       FROM information_schema.COLUMNS
-       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`,
-      [database, table],
+      `SELECT c.COLUMN_NAME,
+              c.COLUMN_TYPE,
+              c.IS_NULLABLE,
+              c.COLUMN_DEFAULT,
+              c.EXTRA,
+              CASE WHEN pk.COLUMN_NAME IS NULL THEN 0 ELSE 1 END AS IS_PRIMARY_KEY,
+              pk.ORDINAL_POSITION AS PRIMARY_KEY_ORDINAL,
+              CASE WHEN fk.COLUMN_NAME IS NULL THEN 0 ELSE 1 END AS IS_FOREIGN_KEY
+       FROM information_schema.COLUMNS c
+       LEFT JOIN (
+         SELECT kcu.COLUMN_NAME, kcu.ORDINAL_POSITION
+         FROM information_schema.KEY_COLUMN_USAGE kcu
+         JOIN information_schema.TABLE_CONSTRAINTS tc
+           ON tc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA
+          AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA
+          AND tc.TABLE_NAME = kcu.TABLE_NAME
+          AND tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+         WHERE kcu.TABLE_SCHEMA = ?
+           AND kcu.TABLE_NAME = ?
+           AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+       ) pk ON pk.COLUMN_NAME = c.COLUMN_NAME
+       LEFT JOIN (
+         SELECT DISTINCT kcu.COLUMN_NAME
+         FROM information_schema.KEY_COLUMN_USAGE kcu
+         JOIN information_schema.TABLE_CONSTRAINTS tc
+           ON tc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA
+          AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA
+          AND tc.TABLE_NAME = kcu.TABLE_NAME
+          AND tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+         WHERE kcu.TABLE_SCHEMA = ?
+           AND kcu.TABLE_NAME = ?
+           AND tc.CONSTRAINT_TYPE = 'FOREIGN KEY'
+       ) fk ON fk.COLUMN_NAME = c.COLUMN_NAME
+       WHERE c.TABLE_SCHEMA = ?
+         AND c.TABLE_NAME = ?
+       ORDER BY c.ORDINAL_POSITION`,
+      [database, table, database, table, database, table],
     );
     return rows.map((r) => ({
       name: r.COLUMN_NAME as string,
       type: r.COLUMN_TYPE as string,
       nullable: r.IS_NULLABLE === "YES",
       defaultValue: r.COLUMN_DEFAULT ?? undefined,
-      isPrimaryKey: r.COLUMN_KEY === "PRI",
-      isForeignKey: r.COLUMN_KEY === "MUL",
+      isPrimaryKey: Number(r.IS_PRIMARY_KEY) === 1,
+      primaryKeyOrdinal:
+        r.PRIMARY_KEY_ORDINAL == null
+          ? undefined
+          : Number(r.PRIMARY_KEY_ORDINAL),
+      isForeignKey: Number(r.IS_FOREIGN_KEY) === 1,
       isAutoIncrement:
         (r.EXTRA as string)?.toLowerCase().includes("auto_increment") ?? false,
     }));
@@ -460,7 +700,7 @@ export class MySQLDriver extends BaseDBDriver {
 
       const boolCols = new Set<number>();
       const floatCols = new Set<number>();
-      const bitIntCols = new Set<number>();
+      const bitIntCols = new Map<number, number>();
       fieldList.forEach((f: any, i: number) => {
         if (
           (f.type === 1 && f.length === 1) ||
@@ -468,7 +708,7 @@ export class MySQLDriver extends BaseDBDriver {
         ) {
           boolCols.add(i);
         } else if (f.type === 16 && f.length > 1) {
-          bitIntCols.add(i);
+          bitIntCols.set(i, f.length as number);
         }
         if (f.type === 4) {
           floatCols.add(i);
@@ -488,11 +728,7 @@ export class MySQLDriver extends BaseDBDriver {
             }
             if (bitIntCols.has(i) && v !== null && v !== undefined) {
               if (Buffer.isBuffer(v)) {
-                const buf = v as Buffer;
-                v =
-                  buf.length === 0
-                    ? 0
-                    : buf.readUIntBE(0, Math.min(buf.length, 6));
+                v = decodeMysqlBitBuffer(v as Buffer, bitIntCols.get(i) ?? 0);
               }
             }
             if (
@@ -673,13 +909,13 @@ export class MySQLDriver extends BaseDBDriver {
 
   mapTypeCategory(nativeType: string): TypeCategory {
     const ct = nativeType.toLowerCase();
-    const base = ct.split("(")[0].trim();
+    const base = mysqlTypeName(nativeType);
     // Boolean
     if (
       base === "bool" ||
       base === "boolean" ||
-      (base === "tinyint" && ct.includes("(1)")) ||
-      (base === "bit" && ct.includes("(1)"))
+      (base === "tinyint" && /tinyint\s*\(\s*1\s*\)/.test(ct)) ||
+      (base === "bit" && /bit\s*\(\s*1\s*\)/.test(ct))
     )
       return "boolean";
     // Integer
@@ -735,16 +971,16 @@ export class MySQLDriver extends BaseDBDriver {
 
   isBooleanType(nativeType: string): boolean {
     const ct = nativeType.toLowerCase();
-    const base = ct.split("(")[0].trim();
+    const base = mysqlTypeName(nativeType);
     if (base === "bool" || base === "boolean") return true;
-    if (base === "tinyint" && ct.includes("(1)")) return true;
-    if (base === "bit" && ct.includes("(1)")) return true;
+    if (base === "tinyint" && /tinyint\s*\(\s*1\s*\)/.test(ct)) return true;
+    if (base === "bit" && /bit\s*\(\s*1\s*\)/.test(ct)) return true;
     return false;
   }
 
   isDatetimeWithTime(nativeType: string): boolean {
-    const ct = nativeType.toLowerCase();
-    return ct === "datetime" || ct === "timestamp";
+    const base = mysqlTypeName(nativeType);
+    return base === "datetime" || base === "timestamp";
   }
 
   // ─── MySQL SQL helpers ───
@@ -813,11 +1049,25 @@ export class MySQLDriver extends BaseDBDriver {
 
     const typeName = mysqlTypeName(column.nativeType);
     if (typeName === "date") {
-      return normalizeMysqlDateInput(value) ?? value;
+      const normalized = normalizeMysqlDateInput(value);
+      if (normalized !== null) {
+        return normalized;
+      }
+      if (looksLikeMysqlDateInput(value)) {
+        throw invalidMysqlTemporalInputError(column.name, typeName);
+      }
+      return value;
     }
 
     if (typeName === "datetime" || typeName === "timestamp") {
-      return normalizeMysqlDatetimeInput(value) ?? value;
+      const normalized = normalizeMysqlDatetimeInput(value);
+      if (normalized !== null) {
+        return normalized;
+      }
+      if (looksLikeMysqlDatetimeInput(value)) {
+        throw invalidMysqlTemporalInputError(column.name, typeName);
+      }
+      return value;
     }
 
     return value;
@@ -835,6 +1085,10 @@ export class MySQLDriver extends BaseDBDriver {
       return JSON.stringify(value);
     }
     if (this.isDatetimeWithTime(column.nativeType)) {
+      if (typeof value === "string") {
+        const normalized = normalizeMysqlDatetimeInput(value);
+        if (normalized !== null) return normalized;
+      }
       const formatted = formatDatetimeForDisplay(value);
       if (formatted !== null) return formatted;
     }
@@ -897,10 +1151,11 @@ export class MySQLDriver extends BaseDBDriver {
 
     if (
       this.isNumericCategory(column.category) &&
-      this.isNumericCompareUnsafe(column.nativeType) &&
+      this.isApproximateNumericType(column.nativeType) &&
       typeof val === "string" &&
       Number.isFinite(Number(val)) &&
-      val !== ""
+      val !== "" &&
+      (operator === "eq" || operator === "neq")
     ) {
       const numericValue = Number(val);
       const tolerance = this.approximateNumericTolerance(val);
@@ -921,7 +1176,6 @@ export class MySQLDriver extends BaseDBDriver {
     if (
       this.isNumericCategory(column.category) &&
       typeof val === "string" &&
-      !this.isNumericCompareUnsafe(column.nativeType) &&
       !Number.isNaN(Number(val)) &&
       val !== ""
     ) {
@@ -960,18 +1214,9 @@ export class MySQLDriver extends BaseDBDriver {
     return { sql: `CAST(${col} AS CHAR) LIKE ?`, params: [mysqlVal] };
   }
 
-  private isNumericCompareUnsafe(nativeType: string): boolean {
-    const ct = nativeType.toLowerCase().split("(")[0].trim();
-    return (
-      ct === "date" ||
-      ct === "datetime" ||
-      ct === "timestamp" ||
-      ct === "year" ||
-      ct === "time" ||
-      ct === "float" ||
-      ct === "real" ||
-      ct === "double"
-    );
+  private isApproximateNumericType(nativeType: string): boolean {
+    const base = mysqlTypeName(nativeType);
+    return base === "float" || base === "real" || base === "double";
   }
 
   private approximateNumericTolerance(rawValue: string): number {

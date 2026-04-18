@@ -137,4 +137,70 @@ describe("ConnectionManager.beginConnect", () => {
       )._connectingMap.has("conn-1"),
     ).toBe(false);
   });
+
+  it("preserves the real schema name when preloading schema cache", async () => {
+    const manager = new ConnectionManager(makeContext());
+    const driver = {
+      listDatabases: vi
+        .fn()
+        .mockResolvedValue([{ name: "appdb", schemas: [] }]),
+      listSchemas: vi.fn().mockResolvedValue([{ name: "dbo" }]),
+      listObjects: vi
+        .fn()
+        .mockResolvedValue([{ schema: "dbo", name: "users", type: "table" }]),
+      describeTable: vi.fn().mockResolvedValue([
+        {
+          name: "id",
+          type: "int",
+          nullable: false,
+          isPrimaryKey: true,
+          isForeignKey: false,
+        },
+      ]),
+    };
+
+    const tables = await (
+      manager as unknown as {
+        _loadSchemaInternal: (
+          drv: typeof driver,
+          config: { database: string },
+        ) => Promise<Array<{ schema: string; table: string }>>;
+      }
+    )._loadSchemaInternal(driver, { database: "appdb" });
+
+    expect(tables).toEqual([
+      {
+        schema: "dbo",
+        table: "users",
+        columns: [{ name: "id", type: "int" }],
+      },
+    ]);
+  });
+
+  it("limits schema preload to the active database", async () => {
+    const manager = new ConnectionManager(makeContext());
+    const driver = {
+      listDatabases: vi.fn().mockResolvedValue([
+        { name: "appdb", schemas: [] },
+        { name: "otherdb", schemas: [] },
+      ]),
+      listSchemas: vi.fn().mockResolvedValue([{ name: "dbo" }]),
+      listObjects: vi.fn().mockResolvedValue([]),
+      describeTable: vi.fn().mockResolvedValue([]),
+    };
+
+    await (
+      manager as unknown as {
+        _loadSchemaInternal: (
+          drv: typeof driver,
+          config: { database: string },
+        ) => Promise<unknown>;
+      }
+    )._loadSchemaInternal(driver, { database: "appdb" });
+
+    expect(driver.listSchemas).toHaveBeenCalledTimes(1);
+    expect(driver.listSchemas).toHaveBeenCalledWith("appdb");
+    expect(driver.listObjects).toHaveBeenCalledTimes(1);
+    expect(driver.listObjects).toHaveBeenCalledWith("appdb", "dbo");
+  });
 });

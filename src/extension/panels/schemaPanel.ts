@@ -133,7 +133,7 @@ export class SchemaPanel {
         }
         try {
           const [columns, indexes, foreignKeys] = await Promise.all([
-            driver.describeTable(this.database, this.schema, this.table),
+            driver.describeColumns(this.database, this.schema, this.table),
             driver
               .getIndexes(this.database, this.schema, this.table)
               .catch(() => []),

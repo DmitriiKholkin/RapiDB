@@ -72,6 +72,7 @@ export interface ColumnMeta {
   nullable: boolean;
   defaultValue?: string;
   isPrimaryKey: boolean;
+  primaryKeyOrdinal?: number;
   isForeignKey: boolean;
   isAutoIncrement?: boolean;
 }
@@ -102,16 +103,18 @@ export interface ForeignKeyMeta {
 
 export function isNumericCategory(category: TypeCategory): boolean {
   return (
-    category === "integer" ||
-    category === "float" ||
-    category === "decimal"
+    category === "integer" || category === "float" || category === "decimal"
   );
 }
 
 export function defaultFilterOperator(
   column: Pick<ColumnTypeMeta, "category" | "isBoolean">,
 ): "eq" | "like" {
-  if (column.isBoolean || isNumericCategory(column.category) || column.category === "date") {
+  if (
+    column.isBoolean ||
+    isNumericCategory(column.category) ||
+    column.category === "date"
+  ) {
     return "eq";
   }
   return "like";
@@ -160,54 +163,57 @@ export function coerceFilterExpressions(
 ): FilterExpression[] {
   if (!Array.isArray(rawFilters)) return [];
 
-  return rawFilters.flatMap<FilterExpression>((rawFilter): FilterExpression[] => {
-    if (!rawFilter || typeof rawFilter !== "object") {
-      return [];
-    }
+  return rawFilters.flatMap<FilterExpression>(
+    (rawFilter): FilterExpression[] => {
+      if (!rawFilter || typeof rawFilter !== "object") {
+        return [];
+      }
 
-    const filter = rawFilter as Record<string, unknown>;
-    const columnName = typeof filter.column === "string" ? filter.column : null;
-    if (!columnName) return [];
+      const filter = rawFilter as Record<string, unknown>;
+      const columnName =
+        typeof filter.column === "string" ? filter.column : null;
+      if (!columnName) return [];
 
-    const operator = filter.operator;
+      const operator = filter.operator;
 
-    if (operator === "is_null" || operator === "is_not_null") {
-      return [{ column: columnName, operator }];
-    }
+      if (operator === "is_null" || operator === "is_not_null") {
+        return [{ column: columnName, operator }];
+      }
 
-    if (operator === "between") {
-      const value = filter.value;
+      if (operator === "between") {
+        const value = filter.value;
+        if (
+          Array.isArray(value) &&
+          value.length === 2 &&
+          typeof value[0] === "string" &&
+          typeof value[1] === "string"
+        ) {
+          return [
+            {
+              column: columnName,
+              operator,
+              value: [value[0], value[1]],
+            },
+          ];
+        }
+        return [];
+      }
+
       if (
-        Array.isArray(value) &&
-        value.length === 2 &&
-        typeof value[0] === "string" &&
-        typeof value[1] === "string"
+        typeof operator === "string" &&
+        SCALAR_FILTER_OPERATORS.has(operator as ScalarFilterOperator) &&
+        typeof filter.value === "string"
       ) {
         return [
           {
             column: columnName,
-            operator,
-            value: [value[0], value[1]],
+            operator: operator as ScalarFilterOperator,
+            value: filter.value,
           },
         ];
       }
+
       return [];
-    }
-
-    if (
-      typeof operator === "string" &&
-      SCALAR_FILTER_OPERATORS.has(operator as ScalarFilterOperator) &&
-      typeof filter.value === "string"
-    ) {
-      return [
-        {
-          column: columnName,
-          operator: operator as ScalarFilterOperator,
-          value: filter.value,
-        },
-      ];
-    }
-
-    return [];
-  });
+    },
+  );
 }

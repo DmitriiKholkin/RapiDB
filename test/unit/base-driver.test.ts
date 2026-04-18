@@ -6,8 +6,22 @@ import {
   isoToLocalDateStr,
   parseHexToBuffer,
 } from "../../src/extension/dbDrivers/BaseDBDriver";
+import type {
+  ColumnMeta,
+  ColumnTypeMeta,
+  TypeCategory,
+} from "../../src/extension/dbDrivers/types";
 import { NULL_SENTINEL } from "../../src/extension/dbDrivers/types";
 import { col, StubDriver } from "./helpers";
+
+type StubDriverInternals = StubDriver & {
+  enrichColumn: (column: ColumnMeta) => ColumnTypeMeta;
+  isFilterable: (nativeType: string, category: TypeCategory) => boolean;
+};
+
+function driverInternals(driver: StubDriver): StubDriverInternals {
+  return driver as unknown as StubDriverInternals;
+}
 
 // ─── Standalone utility functions ───
 
@@ -115,9 +129,7 @@ describe("normalizeFilterValue", () => {
       category: "integer",
     });
 
-    expect(drv.normalizeFilterValue(column, "in", "1,  2 ,3")).toBe(
-      "1, 2, 3",
-    );
+    expect(drv.normalizeFilterValue(column, "in", "1,  2 ,3")).toBe("1, 2, 3");
   });
 
   it("normalizes date comparisons from SQL datetime text", () => {
@@ -274,6 +286,26 @@ describe("BaseDBDriver defaults", () => {
       ];
       expect(drv.buildOrderByDefault(cols)).toBe('ORDER BY "a", "b"');
     });
+
+    it("orders composite PK columns by primary key ordinal", () => {
+      const cols = [
+        col({
+          name: "tenant_id",
+          type: "integer",
+          isPrimaryKey: true,
+          primaryKeyOrdinal: 2,
+        }),
+        col({
+          name: "user_id",
+          type: "integer",
+          isPrimaryKey: true,
+          primaryKeyOrdinal: 1,
+        }),
+      ];
+      expect(drv.buildOrderByDefault(cols)).toBe(
+        'ORDER BY "user_id", "tenant_id"',
+      );
+    });
   });
 
   describe("buildInsertValueExpr", () => {
@@ -417,7 +449,7 @@ describe("BaseDBDriver defaults", () => {
 
   describe("enrichColumn", () => {
     it("enriches a basic text column", () => {
-      const result = (drv as any).enrichColumn({
+      const result = driverInternals(drv).enrichColumn({
         name: "title",
         type: "text",
         nullable: true,
@@ -433,7 +465,7 @@ describe("BaseDBDriver defaults", () => {
     });
 
     it("enriches a boolean column", () => {
-      const result = (drv as any).enrichColumn({
+      const result = driverInternals(drv).enrichColumn({
         name: "active",
         type: "boolean",
         nullable: false,
@@ -452,10 +484,10 @@ describe("BaseDBDriver defaults", () => {
 
     it("exposes null-only operators for nullable non-filterable columns", () => {
       const isFilterable = vi
-        .spyOn(drv as any, "isFilterable")
+        .spyOn(driverInternals(drv), "isFilterable")
         .mockReturnValue(false);
 
-      const result = (drv as any).enrichColumn({
+      const result = driverInternals(drv).enrichColumn({
         name: "notes",
         type: "text",
         nullable: true,
