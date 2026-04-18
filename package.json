@@ -35,15 +35,6 @@
     "database manager",
     "db client"
   ],
-  "activationEvents": [
-    "onView:rapidb-explorer",
-    "onView:rapidb-history",
-    "onView:rapidb-bookmarks",
-    "onCommand:rapidb.addConnection",
-    "onCommand:rapidb.newQuery",
-    "onCommand:rapidb.disconnectAll",
-    "onCommand:rapidb.refresh"
-  ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
@@ -496,7 +487,6 @@
     "lint": "eslint src --ext ts,tsx"
   },
   "devDependencies": {
-    "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@types/mssql": "^9.1.9",
     "@types/node": "^25.5.0",

@@ -1,16 +1,18 @@
 import { randomUUID } from "crypto";
 import * as vscode from "vscode";
+import type { ConnectionType } from "../shared/connectionTypes";
 import { MSSQLDriver } from "./dbDrivers/mssql";
 import { MySQLDriver } from "./dbDrivers/mysql";
 import { OracleDriver } from "./dbDrivers/oracle";
 import { PostgresDriver } from "./dbDrivers/postgres";
 import { SQLiteDriver } from "./dbDrivers/sqlite";
 import type { IDBDriver } from "./dbDrivers/types";
+import { normalizeUnknownError } from "./utils/errorHandling";
 
 export interface ConnectionConfig {
   id: string;
   name: string;
-  type: "mysql" | "pg" | "sqlite" | "mssql" | "oracle";
+  type: ConnectionType;
   host?: string;
   port?: number;
   database?: string;
@@ -55,6 +57,8 @@ interface SchemaCacheEntry {
   tables: SchemaTableEntry[];
   loading: Promise<void> | null;
 }
+
+type StoredConnectionConfig = ConnectionConfig & { user?: string };
 
 async function pMapWithLimit<T, R>(
   items: T[],
@@ -168,11 +172,11 @@ export class ConnectionManager {
     }
     const config = vscode.workspace.getConfiguration("rapidb");
     this._connectionsCache = (
-      config.get<ConnectionConfig[]>("connections") ?? []
+      config.get<StoredConnectionConfig[]>("connections") ?? []
     ).map((c) => ({
       ...c,
       id: c.id ?? randomUUID(),
-      username: c.username ?? (c as any).user,
+      username: c.username ?? c.user,
     }));
     return this._connectionsCache;
   }
@@ -270,10 +274,10 @@ export class ConnectionManager {
         return new MSSQLDriver(config);
       case "oracle":
         return new OracleDriver(config);
-      default:
-        throw new Error(
-          `[RapiDB] Unknown driver type: ${(config as any).type}`,
-        );
+      default: {
+        const unknownType: never = config.type;
+        throw new Error(`[RapiDB] Unknown driver type: ${unknownType}`);
+      }
     }
   }
 
@@ -476,11 +480,12 @@ export class ConnectionManager {
       await driver.connect();
       await driver.disconnect();
       return { success: true };
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const error = normalizeUnknownError(err);
       try {
         await driver.disconnect();
       } catch {}
-      return { success: false, error: err?.message ?? String(err) };
+      return { success: false, error: error.message };
     }
   }
 
@@ -506,7 +511,7 @@ export class ConnectionManager {
       })),
       { placeHolder: "Select a connection" },
     );
-    return (pick as any)?.id;
+    return pick?.id;
   }
 
   getHistory(connectionId?: string): HistoryEntry[] {

@@ -4,6 +4,16 @@ import * as path from "path";
 import * as vscode from "vscode";
 import type { ConnectionManager } from "../connectionManager";
 import { formatDatetimeForDisplay } from "../dbDrivers/BaseDBDriver";
+import {
+  logErrorWithContext,
+  normalizeUnknownError,
+} from "../utils/errorHandling";
+import { createWebviewShell } from "./webviewShell";
+
+interface PanelMessage {
+  type: string;
+  payload?: unknown;
+}
 
 export class QueryPanel {
   private static readonly viewType = "rapidb.queryPanel";
@@ -11,7 +21,6 @@ export class QueryPanel {
   private static _seq = 0;
 
   private readonly panel: vscode.WebviewPanel;
-  private readonly context: vscode.ExtensionContext;
   private readonly connectionManager: ConnectionManager;
   readonly originalConnectionId: string;
   private formatOnOpen = false;
@@ -34,18 +43,9 @@ export class QueryPanel {
     isBookmarked?: boolean,
   ) {
     this.panel = panel;
-    this.context = context;
     this.connectionManager = connectionManager;
     this.originalConnectionId = connectionId;
     this.activeConnectionId = connectionId;
-
-    this.panel.webview.options = {
-      enableScripts: true,
-      localResourceRoots: [
-        vscode.Uri.joinPath(context.extensionUri, "dist"),
-        vscode.Uri.joinPath(context.extensionUri, "media"),
-      ],
-    };
 
     this.formatOnOpen = formatOnOpen ?? false;
     this.isBookmarked = isBookmarked ?? false;
@@ -53,13 +53,10 @@ export class QueryPanel {
     this.panel.webview.onDidReceiveMessage(async (msg) => {
       try {
         await this.handleMessage(msg);
-      } catch (err: any) {
-        console.error(
-          "[RapiDB] QueryPanel unhandled error:",
-          err?.message ?? err,
-        );
+      } catch (err: unknown) {
+        const error = logErrorWithContext("QueryPanel unhandled error", err);
         vscode.window.showErrorMessage(
-          `[RapiDB] Unexpected error: ${err?.message ?? String(err)}`,
+          `[RapiDB] Unexpected error: ${error.message}`,
         );
       }
     });
@@ -160,13 +157,11 @@ export class QueryPanel {
     this.panel.webview.postMessage({ type: "connections", payload: conns });
   }
 
-  private async handleMessage(msg: {
-    type: string;
-    payload?: any;
-  }): Promise<void> {
+  private async handleMessage(msg: PanelMessage): Promise<void> {
     switch (msg.type) {
       case "activeConnectionChanged": {
-        const newId: string = msg.payload?.connectionId;
+        const payload = (msg.payload ?? {}) as { connectionId?: string };
+        const newId = payload.connectionId;
         if (!newId) {
           break;
         }
@@ -176,18 +171,22 @@ export class QueryPanel {
       }
 
       case "executeQuery": {
-        const sql: string = msg.payload?.sql ?? "";
+        const payload = (msg.payload ?? {}) as {
+          sql?: string;
+          connectionId?: string;
+        };
+        const sql = payload.sql ?? "";
         if (!sql.trim()) {
           return;
         }
 
-        const connectionId: string =
-          msg.payload?.connectionId || this.originalConnectionId;
+        const connectionId = payload.connectionId || this.originalConnectionId;
 
         if (!this.connectionManager.isConnected(connectionId)) {
           try {
             await this.connectionManager.connectTo(connectionId);
-          } catch (err: any) {
+          } catch (err: unknown) {
+            const error = normalizeUnknownError(err);
             this.panel.webview.postMessage({
               type: "queryResult",
               payload: {
@@ -195,7 +194,7 @@ export class QueryPanel {
                 rows: [],
                 rowCount: 0,
                 executionTimeMs: 0,
-                error: `Cannot connect: ${err?.message ?? String(err)}`,
+                error: `Cannot connect: ${error.message}`,
               },
             });
             return;
@@ -242,7 +241,8 @@ export class QueryPanel {
             type: "queryResult",
             payload: { ...result, rows, truncated, truncatedAt: limit },
           });
-        } catch (err: any) {
+        } catch (err: unknown) {
+          const error = normalizeUnknownError(err);
           this.panel.webview.postMessage({
             type: "queryResult",
             payload: {
@@ -250,7 +250,7 @@ export class QueryPanel {
               rows: [],
               rowCount: 0,
               executionTimeMs: 0,
-              error: err?.message ?? String(err),
+              error: error.message,
             },
           });
         }
@@ -263,8 +263,8 @@ export class QueryPanel {
       }
 
       case "getSchema": {
-        const connectionId: string =
-          msg.payload?.connectionId || this.activeConnectionId;
+        const payload = (msg.payload ?? {}) as { connectionId?: string };
+        const connectionId = payload.connectionId || this.activeConnectionId;
 
         if (!this.connectionManager.isConnected(connectionId)) {
           this.panel.webview.postMessage({
@@ -424,10 +424,11 @@ export class QueryPanel {
             type: "bookmarkSaved",
             payload: { ok: true },
           });
-        } catch (err: any) {
+        } catch (err: unknown) {
+          const error = normalizeUnknownError(err);
           this.panel.webview.postMessage({
             type: "bookmarkSaved",
-            payload: { ok: false, error: err?.message ?? String(err) },
+            payload: { ok: false, error: error.message },
           });
         }
         break;
@@ -439,68 +440,36 @@ export class QueryPanel {
     context: vscode.ExtensionContext,
     initialSql?: string,
   ): string {
-    const webview = this.panel.webview;
-
-    const webviewJs = webview.asWebviewUri(
-      vscode.Uri.joinPath(context.extensionUri, "dist", "webview.js"),
-    );
-    const webviewCss = webview.asWebviewUri(
-      vscode.Uri.joinPath(context.extensionUri, "dist", "webview.css"),
-    );
-
-    const nonce = crypto.randomUUID();
-
     const conn = this.connectionManager.getConnection(
       this.originalConnectionId,
     );
     const connType = conn?.type ?? "";
 
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy"
-    content="default-src 'none';
-             worker-src blob:;
-             script-src 'nonce-${nonce}' ${webview.cspSource};
-             style-src ${webview.cspSource} 'unsafe-inline';
-             font-src ${webview.cspSource} data:;
-             img-src ${webview.cspSource} https: data:;" /> 
-  <title>RapiDB Query</title>
-  <link rel="stylesheet" href="${webviewCss}" />
-  <style nonce="${nonce}">
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body { height: 100%; overflow: hidden; }
-    body {
-      background: var(--vscode-editor-background);
-      color: var(--vscode-foreground);
-      font-family: var(--vscode-font-family, system-ui, sans-serif);
-      font-size: var(--vscode-font-size, 13px);
-    }
-    #root { height: 100vh; }
-    .monaco-editor .scrollbar .slider { background: var(--vscode-scrollbarSlider-background) !important; border-radius: 4px; }
-    .monaco-editor .scrollbar .slider:hover { background: var(--vscode-scrollbarSlider-hoverBackground) !important; }
-    ::-webkit-scrollbar { width: 8px; height: 8px; }
-    ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 4px; }
-    ::-webkit-scrollbar-thumb:hover { background: var(--vscode-scrollbarSlider-hoverBackground); }
-  </style>
-</head>
-<body>
-  <div id="root"></div>
-  <script nonce="${nonce}">
-    window.__RAPIDB_INITIAL_STATE__ = {
-      view:           'query',
-      connectionId:   ${JSON.stringify(this.originalConnectionId)},
-      connectionType: ${JSON.stringify(connType)},
-      initialSql:     ${JSON.stringify(initialSql ?? "")},
-      formatOnOpen:   ${JSON.stringify(this.formatOnOpen ?? false)},
-      isBookmarked:   ${JSON.stringify(this.isBookmarked ?? false)},
-    };
-  </script>
-  <script nonce="${nonce}" src="${webviewJs}"></script>
-</body>
-</html>`;
+    return createWebviewShell({
+      context,
+      webview: this.panel.webview,
+      title: "RapiDB Query",
+      initialState: {
+        view: "query",
+        connectionId: this.originalConnectionId,
+        connectionType: connType,
+        initialSql: initialSql ?? "",
+        formatOnOpen: this.formatOnOpen ?? false,
+        isBookmarked: this.isBookmarked ?? false,
+      },
+      includeMediaRoot: true,
+      extraCspDirectives: ["worker-src blob:"],
+      htmlStyles: "height: 100%; overflow: hidden;",
+      bodyStyles: "height: 100%; overflow: hidden;",
+      rootStyles: "height: 100vh;",
+      extraStyles: `
+        .monaco-editor .scrollbar .slider { background: var(--vscode-scrollbarSlider-background) !important; border-radius: 4px; }
+        .monaco-editor .scrollbar .slider:hover { background: var(--vscode-scrollbarSlider-hoverBackground) !important; }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--vscode-scrollbarSlider-hoverBackground); }
+      `,
+    });
   }
 }

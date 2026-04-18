@@ -11,6 +11,16 @@ import {
   type SortConfig,
   TableDataService,
 } from "../tableDataService";
+import {
+  logErrorWithContext,
+  normalizeUnknownError,
+} from "../utils/errorHandling";
+import { createWebviewShell } from "./webviewShell";
+
+interface PanelMessage {
+  type: string;
+  payload?: unknown;
+}
 
 export class TablePanel {
   private static readonly viewType = "rapidb.tablePanel";
@@ -47,11 +57,6 @@ export class TablePanel {
     this.table = table;
     this.isView = isView;
 
-    this.panel.webview.options = {
-      enableScripts: true,
-      localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, "dist")],
-    };
-
     this.panel.webview.html = this.buildHtml(context);
 
     const key = TablePanel.panelKey(connectionId, database, schema, table);
@@ -64,13 +69,10 @@ export class TablePanel {
     this.panel.webview.onDidReceiveMessage(async (msg) => {
       try {
         await this.handleMessage(msg);
-      } catch (err: any) {
-        console.error(
-          "[RapiDB] TablePanel unhandled error:",
-          err?.message ?? err,
-        );
+      } catch (err: unknown) {
+        const error = logErrorWithContext("TablePanel unhandled error", err);
         vscode.window.showErrorMessage(
-          `[RapiDB] Unexpected error: ${err?.message ?? String(err)}`,
+          `[RapiDB] Unexpected error: ${error.message}`,
         );
       }
     });
@@ -152,10 +154,7 @@ export class TablePanel {
     });
   }
 
-  private async handleMessage(msg: {
-    type: string;
-    payload?: any;
-  }): Promise<void> {
+  private async handleMessage(msg: PanelMessage): Promise<void> {
     const send = (type: string, payload: unknown) =>
       this.panel.webview.postMessage({ type, payload });
 
@@ -175,15 +174,22 @@ export class TablePanel {
             primaryKeyColumns: pkCols,
             isView: this.isView,
           });
-        } catch (err: any) {
-          send("tableError", { error: err?.message ?? String(err) });
+        } catch (err: unknown) {
+          const error = normalizeUnknownError(err);
+          send("tableError", { error: error.message });
         }
         break;
       }
 
       case "fetchPage": {
-        const raw = msg.payload ?? {};
-        const fetchId: number | undefined = raw.fetchId;
+        const raw = (msg.payload ?? {}) as {
+          fetchId?: number;
+          page?: number | string;
+          pageSize?: number | string;
+          filters?: unknown;
+          sort?: unknown;
+        };
+        const fetchId = raw.fetchId;
         const page = Math.max(1, Math.floor(Number(raw.page) || 1));
         const pageSize = Math.min(
           10000,
@@ -210,8 +216,9 @@ export class TablePanel {
             rows: result.rows,
             totalCount: result.totalCount,
           });
-        } catch (err: any) {
-          const errMsg = err?.message ?? String(err);
+        } catch (err: unknown) {
+          const error = normalizeUnknownError(err);
+          const errMsg = error.message;
           const isFilterError =
             /^\[RapiDB Filter\]/.test(errMsg) ||
             /invalid input syntax|invalid cidr|malformed array|not a valid (binary|hex|uuid)|syntax error in input|invalid value for type|invalid number|operator does not exist|conversion failed|arithmetic overflow|ORA-0(1841|1843|1858|1861|6502)|ORA-01722|incorrect (date|datetime|time)|Incorrect integer value|Truncated incorrect|data truncat/i.test(
@@ -223,7 +230,9 @@ export class TablePanel {
       }
 
       case "applyChanges": {
-        const { updates } = msg.payload ?? {};
+        const { updates } = (msg.payload ?? {}) as {
+          updates?: RowUpdate[];
+        };
         try {
           const result = await applyChangesTransactional(
             this.cm,
@@ -235,17 +244,20 @@ export class TablePanel {
             this.cachedColumns,
           );
           send("applyResult", result);
-        } catch (err: any) {
+        } catch (err: unknown) {
+          const error = normalizeUnknownError(err);
           send("applyResult", {
             success: false,
-            error: err?.message ?? String(err),
+            error: error.message,
           });
         }
         break;
       }
 
       case "insertRow": {
-        const { values } = msg.payload ?? {};
+        const { values = {} } = (msg.payload ?? {}) as {
+          values?: Record<string, unknown>;
+        };
         try {
           await this.svc.insertRow(
             this.connectionId,
@@ -255,17 +267,20 @@ export class TablePanel {
             values,
           );
           send("insertResult", { success: true });
-        } catch (err: any) {
+        } catch (err: unknown) {
+          const error = normalizeUnknownError(err);
           send("insertResult", {
             success: false,
-            error: err?.message ?? String(err),
+            error: error.message,
           });
         }
         break;
       }
 
       case "deleteRows": {
-        const { primaryKeysList } = msg.payload ?? {};
+        const { primaryKeysList = [] } = (msg.payload ?? {}) as {
+          primaryKeysList?: Record<string, unknown>[];
+        };
         try {
           await this.svc.deleteRows(
             this.connectionId,
@@ -275,10 +290,11 @@ export class TablePanel {
             primaryKeysList,
           );
           send("deleteResult", { success: true });
-        } catch (err: any) {
+        } catch (err: unknown) {
+          const error = normalizeUnknownError(err);
           send("deleteResult", {
             success: false,
-            error: err?.message ?? String(err),
+            error: error.message,
           });
         }
         break;
@@ -312,7 +328,10 @@ export class TablePanel {
               });
               let headerWritten = false;
               const { sort: csvSort = null, filters: csvFilters = [] } =
-                msg.payload ?? {};
+                (msg.payload ?? {}) as {
+                  sort?: SortConfig | null;
+                  filters?: unknown[];
+                };
               try {
                 for await (const chunk of this.svc.exportAll(
                   this.connectionId,
@@ -355,10 +374,11 @@ export class TablePanel {
           vscode.window.showInformationMessage(
             `[RapiDB] Exported ${this.table} → ${path.basename(saveUri.fsPath)}`,
           );
-        } catch (err: any) {
-          if (err?.name !== "AbortError") {
+        } catch (err: unknown) {
+          const error = normalizeUnknownError(err);
+          if (error.name !== "AbortError") {
             vscode.window.showErrorMessage(
-              `[RapiDB] CSV export failed: ${err?.message ?? String(err)}`,
+              `[RapiDB] CSV export failed: ${error.message}`,
             );
           }
         }
@@ -366,7 +386,11 @@ export class TablePanel {
       }
 
       case "exportJSON": {
-        const { sort = null, filters: jsonFilters = [] } = msg.payload ?? {};
+        const { sort = null, filters: jsonFilters = [] } = (msg.payload ??
+          {}) as {
+          sort?: SortConfig | null;
+          filters?: unknown[];
+        };
         const saveUri = await vscode.window.showSaveDialog({
           defaultUri: vscode.Uri.file(
             path.join(os.homedir(), "Downloads", `${this.table}.json`),
@@ -410,7 +434,7 @@ export class TablePanel {
                       Object.entries(row).map(([k, v]) => [
                         k,
                         v instanceof Date
-                          ? isNaN(v.getTime())
+                          ? Number.isNaN(v.getTime())
                             ? null
                             : formatCellValue(v)
                           : (v ?? null),
@@ -440,10 +464,11 @@ export class TablePanel {
           vscode.window.showInformationMessage(
             `[RapiDB] Exported ${this.table} → ${path.basename(saveUri.fsPath)}`,
           );
-        } catch (err: any) {
-          if (err?.name !== "AbortError") {
+        } catch (err: unknown) {
+          const error = normalizeUnknownError(err);
+          if (error.name !== "AbortError") {
             vscode.window.showErrorMessage(
-              `[RapiDB] JSON export failed: ${err?.message ?? String(err)}`,
+              `[RapiDB] JSON export failed: ${error.message}`,
             );
           }
         }
@@ -451,7 +476,7 @@ export class TablePanel {
       }
 
       case "confirmDelete": {
-        const { count } = msg.payload ?? {};
+        const { count } = (msg.payload ?? {}) as { count?: number };
         const answer = await vscode.window.showWarningMessage(
           `Delete ${count} row${count !== 1 ? "s" : ""} from "${this.table}"? This cannot be undone.`,
           { modal: true },
@@ -464,75 +489,34 @@ export class TablePanel {
   }
 
   private buildHtml(context: vscode.ExtensionContext): string {
-    const webview = this.panel.webview;
+    return createWebviewShell({
+      context,
+      webview: this.panel.webview,
+      title: `${this.isView ? "View" : "Table"} - ${this.table}`,
+      initialState: {
+        view: "table",
+        connectionId: this.connectionId,
+        database: this.database,
+        schema: this.schema,
+        table: this.table,
+        isView: this.isView,
+        defaultPageSize: this.cm.getDefaultPageSize(),
+      },
+      htmlStyles: "height: 100%; overflow: hidden;",
+      bodyStyles: "height: 100%; overflow: hidden;",
+      rootStyles: "height: 100vh;",
+      extraStyles: `
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--vscode-scrollbarSlider-hoverBackground); }
 
-    const webviewJs = webview.asWebviewUri(
-      vscode.Uri.joinPath(context.extensionUri, "dist", "webview.js"),
-    );
-    const webviewCss = webview.asWebviewUri(
-      vscode.Uri.joinPath(context.extensionUri, "dist", "webview.css"),
-    );
-
-    function escapeHtml(str: string): string {
-      return str
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
-    }
-
-    const nonce = crypto.randomUUID();
-
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy"
-    content="default-src 'none';
-             script-src 'nonce-${nonce}' ${webview.cspSource};
-             style-src ${webview.cspSource} 'unsafe-inline';
-             font-src ${webview.cspSource} data:;
-             img-src ${webview.cspSource} https: data:;" />
-  <title>${this.isView ? "View" : "Table"} — ${escapeHtml(this.table)}</title>
-  <link rel="stylesheet" href="${webviewCss}" />
-  <style nonce="${nonce}">
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body { height: 100%; overflow: hidden; }
-    body {
-      background: var(--vscode-editor-background);
-      color: var(--vscode-foreground);
-      font-family: var(--vscode-font-family, system-ui, sans-serif);
-      font-size: var(--vscode-font-size, 13px);
-    }
-    #root { height: 100vh; }
-    ::-webkit-scrollbar { width: 8px; height: 8px; }
-    ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 4px; }
-    ::-webkit-scrollbar-thumb:hover { background: var(--vscode-scrollbarSlider-hoverBackground); }
-    
-    .pk-key-icon {
-      display: inline-flex; align-items: center; justify-content: center;
-      vertical-align: middle;
-    }
-  </style>
-</head>
-<body>
-  <div id="root"></div>
-  <script nonce="${nonce}">
-    window.__RAPIDB_INITIAL_STATE__ = {
-      view:            'table',
-      connectionId:    ${JSON.stringify(this.connectionId)},
-      database:        ${JSON.stringify(this.database)},
-      schema:          ${JSON.stringify(this.schema)},
-      table:           ${JSON.stringify(this.table)},
-      isView:          ${JSON.stringify(this.isView)},
-      defaultPageSize: ${JSON.stringify(this.cm.getDefaultPageSize())},
-    };
-  </script>
-  <script nonce="${nonce}" src="${webviewJs}"></script>
-</body>
-</html>`;
+        .pk-key-icon {
+          display: inline-flex; align-items: center; justify-content: center;
+          vertical-align: middle;
+        }
+      `,
+    });
   }
 }
 
@@ -542,7 +526,7 @@ function formatCellValue(value: unknown): string {
   }
 
   if (value instanceof Date) {
-    if (isNaN(value.getTime())) {
+    if (Number.isNaN(value.getTime())) {
       return "";
     }
 
@@ -576,7 +560,7 @@ function normalizeFilters(
 
   const columnMap = new Map(columns.map((column) => [column.name, column]));
 
-  return rawFilters.flatMap((rawFilter) => {
+  return rawFilters.flatMap<Filter>((rawFilter): Filter[] => {
     if (!rawFilter || typeof rawFilter !== "object") {
       return [];
     }
@@ -585,11 +569,13 @@ function normalizeFilters(
     const columnName = typeof filter.column === "string" ? filter.column : null;
     if (!columnName) return [];
 
-    if (filter.operator === "is_null" || filter.operator === "is_not_null") {
-      return [{ column: columnName, operator: filter.operator }];
+    const operator = filter.operator;
+
+    if (operator === "is_null" || operator === "is_not_null") {
+      return [{ column: columnName, operator }];
     }
 
-    if (filter.operator === "between") {
+    if (operator === "between") {
       const value = filter.value;
       if (
         Array.isArray(value) &&

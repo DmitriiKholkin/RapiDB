@@ -1,5 +1,15 @@
 import * as vscode from "vscode";
 import type { ConnectionConfig, ConnectionManager } from "../connectionManager";
+import {
+  logErrorWithContext,
+  normalizeUnknownError,
+} from "../utils/errorHandling";
+import { createWebviewShell } from "./webviewShell";
+
+interface PanelMessage {
+  type: string;
+  payload?: unknown;
+}
 
 export class ConnectionFormPanel {
   private static readonly viewType = "rapidb.connectionForm";
@@ -19,26 +29,18 @@ export class ConnectionFormPanel {
     this.context = context;
     this.connectionManager = connectionManager;
 
-    this.panel.webview.options = {
-      enableScripts: true,
-      localResourceRoots: [
-        vscode.Uri.joinPath(context.extensionUri, "dist"),
-        vscode.Uri.joinPath(context.extensionUri, "media"),
-      ],
-    };
-
     this.panel.webview.html = this.buildHtml(context, existing);
     this.panel.webview.onDidReceiveMessage(async (msg) => {
       try {
         await this.handleMessage(msg);
-      } catch (err: any) {
-        console.error(
-          "[RapiDB] ConnectionFormPanel unhandled error:",
-          err?.message ?? err,
+      } catch (err: unknown) {
+        const error = logErrorWithContext(
+          "ConnectionFormPanel unhandled error",
+          err,
         );
         this.panel.webview.postMessage({
-          type: "testResult",
-          payload: { success: false, error: err?.message ?? String(err) },
+          type: msg.type === "saveConnection" ? "saveResult" : "testResult",
+          payload: { success: false, error: error.message },
         });
       }
     });
@@ -83,24 +85,22 @@ export class ConnectionFormPanel {
     });
   }
 
-  private async handleMessage(msg: {
-    type: string;
-    payload?: any;
-  }): Promise<void> {
+  private async handleMessage(msg: PanelMessage): Promise<void> {
     switch (msg.type) {
       case "saveConnection": {
-        const raw: ConnectionConfig = msg.payload;
+        const raw = msg.payload as ConnectionConfig;
 
         if (raw.useSecretStorage) {
           const password = raw.password ?? "";
           try {
             await this.context.secrets.store(raw.id, password);
-          } catch (err: any) {
+          } catch (err: unknown) {
+            const error = normalizeUnknownError(err);
             this.panel.webview.postMessage({
-              type: "testResult",
+              type: "saveResult",
               payload: {
                 success: false,
-                error: `SecretStorage unavailable: ${err?.message ?? String(err)}. Password was not saved.`,
+                error: `SecretStorage unavailable: ${error.message}. Password was not saved.`,
               },
             });
             return;
@@ -139,49 +139,15 @@ export class ConnectionFormPanel {
     context: vscode.ExtensionContext,
     existing?: ConnectionConfig,
   ): string {
-    const webview = this.panel.webview;
-
-    const webviewJs = webview.asWebviewUri(
-      vscode.Uri.joinPath(context.extensionUri, "dist", "webview.js"),
-    );
-    const webviewCss = webview.asWebviewUri(
-      vscode.Uri.joinPath(context.extensionUri, "dist", "webview.css"),
-    );
-
-    const nonce = crypto.randomUUID();
-    const initialState = JSON.stringify({
-      view: "connection",
-      existing: existing ?? null,
+    return createWebviewShell({
+      context,
+      webview: this.panel.webview,
+      title: "RapiDB - Connection",
+      initialState: {
+        view: "connection",
+        existing: existing ?? null,
+      },
+      includeMediaRoot: true,
     });
-
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy"
-    content="default-src 'none';
-             script-src 'nonce-${nonce}' ${webview.cspSource};
-             style-src ${webview.cspSource} 'unsafe-inline';
-             font-src ${webview.cspSource} data:;
-             img-src ${webview.cspSource} https: data:;" />
-  <title>RapiDB — Connection</title>
-  <link rel="stylesheet" href="${webviewCss}" />
-  <style nonce="${nonce}">
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: var(--vscode-editor-background); color: var(--vscode-foreground);
-           font-family: var(--vscode-font-family, system-ui, sans-serif);
-           font-size: var(--vscode-font-size, 13px); }
-    #root { height: 100vh; overflow: auto; }
-  </style>
-</head>
-<body>
-  <div id="root"></div>
-  <script nonce="${nonce}">
-    window.__RAPIDB_INITIAL_STATE__ = ${initialState};
-  </script>
-  <script nonce="${nonce}" src="${webviewJs}"></script>
-</body>
-</html>`;
   }
 }

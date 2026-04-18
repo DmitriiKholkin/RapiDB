@@ -1,0 +1,81 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type * as vscode from "vscode";
+
+const randomUUID = vi.fn(() => "nonce-123");
+const joinPath = vi.fn((base: { path: string }, ...parts: string[]) => ({
+  path: [base.path, ...parts].join("/"),
+}));
+
+vi.mock("crypto", () => ({
+  randomUUID,
+}));
+
+vi.mock("vscode", () => ({
+  Uri: {
+    joinPath,
+  },
+}));
+
+import {
+  configureWebviewResources,
+  createWebviewShell,
+} from "../../src/extension/panels/webviewShell";
+
+describe("webviewShell", () => {
+  const context = {
+    extensionUri: { path: "/extension" },
+  } as unknown as vscode.ExtensionContext;
+
+  let webview: {
+    options?: vscode.WebviewOptions;
+    cspSource: string;
+    asWebviewUri: ReturnType<typeof vi.fn>;
+  } & vscode.Webview;
+
+  beforeEach(() => {
+    joinPath.mockClear();
+    randomUUID.mockClear();
+    webview = {
+      cspSource: "vscode-webview-resource:",
+      asWebviewUri: vi.fn((uri: { path: string }) => `webview:${uri.path}`),
+    };
+  });
+
+  it("configures local resource roots including media when requested", () => {
+    const extraRoot = { path: "/tmp/extra" } as unknown as vscode.Uri;
+
+    configureWebviewResources({
+      context,
+      webview,
+      includeMediaRoot: true,
+      extraLocalResourceRoots: [extraRoot],
+    });
+
+    expect(webview.options).toEqual({
+      enableScripts: true,
+      localResourceRoots: [
+        { path: "/extension/dist" },
+        { path: "/extension/media" },
+        extraRoot,
+      ],
+    });
+  });
+
+  it("escapes the title and injects the initial state into the shell html", () => {
+    const html = createWebviewShell({
+      context,
+      webview,
+      title: 'Admin <Panel> & "Test"',
+      initialState: { ready: true },
+    });
+
+    expect(html).toContain(
+      "<title>Admin &lt;Panel&gt; &amp; &quot;Test&quot;</title>",
+    );
+    expect(html).toContain('window.__RAPIDB_INITIAL_STATE__ = {"ready":true};');
+    expect(html).toContain(
+      "script-src 'nonce-nonce-123' vscode-webview-resource:",
+    );
+    expect(webview.asWebviewUri).toHaveBeenCalledTimes(2);
+  });
+});

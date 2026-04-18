@@ -9,7 +9,7 @@
       "DOM.Iterable"
     ],
     "outDir": "./dist/webview",
-    "rootDir": "./src/webview",
+    "rootDir": "./src",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
@@ -21,7 +21,8 @@
     "noEmit": true
   },
   "include": [
-    "src/webview/**/*"
+    "src/webview/**/*",
+    "src/shared/**/*"
   ],
   "exclude": [
     "node_modules",
