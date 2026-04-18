@@ -3,6 +3,7 @@ import type {
   ConnectionConfig,
   ConnectionManager,
 } from "../../src/extension/connectionManager";
+import { OracleDriver } from "../../src/extension/dbDrivers/oracle";
 import type {
   ColumnTypeMeta,
   IDBDriver,
@@ -16,10 +17,13 @@ import {
   type RowUpdate,
   TableDataService,
 } from "../../src/extension/tableDataService";
+import { StubDriver } from "./helpers";
 
 // ─── Mock driver factory ───
 
 function makeMockDriver(overrides: Partial<IDBDriver> = {}): IDBDriver {
+  const baseDriver = new StubDriver();
+
   return {
     connect: vi.fn(),
     disconnect: vi.fn(),
@@ -53,6 +57,7 @@ function makeMockDriver(overrides: Partial<IDBDriver> = {}): IDBDriver {
     },
     coerceInputValue: (v: unknown) => v,
     formatOutputValue: (v: unknown) => v,
+    normalizeFilterValue: baseDriver.normalizeFilterValue.bind(baseDriver),
     buildFilterCondition: vi.fn().mockReturnValue(null),
     buildInsertValueExpr: () => "?",
     buildSetExpr: (c: ColumnTypeMeta) => `"${c.name}" = ?`,
@@ -203,6 +208,151 @@ describe("TableDataService", () => {
       expect(page.totalCount).toBe(1);
       expect(page.rows).toHaveLength(1);
       expect(page.rows[0]).toEqual({ id: 1, name: "Alice", active: true });
+    });
+
+    it("keeps Oracle interval table values as plain strings", async () => {
+      const oracle = new OracleDriver({
+        id: "ora",
+        name: "ora",
+        type: "oracle",
+        host: "localhost",
+        port: 1521,
+        database: "testdb",
+        username: "u",
+        password: "p",
+      });
+
+      driver = makeMockDriver({
+        formatOutputValue: oracle.formatOutputValue.bind(oracle),
+      });
+      cm = makeMockCM(driver);
+      svc = new TableDataService(cm);
+
+      const cols: ColumnDef[] = [
+        {
+          name: "IVAL",
+          type: "INTERVAL DAY TO SECOND",
+          nullable: true,
+          isPrimaryKey: false,
+          isForeignKey: false,
+          category: "text",
+          nativeType: "INTERVAL DAY TO SECOND",
+          filterable: true,
+          editable: true,
+          filterOperators: ["like"],
+          isBoolean: false,
+        },
+      ];
+
+      (driver.describeColumns as any).mockResolvedValue(cols);
+      (driver.query as any)
+        .mockResolvedValueOnce({
+          columns: ["cnt"],
+          rows: [{ __col_0: 1 }],
+          rowCount: 1,
+          executionTimeMs: 0,
+        })
+        .mockResolvedValueOnce({
+          columns: ["IVAL"],
+          rows: [
+            {
+              __col_0: {
+                days: 3,
+                hours: 4,
+                minutes: 5,
+                seconds: 6,
+                fseconds: 120000000,
+              },
+            },
+          ],
+          rowCount: 1,
+          executionTimeMs: 0,
+        });
+
+      const page = await svc.getPage(
+        "conn1",
+        "testdb",
+        "public",
+        "users",
+        1,
+        25,
+        [],
+      );
+
+      expect(page.rows).toEqual([{ IVAL: "3 04:05:06.12" }]);
+      expect(typeof page.rows[0]?.IVAL).toBe("string");
+      expect(page.rows[0]?.IVAL).not.toBe("[object Object]");
+    });
+
+    it("stringifies unexpected Oracle interval objects instead of leaking raw objects", async () => {
+      const oracle = new OracleDriver({
+        id: "ora",
+        name: "ora",
+        type: "oracle",
+        host: "localhost",
+        port: 1521,
+        database: "testdb",
+        username: "u",
+        password: "p",
+      });
+
+      driver = makeMockDriver({
+        formatOutputValue: oracle.formatOutputValue.bind(oracle),
+      });
+      cm = makeMockCM(driver);
+      svc = new TableDataService(cm);
+
+      const cols: ColumnDef[] = [
+        {
+          name: "IVAL",
+          type: "INTERVAL DAY TO SECOND",
+          nullable: true,
+          isPrimaryKey: false,
+          isForeignKey: false,
+          category: "text",
+          nativeType: "INTERVAL DAY TO SECOND",
+          filterable: true,
+          editable: true,
+          filterOperators: ["like"],
+          isBoolean: false,
+        },
+      ];
+
+      vi.mocked(driver.describeColumns).mockResolvedValue(cols);
+      vi.mocked(driver.query)
+        .mockResolvedValueOnce({
+          columns: ["cnt"],
+          rows: [{ __col_0: 1 }],
+          rowCount: 1,
+          executionTimeMs: 0,
+        })
+        .mockResolvedValueOnce({
+          columns: ["IVAL"],
+          rows: [
+            {
+              __col_0: {
+                days: 3,
+                hours: 4,
+                minutes: 5,
+              },
+            },
+          ],
+          rowCount: 1,
+          executionTimeMs: 0,
+        });
+
+      const page = await svc.getPage(
+        "conn1",
+        "testdb",
+        "public",
+        "users",
+        1,
+        25,
+        [],
+      );
+
+      expect(page.rows).toEqual([{ IVAL: '{"days":3,"hours":4,"minutes":5}' }]);
+      expect(page.rows[0]?.IVAL).not.toBe("[object Object]");
     });
 
     it("passes filters through buildFilterCondition with inferred operators", async () => {

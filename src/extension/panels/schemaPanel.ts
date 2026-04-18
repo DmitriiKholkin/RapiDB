@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import type { WebviewMessageEnvelope } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import {
   logErrorWithContext,
@@ -6,10 +7,7 @@ import {
 } from "../utils/errorHandling";
 import { createWebviewShell } from "./webviewShell";
 
-interface PanelMessage {
-  type: string;
-  payload?: unknown;
-}
+type PanelMessage = WebviewMessageEnvelope;
 
 export class SchemaPanel {
   private static readonly viewType = "rapidb.schemaPanel";

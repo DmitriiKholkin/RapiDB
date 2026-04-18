@@ -19,6 +19,7 @@
   "include": [
     "test/**/*.ts",
     "test/**/*.tsx",
+    "src/shared/**/*.ts",
     "src/extension/**/*.ts",
     "src/webview/**/*.ts",
     "src/webview/**/*.tsx"

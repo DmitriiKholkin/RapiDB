@@ -10,8 +10,21 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ColumnTypeMeta as ColumnMeta } from "../../src/shared/tableTypes";
 import { TableView } from "../../src/webview/components/TableView";
-import type { ColumnMeta } from "../../src/webview/types";
+
+vi.mock("@tanstack/react-virtual", () => ({
+  useVirtualizer: ({ count }: { count: number }) => ({
+    getVirtualItems: () =>
+      Array.from({ length: count }, (_, index) => ({
+        index,
+        key: index,
+        start: index * 26,
+        end: (index + 1) * 26,
+      })),
+    getTotalSize: () => count * 26,
+  }),
+}));
 
 afterEach(cleanup);
 
@@ -219,7 +232,7 @@ describe("TableView", () => {
     expect(input.placeholder).toBe("");
 
     const nullButton = screen.getByRole("button", { name: "NULL" });
-    expect(nullButton).toBeEnabled();
+    expect((nullButton as HTMLButtonElement).disabled).toBe(false);
 
     fireEvent.click(nullButton);
 
@@ -270,6 +283,6 @@ describe("TableView", () => {
     expect(input.placeholder).toBe("");
 
     const nullButton = screen.getByRole("button", { name: "NULL" });
-    expect(nullButton).toBeDisabled();
+    expect((nullButton as HTMLButtonElement).disabled).toBe(true);
   });
 });

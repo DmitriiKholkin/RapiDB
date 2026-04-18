@@ -7,7 +7,7 @@
       "ES2022"
     ],
     "outDir": "./dist/extension",
-    "rootDir": "./src/extension",
+    "rootDir": "./src",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
@@ -18,7 +18,8 @@
     "composite": true
   },
   "include": [
-    "src/extension/**/*"
+    "src/extension/**/*",
+    "src/shared/**/*"
   ],
   "exclude": [
     "node_modules",

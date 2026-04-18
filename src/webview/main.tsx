@@ -1,3 +1,4 @@
+// biome-ignore lint/correctness/noUnusedImports: React needed for JSX
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./components/App";
@@ -5,7 +6,7 @@ import "@vscode/codicons/dist/codicon.css";
 
 const vscode = acquireVsCodeApi();
 
-(window as any).__vscode = vscode;
+window.__vscode = vscode;
 
 const rootEl = document.getElementById("root");
 if (!rootEl) {

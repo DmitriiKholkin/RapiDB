@@ -1,6 +1,6 @@
-// biome-ignore lint/correctness/noUnusedImports: <explanation>
+// biome-ignore lint/correctness/noUnusedImports: React needed for JSX
 import React from "react";
-import type { TypeCategory } from "../../types";
+import type { TypeCategory } from "../../../shared/tableTypes";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
 
 /** Display a cell value with category-aware formatting. */
@@ -9,13 +9,11 @@ export function CellDisplay({
   isPending,
   isBoolean,
   category,
-  nativeType,
 }: {
   value: unknown;
   isPending: boolean;
   isBoolean?: boolean;
   category?: TypeCategory;
-  nativeType?: string;
 }) {
   if (value === null || value === undefined) {
     return <span style={{ fontStyle: "italic", opacity: 0.45 }}>NULL</span>;
@@ -40,7 +38,7 @@ export function CellDisplay({
     }
   }
 
-  const str = formatScalarValueForDisplay(value, category, nativeType);
+  const str = formatScalarValueForDisplay(value);
 
   // Binary display (hex prefix)
   if (category === "binary" && str.startsWith("\\x")) {

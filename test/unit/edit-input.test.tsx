@@ -4,11 +4,11 @@
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { NULL_SENTINEL } from "../../src/shared/tableTypes";
 import {
   EditInput,
   valueToEditString,
 } from "../../src/webview/components/table/EditInput";
-import { NULL_SENTINEL } from "../../src/webview/types";
 
 afterEach(cleanup);
 
@@ -45,10 +45,22 @@ describe("valueToEditString", () => {
     expect(valueToEditString(42, false)).toBe("42");
   });
 
-  it("normalizes Oracle BINARY_FLOAT values for editing", () => {
-    expect(
-      valueToEditString(1.2300000190734863, false, "float", "BINARY_FLOAT"),
-    ).toBe("1.23");
+  it("does not normalize float artifacts in the webview edit layer", () => {
+    expect(valueToEditString(1.2000000476837158, false)).toBe(
+      "1.2000000476837158",
+    );
+  });
+
+  it("serializes dates generically for editing", () => {
+    expect(valueToEditString(new Date("2026-04-15T10:20:30.000Z"), false)).toBe(
+      "2026-04-15T10:20:30.000Z",
+    );
+  });
+
+  it("stringifies unexpected objects generically", () => {
+    expect(valueToEditString({ nested: true }, false)).toBe(
+      '{"nested":true}',
+    );
   });
 });
 

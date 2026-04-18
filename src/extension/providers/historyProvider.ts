@@ -36,7 +36,7 @@ export class HistoryNode extends vscode.TreeItem {
 
 export class HistoryProvider implements vscode.TreeDataProvider<HistoryNode> {
   private readonly _onDidChangeTreeData = new vscode.EventEmitter<
-    HistoryNode | undefined | null | void
+    HistoryNode | undefined | null
   >();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
@@ -44,16 +44,12 @@ export class HistoryProvider implements vscode.TreeDataProvider<HistoryNode> {
 
   constructor(private readonly cm: ConnectionManager) {
     this._subscription = cm.onDidChangeHistory(() =>
-      this._onDidChangeTreeData.fire(),
+      this._onDidChangeTreeData.fire(undefined),
     );
   }
 
   get disposable(): vscode.Disposable {
     return this._subscription;
-  }
-
-  refresh(): void {
-    this._onDidChangeTreeData.fire();
   }
 
   getTreeItem(element: HistoryNode): vscode.TreeItem {

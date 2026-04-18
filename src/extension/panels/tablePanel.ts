@@ -2,8 +2,9 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
+import { coerceFilterExpressions } from "../../shared/tableTypes";
+import type { WebviewMessageEnvelope } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
-import { NULL_SENTINEL } from "../dbDrivers/types";
 import {
   applyChangesTransactional,
   type Filter,
@@ -17,10 +18,7 @@ import {
 } from "../utils/errorHandling";
 import { createWebviewShell } from "./webviewShell";
 
-interface PanelMessage {
-  type: string;
-  payload?: unknown;
-}
+type PanelMessage = WebviewMessageEnvelope;
 
 export class TablePanel {
   private static readonly viewType = "rapidb.tablePanel";
@@ -195,10 +193,7 @@ export class TablePanel {
           10000,
           Math.max(1, Math.floor(Number(raw.pageSize) || 50)),
         );
-        const filters = normalizeFilters(
-          Array.isArray(raw.filters) ? raw.filters : [],
-          this.cachedColumns,
-        );
+        const filters = coerceFilterExpressions(raw.filters);
         const sort = raw.sort ?? null;
         try {
           const result = await this.svc.getPage(
@@ -340,7 +335,7 @@ export class TablePanel {
                   this.table,
                   500,
                   csvSort as SortConfig | null,
-                  normalizeFilters(csvFilters, this.cachedColumns),
+                  coerceFilterExpressions(csvFilters),
                   abortCtrl.signal,
                 )) {
                   if (!headerWritten) {
@@ -426,7 +421,7 @@ export class TablePanel {
                   this.table,
                   500,
                   sort as SortConfig | null,
-                  normalizeFilters(jsonFilters, this.cachedColumns),
+                  coerceFilterExpressions(jsonFilters),
                   abortCtrl.signal,
                 )) {
                   for (const row of chunk.rows) {
@@ -551,102 +546,3 @@ function csvCell(value: unknown): string {
     ? `"${s.replace(/"/g, '""')}"`
     : s;
 }
-
-function normalizeFilters(
-  rawFilters: unknown,
-  columns: import("../tableDataService").ColumnDef[],
-): Filter[] {
-  if (!Array.isArray(rawFilters)) return [];
-
-  const columnMap = new Map(columns.map((column) => [column.name, column]));
-
-  return rawFilters.flatMap<Filter>((rawFilter): Filter[] => {
-    if (!rawFilter || typeof rawFilter !== "object") {
-      return [];
-    }
-
-    const filter = rawFilter as Record<string, unknown>;
-    const columnName = typeof filter.column === "string" ? filter.column : null;
-    if (!columnName) return [];
-
-    const operator = filter.operator;
-
-    if (operator === "is_null" || operator === "is_not_null") {
-      return [{ column: columnName, operator }];
-    }
-
-    if (operator === "between") {
-      const value = filter.value;
-      if (
-        Array.isArray(value) &&
-        value.length === 2 &&
-        typeof value[0] === "string" &&
-        typeof value[1] === "string"
-      ) {
-        return [
-          {
-            column: columnName,
-            operator: "between",
-            value: [value[0], value[1]],
-          },
-        ];
-      }
-      return [];
-    }
-
-    if (
-      typeof filter.operator === "string" &&
-      typeof filter.value === "string"
-    ) {
-      return [
-        {
-          column: columnName,
-          operator: filter.operator as Exclude<
-            Filter["operator"],
-            "between" | "is_null" | "is_not_null"
-          >,
-          value: filter.value,
-        },
-      ];
-    }
-
-    if (typeof filter.value !== "string") {
-      return [];
-    }
-
-    const value = filter.value.trim();
-    if (value === "") return [];
-    if (value === NULL_SENTINEL) {
-      return [{ column: columnName, operator: "is_null" }];
-    }
-
-    return [
-      {
-        column: columnName,
-        operator: defaultLegacyFilterOperator(columnMap.get(columnName)),
-        value,
-      },
-    ];
-  });
-}
-
-function defaultLegacyFilterOperator(
-  column: import("../tableDataService").ColumnDef | undefined,
-): "eq" | "like" {
-  if (!column) return "like";
-  if (column.isBoolean) return "eq";
-  if (
-    column.category === "integer" ||
-    column.category === "float" ||
-    column.category === "decimal" ||
-    column.category === "date"
-  ) {
-    return "eq";
-  }
-  return "like";
-}
-
-export const __testOnly = {
-  normalizeFilters,
-  defaultLegacyFilterOperator,
-};

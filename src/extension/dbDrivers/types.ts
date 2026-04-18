@@ -1,3 +1,24 @@
+import type {
+  ColumnMeta,
+  ColumnTypeMeta,
+  FilterOperator,
+  ForeignKeyMeta,
+  IndexMeta,
+  TypeCategory,
+} from "../../shared/tableTypes";
+
+export {
+  type ColumnMeta,
+  type ColumnTypeMeta,
+  type FilterExpression,
+  type FilterOperator,
+  type ForeignKeyMeta,
+  type IndexMeta,
+  NULL_SENTINEL,
+  type ScalarFilterOperator,
+  type TypeCategory,
+} from "../../shared/tableTypes";
+
 // ─── Shared regex constants (used by drivers and tableDataService) ───
 
 export const ISO_DATETIME_RE =
@@ -7,100 +28,6 @@ export const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 export const DATETIME_SQL_RE =
   /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2})?$/;
-
-export const NULL_SENTINEL = "\x00__NULL__\x00";
-
-// ─── Type system ───
-
-export type TypeCategory =
-  | "text"
-  | "integer"
-  | "float"
-  | "decimal"
-  | "boolean"
-  | "date"
-  | "time"
-  | "datetime"
-  | "binary"
-  | "json"
-  | "uuid"
-  | "spatial"
-  | "interval"
-  | "array"
-  | "enum"
-  | "lob"
-  | "other";
-
-export type FilterOperator =
-  | "eq"
-  | "neq"
-  | "gt"
-  | "gte"
-  | "lt"
-  | "lte"
-  | "between"
-  | "like"
-  | "ilike"
-  | "in"
-  | "is_null"
-  | "is_not_null";
-
-export type ScalarFilterOperator = Exclude<
-  FilterOperator,
-  "between" | "is_null" | "is_not_null"
->;
-
-export type FilterExpression =
-  | {
-      column: string;
-      operator: ScalarFilterOperator;
-      value: string;
-    }
-  | {
-      column: string;
-      operator: "between";
-      value: [string, string];
-    }
-  | {
-      column: string;
-      operator: "is_null" | "is_not_null";
-    };
-
-// ─── Core metadata interfaces ───
-
-export interface ColumnMeta {
-  name: string;
-  type: string;
-  nullable: boolean;
-  defaultValue?: string;
-  isPrimaryKey: boolean;
-  isForeignKey: boolean;
-  isAutoIncrement?: boolean;
-}
-
-export interface ColumnTypeMeta extends ColumnMeta {
-  category: TypeCategory;
-  nativeType: string;
-  filterable: boolean;
-  editable: boolean;
-  filterOperators: FilterOperator[];
-  isBoolean: boolean;
-}
-
-export interface IndexMeta {
-  name: string;
-  columns: string[];
-  unique: boolean;
-  primary: boolean;
-}
-
-export interface ForeignKeyMeta {
-  column: string;
-  referencedSchema: string;
-  referencedTable: string;
-  referencedColumn: string;
-  constraintName: string;
-}
 
 export interface TableInfo {
   schema: string;
@@ -199,6 +126,11 @@ export interface IDBDriver {
   // ── Type-aware data helpers ──
   coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown;
   formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown;
+  normalizeFilterValue(
+    column: ColumnTypeMeta,
+    operator: FilterOperator,
+    value: string | [string, string] | undefined,
+  ): string | [string, string] | undefined;
   buildFilterCondition(
     column: ColumnTypeMeta,
     operator: FilterOperator,

@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
+import type { WebviewMessageEnvelope } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import { formatDatetimeForDisplay } from "../dbDrivers/BaseDBDriver";
 import {
@@ -10,10 +11,7 @@ import {
 } from "../utils/errorHandling";
 import { createWebviewShell } from "./webviewShell";
 
-interface PanelMessage {
-  type: string;
-  payload?: unknown;
-}
+type PanelMessage = WebviewMessageEnvelope;
 
 export class QueryPanel {
   private static readonly viewType = "rapidb.queryPanel";

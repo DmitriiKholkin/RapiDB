@@ -1,6 +1,6 @@
 import { randomUUID } from "crypto";
 import * as vscode from "vscode";
-import type { ConnectionType } from "../shared/connectionTypes";
+import type { ConnectionConfig } from "../shared/connectionConfig";
 import { MSSQLDriver } from "./dbDrivers/mssql";
 import { MySQLDriver } from "./dbDrivers/mysql";
 import { OracleDriver } from "./dbDrivers/oracle";
@@ -9,24 +9,7 @@ import { SQLiteDriver } from "./dbDrivers/sqlite";
 import type { IDBDriver } from "./dbDrivers/types";
 import { normalizeUnknownError } from "./utils/errorHandling";
 
-export interface ConnectionConfig {
-  id: string;
-  name: string;
-  type: ConnectionType;
-  host?: string;
-  port?: number;
-  database?: string;
-  username?: string;
-  password?: string;
-  filePath?: string;
-  ssl?: boolean;
-  rejectUnauthorized?: boolean;
-  folder?: string;
-  serviceName?: string;
-  thickMode?: boolean;
-  clientPath?: string;
-  useSecretStorage?: boolean;
-}
+export type { ConnectionConfig } from "../shared/connectionConfig";
 
 export interface TestConnectionResult {
   success: boolean;
@@ -45,6 +28,11 @@ export interface BookmarkEntry {
   sql: string;
   connectionId: string;
   savedAt: string;
+}
+
+export interface ConnectAttempt {
+  promise: Promise<void>;
+  isNew: boolean;
 }
 
 export interface SchemaTableEntry {
@@ -281,15 +269,14 @@ export class ConnectionManager {
     }
   }
 
-  async connectTo(id: string): Promise<void> {
+  beginConnect(id: string): ConnectAttempt {
     const pending = this._connectingMap.get(id);
     if (pending) {
-      await pending;
-      return;
+      return { promise: pending, isNew: false };
     }
 
     if (this.isConnected(id)) {
-      return;
+      return { promise: Promise.resolve(), isNew: false };
     }
 
     let resolveAttempt!: () => void;
@@ -338,7 +325,11 @@ export class ConnectionManager {
       }
     })();
 
-    await attempt;
+    return { promise: attempt, isNew: true };
+  }
+
+  async connectTo(id: string): Promise<void> {
+    await this.beginConnect(id).promise;
   }
 
   async disconnectFrom(id: string): Promise<void> {

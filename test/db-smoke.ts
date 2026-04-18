@@ -17,6 +17,7 @@ import {
   formatDatetimeForDisplay,
   TableDataService,
 } from "../src/extension/tableDataService";
+import { defaultFilterOperator } from "../src/shared/tableTypes";
 import {
   buildFixtures,
   type ComparisonMode,
@@ -168,16 +169,14 @@ function defaultFilterExpression(
   value: string,
 ): FilterExpression {
   const column = columns.find((entry) => entry.name === columnName);
-  if (
-    column?.isBoolean ||
-    column?.category === "integer" ||
-    column?.category === "float" ||
-    column?.category === "decimal" ||
-    column?.category === "date"
-  ) {
-    return { column: columnName, operator: "eq", value };
-  }
-  return { column: columnName, operator: "like", value };
+
+  return {
+    column: columnName,
+    operator: column
+      ? defaultFilterOperator(column)
+      : "like",
+    value,
+  };
 }
 
 function assertCellValue(

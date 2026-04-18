@@ -2,9 +2,9 @@
 import React, { useLayoutEffect, useRef, useState } from "react";
 import {
   NULL_SENTINEL,
-  placeholderForCategory,
   type TypeCategory,
-} from "../../types";
+} from "../../../shared/tableTypes";
+import { placeholderForCategory } from "../../types";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
 
 const ROW_H = 26;
@@ -187,8 +187,6 @@ export function EditInput({
 export function valueToEditString(
   value: unknown,
   isBoolean: boolean,
-  category?: TypeCategory,
-  nativeType?: string,
 ): string {
   if (isBoolean && value !== null && value !== undefined) {
     if (value === true || value === 1 || value === "1") return "true";
@@ -196,5 +194,5 @@ export function valueToEditString(
     return String(value);
   }
   if (value == null) return NULL_SENTINEL;
-  return formatScalarValueForDisplay(value, category, nativeType);
+  return formatScalarValueForDisplay(value);
 }

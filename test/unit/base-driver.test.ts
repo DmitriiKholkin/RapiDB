@@ -93,6 +93,58 @@ describe("isoToLocalDateStr", () => {
   });
 });
 
+describe("normalizeFilterValue", () => {
+  const drv = new StubDriver();
+
+  it("normalizes boolean scalar values via the driver hook", () => {
+    const column = col({
+      name: "active",
+      type: "boolean",
+      category: "boolean",
+      isBoolean: true,
+    });
+
+    expect(drv.normalizeFilterValue(column, "eq", "1")).toBe("true");
+    expect(drv.normalizeFilterValue(column, "eq", "0")).toBe("false");
+  });
+
+  it("normalizes numeric IN filters via the driver hook", () => {
+    const column = col({
+      name: "age",
+      type: "integer",
+      category: "integer",
+    });
+
+    expect(drv.normalizeFilterValue(column, "in", "1,  2 ,3")).toBe(
+      "1, 2, 3",
+    );
+  });
+
+  it("normalizes date comparisons from SQL datetime text", () => {
+    const column = col({
+      name: "created_on",
+      type: "date",
+      category: "date",
+    });
+
+    expect(
+      drv.normalizeFilterValue(column, "eq", "2026-04-15 00:00:00 +00:00"),
+    ).toBe("2026-04-15");
+  });
+
+  it("throws the existing filter error message for invalid numbers", () => {
+    const column = col({
+      name: "age",
+      type: "integer",
+      category: "integer",
+    });
+
+    expect(() => drv.normalizeFilterValue(column, "eq", "abc")).toThrow(
+      "[RapiDB Filter] Column age expects a number.",
+    );
+  });
+});
+
 describe("hexFromBuffer", () => {
   it("returns \\x-prefixed hex for non-empty buffer", () => {
     expect(hexFromBuffer(Buffer.from([0xde, 0xad, 0xbe, 0xef]))).toBe(

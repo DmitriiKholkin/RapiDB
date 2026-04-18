@@ -14,7 +14,13 @@ import type {
   TransactionOperation,
   TypeCategory,
 } from "./types";
-import { filterOperatorsForCategory, NULL_SENTINEL } from "./types";
+import {
+  DATE_ONLY_RE,
+  DATETIME_SQL_RE,
+  filterOperatorsForCategory,
+  ISO_DATETIME_RE,
+  NULL_SENTINEL,
+} from "./types";
 
 // ─── Shared datetime formatting helper ───
 
@@ -93,6 +99,95 @@ export function isHexLike(value: string): boolean {
   return /^[0-9a-fA-F]+$/.test(value) && value.length % 2 === 0;
 }
 
+function normalizeBooleanFilterValue(value: string): "true" | "false" | null {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "true" || normalized === "1") return "true";
+  if (normalized === "false" || normalized === "0") return "false";
+  return null;
+}
+
+function normalizeDateFilterValue(value: string): string | null {
+  const normalized = value.trim();
+  const normalizedSql = normalizeSqlDatetimeOffsetSpacing(normalized);
+
+  if (DATE_ONLY_RE.test(normalized)) {
+    return isValidDateOnly(normalized) ? normalized : null;
+  }
+
+  if (ISO_DATETIME_RE.test(normalized)) {
+    if (!hasValidDateTimeParts(normalized)) {
+      return null;
+    }
+
+    if (!hasExplicitTimezone(normalized)) {
+      const dateOnly = normalized.slice(0, 10);
+      return isValidDateOnly(dateOnly) ? dateOnly : null;
+    }
+
+    return isoToLocalDateStr(normalized);
+  }
+
+  if (DATETIME_SQL_RE.test(normalizedSql)) {
+    if (!hasValidDateTimeParts(normalizedSql)) {
+      return null;
+    }
+
+    if (hasExplicitTimezone(normalizedSql)) {
+      return isoToLocalDateStr(normalizedSql.replace(" ", "T"));
+    }
+
+    const dateOnly = normalizedSql.slice(0, 10);
+    return isValidDateOnly(dateOnly) ? dateOnly : null;
+  }
+
+  return null;
+}
+
+function looksLikeDateInput(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}(?:[ T].*)?$/.test(value.trim());
+}
+
+function hasExplicitTimezone(value: string): boolean {
+  return /[zZ]|[+-]\d{2}:\d{2}$/.test(value);
+}
+
+function normalizeSqlDatetimeOffsetSpacing(value: string): string {
+  return value.replace(/ ([+-]\d{2}:\d{2})$/, "$1");
+}
+
+function isValidDateOnly(value: string): boolean {
+  if (!DATE_ONLY_RE.test(value)) return false;
+
+  const parsed = new Date(`${value}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) return false;
+
+  const [year, month, day] = value.split("-").map(Number);
+  return (
+    parsed.getUTCFullYear() === year &&
+    parsed.getUTCMonth() + 1 === month &&
+    parsed.getUTCDate() === day
+  );
+}
+
+function hasValidDateTimeParts(value: string): boolean {
+  const match =
+    /^(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?: ?(?:Z|[+-]\d{2}:\d{2}))?$/i.exec(
+      value,
+    );
+  if (!match) return false;
+
+  const [, date, rawHours, rawMinutes, rawSeconds] = match;
+  const hours = Number(rawHours);
+  const minutes = Number(rawMinutes);
+  const seconds = Number(rawSeconds);
+
+  return isValidDateOnly(date) && hours < 24 && minutes < 60 && seconds < 60;
+}
+
+function invalidFilterInputError(columnName: string, expected: string): Error {
+  return new Error(`[RapiDB Filter] Column ${columnName} expects ${expected}.`);
+}
+
 // ─── Abstract base driver ───
 
 export abstract class BaseDBDriver implements IDBDriver {
@@ -156,7 +251,7 @@ export abstract class BaseDBDriver implements IDBDriver {
     const category = this.mapTypeCategory(col.type);
     const filterable = this.isFilterable(col.type, category);
     const editable = this.isEditable(col.type, category);
-    const filterOperators = filterable
+    const filterOperators: FilterOperator[] = filterable
       ? filterOperatorsForCategory(category)
       : col.nullable
         ? ["is_null", "is_not_null"]
@@ -265,6 +360,115 @@ export abstract class BaseDBDriver implements IDBDriver {
     if (this.isDatetimeWithTime(column.nativeType)) {
       const formatted = formatDatetimeForDisplay(value);
       if (formatted !== null) return formatted;
+    }
+
+    return value;
+  }
+
+  normalizeFilterValue(
+    column: ColumnTypeMeta,
+    operator: FilterOperator,
+    value: string | [string, string] | undefined,
+  ): string | [string, string] | undefined {
+    if (operator === "is_null" || operator === "is_not_null") {
+      return undefined;
+    }
+
+    if (value === undefined) {
+      return undefined;
+    }
+
+    if (operator === "between") {
+      if (!Array.isArray(value)) {
+        return value;
+      }
+
+      return [
+        this.normalizeScalarFilterValue(column, value[0], operator),
+        this.normalizeScalarFilterValue(column, value[1], operator),
+      ];
+    }
+
+    if (typeof value !== "string") {
+      return value;
+    }
+
+    return this.normalizeScalarFilterValue(column, value, operator);
+  }
+
+  protected normalizeScalarFilterValue(
+    column: ColumnTypeMeta,
+    rawValue: string,
+    operator: FilterOperator,
+  ): string {
+    const value = rawValue.trim();
+    if (value === "") {
+      throw invalidFilterInputError(column.name, "a filter value");
+    }
+
+    if (column.isBoolean) {
+      const normalized = normalizeBooleanFilterValue(value);
+      if (!normalized) {
+        throw invalidFilterInputError(column.name, "true or false");
+      }
+      return normalized;
+    }
+
+    if (this.isNumericCategory(column.category)) {
+      if (operator === "in") {
+        const values = value
+          .split(",")
+          .map((part) => part.trim())
+          .filter(Boolean);
+        if (
+          values.length === 0 ||
+          values.some((part) => !Number.isFinite(Number(part)))
+        ) {
+          throw invalidFilterInputError(column.name, "comma-separated numbers");
+        }
+        return values.join(", ");
+      }
+
+      const numericValue = Number(value);
+      if (Number.isNaN(numericValue) || !Number.isFinite(numericValue)) {
+        throw invalidFilterInputError(column.name, "a number");
+      }
+      return value;
+    }
+
+    if (column.category === "date") {
+      if (operator === "like") {
+        return value;
+      }
+
+      if (operator === "in") {
+        const values = value
+          .split(",")
+          .map((part) => part.trim())
+          .filter(Boolean);
+        if (values.length === 0) {
+          throw invalidFilterInputError(column.name, "comma-separated dates");
+        }
+
+        const normalizedValues = values.map((part) => {
+          const normalizedDate = normalizeDateFilterValue(part);
+          if (!normalizedDate) {
+            throw invalidFilterInputError(column.name, "a valid date");
+          }
+          return normalizedDate;
+        });
+
+        return normalizedValues.join(", ");
+      }
+
+      const normalizedDate = normalizeDateFilterValue(value);
+      if (normalizedDate) {
+        return normalizedDate;
+      }
+
+      if (looksLikeDateInput(value)) {
+        throw invalidFilterInputError(column.name, "a valid date");
+      }
     }
 
     return value;

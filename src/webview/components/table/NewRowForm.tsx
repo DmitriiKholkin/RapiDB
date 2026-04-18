@@ -1,7 +1,10 @@
 // biome-ignore lint/style/useImportType: React used as value in refs
 import React from "react";
-import type { ColumnMeta } from "../../types";
-import { NULL_SENTINEL, placeholderForCategory } from "../../types";
+import {
+  type ColumnTypeMeta as ColumnMeta,
+  NULL_SENTINEL,
+} from "../../../shared/tableTypes";
+import { placeholderForCategory } from "../../types";
 import { Icon } from "../Icon";
 
 function omitKey(

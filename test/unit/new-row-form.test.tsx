@@ -3,11 +3,12 @@
  */
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
-import React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  type ColumnTypeMeta as ColumnMeta,
+  NULL_SENTINEL,
+} from "../../src/shared/tableTypes";
 import { NewRowForm } from "../../src/webview/components/table/NewRowForm";
-import { type ColumnMeta, NULL_SENTINEL } from "../../src/webview/types";
 
 afterEach(cleanup);
 
@@ -117,7 +118,7 @@ describe("NewRowForm", () => {
       />,
     );
 
-    fireEvent.change(screen.getByPlaceholderText("filter"), {
+    fireEvent.change(screen.getByPlaceholderText("value"), {
       target: { value: "a,b" },
     });
     expect(setNewRow).toHaveBeenLastCalledWith({ tags: "a,b" });
@@ -287,7 +288,7 @@ describe("NewRowForm", () => {
       />,
     );
 
-    await userEvent.click(screen.getByTitle("Remove NULL"));
+    fireEvent.click(screen.getByTitle("Remove NULL"));
 
     expect(setNewRow).toHaveBeenCalledWith({});
   });

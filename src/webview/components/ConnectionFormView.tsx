@@ -1,4 +1,5 @@
-import {
+// biome-ignore lint/correctness/noUnusedImports: <explanation>
+import React, {
   type CSSProperties,
   type InputHTMLAttributes,
   type ReactElement,
@@ -8,6 +9,7 @@ import {
   useEffect,
   useState,
 } from "react";
+import type { ConnectionConfig as SharedConnectionConfig } from "../../shared/connectionConfig";
 import {
   CONNECTION_TYPE_LABELS,
   CONNECTION_TYPES,
@@ -17,24 +19,7 @@ import {
 import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
 
-interface ConnectionConfig {
-  id: string;
-  name: string;
-  type: ConnectionType;
-  host?: string;
-  port?: number;
-  database?: string;
-  username?: string;
-  password?: string;
-  filePath?: string;
-  ssl?: boolean;
-  rejectUnauthorized?: boolean;
-  folder?: string;
-  serviceName?: string;
-  thickMode?: boolean;
-  clientPath?: string;
-  useSecretStorage?: boolean;
-}
+type ConnectionConfig = SharedConnectionConfig;
 
 interface Props {
   existing?: ConnectionConfig | null;

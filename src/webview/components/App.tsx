@@ -1,32 +1,23 @@
 // biome-ignore lint/style/useImportType: React needed for JSX
 import React from "react";
+import type {
+  QueryInitialState,
+  WebviewInitialState,
+} from "../../shared/webviewContracts";
 import { ConnectionFormView } from "./ConnectionFormView";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { QueryView } from "./QueryView";
 import { SchemaView } from "./SchemaView";
 import { TableView } from "./TableView";
 
-type ViewName = "query" | "table" | "schema" | "connection";
-
-interface InitialState {
-  view: ViewName;
-  connectionId?: string;
-  connectionType?: string;
-  formatOnOpen?: boolean;
-  isBookmarked?: boolean;
-  database?: string;
-  schema?: string;
-  table?: string;
-  initialSql?: string;
-  existing?: any | null;
-  isView?: boolean;
-  defaultPageSize?: number;
-}
-
-const state: InitialState = (window as any).__RAPIDB_INITIAL_STATE__ ?? {
+const fallbackState: QueryInitialState = {
   view: "query",
   connectionId: "",
+  connectionType: "",
 };
+
+const state: WebviewInitialState =
+  window.__RAPIDB_INITIAL_STATE__ ?? fallbackState;
 
 export function App(): React.ReactElement {
   switch (state.view) {
@@ -76,7 +67,7 @@ export function App(): React.ReactElement {
     default:
       return (
         <div style={{ padding: 16, color: "var(--vscode-errorForeground)" }}>
-          Unknown view: {(state as any).view}
+          Unknown view: {state.view}
         </div>
       );
   }

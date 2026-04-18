@@ -1,11 +1,12 @@
 import { randomUUID } from "crypto";
 import * as vscode from "vscode";
+import type { WebviewInitialState } from "../../shared/webviewContracts";
 
 interface WebviewShellOptions {
   context: vscode.ExtensionContext;
   webview: vscode.Webview;
   title: string;
-  initialState: unknown;
+  initialState: WebviewInitialState;
   includeMediaRoot?: boolean;
   extraLocalResourceRoots?: vscode.Uri[];
   extraCspDirectives?: string[];
@@ -28,6 +29,15 @@ function escapeHtml(value: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+function serializeInitialState(initialState: WebviewInitialState): string {
+  return JSON.stringify(initialState)
+    .replace(/&/g, "\\u0026")
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
 }
 
 export function configureWebviewResources({
@@ -111,7 +121,7 @@ export function createWebviewShell({
 <body>
   <div id="root"></div>
   <script nonce="${nonce}">
-    window.__RAPIDB_INITIAL_STATE__ = ${JSON.stringify(initialState)};
+    window.__RAPIDB_INITIAL_STATE__ = ${serializeInitialState(initialState)};
   </script>
   <script nonce="${nonce}" src="${webviewJs}"></script>
 </body>

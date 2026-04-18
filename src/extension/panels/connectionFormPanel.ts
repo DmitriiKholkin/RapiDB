@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import type { WebviewMessageEnvelope } from "../../shared/webviewContracts";
 import type { ConnectionConfig, ConnectionManager } from "../connectionManager";
 import {
   logErrorWithContext,
@@ -6,10 +7,7 @@ import {
 } from "../utils/errorHandling";
 import { createWebviewShell } from "./webviewShell";
 
-interface PanelMessage {
-  type: string;
-  payload?: unknown;
-}
+type PanelMessage = WebviewMessageEnvelope;
 
 export class ConnectionFormPanel {
   private static readonly viewType = "rapidb.connectionForm";
@@ -122,7 +120,9 @@ export class ConnectionFormPanel {
         break;
       }
       case "testConnection": {
-        const result = await this.connectionManager.testConnection(msg.payload);
+        const result = await this.connectionManager.testConnection(
+          (msg.payload ?? {}) as Omit<ConnectionConfig, "id">,
+        );
         this.panel.webview.postMessage({ type: "testResult", payload: result });
         break;
       }

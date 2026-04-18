@@ -1,4 +1,5 @@
 import {
+  type CellContext,
   flexRender,
   getCoreRowModel,
   type ColumnDef as TanColumnDef,
@@ -14,14 +15,12 @@ import React, {
 } from "react";
 import {
   buildFilterExpression,
-  type ColumnMeta,
+  type ColumnTypeMeta as ColumnMeta,
   type FilterExpression,
   isNumericCategory,
   NULL_SENTINEL,
-  type PendingEdits,
-  placeholderForCategory,
-  type Row,
-} from "../types";
+} from "../../shared/tableTypes";
+import { type PendingEdits, placeholderForCategory, type Row } from "../types";
 import { type Column, calcColWidths } from "../utils/columnSizing";
 import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
@@ -194,6 +193,19 @@ export function TableView({
   pageSizeRef.current = pageSize;
   debFilRef.current = debFilters;
 
+  const fetchTrigger = useMemo(
+    () =>
+      JSON.stringify({
+        initTick,
+        page,
+        pageSize,
+        filters: debFilters,
+        sortColumn: sort?.column ?? null,
+        sortDirection: sort?.direction ?? null,
+      }),
+    [debFilters, initTick, page, pageSize, sort],
+  );
+
   const fetchPage = useCallback(() => {
     if (!initializedRef.current) return;
     const epoch = ++fetchEpochRef.current;
@@ -256,10 +268,10 @@ export function TableView({
       scrollPreserveRef.current = null;
       if (savedScroll !== null && savedScroll > 0) {
         requestAnimationFrame(() => {
-          scrollRef.current?.scrollTo({ top: savedScroll });
+          scrollRef.current?.scrollTo?.({ top: savedScroll });
         });
       } else {
-        scrollRef.current?.scrollTo({ top: 0 });
+        scrollRef.current?.scrollTo?.({ top: 0 });
       }
       setApplyErr(null);
     });
@@ -349,9 +361,9 @@ export function TableView({
   }, [fetchPage]);
 
   useEffect(() => {
-    if (!initializedRef.current) return;
+    if (!initializedRef.current || fetchTrigger === "") return;
     fetchPage();
-  }, [page, pageSize, debFilters, sort, initTick, fetchPage]);
+  }, [fetchPage, fetchTrigger]);
 
   const filtersMountedRef = useRef(false);
   useEffect(() => {
@@ -412,12 +424,7 @@ export function TableView({
 
       const coerced: unknown = newVal === NULL_SENTINEL ? null : newVal;
 
-      const origStr = valueToEditString(
-        originalVal,
-        column.isBoolean,
-        column.category,
-        column.nativeType,
-      );
+      const origStr = valueToEditString(originalVal, column.isBoolean);
 
       if (newVal === origStr) {
         setPending((prev) => {
@@ -518,7 +525,7 @@ export function TableView({
                   }}
                 />
               ),
-              cell: ({ row }: any) => (
+              cell: ({ row }: CellContext<Row, unknown>) => (
                 <input
                   type="checkbox"
                   checked={selectedRef.current.has(row.index)}
@@ -574,12 +581,7 @@ export function TableView({
 
             if (isEditing) {
               const startVal = hasPending ? pendingValue : getValue();
-              const startStr = valueToEditString(
-                startVal,
-                col.isBoolean,
-                col.category,
-                col.nativeType,
-              );
+              const startStr = valueToEditString(startVal, col.isBoolean);
               return (
                 <EditInput
                   initial={startStr}
@@ -597,7 +599,6 @@ export function TableView({
                 isPending={hasPending}
                 isBoolean={col.isBoolean}
                 category={col.category}
-                nativeType={col.nativeType}
               />
             );
           },
@@ -673,6 +674,7 @@ export function TableView({
           <span style={{ fontWeight: 600 }}>⚠ Filter:</span>
           <span style={{ flex: 1 }}>{filterError}</span>
           <button
+            type="button"
             style={{
               background: "none",
               border: "none",
@@ -706,6 +708,7 @@ export function TableView({
         {!isView && (
           <>
             <button
+              type="button"
               style={btn("primary", busy || !!newRow)}
               disabled={busy || !!newRow}
               onClick={() => {
@@ -719,6 +722,7 @@ export function TableView({
               </>
             </button>
             <button
+              type="button"
               style={btn(
                 "danger",
                 selected.size === 0 || pkCols.length === 0 || busy,
@@ -737,7 +741,12 @@ export function TableView({
           </>
         )}
 
-        <button style={btn("ghost", busy)} disabled={busy} onClick={fetchPage}>
+        <button
+          type="button"
+          style={btn("ghost", busy)}
+          disabled={busy}
+          onClick={fetchPage}
+        >
           <Icon name="refresh" size={13} style={{ marginRight: 4 }} />
           Refresh
         </button>
@@ -814,6 +823,7 @@ export function TableView({
           {pendingCount > 0 && (
             <>
               <button
+                type="button"
                 style={btn("warning", applying)}
                 disabled={applying}
                 onClick={applyChanges}
@@ -821,6 +831,7 @@ export function TableView({
                 {applying ? "Applying…" : "Apply Changes"}
               </button>
               <button
+                type="button"
                 style={btn("ghost", applying)}
                 disabled={applying}
                 onClick={revertChanges}
@@ -831,6 +842,7 @@ export function TableView({
           )}
           {applyErr && pendingCount === 0 && (
             <button
+              type="button"
               style={btn("ghost")}
               onClick={() => setApplyErr(null)}
               title="Dismiss"
@@ -861,6 +873,7 @@ export function TableView({
             {mutErr}
           </span>
           <button
+            type="button"
             onClick={() => setMutErr(null)}
             title="Dismiss"
             style={{
@@ -978,8 +991,14 @@ export function TableView({
                         )}
                       </div>
                       {!isSel && h.column.getCanResize() && (
-                        <div
-                          onMouseDown={h.getResizeHandler()}
+                        <button
+                          type="button"
+                          aria-label={`Resize ${colId} column`}
+                          tabIndex={-1}
+                          onMouseDown={(event) => {
+                            event.stopPropagation();
+                            h.getResizeHandler()(event);
+                          }}
                           onClick={(e) => e.stopPropagation()}
                           style={{
                             position: "absolute",
@@ -987,6 +1006,8 @@ export function TableView({
                             top: 0,
                             height: "100%",
                             width: 5,
+                            padding: 0,
+                            border: "none",
                             cursor: "col-resize",
                             background: h.column.getIsResizing()
                               ? "var(--vscode-focusBorder)"
@@ -1059,12 +1080,14 @@ export function TableView({
                               ? ""
                               : isNullFilter
                                 ? "NULL"
-                                : col
+                                : canValueFilter && col
                                   ? placeholderForCategory(
                                       col.category,
                                       col.isBoolean,
                                     )
-                                  : "filter"
+                                  : col
+                                    ? ""
+                                    : "filter"
                           }
                           style={{
                             flex: 1,
@@ -1218,6 +1241,7 @@ export function TableView({
         }}
       >
         <button
+          type="button"
           style={btn("ghost", page <= 1 || loading)}
           disabled={page <= 1 || loading}
           onClick={() => setPage((p) => Math.max(1, p - 1))}
@@ -1228,6 +1252,7 @@ export function TableView({
           Page {page} of {totalPages}
         </span>
         <button
+          type="button"
           style={btn("ghost", page >= totalPages || loading)}
           disabled={page >= totalPages || loading}
           onClick={() => setPage((p) => Math.min(totalPages, p + 1))}

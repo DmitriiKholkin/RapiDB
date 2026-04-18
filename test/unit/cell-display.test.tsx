@@ -48,16 +48,15 @@ describe("CellDisplay", () => {
     expect(screen.getByText("3.14")).toBeDefined();
   });
 
-  it("normalizes Oracle BINARY_FLOAT artifacts for display", () => {
+  it("does not normalize float artifacts in the webview layer", () => {
     render(
       <CellDisplay
         value={1.2000000476837158}
         isPending={false}
         category="float"
-        nativeType="BINARY_FLOAT"
       />,
     );
-    expect(screen.getByText("1.2")).toBeDefined();
+    expect(screen.getByText("1.2000000476837158")).toBeDefined();
   });
 
   it("renders JSON strings", () => {
@@ -90,6 +89,11 @@ describe("CellDisplay", () => {
   it("renders plain text", () => {
     render(<CellDisplay value="hello world" isPending={false} />);
     expect(screen.getByText("hello world")).toBeDefined();
+  });
+
+  it("renders unexpected objects using generic stringification", () => {
+    render(<CellDisplay value={{ nested: true }} isPending={false} />);
+    expect(screen.getByText('{"nested":true}')).toBeDefined();
   });
 
   it("renders plain text with category text", () => {

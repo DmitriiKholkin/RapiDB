@@ -61,11 +61,22 @@ const ms = new MSSQLDriver(msConfig);
 const ora = new OracleDriver(oraConfig);
 const lite = new SQLiteDriver(sqliteConfig);
 
+const oraInternals = ora as unknown as {
+  _fallbackDDL: (
+    conn: Pick<oracledb.Connection, "execute">,
+    schema: string,
+    table: string,
+  ) => Promise<string>;
+  _fetchTypeHandler: (
+    metaData: oracledb.Metadata<unknown>,
+  ) => oracledb.FetchTypeResponse | undefined;
+};
+
 describe("null-only filter support", () => {
   it.each([
     ["Postgres", pg, '"payload"'],
     ["MySQL", my, "`payload`"],
-    ["MSSQL", ms, '"payload"'],
+    ["MSSQL", ms, "[payload]"],
     ["Oracle", ora, '"payload"'],
     ["SQLite", lite, '"payload"'],
   ] as const)("allows IS NULL for non-filterable nullable columns in %s", (_name, driver, quotedColumn) => {
@@ -90,7 +101,7 @@ describe("null-only filter support", () => {
   it.each([
     ["Postgres", pg, '"payload"'],
     ["MySQL", my, "`payload`"],
-    ["MSSQL", ms, '"payload"'],
+    ["MSSQL", ms, "[payload]"],
     ["Oracle", ora, '"payload"'],
     ["SQLite", lite, '"payload"'],
   ] as const)("allows IS NOT NULL for non-filterable nullable columns in %s", (_name, driver, quotedColumn) => {
@@ -1094,6 +1105,191 @@ describe("OracleDriver", () => {
     });
   });
 
+  describe("getCreateTableDDL", () => {
+    it("prefers DBMS_METADATA for Oracle tables", async () => {
+      const execute = vi.fn(async (sql: string) => {
+        if (sql.includes("SELECT object_type FROM all_objects")) {
+          return { rows: [{ OBJECT_TYPE: "TABLE" }] };
+        }
+        if (sql.includes("SET_TRANSFORM_PARAM")) {
+          return { rowsAffected: 0 };
+        }
+        if (sql.includes("GET_DDL('TABLE'")) {
+          return {
+            rows: [
+              {
+                DDL: 'CREATE TABLE "APP"."EVENTS" (\n  "ID" NUMBER\n);',
+              },
+            ],
+          };
+        }
+        throw new Error(`Unexpected SQL: ${sql}`);
+      });
+      const close = vi.fn(async () => {});
+      const pool = {
+        getConnection: vi.fn(async () => ({ execute, close })),
+      };
+      (ora as unknown as { pool: typeof pool }).pool = pool;
+
+      const ddl = await ora.getCreateTableDDL("test", "APP", "EVENTS");
+
+      expect(ddl).toBe('CREATE TABLE "APP"."EVENTS" (\n  "ID" NUMBER\n);');
+      expect(execute).toHaveBeenCalledWith(
+        expect.stringContaining("SET_TRANSFORM_PARAM"),
+      );
+      expect(execute).toHaveBeenCalledWith(
+        expect.stringContaining("GET_DDL('TABLE'"),
+        ["APP", "EVENTS"],
+        expect.objectContaining({ outFormat: oracledb.OUT_FORMAT_OBJECT }),
+      );
+      expect(close).toHaveBeenCalledTimes(1);
+    });
+
+    it("falls back to view source when all_objects lookup is unavailable", async () => {
+      const execute = vi.fn(async (sql: string) => {
+        if (sql.includes("SELECT object_type FROM all_objects")) {
+          throw new Error("all_objects unavailable");
+        }
+        if (sql.includes("SELECT view_name FROM all_views")) {
+          return { rows: [{ VIEW_NAME: "EVENT_V" }] };
+        }
+        if (sql.includes("SET_TRANSFORM_PARAM")) {
+          return { rowsAffected: 0 };
+        }
+        if (sql.includes("SELECT text FROM all_views")) {
+          return { rows: [{ TEXT: 'SELECT "ID" FROM "APP"."EVENTS"' }] };
+        }
+        throw new Error(`Unexpected SQL: ${sql}`);
+      });
+      const close = vi.fn(async () => {});
+      const pool = {
+        getConnection: vi.fn(async () => ({ execute, close })),
+      };
+      (ora as unknown as { pool: typeof pool }).pool = pool;
+
+      const ddl = await ora.getCreateTableDDL("test", "APP", "EVENT_V");
+
+      expect(ddl).toBe(
+        'CREATE OR REPLACE VIEW "APP"."EVENT_V" AS\nSELECT "ID" FROM "APP"."EVENTS"',
+      );
+      expect(execute).toHaveBeenCalledWith(
+        expect.stringContaining("SELECT view_name FROM all_views"),
+        ["APP", "EVENT_V"],
+        expect.objectContaining({ outFormat: oracledb.OUT_FORMAT_OBJECT }),
+      );
+      expect(close).toHaveBeenCalledTimes(1);
+    });
+
+    it("falls back to manual table DDL when object type metadata is unavailable", async () => {
+      const execute = vi.fn(async (sql: string) => {
+        if (sql.includes("SELECT object_type FROM all_objects")) {
+          throw new Error("all_objects unavailable");
+        }
+        if (sql.includes("SELECT view_name FROM all_views")) {
+          throw new Error("all_views unavailable");
+        }
+        if (sql.includes("SELECT table_name FROM all_tables")) {
+          throw new Error("all_tables unavailable");
+        }
+        if (sql.includes("SELECT text FROM all_views")) {
+          return { rows: [] };
+        }
+        if (sql.includes("FROM all_tab_columns")) {
+          return {
+            rows: [
+              {
+                COLUMN_NAME: "ID",
+                DATA_TYPE: "NUMBER",
+                DATA_PRECISION: 10,
+                DATA_SCALE: 0,
+                DATA_LENGTH: 22,
+                NULLABLE: "N",
+                DATA_DEFAULT: null,
+              },
+            ],
+          };
+        }
+        if (sql.includes("FROM all_tab_identity_cols")) {
+          return { rows: [] };
+        }
+        if (sql.includes("constraint_type = 'P'")) {
+          return { rows: [] };
+        }
+        throw new Error(`Unexpected SQL: ${sql}`);
+      });
+      const close = vi.fn(async () => {});
+      const pool = {
+        getConnection: vi.fn(async () => ({ execute, close })),
+      };
+      (ora as unknown as { pool: typeof pool }).pool = pool;
+
+      const ddl = await ora.getCreateTableDDL("test", "APP", "EVENTS");
+
+      expect(ddl).toBe(
+        'CREATE TABLE "APP"."EVENTS" (\n  "ID" NUMBER(10,0) NOT NULL\n);',
+      );
+      expect(execute).toHaveBeenCalledWith(
+        expect.stringContaining("SELECT text FROM all_views"),
+        ["APP", "EVENTS"],
+        expect.objectContaining({ outFormat: oracledb.OUT_FORMAT_OBJECT }),
+      );
+      expect(execute).toHaveBeenCalledWith(
+        expect.stringContaining("FROM all_tab_columns"),
+        ["APP", "EVENTS"],
+        expect.objectContaining({ outFormat: oracledb.OUT_FORMAT_OBJECT }),
+      );
+      expect(close).toHaveBeenCalledTimes(1);
+    });
+
+    it("manual Oracle DDL fallback keeps interval types valid", async () => {
+      const conn = {
+        execute: vi
+          .fn()
+          .mockResolvedValueOnce({
+            rows: [
+              {
+                COLUMN_NAME: "IYM_COL",
+                DATA_TYPE: "INTERVAL YEAR(2) TO MONTH",
+                DATA_PRECISION: 2,
+                DATA_SCALE: 0,
+                DATA_LENGTH: 5,
+                NULLABLE: "Y",
+                DATA_DEFAULT: null,
+              },
+              {
+                COLUMN_NAME: "IDS_COL",
+                DATA_TYPE: "INTERVAL DAY(2) TO SECOND(6)",
+                DATA_PRECISION: 2,
+                DATA_SCALE: 6,
+                DATA_LENGTH: 11,
+                NULLABLE: "Y",
+                DATA_DEFAULT: null,
+              },
+              {
+                COLUMN_NAME: "AMOUNT",
+                DATA_TYPE: "NUMBER",
+                DATA_PRECISION: 10,
+                DATA_SCALE: 2,
+                DATA_LENGTH: 22,
+                NULLABLE: "N",
+                DATA_DEFAULT: "0 ",
+              },
+            ],
+          })
+          .mockResolvedValueOnce({ rows: [] })
+          .mockResolvedValueOnce({ rows: [] }),
+      };
+
+      const ddl = await oraInternals._fallbackDDL(conn, "APP", "EVENTS");
+
+      expect(ddl).toContain('"IYM_COL" INTERVAL YEAR(2) TO MONTH');
+      expect(ddl).toContain('"IDS_COL" INTERVAL DAY(2) TO SECOND(6)');
+      expect(ddl).toContain('"AMOUNT" NUMBER(10,2) NOT NULL DEFAULT 0');
+      expect(ddl).not.toContain("TO MONTH (2, 0)");
+      expect(ddl).not.toContain("SECOND(6) (2, 6)");
+    });
+  });
+
   describe("buildInsertValueExpr (:N)", () => {
     it("returns :N", () => {
       expect(
@@ -1291,6 +1487,95 @@ describe("OracleDriver", () => {
     it("converts bigint to string", () => {
       const c = col({ name: "n", type: "NUMBER", category: "integer" });
       expect(ora.formatOutputValue(BigInt(42), c)).toBe("42");
+    });
+
+    it("normalizes Oracle BINARY_FLOAT artifacts in the driver", () => {
+      const c = col({
+        name: "value",
+        type: "BINARY_FLOAT",
+        category: "float",
+        nativeType: "BINARY_FLOAT",
+      });
+      expect(ora.formatOutputValue(1.2000000476837158, c)).toBe("1.2");
+    });
+
+    it("normalizes Oracle FLOAT precision artifacts in the driver", () => {
+      const c = col({
+        name: "value",
+        type: "FLOAT(24)",
+        category: "float",
+        nativeType: "FLOAT(24)",
+      });
+      expect(ora.formatOutputValue(1.2300000190734863, c)).toBe("1.23");
+    });
+
+    it("falls back to BaseDBDriver formatting for non-interval objects", () => {
+      const c = col({
+        name: "payload",
+        type: "VARCHAR2(100)",
+        category: "text",
+        nativeType: "VARCHAR2(100)",
+      });
+      expect(ora.formatOutputValue({ years: 1, months: 14 }, c)).toBe(
+        '{"years":1,"months":14}',
+      );
+    });
+
+    it("defensively normalizes IntervalYM values", () => {
+      const c = col({
+        name: "ival",
+        type: "INTERVAL YEAR TO MONTH",
+        category: "text",
+        nativeType: "INTERVAL YEAR TO MONTH",
+      });
+      expect(ora.formatOutputValue({ years: 1, months: 14 }, c)).toBe("2-02");
+    });
+
+    it("defensively normalizes IntervalDS values", () => {
+      const c = col({
+        name: "ival",
+        type: "INTERVAL DAY TO SECOND",
+        category: "text",
+        nativeType: "INTERVAL DAY TO SECOND",
+      });
+      expect(
+        ora.formatOutputValue(
+          {
+            days: 3,
+            hours: 4,
+            minutes: 5,
+            seconds: 6,
+            fseconds: 120000000,
+          },
+          c,
+        ),
+      ).toBe("3 04:05:06.12");
+    });
+  });
+
+  describe("fetchTypeHandler", () => {
+    it("normalizes IntervalYM values at fetch time", () => {
+      const response = oraInternals._fetchTypeHandler({
+        dbType: oracledb.DB_TYPE_INTERVAL_YM,
+      } as oracledb.Metadata<unknown>);
+
+      expect(response?.converter?.({ years: 1, months: 14 })).toBe("2-02");
+    });
+
+    it("normalizes IntervalDS values at fetch time", () => {
+      const response = oraInternals._fetchTypeHandler({
+        dbType: oracledb.DB_TYPE_INTERVAL_DS,
+      } as oracledb.Metadata<unknown>);
+
+      expect(
+        response?.converter?.({
+          days: -1,
+          hours: -2,
+          minutes: -3,
+          seconds: -4,
+          fseconds: -120000000,
+        }),
+      ).toBe("-1 02:03:04.12");
     });
   });
 

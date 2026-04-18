@@ -11,6 +11,7 @@ import {
   type RapiDBNode,
 } from "./providers/connectionProvider";
 import { HistoryProvider } from "./providers/historyProvider";
+import { connectWithProgress } from "./utils/connectOrchestration";
 import {
   logErrorWithContext,
   normalizeUnknownError,
@@ -56,54 +57,10 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(bookmarksView, bookmarksProvider.disposable);
 
   const refresh = () => connectionProvider.refresh();
-  const connectionProgressMap = new Map<string, Promise<boolean>>();
 
-  async function connectIfNeeded(
-    connectionId: string,
-    title: string,
-    waitForExisting: boolean,
-  ): Promise<boolean> {
-    if (connectionManager.isConnected(connectionId)) {
-      return true;
-    }
-
-    const existingProgress = connectionProgressMap.get(connectionId);
-    if (existingProgress) {
-      if (!waitForExisting) {
-        return false;
-      }
-      return existingProgress;
-    }
-
-    if (connectionManager.isConnecting(connectionId)) {
-      if (!waitForExisting) {
-        return false;
-      }
-      await connectionManager.connectTo(connectionId);
-      return connectionManager.isConnected(connectionId);
-    }
-
-    const progressPromise = Promise.resolve(
-      vscode.window.withProgress(
-        {
-          location: vscode.ProgressLocation.Window,
-          title,
-        },
-        () => connectionManager.connectTo(connectionId),
-      ),
-    ).then(() => connectionManager.isConnected(connectionId));
-
-    connectionProgressMap.set(connectionId, progressPromise);
-    try {
-      return await progressPromise;
-    } finally {
-      connectionProgressMap.delete(connectionId);
-    }
-  }
-
-  function reg(
+  function reg<TArgs extends unknown[]>(
     command: string,
-    callback: (...args: unknown[]) => unknown,
+    callback: (...args: TArgs) => unknown,
   ): vscode.Disposable {
     try {
       const d = vscode.commands.registerCommand(command, callback);
@@ -172,7 +129,8 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     const conn = connectionManager.getConnection(id);
     try {
-      await connectIfNeeded(
+      await connectWithProgress(
+        connectionManager,
         id,
         `RapiDB: Connecting to "${conn?.name ?? id}"…`,
         false,
@@ -214,7 +172,12 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     if (!connectionManager.isConnected(connectionId)) {
       try {
-        await connectIfNeeded(connectionId, "RapiDB: Connecting…", true);
+        await connectWithProgress(
+          connectionManager,
+          connectionId,
+          "RapiDB: Connecting…",
+          true,
+        );
         refresh();
       } catch (err: unknown) {
         const error = logErrorWithContext(
@@ -319,7 +282,12 @@ export function activate(context: vscode.ExtensionContext): void {
 
     if (!connectionManager.isConnected(node.connectionId)) {
       try {
-        await connectIfNeeded(node.connectionId, "RapiDB: Connecting…", true);
+        await connectWithProgress(
+          connectionManager,
+          node.connectionId,
+          "RapiDB: Connecting…",
+          true,
+        );
         refresh();
       } catch (err: unknown) {
         const error = logErrorWithContext(

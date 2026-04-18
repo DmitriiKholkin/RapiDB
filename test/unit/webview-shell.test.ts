@@ -1,9 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as vscode from "vscode";
 
-const randomUUID = vi.fn(() => "nonce-123");
-const joinPath = vi.fn((base: { path: string }, ...parts: string[]) => ({
-  path: [base.path, ...parts].join("/"),
+const { randomUUID, joinPath } = vi.hoisted(() => ({
+  randomUUID: vi.fn(() => "nonce-123"),
+  joinPath: vi.fn((base: { path: string }, ...parts: string[]) => ({
+    path: [base.path, ...parts].join("/"),
+  })),
 }));
 
 vi.mock("crypto", () => ({
@@ -66,13 +68,24 @@ describe("webviewShell", () => {
       context,
       webview,
       title: 'Admin <Panel> & "Test"',
-      initialState: { ready: true },
+      initialState: {
+        view: "query",
+        connectionId: "conn-1",
+        connectionType: "pg",
+        initialSql: 'SELECT "</script><script>bad()</script>"',
+      },
     });
 
     expect(html).toContain(
       "<title>Admin &lt;Panel&gt; &amp; &quot;Test&quot;</title>",
     );
-    expect(html).toContain('window.__RAPIDB_INITIAL_STATE__ = {"ready":true};');
+    expect(html).toContain(
+      'window.__RAPIDB_INITIAL_STATE__ = {"view":"query","connectionId":"conn-1","connectionType":"pg"',
+    );
+    expect(html).toContain(
+      "\\u003c/script\\u003e\\u003cscript\\u003ebad()\\u003c/script\\u003e",
+    );
+    expect(html).not.toContain("</script><script>bad()");
     expect(html).toContain(
       "script-src 'nonce-nonce-123' vscode-webview-resource:",
     );

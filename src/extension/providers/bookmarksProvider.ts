@@ -38,7 +38,7 @@ export class BookmarksProvider
   implements vscode.TreeDataProvider<BookmarkNode>
 {
   private readonly _onDidChangeTreeData = new vscode.EventEmitter<
-    BookmarkNode | undefined | null | void
+    BookmarkNode | undefined | null
   >();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
@@ -46,16 +46,12 @@ export class BookmarksProvider
 
   constructor(private readonly cm: ConnectionManager) {
     this._subscription = cm.onDidChangeBookmarks(() =>
-      this._onDidChangeTreeData.fire(),
+      this._onDidChangeTreeData.fire(undefined),
     );
   }
 
   get disposable(): vscode.Disposable {
     return this._subscription;
-  }
-
-  refresh(): void {
-    this._onDidChangeTreeData.fire();
   }
 
   getTreeItem(element: BookmarkNode): vscode.TreeItem {

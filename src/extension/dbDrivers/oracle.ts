@@ -23,7 +23,10 @@ function oracleFullType(
   dataScale: number | null,
   dataLength: number,
 ): string {
-  if (dataType === "NUMBER") {
+  const trimmedType = dataType.trim();
+  const normalizedType = trimmedType.toUpperCase();
+
+  if (normalizedType === "NUMBER") {
     if (dataPrecision !== null && dataScale !== null) {
       return `NUMBER(${dataPrecision},${dataScale})`;
     }
@@ -32,14 +35,16 @@ function oracleFullType(
     }
     return "NUMBER";
   }
-  if (dataType === "FLOAT") {
+  if (normalizedType === "FLOAT") {
     return dataPrecision !== null ? `FLOAT(${dataPrecision})` : "FLOAT";
   }
 
-  if (["VARCHAR2", "NVARCHAR2", "CHAR", "NCHAR", "RAW"].includes(dataType)) {
-    return `${dataType}(${dataLength})`;
+  if (
+    ["VARCHAR2", "NVARCHAR2", "CHAR", "NCHAR", "RAW"].includes(normalizedType)
+  ) {
+    return `${trimmedType}(${dataLength})`;
   }
-  return dataType;
+  return trimmedType;
 }
 
 oracledb.fetchAsString = [oracledb.CLOB];
@@ -48,6 +53,154 @@ oracledb.fetchAsBuffer = [oracledb.BLOB];
 let _thickInitDone = false;
 
 const pad2 = (n: number) => String(n).padStart(2, "0");
+
+const ORACLE_DDL_TRANSFORM_BLOCK = `
+BEGIN
+  DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'PRETTY', TRUE);
+  DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SQLTERMINATOR', TRUE);
+  DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'STORAGE', FALSE);
+  DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'TABLESPACE', FALSE);
+  DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SEGMENT_ATTRIBUTES', FALSE);
+  DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'CONSTRAINTS_AS_ALTER', FALSE);
+END;`;
+
+const ORACLE_INTERVAL_DS_NANOS_PER_SECOND = 1_000_000_000n;
+const ORACLE_INTERVAL_DS_NANOS_PER_MINUTE =
+  60n * ORACLE_INTERVAL_DS_NANOS_PER_SECOND;
+const ORACLE_INTERVAL_DS_NANOS_PER_HOUR =
+  60n * ORACLE_INTERVAL_DS_NANOS_PER_MINUTE;
+const ORACLE_INTERVAL_DS_NANOS_PER_DAY =
+  24n * ORACLE_INTERVAL_DS_NANOS_PER_HOUR;
+
+function oracleFloatPrecision(nativeType?: string): number | null {
+  if (!nativeType) return null;
+
+  const normalized = nativeType.toUpperCase().trim();
+  if (normalized === "BINARY_FLOAT") return 7;
+  if (normalized === "BINARY_DOUBLE") return 15;
+
+  const match = /^FLOAT(?:\((\d+)\))?$/.exec(normalized);
+  if (!match?.[1]) return null;
+
+  const precision = Number.parseInt(match[1], 10);
+  if (precision <= 24) return 7;
+  if (precision <= 53) return 15;
+  return null;
+}
+
+function normalizeOracleFloatValue(
+  value: unknown,
+  nativeType?: string,
+): string | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+
+  const precision = oracleFloatPrecision(nativeType);
+  if (precision === null) {
+    return null;
+  }
+
+  return Number.parseFloat(value.toPrecision(precision)).toString();
+}
+
+function toOracleDdlText(value: string | Buffer | null): string | null {
+  if (typeof value === "string") {
+    const text = value.trim();
+    return text ? text : null;
+  }
+  if (Buffer.isBuffer(value)) {
+    const text = value.toString("utf8").trim();
+    return text ? text : null;
+  }
+  return null;
+}
+
+function isUnavailableOracleDdl(ddl: string): boolean {
+  return ddl.startsWith("-- ");
+}
+
+function readOracleIntervalPart(value: unknown, key: string): number | null {
+  if (!value || typeof value !== "object") return null;
+  const part = (value as Record<string, unknown>)[key];
+  return typeof part === "number" && Number.isInteger(part) ? part : null;
+}
+
+function normalizeOracleIntervalYMValue(value: unknown): string | null {
+  const years = readOracleIntervalPart(value, "years");
+  const months = readOracleIntervalPart(value, "months");
+  if (years === null || months === null) return null;
+
+  const totalMonths = years * 12 + months;
+  const negative = totalMonths < 0;
+  const absMonths = Math.abs(totalMonths);
+  const normalizedYears = Math.floor(absMonths / 12);
+  const normalizedMonths = absMonths % 12;
+  return `${negative ? "-" : ""}${normalizedYears}-${pad2(normalizedMonths)}`;
+}
+
+function normalizeOracleIntervalDSValue(value: unknown): string | null {
+  const days = readOracleIntervalPart(value, "days");
+  const hours = readOracleIntervalPart(value, "hours");
+  const minutes = readOracleIntervalPart(value, "minutes");
+  const seconds = readOracleIntervalPart(value, "seconds");
+  const fseconds = readOracleIntervalPart(value, "fseconds");
+  if (
+    days === null ||
+    hours === null ||
+    minutes === null ||
+    seconds === null ||
+    fseconds === null
+  ) {
+    return null;
+  }
+
+  const totalNanos =
+    BigInt(days) * ORACLE_INTERVAL_DS_NANOS_PER_DAY +
+    BigInt(hours) * ORACLE_INTERVAL_DS_NANOS_PER_HOUR +
+    BigInt(minutes) * ORACLE_INTERVAL_DS_NANOS_PER_MINUTE +
+    BigInt(seconds) * ORACLE_INTERVAL_DS_NANOS_PER_SECOND +
+    BigInt(fseconds);
+  const negative = totalNanos < 0n;
+  let remaining = negative ? -totalNanos : totalNanos;
+
+  const normalizedDays = remaining / ORACLE_INTERVAL_DS_NANOS_PER_DAY;
+  remaining %= ORACLE_INTERVAL_DS_NANOS_PER_DAY;
+  const normalizedHours = remaining / ORACLE_INTERVAL_DS_NANOS_PER_HOUR;
+  remaining %= ORACLE_INTERVAL_DS_NANOS_PER_HOUR;
+  const normalizedMinutes = remaining / ORACLE_INTERVAL_DS_NANOS_PER_MINUTE;
+  remaining %= ORACLE_INTERVAL_DS_NANOS_PER_MINUTE;
+  const normalizedSeconds = remaining / ORACLE_INTERVAL_DS_NANOS_PER_SECOND;
+  const normalizedFseconds = remaining % ORACLE_INTERVAL_DS_NANOS_PER_SECOND;
+
+  const frac =
+    normalizedFseconds > 0n
+      ? `.${normalizedFseconds.toString().padStart(9, "0").replace(/0+$/, "")}`
+      : "";
+
+  return (
+    `${negative ? "-" : ""}${normalizedDays.toString()} ` +
+    `${pad2(Number(normalizedHours))}:${pad2(Number(normalizedMinutes))}:` +
+    `${pad2(Number(normalizedSeconds))}${frac}`
+  );
+}
+
+function normalizeOracleIntervalValue(value: unknown): string | null {
+  return (
+    normalizeOracleIntervalYMValue(value) ??
+    normalizeOracleIntervalDSValue(value)
+  );
+}
+
+type OracleLobLike = {
+  getData?: () => Promise<string | Buffer | null>;
+  destroy?: () => void;
+  close?: () => Promise<void>;
+};
+
+function isOracleLobLike(value: unknown): value is OracleLobLike {
+  return !!value && typeof value === "object";
+}
 
 function ensureThickMode(libDir?: string): void {
   if (_thickInitDone) {
@@ -161,6 +314,10 @@ function oracleTypeName(nativeType: string): string {
     .replace(/\(\s*\d+(?:\s*,\s*-?\d+)?\s*\)/g, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function isOracleIntervalType(nativeType: string): boolean {
+  return oracleTypeName(nativeType).startsWith("INTERVAL ");
 }
 
 function isTimezoneAwareOracleTemporal(nativeType: string): boolean {
@@ -333,6 +490,14 @@ function formatOracleQueryValue(
   value: unknown,
   meta: oracledb.Metadata<unknown>,
 ): unknown {
+  if (meta.dbType === oracledb.DB_TYPE_INTERVAL_YM) {
+    return normalizeOracleIntervalYMValue(value) ?? value;
+  }
+
+  if (meta.dbType === oracledb.DB_TYPE_INTERVAL_DS) {
+    return normalizeOracleIntervalDSValue(value) ?? value;
+  }
+
   if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
     return value;
   }
@@ -851,44 +1016,93 @@ export class OracleDriver extends BaseDBDriver {
   ): Promise<string> {
     const conn = await this.pool!.getConnection();
     try {
+      const objectType = await this._resolveDdlObjectType(conn, schema, table);
+
+      if (objectType) {
+        const ddl = await this._getMetadataDDL(conn, objectType, schema, table);
+        if (ddl) {
+          return ddl;
+        }
+      }
+
+      if (objectType === "VIEW") {
+        return await this._fallbackViewDDL(conn, schema, table);
+      }
+
+      if (objectType === "TABLE") {
+        return await this._fallbackDDL(conn, schema, table);
+      }
+
+      try {
+        const viewDdl = await this._fallbackViewDDL(conn, schema, table);
+        if (!isUnavailableOracleDdl(viewDdl)) {
+          return viewDdl;
+        }
+      } catch {}
+
+      try {
+        const tableDdl = await this._fallbackDDL(conn, schema, table);
+        if (!isUnavailableOracleDdl(tableDdl)) {
+          return tableDdl;
+        }
+      } catch {}
+
+      return `-- DDL not available for "${schema}"."${table}"`;
+    } catch {
+      return `-- DDL not available for "${schema}"."${table}"`;
+    } finally {
+      await conn.close();
+    }
+  }
+
+  private async _resolveDdlObjectType(
+    conn: oracledb.Connection,
+    schema: string,
+    objectName: string,
+  ): Promise<"TABLE" | "VIEW" | null> {
+    const owner = schema.toUpperCase();
+    const name = objectName.toUpperCase();
+    const obj = oracledb.OUT_FORMAT_OBJECT;
+
+    try {
       const objRes = await conn.execute<{ OBJECT_TYPE: string }>(
         `SELECT object_type FROM all_objects
          WHERE owner = :1 AND object_name = :2
            AND object_type IN ('TABLE','VIEW') AND ROWNUM = 1`,
-        [schema.toUpperCase(), table.toUpperCase()],
-        { outFormat: oracledb.OUT_FORMAT_OBJECT },
+        [owner, name],
+        { outFormat: obj },
       );
-      const objectType = objRes.rows?.[0]?.OBJECT_TYPE ?? "TABLE";
-
-      if (objectType === "VIEW") {
-        try {
-          const res = await conn.execute<{ DDL: string }>(
-            `SELECT DBMS_METADATA.GET_DDL('VIEW', :2, :1) AS ddl FROM dual`,
-            [schema.toUpperCase(), table.toUpperCase()],
-            { outFormat: oracledb.OUT_FORMAT_OBJECT },
-          );
-          const ddl = res.rows?.[0]?.DDL;
-          if (typeof ddl === "string" && ddl.trim()) {
-            return ddl.trim();
-          }
-          if (ddl && typeof (ddl as any).getData === "function") {
-            const text = ((await (ddl as any).getData()) as string).trim();
-            if (text) return text;
-          }
-        } catch {}
-        return await this._fallbackViewDDL(conn, schema, table);
+      const objectType = objRes.rows?.[0]?.OBJECT_TYPE;
+      if (objectType === "TABLE" || objectType === "VIEW") {
+        return objectType;
       }
+    } catch {}
 
-      return await this._fallbackDDL(conn, schema, table);
-    } catch {
-      try {
-        return await this._fallbackDDL(conn, schema, table);
-      } catch {
-        return `-- DDL not available for "${schema}"."${table}"`;
+    try {
+      const viewRes = await conn.execute<{ VIEW_NAME: string }>(
+        `SELECT view_name FROM all_views
+         WHERE owner = :1 AND view_name = :2 AND ROWNUM = 1`,
+        [owner, name],
+        { outFormat: obj },
+      );
+      if (viewRes.rows?.[0]?.VIEW_NAME) {
+        return "VIEW";
       }
-    } finally {
-      await conn.close();
-    }
+    } catch {}
+
+    try {
+      const tableRes = await conn.execute<{ TABLE_NAME: string }>(
+        `SELECT table_name FROM all_tables
+         WHERE owner = :1 AND table_name = :2 AND ROWNUM = 1`,
+        [owner, name],
+        { outFormat: obj },
+      );
+      if (tableRes.rows?.[0]?.TABLE_NAME) {
+        return "TABLE";
+      }
+    } catch {}
+
+    return null;
   }
 
   private async _fallbackViewDDL(
@@ -896,31 +1110,57 @@ export class OracleDriver extends BaseDBDriver {
     schema: string,
     view: string,
   ): Promise<string> {
-    const res = await conn.execute<{ TEXT: any }>(
+    const res = await conn.execute<{ TEXT: unknown }>(
       `SELECT text FROM all_views WHERE owner = :1 AND view_name = :2`,
       [schema.toUpperCase(), view.toUpperCase()],
       { outFormat: oracledb.OUT_FORMAT_OBJECT },
     );
 
     const row = res.rows?.[0];
-    if (!row || !row.TEXT) {
+    if (!row?.TEXT) {
       return `-- View source not available for "${schema}"."${view}"`;
     }
 
     const text = await this._consumeLob(row.TEXT);
-    const cleanText = typeof text === "string" ? text.trim() : "";
+    const cleanText = toOracleDdlText(text);
 
-    return `CREATE OR REPLACE VIEW "${schema}"."${view}" AS\n${cleanText}`;
+    return cleanText
+      ? `CREATE OR REPLACE VIEW "${schema}"."${view}" AS\n${cleanText}`
+      : `-- View source not available for "${schema}"."${view}"`;
   }
 
-  private async _consumeLob(lob: any): Promise<string | Buffer | null> {
-    if (!lob) return null;
+  private async _getMetadataDDL(
+    conn: oracledb.Connection,
+    objectType: "TABLE" | "VIEW",
+    schema: string,
+    objectName: string,
+  ): Promise<string | null> {
+    try {
+      await conn.execute(ORACLE_DDL_TRANSFORM_BLOCK);
+    } catch {}
 
     try {
-      if (typeof lob === "string" || Buffer.isBuffer(lob)) {
-        return lob;
-      }
+      const res = await conn.execute<{ DDL: unknown }>(
+        `SELECT DBMS_METADATA.GET_DDL('${objectType}', :2, :1) AS ddl FROM dual`,
+        [schema.toUpperCase(), objectName.toUpperCase()],
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
+      );
 
+      const ddl = await this._consumeLob(res.rows?.[0]?.DDL);
+      return toOracleDdlText(ddl);
+    } catch {
+      return null;
+    }
+  }
+
+  private async _consumeLob(lob: unknown): Promise<string | Buffer | null> {
+    if (!lob) return null;
+
+    if (!isOracleLobLike(lob)) {
+      return typeof lob === "string" || Buffer.isBuffer(lob) ? lob : null;
+    }
+
+    try {
       if (typeof lob.getData === "function") {
         const data = await lob.getData();
         return data;
@@ -1012,16 +1252,12 @@ export class OracleDriver extends BaseDBDriver {
     } catch {}
 
     const colLines = (colRes.rows ?? []).map((r) => {
-      let typ = r.DATA_TYPE;
-      if (r.DATA_PRECISION !== null && r.DATA_SCALE !== null) {
-        typ = `${typ}(${r.DATA_PRECISION},${r.DATA_SCALE})`;
-      } else if (r.DATA_PRECISION !== null) {
-        typ = `${typ}(${r.DATA_PRECISION})`;
-      } else if (
-        ["VARCHAR2", "NVARCHAR2", "CHAR", "NCHAR", "RAW"].includes(r.DATA_TYPE)
-      ) {
-        typ = `${typ}(${r.DATA_LENGTH})`;
-      }
+      const typ = oracleFullType(
+        r.DATA_TYPE,
+        r.DATA_PRECISION,
+        r.DATA_SCALE,
+        r.DATA_LENGTH,
+      );
 
       const nullable = r.NULLABLE === "Y" ? "" : " NOT NULL";
 
@@ -1122,6 +1358,16 @@ export class OracleDriver extends BaseDBDriver {
   ): oracledb.FetchTypeResponse | undefined {
     if (metaData.dbType === oracledb.DB_TYPE_NUMBER) {
       return { type: oracledb.NUMBER };
+    }
+    if (metaData.dbType === oracledb.DB_TYPE_INTERVAL_YM) {
+      return {
+        converter: (value) => normalizeOracleIntervalYMValue(value) ?? value,
+      };
+    }
+    if (metaData.dbType === oracledb.DB_TYPE_INTERVAL_DS) {
+      return {
+        converter: (value) => normalizeOracleIntervalDSValue(value) ?? value,
+      };
     }
     return undefined;
   }
@@ -1377,6 +1623,14 @@ export class OracleDriver extends BaseDBDriver {
     if (value === null || value === undefined) return value;
     if (Buffer.isBuffer(value)) return super.formatOutputValue(value, column);
     if (typeof value === "bigint") return value.toString();
+    if (column.category === "float") {
+      const normalizedFloat = normalizeOracleFloatValue(value, column.nativeType);
+      if (normalizedFloat !== null) return normalizedFloat;
+    }
+    if (isOracleIntervalType(column.nativeType)) {
+      const intervalText = normalizeOracleIntervalValue(value);
+      if (intervalText !== null) return intervalText;
+    }
     if (this.isDatetimeWithTime(column.nativeType)) {
       if (
         value instanceof Date &&
@@ -1389,7 +1643,7 @@ export class OracleDriver extends BaseDBDriver {
       if (formatted !== null) return formatted;
     }
     // LOB-like values already consumed as string/Buffer via fetchAsString/fetchAsBuffer
-    return value;
+    return super.formatOutputValue(value, column);
   }
 
   // ─── Oracle filter building ───

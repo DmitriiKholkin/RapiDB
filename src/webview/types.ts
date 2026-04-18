@@ -1,100 +1,18 @@
-/**
- * Frontend-side type definitions.
- * Mirror the backend ColumnTypeMeta / TypeCategory / FilterOperator types
- * so the webview can use the rich metadata sent via messages.
- */
+export {
+  buildFilterExpression,
+  type ColumnTypeMeta as ColumnMeta,
+  defaultFilterOperator,
+  type FilterExpression,
+  type FilterOperator,
+  type ForeignKeyMeta,
+  type IndexMeta,
+  isNumericCategory,
+  NULL_SENTINEL,
+  type TypeCategory,
+  valueFilterOperator,
+} from "../shared/tableTypes";
 
-// ─── Sentinel used to represent an explicit NULL value in inputs ───
-
-export const NULL_SENTINEL = "\x00__NULL__\x00";
-
-// ─── Type category (mirrors backend TypeCategory) ───
-
-export type TypeCategory =
-  | "text"
-  | "integer"
-  | "float"
-  | "decimal"
-  | "boolean"
-  | "date"
-  | "time"
-  | "datetime"
-  | "binary"
-  | "json"
-  | "uuid"
-  | "spatial"
-  | "interval"
-  | "array"
-  | "enum"
-  | "lob"
-  | "other";
-
-// ─── Filter operators ───
-
-export type FilterOperator =
-  | "eq"
-  | "neq"
-  | "gt"
-  | "gte"
-  | "lt"
-  | "lte"
-  | "between"
-  | "like"
-  | "ilike"
-  | "in"
-  | "is_null"
-  | "is_not_null";
-
-export type FilterExpression =
-  | {
-      column: string;
-      operator: Exclude<FilterOperator, "between" | "is_null" | "is_not_null">;
-      value: string;
-    }
-  | {
-      column: string;
-      operator: "between";
-      value: [string, string];
-    }
-  | {
-      column: string;
-      operator: "is_null" | "is_not_null";
-    };
-
-// ─── Column metadata (matches backend ColumnTypeMeta sent via messages) ───
-
-export interface ColumnMeta {
-  name: string;
-  type: string;
-  nullable: boolean;
-  defaultValue?: string;
-  isPrimaryKey: boolean;
-  isForeignKey: boolean;
-  isAutoIncrement?: boolean;
-  category: TypeCategory;
-  nativeType: string;
-  filterable: boolean;
-  editable: boolean;
-  filterOperators: FilterOperator[];
-  isBoolean: boolean;
-}
-
-// ─── Index / FK metadata ───
-
-export interface IndexMeta {
-  name: string;
-  columns: string[];
-  unique: boolean;
-  primary: boolean;
-}
-
-export interface ForeignKeyMeta {
-  constraintName: string;
-  column: string;
-  referencedSchema: string;
-  referencedTable: string;
-  referencedColumn: string;
-}
+import type { TypeCategory } from "../shared/tableTypes";
 
 // ─── Table data types ───
 
@@ -138,55 +56,6 @@ export function placeholderForCategory(
     default:
       return "filter";
   }
-}
-
-/** Returns true for categories that represent numeric values. */
-export function isNumericCategory(cat: TypeCategory): boolean {
-  return cat === "integer" || cat === "float" || cat === "decimal";
-}
-
-export function defaultFilterOperator(
-  column: Pick<ColumnMeta, "category" | "isBoolean">,
-): "eq" | "like" {
-  if (
-    column.isBoolean ||
-    isNumericCategory(column.category) ||
-    column.category === "date"
-  ) {
-    return "eq";
-  }
-  return "like";
-}
-
-export function valueFilterOperator(
-  column: Pick<
-    ColumnMeta,
-    "category" | "filterable" | "filterOperators" | "isBoolean"
-  >,
-): "eq" | "like" | null {
-  if (!column.filterable) return null;
-  const operator = defaultFilterOperator(column);
-  return column.filterOperators.includes(operator) ? operator : null;
-}
-
-export function buildFilterExpression(
-  column: ColumnMeta,
-  rawValue: string,
-): FilterExpression | null {
-  const value = rawValue.trim();
-  if (value === "") return null;
-  if (value === NULL_SENTINEL) {
-    return column.filterOperators.includes("is_null")
-      ? { column: column.name, operator: "is_null" }
-      : null;
-  }
-  const operator = valueFilterOperator(column);
-  if (!operator) return null;
-  return {
-    column: column.name,
-    operator,
-    value,
-  };
 }
 
 /** Category display label for badges. */
