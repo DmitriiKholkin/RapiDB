@@ -172,9 +172,7 @@ function defaultFilterExpression(
 
   return {
     column: columnName,
-    operator: column
-      ? defaultFilterOperator(column)
-      : "like",
+    operator: column ? defaultFilterOperator(column) : "like",
     value,
   };
 }
@@ -185,6 +183,11 @@ function assertCellValue(
   comparison: ComparisonMode,
   context: string,
 ): void {
+  if (expected === null || expected === undefined) {
+    assert.equal(actual ?? null, expected ?? null, `${context}: values differ`);
+    return;
+  }
+
   const actualText = normalizeValue(actual);
   assert.notEqual(
     actualText,

@@ -20,24 +20,27 @@ import { SchemaView } from "../../src/webview/components/SchemaView";
 afterEach(cleanup);
 
 const postMessage = vi.fn();
+const getState = vi.fn();
+const setState = vi.fn();
 
 function makeColumn(
   overrides: Partial<ColumnMeta> & { name: string; type: string },
 ): ColumnMeta {
+  const { name, type, nativeType, ...rest } = overrides;
   return {
-    name: overrides.name,
-    type: overrides.type,
     nullable: true,
     isPrimaryKey: false,
     isForeignKey: false,
     isAutoIncrement: false,
     category: "text",
-    nativeType: overrides.type,
     filterable: true,
     editable: true,
     filterOperators: ["like"],
     isBoolean: false,
-    ...overrides,
+    ...rest,
+    name,
+    type,
+    nativeType: nativeType ?? type,
   };
 }
 
@@ -84,10 +87,20 @@ async function renderSchemaView(table: string): Promise<void> {
 describe("SchemaView", () => {
   beforeEach(() => {
     postMessage.mockReset();
+    getState.mockReset();
+    setState.mockReset();
     (
-      window as Window & { __vscode?: { postMessage: typeof postMessage } }
+      window as Window & {
+        __vscode?: {
+          postMessage: typeof postMessage;
+          getState: typeof getState;
+          setState: typeof setState;
+        };
+      }
     ).__vscode = {
       postMessage,
+      getState,
+      setState,
     };
   });
 
@@ -108,6 +121,24 @@ describe("SchemaView", () => {
       within(await findColumnRow("payload")).getByText("JSON"),
     ).toBeDefined();
     expect(row).toBeDefined();
+  });
+
+  it("renders Oracle interval columns with the interval badge", async () => {
+    await renderSchemaView("events");
+
+    emitSchemaData([
+      makeColumn({
+        name: "duration",
+        type: "INTERVAL DAY TO SECOND",
+        category: "interval",
+        nativeType: "INTERVAL DAY TO SECOND",
+        editable: false,
+      }),
+    ]);
+
+    expect(
+      within(await findColumnRow("duration")).getByText("INTV"),
+    ).toBeDefined();
   });
 
   it("does not show an FK badge when runtime payload has no FK metadata", async () => {

@@ -15,19 +15,20 @@ afterEach(cleanup);
 function makeColumn(
   overrides: Partial<ColumnMeta> & { name: string; type: string },
 ): ColumnMeta {
+  const { name, type, nativeType, ...rest } = overrides;
   return {
-    name: overrides.name,
-    type: overrides.type,
     nullable: true,
     isPrimaryKey: false,
     isForeignKey: false,
     category: "text",
-    nativeType: overrides.type,
     filterable: true,
     editable: true,
     filterOperators: ["like"],
     isBoolean: false,
-    ...overrides,
+    ...rest,
+    name,
+    type,
+    nativeType: nativeType ?? type,
   };
 }
 
@@ -284,7 +285,9 @@ describe("NewRowForm", () => {
         ]}
         newRow={{ active: NULL_SENTINEL }}
         setNewRow={setNewRow}
+        inserting={false}
         onInsert={vi.fn()}
+        onCancel={vi.fn()}
       />,
     );
 

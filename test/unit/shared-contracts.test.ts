@@ -4,6 +4,7 @@ import {
   buildFilterExpression,
   coerceFilterExpressions,
   defaultFilterOperator,
+  type FilterOperator,
   isNumericCategory,
   NULL_SENTINEL as sharedNullSentinel,
   valueFilterOperator,
@@ -17,12 +18,12 @@ describe("shared contract parity", () => {
   });
 
   it("centralizes the default value-filter operator policy in shared helpers", () => {
-    expect(defaultFilterOperator({ category: "boolean", isBoolean: true })).toBe(
-      "eq",
-    );
-    expect(defaultFilterOperator({ category: "integer", isBoolean: false })).toBe(
-      "eq",
-    );
+    expect(
+      defaultFilterOperator({ category: "boolean", isBoolean: true }),
+    ).toBe("eq");
+    expect(
+      defaultFilterOperator({ category: "integer", isBoolean: false }),
+    ).toBe("eq");
     expect(defaultFilterOperator({ category: "date", isBoolean: false })).toBe(
       "eq",
     );
@@ -89,7 +90,7 @@ describe("shared contract parity", () => {
       nativeType: "text",
       filterable: true,
       editable: true,
-      filterOperators: ["like"],
+      filterOperators: ["like"] as FilterOperator[],
       isBoolean: false,
     };
 

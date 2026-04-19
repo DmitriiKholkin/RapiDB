@@ -29,24 +29,27 @@ vi.mock("@tanstack/react-virtual", () => ({
 afterEach(cleanup);
 
 const postMessage = vi.fn();
+const getState = vi.fn();
+const setState = vi.fn();
 
 function makeColumn(
   overrides: Partial<ColumnMeta> & { name: string; type: string },
 ): ColumnMeta {
+  const { name, type, nativeType, ...rest } = overrides;
   return {
-    name: overrides.name,
-    type: overrides.type,
     nullable: true,
     isPrimaryKey: false,
     isForeignKey: false,
     isAutoIncrement: false,
     category: "text",
-    nativeType: overrides.type,
     filterable: true,
     editable: true,
     filterOperators: ["like"],
     isBoolean: false,
-    ...overrides,
+    ...rest,
+    name,
+    type,
+    nativeType: nativeType ?? type,
   };
 }
 
@@ -59,10 +62,20 @@ function emit(type: string, payload: unknown): void {
 describe("TableView", () => {
   beforeEach(() => {
     postMessage.mockReset();
+    getState.mockReset();
+    setState.mockReset();
     (
-      window as Window & { __vscode?: { postMessage: typeof postMessage } }
+      window as Window & {
+        __vscode?: {
+          postMessage: typeof postMessage;
+          getState: typeof getState;
+          setState: typeof setState;
+        };
+      }
     ).__vscode = {
       postMessage,
+      getState,
+      setState,
     };
   });
 

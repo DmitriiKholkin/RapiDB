@@ -38,8 +38,23 @@ describe("webviewShell", () => {
     joinPath.mockClear();
     randomUUID.mockClear();
     webview = {
+      html: "",
+      options: {
+        enableScripts: false,
+        localResourceRoots: [],
+      },
       cspSource: "vscode-webview-resource:",
-      asWebviewUri: vi.fn((uri: { path: string }) => `webview:${uri.path}`),
+      asWebviewUri: vi.fn(
+        (uri: { path: string }) =>
+          ({
+            path: `webview:${uri.path}`,
+            toString(this: { path: string }) {
+              return this.path;
+            },
+          }) as unknown as vscode.Uri,
+      ),
+      postMessage: vi.fn(async () => true),
+      onDidReceiveMessage: vi.fn(),
     };
   });
 

@@ -2013,7 +2013,7 @@ describe("MSSQLDriver", () => {
 describe("OracleDriver", () => {
   describe("mapTypeCategory", () => {
     it.each([
-      ["NUMBER", "integer"],
+      ["NUMBER", "decimal"],
       ["NUMBER(10)", "integer"],
       ["NUMBER(10,0)", "integer"],
       ["NUMBER(10,2)", "decimal"],
@@ -2029,8 +2029,8 @@ describe("OracleDriver", () => {
       ["TIMESTAMP(6)", "datetime"],
       ["TIMESTAMP(6) WITH TIME ZONE", "datetime"],
       ["TIMESTAMP(6) WITH LOCAL TIME ZONE", "datetime"],
-      ["INTERVAL YEAR TO MONTH", "text"],
-      ["INTERVAL DAY TO SECOND", "text"],
+      ["INTERVAL YEAR TO MONTH", "interval"],
+      ["INTERVAL DAY TO SECOND", "interval"],
       ["VARCHAR2(100)", "text"],
       ["NVARCHAR2(100)", "text"],
       ["CHAR(10)", "text"],
@@ -2146,6 +2146,246 @@ describe("OracleDriver", () => {
       const result = await ora.query("SELECT CURRENT_DATE AS D FROM dual");
 
       expect(result.rows).toEqual([{ __col_0: "2024-06-15 10:30:00" }]);
+      expect(close).toHaveBeenCalledTimes(1);
+    });
+
+    it("preserves unsafe Oracle NUMBER values as strings", () => {
+      const response = oraInternals._fetchTypeHandler({
+        dbType: oracledb.DB_TYPE_NUMBER,
+        scale: 0,
+      } as unknown as oracledb.Metadata<unknown>);
+
+      expect(response?.converter?.("9007199254740993")).toBe(
+        "9007199254740993",
+      );
+    });
+
+    it("converts safe integer Oracle NUMBER values to numbers", () => {
+      const response = oraInternals._fetchTypeHandler({
+        dbType: oracledb.DB_TYPE_NUMBER,
+        scale: 0,
+      } as unknown as oracledb.Metadata<unknown>);
+
+      expect(response?.converter?.("42")).toBe(42);
+    });
+
+    it("converts lower-bound safe Oracle NUMBER values to numbers", () => {
+      const response = oraInternals._fetchTypeHandler({
+        dbType: oracledb.DB_TYPE_NUMBER,
+        scale: 0,
+      } as unknown as oracledb.Metadata<unknown>);
+
+      expect(response?.converter?.("-9007199254740991")).toBe(
+        -9007199254740991,
+      );
+    });
+
+    it("preserves decimal Oracle NUMBER values as strings", () => {
+      const response = oraInternals._fetchTypeHandler({
+        dbType: oracledb.DB_TYPE_NUMBER,
+        scale: 2,
+      } as unknown as oracledb.Metadata<unknown>);
+
+      expect(response?.converter?.("38.73")).toBe("38.73");
+    });
+  });
+
+  describe("describeTable", () => {
+    it("returns ordered Oracle PK ordinals and identity metadata", async () => {
+      const execute = vi.fn(async (sql: string) => {
+        if (sql.includes("FROM all_tab_columns")) {
+          return {
+            rows: [
+              {
+                COLUMN_NAME: "ACCOUNT_ID",
+                DATA_TYPE: "NUMBER",
+                DATA_PRECISION: 10,
+                DATA_SCALE: 0,
+                DATA_LENGTH: 22,
+                NULLABLE: "N",
+                DATA_DEFAULT: null,
+                COLUMN_ID: 1,
+              },
+              {
+                COLUMN_NAME: "TENANT_ID",
+                DATA_TYPE: "NUMBER",
+                DATA_PRECISION: 10,
+                DATA_SCALE: 0,
+                DATA_LENGTH: 22,
+                NULLABLE: "N",
+                DATA_DEFAULT: null,
+                COLUMN_ID: 2,
+              },
+              {
+                COLUMN_NAME: "NAME",
+                DATA_TYPE: "VARCHAR2",
+                DATA_PRECISION: null,
+                DATA_SCALE: null,
+                DATA_LENGTH: 50,
+                NULLABLE: "Y",
+                DATA_DEFAULT: "'demo' ",
+                COLUMN_ID: 3,
+              },
+            ],
+          };
+        }
+        if (sql.includes("cons.constraint_type = 'P'")) {
+          return {
+            rows: [
+              { COLUMN_NAME: "TENANT_ID", POSITION: 1 },
+              { COLUMN_NAME: "ACCOUNT_ID", POSITION: 2 },
+            ],
+          };
+        }
+        if (sql.includes("cons.constraint_type = 'R'")) {
+          return { rows: [{ COLUMN_NAME: "TENANT_ID" }] };
+        }
+        if (sql.includes("FROM all_tab_identity_cols")) {
+          return {
+            rows: [
+              {
+                COLUMN_NAME: "ACCOUNT_ID",
+                GENERATION_TYPE: "BY DEFAULT",
+              },
+            ],
+          };
+        }
+        throw new Error(`Unexpected SQL: ${sql}`);
+      });
+      const close = vi.fn(async () => {});
+      const pool = {
+        getConnection: vi.fn(async () => ({ execute, close })),
+      };
+      (ora as unknown as { pool: typeof pool }).pool = pool;
+
+      const result = await ora.describeTable("test", "APP", "ACCOUNTS");
+
+      expect(result).toEqual([
+        {
+          name: "ACCOUNT_ID",
+          type: "NUMBER(10,0)",
+          nullable: false,
+          defaultValue: undefined,
+          isPrimaryKey: true,
+          primaryKeyOrdinal: 2,
+          isForeignKey: false,
+          isAutoIncrement: true,
+        },
+        {
+          name: "TENANT_ID",
+          type: "NUMBER(10,0)",
+          nullable: false,
+          defaultValue: undefined,
+          isPrimaryKey: true,
+          primaryKeyOrdinal: 1,
+          isForeignKey: true,
+          isAutoIncrement: false,
+        },
+        {
+          name: "NAME",
+          type: "VARCHAR2(50)",
+          nullable: true,
+          defaultValue: "'demo'",
+          isPrimaryKey: false,
+          primaryKeyOrdinal: undefined,
+          isForeignKey: false,
+          isAutoIncrement: false,
+        },
+      ]);
+      expect(close).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("schema metadata", () => {
+    it("groups Oracle index columns in database order", async () => {
+      const execute = vi.fn(async () => ({
+        rows: [
+          {
+            INDEX_NAME: "ACCOUNTS_PK",
+            COLUMN_NAME: "TENANT_ID",
+            UNIQUENESS: "UNIQUE",
+            INDEX_TYPE: "PRIMARY",
+          },
+          {
+            INDEX_NAME: "ACCOUNTS_PK",
+            COLUMN_NAME: "ACCOUNT_ID",
+            UNIQUENESS: "UNIQUE",
+            INDEX_TYPE: "PRIMARY",
+          },
+          {
+            INDEX_NAME: "ACCOUNTS_NAME_IDX",
+            COLUMN_NAME: "NAME",
+            UNIQUENESS: "NONUNIQUE",
+            INDEX_TYPE: "NORMAL",
+          },
+        ],
+      }));
+      const close = vi.fn(async () => {});
+      const pool = {
+        getConnection: vi.fn(async () => ({ execute, close })),
+      };
+      (ora as unknown as { pool: typeof pool }).pool = pool;
+
+      await expect(ora.getIndexes("test", "APP", "ACCOUNTS")).resolves.toEqual([
+        {
+          name: "ACCOUNTS_PK",
+          columns: ["TENANT_ID", "ACCOUNT_ID"],
+          unique: true,
+          primary: true,
+        },
+        {
+          name: "ACCOUNTS_NAME_IDX",
+          columns: ["NAME"],
+          unique: false,
+          primary: false,
+        },
+      ]);
+      expect(close).toHaveBeenCalledTimes(1);
+    });
+
+    it("maps Oracle foreign keys with stable column pairings", async () => {
+      const execute = vi.fn(async () => ({
+        rows: [
+          {
+            CONSTRAINT_NAME: "ACCOUNTS_TENANT_FK",
+            COLUMN_NAME: "TENANT_ID",
+            R_OWNER: "APP",
+            R_TABLE_NAME: "TENANTS",
+            R_COLUMN_NAME: "ID",
+          },
+          {
+            CONSTRAINT_NAME: "ACCOUNTS_PARENT_FK",
+            COLUMN_NAME: "PARENT_ID",
+            R_OWNER: "APP",
+            R_TABLE_NAME: "ACCOUNTS",
+            R_COLUMN_NAME: "ACCOUNT_ID",
+          },
+        ],
+      }));
+      const close = vi.fn(async () => {});
+      const pool = {
+        getConnection: vi.fn(async () => ({ execute, close })),
+      };
+      (ora as unknown as { pool: typeof pool }).pool = pool;
+
+      await expect(
+        ora.getForeignKeys("test", "APP", "ACCOUNTS"),
+      ).resolves.toEqual([
+        {
+          constraintName: "ACCOUNTS_TENANT_FK",
+          column: "TENANT_ID",
+          referencedSchema: "APP",
+          referencedTable: "TENANTS",
+          referencedColumn: "ID",
+        },
+        {
+          constraintName: "ACCOUNTS_PARENT_FK",
+          column: "PARENT_ID",
+          referencedSchema: "APP",
+          referencedTable: "ACCOUNTS",
+          referencedColumn: "ACCOUNT_ID",
+        },
+      ]);
       expect(close).toHaveBeenCalledTimes(1);
     });
   });
@@ -2358,6 +2598,7 @@ describe("OracleDriver", () => {
       "CLOB",
       "XMLTYPE",
       "OBJECT",
+      "INTERVAL DAY TO SECOND",
     ])("marks %s as read-only", (type) => {
       const result = enrichTestColumn(ora, {
         name: "unsupported_col",
@@ -2367,6 +2608,23 @@ describe("OracleDriver", () => {
         isForeignKey: false,
       });
       expect(result.editable).toBe(false);
+    });
+
+    it("classifies Oracle intervals as interval columns", () => {
+      const result = enrichTestColumn(ora, {
+        name: "ival",
+        type: "INTERVAL DAY TO SECOND",
+        nullable: true,
+        isPrimaryKey: false,
+        isForeignKey: false,
+      });
+
+      expect(result.category).toBe("interval");
+      expect(result.filterOperators).toEqual([
+        "like",
+        "is_null",
+        "is_not_null",
+      ]);
     });
 
     it("keeps RAW columns editable", () => {
@@ -2394,6 +2652,28 @@ describe("OracleDriver", () => {
         nativeType,
       });
       expect(ora.coerceInputValue("1.25", c)).toBe(1.25);
+    });
+
+    it("preserves precision-sensitive Oracle NUMBER text for inserts and updates", () => {
+      const integerColumn = col({
+        name: "account_id",
+        type: "NUMBER(20,0)",
+        category: "integer",
+        nativeType: "NUMBER(20,0)",
+      });
+      const decimalColumn = col({
+        name: "amount",
+        type: "NUMBER(38,9)",
+        category: "decimal",
+        nativeType: "NUMBER(38,9)",
+      });
+
+      expect(ora.coerceInputValue("9007199254740993", integerColumn)).toBe(
+        "9007199254740993",
+      );
+      expect(
+        ora.coerceInputValue("12345678901234567890.123456789", decimalColumn),
+      ).toBe("12345678901234567890.123456789");
     });
 
     it("converts ISO datetime to Date object for datetime columns", () => {
@@ -2570,7 +2850,7 @@ describe("OracleDriver", () => {
       const c = col({
         name: "ival",
         type: "INTERVAL YEAR TO MONTH",
-        category: "text",
+        category: "interval",
         nativeType: "INTERVAL YEAR TO MONTH",
       });
       expect(ora.formatOutputValue({ years: 1, months: 14 }, c)).toBe("2-02");
@@ -2580,7 +2860,7 @@ describe("OracleDriver", () => {
       const c = col({
         name: "ival",
         type: "INTERVAL DAY TO SECOND",
-        category: "text",
+        category: "interval",
         nativeType: "INTERVAL DAY TO SECOND",
       });
       expect(
@@ -2599,6 +2879,15 @@ describe("OracleDriver", () => {
   });
 
   describe("fetchTypeHandler", () => {
+    it("returns string-backed Oracle NUMBER conversion", () => {
+      const response = oraInternals._fetchTypeHandler({
+        dbType: oracledb.DB_TYPE_NUMBER,
+        scale: 0,
+      } as unknown as oracledb.Metadata<unknown>);
+
+      expect(response?.type).toBe(oracledb.STRING);
+    });
+
     it("normalizes IntervalYM values at fetch time", () => {
       const response = oraInternals._fetchTypeHandler({
         dbType: oracledb.DB_TYPE_INTERVAL_YM,
@@ -2625,11 +2914,31 @@ describe("OracleDriver", () => {
   });
 
   describe("buildFilterCondition", () => {
-    it("uses :N params", () => {
+    it("uses :N params and preserves Oracle NUMBER binds as strings", () => {
       const c = col({ name: "age", type: "NUMBER", category: "integer" });
       const r = ora.buildFilterCondition(c, "eq", "42", 1);
       expect(r?.sql).toContain(":1");
-      expect(r?.params).toEqual([42]);
+      expect(r?.params).toEqual(["42"]);
+    });
+
+    it("keeps precision-sensitive Oracle NUMBER filters as string binds", () => {
+      const c = col({
+        name: "amount",
+        type: "NUMBER(38,9)",
+        category: "decimal",
+        nativeType: "NUMBER(38,9)",
+      });
+      const r = ora.buildFilterCondition(
+        c,
+        "eq",
+        "12345678901234567890.123456789",
+        1,
+      );
+
+      expect(r).toEqual({
+        sql: '"amount" = :1',
+        params: ["12345678901234567890.123456789"],
+      });
     });
 
     it("uses UPPER for text LIKE", () => {
@@ -2686,6 +2995,21 @@ describe("OracleDriver", () => {
       );
       expect(r?.sql).toContain("SYS_EXTRACT_UTC");
       expect(r?.params).toEqual(["%2024-06-15 08:30:00%"]);
+    });
+
+    it("filters Oracle intervals as case-insensitive text", () => {
+      const c = col({
+        name: "duration",
+        type: "INTERVAL DAY TO SECOND",
+        category: "interval",
+        nativeType: "INTERVAL DAY TO SECOND",
+      });
+      const r = ora.buildFilterCondition(c, "like", "04:05:06", 1);
+
+      expect(r).toEqual({
+        sql: 'UPPER("duration") LIKE UPPER(:1)',
+        params: ["%04:05:06%"],
+      });
     });
   });
 });

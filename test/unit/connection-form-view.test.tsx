@@ -9,16 +9,26 @@ import { ConnectionFormView } from "../../src/webview/components/ConnectionFormV
 afterEach(cleanup);
 
 const postMessage = vi.fn();
+const getState = vi.fn();
+const setState = vi.fn();
 
 describe("ConnectionFormView", () => {
   beforeEach(() => {
     postMessage.mockReset();
+    getState.mockReset();
+    setState.mockReset();
     (
       window as Window & {
-        __vscode?: { postMessage: typeof postMessage };
+        __vscode?: {
+          postMessage: typeof postMessage;
+          getState: typeof getState;
+          setState: typeof setState;
+        };
       }
     ).__vscode = {
       postMessage,
+      getState,
+      setState,
     };
   });
 

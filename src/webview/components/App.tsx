@@ -64,11 +64,13 @@ export function App(): React.ReactElement {
         </ErrorBoundary>
       );
 
-    default:
+    default: {
+      const unknownView = (state as { view?: string }).view ?? "unknown";
       return (
         <div style={{ padding: 16, color: "var(--vscode-errorForeground)" }}>
-          Unknown view: {state.view}
+          Unknown view: {unknownView}
         </div>
       );
+    }
   }
 }

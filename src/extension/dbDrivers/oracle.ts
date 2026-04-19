@@ -71,6 +71,41 @@ const ORACLE_INTERVAL_DS_NANOS_PER_HOUR =
   60n * ORACLE_INTERVAL_DS_NANOS_PER_MINUTE;
 const ORACLE_INTERVAL_DS_NANOS_PER_DAY =
   24n * ORACLE_INTERVAL_DS_NANOS_PER_HOUR;
+const ORACLE_MAX_SAFE_INTEGER = BigInt(Number.MAX_SAFE_INTEGER);
+const ORACLE_MIN_SAFE_INTEGER = BigInt(Number.MIN_SAFE_INTEGER);
+
+function normalizeOracleNumberValue(
+  value: unknown,
+  metaData: Pick<oracledb.Metadata<unknown>, "scale">,
+): string | number | null {
+  if (value === null) {
+    return null;
+  }
+  if (typeof value !== "string") {
+    return typeof value === "number" && Number.isFinite(value) ? value : null;
+  }
+
+  const trimmed = value.trim();
+  if (trimmed === "") {
+    return value;
+  }
+
+  if (metaData.scale === 0 && /^[+-]?\d+$/.test(trimmed)) {
+    try {
+      const parsed = BigInt(trimmed);
+      if (
+        parsed >= ORACLE_MIN_SAFE_INTEGER &&
+        parsed <= ORACLE_MAX_SAFE_INTEGER
+      ) {
+        return Number(trimmed);
+      }
+    } catch {
+      return trimmed;
+    }
+  }
+
+  return trimmed;
+}
 
 function oracleFloatPrecision(nativeType?: string): number | null {
   if (!nativeType) return null;
@@ -202,6 +237,13 @@ function isOracleLobLike(value: unknown): value is OracleLobLike {
   return !!value && typeof value === "object";
 }
 
+function oracleErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return String(error);
+}
+
 function ensureThickMode(libDir?: string): void {
   if (_thickInitDone) {
     return;
@@ -209,9 +251,9 @@ function ensureThickMode(libDir?: string): void {
   try {
     oracledb.initOracleClient(libDir ? { libDir } : undefined);
     _thickInitDone = true;
-  } catch (err: any) {
+  } catch (err: unknown) {
     throw new Error(
-      `[RapiDB] Oracle thick mode init failed: ${err.message}\n` +
+      `[RapiDB] Oracle thick mode init failed: ${oracleErrorMessage(err)}\n` +
         `Make sure Oracle Instant Client is installed and the path is correct.`,
     );
   }
@@ -718,8 +760,16 @@ export class OracleDriver extends BaseDBDriver {
     return this.pool.connectionsInUse > 0 || this.pool.connectionsOpen > 0;
   }
 
+  private async getConnection(): Promise<oracledb.Connection> {
+    if (!this.pool) {
+      throw new Error("[RapiDB] Oracle connection pool is not initialized.");
+    }
+
+    return this.pool.getConnection();
+  }
+
   async listDatabases(): Promise<DatabaseInfo[]> {
-    const conn = await this.pool!.getConnection();
+    const conn = await this.getConnection();
     try {
       const res = await conn.execute<{ ORA_DATABASE_NAME: string }>(
         `SELECT ora_database_name FROM dual`,
@@ -745,7 +795,7 @@ export class OracleDriver extends BaseDBDriver {
   }
 
   async listSchemas(_database: string): Promise<SchemaInfo[]> {
-    const conn = await this.pool!.getConnection();
+    const conn = await this.getConnection();
     try {
       const res = await conn.execute<{ OWNER: string }>(
         `SELECT username AS owner
@@ -771,7 +821,7 @@ export class OracleDriver extends BaseDBDriver {
   }
 
   async listObjects(_database: string, schema: string): Promise<TableInfo[]> {
-    const conn = await this.pool!.getConnection();
+    const conn = await this.getConnection();
     try {
       const objects: TableInfo[] = [];
 
@@ -817,7 +867,7 @@ export class OracleDriver extends BaseDBDriver {
     schema: string,
     table: string,
   ): Promise<ColumnMeta[]> {
-    const conn = await this.pool!.getConnection();
+    const conn = await this.getConnection();
     try {
       const colRes = await conn.execute<{
         COLUMN_NAME: string;
@@ -838,19 +888,25 @@ export class OracleDriver extends BaseDBDriver {
         { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
 
-      const pkRes = await conn.execute<{ COLUMN_NAME: string }>(
-        `SELECT cols.column_name
+      const pkRes = await conn.execute<{
+        COLUMN_NAME: string;
+        POSITION: number;
+      }>(
+        `SELECT cols.column_name, cols.position
          FROM all_constraints cons
          JOIN all_cons_columns cols
            ON cons.constraint_name = cols.constraint_name
            AND cons.owner = cols.owner
          WHERE cons.constraint_type = 'P'
            AND cons.owner = :1
-           AND cons.table_name = :2`,
+           AND cons.table_name = :2
+         ORDER BY cols.position`,
         [schema.toUpperCase(), table.toUpperCase()],
         { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
-      const pkCols = new Set((pkRes.rows ?? []).map((r) => r.COLUMN_NAME));
+      const pkOrdinalByColumn = new Map(
+        (pkRes.rows ?? []).map((r) => [r.COLUMN_NAME, r.POSITION]),
+      );
 
       const fkRes = await conn.execute<{ COLUMN_NAME: string }>(
         `SELECT cols.column_name
@@ -894,6 +950,7 @@ export class OracleDriver extends BaseDBDriver {
 
       return (colRes.rows ?? []).map((r) => {
         const genType = identityMap.get(r.COLUMN_NAME);
+        const primaryKeyOrdinal = pkOrdinalByColumn.get(r.COLUMN_NAME);
         return {
           name: r.COLUMN_NAME,
           type: oracleFullType(
@@ -907,7 +964,8 @@ export class OracleDriver extends BaseDBDriver {
             genType !== undefined
               ? undefined
               : (r.DATA_DEFAULT?.trim() ?? undefined),
-          isPrimaryKey: pkCols.has(r.COLUMN_NAME),
+          isPrimaryKey: primaryKeyOrdinal !== undefined,
+          primaryKeyOrdinal,
           isForeignKey: fkCols.has(r.COLUMN_NAME),
           isAutoIncrement: genType !== undefined,
         };
@@ -922,7 +980,7 @@ export class OracleDriver extends BaseDBDriver {
     schema: string,
     table: string,
   ): Promise<IndexMeta[]> {
-    const conn = await this.pool!.getConnection();
+    const conn = await this.getConnection();
     try {
       const res = await conn.execute<{
         INDEX_NAME: string;
@@ -955,7 +1013,10 @@ export class OracleDriver extends BaseDBDriver {
             primary: r.INDEX_TYPE === "PRIMARY",
           });
         }
-        map.get(r.INDEX_NAME)!.columns.push(r.COLUMN_NAME);
+        const index = map.get(r.INDEX_NAME);
+        if (index) {
+          index.columns.push(r.COLUMN_NAME);
+        }
       }
       return [...map.values()];
     } finally {
@@ -968,7 +1029,7 @@ export class OracleDriver extends BaseDBDriver {
     schema: string,
     table: string,
   ): Promise<ForeignKeyMeta[]> {
-    const conn = await this.pool!.getConnection();
+    const conn = await this.getConnection();
     try {
       const res = await conn.execute<{
         CONSTRAINT_NAME: string;
@@ -1014,7 +1075,7 @@ export class OracleDriver extends BaseDBDriver {
     schema: string,
     table: string,
   ): Promise<string> {
-    const conn = await this.pool!.getConnection();
+    const conn = await this.getConnection();
     try {
       const objectType = await this._resolveDdlObjectType(conn, schema, table);
 
@@ -1300,7 +1361,7 @@ export class OracleDriver extends BaseDBDriver {
     name: string,
     _kind: "function" | "procedure",
   ): Promise<string> {
-    const conn = await this.pool!.getConnection();
+    const conn = await this.getConnection();
     try {
       const res = await conn.execute<{ TEXT: string }>(
         `SELECT text FROM all_source
@@ -1357,7 +1418,10 @@ export class OracleDriver extends BaseDBDriver {
     metaData: oracledb.Metadata<unknown>,
   ): oracledb.FetchTypeResponse | undefined {
     if (metaData.dbType === oracledb.DB_TYPE_NUMBER) {
-      return { type: oracledb.NUMBER };
+      return {
+        type: oracledb.STRING,
+        converter: (value) => normalizeOracleNumberValue(value, metaData),
+      };
     }
     if (metaData.dbType === oracledb.DB_TYPE_INTERVAL_YM) {
       return {
@@ -1377,7 +1441,7 @@ export class OracleDriver extends BaseDBDriver {
     params: unknown[] | undefined,
     start: number,
   ): Promise<QueryResult> {
-    const conn = await this.pool!.getConnection();
+    const conn = await this.getConnection();
     try {
       let finalSql = sql;
       let binds: unknown[] = [];
@@ -1439,7 +1503,7 @@ export class OracleDriver extends BaseDBDriver {
   async runTransaction(
     operations: import("./types").TransactionOperation[],
   ): Promise<void> {
-    const conn = await this.pool!.getConnection();
+    const conn = await this.getConnection();
     try {
       for (const op of operations) {
         let finalSql = op.sql;
@@ -1490,6 +1554,9 @@ export class OracleDriver extends BaseDBDriver {
         "BINARY_INTEGER",
       ].includes(ct)
     ) {
+      if (ct === "NUMBER" && !normalizedType.includes("(")) {
+        return "decimal";
+      }
       const scale = parseOracleNumberScale(normalizedType);
       if (ct === "NUMBER" && scale !== null && scale > 0) {
         return "decimal";
@@ -1500,7 +1567,7 @@ export class OracleDriver extends BaseDBDriver {
       return "float";
     if (ct === "DATE") return "datetime";
     if (ct.startsWith("TIMESTAMP")) return "datetime";
-    if (ct.startsWith("INTERVAL")) return "text";
+    if (ct.startsWith("INTERVAL")) return "interval";
     if (["BLOB", "RAW", "LONG RAW"].includes(ct)) return "binary";
     if (["CLOB", "NCLOB", "LONG"].includes(ct)) return "text";
     if (ct === "XMLTYPE") return "text";
@@ -1536,6 +1603,7 @@ export class OracleDriver extends BaseDBDriver {
   ): boolean {
     return (
       super.isEditable(nativeType, category) &&
+      category !== "interval" &&
       !ORACLE_NON_EDITABLE.has(oracleTypeName(nativeType).toLowerCase())
     );
   }
@@ -1624,7 +1692,10 @@ export class OracleDriver extends BaseDBDriver {
     if (Buffer.isBuffer(value)) return super.formatOutputValue(value, column);
     if (typeof value === "bigint") return value.toString();
     if (column.category === "float") {
-      const normalizedFloat = normalizeOracleFloatValue(value, column.nativeType);
+      const normalizedFloat = normalizeOracleFloatValue(
+        value,
+        column.nativeType,
+      );
       if (normalizedFloat !== null) return normalizedFloat;
     }
     if (isOracleIntervalType(column.nativeType)) {
@@ -1673,7 +1744,10 @@ export class OracleDriver extends BaseDBDriver {
       val !== ""
     ) {
       const sqlOp = this.sqlOperator(operator);
-      return { sql: `${col} ${sqlOp} :${paramIndex}`, params: [Number(val)] };
+      return {
+        sql: `${col} ${sqlOp} :${paramIndex}`,
+        params: [column.category === "float" ? Number(val) : val],
+      };
     }
 
     // Between

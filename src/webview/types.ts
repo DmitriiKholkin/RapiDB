@@ -115,6 +115,8 @@ export function categoryColor(cat: TypeCategory): string {
       return "var(--vscode-charts-yellow, #cca700)";
     case "spatial":
       return "#00bcd4";
+    case "interval":
+      return "var(--vscode-charts-orange, #e0a040)";
     case "text":
       return "var(--vscode-foreground)";
     default:
