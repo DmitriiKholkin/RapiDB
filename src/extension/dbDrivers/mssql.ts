@@ -102,6 +102,8 @@ const MSSQL_UUID_RE =
 const INTEGER_RE = /^-?\d+$/;
 const DECIMAL_RE = /^-?\d+(?:\.\d+)?$/;
 
+type MssqlTemporalDate = Date & { nanosecondDelta?: number };
+
 function mssqlFullType(
   typeName: string,
   maxLength: number,
@@ -200,6 +202,88 @@ function detectScale(value: unknown): number | null {
   return Math.min(match[1].length, 7);
 }
 
+function parseMssqlTimeLiteral(value: string): MssqlTemporalDate {
+  const match = /^(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,7}))?$/.exec(value);
+  if (!match) {
+    throw new TypeError("Invalid time.");
+  }
+
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  const seconds = Number(match[3]);
+  const fraction = match[4] ?? "";
+
+  if (hours > 23 || minutes > 59 || seconds > 59) {
+    throw new TypeError("Invalid time.");
+  }
+
+  const milliseconds = Number((fraction.slice(0, 3) || "0").padEnd(3, "0"));
+  const result = new Date(
+    Date.UTC(1970, 0, 1, hours, minutes, seconds, milliseconds),
+  ) as MssqlTemporalDate;
+
+  const subMillisecond = fraction.slice(3);
+  if (subMillisecond.length > 0) {
+    result.nanosecondDelta = Number(subMillisecond) / 10 ** fraction.length;
+  }
+
+  return result;
+}
+
+function parseMssqlNaiveDatetimeLiteral(value: string): MssqlTemporalDate {
+  const match =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,7}))?$/.exec(
+      value,
+    );
+  if (!match) {
+    throw new TypeError("Invalid datetime.");
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hours = Number(match[4]);
+  const minutes = Number(match[5]);
+  const seconds = Number(match[6]);
+  const fraction = match[7] ?? "";
+
+  if (
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31 ||
+    hours > 23 ||
+    minutes > 59 ||
+    seconds > 59
+  ) {
+    throw new TypeError("Invalid datetime.");
+  }
+
+  const milliseconds = Number((fraction.slice(0, 3) || "0").padEnd(3, "0"));
+  const result = new Date(
+    Date.UTC(0, month - 1, day, hours, minutes, seconds, milliseconds),
+  ) as MssqlTemporalDate;
+  result.setUTCFullYear(year, month - 1, day);
+
+  if (
+    result.getUTCFullYear() !== year ||
+    result.getUTCMonth() !== month - 1 ||
+    result.getUTCDate() !== day ||
+    result.getUTCHours() !== hours ||
+    result.getUTCMinutes() !== minutes ||
+    result.getUTCSeconds() !== seconds
+  ) {
+    throw new TypeError("Invalid datetime.");
+  }
+
+  const subMillisecond = fraction.slice(3);
+  if (subMillisecond.length > 0) {
+    result.nanosecondDelta = Number(subMillisecond) / 10 ** fraction.length;
+  }
+
+  return result;
+}
+
 function isSetFlag(value: boolean | number | null | undefined): boolean {
   return value === true || value === 1;
 }
@@ -211,6 +295,14 @@ function columnTypeName(meta: MssqlArrayColumnMeta | undefined): string {
     return rawType.name;
   }
   return typeof rawType.type === "function" ? rawType.type.name : "";
+}
+
+function mssqlSqlTypeName(sqlType: MssqlSqlType): string {
+  if (typeof sqlType === "function") {
+    return sqlType.name;
+  }
+
+  return typeof sqlType.type === "function" ? sqlType.type.name : "";
 }
 
 function temporalSearchLiteral(value: string): string {
@@ -392,8 +484,21 @@ export class MSSQLDriver extends BaseDBDriver {
     rawValue: unknown,
   ): void {
     const normalizedValue = this.normalizeInputValue(rawValue);
-    const value = normalizedValue === undefined ? null : normalizedValue;
-    const type = this.typeForValue(value);
+    const baseValue = normalizedValue === undefined ? null : normalizedValue;
+    const type = this.typeForValue(baseValue);
+    const typeName = mssqlSqlTypeName(type);
+    let value = baseValue;
+
+    if (typeof baseValue === "string") {
+      if (typeName === "Time") {
+        value = parseMssqlTimeLiteral(baseValue);
+      } else if (typeName === "DateTime2" && !hasExplicitTimezone(baseValue)) {
+        value = parseMssqlNaiveDatetimeLiteral(
+          normalizeDatetimeLiteral(baseValue),
+        );
+      }
+    }
+
     request.input(name, type, value);
   }
 

@@ -80,6 +80,55 @@ function mssqlTypeName(sqlType: unknown): string {
   return "";
 }
 
+function expectMssqlTimeBinding(
+  boundValue: unknown,
+  expectedTime: {
+    hours: number;
+    minutes: number;
+    seconds: number;
+    milliseconds: number;
+    nanosecondDelta?: number;
+  },
+): void {
+  expect(boundValue).toBeInstanceOf(Date);
+
+  const date = boundValue as Date & { nanosecondDelta?: number };
+  expect(date.getUTCFullYear()).toBe(1970);
+  expect(date.getUTCMonth()).toBe(0);
+  expect(date.getUTCDate()).toBe(1);
+  expect(date.getUTCHours()).toBe(expectedTime.hours);
+  expect(date.getUTCMinutes()).toBe(expectedTime.minutes);
+  expect(date.getUTCSeconds()).toBe(expectedTime.seconds);
+  expect(date.getUTCMilliseconds()).toBe(expectedTime.milliseconds);
+  expect(date.nanosecondDelta).toBe(expectedTime.nanosecondDelta);
+}
+
+function expectMssqlDatetimeBinding(
+  boundValue: unknown,
+  expectedValue: {
+    year: number;
+    month: number;
+    day: number;
+    hours: number;
+    minutes: number;
+    seconds: number;
+    milliseconds: number;
+    nanosecondDelta?: number;
+  },
+): void {
+  expect(boundValue).toBeInstanceOf(Date);
+
+  const date = boundValue as Date & { nanosecondDelta?: number };
+  expect(date.getUTCFullYear()).toBe(expectedValue.year);
+  expect(date.getUTCMonth()).toBe(expectedValue.month - 1);
+  expect(date.getUTCDate()).toBe(expectedValue.day);
+  expect(date.getUTCHours()).toBe(expectedValue.hours);
+  expect(date.getUTCMinutes()).toBe(expectedValue.minutes);
+  expect(date.getUTCSeconds()).toBe(expectedValue.seconds);
+  expect(date.getUTCMilliseconds()).toBe(expectedValue.milliseconds);
+  expect(date.nanosecondDelta).toBe(expectedValue.nanosecondDelta);
+}
+
 function enrichTestColumn(
   driver: BaseDBDriver,
   column: ColumnMeta,
@@ -167,6 +216,37 @@ describe("null-only filter support", () => {
       sql: `${quotedColumn} IS NOT NULL`,
       params: [],
     });
+  });
+});
+
+describe("cross-driver type capability parity", () => {
+  it.each([
+    ["Postgres spatial", pg, "point", "spatial", false, false],
+    ["Postgres interval", pg, "interval", "interval", false, false],
+    ["MySQL spatial", my, "geometry", "spatial", false, false],
+    ["MSSQL spatial", ms, "geometry", "spatial", false, false],
+    ["Oracle spatial", ora, "SDO_GEOMETRY", "spatial", false, false],
+    [
+      "Oracle interval",
+      ora,
+      "INTERVAL DAY TO SECOND",
+      "interval",
+      false,
+      false,
+    ],
+  ] as const)("aligns %s metadata", (_name, driver, type, category, filterable, editable) => {
+    const result = enrichTestColumn(driver, {
+      name: "value_col",
+      type,
+      nullable: true,
+      isPrimaryKey: false,
+      isForeignKey: false,
+    });
+
+    expect(result.category).toBe(category);
+    expect(result.filterable).toBe(filterable);
+    expect(result.editable).toBe(editable);
+    expect(result.filterOperators).toEqual(["is_null", "is_not_null"]);
   });
 });
 
@@ -518,7 +598,7 @@ describe("PostgresDriver", () => {
       expect(result.editable).toBe(false);
     });
 
-    it("keeps interval columns editable", () => {
+    it("marks interval columns as read-only", () => {
       const result = enrichTestColumn(pg, {
         name: "duration_col",
         type: "interval",
@@ -526,7 +606,7 @@ describe("PostgresDriver", () => {
         isPrimaryKey: false,
         isForeignKey: false,
       });
-      expect(result.editable).toBe(true);
+      expect(result.editable).toBe(false);
     });
   });
 
@@ -576,7 +656,7 @@ describe("PostgresDriver", () => {
           name: "duration",
           category: "interval",
           filterable: false,
-          editable: true,
+          editable: false,
         }),
         expect.objectContaining({
           name: "location",
@@ -1029,16 +1109,7 @@ describe("MySQLDriver", () => {
   });
 
   describe("buildInsertValueExpr", () => {
-    it("returns ST_GeomFromText(?) for spatial", () => {
-      const c = col({
-        name: "p",
-        type: "point",
-        category: "spatial",
-        nativeType: "point",
-      });
-      expect(my.buildInsertValueExpr(c, 1)).toBe("ST_GeomFromText(?)");
-    });
-    it("returns ? for non-spatial", () => {
+    it("returns ? for inserts", () => {
       const c = col({
         name: "a",
         type: "int",
@@ -1215,16 +1286,16 @@ describe("MySQLDriver", () => {
       expect(r?.params).toEqual([1]);
     });
 
-    it("uses ST_AsText LIKE for spatial", () => {
+    it("does not expose spatial filtering when metadata marks the column non-filterable", () => {
       const c = col({
         name: "p",
         type: "point",
         category: "spatial",
         nativeType: "point",
+        filterable: false,
       });
       const r = my.buildFilterCondition(c, "like", "POINT", 1);
-      expect(r?.sql).toContain("ST_AsText");
-      expect(r?.sql).toContain("LIKE");
+      expect(r).toBeNull();
     });
 
     it("uses HEX LIKE for binary", () => {
@@ -1839,20 +1910,190 @@ describe("MSSQLDriver", () => {
         "2026-04-15",
       );
       expect(input).toHaveBeenNthCalledWith(
-        2,
-        "p2",
-        expect.anything(),
-        "10:30:00.1234",
-      );
-      expect(input).toHaveBeenNthCalledWith(
         3,
         "p3",
         expect.anything(),
         "2026-04-15T10:30:00+02:00",
       );
+
+      const timeBinding = input.mock.calls[1]?.[2];
+      expectMssqlTimeBinding(timeBinding, {
+        hours: 10,
+        minutes: 30,
+        seconds: 0,
+        milliseconds: 123,
+        nanosecondDelta: 0.0004,
+      });
       expect(
         input.mock.calls.map(([, sqlType]) => mssqlTypeName(sqlType)),
       ).toEqual(["Date", "Time", "DateTimeOffset"]);
+      expect((input.mock.calls[1]?.[1] as { scale?: number }).scale).toBe(4);
+    });
+
+    it("binds naive MSSQL datetime strings as UTC dates", async () => {
+      const input = vi.fn();
+      const query = vi.fn().mockResolvedValue({
+        recordset: [],
+        rowsAffected: [0],
+        columns: [[]],
+      });
+      const request = {
+        arrayRowMode: false,
+        input,
+        query,
+      };
+
+      (ms as unknown as { pool: { request: () => typeof request } }).pool = {
+        request: () => request,
+      };
+
+      await (
+        ms as unknown as {
+          _executeBatch: (sql: string, params?: unknown[]) => Promise<unknown>;
+        }
+      )._executeBatch("SELECT ?, ?", [
+        "2026-04-15 12:34:56.1234",
+        "2026-04-15T12:34:56+02:00",
+      ]);
+
+      expect(
+        input.mock.calls.map(([, sqlType]) => mssqlTypeName(sqlType)),
+      ).toEqual(["DateTime2", "DateTimeOffset"]);
+      expect(
+        input.mock.calls.map(
+          ([, sqlType]) => (sqlType as { scale?: number }).scale,
+        ),
+      ).toEqual([4, 7]);
+
+      expectMssqlDatetimeBinding(input.mock.calls[0]?.[2], {
+        year: 2026,
+        month: 4,
+        day: 15,
+        hours: 12,
+        minutes: 34,
+        seconds: 56,
+        milliseconds: 123,
+        nanosecondDelta: 0.0004,
+      });
+      expect(input.mock.calls[1]?.[2]).toBe("2026-04-15T12:34:56+02:00");
+    });
+
+    it("rejects invalid naive MSSQL datetime strings instead of rolling them forward", async () => {
+      const request = {
+        arrayRowMode: false,
+        input: vi.fn(),
+        query: vi.fn(),
+      };
+
+      (ms as unknown as { pool: { request: () => typeof request } }).pool = {
+        request: () => request,
+      };
+
+      await expect(
+        (
+          ms as unknown as {
+            _executeBatch: (
+              sql: string,
+              params?: unknown[],
+            ) => Promise<unknown>;
+          }
+        )._executeBatch("SELECT ?", ["2025-02-29 00:00:00"]),
+      ).rejects.toThrow("Invalid datetime.");
+
+      expect(request.input).not.toHaveBeenCalled();
+      expect(request.query).not.toHaveBeenCalled();
+    });
+
+    it("accepts valid early-year MSSQL datetime2 literals", async () => {
+      const input = vi.fn();
+      const query = vi.fn().mockResolvedValue({
+        recordset: [],
+        rowsAffected: [0],
+        columns: [[]],
+      });
+      const request = {
+        arrayRowMode: false,
+        input,
+        query,
+      };
+
+      (ms as unknown as { pool: { request: () => typeof request } }).pool = {
+        request: () => request,
+      };
+
+      await (
+        ms as unknown as {
+          _executeBatch: (sql: string, params?: unknown[]) => Promise<unknown>;
+        }
+      )._executeBatch("SELECT ?", ["0001-01-01 00:00:00"]);
+
+      expect(mssqlTypeName(input.mock.calls[0]?.[1])).toBe("DateTime2");
+      expectMssqlDatetimeBinding(input.mock.calls[0]?.[2], {
+        year: 1,
+        month: 1,
+        day: 1,
+        hours: 0,
+        minutes: 0,
+        seconds: 0,
+        milliseconds: 0,
+      });
+    });
+
+    it("binds MSSQL time values as UTC dates across supported scales", async () => {
+      const input = vi.fn();
+      const query = vi.fn().mockResolvedValue({
+        recordset: [],
+        rowsAffected: [0],
+        columns: [[]],
+      });
+      const request = {
+        arrayRowMode: false,
+        input,
+        query,
+      };
+
+      (ms as unknown as { pool: { request: () => typeof request } }).pool = {
+        request: () => request,
+      };
+
+      await (
+        ms as unknown as {
+          _executeBatch: (sql: string, params?: unknown[]) => Promise<unknown>;
+        }
+      )._executeBatch("SELECT ?, ?, ?", [
+        "10:30:00",
+        "10:30:00.123",
+        "10:30:00.1234567",
+      ]);
+
+      expect(
+        input.mock.calls.map(([, sqlType]) => mssqlTypeName(sqlType)),
+      ).toEqual(["Time", "Time", "Time"]);
+      expect(
+        input.mock.calls.map(
+          ([, sqlType]) => (sqlType as { scale?: number }).scale,
+        ),
+      ).toEqual([7, 3, 7]);
+
+      expectMssqlTimeBinding(input.mock.calls[0]?.[2], {
+        hours: 10,
+        minutes: 30,
+        seconds: 0,
+        milliseconds: 0,
+      });
+      expectMssqlTimeBinding(input.mock.calls[1]?.[2], {
+        hours: 10,
+        minutes: 30,
+        seconds: 0,
+        milliseconds: 123,
+      });
+      expectMssqlTimeBinding(input.mock.calls[2]?.[2], {
+        hours: 10,
+        minutes: 30,
+        seconds: 0,
+        milliseconds: 123,
+        nanosecondDelta: 0.0004567,
+      });
     });
   });
 
@@ -2620,11 +2861,7 @@ describe("OracleDriver", () => {
       });
 
       expect(result.category).toBe("interval");
-      expect(result.filterOperators).toEqual([
-        "like",
-        "is_null",
-        "is_not_null",
-      ]);
+      expect(result.filterOperators).toEqual(["is_null", "is_not_null"]);
     });
 
     it("keeps RAW columns editable", () => {
@@ -2997,19 +3234,17 @@ describe("OracleDriver", () => {
       expect(r?.params).toEqual(["%2024-06-15 08:30:00%"]);
     });
 
-    it("filters Oracle intervals as case-insensitive text", () => {
+    it("does not expose Oracle interval text filtering", () => {
       const c = col({
         name: "duration",
         type: "INTERVAL DAY TO SECOND",
         category: "interval",
         nativeType: "INTERVAL DAY TO SECOND",
+        filterable: false,
       });
       const r = ora.buildFilterCondition(c, "like", "04:05:06", 1);
 
-      expect(r).toEqual({
-        sql: 'UPPER("duration") LIKE UPPER(:1)',
-        params: ["%04:05:06%"],
-      });
+      expect(r).toBeNull();
     });
   });
 });
@@ -3108,6 +3343,20 @@ describe("SQLiteDriver", () => {
   });
 
   describe("formatOutputValue", () => {
+    it("normalizes SQLite booleans to true/false", () => {
+      const c = col({
+        name: "is_active",
+        type: "BOOLEAN",
+        category: "boolean",
+        isBoolean: true,
+      });
+
+      expect(lite.formatOutputValue(1, c)).toBe(true);
+      expect(lite.formatOutputValue(0, c)).toBe(false);
+      expect(lite.formatOutputValue("1", c)).toBe(true);
+      expect(lite.formatOutputValue("0", c)).toBe(false);
+    });
+
     it("converts bigint to string", () => {
       const c = col({ name: "n", type: "INTEGER", category: "integer" });
       expect(lite.formatOutputValue(BigInt(99), c)).toBe("99");

@@ -685,6 +685,7 @@ export class PostgresDriver extends BaseDBDriver {
   ): boolean {
     if (PG_GEOMETRIC_TYPES.has(nativeType.toLowerCase().split("(")[0].trim()))
       return false;
+    if (category === "interval") return false;
     return super.isEditable(nativeType, category);
   }
 

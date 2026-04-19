@@ -843,6 +843,15 @@ export class SQLiteDriver extends BaseDBDriver {
     return super.coerceInputValue(value, column);
   }
 
+  override formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (column.isBoolean) {
+      if (value === 1 || value === "1") return true;
+      if (value === 0 || value === "0") return false;
+    }
+
+    return super.formatOutputValue(value, column);
+  }
+
   override normalizeFilterValue(
     column: ColumnTypeMeta,
     operator: FilterOperator,

@@ -12,7 +12,14 @@ const testConfig = {
   sourcesContent: true,
   minify: false,
   logLevel: "info",
-  external: ["pg", "mysql2", "mssql", "oracledb", "vscode"],
+  external: [
+    "pg",
+    "mysql2",
+    "mssql",
+    "oracledb",
+    "node-sqlite3-wasm",
+    "vscode",
+  ],
 };
 
 esbuild.build(testConfig).catch((err) => {

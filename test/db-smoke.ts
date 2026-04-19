@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { rmSync } from "node:fs";
 import type {
   ConnectionConfig,
   ConnectionManager,
@@ -7,11 +8,11 @@ import { MSSQLDriver } from "../src/extension/dbDrivers/mssql";
 import { MySQLDriver } from "../src/extension/dbDrivers/mysql";
 import { OracleDriver } from "../src/extension/dbDrivers/oracle";
 import { PostgresDriver } from "../src/extension/dbDrivers/postgres";
-import {
-  type ColumnTypeMeta,
-  type FilterExpression,
-  type IDBDriver,
-  NULL_SENTINEL,
+import { SQLiteDriver } from "../src/extension/dbDrivers/sqlite";
+import type {
+  ColumnTypeMeta,
+  FilterExpression,
+  IDBDriver,
 } from "../src/extension/dbDrivers/types";
 import {
   formatDatetimeForDisplay,
@@ -53,7 +54,8 @@ function isDbKind(value: string): value is DbKind {
     value === "pg" ||
     value === "mysql" ||
     value === "mssql" ||
-    value === "oracle"
+    value === "oracle" ||
+    value === "sqlite"
   );
 }
 
@@ -100,6 +102,8 @@ function createDriver(
       return new MSSQLDriver({ ...config, id: "__smoke__" });
     case "oracle":
       return new OracleDriver({ ...config, id: "__smoke__" });
+    case "sqlite":
+      return new SQLiteDriver({ ...config, id: "__smoke__" });
   }
 }
 
@@ -120,6 +124,8 @@ function objectRef(fixture: DbFixture, name: string): string {
       return `[${fixture.schema}].[${name}]`;
     case "oracle":
       return name.toUpperCase();
+    case "sqlite":
+      return `"${name}"`;
   }
 }
 
@@ -246,6 +252,9 @@ function assertRowMatchesColumns(
   label: string,
 ): void {
   for (const column of columns) {
+    if (column.readbackOnly) {
+      continue;
+    }
     const expectedValue = values[column.name];
     const context = `${label}.${column.name}`;
     assertCellValue(
@@ -253,6 +262,21 @@ function assertRowMatchesColumns(
       expectedValue,
       column.comparison ?? "exact",
       context,
+    );
+  }
+}
+
+function assertReadbackChecks(
+  row: Record<string, unknown>,
+  fixture: DbFixture,
+  label: string,
+): void {
+  for (const check of fixture.readbackChecks) {
+    assertCellValue(
+      row[check.column],
+      check.expected,
+      check.comparison,
+      `${label}.${check.column}`,
     );
   }
 }
@@ -297,6 +321,13 @@ function assertColumnMetadata(
         `${fixture.displayName}: unexpected filterable for ${expectation.column}`,
       );
     }
+    if (expectation.editable !== undefined) {
+      assert.equal(
+        column.editable,
+        expectation.editable,
+        `${fixture.displayName}: unexpected editable for ${expectation.column}`,
+      );
+    }
     if (expectation.isAutoIncrement !== undefined) {
       assert.equal(
         column.isAutoIncrement ?? false,
@@ -320,6 +351,198 @@ function execSql(driver: IDBDriver, sql: string): Promise<unknown> {
     return Promise.resolve();
   }
   return driver.query(sql);
+}
+
+function supportsFunctions(fixture: DbFixture): boolean {
+  return fixture.supportsFunctions !== false;
+}
+
+function supportsProcedures(fixture: DbFixture): boolean {
+  return fixture.supportsProcedures !== false;
+}
+
+async function runSqliteExtendedFlow(
+  fixture: DbFixture,
+  connectionId: string,
+  service: TableDataService,
+  driver: IDBDriver,
+): Promise<void> {
+  if (fixture.kind !== "sqlite") {
+    return;
+  }
+
+  const docsTable = `${fixture.table}_docs`;
+  console.log(`[${fixture.displayName}] running SQLite composite-key scenario`);
+
+  try {
+    await execSql(
+      driver,
+      `DROP TABLE IF EXISTS "${docsTable}";
+       CREATE TABLE "${docsTable}" (
+         tenant_id INTEGER NOT NULL,
+         user_id INTEGER NOT NULL,
+         external_id UUID NOT NULL,
+         payload JSON NOT NULL,
+         PRIMARY KEY (tenant_id, user_id)
+       );
+       INSERT INTO "${docsTable}" (user_id, tenant_id, external_id, payload)
+       VALUES
+         (2, 1, 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', '{"name":"second"}'),
+         (1, 2, 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', '{"name":"third"}'),
+         (1, 1, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', '{"name":"first"}');`,
+    );
+
+    const docsColumns = await service.getColumns(
+      connectionId,
+      fixture.database,
+      fixture.schema,
+      docsTable,
+    );
+
+    assert.deepEqual(
+      docsColumns.map((column) => column.name),
+      ["tenant_id", "user_id", "external_id", "payload"],
+      `${fixture.displayName}: docs column order mismatch`,
+    );
+    const payloadColumn = docsColumns.find(
+      (column) => column.name === "payload",
+    );
+    const externalIdColumn = docsColumns.find(
+      (column) => column.name === "external_id",
+    );
+    const tenantIdColumn = docsColumns.find(
+      (column) => column.name === "tenant_id",
+    );
+    const userIdColumn = docsColumns.find(
+      (column) => column.name === "user_id",
+    );
+
+    assert.ok(
+      payloadColumn,
+      `${fixture.displayName}: docs payload metadata missing`,
+    );
+    assert.ok(
+      externalIdColumn,
+      `${fixture.displayName}: docs external_id metadata missing`,
+    );
+    assert.ok(
+      tenantIdColumn,
+      `${fixture.displayName}: docs tenant_id metadata missing`,
+    );
+    assert.ok(
+      userIdColumn,
+      `${fixture.displayName}: docs user_id metadata missing`,
+    );
+
+    assert.equal(payloadColumn?.category, "json");
+    assert.deepEqual(payloadColumn?.filterOperators, [
+      "like",
+      "in",
+      "is_null",
+      "is_not_null",
+    ]);
+    assert.equal(externalIdColumn?.category, "uuid");
+    assert.deepEqual(externalIdColumn?.filterOperators, [
+      "like",
+      "in",
+      "is_null",
+      "is_not_null",
+    ]);
+    assert.equal(tenantIdColumn?.isPrimaryKey, true);
+    assert.equal(tenantIdColumn?.primaryKeyOrdinal, 1);
+    assert.equal(userIdColumn?.isPrimaryKey, true);
+    assert.equal(userIdColumn?.primaryKeyOrdinal, 2);
+
+    await service.insertRow(
+      connectionId,
+      fixture.database,
+      fixture.schema,
+      docsTable,
+      {
+        user_id: 2,
+        tenant_id: 2,
+        external_id: "550e8400-e29b-41d4-a716-446655440000",
+        payload: '{"name":"inserted"}',
+      },
+    );
+
+    await service.updateRow(
+      connectionId,
+      fixture.database,
+      fixture.schema,
+      docsTable,
+      { tenant_id: 2, user_id: 2 },
+      { payload: '{"name":"updated"}' },
+    );
+
+    const orderedPage = await service.getPage(
+      connectionId,
+      fixture.database,
+      fixture.schema,
+      docsTable,
+      1,
+      50,
+      [],
+      null,
+    );
+    assert.deepEqual(
+      orderedPage.rows.map(
+        (row) => `${String(row.tenant_id)}:${String(row.user_id)}`,
+      ),
+      ["1:1", "1:2", "2:1", "2:2"],
+      `${fixture.displayName}: composite PK default ordering mismatch`,
+    );
+
+    const filteredPage = await service.getPage(
+      connectionId,
+      fixture.database,
+      fixture.schema,
+      docsTable,
+      1,
+      50,
+      [{ column: "external_id", operator: "like", value: "550e8400" }],
+      null,
+    );
+    assert.deepEqual(filteredPage.rows, [
+      {
+        tenant_id: 2,
+        user_id: 2,
+        external_id: "550e8400-e29b-41d4-a716-446655440000",
+        payload: '{"name":"updated"}',
+      },
+    ]);
+
+    await service.deleteRows(
+      connectionId,
+      fixture.database,
+      fixture.schema,
+      docsTable,
+      [
+        { tenant_id: 1, user_id: 2 },
+        { tenant_id: 2, user_id: 2 },
+      ],
+    );
+
+    const afterDelete = await service.getPage(
+      connectionId,
+      fixture.database,
+      fixture.schema,
+      docsTable,
+      1,
+      50,
+      [],
+      null,
+    );
+    assert.deepEqual(
+      afterDelete.rows.map(
+        (row) => `${String(row.tenant_id)}:${String(row.user_id)}`,
+      ),
+      ["1:1", "2:1"],
+      `${fixture.displayName}: composite PK deleteRows should use a transaction and keep the expected rows`,
+    );
+  } finally {
+    await execSql(driver, `DROP TABLE IF EXISTS "${docsTable}";`);
+  }
 }
 
 function isMeaningfulSql(sql: string): boolean {
@@ -384,8 +607,16 @@ async function runFixture(fixture: DbFixture, runId: string): Promise<void> {
     console.log(`[${fixture.displayName}] creating table/view/routines`);
     await execSql(mainDriver, fixture.createTableSql);
     await execSql(mainDriver, fixture.createViewSql);
-    await execSql(mainDriver, fixture.createFunctionSql);
-    if (isMeaningfulSql(fixture.createProcedureSql)) {
+    if (
+      supportsFunctions(fixture) &&
+      isMeaningfulSql(fixture.createFunctionSql)
+    ) {
+      await execSql(mainDriver, fixture.createFunctionSql);
+    }
+    if (
+      supportsProcedures(fixture) &&
+      isMeaningfulSql(fixture.createProcedureSql)
+    ) {
       await execSql(mainDriver, fixture.createProcedureSql);
     }
 
@@ -432,6 +663,11 @@ async function runFixture(fixture: DbFixture, runId: string): Promise<void> {
       fixture.seedValues,
       `${fixture.displayName} seed row`,
     );
+    assertReadbackChecks(
+      page.rows[0] as Record<string, unknown>,
+      fixture,
+      `${fixture.displayName} seed readback`,
+    );
 
     const pkName = idColumnName(fixture);
     const pkValue = (page.rows[0] as Record<string, unknown>)[pkName];
@@ -445,40 +681,44 @@ async function runFixture(fixture: DbFixture, runId: string): Promise<void> {
       `${fixture.displayName}: view should return at least one row`,
     );
 
-    const functionResult = await mainDriver.query(fixture.functionCallSql);
-    assert.equal(
-      normalizeValue(
-        (functionResult.rows[0] as Record<string, unknown> | undefined)
-          ?.__col_0,
-      ),
-      fixture.functionExpected,
-      `${fixture.displayName}: function result mismatch`,
-    );
+    if (supportsFunctions(fixture)) {
+      const functionResult = await mainDriver.query(fixture.functionCallSql);
+      assert.equal(
+        normalizeValue(
+          (functionResult.rows[0] as Record<string, unknown> | undefined)
+            ?.__col_0,
+        ),
+        fixture.functionExpected,
+        `${fixture.displayName}: function result mismatch`,
+      );
 
-    const routineName = fixture.functionName;
-    const routineDef = await mainDriver.getRoutineDefinition(
-      fixture.database,
-      fixture.schema,
-      routineName,
-      "function",
-    );
-    assert.match(
-      routineDef.toLowerCase(),
-      new RegExp(routineName.toLowerCase()),
-      `${fixture.displayName}: function definition should include the function name`,
-    );
+      const routineName = fixture.functionName;
+      const routineDef = await mainDriver.getRoutineDefinition(
+        fixture.database,
+        fixture.schema,
+        routineName,
+        "function",
+      );
+      assert.match(
+        routineDef.toLowerCase(),
+        new RegExp(routineName.toLowerCase()),
+        `${fixture.displayName}: function definition should include the function name`,
+      );
+    }
 
-    const procedureDef = await mainDriver.getRoutineDefinition(
-      fixture.database,
-      fixture.schema,
-      fixture.procedureName,
-      "procedure",
-    );
-    assert.match(
-      procedureDef.toLowerCase(),
-      new RegExp(fixture.procedureName.toLowerCase()),
-      `${fixture.displayName}: procedure definition should include the procedure name`,
-    );
+    if (supportsProcedures(fixture)) {
+      const procedureDef = await mainDriver.getRoutineDefinition(
+        fixture.database,
+        fixture.schema,
+        fixture.procedureName,
+        "procedure",
+      );
+      assert.match(
+        procedureDef.toLowerCase(),
+        new RegExp(fixture.procedureName.toLowerCase()),
+        `${fixture.displayName}: procedure definition should include the procedure name`,
+      );
+    }
 
     const ddl = await mainDriver.getCreateTableDDL(
       fixture.database,
@@ -505,16 +745,6 @@ async function runFixture(fixture: DbFixture, runId: string): Promise<void> {
         object.name.toLowerCase() === fixture.view.toLowerCase() &&
         object.type === "view",
     );
-    const hasFunction = objects.some(
-      (object) =>
-        object.name.toLowerCase() === fixture.functionName.toLowerCase() &&
-        object.type === "function",
-    );
-    const hasProcedure = objects.some(
-      (object) =>
-        object.name.toLowerCase() === fixture.procedureName.toLowerCase() &&
-        object.type === "procedure",
-    );
     assert.ok(
       hasTable,
       `${fixture.displayName}: listObjects should include the table`,
@@ -523,14 +753,28 @@ async function runFixture(fixture: DbFixture, runId: string): Promise<void> {
       hasView,
       `${fixture.displayName}: listObjects should include the view`,
     );
-    assert.ok(
-      hasFunction,
-      `${fixture.displayName}: listObjects should include the function`,
-    );
-    assert.ok(
-      hasProcedure,
-      `${fixture.displayName}: listObjects should include the procedure`,
-    );
+    if (supportsFunctions(fixture)) {
+      const hasFunction = objects.some(
+        (object) =>
+          object.name.toLowerCase() === fixture.functionName.toLowerCase() &&
+          object.type === "function",
+      );
+      assert.ok(
+        hasFunction,
+        `${fixture.displayName}: listObjects should include the function`,
+      );
+    }
+    if (supportsProcedures(fixture)) {
+      const hasProcedure = objects.some(
+        (object) =>
+          object.name.toLowerCase() === fixture.procedureName.toLowerCase() &&
+          object.type === "procedure",
+      );
+      assert.ok(
+        hasProcedure,
+        `${fixture.displayName}: listObjects should include the procedure`,
+      );
+    }
 
     console.log(
       `[${fixture.displayName}] updating rows through TableDataService`,
@@ -610,6 +854,11 @@ async function runFixture(fixture: DbFixture, runId: string): Promise<void> {
       fixture.columns,
       fixture.seedValues,
       `${fixture.displayName} restored seed row`,
+    );
+    assertReadbackChecks(
+      page.rows[0] as Record<string, unknown>,
+      fixture,
+      `${fixture.displayName} restored readback`,
     );
 
     console.log(
@@ -715,7 +964,17 @@ async function runFixture(fixture: DbFixture, runId: string): Promise<void> {
     );
 
     console.log(`[${fixture.displayName}] calling procedure`);
-    await execSql(mainDriver, fixture.procedureCallSql);
+    if (supportsProcedures(fixture)) {
+      await execSql(mainDriver, fixture.procedureCallSql);
+    } else if (fixture.nullFilterRowValues) {
+      await service.insertRow(
+        connectionId,
+        fixture.database,
+        fixture.schema,
+        fixture.table,
+        fixture.nullFilterRowValues,
+      );
+    }
 
     const procedureFilter = await service.getPage(
       connectionId,
@@ -809,12 +1068,14 @@ async function runFixture(fixture: DbFixture, runId: string): Promise<void> {
       if (column) {
         assertCellValue(
           row[column.name],
-          fixture.seedValues[column.name],
+          column.seedValue,
           column.comparison ?? "exact",
           `${fixture.displayName} filter ${column.name}`,
         );
       }
     }
+
+    await runSqliteExtendedFlow(fixture, connectionId, service, mainDriver);
 
     const allRows = await service.getPage(
       connectionId,
@@ -873,6 +1134,9 @@ async function runFixture(fixture: DbFixture, runId: string): Promise<void> {
     try {
       await mainDriver.disconnect();
     } catch {}
+    if (fixture.kind === "sqlite" && fixture.connection.filePath) {
+      rmSync(fixture.connection.filePath, { force: true });
+    }
   }
 }
 

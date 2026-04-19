@@ -1,4 +1,11 @@
-import type { Pool } from "mysql2/promise";
+import type {
+  FieldPacket,
+  Pool,
+  PoolConnection,
+  QueryOptions,
+  ResultSetHeader,
+  RowDataPacket,
+} from "mysql2/promise";
 import * as mysql from "mysql2/promise";
 import type { ConnectionConfig } from "../connectionManager";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
@@ -184,58 +191,6 @@ const MYSQL_SPATIAL_TYPES = new Set([
 
 function isMysqlSpatialType(colType: string): boolean {
   return MYSQL_SPATIAL_TYPES.has(colType.toLowerCase().split("(")[0].trim());
-}
-
-function parseMysqlSpatialToWkt(val: string): string {
-  const trimmed = val.trim();
-  if (
-    /^(POINT|LINESTRING|POLYGON|MULTI\w+|GEOMETRYCOLLECTION|GEOMETRY)\s*\(/i.test(
-      trimmed,
-    )
-  ) {
-    return trimmed;
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch {
-    throw new Error(
-      "Cannot parse spatial value. Use WKT, e.g. POINT(1 2) or POLYGON((0 0, 1 0, 1 1, 0 0)).",
-    );
-  }
-  try {
-    return mysqlSpatialJsonToWkt(parsed);
-  } catch (e: any) {
-    throw new Error(
-      `Cannot convert spatial value to WKT: ${e?.message ?? String(e)}. Use WKT, e.g. POINT(1 2).`,
-    );
-  }
-}
-
-function mysqlSpatialJsonToWkt(obj: unknown): string {
-  if (obj === null || typeof obj !== "object")
-    throw new Error("Invalid spatial JSON");
-  if (!Array.isArray(obj)) {
-    const o = obj as Record<string, unknown>;
-    if (typeof o.x === "number" && typeof o.y === "number")
-      return `POINT(${o.x} ${o.y})`;
-    throw new Error("Unknown spatial object format");
-  }
-  const arr = obj as unknown[];
-  if (arr.length === 0) throw new Error("Empty spatial array");
-  const first = arr[0];
-  if (
-    first !== null &&
-    typeof first === "object" &&
-    !Array.isArray(first) &&
-    typeof (first as any).x === "number"
-  ) {
-    return `LINESTRING(${(arr as Array<{ x: number; y: number }>).map((p) => `${p.x} ${p.y}`).join(", ")})`;
-  }
-  if (Array.isArray(first)) {
-    return `POLYGON(${(arr as Array<Array<{ x: number; y: number }>>).map((ring) => `(${ring.map((p) => `${p.x} ${p.y}`).join(", ")})`).join(", ")})`;
-  }
-  throw new Error("Unrecognised spatial JSON structure");
 }
 
 function mysqlTypeName(nativeType: string): string {
@@ -495,6 +450,20 @@ function decodeMysqlBitBuffer(
   return declaredBits > 48 ? result : Number(result);
 }
 
+type MysqlObjectRow = RowDataPacket & Record<string, unknown>;
+type MysqlArrayRow = unknown[];
+type MysqlSelectRows = MysqlArrayRow[];
+type MysqlQueryRows = MysqlSelectRows | ResultSetHeader;
+
+function isMysqlSelectRows(
+  rawRows: MysqlQueryRows,
+): rawRows is MysqlSelectRows {
+  return (
+    Array.isArray(rawRows) &&
+    (rawRows.length === 0 || Array.isArray(rawRows[0]))
+  );
+}
+
 export class MySQLDriver extends BaseDBDriver {
   private pool: Pool | null = null;
   private readonly config: ConnectionConfig;
@@ -545,10 +514,36 @@ export class MySQLDriver extends BaseDBDriver {
     return this.pool !== null;
   }
 
+  private requirePool(): Pool {
+    if (!this.pool) {
+      throw new Error("[RapiDB] MySQL connection is not established.");
+    }
+    return this.pool;
+  }
+
+  private async queryObjectRows<TRow extends RowDataPacket = RowDataPacket>(
+    sql: string,
+    params?: QueryOptions["values"],
+  ): Promise<TRow[]> {
+    const [rows] = await this.requirePool().query<TRow[]>(sql, params);
+    return rows;
+  }
+
+  private async queryArrayRows(
+    queryable: Pool | PoolConnection,
+    options: QueryOptions,
+  ): Promise<[MysqlQueryRows, FieldPacket[]]> {
+    const [rows, fields] = await queryable.query({
+      ...options,
+      rowsAsArray: true,
+    });
+    return [rows as MysqlQueryRows, fields as FieldPacket[]];
+  }
+
   async listDatabases(): Promise<DatabaseInfo[]> {
-    const [rows] = await this.pool!.query<any[]>("SHOW DATABASES");
+    const rows = await this.queryObjectRows<MysqlObjectRow>("SHOW DATABASES");
     return rows.map((r) => ({
-      name: Object.values(r)[0] as string,
+      name: String(Object.values(r)[0] ?? ""),
       schemas: [],
     }));
   }
@@ -558,7 +553,9 @@ export class MySQLDriver extends BaseDBDriver {
   }
 
   async listObjects(database: string, _schema: string): Promise<TableInfo[]> {
-    const [tableRows] = await this.pool!.query<any[]>(
+    const tableRows = await this.queryObjectRows<
+      RowDataPacket & { name: string; type: string }
+    >(
       `SELECT TABLE_NAME AS name, TABLE_TYPE AS type
        FROM information_schema.TABLES
        WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME`,
@@ -570,7 +567,9 @@ export class MySQLDriver extends BaseDBDriver {
       type: (r.type === "VIEW" ? "view" : "table") as TableInfo["type"],
     }));
     try {
-      const [fnRows] = await this.pool!.query<any[]>(
+      const fnRows = await this.queryObjectRows<
+        RowDataPacket & { name: string; type: string }
+      >(
         `SELECT ROUTINE_NAME AS name, ROUTINE_TYPE AS type
          FROM information_schema.ROUTINES
          WHERE ROUTINE_SCHEMA = ? ORDER BY ROUTINE_NAME`,
@@ -594,7 +593,18 @@ export class MySQLDriver extends BaseDBDriver {
     _schema: string,
     table: string,
   ): Promise<ColumnMeta[]> {
-    const [rows] = await this.pool!.query<any[]>(
+    const rows = await this.queryObjectRows<
+      RowDataPacket & {
+        COLUMN_NAME: string;
+        COLUMN_TYPE: string;
+        IS_NULLABLE: string;
+        COLUMN_DEFAULT: unknown;
+        EXTRA: string | null;
+        IS_PRIMARY_KEY: number | string;
+        PRIMARY_KEY_ORDINAL: number | string | null;
+        IS_FOREIGN_KEY: number | string;
+      }
+    >(
       `SELECT c.COLUMN_NAME,
               c.COLUMN_TYPE,
               c.IS_NULLABLE,
@@ -637,7 +647,8 @@ export class MySQLDriver extends BaseDBDriver {
       name: r.COLUMN_NAME as string,
       type: r.COLUMN_TYPE as string,
       nullable: r.IS_NULLABLE === "YES",
-      defaultValue: r.COLUMN_DEFAULT ?? undefined,
+      defaultValue:
+        r.COLUMN_DEFAULT == null ? undefined : String(r.COLUMN_DEFAULT),
       isPrimaryKey: Number(r.IS_PRIMARY_KEY) === 1,
       primaryKeyOrdinal:
         r.PRIMARY_KEY_ORDINAL == null
@@ -653,16 +664,11 @@ export class MySQLDriver extends BaseDBDriver {
     const start = Date.now();
 
     if (params && params.length > 0) {
-      const [rawRows, fields] = await this.pool!.query<any[]>({
+      const [rawRows, fields] = await this.queryArrayRows(this.requirePool(), {
         sql,
-        values: params,
-        rowsAsArray: true,
-      } as any);
-      return this._parseQueryResult(
-        rawRows,
-        fields as any[],
-        Date.now() - start,
-      );
+        values: params as QueryOptions["values"],
+      });
+      return this._parseQueryResult(rawRows, fields, Date.now() - start);
     }
 
     const stmts = splitMySQLScript(sql);
@@ -671,64 +677,56 @@ export class MySQLDriver extends BaseDBDriver {
     }
 
     if (stmts.length === 1) {
-      const [rawRows, fields] = await this.pool!.query<any[]>({
+      const [rawRows, fields] = await this.queryArrayRows(this.requirePool(), {
         sql: stmts[0],
-        rowsAsArray: true,
-      } as any);
-      return this._parseQueryResult(
-        rawRows,
-        fields as any[],
-        Date.now() - start,
-      );
+      });
+      return this._parseQueryResult(rawRows, fields, Date.now() - start);
     }
 
     return this._executeScript(stmts, start);
   }
 
   private _parseQueryResult(
-    rawRows: any,
-    fields: any[],
+    rawRows: MysqlQueryRows,
+    fields: FieldPacket[],
     executionTimeMs: number,
   ): QueryResult {
-    const fieldList = Array.isArray(fields) ? fields : [];
-    const isSelect =
-      Array.isArray(rawRows) &&
-      (rawRows.length === 0 || Array.isArray((rawRows as any)[0]));
-
-    if (isSelect) {
-      const columns = fieldList.map((f: any) => f.name as string);
+    if (isMysqlSelectRows(rawRows)) {
+      const columns = fields.map((field) => field.name);
 
       const boolCols = new Set<number>();
       const floatCols = new Set<number>();
       const bitIntCols = new Map<number, number>();
-      fieldList.forEach((f: any, i: number) => {
+      fields.forEach((field, i) => {
+        const fieldType = field.type ?? field.columnType;
+        const fieldLength = field.length ?? field.columnLength ?? 0;
         if (
-          (f.type === 1 && f.length === 1) ||
-          (f.type === 16 && f.length === 1)
+          (fieldType === 1 && fieldLength === 1) ||
+          (fieldType === 16 && fieldLength === 1)
         ) {
           boolCols.add(i);
-        } else if (f.type === 16 && f.length > 1) {
-          bitIntCols.set(i, f.length as number);
+        } else if (fieldType === 16 && fieldLength > 1) {
+          bitIntCols.set(i, fieldLength);
         }
-        if (f.type === 4) {
+        if (fieldType === 4) {
           floatCols.add(i);
         }
       });
 
-      const rows = (rawRows as unknown[][]).map((row) =>
+      const rows = rawRows.map((row) =>
         Object.fromEntries(
           row.map((val, i) => {
             let v = val;
             if (boolCols.has(i) && v !== null && v !== undefined) {
               if (Buffer.isBuffer(v)) {
-                v = (v as Buffer)[0] === 1;
+                v = v[0] === 1;
               } else {
                 v = v === 1 || v === "1";
               }
             }
             if (bitIntCols.has(i) && v !== null && v !== undefined) {
               if (Buffer.isBuffer(v)) {
-                v = decodeMysqlBitBuffer(v as Buffer, bitIntCols.get(i) ?? 0);
+                v = decodeMysqlBitBuffer(v, bitIntCols.get(i) ?? 0);
               }
             }
             if (
@@ -736,7 +734,7 @@ export class MySQLDriver extends BaseDBDriver {
               typeof v === "number" &&
               !Number.isInteger(v)
             ) {
-              v = parseFloat((v as number).toPrecision(7));
+              v = parseFloat(v.toPrecision(7));
             }
             return [`__col_${i}`, v];
           }),
@@ -745,7 +743,7 @@ export class MySQLDriver extends BaseDBDriver {
       return { columns, rows, rowCount: rows.length, executionTimeMs };
     }
 
-    const affectedRows = (rawRows as any)?.affectedRows as number | undefined;
+    const affectedRows = rawRows.affectedRows;
     return {
       columns: [],
       rows: [],
@@ -759,7 +757,7 @@ export class MySQLDriver extends BaseDBDriver {
     stmts: string[],
     start: number,
   ): Promise<QueryResult> {
-    const conn = await this.pool!.getConnection();
+    const conn = await this.requirePool().getConnection();
 
     let lastResult: QueryResult = {
       columns: [],
@@ -770,11 +768,10 @@ export class MySQLDriver extends BaseDBDriver {
     let totalAffected = 0;
     try {
       for (const stmt of stmts) {
-        const [rawRows, fields] = await conn.query({
+        const [rawRows, fields] = await this.queryArrayRows(conn, {
           sql: stmt,
-          rowsAsArray: true,
-        } as any);
-        const r = this._parseQueryResult(rawRows, fields as any[], 0);
+        });
+        const r = this._parseQueryResult(rawRows, fields, 0);
         totalAffected += r.affectedRows ?? r.rowCount ?? 0;
         if (r.columns.length > 0) {
           lastResult = r;
@@ -798,7 +795,13 @@ export class MySQLDriver extends BaseDBDriver {
     _schema: string,
     table: string,
   ): Promise<import("./types").IndexMeta[]> {
-    const [rows] = await this.pool!.query<any[]>(
+    const rows = await this.queryObjectRows<
+      RowDataPacket & {
+        INDEX_NAME: string;
+        COLUMN_NAME: string;
+        NON_UNIQUE: number;
+      }
+    >(
       `SELECT INDEX_NAME, COLUMN_NAME, NON_UNIQUE
        FROM information_schema.STATISTICS
        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
@@ -816,7 +819,10 @@ export class MySQLDriver extends BaseDBDriver {
           primary: name === "PRIMARY",
         });
       }
-      map.get(name)!.columns.push(r.COLUMN_NAME as string);
+      const index = map.get(name);
+      if (index) {
+        index.columns.push(r.COLUMN_NAME);
+      }
     }
     return [...map.values()];
   }
@@ -826,7 +832,15 @@ export class MySQLDriver extends BaseDBDriver {
     _schema: string,
     table: string,
   ): Promise<import("./types").ForeignKeyMeta[]> {
-    const [rows] = await this.pool!.query<any[]>(
+    const rows = await this.queryObjectRows<
+      RowDataPacket & {
+        CONSTRAINT_NAME: string;
+        COLUMN_NAME: string;
+        REFERENCED_TABLE_SCHEMA: string;
+        REFERENCED_TABLE_NAME: string;
+        REFERENCED_COLUMN_NAME: string;
+      }
+    >(
       `SELECT kcu.CONSTRAINT_NAME, kcu.COLUMN_NAME,
               kcu.REFERENCED_TABLE_SCHEMA, kcu.REFERENCED_TABLE_NAME, kcu.REFERENCED_COLUMN_NAME
        FROM information_schema.KEY_COLUMN_USAGE kcu
@@ -852,12 +866,16 @@ export class MySQLDriver extends BaseDBDriver {
     _schema: string,
     table: string,
   ): Promise<string> {
-    const [rows] = await this.pool!.query<any[]>(
+    const rows = await this.queryObjectRows<
+      RowDataPacket & {
+        "Create Table"?: string;
+        "Create View"?: string;
+      }
+    >(
       `SHOW CREATE TABLE \`${database.replace(/`/g, "``")}\`.\`${table.replace(/`/g, "``")}\``,
     );
-    return (
-      (rows[0] as any)["Create Table"] ?? (rows[0] as any)["Create View"] ?? ""
-    );
+    const firstRow = rows[0];
+    return firstRow?.["Create Table"] ?? firstRow?.["Create View"] ?? "";
   }
 
   async getRoutineDefinition(
@@ -869,26 +887,27 @@ export class MySQLDriver extends BaseDBDriver {
     const type = kind === "function" ? "FUNCTION" : "PROCEDURE";
     const db = database.replace(/`/g, "``");
     const nm = name.replace(/`/g, "``");
-    const [rows] = await this.pool!.query<any[]>(
-      `SHOW CREATE ${type} \`${db}\`.\`${nm}\``,
-    );
-    const row = rows[0] as Record<string, unknown>;
+    const rows = await this.queryObjectRows<
+      RowDataPacket & {
+        "Create Function"?: string;
+        "Create Procedure"?: string;
+      }
+    >(`SHOW CREATE ${type} \`${db}\`.\`${nm}\``);
+    const row = rows[0];
     const key = type === "FUNCTION" ? "Create Function" : "Create Procedure";
-    return (row[key] as string) ?? `-- Definition not available for ${name}`;
+    return row?.[key] ?? `-- Definition not available for ${name}`;
   }
 
   async runTransaction(
     operations: import("./types").TransactionOperation[],
   ): Promise<void> {
-    const conn = await this.pool!.getConnection();
+    const conn = await this.requirePool().getConnection();
     await conn.beginTransaction();
     try {
       for (const op of operations) {
-        const [rows] = await conn.query<any>(op.sql, op.params);
+        const [rows] = await conn.query<ResultSetHeader>(op.sql, op.params);
         if (op.checkAffectedRows) {
-          const affectedRows = !Array.isArray(rows)
-            ? (rows as any).affectedRows
-            : 0;
+          const affectedRows = rows.affectedRows;
           if (affectedRows === 0) {
             throw new Error(
               "Row not found — the row may have been modified or deleted by another user",
@@ -983,6 +1002,22 @@ export class MySQLDriver extends BaseDBDriver {
     return base === "datetime" || base === "timestamp";
   }
 
+  protected override isFilterable(
+    nativeType: string,
+    category: TypeCategory,
+  ): boolean {
+    if (category === "spatial" || isMysqlSpatialType(nativeType)) return false;
+    return super.isFilterable(nativeType, category);
+  }
+
+  protected override isEditable(
+    nativeType: string,
+    category: TypeCategory,
+  ): boolean {
+    if (category === "spatial" || isMysqlSpatialType(nativeType)) return false;
+    return super.isEditable(nativeType, category);
+  }
+
   // ─── MySQL SQL helpers ───
 
   override quoteIdentifier(name: string): string {
@@ -997,21 +1032,6 @@ export class MySQLDriver extends BaseDBDriver {
     return database
       ? `${this.quoteIdentifier(database)}.${this.quoteIdentifier(table)}`
       : this.quoteIdentifier(table);
-  }
-
-  override buildInsertValueExpr(
-    column: ColumnTypeMeta,
-    _paramIndex: number,
-  ): string {
-    if (isMysqlSpatialType(column.nativeType)) return "ST_GeomFromText(?)";
-    return "?";
-  }
-
-  override buildSetExpr(column: ColumnTypeMeta, _paramIndex: number): string {
-    if (isMysqlSpatialType(column.nativeType)) {
-      return `${this.quoteIdentifier(column.name)} = ST_GeomFromText(?)`;
-    }
-    return `${this.quoteIdentifier(column.name)} = ?`;
   }
 
   protected override coerceBooleanTrue(): unknown {
@@ -1043,9 +1063,6 @@ export class MySQLDriver extends BaseDBDriver {
     // Binary
     if (column.category === "binary")
       return super.coerceInputValue(value, column);
-
-    // Spatial
-    if (column.category === "spatial") return parseMysqlSpatialToWkt(value);
 
     const typeName = mysqlTypeName(column.nativeType);
     if (typeName === "date") {
@@ -1122,12 +1139,6 @@ export class MySQLDriver extends BaseDBDriver {
         const op = operator === "neq" ? "!=" : "=";
         return { sql: `${col} ${op} ?`, params: [boolVal] };
       }
-    }
-
-    // Spatial: ST_AsText LIKE
-    if (column.category === "spatial") {
-      const v = typeof val === "string" ? val : val[0];
-      return { sql: `ST_AsText(${col}) LIKE ?`, params: [`%${v}%`] };
     }
 
     // Binary: HEX LIKE

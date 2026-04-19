@@ -1593,6 +1593,7 @@ export class OracleDriver extends BaseDBDriver {
   ): boolean {
     return (
       super.isFilterable(nativeType, category) &&
+      category !== "interval" &&
       !ORACLE_NON_FILTERABLE.has(oracleTypeName(nativeType).toLowerCase())
     );
   }
