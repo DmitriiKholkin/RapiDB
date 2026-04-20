@@ -4,6 +4,7 @@ import type {
   QueryInitialState,
   WebviewInitialState,
 } from "../../shared/webviewContracts";
+import { parseWebviewInitialState } from "../../shared/webviewContracts";
 import { ConnectionFormView } from "./ConnectionFormView";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { QueryView } from "./QueryView";
@@ -17,7 +18,7 @@ const fallbackState: QueryInitialState = {
 };
 
 const state: WebviewInitialState =
-  window.__RAPIDB_INITIAL_STATE__ ?? fallbackState;
+  parseWebviewInitialState(window.__RAPIDB_INITIAL_STATE__) ?? fallbackState;
 
 export function App(): React.ReactElement {
   switch (state.view) {

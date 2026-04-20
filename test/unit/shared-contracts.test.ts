@@ -12,6 +12,12 @@ import {
   NULL_SENTINEL as sharedNullSentinel,
   valueFilterOperator,
 } from "../../src/shared/tableTypes";
+import {
+  parseConnectionFormPanelMessage,
+  parseQueryPanelMessage,
+  parseTablePanelMessage,
+  parseWebviewInitialState,
+} from "../../src/shared/webviewContracts";
 import { NULL_SENTINEL as webviewNullSentinel } from "../../src/webview/types";
 
 describe("shared contract parity", () => {
@@ -109,6 +115,121 @@ describe("shared contract parity", () => {
         value: ["2026-04-01", "2026-04-15"],
       },
     ]);
+  });
+
+  it("parses sanitized connection initial state without exposing a password", () => {
+    expect(
+      parseWebviewInitialState({
+        view: "connection",
+        existing: {
+          id: "conn-1",
+          name: "Analytics",
+          type: "pg",
+          host: "localhost",
+          username: "reader",
+          useSecretStorage: true,
+          hasStoredSecret: true,
+          password: "should-not-pass",
+        },
+      }),
+    ).toEqual({
+      view: "connection",
+      existing: {
+        id: "conn-1",
+        name: "Analytics",
+        type: "pg",
+        host: "localhost",
+        username: "reader",
+        useSecretStorage: true,
+        hasStoredSecret: true,
+      },
+    });
+  });
+
+  it("allows empty database and schema values for table and schema views", () => {
+    expect(
+      parseWebviewInitialState({
+        view: "table",
+        connectionId: "conn-1",
+        database: "",
+        schema: "",
+        table: "users",
+      }),
+    ).toEqual({
+      view: "table",
+      connectionId: "conn-1",
+      database: "",
+      schema: "",
+      table: "users",
+      isView: undefined,
+      defaultPageSize: undefined,
+    });
+
+    expect(
+      parseWebviewInitialState({
+        view: "schema",
+        connectionId: "conn-1",
+        database: "",
+        schema: "",
+        table: "users",
+      }),
+    ).toEqual({
+      view: "schema",
+      connectionId: "conn-1",
+      database: "",
+      schema: "",
+      table: "users",
+    });
+  });
+
+  it("rejects malformed query and table panel messages", () => {
+    expect(
+      parseQueryPanelMessage({
+        type: "executeQuery",
+        payload: { connectionId: "conn-1" },
+      }),
+    ).toBeNull();
+
+    expect(
+      parseTablePanelMessage({
+        type: "deleteRows",
+        payload: { primaryKeysList: [null] },
+      }),
+    ).toBeNull();
+  });
+
+  it("preserves hasStoredSecret on parsed connection form messages", () => {
+    expect(
+      parseConnectionFormPanelMessage({
+        type: "testConnection",
+        payload: {
+          id: "conn-1",
+          name: "Analytics",
+          type: "pg",
+          host: "localhost",
+          port: 5432,
+          database: "app",
+          username: "reader",
+          password: "",
+          useSecretStorage: true,
+          hasStoredSecret: true,
+        },
+      }),
+    ).toEqual({
+      type: "testConnection",
+      payload: {
+        id: "conn-1",
+        name: "Analytics",
+        type: "pg",
+        host: "localhost",
+        port: 5432,
+        database: "app",
+        username: "reader",
+        password: "",
+        useSecretStorage: true,
+        hasStoredSecret: true,
+      },
+    });
   });
 
   describe("buildFilterExpression", () => {

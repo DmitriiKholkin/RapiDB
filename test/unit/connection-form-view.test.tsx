@@ -63,6 +63,37 @@ describe("ConnectionFormView", () => {
         host: "localhost",
         port: 1433,
         username: "",
+        useSecretStorage: true,
+      }),
+    });
+  });
+
+  it("keeps secret-storage metadata without hydrating the stored password", () => {
+    render(
+      <ConnectionFormView
+        existing={{
+          id: "conn-1",
+          name: "Analytics",
+          type: "pg",
+          host: "localhost",
+          port: 5432,
+          database: "app",
+          username: "reader",
+          useSecretStorage: true,
+          hasStoredSecret: true,
+        }}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Test Connection" }));
+
+    expect(postMessage).toHaveBeenCalledWith({
+      type: "testConnection",
+      payload: expect.objectContaining({
+        id: "conn-1",
+        useSecretStorage: true,
+        hasStoredSecret: true,
+        password: "",
       }),
     });
   });

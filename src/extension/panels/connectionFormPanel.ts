@@ -1,13 +1,15 @@
 import * as vscode from "vscode";
-import type { WebviewMessageEnvelope } from "../../shared/webviewContracts";
+import {
+  type ConnectionFormExistingState,
+  type ConnectionFormSubmission,
+  parseConnectionFormPanelMessage,
+} from "../../shared/webviewContracts";
 import type { ConnectionConfig, ConnectionManager } from "../connectionManager";
 import {
   logErrorWithContext,
   normalizeUnknownError,
 } from "../utils/errorHandling";
 import { createWebviewShell } from "./webviewShell";
-
-type PanelMessage = WebviewMessageEnvelope;
 
 export class ConnectionFormPanel {
   private static readonly viewType = "rapidb.connectionForm";
@@ -54,14 +56,21 @@ export class ConnectionFormPanel {
   ): Promise<ConnectionConfig | undefined> {
     const title = existing ? `Edit — ${existing.name}` : "New Connection";
 
-    let existingForForm = existing;
-    if (existing?.useSecretStorage && existing.id) {
-      try {
-        const stored = await context.secrets.get(existing.id);
-        if (stored !== undefined) {
-          existingForForm = { ...existing, password: stored };
-        }
-      } catch {}
+    let existingForForm: ConnectionFormExistingState | undefined;
+    if (existing) {
+      let hasStoredSecret = false;
+      if (existing.useSecretStorage && existing.id) {
+        try {
+          hasStoredSecret =
+            (await context.secrets.get(existing.id)) !== undefined;
+        } catch {}
+      }
+
+      const { password: _password, ...rest } = existing;
+      existingForForm = {
+        ...rest,
+        hasStoredSecret: hasStoredSecret || undefined,
+      };
     }
 
     const panel = vscode.window.createWebviewPanel(
@@ -83,15 +92,70 @@ export class ConnectionFormPanel {
     });
   }
 
-  private async handleMessage(msg: PanelMessage): Promise<void> {
-    switch (msg.type) {
+  private async resolveSubmittedPassword(
+    payload: ConnectionFormSubmission,
+  ): Promise<string> {
+    if (payload.password !== undefined && payload.password !== "") {
+      return payload.password;
+    }
+
+    if (payload.useSecretStorage && payload.hasStoredSecret) {
+      try {
+        return (await this.context.secrets.get(payload.id)) ?? "";
+      } catch {
+        return "";
+      }
+    }
+
+    const existing = this.connectionManager.getConnection(payload.id);
+    if (payload.useSecretStorage && existing?.useSecretStorage) {
+      try {
+        return (await this.context.secrets.get(payload.id)) ?? "";
+      } catch {
+        return "";
+      }
+    }
+
+    return existing?.password ?? payload.password ?? "";
+  }
+
+  private async resolveSubmittedConfig(
+    payload: ConnectionFormSubmission,
+  ): Promise<ConnectionConfig> {
+    const password = await this.resolveSubmittedPassword(payload);
+    const { hasStoredSecret: _hasStoredSecret, ...rest } = payload;
+    return { ...rest, password };
+  }
+
+  private async handleMessage(msg: unknown): Promise<void> {
+    const parsed = parseConnectionFormPanelMessage(msg);
+    if (!parsed) {
+      return;
+    }
+
+    switch (parsed.type) {
       case "saveConnection": {
-        const raw = msg.payload as ConnectionConfig;
+        const payload = parsed.payload;
+        if (!payload) {
+          return;
+        }
+        if (!payload.name.trim()) {
+          this.panel.webview.postMessage({
+            type: "saveResult",
+            payload: { success: false, error: "Name is required." },
+          });
+          return;
+        }
+        const raw = await this.resolveSubmittedConfig(payload);
 
         if (raw.useSecretStorage) {
+          const shouldReuseStored =
+            payload.hasStoredSecret === true && (payload.password ?? "") === "";
           const password = raw.password ?? "";
           try {
-            await this.context.secrets.store(raw.id, password);
+            if (!shouldReuseStored) {
+              await this.context.secrets.store(raw.id, password);
+            }
           } catch (err: unknown) {
             const error = normalizeUnknownError(err);
             this.panel.webview.postMessage({
@@ -120,9 +184,12 @@ export class ConnectionFormPanel {
         break;
       }
       case "testConnection": {
-        const result = await this.connectionManager.testConnection(
-          (msg.payload ?? {}) as Omit<ConnectionConfig, "id">,
-        );
+        const payload = parsed.payload;
+        if (!payload) {
+          return;
+        }
+        const raw = await this.resolveSubmittedConfig(payload);
+        const result = await this.connectionManager.testConnection(raw);
         this.panel.webview.postMessage({ type: "testResult", payload: result });
         break;
       }

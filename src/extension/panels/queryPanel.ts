@@ -2,7 +2,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
-import type { WebviewMessageEnvelope } from "../../shared/webviewContracts";
+import { parseQueryPanelMessage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import { formatDatetimeForDisplay } from "../dbDrivers/BaseDBDriver";
 import {
@@ -10,8 +10,6 @@ import {
   normalizeUnknownError,
 } from "../utils/errorHandling";
 import { createWebviewShell } from "./webviewShell";
-
-type PanelMessage = WebviewMessageEnvelope;
 
 export class QueryPanel {
   private static readonly viewType = "rapidb.queryPanel";
@@ -155,26 +153,61 @@ export class QueryPanel {
     this.panel.webview.postMessage({ type: "connections", payload: conns });
   }
 
-  private async handleMessage(msg: PanelMessage): Promise<void> {
-    switch (msg.type) {
+  private postQueryError(error: string): void {
+    this.panel.webview.postMessage({
+      type: "queryResult",
+      payload: {
+        columns: [],
+        rows: [],
+        rowCount: 0,
+        executionTimeMs: 0,
+        error,
+      },
+    });
+  }
+
+  private async confirmQueryExecution(sql: string): Promise<boolean> {
+    if (!isLikelyUnboundedResultQuery(sql)) {
+      return true;
+    }
+
+    const answer = await vscode.window.showWarningMessage(
+      "[RapiDB] This query looks unbounded and the extension currently fetches the full result set before truncating it. Continue anyway?",
+      { modal: true },
+      "Run Anyway",
+    );
+    return answer === "Run Anyway";
+  }
+
+  private async handleMessage(msg: unknown): Promise<void> {
+    const parsed = parseQueryPanelMessage(msg);
+    if (!parsed) {
+      return;
+    }
+
+    switch (parsed.type) {
       case "activeConnectionChanged": {
-        const payload = (msg.payload ?? {}) as { connectionId?: string };
-        const newId = payload.connectionId;
-        if (!newId) {
-          break;
+        const payload = parsed.payload;
+        if (!payload) {
+          return;
         }
-        this.activeConnectionId = newId;
+        this.activeConnectionId = payload.connectionId;
         this.syncTitle();
         break;
       }
 
       case "executeQuery": {
-        const payload = (msg.payload ?? {}) as {
-          sql?: string;
-          connectionId?: string;
-        };
-        const sql = payload.sql ?? "";
+        const payload = parsed.payload;
+        if (!payload) {
+          return;
+        }
+        const sql = payload.sql;
         if (!sql.trim()) {
+          return;
+        }
+
+        if (!(await this.confirmQueryExecution(sql))) {
+          this.postQueryError("Query execution cancelled.");
           return;
         }
 
@@ -185,16 +218,7 @@ export class QueryPanel {
             await this.connectionManager.connectTo(connectionId);
           } catch (err: unknown) {
             const error = normalizeUnknownError(err);
-            this.panel.webview.postMessage({
-              type: "queryResult",
-              payload: {
-                columns: [],
-                rows: [],
-                rowCount: 0,
-                executionTimeMs: 0,
-                error: `Cannot connect: ${error.message}`,
-              },
-            });
+            this.postQueryError(`Cannot connect: ${error.message}`);
             return;
           }
         }
@@ -241,16 +265,7 @@ export class QueryPanel {
           });
         } catch (err: unknown) {
           const error = normalizeUnknownError(err);
-          this.panel.webview.postMessage({
-            type: "queryResult",
-            payload: {
-              columns: [],
-              rows: [],
-              rowCount: 0,
-              executionTimeMs: 0,
-              error: error.message,
-            },
-          });
+          this.postQueryError(error.message);
         }
         break;
       }
@@ -261,8 +276,8 @@ export class QueryPanel {
       }
 
       case "getSchema": {
-        const payload = (msg.payload ?? {}) as { connectionId?: string };
-        const connectionId = payload.connectionId || this.activeConnectionId;
+        const connectionId =
+          parsed.payload?.connectionId || this.activeConnectionId;
 
         if (!this.connectionManager.isConnected(connectionId)) {
           this.panel.webview.postMessage({
@@ -407,10 +422,11 @@ export class QueryPanel {
       }
 
       case "addBookmark": {
-        const { sql, connectionId: bmConnId } = (msg.payload ?? {}) as {
-          sql: string;
-          connectionId: string;
-        };
+        const payload = parsed.payload;
+        if (!payload) {
+          return;
+        }
+        const { sql, connectionId: bmConnId } = payload;
         if (!sql?.trim()) {
           break;
         }
@@ -470,4 +486,40 @@ export class QueryPanel {
       `,
     });
   }
+}
+
+function normaliseSqlForGuardrail(sql: string): string {
+  return sql
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/--.*$/gm, " ")
+    .replace(/'([^']|'')*'/g, "''")
+    .replace(/"([^"]|"")*"/g, '""')
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+export function isLikelyUnboundedResultQuery(sql: string): boolean {
+  const normalized = normaliseSqlForGuardrail(sql);
+  if (!/^(select|with)\b/.test(normalized)) {
+    return false;
+  }
+
+  if (/\bcount\s*\(/.test(normalized)) {
+    return false;
+  }
+
+  if (
+    /\blimit\s+\d+\b/.test(normalized) ||
+    /\btop\s*(?:\(\s*\d+\s*\)|\d+)\b/.test(normalized) ||
+    /\bfetch\s+(?:first|next)\s+\d+\s+rows?\s+only\b/.test(normalized) ||
+    /\boffset\s+\d+\s+rows?\s+fetch\s+(?:first|next)\s+\d+\s+rows?\s+only\b/.test(
+      normalized,
+    ) ||
+    /\brownum\s*(?:<=|<)\s*\d+\b/.test(normalized)
+  ) {
+    return false;
+  }
+
+  return true;
 }

@@ -138,6 +138,87 @@ describe("ConnectionManager.beginConnect", () => {
     ).toBe(false);
   });
 
+  it("does not eagerly preload schema during beginConnect", async () => {
+    const manager = new ConnectionManager(makeContext());
+    const driver = {
+      connect: vi.fn().mockResolvedValue(undefined),
+      disconnect: vi.fn().mockResolvedValue(undefined),
+      isConnected: vi.fn(() => true),
+    };
+
+    (
+      manager as unknown as { getConnection: (id: string) => unknown }
+    ).getConnection = vi.fn(() => ({
+      id: "conn-1",
+      name: "Local",
+      type: "pg",
+    }));
+    (
+      manager as unknown as {
+        _hydratePassword: (config: unknown) => Promise<unknown>;
+      }
+    )._hydratePassword = vi.fn(async (config) => config);
+    (manager as unknown as { createDriver: () => unknown }).createDriver =
+      vi.fn(() => driver);
+
+    const startSchemaLoadSpy = vi.spyOn(
+      manager as unknown as { _startSchemaLoad: (id: string) => void },
+      "_startSchemaLoad",
+    );
+
+    await manager.beginConnect("conn-1").promise;
+
+    expect(driver.connect).toHaveBeenCalledTimes(1);
+    expect(startSchemaLoadSpy).not.toHaveBeenCalled();
+  });
+
+  it("loads schema lazily on first getSchemaAsync request", async () => {
+    const manager = new ConnectionManager(makeContext());
+    const lazyTables = [{ schema: "dbo", table: "users", columns: [] }];
+
+    (
+      manager as unknown as {
+        _startSchemaLoad: (id: string) => void;
+        _schemaCacheMap: Map<
+          string,
+          {
+            tables: Array<{
+              schema: string;
+              table: string;
+              columns: unknown[];
+            }>;
+            loading: Promise<void> | null;
+          }
+        >;
+      }
+    )._startSchemaLoad = vi.fn(function (this: unknown, id: string) {
+      (
+        manager as unknown as {
+          _schemaCacheMap: Map<
+            string,
+            {
+              tables: Array<{
+                schema: string;
+                table: string;
+                columns: unknown[];
+              }>;
+              loading: Promise<void> | null;
+            }
+          >;
+        }
+      )._schemaCacheMap.set(id, {
+        tables: lazyTables,
+        loading: null,
+      });
+    });
+
+    await expect(manager.getSchemaAsync("conn-1")).resolves.toEqual(lazyTables);
+    expect(
+      (manager as unknown as { _startSchemaLoad: ReturnType<typeof vi.fn> })
+        ._startSchemaLoad,
+    ).toHaveBeenCalledWith("conn-1");
+  });
+
   it("counts only active connected drivers", () => {
     const manager = new ConnectionManager(makeContext());
 

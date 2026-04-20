@@ -1,4 +1,4 @@
-// biome-ignore lint/correctness/noUnusedImports: <explanation>
+// biome-ignore lint/correctness/noUnusedImports: React is required for JSX in this build setup
 import React, {
   type CSSProperties,
   type InputHTMLAttributes,
@@ -9,20 +9,21 @@ import React, {
   useEffect,
   useState,
 } from "react";
-import type { ConnectionConfig as SharedConnectionConfig } from "../../shared/connectionConfig";
 import {
   CONNECTION_TYPE_LABELS,
   CONNECTION_TYPES,
   type ConnectionType,
   DEFAULT_PORT_BY_CONNECTION_TYPE,
 } from "../../shared/connectionTypes";
+import type {
+  ConnectionFormExistingState,
+  ConnectionFormSubmission,
+} from "../../shared/webviewContracts";
 import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
 
-type ConnectionConfig = SharedConnectionConfig;
-
 interface Props {
-  existing?: ConnectionConfig | null;
+  existing?: ConnectionFormExistingState | null;
 }
 
 const s = {
@@ -231,6 +232,7 @@ function Toggle({
 
 export function ConnectionFormView({ existing }: Props): ReactElement {
   const isEdit = !!existing;
+  const hasStoredSecret = existing?.hasStoredSecret ?? false;
 
   const [name, setName] = useState(existing?.name ?? "");
   const [type, setType] = useState<ConnectionType>(existing?.type ?? "pg");
@@ -242,7 +244,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   );
   const [database, setDatabase] = useState(existing?.database ?? "");
   const [username, setUsername] = useState(existing?.username ?? "");
-  const [password, setPassword] = useState(existing?.password ?? "");
+  const [password, setPassword] = useState("");
   const [filePath, setFilePath] = useState(existing?.filePath ?? "");
   const [folder, setFolder] = useState(existing?.folder ?? "");
 
@@ -261,7 +263,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     existing?.rejectUnauthorized ?? true,
   );
   const [useSecretStorage, setUseSecretStorage] = useState(
-    existing?.useSecretStorage ?? false,
+    existing?.useSecretStorage ?? true,
   );
 
   const [testState, setTestState] = useState<
@@ -306,12 +308,13 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   };
 
   const buildPayload = useCallback(
-    (): ConnectionConfig => ({
+    (): ConnectionFormSubmission => ({
       id: existing?.id ?? crypto.randomUUID(),
       name: name.trim(),
       type,
       folder: folder.trim() || undefined,
       useSecretStorage: useSecretStorage || undefined,
+      hasStoredSecret: hasStoredSecret || undefined,
       ...(isSQLite
         ? { filePath: filePath.trim() }
         : {
@@ -341,6 +344,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       type,
       folder,
       useSecretStorage,
+      hasStoredSecret,
       isSQLite,
       filePath,
       host,
@@ -388,6 +392,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
 
       <Field label="Name" error={nameError}>
         <FocusInput
+          aria-label="Connection name"
           value={name}
           onChange={(e) => {
             setName(e.target.value);
@@ -403,6 +408,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
         hint="Group this connection under a folder in the explorer. Leave empty to show at the root."
       >
         <FocusInput
+          aria-label="Connection folder"
           value={folder}
           onChange={(e) => setFolder(e.target.value)}
           placeholder="Production"
@@ -411,6 +417,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
 
       <Field label="Database Type">
         <FocusSelect
+          aria-label="Database type"
           value={type}
           onChange={(e) => handleTypeChange(e.target.value as ConnectionType)}
         >
@@ -425,6 +432,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       {isSQLite ? (
         <Field label="Database File Path">
           <FocusInput
+            aria-label="Database file path"
             value={filePath}
             onChange={(e) => setFilePath(e.target.value)}
             placeholder="/absolute/path/to/database.db"
@@ -436,6 +444,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
             <div style={{ flex: 1 }}>
               <div style={s.label}>Host</div>
               <FocusInput
+                aria-label="Host"
                 value={host}
                 onChange={(e) => setHost(e.target.value)}
                 placeholder="localhost"
@@ -444,6 +453,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
             <div style={{ width: 90 }}>
               <div style={s.label}>Port</div>
               <FocusInput
+                aria-label="Port"
                 value={port}
                 onChange={(e) => setPort(e.target.value)}
                 type="text"
@@ -462,6 +472,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
 
           <Field label="Database">
             <FocusInput
+              aria-label="Database"
               value={database}
               onChange={(e) => setDatabase(e.target.value)}
               placeholder="mydb"
@@ -470,6 +481,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
 
           <Field label="Username">
             <FocusInput
+              aria-label="Username"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               placeholder="admin"
@@ -492,13 +504,16 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
           <Field
             label="Password"
             hint={
-              useSecretStorage
-                ? "🔒 Will be stored securely in VS Code Secret Storage (OS keychain)"
-                : "⚠ Will be stored in plaintext in settings.json"
+              useSecretStorage && hasStoredSecret && password.length === 0
+                ? "Leave blank to keep the stored password in VS Code Secret Storage."
+                : useSecretStorage
+                  ? "🔒 Will be stored securely in VS Code Secret Storage (OS keychain)"
+                  : "⚠ Will be stored in plaintext in settings.json"
             }
           >
             <div style={{ position: "relative" }}>
               <FocusInput
+                aria-label="Password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 type="password"
@@ -541,6 +556,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                 hint="e.g. XEPDB1, ORCL, or your PDB service name. Recommended over SID. Leave empty to use the Database field above."
               >
                 <FocusInput
+                  aria-label="Oracle service name"
                   value={oracleServiceName}
                   onChange={(e) => setOracleServiceName(e.target.value)}
                   placeholder="XEPDB1"
@@ -567,6 +583,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                     hint="Directory containing libclntsh.so / oci.dll. Leave empty to use system default."
                   >
                     <FocusInput
+                      aria-label="Oracle Instant Client path"
                       value={oracleClientPath}
                       onChange={(e) => setOracleClientPath(e.target.value)}
                       placeholder="/opt/oracle/instantclient_21_9"

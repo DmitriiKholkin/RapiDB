@@ -314,7 +314,6 @@ export class ConnectionManager {
 
         this.driverMap.set(id, driver);
         this._schemaCacheMap.delete(id);
-        this._startSchemaLoad(id);
         this._onDidConnect.fire();
         resolveAttempt();
       } catch (err) {
@@ -366,6 +365,11 @@ export class ConnectionManager {
   }
 
   async getSchemaAsync(connectionId: string): Promise<SchemaTableEntry[]> {
+    const existing = this._schemaCacheMap.get(connectionId);
+    if (!existing || (!existing.loading && existing.tables.length === 0)) {
+      this._startSchemaLoad(connectionId);
+    }
+
     const entry = this._schemaCacheMap.get(connectionId);
     if (entry?.loading) {
       try {

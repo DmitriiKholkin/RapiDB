@@ -3,15 +3,12 @@ import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 import { coerceFilterExpressions } from "../../shared/tableTypes";
-import type {
-  ApplyResultPayload,
-  WebviewMessageEnvelope,
-} from "../../shared/webviewContracts";
+import type { ApplyResultPayload } from "../../shared/webviewContracts";
+import { parseTablePanelMessage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import {
   applyChangesTransactional,
   type Filter,
-  type RowUpdate,
   type SortConfig,
   TableDataService,
 } from "../tableDataService";
@@ -20,8 +17,6 @@ import {
   normalizeUnknownError,
 } from "../utils/errorHandling";
 import { createWebviewShell } from "./webviewShell";
-
-type PanelMessage = WebviewMessageEnvelope;
 
 export class TablePanel {
   private static readonly viewType = "rapidb.tablePanel";
@@ -155,11 +150,16 @@ export class TablePanel {
     });
   }
 
-  private async handleMessage(msg: PanelMessage): Promise<void> {
+  private async handleMessage(msg: unknown): Promise<void> {
     const send = (type: string, payload: unknown) =>
       this.panel.webview.postMessage({ type, payload });
 
-    switch (msg.type) {
+    const parsed = parseTablePanelMessage(msg);
+    if (!parsed) {
+      return;
+    }
+
+    switch (parsed.type) {
       case "ready": {
         try {
           const cols = await this.svc.getColumns(
@@ -183,13 +183,10 @@ export class TablePanel {
       }
 
       case "fetchPage": {
-        const raw = (msg.payload ?? {}) as {
-          fetchId?: number;
-          page?: number | string;
-          pageSize?: number | string;
-          filters?: unknown;
-          sort?: unknown;
-        };
+        const raw = parsed.payload;
+        if (!raw) {
+          return;
+        }
         const fetchId = raw.fetchId;
         const page = Math.max(1, Math.floor(Number(raw.page) || 1));
         const pageSize = Math.min(
@@ -228,9 +225,11 @@ export class TablePanel {
       }
 
       case "applyChanges": {
-        const { updates } = (msg.payload ?? {}) as {
-          updates?: RowUpdate[];
-        };
+        const payload = parsed.payload;
+        if (!payload) {
+          return;
+        }
+        const { updates } = payload;
         try {
           const result: ApplyResultPayload = await applyChangesTransactional(
             this.cm,
@@ -238,7 +237,7 @@ export class TablePanel {
             this.database,
             this.schema,
             this.table,
-            (updates ?? []) as RowUpdate[],
+            updates ?? [],
             this.cachedColumns,
           );
           if (result.warning) {
@@ -256,9 +255,11 @@ export class TablePanel {
       }
 
       case "insertRow": {
-        const { values = {} } = (msg.payload ?? {}) as {
-          values?: Record<string, unknown>;
-        };
+        const payload = parsed.payload;
+        if (!payload) {
+          return;
+        }
+        const { values = {} } = payload;
         try {
           await this.svc.insertRow(
             this.connectionId,
@@ -279,9 +280,11 @@ export class TablePanel {
       }
 
       case "deleteRows": {
-        const { primaryKeysList = [] } = (msg.payload ?? {}) as {
-          primaryKeysList?: Record<string, unknown>[];
-        };
+        const payload = parsed.payload;
+        if (!payload) {
+          return;
+        }
+        const { primaryKeysList = [] } = payload;
         try {
           await this.svc.deleteRows(
             this.connectionId,
@@ -328,11 +331,9 @@ export class TablePanel {
                 encoding: "utf8",
               });
               let headerWritten = false;
+              const payload = parsed.payload;
               const { sort: csvSort = null, filters: csvFilters = [] } =
-                (msg.payload ?? {}) as {
-                  sort?: SortConfig | null;
-                  filters?: unknown[];
-                };
+                payload ?? {};
               try {
                 for await (const chunk of this.svc.exportAll(
                   this.connectionId,
@@ -387,11 +388,8 @@ export class TablePanel {
       }
 
       case "exportJSON": {
-        const { sort = null, filters: jsonFilters = [] } = (msg.payload ??
-          {}) as {
-          sort?: SortConfig | null;
-          filters?: unknown[];
-        };
+        const payload = parsed.payload;
+        const { sort = null, filters: jsonFilters = [] } = payload ?? {};
         const saveUri = await vscode.window.showSaveDialog({
           defaultUri: vscode.Uri.file(
             path.join(os.homedir(), "Downloads", `${this.table}.json`),
@@ -477,7 +475,11 @@ export class TablePanel {
       }
 
       case "confirmDelete": {
-        const { count } = (msg.payload ?? {}) as { count?: number };
+        const payload = parsed.payload;
+        if (!payload) {
+          return;
+        }
+        const { count } = payload;
         const answer = await vscode.window.showWarningMessage(
           `Delete ${count} row${count !== 1 ? "s" : ""} from "${this.table}"? This cannot be undone.`,
           { modal: true },

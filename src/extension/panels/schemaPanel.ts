@@ -1,13 +1,11 @@
 import * as vscode from "vscode";
-import type { WebviewMessageEnvelope } from "../../shared/webviewContracts";
+import { parseSchemaPanelMessage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import {
   logErrorWithContext,
   normalizeUnknownError,
 } from "../utils/errorHandling";
 import { createWebviewShell } from "./webviewShell";
-
-type PanelMessage = WebviewMessageEnvelope;
 
 export class SchemaPanel {
   private static readonly viewType = "rapidb.schemaPanel";
@@ -120,11 +118,16 @@ export class SchemaPanel {
     });
   }
 
-  private async handleMessage(msg: PanelMessage): Promise<void> {
+  private async handleMessage(msg: unknown): Promise<void> {
     const send = (type: string, payload: unknown) =>
       this.panel.webview.postMessage({ type, payload });
 
-    switch (msg.type) {
+    const parsed = parseSchemaPanelMessage(msg);
+    if (!parsed) {
+      return;
+    }
+
+    switch (parsed.type) {
       case "ready": {
         const driver = this.cm.getDriver(this.connectionId);
         if (!driver) {
@@ -150,14 +153,11 @@ export class SchemaPanel {
       }
 
       case "openRelatedSchema": {
-        const { table, schema, database } = (msg.payload ?? {}) as {
-          table?: string;
-          schema?: string;
-          database?: string;
-        };
-        if (!table) {
-          break;
+        const payload = parsed.payload;
+        if (!payload) {
+          return;
         }
+        const { table, schema, database } = payload;
         SchemaPanel.createOrShow(
           this.context,
           this.cm,

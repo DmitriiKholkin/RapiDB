@@ -1,4 +1,4 @@
-// biome-ignore lint/correctness/noUnusedImports: <explanation>
+// biome-ignore lint/correctness/noUnusedImports: React is required for JSX in this build setup
 import React, { type CSSProperties, useEffect, useRef, useState } from "react";
 import {
   type ColumnTypeMeta as ColumnMeta,
@@ -129,6 +129,16 @@ function isInputOperator(
   return operator !== "is_null" && operator !== "is_not_null";
 }
 
+function isScalarDraft(
+  draft: FilterDraft | undefined,
+): draft is { operator: ScalarFilterOperator; value: string } {
+  return draft !== undefined && isScalarOperator(draft.operator);
+}
+
+function readScalarDraftValue(draft: FilterDraft | undefined): string {
+  return isScalarDraft(draft) ? draft.value : "";
+}
+
 function getAvailableOperators(column: ColumnMeta): FilterOperator[] {
   return column.filterOperators.filter((operator) =>
     isInputOperator(operator) ? column.filterable : true,
@@ -173,8 +183,7 @@ function nextDraftForOperator(
         return draft;
       }
 
-      const start =
-        draft && isScalarOperator(draft.operator) ? draft.value : "";
+      const start = readScalarDraftValue(draft);
       return { operator, value: [start, ""] };
     }
     default: {
@@ -185,7 +194,7 @@ function nextDraftForOperator(
       const value =
         draft?.operator === "between"
           ? draft.value[0]
-          : draft && isScalarOperator(draft.operator)
+          : isScalarDraft(draft)
             ? draft.value
             : "";
       return { operator, value };
