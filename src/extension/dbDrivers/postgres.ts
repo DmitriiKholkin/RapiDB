@@ -687,6 +687,13 @@ export class PostgresDriver extends BaseDBDriver {
   ): boolean {
     const baseType = nativeType.toLowerCase().split("(")[0].trim();
     if (PG_GEOMETRIC_TYPES.has(baseType)) return false;
+    if (
+      baseType === "bit" ||
+      baseType === "varbit" ||
+      baseType === "bit varying"
+    ) {
+      return true;
+    }
     if (category === "interval" || baseType === "money") return false;
     return super.isEditable(nativeType, category);
   }

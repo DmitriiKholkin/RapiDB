@@ -928,6 +928,23 @@ describe("PostgresDriver", () => {
       });
       expect(result.editable).toBe(false);
     });
+
+    it.each([
+      "bit(1)",
+      "bit varying(8)",
+      "varbit(8)",
+    ])("keeps PostgreSQL %s columns writable", (type) => {
+      const result = enrichTestColumn(pg, {
+        name: "bits_col",
+        type,
+        nullable: true,
+        isPrimaryKey: false,
+        isForeignKey: false,
+      });
+
+      expect(result.category).toBe("other");
+      expect(result.editable).toBe(true);
+    });
   });
 
   describe("describeColumns", () => {

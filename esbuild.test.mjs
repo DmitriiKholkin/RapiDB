@@ -1,10 +1,8 @@
 import * as esbuild from "esbuild";
 
 /** @type {import('esbuild').BuildOptions} */
-const testConfig = {
-  entryPoints: ["test/db-smoke.ts"],
+const sharedConfig = {
   bundle: true,
-  outfile: "dist/test/db-smoke.cjs",
   format: "cjs",
   platform: "node",
   target: "node20",
@@ -22,7 +20,17 @@ const testConfig = {
   ],
 };
 
-esbuild.build(testConfig).catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+const builds = [
+  {
+    entryPoints: ["test/db-preflight.ts"],
+    outfile: "dist/test/db-preflight.cjs",
+  },
+  {
+    entryPoints: ["test/db-smoke.ts"],
+    outfile: "dist/test/db-smoke.cjs",
+  },
+];
+
+for (const build of builds) {
+  await esbuild.build({ ...sharedConfig, ...build });
+}

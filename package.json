@@ -487,7 +487,7 @@
     "typecheck:test": "tsc -p tsconfig.test.json --noEmit",
     "verify": "npm run typecheck && npm run test:unit",
     "test:unit": "vitest run",
-    "test:db": "tsc -p tsconfig.test.json && node esbuild.test.mjs && node dist/test/db-smoke.cjs",
+    "test:db": "tsc -p tsconfig.test.json && node esbuild.test.mjs && node dist/test/db-preflight.cjs && node dist/test/db-smoke.cjs",
     "package": "vsce package",
     "lint": "eslint src --ext ts,tsx"
   },

@@ -12,10 +12,13 @@ afterEach(cleanup);
 function makeColumn(
   overrides: Partial<ColumnTypeMeta> & { name: string; type: string },
 ): ColumnTypeMeta {
+  const { name, type, ...rest } = overrides;
+
   return {
-    name: overrides.name,
-    type: overrides.type,
-    nativeType: overrides.nativeType ?? overrides.type,
+    ...rest,
+    name,
+    type,
+    nativeType: rest.nativeType ?? type,
     nullable: true,
     isPrimaryKey: false,
     isForeignKey: false,
@@ -24,7 +27,6 @@ function makeColumn(
     editable: true,
     filterOperators: ["like", "between", "is_null"],
     isBoolean: false,
-    ...overrides,
   };
 }
 

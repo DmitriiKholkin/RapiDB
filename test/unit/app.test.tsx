@@ -35,19 +35,27 @@ afterEach(() => {
 
 describe("App", () => {
   beforeEach(() => {
-    window.__RAPIDB_INITIAL_STATE__ = undefined;
+    const testWindow = window as typeof window & {
+      __RAPIDB_INITIAL_STATE__?: unknown;
+    };
+    testWindow.__RAPIDB_INITIAL_STATE__ = undefined;
   });
 
   it("falls back to the query view when the initial state is malformed", async () => {
-    window.__RAPIDB_INITIAL_STATE__ = {
+    const testWindow = window as typeof window & {
+      __RAPIDB_INITIAL_STATE__?: unknown;
+    };
+
+    testWindow.__RAPIDB_INITIAL_STATE__ = {
       view: "connection",
       existing: {
         id: "conn-1",
+        name: "Analytics",
         type: "pg",
       },
     };
 
-    const { App } = await import("../../src/webview/components/App");
+    const { App } = await import("../../src/webview/components/App.js");
     render(<App />);
 
     expect(screen.getByTestId("query-view").textContent).toBe(

@@ -10,7 +10,7 @@ import {
 import { useVirtualizer } from "@tanstack/react-virtual";
 import React, { useCallback, useMemo, useRef, useState } from "react";
 import type { QueryResult, QueryStatus } from "../store";
-import { inferQueryColumnCategory, isNumericCategory } from "../types";
+import { inferQueryColumnCategory } from "../types";
 import { type Column, calcColWidths } from "../utils/columnSizing";
 import { postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
@@ -453,7 +453,9 @@ const VirtualRow = React.memo(function VirtualRow({
           cell.column.columnDef.meta as { category?: string } | undefined
         )?.category;
         const isNum =
-          typeof category === "string" && isNumericCategory(category);
+          category === "integer" ||
+          category === "float" ||
+          category === "decimal";
         const isNull = raw === null || raw === undefined;
         return (
           <td
