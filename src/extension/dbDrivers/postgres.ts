@@ -14,12 +14,14 @@ import type {
   ForeignKeyMeta,
   IndexMeta,
   PaginationResult,
+  PersistedEditCheckOptions,
+  PersistedEditCheckResult,
   QueryResult,
   SchemaInfo,
   TableInfo,
   TypeCategory,
 } from "./types";
-import { DATE_ONLY_RE, ISO_DATETIME_RE, NULL_SENTINEL } from "./types";
+import { ISO_DATETIME_RE, NULL_SENTINEL } from "./types";
 
 pgTypes.setTypeParser(1082, (val: string) => val);
 pgTypes.setTypeParser(1114, (val: string) => val);
@@ -683,9 +685,9 @@ export class PostgresDriver extends BaseDBDriver {
     nativeType: string,
     category: TypeCategory,
   ): boolean {
-    if (PG_GEOMETRIC_TYPES.has(nativeType.toLowerCase().split("(")[0].trim()))
-      return false;
-    if (category === "interval") return false;
+    const baseType = nativeType.toLowerCase().split("(")[0].trim();
+    if (PG_GEOMETRIC_TYPES.has(baseType)) return false;
+    if (category === "interval" || baseType === "money") return false;
     return super.isEditable(nativeType, category);
   }
 
@@ -800,6 +802,82 @@ export class PostgresDriver extends BaseDBDriver {
     return value;
   }
 
+  override checkPersistedEdit(
+    column: ColumnTypeMeta,
+    expectedValue: unknown,
+    options?: PersistedEditCheckOptions,
+  ): PersistedEditCheckResult | null {
+    const baseType = column.nativeType.toLowerCase().split("(")[0].trim();
+
+    if (column.category === "integer") {
+      return this.checkExactNumericPersistedEdit(
+        column,
+        expectedValue,
+        { precision: null, scale: 0 },
+        options,
+      );
+    }
+
+    if (column.category === "decimal") {
+      if (baseType === "money") {
+        return null;
+      }
+
+      if (!["numeric", "decimal"].includes(baseType)) {
+        return null;
+      }
+
+      return this.checkExactNumericPersistedEdit(
+        column,
+        expectedValue,
+        this.parseExactNumericConstraint(column.nativeType),
+        options,
+      );
+    }
+
+    if (column.category === "float") {
+      const significantDigits =
+        baseType === "real" || baseType === "float4" ? 7 : 15;
+      return this.checkApproximateNumericPersistedEdit(
+        column,
+        expectedValue,
+        significantDigits,
+        options,
+      );
+    }
+
+    if (column.category === "boolean") {
+      return this.checkBooleanPersistedEdit(column, expectedValue, options);
+    }
+
+    if (column.category === "binary") {
+      return this.checkBinaryPersistedEdit(column, expectedValue, options);
+    }
+
+    if (column.category === "json") {
+      return this.checkJsonPersistedEdit(column, expectedValue, options);
+    }
+
+    if (column.category === "uuid") {
+      return this.checkUuidPersistedEdit(column, expectedValue, options);
+    }
+
+    if (column.category === "array") {
+      return this.checkJsonArrayPersistedEdit(column, expectedValue, options);
+    }
+
+    if (
+      column.category === "text" ||
+      column.category === "date" ||
+      column.category === "time" ||
+      column.category === "datetime"
+    ) {
+      return this.checkTextPersistedEdit(column, expectedValue, options);
+    }
+
+    return null;
+  }
+
   // ─── PG filter building ───
 
   override buildFilterCondition(
@@ -829,20 +907,12 @@ export class PostgresDriver extends BaseDBDriver {
       }
     }
 
-    // Date exact match
     if (column.category === "date" && typeof val === "string") {
-      let dateVal: string | null = null;
-      if (DATE_ONLY_RE.test(val)) dateVal = val;
-      else if (ISO_DATETIME_RE.test(val)) dateVal = isoToLocalDateStr(val);
-      if (dateVal) {
-        if (operator === "eq")
-          return { sql: `${col} = $${paramIndex}::date`, params: [dateVal] };
-        const sqlOp = this.sqlOperator(operator);
-        return {
-          sql: `${col} ${sqlOp} $${paramIndex}::date`,
-          params: [dateVal],
-        };
-      }
+      const sqlOp = this.sqlOperator(operator);
+      return {
+        sql: `${col} ${sqlOp} $${paramIndex}::date`,
+        params: [val],
+      };
     }
 
     // Timestamp/time: CAST AS TEXT ILIKE

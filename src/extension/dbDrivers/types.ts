@@ -70,6 +70,16 @@ export interface PaginationResult {
   params: unknown[];
 }
 
+export interface PersistedEditCheckOptions {
+  persistedValue: unknown;
+}
+
+export interface PersistedEditCheckResult {
+  ok: boolean;
+  shouldVerify: boolean;
+  message?: string;
+}
+
 // ─── Driver interface ───
 
 export interface IDBDriver {
@@ -126,6 +136,11 @@ export interface IDBDriver {
   // ── Type-aware data helpers ──
   coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown;
   formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown;
+  checkPersistedEdit(
+    column: ColumnTypeMeta,
+    expectedValue: unknown,
+    options?: PersistedEditCheckOptions,
+  ): PersistedEditCheckResult | null;
   normalizeFilterValue(
     column: ColumnTypeMeta,
     operator: FilterOperator,

@@ -349,7 +349,7 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
         `Type: \`sqlite\``,
         `File: \`${config.filePath ?? "—"}\``,
       ];
-      node.tooltip = new vscode.MarkdownString(tooltipLines.join("\n"));
+      node.tooltip = new vscode.MarkdownString(tooltipLines.join("\n\n"));
     } else {
       const sslStatus = config.ssl
         ? config.rejectUnauthorized !== false
@@ -366,7 +366,7 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
         `User: \`${config.username ?? "—"}\``,
         `SSL: \`${sslStatus}\``,
       ];
-      node.tooltip = new vscode.MarkdownString(tooltipLines.join("\n"));
+      node.tooltip = new vscode.MarkdownString(tooltipLines.join("\n\n"));
     }
 
     if (!connected && !connecting) {

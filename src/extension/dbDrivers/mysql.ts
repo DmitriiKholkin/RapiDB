@@ -15,6 +15,8 @@ import type {
   DatabaseInfo,
   FilterConditionResult,
   FilterOperator,
+  PersistedEditCheckOptions,
+  PersistedEditCheckResult,
   QueryResult,
   SchemaInfo,
   TableInfo,
@@ -48,22 +50,11 @@ export function splitMySQLScript(sql: string): string[] {
 
   while (i < n) {
     const atLineStart = i === 0 || sql[i - 1] === "\n";
-    if (atLineStart && /^DELIMITER[ \t]/i.test(sql.slice(i))) {
-      const s = buf.trim();
-      if (s) stmts.push(s);
-      buf = "";
-
-      i += 9;
+    if (atLineStart && /^DELIMITER\b/i.test(sql.slice(i))) {
+      while (i < n && sql[i] !== " " && sql[i] !== "\t") i++;
       while (i < n && (sql[i] === " " || sql[i] === "\t")) i++;
-
       let nd = "";
-      while (
-        i < n &&
-        sql[i] !== " " &&
-        sql[i] !== "\t" &&
-        sql[i] !== "\r" &&
-        sql[i] !== "\n"
-      ) {
+      while (i < n && sql[i] !== "\r" && sql[i] !== "\n") {
         nd += sql[i++];
       }
       if (nd) delim = nd;
@@ -164,8 +155,9 @@ export function splitMySQLScript(sql: string): string[] {
           sql[i] === "\t" ||
           sql[i] === "\r" ||
           sql[i] === "\n")
-      )
+      ) {
         i++;
+      }
       continue;
     }
 
@@ -1110,6 +1102,73 @@ export class MySQLDriver extends BaseDBDriver {
       if (formatted !== null) return formatted;
     }
     return value;
+  }
+
+  override checkPersistedEdit(
+    column: ColumnTypeMeta,
+    expectedValue: unknown,
+    options?: PersistedEditCheckOptions,
+  ): PersistedEditCheckResult | null {
+    if (column.category === "integer") {
+      return this.checkExactNumericPersistedEdit(
+        column,
+        expectedValue,
+        { precision: null, scale: 0 },
+        options,
+      );
+    }
+
+    const baseType = mysqlTypeName(column.nativeType);
+
+    if (column.category === "decimal") {
+      if (!["decimal", "numeric", "dec", "fixed"].includes(baseType)) {
+        return null;
+      }
+
+      return this.checkExactNumericPersistedEdit(
+        column,
+        expectedValue,
+        this.parseExactNumericConstraint(column.nativeType),
+        options,
+      );
+    }
+
+    if (
+      column.category === "float" &&
+      this.isApproximateNumericType(column.nativeType)
+    ) {
+      const significantDigits = baseType === "float" ? 7 : 15;
+      return this.checkApproximateNumericPersistedEdit(
+        column,
+        expectedValue,
+        significantDigits,
+        options,
+      );
+    }
+
+    if (column.category === "boolean") {
+      return this.checkBooleanPersistedEdit(column, expectedValue, options);
+    }
+
+    if (column.category === "json") {
+      return this.checkJsonPersistedEdit(column, expectedValue, options);
+    }
+
+    if (column.category === "binary") {
+      return this.checkBinaryPersistedEdit(column, expectedValue, options);
+    }
+
+    if (
+      column.category === "enum" ||
+      column.category === "text" ||
+      column.category === "date" ||
+      column.category === "time" ||
+      column.category === "datetime"
+    ) {
+      return this.checkTextPersistedEdit(column, expectedValue, options);
+    }
+
+    return null;
   }
 
   // ─── MySQL filter building ───

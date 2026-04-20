@@ -7,6 +7,8 @@ import type {
   DatabaseInfo,
   FilterConditionResult,
   FilterOperator,
+  PersistedEditCheckOptions,
+  PersistedEditCheckResult,
   QueryResult,
   SchemaInfo,
   TableInfo,
@@ -850,6 +852,66 @@ export class SQLiteDriver extends BaseDBDriver {
     }
 
     return super.formatOutputValue(value, column);
+  }
+
+  override checkPersistedEdit(
+    column: ColumnTypeMeta,
+    expectedValue: unknown,
+    options?: PersistedEditCheckOptions,
+  ): PersistedEditCheckResult | null {
+    if (column.category === "integer") {
+      return this.checkExactNumericPersistedEdit(
+        column,
+        expectedValue,
+        { precision: null, scale: 0 },
+        options,
+      );
+    }
+
+    if (column.category === "decimal") {
+      return this.checkExactNumericPersistedEdit(
+        column,
+        expectedValue,
+        { precision: null, scale: null },
+        options,
+      );
+    }
+
+    if (column.category === "float") {
+      return this.checkApproximateNumericPersistedEdit(
+        column,
+        expectedValue,
+        15,
+        options,
+      );
+    }
+
+    if (column.category === "boolean") {
+      return this.checkBooleanPersistedEdit(column, expectedValue, options);
+    }
+
+    if (column.category === "binary") {
+      return this.checkBinaryPersistedEdit(column, expectedValue, options);
+    }
+
+    if (column.category === "json") {
+      return this.checkJsonPersistedEdit(column, expectedValue, options);
+    }
+
+    if (column.category === "uuid") {
+      return this.checkUuidPersistedEdit(column, expectedValue, options);
+    }
+
+    if (
+      column.category === "text" ||
+      column.category === "date" ||
+      column.category === "time" ||
+      column.category === "datetime"
+    ) {
+      return this.checkTextPersistedEdit(column, expectedValue, options);
+    }
+
+    return null;
   }
 
   override normalizeFilterValue(

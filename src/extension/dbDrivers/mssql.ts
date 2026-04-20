@@ -12,6 +12,8 @@ import type {
   FilterConditionResult,
   FilterOperator,
   PaginationResult,
+  PersistedEditCheckOptions,
+  PersistedEditCheckResult,
   QueryResult,
   SchemaInfo,
   TableInfo,
@@ -24,7 +26,7 @@ import {
   NULL_SENTINEL,
 } from "./types";
 
-type MssqlSqlType = (() => mssql.ISqlType) | mssql.ISqlType;
+type MssqlSqlType = Parameters<mssql.Request["input"]>[1];
 
 interface NamedRow {
   name: string;
@@ -101,6 +103,20 @@ const MSSQL_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const INTEGER_RE = /^-?\d+$/;
 const DECIMAL_RE = /^-?\d+(?:\.\d+)?$/;
+
+function mssqlFloatSignificantDigits(nativeType: string): number {
+  const normalized = nativeType.toLowerCase().trim();
+  if (normalized.startsWith("real")) {
+    return 7;
+  }
+
+  const match = /^float(?:\((\d+)\))?/.exec(normalized);
+  if (!match?.[1]) {
+    return 15;
+  }
+
+  return Number.parseInt(match[1], 10) <= 24 ? 7 : 15;
+}
 
 type MssqlTemporalDate = Date & { nanosecondDelta?: number };
 
@@ -1135,6 +1151,86 @@ export class MSSQLDriver extends BaseDBDriver {
       if (formatted !== null) return formatted;
     }
     return value;
+  }
+
+  override checkPersistedEdit(
+    column: ColumnTypeMeta,
+    expectedValue: unknown,
+    options?: PersistedEditCheckOptions,
+  ): PersistedEditCheckResult | null {
+    if (column.category === "integer") {
+      return this.checkExactNumericPersistedEdit(
+        column,
+        expectedValue,
+        { precision: null, scale: 0 },
+        options,
+      );
+    }
+
+    const baseType = baseTypeName(column.nativeType);
+
+    if (column.category === "decimal") {
+      if (baseType === "money") {
+        return this.checkExactNumericPersistedEdit(
+          column,
+          expectedValue,
+          { precision: 19, scale: 4 },
+          options,
+        );
+      }
+
+      if (baseType === "smallmoney") {
+        return this.checkExactNumericPersistedEdit(
+          column,
+          expectedValue,
+          { precision: 10, scale: 4 },
+          options,
+        );
+      }
+
+      if (!["decimal", "numeric"].includes(baseType)) {
+        return null;
+      }
+
+      return this.checkExactNumericPersistedEdit(
+        column,
+        expectedValue,
+        this.parseExactNumericConstraint(column.nativeType),
+        options,
+      );
+    }
+
+    if (column.category === "float") {
+      return this.checkApproximateNumericPersistedEdit(
+        column,
+        expectedValue,
+        mssqlFloatSignificantDigits(column.nativeType),
+        options,
+      );
+    }
+
+    if (column.category === "boolean") {
+      return this.checkBooleanPersistedEdit(column, expectedValue, options);
+    }
+
+    if (column.category === "uuid") {
+      return this.checkUuidPersistedEdit(column, expectedValue, options);
+    }
+
+    if (column.category === "binary") {
+      return this.checkBinaryPersistedEdit(column, expectedValue, options);
+    }
+
+    if (
+      column.category === "text" ||
+      column.category === "date" ||
+      column.category === "time" ||
+      column.category === "datetime"
+    ) {
+      return this.checkTextPersistedEdit(column, expectedValue, options);
+    }
+
+    return null;
   }
 
   override buildFilterCondition(

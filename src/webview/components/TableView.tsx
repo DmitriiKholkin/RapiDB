@@ -21,6 +21,7 @@ import {
   NULL_SENTINEL,
   serializeFilterDrafts,
 } from "../../shared/tableTypes";
+import type { ApplyResultPayload } from "../../shared/webviewContracts";
 import type { PendingEdits, Row } from "../types";
 import { type Column, calcColWidths } from "../utils/columnSizing";
 import { onMessage, postMessage } from "../utils/messaging";
@@ -105,6 +106,146 @@ function canEditColumn(column?: ColumnMeta): column is ColumnMeta {
   return !!column && column.editable && !column.isAutoIncrement;
 }
 
+function clonePendingEdits(pendingEdits: PendingEdits): PendingEdits {
+  return new Map(
+    [...pendingEdits.entries()].map(([rowIdx, columnMap]) => [
+      rowIdx,
+      new Map(columnMap),
+    ]),
+  );
+}
+
+type PendingRestoreState = Map<string, Map<string, unknown>>;
+
+function stablePrimaryKeyPart(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => stablePrimaryKeyPart(item));
+  }
+
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entryValue]) => [key, stablePrimaryKeyPart(entryValue)]),
+    );
+  }
+
+  return value;
+}
+
+function rowPrimaryKeySignature(
+  row: Row | undefined,
+  primaryKeyColumns: readonly string[],
+): string | null {
+  if (!row || primaryKeyColumns.length === 0) {
+    return null;
+  }
+
+  const keyEntries: Array<[string, unknown]> = [];
+  for (const columnName of primaryKeyColumns) {
+    if (!(columnName in row)) {
+      return null;
+    }
+
+    keyEntries.push([columnName, stablePrimaryKeyPart(row[columnName])]);
+  }
+
+  return JSON.stringify(keyEntries);
+}
+
+function buildPendingRestoreState(
+  pendingEdits: PendingEdits,
+  rows: readonly Row[],
+  primaryKeyColumns: readonly string[],
+): PendingRestoreState {
+  const restoreState: PendingRestoreState = new Map();
+
+  for (const [rowIdx, columnMap] of pendingEdits.entries()) {
+    const signature = rowPrimaryKeySignature(rows[rowIdx], primaryKeyColumns);
+    if (!signature) {
+      continue;
+    }
+
+    restoreState.set(signature, new Map(columnMap));
+  }
+
+  return restoreState;
+}
+
+function restorePendingEdits(
+  restoreState: PendingRestoreState | null,
+  rows: readonly Row[],
+  primaryKeyColumns: readonly string[],
+): PendingEdits {
+  if (!restoreState || restoreState.size === 0) {
+    return new Map();
+  }
+
+  const restored: PendingEdits = new Map();
+
+  rows.forEach((row, rowIdx) => {
+    const signature = rowPrimaryKeySignature(row, primaryKeyColumns);
+    if (!signature) {
+      return;
+    }
+
+    const columnMap = restoreState.get(signature);
+    if (columnMap) {
+      restored.set(rowIdx, new Map(columnMap));
+    }
+  });
+
+  return restored;
+}
+
+function getRetainedPendingEdits(
+  pendingEdits: PendingEdits,
+  updateRowIndexes: readonly number[],
+  rowOutcomes?: ApplyResultPayload["rowOutcomes"],
+  failedRows?: readonly number[],
+): PendingEdits {
+  const retainedUpdateIndexes = new Set<number>();
+
+  if (rowOutcomes && rowOutcomes.length > 0) {
+    for (const outcome of rowOutcomes) {
+      if (outcome.status !== "applied" && outcome.status !== "skipped") {
+        retainedUpdateIndexes.add(outcome.rowIndex);
+      }
+    }
+  } else if (failedRows && failedRows.length > 0) {
+    for (const rowIndex of failedRows) {
+      retainedUpdateIndexes.add(rowIndex);
+    }
+  }
+
+  if (retainedUpdateIndexes.size === 0) {
+    return new Map();
+  }
+
+  const nextPending: PendingEdits = new Map();
+  for (const updateIndex of retainedUpdateIndexes) {
+    const rowIdx = updateRowIndexes[updateIndex];
+    if (rowIdx === undefined) {
+      continue;
+    }
+
+    const rowPending = pendingEdits.get(rowIdx);
+    if (rowPending) {
+      nextPending.set(rowIdx, new Map(rowPending));
+    }
+  }
+
+  return nextPending;
+}
+
 export function TableView({
   connectionId: _connectionId,
   database: _database,
@@ -138,7 +279,10 @@ export function TableView({
     col: string;
   } | null>(null);
   const [applying, setApplying] = useState(false);
-  const [applyErr, setApplyErr] = useState<string | null>(null);
+  const [applyStatus, setApplyStatus] = useState<{
+    tone: "error" | "warning";
+    message: string;
+  } | null>(null);
   const [newRow, setNewRow] = useState<Row | null>(null);
   const [inserting, setInserting] = useState(false);
   const [mutErr, setMutErr] = useState<string | null>(null);
@@ -153,6 +297,9 @@ export function TableView({
   const colSizesInitedRef = useRef(false);
 
   const columnsRef = useRef<ColumnMeta[]>([]);
+  const applyPendingSnapshotRef = useRef<PendingEdits>(new Map());
+  const applyRowIndexesRef = useRef<number[]>([]);
+  const pendingRestoreRef = useRef<PendingRestoreState | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const scrollPreserveRef = useRef<number | null>(null);
@@ -254,7 +401,13 @@ export function TableView({
       setLoading(false);
       setFilterError(null);
       setSelected(new Set());
-      setPending(new Map());
+      const restoredPending = restorePendingEdits(
+        pendingRestoreRef.current,
+        r,
+        pkColsRef.current,
+      );
+      pendingRestoreRef.current = null;
+      setPending(restoredPending);
       setEditCell(null);
 
       const savedScroll = scrollPreserveRef.current;
@@ -266,7 +419,6 @@ export function TableView({
       } else {
         scrollRef.current?.scrollTo?.({ top: 0 });
       }
-      setApplyErr(null);
     });
     const unError = onMessage<{
       fetchId?: number;
@@ -284,18 +436,44 @@ export function TableView({
       setLoading(false);
     });
 
-    const unApply = onMessage<{ success: boolean; error?: string }>(
+    const unApply = onMessage<ApplyResultPayload>(
       "applyResult",
-      ({ success, error: e }) => {
+      ({ success, error: e, warning, failedRows, rowOutcomes }) => {
         setApplying(false);
         if (success) {
-          setApplyErr(null);
-          setPending(new Map());
+          const nextPending = getRetainedPendingEdits(
+            applyPendingSnapshotRef.current,
+            applyRowIndexesRef.current,
+            rowOutcomes,
+            failedRows,
+          );
+          setPending(nextPending);
+          setApplyStatus(
+            warning
+              ? {
+                  tone: "warning",
+                  message: warning,
+                }
+              : null,
+          );
+          const restoreState = buildPendingRestoreState(
+            nextPending,
+            rowsRef.current,
+            pkColsRef.current,
+          );
+          pendingRestoreRef.current =
+            restoreState.size > 0 ? restoreState : null;
           scrollPreserveRef.current = scrollRef.current?.scrollTop ?? null;
           fetchPage();
         } else {
-          setApplyErr(e ?? "Apply failed — all changes were rolled back");
+          pendingRestoreRef.current = null;
+          setApplyStatus({
+            tone: "error",
+            message: e ?? "Apply failed — all changes were rolled back",
+          });
         }
+        applyPendingSnapshotRef.current = new Map();
+        applyRowIndexesRef.current = [];
       },
     );
 
@@ -412,7 +590,9 @@ export function TableView({
       return;
     }
     setApplying(true);
-    setApplyErr(null);
+    setApplyStatus(null);
+    applyPendingSnapshotRef.current = clonePendingEdits(pendingEdits);
+    applyRowIndexesRef.current = [...pendingEdits.keys()];
     const updates = [...pendingEdits.entries()].map(([rowIdx, colMap]) => ({
       primaryKeys: Object.fromEntries(
         pkColsRef.current.map((k) => [k, rowsRef.current[rowIdx][k]]),
@@ -423,9 +603,10 @@ export function TableView({
   }, [pendingEdits, applying]);
 
   const revertChanges = useCallback(() => {
+    pendingRestoreRef.current = null;
     setPending(new Map());
     setEditCell(null);
-    setApplyErr(null);
+    setApplyStatus(null);
   }, []);
 
   const commitCellEdit = useCallback(
@@ -476,7 +657,7 @@ export function TableView({
         return;
       }
       setEditCell({ rowIdx, col: col.name });
-      setApplyErr(null);
+      setApplyStatus(null);
     },
     [isView],
   );
@@ -800,7 +981,7 @@ export function TableView({
       </div>
 
       {}
-      {!isView && (pendingCount > 0 || applyErr) && (
+      {!isView && (pendingCount > 0 || applyStatus) && (
         <div
           style={{
             flexShrink: 0,
@@ -809,13 +990,18 @@ export function TableView({
             display: "flex",
             alignItems: "center",
             gap: 8,
-            background: applyErr
-              ? "var(--vscode-inputValidation-errorBackground, rgba(200,50,50,0.1))"
-              : "rgba(200,150,0,0.08)",
-            borderBottom: `1px solid ${applyErr ? "var(--vscode-inputValidation-errorBorder, rgba(200,50,50,0.4))" : "rgba(200,150,0,0.3)"}`,
+            background:
+              applyStatus?.tone === "error"
+                ? "var(--vscode-inputValidation-errorBackground, rgba(200,50,50,0.1))"
+                : "rgba(200,150,0,0.08)",
+            borderBottom: `1px solid ${
+              applyStatus?.tone === "error"
+                ? "var(--vscode-inputValidation-errorBorder, rgba(200,50,50,0.4))"
+                : "rgba(200,150,0,0.3)"
+            }`,
           }}
         >
-          {pendingCount > 0 && !applyErr && (
+          {pendingCount > 0 && applyStatus?.tone !== "error" && (
             <span
               style={{
                 fontSize: 12,
@@ -827,17 +1013,20 @@ export function TableView({
               changes
             </span>
           )}
-          {applyErr && (
+          {applyStatus && (
             <span
               style={{
                 fontSize: 12,
-                color: "var(--vscode-errorForeground)",
+                color:
+                  applyStatus.tone === "error"
+                    ? "var(--vscode-errorForeground)"
+                    : "var(--vscode-editorWarning-foreground, #cca700)",
                 flex: 1,
               }}
             >
               <>
                 <Icon name="warning" size={13} style={{ marginRight: 4 }} />
-                {applyErr}
+                {applyStatus.message}
               </>
             </span>
           )}
@@ -861,11 +1050,11 @@ export function TableView({
               </button>
             </>
           )}
-          {applyErr && pendingCount === 0 && (
+          {applyStatus && pendingCount === 0 && (
             <button
               type="button"
               style={btn("ghost")}
-              onClick={() => setApplyErr(null)}
+              onClick={() => setApplyStatus(null)}
               title="Dismiss"
             >
               <Icon name="close" size={13} />

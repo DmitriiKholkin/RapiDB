@@ -8,6 +8,8 @@ import type {
   IDBDriver,
   IndexMeta,
   PaginationResult,
+  PersistedEditCheckOptions,
+  PersistedEditCheckResult,
   QueryResult,
   SchemaInfo,
   TableInfo,
@@ -188,6 +190,474 @@ function invalidFilterInputError(columnName: string, expected: string): Error {
   return new Error(`[RapiDB Filter] Column ${columnName} expects ${expected}.`);
 }
 
+const PERSISTED_EDIT_NULL_TOKEN = "\x00__RAPIDB_PERSISTED_EDIT_NULL__\x00";
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+interface ExactNumericConstraint {
+  precision: number | null;
+  scale: number | null;
+}
+
+interface CanonicalPersistedEditValue {
+  canonical: string;
+}
+
+type PersistedEditCanonicalizer = (
+  value: unknown,
+) => CanonicalPersistedEditValue | null;
+
+interface CanonicalExactNumericValue {
+  canonical: string;
+  integerDigits: number;
+  fractionDigits: number;
+  scaleOverflow: boolean;
+}
+
+function parseTypePrecisionScale(nativeType: string): ExactNumericConstraint {
+  const match = /\((\d+)(?:\s*,\s*(-?\d+))?\)/.exec(nativeType);
+  if (!match) {
+    return { precision: null, scale: null };
+  }
+
+  return {
+    precision: Number.parseInt(match[1], 10),
+    scale: match[2] === undefined ? null : Number.parseInt(match[2], 10),
+  };
+}
+
+function numberToDecimalString(value: number): string {
+  const raw = value.toString();
+  if (!/[eE]/.test(raw)) {
+    return raw;
+  }
+
+  const [mantissa, exponentText] = raw.toLowerCase().split("e");
+  const exponent = Number.parseInt(exponentText, 10);
+  const sign = mantissa.startsWith("-") ? "-" : "";
+  const unsignedMantissa = mantissa.replace(/^[+-]/, "");
+  const [integerPart, fractionPart = ""] = unsignedMantissa.split(".");
+  const digits = `${integerPart}${fractionPart}`;
+  const decimalIndex = integerPart.length + exponent;
+
+  if (decimalIndex <= 0) {
+    return `${sign}0.${"0".repeat(Math.abs(decimalIndex))}${digits}`;
+  }
+
+  if (decimalIndex >= digits.length) {
+    return `${sign}${digits}${"0".repeat(decimalIndex - digits.length)}`;
+  }
+
+  return `${sign}${digits.slice(0, decimalIndex)}.${digits.slice(decimalIndex)}`;
+}
+
+function parseDecimalString(value: unknown): string | null {
+  if (value === null || value === undefined || value === NULL_SENTINEL) {
+    return null;
+  }
+
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? numberToDecimalString(value) : null;
+  }
+
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed === "" ? null : trimmed;
+}
+
+function canonicalizeExactNumeric(
+  value: unknown,
+  scale: number | null,
+): CanonicalExactNumericValue | null {
+  const raw = parseDecimalString(value);
+  if (raw === null) {
+    return null;
+  }
+
+  const match = /^([+-])?(?:(\d+)(?:\.(\d*))?|\.(\d+))$/.exec(raw);
+  if (!match) {
+    return null;
+  }
+
+  const sign = match[1] === "-" ? "-" : "";
+  const integerPart = match[2] ?? "0";
+  const fractionPart = match[3] ?? match[4] ?? "";
+  const normalizedInteger = integerPart.replace(/^0+(?=\d)/, "");
+
+  if (scale !== null) {
+    if (scale < 0) {
+      return null;
+    }
+
+    const overflowDigits = fractionPart.slice(scale);
+    const scaleOverflow = /[1-9]/.test(overflowDigits);
+    const normalizedFraction = fractionPart.slice(0, scale).padEnd(scale, "0");
+    const isZero =
+      normalizedInteger.replace(/^0+/, "") === "" &&
+      /^0*$/.test(normalizedFraction);
+    const integerDigits =
+      normalizedInteger.replace(/^0+/, "") === ""
+        ? 1
+        : normalizedInteger.replace(/^0+/, "").length;
+
+    return {
+      canonical:
+        scale === 0
+          ? isZero
+            ? "0"
+            : `${sign}${normalizedInteger.replace(/^0+/, "") || "0"}`
+          : `${isZero ? "" : sign}${normalizedInteger.replace(/^0+/, "") || "0"}.${normalizedFraction}`,
+      integerDigits,
+      fractionDigits: normalizedFraction.length,
+      scaleOverflow,
+    };
+  }
+
+  const trimmedFraction = fractionPart.replace(/0+$/, "");
+  const normalizedInt = normalizedInteger.replace(/^0+/, "") || "0";
+  const isZero = normalizedInt === "0" && trimmedFraction === "";
+
+  return {
+    canonical:
+      `${isZero ? "" : sign}${normalizedInt}${trimmedFraction ? `.${trimmedFraction}` : ""}` ||
+      "0",
+    integerDigits: normalizedInt === "0" ? 1 : normalizedInt.length,
+    fractionDigits: trimmedFraction.length,
+    scaleOverflow: false,
+  };
+}
+
+function formatDiagnosticValue(value: unknown): string {
+  if (value === null) return "NULL";
+  if (value === undefined) return "<missing>";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function buildValidationMessage(
+  columnName: string,
+  constraint: ExactNumericConstraint,
+  canonical: CanonicalExactNumericValue,
+): string | null {
+  if (canonical.scaleOverflow && constraint.scale !== null) {
+    return `Column "${columnName}" accepts at most ${constraint.scale} fractional digit${constraint.scale === 1 ? "" : "s"}.`;
+  }
+
+  if (constraint.precision !== null) {
+    if (constraint.scale !== null) {
+      const allowedIntegerDigits = Math.max(
+        constraint.precision - constraint.scale,
+        0,
+      );
+      if (canonical.integerDigits > allowedIntegerDigits) {
+        return `Column "${columnName}" exceeds precision ${constraint.precision} with scale ${constraint.scale}.`;
+      }
+    } else if (
+      canonical.integerDigits + canonical.fractionDigits >
+      constraint.precision
+    ) {
+      return `Column "${columnName}" exceeds precision ${constraint.precision}.`;
+    }
+  }
+
+  return null;
+}
+
+function canonicalizeNullishPersistedEditValue(
+  value: unknown,
+): CanonicalPersistedEditValue | null {
+  if (value === NULL_SENTINEL || value === null) {
+    return { canonical: PERSISTED_EDIT_NULL_TOKEN };
+  }
+
+  return null;
+}
+
+function canonicalizeTextPersistedEditValue(
+  value: unknown,
+): CanonicalPersistedEditValue | null {
+  const nullish = canonicalizeNullishPersistedEditValue(value);
+  if (nullish) {
+    return nullish;
+  }
+
+  if (typeof value === "string") {
+    return { canonical: value };
+  }
+
+  if (
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    typeof value === "bigint"
+  ) {
+    return { canonical: String(value) };
+  }
+
+  return null;
+}
+
+function canonicalizeBooleanPersistedEditValue(
+  value: unknown,
+): CanonicalPersistedEditValue | null {
+  const nullish = canonicalizeNullishPersistedEditValue(value);
+  if (nullish) {
+    return nullish;
+  }
+
+  if (value === true || value === 1) {
+    return { canonical: "true" };
+  }
+
+  if (value === false || value === 0) {
+    return { canonical: "false" };
+  }
+
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (["true", "t", "1"].includes(normalized)) {
+    return { canonical: "true" };
+  }
+
+  if (["false", "f", "0"].includes(normalized)) {
+    return { canonical: "false" };
+  }
+
+  return null;
+}
+
+function canonicalizeUuidPersistedEditValue(
+  value: unknown,
+): CanonicalPersistedEditValue | null {
+  const nullish = canonicalizeNullishPersistedEditValue(value);
+  if (nullish) {
+    return nullish;
+  }
+
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (!UUID_RE.test(normalized)) {
+    return null;
+  }
+
+  return { canonical: normalized };
+}
+
+function stableJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => stableJsonValue(item));
+  }
+
+  if (value !== null && typeof value === "object") {
+    const proto = Object.getPrototypeOf(value);
+    if (proto === Object.prototype || proto === null) {
+      return Object.fromEntries(
+        Object.keys(value)
+          .sort()
+          .map((key) => [
+            key,
+            stableJsonValue((value as Record<string, unknown>)[key]),
+          ]),
+      );
+    }
+  }
+
+  return value;
+}
+
+function canonicalizeJsonPersistedEditValue(
+  value: unknown,
+): CanonicalPersistedEditValue | null {
+  const nullish = canonicalizeNullishPersistedEditValue(value);
+  if (nullish) {
+    return nullish;
+  }
+
+  let parsed = value;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed === "") {
+      return null;
+    }
+
+    try {
+      parsed = JSON.parse(trimmed) as unknown;
+    } catch {
+      return null;
+    }
+  }
+
+  try {
+    return { canonical: JSON.stringify(stableJsonValue(parsed)) };
+  } catch {
+    return null;
+  }
+}
+
+function canonicalizeJsonArrayPersistedEditValue(
+  value: unknown,
+): CanonicalPersistedEditValue | null {
+  const nullish = canonicalizeNullishPersistedEditValue(value);
+  if (nullish) {
+    return nullish;
+  }
+
+  let parsed = value;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed === "") {
+      return null;
+    }
+
+    try {
+      parsed = JSON.parse(trimmed) as unknown;
+    } catch {
+      return null;
+    }
+  }
+
+  if (!Array.isArray(parsed)) {
+    return null;
+  }
+
+  try {
+    return { canonical: JSON.stringify(stableJsonValue(parsed)) };
+  } catch {
+    return null;
+  }
+}
+
+function toPersistedEditBuffer(value: unknown): Buffer | null {
+  if (Buffer.isBuffer(value)) {
+    return value;
+  }
+
+  if (value instanceof Uint8Array) {
+    return Buffer.from(value);
+  }
+
+  if (value instanceof ArrayBuffer) {
+    return Buffer.from(new Uint8Array(value));
+  }
+
+  return null;
+}
+
+function canonicalizeBinaryPersistedEditValue(
+  value: unknown,
+): CanonicalPersistedEditValue | null {
+  const nullish = canonicalizeNullishPersistedEditValue(value);
+  if (nullish) {
+    return nullish;
+  }
+
+  const buffer = toPersistedEditBuffer(value);
+  if (buffer) {
+    return { canonical: hexFromBuffer(buffer).toLowerCase() };
+  }
+
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  if (value === "") {
+    return { canonical: "" };
+  }
+
+  if (!isHexLike(value)) {
+    return null;
+  }
+
+  return {
+    canonical: hexFromBuffer(parseHexToBuffer(value)).toLowerCase(),
+  };
+}
+
+function canonicalizeApproximateNumericPersistedEditValue(
+  value: unknown,
+  significantDigits: number,
+): CanonicalPersistedEditValue | null {
+  const nullish = canonicalizeNullishPersistedEditValue(value);
+  if (nullish) {
+    return nullish;
+  }
+
+  const raw = parseDecimalString(value);
+  if (raw === null) {
+    return null;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  return {
+    canonical: Number.parseFloat(
+      parsed.toPrecision(significantDigits),
+    ).toString(),
+  };
+}
+
+function findApproximateNumericPrecisionLoss(
+  value: unknown,
+  significantDigits: number,
+): { roundedValue: string } | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const raw = parseDecimalString(value);
+  if (raw === null) {
+    return null;
+  }
+
+  const requested = canonicalizeExactNumeric(raw, null);
+  if (!requested) {
+    return null;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  const roundedNumber = Number.parseFloat(
+    parsed.toPrecision(significantDigits),
+  );
+  const rounded = canonicalizeExactNumeric(
+    numberToDecimalString(roundedNumber),
+    null,
+  );
+  if (!rounded || requested.canonical === rounded.canonical) {
+    return null;
+  }
+
+  return {
+    roundedValue: rounded.canonical,
+  };
+}
+
 // ─── Abstract base driver ───
 
 export abstract class BaseDBDriver implements IDBDriver {
@@ -272,7 +742,7 @@ export abstract class BaseDBDriver implements IDBDriver {
   }
 
   protected isEditable(_nativeType: string, category: TypeCategory): boolean {
-    return category !== "lob";
+    return category !== "lob" && category !== "other";
   }
 
   // ─── SQL helpers ───
@@ -369,6 +839,258 @@ export abstract class BaseDBDriver implements IDBDriver {
     }
 
     return value;
+  }
+
+  checkPersistedEdit(
+    _column: ColumnTypeMeta,
+    _expectedValue: unknown,
+    _options?: PersistedEditCheckOptions,
+  ): PersistedEditCheckResult | null {
+    return null;
+  }
+
+  protected parseExactNumericConstraint(
+    nativeType: string,
+  ): ExactNumericConstraint {
+    return parseTypePrecisionScale(nativeType);
+  }
+
+  protected checkExactNumericPersistedEdit(
+    column: ColumnTypeMeta,
+    expectedValue: unknown,
+    constraint: ExactNumericConstraint | null,
+    options?: PersistedEditCheckOptions,
+  ): PersistedEditCheckResult | null {
+    if (!constraint) {
+      return null;
+    }
+
+    const expectedNullish =
+      canonicalizeNullishPersistedEditValue(expectedValue);
+    if (expectedNullish) {
+      if (options === undefined) {
+        return {
+          ok: true,
+          shouldVerify: true,
+        };
+      }
+
+      const actualNullish = canonicalizeNullishPersistedEditValue(
+        options.persistedValue,
+      );
+      if (
+        !actualNullish ||
+        actualNullish.canonical !== expectedNullish.canonical
+      ) {
+        return {
+          ok: false,
+          shouldVerify: true,
+          message: `${column.name} stored ${formatDiagnosticValue(options.persistedValue)} instead of ${formatDiagnosticValue(expectedValue)}`,
+        };
+      }
+
+      return {
+        ok: true,
+        shouldVerify: true,
+      };
+    }
+
+    const expected = canonicalizeExactNumeric(expectedValue, constraint.scale);
+    if (!expected) {
+      return null;
+    }
+
+    if (options === undefined) {
+      const message = buildValidationMessage(column.name, constraint, expected);
+      if (message) {
+        return {
+          ok: false,
+          shouldVerify: false,
+          message,
+        };
+      }
+
+      return {
+        ok: true,
+        shouldVerify: true,
+      };
+    }
+
+    const actual = canonicalizeExactNumeric(
+      options.persistedValue,
+      constraint.scale,
+    );
+    if (!actual || actual.canonical !== expected.canonical) {
+      return {
+        ok: false,
+        shouldVerify: true,
+        message: `${column.name} stored ${formatDiagnosticValue(options.persistedValue)} instead of ${formatDiagnosticValue(expectedValue)}`,
+      };
+    }
+
+    return {
+      ok: true,
+      shouldVerify: true,
+    };
+  }
+
+  protected checkNormalizedPersistedEdit(
+    column: ColumnTypeMeta,
+    expectedValue: unknown,
+    options: PersistedEditCheckOptions | undefined,
+    canonicalize: PersistedEditCanonicalizer,
+    invalidMessage?: string,
+  ): PersistedEditCheckResult | null {
+    const expected = canonicalize(expectedValue);
+    if (!expected) {
+      return invalidMessage
+        ? {
+            ok: false,
+            shouldVerify: false,
+            message: invalidMessage,
+          }
+        : null;
+    }
+
+    if (options === undefined) {
+      return {
+        ok: true,
+        shouldVerify: true,
+      };
+    }
+
+    const actual = canonicalize(options.persistedValue);
+    if (!actual || actual.canonical !== expected.canonical) {
+      return {
+        ok: false,
+        shouldVerify: true,
+        message: `${column.name} stored ${formatDiagnosticValue(options.persistedValue)} instead of ${formatDiagnosticValue(expectedValue)}`,
+      };
+    }
+
+    return {
+      ok: true,
+      shouldVerify: true,
+    };
+  }
+
+  protected checkTextPersistedEdit(
+    column: ColumnTypeMeta,
+    expectedValue: unknown,
+    options?: PersistedEditCheckOptions,
+  ): PersistedEditCheckResult | null {
+    return this.checkNormalizedPersistedEdit(
+      column,
+      expectedValue,
+      options,
+      canonicalizeTextPersistedEditValue,
+      `Column "${column.name}" expects a text value.`,
+    );
+  }
+
+  protected checkBooleanPersistedEdit(
+    column: ColumnTypeMeta,
+    expectedValue: unknown,
+    options?: PersistedEditCheckOptions,
+  ): PersistedEditCheckResult | null {
+    return this.checkNormalizedPersistedEdit(
+      column,
+      expectedValue,
+      options,
+      canonicalizeBooleanPersistedEditValue,
+      `Column "${column.name}" expects true or false.`,
+    );
+  }
+
+  protected checkUuidPersistedEdit(
+    column: ColumnTypeMeta,
+    expectedValue: unknown,
+    options?: PersistedEditCheckOptions,
+  ): PersistedEditCheckResult | null {
+    return this.checkNormalizedPersistedEdit(
+      column,
+      expectedValue,
+      options,
+      canonicalizeUuidPersistedEditValue,
+      `Column "${column.name}" expects a valid UUID.`,
+    );
+  }
+
+  protected checkJsonPersistedEdit(
+    column: ColumnTypeMeta,
+    expectedValue: unknown,
+    options?: PersistedEditCheckOptions,
+  ): PersistedEditCheckResult | null {
+    return this.checkNormalizedPersistedEdit(
+      column,
+      expectedValue,
+      options,
+      canonicalizeJsonPersistedEditValue,
+      `Column "${column.name}" expects valid JSON.`,
+    );
+  }
+
+  protected checkJsonArrayPersistedEdit(
+    column: ColumnTypeMeta,
+    expectedValue: unknown,
+    options?: PersistedEditCheckOptions,
+  ): PersistedEditCheckResult | null {
+    return this.checkNormalizedPersistedEdit(
+      column,
+      expectedValue,
+      options,
+      canonicalizeJsonArrayPersistedEditValue,
+      `Column "${column.name}" expects a JSON array value.`,
+    );
+  }
+
+  protected checkBinaryPersistedEdit(
+    column: ColumnTypeMeta,
+    expectedValue: unknown,
+    options?: PersistedEditCheckOptions,
+  ): PersistedEditCheckResult | null {
+    return this.checkNormalizedPersistedEdit(
+      column,
+      expectedValue,
+      options,
+      canonicalizeBinaryPersistedEditValue,
+      `Column "${column.name}" expects a hex value like \\xDEADBEEF.`,
+    );
+  }
+
+  protected checkApproximateNumericPersistedEdit(
+    column: ColumnTypeMeta,
+    expectedValue: unknown,
+    significantDigits: number,
+    options?: PersistedEditCheckOptions,
+  ): PersistedEditCheckResult | null {
+    if (options === undefined) {
+      const precisionLoss = findApproximateNumericPrecisionLoss(
+        expectedValue,
+        significantDigits,
+      );
+      if (precisionLoss) {
+        return {
+          ok: false,
+          shouldVerify: false,
+          message:
+            `Column "${column.name}" exceeds the reliable precision of this approximate numeric type ` +
+            `(${significantDigits} significant digits) and would round to ${precisionLoss.roundedValue}.`,
+        };
+      }
+    }
+
+    return this.checkNormalizedPersistedEdit(
+      column,
+      expectedValue,
+      options,
+      (value) =>
+        canonicalizeApproximateNumericPersistedEditValue(
+          value,
+          significantDigits,
+        ),
+      `Column "${column.name}" expects a numeric value.`,
+    );
   }
 
   normalizeFilterValue(

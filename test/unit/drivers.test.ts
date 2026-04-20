@@ -250,6 +250,326 @@ describe("cross-driver type capability parity", () => {
   });
 });
 
+describe("driver-owned persisted edit checks", () => {
+  it.each([
+    ["Postgres", pg, "numeric(10,2)", "123.523"],
+    ["MySQL", my, "decimal(10,2)", "123.523"],
+    ["MSSQL", ms, "money", "12.12345"],
+    ["Oracle", ora, "NUMBER(10,2)", "123.523"],
+  ] as const)("rejects out-of-scale exact numerics in %s before write", (_name, driver, nativeType, invalidValue) => {
+    const result = driver.checkPersistedEdit(
+      col({
+        name: "amount",
+        type: nativeType,
+        category: "decimal",
+        nativeType,
+      }),
+      invalidValue,
+    );
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        ok: false,
+        shouldVerify: false,
+      }),
+    );
+    expect(result?.message).toContain("amount");
+  });
+
+  it.each([
+    ["Postgres", pg, "numeric(10,2)", "123.45", "123.40"],
+    ["MySQL", my, "decimal(10,2)", "123.45", "123.40"],
+    ["MSSQL", ms, "money", "12.3400", "12.0000"],
+    ["Oracle", ora, "NUMBER(10,2)", "123.45", "123.40"],
+  ] as const)("compares persisted exact numerics in %s during verification", (_name, driver, nativeType, expectedValue, persistedValue) => {
+    const result = driver.checkPersistedEdit(
+      col({
+        name: "amount",
+        type: nativeType,
+        category: "decimal",
+        nativeType,
+      }),
+      expectedValue,
+      { persistedValue },
+    );
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        ok: false,
+        shouldVerify: true,
+      }),
+    );
+    expect(result?.message).toContain("stored");
+  });
+
+  it("verifies SQLite declared DECIMAL values without enforcing a fixed scale", () => {
+    const column = col({
+      name: "amount",
+      type: "DECIMAL(10,2)",
+      category: "decimal",
+      nativeType: "DECIMAL(10,2)",
+    });
+
+    expect(lite.checkPersistedEdit(column, "123.523")).toEqual(
+      expect.objectContaining({
+        ok: true,
+        shouldVerify: true,
+      }),
+    );
+    expect(
+      lite.checkPersistedEdit(column, "123.52", { persistedValue: "123.00" }),
+    ).toEqual(
+      expect.objectContaining({
+        ok: false,
+        shouldVerify: true,
+      }),
+    );
+  });
+
+  it.each([
+    ["Postgres", pg, "numeric(10,2)"],
+    ["MySQL", my, "decimal(10,2)"],
+    ["MSSQL", ms, "money"],
+    ["Oracle", ora, "NUMBER(10,2)"],
+    ["SQLite", lite, "DECIMAL(10,2)"],
+  ] as const)("verifies NULL exact numerics in %s instead of silently opting out", (_name, driver, nativeType) => {
+    const column = col({
+      name: "amount",
+      type: nativeType,
+      category: "decimal",
+      nativeType,
+    });
+
+    expect(driver.checkPersistedEdit(column, null)).toEqual(
+      expect.objectContaining({
+        ok: true,
+        shouldVerify: true,
+      }),
+    );
+    expect(
+      driver.checkPersistedEdit(column, null, { persistedValue: "0.00" }),
+    ).toEqual(
+      expect.objectContaining({
+        ok: false,
+        shouldVerify: true,
+      }),
+    );
+  });
+
+  it.each([
+    ["Postgres json", pg, "jsonb", '{"a":1}', "json", true],
+    ["Postgres array", pg, "integer[]", "[1,2,3]", "array", true],
+    [
+      "Postgres uuid",
+      pg,
+      "uuid",
+      "550e8400-e29b-41d4-a716-446655440000",
+      "uuid",
+      true,
+    ],
+    ["Postgres bytea", pg, "bytea", "\\xdeadbeef", "binary", true],
+    ["Postgres text", pg, "text", "alpha", "text", true],
+    ["Postgres float", pg, "float8", "12.5", "float", true],
+    ["MySQL json", my, "json", '{"a":1}', "json", true],
+    ["MySQL enum", my, "enum('a','b')", "a", "enum", true],
+    ["MySQL blob", my, "blob", "\\xdeadbeef", "binary", true],
+    ["MySQL text", my, "varchar(32)", "alpha", "text", true],
+    ["MySQL float", my, "double", "12.5", "float", true],
+    [
+      "MSSQL uuid",
+      ms,
+      "uniqueidentifier",
+      "550e8400-e29b-41d4-a716-446655440000",
+      "uuid",
+      true,
+    ],
+    ["MSSQL varbinary", ms, "varbinary(16)", "\\xdeadbeef", "binary", true],
+    ["MSSQL text", ms, "nvarchar(64)", "alpha", "text", true],
+    [
+      "MSSQL datetime",
+      ms,
+      "datetime2(3)",
+      "2026-04-20 12:34:56.123",
+      "datetime",
+      true,
+    ],
+    ["Oracle RAW", ora, "RAW(16)", "\\xdeadbeef", "binary", true],
+    ["Oracle text", ora, "VARCHAR2(32)", "alpha", "text", true],
+    [
+      "Oracle datetime",
+      ora,
+      "TIMESTAMP(3)",
+      "2026-04-20 12:34:56.123",
+      "datetime",
+      true,
+    ],
+    ["Oracle float", ora, "BINARY_DOUBLE", "12.5", "float", true],
+    ["SQLite json", lite, "JSON", '{"a":1}', "json", true],
+    [
+      "SQLite uuid",
+      lite,
+      "UUID",
+      "550e8400-e29b-41d4-a716-446655440000",
+      "uuid",
+      true,
+    ],
+    ["SQLite blob", lite, "BLOB", "\\xdeadbeef", "binary", true],
+    [
+      "SQLite datetime",
+      lite,
+      "DATETIME",
+      "2026-04-20 12:34:56",
+      "datetime",
+      true,
+    ],
+    ["SQLite float", lite, "DOUBLE", "12.5", "float", true],
+  ] as const)("returns an explicit edit check for %s", (_name, driver, type, value, category, editable) => {
+    const column = enrichTestColumn(driver, {
+      name: "value_col",
+      type,
+      nullable: true,
+      isPrimaryKey: false,
+      isForeignKey: false,
+    });
+
+    expect(column.category).toBe(category);
+    expect(column.editable).toBe(editable);
+    expect(driver.checkPersistedEdit(column, value)).toEqual(
+      expect.objectContaining({
+        ok: true,
+        shouldVerify: true,
+      }),
+    );
+  });
+
+  it.each([
+    ["Postgres", pg, "double precision", "1.12345678901234567", 15],
+    ["MySQL", my, "double", "1.12345678901234567", 15],
+    ["MySQL float", my, "float", "1.123456789", 7],
+    ["MSSQL", ms, "float", "1.12345678901234567", 15],
+    ["MSSQL real", ms, "real", "1.123456789", 7],
+    ["Oracle", ora, "BINARY_DOUBLE", "1.12345678901234567", 15],
+    ["Oracle BINARY_FLOAT", ora, "BINARY_FLOAT", "1.123456789", 7],
+    ["SQLite", lite, "DOUBLE", "1.12345678901234567", 15],
+    ["Postgres real", pg, "real", "1.123456789", 7],
+  ] as const)("rejects lossy approximate numerics before write in %s", (_name, driver, nativeType, invalidValue, significantDigits) => {
+    const column = enrichTestColumn(driver, {
+      name: "ratio",
+      type: nativeType,
+      nullable: true,
+      isPrimaryKey: false,
+      isForeignKey: false,
+    });
+
+    const result = driver.checkPersistedEdit(column, invalidValue);
+    expect(result).toEqual(
+      expect.objectContaining({
+        ok: false,
+        shouldVerify: false,
+      }),
+    );
+    expect(result?.message).toContain(
+      `${significantDigits} significant digits`,
+    );
+    expect(result?.message).toContain("would round to");
+  });
+
+  it.each([
+    ["Postgres", pg, "double precision", "1.2300000000000000000"],
+    ["MySQL", my, "double", "1.2300000000000000000"],
+    ["MySQL float", my, "float", "1.230000000"],
+    ["MSSQL", ms, "float", "1.2300000000000000000"],
+    ["MSSQL real", ms, "real", "1.230000000"],
+    ["Oracle", ora, "BINARY_DOUBLE", "1.2300000000000000000"],
+    ["Oracle BINARY_FLOAT", ora, "BINARY_FLOAT", "1.230000000"],
+    ["SQLite", lite, "DOUBLE", "1.2300000000000000000"],
+  ] as const)("allows approximate numerics with redundant trailing zeros in %s", (_name, driver, nativeType, value) => {
+    const column = enrichTestColumn(driver, {
+      name: "ratio",
+      type: nativeType,
+      nullable: true,
+      isPrimaryKey: false,
+      isForeignKey: false,
+    });
+
+    expect(driver.checkPersistedEdit(column, value)).toEqual(
+      expect.objectContaining({
+        ok: true,
+        shouldVerify: true,
+      }),
+    );
+  });
+
+  it.each([
+    ["Postgres", pg, "jsonb", "{bad json", "valid JSON"],
+    ["MySQL", my, "json", "{bad json", "valid JSON"],
+    ["SQLite", lite, "JSON", "{bad json", "valid JSON"],
+    ["Postgres", pg, "uuid", "not-a-uuid", "valid UUID"],
+    ["MSSQL", ms, "uniqueidentifier", "not-a-uuid", "valid UUID"],
+    ["SQLite", lite, "UUID", "not-a-uuid", "valid UUID"],
+    ["Postgres", pg, "bytea", "not-hex", "hex value"],
+    ["MySQL", my, "blob", "not-hex", "hex value"],
+    ["MSSQL", ms, "varbinary(16)", "not-hex", "hex value"],
+    ["Oracle", ora, "RAW(16)", "not-hex", "hex value"],
+    ["SQLite", lite, "BLOB", "not-hex", "hex value"],
+    ["Postgres", pg, "integer[]", "not-an-array", "JSON array"],
+  ] as const)("rejects malformed %s edit input before write", (_name, driver, type, invalidValue, messageFragment) => {
+    const column = enrichTestColumn(driver, {
+      name: "payload",
+      type,
+      nullable: true,
+      isPrimaryKey: false,
+      isForeignKey: false,
+    });
+
+    const result = driver.checkPersistedEdit(column, invalidValue);
+    expect(result).toEqual(
+      expect.objectContaining({
+        ok: false,
+        shouldVerify: false,
+      }),
+    );
+    expect(result?.message).toContain(messageFragment);
+  });
+
+  it.each([
+    ["Postgres", pg, "jsonb"],
+    ["MySQL", my, "json"],
+    ["SQLite", lite, "JSON"],
+  ] as const)("canonicalizes JSON key order during verification in %s", (_name, driver, nativeType) => {
+    const result = driver.checkPersistedEdit(
+      col({
+        name: "payload",
+        type: nativeType,
+        category: "json",
+        nativeType,
+      }),
+      '{"a":1,"b":2}',
+      { persistedValue: '{"b":2,"a":1}' },
+    );
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        ok: true,
+        shouldVerify: true,
+      }),
+    );
+  });
+
+  it("keeps PostgreSQL money columns read-only because locale-aware formatting is not safely verifiable", () => {
+    const column = enrichTestColumn(pg, {
+      name: "price",
+      type: "money",
+      nullable: true,
+      isPrimaryKey: false,
+      isForeignKey: false,
+    });
+
+    expect(column.category).toBe("decimal");
+    expect(column.editable).toBe(false);
+  });
+});
+
 // ────────────────────────────────────────────
 // PostgreSQL Driver
 // ────────────────────────────────────────────

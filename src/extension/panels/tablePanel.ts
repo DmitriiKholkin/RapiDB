@@ -3,7 +3,10 @@ import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 import { coerceFilterExpressions } from "../../shared/tableTypes";
-import type { WebviewMessageEnvelope } from "../../shared/webviewContracts";
+import type {
+  ApplyResultPayload,
+  WebviewMessageEnvelope,
+} from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import {
   applyChangesTransactional,
@@ -229,7 +232,7 @@ export class TablePanel {
           updates?: RowUpdate[];
         };
         try {
-          const result = await applyChangesTransactional(
+          const result: ApplyResultPayload = await applyChangesTransactional(
             this.cm,
             this.connectionId,
             this.database,
@@ -238,6 +241,9 @@ export class TablePanel {
             (updates ?? []) as RowUpdate[],
             this.cachedColumns,
           );
+          if (result.warning) {
+            void vscode.window.showWarningMessage(`[RapiDB] ${result.warning}`);
+          }
           send("applyResult", result);
         } catch (err: unknown) {
           const error = normalizeUnknownError(err);

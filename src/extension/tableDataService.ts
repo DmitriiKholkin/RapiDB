@@ -1,3 +1,7 @@
+import type {
+  ApplyResultPayload,
+  ApplyRowOutcome,
+} from "../shared/webviewContracts";
 import type { ConnectionManager } from "./connectionManager";
 import type {
   ColumnTypeMeta,
@@ -35,10 +39,21 @@ export interface RowUpdate {
   changes: Record<string, unknown>;
 }
 
-export interface ApplyResult {
-  success: boolean;
-  error?: string;
-  failedRows?: number[];
+export type ApplyResult = ApplyResultPayload;
+
+interface VerificationTarget {
+  rowIndex: number;
+  primaryKeys: Record<string, unknown>;
+  values: Array<{
+    column: ColumnDef;
+    expectedValue: unknown;
+  }>;
+}
+
+interface VerificationFailure {
+  rowIndex: number;
+  columns: string[];
+  message: string;
 }
 
 // ─── Service ───
@@ -346,6 +361,125 @@ export class TableDataService {
   }
 }
 
+function summarizeOutcomeMessages(
+  prefix: string,
+  outcomes: ApplyRowOutcome[],
+): string {
+  const details = outcomes
+    .slice(0, 2)
+    .map(
+      (outcome) =>
+        `Row ${outcome.rowIndex + 1}: ${outcome.message ?? "Unknown issue"}`,
+    )
+    .join(" ");
+  const suffix =
+    outcomes.length > 2
+      ? ` ${outcomes.length - 2} more row(s) had the same issue.`
+      : "";
+  return `${prefix} ${details}${suffix}`.trim();
+}
+
+function buildSkippedOutcome(
+  rowIndex: number,
+  message: string,
+  success = true,
+): ApplyRowOutcome {
+  return {
+    rowIndex,
+    success,
+    status: "skipped",
+    message,
+  };
+}
+
+async function verifyExactNumericUpdates(
+  driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>,
+  database: string,
+  schema: string,
+  table: string,
+  cols: ColumnDef[],
+  targets: VerificationTarget[],
+): Promise<VerificationFailure[]> {
+  const qt = driver.qualifiedTableName(database, schema, table);
+  const colMap = new Map(cols.map((col) => [col.name, col]));
+  const failures: VerificationFailure[] = [];
+
+  for (const target of targets) {
+    if (target.values.length === 0) {
+      continue;
+    }
+
+    try {
+      const params: unknown[] = [];
+      const whereParts = Object.entries(target.primaryKeys).map(
+        ([columnName, rawValue]) => {
+          const meta = colMap.get(columnName);
+          params.push(
+            meta ? driver.coerceInputValue(rawValue, meta) : rawValue,
+          );
+          const placeholder = meta
+            ? driver.buildInsertValueExpr(meta, params.length)
+            : "?";
+          return `${driver.quoteIdentifier(columnName)} = ${placeholder}`;
+        },
+      );
+
+      const sql = `SELECT ${target.values
+        .map(
+          ({ column }, index) =>
+            `${driver.quoteIdentifier(column.name)} AS ${driver.quoteIdentifier(`__col_${index}`)}`,
+        )
+        .join(", ")} FROM ${qt} WHERE ${whereParts.join(" AND ")}`;
+      const result = await driver.query(sql, params);
+      const row = result.rows[0];
+      if (!row) {
+        failures.push({
+          rowIndex: target.rowIndex,
+          columns: target.values.map(({ column }) => column.name),
+          message: "The updated row could not be read back for verification.",
+        });
+        continue;
+      }
+
+      const mismatchColumns: string[] = [];
+      const mismatchMessages: string[] = [];
+
+      target.values.forEach(({ column, expectedValue }, index) => {
+        const check = driver.checkPersistedEdit(column, expectedValue, {
+          persistedValue: row[`__col_${index}`],
+        });
+
+        if (check && !check.ok) {
+          mismatchColumns.push(column.name);
+          mismatchMessages.push(
+            check.message ??
+              `${column.name} could not be confirmed against the persisted value.`,
+          );
+        }
+      });
+
+      if (mismatchColumns.length > 0) {
+        failures.push({
+          rowIndex: target.rowIndex,
+          columns: mismatchColumns,
+          message: mismatchMessages.join("; "),
+        });
+      }
+    } catch (err: unknown) {
+      failures.push({
+        rowIndex: target.rowIndex,
+        columns: target.values.map(({ column }) => column.name),
+        message:
+          err instanceof Error
+            ? `Verification query failed: ${err.message}`
+            : `Verification query failed: ${String(err)}`,
+      });
+    }
+  }
+
+  return failures;
+}
+
 export async function applyChangesTransactional(
   cm: ConnectionManager,
   connectionId: string,
@@ -355,14 +489,67 @@ export async function applyChangesTransactional(
   updates: RowUpdate[],
   cols: ColumnDef[],
 ): Promise<ApplyResult> {
-  if (updates.length === 0) return { success: true };
+  if (updates.length === 0) return { success: true, rowOutcomes: [] };
 
   const driver = cm.getDriver(connectionId);
   if (!driver) return { success: false, error: "Not connected" };
 
-  const operations: TransactionOperation[] = [];
+  const colMap = new Map(cols.map((col) => [col.name, col]));
 
-  for (const { primaryKeys, changes } of updates) {
+  const operations: TransactionOperation[] = [];
+  const validationFailures = new Map<number, ApplyRowOutcome>();
+  const verificationTargets = new Map<number, VerificationTarget>();
+  const skippedRows = new Set<number>();
+
+  for (const [rowIndex, { primaryKeys, changes }] of updates.entries()) {
+    const columnMessages: string[] = [];
+    const invalidColumns: string[] = [];
+    const verificationValues: VerificationTarget["values"] = [];
+    const verificationPrimaryKeys = { ...primaryKeys };
+
+    for (const [columnName, nextValue] of Object.entries(changes)) {
+      const column = colMap.get(columnName);
+      if (!column) {
+        continue;
+      }
+
+      const check = driver.checkPersistedEdit(column, nextValue);
+      if (!check) {
+        continue;
+      }
+
+      if (!check.ok) {
+        columnMessages.push(
+          check.message ??
+            `Column "${columnName}" failed persisted-value validation.`,
+        );
+        invalidColumns.push(columnName);
+        continue;
+      }
+
+      if (check.shouldVerify) {
+        verificationValues.push({
+          column,
+          expectedValue: nextValue,
+        });
+      }
+
+      if (column.isPrimaryKey) {
+        verificationPrimaryKeys[columnName] = nextValue;
+      }
+    }
+
+    if (columnMessages.length > 0) {
+      validationFailures.set(rowIndex, {
+        rowIndex,
+        success: false,
+        status: "prevalidation_failed",
+        message: columnMessages.join(" "),
+        columns: invalidColumns,
+      });
+      continue;
+    }
+
     const op = buildUpdateRowSql(
       driver,
       database,
@@ -378,18 +565,126 @@ export async function applyChangesTransactional(
         params: op.params,
         checkAffectedRows: true,
       });
+      verificationTargets.set(rowIndex, {
+        rowIndex,
+        primaryKeys: verificationPrimaryKeys,
+        values: verificationValues,
+      });
+    } else {
+      skippedRows.add(rowIndex);
     }
   }
 
-  if (operations.length === 0) return { success: true };
+  if (validationFailures.size > 0) {
+    const rowOutcomes = updates.map((_, rowIndex) => {
+      const failure = validationFailures.get(rowIndex);
+      if (failure) {
+        return failure;
+      }
+
+      if (skippedRows.has(rowIndex)) {
+        return buildSkippedOutcome(rowIndex, "No editable changes to apply.");
+      }
+
+      return buildSkippedOutcome(
+        rowIndex,
+        "Not applied because another row failed validation.",
+        false,
+      );
+    });
+
+    return {
+      success: false,
+      error: summarizeOutcomeMessages(
+        "One or more edits were rejected before writing.",
+        rowOutcomes.filter(
+          (outcome) => outcome.status === "prevalidation_failed",
+        ),
+      ),
+      failedRows: [...validationFailures.keys()],
+      rowOutcomes,
+    };
+  }
+
+  if (operations.length === 0) {
+    return {
+      success: true,
+      rowOutcomes: updates.map((_, rowIndex) =>
+        buildSkippedOutcome(rowIndex, "No editable changes to apply."),
+      ),
+    };
+  }
 
   try {
     await driver.runTransaction(operations);
-    return { success: true };
+
+    const verificationFailures = await verifyExactNumericUpdates(
+      driver,
+      database,
+      schema,
+      table,
+      cols,
+      [...verificationTargets.values()],
+    );
+    const verificationFailureMap = new Map(
+      verificationFailures.map((failure) => [failure.rowIndex, failure]),
+    );
+
+    const rowOutcomes = updates.map((_, rowIndex) => {
+      if (skippedRows.has(rowIndex)) {
+        return buildSkippedOutcome(rowIndex, "No editable changes to apply.");
+      }
+
+      const verificationFailure = verificationFailureMap.get(rowIndex);
+      if (verificationFailure) {
+        return {
+          rowIndex,
+          success: false,
+          status: "verification_failed",
+          message: verificationFailure.message,
+          columns: verificationFailure.columns,
+        } satisfies ApplyRowOutcome;
+      }
+
+      return {
+        rowIndex,
+        success: true,
+        status: "applied",
+      } satisfies ApplyRowOutcome;
+    });
+
+    if (verificationFailures.length > 0) {
+      const warning = summarizeOutcomeMessages(
+        "Some edits were written but could not be confirmed exactly.",
+        rowOutcomes.filter(
+          (outcome) => outcome.status === "verification_failed",
+        ),
+      );
+
+      return {
+        success: true,
+        warning,
+        failedRows: verificationFailures.map((failure) => failure.rowIndex),
+        rowOutcomes,
+      };
+    }
+
+    return { success: true, rowOutcomes };
   } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+
     return {
       success: false,
-      error: err instanceof Error ? err.message : String(err),
+      error: message,
+      rowOutcomes: updates.map((_, rowIndex) =>
+        skippedRows.has(rowIndex)
+          ? buildSkippedOutcome(rowIndex, "No editable changes to apply.")
+          : buildSkippedOutcome(
+              rowIndex,
+              `The transaction was rolled back: ${message}`,
+              false,
+            ),
+      ),
     };
   }
 }

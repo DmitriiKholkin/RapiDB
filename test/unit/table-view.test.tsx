@@ -83,6 +83,63 @@ function fetchMessageCount(): number {
   return getMessages("fetchPage").length;
 }
 
+async function renderEditableTable(
+  rows: Array<{ id: number; name: string }> = [{ id: 1, name: "Alice" }],
+): Promise<void> {
+  render(
+    <TableView
+      connectionId="conn1"
+      database="db"
+      schema="public"
+      table="users"
+    />,
+  );
+
+  emit("tableInit", {
+    columns: [
+      makeColumn({
+        name: "id",
+        type: "integer",
+        category: "integer",
+        isPrimaryKey: true,
+        filterable: false,
+        editable: false,
+        isAutoIncrement: true,
+      }),
+      makeColumn({ name: "name", type: "text" }),
+    ],
+    primaryKeyColumns: ["id"],
+  });
+  emit("tableData", {
+    rows,
+    totalCount: rows.length,
+  });
+
+  await waitFor(() => {
+    expect(screen.getByText(rows[0]?.name ?? "")).toBeDefined();
+  });
+}
+
+async function editCellValue(
+  currentValue: string,
+  nextValue: string,
+): Promise<void> {
+  const cell = screen.getByText(currentValue).closest("td");
+  expect(cell).not.toBeNull();
+
+  fireEvent.doubleClick(cell as HTMLElement);
+
+  const input = (await screen.findByDisplayValue(
+    currentValue,
+  )) as HTMLInputElement;
+  fireEvent.change(input, { target: { value: nextValue } });
+  fireEvent.keyDown(input, { key: "Enter" });
+
+  await waitFor(() => {
+    expect(screen.queryByDisplayValue(currentValue)).toBeNull();
+  });
+}
+
 async function waitForFetchFilters(
   previousCount: number,
   filters: unknown,
@@ -564,5 +621,205 @@ describe("TableView", () => {
           | undefined
       )?.filters,
     ).toEqual(activeFilters);
+  });
+
+  it("clears pending edits after a full successful apply", async () => {
+    await renderEditableTable();
+    await editCellValue("Alice", "Alicia");
+
+    expect(screen.getByText(/1 row with unsaved changes/i)).toBeDefined();
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply Changes" }));
+
+    expect(getLastMessage("applyChanges")?.payload).toEqual({
+      updates: [
+        {
+          primaryKeys: { id: 1 },
+          changes: { name: "Alicia" },
+        },
+      ],
+    });
+
+    emit("applyResult", {
+      success: true,
+      rowOutcomes: [{ rowIndex: 0, success: true, status: "applied" }],
+    });
+    emit("tableData", {
+      rows: [{ id: 1, name: "Alicia" }],
+      totalCount: 1,
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("button", { name: "Apply Changes" }),
+      ).toBeNull();
+    });
+
+    expect(screen.queryByText(/unsaved changes/i)).toBeNull();
+    expect(screen.queryByText(/could not be confirmed exactly/i)).toBeNull();
+    expect(screen.getByText("Alicia")).toBeDefined();
+  });
+
+  it("keeps verification-failed rows pending and shows the warning", async () => {
+    await renderEditableTable([
+      { id: 1, name: "Alice" },
+      { id: 2, name: "Bob" },
+    ]);
+    await editCellValue("Alice", "Alicia");
+    await editCellValue("Bob", "Bobby");
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply Changes" }));
+
+    emit("applyResult", {
+      success: true,
+      warning: "Some edits were written but could not be confirmed exactly.",
+      failedRows: [1],
+      rowOutcomes: [
+        { rowIndex: 0, success: true, status: "applied" },
+        {
+          rowIndex: 1,
+          success: false,
+          status: "verification_failed",
+          message: "Rounded by the database.",
+        },
+      ],
+    });
+    emit("tableData", {
+      rows: [
+        { id: 1, name: "Alicia" },
+        { id: 2, name: "Bob" },
+      ],
+      totalCount: 2,
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(
+          /Some edits were written but could not be confirmed exactly\./i,
+        ),
+      ).toBeDefined();
+    });
+
+    expect(screen.getByText(/1 row with unsaved changes/i)).toBeDefined();
+    expect(screen.queryByText(/2 rows with unsaved changes/i)).toBeNull();
+    expect(screen.getByText("Bobby")).toBeDefined();
+    expect(screen.getByRole("button", { name: "Apply Changes" })).toBeDefined();
+  });
+
+  it("restores retained edits by primary key after the refetch reorders rows", async () => {
+    await renderEditableTable([
+      { id: 1, name: "Alice" },
+      { id: 2, name: "Bob" },
+    ]);
+    await editCellValue("Alice", "Alicia");
+    await editCellValue("Bob", "Bobby");
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply Changes" }));
+
+    emit("applyResult", {
+      success: true,
+      warning: "Some edits were written but could not be confirmed exactly.",
+      failedRows: [1],
+      rowOutcomes: [
+        { rowIndex: 0, success: true, status: "applied" },
+        {
+          rowIndex: 1,
+          success: false,
+          status: "verification_failed",
+          message: "Rounded by the database.",
+        },
+      ],
+    });
+    emit("tableData", {
+      rows: [
+        { id: 2, name: "Bob" },
+        { id: 1, name: "Alicia" },
+      ],
+      totalCount: 2,
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(/1 row with unsaved changes/i)).toBeDefined();
+    });
+
+    expect(screen.getByText("Bobby")).toBeDefined();
+    expect(screen.queryByText("Alicia")).toBeDefined();
+    expect(screen.queryByText(/2 rows with unsaved changes/i)).toBeNull();
+  });
+
+  it("does not restore retained edits after the user reverts while the apply refetch is in flight", async () => {
+    await renderEditableTable();
+    await editCellValue("Alice", "Alicia");
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply Changes" }));
+
+    emit("applyResult", {
+      success: true,
+      warning: "Some edits were written but could not be confirmed exactly.",
+      failedRows: [0],
+      rowOutcomes: [
+        {
+          rowIndex: 0,
+          success: false,
+          status: "verification_failed",
+          message: "Rounded by the database.",
+        },
+      ],
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(/1 row with unsaved changes/i)).toBeDefined();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Revert All" }));
+
+    emit("tableData", {
+      rows: [{ id: 1, name: "Alice" }],
+      totalCount: 1,
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("button", { name: "Apply Changes" }),
+      ).toBeNull();
+    });
+
+    expect(screen.queryByText(/unsaved changes/i)).toBeNull();
+    expect(screen.queryByText(/could not be confirmed exactly/i)).toBeNull();
+    expect(screen.getByText("Alice")).toBeDefined();
+    expect(screen.queryByText("Alicia")).toBeNull();
+  });
+
+  it("keeps edits pending and shows the failure when apply is blocked", async () => {
+    await renderEditableTable();
+    await editCellValue("Alice", "Alicia");
+
+    const fetchCountBeforeApply = fetchMessageCount();
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply Changes" }));
+
+    emit("applyResult", {
+      success: false,
+      error: "One or more edits were rejected before writing.",
+      failedRows: [0],
+      rowOutcomes: [
+        {
+          rowIndex: 0,
+          success: false,
+          status: "prevalidation_failed",
+          message: "Scale exceeds the column definition.",
+        },
+      ],
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/One or more edits were rejected before writing\./i),
+      ).toBeDefined();
+    });
+
+    expect(fetchMessageCount()).toBe(fetchCountBeforeApply);
+    expect(screen.getByText("Alicia")).toBeDefined();
+    expect(screen.getByRole("button", { name: "Apply Changes" })).toBeDefined();
   });
 });

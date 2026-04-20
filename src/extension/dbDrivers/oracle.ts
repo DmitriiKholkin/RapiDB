@@ -10,6 +10,8 @@ import type {
   ForeignKeyMeta,
   IndexMeta,
   PaginationResult,
+  PersistedEditCheckOptions,
+  PersistedEditCheckResult,
   QueryResult,
   SchemaInfo,
   TableInfo,
@@ -1716,6 +1718,78 @@ export class OracleDriver extends BaseDBDriver {
     }
     // LOB-like values already consumed as string/Buffer via fetchAsString/fetchAsBuffer
     return super.formatOutputValue(value, column);
+  }
+
+  override checkPersistedEdit(
+    column: ColumnTypeMeta,
+    expectedValue: unknown,
+    options?: PersistedEditCheckOptions,
+  ): PersistedEditCheckResult | null {
+    const baseType = column.nativeType.toUpperCase().split("(")[0].trim();
+
+    if (column.category === "integer") {
+      const constraint =
+        baseType === "NUMBER"
+          ? (() => {
+              const parsed = this.parseExactNumericConstraint(
+                column.nativeType,
+              );
+              return {
+                precision: parsed.precision,
+                scale: parsed.scale ?? 0,
+              };
+            })()
+          : { precision: null, scale: 0 };
+
+      return this.checkExactNumericPersistedEdit(
+        column,
+        expectedValue,
+        constraint,
+        options,
+      );
+    }
+
+    if (column.category === "decimal") {
+      if (baseType !== "NUMBER") {
+        return null;
+      }
+
+      return this.checkExactNumericPersistedEdit(
+        column,
+        expectedValue,
+        this.parseExactNumericConstraint(column.nativeType),
+        options,
+      );
+    }
+
+    if (column.category === "float") {
+      const significantDigits = oracleFloatPrecision(column.nativeType);
+      if (significantDigits !== null) {
+        return this.checkApproximateNumericPersistedEdit(
+          column,
+          expectedValue,
+          significantDigits,
+          options,
+        );
+      }
+
+      return this.checkTextPersistedEdit(column, expectedValue, options);
+    }
+
+    if (column.category === "binary") {
+      return this.checkBinaryPersistedEdit(column, expectedValue, options);
+    }
+
+    if (
+      column.category === "text" ||
+      column.category === "date" ||
+      column.category === "time" ||
+      column.category === "datetime"
+    ) {
+      return this.checkTextPersistedEdit(column, expectedValue, options);
+    }
+
+    return null;
   }
 
   // ─── Oracle filter building ───

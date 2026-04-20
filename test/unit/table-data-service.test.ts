@@ -3,7 +3,11 @@ import type {
   ConnectionConfig,
   ConnectionManager,
 } from "../../src/extension/connectionManager";
+import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
+import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
 import { OracleDriver } from "../../src/extension/dbDrivers/oracle";
+import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
+import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
 import type {
   ColumnTypeMeta,
   IDBDriver,
@@ -17,6 +21,7 @@ import {
   type RowUpdate,
   TableDataService,
 } from "../../src/extension/tableDataService";
+import type { ConnectionType } from "../../src/shared/connectionTypes";
 import { StubDriver } from "./helpers";
 
 // ─── Mock driver factory ───
@@ -57,6 +62,7 @@ function makeMockDriver(overrides: Partial<IDBDriver> = {}): IDBDriver {
     },
     coerceInputValue: (v: unknown) => v,
     formatOutputValue: (v: unknown) => v,
+    checkPersistedEdit: () => null,
     normalizeFilterValue: baseDriver.normalizeFilterValue.bind(baseDriver),
     buildFilterCondition: vi.fn().mockReturnValue(null),
     buildInsertValueExpr: () => "?",
@@ -65,11 +71,14 @@ function makeMockDriver(overrides: Partial<IDBDriver> = {}): IDBDriver {
   } as unknown as IDBDriver;
 }
 
-function makeMockCM(driver: IDBDriver): ConnectionManager {
+function makeMockCM(
+  driver: IDBDriver,
+  connectionType: ConnectionType = "pg",
+): ConnectionManager {
   const cfg: ConnectionConfig = {
     id: "conn1",
     name: "test",
-    type: "pg",
+    type: connectionType,
     host: "localhost",
     port: 5432,
     database: "testdb",
@@ -80,6 +89,121 @@ function makeMockCM(driver: IDBDriver): ConnectionManager {
     getConnection: vi.fn().mockReturnValue(cfg),
     getDriver: vi.fn().mockReturnValue(driver),
   } as unknown as ConnectionManager;
+}
+
+function makeExactNumericColumns(nativeType = "numeric(10,2)"): ColumnDef[] {
+  return [
+    {
+      name: "id",
+      type: "integer",
+      nullable: false,
+      isPrimaryKey: true,
+      isForeignKey: false,
+      category: "integer",
+      nativeType: "integer",
+      filterable: true,
+      editable: true,
+      filterOperators: ["eq"],
+      isBoolean: false,
+    },
+    {
+      name: "amount",
+      type: nativeType,
+      nullable: true,
+      isPrimaryKey: false,
+      isForeignKey: false,
+      category: "decimal",
+      nativeType,
+      filterable: true,
+      editable: true,
+      filterOperators: ["eq"],
+      isBoolean: false,
+    },
+  ];
+}
+
+function makeJsonColumns(nativeType = "jsonb"): ColumnDef[] {
+  return [
+    {
+      name: "id",
+      type: "integer",
+      nullable: false,
+      isPrimaryKey: true,
+      isForeignKey: false,
+      category: "integer",
+      nativeType: "integer",
+      filterable: true,
+      editable: true,
+      filterOperators: ["eq"],
+      isBoolean: false,
+    },
+    {
+      name: "payload",
+      type: nativeType,
+      nullable: true,
+      isPrimaryKey: false,
+      isForeignKey: false,
+      category: "json",
+      nativeType,
+      filterable: true,
+      editable: true,
+      filterOperators: ["like"],
+      isBoolean: false,
+    },
+  ];
+}
+
+function makeFloatColumns(nativeType = "double precision"): ColumnDef[] {
+  return [
+    {
+      name: "id",
+      type: "integer",
+      nullable: false,
+      isPrimaryKey: true,
+      isForeignKey: false,
+      category: "integer",
+      nativeType: "integer",
+      filterable: true,
+      editable: true,
+      filterOperators: ["eq"],
+      isBoolean: false,
+    },
+    {
+      name: "ratio",
+      type: nativeType,
+      nullable: true,
+      isPrimaryKey: false,
+      isForeignKey: false,
+      category: "float",
+      nativeType,
+      filterable: true,
+      editable: true,
+      filterOperators: ["eq"],
+      isBoolean: false,
+    },
+  ];
+}
+
+function makeDriverConfig(type: ConnectionType): ConnectionConfig {
+  return {
+    id: `${type}-conn`,
+    name: type,
+    type,
+    host: "localhost",
+    port:
+      type === "pg"
+        ? 5432
+        : type === "mysql"
+          ? 3306
+          : type === "mssql"
+            ? 1433
+            : type === "oracle"
+              ? 1521
+              : 0,
+    database: "testdb",
+    username: "u",
+    password: "p",
+  };
 }
 
 function makeTestColumns(): ColumnDef[] {
@@ -1310,5 +1434,610 @@ describe("applyChangesTransactional", () => {
     );
     expect(result.success).toBe(false);
     expect(result.error).toContain("deadlock");
+  });
+
+  it("prevalidates exact numerics before writing for Oracle NUMBER(p,s)", async () => {
+    const mockRunTransaction = vi.fn();
+    const oracle = new OracleDriver(makeDriverConfig("oracle"));
+    const driver = makeMockDriver({
+      runTransaction: mockRunTransaction,
+      checkPersistedEdit: oracle.checkPersistedEdit.bind(oracle),
+    });
+    const cm = makeMockCM(driver, "oracle");
+
+    const result = await applyChangesTransactional(
+      cm,
+      "conn1",
+      "testdb",
+      "public",
+      "users",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { amount: "1234.523" },
+        },
+      ],
+      makeExactNumericColumns("NUMBER(10,2)"),
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("rejected before writing");
+    expect(result.failedRows).toEqual([0]);
+    expect(result.rowOutcomes).toEqual([
+      expect.objectContaining({
+        rowIndex: 0,
+        status: "prevalidation_failed",
+        success: false,
+        columns: ["amount"],
+      }),
+    ]);
+    expect(mockRunTransaction).not.toHaveBeenCalled();
+  });
+
+  it("prevalidates exact numerics before writing for PostgreSQL NUMERIC(p,s)", async () => {
+    const mockRunTransaction = vi.fn();
+    const postgres = new PostgresDriver(makeDriverConfig("pg"));
+    const driver = makeMockDriver({
+      runTransaction: mockRunTransaction,
+      checkPersistedEdit: postgres.checkPersistedEdit.bind(postgres),
+    });
+    const cm = makeMockCM(driver, "pg");
+
+    const result = await applyChangesTransactional(
+      cm,
+      "conn1",
+      "testdb",
+      "public",
+      "users",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { amount: "1234.523" },
+        },
+      ],
+      makeExactNumericColumns("numeric(10,2)"),
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("rejected before writing");
+    expect(result.failedRows).toEqual([0]);
+    expect(result.rowOutcomes).toEqual([
+      expect.objectContaining({
+        rowIndex: 0,
+        status: "prevalidation_failed",
+        success: false,
+      }),
+    ]);
+    expect(mockRunTransaction).not.toHaveBeenCalled();
+  });
+
+  it("prevalidates MSSQL money scale overflow before writing", async () => {
+    const mockRunTransaction = vi.fn();
+    const mssql = new MSSQLDriver(makeDriverConfig("mssql"));
+    const driver = makeMockDriver({
+      runTransaction: mockRunTransaction,
+      checkPersistedEdit: mssql.checkPersistedEdit.bind(mssql),
+    });
+    const cm = makeMockCM(driver, "mssql");
+
+    const result = await applyChangesTransactional(
+      cm,
+      "conn1",
+      "testdb",
+      "dbo",
+      "users",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { amount: "12.12345" },
+        },
+      ],
+      makeExactNumericColumns("money"),
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("rejected before writing");
+    expect(result.failedRows).toEqual([0]);
+    expect(result.rowOutcomes).toEqual([
+      expect.objectContaining({
+        rowIndex: 0,
+        status: "prevalidation_failed",
+        success: false,
+      }),
+    ]);
+    expect(mockRunTransaction).not.toHaveBeenCalled();
+  });
+
+  it("prevalidates MySQL DECIMAL(p,s) before writing", async () => {
+    const mockRunTransaction = vi.fn();
+    const mysql = new MySQLDriver(makeDriverConfig("mysql"));
+    const driver = makeMockDriver({
+      runTransaction: mockRunTransaction,
+      checkPersistedEdit: mysql.checkPersistedEdit.bind(mysql),
+    });
+    const cm = makeMockCM(driver, "mysql");
+
+    const result = await applyChangesTransactional(
+      cm,
+      "conn1",
+      "testdb",
+      "public",
+      "users",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { amount: "1234.523" },
+        },
+      ],
+      makeExactNumericColumns("decimal(10,2)"),
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("rejected before writing");
+    expect(result.failedRows).toEqual([0]);
+    expect(result.rowOutcomes).toEqual([
+      expect.objectContaining({
+        rowIndex: 0,
+        status: "prevalidation_failed",
+        success: false,
+      }),
+    ]);
+    expect(mockRunTransaction).not.toHaveBeenCalled();
+  });
+
+  it("prevalidates malformed JSON edits before writing", async () => {
+    const mockRunTransaction = vi.fn();
+    const postgres = new PostgresDriver(makeDriverConfig("pg"));
+    const driver = makeMockDriver({
+      runTransaction: mockRunTransaction,
+      checkPersistedEdit: postgres.checkPersistedEdit.bind(postgres),
+    });
+    const cm = makeMockCM(driver, "pg");
+
+    const result = await applyChangesTransactional(
+      cm,
+      "conn1",
+      "testdb",
+      "public",
+      "users",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { payload: "{bad json" },
+        },
+      ],
+      makeJsonColumns("jsonb"),
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("rejected before writing");
+    expect(result.failedRows).toEqual([0]);
+    expect(result.rowOutcomes).toEqual([
+      expect.objectContaining({
+        rowIndex: 0,
+        status: "prevalidation_failed",
+        success: false,
+        columns: ["payload"],
+      }),
+    ]);
+    expect(mockRunTransaction).not.toHaveBeenCalled();
+  });
+
+  it("prevalidates PostgreSQL double precision edits that exceed reliable float precision", async () => {
+    const mockRunTransaction = vi.fn();
+    const postgres = new PostgresDriver(makeDriverConfig("pg"));
+    const driver = makeMockDriver({
+      runTransaction: mockRunTransaction,
+      checkPersistedEdit: postgres.checkPersistedEdit.bind(postgres),
+    });
+    const cm = makeMockCM(driver, "pg");
+
+    const result = await applyChangesTransactional(
+      cm,
+      "conn1",
+      "testdb",
+      "public",
+      "users",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { ratio: "1.12345678901234567" },
+        },
+      ],
+      makeFloatColumns("double precision"),
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("rejected before writing");
+    expect(result.failedRows).toEqual([0]);
+    expect(result.rowOutcomes).toEqual([
+      expect.objectContaining({
+        rowIndex: 0,
+        status: "prevalidation_failed",
+        success: false,
+        columns: ["ratio"],
+      }),
+    ]);
+    expect(result.rowOutcomes?.[0]?.message).toContain("15 significant digits");
+    expect(result.rowOutcomes?.[0]?.message).toContain("would round to");
+    expect(mockRunTransaction).not.toHaveBeenCalled();
+  });
+
+  it("marks sibling rows as skipped when a driver hook prevalidation failure blocks the batch", async () => {
+    const mockRunTransaction = vi.fn();
+    const mockQuery = vi.fn();
+    const checkPersistedEdit = vi.fn(
+      (
+        column: ColumnTypeMeta,
+        expectedValue: unknown,
+        options?: { persistedValue: unknown },
+      ) => {
+        if (column.name !== "amount") {
+          return null;
+        }
+
+        if (options) {
+          return {
+            ok: true,
+            shouldVerify: true,
+          };
+        }
+
+        return expectedValue === "1234.523"
+          ? {
+              ok: false,
+              shouldVerify: false,
+              message: "Scale exceeds the column definition.",
+            }
+          : {
+              ok: true,
+              shouldVerify: true,
+            };
+      },
+    );
+    const driver = makeMockDriver({
+      runTransaction: mockRunTransaction,
+      query: mockQuery,
+      checkPersistedEdit,
+    });
+    const cm = makeMockCM(driver);
+
+    const result = await applyChangesTransactional(
+      cm,
+      "conn1",
+      "testdb",
+      "public",
+      "users",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { amount: "1234.523" },
+        },
+        {
+          primaryKeys: { id: 2 },
+          changes: { amount: "1234.52" },
+        },
+      ],
+      makeExactNumericColumns("numeric(10,2)"),
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("rejected before writing");
+    expect(result.failedRows).toEqual([0]);
+    expect(result.rowOutcomes).toEqual([
+      expect.objectContaining({
+        rowIndex: 0,
+        status: "prevalidation_failed",
+        success: false,
+        columns: ["amount"],
+        message: "Scale exceeds the column definition.",
+      }),
+      expect.objectContaining({
+        rowIndex: 1,
+        status: "skipped",
+        success: false,
+        message: "Not applied because another row failed validation.",
+      }),
+    ]);
+    expect(mockRunTransaction).not.toHaveBeenCalled();
+    expect(mockQuery).not.toHaveBeenCalled();
+  });
+
+  it("keeps no-op rows distinct when another row fails driver prevalidation", async () => {
+    const mockRunTransaction = vi.fn();
+    const checkPersistedEdit = vi.fn(
+      (
+        column: ColumnTypeMeta,
+        expectedValue: unknown,
+        options?: { persistedValue: unknown },
+      ) => {
+        if (column.name !== "amount") {
+          return null;
+        }
+
+        if (options) {
+          return {
+            ok: true,
+            shouldVerify: true,
+          };
+        }
+
+        return expectedValue === "1234.523"
+          ? {
+              ok: false,
+              shouldVerify: false,
+              message: "Scale exceeds the column definition.",
+            }
+          : {
+              ok: true,
+              shouldVerify: true,
+            };
+      },
+    );
+    const driver = makeMockDriver({
+      runTransaction: mockRunTransaction,
+      checkPersistedEdit,
+    });
+    const cm = makeMockCM(driver);
+
+    const result = await applyChangesTransactional(
+      cm,
+      "conn1",
+      "testdb",
+      "public",
+      "users",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { amount: "1234.523" },
+        },
+        {
+          primaryKeys: { id: 2 },
+          changes: { ignored: "stale client field" },
+        },
+      ],
+      makeExactNumericColumns("numeric(10,2)"),
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.rowOutcomes).toEqual([
+      expect.objectContaining({
+        rowIndex: 0,
+        status: "prevalidation_failed",
+        success: false,
+      }),
+      expect.objectContaining({
+        rowIndex: 1,
+        status: "skipped",
+        success: true,
+        message: "No editable changes to apply.",
+      }),
+    ]);
+    expect(mockRunTransaction).not.toHaveBeenCalled();
+  });
+
+  it("returns a warning when exact numeric read-back does not match the requested value", async () => {
+    const mockRunTransaction = vi.fn().mockResolvedValue(undefined);
+    const mockQuery = vi.fn().mockResolvedValue({
+      columns: ["amount"],
+      rows: [{ __col_0: "100.00" }],
+      rowCount: 1,
+      executionTimeMs: 0,
+    });
+    const oracle = new OracleDriver(makeDriverConfig("oracle"));
+    const driver = makeMockDriver({
+      runTransaction: mockRunTransaction,
+      query: mockQuery,
+      checkPersistedEdit: oracle.checkPersistedEdit.bind(oracle),
+    });
+    const cm = makeMockCM(driver, "oracle");
+
+    const result = await applyChangesTransactional(
+      cm,
+      "conn1",
+      "testdb",
+      "public",
+      "users",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { amount: "1234.52" },
+        },
+      ],
+      makeExactNumericColumns("NUMBER(10,2)"),
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.warning).toContain("could not be confirmed exactly");
+    expect(result.failedRows).toEqual([0]);
+    expect(result.rowOutcomes).toEqual([
+      expect.objectContaining({
+        rowIndex: 0,
+        status: "verification_failed",
+        success: false,
+      }),
+    ]);
+    expect(mockRunTransaction).toHaveBeenCalledTimes(1);
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a warning when a nullable exact numeric reads back as a non-null value", async () => {
+    const mockRunTransaction = vi.fn().mockResolvedValue(undefined);
+    const mockQuery = vi.fn().mockResolvedValue({
+      columns: ["amount"],
+      rows: [{ __col_0: "100.00" }],
+      rowCount: 1,
+      executionTimeMs: 0,
+    });
+    const postgres = new PostgresDriver(makeDriverConfig("pg"));
+    const driver = makeMockDriver({
+      runTransaction: mockRunTransaction,
+      query: mockQuery,
+      checkPersistedEdit: postgres.checkPersistedEdit.bind(postgres),
+    });
+    const cm = makeMockCM(driver, "pg");
+
+    const result = await applyChangesTransactional(
+      cm,
+      "conn1",
+      "testdb",
+      "public",
+      "users",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { amount: null },
+        },
+      ],
+      makeExactNumericColumns("numeric(10,2)"),
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.warning).toContain("could not be confirmed exactly");
+    expect(result.failedRows).toEqual([0]);
+    expect(result.rowOutcomes).toEqual([
+      expect.objectContaining({
+        rowIndex: 0,
+        status: "verification_failed",
+        success: false,
+      }),
+    ]);
+    expect(mockRunTransaction).toHaveBeenCalledTimes(1);
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+  });
+
+  it("verifies edited primary keys using the post-update key values", async () => {
+    const mockRunTransaction = vi.fn().mockResolvedValue(undefined);
+    const mockQuery = vi.fn().mockResolvedValue({
+      columns: ["id"],
+      rows: [{ __col_0: "2" }],
+      rowCount: 1,
+      executionTimeMs: 0,
+    });
+    const postgres = new PostgresDriver(makeDriverConfig("pg"));
+    const driver = makeMockDriver({
+      runTransaction: mockRunTransaction,
+      query: mockQuery,
+      checkPersistedEdit: postgres.checkPersistedEdit.bind(postgres),
+    });
+    const cm = makeMockCM(driver, "pg");
+
+    const result = await applyChangesTransactional(
+      cm,
+      "conn1",
+      "testdb",
+      "public",
+      "users",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { id: "2" },
+        },
+      ],
+      makeExactNumericColumns("numeric(10,2)"),
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.warning).toBeUndefined();
+    expect(result.rowOutcomes).toEqual([
+      expect.objectContaining({
+        rowIndex: 0,
+        status: "applied",
+        success: true,
+      }),
+    ]);
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+    expect(mockQuery.mock.calls[0]?.[0]).toContain('WHERE "id" = ?');
+    expect(mockQuery.mock.calls[0]?.[1]).toEqual(["2"]);
+  });
+
+  it("marks exact numeric edits as applied when read-back matches the requested value", async () => {
+    const mockRunTransaction = vi.fn().mockResolvedValue(undefined);
+    const mockQuery = vi.fn().mockResolvedValue({
+      columns: ["amount"],
+      rows: [{ __col_0: "1234.52" }],
+      rowCount: 1,
+      executionTimeMs: 0,
+    });
+    const postgres = new PostgresDriver(makeDriverConfig("pg"));
+    const driver = makeMockDriver({
+      runTransaction: mockRunTransaction,
+      query: mockQuery,
+      checkPersistedEdit: postgres.checkPersistedEdit.bind(postgres),
+    });
+    const cm = makeMockCM(driver, "pg");
+
+    const result = await applyChangesTransactional(
+      cm,
+      "conn1",
+      "testdb",
+      "public",
+      "users",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { amount: "1234.52" },
+        },
+      ],
+      makeExactNumericColumns("numeric(10,2)"),
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.warning).toBeUndefined();
+    expect(result.failedRows).toBeUndefined();
+    expect(result.rowOutcomes).toEqual([
+      expect.objectContaining({
+        rowIndex: 0,
+        status: "applied",
+        success: true,
+      }),
+    ]);
+    expect(mockRunTransaction).toHaveBeenCalledTimes(1);
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+    expect(mockQuery.mock.calls[0]?.[0]).toContain('AS "__col_0"');
+  });
+
+  it("skips decimal scale enforcement for SQLite declared DECIMAL types", async () => {
+    const mockRunTransaction = vi.fn().mockResolvedValue(undefined);
+    const mockQuery = vi.fn().mockResolvedValue({
+      columns: ["amount"],
+      rows: [{ __col_0: "1234.523" }],
+      rowCount: 1,
+      executionTimeMs: 0,
+    });
+    const sqlite = new SQLiteDriver(makeDriverConfig("sqlite"));
+    const driver = makeMockDriver({
+      runTransaction: mockRunTransaction,
+      query: mockQuery,
+      checkPersistedEdit: sqlite.checkPersistedEdit.bind(sqlite),
+    });
+    const cm = makeMockCM(driver, "sqlite");
+
+    const result = await applyChangesTransactional(
+      cm,
+      "conn1",
+      "testdb",
+      "main",
+      "users",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { amount: "1234.523" },
+        },
+      ],
+      makeExactNumericColumns("DECIMAL(10,2)"),
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.warning).toBeUndefined();
+    expect(result.rowOutcomes).toEqual([
+      expect.objectContaining({
+        rowIndex: 0,
+        status: "applied",
+        success: true,
+      }),
+    ]);
+    expect(mockRunTransaction).toHaveBeenCalledTimes(1);
+    expect(mockQuery).toHaveBeenCalledTimes(1);
   });
 });

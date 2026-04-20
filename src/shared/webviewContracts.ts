@@ -9,6 +9,28 @@ export interface WebviewMessageEnvelope<
   payload?: TPayload;
 }
 
+export type ApplyRowStatus =
+  | "applied"
+  | "skipped"
+  | "prevalidation_failed"
+  | "verification_failed";
+
+export interface ApplyRowOutcome {
+  rowIndex: number;
+  success: boolean;
+  status: ApplyRowStatus;
+  message?: string;
+  columns?: string[];
+}
+
+export interface ApplyResultPayload {
+  success: boolean;
+  error?: string;
+  warning?: string;
+  failedRows?: number[];
+  rowOutcomes?: ApplyRowOutcome[];
+}
+
 export interface QueryInitialState {
   view: "query";
   connectionId: string;
