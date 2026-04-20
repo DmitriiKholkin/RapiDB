@@ -15,6 +15,10 @@ import type {
   ForeignKeyMeta,
   IndexMeta,
 } from "../../src/shared/tableTypes";
+import {
+  categoryColor,
+  getStructuralBadgePresentation,
+} from "../../src/webview/types";
 import { SchemaView } from "../../src/webview/components/SchemaView";
 
 afterEach(cleanup);
@@ -141,6 +145,25 @@ describe("SchemaView", () => {
     ).toBeDefined();
   });
 
+  it("renders type badges without borders and keeps GEO readable", async () => {
+    await renderSchemaView("places");
+
+    emitSchemaData([
+      makeColumn({
+        name: "geom",
+        type: "geometry",
+        category: "spatial",
+        nativeType: "geometry",
+        editable: false,
+      }),
+    ]);
+
+    const badge = within(await findColumnRow("geom")).getByText("GEO");
+    expect(badge).toBeDefined();
+    expect((badge as HTMLElement).style.borderStyle).toBe("none");
+    expect((badge as HTMLElement).style.color).toBe(categoryColor("spatial"));
+  });
+
   it("does not show an FK badge when runtime payload has no FK metadata", async () => {
     await renderSchemaView("orders");
 
@@ -245,5 +268,71 @@ describe("SchemaView", () => {
     expect(screen.getByText("Indexes")).toBeDefined();
     expect(screen.getByText("orders_customer_id_idx")).toBeDefined();
     expect(screen.getByText("INDEX")).toBeDefined();
+  });
+
+  it("uses the shared structural badge palette for column and index badges", async () => {
+    await renderSchemaView("users");
+
+    emitSchemaData(
+      [
+        makeColumn({
+          name: "id",
+          type: "int",
+          category: "integer",
+          nativeType: "int",
+          isPrimaryKey: true,
+          isForeignKey: true,
+          isAutoIncrement: true,
+        }),
+      ],
+      [],
+      [
+        {
+          name: "users_pkey",
+          columns: ["id"],
+          unique: true,
+          primary: true,
+        },
+        {
+          name: "users_email_key",
+          columns: ["email"],
+          unique: true,
+          primary: false,
+        },
+        {
+          name: "users_created_idx",
+          columns: ["created_at"],
+          unique: false,
+          primary: false,
+        },
+      ],
+    );
+
+    const row = await findColumnRow("id");
+    const pkBadge = within(row).getByText("PK") as HTMLElement;
+    const fkBadge = within(row).getByText("FK") as HTMLElement;
+    const aiBadge = within(row).getByText("AI") as HTMLElement;
+    const primaryBadge = screen.getByText("PRIMARY") as HTMLElement;
+    const uniqueBadge = screen.getByText("UNIQUE") as HTMLElement;
+    const indexBadge = screen.getByText("INDEX") as HTMLElement;
+
+    expect(pkBadge.style.color).toBe(
+      getStructuralBadgePresentation("pk").foreground,
+    );
+    expect(fkBadge.style.color).toBe(
+      getStructuralBadgePresentation("fk").foreground,
+    );
+    expect(aiBadge.style.color).toBe(
+      getStructuralBadgePresentation("ai").foreground,
+    );
+    expect(primaryBadge.style.color).toBe(
+      getStructuralBadgePresentation("primary").foreground,
+    );
+    expect(uniqueBadge.style.color).toBe(
+      getStructuralBadgePresentation("unique").foreground,
+    );
+    expect(indexBadge.style.color).toBe(
+      getStructuralBadgePresentation("index").foreground,
+    );
   });
 });

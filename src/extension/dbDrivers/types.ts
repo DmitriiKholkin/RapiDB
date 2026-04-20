@@ -4,6 +4,7 @@ import type {
   FilterOperator,
   ForeignKeyMeta,
   IndexMeta,
+  QueryColumnMeta,
   TypeCategory,
 } from "../../shared/tableTypes";
 
@@ -15,6 +16,7 @@ export {
   type ForeignKeyMeta,
   type IndexMeta,
   NULL_SENTINEL,
+  type QueryColumnMeta,
   type ScalarFilterOperator,
   type TypeCategory,
 } from "../../shared/tableTypes";
@@ -37,6 +39,7 @@ export interface TableInfo {
 
 export interface QueryResult {
   columns: string[];
+  columnMeta?: QueryColumnMeta[];
   rows: Record<string, unknown>[];
   rowCount: number;
   executionTimeMs: number;

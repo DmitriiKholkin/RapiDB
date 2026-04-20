@@ -1,7 +1,12 @@
-// biome-ignore lint/style/useImportType: <explanation>
-import React, { useEffect, useState } from "react";
+// biome-ignore assist/source/organizeImports: React import order is intentional here.
+import React, {
+  useEffect,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from "react";
 import type { ColumnMeta, ForeignKeyMeta, IndexMeta } from "../types";
-import { categoryColor, categoryLabel } from "../types";
+import { getCategoryPresentation, getStructuralBadgePresentation } from "../types";
 import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
 
@@ -18,7 +23,7 @@ interface Props {
   table: string;
 }
 
-const th: React.CSSProperties = {
+const th: CSSProperties = {
   padding: "5px 12px",
   textAlign: "left",
   background: "var(--vscode-editorGroupHeader-tabsBackground)",
@@ -33,7 +38,7 @@ const th: React.CSSProperties = {
   userSelect: "none",
 };
 
-const td = (extra?: React.CSSProperties): React.CSSProperties => ({
+const td = (extra?: CSSProperties): CSSProperties => ({
   padding: "4px 12px",
   borderBottom: "1px solid var(--vscode-panel-border)",
   borderRight: "1px solid var(--vscode-panel-border)",
@@ -44,7 +49,12 @@ const td = (extra?: React.CSSProperties): React.CSSProperties => ({
   ...extra,
 });
 
-export function SchemaView({ connectionId, database, schema, table }: Props) {
+export function SchemaView({
+  connectionId: _connectionId,
+  database: _database,
+  schema,
+  table,
+}: Props) {
   const [data, setData] = useState<SchemaData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -161,7 +171,7 @@ export function SchemaView({ connectionId, database, schema, table }: Props) {
             <tbody>
               {foreignKeys.map((fk, i) => (
                 <FKRow
-                  key={fk.constraintName + i}
+                  key={`${fk.constraintName}:${fk.column}`}
                   fk={fk}
                   isEven={i % 2 === 0}
                   currentSchema={schema}
@@ -204,7 +214,7 @@ function Section({
 }: {
   title: string;
   count: number;
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   return (
     <div style={{ marginBottom: 28 }}>
@@ -272,34 +282,50 @@ function ColRow({
 
   const badges: React.ReactNode[] = [];
   if (col.isPrimaryKey) {
+    const presentation = getStructuralBadgePresentation("pk");
     badges.push(
       <Badge
         key="pk"
-        label="PK"
-        color="var(--vscode-charts-yellow, #cca700)"
+        label={presentation.label}
+        color={presentation.foreground}
+        background={presentation.badgeBackground}
+        border={presentation.badgeBorder}
       />,
     );
   }
   if (col.isForeignKey || foreignKeys.some((fk) => fk.column === col.name)) {
+    const presentation = getStructuralBadgePresentation("fk");
     badges.push(
-      <Badge key="fk" label="FK" color="var(--vscode-charts-blue, #4fc3f7)" />,
+      <Badge
+        key="fk"
+        label={presentation.label}
+        color={presentation.foreground}
+        background={presentation.badgeBackground}
+        border={presentation.badgeBorder}
+      />,
     );
   }
   if (col.isAutoIncrement) {
+    const presentation = getStructuralBadgePresentation("ai");
     badges.push(
       <Badge
         key="ai"
-        label="AI"
-        color="var(--vscode-charts-purple, #b48ead)"
+        label={presentation.label}
+        color={presentation.foreground}
+        background={presentation.badgeBackground}
+        border={presentation.badgeBorder}
       />,
     );
   }
   if (col.category) {
+    const categoryPresentation = getCategoryPresentation(col.category);
     badges.push(
       <Badge
         key="cat"
-        label={categoryLabel(col.category)}
-        color={categoryColor(col.category)}
+        label={categoryPresentation.label}
+        color={categoryPresentation.foreground}
+        background={categoryPresentation.badgeBackground}
+        border={categoryPresentation.badgeBorder}
       />,
     );
   }
@@ -402,26 +428,40 @@ function IdxRow({ idx, isEven }: { idx: IndexMeta; isEven: boolean }) {
       : "var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.04))";
 
   const typeBadges: React.ReactNode[] = [];
-  if (idx.primary)
+  if (idx.primary) {
+    const presentation = getStructuralBadgePresentation("primary");
     typeBadges.push(
       <Badge
         key="pk"
-        label="PRIMARY"
-        color="var(--vscode-charts-yellow, #cca700)"
+        label={presentation.label}
+        color={presentation.foreground}
+        background={presentation.badgeBackground}
+        border={presentation.badgeBorder}
       />,
     );
-  else if (idx.unique)
+  } else if (idx.unique) {
+    const presentation = getStructuralBadgePresentation("unique");
     typeBadges.push(
       <Badge
         key="u"
-        label="UNIQUE"
-        color="var(--vscode-charts-blue, #4fc3f7)"
+        label={presentation.label}
+        color={presentation.foreground}
+        background={presentation.badgeBackground}
+        border={presentation.badgeBorder}
       />,
     );
-  else
+  } else {
+    const presentation = getStructuralBadgePresentation("index");
     typeBadges.push(
-      <Badge key="i" label="INDEX" color="var(--vscode-disabledForeground)" />,
+      <Badge
+        key="i"
+        label={presentation.label}
+        color={presentation.foreground}
+        background={presentation.badgeBackground}
+        border={presentation.badgeBorder}
+      />,
     );
+  }
 
   return (
     <tr
@@ -438,16 +478,26 @@ function IdxRow({ idx, isEven }: { idx: IndexMeta; isEven: boolean }) {
   );
 }
 
-function Badge({ label, color }: { label: string; color: string }) {
+function Badge({
+  label,
+  color,
+  background = "var(--vscode-badge-background, rgba(128,128,128,0.16))",
+  border = "none",
+}: {
+  label: string;
+  color: string;
+  background?: string;
+  border?: CSSProperties["border"];
+}) {
   return (
     <span
       style={{
         fontSize: 9,
         padding: "1px 5px",
         borderRadius: 2,
-        background: `${color}22`,
+        backgroundColor: background,
         color,
-        border: `1px solid ${color}55`,
+        border,
         fontWeight: 700,
         letterSpacing: "0.05em",
         fontFamily: "var(--vscode-font-family, system-ui)",

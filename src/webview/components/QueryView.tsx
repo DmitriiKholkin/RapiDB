@@ -1,4 +1,4 @@
-// biome-ignore lint/style/useImportType: <explanation>
+// biome-ignore lint/style/useImportType: React is needed for JSX runtime typing in this file.
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   type QueryResult,
@@ -137,7 +137,7 @@ export function QueryView({
   useEffect(() => {
     setActiveConnection(connectionId);
     postMessage("getConnections");
-  }, [connectionId]);
+  }, [connectionId, setActiveConnection]);
 
   useEffect(() => {
     const id = activeConnectionId || connectionId;
@@ -154,14 +154,15 @@ export function QueryView({
     }
     schemaFetchedRef.current.add(id);
     postMessage("getSchema", { connectionId: id });
-  }, [activeConnectionId]);
+  }, [activeConnectionId, connectionId]);
 
   useEffect(() => {
     const unsubResult = onMessage<QueryResult>("queryResult", (payload) => {
-      if (payload.error) {
-        setError(payload.error);
+      const normalized = normalizeQueryResultPayload(payload);
+      if (normalized.error) {
+        setError(normalized.error);
       } else {
-        setResult(payload);
+        setResult(normalized);
       }
     });
 
@@ -195,7 +196,7 @@ export function QueryView({
       unsubSchema();
       unsubBookmark();
     };
-  }, []);
+  }, [setConnections, setError, setResult, setSchema]);
 
   const handleConnectionChange = useCallback(
     (newId: string) => {
@@ -226,7 +227,7 @@ export function QueryView({
         editorRef.current?.placeCursor();
       });
     });
-  }, [connections]);
+  }, [connections, formatOnOpen, initialSql, sqlDialect]);
 
   const didPlaceCursor = useRef(false);
   useEffect(() => {
@@ -240,7 +241,7 @@ export function QueryView({
     requestAnimationFrame(() => {
       editorRef.current?.placeCursor();
     });
-  }, []);
+  }, [formatOnOpen]);
 
   const executeQuery = useCallback(() => {
     const sql = editorRef.current?.getSelectionOrValue().trim() ?? "";
@@ -349,6 +350,7 @@ export function QueryView({
 
         {}
         <button
+          type="button"
           style={btnStyle(status === "running")}
           disabled={status === "running"}
           onClick={executeQuery}
@@ -362,6 +364,7 @@ export function QueryView({
 
         {}
         <button
+          type="button"
           style={btnGhostStyle(false)}
           onClick={() => editorRef.current?.setValue("")}
           title="Clear SQL"
@@ -374,6 +377,7 @@ export function QueryView({
 
         {}
         <button
+          type="button"
           style={btnGhostStyle(false)}
           onClick={() => {
             const err = editorRef.current?.format(sqlDialect) ?? null;
@@ -391,6 +395,7 @@ export function QueryView({
 
         {}
         <button
+          type="button"
           style={{
             ...btnGhostStyle(bookmarked || bookmarking),
             ...(bookmarked
@@ -429,9 +434,13 @@ export function QueryView({
       </div>
 
       {}
-      <div
+      <button
+        type="button"
+        aria-label="Resize editor and results panels"
         onMouseDown={onMouseDownDivider}
         style={{
+          display: "block",
+          width: "100%",
           height: 5,
           flexShrink: 0,
           cursor: "row-resize",
@@ -440,6 +449,8 @@ export function QueryView({
             : "var(--vscode-panel-border)",
           transition: isResizing ? "none" : "background 150ms",
           userSelect: "none",
+          border: "none",
+          padding: 0,
         }}
         title="Drag to resize"
       />
@@ -450,4 +461,11 @@ export function QueryView({
       </div>
     </div>
   );
+}
+
+function normalizeQueryResultPayload(payload: QueryResult): QueryResult {
+  return {
+    ...payload,
+    columnMeta: Array.isArray(payload.columnMeta) ? payload.columnMeta : [],
+  };
 }

@@ -3,6 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 import { parseQueryPanelMessage } from "../../shared/webviewContracts";
+import { inferQueryColumnCategory, type QueryColumnMeta } from "../../shared/tableTypes";
 import type { ConnectionManager } from "../connectionManager";
 import { formatDatetimeForDisplay } from "../dbDrivers/BaseDBDriver";
 import {
@@ -158,6 +159,7 @@ export class QueryPanel {
       type: "queryResult",
       payload: {
         columns: [],
+        columnMeta: [],
         rows: [],
         rowCount: 0,
         executionTimeMs: 0,
@@ -235,6 +237,7 @@ export class QueryPanel {
           const limit = this.connectionManager.getQueryRowLimit();
           const truncated = result.rows.length > limit;
           const rawRows = truncated ? result.rows.slice(0, limit) : result.rows;
+          const columnMeta = resolveQueryColumnMeta(result.columns, result.columnMeta, result.rows);
 
           const rows = rawRows.map((row) => {
             const normalised: Record<string, unknown> = {};
@@ -261,7 +264,13 @@ export class QueryPanel {
           this.lastQueryResult = { columns: result.columns, rows };
           this.panel.webview.postMessage({
             type: "queryResult",
-            payload: { ...result, rows, truncated, truncatedAt: limit },
+            payload: {
+              ...result,
+              columnMeta,
+              rows,
+              truncated,
+              truncatedAt: limit,
+            },
           });
         } catch (err: unknown) {
           const error = normalizeUnknownError(err);
@@ -486,6 +495,19 @@ export class QueryPanel {
       `,
     });
   }
+}
+
+function resolveQueryColumnMeta(
+  columns: string[],
+  rawMeta: QueryColumnMeta[] | undefined,
+  rows: Record<string, unknown>[],
+): QueryColumnMeta[] {
+  const samples = rows.slice(0, 50);
+  return columns.map((_, index) => ({
+    category:
+      rawMeta?.[index]?.category ??
+      inferQueryColumnCategory(samples.map((row) => row[`__col_${index}`])),
+  }));
 }
 
 function normaliseSqlForGuardrail(sql: string): string {

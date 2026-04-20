@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   categoryColor,
   categoryLabel,
+  getCategoryPresentation,
+  getStructuralBadgePresentation,
+  inferQueryColumnCategory,
+  inferValueCategory,
   placeholderForCategory,
   type TypeCategory,
 } from "../../src/webview/types";
@@ -98,5 +102,68 @@ describe("categoryColor", () => {
     expect(categoryColor("float")).toBe(categoryColor("decimal"));
     expect(categoryColor("date")).toBe(categoryColor("datetime"));
     expect(categoryColor("date")).toBe(categoryColor("time"));
+  });
+});
+
+describe("getCategoryPresentation", () => {
+  it("returns borderless badge presentation for every category", () => {
+    const allCategories: TypeCategory[] = [
+      "text",
+      "integer",
+      "float",
+      "decimal",
+      "boolean",
+      "date",
+      "time",
+      "datetime",
+      "binary",
+      "json",
+      "uuid",
+      "spatial",
+      "interval",
+      "array",
+      "enum",
+      "lob",
+      "other",
+    ];
+
+    for (const cat of allCategories) {
+      const presentation = getCategoryPresentation(cat);
+      expect(presentation.label.length).toBeGreaterThan(0);
+      expect(presentation.foreground.length).toBeGreaterThan(0);
+      expect(presentation.badgeBackground.length).toBeGreaterThan(0);
+      expect(presentation.badgeBorder).toBe("none");
+    }
+  });
+});
+
+describe("getStructuralBadgePresentation", () => {
+  it("returns borderless shared presentation for structural badges", () => {
+    for (const kind of ["pk", "fk", "ai", "primary", "unique", "index"] as const) {
+      const presentation = getStructuralBadgePresentation(kind);
+      expect(presentation.label.length).toBeGreaterThan(0);
+      expect(presentation.foreground.length).toBeGreaterThan(0);
+      expect(presentation.badgeBackground.length).toBeGreaterThan(0);
+      expect(presentation.badgeBorder).toBe("none");
+    }
+  });
+});
+
+describe("query result type inference", () => {
+  it("infers common categories from individual values", () => {
+    expect(inferValueCategory(true)).toBe("boolean");
+    expect(inferValueCategory(42)).toBe("integer");
+    expect(inferValueCategory("2024-01-15")).toBe("date");
+    expect(inferValueCategory("POINT(1 2)")).toBe("spatial");
+    expect(inferValueCategory("\\xDEADBEEF")).toBe("binary");
+    expect(inferValueCategory('{"ok":true}')).toBe("json");
+  });
+
+  it("infers a column category from sampled query values", () => {
+    expect(inferQueryColumnCategory([null, undefined, "POINT(1 2)"])).toBe(
+      "spatial",
+    );
+    expect(inferQueryColumnCategory([null, "\\xAA"])).toBe("binary");
+    expect(inferQueryColumnCategory([null, null, null])).toBeNull();
   });
 });

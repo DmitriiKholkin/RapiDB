@@ -5,6 +5,7 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { CellDisplay } from "../../src/webview/components/table/CellDisplay";
+import { categoryColor, type TypeCategory } from "../../src/webview/types";
 
 afterEach(cleanup);
 
@@ -101,9 +102,58 @@ describe("CellDisplay", () => {
     expect(screen.getByText("hello")).toBeDefined();
   });
 
+  it("uses the shared type color for boolean values", () => {
+    render(<CellDisplay value={true} isPending={false} category="boolean" />);
+    const el = screen.getByText("true");
+    expect(el.style.color).toBe(categoryColor("boolean"));
+  });
+
+  it("uses the shared type color for date values", () => {
+    render(
+      <CellDisplay value="2024-01-15" isPending={false} category="date" />,
+    );
+    const el = screen.getByText("2024-01-15");
+    expect(el.style.color).toBe(categoryColor("date"));
+  });
+
+  it("uses the shared type color for spatial values", () => {
+    render(
+      <CellDisplay value="POINT(1 2)" isPending={false} category="spatial" />,
+    );
+    const el = screen.getByText("POINT(1 2)");
+    expect(el.style.color).toBe(categoryColor("spatial"));
+  });
+
+  it.each([
+    ["json", '{"key": "value"}'],
+    ["binary", "\\xDEADBEEF"],
+    ["uuid", "550e8400-e29b-41d4-a716-446655440000"],
+  ] as const)(
+    "uses the shared type color for %s values in specialized render paths",
+    (category, value) => {
+      render(
+        <CellDisplay
+          value={value}
+          isPending={false}
+          category={category as TypeCategory}
+        />,
+      );
+      const el = screen.getByText(value);
+      expect(el.style.color).toBe(categoryColor(category as TypeCategory));
+    },
+  );
+
   it("applies warning color when pending", () => {
     render(<CellDisplay value="test" isPending={true} />);
     const el = screen.getByText("test");
+    expect(el.style.color).toContain("cca700");
+  });
+
+  it("keeps pending warning color precedence over category color", () => {
+    render(
+      <CellDisplay value="POINT(1 2)" isPending={true} category="spatial" />,
+    );
+    const el = screen.getByText("POINT(1 2)");
     expect(el.style.color).toContain("cca700");
   });
 

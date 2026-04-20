@@ -10,15 +10,16 @@ import {
 import { useVirtualizer } from "@tanstack/react-virtual";
 import React, {
   useCallback,
-  useEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
 import type { QueryResult, QueryStatus } from "../store";
+import { inferQueryColumnCategory, isNumericCategory } from "../types";
 import { type Column, calcColWidths } from "../utils/columnSizing";
 import { postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
+import { CellDisplay } from "./table/CellDisplay";
 
 interface Props {
   status: QueryStatus;
@@ -106,6 +107,18 @@ function DataTable({ result }: { result: QueryResult }) {
 
   const [sorting, setSorting] = useState<SortingState>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const truncatedCount = truncatedAt ?? rowCount;
+  const columnMeta = Array.isArray(result.columnMeta) ? result.columnMeta : [];
+  const sampleRows = useMemo(() => rows.slice(0, 50), [rows]);
+  const columnCategories = useMemo(
+    () =>
+      colNames.map(
+        (_, index) =>
+          columnMeta[index]?.category ??
+          inferQueryColumnCategory(sampleRows.map((row) => row[`__col_${index}`])),
+      ),
+    [colNames, columnMeta, sampleRows],
+  );
 
   const colSizes = useMemo(
     () =>
@@ -120,13 +133,14 @@ function DataTable({ result }: { result: QueryResult }) {
         rows,
         { hPad: 19 },
       ),
-    [result],
+    [colNames, rows],
   );
 
   const columns = useMemo<ColumnDef<Record<string, unknown>>[]>(
     () =>
       colNames.map((name, i) => {
         const key = `__col_${i}`;
+        const category = columnCategories[i] ?? undefined;
         return {
           id: key,
           accessorKey: key,
@@ -134,10 +148,17 @@ function DataTable({ result }: { result: QueryResult }) {
           size: colSizes[key] ?? 160,
           minSize: 40,
           maxSize: 800,
-          cell: (info) => <CellValue value={info.getValue()} />,
+          meta: { category },
+          cell: (info) => (
+            <CellDisplay
+              value={info.getValue()}
+              isPending={false}
+              category={category}
+            />
+          ),
         };
       }),
-    [colNames, colSizes],
+    [colNames, colSizes, columnCategories],
   );
 
   const table = useReactTable({
@@ -198,7 +219,7 @@ function DataTable({ result }: { result: QueryResult }) {
       >
         <span style={{ opacity: 0.7 }}>
           {truncated
-            ? `${truncatedAt!.toLocaleString()} rows (truncated — query returned more)`
+            ? `${truncatedCount.toLocaleString()} rows (truncated — query returned more)`
             : `${rowCount.toLocaleString()} row${rowCount !== 1 ? "s" : ""}`}
           <span style={{ opacity: 0.5, marginLeft: 6 }}>
             {executionTimeMs} ms
@@ -243,7 +264,7 @@ function DataTable({ result }: { result: QueryResult }) {
             style={{ opacity: 0.8, flexShrink: 0 }}
           />
           <span>
-            Result limited to <strong>{truncatedAt!.toLocaleString()}</strong>{" "}
+            Result limited to <strong>{truncatedCount.toLocaleString()}</strong>{" "}
             rows. The query returned more data. Use <code>LIMIT</code> in your
             query or increase <em>RapiDB: Query Row Limit</em> in settings.
           </span>
@@ -342,7 +363,9 @@ function DataTable({ result }: { result: QueryResult }) {
 
                       {}
                       {header.column.getCanResize() && (
-                        <div
+                        <button
+                          type="button"
+                          aria-label={`Resize ${String(header.column.columnDef.header)} column`}
                           onMouseDown={header.getResizeHandler()}
                           onTouchStart={header.getResizeHandler()}
                           onClick={(e) => e.stopPropagation()}
@@ -358,6 +381,8 @@ function DataTable({ result }: { result: QueryResult }) {
                               ? "var(--vscode-focusBorder)"
                               : "transparent",
                             zIndex: 1,
+                            border: "none",
+                            padding: 0,
                           }}
                         />
                       )}
@@ -427,7 +452,9 @@ const VirtualRow = React.memo(function VirtualRow({
     >
       {row.getVisibleCells().map((cell) => {
         const raw = cell.getValue();
-        const isNum = typeof raw === "number";
+        const category = (cell.column.columnDef.meta as { category?: string } | undefined)
+          ?.category;
+        const isNum = typeof category === "string" && isNumericCategory(category);
         const isNull = raw === null || raw === undefined;
         return (
           <td
@@ -456,27 +483,6 @@ const VirtualRow = React.memo(function VirtualRow({
   );
 });
 
-function CellValue({ value }: { value: unknown }) {
-  if (value === null || value === undefined) {
-    return <span style={{ fontStyle: "italic", opacity: 0.45 }}>NULL</span>;
-  }
-  if (typeof value === "boolean") {
-    return (
-      <span
-        style={{
-          color: value
-            ? "var(--vscode-testing-iconPassed, #4ec94e)"
-            : "var(--vscode-errorForeground)",
-          fontWeight: 500,
-        }}
-      >
-        {value ? "true" : "false"}
-      </span>
-    );
-  }
-  return <>{String(value)}</>;
-}
-
 function ToolbarBtn({
   onClick,
   title,
@@ -489,6 +495,7 @@ function ToolbarBtn({
   const [hov, setHov] = useState(false);
   return (
     <button
+      type="button"
       onClick={onClick}
       title={title}
       onMouseEnter={() => setHov(true)}

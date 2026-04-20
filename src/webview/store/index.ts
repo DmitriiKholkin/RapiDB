@@ -1,7 +1,9 @@
 import { create } from "zustand";
+import type { QueryColumnMeta } from "../../shared/tableTypes";
 
 export interface QueryResult {
   columns: string[];
+  columnMeta: QueryColumnMeta[];
   rows: Record<string, unknown>[];
   rowCount: number;
   executionTimeMs: number;
@@ -21,6 +23,13 @@ export interface QueryState {
   setResult: (result: QueryResult) => void;
   setError: (error: string) => void;
   reset: () => void;
+}
+
+function normalizeQueryResult(result: QueryResult): QueryResult {
+  return {
+    ...result,
+    columnMeta: Array.isArray(result.columnMeta) ? result.columnMeta : [],
+  };
 }
 
 export interface ConnectionEntry {
@@ -57,11 +66,19 @@ export const useQueryStore = create<QueryState>((set) => ({
   status: "idle",
   result: null,
   setRunning: () => set({ status: "running", result: null }),
-  setResult: (result) => set({ status: "success", result }),
+  setResult: (result) =>
+    set({ status: "success", result: normalizeQueryResult(result) }),
   setError: (error) =>
     set({
       status: "error",
-      result: { columns: [], rows: [], rowCount: 0, executionTimeMs: 0, error },
+      result: {
+        columns: [],
+        columnMeta: [],
+        rows: [],
+        rowCount: 0,
+        executionTimeMs: 0,
+        error,
+      },
     }),
   reset: () => set({ status: "idle", result: null }),
 }));

@@ -14,6 +14,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ColumnTypeMeta as ColumnMeta } from "../../src/shared/tableTypes";
 import { TableView } from "../../src/webview/components/TableView";
+import { categoryColor } from "../../src/webview/types";
 
 vi.mock("@tanstack/react-virtual", () => ({
   useVirtualizer: ({ count }: { count: number }) => ({
@@ -289,6 +290,50 @@ describe("TableView", () => {
       screen.getByText("Alice").closest("td") as HTMLElement,
     );
     expect(screen.getByDisplayValue("Alice")).toBeDefined();
+  });
+
+  it("passes type colors through to cells and keeps pending warning color precedence", async () => {
+    render(
+      <TableView
+        connectionId="conn1"
+        database="db"
+        schema="public"
+        table="places"
+      />,
+    );
+
+    emit("tableInit", {
+      columns: [
+        makeColumn({
+          name: "id",
+          type: "integer",
+          category: "integer",
+          isPrimaryKey: true,
+          filterable: false,
+          editable: false,
+          isAutoIncrement: true,
+        }),
+        makeColumn({
+          name: "geom",
+          type: "geometry",
+          category: "spatial",
+          nativeType: "geometry",
+        }),
+      ],
+      primaryKeyColumns: ["id"],
+    });
+    emit("tableData", {
+      rows: [{ id: 1, geom: "POINT(1 2)" }],
+      totalCount: 1,
+    });
+
+    const originalValue = await screen.findByText("POINT(1 2)");
+    expect(originalValue.style.color).toBe(categoryColor("spatial"));
+
+    await editCellValue("POINT(1 2)", "POINT(3 4)");
+
+    const pendingValue = await screen.findByText("POINT(3 4)");
+    expect(pendingValue.style.color).toContain("cca700");
   });
 
   it("serializes scalar filters only after non-empty input", async () => {

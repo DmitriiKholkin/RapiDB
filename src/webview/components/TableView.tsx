@@ -1454,11 +1454,7 @@ const TableRow = React.memo(function TableRow({
                   : "pointer",
 
               userSelect: isSel ? "auto" : "none",
-              background: isPk
-                ? "var(--vscode-badge-background, rgba(128,128,128,0.12))"
-                : isCellPending
-                  ? "rgba(200,150,0,0.07)"
-                  : undefined,
+              background: isCellPending ? "rgba(200,150,0,0.07)" : undefined,
             }}
             title={isPk ? `PK: ${String(cell.getValue())}` : undefined}
             onDoubleClick={() => {

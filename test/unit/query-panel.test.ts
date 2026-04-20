@@ -122,6 +122,7 @@ describe("QueryPanel", () => {
       type: "queryResult",
       payload: {
         columns: [],
+        columnMeta: [],
         rows: [],
         rowCount: 0,
         executionTimeMs: 0,
@@ -177,5 +178,81 @@ describe("QueryPanel", () => {
     expect(cm.addToHistory).not.toHaveBeenCalled();
     expect(driver.query).not.toHaveBeenCalled();
     expect(vscodeMocks.showWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("posts inferred column metadata for query results", async () => {
+    let onMessage:
+      | ((message: { type: string; payload?: unknown }) => Promise<void>)
+      | undefined;
+    const postMessage = vi.fn();
+
+    vscodeMocks.createWebviewPanel.mockReturnValue({
+      webview: {
+        html: "",
+        postMessage,
+        onDidReceiveMessage: vi.fn((handler) => {
+          onMessage = handler;
+          return { dispose: vi.fn() };
+        }),
+      },
+      onDidDispose: vi.fn(() => ({ dispose: vi.fn() })),
+      reveal: vi.fn(),
+      dispose: vi.fn(),
+      title: "",
+    });
+
+    const driver = {
+      query: vi.fn().mockResolvedValue({
+        columns: ["payload", "shape", "size"],
+        rows: [
+          {
+            __col_0: { nested: true },
+            __col_1: "POINT(1 2)",
+            __col_2: 42,
+          },
+        ],
+        rowCount: 1,
+        executionTimeMs: 9,
+      }),
+    };
+    const cm = {
+      getConnection: vi.fn().mockReturnValue({ name: "Local", type: "pg" }),
+      getConnections: vi.fn().mockReturnValue([]),
+      getQueryRowLimit: vi.fn().mockReturnValue(500),
+      onDidSchemaLoad: vi.fn(() => ({ dispose: vi.fn() })),
+      isConnected: vi.fn(() => true),
+      connectTo: vi.fn(),
+      addToHistory: vi.fn(),
+      getDriver: vi.fn().mockReturnValue(driver),
+    };
+
+    QueryPanel.createOrShow(
+      { extensionUri: { path: "/extension" } } as never,
+      cm as never,
+      "conn-1",
+    );
+
+    await onMessage?.({
+      type: "executeQuery",
+      payload: {
+        sql: "select * from users limit 1",
+        connectionId: "conn-1",
+      },
+    });
+
+    expect(postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "queryResult",
+        payload: expect.objectContaining({
+          columns: ["payload", "shape", "size"],
+          columnMeta: [
+            { category: "json" },
+            { category: "spatial" },
+            { category: "integer" },
+          ],
+          rowCount: 1,
+        }),
+      }),
+    );
   });
 });

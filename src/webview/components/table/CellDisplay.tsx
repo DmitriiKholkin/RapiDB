@@ -1,7 +1,10 @@
 // biome-ignore lint/correctness/noUnusedImports: React needed for JSX
 import React from "react";
 import type { TypeCategory } from "../../../shared/tableTypes";
+import { getCategoryPresentation } from "../../types";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
+
+const PENDING_COLOR = "var(--vscode-editorWarning-foreground, #cca700)";
 
 /** Display a cell value with category-aware formatting. */
 export function CellDisplay({
@@ -19,6 +22,11 @@ export function CellDisplay({
     return <span style={{ fontStyle: "italic", opacity: 0.45 }}>NULL</span>;
   }
 
+  const categoryColor = category
+    ? getCategoryPresentation(category).foreground
+    : undefined;
+  const resolvedColor = isPending ? PENDING_COLOR : categoryColor;
+
   // Boolean display
   if (isBoolean || category === "boolean") {
     const boolVal = coerceBoolDisplay(value);
@@ -26,9 +34,7 @@ export function CellDisplay({
       return (
         <span
           style={{
-            color: boolVal
-              ? "var(--vscode-testing-iconPassed, #4ec94e)"
-              : "var(--vscode-errorForeground)",
+            color: resolvedColor ?? getCategoryPresentation("boolean").foreground,
             fontWeight: 500,
           }}
         >
@@ -45,9 +51,7 @@ export function CellDisplay({
     return (
       <span
         style={{
-          color: isPending
-            ? "var(--vscode-editorWarning-foreground, #cca700)"
-            : "var(--vscode-charts-red, #e06050)",
+          color: resolvedColor,
           opacity: 0.85,
         }}
       >
@@ -61,9 +65,7 @@ export function CellDisplay({
     return (
       <span
         style={{
-          color: isPending
-            ? "var(--vscode-editorWarning-foreground, #cca700)"
-            : "var(--vscode-charts-green, #4ec94e)",
+          color: resolvedColor,
           opacity: 0.85,
         }}
         title={str}
@@ -78,9 +80,7 @@ export function CellDisplay({
     return (
       <span
         style={{
-          color: isPending
-            ? "var(--vscode-editorWarning-foreground, #cca700)"
-            : "var(--vscode-charts-yellow, #cca700)",
+          color: resolvedColor,
           opacity: 0.85,
         }}
       >
@@ -98,9 +98,7 @@ export function CellDisplay({
     return (
       <span
         style={{
-          color: isPending
-            ? "var(--vscode-editorWarning-foreground, #cca700)"
-            : "var(--vscode-charts-blue, #4fc3f7)",
+          color: resolvedColor,
         }}
       >
         {str}
@@ -112,9 +110,7 @@ export function CellDisplay({
   return (
     <span
       style={{
-        color: isPending
-          ? "var(--vscode-editorWarning-foreground, #cca700)"
-          : undefined,
+        color: resolvedColor,
       }}
     >
       {str}
