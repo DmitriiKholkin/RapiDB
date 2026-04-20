@@ -128,20 +128,17 @@ describe("CellDisplay", () => {
     ["json", '{"key": "value"}'],
     ["binary", "\\xDEADBEEF"],
     ["uuid", "550e8400-e29b-41d4-a716-446655440000"],
-  ] as const)(
-    "uses the shared type color for %s values in specialized render paths",
-    (category, value) => {
-      render(
-        <CellDisplay
-          value={value}
-          isPending={false}
-          category={category as TypeCategory}
-        />,
-      );
-      const el = screen.getByText(value);
-      expect(el.style.color).toBe(categoryColor(category as TypeCategory));
-    },
-  );
+  ] as const)("uses the shared type color for %s values in specialized render paths", (category, value) => {
+    render(
+      <CellDisplay
+        value={value}
+        isPending={false}
+        category={category as TypeCategory}
+      />,
+    );
+    const el = screen.getByText(value);
+    expect(el.style.color).toBe(categoryColor(category as TypeCategory));
+  });
 
   it("applies warning color when pending", () => {
     render(<CellDisplay value="test" isPending={true} />);

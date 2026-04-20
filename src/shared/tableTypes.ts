@@ -26,8 +26,7 @@ export interface QueryColumnMeta {
 const UUID_VALUE_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const INTEGER_VALUE_RE = /^[+-]?\d+$/;
-const DECIMAL_VALUE_RE =
-  /^[+-]?(?:\d+\.\d*|\d*\.\d+|\d+(?:[eE][+-]?\d+))$/;
+const DECIMAL_VALUE_RE = /^[+-]?(?:\d+\.\d*|\d*\.\d+|\d+(?:[eE][+-]?\d+))$/;
 const DATE_VALUE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_VALUE_RE = /^\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
 const DATETIME_VALUE_RE =

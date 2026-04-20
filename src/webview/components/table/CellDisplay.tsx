@@ -34,7 +34,8 @@ export function CellDisplay({
       return (
         <span
           style={{
-            color: resolvedColor ?? getCategoryPresentation("boolean").foreground,
+            color:
+              resolvedColor ?? getCategoryPresentation("boolean").foreground,
             fontWeight: 500,
           }}
         >

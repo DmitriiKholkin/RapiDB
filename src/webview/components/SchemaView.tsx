@@ -6,7 +6,10 @@ import React, {
   type ReactNode,
 } from "react";
 import type { ColumnMeta, ForeignKeyMeta, IndexMeta } from "../types";
-import { getCategoryPresentation, getStructuralBadgePresentation } from "../types";
+import {
+  getCategoryPresentation,
+  getStructuralBadgePresentation,
+} from "../types";
 import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
 

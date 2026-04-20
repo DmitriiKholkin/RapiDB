@@ -2,8 +2,11 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
+import {
+  inferQueryColumnCategory,
+  type QueryColumnMeta,
+} from "../../shared/tableTypes";
 import { parseQueryPanelMessage } from "../../shared/webviewContracts";
-import { inferQueryColumnCategory, type QueryColumnMeta } from "../../shared/tableTypes";
 import type { ConnectionManager } from "../connectionManager";
 import { formatDatetimeForDisplay } from "../dbDrivers/BaseDBDriver";
 import {
@@ -237,7 +240,11 @@ export class QueryPanel {
           const limit = this.connectionManager.getQueryRowLimit();
           const truncated = result.rows.length > limit;
           const rawRows = truncated ? result.rows.slice(0, limit) : result.rows;
-          const columnMeta = resolveQueryColumnMeta(result.columns, result.columnMeta, result.rows);
+          const columnMeta = resolveQueryColumnMeta(
+            result.columns,
+            result.columnMeta,
+            result.rows,
+          );
 
           const rows = rawRows.map((row) => {
             const normalised: Record<string, unknown> = {};

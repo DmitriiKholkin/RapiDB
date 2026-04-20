@@ -139,7 +139,14 @@ describe("getCategoryPresentation", () => {
 
 describe("getStructuralBadgePresentation", () => {
   it("returns borderless shared presentation for structural badges", () => {
-    for (const kind of ["pk", "fk", "ai", "primary", "unique", "index"] as const) {
+    for (const kind of [
+      "pk",
+      "fk",
+      "ai",
+      "primary",
+      "unique",
+      "index",
+    ] as const) {
       const presentation = getStructuralBadgePresentation(kind);
       expect(presentation.label.length).toBeGreaterThan(0);
       expect(presentation.foreground.length).toBeGreaterThan(0);

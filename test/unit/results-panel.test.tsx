@@ -4,8 +4,8 @@
 
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { QueryResult } from "../../src/webview/store";
 import { ResultsPanel } from "../../src/webview/components/ResultsPanel";
+import type { QueryResult } from "../../src/webview/store";
 import { categoryColor } from "../../src/webview/types";
 
 vi.mock("@tanstack/react-virtual", () => ({

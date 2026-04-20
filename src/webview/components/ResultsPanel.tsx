@@ -8,12 +8,7 @@ import {
   useReactTable,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import React, {
-  useCallback,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import React, { useCallback, useMemo, useRef, useState } from "react";
 import type { QueryResult, QueryStatus } from "../store";
 import { inferQueryColumnCategory, isNumericCategory } from "../types";
 import { type Column, calcColWidths } from "../utils/columnSizing";
@@ -115,7 +110,9 @@ function DataTable({ result }: { result: QueryResult }) {
       colNames.map(
         (_, index) =>
           columnMeta[index]?.category ??
-          inferQueryColumnCategory(sampleRows.map((row) => row[`__col_${index}`])),
+          inferQueryColumnCategory(
+            sampleRows.map((row) => row[`__col_${index}`]),
+          ),
       ),
     [colNames, columnMeta, sampleRows],
   );
@@ -452,9 +449,11 @@ const VirtualRow = React.memo(function VirtualRow({
     >
       {row.getVisibleCells().map((cell) => {
         const raw = cell.getValue();
-        const category = (cell.column.columnDef.meta as { category?: string } | undefined)
-          ?.category;
-        const isNum = typeof category === "string" && isNumericCategory(category);
+        const category = (
+          cell.column.columnDef.meta as { category?: string } | undefined
+        )?.category;
+        const isNum =
+          typeof category === "string" && isNumericCategory(category);
         const isNull = raw === null || raw === undefined;
         return (
           <td

@@ -93,6 +93,8 @@ export const useConnectionStore = create<ConnectionState>((set) => ({
 export const useSchemaStore = create<SchemaState>((set, get) => ({
   schemaByConnection: {},
   setSchema: (connectionId, schema) =>
-    set((s) => ({ schemaByConnection: { ...s.schemaByConnection, [connectionId]: schema } })),
+    set((s) => ({
+      schemaByConnection: { ...s.schemaByConnection, [connectionId]: schema },
+    })),
   getSchema: (connectionId) => get().schemaByConnection[connectionId] ?? [],
 }));

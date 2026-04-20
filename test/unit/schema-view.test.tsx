@@ -15,11 +15,11 @@ import type {
   ForeignKeyMeta,
   IndexMeta,
 } from "../../src/shared/tableTypes";
+import { SchemaView } from "../../src/webview/components/SchemaView";
 import {
   categoryColor,
   getStructuralBadgePresentation,
 } from "../../src/webview/types";
-import { SchemaView } from "../../src/webview/components/SchemaView";
 
 afterEach(cleanup);
 
