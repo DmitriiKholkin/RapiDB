@@ -2,10 +2,13 @@ import { describe, expect, it } from "vitest";
 import { NULL_SENTINEL as extensionNullSentinel } from "../../src/extension/dbDrivers/types";
 import {
   buildFilterExpression,
+  buildFilterExpressionFromDraft,
   coerceFilterExpressions,
   defaultFilterOperator,
+  type FilterDraftMap,
   type FilterOperator,
   isNumericCategory,
+  serializeFilterDrafts,
   NULL_SENTINEL as sharedNullSentinel,
   valueFilterOperator,
 } from "../../src/shared/tableTypes";
@@ -63,7 +66,7 @@ describe("shared contract parity", () => {
   it("keeps structured filter coercion in shared helpers", () => {
     expect(
       coerceFilterExpressions([
-        { column: "created_on", operator: "eq", value: "2026-04-15" },
+        { column: "created_on", operator: "eq", value: " 2026-04-15 " },
         { column: "name", operator: "is_null" },
       ]),
     ).toEqual([
@@ -77,6 +80,35 @@ describe("shared contract parity", () => {
         { column: "name", value: sharedNullSentinel },
       ]),
     ).toEqual([]);
+  });
+
+  it("drops incomplete raw filters during coercion", () => {
+    expect(
+      coerceFilterExpressions([
+        { column: "name", operator: "like", value: "   " },
+        {
+          column: "created_on",
+          operator: "between",
+          value: ["2026-04-01", "  "],
+        },
+      ]),
+    ).toEqual([]);
+
+    expect(
+      coerceFilterExpressions([
+        {
+          column: "created_on",
+          operator: "between",
+          value: [" 2026-04-01 ", " 2026-04-15 "],
+        },
+      ]),
+    ).toEqual([
+      {
+        column: "created_on",
+        operator: "between",
+        value: ["2026-04-01", "2026-04-15"],
+      },
+    ]);
   });
 
   describe("buildFilterExpression", () => {
@@ -134,6 +166,190 @@ describe("shared contract parity", () => {
 
     it("skips empty values", () => {
       expect(buildFilterExpression(column, "   ")).toBeNull();
+    });
+  });
+
+  describe("buildFilterExpressionFromDraft", () => {
+    const textColumn = {
+      name: "name",
+      filterable: true,
+      filterOperators: ["like", "is_null", "is_not_null"] as FilterOperator[],
+    };
+
+    it("returns null when the draft is missing", () => {
+      expect(buildFilterExpressionFromDraft(textColumn, undefined)).toBeNull();
+    });
+
+    it("builds scalar filters from explicit drafts", () => {
+      expect(
+        buildFilterExpressionFromDraft(textColumn, {
+          operator: "like",
+          value: " alice ",
+        }),
+      ).toEqual({
+        column: "name",
+        operator: "like",
+        value: "alice",
+      });
+    });
+
+    it("skips empty scalar drafts", () => {
+      expect(
+        buildFilterExpressionFromDraft(textColumn, {
+          operator: "like",
+          value: "   ",
+        }),
+      ).toBeNull();
+    });
+
+    it("allows nullability operators without requiring filterable", () => {
+      expect(
+        buildFilterExpressionFromDraft(
+          {
+            name: "archived_at",
+            filterable: false,
+            filterOperators: ["is_null", "is_not_null"],
+          },
+          { operator: "is_not_null" },
+        ),
+      ).toEqual({
+        column: "archived_at",
+        operator: "is_not_null",
+      });
+    });
+
+    it("rejects unsupported nullability drafts", () => {
+      expect(
+        buildFilterExpressionFromDraft(
+          {
+            name: "archived_at",
+            filterable: false,
+            filterOperators: ["between"],
+          },
+          { operator: "is_null" },
+        ),
+      ).toBeNull();
+    });
+
+    it("requires both between values", () => {
+      expect(
+        buildFilterExpressionFromDraft(
+          {
+            name: "created_on",
+            filterable: true,
+            filterOperators: ["between"],
+          },
+          {
+            operator: "between",
+            value: ["2026-04-01", "  "],
+          },
+        ),
+      ).toBeNull();
+
+      expect(
+        buildFilterExpressionFromDraft(
+          {
+            name: "created_on",
+            filterable: true,
+            filterOperators: ["between"],
+          },
+          {
+            operator: "between",
+            value: [" 2026-04-01 ", " 2026-04-15 "],
+          },
+        ),
+      ).toEqual({
+        column: "created_on",
+        operator: "between",
+        value: ["2026-04-01", "2026-04-15"],
+      });
+    });
+
+    it("rejects unsupported scalar and between drafts", () => {
+      expect(
+        buildFilterExpressionFromDraft(
+          {
+            name: "name",
+            filterable: false,
+            filterOperators: ["like"],
+          },
+          {
+            operator: "like",
+            value: "alice",
+          },
+        ),
+      ).toBeNull();
+
+      expect(
+        buildFilterExpressionFromDraft(
+          {
+            name: "created_on",
+            filterable: true,
+            filterOperators: ["eq"],
+          },
+          {
+            operator: "between",
+            value: ["2026-04-01", "2026-04-15"],
+          },
+        ),
+      ).toBeNull();
+    });
+  });
+
+  describe("serializeFilterDrafts", () => {
+    const columns = [
+      {
+        name: "name",
+        filterable: true,
+        filterOperators: ["like", "is_null"] as FilterOperator[],
+      },
+      {
+        name: "created_on",
+        filterable: true,
+        filterOperators: ["between"] as FilterOperator[],
+      },
+      {
+        name: "archived_at",
+        filterable: false,
+        filterOperators: ["is_not_null"] as FilterOperator[],
+      },
+    ];
+
+    it("returns an empty array when drafts are absent", () => {
+      expect(serializeFilterDrafts(columns, undefined)).toEqual([]);
+    });
+
+    it("serializes in column order instead of draft insertion order", () => {
+      const drafts: FilterDraftMap = {
+        archived_at: { operator: "is_not_null" },
+        name: { operator: "like", value: "alice" },
+        created_on: {
+          operator: "between",
+          value: ["2026-04-01", "2026-04-15"],
+        },
+      };
+
+      expect(serializeFilterDrafts(columns, drafts)).toEqual([
+        { column: "name", operator: "like", value: "alice" },
+        {
+          column: "created_on",
+          operator: "between",
+          value: ["2026-04-01", "2026-04-15"],
+        },
+        { column: "archived_at", operator: "is_not_null" },
+      ]);
+    });
+
+    it("drops incomplete or unsupported drafts", () => {
+      const drafts: FilterDraftMap = {
+        name: { operator: "like", value: "   " },
+        created_on: {
+          operator: "between",
+          value: ["2026-04-01", "   "],
+        },
+      };
+
+      expect(serializeFilterDrafts(columns, drafts)).toEqual([]);
     });
   });
 });

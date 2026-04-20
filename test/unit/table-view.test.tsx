@@ -3,11 +3,13 @@
  */
 
 import {
+  act,
   cleanup,
   fireEvent,
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ColumnTypeMeta as ColumnMeta } from "../../src/shared/tableTypes";
@@ -26,11 +28,19 @@ vi.mock("@tanstack/react-virtual", () => ({
   }),
 }));
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 const postMessage = vi.fn();
 const getState = vi.fn();
 const setState = vi.fn();
+
+interface OutgoingMessage {
+  type: string;
+  payload?: unknown;
+}
 
 function makeColumn(
   overrides: Partial<ColumnMeta> & { name: string; type: string },
@@ -59,6 +69,33 @@ function emit(type: string, payload: unknown): void {
   );
 }
 
+function getMessages(type: string): OutgoingMessage[] {
+  return postMessage.mock.calls
+    .map(([message]) => message as OutgoingMessage)
+    .filter((message) => message.type === type);
+}
+
+function getLastMessage(type: string): OutgoingMessage | undefined {
+  return getMessages(type).at(-1);
+}
+
+function fetchMessageCount(): number {
+  return getMessages("fetchPage").length;
+}
+
+async function waitForFetchFilters(
+  previousCount: number,
+  filters: unknown,
+): Promise<void> {
+  await waitFor(() => {
+    const messages = getMessages("fetchPage");
+    expect(messages.length).toBeGreaterThan(previousCount);
+    expect(
+      (messages.at(-1)?.payload as { filters?: unknown } | undefined)?.filters,
+    ).toEqual(filters);
+  });
+}
+
 describe("TableView", () => {
   beforeEach(() => {
     postMessage.mockReset();
@@ -79,7 +116,7 @@ describe("TableView", () => {
     };
   });
 
-  it("renders filter controls only for filterable columns", async () => {
+  it("renders operator-aware filter controls and disables unsupported columns", async () => {
     render(
       <TableView
         connectionId="conn1"
@@ -124,7 +161,25 @@ describe("TableView", () => {
     expect(inputs).toHaveLength(2);
     expect((inputs[0] as HTMLInputElement).disabled).toBe(true);
     expect((inputs[1] as HTMLInputElement).disabled).toBe(false);
-    expect(screen.getByPlaceholderText("filter")).toBeDefined();
+
+    const idTrigger = screen.getByRole("button", {
+      name: "id filter operator",
+    }) as HTMLButtonElement;
+    const nameTrigger = screen.getByRole("button", {
+      name: "name filter operator",
+    }) as HTMLButtonElement;
+
+    expect(idTrigger.disabled).toBe(true);
+    expect(nameTrigger.disabled).toBe(false);
+    expect(
+      (screen.getByLabelText("name filter value") as HTMLInputElement).value,
+    ).toBe("");
+    expect(
+      within(
+        (screen.getByLabelText("name filter value") as HTMLInputElement)
+          .parentElement as HTMLElement,
+      ).getAllByRole("button"),
+    ).toHaveLength(1);
   });
 
   it("blocks editing for read-only auto-increment cells but allows editable cells", async () => {
@@ -179,7 +234,7 @@ describe("TableView", () => {
     expect(screen.getByDisplayValue("Alice")).toBeDefined();
   });
 
-  it("serializes plain-text filters as structured filter expressions", async () => {
+  it("serializes scalar filters only after non-empty input", async () => {
     render(
       <TableView
         connectionId="conn1"
@@ -198,22 +253,28 @@ describe("TableView", () => {
       totalCount: 1,
     });
 
-    const input = await screen.findByPlaceholderText("filter");
-    fireEvent.change(input, { target: { value: "Alice" } });
+    const input = (await screen.findByLabelText(
+      "name filter value",
+    )) as HTMLInputElement;
 
     await waitFor(() => {
-      expect(postMessage).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: "fetchPage",
-          payload: expect.objectContaining({
-            filters: [{ column: "name", operator: "like", value: "Alice" }],
-          }),
-        }),
-      );
+      expect(fetchMessageCount()).toBeGreaterThan(0);
     });
+
+    const whitespaceFetchCount = fetchMessageCount();
+    fireEvent.change(input, { target: { value: "   " } });
+
+    await waitForFetchFilters(whitespaceFetchCount, []);
+
+    const valueFetchCount = fetchMessageCount();
+    fireEvent.change(input, { target: { value: "Alice" } });
+
+    await waitForFetchFilters(valueFetchCount, [
+      { column: "name", operator: "like", value: "Alice" },
+    ]);
   });
 
-  it("allows NULL-only filters while keeping the value input disabled", async () => {
+  it("shows only supported operators and locks the input for nullability filters", async () => {
     render(
       <TableView
         connectionId="conn1"
@@ -228,9 +289,9 @@ describe("TableView", () => {
         makeColumn({
           name: "payload",
           type: "jsonb",
-          filterable: false,
+          filterable: true,
           editable: false,
-          filterOperators: ["is_null"],
+          filterOperators: ["like", "is_null", "is_not_null"],
         }),
       ],
       primaryKeyColumns: [],
@@ -240,31 +301,36 @@ describe("TableView", () => {
       totalCount: 1,
     });
 
-    const input = (await screen.findByRole("textbox")) as HTMLInputElement;
+    const trigger = (await screen.findByRole("button", {
+      name: "payload filter operator",
+    })) as HTMLButtonElement;
+
+    fireEvent.click(trigger);
+
+    expect(screen.getByText("No filter")).toBeDefined();
+    expect(screen.getByText("Contains")).toBeDefined();
+    expect(screen.getByText("Is NULL")).toBeDefined();
+    expect(screen.getByText("Is NOT NULL")).toBeDefined();
+    expect(screen.queryByText("Between")).toBeNull();
+
+    const fetchCount = fetchMessageCount();
+    fireEvent.click(
+      screen.getByText("Is NOT NULL").closest("button") as HTMLElement,
+    );
+
+    await waitForFetchFilters(fetchCount, [
+      { column: "payload", operator: "is_not_null" },
+    ]);
+
+    const input = screen.getByLabelText(
+      "payload filter value",
+    ) as HTMLInputElement;
     expect(input.disabled).toBe(true);
-    expect(input.placeholder).toBe("");
-
-    const nullButton = screen.getByRole("button", { name: "NULL" });
-    expect((nullButton as HTMLButtonElement).disabled).toBe(false);
-
-    fireEvent.click(nullButton);
-
-    await waitFor(() => {
-      expect(postMessage).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: "fetchPage",
-          payload: expect.objectContaining({
-            filters: [{ column: "payload", operator: "is_null" }],
-          }),
-        }),
-      );
-    });
-
-    expect(input.disabled).toBe(true);
-    expect(input.placeholder).toBe("");
+    expect(input.value).toBe("NULL");
+    expect(trigger.textContent).toBe("!N");
   });
 
-  it("keeps NULL toggle disabled when is_null is unsupported", async () => {
+  it("allows clearing null-only filters back to a neutral state", async () => {
     render(
       <TableView
         connectionId="conn1"
@@ -281,7 +347,7 @@ describe("TableView", () => {
           type: "text",
           filterable: false,
           editable: false,
-          filterOperators: [],
+          filterOperators: ["is_null", "is_not_null"],
         }),
       ],
       primaryKeyColumns: [],
@@ -291,11 +357,212 @@ describe("TableView", () => {
       totalCount: 1,
     });
 
-    const input = (await screen.findByRole("textbox")) as HTMLInputElement;
-    expect(input.disabled).toBe(true);
-    expect(input.placeholder).toBe("");
+    const trigger = (await screen.findByRole("button", {
+      name: "notes filter operator",
+    })) as HTMLButtonElement;
+    const input = (await screen.findByLabelText(
+      "notes filter value",
+    )) as HTMLInputElement;
 
-    const nullButton = screen.getByRole("button", { name: "NULL" });
-    expect((nullButton as HTMLButtonElement).disabled).toBe(true);
+    expect(input.disabled).toBe(true);
+    expect(input.value).toBe("");
+    expect(trigger.textContent).toBe("x");
+
+    const selectFetchCount = fetchMessageCount();
+    fireEvent.click(trigger);
+    fireEvent.click(
+      screen.getByText("Is NULL").closest("button") as HTMLElement,
+    );
+
+    await waitForFetchFilters(selectFetchCount, [
+      { column: "notes", operator: "is_null" },
+    ]);
+
+    expect(
+      (screen.getByLabelText("notes filter value") as HTMLInputElement).value,
+    ).toBe("NULL");
+
+    const clearFetchCount = fetchMessageCount();
+    fireEvent.click(
+      screen.getByRole("button", { name: "notes filter operator" }),
+    );
+    fireEvent.click(
+      screen.getByText("No filter").closest("button") as HTMLElement,
+    );
+
+    await waitForFetchFilters(clearFetchCount, []);
+
+    expect(
+      (screen.getByLabelText("notes filter value") as HTMLInputElement).value,
+    ).toBe("");
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "notes filter operator",
+        }) as HTMLButtonElement
+      ).textContent,
+    ).toBe("x");
+  });
+
+  it("renders between filters with two inputs and waits for both values", async () => {
+    render(
+      <TableView
+        connectionId="conn1"
+        database="db"
+        schema="public"
+        table="events"
+      />,
+    );
+
+    emit("tableInit", {
+      columns: [
+        makeColumn({
+          name: "created_on",
+          type: "date",
+          category: "date",
+          filterOperators: ["between"],
+        }),
+      ],
+      primaryKeyColumns: [],
+    });
+    emit("tableData", {
+      rows: [{ created_on: "2026-04-15" }],
+      totalCount: 1,
+    });
+
+    const startInput = (await screen.findByLabelText(
+      "created_on filter start",
+    )) as HTMLInputElement;
+    const endInput = screen.getByLabelText(
+      "created_on filter end",
+    ) as HTMLInputElement;
+
+    await waitFor(() => {
+      expect(fetchMessageCount()).toBeGreaterThan(0);
+    });
+
+    const firstFetchCount = fetchMessageCount();
+    fireEvent.change(startInput, { target: { value: "2026-04-01" } });
+
+    await waitForFetchFilters(firstFetchCount, []);
+
+    const secondFetchCount = fetchMessageCount();
+    fireEvent.change(endInput, { target: { value: "2026-04-30" } });
+
+    await waitForFetchFilters(secondFetchCount, [
+      {
+        column: "created_on",
+        operator: "between",
+        value: ["2026-04-01", "2026-04-30"],
+      },
+    ]);
+  });
+
+  it("uses only debounced filters for refresh and export actions", async () => {
+    render(
+      <TableView
+        connectionId="conn1"
+        database="db"
+        schema="public"
+        table="users"
+      />,
+    );
+
+    emit("tableInit", {
+      columns: [makeColumn({ name: "name", type: "text" })],
+      primaryKeyColumns: [],
+    });
+    emit("tableData", {
+      rows: [{ name: "Alice" }],
+      totalCount: 1,
+    });
+
+    const input = (await screen.findByLabelText(
+      "name filter value",
+    )) as HTMLInputElement;
+
+    await waitFor(() => {
+      expect(fetchMessageCount()).toBeGreaterThan(0);
+    });
+
+    const activeFilters = [
+      { column: "name", operator: "like", value: "Alice" },
+    ];
+
+    vi.useFakeTimers();
+
+    fireEvent.change(input, { target: { value: "Alice" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
+    fireEvent.click(screen.getByRole("button", { name: "Export JSON" }));
+
+    expect(
+      (
+        getLastMessage("fetchPage")?.payload as
+          | { filters?: unknown }
+          | undefined
+      )?.filters,
+    ).toEqual([]);
+    expect(
+      (
+        getLastMessage("exportCSV")?.payload as
+          | { filters?: unknown }
+          | undefined
+      )?.filters,
+    ).toEqual([]);
+    expect(
+      (
+        getLastMessage("exportJSON")?.payload as
+          | { filters?: unknown }
+          | undefined
+      )?.filters,
+    ).toEqual([]);
+
+    const preDebounceFetchCount = fetchMessageCount();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(399);
+    });
+
+    expect(fetchMessageCount()).toBe(preDebounceFetchCount);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+
+    expect(fetchMessageCount()).toBeGreaterThan(preDebounceFetchCount);
+    expect(
+      (
+        getLastMessage("fetchPage")?.payload as
+          | { filters?: unknown }
+          | undefined
+      )?.filters,
+    ).toEqual(activeFilters);
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
+    fireEvent.click(screen.getByRole("button", { name: "Export JSON" }));
+
+    expect(
+      (
+        getLastMessage("fetchPage")?.payload as
+          | { filters?: unknown }
+          | undefined
+      )?.filters,
+    ).toEqual(activeFilters);
+    expect(
+      (
+        getLastMessage("exportCSV")?.payload as
+          | { filters?: unknown }
+          | undefined
+      )?.filters,
+    ).toEqual(activeFilters);
+    expect(
+      (
+        getLastMessage("exportJSON")?.payload as
+          | { filters?: unknown }
+          | undefined
+      )?.filters,
+    ).toEqual(activeFilters);
   });
 });

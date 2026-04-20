@@ -66,6 +66,26 @@ export type FilterExpression =
       operator: "is_null" | "is_not_null";
     };
 
+export type FilterDraft =
+  | {
+      operator: ScalarFilterOperator;
+      value: string;
+    }
+  | {
+      operator: "between";
+      value: [string, string];
+    }
+  | {
+      operator: "is_null" | "is_not_null";
+    };
+
+export type FilterDraftMap = Partial<Record<string, FilterDraft>>;
+
+type FilterDraftColumn = Pick<
+  ColumnTypeMeta,
+  "name" | "filterable" | "filterOperators"
+>;
+
 export interface ColumnMeta {
   name: string;
   type: string;
@@ -132,6 +152,74 @@ export function valueFilterOperator(
   return column.filterOperators.includes(operator) ? operator : null;
 }
 
+function hasFilterOperator(
+  column: Pick<ColumnTypeMeta, "filterOperators">,
+  operator: FilterOperator,
+): boolean {
+  return column.filterOperators.includes(operator);
+}
+
+function normalizeFilterValue(rawValue: string): string | null {
+  const value = rawValue.trim();
+  return value === "" ? null : value;
+}
+
+export function buildFilterExpressionFromDraft(
+  column: FilterDraftColumn,
+  draft: FilterDraft | null | undefined,
+): FilterExpression | null {
+  if (!draft) return null;
+
+  switch (draft.operator) {
+    case "is_null":
+    case "is_not_null":
+      return hasFilterOperator(column, draft.operator)
+        ? { column: column.name, operator: draft.operator }
+        : null;
+    case "between": {
+      if (!column.filterable || !hasFilterOperator(column, "between")) {
+        return null;
+      }
+
+      const start = normalizeFilterValue(draft.value[0]);
+      const end = normalizeFilterValue(draft.value[1]);
+      if (!start || !end) return null;
+
+      return {
+        column: column.name,
+        operator: "between",
+        value: [start, end],
+      };
+    }
+    default: {
+      if (!column.filterable || !hasFilterOperator(column, draft.operator)) {
+        return null;
+      }
+
+      const value = normalizeFilterValue(draft.value);
+      if (!value) return null;
+
+      return {
+        column: column.name,
+        operator: draft.operator,
+        value,
+      };
+    }
+  }
+}
+
+export function serializeFilterDrafts(
+  columns: readonly FilterDraftColumn[],
+  drafts: FilterDraftMap | null | undefined,
+): FilterExpression[] {
+  if (!drafts) return [];
+
+  return columns.flatMap<FilterExpression>((column) => {
+    const filter = buildFilterExpressionFromDraft(column, drafts[column.name]);
+    return filter ? [filter] : [];
+  });
+}
+
 export function buildFilterExpression(
   column: Pick<
     ColumnTypeMeta,
@@ -139,23 +227,17 @@ export function buildFilterExpression(
   >,
   rawValue: string,
 ): FilterExpression | null {
-  const value = rawValue.trim();
-  if (value === "") return null;
+  const value = normalizeFilterValue(rawValue);
+  if (!value) return null;
 
   if (value === NULL_SENTINEL) {
-    return column.filterOperators.includes("is_null")
-      ? { column: column.name, operator: "is_null" }
-      : null;
+    return buildFilterExpressionFromDraft(column, { operator: "is_null" });
   }
 
   const operator = valueFilterOperator(column);
   if (!operator) return null;
 
-  return {
-    column: column.name,
-    operator,
-    value,
-  };
+  return buildFilterExpressionFromDraft(column, { operator, value });
 }
 
 export function coerceFilterExpressions(
@@ -188,11 +270,17 @@ export function coerceFilterExpressions(
           typeof value[0] === "string" &&
           typeof value[1] === "string"
         ) {
+          const start = normalizeFilterValue(value[0]);
+          const end = normalizeFilterValue(value[1]);
+          if (!start || !end) {
+            return [];
+          }
+
           return [
             {
               column: columnName,
               operator,
-              value: [value[0], value[1]],
+              value: [start, end],
             },
           ];
         }
@@ -204,11 +292,16 @@ export function coerceFilterExpressions(
         SCALAR_FILTER_OPERATORS.has(operator as ScalarFilterOperator) &&
         typeof filter.value === "string"
       ) {
+        const value = normalizeFilterValue(filter.value);
+        if (!value) {
+          return [];
+        }
+
         return [
           {
             column: columnName,
             operator: operator as ScalarFilterOperator,
-            value: filter.value,
+            value,
           },
         ];
       }

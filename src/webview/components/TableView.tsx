@@ -14,17 +14,19 @@ import React, {
   useState,
 } from "react";
 import {
-  buildFilterExpression,
   type ColumnTypeMeta as ColumnMeta,
-  type FilterExpression,
+  type FilterDraft,
+  type FilterDraftMap,
   isNumericCategory,
   NULL_SENTINEL,
+  serializeFilterDrafts,
 } from "../../shared/tableTypes";
-import { type PendingEdits, placeholderForCategory, type Row } from "../types";
+import type { PendingEdits, Row } from "../types";
 import { type Column, calcColWidths } from "../utils/columnSizing";
 import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
 import { CellDisplay } from "./table/CellDisplay";
+import { ColumnFilterControl } from "./table/ColumnFilterControl";
 import { EditInput, valueToEditString } from "./table/EditInput";
 import { NewRowForm } from "./table/NewRowForm";
 
@@ -99,16 +101,6 @@ const btn = (
           }),
 });
 
-function canFilterColumn(column?: ColumnMeta): column is ColumnMeta {
-  return !!column && column.filterable;
-}
-
-function canNullFilterColumn(column?: ColumnMeta): column is ColumnMeta {
-  return (
-    !!column && column.nullable && column.filterOperators.includes("is_null")
-  );
-}
-
 function canEditColumn(column?: ColumnMeta): column is ColumnMeta {
   return !!column && column.editable && !column.isAutoIncrement;
 }
@@ -136,8 +128,9 @@ export function TableView({
   const [filterError, setFilterError] = useState<string | null>(null);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(initialPageSize);
-  const [filters, setFilters] = useState<Record<string, string>>({});
-  const [debFilters, setDebFilters] = useState<Record<string, string>>({});
+  const [filterDrafts, setFilterDrafts] = useState<FilterDraftMap>({});
+  const [debouncedFilterDrafts, setDebouncedFilterDrafts] =
+    useState<FilterDraftMap>({});
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [pendingEdits, setPending] = useState<PendingEdits>(new Map());
   const [editCell, setEditCell] = useState<{
@@ -188,10 +181,10 @@ export function TableView({
 
   const pageRef = useRef(page);
   const pageSizeRef = useRef(pageSize);
-  const debFilRef = useRef(debFilters);
+  const debouncedFilterDraftsRef = useRef(debouncedFilterDrafts);
   pageRef.current = page;
   pageSizeRef.current = pageSize;
-  debFilRef.current = debFilters;
+  debouncedFilterDraftsRef.current = debouncedFilterDrafts;
 
   const fetchTrigger = useMemo(
     () =>
@@ -199,20 +192,20 @@ export function TableView({
         initTick,
         page,
         pageSize,
-        filters: debFilters,
+        filters: debouncedFilterDrafts,
         sortColumn: sort?.column ?? null,
         sortDirection: sort?.direction ?? null,
       }),
-    [debFilters, initTick, page, pageSize, sort],
+    [debouncedFilterDrafts, initTick, page, pageSize, sort],
   );
 
   const fetchPage = useCallback(() => {
     if (!initializedRef.current) return;
     const epoch = ++fetchEpochRef.current;
     setLoading(true);
-    const activeFilters = serializeFilters(
-      debFilRef.current,
+    const activeFilters = serializeFilterDrafts(
       columnsRef.current,
+      debouncedFilterDraftsRef.current,
     );
     postMessage("fetchPage", {
       fetchId: epoch,
@@ -374,10 +367,10 @@ export function TableView({
     const t = setTimeout(() => {
       setFilterError(null);
       setPage(1);
-      setDebFilters(filters);
+      setDebouncedFilterDrafts(filterDrafts);
     }, DEBOUNCE);
     return () => clearTimeout(t);
-  }, [filters]);
+  }, [filterDrafts]);
 
   const handleSort = useCallback((column: string) => {
     setPage(1);
@@ -391,6 +384,28 @@ export function TableView({
       return { column, direction: "asc" as const };
     });
   }, []);
+
+  const updateFilterDraft = useCallback(
+    (columnName: string, nextDraft: FilterDraft | undefined) => {
+      setFilterDrafts((current) => {
+        if (!nextDraft) {
+          if (current[columnName] === undefined) {
+            return current;
+          }
+
+          const next = { ...current };
+          delete next[columnName];
+          return next;
+        }
+
+        return {
+          ...current,
+          [columnName]: nextDraft,
+        };
+      });
+    },
+    [],
+  );
 
   const applyChanges = useCallback(() => {
     if (pendingEdits.size === 0 || applying) {
@@ -754,7 +769,10 @@ export function TableView({
           type="button"
           style={btn("ghost")}
           onClick={() => {
-            const activeFilters = serializeFilters(debFilters, columns);
+            const activeFilters = serializeFilterDrafts(
+              columns,
+              debouncedFilterDrafts,
+            );
             postMessage("exportCSV", { sort, filters: activeFilters });
           }}
         >
@@ -765,7 +783,10 @@ export function TableView({
           type="button"
           style={btn("ghost")}
           onClick={() => {
-            const activeFilters = serializeFilters(debFilters, columns);
+            const activeFilters = serializeFilterDrafts(
+              columns,
+              debouncedFilterDrafts,
+            );
             postMessage("exportJSON", { sort, filters: activeFilters });
           }}
         >
@@ -1024,12 +1045,7 @@ export function TableView({
             <tr>
               {tanTable.getHeaderGroups()[0]?.headers.map((h) => {
                 const isSel = h.column.id === "__sel";
-                const col = columns.find((c) => c.name === h.column.id);
-                const canValueFilter = canFilterColumn(col);
-                const canNullFilter = canNullFilterColumn(col);
-                const isNullOnlyFilter = !canValueFilter && canNullFilter;
-                const isNullFilter =
-                  canNullFilter && filters[h.column.id] === NULL_SENTINEL;
+                const col = columnsMap.get(h.column.id);
                 return (
                   <th
                     key={h.id + "_f"}
@@ -1050,127 +1066,14 @@ export function TableView({
                         "0 -1px 0 0 var(--vscode-editorGroupHeader-tabsBackground)",
                     }}
                   >
-                    {!isSel && (
-                      <div
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 2,
-                          height: "100%",
-                        }}
-                      >
-                        <input
-                          value={
-                            isNullFilter
-                              ? ""
-                              : canValueFilter
-                                ? (filters[h.column.id] ?? "")
-                                : ""
-                          }
-                          disabled={!canValueFilter || isNullFilter}
-                          onChange={(e) =>
-                            canValueFilter &&
-                            setFilters((f) => ({
-                              ...f,
-                              [h.column.id]: e.target.value,
-                            }))
-                          }
-                          placeholder={
-                            isNullOnlyFilter
-                              ? ""
-                              : isNullFilter
-                                ? "NULL"
-                                : canValueFilter && col
-                                  ? placeholderForCategory(
-                                      col.category,
-                                      col.isBoolean,
-                                    )
-                                  : col
-                                    ? ""
-                                    : "filter"
-                          }
-                          style={{
-                            flex: 1,
-                            minWidth: 0,
-                            height: "100%",
-                            padding: "0 4px",
-                            fontSize: 11,
-                            background: "var(--vscode-input-background)",
-                            color:
-                              !canValueFilter || isNullFilter
-                                ? "var(--vscode-disabledForeground)"
-                                : "var(--vscode-input-foreground)",
-                            border: "1px solid transparent",
-                            borderRadius: 2,
-                            fontFamily: "inherit",
-                            outline: "none",
-                            boxSizing: "border-box",
-                            opacity: !canValueFilter || isNullFilter ? 0.55 : 1,
-                            fontStyle:
-                              !canValueFilter || isNullFilter
-                                ? "italic"
-                                : "normal",
-                          }}
-                          onFocus={(e) => {
-                            if (canValueFilter && !isNullFilter) {
-                              e.target.style.borderColor =
-                                "var(--vscode-focusBorder)";
-                            }
-                          }}
-                          onBlur={(e) => {
-                            e.target.style.borderColor = "transparent";
-                          }}
-                        />
-                        {col?.nullable && (
-                          <button
-                            type="button"
-                            disabled={!canNullFilter}
-                            onClick={() =>
-                              canNullFilter &&
-                              setFilters((f) => ({
-                                ...f,
-                                [h.column.id]: isNullFilter
-                                  ? ""
-                                  : NULL_SENTINEL,
-                              }))
-                            }
-                            title={
-                              !canNullFilter
-                                ? "Filtering is not available for this column"
-                                : isNullFilter
-                                  ? "Remove NULL filter"
-                                  : "Filter by NULL"
-                            }
-                            style={{
-                              flexShrink: 0,
-                              height: "100%",
-                              padding: "0 5px",
-                              fontSize: 9,
-                              fontStyle: "italic",
-                              fontFamily: "inherit",
-                              background: isNullFilter
-                                ? "var(--vscode-button-background)"
-                                : "transparent",
-                              color: !canNullFilter
-                                ? "var(--vscode-disabledForeground)"
-                                : isNullFilter
-                                  ? "var(--vscode-button-foreground)"
-                                  : "var(--vscode-badge-foreground)",
-                              border: "none",
-                              borderRadius: 2,
-                              cursor: canNullFilter ? "pointer" : "default",
-                              letterSpacing: "0.02em",
-                              opacity: !canNullFilter
-                                ? 0.35
-                                : isNullFilter
-                                  ? 1
-                                  : 0.5,
-                            }}
-                          >
-                            NULL
-                          </button>
-                        )}
-                      </div>
+                    {!isSel && col && (
+                      <ColumnFilterControl
+                        column={col}
+                        draft={filterDrafts[h.column.id]}
+                        onChange={(nextDraft) =>
+                          updateFilterDraft(h.column.id, nextDraft)
+                        }
+                      />
                     )}
                   </th>
                 );
@@ -1186,6 +1089,7 @@ export function TableView({
               const isSelected = selected.has(vRow.index);
               const editingCol =
                 editCell?.rowIdx === vRow.index ? editCell.col : null;
+
               return (
                 <TableRow
                   key={vRow.key}
@@ -1381,17 +1285,3 @@ const TableRow = React.memo(function TableRow({
     </tr>
   );
 });
-
-function serializeFilters(
-  filters: Record<string, string>,
-  columns: ColumnMeta[],
-): FilterExpression[] {
-  const columnMap = new Map(columns.map((column) => [column.name, column]));
-
-  return Object.entries(filters)
-    .map(([columnName, rawValue]) => {
-      const column = columnMap.get(columnName);
-      return column ? buildFilterExpression(column, rawValue) : null;
-    })
-    .filter((filter): filter is FilterExpression => filter !== null);
-}

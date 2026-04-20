@@ -40,7 +40,28 @@ export function activate(context: vscode.ExtensionContext): void {
     treeDataProvider: connectionProvider,
     showCollapseAll: true,
   });
+
+  const updateExplorerBadge = () => {
+    const connectedCount = connectionManager.getConnectedCount();
+    treeView.badge =
+      connectedCount > 0
+        ? {
+            value: connectedCount,
+            tooltip: `${connectedCount} connected database${connectedCount === 1 ? "" : "s"}`,
+          }
+        : undefined;
+  };
+
+  updateExplorerBadge();
   context.subscriptions.push(treeView, connectionProvider.disposable);
+  context.subscriptions.push(
+    connectionManager.onDidConnect(() => {
+      updateExplorerBadge();
+    }),
+    connectionManager.onDidDisconnect(() => {
+      updateExplorerBadge();
+    }),
+  );
 
   const historyProvider = new HistoryProvider(connectionManager);
   const historyView = vscode.window.createTreeView("rapidb-history", {

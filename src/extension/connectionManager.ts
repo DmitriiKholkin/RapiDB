@@ -348,6 +348,11 @@ export class ConnectionManager {
     return this.driverMap.get(id)?.isConnected() ?? false;
   }
 
+  getConnectedCount(): number {
+    return [...this.driverMap.values()].filter((driver) => driver.isConnected())
+      .length;
+  }
+
   isConnecting(id: string): boolean {
     return this._connectingMap.has(id);
   }

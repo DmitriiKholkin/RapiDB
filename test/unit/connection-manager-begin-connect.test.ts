@@ -138,6 +138,27 @@ describe("ConnectionManager.beginConnect", () => {
     ).toBe(false);
   });
 
+  it("counts only active connected drivers", () => {
+    const manager = new ConnectionManager(makeContext());
+
+    (
+      manager as unknown as {
+        driverMap: Map<string, { isConnected: () => boolean }>;
+      }
+    ).driverMap.set("connected", {
+      isConnected: () => true,
+    });
+    (
+      manager as unknown as {
+        driverMap: Map<string, { isConnected: () => boolean }>;
+      }
+    ).driverMap.set("stale", {
+      isConnected: () => false,
+    });
+
+    expect(manager.getConnectedCount()).toBe(1);
+  });
+
   it("preserves the real schema name when preloading schema cache", async () => {
     const manager = new ConnectionManager(makeContext());
     const driver = {
