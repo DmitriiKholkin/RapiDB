@@ -226,8 +226,6 @@ export function ColumnFilterControl({
     : { token: "x", label: "No filter" };
   const hasMenu = availableOperators.length > 0;
   const isBetween = selectedOperator === "between";
-  const isNullabilityOperator =
-    selectedOperator === "is_null" || selectedOperator === "is_not_null";
   const scalarOperator =
     selectedOperator && isScalarOperator(selectedOperator)
       ? selectedOperator
@@ -392,8 +390,18 @@ export function ColumnFilterControl({
       ) : (
         <input
           aria-label={`${column.name} filter value`}
-          value={isNullabilityOperator ? "NULL" : scalarValue}
-          disabled={!scalarOperator || isNullabilityOperator}
+          value={
+            selectedOperator === "is_null"
+              ? "NULL"
+              : selectedOperator === "is_not_null"
+                ? "NOT NULL"
+                : scalarValue
+          }
+          disabled={
+            !scalarOperator ||
+            selectedOperator === "is_null" ||
+            selectedOperator === "is_not_null"
+          }
           onChange={(event) => {
             if (!scalarOperator) {
               return;
@@ -407,7 +415,9 @@ export function ColumnFilterControl({
           placeholder={scalarOperator ? scalarPlaceholder : ""}
           style={{
             ...inputStyle,
-            ...(!scalarOperator || isNullabilityOperator
+            ...(!scalarOperator ||
+            selectedOperator === "is_null" ||
+            selectedOperator === "is_not_null"
               ? lockedInputStyle
               : null),
           }}
