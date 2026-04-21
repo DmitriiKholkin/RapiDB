@@ -196,6 +196,35 @@ describe("shared contract parity", () => {
         payload: { primaryKeysList: [null] },
       }),
     ).toBeNull();
+
+    expect(
+      parseTablePanelMessage({
+        type: "confirmMutationPreview",
+        payload: {},
+      }),
+    ).toBeNull();
+  });
+
+  it("parses table mutation preview confirmation messages", () => {
+    expect(
+      parseTablePanelMessage({
+        type: "confirmMutationPreview",
+        payload: { previewToken: "preview-1" },
+      }),
+    ).toEqual({
+      type: "confirmMutationPreview",
+      payload: { previewToken: "preview-1" },
+    });
+
+    expect(
+      parseTablePanelMessage({
+        type: "cancelMutationPreview",
+        payload: { previewToken: "preview-2" },
+      }),
+    ).toEqual({
+      type: "cancelMutationPreview",
+      payload: { previewToken: "preview-2" },
+    });
   });
 
   it("preserves hasStoredSecret on parsed connection form messages", () => {

@@ -1,4 +1,3 @@
-// biome-ignore lint/style/useImportType: React is needed for JSX runtime typing in this file.
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   type QueryResult,

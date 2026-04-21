@@ -1,3 +1,4 @@
+/* biome-ignore-all lint/suspicious/noExplicitAny: legacy mock-heavy test file uses explicit any casts throughout */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ConnectionConfig,
@@ -11,13 +12,13 @@ import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
 import type {
   ColumnTypeMeta,
   IDBDriver,
-  QueryResult,
 } from "../../src/extension/dbDrivers/types";
-import { NULL_SENTINEL } from "../../src/extension/dbDrivers/types";
 import {
   applyChangesTransactional,
   type ColumnDef,
+  executePreparedApplyPlan,
   type Filter,
+  prepareApplyChangesPlan,
   type RowUpdate,
   TableDataService,
 } from "../../src/extension/tableDataService";
@@ -67,6 +68,7 @@ function makeMockDriver(overrides: Partial<IDBDriver> = {}): IDBDriver {
     buildFilterCondition: vi.fn().mockReturnValue(null),
     buildInsertValueExpr: () => "?",
     buildSetExpr: (c: ColumnTypeMeta) => `"${c.name}" = ?`,
+    materializePreviewSql: (sql: string) => sql,
     ...overrides,
   } as unknown as IDBDriver;
 }
@@ -2039,5 +2041,215 @@ describe("applyChangesTransactional", () => {
     ]);
     expect(mockRunTransaction).toHaveBeenCalledTimes(1);
     expect(mockQuery).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores read-only changes when building a prepared apply plan", () => {
+    const driver = makeMockDriver();
+    const cm = makeMockCM(driver);
+
+    const prepared = prepareApplyChangesPlan(
+      cm,
+      "conn1",
+      "testdb",
+      "public",
+      "users",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { created_at: "2026-04-21 10:00:00" },
+        },
+      ],
+      [
+        {
+          name: "id",
+          type: "integer",
+          nullable: false,
+          isPrimaryKey: true,
+          isForeignKey: false,
+          category: "integer",
+          nativeType: "integer",
+          filterable: true,
+          editable: true,
+          filterOperators: ["eq"],
+          isBoolean: false,
+        },
+        {
+          name: "created_at",
+          type: "timestamp",
+          nullable: true,
+          isPrimaryKey: false,
+          isForeignKey: false,
+          category: "datetime",
+          nativeType: "timestamp",
+          filterable: true,
+          editable: false,
+          filterOperators: ["like"],
+          isBoolean: false,
+        },
+      ],
+    );
+
+    expect(prepared).toEqual({
+      executable: false,
+      result: {
+        success: true,
+        rowOutcomes: [
+          {
+            rowIndex: 0,
+            success: true,
+            status: "skipped",
+            message: "No editable changes to apply.",
+          },
+        ],
+      },
+    });
+  });
+
+  it("short-circuits prevalidation failures before returning an executable plan", () => {
+    const postgres = new PostgresDriver(makeDriverConfig("pg"));
+    const driver = makeMockDriver({
+      checkPersistedEdit: postgres.checkPersistedEdit.bind(postgres),
+    });
+    const cm = makeMockCM(driver, "pg");
+
+    const prepared = prepareApplyChangesPlan(
+      cm,
+      "conn1",
+      "testdb",
+      "public",
+      "users",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { amount: "1234.567" },
+        },
+      ],
+      makeExactNumericColumns("numeric(10,2)"),
+    );
+
+    expect(prepared.executable).toBe(false);
+    if (prepared.executable) {
+      throw new Error("expected a non-executable preparation result");
+    }
+    expect(prepared.result.success).toBe(false);
+    expect(prepared.result.failedRows).toEqual([0]);
+  });
+
+  it("reuses prepared operations when executing an apply plan", async () => {
+    const mockRunTransaction = vi.fn().mockResolvedValue(undefined);
+    const mockQuery = vi.fn().mockResolvedValue({
+      columns: ["amount"],
+      rows: [{ __col_0: "1234.52" }],
+      rowCount: 1,
+      executionTimeMs: 0,
+    });
+    const driver = makeMockDriver({
+      runTransaction: mockRunTransaction,
+      query: mockQuery,
+    });
+    const cm = makeMockCM(driver);
+
+    const prepared = prepareApplyChangesPlan(
+      cm,
+      "conn1",
+      "testdb",
+      "public",
+      "users",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { amount: "1234.52" },
+        },
+      ],
+      makeExactNumericColumns("numeric(10,2)"),
+    );
+
+    expect(prepared.executable).toBe(true);
+    if (!prepared.executable) {
+      throw new Error("expected an executable preparation result");
+    }
+    expect(mockRunTransaction).not.toHaveBeenCalled();
+
+    const result = await executePreparedApplyPlan(cm, prepared.plan);
+
+    expect(mockRunTransaction).toHaveBeenCalledWith(prepared.plan.operations);
+    expect(result.success).toBe(true);
+    expect(result.rowOutcomes).toEqual([
+      expect.objectContaining({
+        rowIndex: 0,
+        status: "applied",
+        success: true,
+      }),
+    ]);
+  });
+
+  it("prepares an INSERT once and executes the same operation later", async () => {
+    const materializePreviewSql = vi.fn((sql: string) => sql);
+    const driver = makeMockDriver({
+      describeColumns: vi.fn().mockResolvedValue(makeTestColumns()),
+      materializePreviewSql,
+      query: vi.fn().mockResolvedValue({
+        columns: [],
+        rows: [],
+        rowCount: 1,
+        affectedRows: 1,
+        executionTimeMs: 0,
+      }),
+    });
+    const cm = makeMockCM(driver);
+    const svc = new TableDataService(cm);
+
+    const prepared = await svc.prepareInsertRow(
+      "conn1",
+      "testdb",
+      "public",
+      "users",
+      { id: 10, name: "Alice" },
+    );
+
+    expect(driver.query).not.toHaveBeenCalled();
+    expect(materializePreviewSql).toHaveBeenCalledWith(
+      'INSERT INTO "public"."users" ("id", "name") VALUES (?, ?)',
+      [10, "Alice"],
+    );
+    expect(prepared.previewStatements).toEqual([
+      'INSERT INTO "public"."users" ("id", "name") VALUES (?, ?)',
+    ]);
+
+    await svc.executePreparedInsertPlan(prepared);
+
+    expect(driver.query).toHaveBeenCalledTimes(1);
+    expect(driver.query).toHaveBeenCalledWith(
+      'INSERT INTO "public"."users" ("id", "name") VALUES (?, ?)',
+      [10, "Alice"],
+    );
+  });
+
+  it("throws when a prepared INSERT reports zero affected rows", async () => {
+    const driver = makeMockDriver({
+      describeColumns: vi.fn().mockResolvedValue(makeTestColumns()),
+      query: vi.fn().mockResolvedValue({
+        columns: [],
+        rows: [],
+        rowCount: 0,
+        affectedRows: 0,
+        executionTimeMs: 0,
+      }),
+    });
+    const cm = makeMockCM(driver);
+    const svc = new TableDataService(cm);
+
+    const prepared = await svc.prepareInsertRow(
+      "conn1",
+      "testdb",
+      "public",
+      "users",
+      { id: 10, name: "Alice" },
+    );
+
+    await expect(svc.executePreparedInsertPlan(prepared)).rejects.toThrow(
+      "Insert failed: the database reported 0 rows affected.",
+    );
+    expect(driver.query).toHaveBeenCalledTimes(1);
   });
 });

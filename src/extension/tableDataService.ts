@@ -9,11 +9,8 @@ import type {
   TransactionOperation,
 } from "./dbDrivers/types";
 import { buildWhere } from "./table/filterSql";
-import {
-  buildUpdateRowSql,
-  coerceRecord,
-  writableEntries,
-} from "./table/updateSql";
+import { buildInsertRowOperation } from "./table/insertSql";
+import { buildUpdateRowSql, coerceRecord } from "./table/updateSql";
 
 // Re-export formatDatetimeForDisplay for consumers that imported it from here
 export { formatDatetimeForDisplay } from "./dbDrivers/BaseDBDriver";
@@ -40,6 +37,35 @@ export interface RowUpdate {
 }
 
 export type ApplyResult = ApplyResultPayload;
+
+export interface PreparedInsertPlan {
+  connectionId: string;
+  operation: TransactionOperation;
+  previewStatements: string[];
+}
+
+export interface PreparedApplyPlan {
+  connectionId: string;
+  database: string;
+  schema: string;
+  table: string;
+  cols: ColumnDef[];
+  updates: RowUpdate[];
+  operations: TransactionOperation[];
+  previewStatements: string[];
+  skippedRows: number[];
+  verificationTargets: VerificationTarget[];
+}
+
+export type PreparedApplyPlanResult =
+  | {
+      executable: false;
+      result: ApplyResult;
+    }
+  | {
+      executable: true;
+      plan: PreparedApplyPlan;
+    };
 
 interface VerificationTarget {
   rowIndex: number;
@@ -217,35 +243,47 @@ export class TableDataService {
     table: string,
     values: Record<string, unknown>,
   ): Promise<void> {
-    const { drv } = this.conn(connectionId);
-    const qt = drv.qualifiedTableName(database, schema, table);
-    const cols = await this.getColumns(connectionId, database, schema, table);
-    const colMap = new Map(cols.map((c) => [c.name, c]));
-
-    const entries = writableEntries(values, colMap);
-    if (entries.length === 0) {
-      throw new Error(
-        "Insert failed: no values provided. Fill in at least one field or explicitly set a field to NULL.",
-      );
-    }
-
-    const colNames: string[] = [];
-    const valExprs: string[] = [];
-    const params: unknown[] = [];
-
-    for (let i = 0; i < entries.length; i++) {
-      const [colName, rawVal] = entries[i];
-      const meta = colMap.get(colName);
-      if (!meta) continue;
-      colNames.push(drv.quoteIdentifier(colName));
-      valExprs.push(drv.buildInsertValueExpr(meta, params.length + 1));
-      params.push(drv.coerceInputValue(rawVal, meta));
-    }
-
-    const result = await drv.query(
-      `INSERT INTO ${qt} (${colNames.join(", ")}) VALUES (${valExprs.join(", ")})`,
-      params,
+    const plan = await this.prepareInsertRow(
+      connectionId,
+      database,
+      schema,
+      table,
+      values,
     );
+    await this.executePreparedInsertPlan(plan);
+  }
+
+  async prepareInsertRow(
+    connectionId: string,
+    database: string,
+    schema: string,
+    table: string,
+    values: Record<string, unknown>,
+  ): Promise<PreparedInsertPlan> {
+    const { drv } = this.conn(connectionId);
+    const cols = await this.getColumns(connectionId, database, schema, table);
+    const operation = buildInsertRowOperation(
+      drv,
+      database,
+      schema,
+      table,
+      values,
+      cols,
+    );
+
+    return {
+      connectionId,
+      operation,
+      previewStatements: [
+        drv.materializePreviewSql(operation.sql, operation.params),
+      ],
+    };
+  }
+
+  async executePreparedInsertPlan(plan: PreparedInsertPlan): Promise<void> {
+    const { drv } = this.conn(plan.connectionId);
+
+    const result = await drv.query(plan.operation.sql, plan.operation.params);
 
     const affected = result.affectedRows ?? result.rowCount;
     if (affected !== undefined && affected === 0) {
@@ -489,16 +527,49 @@ export async function applyChangesTransactional(
   updates: RowUpdate[],
   cols: ColumnDef[],
 ): Promise<ApplyResult> {
-  if (updates.length === 0) return { success: true, rowOutcomes: [] };
+  const prepared = prepareApplyChangesPlan(
+    cm,
+    connectionId,
+    database,
+    schema,
+    table,
+    updates,
+    cols,
+  );
+
+  if (!prepared.executable) {
+    return prepared.result;
+  }
+
+  return executePreparedApplyPlan(cm, prepared.plan);
+}
+
+export function prepareApplyChangesPlan(
+  cm: ConnectionManager,
+  connectionId: string,
+  database: string,
+  schema: string,
+  table: string,
+  updates: RowUpdate[],
+  cols: ColumnDef[],
+): PreparedApplyPlanResult {
+  if (updates.length === 0) {
+    return { executable: false, result: { success: true, rowOutcomes: [] } };
+  }
 
   const driver = cm.getDriver(connectionId);
-  if (!driver) return { success: false, error: "Not connected" };
+  if (!driver) {
+    return {
+      executable: false,
+      result: { success: false, error: "Not connected" },
+    };
+  }
 
   const colMap = new Map(cols.map((col) => [col.name, col]));
-
   const operations: TransactionOperation[] = [];
+  const previewStatements: string[] = [];
   const validationFailures = new Map<number, ApplyRowOutcome>();
-  const verificationTargets = new Map<number, VerificationTarget>();
+  const verificationTargets: VerificationTarget[] = [];
   const skippedRows = new Set<number>();
 
   for (const [rowIndex, { primaryKeys, changes }] of updates.entries()) {
@@ -559,20 +630,22 @@ export async function applyChangesTransactional(
       changes,
       cols,
     );
-    if (op) {
-      operations.push({
-        sql: op.sql,
-        params: op.params,
-        checkAffectedRows: true,
-      });
-      verificationTargets.set(rowIndex, {
-        rowIndex,
-        primaryKeys: verificationPrimaryKeys,
-        values: verificationValues,
-      });
-    } else {
+    if (!op) {
       skippedRows.add(rowIndex);
+      continue;
     }
+
+    operations.push({
+      sql: op.sql,
+      params: op.params,
+      checkAffectedRows: true,
+    });
+    previewStatements.push(driver.materializePreviewSql(op.sql, op.params));
+    verificationTargets.push({
+      rowIndex,
+      primaryKeys: verificationPrimaryKeys,
+      values: verificationValues,
+    });
   }
 
   if (validationFailures.size > 0) {
@@ -594,43 +667,77 @@ export async function applyChangesTransactional(
     });
 
     return {
-      success: false,
-      error: summarizeOutcomeMessages(
-        "One or more edits were rejected before writing.",
-        rowOutcomes.filter(
-          (outcome) => outcome.status === "prevalidation_failed",
+      executable: false,
+      result: {
+        success: false,
+        error: summarizeOutcomeMessages(
+          "One or more edits were rejected before writing.",
+          rowOutcomes.filter(
+            (outcome) => outcome.status === "prevalidation_failed",
+          ),
         ),
-      ),
-      failedRows: [...validationFailures.keys()],
-      rowOutcomes,
+        failedRows: [...validationFailures.keys()],
+        rowOutcomes,
+      },
     };
   }
 
   if (operations.length === 0) {
     return {
-      success: true,
-      rowOutcomes: updates.map((_, rowIndex) =>
-        buildSkippedOutcome(rowIndex, "No editable changes to apply."),
-      ),
+      executable: false,
+      result: {
+        success: true,
+        rowOutcomes: updates.map((_, rowIndex) =>
+          buildSkippedOutcome(rowIndex, "No editable changes to apply."),
+        ),
+      },
     };
   }
 
-  try {
-    await driver.runTransaction(operations);
-
-    const verificationFailures = await verifyExactNumericUpdates(
-      driver,
+  return {
+    executable: true,
+    plan: {
+      connectionId,
       database,
       schema,
       table,
       cols,
-      [...verificationTargets.values()],
+      updates,
+      operations,
+      previewStatements,
+      skippedRows: [...skippedRows],
+      verificationTargets,
+    },
+  };
+}
+
+export async function executePreparedApplyPlan(
+  cm: ConnectionManager,
+  plan: PreparedApplyPlan,
+): Promise<ApplyResult> {
+  const driver = cm.getDriver(plan.connectionId);
+  if (!driver) {
+    return { success: false, error: "Not connected" };
+  }
+
+  const skippedRows = new Set(plan.skippedRows);
+
+  try {
+    await driver.runTransaction(plan.operations);
+
+    const verificationFailures = await verifyExactNumericUpdates(
+      driver,
+      plan.database,
+      plan.schema,
+      plan.table,
+      plan.cols,
+      plan.verificationTargets,
     );
     const verificationFailureMap = new Map(
       verificationFailures.map((failure) => [failure.rowIndex, failure]),
     );
 
-    const rowOutcomes = updates.map((_, rowIndex) => {
+    const rowOutcomes = plan.updates.map((_, rowIndex) => {
       if (skippedRows.has(rowIndex)) {
         return buildSkippedOutcome(rowIndex, "No editable changes to apply.");
       }
@@ -676,7 +783,7 @@ export async function applyChangesTransactional(
     return {
       success: false,
       error: message,
-      rowOutcomes: updates.map((_, rowIndex) =>
+      rowOutcomes: plan.updates.map((_, rowIndex) =>
         skippedRows.has(rowIndex)
           ? buildSkippedOutcome(rowIndex, "No editable changes to apply.")
           : buildSkippedOutcome(

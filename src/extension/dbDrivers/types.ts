@@ -157,6 +157,7 @@ export interface IDBDriver {
   ): FilterConditionResult | null;
   buildInsertValueExpr(column: ColumnTypeMeta, paramIndex: number): string;
   buildSetExpr(column: ColumnTypeMeta, paramIndex: number): string;
+  materializePreviewSql(sql: string, params?: readonly unknown[]): string;
 }
 
 export interface TransactionOperation {

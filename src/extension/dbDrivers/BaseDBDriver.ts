@@ -69,6 +69,88 @@ export function hexFromBuffer(val: Buffer): string {
   return val.length === 0 ? "" : `\\x${val.toString("hex")}`;
 }
 
+function escapePreviewSqlString(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
+function formatPreviewSqlLiteral(value: unknown): string {
+  if (value === null || value === undefined || value === NULL_SENTINEL) {
+    return "NULL";
+  }
+
+  if (typeof value === "string") {
+    return `'${escapePreviewSqlString(value)}'`;
+  }
+
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? String(value) : "NULL";
+  }
+
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+
+  if (typeof value === "boolean") {
+    return value ? "TRUE" : "FALSE";
+  }
+
+  if (value instanceof Date) {
+    const formatted = formatDatetimeForDisplay(value) ?? value.toISOString();
+    return `'${escapePreviewSqlString(formatted)}'`;
+  }
+
+  if (Buffer.isBuffer(value)) {
+    return `X'${value.toString("hex")}'`;
+  }
+
+  if (value instanceof ArrayBuffer) {
+    return `X'${Buffer.from(new Uint8Array(value)).toString("hex")}'`;
+  }
+
+  if (ArrayBuffer.isView(value)) {
+    return `X'${Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("hex")}'`;
+  }
+
+  try {
+    return `'${escapePreviewSqlString(JSON.stringify(value))}'`;
+  } catch {
+    return `'${escapePreviewSqlString(String(value))}'`;
+  }
+}
+
+function materializeSequentialPreviewSql(
+  sql: string,
+  params: readonly unknown[],
+): string {
+  const placeholderCount = (sql.match(/\?/g) ?? []).length;
+  if (placeholderCount !== params.length) {
+    throw new Error(
+      `[RapiDB] Preview parameter mismatch: SQL has ${placeholderCount} placeholder(s) but ${params.length} value(s) were supplied.`,
+    );
+  }
+
+  let index = 0;
+  return sql.replace(/\?/g, () => formatPreviewSqlLiteral(params[index++]));
+}
+
+function materializeIndexedPreviewSql(
+  sql: string,
+  params: readonly unknown[],
+  marker: "$" | ":",
+): string {
+  const placeholderPattern = marker === "$" ? /\$(\d+)/g : /:(\d+)/g;
+
+  return sql.replace(placeholderPattern, (match, rawIndex: string) => {
+    const paramIndex = Number.parseInt(rawIndex, 10) - 1;
+    if (paramIndex < 0 || paramIndex >= params.length) {
+      throw new Error(
+        `[RapiDB] Preview parameter mismatch: ${match} is out of range for ${params.length} value(s).`,
+      );
+    }
+    return formatPreviewSqlLiteral(params[paramIndex]);
+  });
+}
+
 export function parseHexToBuffer(value: string): Buffer {
   const stripped =
     value.startsWith("\\x") ||
@@ -787,6 +869,26 @@ export abstract class BaseDBDriver implements IDBDriver {
 
   buildSetExpr(column: ColumnTypeMeta, _paramIndex: number): string {
     return `${this.quoteIdentifier(column.name)} = ?`;
+  }
+
+  materializePreviewSql(sql: string, params?: readonly unknown[]): string {
+    if (!params || params.length === 0) {
+      return sql;
+    }
+
+    if (sql.includes("?")) {
+      return materializeSequentialPreviewSql(sql, params);
+    }
+
+    if (/\$\d+/.test(sql)) {
+      return materializeIndexedPreviewSql(sql, params, "$");
+    }
+
+    if (/:\d+/.test(sql)) {
+      return materializeIndexedPreviewSql(sql, params, ":");
+    }
+
+    return sql;
   }
 
   // ─── Type-aware data helpers ───

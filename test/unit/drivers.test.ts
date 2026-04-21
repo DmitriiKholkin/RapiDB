@@ -67,6 +67,48 @@ const ms = new MSSQLDriver(msConfig);
 const ora = new OracleDriver(oraConfig);
 const lite = new SQLiteDriver(sqliteConfig);
 
+describe("preview SQL materialization", () => {
+  it("interpolates SQLite positional parameters with display values", () => {
+    expect(
+      lite.materializePreviewSql(
+        'UPDATE "main"."apples" SET "name" = ? WHERE "id" = ?',
+        ["O'Red", 7],
+      ),
+    ).toBe(`UPDATE "main"."apples" SET "name" = 'O''Red' WHERE "id" = 7`);
+  });
+
+  it("interpolates PostgreSQL numbered parameters with display values", () => {
+    expect(
+      pg.materializePreviewSql(
+        'UPDATE "public"."users" SET "name" = $1 WHERE "id" = $2',
+        ["Alice", 1],
+      ),
+    ).toBe(`UPDATE "public"."users" SET "name" = 'Alice' WHERE "id" = 1`);
+  });
+
+  it("interpolates Oracle numbered parameters including NULL values", () => {
+    expect(
+      ora.materializePreviewSql(
+        'INSERT INTO "APPLES" ("NAME", "COLOR") VALUES (:1, :2)',
+        ["Honeycrisp", null],
+      ),
+    ).toBe(
+      `INSERT INTO "APPLES" ("NAME", "COLOR") VALUES ('Honeycrisp', NULL)`,
+    );
+  });
+
+  it("interpolates MSSQL positional parameters with display values", () => {
+    expect(
+      ms.materializePreviewSql(
+        "UPDATE [dbo].[apples] SET [name] = CAST(? AS nvarchar(max)) WHERE [id] = ?",
+        ["Granny Smith", 3],
+      ),
+    ).toBe(
+      `UPDATE [dbo].[apples] SET [name] = CAST('Granny Smith' AS nvarchar(max)) WHERE [id] = 3`,
+    );
+  });
+});
+
 function mssqlTypeName(sqlType: unknown): string {
   if (typeof sqlType === "function") {
     return sqlType.name;

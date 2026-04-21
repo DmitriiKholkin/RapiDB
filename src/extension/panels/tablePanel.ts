@@ -1,14 +1,21 @@
+import { randomUUID } from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 import { coerceFilterExpressions } from "../../shared/tableTypes";
-import type { ApplyResultPayload } from "../../shared/webviewContracts";
+import type {
+  ApplyResultPayload,
+  TableMutationPreviewPayload,
+} from "../../shared/webviewContracts";
 import { parseTablePanelMessage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import {
-  applyChangesTransactional,
+  executePreparedApplyPlan,
   type Filter,
+  type PreparedApplyPlan,
+  type PreparedInsertPlan,
+  prepareApplyChangesPlan,
   type SortConfig,
   TableDataService,
 } from "../tableDataService";
@@ -16,7 +23,18 @@ import {
   logErrorWithContext,
   normalizeUnknownError,
 } from "../utils/errorHandling";
+import { formatMutationPreviewSql } from "../utils/mutationPreview";
 import { createWebviewShell } from "./webviewShell";
+
+type PendingTableMutationPreview =
+  | {
+      kind: "applyChanges";
+      plan: PreparedApplyPlan;
+    }
+  | {
+      kind: "insertRow";
+      plan: PreparedInsertPlan;
+    };
 
 export class TablePanel {
   private static readonly viewType = "rapidb.tablePanel";
@@ -31,6 +49,10 @@ export class TablePanel {
   private readonly schema: string;
   private readonly table: string;
   private readonly isView: boolean;
+  private readonly pendingMutationPreviews = new Map<
+    string,
+    PendingTableMutationPreview
+  >();
 
   private cachedColumns: import("../tableDataService").ColumnDef[] = [];
 
@@ -57,6 +79,7 @@ export class TablePanel {
 
     const key = TablePanel.panelKey(connectionId, database, schema, table);
     this.panel.onDidDispose(() => {
+      this.pendingMutationPreviews.clear();
       TablePanel.panels.delete(key);
 
       this.svc.clearForConnection(connectionId);
@@ -231,7 +254,7 @@ export class TablePanel {
         }
         const { updates } = payload;
         try {
-          const result: ApplyResultPayload = await applyChangesTransactional(
+          const prepared = prepareApplyChangesPlan(
             this.cm,
             this.connectionId,
             this.database,
@@ -240,10 +263,22 @@ export class TablePanel {
             updates ?? [],
             this.cachedColumns,
           );
-          if (result.warning) {
-            void vscode.window.showWarningMessage(`[RapiDB] ${result.warning}`);
+
+          if (!prepared.executable) {
+            if (prepared.result.warning) {
+              void vscode.window.showWarningMessage(
+                `[RapiDB] ${prepared.result.warning}`,
+              );
+            }
+            send("applyResult", prepared.result);
+            break;
           }
-          send("applyResult", result);
+
+          const previewToken = this.storePendingMutationPreview({
+            kind: "applyChanges",
+            plan: prepared.plan,
+          });
+          await this.previewAndConfirmMutation(previewToken, send);
         } catch (err: unknown) {
           const error = normalizeUnknownError(err);
           send("applyResult", {
@@ -261,14 +296,18 @@ export class TablePanel {
         }
         const { values = {} } = payload;
         try {
-          await this.svc.insertRow(
+          const plan = await this.svc.prepareInsertRow(
             this.connectionId,
             this.database,
             this.schema,
             this.table,
             values,
           );
-          send("insertResult", { success: true });
+          const previewToken = this.storePendingMutationPreview({
+            kind: "insertRow",
+            plan,
+          });
+          await this.previewAndConfirmMutation(previewToken, send);
         } catch (err: unknown) {
           const error = normalizeUnknownError(err);
           send("insertResult", {
@@ -488,7 +527,108 @@ export class TablePanel {
         send("deleteConfirmed", { confirmed: answer === "Delete" });
         break;
       }
+
+      case "confirmMutationPreview": {
+        const payload = parsed.payload;
+        if (!payload) {
+          return;
+        }
+        await this.executePendingMutationPreview(payload.previewToken, send);
+        break;
+      }
+
+      case "cancelMutationPreview": {
+        const payload = parsed.payload;
+        if (!payload) {
+          return;
+        }
+        this.cancelPendingMutationPreview(payload.previewToken, send);
+        break;
+      }
     }
+  }
+
+  private storePendingMutationPreview(
+    preview: PendingTableMutationPreview,
+  ): string {
+    const previewToken = randomUUID();
+    this.pendingMutationPreviews.set(previewToken, preview);
+    return previewToken;
+  }
+
+  private async previewAndConfirmMutation(
+    previewToken: string,
+    send: (type: string, payload: unknown) => Thenable<boolean>,
+  ): Promise<void> {
+    const preview = this.pendingMutationPreviews.get(previewToken);
+    if (!preview) {
+      return;
+    }
+
+    const connectionType = this.cm.getConnection(this.connectionId)?.type;
+    const previewStatements = preview.plan.previewStatements;
+    const title =
+      preview.kind === "applyChanges"
+        ? `Apply changes to ${this.table}`
+        : `Insert row into ${this.table}`;
+    const sql = formatMutationPreviewSql(previewStatements, connectionType);
+
+    const payload: TableMutationPreviewPayload = {
+      previewToken,
+      kind: preview.kind,
+      title,
+      sql,
+      statementCount: previewStatements.length,
+    };
+
+    await send("tableMutationPreview", payload);
+  }
+
+  private async executePendingMutationPreview(
+    previewToken: string,
+    send: (type: string, payload: unknown) => Thenable<boolean>,
+  ): Promise<void> {
+    const preview = this.pendingMutationPreviews.get(previewToken);
+    if (!preview) {
+      return;
+    }
+
+    this.pendingMutationPreviews.delete(previewToken);
+
+    if (preview.kind === "applyChanges") {
+      const result: ApplyResultPayload = await executePreparedApplyPlan(
+        this.cm,
+        preview.plan,
+      );
+      if (result.warning) {
+        void vscode.window.showWarningMessage(`[RapiDB] ${result.warning}`);
+      }
+      send("applyResult", result);
+      return;
+    }
+
+    try {
+      await this.svc.executePreparedInsertPlan(preview.plan);
+      send("insertResult", { success: true });
+    } catch (err: unknown) {
+      const error = normalizeUnknownError(err);
+      send("insertResult", {
+        success: false,
+        error: error.message,
+      });
+    }
+  }
+
+  private cancelPendingMutationPreview(
+    previewToken: string,
+    _send: (type: string, payload: unknown) => Thenable<boolean>,
+  ): void {
+    const preview = this.pendingMutationPreviews.get(previewToken);
+    if (!preview) {
+      return;
+    }
+
+    this.pendingMutationPreviews.delete(previewToken);
   }
 
   private buildHtml(context: vscode.ExtensionContext): string {

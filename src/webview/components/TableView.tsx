@@ -9,6 +9,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import React, {
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -21,11 +22,15 @@ import {
   NULL_SENTINEL,
   serializeFilterDrafts,
 } from "../../shared/tableTypes";
-import type { ApplyResultPayload } from "../../shared/webviewContracts";
+import type {
+  ApplyResultPayload,
+  TableMutationPreviewPayload,
+} from "../../shared/webviewContracts";
 import type { PendingEdits, Row } from "../types";
 import { type Column, calcColWidths } from "../utils/columnSizing";
 import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
+import { MonacoEditor } from "./MonacoEditor";
 import { CellDisplay } from "./table/CellDisplay";
 import { ColumnFilterControl } from "./table/ColumnFilterControl";
 import { EditInput, valueToEditString } from "./table/EditInput";
@@ -46,6 +51,7 @@ const ROW_H = 26;
 const HEADER_H = 28;
 const FILTER_H = 30;
 const TOOLBAR_H = 36;
+const PREVIEW_DIALOG_EDITOR_H = "min(42vh, 360px)";
 
 const TABLE_ROW_STYLE_ID = "rapidb-table-row-style";
 if (
@@ -291,6 +297,8 @@ export function TableView({
     column: string;
     direction: "asc" | "desc";
   } | null>(null);
+  const [mutationPreview, setMutationPreview] =
+    useState<TableMutationPreviewPayload | null>(null);
 
   const [colSizes, setColSizes] = useState<Record<string, number>>({});
 
@@ -518,6 +526,12 @@ export function TableView({
         postMessage("deleteRows", { primaryKeysList: toDelete });
       },
     );
+    const unMutationPreview = onMessage<TableMutationPreviewPayload>(
+      "tableMutationPreview",
+      (payload) => {
+        setMutationPreview(payload);
+      },
+    );
 
     postMessage("ready");
     return () => {
@@ -528,6 +542,7 @@ export function TableView({
       unInsert();
       unDelete();
       unConfirm();
+      unMutationPreview();
     };
   }, [fetchPage]);
 
@@ -681,6 +696,59 @@ export function TableView({
     setMutErr(null);
     postMessage("insertRow", { values: newRow });
   }, [newRow, inserting]);
+
+  const clearApplyRequestState = useCallback(() => {
+    setApplying(false);
+    applyPendingSnapshotRef.current = new Map();
+    applyRowIndexesRef.current = [];
+  }, []);
+
+  const cancelMutationPreview = useCallback(() => {
+    if (!mutationPreview) {
+      return;
+    }
+
+    const { kind, previewToken } = mutationPreview;
+    setMutationPreview(null);
+
+    if (kind === "applyChanges") {
+      clearApplyRequestState();
+    } else {
+      setInserting(false);
+    }
+
+    postMessage("cancelMutationPreview", { previewToken });
+  }, [clearApplyRequestState, mutationPreview]);
+
+  const confirmMutationPreview = useCallback(() => {
+    if (!mutationPreview) {
+      return;
+    }
+
+    const { previewToken } = mutationPreview;
+    setMutationPreview(null);
+    postMessage("confirmMutationPreview", { previewToken });
+  }, [mutationPreview]);
+
+  useEffect(() => {
+    if (!mutationPreview) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") {
+        return;
+      }
+
+      event.preventDefault();
+      cancelMutationPreview();
+    };
+
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown, true);
+    };
+  }, [cancelMutationPreview, mutationPreview]);
 
   const columnsMap = useMemo(
     () => new Map(columns.map((c) => [c.name, c])),
@@ -849,6 +917,7 @@ export function TableView({
         flexDirection: "column",
         height: "100vh",
         overflow: "hidden",
+        position: "relative",
       }}
     >
       {filterError && (
@@ -1380,6 +1449,228 @@ export function TableView({
             </option>
           ))}
         </select>
+      </div>
+
+      {mutationPreview && (
+        <MutationPreviewDialog
+          preview={mutationPreview}
+          onCancel={cancelMutationPreview}
+          onConfirm={confirmMutationPreview}
+        />
+      )}
+    </div>
+  );
+}
+
+function MutationPreviewDialog({
+  preview,
+  onCancel,
+  onConfirm,
+}: {
+  preview: TableMutationPreviewPayload;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const confirmLabel =
+    preview.kind === "applyChanges" ? "Apply Changes" : "Insert Row";
+  const titleId = useId();
+  const descriptionId = useId();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const confirmButtonRef = useRef<HTMLButtonElement>(null);
+
+  const getFocusableElements = useCallback((): HTMLElement[] => {
+    const dialog = dialogRef.current;
+    if (!dialog) {
+      return [];
+    }
+
+    return Array.from(
+      dialog.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    );
+  }, []);
+
+  useEffect(() => {
+    const previousActiveElement =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+
+    closeButtonRef.current?.focus();
+
+    return () => {
+      previousActiveElement?.focus();
+    };
+  }, []);
+
+  const handleDialogKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLDivElement>) => {
+      if (event.key !== "Tab") {
+        return;
+      }
+
+      const focusableElements = getFocusableElements();
+
+      if (focusableElements.length === 0) {
+        event.preventDefault();
+        dialogRef.current?.focus();
+        return;
+      }
+
+      const firstElement = focusableElements[0];
+      const lastElement = focusableElements[focusableElements.length - 1];
+      const activeElement =
+        document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : null;
+
+      if (!activeElement || !dialogRef.current?.contains(activeElement)) {
+        event.preventDefault();
+        firstElement.focus();
+        return;
+      }
+
+      if (event.shiftKey && activeElement === firstElement) {
+        event.preventDefault();
+        lastElement.focus();
+        return;
+      }
+
+      if (!event.shiftKey && activeElement === lastElement) {
+        event.preventDefault();
+        firstElement.focus();
+      }
+    },
+    [getFocusableElements],
+  );
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        inset: 0,
+        zIndex: 30,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 24,
+        background: "rgba(0, 0, 0, 0.36)",
+        backdropFilter: "blur(2px)",
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={descriptionId}
+        tabIndex={-1}
+        ref={dialogRef}
+        onKeyDown={handleDialogKeyDown}
+        style={{
+          width: "min(920px, calc(100vw - 48px))",
+          maxHeight: "calc(100vh - 48px)",
+          display: "flex",
+          flexDirection: "column",
+          overflow: "hidden",
+          borderRadius: 6,
+          border: "1px solid var(--vscode-panel-border)",
+          background: "var(--vscode-editor-background)",
+          boxShadow: "0 18px 48px rgba(0, 0, 0, 0.42)",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "flex-start",
+            justifyContent: "space-between",
+            gap: 12,
+            padding: "14px 16px 12px",
+            borderBottom: "1px solid var(--vscode-panel-border)",
+            background: "var(--vscode-editorGroupHeader-tabsBackground)",
+          }}
+        >
+          <div style={{ minWidth: 0 }}>
+            <div id={titleId} style={{ fontSize: 13, fontWeight: 600 }}>
+              {preview.title}
+            </div>
+            <div
+              id={descriptionId}
+              style={{
+                marginTop: 4,
+                fontSize: 11,
+                opacity: 0.75,
+              }}
+            >
+              {preview.statementCount} statement
+              {preview.statementCount === 1 ? "" : "s"} will be executed. The
+              SQL below is read only and matches the prepared mutation plan.
+            </div>
+          </div>
+          <button
+            type="button"
+            ref={closeButtonRef}
+            onClick={onCancel}
+            aria-label="Close SQL preview"
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "var(--vscode-foreground)",
+              cursor: "pointer",
+              padding: 0,
+              opacity: 0.8,
+            }}
+          >
+            <Icon name="close" size={14} />
+          </button>
+        </div>
+
+        <div
+          style={{
+            padding: "12px 16px 16px",
+            display: "flex",
+            flexDirection: "column",
+            gap: 12,
+          }}
+        >
+          <div
+            style={{
+              height: PREVIEW_DIALOG_EDITOR_H,
+              border: "1px solid var(--vscode-panel-border)",
+              borderRadius: 4,
+              overflow: "hidden",
+            }}
+          >
+            <MonacoEditor
+              key={preview.previewToken}
+              initialValue={preview.sql}
+              height="100%"
+              readOnly
+              ariaLabel="SQL mutation preview"
+            />
+          </div>
+
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "flex-end",
+              gap: 8,
+            }}
+          >
+            <button type="button" style={btn("ghost")} onClick={onCancel}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              ref={confirmButtonRef}
+              style={btn("primary")}
+              onClick={onConfirm}
+            >
+              {confirmLabel}
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );

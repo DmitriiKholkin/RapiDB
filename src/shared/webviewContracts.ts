@@ -101,6 +101,20 @@ export interface RowUpdateMessagePayload {
   changes: Record<string, unknown>;
 }
 
+export type TableMutationPreviewKind = "applyChanges" | "insertRow";
+
+export interface TableMutationPreviewPayload {
+  previewToken: string;
+  kind: TableMutationPreviewKind;
+  title: string;
+  sql: string;
+  statementCount: number;
+}
+
+export interface TableMutationPreviewDecisionPayload {
+  previewToken: string;
+}
+
 export type TablePanelMessage =
   | WebviewMessageEnvelope<"ready">
   | WebviewMessageEnvelope<
@@ -127,7 +141,15 @@ export type TablePanelMessage =
       "exportJSON",
       { sort?: unknown; filters?: unknown[] }
     >
-  | WebviewMessageEnvelope<"confirmDelete", { count: number }>;
+  | WebviewMessageEnvelope<"confirmDelete", { count: number }>
+  | WebviewMessageEnvelope<
+      "confirmMutationPreview",
+      TableMutationPreviewDecisionPayload
+    >
+  | WebviewMessageEnvelope<
+      "cancelMutationPreview",
+      TableMutationPreviewDecisionPayload
+    >;
 
 export type SchemaPanelMessage =
   | WebviewMessageEnvelope<"ready">
@@ -570,6 +592,17 @@ export function parseTablePanelMessage(
       return count === undefined
         ? null
         : { type: envelope.type, payload: { count } };
+    }
+
+    case "confirmMutationPreview":
+    case "cancelMutationPreview": {
+      if (!isRecord(envelope.payload)) {
+        return null;
+      }
+      const previewToken = readRequiredString(envelope.payload, "previewToken");
+      return previewToken
+        ? { type: envelope.type, payload: { previewToken } }
+        : null;
     }
 
     default:

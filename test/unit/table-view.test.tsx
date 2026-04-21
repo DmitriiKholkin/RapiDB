@@ -13,6 +13,17 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ColumnTypeMeta as ColumnMeta } from "../../src/shared/tableTypes";
+
+vi.mock("../../src/webview/components/MonacoEditor", () => ({
+  MonacoEditor: ({
+    initialValue = "",
+    ariaLabel = "SQL editor",
+  }: {
+    initialValue?: string;
+    ariaLabel?: string;
+  }) => <textarea aria-label={ariaLabel} readOnly value={initialValue} />,
+}));
+
 import { TableView } from "../../src/webview/components/TableView";
 import { categoryColor } from "../../src/webview/types";
 
@@ -428,7 +439,7 @@ describe("TableView", () => {
       "payload filter value",
     ) as HTMLInputElement;
     expect(input.disabled).toBe(true);
-    expect(input.value).toBe("NULL");
+    expect(input.value).toBe("NOT NULL");
     expect(trigger.textContent).toBe("!N");
   });
 
@@ -866,5 +877,216 @@ describe("TableView", () => {
     expect(fetchMessageCount()).toBe(fetchCountBeforeApply);
     expect(screen.getByText("Alicia")).toBeDefined();
     expect(screen.getByRole("button", { name: "Apply Changes" })).toBeDefined();
+  });
+
+  it("shows a blocking SQL preview for table edits and confirms with previewToken only", async () => {
+    await renderEditableTable();
+    await editCellValue("Alice", "Alicia");
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply Changes" }));
+
+    emit("tableMutationPreview", {
+      previewToken: "preview-apply-1",
+      kind: "applyChanges",
+      title: "Apply changes to users",
+      sql: 'UPDATE "public"."users"\nSET "name" = \'Alicia\'\nWHERE "id" = 1;',
+      statementCount: 1,
+    });
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Apply changes to users",
+    });
+    const cancelButton = within(dialog).getByRole("button", {
+      name: "Close SQL preview",
+    });
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(cancelButton);
+    });
+
+    expect(
+      (
+        within(dialog).getByRole("textbox", {
+          name: "SQL mutation preview",
+        }) as HTMLTextAreaElement
+      ).value,
+    ).toBe('UPDATE "public"."users"\nSET "name" = \'Alicia\'\nWHERE "id" = 1;');
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Apply Changes" }),
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+
+    expect(getLastMessage("confirmMutationPreview")?.payload).toEqual({
+      previewToken: "preview-apply-1",
+    });
+  });
+
+  it("cancels table edit preview without dropping pending edits", async () => {
+    await renderEditableTable();
+    await editCellValue("Alice", "Alicia");
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply Changes" }));
+
+    emit("tableMutationPreview", {
+      previewToken: "preview-apply-cancel",
+      kind: "applyChanges",
+      title: "Apply changes to users",
+      sql: 'UPDATE "public"."users" SET "name" = \'Alicia\' WHERE "id" = 1;',
+      statementCount: 1,
+    });
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Apply changes to users",
+    });
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+
+    expect(getLastMessage("cancelMutationPreview")?.payload).toEqual({
+      previewToken: "preview-apply-cancel",
+    });
+    expect(screen.getByText(/1 row with unsaved changes/i)).toBeDefined();
+    expect(screen.getByText("Alicia")).toBeDefined();
+    expect(screen.queryByText(/cancelled/i)).toBeNull();
+  });
+
+  it("cancels table edit preview on Escape without dropping pending edits", async () => {
+    await renderEditableTable();
+    await editCellValue("Alice", "Alicia");
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply Changes" }));
+
+    emit("tableMutationPreview", {
+      previewToken: "preview-apply-escape",
+      kind: "applyChanges",
+      title: "Apply changes to users",
+      sql: 'UPDATE "public"."users" SET "name" = \'Alicia\' WHERE "id" = 1;',
+      statementCount: 1,
+    });
+
+    await screen.findByRole("dialog", {
+      name: "Apply changes to users",
+    });
+
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+
+    expect(getLastMessage("cancelMutationPreview")?.payload).toEqual({
+      previewToken: "preview-apply-escape",
+    });
+    expect(screen.getByText(/1 row with unsaved changes/i)).toBeDefined();
+    expect(screen.getByText("Alicia")).toBeDefined();
+  });
+
+  it("cancels insert preview without dropping the drafted row", async () => {
+    await renderEditableTable();
+
+    const fetchPayload = getLastMessage("fetchPage")?.payload as
+      | { fetchId?: number }
+      | undefined;
+    if (fetchPayload?.fetchId !== undefined) {
+      emit("tableData", {
+        fetchId: fetchPayload.fetchId,
+        rows: [{ id: 1, name: "Alice" }],
+        totalCount: 1,
+      });
+    }
+
+    await waitFor(() => {
+      expect(
+        (screen.getByRole("button", { name: "Add Row" }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(false);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Add Row" }));
+
+    const newRowLabel = await screen.findByText("New row:");
+    const newRowForm = newRowLabel.parentElement as HTMLElement;
+
+    const nameInput = newRowForm.querySelectorAll("input").item(1) as
+      | HTMLInputElement
+      | undefined;
+    expect(nameInput).toBeDefined();
+
+    fireEvent.change(nameInput as HTMLInputElement, {
+      target: { value: "Charlie" },
+    });
+
+    fireEvent.click(within(newRowForm).getByRole("button", { name: "Insert" }));
+
+    expect(getLastMessage("insertRow")?.payload).toEqual({
+      values: { name: "Charlie" },
+    });
+
+    emit("tableMutationPreview", {
+      previewToken: "preview-insert-1",
+      kind: "insertRow",
+      title: "Insert row into users",
+      sql: 'INSERT INTO "public"."users" ("name")\nVALUES (\'Charlie\');',
+      statementCount: 1,
+    });
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Insert row into users",
+    });
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+
+    expect(getLastMessage("cancelMutationPreview")?.payload).toEqual({
+      previewToken: "preview-insert-1",
+    });
+    expect(screen.getByDisplayValue("Charlie")).toBeDefined();
+    expect(screen.queryByText("Inserting…")).toBeNull();
+    expect(screen.queryByText(/insert cancelled/i)).toBeNull();
+  });
+
+  it("keeps keyboard focus trapped inside the SQL preview dialog", async () => {
+    await renderEditableTable();
+    await editCellValue("Alice", "Alicia");
+
+    fireEvent.click(screen.getByRole("button", { name: "Apply Changes" }));
+
+    emit("tableMutationPreview", {
+      previewToken: "preview-apply-focus-trap",
+      kind: "applyChanges",
+      title: "Apply changes to users",
+      sql: 'UPDATE "public"."users" SET "name" = \'Alicia\' WHERE "id" = 1;',
+      statementCount: 1,
+    });
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Apply changes to users",
+    });
+    const closeButton = within(dialog).getByRole("button", {
+      name: "Close SQL preview",
+    });
+    const confirmButton = within(dialog).getByRole("button", {
+      name: "Apply Changes",
+    });
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(closeButton);
+    });
+
+    fireEvent.keyDown(dialog, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(confirmButton);
+
+    fireEvent.keyDown(dialog, { key: "Tab" });
+    expect(document.activeElement).toBe(closeButton);
   });
 });
