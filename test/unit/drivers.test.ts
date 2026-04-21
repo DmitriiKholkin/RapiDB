@@ -417,6 +417,7 @@ describe("driver-owned persisted edit checks", () => {
     ["MySQL blob", my, "blob", "\\xdeadbeef", "binary", true],
     ["MySQL text", my, "varchar(32)", "alpha", "text", true],
     ["MySQL float", my, "double", "12.5", "float", true],
+    ["MySQL bit", my, "bit(8)", "42", "integer", true],
     [
       "MSSQL uuid",
       ms,
@@ -545,6 +546,7 @@ describe("driver-owned persisted edit checks", () => {
   it.each([
     ["Postgres", pg, "jsonb", "{bad json", "valid JSON"],
     ["MySQL", my, "json", "{bad json", "valid JSON"],
+    ["MySQL", my, "bit(8)", "256", "BIT(8) value between 0 and 255"],
     ["SQLite", lite, "JSON", "{bad json", "valid JSON"],
     ["Postgres", pg, "uuid", "not-a-uuid", "valid UUID"],
     ["MSSQL", ms, "uniqueidentifier", "not-a-uuid", "valid UUID"],
@@ -1395,7 +1397,7 @@ describe("MySQLDriver", () => {
   describe("mapTypeCategory", () => {
     it.each([
       ["tinyint(1)", "boolean"],
-      ["bit(1)", "boolean"],
+      ["bit(1)", "integer"],
       ["bool", "boolean"],
       ["boolean", "boolean"],
       ["tinyint(4)", "integer"],
@@ -1442,15 +1444,21 @@ describe("MySQLDriver", () => {
   });
 
   describe("isBooleanType", () => {
-    it("true for tinyint(1), bit(1), boolean", () => {
+    it("true for tinyint(1) and boolean aliases only", () => {
       expect(my.isBooleanType("tinyint(1)")).toBe(true);
       expect(my.isBooleanType("tinyint(1) unsigned")).toBe(true);
-      expect(my.isBooleanType("bit(1)")).toBe(true);
       expect(my.isBooleanType("boolean")).toBe(true);
     });
     it("false for tinyint(4), bit(8)", () => {
       expect(my.isBooleanType("tinyint(4)")).toBe(false);
+      expect(my.isBooleanType("bit(1)")).toBe(false);
       expect(my.isBooleanType("bit(8)")).toBe(false);
+    });
+
+    it("detects bit semantics separately", () => {
+      expect(my.isBitType("bit(1)")).toBe(true);
+      expect(my.isBitType("bit(8)")).toBe(true);
+      expect(my.isBitType("boolean")).toBe(false);
     });
   });
 
@@ -1616,9 +1624,26 @@ describe("MySQLDriver", () => {
         type: "bit(8)",
         category: "integer",
         nativeType: "bit(8)",
-        isBoolean: false,
+        valueSemantics: "bit",
       });
       expect(my.coerceInputValue("5", c)).toBe(5);
+    });
+
+    it("rejects negative and out-of-range bit values", () => {
+      const c = col({
+        name: "flags",
+        type: "bit(8)",
+        category: "integer",
+        nativeType: "bit(8)",
+        valueSemantics: "bit",
+      });
+
+      expect(() => my.coerceInputValue("-1", c)).toThrow(
+        "expects an unsigned BIT(8) value between 0 and 255",
+      );
+      expect(() => my.coerceInputValue("256", c)).toThrow(
+        "expects an unsigned BIT(8) value between 0 and 255",
+      );
     });
   });
 
@@ -1686,6 +1711,20 @@ describe("MySQLDriver", () => {
       });
       const r = my.buildFilterCondition(c, "like", "0xDEAD", 1);
       expect(r?.sql).toContain("HEX");
+    });
+
+    it("rejects out-of-range bit filters using the declared width", () => {
+      const c = col({
+        name: "flags",
+        type: "bit(8)",
+        category: "integer",
+        nativeType: "bit(8)",
+        valueSemantics: "bit",
+      });
+
+      expect(() => my.buildFilterCondition(c, "eq", "256", 1)).toThrow(
+        "expects an unsigned BIT(8) value between 0 and 255",
+      );
     });
 
     it("uses CAST AS CHAR LIKE for text", () => {
@@ -1858,7 +1897,7 @@ describe("MySQLDriver", () => {
 describe("MSSQLDriver", () => {
   describe("mapTypeCategory", () => {
     it.each([
-      ["bit", "boolean"],
+      ["bit", "integer"],
       ["tinyint", "integer"],
       ["smallint", "integer"],
       ["int", "integer"],
@@ -1899,12 +1938,17 @@ describe("MSSQLDriver", () => {
   });
 
   describe("isBooleanType", () => {
-    it("true only for bit", () => {
-      expect(ms.isBooleanType("bit")).toBe(true);
+    it("does not classify bit as boolean semantics", () => {
+      expect(ms.isBooleanType("bit")).toBe(false);
     });
     it("false for others", () => {
       expect(ms.isBooleanType("tinyint")).toBe(false);
       expect(ms.isBooleanType("boolean")).toBe(false);
+    });
+
+    it("detects bit semantics separately", () => {
+      expect(ms.isBitType("bit")).toBe(true);
+      expect(ms.isBitType("tinyint")).toBe(false);
     });
   });
 
@@ -1982,15 +2026,15 @@ describe("MSSQLDriver", () => {
   });
 
   describe("coerceInputValue", () => {
-    it("returns true/false for boolean", () => {
+    it("returns 0/1 for bit semantics", () => {
       const c = col({
         name: "b",
         type: "bit",
-        category: "boolean",
-        isBoolean: true,
+        category: "integer",
+        valueSemantics: "bit",
       });
-      expect(ms.coerceInputValue("true", c)).toBe(true);
-      expect(ms.coerceInputValue("false", c)).toBe(false);
+      expect(ms.coerceInputValue("true", c)).toBe(1);
+      expect(ms.coerceInputValue("false", c)).toBe(0);
     });
 
     it("converts hex to Buffer for binary", () => {
@@ -2550,8 +2594,8 @@ describe("MSSQLDriver", () => {
       const c = col({
         name: "active",
         type: "bit",
-        category: "boolean",
-        isBoolean: true,
+        category: "integer",
+        valueSemantics: "bit",
       });
       const r = ms.buildFilterCondition(c, "neq", "true", 1);
       expect(r?.sql).toContain("<>");

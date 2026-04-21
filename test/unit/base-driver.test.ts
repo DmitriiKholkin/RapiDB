@@ -460,7 +460,7 @@ describe("BaseDBDriver defaults", () => {
       expect(result.nativeType).toBe("text");
       expect(result.filterable).toBe(true);
       expect(result.editable).toBe(true);
-      expect(result.isBoolean).toBe(false);
+      expect(result.valueSemantics).toBe("plain");
       expect(result.filterOperators).toContain("like");
     });
 
@@ -473,7 +473,7 @@ describe("BaseDBDriver defaults", () => {
         isForeignKey: false,
       });
       expect(result.category).toBe("boolean");
-      expect(result.isBoolean).toBe(true);
+      expect(result.valueSemantics).toBe("boolean");
       expect(result.filterOperators).toEqual([
         "eq",
         "neq",

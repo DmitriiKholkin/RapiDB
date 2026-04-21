@@ -27,18 +27,10 @@ describe("shared contract parity", () => {
   });
 
   it("centralizes the default value-filter operator policy in shared helpers", () => {
-    expect(
-      defaultFilterOperator({ category: "boolean", isBoolean: true }),
-    ).toBe("eq");
-    expect(
-      defaultFilterOperator({ category: "integer", isBoolean: false }),
-    ).toBe("eq");
-    expect(defaultFilterOperator({ category: "date", isBoolean: false })).toBe(
-      "eq",
-    );
-    expect(defaultFilterOperator({ category: "text", isBoolean: false })).toBe(
-      "like",
-    );
+    expect(defaultFilterOperator({ category: "boolean" })).toBe("eq");
+    expect(defaultFilterOperator({ category: "integer" })).toBe("eq");
+    expect(defaultFilterOperator({ category: "date" })).toBe("eq");
+    expect(defaultFilterOperator({ category: "text" })).toBe("like");
   });
 
   it("uses shared operator policy only when the column supports value filters", () => {
@@ -47,7 +39,6 @@ describe("shared contract parity", () => {
         category: "text",
         filterable: true,
         filterOperators: ["like", "is_null"],
-        isBoolean: false,
       }),
     ).toBe("like");
 
@@ -56,7 +47,6 @@ describe("shared contract parity", () => {
         category: "text",
         filterable: true,
         filterOperators: ["eq", "is_null"],
-        isBoolean: false,
       }),
     ).toBeNull();
   });
@@ -273,7 +263,7 @@ describe("shared contract parity", () => {
       filterable: true,
       editable: true,
       filterOperators: ["like"] as FilterOperator[],
-      isBoolean: false,
+      valueSemantics: "plain" as const,
     };
 
     it("builds a structured value filter", () => {

@@ -20,6 +20,7 @@ import type {
   SchemaInfo,
   TableInfo,
   TypeCategory,
+  ValueSemantics,
 } from "./types";
 import { ISO_DATETIME_RE, NULL_SENTINEL } from "./types";
 
@@ -656,9 +657,16 @@ export class PostgresDriver extends BaseDBDriver {
     return "other";
   }
 
-  isBooleanType(nativeType: string): boolean {
+  protected getValueSemantics(
+    nativeType: string,
+    _category: TypeCategory,
+  ): ValueSemantics {
     const ct = nativeType.toLowerCase().split("(")[0].trim();
-    return ct === "boolean" || ct === "bool";
+    if (ct === "boolean" || ct === "bool") return "boolean";
+    if (ct === "bit" || ct === "varbit" || ct === "bit varying") {
+      return "bit";
+    }
+    return "plain";
   }
 
   isDatetimeWithTime(nativeType: string): boolean {
@@ -729,10 +737,11 @@ export class PostgresDriver extends BaseDBDriver {
     if (value === NULL_SENTINEL) return null;
     if (typeof value !== "string") return value;
 
-    if (column.isBoolean) {
-      const lower = value.toLowerCase();
-      if (lower === "true" || lower === "1") return true;
-      if (lower === "false" || lower === "0") return false;
+    if (this.hasBooleanSemantics(column)) {
+      const normalized = this.parseBooleanInput(value);
+      if (normalized !== null) {
+        return normalized;
+      }
     }
 
     // Arrays: JSON array → native array
@@ -905,7 +914,10 @@ export class PostgresDriver extends BaseDBDriver {
     const val = typeof value === "string" ? value.trim() : value;
 
     // Boolean
-    if (column.isBoolean && (operator === "eq" || operator === "neq")) {
+    if (
+      this.hasBooleanSemantics(column) &&
+      (operator === "eq" || operator === "neq")
+    ) {
       const strVal = (typeof val === "string" ? val : val[0]).toLowerCase();
       if (strVal === "true" || strVal === "false") {
         const boolVal = strVal === "true";

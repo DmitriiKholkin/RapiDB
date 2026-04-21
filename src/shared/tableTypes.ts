@@ -19,6 +19,8 @@ export type TypeCategory =
   | "lob"
   | "other";
 
+export type ValueSemantics = "plain" | "boolean" | "bit";
+
 export interface QueryColumnMeta {
   category: TypeCategory | null;
 }
@@ -217,7 +219,7 @@ export interface ColumnTypeMeta extends ColumnMeta {
   filterable: boolean;
   editable: boolean;
   filterOperators: FilterOperator[];
-  isBoolean: boolean;
+  valueSemantics: ValueSemantics;
 }
 
 export interface IndexMeta {
@@ -242,23 +244,20 @@ export function isNumericCategory(category: TypeCategory): boolean {
 }
 
 export function defaultFilterOperator(
-  column: Pick<ColumnTypeMeta, "category" | "isBoolean">,
+  column: Pick<ColumnTypeMeta, "category">,
 ): "eq" | "like" {
-  if (
-    column.isBoolean ||
-    isNumericCategory(column.category) ||
-    column.category === "date"
-  ) {
+  if (column.category === "boolean") {
+    return "eq";
+  }
+
+  if (isNumericCategory(column.category) || column.category === "date") {
     return "eq";
   }
   return "like";
 }
 
 export function valueFilterOperator(
-  column: Pick<
-    ColumnTypeMeta,
-    "category" | "filterable" | "filterOperators" | "isBoolean"
-  >,
+  column: Pick<ColumnTypeMeta, "category" | "filterable" | "filterOperators">,
 ): "eq" | "like" | null {
   if (!column.filterable) return null;
 
@@ -337,7 +336,7 @@ export function serializeFilterDrafts(
 export function buildFilterExpression(
   column: Pick<
     ColumnTypeMeta,
-    "name" | "category" | "filterable" | "filterOperators" | "isBoolean"
+    "name" | "category" | "filterable" | "filterOperators"
   >,
   rawValue: string,
 ): FilterExpression | null {

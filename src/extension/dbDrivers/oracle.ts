@@ -16,6 +16,7 @@ import type {
   SchemaInfo,
   TableInfo,
   TypeCategory,
+  ValueSemantics,
 } from "./types";
 import { DATETIME_SQL_RE, NULL_SENTINEL } from "./types";
 
@@ -1580,8 +1581,11 @@ export class OracleDriver extends BaseDBDriver {
     return "other";
   }
 
-  isBooleanType(_nativeType: string): boolean {
-    return false;
+  protected getValueSemantics(
+    _nativeType: string,
+    _category: TypeCategory,
+  ): ValueSemantics {
+    return "plain";
   }
 
   isDatetimeWithTime(nativeType: string): boolean {

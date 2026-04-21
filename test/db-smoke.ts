@@ -335,11 +335,11 @@ function assertColumnMetadata(
         `${fixture.displayName}: unexpected isAutoIncrement for ${expectation.column}`,
       );
     }
-    if (expectation.isBoolean !== undefined) {
+    if (expectation.valueSemantics !== undefined) {
       assert.equal(
-        column.isBoolean,
-        expectation.isBoolean,
-        `${fixture.displayName}: unexpected isBoolean for ${expectation.column}`,
+        column.valueSemantics,
+        expectation.valueSemantics,
+        `${fixture.displayName}: unexpected valueSemantics for ${expectation.column}`,
       );
     }
   }

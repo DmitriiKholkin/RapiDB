@@ -67,7 +67,7 @@ function makeColumn(
     filterable: true,
     editable: true,
     filterOperators: ["like"],
-    isBoolean: false,
+    valueSemantics: "plain",
     ...rest,
     name,
     type,

@@ -1,7 +1,10 @@
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ConnectionConfig } from "../src/extension/connectionManager";
-import type { TypeCategory } from "../src/extension/dbDrivers/types";
+import type {
+  TypeCategory,
+  ValueSemantics,
+} from "../src/extension/dbDrivers/types";
 
 export type DbKind = "pg" | "mysql" | "mssql" | "oracle" | "sqlite";
 
@@ -25,7 +28,7 @@ export interface MetadataExpectation {
   filterable?: boolean;
   editable?: boolean;
   isAutoIncrement?: boolean;
-  isBoolean?: boolean;
+  valueSemantics?: ValueSemantics;
 }
 
 export interface ReadbackExpectation {
@@ -395,7 +398,7 @@ function buildPgFixture(runId: string): DbFixture {
     metadataChecks: [
       { column: "id", category: "integer", isAutoIncrement: true },
       { column: "numeric_col", category: "decimal" },
-      { column: "bool_col", category: "boolean", isBoolean: true },
+      { column: "bool_col", category: "boolean", valueSemantics: "boolean" },
       {
         column: "point_col",
         category: "spatial",
@@ -518,10 +521,9 @@ function buildMySqlFixture(runId: string): DbFixture {
     {
       name: "bit_col",
       typeSql: "bit(1)",
-      seedValue: true,
-      updateValue: false,
-      filterValue: "true",
-      comparison: "presence",
+      seedValue: 1,
+      updateValue: 0,
+      filterValue: "1",
     },
     {
       name: "bool_col",
@@ -708,7 +710,7 @@ function buildMySqlFixture(runId: string): DbFixture {
     metadataChecks: [
       { column: "id", category: "integer", isAutoIncrement: true },
       { column: "dec_col", category: "decimal" },
-      { column: "bit_col", category: "boolean", isBoolean: true },
+      { column: "bit_col", category: "integer", valueSemantics: "bit" },
       { column: "double_col", category: "float", filterable: true },
       {
         column: "point_col",
@@ -838,9 +840,9 @@ function buildMssqlFixture(runId: string): DbFixture {
     {
       name: "bit_col",
       typeSql: "bit",
-      seedValue: true,
-      updateValue: false,
-      filterValue: "true",
+      seedValue: 1,
+      updateValue: 0,
+      filterValue: "1",
     },
     {
       name: "char_col",
@@ -997,7 +999,7 @@ function buildMssqlFixture(runId: string): DbFixture {
     metadataChecks: [
       { column: "id", category: "integer", isAutoIncrement: true },
       { column: "dec_col", category: "decimal" },
-      { column: "bit_col", category: "boolean", isBoolean: true },
+      { column: "bit_col", category: "integer", valueSemantics: "bit" },
       { column: "smalldatetime_col", category: "datetime", filterable: true },
       {
         column: "text_col",
@@ -1399,7 +1401,7 @@ function buildSqliteFixture(runId: string): DbFixture {
     columns,
     metadataChecks: [
       { column: "id", category: "integer", isAutoIncrement: true },
-      { column: "bool_col", category: "boolean", isBoolean: true },
+      { column: "bool_col", category: "boolean", valueSemantics: "boolean" },
       { column: "date_col", category: "date", filterable: true },
       { column: "datetime_col", category: "datetime", filterable: true },
       { column: "time_col", category: "time", filterable: true },

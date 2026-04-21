@@ -10,6 +10,7 @@ import type {
   TableInfo,
   TransactionOperation,
   TypeCategory,
+  ValueSemantics,
 } from "../../src/extension/dbDrivers/types";
 
 /**
@@ -34,9 +35,12 @@ export class StubDriver extends BaseDBDriver {
     return "other";
   }
 
-  isBooleanType(nativeType: string): boolean {
+  protected getValueSemantics(
+    nativeType: string,
+    _category: TypeCategory,
+  ): ValueSemantics {
     const t = nativeType.toLowerCase().split("(")[0].trim();
-    return t === "boolean" || t === "bool";
+    return t === "boolean" || t === "bool" ? "boolean" : "plain";
   }
 
   isDatetimeWithTime(nativeType: string): boolean {
@@ -81,8 +85,15 @@ export class StubDriver extends BaseDBDriver {
 
 /** Build a minimal ColumnTypeMeta for testing purposes. */
 export function col(
-  overrides: Partial<ColumnTypeMeta> & { name: string; type: string },
+  overrides: Partial<ColumnTypeMeta> & {
+    name: string;
+    type: string;
+    isBoolean?: boolean;
+  },
 ): ColumnTypeMeta {
+  const valueSemantics =
+    overrides.valueSemantics ?? (overrides.isBoolean ? "boolean" : "plain");
+
   return {
     nullable: true,
     isPrimaryKey: false,
@@ -92,7 +103,7 @@ export function col(
     filterable: true,
     editable: true,
     filterOperators: [],
-    isBoolean: false,
+    valueSemantics,
     ...overrides,
   };
 }

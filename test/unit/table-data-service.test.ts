@@ -106,7 +106,7 @@ function makeExactNumericColumns(nativeType = "numeric(10,2)"): ColumnDef[] {
       filterable: true,
       editable: true,
       filterOperators: ["eq"],
-      isBoolean: false,
+      valueSemantics: "plain",
     },
     {
       name: "amount",
@@ -119,7 +119,7 @@ function makeExactNumericColumns(nativeType = "numeric(10,2)"): ColumnDef[] {
       filterable: true,
       editable: true,
       filterOperators: ["eq"],
-      isBoolean: false,
+      valueSemantics: "plain",
     },
   ];
 }
@@ -137,7 +137,7 @@ function makeJsonColumns(nativeType = "jsonb"): ColumnDef[] {
       filterable: true,
       editable: true,
       filterOperators: ["eq"],
-      isBoolean: false,
+      valueSemantics: "plain",
     },
     {
       name: "payload",
@@ -150,7 +150,7 @@ function makeJsonColumns(nativeType = "jsonb"): ColumnDef[] {
       filterable: true,
       editable: true,
       filterOperators: ["like"],
-      isBoolean: false,
+      valueSemantics: "plain",
     },
   ];
 }
@@ -168,7 +168,7 @@ function makeFloatColumns(nativeType = "double precision"): ColumnDef[] {
       filterable: true,
       editable: true,
       filterOperators: ["eq"],
-      isBoolean: false,
+      valueSemantics: "plain",
     },
     {
       name: "ratio",
@@ -181,7 +181,7 @@ function makeFloatColumns(nativeType = "double precision"): ColumnDef[] {
       filterable: true,
       editable: true,
       filterOperators: ["eq"],
-      isBoolean: false,
+      valueSemantics: "plain",
     },
   ];
 }
@@ -221,7 +221,7 @@ function makeTestColumns(): ColumnDef[] {
       filterable: true,
       editable: true,
       filterOperators: ["eq"],
-      isBoolean: false,
+      valueSemantics: "plain",
     },
     {
       name: "name",
@@ -234,7 +234,7 @@ function makeTestColumns(): ColumnDef[] {
       filterable: true,
       editable: true,
       filterOperators: ["like"],
-      isBoolean: false,
+      valueSemantics: "plain",
     },
     {
       name: "active",
@@ -247,7 +247,7 @@ function makeTestColumns(): ColumnDef[] {
       filterable: true,
       editable: true,
       filterOperators: ["eq"],
-      isBoolean: true,
+      valueSemantics: "boolean",
     },
   ];
 }
@@ -366,7 +366,7 @@ describe("TableDataService", () => {
           filterable: true,
           editable: true,
           filterOperators: ["like"],
-          isBoolean: false,
+          valueSemantics: "plain",
         },
       ];
 
@@ -440,7 +440,7 @@ describe("TableDataService", () => {
           filterable: true,
           editable: true,
           filterOperators: ["like"],
-          isBoolean: false,
+          valueSemantics: "plain",
         },
       ];
 
@@ -2071,7 +2071,7 @@ describe("applyChangesTransactional", () => {
           filterable: true,
           editable: true,
           filterOperators: ["eq"],
-          isBoolean: false,
+          valueSemantics: "plain",
         },
         {
           name: "created_at",
@@ -2084,7 +2084,7 @@ describe("applyChangesTransactional", () => {
           filterable: true,
           editable: false,
           filterOperators: ["like"],
-          isBoolean: false,
+          valueSemantics: "plain",
         },
       ],
     );

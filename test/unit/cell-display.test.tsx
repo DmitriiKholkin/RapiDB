@@ -25,12 +25,12 @@ describe("CellDisplay", () => {
   it.each([
     [true, "true"],
     [false, "false"],
-    [1, "true"],
-    [0, "false"],
-    ["1", "true"],
+    [1, "1"],
+    [0, "0"],
+    ["1", "1"],
     ["false", "false"],
-  ])("renders boolean %p as %s", (value, expected) => {
-    render(<CellDisplay value={value} isPending={false} isBoolean={true} />);
+  ])("renders scalar values generically as %s", (value, expected) => {
+    render(<CellDisplay value={value} isPending={false} />);
     expect(screen.getByText(expected)).toBeDefined();
   });
 

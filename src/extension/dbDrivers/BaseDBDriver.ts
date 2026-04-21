@@ -15,6 +15,7 @@ import type {
   TableInfo,
   TransactionOperation,
   TypeCategory,
+  ValueSemantics,
 } from "./types";
 import {
   DATE_ONLY_RE,
@@ -782,8 +783,25 @@ export abstract class BaseDBDriver implements IDBDriver {
   // ── Abstract: each driver maps its native types to TypeCategory ──
   abstract mapTypeCategory(nativeType: string): TypeCategory;
 
-  // ── Abstract: each driver determines boolean detection ──
-  abstract isBooleanType(nativeType: string): boolean;
+  // ── Abstract: each driver determines value semantics ──
+  protected abstract getValueSemantics(
+    nativeType: string,
+    category: TypeCategory,
+  ): ValueSemantics;
+
+  isBooleanType(nativeType: string): boolean {
+    return (
+      this.getValueSemantics(nativeType, this.mapTypeCategory(nativeType)) ===
+      "boolean"
+    );
+  }
+
+  isBitType(nativeType: string): boolean {
+    return (
+      this.getValueSemantics(nativeType, this.mapTypeCategory(nativeType)) ===
+      "bit"
+    );
+  }
 
   // ── Abstract: each driver determines datetime-with-time detection ──
   abstract isDatetimeWithTime(nativeType: string): boolean;
@@ -801,6 +819,7 @@ export abstract class BaseDBDriver implements IDBDriver {
 
   protected enrichColumn(col: ColumnMeta): ColumnTypeMeta {
     const category = this.mapTypeCategory(col.type);
+    const valueSemantics = this.getValueSemantics(col.type, category);
     const filterable = this.isFilterable(col.type, category);
     const editable = this.isEditable(col.type, category);
     const filterOperators: FilterOperator[] = filterable
@@ -815,7 +834,7 @@ export abstract class BaseDBDriver implements IDBDriver {
       filterable,
       editable,
       filterOperators,
-      isBoolean: this.isBooleanType(col.type),
+      valueSemantics,
     };
   }
 
@@ -893,15 +912,43 @@ export abstract class BaseDBDriver implements IDBDriver {
 
   // ─── Type-aware data helpers ───
 
+  protected hasBooleanSemantics(
+    column: Pick<ColumnTypeMeta, "valueSemantics">,
+  ): boolean {
+    return column.valueSemantics === "boolean";
+  }
+
+  protected hasBitSemantics(
+    column: Pick<ColumnTypeMeta, "valueSemantics">,
+  ): boolean {
+    return column.valueSemantics === "bit";
+  }
+
+  protected parseBooleanInput(value: string): boolean | null {
+    const lower = value.trim().toLowerCase();
+    if (lower === "true" || lower === "1") return true;
+    if (lower === "false" || lower === "0") return false;
+    return null;
+  }
+
   coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (value === null || value === undefined || value === "") return value;
     if (value === NULL_SENTINEL) return null;
     if (typeof value !== "string") return value;
 
-    if (column.isBoolean) {
-      const lower = value.toLowerCase();
-      if (lower === "true" || lower === "1") return this.coerceBooleanTrue();
-      if (lower === "false" || lower === "0") return this.coerceBooleanFalse();
+    const booleanValue = this.parseBooleanInput(value);
+
+    if (this.hasBooleanSemantics(column) && booleanValue !== null) {
+      return booleanValue
+        ? this.coerceBooleanTrue()
+        : this.coerceBooleanFalse();
+    }
+
+    if (this.hasBitSemantics(column)) {
+      const bitValue = this.coerceBitInputValue(value, column);
+      if (bitValue !== undefined) {
+        return bitValue;
+      }
     }
 
     if (column.category === "binary" && isHexLike(value)) {
@@ -916,6 +963,13 @@ export abstract class BaseDBDriver implements IDBDriver {
   }
   protected coerceBooleanFalse(): unknown {
     return false;
+  }
+
+  protected coerceBitInputValue(
+    _value: string,
+    _column: ColumnTypeMeta,
+  ): unknown | undefined {
+    return undefined;
   }
 
   formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
@@ -1236,7 +1290,7 @@ export abstract class BaseDBDriver implements IDBDriver {
       throw invalidFilterInputError(column.name, "a filter value");
     }
 
-    if (column.isBoolean) {
+    if (this.hasBooleanSemantics(column)) {
       const normalized = normalizeBooleanFilterValue(value);
       if (!normalized) {
         throw invalidFilterInputError(column.name, "true or false");
@@ -1325,7 +1379,10 @@ export abstract class BaseDBDriver implements IDBDriver {
     const val = typeof value === "string" ? value.trim() : value;
 
     // Boolean
-    if (column.isBoolean && (operator === "eq" || operator === "neq")) {
+    if (
+      this.hasBooleanSemantics(column) &&
+      (operator === "eq" || operator === "neq")
+    ) {
       const strVal = (typeof val === "string" ? val : val[0]).toLowerCase();
       if (strVal === "true" || strVal === "false") {
         return this.buildBooleanFilter(

@@ -24,7 +24,7 @@ function makeColumn(
     filterable: true,
     editable: true,
     filterOperators: ["like"],
-    isBoolean: false,
+    valueSemantics: "plain",
     ...rest,
     name,
     type,
@@ -237,7 +237,7 @@ describe("NewRowForm", () => {
       name: "active",
       type: "boolean",
       category: "boolean",
-      isBoolean: true,
+      valueSemantics: "boolean",
     });
     const { rerender } = render(
       <NewRowForm
@@ -250,7 +250,7 @@ describe("NewRowForm", () => {
       />,
     );
 
-    fireEvent.change(screen.getByRole("combobox"), {
+    fireEvent.change(screen.getByPlaceholderText("true / false"), {
       target: { value: "true" },
     });
     expect(setNewRow).toHaveBeenLastCalledWith({ active: "true" });
@@ -266,8 +266,38 @@ describe("NewRowForm", () => {
       />,
     );
 
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "" } });
+    fireEvent.change(screen.getByDisplayValue("true"), {
+      target: { value: "" },
+    });
     expect(setNewRow).toHaveBeenLastCalledWith({});
+  });
+
+  it("keeps bit drafts string-based and uses the integer placeholder", () => {
+    const setNewRow = vi.fn();
+
+    render(
+      <NewRowForm
+        columns={[
+          makeColumn({
+            name: "flags",
+            type: "bit(8)",
+            category: "integer",
+            valueSemantics: "bit",
+          }),
+        ]}
+        newRow={{}}
+        setNewRow={setNewRow}
+        inserting={false}
+        onInsert={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    fireEvent.change(screen.getByPlaceholderText("number"), {
+      target: { value: "13" },
+    });
+
+    expect(setNewRow).toHaveBeenLastCalledWith({ flags: "13" });
   });
 
   it("removes nullable boolean draft key when NULL is cleared", async () => {
@@ -280,7 +310,7 @@ describe("NewRowForm", () => {
             name: "active",
             type: "boolean",
             category: "boolean",
-            isBoolean: true,
+            valueSemantics: "boolean",
           }),
         ]}
         newRow={{ active: NULL_SENTINEL }}

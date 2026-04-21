@@ -6,6 +6,7 @@ import type {
   IndexMeta,
   QueryColumnMeta,
   TypeCategory,
+  ValueSemantics,
 } from "../../shared/tableTypes";
 
 export {
@@ -19,6 +20,7 @@ export {
   type QueryColumnMeta,
   type ScalarFilterOperator,
   type TypeCategory,
+  type ValueSemantics,
 } from "../../shared/tableTypes";
 
 // ─── Shared regex constants (used by drivers and tableDataService) ───

@@ -12,38 +12,35 @@ import {
 
 describe("placeholderForCategory", () => {
   it("returns 'true / false' for boolean columns", () => {
-    expect(placeholderForCategory("boolean", true)).toBe("true / false");
-    expect(placeholderForCategory("text", true)).toBe("true / false");
+    expect(placeholderForCategory("boolean")).toBe("true / false");
   });
 
   it("returns 'number' for numeric categories", () => {
-    expect(placeholderForCategory("integer", false)).toBe("number");
-    expect(placeholderForCategory("float", false)).toBe("number");
-    expect(placeholderForCategory("decimal", false)).toBe("number");
+    expect(placeholderForCategory("integer")).toBe("number");
+    expect(placeholderForCategory("float")).toBe("number");
+    expect(placeholderForCategory("decimal")).toBe("number");
   });
 
   it("returns date/time format strings", () => {
-    expect(placeholderForCategory("date", false)).toBe("YYYY-MM-DD");
-    expect(placeholderForCategory("time", false)).toBe("HH:MM:SS");
-    expect(placeholderForCategory("datetime", false)).toBe(
-      "YYYY-MM-DD HH:MM:SS",
-    );
+    expect(placeholderForCategory("date")).toBe("YYYY-MM-DD");
+    expect(placeholderForCategory("time")).toBe("HH:MM:SS");
+    expect(placeholderForCategory("datetime")).toBe("YYYY-MM-DD HH:MM:SS");
   });
 
   it("returns appropriate placeholders for other categories", () => {
-    expect(placeholderForCategory("uuid", false)).toBe("UUID");
-    expect(placeholderForCategory("json", false)).toBe('{"key": "value"}');
-    expect(placeholderForCategory("binary", false)).toBe("\\xHEX");
-    expect(placeholderForCategory("spatial", false)).toBe("POINT(x y)");
-    expect(placeholderForCategory("interval", false)).toBe("interval");
-    expect(placeholderForCategory("array", false)).toBe("[1, 2, 3]");
-    expect(placeholderForCategory("enum", false)).toBe("value");
+    expect(placeholderForCategory("uuid")).toBe("UUID");
+    expect(placeholderForCategory("json")).toBe('{"key": "value"}');
+    expect(placeholderForCategory("binary")).toBe("\\xHEX");
+    expect(placeholderForCategory("spatial")).toBe("POINT(x y)");
+    expect(placeholderForCategory("interval")).toBe("interval");
+    expect(placeholderForCategory("array")).toBe("[1, 2, 3]");
+    expect(placeholderForCategory("enum")).toBe("value");
   });
 
   it("returns 'filter' for text and other categories", () => {
-    expect(placeholderForCategory("text", false)).toBe("filter");
-    expect(placeholderForCategory("other", false)).toBe("filter");
-    expect(placeholderForCategory("lob", false)).toBe("filter");
+    expect(placeholderForCategory("text")).toBe("filter");
+    expect(placeholderForCategory("other")).toBe("filter");
+    expect(placeholderForCategory("lob")).toBe("filter");
   });
 });
 

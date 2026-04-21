@@ -18,6 +18,7 @@ import type {
   SchemaInfo,
   TableInfo,
   TypeCategory,
+  ValueSemantics,
 } from "./types";
 import {
   DATE_ONLY_RE,
@@ -77,6 +78,35 @@ interface DdlColumnRow {
   COLUMN_DEFAULT: string | null;
   IS_PK: number;
   PK_ORDINAL: number | null;
+}
+
+function canonicalizeMssqlBitPersistedEditValue(
+  value: unknown,
+): { canonical: string } | null {
+  if (value === NULL_SENTINEL || value === null) {
+    return { canonical: "__rapidb_null__" };
+  }
+
+  if (value === true || value === 1) {
+    return { canonical: "1" };
+  }
+
+  if (value === false || value === 0) {
+    return { canonical: "0" };
+  }
+
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "true" || normalized === "1") {
+    return { canonical: "1" };
+  }
+  if (normalized === "false" || normalized === "0") {
+    return { canonical: "0" };
+  }
+  return null;
 }
 
 interface RoutineDefinitionRow {
@@ -398,10 +428,18 @@ export class MSSQLDriver extends BaseDBDriver {
     const trimmed = value.trim();
     if (trimmed === "") return value;
 
-    if (column?.isBoolean) {
-      const lower = trimmed.toLowerCase();
-      if (lower === "true" || lower === "1") return true;
-      if (lower === "false" || lower === "0") return false;
+    if (column && this.hasBooleanSemantics(column)) {
+      const normalized = this.parseBooleanInput(trimmed);
+      if (normalized !== null) {
+        return normalized;
+      }
+    }
+
+    if (column && this.hasBitSemantics(column)) {
+      const normalized = this.parseBooleanInput(trimmed);
+      if (normalized !== null) {
+        return normalized ? 1 : 0;
+      }
     }
 
     if (column?.category === "binary") {
@@ -1010,7 +1048,7 @@ export class MSSQLDriver extends BaseDBDriver {
 
   mapTypeCategory(nativeType: string): TypeCategory {
     const ct = baseTypeName(nativeType);
-    if (ct === "bit") return "boolean";
+    if (ct === "bit") return "integer";
     if (["tinyint", "smallint", "int", "bigint"].includes(ct)) return "integer";
     if (["real", "float"].includes(ct)) return "float";
     if (["decimal", "numeric", "money", "smallmoney"].includes(ct))
@@ -1032,8 +1070,11 @@ export class MSSQLDriver extends BaseDBDriver {
     return "other";
   }
 
-  isBooleanType(nativeType: string): boolean {
-    return baseTypeName(nativeType) === "bit";
+  protected getValueSemantics(
+    nativeType: string,
+    _category: TypeCategory,
+  ): ValueSemantics {
+    return baseTypeName(nativeType) === "bit" ? "bit" : "plain";
   }
 
   isDatetimeWithTime(nativeType: string): boolean {
@@ -1127,6 +1168,10 @@ export class MSSQLDriver extends BaseDBDriver {
 
   override formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (value === null || value === undefined) return value;
+    if (this.hasBitSemantics(column)) {
+      if (value === true || value === 1 || value === "1") return 1;
+      if (value === false || value === 0 || value === "0") return 0;
+    }
     if (Buffer.isBuffer(value)) return super.formatOutputValue(value, column);
     if (typeof value === "bigint") return value.toString();
     if (value instanceof Date && !Number.isNaN(value.getTime())) {
@@ -1158,6 +1203,16 @@ export class MSSQLDriver extends BaseDBDriver {
     expectedValue: unknown,
     options?: PersistedEditCheckOptions,
   ): PersistedEditCheckResult | null {
+    if (this.hasBitSemantics(column)) {
+      return this.checkNormalizedPersistedEdit(
+        column,
+        expectedValue,
+        options,
+        canonicalizeMssqlBitPersistedEditValue,
+        `Column "${column.name}" expects 0 or 1.`,
+      );
+    }
+
     if (column.category === "integer") {
       return this.checkExactNumericPersistedEdit(
         column,
@@ -1209,7 +1264,7 @@ export class MSSQLDriver extends BaseDBDriver {
       );
     }
 
-    if (column.category === "boolean") {
+    if (this.hasBooleanSemantics(column)) {
       return this.checkBooleanPersistedEdit(column, expectedValue, options);
     }
 
@@ -1250,12 +1305,21 @@ export class MSSQLDriver extends BaseDBDriver {
 
     const val = typeof value === "string" ? value.trim() : value;
 
-    if (column.isBoolean && (operator === "eq" || operator === "neq")) {
+    if (
+      (this.hasBooleanSemantics(column) || this.hasBitSemantics(column)) &&
+      (operator === "eq" || operator === "neq")
+    ) {
       const strVal = (typeof val === "string" ? val : val[0]).toLowerCase();
-      if (strVal === "true" || strVal === "false") {
-        const boolVal = strVal === "true" ? 1 : 0;
+      const normalized = this.parseBooleanInput(strVal);
+      if (normalized !== null) {
+        const boolVal = normalized ? 1 : 0;
         const sqlOp = operator === "neq" ? "<>" : "=";
         return { sql: `${col} ${sqlOp} ?`, params: [boolVal] };
+      }
+
+      if (this.hasBitSemantics(column) && (strVal === "0" || strVal === "1")) {
+        const sqlOp = operator === "neq" ? "<>" : "=";
+        return { sql: `${col} ${sqlOp} ?`, params: [Number(strVal)] };
       }
     }
 

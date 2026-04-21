@@ -170,11 +170,8 @@ const STRUCTURAL_BADGE_PRESENTATIONS: Record<
 // ─── Formatting helpers ───
 
 /** Returns a human-friendly placeholder based on column category. */
-export function placeholderForCategory(
-  cat: TypeCategory,
-  isBoolean: boolean,
-): string {
-  if (isBoolean) return "true / false";
+export function placeholderForCategory(cat: TypeCategory): string {
+  if (cat === "boolean") return "true / false";
   switch (cat) {
     case "integer":
     case "float":

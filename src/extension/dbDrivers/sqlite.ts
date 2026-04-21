@@ -13,6 +13,7 @@ import type {
   SchemaInfo,
   TableInfo,
   TypeCategory,
+  ValueSemantics,
 } from "./types";
 
 type SqlStatementKind = "select" | "dml";
@@ -825,9 +826,12 @@ export class SQLiteDriver extends BaseDBDriver {
     return "other";
   }
 
-  isBooleanType(nativeType: string): boolean {
+  protected getValueSemantics(
+    nativeType: string,
+    _category: TypeCategory,
+  ): ValueSemantics {
     const base = sqliteDeclaredTypeBase(nativeType);
-    return base === "BOOLEAN" || base === "BOOL";
+    return base === "BOOLEAN" || base === "BOOL" ? "boolean" : "plain";
   }
 
   isDatetimeWithTime(nativeType: string): boolean {
@@ -836,17 +840,18 @@ export class SQLiteDriver extends BaseDBDriver {
   }
 
   override coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
-    if (typeof value === "string" && column.isBoolean) {
-      const lower = value.toLowerCase();
-      if (lower === "true" || lower === "1") return 1;
-      if (lower === "false" || lower === "0") return 0;
+    if (typeof value === "string" && this.hasBooleanSemantics(column)) {
+      const normalized = this.parseBooleanInput(value);
+      if (normalized !== null) {
+        return normalized ? 1 : 0;
+      }
     }
 
     return super.coerceInputValue(value, column);
   }
 
   override formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
-    if (column.isBoolean) {
+    if (this.hasBooleanSemantics(column)) {
       if (value === 1 || value === "1") return true;
       if (value === 0 || value === "0") return false;
     }
@@ -988,7 +993,10 @@ export class SQLiteDriver extends BaseDBDriver {
     });
 
     // Boolean
-    if (column.isBoolean && (operator === "eq" || operator === "neq")) {
+    if (
+      this.hasBooleanSemantics(column) &&
+      (operator === "eq" || operator === "neq")
+    ) {
       const strVal = (typeof val === "string" ? val : val[0]).toLowerCase();
       if (strVal === "true" || strVal === "false") {
         const boolVal = strVal === "true" ? 1 : 0;

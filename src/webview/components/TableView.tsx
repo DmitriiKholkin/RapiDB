@@ -635,7 +635,7 @@ export function TableView({
 
       const coerced: unknown = newVal === NULL_SENTINEL ? null : newVal;
 
-      const origStr = valueToEditString(originalVal, column.isBoolean);
+      const origStr = valueToEditString(originalVal);
 
       if (newVal === origStr) {
         setPending((prev) => {
@@ -765,6 +765,7 @@ export function TableView({
               header: () => (
                 <input
                   type="checkbox"
+                  aria-label="Select all rows"
                   checked={
                     rowsRef.current.length > 0 &&
                     selectedRef.current.size === rowsRef.current.length
@@ -792,6 +793,7 @@ export function TableView({
               cell: ({ row }: CellContext<Row, unknown>) => (
                 <input
                   type="checkbox"
+                  aria-label={`Select row ${row.index + 1}`}
                   checked={selectedRef.current.has(row.index)}
                   onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
                     const next = new Set(selectedRef.current);
@@ -845,12 +847,11 @@ export function TableView({
 
             if (isEditing) {
               const startVal = hasPending ? pendingValue : getValue();
-              const startStr = valueToEditString(startVal, col.isBoolean);
+              const startStr = valueToEditString(startVal);
               return (
                 <EditInput
                   initial={startStr}
                   nullable={col.nullable}
-                  isBoolean={col.isBoolean}
                   category={col.category}
                   onCommit={(v) => commitCellEdit(rowIdx, col, v, getValue())}
                   onCancel={() => setEditCell(null)}
@@ -861,7 +862,6 @@ export function TableView({
               <CellDisplay
                 value={displayVal}
                 isPending={hasPending}
-                isBoolean={col.isBoolean}
                 category={col.category}
               />
             );

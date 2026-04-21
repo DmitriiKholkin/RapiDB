@@ -15,10 +15,6 @@ function makeColumn(
   const { name, type, ...rest } = overrides;
 
   return {
-    ...rest,
-    name,
-    type,
-    nativeType: rest.nativeType ?? type,
     nullable: true,
     isPrimaryKey: false,
     isForeignKey: false,
@@ -26,7 +22,11 @@ function makeColumn(
     filterable: true,
     editable: true,
     filterOperators: ["like", "between", "is_null"],
-    isBoolean: false,
+    valueSemantics: "plain",
+    ...rest,
+    name,
+    type,
+    nativeType: rest.nativeType ?? type,
   };
 }
 
@@ -75,5 +75,26 @@ describe("ColumnFilterControl", () => {
       operator: "like",
       value: "2026-04-01",
     });
+  });
+
+  it("uses the category placeholder without changing the input control", () => {
+    const onChange = vi.fn();
+    render(
+      <ColumnFilterControl
+        column={makeColumn({
+          name: "flags",
+          type: "bit(8)",
+          category: "integer",
+          filterOperators: ["eq"],
+          valueSemantics: "bit",
+        })}
+        draft={{ operator: "eq", value: "" }}
+        onChange={onChange}
+      />,
+    );
+
+    const input = screen.getByLabelText("flags filter value");
+    expect(input.getAttribute("placeholder")).toBe("number");
+    expect(input.tagName).toBe("INPUT");
   });
 });

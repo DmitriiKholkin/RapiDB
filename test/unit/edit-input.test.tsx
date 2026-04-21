@@ -14,53 +14,49 @@ afterEach(cleanup);
 
 describe("valueToEditString", () => {
   it("converts boolean true to 'true'", () => {
-    expect(valueToEditString(true, true)).toBe("true");
+    expect(valueToEditString(true)).toBe("true");
   });
 
   it("converts boolean false to 'false'", () => {
-    expect(valueToEditString(false, true)).toBe("false");
+    expect(valueToEditString(false)).toBe("false");
   });
 
-  it("converts number 1 to 'true' for boolean column", () => {
-    expect(valueToEditString(1, true)).toBe("true");
+  it("keeps number 1 as a string", () => {
+    expect(valueToEditString(1)).toBe("1");
   });
 
-  it("converts number 0 to 'false' for boolean column", () => {
-    expect(valueToEditString(0, true)).toBe("false");
+  it("keeps number 0 as a string", () => {
+    expect(valueToEditString(0)).toBe("0");
   });
 
   it("converts null to NULL_SENTINEL", () => {
-    expect(valueToEditString(null, false)).toBe(NULL_SENTINEL);
+    expect(valueToEditString(null)).toBe(NULL_SENTINEL);
   });
 
   it("converts undefined to NULL_SENTINEL", () => {
-    expect(valueToEditString(undefined, false)).toBe(NULL_SENTINEL);
+    expect(valueToEditString(undefined)).toBe(NULL_SENTINEL);
   });
 
   it("converts strings as-is for non-boolean", () => {
-    expect(valueToEditString("hello", false)).toBe("hello");
+    expect(valueToEditString("hello")).toBe("hello");
   });
 
   it("converts numbers as-is for non-boolean", () => {
-    expect(valueToEditString(42, false)).toBe("42");
+    expect(valueToEditString(42)).toBe("42");
   });
 
   it("does not normalize float artifacts in the webview edit layer", () => {
-    expect(valueToEditString(1.2000000476837158, false)).toBe(
-      "1.2000000476837158",
-    );
+    expect(valueToEditString(1.2000000476837158)).toBe("1.2000000476837158");
   });
 
   it("serializes dates generically for editing", () => {
-    expect(valueToEditString(new Date("2026-04-15T10:20:30.000Z"), false)).toBe(
+    expect(valueToEditString(new Date("2026-04-15T10:20:30.000Z"))).toBe(
       "2026-04-15T10:20:30.000Z",
     );
   });
 
   it("stringifies unexpected objects generically", () => {
-    expect(valueToEditString({ nested: true }, false)).toBe(
-      '{"nested":true}',
-    );
+    expect(valueToEditString({ nested: true })).toBe('{"nested":true}');
   });
 });
 
@@ -160,24 +156,23 @@ describe("EditInput", () => {
     expect(onCommit).toHaveBeenCalledWith(NULL_SENTINEL);
   });
 
-  it("renders a select for boolean columns", () => {
+  it("renders a text input for boolean-category columns", () => {
     const onCommit = vi.fn();
     const onCancel = vi.fn();
     render(
       <EditInput
         initial="true"
         nullable={false}
-        isBoolean={true}
+        category="boolean"
         onCommit={onCommit}
         onCancel={onCancel}
       />,
     );
-    // Boolean columns use a <select>
-    const select = document.querySelector("select");
-    expect(select).not.toBeNull();
+    const input = screen.getByDisplayValue("true");
+    expect(input.tagName).toBe("INPUT");
   });
 
-  it("renders a select for category boolean", () => {
+  it("uses a text input for category boolean", () => {
     const onCommit = vi.fn();
     const onCancel = vi.fn();
     render(
@@ -189,8 +184,44 @@ describe("EditInput", () => {
         onCancel={onCancel}
       />,
     );
-    const select = document.querySelector("select");
-    expect(select).not.toBeNull();
+    const input = screen.getByDisplayValue("false");
+    expect(input.tagName).toBe("INPUT");
+  });
+
+  it("uses semantics-aware placeholder text without changing the editor control", () => {
+    const onCommit = vi.fn();
+    const onCancel = vi.fn();
+    render(
+      <EditInput
+        initial=""
+        nullable={false}
+        category="boolean"
+        onCommit={onCommit}
+        onCancel={onCancel}
+      />,
+    );
+
+    expect(screen.getByPlaceholderText("true / false").tagName).toBe("INPUT");
+  });
+
+  it("uses the integer placeholder for bit-style values while staying string-based", () => {
+    const onCommit = vi.fn();
+    const onCancel = vi.fn();
+    render(
+      <EditInput
+        initial=""
+        nullable={false}
+        category="integer"
+        onCommit={onCommit}
+        onCancel={onCancel}
+      />,
+    );
+
+    const input = screen.getByPlaceholderText("number");
+    fireEvent.change(input, { target: { value: "13" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(onCommit).toHaveBeenCalledWith("13");
   });
 
   it("keeps NULL when a null text editor blurs without changes", () => {
@@ -227,38 +258,38 @@ describe("EditInput", () => {
     expect(onCommit).toHaveBeenCalledWith("hello");
   });
 
-  it("keeps NULL for a null boolean editor on blur without selection", () => {
+  it("keeps NULL for a null boolean-category editor on blur without changes", () => {
     const onCommit = vi.fn();
     const onCancel = vi.fn();
     const { container } = render(
       <EditInput
         initial={NULL_SENTINEL}
         nullable={true}
-        isBoolean={true}
+        category="boolean"
         onCommit={onCommit}
         onCancel={onCancel}
       />,
     );
-    const select = container.querySelector("select") as HTMLSelectElement;
-    fireEvent.blur(select);
+    const input = container.querySelector("input") as HTMLInputElement;
+    fireEvent.blur(input);
     expect(onCommit).toHaveBeenCalledWith(NULL_SENTINEL);
   });
 
-  it("commits an explicit boolean value after starting from NULL", () => {
+  it("commits an explicit boolean text value after starting from NULL", () => {
     const onCommit = vi.fn();
     const onCancel = vi.fn();
     const { container } = render(
       <EditInput
         initial={NULL_SENTINEL}
         nullable={true}
-        isBoolean={true}
+        category="boolean"
         onCommit={onCommit}
         onCancel={onCancel}
       />,
     );
-    const select = container.querySelector("select") as HTMLSelectElement;
-    fireEvent.change(select, { target: { value: "true" } });
-    fireEvent.blur(select);
+    const input = container.querySelector("input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "true" } });
+    fireEvent.blur(input);
     expect(onCommit).toHaveBeenCalledWith("true");
   });
 });

@@ -21,6 +21,7 @@ import type {
   SchemaInfo,
   TableInfo,
   TypeCategory,
+  ValueSemantics,
 } from "./types";
 import { DATETIME_SQL_RE, ISO_DATETIME_RE, NULL_SENTINEL } from "./types";
 
@@ -442,6 +443,88 @@ function decodeMysqlBitBuffer(
   return declaredBits > 48 ? result : Number(result);
 }
 
+function parseMysqlBitWidth(nativeType: string): number | null {
+  const match = /bit\s*\(\s*(\d+)\s*\)/i.exec(nativeType);
+  if (!match) {
+    return null;
+  }
+
+  const width = Number.parseInt(match[1], 10);
+  return Number.isInteger(width) && width > 0 ? width : null;
+}
+
+function mysqlBitMaxValue(nativeType: string): bigint | null {
+  const width = parseMysqlBitWidth(nativeType);
+  return width === null ? null : (1n << BigInt(width)) - 1n;
+}
+
+function mysqlBitValidationMessage(
+  columnName: string,
+  nativeType: string,
+): string {
+  const width = parseMysqlBitWidth(nativeType);
+  if (width === null) {
+    return `Column ${columnName} expects a non-negative integer bit value.`;
+  }
+
+  return `Column ${columnName} expects an unsigned BIT(${width}) value between 0 and ${mysqlBitMaxValue(nativeType)?.toString() ?? "0"}.`;
+}
+
+function parseMysqlBitValue(
+  value: unknown,
+  nativeType: string,
+): { canonical: string; parameter: number | string } | null {
+  let bigintValue: bigint;
+
+  if (typeof value === "number") {
+    if (!Number.isInteger(value) || value < 0) {
+      return null;
+    }
+    bigintValue = BigInt(value);
+  } else if (typeof value === "bigint") {
+    if (value < 0n) {
+      return null;
+    }
+    bigintValue = value;
+  } else if (typeof value === "string") {
+    const normalized = value.trim();
+    if (!/^\d+$/.test(normalized)) {
+      return null;
+    }
+    bigintValue = BigInt(normalized);
+  } else {
+    return null;
+  }
+
+  const maxValue = mysqlBitMaxValue(nativeType);
+  if (maxValue !== null && bigintValue > maxValue) {
+    return null;
+  }
+
+  const canonical = bigintValue.toString();
+  const safeNumber = BigInt(Number.MAX_SAFE_INTEGER);
+  return {
+    canonical,
+    parameter: bigintValue <= safeNumber ? Number(canonical) : canonical,
+  };
+}
+
+function canonicalizeMysqlBitPersistedEditValue(
+  value: unknown,
+  nativeType?: string,
+): { canonical: string } | null {
+  if (value === NULL_SENTINEL || value === null) {
+    return { canonical: "__rapidb_null__" };
+  }
+
+  const parsed = parseMysqlBitValue(value, nativeType ?? "bit");
+  if (!parsed) {
+    return null;
+  }
+
+  return { canonical: parsed.canonical };
+}
+
 type MysqlObjectRow = RowDataPacket & Record<string, unknown>;
 type MysqlArrayRow = unknown[];
 type MysqlSelectRows = MysqlArrayRow[];
@@ -692,12 +775,9 @@ export class MySQLDriver extends BaseDBDriver {
       fields.forEach((field, i) => {
         const fieldType = field.type ?? field.columnType;
         const fieldLength = field.length ?? field.columnLength ?? 0;
-        if (
-          (fieldType === 1 && fieldLength === 1) ||
-          (fieldType === 16 && fieldLength === 1)
-        ) {
+        if (fieldType === 1 && fieldLength === 1) {
           boolCols.add(i);
-        } else if (fieldType === 16 && fieldLength > 1) {
+        } else if (fieldType === 16) {
           bitIntCols.set(i, fieldLength);
         }
         if (fieldType === 4) {
@@ -925,8 +1005,7 @@ export class MySQLDriver extends BaseDBDriver {
     if (
       base === "bool" ||
       base === "boolean" ||
-      (base === "tinyint" && /tinyint\s*\(\s*1\s*\)/.test(ct)) ||
-      (base === "bit" && /bit\s*\(\s*1\s*\)/.test(ct))
+      (base === "tinyint" && /tinyint\s*\(\s*1\s*\)/.test(ct))
     )
       return "boolean";
     // Integer
@@ -980,13 +1059,18 @@ export class MySQLDriver extends BaseDBDriver {
     return "other";
   }
 
-  isBooleanType(nativeType: string): boolean {
+  protected getValueSemantics(
+    nativeType: string,
+    _category: TypeCategory,
+  ): ValueSemantics {
     const ct = nativeType.toLowerCase();
     const base = mysqlTypeName(nativeType);
-    if (base === "bool" || base === "boolean") return true;
-    if (base === "tinyint" && /tinyint\s*\(\s*1\s*\)/.test(ct)) return true;
-    if (base === "bit" && /bit\s*\(\s*1\s*\)/.test(ct)) return true;
-    return false;
+    if (base === "bool" || base === "boolean") return "boolean";
+    if (base === "tinyint" && /tinyint\s*\(\s*1\s*\)/.test(ct)) {
+      return "boolean";
+    }
+    if (base === "bit") return "bit";
+    return "plain";
   }
 
   isDatetimeWithTime(nativeType: string): boolean {
@@ -1040,16 +1124,21 @@ export class MySQLDriver extends BaseDBDriver {
     if (value === NULL_SENTINEL) return null;
     if (typeof value !== "string") return value;
 
-    if (column.isBoolean) {
-      const lower = value.toLowerCase();
-      if (lower === "true" || lower === "1") return 1;
-      if (lower === "false" || lower === "0") return 0;
+    if (this.hasBooleanSemantics(column)) {
+      const normalized = this.parseBooleanInput(value);
+      if (normalized !== null) {
+        return normalized ? 1 : 0;
+      }
     }
 
-    // Bit columns
-    if (column.nativeType.toLowerCase().startsWith("bit")) {
-      const n = parseInt(value, 10);
-      if (!Number.isNaN(n)) return n;
+    if (this.hasBitSemantics(column)) {
+      const parsed = parseMysqlBitValue(value, column.nativeType);
+      if (!parsed) {
+        throw new Error(
+          `[RapiDB] ${mysqlBitValidationMessage(column.name, column.nativeType)}`,
+        );
+      }
+      return parsed.parameter;
     }
 
     // Binary
@@ -1109,6 +1198,17 @@ export class MySQLDriver extends BaseDBDriver {
     expectedValue: unknown,
     options?: PersistedEditCheckOptions,
   ): PersistedEditCheckResult | null {
+    if (this.hasBitSemantics(column)) {
+      return this.checkNormalizedPersistedEdit(
+        column,
+        expectedValue,
+        options,
+        (value) =>
+          canonicalizeMysqlBitPersistedEditValue(value, column.nativeType),
+        mysqlBitValidationMessage(column.name, column.nativeType),
+      );
+    }
+
     if (column.category === "integer") {
       return this.checkExactNumericPersistedEdit(
         column,
@@ -1146,7 +1246,7 @@ export class MySQLDriver extends BaseDBDriver {
       );
     }
 
-    if (column.category === "boolean") {
+    if (this.hasBooleanSemantics(column)) {
       return this.checkBooleanPersistedEdit(column, expectedValue, options);
     }
 
@@ -1191,12 +1291,58 @@ export class MySQLDriver extends BaseDBDriver {
     const val = typeof value === "string" ? value.trim() : value;
 
     // Boolean
-    if (column.isBoolean && (operator === "eq" || operator === "neq")) {
+    if (
+      this.hasBooleanSemantics(column) &&
+      (operator === "eq" || operator === "neq")
+    ) {
       const strVal = (typeof val === "string" ? val : val[0]).toLowerCase();
       if (strVal === "true" || strVal === "false") {
         const boolVal = strVal === "true" ? 1 : 0;
         const op = operator === "neq" ? "!=" : "=";
         return { sql: `${col} ${op} ?`, params: [boolVal] };
+      }
+    }
+
+    if (this.hasBitSemantics(column)) {
+      const parseFilterValue = (raw: string): number | string => {
+        const parsed = parseMysqlBitValue(raw, column.nativeType);
+        if (!parsed) {
+          throw new Error(
+            `[RapiDB Filter] ${mysqlBitValidationMessage(column.name, column.nativeType)}`,
+          );
+        }
+        return parsed.parameter;
+      };
+
+      if (typeof val === "string") {
+        if (operator === "in") {
+          const parts = val
+            .split(",")
+            .map((part) => part.trim())
+            .filter(Boolean);
+          if (parts.length === 0) {
+            throw new Error(
+              `[RapiDB Filter] ${mysqlBitValidationMessage(column.name, column.nativeType)}`,
+            );
+          }
+
+          return {
+            sql: `${col} IN (${parts.map(() => "?").join(", ")})`,
+            params: parts.map(parseFilterValue),
+          };
+        }
+
+        if (["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)) {
+          const op = this.sqlOperator(operator);
+          return { sql: `${col} ${op} ?`, params: [parseFilterValue(val)] };
+        }
+      }
+
+      if (operator === "between" && Array.isArray(val)) {
+        return {
+          sql: `${col} BETWEEN ? AND ?`,
+          params: [parseFilterValue(val[0]), parseFilterValue(val[1])],
+        };
       }
     }
 

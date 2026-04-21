@@ -1,4 +1,3 @@
-// biome-ignore lint/correctness/noUnusedImports: React is required for JSX in this build setup
 import React, { type CSSProperties, useEffect, useRef, useState } from "react";
 import {
   type ColumnTypeMeta as ColumnMeta,
@@ -266,7 +265,7 @@ export function ColumnFilterControl({
   const scalarPlaceholder =
     scalarOperator === "in"
       ? "value1, value2"
-      : placeholderForCategory(column.category, column.isBoolean);
+      : placeholderForCategory(column.category);
 
   const handleOperatorSelect = (
     operator: FilterOperator | typeof CLEAR_FILTER,

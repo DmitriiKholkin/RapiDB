@@ -1,4 +1,3 @@
-// biome-ignore lint/style/useImportType: React used as value in refs
 import React from "react";
 import {
   type ColumnTypeMeta as ColumnMeta,
@@ -96,77 +95,39 @@ export function NewRowForm({
               )}
             </span>
             <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-              {col.isBoolean || col.category === "boolean" ? (
-                <select
-                  value={
-                    isNull ? "" : rawVal === undefined ? "" : String(rawVal)
+              <input
+                aria-label={`New value for ${col.name}`}
+                value={isNull ? "" : String(rawVal ?? "")}
+                disabled={isNull || !canInsert}
+                onChange={(e) => {
+                  if (!canInsert) return;
+                  const next = e.target.value;
+                  if (next === "" && !clearsNullToEmptyString(col)) {
+                    setNewRow(omitKey(newRow, col.name));
+                    return;
                   }
-                  disabled={isNull || !canInsert}
-                  onChange={(e) => {
-                    if (!canInsert) return;
-                    const next = e.target.value;
-                    if (next === "") {
-                      setNewRow(omitKey(newRow, col.name));
-                      return;
-                    }
-                    setNewRow({ ...newRow, [col.name]: next });
-                  }}
-                  style={{
-                    width: 120,
-                    padding: "3px 6px",
-                    fontSize: 12,
-                    background: "var(--vscode-input-background)",
-                    color:
-                      isNull || !canInsert
-                        ? "var(--vscode-disabledForeground)"
-                        : "var(--vscode-input-foreground)",
-                    border: "1px solid var(--vscode-input-border)",
-                    borderRadius: 2,
-                    fontFamily: "inherit",
-                    opacity: isNull || !canInsert ? 0.55 : 1,
-                    boxSizing: "border-box" as const,
-                  }}
-                >
-                  <option value="" />
-                  <option value="false">false</option>
-                  <option value="true">true</option>
-                </select>
-              ) : (
-                <input
-                  value={isNull ? "" : String(rawVal ?? "")}
-                  disabled={isNull || !canInsert}
-                  onChange={(e) => {
-                    if (!canInsert) return;
-                    const next = e.target.value;
-                    if (next === "" && !clearsNullToEmptyString(col)) {
-                      setNewRow(omitKey(newRow, col.name));
-                      return;
-                    }
-                    setNewRow({ ...newRow, [col.name]: next });
-                  }}
-                  placeholder={
-                    isNull
-                      ? "NULL"
-                      : placeholderForCategory(col.category, col.isBoolean)
-                  }
-                  style={{
-                    width: 120,
-                    padding: "3px 6px",
-                    fontSize: 12,
-                    background: "var(--vscode-input-background)",
-                    color:
-                      isNull || !canInsert
-                        ? "var(--vscode-disabledForeground)"
-                        : "var(--vscode-input-foreground)",
-                    border: "1px solid var(--vscode-input-border)",
-                    borderRadius: 2,
-                    fontFamily: "inherit",
-                    opacity: isNull || !canInsert ? 0.55 : 1,
-                    fontStyle: isNull || !canInsert ? "italic" : "normal",
-                    boxSizing: "border-box" as const,
-                  }}
-                />
-              )}
+                  setNewRow({ ...newRow, [col.name]: next });
+                }}
+                placeholder={
+                  isNull ? "NULL" : placeholderForCategory(col.category)
+                }
+                style={{
+                  width: 120,
+                  padding: "3px 6px",
+                  fontSize: 12,
+                  background: "var(--vscode-input-background)",
+                  color:
+                    isNull || !canInsert
+                      ? "var(--vscode-disabledForeground)"
+                      : "var(--vscode-input-foreground)",
+                  border: "1px solid var(--vscode-input-border)",
+                  borderRadius: 2,
+                  fontFamily: "inherit",
+                  opacity: isNull || !canInsert ? 0.55 : 1,
+                  fontStyle: isNull || !canInsert ? "italic" : "normal",
+                  boxSizing: "border-box" as const,
+                }}
+              />
               {col.nullable && (
                 <button
                   type="button"

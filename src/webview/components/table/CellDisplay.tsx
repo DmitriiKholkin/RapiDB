@@ -1,4 +1,3 @@
-// biome-ignore lint/correctness/noUnusedImports: React needed for JSX
 import React from "react";
 import type { TypeCategory } from "../../../shared/tableTypes";
 import { getCategoryPresentation } from "../../types";
@@ -10,12 +9,10 @@ const PENDING_COLOR = "var(--vscode-editorWarning-foreground, #cca700)";
 export function CellDisplay({
   value,
   isPending,
-  isBoolean,
   category,
 }: {
   value: unknown;
   isPending: boolean;
-  isBoolean?: boolean;
   category?: TypeCategory;
 }) {
   if (value === null || value === undefined) {
@@ -26,24 +23,6 @@ export function CellDisplay({
     ? getCategoryPresentation(category).foreground
     : undefined;
   const resolvedColor = isPending ? PENDING_COLOR : categoryColor;
-
-  // Boolean display
-  if (isBoolean || category === "boolean") {
-    const boolVal = coerceBoolDisplay(value);
-    if (boolVal !== null) {
-      return (
-        <span
-          style={{
-            color:
-              resolvedColor ?? getCategoryPresentation("boolean").foreground,
-            fontWeight: 500,
-          }}
-        >
-          {boolVal ? "true" : "false"}
-        </span>
-      );
-    }
-  }
 
   const str = formatScalarValueForDisplay(value);
 
@@ -117,15 +96,4 @@ export function CellDisplay({
       {str}
     </span>
   );
-}
-
-/**
- * Normalize a raw cell value to a boolean for display.
- * Returns null if not representable as boolean.
- */
-function coerceBoolDisplay(value: unknown): boolean | null {
-  if (typeof value === "boolean") return value;
-  if (value === 1 || value === "1" || value === "true") return true;
-  if (value === 0 || value === "0" || value === "false") return false;
-  return null;
 }
