@@ -1,20 +1,9 @@
-import { randomUUID } from "crypto";
-import * as fs from "fs";
-import * as os from "os";
-import * as path from "path";
 import * as vscode from "vscode";
 import { coerceFilterExpressions } from "../../shared/tableTypes";
-import type {
-  ApplyResultPayload,
-  TableMutationPreviewPayload,
-} from "../../shared/webviewContracts";
 import { parseTablePanelMessage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
+import type { FilterExpression } from "../dbDrivers/types";
 import {
-  executePreparedApplyPlan,
-  type Filter,
-  type PreparedApplyPlan,
-  type PreparedInsertPlan,
   prepareApplyChangesPlan,
   type SortConfig,
   TableDataService,
@@ -23,18 +12,17 @@ import {
   logErrorWithContext,
   normalizeUnknownError,
 } from "../utils/errorHandling";
-import { formatMutationPreviewSql } from "../utils/mutationPreview";
+import {
+  exportTableDataAsCsv,
+  exportTableDataAsJson,
+} from "../utils/exportService";
+import { TableMutationPreviewController } from "./tableMutationPreviewController";
 import { createWebviewShell } from "./webviewShell";
 
-type PendingTableMutationPreview =
-  | {
-      kind: "applyChanges";
-      plan: PreparedApplyPlan;
-    }
-  | {
-      kind: "insertRow";
-      plan: PreparedInsertPlan;
-    };
+const EXPORT_CHUNK_SIZE = 500;
+
+const FILTER_ERROR_RE =
+  /^\[RapiDB Filter\]|invalid input syntax|invalid cidr|malformed array|not a valid (binary|hex|uuid)|syntax error in input|invalid value for type|invalid number|operator does not exist|conversion failed|arithmetic overflow|ORA-0(1841|1843|1858|1861|6502)|ORA-01722|incorrect (date|datetime|time)|Incorrect integer value|Truncated incorrect|data truncat/i;
 
 export class TablePanel {
   private static readonly viewType = "rapidb.tablePanel";
@@ -43,18 +31,15 @@ export class TablePanel {
 
   private readonly panel: vscode.WebviewPanel;
   private readonly svc: TableDataService;
-  private readonly cm: ConnectionManager;
+  private readonly connectionManager: ConnectionManager;
   private readonly connectionId: string;
   private readonly database: string;
   private readonly schema: string;
   private readonly table: string;
   private readonly isView: boolean;
-  private readonly pendingMutationPreviews = new Map<
-    string,
-    PendingTableMutationPreview
-  >();
+  private readonly previewController: TableMutationPreviewController;
 
-  private cachedColumns: import("../tableDataService").ColumnDef[] = [];
+  private cachedColumns: import("../dbDrivers/types").ColumnTypeMeta[] = [];
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -68,18 +53,27 @@ export class TablePanel {
   ) {
     this.panel = panel;
     this.svc = new TableDataService(connectionManager);
-    this.cm = connectionManager;
+    this.connectionManager = connectionManager;
     this.connectionId = connectionId;
     this.database = database;
     this.schema = schema;
     this.table = table;
     this.isView = isView;
+    this.previewController = new TableMutationPreviewController({
+      connectionId,
+      tableName: table,
+      connectionManager,
+      tableDataService: this.svc,
+      notifyWarning: (message) => {
+        void vscode.window.showWarningMessage(`[RapiDB] ${message}`);
+      },
+    });
 
     this.panel.webview.html = this.buildHtml(context);
 
     const key = TablePanel.panelKey(connectionId, database, schema, table);
     this.panel.onDidDispose(() => {
-      this.pendingMutationPreviews.clear();
+      this.previewController.clear();
       TablePanel.panels.delete(key);
 
       this.svc.clearForConnection(connectionId);
@@ -183,452 +177,258 @@ export class TablePanel {
     }
 
     switch (parsed.type) {
-      case "ready": {
-        try {
-          const cols = await this.svc.getColumns(
-            this.connectionId,
-            this.database,
-            this.schema,
-            this.table,
-          );
-          this.cachedColumns = cols;
-          const pkCols = cols.filter((c) => c.isPrimaryKey).map((c) => c.name);
-          send("tableInit", {
-            columns: cols,
-            primaryKeyColumns: pkCols,
-            isView: this.isView,
-          });
-        } catch (err: unknown) {
-          const error = normalizeUnknownError(err);
-          send("tableError", { error: error.message });
-        }
+      case "ready":
+        await this._handleReady(send);
         break;
-      }
-
-      case "fetchPage": {
-        const raw = parsed.payload;
-        if (!raw) {
-          return;
-        }
-        const fetchId = raw.fetchId;
-        const page = Math.max(1, Math.floor(Number(raw.page) || 1));
-        const pageSize = Math.min(
-          10000,
-          Math.max(1, Math.floor(Number(raw.pageSize) || 50)),
-        );
-        const filters = coerceFilterExpressions(raw.filters);
-        const sort = raw.sort ?? null;
-        try {
-          const result = await this.svc.getPage(
-            this.connectionId,
-            this.database,
-            this.schema,
-            this.table,
-            page,
-            pageSize,
-            filters as Filter[],
-            sort as SortConfig | null,
-          );
-          send("tableData", {
-            fetchId,
-            rows: result.rows,
-            totalCount: result.totalCount,
-          });
-        } catch (err: unknown) {
-          const error = normalizeUnknownError(err);
-          const errMsg = error.message;
-          const isFilterError =
-            /^\[RapiDB Filter\]/.test(errMsg) ||
-            /invalid input syntax|invalid cidr|malformed array|not a valid (binary|hex|uuid)|syntax error in input|invalid value for type|invalid number|operator does not exist|conversion failed|arithmetic overflow|ORA-0(1841|1843|1858|1861|6502)|ORA-01722|incorrect (date|datetime|time)|Incorrect integer value|Truncated incorrect|data truncat/i.test(
-              errMsg,
-            );
-          send("tableError", { fetchId, error: errMsg, isFilterError });
-        }
+      case "fetchPage":
+        if (parsed.payload) await this._handleFetchPage(parsed.payload, send);
         break;
-      }
-
-      case "applyChanges": {
-        const payload = parsed.payload;
-        if (!payload) {
-          return;
-        }
-        const { updates } = payload;
-        try {
-          const prepared = prepareApplyChangesPlan(
-            this.cm,
-            this.connectionId,
-            this.database,
-            this.schema,
-            this.table,
-            updates ?? [],
-            this.cachedColumns,
-          );
-
-          if (!prepared.executable) {
-            if (prepared.result.warning) {
-              void vscode.window.showWarningMessage(
-                `[RapiDB] ${prepared.result.warning}`,
-              );
-            }
-            send("applyResult", prepared.result);
-            break;
-          }
-
-          const previewToken = this.storePendingMutationPreview({
-            kind: "applyChanges",
-            plan: prepared.plan,
-          });
-          await this.previewAndConfirmMutation(previewToken, send);
-        } catch (err: unknown) {
-          const error = normalizeUnknownError(err);
-          send("applyResult", {
-            success: false,
-            error: error.message,
-          });
-        }
+      case "applyChanges":
+        if (parsed.payload)
+          await this._handleApplyChanges(parsed.payload, send);
         break;
-      }
-
-      case "insertRow": {
-        const payload = parsed.payload;
-        if (!payload) {
-          return;
-        }
-        const { values = {} } = payload;
-        try {
-          const plan = await this.svc.prepareInsertRow(
-            this.connectionId,
-            this.database,
-            this.schema,
-            this.table,
-            values,
-          );
-          const previewToken = this.storePendingMutationPreview({
-            kind: "insertRow",
-            plan,
-          });
-          await this.previewAndConfirmMutation(previewToken, send);
-        } catch (err: unknown) {
-          const error = normalizeUnknownError(err);
-          send("insertResult", {
-            success: false,
-            error: error.message,
-          });
-        }
+      case "insertRow":
+        if (parsed.payload) await this._handleInsertRow(parsed.payload, send);
         break;
-      }
-
-      case "deleteRows": {
-        const payload = parsed.payload;
-        if (!payload) {
-          return;
-        }
-        const { primaryKeysList = [] } = payload;
-        try {
-          await this.svc.deleteRows(
-            this.connectionId,
-            this.database,
-            this.schema,
-            this.table,
-            primaryKeysList,
-          );
-          send("deleteResult", { success: true });
-        } catch (err: unknown) {
-          const error = normalizeUnknownError(err);
-          send("deleteResult", {
-            success: false,
-            error: error.message,
-          });
-        }
+      case "deleteRows":
+        if (parsed.payload) await this._handleDeleteRows(parsed.payload, send);
         break;
-      }
-
-      case "exportCSV": {
-        const saveUri = await vscode.window.showSaveDialog({
-          defaultUri: vscode.Uri.file(
-            path.join(os.homedir(), "Downloads", `${this.table}.csv`),
-          ),
-          filters: { "CSV files": ["csv"], "All files": ["*"] },
-        });
-        if (!saveUri) {
-          break;
-        }
-
-        try {
-          await vscode.window.withProgress(
-            {
-              location: vscode.ProgressLocation.Notification,
-              title: `RapiDB: Exporting ${this.table}…`,
-              cancellable: true,
-            },
-            async (_progress, token) => {
-              const abortCtrl = new AbortController();
-              const cancelSub = token.onCancellationRequested(() =>
-                abortCtrl.abort(),
-              );
-              const writeStream = fs.createWriteStream(saveUri.fsPath, {
-                encoding: "utf8",
-              });
-              let headerWritten = false;
-              const payload = parsed.payload;
-              const { sort: csvSort = null, filters: csvFilters = [] } =
-                payload ?? {};
-              try {
-                for await (const chunk of this.svc.exportAll(
-                  this.connectionId,
-                  this.database,
-                  this.schema,
-                  this.table,
-                  500,
-                  csvSort as SortConfig | null,
-                  coerceFilterExpressions(csvFilters),
-                  abortCtrl.signal,
-                )) {
-                  if (!headerWritten) {
-                    writeStream.write(
-                      chunk.columns.map((c) => csvCell(c.name)).join(",") +
-                        "\n",
-                    );
-                    headerWritten = true;
-                  }
-                  for (const row of chunk.rows) {
-                    writeStream.write(
-                      chunk.columns.map((c) => csvCell(row[c.name])).join(",") +
-                        "\n",
-                    );
-                  }
-                }
-                await new Promise<void>((res, rej) => {
-                  writeStream.end((err?: Error | null) =>
-                    err ? rej(err) : res(),
-                  );
-                });
-              } catch (err) {
-                writeStream.destroy();
-                throw err;
-              } finally {
-                cancelSub.dispose();
-              }
-            },
-          );
-
-          vscode.window.showInformationMessage(
-            `[RapiDB] Exported ${this.table} → ${path.basename(saveUri.fsPath)}`,
-          );
-        } catch (err: unknown) {
-          const error = normalizeUnknownError(err);
-          if (error.name !== "AbortError") {
-            vscode.window.showErrorMessage(
-              `[RapiDB] CSV export failed: ${error.message}`,
-            );
-          }
-        }
+      case "exportCSV":
+        await this._handleExportCSV(parsed.payload);
         break;
-      }
-
-      case "exportJSON": {
-        const payload = parsed.payload;
-        const { sort = null, filters: jsonFilters = [] } = payload ?? {};
-        const saveUri = await vscode.window.showSaveDialog({
-          defaultUri: vscode.Uri.file(
-            path.join(os.homedir(), "Downloads", `${this.table}.json`),
-          ),
-          filters: { "JSON files": ["json"], "All files": ["*"] },
-        });
-        if (!saveUri) {
-          break;
-        }
-
-        try {
-          await vscode.window.withProgress(
-            {
-              location: vscode.ProgressLocation.Notification,
-              title: `RapiDB: Exporting ${this.table} as JSON…`,
-              cancellable: true,
-            },
-            async (_progress, token) => {
-              const abortCtrl = new AbortController();
-              const cancelSub = token.onCancellationRequested(() =>
-                abortCtrl.abort(),
-              );
-              const writeStream = fs.createWriteStream(saveUri.fsPath, {
-                encoding: "utf8",
-              });
-              writeStream.write("[\n");
-              let first = true;
-              try {
-                for await (const chunk of this.svc.exportAll(
-                  this.connectionId,
-                  this.database,
-                  this.schema,
-                  this.table,
-                  500,
-                  sort as SortConfig | null,
-                  coerceFilterExpressions(jsonFilters),
-                  abortCtrl.signal,
-                )) {
-                  for (const row of chunk.rows) {
-                    const serialisable = Object.fromEntries(
-                      Object.entries(row).map(([k, v]) => [
-                        k,
-                        v instanceof Date
-                          ? Number.isNaN(v.getTime())
-                            ? null
-                            : formatCellValue(v)
-                          : (v ?? null),
-                      ]),
-                    );
-                    writeStream.write(
-                      (first ? "" : ",\n") + JSON.stringify(serialisable),
-                    );
-                    first = false;
-                  }
-                }
-                writeStream.write("\n]\n");
-                await new Promise<void>((res, rej) => {
-                  writeStream.end((err?: Error | null) =>
-                    err ? rej(err) : res(),
-                  );
-                });
-              } catch (err) {
-                writeStream.destroy();
-                throw err;
-              } finally {
-                cancelSub.dispose();
-              }
-            },
-          );
-
-          vscode.window.showInformationMessage(
-            `[RapiDB] Exported ${this.table} → ${path.basename(saveUri.fsPath)}`,
-          );
-        } catch (err: unknown) {
-          const error = normalizeUnknownError(err);
-          if (error.name !== "AbortError") {
-            vscode.window.showErrorMessage(
-              `[RapiDB] JSON export failed: ${error.message}`,
-            );
-          }
-        }
+      case "exportJSON":
+        await this._handleExportJSON(parsed.payload);
         break;
-      }
-
-      case "confirmDelete": {
-        const payload = parsed.payload;
-        if (!payload) {
-          return;
-        }
-        const { count } = payload;
-        const answer = await vscode.window.showWarningMessage(
-          `Delete ${count} row${count !== 1 ? "s" : ""} from "${this.table}"? This cannot be undone.`,
-          { modal: true },
-          "Delete",
-        );
-        send("deleteConfirmed", { confirmed: answer === "Delete" });
+      case "confirmDelete":
+        if (parsed.payload)
+          await this._handleConfirmDelete(parsed.payload, send);
         break;
-      }
-
-      case "confirmMutationPreview": {
-        const payload = parsed.payload;
-        if (!payload) {
-          return;
-        }
-        await this.executePendingMutationPreview(payload.previewToken, send);
+      case "confirmMutationPreview":
+        if (parsed.payload)
+          await this._handleConfirmMutationPreview(parsed.payload, send);
         break;
-      }
-
-      case "cancelMutationPreview": {
-        const payload = parsed.payload;
-        if (!payload) {
-          return;
-        }
-        this.cancelPendingMutationPreview(payload.previewToken, send);
+      case "cancelMutationPreview":
+        if (parsed.payload) this._handleCancelMutationPreview(parsed.payload);
         break;
-      }
     }
   }
 
-  private storePendingMutationPreview(
-    preview: PendingTableMutationPreview,
-  ): string {
-    const previewToken = randomUUID();
-    this.pendingMutationPreviews.set(previewToken, preview);
-    return previewToken;
-  }
-
-  private async previewAndConfirmMutation(
-    previewToken: string,
+  private async _handleReady(
     send: (type: string, payload: unknown) => Thenable<boolean>,
   ): Promise<void> {
-    const preview = this.pendingMutationPreviews.get(previewToken);
-    if (!preview) {
-      return;
-    }
-
-    const connectionType = this.cm.getConnection(this.connectionId)?.type;
-    const previewStatements = preview.plan.previewStatements;
-    const title =
-      preview.kind === "applyChanges"
-        ? `Apply changes to ${this.table}`
-        : `Insert row into ${this.table}`;
-    const sql = formatMutationPreviewSql(previewStatements, connectionType);
-
-    const payload: TableMutationPreviewPayload = {
-      previewToken,
-      kind: preview.kind,
-      title,
-      sql,
-      statementCount: previewStatements.length,
-    };
-
-    await send("tableMutationPreview", payload);
-  }
-
-  private async executePendingMutationPreview(
-    previewToken: string,
-    send: (type: string, payload: unknown) => Thenable<boolean>,
-  ): Promise<void> {
-    const preview = this.pendingMutationPreviews.get(previewToken);
-    if (!preview) {
-      return;
-    }
-
-    this.pendingMutationPreviews.delete(previewToken);
-
-    if (preview.kind === "applyChanges") {
-      const result: ApplyResultPayload = await executePreparedApplyPlan(
-        this.cm,
-        preview.plan,
-      );
-      if (result.warning) {
-        void vscode.window.showWarningMessage(`[RapiDB] ${result.warning}`);
-      }
-      send("applyResult", result);
-      return;
-    }
-
     try {
-      await this.svc.executePreparedInsertPlan(preview.plan);
-      send("insertResult", { success: true });
+      const cols = await this.svc.getColumns(
+        this.connectionId,
+        this.database,
+        this.schema,
+        this.table,
+      );
+      this.cachedColumns = cols;
+      const pkCols = cols.filter((c) => c.isPrimaryKey).map((c) => c.name);
+      send("tableInit", {
+        columns: cols,
+        primaryKeyColumns: pkCols,
+        isView: this.isView,
+      });
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
-      send("insertResult", {
-        success: false,
-        error: error.message,
-      });
+      send("tableError", { error: error.message });
     }
   }
 
-  private cancelPendingMutationPreview(
-    previewToken: string,
-    _send: (type: string, payload: unknown) => Thenable<boolean>,
-  ): void {
-    const preview = this.pendingMutationPreviews.get(previewToken);
-    if (!preview) {
+  private async _handleFetchPage(
+    raw: NonNullable<
+      Extract<
+        import("../../shared/webviewContracts").TablePanelMessage,
+        { type: "fetchPage" }
+      >["payload"]
+    >,
+    send: (type: string, payload: unknown) => Thenable<boolean>,
+  ): Promise<void> {
+    const fetchId = raw.fetchId;
+    const page = Math.max(1, Math.floor(Number(raw.page) || 1));
+    const pageSize = Math.min(
+      10000,
+      Math.max(1, Math.floor(Number(raw.pageSize) || 50)),
+    );
+    const filters = coerceFilterExpressions(raw.filters);
+    const sort = raw.sort ?? null;
+    try {
+      const result = await this.svc.getPage(
+        this.connectionId,
+        this.database,
+        this.schema,
+        this.table,
+        page,
+        pageSize,
+        filters as FilterExpression[],
+        sort as SortConfig | null,
+      );
+      send("tableData", {
+        fetchId,
+        rows: result.rows,
+        totalCount: result.totalCount,
+      });
+    } catch (err: unknown) {
+      const error = normalizeUnknownError(err);
+      const errMsg = error.message;
+      const isFilterError = FILTER_ERROR_RE.test(errMsg);
+      send("tableError", { fetchId, error: errMsg, isFilterError });
+    }
+  }
+
+  private async _handleApplyChanges(
+    payload: {
+      updates?: import("../../shared/webviewContracts").RowUpdateMessagePayload[];
+    },
+    send: (type: string, payload: unknown) => Thenable<boolean>,
+  ): Promise<void> {
+    const { updates } = payload;
+    try {
+      const prepared = prepareApplyChangesPlan(
+        this.connectionManager,
+        this.connectionId,
+        this.database,
+        this.schema,
+        this.table,
+        updates ?? [],
+        this.cachedColumns,
+      );
+
+      if (!prepared.executable) {
+        if (prepared.result.warning) {
+          void vscode.window.showWarningMessage(
+            `[RapiDB] ${prepared.result.warning}`,
+          );
+        }
+        send("applyResult", prepared.result);
+        return;
+      }
+
+      await send(
+        "tableMutationPreview",
+        this.previewController.createApplyChangesPreview(prepared.plan),
+      );
+    } catch (err: unknown) {
+      const error = normalizeUnknownError(err);
+      send("applyResult", { success: false, error: error.message });
+    }
+  }
+
+  private async _handleInsertRow(
+    payload: { values?: Record<string, unknown> },
+    send: (type: string, payload: unknown) => Thenable<boolean>,
+  ): Promise<void> {
+    const { values = {} } = payload;
+    try {
+      const plan = await this.svc.prepareInsertRow(
+        this.connectionId,
+        this.database,
+        this.schema,
+        this.table,
+        values,
+      );
+      await send(
+        "tableMutationPreview",
+        this.previewController.createInsertPreview(plan),
+      );
+    } catch (err: unknown) {
+      const error = normalizeUnknownError(err);
+      send("insertResult", { success: false, error: error.message });
+    }
+  }
+
+  private async _handleDeleteRows(
+    payload: { primaryKeysList?: Array<Record<string, unknown>> },
+    send: (type: string, payload: unknown) => Thenable<boolean>,
+  ): Promise<void> {
+    const { primaryKeysList = [] } = payload;
+    try {
+      await this.svc.deleteRows(
+        this.connectionId,
+        this.database,
+        this.schema,
+        this.table,
+        primaryKeysList,
+      );
+      send("deleteResult", { success: true });
+    } catch (err: unknown) {
+      const error = normalizeUnknownError(err);
+      send("deleteResult", { success: false, error: error.message });
+    }
+  }
+
+  private async _handleExportCSV(
+    payload: { sort?: unknown; filters?: unknown[] } | undefined,
+  ): Promise<void> {
+    const { sort: csvSort = null, filters: csvFilters = [] } = payload ?? {};
+
+    await exportTableDataAsCsv({
+      tableName: this.table,
+      loadChunks: (signal) =>
+        this.svc.exportAll(
+          this.connectionId,
+          this.database,
+          this.schema,
+          this.table,
+          EXPORT_CHUNK_SIZE,
+          csvSort as SortConfig | null,
+          coerceFilterExpressions(csvFilters),
+          signal,
+        ),
+    });
+  }
+
+  private async _handleExportJSON(
+    payload: { sort?: unknown; filters?: unknown[] } | undefined,
+  ): Promise<void> {
+    const { sort = null, filters: jsonFilters = [] } = payload ?? {};
+
+    await exportTableDataAsJson({
+      tableName: this.table,
+      loadChunks: (signal) =>
+        this.svc.exportAll(
+          this.connectionId,
+          this.database,
+          this.schema,
+          this.table,
+          EXPORT_CHUNK_SIZE,
+          sort as SortConfig | null,
+          coerceFilterExpressions(jsonFilters),
+          signal,
+        ),
+    });
+  }
+
+  private async _handleConfirmDelete(
+    payload: { count: number },
+    send: (type: string, payload: unknown) => Thenable<boolean>,
+  ): Promise<void> {
+    const { count } = payload;
+    const answer = await vscode.window.showWarningMessage(
+      `Delete ${count} row${count !== 1 ? "s" : ""} from "${this.table}"? This cannot be undone.`,
+      { modal: true },
+      "Delete",
+    );
+    send("deleteConfirmed", { confirmed: answer === "Delete" });
+  }
+
+  private async _handleConfirmMutationPreview(
+    payload: { previewToken: string },
+    send: (type: string, payload: unknown) => Thenable<boolean>,
+  ): Promise<void> {
+    const result = await this.previewController.confirm(payload.previewToken);
+    if (!result) {
       return;
     }
 
-    this.pendingMutationPreviews.delete(previewToken);
+    await send(result.type, result.payload);
+  }
+
+  private _handleCancelMutationPreview(payload: {
+    previewToken: string;
+  }): void {
+    this.previewController.cancel(payload.previewToken);
   }
 
   private buildHtml(context: vscode.ExtensionContext): string {
@@ -643,7 +443,7 @@ export class TablePanel {
         schema: this.schema,
         table: this.table,
         isView: this.isView,
-        defaultPageSize: this.cm.getDefaultPageSize(),
+        defaultPageSize: this.connectionManager.getDefaultPageSize(),
       },
       htmlStyles: "height: 100%; overflow: hidden;",
       bodyStyles: "height: 100%; overflow: hidden;",
@@ -661,36 +461,4 @@ export class TablePanel {
       `,
     });
   }
-}
-
-function formatCellValue(value: unknown): string {
-  if (value == null) {
-    return "";
-  }
-
-  if (value instanceof Date) {
-    if (Number.isNaN(value.getTime())) {
-      return "";
-    }
-
-    const pad = (n: number) => String(n).padStart(2, "0");
-    return (
-      `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())} ` +
-      `${pad(value.getUTCHours())}:${pad(value.getUTCMinutes())}:${pad(value.getUTCSeconds())}`
-    );
-  }
-  return String(value);
-}
-
-function csvCell(value: unknown): string {
-  const s = formatCellValue(value);
-  if (s === "") {
-    return "";
-  }
-  return s.includes(",") ||
-    s.includes('"') ||
-    s.includes("\n") ||
-    s.includes("\r")
-    ? `"${s.replace(/"/g, '""')}"`
-    : s;
 }

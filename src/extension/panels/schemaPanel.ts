@@ -12,7 +12,7 @@ export class SchemaPanel {
   private static panels = new Map<string, SchemaPanel>();
 
   private readonly panel: vscode.WebviewPanel;
-  private readonly cm: ConnectionManager;
+  private readonly connectionManager: ConnectionManager;
   private readonly context: vscode.ExtensionContext;
   private readonly connectionId: string;
   private readonly database: string;
@@ -22,7 +22,7 @@ export class SchemaPanel {
   private constructor(
     panel: vscode.WebviewPanel,
     context: vscode.ExtensionContext,
-    cm: ConnectionManager,
+    connectionManager: ConnectionManager,
     connectionId: string,
     database: string,
     schema: string,
@@ -30,7 +30,7 @@ export class SchemaPanel {
   ) {
     this.panel = panel;
     this.context = context;
-    this.cm = cm;
+    this.connectionManager = connectionManager;
     this.connectionId = connectionId;
     this.database = database;
     this.schema = schema;
@@ -67,7 +67,7 @@ export class SchemaPanel {
 
   static createOrShow(
     context: vscode.ExtensionContext,
-    cm: ConnectionManager,
+    connectionManager: ConnectionManager,
     connectionId: string,
     database: string,
     schema: string,
@@ -81,7 +81,8 @@ export class SchemaPanel {
     }
 
     const buildTitle = () => {
-      const connName = cm.getConnection(connectionId)?.name ?? connectionId;
+      const connName =
+        connectionManager.getConnection(connectionId)?.name ?? connectionId;
       const schemaPrefix = schema ? `${schema}.` : "";
       return `${schemaPrefix}${table} (schema) [${connName}]`;
     };
@@ -94,7 +95,7 @@ export class SchemaPanel {
     const instance = new SchemaPanel(
       panel,
       context,
-      cm,
+      connectionManager,
       connectionId,
       database,
       schema,
@@ -107,7 +108,7 @@ export class SchemaPanel {
         panel.title = buildTitle();
       }
     });
-    const disconnSub = cm.onDidDisconnect((id) => {
+    const disconnSub = connectionManager.onDidDisconnect((id) => {
       if (id === connectionId) {
         panel.dispose();
       }
@@ -129,7 +130,7 @@ export class SchemaPanel {
 
     switch (parsed.type) {
       case "ready": {
-        const driver = this.cm.getDriver(this.connectionId);
+        const driver = this.connectionManager.getDriver(this.connectionId);
         if (!driver) {
           send("schemaError", { error: "Not connected" });
           return;
@@ -160,7 +161,7 @@ export class SchemaPanel {
         const { table, schema, database } = payload;
         SchemaPanel.createOrShow(
           this.context,
-          this.cm,
+          this.connectionManager,
           this.connectionId,
           database ?? this.database,
           schema ?? this.schema,

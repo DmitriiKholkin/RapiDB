@@ -232,11 +232,11 @@ function looksLikeDateInput(value: string): boolean {
   return /^\d{4}-\d{2}-\d{2}(?:[ T].*)?$/.test(value.trim());
 }
 
-function hasExplicitTimezone(value: string): boolean {
+export function hasExplicitTimezone(value: string): boolean {
   return /[zZ]|[+-]\d{2}:\d{2}$/.test(value);
 }
 
-function normalizeSqlDatetimeOffsetSpacing(value: string): string {
+export function normalizeSqlDatetimeOffsetSpacing(value: string): string {
   return value.replace(/ ([+-]\d{2}:\d{2})$/, "$1");
 }
 

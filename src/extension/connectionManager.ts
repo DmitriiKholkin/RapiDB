@@ -1,6 +1,18 @@
 import { randomUUID } from "crypto";
 import * as vscode from "vscode";
-import type { ConnectionConfig } from "../shared/connectionConfig";
+import {
+  type BookmarkEntry,
+  type ConnectAttempt,
+  type ConnectionConfig,
+  type HistoryEntry,
+  type SchemaTableEntry,
+  type StoredConnectionConfig,
+  type TestConnectionResult,
+} from "./connectionManagerModels";
+import {
+  type ConnectionManagerStore,
+  VSCodeConnectionManagerStore,
+} from "./connectionManagerStore";
 import { MSSQLDriver } from "./dbDrivers/mssql";
 import { MySQLDriver } from "./dbDrivers/mysql";
 import { OracleDriver } from "./dbDrivers/oracle";
@@ -9,46 +21,20 @@ import { SQLiteDriver } from "./dbDrivers/sqlite";
 import type { IDBDriver } from "./dbDrivers/types";
 import { normalizeUnknownError } from "./utils/errorHandling";
 
-export type { ConnectionConfig } from "../shared/connectionConfig";
-
-export interface TestConnectionResult {
-  success: boolean;
-  error?: string;
-}
-
-export interface HistoryEntry {
-  id: string;
-  sql: string;
-  connectionId: string;
-  executedAt: string;
-}
-
-export interface BookmarkEntry {
-  id: string;
-  sql: string;
-  connectionId: string;
-  savedAt: string;
-}
-
-export interface ConnectAttempt {
-  promise: Promise<void>;
-  isNew: boolean;
-}
-
-export interface SchemaTableEntry {
-  schema: string;
-  table: string;
-  columns: { name: string; type: string }[];
-}
+export type {
+  BookmarkEntry,
+  ConnectAttempt,
+  ConnectionConfig,
+  HistoryEntry,
+  SchemaTableEntry,
+  TestConnectionResult,
+} from "./connectionManagerModels";
 
 interface SchemaCacheEntry {
   tables: SchemaTableEntry[];
   loading: Promise<void> | null;
 }
-
-type StoredConnectionConfig = ConnectionConfig & { user?: string };
-
-async function pMapWithLimit<T, R>(
+export async function pMapWithLimit<T, R>(
   items: T[],
   limit: number,
   fn: (item: T) => Promise<R>,
@@ -69,14 +55,10 @@ async function pMapWithLimit<T, R>(
   return results;
 }
 
-const HISTORY_STATE_KEY = "rapidb.queryHistory";
-const BOOKMARKS_STATE_KEY = "rapidb.bookmarks";
-const HISTORY_LIMIT_DEFAULT = 100;
-const HISTORY_LIMIT_MAX = 10000;
-const VALID_PAGE_SIZES = [25, 100, 500, 1000] as const;
+const TEST_CONNECTION_ID = "__test__";
 
 export class ConnectionManager {
-  private readonly context: vscode.ExtensionContext;
+  private readonly store: ConnectionManagerStore;
   private driverMap = new Map<string, IDBDriver>();
   private readonly _connectingMap = new Map<string, Promise<void>>();
 
@@ -101,8 +83,11 @@ export class ConnectionManager {
   private _connectionsCache: ConnectionConfig[] | null = null;
   private readonly _schemaCacheMap = new Map<string, SchemaCacheEntry>();
 
-  constructor(context: vscode.ExtensionContext) {
-    this.context = context;
+  constructor(
+    context: vscode.ExtensionContext,
+    store: ConnectionManagerStore = new VSCodeConnectionManagerStore(context),
+  ) {
+    this.store = store;
     this.onDidChangeConnections = this._onDidChangeConnections.event;
     this.onDidChangeHistory = this._onDidChangeHistory.event;
     this.onDidChangeBookmarks = this._onDidChangeBookmarks.event;
@@ -110,46 +95,31 @@ export class ConnectionManager {
     this.onDidDisconnect = this._onDidDisconnect.event;
     this.onDidSchemaLoad = this._onDidSchemaLoad.event;
 
-    vscode.workspace.onDidChangeConfiguration(
-      async (e) => {
-        this._connectionsCache = null;
-        if (e.affectsConfiguration("rapidb.queryHistoryLimit")) {
-          await this._trimHistoryToLimit();
-        }
-      },
-      undefined,
-      context.subscriptions,
-    );
+    this.store.onDidChangeConfiguration(async (e) => {
+      this._connectionsCache = null;
+      if (e.affectsConfiguration("rapidb.queryHistoryLimit")) {
+        await this._trimHistoryToLimit();
+      }
+    }, context.subscriptions);
   }
 
   private getHistoryLimit(): number {
-    const cfg = vscode.workspace.getConfiguration("rapidb");
-    const raw = cfg.get<number>("queryHistoryLimit", HISTORY_LIMIT_DEFAULT);
-    const clamped = Math.max(1, Math.min(HISTORY_LIMIT_MAX, Math.round(raw)));
-    return clamped;
+    return this.store.getHistoryLimit();
   }
 
   getDefaultPageSize(): number {
-    const cfg = vscode.workspace.getConfiguration("rapidb");
-    const raw = cfg.get<number>("defaultPageSize", 25);
-    return (VALID_PAGE_SIZES as readonly number[]).includes(raw) ? raw : 25;
+    return this.store.getDefaultPageSize();
   }
 
   getQueryRowLimit(): number {
-    const cfg = vscode.workspace.getConfiguration("rapidb");
-    const raw = cfg.get<number>("queryRowLimit", 10000);
-    return Math.max(100, Math.min(100000, Math.round(raw)));
+    return this.store.getQueryRowLimit();
   }
 
   private async _trimHistoryToLimit(): Promise<void> {
     const limit = this.getHistoryLimit();
-    const all =
-      this.context.globalState.get<HistoryEntry[]>(HISTORY_STATE_KEY) ?? [];
+    const all = this.store.readHistory();
     if (all.length > limit) {
-      await this.context.globalState.update(
-        HISTORY_STATE_KEY,
-        all.slice(0, limit),
-      );
+      await this.store.writeHistory(all.slice(0, limit));
       this._onDidChangeHistory.fire();
     }
   }
@@ -158,10 +128,7 @@ export class ConnectionManager {
     if (this._connectionsCache) {
       return this._connectionsCache;
     }
-    const config = vscode.workspace.getConfiguration("rapidb");
-    this._connectionsCache = (
-      config.get<StoredConnectionConfig[]>("connections") ?? []
-    ).map((c) => ({
+    this._connectionsCache = this.store.getConnections().map((c) => ({
       ...c,
       id: c.id ?? randomUUID(),
       username: c.username ?? c.user,
@@ -171,9 +138,7 @@ export class ConnectionManager {
 
   private async saveConnections(conns: ConnectionConfig[]): Promise<void> {
     this._connectionsCache = null;
-    await vscode.workspace
-      .getConfiguration("rapidb")
-      .update("connections", conns, vscode.ConfigurationTarget.Global);
+    await this.store.saveConnections(conns);
   }
 
   getConnection(id: string): ConnectionConfig | undefined {
@@ -199,16 +164,11 @@ export class ConnectionManager {
     this._onDidChangeConnections.fire();
   }
 
-  async deleteConnection(id: string): Promise<boolean> {
-    const conn = this.getConnection(id);
-    const confirm = await vscode.window.showWarningMessage(
-      `Delete connection "${conn?.name ?? id}"?`,
-      { modal: true },
-      "Delete",
-    );
-    if (confirm !== "Delete") {
+  async removeConnection(id: string): Promise<boolean> {
+    if (!this.getConnection(id)) {
       return false;
     }
+
     if (this.driverMap.has(id)) {
       await this.disconnectFrom(id);
     }
@@ -217,12 +177,13 @@ export class ConnectionManager {
     );
 
     try {
-      await this.context.secrets.delete(id);
+      await this.store.deleteSecret(id);
     } catch {}
 
     await this._purgeHistoryForConnection(id);
 
     await this._purgeBookmarksForConnection(id);
+    this._onDidChangeConnections.fire();
     return true;
   }
 
@@ -231,7 +192,7 @@ export class ConnectionManager {
       return config;
     }
     try {
-      const stored = await this.context.secrets.get(config.id);
+      const stored = await this.store.getSecret(config.id);
       return { ...config, password: stored ?? "" };
     } catch {
       return { ...config, password: "" };
@@ -241,11 +202,10 @@ export class ConnectionManager {
   private async _purgeHistoryForConnection(
     connectionId: string,
   ): Promise<void> {
-    const all =
-      this.context.globalState.get<HistoryEntry[]>(HISTORY_STATE_KEY) ?? [];
+    const all = this.store.readHistory();
     const filtered = all.filter((e) => e.connectionId !== connectionId);
     if (filtered.length !== all.length) {
-      await this.context.globalState.update(HISTORY_STATE_KEY, filtered);
+      await this.store.writeHistory(filtered);
       this._onDidChangeHistory.fire();
     }
   }
@@ -456,7 +416,7 @@ export class ConnectionManager {
   async testConnection(
     config: Omit<ConnectionConfig, "id">,
   ): Promise<TestConnectionResult> {
-    const driver = this.createDriver({ ...config, id: "__test__" });
+    const driver = this.createDriver({ ...config, id: TEST_CONNECTION_ID });
     try {
       await driver.connect();
       await driver.disconnect();
@@ -476,28 +436,8 @@ export class ConnectionManager {
     );
   }
 
-  async pickConnection(): Promise<string | undefined> {
-    const conns = this.getConnections();
-    if (conns.length === 0) {
-      vscode.window.showInformationMessage(
-        "[RapiDB] No connections configured. Use 'Add Connection' first.",
-      );
-      return;
-    }
-    const pick = await vscode.window.showQuickPick(
-      conns.map((c) => ({
-        label: `${this.isConnected(c.id) ? "$(circle-filled)" : "$(circle-outline)"} ${c.name}`,
-        description: c.type,
-        id: c.id,
-      })),
-      { placeHolder: "Select a connection" },
-    );
-    return pick?.id;
-  }
-
   getHistory(connectionId?: string): HistoryEntry[] {
-    const all =
-      this.context.globalState.get<HistoryEntry[]>(HISTORY_STATE_KEY) ?? [];
+    const all = this.store.readHistory();
     if (connectionId) {
       return all.filter((e) => e.connectionId === connectionId);
     }
@@ -510,8 +450,7 @@ export class ConnectionManager {
       return;
     }
 
-    const all =
-      this.context.globalState.get<HistoryEntry[]>(HISTORY_STATE_KEY) ?? [];
+    const all = this.store.readHistory();
 
     const latest = all[0];
     if (
@@ -530,22 +469,25 @@ export class ConnectionManager {
     };
     const updated = [entry, ...all].slice(0, this.getHistoryLimit());
 
-    await this.context.globalState.update(HISTORY_STATE_KEY, updated);
+    await this.store.writeHistory(updated);
     this._onDidChangeHistory.fire();
   }
 
   async clearHistory(): Promise<void> {
-    await this.context.globalState.update(HISTORY_STATE_KEY, []);
+    await this.store.writeHistory([]);
     this._onDidChangeHistory.fire();
   }
 
   getBookmarks(connectionId?: string): BookmarkEntry[] {
-    const all =
-      this.context.globalState.get<BookmarkEntry[]>(BOOKMARKS_STATE_KEY) ?? [];
+    const all = this.store.readBookmarks();
     if (connectionId) {
       return all.filter((b) => b.connectionId === connectionId);
     }
     return all;
+  }
+
+  getBookmark(id: string): BookmarkEntry | undefined {
+    return this.store.readBookmarks().find((bookmark) => bookmark.id === id);
   }
 
   async addBookmark(connectionId: string, sql: string): Promise<BookmarkEntry> {
@@ -556,34 +498,20 @@ export class ConnectionManager {
       connectionId,
       savedAt: new Date().toISOString(),
     };
-    const all =
-      this.context.globalState.get<BookmarkEntry[]>(BOOKMARKS_STATE_KEY) ?? [];
-    await this.context.globalState.update(BOOKMARKS_STATE_KEY, [entry, ...all]);
+    const all = this.store.readBookmarks();
+    await this.store.writeBookmarks([entry, ...all]);
     this._onDidChangeBookmarks.fire();
     return entry;
   }
 
-  async deleteBookmark(id: string): Promise<boolean> {
-    const all =
-      this.context.globalState.get<BookmarkEntry[]>(BOOKMARKS_STATE_KEY) ?? [];
-    const target = all.find((b) => b.id === id);
-    const preview = target
-      ? target.sql.slice(0, 60).replace(/\s+/g, " ") +
-        (target.sql.length > 60 ? "…" : "")
-      : id;
-
-    const answer = await vscode.window.showWarningMessage(
-      `[RapiDB] Delete bookmark: "${preview}"?`,
-      { modal: true },
-      "Delete",
-    );
-    if (answer !== "Delete") {
+  async removeBookmark(id: string): Promise<boolean> {
+    const all = this.store.readBookmarks();
+    if (!all.some((bookmark) => bookmark.id === id)) {
       return false;
     }
 
-    await this.context.globalState.update(
-      BOOKMARKS_STATE_KEY,
-      all.filter((b) => b.id !== id),
+    await this.store.writeBookmarks(
+      all.filter((bookmark) => bookmark.id !== id),
     );
     this._onDidChangeBookmarks.fire();
     return true;
@@ -592,17 +520,16 @@ export class ConnectionManager {
   private async _purgeBookmarksForConnection(
     connectionId: string,
   ): Promise<void> {
-    const all =
-      this.context.globalState.get<BookmarkEntry[]>(BOOKMARKS_STATE_KEY) ?? [];
+    const all = this.store.readBookmarks();
     const filtered = all.filter((b) => b.connectionId !== connectionId);
     if (filtered.length !== all.length) {
-      await this.context.globalState.update(BOOKMARKS_STATE_KEY, filtered);
+      await this.store.writeBookmarks(filtered);
       this._onDidChangeBookmarks.fire();
     }
   }
 
   async clearBookmarks(): Promise<void> {
-    await this.context.globalState.update(BOOKMARKS_STATE_KEY, []);
+    await this.store.writeBookmarks([]);
     this._onDidChangeBookmarks.fire();
   }
 }

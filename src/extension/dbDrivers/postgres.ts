@@ -24,9 +24,13 @@ import type {
 } from "./types";
 import { ISO_DATETIME_RE, NULL_SENTINEL } from "./types";
 
-pgTypes.setTypeParser(1082, (val: string) => val);
-pgTypes.setTypeParser(1114, (val: string) => val);
-pgTypes.setTypeParser(1184, (val: string) => val);
+const PG_OID_DATE = 1082; // date
+const PG_OID_TIMESTAMP = 1114; // timestamp without time zone
+const PG_OID_TIMESTAMPTZ = 1184; // timestamp with time zone
+
+pgTypes.setTypeParser(PG_OID_DATE, (val: string) => val);
+pgTypes.setTypeParser(PG_OID_TIMESTAMP, (val: string) => val);
+pgTypes.setTypeParser(PG_OID_TIMESTAMPTZ, (val: string) => val);
 
 const PG_GEOMETRIC_TYPES = new Set([
   "point",

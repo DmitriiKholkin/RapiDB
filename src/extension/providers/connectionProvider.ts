@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { ConnectionConfig, ConnectionManager } from "../connectionManager";
 import type { TableInfo } from "../dbDrivers/types";
+import { normalizeUnknownError } from "../utils/errorHandling";
 
 export type NodeKind =
   | "connectionNode_disconnected"
@@ -189,8 +190,13 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
           node.tooltip = `Database: ${db.name}`;
           return node;
         });
-      } catch (err: any) {
-        return [this.makeError(element.connectionId, err.message)];
+      } catch (err: unknown) {
+        return [
+          this.makeError(
+            element.connectionId,
+            normalizeUnknownError(err).message,
+          ),
+        ];
       }
     }
 
@@ -221,8 +227,13 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
           node.tooltip = `Schema: ${s.name}`;
           return node;
         });
-      } catch (err: any) {
-        return [this.makeError(element.connectionId, err.message)];
+      } catch (err: unknown) {
+        return [
+          this.makeError(
+            element.connectionId,
+            normalizeUnknownError(err).message,
+          ),
+        ];
       }
     }
 
@@ -292,8 +303,13 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
           }
           return node;
         });
-      } catch (err: any) {
-        return [this.makeError(element.connectionId, err.message)];
+      } catch (err: unknown) {
+        return [
+          this.makeError(
+            element.connectionId,
+            normalizeUnknownError(err).message,
+          ),
+        ];
       }
     }
 

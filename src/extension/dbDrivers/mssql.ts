@@ -3,7 +3,9 @@ import type { ConnectionConfig } from "../connectionManager";
 import {
   BaseDBDriver,
   formatDatetimeForDisplay,
+  hasExplicitTimezone,
   isoToLocalDateStr,
+  normalizeSqlDatetimeOffsetSpacing,
 } from "./BaseDBDriver";
 import type {
   ColumnMeta,
@@ -194,14 +196,6 @@ const escapeMssqlId = (s: string) => s.replace(/]/g, "]]");
 
 function baseTypeName(typeName: string): string {
   return typeName.toLowerCase().split("(")[0].trim();
-}
-
-function hasExplicitTimezone(value: string): boolean {
-  return /[zZ]|[+-]\d{2}:\d{2}$/.test(value);
-}
-
-function normalizeSqlDatetimeOffsetSpacing(value: string): string {
-  return value.replace(/ ([+-]\d{2}:\d{2})$/, "$1");
 }
 
 function normalizeDatetimeLiteral(value: string): string {
@@ -1003,7 +997,7 @@ export class MSSQLDriver extends BaseDBDriver {
       colDefs.push(`  PRIMARY KEY (${pkCols.join(", ")})`);
     }
 
-    return `CREATE TABLE ${this.qualifiedTableName(database, schema, table)} (\n${colDefs.join(",\n")}\n);`;
+    return `CREATE TABLE ${this.qualifiedTableName("", schema, table)} (\n${colDefs.join(",\n")}\n);`;
   }
 
   async getRoutineDefinition(
@@ -1112,11 +1106,19 @@ export class MSSQLDriver extends BaseDBDriver {
   }
 
   override qualifiedTableName(
-    _database: string,
+    database: string,
     schema: string,
     table: string,
   ): string {
-    return `${this.quoteIdentifier(schema)}.${this.quoteIdentifier(table)}`;
+    const parts: string[] = [];
+    if (database) {
+      parts.push(this.quoteIdentifier(database));
+    }
+    if (schema) {
+      parts.push(this.quoteIdentifier(schema));
+    }
+    parts.push(this.quoteIdentifier(table));
+    return parts.join(".");
   }
 
   override buildPagination(

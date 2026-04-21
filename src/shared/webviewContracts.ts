@@ -174,11 +174,6 @@ function readRequiredString(record: UnknownRecord, key: string): string | null {
   return typeof value === "string" ? value : null;
 }
 
-function readString(record: UnknownRecord, key: string): string | undefined {
-  const value = record[key];
-  return typeof value === "string" ? value : undefined;
-}
-
 function readOptionalString(
   record: UnknownRecord,
   key: string,
@@ -248,7 +243,7 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
   }
 
   const id = readRequiredString(input, "id");
-  const name = readString(input, "name");
+  const name = readOptionalString(input, "name");
   const type = readConnectionType(input.type);
   if (!id || name === undefined || type === undefined || type === "") {
     return null;
@@ -327,8 +322,8 @@ export function parseWebviewInitialState(
 
     case "table": {
       const connectionId = readRequiredString(input, "connectionId");
-      const database = readString(input, "database");
-      const schema = readString(input, "schema");
+      const database = readOptionalString(input, "database");
+      const schema = readOptionalString(input, "schema");
       const table = readRequiredString(input, "table");
       if (
         !connectionId ||
@@ -351,8 +346,8 @@ export function parseWebviewInitialState(
 
     case "schema": {
       const connectionId = readRequiredString(input, "connectionId");
-      const database = readString(input, "database");
-      const schema = readString(input, "schema");
+      const database = readOptionalString(input, "database");
+      const schema = readOptionalString(input, "schema");
       const table = readRequiredString(input, "table");
       if (
         !connectionId ||

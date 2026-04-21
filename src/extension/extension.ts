@@ -1,6 +1,11 @@
 import * as vscode from "vscode";
 import type { BookmarkEntry, HistoryEntry } from "./connectionManager";
 import { ConnectionManager } from "./connectionManager";
+import {
+  confirmBookmarkRemoval,
+  confirmConnectionRemoval,
+  pickConnectionWithPrompt,
+} from "./connectionManagerPrompts";
 import { ConnectionFormPanel } from "./panels/connectionFormPanel";
 import { QueryPanel } from "./panels/queryPanel";
 import { SchemaPanel } from "./panels/schemaPanel";
@@ -18,6 +23,27 @@ import {
 } from "./utils/errorHandling";
 
 let _activated = false;
+
+const CMD = {
+  addConnection: "rapidb.addConnection",
+  editConnection: "rapidb.editConnection",
+  deleteConnection: "rapidb.deleteConnection",
+  connect: "rapidb.connect",
+  disconnect: "rapidb.disconnect",
+  newQuery: "rapidb.newQuery",
+  openTableData: "rapidb.openTableData",
+  showDDL: "rapidb.showDDL",
+  copyNodeName: "rapidb.copyNodeName",
+  openSchema: "rapidb.openSchema",
+  openRoutine: "rapidb.openRoutine",
+  openHistoryEntry: "rapidb.openHistoryEntry",
+  openBookmarkEntry: "rapidb.openBookmarkEntry",
+  deleteBookmark: "rapidb.deleteBookmark",
+  clearBookmarks: "rapidb.clearBookmarks",
+  clearHistory: "rapidb.clearHistory",
+  disconnectAll: "rapidb.disconnectAll",
+  refresh: "rapidb.refresh",
+} as const;
 
 let _connectionManager: import("./connectionManager").ConnectionManager | null =
   null;
@@ -96,7 +122,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   }
 
-  reg("rapidb.addConnection", async () => {
+  reg(CMD.addConnection, async () => {
     const result = await ConnectionFormPanel.show(context, connectionManager);
     if (result) {
       vscode.window.showInformationMessage(
@@ -106,8 +132,9 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   });
 
-  reg("rapidb.editConnection", async (node?: RapiDBNode) => {
-    const id = node?.connectionId ?? (await connectionManager.pickConnection());
+  reg(CMD.editConnection, async (node?: RapiDBNode) => {
+    const id =
+      node?.connectionId ?? (await pickConnectionWithPrompt(connectionManager));
     if (!id) {
       return;
     }
@@ -125,19 +152,21 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   });
 
-  reg("rapidb.deleteConnection", async (node?: RapiDBNode) => {
-    const id = node?.connectionId ?? (await connectionManager.pickConnection());
+  reg(CMD.deleteConnection, async (node?: RapiDBNode) => {
+    const id =
+      node?.connectionId ?? (await pickConnectionWithPrompt(connectionManager));
     if (!id) {
       return;
     }
-    const deleted = await connectionManager.deleteConnection(id);
+    const deleted = await confirmConnectionRemoval(connectionManager, id);
     if (deleted) {
       refresh();
     }
   });
 
-  reg("rapidb.connect", async (node?: RapiDBNode) => {
-    const id = node?.connectionId ?? (await connectionManager.pickConnection());
+  reg(CMD.connect, async (node?: RapiDBNode) => {
+    const id =
+      node?.connectionId ?? (await pickConnectionWithPrompt(connectionManager));
     if (!id) {
       return;
     }
@@ -176,8 +205,9 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   });
 
-  reg("rapidb.disconnect", async (node?: RapiDBNode) => {
-    const id = node?.connectionId ?? (await connectionManager.pickConnection());
+  reg(CMD.disconnect, async (node?: RapiDBNode) => {
+    const id =
+      node?.connectionId ?? (await pickConnectionWithPrompt(connectionManager));
     if (!id) {
       return;
     }
@@ -185,9 +215,9 @@ export function activate(context: vscode.ExtensionContext): void {
     refresh();
   });
 
-  reg("rapidb.newQuery", async (node?: RapiDBNode) => {
+  reg(CMD.newQuery, async (node?: RapiDBNode) => {
     const connectionId =
-      node?.connectionId ?? (await connectionManager.pickConnection());
+      node?.connectionId ?? (await pickConnectionWithPrompt(connectionManager));
     if (!connectionId) {
       return;
     }
@@ -220,7 +250,7 @@ export function activate(context: vscode.ExtensionContext): void {
     );
   });
 
-  reg("rapidb.openTableData", (node?: RapiDBNode) => {
+  reg(CMD.openTableData, (node?: RapiDBNode) => {
     if (!node?.connectionId || !node.objectName) {
       return;
     }
@@ -236,7 +266,7 @@ export function activate(context: vscode.ExtensionContext): void {
     );
   });
 
-  reg("rapidb.showDDL", async (node?: RapiDBNode) => {
+  reg(CMD.showDDL, async (node?: RapiDBNode) => {
     if (!node?.connectionId || !node.objectName) {
       vscode.window.showWarningMessage(
         "[RapiDB] Select a table or view node first.",
@@ -274,14 +304,14 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   });
 
-  reg("rapidb.copyNodeName", async (node?: RapiDBNode) => {
+  reg(CMD.copyNodeName, async (node?: RapiDBNode) => {
     const name = node?.objectName ?? node?.label?.toString();
     if (name) {
       await vscode.env.clipboard.writeText(name);
     }
   });
 
-  reg("rapidb.openSchema", (node?: RapiDBNode) => {
+  reg(CMD.openSchema, (node?: RapiDBNode) => {
     if (!node?.connectionId || !node.objectName) {
       return;
     }
@@ -295,7 +325,7 @@ export function activate(context: vscode.ExtensionContext): void {
     );
   });
 
-  reg("rapidb.openRoutine", async (node?: RapiDBNode) => {
+  reg(CMD.openRoutine, async (node?: RapiDBNode) => {
     if (!node?.connectionId || !node.objectName) {
       return;
     }
@@ -352,7 +382,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   });
 
-  reg("rapidb.openHistoryEntry", (entry: HistoryEntry) => {
+  reg(CMD.openHistoryEntry, (entry: HistoryEntry) => {
     if (!entry?.connectionId || !entry?.sql) {
       return;
     }
@@ -364,7 +394,7 @@ export function activate(context: vscode.ExtensionContext): void {
     );
   });
 
-  reg("rapidb.openBookmarkEntry", (entry: BookmarkEntry) => {
+  reg(CMD.openBookmarkEntry, (entry: BookmarkEntry) => {
     if (!entry?.connectionId || !entry?.sql) {
       return;
     }
@@ -380,17 +410,17 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   reg(
-    "rapidb.deleteBookmark",
+    CMD.deleteBookmark,
     async (node?: { entry?: { id?: string }; id?: string }) => {
       const id = node?.entry?.id ?? node?.id;
       if (!id) {
         return;
       }
-      await connectionManager.deleteBookmark(id);
+      await confirmBookmarkRemoval(connectionManager, id);
     },
   );
 
-  reg("rapidb.clearBookmarks", async () => {
+  reg(CMD.clearBookmarks, async () => {
     const answer = await vscode.window.showWarningMessage(
       "[RapiDB] Clear all bookmarks?",
       { modal: true },
@@ -402,7 +432,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   });
 
-  reg("rapidb.clearHistory", async () => {
+  reg(CMD.clearHistory, async () => {
     const answer = await vscode.window.showWarningMessage(
       "[RapiDB] Clear all query history?",
       { modal: true },
@@ -414,12 +444,12 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   });
 
-  reg("rapidb.disconnectAll", async () => {
+  reg(CMD.disconnectAll, async () => {
     await connectionManager.disconnectAll();
     refresh();
   });
 
-  reg("rapidb.refresh", () => {
+  reg(CMD.refresh, () => {
     refresh();
   });
 }
