@@ -332,6 +332,7 @@ export function QueryView({
       >
         {}
         <select
+          aria-label="Active connection"
           style={selectStyle}
           value={activeConnectionId || connectionId}
           onChange={(e) => handleConnectionChange(e.target.value)}

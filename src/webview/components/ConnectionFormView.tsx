@@ -1,4 +1,3 @@
-// biome-ignore lint/correctness/noUnusedImports: React is required for JSX in this build setup
 import React, {
   type CSSProperties,
   type InputHTMLAttributes,
@@ -33,7 +32,9 @@ const s = {
     fontSize: "13px",
     background: "var(--vscode-input-background)",
     color: "var(--vscode-input-foreground)",
-    border: "1px solid var(--vscode-input-border, var(--vscode-widget-border))",
+    borderWidth: 1,
+    borderStyle: "solid",
+    borderColor: "var(--vscode-input-border, var(--vscode-widget-border))",
     borderRadius: 2,
     outline: "none",
     fontFamily: "inherit",

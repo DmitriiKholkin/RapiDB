@@ -52,6 +52,17 @@ const HEADER_H = 28;
 const FILTER_H = 30;
 const TOOLBAR_H = 36;
 const PREVIEW_DIALOG_EDITOR_H = "min(42vh, 360px)";
+const SR_ONLY_STYLE: React.CSSProperties = {
+  position: "absolute",
+  width: 1,
+  height: 1,
+  padding: 0,
+  margin: -1,
+  overflow: "hidden",
+  clip: "rect(0, 0, 0, 0)",
+  whiteSpace: "nowrap",
+  border: 0,
+};
 
 const TABLE_ROW_STYLE_ID = "rapidb-table-row-style";
 if (
@@ -911,7 +922,8 @@ export function TableView({
   const busy = loading || applying || deleting || inserting;
 
   return (
-    <div
+    <main
+      aria-label={`Table data for ${_table}`}
       style={{
         display: "flex",
         flexDirection: "column",
@@ -1324,7 +1336,9 @@ export function TableView({
                         "0 -1px 0 0 var(--vscode-editorGroupHeader-tabsBackground)",
                     }}
                   >
-                    {!isSel && col && (
+                    {isSel ? (
+                      <span style={SR_ONLY_STYLE}>Selection column</span>
+                    ) : col ? (
                       <ColumnFilterControl
                         column={col}
                         draft={filterDrafts[h.column.id]}
@@ -1332,7 +1346,7 @@ export function TableView({
                           updateFilterDraft(h.column.id, nextDraft)
                         }
                       />
-                    )}
+                    ) : null}
                   </th>
                 );
               })}
@@ -1340,7 +1354,16 @@ export function TableView({
           </thead>
           <tbody>
             {virtItems.length > 0 && virtItems[0].start > 0 && (
-              <tr style={{ height: virtItems[0].start }} />
+              <tr>
+                <td
+                  colSpan={tanColumns.length}
+                  style={{
+                    height: virtItems[0].start,
+                    padding: 0,
+                    border: "none",
+                  }}
+                />
+              </tr>
             )}
             {virtItems.map((vRow) => {
               const row = tableRows[vRow.index];
@@ -1366,7 +1389,14 @@ export function TableView({
               (() => {
                 const last = virtItems[virtItems.length - 1];
                 const rem = totalVirtH - last.end;
-                return rem > 0 ? <tr style={{ height: rem }} /> : null;
+                return rem > 0 ? (
+                  <tr>
+                    <td
+                      colSpan={tanColumns.length}
+                      style={{ height: rem, padding: 0, border: "none" }}
+                    />
+                  </tr>
+                ) : null;
               })()}
           </tbody>
         </table>
@@ -1424,6 +1454,7 @@ export function TableView({
         <div style={{ flex: 1 }} />
         <span style={{ opacity: 0.6 }}>Rows per page:</span>
         <select
+          aria-label="Rows per page"
           value={pageSize}
           onChange={(e) => {
             setPageSize(Number(e.target.value));
@@ -1458,7 +1489,7 @@ export function TableView({
           onConfirm={confirmMutationPreview}
         />
       )}
-    </div>
+    </main>
   );
 }
 

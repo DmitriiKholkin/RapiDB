@@ -161,6 +161,18 @@ Everything you'd normally Google `information_schema` for — **one click away**
 
 <br/>
 
+Test workflow:
+
+```bash
+npm run test:all
+```
+
+That single command now runs compile, typecheck, unit, webview, live DB, and extension suites in order. The DB step brings Docker services up, prepares fixtures, runs the per-engine suites serially, and tears the services down on exit.
+
+Compose-backed suites require Docker Desktop with the daemon running. If Docker is installed but not started, the suite now fails fast during `db:check` with a dedicated preflight error instead of failing later inside `docker compose`.
+
+If you want to keep the compose-backed databases running for debugging after the suite finishes, set `RAPIDB_KEEP_TEST_SERVICES=1` before `npm run test:all` or `npm run test:db`.
+
 **Stack:**
 
 | Layer | Technology |
@@ -174,6 +186,7 @@ Everything you'd normally Google `information_schema` for — **one click away**
 PRs and contributions are welcome at [github.com/DmitriiKholkin/RapiDB](https://github.com/DmitriiKholkin/RapiDB).
 
 </details>
+
 
 ---
 

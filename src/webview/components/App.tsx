@@ -1,5 +1,4 @@
-// biome-ignore lint/style/useImportType: React needed for JSX
-import React from "react";
+import React, { ReactElement } from "react";
 import type {
   QueryInitialState,
   WebviewInitialState,
@@ -17,10 +16,10 @@ const fallbackState: QueryInitialState = {
   connectionType: "",
 };
 
-const state: WebviewInitialState =
-  parseWebviewInitialState(window.__RAPIDB_INITIAL_STATE__) ?? fallbackState;
+export function App(): ReactElement {
+  const state: WebviewInitialState =
+    parseWebviewInitialState(window.__RAPIDB_INITIAL_STATE__) ?? fallbackState;
 
-export function App(): React.ReactElement {
   switch (state.view) {
     case "query":
       return (
