@@ -34,9 +34,9 @@ export type ComposeBackedDbEngineId =
   (typeof COMPOSE_BACKED_DB_ENGINE_IDS)[number];
 
 export const TEST_DATABASE_NAMES = {
-  postgres: "happy_pg_db",
-  mysql: "happy_mysql_db",
-  mssql: "happy_mssql_db",
+  postgres: "rapidb_pg_db",
+  mysql: "rapidb_mysql_db",
+  mssql: "rapidb_mssql_db",
   oracle: "FREEPDB1",
 } as const;
 
@@ -388,7 +388,7 @@ export const TEST_ADMIN_CONNECTION_SEEDS: Partial<
       port: 1433,
       database: "master",
       username: "sa",
-      password: "Happy_Pass123!",
+      password: "Rapidb_Pass123!",
       ssl: true,
       rejectUnauthorized: false,
       folder: "Automated Tests",

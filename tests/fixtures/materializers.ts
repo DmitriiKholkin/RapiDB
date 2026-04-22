@@ -510,10 +510,10 @@ function createBootstrapStatements(engineId: DbEngineId): string[] {
   }
 
   return [
-    `IF DB_ID(N'happy_mssql_db') IS NULL CREATE DATABASE [happy_mssql_db]`,
+    `IF DB_ID(N'rapidb_mssql_db') IS NULL CREATE DATABASE [rapidb_mssql_db]`,
     `IF NOT EXISTS (SELECT 1 FROM sys.sql_logins WHERE name = N'rapidb_test_user') CREATE LOGIN [rapidb_test_user] WITH PASSWORD = N'mssql_pass123', CHECK_POLICY = OFF, CHECK_EXPIRATION = OFF`,
-    `IF NOT EXISTS (SELECT 1 FROM [happy_mssql_db].sys.database_principals WHERE name = N'rapidb_test_user') EXEC(N'USE [happy_mssql_db]; CREATE USER [rapidb_test_user] FOR LOGIN [rapidb_test_user]')`,
-    `IF NOT EXISTS (SELECT 1 FROM [happy_mssql_db].sys.database_role_members drm JOIN [happy_mssql_db].sys.database_principals roles ON roles.principal_id = drm.role_principal_id JOIN [happy_mssql_db].sys.database_principals members ON members.principal_id = drm.member_principal_id WHERE roles.name = N'db_owner' AND members.name = N'rapidb_test_user') EXEC(N'USE [happy_mssql_db]; ALTER ROLE [db_owner] ADD MEMBER [rapidb_test_user]')`,
+    `IF NOT EXISTS (SELECT 1 FROM [rapidb_mssql_db].sys.database_principals WHERE name = N'rapidb_test_user') EXEC(N'USE [rapidb_mssql_db]; CREATE USER [rapidb_test_user] FOR LOGIN [rapidb_test_user]')`,
+    `IF NOT EXISTS (SELECT 1 FROM [rapidb_mssql_db].sys.database_role_members drm JOIN [rapidb_mssql_db].sys.database_principals roles ON roles.principal_id = drm.role_principal_id JOIN [rapidb_mssql_db].sys.database_principals members ON members.principal_id = drm.member_principal_id WHERE roles.name = N'db_owner' AND members.name = N'rapidb_test_user') EXEC(N'USE [rapidb_mssql_db]; ALTER ROLE [db_owner] ADD MEMBER [rapidb_test_user]')`,
   ];
 }
 

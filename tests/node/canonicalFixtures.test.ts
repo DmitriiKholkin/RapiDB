@@ -38,7 +38,7 @@ describe("canonical fixture materializers", () => {
 
     expect(
       plan.bootstrapStatements.some((statement) =>
-        statement.includes("CREATE DATABASE [happy_mssql_db]"),
+        statement.includes("CREATE DATABASE [rapidb_mssql_db]"),
       ),
     ).toBe(true);
     expect(
