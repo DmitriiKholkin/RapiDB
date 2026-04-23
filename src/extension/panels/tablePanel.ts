@@ -364,7 +364,7 @@ export class TablePanel {
     const { sort: csvSort = null, filters: csvFilters = [] } = payload ?? {};
 
     await exportTableDataAsCsv({
-      tableName: this.table,
+      fileName: this.schema ? `${this.schema}_${this.table}` : this.table,
       loadChunks: (signal) =>
         this.svc.exportAll(
           this.connectionId,
@@ -385,7 +385,7 @@ export class TablePanel {
     const { sort = null, filters: jsonFilters = [] } = payload ?? {};
 
     await exportTableDataAsJson({
-      tableName: this.table,
+      fileName: this.schema ? `${this.schema}_${this.table}` : this.table,
       loadChunks: (signal) =>
         this.svc.exportAll(
           this.connectionId,

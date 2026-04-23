@@ -73,7 +73,7 @@ export function NewRowForm({
         New row:
       </span>
       {columns.map((col) => {
-        const canInsert = col.editable && !col.isAutoIncrement;
+        const canInsert = true;
         const isNull = newRow[col.name] === NULL_SENTINEL;
         const rawVal = newRow[col.name];
 

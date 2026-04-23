@@ -1,7 +1,4 @@
-import type {
-  ColumnTypeMeta,
-  IDBDriver,
-} from "../dbDrivers/types";
+import type { ColumnTypeMeta, IDBDriver } from "../dbDrivers/types";
 
 export function coerceRecord(
   drv: IDBDriver,
@@ -84,5 +81,5 @@ function filterWritableRecord(
 function isWritableColumn(
   column: ColumnTypeMeta | undefined,
 ): column is ColumnTypeMeta {
-  return !!column && column.editable && !column.isAutoIncrement;
+  return !!column;
 }

@@ -1086,14 +1086,6 @@ export class MySQLDriver extends BaseDBDriver {
     return super.isFilterable(nativeType, category);
   }
 
-  protected override isEditable(
-    nativeType: string,
-    category: TypeCategory,
-  ): boolean {
-    if (category === "spatial" || isMysqlSpatialType(nativeType)) return false;
-    return super.isEditable(nativeType, category);
-  }
-
   // ─── MySQL SQL helpers ───
 
   override quoteIdentifier(name: string): string {

@@ -19,7 +19,6 @@ const columns: ColumnTypeMeta[] = [
     isAutoIncrement: true,
     category: "integer",
     filterable: true,
-    editable: false,
     filterOperators: ["eq", "gt", "lt", "is_null", "is_not_null"],
     valueSemantics: "plain",
   },
@@ -33,7 +32,6 @@ const columns: ColumnTypeMeta[] = [
     isAutoIncrement: false,
     category: "text",
     filterable: true,
-    editable: true,
     filterOperators: ["eq", "like", "is_null", "is_not_null"],
     valueSemantics: "plain",
   },
@@ -47,7 +45,6 @@ const columns: ColumnTypeMeta[] = [
     isAutoIncrement: false,
     category: "decimal",
     filterable: true,
-    editable: true,
     filterOperators: ["eq", "between", "is_null", "is_not_null"],
     valueSemantics: "plain",
   },
@@ -129,7 +126,7 @@ describe("table helpers", () => {
     expect(result.params).toEqual(["Alpha", "10", "20"]);
   });
 
-  it("builds an insert operation from writable values only", () => {
+  it("builds an insert operation including explicit key and identity values", () => {
     const operation = buildInsertRowOperation(
       fakeDriver,
       "main",
@@ -145,12 +142,12 @@ describe("table helpers", () => {
     );
 
     expect(operation.sql).toBe(
-      'INSERT INTO public.fixture_rows ("display_name", "amount") VALUES ($1, $2)',
+      'INSERT INTO public.fixture_rows ("id", "display_name", "amount") VALUES ($1, $2, $3)',
     );
-    expect(operation.params).toEqual(["Gamma", "10.25"]);
+    expect(operation.params).toEqual([99, "Gamma", "10.25"]);
   });
 
-  it("prepares preview SQL and blocks invalid persisted edits before execution", () => {
+  it("prepares preview SQL without prevalidation blocking and keeps key edits", () => {
     const result = prepareApplyChangesPlan(
       {
         getDriver: () => fakeDriver,
@@ -172,23 +169,17 @@ describe("table helpers", () => {
       columns,
     );
 
-    expect(result.executable).toBe(false);
-    if (result.executable) {
-      throw new Error("Expected prevalidation failure");
+    expect(result.executable).toBe(true);
+    if (!result.executable) {
+      throw new Error("Expected executable plan");
     }
 
-    expect(result.result.success).toBe(false);
-    expect(result.result.rowOutcomes).toEqual([
-      expect.objectContaining({
-        status: "prevalidation_failed",
-        columns: ["amount"],
-      }),
-      expect.objectContaining({
-        status: "skipped",
-        success: true,
-        message: "No editable changes to apply.",
-      }),
-    ]);
+    expect(result.plan.previewStatements).toHaveLength(2);
+    expect(result.plan.previewStatements[0]).toContain(
+      "UPDATE public.fixture_rows",
+    );
+    expect(result.plan.previewStatements[1]).toContain('SET "id" = $1');
+    expect(result.plan.skippedRows).toEqual([]);
   });
 
   it("returns executable preview statements for valid row updates and skips empty changes", () => {
@@ -207,7 +198,7 @@ describe("table helpers", () => {
         },
         {
           primaryKeys: { id: 2 },
-          changes: { id: 2 },
+          changes: {},
         },
       ],
       columns,

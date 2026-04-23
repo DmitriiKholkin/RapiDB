@@ -560,9 +560,6 @@ export class SQLiteDriver extends BaseDBDriver {
 
       return {
         ...column,
-        editable: metadata.generatedColumns.has(row.name)
-          ? false
-          : column.editable,
         filterOperators: isExplicitTemporal
           ? ["eq", "neq", "between", "like", "is_null", "is_not_null"]
           : column.filterOperators,

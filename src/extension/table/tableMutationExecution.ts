@@ -71,13 +71,10 @@ export function prepareApplyChangesPlan(
   );
   const operations: PreparedApplyPlan["operations"] = [];
   const previewStatements: string[] = [];
-  const validationFailures = new Map<number, ApplyRowOutcome>();
   const verificationTargets: VerificationTarget[] = [];
   const skippedRows = new Set<number>();
 
   for (const [rowIndex, { primaryKeys, changes }] of updates.entries()) {
-    const messages: string[] = [];
-    const invalidColumns: string[] = [];
     const verificationValues: VerificationTarget["values"] = [];
     const verificationPrimaryKeys = { ...primaryKeys };
 
@@ -88,20 +85,7 @@ export function prepareApplyChangesPlan(
       }
 
       const check = driver.checkPersistedEdit(column, nextValue);
-      if (!check) {
-        continue;
-      }
-
-      if (!check.ok) {
-        messages.push(
-          check.message ??
-            `Column "${columnName}" failed persisted-value validation.`,
-        );
-        invalidColumns.push(columnName);
-        continue;
-      }
-
-      if (check.shouldVerify) {
+      if (check?.shouldVerify) {
         verificationValues.push({
           column,
           expectedValue: nextValue,
@@ -111,17 +95,6 @@ export function prepareApplyChangesPlan(
       if (column.isPrimaryKey) {
         verificationPrimaryKeys[columnName] = nextValue;
       }
-    }
-
-    if (messages.length > 0) {
-      validationFailures.set(rowIndex, {
-        rowIndex,
-        success: false,
-        status: "prevalidation_failed",
-        message: messages.join(" "),
-        columns: invalidColumns,
-      });
-      continue;
     }
 
     const operation = buildUpdateRowSql(
@@ -153,47 +126,13 @@ export function prepareApplyChangesPlan(
     });
   }
 
-  if (validationFailures.size > 0) {
-    const rowOutcomes = updates.map((_, rowIndex) => {
-      const failure = validationFailures.get(rowIndex);
-      if (failure) {
-        return failure;
-      }
-
-      if (skippedRows.has(rowIndex)) {
-        return buildSkippedOutcome(rowIndex, "No editable changes to apply.");
-      }
-
-      return buildSkippedOutcome(
-        rowIndex,
-        "Not applied because another row failed validation.",
-        false,
-      );
-    });
-
-    return {
-      executable: false,
-      result: {
-        success: false,
-        error: summarizeOutcomeMessages(
-          "One or more edits were rejected before writing.",
-          rowOutcomes.filter(
-            (outcome) => outcome.status === "prevalidation_failed",
-          ),
-        ),
-        failedRows: [...validationFailures.keys()],
-        rowOutcomes,
-      },
-    };
-  }
-
   if (operations.length === 0) {
     return {
       executable: false,
       result: {
         success: true,
         rowOutcomes: updates.map((_, rowIndex) =>
-          buildSkippedOutcome(rowIndex, "No editable changes to apply."),
+          buildSkippedOutcome(rowIndex, "No changes to apply."),
         ),
       },
     };
@@ -244,7 +183,7 @@ export async function executePreparedApplyPlan(
 
     const rowOutcomes = plan.updates.map((_, rowIndex) => {
       if (skippedRows.has(rowIndex)) {
-        return buildSkippedOutcome(rowIndex, "No editable changes to apply.");
+        return buildSkippedOutcome(rowIndex, "No changes to apply.");
       }
 
       const verificationFailure = verificationFailuresByRow.get(rowIndex);
@@ -287,7 +226,7 @@ export async function executePreparedApplyPlan(
       error: message,
       rowOutcomes: plan.updates.map((_, rowIndex) =>
         skippedRows.has(rowIndex)
-          ? buildSkippedOutcome(rowIndex, "No editable changes to apply.")
+          ? buildSkippedOutcome(rowIndex, "No changes to apply.")
           : buildSkippedOutcome(
               rowIndex,
               `The transaction was rolled back: ${message}`,

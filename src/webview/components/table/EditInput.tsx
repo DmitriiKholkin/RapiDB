@@ -9,12 +9,14 @@ export function EditInput({
   initial,
   nullable,
   category,
+  readOnly = false,
   onCommit,
   onCancel,
 }: {
   initial: string;
   nullable: boolean;
   category?: TypeCategory;
+  readOnly?: boolean;
   onCommit: (v: string) => void;
   onCancel: () => void;
 }) {
@@ -75,6 +77,7 @@ export function EditInput({
         ref={ref}
         aria-label="Cell value"
         value={val}
+        readOnly={readOnly}
         onChange={(e) => {
           if (isNull) {
             setIsNull(false);
@@ -102,7 +105,7 @@ export function EditInput({
         }
         style={inputStyle}
       />
-      {nullable && (
+      {nullable && !readOnly && (
         <button
           type="button"
           data-null-btn="1"

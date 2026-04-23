@@ -821,7 +821,6 @@ export abstract class BaseDBDriver implements IDBDriver {
     const category = this.mapTypeCategory(col.type);
     const valueSemantics = this.getValueSemantics(col.type, category);
     const filterable = this.isFilterable(col.type, category);
-    const editable = this.isEditable(col.type, category);
     const filterOperators: FilterOperator[] = filterable
       ? filterOperatorsForCategory(category)
       : col.nullable
@@ -832,7 +831,6 @@ export abstract class BaseDBDriver implements IDBDriver {
       category,
       nativeType: col.type,
       filterable,
-      editable,
       filterOperators,
       valueSemantics,
     };
@@ -840,10 +838,6 @@ export abstract class BaseDBDriver implements IDBDriver {
 
   protected isFilterable(_nativeType: string, category: TypeCategory): boolean {
     return category !== "lob";
-  }
-
-  protected isEditable(_nativeType: string, category: TypeCategory): boolean {
-    return category !== "lob" && category !== "other";
   }
 
   // ─── SQL helpers ───

@@ -66,15 +66,15 @@ export async function exportQueryResultsAsJson(
 }
 
 export async function exportTableDataAsCsv(options: {
-  tableName: string;
+  fileName: string;
   loadChunks: (signal: AbortSignal) => AsyncIterable<ChunkedExportData>;
 }): Promise<void> {
-  const { tableName, loadChunks } = options;
+  const { fileName, loadChunks } = options;
   await runExport({
-    defaultFileName: tableName,
+    defaultFileName: fileName,
     format: CSV_EXTENSION,
-    progressTitle: `RapiDB: Exporting ${tableName}…`,
-    successLabel: tableName,
+    progressTitle: `RapiDB: Exporting ${fileName}…`,
+    successLabel: fileName,
     errorLabel: "CSV export failed",
     write: async (filePath, signal) => {
       await writeChunkedCsv(filePath, loadChunks(signal));
@@ -83,15 +83,15 @@ export async function exportTableDataAsCsv(options: {
 }
 
 export async function exportTableDataAsJson(options: {
-  tableName: string;
+  fileName: string;
   loadChunks: (signal: AbortSignal) => AsyncIterable<ChunkedExportData>;
 }): Promise<void> {
-  const { tableName, loadChunks } = options;
+  const { fileName, loadChunks } = options;
   await runExport({
-    defaultFileName: tableName,
+    defaultFileName: fileName,
     format: JSON_EXTENSION,
-    progressTitle: `RapiDB: Exporting ${tableName} as JSON…`,
-    successLabel: tableName,
+    progressTitle: `RapiDB: Exporting ${fileName} as JSON…`,
+    successLabel: fileName,
     errorLabel: "JSON export failed",
     write: async (filePath, signal) => {
       await writeChunkedJson(filePath, loadChunks(signal));

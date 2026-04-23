@@ -681,23 +681,6 @@ const ORACLE_NON_FILTERABLE = new Set([
   "anytype",
 ]);
 
-const ORACLE_NON_EDITABLE = new Set([
-  "blob",
-  "clob",
-  "nclob",
-  "bfile",
-  "long raw",
-  "long",
-  "xmltype",
-  "sdo_geometry",
-  "anydata",
-  "anytype",
-  "anydataset",
-  "object",
-  "ref",
-  "opaque",
-]);
-
 export class OracleDriver extends BaseDBDriver {
   private pool: oracledb.Pool | null = null;
   private readonly config: ConnectionConfig;
@@ -1601,17 +1584,6 @@ export class OracleDriver extends BaseDBDriver {
       super.isFilterable(nativeType, category) &&
       category !== "interval" &&
       !ORACLE_NON_FILTERABLE.has(oracleTypeName(nativeType).toLowerCase())
-    );
-  }
-
-  protected override isEditable(
-    nativeType: string,
-    category: TypeCategory,
-  ): boolean {
-    return (
-      super.isEditable(nativeType, category) &&
-      category !== "interval" &&
-      !ORACLE_NON_EDITABLE.has(oracleTypeName(nativeType).toLowerCase())
     );
   }
 

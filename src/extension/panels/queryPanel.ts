@@ -2,7 +2,6 @@ import * as vscode from "vscode";
 import type { ConnectionManager } from "../connectionManager";
 import { logErrorWithContext } from "../utils/errorHandling";
 import {
-  isLikelyUnboundedResultQuery,
   type QueryPanelCachedResult,
   QueryPanelController,
 } from "./queryPanelController";
@@ -184,5 +183,3 @@ export class QueryPanel {
     });
   }
 }
-
-export { isLikelyUnboundedResultQuery };

@@ -110,11 +110,6 @@ export class QueryPanelController {
       return;
     }
 
-    if (!(await this.confirmQueryExecution(sql))) {
-      this.postQueryError("Query execution cancelled.");
-      return;
-    }
-
     const connectionId =
       connectionIdOverride || this.view.getInitialConnectionId();
 
@@ -200,19 +195,6 @@ export class QueryPanelController {
     });
   }
 
-  private async confirmQueryExecution(sql: string): Promise<boolean> {
-    if (!isLikelyUnboundedResultQuery(sql)) {
-      return true;
-    }
-
-    const answer = await vscode.window.showWarningMessage(
-      "[RapiDB] This query looks unbounded and the extension currently fetches the full result set before truncating it. Continue anyway?",
-      { modal: true },
-      "Run Anyway",
-    );
-    return answer === "Run Anyway";
-  }
-
   private async handleExportResultsCsv(): Promise<void> {
     const cached = this.view.getLastQueryResult();
     if (!cached || cached.columns.length === 0) {
@@ -280,29 +262,4 @@ function normaliseSqlForGuardrail(sql: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
-}
-
-export function isLikelyUnboundedResultQuery(sql: string): boolean {
-  const normalized = normaliseSqlForGuardrail(sql);
-  if (!/^(select|with)\b/.test(normalized)) {
-    return false;
-  }
-
-  if (/\bcount\s*\(/.test(normalized)) {
-    return false;
-  }
-
-  if (
-    /\blimit\s+\d+\b/.test(normalized) ||
-    /\btop\s*(?:\(\s*\d+\s*\)|\d+)\b/.test(normalized) ||
-    /\bfetch\s+(?:first|next)\s+\d+\s+rows?\s+only\b/.test(normalized) ||
-    /\boffset\s+\d+\s+rows?\s+fetch\s+(?:first|next)\s+\d+\s+rows?\s+only\b/.test(
-      normalized,
-    ) ||
-    /\brownum\s*(?:<=|<)\s*\d+\b/.test(normalized)
-  ) {
-    return false;
-  }
-
-  return true;
 }

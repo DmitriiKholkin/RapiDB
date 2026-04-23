@@ -199,11 +199,7 @@ function baseTypeName(typeName: string): string {
 }
 
 function normalizeDatetimeLiteral(value: string): string {
-  const trimmed = normalizeSqlDatetimeOffsetSpacing(value.trim());
-  if (DATETIME_SQL_RE.test(trimmed)) {
-    return trimmed.replace(" ", "T");
-  }
-  return trimmed;
+  return normalizeSqlDatetimeOffsetSpacing(value.trim());
 }
 
 function normalizeDateLiteral(value: string): string {
@@ -272,7 +268,7 @@ function parseMssqlTimeLiteral(value: string): MssqlTemporalDate {
 
 function parseMssqlNaiveDatetimeLiteral(value: string): MssqlTemporalDate {
   const match =
-    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,7}))?$/.exec(
+    /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,7}))?$/.exec(
       value,
     );
   if (!match) {
@@ -361,8 +357,6 @@ const MSSQL_NON_FILTERABLE = new Set([
   "timestamp",
   "rowversion",
 ]);
-
-const MSSQL_NON_EDITABLE = new Set(MSSQL_NON_FILTERABLE);
 
 export class MSSQLDriver extends BaseDBDriver {
   private pool: mssql.ConnectionPool | null = null;
@@ -1091,16 +1085,6 @@ export class MSSQLDriver extends BaseDBDriver {
     );
   }
 
-  protected override isEditable(
-    nativeType: string,
-    category: TypeCategory,
-  ): boolean {
-    return (
-      super.isEditable(nativeType, category) &&
-      !MSSQL_NON_EDITABLE.has(baseTypeName(nativeType))
-    );
-  }
-
   override quoteIdentifier(name: string): string {
     return `[${name.replace(/]/g, "]]")}]`;
   }
@@ -1196,6 +1180,14 @@ export class MSSQLDriver extends BaseDBDriver {
       }
       const formatted = formatDatetimeForDisplay(value);
       if (formatted !== null) return formatted;
+    }
+    if (typeof value === "string") {
+      const ct = baseTypeName(column.nativeType);
+      if (ct === "datetimeoffset") {
+        return normalizeDatetimeLiteral(value)
+          .replace("T", " ")
+          .replace(/([0-9])([+-]\d{2}:\d{2})$/, "$1 $2");
+      }
     }
     return value;
   }

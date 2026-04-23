@@ -70,9 +70,71 @@ function createProbeTableSql(
 
 function probeColumnName(
   engineId: DbEngineId,
-  logicalName: "id" | "note",
+  logicalName: "id" | "note" | "amount",
 ): string {
   return engineId === "oracle" ? logicalName.toUpperCase() : logicalName;
+}
+
+function createMonetaryProbeTableSql(
+  engineId: DbEngineId,
+  qualifiedName: string,
+): string {
+  switch (engineId) {
+    case "postgres":
+      return `CREATE TABLE ${qualifiedName} (id INTEGER NOT NULL PRIMARY KEY, amount MONEY NOT NULL)`;
+    case "mssql":
+      return `CREATE TABLE ${qualifiedName} (id INT NOT NULL PRIMARY KEY, amount MONEY NOT NULL)`;
+    case "oracle":
+      return `CREATE TABLE ${qualifiedName} (ID NUMBER(10) NOT NULL PRIMARY KEY, AMOUNT NUMBER(19,4) NOT NULL)`;
+    case "mysql":
+      return `CREATE TABLE ${qualifiedName} (id INT NOT NULL PRIMARY KEY, amount DECIMAL(19,4) NOT NULL)`;
+    case "sqlite":
+      return `CREATE TABLE ${qualifiedName} (id INTEGER NOT NULL PRIMARY KEY, amount DECIMAL(19,4) NOT NULL)`;
+  }
+}
+
+function sqlNumericLiteral(value: unknown): string {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+  if (typeof value === "string") {
+    return sqlString(value);
+  }
+  throw new Error(`Unsupported numeric literal value: ${String(value)}`);
+}
+
+function parseMonetaryLike(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "bigint") {
+    return Number(value);
+  }
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  const normalizedSign =
+    trimmed.startsWith("(") && trimmed.endsWith(")")
+      ? `-${trimmed.slice(1, -1)}`
+      : trimmed;
+  const normalizedDigits = normalizedSign
+    .replace(/[^0-9,.-]/g, "")
+    .replace(/,/g, "");
+  if (
+    normalizedDigits === "" ||
+    normalizedDigits === "-" ||
+    normalizedDigits === "."
+  ) {
+    return null;
+  }
+
+  const parsed = Number(normalizedDigits);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 export function registerLiveDriverConformanceTests(engineId: DbEngineId): void {
@@ -359,6 +421,73 @@ export function registerLiveDriverConformanceTests(engineId: DbEngineId): void {
         { persistedValue: "123.450000" },
       );
       expect(persistedCheck?.ok ?? true).toBe(true);
+
+      const moneyProbeTable = `rapidb_money_probe_${engineId}_${Date.now()}`;
+      const qualifiedMoneyProbeTable = harness.driver.qualifiedTableName(
+        harness.databaseName,
+        harness.schemaName,
+        moneyProbeTable,
+      );
+      const moneyIdColumn = probeColumnName(engineId, "id");
+      const moneyAmountColumn = probeColumnName(engineId, "amount");
+      const moneyProbeDescribeName =
+        engineId === "oracle" ? moneyProbeTable.toUpperCase() : moneyProbeTable;
+      await harness.driver.query(
+        createMonetaryProbeTableSql(engineId, qualifiedMoneyProbeTable),
+      );
+
+      try {
+        await harness.driver.query(
+          `INSERT INTO ${qualifiedMoneyProbeTable} (${harness.driver.quoteIdentifier(moneyIdColumn)}, ${harness.driver.quoteIdentifier(moneyAmountColumn)}) VALUES (1, 10.25)`,
+        );
+
+        const moneyColumns = await harness.driver.describeColumns(
+          harness.databaseName,
+          harness.schemaName,
+          moneyProbeDescribeName,
+        );
+        const amountColumn =
+          moneyColumns.find(
+            (candidate) => candidate.name.toLowerCase() === "amount",
+          ) ??
+          (engineId === "oracle"
+            ? {
+                ...exactAmountColumn,
+                name: moneyAmountColumn,
+                nativeType: "NUMBER(19,4)",
+                category: "decimal" as const,
+              }
+            : findColumn(moneyColumns, "amount"));
+
+        expect(amountColumn.category).toBe("decimal");
+
+        const coercedMoneyInput = harness.driver.coerceInputValue(
+          "1234.56",
+          amountColumn,
+        );
+
+        await harness.driver.query(
+          `UPDATE ${qualifiedMoneyProbeTable} SET ${harness.driver.quoteIdentifier(moneyAmountColumn)} = ${sqlNumericLiteral(coercedMoneyInput)} WHERE ${harness.driver.quoteIdentifier(moneyIdColumn)} = 1`,
+        );
+
+        const moneySelect = await harness.driver.query(
+          `SELECT ${harness.driver.quoteIdentifier(moneyAmountColumn)} AS probe_amount FROM ${qualifiedMoneyProbeTable} WHERE ${harness.driver.quoteIdentifier(moneyIdColumn)} = 1`,
+        );
+        const rawMoneyValue = getCaseInsensitive(
+          rowsFromQuery(moneySelect)[0] ?? {},
+          "probe_amount",
+        );
+        const formattedMoneyValue = harness.driver.formatOutputValue(
+          rawMoneyValue,
+          amountColumn,
+        );
+
+        const numericMoneyValue = parseMonetaryLike(formattedMoneyValue);
+        expect(numericMoneyValue).not.toBeNull();
+        expect(numericMoneyValue).toBeCloseTo(1234.56, 2);
+      } finally {
+        await harness.driver.query(`DROP TABLE ${qualifiedMoneyProbeTable}`);
+      }
     });
   });
 }

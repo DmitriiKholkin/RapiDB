@@ -693,23 +693,6 @@ export class PostgresDriver extends BaseDBDriver {
     return super.isFilterable(nativeType, category);
   }
 
-  protected override isEditable(
-    nativeType: string,
-    category: TypeCategory,
-  ): boolean {
-    const baseType = nativeType.toLowerCase().split("(")[0].trim();
-    if (PG_GEOMETRIC_TYPES.has(baseType)) return false;
-    if (
-      baseType === "bit" ||
-      baseType === "varbit" ||
-      baseType === "bit varying"
-    ) {
-      return true;
-    }
-    if (category === "interval" || baseType === "money") return false;
-    return super.isEditable(nativeType, category);
-  }
-
   // ─── PG SQL helpers ───
 
   override buildPagination(

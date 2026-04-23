@@ -120,7 +120,7 @@ const btn = (
 });
 
 function canEditColumn(column?: ColumnMeta): column is ColumnMeta {
-  return !!column && column.editable && !column.isAutoIncrement;
+  return !!column;
 }
 
 function clonePendingEdits(pendingEdits: PendingEdits): PendingEdits {
@@ -311,6 +311,8 @@ export function TableView({
   const [mutationPreview, setMutationPreview] =
     useState<TableMutationPreviewPayload | null>(null);
 
+  const [readOnlyTable, setReadOnlyTable] = useState(isView);
+
   const [colSizes, setColSizes] = useState<Record<string, number>>({});
 
   const colSizesInitedRef = useRef(false);
@@ -383,6 +385,10 @@ export function TableView({
   }, []);
 
   useEffect(() => {
+    setReadOnlyTable(isView);
+  }, [isView]);
+
+  useEffect(() => {
     const unInit = onMessage<{
       columns: ColumnMeta[];
       primaryKeyColumns: string[];
@@ -392,6 +398,7 @@ export function TableView({
       initializedRef.current = true;
       setColumns(cols);
       setPkCols(primaryKeyColumns);
+      setReadOnlyTable(isView);
 
       setInitTick((t) => t + 1);
     });
@@ -555,7 +562,7 @@ export function TableView({
       unConfirm();
       unMutationPreview();
     };
-  }, [fetchPage]);
+  }, [fetchPage, isView]);
 
   useEffect(() => {
     if (!initializedRef.current || fetchTrigger === "") return;
@@ -679,13 +686,13 @@ export function TableView({
 
   const handleStartEdit = useCallback(
     (rowIdx: number, col: ColumnMeta) => {
-      if (isView || !canEditColumn(col)) {
+      if (readOnlyTable || !canEditColumn(col)) {
         return;
       }
       setEditCell({ rowIdx, col: col.name });
       setApplyStatus(null);
     },
-    [isView],
+    [readOnlyTable],
   );
 
   const deleteSelected = useCallback(() => {
@@ -768,7 +775,7 @@ export function TableView({
 
   const tanColumns = useMemo<TanColumnDef<Row>[]>(
     () => [
-      ...(!isView
+      ...(!readOnlyTable
         ? [
             {
               id: "__sel",
@@ -864,6 +871,7 @@ export function TableView({
                   initial={startStr}
                   nullable={col.nullable}
                   category={col.category}
+                  readOnly={!isEditing}
                   onCommit={(v) => commitCellEdit(rowIdx, col, v, getValue())}
                   onCancel={() => setEditCell(null)}
                 />
@@ -881,7 +889,7 @@ export function TableView({
       ),
     ],
 
-    [columns, colSizes, commitCellEdit, isView],
+    [columns, colSizes, commitCellEdit, readOnlyTable],
   );
 
   const tanTable = useReactTable({
@@ -982,7 +990,7 @@ export function TableView({
           background: "var(--vscode-editorGroupHeader-tabsBackground)",
         }}
       >
-        {!isView && (
+        {!readOnlyTable && (
           <>
             <button
               type="button"
@@ -1062,7 +1070,7 @@ export function TableView({
       </div>
 
       {}
-      {!isView && (pendingCount > 0 || applyStatus) && (
+      {!readOnlyTable && (pendingCount > 0 || applyStatus) && (
         <div
           style={{
             flexShrink: 0,
@@ -1145,7 +1153,7 @@ export function TableView({
       )}
 
       {}
-      {!isView && mutErr && (
+      {!readOnlyTable && mutErr && (
         <div
           style={{
             padding: "5px 12px",
@@ -1181,7 +1189,7 @@ export function TableView({
       )}
 
       {}
-      {!isView && newRow && (
+      {!readOnlyTable && newRow && (
         <NewRowForm
           columns={columns}
           newRow={newRow}
@@ -1380,7 +1388,7 @@ export function TableView({
                   pendingCols={pendingEdits.get(vRow.index)}
                   columnsMap={columnsMap}
                   editingCol={editingCol}
-                  isView={isView}
+                  readOnly={readOnlyTable}
                   onStartEdit={handleStartEdit}
                 />
               );
@@ -1714,7 +1722,7 @@ const TableRow = React.memo(function TableRow({
   pendingCols,
   columnsMap,
   editingCol,
-  isView,
+  readOnly,
   onStartEdit,
 }: {
   row: ReturnType<ReturnType<typeof useReactTable>["getRowModel"]>["rows"][0];
@@ -1724,7 +1732,7 @@ const TableRow = React.memo(function TableRow({
 
   columnsMap: Map<string, ColumnMeta>;
   editingCol: string | null;
-  isView: boolean;
+  readOnly: boolean;
 
   onStartEdit: (rowIndex: number, col: ColumnMeta) => void;
 }) {
@@ -1771,7 +1779,7 @@ const TableRow = React.memo(function TableRow({
               boxSizing: "border-box",
               verticalAlign: "middle",
               cursor:
-                isSel || isView || !canEditColumn(colDef)
+                isSel || readOnly || !canEditColumn(colDef)
                   ? "default"
                   : "pointer",
 
@@ -1780,7 +1788,7 @@ const TableRow = React.memo(function TableRow({
             }}
             title={isPk ? `PK: ${String(cell.getValue())}` : undefined}
             onDoubleClick={() => {
-              if (colDef && !isSel && !isView && canEditColumn(colDef)) {
+              if (colDef && !isSel && !readOnly && canEditColumn(colDef)) {
                 onStartEdit(index, colDef);
               }
             }}

@@ -65,7 +65,6 @@ const columns: ColumnTypeMeta[] = [
     isAutoIncrement: false,
     category: "integer",
     filterable: true,
-    editable: false,
     filterOperators: ["eq", "gt", "lt"],
     valueSemantics: "plain",
   },
@@ -79,7 +78,6 @@ const columns: ColumnTypeMeta[] = [
     isAutoIncrement: false,
     category: "text",
     filterable: true,
-    editable: true,
     filterOperators: ["eq", "like"],
     valueSemantics: "plain",
   },
@@ -89,6 +87,71 @@ const rows = [
   { id: 1, name: "Alice" },
   { id: 2, name: "Bob" },
 ];
+
+const noPkColumns: ColumnTypeMeta[] = [
+  {
+    name: "code",
+    type: "TEXT",
+    nativeType: "TEXT",
+    nullable: false,
+    isPrimaryKey: false,
+    isForeignKey: false,
+    isAutoIncrement: false,
+    category: "text",
+    filterable: true,
+    filterOperators: ["eq", "like"],
+    valueSemantics: "plain",
+  },
+  {
+    name: "name",
+    type: "TEXT",
+    nativeType: "TEXT",
+    nullable: false,
+    isPrimaryKey: false,
+    isForeignKey: false,
+    isAutoIncrement: false,
+    category: "text",
+    filterable: true,
+    filterOperators: ["eq", "like"],
+    valueSemantics: "plain",
+  },
+];
+
+const noPkRows = [
+  { code: "A-1", name: "Alice" },
+  { code: "B-2", name: "Bob" },
+];
+
+const autoIncrementColumns: ColumnTypeMeta[] = [
+  {
+    name: "seq",
+    type: "INTEGER",
+    nativeType: "INTEGER",
+    nullable: false,
+    isPrimaryKey: false,
+    isForeignKey: false,
+    isAutoIncrement: true,
+    category: "integer",
+    filterable: true,
+    filterOperators: ["eq", "gt", "lt"],
+    valueSemantics: "plain",
+  },
+  {
+    name: "label",
+    type: "TEXT",
+    nativeType: "TEXT",
+    nullable: false,
+    isPrimaryKey: false,
+    isForeignKey: false,
+    isAutoIncrement: false,
+    category: "text",
+    filterable: true,
+    filterOperators: ["eq", "like"],
+    valueSemantics: "plain",
+  },
+];
+
+const autoIncrementRows = [{ seq: 10, label: "First" }];
 
 function lastFetchPayload(): {
   fetchId?: number;
@@ -345,6 +408,82 @@ describe("TableView", () => {
     });
 
     expect(screen.getByText("Alicia")).toBeTruthy();
+  });
+
+  it("keeps non-view tables writable even when no primary key is present", async () => {
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns: noPkColumns,
+      primaryKeyColumns: [],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows: noPkRows,
+        totalCount: noPkRows.length,
+      });
+    });
+
+    expect(screen.getByRole("button", { name: "Add Row" })).toBeTruthy();
+    const deleteButton = screen.getByRole("button", {
+      name: "Delete (0)",
+    });
+    expect((deleteButton as HTMLButtonElement).disabled).toBe(true);
+
+    const aliceCell = screen.getByText("Alice").closest("td");
+    if (!(aliceCell instanceof HTMLTableCellElement)) {
+      throw new Error("Expected writable cell");
+    }
+
+    fireEvent.doubleClick(aliceCell);
+
+    expect(screen.getByLabelText("Cell value")).toBeTruthy();
+  });
+
+  it("allows editing auto-increment columns when table is writable", async () => {
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns: autoIncrementColumns,
+      primaryKeyColumns: [],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows: autoIncrementRows,
+        totalCount: autoIncrementRows.length,
+      });
+    });
+
+    const seqCell = screen.getByText("10").closest("td");
+    if (!(seqCell instanceof HTMLTableCellElement)) {
+      throw new Error("Expected auto-increment cell");
+    }
+
+    fireEvent.doubleClick(seqCell);
+
+    expect(screen.getByLabelText("Cell value")).toBeTruthy();
   });
 
   it("requests delete confirmation with selected primary keys", async () => {

@@ -217,7 +217,6 @@ export interface ColumnTypeMeta extends ColumnMeta {
   category: TypeCategory;
   nativeType: string;
   filterable: boolean;
-  editable: boolean;
   filterOperators: FilterOperator[];
   valueSemantics: ValueSemantics;
 }
