@@ -302,6 +302,86 @@ export function registerTableServiceIntegrationTests(
       expect(rowsFromQuery(compositeResult)).toHaveLength(0);
     });
 
+    it("fails when insert or delete cannot be verified", async () => {
+      const probeId = 970_000 + Math.floor(Math.random() * 10_000);
+      const tableName = fixtureTableName(engineId, "transactionProbe");
+      const columns = await readService.getColumns(
+        connectionId,
+        harness.databaseName,
+        harness.schemaName,
+        tableName,
+      );
+      const idColumn = findColumnName(columns, "id");
+
+      const unverifiableDriver = Object.create(harness.driver) as IDBDriver;
+      unverifiableDriver.query = async (sql, params) => {
+        if (/^\s*insert\b/i.test(sql) || /^\s*delete\b/i.test(sql)) {
+          return {
+            columns: [],
+            rows: [],
+            rowCount: 1,
+            executionTimeMs: 0,
+            affectedRows: 1,
+          };
+        }
+
+        return harness.driver.query(sql, params);
+      };
+
+      const strictMutationService = new TableMutationService(
+        createManagerLike(connectionId, unverifiableDriver, harness.connection),
+        readService,
+      );
+
+      const plan = await strictMutationService.prepareInsertRow(
+        connectionId,
+        harness.databaseName,
+        harness.schemaName,
+        tableName,
+        toPhysicalRecord(columns, {
+          id: probeId,
+          account_name: "Verification Probe",
+          balance: "12.34",
+          updated_at: "2026-04-21T12:00:00.000Z",
+        }),
+      );
+
+      await expect(
+        strictMutationService.executePreparedInsertPlan(plan),
+      ).rejects.toThrow(/insert verification failed/i);
+
+      await mutationService.insertRow(
+        connectionId,
+        harness.databaseName,
+        harness.schemaName,
+        tableName,
+        toPhysicalRecord(columns, {
+          id: probeId,
+          account_name: "Verification Probe",
+          balance: "12.34",
+          updated_at: "2026-04-21T12:00:00.000Z",
+        }),
+      );
+
+      await expect(
+        strictMutationService.deleteRows(
+          connectionId,
+          harness.databaseName,
+          harness.schemaName,
+          tableName,
+          [{ [idColumn]: probeId }],
+        ),
+      ).rejects.toThrow(/delete verification failed/i);
+
+      await mutationService.deleteRows(
+        connectionId,
+        harness.databaseName,
+        harness.schemaName,
+        tableName,
+        [{ [idColumn]: probeId }],
+      );
+    });
+
     it("prepares previews, rolls back failed transactions, reports skipped rows, and surfaces verification warnings", async () => {
       const tableName = fixtureTableName(engineId, "transactionProbe");
       const columns = await readService.getColumns(

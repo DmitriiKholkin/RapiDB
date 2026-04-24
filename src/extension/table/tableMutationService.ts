@@ -5,7 +5,7 @@ import type {
   PreparedInsertPlan,
   TableColumnsProvider,
 } from "./tableDataContracts";
-import { buildUpdateRowSql, coerceRecord } from "./updateSql";
+import { buildUpdateRowSql, coerceRecord, writableEntries } from "./updateSql";
 
 export class TableMutationService {
   constructor(
@@ -13,6 +13,7 @@ export class TableMutationService {
     private readonly columnsProvider: TableColumnsProvider,
   ) {}
 
+  /** @deprecated Use prepareApplyChangesPlan + executePreparedApplyPlan for preview-first flow. */
   async updateRow(
     connectionId: string,
     database: string,
@@ -51,6 +52,7 @@ export class TableMutationService {
     }
   }
 
+  /** @deprecated Use prepareInsertRow + executePreparedInsertPlan for preview-first flow. */
   async insertRow(
     connectionId: string,
     database: string,
@@ -82,6 +84,33 @@ export class TableMutationService {
       schema,
       table,
     );
+    const columnMetaByName = new Map(
+      columns.map((column) => [column.name, column]),
+    );
+    const writableValues = Object.fromEntries(
+      writableEntries(values, columnMetaByName),
+    );
+    const coercedWritableValues = coerceRecord(
+      driver,
+      writableValues,
+      columnMetaByName,
+    );
+    const primaryKeyColumns = columns
+      .filter((column) => column.isPrimaryKey)
+      .map((column) => column.name);
+    const hasFullPrimaryKeyCriteria =
+      primaryKeyColumns.length > 0 &&
+      primaryKeyColumns.every(
+        (columnName) => coercedWritableValues[columnName] !== undefined,
+      );
+    const verificationCriteria = hasFullPrimaryKeyCriteria
+      ? Object.fromEntries(
+          primaryKeyColumns.map((columnName) => [
+            columnName,
+            coercedWritableValues[columnName],
+          ]),
+        )
+      : null;
     const operation = buildInsertRowOperation(
       driver,
       database,
@@ -93,10 +122,14 @@ export class TableMutationService {
 
     return {
       connectionId,
+      database,
+      schema,
+      table,
       operation,
       previewStatements: [
         driver.materializePreviewSql(operation.sql, operation.params),
       ],
+      verificationCriteria,
     };
   }
 
@@ -111,6 +144,31 @@ export class TableMutationService {
     if (affectedRows !== undefined && affectedRows === 0) {
       throw new Error(
         "Insert failed: the database reported 0 rows affected. The row may have been rejected by a trigger or constraint.",
+      );
+    }
+
+    if (!plan.verificationCriteria) {
+      return;
+    }
+
+    const columns = await this.columnsProvider.getColumns(
+      plan.connectionId,
+      plan.database,
+      plan.schema,
+      plan.table,
+    );
+    const exists = await this.rowExistsByCriteria(
+      driver,
+      plan.database,
+      plan.schema,
+      plan.table,
+      columns,
+      plan.verificationCriteria,
+    );
+
+    if (!exists) {
+      throw new Error(
+        "Insert verification failed: the inserted row could not be read back by primary key.",
       );
     }
   }
@@ -167,6 +225,14 @@ export class TableMutationService {
         firstPrimaryKeys[0],
         coercedPrimaryKeys,
       );
+      await this.verifyRowsDeleted(
+        driver,
+        database,
+        schema,
+        table,
+        columns,
+        coercedPrimaryKeys,
+      );
       return;
     }
 
@@ -176,6 +242,77 @@ export class TableMutationService {
       columnMetaByName,
       coercedPrimaryKeys,
     );
+    await this.verifyRowsDeleted(
+      driver,
+      database,
+      schema,
+      table,
+      columns,
+      coercedPrimaryKeys,
+    );
+  }
+
+  private async verifyRowsDeleted(
+    driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>,
+    database: string,
+    schema: string,
+    table: string,
+    columns: ColumnTypeMeta[],
+    criteriaList: Record<string, unknown>[],
+  ): Promise<void> {
+    for (const criteria of criteriaList) {
+      const exists = await this.rowExistsByCriteria(
+        driver,
+        database,
+        schema,
+        table,
+        columns,
+        criteria,
+      );
+      if (exists) {
+        throw new Error(
+          "Delete verification failed: at least one row is still visible after delete.",
+        );
+      }
+    }
+  }
+
+  private async rowExistsByCriteria(
+    driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>,
+    database: string,
+    schema: string,
+    table: string,
+    columns: ColumnTypeMeta[],
+    criteria: Record<string, unknown>,
+  ): Promise<boolean> {
+    const criteriaEntries = Object.entries(criteria);
+    if (criteriaEntries.length === 0) {
+      return false;
+    }
+
+    const qualifiedTableName = driver.qualifiedTableName(
+      database,
+      schema,
+      table,
+    );
+    const columnMetaByName = new Map(
+      columns.map((column) => [column.name, column]),
+    );
+    const parameters: unknown[] = [];
+    const whereParts = criteriaEntries.map(([columnName, value]) => {
+      parameters.push(value);
+      const column = columnMetaByName.get(columnName);
+      const placeholder = column
+        ? driver.buildInsertValueExpr(column, parameters.length)
+        : "?";
+      return `${driver.quoteIdentifier(columnName)} = ${placeholder}`;
+    });
+
+    const result = await driver.query(
+      `SELECT 1 FROM ${qualifiedTableName} WHERE ${whereParts.join(" AND ")}`,
+      parameters,
+    );
+    return result.rows.length > 0;
   }
 
   private async deleteSinglePrimaryKeyRows(

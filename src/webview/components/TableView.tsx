@@ -263,14 +263,88 @@ function getRetainedPendingEdits(
   return nextPending;
 }
 
-export function TableView({
-  connectionId: _connectionId,
-  database: _database,
-  schema: _schema,
-  table: _table,
-  isView = false,
-  defaultPageSize,
-}: Props) {
+const DIALOG_FOCUSABLE_SELECTOR =
+  'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function getFocusableElements(dialog: HTMLDivElement | null): HTMLElement[] {
+  if (!dialog) {
+    return [];
+  }
+
+  return Array.from(
+    dialog.querySelectorAll<HTMLElement>(DIALOG_FOCUSABLE_SELECTOR),
+  );
+}
+
+function useDialogFocusTrap(options: {
+  dialogRef: React.RefObject<HTMLDivElement | null>;
+  initialFocusRef?: React.RefObject<HTMLElement | null>;
+  onEscape?: () => void;
+}) {
+  const { dialogRef, initialFocusRef, onEscape } = options;
+
+  useEffect(() => {
+    const previousActiveElement =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+
+    initialFocusRef?.current?.focus();
+
+    return () => {
+      previousActiveElement?.focus();
+    };
+  }, [initialFocusRef]);
+
+  return useCallback(
+    (event: React.KeyboardEvent<HTMLDivElement>) => {
+      if (event.key === "Escape") {
+        onEscape?.();
+        return;
+      }
+
+      if (event.key !== "Tab") {
+        return;
+      }
+
+      const dialog = dialogRef.current;
+      const focusableElements = getFocusableElements(dialog);
+
+      if (focusableElements.length === 0) {
+        event.preventDefault();
+        dialog?.focus();
+        return;
+      }
+
+      const firstElement = focusableElements[0];
+      const lastElement = focusableElements[focusableElements.length - 1];
+      const activeElement =
+        document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : null;
+
+      if (!activeElement || !dialog?.contains(activeElement)) {
+        event.preventDefault();
+        firstElement.focus();
+        return;
+      }
+
+      if (event.shiftKey && activeElement === firstElement) {
+        event.preventDefault();
+        lastElement.focus();
+        return;
+      }
+
+      if (!event.shiftKey && activeElement === lastElement) {
+        event.preventDefault();
+        firstElement.focus();
+      }
+    },
+    [dialogRef, onEscape],
+  );
+}
+
+export function TableView({ table, isView = false, defaultPageSize }: Props) {
   const validSizes = PAGE_SIZES as readonly number[];
   const initialPageSize =
     defaultPageSize !== undefined && validSizes.includes(defaultPageSize)
@@ -310,6 +384,11 @@ export function TableView({
   } | null>(null);
   const [mutationPreview, setMutationPreview] =
     useState<TableMutationPreviewPayload | null>(null);
+  const [exportChoice, setExportChoice] = useState<{
+    format: "csv" | "json";
+    sort: { column: string; direction: "asc" | "desc" } | null;
+    filters: unknown[];
+  } | null>(null);
 
   const [readOnlyTable, setReadOnlyTable] = useState(isView);
 
@@ -349,6 +428,8 @@ export function TableView({
   const initializedRef = useRef(false);
   const fetchEpochRef = useRef(0);
   const [initTick, setInitTick] = useState(0);
+  const showMissingPrimaryKeyNotice =
+    !readOnlyTable && initializedRef.current && !hasPrimaryKey;
 
   const pageRef = useRef(page);
   const pageSizeRef = useRef(pageSize);
@@ -931,7 +1012,7 @@ export function TableView({
 
   return (
     <main
-      aria-label={`Table data for ${_table}`}
+      aria-label={`Table data for ${table}`}
       style={{
         display: "flex",
         flexDirection: "column",
@@ -975,6 +1056,30 @@ export function TableView({
           >
             ×
           </button>
+        </div>
+      )}
+      {showMissingPrimaryKeyNotice && (
+        <div
+          role="alert"
+          style={{
+            flexShrink: 0,
+            padding: "6px 12px",
+            fontSize: 12,
+            background:
+              "var(--vscode-inputValidation-warningBackground, rgba(180,120,0,0.15))",
+            borderBottom:
+              "1px solid var(--vscode-inputValidation-warningBorder, rgba(180,120,0,0.4))",
+            color: "var(--vscode-editorWarning-foreground, #CCA700)",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+          }}
+        >
+          <Icon name="warning" size={13} style={{ flexShrink: 0 }} />
+          <span>
+            Reduced table mode: no unique key was detected for row binding, so
+            editing fields and deleting rows are disabled.
+          </span>
         </div>
       )}
       {}
@@ -1039,7 +1144,11 @@ export function TableView({
               columns,
               debouncedFilterDrafts,
             );
-            postMessage("exportCSV", { sort, filters: activeFilters });
+            if (totalCount > rows.length) {
+              setExportChoice({ format: "csv", sort, filters: activeFilters });
+            } else {
+              postMessage("exportCSV", { sort, filters: activeFilters });
+            }
           }}
         >
           <Icon name="export" size={13} style={{ marginRight: 4 }} />
@@ -1053,7 +1162,11 @@ export function TableView({
               columns,
               debouncedFilterDrafts,
             );
-            postMessage("exportJSON", { sort, filters: activeFilters });
+            if (totalCount > rows.length) {
+              setExportChoice({ format: "json", sort, filters: activeFilters });
+            } else {
+              postMessage("exportJSON", { sort, filters: activeFilters });
+            }
           }}
         >
           <Icon name="export" size={13} style={{ marginRight: 4 }} />
@@ -1421,7 +1534,6 @@ export function TableView({
         )}
       </div>
 
-      {}
       <div
         style={{
           height: 34,
@@ -1492,7 +1604,177 @@ export function TableView({
           onConfirm={confirmMutationPreview}
         />
       )}
+      {exportChoice && (
+        <ExportChoiceDialog
+          format={exportChoice.format}
+          visibleCount={rows.length}
+          totalCount={totalCount}
+          onExportVisible={() => {
+            const { format, sort: s, filters } = exportChoice;
+            setExportChoice(null);
+            postMessage(format === "csv" ? "exportCSV" : "exportJSON", {
+              sort: s,
+              filters,
+              limitToPage: { page, pageSize },
+            });
+          }}
+          onExportAll={() => {
+            const { format, sort: s, filters } = exportChoice;
+            setExportChoice(null);
+            postMessage(format === "csv" ? "exportCSV" : "exportJSON", {
+              sort: s,
+              filters,
+            });
+          }}
+          onCancel={() => setExportChoice(null)}
+        />
+      )}
     </main>
+  );
+}
+
+function ExportChoiceDialog({
+  format,
+  visibleCount,
+  totalCount,
+  onExportVisible,
+  onExportAll,
+  onCancel,
+}: {
+  format: "csv" | "json";
+  visibleCount: number;
+  totalCount: number;
+  onExportVisible: () => void;
+  onExportAll: () => void;
+  onCancel: () => void;
+}) {
+  const titleId = useId();
+  const descriptionId = useId();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const cancelButtonRef = useRef<HTMLButtonElement>(null);
+  const handleKeyDown = useDialogFocusTrap({
+    dialogRef,
+    initialFocusRef: cancelButtonRef,
+    onEscape: onCancel,
+  });
+
+  const ext = format.toUpperCase();
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        inset: 0,
+        zIndex: 30,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 24,
+        background: "rgba(0, 0, 0, 0.36)",
+        backdropFilter: "blur(2px)",
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={descriptionId}
+        tabIndex={-1}
+        ref={dialogRef}
+        onKeyDown={handleKeyDown}
+        style={{
+          width: "min(480px, calc(100vw - 48px))",
+          display: "flex",
+          flexDirection: "column",
+          overflow: "hidden",
+          borderRadius: 6,
+          border: "1px solid var(--vscode-panel-border)",
+          background: "var(--vscode-editor-background)",
+          boxShadow: "0 18px 48px rgba(0, 0, 0, 0.42)",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+            padding: "14px 16px 12px",
+            borderBottom: "1px solid var(--vscode-panel-border)",
+            background: "var(--vscode-editorGroupHeader-tabsBackground)",
+          }}
+        >
+          <div id={titleId} style={{ fontSize: 13, fontWeight: 600 }}>
+            Export {ext}
+          </div>
+          <button
+            type="button"
+            ref={cancelButtonRef}
+            onClick={onCancel}
+            aria-label="Close export dialog"
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "var(--vscode-foreground)",
+              cursor: "pointer",
+              padding: 0,
+              opacity: 0.8,
+            }}
+          >
+            <Icon name="close" size={14} />
+          </button>
+        </div>
+
+        <div
+          style={{
+            padding: "16px",
+            display: "flex",
+            flexDirection: "column",
+            gap: 16,
+          }}
+        >
+          <p
+            id={descriptionId}
+            style={{ margin: 0, fontSize: 13, lineHeight: 1.5 }}
+          >
+            The table has <strong>{totalCount.toLocaleString()} rows</strong> in
+            total, but only{" "}
+            <strong>{visibleCount.toLocaleString()} rows</strong> are currently
+            visible on this page. Choose what to export:
+          </p>
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            <button
+              type="button"
+              style={{ ...btn("ghost"), textAlign: "left" }}
+              onClick={onExportVisible}
+            >
+              Export visible ({visibleCount.toLocaleString()} rows)
+            </button>
+            <button
+              type="button"
+              style={{ ...btn("ghost"), textAlign: "left" }}
+              onClick={onExportAll}
+            >
+              Export full table ({totalCount.toLocaleString()} rows){" "}
+              <span style={{ opacity: 0.65, fontSize: 11 }}>
+                ⚠ may be a heavy operation
+              </span>
+            </button>
+          </div>
+          <div style={{ display: "flex", justifyContent: "flex-end" }}>
+            <button type="button" style={btn("ghost")} onClick={onCancel}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1511,74 +1793,10 @@ function MutationPreviewDialog({
   const descriptionId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
-  const confirmButtonRef = useRef<HTMLButtonElement>(null);
-
-  const getFocusableElements = useCallback((): HTMLElement[] => {
-    const dialog = dialogRef.current;
-    if (!dialog) {
-      return [];
-    }
-
-    return Array.from(
-      dialog.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-      ),
-    );
-  }, []);
-
-  useEffect(() => {
-    const previousActiveElement =
-      document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : null;
-
-    closeButtonRef.current?.focus();
-
-    return () => {
-      previousActiveElement?.focus();
-    };
-  }, []);
-
-  const handleDialogKeyDown = useCallback(
-    (event: React.KeyboardEvent<HTMLDivElement>) => {
-      if (event.key !== "Tab") {
-        return;
-      }
-
-      const focusableElements = getFocusableElements();
-
-      if (focusableElements.length === 0) {
-        event.preventDefault();
-        dialogRef.current?.focus();
-        return;
-      }
-
-      const firstElement = focusableElements[0];
-      const lastElement = focusableElements[focusableElements.length - 1];
-      const activeElement =
-        document.activeElement instanceof HTMLElement
-          ? document.activeElement
-          : null;
-
-      if (!activeElement || !dialogRef.current?.contains(activeElement)) {
-        event.preventDefault();
-        firstElement.focus();
-        return;
-      }
-
-      if (event.shiftKey && activeElement === firstElement) {
-        event.preventDefault();
-        lastElement.focus();
-        return;
-      }
-
-      if (!event.shiftKey && activeElement === lastElement) {
-        event.preventDefault();
-        firstElement.focus();
-      }
-    },
-    [getFocusableElements],
-  );
+  const handleDialogKeyDown = useDialogFocusTrap({
+    dialogRef,
+    initialFocusRef: closeButtonRef,
+  });
 
   return (
     <div
@@ -1695,12 +1913,7 @@ function MutationPreviewDialog({
             <button type="button" style={btn("ghost")} onClick={onCancel}>
               Cancel
             </button>
-            <button
-              type="button"
-              ref={confirmButtonRef}
-              style={btn("primary")}
-              onClick={onConfirm}
-            >
+            <button type="button" style={btn("primary")} onClick={onConfirm}>
               {confirmLabel}
             </button>
           </div>

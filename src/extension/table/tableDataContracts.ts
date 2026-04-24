@@ -21,8 +21,12 @@ export type ApplyResult = ApplyResultPayload;
 
 export interface PreparedInsertPlan {
   connectionId: string;
+  database: string;
+  schema: string;
+  table: string;
   operation: TransactionOperation;
   previewStatements: string[];
+  verificationCriteria: Record<string, unknown> | null;
 }
 
 export interface VerificationTarget {

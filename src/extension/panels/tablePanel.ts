@@ -21,6 +21,14 @@ import { createWebviewShell } from "./webviewShell";
 
 const EXPORT_CHUNK_SIZE = 500;
 
+type ExportPayload = {
+  sort?: unknown;
+  filters?: unknown[];
+  limitToPage?: { page: number; pageSize: number };
+};
+
+type ExportFormat = "csv" | "json";
+
 const FILTER_ERROR_RE =
   /^\[RapiDB Filter\]|invalid input syntax|invalid cidr|malformed array|not a valid (binary|hex|uuid)|syntax error in input|invalid value for type|invalid number|operator does not exist|conversion failed|arithmetic overflow|ORA-0(1841|1843|1858|1861|6502)|ORA-01722|incorrect (date|datetime|time)|Incorrect integer value|Truncated incorrect|data truncat/i;
 
@@ -359,45 +367,84 @@ export class TablePanel {
   }
 
   private async _handleExportCSV(
-    payload: { sort?: unknown; filters?: unknown[] } | undefined,
+    payload: ExportPayload | undefined,
   ): Promise<void> {
-    const { sort: csvSort = null, filters: csvFilters = [] } = payload ?? {};
-
-    await exportTableDataAsCsv({
-      fileName: this.schema ? `${this.schema}_${this.table}` : this.table,
-      loadChunks: (signal) =>
-        this.svc.exportAll(
-          this.connectionId,
-          this.database,
-          this.schema,
-          this.table,
-          EXPORT_CHUNK_SIZE,
-          csvSort as SortConfig | null,
-          coerceFilterExpressions(csvFilters),
-          signal,
-        ),
-    });
+    await this._handleExport("csv", payload);
   }
 
   private async _handleExportJSON(
-    payload: { sort?: unknown; filters?: unknown[] } | undefined,
+    payload: ExportPayload | undefined,
   ): Promise<void> {
-    const { sort = null, filters: jsonFilters = [] } = payload ?? {};
+    await this._handleExport("json", payload);
+  }
 
-    await exportTableDataAsJson({
-      fileName: this.schema ? `${this.schema}_${this.table}` : this.table,
-      loadChunks: (signal) =>
-        this.svc.exportAll(
-          this.connectionId,
-          this.database,
-          this.schema,
-          this.table,
-          EXPORT_CHUNK_SIZE,
-          sort as SortConfig | null,
-          coerceFilterExpressions(jsonFilters),
-          signal,
-        ),
-    });
+  private async _handleExport(
+    format: ExportFormat,
+    payload: ExportPayload | undefined,
+  ): Promise<void> {
+    const { sort = null, filters = [], limitToPage } = payload ?? {};
+    const normalizedLimitToPage = limitToPage
+      ? {
+          page: Math.max(1, Math.floor(Number(limitToPage.page) || 1)),
+          pageSize: Math.min(
+            10000,
+            Math.max(1, Math.floor(Number(limitToPage.pageSize) || 50)),
+          ),
+        }
+      : undefined;
+    const fileName = this.schema ? `${this.schema}_${this.table}` : this.table;
+    const filterExpressions = coerceFilterExpressions(filters);
+    const loadChunks = (signal: AbortSignal) =>
+      normalizedLimitToPage
+        ? this._pageAsChunks(
+            normalizedLimitToPage.page,
+            normalizedLimitToPage.pageSize,
+            sort as SortConfig | null,
+            filterExpressions,
+            signal,
+          )
+        : this.svc.exportAll(
+            this.connectionId,
+            this.database,
+            this.schema,
+            this.table,
+            EXPORT_CHUNK_SIZE,
+            sort as SortConfig | null,
+            filterExpressions,
+            signal,
+          );
+
+    if (format === "csv") {
+      await exportTableDataAsCsv({ fileName, loadChunks });
+      return;
+    }
+
+    await exportTableDataAsJson({ fileName, loadChunks });
+  }
+
+  private async *_pageAsChunks(
+    page: number,
+    pageSize: number,
+    sort: SortConfig | null,
+    filters: FilterExpression[],
+    signal: AbortSignal,
+  ): AsyncGenerator<{
+    columns: { name: string }[];
+    rows: Record<string, unknown>[];
+  }> {
+    if (signal.aborted) return;
+    const result = await this.svc.getPage(
+      this.connectionId,
+      this.database,
+      this.schema,
+      this.table,
+      page,
+      pageSize,
+      filters,
+      sort,
+      true,
+    );
+    yield { columns: result.columns, rows: result.rows };
   }
 
   private async _handleConfirmDelete(

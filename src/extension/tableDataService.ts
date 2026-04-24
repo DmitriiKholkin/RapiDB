@@ -20,6 +20,7 @@ export type {
   TablePage,
 } from "./table/tableDataContracts";
 export {
+  /** @deprecated Use prepareApplyChangesPlan + executePreparedApplyPlan for preview-first flow. */
   applyChangesTransactional,
   executePreparedApplyPlan,
   prepareApplyChangesPlan,
@@ -74,6 +75,7 @@ export class TableDataService {
     );
   }
 
+  /** @deprecated Use prepareApplyChangesPlan + executePreparedApplyPlan for preview-first flow. */
   updateRow(
     connectionId: string,
     database: string,
@@ -92,6 +94,7 @@ export class TableDataService {
     );
   }
 
+  /** @deprecated Use prepareInsertRow + executePreparedInsertPlan for preview-first flow. */
   insertRow(
     connectionId: string,
     database: string,

@@ -136,10 +136,21 @@ export type TablePanelMessage =
       "deleteRows",
       { primaryKeysList?: Array<Record<string, unknown>> }
     >
-  | WebviewMessageEnvelope<"exportCSV", { sort?: unknown; filters?: unknown[] }>
+  | WebviewMessageEnvelope<
+      "exportCSV",
+      {
+        sort?: unknown;
+        filters?: unknown[];
+        limitToPage?: { page: number; pageSize: number };
+      }
+    >
   | WebviewMessageEnvelope<
       "exportJSON",
-      { sort?: unknown; filters?: unknown[] }
+      {
+        sort?: unknown;
+        filters?: unknown[];
+        limitToPage?: { page: number; pageSize: number };
+      }
     >
   | WebviewMessageEnvelope<"confirmDelete", { count: number }>
   | WebviewMessageEnvelope<
@@ -202,6 +213,19 @@ function readOptionalNumber(
     const parsed = Number(value);
     return Number.isFinite(parsed) ? parsed : undefined;
   }
+  return undefined;
+}
+
+function readPositiveInteger(value: unknown): number | undefined {
+  if (typeof value === "number") {
+    return Number.isInteger(value) && value > 0 ? value : undefined;
+  }
+
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+  }
+
   return undefined;
 }
 
@@ -570,11 +594,20 @@ export function parseTablePanelMessage(
       if (payload.filters !== undefined && !Array.isArray(payload.filters)) {
         return null;
       }
+      let limitToPage: { page: number; pageSize: number } | undefined;
+      if (isRecord(payload.limitToPage)) {
+        const page = readPositiveInteger(payload.limitToPage.page);
+        const pageSize = readPositiveInteger(payload.limitToPage.pageSize);
+        if (page !== undefined && pageSize !== undefined) {
+          limitToPage = { page, pageSize };
+        }
+      }
       return {
         type: envelope.type,
         payload: {
           sort: payload.sort,
           filters: payload.filters as unknown[] | undefined,
+          limitToPage,
         },
       };
     }

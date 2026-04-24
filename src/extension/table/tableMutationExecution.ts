@@ -19,6 +19,7 @@ interface VerificationFailure {
   message: string;
 }
 
+/** @deprecated Use prepareApplyChangesPlan + executePreparedApplyPlan for preview-first flow. */
 export async function applyChangesTransactional(
   connectionManager: ConnectionManager,
   connectionId: string,
