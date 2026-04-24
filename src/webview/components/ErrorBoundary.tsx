@@ -1,4 +1,3 @@
-// biome-ignore lint/style/useImportType: React needed for JSX
 import React from "react";
 
 interface Props {

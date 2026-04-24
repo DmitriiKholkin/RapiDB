@@ -356,10 +356,8 @@ export function QueryView({
           onClick={executeQuery}
           title="Run query (Ctrl+Enter / F5)"
         >
-          <>
-            <Icon name="run" size={13} style={{ marginRight: 4 }} />
-            Run
-          </>
+          <Icon name="run" size={13} style={{ marginRight: 4 }} />
+          Run
         </button>
 
         {}
@@ -369,10 +367,8 @@ export function QueryView({
           onClick={() => editorRef.current?.setValue("")}
           title="Clear SQL"
         >
-          <>
-            <Icon name="close" size={13} style={{ marginRight: 4 }} />
-            Clear
-          </>
+          <Icon name="close" size={13} style={{ marginRight: 4 }} />
+          Clear
         </button>
 
         {}
@@ -387,10 +383,8 @@ export function QueryView({
           }}
           title="Format SQL (Shift+Alt+F)"
         >
-          <>
-            <Icon name="symbol-color" size={13} style={{ marginRight: 4 }} />
-            Format
-          </>
+          <Icon name="symbol-color" size={13} style={{ marginRight: 4 }} />
+          Format
         </button>
 
         {}
@@ -409,10 +403,8 @@ export function QueryView({
           onClick={handleBookmark}
           title={bookmarked ? "Already bookmarked" : "Add to Bookmarks"}
         >
-          <>
-            <Icon name="bookmark" size={13} style={{ marginRight: 4 }} />
-            Bookmark
-          </>
+          <Icon name="bookmark" size={13} style={{ marginRight: 4 }} />
+          Bookmark
         </button>
 
         <div style={{ flex: 1 }} />

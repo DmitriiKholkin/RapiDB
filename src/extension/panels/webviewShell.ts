@@ -1,4 +1,4 @@
-import { randomUUID } from "crypto";
+import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import type { WebviewInitialState } from "../../shared/webviewContracts";
 

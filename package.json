@@ -480,7 +480,10 @@
     "vscode:prepublish": "node esbuild.config.mjs --production",
     "build": "node esbuild.config.mjs",
     "watch": "node esbuild.config.mjs --watch",
-    "compile": "node esbuild.config.mjs",
+    "compile": "npm run build",
+    "check": "npm run typecheck && npm run lint",
+    "lint": "biome check . --max-diagnostics=none",
+    "lint:fix": "biome check . --write --unsafe --max-diagnostics=none",
     "typecheck": "npm run typecheck:extension && npm run typecheck:webview && npm run typecheck:tests",
     "typecheck:extension": "tsc -p tsconfig.extension.json --noEmit",
     "typecheck:webview": "tsc -p tsconfig.webview.json --noEmit",
@@ -506,6 +509,7 @@
     "package": "vsce package"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.4.13",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",
     "@types/mssql": "^9.1.9",

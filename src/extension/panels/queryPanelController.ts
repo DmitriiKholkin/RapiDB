@@ -253,7 +253,7 @@ export class QueryPanelController {
   }
 }
 
-function normaliseSqlForGuardrail(sql: string): string {
+function _normaliseSqlForGuardrail(sql: string): string {
   return sql
     .replace(/\/\*[\s\S]*?\*\//g, " ")
     .replace(/--.*$/gm, " ")

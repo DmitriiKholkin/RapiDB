@@ -1,4 +1,8 @@
-import type { ColumnTypeMeta, FilterExpression, IDBDriver } from "../dbDrivers/types";
+import type {
+  ColumnTypeMeta,
+  FilterExpression,
+  IDBDriver,
+} from "../dbDrivers/types";
 
 export function buildWhere(
   drv: IDBDriver,

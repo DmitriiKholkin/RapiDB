@@ -4,10 +4,7 @@ import type { ConnectionManager } from "../connectionManager";
 type ProgressRunner = typeof vscode.window.withProgress;
 
 export async function connectWithProgress(
-  connectionManager: Pick<
-    ConnectionManager,
-    "beginConnect" | "isConnected"
-  >,
+  connectionManager: Pick<ConnectionManager, "beginConnect" | "isConnected">,
   connectionId: string,
   title: string,
   waitForExisting: boolean,

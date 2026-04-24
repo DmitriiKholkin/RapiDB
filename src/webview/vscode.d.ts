@@ -1,5 +1,7 @@
 import type { WebviewInitialState } from "../shared/webviewContracts";
 
+declare module "*.css";
+
 declare global {
   interface VSCodeAPI {
     postMessage(message: unknown): void;

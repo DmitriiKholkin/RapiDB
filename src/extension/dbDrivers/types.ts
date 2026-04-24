@@ -223,7 +223,6 @@ export function filterOperatorsForCategory(
     case "array":
     case "other":
       return SEARCH_OPS;
-    case "lob":
     default:
       return [];
   }

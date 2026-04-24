@@ -365,17 +365,13 @@ export function formatSQLSafe(sql: string, dialect = "sql"): string {
   if (!sql.trim()) {
     return sql;
   }
-  try {
-    return sqlFormatterFormat(sql, {
-      language: dialect as SqlFormatterLanguage,
-      tabWidth: 2,
-      keywordCase: "upper",
-      linesBetweenQueries: 1,
-      indentStyle: "standard",
-    });
-  } catch (err) {
-    throw err;
-  }
+  return sqlFormatterFormat(sql, {
+    language: dialect as SqlFormatterLanguage,
+    tabWidth: 2,
+    keywordCase: "upper",
+    linesBetweenQueries: 1,
+    indentStyle: "standard",
+  });
 }
 
 export function formatSQLOrError(
@@ -572,6 +568,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
           getComputedStyle(document.body).getPropertyValue(
             "--vscode-editor-font-size",
           ) || "13",
+          10,
         ),
         fontFamily:
           getComputedStyle(document.body)

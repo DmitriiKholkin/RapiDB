@@ -1,4 +1,3 @@
-// biome-ignore lint/correctness/noUnusedImports: React needed for JSX
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./components/App";

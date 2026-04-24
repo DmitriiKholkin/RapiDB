@@ -224,16 +224,12 @@ function DataTable({ result }: { result: QueryResult }) {
         </span>
         <div style={{ display: "flex", gap: 4 }}>
           <ToolbarBtn onClick={exportCSV} title="Export results as CSV file">
-            <>
-              <Icon name="export" size={12} style={{ marginRight: 3 }} />
-              Export CSV
-            </>
+            <Icon name="export" size={12} style={{ marginRight: 3 }} />
+            Export CSV
           </ToolbarBtn>
           <ToolbarBtn onClick={exportJSON} title="Export results as JSON file">
-            <>
-              <Icon name="export" size={12} style={{ marginRight: 3 }} />
-              Export JSON
-            </>
+            <Icon name="export" size={12} style={{ marginRight: 3 }} />
+            Export JSON
           </ToolbarBtn>
         </div>
       </div>

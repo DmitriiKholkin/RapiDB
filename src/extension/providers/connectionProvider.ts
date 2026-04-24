@@ -81,7 +81,7 @@ const CATEGORY_NODE_KIND: Record<string, NodeKind> = {
 
 export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
   private readonly _onDidChangeTreeData = new vscode.EventEmitter<
-    RapiDBNode | undefined | null | void
+    RapiDBNode | undefined | null
   >();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
@@ -147,7 +147,11 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       const ungrouped = conns.filter((c) => !c.folder?.trim());
 
       const folderNames = [
-        ...new Set(grouped.map((c) => c.folder!.trim())),
+        ...new Set(
+          grouped
+            .map((c) => c.folder?.trim())
+            .filter((name): name is string => !!name),
+        ),
       ].sort((a, b) => a.localeCompare(b));
 
       const folderNodes = folderNames.map((name) => this.makeFolderNode(name));
@@ -161,7 +165,10 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     }
 
     if (element.kind === "folder") {
-      const folderName = element.objectName!;
+      const folderName = element.objectName;
+      if (!folderName) {
+        return [];
+      }
       const conns = this.connectionManager
         .getConnections()
         .filter((c) => c.folder?.trim() === folderName)
@@ -176,7 +183,10 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       if (!this.connectionManager.isConnected(element.connectionId)) {
         return [];
       }
-      const driver = this.connectionManager.getDriver(element.connectionId)!;
+      const driver = this.connectionManager.getDriver(element.connectionId);
+      if (!driver) {
+        return [];
+      }
       try {
         const dbs = await driver.listDatabases();
         return dbs.map((db) => {
@@ -201,16 +211,20 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     }
 
     if (element.kind === "database") {
+      const databaseName = element.database;
+      if (!databaseName) {
+        return [];
+      }
       const driver = this.connectionManager.getDriver(element.connectionId);
       if (!driver) {
         return [];
       }
       try {
-        const schemas = await driver.listSchemas(element.database!);
+        const schemas = await driver.listSchemas(databaseName);
         if (schemas.length <= 1) {
           return this.categoryNodes(
             element.connectionId,
-            element.database!,
+            databaseName,
             schemas[0]?.name ?? "",
             driver,
           );
@@ -221,7 +235,7 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
             "schema",
             vscode.TreeItemCollapsibleState.Collapsed,
             element.connectionId,
-            element.database,
+            databaseName,
             s.name,
           );
           node.tooltip = `Schema: ${s.name}`;
@@ -238,19 +252,29 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     }
 
     if (element.kind === "schema") {
+      const databaseName = element.database;
+      const schemaName = element.schema;
+      if (!databaseName || !schemaName) {
+        return [];
+      }
       const driver = this.connectionManager.getDriver(element.connectionId);
       if (!driver) {
         return [];
       }
       return this.categoryNodes(
         element.connectionId,
-        element.database!,
-        element.schema!,
+        databaseName,
+        schemaName,
         driver,
       );
     }
 
     if (element.kind in CATEGORY_TYPES) {
+      const databaseName = element.database;
+      const schemaName = element.schema;
+      if (!databaseName || !schemaName) {
+        return [];
+      }
       const driver = this.connectionManager.getDriver(element.connectionId);
       if (!driver) {
         return [];
@@ -258,12 +282,12 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       try {
         const cacheKey = this.objectsCacheKey(
           element.connectionId,
-          element.database!,
-          element.schema!,
+          databaseName,
+          schemaName,
         );
         let all = this._objectsCache.get(cacheKey);
         if (!all) {
-          all = await driver.listObjects(element.database!, element.schema!);
+          all = await driver.listObjects(databaseName, schemaName);
           this._objectsCache.set(cacheKey, all);
         }
 
@@ -283,11 +307,11 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
             childKind,
             vscode.TreeItemCollapsibleState.None,
             element.connectionId,
-            element.database,
-            element.schema,
+            databaseName,
+            schemaName,
             o.name,
           );
-          node.tooltip = `${childKind}: ${o.name}\nSchema: ${element.schema ?? "—"}\nDatabase: ${element.database ?? "—"}`;
+          node.tooltip = `${childKind}: ${o.name}\nSchema: ${schemaName}\nDatabase: ${databaseName}`;
           if (childKind === "table" || childKind === "view") {
             node.command = {
               command: "rapidb.openTableData",
@@ -461,7 +485,7 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
         schema,
       );
       node.description = `(${count})`;
-      node.tooltip = `${c.label} in ${schema ? schema + "." : ""}${database} — ${count} item${count !== 1 ? "s" : ""}`;
+      node.tooltip = `${c.label} in ${schema ? `${schema}.` : ""}${database} — ${count} item${count !== 1 ? "s" : ""}`;
       return node;
     });
   }

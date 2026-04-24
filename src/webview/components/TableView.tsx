@@ -1106,10 +1106,8 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
                 setMutErr(null);
               }}
             >
-              <>
-                <Icon name="add" size={13} style={{ marginRight: 4 }} />
-                Add Row
-              </>
+              <Icon name="add" size={13} style={{ marginRight: 4 }} />
+              Add Row
             </button>
             {canSelectAndDeleteRows && (
               <button
@@ -1118,10 +1116,8 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
                 disabled={selected.size === 0 || busy}
                 onClick={deleteSelected}
               >
-                <>
-                  <Icon name="trash" size={13} style={{ marginRight: 4 }} />
-                  {deleting ? "Deleting…" : `Delete (${selected.size})`}
-                </>
+                <Icon name="trash" size={13} style={{ marginRight: 4 }} />
+                {deleting ? "Deleting…" : `Delete (${selected.size})`}
               </button>
             )}
           </>
@@ -1222,10 +1218,8 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
                 flex: 1,
               }}
             >
-              <>
-                <Icon name="warning" size={13} style={{ marginRight: 4 }} />
-                {applyStatus.message}
-              </>
+              <Icon name="warning" size={13} style={{ marginRight: 4 }} />
+              {applyStatus.message}
             </span>
           )}
           {pendingCount > 0 && (
@@ -1435,7 +1429,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
                 const col = columnsMap.get(h.column.id);
                 return (
                   <th
-                    key={h.id + "_f"}
+                    key={`${h.id}_f`}
                     style={{
                       width: h.getSize(),
                       height: FILTER_H,
