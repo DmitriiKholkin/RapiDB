@@ -342,6 +342,9 @@ export function TableView({
 
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
   const pendingCount = pendingEdits.size;
+  const hasPrimaryKey = pkCols.length > 0;
+  const canEditRows = !readOnlyTable && hasPrimaryKey;
+  const canSelectAndDeleteRows = !readOnlyTable && hasPrimaryKey;
 
   const initializedRef = useRef(false);
   const fetchEpochRef = useRef(0);
@@ -684,16 +687,13 @@ export function TableView({
     [],
   );
 
-  const handleStartEdit = useCallback(
-    (rowIdx: number, col: ColumnMeta) => {
-      if (readOnlyTable || !canEditColumn(col)) {
-        return;
-      }
-      setEditCell({ rowIdx, col: col.name });
-      setApplyStatus(null);
-    },
-    [readOnlyTable],
-  );
+  const handleStartEdit = useCallback((rowIdx: number, col: ColumnMeta) => {
+    if (!canEditColumn(col)) {
+      return;
+    }
+    setEditCell({ rowIdx, col: col.name });
+    setApplyStatus(null);
+  }, []);
 
   const deleteSelected = useCallback(() => {
     if (
@@ -775,7 +775,7 @@ export function TableView({
 
   const tanColumns = useMemo<TanColumnDef<Row>[]>(
     () => [
-      ...(!readOnlyTable
+      ...(canSelectAndDeleteRows
         ? [
             {
               id: "__sel",
@@ -871,7 +871,7 @@ export function TableView({
                   initial={startStr}
                   nullable={col.nullable}
                   category={col.category}
-                  readOnly={!isEditing}
+                  readOnly={!canEditRows}
                   onCommit={(v) => commitCellEdit(rowIdx, col, v, getValue())}
                   onCancel={() => setEditCell(null)}
                 />
@@ -889,7 +889,7 @@ export function TableView({
       ),
     ],
 
-    [columns, colSizes, commitCellEdit, readOnlyTable],
+    [canEditRows, canSelectAndDeleteRows, columns, colSizes, commitCellEdit],
   );
 
   const tanTable = useReactTable({
@@ -1006,23 +1006,19 @@ export function TableView({
                 Add Row
               </>
             </button>
-            <button
-              type="button"
-              style={btn(
-                "danger",
-                selected.size === 0 || pkCols.length === 0 || busy,
-              )}
-              disabled={selected.size === 0 || pkCols.length === 0 || busy}
-              onClick={deleteSelected}
-              title={
-                pkCols.length === 0 ? "No primary key — cannot delete" : ""
-              }
-            >
-              <>
-                <Icon name="trash" size={13} style={{ marginRight: 4 }} />
-                {deleting ? "Deleting…" : `Delete (${selected.size})`}
-              </>
-            </button>
+            {canSelectAndDeleteRows && (
+              <button
+                type="button"
+                style={btn("danger", selected.size === 0 || busy)}
+                disabled={selected.size === 0 || busy}
+                onClick={deleteSelected}
+              >
+                <>
+                  <Icon name="trash" size={13} style={{ marginRight: 4 }} />
+                  {deleting ? "Deleting…" : `Delete (${selected.size})`}
+                </>
+              </button>
+            )}
           </>
         )}
 
@@ -1388,7 +1384,6 @@ export function TableView({
                   pendingCols={pendingEdits.get(vRow.index)}
                   columnsMap={columnsMap}
                   editingCol={editingCol}
-                  readOnly={readOnlyTable}
                   onStartEdit={handleStartEdit}
                 />
               );
@@ -1722,7 +1717,6 @@ const TableRow = React.memo(function TableRow({
   pendingCols,
   columnsMap,
   editingCol,
-  readOnly,
   onStartEdit,
 }: {
   row: ReturnType<ReturnType<typeof useReactTable>["getRowModel"]>["rows"][0];
@@ -1732,7 +1726,6 @@ const TableRow = React.memo(function TableRow({
 
   columnsMap: Map<string, ColumnMeta>;
   editingCol: string | null;
-  readOnly: boolean;
 
   onStartEdit: (rowIndex: number, col: ColumnMeta) => void;
 }) {
@@ -1778,17 +1771,14 @@ const TableRow = React.memo(function TableRow({
               textOverflow: "ellipsis",
               boxSizing: "border-box",
               verticalAlign: "middle",
-              cursor:
-                isSel || readOnly || !canEditColumn(colDef)
-                  ? "default"
-                  : "pointer",
+              cursor: isSel || !canEditColumn(colDef) ? "default" : "pointer",
 
               userSelect: isSel ? "auto" : "none",
               background: isCellPending ? "rgba(200,150,0,0.07)" : undefined,
             }}
             title={isPk ? `PK: ${String(cell.getValue())}` : undefined}
             onDoubleClick={() => {
-              if (colDef && !isSel && !readOnly && canEditColumn(colDef)) {
+              if (colDef && !isSel && canEditColumn(colDef)) {
                 onStartEdit(index, colDef);
               }
             }}

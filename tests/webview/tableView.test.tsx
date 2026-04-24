@@ -72,7 +72,7 @@ const columns: ColumnTypeMeta[] = [
     name: "name",
     type: "TEXT",
     nativeType: "TEXT",
-    nullable: false,
+    nullable: true,
     isPrimaryKey: false,
     isForeignKey: false,
     isAutoIncrement: false,
@@ -410,7 +410,7 @@ describe("TableView", () => {
     expect(screen.getByText("Alicia")).toBeTruthy();
   });
 
-  it("keeps non-view tables writable even when no primary key is present", async () => {
+  it("hides selection and delete for tables without primary key and opens read-only cell editor", async () => {
     renderTableView();
 
     dispatchIncomingMessage("tableInit", {
@@ -436,22 +436,23 @@ describe("TableView", () => {
     });
 
     expect(screen.getByRole("button", { name: "Add Row" })).toBeTruthy();
-    const deleteButton = screen.getByRole("button", {
-      name: "Delete (0)",
-    });
-    expect((deleteButton as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByRole("button", { name: /^Delete \(/ })).toBeNull();
+    expect(screen.queryByLabelText("Select all rows")).toBeNull();
+    expect(screen.queryByLabelText("Select row 1")).toBeNull();
 
     const aliceCell = screen.getByText("Alice").closest("td");
     if (!(aliceCell instanceof HTMLTableCellElement)) {
-      throw new Error("Expected writable cell");
+      throw new Error("Expected readable cell");
     }
 
     fireEvent.doubleClick(aliceCell);
 
-    expect(screen.getByLabelText("Cell value")).toBeTruthy();
+    const editInput = screen.getByLabelText("Cell value");
+    expect((editInput as HTMLInputElement).readOnly).toBe(true);
+    expect(screen.queryByRole("button", { name: "NULL" })).toBeNull();
   });
 
-  it("allows editing auto-increment columns when table is writable", async () => {
+  it("opens auto-increment cells in read-only mode when table has no primary key", async () => {
     renderTableView();
 
     dispatchIncomingMessage("tableInit", {
@@ -483,7 +484,8 @@ describe("TableView", () => {
 
     fireEvent.doubleClick(seqCell);
 
-    expect(screen.getByLabelText("Cell value")).toBeTruthy();
+    const editInput = screen.getByLabelText("Cell value");
+    expect((editInput as HTMLInputElement).readOnly).toBe(true);
   });
 
   it("requests delete confirmation with selected primary keys", async () => {

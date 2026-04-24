@@ -80,7 +80,11 @@ export function registerTableServiceIntegrationTests(
 
     beforeAll(async () => {
       harness = await createLiveDriverHarness(engineId);
-      connectionManager = createManagerLike(connectionId, harness.driver);
+      connectionManager = createManagerLike(
+        connectionId,
+        harness.driver,
+        harness.connection,
+      );
       readService = new TableReadService(connectionManager);
       mutationService = new TableMutationService(
         connectionManager,
@@ -478,5 +482,80 @@ export function registerTableServiceIntegrationTests(
         ),
       ).rejects.toThrow(/Not connected/);
     });
+
+    it.runIf(engineId === "postgres")(
+      "executes generated preview SQL for array and bytea literals",
+      async () => {
+        const previewTableName = `preview_literal_probe_${Date.now()}_${Math.floor(Math.random() * 10_000)}`;
+        const qualifiedPreviewTableName = harness.driver.qualifiedTableName(
+          harness.databaseName,
+          harness.schemaName,
+          previewTableName,
+        );
+
+        await harness.driver.query(
+          `CREATE TABLE ${qualifiedPreviewTableName} ("id" INTEGER PRIMARY KEY, "tags" TEXT[], "payload" BYTEA)`,
+        );
+
+        try {
+          await harness.driver.query(
+            `INSERT INTO ${qualifiedPreviewTableName} ("id", "tags", "payload") VALUES (1, ARRAY['seed'], '\\x01'::bytea)`,
+          );
+
+          const previewColumns = await readService.getColumns(
+            connectionId,
+            harness.databaseName,
+            harness.schemaName,
+            previewTableName,
+          );
+          const idColumn = findColumnName(previewColumns, "id");
+          const tagsColumn = findColumnName(previewColumns, "tags");
+          const payloadColumn = findColumnName(previewColumns, "payload");
+
+          const previewPlan = prepareApplyChangesPlan(
+            connectionManager,
+            connectionId,
+            harness.databaseName,
+            harness.schemaName,
+            previewTableName,
+            [
+              {
+                primaryKeys: { [idColumn]: 1 },
+                changes: {
+                  [tagsColumn]: ["alpha", "beta's", null],
+                  [payloadColumn]: Buffer.from([0x00, 0xff, 0x10]),
+                },
+              },
+            ],
+            previewColumns,
+          );
+
+          expect(previewPlan.executable).toBe(true);
+          if (!previewPlan.executable) {
+            throw new Error("Expected executable preview plan.");
+          }
+
+          expect(previewPlan.plan.previewStatements).toHaveLength(1);
+          const [previewStatement] = previewPlan.plan.previewStatements;
+          expect(previewStatement).toContain("ARRAY[");
+          expect(previewStatement).toContain("::bytea");
+
+          await harness.driver.query(previewStatement);
+
+          const verification = await harness.driver.query(
+            `SELECT "tags"[1] AS tag1, "tags"[2] AS tag2, "tags"[3] IS NULL AS tag3_is_null, encode("payload", 'hex') AS payload_hex FROM ${qualifiedPreviewTableName} WHERE "id" = 1`,
+          );
+          const row = rowsFromQuery(verification)[0];
+          expect(caseInsensitiveValue(row, "tag1")).toBe("alpha");
+          expect(caseInsensitiveValue(row, "tag2")).toBe("beta's");
+          expect(caseInsensitiveValue(row, "tag3_is_null")).toBe(true);
+          expect(caseInsensitiveValue(row, "payload_hex")).toBe("00ff10");
+        } finally {
+          await harness.driver.query(
+            `DROP TABLE IF EXISTS ${qualifiedPreviewTableName}`,
+          );
+        }
+      },
+    );
   });
 }

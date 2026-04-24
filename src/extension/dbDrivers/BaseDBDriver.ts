@@ -74,7 +74,7 @@ function escapePreviewSqlString(value: string): string {
   return value.replace(/'/g, "''");
 }
 
-function formatPreviewSqlLiteral(value: unknown): string {
+function formatGenericPreviewSqlLiteral(value: unknown): string {
   if (value === null || value === undefined || value === NULL_SENTINEL) {
     return "NULL";
   }
@@ -122,6 +122,7 @@ function formatPreviewSqlLiteral(value: unknown): string {
 function materializeSequentialPreviewSql(
   sql: string,
   params: readonly unknown[],
+  formatLiteral: (value: unknown) => string,
 ): string {
   const placeholderCount = (sql.match(/\?/g) ?? []).length;
   if (placeholderCount !== params.length) {
@@ -131,13 +132,14 @@ function materializeSequentialPreviewSql(
   }
 
   let index = 0;
-  return sql.replace(/\?/g, () => formatPreviewSqlLiteral(params[index++]));
+  return sql.replace(/\?/g, () => formatLiteral(params[index++]));
 }
 
 function materializeIndexedPreviewSql(
   sql: string,
   params: readonly unknown[],
   marker: "$" | ":",
+  formatLiteral: (value: unknown) => string,
 ): string {
   const placeholderPattern = marker === "$" ? /\$(\d+)/g : /:(\d+)/g;
 
@@ -148,7 +150,7 @@ function materializeIndexedPreviewSql(
         `[RapiDB] Preview parameter mismatch: ${match} is out of range for ${params.length} value(s).`,
       );
     }
-    return formatPreviewSqlLiteral(params[paramIndex]);
+    return formatLiteral(params[paramIndex]);
   });
 }
 
@@ -884,21 +886,28 @@ export abstract class BaseDBDriver implements IDBDriver {
     return `${this.quoteIdentifier(column.name)} = ?`;
   }
 
+  protected formatPreviewSqlLiteral(value: unknown): string {
+    return formatGenericPreviewSqlLiteral(value);
+  }
+
   materializePreviewSql(sql: string, params?: readonly unknown[]): string {
     if (!params || params.length === 0) {
       return sql;
     }
 
+    const formatLiteral = (value: unknown) =>
+      this.formatPreviewSqlLiteral(value);
+
     if (sql.includes("?")) {
-      return materializeSequentialPreviewSql(sql, params);
+      return materializeSequentialPreviewSql(sql, params, formatLiteral);
     }
 
     if (/\$\d+/.test(sql)) {
-      return materializeIndexedPreviewSql(sql, params, "$");
+      return materializeIndexedPreviewSql(sql, params, "$", formatLiteral);
     }
 
     if (/:\d+/.test(sql)) {
-      return materializeIndexedPreviewSql(sql, params, ":");
+      return materializeIndexedPreviewSql(sql, params, ":", formatLiteral);
     }
 
     return sql;

@@ -110,6 +110,8 @@ function sampleValueFor(
     case "other":
       return "sample";
   }
+
+  return "sample";
 }
 
 function persistedSampleFor(

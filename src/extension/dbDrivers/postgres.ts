@@ -131,6 +131,10 @@ function pgIdentityClause(value: unknown): string {
   return "";
 }
 
+function escapePostgresPreviewString(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
 export class PostgresDriver extends BaseDBDriver {
   private pool: Pool | null = null;
   private readonly config: ConnectionConfig;
@@ -715,6 +719,49 @@ export class PostgresDriver extends BaseDBDriver {
 
   override buildSetExpr(column: ColumnTypeMeta, paramIndex: number): string {
     return `${this.quoteIdentifier(column.name)} = $${paramIndex}`;
+  }
+
+  private formatPostgresArrayLiteralValue(value: unknown): string {
+    if (value === null || value === undefined || value === NULL_SENTINEL) {
+      return "NULL";
+    }
+
+    if (Array.isArray(value)) {
+      return `ARRAY[${value.map((entry) => this.formatPostgresArrayLiteralValue(entry)).join(", ")}]`;
+    }
+
+    return this.formatPreviewSqlLiteral(value);
+  }
+
+  protected override formatPreviewSqlLiteral(value: unknown): string {
+    if (value === null || value === undefined || value === NULL_SENTINEL) {
+      return "NULL";
+    }
+
+    if (Array.isArray(value)) {
+      if (value.length === 0) {
+        return "'{}'";
+      }
+      return this.formatPostgresArrayLiteralValue(value);
+    }
+
+    if (Buffer.isBuffer(value)) {
+      return `'\\x${value.toString("hex")}'::bytea`;
+    }
+
+    if (value instanceof ArrayBuffer) {
+      return `'\\x${Buffer.from(new Uint8Array(value)).toString("hex")}'::bytea`;
+    }
+
+    if (ArrayBuffer.isView(value)) {
+      return `'\\x${Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("hex")}'::bytea`;
+    }
+
+    if (typeof value === "string") {
+      return `'${escapePostgresPreviewString(value)}'`;
+    }
+
+    return super.formatPreviewSqlLiteral(value);
   }
 
   // ─── PG type-aware data helpers ───
