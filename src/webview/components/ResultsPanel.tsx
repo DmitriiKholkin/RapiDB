@@ -448,7 +448,7 @@ const VirtualRow = React.memo(function VirtualRow({
       {row.getVisibleCells().map((cell) => {
         const raw = cell.getValue();
         const isNull = raw === null || raw === undefined;
-        const isActive =
+        const isEditing =
           activeCell?.rowIndex === index &&
           activeCell.columnId === cell.column.id;
         return (
@@ -457,13 +457,8 @@ const VirtualRow = React.memo(function VirtualRow({
             style={{
               width: cell.column.getSize(),
               height: ROW_H,
-              padding: isActive ? "0" : "0 8px",
-              borderBottom: isActive
-                ? "1px solid transparent"
-                : "1px solid var(--vscode-panel-border)",
-              borderRight: isActive
-                ? "1px solid transparent"
-                : "1px solid var(--vscode-panel-border)",
+              padding: isEditing ? "0" : "0 8px",
+              border: "1px solid var(--vscode-panel-border)",
               textAlign: "left",
               whiteSpace: "nowrap",
               overflow: "hidden",
@@ -475,7 +470,7 @@ const VirtualRow = React.memo(function VirtualRow({
             title={isNull ? "" : String(raw)}
             onDoubleClick={() => onActivateCell(index, cell.column.id)}
           >
-            {isActive ? (
+            {isEditing ? (
               <EditInput
                 initial={valueToEditString(raw)}
                 nullable

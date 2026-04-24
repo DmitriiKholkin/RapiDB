@@ -3,8 +3,6 @@ import { NULL_SENTINEL, type TypeCategory } from "../../../shared/tableTypes";
 import { placeholderForCategory } from "../../types";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
 
-const ROW_H = 26;
-
 export function EditInput({
   initial,
   nullable,
@@ -46,10 +44,8 @@ export function EditInput({
       ? "var(--vscode-disabledForeground)"
       : "var(--vscode-input-foreground)",
     border: "1px solid var(--vscode-focusBorder)",
-    borderRadius: 2,
     outline: "none",
     boxSizing: "border-box" as const,
-    opacity: isNull ? 0.5 : 1,
     fontStyle: isNull ? "italic" : "normal",
   };
 
@@ -60,13 +56,11 @@ export function EditInput({
     fontSize: 9,
     fontStyle: "italic",
     fontFamily: "inherit",
-    background: "transparent",
-    color: "var(--vscode-badge-foreground)",
-    border: "none",
-    borderRadius: 2,
+    background: "var(--vscode-input-background)",
+    color: "var(--vscode-input-foreground)",
+    border: "1px solid var(--vscode-focusBorder)",
     cursor: "pointer",
     letterSpacing: "0.02em",
-    opacity: 0.5,
   };
 
   return (
@@ -74,7 +68,6 @@ export function EditInput({
       style={{
         display: "flex",
         alignItems: "center",
-        gap: 2,
         width: "100%",
         height: "100%",
       }}

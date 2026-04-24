@@ -1969,26 +1969,15 @@ const TableRow = React.memo(function TableRow({
                 : colDef && isNumericCategory(colDef.category)
                   ? "right"
                   : "left",
-              borderBottom: isEditing
-                ? "1px solid transparent"
-                : "1px solid var(--vscode-panel-border)",
-              borderRight: isEditing
-                ? "1px solid transparent"
-                : "1px solid var(--vscode-panel-border)",
-              borderLeft: isEditing
-                ? "3px solid transparent"
-                : isCellPending
-                  ? "3px solid var(--vscode-editorWarning-foreground, #cca700)"
-                  : "none",
+              border: "1px solid var(--vscode-panel-border)",
               whiteSpace: "nowrap",
               overflow: "hidden",
               textOverflow: "ellipsis",
               boxSizing: "border-box",
               verticalAlign: "middle",
               cursor: isSel || !canEditColumn(colDef) ? "default" : "pointer",
-
               userSelect: isSel ? "auto" : "none",
-              background: isCellPending ? "rgba(200,150,0,0.07)" : undefined,
+              background: isCellPending ? "rgba(200, 150, 0, 0.23)" : undefined,
             }}
             title={isPk ? `PK: ${String(cell.getValue())}` : undefined}
             onDoubleClick={() => {
