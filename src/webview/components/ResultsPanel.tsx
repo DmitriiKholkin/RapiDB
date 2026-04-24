@@ -10,11 +10,11 @@ import {
 import { useVirtualizer } from "@tanstack/react-virtual";
 import React, { useCallback, useMemo, useRef, useState } from "react";
 import type { QueryResult, QueryStatus } from "../store";
-import { inferQueryColumnCategory } from "../types";
 import { type Column, calcColWidths } from "../utils/columnSizing";
 import { postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
 import { CellDisplay } from "./table/CellDisplay";
+import { EditInput, valueToEditString } from "./table/EditInput";
 
 interface Props {
   status: QueryStatus;
@@ -101,21 +101,12 @@ function DataTable({ result }: { result: QueryResult }) {
   } = result;
 
   const [sorting, setSorting] = useState<SortingState>([]);
+  const [activeCell, setActiveCell] = useState<{
+    rowIndex: number;
+    columnId: string;
+  } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const truncatedCount = truncatedAt ?? rowCount;
-  const columnMeta = Array.isArray(result.columnMeta) ? result.columnMeta : [];
-  const sampleRows = useMemo(() => rows.slice(0, 50), [rows]);
-  const columnCategories = useMemo(
-    () =>
-      colNames.map(
-        (_, index) =>
-          columnMeta[index]?.category ??
-          inferQueryColumnCategory(
-            sampleRows.map((row) => row[`__col_${index}`]),
-          ),
-      ),
-    [colNames, columnMeta, sampleRows],
-  );
 
   const colSizes = useMemo(
     () =>
@@ -137,7 +128,6 @@ function DataTable({ result }: { result: QueryResult }) {
     () =>
       colNames.map((name, i) => {
         const key = `__col_${i}`;
-        const category = columnCategories[i] ?? undefined;
         return {
           id: key,
           accessorKey: key,
@@ -145,17 +135,12 @@ function DataTable({ result }: { result: QueryResult }) {
           size: colSizes[key] ?? 160,
           minSize: 40,
           maxSize: 800,
-          meta: { category },
           cell: (info) => (
-            <CellDisplay
-              value={info.getValue()}
-              isPending={false}
-              category={category}
-            />
+            <CellDisplay value={info.getValue()} isPending={false} />
           ),
         };
       }),
-    [colNames, colSizes, columnCategories],
+    [colNames, colSizes],
   );
 
   const table = useReactTable({
@@ -395,7 +380,18 @@ function DataTable({ result }: { result: QueryResult }) {
 
             {virtItems.map((vRow) => {
               const row = tableRows[vRow.index];
-              return <VirtualRow key={vRow.key} row={row} index={vRow.index} />;
+              return (
+                <VirtualRow
+                  key={vRow.key}
+                  row={row}
+                  index={vRow.index}
+                  activeCell={activeCell}
+                  onActivateCell={(rowIndex, columnId) =>
+                    setActiveCell({ rowIndex, columnId })
+                  }
+                  onDeactivateCell={() => setActiveCell(null)}
+                />
+              );
             })}
 
             {}
@@ -433,9 +429,15 @@ if (
 const VirtualRow = React.memo(function VirtualRow({
   row,
   index,
+  activeCell,
+  onActivateCell,
+  onDeactivateCell,
 }: {
   row: ReturnType<ReturnType<typeof useReactTable>["getRowModel"]>["rows"][0];
   index: number;
+  activeCell: { rowIndex: number; columnId: string } | null;
+  onActivateCell: (rowIndex: number, columnId: string) => void;
+  onDeactivateCell: () => void;
 }) {
   return (
     <tr
@@ -445,34 +447,45 @@ const VirtualRow = React.memo(function VirtualRow({
     >
       {row.getVisibleCells().map((cell) => {
         const raw = cell.getValue();
-        const category = (
-          cell.column.columnDef.meta as { category?: string } | undefined
-        )?.category;
-        const isNum =
-          category === "integer" ||
-          category === "float" ||
-          category === "decimal";
         const isNull = raw === null || raw === undefined;
+        const isActive =
+          activeCell?.rowIndex === index &&
+          activeCell.columnId === cell.column.id;
         return (
           <td
             key={cell.id}
             style={{
               width: cell.column.getSize(),
               height: ROW_H,
-              padding: "0 8px",
-              borderBottom: "1px solid var(--vscode-panel-border)",
-              borderRight: "1px solid var(--vscode-panel-border)",
-              textAlign: isNum ? "right" : "left",
+              padding: isActive ? "0" : "0 8px",
+              borderBottom: isActive
+                ? "1px solid transparent"
+                : "1px solid var(--vscode-panel-border)",
+              borderRight: isActive
+                ? "1px solid transparent"
+                : "1px solid var(--vscode-panel-border)",
+              textAlign: "left",
               whiteSpace: "nowrap",
               overflow: "hidden",
               textOverflow: "ellipsis",
               boxSizing: "border-box",
               verticalAlign: "middle",
-              cursor: "default",
+              cursor: "pointer",
             }}
             title={isNull ? "" : String(raw)}
+            onDoubleClick={() => onActivateCell(index, cell.column.id)}
           >
-            {flexRender(cell.column.columnDef.cell, cell.getContext())}
+            {isActive ? (
+              <EditInput
+                initial={valueToEditString(raw)}
+                nullable
+                readOnly
+                onCommit={onDeactivateCell}
+                onCancel={onDeactivateCell}
+              />
+            ) : (
+              flexRender(cell.column.columnDef.cell, cell.getContext())
+            )}
           </td>
         );
       })}

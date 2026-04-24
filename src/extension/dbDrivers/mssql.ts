@@ -575,6 +575,15 @@ export class MSSQLDriver extends BaseDBDriver {
     const typeName = columnTypeName(columnMeta);
     const pad = (n: number) => String(n).padStart(2, "0");
 
+    if (typeName === "Bit") {
+      if (value === true || value === 1 || value === "1") {
+        return 1;
+      }
+      if (value === false || value === 0 || value === "0") {
+        return 0;
+      }
+    }
+
     if (
       typeName === "Real" &&
       typeof value === "number" &&

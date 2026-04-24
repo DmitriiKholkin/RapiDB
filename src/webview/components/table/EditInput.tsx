@@ -37,8 +37,8 @@ export function EditInput({
   const inputStyle: React.CSSProperties = {
     flex: 1,
     minWidth: 0,
-    height: ROW_H - 4,
-    padding: "0 4px",
+    height: "100%",
+    padding: "0px",
     fontSize: 12,
     fontFamily: "inherit",
     background: "var(--vscode-input-background)",
@@ -71,7 +71,13 @@ export function EditInput({
 
   return (
     <div
-      style={{ display: "flex", alignItems: "center", gap: 2, width: "100%" }}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 2,
+        width: "100%",
+        height: "100%",
+      }}
     >
       <input
         ref={ref}

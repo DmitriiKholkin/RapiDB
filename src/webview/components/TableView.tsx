@@ -1956,23 +1956,30 @@ const TableRow = React.memo(function TableRow({
         const isPk = colDef?.isPrimaryKey ?? false;
         const isSel = colId === "__sel";
         const isCellPending = pendingCols?.has(colId) ?? false;
+        const isEditing = colId === editingCol;
         return (
           <td
             key={cell.id}
             style={{
               width: cell.column.getSize(),
               height: ROW_H,
-              padding: isSel ? "0 6px" : "0 0 0 8px",
+              padding: isEditing ? "0" : isSel ? "0 6px" : "0 0 0 8px",
               textAlign: isSel
                 ? "center"
                 : colDef && isNumericCategory(colDef.category)
                   ? "right"
                   : "left",
-              borderBottom: "1px solid var(--vscode-panel-border)",
-              borderRight: "1px solid var(--vscode-panel-border)",
-              borderLeft: isCellPending
-                ? "3px solid var(--vscode-editorWarning-foreground, #cca700)"
-                : "none",
+              borderBottom: isEditing
+                ? "1px solid transparent"
+                : "1px solid var(--vscode-panel-border)",
+              borderRight: isEditing
+                ? "1px solid transparent"
+                : "1px solid var(--vscode-panel-border)",
+              borderLeft: isEditing
+                ? "3px solid transparent"
+                : isCellPending
+                  ? "3px solid var(--vscode-editorWarning-foreground, #cca700)"
+                  : "none",
               whiteSpace: "nowrap",
               overflow: "hidden",
               textOverflow: "ellipsis",

@@ -535,6 +535,14 @@ function formatOracleQueryValue(
   value: unknown,
   meta: oracledb.Metadata<unknown>,
 ): unknown {
+  if (meta.dbType === oracledb.DB_TYPE_BINARY_FLOAT) {
+    return normalizeOracleFloatValue(value, "BINARY_FLOAT") ?? value;
+  }
+
+  if (meta.dbType === oracledb.DB_TYPE_BINARY_DOUBLE) {
+    return normalizeOracleFloatValue(value, "BINARY_DOUBLE") ?? value;
+  }
+
   if (meta.dbType === oracledb.DB_TYPE_INTERVAL_YM) {
     return normalizeOracleIntervalYMValue(value) ?? value;
   }

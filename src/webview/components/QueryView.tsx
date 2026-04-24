@@ -73,7 +73,7 @@ const TOOLBAR_H = 36;
 const DIVIDER_H = 5;
 const MIN_EDITOR_H = 80;
 
-const DEFAULT_EDITOR_RATIO = 0.7;
+const DEFAULT_EDITOR_RATIO = 0.5;
 const DEFAULT_EDITOR_H = 400;
 
 export function QueryView({
@@ -157,11 +157,10 @@ export function QueryView({
 
   useEffect(() => {
     const unsubResult = onMessage<QueryResult>("queryResult", (payload) => {
-      const normalized = normalizeQueryResultPayload(payload);
-      if (normalized.error) {
-        setError(normalized.error);
+      if (payload.error) {
+        setError(payload.error);
       } else {
-        setResult(normalized);
+        setResult(payload);
       }
     });
 
@@ -453,11 +452,4 @@ export function QueryView({
       </div>
     </div>
   );
-}
-
-function normalizeQueryResultPayload(payload: QueryResult): QueryResult {
-  return {
-    ...payload,
-    columnMeta: Array.isArray(payload.columnMeta) ? payload.columnMeta : [],
-  };
 }

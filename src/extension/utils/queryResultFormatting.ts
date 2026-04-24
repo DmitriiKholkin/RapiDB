@@ -1,9 +1,6 @@
-import {
-  inferQueryColumnCategory,
-  type QueryColumnMeta,
-} from "../../shared/tableTypes";
+import { type QueryColumnMeta } from "../../shared/tableTypes";
 import { formatDatetimeForDisplay } from "../dbDrivers/BaseDBDriver";
-import { colKey, type QueryResult } from "../dbDrivers/types";
+import { type QueryResult } from "../dbDrivers/types";
 
 export interface FormattedQueryResult extends QueryResult {
   columnMeta: QueryColumnMeta[];
@@ -21,11 +18,7 @@ export function formatQueryResult(
 
   return {
     ...result,
-    columnMeta: resolveQueryColumnMeta(
-      result.columns,
-      result.columnMeta,
-      result.rows,
-    ),
+    columnMeta: resolveQueryColumnMeta(result.columns, result.columnMeta),
     rows: normalizeQueryRows(sampledRows),
     truncated,
     truncatedAt: rowLimit,
@@ -71,12 +64,8 @@ function normalizeQueryRows(
 function resolveQueryColumnMeta(
   columns: string[],
   rawMeta: QueryColumnMeta[] | undefined,
-  rows: Record<string, unknown>[],
 ): QueryColumnMeta[] {
-  const samples = rows.slice(0, 50);
   return columns.map((_, index) => ({
-    category:
-      rawMeta?.[index]?.category ??
-      inferQueryColumnCategory(samples.map((row) => row[colKey(index)])),
+    category: rawMeta?.[index]?.category ?? null,
   }));
 }

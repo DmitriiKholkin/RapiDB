@@ -358,7 +358,18 @@ export class PostgresDriver extends BaseDBDriver {
     const columns = result.fields?.map((field) => field.name) ?? [];
     const rawRows: unknown[][] = result.rows ?? [];
     const rows = rawRows.map((row) =>
-      Object.fromEntries(row.map((val, i) => [`__col_${i}`, val])),
+      Object.fromEntries(
+        row.map((val, i) => {
+          const normalized =
+            val !== null &&
+            typeof val === "object" &&
+            !(val instanceof Date) &&
+            isPointValue(val)
+              ? `(${String(val.x)}, ${String(val.y)})`
+              : val;
+          return [`__col_${i}`, normalized];
+        }),
+      ),
     );
     return {
       columns,
