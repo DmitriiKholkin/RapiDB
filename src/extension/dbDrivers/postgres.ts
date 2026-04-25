@@ -663,6 +663,8 @@ export class PostgresDriver extends BaseDBDriver {
     if (ct === "tsvector" || ct === "tsquery") return "text";
     if (
       ct === "text" ||
+      ct === "char" ||
+      ct === "bpchar" ||
       ct === "varchar" ||
       ct.startsWith("character") ||
       ct === "name" ||
@@ -917,6 +919,14 @@ export class PostgresDriver extends BaseDBDriver {
       column.category === "time" ||
       column.category === "datetime"
     ) {
+      if (["char", "bpchar", "character"].includes(baseType)) {
+        return this.checkFixedWidthCharPersistedEdit(
+          column,
+          expectedValue,
+          options,
+        );
+      }
+
       return this.checkTextPersistedEdit(column, expectedValue, options);
     }
 
@@ -1007,11 +1017,16 @@ export class PostgresDriver extends BaseDBDriver {
       val !== ""
     ) {
       const ct = column.nativeType.toLowerCase().split("(")[0].trim();
+      const sqlOp = this.sqlOperator(operator);
+
+      // Keep exact decimal text to avoid precision loss for large/precise NUMERIC values.
+      if (column.category === "decimal") {
+        return { sql: `${col} ${sqlOp} $${paramIndex}`, params: [val] };
+      }
+
       if (ct === "bigint" && /^-?\d+$/.test(val)) {
-        const sqlOp = this.sqlOperator(operator);
         return { sql: `${col} ${sqlOp} $${paramIndex}`, params: [BigInt(val)] };
       }
-      const sqlOp = this.sqlOperator(operator);
       return { sql: `${col} ${sqlOp} $${paramIndex}`, params: [Number(val)] };
     }
 

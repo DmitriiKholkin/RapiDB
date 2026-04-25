@@ -1766,6 +1766,14 @@ export class OracleDriver extends BaseDBDriver {
       column.category === "time" ||
       column.category === "datetime"
     ) {
+      if (["CHAR", "NCHAR"].includes(baseType)) {
+        return this.checkFixedWidthCharPersistedEdit(
+          column,
+          expectedValue,
+          options,
+        );
+      }
+
       return this.checkTextPersistedEdit(column, expectedValue, options);
     }
 

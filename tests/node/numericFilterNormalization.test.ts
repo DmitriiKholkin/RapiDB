@@ -93,4 +93,18 @@ describe("numeric filter normalization", () => {
       "[RapiDB Filter] Column col_money expects comma-separated numbers.",
     );
   });
+
+  it("preserves precision for large decimal values in PostgreSQL filter SQL", () => {
+    const condition = postgresDriver.buildFilterCondition(
+      moneyColumn,
+      "eq",
+      "99999999999.12345678",
+      1,
+    );
+
+    expect(condition).toEqual({
+      sql: '"col_money" = $1',
+      params: ["99999999999.12345678"],
+    });
+  });
 });

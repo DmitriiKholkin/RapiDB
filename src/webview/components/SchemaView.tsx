@@ -6,10 +6,7 @@ import React, {
   type ReactNode,
 } from "react";
 import type { ColumnMeta, ForeignKeyMeta, IndexMeta } from "../types";
-import {
-  getCategoryPresentation,
-  getStructuralBadgePresentation,
-} from "../types";
+import { getStructuralBadgePresentation } from "../types";
 import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
 
@@ -317,18 +314,6 @@ function ColRow({
         color={presentation.foreground}
         background={presentation.badgeBackground}
         border={presentation.badgeBorder}
-      />,
-    );
-  }
-  if (col.category) {
-    const categoryPresentation = getCategoryPresentation(col.category);
-    badges.push(
-      <Badge
-        key="cat"
-        label={categoryPresentation.label}
-        color={categoryPresentation.foreground}
-        background={categoryPresentation.badgeBackground}
-        border={categoryPresentation.badgeBorder}
       />,
     );
   }

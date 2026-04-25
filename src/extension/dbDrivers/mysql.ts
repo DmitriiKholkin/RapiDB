@@ -1252,6 +1252,14 @@ export class MySQLDriver extends BaseDBDriver {
       column.category === "time" ||
       column.category === "datetime"
     ) {
+      if (baseType === "char") {
+        return this.checkFixedWidthCharPersistedEdit(
+          column,
+          expectedValue,
+          options,
+        );
+      }
+
       return this.checkTextPersistedEdit(column, expectedValue, options);
     }
 

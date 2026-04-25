@@ -523,7 +523,7 @@ function canonicalizeExactNumeric(
 function formatDiagnosticValue(value: unknown): string {
   if (value === null) return "NULL";
   if (value === undefined) return "<missing>";
-  if (typeof value === "string") return value;
+  if (typeof value === "string") return JSON.stringify(value);
   if (typeof value === "number" || typeof value === "boolean") {
     return String(value);
   }
@@ -1252,6 +1252,39 @@ export abstract class BaseDBDriver implements IDBDriver {
       expectedValue,
       options,
       canonicalizeTextPersistedEditValue,
+      `Column "${column.name}" expects a text value.`,
+    );
+  }
+
+  protected checkFixedWidthCharPersistedEdit(
+    column: ColumnTypeMeta,
+    expectedValue: unknown,
+    options?: PersistedEditCheckOptions,
+  ): PersistedEditCheckResult | null {
+    return this.checkNormalizedPersistedEdit(
+      column,
+      expectedValue,
+      options,
+      (value) => {
+        const nullish = canonicalizeNullishPersistedEditValue(value);
+        if (nullish) {
+          return nullish;
+        }
+
+        if (typeof value === "string") {
+          return { canonical: value.trimEnd() };
+        }
+
+        if (
+          typeof value === "number" ||
+          typeof value === "boolean" ||
+          typeof value === "bigint"
+        ) {
+          return { canonical: String(value).trimEnd() };
+        }
+
+        return null;
+      },
       `Column "${column.name}" expects a text value.`,
     );
   }

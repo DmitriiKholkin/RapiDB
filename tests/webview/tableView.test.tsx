@@ -8,7 +8,10 @@ import {
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
+import {
+  type ColumnTypeMeta,
+  NULL_SENTINEL,
+} from "../../src/shared/tableTypes";
 
 vi.mock("@tanstack/react-virtual", () => ({
   useVirtualizer: ({ count }: { count: number }) => ({
@@ -219,6 +222,48 @@ afterEach(() => {
 });
 
 describe("TableView", () => {
+  it("preserves repeated spaces in rendered text cells", async () => {
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({
+          page: 1,
+          pageSize: 25,
+          filters: [],
+          sort: null,
+        }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows: [{ id: 1, name: "wad  23" }],
+        totalCount: 1,
+      });
+    });
+
+    const valueCell = screen.getByText(
+      (_, element) =>
+        element?.textContent === "wad  23" &&
+        element.tagName === "SPAN" &&
+        element.getAttribute("style")?.includes("white-space: break-spaces") ===
+          true,
+    );
+    expect(valueCell.getAttribute("style")).toContain(
+      "white-space: break-spaces",
+    );
+  });
+
   it("requests pages, debounces filter application, and renders filter errors", async () => {
     renderTableView();
 
@@ -576,6 +621,80 @@ describe("TableView", () => {
     expect(getLastPostedMessage()).toEqual({
       type: "deleteRows",
       payload: { primaryKeysList: [{ id: 1 }] },
+    });
+  });
+
+  it("includes only checked fields in insert payload and uses NULL explicitly", async () => {
+    const user = userEvent.setup();
+
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    clearPostedMessages();
+
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+
+    const includeName = screen.getByRole("checkbox", {
+      name: "Include name in insert",
+    });
+    const nameInput = screen.getByLabelText("New value for name");
+    const nullButton = screen.getByRole("button", { name: "NULL" });
+
+    expect((nameInput as HTMLInputElement).disabled).toBe(true);
+    expect((nullButton as HTMLButtonElement).disabled).toBe(true);
+
+    await user.click(includeName);
+
+    expect((nameInput as HTMLInputElement).disabled).toBe(false);
+    expect((nullButton as HTMLButtonElement).disabled).toBe(false);
+
+    await user.click(screen.getByRole("button", { name: "Insert" }));
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "insertRow",
+      payload: { values: { name: "" } },
+    });
+
+    await act(async () => {
+      dispatchIncomingMessage("insertResult", {
+        success: false,
+        error: "Insert failed",
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Insert" })).toBeTruthy();
+    });
+
+    clearPostedMessages();
+
+    await user.click(nullButton);
+    await user.click(screen.getByRole("button", { name: "Insert" }));
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "insertRow",
+      payload: { values: { name: NULL_SENTINEL } },
     });
   });
 

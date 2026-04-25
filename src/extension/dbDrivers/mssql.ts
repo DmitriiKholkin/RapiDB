@@ -1280,6 +1280,14 @@ export class MSSQLDriver extends BaseDBDriver {
       column.category === "time" ||
       column.category === "datetime"
     ) {
+      if (["char", "nchar"].includes(baseType)) {
+        return this.checkFixedWidthCharPersistedEdit(
+          column,
+          expectedValue,
+          options,
+        );
+      }
+
       return this.checkTextPersistedEdit(column, expectedValue, options);
     }
 

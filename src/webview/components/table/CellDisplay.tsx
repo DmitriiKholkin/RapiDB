@@ -91,6 +91,7 @@ export function CellDisplay({
     <span
       style={{
         color: resolvedColor,
+        whiteSpace: "break-spaces",
       }}
     >
       {str}
