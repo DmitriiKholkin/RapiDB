@@ -127,6 +127,11 @@ export interface IDBDriver {
   ): Promise<string>;
   query(sql: string, params?: unknown[]): Promise<QueryResult>;
   runTransaction(operations: TransactionOperation[]): Promise<void>;
+  getMutationAtomicityRisk?(
+    database: string,
+    schema: string,
+    table: string,
+  ): Promise<string | null>;
 
   // ── SQL building helpers ──
   quoteIdentifier(name: string): string;
@@ -157,6 +162,10 @@ export interface IDBDriver {
     value: string | [string, string] | undefined,
     paramIndex: number,
   ): FilterConditionResult | null;
+  buildInsertDefaultValuesSql(
+    qualifiedTableName: string,
+    columns?: readonly ColumnTypeMeta[],
+  ): string;
   buildInsertValueExpr(column: ColumnTypeMeta, paramIndex: number): string;
   buildSetExpr(column: ColumnTypeMeta, paramIndex: number): string;
   materializePreviewSql(sql: string, params?: readonly unknown[]): string;

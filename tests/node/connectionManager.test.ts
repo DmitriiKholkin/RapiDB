@@ -163,6 +163,10 @@ class FakeDriver implements IDBDriver {
     return `$${paramIndex}`;
   }
 
+  buildInsertDefaultValuesSql(qualifiedTableName: string): string {
+    return `INSERT INTO ${qualifiedTableName} DEFAULT VALUES`;
+  }
+
   buildSetExpr(column: ColumnTypeMeta, paramIndex: number): string {
     return `${this.quoteIdentifier(column.name)} = $${paramIndex}`;
   }

@@ -3,6 +3,7 @@ import {
   flexRender,
   getCoreRowModel,
   type ColumnDef as TanColumnDef,
+  type Column as TanStackColumn,
   useReactTable,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -26,15 +27,18 @@ import type {
   ApplyResultPayload,
   TableMutationPreviewPayload,
 } from "../../shared/webviewContracts";
-import type { PendingEdits, Row } from "../types";
-import { type Column, calcColWidths } from "../utils/columnSizing";
+import type { EditTarget, InsertDraftRow, PendingEdits, Row } from "../types";
+import { buildButtonStyle } from "../utils/buttonStyles";
+import {
+  calcColWidths,
+  type Column as WidthColumn,
+} from "../utils/columnSizing";
 import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
 import { MonacoEditor } from "./MonacoEditor";
 import { CellDisplay } from "./table/CellDisplay";
 import { ColumnFilterControl } from "./table/ColumnFilterControl";
 import { EditInput, valueToEditString } from "./table/EditInput";
-import { NewRowForm } from "./table/NewRowForm";
 
 interface Props {
   connectionId: string;
@@ -52,6 +56,7 @@ const HEADER_H = 28;
 const FILTER_H = 30;
 const TOOLBAR_H = 36;
 const PREVIEW_DIALOG_EDITOR_H = "min(42vh, 360px)";
+const INSERT_DEFAULT_SENTINEL = "__RAPIDB_INSERT_DEFAULT__";
 const SR_ONLY_STYLE: React.CSSProperties = {
   position: "absolute",
   width: 1,
@@ -84,40 +89,7 @@ if (
 const btn = (
   v: "primary" | "ghost" | "danger" | "warning" = "ghost",
   disabled = false,
-): React.CSSProperties => ({
-  padding: "3px 10px",
-  fontSize: 12,
-  borderRadius: 2,
-  cursor: disabled ? "default" : "pointer",
-  fontFamily: "inherit",
-  opacity: disabled ? 0.45 : 1,
-  whiteSpace: "nowrap",
-  ...(v === "primary"
-    ? {
-        background: "var(--vscode-button-background)",
-        color: "var(--vscode-button-foreground)",
-        border: "none",
-      }
-    : v === "danger"
-      ? {
-          background:
-            "var(--vscode-inputValidation-errorBackground, rgba(200,50,50,0.2))",
-          color: "var(--vscode-errorForeground)",
-          border:
-            "1px solid var(--vscode-inputValidation-errorBorder, rgba(200,50,50,0.4))",
-        }
-      : v === "warning"
-        ? {
-            background: "rgba(200,150,0,0.15)",
-            color: "var(--vscode-editorWarning-foreground, #cca700)",
-            border: "1px solid rgba(200,150,0,0.4)",
-          }
-        : {
-            background: "transparent",
-            color: "var(--vscode-foreground)",
-            border: "1px solid var(--vscode-panel-border)",
-          }),
-});
+): React.CSSProperties => buildButtonStyle(v, { disabled, size: "sm" });
 
 function canEditColumn(column?: ColumnMeta): column is ColumnMeta {
   return !!column;
@@ -130,6 +102,33 @@ function clonePendingEdits(pendingEdits: PendingEdits): PendingEdits {
       new Map(columnMap),
     ]),
   );
+}
+
+function createInsertDraft(columns: readonly ColumnMeta[]): InsertDraftRow {
+  return Object.fromEntries(
+    columns.map((column) => [
+      column.name,
+      {
+        value: INSERT_DEFAULT_SENTINEL,
+      },
+    ]),
+  );
+}
+
+function buildInsertValues(draft: InsertDraftRow): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(draft)
+      .filter(([, cell]) => cell.value !== INSERT_DEFAULT_SENTINEL)
+      .map(([columnName, cell]) => [columnName, cell.value]),
+  );
+}
+
+function toDraftEditInitialValue(value: unknown): string {
+  if (value === INSERT_DEFAULT_SENTINEL) {
+    return "";
+  }
+
+  return valueToEditString(value);
 }
 
 type PendingRestoreState = Map<string, Map<string, unknown>>;
@@ -365,16 +364,13 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
     useState<FilterDraftMap>({});
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [pendingEdits, setPending] = useState<PendingEdits>(new Map());
-  const [editCell, setEditCell] = useState<{
-    rowIdx: number;
-    col: string;
-  } | null>(null);
+  const [editCell, setEditCell] = useState<EditTarget | null>(null);
   const [applying, setApplying] = useState(false);
   const [applyStatus, setApplyStatus] = useState<{
     tone: "error" | "warning";
     message: string;
   } | null>(null);
-  const [newRow, setNewRow] = useState<Row | null>(null);
+  const [newRow, setNewRow] = useState<InsertDraftRow | null>(null);
   const [inserting, setInserting] = useState(false);
   const [mutErr, setMutErr] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -421,6 +417,12 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
 
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
   const pendingCount = pendingEdits.size;
+  const unsavedRowCount = pendingCount + (newRow ? 1 : 0);
+  const insertValueCount = newRow
+    ? Object.values(newRow).filter(
+        (cell) => cell.value !== INSERT_DEFAULT_SENTINEL,
+      ).length
+    : 0;
   const hasPrimaryKey = pkCols.length > 0;
   const canEditRows = !readOnlyTable && hasPrimaryKey;
   const canSelectAndDeleteRows = !readOnlyTable && hasPrimaryKey;
@@ -468,6 +470,15 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
     });
   }, []);
 
+  const buildPendingUpdatesPayload = useCallback((source: PendingEdits) => {
+    return [...source.entries()].map(([rowIdx, colMap]) => ({
+      primaryKeys: Object.fromEntries(
+        pkColsRef.current.map((k) => [k, rowsRef.current[rowIdx][k]]),
+      ),
+      changes: Object.fromEntries(colMap),
+    }));
+  }, []);
+
   useEffect(() => {
     setReadOnlyTable(isView);
   }, [isView]);
@@ -483,6 +494,9 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
       setColumns(cols);
       setPkCols(primaryKeyColumns);
       setReadOnlyTable(isView);
+      setNewRow(null);
+      setEditCell(null);
+      setMutErr(null);
 
       setInitTick((t) => t + 1);
     });
@@ -496,7 +510,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
         colSizesInitedRef.current = true;
         setColSizes(
           calcColWidths(
-            columnsRef.current.map((c): Column => {
+            columnsRef.current.map((c): WidthColumn => {
               return {
                 name: c.name,
                 isPrimaryKey: c.isPrimaryKey,
@@ -548,9 +562,17 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
 
     const unApply = onMessage<ApplyResultPayload>(
       "applyResult",
-      ({ success, error: e, warning, failedRows, rowOutcomes }) => {
+      ({
+        success,
+        error: e,
+        warning,
+        failedRows,
+        rowOutcomes,
+        insertApplied,
+      }) => {
         setApplying(false);
         if (success) {
+          setNewRow(null);
           const nextPending = getRetainedPendingEdits(
             applyPendingSnapshotRef.current,
             applyRowIndexesRef.current,
@@ -576,10 +598,26 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
           scrollPreserveRef.current = scrollRef.current?.scrollTop ?? null;
           fetchPage();
         } else {
-          pendingRestoreRef.current = null;
+          if (insertApplied) {
+            setNewRow(null);
+            const restoreState = buildPendingRestoreState(
+              pendingEditsRef.current,
+              rowsRef.current,
+              pkColsRef.current,
+            );
+            pendingRestoreRef.current =
+              restoreState.size > 0 ? restoreState : null;
+            scrollPreserveRef.current = scrollRef.current?.scrollTop ?? null;
+            fetchPage();
+          } else {
+            pendingRestoreRef.current = null;
+          }
+
           setApplyStatus({
             tone: "error",
-            message: e ?? "Apply failed — all changes were rolled back",
+            message: insertApplied
+              ? `${e ?? "Apply failed"}. Insert was applied, but update changes were not.`
+              : (e ?? "Apply failed — all changes were rolled back"),
           });
         }
         applyPendingSnapshotRef.current = new Map();
@@ -593,9 +631,21 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
         setInserting(false);
         if (success) {
           setNewRow(null);
+          setEditCell(null);
           setMutErr(null);
+
+          if (applyRowIndexesRef.current.length > 0) {
+            const updates = buildPendingUpdatesPayload(
+              applyPendingSnapshotRef.current,
+            );
+            postMessage("applyChanges", { updates });
+            return;
+          }
+
+          setApplying(false);
           fetchPage();
         } else {
+          setApplying(false);
           setMutErr(e ?? "Insert failed");
         }
       },
@@ -646,7 +696,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
       unConfirm();
       unMutationPreview();
     };
-  }, [fetchPage, isView]);
+  }, [buildPendingUpdatesPayload, fetchPage, isView]);
 
   useEffect(() => {
     if (!initializedRef.current || fetchTrigger === "") return;
@@ -703,26 +753,35 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
   );
 
   const applyChanges = useCallback(() => {
-    if (pendingEdits.size === 0 || applying) {
+    if (unsavedRowCount === 0 || applying) {
       return;
     }
-    setApplying(true);
-    setApplyStatus(null);
+
     applyPendingSnapshotRef.current = clonePendingEdits(pendingEdits);
     applyRowIndexesRef.current = [...pendingEdits.keys()];
-    const updates = [...pendingEdits.entries()].map(([rowIdx, colMap]) => ({
-      primaryKeys: Object.fromEntries(
-        pkColsRef.current.map((k) => [k, rowsRef.current[rowIdx][k]]),
-      ),
-      changes: Object.fromEntries(colMap),
-    }));
-    postMessage("applyChanges", { updates });
-  }, [pendingEdits, applying]);
+
+    setApplying(true);
+    setApplyStatus(null);
+    setMutErr(null);
+    const updates = buildPendingUpdatesPayload(pendingEdits);
+    postMessage("applyChanges", {
+      updates,
+      ...(newRow ? { insertValues: buildInsertValues(newRow) } : {}),
+    });
+  }, [
+    unsavedRowCount,
+    applying,
+    pendingEdits,
+    newRow,
+    buildPendingUpdatesPayload,
+  ]);
 
   const revertChanges = useCallback(() => {
     pendingRestoreRef.current = null;
     setPending(new Map());
+    setNewRow(null);
     setEditCell(null);
+    setMutErr(null);
     setApplyStatus(null);
   }, []);
 
@@ -768,11 +827,37 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
     [],
   );
 
+  const commitDraftCellEdit = useCallback(
+    (column: ColumnMeta, newVal: string) => {
+      setEditCell(null);
+
+      setNewRow((current) => {
+        if (!current) {
+          return current;
+        }
+
+        return {
+          ...current,
+          [column.name]: {
+            ...current[column.name],
+            value: newVal === NULL_SENTINEL ? NULL_SENTINEL : newVal,
+          },
+        };
+      });
+    },
+    [],
+  );
+
   const handleStartEdit = useCallback((rowIdx: number, col: ColumnMeta) => {
     if (!canEditColumn(col)) {
       return;
     }
-    setEditCell({ rowIdx, col: col.name });
+    setEditCell({ kind: "persisted", rowIdx, col: col.name });
+    setApplyStatus(null);
+  }, []);
+
+  const handleStartDraftEdit = useCallback((col: ColumnMeta) => {
+    setEditCell({ kind: "draft", col: col.name });
     setApplyStatus(null);
   }, []);
 
@@ -786,15 +871,6 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
     }
     postMessage("confirmDelete", { count: selectedRef.current.size });
   }, [deleting]);
-
-  const commitNewRow = useCallback(() => {
-    if (!newRow || inserting) {
-      return;
-    }
-    setInserting(true);
-    setMutErr(null);
-    postMessage("insertRow", { values: newRow });
-  }, [newRow, inserting]);
 
   const clearApplyRequestState = useCallback(() => {
     setApplying(false);
@@ -814,6 +890,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
       clearApplyRequestState();
     } else {
       setInserting(false);
+      clearApplyRequestState();
     }
 
     postMessage("cancelMutationPreview", { previewToken });
@@ -938,7 +1015,10 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
 
             const ec = editCellRef.current;
             const pe = pendingEditsRef.current;
-            const isEditing = ec?.rowIdx === rowIdx && ec.col === col.name;
+            const isEditing =
+              ec?.kind === "persisted" &&
+              ec.rowIdx === rowIdx &&
+              ec.col === col.name;
             const pendingRow = pe.get(rowIdx);
             const hasPending = pendingRow?.has(col.name) ?? false;
             const pendingValue = pendingRow?.get(col.name);
@@ -981,8 +1061,10 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
     enableColumnResizing: true,
   });
   const { rows: tableRows } = tanTable.getRowModel();
+  const visibleColumns = tanTable.getVisibleLeafColumns();
+  const hasDraftRow = newRow !== null;
   const virt = useVirtualizer({
-    count: tableRows.length,
+    count: tableRows.length + (hasDraftRow ? 1 : 0),
     getScrollElement: () => scrollRef.current,
     estimateSize: () => ROW_H,
     overscan: 15,
@@ -1102,7 +1184,8 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
               style={btn("primary", busy || !!newRow)}
               disabled={busy || !!newRow}
               onClick={() => {
-                setNewRow({});
+                setNewRow(createInsertDraft(columnsRef.current));
+                setEditCell(null);
                 setMutErr(null);
               }}
             >
@@ -1175,7 +1258,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
       </div>
 
       {}
-      {!readOnlyTable && (pendingCount > 0 || applyStatus) && (
+      {!readOnlyTable && (unsavedRowCount > 0 || applyStatus) && (
         <div
           style={{
             flexShrink: 0,
@@ -1195,16 +1278,17 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
             }`,
           }}
         >
-          {pendingCount > 0 && applyStatus?.tone !== "error" && (
+          {unsavedRowCount > 0 && applyStatus?.tone !== "error" && (
             <span
               style={{
                 fontSize: 12,
                 color: "var(--vscode-editorWarning-foreground, #cca700)",
+                flex: 1,
               }}
             >
               <Icon name="edit" size={12} style={{ marginRight: 4 }} />
-              {pendingCount} row{pendingCount !== 1 ? "s" : ""} with unsaved
-              changes
+              {unsavedRowCount} row{unsavedRowCount !== 1 ? "s" : ""} with
+              unsaved changes
             </span>
           )}
           {applyStatus && (
@@ -1222,27 +1306,32 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
               {applyStatus.message}
             </span>
           )}
-          {pendingCount > 0 && (
+          {unsavedRowCount > 0 && (
             <>
               <button
                 type="button"
-                style={btn("warning", applying)}
-                disabled={applying}
+                style={btn("warning", applying || inserting)}
+                disabled={applying || inserting}
+                title={
+                  newRow && insertValueCount === 0
+                    ? "Apply insert with database defaults, then updates"
+                    : undefined
+                }
                 onClick={applyChanges}
               >
                 {applying ? "Applying…" : "Apply Changes"}
               </button>
               <button
                 type="button"
-                style={btn("ghost", applying)}
-                disabled={applying}
+                style={btn("ghost", applying || inserting)}
+                disabled={applying || inserting}
                 onClick={revertChanges}
               >
                 Revert All
               </button>
             </>
           )}
-          {applyStatus && pendingCount === 0 && (
+          {applyStatus && unsavedRowCount === 0 && (
             <button
               type="button"
               style={btn("ghost")}
@@ -1289,18 +1378,6 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
             <Icon name="close" size={13} />
           </button>
         </div>
-      )}
-
-      {}
-      {!readOnlyTable && newRow && (
-        <NewRowForm
-          columns={columns}
-          newRow={newRow}
-          setNewRow={setNewRow}
-          inserting={inserting}
-          onInsert={commitNewRow}
-          onCancel={() => setNewRow(null)}
-        />
       )}
 
       {}
@@ -1477,18 +1554,40 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
               </tr>
             )}
             {virtItems.map((vRow) => {
-              const row = tableRows[vRow.index];
-              const isSelected = selected.has(vRow.index);
+              if (hasDraftRow && vRow.index === 0) {
+                return (
+                  <DraftTableRow
+                    key={vRow.key}
+                    columns={columns}
+                    visibleColumns={visibleColumns}
+                    draft={newRow}
+                    editingCol={
+                      editCell?.kind === "draft" ? editCell.col : null
+                    }
+                    onStartEdit={handleStartDraftEdit}
+                    onCommit={commitDraftCellEdit}
+                    onCancelEdit={() => setEditCell(null)}
+                  />
+                );
+              }
+
+              const persistedIndex = hasDraftRow ? vRow.index - 1 : vRow.index;
+              const row = tableRows[persistedIndex];
+              const isSelected = selected.has(persistedIndex);
               const editingCol =
-                editCell?.rowIdx === vRow.index ? editCell.col : null;
+                editCell?.kind === "persisted" &&
+                editCell.rowIdx === persistedIndex
+                  ? editCell.col
+                  : null;
 
               return (
                 <TableRow
                   key={vRow.key}
                   row={row}
-                  index={vRow.index}
+                  visualIndex={vRow.index}
+                  rowIndex={persistedIndex}
                   isSelected={isSelected}
-                  pendingCols={pendingEdits.get(vRow.index)}
+                  pendingCols={pendingEdits.get(persistedIndex)}
                   columnsMap={columnsMap}
                   editingCol={editingCol}
                   onStartEdit={handleStartEdit}
@@ -1510,7 +1609,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
               })()}
           </tbody>
         </table>
-        {!loading && rows.length === 0 && (
+        {!loading && rows.length === 0 && !hasDraftRow && (
           <div
             style={{
               display: "flex",
@@ -1919,7 +2018,8 @@ function MutationPreviewDialog({
 
 const TableRow = React.memo(function TableRow({
   row,
-  index,
+  visualIndex,
+  rowIndex,
   isSelected,
   pendingCols,
   columnsMap,
@@ -1927,7 +2027,8 @@ const TableRow = React.memo(function TableRow({
   onStartEdit,
 }: {
   row: ReturnType<ReturnType<typeof useReactTable>["getRowModel"]>["rows"][0];
-  index: number;
+  visualIndex: number;
+  rowIndex: number;
   isSelected: boolean;
   pendingCols?: Map<string, unknown>;
 
@@ -1939,7 +2040,7 @@ const TableRow = React.memo(function TableRow({
   return (
     <tr
       className="rdb-trow"
-      data-even={String(index % 2 === 0)}
+      data-even={String(visualIndex % 2 === 0)}
       data-editing-col={editingCol ?? ""}
       data-selected={String(isSelected)}
       style={{
@@ -1982,11 +2083,140 @@ const TableRow = React.memo(function TableRow({
             title={isPk ? `PK: ${String(cell.getValue())}` : undefined}
             onDoubleClick={() => {
               if (colDef && !isSel && canEditColumn(colDef)) {
-                onStartEdit(index, colDef);
+                onStartEdit(rowIndex, colDef);
               }
             }}
           >
             {flexRender(cell.column.columnDef.cell, cell.getContext())}
+          </td>
+        );
+      })}
+    </tr>
+  );
+});
+
+const DraftTableRow = React.memo(function DraftTableRow({
+  columns,
+  visibleColumns,
+  draft,
+  editingCol,
+  onStartEdit,
+  onCommit,
+  onCancelEdit,
+}: {
+  columns: readonly ColumnMeta[];
+  visibleColumns: readonly TanStackColumn<Row, unknown>[];
+  draft: InsertDraftRow;
+  editingCol: string | null;
+  onStartEdit: (col: ColumnMeta) => void;
+  onCommit: (column: ColumnMeta, value: string) => void;
+  onCancelEdit: () => void;
+}) {
+  const columnsMap = useMemo(
+    () => new Map(columns.map((column) => [column.name, column])),
+    [columns],
+  );
+
+  return (
+    <tr className="rdb-trow" data-even="true" data-selected="false">
+      {visibleColumns.map((column) => {
+        const colId = column.id;
+        const colDef = columnsMap.get(colId);
+        const isSelectionColumn = colId === "__sel";
+
+        if (isSelectionColumn || !colDef) {
+          return (
+            <td
+              key={colId}
+              style={{
+                width: column.getSize(),
+                height: ROW_H,
+                padding: "0 6px",
+                textAlign: "center",
+                border: "1px solid var(--vscode-panel-border)",
+                boxSizing: "border-box",
+                background: "rgba(200, 150, 0, 0.23)",
+              }}
+            />
+          );
+        }
+
+        const draftCell = draft[colId] ?? {
+          value: INSERT_DEFAULT_SENTINEL,
+        };
+        const isEditing = editingCol === colId;
+        const isDefault = draftCell.value === INSERT_DEFAULT_SENTINEL;
+        const displayValue =
+          draftCell.value === NULL_SENTINEL ? null : draftCell.value;
+
+        return (
+          <td
+            key={colId}
+            style={{
+              width: column.getSize(),
+              height: ROW_H,
+              padding: isEditing ? "0" : "0 0 0 8px",
+              textAlign: isNumericCategory(colDef.category) ? "right" : "left",
+              border: "1px solid var(--vscode-panel-border)",
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              boxSizing: "border-box",
+              verticalAlign: "middle",
+              cursor: "pointer",
+              userSelect: "none",
+              background: "rgba(200, 150, 0, 0.23)",
+            }}
+            onDoubleClick={() => onStartEdit(colDef)}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                width: "100%",
+                height: "100%",
+              }}
+            >
+              <div
+                style={{
+                  minWidth: 0,
+                  flex: 1,
+                  height: "100%",
+                  display: "flex",
+                  alignItems: "center",
+                }}
+              >
+                {isEditing ? (
+                  <EditInput
+                    initial={toDraftEditInitialValue(draftCell.value)}
+                    nullable={colDef.nullable}
+                    category={colDef.category}
+                    suppressPlaceholder
+                    showDefaultButton
+                    onSetDefault={() =>
+                      onCommit(colDef, INSERT_DEFAULT_SENTINEL)
+                    }
+                    onCommit={(value) => onCommit(colDef, value)}
+                    onCancel={onCancelEdit}
+                  />
+                ) : isDefault ? (
+                  <span
+                    style={{
+                      fontStyle: "italic",
+                      opacity: 0.65,
+                    }}
+                  >
+                    DEFAULT
+                  </span>
+                ) : (
+                  <CellDisplay
+                    value={displayValue}
+                    isPending
+                    category={colDef.category}
+                  />
+                )}
+              </div>
+            </div>
           </td>
         );
       })}

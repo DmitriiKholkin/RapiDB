@@ -883,6 +883,14 @@ export abstract class BaseDBDriver implements IDBDriver {
   abstract query(sql: string, params?: unknown[]): Promise<QueryResult>;
   abstract runTransaction(operations: TransactionOperation[]): Promise<void>;
 
+  async getMutationAtomicityRisk(
+    _database: string,
+    _schema: string,
+    _table: string,
+  ): Promise<string | null> {
+    return null;
+  }
+
   // ── Abstract: each driver maps its native types to TypeCategory ──
   abstract mapTypeCategory(nativeType: string): TypeCategory;
 
@@ -985,6 +993,13 @@ export abstract class BaseDBDriver implements IDBDriver {
       });
     if (pkCols.length === 0) return "";
     return `ORDER BY ${pkCols.map((c) => this.quoteIdentifier(c.name)).join(", ")}`;
+  }
+
+  buildInsertDefaultValuesSql(
+    qualifiedTableName: string,
+    _columns?: readonly ColumnTypeMeta[],
+  ): string {
+    return `INSERT INTO ${qualifiedTableName} DEFAULT VALUES`;
   }
 
   buildInsertValueExpr(_column: ColumnTypeMeta, _paramIndex: number): string {

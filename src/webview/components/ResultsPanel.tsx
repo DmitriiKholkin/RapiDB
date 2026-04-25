@@ -10,6 +10,7 @@ import {
 import { useVirtualizer } from "@tanstack/react-virtual";
 import React, { useCallback, useMemo, useRef, useState } from "react";
 import type { QueryResult, QueryStatus } from "../store";
+import { buildButtonStyle } from "../utils/buttonStyles";
 import { type Column, calcColWidths } from "../utils/columnSizing";
 import { postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
@@ -507,16 +508,13 @@ function ToolbarBtn({
       onMouseEnter={() => setHov(true)}
       onMouseLeave={() => setHov(false)}
       style={{
-        padding: "2px 8px",
+        ...buildButtonStyle("ghost", { size: "sm" }),
+        height: 22,
+        padding: "0 8px",
         fontSize: 11,
         background: hov
           ? "var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground))"
           : "transparent",
-        color: "var(--vscode-foreground)",
-        border: "1px solid var(--vscode-panel-border)",
-        borderRadius: 2,
-        cursor: "pointer",
-        fontFamily: "inherit",
       }}
     >
       {children}

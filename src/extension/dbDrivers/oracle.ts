@@ -1616,6 +1616,22 @@ export class OracleDriver extends BaseDBDriver {
     };
   }
 
+  override buildInsertDefaultValuesSql(
+    qualifiedTableName: string,
+    columns?: readonly ColumnTypeMeta[],
+  ): string {
+    if (!columns || columns.length === 0) {
+      return `INSERT INTO ${qualifiedTableName} DEFAULT VALUES`;
+    }
+
+    const columnNames = columns.map((column) =>
+      this.quoteIdentifier(column.name),
+    );
+    const defaults = columns.map(() => "DEFAULT");
+
+    return `INSERT INTO ${qualifiedTableName} (${columnNames.join(", ")}) VALUES (${defaults.join(", ")})`;
+  }
+
   override buildInsertValueExpr(
     _column: ColumnTypeMeta,
     paramIndex: number,

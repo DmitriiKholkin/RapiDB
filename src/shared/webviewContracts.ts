@@ -29,6 +29,7 @@ export interface ApplyResultPayload {
   warning?: string;
   failedRows?: number[];
   rowOutcomes?: ApplyRowOutcome[];
+  insertApplied?: boolean;
 }
 
 export interface QueryInitialState {
@@ -129,7 +130,10 @@ export type TablePanelMessage =
     >
   | WebviewMessageEnvelope<
       "applyChanges",
-      { updates?: RowUpdateMessagePayload[] }
+      {
+        updates?: RowUpdateMessagePayload[];
+        insertValues?: Record<string, unknown>;
+      }
     >
   | WebviewMessageEnvelope<"insertRow", { values?: Record<string, unknown> }>
   | WebviewMessageEnvelope<
@@ -530,6 +534,7 @@ export function parseTablePanelMessage(
         return null;
       }
       const updates = envelope.payload.updates;
+      const insertValues = envelope.payload.insertValues;
       if (
         updates !== undefined &&
         (!Array.isArray(updates) ||
@@ -537,9 +542,15 @@ export function parseTablePanelMessage(
       ) {
         return null;
       }
+      if (insertValues !== undefined && !isRecord(insertValues)) {
+        return null;
+      }
       return {
         type: envelope.type,
-        payload: { updates: updates as RowUpdateMessagePayload[] | undefined },
+        payload: {
+          updates: updates as RowUpdateMessagePayload[] | undefined,
+          insertValues: insertValues as Record<string, unknown> | undefined,
+        },
       };
     }
 

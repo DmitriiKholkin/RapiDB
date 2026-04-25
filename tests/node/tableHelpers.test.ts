@@ -103,6 +103,8 @@ const fakeDriver: IDBDriver = {
         : `${column.name} ${operator} $${paramIndex}`,
     params: value === undefined ? [] : Array.isArray(value) ? value : [value],
   }),
+  buildInsertDefaultValuesSql: (qualifiedTableName: string) =>
+    `INSERT INTO ${qualifiedTableName} DEFAULT VALUES`,
   buildInsertValueExpr: (_column, paramIndex) => `$${paramIndex}`,
   buildSetExpr: (column, paramIndex) => `"${column.name}" = $${paramIndex}`,
   materializePreviewSql: (sql, params = []) => `${sql} -- ${params.join(",")}`,
@@ -145,6 +147,60 @@ describe("table helpers", () => {
       'INSERT INTO public.fixture_rows ("id", "display_name", "amount") VALUES ($1, $2, $3)',
     );
     expect(operation.params).toEqual([99, "Gamma", "10.25"]);
+  });
+
+  it("builds a default-values insert operation when no fields are provided", () => {
+    const operation = buildInsertRowOperation(
+      fakeDriver,
+      "main",
+      "public",
+      "fixture_rows",
+      {},
+      columns,
+    );
+
+    expect(operation.sql).toBe(
+      "INSERT INTO public.fixture_rows DEFAULT VALUES",
+    );
+    expect(operation.params).toEqual([]);
+  });
+
+  it("builds Oracle-safe default-only insert SQL using explicit DEFAULT expressions", () => {
+    const oracleLikeDriver: IDBDriver = {
+      ...fakeDriver,
+      quoteIdentifier: (name: string) => `"${name}"`,
+      qualifiedTableName: (_database: string, schema: string, table: string) =>
+        `"${schema}"."${table}"`,
+      buildInsertDefaultValuesSql: (
+        qualifiedTableName: string,
+        tableColumns?: readonly ColumnTypeMeta[],
+      ) => {
+        if (!tableColumns || tableColumns.length === 0) {
+          return `INSERT INTO ${qualifiedTableName} DEFAULT VALUES`;
+        }
+
+        const columnNames = tableColumns.map((column) => `"${column.name}"`);
+        const defaults = tableColumns.map(() => "DEFAULT");
+
+        return `INSERT INTO ${qualifiedTableName} (${columnNames.join(", ")}) VALUES (${defaults.join(", ")})`;
+      },
+      buildInsertValueExpr: (_column, paramIndex) => `:${paramIndex}`,
+      buildSetExpr: (column, paramIndex) => `"${column.name}" = :${paramIndex}`,
+    };
+
+    const operation = buildInsertRowOperation(
+      oracleLikeDriver,
+      "main",
+      "PUBLIC",
+      "fixture_rows",
+      {},
+      columns,
+    );
+
+    expect(operation.sql).toBe(
+      'INSERT INTO "PUBLIC"."fixture_rows" ("id", "display_name", "amount") VALUES (DEFAULT, DEFAULT, DEFAULT)',
+    );
+    expect(operation.params).toEqual([]);
   });
 
   it("prepares preview SQL without prevalidation blocking and keeps key edits", () => {

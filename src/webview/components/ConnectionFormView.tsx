@@ -18,6 +18,11 @@ import type {
   ConnectionFormExistingState,
   ConnectionFormSubmission,
 } from "../../shared/webviewContracts";
+import { buildButtonStyle } from "../utils/buttonStyles";
+import {
+  buildSelectControlStyle,
+  buildTextInputStyle,
+} from "../utils/controlStyles";
 import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
 
@@ -26,57 +31,13 @@ interface Props {
 }
 
 const s = {
-  input: {
-    width: "100%",
-    padding: "5px 8px",
-    fontSize: "13px",
-    background: "var(--vscode-input-background)",
-    color: "var(--vscode-input-foreground)",
-    borderWidth: 1,
-    borderStyle: "solid",
-    borderColor: "var(--vscode-input-border, var(--vscode-widget-border))",
-    borderRadius: 2,
-    outline: "none",
-    fontFamily: "inherit",
-  } as CSSProperties,
+  input: buildTextInputStyle("md") as CSSProperties,
   label: {
     display: "block",
     fontSize: "11px",
     fontWeight: 500,
     marginBottom: 4,
     opacity: 0.8,
-  } as CSSProperties,
-  btnPrimary: {
-    padding: "5px 14px",
-    fontSize: "13px",
-    background: "var(--vscode-button-background)",
-    color: "var(--vscode-button-foreground)",
-    border: "none",
-    borderRadius: 2,
-    cursor: "pointer",
-    fontFamily: "inherit",
-  } as CSSProperties,
-  btnSecondary: {
-    padding: "5px 14px",
-    fontSize: "13px",
-    background: "var(--vscode-button-secondaryBackground, transparent)",
-    color: "var(--vscode-button-secondaryForeground, var(--vscode-foreground))",
-    border:
-      "1px solid var(--vscode-button-border, var(--vscode-widget-border))",
-    borderRadius: 2,
-    cursor: "pointer",
-    fontFamily: "inherit",
-  } as CSSProperties,
-  btnGhost: {
-    padding: "5px 14px",
-    fontSize: "13px",
-    background: "transparent",
-    color: "var(--vscode-foreground)",
-    border: "none",
-    borderRadius: 2,
-    cursor: "pointer",
-    opacity: 0.7,
-    fontFamily: "inherit",
   } as CSSProperties,
 };
 
@@ -86,8 +47,7 @@ function FocusInput(props: InputHTMLAttributes<HTMLInputElement>) {
     <input
       {...props}
       style={{
-        ...s.input,
-        ...(focused ? { borderColor: "var(--vscode-focusBorder)" } : {}),
+        ...buildTextInputStyle("md", focused),
         ...(props.style ?? {}),
       }}
       onFocus={(e) => {
@@ -108,8 +68,7 @@ function FocusSelect(props: SelectHTMLAttributes<HTMLSelectElement>) {
     <select
       {...props}
       style={{
-        ...s.input,
-        ...(focused ? { borderColor: "var(--vscode-focusBorder)" } : {}),
+        ...buildSelectControlStyle("md", focused),
         ...(props.style ?? {}),
       }}
       onFocus={(e) => {
@@ -677,12 +636,10 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       >
         <button
           type="button"
-          style={{
-            ...s.btnPrimary,
-            ...(!name.trim() || saving
-              ? { opacity: 0.5, cursor: "default" }
-              : {}),
-          }}
+          style={buildButtonStyle("primary", {
+            disabled: !name.trim() || saving,
+            size: "md",
+          })}
           disabled={!name.trim() || saving}
           onClick={handleSave}
         >
@@ -690,12 +647,10 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
         </button>
         <button
           type="button"
-          style={{
-            ...s.btnSecondary,
-            ...(testState === "testing"
-              ? { opacity: 0.5, cursor: "default" }
-              : {}),
-          }}
+          style={buildButtonStyle("secondary", {
+            disabled: testState === "testing",
+            size: "md",
+          })}
           disabled={testState === "testing"}
           onClick={handleTest}
         >
@@ -703,7 +658,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
         </button>
         <button
           type="button"
-          style={s.btnGhost}
+          style={buildButtonStyle("ghost", { size: "md" })}
           onClick={() => postMessage("cancel")}
         >
           Cancel

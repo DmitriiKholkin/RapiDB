@@ -288,10 +288,11 @@ export class TablePanel {
   private async _handleApplyChanges(
     payload: {
       updates?: import("../../shared/webviewContracts").RowUpdateMessagePayload[];
+      insertValues?: Record<string, unknown>;
     },
     send: (type: string, payload: unknown) => Thenable<boolean>,
   ): Promise<void> {
-    const { updates } = payload;
+    const { updates, insertValues } = payload;
     try {
       const prepared = prepareApplyChangesPlan(
         this.connectionManager,
@@ -303,7 +304,38 @@ export class TablePanel {
         this.cachedColumns,
       );
 
-      if (!prepared.executable) {
+      const insertPlan =
+        insertValues !== undefined
+          ? await this.svc.prepareInsertRow(
+              this.connectionId,
+              this.database,
+              this.schema,
+              this.table,
+              insertValues,
+            )
+          : null;
+
+      const mutationStatementCount =
+        (insertPlan ? 1 : 0) +
+        (prepared.executable ? prepared.plan.operations.length : 0);
+      if (mutationStatementCount > 1) {
+        const driver = this.connectionManager.getDriver(this.connectionId);
+        const risk = await driver?.getMutationAtomicityRisk?.(
+          this.database,
+          this.schema,
+          this.table,
+        );
+
+        if (risk) {
+          send("applyResult", {
+            success: false,
+            error: risk,
+          });
+          return;
+        }
+      }
+
+      if (!prepared.executable && !insertPlan) {
         if (prepared.result.warning) {
           void vscode.window.showWarningMessage(
             `[RapiDB] ${prepared.result.warning}`,
@@ -315,7 +347,11 @@ export class TablePanel {
 
       await send(
         "tableMutationPreview",
-        this.previewController.createApplyChangesPreview(prepared.plan),
+        this.previewController.createApplyChangesPreview({
+          apply: prepared.executable ? prepared.plan : null,
+          applyResultWhenEmpty: prepared.executable ? null : prepared.result,
+          insert: insertPlan,
+        }),
       );
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);

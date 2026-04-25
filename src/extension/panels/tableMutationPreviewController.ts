@@ -16,7 +16,11 @@ import { formatMutationPreviewSql } from "../utils/mutationPreview";
 type PendingTableMutationPreview =
   | {
       kind: "applyChanges";
-      plan: PreparedApplyPlan;
+      plan: {
+        apply: PreparedApplyPlan | null;
+        applyResultWhenEmpty: ApplyResultPayload | null;
+        insert: PreparedInsertPlan | null;
+      };
     }
   | {
       kind: "insertRow";
@@ -71,9 +75,11 @@ export class TableMutationPreviewController {
     this.pendingMutationPreviews.clear();
   }
 
-  createApplyChangesPreview(
-    plan: PreparedApplyPlan,
-  ): TableMutationPreviewPayload {
+  createApplyChangesPreview(plan: {
+    apply: PreparedApplyPlan | null;
+    applyResultWhenEmpty: ApplyResultPayload | null;
+    insert: PreparedInsertPlan | null;
+  }): TableMutationPreviewPayload {
     return this.storePreview({ kind: "applyChanges", plan });
   }
 
@@ -92,18 +98,47 @@ export class TableMutationPreviewController {
     this.pendingMutationPreviews.delete(previewToken);
 
     if (preview.kind === "applyChanges") {
-      const result: ApplyResultPayload = await executePreparedApplyPlan(
-        this.connectionManager,
-        preview.plan,
-      );
+      let insertApplied = false;
 
-      if (result.warning) {
-        this.notifyWarning(result.warning);
+      if (preview.plan.insert) {
+        try {
+          await this.tableDataService.executePreparedInsertPlan(
+            preview.plan.insert,
+          );
+          insertApplied = true;
+        } catch (error: unknown) {
+          const normalized = normalizeUnknownError(error);
+          return {
+            type: "applyResult",
+            payload: {
+              success: false,
+              error: normalized.message,
+            },
+          };
+        }
+      }
+
+      const result: ApplyResultPayload = preview.plan.apply
+        ? await executePreparedApplyPlan(
+            this.connectionManager,
+            preview.plan.apply,
+          )
+        : (preview.plan.applyResultWhenEmpty ?? {
+            success: true,
+            rowOutcomes: [],
+          });
+
+      const payload: ApplyResultPayload = insertApplied
+        ? { ...result, insertApplied: true }
+        : result;
+
+      if (payload.warning) {
+        this.notifyWarning(payload.warning);
       }
 
       return {
         type: "applyResult",
-        payload: result,
+        payload,
       };
     }
 
@@ -144,7 +179,13 @@ export class TableMutationPreviewController {
     const connectionType = this.connectionManager.getConnection(
       this.connectionId,
     )?.type;
-    const previewStatements = preview.plan.previewStatements;
+    const previewStatements =
+      preview.kind === "applyChanges"
+        ? [
+            ...(preview.plan.insert?.previewStatements ?? []),
+            ...(preview.plan.apply?.previewStatements ?? []),
+          ]
+        : preview.plan.previewStatements;
     const title =
       preview.kind === "applyChanges"
         ? `Apply changes to ${this.tableName}`

@@ -18,9 +18,10 @@ export function buildInsertRowOperation(
   const entries = writableEntries(values, colMap);
 
   if (entries.length === 0) {
-    throw new Error(
-      "Insert failed: no values provided. Fill in at least one field or explicitly set a field to NULL.",
-    );
+    return {
+      sql: buildDefaultValuesInsertSql(drv, qt, cols),
+      params: [],
+    };
   }
 
   const columnNames: string[] = [];
@@ -48,4 +49,12 @@ export function buildInsertRowOperation(
     sql: `INSERT INTO ${qt} (${columnNames.join(", ")}) VALUES (${valueExpressions.join(", ")})`,
     params,
   };
+}
+
+function buildDefaultValuesInsertSql(
+  drv: IDBDriver,
+  qualifiedTable: string,
+  columns: readonly ColumnTypeMeta[],
+): string {
+  return drv.buildInsertDefaultValuesSql(qualifiedTable, columns);
 }

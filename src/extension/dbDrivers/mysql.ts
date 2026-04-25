@@ -992,6 +992,42 @@ export class MySQLDriver extends BaseDBDriver {
     }
   }
 
+  override async getMutationAtomicityRisk(
+    database: string,
+    _schema: string,
+    table: string,
+  ): Promise<string | null> {
+    const rows = await this.queryObjectRows<
+      RowDataPacket & { ENGINE: string | null }
+    >(
+      `SELECT ENGINE
+       FROM information_schema.TABLES
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+       LIMIT 1`,
+      [database, table],
+    );
+
+    const engine = (rows[0]?.ENGINE ?? "").toUpperCase();
+    if (!engine) {
+      return null;
+    }
+
+    const nonTransactionalEngines = new Set([
+      "MYISAM",
+      "MEMORY",
+      "CSV",
+      "ARCHIVE",
+      "MRG_MYISAM",
+      "ISAM",
+    ]);
+
+    if (!nonTransactionalEngines.has(engine)) {
+      return null;
+    }
+
+    return `Table \`${database}\`.\`${table}\` uses the non-transactional MySQL engine ${engine}. Multi-row apply operations are blocked to avoid partial writes. Convert the table to InnoDB or apply rows one by one.`;
+  }
+
   // ─── MySQL type system ───
 
   mapTypeCategory(nativeType: string): TypeCategory {
@@ -1095,6 +1131,13 @@ export class MySQLDriver extends BaseDBDriver {
     return database
       ? `${this.quoteIdentifier(database)}.${this.quoteIdentifier(table)}`
       : this.quoteIdentifier(table);
+  }
+
+  override buildInsertDefaultValuesSql(
+    qualifiedTableName: string,
+    _columns?: readonly ColumnTypeMeta[],
+  ): string {
+    return `INSERT INTO ${qualifiedTableName} () VALUES ()`;
   }
 
   protected override coerceBooleanTrue(): unknown {

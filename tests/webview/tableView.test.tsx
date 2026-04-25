@@ -358,6 +358,57 @@ describe("TableView", () => {
     expect(screen.queryByText("Bad filter expression")).toBeNull();
   });
 
+  it("treats reopened NULL cell as empty unless NULL is clicked again", async () => {
+    const user = userEvent.setup();
+
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows: [{ id: 1, name: null }],
+        totalCount: 1,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("NULL")).toBeTruthy();
+    });
+
+    const nullCell = screen.getByText("NULL").closest("td");
+    if (!(nullCell instanceof HTMLTableCellElement)) {
+      throw new Error("Expected NULL cell to be rendered");
+    }
+
+    fireEvent.doubleClick(nullCell);
+    const editInput = screen.getByLabelText("Cell value");
+    fireEvent.blur(editInput);
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "applyChanges",
+      payload: {
+        updates: [{ primaryKeys: { id: 1 }, changes: { name: "" } }],
+      },
+    });
+  });
+
   it("retains failed edits across previewed apply flows", async () => {
     const user = userEvent.setup();
 
@@ -381,6 +432,7 @@ describe("TableView", () => {
     fireEvent.doubleClick(aliceCell);
 
     const editInput = screen.getByLabelText("Cell value");
+    expect((editInput as HTMLInputElement).placeholder).toBe("");
     await user.clear(editInput);
     await user.type(editInput, "Alicia");
     fireEvent.blur(editInput);
@@ -624,7 +676,7 @@ describe("TableView", () => {
     });
   });
 
-  it("includes only checked fields in insert payload and uses NULL explicitly", async () => {
+  it("supports insert with all DEFAULT fields and explicit draft edits", async () => {
     const user = userEvent.setup();
 
     renderTableView();
@@ -655,47 +707,405 @@ describe("TableView", () => {
 
     await user.click(screen.getByRole("button", { name: "Add Row" }));
 
-    const includeName = screen.getByRole("checkbox", {
-      name: "Include name in insert",
-    });
-    const nameInput = screen.getByLabelText("New value for name");
-    const nullButton = screen.getByRole("button", { name: "NULL" });
+    expect(
+      (screen.getByRole("button", { name: "Add Row" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
 
-    expect((nameInput as HTMLInputElement).disabled).toBe(true);
-    expect((nullButton as HTMLButtonElement).disabled).toBe(true);
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply Changes",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
 
-    await user.click(includeName);
+    const table = screen.getByRole("table");
+    const bodyRows = Array.from(table.querySelectorAll("tbody > tr"));
+    expect(bodyRows[0]?.textContent ?? "").not.toContain("Alice");
+    expect(bodyRows[1]?.textContent ?? "").toContain("Alice");
+    expect(bodyRows[2]?.textContent ?? "").toContain("Bob");
 
-    expect((nameInput as HTMLInputElement).disabled).toBe(false);
-    expect((nullButton as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByLabelText(/Include .* in insert/i)).toBeNull();
 
-    await user.click(screen.getByRole("button", { name: "Insert" }));
+    const tableEl = screen.getByRole("table");
+    const headerCells = Array.from(
+      tableEl.querySelectorAll("thead tr:first-child th"),
+    );
+    const nameColumnIndex = headerCells.findIndex((cell) =>
+      (cell.textContent ?? "").includes("name"),
+    );
+    if (nameColumnIndex < 0) {
+      throw new Error("Expected name column header");
+    }
+
+    const draftRow = tableEl.querySelector("tbody tr");
+    const nameCell = draftRow?.querySelectorAll("td")[nameColumnIndex] ?? null;
+    if (!(nameCell instanceof HTMLTableCellElement)) {
+      throw new Error("Expected inline draft cell");
+    }
+
+    expect(nameCell.textContent ?? "").toContain("DEFAULT");
+
+    expect(nameCell.style.background).toContain("rgba(200, 150, 0, 0.23)");
+
+    fireEvent.doubleClick(nameCell);
+
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply Changes",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
+
+    expect(screen.getByLabelText("Cell value")).toBeTruthy();
+    expect(
+      (screen.getByLabelText("Cell value") as HTMLInputElement).placeholder,
+    ).toBe("");
+    expect(screen.getByRole("button", { name: "DEF" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "NULL" })).toBeTruthy();
+
+    fireEvent.keyDown(screen.getByLabelText("Cell value"), { key: "Enter" });
+
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply Changes",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
+
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
 
     expect(getLastPostedMessage()).toEqual({
-      type: "insertRow",
-      payload: { values: { name: "" } },
+      type: "applyChanges",
+      payload: { updates: [], insertValues: { name: "" } },
     });
 
     await act(async () => {
-      dispatchIncomingMessage("insertResult", {
+      dispatchIncomingMessage("applyResult", {
         success: false,
         error: "Insert failed",
       });
     });
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: "Insert" })).toBeTruthy();
+      expect(
+        screen.getByRole("button", { name: "Apply Changes" }),
+      ).toBeTruthy();
     });
 
     clearPostedMessages();
 
-    await user.click(nullButton);
-    await user.click(screen.getByRole("button", { name: "Insert" }));
+    fireEvent.doubleClick(nameCell);
+    await user.click(screen.getByRole("button", { name: "DEF" }));
+
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply Changes",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
+
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
 
     expect(getLastPostedMessage()).toEqual({
-      type: "insertRow",
-      payload: { values: { name: NULL_SENTINEL } },
+      type: "applyChanges",
+      payload: { updates: [], insertValues: {} },
     });
+
+    await act(async () => {
+      dispatchIncomingMessage("applyResult", {
+        success: false,
+        error: "Insert failed",
+      });
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: "Apply Changes" }),
+      ).toBeTruthy();
+    });
+
+    clearPostedMessages();
+
+    fireEvent.doubleClick(nameCell);
+    await user.click(screen.getByRole("button", { name: "NULL" }));
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "applyChanges",
+      payload: { updates: [], insertValues: { name: NULL_SENTINEL } },
+    });
+  });
+
+  it("restores normal toolbar state after reverting inline insert mode", async () => {
+    const user = userEvent.setup();
+
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Alice")).toBeTruthy();
+    });
+
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    await user.click(screen.getByRole("button", { name: "Revert All" }));
+
+    expect(screen.getByRole("button", { name: "Add Row" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Apply Changes" })).toBeNull();
+
+    const table = screen.getByRole("table");
+    const bodyRows = Array.from(table.querySelectorAll("tbody > tr"));
+    expect(bodyRows[0]?.textContent ?? "").toContain("Alice");
+  });
+
+  it("exits inline insert mode safely when a new table schema is initialized", async () => {
+    const user = userEvent.setup();
+
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    expect(screen.getByRole("button", { name: "Apply Changes" })).toBeTruthy();
+
+    dispatchIncomingMessage("tableInit", {
+      columns: noPkColumns,
+      primaryKeyColumns: [],
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Add Row" })).toBeTruthy();
+    });
+
+    expect(screen.queryByRole("button", { name: "Apply Changes" })).toBeNull();
+  });
+
+  it("keeps persisted row selection indexes stable while draft row is visible", async () => {
+    const user = userEvent.setup();
+
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Select row 1")).toBeTruthy();
+    });
+
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    await user.click(screen.getByLabelText("Select row 1"));
+
+    clearPostedMessages();
+
+    await user.click(screen.getByRole("button", { name: "Delete (1)" }));
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "confirmDelete",
+      payload: { count: 1 },
+    });
+
+    await act(async () => {
+      dispatchIncomingMessage("deleteConfirmed", { confirmed: true });
+    });
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "deleteRows",
+      payload: { primaryKeysList: [{ id: 1 }] },
+    });
+  });
+
+  it("combines insert draft with pending edits in shared unsaved state", async () => {
+    const user = userEvent.setup();
+
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    const aliceCell = screen.getByText("Alice").closest("td");
+    if (!(aliceCell instanceof HTMLTableCellElement)) {
+      throw new Error("Expected Alice cell to be rendered");
+    }
+
+    fireEvent.doubleClick(aliceCell);
+    const editInput = screen.getByLabelText("Cell value");
+    await user.clear(editInput);
+    await user.type(editInput, "Alicia");
+    fireEvent.blur(editInput);
+
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+
+    expect(screen.getByText(/2 rows with unsaved changes/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Apply Changes" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Insert Row" })).toBeNull();
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "applyChanges",
+      payload: {
+        updates: [{ primaryKeys: { id: 1 }, changes: { name: "Alicia" } }],
+        insertValues: {},
+      },
+    });
+  });
+
+  it("clears draft and refreshes when insert is applied but updates fail", async () => {
+    const user = userEvent.setup();
+
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    const aliceCell = screen.getByText("Alice").closest("td");
+    if (!(aliceCell instanceof HTMLTableCellElement)) {
+      throw new Error("Expected Alice cell to be rendered");
+    }
+
+    fireEvent.doubleClick(aliceCell);
+    const editInput = screen.getByLabelText("Cell value");
+    await user.clear(editInput);
+    await user.type(editInput, "Alicia");
+    fireEvent.blur(editInput);
+
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "applyChanges",
+      payload: {
+        updates: [{ primaryKeys: { id: 1 }, changes: { name: "Alicia" } }],
+        insertValues: {},
+      },
+    });
+
+    await act(async () => {
+      dispatchIncomingMessage("applyResult", {
+        success: false,
+        error: "Update failed",
+        insertApplied: true,
+      });
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+
+    expect(screen.queryByText(/^DEFAULT$/)).toBeNull();
+    expect(
+      screen.getByText(/Insert was applied, but update changes were not/),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Apply Changes" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Revert All" })).toBeTruthy();
   });
 
   it("renders filter operator menus according to column filter policy payload", async () => {

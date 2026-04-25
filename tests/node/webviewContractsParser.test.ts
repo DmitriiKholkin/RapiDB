@@ -75,3 +75,35 @@ describe("parseTablePanelMessage export payload", () => {
     });
   });
 });
+
+describe("parseTablePanelMessage applyChanges payload", () => {
+  it("parses updates and insertValues together", () => {
+    const parsed = parseTablePanelMessage({
+      type: "applyChanges",
+      payload: {
+        updates: [{ primaryKeys: { id: 1 }, changes: { name: "Alicia" } }],
+        insertValues: { name: "New user" },
+      },
+    });
+
+    expect(parsed).toEqual({
+      type: "applyChanges",
+      payload: {
+        updates: [{ primaryKeys: { id: 1 }, changes: { name: "Alicia" } }],
+        insertValues: { name: "New user" },
+      },
+    });
+  });
+
+  it("rejects invalid insertValues", () => {
+    const parsed = parseTablePanelMessage({
+      type: "applyChanges",
+      payload: {
+        updates: [],
+        insertValues: "invalid",
+      },
+    });
+
+    expect(parsed).toBeNull();
+  });
+});

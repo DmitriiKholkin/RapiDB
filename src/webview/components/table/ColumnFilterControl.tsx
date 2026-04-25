@@ -6,6 +6,8 @@ import {
   type FilterOperator,
   type ScalarFilterOperator,
 } from "../../../shared/tableTypes";
+import { buildButtonStyle } from "../../utils/buttonStyles";
+import { buildTextInputStyle } from "../../utils/controlStyles";
 
 const CLEAR_FILTER = "__clear__";
 
@@ -34,33 +36,24 @@ const rootStyle: CSSProperties = {
 };
 
 const triggerStyle: CSSProperties = {
+  ...buildButtonStyle("ghost", { size: "sm" }),
   flexShrink: 0,
   width: 22,
   height: "100%",
   padding: 0,
-  borderRadius: 2,
-  border: "1px solid var(--vscode-panel-border)",
-  background: "var(--vscode-editor-background)",
-  color: "var(--vscode-foreground)",
-  fontFamily: "inherit",
   fontSize: 9,
   fontWeight: 700,
-  cursor: "pointer",
   lineHeight: 1,
 };
 
 const inputStyle: CSSProperties = {
+  ...buildTextInputStyle("sm"),
   flex: 1,
   minWidth: 0,
   height: "100%",
   padding: "0 4px",
-  fontSize: 11,
-  background: "var(--vscode-input-background)",
-  color: "var(--vscode-input-foreground)",
   border: "1px solid transparent",
-  borderRadius: 2,
-  fontFamily: "inherit",
-  boxSizing: "border-box",
+  fontSize: 11,
 };
 
 const lockedInputStyle: CSSProperties = {
@@ -87,19 +80,18 @@ const menuStyle: CSSProperties = {
 };
 
 const menuItemStyle: CSSProperties = {
+  ...buildButtonStyle("ghost", { size: "sm" }),
   width: "100%",
-  padding: "4px 6px",
+  height: 24,
+  padding: "0 6px",
   display: "flex",
   alignItems: "center",
   gap: 8,
-  border: "none",
   borderRadius: 3,
-  background: "transparent",
-  color: "inherit",
-  fontFamily: "inherit",
   fontSize: 11,
   textAlign: "left",
-  cursor: "pointer",
+  justifyContent: "flex-start",
+  color: "inherit",
 };
 
 const tokenStyle: CSSProperties = {

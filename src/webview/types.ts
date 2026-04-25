@@ -23,6 +23,23 @@ export type Row = Record<string, unknown>;
 
 export type PendingEdits = Map<number, Map<string, unknown>>;
 
+export interface InsertDraftCell {
+  value: unknown;
+}
+
+export type InsertDraftRow = Record<string, InsertDraftCell>;
+
+export type EditTarget =
+  | {
+      kind: "persisted";
+      rowIdx: number;
+      col: string;
+    }
+  | {
+      kind: "draft";
+      col: string;
+    };
+
 export interface BadgePresentation {
   foreground: string;
   badgeBackground: string;
@@ -171,34 +188,19 @@ const STRUCTURAL_BADGE_PRESENTATIONS: Record<
 
 /** Returns a human-friendly placeholder based on column category. */
 export function placeholderForCategory(cat: TypeCategory): string {
-  if (cat === "boolean") return "true / false";
   switch (cat) {
-    case "integer":
-    case "float":
-    case "decimal":
-      return "number";
+    case "boolean":
+      return "true / false";
     case "date":
       return "YYYY-MM-DD";
     case "time":
       return "HH:MM:SS";
     case "datetime":
       return "YYYY-MM-DD HH:MM:SS";
-    case "uuid":
-      return "UUID";
-    case "json":
-      return '{"key": "value"}';
     case "binary":
       return "\\xHEX";
-    case "spatial":
-      return "POINT(x y)";
-    case "interval":
-      return "interval";
-    case "array":
-      return "[1, 2, 3]";
-    case "enum":
-      return "value";
     default:
-      return "filter";
+      return "";
   }
 }
 

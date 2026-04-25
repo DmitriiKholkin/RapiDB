@@ -6,6 +6,8 @@ import {
   useQueryStore,
   useSchemaStore,
 } from "../store";
+import { buildButtonStyle } from "../utils/buttonStyles";
+import { buildSelectControlStyle } from "../utils/controlStyles";
 import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
 import {
@@ -23,49 +25,14 @@ interface Props {
   isBookmarked?: boolean;
 }
 
-const btnStyle = (disabled = false): React.CSSProperties => ({
-  display: "inline-flex",
-  alignItems: "center",
-  gap: 4,
-  padding: "3px 10px",
-  fontSize: 12,
-  borderRadius: 2,
-  cursor: disabled ? "default" : "pointer",
-  fontFamily: "inherit",
-  border: "none",
-  background: "var(--vscode-button-background)",
-  color: "var(--vscode-button-foreground)",
-  opacity: disabled ? 0.5 : 1,
-  whiteSpace: "nowrap",
-});
+const btnStyle = (disabled = false): React.CSSProperties =>
+  buildButtonStyle("primary", { disabled, gap: 4, size: "sm" });
 
-const btnGhostStyle = (disabled = false): React.CSSProperties => ({
-  display: "inline-flex",
-  alignItems: "center",
-  gap: 4,
-  padding: "3px 10px",
-  fontSize: 12,
-  borderRadius: 2,
-  cursor: disabled ? "default" : "pointer",
-  fontFamily: "inherit",
-  background: "transparent",
-  color: "var(--vscode-foreground)",
-  border: "1px solid var(--vscode-button-border, var(--vscode-panel-border))",
-  opacity: disabled ? 0.5 : 1,
-  whiteSpace: "nowrap",
-});
+const btnGhostStyle = (disabled = false): React.CSSProperties =>
+  buildButtonStyle("ghost", { disabled, gap: 4, size: "sm" });
 
 const selectStyle: React.CSSProperties = {
-  padding: "3px 6px",
-  fontSize: 12,
-  borderRadius: 2,
-  background:
-    "var(--vscode-dropdown-background, var(--vscode-input-background))",
-  color: "var(--vscode-dropdown-foreground, var(--vscode-foreground))",
-  border: "1px solid var(--vscode-dropdown-border, var(--vscode-input-border))",
-  fontFamily: "inherit",
-  outline: "none",
-  cursor: "pointer",
+  ...buildSelectControlStyle("sm"),
   maxWidth: 220,
 };
 
