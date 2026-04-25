@@ -48,6 +48,17 @@ const CMD = {
 let _connectionManager: import("./connectionManager").ConnectionManager | null =
   null;
 
+/**
+ * Resolves a connection ID from a tree node, or prompts the user to pick one.
+ * Returns undefined if the user cancels the picker or no connections exist.
+ */
+async function resolveConnectionId(
+  node: RapiDBNode | undefined,
+  connectionManager: ConnectionManager,
+): Promise<string | undefined> {
+  return node?.connectionId ?? pickConnectionWithPrompt(connectionManager);
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   if (_activated) {
     console.warn(
@@ -134,7 +145,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   reg(CMD.editConnection, async (node?: RapiDBNode) => {
     const id =
-      node?.connectionId ?? (await pickConnectionWithPrompt(connectionManager));
+      await resolveConnectionId(node, connectionManager);
     if (!id) {
       return;
     }
@@ -154,7 +165,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   reg(CMD.deleteConnection, async (node?: RapiDBNode) => {
     const id =
-      node?.connectionId ?? (await pickConnectionWithPrompt(connectionManager));
+      await resolveConnectionId(node, connectionManager);
     if (!id) {
       return;
     }
@@ -166,7 +177,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   reg(CMD.connect, async (node?: RapiDBNode) => {
     const id =
-      node?.connectionId ?? (await pickConnectionWithPrompt(connectionManager));
+      await resolveConnectionId(node, connectionManager);
     if (!id) {
       return;
     }
@@ -207,7 +218,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   reg(CMD.disconnect, async (node?: RapiDBNode) => {
     const id =
-      node?.connectionId ?? (await pickConnectionWithPrompt(connectionManager));
+      await resolveConnectionId(node, connectionManager);
     if (!id) {
       return;
     }
@@ -217,7 +228,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   reg(CMD.newQuery, async (node?: RapiDBNode) => {
     const connectionId =
-      node?.connectionId ?? (await pickConnectionWithPrompt(connectionManager));
+      await resolveConnectionId(node, connectionManager);
     if (!connectionId) {
       return;
     }
