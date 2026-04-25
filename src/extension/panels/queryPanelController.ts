@@ -90,10 +90,10 @@ export class QueryPanelController {
       return;
     }
 
-    const tables = this.connectionManager.getSchema(connectionId);
+    const schema = this.connectionManager.getSchema(connectionId);
     this.view.postMessage({
       type: "schema",
-      payload: { connectionId, tables },
+      payload: { connectionId, schema },
     });
   }
 
@@ -169,15 +169,15 @@ export class QueryPanelController {
     if (!this.connectionManager.isConnected(connectionId)) {
       this.view.postMessage({
         type: "schema",
-        payload: { connectionId, tables: [] },
+        payload: { connectionId, schema: [] },
       });
       return;
     }
 
-    const tables = await this.connectionManager.getSchemaAsync(connectionId);
+    const schema = await this.connectionManager.getSchemaAsync(connectionId);
     this.view.postMessage({
       type: "schema",
-      payload: { connectionId, tables },
+      payload: { connectionId, schema },
     });
   }
 

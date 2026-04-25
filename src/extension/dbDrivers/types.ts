@@ -26,12 +26,12 @@ export {
 // ─── Shared regex constants (used by drivers and tableDataService) ───
 
 export const ISO_DATETIME_RE =
-  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$/;
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}(?::?\d{2})?)?$/;
 
 export const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 export const DATETIME_SQL_RE =
-  /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2})?$/;
+  /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}(?::?\d{2})?)?$/;
 
 export interface TableInfo {
   schema: string;

@@ -6,7 +6,7 @@ import React, {
   useRef,
 } from "react";
 import { format as sqlFormatterFormat } from "sql-formatter";
-import type { SchemaTable } from "../store";
+import type { SchemaObject } from "../store";
 import { onMessage, postMessage } from "../utils/messaging";
 
 type MonacoHostWindow = Window & {
@@ -172,7 +172,24 @@ const SQL_KEYWORDS = [
 
 let providerDisposable: monaco.IDisposable | null = null;
 
-let getActiveSchema: () => SchemaTable[] = () => [];
+let getActiveSchema: () => SchemaObject[] = () => [];
+
+function objectKindFor(
+  type: SchemaObject["type"],
+): monaco.languages.CompletionItemKind {
+  switch (type) {
+    case "table":
+      return monaco.languages.CompletionItemKind.Class;
+    case "view":
+      return monaco.languages.CompletionItemKind.Class;
+    case "procedure":
+      return monaco.languages.CompletionItemKind.Function;
+    case "function":
+      return monaco.languages.CompletionItemKind.Function;
+    default:
+      return monaco.languages.CompletionItemKind.Value;
+  }
+}
 
 function ensureCompletionProvider() {
   if (providerDisposable) {
@@ -206,7 +223,7 @@ function ensureCompletionProvider() {
         const matched = schema.find(
           (t) =>
             t.schema.toLowerCase() === schemaHint &&
-            t.table.toLowerCase() === tableHint,
+            t.object.toLowerCase() === tableHint,
         );
         if (matched) {
           matched.columns.forEach((col, i) => {
@@ -233,13 +250,15 @@ function ensureCompletionProvider() {
         if (schemasWithHint.length > 0) {
           schemasWithHint.forEach((t, i) => {
             items.push({
-              label: t.table,
+              label: t.object,
               detail:
-                t.columns.length > 0
-                  ? `table (${t.columns.length} cols)`
-                  : "table",
-              kind: monaco.languages.CompletionItemKind.Class,
-              insertText: t.table,
+                t.type === "function" || t.type === "procedure"
+                  ? (t.type ?? "routine")
+                  : t.columns && t.columns?.length > 0
+                    ? `table (${t.columns.length} cols)`
+                    : (t.type ?? "table"),
+              kind: objectKindFor(t.type),
+              insertText: t.object,
               range,
               sortText: String(i).padStart(5, "0"),
             });
@@ -247,7 +266,9 @@ function ensureCompletionProvider() {
           return { suggestions: items };
         }
 
-        const matchedTable = schema.find((t) => t.table.toLowerCase() === hint);
+        const matchedTable = schema.find(
+          (t) => t.object.toLowerCase() === hint,
+        );
         if (matchedTable) {
           matchedTable.columns.forEach((col, i) => {
             items.push({
@@ -290,34 +311,41 @@ function ensureCompletionProvider() {
       const primarySchema = schemaNames[0] ?? "";
       schema.forEach((t, ti) => {
         const isPrimary = t.schema === primarySchema;
+        const isRoutine = t.type === "function" || t.type === "procedure";
+        const objectKind = objectKindFor(t.type);
+        const detailLabel = isRoutine
+          ? (t.type ?? "routine")
+          : t.columns.length > 0
+            ? `table (${t.columns.length} cols)`
+            : (t.type ?? "table");
 
         items.push({
-          label: t.table,
+          label: t.object,
           detail: isPrimary
-            ? `table in ${t.schema} (${t.columns.length} cols)`
-            : `table in ${t.schema}`,
-          kind: monaco.languages.CompletionItemKind.Class,
-          insertText: t.table,
+            ? `${detailLabel} in ${t.schema}`
+            : `${detailLabel} in ${t.schema}`,
+          kind: objectKind,
+          insertText: t.object,
           range,
           sortText: `2_${isPrimary ? "0" : "1"}_${String(ti).padStart(5, "0")}_tbl`,
         });
 
         items.push({
-          label: `${t.schema}.${t.table}`,
+          label: `${t.schema}.${t.object}`,
           detail: isPrimary
-            ? `qualified (${t.columns.length} cols)`
-            : "qualified",
-          kind: monaco.languages.CompletionItemKind.Class,
-          insertText: `${t.schema}.${t.table}`,
+            ? `qualified (${detailLabel})`
+            : `qualified (${detailLabel})`,
+          kind: objectKind,
+          insertText: `${t.schema}.${t.object}`,
           range,
           sortText: `2_${isPrimary ? "0" : "1"}_${String(ti).padStart(5, "0")}_qual`,
         });
 
-        if (isPrimary) {
+        if (isPrimary && !isRoutine) {
           t.columns.forEach((col, ci) => {
             items.push({
               label: col.name,
-              detail: `${t.table}.${col.name}  ${col.type}`,
+              detail: `${t.object}.${col.name}  ${col.type}`,
               kind: monaco.languages.CompletionItemKind.Field,
               insertText: col.name,
               range,
@@ -399,7 +427,7 @@ export function formatSQLOrError(
 
 interface Props {
   initialValue?: string;
-  schema?: SchemaTable[];
+  schema?: SchemaObject[];
   dialect?: string;
   onChange?: (value: string) => void;
   onExecute?: (value: string) => void;
@@ -464,7 +492,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       }
     }, [initialValue]);
 
-    const schemaRef = useRef<SchemaTable[]>([]);
+    const schemaRef = useRef<SchemaObject[]>([]);
     useEffect(() => {
       schemaRef.current = schema;
     }, [schema]);

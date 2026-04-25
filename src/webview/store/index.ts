@@ -50,16 +50,17 @@ export interface SchemaColumn {
   type: string;
 }
 
-export interface SchemaTable {
+export interface SchemaObject {
   schema: string;
-  table: string;
+  object: string;
+  type?: "table" | "view" | "function" | "procedure";
   columns: SchemaColumn[];
 }
 
 export interface SchemaState {
-  schemaByConnection: Record<string, SchemaTable[]>;
-  setSchema: (connectionId: string, schema: SchemaTable[]) => void;
-  getSchema: (connectionId: string) => SchemaTable[];
+  schemaByConnection: Record<string, SchemaObject[]>;
+  setSchema: (connectionId: string, schema: SchemaObject[]) => void;
+  getSchema: (connectionId: string) => SchemaObject[];
 }
 
 export const useQueryStore = create<QueryState>((set) => ({

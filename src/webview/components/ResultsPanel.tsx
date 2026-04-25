@@ -226,14 +226,14 @@ function DataTable({ result }: { result: QueryResult }) {
             flexShrink: 0,
             display: "flex",
             alignItems: "center",
-            gap: 6,
-            padding: "5px 10px",
-            fontSize: 11,
+            gap: 8,
+            padding: "6px 12px",
+            fontSize: 12,
             background:
-              "var(--vscode-inputValidation-warningBackground, rgba(200,150,0,0.15))",
+              "var(--vscode-inputValidation-warningBackground, rgba(180,120,0,0.15))",
             borderBottom:
-              "1px solid var(--vscode-inputValidation-warningBorder, rgba(200,150,0,0.5))",
-            color: "var(--vscode-foreground)",
+              "1px solid var(--vscode-inputValidation-warningBorder, rgba(180,120,0,0.4))",
+            color: "var(--vscode-editorWarning-foreground, #CCA700)",
           }}
         >
           <Icon
@@ -466,6 +466,7 @@ const VirtualRow = React.memo(function VirtualRow({
               boxSizing: "border-box",
               verticalAlign: "middle",
               cursor: "pointer",
+              userSelect: "none",
             }}
             title={isNull ? "" : String(raw)}
             onDoubleClick={() => onActivateCell(index, cell.column.id)}

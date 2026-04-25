@@ -4,6 +4,7 @@ import {
   BaseDBDriver,
   formatDatetimeForDisplay,
   isoToLocalDateStr,
+  normalizeSqlDatetimeOffsetSpacing,
 } from "./BaseDBDriver";
 import type {
   ColumnMeta,
@@ -22,7 +23,7 @@ import type {
   TypeCategory,
   ValueSemantics,
 } from "./types";
-import { ISO_DATETIME_RE, NULL_SENTINEL } from "./types";
+import { DATETIME_SQL_RE, ISO_DATETIME_RE, NULL_SENTINEL } from "./types";
 
 const PG_OID_DATE = 1082; // date
 const PG_OID_TIMESTAMP = 1114; // timestamp without time zone
@@ -133,6 +134,24 @@ function pgIdentityClause(value: unknown): string {
 
 function escapePostgresPreviewString(value: string): string {
   return value.replace(/'/g, "''");
+}
+
+function normalizeTemporalSearchValue(value: string): string {
+  const trimmed = value.trim();
+  const normalizedSql = normalizeSqlDatetimeOffsetSpacing(
+    trimmed.replace("T", " "),
+  );
+
+  if (ISO_DATETIME_RE.test(trimmed) || DATETIME_SQL_RE.test(normalizedSql)) {
+    return normalizedSql
+      .replace(/(\.\d*?[1-9])0+(?=[Zz+-]|$)/, "$1")
+      .replace(/\.0+(?=[Zz+-]|$)/, "")
+      .replace(" ", "%")
+      .replace(/[zZ]$/, "")
+      .replace(/[+-]\d{2}(?::?\d{2})?$/, "");
+  }
+
+  return trimmed;
 }
 
 export class PostgresDriver extends BaseDBDriver {
@@ -972,6 +991,18 @@ export class PostgresDriver extends BaseDBDriver {
     }
 
     if (column.category === "date" && typeof val === "string") {
+      if (operator === "like" || operator === "ilike") {
+        const normalized = this.normalizeFilterValue(column, "eq", val);
+        const searchValue =
+          typeof normalized === "string" && normalized.trim() !== ""
+            ? normalized.trim()
+            : val;
+        return {
+          sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex}`,
+          params: [`%${searchValue}%`],
+        };
+      }
+
       const sqlOp = this.sqlOperator(operator);
       return {
         sql: `${col} ${sqlOp} $${paramIndex}::date`,
@@ -983,9 +1014,10 @@ export class PostgresDriver extends BaseDBDriver {
     if (column.category === "datetime" || column.category === "time") {
       if (operator === "eq" || operator === "like" || operator === "ilike") {
         const v = typeof val === "string" ? val : val[0];
+        const searchValue = normalizeTemporalSearchValue(v);
         return {
           sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex}`,
-          params: [`%${v}%`],
+          params: [`%${searchValue}%`],
         };
       }
       if (operator === "between" && Array.isArray(val)) {
@@ -995,9 +1027,10 @@ export class PostgresDriver extends BaseDBDriver {
         };
       }
       const v = typeof val === "string" ? val : val[0];
+      const searchValue = normalizeTemporalSearchValue(v);
       return {
         sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex}`,
-        params: [`%${v}%`],
+        params: [`%${searchValue}%`],
       };
     }
 
@@ -1034,15 +1067,7 @@ export class PostgresDriver extends BaseDBDriver {
 
     // Default: CAST AS TEXT ILIKE
     const v = typeof val === "string" ? val : val[0];
-    let finalVal = v;
-    if (ISO_DATETIME_RE.test(v)) {
-      finalVal = v
-        .replace(/(\.\d*?[1-9])0+(?=[Z+-]|$)/, "$1")
-        .replace(/\.0+(?=[Z+-]|$)/, "")
-        .replace("T", "%")
-        .replace("Z", "%")
-        .replace(/[+-]\d{2}:\d{2}$/, "%");
-    }
+    const finalVal = normalizeTemporalSearchValue(v);
     return {
       sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex}`,
       params: [`%${finalVal}%`],

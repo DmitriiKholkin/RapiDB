@@ -43,7 +43,7 @@ export function EditInput({
     color: isNull
       ? "var(--vscode-disabledForeground)"
       : "var(--vscode-input-foreground)",
-    border: "1px solid var(--vscode-focusBorder)",
+    border: "0px",
     outline: "none",
     boxSizing: "border-box" as const,
     fontStyle: isNull ? "italic" : "normal",
@@ -58,7 +58,7 @@ export function EditInput({
     fontFamily: "inherit",
     background: "var(--vscode-input-background)",
     color: "var(--vscode-input-foreground)",
-    border: "1px solid var(--vscode-focusBorder)",
+    border: "0px",
     cursor: "pointer",
     letterSpacing: "0.02em",
   };

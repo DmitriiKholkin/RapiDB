@@ -26,9 +26,10 @@ export interface ConnectAttempt {
   isNew: boolean;
 }
 
-export interface SchemaTableEntry {
+export interface SchemaObjectEntry {
   schema: string;
-  table: string;
+  object: string;
+  type?: "table" | "view" | "function" | "procedure";
   columns: { name: string; type: string }[];
 }
 

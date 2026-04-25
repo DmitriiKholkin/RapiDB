@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   type QueryResult,
-  type SchemaTable,
+  type SchemaObject,
   useConnectionStore,
   useQueryStore,
   useSchemaStore,
@@ -125,7 +125,7 @@ export function QueryView({
     }
   }, []);
 
-  const schema: SchemaTable[] =
+  const schema: SchemaObject[] =
     schemaByConnection[activeConnectionId || connectionId] ?? [];
 
   const activeConn = connections.find(
@@ -173,9 +173,9 @@ export function QueryView({
 
     const unsubSchema = onMessage<{
       connectionId: string;
-      tables: SchemaTable[];
+      schema: SchemaObject[];
     }>("schema", (payload) => {
-      setSchema(payload.connectionId, payload.tables);
+      setSchema(payload.connectionId, payload.schema);
     });
 
     const unsubBookmark = onMessage<{ ok: boolean; error?: string }>(

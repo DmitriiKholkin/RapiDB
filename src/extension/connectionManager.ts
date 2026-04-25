@@ -5,7 +5,7 @@ import {
   type ConnectAttempt,
   type ConnectionConfig,
   type HistoryEntry,
-  type SchemaTableEntry,
+  type SchemaObjectEntry,
   type StoredConnectionConfig,
   type TestConnectionResult,
 } from "./connectionManagerModels";
@@ -26,12 +26,12 @@ export type {
   ConnectAttempt,
   ConnectionConfig,
   HistoryEntry,
-  SchemaTableEntry,
+  SchemaObjectEntry,
   TestConnectionResult,
 } from "./connectionManagerModels";
 
 interface SchemaCacheEntry {
-  tables: SchemaTableEntry[];
+  objects: SchemaObjectEntry[];
   loading: Promise<void> | null;
 }
 export async function pMapWithLimit<T, R>(
@@ -320,13 +320,13 @@ export class ConnectionManager {
     return this.driverMap.get(id);
   }
 
-  getSchema(connectionId: string): SchemaTableEntry[] {
-    return this._schemaCacheMap.get(connectionId)?.tables ?? [];
+  getSchema(connectionId: string): SchemaObjectEntry[] {
+    return this._schemaCacheMap.get(connectionId)?.objects ?? [];
   }
 
-  async getSchemaAsync(connectionId: string): Promise<SchemaTableEntry[]> {
+  async getSchemaAsync(connectionId: string): Promise<SchemaObjectEntry[]> {
     const existing = this._schemaCacheMap.get(connectionId);
-    if (!existing || (!existing.loading && existing.tables.length === 0)) {
+    if (!existing || (!existing.loading && existing.objects.length === 0)) {
       this._startSchemaLoad(connectionId);
     }
 
@@ -336,7 +336,7 @@ export class ConnectionManager {
         await entry.loading;
       } catch {}
     }
-    return this._schemaCacheMap.get(connectionId)?.tables ?? [];
+    return this._schemaCacheMap.get(connectionId)?.objects ?? [];
   }
 
   private _startSchemaLoad(connectionId: string): void {
@@ -348,7 +348,7 @@ export class ConnectionManager {
 
     let entry = this._schemaCacheMap.get(connectionId);
     if (!entry) {
-      entry = { tables: [], loading: null };
+      entry = { objects: [], loading: null };
       this._schemaCacheMap.set(connectionId, entry);
     }
     if (entry.loading) {
@@ -357,10 +357,10 @@ export class ConnectionManager {
 
     const capturedEntry = entry;
     capturedEntry.loading = this._loadSchemaInternal(driver, config)
-      .then((tables) => {
+      .then((objects) => {
         const live = this._schemaCacheMap.get(connectionId);
         if (live === capturedEntry) {
-          live.tables = tables;
+          live.objects = objects;
           live.loading = null;
         }
         this._onDidSchemaLoad.fire(connectionId);
@@ -376,8 +376,8 @@ export class ConnectionManager {
   private async _loadSchemaInternal(
     driver: IDBDriver,
     config: ConnectionConfig,
-  ): Promise<SchemaTableEntry[]> {
-    const result: SchemaTableEntry[] = [];
+  ): Promise<SchemaObjectEntry[]> {
+    const result: SchemaObjectEntry[] = [];
     const configuredDb = config.database || (config.filePath ? "main" : "");
     const allDbs = await driver.listDatabases().catch(() => []);
     const primaryDb = configuredDb || allDbs[0]?.name || "";
@@ -393,19 +393,36 @@ export class ConnectionManager {
       const objects = await driver
         .listObjects(primaryDb, schema.name)
         .catch(() => []);
-      const tables = objects
-        .filter((o) => o.type === "table" || o.type === "view")
-        .slice(0, 100);
+      const objectsForSchema = objects
+        .filter(
+          (o) =>
+            o.type === "table" ||
+            o.type === "view" ||
+            o.type === "function" ||
+            o.type === "procedure",
+        )
+        .slice(0, 1000);
 
-      const allCols = await pMapWithLimit(tables, 5, (tbl) =>
-        driver.describeTable(primaryDb, schema.name, tbl.name).catch(() => []),
-      );
+      const allCols = await pMapWithLimit(objectsForSchema, 10, async (tbl) => {
+        if (tbl.type === "table" || tbl.type === "view") {
+          try {
+            return await driver.describeTable(primaryDb, schema.name, tbl.name);
+          } catch {
+            return [];
+          }
+        }
+        return [];
+      });
 
-      tables.forEach((tbl, i) => {
+      objectsForSchema.forEach((tbl, i) => {
         result.push({
           schema: schema.name,
-          table: tbl.name,
-          columns: allCols[i].map((c) => ({ name: c.name, type: c.type })),
+          object: tbl.name,
+          type: tbl.type,
+          columns:
+            tbl.type === "table" || tbl.type === "view"
+              ? allCols[i].map((c) => ({ name: c.name, type: c.type }))
+              : [],
         });
       });
     }

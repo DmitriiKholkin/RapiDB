@@ -235,11 +235,21 @@ function looksLikeDateInput(value: string): boolean {
 }
 
 export function hasExplicitTimezone(value: string): boolean {
-  return /[zZ]|[+-]\d{2}:\d{2}$/.test(value);
+  return /[zZ]|[+-]\d{2}(?::?\d{2})?$/.test(value);
 }
 
 export function normalizeSqlDatetimeOffsetSpacing(value: string): string {
-  return value.replace(/ ([+-]\d{2}:\d{2})$/, "$1");
+  const compact = value.replace(/ ([+-]\d{2}(?::?\d{2})?)$/, "$1");
+  if (/[+-]\d{2}:\d{2}$/.test(compact)) {
+    return compact;
+  }
+  if (/[+-]\d{4}$/.test(compact)) {
+    return compact.replace(/([+-]\d{2})(\d{2})$/, "$1:$2");
+  }
+  if (/[+-]\d{2}$/.test(compact)) {
+    return `${compact}:00`;
+  }
+  return compact;
 }
 
 function isValidDateOnly(value: string): boolean {
@@ -258,7 +268,7 @@ function isValidDateOnly(value: string): boolean {
 
 function hasValidDateTimeParts(value: string): boolean {
   const match =
-    /^(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?: ?(?:Z|[+-]\d{2}:\d{2}))?$/i.exec(
+    /^(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?: ?(?:Z|[+-]\d{2}(?::?\d{2})?))?$/i.exec(
       value,
     );
   if (!match) return false;
