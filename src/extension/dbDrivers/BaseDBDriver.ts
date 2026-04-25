@@ -285,6 +285,97 @@ function invalidFilterInputError(columnName: string, expected: string): Error {
   return new Error(`[RapiDB Filter] Column ${columnName} expects ${expected}.`);
 }
 
+function stripCurrencyAffixes(rawValue: string): string {
+  let value = rawValue.trim();
+
+  // Remove any Unicode currency symbols from both sides (e.g. $, €, ₹, ₽, ₺, etc.)
+  value = value.replace(/^[\p{Sc}\s]+/gu, "");
+  value = value.replace(/[\p{Sc}\s]+$/gu, "");
+
+  // Remove common ISO currency code wrappers from both sides (e.g. USD 1,234.56 / 1,234.56 EUR)
+  if (/^[A-Za-z]{3}(?=\s|[+-]?\d|\.)/.test(value)) {
+    value = value.slice(3).trim();
+  }
+  if (/(?:\d|\.)[A-Za-z]{3}$/.test(value)) {
+    value = value.slice(0, -3).trim();
+  }
+
+  return value;
+}
+
+function normalizeNumericFilterToken(rawValue: string): string | null {
+  let value = rawValue.trim();
+  if (value === "") return null;
+
+  let isNegative = false;
+  const wrappedNegative = /^\((.*)\)$/.exec(value);
+  if (wrappedNegative) {
+    isNegative = true;
+    value = wrappedNegative[1].trim();
+  }
+
+  value = stripCurrencyAffixes(value);
+  value = value.replace(/\s+/g, "");
+
+  if (value.includes("'")) {
+    const apostropheGroupedNumberPattern =
+      /^[+-]?(?:\d{1,3}(?:'\d{3})+)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
+    if (!apostropheGroupedNumberPattern.test(value)) {
+      return null;
+    }
+    value = value.replace(/'/g, "");
+  }
+
+  if (value.includes(",")) {
+    const groupedNumberPattern =
+      /^[+-]?(?:\d{1,3}(?:,\d{3})+)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
+    if (!groupedNumberPattern.test(value)) {
+      return null;
+    }
+    value = value.replace(/,/g, "");
+  }
+
+  if (isNegative) {
+    value = `-${value.replace(/^[+-]/, "")}`;
+  }
+
+  const numericPattern = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+  if (!numericPattern.test(value)) {
+    return null;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? value : null;
+}
+
+function splitNumericFilterInList(rawValue: string): string[] {
+  const input = rawValue.trim();
+  if (input === "") return [];
+
+  const parts: string[] = [];
+  let start = 0;
+
+  for (let i = 0; i < input.length; i += 1) {
+    if (input[i] !== ",") continue;
+
+    const prevChar = i > 0 ? input[i - 1] : "";
+    const nextSlice = input.slice(i + 1);
+    const isThousandsSeparator =
+      /\d/.test(prevChar) && /^\d{3}(?=[^\d]|$)/.test(nextSlice);
+
+    if (isThousandsSeparator) {
+      continue;
+    }
+
+    parts.push(input.slice(start, i).trim());
+    start = i + 1;
+  }
+
+  parts.push(input.slice(start).trim());
+
+  return parts.filter(Boolean);
+}
+
 const PERSISTED_EDIT_NULL_TOKEN = "\x00__RAPIDB_PERSISTED_EDIT_NULL__\x00";
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -848,6 +939,14 @@ export abstract class BaseDBDriver implements IDBDriver {
     };
   }
 
+  /**
+   * Shared filterability contract:
+   * - default allow for all mapped categories;
+   * - deny only categories/types that are too large/complex to compare safely.
+   *
+   * Spatial/array/interval reuse the existing text fallback semantics from
+   * filter builders (CAST/CONVERT + LIKE family) and category operators.
+   */
   protected isFilterable(_nativeType: string, category: TypeCategory): boolean {
     return category !== "lob";
   }
@@ -1313,24 +1412,26 @@ export abstract class BaseDBDriver implements IDBDriver {
 
     if (this.isNumericCategory(column.category)) {
       if (operator === "in") {
-        const values = value
-          .split(",")
-          .map((part) => part.trim())
-          .filter(Boolean);
-        if (
-          values.length === 0 ||
-          values.some((part) => !Number.isFinite(Number(part)))
-        ) {
+        const rawValues = splitNumericFilterInList(value);
+        if (rawValues.length === 0) {
           throw invalidFilterInputError(column.name, "comma-separated numbers");
         }
+
+        const values = rawValues.map((part) =>
+          normalizeNumericFilterToken(part),
+        );
+        if (values.some((part) => part === null)) {
+          throw invalidFilterInputError(column.name, "comma-separated numbers");
+        }
+
         return values.join(", ");
       }
 
-      const numericValue = Number(value);
-      if (Number.isNaN(numericValue) || !Number.isFinite(numericValue)) {
+      const normalizedNumericValue = normalizeNumericFilterToken(value);
+      if (!normalizedNumericValue) {
         throw invalidFilterInputError(column.name, "a number");
       }
-      return value;
+      return normalizedNumericValue;
     }
 
     if (column.category === "date") {

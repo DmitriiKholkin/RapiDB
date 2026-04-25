@@ -153,6 +153,35 @@ const autoIncrementColumns: ColumnTypeMeta[] = [
 
 const autoIncrementRows = [{ seq: 10, label: "First" }];
 
+const operatorVisibilityColumns: ColumnTypeMeta[] = [
+  {
+    name: "tags",
+    type: "TEXT[]",
+    nativeType: "TEXT[]",
+    nullable: true,
+    isPrimaryKey: false,
+    isForeignKey: false,
+    isAutoIncrement: false,
+    category: "text",
+    filterable: true,
+    filterOperators: ["eq", "in", "is_null", "is_not_null"],
+    valueSemantics: "plain",
+  },
+  {
+    name: "geom",
+    type: "GEOMETRY",
+    nativeType: "GEOMETRY",
+    nullable: true,
+    isPrimaryKey: false,
+    isForeignKey: false,
+    isAutoIncrement: false,
+    category: "json",
+    filterable: false,
+    filterOperators: ["is_null", "is_not_null"],
+    valueSemantics: "plain",
+  },
+];
+
 function lastFetchPayload(): {
   fetchId?: number;
   page?: number;
@@ -548,6 +577,65 @@ describe("TableView", () => {
       type: "deleteRows",
       payload: { primaryKeysList: [{ id: 1 }] },
     });
+  });
+
+  it("renders filter operator menus according to column filter policy payload", async () => {
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns: operatorVisibilityColumns,
+      primaryKeyColumns: [],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "tags filter operator" }),
+    );
+
+    const tagsMenu = screen.getByRole("menu", {
+      name: "tags filter operators",
+    });
+    expect(
+      within(tagsMenu).getByRole("menuitemradio", { name: /Equals/i }),
+    ).toBeTruthy();
+    expect(
+      within(tagsMenu).getByRole("menuitemradio", { name: /In list/i }),
+    ).toBeTruthy();
+    expect(
+      within(tagsMenu).getByRole("menuitemradio", { name: /Is NULL/i }),
+    ).toBeTruthy();
+    expect(
+      within(tagsMenu).getByRole("menuitemradio", { name: /Is NOT NULL/i }),
+    ).toBeTruthy();
+    expect(
+      within(tagsMenu).queryByRole("menuitemradio", { name: /Greater than/i }),
+    ).toBeNull();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "geom filter operator" }),
+    );
+
+    const geomMenu = screen.getByRole("menu", {
+      name: "geom filter operators",
+    });
+    expect(
+      within(geomMenu).getByRole("menuitemradio", { name: /Is NULL/i }),
+    ).toBeTruthy();
+    expect(
+      within(geomMenu).getByRole("menuitemradio", { name: /Is NOT NULL/i }),
+    ).toBeTruthy();
+    expect(
+      within(geomMenu).queryByRole("menuitemradio", { name: /Equals/i }),
+    ).toBeNull();
+
+    const geomFilterInput = screen.getByLabelText("geom filter value");
+    expect((geomFilterInput as HTMLInputElement).disabled).toBe(true);
   });
 
   it("renders fatal table errors", async () => {

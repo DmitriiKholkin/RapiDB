@@ -9,6 +9,7 @@ import type {
   TypeCategory,
   ValueSemantics,
 } from "../../src/extension/dbDrivers/types";
+import { filterOperatorsForCategory } from "../../src/extension/dbDrivers/types";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 import { formatScalarValueForDisplay } from "../../src/webview/utils/valueFormatting";
 
@@ -59,10 +60,98 @@ function buildColumn(
     isForeignKey: false,
     isAutoIncrement: false,
     filterable,
-    filterOperators: [],
+    filterOperators: filterable
+      ? filterOperatorsForCategory(category)
+      : ["is_null", "is_not_null"],
     valueSemantics,
   };
 }
+
+type FilterabilityExpectation = {
+  nativeType: string;
+  expectedFilterable: boolean;
+  expectedOperators?: readonly string[];
+};
+
+const edgeFilterabilityExpectations: Record<
+  DriverUnderTest["name"],
+  FilterabilityExpectation[]
+> = {
+  postgres: [
+    {
+      nativeType: "point",
+      expectedFilterable: true,
+      expectedOperators: ["like", "is_null", "is_not_null"],
+    },
+    {
+      nativeType: "integer[]",
+      expectedFilterable: true,
+      expectedOperators: ["like", "is_null", "is_not_null"],
+    },
+    {
+      nativeType: "interval",
+      expectedFilterable: true,
+      expectedOperators: ["like", "is_null", "is_not_null"],
+    },
+  ],
+  mysql: [
+    {
+      nativeType: "geometry",
+      expectedFilterable: true,
+      expectedOperators: ["like", "is_null", "is_not_null"],
+    },
+    {
+      nativeType: "enum('A','B')",
+      expectedFilterable: true,
+      expectedOperators: ["like", "in", "is_null", "is_not_null"],
+    },
+  ],
+  mssql: [
+    {
+      nativeType: "geometry",
+      expectedFilterable: true,
+      expectedOperators: ["like", "is_null", "is_not_null"],
+    },
+    {
+      nativeType: "geography",
+      expectedFilterable: true,
+      expectedOperators: ["like", "is_null", "is_not_null"],
+    },
+    {
+      nativeType: "xml",
+      expectedFilterable: true,
+      expectedOperators: ["like", "is_null", "is_not_null"],
+    },
+    {
+      nativeType: "image",
+      expectedFilterable: false,
+      expectedOperators: ["is_null", "is_not_null"],
+    },
+  ],
+  oracle: [
+    {
+      nativeType: "SDO_GEOMETRY",
+      expectedFilterable: true,
+      expectedOperators: ["like", "is_null", "is_not_null"],
+    },
+    {
+      nativeType: "INTERVAL DAY TO SECOND",
+      expectedFilterable: true,
+      expectedOperators: ["like", "is_null", "is_not_null"],
+    },
+    {
+      nativeType: "XMLTYPE",
+      expectedFilterable: true,
+      expectedOperators: ["like", "is_null", "is_not_null"],
+    },
+    {
+      nativeType: "BLOB",
+      expectedFilterable: false,
+      expectedOperators: ["is_null", "is_not_null"],
+    },
+  ],
+  sqlite: [],
+};
 
 function sampleValueFor(
   category: TypeCategory,
@@ -188,6 +277,27 @@ function persistedSampleFor(
 
 function toEditString(value: unknown): string {
   return value == null ? "" : formatScalarValueForDisplay(value);
+}
+
+function buildFilterColumn(
+  nativeType: string,
+  category: TypeCategory,
+): ColumnTypeMeta {
+  return {
+    name: "probe_col",
+    type: nativeType,
+    nativeType,
+    category,
+    nullable: true,
+    defaultValue: undefined,
+    isPrimaryKey: false,
+    primaryKeyOrdinal: undefined,
+    isForeignKey: false,
+    isAutoIncrement: false,
+    filterable: true,
+    filterOperators: filterOperatorsForCategory(category),
+    valueSemantics: "plain",
+  };
 }
 
 const baseConfig = {
@@ -434,6 +544,7 @@ describe("driver native type coverage", () => {
   for (const driverCase of drivers) {
     describe(`${driverCase.name} native types`, () => {
       const driver = driverCase.make() as DriverProbe;
+      const edgeCases = edgeFilterabilityExpectations[driverCase.name] ?? [];
 
       for (const [nativeType, expectedCategory] of driverCase.cases) {
         it(`handles "${nativeType}"`, () => {
@@ -486,6 +597,156 @@ describe("driver native type coverage", () => {
           }
         });
       }
+
+      for (const edgeCase of edgeCases) {
+        it(`filterability policy for "${edgeCase.nativeType}"`, () => {
+          const category = driver.mapTypeCategory(
+            edgeCase.nativeType,
+          ) as TypeCategory;
+          const column = buildColumn(driver, edgeCase.nativeType, category);
+
+          expect(column.filterable).toBe(edgeCase.expectedFilterable);
+
+          if (edgeCase.expectedOperators) {
+            expect(column.filterOperators).toEqual(edgeCase.expectedOperators);
+          }
+        });
+      }
     });
   }
+});
+
+describe("filter SQL compatibility for edge filterable types", () => {
+  it("uses ST_AsText for MySQL spatial like filters", () => {
+    const driver = new MySQLDriver({
+      ...baseConfig,
+      type: "mysql",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      buildFilterColumn("geometry", "spatial"),
+      "like",
+      "POINT(1 2)",
+      1,
+    );
+
+    expect(result?.sql).toContain("ST_AsText");
+    expect(result?.params).toEqual(["%POINT(1 2)%"]);
+  });
+
+  it("uses STAsText for MSSQL spatial like filters", () => {
+    const driver = new MSSQLDriver({
+      ...baseConfig,
+      type: "mssql",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      buildFilterColumn("geometry", "spatial"),
+      "like",
+      "POINT(1 2)",
+      1,
+    );
+
+    expect(result?.sql).toContain("STAsText()");
+    expect(result?.params).toEqual(["%POINT(1 2)%"]);
+  });
+
+  it("uses TO_CHAR for Oracle interval like filters", () => {
+    const driver = new OracleDriver({
+      ...baseConfig,
+      type: "oracle",
+      serviceName: "FREEPDB1",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      buildFilterColumn("INTERVAL DAY TO SECOND", "interval"),
+      "like",
+      "1 02:03:04",
+      1,
+    );
+
+    expect(result?.sql).toContain("TO_CHAR");
+    expect(result?.params).toEqual(["%1 02:03:04%"]);
+  });
+
+  it("uses RAWTOHEX for Oracle RAW like filters", () => {
+    const driver = new OracleDriver({
+      ...baseConfig,
+      type: "oracle",
+      serviceName: "FREEPDB1",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      buildFilterColumn("RAW(16)", "binary"),
+      "like",
+      "0x0a0b",
+      1,
+    );
+
+    expect(result?.sql).toContain("RAWTOHEX");
+    expect(result?.params).toEqual(["%0A0B%"]);
+  });
+
+  it("uses SDO_UTIL.TO_WKTGEOMETRY for Oracle spatial like filters", () => {
+    const driver = new OracleDriver({
+      ...baseConfig,
+      type: "oracle",
+      serviceName: "FREEPDB1",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      buildFilterColumn("SDO_GEOMETRY", "spatial"),
+      "like",
+      "POINT(1 2)",
+      1,
+    );
+
+    expect(result?.sql).toContain("SDO_UTIL.TO_WKTGEOMETRY");
+    expect(result?.params).toEqual(["%POINT(1 2)%"]);
+  });
+
+  it("uses CAST AS TEXT ILIKE for Postgres array like filters", () => {
+    const driver = new PostgresDriver({
+      ...baseConfig,
+      type: "pg",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      buildFilterColumn("integer[]", "array"),
+      "like",
+      "1",
+      1,
+    );
+
+    expect(result?.sql).toContain("CAST");
+    expect(result?.sql).toContain("ILIKE");
+    expect(result?.params).toEqual(["%1%"]);
+  });
+
+  it("normalizes spaces around commas for Postgres point like filters", () => {
+    const driver = new PostgresDriver({
+      ...baseConfig,
+      type: "pg",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      buildFilterColumn("point", "spatial"),
+      "like",
+      "(1.5, 2.5)",
+      1,
+    );
+
+    expect(result?.sql).toContain("CAST");
+    expect(result?.sql).toContain("ILIKE");
+    // PG text repr of point has no space after comma: (1.5,2.5)
+    expect(result?.params).toEqual(["%( 1.5,2.5)%".replace(" ", "")]);
+  });
+
+  it("normalizes spaces in Postgres polygon like filters", () => {
+    const driver = new PostgresDriver({
+      ...baseConfig,
+      type: "pg",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      buildFilterColumn("polygon", "spatial"),
+      "like",
+      "((0, 0), (1, 0), (1, 1))",
+      1,
+    );
+
+    expect(result?.params).toEqual(["%((0,0),(1,0),(1,1))%"]);
+  });
 });

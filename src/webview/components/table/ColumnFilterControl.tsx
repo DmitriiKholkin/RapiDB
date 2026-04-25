@@ -6,7 +6,6 @@ import {
   type FilterOperator,
   type ScalarFilterOperator,
 } from "../../../shared/tableTypes";
-import { placeholderForCategory } from "../../types";
 
 const CLEAR_FILTER = "__clear__";
 
@@ -262,10 +261,7 @@ export function ColumnFilterControl({
       : "";
   const betweenValue =
     normalizedDraft?.operator === "between" ? normalizedDraft.value : ["", ""];
-  const scalarPlaceholder =
-    scalarOperator === "in"
-      ? "value1, value2"
-      : placeholderForCategory(column.category);
+  const scalarPlaceholder = "filter";
 
   const handleOperatorSelect = (
     operator: FilterOperator | typeof CLEAR_FILTER,

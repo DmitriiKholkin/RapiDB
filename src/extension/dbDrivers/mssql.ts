@@ -345,13 +345,8 @@ function temporalSearchLiteral(value: string): string {
   return normalizeDatetimeLiteral(value).replace(" ", "T");
 }
 
-const MSSQL_NON_FILTERABLE = new Set([
+const MSSQL_FILTER_DENYLIST = new Set([
   "image",
-  "text",
-  "ntext",
-  "xml",
-  "geography",
-  "geometry",
   "hierarchyid",
   "sql_variant",
   "timestamp",
@@ -1090,7 +1085,7 @@ export class MSSQLDriver extends BaseDBDriver {
   ): boolean {
     return (
       super.isFilterable(nativeType, category) &&
-      !MSSQL_NON_FILTERABLE.has(baseTypeName(nativeType))
+      !MSSQL_FILTER_DENYLIST.has(baseTypeName(nativeType))
     );
   }
 
@@ -1428,6 +1423,14 @@ export class MSSQLDriver extends BaseDBDriver {
             ? `CONVERT(VARCHAR(40), ${col}, 127) LIKE ?`
             : `CONVERT(VARCHAR(33), ${col}, 126) LIKE ?`,
         params: [`%${temporalSearchLiteral(v)}%`],
+      };
+    }
+
+    if (column.category === "spatial") {
+      const v = typeof val === "string" ? val : val[0];
+      return {
+        sql: `${col}.STAsText() LIKE ?`,
+        params: [`%${v}%`],
       };
     }
 

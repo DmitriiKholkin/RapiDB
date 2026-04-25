@@ -675,16 +675,13 @@ function splitOracleStatements(src: string): string[] {
   return stmts.filter((s) => s.length > 0);
 }
 
-const ORACLE_NON_FILTERABLE = new Set([
+const ORACLE_FILTER_DENYLIST = new Set([
   "blob",
   "clob",
   "nclob",
   "bfile",
-  "raw",
   "long raw",
   "long",
-  "xmltype",
-  "sdo_geometry",
   "anydata",
   "anytype",
 ]);
@@ -1590,8 +1587,7 @@ export class OracleDriver extends BaseDBDriver {
   ): boolean {
     return (
       super.isFilterable(nativeType, category) &&
-      category !== "interval" &&
-      !ORACLE_NON_FILTERABLE.has(oracleTypeName(nativeType).toLowerCase())
+      !ORACLE_FILTER_DENYLIST.has(oracleTypeName(nativeType).toLowerCase())
     );
   }
 
@@ -1842,6 +1838,32 @@ export class OracleDriver extends BaseDBDriver {
       return {
         sql: `${oracleTemporalFilterExpr(column)} LIKE :${paramIndex}`,
         params: [`%${comparable}%`],
+      };
+    }
+
+    if (column.category === "binary") {
+      const v = (typeof val === "string" ? val : val[0])
+        .replace(/^(0x|\\x)/i, "")
+        .toUpperCase();
+      return {
+        sql: `UPPER(RAWTOHEX(${col})) LIKE UPPER(:${paramIndex})`,
+        params: [`%${v}%`],
+      };
+    }
+
+    if (column.category === "interval") {
+      const v = typeof val === "string" ? val : val[0];
+      return {
+        sql: `UPPER(TO_CHAR(${col})) LIKE UPPER(:${paramIndex})`,
+        params: [`%${v}%`],
+      };
+    }
+
+    if (column.category === "spatial") {
+      const v = typeof val === "string" ? val : val[0];
+      return {
+        sql: `UPPER(TO_CHAR(SDO_UTIL.TO_WKTGEOMETRY(${col}))) LIKE UPPER(:${paramIndex})`,
+        params: [`%${v}%`],
       };
     }
 

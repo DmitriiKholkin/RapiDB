@@ -182,10 +182,6 @@ const MYSQL_SPATIAL_TYPES = new Set([
   "geometry",
 ]);
 
-function isMysqlSpatialType(colType: string): boolean {
-  return MYSQL_SPATIAL_TYPES.has(colType.toLowerCase().split("(")[0].trim());
-}
-
 function mysqlTypeName(nativeType: string): string {
   const match = /^[a-z]+/i.exec(nativeType.trim());
   return match?.[0]?.toLowerCase() ?? nativeType.toLowerCase().trim();
@@ -1082,7 +1078,6 @@ export class MySQLDriver extends BaseDBDriver {
     nativeType: string,
     category: TypeCategory,
   ): boolean {
-    if (category === "spatial" || isMysqlSpatialType(nativeType)) return false;
     return super.isFilterable(nativeType, category);
   }
 
@@ -1403,6 +1398,11 @@ export class MySQLDriver extends BaseDBDriver {
         sql: `${col} IN (${parts.map(() => "?").join(", ")})`,
         params: parts,
       };
+    }
+
+    if (column.category === "spatial") {
+      const v = typeof val === "string" ? val : val[0];
+      return { sql: `ST_AsText(${col}) LIKE ?`, params: [`%${v}%`] };
     }
 
     // Datetime text search

@@ -190,7 +190,9 @@ const FLOAT_OPS: FilterOperator[] = [
   "is_null",
   "is_not_null",
 ];
-const TEXT_OPS: FilterOperator[] = ["like", "in", "is_null", "is_not_null"];
+const TEXT_OPS: FilterOperator[] = ["like", "is_null", "is_not_null"];
+const UUID_OPS: FilterOperator[] = ["like", "in", "is_null", "is_not_null"];
+const ENUM_OPS: FilterOperator[] = ["like", "in", "is_null", "is_not_null"];
 const DATE_OPS: FilterOperator[] = ["eq", "like", "is_null", "is_not_null"];
 const TEMPORAL_OPS: FilterOperator[] = ["like", "is_null", "is_not_null"];
 const BOOL_OPS: FilterOperator[] = ["eq", "neq", "is_null", "is_not_null"];
@@ -205,11 +207,13 @@ export function filterOperatorsForCategory(
       return NUMERIC_OPS;
     case "float":
       return FLOAT_OPS;
+    case "uuid":
+      return UUID_OPS;
     case "text":
     case "json":
-    case "uuid":
-    case "enum":
       return TEXT_OPS;
+    case "enum":
+      return ENUM_OPS;
     case "date":
       return DATE_OPS;
     case "time":

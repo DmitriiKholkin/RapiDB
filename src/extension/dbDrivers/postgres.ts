@@ -43,29 +43,6 @@ const PG_GEOMETRIC_TYPES = new Set([
   "circle",
 ]);
 
-function normalizeCidrValue(val: string): string {
-  const m = val
-    .trim()
-    .match(/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\/(\d{1,2})$/);
-  if (!m) return val;
-  const prefix = parseInt(m[2], 10);
-  if (prefix < 0 || prefix > 32) return val;
-  const parts = m[1].split(".").map(Number);
-  if (parts.some((p) => p < 0 || p > 255)) return val;
-  const mask =
-    prefix === 0 ? 0 : ((0xffffffff << (32 - prefix)) & 0xffffffff) >>> 0;
-  const ipNum =
-    (((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0) &
-    mask;
-  const masked = [
-    (ipNum >>> 24) & 0xff,
-    (ipNum >>> 16) & 0xff,
-    (ipNum >>> 8) & 0xff,
-    ipNum & 0xff,
-  ].join(".");
-  return `${masked}/${prefix}`;
-}
-
 function jsonToPgCircle(val: string): string {
   const trimmed = val.trim();
   if (!trimmed.startsWith("{")) return trimmed;
@@ -717,16 +694,6 @@ export class PostgresDriver extends BaseDBDriver {
     );
   }
 
-  protected override isFilterable(
-    nativeType: string,
-    category: TypeCategory,
-  ): boolean {
-    if (PG_GEOMETRIC_TYPES.has(nativeType.toLowerCase().split("(")[0].trim()))
-      return false;
-    if (category === "array" || category === "interval") return false;
-    return super.isFilterable(nativeType, category);
-  }
-
   // ─── PG SQL helpers ───
 
   override buildPagination(
@@ -844,9 +811,7 @@ export class PostgresDriver extends BaseDBDriver {
       return super.coerceInputValue(value, column);
     }
 
-    // CIDR: normalize
     const ct = column.nativeType.toLowerCase().split("(")[0].trim();
-    if (ct === "cidr") return normalizeCidrValue(value);
     if (ct === "circle") return jsonToPgCircle(value);
 
     // ISO datetime → date-only for date columns
@@ -1063,6 +1028,16 @@ export class PostgresDriver extends BaseDBDriver {
       const parts = val.split(",").map((s) => s.trim());
       const placeholders = parts.map((_, i) => `$${paramIndex + i}`).join(", ");
       return { sql: `${col} IN (${placeholders})`, params: parts };
+    }
+
+    // Spatial (geometric types): normalize spaces around commas to match PG text repr "(x,y)"
+    if (column.category === "spatial" || column.category === "array") {
+      const v = typeof val === "string" ? val : val[0];
+      const normalized = v.trim().replace(/\s*,\s*/g, ",");
+      return {
+        sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex}`,
+        params: [`%${normalized}%`],
+      };
     }
 
     // Default: CAST AS TEXT ILIKE
