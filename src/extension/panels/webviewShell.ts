@@ -40,7 +40,7 @@ function serializeInitialState(initialState: WebviewInitialState): string {
     .replace(/\u2029/g, "\\u2029");
 }
 
-export function configureWebviewResources({
+function configureWebviewResources({
   context,
   webview,
   includeMediaRoot = false,

@@ -87,14 +87,16 @@ export function CellDisplay({
   }
 
   // Default text
+  const singleLineStr = str.replace(/\r?\n/g, " ");
+
   return (
     <span
       style={{
         color: resolvedColor,
-        whiteSpace: "break-spaces",
+        whiteSpace: "pre",
       }}
     >
-      {str}
+      {singleLineStr}
     </span>
   );
 }

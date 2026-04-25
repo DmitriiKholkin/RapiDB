@@ -20,6 +20,7 @@ import { PostgresDriver } from "./dbDrivers/postgres";
 import { SQLiteDriver } from "./dbDrivers/sqlite";
 import type { IDBDriver } from "./dbDrivers/types";
 import { normalizeUnknownError } from "./utils/errorHandling";
+import { pMapWithLimit } from "./utils/concurrency";
 
 export type {
   BookmarkEntry,
@@ -33,26 +34,6 @@ export type {
 interface SchemaCacheEntry {
   objects: SchemaObjectEntry[];
   loading: Promise<void> | null;
-}
-export async function pMapWithLimit<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const results: R[] = new Array(items.length);
-  const indexed = items.map((item, i) => ({ item, i }));
-  const workers = Array.from(
-    { length: Math.min(limit, indexed.length) },
-    async () => {
-      while (indexed.length > 0) {
-        const next = indexed.shift();
-        if (!next) break;
-        results[next.i] = await fn(next.item).catch(() => [] as unknown as R);
-      }
-    },
-  );
-  await Promise.all(workers);
-  return results;
 }
 
 const TEST_CONNECTION_ID = "__test__";
@@ -199,15 +180,33 @@ export class ConnectionManager {
     }
   }
 
+  /**
+   * Shared helper: filters out all entries whose connectionId matches,
+   * writes the result, and fires the change event — only if something changed.
+   */
+  private async _purgeEntriesForConnection<T extends { connectionId: string }>(
+    connectionId: string,
+    read: () => T[],
+    write: (entries: T[]) => Promise<void>,
+    fire: () => void,
+  ): Promise<void> {
+    const all = read();
+    const filtered = all.filter((e) => e.connectionId !== connectionId);
+    if (filtered.length !== all.length) {
+      await write(filtered);
+      fire();
+    }
+  }
+
   private async _purgeHistoryForConnection(
     connectionId: string,
   ): Promise<void> {
-    const all = this.store.readHistory();
-    const filtered = all.filter((e) => e.connectionId !== connectionId);
-    if (filtered.length !== all.length) {
-      await this.store.writeHistory(filtered);
-      this._onDidChangeHistory.fire();
-    }
+    await this._purgeEntriesForConnection(
+      connectionId,
+      () => this.store.readHistory(),
+      (entries) => this.store.writeHistory(entries),
+      () => this._onDidChangeHistory.fire(),
+    );
   }
 
   private createDriver(config: ConnectionConfig): IDBDriver {
@@ -537,12 +536,12 @@ export class ConnectionManager {
   private async _purgeBookmarksForConnection(
     connectionId: string,
   ): Promise<void> {
-    const all = this.store.readBookmarks();
-    const filtered = all.filter((b) => b.connectionId !== connectionId);
-    if (filtered.length !== all.length) {
-      await this.store.writeBookmarks(filtered);
-      this._onDidChangeBookmarks.fire();
-    }
+    await this._purgeEntriesForConnection(
+      connectionId,
+      () => this.store.readBookmarks(),
+      (entries) => this.store.writeBookmarks(entries),
+      () => this._onDidChangeBookmarks.fire(),
+    );
   }
 
   async clearBookmarks(): Promise<void> {

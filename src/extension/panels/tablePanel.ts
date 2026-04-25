@@ -27,8 +27,6 @@ type ExportPayload = {
   limitToPage?: { page: number; pageSize: number };
 };
 
-type ExportFormat = "csv" | "json";
-
 const FILTER_ERROR_RE =
   /^\[RapiDB Filter\]|invalid input syntax|invalid cidr|malformed array|not a valid (binary|hex|uuid)|syntax error in input|invalid value for type|invalid number|operator does not exist|conversion failed|arithmetic overflow|ORA-0(1841|1843|1858|1861|6502)|ORA-01722|incorrect (date|datetime|time)|Incorrect integer value|Truncated incorrect|data truncat/i;
 
@@ -415,7 +413,7 @@ export class TablePanel {
   }
 
   private async _handleExport(
-    format: ExportFormat,
+    format: "csv" | "json",
     payload: ExportPayload | undefined,
   ): Promise<void> {
     const { sort = null, filters = [], limitToPage } = payload ?? {};

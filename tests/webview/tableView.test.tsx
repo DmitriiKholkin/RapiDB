@@ -256,12 +256,9 @@ describe("TableView", () => {
       (_, element) =>
         element?.textContent === "wad  23" &&
         element.tagName === "SPAN" &&
-        element.getAttribute("style")?.includes("white-space: break-spaces") ===
-          true,
+        element.getAttribute("style")?.includes("white-space: pre") === true,
     );
-    expect(valueCell.getAttribute("style")).toContain(
-      "white-space: break-spaces",
-    );
+    expect(valueCell.getAttribute("style")).toContain("white-space: pre");
   });
 
   it("requests pages, debounces filter application, and renders filter errors", async () => {

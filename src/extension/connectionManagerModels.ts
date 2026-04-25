@@ -34,5 +34,10 @@ export interface SchemaObjectEntry {
 }
 
 export interface StoredConnectionConfig extends ConnectionConfig {
+  /**
+   * Legacy alias for `username`, kept for backwards-compatibility with
+   * connection configs saved before the rename. Prefer `username` for any
+   * new code; this field is normalised to `username` on first read.
+   */
   user?: string;
 }
