@@ -401,6 +401,54 @@ function normalizeSqliteDatetimeLiteral(value: string): string | null {
   return normalized;
 }
 
+/**
+ * Tries to parse the UI JSON representation of a SQLite BLOB back into raw
+ * bytes.  The driver serialises Uint8Array / Buffer values via JSON.stringify
+ * which produces an index-keyed object:  {"0":72,"1":101,...}
+ * We also accept a plain JSON array of byte numbers: [72,101,...]
+ */
+function parseSqliteBlobDisplayValue(val: string): Uint8Array | null {
+  try {
+    const parsed: unknown = JSON.parse(val.trim());
+    if (Array.isArray(parsed)) {
+      if (
+        parsed.length > 0 &&
+        parsed.every(
+          (v) =>
+            typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 255,
+        )
+      ) {
+        return new Uint8Array(parsed as number[]);
+      }
+      return null;
+    }
+    if (parsed !== null && typeof parsed === "object") {
+      const entries = Object.entries(parsed as Record<string, unknown>);
+      if (
+        entries.length > 0 &&
+        entries.every(
+          ([k, v]) =>
+            /^\d+$/.test(k) &&
+            typeof v === "number" &&
+            Number.isInteger(v) &&
+            v >= 0 &&
+            v <= 255,
+        )
+      ) {
+        const maxIdx = Math.max(...entries.map(([k]) => Number(k)));
+        const bytes = new Uint8Array(maxIdx + 1);
+        for (const [k, v] of entries) {
+          bytes[Number(k)] = v as number;
+        }
+        return bytes;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function invalidSqliteTemporalFilterError(
   columnName: string,
   typeName: "time" | "datetime",
@@ -844,6 +892,13 @@ export class SQLiteDriver extends BaseDBDriver {
       }
     }
 
+    if (typeof value === "string" && column.category === "binary") {
+      const parsedBlob = parseSqliteBlobDisplayValue(value);
+      if (parsedBlob !== null) {
+        return parsedBlob;
+      }
+    }
+
     return super.coerceInputValue(value, column);
   }
 
@@ -1010,6 +1065,15 @@ export class SQLiteDriver extends BaseDBDriver {
       val !== ""
     ) {
       const sqlOp = this.sqlOperator(operator);
+      if (column.category === "integer" && /^-?\d+$/.test(val)) {
+        const big = BigInt(val);
+        if (
+          big > BigInt(Number.MAX_SAFE_INTEGER) ||
+          big < -BigInt(Number.MAX_SAFE_INTEGER)
+        ) {
+          return { sql: `${col} ${sqlOp} ?`, params: [big] };
+        }
+      }
       return { sql: `${col} ${sqlOp} ?`, params: [Number(val)] };
     }
 
@@ -1089,6 +1153,20 @@ export class SQLiteDriver extends BaseDBDriver {
         sql: `${col} IN (${parts.map(() => "?").join(", ")})`,
         params: parts,
       };
+    }
+
+    // Default text LIKE
+    // Binary / BLOB – parse the UI display value back to raw bytes and use
+    // INSTR so the user can search for an exact byte-sequence substring.
+    if (column.category === "binary" && typeof val === "string") {
+      const bytes = parseSqliteBlobDisplayValue(val);
+      if (bytes !== null && bytes.length > 0) {
+        return {
+          sql: `(INSTR(${col}, ?) > 0 OR CAST(${col} AS TEXT) = ?)`,
+          params: [bytes, val],
+        };
+      }
+      return null;
     }
 
     // Default text LIKE

@@ -1356,6 +1356,12 @@ export class MSSQLDriver extends BaseDBDriver {
 
       if (!Number.isNaN(Number(val)) && val !== "") {
         const sqlOp = this.sqlOperator(operator);
+        if (
+          baseTypeName(column.nativeType) === "bigint" &&
+          /^-?\d+$/.test(val)
+        ) {
+          return { sql: `${col} ${sqlOp} ?`, params: [BigInt(val)] };
+        }
         return { sql: `${col} ${sqlOp} ?`, params: [Number(val)] };
       }
     }

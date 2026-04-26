@@ -749,4 +749,38 @@ describe("filter SQL compatibility for edge filterable types", () => {
 
     expect(result?.params).toEqual(["%((0,0),(1,0),(1,1))%"]);
   });
+
+  it("passes bigint unsigned MAX value as string param to preserve precision", () => {
+    const driver = new MySQLDriver({
+      ...baseConfig,
+      type: "mysql",
+    } as ConnectionConfig);
+    const BIGINT_U_MAX = "18446744073709551615";
+    const result = driver.buildFilterCondition(
+      buildFilterColumn("bigint unsigned", "integer"),
+      "eq",
+      BIGINT_U_MAX,
+      1,
+    );
+
+    expect(result?.sql).toBe("`probe_col` = ?");
+    expect(result?.params).toEqual([BIGINT_U_MAX]);
+    expect(typeof result?.params[0]).toBe("string");
+  });
+
+  it("passes safe integer bigint value as number param", () => {
+    const driver = new MySQLDriver({
+      ...baseConfig,
+      type: "mysql",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      buildFilterColumn("bigint unsigned", "integer"),
+      "eq",
+      "42",
+      1,
+    );
+
+    expect(result?.params).toEqual([42]);
+    expect(typeof result?.params[0]).toBe("number");
+  });
 });

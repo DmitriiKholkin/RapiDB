@@ -125,7 +125,12 @@ export function splitMySQLScript(sql: string): string[] {
       continue;
     }
     if (consumeKeyword("IF")) {
-      compoundDepth++;
+      // Treat IF as a compound keyword only inside an existing block.
+      // This avoids false positives for top-level clauses like
+      // `CREATE DATABASE ... IF NOT EXISTS`.
+      if (compoundDepth > 0) {
+        compoundDepth++;
+      }
       continue;
     }
     if (consumeKeyword("LOOP")) {
@@ -447,6 +452,23 @@ function parseMysqlBitWidth(nativeType: string): number | null {
 
   const width = Number.parseInt(match[1], 10);
   return Number.isInteger(width) && width > 0 ? width : null;
+}
+
+/**
+ * Returns a safe SQL parameter for integer filter values.
+ * Values that exceed Number.MAX_SAFE_INTEGER are passed as strings so that
+ * mysql2 preserves full precision (it coerces string params to the column
+ * type on the server side).
+ */
+function toMysqlIntegerFilterParam(val: string): number | string {
+  if (/^-?\d+$/.test(val)) {
+    const big = BigInt(val);
+    const safe = BigInt(Number.MAX_SAFE_INTEGER);
+    if (big > safe || big < -safe) {
+      return val;
+    }
+  }
+  return Number(val);
 }
 
 function mysqlBitMaxValue(nativeType: string): bigint | null {
@@ -1434,7 +1456,11 @@ export class MySQLDriver extends BaseDBDriver {
       val !== ""
     ) {
       const sqlOp = this.sqlOperator(operator);
-      return { sql: `${col} ${sqlOp} ?`, params: [Number(val)] };
+      const param =
+        column.category === "integer"
+          ? toMysqlIntegerFilterParam(val)
+          : Number(val);
+      return { sql: `${col} ${sqlOp} ?`, params: [param] };
     }
 
     // Between

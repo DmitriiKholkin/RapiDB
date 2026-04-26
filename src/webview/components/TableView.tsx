@@ -794,6 +794,10 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
     ) => {
       setEditCell(null);
 
+      if (!canEditRows) {
+        return;
+      }
+
       const coerced: unknown = newVal === NULL_SENTINEL ? null : newVal;
 
       const origStr = valueToEditString(originalVal);
@@ -824,7 +828,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
         return next;
       });
     },
-    [],
+    [canEditRows],
   );
 
   const commitDraftCellEdit = useCallback(
@@ -1844,18 +1848,18 @@ function ExportChoiceDialog({
           >
             <button
               type="button"
-              style={{ ...btn("ghost"), textAlign: "left" }}
+              style={{ ...btn("ghost"), justifyContent: "flex-start" }}
               onClick={onExportVisible}
             >
               Export visible ({visibleCount.toLocaleString()} rows)
             </button>
             <button
               type="button"
-              style={{ ...btn("ghost"), textAlign: "left" }}
+              style={{ ...btn("ghost"), justifyContent: "flex-start" }}
               onClick={onExportAll}
             >
-              Export full table ({totalCount.toLocaleString()} rows){" "}
-              <span style={{ opacity: 0.65, fontSize: 11 }}>
+              Export full table ({totalCount.toLocaleString()} rows)
+              <span style={{ opacity: 0.65, fontSize: 11, marginLeft: 6 }}>
                 ⚠ may be a heavy operation
               </span>
             </button>
