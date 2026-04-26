@@ -65,7 +65,7 @@ The **Database Explorer** tree expands into databases → schemas → tables, vi
 
 ### 🗂️ Query History & Bookmarks
 
-Every query you run lands in **Query History** — click any entry to reopen it in the editor. Queries you want to keep forever go into **Bookmarks** with a single press. Both limits are configurable.
+Every query you run lands in **Query History** — click any entry to reopen it in the editor. Queries you want to keep forever go into **Bookmarks** with a single press. Query History limit is configurable.
 
 <br/>
 
@@ -73,7 +73,7 @@ Every query you run lands in **Query History** — click any entry to reopen it 
 
 The query editor runs on **Monaco** — the same engine as VS Code itself. You get:
 
-- 🎨 Syntax highlighting & auto-formatting
+- 🎨 Syntax highlighting & SQL formatting (button / `Shift+Alt+F`)
 - 🧠 Schema-aware autocompletion — knows your actual tables and columns
 - ⌨️ `Ctrl+Enter` / `F5` to run · Select a fragment to run just that part
 - ↕️ Drag the divider to resize editor vs results
@@ -106,7 +106,7 @@ Click any table → the **Table Data Viewer** opens:
 | Inline editing | Click a cell → type → Enter |
 | New rows | Insert bar at the bottom |
 | Deletion | Select rows and delete |
-| Safety | Every write goes through a transaction — nothing half-applied |
+| Safety | Preview-first apply flow with verification; transactional where applicable |
 
 <br/>
 
@@ -160,18 +160,6 @@ Everything you'd normally Google `information_schema` for — **one click away**
 <summary>🛠️ For developers</summary>
 
 <br/>
-
-Test workflow:
-
-```bash
-npm run test:all
-```
-
-That single command now runs compile, typecheck, unit, webview, live DB, and extension suites in order. The DB step brings Docker services up, prepares fixtures, runs the per-engine suites serially, and tears the services down on exit.
-
-Compose-backed suites require Docker Desktop with the daemon running. If Docker is installed but not started, the suite now fails fast during `db:check` with a dedicated preflight error instead of failing later inside `docker compose`.
-
-If you want to keep the compose-backed databases running for debugging after the suite finishes, set `RAPIDB_KEEP_TEST_SERVICES=1` before `npm run test:all` or `npm run test:db`.
 
 **Stack:**
 
