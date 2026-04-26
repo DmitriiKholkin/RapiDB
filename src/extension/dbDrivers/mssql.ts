@@ -1329,15 +1329,6 @@ export class MSSQLDriver extends BaseDBDriver {
       }
     }
 
-    if (column.category === "binary") {
-      const v = typeof val === "string" ? val : val[0];
-      const hexVal = v.replace(/^(0x|\\x)/i, "").toUpperCase();
-      return {
-        sql: `CONVERT(VARCHAR(MAX), ${col}, 2) LIKE ?`,
-        params: [`%${hexVal}%`],
-      };
-    }
-
     if (this.isNumericCategory(column.category) && Array.isArray(val)) {
       return {
         sql: `${col} BETWEEN ? AND ?`,
@@ -1437,14 +1428,6 @@ export class MSSQLDriver extends BaseDBDriver {
             ? `CONVERT(VARCHAR(40), ${col}, 127) LIKE ?`
             : `CONVERT(VARCHAR(33), ${col}, 126) LIKE ?`,
         params: [`%${temporalSearchLiteral(v)}%`],
-      };
-    }
-
-    if (column.category === "spatial") {
-      const v = typeof val === "string" ? val : val[0];
-      return {
-        sql: `${col}.STAsText() LIKE ?`,
-        params: [`%${v}%`],
       };
     }
 

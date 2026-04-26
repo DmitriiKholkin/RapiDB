@@ -126,6 +126,22 @@ function oracleFloatPrecision(nativeType?: string): number | null {
   return null;
 }
 
+function oracleFloatDisplayPrecision(nativeType?: string): number | null {
+  if (!nativeType) return null;
+
+  const normalized = nativeType.toUpperCase().trim();
+  if (normalized === "BINARY_FLOAT") return 7;
+  if (normalized === "BINARY_DOUBLE") return 12;
+
+  const match = /^FLOAT(?:\((\d+)\))?$/.exec(normalized);
+  if (!match?.[1]) return null;
+
+  const precision = Number.parseInt(match[1], 10);
+  if (precision <= 24) return 7;
+  if (precision <= 53) return 12;
+  return null;
+}
+
 function normalizeOracleFloatValue(
   value: unknown,
   nativeType?: string,
@@ -134,12 +150,19 @@ function normalizeOracleFloatValue(
     return null;
   }
 
-  const precision = oracleFloatPrecision(nativeType);
+  const precision = oracleFloatDisplayPrecision(nativeType);
   if (precision === null) {
     return null;
   }
 
   return Number.parseFloat(value.toPrecision(precision)).toString();
+}
+
+function oracleFloatFilterTolerance(nativeType?: string): number {
+  const precision = oracleFloatPrecision(nativeType);
+  if (precision === 7) return 1e-6;
+  if (precision === 15) return 1e-12;
+  return 1e-9;
 }
 
 function toOracleDdlText(value: string | Buffer | null): string | null {
@@ -152,6 +175,42 @@ function toOracleDdlText(value: string | Buffer | null): string | null {
     return text ? text : null;
   }
   return null;
+}
+
+function oracleTimestampPreviewLiteral(value: Date): string {
+  const year = value.getUTCFullYear();
+  const month = pad2(value.getUTCMonth() + 1);
+  const day = pad2(value.getUTCDate());
+  const hours = pad2(value.getUTCHours());
+  const minutes = pad2(value.getUTCMinutes());
+  const seconds = pad2(value.getUTCSeconds());
+  const milliseconds = value.getUTCMilliseconds();
+  const fraction =
+    milliseconds > 0
+      ? `.${String(milliseconds).padStart(3, "0").replace(/0+$/, "")}`
+      : "";
+  return `TIMESTAMP '${year}-${month}-${day} ${hours}:${minutes}:${seconds}${fraction}'`;
+}
+
+function oracleTimestampPreviewText(value: Date, useUtc: boolean): string {
+  const year = useUtc ? value.getUTCFullYear() : value.getFullYear();
+  const month = pad2((useUtc ? value.getUTCMonth() : value.getMonth()) + 1);
+  const day = pad2(useUtc ? value.getUTCDate() : value.getDate());
+  const hours = pad2(useUtc ? value.getUTCHours() : value.getHours());
+  const minutes = pad2(useUtc ? value.getUTCMinutes() : value.getMinutes());
+  const seconds = pad2(useUtc ? value.getUTCSeconds() : value.getSeconds());
+  const milliseconds = useUtc
+    ? value.getUTCMilliseconds()
+    : value.getMilliseconds();
+  const fraction =
+    milliseconds > 0
+      ? `.${String(milliseconds).padStart(3, "0").replace(/0+$/, "")}`
+      : "";
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}${fraction}`;
+}
+
+function escapeOraclePreviewSqlString(value: string): string {
+  return value.replace(/'/g, "''");
 }
 
 function isUnavailableOracleDdl(ddl: string): boolean {
@@ -791,9 +850,13 @@ export class OracleDriver extends BaseDBDriver {
       const res = await conn.execute<{ OWNER: string }>(
         `SELECT username AS owner
         FROM all_users
-        WHERE oracle_maintained = 'N'
-            OR username = 'SYSTEM'
-        ORDER BY username`,
+        WHERE username = sys_context('USERENV','SESSION_USER')
+           OR oracle_maintained = 'N'
+        ORDER BY CASE
+                   WHEN username = sys_context('USERENV','SESSION_USER') THEN 0
+                   ELSE 1
+                 END,
+                 username`,
         {},
         { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
@@ -1643,6 +1706,60 @@ export class OracleDriver extends BaseDBDriver {
     return `${this.quoteIdentifier(column.name)} = :${paramIndex}`;
   }
 
+  materializePreviewInsertSql(
+    sql: string,
+    params: readonly unknown[] | undefined,
+    columns: readonly ColumnTypeMeta[],
+  ): string {
+    if (!params || params.length === 0 || columns.length === 0) {
+      return this.materializePreviewSql(sql, params);
+    }
+
+    return sql.replace(/:(\d+)/g, (match, rawIndex: string) => {
+      const index = Number.parseInt(rawIndex, 10) - 1;
+      if (index < 0 || index >= params.length) {
+        return match;
+      }
+
+      const value = params[index];
+      const column = columns[index];
+      if (
+        value instanceof Date &&
+        !Number.isNaN(value.getTime()) &&
+        column !== undefined
+      ) {
+        const typeName = oracleTypeName(column.nativeType);
+        if (typeName === "DATE") {
+          const temporalText = oracleTimestampPreviewText(value, false).slice(
+            0,
+            19,
+          );
+          return `TO_DATE('${escapeOraclePreviewSqlString(temporalText)}', 'YYYY-MM-DD HH24:MI:SS')`;
+        }
+
+        if (isTimezoneAwareOracleTemporal(column.nativeType)) {
+          const temporalText = oracleTimestampPreviewText(value, true);
+          return `TO_TIMESTAMP_TZ('${escapeOraclePreviewSqlString(temporalText)} +00:00', 'YYYY-MM-DD HH24:MI:SS.FF3 TZH:TZM')`;
+        }
+
+        if (typeName.startsWith("TIMESTAMP")) {
+          const temporalText = oracleTimestampPreviewText(value, false);
+          return `TO_TIMESTAMP('${escapeOraclePreviewSqlString(temporalText)}', 'YYYY-MM-DD HH24:MI:SS.FF3')`;
+        }
+      }
+
+      return this.formatPreviewSqlLiteral(value);
+    });
+  }
+
+  protected override formatPreviewSqlLiteral(value: unknown): string {
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+      return oracleTimestampPreviewLiteral(value);
+    }
+
+    return super.formatPreviewSqlLiteral(value);
+  }
+
   // ─── Oracle type-aware data helpers ───
 
   override coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
@@ -1822,6 +1939,27 @@ export class OracleDriver extends BaseDBDriver {
       !Number.isNaN(Number(val)) &&
       val !== ""
     ) {
+      if (
+        column.category === "float" &&
+        (operator === "eq" || operator === "neq")
+      ) {
+        const numericValue = Number(val);
+        const tolerance = oracleFloatFilterTolerance(column.nativeType);
+        const valueBind = `:${paramIndex}`;
+        const epsilonBind = `:${paramIndex + 1}`;
+        const valueRepeatBind = `:${paramIndex + 2}`;
+        const epsilonRepeatBind = `:${paramIndex + 3}`;
+        const deltaExpr = `ABS(TO_BINARY_DOUBLE(${col}) - TO_BINARY_DOUBLE(${valueBind}))`;
+        const toleranceExpr = `GREATEST(${epsilonBind}, ABS(TO_BINARY_DOUBLE(${valueRepeatBind})) * ${epsilonRepeatBind})`;
+        return {
+          sql:
+            operator === "neq"
+              ? `${deltaExpr} >= ${toleranceExpr}`
+              : `${deltaExpr} < ${toleranceExpr}`,
+          params: [numericValue, tolerance, numericValue, tolerance],
+        };
+      }
+
       const sqlOp = this.sqlOperator(operator);
       return {
         sql: `${col} ${sqlOp} :${paramIndex}`,
@@ -1862,32 +2000,6 @@ export class OracleDriver extends BaseDBDriver {
       return {
         sql: `${oracleTemporalFilterExpr(column)} LIKE :${paramIndex}`,
         params: [`%${comparable}%`],
-      };
-    }
-
-    if (column.category === "binary") {
-      const v = (typeof val === "string" ? val : val[0])
-        .replace(/^(0x|\\x)/i, "")
-        .toUpperCase();
-      return {
-        sql: `UPPER(RAWTOHEX(${col})) LIKE UPPER(:${paramIndex})`,
-        params: [`%${v}%`],
-      };
-    }
-
-    if (column.category === "interval") {
-      const v = typeof val === "string" ? val : val[0];
-      return {
-        sql: `UPPER(TO_CHAR(${col})) LIKE UPPER(:${paramIndex})`,
-        params: [`%${v}%`],
-      };
-    }
-
-    if (column.category === "spatial") {
-      const v = typeof val === "string" ? val : val[0];
-      return {
-        sql: `UPPER(TO_CHAR(SDO_UTIL.TO_WKTGEOMETRY(${col}))) LIKE UPPER(:${paramIndex})`,
-        params: [`%${v}%`],
       };
     }
 

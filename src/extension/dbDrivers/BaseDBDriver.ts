@@ -956,7 +956,9 @@ export abstract class BaseDBDriver implements IDBDriver {
    * filter builders (CAST/CONVERT + LIKE family) and category operators.
    */
   protected isFilterable(_nativeType: string, category: TypeCategory): boolean {
-    return category !== "lob";
+    return !["lob", "binary", "spatial", "array", "interval"].includes(
+      category,
+    );
   }
 
   // ─── SQL helpers ───

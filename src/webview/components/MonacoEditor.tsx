@@ -191,6 +191,29 @@ function objectKindFor(
   }
 }
 
+function objectDetailLabel(
+  type: SchemaObject["type"],
+  columnCount: number,
+): string {
+  if (type === "function" || type === "procedure") {
+    return type;
+  }
+
+  if (type === "view") {
+    return columnCount > 0 ? `view (${columnCount} cols)` : "view";
+  }
+
+  if (type === "table") {
+    return columnCount > 0 ? `table (${columnCount} cols)` : "table";
+  }
+
+  if (columnCount > 0) {
+    return `table (${columnCount} cols)`;
+  }
+
+  return type ?? "table";
+}
+
 function ensureCompletionProvider() {
   if (providerDisposable) {
     return;
@@ -251,12 +274,7 @@ function ensureCompletionProvider() {
           schemasWithHint.forEach((t, i) => {
             items.push({
               label: t.object,
-              detail:
-                t.type === "function" || t.type === "procedure"
-                  ? (t.type ?? "routine")
-                  : t.columns && t.columns?.length > 0
-                    ? `table (${t.columns.length} cols)`
-                    : (t.type ?? "table"),
+              detail: objectDetailLabel(t.type, t.columns.length),
               kind: objectKindFor(t.type),
               insertText: t.object,
               range,
@@ -313,11 +331,7 @@ function ensureCompletionProvider() {
         const isPrimary = t.schema === primarySchema;
         const isRoutine = t.type === "function" || t.type === "procedure";
         const objectKind = objectKindFor(t.type);
-        const detailLabel = isRoutine
-          ? (t.type ?? "routine")
-          : t.columns.length > 0
-            ? `table (${t.columns.length} cols)`
-            : (t.type ?? "table");
+        const detailLabel = objectDetailLabel(t.type, t.columns.length);
 
         items.push({
           label: t.object,

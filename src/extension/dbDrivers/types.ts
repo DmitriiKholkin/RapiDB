@@ -206,6 +206,7 @@ const DATE_OPS: FilterOperator[] = ["eq", "like", "is_null", "is_not_null"];
 const TEMPORAL_OPS: FilterOperator[] = ["like", "is_null", "is_not_null"];
 const BOOL_OPS: FilterOperator[] = ["eq", "neq", "is_null", "is_not_null"];
 const SEARCH_OPS: FilterOperator[] = ["like", "is_null", "is_not_null"];
+const NULL_ONLY_OPS: FilterOperator[] = ["is_null", "is_not_null"];
 
 export function filterOperatorsForCategory(
   cat: TypeCategory,
@@ -227,13 +228,15 @@ export function filterOperatorsForCategory(
       return DATE_OPS;
     case "time":
     case "datetime":
-    case "interval":
       return TEMPORAL_OPS;
+    case "interval":
+      return NULL_ONLY_OPS;
     case "boolean":
       return BOOL_OPS;
     case "binary":
     case "spatial":
     case "array":
+      return NULL_ONLY_OPS;
     case "other":
       return SEARCH_OPS;
     default:

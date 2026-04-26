@@ -120,15 +120,34 @@ export class TableMutationService {
       columns,
     );
 
+    const insertPreviewColumns = writableEntries(values, columnMetaByName)
+      .map(([columnName]) => columnMetaByName.get(columnName))
+      .filter((column): column is ColumnTypeMeta => column !== undefined);
+
+    const oracleLikeDriver = driver as {
+      materializePreviewInsertSql?: (
+        sql: string,
+        params: readonly unknown[] | undefined,
+        columns: readonly ColumnTypeMeta[],
+      ) => string;
+    };
+
+    const previewSql =
+      typeof oracleLikeDriver.materializePreviewInsertSql === "function"
+        ? oracleLikeDriver.materializePreviewInsertSql(
+            operation.sql,
+            operation.params,
+            insertPreviewColumns,
+          )
+        : driver.materializePreviewSql(operation.sql, operation.params);
+
     return {
       connectionId,
       database,
       schema,
       table,
       operation,
-      previewStatements: [
-        driver.materializePreviewSql(operation.sql, operation.params),
-      ],
+      previewStatements: [previewSql],
       verificationCriteria,
     };
   }

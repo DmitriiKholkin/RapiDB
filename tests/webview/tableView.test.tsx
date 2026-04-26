@@ -462,9 +462,11 @@ describe("TableView", () => {
 
     fireEvent.keyDown(window, { key: "Escape" });
 
-    expect(getLastPostedMessage()).toEqual({
-      type: "cancelMutationPreview",
-      payload: { previewToken: "preview-1" },
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "cancelMutationPreview",
+        payload: { previewToken: "preview-1" },
+      });
     });
 
     await waitFor(() => {

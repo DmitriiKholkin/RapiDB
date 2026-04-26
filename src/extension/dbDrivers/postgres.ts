@@ -1045,16 +1045,6 @@ export class PostgresDriver extends BaseDBDriver {
       return { sql: `${col} IN (${placeholders})`, params: parts };
     }
 
-    // Spatial (geometric types): normalize spaces around commas to match PG text repr "(x,y)"
-    if (column.category === "spatial" || column.category === "array") {
-      const v = typeof val === "string" ? val : val[0];
-      const normalized = v.trim().replace(/\s*,\s*/g, ",");
-      return {
-        sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex}`,
-        params: [`%${normalized}%`],
-      };
-    }
-
     // Default: CAST AS TEXT ILIKE
     const v = typeof val === "string" ? val : val[0];
     const finalVal = normalizeTemporalSearchValue(v);

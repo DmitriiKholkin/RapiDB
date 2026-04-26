@@ -80,25 +80,25 @@ const edgeFilterabilityExpectations: Record<
   postgres: [
     {
       nativeType: "point",
-      expectedFilterable: true,
-      expectedOperators: ["like", "is_null", "is_not_null"],
+      expectedFilterable: false,
+      expectedOperators: ["is_null", "is_not_null"],
     },
     {
       nativeType: "integer[]",
-      expectedFilterable: true,
-      expectedOperators: ["like", "is_null", "is_not_null"],
+      expectedFilterable: false,
+      expectedOperators: ["is_null", "is_not_null"],
     },
     {
       nativeType: "interval",
-      expectedFilterable: true,
-      expectedOperators: ["like", "is_null", "is_not_null"],
+      expectedFilterable: false,
+      expectedOperators: ["is_null", "is_not_null"],
     },
   ],
   mysql: [
     {
       nativeType: "geometry",
-      expectedFilterable: true,
-      expectedOperators: ["like", "is_null", "is_not_null"],
+      expectedFilterable: false,
+      expectedOperators: ["is_null", "is_not_null"],
     },
     {
       nativeType: "enum('A','B')",
@@ -109,13 +109,13 @@ const edgeFilterabilityExpectations: Record<
   mssql: [
     {
       nativeType: "geometry",
-      expectedFilterable: true,
-      expectedOperators: ["like", "is_null", "is_not_null"],
+      expectedFilterable: false,
+      expectedOperators: ["is_null", "is_not_null"],
     },
     {
       nativeType: "geography",
-      expectedFilterable: true,
-      expectedOperators: ["like", "is_null", "is_not_null"],
+      expectedFilterable: false,
+      expectedOperators: ["is_null", "is_not_null"],
     },
     {
       nativeType: "xml",
@@ -131,13 +131,13 @@ const edgeFilterabilityExpectations: Record<
   oracle: [
     {
       nativeType: "SDO_GEOMETRY",
-      expectedFilterable: true,
-      expectedOperators: ["like", "is_null", "is_not_null"],
+      expectedFilterable: false,
+      expectedOperators: ["is_null", "is_not_null"],
     },
     {
       nativeType: "INTERVAL DAY TO SECOND",
-      expectedFilterable: true,
-      expectedOperators: ["like", "is_null", "is_not_null"],
+      expectedFilterable: false,
+      expectedOperators: ["is_null", "is_not_null"],
     },
     {
       nativeType: "XMLTYPE",
@@ -616,138 +616,160 @@ describe("driver native type coverage", () => {
   }
 });
 
-describe("filter SQL compatibility for edge filterable types", () => {
-  it("uses ST_AsText for MySQL spatial like filters", () => {
+describe("filter SQL compatibility for complex null-only types", () => {
+  it("returns null for MySQL spatial like filters", () => {
     const driver = new MySQLDriver({
       ...baseConfig,
       type: "mysql",
     } as ConnectionConfig);
     const result = driver.buildFilterCondition(
-      buildFilterColumn("geometry", "spatial"),
+      {
+        ...buildFilterColumn("geometry", "spatial"),
+        filterable: false,
+        filterOperators: ["is_null", "is_not_null"],
+      },
       "like",
       "POINT(1 2)",
       1,
     );
 
-    expect(result?.sql).toContain("ST_AsText");
-    expect(result?.params).toEqual(["%POINT(1 2)%"]);
+    expect(result).toBeNull();
   });
 
-  it("uses STAsText for MSSQL spatial like filters", () => {
+  it("returns null for MSSQL spatial like filters", () => {
     const driver = new MSSQLDriver({
       ...baseConfig,
       type: "mssql",
     } as ConnectionConfig);
     const result = driver.buildFilterCondition(
-      buildFilterColumn("geometry", "spatial"),
+      {
+        ...buildFilterColumn("geometry", "spatial"),
+        filterable: false,
+        filterOperators: ["is_null", "is_not_null"],
+      },
       "like",
       "POINT(1 2)",
       1,
     );
 
-    expect(result?.sql).toContain("STAsText()");
-    expect(result?.params).toEqual(["%POINT(1 2)%"]);
+    expect(result).toBeNull();
   });
 
-  it("uses TO_CHAR for Oracle interval like filters", () => {
+  it("returns null for Oracle interval like filters", () => {
     const driver = new OracleDriver({
       ...baseConfig,
       type: "oracle",
       serviceName: "FREEPDB1",
     } as ConnectionConfig);
     const result = driver.buildFilterCondition(
-      buildFilterColumn("INTERVAL DAY TO SECOND", "interval"),
+      {
+        ...buildFilterColumn("INTERVAL DAY TO SECOND", "interval"),
+        filterable: false,
+        filterOperators: ["is_null", "is_not_null"],
+      },
       "like",
       "1 02:03:04",
       1,
     );
 
-    expect(result?.sql).toContain("TO_CHAR");
-    expect(result?.params).toEqual(["%1 02:03:04%"]);
+    expect(result).toBeNull();
   });
 
-  it("uses RAWTOHEX for Oracle RAW like filters", () => {
+  it("returns null for Oracle RAW like filters", () => {
     const driver = new OracleDriver({
       ...baseConfig,
       type: "oracle",
       serviceName: "FREEPDB1",
     } as ConnectionConfig);
     const result = driver.buildFilterCondition(
-      buildFilterColumn("RAW(16)", "binary"),
+      {
+        ...buildFilterColumn("RAW(16)", "binary"),
+        filterable: false,
+        filterOperators: ["is_null", "is_not_null"],
+      },
       "like",
       "0x0a0b",
       1,
     );
 
-    expect(result?.sql).toContain("RAWTOHEX");
-    expect(result?.params).toEqual(["%0A0B%"]);
+    expect(result).toBeNull();
   });
 
-  it("uses SDO_UTIL.TO_WKTGEOMETRY for Oracle spatial like filters", () => {
+  it("returns null for Oracle spatial like filters", () => {
     const driver = new OracleDriver({
       ...baseConfig,
       type: "oracle",
       serviceName: "FREEPDB1",
     } as ConnectionConfig);
     const result = driver.buildFilterCondition(
-      buildFilterColumn("SDO_GEOMETRY", "spatial"),
+      {
+        ...buildFilterColumn("SDO_GEOMETRY", "spatial"),
+        filterable: false,
+        filterOperators: ["is_null", "is_not_null"],
+      },
       "like",
       "POINT(1 2)",
       1,
     );
 
-    expect(result?.sql).toContain("SDO_UTIL.TO_WKTGEOMETRY");
-    expect(result?.params).toEqual(["%POINT(1 2)%"]);
+    expect(result).toBeNull();
   });
 
-  it("uses CAST AS TEXT ILIKE for Postgres array like filters", () => {
+  it("returns null for Postgres array like filters", () => {
     const driver = new PostgresDriver({
       ...baseConfig,
       type: "pg",
     } as ConnectionConfig);
     const result = driver.buildFilterCondition(
-      buildFilterColumn("integer[]", "array"),
+      {
+        ...buildFilterColumn("integer[]", "array"),
+        filterable: false,
+        filterOperators: ["is_null", "is_not_null"],
+      },
       "like",
       "1",
       1,
     );
 
-    expect(result?.sql).toContain("CAST");
-    expect(result?.sql).toContain("ILIKE");
-    expect(result?.params).toEqual(["%1%"]);
+    expect(result).toBeNull();
   });
 
-  it("normalizes spaces around commas for Postgres point like filters", () => {
+  it("returns null for Postgres point like filters", () => {
     const driver = new PostgresDriver({
       ...baseConfig,
       type: "pg",
     } as ConnectionConfig);
     const result = driver.buildFilterCondition(
-      buildFilterColumn("point", "spatial"),
+      {
+        ...buildFilterColumn("point", "spatial"),
+        filterable: false,
+        filterOperators: ["is_null", "is_not_null"],
+      },
       "like",
       "(1.5, 2.5)",
       1,
     );
 
-    expect(result?.sql).toContain("CAST");
-    expect(result?.sql).toContain("ILIKE");
-    // PG text repr of point has no space after comma: (1.5,2.5)
-    expect(result?.params).toEqual(["%( 1.5,2.5)%".replace(" ", "")]);
+    expect(result).toBeNull();
   });
 
-  it("normalizes spaces in Postgres polygon like filters", () => {
+  it("returns null for Postgres polygon like filters", () => {
     const driver = new PostgresDriver({
       ...baseConfig,
       type: "pg",
     } as ConnectionConfig);
     const result = driver.buildFilterCondition(
-      buildFilterColumn("polygon", "spatial"),
+      {
+        ...buildFilterColumn("polygon", "spatial"),
+        filterable: false,
+        filterOperators: ["is_null", "is_not_null"],
+      },
       "like",
       "((0, 0), (1, 0), (1, 1))",
       1,
     );
 
-    expect(result?.params).toEqual(["%((0,0),(1,0),(1,1))%"]);
+    expect(result).toBeNull();
   });
 
   it("passes bigint unsigned MAX value as string param to preserve precision", () => {
@@ -782,5 +804,52 @@ describe("filter SQL compatibility for edge filterable types", () => {
 
     expect(result?.params).toEqual([42]);
     expect(typeof result?.params[0]).toBe("number");
+  });
+
+  it("uses tolerant comparison for Oracle BINARY_FLOAT eq filters", () => {
+    const driver = new OracleDriver({
+      ...baseConfig,
+      type: "oracle",
+      serviceName: "FREEPDB1",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      buildFilterColumn("BINARY_FLOAT", "float"),
+      "eq",
+      "3.141593",
+      1,
+    );
+
+    expect(result?.sql).toContain("ABS(TO_BINARY_DOUBLE");
+    expect(result?.sql).toContain("GREATEST(:2");
+    expect(result?.sql).toContain("TO_BINARY_DOUBLE(:3)");
+    expect(result?.params).toHaveLength(4);
+    expect(result?.params[0]).toBe(Number.parseFloat("3.141593"));
+    expect(typeof result?.params[1]).toBe("number");
+    expect(result?.params[2]).toBe(Number.parseFloat("3.141593"));
+    expect(typeof result?.params[3]).toBe("number");
+  });
+
+  it("formats Oracle BINARY_DOUBLE values with readable precision", () => {
+    const driver = new OracleDriver({
+      ...baseConfig,
+      type: "oracle",
+      serviceName: "FREEPDB1",
+    } as ConnectionConfig);
+
+    const formatted = driver.formatOutputValue(
+      Number.parseFloat("3.141592653589793"),
+      {
+        ...buildFilterColumn("BINARY_DOUBLE", "float"),
+        valueSemantics: "plain",
+        nullable: true,
+        defaultValue: undefined,
+        isPrimaryKey: false,
+        primaryKeyOrdinal: undefined,
+        isForeignKey: false,
+        isAutoIncrement: false,
+      },
+    );
+
+    expect(formatted).toBe("3.14159265359");
   });
 });

@@ -1156,20 +1156,6 @@ export class SQLiteDriver extends BaseDBDriver {
     }
 
     // Default text LIKE
-    // Binary / BLOB – parse the UI display value back to raw bytes and use
-    // INSTR so the user can search for an exact byte-sequence substring.
-    if (column.category === "binary" && typeof val === "string") {
-      const bytes = parseSqliteBlobDisplayValue(val);
-      if (bytes !== null && bytes.length > 0) {
-        return {
-          sql: `(INSTR(${col}, ?) > 0 OR CAST(${col} AS TEXT) = ?)`,
-          params: [bytes, val],
-        };
-      }
-      return null;
-    }
-
-    // Default text LIKE
     const v = typeof val === "string" ? val : val[0];
     return { sql: `${col} LIKE ?`, params: [`%${v}%`] };
   }

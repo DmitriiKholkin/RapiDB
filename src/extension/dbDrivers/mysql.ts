@@ -1406,13 +1406,6 @@ export class MySQLDriver extends BaseDBDriver {
       }
     }
 
-    // Binary: HEX LIKE
-    if (column.category === "binary") {
-      const v = typeof val === "string" ? val : val[0];
-      const hexVal = v.replace(/^(0x|\\x)/i, "").toUpperCase();
-      return { sql: `HEX(${col}) LIKE ?`, params: [`%${hexVal}%`] };
-    }
-
     if (
       column.category === "date" &&
       typeof val === "string" &&
@@ -1475,11 +1468,6 @@ export class MySQLDriver extends BaseDBDriver {
         sql: `${col} IN (${parts.map(() => "?").join(", ")})`,
         params: parts,
       };
-    }
-
-    if (column.category === "spatial") {
-      const v = typeof val === "string" ? val : val[0];
-      return { sql: `ST_AsText(${col}) LIKE ?`, params: [`%${v}%`] };
     }
 
     // Datetime text search
