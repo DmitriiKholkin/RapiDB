@@ -28,18 +28,14 @@ import {
   ISO_DATETIME_RE,
   NULL_SENTINEL,
 } from "./types";
-
 type MssqlSqlType = Parameters<mssql.Request["input"]>[1];
-
 interface NamedRow {
   name: string;
 }
-
 interface ObjectRow {
   name: string;
   type: string;
 }
-
 interface DescribeColumnRow {
   COLUMN_NAME: string;
   DATA_TYPE: string;
@@ -55,14 +51,12 @@ interface DescribeColumnRow {
   PK_ORDINAL: number | null;
   IS_FK: number;
 }
-
 interface IndexRow {
   idx_name: string;
   col_name: string;
   is_unique: boolean | number;
   is_pk: boolean | number;
 }
-
 interface ForeignKeyRow {
   constraint_name: string;
   column_name: string;
@@ -70,7 +64,6 @@ interface ForeignKeyRow {
   ref_table: string;
   ref_column: string;
 }
-
 interface DdlColumnRow {
   COLUMN_NAME: string;
   DATA_TYPE: string;
@@ -86,26 +79,21 @@ interface DdlColumnRow {
   IS_PK: number;
   PK_ORDINAL: number | null;
 }
-
-function canonicalizeMssqlBitPersistedEditValue(
-  value: unknown,
-): { canonical: string } | null {
+function canonicalizeMssqlBitPersistedEditValue(value: unknown): {
+  canonical: string;
+} | null {
   if (value === NULL_SENTINEL || value === null) {
     return { canonical: "__rapidb_null__" };
   }
-
   if (value === true || value === 1) {
     return { canonical: "1" };
   }
-
   if (value === false || value === 0) {
     return { canonical: "0" };
   }
-
   if (typeof value !== "string") {
     return null;
   }
-
   const normalized = value.trim().toLowerCase();
   if (normalized === "true" || normalized === "1") {
     return { canonical: "1" };
@@ -115,11 +103,9 @@ function canonicalizeMssqlBitPersistedEditValue(
   }
   return null;
 }
-
 interface RoutineDefinitionRow {
   def: string | null;
 }
-
 interface MssqlArrayColumnMeta {
   index: number;
   name: string;
@@ -130,40 +116,34 @@ interface MssqlArrayColumnMeta {
   identity: boolean;
   readOnly: boolean;
 }
-
 interface MssqlArrayResult extends mssql.IResult<unknown[]> {
   columns?: MssqlArrayColumnMeta[][];
 }
-
 const MSSQL_TIME_RE = /^\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?$/;
 const MSSQL_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const INTEGER_RE = /^-?\d+$/;
 const DECIMAL_RE = /^-?\d+(?:\.\d+)?$/;
 const MSSQL_LIKE_MAX_NVARCHAR_CHARS = 3900;
-
 function approximateNumericFilterTolerance(rawValue: string): number {
   const fraction = /\.(\d+)/.exec(rawValue)?.[1].length ?? 0;
   const precision = Math.min(Math.max(fraction + 2, 6), 12);
   return 10 ** -precision;
 }
-
 function mssqlFloatSignificantDigits(nativeType: string): number {
   const normalized = nativeType.toLowerCase().trim();
   if (normalized.startsWith("real")) {
     return 7;
   }
-
   const match = /^float(?:\((\d+)\))?/.exec(normalized);
   if (!match?.[1]) {
     return 15;
   }
-
   return Number.parseInt(match[1], 10) <= 24 ? 7 : 15;
 }
-
-type MssqlTemporalDate = Date & { nanosecondDelta?: number };
-
+type MssqlTemporalDate = Date & {
+  nanosecondDelta?: number;
+};
 function mssqlFullType(
   typeName: string,
   maxLength: number,
@@ -171,28 +151,23 @@ function mssqlFullType(
   scale: number,
 ): string {
   const t = typeName.toLowerCase();
-
   if (["varchar", "char", "varbinary", "binary"].includes(t)) {
     return maxLength === -1 ? `${t}(MAX)` : `${t}(${maxLength})`;
   }
   if (["nvarchar", "nchar"].includes(t)) {
     return maxLength === -1 ? `${t}(MAX)` : `${t}(${maxLength / 2})`;
   }
-
   if (["decimal", "numeric"].includes(t)) {
     return `${t}(${precision},${scale})`;
   }
-
   if (t === "float") {
     return `float(${precision})`;
   }
-
   if (["datetime2", "datetimeoffset", "time"].includes(t)) {
     return `${t}(${scale})`;
   }
   return typeName;
 }
-
 function cleanMssqlDefault(raw: string): string {
   let s = raw.trim();
   while (s.startsWith("(") && s.endsWith(")")) {
@@ -203,27 +178,21 @@ function cleanMssqlDefault(raw: string): string {
   }
   return s;
 }
-
 function escapeMssqlPreviewSqlString(value: string): string {
   return value.replace(/'/g, "''");
 }
-
 const escapeMssqlId = (s: string) => s.replace(/]/g, "]]");
-
 function baseTypeName(typeName: string): string {
   return typeName.toLowerCase().split("(")[0].trim();
 }
-
 function formatMssqlBinaryPreviewLiteral(value: Buffer): string {
   return `0x${value.toString("hex")}`;
 }
-
 function isUnicodeMssqlLiteralType(nativeType: string): boolean {
   return ["nchar", "nvarchar", "ntext", "xml"].includes(
     baseTypeName(nativeType),
   );
 }
-
 function formatMssqlStringPreviewLiteral(
   value: string,
   nativeType?: string,
@@ -234,11 +203,9 @@ function formatMssqlStringPreviewLiteral(
       : "";
   return `${prefix}'${escapeMssqlPreviewSqlString(value)}'`;
 }
-
 function normalizeDatetimeLiteral(value: string): string {
   return normalizeSqlDatetimeOffsetSpacing(value.trim());
 }
-
 function normalizeDateLiteral(value: string): string {
   const trimmed = value.trim();
   if (DATE_ONLY_RE.test(trimmed)) {
@@ -250,7 +217,6 @@ function normalizeDateLiteral(value: string): string {
     }
     return isoToLocalDateStr(trimmed) ?? trimmed.slice(0, 10);
   }
-
   const normalizedSql = normalizeSqlDatetimeOffsetSpacing(trimmed);
   if (DATETIME_SQL_RE.test(normalizedSql)) {
     if (hasExplicitTimezone(normalizedSql)) {
@@ -261,48 +227,38 @@ function normalizeDateLiteral(value: string): string {
     }
     return normalizedSql.slice(0, 10);
   }
-
   return trimmed;
 }
-
 function detectScale(value: unknown): number | null {
   if (typeof value !== "string") {
     return null;
   }
-
   const match = /\.(\d+)/.exec(value);
   if (!match) return null;
   return Math.min(match[1].length, 7);
 }
-
 function parseMssqlTimeLiteral(value: string): MssqlTemporalDate {
   const match = /^(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,7}))?$/.exec(value);
   if (!match) {
     throw new TypeError("Invalid time.");
   }
-
   const hours = Number(match[1]);
   const minutes = Number(match[2]);
   const seconds = Number(match[3]);
   const fraction = match[4] ?? "";
-
   if (hours > 23 || minutes > 59 || seconds > 59) {
     throw new TypeError("Invalid time.");
   }
-
   const milliseconds = Number((fraction.slice(0, 3) || "0").padEnd(3, "0"));
   const result = new Date(
     Date.UTC(1970, 0, 1, hours, minutes, seconds, milliseconds),
   ) as MssqlTemporalDate;
-
   const subMillisecond = fraction.slice(3);
   if (subMillisecond.length > 0) {
     result.nanosecondDelta = Number(subMillisecond) / 10 ** fraction.length;
   }
-
   return result;
 }
-
 function parseMssqlNaiveDatetimeLiteral(value: string): MssqlTemporalDate {
   const match =
     /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,7}))?$/.exec(
@@ -311,7 +267,6 @@ function parseMssqlNaiveDatetimeLiteral(value: string): MssqlTemporalDate {
   if (!match) {
     throw new TypeError("Invalid datetime.");
   }
-
   const year = Number(match[1]);
   const month = Number(match[2]);
   const day = Number(match[3]);
@@ -319,7 +274,6 @@ function parseMssqlNaiveDatetimeLiteral(value: string): MssqlTemporalDate {
   const minutes = Number(match[5]);
   const seconds = Number(match[6]);
   const fraction = match[7] ?? "";
-
   if (
     month < 1 ||
     month > 12 ||
@@ -331,13 +285,11 @@ function parseMssqlNaiveDatetimeLiteral(value: string): MssqlTemporalDate {
   ) {
     throw new TypeError("Invalid datetime.");
   }
-
   const milliseconds = Number((fraction.slice(0, 3) || "0").padEnd(3, "0"));
   const result = new Date(
     Date.UTC(0, month - 1, day, hours, minutes, seconds, milliseconds),
   ) as MssqlTemporalDate;
   result.setUTCFullYear(year, month - 1, day);
-
   if (
     result.getUTCFullYear() !== year ||
     result.getUTCMonth() !== month - 1 ||
@@ -348,19 +300,15 @@ function parseMssqlNaiveDatetimeLiteral(value: string): MssqlTemporalDate {
   ) {
     throw new TypeError("Invalid datetime.");
   }
-
   const subMillisecond = fraction.slice(3);
   if (subMillisecond.length > 0) {
     result.nanosecondDelta = Number(subMillisecond) / 10 ** fraction.length;
   }
-
   return result;
 }
-
 function isSetFlag(value: boolean | number | null | undefined): boolean {
   return value === true || value === 1;
 }
-
 function columnTypeName(meta: MssqlArrayColumnMeta | undefined): string {
   const rawType = meta?.type;
   if (!rawType) return "";
@@ -369,15 +317,12 @@ function columnTypeName(meta: MssqlArrayColumnMeta | undefined): string {
   }
   return typeof rawType.type === "function" ? rawType.type.name : "";
 }
-
 function mssqlSqlTypeName(sqlType: MssqlSqlType): string {
   if (typeof sqlType === "function") {
     return sqlType.name;
   }
-
   return typeof sqlType.type === "function" ? sqlType.type.name : "";
 }
-
 function temporalSearchLiteral(value: string): string {
   const trimmed = value.trim();
   const hasMatchingQuotes =
@@ -387,34 +332,27 @@ function temporalSearchLiteral(value: string): string {
     hasMatchingQuotes && trimmed.length >= 2 ? trimmed.slice(1, -1) : trimmed;
   return normalizeDatetimeLiteral(unquoted).replace(" ", "T");
 }
-
 function datetimeOffsetSearchLiteral(value: string): string {
   const normalized = temporalSearchLiteral(value);
   const match =
     /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}:\d{2}|Z)$/i.exec(
       normalized,
     );
-
   if (!match) {
     return normalized;
   }
-
   const prefix = match[1];
   const fraction = match[2] ?? "";
   const offset = match[3];
-
   if (fraction === "") {
     return normalized;
   }
-
   const compactFraction = fraction.replace(/0+$/, "");
   if (compactFraction === "") {
     return `${prefix}%${offset}`;
   }
-
   return `${prefix}${compactFraction}%${offset}`;
 }
-
 const MSSQL_FILTER_DENYLIST = new Set([
   "image",
   "hierarchyid",
@@ -422,31 +360,25 @@ const MSSQL_FILTER_DENYLIST = new Set([
   "timestamp",
   "rowversion",
 ]);
-
 export class MSSQLDriver extends BaseDBDriver {
   private pool: mssql.ConnectionPool | null = null;
   private readonly config: ConnectionConfig;
-
   constructor(config: ConnectionConfig) {
     super();
     this.config = config;
   }
-
   private requirePool(): mssql.ConnectionPool {
     if (this.pool) {
       return this.pool;
     }
     throw new Error("[RapiDB] MSSQL connection is not open");
   }
-
   private poolConfig(): mssql.config {
     if (!this.config.host) {
       throw new Error("[RapiDB] MSSQL host is required");
     }
-
     const sslEnabled = this.config.ssl ?? true;
     const trustCert = !(this.config.rejectUnauthorized ?? true);
-
     return {
       server: this.config.host,
       port: this.config.port,
@@ -464,12 +396,10 @@ export class MSSQLDriver extends BaseDBDriver {
       },
     };
   }
-
   private createNVarCharType(value: unknown): MssqlSqlType {
     const length = typeof value === "string" ? value.length : 0;
     return mssql.NVarChar(length === 0 || length > 4000 ? mssql.MAX : length);
   }
-
   private normalizeInputValue(
     value: unknown,
     column?: ColumnTypeMeta,
@@ -477,28 +407,23 @@ export class MSSQLDriver extends BaseDBDriver {
     if (value === NULL_SENTINEL) return null;
     if (value === null || value === undefined || value === "") return value;
     if (typeof value !== "string") return value;
-
     const trimmed = value.trim();
     if (trimmed === "") return value;
-
     if (column && this.hasBooleanSemantics(column)) {
       const normalized = this.parseBooleanInput(trimmed);
       if (normalized !== null) {
         return normalized;
       }
     }
-
     if (column && this.hasBitSemantics(column)) {
       const normalized = this.parseBooleanInput(trimmed);
       if (normalized !== null) {
         return normalized ? 1 : 0;
       }
     }
-
     if (column?.category === "binary") {
       return super.coerceInputValue(trimmed, column);
     }
-
     if (column?.category === "integer") {
       if (INTEGER_RE.test(trimmed)) {
         return baseTypeName(column.nativeType) === "bigint"
@@ -507,23 +432,18 @@ export class MSSQLDriver extends BaseDBDriver {
       }
       return value;
     }
-
     if (column?.category === "float") {
       return DECIMAL_RE.test(trimmed) ? Number(trimmed) : value;
     }
-
     if (column?.category === "decimal") {
       return DECIMAL_RE.test(trimmed) ? trimmed : value;
     }
-
     if (column?.category === "date") {
       return normalizeDateLiteral(trimmed);
     }
-
     if (column?.category === "time") {
       return MSSQL_TIME_RE.test(trimmed) ? trimmed : value;
     }
-
     if (column?.category === "datetime") {
       const normalized = normalizeDatetimeLiteral(trimmed);
       return ISO_DATETIME_RE.test(normalized) ||
@@ -531,11 +451,9 @@ export class MSSQLDriver extends BaseDBDriver {
         ? normalized
         : value;
     }
-
     if (DATE_ONLY_RE.test(trimmed) || MSSQL_TIME_RE.test(trimmed)) {
       return trimmed;
     }
-
     const normalizedDateTime = normalizeDatetimeLiteral(trimmed);
     if (
       ISO_DATETIME_RE.test(normalizedDateTime) ||
@@ -543,10 +461,8 @@ export class MSSQLDriver extends BaseDBDriver {
     ) {
       return normalizedDateTime;
     }
-
     return value;
   }
-
   private typeForValue(value: unknown): MssqlSqlType {
     if (Buffer.isBuffer(value)) {
       return mssql.VarBinary(value.length === 0 ? mssql.MAX : value.length);
@@ -584,7 +500,6 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     return this.createNVarCharType(value);
   }
-
   private bindRequestInput(
     request: mssql.Request,
     name: string,
@@ -595,7 +510,6 @@ export class MSSQLDriver extends BaseDBDriver {
     const type = this.typeForValue(baseValue);
     const typeName = mssqlSqlTypeName(type);
     let value = baseValue;
-
     if (typeof baseValue === "string") {
       if (typeName === "Time") {
         value = parseMssqlTimeLiteral(baseValue);
@@ -605,10 +519,8 @@ export class MSSQLDriver extends BaseDBDriver {
         );
       }
     }
-
     request.input(name, type, value);
   }
-
   private bindPositionalParameters(
     request: mssql.Request,
     sql: string,
@@ -617,14 +529,12 @@ export class MSSQLDriver extends BaseDBDriver {
     if (!params || params.length === 0) {
       return sql;
     }
-
     const placeholderCount = (sql.match(/\?/g) ?? []).length;
     if (placeholderCount !== params.length) {
       throw new Error(
         `[RapiDB] MSSQL parameter mismatch: SQL has ${placeholderCount} placeholder(s) but ${params.length} value(s) were supplied.`,
       );
     }
-
     let index = 0;
     return sql.replace(/\?/g, () => {
       const name = `p${++index}`;
@@ -632,14 +542,12 @@ export class MSSQLDriver extends BaseDBDriver {
       return `@${name}`;
     });
   }
-
   private formatQueryValue(
     value: unknown,
     columnMeta: MssqlArrayColumnMeta | undefined,
   ): unknown {
     const typeName = columnTypeName(columnMeta);
     const pad = (n: number) => String(n).padStart(2, "0");
-
     if (typeName === "Bit") {
       if (value === true || value === 1 || value === "1") {
         return 1;
@@ -648,7 +556,6 @@ export class MSSQLDriver extends BaseDBDriver {
         return 0;
       }
     }
-
     if (
       typeName === "Real" &&
       typeof value === "number" &&
@@ -656,7 +563,6 @@ export class MSSQLDriver extends BaseDBDriver {
     ) {
       return Number.parseFloat(value.toPrecision(7));
     }
-
     if (value instanceof Date && !Number.isNaN(value.getTime())) {
       if (typeName === "Date") {
         return `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())}`;
@@ -677,10 +583,8 @@ export class MSSQLDriver extends BaseDBDriver {
         );
       }
     }
-
     return value;
   }
-
   async connect(): Promise<void> {
     if (this.pool !== null) {
       try {
@@ -688,7 +592,6 @@ export class MSSQLDriver extends BaseDBDriver {
       } catch {}
       this.pool = null;
     }
-
     const pool = new mssql.ConnectionPool(this.poolConfig());
     pool.on("error", (err: unknown) => {
       console.error(
@@ -698,16 +601,13 @@ export class MSSQLDriver extends BaseDBDriver {
     });
     this.pool = await pool.connect();
   }
-
   async disconnect(): Promise<void> {
     await this.pool?.close();
     this.pool = null;
   }
-
   isConnected(): boolean {
     return this.pool?.connected ?? false;
   }
-
   async listDatabases(): Promise<DatabaseInfo[]> {
     const res = await this.requirePool()
       .request()
@@ -719,30 +619,24 @@ export class MSSQLDriver extends BaseDBDriver {
       schemas: [],
     }));
   }
-
   async listSchemas(database: string): Promise<SchemaInfo[]> {
     const res = await this.requirePool()
       .request()
-      .query<NamedRow>(
-        `SELECT SCHEMA_NAME AS name FROM [${escapeMssqlId(database)}].INFORMATION_SCHEMA.SCHEMATA
+      .query<NamedRow>(`SELECT SCHEMA_NAME AS name FROM [${escapeMssqlId(database)}].INFORMATION_SCHEMA.SCHEMATA
          WHERE SCHEMA_NAME NOT IN ('sys','INFORMATION_SCHEMA','db_accessadmin','db_backupoperator',
            'db_datareader','db_datawriter','db_ddladmin','db_denydatareader','db_denydatawriter',
            'db_owner','db_securityadmin','guest')
-         ORDER BY SCHEMA_NAME`,
-      );
+         ORDER BY SCHEMA_NAME`);
     return res.recordset.map((row) => ({ name: row.name }));
   }
-
   async listObjects(database: string, schema: string): Promise<TableInfo[]> {
     const objects: TableInfo[] = [];
     const esc = (s: string) => s.replace(/'/g, "''");
     const tableRes = await this.requirePool()
       .request()
-      .query<ObjectRow>(
-        `SELECT TABLE_NAME AS name, TABLE_TYPE AS type
+      .query<ObjectRow>(`SELECT TABLE_NAME AS name, TABLE_TYPE AS type
          FROM [${escapeMssqlId(database)}].INFORMATION_SCHEMA.TABLES
-         WHERE TABLE_SCHEMA = '${esc(schema)}' ORDER BY TABLE_NAME`,
-      );
+         WHERE TABLE_SCHEMA = '${esc(schema)}' ORDER BY TABLE_NAME`);
     for (const row of tableRes.recordset) {
       objects.push({
         schema,
@@ -755,8 +649,7 @@ export class MSSQLDriver extends BaseDBDriver {
     try {
       const routineRes = await this.requirePool()
         .request()
-        .query<ObjectRow>(
-          `SELECT o.name,
+        .query<ObjectRow>(`SELECT o.name,
                   CASE o.type WHEN 'P' THEN 'procedure' WHEN 'PC' THEN 'procedure'
                               WHEN 'FN' THEN 'function'  WHEN 'IF' THEN 'function'
                               WHEN 'TF' THEN 'function'  WHEN 'AF' THEN 'function'
@@ -764,8 +657,7 @@ export class MSSQLDriver extends BaseDBDriver {
            FROM [${escapeMssqlId(database)}].sys.objects o
            JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = o.schema_id
            WHERE s.name = '${esc(schema)}' AND o.type IN ('P','PC','FN','IF','TF','AF')
-           ORDER BY o.name`,
-        );
+           ORDER BY o.name`);
       for (const row of routineRes.recordset) {
         objects.push({
           schema,
@@ -776,7 +668,6 @@ export class MSSQLDriver extends BaseDBDriver {
     } catch {}
     return objects;
   }
-
   async describeTable(
     database: string,
     schema: string,
@@ -785,8 +676,7 @@ export class MSSQLDriver extends BaseDBDriver {
     const esc = (s: string) => s.replace(/'/g, "''");
     const res = await this.requirePool()
       .request()
-      .query<DescribeColumnRow>(
-        `SELECT
+      .query<DescribeColumnRow>(`SELECT
            c.name                                                AS COLUMN_NAME,
            TYPE_NAME(c.user_type_id)                            AS DATA_TYPE,
            c.max_length,
@@ -817,8 +707,7 @@ export class MSSQLDriver extends BaseDBDriver {
            FROM [${escapeMssqlId(database)}].sys.foreign_key_columns fkc
          ) fk ON fk.parent_object_id = c.object_id AND fk.parent_column_id = c.column_id
          WHERE s.name = '${esc(schema)}' AND o.name = '${esc(table)}'
-         ORDER BY c.column_id`,
-      );
+         ORDER BY c.column_id`);
     return res.recordset.map((row) => ({
       name: row.COLUMN_NAME,
       type: mssqlFullType(
@@ -842,16 +731,13 @@ export class MSSQLDriver extends BaseDBDriver {
       isAutoIncrement: isSetFlag(row.is_identity),
     }));
   }
-
   async query(sql: string, params?: unknown[]): Promise<QueryResult> {
     const start = Date.now();
-
     const batches = sql
       .split(/\r?\n/)
       .reduce<string[]>(
         (acc, line) => {
           const isGo = /^GO(?:\s+\d+)?$/i.test(line.trim());
-
           if (isGo) {
             acc.push("");
           } else {
@@ -864,7 +750,6 @@ export class MSSQLDriver extends BaseDBDriver {
       )
       .map((b) => b.trim())
       .filter((b) => b.length > 0);
-
     if (batches.length === 0) {
       return {
         columns: [],
@@ -873,30 +758,25 @@ export class MSSQLDriver extends BaseDBDriver {
         executionTimeMs: Date.now() - start,
       };
     }
-
     if (batches.length > 1 && params && params.length > 0) {
       throw new Error(
         "[RapiDB] MSSQL:parameters are not supported in multi-batch scripts (GO). " +
           "Use parameters only in single queries without the GO separator.",
       );
     }
-
     let lastResult: QueryResult = {
       columns: [],
       rows: [],
       rowCount: 0,
       executionTimeMs: 0,
     };
-
     for (const batch of batches) {
       const currentParams = batches.length === 1 ? params : undefined;
       lastResult = await this._executeBatch(batch, currentParams, start);
     }
-
     lastResult.executionTimeMs = Date.now() - start;
     return lastResult;
   }
-
   private async _executeBatch(
     sql: string,
     params?: unknown[],
@@ -904,13 +784,11 @@ export class MSSQLDriver extends BaseDBDriver {
   ): Promise<QueryResult> {
     const req = this.requirePool().request();
     req.arrayRowMode = true;
-
     const finalSql = this.bindPositionalParameters(req, sql, params);
     const res = (await req.query(finalSql)) as MssqlArrayResult;
     const executionTimeMs = Date.now() - start;
     const columnsMeta = res.columns?.[0] ?? [];
     const affectedRows = res.rowsAffected.at(-1) ?? 0;
-
     if (columnsMeta.length === 0) {
       return {
         columns: [],
@@ -920,7 +798,6 @@ export class MSSQLDriver extends BaseDBDriver {
         executionTimeMs,
       };
     }
-
     const columns = columnsMeta.map((column) =>
       column.name === "" ? " " : column.name,
     );
@@ -932,7 +809,6 @@ export class MSSQLDriver extends BaseDBDriver {
         ]),
       ),
     );
-
     return {
       columns,
       rows,
@@ -941,7 +817,6 @@ export class MSSQLDriver extends BaseDBDriver {
       executionTimeMs,
     };
   }
-
   async getIndexes(
     database: string,
     schema: string,
@@ -950,8 +825,7 @@ export class MSSQLDriver extends BaseDBDriver {
     const esc = (s: string) => s.replace(/'/g, "''");
     const res = await this.requirePool()
       .request()
-      .query<IndexRow>(
-        `SELECT i.name AS idx_name, c.name AS col_name,
+      .query<IndexRow>(`SELECT i.name AS idx_name, c.name AS col_name,
                 i.is_unique AS is_unique, i.is_primary_key AS is_pk
          FROM [${escapeMssqlId(database)}].sys.indexes i
          JOIN [${escapeMssqlId(database)}].sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
@@ -959,8 +833,7 @@ export class MSSQLDriver extends BaseDBDriver {
          JOIN [${escapeMssqlId(database)}].sys.objects o ON o.object_id = i.object_id
          JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = o.schema_id
          WHERE s.name = '${esc(schema)}' AND o.name = '${esc(table)}'
-         ORDER BY i.name, ic.key_ordinal`,
-      );
+         ORDER BY i.name, ic.key_ordinal`);
     const map = new Map<string, import("./types").IndexMeta>();
     for (const row of res.recordset) {
       if (!map.has(row.idx_name)) {
@@ -978,7 +851,6 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     return [...map.values()];
   }
-
   async getForeignKeys(
     database: string,
     schema: string,
@@ -987,8 +859,7 @@ export class MSSQLDriver extends BaseDBDriver {
     const esc = (s: string) => s.replace(/'/g, "''");
     const res = await this.requirePool()
       .request()
-      .query<ForeignKeyRow>(
-        `SELECT fk.name AS constraint_name,
+      .query<ForeignKeyRow>(`SELECT fk.name AS constraint_name,
                 pc.name AS column_name,
                 rs.name AS ref_schema,
                 ro.name AS ref_table,
@@ -1001,8 +872,7 @@ export class MSSQLDriver extends BaseDBDriver {
          JOIN [${escapeMssqlId(database)}].sys.schemas rs ON rs.schema_id = ro.schema_id
          JOIN [${escapeMssqlId(database)}].sys.objects po ON po.object_id = fkc.parent_object_id
          JOIN [${escapeMssqlId(database)}].sys.schemas ps ON ps.schema_id = po.schema_id
-         WHERE ps.name = '${esc(schema)}' AND po.name = '${esc(table)}'`,
-      );
+         WHERE ps.name = '${esc(schema)}' AND po.name = '${esc(table)}'`);
     return res.recordset.map((row) => ({
       constraintName: row.constraint_name,
       column: row.column_name,
@@ -1011,7 +881,6 @@ export class MSSQLDriver extends BaseDBDriver {
       referencedColumn: row.ref_column,
     }));
   }
-
   async getCreateTableDDL(
     database: string,
     schema: string,
@@ -1020,8 +889,7 @@ export class MSSQLDriver extends BaseDBDriver {
     const esc = (s: string) => s.replace(/'/g, "''");
     const cols = await this.requirePool()
       .request()
-      .query<DdlColumnRow>(
-        `SELECT
+      .query<DdlColumnRow>(`SELECT
            c.name                              AS COLUMN_NAME,
            TYPE_NAME(c.user_type_id)           AS DATA_TYPE,
            c.max_length,
@@ -1048,9 +916,7 @@ export class MSSQLDriver extends BaseDBDriver {
            WHERE i.is_primary_key = 1
          ) pk ON pk.object_id = c.object_id AND pk.column_id = c.column_id
          WHERE s.name = '${esc(schema)}' AND o.name = '${esc(table)}'
-         ORDER BY c.column_id`,
-      );
-
+         ORDER BY c.column_id`);
     const pkCols = cols.recordset
       .filter((row) => row.IS_PK === 1)
       .sort(
@@ -1059,13 +925,11 @@ export class MSSQLDriver extends BaseDBDriver {
           (right.PK_ORDINAL ?? Number.MAX_SAFE_INTEGER),
       )
       .map((row) => this.quoteIdentifier(row.COLUMN_NAME));
-
     const colDefs = cols.recordset.map((row) => {
       if (isSetFlag(row.is_computed) && row.COMPUTED_DEFINITION) {
         const persisted = isSetFlag(row.is_persisted) ? " PERSISTED" : "";
         return `  ${this.quoteIdentifier(row.COLUMN_NAME)} AS (${row.COMPUTED_DEFINITION})${persisted}`;
       }
-
       const typ = mssqlFullType(
         row.DATA_TYPE,
         row.max_length,
@@ -1078,14 +942,11 @@ export class MSSQLDriver extends BaseDBDriver {
       const pk = pkCols.length === 1 && row.IS_PK === 1 ? " PRIMARY KEY" : "";
       return `  ${this.quoteIdentifier(row.COLUMN_NAME)} ${typ}${identity}${nullable}${def}${pk}`;
     });
-
     if (pkCols.length > 1) {
       colDefs.push(`  PRIMARY KEY (${pkCols.join(", ")})`);
     }
-
     return `CREATE TABLE ${this.qualifiedTableName("", schema, table)} (\n${colDefs.join(",\n")}\n);`;
   }
-
   async getRoutineDefinition(
     database: string,
     schema: string,
@@ -1100,7 +961,6 @@ export class MSSQLDriver extends BaseDBDriver {
     const def = res.recordset[0]?.def ?? null;
     return def ?? `-- Definition not available for [${schema}].[${name}]`;
   }
-
   async runTransaction(
     operations: import("./types").TransactionOperation[],
   ): Promise<void> {
@@ -1125,7 +985,6 @@ export class MSSQLDriver extends BaseDBDriver {
       throw e;
     }
   }
-
   mapTypeCategory(nativeType: string): TypeCategory {
     const ct = baseTypeName(nativeType);
     if (ct === "bit") return "integer";
@@ -1149,14 +1008,12 @@ export class MSSQLDriver extends BaseDBDriver {
     if (ct.includes("char") || ct.includes("varchar")) return "text";
     return "other";
   }
-
   protected getValueSemantics(
     nativeType: string,
     _category: TypeCategory,
   ): ValueSemantics {
     return baseTypeName(nativeType) === "bit" ? "bit" : "plain";
   }
-
   isDatetimeWithTime(nativeType: string): boolean {
     const ct = baseTypeName(nativeType);
     return [
@@ -1166,7 +1023,6 @@ export class MSSQLDriver extends BaseDBDriver {
       "smalldatetime",
     ].includes(ct);
   }
-
   protected override isFilterable(
     nativeType: string,
     category: TypeCategory,
@@ -1176,11 +1032,9 @@ export class MSSQLDriver extends BaseDBDriver {
       !MSSQL_FILTER_DENYLIST.has(baseTypeName(nativeType))
     );
   }
-
   override quoteIdentifier(name: string): string {
     return `[${name.replace(/]/g, "]]")}]`;
   }
-
   override qualifiedTableName(
     database: string,
     schema: string,
@@ -1196,7 +1050,6 @@ export class MSSQLDriver extends BaseDBDriver {
     parts.push(this.quoteIdentifier(table));
     return parts.join(".");
   }
-
   override buildPagination(
     offset: number,
     limit: number,
@@ -1207,7 +1060,6 @@ export class MSSQLDriver extends BaseDBDriver {
       params: [offset, limit],
     };
   }
-
   override buildInsertValueExpr(
     column: ColumnTypeMeta,
     _paramIndex: number,
@@ -1217,12 +1069,10 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     return "?";
   }
-
   override buildSetExpr(column: ColumnTypeMeta, _paramIndex: number): string {
     const expr = this.buildInsertValueExpr(column, _paramIndex);
     return `${this.quoteIdentifier(column.name)} = ${expr}`;
   }
-
   materializePreviewInsertSql(
     sql: string,
     params: readonly unknown[] | undefined,
@@ -1231,56 +1081,45 @@ export class MSSQLDriver extends BaseDBDriver {
     if (!params || params.length === 0) {
       return sql;
     }
-
     const placeholderCount = (sql.match(/\?/g) ?? []).length;
     if (placeholderCount !== params.length) {
       throw new Error(
         `[RapiDB] Preview parameter mismatch: SQL has ${placeholderCount} placeholder(s) but ${params.length} value(s) were supplied.`,
       );
     }
-
     let index = 0;
     return sql.replace(/\?/g, () => {
       const value = params[index];
       const column = columns[index];
       index += 1;
-
       if (typeof value === "string" && column) {
         return formatMssqlStringPreviewLiteral(value, column.nativeType);
       }
-
       return this.formatPreviewSqlLiteral(value);
     });
   }
-
   protected override formatPreviewSqlLiteral(value: unknown): string {
     if (typeof value === "string") {
       return formatMssqlStringPreviewLiteral(value);
     }
-
     if (typeof value === "boolean") {
       return value ? "1" : "0";
     }
-
     if (Buffer.isBuffer(value)) {
       return formatMssqlBinaryPreviewLiteral(value);
     }
-
     if (value instanceof ArrayBuffer) {
       return formatMssqlBinaryPreviewLiteral(
         Buffer.from(new Uint8Array(value)),
       );
     }
-
     if (ArrayBuffer.isView(value)) {
       return formatMssqlBinaryPreviewLiteral(
         Buffer.from(value.buffer, value.byteOffset, value.byteLength),
       );
     }
-
     return super.formatPreviewSqlLiteral(value);
   }
-
   override buildOrderByDefault(columns: ColumnTypeMeta[]): string {
     const pkCols = columns
       .filter((column) => column.isPrimaryKey)
@@ -1297,11 +1136,9 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     return "ORDER BY (SELECT NULL)";
   }
-
   override coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
     return this.normalizeInputValue(value, column);
   }
-
   override formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (value === null || value === undefined) return value;
     if (this.hasBitSemantics(column)) {
@@ -1341,7 +1178,6 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     return value;
   }
-
   override checkPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -1356,7 +1192,6 @@ export class MSSQLDriver extends BaseDBDriver {
         `Column "${column.name}" expects 0 or 1.`,
       );
     }
-
     if (column.category === "integer") {
       return this.checkExactNumericPersistedEdit(
         column,
@@ -1365,9 +1200,7 @@ export class MSSQLDriver extends BaseDBDriver {
         options,
       );
     }
-
     const baseType = baseTypeName(column.nativeType);
-
     if (column.category === "decimal") {
       if (baseType === "money") {
         return this.checkExactNumericPersistedEdit(
@@ -1377,7 +1210,6 @@ export class MSSQLDriver extends BaseDBDriver {
           options,
         );
       }
-
       if (baseType === "smallmoney") {
         return this.checkExactNumericPersistedEdit(
           column,
@@ -1386,11 +1218,9 @@ export class MSSQLDriver extends BaseDBDriver {
           options,
         );
       }
-
       if (!["decimal", "numeric"].includes(baseType)) {
         return null;
       }
-
       return this.checkExactNumericPersistedEdit(
         column,
         expectedValue,
@@ -1398,7 +1228,6 @@ export class MSSQLDriver extends BaseDBDriver {
         options,
       );
     }
-
     if (column.category === "float") {
       return this.checkApproximateNumericPersistedEdit(
         column,
@@ -1407,19 +1236,15 @@ export class MSSQLDriver extends BaseDBDriver {
         options,
       );
     }
-
     if (this.hasBooleanSemantics(column)) {
       return this.checkBooleanPersistedEdit(column, expectedValue, options);
     }
-
     if (column.category === "uuid") {
       return this.checkUuidPersistedEdit(column, expectedValue, options);
     }
-
     if (column.category === "binary") {
       return this.checkBinaryPersistedEdit(column, expectedValue, options);
     }
-
     if (
       column.category === "text" ||
       column.category === "date" ||
@@ -1433,13 +1258,10 @@ export class MSSQLDriver extends BaseDBDriver {
           options,
         );
       }
-
       return this.checkTextPersistedEdit(column, expectedValue, options);
     }
-
     return null;
   }
-
   override buildFilterCondition(
     column: ColumnTypeMeta,
     operator: FilterOperator,
@@ -1447,16 +1269,12 @@ export class MSSQLDriver extends BaseDBDriver {
     _paramIndex: number,
   ): FilterConditionResult | null {
     const col = this.quoteIdentifier(column.name);
-
     if (operator === "is_null") return { sql: `${col} IS NULL`, params: [] };
     if (operator === "is_not_null") {
       return { sql: `${col} IS NOT NULL`, params: [] };
     }
-
     if (!column.filterable || value === undefined) return null;
-
     const val = typeof value === "string" ? value.trim() : value;
-
     if (
       (this.hasBooleanSemantics(column) || this.hasBitSemantics(column)) &&
       (operator === "eq" || operator === "neq")
@@ -1468,20 +1286,17 @@ export class MSSQLDriver extends BaseDBDriver {
         const sqlOp = operator === "neq" ? "<>" : "=";
         return { sql: `${col} ${sqlOp} ?`, params: [boolVal] };
       }
-
       if (this.hasBitSemantics(column) && (strVal === "0" || strVal === "1")) {
         const sqlOp = operator === "neq" ? "<>" : "=";
         return { sql: `${col} ${sqlOp} ?`, params: [Number(strVal)] };
       }
     }
-
     if (this.isNumericCategory(column.category) && Array.isArray(val)) {
       return {
         sql: `${col} BETWEEN ? AND ?`,
         params: [Number(val[0]), Number(val[1])],
       };
     }
-
     if (this.isNumericCategory(column.category) && typeof val === "string") {
       if (operator === "in") {
         const parts = val.split(",").map((part) => Number(part.trim()));
@@ -1490,7 +1305,6 @@ export class MSSQLDriver extends BaseDBDriver {
           params: parts,
         };
       }
-
       if (!Number.isNaN(Number(val)) && val !== "") {
         if (
           column.category === "float" &&
@@ -1517,7 +1331,6 @@ export class MSSQLDriver extends BaseDBDriver {
             ],
           };
         }
-
         const sqlOp = this.sqlOperator(operator);
         if (
           baseTypeName(column.nativeType) === "bigint" &&
@@ -1528,7 +1341,6 @@ export class MSSQLDriver extends BaseDBDriver {
         return { sql: `${col} ${sqlOp} ?`, params: [Number(val)] };
       }
     }
-
     if (column.category === "date") {
       const v = typeof val === "string" ? val : val[0];
       if (Array.isArray(val)) {
@@ -1544,7 +1356,6 @@ export class MSSQLDriver extends BaseDBDriver {
           params: parts,
         };
       }
-
       if (["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)) {
         const sqlOp = operator === "neq" ? "<>" : this.sqlOperator(operator);
         return { sql: `CONVERT(date, ${col}) ${sqlOp} ?`, params: [v] };
@@ -1554,7 +1365,6 @@ export class MSSQLDriver extends BaseDBDriver {
         params: [`%${v}%`],
       };
     }
-
     if (column.category === "time") {
       const v = typeof val === "string" ? val : val[0];
       if (Array.isArray(val)) {
@@ -1572,11 +1382,9 @@ export class MSSQLDriver extends BaseDBDriver {
         params: [`%${v}%`],
       };
     }
-
     if (operator === "between" && Array.isArray(val)) {
       return { sql: `${col} BETWEEN ? AND ?`, params: [val[0], val[1]] };
     }
-
     if (operator === "in" && typeof val === "string") {
       const parts = val.split(",").map((part) => part.trim());
       return {
@@ -1584,7 +1392,6 @@ export class MSSQLDriver extends BaseDBDriver {
         params: parts,
       };
     }
-
     if (this.isDatetimeWithTime(column.nativeType)) {
       const v = typeof val === "string" ? val : val[0];
       if (["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)) {
@@ -1594,7 +1401,6 @@ export class MSSQLDriver extends BaseDBDriver {
           params: [normalizeDatetimeLiteral(v)],
         };
       }
-
       if (baseTypeName(column.nativeType) === "datetimeoffset") {
         const normalizedExpr = `REPLACE(REPLACE(REPLACE(CONVERT(VARCHAR(40), ${col}, 127), 'Z', '+00:00'), ' +', '+'), ' -', '-')`;
         return {
@@ -1602,30 +1408,24 @@ export class MSSQLDriver extends BaseDBDriver {
           params: [`%${datetimeOffsetSearchLiteral(v)}%`],
         };
       }
-
       return {
         sql: `CONVERT(VARCHAR(33), ${col}, 126) LIKE ?`,
         params: [`%${temporalSearchLiteral(v)}%`],
       };
     }
-
     const v = typeof val === "string" ? val : val[0];
     if (operator === "like" || operator === "ilike") {
       if (v.length > MSSQL_LIKE_MAX_NVARCHAR_CHARS) {
-        // SQL Server pattern functions are not reliable for very large search terms.
-        // Fall back to exact comparison so pasted full cell values still work.
         return {
           sql: `CAST(${col} AS NVARCHAR(MAX)) = CAST(? AS NVARCHAR(MAX))`,
           params: [v],
         };
       }
-
       return {
         sql: `CHARINDEX(CAST(? AS NVARCHAR(MAX)), CAST(${col} AS NVARCHAR(MAX))) > 0`,
         params: [v],
       };
     }
-
     if (operator === "eq" || operator === "neq") {
       const sqlOp = operator === "neq" ? "<>" : "=";
       return { sql: `${col} ${sqlOp} ?`, params: [v] };

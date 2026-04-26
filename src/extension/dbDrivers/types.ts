@@ -8,7 +8,6 @@ import type {
   TypeCategory,
   ValueSemantics,
 } from "../../shared/tableTypes";
-
 export {
   type ColumnMeta,
   type ColumnTypeMeta,
@@ -22,23 +21,16 @@ export {
   type TypeCategory,
   type ValueSemantics,
 } from "../../shared/tableTypes";
-
-// ─── Shared regex constants (used by drivers and tableDataService) ───
-
 export const ISO_DATETIME_RE =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}(?::?\d{2})?)?$/;
-
 export const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
-
 export const DATETIME_SQL_RE =
   /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}(?::?\d{2})?)?$/;
-
 export interface TableInfo {
   schema: string;
   name: string;
   type: "table" | "view" | "function" | "procedure";
 }
-
 export interface QueryResult {
   columns: string[];
   columnMeta?: QueryColumnMeta[];
@@ -47,46 +39,32 @@ export interface QueryResult {
   executionTimeMs: number;
   affectedRows?: number;
 }
-
 export function colKey(index: number): string {
   return `__col_${index}`;
 }
-
 export interface DatabaseInfo {
   name: string;
   schemas: SchemaInfo[];
 }
-
 export interface SchemaInfo {
   name: string;
 }
-
-// ─── Filter condition result (returned by driver.buildFilterCondition) ───
-
 export interface FilterConditionResult {
   sql: string;
   params: unknown[];
 }
-
-// ─── Pagination result (returned by driver.buildPagination) ───
-
 export interface PaginationResult {
   sql: string;
   params: unknown[];
 }
-
 export interface PersistedEditCheckOptions {
   persistedValue: unknown;
 }
-
 export interface PersistedEditCheckResult {
   ok: boolean;
   shouldVerify: boolean;
   message?: string;
 }
-
-// ─── Driver interface ───
-
 export interface IDBDriver {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
@@ -132,8 +110,6 @@ export interface IDBDriver {
     schema: string,
     table: string,
   ): Promise<string | null>;
-
-  // ── SQL building helpers ──
   quoteIdentifier(name: string): string;
   qualifiedTableName(database: string, schema: string, table: string): string;
   buildPagination(
@@ -142,8 +118,6 @@ export interface IDBDriver {
     paramIndex: number,
   ): PaginationResult;
   buildOrderByDefault(cols: ColumnTypeMeta[]): string;
-
-  // ── Type-aware data helpers ──
   coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown;
   formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown;
   checkPersistedEdit(
@@ -170,15 +144,11 @@ export interface IDBDriver {
   buildSetExpr(column: ColumnTypeMeta, paramIndex: number): string;
   materializePreviewSql(sql: string, params?: readonly unknown[]): string;
 }
-
 export interface TransactionOperation {
   sql: string;
   params?: unknown[];
   checkAffectedRows?: boolean;
 }
-
-// ─── Helpers for filter operators per TypeCategory ───
-
 const NUMERIC_OPS: FilterOperator[] = [
   "eq",
   "neq",
@@ -222,7 +192,6 @@ const TEMPORAL_OPS: FilterOperator[] = ["like", "is_null", "is_not_null"];
 const BOOL_OPS: FilterOperator[] = ["eq", "neq", "is_null", "is_not_null"];
 const SEARCH_OPS: FilterOperator[] = ["like", "is_null", "is_not_null"];
 const NULL_ONLY_OPS: FilterOperator[] = ["is_null", "is_not_null"];
-
 export function filterOperatorsForCategory(
   cat: TypeCategory,
 ): FilterOperator[] {

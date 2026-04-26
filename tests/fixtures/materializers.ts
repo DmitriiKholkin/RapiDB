@@ -531,8 +531,3 @@ export function buildFixtureMaterializationPlan(
     seedStatements: createSeedStatements(engineId),
   };
 }
-
-export const CANONICAL_FIXTURE_PLAN_MANIFEST = {
-  datasetId: CANONICAL_FIXTURE_DATASET.datasetId,
-  supportedEngines: ["sqlite", "postgres", "mysql", "mssql", "oracle"] as const,
-};

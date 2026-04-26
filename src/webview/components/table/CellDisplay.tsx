@@ -2,10 +2,7 @@ import React from "react";
 import type { TypeCategory } from "../../../shared/tableTypes";
 import { getCategoryPresentation } from "../../types";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
-
 const PENDING_COLOR = "var(--vscode-editorWarning-foreground, #cca700)";
-
-/** Display a cell value with category-aware formatting. */
 export function CellDisplay({
   value,
   isPending,
@@ -18,15 +15,11 @@ export function CellDisplay({
   if (value === null || value === undefined) {
     return <span style={{ fontStyle: "italic", opacity: 0.45 }}>NULL</span>;
   }
-
   const categoryColor = category
     ? getCategoryPresentation(category).foreground
     : undefined;
   const resolvedColor = isPending ? PENDING_COLOR : categoryColor;
-
   const str = formatScalarValueForDisplay(value);
-
-  // Binary display (hex prefix)
   if (category === "binary" && str.startsWith("\\x")) {
     return (
       <span
@@ -39,8 +32,6 @@ export function CellDisplay({
       </span>
     );
   }
-
-  // JSON display (truncated)
   if (category === "json" && str.length > 0) {
     return (
       <span
@@ -54,8 +45,6 @@ export function CellDisplay({
       </span>
     );
   }
-
-  // UUID — monospace inherent, but subtle color
   if (category === "uuid") {
     return (
       <span
@@ -68,8 +57,6 @@ export function CellDisplay({
       </span>
     );
   }
-
-  // Numeric — right-aligned is handled by parent; here just style
   if (
     category === "integer" ||
     category === "float" ||
@@ -85,10 +72,7 @@ export function CellDisplay({
       </span>
     );
   }
-
-  // Default text
   const singleLineStr = str.replace(/\r?\n/g, " ");
-
   return (
     <span
       style={{

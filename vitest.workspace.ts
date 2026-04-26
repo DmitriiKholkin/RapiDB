@@ -4,7 +4,6 @@ import {
   projectIdForEngine,
   TEST_PROJECT_IDS,
 } from "./tests/contracts/testingContracts";
-
 const dbProjects = DB_ENGINE_IDS.map((engineId) =>
   createVitestProject({
     projectId: projectIdForEngine(engineId),
@@ -14,12 +13,11 @@ const dbProjects = DB_ENGINE_IDS.map((engineId) =>
       "./tests/setup/common.setup.ts",
       "./tests/setup/liveDb.setup.ts",
     ],
-    testTimeout: 120_000,
-    hookTimeout: 300_000,
+    testTimeout: 120000,
+    hookTimeout: 300000,
     fileParallelism: false,
   }),
 );
-
 export default [
   createVitestProject({
     projectId: TEST_PROJECT_IDS[0],
@@ -45,8 +43,8 @@ export default [
       "./tests/setup/common.setup.ts",
       "./tests/setup/extension.setup.ts",
     ],
-    testTimeout: 60_000,
-    hookTimeout: 60_000,
+    testTimeout: 60000,
+    hookTimeout: 60000,
     fileParallelism: false,
   }),
 ];

@@ -24,15 +24,12 @@ import type {
   ValueSemantics,
 } from "./types";
 import { DATETIME_SQL_RE, ISO_DATETIME_RE, NULL_SENTINEL } from "./types";
-
-const PG_OID_DATE = 1082; // date
-const PG_OID_TIMESTAMP = 1114; // timestamp without time zone
-const PG_OID_TIMESTAMPTZ = 1184; // timestamp with time zone
-
+const PG_OID_DATE = 1082;
+const PG_OID_TIMESTAMP = 1114;
+const PG_OID_TIMESTAMPTZ = 1184;
 pgTypes.setTypeParser(PG_OID_DATE, (val: string) => val);
 pgTypes.setTypeParser(PG_OID_TIMESTAMP, (val: string) => val);
 pgTypes.setTypeParser(PG_OID_TIMESTAMPTZ, (val: string) => val);
-
 const PG_GEOMETRIC_TYPES = new Set([
   "point",
   "line",
@@ -42,7 +39,6 @@ const PG_GEOMETRIC_TYPES = new Set([
   "polygon",
   "circle",
 ]);
-
 function jsonToPgCircle(val: string): string {
   const trimmed = val.trim();
   if (!trimmed.startsWith("{")) return trimmed;
@@ -58,11 +54,12 @@ function jsonToPgCircle(val: string): string {
   } catch {}
   return trimmed;
 }
-
-function isPointValue(value: object): value is { x: unknown; y: unknown } {
+function isPointValue(value: object): value is {
+  x: unknown;
+  y: unknown;
+} {
   return "x" in value && "y" in value && Object.keys(value).length === 2;
 }
-
 function isPgTrue(value: unknown): boolean {
   if (typeof value === "boolean") return value;
   if (typeof value === "number") return value === 1;
@@ -71,33 +68,26 @@ function isPgTrue(value: unknown): boolean {
     ["true", "t", "1"].includes(value.toLowerCase())
   );
 }
-
 function toOptionalNumber(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
   }
-
   if (typeof value !== "string") {
     return undefined;
   }
-
   const normalized = value.trim();
   if (normalized === "") {
     return undefined;
   }
-
   const parsed = Number(normalized);
   return Number.isFinite(parsed) ? parsed : undefined;
 }
-
 function pgIdentityKind(value: unknown): "" | "a" | "d" {
   return value === "a" || value === "d" ? value : "";
 }
-
 function isPgIdentityColumn(value: unknown): boolean {
   return pgIdentityKind(value) !== "";
 }
-
 function pgIdentityClause(value: unknown): string {
   const identityKind = pgIdentityKind(value);
   if (identityKind === "a") {
@@ -108,17 +98,14 @@ function pgIdentityClause(value: unknown): string {
   }
   return "";
 }
-
 function escapePostgresPreviewString(value: string): string {
   return value.replace(/'/g, "''");
 }
-
 function normalizeTemporalSearchValue(value: string): string {
   const trimmed = value.trim();
   const normalizedSql = normalizeSqlDatetimeOffsetSpacing(
     trimmed.replace("T", " "),
   );
-
   if (ISO_DATETIME_RE.test(trimmed) || DATETIME_SQL_RE.test(normalizedSql)) {
     return normalizedSql
       .replace(/(\.\d*?[1-9])0+(?=[Zz+-]|$)/, "$1")
@@ -127,33 +114,27 @@ function normalizeTemporalSearchValue(value: string): string {
       .replace(/[zZ]$/, "")
       .replace(/[+-]\d{2}(?::?\d{2})?$/, "");
   }
-
   return trimmed;
 }
-
 function approximateNumericFilterTolerance(rawValue: string): number {
   const fraction = /\.(\d+)/.exec(rawValue)?.[1].length ?? 0;
   const precision = Math.min(Math.max(fraction + 2, 6), 12);
   return 10 ** -precision;
 }
-
 export class PostgresDriver extends BaseDBDriver {
   private pool: Pool | null = null;
   private readonly config: ConnectionConfig;
   private _connected = false;
-
   private requirePool(): Pool {
     if (!this.pool) {
       throw new Error("[RapiDB] PostgreSQL connection is not open");
     }
     return this.pool;
   }
-
   constructor(config: ConnectionConfig) {
     super();
     this.config = config;
   }
-
   async connect(): Promise<void> {
     if (this.pool !== null) {
       try {
@@ -183,22 +164,18 @@ export class PostgresDriver extends BaseDBDriver {
       console.error("[RapiDB] PostgreSQL pool error:", err.message);
       this._connected = false;
     });
-
     const client = await this.pool.connect();
     client.release();
     this._connected = true;
   }
-
   async disconnect(): Promise<void> {
     this._connected = false;
     await this.pool?.end();
     this.pool = null;
   }
-
   isConnected(): boolean {
     return this.pool !== null && this._connected;
   }
-
   async listDatabases(): Promise<DatabaseInfo[]> {
     const res = await this.requirePool().query(
       `SELECT current_database() AS name`,
@@ -207,16 +184,13 @@ export class PostgresDriver extends BaseDBDriver {
       (res.rows[0]?.name as string) ?? this.config.database ?? "postgres";
     return [{ name, schemas: [] }];
   }
-
   async listSchemas(_database: string): Promise<SchemaInfo[]> {
-    const res = await this.requirePool().query(
-      `SELECT schema_name FROM information_schema.schemata
+    const res =
+      await this.requirePool().query(`SELECT schema_name FROM information_schema.schemata
        WHERE schema_name NOT IN ('information_schema','pg_catalog','pg_toast','pg_temp_1','pg_toast_temp_1')
-       ORDER BY schema_name`,
-    );
+       ORDER BY schema_name`);
     return res.rows.map((r) => ({ name: r.schema_name as string }));
   }
-
   async listObjects(_database: string, schema: string): Promise<TableInfo[]> {
     const objects: TableInfo[] = [];
     const pool = this.requirePool();
@@ -268,7 +242,6 @@ export class PostgresDriver extends BaseDBDriver {
     }
     return objects;
   }
-
   async describeTable(
     _database: string,
     schema: string,
@@ -285,7 +258,6 @@ export class PostgresDriver extends BaseDBDriver {
       pk_ordinal: number | string | null;
       is_fk: boolean | number | string;
     };
-
     const res = await this.requirePool().query<DescribeTableRow>(
       `SELECT
          a.attname                                AS column_name,
@@ -329,10 +301,8 @@ export class PostgresDriver extends BaseDBDriver {
       const isAutoIncrement =
         isPgIdentityColumn(r.identity_kind) ||
         (typeof rawDefault === "string" && rawDefault.startsWith("nextval("));
-
       const computedExpression =
         isComputed && typeof rawDefault === "string" ? rawDefault : undefined;
-
       return {
         name: r.column_name as string,
         type: r.data_type as string,
@@ -352,17 +322,16 @@ export class PostgresDriver extends BaseDBDriver {
       };
     });
   }
-
   async query(sql: string, params?: unknown[]): Promise<QueryResult> {
-    type PgArrayField = { name: string };
+    type PgArrayField = {
+      name: string;
+    };
     type PgArrayQueryResult = {
       fields?: PgArrayField[];
       rows?: unknown[][];
       rowCount?: number | null;
     };
-
     const start = Date.now();
-
     const res = await this.requirePool().query({
       text: sql,
       values: params ?? [],
@@ -395,7 +364,6 @@ export class PostgresDriver extends BaseDBDriver {
       executionTimeMs,
     };
   }
-
   async getIndexes(
     _database: string,
     schema: string,
@@ -407,7 +375,6 @@ export class PostgresDriver extends BaseDBDriver {
       primary: boolean | number | string;
       column: string;
     };
-
     const res = await this.requirePool().query<IndexRow>(
       `SELECT i.relname AS name,
               ix.indisunique AS unique,
@@ -447,7 +414,6 @@ export class PostgresDriver extends BaseDBDriver {
     }
     return [...map.values()];
   }
-
   async getForeignKeys(
     _database: string,
     schema: string,
@@ -460,7 +426,6 @@ export class PostgresDriver extends BaseDBDriver {
       ref_table: string;
       ref_column: string;
     };
-
     const res = await this.requirePool().query<ForeignKeyRow>(
       `SELECT con.conname        AS constraint_name,
               src.attname        AS column_name,
@@ -490,7 +455,6 @@ export class PostgresDriver extends BaseDBDriver {
       referencedColumn: r.ref_column,
     }));
   }
-
   async getCreateTableDDL(
     _database: string,
     schema: string,
@@ -504,17 +468,19 @@ export class PostgresDriver extends BaseDBDriver {
       generated_kind: string | null;
       identity_kind: string | null;
     };
-
     const pool = this.requirePool();
-    const kindRes = await pool.query<{ table_type: string }>(
+    const kindRes = await pool.query<{
+      table_type: string;
+    }>(
       `SELECT table_type FROM information_schema.tables
        WHERE table_schema = $1 AND table_name = $2 LIMIT 1`,
       [schema, table],
     );
     const isView = kindRes.rows[0]?.table_type === "VIEW";
-
     if (isView) {
-      const res = await pool.query<{ def: string }>(
+      const res = await pool.query<{
+        def: string;
+      }>(
         `SELECT 'CREATE OR REPLACE VIEW "' || n.nspname || '"."' || c.relname || '" AS\n' ||
                 pg_get_viewdef(c.oid, true) AS def
          FROM pg_class c
@@ -528,7 +494,6 @@ export class PostgresDriver extends BaseDBDriver {
         `-- View definition not available for "${schema}"."${table}"`
       );
     }
-
     const colRes = await pool.query<DdlColumnRow>(
       `SELECT
          a.attname                                AS column_name,
@@ -548,7 +513,6 @@ export class PostgresDriver extends BaseDBDriver {
        ORDER BY a.attnum`,
       [schema, table],
     );
-
     const pkRes = await pool.query<{
       column_name: string;
       key_ordinal: number;
@@ -565,11 +529,9 @@ export class PostgresDriver extends BaseDBDriver {
        ORDER BY pk_key.ordinality`,
       [schema, table],
     );
-
     const pkColumns = pkRes.rows.map((row) => row.column_name);
     const pkColumnSet = new Set(pkColumns);
     const hasCompositePrimaryKey = pkColumns.length > 1;
-
     const cols = colRes.rows.map((r) => {
       const columnName = r.column_name as string;
       const isPk = pkColumnSet.has(columnName);
@@ -577,11 +539,9 @@ export class PostgresDriver extends BaseDBDriver {
       const nullable = isPgTrue(r.is_nullable);
       const notNull = !nullable && !isPk ? " NOT NULL" : "";
       const identityClause = pgIdentityClause(r.identity_kind);
-
       if (isComputed && r.column_default) {
         return `  ${this.quoteIdentifier(columnName)} ${r.data_type} GENERATED ALWAYS AS (${r.column_default}) STORED${notNull}`;
       }
-
       const defClause =
         !identityClause && r.column_default
           ? ` DEFAULT ${r.column_default}`
@@ -589,23 +549,22 @@ export class PostgresDriver extends BaseDBDriver {
       const pk = !hasCompositePrimaryKey && isPk ? " PRIMARY KEY" : "";
       return `  ${this.quoteIdentifier(columnName)} ${r.data_type}${identityClause}${notNull}${defClause}${pk}`;
     });
-
     if (hasCompositePrimaryKey) {
       cols.push(
         `  PRIMARY KEY (${pkColumns.map((columnName) => this.quoteIdentifier(columnName)).join(", ")})`,
       );
     }
-
     return `CREATE TABLE ${this.qualifiedTableName("", schema, table)} (\n${cols.join(",\n")}\n);`;
   }
-
   async getRoutineDefinition(
     _database: string,
     schema: string,
     name: string,
     _kind: "function" | "procedure",
   ): Promise<string> {
-    const res = await this.requirePool().query<{ def: string }>(
+    const res = await this.requirePool().query<{
+      def: string;
+    }>(
       `SELECT pg_get_functiondef(p.oid) AS def
        FROM pg_proc p
        JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -615,7 +574,6 @@ export class PostgresDriver extends BaseDBDriver {
     );
     return res.rows[0]?.def ?? `-- Definition not available for ${name}`;
   }
-
   async runTransaction(
     operations: import("./types").TransactionOperation[],
   ): Promise<void> {
@@ -638,9 +596,6 @@ export class PostgresDriver extends BaseDBDriver {
       client.release();
     }
   }
-
-  // ─── PG type system ───
-
   mapTypeCategory(nativeType: string): TypeCategory {
     const ct = nativeType.toLowerCase().split("(")[0].trim();
     if (ct === "boolean" || ct === "bool") return "boolean";
@@ -702,7 +657,6 @@ export class PostgresDriver extends BaseDBDriver {
       return "text";
     return "other";
   }
-
   protected getValueSemantics(
     nativeType: string,
     _category: TypeCategory,
@@ -714,7 +668,6 @@ export class PostgresDriver extends BaseDBDriver {
     }
     return "plain";
   }
-
   isDatetimeWithTime(nativeType: string): boolean {
     const ct = nativeType.toLowerCase();
     return (
@@ -724,9 +677,6 @@ export class PostgresDriver extends BaseDBDriver {
       ct === "time"
     );
   }
-
-  // ─── PG SQL helpers ───
-
   override buildPagination(
     offset: number,
     limit: number,
@@ -737,76 +687,58 @@ export class PostgresDriver extends BaseDBDriver {
       params: [limit, offset],
     };
   }
-
   override buildInsertValueExpr(
     _column: ColumnTypeMeta,
     paramIndex: number,
   ): string {
     return `$${paramIndex}`;
   }
-
   override buildSetExpr(column: ColumnTypeMeta, paramIndex: number): string {
     return `${this.quoteIdentifier(column.name)} = $${paramIndex}`;
   }
-
   private formatPostgresArrayLiteralValue(value: unknown): string {
     if (value === null || value === undefined || value === NULL_SENTINEL) {
       return "NULL";
     }
-
     if (Array.isArray(value)) {
       return `ARRAY[${value.map((entry) => this.formatPostgresArrayLiteralValue(entry)).join(", ")}]`;
     }
-
     return this.formatPreviewSqlLiteral(value);
   }
-
   protected override formatPreviewSqlLiteral(value: unknown): string {
     if (value === null || value === undefined || value === NULL_SENTINEL) {
       return "NULL";
     }
-
     if (Array.isArray(value)) {
       if (value.length === 0) {
         return "'{}'";
       }
       return this.formatPostgresArrayLiteralValue(value);
     }
-
     if (Buffer.isBuffer(value)) {
       return `'\\x${value.toString("hex")}'::bytea`;
     }
-
     if (value instanceof ArrayBuffer) {
       return `'\\x${Buffer.from(new Uint8Array(value)).toString("hex")}'::bytea`;
     }
-
     if (ArrayBuffer.isView(value)) {
       return `'\\x${Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("hex")}'::bytea`;
     }
-
     if (typeof value === "string") {
       return `'${escapePostgresPreviewString(value)}'`;
     }
-
     return super.formatPreviewSqlLiteral(value);
   }
-
-  // ─── PG type-aware data helpers ───
-
   override coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (value === null || value === undefined || value === "") return value;
     if (value === NULL_SENTINEL) return null;
     if (typeof value !== "string") return value;
-
     if (this.hasBooleanSemantics(column)) {
       const normalized = this.parseBooleanInput(value);
       if (normalized !== null) {
         return normalized;
       }
     }
-
-    // Arrays: JSON array → native array
     if (column.category === "array") {
       if (value.startsWith("[") && value.endsWith("]")) {
         try {
@@ -815,8 +747,6 @@ export class PostgresDriver extends BaseDBDriver {
         } catch {}
       }
     }
-
-    // Interval: JSON object → ISO duration
     if (column.category === "interval" && value.startsWith("{")) {
       try {
         const obj = JSON.parse(value) as Record<string, number>;
@@ -836,29 +766,20 @@ export class PostgresDriver extends BaseDBDriver {
       } catch {}
       return value;
     }
-
-    // bytea: hex string → Buffer
     if (column.category === "binary") {
       return super.coerceInputValue(value, column);
     }
-
     const ct = column.nativeType.toLowerCase().split("(")[0].trim();
     if (ct === "circle") return jsonToPgCircle(value);
-
-    // ISO datetime → date-only for date columns
     if (ISO_DATETIME_RE.test(value) && column.category === "date") {
       return isoToLocalDateStr(value) ?? value;
     }
-
     return value;
   }
-
   override formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (value === null || value === undefined) return value;
     if (Buffer.isBuffer(value)) return super.formatOutputValue(value, column);
     if (typeof value === "bigint") return value.toString();
-
-    // PG point object → "(x, y)" string
     if (
       value !== null &&
       typeof value === "object" &&
@@ -869,22 +790,18 @@ export class PostgresDriver extends BaseDBDriver {
       }
       return JSON.stringify(value);
     }
-
     if (this.isDatetimeWithTime(column.nativeType)) {
       const formatted = formatDatetimeForDisplay(value);
       if (formatted !== null) return formatted;
     }
-
     return value;
   }
-
   override checkPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
     options?: PersistedEditCheckOptions,
   ): PersistedEditCheckResult | null {
     const baseType = column.nativeType.toLowerCase().split("(")[0].trim();
-
     if (column.category === "integer") {
       return this.checkExactNumericPersistedEdit(
         column,
@@ -893,16 +810,13 @@ export class PostgresDriver extends BaseDBDriver {
         options,
       );
     }
-
     if (column.category === "decimal") {
       if (baseType === "money") {
         return null;
       }
-
       if (!["numeric", "decimal"].includes(baseType)) {
         return null;
       }
-
       return this.checkExactNumericPersistedEdit(
         column,
         expectedValue,
@@ -910,7 +824,6 @@ export class PostgresDriver extends BaseDBDriver {
         options,
       );
     }
-
     if (column.category === "float") {
       const significantDigits =
         baseType === "real" || baseType === "float4" ? 7 : 15;
@@ -921,27 +834,21 @@ export class PostgresDriver extends BaseDBDriver {
         options,
       );
     }
-
     if (column.category === "boolean") {
       return this.checkBooleanPersistedEdit(column, expectedValue, options);
     }
-
     if (column.category === "binary") {
       return this.checkBinaryPersistedEdit(column, expectedValue, options);
     }
-
     if (column.category === "json") {
       return this.checkJsonPersistedEdit(column, expectedValue, options);
     }
-
     if (column.category === "uuid") {
       return this.checkUuidPersistedEdit(column, expectedValue, options);
     }
-
     if (column.category === "array") {
       return this.checkJsonArrayPersistedEdit(column, expectedValue, options);
     }
-
     if (
       column.category === "text" ||
       column.category === "date" ||
@@ -955,15 +862,10 @@ export class PostgresDriver extends BaseDBDriver {
           options,
         );
       }
-
       return this.checkTextPersistedEdit(column, expectedValue, options);
     }
-
     return null;
   }
-
-  // ─── PG filter building ───
-
   override buildFilterCondition(
     column: ColumnTypeMeta,
     operator: FilterOperator,
@@ -971,17 +873,12 @@ export class PostgresDriver extends BaseDBDriver {
     paramIndex: number,
   ): FilterConditionResult | null {
     const col = this.quoteIdentifier(column.name);
-
     if (operator === "is_null") return { sql: `${col} IS NULL`, params: [] };
     if (operator === "is_not_null")
       return { sql: `${col} IS NOT NULL`, params: [] };
-
     if (!column.filterable) return null;
     if (value === undefined) return null;
-
     const val = typeof value === "string" ? value.trim() : value;
-
-    // Boolean
     if (
       this.hasBooleanSemantics(column) &&
       (operator === "eq" || operator === "neq")
@@ -993,7 +890,6 @@ export class PostgresDriver extends BaseDBDriver {
         return { sql: `${col} ${op} $${paramIndex}`, params: [boolVal] };
       }
     }
-
     if (column.category === "date" && typeof val === "string") {
       if (operator === "like" || operator === "ilike") {
         const normalized = this.normalizeFilterValue(column, "eq", val);
@@ -1006,15 +902,12 @@ export class PostgresDriver extends BaseDBDriver {
           params: [`%${searchValue}%`],
         };
       }
-
       const sqlOp = this.sqlOperator(operator);
       return {
         sql: `${col} ${sqlOp} $${paramIndex}::date`,
         params: [val],
       };
     }
-
-    // Timestamp/time: CAST AS TEXT ILIKE
     if (column.category === "datetime" || column.category === "time") {
       if (operator === "eq" || operator === "like" || operator === "ilike") {
         const v = typeof val === "string" ? val : val[0];
@@ -1037,8 +930,6 @@ export class PostgresDriver extends BaseDBDriver {
         params: [`%${searchValue}%`],
       };
     }
-
-    // Numeric exact
     if (
       this.isNumericCategory(column.category) &&
       typeof val === "string" &&
@@ -1047,12 +938,9 @@ export class PostgresDriver extends BaseDBDriver {
     ) {
       const ct = column.nativeType.toLowerCase().split("(")[0].trim();
       const sqlOp = this.sqlOperator(operator);
-
-      // Keep exact decimal text to avoid precision loss for large/precise NUMERIC values.
       if (column.category === "decimal") {
         return { sql: `${col} ${sqlOp} $${paramIndex}`, params: [val] };
       }
-
       if (
         column.category === "float" &&
         (operator === "eq" || operator === "neq")
@@ -1071,29 +959,22 @@ export class PostgresDriver extends BaseDBDriver {
           params: [numericValue, tolerance, numericValue, tolerance],
         };
       }
-
       if (ct === "bigint" && /^-?\d+$/.test(val)) {
         return { sql: `${col} ${sqlOp} $${paramIndex}`, params: [BigInt(val)] };
       }
       return { sql: `${col} ${sqlOp} $${paramIndex}`, params: [Number(val)] };
     }
-
-    // Between for numerics
     if (operator === "between" && Array.isArray(val)) {
       return {
         sql: `${col} BETWEEN $${paramIndex} AND $${paramIndex + 1}`,
         params: [val[0], val[1]],
       };
     }
-
-    // In
     if (operator === "in" && typeof val === "string") {
       const parts = val.split(",").map((s) => s.trim());
       const placeholders = parts.map((_, i) => `$${paramIndex + i}`).join(", ");
       return { sql: `${col} IN (${placeholders})`, params: parts };
     }
-
-    // Default: CAST AS TEXT ILIKE
     const v = typeof val === "string" ? val : val[0];
     const finalVal = normalizeTemporalSearchValue(v);
     return {

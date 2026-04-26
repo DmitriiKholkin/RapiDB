@@ -7,14 +7,11 @@ import type {
   TableColumnsProvider,
 } from "./tableDataContracts";
 import { buildUpdateRowSql, coerceRecord, writableEntries } from "./updateSql";
-
 export class TableMutationService {
   constructor(
     private readonly connectionManager: ConnectionManager,
     private readonly columnsProvider: TableColumnsProvider,
   ) {}
-
-  /** @deprecated Use prepareApplyChangesPlan + executePreparedApplyPlan for preview-first flow. */
   async updateRow(
     connectionId: string,
     database: string,
@@ -30,7 +27,6 @@ export class TableMutationService {
       schema,
       table,
     );
-
     const operation = buildUpdateRowSql(
       driver,
       database,
@@ -43,7 +39,6 @@ export class TableMutationService {
     if (!operation) {
       return;
     }
-
     const result = await driver.query(operation.sql, operation.params);
     const affectedRows = result.affectedRows ?? result.rowCount;
     if (affectedRows === 0) {
@@ -52,8 +47,6 @@ export class TableMutationService {
       );
     }
   }
-
-  /** @deprecated Use prepareInsertRow + executePreparedInsertPlan for preview-first flow. */
   async insertRow(
     connectionId: string,
     database: string,
@@ -70,7 +63,6 @@ export class TableMutationService {
     );
     await this.executePreparedInsertPlan(plan);
   }
-
   async prepareInsertRow(
     connectionId: string,
     database: string,
@@ -120,11 +112,9 @@ export class TableMutationService {
       values,
       columns,
     );
-
     const insertPreviewColumns = writableEntries(values, columnMetaByName)
       .map(([columnName]) => columnMetaByName.get(columnName))
       .filter((column): column is ColumnTypeMeta => column !== undefined);
-
     const oracleLikeDriver = driver as {
       materializePreviewInsertSql?: (
         sql: string,
@@ -132,7 +122,6 @@ export class TableMutationService {
         columns: readonly ColumnTypeMeta[],
       ) => string;
     };
-
     const previewSql =
       typeof oracleLikeDriver.materializePreviewInsertSql === "function"
         ? oracleLikeDriver.materializePreviewInsertSql(
@@ -141,7 +130,6 @@ export class TableMutationService {
             insertPreviewColumns,
           )
         : driver.materializePreviewSql(operation.sql, operation.params);
-
     return {
       connectionId,
       database,
@@ -152,7 +140,6 @@ export class TableMutationService {
       verificationCriteria,
     };
   }
-
   async executePreparedInsertPlan(plan: PreparedInsertPlan): Promise<void> {
     const { driver } = this.getConnectionDriver(plan.connectionId);
     const result = await driver.query(
@@ -160,17 +147,14 @@ export class TableMutationService {
       plan.operation.params,
     );
     const affectedRows = result.affectedRows ?? result.rowCount;
-
     if (affectedRows !== undefined && affectedRows === 0) {
       throw new Error(
         "Insert failed: the database reported 0 rows affected. The row may have been rejected by a trigger or constraint.",
       );
     }
-
     if (!plan.verificationCriteria) {
       return;
     }
-
     const columns = await this.columnsProvider.getColumns(
       plan.connectionId,
       plan.database,
@@ -185,14 +169,12 @@ export class TableMutationService {
       columns,
       plan.verificationCriteria,
     );
-
     if (!exists) {
       throw new Error(
         "Insert verification failed: the inserted row could not be read back by primary key.",
       );
     }
   }
-
   async deleteRows(
     connectionId: string,
     database: string,
@@ -210,10 +192,8 @@ export class TableMutationService {
     if (!plan) {
       return;
     }
-
     await this.executePreparedDeletePlan(plan);
   }
-
   async prepareDeleteRowsPlan(
     connectionId: string,
     database: string,
@@ -224,7 +204,6 @@ export class TableMutationService {
     if (primaryKeyValuesList.length === 0) {
       return null;
     }
-
     const { driver } = this.getConnectionDriver(connectionId);
     const qualifiedTableName = driver.qualifiedTableName(
       database,
@@ -238,13 +217,11 @@ export class TableMutationService {
       table,
     );
     const primaryKeyColumns = columns.filter((column) => column.isPrimaryKey);
-
     if (primaryKeyColumns.length === 0) {
       throw new Error(
         "Delete requires a primary key so the affected rows can be targeted safely.",
       );
     }
-
     const columnMetaByName = new Map(
       columns.map((column) => [column.name, column]),
     );
@@ -252,7 +229,6 @@ export class TableMutationService {
       (column) => column.name,
     );
     const primaryKeyColumnSet = new Set(primaryKeyColumnNames);
-
     const coercedPrimaryKeys = primaryKeyValuesList.map((row) => {
       const providedColumnNames = Object.keys(row);
       const hasExactPrimaryKeyShape =
@@ -263,29 +239,23 @@ export class TableMutationService {
         primaryKeyColumnNames.every(
           (columnName) => row[columnName] !== undefined,
         );
-
       if (!hasExactPrimaryKeyShape) {
         throw new Error(
           "Delete requires the full primary key for every selected row.",
         );
       }
-
       const normalizedPrimaryKeys = Object.fromEntries(
         primaryKeyColumnNames.map((columnName) => [
           columnName,
           row[columnName],
         ]),
       );
-
       return coerceRecord(driver, normalizedPrimaryKeys, columnMetaByName);
     });
-
     if (coercedPrimaryKeys.length === 0) {
       return null;
     }
-
     const isSinglePrimaryKey = primaryKeyColumnNames.length === 1;
-
     const operations = isSinglePrimaryKey
       ? this.buildDeleteSinglePrimaryKeyOperations(
           driver,
@@ -300,7 +270,6 @@ export class TableMutationService {
           columnMetaByName,
           coercedPrimaryKeys,
         );
-
     return {
       connectionId,
       database,
@@ -314,10 +283,8 @@ export class TableMutationService {
       verificationCriteriaList: coercedPrimaryKeys,
     };
   }
-
   async executePreparedDeletePlan(plan: PreparedDeletePlan): Promise<void> {
     const { driver } = this.getConnectionDriver(plan.connectionId);
-
     if (plan.executionMode === "sequential") {
       for (const operation of plan.operations) {
         await driver.query(operation.sql, operation.params);
@@ -325,14 +292,12 @@ export class TableMutationService {
     } else {
       await driver.runTransaction(plan.operations);
     }
-
     const columns = await this.columnsProvider.getColumns(
       plan.connectionId,
       plan.database,
       plan.schema,
       plan.table,
     );
-
     await this.verifyRowsDeleted(
       driver,
       plan.database,
@@ -342,7 +307,6 @@ export class TableMutationService {
       plan.verificationCriteriaList,
     );
   }
-
   private async verifyRowsDeleted(
     driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>,
     database: string,
@@ -367,7 +331,6 @@ export class TableMutationService {
       }
     }
   }
-
   private async rowExistsByCriteria(
     driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>,
     database: string,
@@ -380,7 +343,6 @@ export class TableMutationService {
     if (criteriaEntries.length === 0) {
       return false;
     }
-
     const qualifiedTableName = driver.qualifiedTableName(
       database,
       schema,
@@ -398,25 +360,28 @@ export class TableMutationService {
         : "?";
       return `${driver.quoteIdentifier(columnName)} = ${placeholder}`;
     });
-
     const result = await driver.query(
       `SELECT 1 FROM ${qualifiedTableName} WHERE ${whereParts.join(" AND ")}`,
       parameters,
     );
     return result.rows.length > 0;
   }
-
   private buildDeleteSinglePrimaryKeyOperations(
     driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>,
     qualifiedTableName: string,
     columnMetaByName: Map<string, ColumnTypeMeta>,
     primaryKeyColumn: string,
     rows: Record<string, unknown>[],
-  ): Array<{ sql: string; params: unknown[] }> {
+  ): Array<{
+    sql: string;
+    params: unknown[];
+  }> {
     const values = rows.map((row) => row[primaryKeyColumn]);
     const chunkSize = 1000;
-    const operations: Array<{ sql: string; params: unknown[] }> = [];
-
+    const operations: Array<{
+      sql: string;
+      params: unknown[];
+    }> = [];
     for (let index = 0; index < values.length; index += chunkSize) {
       const chunk = values.slice(index, index + chunkSize);
       const placeholders = chunk
@@ -427,22 +392,22 @@ export class TableMutationService {
             : "?";
         })
         .join(", ");
-
       operations.push({
         sql: `DELETE FROM ${qualifiedTableName} WHERE ${driver.quoteIdentifier(primaryKeyColumn)} IN (${placeholders})`,
         params: chunk,
       });
     }
-
     return operations;
   }
-
   private buildDeleteCompositePrimaryKeyOperations(
     driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>,
     qualifiedTableName: string,
     columnMetaByName: Map<string, ColumnTypeMeta>,
     rows: Record<string, unknown>[],
-  ): Array<{ sql: string; params: unknown[] }> {
+  ): Array<{
+    sql: string;
+    params: unknown[];
+  }> {
     return rows.map((row) => {
       const parameters: unknown[] = [];
       const whereParts = Object.keys(row).map((columnName) => {
@@ -453,14 +418,12 @@ export class TableMutationService {
           : "?";
         return `${driver.quoteIdentifier(columnName)} = ${placeholder}`;
       });
-
       return {
         sql: `DELETE FROM ${qualifiedTableName} WHERE ${whereParts.join(" AND ")}`,
         params: parameters,
       };
     });
   }
-
   private getConnectionDriver(connectionId: string): {
     driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>;
   } {
@@ -469,7 +432,6 @@ export class TableMutationService {
     if (!connection || !driver) {
       throw new Error(`[RapiDB] Not connected: ${connectionId}`);
     }
-
     return { driver };
   }
 }

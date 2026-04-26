@@ -16,19 +16,12 @@ export {
 } from "../shared/tableTypes";
 
 import type { TypeCategory } from "../shared/tableTypes";
-
-// ─── Table data types ───
-
 export type Row = Record<string, unknown>;
-
 export type PendingEdits = Map<number, Map<string, unknown>>;
-
 export interface InsertDraftCell {
   value: unknown;
 }
-
 export type InsertDraftRow = Record<string, InsertDraftCell>;
-
 export type EditTarget =
   | {
       kind: "persisted";
@@ -39,17 +32,14 @@ export type EditTarget =
       kind: "draft";
       col: string;
     };
-
 export interface BadgePresentation {
   foreground: string;
   badgeBackground: string;
   badgeBorder: "none";
 }
-
 export interface CategoryPresentation extends BadgePresentation {
   label: string;
 }
-
 export type StructuralBadgeKind =
   | "pk"
   | "fk"
@@ -57,11 +47,9 @@ export type StructuralBadgeKind =
   | "primary"
   | "unique"
   | "index";
-
 export interface StructuralBadgePresentation extends BadgePresentation {
   label: string;
 }
-
 type CategoryPresentationKey =
   | "numeric"
   | "boolean"
@@ -76,7 +64,6 @@ type CategoryPresentationKey =
   | "lob"
   | "text"
   | "other";
-
 const CATEGORY_PRESENTATIONS: Record<
   CategoryPresentationKey,
   CategoryPresentation
@@ -147,7 +134,6 @@ const CATEGORY_PRESENTATIONS: Record<
     "rgba(128,128,128,0.12)",
   ),
 };
-
 const STRUCTURAL_BADGE_PRESENTATIONS: Record<
   StructuralBadgeKind,
   StructuralBadgePresentation
@@ -183,10 +169,6 @@ const STRUCTURAL_BADGE_PRESENTATIONS: Record<
     "rgba(107, 114, 128, 0.12)",
   ),
 };
-
-// ─── Formatting helpers ───
-
-/** Returns a human-friendly placeholder based on column category. */
 export function placeholderForCategory(cat: TypeCategory): string {
   switch (cat) {
     case "boolean":
@@ -203,29 +185,22 @@ export function placeholderForCategory(cat: TypeCategory): string {
       return "";
   }
 }
-
-/** Category display label for badges. */
 export function categoryLabel(cat: TypeCategory): string {
   return getCategoryPresentation(cat).label;
 }
-
-/** Returns a color for the given category. */
 export function categoryColor(cat: TypeCategory): string {
   return getCategoryPresentation(cat).foreground;
 }
-
 export function getCategoryPresentation(
   cat: TypeCategory,
 ): CategoryPresentation {
   return CATEGORY_PRESENTATIONS[getCategoryPresentationKey(cat)];
 }
-
 export function getStructuralBadgePresentation(
   kind: StructuralBadgeKind,
 ): StructuralBadgePresentation {
   return STRUCTURAL_BADGE_PRESENTATIONS[kind];
 }
-
 function getCategoryPresentationKey(
   cat: TypeCategory,
 ): CategoryPresentationKey {
@@ -262,7 +237,6 @@ function getCategoryPresentationKey(
       return "other";
   }
 }
-
 function makeCategoryPresentation(
   label: string,
   foreground: string,
@@ -275,7 +249,6 @@ function makeCategoryPresentation(
     badgeBorder: "none",
   };
 }
-
 function makeStructuralBadgePresentation(
   label: string,
   foreground: string,

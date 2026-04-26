@@ -21,7 +21,6 @@ import { SQLiteDriver } from "./dbDrivers/sqlite";
 import type { IDBDriver } from "./dbDrivers/types";
 import { normalizeUnknownError } from "./utils/errorHandling";
 import { pMapWithLimit } from "./utils/concurrency";
-
 export type {
   BookmarkEntry,
   ConnectAttempt,
@@ -30,40 +29,29 @@ export type {
   SchemaObjectEntry,
   TestConnectionResult,
 } from "./connectionManagerModels";
-
 interface SchemaCacheEntry {
   objects: SchemaObjectEntry[];
   loading: Promise<void> | null;
 }
-
 const TEST_CONNECTION_ID = "__test__";
-
 export class ConnectionManager {
   private readonly store: ConnectionManagerStore;
   private driverMap = new Map<string, IDBDriver>();
   private readonly _connectingMap = new Map<string, Promise<void>>();
-
   readonly onDidChangeConnections: vscode.Event<void>;
   private readonly _onDidChangeConnections = new vscode.EventEmitter<void>();
-
   readonly onDidChangeHistory: vscode.Event<void>;
   private readonly _onDidChangeHistory = new vscode.EventEmitter<void>();
-
   readonly onDidChangeBookmarks: vscode.Event<void>;
   private readonly _onDidChangeBookmarks = new vscode.EventEmitter<void>();
-
   readonly onDidDisconnect: vscode.Event<string>;
   private readonly _onDidDisconnect = new vscode.EventEmitter<string>();
-
   readonly onDidConnect: vscode.Event<void>;
   private readonly _onDidConnect = new vscode.EventEmitter<void>();
-
   readonly onDidSchemaLoad: vscode.Event<string>;
   private readonly _onDidSchemaLoad = new vscode.EventEmitter<string>();
-
   private _connectionsCache: ConnectionConfig[] | null = null;
   private readonly _schemaCacheMap = new Map<string, SchemaCacheEntry>();
-
   constructor(
     context: vscode.ExtensionContext,
     store: ConnectionManagerStore = new VSCodeConnectionManagerStore(context),
@@ -75,7 +63,6 @@ export class ConnectionManager {
     this.onDidConnect = this._onDidConnect.event;
     this.onDidDisconnect = this._onDidDisconnect.event;
     this.onDidSchemaLoad = this._onDidSchemaLoad.event;
-
     this.store.onDidChangeConfiguration(async (e) => {
       this._connectionsCache = null;
       if (e.affectsConfiguration("rapidb.queryHistoryLimit")) {
@@ -83,19 +70,15 @@ export class ConnectionManager {
       }
     }, context.subscriptions);
   }
-
   private getHistoryLimit(): number {
     return this.store.getHistoryLimit();
   }
-
   getDefaultPageSize(): number {
     return this.store.getDefaultPageSize();
   }
-
   getQueryRowLimit(): number {
     return this.store.getQueryRowLimit();
   }
-
   private async _trimHistoryToLimit(): Promise<void> {
     const limit = this.getHistoryLimit();
     const all = this.store.readHistory();
@@ -104,7 +87,6 @@ export class ConnectionManager {
       this._onDidChangeHistory.fire();
     }
   }
-
   getConnections(): ConnectionConfig[] {
     if (this._connectionsCache) {
       return this._connectionsCache;
@@ -116,58 +98,46 @@ export class ConnectionManager {
     }));
     return this._connectionsCache;
   }
-
   private async saveConnections(conns: ConnectionConfig[]): Promise<void> {
     this._connectionsCache = null;
     await this.store.saveConnections(conns);
   }
-
   getConnection(id: string): ConnectionConfig | undefined {
     return this.getConnections().find((c) => c.id === id);
   }
-
   async saveConnection(config: ConnectionConfig): Promise<void> {
     const conns = this.getConnections();
     const idx = conns.findIndex((c) => c.id === config.id);
     const isEdit = idx >= 0;
-
     if (isEdit) {
       conns[idx] = config;
     } else {
       conns.push({ ...config, id: config.id || randomUUID() });
     }
     await this.saveConnections(conns);
-
     if (isEdit && this.isConnected(config.id)) {
       await this.disconnectFrom(config.id);
     }
-
     this._onDidChangeConnections.fire();
   }
-
   async removeConnection(id: string): Promise<boolean> {
     if (!this.getConnection(id)) {
       return false;
     }
-
     if (this.driverMap.has(id)) {
       await this.disconnectFrom(id);
     }
     await this.saveConnections(
       this.getConnections().filter((c) => c.id !== id),
     );
-
     try {
       await this.store.deleteSecret(id);
     } catch {}
-
     await this._purgeHistoryForConnection(id);
-
     await this._purgeBookmarksForConnection(id);
     this._onDidChangeConnections.fire();
     return true;
   }
-
   async _hydratePassword(config: ConnectionConfig): Promise<ConnectionConfig> {
     if (!config.useSecretStorage) {
       return config;
@@ -179,12 +149,11 @@ export class ConnectionManager {
       return { ...config, password: "" };
     }
   }
-
-  /**
-   * Shared helper: filters out all entries whose connectionId matches,
-   * writes the result, and fires the change event — only if something changed.
-   */
-  private async _purgeEntriesForConnection<T extends { connectionId: string }>(
+  private async _purgeEntriesForConnection<
+    T extends {
+      connectionId: string;
+    },
+  >(
     connectionId: string,
     read: () => T[],
     write: (entries: T[]) => Promise<void>,
@@ -197,7 +166,6 @@ export class ConnectionManager {
       fire();
     }
   }
-
   private async _purgeHistoryForConnection(
     connectionId: string,
   ): Promise<void> {
@@ -208,7 +176,6 @@ export class ConnectionManager {
       () => this._onDidChangeHistory.fire(),
     );
   }
-
   private createDriver(config: ConnectionConfig): IDBDriver {
     switch (config.type) {
       case "mysql":
@@ -227,41 +194,33 @@ export class ConnectionManager {
       }
     }
   }
-
   beginConnect(id: string): ConnectAttempt {
     const pending = this._connectingMap.get(id);
     if (pending) {
       return { promise: pending, isNew: false };
     }
-
     if (this.isConnected(id)) {
       return { promise: Promise.resolve(), isNew: false };
     }
-
     let resolveAttempt!: () => void;
     let rejectAttempt!: (err: unknown) => void;
     const attempt = new Promise<void>((resolve, reject) => {
       resolveAttempt = resolve;
       rejectAttempt = reject;
     });
-
     this._connectingMap.set(id, attempt);
     this._onDidChangeConnections.fire();
-
     void (async () => {
       try {
         if (this.driverMap.has(id)) {
           await this.disconnectFrom(id);
         }
-
         const config = this.getConnection(id);
         if (!config) {
           throw new Error(`[RapiDB] Connection "${id}" not found`);
         }
-
         const fullConfig = await this._hydratePassword(config);
         const driver = this.createDriver(fullConfig);
-
         try {
           await driver.connect();
         } catch (err) {
@@ -270,7 +229,6 @@ export class ConnectionManager {
           } catch {}
           throw err;
         }
-
         this.driverMap.set(id, driver);
         this._schemaCacheMap.delete(id);
         this._onDidConnect.fire();
@@ -282,14 +240,11 @@ export class ConnectionManager {
         this._onDidChangeConnections.fire();
       }
     })();
-
     return { promise: attempt, isNew: true };
   }
-
   async connectTo(id: string): Promise<void> {
     await this.beginConnect(id).promise;
   }
-
   async disconnectFrom(id: string): Promise<void> {
     const driver = this.driverMap.get(id);
     if (driver) {
@@ -301,34 +256,27 @@ export class ConnectionManager {
       this._onDidDisconnect.fire(id);
     }
   }
-
   isConnected(id: string): boolean {
     return this.driverMap.get(id)?.isConnected() ?? false;
   }
-
   getConnectedCount(): number {
     return [...this.driverMap.values()].filter((driver) => driver.isConnected())
       .length;
   }
-
   isConnecting(id: string): boolean {
     return this._connectingMap.has(id);
   }
-
   getDriver(id: string): IDBDriver | undefined {
     return this.driverMap.get(id);
   }
-
   getSchema(connectionId: string): SchemaObjectEntry[] {
     return this._schemaCacheMap.get(connectionId)?.objects ?? [];
   }
-
   async getSchemaAsync(connectionId: string): Promise<SchemaObjectEntry[]> {
     const existing = this._schemaCacheMap.get(connectionId);
     if (!existing || (!existing.loading && existing.objects.length === 0)) {
       this._startSchemaLoad(connectionId);
     }
-
     const entry = this._schemaCacheMap.get(connectionId);
     if (entry?.loading) {
       try {
@@ -337,14 +285,12 @@ export class ConnectionManager {
     }
     return this._schemaCacheMap.get(connectionId)?.objects ?? [];
   }
-
   private _startSchemaLoad(connectionId: string): void {
     const driver = this.getDriver(connectionId);
     const config = this.getConnection(connectionId);
     if (!driver || !config) {
       return;
     }
-
     let entry = this._schemaCacheMap.get(connectionId);
     if (!entry) {
       entry = { objects: [], loading: null };
@@ -353,7 +299,6 @@ export class ConnectionManager {
     if (entry.loading) {
       return;
     }
-
     const capturedEntry = entry;
     capturedEntry.loading = this._loadSchemaInternal(driver, config)
       .then((objects) => {
@@ -371,7 +316,6 @@ export class ConnectionManager {
         }
       });
   }
-
   private async _loadSchemaInternal(
     driver: IDBDriver,
     config: ConnectionConfig,
@@ -383,11 +327,9 @@ export class ConnectionManager {
     if (!primaryDb) {
       return result;
     }
-
     const primarySchemas = await driver
       .listSchemas(primaryDb)
       .catch(() => [{ name: primaryDb }]);
-
     for (const schema of primarySchemas.slice(0, 10)) {
       const objects = await driver
         .listObjects(primaryDb, schema.name)
@@ -401,7 +343,6 @@ export class ConnectionManager {
             o.type === "procedure",
         )
         .slice(0, 1000);
-
       const allCols = await pMapWithLimit(objectsForSchema, 10, async (tbl) => {
         if (tbl.type === "table" || tbl.type === "view") {
           try {
@@ -412,7 +353,6 @@ export class ConnectionManager {
         }
         return [];
       });
-
       objectsForSchema.forEach((tbl, i) => {
         result.push({
           schema: schema.name,
@@ -425,10 +365,8 @@ export class ConnectionManager {
         });
       });
     }
-
     return result;
   }
-
   async testConnection(
     config: Omit<ConnectionConfig, "id">,
   ): Promise<TestConnectionResult> {
@@ -445,13 +383,11 @@ export class ConnectionManager {
       return { success: false, error: error.message };
     }
   }
-
   async disconnectAll(): Promise<void> {
     await Promise.allSettled(
       [...this.driverMap.keys()].map((id) => this.disconnectFrom(id)),
     );
   }
-
   getHistory(connectionId?: string): HistoryEntry[] {
     const all = this.store.readHistory();
     if (connectionId) {
@@ -459,15 +395,12 @@ export class ConnectionManager {
     }
     return all;
   }
-
   async addToHistory(connectionId: string, sql: string): Promise<void> {
     const trimmed = sql.trim();
     if (!trimmed) {
       return;
     }
-
     const all = this.store.readHistory();
-
     const latest = all[0];
     if (
       latest &&
@@ -476,7 +409,6 @@ export class ConnectionManager {
     ) {
       return;
     }
-
     const entry: HistoryEntry = {
       id: randomUUID(),
       sql: trimmed,
@@ -484,16 +416,13 @@ export class ConnectionManager {
       executedAt: new Date().toISOString(),
     };
     const updated = [entry, ...all].slice(0, this.getHistoryLimit());
-
     await this.store.writeHistory(updated);
     this._onDidChangeHistory.fire();
   }
-
   async clearHistory(): Promise<void> {
     await this.store.writeHistory([]);
     this._onDidChangeHistory.fire();
   }
-
   getBookmarks(connectionId?: string): BookmarkEntry[] {
     const all = this.store.readBookmarks();
     if (connectionId) {
@@ -501,11 +430,9 @@ export class ConnectionManager {
     }
     return all;
   }
-
   getBookmark(id: string): BookmarkEntry | undefined {
     return this.store.readBookmarks().find((bookmark) => bookmark.id === id);
   }
-
   async addBookmark(connectionId: string, sql: string): Promise<BookmarkEntry> {
     const trimmed = sql.trim();
     const entry: BookmarkEntry = {
@@ -519,20 +446,17 @@ export class ConnectionManager {
     this._onDidChangeBookmarks.fire();
     return entry;
   }
-
   async removeBookmark(id: string): Promise<boolean> {
     const all = this.store.readBookmarks();
     if (!all.some((bookmark) => bookmark.id === id)) {
       return false;
     }
-
     await this.store.writeBookmarks(
       all.filter((bookmark) => bookmark.id !== id),
     );
     this._onDidChangeBookmarks.fire();
     return true;
   }
-
   private async _purgeBookmarksForConnection(
     connectionId: string,
   ): Promise<void> {
@@ -543,7 +467,6 @@ export class ConnectionManager {
       () => this._onDidChangeBookmarks.fire(),
     );
   }
-
   async clearBookmarks(): Promise<void> {
     await this.store.writeBookmarks([]);
     this._onDidChangeBookmarks.fire();

@@ -4,7 +4,6 @@ import { placeholderForCategory } from "../../types";
 import { buildButtonStyle } from "../../utils/buttonStyles";
 import { buildTextInputStyle } from "../../utils/controlStyles";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
-
 export function EditInput({
   initial,
   nullable,
@@ -30,16 +29,13 @@ export function EditInput({
   const [isNull, setIsNull] = useState(false);
   const [val, setVal] = useState(isInitiallyNull ? "" : initial);
   const ref = useRef<HTMLInputElement>(null);
-
   useLayoutEffect(() => {
     ref.current?.focus();
     if (ref.current instanceof HTMLInputElement) {
       ref.current.select();
     }
   }, []);
-
   const commit = () => onCommit(isNull ? NULL_SENTINEL : val);
-
   const inputStyle: React.CSSProperties = {
     ...buildTextInputStyle("sm"),
     flex: 1,
@@ -53,7 +49,6 @@ export function EditInput({
     boxSizing: "border-box" as const,
     fontStyle: isNull ? "italic" : "normal",
   };
-
   const nullBtnStyle: React.CSSProperties = {
     ...buildButtonStyle("ghost", { size: "sm" }),
     flexShrink: 0,
@@ -66,7 +61,6 @@ export function EditInput({
     border: "0px",
     letterSpacing: "0em",
   };
-
   return (
     <div
       style={{
@@ -137,10 +131,6 @@ export function EditInput({
     </div>
   );
 }
-
-/**
- * Convert a cell value to an initial string for the edit input.
- */
 export function valueToEditString(value: unknown): string {
   if (value == null) return NULL_SENTINEL;
   return formatScalarValueForDisplay(value);

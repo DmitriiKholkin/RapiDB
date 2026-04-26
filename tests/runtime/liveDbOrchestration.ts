@@ -1,7 +1,6 @@
 import type { ConnectionConfig } from "../../src/shared/connectionConfig.ts";
 import {
   COMPOSE_BACKED_DB_ENGINE_IDS,
-  DB_ENGINE_IDS,
   type DbEngineId,
   TEST_ADMIN_CONNECTION_SEEDS,
   TEST_CONNECTION_SEEDS,
@@ -290,8 +289,4 @@ export async function materializeSqliteFixture(
     connection: finalConnection,
     filePath: finalConnection.filePath ?? "",
   };
-}
-
-export function isDbEngineId(value: string): value is DbEngineId {
-  return DB_ENGINE_IDS.includes(value as DbEngineId);
 }

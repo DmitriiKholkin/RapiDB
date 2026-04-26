@@ -122,19 +122,6 @@ export function truthyBoolean(value: unknown): boolean {
   return ["1", "true", "t", "y", "yes"].includes(String(value).toLowerCase());
 }
 
-export function normalizeIsoDateTime(value: unknown): string {
-  if (value instanceof Date) {
-    return value.toISOString();
-  }
-
-  const text = String(value);
-  if (/^\d{4}-\d{2}-\d{2} /.test(text)) {
-    return new Date(text.replace(" ", "T").replace(/$/, "Z")).toISOString();
-  }
-
-  return new Date(text).toISOString();
-}
-
 export function fixtureSupportSummary(engineId: DbEngineId): {
   routines: boolean;
 } {

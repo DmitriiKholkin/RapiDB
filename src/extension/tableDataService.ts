@@ -8,9 +8,7 @@ import type {
 } from "./table/tableDataContracts";
 import { TableMutationService } from "./table/tableMutationService";
 import { TableReadService } from "./table/tableReadService";
-
 export { formatDatetimeForDisplay } from "./dbDrivers/BaseDBDriver";
-
 export type {
   ApplyResult,
   PreparedApplyPlan,
@@ -22,16 +20,13 @@ export type {
   TablePage,
 } from "./table/tableDataContracts";
 export {
-  /** @deprecated Use prepareApplyChangesPlan + executePreparedApplyPlan for preview-first flow. */
   applyChangesTransactional,
   executePreparedApplyPlan,
   prepareApplyChangesPlan,
 } from "./table/tableMutationExecution";
-
 export class TableDataService {
   private readonly readService: TableReadService;
   private readonly mutationService: TableMutationService;
-
   constructor(connectionManager: ConnectionManager) {
     this.readService = new TableReadService(connectionManager);
     this.mutationService = new TableMutationService(
@@ -39,11 +34,9 @@ export class TableDataService {
       this.readService,
     );
   }
-
   clearForConnection(connectionId: string): void {
     this.readService.clearForConnection(connectionId);
   }
-
   getColumns(
     connectionId: string,
     database: string,
@@ -52,7 +45,6 @@ export class TableDataService {
   ): Promise<ColumnTypeMeta[]> {
     return this.readService.getColumns(connectionId, database, schema, table);
   }
-
   getPage(
     connectionId: string,
     database: string,
@@ -76,8 +68,6 @@ export class TableDataService {
       skipCount,
     );
   }
-
-  /** @deprecated Use prepareApplyChangesPlan + executePreparedApplyPlan for preview-first flow. */
   updateRow(
     connectionId: string,
     database: string,
@@ -95,8 +85,6 @@ export class TableDataService {
       changes,
     );
   }
-
-  /** @deprecated Use prepareInsertRow + executePreparedInsertPlan for preview-first flow. */
   insertRow(
     connectionId: string,
     database: string,
@@ -112,7 +100,6 @@ export class TableDataService {
       values,
     );
   }
-
   prepareInsertRow(
     connectionId: string,
     database: string,
@@ -128,11 +115,9 @@ export class TableDataService {
       values,
     );
   }
-
   executePreparedInsertPlan(plan: PreparedInsertPlan): Promise<void> {
     return this.mutationService.executePreparedInsertPlan(plan);
   }
-
   prepareDeleteRowsPlan(
     connectionId: string,
     database: string,
@@ -148,11 +133,9 @@ export class TableDataService {
       primaryKeyValuesList,
     );
   }
-
   executePreparedDeletePlan(plan: PreparedDeletePlan): Promise<void> {
     return this.mutationService.executePreparedDeletePlan(plan);
   }
-
   deleteRows(
     connectionId: string,
     database: string,
@@ -168,7 +151,6 @@ export class TableDataService {
       primaryKeyValuesList,
     );
   }
-
   exportAll(
     connectionId: string,
     database: string,

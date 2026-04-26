@@ -1,9 +1,8 @@
-// biome-ignore assist/source/organizeImports: React import order is intentional here.
 import React, {
-  useEffect,
-  useState,
   type CSSProperties,
   type ReactNode,
+  useEffect,
+  useState,
 } from "react";
 import type { ColumnMeta, ForeignKeyMeta, IndexMeta } from "../types";
 import { getStructuralBadgePresentation } from "../types";
@@ -15,14 +14,12 @@ interface SchemaData {
   indexes: IndexMeta[];
   foreignKeys: ForeignKeyMeta[];
 }
-
 interface Props {
   connectionId: string;
   database: string;
   schema: string;
   table: string;
 }
-
 const th: CSSProperties = {
   padding: "5px 12px",
   textAlign: "left",
@@ -37,7 +34,6 @@ const th: CSSProperties = {
   zIndex: 1,
   userSelect: "none",
 };
-
 const td = (extra?: CSSProperties): CSSProperties => ({
   padding: "4px 12px",
   borderBottom: "1px solid var(--vscode-panel-border)",
@@ -48,7 +44,6 @@ const td = (extra?: CSSProperties): CSSProperties => ({
   whiteSpace: "nowrap",
   ...extra,
 });
-
 export function SchemaView({
   connectionId: _connectionId,
   database: _database,
@@ -58,26 +53,23 @@ export function SchemaView({
   const [data, setData] = useState<SchemaData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-
   useEffect(() => {
     const unData = onMessage<SchemaData>("schemaData", (d) => {
       setData(d);
       setLoading(false);
     });
-    const unErr = onMessage<{ error: string }>(
-      "schemaError",
-      ({ error: e }) => {
-        setError(e);
-        setLoading(false);
-      },
-    );
+    const unErr = onMessage<{
+      error: string;
+    }>("schemaError", ({ error: e }) => {
+      setError(e);
+      setLoading(false);
+    });
     postMessage("ready");
     return () => {
       unData();
       unErr();
     };
   }, []);
-
   if (loading) {
     return (
       <div style={{ padding: 20, opacity: 0.5, fontSize: 13 }}>
@@ -86,7 +78,6 @@ export function SchemaView({
       </div>
     );
   }
-
   if (error) {
     return (
       <div
@@ -104,16 +95,12 @@ export function SchemaView({
       </div>
     );
   }
-
   if (!data) {
     return null;
   }
-
   const { columns, indexes, foreignKeys } = data;
-
   return (
     <div style={{ padding: "16px 20px", overflow: "auto", height: "100vh" }}>
-      {}
       <div style={{ marginBottom: 20 }}>
         <h1 style={{ fontSize: 15, fontWeight: 600, margin: 0 }}>
           {schema ? `${schema}.` : ""}
@@ -128,7 +115,6 @@ export function SchemaView({
         />
       </div>
 
-      {}
       <Section title="Columns" count={columns.length}>
         <table
           style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}
@@ -155,7 +141,6 @@ export function SchemaView({
         </table>
       </Section>
 
-      {}
       {foreignKeys.length > 0 && (
         <Section title="Foreign Keys" count={foreignKeys.length}>
           <table
@@ -182,7 +167,6 @@ export function SchemaView({
         </Section>
       )}
 
-      {}
       {indexes.length > 0 && (
         <Section title="Indexes" count={indexes.length}>
           <table
@@ -206,7 +190,6 @@ export function SchemaView({
     </div>
   );
 }
-
 function Section({
   title,
   count,
@@ -262,7 +245,6 @@ function Section({
     </div>
   );
 }
-
 function ColRow({
   col,
   index,
@@ -279,7 +261,6 @@ function ColRow({
     : isEven
       ? "var(--vscode-editor-background)"
       : "var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.04))";
-
   const badges: React.ReactNode[] = [];
   if (col.isPrimaryKey) {
     const presentation = getStructuralBadgePresentation("pk");
@@ -317,7 +298,6 @@ function ColRow({
       />,
     );
   }
-
   if (col.isComputed) {
     badges.push(
       <Badge
@@ -329,13 +309,11 @@ function ColRow({
       />,
     );
   }
-
   const rawDefault = col.defaultValue;
   const displayDefault =
     rawDefault != null
       ? rawDefault.replace(/::[A-Za-z_][\w. ]*/g, "").trim()
       : null;
-
   return (
     <tr
       style={{ background: bg, transition: "background 60ms" }}
@@ -382,7 +360,6 @@ function ColRow({
     </tr>
   );
 }
-
 function FKRow({
   fk,
   isEven,
@@ -398,12 +375,10 @@ function FKRow({
     : isEven
       ? "var(--vscode-editor-background)"
       : "var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.04))";
-
   const refLabel =
     fk.referencedSchema && fk.referencedSchema !== currentSchema
       ? `${fk.referencedSchema}.${fk.referencedTable}.${fk.referencedColumn}`
       : `${fk.referencedTable}.${fk.referencedColumn}`;
-
   return (
     <tr
       style={{ background: bg, transition: "background 60ms" }}
@@ -418,7 +393,6 @@ function FKRow({
     </tr>
   );
 }
-
 function IdxRow({ idx, isEven }: { idx: IndexMeta; isEven: boolean }) {
   const [hov, setHov] = useState(false);
   const bg = hov
@@ -426,7 +400,6 @@ function IdxRow({ idx, isEven }: { idx: IndexMeta; isEven: boolean }) {
     : isEven
       ? "var(--vscode-editor-background)"
       : "var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.04))";
-
   const typeBadges: React.ReactNode[] = [];
   if (idx.primary) {
     const presentation = getStructuralBadgePresentation("primary");
@@ -462,7 +435,6 @@ function IdxRow({ idx, isEven }: { idx: IndexMeta; isEven: boolean }) {
       />,
     );
   }
-
   return (
     <tr
       style={{ background: bg, transition: "background 60ms" }}
@@ -477,7 +449,6 @@ function IdxRow({ idx, isEven }: { idx: IndexMeta; isEven: boolean }) {
     </tr>
   );
 }
-
 function Badge({
   label,
   color,

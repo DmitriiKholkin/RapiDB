@@ -8,6 +8,7 @@ import {
   createExtensionContextStub,
   FakeConnectionManagerStore,
 } from "../support/fakeConnectionManagerStore";
+import { MockEventEmitter } from "../support/mockVscode";
 
 interface DriverBehavior {
   connectError?: Error;
@@ -15,25 +16,6 @@ interface DriverBehavior {
 
 const driverBehaviors = new Map<string, DriverBehavior>();
 const driverInstances: FakeDriver[] = [];
-
-class MockEventEmitter<T> {
-  private readonly listeners = new Set<(value: T) => void>();
-
-  readonly event = (listener: (value: T) => void) => {
-    this.listeners.add(listener);
-    return {
-      dispose: () => {
-        this.listeners.delete(listener);
-      },
-    };
-  };
-
-  fire(value: T): void {
-    for (const listener of this.listeners) {
-      listener(value);
-    }
-  }
-}
 
 class FakeDriver implements IDBDriver {
   connectCalls = 0;

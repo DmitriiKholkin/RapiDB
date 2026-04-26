@@ -639,9 +639,11 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         domReadOnly: readOnlyRef.current,
       });
       editorRef.current = editor;
-      const isReadOnly = readOnlyRef.current;
 
       const insertText = (text: string) => {
+        if (readOnlyRef.current) {
+          return;
+        }
         if (!text) {
           return;
         }
@@ -686,6 +688,9 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
 
       const domNode = editor.getDomNode();
       const nativePaste = (e: ClipboardEvent) => {
+        if (readOnlyRef.current) {
+          return;
+        }
         e.preventDefault();
         e.stopImmediatePropagation();
         postMessage("readClipboard");
@@ -700,49 +705,64 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         return editor.getValue();
       };
 
-      if (!isReadOnly) {
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, () =>
-          postMessage("readClipboard"),
-        );
-        editor.addCommand(
-          monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyV,
-          () => postMessage("readClipboard"),
-        );
-        domNode?.addEventListener("paste", nativePaste, true);
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, () => {
+        if (readOnlyRef.current) {
+          return;
+        }
+        postMessage("readClipboard");
+      });
+      editor.addCommand(
+        monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyV,
+        () => {
+          if (readOnlyRef.current) {
+            return;
+          }
+          postMessage("readClipboard");
+        },
+      );
+      domNode?.addEventListener("paste", nativePaste, true);
 
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () =>
-          onExecuteRef.current?.(getExecText()),
-        );
-        editor.addCommand(monaco.KeyCode.F5, () =>
-          onExecuteRef.current?.(getExecText()),
-        );
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => {
+        if (readOnlyRef.current) {
+          return;
+        }
+        onExecuteRef.current?.(getExecText());
+      });
+      editor.addCommand(monaco.KeyCode.F5, () => {
+        if (readOnlyRef.current) {
+          return;
+        }
+        onExecuteRef.current?.(getExecText());
+      });
 
-        editor.addCommand(
-          monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyF,
-          () => {
-            const model = editor.getModel();
-            if (!model) {
-              return;
-            }
-            const raw = editor.getValue();
-            const out = formatSQLOrError(raw, dialectRef.current ?? "sql");
-            if ("error" in out) {
-              return;
-            }
-            if (out.result === raw) {
-              return;
-            }
-            editor.executeEdits("format-sql", [
-              {
-                range: model.getFullModelRange(),
-                text: out.result,
-                forceMoveMarkers: true,
-              },
-            ]);
-            editor.pushUndoStop();
-          },
-        );
-      }
+      editor.addCommand(
+        monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyF,
+        () => {
+          if (readOnlyRef.current) {
+            return;
+          }
+          const model = editor.getModel();
+          if (!model) {
+            return;
+          }
+          const raw = editor.getValue();
+          const out = formatSQLOrError(raw, dialectRef.current ?? "sql");
+          if ("error" in out) {
+            return;
+          }
+          if (out.result === raw) {
+            return;
+          }
+          editor.executeEdits("format-sql", [
+            {
+              range: model.getFullModelRange(),
+              text: out.result,
+              forceMoveMarkers: true,
+            },
+          ]);
+          editor.pushUndoStop();
+        },
+      );
 
       const changeDisposable = editor.onDidChangeModelContent(() => {
         onChangeRef.current?.(editor.getValue());
@@ -760,9 +780,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         observer.disconnect();
         changeDisposable.dispose();
         unsubClipboard();
-        if (!isReadOnly) {
-          domNode?.removeEventListener("paste", nativePaste, true);
-        }
+        domNode?.removeEventListener("paste", nativePaste, true);
         editor.dispose();
       };
     }, []);

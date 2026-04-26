@@ -273,7 +273,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       name: name.trim(),
       type,
       folder: folder.trim() || undefined,
-      useSecretStorage: useSecretStorage || undefined,
+      useSecretStorage,
       hasStoredSecret: hasStoredSecret || undefined,
       ...(isSQLite
         ? { filePath: filePath.trim() }

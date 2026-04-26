@@ -12,14 +12,11 @@ import type {
   VerificationTarget,
 } from "./tableDataContracts";
 import { buildUpdateRowSql } from "./updateSql";
-
 interface VerificationFailure {
   rowIndex: number;
   columns: string[];
   message: string;
 }
-
-/** @deprecated Use prepareApplyChangesPlan + executePreparedApplyPlan for preview-first flow. */
 export async function applyChangesTransactional(
   connectionManager: ConnectionManager,
   connectionId: string,
@@ -38,14 +35,11 @@ export async function applyChangesTransactional(
     updates,
     columns,
   );
-
   if (!prepared.executable) {
     return prepared.result;
   }
-
   return executePreparedApplyPlan(connectionManager, prepared.plan);
 }
-
 export function prepareApplyChangesPlan(
   connectionManager: ConnectionManager,
   connectionId: string,
@@ -58,7 +52,6 @@ export function prepareApplyChangesPlan(
   if (updates.length === 0) {
     return { executable: false, result: { success: true, rowOutcomes: [] } };
   }
-
   const driver = connectionManager.getDriver(connectionId);
   if (!driver) {
     return {
@@ -66,7 +59,6 @@ export function prepareApplyChangesPlan(
       result: { success: false, error: "Not connected" },
     };
   }
-
   const columnMetaByName = new Map(
     columns.map((column) => [column.name, column]),
   );
@@ -74,17 +66,14 @@ export function prepareApplyChangesPlan(
   const previewStatements: string[] = [];
   const verificationTargets: VerificationTarget[] = [];
   const skippedRows = new Set<number>();
-
   for (const [rowIndex, { primaryKeys, changes }] of updates.entries()) {
     const verificationValues: VerificationTarget["values"] = [];
     const verificationPrimaryKeys = { ...primaryKeys };
-
     for (const [columnName, nextValue] of Object.entries(changes)) {
       const column = columnMetaByName.get(columnName);
       if (!column) {
         continue;
       }
-
       const check = driver.checkPersistedEdit(column, nextValue);
       if (check?.shouldVerify) {
         verificationValues.push({
@@ -92,12 +81,10 @@ export function prepareApplyChangesPlan(
           expectedValue: nextValue,
         });
       }
-
       if (column.isPrimaryKey) {
         verificationPrimaryKeys[columnName] = nextValue;
       }
     }
-
     const operation = buildUpdateRowSql(
       driver,
       database,
@@ -111,7 +98,6 @@ export function prepareApplyChangesPlan(
       skippedRows.add(rowIndex);
       continue;
     }
-
     operations.push({
       sql: operation.sql,
       params: operation.params,
@@ -126,7 +112,6 @@ export function prepareApplyChangesPlan(
       values: verificationValues,
     });
   }
-
   if (operations.length === 0) {
     return {
       executable: false,
@@ -138,7 +123,6 @@ export function prepareApplyChangesPlan(
       },
     };
   }
-
   return {
     executable: true,
     plan: {
@@ -155,7 +139,6 @@ export function prepareApplyChangesPlan(
     },
   };
 }
-
 export async function executePreparedApplyPlan(
   connectionManager: ConnectionManager,
   plan: PreparedApplyPlan,
@@ -164,12 +147,9 @@ export async function executePreparedApplyPlan(
   if (!driver) {
     return { success: false, error: "Not connected" };
   }
-
   const skippedRows = new Set(plan.skippedRows);
-
   try {
     await driver.runTransaction(plan.operations);
-
     const verificationFailures = await verifyExactNumericUpdates(
       driver,
       plan.database,
@@ -181,12 +161,10 @@ export async function executePreparedApplyPlan(
     const verificationFailuresByRow = new Map(
       verificationFailures.map((failure) => [failure.rowIndex, failure]),
     );
-
     const rowOutcomes = plan.updates.map((_, rowIndex) => {
       if (skippedRows.has(rowIndex)) {
         return buildSkippedOutcome(rowIndex, "No changes to apply.");
       }
-
       const verificationFailure = verificationFailuresByRow.get(rowIndex);
       if (verificationFailure) {
         return {
@@ -197,14 +175,12 @@ export async function executePreparedApplyPlan(
           columns: verificationFailure.columns,
         } satisfies ApplyRowOutcome;
       }
-
       return {
         rowIndex,
         success: true,
         status: "applied",
       } satisfies ApplyRowOutcome;
     });
-
     if (verificationFailures.length > 0) {
       return {
         success: true,
@@ -218,7 +194,6 @@ export async function executePreparedApplyPlan(
         rowOutcomes,
       };
     }
-
     return { success: true, rowOutcomes };
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
@@ -237,7 +212,6 @@ export async function executePreparedApplyPlan(
     };
   }
 }
-
 function summarizeOutcomeMessages(
   prefix: string,
   outcomes: ApplyRowOutcome[],
@@ -255,7 +229,6 @@ function summarizeOutcomeMessages(
       : "";
   return `${prefix} ${details}${suffix}`.trim();
 }
-
 function buildSkippedOutcome(
   rowIndex: number,
   message: string,
@@ -268,7 +241,6 @@ function buildSkippedOutcome(
     message,
   };
 }
-
 async function verifyExactNumericUpdates(
   driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>,
   database: string,
@@ -282,12 +254,10 @@ async function verifyExactNumericUpdates(
     columns.map((column) => [column.name, column]),
   );
   const failures: VerificationFailure[] = [];
-
   for (const target of targets) {
     if (target.values.length === 0) {
       continue;
     }
-
     try {
       const parameters: unknown[] = [];
       const whereParts = Object.entries(target.primaryKeys).map(
@@ -302,7 +272,6 @@ async function verifyExactNumericUpdates(
           return `${driver.quoteIdentifier(columnName)} = ${placeholder}`;
         },
       );
-
       const sql = `SELECT ${target.values
         .map(
           ({ column }, index) =>
@@ -313,7 +282,6 @@ async function verifyExactNumericUpdates(
         )} FROM ${qualifiedTableName} WHERE ${whereParts.join(" AND ")}`;
       const result = await driver.query(sql, parameters);
       const row = result.rows[0];
-
       if (!row) {
         failures.push({
           rowIndex: target.rowIndex,
@@ -322,15 +290,12 @@ async function verifyExactNumericUpdates(
         });
         continue;
       }
-
       const mismatchColumns: string[] = [];
       const mismatchMessages: string[] = [];
-
       target.values.forEach(({ column, expectedValue }, index) => {
         const check = driver.checkPersistedEdit(column, expectedValue, {
           persistedValue: row[`__col_${index}`],
         });
-
         if (check && !check.ok) {
           mismatchColumns.push(column.name);
           mismatchMessages.push(
@@ -339,7 +304,6 @@ async function verifyExactNumericUpdates(
           );
         }
       });
-
       if (mismatchColumns.length > 0) {
         failures.push({
           rowIndex: target.rowIndex,
@@ -358,6 +322,5 @@ async function verifyExactNumericUpdates(
       });
     }
   }
-
   return failures;
 }

@@ -344,7 +344,7 @@ function DataTable({ result }: { result: QueryResult }) {
                       {header.column.getCanResize() && (
                         <button
                           type="button"
-                          aria-label={`Resize ${String(header.column.columnDef.header)} column`}
+                          aria-label={`Resize ${typeof header.column.columnDef.header === "string" ? header.column.columnDef.header : header.column.id} column`}
                           onMouseDown={header.getResizeHandler()}
                           onTouchStart={header.getResizeHandler()}
                           onClick={(e) => e.stopPropagation()}

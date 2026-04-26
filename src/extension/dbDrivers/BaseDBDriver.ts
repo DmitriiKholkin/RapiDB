@@ -25,10 +25,7 @@ import {
   NULL_SENTINEL,
 } from "./types";
 
-// ─── Shared datetime formatting helper ───
-
 const pad2 = (n: number) => String(n).padStart(2, "0");
-
 export function formatDatetimeForDisplay(val: unknown): string | null {
   if (val instanceof Date) {
     if (Number.isNaN(val.getTime())) return null;
@@ -59,66 +56,52 @@ export function formatDatetimeForDisplay(val: unknown): string | null {
   }
   return null;
 }
-
 export function isoToLocalDateStr(iso: string): string | null {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return null;
   return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
 }
-
 export function hexFromBuffer(val: Buffer): string {
   return val.length === 0 ? "" : `\\x${val.toString("hex")}`;
 }
-
 function escapePreviewSqlString(value: string): string {
   return value.replace(/'/g, "''");
 }
-
 function formatGenericPreviewSqlLiteral(value: unknown): string {
   if (value === null || value === undefined || value === NULL_SENTINEL) {
     return "NULL";
   }
-
   if (typeof value === "string") {
     return `'${escapePreviewSqlString(value)}'`;
   }
-
   if (typeof value === "number") {
     return Number.isFinite(value) ? String(value) : "NULL";
   }
-
   if (typeof value === "bigint") {
     return value.toString();
   }
-
   if (typeof value === "boolean") {
     return value ? "TRUE" : "FALSE";
   }
-
   if (value instanceof Date) {
     const formatted = formatDatetimeForDisplay(value) ?? value.toISOString();
     return `'${escapePreviewSqlString(formatted)}'`;
   }
-
   if (Buffer.isBuffer(value)) {
     return `X'${value.toString("hex")}'`;
   }
-
   if (value instanceof ArrayBuffer) {
     return `X'${Buffer.from(new Uint8Array(value)).toString("hex")}'`;
   }
-
   if (ArrayBuffer.isView(value)) {
     return `X'${Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("hex")}'`;
   }
-
   try {
     return `'${escapePreviewSqlString(JSON.stringify(value))}'`;
   } catch {
     return `'${escapePreviewSqlString(String(value))}'`;
   }
 }
-
 function materializeSequentialPreviewSql(
   sql: string,
   params: readonly unknown[],
@@ -130,11 +113,9 @@ function materializeSequentialPreviewSql(
       `[RapiDB] Preview parameter mismatch: SQL has ${placeholderCount} placeholder(s) but ${params.length} value(s) were supplied.`,
     );
   }
-
   let index = 0;
   return sql.replace(/\?/g, () => formatLiteral(params[index++]));
 }
-
 function materializeIndexedPreviewSql(
   sql: string,
   params: readonly unknown[],
@@ -142,7 +123,6 @@ function materializeIndexedPreviewSql(
   formatLiteral: (value: unknown) => string,
 ): string {
   const placeholderPattern = marker === "$" ? /\$(\d+)/g : /:(\d+)/g;
-
   return sql.replace(placeholderPattern, (match, rawIndex: string) => {
     const paramIndex = Number.parseInt(rawIndex, 10) - 1;
     if (paramIndex < 0 || paramIndex >= params.length) {
@@ -153,7 +133,6 @@ function materializeIndexedPreviewSql(
     return formatLiteral(params[paramIndex]);
   });
 }
-
 export function parseHexToBuffer(value: string): Buffer {
   const stripped =
     value.startsWith("\\x") ||
@@ -173,7 +152,6 @@ export function parseHexToBuffer(value: string): Buffer {
   }
   throw new Error(`Invalid hex string: "${value}"`);
 }
-
 export function isHexLike(value: string): boolean {
   if (
     value.startsWith("\\x") ||
@@ -185,59 +163,46 @@ export function isHexLike(value: string): boolean {
   }
   return /^[0-9a-fA-F]+$/.test(value) && value.length % 2 === 0;
 }
-
 function normalizeBooleanFilterValue(value: string): "true" | "false" | null {
   const normalized = value.trim().toLowerCase();
   if (normalized === "true" || normalized === "1") return "true";
   if (normalized === "false" || normalized === "0") return "false";
   return null;
 }
-
 function normalizeDateFilterValue(value: string): string | null {
   const normalized = value.trim();
   const normalizedSql = normalizeSqlDatetimeOffsetSpacing(normalized);
-
   if (DATE_ONLY_RE.test(normalized)) {
     return isValidDateOnly(normalized) ? normalized : null;
   }
-
   if (ISO_DATETIME_RE.test(normalized)) {
     if (!hasValidDateTimeParts(normalized)) {
       return null;
     }
-
     if (!hasExplicitTimezone(normalized)) {
       const dateOnly = normalized.slice(0, 10);
       return isValidDateOnly(dateOnly) ? dateOnly : null;
     }
-
     return isoToLocalDateStr(normalized);
   }
-
   if (DATETIME_SQL_RE.test(normalizedSql)) {
     if (!hasValidDateTimeParts(normalizedSql)) {
       return null;
     }
-
     if (hasExplicitTimezone(normalizedSql)) {
       return isoToLocalDateStr(normalizedSql.replace(" ", "T"));
     }
-
     const dateOnly = normalizedSql.slice(0, 10);
     return isValidDateOnly(dateOnly) ? dateOnly : null;
   }
-
   return null;
 }
-
 function looksLikeDateInput(value: string): boolean {
   return /^\d{4}-\d{2}-\d{2}(?:[ T].*)?$/.test(value.trim());
 }
-
 export function hasExplicitTimezone(value: string): boolean {
   return /[zZ]|[+-]\d{2}(?::?\d{2})?$/.test(value);
 }
-
 export function normalizeSqlDatetimeOffsetSpacing(value: string): string {
   const compact = value.replace(/ ([+-]\d{2}(?::?\d{2})?)$/, "$1");
   if (/[+-]\d{2}:\d{2}$/.test(compact)) {
@@ -251,13 +216,10 @@ export function normalizeSqlDatetimeOffsetSpacing(value: string): string {
   }
   return compact;
 }
-
 function isValidDateOnly(value: string): boolean {
   if (!DATE_ONLY_RE.test(value)) return false;
-
   const parsed = new Date(`${value}T00:00:00Z`);
   if (Number.isNaN(parsed.getTime())) return false;
-
   const [year, month, day] = value.split("-").map(Number);
   return (
     parsed.getUTCFullYear() === year &&
@@ -265,58 +227,44 @@ function isValidDateOnly(value: string): boolean {
     parsed.getUTCDate() === day
   );
 }
-
 function hasValidDateTimeParts(value: string): boolean {
   const match =
     /^(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?: ?(?:Z|[+-]\d{2}(?::?\d{2})?))?$/i.exec(
       value,
     );
   if (!match) return false;
-
   const [, date, rawHours, rawMinutes, rawSeconds] = match;
   const hours = Number(rawHours);
   const minutes = Number(rawMinutes);
   const seconds = Number(rawSeconds);
-
   return isValidDateOnly(date) && hours < 24 && minutes < 60 && seconds < 60;
 }
-
 function invalidFilterInputError(columnName: string, expected: string): Error {
   return new Error(`[RapiDB Filter] Column ${columnName} expects ${expected}.`);
 }
-
 function stripCurrencyAffixes(rawValue: string): string {
   let value = rawValue.trim();
-
-  // Remove any Unicode currency symbols from both sides (e.g. $, €, ₹, ₽, ₺, etc.)
   value = value.replace(/^[\p{Sc}\s]+/gu, "");
   value = value.replace(/[\p{Sc}\s]+$/gu, "");
-
-  // Remove common ISO currency code wrappers from both sides (e.g. USD 1,234.56 / 1,234.56 EUR)
   if (/^[A-Za-z]{3}(?=\s|[+-]?\d|\.)/.test(value)) {
     value = value.slice(3).trim();
   }
   if (/(?:\d|\.)[A-Za-z]{3}$/.test(value)) {
     value = value.slice(0, -3).trim();
   }
-
   return value;
 }
-
 function normalizeNumericFilterToken(rawValue: string): string | null {
   let value = rawValue.trim();
   if (value === "") return null;
-
   let isNegative = false;
   const wrappedNegative = /^\((.*)\)$/.exec(value);
   if (wrappedNegative) {
     isNegative = true;
     value = wrappedNegative[1].trim();
   }
-
   value = stripCurrencyAffixes(value);
   value = value.replace(/\s+/g, "");
-
   if (value.includes("'")) {
     const apostropheGroupedNumberPattern =
       /^[+-]?(?:\d{1,3}(?:'\d{3})+)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
@@ -325,7 +273,6 @@ function normalizeNumericFilterToken(rawValue: string): string | null {
     }
     value = value.replace(/'/g, "");
   }
-
   if (value.includes(",")) {
     const groupedNumberPattern =
       /^[+-]?(?:\d{1,3}(?:,\d{3})+)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
@@ -334,90 +281,70 @@ function normalizeNumericFilterToken(rawValue: string): string | null {
     }
     value = value.replace(/,/g, "");
   }
-
   if (isNegative) {
     value = `-${value.replace(/^[+-]/, "")}`;
   }
-
   const numericPattern = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/;
   if (!numericPattern.test(value)) {
     return null;
   }
-
   const parsed = Number(value);
   return Number.isFinite(parsed) ? value : null;
 }
-
 function splitNumericFilterInList(rawValue: string): string[] {
   const input = rawValue.trim();
   if (input === "") return [];
-
   const parts: string[] = [];
   let start = 0;
-
   for (let i = 0; i < input.length; i += 1) {
     if (input[i] !== ",") continue;
-
     const prevChar = i > 0 ? input[i - 1] : "";
     const nextSlice = input.slice(i + 1);
     const isThousandsSeparator =
       /\d/.test(prevChar) && /^\d{3}(?=[^\d]|$)/.test(nextSlice);
-
     if (isThousandsSeparator) {
       continue;
     }
-
     parts.push(input.slice(start, i).trim());
     start = i + 1;
   }
-
   parts.push(input.slice(start).trim());
-
   return parts.filter(Boolean);
 }
-
 const PERSISTED_EDIT_NULL_TOKEN = "\x00__RAPIDB_PERSISTED_EDIT_NULL__\x00";
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
 interface ExactNumericConstraint {
   precision: number | null;
   scale: number | null;
 }
-
 interface CanonicalPersistedEditValue {
   canonical: string;
 }
-
 type PersistedEditCanonicalizer = (
   value: unknown,
 ) => CanonicalPersistedEditValue | null;
-
 interface CanonicalExactNumericValue {
   canonical: string;
   integerDigits: number;
   fractionDigits: number;
   scaleOverflow: boolean;
 }
-
 function parseTypePrecisionScale(nativeType: string): ExactNumericConstraint {
   const match = /\((\d+)(?:\s*,\s*(-?\d+))?\)/.exec(nativeType);
   if (!match) {
     return { precision: null, scale: null };
   }
-
   return {
     precision: Number.parseInt(match[1], 10),
     scale: match[2] === undefined ? null : Number.parseInt(match[2], 10),
   };
 }
-
 function numberToDecimalString(value: number): string {
   const raw = value.toString();
   if (!/[eE]/.test(raw)) {
     return raw;
   }
-
   const [mantissa, exponentText] = raw.toLowerCase().split("e");
   const exponent = Number.parseInt(exponentText, 10);
   const sign = mantissa.startsWith("-") ? "-" : "";
@@ -425,39 +352,30 @@ function numberToDecimalString(value: number): string {
   const [integerPart, fractionPart = ""] = unsignedMantissa.split(".");
   const digits = `${integerPart}${fractionPart}`;
   const decimalIndex = integerPart.length + exponent;
-
   if (decimalIndex <= 0) {
     return `${sign}0.${"0".repeat(Math.abs(decimalIndex))}${digits}`;
   }
-
   if (decimalIndex >= digits.length) {
     return `${sign}${digits}${"0".repeat(decimalIndex - digits.length)}`;
   }
-
   return `${sign}${digits.slice(0, decimalIndex)}.${digits.slice(decimalIndex)}`;
 }
-
 function parseDecimalString(value: unknown): string | null {
   if (value === null || value === undefined || value === NULL_SENTINEL) {
     return null;
   }
-
   if (typeof value === "bigint") {
     return value.toString();
   }
-
   if (typeof value === "number") {
     return Number.isFinite(value) ? numberToDecimalString(value) : null;
   }
-
   if (typeof value !== "string") {
     return null;
   }
-
   const trimmed = value.trim();
   return trimmed === "" ? null : trimmed;
 }
-
 function canonicalizeExactNumeric(
   value: unknown,
   scale: number | null,
@@ -466,22 +384,18 @@ function canonicalizeExactNumeric(
   if (raw === null) {
     return null;
   }
-
   const match = /^([+-])?(?:(\d+)(?:\.(\d*))?|\.(\d+))$/.exec(raw);
   if (!match) {
     return null;
   }
-
   const sign = match[1] === "-" ? "-" : "";
   const integerPart = match[2] ?? "0";
   const fractionPart = match[3] ?? match[4] ?? "";
   const normalizedInteger = integerPart.replace(/^0+(?=\d)/, "");
-
   if (scale !== null) {
     if (scale < 0) {
       return null;
     }
-
     const overflowDigits = fractionPart.slice(scale);
     const scaleOverflow = /[1-9]/.test(overflowDigits);
     const normalizedFraction = fractionPart.slice(0, scale).padEnd(scale, "0");
@@ -492,7 +406,6 @@ function canonicalizeExactNumeric(
       normalizedInteger.replace(/^0+/, "") === ""
         ? 1
         : normalizedInteger.replace(/^0+/, "").length;
-
     return {
       canonical:
         scale === 0
@@ -505,11 +418,9 @@ function canonicalizeExactNumeric(
       scaleOverflow,
     };
   }
-
   const trimmedFraction = fractionPart.replace(/0+$/, "");
   const normalizedInt = normalizedInteger.replace(/^0+/, "") || "0";
   const isZero = normalizedInt === "0" && trimmedFraction === "";
-
   return {
     canonical:
       `${isZero ? "" : sign}${normalizedInt}${trimmedFraction ? `.${trimmedFraction}` : ""}` ||
@@ -519,7 +430,6 @@ function canonicalizeExactNumeric(
     scaleOverflow: false,
   };
 }
-
 function formatDiagnosticValue(value: unknown): string {
   if (value === null) return "NULL";
   if (value === undefined) return "<missing>";
@@ -527,14 +437,12 @@ function formatDiagnosticValue(value: unknown): string {
   if (typeof value === "number" || typeof value === "boolean") {
     return String(value);
   }
-
   try {
     return JSON.stringify(value);
   } catch {
     return String(value);
   }
 }
-
 function buildValidationMessage(
   columnName: string,
   constraint: ExactNumericConstraint,
@@ -543,7 +451,6 @@ function buildValidationMessage(
   if (canonical.scaleOverflow && constraint.scale !== null) {
     return `Column "${columnName}" accepts at most ${constraint.scale} fractional digit${constraint.scale === 1 ? "" : "s"}.`;
   }
-
   if (constraint.precision !== null) {
     if (constraint.scale !== null) {
       const allowedIntegerDigits = Math.max(
@@ -560,20 +467,16 @@ function buildValidationMessage(
       return `Column "${columnName}" exceeds precision ${constraint.precision}.`;
     }
   }
-
   return null;
 }
-
 function canonicalizeNullishPersistedEditValue(
   value: unknown,
 ): CanonicalPersistedEditValue | null {
   if (value === NULL_SENTINEL || value === null) {
     return { canonical: PERSISTED_EDIT_NULL_TOKEN };
   }
-
   return null;
 }
-
 function canonicalizeTextPersistedEditValue(
   value: unknown,
 ): CanonicalPersistedEditValue | null {
@@ -581,11 +484,9 @@ function canonicalizeTextPersistedEditValue(
   if (nullish) {
     return nullish;
   }
-
   if (typeof value === "string") {
     return { canonical: value };
   }
-
   if (
     typeof value === "number" ||
     typeof value === "boolean" ||
@@ -593,10 +494,8 @@ function canonicalizeTextPersistedEditValue(
   ) {
     return { canonical: String(value) };
   }
-
   return null;
 }
-
 function canonicalizeBooleanPersistedEditValue(
   value: unknown,
 ): CanonicalPersistedEditValue | null {
@@ -604,31 +503,24 @@ function canonicalizeBooleanPersistedEditValue(
   if (nullish) {
     return nullish;
   }
-
   if (value === true || value === 1) {
     return { canonical: "true" };
   }
-
   if (value === false || value === 0) {
     return { canonical: "false" };
   }
-
   if (typeof value !== "string") {
     return null;
   }
-
   const normalized = value.trim().toLowerCase();
   if (["true", "t", "1"].includes(normalized)) {
     return { canonical: "true" };
   }
-
   if (["false", "f", "0"].includes(normalized)) {
     return { canonical: "false" };
   }
-
   return null;
 }
-
 function canonicalizeUuidPersistedEditValue(
   value: unknown,
 ): CanonicalPersistedEditValue | null {
@@ -636,24 +528,19 @@ function canonicalizeUuidPersistedEditValue(
   if (nullish) {
     return nullish;
   }
-
   if (typeof value !== "string") {
     return null;
   }
-
   const normalized = value.trim().toLowerCase();
   if (!UUID_RE.test(normalized)) {
     return null;
   }
-
   return { canonical: normalized };
 }
-
 function stableJsonValue(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map((item) => stableJsonValue(item));
   }
-
   if (value !== null && typeof value === "object") {
     const proto = Object.getPrototypeOf(value);
     if (proto === Object.prototype || proto === null) {
@@ -667,10 +554,8 @@ function stableJsonValue(value: unknown): unknown {
       );
     }
   }
-
   return value;
 }
-
 function canonicalizeJsonPersistedEditValue(
   value: unknown,
 ): CanonicalPersistedEditValue | null {
@@ -678,28 +563,24 @@ function canonicalizeJsonPersistedEditValue(
   if (nullish) {
     return nullish;
   }
-
   let parsed = value;
   if (typeof value === "string") {
     const trimmed = value.trim();
     if (trimmed === "") {
       return null;
     }
-
     try {
       parsed = JSON.parse(trimmed) as unknown;
     } catch {
       return null;
     }
   }
-
   try {
     return { canonical: JSON.stringify(stableJsonValue(parsed)) };
   } catch {
     return null;
   }
 }
-
 function canonicalizeJsonArrayPersistedEditValue(
   value: unknown,
 ): CanonicalPersistedEditValue | null {
@@ -707,48 +588,39 @@ function canonicalizeJsonArrayPersistedEditValue(
   if (nullish) {
     return nullish;
   }
-
   let parsed = value;
   if (typeof value === "string") {
     const trimmed = value.trim();
     if (trimmed === "") {
       return null;
     }
-
     try {
       parsed = JSON.parse(trimmed) as unknown;
     } catch {
       return null;
     }
   }
-
   if (!Array.isArray(parsed)) {
     return null;
   }
-
   try {
     return { canonical: JSON.stringify(stableJsonValue(parsed)) };
   } catch {
     return null;
   }
 }
-
 function toPersistedEditBuffer(value: unknown): Buffer | null {
   if (Buffer.isBuffer(value)) {
     return value;
   }
-
   if (value instanceof Uint8Array) {
     return Buffer.from(value);
   }
-
   if (value instanceof ArrayBuffer) {
     return Buffer.from(new Uint8Array(value));
   }
-
   return null;
 }
-
 function canonicalizeBinaryPersistedEditValue(
   value: unknown,
 ): CanonicalPersistedEditValue | null {
@@ -756,29 +628,23 @@ function canonicalizeBinaryPersistedEditValue(
   if (nullish) {
     return nullish;
   }
-
   const buffer = toPersistedEditBuffer(value);
   if (buffer) {
     return { canonical: hexFromBuffer(buffer).toLowerCase() };
   }
-
   if (typeof value !== "string") {
     return null;
   }
-
   if (value === "") {
     return { canonical: "" };
   }
-
   if (!isHexLike(value)) {
     return null;
   }
-
   return {
     canonical: hexFromBuffer(parseHexToBuffer(value)).toLowerCase(),
   };
 }
-
 function canonicalizeApproximateNumericPersistedEditValue(
   value: unknown,
   significantDigits: number,
@@ -787,47 +653,41 @@ function canonicalizeApproximateNumericPersistedEditValue(
   if (nullish) {
     return nullish;
   }
-
   const raw = parseDecimalString(value);
   if (raw === null) {
     return null;
   }
-
   const parsed = Number(raw);
   if (!Number.isFinite(parsed)) {
     return null;
   }
-
   return {
     canonical: Number.parseFloat(
       parsed.toPrecision(significantDigits),
     ).toString(),
   };
 }
-
 function findApproximateNumericPrecisionLoss(
   value: unknown,
   significantDigits: number,
-): { roundedValue: string } | null {
+): {
+  roundedValue: string;
+} | null {
   if (typeof value !== "string") {
     return null;
   }
-
   const raw = parseDecimalString(value);
   if (raw === null) {
     return null;
   }
-
   const requested = canonicalizeExactNumeric(raw, null);
   if (!requested) {
     return null;
   }
-
   const parsed = Number(raw);
   if (!Number.isFinite(parsed)) {
     return null;
   }
-
   const roundedNumber = Number.parseFloat(
     parsed.toPrecision(significantDigits),
   );
@@ -838,16 +698,11 @@ function findApproximateNumericPrecisionLoss(
   if (!rounded || requested.canonical === rounded.canonical) {
     return null;
   }
-
   return {
     roundedValue: rounded.canonical,
   };
 }
-
-// ─── Abstract base driver ───
-
 export abstract class BaseDBDriver implements IDBDriver {
-  // ── Abstract methods each driver MUST implement ──
   abstract connect(): Promise<void>;
   abstract disconnect(): Promise<void>;
   abstract isConnected(): boolean;
@@ -882,7 +737,6 @@ export abstract class BaseDBDriver implements IDBDriver {
   ): Promise<string>;
   abstract query(sql: string, params?: unknown[]): Promise<QueryResult>;
   abstract runTransaction(operations: TransactionOperation[]): Promise<void>;
-
   async getMutationAtomicityRisk(
     _database: string,
     _schema: string,
@@ -890,35 +744,24 @@ export abstract class BaseDBDriver implements IDBDriver {
   ): Promise<string | null> {
     return null;
   }
-
-  // ── Abstract: each driver maps its native types to TypeCategory ──
   abstract mapTypeCategory(nativeType: string): TypeCategory;
-
-  // ── Abstract: each driver determines value semantics ──
   protected abstract getValueSemantics(
     nativeType: string,
     category: TypeCategory,
   ): ValueSemantics;
-
   isBooleanType(nativeType: string): boolean {
     return (
       this.getValueSemantics(nativeType, this.mapTypeCategory(nativeType)) ===
       "boolean"
     );
   }
-
   isBitType(nativeType: string): boolean {
     return (
       this.getValueSemantics(nativeType, this.mapTypeCategory(nativeType)) ===
       "bit"
     );
   }
-
-  // ── Abstract: each driver determines datetime-with-time detection ──
   abstract isDatetimeWithTime(nativeType: string): boolean;
-
-  // ─── describeColumns: wraps describeTable + enriches ───
-
   async describeColumns(
     database: string,
     schema: string,
@@ -927,7 +770,6 @@ export abstract class BaseDBDriver implements IDBDriver {
     const cols = await this.describeTable(database, schema, table);
     return cols.map((c) => this.enrichColumn(c));
   }
-
   protected enrichColumn(col: ColumnMeta): ColumnTypeMeta {
     const category = this.mapTypeCategory(col.type);
     const valueSemantics = this.getValueSemantics(col.type, category);
@@ -946,34 +788,20 @@ export abstract class BaseDBDriver implements IDBDriver {
       valueSemantics,
     };
   }
-
-  /**
-   * Shared filterability contract:
-   * - default allow for all mapped categories;
-   * - deny only categories/types that are too large/complex to compare safely.
-   *
-   * Spatial/array/interval reuse the existing text fallback semantics from
-   * filter builders (CAST/CONVERT + LIKE family) and category operators.
-   */
   protected isFilterable(_nativeType: string, category: TypeCategory): boolean {
     return !["lob", "binary", "spatial", "array", "interval"].includes(
       category,
     );
   }
-
-  // ─── SQL helpers ───
-
   quoteIdentifier(name: string): string {
     return `"${name.replace(/"/g, '""')}"`;
   }
-
   qualifiedTableName(_database: string, schema: string, table: string): string {
     const parts: string[] = [];
     if (schema) parts.push(this.quoteIdentifier(schema));
     parts.push(this.quoteIdentifier(table));
     return parts.join(".");
   }
-
   buildPagination(
     offset: number,
     limit: number,
@@ -984,7 +812,6 @@ export abstract class BaseDBDriver implements IDBDriver {
       params: [limit, offset],
     };
   }
-
   buildOrderByDefault(cols: ColumnTypeMeta[]): string {
     const pkCols = cols
       .filter((c) => c.isPrimaryKey)
@@ -996,136 +823,106 @@ export abstract class BaseDBDriver implements IDBDriver {
     if (pkCols.length === 0) return "";
     return `ORDER BY ${pkCols.map((c) => this.quoteIdentifier(c.name)).join(", ")}`;
   }
-
   buildInsertDefaultValuesSql(
     qualifiedTableName: string,
     _columns?: readonly ColumnTypeMeta[],
   ): string {
     return `INSERT INTO ${qualifiedTableName} DEFAULT VALUES`;
   }
-
   buildInsertValueExpr(_column: ColumnTypeMeta, _paramIndex: number): string {
     return "?";
   }
-
   buildSetExpr(column: ColumnTypeMeta, _paramIndex: number): string {
     return `${this.quoteIdentifier(column.name)} = ?`;
   }
-
   protected formatPreviewSqlLiteral(value: unknown): string {
     return formatGenericPreviewSqlLiteral(value);
   }
-
   materializePreviewSql(sql: string, params?: readonly unknown[]): string {
     if (!params || params.length === 0) {
       return sql;
     }
-
     const formatLiteral = (value: unknown) =>
       this.formatPreviewSqlLiteral(value);
-
     if (sql.includes("?")) {
       return materializeSequentialPreviewSql(sql, params, formatLiteral);
     }
-
     if (/\$\d+/.test(sql)) {
       return materializeIndexedPreviewSql(sql, params, "$", formatLiteral);
     }
-
     if (/:\d+/.test(sql)) {
       return materializeIndexedPreviewSql(sql, params, ":", formatLiteral);
     }
-
     return sql;
   }
-
-  // ─── Type-aware data helpers ───
-
   protected hasBooleanSemantics(
     column: Pick<ColumnTypeMeta, "valueSemantics">,
   ): boolean {
     return column.valueSemantics === "boolean";
   }
-
   protected hasBitSemantics(
     column: Pick<ColumnTypeMeta, "valueSemantics">,
   ): boolean {
     return column.valueSemantics === "bit";
   }
-
   protected parseBooleanInput(value: string): boolean | null {
     const lower = value.trim().toLowerCase();
     if (lower === "true" || lower === "1") return true;
     if (lower === "false" || lower === "0") return false;
     return null;
   }
-
   coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (value === null || value === undefined || value === "") return value;
     if (value === NULL_SENTINEL) return null;
     if (typeof value !== "string") return value;
-
     const booleanValue = this.parseBooleanInput(value);
-
     if (this.hasBooleanSemantics(column) && booleanValue !== null) {
       return booleanValue
         ? this.coerceBooleanTrue()
         : this.coerceBooleanFalse();
     }
-
     if (this.hasBitSemantics(column)) {
       const bitValue = this.coerceBitInputValue(value, column);
       if (bitValue !== undefined) {
         return bitValue;
       }
     }
-
     if (column.category === "binary" && isHexLike(value)) {
       return parseHexToBuffer(value);
     }
-
     return value;
   }
-
   protected coerceBooleanTrue(): unknown {
     return true;
   }
   protected coerceBooleanFalse(): unknown {
     return false;
   }
-
   protected coerceBitInputValue(
     _value: string,
     _column: ColumnTypeMeta,
   ): unknown | undefined {
     return undefined;
   }
-
   formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (value === null || value === undefined) return value;
-
     if (Buffer.isBuffer(value)) return hexFromBuffer(value);
     if (typeof value === "bigint") return value.toString();
-
     if (value instanceof Date) {
       if (column.category === "date") {
         return isoToLocalDateStr(value.toISOString()) ?? value;
       }
       return formatDatetimeForDisplay(value) ?? value;
     }
-
     if (value !== null && typeof value === "object") {
       return JSON.stringify(value);
     }
-
     if (this.isDatetimeWithTime(column.nativeType)) {
       const formatted = formatDatetimeForDisplay(value);
       if (formatted !== null) return formatted;
     }
-
     return value;
   }
-
   checkPersistedEdit(
     _column: ColumnTypeMeta,
     _expectedValue: unknown,
@@ -1133,13 +930,11 @@ export abstract class BaseDBDriver implements IDBDriver {
   ): PersistedEditCheckResult | null {
     return null;
   }
-
   protected parseExactNumericConstraint(
     nativeType: string,
   ): ExactNumericConstraint {
     return parseTypePrecisionScale(nativeType);
   }
-
   protected checkExactNumericPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -1149,7 +944,6 @@ export abstract class BaseDBDriver implements IDBDriver {
     if (!constraint) {
       return null;
     }
-
     const expectedNullish =
       canonicalizeNullishPersistedEditValue(expectedValue);
     if (expectedNullish) {
@@ -1159,7 +953,6 @@ export abstract class BaseDBDriver implements IDBDriver {
           shouldVerify: true,
         };
       }
-
       const actualNullish = canonicalizeNullishPersistedEditValue(
         options.persistedValue,
       );
@@ -1173,18 +966,15 @@ export abstract class BaseDBDriver implements IDBDriver {
           message: `${column.name} stored ${formatDiagnosticValue(options.persistedValue)} instead of ${formatDiagnosticValue(expectedValue)}`,
         };
       }
-
       return {
         ok: true,
         shouldVerify: true,
       };
     }
-
     const expected = canonicalizeExactNumeric(expectedValue, constraint.scale);
     if (!expected) {
       return null;
     }
-
     if (options === undefined) {
       const message = buildValidationMessage(column.name, constraint, expected);
       if (message) {
@@ -1194,13 +984,11 @@ export abstract class BaseDBDriver implements IDBDriver {
           message,
         };
       }
-
       return {
         ok: true,
         shouldVerify: true,
       };
     }
-
     const actual = canonicalizeExactNumeric(
       options.persistedValue,
       constraint.scale,
@@ -1212,13 +1000,11 @@ export abstract class BaseDBDriver implements IDBDriver {
         message: `${column.name} stored ${formatDiagnosticValue(options.persistedValue)} instead of ${formatDiagnosticValue(expectedValue)}`,
       };
     }
-
     return {
       ok: true,
       shouldVerify: true,
     };
   }
-
   protected checkNormalizedPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -1236,14 +1022,12 @@ export abstract class BaseDBDriver implements IDBDriver {
           }
         : null;
     }
-
     if (options === undefined) {
       return {
         ok: true,
         shouldVerify: true,
       };
     }
-
     const actual = canonicalize(options.persistedValue);
     if (!actual || actual.canonical !== expected.canonical) {
       return {
@@ -1252,13 +1036,11 @@ export abstract class BaseDBDriver implements IDBDriver {
         message: `${column.name} stored ${formatDiagnosticValue(options.persistedValue)} instead of ${formatDiagnosticValue(expectedValue)}`,
       };
     }
-
     return {
       ok: true,
       shouldVerify: true,
     };
   }
-
   protected checkTextPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -1272,7 +1054,6 @@ export abstract class BaseDBDriver implements IDBDriver {
       `Column "${column.name}" expects a text value.`,
     );
   }
-
   protected checkFixedWidthCharPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -1287,11 +1068,9 @@ export abstract class BaseDBDriver implements IDBDriver {
         if (nullish) {
           return nullish;
         }
-
         if (typeof value === "string") {
           return { canonical: value.trimEnd() };
         }
-
         if (
           typeof value === "number" ||
           typeof value === "boolean" ||
@@ -1299,13 +1078,11 @@ export abstract class BaseDBDriver implements IDBDriver {
         ) {
           return { canonical: String(value).trimEnd() };
         }
-
         return null;
       },
       `Column "${column.name}" expects a text value.`,
     );
   }
-
   protected checkBooleanPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -1319,7 +1096,6 @@ export abstract class BaseDBDriver implements IDBDriver {
       `Column "${column.name}" expects true or false.`,
     );
   }
-
   protected checkUuidPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -1333,7 +1109,6 @@ export abstract class BaseDBDriver implements IDBDriver {
       `Column "${column.name}" expects a valid UUID.`,
     );
   }
-
   protected checkJsonPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -1347,7 +1122,6 @@ export abstract class BaseDBDriver implements IDBDriver {
       `Column "${column.name}" expects valid JSON.`,
     );
   }
-
   protected checkJsonArrayPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -1361,7 +1135,6 @@ export abstract class BaseDBDriver implements IDBDriver {
       `Column "${column.name}" expects a JSON array value.`,
     );
   }
-
   protected checkBinaryPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -1375,7 +1148,6 @@ export abstract class BaseDBDriver implements IDBDriver {
       `Column "${column.name}" expects a hex value like \\xDEADBEEF.`,
     );
   }
-
   protected checkApproximateNumericPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -1397,7 +1169,6 @@ export abstract class BaseDBDriver implements IDBDriver {
         };
       }
     }
-
     return this.checkNormalizedPersistedEdit(
       column,
       expectedValue,
@@ -1410,7 +1181,6 @@ export abstract class BaseDBDriver implements IDBDriver {
       `Column "${column.name}" expects a numeric value.`,
     );
   }
-
   normalizeFilterValue(
     column: ColumnTypeMeta,
     operator: FilterOperator,
@@ -1419,29 +1189,23 @@ export abstract class BaseDBDriver implements IDBDriver {
     if (operator === "is_null" || operator === "is_not_null") {
       return undefined;
     }
-
     if (value === undefined) {
       return undefined;
     }
-
     if (operator === "between") {
       if (!Array.isArray(value)) {
         return value;
       }
-
       return [
         this.normalizeScalarFilterValue(column, value[0], operator),
         this.normalizeScalarFilterValue(column, value[1], operator),
       ];
     }
-
     if (typeof value !== "string") {
       return value;
     }
-
     return this.normalizeScalarFilterValue(column, value, operator);
   }
-
   protected normalizeScalarFilterValue(
     column: ColumnTypeMeta,
     rawValue: string,
@@ -1451,7 +1215,6 @@ export abstract class BaseDBDriver implements IDBDriver {
     if (value === "") {
       throw invalidFilterInputError(column.name, "a filter value");
     }
-
     if (this.hasBooleanSemantics(column)) {
       const normalized = normalizeBooleanFilterValue(value);
       if (!normalized) {
@@ -1459,36 +1222,30 @@ export abstract class BaseDBDriver implements IDBDriver {
       }
       return normalized;
     }
-
     if (this.isNumericCategory(column.category)) {
       if (operator === "in") {
         const rawValues = splitNumericFilterInList(value);
         if (rawValues.length === 0) {
           throw invalidFilterInputError(column.name, "comma-separated numbers");
         }
-
         const values = rawValues.map((part) =>
           normalizeNumericFilterToken(part),
         );
         if (values.some((part) => part === null)) {
           throw invalidFilterInputError(column.name, "comma-separated numbers");
         }
-
         return values.join(", ");
       }
-
       const normalizedNumericValue = normalizeNumericFilterToken(value);
       if (!normalizedNumericValue) {
         throw invalidFilterInputError(column.name, "a number");
       }
       return normalizedNumericValue;
     }
-
     if (column.category === "date") {
       if (operator === "like") {
         return value;
       }
-
       if (operator === "in") {
         const values = value
           .split(",")
@@ -1497,7 +1254,6 @@ export abstract class BaseDBDriver implements IDBDriver {
         if (values.length === 0) {
           throw invalidFilterInputError(column.name, "comma-separated dates");
         }
-
         const normalizedValues = values.map((part) => {
           const normalizedDate = normalizeDateFilterValue(part);
           if (!normalizedDate) {
@@ -1505,25 +1261,18 @@ export abstract class BaseDBDriver implements IDBDriver {
           }
           return normalizedDate;
         });
-
         return normalizedValues.join(", ");
       }
-
       const normalizedDate = normalizeDateFilterValue(value);
       if (normalizedDate) {
         return normalizedDate;
       }
-
       if (looksLikeDateInput(value)) {
         throw invalidFilterInputError(column.name, "a valid date");
       }
     }
-
     return value;
   }
-
-  // ─── Filter condition building (default: CAST AS TEXT LIKE) ───
-
   buildFilterCondition(
     column: ColumnTypeMeta,
     operator: FilterOperator,
@@ -1531,18 +1280,12 @@ export abstract class BaseDBDriver implements IDBDriver {
     paramIndex: number,
   ): FilterConditionResult | null {
     const col = this.quoteIdentifier(column.name);
-
-    // Null checks
     if (operator === "is_null") return { sql: `${col} IS NULL`, params: [] };
     if (operator === "is_not_null")
       return { sql: `${col} IS NOT NULL`, params: [] };
-
     if (!column.filterable) return null;
     if (value === undefined) return null;
-
     const val = typeof value === "string" ? value.trim() : value;
-
-    // Boolean
     if (
       this.hasBooleanSemantics(column) &&
       (operator === "eq" || operator === "neq")
@@ -1557,8 +1300,6 @@ export abstract class BaseDBDriver implements IDBDriver {
         );
       }
     }
-
-    // Numeric exact match
     if (
       this.isNumericCategory(column.category) &&
       typeof val === "string" &&
@@ -1567,13 +1308,9 @@ export abstract class BaseDBDriver implements IDBDriver {
     ) {
       return this.buildNumericFilter(col, column, operator, val, paramIndex);
     }
-
-    // Between
     if (operator === "between" && Array.isArray(val)) {
       return this.buildBetweenFilter(col, column, val, paramIndex);
     }
-
-    // Default: text-based comparison
     return this.buildTextFilter(
       col,
       column,
@@ -1582,11 +1319,9 @@ export abstract class BaseDBDriver implements IDBDriver {
       paramIndex,
     );
   }
-
   protected isNumericCategory(cat: TypeCategory): boolean {
     return cat === "integer" || cat === "float" || cat === "decimal";
   }
-
   protected buildBooleanFilter(
     col: string,
     operator: FilterOperator,
@@ -1596,7 +1331,6 @@ export abstract class BaseDBDriver implements IDBDriver {
     const op = operator === "neq" ? "!=" : "=";
     return { sql: `${col} ${op} ?`, params: [isTrue ? 1 : 0] };
   }
-
   protected buildNumericFilter(
     col: string,
     _column: ColumnTypeMeta,
@@ -1608,7 +1342,6 @@ export abstract class BaseDBDriver implements IDBDriver {
     const sqlOp = this.sqlOperator(operator);
     return { sql: `${col} ${sqlOp} ?`, params: [num] };
   }
-
   protected buildBetweenFilter(
     col: string,
     _column: ColumnTypeMeta,
@@ -1617,7 +1350,6 @@ export abstract class BaseDBDriver implements IDBDriver {
   ): FilterConditionResult {
     return { sql: `${col} BETWEEN ? AND ?`, params: [val[0], val[1]] };
   }
-
   protected buildTextFilter(
     col: string,
     _column: ColumnTypeMeta,
@@ -1629,10 +1361,6 @@ export abstract class BaseDBDriver implements IDBDriver {
     if (operator === "like" || operator === "ilike") {
       return { sql: `CAST(${col} AS CHAR) LIKE ?`, params: [`%${val}%`] };
     }
-    // NOTE: `eq` and `neq` are not in TEXT_OPS so they will never appear as
-    // filter-operator choices for text columns in the UI.  These branches are
-    // a defensive fallback for callers that invoke buildFilterCondition
-    // directly with an arbitrary operator (e.g. unit-tests, future drivers).
     if (operator === "eq") {
       return { sql: `CAST(${col} AS CHAR) LIKE ?`, params: [`%${val}%`] };
     }
@@ -1648,7 +1376,6 @@ export abstract class BaseDBDriver implements IDBDriver {
     }
     return { sql: `${col} ${sqlOp} ?`, params: [val] };
   }
-
   protected sqlOperator(op: FilterOperator): string {
     switch (op) {
       case "eq":

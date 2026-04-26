@@ -111,7 +111,9 @@ export class QueryPanelController {
     }
 
     const connectionId =
-      connectionIdOverride || this.view.getInitialConnectionId();
+      connectionIdOverride ||
+      this.view.getActiveConnectionId() ||
+      this.view.getInitialConnectionId();
 
     if (!this.connectionManager.isConnected(connectionId)) {
       try {
@@ -164,7 +166,9 @@ export class QueryPanelController {
 
   private async pushSchema(connectionIdOverride?: string): Promise<void> {
     const connectionId =
-      connectionIdOverride || this.view.getActiveConnectionId();
+      connectionIdOverride ||
+      this.view.getActiveConnectionId() ||
+      this.view.getInitialConnectionId();
 
     if (!this.connectionManager.isConnected(connectionId)) {
       this.view.postMessage({
@@ -251,15 +255,4 @@ export class QueryPanelController {
       });
     }
   }
-}
-
-function _normaliseSqlForGuardrail(sql: string): string {
-  return sql
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .replace(/--.*$/gm, " ")
-    .replace(/'([^']|'')*'/g, "''")
-    .replace(/"([^"]|"")*"/g, '""')
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
 }
