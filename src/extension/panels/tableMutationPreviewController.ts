@@ -7,6 +7,7 @@ import type { ConnectionManager } from "../connectionManager";
 import {
   executePreparedApplyPlan,
   type PreparedApplyPlan,
+  type PreparedDeletePlan,
   type PreparedInsertPlan,
   type TableDataService,
 } from "../tableDataService";
@@ -25,6 +26,10 @@ type PendingTableMutationPreview =
   | {
       kind: "insertRow";
       plan: PreparedInsertPlan;
+    }
+  | {
+      kind: "deleteRows";
+      plan: PreparedDeletePlan;
     };
 
 type MutationPreviewExecutionResult =
@@ -33,7 +38,7 @@ type MutationPreviewExecutionResult =
       payload: ApplyResultPayload;
     }
   | {
-      type: "insertResult";
+      type: "insertResult" | "deleteResult";
       payload: {
         success: boolean;
         error?: string;
@@ -44,7 +49,10 @@ interface TableMutationPreviewControllerOptions {
   connectionId: string;
   tableName: string;
   connectionManager: ConnectionManager;
-  tableDataService: Pick<TableDataService, "executePreparedInsertPlan">;
+  tableDataService: Pick<
+    TableDataService,
+    "executePreparedInsertPlan" | "executePreparedDeletePlan"
+  >;
   notifyWarning: (message: string) => void;
 }
 
@@ -59,7 +67,7 @@ export class TableMutationPreviewController {
   private readonly connectionManager: ConnectionManager;
   private readonly tableDataService: Pick<
     TableDataService,
-    "executePreparedInsertPlan"
+    "executePreparedInsertPlan" | "executePreparedDeletePlan"
   >;
   private readonly notifyWarning: (message: string) => void;
 
@@ -85,6 +93,12 @@ export class TableMutationPreviewController {
 
   createInsertPreview(plan: PreparedInsertPlan): TableMutationPreviewPayload {
     return this.storePreview({ kind: "insertRow", plan });
+  }
+
+  createDeleteRowsPreview(
+    plan: PreparedDeletePlan,
+  ): TableMutationPreviewPayload {
+    return this.storePreview({ kind: "deleteRows", plan });
   }
 
   async confirm(
@@ -143,15 +157,20 @@ export class TableMutationPreviewController {
     }
 
     try {
-      await this.tableDataService.executePreparedInsertPlan(preview.plan);
+      if (preview.kind === "insertRow") {
+        await this.tableDataService.executePreparedInsertPlan(preview.plan);
+      } else {
+        await this.tableDataService.executePreparedDeletePlan(preview.plan);
+      }
+
       return {
-        type: "insertResult",
+        type: preview.kind === "insertRow" ? "insertResult" : "deleteResult",
         payload: { success: true },
       };
     } catch (error: unknown) {
       const normalized = normalizeUnknownError(error);
       return {
-        type: "insertResult",
+        type: preview.kind === "insertRow" ? "insertResult" : "deleteResult",
         payload: {
           success: false,
           error: normalized.message,
@@ -189,7 +208,9 @@ export class TableMutationPreviewController {
     const title =
       preview.kind === "applyChanges"
         ? `Apply changes to ${this.tableName}`
-        : `Insert row into ${this.tableName}`;
+        : preview.kind === "insertRow"
+          ? `Insert row into ${this.tableName}`
+          : `Apply changes to ${this.tableName}`;
 
     return {
       previewToken,

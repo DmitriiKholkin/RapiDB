@@ -4,6 +4,18 @@ import { TablePanel } from "../../src/extension/panels/tablePanel";
 const getPageMock = vi.hoisted(() =>
   vi.fn(async () => ({ rows: [], totalCount: 0, columns: [] })),
 );
+const prepareDeleteRowsPlanMock = vi.hoisted(() =>
+  vi.fn<
+    (
+      connectionId: string,
+      database: string,
+      schema: string,
+      table: string,
+      primaryKeysList: Array<Record<string, unknown>>,
+    ) => Promise<unknown | null>
+  >(async () => null),
+);
+const createDeleteRowsPreviewMock = vi.hoisted(() => vi.fn());
 
 const vscodeMock = vi.hoisted(() => {
   const createWebviewPanel = vi.fn(() => {
@@ -76,6 +88,7 @@ vi.mock("../../src/extension/tableDataService", () => ({
   TableDataService: class {
     getColumns = vi.fn(async () => []);
     getPage = getPageMock;
+    prepareDeleteRowsPlan = prepareDeleteRowsPlanMock;
     clearForConnection = vi.fn();
   },
   prepareApplyChangesPlan: vi.fn(),
@@ -88,6 +101,7 @@ vi.mock("../../src/extension/panels/tableMutationPreviewController", () => ({
     cancel = vi.fn();
     createApplyChangesPreview = vi.fn();
     createInsertPreview = vi.fn();
+    createDeleteRowsPreview = createDeleteRowsPreviewMock;
   },
 }));
 
@@ -100,6 +114,16 @@ describe("TablePanel", () => {
     vi.clearAllMocks();
     TablePanel.disposeAll();
     getPageMock.mockClear();
+    prepareDeleteRowsPlanMock.mockReset();
+    prepareDeleteRowsPlanMock.mockResolvedValue(null);
+    createDeleteRowsPreviewMock.mockReset();
+    createDeleteRowsPreviewMock.mockReturnValue({
+      previewToken: "preview-token",
+      kind: "deleteRows",
+      title: "Apply changes to users",
+      sql: "DELETE FROM users WHERE id = 1;",
+      statementCount: 1,
+    });
   });
 
   it("normalizes fetchPage pagination before querying data service", async () => {
@@ -168,5 +192,126 @@ describe("TablePanel", () => {
       [],
       null,
     );
+  });
+
+  it("routes deleteRows through mutation preview when prepared plan exists", async () => {
+    const connectionManager = {
+      getConnection: vi.fn(() => ({ name: "Main" })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      getDefaultPageSize: vi.fn(() => 25),
+    };
+
+    prepareDeleteRowsPlanMock.mockResolvedValueOnce({
+      connectionId: "conn-1",
+      database: "db1",
+      schema: "public",
+      table: "users",
+      executionMode: "sequential",
+      operations: [{ sql: "DELETE FROM users WHERE id = ?", params: [1] }],
+      previewStatements: ["DELETE FROM users WHERE id = 1"],
+      verificationCriteriaList: [{ id: 1 }],
+    });
+
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      "db1",
+      "public",
+      "users",
+    );
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected table panel instance");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "deleteRows",
+      payload: { primaryKeysList: [{ id: 1 }] },
+    });
+
+    expect(prepareDeleteRowsPlanMock).toHaveBeenCalledWith(
+      "conn-1",
+      "db1",
+      "public",
+      "users",
+      [{ id: 1 }],
+    );
+    expect(createDeleteRowsPreviewMock).toHaveBeenCalledOnce();
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "tableMutationPreview",
+      payload: expect.objectContaining({ kind: "deleteRows" }),
+    });
+  });
+
+  it("returns immediate success when prepared delete plan is empty", async () => {
+    const connectionManager = {
+      getConnection: vi.fn(() => ({ name: "Main" })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      getDefaultPageSize: vi.fn(() => 25),
+    };
+
+    prepareDeleteRowsPlanMock.mockResolvedValueOnce(null);
+
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      "db1",
+      "public",
+      "users",
+    );
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected table panel instance");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "deleteRows",
+      payload: { primaryKeysList: [] },
+    });
+
+    expect(createDeleteRowsPreviewMock).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "deleteResult",
+      payload: { success: true },
+    });
+  });
+
+  it("returns delete failure when preparing delete preview plan throws", async () => {
+    const connectionManager = {
+      getConnection: vi.fn(() => ({ name: "Main" })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      getDefaultPageSize: vi.fn(() => 25),
+    };
+
+    prepareDeleteRowsPlanMock.mockRejectedValueOnce(new Error("Plan failed"));
+
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      "db1",
+      "public",
+      "users",
+    );
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected table panel instance");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "deleteRows",
+      payload: { primaryKeysList: [{ id: 1 }] },
+    });
+
+    expect(createDeleteRowsPreviewMock).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "deleteResult",
+      payload: { success: false, error: "Plan failed" },
+    });
   });
 });

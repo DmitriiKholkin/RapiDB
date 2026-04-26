@@ -6,6 +6,7 @@ import type {
 import { buildWhere } from "../../src/extension/table/filterSql";
 import { buildInsertRowOperation } from "../../src/extension/table/insertSql";
 import { prepareApplyChangesPlan } from "../../src/extension/table/tableMutationExecution";
+import { TableMutationService } from "../../src/extension/table/tableMutationService";
 
 const columns: ColumnTypeMeta[] = [
   {
@@ -61,6 +62,50 @@ const columns: ColumnTypeMeta[] = [
     category: "integer",
     filterable: true,
     filterOperators: ["eq", "gt", "lt", "is_null", "is_not_null"],
+    valueSemantics: "plain",
+  },
+];
+
+const compositePrimaryKeyColumns: ColumnTypeMeta[] = [
+  {
+    name: "tenant_id",
+    type: "INTEGER",
+    nativeType: "INTEGER",
+    nullable: false,
+    isPrimaryKey: true,
+    primaryKeyOrdinal: 1,
+    isForeignKey: false,
+    isAutoIncrement: false,
+    category: "integer",
+    filterable: true,
+    filterOperators: ["eq", "gt", "lt", "is_null", "is_not_null"],
+    valueSemantics: "plain",
+  },
+  {
+    name: "external_id",
+    type: "INTEGER",
+    nativeType: "INTEGER",
+    nullable: false,
+    isPrimaryKey: true,
+    primaryKeyOrdinal: 2,
+    isForeignKey: false,
+    isAutoIncrement: false,
+    category: "integer",
+    filterable: true,
+    filterOperators: ["eq", "gt", "lt", "is_null", "is_not_null"],
+    valueSemantics: "plain",
+  },
+  {
+    name: "description",
+    type: "TEXT",
+    nativeType: "TEXT",
+    nullable: false,
+    isPrimaryKey: false,
+    isForeignKey: false,
+    isAutoIncrement: false,
+    category: "text",
+    filterable: true,
+    filterOperators: ["eq", "like", "is_null", "is_not_null"],
     valueSemantics: "plain",
   },
 ];
@@ -305,5 +350,37 @@ describe("table helpers", () => {
       "UPDATE public.fixture_rows",
     );
     expect(result.plan.skippedRows).toEqual([1]);
+  });
+
+  it("requires the full primary key for delete previews", async () => {
+    const mutationService = new TableMutationService(
+      {
+        getConnection: () => ({ id: "conn-1" }),
+        getDriver: () => fakeDriver,
+      } as never,
+      {
+        getColumns: async () => compositePrimaryKeyColumns,
+      },
+    );
+
+    await expect(
+      mutationService.prepareDeleteRowsPlan(
+        "conn-1",
+        "main",
+        "public",
+        "composite_fixture_rows",
+        [{ tenant_id: 1 }],
+      ),
+    ).rejects.toThrow(/full primary key/i);
+
+    await expect(
+      mutationService.prepareDeleteRowsPlan(
+        "conn-1",
+        "main",
+        "public",
+        "composite_fixture_rows",
+        [{ tenant_id: 1, external_id: 2, description: "extra" }],
+      ),
+    ).rejects.toThrow(/full primary key/i);
   });
 });

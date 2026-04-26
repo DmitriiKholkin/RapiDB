@@ -665,20 +665,6 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
       },
     );
 
-    const unConfirm = onMessage<{ confirmed: boolean }>(
-      "deleteConfirmed",
-      ({ confirmed }) => {
-        if (!confirmed) {
-          return;
-        }
-        const toDelete = [...selectedRef.current].map((idx) => {
-          const row = rowsRef.current[idx];
-          return Object.fromEntries(pkColsRef.current.map((k) => [k, row[k]]));
-        });
-        setDeleting(true);
-        postMessage("deleteRows", { primaryKeysList: toDelete });
-      },
-    );
     const unMutationPreview = onMessage<TableMutationPreviewPayload>(
       "tableMutationPreview",
       (payload) => {
@@ -694,7 +680,6 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
       unApply();
       unInsert();
       unDelete();
-      unConfirm();
       unMutationPreview();
     };
   }, [buildPendingUpdatesPayload, fetchPage, isView]);
@@ -874,7 +859,12 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
     ) {
       return;
     }
-    postMessage("confirmDelete", { count: selectedRef.current.size });
+    const toDelete = [...selectedRef.current].map((idx) => {
+      const row = rowsRef.current[idx];
+      return Object.fromEntries(pkColsRef.current.map((k) => [k, row[k]]));
+    });
+    setDeleting(true);
+    postMessage("deleteRows", { primaryKeysList: toDelete });
   }, [deleting]);
 
   const clearApplyRequestState = useCallback(() => {
@@ -893,9 +883,11 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
 
     if (kind === "applyChanges") {
       clearApplyRequestState();
-    } else {
+    } else if (kind === "insertRow") {
       setInserting(false);
       clearApplyRequestState();
+    } else {
+      setDeleting(false);
     }
 
     postMessage("cancelMutationPreview", { previewToken });
@@ -1886,7 +1878,11 @@ function MutationPreviewDialog({
   onConfirm: () => void;
 }) {
   const confirmLabel =
-    preview.kind === "applyChanges" ? "Apply Changes" : "Insert Row";
+    preview.kind === "applyChanges"
+      ? "Apply Changes"
+      : preview.kind === "insertRow"
+        ? "Insert Row"
+        : "Apply Changes";
   const titleId = useId();
   const descriptionId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);

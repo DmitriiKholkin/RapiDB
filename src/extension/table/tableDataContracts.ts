@@ -29,6 +29,17 @@ export interface PreparedInsertPlan {
   verificationCriteria: Record<string, unknown> | null;
 }
 
+export interface PreparedDeletePlan {
+  connectionId: string;
+  database: string;
+  schema: string;
+  table: string;
+  executionMode: "sequential" | "transaction";
+  operations: TransactionOperation[];
+  previewStatements: string[];
+  verificationCriteriaList: Record<string, unknown>[];
+}
+
 export interface VerificationTarget {
   rowIndex: number;
   primaryKeys: Record<string, unknown>;

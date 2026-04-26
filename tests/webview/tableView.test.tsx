@@ -613,7 +613,7 @@ describe("TableView", () => {
     expect((editInput as HTMLInputElement).readOnly).toBe(true);
   });
 
-  it("requests delete confirmation with selected primary keys", async () => {
+  it("requests delete preview with selected primary keys", async () => {
     const user = userEvent.setup();
 
     renderTableView();
@@ -661,13 +661,98 @@ describe("TableView", () => {
     await user.click(screen.getByRole("button", { name: "Delete (1)" }));
 
     expect(getLastPostedMessage()).toEqual({
-      type: "confirmDelete",
-      payload: { count: 1 },
+      type: "deleteRows",
+      payload: { primaryKeysList: [{ id: 1 }] },
     });
 
     await act(async () => {
-      dispatchIncomingMessage("deleteConfirmed", { confirmed: true });
+      dispatchIncomingMessage("tableMutationPreview", {
+        previewToken: "delete-preview-1",
+        kind: "deleteRows",
+        title: "Apply changes to users",
+        sql: "delete from users where id = 1;",
+        statementCount: 1,
+      });
     });
+
+    await waitFor(() => {
+      expect(screen.getByRole("dialog")).toBeTruthy();
+    });
+
+    const dialog = screen.getByRole("dialog");
+    await user.click(
+      within(dialog).getByRole("button", { name: "Apply Changes" }),
+    );
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "confirmMutationPreview",
+      payload: { previewToken: "delete-preview-1" },
+    });
+  });
+
+  it("cancels delete preview and allows sending delete request again", async () => {
+    const user = userEvent.setup();
+
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    await user.click(screen.getByLabelText("Select row 1"));
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Delete (1)" }));
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "deleteRows",
+      payload: { primaryKeysList: [{ id: 1 }] },
+    });
+
+    dispatchIncomingMessage("tableMutationPreview", {
+      previewToken: "delete-preview-cancel",
+      kind: "deleteRows",
+      title: "Apply changes to users",
+      sql: "delete from users where id = 1;",
+      statementCount: 1,
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("dialog")).toBeTruthy();
+    });
+
+    const dialog = screen.getByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "cancelMutationPreview",
+      payload: { previewToken: "delete-preview-cancel" },
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Delete (1)" }));
 
     expect(getLastPostedMessage()).toEqual({
       type: "deleteRows",
@@ -961,15 +1046,6 @@ describe("TableView", () => {
     clearPostedMessages();
 
     await user.click(screen.getByRole("button", { name: "Delete (1)" }));
-
-    expect(getLastPostedMessage()).toEqual({
-      type: "confirmDelete",
-      payload: { count: 1 },
-    });
-
-    await act(async () => {
-      dispatchIncomingMessage("deleteConfirmed", { confirmed: true });
-    });
 
     expect(getLastPostedMessage()).toEqual({
       type: "deleteRows",

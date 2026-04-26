@@ -2,6 +2,7 @@ import type { ConnectionManager } from "../connectionManager";
 import type { ColumnTypeMeta } from "../dbDrivers/types";
 import { buildInsertRowOperation } from "./insertSql";
 import type {
+  PreparedDeletePlan,
   PreparedInsertPlan,
   TableColumnsProvider,
 } from "./tableDataContracts";
@@ -199,8 +200,29 @@ export class TableMutationService {
     table: string,
     primaryKeyValuesList: Record<string, unknown>[],
   ): Promise<void> {
-    if (primaryKeyValuesList.length === 0) {
+    const plan = await this.prepareDeleteRowsPlan(
+      connectionId,
+      database,
+      schema,
+      table,
+      primaryKeyValuesList,
+    );
+    if (!plan) {
       return;
+    }
+
+    await this.executePreparedDeletePlan(plan);
+  }
+
+  async prepareDeleteRowsPlan(
+    connectionId: string,
+    database: string,
+    schema: string,
+    table: string,
+    primaryKeyValuesList: Record<string, unknown>[],
+  ): Promise<PreparedDeletePlan | null> {
+    if (primaryKeyValuesList.length === 0) {
+      return null;
     }
 
     const { driver } = this.getConnectionDriver(connectionId);
@@ -215,59 +237,109 @@ export class TableMutationService {
       schema,
       table,
     );
+    const primaryKeyColumns = columns.filter((column) => column.isPrimaryKey);
+
+    if (primaryKeyColumns.length === 0) {
+      throw new Error(
+        "Delete requires a primary key so the affected rows can be targeted safely.",
+      );
+    }
+
     const columnMetaByName = new Map(
       columns.map((column) => [column.name, column]),
     );
+    const primaryKeyColumnNames = primaryKeyColumns.map(
+      (column) => column.name,
+    );
+    const primaryKeyColumnSet = new Set(primaryKeyColumnNames);
 
-    const coercedPrimaryKeys = primaryKeyValuesList
-      .map((row) => coerceRecord(driver, row, columnMetaByName))
-      .filter((row) => Object.keys(row).length > 0);
+    const coercedPrimaryKeys = primaryKeyValuesList.map((row) => {
+      const providedColumnNames = Object.keys(row);
+      const hasExactPrimaryKeyShape =
+        providedColumnNames.length === primaryKeyColumnNames.length &&
+        providedColumnNames.every((columnName) =>
+          primaryKeyColumnSet.has(columnName),
+        ) &&
+        primaryKeyColumnNames.every(
+          (columnName) => row[columnName] !== undefined,
+        );
+
+      if (!hasExactPrimaryKeyShape) {
+        throw new Error(
+          "Delete requires the full primary key for every selected row.",
+        );
+      }
+
+      const normalizedPrimaryKeys = Object.fromEntries(
+        primaryKeyColumnNames.map((columnName) => [
+          columnName,
+          row[columnName],
+        ]),
+      );
+
+      return coerceRecord(driver, normalizedPrimaryKeys, columnMetaByName);
+    });
 
     if (coercedPrimaryKeys.length === 0) {
-      return;
+      return null;
     }
 
-    const firstPrimaryKeys = Object.keys(coercedPrimaryKeys[0]);
-    const isSinglePrimaryKey =
-      firstPrimaryKeys.length === 1 &&
-      coercedPrimaryKeys.every(
-        (row) =>
-          Object.keys(row).length === 1 &&
-          Object.keys(row)[0] === firstPrimaryKeys[0],
-      );
+    const isSinglePrimaryKey = primaryKeyColumnNames.length === 1;
 
-    if (isSinglePrimaryKey) {
-      await this.deleteSinglePrimaryKeyRows(
-        driver,
-        qualifiedTableName,
-        columnMetaByName,
-        firstPrimaryKeys[0],
-        coercedPrimaryKeys,
-      );
-      await this.verifyRowsDeleted(
-        driver,
-        database,
-        schema,
-        table,
-        columns,
-        coercedPrimaryKeys,
-      );
-      return;
-    }
+    const operations = isSinglePrimaryKey
+      ? this.buildDeleteSinglePrimaryKeyOperations(
+          driver,
+          qualifiedTableName,
+          columnMetaByName,
+          primaryKeyColumnNames[0],
+          coercedPrimaryKeys,
+        )
+      : this.buildDeleteCompositePrimaryKeyOperations(
+          driver,
+          qualifiedTableName,
+          columnMetaByName,
+          coercedPrimaryKeys,
+        );
 
-    await this.deleteCompositePrimaryKeyRows(
-      driver,
-      qualifiedTableName,
-      columnMetaByName,
-      coercedPrimaryKeys,
-    );
-    await this.verifyRowsDeleted(
-      driver,
+    return {
+      connectionId,
       database,
       schema,
       table,
+      executionMode: isSinglePrimaryKey ? "sequential" : "transaction",
+      operations,
+      previewStatements: operations.map((operation) =>
+        driver.materializePreviewSql(operation.sql, operation.params),
+      ),
+      verificationCriteriaList: coercedPrimaryKeys,
+    };
+  }
+
+  async executePreparedDeletePlan(plan: PreparedDeletePlan): Promise<void> {
+    const { driver } = this.getConnectionDriver(plan.connectionId);
+
+    if (plan.executionMode === "sequential") {
+      for (const operation of plan.operations) {
+        await driver.query(operation.sql, operation.params);
+      }
+    } else {
+      await driver.runTransaction(plan.operations);
+    }
+
+    const columns = await this.columnsProvider.getColumns(
+      plan.connectionId,
+      plan.database,
+      plan.schema,
+      plan.table,
+    );
+
+    await this.verifyRowsDeleted(
+      driver,
+      plan.database,
+      plan.schema,
+      plan.table,
       columns,
-      coercedPrimaryKeys,
+      plan.verificationCriteriaList,
     );
   }
 
@@ -334,15 +406,16 @@ export class TableMutationService {
     return result.rows.length > 0;
   }
 
-  private async deleteSinglePrimaryKeyRows(
+  private buildDeleteSinglePrimaryKeyOperations(
     driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>,
     qualifiedTableName: string,
     columnMetaByName: Map<string, ColumnTypeMeta>,
     primaryKeyColumn: string,
     rows: Record<string, unknown>[],
-  ): Promise<void> {
+  ): Array<{ sql: string; params: unknown[] }> {
     const values = rows.map((row) => row[primaryKeyColumn]);
     const chunkSize = 1000;
+    const operations: Array<{ sql: string; params: unknown[] }> = [];
 
     for (let index = 0; index < values.length; index += chunkSize) {
       const chunk = values.slice(index, index + chunkSize);
@@ -355,20 +428,22 @@ export class TableMutationService {
         })
         .join(", ");
 
-      await driver.query(
-        `DELETE FROM ${qualifiedTableName} WHERE ${driver.quoteIdentifier(primaryKeyColumn)} IN (${placeholders})`,
-        chunk,
-      );
+      operations.push({
+        sql: `DELETE FROM ${qualifiedTableName} WHERE ${driver.quoteIdentifier(primaryKeyColumn)} IN (${placeholders})`,
+        params: chunk,
+      });
     }
+
+    return operations;
   }
 
-  private async deleteCompositePrimaryKeyRows(
+  private buildDeleteCompositePrimaryKeyOperations(
     driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>,
     qualifiedTableName: string,
     columnMetaByName: Map<string, ColumnTypeMeta>,
     rows: Record<string, unknown>[],
-  ): Promise<void> {
-    const operations = rows.map((row) => {
+  ): Array<{ sql: string; params: unknown[] }> {
+    return rows.map((row) => {
       const parameters: unknown[] = [];
       const whereParts = Object.keys(row).map((columnName) => {
         parameters.push(row[columnName]);
@@ -384,8 +459,6 @@ export class TableMutationService {
         params: parameters,
       };
     });
-
-    await driver.runTransaction(operations);
   }
 
   private getConnectionDriver(connectionId: string): {

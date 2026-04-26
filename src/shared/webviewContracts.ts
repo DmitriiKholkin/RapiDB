@@ -102,7 +102,10 @@ export interface RowUpdateMessagePayload {
   changes: Record<string, unknown>;
 }
 
-export type TableMutationPreviewKind = "applyChanges" | "insertRow";
+export type TableMutationPreviewKind =
+  | "applyChanges"
+  | "insertRow"
+  | "deleteRows";
 
 export interface TableMutationPreviewPayload {
   previewToken: string;
@@ -156,7 +159,6 @@ export type TablePanelMessage =
         limitToPage?: { page: number; pageSize: number };
       }
     >
-  | WebviewMessageEnvelope<"confirmDelete", { count: number }>
   | WebviewMessageEnvelope<
       "confirmMutationPreview",
       TableMutationPreviewDecisionPayload
@@ -621,16 +623,6 @@ export function parseTablePanelMessage(
           limitToPage,
         },
       };
-    }
-
-    case "confirmDelete": {
-      if (!isRecord(envelope.payload)) {
-        return null;
-      }
-      const count = readOptionalNumber(envelope.payload, "count");
-      return count === undefined
-        ? null
-        : { type: envelope.type, payload: { count } };
     }
 
     case "confirmMutationPreview":

@@ -204,10 +204,6 @@ export class TablePanel {
       case "exportJSON":
         await this._handleExportJSON(parsed.payload);
         break;
-      case "confirmDelete":
-        if (parsed.payload)
-          await this._handleConfirmDelete(parsed.payload, send);
-        break;
       case "confirmMutationPreview":
         if (parsed.payload)
           await this._handleConfirmMutationPreview(parsed.payload, send);
@@ -388,14 +384,23 @@ export class TablePanel {
   ): Promise<void> {
     const { primaryKeysList = [] } = payload;
     try {
-      await this.svc.deleteRows(
+      const plan = await this.svc.prepareDeleteRowsPlan(
         this.connectionId,
         this.database,
         this.schema,
         this.table,
         primaryKeysList,
       );
-      send("deleteResult", { success: true });
+
+      if (!plan) {
+        send("deleteResult", { success: true });
+        return;
+      }
+
+      await send(
+        "tableMutationPreview",
+        this.previewController.createDeleteRowsPreview(plan),
+      );
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
       send("deleteResult", { success: false, error: error.message });
@@ -481,19 +486,6 @@ export class TablePanel {
       true,
     );
     yield { columns: result.columns, rows: result.rows };
-  }
-
-  private async _handleConfirmDelete(
-    payload: { count: number },
-    send: (type: string, payload: unknown) => Thenable<boolean>,
-  ): Promise<void> {
-    const { count } = payload;
-    const answer = await vscode.window.showWarningMessage(
-      `Delete ${count} row${count !== 1 ? "s" : ""} from "${this.table}"? This cannot be undone.`,
-      { modal: true },
-      "Delete",
-    );
-    send("deleteConfirmed", { confirmed: answer === "Delete" });
   }
 
   private async _handleConfirmMutationPreview(

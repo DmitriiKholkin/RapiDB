@@ -1,6 +1,7 @@
 import type { ConnectionManager } from "./connectionManager";
 import type { ColumnTypeMeta, FilterExpression } from "./dbDrivers/types";
 import type {
+  PreparedDeletePlan,
   PreparedInsertPlan,
   SortConfig,
   TablePage,
@@ -14,6 +15,7 @@ export type {
   ApplyResult,
   PreparedApplyPlan,
   PreparedApplyPlanResult,
+  PreparedDeletePlan,
   PreparedInsertPlan,
   RowUpdate,
   SortConfig,
@@ -129,6 +131,26 @@ export class TableDataService {
 
   executePreparedInsertPlan(plan: PreparedInsertPlan): Promise<void> {
     return this.mutationService.executePreparedInsertPlan(plan);
+  }
+
+  prepareDeleteRowsPlan(
+    connectionId: string,
+    database: string,
+    schema: string,
+    table: string,
+    primaryKeyValuesList: Record<string, unknown>[],
+  ): Promise<PreparedDeletePlan | null> {
+    return this.mutationService.prepareDeleteRowsPlan(
+      connectionId,
+      database,
+      schema,
+      table,
+      primaryKeyValuesList,
+    );
+  }
+
+  executePreparedDeletePlan(plan: PreparedDeletePlan): Promise<void> {
+    return this.mutationService.executePreparedDeletePlan(plan);
   }
 
   deleteRows(
