@@ -1425,16 +1425,26 @@ export class MySQLDriver extends BaseDBDriver {
       }
     }
 
-    if (
-      column.category === "date" &&
-      typeof val === "string" &&
-      (operator === "eq" || operator === "neq")
-    ) {
-      const sqlOp = operator === "neq" ? "!=" : "=";
-      return {
-        sql: `${col} ${sqlOp} CAST(? AS DATE)`,
-        params: [normalizeMysqlDateInput(val) ?? val],
-      };
+    if (column.category === "date") {
+      if (operator === "between" && Array.isArray(val)) {
+        return {
+          sql: `${col} BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)`,
+          params: [
+            normalizeMysqlDateInput(val[0]) ?? val[0],
+            normalizeMysqlDateInput(val[1]) ?? val[1],
+          ],
+        };
+      }
+      if (
+        typeof val === "string" &&
+        ["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)
+      ) {
+        const sqlOp = operator === "neq" ? "!=" : this.sqlOperator(operator);
+        return {
+          sql: `${col} ${sqlOp} CAST(? AS DATE)`,
+          params: [normalizeMysqlDateInput(val) ?? val],
+        };
+      }
     }
 
     if (

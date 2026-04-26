@@ -1102,13 +1102,20 @@ export class SQLiteDriver extends BaseDBDriver {
       return { sql: `${col} ${sqlOp} ?`, params: [Number(val)] };
     }
 
-    if (
-      column.category === "date" &&
-      typeof val === "string" &&
-      (operator === "eq" || operator === "neq")
-    ) {
-      const sqlOp = operator === "neq" ? "!=" : "=";
-      return { sql: `DATE(${col}) ${sqlOp} DATE(?)`, params: [val] };
+    if (column.category === "date") {
+      if (operator === "between" && Array.isArray(val)) {
+        return {
+          sql: `DATE(${col}) BETWEEN DATE(?) AND DATE(?)`,
+          params: [val[0], val[1]],
+        };
+      }
+      if (
+        typeof val === "string" &&
+        ["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)
+      ) {
+        const sqlOp = operator === "neq" ? "!=" : this.sqlOperator(operator);
+        return { sql: `DATE(${col}) ${sqlOp} DATE(?)`, params: [val] };
+      }
     }
 
     if (column.category === "time") {

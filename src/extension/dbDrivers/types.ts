@@ -194,6 +194,10 @@ const NUMERIC_OPS: FilterOperator[] = [
 const FLOAT_OPS: FilterOperator[] = [
   "eq",
   "neq",
+  "gt",
+  "gte",
+  "lt",
+  "lte",
   "between",
   "in",
   "is_null",
@@ -202,7 +206,18 @@ const FLOAT_OPS: FilterOperator[] = [
 const TEXT_OPS: FilterOperator[] = ["like", "is_null", "is_not_null"];
 const UUID_OPS: FilterOperator[] = ["like", "in", "is_null", "is_not_null"];
 const ENUM_OPS: FilterOperator[] = ["like", "in", "is_null", "is_not_null"];
-const DATE_OPS: FilterOperator[] = ["eq", "like", "is_null", "is_not_null"];
+const DATE_OPS: FilterOperator[] = [
+  "eq",
+  "neq",
+  "gt",
+  "gte",
+  "lt",
+  "lte",
+  "between",
+  "like",
+  "is_null",
+  "is_not_null",
+];
 const TEMPORAL_OPS: FilterOperator[] = ["like", "is_null", "is_not_null"];
 const BOOL_OPS: FilterOperator[] = ["eq", "neq", "is_null", "is_not_null"];
 const SEARCH_OPS: FilterOperator[] = ["like", "is_null", "is_not_null"];
