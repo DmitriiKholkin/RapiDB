@@ -1,5 +1,9 @@
 import type { ConnectionManager } from "../connectionManager";
-import type { ColumnTypeMeta, FilterExpression } from "../dbDrivers/types";
+import type {
+  ColumnTypeMeta,
+  FilterExpression,
+  QueryResult,
+} from "../dbDrivers/types";
 import { buildWhere } from "./filterSql";
 import type { SortConfig, TablePage } from "./tableDataContracts";
 
@@ -99,11 +103,27 @@ export class TableReadService {
     );
     const effectiveOrderBy =
       orderByClause || driver.buildOrderByDefault(columns);
+    const baseParams = [...whereParams, ...pagination.params];
     const dataSql = `SELECT * FROM ${qualifiedTableName} ${whereClause} ${effectiveOrderBy} ${pagination.sql}`;
-    const dataResult = await driver.query(dataSql, [
-      ...whereParams,
-      ...pagination.params,
-    ]);
+    let dataResult: QueryResult;
+    try {
+      dataResult = await driver.query(dataSql, baseParams);
+    } catch (error: unknown) {
+      if (this.isArithmeticOverflowError(error)) {
+        const computedColumns = columns
+          .filter((column) => column.isComputed)
+          .map((column) => column.name);
+        if (computedColumns.length > 0) {
+          const message =
+            error instanceof Error ? error.message : String(error ?? "");
+          throw new Error(
+            `${message} (computed columns: ${computedColumns.join(", ")})`,
+          );
+        }
+      }
+
+      throw error;
+    }
     const columnMetaByName = new Map(
       columns.map((column) => [column.name, column]),
     );
@@ -117,10 +137,17 @@ export class TableReadService {
           ? driver.formatOutputValue(value, column)
           : value;
       });
+
       return formattedRow;
     });
 
     return { columns, rows, totalCount };
+  }
+
+  private isArithmeticOverflowError(error: unknown): boolean {
+    const message =
+      error instanceof Error ? error.message : String(error ?? "");
+    return /arithmetic overflow/i.test(message);
   }
 
   async *exportAll(

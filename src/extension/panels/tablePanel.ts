@@ -277,7 +277,10 @@ export class TablePanel {
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
       const errMsg = error.message;
-      const isFilterError = FILTER_ERROR_RE.test(errMsg);
+      const isFilterError =
+        filters.length > 0 &&
+        FILTER_ERROR_RE.test(errMsg) &&
+        !/arithmetic overflow/i.test(errMsg);
       send("tableError", { fetchId, error: errMsg, isFilterError });
     }
   }

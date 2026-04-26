@@ -48,6 +48,21 @@ const columns: ColumnTypeMeta[] = [
     filterOperators: ["eq", "between", "is_null", "is_not_null"],
     valueSemantics: "plain",
   },
+  {
+    name: "amount_x2",
+    type: "INTEGER",
+    nativeType: "INTEGER",
+    nullable: true,
+    isPrimaryKey: false,
+    isForeignKey: false,
+    isAutoIncrement: false,
+    isComputed: true,
+    computedExpression: "amount * 2",
+    category: "integer",
+    filterable: true,
+    filterOperators: ["eq", "gt", "lt", "is_null", "is_not_null"],
+    valueSemantics: "plain",
+  },
 ];
 
 const fakeDriver: IDBDriver = {
@@ -165,6 +180,26 @@ describe("table helpers", () => {
     expect(operation.params).toEqual([]);
   });
 
+  it("includes computed columns in insert operations", () => {
+    const operation = buildInsertRowOperation(
+      fakeDriver,
+      "main",
+      "public",
+      "fixture_rows",
+      {
+        display_name: "Gamma",
+        amount: "10.25",
+        amount_x2: "20.50",
+      },
+      columns,
+    );
+
+    expect(operation.sql).toBe(
+      'INSERT INTO public.fixture_rows ("display_name", "amount", "amount_x2") VALUES ($1, $2, $3)',
+    );
+    expect(operation.params).toEqual(["Gamma", "10.25", "20.50"]);
+  });
+
   it("builds Oracle-safe default-only insert SQL using explicit DEFAULT expressions", () => {
     const oracleLikeDriver: IDBDriver = {
       ...fakeDriver,
@@ -198,7 +233,7 @@ describe("table helpers", () => {
     );
 
     expect(operation.sql).toBe(
-      'INSERT INTO "PUBLIC"."fixture_rows" ("id", "display_name", "amount") VALUES (DEFAULT, DEFAULT, DEFAULT)',
+      'INSERT INTO "PUBLIC"."fixture_rows" ("id", "display_name", "amount", "amount_x2") VALUES (DEFAULT, DEFAULT, DEFAULT, DEFAULT)',
     );
     expect(operation.params).toEqual([]);
   });

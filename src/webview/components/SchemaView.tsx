@@ -318,6 +318,18 @@ function ColRow({
     );
   }
 
+  if (col.isComputed) {
+    badges.push(
+      <Badge
+        key="computed"
+        label="CMP"
+        color="var(--vscode-terminal-ansiBlue, #356fa8)"
+        background="rgba(53, 111, 168, 0.16)"
+        border="none"
+      />,
+    );
+  }
+
   const rawDefault = col.defaultValue;
   const displayDefault =
     rawDefault != null

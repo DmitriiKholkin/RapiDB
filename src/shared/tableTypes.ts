@@ -207,6 +207,8 @@ export interface ColumnMeta {
   type: string;
   nullable: boolean;
   defaultValue?: string;
+  isComputed?: boolean;
+  computedExpression?: string;
   isPrimaryKey: boolean;
   primaryKeyOrdinal?: number;
   isForeignKey: boolean;

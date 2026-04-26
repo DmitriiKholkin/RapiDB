@@ -131,6 +131,12 @@ function normalizeTemporalSearchValue(value: string): string {
   return trimmed;
 }
 
+function approximateNumericFilterTolerance(rawValue: string): number {
+  const fraction = /\.(\d+)/.exec(rawValue)?.[1].length ?? 0;
+  const precision = Math.min(Math.max(fraction + 2, 6), 12);
+  return 10 ** -precision;
+}
+
 export class PostgresDriver extends BaseDBDriver {
   private pool: Pool | null = null;
   private readonly config: ConnectionConfig;
@@ -273,6 +279,7 @@ export class PostgresDriver extends BaseDBDriver {
       data_type: string;
       is_nullable: boolean | number | string;
       column_default: string | null;
+      generated_kind: string | null;
       identity_kind: string | null;
       is_pk: boolean | number | string;
       pk_ordinal: number | string | null;
@@ -285,6 +292,7 @@ export class PostgresDriver extends BaseDBDriver {
          format_type(a.atttypid, a.atttypmod)    AS data_type,
          NOT a.attnotnull                         AS is_nullable,
          pg_get_expr(d.adbin, d.adrelid)         AS column_default,
+         NULLIF(a.attgenerated, '')               AS generated_kind,
          NULLIF(a.attidentity, '')                AS identity_kind,
          pk.pk_ordinal IS NOT NULL                AS is_pk,
          pk.pk_ordinal                            AS pk_ordinal,
@@ -316,14 +324,27 @@ export class PostgresDriver extends BaseDBDriver {
     );
     return res.rows.map((r) => {
       const rawDefault = r.column_default as string | null | undefined;
+      const generatedKind = r.generated_kind as string | null | undefined;
+      const isComputed = generatedKind === "s";
       const isAutoIncrement =
         isPgIdentityColumn(r.identity_kind) ||
         (typeof rawDefault === "string" && rawDefault.startsWith("nextval("));
+
+      const computedExpression =
+        isComputed && typeof rawDefault === "string" ? rawDefault : undefined;
+
       return {
         name: r.column_name as string,
         type: r.data_type as string,
         nullable: isPgTrue(r.is_nullable),
-        defaultValue: isAutoIncrement ? undefined : (rawDefault ?? undefined),
+        defaultValue:
+          isComputed && computedExpression
+            ? `GENERATED ALWAYS AS (${computedExpression}) STORED`
+            : isAutoIncrement
+              ? undefined
+              : (rawDefault ?? undefined),
+        isComputed,
+        computedExpression,
         isPrimaryKey: isPgTrue(r.is_pk),
         primaryKeyOrdinal: toOptionalNumber(r.pk_ordinal),
         isForeignKey: isPgTrue(r.is_fk),
@@ -480,6 +501,7 @@ export class PostgresDriver extends BaseDBDriver {
       data_type: string;
       is_nullable: boolean | number | string;
       column_default: string | null;
+      generated_kind: string | null;
       identity_kind: string | null;
     };
 
@@ -513,6 +535,7 @@ export class PostgresDriver extends BaseDBDriver {
          format_type(a.atttypid, a.atttypmod)    AS data_type,
          NOT a.attnotnull                         AS is_nullable,
          pg_get_expr(d.adbin, d.adrelid)         AS column_default,
+         NULLIF(a.attgenerated, '')               AS generated_kind,
          NULLIF(a.attidentity, '')                AS identity_kind
        FROM pg_attribute a
        JOIN pg_class     c ON c.oid = a.attrelid
@@ -550,9 +573,15 @@ export class PostgresDriver extends BaseDBDriver {
     const cols = colRes.rows.map((r) => {
       const columnName = r.column_name as string;
       const isPk = pkColumnSet.has(columnName);
+      const isComputed = r.generated_kind === "s";
       const nullable = isPgTrue(r.is_nullable);
       const notNull = !nullable && !isPk ? " NOT NULL" : "";
       const identityClause = pgIdentityClause(r.identity_kind);
+
+      if (isComputed && r.column_default) {
+        return `  ${this.quoteIdentifier(columnName)} ${r.data_type} GENERATED ALWAYS AS (${r.column_default}) STORED${notNull}`;
+      }
+
       const defClause =
         !identityClause && r.column_default
           ? ` DEFAULT ${r.column_default}`
@@ -1022,6 +1051,25 @@ export class PostgresDriver extends BaseDBDriver {
       // Keep exact decimal text to avoid precision loss for large/precise NUMERIC values.
       if (column.category === "decimal") {
         return { sql: `${col} ${sqlOp} $${paramIndex}`, params: [val] };
+      }
+
+      if (
+        column.category === "float" &&
+        (operator === "eq" || operator === "neq")
+      ) {
+        const numericValue = Number(val);
+        const tolerance = approximateNumericFilterTolerance(val);
+        const deltaExpr = `ABS((${col})::double precision - $${paramIndex}::double precision)`;
+        const toleranceExpr =
+          `GREATEST($${paramIndex + 1}::double precision, ` +
+          `ABS($${paramIndex + 2}::double precision) * $${paramIndex + 3}::double precision)`;
+        return {
+          sql:
+            operator === "neq"
+              ? `${deltaExpr} >= ${toleranceExpr}`
+              : `${deltaExpr} < ${toleranceExpr}`,
+          params: [numericValue, tolerance, numericValue, tolerance],
+        };
       }
 
       if (ct === "bigint" && /^-?\d+$/.test(val)) {

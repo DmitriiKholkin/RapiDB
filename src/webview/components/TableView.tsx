@@ -523,6 +523,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
       setRows(r);
       setTotalCount(t);
       setLoading(false);
+      setError(null);
       setFilterError(null);
       setSelected(new Set());
       const restoredPending = restorePendingEdits(

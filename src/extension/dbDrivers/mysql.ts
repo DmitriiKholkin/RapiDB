@@ -692,6 +692,7 @@ export class MySQLDriver extends BaseDBDriver {
         COLUMN_TYPE: string;
         IS_NULLABLE: string;
         COLUMN_DEFAULT: unknown;
+        GENERATION_EXPRESSION: string | null;
         EXTRA: string | null;
         IS_PRIMARY_KEY: number | string;
         PRIMARY_KEY_ORDINAL: number | string | null;
@@ -702,6 +703,7 @@ export class MySQLDriver extends BaseDBDriver {
               c.COLUMN_TYPE,
               c.IS_NULLABLE,
               c.COLUMN_DEFAULT,
+              c.GENERATION_EXPRESSION,
               c.EXTRA,
               CASE WHEN pk.COLUMN_NAME IS NULL THEN 0 ELSE 1 END AS IS_PRIMARY_KEY,
               pk.ORDINAL_POSITION AS PRIMARY_KEY_ORDINAL,
@@ -736,21 +738,38 @@ export class MySQLDriver extends BaseDBDriver {
        ORDER BY c.ORDINAL_POSITION`,
       [database, table, database, table, database, table],
     );
-    return rows.map((r) => ({
-      name: r.COLUMN_NAME as string,
-      type: r.COLUMN_TYPE as string,
-      nullable: r.IS_NULLABLE === "YES",
-      defaultValue:
-        r.COLUMN_DEFAULT == null ? undefined : String(r.COLUMN_DEFAULT),
-      isPrimaryKey: Number(r.IS_PRIMARY_KEY) === 1,
-      primaryKeyOrdinal:
-        r.PRIMARY_KEY_ORDINAL == null
-          ? undefined
-          : Number(r.PRIMARY_KEY_ORDINAL),
-      isForeignKey: Number(r.IS_FOREIGN_KEY) === 1,
-      isAutoIncrement:
-        (r.EXTRA as string)?.toLowerCase().includes("auto_increment") ?? false,
-    }));
+    return rows.map((r) => {
+      const generationExpression =
+        typeof r.GENERATION_EXPRESSION === "string" &&
+        r.GENERATION_EXPRESSION.trim().length > 0
+          ? r.GENERATION_EXPRESSION.trim()
+          : undefined;
+      const extra = (r.EXTRA as string | null | undefined)?.toLowerCase() ?? "";
+      const isComputed =
+        generationExpression !== undefined || extra.includes("generated");
+
+      return {
+        name: r.COLUMN_NAME as string,
+        type: r.COLUMN_TYPE as string,
+        nullable: r.IS_NULLABLE === "YES",
+        defaultValue: isComputed
+          ? generationExpression
+            ? `AS (${generationExpression})`
+            : undefined
+          : r.COLUMN_DEFAULT == null
+            ? undefined
+            : String(r.COLUMN_DEFAULT),
+        isComputed,
+        computedExpression: generationExpression,
+        isPrimaryKey: Number(r.IS_PRIMARY_KEY) === 1,
+        primaryKeyOrdinal:
+          r.PRIMARY_KEY_ORDINAL == null
+            ? undefined
+            : Number(r.PRIMARY_KEY_ORDINAL),
+        isForeignKey: Number(r.IS_FOREIGN_KEY) === 1,
+        isAutoIncrement: extra.includes("auto_increment"),
+      };
+    });
   }
 
   async query(sql: string, params?: unknown[]): Promise<QueryResult> {

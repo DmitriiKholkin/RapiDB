@@ -48,6 +48,8 @@ interface DescribeColumnRow {
   scale: number;
   IS_NULLABLE: boolean | number;
   is_identity: boolean | number;
+  is_computed: boolean | number;
+  COMPUTED_DEFINITION: string | null;
   COLUMN_DEFAULT: string | null;
   IS_PK: number;
   PK_ORDINAL: number | null;
@@ -77,6 +79,9 @@ interface DdlColumnRow {
   scale: number;
   IS_NULLABLE: boolean | number;
   is_identity: boolean | number;
+  is_computed: boolean | number;
+  COMPUTED_DEFINITION: string | null;
+  is_persisted: boolean | number;
   COLUMN_DEFAULT: string | null;
   IS_PK: number;
   PK_ORDINAL: number | null;
@@ -135,6 +140,13 @@ const MSSQL_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const INTEGER_RE = /^-?\d+$/;
 const DECIMAL_RE = /^-?\d+(?:\.\d+)?$/;
+const MSSQL_LIKE_MAX_NVARCHAR_CHARS = 3900;
+
+function approximateNumericFilterTolerance(rawValue: string): number {
+  const fraction = /\.(\d+)/.exec(rawValue)?.[1].length ?? 0;
+  const precision = Math.min(Math.max(fraction + 2, 6), 12);
+  return 10 ** -precision;
+}
 
 function mssqlFloatSignificantDigits(nativeType: string): number {
   const normalized = nativeType.toLowerCase().trim();
@@ -192,10 +204,35 @@ function cleanMssqlDefault(raw: string): string {
   return s;
 }
 
+function escapeMssqlPreviewSqlString(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
 const escapeMssqlId = (s: string) => s.replace(/]/g, "]]");
 
 function baseTypeName(typeName: string): string {
   return typeName.toLowerCase().split("(")[0].trim();
+}
+
+function formatMssqlBinaryPreviewLiteral(value: Buffer): string {
+  return `0x${value.toString("hex")}`;
+}
+
+function isUnicodeMssqlLiteralType(nativeType: string): boolean {
+  return ["nchar", "nvarchar", "ntext", "xml"].includes(
+    baseTypeName(nativeType),
+  );
+}
+
+function formatMssqlStringPreviewLiteral(
+  value: string,
+  nativeType?: string,
+): string {
+  const prefix =
+    nativeType !== undefined && isUnicodeMssqlLiteralType(nativeType)
+      ? "N"
+      : "";
+  return `${prefix}'${escapeMssqlPreviewSqlString(value)}'`;
 }
 
 function normalizeDatetimeLiteral(value: string): string {
@@ -342,7 +379,40 @@ function mssqlSqlTypeName(sqlType: MssqlSqlType): string {
 }
 
 function temporalSearchLiteral(value: string): string {
-  return normalizeDatetimeLiteral(value).replace(" ", "T");
+  const trimmed = value.trim();
+  const hasMatchingQuotes =
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"));
+  const unquoted =
+    hasMatchingQuotes && trimmed.length >= 2 ? trimmed.slice(1, -1) : trimmed;
+  return normalizeDatetimeLiteral(unquoted).replace(" ", "T");
+}
+
+function datetimeOffsetSearchLiteral(value: string): string {
+  const normalized = temporalSearchLiteral(value);
+  const match =
+    /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}:\d{2}|Z)$/i.exec(
+      normalized,
+    );
+
+  if (!match) {
+    return normalized;
+  }
+
+  const prefix = match[1];
+  const fraction = match[2] ?? "";
+  const offset = match[3];
+
+  if (fraction === "") {
+    return normalized;
+  }
+
+  const compactFraction = fraction.replace(/0+$/, "");
+  if (compactFraction === "") {
+    return `${prefix}%${offset}`;
+  }
+
+  return `${prefix}${compactFraction}%${offset}`;
 }
 
 const MSSQL_FILTER_DENYLIST = new Set([
@@ -724,6 +794,8 @@ export class MSSQLDriver extends BaseDBDriver {
            c.scale,
            c.is_nullable                                        AS IS_NULLABLE,
            c.is_identity,
+           c.is_computed,
+           cc.definition                                        AS COMPUTED_DEFINITION,
            OBJECT_DEFINITION(c.default_object_id)               AS COLUMN_DEFAULT,
            CASE WHEN pk.column_id IS NOT NULL THEN 1 ELSE 0 END AS IS_PK,
            pk.key_ordinal                                       AS PK_ORDINAL,
@@ -731,6 +803,8 @@ export class MSSQLDriver extends BaseDBDriver {
          FROM [${escapeMssqlId(database)}].sys.columns c
          JOIN [${escapeMssqlId(database)}].sys.objects  o ON o.object_id = c.object_id
          JOIN [${escapeMssqlId(database)}].sys.schemas  s ON s.schema_id  = o.schema_id
+         LEFT JOIN [${escapeMssqlId(database)}].sys.computed_columns cc
+           ON cc.object_id = c.object_id AND cc.column_id = c.column_id
          LEFT JOIN (
            SELECT ic.object_id, ic.column_id, ic.key_ordinal
            FROM [${escapeMssqlId(database)}].sys.index_columns ic
@@ -755,9 +829,13 @@ export class MSSQLDriver extends BaseDBDriver {
       ),
       nullable: isSetFlag(row.IS_NULLABLE),
       defaultValue:
-        row.COLUMN_DEFAULT != null
-          ? cleanMssqlDefault(row.COLUMN_DEFAULT)
-          : undefined,
+        isSetFlag(row.is_computed) && row.COMPUTED_DEFINITION
+          ? `AS (${row.COMPUTED_DEFINITION})`
+          : row.COLUMN_DEFAULT != null
+            ? cleanMssqlDefault(row.COLUMN_DEFAULT)
+            : undefined,
+      isComputed: isSetFlag(row.is_computed),
+      computedExpression: row.COMPUTED_DEFINITION ?? undefined,
       isPrimaryKey: row.IS_PK === 1,
       primaryKeyOrdinal: row.PK_ORDINAL ?? undefined,
       isForeignKey: row.IS_FK === 1,
@@ -951,12 +1029,17 @@ export class MSSQLDriver extends BaseDBDriver {
            c.scale,
            c.is_nullable                       AS IS_NULLABLE,
            c.is_identity,
+           c.is_computed,
+           cc.definition                       AS COMPUTED_DEFINITION,
+           cc.is_persisted,
            OBJECT_DEFINITION(c.default_object_id) AS COLUMN_DEFAULT,
            CASE WHEN pk.column_id IS NOT NULL THEN 1 ELSE 0 END AS IS_PK,
            pk.key_ordinal                      AS PK_ORDINAL
          FROM [${escapeMssqlId(database)}].sys.columns c
          JOIN [${escapeMssqlId(database)}].sys.objects  o ON o.object_id = c.object_id
          JOIN [${escapeMssqlId(database)}].sys.schemas  s ON s.schema_id  = o.schema_id
+         LEFT JOIN [${escapeMssqlId(database)}].sys.computed_columns cc
+           ON cc.object_id = c.object_id AND cc.column_id = c.column_id
          LEFT JOIN (
            SELECT ic.object_id, ic.column_id, ic.key_ordinal
            FROM [${escapeMssqlId(database)}].sys.index_columns ic
@@ -978,6 +1061,11 @@ export class MSSQLDriver extends BaseDBDriver {
       .map((row) => this.quoteIdentifier(row.COLUMN_NAME));
 
     const colDefs = cols.recordset.map((row) => {
+      if (isSetFlag(row.is_computed) && row.COMPUTED_DEFINITION) {
+        const persisted = isSetFlag(row.is_persisted) ? " PERSISTED" : "";
+        return `  ${this.quoteIdentifier(row.COLUMN_NAME)} AS (${row.COMPUTED_DEFINITION})${persisted}`;
+      }
+
       const typ = mssqlFullType(
         row.DATA_TYPE,
         row.max_length,
@@ -1133,6 +1221,64 @@ export class MSSQLDriver extends BaseDBDriver {
   override buildSetExpr(column: ColumnTypeMeta, _paramIndex: number): string {
     const expr = this.buildInsertValueExpr(column, _paramIndex);
     return `${this.quoteIdentifier(column.name)} = ${expr}`;
+  }
+
+  materializePreviewInsertSql(
+    sql: string,
+    params: readonly unknown[] | undefined,
+    columns: readonly ColumnTypeMeta[],
+  ): string {
+    if (!params || params.length === 0) {
+      return sql;
+    }
+
+    const placeholderCount = (sql.match(/\?/g) ?? []).length;
+    if (placeholderCount !== params.length) {
+      throw new Error(
+        `[RapiDB] Preview parameter mismatch: SQL has ${placeholderCount} placeholder(s) but ${params.length} value(s) were supplied.`,
+      );
+    }
+
+    let index = 0;
+    return sql.replace(/\?/g, () => {
+      const value = params[index];
+      const column = columns[index];
+      index += 1;
+
+      if (typeof value === "string" && column) {
+        return formatMssqlStringPreviewLiteral(value, column.nativeType);
+      }
+
+      return this.formatPreviewSqlLiteral(value);
+    });
+  }
+
+  protected override formatPreviewSqlLiteral(value: unknown): string {
+    if (typeof value === "string") {
+      return formatMssqlStringPreviewLiteral(value);
+    }
+
+    if (typeof value === "boolean") {
+      return value ? "1" : "0";
+    }
+
+    if (Buffer.isBuffer(value)) {
+      return formatMssqlBinaryPreviewLiteral(value);
+    }
+
+    if (value instanceof ArrayBuffer) {
+      return formatMssqlBinaryPreviewLiteral(
+        Buffer.from(new Uint8Array(value)),
+      );
+    }
+
+    if (ArrayBuffer.isView(value)) {
+      return formatMssqlBinaryPreviewLiteral(
+        Buffer.from(value.buffer, value.byteOffset, value.byteLength),
+      );
+    }
+
+    return super.formatPreviewSqlLiteral(value);
   }
 
   override buildOrderByDefault(columns: ColumnTypeMeta[]): string {
@@ -1346,6 +1492,32 @@ export class MSSQLDriver extends BaseDBDriver {
       }
 
       if (!Number.isNaN(Number(val)) && val !== "") {
+        if (
+          column.category === "float" &&
+          (operator === "eq" || operator === "neq")
+        ) {
+          const numericValue = Number(val);
+          const tolerance = approximateNumericFilterTolerance(val);
+          const toleranceExpr =
+            "CASE WHEN ABS(?) * ? > ? THEN ABS(?) * ? ELSE ? END";
+          const deltaExpr = `ABS(CAST(${col} AS float) - ?)`;
+          return {
+            sql:
+              operator === "neq"
+                ? `${deltaExpr} >= ${toleranceExpr}`
+                : `${deltaExpr} < ${toleranceExpr}`,
+            params: [
+              numericValue,
+              numericValue,
+              tolerance,
+              tolerance,
+              numericValue,
+              tolerance,
+              tolerance,
+            ],
+          };
+        }
+
         const sqlOp = this.sqlOperator(operator);
         if (
           baseTypeName(column.nativeType) === "bigint" &&
@@ -1422,16 +1594,38 @@ export class MSSQLDriver extends BaseDBDriver {
           params: [normalizeDatetimeLiteral(v)],
         };
       }
+
+      if (baseTypeName(column.nativeType) === "datetimeoffset") {
+        const normalizedExpr = `REPLACE(REPLACE(REPLACE(CONVERT(VARCHAR(40), ${col}, 127), 'Z', '+00:00'), ' +', '+'), ' -', '-')`;
+        return {
+          sql: `${normalizedExpr} LIKE ?`,
+          params: [`%${datetimeOffsetSearchLiteral(v)}%`],
+        };
+      }
+
       return {
-        sql:
-          baseTypeName(column.nativeType) === "datetimeoffset"
-            ? `CONVERT(VARCHAR(40), ${col}, 127) LIKE ?`
-            : `CONVERT(VARCHAR(33), ${col}, 126) LIKE ?`,
+        sql: `CONVERT(VARCHAR(33), ${col}, 126) LIKE ?`,
         params: [`%${temporalSearchLiteral(v)}%`],
       };
     }
 
     const v = typeof val === "string" ? val : val[0];
+    if (operator === "like" || operator === "ilike") {
+      if (v.length > MSSQL_LIKE_MAX_NVARCHAR_CHARS) {
+        // SQL Server pattern functions are not reliable for very large search terms.
+        // Fall back to exact comparison so pasted full cell values still work.
+        return {
+          sql: `CAST(${col} AS NVARCHAR(MAX)) = CAST(? AS NVARCHAR(MAX))`,
+          params: [v],
+        };
+      }
+
+      return {
+        sql: `CHARINDEX(CAST(? AS NVARCHAR(MAX)), CAST(${col} AS NVARCHAR(MAX))) > 0`,
+        params: [v],
+      };
+    }
+
     if (operator === "eq" || operator === "neq") {
       const sqlOp = operator === "neq" ? "<>" : "=";
       return { sql: `${col} ${sqlOp} ?`, params: [v] };

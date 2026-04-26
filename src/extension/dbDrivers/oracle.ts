@@ -931,10 +931,11 @@ export class OracleDriver extends BaseDBDriver {
         DATA_LENGTH: number;
         NULLABLE: string;
         DATA_DEFAULT: string | null;
+        VIRTUAL_COLUMN: string;
         COLUMN_ID: number;
       }>(
         `SELECT column_name, data_type, data_precision, data_scale,
-                data_length, nullable, data_default, column_id
+                data_length, nullable, data_default, virtual_column, column_id
          FROM all_tab_columns
          WHERE owner = :1 AND table_name = :2
          ORDER BY column_id`,
@@ -1004,6 +1005,10 @@ export class OracleDriver extends BaseDBDriver {
 
       return (colRes.rows ?? []).map((r) => {
         const genType = identityMap.get(r.COLUMN_NAME);
+        const isComputed = r.VIRTUAL_COLUMN === "YES";
+        const computedExpression = isComputed
+          ? (r.DATA_DEFAULT?.trim() ?? undefined)
+          : undefined;
         const primaryKeyOrdinal = pkOrdinalByColumn.get(r.COLUMN_NAME);
         return {
           name: r.COLUMN_NAME,
@@ -1015,9 +1020,13 @@ export class OracleDriver extends BaseDBDriver {
           ),
           nullable: r.NULLABLE === "Y",
           defaultValue:
-            genType !== undefined
-              ? undefined
-              : (r.DATA_DEFAULT?.trim() ?? undefined),
+            isComputed && computedExpression
+              ? `AS (${computedExpression})`
+              : genType !== undefined
+                ? undefined
+                : (r.DATA_DEFAULT?.trim() ?? undefined),
+          isComputed,
+          computedExpression,
           isPrimaryKey: primaryKeyOrdinal !== undefined,
           primaryKeyOrdinal,
           isForeignKey: fkCols.has(r.COLUMN_NAME),
@@ -1306,9 +1315,10 @@ export class OracleDriver extends BaseDBDriver {
       DATA_LENGTH: number;
       NULLABLE: string;
       DATA_DEFAULT: string | null;
+      VIRTUAL_COLUMN: string;
     }>(
       `SELECT column_name, data_type, data_precision, data_scale,
-              data_length, nullable, data_default
+              data_length, nullable, data_default, virtual_column
        FROM all_tab_columns
        WHERE owner = :1 AND table_name = :2
        ORDER BY column_id`,
@@ -1375,6 +1385,11 @@ export class OracleDriver extends BaseDBDriver {
       );
 
       const nullable = r.NULLABLE === "Y" ? "" : " NOT NULL";
+
+      if (r.VIRTUAL_COLUMN === "YES") {
+        const expression = r.DATA_DEFAULT?.trim() ?? "";
+        return `  "${r.COLUMN_NAME}" ${typ} GENERATED ALWAYS AS (${expression}) VIRTUAL${nullable}`;
+      }
 
       const genType = identityMap.get(r.COLUMN_NAME);
       if (genType !== undefined) {

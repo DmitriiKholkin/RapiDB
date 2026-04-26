@@ -47,6 +47,12 @@ const SQLITE_TIME_LITERAL_RE = /^\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
 const SQLITE_DATETIME_LITERAL_RE =
   /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?: ?(?:Z|[+-]\d{2}:\d{2}))?$/i;
 
+function approximateNumericFilterTolerance(rawValue: string): number {
+  const fraction = /\.(\d+)/.exec(rawValue)?.[1].length ?? 0;
+  const precision = Math.min(Math.max(fraction + 2, 6), 12);
+  return 10 ** -precision;
+}
+
 function sqliteDeclaredTypeBase(typeName: string): string {
   return typeName.toUpperCase().trim().split("(")[0].trim();
 }
@@ -535,11 +541,13 @@ export class SQLiteDriver extends BaseDBDriver {
     row: SQLiteTableXInfoRow,
     metadata: SQLiteTableMetadata,
   ): ColumnMeta {
+    const isComputed = metadata.generatedColumns.has(row.name);
     return {
       name: row.name,
       type: row.type || "TEXT",
       nullable: row.notnull === 0,
       defaultValue: row.dflt_value ?? undefined,
+      isComputed,
       isPrimaryKey: row.pk > 0,
       primaryKeyOrdinal: row.pk > 0 ? row.pk : undefined,
       isForeignKey: metadata.foreignKeyColumns.has(row.name),
@@ -1064,6 +1072,23 @@ export class SQLiteDriver extends BaseDBDriver {
       !Number.isNaN(Number(val)) &&
       val !== ""
     ) {
+      if (
+        column.category === "float" &&
+        (operator === "eq" || operator === "neq")
+      ) {
+        const numericValue = Number(val);
+        const tolerance = approximateNumericFilterTolerance(val);
+        const toleranceExpr = "MAX(?, ABS(?) * ?)";
+        const deltaExpr = `ABS(CAST(${col} AS REAL) - ?)`;
+        return {
+          sql:
+            operator === "neq"
+              ? `${deltaExpr} >= ${toleranceExpr}`
+              : `${deltaExpr} < ${toleranceExpr}`,
+          params: [numericValue, tolerance, numericValue, tolerance],
+        };
+      }
+
       const sqlOp = this.sqlOperator(operator);
       if (column.category === "integer" && /^-?\d+$/.test(val)) {
         const big = BigInt(val);
