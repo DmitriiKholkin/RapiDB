@@ -69,6 +69,7 @@ const ORACLE_INTERVAL_DS_NANOS_PER_DAY =
   24n * ORACLE_INTERVAL_DS_NANOS_PER_HOUR;
 const ORACLE_MAX_SAFE_INTEGER = BigInt(Number.MAX_SAFE_INTEGER);
 const ORACLE_MIN_SAFE_INTEGER = BigInt(Number.MIN_SAFE_INTEGER);
+const ORACLE_PREVIEW_LITERAL_CHUNK_SIZE = 500;
 function isOracleInvalidIdentifierError(error: unknown): boolean {
   if (!(error instanceof Error)) {
     return false;
@@ -202,6 +203,51 @@ function oracleTimestampPreviewText(value: Date, useUtc: boolean): string {
 function escapeOraclePreviewSqlString(value: string): string {
   return value.replace(/'/g, "''");
 }
+function formatOracleQuotedStringLiteral(
+  value: string,
+  useNationalCharacterSet = false,
+): string {
+  return `${useNationalCharacterSet ? "N" : ""}'${escapeOraclePreviewSqlString(value)}'`;
+}
+function splitOraclePreviewLiteral(value: string): string[] {
+  const characters = Array.from(value);
+  if (characters.length === 0) {
+    return [""];
+  }
+  const chunks: string[] = [];
+  for (
+    let index = 0;
+    index < characters.length;
+    index += ORACLE_PREVIEW_LITERAL_CHUNK_SIZE
+  ) {
+    chunks.push(
+      characters
+        .slice(index, index + ORACLE_PREVIEW_LITERAL_CHUNK_SIZE)
+        .join(""),
+    );
+  }
+  return chunks;
+}
+function formatOracleLobPreviewExpression(
+  value: string,
+  options: {
+    converter: "TO_CLOB" | "TO_NCLOB";
+    useNationalCharacterSet?: boolean;
+  },
+): string {
+  return splitOraclePreviewLiteral(value)
+    .map(
+      (chunk) =>
+        `${options.converter}(${formatOracleQuotedStringLiteral(chunk, options.useNationalCharacterSet)})`,
+    )
+    .join(" || ");
+}
+function formatOracleXmlPreviewExpression(value: string): string {
+  return `XMLTYPE(${formatOracleLobPreviewExpression(value, { converter: "TO_CLOB" })})`;
+}
+function formatOracleBinaryPreviewLiteral(value: Buffer): string {
+  return `HEXTORAW('${value.toString("hex")}')`;
+}
 function isUnavailableOracleDdl(ddl: string): boolean {
   return ddl.startsWith("-- ");
 }
@@ -267,6 +313,16 @@ function normalizeOracleIntervalValue(value: unknown): string | null {
     normalizeOracleIntervalYMValue(value) ??
     normalizeOracleIntervalDSValue(value)
   );
+}
+function normalizeOracleXmlValue(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  return trimmed.replace(/>\s+</g, "><");
+}
+function oracleXmlFilterExpr(column: ColumnTypeMeta): string {
+  const col = `"${column.name.replace(/"/g, '""')}"`;
+  return `REGEXP_REPLACE(XMLSERIALIZE(CONTENT ${col} AS CLOB), '>\\s+<', '><')`;
 }
 type OracleLobLike = {
   getData?: () => Promise<string | Buffer | null>;
@@ -1614,18 +1670,33 @@ export class OracleDriver extends BaseDBDriver {
     if (!params || params.length === 0 || columns.length === 0) {
       return this.materializePreviewSql(sql, params);
     }
+    return this.materializePreviewColumnSql(sql, params, columns);
+  }
+  materializePreviewColumnSql(
+    sql: string,
+    params: readonly unknown[] | undefined,
+    columns: readonly (ColumnTypeMeta | undefined)[],
+  ): string {
+    if (!params || params.length === 0) {
+      return sql;
+    }
     return sql.replace(/:(\d+)/g, (match, rawIndex: string) => {
       const index = Number.parseInt(rawIndex, 10) - 1;
       if (index < 0 || index >= params.length) {
         return match;
       }
-      const value = params[index];
-      const column = columns[index];
-      if (
-        value instanceof Date &&
-        !Number.isNaN(value.getTime()) &&
-        column !== undefined
-      ) {
+      return this.formatOracleColumnAwarePreviewLiteral(
+        params[index],
+        columns[index],
+      );
+    });
+  }
+  private formatOracleColumnAwarePreviewLiteral(
+    value: unknown,
+    column: ColumnTypeMeta | undefined,
+  ): string {
+    if (column !== undefined) {
+      if (value instanceof Date && !Number.isNaN(value.getTime())) {
         const typeName = oracleTypeName(column.nativeType);
         if (typeName === "DATE") {
           const temporalText = oracleTimestampPreviewText(value, false).slice(
@@ -1643,12 +1714,58 @@ export class OracleDriver extends BaseDBDriver {
           return `TO_TIMESTAMP('${escapeOraclePreviewSqlString(temporalText)}', 'YYYY-MM-DD HH24:MI:SS.FF3')`;
         }
       }
-      return this.formatPreviewSqlLiteral(value);
-    });
+      if (typeof value === "string") {
+        const typeName = oracleTypeName(column.nativeType);
+        if (typeName === "XMLTYPE") {
+          return formatOracleXmlPreviewExpression(value);
+        }
+        if (typeName === "CLOB") {
+          return formatOracleLobPreviewExpression(value, {
+            converter: "TO_CLOB",
+          });
+        }
+        if (typeName === "NCLOB") {
+          return formatOracleLobPreviewExpression(value, {
+            converter: "TO_NCLOB",
+            useNationalCharacterSet: true,
+          });
+        }
+        if (typeName === "NCHAR" || typeName === "NVARCHAR2") {
+          return formatOracleQuotedStringLiteral(value, true);
+        }
+      }
+    }
+    if (Buffer.isBuffer(value)) {
+      return formatOracleBinaryPreviewLiteral(value);
+    }
+    if (value instanceof ArrayBuffer) {
+      return formatOracleBinaryPreviewLiteral(
+        Buffer.from(new Uint8Array(value)),
+      );
+    }
+    if (ArrayBuffer.isView(value)) {
+      return formatOracleBinaryPreviewLiteral(
+        Buffer.from(value.buffer, value.byteOffset, value.byteLength),
+      );
+    }
+    return this.formatPreviewSqlLiteral(value);
   }
   protected override formatPreviewSqlLiteral(value: unknown): string {
     if (value instanceof Date && !Number.isNaN(value.getTime())) {
       return oracleTimestampPreviewLiteral(value);
+    }
+    if (Buffer.isBuffer(value)) {
+      return formatOracleBinaryPreviewLiteral(value);
+    }
+    if (value instanceof ArrayBuffer) {
+      return formatOracleBinaryPreviewLiteral(
+        Buffer.from(new Uint8Array(value)),
+      );
+    }
+    if (ArrayBuffer.isView(value)) {
+      return formatOracleBinaryPreviewLiteral(
+        Buffer.from(value.buffer, value.byteOffset, value.byteLength),
+      );
     }
     return super.formatPreviewSqlLiteral(value);
   }
@@ -1685,6 +1802,20 @@ export class OracleDriver extends BaseDBDriver {
     }
     return value;
   }
+  override normalizeFilterValue(
+    column: ColumnTypeMeta,
+    operator: FilterOperator,
+    value: string | [string, string] | undefined,
+  ): string | [string, string] | undefined {
+    const normalized = super.normalizeFilterValue(column, operator, value);
+    if (oracleTypeName(column.nativeType) !== "XMLTYPE") {
+      return normalized;
+    }
+    if (typeof normalized === "string") {
+      return normalizeOracleXmlValue(normalized) ?? normalized;
+    }
+    return normalized;
+  }
   override formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (value === null || value === undefined) return value;
     if (Buffer.isBuffer(value)) return super.formatOutputValue(value, column);
@@ -1699,6 +1830,10 @@ export class OracleDriver extends BaseDBDriver {
     if (isOracleIntervalType(column.nativeType)) {
       const intervalText = normalizeOracleIntervalValue(value);
       if (intervalText !== null) return intervalText;
+    }
+    if (oracleTypeName(column.nativeType) === "XMLTYPE") {
+      const xmlText = normalizeOracleXmlValue(value);
+      if (xmlText !== null) return xmlText;
     }
     if (this.isDatetimeWithTime(column.nativeType)) {
       if (
@@ -1795,6 +1930,26 @@ export class OracleDriver extends BaseDBDriver {
     if (!column.filterable) return null;
     if (value === undefined) return null;
     const val = typeof value === "string" ? value.trim() : value;
+    if (oracleTypeName(column.nativeType) === "XMLTYPE") {
+      if (
+        operator !== "like" &&
+        operator !== "ilike" &&
+        operator !== "eq" &&
+        operator !== "neq"
+      ) {
+        return null;
+      }
+      const xmlValue =
+        typeof val === "string"
+          ? (normalizeOracleXmlValue(val) ?? val)
+          : val[0];
+      const xmlExpr = oracleXmlFilterExpr(column);
+      const sqlOp = operator === "neq" ? "NOT LIKE" : "LIKE";
+      return {
+        sql: `UPPER(${xmlExpr}) ${sqlOp} UPPER(:${paramIndex})`,
+        params: [`%${xmlValue}%`],
+      };
+    }
     if (column.category === "array") {
       if (operator !== "like" && operator !== "ilike") {
         return null;

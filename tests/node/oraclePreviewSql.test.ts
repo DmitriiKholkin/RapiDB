@@ -16,6 +16,28 @@ const baseConfig = {
   password: "pass",
 } as const satisfies Partial<ConnectionConfig>;
 
+function buildColumn(
+  name: string,
+  nativeType: string,
+  category: ColumnTypeMeta["category"],
+): ColumnTypeMeta {
+  return {
+    name,
+    type: nativeType,
+    nativeType,
+    category,
+    nullable: true,
+    defaultValue: undefined,
+    isPrimaryKey: false,
+    primaryKeyOrdinal: undefined,
+    isForeignKey: false,
+    isAutoIncrement: false,
+    filterable: true,
+    filterOperators: ["is_null", "is_not_null"],
+    valueSemantics: "plain",
+  };
+}
+
 describe("Oracle preview SQL literals", () => {
   it("materializes JS Date values as ANSI TIMESTAMP literals", () => {
     const driver = new OracleDriver(baseConfig as ConnectionConfig);
@@ -146,5 +168,77 @@ describe("Oracle preview SQL literals", () => {
     ).toBe(
       'INSERT INTO "APP"."T" ("amount") VALUES (\'9999999999.1234567890\')',
     );
+  });
+
+  it("materializes Oracle-specific literals for binary, LOB, and XML columns", () => {
+    const driver = new OracleDriver(baseConfig as ConnectionConfig);
+    const longClob = `Very long CLOB: ${"x".repeat(1200)}`;
+    const preview = driver.materializePreviewInsertSql(
+      'INSERT INTO "T" ("COL_BLOB", "COL_RAW", "COL_CLOB", "COL_NCLOB", "COL_XMLTYPE") VALUES (:1, :2, :3, :4, :5)',
+      [
+        Buffer.from("deadbeefcafe0102030405060708090a", "hex"),
+        Buffer.from("48656c6c6f", "hex"),
+        longClob,
+        "Unicode NCLOB: Привет мир 你好 😀",
+        '<root><child id="1">Text</child></root>',
+      ],
+      [
+        buildColumn("COL_BLOB", "BLOB", "binary"),
+        buildColumn("COL_RAW", "RAW(16)", "binary"),
+        buildColumn("COL_CLOB", "CLOB", "text"),
+        buildColumn("COL_NCLOB", "NCLOB", "text"),
+        buildColumn("COL_XMLTYPE", "XMLTYPE", "text"),
+      ],
+    );
+
+    expect(preview).toContain("HEXTORAW('deadbeefcafe0102030405060708090a')");
+    expect(preview).toContain("HEXTORAW('48656c6c6f')");
+    expect(preview).not.toContain("X '");
+    expect(preview).not.toContain("X'");
+    expect(preview).toContain("TO_CLOB('Very long CLOB: ");
+    expect(preview).toContain(" || TO_CLOB('");
+    expect(preview).toContain("TO_NCLOB(N'Unicode NCLOB: Привет мир 你好 😀')");
+    expect(preview).toContain(
+      `XMLTYPE(TO_CLOB('<root><child id="1">Text</child></root>'))`,
+    );
+  });
+
+  it("normalizes Oracle XMLTYPE whitespace for display and editing", () => {
+    const driver = new OracleDriver(baseConfig as ConnectionConfig);
+    const column = buildColumn("COL_XMLTYPE", "XMLTYPE", "text");
+
+    const formatted = driver.formatOutputValue(
+      '<root>    <child id="1">Text</child>   </root>',
+      column,
+    );
+
+    expect(formatted).toBe('<root><child id="1">Text</child></root>');
+    expect(String(formatted)).toBe('<root><child id="1">Text</child></root>');
+  });
+
+  it("normalizes Oracle XMLTYPE filters to the compact XML form", () => {
+    const driver = new OracleDriver(baseConfig as ConnectionConfig);
+    const column = buildColumn("COL_XMLTYPE", "XMLTYPE", "text");
+
+    expect(
+      driver.normalizeFilterValue(
+        column,
+        "like",
+        '<root>    <child id="1">Text</child>   </root>',
+      ),
+    ).toBe('<root><child id="1">Text</child></root>');
+
+    const condition = driver.buildFilterCondition(
+      column,
+      "like",
+      '<root><child id="1">Text</child></root>',
+      1,
+    );
+
+    expect(condition).toBeTruthy();
+    expect(condition).toMatchObject({
+      sql: `UPPER(REGEXP_REPLACE(XMLSERIALIZE(CONTENT "COL_XMLTYPE" AS CLOB), '>\\s+<', '><')) LIKE UPPER(:1)`,
+      params: ['%<root><child id="1">Text</child></root>%'],
+    });
   });
 });
