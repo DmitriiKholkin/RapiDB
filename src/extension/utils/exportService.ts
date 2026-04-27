@@ -44,8 +44,8 @@ export async function exportQueryResultsAsCsv(
     progressTitle: "RapiDB: Exporting query results…",
     successLabel: "query results",
     errorLabel: "CSV export failed",
-    write: async (filePath) => {
-      await writeQueryResultsCsv(filePath, result);
+    write: async (filePath, signal) => {
+      await writeQueryResultsCsv(filePath, result, signal);
     },
   });
 }
@@ -59,8 +59,8 @@ export async function exportQueryResultsAsJson(
     progressTitle: "RapiDB: Exporting query results…",
     successLabel: "query results",
     errorLabel: "JSON export failed",
-    write: async (filePath) => {
-      await writeQueryResultsJson(filePath, result);
+    write: async (filePath, signal) => {
+      await writeQueryResultsJson(filePath, result, signal);
     },
   });
 }
@@ -77,7 +77,7 @@ export async function exportTableDataAsCsv(options: {
     successLabel: fileName,
     errorLabel: "CSV export failed",
     write: async (filePath, signal) => {
-      await writeChunkedCsv(filePath, loadChunks(signal));
+      await writeChunkedCsv(filePath, loadChunks(signal), signal);
     },
   });
 }
@@ -94,7 +94,7 @@ export async function exportTableDataAsJson(options: {
     successLabel: fileName,
     errorLabel: "JSON export failed",
     write: async (filePath, signal) => {
-      await writeChunkedJson(filePath, loadChunks(signal));
+      await writeChunkedJson(filePath, loadChunks(signal), signal);
     },
   });
 }
@@ -166,11 +166,14 @@ function buildExportFilters(format: ExportFormat): Record<string, string[]> {
 async function writeQueryResultsCsv(
   filePath: string,
   result: QueryResultExport,
+  signal: AbortSignal,
 ): Promise<void> {
   await withWriteStream(filePath, async (writeStream) => {
+    throwIfAborted(signal);
     writeStream.write(result.columns.map(csvCell).join(",") + LINE_BREAK);
 
     for (const row of result.rows) {
+      throwIfAborted(signal);
       writeStream.write(
         result.columns
           .map((_, index) => csvCell(row[queryColumnKey(index)]))
@@ -183,11 +186,14 @@ async function writeQueryResultsCsv(
 async function writeQueryResultsJson(
   filePath: string,
   result: QueryResultExport,
+  signal: AbortSignal,
 ): Promise<void> {
   await withWriteStream(filePath, async (writeStream) => {
+    throwIfAborted(signal);
     writeStream.write("[\n");
 
     for (let index = 0; index < result.rows.length; index++) {
+      throwIfAborted(signal);
       const row = result.rows[index];
       writeStream.write(
         `${index === 0 ? "" : ",\n"}${JSON.stringify(toQueryJsonRow(result.columns, row))}`,
@@ -201,11 +207,13 @@ async function writeQueryResultsJson(
 async function writeChunkedCsv(
   filePath: string,
   chunks: AsyncIterable<ChunkedExportData>,
+  signal: AbortSignal,
 ): Promise<void> {
   await withWriteStream(filePath, async (writeStream) => {
     let headerWritten = false;
 
     for await (const chunk of chunks) {
+      throwIfAborted(signal);
       if (!headerWritten) {
         writeStream.write(
           chunk.columns.map((column) => csvCell(column.name)).join(",") +
@@ -215,6 +223,7 @@ async function writeChunkedCsv(
       }
 
       for (const row of chunk.rows) {
+        throwIfAborted(signal);
         writeStream.write(
           chunk.columns
             .map((column) => csvCell(formatExportCellValue(row[column.name])))
@@ -228,13 +237,16 @@ async function writeChunkedCsv(
 async function writeChunkedJson(
   filePath: string,
   chunks: AsyncIterable<ChunkedExportData>,
+  signal: AbortSignal,
 ): Promise<void> {
   await withWriteStream(filePath, async (writeStream) => {
+    throwIfAborted(signal);
     writeStream.write("[\n");
     let firstRow = true;
 
     for await (const chunk of chunks) {
       for (const row of chunk.rows) {
+        throwIfAborted(signal);
         const serializableRow = Object.fromEntries(
           Object.entries(row).map(([key, value]) => [
             key,
@@ -303,6 +315,16 @@ function formatExportCellValue(value: unknown): string {
   }
 
   return String(value);
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (!signal.aborted) {
+    return;
+  }
+
+  const error = new Error("The operation was aborted.");
+  error.name = "AbortError";
+  throw error;
 }
 
 async function withWriteStream(

@@ -494,6 +494,9 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
 
     useEffect(() => {
       ariaLabelRef.current = ariaLabel;
+      editorRef.current?.updateOptions({
+        ariaLabel,
+      });
     }, [ariaLabel]);
 
     useEffect(() => {

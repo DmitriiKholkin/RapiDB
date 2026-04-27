@@ -4,14 +4,16 @@ export async function pMapWithLimit<T, R>(
   fn: (item: T) => Promise<R>,
 ): Promise<R[]> {
   const results: R[] = new Array(items.length);
-  const queue = items.map((item, i) => ({ item, i }));
+  let nextIndex = 0;
   const workers = Array.from(
-    { length: Math.min(limit, queue.length) },
+    { length: Math.min(limit, items.length) },
     async () => {
-      while (queue.length > 0) {
-        const next = queue.shift();
-        if (!next) break;
-        results[next.i] = await fn(next.item);
+      while (true) {
+        const currentIndex = nextIndex++;
+        if (currentIndex >= items.length) {
+          break;
+        }
+        results[currentIndex] = await fn(items[currentIndex]);
       }
     },
   );

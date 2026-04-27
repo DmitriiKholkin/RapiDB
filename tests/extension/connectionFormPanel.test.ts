@@ -60,6 +60,10 @@ function createdPanel() {
   return vscodeMock.createWebviewPanel.mock.results[0]?.value;
 }
 
+type ConnectionFormPanelPrototype = {
+  handleMessage(message: unknown): Promise<void>;
+};
+
 describe("ConnectionFormPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -180,5 +184,48 @@ describe("ConnectionFormPanel", () => {
     await panel.webview.dispatchMessage({ type: "cancel" });
 
     await expect(promise).resolves.toBeUndefined();
+  });
+
+  it("falls back to a testResult message when unhandled errors occur for malformed input", async () => {
+    const context = {
+      secrets: {
+        get: vi.fn(async () => undefined),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn(),
+      getConnection: vi.fn(() => undefined),
+      testConnection: vi.fn(),
+    };
+
+    const handleMessageSpy = vi
+      .spyOn(
+        ConnectionFormPanel.prototype as unknown as ConnectionFormPanelPrototype,
+        "handleMessage",
+      )
+      .mockRejectedValue(new Error("boom"));
+
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+    );
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected a webview panel to be created.");
+    }
+
+    await expect(panel.webview.dispatchMessage(null)).resolves.toBeUndefined();
+
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "testResult",
+      payload: { success: false, error: "boom" },
+    });
+
+    panel.dispose();
+    await expect(promise).resolves.toBeUndefined();
+    handleMessageSpy.mockRestore();
   });
 });

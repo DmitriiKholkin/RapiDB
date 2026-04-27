@@ -38,8 +38,13 @@ export class ConnectionFormPanel {
           "ConnectionFormPanel unhandled error",
           err,
         );
+        const isSaveConnectionMessage =
+          typeof msg === "object" &&
+          msg !== null &&
+          "type" in msg &&
+          (msg as { type?: unknown }).type === "saveConnection";
         this.panel.webview.postMessage({
-          type: msg.type === "saveConnection" ? "saveResult" : "testResult",
+          type: isSaveConnectionMessage ? "saveResult" : "testResult",
           payload: { success: false, error: error.message },
         });
       }
