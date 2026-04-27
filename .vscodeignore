@@ -4,6 +4,10 @@ esbuild.config.mjs
 tsconfig*.json
 biome.json
 compose.yaml
+vitest.config.ts
+vitest.workspace.ts
+tests/
+dist/*.tsbuildinfo
 
 # Dev environment
 .vscode/
@@ -13,6 +17,14 @@ compose.yaml
 node_modules/**
 !node_modules/oracledb/**
 !node_modules/node-sqlite3-wasm/**
+node_modules/oracledb/examples/**
+node_modules/oracledb/package/**
+node_modules/oracledb/**/*-buildinfo.txt
+node_modules/oracledb/CHANGELOG.md
+node_modules/oracledb/README.md
+node_modules/oracledb/SECURITY.md
+node_modules/node-sqlite3-wasm/README.md
+node_modules/node-sqlite3-wasm/*.d.ts
 
 # Misc
 **/*.map

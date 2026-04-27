@@ -31,6 +31,7 @@ describe("extension activation", () => {
   }>;
   let connectionFormShow: ReturnType<typeof vi.fn>;
   let connectWithProgress: ReturnType<typeof vi.fn>;
+  let queryPanelCreateOrShow: ReturnType<typeof vi.fn>;
   let queryPanelDisposeAll: ReturnType<typeof vi.fn>;
   let tablePanelDisposeAll: ReturnType<typeof vi.fn>;
   let schemaPanelDisposeAll: ReturnType<typeof vi.fn>;
@@ -40,6 +41,7 @@ describe("extension activation", () => {
     connectionProviderInstances = [];
     connectionFormShow = vi.fn();
     connectWithProgress = vi.fn();
+    queryPanelCreateOrShow = vi.fn();
     queryPanelDisposeAll = vi.fn();
     tablePanelDisposeAll = vi.fn();
     schemaPanelDisposeAll = vi.fn();
@@ -104,7 +106,7 @@ describe("extension activation", () => {
     }));
     vi.doMock("../../src/extension/panels/queryPanel", () => ({
       QueryPanel: {
-        createOrShow: vi.fn(),
+        createOrShow: queryPanelCreateOrShow,
         disposeAll: queryPanelDisposeAll,
       },
     }));
@@ -177,6 +179,110 @@ describe("extension activation", () => {
     expect(connectionProviderInstances[0]?.refresh).toHaveBeenCalledTimes(1);
     expect(vscodeState.showInformationMessage).toHaveBeenCalledWith(
       '[RapiDB] Connection "Analytics" saved.',
+    );
+  });
+
+  it("opens saved history and bookmark entries with preserved query panel options", async () => {
+    const extension = await import("../../src/extension/extension");
+    const context = { subscriptions: [] as Array<{ dispose(): void }> };
+
+    extension.activate(context as never);
+
+    const openHistoryCommand = vscodeState.registerCommand.mock.calls.find(
+      ([command]) => command === "rapidb.openHistoryEntry",
+    )?.[1] as
+      | ((entry: { connectionId?: string; sql?: string }) => void)
+      | undefined;
+    const openBookmarkCommand = vscodeState.registerCommand.mock.calls.find(
+      ([command]) => command === "rapidb.openBookmarkEntry",
+    )?.[1] as
+      | ((entry: { connectionId?: string; sql?: string }) => void)
+      | undefined;
+
+    if (!openHistoryCommand || !openBookmarkCommand) {
+      throw new Error("Saved query commands were not registered.");
+    }
+
+    openHistoryCommand({ connectionId: "conn-1", sql: "select 1" });
+    openHistoryCommand({ connectionId: "", sql: "select ignored" });
+    openBookmarkCommand({ connectionId: "conn-1", sql: "select 2" });
+
+    expect(queryPanelCreateOrShow).toHaveBeenCalledTimes(2);
+    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
+      1,
+      context,
+      connectionManagerInstance,
+      "conn-1",
+      "select 1",
+      undefined,
+      undefined,
+      undefined,
+    );
+    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
+      2,
+      context,
+      connectionManagerInstance,
+      "conn-1",
+      "select 2",
+      true,
+      false,
+      true,
+    );
+  });
+
+  it("confirms saved entry clearing before mutating state and preserves success messages", async () => {
+    const extension = await import("../../src/extension/extension");
+    const context = { subscriptions: [] as Array<{ dispose(): void }> };
+
+    vscodeState.showWarningMessage
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce("Clear")
+      .mockResolvedValueOnce("Clear");
+
+    extension.activate(context as never);
+
+    const clearBookmarksCommand = vscodeState.registerCommand.mock.calls.find(
+      ([command]) => command === "rapidb.clearBookmarks",
+    )?.[1] as (() => Promise<void>) | undefined;
+    const clearHistoryCommand = vscodeState.registerCommand.mock.calls.find(
+      ([command]) => command === "rapidb.clearHistory",
+    )?.[1] as (() => Promise<void>) | undefined;
+
+    if (!clearBookmarksCommand || !clearHistoryCommand) {
+      throw new Error("Clear saved entry commands were not registered.");
+    }
+
+    await clearBookmarksCommand();
+    await clearBookmarksCommand();
+    await clearHistoryCommand();
+
+    expect(connectionManagerInstance.clearBookmarks).toHaveBeenCalledTimes(1);
+    expect(connectionManagerInstance.clearHistory).toHaveBeenCalledTimes(1);
+    expect(vscodeState.showWarningMessage).toHaveBeenNthCalledWith(
+      1,
+      "[RapiDB] Clear all bookmarks?",
+      { modal: true },
+      "Clear",
+    );
+    expect(vscodeState.showWarningMessage).toHaveBeenNthCalledWith(
+      2,
+      "[RapiDB] Clear all bookmarks?",
+      { modal: true },
+      "Clear",
+    );
+    expect(vscodeState.showWarningMessage).toHaveBeenNthCalledWith(
+      3,
+      "[RapiDB] Clear all query history?",
+      { modal: true },
+      "Clear",
+    );
+    expect(vscodeState.showInformationMessage).toHaveBeenNthCalledWith(
+      1,
+      "[RapiDB] All bookmarks cleared.",
+    );
+    expect(vscodeState.showInformationMessage).toHaveBeenNthCalledWith(
+      2,
+      "[RapiDB] Query history cleared.",
     );
   });
 

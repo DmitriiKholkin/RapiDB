@@ -2,7 +2,7 @@
   "name": "rapidb",
   "displayName": "RapiDB",
   "description": "Database management tool inside VSCode — PostgreSQL, MSSQL, MySQL/MariaDB, SQLite, Oracle",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "DmitriiKholkin",
   "repository": {
     "type": "git",

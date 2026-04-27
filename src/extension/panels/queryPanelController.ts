@@ -29,6 +29,24 @@ export class QueryPanelController {
     private readonly view: QueryPanelView,
   ) {}
 
+  private resolveConnectionId(connectionIdOverride?: string): string {
+    return (
+      connectionIdOverride ||
+      this.view.getActiveConnectionId() ||
+      this.view.getInitialConnectionId()
+    );
+  }
+
+  private getCachedResultForExport(): QueryPanelCachedResult | null {
+    const cached = this.view.getLastQueryResult();
+    if (cached && cached.columns.length > 0) {
+      return cached;
+    }
+
+    vscode.window.showWarningMessage("[RapiDB] No query results to export.");
+    return null;
+  }
+
   async handleMessage(message: unknown): Promise<void> {
     const parsed = parseQueryPanelMessage(message);
     if (!parsed) {
@@ -112,10 +130,7 @@ export class QueryPanelController {
       return;
     }
 
-    const connectionId =
-      connectionIdOverride ||
-      this.view.getActiveConnectionId() ||
-      this.view.getInitialConnectionId();
+    const connectionId = this.resolveConnectionId(connectionIdOverride);
 
     if (!this.connectionManager.isConnected(connectionId)) {
       try {
@@ -167,10 +182,7 @@ export class QueryPanelController {
   }
 
   private async pushSchema(connectionIdOverride?: string): Promise<void> {
-    const connectionId =
-      connectionIdOverride ||
-      this.view.getActiveConnectionId() ||
-      this.view.getInitialConnectionId();
+    const connectionId = this.resolveConnectionId(connectionIdOverride);
 
     if (!this.connectionManager.isConnected(connectionId)) {
       this.view.postMessage({
@@ -201,24 +213,26 @@ export class QueryPanelController {
     });
   }
 
-  private async handleExportResultsCsv(): Promise<void> {
-    const cached = this.view.getLastQueryResult();
-    if (!cached || cached.columns.length === 0) {
-      vscode.window.showWarningMessage("[RapiDB] No query results to export.");
+  private async handleExportResults(format: "csv" | "json"): Promise<void> {
+    const cached = this.getCachedResultForExport();
+    if (!cached) {
       return;
     }
 
-    await exportQueryResultsAsCsv(cached);
-  }
-
-  private async handleExportResultsJson(): Promise<void> {
-    const cached = this.view.getLastQueryResult();
-    if (!cached || cached.columns.length === 0) {
-      vscode.window.showWarningMessage("[RapiDB] No query results to export.");
+    if (format === "csv") {
+      await exportQueryResultsAsCsv(cached);
       return;
     }
 
     await exportQueryResultsAsJson(cached);
+  }
+
+  private async handleExportResultsCsv(): Promise<void> {
+    await this.handleExportResults("csv");
+  }
+
+  private async handleExportResultsJson(): Promise<void> {
+    await this.handleExportResults("json");
   }
 
   private async handleReadClipboard(): Promise<void> {
@@ -238,10 +252,7 @@ export class QueryPanelController {
       return;
     }
 
-    const connectionId =
-      connectionIdOverride ||
-      this.view.getActiveConnectionId() ||
-      this.view.getInitialConnectionId();
+    const connectionId = this.resolveConnectionId(connectionIdOverride);
 
     try {
       await this.connectionManager.addBookmark(connectionId, sql);

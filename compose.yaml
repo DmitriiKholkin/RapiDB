@@ -1,0 +1,64 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: rapidb-pg
+    environment:
+      POSTGRES_USER: db_admin
+      POSTGRES_PASSWORD: pg_pass123
+      POSTGRES_DB: rapidb_pg_db
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -h 127.0.0.1 -U $$POSTGRES_USER -d $$POSTGRES_DB" ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  mysql:
+    image: mysql:8.0
+    container_name: rapidb-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root_pass123
+      MYSQL_USER: mysql_user
+      MYSQL_PASSWORD: mysql_pass123
+      MYSQL_DATABASE: rapidb_mysql_db
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: [ "CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent" ]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 20s
+
+  mssql:
+    image: mcr.microsoft.com/azure-sql-edge:latest
+    container_name: rapidb-mssql
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Rapidb_Pass123!"
+    ports:
+      - "1433:1433"
+    healthcheck:
+      test: [ "CMD-SHELL", "test -f /var/opt/mssql/log/errorlog && grep -q 'Recovery is complete' /var/opt/mssql/log/errorlog" ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+
+  oracle:
+    image: gvenzl/oracle-free:latest
+    container_name: rapidb-oracle
+    environment:
+      ORACLE_PASSWORD: root_oracle_pass123
+      APP_USER: oracle_test_user
+      APP_USER_PASSWORD: oracle_pass123
+    ports:
+      - "1521:1521"
+    healthcheck:
+      test: [ "CMD", "healthcheck.sh" ]
+      interval: 20s
+      timeout: 10s
+      retries: 24
+      start_period: 120s

@@ -56,6 +56,49 @@ describe("ConnectionProvider", () => {
     vi.clearAllMocks();
   });
 
+  it("groups folder connections ahead of ungrouped roots and preserves folder metadata", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-b", name: "Zeta", type: "pg", folder: "Team" },
+        { id: "conn-c", name: "Solo", type: "sqlite" },
+        { id: "conn-a", name: "Alpha", type: "mysql", folder: "Team" },
+      ]),
+      isConnected: vi.fn(() => false),
+      isConnecting: vi.fn(() => false),
+      getSchemaSnapshotAsync: vi.fn(async () => ({ databases: [] })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidSchemaLoad: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+
+    const roots = await provider.getChildren();
+    expect(roots.map((node) => node.label)).toEqual(["Team", "Solo"]);
+    expect(roots[0]).toMatchObject({
+      id: "folder:Team",
+      contextValue: "folder",
+      description: "2 connections",
+      tooltip: "Folder: Team (2 connections)",
+    });
+
+    const folderChildren = await provider.getChildren(roots[0]);
+    expect(folderChildren.map((node) => node.label)).toEqual(["Alpha", "Zeta"]);
+    expect(folderChildren.map((node) => node.description)).toEqual([
+      "mysql",
+      "pg",
+    ]);
+  });
+
   it("renders multi-schema databases from the shared schema snapshot", async () => {
     const connectionManager = {
       getConnections: vi.fn(() => [
@@ -183,5 +226,110 @@ describe("ConnectionProvider", () => {
     const procedureNodes = await provider.getChildren(categories[3]);
     expect(procedureNodes.map((node) => node.label)).toEqual(["refresh_users"]);
     expect(connectionManager.getDriver).not.toHaveBeenCalled();
+  });
+
+  it("preserves object node ids, tooltips, and command wiring", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-1", name: "Primary", type: "mysql" },
+      ]),
+      isConnected: vi.fn((id: string) => id === "conn-1"),
+      isConnecting: vi.fn(() => false),
+      getSchemaSnapshotAsync: vi.fn(async () => ({
+        databases: [
+          {
+            name: "app_db",
+            schemas: [
+              {
+                name: "app_db",
+                objects: [
+                  { name: "users", type: "table", columns: [] },
+                  { name: "refresh_users", type: "procedure", columns: [] },
+                ],
+              },
+            ],
+          },
+        ],
+      })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidSchemaLoad: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+
+    const roots = await provider.getChildren();
+    const databases = await provider.getChildren(roots[0]);
+    const categories = await provider.getChildren(databases[0]);
+    const tableNode = (await provider.getChildren(categories[0]))[0];
+    const procedureNode = (await provider.getChildren(categories[3]))[0];
+
+    expect(tableNode).toMatchObject({
+      id: "table:conn-1:app_db:app_db:users",
+      contextValue: "table",
+      tooltip: "table: users\nSchema: app_db\nDatabase: app_db",
+    });
+    expect(tableNode?.command).toEqual({
+      command: "rapidb.openTableData",
+      title: "Open Data",
+      arguments: [tableNode],
+    });
+    expect(procedureNode).toMatchObject({
+      id: "procedure:conn-1:app_db:app_db:refresh_users",
+      contextValue: "procedure",
+      tooltip: "procedure: refresh_users\nSchema: app_db\nDatabase: app_db",
+    });
+    expect(procedureNode?.command).toEqual({
+      command: "rapidb.openRoutine",
+      title: "Open Definition",
+      arguments: [procedureNode],
+    });
+  });
+
+  it("returns an error node when loading connection children fails", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-1", name: "Primary", type: "pg" },
+      ]),
+      isConnected: vi.fn((id: string) => id === "conn-1"),
+      isConnecting: vi.fn(() => false),
+      getSchemaSnapshotAsync: vi.fn(async () => {
+        throw new Error("Snapshot failed");
+      }),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidSchemaLoad: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+
+    const roots = await provider.getChildren();
+    const children = await provider.getChildren(roots[0]);
+
+    expect(children).toHaveLength(1);
+    expect(children[0]).toMatchObject({
+      id: "connectionNode_disconnected:conn-1",
+      label: "Snapshot failed",
+      contextValue: "_error",
+      tooltip: "Error: Snapshot failed",
+    });
   });
 });

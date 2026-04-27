@@ -18,17 +18,17 @@ describe("ConnectionFormView", () => {
     expect(screen.getByLabelText("Host")).toBeTruthy();
     expect(screen.queryByLabelText("Database file path")).toBeNull();
 
-    await user.selectOptions(screen.getByLabelText("Database type"), "sqlite");
+    await user.click(screen.getByRole("button", { name: /sqlite/i }));
 
     expect(screen.getByLabelText("Database file path")).toBeTruthy();
     expect(screen.queryByLabelText("Host")).toBeNull();
 
-    await user.selectOptions(screen.getByLabelText("Database type"), "oracle");
+    await user.click(screen.getByRole("button", { name: /oracle/i }));
 
     expect(screen.getByLabelText("Oracle service name")).toBeTruthy();
 
     await user.click(
-      screen.getByRole("checkbox", {
+      screen.getByRole("switch", {
         name: /Use thick mode \(requires Oracle Instant Client\)/i,
       }),
     );
@@ -94,7 +94,7 @@ describe("ConnectionFormView", () => {
 
     clearPostedMessages();
 
-    await user.click(screen.getByRole("button", { name: "Save" }));
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
 
     expect(getLastPostedMessage()).toEqual({
       type: "saveConnection",

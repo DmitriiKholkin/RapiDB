@@ -19,6 +19,12 @@ export type NodeKind =
   | "function"
   | "procedure";
 
+type CategoryKind =
+  | "category_tables"
+  | "category_views"
+  | "category_functions"
+  | "category_procedures";
+
 const ICON_MAP: Record<NodeKind, string> = {
   connectionNode_disconnected: "server",
   connectionNode_connecting: "sync~spin",
@@ -65,14 +71,14 @@ export class RapiDBNode extends vscode.TreeItem {
   }
 }
 
-const CATEGORY_TYPES: Record<string, NodeKind[]> = {
+const CATEGORY_TYPES: Record<CategoryKind, NodeKind[]> = {
   category_tables: ["table"],
   category_views: ["view"],
   category_functions: ["function"],
   category_procedures: ["procedure"],
 };
 
-const CATEGORY_NODE_KIND: Record<string, NodeKind> = {
+const CATEGORY_NODE_KIND: Record<CategoryKind, NodeKind> = {
   category_tables: "table",
   category_views: "view",
   category_functions: "function",
@@ -132,194 +138,265 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
 
   async getChildren(element?: RapiDBNode): Promise<RapiDBNode[]> {
     if (!element) {
-      const conns = this.connectionManager.getConnections();
-
-      const grouped = conns.filter((c) => c.folder?.trim());
-      const ungrouped = conns.filter((c) => !c.folder?.trim());
-
-      const folderNames = [
-        ...new Set(
-          grouped
-            .map((c) => c.folder?.trim())
-            .filter((name): name is string => !!name),
-        ),
-      ].sort((a, b) => a.localeCompare(b));
-
-      const folderNodes = folderNames.map((name) => this.makeFolderNode(name));
-
-      const connNodes = ungrouped
-        .slice()
-        .sort((a, b) => a.name.localeCompare(b.name))
-        .map((c) => this.makeConnectionNode(c));
-
-      return [...folderNodes, ...connNodes];
+      return this.getRootChildren();
     }
 
     if (element.kind === "folder") {
-      const folderName = element.objectName;
-      if (!folderName) {
-        return [];
-      }
-      const conns = this.connectionManager
-        .getConnections()
-        .filter((c) => c.folder?.trim() === folderName)
-        .sort((a, b) => a.name.localeCompare(b.name));
-      return conns.map((c) => this.makeConnectionNode(c));
+      return this.getFolderChildren(element);
     }
 
     if (
       element.kind === "connectionNode_connected" ||
       element.kind === "connectionNode_disconnected"
     ) {
-      if (!this.connectionManager.isConnected(element.connectionId)) {
-        return [];
-      }
-      try {
-        const snapshot = await this.connectionManager.getSchemaSnapshotAsync(
-          element.connectionId,
-        );
-        return snapshot.databases.map((database) => {
-          const node = new RapiDBNode(
-            database.name,
-            "database",
-            vscode.TreeItemCollapsibleState.Collapsed,
-            element.connectionId,
-            database.name,
-          );
-          node.tooltip = `Database: ${database.name}`;
-          return node;
-        });
-      } catch (err: unknown) {
-        return [
-          this.makeError(
-            element.connectionId,
-            normalizeUnknownError(err).message,
-          ),
-        ];
-      }
+      return this.getConnectionChildren(element);
     }
 
     if (element.kind === "database") {
-      const databaseName = element.database;
-      if (!databaseName) {
-        return [];
-      }
-      try {
-        const snapshot = await this.connectionManager.getSchemaSnapshotAsync(
-          element.connectionId,
-        );
-        const database = snapshot.databases.find(
-          (entry) => entry.name === databaseName,
-        );
-        const schemas = database?.schemas ?? [];
-        if (schemas.length <= 1) {
-          return schemas[0]
-            ? this.categoryNodes(element.connectionId, databaseName, schemas[0])
-            : [];
-        }
-        return schemas.map((s) => {
-          const node = new RapiDBNode(
-            s.name,
-            "schema",
-            vscode.TreeItemCollapsibleState.Collapsed,
-            element.connectionId,
-            databaseName,
-            s.name,
-          );
-          node.tooltip = `Schema: ${s.name}`;
-          return node;
-        });
-      } catch (err: unknown) {
-        return [
-          this.makeError(
-            element.connectionId,
-            normalizeUnknownError(err).message,
-          ),
-        ];
-      }
+      return this.getDatabaseChildren(element);
     }
 
     if (element.kind === "schema") {
-      const databaseName = element.database;
-      const schemaName = element.schema;
-      if (!databaseName || !schemaName) {
-        return [];
+      return this.getSchemaChildren(element);
+    }
+
+    if (this.isCategoryKind(element.kind)) {
+      return this.getCategoryChildren(element, element.kind);
+    }
+
+    return [];
+  }
+
+  private getRootChildren(): RapiDBNode[] {
+    const connections = this.connectionManager.getConnections();
+    const groupedConnections = connections.filter((connection) =>
+      connection.folder?.trim(),
+    );
+    const ungroupedConnections = connections.filter(
+      (connection) => !connection.folder?.trim(),
+    );
+    const folderNodes = [
+      ...new Set(
+        groupedConnections
+          .map((connection) => connection.folder?.trim())
+          .filter((folderName): folderName is string => !!folderName),
+      ),
+    ]
+      .sort((left, right) => left.localeCompare(right))
+      .map((folderName) => this.makeFolderNode(folderName));
+
+    return [
+      ...folderNodes,
+      ...this.sortConnectionsByName(ungroupedConnections).map((connection) =>
+        this.makeConnectionNode(connection),
+      ),
+    ];
+  }
+
+  private getFolderChildren(element: RapiDBNode): RapiDBNode[] {
+    const folderName = element.objectName;
+    if (!folderName) {
+      return [];
+    }
+
+    return this.sortConnectionsByName(
+      this.connectionManager
+        .getConnections()
+        .filter((connection) => connection.folder?.trim() === folderName),
+    ).map((connection) => this.makeConnectionNode(connection));
+  }
+
+  private async getConnectionChildren(
+    element: RapiDBNode,
+  ): Promise<RapiDBNode[]> {
+    if (!this.connectionManager.isConnected(element.connectionId)) {
+      return [];
+    }
+
+    try {
+      const snapshot = await this.connectionManager.getSchemaSnapshotAsync(
+        element.connectionId,
+      );
+      return snapshot.databases.map((database) =>
+        this.makeDatabaseNode(element.connectionId, database.name),
+      );
+    } catch (err: unknown) {
+      return this.makeErrorNodes(element.connectionId, err);
+    }
+  }
+
+  private async getDatabaseChildren(
+    element: RapiDBNode,
+  ): Promise<RapiDBNode[]> {
+    const databaseName = element.database;
+    if (!databaseName) {
+      return [];
+    }
+
+    try {
+      const snapshot = await this.connectionManager.getSchemaSnapshotAsync(
+        element.connectionId,
+      );
+      const database = snapshot.databases.find(
+        (entry) => entry.name === databaseName,
+      );
+      const schemas = database?.schemas ?? [];
+
+      if (schemas.length <= 1) {
+        return schemas[0]
+          ? this.categoryNodes(element.connectionId, databaseName, schemas[0])
+          : [];
       }
+
+      return schemas.map((schema) =>
+        this.makeSchemaNode(element.connectionId, databaseName, schema.name),
+      );
+    } catch (err: unknown) {
+      return this.makeErrorNodes(element.connectionId, err);
+    }
+  }
+
+  private async getSchemaChildren(element: RapiDBNode): Promise<RapiDBNode[]> {
+    const databaseName = element.database;
+    const schemaName = element.schema;
+    if (!databaseName || !schemaName) {
+      return [];
+    }
+
+    const snapshot = await this.connectionManager.getSchemaSnapshotAsync(
+      element.connectionId,
+    );
+    const schema = snapshot.databases
+      .find((entry) => entry.name === databaseName)
+      ?.schemas.find((entry) => entry.name === schemaName);
+    return schema
+      ? this.categoryNodes(element.connectionId, databaseName, schema)
+      : [];
+  }
+
+  private async getCategoryChildren(
+    element: RapiDBNode,
+    kind: CategoryKind,
+  ): Promise<RapiDBNode[]> {
+    const databaseName = element.database;
+    const schemaName = element.schema;
+    if (!databaseName || !schemaName) {
+      return [];
+    }
+
+    try {
       const snapshot = await this.connectionManager.getSchemaSnapshotAsync(
         element.connectionId,
       );
       const schema = snapshot.databases
         .find((entry) => entry.name === databaseName)
         ?.schemas.find((entry) => entry.name === schemaName);
-      return schema
-        ? this.categoryNodes(element.connectionId, databaseName, schema)
-        : [];
-    }
+      const filteredObjects = (schema?.objects ?? []).filter((object) =>
+        CATEGORY_TYPES[kind].includes(object.type),
+      );
+      const childKind = CATEGORY_NODE_KIND[kind];
 
-    if (element.kind in CATEGORY_TYPES) {
-      const databaseName = element.database;
-      const schemaName = element.schema;
-      if (!databaseName || !schemaName) {
+      element.description = `(${filteredObjects.length})`;
+
+      if (filteredObjects.length === 0) {
         return [];
       }
-      try {
-        const snapshot = await this.connectionManager.getSchemaSnapshotAsync(
+
+      return filteredObjects.map((object) =>
+        this.makeObjectNode(
+          childKind,
           element.connectionId,
-        );
-        const schema = snapshot.databases
-          .find((entry) => entry.name === databaseName)
-          ?.schemas.find((entry) => entry.name === schemaName);
-        const all = schema?.objects ?? [];
+          databaseName,
+          schemaName,
+          object.name,
+        ),
+      );
+    } catch (err: unknown) {
+      return this.makeErrorNodes(element.connectionId, err);
+    }
+  }
 
-        const wantedTypes = CATEGORY_TYPES[element.kind];
-        const childKind = CATEGORY_NODE_KIND[element.kind];
-        const filtered = all.filter((object) =>
-          wantedTypes.includes(object.type),
-        );
+  private isCategoryKind(kind: NodeKind): kind is CategoryKind {
+    return kind in CATEGORY_TYPES;
+  }
 
-        element.description = `(${filtered.length})`;
+  private sortConnectionsByName(
+    connections: ConnectionConfig[],
+  ): ConnectionConfig[] {
+    return connections
+      .slice()
+      .sort((left, right) => left.name.localeCompare(right.name));
+  }
 
-        if (filtered.length === 0) {
-          return [];
-        }
+  private makeDatabaseNode(
+    connectionId: string,
+    databaseName: string,
+  ): RapiDBNode {
+    const node = new RapiDBNode(
+      databaseName,
+      "database",
+      vscode.TreeItemCollapsibleState.Collapsed,
+      connectionId,
+      databaseName,
+    );
+    node.tooltip = `Database: ${databaseName}`;
+    return node;
+  }
 
-        return filtered.map((o) => {
-          const node = new RapiDBNode(
-            o.name,
-            childKind,
-            vscode.TreeItemCollapsibleState.None,
-            element.connectionId,
-            databaseName,
-            schemaName,
-            o.name,
-          );
-          node.tooltip = `${childKind}: ${o.name}\nSchema: ${schemaName}\nDatabase: ${databaseName}`;
-          if (childKind === "table" || childKind === "view") {
-            node.command = {
-              command: "rapidb.openTableData",
-              title: "Open Data",
-              arguments: [node],
-            };
-          } else if (childKind === "function" || childKind === "procedure") {
-            node.command = {
-              command: "rapidb.openRoutine",
-              title: "Open Definition",
-              arguments: [node],
-            };
-          }
-          return node;
-        });
-      } catch (err: unknown) {
-        return [
-          this.makeError(
-            element.connectionId,
-            normalizeUnknownError(err).message,
-          ),
-        ];
-      }
+  private makeSchemaNode(
+    connectionId: string,
+    databaseName: string,
+    schemaName: string,
+  ): RapiDBNode {
+    const node = new RapiDBNode(
+      schemaName,
+      "schema",
+      vscode.TreeItemCollapsibleState.Collapsed,
+      connectionId,
+      databaseName,
+      schemaName,
+    );
+    node.tooltip = `Schema: ${schemaName}`;
+    return node;
+  }
+
+  private makeObjectNode(
+    kind: NodeKind,
+    connectionId: string,
+    databaseName: string,
+    schemaName: string,
+    objectName: string,
+  ): RapiDBNode {
+    const node = new RapiDBNode(
+      objectName,
+      kind,
+      vscode.TreeItemCollapsibleState.None,
+      connectionId,
+      databaseName,
+      schemaName,
+      objectName,
+    );
+    node.tooltip = `${kind}: ${objectName}\nSchema: ${schemaName}\nDatabase: ${databaseName}`;
+
+    if (kind === "table" || kind === "view") {
+      node.command = {
+        command: "rapidb.openTableData",
+        title: "Open Data",
+        arguments: [node],
+      };
+    } else if (kind === "function" || kind === "procedure") {
+      node.command = {
+        command: "rapidb.openRoutine",
+        title: "Open Definition",
+        arguments: [node],
+      };
     }
 
-    return [];
+    return node;
+  }
+
+  private makeErrorNodes(connectionId: string, error: unknown): RapiDBNode[] {
+    return [this.makeError(connectionId, normalizeUnknownError(error).message)];
   }
 
   private makeFolderNode(folderName: string): RapiDBNode {
@@ -409,7 +486,7 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
   ): RapiDBNode[] {
     const all = schema.objects;
 
-    const counts: Record<string, number> = {
+    const counts: Record<CategoryKind, number> = {
       category_tables: 0,
       category_views: 0,
       category_functions: 0,
@@ -427,7 +504,7 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       }
     }
 
-    const cats: { kind: NodeKind; label: string }[] = [
+    const cats: { kind: CategoryKind; label: string }[] = [
       { kind: "category_tables", label: "Tables" },
       { kind: "category_views", label: "Views" },
       { kind: "category_functions", label: "Functions" },

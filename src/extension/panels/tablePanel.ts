@@ -105,6 +105,23 @@ export class TablePanel {
     return `${connectionId}::${database}::${schema}::${table}`;
   }
 
+  private postMessage(type: string, payload: unknown): Thenable<boolean> {
+    return this.panel.webview.postMessage({ type, payload });
+  }
+
+  private normalizePageRequest(
+    page: number | string | undefined,
+    pageSize: number | string | undefined,
+  ): { page: number; pageSize: number } {
+    return {
+      page: Math.max(1, Math.floor(Number(page) || 1)),
+      pageSize: Math.min(
+        10000,
+        Math.max(1, Math.floor(Number(pageSize) || 50)),
+      ),
+    };
+  }
+
   static disposeAll(): void {
     for (const panel of TablePanel.panels.values()) {
       try {
@@ -173,9 +190,6 @@ export class TablePanel {
   }
 
   private async handleMessage(msg: unknown): Promise<void> {
-    const send = (type: string, payload: unknown) =>
-      this.panel.webview.postMessage({ type, payload });
-
     const parsed = parseTablePanelMessage(msg);
     if (!parsed) {
       return;
@@ -183,20 +197,19 @@ export class TablePanel {
 
     switch (parsed.type) {
       case "ready":
-        await this._handleReady(send);
+        await this._handleReady();
         break;
       case "fetchPage":
-        if (parsed.payload) await this._handleFetchPage(parsed.payload, send);
+        if (parsed.payload) await this._handleFetchPage(parsed.payload);
         break;
       case "applyChanges":
-        if (parsed.payload)
-          await this._handleApplyChanges(parsed.payload, send);
+        if (parsed.payload) await this._handleApplyChanges(parsed.payload);
         break;
       case "insertRow":
-        if (parsed.payload) await this._handleInsertRow(parsed.payload, send);
+        if (parsed.payload) await this._handleInsertRow(parsed.payload);
         break;
       case "deleteRows":
-        if (parsed.payload) await this._handleDeleteRows(parsed.payload, send);
+        if (parsed.payload) await this._handleDeleteRows(parsed.payload);
         break;
       case "exportCSV":
         await this._handleExportCSV(parsed.payload);
@@ -206,7 +219,7 @@ export class TablePanel {
         break;
       case "confirmMutationPreview":
         if (parsed.payload)
-          await this._handleConfirmMutationPreview(parsed.payload, send);
+          await this._handleConfirmMutationPreview(parsed.payload);
         break;
       case "cancelMutationPreview":
         if (parsed.payload) this._handleCancelMutationPreview(parsed.payload);
@@ -214,9 +227,7 @@ export class TablePanel {
     }
   }
 
-  private async _handleReady(
-    send: (type: string, payload: unknown) => Thenable<boolean>,
-  ): Promise<void> {
+  private async _handleReady(): Promise<void> {
     try {
       const cols = await this.svc.getColumns(
         this.connectionId,
@@ -226,14 +237,14 @@ export class TablePanel {
       );
       this.cachedColumns = cols;
       const pkCols = cols.filter((c) => c.isPrimaryKey).map((c) => c.name);
-      send("tableInit", {
+      this.postMessage("tableInit", {
         columns: cols,
         primaryKeyColumns: pkCols,
         isView: this.isView,
       });
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
-      send("tableError", { error: error.message });
+      this.postMessage("tableError", { error: error.message });
     }
   }
 
@@ -244,13 +255,11 @@ export class TablePanel {
         { type: "fetchPage" }
       >["payload"]
     >,
-    send: (type: string, payload: unknown) => Thenable<boolean>,
   ): Promise<void> {
     const fetchId = raw.fetchId;
-    const page = Math.max(1, Math.floor(Number(raw.page) || 1));
-    const pageSize = Math.min(
-      10000,
-      Math.max(1, Math.floor(Number(raw.pageSize) || 50)),
+    const { page, pageSize } = this.normalizePageRequest(
+      raw.page,
+      raw.pageSize,
     );
     const filters = coerceFilterExpressions(raw.filters);
     const sort = raw.sort ?? null;
@@ -265,7 +274,7 @@ export class TablePanel {
         filters as FilterExpression[],
         sort as SortConfig | null,
       );
-      send("tableData", {
+      this.postMessage("tableData", {
         fetchId,
         rows: result.rows,
         totalCount: result.totalCount,
@@ -277,17 +286,14 @@ export class TablePanel {
         filters.length > 0 &&
         FILTER_ERROR_RE.test(errMsg) &&
         !/arithmetic overflow/i.test(errMsg);
-      send("tableError", { fetchId, error: errMsg, isFilterError });
+      this.postMessage("tableError", { fetchId, error: errMsg, isFilterError });
     }
   }
 
-  private async _handleApplyChanges(
-    payload: {
-      updates?: import("../../shared/webviewContracts").RowUpdateMessagePayload[];
-      insertValues?: Record<string, unknown>;
-    },
-    send: (type: string, payload: unknown) => Thenable<boolean>,
-  ): Promise<void> {
+  private async _handleApplyChanges(payload: {
+    updates?: import("../../shared/webviewContracts").RowUpdateMessagePayload[];
+    insertValues?: Record<string, unknown>;
+  }): Promise<void> {
     const { updates, insertValues } = payload;
     try {
       const prepared = prepareApplyChangesPlan(
@@ -323,7 +329,7 @@ export class TablePanel {
         );
 
         if (risk) {
-          send("applyResult", {
+          this.postMessage("applyResult", {
             success: false,
             error: risk,
           });
@@ -337,11 +343,11 @@ export class TablePanel {
             `[RapiDB] ${prepared.result.warning}`,
           );
         }
-        send("applyResult", prepared.result);
+        this.postMessage("applyResult", prepared.result);
         return;
       }
 
-      await send(
+      await this.postMessage(
         "tableMutationPreview",
         this.previewController.createApplyChangesPreview({
           apply: prepared.executable ? prepared.plan : null,
@@ -351,14 +357,13 @@ export class TablePanel {
       );
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
-      send("applyResult", { success: false, error: error.message });
+      this.postMessage("applyResult", { success: false, error: error.message });
     }
   }
 
-  private async _handleInsertRow(
-    payload: { values?: Record<string, unknown> },
-    send: (type: string, payload: unknown) => Thenable<boolean>,
-  ): Promise<void> {
+  private async _handleInsertRow(payload: {
+    values?: Record<string, unknown>;
+  }): Promise<void> {
     const { values = {} } = payload;
     try {
       const plan = await this.svc.prepareInsertRow(
@@ -368,20 +373,22 @@ export class TablePanel {
         this.table,
         values,
       );
-      await send(
+      await this.postMessage(
         "tableMutationPreview",
         this.previewController.createInsertPreview(plan),
       );
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
-      send("insertResult", { success: false, error: error.message });
+      this.postMessage("insertResult", {
+        success: false,
+        error: error.message,
+      });
     }
   }
 
-  private async _handleDeleteRows(
-    payload: { primaryKeysList?: Array<Record<string, unknown>> },
-    send: (type: string, payload: unknown) => Thenable<boolean>,
-  ): Promise<void> {
+  private async _handleDeleteRows(payload: {
+    primaryKeysList?: Array<Record<string, unknown>>;
+  }): Promise<void> {
     const { primaryKeysList = [] } = payload;
     try {
       const plan = await this.svc.prepareDeleteRowsPlan(
@@ -393,17 +400,20 @@ export class TablePanel {
       );
 
       if (!plan) {
-        send("deleteResult", { success: true });
+        this.postMessage("deleteResult", { success: true });
         return;
       }
 
-      await send(
+      await this.postMessage(
         "tableMutationPreview",
         this.previewController.createDeleteRowsPreview(plan),
       );
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
-      send("deleteResult", { success: false, error: error.message });
+      this.postMessage("deleteResult", {
+        success: false,
+        error: error.message,
+      });
     }
   }
 
@@ -425,13 +435,7 @@ export class TablePanel {
   ): Promise<void> {
     const { sort = null, filters = [], limitToPage } = payload ?? {};
     const normalizedLimitToPage = limitToPage
-      ? {
-          page: Math.max(1, Math.floor(Number(limitToPage.page) || 1)),
-          pageSize: Math.min(
-            10000,
-            Math.max(1, Math.floor(Number(limitToPage.pageSize) || 50)),
-          ),
-        }
+      ? this.normalizePageRequest(limitToPage.page, limitToPage.pageSize)
       : undefined;
     const fileName = this.schema ? `${this.schema}_${this.table}` : this.table;
     const filterExpressions = coerceFilterExpressions(filters);
@@ -488,16 +492,15 @@ export class TablePanel {
     yield { columns: result.columns, rows: result.rows };
   }
 
-  private async _handleConfirmMutationPreview(
-    payload: { previewToken: string },
-    send: (type: string, payload: unknown) => Thenable<boolean>,
-  ): Promise<void> {
+  private async _handleConfirmMutationPreview(payload: {
+    previewToken: string;
+  }): Promise<void> {
     const result = await this.previewController.confirm(payload.previewToken);
     if (!result) {
       return;
     }
 
-    await send(result.type, result.payload);
+    await this.postMessage(result.type, result.payload);
   }
 
   private _handleCancelMutationPreview(payload: {
