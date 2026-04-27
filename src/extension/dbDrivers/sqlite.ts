@@ -7,6 +7,7 @@ import type {
   DatabaseInfo,
   FilterConditionResult,
   FilterOperator,
+  GeneratedKind,
   PersistedEditCheckOptions,
   PersistedEditCheckResult,
   QueryResult,
@@ -25,11 +26,15 @@ interface SQLiteTableXInfoRow {
   pk: number;
   hidden: number;
 }
+interface SQLiteGeneratedColumnDetail {
+  expression?: string;
+  generatedKind?: GeneratedKind;
+}
 interface SQLiteTableMetadata {
   rows: SQLiteTableXInfoRow[];
   foreignKeyColumns: Set<string>;
   autoIncrementColumns: Set<string>;
-  generatedColumns: Set<string>;
+  generatedColumns: Map<string, SQLiteGeneratedColumnDetail>;
 }
 const SQLITE_SELECT_STARTERS = new Set([
   "SELECT",
@@ -248,6 +253,135 @@ function skipSqlIdentifier(sql: string, start: number): number {
   const match = /^[A-Za-z_][A-Za-z0-9_]*/.exec(sql.slice(index));
   return match ? index + match[0].length : index;
 }
+function sqliteColumnDefinitionName(definition: string): string | null {
+  const trimmed = definition.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (/^(?:constraint|primary|unique|check|foreign)\b/i.test(trimmed)) {
+    return null;
+  }
+  const first = trimmed[0];
+  if (first === '"' || first === "`" || first === "[") {
+    const closer = first === "[" ? "]" : first;
+    let value = "";
+    let index = 1;
+    while (index < trimmed.length) {
+      const current = trimmed[index];
+      const next = trimmed[index + 1];
+      if (current === closer) {
+        if (closer !== "]" && next === closer) {
+          value += closer;
+          index += 2;
+          continue;
+        }
+        return value;
+      }
+      value += current;
+      index++;
+    }
+    return null;
+  }
+  const match = /^[A-Za-z_][A-Za-z0-9_]*/.exec(trimmed);
+  return match?.[0] ?? null;
+}
+function sqliteSplitCreateDefinitions(createSql: string): string[] {
+  const openParenIndex = createSql.indexOf("(");
+  if (openParenIndex < 0) {
+    return [];
+  }
+  const closeParenIndex = skipBalancedParens(createSql, openParenIndex) - 1;
+  if (closeParenIndex <= openParenIndex) {
+    return [];
+  }
+  const body = createSql.slice(openParenIndex + 1, closeParenIndex);
+  const definitions: string[] = [];
+  let depth = 0;
+  let start = 0;
+  let index = 0;
+  while (index < body.length) {
+    const current = body[index];
+    if (
+      current === '"' ||
+      current === "'" ||
+      current === "`" ||
+      current === "["
+    ) {
+      index = skipQuotedSql(body, index);
+      continue;
+    }
+    if (current === "(") {
+      depth++;
+      index++;
+      continue;
+    }
+    if (current === ")") {
+      depth = Math.max(0, depth - 1);
+      index++;
+      continue;
+    }
+    if (current === "," && depth === 0) {
+      const definition = body.slice(start, index).trim();
+      if (definition) {
+        definitions.push(definition);
+      }
+      start = index + 1;
+    }
+    index++;
+  }
+  const tail = body.slice(start).trim();
+  if (tail) {
+    definitions.push(tail);
+  }
+  return definitions;
+}
+function sqliteGeneratedKindFromHidden(
+  hidden: number,
+): GeneratedKind | undefined {
+  if (hidden === 2) {
+    return "virtual";
+  }
+  if (hidden === 3) {
+    return "stored";
+  }
+  return undefined;
+}
+function parseSqliteGeneratedColumns(
+  createSql: string,
+): Map<string, SQLiteGeneratedColumnDetail> {
+  const details = new Map<string, SQLiteGeneratedColumnDetail>();
+  for (const definition of sqliteSplitCreateDefinitions(createSql)) {
+    const columnName = sqliteColumnDefinitionName(definition);
+    if (!columnName) {
+      continue;
+    }
+    const asMatch = /\bAS\s*\(/i.exec(definition);
+    if (!asMatch) {
+      continue;
+    }
+    const openParenIndex = definition.indexOf("(", asMatch.index);
+    if (openParenIndex < 0) {
+      continue;
+    }
+    const closeParenIndex = skipBalancedParens(definition, openParenIndex) - 1;
+    if (closeParenIndex <= openParenIndex) {
+      continue;
+    }
+    const expression = definition
+      .slice(openParenIndex + 1, closeParenIndex)
+      .trim();
+    const suffix = definition.slice(closeParenIndex + 1);
+    details.set(columnName.toLowerCase(), {
+      expression: expression || undefined,
+      generatedKind: /\bSTORED\b/i.test(suffix)
+        ? "stored"
+        : /\bVIRTUAL\b/i.test(suffix)
+          ? "virtual"
+          : undefined,
+    });
+  }
+  return details;
+}
 function classifyWithStatement(sql: string, start: number): SqlStatementKind {
   let index = skipSqlTrivia(sql, start);
   const maybeRecursive = readSqlKeyword(sql, index);
@@ -428,12 +562,8 @@ export class SQLiteDriver extends BaseDBDriver {
     const fkRows = db.all(`PRAGMA foreign_key_list("${safeName}")`) as {
       from: string;
     }[];
-    const generatedColumns = new Set(
-      rows
-        .filter((row) => row.hidden === 2 || row.hidden === 3)
-        .map((row) => row.name),
-    );
     const autoIncrementColumns = new Set<string>();
+    let createSql = "";
     try {
       const master = db.all(
         `SELECT sql FROM sqlite_master WHERE type='table' AND name=?`,
@@ -441,7 +571,7 @@ export class SQLiteDriver extends BaseDBDriver {
       ) as {
         sql: string;
       }[];
-      const createSql = master[0]?.sql ?? "";
+      createSql = master[0]?.sql ?? "";
       const re =
         /[`"[]?(\w+)[`"\]]?\s+INTEGER\b[^,)]*\bPRIMARY\s+KEY\b[^,)]*\bAUTOINCREMENT\b/gi;
       let match: RegExpExecArray | null;
@@ -451,6 +581,19 @@ export class SQLiteDriver extends BaseDBDriver {
         match = re.exec(createSql);
       }
     } catch {}
+    const generatedColumns = parseSqliteGeneratedColumns(createSql);
+    for (const row of rows) {
+      const generatedKind = sqliteGeneratedKindFromHidden(row.hidden);
+      if (!generatedKind) {
+        continue;
+      }
+      const key = row.name.toLowerCase();
+      const detail = generatedColumns.get(key) ?? {};
+      generatedColumns.set(key, {
+        ...detail,
+        generatedKind: detail.generatedKind ?? generatedKind,
+      });
+    }
     return {
       rows,
       foreignKeyColumns: new Set(fkRows.map((row) => row.from)),
@@ -462,13 +605,29 @@ export class SQLiteDriver extends BaseDBDriver {
     row: SQLiteTableXInfoRow,
     metadata: SQLiteTableMetadata,
   ): ColumnMeta {
-    const isComputed = metadata.generatedColumns.has(row.name);
+    const generatedDetail = metadata.generatedColumns.get(
+      row.name.toLowerCase(),
+    );
+    const isComputed = generatedDetail !== undefined;
+    const defaultValue = !isComputed
+      ? (row.dflt_value ?? undefined)
+      : undefined;
     return {
       name: row.name,
       type: row.type || "TEXT",
       nullable: row.notnull === 0,
-      defaultValue: row.dflt_value ?? undefined,
+      defaultValue,
+      defaultKind:
+        defaultValue === undefined
+          ? undefined
+          : this.inferDefaultKind(defaultValue),
       isComputed,
+      computedExpression: generatedDetail?.expression,
+      generatedKind: generatedDetail?.generatedKind,
+      isPersisted:
+        generatedDetail?.generatedKind === undefined
+          ? undefined
+          : generatedDetail.generatedKind === "stored",
       isPrimaryKey: row.pk > 0,
       primaryKeyOrdinal: row.pk > 0 ? row.pk : undefined,
       isForeignKey: metadata.foreignKeyColumns.has(row.name),

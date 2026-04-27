@@ -393,18 +393,21 @@ export class PostgresDriver extends BaseDBDriver {
         (typeof rawDefault === "string" && rawDefault.startsWith("nextval("));
       const computedExpression =
         isComputed && typeof rawDefault === "string" ? rawDefault : undefined;
+      const defaultValue =
+        !isComputed && !isAutoIncrement ? (rawDefault ?? undefined) : undefined;
       return {
         name: r.column_name as string,
         type: r.data_type as string,
         nullable: isPgTrue(r.is_nullable),
-        defaultValue:
-          isComputed && computedExpression
-            ? `GENERATED ALWAYS AS (${computedExpression}) STORED`
-            : isAutoIncrement
-              ? undefined
-              : (rawDefault ?? undefined),
+        defaultValue,
+        defaultKind:
+          defaultValue === undefined
+            ? undefined
+            : this.inferDefaultKind(defaultValue),
         isComputed,
         computedExpression,
+        generatedKind: isComputed ? "stored" : undefined,
+        isPersisted: isComputed ? true : undefined,
         isPrimaryKey: isPgTrue(r.is_pk),
         primaryKeyOrdinal: toOptionalNumber(r.pk_ordinal),
         isForeignKey: isPgTrue(r.is_fk),

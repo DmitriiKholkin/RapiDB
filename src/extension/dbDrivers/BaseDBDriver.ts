@@ -1,4 +1,5 @@
 import type {
+  ColumnDefaultKind,
   ColumnMeta,
   ColumnTypeMeta,
   DatabaseInfo,
@@ -66,6 +67,91 @@ export function hexFromBuffer(val: Buffer): string {
 }
 function escapePreviewSqlString(value: string): string {
   return value.replace(/'/g, "''");
+}
+function stripOuterSqlParens(value: string): string {
+  let current = value.trim();
+  while (current.startsWith("(") && current.endsWith(")")) {
+    let depth = 0;
+    let inSingleQuote = false;
+    let inDoubleQuote = false;
+    let wrapsWholeValue = true;
+    for (let index = 0; index < current.length; index++) {
+      const char = current[index];
+      const next = current[index + 1];
+      if (inSingleQuote) {
+        if (char === "'" && next === "'") {
+          index++;
+          continue;
+        }
+        if (char === "'") {
+          inSingleQuote = false;
+        }
+        continue;
+      }
+      if (inDoubleQuote) {
+        if (char === '"' && next === '"') {
+          index++;
+          continue;
+        }
+        if (char === '"') {
+          inDoubleQuote = false;
+        }
+        continue;
+      }
+      if (char === "'") {
+        inSingleQuote = true;
+        continue;
+      }
+      if (char === '"') {
+        inDoubleQuote = true;
+        continue;
+      }
+      if (char === "(") {
+        depth++;
+        continue;
+      }
+      if (char === ")") {
+        depth--;
+        if (depth === 0 && index < current.length - 1) {
+          wrapsWholeValue = false;
+          break;
+        }
+      }
+    }
+    if (!wrapsWholeValue || depth !== 0) {
+      break;
+    }
+    current = current.slice(1, -1).trim();
+  }
+  return current;
+}
+function inferSqlDefaultKind(defaultValue: string): ColumnDefaultKind {
+  const trimmed = stripOuterSqlParens(defaultValue);
+  if (!trimmed) {
+    return "literal";
+  }
+  if (
+    /^N?'(?:[^']|'')*'$/i.test(trimmed) ||
+    /^"(?:[^"]|"")*"$/i.test(trimmed) ||
+    /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/.test(trimmed) ||
+    /^0x[0-9a-f]+$/i.test(trimmed) ||
+    /^[Xx]'[0-9a-f]+'$/.test(trimmed) ||
+    /^[Bb]'[01]+'$/.test(trimmed) ||
+    /^(?:true|false|null)$/i.test(trimmed)
+  ) {
+    return "literal";
+  }
+  if (
+    /^(?:current_(?:date|time|timestamp)|localtime|localtimestamp|now\s*\(|sys(?:date|timestamp)|current_user|session_user|uuid\s*\(|newid\s*\(|gen_random_uuid\s*\(|sys_guid\s*\(|nextval\s*\(|next value for\b)/i.test(
+      trimmed,
+    )
+  ) {
+    return "expression";
+  }
+  if (trimmed.includes("::") || /[A-Za-z_]/.test(trimmed)) {
+    return "expression";
+  }
+  return "literal";
 }
 function formatGenericPreviewSqlLiteral(value: unknown): string {
   if (value === null || value === undefined || value === NULL_SENTINEL) {
@@ -762,6 +848,9 @@ export abstract class BaseDBDriver implements IDBDriver {
     );
   }
   abstract isDatetimeWithTime(nativeType: string): boolean;
+  protected inferDefaultKind(defaultValue: string): ColumnDefaultKind {
+    return inferSqlDefaultKind(defaultValue);
+  }
   async describeColumns(
     database: string,
     schema: string,

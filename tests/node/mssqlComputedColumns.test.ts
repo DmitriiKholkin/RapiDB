@@ -42,7 +42,24 @@ describe("MSSQL computed columns", () => {
         is_identity: 0,
         is_computed: 0,
         COMPUTED_DEFINITION: null,
+        is_persisted: 0,
         COLUMN_DEFAULT: null,
+        IS_PK: 0,
+        PK_ORDINAL: null,
+        IS_FK: 0,
+      },
+      {
+        COLUMN_NAME: "created_at",
+        DATA_TYPE: "datetime2",
+        max_length: 8,
+        precision: 27,
+        scale: 7,
+        IS_NULLABLE: 0,
+        is_identity: 0,
+        is_computed: 0,
+        COMPUTED_DEFINITION: null,
+        is_persisted: 0,
+        COLUMN_DEFAULT: "((sysdatetime()))",
         IS_PK: 0,
         PK_ORDINAL: null,
         IS_FK: 0,
@@ -57,6 +74,7 @@ describe("MSSQL computed columns", () => {
         is_identity: 0,
         is_computed: 1,
         COMPUTED_DEFINITION: "([col_int]*(2))",
+        is_persisted: 1,
         COLUMN_DEFAULT: null,
         IS_PK: 0,
         PK_ORDINAL: null,
@@ -65,13 +83,18 @@ describe("MSSQL computed columns", () => {
     ]);
 
     const columns = await driver.describeTable("rapidb", "dbo", "t_calc");
+    const createdAt = columns.find((column) => column.name === "created_at");
     const computed = columns.find((column) => column.name === "col_computed");
 
+    expect(createdAt?.defaultValue).toBe("sysdatetime()");
+    expect(createdAt?.defaultKind).toBe("expression");
     expect(computed).toBeTruthy();
     expect(computed?.type).toBe("int");
     expect(computed?.isComputed).toBe(true);
     expect(computed?.computedExpression).toBe("([col_int]*(2))");
-    expect(computed?.defaultValue).toBe("AS (([col_int]*(2)))");
+    expect(computed?.defaultValue).toBeUndefined();
+    expect(computed?.generatedKind).toBe("stored");
+    expect(computed?.isPersisted).toBe(true);
   });
 
   it("renders computed expression in MSSQL create table DDL", async () => {

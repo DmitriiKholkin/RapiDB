@@ -1,19 +1,23 @@
 import type {
+  ColumnDefaultKind,
   ColumnMeta,
   ColumnTypeMeta,
   FilterOperator,
   ForeignKeyMeta,
+  GeneratedKind,
   IndexMeta,
   QueryColumnMeta,
   TypeCategory,
 } from "../../shared/tableTypes";
 
 export {
+  type ColumnDefaultKind,
   type ColumnMeta,
   type ColumnTypeMeta,
   type FilterExpression,
   type FilterOperator,
   type ForeignKeyMeta,
+  type GeneratedKind,
   type IndexMeta,
   NULL_SENTINEL,
   type QueryColumnMeta,

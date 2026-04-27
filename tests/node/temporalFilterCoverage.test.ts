@@ -216,6 +216,52 @@ describe("temporal filter operator coverage", () => {
     });
   });
 
+  it("matches MSSQL temporal equality against the millisecond-precision values shown in the table viewer", () => {
+    const driver = new MSSQLDriver({
+      ...baseConfig,
+      type: "mssql",
+    } as ConnectionConfig);
+    const timeColumn = column("event_time", "time(7)", "time");
+    const datetime2Column = column("event_at", "datetime2(7)", "datetime");
+    const datetimeOffsetColumn = column(
+      "event_offset",
+      "datetimeoffset(7)",
+      "datetime",
+    );
+
+    const timeCondition = driver.buildFilterCondition(
+      timeColumn,
+      "eq",
+      "14:30:00.123",
+      1,
+    );
+    const datetime2Condition = driver.buildFilterCondition(
+      datetime2Column,
+      "eq",
+      "2024-06-15 14:30:00.123",
+      1,
+    );
+    const datetimeOffsetCondition = driver.buildFilterCondition(
+      datetimeOffsetColumn,
+      "eq",
+      "2024-06-15 11:30:00.123 +00:00",
+      1,
+    );
+
+    expect(timeCondition).toEqual({
+      sql: "DATEDIFF(millisecond, CAST(? AS time), CAST([event_time] AS time)) BETWEEN 0 AND ?",
+      params: ["14:30:00.123", 0],
+    });
+    expect(datetime2Condition).toEqual({
+      sql: "DATEDIFF(millisecond, CAST(? AS datetime2(7)), [event_at]) BETWEEN 0 AND ?",
+      params: ["2024-06-15 14:30:00.123", 0],
+    });
+    expect(datetimeOffsetCondition).toEqual({
+      sql: "DATEDIFF(millisecond, CAST(? AS datetimeoffset(7)), [event_offset]) BETWEEN 0 AND ?",
+      params: ["2024-06-15 11:30:00.123+00:00", 0],
+    });
+  });
+
   it("builds Oracle temporal comparison and IN filters", () => {
     const driver = new OracleDriver({
       ...baseConfig,

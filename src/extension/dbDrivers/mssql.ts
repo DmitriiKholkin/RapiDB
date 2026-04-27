@@ -47,6 +47,7 @@ interface DescribeColumnRow {
   is_identity: boolean | number;
   is_computed: boolean | number;
   COMPUTED_DEFINITION: string | null;
+  is_persisted: boolean | number;
   COLUMN_DEFAULT: string | null;
   IS_PK: number;
   PK_ORDINAL: number | null;
@@ -79,6 +80,9 @@ interface DdlColumnRow {
   COLUMN_DEFAULT: string | null;
   IS_PK: number;
   PK_ORDINAL: number | null;
+}
+interface ObjectTypeRow {
+  TABLE_TYPE: string;
 }
 function canonicalizeMssqlBitPersistedEditValue(value: unknown): {
   canonical: string;
@@ -130,6 +134,35 @@ function approximateNumericFilterTolerance(rawValue: string): number {
   const fraction = /\.(\d+)/.exec(rawValue)?.[1].length ?? 0;
   const precision = Math.min(Math.max(fraction + 2, 6), 12);
   return 10 ** -precision;
+}
+function mssqlNumericFilterParam(
+  column: ColumnTypeMeta,
+  rawValue: string,
+): string | number | bigint {
+  if (column.category === "decimal") {
+    return rawValue;
+  }
+  if (
+    column.category === "integer" &&
+    baseTypeName(column.nativeType) === "bigint" &&
+    /^-?\d+$/.test(rawValue)
+  ) {
+    return BigInt(rawValue);
+  }
+  return Number(rawValue);
+}
+function mssqlDisplayedTemporalDiffUpperBound(rawValue: string): number | null {
+  const fractionMatch = /\.(\d+)(?: ?(?:Z|[+-]\d{2}(?::?\d{2})?))?$/i.exec(
+    rawValue.trim(),
+  );
+  if (!fractionMatch) {
+    return 999;
+  }
+  const digits = fractionMatch[1].length;
+  if (digits > 3) {
+    return null;
+  }
+  return 10 ** (3 - digits) - 1;
 }
 function mssqlFloatSignificantDigits(nativeType: string): number {
   const normalized = nativeType.toLowerCase().trim();
@@ -687,6 +720,7 @@ export class MSSQLDriver extends BaseDBDriver {
            c.is_identity,
            c.is_computed,
            cc.definition                                        AS COMPUTED_DEFINITION,
+           cc.is_persisted,
            OBJECT_DEFINITION(c.default_object_id)               AS COLUMN_DEFAULT,
            CASE WHEN pk.column_id IS NOT NULL THEN 1 ELSE 0 END AS IS_PK,
            pk.key_ordinal                                       AS PK_ORDINAL,
@@ -709,28 +743,41 @@ export class MSSQLDriver extends BaseDBDriver {
          ) fk ON fk.parent_object_id = c.object_id AND fk.parent_column_id = c.column_id
          WHERE s.name = '${esc(schema)}' AND o.name = '${esc(table)}'
          ORDER BY c.column_id`);
-    return res.recordset.map((row) => ({
-      name: row.COLUMN_NAME,
-      type: mssqlFullType(
-        row.DATA_TYPE,
-        row.max_length,
-        row.precision,
-        row.scale,
-      ),
-      nullable: isSetFlag(row.IS_NULLABLE),
-      defaultValue:
-        isSetFlag(row.is_computed) && row.COMPUTED_DEFINITION
-          ? `AS (${row.COMPUTED_DEFINITION})`
-          : row.COLUMN_DEFAULT != null
-            ? cleanMssqlDefault(row.COLUMN_DEFAULT)
-            : undefined,
-      isComputed: isSetFlag(row.is_computed),
-      computedExpression: row.COMPUTED_DEFINITION ?? undefined,
-      isPrimaryKey: row.IS_PK === 1,
-      primaryKeyOrdinal: row.PK_ORDINAL ?? undefined,
-      isForeignKey: row.IS_FK === 1,
-      isAutoIncrement: isSetFlag(row.is_identity),
-    }));
+    return res.recordset.map((row) => {
+      const isComputed = isSetFlag(row.is_computed);
+      const isPersisted = isComputed ? isSetFlag(row.is_persisted) : undefined;
+      const defaultValue =
+        !isComputed && row.COLUMN_DEFAULT != null
+          ? cleanMssqlDefault(row.COLUMN_DEFAULT)
+          : undefined;
+      return {
+        name: row.COLUMN_NAME,
+        type: mssqlFullType(
+          row.DATA_TYPE,
+          row.max_length,
+          row.precision,
+          row.scale,
+        ),
+        nullable: isSetFlag(row.IS_NULLABLE),
+        defaultValue,
+        defaultKind:
+          defaultValue === undefined
+            ? undefined
+            : this.inferDefaultKind(defaultValue),
+        isComputed,
+        computedExpression: row.COMPUTED_DEFINITION ?? undefined,
+        generatedKind: isComputed
+          ? isPersisted
+            ? "stored"
+            : "virtual"
+          : undefined,
+        isPersisted,
+        isPrimaryKey: row.IS_PK === 1,
+        primaryKeyOrdinal: row.PK_ORDINAL ?? undefined,
+        isForeignKey: row.IS_FK === 1,
+        isAutoIncrement: isSetFlag(row.is_identity),
+      };
+    });
   }
   async query(sql: string, params?: unknown[]): Promise<QueryResult> {
     const start = Date.now();
@@ -888,6 +935,22 @@ export class MSSQLDriver extends BaseDBDriver {
     table: string,
   ): Promise<string> {
     const esc = (s: string) => s.replace(/'/g, "''");
+    const objectTypeRes = await this.requirePool()
+      .request()
+      .query<ObjectTypeRow>(`SELECT TABLE_TYPE
+         FROM [${escapeMssqlId(database)}].INFORMATION_SCHEMA.TABLES
+         WHERE TABLE_SCHEMA = '${esc(schema)}' AND TABLE_NAME = '${esc(table)}'`);
+    if (objectTypeRes.recordset[0]?.TABLE_TYPE === "VIEW") {
+      const viewDef = await this.requirePool()
+        .request()
+        .query<RoutineDefinitionRow>(
+          `SELECT OBJECT_DEFINITION(OBJECT_ID('[${escapeMssqlId(database)}].[${escapeMssqlId(schema)}].[${escapeMssqlId(table)}]')) AS def`,
+        );
+      return (
+        viewDef.recordset[0]?.def ??
+        `-- DDL not available for "${schema}"."${table}"`
+      );
+    }
     const cols = await this.requirePool()
       .request()
       .query<DdlColumnRow>(`SELECT
@@ -1311,12 +1374,17 @@ export class MSSQLDriver extends BaseDBDriver {
     if (this.isNumericCategory(column.category) && Array.isArray(val)) {
       return {
         sql: `${col} BETWEEN ? AND ?`,
-        params: [Number(val[0]), Number(val[1])],
+        params: [
+          mssqlNumericFilterParam(column, val[0]),
+          mssqlNumericFilterParam(column, val[1]),
+        ],
       };
     }
     if (this.isNumericCategory(column.category) && typeof val === "string") {
       if (operator === "in") {
-        const parts = val.split(",").map((part) => Number(part.trim()));
+        const parts = val
+          .split(",")
+          .map((part) => mssqlNumericFilterParam(column, part.trim()));
         return {
           sql: `${col} IN (${parts.map(() => "?").join(", ")})`,
           params: parts,
@@ -1349,13 +1417,10 @@ export class MSSQLDriver extends BaseDBDriver {
           };
         }
         const sqlOp = this.sqlOperator(operator);
-        if (
-          baseTypeName(column.nativeType) === "bigint" &&
-          /^-?\d+$/.test(val)
-        ) {
-          return { sql: `${col} ${sqlOp} ?`, params: [BigInt(val)] };
-        }
-        return { sql: `${col} ${sqlOp} ?`, params: [Number(val)] };
+        return {
+          sql: `${col} ${sqlOp} ?`,
+          params: [mssqlNumericFilterParam(column, val)],
+        };
       }
     }
     if (column.category === "date") {
@@ -1398,6 +1463,17 @@ export class MSSQLDriver extends BaseDBDriver {
         };
       }
       if (["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)) {
+        if (operator === "eq" || operator === "neq") {
+          const diffUpperBound = mssqlDisplayedTemporalDiffUpperBound(v);
+          if (diffUpperBound !== null) {
+            const diffExpr = `DATEDIFF(millisecond, CAST(? AS time), CAST(${col} AS time))`;
+            const rangeExpr = `${diffExpr} BETWEEN 0 AND ?`;
+            return {
+              sql: operator === "neq" ? `NOT (${rangeExpr})` : rangeExpr,
+              params: [v, diffUpperBound],
+            };
+          }
+        }
         const sqlOp = operator === "neq" ? "<>" : this.sqlOperator(operator);
         return {
           sql: `CAST(${col} AS time) ${sqlOp} CAST(? AS time)`,
@@ -1430,6 +1506,22 @@ export class MSSQLDriver extends BaseDBDriver {
         };
       }
       if (["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)) {
+        if (operator === "eq" || operator === "neq") {
+          const normalizedValue = normalizeDatetimeLiteral(v);
+          const diffUpperBound = mssqlDisplayedTemporalDiffUpperBound(v);
+          if (diffUpperBound !== null) {
+            const castType =
+              baseTypeName(column.nativeType) === "datetimeoffset"
+                ? "datetimeoffset(7)"
+                : "datetime2(7)";
+            const diffExpr = `DATEDIFF(millisecond, CAST(? AS ${castType}), ${col})`;
+            const rangeExpr = `${diffExpr} BETWEEN 0 AND ?`;
+            return {
+              sql: operator === "neq" ? `NOT (${rangeExpr})` : rangeExpr,
+              params: [normalizedValue, diffUpperBound],
+            };
+          }
+        }
         const sqlOp = operator === "neq" ? "<>" : this.sqlOperator(operator);
         return {
           sql: `${col} ${sqlOp} ?`,

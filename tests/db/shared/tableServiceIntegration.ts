@@ -563,6 +563,107 @@ export function registerTableServiceIntegrationTests(
       ).rejects.toThrow(/Not connected/);
     });
 
+    it.runIf(engineId === "mssql")(
+      "filters exact numeric and temporal MSSQL values through table service",
+      async () => {
+        const probeTableName = `filter_probe_${Date.now()}_${Math.floor(Math.random() * 10_000)}`;
+        const qualifiedProbeTableName = harness.driver.qualifiedTableName(
+          harness.databaseName,
+          harness.schemaName,
+          probeTableName,
+        );
+
+        await harness.driver.query(
+          `CREATE TABLE ${qualifiedProbeTableName} ([id] INT NOT NULL PRIMARY KEY, [exact_amount] DECIMAL(16,6) NOT NULL, [event_time] TIME(7) NOT NULL, [event_at] DATETIME2(7) NOT NULL, [event_offset] DATETIMEOFFSET(7) NOT NULL)`,
+        );
+
+        try {
+          await harness.driver.query(
+            `INSERT INTO ${qualifiedProbeTableName} ([id], [exact_amount], [event_time], [event_at], [event_offset]) VALUES (1, CAST('9999999999.123455' AS DECIMAL(16,6)), CAST('14:30:00.1234567' AS TIME(7)), CAST('2024-06-15 14:30:00.1234567' AS DATETIME2(7)), CAST('2024-06-15 11:30:00.1234567 +00:00' AS DATETIMEOFFSET(7)))`,
+          );
+
+          const columns = await readService.getColumns(
+            connectionId,
+            harness.databaseName,
+            harness.schemaName,
+            probeTableName,
+          );
+          const exactAmountColumn = findColumnName(columns, "exact_amount");
+          const eventTimeColumn = findColumnName(columns, "event_time");
+          const eventAtColumn = findColumnName(columns, "event_at");
+          const eventOffsetColumn = findColumnName(columns, "event_offset");
+
+          const exactNumericPage = await readService.getPage(
+            connectionId,
+            harness.databaseName,
+            harness.schemaName,
+            probeTableName,
+            1,
+            10,
+            [
+              {
+                column: exactAmountColumn,
+                operator: "eq",
+                value: "9999999999.123455",
+              },
+            ],
+          );
+          const timePage = await readService.getPage(
+            connectionId,
+            harness.databaseName,
+            harness.schemaName,
+            probeTableName,
+            1,
+            10,
+            [
+              {
+                column: eventTimeColumn,
+                operator: "eq",
+                value: "14:30:00.123",
+              },
+            ],
+          );
+          const datetime2Page = await readService.getPage(
+            connectionId,
+            harness.databaseName,
+            harness.schemaName,
+            probeTableName,
+            1,
+            10,
+            [
+              {
+                column: eventAtColumn,
+                operator: "eq",
+                value: "2024-06-15 14:30:00.123",
+              },
+            ],
+          );
+          const datetimeOffsetPage = await readService.getPage(
+            connectionId,
+            harness.databaseName,
+            harness.schemaName,
+            probeTableName,
+            1,
+            10,
+            [
+              {
+                column: eventOffsetColumn,
+                operator: "eq",
+                value: "2024-06-15 11:30:00.123 +00:00",
+              },
+            ],
+          );
+
+          expect(exactNumericPage.rows).toHaveLength(1);
+          expect(timePage.rows).toHaveLength(1);
+          expect(datetime2Page.rows).toHaveLength(1);
+          expect(datetimeOffsetPage.rows).toHaveLength(1);
+        } finally {
+          await harness.driver.query(`DROP TABLE ${qualifiedProbeTableName}`);
+        }
+      },
+    );
+
     it.runIf(engineId === "postgres")(
       "executes generated preview SQL for array and bytea literals",
       async () => {

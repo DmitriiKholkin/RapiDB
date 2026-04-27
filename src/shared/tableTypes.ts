@@ -21,6 +21,10 @@ export type TypeCategory =
 
 export type ValueSemantics = "plain" | "boolean" | "bit";
 
+export type ColumnDefaultKind = "literal" | "expression";
+
+export type GeneratedKind = "virtual" | "stored";
+
 export interface QueryColumnMeta {
   category: TypeCategory | null;
 }
@@ -207,8 +211,12 @@ export interface ColumnMeta {
   type: string;
   nullable: boolean;
   defaultValue?: string;
+  defaultKind?: ColumnDefaultKind;
+  onUpdateExpression?: string;
   isComputed?: boolean;
   computedExpression?: string;
+  generatedKind?: GeneratedKind;
+  isPersisted?: boolean;
   isPrimaryKey: boolean;
   primaryKeyOrdinal?: number;
   isForeignKey: boolean;

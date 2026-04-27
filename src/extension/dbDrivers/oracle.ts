@@ -891,10 +891,11 @@ export class OracleDriver extends BaseDBDriver {
       return colRows.map((r) => {
         const genType = identityMap.get(r.COLUMN_NAME);
         const isComputed = r.VIRTUAL_COLUMN === "YES";
-        const computedExpression = isComputed
-          ? (r.DATA_DEFAULT?.trim() ?? undefined)
-          : undefined;
+        const rawDefault = r.DATA_DEFAULT?.trim() ?? undefined;
+        const computedExpression = isComputed ? rawDefault : undefined;
         const primaryKeyOrdinal = pkOrdinalByColumn.get(r.COLUMN_NAME);
+        const defaultValue =
+          !isComputed && genType === undefined ? rawDefault : undefined;
         return {
           name: r.COLUMN_NAME,
           type: oracleFullType(
@@ -904,14 +905,15 @@ export class OracleDriver extends BaseDBDriver {
             r.DATA_LENGTH,
           ),
           nullable: r.NULLABLE === "Y",
-          defaultValue:
-            isComputed && computedExpression
-              ? `AS (${computedExpression})`
-              : genType !== undefined
-                ? undefined
-                : (r.DATA_DEFAULT?.trim() ?? undefined),
+          defaultValue,
+          defaultKind:
+            defaultValue === undefined
+              ? undefined
+              : this.inferDefaultKind(defaultValue),
           isComputed,
           computedExpression,
+          generatedKind: isComputed ? "virtual" : undefined,
+          isPersisted: isComputed ? false : undefined,
           isPrimaryKey: primaryKeyOrdinal !== undefined,
           primaryKeyOrdinal,
           isForeignKey: fkCols.has(r.COLUMN_NAME),

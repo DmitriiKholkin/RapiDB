@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
@@ -12,6 +13,17 @@ const postgresDriver = new PostgresDriver({
   database: "postgres",
   username: "postgres",
   password: "postgres",
+} as ConnectionConfig);
+
+const mssqlDriver = new MSSQLDriver({
+  id: "numeric-filter-normalization-mssql",
+  name: "Numeric Filter Normalization MSSQL",
+  type: "mssql",
+  host: "127.0.0.1",
+  port: 1433,
+  database: "master",
+  username: "sa",
+  password: "secret",
 } as ConnectionConfig);
 
 const moneyColumn: ColumnTypeMeta = {
@@ -105,6 +117,20 @@ describe("numeric filter normalization", () => {
     expect(condition).toEqual({
       sql: '"col_money" = $1',
       params: ["99999999999.12345678"],
+    });
+  });
+
+  it("preserves precision for large decimal values in MSSQL filter SQL", () => {
+    const condition = mssqlDriver.buildFilterCondition(
+      moneyColumn,
+      "eq",
+      "9999999999.123455",
+      1,
+    );
+
+    expect(condition).toEqual({
+      sql: "[col_money] = ?",
+      params: ["9999999999.123455"],
     });
   });
 });

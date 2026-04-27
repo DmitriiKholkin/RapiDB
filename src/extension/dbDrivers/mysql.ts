@@ -175,9 +175,44 @@ const MYSQL_SPATIAL_TYPES = new Set([
   "geometrycollection",
   "geometry",
 ]);
+const MYSQL_WKT_VALUE_RE =
+  /^(?:srid=\d+;)?\s*(?:point|linestring|polygon|multipoint|multilinestring|multipolygon|geometrycollection)\s*\(/i;
 function mysqlTypeName(nativeType: string): string {
   const match = /^[a-z]+/i.exec(nativeType.trim());
   return match?.[0]?.toLowerCase() ?? nativeType.toLowerCase().trim();
+}
+function mysqlGeneratedKind(
+  extra: string | null | undefined,
+): ColumnMeta["generatedKind"] {
+  if (!extra) {
+    return undefined;
+  }
+  if (/\bstored generated\b/i.test(extra)) {
+    return "stored";
+  }
+  if (/\bvirtual generated\b/i.test(extra)) {
+    return "virtual";
+  }
+  return undefined;
+}
+function parseMysqlExtraMetadata(extra: string | null | undefined): {
+  defaultKind: ColumnMeta["defaultKind"];
+  onUpdateExpression: string | undefined;
+  generatedKind: ColumnMeta["generatedKind"];
+  isAutoIncrement: boolean;
+} {
+  const normalizedExtra = extra?.trim() ?? "";
+  const onUpdateExpression = /\bon update\s+(.+)$/i
+    .exec(normalizedExtra)?.[1]
+    ?.trim();
+  return {
+    defaultKind: /\bdefault_generated\b/i.test(normalizedExtra)
+      ? "expression"
+      : undefined,
+    onUpdateExpression,
+    generatedKind: mysqlGeneratedKind(normalizedExtra),
+    isAutoIncrement: /\bauto_increment\b/i.test(normalizedExtra),
+  };
 }
 function isValidMysqlDateParts(
   year: number,
@@ -478,6 +513,174 @@ function parseMysqlBitValue(
     parameter: bigintValue <= safeNumber ? Number(canonical) : canonical,
   };
 }
+function isMysqlSpatialPointLike(
+  value: unknown,
+): value is { x: unknown; y: unknown } {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    "x" in value &&
+    "y" in value
+  );
+}
+function formatMysqlSpatialCoordinate(value: unknown): string | null {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? String(value) : null;
+  }
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (/^[+-]?(?:\d+(?:\.\d*)?|\d*\.\d+)(?:[eE][+-]?\d+)?$/.test(trimmed)) {
+      return trimmed;
+    }
+  }
+  return null;
+}
+function mysqlPointCoordinatesText(value: unknown): string | null {
+  if (!isMysqlSpatialPointLike(value)) {
+    return null;
+  }
+  const x = formatMysqlSpatialCoordinate(value.x);
+  const y = formatMysqlSpatialCoordinate(value.y);
+  if (x === null || y === null) {
+    return null;
+  }
+  return `${x} ${y}`;
+}
+function mysqlLineStringCoordinatesText(value: unknown): string | null {
+  if (!Array.isArray(value) || value.length === 0) {
+    return null;
+  }
+  const points = value.map((entry) => mysqlPointCoordinatesText(entry));
+  if (points.some((entry) => entry === null)) {
+    return null;
+  }
+  return points.join(", ");
+}
+function mysqlPolygonCoordinatesText(value: unknown): string | null {
+  if (!Array.isArray(value) || value.length === 0) {
+    return null;
+  }
+  const rings = value.map((entry) => mysqlLineStringCoordinatesText(entry));
+  if (rings.some((entry) => entry === null)) {
+    return null;
+  }
+  return rings.map((ring) => `(${ring})`).join(", ");
+}
+function inferMysqlSpatialWkt(value: unknown): string | null {
+  const point = mysqlPointCoordinatesText(value);
+  if (point !== null) {
+    return `POINT(${point})`;
+  }
+  const lineString = mysqlLineStringCoordinatesText(value);
+  if (lineString !== null) {
+    return `LINESTRING(${lineString})`;
+  }
+  const polygon = mysqlPolygonCoordinatesText(value);
+  if (polygon !== null) {
+    return `POLYGON(${polygon})`;
+  }
+  if (Array.isArray(value) && value.length > 0) {
+    const polygons = value.map((entry) => mysqlPolygonCoordinatesText(entry));
+    if (polygons.every((entry) => entry !== null)) {
+      return `MULTIPOLYGON(${polygons.map((polygonText) => `(${polygonText})`).join(", ")})`;
+    }
+    const geometries = value.map((entry) => inferMysqlSpatialWkt(entry));
+    if (geometries.every((entry) => entry !== null)) {
+      return `GEOMETRYCOLLECTION(${geometries.join(", ")})`;
+    }
+  }
+  return null;
+}
+function buildMysqlSpatialWkt(
+  value: unknown,
+  nativeType: string,
+): string | null {
+  const baseType = mysqlTypeName(nativeType);
+  switch (baseType) {
+    case "point": {
+      const coordinates = mysqlPointCoordinatesText(value);
+      return coordinates === null ? null : `POINT(${coordinates})`;
+    }
+    case "linestring": {
+      const coordinates = mysqlLineStringCoordinatesText(value);
+      return coordinates === null ? null : `LINESTRING(${coordinates})`;
+    }
+    case "polygon": {
+      const coordinates = mysqlPolygonCoordinatesText(value);
+      return coordinates === null ? null : `POLYGON(${coordinates})`;
+    }
+    case "multipoint": {
+      const coordinates = mysqlLineStringCoordinatesText(value);
+      if (coordinates === null) {
+        return null;
+      }
+      return `MULTIPOINT(${coordinates
+        .split(", ")
+        .map((point) => `(${point})`)
+        .join(", ")})`;
+    }
+    case "multilinestring": {
+      if (!Array.isArray(value) || value.length === 0) {
+        return null;
+      }
+      const lineStrings = value.map((entry) =>
+        mysqlLineStringCoordinatesText(entry),
+      );
+      if (lineStrings.some((entry) => entry === null)) {
+        return null;
+      }
+      return `MULTILINESTRING(${lineStrings.map((lineString) => `(${lineString})`).join(", ")})`;
+    }
+    case "multipolygon": {
+      if (!Array.isArray(value) || value.length === 0) {
+        return null;
+      }
+      const polygons = value.map((entry) => mysqlPolygonCoordinatesText(entry));
+      if (polygons.some((entry) => entry === null)) {
+        return null;
+      }
+      return `MULTIPOLYGON(${polygons.map((polygonText) => `(${polygonText})`).join(", ")})`;
+    }
+    case "geometrycollection": {
+      if (!Array.isArray(value) || value.length === 0) {
+        return null;
+      }
+      const geometries = value.map((entry) => inferMysqlSpatialWkt(entry));
+      if (geometries.some((entry) => entry === null)) {
+        return null;
+      }
+      return `GEOMETRYCOLLECTION(${geometries.join(", ")})`;
+    }
+    case "geometry":
+      return inferMysqlSpatialWkt(value);
+    default:
+      return null;
+  }
+}
+function normalizeMysqlSpatialInput(
+  value: unknown,
+  nativeType: string,
+): string | null {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed === "") {
+      return null;
+    }
+    if (MYSQL_WKT_VALUE_RE.test(trimmed)) {
+      return trimmed;
+    }
+    try {
+      return buildMysqlSpatialWkt(JSON.parse(trimmed), nativeType);
+    } catch {
+      return null;
+    }
+  }
+  return buildMysqlSpatialWkt(value, nativeType);
+}
 function canonicalizeMysqlBitPersistedEditValue(
   value: unknown,
   nativeType?: string,
@@ -686,29 +889,41 @@ export class MySQLDriver extends BaseDBDriver {
         r.GENERATION_EXPRESSION.trim().length > 0
           ? r.GENERATION_EXPRESSION.trim()
           : undefined;
-      const extra = (r.EXTRA as string | null | undefined)?.toLowerCase() ?? "";
+      const extraMetadata = parseMysqlExtraMetadata(
+        r.EXTRA as string | null | undefined,
+      );
       const isComputed =
-        generationExpression !== undefined || extra.includes("generated");
+        generationExpression !== undefined ||
+        extraMetadata.generatedKind !== undefined;
+      const defaultValue =
+        !isComputed && r.COLUMN_DEFAULT != null
+          ? String(r.COLUMN_DEFAULT)
+          : undefined;
       return {
         name: r.COLUMN_NAME as string,
         type: r.COLUMN_TYPE as string,
         nullable: r.IS_NULLABLE === "YES",
-        defaultValue: isComputed
-          ? generationExpression
-            ? `AS (${generationExpression})`
-            : undefined
-          : r.COLUMN_DEFAULT == null
+        defaultValue,
+        defaultKind:
+          defaultValue === undefined
             ? undefined
-            : String(r.COLUMN_DEFAULT),
+            : (extraMetadata.defaultKind ??
+              this.inferDefaultKind(defaultValue)),
+        onUpdateExpression: extraMetadata.onUpdateExpression,
         isComputed,
         computedExpression: generationExpression,
+        generatedKind: extraMetadata.generatedKind,
+        isPersisted:
+          extraMetadata.generatedKind === undefined
+            ? undefined
+            : extraMetadata.generatedKind === "stored",
         isPrimaryKey: Number(r.IS_PRIMARY_KEY) === 1,
         primaryKeyOrdinal:
           r.PRIMARY_KEY_ORDINAL == null
             ? undefined
             : Number(r.PRIMARY_KEY_ORDINAL),
         isForeignKey: Number(r.IS_FOREIGN_KEY) === 1,
-        isAutoIncrement: extra.includes("auto_increment"),
+        isAutoIncrement: extraMetadata.isAutoIncrement,
       };
     });
   }
@@ -1081,6 +1296,21 @@ export class MySQLDriver extends BaseDBDriver {
   ): string {
     return `INSERT INTO ${qualifiedTableName} () VALUES ()`;
   }
+  override buildInsertValueExpr(
+    column: ColumnTypeMeta,
+    _paramIndex: number,
+  ): string {
+    if (this.hasBitSemantics(column)) {
+      return "CAST(? AS UNSIGNED)";
+    }
+    if (column.category === "spatial") {
+      return "ST_GeomFromText(?)";
+    }
+    return "?";
+  }
+  override buildSetExpr(column: ColumnTypeMeta, _paramIndex: number): string {
+    return `${this.quoteIdentifier(column.name)} = ${this.buildInsertValueExpr(column, _paramIndex)}`;
+  }
   protected override coerceBooleanTrue(): unknown {
     return 1;
   }
@@ -1105,6 +1335,15 @@ export class MySQLDriver extends BaseDBDriver {
         );
       }
       return parsed.parameter;
+    }
+    if (column.category === "spatial") {
+      const normalized = normalizeMysqlSpatialInput(value, column.nativeType);
+      if (normalized === null) {
+        throw new Error(
+          `[RapiDB] Column ${column.name} expects WKT text or a copied MySQL spatial JSON value.`,
+        );
+      }
+      return normalized;
     }
     if (column.category === "binary")
       return super.coerceInputValue(value, column);
