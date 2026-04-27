@@ -1,12 +1,13 @@
-// biome-ignore lint/style/useImportType: <explanation>
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   type QueryResult,
-  type SchemaTable,
+  type SchemaObject,
   useConnectionStore,
   useQueryStore,
   useSchemaStore,
 } from "../store";
+import { buildButtonStyle } from "../utils/buttonStyles";
+import { buildSelectControlStyle } from "../utils/controlStyles";
 import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
 import {
@@ -24,49 +25,14 @@ interface Props {
   isBookmarked?: boolean;
 }
 
-const btnStyle = (disabled = false): React.CSSProperties => ({
-  display: "inline-flex",
-  alignItems: "center",
-  gap: 4,
-  padding: "3px 10px",
-  fontSize: 12,
-  borderRadius: 2,
-  cursor: disabled ? "default" : "pointer",
-  fontFamily: "inherit",
-  border: "none",
-  background: "var(--vscode-button-background)",
-  color: "var(--vscode-button-foreground)",
-  opacity: disabled ? 0.5 : 1,
-  whiteSpace: "nowrap",
-});
+const btnStyle = (disabled = false): React.CSSProperties =>
+  buildButtonStyle("primary", { disabled, gap: 4, size: "sm" });
 
-const btnGhostStyle = (disabled = false): React.CSSProperties => ({
-  display: "inline-flex",
-  alignItems: "center",
-  gap: 4,
-  padding: "3px 10px",
-  fontSize: 12,
-  borderRadius: 2,
-  cursor: disabled ? "default" : "pointer",
-  fontFamily: "inherit",
-  background: "transparent",
-  color: "var(--vscode-foreground)",
-  border: "1px solid var(--vscode-button-border, var(--vscode-panel-border))",
-  opacity: disabled ? 0.5 : 1,
-  whiteSpace: "nowrap",
-});
+const btnGhostStyle = (disabled = false): React.CSSProperties =>
+  buildButtonStyle("ghost", { disabled, gap: 4, size: "sm" });
 
 const selectStyle: React.CSSProperties = {
-  padding: "3px 6px",
-  fontSize: 12,
-  borderRadius: 2,
-  background:
-    "var(--vscode-dropdown-background, var(--vscode-input-background))",
-  color: "var(--vscode-dropdown-foreground, var(--vscode-foreground))",
-  border: "1px solid var(--vscode-dropdown-border, var(--vscode-input-border))",
-  fontFamily: "inherit",
-  outline: "none",
-  cursor: "pointer",
+  ...buildSelectControlStyle("sm"),
   maxWidth: 220,
 };
 
@@ -74,7 +40,7 @@ const TOOLBAR_H = 36;
 const DIVIDER_H = 5;
 const MIN_EDITOR_H = 80;
 
-const DEFAULT_EDITOR_RATIO = 0.7;
+const DEFAULT_EDITOR_RATIO = 0.5;
 const DEFAULT_EDITOR_H = 400;
 
 export function QueryView({
@@ -126,7 +92,7 @@ export function QueryView({
     }
   }, []);
 
-  const schema: SchemaTable[] =
+  const schema: SchemaObject[] =
     schemaByConnection[activeConnectionId || connectionId] ?? [];
 
   const activeConn = connections.find(
@@ -137,7 +103,7 @@ export function QueryView({
   useEffect(() => {
     setActiveConnection(connectionId);
     postMessage("getConnections");
-  }, [connectionId]);
+  }, [connectionId, setActiveConnection]);
 
   useEffect(() => {
     const id = activeConnectionId || connectionId;
@@ -154,7 +120,7 @@ export function QueryView({
     }
     schemaFetchedRef.current.add(id);
     postMessage("getSchema", { connectionId: id });
-  }, [activeConnectionId]);
+  }, [activeConnectionId, connectionId]);
 
   useEffect(() => {
     const unsubResult = onMessage<QueryResult>("queryResult", (payload) => {
@@ -174,9 +140,9 @@ export function QueryView({
 
     const unsubSchema = onMessage<{
       connectionId: string;
-      tables: SchemaTable[];
+      schema: SchemaObject[];
     }>("schema", (payload) => {
-      setSchema(payload.connectionId, payload.tables);
+      setSchema(payload.connectionId, payload.schema);
     });
 
     const unsubBookmark = onMessage<{ ok: boolean; error?: string }>(
@@ -195,7 +161,7 @@ export function QueryView({
       unsubSchema();
       unsubBookmark();
     };
-  }, []);
+  }, [setConnections, setError, setResult, setSchema]);
 
   const handleConnectionChange = useCallback(
     (newId: string) => {
@@ -226,7 +192,7 @@ export function QueryView({
         editorRef.current?.placeCursor();
       });
     });
-  }, [connections]);
+  }, [connections, formatOnOpen, initialSql, sqlDialect]);
 
   const didPlaceCursor = useRef(false);
   useEffect(() => {
@@ -240,7 +206,7 @@ export function QueryView({
     requestAnimationFrame(() => {
       editorRef.current?.placeCursor();
     });
-  }, []);
+  }, [formatOnOpen]);
 
   const executeQuery = useCallback(() => {
     const sql = editorRef.current?.getSelectionOrValue().trim() ?? "";
@@ -332,6 +298,7 @@ export function QueryView({
       >
         {}
         <select
+          aria-label="Active connection"
           style={selectStyle}
           value={activeConnectionId || connectionId}
           onChange={(e) => handleConnectionChange(e.target.value)}
@@ -349,31 +316,30 @@ export function QueryView({
 
         {}
         <button
+          type="button"
           style={btnStyle(status === "running")}
           disabled={status === "running"}
           onClick={executeQuery}
           title="Run query (Ctrl+Enter / F5)"
         >
-          <>
-            <Icon name="run" size={13} style={{ marginRight: 4 }} />
-            Run
-          </>
+          <Icon name="run" size={13} style={{ marginRight: 4 }} />
+          Run
         </button>
 
         {}
         <button
+          type="button"
           style={btnGhostStyle(false)}
           onClick={() => editorRef.current?.setValue("")}
           title="Clear SQL"
         >
-          <>
-            <Icon name="close" size={13} style={{ marginRight: 4 }} />
-            Clear
-          </>
+          <Icon name="close" size={13} style={{ marginRight: 4 }} />
+          Clear
         </button>
 
         {}
         <button
+          type="button"
           style={btnGhostStyle(false)}
           onClick={() => {
             const err = editorRef.current?.format(sqlDialect) ?? null;
@@ -383,14 +349,13 @@ export function QueryView({
           }}
           title="Format SQL (Shift+Alt+F)"
         >
-          <>
-            <Icon name="symbol-color" size={13} style={{ marginRight: 4 }} />
-            Format
-          </>
+          <Icon name="symbol-color" size={13} style={{ marginRight: 4 }} />
+          Format
         </button>
 
         {}
         <button
+          type="button"
           style={{
             ...btnGhostStyle(bookmarked || bookmarking),
             ...(bookmarked
@@ -404,10 +369,8 @@ export function QueryView({
           onClick={handleBookmark}
           title={bookmarked ? "Already bookmarked" : "Add to Bookmarks"}
         >
-          <>
-            <Icon name="bookmark" size={13} style={{ marginRight: 4 }} />
-            Bookmark
-          </>
+          <Icon name="bookmark" size={13} style={{ marginRight: 4 }} />
+          Bookmark
         </button>
 
         <div style={{ flex: 1 }} />
@@ -429,9 +392,13 @@ export function QueryView({
       </div>
 
       {}
-      <div
+      <button
+        type="button"
+        aria-label="Resize editor and results panels"
         onMouseDown={onMouseDownDivider}
         style={{
+          display: "block",
+          width: "100%",
           height: 5,
           flexShrink: 0,
           cursor: "row-resize",
@@ -440,6 +407,8 @@ export function QueryView({
             : "var(--vscode-panel-border)",
           transition: isResizing ? "none" : "background 150ms",
           userSelect: "none",
+          border: "none",
+          padding: 0,
         }}
         title="Drag to resize"
       />

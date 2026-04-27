@@ -1,12 +1,18 @@
 import * as vscode from "vscode";
+import { parseSchemaPanelMessage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
+import {
+  logErrorWithContext,
+  normalizeUnknownError,
+} from "../utils/errorHandling";
+import { createWebviewShell } from "./webviewShell";
 
 export class SchemaPanel {
   private static readonly viewType = "rapidb.schemaPanel";
   private static panels = new Map<string, SchemaPanel>();
 
   private readonly panel: vscode.WebviewPanel;
-  private readonly cm: ConnectionManager;
+  private readonly connectionManager: ConnectionManager;
   private readonly context: vscode.ExtensionContext;
   private readonly connectionId: string;
   private readonly database: string;
@@ -16,7 +22,7 @@ export class SchemaPanel {
   private constructor(
     panel: vscode.WebviewPanel,
     context: vscode.ExtensionContext,
-    cm: ConnectionManager,
+    connectionManager: ConnectionManager,
     connectionId: string,
     database: string,
     schema: string,
@@ -24,16 +30,11 @@ export class SchemaPanel {
   ) {
     this.panel = panel;
     this.context = context;
-    this.cm = cm;
+    this.connectionManager = connectionManager;
     this.connectionId = connectionId;
     this.database = database;
     this.schema = schema;
     this.table = table;
-
-    this.panel.webview.options = {
-      enableScripts: true,
-      localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, "dist")],
-    };
     this.panel.webview.html = this.buildHtml(context);
 
     const key = SchemaPanel.key(connectionId, database, schema, table);
@@ -41,14 +42,11 @@ export class SchemaPanel {
     this.panel.webview.onDidReceiveMessage(async (msg) => {
       try {
         await this.handleMessage(msg);
-      } catch (err: any) {
-        console.error(
-          "[RapiDB] SchemaPanel unhandled error:",
-          err?.message ?? err,
-        );
+      } catch (err: unknown) {
+        const error = logErrorWithContext("SchemaPanel unhandled error", err);
         this.panel.webview.postMessage({
           type: "schemaError",
-          payload: { error: err?.message ?? String(err) },
+          payload: { error: error.message },
         });
       }
     });
@@ -69,7 +67,7 @@ export class SchemaPanel {
 
   static createOrShow(
     context: vscode.ExtensionContext,
-    cm: ConnectionManager,
+    connectionManager: ConnectionManager,
     connectionId: string,
     database: string,
     schema: string,
@@ -83,7 +81,8 @@ export class SchemaPanel {
     }
 
     const buildTitle = () => {
-      const connName = cm.getConnection(connectionId)?.name ?? connectionId;
+      const connName =
+        connectionManager.getConnection(connectionId)?.name ?? connectionId;
       const schemaPrefix = schema ? `${schema}.` : "";
       return `${schemaPrefix}${table} (schema) [${connName}]`;
     };
@@ -96,7 +95,7 @@ export class SchemaPanel {
     const instance = new SchemaPanel(
       panel,
       context,
-      cm,
+      connectionManager,
       connectionId,
       database,
       schema,
@@ -109,7 +108,7 @@ export class SchemaPanel {
         panel.title = buildTitle();
       }
     });
-    const disconnSub = cm.onDidDisconnect((id) => {
+    const disconnSub = connectionManager.onDidDisconnect((id) => {
       if (id === connectionId) {
         panel.dispose();
       }
@@ -120,23 +119,25 @@ export class SchemaPanel {
     });
   }
 
-  private async handleMessage(msg: {
-    type: string;
-    payload?: any;
-  }): Promise<void> {
+  private async handleMessage(msg: unknown): Promise<void> {
     const send = (type: string, payload: unknown) =>
       this.panel.webview.postMessage({ type, payload });
 
-    switch (msg.type) {
+    const parsed = parseSchemaPanelMessage(msg);
+    if (!parsed) {
+      return;
+    }
+
+    switch (parsed.type) {
       case "ready": {
-        const driver = this.cm.getDriver(this.connectionId);
+        const driver = this.connectionManager.getDriver(this.connectionId);
         if (!driver) {
           send("schemaError", { error: "Not connected" });
           return;
         }
         try {
           const [columns, indexes, foreignKeys] = await Promise.all([
-            driver.describeTable(this.database, this.schema, this.table),
+            driver.describeColumns(this.database, this.schema, this.table),
             driver
               .getIndexes(this.database, this.schema, this.table)
               .catch(() => []),
@@ -145,17 +146,22 @@ export class SchemaPanel {
               .catch(() => []),
           ]);
           send("schemaData", { columns, indexes, foreignKeys });
-        } catch (err: any) {
-          send("schemaError", { error: err?.message ?? String(err) });
+        } catch (err: unknown) {
+          const error = normalizeUnknownError(err);
+          send("schemaError", { error: error.message });
         }
         break;
       }
 
       case "openRelatedSchema": {
-        const { table, schema, database } = msg.payload ?? {};
+        const payload = parsed.payload;
+        if (!payload) {
+          return;
+        }
+        const { table, schema, database } = payload;
         SchemaPanel.createOrShow(
           this.context,
-          this.cm,
+          this.connectionManager,
           this.connectionId,
           database ?? this.database,
           schema ?? this.schema,
@@ -167,66 +173,25 @@ export class SchemaPanel {
   }
 
   private buildHtml(context: vscode.ExtensionContext): string {
-    const webview = this.panel.webview;
-
-    const webviewJs = webview.asWebviewUri(
-      vscode.Uri.joinPath(context.extensionUri, "dist", "webview.js"),
-    );
-    const webviewCss = webview.asWebviewUri(
-      vscode.Uri.joinPath(context.extensionUri, "dist", "webview.css"),
-    );
-
-    function escapeHtml(str: string): string {
-      return str
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
-    }
-
-    const nonce = crypto.randomUUID();
-
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy"
-    content="default-src 'none';
-             script-src 'nonce-${nonce}' ${webview.cspSource};
-             style-src ${webview.cspSource} 'unsafe-inline';
-             font-src ${webview.cspSource} data:;
-             img-src ${webview.cspSource} https: data:;" />
-  <title>Schema — ${escapeHtml(this.table)}</title>
-  <link rel="stylesheet" href="${webviewCss}" />
-  <style nonce="${nonce}">
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body { height: 100%; overflow: hidden; }
-    body {
-      background: var(--vscode-editor-background);
-      color: var(--vscode-foreground);
-      font-family: var(--vscode-font-family, system-ui, sans-serif);
-      font-size: var(--vscode-font-size, 13px);
-    }
-    #root { height: 100vh; overflow: auto; }
-    ::-webkit-scrollbar { width: 8px; height: 8px; }
-    ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 4px; }
-  </style>
-</head>
-<body>
-  <div id="root"></div>
-  <script nonce="${nonce}">
-    window.__HAPPYDB_INITIAL_STATE__ = {
-      view:         'schema',
-      connectionId: ${JSON.stringify(this.connectionId)},
-      database:     ${JSON.stringify(this.database)},
-      schema:       ${JSON.stringify(this.schema)},
-      table:        ${JSON.stringify(this.table)},
-    };
-  </script>
-  <script nonce="${nonce}" src="${webviewJs}"></script>
-</body>
-</html>`;
+    return createWebviewShell({
+      context,
+      webview: this.panel.webview,
+      title: `Schema - ${this.table}`,
+      initialState: {
+        view: "schema",
+        connectionId: this.connectionId,
+        database: this.database,
+        schema: this.schema,
+        table: this.table,
+      },
+      htmlStyles: "height: 100%; overflow: hidden;",
+      bodyStyles: "height: 100%; overflow: hidden;",
+      rootStyles: "height: 100vh; overflow: auto;",
+      extraStyles: `
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 4px; }
+      `,
+    });
   }
 }

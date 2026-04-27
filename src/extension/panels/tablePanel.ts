@@ -1,15 +1,33 @@
-import * as fs from "fs";
-import * as os from "os";
-import * as path from "path";
 import * as vscode from "vscode";
+import { coerceFilterExpressions } from "../../shared/tableTypes";
+import { parseTablePanelMessage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
+import type { FilterExpression } from "../dbDrivers/types";
 import {
-  applyChangesTransactional,
-  type Filter,
-  type RowUpdate,
+  prepareApplyChangesPlan,
   type SortConfig,
   TableDataService,
 } from "../tableDataService";
+import {
+  logErrorWithContext,
+  normalizeUnknownError,
+} from "../utils/errorHandling";
+import {
+  exportTableDataAsCsv,
+  exportTableDataAsJson,
+} from "../utils/exportService";
+import { TableMutationPreviewController } from "./tableMutationPreviewController";
+import { createWebviewShell } from "./webviewShell";
+
+const EXPORT_CHUNK_SIZE = 500;
+
+type ExportPayload = {
+  sort?: unknown;
+  filters?: unknown[];
+  limitToPage?: { page: number; pageSize: number };
+};
+const FILTER_ERROR_RE =
+  /^\[RapiDB Filter\]|invalid input syntax|invalid cidr|malformed array|not a valid (binary|hex|uuid)|syntax error in input|invalid value for type|invalid number|operator does not exist|conversion failed|arithmetic overflow|ORA-0(1841|1843|1858|1861|6502)|ORA-01722|incorrect (date|datetime|time)|Incorrect integer value|Truncated incorrect|data truncat/i;
 
 export class TablePanel {
   private static readonly viewType = "rapidb.tablePanel";
@@ -18,14 +36,15 @@ export class TablePanel {
 
   private readonly panel: vscode.WebviewPanel;
   private readonly svc: TableDataService;
-  private readonly cm: ConnectionManager;
+  private readonly connectionManager: ConnectionManager;
   private readonly connectionId: string;
   private readonly database: string;
   private readonly schema: string;
   private readonly table: string;
   private readonly isView: boolean;
+  private readonly previewController: TableMutationPreviewController;
 
-  private cachedColumns: import("../tableDataService").ColumnDef[] = [];
+  private cachedColumns: import("../dbDrivers/types").ColumnTypeMeta[] = [];
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -39,22 +58,27 @@ export class TablePanel {
   ) {
     this.panel = panel;
     this.svc = new TableDataService(connectionManager);
-    this.cm = connectionManager;
+    this.connectionManager = connectionManager;
     this.connectionId = connectionId;
     this.database = database;
     this.schema = schema;
     this.table = table;
     this.isView = isView;
-
-    this.panel.webview.options = {
-      enableScripts: true,
-      localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, "dist")],
-    };
+    this.previewController = new TableMutationPreviewController({
+      connectionId,
+      tableName: table,
+      connectionManager,
+      tableDataService: this.svc,
+      notifyWarning: (message) => {
+        void vscode.window.showWarningMessage(`[RapiDB] ${message}`);
+      },
+    });
 
     this.panel.webview.html = this.buildHtml(context);
 
     const key = TablePanel.panelKey(connectionId, database, schema, table);
     this.panel.onDidDispose(() => {
+      this.previewController.clear();
       TablePanel.panels.delete(key);
 
       this.svc.clearForConnection(connectionId);
@@ -63,13 +87,10 @@ export class TablePanel {
     this.panel.webview.onDidReceiveMessage(async (msg) => {
       try {
         await this.handleMessage(msg);
-      } catch (err: any) {
-        console.error(
-          "[RapiDB] TablePanel unhandled error:",
-          err?.message ?? err,
-        );
+      } catch (err: unknown) {
+        const error = logErrorWithContext("TablePanel unhandled error", err);
         vscode.window.showErrorMessage(
-          `[RapiDB] Unexpected error: ${err?.message ?? String(err)}`,
+          `[RapiDB] Unexpected error: ${error.message}`,
         );
       }
     });
@@ -151,418 +172,368 @@ export class TablePanel {
     });
   }
 
-  private async handleMessage(msg: {
-    type: string;
-    payload?: any;
-  }): Promise<void> {
+  private async handleMessage(msg: unknown): Promise<void> {
     const send = (type: string, payload: unknown) =>
       this.panel.webview.postMessage({ type, payload });
 
-    switch (msg.type) {
-      case "ready": {
-        try {
-          const cols = await this.svc.getColumns(
-            this.connectionId,
-            this.database,
-            this.schema,
-            this.table,
-          );
-          this.cachedColumns = cols;
-          const pkCols = cols.filter((c) => c.isPrimaryKey).map((c) => c.name);
-          send("tableInit", {
-            columns: cols,
-            primaryKeyColumns: pkCols,
-            isView: this.isView,
-          });
-        } catch (err: any) {
-          send("tableError", { error: err?.message ?? String(err) });
-        }
-        break;
-      }
+    const parsed = parseTablePanelMessage(msg);
+    if (!parsed) {
+      return;
+    }
 
-      case "fetchPage": {
-        const raw = msg.payload ?? {};
-        const fetchId: number | undefined = raw.fetchId;
-        const page = Math.max(1, Math.floor(Number(raw.page) || 1));
-        const pageSize = Math.min(
-          10000,
-          Math.max(1, Math.floor(Number(raw.pageSize) || 50)),
+    switch (parsed.type) {
+      case "ready":
+        await this._handleReady(send);
+        break;
+      case "fetchPage":
+        if (parsed.payload) await this._handleFetchPage(parsed.payload, send);
+        break;
+      case "applyChanges":
+        if (parsed.payload)
+          await this._handleApplyChanges(parsed.payload, send);
+        break;
+      case "insertRow":
+        if (parsed.payload) await this._handleInsertRow(parsed.payload, send);
+        break;
+      case "deleteRows":
+        if (parsed.payload) await this._handleDeleteRows(parsed.payload, send);
+        break;
+      case "exportCSV":
+        await this._handleExportCSV(parsed.payload);
+        break;
+      case "exportJSON":
+        await this._handleExportJSON(parsed.payload);
+        break;
+      case "confirmMutationPreview":
+        if (parsed.payload)
+          await this._handleConfirmMutationPreview(parsed.payload, send);
+        break;
+      case "cancelMutationPreview":
+        if (parsed.payload) this._handleCancelMutationPreview(parsed.payload);
+        break;
+    }
+  }
+
+  private async _handleReady(
+    send: (type: string, payload: unknown) => Thenable<boolean>,
+  ): Promise<void> {
+    try {
+      const cols = await this.svc.getColumns(
+        this.connectionId,
+        this.database,
+        this.schema,
+        this.table,
+      );
+      this.cachedColumns = cols;
+      const pkCols = cols.filter((c) => c.isPrimaryKey).map((c) => c.name);
+      send("tableInit", {
+        columns: cols,
+        primaryKeyColumns: pkCols,
+        isView: this.isView,
+      });
+    } catch (err: unknown) {
+      const error = normalizeUnknownError(err);
+      send("tableError", { error: error.message });
+    }
+  }
+
+  private async _handleFetchPage(
+    raw: NonNullable<
+      Extract<
+        import("../../shared/webviewContracts").TablePanelMessage,
+        { type: "fetchPage" }
+      >["payload"]
+    >,
+    send: (type: string, payload: unknown) => Thenable<boolean>,
+  ): Promise<void> {
+    const fetchId = raw.fetchId;
+    const page = Math.max(1, Math.floor(Number(raw.page) || 1));
+    const pageSize = Math.min(
+      10000,
+      Math.max(1, Math.floor(Number(raw.pageSize) || 50)),
+    );
+    const filters = coerceFilterExpressions(raw.filters);
+    const sort = raw.sort ?? null;
+    try {
+      const result = await this.svc.getPage(
+        this.connectionId,
+        this.database,
+        this.schema,
+        this.table,
+        page,
+        pageSize,
+        filters as FilterExpression[],
+        sort as SortConfig | null,
+      );
+      send("tableData", {
+        fetchId,
+        rows: result.rows,
+        totalCount: result.totalCount,
+      });
+    } catch (err: unknown) {
+      const error = normalizeUnknownError(err);
+      const errMsg = error.message;
+      const isFilterError =
+        filters.length > 0 &&
+        FILTER_ERROR_RE.test(errMsg) &&
+        !/arithmetic overflow/i.test(errMsg);
+      send("tableError", { fetchId, error: errMsg, isFilterError });
+    }
+  }
+
+  private async _handleApplyChanges(
+    payload: {
+      updates?: import("../../shared/webviewContracts").RowUpdateMessagePayload[];
+      insertValues?: Record<string, unknown>;
+    },
+    send: (type: string, payload: unknown) => Thenable<boolean>,
+  ): Promise<void> {
+    const { updates, insertValues } = payload;
+    try {
+      const prepared = prepareApplyChangesPlan(
+        this.connectionManager,
+        this.connectionId,
+        this.database,
+        this.schema,
+        this.table,
+        updates ?? [],
+        this.cachedColumns,
+      );
+
+      const insertPlan =
+        insertValues !== undefined
+          ? await this.svc.prepareInsertRow(
+              this.connectionId,
+              this.database,
+              this.schema,
+              this.table,
+              insertValues,
+            )
+          : null;
+
+      const mutationStatementCount =
+        (insertPlan ? 1 : 0) +
+        (prepared.executable ? prepared.plan.operations.length : 0);
+      if (mutationStatementCount > 1) {
+        const driver = this.connectionManager.getDriver(this.connectionId);
+        const risk = await driver?.getMutationAtomicityRisk?.(
+          this.database,
+          this.schema,
+          this.table,
         );
-        const filters = Array.isArray(raw.filters) ? raw.filters : [];
-        const sort = raw.sort ?? null;
-        try {
-          const result = await this.svc.getPage(
-            this.connectionId,
-            this.database,
-            this.schema,
-            this.table,
-            page,
-            pageSize,
-            filters as Filter[],
-            sort as SortConfig | null,
-          );
-          send("tableData", {
-            fetchId,
-            rows: result.rows,
-            totalCount: result.totalCount,
-          });
-        } catch (err: any) {
-          const errMsg = err?.message ?? String(err);
-          const isFilterError =
-            /invalid input syntax|invalid cidr|malformed array|not a valid (binary|hex|uuid)|syntax error in input|invalid value for type|conversion failed|arithmetic overflow|ORA-0(1841|1843|1858|1861|6502)|incorrect (date|datetime|time)|data truncat/i.test(
-              errMsg,
-            );
-          send("tableError", { fetchId, error: errMsg, isFilterError });
-        }
-        break;
-      }
 
-      case "applyChanges": {
-        const { updates } = msg.payload ?? {};
-        try {
-          const result = await applyChangesTransactional(
-            this.cm,
-            this.connectionId,
-            this.database,
-            this.schema,
-            this.table,
-            (updates ?? []) as RowUpdate[],
-            this.cachedColumns,
-          );
-          send("applyResult", result);
-        } catch (err: any) {
+        if (risk) {
           send("applyResult", {
             success: false,
-            error: err?.message ?? String(err),
+            error: risk,
           });
+          return;
         }
-        break;
       }
 
-      case "insertRow": {
-        const { values } = msg.payload ?? {};
-        try {
-          await this.svc.insertRow(
-            this.connectionId,
-            this.database,
-            this.schema,
-            this.table,
-            values,
+      if (!prepared.executable && !insertPlan) {
+        if (prepared.result.warning) {
+          void vscode.window.showWarningMessage(
+            `[RapiDB] ${prepared.result.warning}`,
           );
-          send("insertResult", { success: true });
-        } catch (err: any) {
-          send("insertResult", {
-            success: false,
-            error: err?.message ?? String(err),
-          });
         }
-        break;
+        send("applyResult", prepared.result);
+        return;
       }
 
-      case "deleteRows": {
-        const { primaryKeysList } = msg.payload ?? {};
-        try {
-          await this.svc.deleteRows(
-            this.connectionId,
-            this.database,
-            this.schema,
-            this.table,
-            primaryKeysList,
-          );
-          send("deleteResult", { success: true });
-        } catch (err: any) {
-          send("deleteResult", {
-            success: false,
-            error: err?.message ?? String(err),
-          });
-        }
-        break;
-      }
-
-      case "exportCSV": {
-        const saveUri = await vscode.window.showSaveDialog({
-          defaultUri: vscode.Uri.file(
-            path.join(os.homedir(), "Downloads", `${this.table}.csv`),
-          ),
-          filters: { "CSV files": ["csv"], "All files": ["*"] },
-        });
-        if (!saveUri) {
-          break;
-        }
-
-        try {
-          await vscode.window.withProgress(
-            {
-              location: vscode.ProgressLocation.Notification,
-              title: `RapiDB: Exporting ${this.table}…`,
-              cancellable: true,
-            },
-            async (_progress, token) => {
-              const abortCtrl = new AbortController();
-              const cancelSub = token.onCancellationRequested(() =>
-                abortCtrl.abort(),
-              );
-              const writeStream = fs.createWriteStream(saveUri.fsPath, {
-                encoding: "utf8",
-              });
-              let headerWritten = false;
-              const { sort: csvSort = null, filters: csvFilters = [] } =
-                msg.payload ?? {};
-              try {
-                for await (const chunk of this.svc.exportAll(
-                  this.connectionId,
-                  this.database,
-                  this.schema,
-                  this.table,
-                  500,
-                  csvSort as SortConfig | null,
-                  (csvFilters as { column: string; value: string }[]).map(
-                    (f) => ({ column: f.column, value: f.value }),
-                  ),
-                  abortCtrl.signal,
-                )) {
-                  if (!headerWritten) {
-                    writeStream.write(
-                      chunk.columns.map((c) => csvCell(c.name)).join(",") +
-                        "\n",
-                    );
-                    headerWritten = true;
-                  }
-                  for (const row of chunk.rows) {
-                    writeStream.write(
-                      chunk.columns.map((c) => csvCell(row[c.name])).join(",") +
-                        "\n",
-                    );
-                  }
-                }
-                await new Promise<void>((res, rej) => {
-                  writeStream.end((err?: Error | null) =>
-                    err ? rej(err) : res(),
-                  );
-                });
-              } catch (err) {
-                writeStream.destroy();
-                throw err;
-              } finally {
-                cancelSub.dispose();
-              }
-            },
-          );
-
-          vscode.window.showInformationMessage(
-            `[RapiDB] Exported ${this.table} → ${path.basename(saveUri.fsPath)}`,
-          );
-        } catch (err: any) {
-          if (err?.name !== "AbortError") {
-            vscode.window.showErrorMessage(
-              `[RapiDB] CSV export failed: ${err?.message ?? String(err)}`,
-            );
-          }
-        }
-        break;
-      }
-
-      case "exportJSON": {
-        const { sort = null, filters: jsonFilters = [] } = msg.payload ?? {};
-        const saveUri = await vscode.window.showSaveDialog({
-          defaultUri: vscode.Uri.file(
-            path.join(os.homedir(), "Downloads", `${this.table}.json`),
-          ),
-          filters: { "JSON files": ["json"], "All files": ["*"] },
-        });
-        if (!saveUri) {
-          break;
-        }
-
-        try {
-          await vscode.window.withProgress(
-            {
-              location: vscode.ProgressLocation.Notification,
-              title: `RapiDB: Exporting ${this.table} as JSON…`,
-              cancellable: true,
-            },
-            async (_progress, token) => {
-              const abortCtrl = new AbortController();
-              const cancelSub = token.onCancellationRequested(() =>
-                abortCtrl.abort(),
-              );
-              const writeStream = fs.createWriteStream(saveUri.fsPath, {
-                encoding: "utf8",
-              });
-              writeStream.write("[\n");
-              let first = true;
-              try {
-                for await (const chunk of this.svc.exportAll(
-                  this.connectionId,
-                  this.database,
-                  this.schema,
-                  this.table,
-                  500,
-                  sort as SortConfig | null,
-                  (jsonFilters as { column: string; value: string }[]).map(
-                    (f) => ({ column: f.column, value: f.value }),
-                  ),
-                  abortCtrl.signal,
-                )) {
-                  for (const row of chunk.rows) {
-                    const serialisable = Object.fromEntries(
-                      Object.entries(row).map(([k, v]) => [
-                        k,
-                        v instanceof Date
-                          ? isNaN(v.getTime())
-                            ? null
-                            : formatCellValue(v)
-                          : (v ?? null),
-                      ]),
-                    );
-                    writeStream.write(
-                      (first ? "" : ",\n") + JSON.stringify(serialisable),
-                    );
-                    first = false;
-                  }
-                }
-                writeStream.write("\n]\n");
-                await new Promise<void>((res, rej) => {
-                  writeStream.end((err?: Error | null) =>
-                    err ? rej(err) : res(),
-                  );
-                });
-              } catch (err) {
-                writeStream.destroy();
-                throw err;
-              } finally {
-                cancelSub.dispose();
-              }
-            },
-          );
-
-          vscode.window.showInformationMessage(
-            `[RapiDB] Exported ${this.table} → ${path.basename(saveUri.fsPath)}`,
-          );
-        } catch (err: any) {
-          if (err?.name !== "AbortError") {
-            vscode.window.showErrorMessage(
-              `[RapiDB] JSON export failed: ${err?.message ?? String(err)}`,
-            );
-          }
-        }
-        break;
-      }
-
-      case "confirmDelete": {
-        const { count } = msg.payload ?? {};
-        const answer = await vscode.window.showWarningMessage(
-          `Delete ${count} row${count !== 1 ? "s" : ""} from "${this.table}"? This cannot be undone.`,
-          { modal: true },
-          "Delete",
-        );
-        send("deleteConfirmed", { confirmed: answer === "Delete" });
-        break;
-      }
+      await send(
+        "tableMutationPreview",
+        this.previewController.createApplyChangesPreview({
+          apply: prepared.executable ? prepared.plan : null,
+          applyResultWhenEmpty: prepared.executable ? null : prepared.result,
+          insert: insertPlan,
+        }),
+      );
+    } catch (err: unknown) {
+      const error = normalizeUnknownError(err);
+      send("applyResult", { success: false, error: error.message });
     }
+  }
+
+  private async _handleInsertRow(
+    payload: { values?: Record<string, unknown> },
+    send: (type: string, payload: unknown) => Thenable<boolean>,
+  ): Promise<void> {
+    const { values = {} } = payload;
+    try {
+      const plan = await this.svc.prepareInsertRow(
+        this.connectionId,
+        this.database,
+        this.schema,
+        this.table,
+        values,
+      );
+      await send(
+        "tableMutationPreview",
+        this.previewController.createInsertPreview(plan),
+      );
+    } catch (err: unknown) {
+      const error = normalizeUnknownError(err);
+      send("insertResult", { success: false, error: error.message });
+    }
+  }
+
+  private async _handleDeleteRows(
+    payload: { primaryKeysList?: Array<Record<string, unknown>> },
+    send: (type: string, payload: unknown) => Thenable<boolean>,
+  ): Promise<void> {
+    const { primaryKeysList = [] } = payload;
+    try {
+      const plan = await this.svc.prepareDeleteRowsPlan(
+        this.connectionId,
+        this.database,
+        this.schema,
+        this.table,
+        primaryKeysList,
+      );
+
+      if (!plan) {
+        send("deleteResult", { success: true });
+        return;
+      }
+
+      await send(
+        "tableMutationPreview",
+        this.previewController.createDeleteRowsPreview(plan),
+      );
+    } catch (err: unknown) {
+      const error = normalizeUnknownError(err);
+      send("deleteResult", { success: false, error: error.message });
+    }
+  }
+
+  private async _handleExportCSV(
+    payload: ExportPayload | undefined,
+  ): Promise<void> {
+    await this._handleExport("csv", payload);
+  }
+
+  private async _handleExportJSON(
+    payload: ExportPayload | undefined,
+  ): Promise<void> {
+    await this._handleExport("json", payload);
+  }
+
+  private async _handleExport(
+    format: "csv" | "json",
+    payload: ExportPayload | undefined,
+  ): Promise<void> {
+    const { sort = null, filters = [], limitToPage } = payload ?? {};
+    const normalizedLimitToPage = limitToPage
+      ? {
+          page: Math.max(1, Math.floor(Number(limitToPage.page) || 1)),
+          pageSize: Math.min(
+            10000,
+            Math.max(1, Math.floor(Number(limitToPage.pageSize) || 50)),
+          ),
+        }
+      : undefined;
+    const fileName = this.schema ? `${this.schema}_${this.table}` : this.table;
+    const filterExpressions = coerceFilterExpressions(filters);
+    const loadChunks = (signal: AbortSignal) =>
+      normalizedLimitToPage
+        ? this._pageAsChunks(
+            normalizedLimitToPage.page,
+            normalizedLimitToPage.pageSize,
+            sort as SortConfig | null,
+            filterExpressions,
+            signal,
+          )
+        : this.svc.exportAll(
+            this.connectionId,
+            this.database,
+            this.schema,
+            this.table,
+            EXPORT_CHUNK_SIZE,
+            sort as SortConfig | null,
+            filterExpressions,
+            signal,
+          );
+
+    if (format === "csv") {
+      await exportTableDataAsCsv({ fileName, loadChunks });
+      return;
+    }
+
+    await exportTableDataAsJson({ fileName, loadChunks });
+  }
+
+  private async *_pageAsChunks(
+    page: number,
+    pageSize: number,
+    sort: SortConfig | null,
+    filters: FilterExpression[],
+    signal: AbortSignal,
+  ): AsyncGenerator<{
+    columns: { name: string }[];
+    rows: Record<string, unknown>[];
+  }> {
+    if (signal.aborted) return;
+    const result = await this.svc.getPage(
+      this.connectionId,
+      this.database,
+      this.schema,
+      this.table,
+      page,
+      pageSize,
+      filters,
+      sort,
+      true,
+    );
+    yield { columns: result.columns, rows: result.rows };
+  }
+
+  private async _handleConfirmMutationPreview(
+    payload: { previewToken: string },
+    send: (type: string, payload: unknown) => Thenable<boolean>,
+  ): Promise<void> {
+    const result = await this.previewController.confirm(payload.previewToken);
+    if (!result) {
+      return;
+    }
+
+    await send(result.type, result.payload);
+  }
+
+  private _handleCancelMutationPreview(payload: {
+    previewToken: string;
+  }): void {
+    this.previewController.cancel(payload.previewToken);
   }
 
   private buildHtml(context: vscode.ExtensionContext): string {
-    const webview = this.panel.webview;
+    return createWebviewShell({
+      context,
+      webview: this.panel.webview,
+      title: `${this.isView ? "View" : "Table"} - ${this.table}`,
+      initialState: {
+        view: "table",
+        connectionId: this.connectionId,
+        database: this.database,
+        schema: this.schema,
+        table: this.table,
+        isView: this.isView,
+        defaultPageSize: this.connectionManager.getDefaultPageSize(),
+      },
+      htmlStyles: "height: 100%; overflow: hidden;",
+      bodyStyles: "height: 100%; overflow: hidden;",
+      rootStyles: "height: 100vh;",
+      extraStyles: `
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--vscode-scrollbarSlider-hoverBackground); }
 
-    const webviewJs = webview.asWebviewUri(
-      vscode.Uri.joinPath(context.extensionUri, "dist", "webview.js"),
-    );
-    const webviewCss = webview.asWebviewUri(
-      vscode.Uri.joinPath(context.extensionUri, "dist", "webview.css"),
-    );
-
-    function escapeHtml(str: string): string {
-      return str
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
-    }
-
-    const nonce = crypto.randomUUID();
-
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy"
-    content="default-src 'none';
-             script-src 'nonce-${nonce}' ${webview.cspSource};
-             style-src ${webview.cspSource} 'unsafe-inline';
-             font-src ${webview.cspSource} data:;
-             img-src ${webview.cspSource} https: data:;" />
-  <title>${this.isView ? "View" : "Table"} — ${escapeHtml(this.table)}</title>
-  <link rel="stylesheet" href="${webviewCss}" />
-  <style nonce="${nonce}">
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body { height: 100%; overflow: hidden; }
-    body {
-      background: var(--vscode-editor-background);
-      color: var(--vscode-foreground);
-      font-family: var(--vscode-font-family, system-ui, sans-serif);
-      font-size: var(--vscode-font-size, 13px);
-    }
-    #root { height: 100vh; }
-    ::-webkit-scrollbar { width: 8px; height: 8px; }
-    ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 4px; }
-    ::-webkit-scrollbar-thumb:hover { background: var(--vscode-scrollbarSlider-hoverBackground); }
-    
-    .pk-key-icon {
-      display: inline-flex; align-items: center; justify-content: center;
-      vertical-align: middle;
-    }
-  </style>
-</head>
-<body>
-  <div id="root"></div>
-  <script nonce="${nonce}">
-    window.__HAPPYDB_INITIAL_STATE__ = {
-      view:            'table',
-      connectionId:    ${JSON.stringify(this.connectionId)},
-      database:        ${JSON.stringify(this.database)},
-      schema:          ${JSON.stringify(this.schema)},
-      table:           ${JSON.stringify(this.table)},
-      isView:          ${JSON.stringify(this.isView)},
-      defaultPageSize: ${JSON.stringify(this.cm.getDefaultPageSize())},
-    };
-  </script>
-  <script nonce="${nonce}" src="${webviewJs}"></script>
-</body>
-</html>`;
+        .pk-key-icon {
+          display: inline-flex; align-items: center; justify-content: center;
+          vertical-align: middle;
+        }
+      `,
+    });
   }
-}
-
-function formatCellValue(value: unknown): string {
-  if (value == null) {
-    return "";
-  }
-
-  if (value instanceof Date) {
-    if (isNaN(value.getTime())) {
-      return "";
-    }
-
-    const pad = (n: number) => String(n).padStart(2, "0");
-    return (
-      `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())} ` +
-      `${pad(value.getUTCHours())}:${pad(value.getUTCMinutes())}:${pad(value.getUTCSeconds())}`
-    );
-  }
-  return String(value);
-}
-
-function csvCell(value: unknown): string {
-  const s = formatCellValue(value);
-  if (s === "") {
-    return "";
-  }
-  return s.includes(",") ||
-    s.includes('"') ||
-    s.includes("\n") ||
-    s.includes("\r")
-    ? `"${s.replace(/"/g, '""')}"`
-    : s;
 }

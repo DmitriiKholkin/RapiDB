@@ -1,109 +1,53 @@
-// biome-ignore lint/style/useImportType: <explanation>
-import React, { useCallback, useEffect, useState } from "react";
+import React, {
+  type CSSProperties,
+  type InputHTMLAttributes,
+  type ReactElement,
+  type ReactNode,
+  type SelectHTMLAttributes,
+  useCallback,
+  useEffect,
+  useState,
+} from "react";
+import {
+  CONNECTION_TYPE_LABELS,
+  CONNECTION_TYPES,
+  type ConnectionType,
+  DEFAULT_PORT_BY_CONNECTION_TYPE,
+} from "../../shared/connectionTypes";
+import type {
+  ConnectionFormExistingState,
+  ConnectionFormSubmission,
+} from "../../shared/webviewContracts";
+import { buildButtonStyle } from "../utils/buttonStyles";
+import {
+  buildSelectControlStyle,
+  buildTextInputStyle,
+} from "../utils/controlStyles";
 import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
 
-type ConnType = "mysql" | "pg" | "sqlite" | "mssql" | "oracle";
-
-interface ConnectionConfig {
-  id: string;
-  name: string;
-  type: ConnType;
-  host?: string;
-  port?: number;
-  database?: string;
-  username?: string;
-  password?: string;
-  filePath?: string;
-  ssl?: boolean;
-  rejectUnauthorized?: boolean;
-  folder?: string;
-  serviceName?: string;
-  thickMode?: boolean;
-  clientPath?: string;
-  useSecretStorage?: boolean;
-}
-
 interface Props {
-  existing?: ConnectionConfig | null;
+  existing?: ConnectionFormExistingState | null;
 }
-
-const DEFAULT_PORTS: Record<ConnType, number> = {
-  pg: 5432,
-  mysql: 3306,
-  mssql: 1433,
-  sqlite: 0,
-  oracle: 1521,
-};
-const TYPE_LABELS: Record<ConnType, string> = {
-  pg: "PostgreSQL",
-  mysql: "MySQL / MariaDB",
-  sqlite: "SQLite",
-  mssql: "SQL Server (MSSQL)",
-  oracle: "Oracle",
-};
 
 const s = {
-  input: {
-    width: "100%",
-    padding: "5px 8px",
-    fontSize: "13px",
-    background: "var(--vscode-input-background)",
-    color: "var(--vscode-input-foreground)",
-    border: "1px solid var(--vscode-input-border, var(--vscode-widget-border))",
-    borderRadius: 2,
-    outline: "none",
-    fontFamily: "inherit",
-  } as React.CSSProperties,
+  input: buildTextInputStyle("md") as CSSProperties,
   label: {
     display: "block",
     fontSize: "11px",
     fontWeight: 500,
     marginBottom: 4,
     opacity: 0.8,
-  } as React.CSSProperties,
-  btnPrimary: {
-    padding: "5px 14px",
-    fontSize: "13px",
-    background: "var(--vscode-button-background)",
-    color: "var(--vscode-button-foreground)",
-    border: "none",
-    borderRadius: 2,
-    cursor: "pointer",
-    fontFamily: "inherit",
-  } as React.CSSProperties,
-  btnSecondary: {
-    padding: "5px 14px",
-    fontSize: "13px",
-    background: "var(--vscode-button-secondaryBackground, transparent)",
-    color: "var(--vscode-button-secondaryForeground, var(--vscode-foreground))",
-    border:
-      "1px solid var(--vscode-button-border, var(--vscode-widget-border))",
-    borderRadius: 2,
-    cursor: "pointer",
-    fontFamily: "inherit",
-  } as React.CSSProperties,
-  btnGhost: {
-    padding: "5px 14px",
-    fontSize: "13px",
-    background: "transparent",
-    color: "var(--vscode-foreground)",
-    border: "none",
-    borderRadius: 2,
-    cursor: "pointer",
-    opacity: 0.7,
-    fontFamily: "inherit",
-  } as React.CSSProperties,
+  } as CSSProperties,
 };
 
-function FocusInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
+function FocusInput(props: InputHTMLAttributes<HTMLInputElement>) {
   const [focused, setFocused] = useState(false);
   return (
     <input
       {...props}
       style={{
-        ...s.input,
-        ...(focused ? { borderColor: "var(--vscode-focusBorder)" } : {}),
+        ...buildTextInputStyle("md", focused),
         ...(props.style ?? {}),
       }}
       onFocus={(e) => {
@@ -118,14 +62,13 @@ function FocusInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
   );
 }
 
-function FocusSelect(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
+function FocusSelect(props: SelectHTMLAttributes<HTMLSelectElement>) {
   const [focused, setFocused] = useState(false);
   return (
     <select
       {...props}
       style={{
-        ...s.input,
-        ...(focused ? { borderColor: "var(--vscode-focusBorder)" } : {}),
+        ...buildSelectControlStyle("md", focused),
         ...(props.style ?? {}),
       }}
       onFocus={(e) => {
@@ -149,11 +92,11 @@ function Field({
   label: string;
   hint?: string;
   error?: string;
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   return (
     <div style={{ marginBottom: 12 }}>
-      <label style={s.label}>{label}</label>
+      <div style={s.label}>{label}</div>
       {children}
       {error && (
         <div
@@ -247,18 +190,21 @@ function Toggle({
   );
 }
 
-export function ConnectionFormView({ existing }: Props): React.ReactElement {
+export function ConnectionFormView({ existing }: Props): ReactElement {
   const isEdit = !!existing;
+  const hasStoredSecret = existing?.hasStoredSecret ?? false;
 
   const [name, setName] = useState(existing?.name ?? "");
-  const [type, setType] = useState<ConnType>(existing?.type ?? "pg");
+  const [type, setType] = useState<ConnectionType>(existing?.type ?? "pg");
   const [host, setHost] = useState(existing?.host ?? "localhost");
   const [port, setPort] = useState(
-    String(existing?.port ?? DEFAULT_PORTS[existing?.type ?? "pg"]),
+    String(
+      existing?.port ?? DEFAULT_PORT_BY_CONNECTION_TYPE[existing?.type ?? "pg"],
+    ),
   );
   const [database, setDatabase] = useState(existing?.database ?? "");
-  const [user, setUser] = useState(existing?.username ?? "");
-  const [password, setPassword] = useState(existing?.password ?? "");
+  const [username, setUsername] = useState(existing?.username ?? "");
+  const [password, setPassword] = useState("");
   const [filePath, setFilePath] = useState(existing?.filePath ?? "");
   const [folder, setFolder] = useState(existing?.folder ?? "");
 
@@ -273,11 +219,11 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
   );
 
   const [sslEnabled, setSslEnabled] = useState(existing?.ssl ?? false);
-  const [rejectUnauth, setRejectUnauth] = useState(
+  const [rejectUnauthorized, setRejectUnauthorized] = useState(
     existing?.rejectUnauthorized ?? true,
   );
   const [useSecretStorage, setUseSecretStorage] = useState(
-    existing?.useSecretStorage ?? false,
+    existing?.useSecretStorage ?? true,
   );
 
   const [testState, setTestState] = useState<
@@ -300,32 +246,46 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
     [],
   );
 
-  const handleTypeChange = (t: ConnType) => {
-    setType(t);
-    setPort(String(DEFAULT_PORTS[t] || ""));
+  useEffect(
+    () =>
+      onMessage<{ success: boolean; error?: string }>("saveResult", (p) => {
+        setSaving(false);
+        if (p.success) {
+          return;
+        }
+        setTestState("fail");
+        setTestError(p.error ?? "Connection failed");
+      }),
+    [],
+  );
+
+  const handleTypeChange = (nextType: ConnectionType) => {
+    setType(nextType);
+    setPort(String(DEFAULT_PORT_BY_CONNECTION_TYPE[nextType] || ""));
     setTestState("idle");
     setSslEnabled(false);
-    setRejectUnauth(true);
+    setRejectUnauthorized(true);
   };
 
   const buildPayload = useCallback(
-    (): ConnectionConfig => ({
+    (): ConnectionFormSubmission => ({
       id: existing?.id ?? crypto.randomUUID(),
       name: name.trim(),
       type,
       folder: folder.trim() || undefined,
-      useSecretStorage: useSecretStorage || undefined,
+      useSecretStorage,
+      hasStoredSecret: hasStoredSecret || undefined,
       ...(isSQLite
         ? { filePath: filePath.trim() }
         : {
             host: host.trim(),
-            port: Number(port) || DEFAULT_PORTS[type],
+            port: Number(port) || DEFAULT_PORT_BY_CONNECTION_TYPE[type],
             database: database.trim(),
-            username: user.trim(),
+            username: username.trim(),
             password,
             ssl: supportsSsl ? sslEnabled : undefined,
             rejectUnauthorized:
-              supportsSsl && sslEnabled ? rejectUnauth : undefined,
+              supportsSsl && sslEnabled ? rejectUnauthorized : undefined,
             ...(isOracle
               ? {
                   serviceName: oracleServiceName.trim() || undefined,
@@ -344,15 +304,16 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
       type,
       folder,
       useSecretStorage,
+      hasStoredSecret,
       isSQLite,
       filePath,
       host,
       port,
       database,
-      user,
+      username,
       password,
       sslEnabled,
-      rejectUnauth,
+      rejectUnauthorized,
       supportsSsl,
       isOracle,
       oracleServiceName,
@@ -378,9 +339,8 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
 
   return (
     <div style={{ maxWidth: 520, margin: "0 auto", padding: "24px 24px 40px" }}>
-      {}
       <h2 style={{ fontSize: 15, fontWeight: 600, marginBottom: 4 }}>
-        {isEdit ? `Edit — ${existing!.name}` : "New Connection"}
+        {isEdit ? `Edit — ${existing?.name ?? ""}` : "New Connection"}
       </h2>
       <div
         style={{
@@ -390,9 +350,9 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
         }}
       />
 
-      {}
       <Field label="Name" error={nameError}>
         <FocusInput
+          aria-label="Connection name"
           value={name}
           onChange={(e) => {
             setName(e.target.value);
@@ -403,36 +363,36 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
         />
       </Field>
 
-      {}
       <Field
         label="Folder"
         hint="Group this connection under a folder in the explorer. Leave empty to show at the root."
       >
         <FocusInput
+          aria-label="Connection folder"
           value={folder}
           onChange={(e) => setFolder(e.target.value)}
           placeholder="Production"
         />
       </Field>
 
-      {}
       <Field label="Database Type">
         <FocusSelect
+          aria-label="Database type"
           value={type}
-          onChange={(e) => handleTypeChange(e.target.value as ConnType)}
+          onChange={(e) => handleTypeChange(e.target.value as ConnectionType)}
         >
-          {(Object.keys(TYPE_LABELS) as ConnType[]).map((t) => (
-            <option key={t} value={t}>
-              {TYPE_LABELS[t]}
+          {CONNECTION_TYPES.map((connectionType) => (
+            <option key={connectionType} value={connectionType}>
+              {CONNECTION_TYPE_LABELS[connectionType]}
             </option>
           ))}
         </FocusSelect>
       </Field>
 
-      {}
       {isSQLite ? (
         <Field label="Database File Path">
           <FocusInput
+            aria-label="Database file path"
             value={filePath}
             onChange={(e) => setFilePath(e.target.value)}
             placeholder="/absolute/path/to/database.db"
@@ -440,19 +400,20 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
         </Field>
       ) : (
         <>
-          {}
           <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
             <div style={{ flex: 1 }}>
-              <label style={s.label}>Host</label>
+              <div style={s.label}>Host</div>
               <FocusInput
+                aria-label="Host"
                 value={host}
                 onChange={(e) => setHost(e.target.value)}
                 placeholder="localhost"
               />
             </div>
             <div style={{ width: 90 }}>
-              <label style={s.label}>Port</label>
+              <div style={s.label}>Port</div>
               <FocusInput
+                aria-label="Port"
                 value={port}
                 onChange={(e) => setPort(e.target.value)}
                 type="text"
@@ -463,7 +424,7 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
                     ...s.input,
                     fontFamily: "var(--vscode-editor-font-family, monospace)",
                     MozAppearance: "textfield",
-                  } as React.CSSProperties
+                  } as CSSProperties
                 }
               />
             </div>
@@ -471,6 +432,7 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
 
           <Field label="Database">
             <FocusInput
+              aria-label="Database"
               value={database}
               onChange={(e) => setDatabase(e.target.value)}
               placeholder="mydb"
@@ -479,8 +441,9 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
 
           <Field label="Username">
             <FocusInput
-              value={user}
-              onChange={(e) => setUser(e.target.value)}
+              aria-label="Username"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
               placeholder="admin"
             />
           </Field>
@@ -501,13 +464,16 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
           <Field
             label="Password"
             hint={
-              useSecretStorage
-                ? "🔒 Will be stored securely in VS Code Secret Storage (OS keychain)"
-                : "⚠ Will be stored in plaintext in settings.json"
+              useSecretStorage && hasStoredSecret && password.length === 0
+                ? "Leave blank to keep the stored password in VS Code Secret Storage."
+                : useSecretStorage
+                  ? "🔒 Will be stored securely in VS Code Secret Storage (OS keychain)"
+                  : "⚠ Will be stored in plaintext in settings.json"
             }
           >
             <div style={{ position: "relative" }}>
               <FocusInput
+                aria-label="Password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 type="password"
@@ -542,7 +508,6 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
             </div>
           </Field>
 
-          {}
           {isOracle && (
             <>
               <Divider label="Oracle Connection" />
@@ -551,6 +516,7 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
                 hint="e.g. XEPDB1, ORCL, or your PDB service name. Recommended over SID. Leave empty to use the Database field above."
               >
                 <FocusInput
+                  aria-label="Oracle service name"
                   value={oracleServiceName}
                   onChange={(e) => setOracleServiceName(e.target.value)}
                   placeholder="XEPDB1"
@@ -577,6 +543,7 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
                     hint="Directory containing libclntsh.so / oci.dll. Leave empty to use system default."
                   >
                     <FocusInput
+                      aria-label="Oracle Instant Client path"
                       value={oracleClientPath}
                       onChange={(e) => setOracleClientPath(e.target.value)}
                       placeholder="/opt/oracle/instantclient_21_9"
@@ -587,7 +554,6 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
             </>
           )}
 
-          {}
           <Divider label="SSL / TLS" />
 
           <Toggle
@@ -611,15 +577,14 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
               <Toggle
                 label="Verify server certificate"
                 hint="Uncheck to accept self-signed certificates"
-                checked={rejectUnauth}
-                onChange={setRejectUnauth}
+                checked={rejectUnauthorized}
+                onChange={setRejectUnauthorized}
               />
             </div>
           )}
         </>
       )}
 
-      {}
       {testState !== "idle" && (
         <div
           style={{
@@ -666,35 +631,36 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
         </div>
       )}
 
-      {}
       <div
         style={{ display: "flex", gap: 6, alignItems: "center", marginTop: 4 }}
       >
         <button
-          style={{
-            ...s.btnPrimary,
-            ...(!name.trim() || saving
-              ? { opacity: 0.5, cursor: "default" }
-              : {}),
-          }}
+          type="button"
+          style={buildButtonStyle("primary", {
+            disabled: !name.trim() || saving,
+            size: "md",
+          })}
           disabled={!name.trim() || saving}
           onClick={handleSave}
         >
           {saving ? "Saving…" : "Save"}
         </button>
         <button
-          style={{
-            ...s.btnSecondary,
-            ...(testState === "testing"
-              ? { opacity: 0.5, cursor: "default" }
-              : {}),
-          }}
+          type="button"
+          style={buildButtonStyle("secondary", {
+            disabled: testState === "testing",
+            size: "md",
+          })}
           disabled={testState === "testing"}
           onClick={handleTest}
         >
           {testState === "testing" ? "Testing…" : "Test Connection"}
         </button>
-        <button style={s.btnGhost} onClick={() => postMessage("cancel")}>
+        <button
+          type="button"
+          style={buildButtonStyle("ghost", { size: "md" })}
+          onClick={() => postMessage("cancel")}
+        >
           Cancel
         </button>
       </div>
@@ -703,10 +669,5 @@ export function ConnectionFormView({ existing }: Props): React.ReactElement {
 }
 
 function SpinIcon() {
-  const [deg, setDeg] = useState(0);
-  useEffect(() => {
-    const id = setInterval(() => setDeg((d) => (d + 20) % 360), 50);
-    return () => clearInterval(id);
-  }, []);
   return <Icon name="sync" size={14} spin />;
 }

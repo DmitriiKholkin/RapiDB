@@ -1,30 +1,45 @@
 import {
+  type CellContext,
   flexRender,
   getCoreRowModel,
   type ColumnDef as TanColumnDef,
+  type Column as TanStackColumn,
   useReactTable,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import React, {
   useCallback,
   useEffect,
-  useLayoutEffect,
+  useId,
   useMemo,
   useRef,
   useState,
 } from "react";
-import { type Column, calcColWidths } from "../utils/columnSizing";
+import {
+  type ColumnTypeMeta as ColumnMeta,
+  type FilterDraft,
+  type FilterDraftMap,
+  isNumericCategory,
+  NULL_SENTINEL,
+  serializeFilterDrafts,
+} from "../../shared/tableTypes";
+import type {
+  ApplyResultPayload,
+  TableMutationPreviewPayload,
+} from "../../shared/webviewContracts";
+import type { EditTarget, InsertDraftRow, PendingEdits, Row } from "../types";
+import { buildButtonStyle } from "../utils/buttonStyles";
+import {
+  calcColWidths,
+  type Column as WidthColumn,
+} from "../utils/columnSizing";
 import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
+import { MonacoEditor } from "./MonacoEditor";
+import { CellDisplay } from "./table/CellDisplay";
+import { ColumnFilterControl } from "./table/ColumnFilterControl";
+import { EditInput, valueToEditString } from "./table/EditInput";
 
-interface ColDef {
-  name: string;
-  type: string;
-  nullable: boolean;
-  isPrimaryKey: boolean;
-  isForeignKey: boolean;
-  isBoolean?: boolean;
-}
 interface Props {
   connectionId: string;
   database: string;
@@ -33,8 +48,6 @@ interface Props {
   isView?: boolean;
   defaultPageSize?: number;
 }
-type Row = Record<string, unknown>;
-type PendingEdits = Map<number, Map<string, unknown>>;
 
 const PAGE_SIZES = [25, 100, 500, 1000];
 const DEBOUNCE = 400;
@@ -42,6 +55,19 @@ const ROW_H = 26;
 const HEADER_H = 28;
 const FILTER_H = 30;
 const TOOLBAR_H = 36;
+const PREVIEW_DIALOG_EDITOR_H = "min(42vh, 360px)";
+const INSERT_DEFAULT_SENTINEL = "__RAPIDB_INSERT_DEFAULT__";
+const SR_ONLY_STYLE: React.CSSProperties = {
+  position: "absolute",
+  width: 1,
+  height: 1,
+  padding: 0,
+  margin: -1,
+  overflow: "hidden",
+  clip: "rect(0, 0, 0, 0)",
+  whiteSpace: "nowrap",
+  border: 0,
+};
 
 const TABLE_ROW_STYLE_ID = "rapidb-table-row-style";
 if (
@@ -51,11 +77,11 @@ if (
   const s = document.createElement("style");
   s.id = TABLE_ROW_STYLE_ID;
   s.textContent = [
-    `.hdb-trow { transition: background 60ms; }`,
-    `.hdb-trow[data-even="true"]  { background: var(--vscode-editor-background); }`,
-    `.hdb-trow[data-even="false"] { background: var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.04)); }`,
+    `.rdb-trow { transition: background 60ms; }`,
+    `.rdb-trow[data-even="true"]  { background: var(--vscode-editor-background); }`,
+    `.rdb-trow[data-even="false"] { background: var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.04)); }`,
 
-    `.hdb-trow:not([data-selected="true"]):hover { background: var(--vscode-list-hoverBackground); }`,
+    `.rdb-trow:not([data-selected="true"]):hover { background: var(--vscode-list-hoverBackground); }`,
   ].join("\n");
   document.head.appendChild(s);
 }
@@ -63,56 +89,268 @@ if (
 const btn = (
   v: "primary" | "ghost" | "danger" | "warning" = "ghost",
   disabled = false,
-): React.CSSProperties => ({
-  padding: "3px 10px",
-  fontSize: 12,
-  borderRadius: 2,
-  cursor: disabled ? "default" : "pointer",
-  fontFamily: "inherit",
-  opacity: disabled ? 0.45 : 1,
-  whiteSpace: "nowrap",
-  ...(v === "primary"
-    ? {
-        background: "var(--vscode-button-background)",
-        color: "var(--vscode-button-foreground)",
-        border: "none",
-      }
-    : v === "danger"
-      ? {
-          background:
-            "var(--vscode-inputValidation-errorBackground, rgba(200,50,50,0.2))",
-          color: "var(--vscode-errorForeground)",
-          border:
-            "1px solid var(--vscode-inputValidation-errorBorder, rgba(200,50,50,0.4))",
-        }
-      : v === "warning"
-        ? {
-            background: "rgba(200,150,0,0.15)",
-            color: "var(--vscode-editorWarning-foreground, #cca700)",
-            border: "1px solid rgba(200,150,0,0.4)",
-          }
-        : {
-            background: "transparent",
-            color: "var(--vscode-foreground)",
-            border: "1px solid var(--vscode-panel-border)",
-          }),
-});
+): React.CSSProperties => buildButtonStyle(v, { disabled, size: "sm" });
 
-export function TableView({
-  connectionId,
-  database,
-  schema,
-  table,
-  isView = false,
-  defaultPageSize,
-}: Props) {
+function canEditColumn(column?: ColumnMeta): column is ColumnMeta {
+  return !!column;
+}
+
+function clonePendingEdits(pendingEdits: PendingEdits): PendingEdits {
+  return new Map(
+    [...pendingEdits.entries()].map(([rowIdx, columnMap]) => [
+      rowIdx,
+      new Map(columnMap),
+    ]),
+  );
+}
+
+function createInsertDraft(columns: readonly ColumnMeta[]): InsertDraftRow {
+  return Object.fromEntries(
+    columns.map((column) => [
+      column.name,
+      {
+        value: INSERT_DEFAULT_SENTINEL,
+      },
+    ]),
+  );
+}
+
+function buildInsertValues(draft: InsertDraftRow): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(draft)
+      .filter(([, cell]) => cell.value !== INSERT_DEFAULT_SENTINEL)
+      .map(([columnName, cell]) => [columnName, cell.value]),
+  );
+}
+
+function toDraftEditInitialValue(value: unknown): string {
+  if (value === INSERT_DEFAULT_SENTINEL) {
+    return "";
+  }
+
+  return valueToEditString(value);
+}
+
+type PendingRestoreState = Map<string, Map<string, unknown>>;
+
+function stablePrimaryKeyPart(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => stablePrimaryKeyPart(item));
+  }
+
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entryValue]) => [key, stablePrimaryKeyPart(entryValue)]),
+    );
+  }
+
+  return value;
+}
+
+function rowPrimaryKeySignature(
+  row: Row | undefined,
+  primaryKeyColumns: readonly string[],
+): string | null {
+  if (!row || primaryKeyColumns.length === 0) {
+    return null;
+  }
+
+  const keyEntries: Array<[string, unknown]> = [];
+  for (const columnName of primaryKeyColumns) {
+    if (!(columnName in row)) {
+      return null;
+    }
+
+    keyEntries.push([columnName, stablePrimaryKeyPart(row[columnName])]);
+  }
+
+  return JSON.stringify(keyEntries);
+}
+
+function buildPendingRestoreState(
+  pendingEdits: PendingEdits,
+  rows: readonly Row[],
+  primaryKeyColumns: readonly string[],
+): PendingRestoreState {
+  const restoreState: PendingRestoreState = new Map();
+
+  for (const [rowIdx, columnMap] of pendingEdits.entries()) {
+    const signature = rowPrimaryKeySignature(rows[rowIdx], primaryKeyColumns);
+    if (!signature) {
+      continue;
+    }
+
+    restoreState.set(signature, new Map(columnMap));
+  }
+
+  return restoreState;
+}
+
+function restorePendingEdits(
+  restoreState: PendingRestoreState | null,
+  rows: readonly Row[],
+  primaryKeyColumns: readonly string[],
+): PendingEdits {
+  if (!restoreState || restoreState.size === 0) {
+    return new Map();
+  }
+
+  const restored: PendingEdits = new Map();
+
+  rows.forEach((row, rowIdx) => {
+    const signature = rowPrimaryKeySignature(row, primaryKeyColumns);
+    if (!signature) {
+      return;
+    }
+
+    const columnMap = restoreState.get(signature);
+    if (columnMap) {
+      restored.set(rowIdx, new Map(columnMap));
+    }
+  });
+
+  return restored;
+}
+
+function getRetainedPendingEdits(
+  pendingEdits: PendingEdits,
+  updateRowIndexes: readonly number[],
+  rowOutcomes?: ApplyResultPayload["rowOutcomes"],
+  failedRows?: readonly number[],
+): PendingEdits {
+  const retainedUpdateIndexes = new Set<number>();
+
+  if (rowOutcomes && rowOutcomes.length > 0) {
+    for (const outcome of rowOutcomes) {
+      if (outcome.status !== "applied" && outcome.status !== "skipped") {
+        retainedUpdateIndexes.add(outcome.rowIndex);
+      }
+    }
+  } else if (failedRows && failedRows.length > 0) {
+    for (const rowIndex of failedRows) {
+      retainedUpdateIndexes.add(rowIndex);
+    }
+  }
+
+  if (retainedUpdateIndexes.size === 0) {
+    return new Map();
+  }
+
+  const nextPending: PendingEdits = new Map();
+  for (const updateIndex of retainedUpdateIndexes) {
+    const rowIdx = updateRowIndexes[updateIndex];
+    if (rowIdx === undefined) {
+      continue;
+    }
+
+    const rowPending = pendingEdits.get(rowIdx);
+    if (rowPending) {
+      nextPending.set(rowIdx, new Map(rowPending));
+    }
+  }
+
+  return nextPending;
+}
+
+const DIALOG_FOCUSABLE_SELECTOR =
+  'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function getFocusableElements(dialog: HTMLDivElement | null): HTMLElement[] {
+  if (!dialog) {
+    return [];
+  }
+
+  return Array.from(
+    dialog.querySelectorAll<HTMLElement>(DIALOG_FOCUSABLE_SELECTOR),
+  );
+}
+
+function useDialogFocusTrap(options: {
+  dialogRef: React.RefObject<HTMLDivElement | null>;
+  initialFocusRef?: React.RefObject<HTMLElement | null>;
+  onEscape?: () => void;
+}) {
+  const { dialogRef, initialFocusRef, onEscape } = options;
+
+  useEffect(() => {
+    const previousActiveElement =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+
+    initialFocusRef?.current?.focus();
+
+    return () => {
+      previousActiveElement?.focus();
+    };
+  }, [initialFocusRef]);
+
+  return useCallback(
+    (event: React.KeyboardEvent<HTMLDivElement>) => {
+      if (event.key === "Escape") {
+        onEscape?.();
+        return;
+      }
+
+      if (event.key !== "Tab") {
+        return;
+      }
+
+      const dialog = dialogRef.current;
+      const focusableElements = getFocusableElements(dialog);
+
+      if (focusableElements.length === 0) {
+        event.preventDefault();
+        dialog?.focus();
+        return;
+      }
+
+      const firstElement = focusableElements[0];
+      const lastElement = focusableElements[focusableElements.length - 1];
+      const activeElement =
+        document.activeElement instanceof HTMLElement
+          ? document.activeElement
+          : null;
+
+      if (!activeElement || !dialog?.contains(activeElement)) {
+        event.preventDefault();
+        firstElement.focus();
+        return;
+      }
+
+      if (event.shiftKey && activeElement === firstElement) {
+        event.preventDefault();
+        lastElement.focus();
+        return;
+      }
+
+      if (!event.shiftKey && activeElement === lastElement) {
+        event.preventDefault();
+        firstElement.focus();
+      }
+    },
+    [dialogRef, onEscape],
+  );
+}
+
+export function TableView({ table, isView = false, defaultPageSize }: Props) {
   const validSizes = PAGE_SIZES as readonly number[];
   const initialPageSize =
     defaultPageSize !== undefined && validSizes.includes(defaultPageSize)
       ? defaultPageSize
       : 25;
 
-  const [columns, setColumns] = useState<ColDef[]>([]);
+  const [columns, setColumns] = useState<ColumnMeta[]>([]);
   const [pkCols, setPkCols] = useState<string[]>([]);
   const [rows, setRows] = useState<Row[]>([]);
   const [totalCount, setTotalCount] = useState(0);
@@ -121,17 +359,18 @@ export function TableView({
   const [filterError, setFilterError] = useState<string | null>(null);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(initialPageSize);
-  const [filters, setFilters] = useState<Record<string, string>>({});
-  const [debFilters, setDebFilters] = useState<Record<string, string>>({});
+  const [filterDrafts, setFilterDrafts] = useState<FilterDraftMap>({});
+  const [debouncedFilterDrafts, setDebouncedFilterDrafts] =
+    useState<FilterDraftMap>({});
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [pendingEdits, setPending] = useState<PendingEdits>(new Map());
-  const [editCell, setEditCell] = useState<{
-    rowIdx: number;
-    col: string;
-  } | null>(null);
+  const [editCell, setEditCell] = useState<EditTarget | null>(null);
   const [applying, setApplying] = useState(false);
-  const [applyErr, setApplyErr] = useState<string | null>(null);
-  const [newRow, setNewRow] = useState<Row | null>(null);
+  const [applyStatus, setApplyStatus] = useState<{
+    tone: "error" | "warning";
+    message: string;
+  } | null>(null);
+  const [newRow, setNewRow] = useState<InsertDraftRow | null>(null);
   const [inserting, setInserting] = useState(false);
   const [mutErr, setMutErr] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -139,12 +378,24 @@ export function TableView({
     column: string;
     direction: "asc" | "desc";
   } | null>(null);
+  const [mutationPreview, setMutationPreview] =
+    useState<TableMutationPreviewPayload | null>(null);
+  const [exportChoice, setExportChoice] = useState<{
+    format: "csv" | "json";
+    sort: { column: string; direction: "asc" | "desc" } | null;
+    filters: unknown[];
+  } | null>(null);
+
+  const [readOnlyTable, setReadOnlyTable] = useState(isView);
 
   const [colSizes, setColSizes] = useState<Record<string, number>>({});
 
   const colSizesInitedRef = useRef(false);
 
-  const columnsRef = useRef<ColDef[]>([]);
+  const columnsRef = useRef<ColumnMeta[]>([]);
+  const applyPendingSnapshotRef = useRef<PendingEdits>(new Map());
+  const applyRowIndexesRef = useRef<number[]>([]);
+  const pendingRestoreRef = useRef<PendingRestoreState | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const scrollPreserveRef = useRef<number | null>(null);
@@ -166,25 +417,50 @@ export function TableView({
 
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
   const pendingCount = pendingEdits.size;
+  const unsavedRowCount = pendingCount + (newRow ? 1 : 0);
+  const insertValueCount = newRow
+    ? Object.values(newRow).filter(
+        (cell) => cell.value !== INSERT_DEFAULT_SENTINEL,
+      ).length
+    : 0;
+  const hasPrimaryKey = pkCols.length > 0;
+  const canEditRows = !readOnlyTable && hasPrimaryKey;
+  const canSelectAndDeleteRows = !readOnlyTable && hasPrimaryKey;
 
   const initializedRef = useRef(false);
   const fetchEpochRef = useRef(0);
   const [initTick, setInitTick] = useState(0);
+  const showMissingPrimaryKeyNotice =
+    !readOnlyTable && initializedRef.current && !hasPrimaryKey;
 
   const pageRef = useRef(page);
   const pageSizeRef = useRef(pageSize);
-  const debFilRef = useRef(debFilters);
+  const debouncedFilterDraftsRef = useRef(debouncedFilterDrafts);
   pageRef.current = page;
   pageSizeRef.current = pageSize;
-  debFilRef.current = debFilters;
+  debouncedFilterDraftsRef.current = debouncedFilterDrafts;
+
+  const fetchTrigger = useMemo(
+    () =>
+      JSON.stringify({
+        initTick,
+        page,
+        pageSize,
+        filters: debouncedFilterDrafts,
+        sortColumn: sort?.column ?? null,
+        sortDirection: sort?.direction ?? null,
+      }),
+    [debouncedFilterDrafts, initTick, page, pageSize, sort],
+  );
 
   const fetchPage = useCallback(() => {
     if (!initializedRef.current) return;
     const epoch = ++fetchEpochRef.current;
     setLoading(true);
-    const activeFilters = Object.entries(debFilRef.current)
-      .filter(([, v]) => v.trim())
-      .map(([column, value]) => ({ column, value }));
+    const activeFilters = serializeFilterDrafts(
+      columnsRef.current,
+      debouncedFilterDraftsRef.current,
+    );
     postMessage("fetchPage", {
       fetchId: epoch,
       page: pageRef.current,
@@ -194,9 +470,22 @@ export function TableView({
     });
   }, []);
 
+  const buildPendingUpdatesPayload = useCallback((source: PendingEdits) => {
+    return [...source.entries()].map(([rowIdx, colMap]) => ({
+      primaryKeys: Object.fromEntries(
+        pkColsRef.current.map((k) => [k, rowsRef.current[rowIdx][k]]),
+      ),
+      changes: Object.fromEntries(colMap),
+    }));
+  }, []);
+
+  useEffect(() => {
+    setReadOnlyTable(isView);
+  }, [isView]);
+
   useEffect(() => {
     const unInit = onMessage<{
-      columns: ColDef[];
+      columns: ColumnMeta[];
       primaryKeyColumns: string[];
     }>("tableInit", ({ columns: cols, primaryKeyColumns }) => {
       columnsRef.current = cols;
@@ -204,6 +493,10 @@ export function TableView({
       initializedRef.current = true;
       setColumns(cols);
       setPkCols(primaryKeyColumns);
+      setReadOnlyTable(isView);
+      setNewRow(null);
+      setEditCell(null);
+      setMutErr(null);
 
       setInitTick((t) => t + 1);
     });
@@ -217,7 +510,7 @@ export function TableView({
         colSizesInitedRef.current = true;
         setColSizes(
           calcColWidths(
-            columnsRef.current.map((c): Column => {
+            columnsRef.current.map((c): WidthColumn => {
               return {
                 name: c.name,
                 isPrimaryKey: c.isPrimaryKey,
@@ -230,21 +523,27 @@ export function TableView({
       setRows(r);
       setTotalCount(t);
       setLoading(false);
+      setError(null);
       setFilterError(null);
       setSelected(new Set());
-      setPending(new Map());
+      const restoredPending = restorePendingEdits(
+        pendingRestoreRef.current,
+        r,
+        pkColsRef.current,
+      );
+      pendingRestoreRef.current = null;
+      setPending(restoredPending);
       setEditCell(null);
 
       const savedScroll = scrollPreserveRef.current;
       scrollPreserveRef.current = null;
       if (savedScroll !== null && savedScroll > 0) {
         requestAnimationFrame(() => {
-          scrollRef.current?.scrollTo({ top: savedScroll });
+          scrollRef.current?.scrollTo?.({ top: savedScroll });
         });
       } else {
-        scrollRef.current?.scrollTo({ top: 0 });
+        scrollRef.current?.scrollTo?.({ top: 0 });
       }
-      setApplyErr(null);
     });
     const unError = onMessage<{
       fetchId?: number;
@@ -262,18 +561,68 @@ export function TableView({
       setLoading(false);
     });
 
-    const unApply = onMessage<{ success: boolean; error?: string }>(
+    const unApply = onMessage<ApplyResultPayload>(
       "applyResult",
-      ({ success, error: e }) => {
+      ({
+        success,
+        error: e,
+        warning,
+        failedRows,
+        rowOutcomes,
+        insertApplied,
+      }) => {
         setApplying(false);
         if (success) {
-          setApplyErr(null);
-          setPending(new Map());
+          setNewRow(null);
+          const nextPending = getRetainedPendingEdits(
+            applyPendingSnapshotRef.current,
+            applyRowIndexesRef.current,
+            rowOutcomes,
+            failedRows,
+          );
+          setPending(nextPending);
+          setApplyStatus(
+            warning
+              ? {
+                  tone: "warning",
+                  message: warning,
+                }
+              : null,
+          );
+          const restoreState = buildPendingRestoreState(
+            nextPending,
+            rowsRef.current,
+            pkColsRef.current,
+          );
+          pendingRestoreRef.current =
+            restoreState.size > 0 ? restoreState : null;
           scrollPreserveRef.current = scrollRef.current?.scrollTop ?? null;
           fetchPage();
         } else {
-          setApplyErr(e ?? "Apply failed — all changes were rolled back");
+          if (insertApplied) {
+            setNewRow(null);
+            const restoreState = buildPendingRestoreState(
+              pendingEditsRef.current,
+              rowsRef.current,
+              pkColsRef.current,
+            );
+            pendingRestoreRef.current =
+              restoreState.size > 0 ? restoreState : null;
+            scrollPreserveRef.current = scrollRef.current?.scrollTop ?? null;
+            fetchPage();
+          } else {
+            pendingRestoreRef.current = null;
+          }
+
+          setApplyStatus({
+            tone: "error",
+            message: insertApplied
+              ? `${e ?? "Apply failed"}. Insert was applied, but update changes were not.`
+              : (e ?? "Apply failed — all changes were rolled back"),
+          });
         }
+        applyPendingSnapshotRef.current = new Map();
+        applyRowIndexesRef.current = [];
       },
     );
 
@@ -283,9 +632,21 @@ export function TableView({
         setInserting(false);
         if (success) {
           setNewRow(null);
+          setEditCell(null);
           setMutErr(null);
+
+          if (applyRowIndexesRef.current.length > 0) {
+            const updates = buildPendingUpdatesPayload(
+              applyPendingSnapshotRef.current,
+            );
+            postMessage("applyChanges", { updates });
+            return;
+          }
+
+          setApplying(false);
           fetchPage();
         } else {
+          setApplying(false);
           setMutErr(e ?? "Insert failed");
         }
       },
@@ -304,18 +665,10 @@ export function TableView({
       },
     );
 
-    const unConfirm = onMessage<{ confirmed: boolean }>(
-      "deleteConfirmed",
-      ({ confirmed }) => {
-        if (!confirmed) {
-          return;
-        }
-        const toDelete = [...selectedRef.current].map((idx) => {
-          const row = rowsRef.current[idx];
-          return Object.fromEntries(pkColsRef.current.map((k) => [k, row[k]]));
-        });
-        setDeleting(true);
-        postMessage("deleteRows", { primaryKeysList: toDelete });
+    const unMutationPreview = onMessage<TableMutationPreviewPayload>(
+      "tableMutationPreview",
+      (payload) => {
+        setMutationPreview(payload);
       },
     );
 
@@ -327,14 +680,14 @@ export function TableView({
       unApply();
       unInsert();
       unDelete();
-      unConfirm();
+      unMutationPreview();
     };
-  }, [fetchPage]);
+  }, [buildPendingUpdatesPayload, fetchPage, isView]);
 
   useEffect(() => {
-    if (!initializedRef.current) return;
+    if (!initializedRef.current || fetchTrigger === "") return;
     fetchPage();
-  }, [page, pageSize, debFilters, sort, initTick, fetchPage]);
+  }, [fetchPage, fetchTrigger]);
 
   const filtersMountedRef = useRef(false);
   useEffect(() => {
@@ -345,10 +698,10 @@ export function TableView({
     const t = setTimeout(() => {
       setFilterError(null);
       setPage(1);
-      setDebFilters(filters);
+      setDebouncedFilterDrafts(filterDrafts);
     }, DEBOUNCE);
     return () => clearTimeout(t);
-  }, [filters]);
+  }, [filterDrafts]);
 
   const handleSort = useCallback((column: string) => {
     setPage(1);
@@ -363,44 +716,87 @@ export function TableView({
     });
   }, []);
 
+  const updateFilterDraft = useCallback(
+    (columnName: string, nextDraft: FilterDraft | undefined) => {
+      setFilterDrafts((current) => {
+        if (!nextDraft) {
+          if (current[columnName] === undefined) {
+            return current;
+          }
+
+          const next = { ...current };
+          delete next[columnName];
+          return next;
+        }
+
+        return {
+          ...current,
+          [columnName]: nextDraft,
+        };
+      });
+    },
+    [],
+  );
+
   const applyChanges = useCallback(() => {
-    if (pendingEdits.size === 0 || applying) {
+    if (unsavedRowCount === 0 || applying) {
       return;
     }
+
+    applyPendingSnapshotRef.current = clonePendingEdits(pendingEdits);
+    applyRowIndexesRef.current = [...pendingEdits.keys()];
+
     setApplying(true);
-    setApplyErr(null);
-    const updates = [...pendingEdits.entries()].map(([rowIdx, colMap]) => ({
-      primaryKeys: Object.fromEntries(
-        pkColsRef.current.map((k) => [k, rowsRef.current[rowIdx][k]]),
-      ),
-      changes: Object.fromEntries(colMap),
-    }));
-    postMessage("applyChanges", { updates });
-  }, [pendingEdits, applying]);
+    setApplyStatus(null);
+    setMutErr(null);
+    const updates = buildPendingUpdatesPayload(pendingEdits);
+    postMessage("applyChanges", {
+      updates,
+      ...(newRow ? { insertValues: buildInsertValues(newRow) } : {}),
+    });
+  }, [
+    unsavedRowCount,
+    applying,
+    pendingEdits,
+    newRow,
+    buildPendingUpdatesPayload,
+  ]);
 
   const revertChanges = useCallback(() => {
+    pendingRestoreRef.current = null;
     setPending(new Map());
+    setNewRow(null);
     setEditCell(null);
-    setApplyErr(null);
+    setMutErr(null);
+    setApplyStatus(null);
   }, []);
 
   const commitCellEdit = useCallback(
-    (rowIdx: number, colName: string, newVal: string, originalVal: unknown) => {
+    (
+      rowIdx: number,
+      column: ColumnMeta,
+      newVal: string,
+      originalVal: unknown,
+    ) => {
       setEditCell(null);
+
+      if (!canEditRows) {
+        return;
+      }
 
       const coerced: unknown = newVal === NULL_SENTINEL ? null : newVal;
 
-      const origStr = originalVal == null ? NULL_SENTINEL : String(originalVal);
+      const origStr = valueToEditString(originalVal);
 
       if (newVal === origStr) {
         setPending((prev) => {
           const rowMap = prev.get(rowIdx);
-          if (!rowMap || !rowMap.has(colName)) {
+          if (!rowMap?.has(column.name)) {
             return prev;
           }
           const next = new Map(prev);
           const newRow = new Map(rowMap);
-          newRow.delete(colName);
+          newRow.delete(column.name);
           if (newRow.size === 0) {
             next.delete(rowIdx);
           } else {
@@ -413,24 +809,47 @@ export function TableView({
       setPending((prev) => {
         const next = new Map(prev);
         const row = new Map(next.get(rowIdx) ?? []);
-        row.set(colName, coerced);
+        row.set(column.name, coerced);
         next.set(rowIdx, row);
         return next;
+      });
+    },
+    [canEditRows],
+  );
+
+  const commitDraftCellEdit = useCallback(
+    (column: ColumnMeta, newVal: string) => {
+      setEditCell(null);
+
+      setNewRow((current) => {
+        if (!current) {
+          return current;
+        }
+
+        return {
+          ...current,
+          [column.name]: {
+            ...current[column.name],
+            value: newVal === NULL_SENTINEL ? NULL_SENTINEL : newVal,
+          },
+        };
       });
     },
     [],
   );
 
-  const handleStartEdit = useCallback(
-    (rowIdx: number, col: ColDef) => {
-      if (isView) {
-        return;
-      }
-      setEditCell({ rowIdx, col: col.name });
-      setApplyErr(null);
-    },
-    [isView],
-  );
+  const handleStartEdit = useCallback((rowIdx: number, col: ColumnMeta) => {
+    if (!canEditColumn(col)) {
+      return;
+    }
+    setEditCell({ kind: "persisted", rowIdx, col: col.name });
+    setApplyStatus(null);
+  }, []);
+
+  const handleStartDraftEdit = useCallback((col: ColumnMeta) => {
+    setEditCell({ kind: "draft", col: col.name });
+    setApplyStatus(null);
+  }, []);
 
   const deleteSelected = useCallback(() => {
     if (
@@ -440,17 +859,69 @@ export function TableView({
     ) {
       return;
     }
-    postMessage("confirmDelete", { count: selectedRef.current.size });
+    const toDelete = [...selectedRef.current].map((idx) => {
+      const row = rowsRef.current[idx];
+      return Object.fromEntries(pkColsRef.current.map((k) => [k, row[k]]));
+    });
+    setDeleting(true);
+    postMessage("deleteRows", { primaryKeysList: toDelete });
   }, [deleting]);
 
-  const commitNewRow = useCallback(() => {
-    if (!newRow || inserting) {
+  const clearApplyRequestState = useCallback(() => {
+    setApplying(false);
+    applyPendingSnapshotRef.current = new Map();
+    applyRowIndexesRef.current = [];
+  }, []);
+
+  const cancelMutationPreview = useCallback(() => {
+    if (!mutationPreview) {
       return;
     }
-    setInserting(true);
-    setMutErr(null);
-    postMessage("insertRow", { values: newRow });
-  }, [newRow, inserting]);
+
+    const { kind, previewToken } = mutationPreview;
+    setMutationPreview(null);
+
+    if (kind === "applyChanges") {
+      clearApplyRequestState();
+    } else if (kind === "insertRow") {
+      setInserting(false);
+      clearApplyRequestState();
+    } else {
+      setDeleting(false);
+    }
+
+    postMessage("cancelMutationPreview", { previewToken });
+  }, [clearApplyRequestState, mutationPreview]);
+
+  const confirmMutationPreview = useCallback(() => {
+    if (!mutationPreview) {
+      return;
+    }
+
+    const { previewToken } = mutationPreview;
+    setMutationPreview(null);
+    postMessage("confirmMutationPreview", { previewToken });
+  }, [mutationPreview]);
+
+  useEffect(() => {
+    if (!mutationPreview) {
+      return;
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") {
+        return;
+      }
+
+      event.preventDefault();
+      cancelMutationPreview();
+    };
+
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown, true);
+    };
+  }, [cancelMutationPreview, mutationPreview]);
 
   const columnsMap = useMemo(
     () => new Map(columns.map((c) => [c.name, c])),
@@ -459,7 +930,7 @@ export function TableView({
 
   const tanColumns = useMemo<TanColumnDef<Row>[]>(
     () => [
-      ...(!isView
+      ...(canSelectAndDeleteRows
         ? [
             {
               id: "__sel",
@@ -467,6 +938,7 @@ export function TableView({
               header: () => (
                 <input
                   type="checkbox"
+                  aria-label="Select all rows"
                   checked={
                     rowsRef.current.length > 0 &&
                     selectedRef.current.size === rowsRef.current.length
@@ -491,9 +963,10 @@ export function TableView({
                   }}
                 />
               ),
-              cell: ({ row }: any) => (
+              cell: ({ row }: CellContext<Row, unknown>) => (
                 <input
                   type="checkbox"
+                  aria-label={`Select row ${row.index + 1}`}
                   checked={selectedRef.current.has(row.index)}
                   onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
                     const next = new Set(selectedRef.current);
@@ -539,34 +1012,25 @@ export function TableView({
 
             const ec = editCellRef.current;
             const pe = pendingEditsRef.current;
-            const isEditing = ec?.rowIdx === rowIdx && ec.col === col.name;
-            const hasPending = pe.get(rowIdx)?.has(col.name) ?? false;
-            const displayVal = hasPending
-              ? pe.get(rowIdx)!.get(col.name)
-              : getValue();
+            const isEditing =
+              ec?.kind === "persisted" &&
+              ec.rowIdx === rowIdx &&
+              ec.col === col.name;
+            const pendingRow = pe.get(rowIdx);
+            const hasPending = pendingRow?.has(col.name) ?? false;
+            const pendingValue = pendingRow?.get(col.name);
+            const displayVal = hasPending ? pendingValue : getValue();
 
             if (isEditing) {
-              const startVal = hasPending
-                ? (pe.get(rowIdx)!.get(col.name) ?? "")
-                : (getValue() ?? "");
-              const startStr =
-                col.isBoolean && startVal !== null && startVal !== undefined
-                  ? startVal === true || startVal === 1 || startVal === "1"
-                    ? "true"
-                    : startVal === false || startVal === 0 || startVal === "0"
-                      ? "false"
-                      : String(startVal)
-                  : startVal == null
-                    ? NULL_SENTINEL
-                    : String(startVal);
+              const startVal = hasPending ? pendingValue : getValue();
+              const startStr = valueToEditString(startVal);
               return (
                 <EditInput
                   initial={startStr}
                   nullable={col.nullable}
-                  isBoolean={col.isBoolean}
-                  onCommit={(v) =>
-                    commitCellEdit(rowIdx, col.name, v, getValue())
-                  }
+                  category={col.category}
+                  readOnly={!canEditRows}
+                  onCommit={(v) => commitCellEdit(rowIdx, col, v, getValue())}
                   onCancel={() => setEditCell(null)}
                 />
               );
@@ -574,9 +1038,8 @@ export function TableView({
             return (
               <CellDisplay
                 value={displayVal}
-                isPk={col.isPrimaryKey}
                 isPending={hasPending}
-                isBoolean={col.isBoolean}
+                category={col.category}
               />
             );
           },
@@ -584,7 +1047,7 @@ export function TableView({
       ),
     ],
 
-    [columns, colSizes],
+    [canEditRows, canSelectAndDeleteRows, columns, colSizes, commitCellEdit],
   );
 
   const tanTable = useReactTable({
@@ -595,8 +1058,10 @@ export function TableView({
     enableColumnResizing: true,
   });
   const { rows: tableRows } = tanTable.getRowModel();
+  const visibleColumns = tanTable.getVisibleLeafColumns();
+  const hasDraftRow = newRow !== null;
   const virt = useVirtualizer({
-    count: tableRows.length,
+    count: tableRows.length + (hasDraftRow ? 1 : 0),
     getScrollElement: () => scrollRef.current,
     estimateSize: () => ROW_H,
     overscan: 15,
@@ -625,12 +1090,14 @@ export function TableView({
   const busy = loading || applying || deleting || inserting;
 
   return (
-    <div
+    <main
+      aria-label={`Table data for ${table}`}
       style={{
         display: "flex",
         flexDirection: "column",
         height: "100vh",
         overflow: "hidden",
+        position: "relative",
       }}
     >
       {filterError && (
@@ -652,6 +1119,7 @@ export function TableView({
           <span style={{ fontWeight: 600 }}>⚠ Filter:</span>
           <span style={{ flex: 1 }}>{filterError}</span>
           <button
+            type="button"
             style={{
               background: "none",
               border: "none",
@@ -669,6 +1137,30 @@ export function TableView({
           </button>
         </div>
       )}
+      {showMissingPrimaryKeyNotice && (
+        <div
+          role="alert"
+          style={{
+            flexShrink: 0,
+            padding: "6px 12px",
+            fontSize: 12,
+            background:
+              "var(--vscode-inputValidation-warningBackground, rgba(180,120,0,0.15))",
+            borderBottom:
+              "1px solid var(--vscode-inputValidation-warningBorder, rgba(180,120,0,0.4))",
+            color: "var(--vscode-editorWarning-foreground, #CCA700)",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+          }}
+        >
+          <Icon name="warning" size={13} style={{ flexShrink: 0 }} />
+          <span>
+            Reduced table mode: no unique key was detected for row binding, so
+            editing fields and deleting rows are disabled.
+          </span>
+        </div>
+      )}
       {}
       <div
         style={{
@@ -682,63 +1174,75 @@ export function TableView({
           background: "var(--vscode-editorGroupHeader-tabsBackground)",
         }}
       >
-        {!isView && (
+        {!readOnlyTable && (
           <>
             <button
+              type="button"
               style={btn("primary", busy || !!newRow)}
               disabled={busy || !!newRow}
               onClick={() => {
-                setNewRow(Object.fromEntries(columns.map((c) => [c.name, ""])));
+                setNewRow(createInsertDraft(columnsRef.current));
+                setEditCell(null);
                 setMutErr(null);
               }}
             >
-              <>
-                <Icon name="add" size={13} style={{ marginRight: 4 }} />
-                Add Row
-              </>
+              <Icon name="add" size={13} style={{ marginRight: 4 }} />
+              Add Row
             </button>
-            <button
-              style={btn(
-                "danger",
-                selected.size === 0 || pkCols.length === 0 || busy,
-              )}
-              disabled={selected.size === 0 || pkCols.length === 0 || busy}
-              onClick={deleteSelected}
-              title={
-                pkCols.length === 0 ? "No primary key — cannot delete" : ""
-              }
-            >
-              <>
+            {canSelectAndDeleteRows && (
+              <button
+                type="button"
+                style={btn("danger", selected.size === 0 || busy)}
+                disabled={selected.size === 0 || busy}
+                onClick={deleteSelected}
+              >
                 <Icon name="trash" size={13} style={{ marginRight: 4 }} />
                 {deleting ? "Deleting…" : `Delete (${selected.size})`}
-              </>
-            </button>
+              </button>
+            )}
           </>
         )}
 
-        <button style={btn("ghost", busy)} disabled={busy} onClick={fetchPage}>
+        <button
+          type="button"
+          style={btn("ghost", busy)}
+          disabled={busy}
+          onClick={fetchPage}
+        >
           <Icon name="refresh" size={13} style={{ marginRight: 4 }} />
           Refresh
         </button>
         <button
+          type="button"
           style={btn("ghost")}
           onClick={() => {
-            const activeFilters = Object.entries(debFilters)
-              .filter(([, v]) => v.trim())
-              .map(([column, value]) => ({ column, value }));
-            postMessage("exportCSV", { sort, filters: activeFilters });
+            const activeFilters = serializeFilterDrafts(
+              columns,
+              debouncedFilterDrafts,
+            );
+            if (totalCount > rows.length) {
+              setExportChoice({ format: "csv", sort, filters: activeFilters });
+            } else {
+              postMessage("exportCSV", { sort, filters: activeFilters });
+            }
           }}
         >
           <Icon name="export" size={13} style={{ marginRight: 4 }} />
           Export CSV
         </button>
         <button
+          type="button"
           style={btn("ghost")}
           onClick={() => {
-            const activeFilters = Object.entries(debFilters)
-              .filter(([, v]) => v.trim())
-              .map(([column, value]) => ({ column, value }));
-            postMessage("exportJSON", { sort, filters: activeFilters });
+            const activeFilters = serializeFilterDrafts(
+              columns,
+              debouncedFilterDrafts,
+            );
+            if (totalCount > rows.length) {
+              setExportChoice({ format: "json", sort, filters: activeFilters });
+            } else {
+              postMessage("exportJSON", { sort, filters: activeFilters });
+            }
           }}
         >
           <Icon name="export" size={13} style={{ marginRight: 4 }} />
@@ -751,7 +1255,7 @@ export function TableView({
       </div>
 
       {}
-      {!isView && (pendingCount > 0 || applyErr) && (
+      {!readOnlyTable && (unsavedRowCount > 0 || applyStatus) && (
         <div
           style={{
             flexShrink: 0,
@@ -760,60 +1264,75 @@ export function TableView({
             display: "flex",
             alignItems: "center",
             gap: 8,
-            background: applyErr
-              ? "var(--vscode-inputValidation-errorBackground, rgba(200,50,50,0.1))"
-              : "rgba(200,150,0,0.08)",
-            borderBottom: `1px solid ${applyErr ? "var(--vscode-inputValidation-errorBorder, rgba(200,50,50,0.4))" : "rgba(200,150,0,0.3)"}`,
+            background:
+              applyStatus?.tone === "error"
+                ? "var(--vscode-inputValidation-errorBackground, rgba(200,50,50,0.1))"
+                : "rgba(200,150,0,0.08)",
+            borderBottom: `1px solid ${
+              applyStatus?.tone === "error"
+                ? "var(--vscode-inputValidation-errorBorder, rgba(200,50,50,0.4))"
+                : "rgba(200,150,0,0.3)"
+            }`,
           }}
         >
-          {pendingCount > 0 && !applyErr && (
+          {unsavedRowCount > 0 && applyStatus?.tone !== "error" && (
             <span
               style={{
                 fontSize: 12,
                 color: "var(--vscode-editorWarning-foreground, #cca700)",
-              }}
-            >
-              <Icon name="edit" size={12} style={{ marginRight: 4 }} />
-              {pendingCount} row{pendingCount !== 1 ? "s" : ""} with unsaved
-              changes
-            </span>
-          )}
-          {applyErr && (
-            <span
-              style={{
-                fontSize: 12,
-                color: "var(--vscode-errorForeground)",
                 flex: 1,
               }}
             >
-              <>
-                <Icon name="warning" size={13} style={{ marginRight: 4 }} />
-                {applyErr}
-              </>
+              <Icon name="edit" size={12} style={{ marginRight: 4 }} />
+              {unsavedRowCount} row{unsavedRowCount !== 1 ? "s" : ""} with
+              unsaved changes
             </span>
           )}
-          {pendingCount > 0 && (
+          {applyStatus && (
+            <span
+              style={{
+                fontSize: 12,
+                color:
+                  applyStatus.tone === "error"
+                    ? "var(--vscode-errorForeground)"
+                    : "var(--vscode-editorWarning-foreground, #cca700)",
+                flex: 1,
+              }}
+            >
+              <Icon name="warning" size={13} style={{ marginRight: 4 }} />
+              {applyStatus.message}
+            </span>
+          )}
+          {unsavedRowCount > 0 && (
             <>
               <button
-                style={btn("warning", applying)}
-                disabled={applying}
+                type="button"
+                style={btn("warning", applying || inserting)}
+                disabled={applying || inserting}
+                title={
+                  newRow && insertValueCount === 0
+                    ? "Apply insert with database defaults, then updates"
+                    : undefined
+                }
                 onClick={applyChanges}
               >
                 {applying ? "Applying…" : "Apply Changes"}
               </button>
               <button
-                style={btn("ghost", applying)}
-                disabled={applying}
+                type="button"
+                style={btn("ghost", applying || inserting)}
+                disabled={applying || inserting}
                 onClick={revertChanges}
               >
                 Revert All
               </button>
             </>
           )}
-          {applyErr && pendingCount === 0 && (
+          {applyStatus && unsavedRowCount === 0 && (
             <button
+              type="button"
               style={btn("ghost")}
-              onClick={() => setApplyErr(null)}
+              onClick={() => setApplyStatus(null)}
               title="Dismiss"
             >
               <Icon name="close" size={13} />
@@ -823,7 +1342,7 @@ export function TableView({
       )}
 
       {}
-      {!isView && mutErr && (
+      {!readOnlyTable && mutErr && (
         <div
           style={{
             padding: "5px 12px",
@@ -842,6 +1361,7 @@ export function TableView({
             {mutErr}
           </span>
           <button
+            type="button"
             onClick={() => setMutErr(null)}
             title="Dismiss"
             style={{
@@ -853,139 +1373,6 @@ export function TableView({
             }}
           >
             <Icon name="close" size={13} />
-          </button>
-        </div>
-      )}
-
-      {}
-      {!isView && newRow && (
-        <div
-          style={{
-            flexShrink: 0,
-            padding: "8px 12px",
-            borderBottom: "1px solid var(--vscode-panel-border)",
-            background:
-              "var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.1))",
-            display: "flex",
-            flexWrap: "wrap",
-            gap: 8,
-            alignItems: "flex-end",
-          }}
-        >
-          <span
-            style={{
-              fontSize: 11,
-              opacity: 0.6,
-              alignSelf: "center",
-              marginRight: 4,
-            }}
-          >
-            New row:
-          </span>
-          {columns.map((col) => {
-            const isNull = newRow[col.name] === NULL_SENTINEL;
-            const rawVal = newRow[col.name];
-
-            return (
-              <div
-                key={col.name}
-                style={{ display: "flex", flexDirection: "column", gap: 2 }}
-              >
-                <label style={{ fontSize: 10, opacity: 0.6 }}>
-                  {col.name}
-                  {col.isPrimaryKey && (
-                    <Icon
-                      name="key"
-                      size={10}
-                      color="var(--vscode-charts-yellow, #cca700)"
-                      style={{ marginLeft: 3 }}
-                      title="Primary Key"
-                    />
-                  )}
-                </label>
-                <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
-                  <input
-                    value={isNull ? "" : String(rawVal ?? "")}
-                    disabled={isNull}
-                    onChange={(e) =>
-                      setNewRow({ ...newRow, [col.name]: e.target.value })
-                    }
-                    placeholder={
-                      isNull
-                        ? "NULL"
-                        : col.isBoolean
-                          ? "true / false"
-                          : undefined
-                    }
-                    style={{
-                      width: 120,
-                      padding: "3px 6px",
-                      fontSize: 12,
-                      background: "var(--vscode-input-background)",
-                      color: isNull
-                        ? "var(--vscode-disabledForeground)"
-                        : "var(--vscode-input-foreground)",
-                      border: "1px solid var(--vscode-input-border)",
-                      borderRadius: 2,
-                      fontFamily: "inherit",
-                      opacity: isNull ? 0.55 : 1,
-                      fontStyle: isNull ? "italic" : "normal",
-                      boxSizing: "border-box",
-                    }}
-                  />
-                  {col.nullable && (
-                    <button
-                      onMouseDown={(e) => e.preventDefault()}
-                      onClick={() =>
-                        setNewRow({
-                          ...newRow,
-                          [col.name]: isNull ? "" : NULL_SENTINEL,
-                        })
-                      }
-                      title={
-                        isNull
-                          ? "Remove NULL — set to empty"
-                          : "Set field to NULL"
-                      }
-                      style={{
-                        flexShrink: 0,
-                        height: 24,
-                        padding: "0 5px",
-                        fontSize: 9,
-                        fontStyle: "italic",
-                        fontFamily: "inherit",
-                        background: isNull
-                          ? "var(--vscode-button-background)"
-                          : "transparent",
-                        color: isNull
-                          ? "var(--vscode-button-foreground)"
-                          : "var(--vscode-badge-foreground)",
-                        border: "none",
-                        borderRadius: 2,
-                        cursor: "pointer",
-                        letterSpacing: "0.02em",
-                        opacity: isNull ? 1 : 0.5,
-                      }}
-                    >
-                      NULL
-                    </button>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-          <button
-            style={{ ...btn("primary", inserting), alignSelf: "flex-end" }}
-            disabled={inserting}
-            onClick={commitNewRow}
-          >
-            {inserting ? "Inserting…" : "Insert"}
-          </button>
-          <button
-            style={{ ...btn("ghost"), alignSelf: "flex-end" }}
-            onClick={() => setNewRow(null)}
-          >
-            Cancel
           </button>
         </div>
       )}
@@ -1011,7 +1398,7 @@ export function TableView({
                   const isSel = h.column.id === "__sel";
                   const colId = h.column.id;
                   const isSorted = sort?.column === colId;
-                  const sortDir = isSorted ? sort!.direction : null;
+                  const sortDir = isSorted ? (sort?.direction ?? null) : null;
                   return (
                     <th
                       key={h.id}
@@ -1080,8 +1467,14 @@ export function TableView({
                         )}
                       </div>
                       {!isSel && h.column.getCanResize() && (
-                        <div
-                          onMouseDown={h.getResizeHandler()}
+                        <button
+                          type="button"
+                          aria-label={`Resize ${colId} column`}
+                          tabIndex={-1}
+                          onMouseDown={(event) => {
+                            event.stopPropagation();
+                            h.getResizeHandler()(event);
+                          }}
                           onClick={(e) => e.stopPropagation()}
                           style={{
                             position: "absolute",
@@ -1089,6 +1482,8 @@ export function TableView({
                             top: 0,
                             height: "100%",
                             width: 5,
+                            padding: 0,
+                            border: "none",
                             cursor: "col-resize",
                             background: h.column.getIsResizing()
                               ? "var(--vscode-focusBorder)"
@@ -1105,11 +1500,10 @@ export function TableView({
             <tr>
               {tanTable.getHeaderGroups()[0]?.headers.map((h) => {
                 const isSel = h.column.id === "__sel";
-                const col = columns.find((c) => c.name === h.column.id);
-                const isNullFilter = filters[h.column.id] === NULL_SENTINEL;
+                const col = columnsMap.get(h.column.id);
                 return (
                   <th
-                    key={h.id + "_f"}
+                    key={`${h.id}_f`}
                     style={{
                       width: h.getSize(),
                       height: FILTER_H,
@@ -1127,101 +1521,17 @@ export function TableView({
                         "0 -1px 0 0 var(--vscode-editorGroupHeader-tabsBackground)",
                     }}
                   >
-                    {!isSel && (
-                      <div
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 2,
-                          height: "100%",
-                        }}
-                      >
-                        <input
-                          value={
-                            isNullFilter ? "" : (filters[h.column.id] ?? "")
-                          }
-                          disabled={isNullFilter}
-                          onChange={(e) =>
-                            setFilters((f) => ({
-                              ...f,
-                              [h.column.id]: e.target.value,
-                            }))
-                          }
-                          placeholder={
-                            isNullFilter
-                              ? "NULL"
-                              : col?.isBoolean
-                                ? "true / false"
-                                : "filter"
-                          }
-                          style={{
-                            flex: 1,
-                            minWidth: 0,
-                            height: "100%",
-                            padding: "0 4px",
-                            fontSize: 11,
-                            background: "var(--vscode-input-background)",
-                            color: isNullFilter
-                              ? "var(--vscode-disabledForeground)"
-                              : "var(--vscode-input-foreground)",
-                            border: "1px solid transparent",
-                            borderRadius: 2,
-                            fontFamily: "inherit",
-                            outline: "none",
-                            boxSizing: "border-box",
-                            opacity: isNullFilter ? 0.55 : 1,
-                            fontStyle: isNullFilter ? "italic" : "normal",
-                          }}
-                          onFocus={(e) => {
-                            if (!isNullFilter) {
-                              e.target.style.borderColor =
-                                "var(--vscode-focusBorder)";
-                            }
-                          }}
-                          onBlur={(e) => {
-                            e.target.style.borderColor = "transparent";
-                          }}
-                        />
-                        {col?.nullable && (
-                          <button
-                            onClick={() =>
-                              setFilters((f) => ({
-                                ...f,
-                                [h.column.id]: isNullFilter
-                                  ? ""
-                                  : NULL_SENTINEL,
-                              }))
-                            }
-                            title={
-                              isNullFilter
-                                ? "Remove NULL filter"
-                                : "Filter by NULL"
-                            }
-                            style={{
-                              flexShrink: 0,
-                              height: "100%",
-                              padding: "0 5px",
-                              fontSize: 9,
-                              fontStyle: "italic",
-                              fontFamily: "inherit",
-                              background: isNullFilter
-                                ? "var(--vscode-button-background)"
-                                : "transparent",
-                              color: isNullFilter
-                                ? "var(--vscode-button-foreground)"
-                                : "var(--vscode-badge-foreground)",
-                              border: "none",
-                              borderRadius: 2,
-                              cursor: "pointer",
-                              letterSpacing: "0.02em",
-                              opacity: isNullFilter ? 1 : 0.5,
-                            }}
-                          >
-                            NULL
-                          </button>
-                        )}
-                      </div>
-                    )}
+                    {isSel ? (
+                      <span style={SR_ONLY_STYLE}>Selection column</span>
+                    ) : col ? (
+                      <ColumnFilterControl
+                        column={col}
+                        draft={filterDrafts[h.column.id]}
+                        onChange={(nextDraft) =>
+                          updateFilterDraft(h.column.id, nextDraft)
+                        }
+                      />
+                    ) : null}
                   </th>
                 );
               })}
@@ -1229,23 +1539,54 @@ export function TableView({
           </thead>
           <tbody>
             {virtItems.length > 0 && virtItems[0].start > 0 && (
-              <tr style={{ height: virtItems[0].start }} />
+              <tr>
+                <td
+                  colSpan={tanColumns.length}
+                  style={{
+                    height: virtItems[0].start,
+                    padding: 0,
+                    border: "none",
+                  }}
+                />
+              </tr>
             )}
             {virtItems.map((vRow) => {
-              const row = tableRows[vRow.index];
-              const isSelected = selected.has(vRow.index);
+              if (hasDraftRow && vRow.index === 0) {
+                return (
+                  <DraftTableRow
+                    key={vRow.key}
+                    columns={columns}
+                    visibleColumns={visibleColumns}
+                    draft={newRow}
+                    editingCol={
+                      editCell?.kind === "draft" ? editCell.col : null
+                    }
+                    onStartEdit={handleStartDraftEdit}
+                    onCommit={commitDraftCellEdit}
+                    onCancelEdit={() => setEditCell(null)}
+                  />
+                );
+              }
+
+              const persistedIndex = hasDraftRow ? vRow.index - 1 : vRow.index;
+              const row = tableRows[persistedIndex];
+              const isSelected = selected.has(persistedIndex);
               const editingCol =
-                editCell?.rowIdx === vRow.index ? editCell.col : null;
+                editCell?.kind === "persisted" &&
+                editCell.rowIdx === persistedIndex
+                  ? editCell.col
+                  : null;
+
               return (
                 <TableRow
                   key={vRow.key}
                   row={row}
-                  index={vRow.index}
+                  visualIndex={vRow.index}
+                  rowIndex={persistedIndex}
                   isSelected={isSelected}
-                  pendingCols={pendingEdits.get(vRow.index)}
+                  pendingCols={pendingEdits.get(persistedIndex)}
                   columnsMap={columnsMap}
                   editingCol={editingCol}
-                  isView={isView}
                   onStartEdit={handleStartEdit}
                 />
               );
@@ -1254,11 +1595,18 @@ export function TableView({
               (() => {
                 const last = virtItems[virtItems.length - 1];
                 const rem = totalVirtH - last.end;
-                return rem > 0 ? <tr style={{ height: rem }} /> : null;
+                return rem > 0 ? (
+                  <tr>
+                    <td
+                      colSpan={tanColumns.length}
+                      style={{ height: rem, padding: 0, border: "none" }}
+                    />
+                  </tr>
+                ) : null;
               })()}
           </tbody>
         </table>
-        {!loading && rows.length === 0 && (
+        {!loading && rows.length === 0 && !hasDraftRow && (
           <div
             style={{
               display: "flex",
@@ -1276,7 +1624,6 @@ export function TableView({
         )}
       </div>
 
-      {}
       <div
         style={{
           height: 34,
@@ -1291,6 +1638,7 @@ export function TableView({
         }}
       >
         <button
+          type="button"
           style={btn("ghost", page <= 1 || loading)}
           disabled={page <= 1 || loading}
           onClick={() => setPage((p) => Math.max(1, p - 1))}
@@ -1301,6 +1649,7 @@ export function TableView({
           Page {page} of {totalPages}
         </span>
         <button
+          type="button"
           style={btn("ghost", page >= totalPages || loading)}
           disabled={page >= totalPages || loading}
           onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
@@ -1310,6 +1659,7 @@ export function TableView({
         <div style={{ flex: 1 }} />
         <span style={{ opacity: 0.6 }}>Rows per page:</span>
         <select
+          aria-label="Rows per page"
           value={pageSize}
           onChange={(e) => {
             setPageSize(Number(e.target.value));
@@ -1336,36 +1686,363 @@ export function TableView({
           ))}
         </select>
       </div>
+
+      {mutationPreview && (
+        <MutationPreviewDialog
+          preview={mutationPreview}
+          onCancel={cancelMutationPreview}
+          onConfirm={confirmMutationPreview}
+        />
+      )}
+      {exportChoice && (
+        <ExportChoiceDialog
+          format={exportChoice.format}
+          visibleCount={rows.length}
+          totalCount={totalCount}
+          onExportVisible={() => {
+            const { format, sort: s, filters } = exportChoice;
+            setExportChoice(null);
+            postMessage(format === "csv" ? "exportCSV" : "exportJSON", {
+              sort: s,
+              filters,
+              limitToPage: { page, pageSize },
+            });
+          }}
+          onExportAll={() => {
+            const { format, sort: s, filters } = exportChoice;
+            setExportChoice(null);
+            postMessage(format === "csv" ? "exportCSV" : "exportJSON", {
+              sort: s,
+              filters,
+            });
+          }}
+          onCancel={() => setExportChoice(null)}
+        />
+      )}
+    </main>
+  );
+}
+
+function ExportChoiceDialog({
+  format,
+  visibleCount,
+  totalCount,
+  onExportVisible,
+  onExportAll,
+  onCancel,
+}: {
+  format: "csv" | "json";
+  visibleCount: number;
+  totalCount: number;
+  onExportVisible: () => void;
+  onExportAll: () => void;
+  onCancel: () => void;
+}) {
+  const titleId = useId();
+  const descriptionId = useId();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const cancelButtonRef = useRef<HTMLButtonElement>(null);
+  const handleKeyDown = useDialogFocusTrap({
+    dialogRef,
+    initialFocusRef: cancelButtonRef,
+    onEscape: onCancel,
+  });
+
+  const ext = format.toUpperCase();
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        inset: 0,
+        zIndex: 30,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 24,
+        background: "rgba(0, 0, 0, 0.36)",
+        backdropFilter: "blur(2px)",
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={descriptionId}
+        tabIndex={-1}
+        ref={dialogRef}
+        onKeyDown={handleKeyDown}
+        style={{
+          width: "min(480px, calc(100vw - 48px))",
+          display: "flex",
+          flexDirection: "column",
+          overflow: "hidden",
+          borderRadius: 6,
+          border: "1px solid var(--vscode-panel-border)",
+          background: "var(--vscode-editor-background)",
+          boxShadow: "0 18px 48px rgba(0, 0, 0, 0.42)",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+            padding: "14px 16px 12px",
+            borderBottom: "1px solid var(--vscode-panel-border)",
+            background: "var(--vscode-editorGroupHeader-tabsBackground)",
+          }}
+        >
+          <div id={titleId} style={{ fontSize: 13, fontWeight: 600 }}>
+            Export {ext}
+          </div>
+          <button
+            type="button"
+            ref={cancelButtonRef}
+            onClick={onCancel}
+            aria-label="Close export dialog"
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "var(--vscode-foreground)",
+              cursor: "pointer",
+              padding: 0,
+              opacity: 0.8,
+            }}
+          >
+            <Icon name="close" size={14} />
+          </button>
+        </div>
+
+        <div
+          style={{
+            padding: "16px",
+            display: "flex",
+            flexDirection: "column",
+            gap: 16,
+          }}
+        >
+          <p
+            id={descriptionId}
+            style={{ margin: 0, fontSize: 13, lineHeight: 1.5 }}
+          >
+            The table has <strong>{totalCount.toLocaleString()} rows</strong> in
+            total, but only{" "}
+            <strong>{visibleCount.toLocaleString()} rows</strong> are currently
+            visible on this page. Choose what to export:
+          </p>
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            <button
+              type="button"
+              style={{ ...btn("ghost"), justifyContent: "flex-start" }}
+              onClick={onExportVisible}
+            >
+              Export visible ({visibleCount.toLocaleString()} rows)
+            </button>
+            <button
+              type="button"
+              style={{ ...btn("ghost"), justifyContent: "flex-start" }}
+              onClick={onExportAll}
+            >
+              Export full table ({totalCount.toLocaleString()} rows)
+              <span style={{ opacity: 0.65, fontSize: 11, marginLeft: 6 }}>
+                ⚠ may be a heavy operation
+              </span>
+            </button>
+          </div>
+          <div style={{ display: "flex", justifyContent: "flex-end" }}>
+            <button type="button" style={btn("ghost")} onClick={onCancel}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MutationPreviewDialog({
+  preview,
+  onCancel,
+  onConfirm,
+}: {
+  preview: TableMutationPreviewPayload;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const confirmLabel =
+    preview.kind === "applyChanges"
+      ? "Apply Changes"
+      : preview.kind === "insertRow"
+        ? "Insert Row"
+        : "Apply Changes";
+  const titleId = useId();
+  const descriptionId = useId();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const handleDialogKeyDown = useDialogFocusTrap({
+    dialogRef,
+    initialFocusRef: closeButtonRef,
+  });
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        inset: 0,
+        zIndex: 30,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 24,
+        background: "rgba(0, 0, 0, 0.36)",
+        backdropFilter: "blur(2px)",
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={descriptionId}
+        tabIndex={-1}
+        ref={dialogRef}
+        onKeyDown={handleDialogKeyDown}
+        style={{
+          width: "min(920px, calc(100vw - 48px))",
+          maxHeight: "calc(100vh - 48px)",
+          display: "flex",
+          flexDirection: "column",
+          overflow: "hidden",
+          borderRadius: 6,
+          border: "1px solid var(--vscode-panel-border)",
+          background: "var(--vscode-editor-background)",
+          boxShadow: "0 18px 48px rgba(0, 0, 0, 0.42)",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "flex-start",
+            justifyContent: "space-between",
+            gap: 12,
+            padding: "14px 16px 12px",
+            borderBottom: "1px solid var(--vscode-panel-border)",
+            background: "var(--vscode-editorGroupHeader-tabsBackground)",
+          }}
+        >
+          <div style={{ minWidth: 0 }}>
+            <div id={titleId} style={{ fontSize: 13, fontWeight: 600 }}>
+              {preview.title}
+            </div>
+            <div
+              id={descriptionId}
+              style={{
+                marginTop: 4,
+                fontSize: 11,
+                opacity: 0.75,
+              }}
+            >
+              {preview.statementCount} statement
+              {preview.statementCount === 1 ? "" : "s"} will be executed. The
+              SQL below is read only and matches the prepared mutation plan.
+            </div>
+          </div>
+          <button
+            type="button"
+            ref={closeButtonRef}
+            onClick={onCancel}
+            aria-label="Close SQL preview"
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "var(--vscode-foreground)",
+              cursor: "pointer",
+              padding: 0,
+              opacity: 0.8,
+            }}
+          >
+            <Icon name="close" size={14} />
+          </button>
+        </div>
+
+        <div
+          style={{
+            padding: "12px 16px 16px",
+            display: "flex",
+            flexDirection: "column",
+            gap: 12,
+          }}
+        >
+          <div
+            style={{
+              height: PREVIEW_DIALOG_EDITOR_H,
+              border: "1px solid var(--vscode-panel-border)",
+              borderRadius: 4,
+              overflow: "hidden",
+            }}
+          >
+            <MonacoEditor
+              key={preview.previewToken}
+              initialValue={preview.sql}
+              height="100%"
+              readOnly
+              ariaLabel="SQL mutation preview"
+            />
+          </div>
+
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "flex-end",
+              gap: 8,
+            }}
+          >
+            <button type="button" style={btn("ghost")} onClick={onCancel}>
+              Cancel
+            </button>
+            <button type="button" style={btn("primary")} onClick={onConfirm}>
+              {confirmLabel}
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
 
 const TableRow = React.memo(function TableRow({
   row,
-  index,
+  visualIndex,
+  rowIndex,
   isSelected,
   pendingCols,
   columnsMap,
   editingCol,
-  isView,
   onStartEdit,
 }: {
   row: ReturnType<ReturnType<typeof useReactTable>["getRowModel"]>["rows"][0];
-  index: number;
+  visualIndex: number;
+  rowIndex: number;
   isSelected: boolean;
   pendingCols?: Map<string, unknown>;
 
-  columnsMap: Map<string, ColDef>;
-
+  columnsMap: Map<string, ColumnMeta>;
   editingCol: string | null;
-  isView: boolean;
 
-  onStartEdit: (rowIndex: number, col: ColDef) => void;
+  onStartEdit: (rowIndex: number, col: ColumnMeta) => void;
 }) {
   return (
     <tr
-      className="hdb-trow"
-      data-even={String(index % 2 === 0)}
+      className="rdb-trow"
+      data-even={String(visualIndex % 2 === 0)}
+      data-editing-col={editingCol ?? ""}
       data-selected={String(isSelected)}
       style={{
         height: ROW_H,
@@ -1381,37 +2058,33 @@ const TableRow = React.memo(function TableRow({
         const isPk = colDef?.isPrimaryKey ?? false;
         const isSel = colId === "__sel";
         const isCellPending = pendingCols?.has(colId) ?? false;
+        const isEditing = colId === editingCol;
         return (
           <td
             key={cell.id}
             style={{
               width: cell.column.getSize(),
               height: ROW_H,
-              padding: isSel ? "0 6px" : "0 0 0 8px",
-              textAlign: isSel ? "center" : "left",
-              borderBottom: "1px solid var(--vscode-panel-border)",
-              borderRight: "1px solid var(--vscode-panel-border)",
-              borderLeft: isCellPending
-                ? "3px solid var(--vscode-editorWarning-foreground, #cca700)"
-                : "none",
+              padding: isEditing ? "0" : isSel ? "0 6px" : "0 0 0 8px",
+              textAlign: isSel
+                ? "center"
+                : colDef && isNumericCategory(colDef.category)
+                  ? "right"
+                  : "left",
+              border: "1px solid var(--vscode-panel-border)",
               whiteSpace: "nowrap",
               overflow: "hidden",
               textOverflow: "ellipsis",
               boxSizing: "border-box",
               verticalAlign: "middle",
-              cursor: isSel || isView ? "default" : "pointer",
-
+              cursor: isSel || !canEditColumn(colDef) ? "default" : "pointer",
               userSelect: isSel ? "auto" : "none",
-              background: isPk
-                ? "var(--vscode-badge-background, rgba(128,128,128,0.12))"
-                : isCellPending
-                  ? "rgba(200,150,0,0.07)"
-                  : undefined,
+              background: isCellPending ? "rgba(200, 150, 0, 0.23)" : undefined,
             }}
             title={isPk ? `PK: ${String(cell.getValue())}` : undefined}
             onDoubleClick={() => {
-              if (colDef && !isSel && !isView) {
-                onStartEdit(index, colDef);
+              if (colDef && !isSel && canEditColumn(colDef)) {
+                onStartEdit(rowIndex, colDef);
               }
             }}
           >
@@ -1423,157 +2096,131 @@ const TableRow = React.memo(function TableRow({
   );
 });
 
-export const NULL_SENTINEL = "\x00__NULL__\x00";
-
-function EditInput({
-  initial,
-  nullable,
-  isBoolean,
+const DraftTableRow = React.memo(function DraftTableRow({
+  columns,
+  visibleColumns,
+  draft,
+  editingCol,
+  onStartEdit,
   onCommit,
-  onCancel,
+  onCancelEdit,
 }: {
-  initial: string;
-  nullable: boolean;
-  isBoolean?: boolean;
-  onCommit: (v: string) => void;
-  onCancel: () => void;
+  columns: readonly ColumnMeta[];
+  visibleColumns: readonly TanStackColumn<Row, unknown>[];
+  draft: InsertDraftRow;
+  editingCol: string | null;
+  onStartEdit: (col: ColumnMeta) => void;
+  onCommit: (column: ColumnMeta, value: string) => void;
+  onCancelEdit: () => void;
 }) {
-  const isInitiallyNull = initial === NULL_SENTINEL;
-  const [isNull, setIsNull] = useState(isInitiallyNull);
-  const [val, setVal] = useState(isInitiallyNull ? "" : initial);
-  const ref = useRef<HTMLInputElement>(null);
-
-  useLayoutEffect(() => {
-    if (!isNull) {
-      ref.current?.focus();
-      ref.current?.select();
-    }
-  }, [isNull]);
-
-  const commit = () => onCommit(isNull ? NULL_SENTINEL : val);
-
-  const inputStyle: React.CSSProperties = {
-    flex: 1,
-    minWidth: 0,
-    height: ROW_H - 4,
-    padding: "0 4px",
-    fontSize: 12,
-    fontFamily: "inherit",
-    background: "var(--vscode-input-background)",
-    color: isNull
-      ? "var(--vscode-disabledForeground)"
-      : "var(--vscode-input-foreground)",
-    border: "1px solid var(--vscode-focusBorder)",
-    borderRadius: 2,
-    outline: "none",
-    boxSizing: "border-box",
-    opacity: isNull ? 0.5 : 1,
-  };
-
-  const nullBtnStyle: React.CSSProperties = {
-    flexShrink: 0,
-    height: "100%",
-    padding: "0 5px",
-    fontSize: 9,
-    fontStyle: "italic",
-    fontFamily: "inherit",
-    background: "transparent",
-    color: "var(--vscode-badge-foreground)",
-    border: "none",
-    borderRadius: 2,
-    cursor: "pointer",
-    letterSpacing: "0.02em",
-    opacity: 0.5,
-  };
+  const columnsMap = useMemo(
+    () => new Map(columns.map((column) => [column.name, column])),
+    [columns],
+  );
 
   return (
-    <div
-      style={{ display: "flex", alignItems: "center", gap: 2, width: "100%" }}
-    >
-      <input
-        ref={ref}
-        value={val}
-        disabled={isNull}
-        onChange={(e) => setVal(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            commit();
-          }
-          if (e.key === "Escape") {
-            e.preventDefault();
-            onCancel();
-          }
-        }}
-        onBlur={commit}
-        onClick={(e) => e.stopPropagation()}
-        style={inputStyle}
-      />
-      {nullable && (
-        <button
-          data-null-btn="1"
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={() => onCommit(NULL_SENTINEL)}
-          title="Set field to NULL"
-          style={nullBtnStyle}
-        >
-          NULL
-        </button>
-      )}
-    </div>
+    <tr className="rdb-trow" data-even="true" data-selected="false">
+      {visibleColumns.map((column) => {
+        const colId = column.id;
+        const colDef = columnsMap.get(colId);
+        const isSelectionColumn = colId === "__sel";
+
+        if (isSelectionColumn || !colDef) {
+          return (
+            <td
+              key={colId}
+              style={{
+                width: column.getSize(),
+                height: ROW_H,
+                padding: "0 6px",
+                textAlign: "center",
+                border: "1px solid var(--vscode-panel-border)",
+                boxSizing: "border-box",
+                background: "rgba(200, 150, 0, 0.23)",
+              }}
+            />
+          );
+        }
+
+        const draftCell = draft[colId] ?? {
+          value: INSERT_DEFAULT_SENTINEL,
+        };
+        const isEditing = editingCol === colId;
+        const isDefault = draftCell.value === INSERT_DEFAULT_SENTINEL;
+        const displayValue =
+          draftCell.value === NULL_SENTINEL ? null : draftCell.value;
+
+        return (
+          <td
+            key={colId}
+            style={{
+              width: column.getSize(),
+              height: ROW_H,
+              padding: isEditing ? "0" : "0 0 0 8px",
+              textAlign: isNumericCategory(colDef.category) ? "right" : "left",
+              border: "1px solid var(--vscode-panel-border)",
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              boxSizing: "border-box",
+              verticalAlign: "middle",
+              cursor: "pointer",
+              userSelect: "none",
+              background: "rgba(200, 150, 0, 0.23)",
+            }}
+            onDoubleClick={() => onStartEdit(colDef)}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                width: "100%",
+                height: "100%",
+              }}
+            >
+              <div
+                style={{
+                  minWidth: 0,
+                  flex: 1,
+                  height: "100%",
+                  display: "flex",
+                  alignItems: "center",
+                }}
+              >
+                {isEditing ? (
+                  <EditInput
+                    initial={toDraftEditInitialValue(draftCell.value)}
+                    nullable={colDef.nullable}
+                    category={colDef.category}
+                    suppressPlaceholder
+                    showDefaultButton
+                    onSetDefault={() =>
+                      onCommit(colDef, INSERT_DEFAULT_SENTINEL)
+                    }
+                    onCommit={(value) => onCommit(colDef, value)}
+                    onCancel={onCancelEdit}
+                  />
+                ) : isDefault ? (
+                  <span
+                    style={{
+                      fontStyle: "italic",
+                      opacity: 0.65,
+                    }}
+                  >
+                    DEFAULT
+                  </span>
+                ) : (
+                  <CellDisplay
+                    value={displayValue}
+                    isPending
+                    category={colDef.category}
+                  />
+                )}
+              </div>
+            </div>
+          </td>
+        );
+      })}
+    </tr>
   );
-}
-
-function CellDisplay({
-  value,
-  isPk,
-  isPending,
-  isBoolean,
-}: {
-  value: unknown;
-  isPk: boolean;
-  isPending: boolean;
-  isBoolean?: boolean;
-}) {
-  if (value === null || value === undefined) {
-    return <span style={{ fontStyle: "italic", opacity: 0.45 }}>NULL</span>;
-  }
-
-  const isBoolVal =
-    typeof value === "boolean" ||
-    (isBoolean &&
-      (value === 0 ||
-        value === 1 ||
-        value === "0" ||
-        value === "1" ||
-        value === "true" ||
-        value === "false"));
-  if (isBoolVal) {
-    const boolVal =
-      value === true || value === 1 || value === "1" || value === "true";
-    return (
-      <span
-        style={{
-          color: boolVal
-            ? "var(--vscode-testing-iconPassed, #4ec94e)"
-            : "var(--vscode-errorForeground)",
-          fontWeight: 500,
-        }}
-      >
-        {boolVal ? "true" : "false"}
-      </span>
-    );
-  }
-
-  return (
-    <span
-      style={{
-        color: isPending
-          ? "var(--vscode-editorWarning-foreground, #cca700)"
-          : undefined,
-      }}
-    >
-      {String(value)}
-    </span>
-  );
-}
+});

@@ -35,15 +35,6 @@
     "database manager",
     "db client"
   ],
-  "activationEvents": [
-    "onView:rapidb-explorer",
-    "onView:rapidb-history",
-    "onView:rapidb-bookmarks",
-    "onCommand:rapidb.addConnection",
-    "onCommand:rapidb.newQuery",
-    "onCommand:rapidb.disconnectAll",
-    "onCommand:rapidb.refresh"
-  ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
@@ -487,14 +478,39 @@
   },
   "scripts": {
     "vscode:prepublish": "node esbuild.config.mjs --production",
-    "build": "npm i && node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs",
     "watch": "node esbuild.config.mjs --watch",
-    "compile": "node esbuild.config.mjs",
-    "test:db": "tsc -p tsconfig.test.json && node esbuild.test.mjs && node dist/test/db-smoke.cjs",
-    "package": "vsce package",
-    "lint": "eslint src --ext ts,tsx"
+    "compile": "npm run build",
+    "check": "npm run typecheck && npm run lint",
+    "lint": "biome check . --max-diagnostics=none",
+    "lint:fix": "biome check . --write --unsafe --max-diagnostics=none",
+    "typecheck": "npm run typecheck:extension && npm run typecheck:webview && npm run typecheck:tests",
+    "typecheck:extension": "tsc -p tsconfig.extension.json --noEmit",
+    "typecheck:webview": "tsc -p tsconfig.webview.json --noEmit",
+    "typecheck:tests": "tsc -p tsconfig.tests.json --noEmit",
+    "test": "node ./tests/scripts/run-npm-scripts.mjs compile typecheck test:unit test:webview test:db test:extension",
+    "test:unit": "vitest run --project unit-node",
+    "test:webview": "vitest run --project webview-jsdom",
+    "test:db": "node ./tests/scripts/run-npm-scripts.mjs db:up db:prepare test:db:sqlite test:db:postgres test:db:mysql test:db:mssql test:db:oracle db:down --finally-if-env-not RAPIDB_KEEP_TEST_SERVICES",
+    "test:db:sqlite": "vitest run --project db-sqlite",
+    "test:db:postgres": "vitest run --project db-postgres",
+    "test:db:mysql": "vitest run --project db-mysql",
+    "test:db:mssql": "vitest run --project db-mssql",
+    "test:db:oracle": "vitest run --project db-oracle",
+    "test:extension": "vitest run --project extension-host",
+    "db:check": "node ./tests/scripts/db-check.mjs",
+    "db:up": "npm run db:check && docker compose -f ./compose.yaml up -d postgres mysql mssql oracle",
+    "db:wait": "node --experimental-strip-types ./tests/scripts/db-wait.ts",
+    "db:reset": "node --experimental-strip-types ./tests/scripts/db-reset.ts",
+    "db:seed": "node --experimental-strip-types ./tests/scripts/db-seed.ts",
+    "db:prepare": "node ./tests/scripts/run-npm-scripts.mjs db:wait db:reset db:seed",
+    "db:down": "docker compose -f ./compose.yaml down --remove-orphans",
+    "package": "vsce package"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.4.13",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
     "@types/mssql": "^9.1.9",
     "@types/node": "^25.5.0",
     "@types/oracledb": "^6.10.2",
@@ -502,8 +518,12 @@
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@types/vscode": "^1.85.0",
+    "@vscode/test-electron": "^2.5.2",
+    "axe-core": "^4.11.3",
     "esbuild": "^0.27.4",
-    "typescript": "^5.9.3"
+    "jsdom": "^29.0.2",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.4"
   },
   "dependencies": {
     "@tanstack/react-table": "^8.21.3",

@@ -1,0 +1,12 @@
+import {
+  resolveRequestedComposeBackedEngines,
+  waitForComposeBackedDatabases,
+} from "../runtime/liveDbOrchestration.ts";
+
+try {
+  const engines = resolveRequestedComposeBackedEngines(process.argv.slice(2));
+  await waitForComposeBackedDatabases(engines);
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+}

@@ -1,5 +1,5 @@
-// biome-ignore lint/style/useImportType: React needed for JSX
 import React from "react";
+import { buildButtonStyle } from "../utils/buttonStyles";
 
 interface Props {
   context?: string;
@@ -77,16 +77,7 @@ export class ErrorBoundary extends React.Component<Props, State> {
           <button
             type="button"
             onClick={this.handleRetry}
-            style={{
-              padding: "4px 14px",
-              fontSize: 12,
-              borderRadius: 2,
-              cursor: "pointer",
-              fontFamily: "inherit",
-              background: "var(--vscode-button-background)",
-              color: "var(--vscode-button-foreground)",
-              border: "none",
-            }}
+            style={buildButtonStyle("primary", { size: "sm" })}
           >
             Retry
           </button>

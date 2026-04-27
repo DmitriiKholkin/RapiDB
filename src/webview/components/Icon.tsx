@@ -1,5 +1,16 @@
-// biome-ignore lint/style/useImportType: <explanation>
-import React from "react";
+import React, { CSSProperties, ReactElement } from "react";
+
+const visuallyHiddenStyle: CSSProperties = {
+  position: "absolute",
+  width: 1,
+  height: 1,
+  padding: 0,
+  margin: -1,
+  overflow: "hidden",
+  clip: "rect(0, 0, 0, 0)",
+  whiteSpace: "nowrap",
+  border: 0,
+};
 
 interface IconProps {
   name: string;
@@ -8,7 +19,7 @@ interface IconProps {
   spin?: boolean;
   className?: string;
   title?: string;
-  style?: React.CSSProperties;
+  style?: CSSProperties;
 }
 
 export function Icon({
@@ -19,13 +30,13 @@ export function Icon({
   className,
   title,
   style,
-}: IconProps) {
+}: IconProps): ReactElement {
   return (
-    <i
+    <span
       className={`codicon codicon-${name}${className ? ` ${className}` : ""}`}
       title={title}
-      aria-hidden={!title}
-      aria-label={title}
+      role={title ? "img" : undefined}
+      aria-hidden={title ? undefined : true}
       style={{
         display: "inline-flex",
         alignItems: "center",
@@ -40,7 +51,9 @@ export function Icon({
         flexShrink: 0,
         ...style,
       }}
-    />
+    >
+      {title ? <span style={visuallyHiddenStyle}>{title}</span> : null}
+    </span>
   );
 }
 

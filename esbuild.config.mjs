@@ -1,9 +1,6 @@
 import * as esbuild from "esbuild";
-
 const isWatch = process.argv.includes("--watch");
 const isProduction = process.argv.includes("--production");
-
-/** @type {import('esbuild').BuildOptions} */
 const extensionConfig = {
   entryPoints: ["src/extension/extension.ts"],
   bundle: true,
@@ -17,8 +14,6 @@ const extensionConfig = {
   minify: isProduction,
   logLevel: "info",
 };
-
-/** @type {import('esbuild').BuildOptions} */
 const webviewConfig = {
   entryPoints: ["src/webview/main.tsx"],
   bundle: true,
@@ -46,7 +41,6 @@ const webviewConfig = {
     "process.env.NODE_ENV": isProduction ? '"production"' : '"development"',
   },
 };
-
 async function build() {
   if (isWatch) {
     console.log("⚡ RapiDB — watch mode (extension + webview)");
@@ -67,7 +61,6 @@ async function build() {
     console.log("✅ Build complete → dist/");
   }
 }
-
 build().catch((err) => {
   console.error(err);
   process.exit(1);

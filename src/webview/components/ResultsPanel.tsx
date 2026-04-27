@@ -8,17 +8,14 @@ import {
   useReactTable,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import React, {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import React, { useCallback, useMemo, useRef, useState } from "react";
 import type { QueryResult, QueryStatus } from "../store";
+import { buildButtonStyle } from "../utils/buttonStyles";
 import { type Column, calcColWidths } from "../utils/columnSizing";
 import { postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
+import { CellDisplay } from "./table/CellDisplay";
+import { EditInput, valueToEditString } from "./table/EditInput";
 
 interface Props {
   status: QueryStatus;
@@ -105,7 +102,12 @@ function DataTable({ result }: { result: QueryResult }) {
   } = result;
 
   const [sorting, setSorting] = useState<SortingState>([]);
+  const [activeCell, setActiveCell] = useState<{
+    rowIndex: number;
+    columnId: string;
+  } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const truncatedCount = truncatedAt ?? rowCount;
 
   const colSizes = useMemo(
     () =>
@@ -120,7 +122,7 @@ function DataTable({ result }: { result: QueryResult }) {
         rows,
         { hPad: 19 },
       ),
-    [result],
+    [colNames, rows],
   );
 
   const columns = useMemo<ColumnDef<Record<string, unknown>>[]>(
@@ -134,7 +136,9 @@ function DataTable({ result }: { result: QueryResult }) {
           size: colSizes[key] ?? 160,
           minSize: 40,
           maxSize: 800,
-          cell: (info) => <CellValue value={info.getValue()} />,
+          cell: (info) => (
+            <CellDisplay value={info.getValue()} isPending={false} />
+          ),
         };
       }),
     [colNames, colSizes],
@@ -198,7 +202,7 @@ function DataTable({ result }: { result: QueryResult }) {
       >
         <span style={{ opacity: 0.7 }}>
           {truncated
-            ? `${truncatedAt!.toLocaleString()} rows (truncated — query returned more)`
+            ? `${truncatedCount.toLocaleString()} rows (truncated — query returned more)`
             : `${rowCount.toLocaleString()} row${rowCount !== 1 ? "s" : ""}`}
           <span style={{ opacity: 0.5, marginLeft: 6 }}>
             {executionTimeMs} ms
@@ -206,16 +210,12 @@ function DataTable({ result }: { result: QueryResult }) {
         </span>
         <div style={{ display: "flex", gap: 4 }}>
           <ToolbarBtn onClick={exportCSV} title="Export results as CSV file">
-            <>
-              <Icon name="export" size={12} style={{ marginRight: 3 }} />
-              Export CSV
-            </>
+            <Icon name="export" size={12} style={{ marginRight: 3 }} />
+            Export CSV
           </ToolbarBtn>
           <ToolbarBtn onClick={exportJSON} title="Export results as JSON file">
-            <>
-              <Icon name="export" size={12} style={{ marginRight: 3 }} />
-              Export JSON
-            </>
+            <Icon name="export" size={12} style={{ marginRight: 3 }} />
+            Export JSON
           </ToolbarBtn>
         </div>
       </div>
@@ -227,14 +227,14 @@ function DataTable({ result }: { result: QueryResult }) {
             flexShrink: 0,
             display: "flex",
             alignItems: "center",
-            gap: 6,
-            padding: "5px 10px",
-            fontSize: 11,
+            gap: 8,
+            padding: "6px 12px",
+            fontSize: 12,
             background:
-              "var(--vscode-inputValidation-warningBackground, rgba(200,150,0,0.15))",
+              "var(--vscode-inputValidation-warningBackground, rgba(180,120,0,0.15))",
             borderBottom:
-              "1px solid var(--vscode-inputValidation-warningBorder, rgba(200,150,0,0.5))",
-            color: "var(--vscode-foreground)",
+              "1px solid var(--vscode-inputValidation-warningBorder, rgba(180,120,0,0.4))",
+            color: "var(--vscode-editorWarning-foreground, #CCA700)",
           }}
         >
           <Icon
@@ -243,7 +243,7 @@ function DataTable({ result }: { result: QueryResult }) {
             style={{ opacity: 0.8, flexShrink: 0 }}
           />
           <span>
-            Result limited to <strong>{truncatedAt!.toLocaleString()}</strong>{" "}
+            Result limited to <strong>{truncatedCount.toLocaleString()}</strong>{" "}
             rows. The query returned more data. Use <code>LIMIT</code> in your
             query or increase <em>RapiDB: Query Row Limit</em> in settings.
           </span>
@@ -342,7 +342,9 @@ function DataTable({ result }: { result: QueryResult }) {
 
                       {}
                       {header.column.getCanResize() && (
-                        <div
+                        <button
+                          type="button"
+                          aria-label={`Resize ${typeof header.column.columnDef.header === "string" ? header.column.columnDef.header : header.column.id} column`}
                           onMouseDown={header.getResizeHandler()}
                           onTouchStart={header.getResizeHandler()}
                           onClick={(e) => e.stopPropagation()}
@@ -358,6 +360,8 @@ function DataTable({ result }: { result: QueryResult }) {
                               ? "var(--vscode-focusBorder)"
                               : "transparent",
                             zIndex: 1,
+                            border: "none",
+                            padding: 0,
                           }}
                         />
                       )}
@@ -377,7 +381,18 @@ function DataTable({ result }: { result: QueryResult }) {
 
             {virtItems.map((vRow) => {
               const row = tableRows[vRow.index];
-              return <VirtualRow key={vRow.key} row={row} index={vRow.index} />;
+              return (
+                <VirtualRow
+                  key={vRow.key}
+                  row={row}
+                  index={vRow.index}
+                  activeCell={activeCell}
+                  onActivateCell={(rowIndex, columnId) =>
+                    setActiveCell({ rowIndex, columnId })
+                  }
+                  onDeactivateCell={() => setActiveCell(null)}
+                />
+              );
             })}
 
             {}
@@ -404,10 +419,10 @@ if (
   const s = document.createElement("style");
   s.id = RESULTS_ROW_STYLE_ID;
   s.textContent = [
-    `.hdb-rrow { transition: background 60ms; }`,
-    `.hdb-rrow[data-even="true"]  { background: var(--vscode-editor-background); }`,
-    `.hdb-rrow[data-even="false"] { background: var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.04)); }`,
-    `.hdb-rrow:hover { background: var(--vscode-list-hoverBackground); }`,
+    `.rdb-rrow { transition: background 60ms; }`,
+    `.rdb-rrow[data-even="true"]  { background: var(--vscode-editor-background); }`,
+    `.rdb-rrow[data-even="false"] { background: var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.04)); }`,
+    `.rdb-rrow:hover { background: var(--vscode-list-hoverBackground); }`,
   ].join("\n");
   document.head.appendChild(s);
 }
@@ -415,67 +430,66 @@ if (
 const VirtualRow = React.memo(function VirtualRow({
   row,
   index,
+  activeCell,
+  onActivateCell,
+  onDeactivateCell,
 }: {
   row: ReturnType<ReturnType<typeof useReactTable>["getRowModel"]>["rows"][0];
   index: number;
+  activeCell: { rowIndex: number; columnId: string } | null;
+  onActivateCell: (rowIndex: number, columnId: string) => void;
+  onDeactivateCell: () => void;
 }) {
   return (
     <tr
-      className="hdb-rrow"
+      className="rdb-rrow"
       data-even={String(index % 2 === 0)}
       style={{ height: ROW_H }}
     >
       {row.getVisibleCells().map((cell) => {
         const raw = cell.getValue();
-        const isNum = typeof raw === "number";
         const isNull = raw === null || raw === undefined;
+        const isNumeric = typeof raw === "number" || typeof raw === "bigint";
+        const isEditing =
+          activeCell?.rowIndex === index &&
+          activeCell.columnId === cell.column.id;
         return (
           <td
             key={cell.id}
             style={{
               width: cell.column.getSize(),
               height: ROW_H,
-              padding: "0 8px",
-              borderBottom: "1px solid var(--vscode-panel-border)",
-              borderRight: "1px solid var(--vscode-panel-border)",
-              textAlign: isNum ? "right" : "left",
+              padding: isEditing ? "0" : "0 8px",
+              border: "1px solid var(--vscode-panel-border)",
+              textAlign: isNumeric ? "right" : "left",
               whiteSpace: "nowrap",
               overflow: "hidden",
               textOverflow: "ellipsis",
               boxSizing: "border-box",
               verticalAlign: "middle",
-              cursor: "default",
+              cursor: "pointer",
+              userSelect: "text",
             }}
             title={isNull ? "" : String(raw)}
+            onDoubleClick={() => onActivateCell(index, cell.column.id)}
           >
-            {flexRender(cell.column.columnDef.cell, cell.getContext())}
+            {isEditing ? (
+              <EditInput
+                initial={valueToEditString(raw)}
+                nullable
+                readOnly
+                onCommit={onDeactivateCell}
+                onCancel={onDeactivateCell}
+              />
+            ) : (
+              flexRender(cell.column.columnDef.cell, cell.getContext())
+            )}
           </td>
         );
       })}
     </tr>
   );
 });
-
-function CellValue({ value }: { value: unknown }) {
-  if (value === null || value === undefined) {
-    return <span style={{ fontStyle: "italic", opacity: 0.45 }}>NULL</span>;
-  }
-  if (typeof value === "boolean") {
-    return (
-      <span
-        style={{
-          color: value
-            ? "var(--vscode-testing-iconPassed, #4ec94e)"
-            : "var(--vscode-errorForeground)",
-          fontWeight: 500,
-        }}
-      >
-        {value ? "true" : "false"}
-      </span>
-    );
-  }
-  return <>{String(value)}</>;
-}
 
 function ToolbarBtn({
   onClick,
@@ -489,21 +503,19 @@ function ToolbarBtn({
   const [hov, setHov] = useState(false);
   return (
     <button
+      type="button"
       onClick={onClick}
       title={title}
       onMouseEnter={() => setHov(true)}
       onMouseLeave={() => setHov(false)}
       style={{
-        padding: "2px 8px",
+        ...buildButtonStyle("ghost", { size: "sm" }),
+        height: 22,
+        padding: "0 8px",
         fontSize: 11,
         background: hov
           ? "var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground))"
           : "transparent",
-        color: "var(--vscode-foreground)",
-        border: "1px solid var(--vscode-panel-border)",
-        borderRadius: 2,
-        cursor: "pointer",
-        fontFamily: "inherit",
       }}
     >
       {children}

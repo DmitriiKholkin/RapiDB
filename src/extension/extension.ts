@@ -1,6 +1,11 @@
 import * as vscode from "vscode";
 import type { BookmarkEntry, HistoryEntry } from "./connectionManager";
 import { ConnectionManager } from "./connectionManager";
+import {
+  confirmBookmarkRemoval,
+  confirmConnectionRemoval,
+  pickConnectionWithPrompt,
+} from "./connectionManagerPrompts";
 import { ConnectionFormPanel } from "./panels/connectionFormPanel";
 import { QueryPanel } from "./panels/queryPanel";
 import { SchemaPanel } from "./panels/schemaPanel";
@@ -11,12 +16,40 @@ import {
   type RapiDBNode,
 } from "./providers/connectionProvider";
 import { HistoryProvider } from "./providers/historyProvider";
-
+import { connectWithProgress } from "./utils/connectOrchestration";
+import {
+  logErrorWithContext,
+  normalizeUnknownError,
+} from "./utils/errorHandling";
 let _activated = false;
-
+const CMD = {
+  addConnection: "rapidb.addConnection",
+  editConnection: "rapidb.editConnection",
+  deleteConnection: "rapidb.deleteConnection",
+  connect: "rapidb.connect",
+  disconnect: "rapidb.disconnect",
+  newQuery: "rapidb.newQuery",
+  openTableData: "rapidb.openTableData",
+  showDDL: "rapidb.showDDL",
+  copyNodeName: "rapidb.copyNodeName",
+  openSchema: "rapidb.openSchema",
+  openRoutine: "rapidb.openRoutine",
+  openHistoryEntry: "rapidb.openHistoryEntry",
+  openBookmarkEntry: "rapidb.openBookmarkEntry",
+  deleteBookmark: "rapidb.deleteBookmark",
+  clearBookmarks: "rapidb.clearBookmarks",
+  clearHistory: "rapidb.clearHistory",
+  disconnectAll: "rapidb.disconnectAll",
+  refresh: "rapidb.refresh",
+} as const;
 let _connectionManager: import("./connectionManager").ConnectionManager | null =
   null;
-
+async function resolveConnectionId(
+  node: RapiDBNode | undefined,
+  connectionManager: ConnectionManager,
+): Promise<string | undefined> {
+  return node?.connectionId ?? pickConnectionWithPrompt(connectionManager);
+}
 export function activate(context: vscode.ExtensionContext): void {
   if (_activated) {
     console.warn(
@@ -26,92 +59,63 @@ export function activate(context: vscode.ExtensionContext): void {
   }
   _activated = true;
   console.log("[RapiDB] Extension activated");
-
   const connectionManager = new ConnectionManager(context);
   _connectionManager = connectionManager;
-
   const connectionProvider = new ConnectionProvider(connectionManager);
   const treeView = vscode.window.createTreeView("rapidb-explorer", {
     treeDataProvider: connectionProvider,
     showCollapseAll: true,
   });
+  const updateExplorerBadge = () => {
+    const connectedCount = connectionManager.getConnectedCount();
+    treeView.badge =
+      connectedCount > 0
+        ? {
+            value: connectedCount,
+            tooltip: `${connectedCount} connected database${connectedCount === 1 ? "" : "s"}`,
+          }
+        : undefined;
+  };
+  updateExplorerBadge();
   context.subscriptions.push(treeView, connectionProvider.disposable);
-
+  context.subscriptions.push(
+    connectionManager.onDidConnect(() => {
+      updateExplorerBadge();
+    }),
+    connectionManager.onDidDisconnect(() => {
+      updateExplorerBadge();
+    }),
+  );
   const historyProvider = new HistoryProvider(connectionManager);
   const historyView = vscode.window.createTreeView("rapidb-history", {
     treeDataProvider: historyProvider,
     showCollapseAll: false,
   });
   context.subscriptions.push(historyView, historyProvider.disposable);
-
   const bookmarksProvider = new BookmarksProvider(connectionManager);
   const bookmarksView = vscode.window.createTreeView("rapidb-bookmarks", {
     treeDataProvider: bookmarksProvider,
     showCollapseAll: false,
   });
   context.subscriptions.push(bookmarksView, bookmarksProvider.disposable);
-
   const refresh = () => connectionProvider.refresh();
-  const connectionProgressMap = new Map<string, Promise<boolean>>();
-
-  async function connectIfNeeded(
-    connectionId: string,
-    title: string,
-    waitForExisting: boolean,
-  ): Promise<boolean> {
-    if (connectionManager.isConnected(connectionId)) {
-      return true;
-    }
-
-    const existingProgress = connectionProgressMap.get(connectionId);
-    if (existingProgress) {
-      if (!waitForExisting) {
-        return false;
-      }
-      return existingProgress;
-    }
-
-    if (connectionManager.isConnecting(connectionId)) {
-      if (!waitForExisting) {
-        return false;
-      }
-      await connectionManager.connectTo(connectionId);
-      return connectionManager.isConnected(connectionId);
-    }
-
-    const progressPromise = Promise.resolve(
-      vscode.window.withProgress(
-        {
-          location: vscode.ProgressLocation.Window,
-          title,
-        },
-        () => connectionManager.connectTo(connectionId),
-      ),
-    ).then(() => connectionManager.isConnected(connectionId));
-
-    connectionProgressMap.set(connectionId, progressPromise);
-    try {
-      return await progressPromise;
-    } finally {
-      connectionProgressMap.delete(connectionId);
-    }
-  }
-
-  function reg(
+  function reg<TArgs extends unknown[]>(
     command: string,
-    callback: (...args: any[]) => any,
+    callback: (...args: TArgs) => unknown,
   ): vscode.Disposable {
     try {
       const d = vscode.commands.registerCommand(command, callback);
       context.subscriptions.push(d);
       return d;
-    } catch (err: any) {
-      console.warn(`[RapiDB] Could not register "${command}": ${err?.message}`);
+    } catch (err: unknown) {
+      const error = normalizeUnknownError(err);
+      console.warn(
+        `[RapiDB] Could not register "${command}": ${error.message}`,
+      );
       return { dispose: () => {} };
     }
   }
-
-  reg("rapidb.addConnection", async () => {
+  reg(CMD.addConnection, async () => {
     const result = await ConnectionFormPanel.show(context, connectionManager);
     if (result) {
       vscode.window.showInformationMessage(
@@ -120,9 +124,8 @@ export function activate(context: vscode.ExtensionContext): void {
       refresh();
     }
   });
-
-  reg("rapidb.editConnection", async (node?: RapiDBNode) => {
-    const id = node?.connectionId ?? (await connectionManager.pickConnection());
+  reg(CMD.editConnection, async (node?: RapiDBNode) => {
+    const id = await resolveConnectionId(node, connectionManager);
     if (!id) {
       return;
     }
@@ -139,20 +142,18 @@ export function activate(context: vscode.ExtensionContext): void {
       refresh();
     }
   });
-
-  reg("rapidb.deleteConnection", async (node?: RapiDBNode) => {
-    const id = node?.connectionId ?? (await connectionManager.pickConnection());
+  reg(CMD.deleteConnection, async (node?: RapiDBNode) => {
+    const id = await resolveConnectionId(node, connectionManager);
     if (!id) {
       return;
     }
-    const deleted = await connectionManager.deleteConnection(id);
+    const deleted = await confirmConnectionRemoval(connectionManager, id);
     if (deleted) {
       refresh();
     }
   });
-
-  reg("rapidb.connect", async (node?: RapiDBNode) => {
-    const id = node?.connectionId ?? (await connectionManager.pickConnection());
+  reg(CMD.connect, async (node?: RapiDBNode) => {
+    const id = await resolveConnectionId(node, connectionManager);
     if (!id) {
       return;
     }
@@ -165,15 +166,20 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     const conn = connectionManager.getConnection(id);
     try {
-      await connectIfNeeded(
+      await connectWithProgress(
+        connectionManager,
         id,
         `RapiDB: Connecting to "${conn?.name ?? id}"…`,
         false,
       );
       refresh();
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const error = logErrorWithContext(
+        `Connect command failed for ${conn?.name ?? id}`,
+        err,
+      );
       const action = await vscode.window.showErrorMessage(
-        `[RapiDB] Cannot connect to "${conn?.name ?? id}": ${err.message}`,
+        `[RapiDB] Cannot connect to "${conn?.name ?? id}": ${error.message}`,
         "Edit Connection",
       );
       if (action === "Edit Connection") {
@@ -185,29 +191,35 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }
   });
-
-  reg("rapidb.disconnect", async (node?: RapiDBNode) => {
-    const id = node?.connectionId ?? (await connectionManager.pickConnection());
+  reg(CMD.disconnect, async (node?: RapiDBNode) => {
+    const id = await resolveConnectionId(node, connectionManager);
     if (!id) {
       return;
     }
     await connectionManager.disconnectFrom(id);
     refresh();
   });
-
-  reg("rapidb.newQuery", async (node?: RapiDBNode) => {
-    const connectionId =
-      node?.connectionId ?? (await connectionManager.pickConnection());
+  reg(CMD.newQuery, async (node?: RapiDBNode) => {
+    const connectionId = await resolveConnectionId(node, connectionManager);
     if (!connectionId) {
       return;
     }
     if (!connectionManager.isConnected(connectionId)) {
       try {
-        await connectIfNeeded(connectionId, "RapiDB: Connecting…", true);
+        await connectWithProgress(
+          connectionManager,
+          connectionId,
+          "RapiDB: Connecting…",
+          true,
+        );
         refresh();
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const error = logErrorWithContext(
+          `New query connect failed for ${connectionId}`,
+          err,
+        );
         vscode.window.showErrorMessage(
-          `[RapiDB] Cannot connect: ${err.message}`,
+          `[RapiDB] Cannot connect: ${error.message}`,
         );
         return;
       }
@@ -220,8 +232,7 @@ export function activate(context: vscode.ExtensionContext): void {
       true,
     );
   });
-
-  reg("rapidb.openTableData", (node?: RapiDBNode) => {
+  reg(CMD.openTableData, (node?: RapiDBNode) => {
     if (!node?.connectionId || !node.objectName) {
       return;
     }
@@ -236,28 +247,24 @@ export function activate(context: vscode.ExtensionContext): void {
       isView,
     );
   });
-
-  reg("rapidb.showDDL", async (node?: RapiDBNode) => {
+  reg(CMD.showDDL, async (node?: RapiDBNode) => {
     if (!node?.connectionId || !node.objectName) {
       vscode.window.showWarningMessage(
         "[RapiDB] Select a table or view node first.",
       );
       return;
     }
-
     const driver = connectionManager.getDriver(node.connectionId);
     if (!driver) {
       vscode.window.showErrorMessage("[RapiDB] Not connected. Connect first.");
       return;
     }
-
     try {
       const ddl = await driver.getCreateTableDDL(
         node.database ?? "",
         node.schema ?? "",
         node.objectName,
       );
-
       QueryPanel.createOrShow(
         context,
         connectionManager,
@@ -266,21 +273,21 @@ export function activate(context: vscode.ExtensionContext): void {
         true,
         true,
       );
-    } catch (err: any) {
-      vscode.window.showErrorMessage(
-        `[RapiDB] DDL error: ${err?.message ?? String(err)}`,
+    } catch (err: unknown) {
+      const error = logErrorWithContext(
+        `Load DDL failed for ${node.objectName}`,
+        err,
       );
+      vscode.window.showErrorMessage(`[RapiDB] DDL error: ${error.message}`);
     }
   });
-
-  reg("rapidb.copyNodeName", async (node?: RapiDBNode) => {
+  reg(CMD.copyNodeName, async (node?: RapiDBNode) => {
     const name = node?.objectName ?? node?.label?.toString();
     if (name) {
       await vscode.env.clipboard.writeText(name);
     }
   });
-
-  reg("rapidb.openSchema", (node?: RapiDBNode) => {
+  reg(CMD.openSchema, (node?: RapiDBNode) => {
     if (!node?.connectionId || !node.objectName) {
       return;
     }
@@ -293,30 +300,35 @@ export function activate(context: vscode.ExtensionContext): void {
       node.objectName,
     );
   });
-
-  reg("rapidb.openRoutine", async (node?: RapiDBNode) => {
+  reg(CMD.openRoutine, async (node?: RapiDBNode) => {
     if (!node?.connectionId || !node.objectName) {
       return;
     }
     const kind = node.kind as "function" | "procedure";
-
     if (!connectionManager.isConnected(node.connectionId)) {
       try {
-        await connectIfNeeded(node.connectionId, "RapiDB: Connecting…", true);
+        await connectWithProgress(
+          connectionManager,
+          node.connectionId,
+          "RapiDB: Connecting…",
+          true,
+        );
         refresh();
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const error = logErrorWithContext(
+          `Open routine connect failed for ${node.objectName}`,
+          err,
+        );
         vscode.window.showErrorMessage(
-          `[RapiDB] Cannot connect: ${err.message}`,
+          `[RapiDB] Cannot connect: ${error.message}`,
         );
         return;
       }
     }
-
     const driver = connectionManager.getDriver(node.connectionId);
     if (!driver) {
       return;
     }
-
     try {
       const sql = await driver.getRoutineDefinition(
         node.database ?? "",
@@ -324,21 +336,23 @@ export function activate(context: vscode.ExtensionContext): void {
         node.objectName,
         kind,
       );
-
       QueryPanel.createOrShow(
         context,
         connectionManager,
         node.connectionId,
         sql,
       );
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const error = logErrorWithContext(
+        `Load routine definition failed for ${node.objectName}`,
+        err,
+      );
       vscode.window.showErrorMessage(
-        `[RapiDB] Cannot load ${kind} definition: ${err.message}`,
+        `[RapiDB] Cannot load ${kind} definition: ${error.message}`,
       );
     }
   });
-
-  reg("rapidb.openHistoryEntry", (entry: HistoryEntry) => {
+  reg(CMD.openHistoryEntry, (entry: HistoryEntry) => {
     if (!entry?.connectionId || !entry?.sql) {
       return;
     }
@@ -349,8 +363,7 @@ export function activate(context: vscode.ExtensionContext): void {
       entry.sql,
     );
   });
-
-  reg("rapidb.openBookmarkEntry", (entry: BookmarkEntry) => {
+  reg(CMD.openBookmarkEntry, (entry: BookmarkEntry) => {
     if (!entry?.connectionId || !entry?.sql) {
       return;
     }
@@ -364,16 +377,22 @@ export function activate(context: vscode.ExtensionContext): void {
       true,
     );
   });
-
-  reg("rapidb.deleteBookmark", async (node?: any) => {
-    const id = node?.entry?.id ?? node?.id;
-    if (!id) {
-      return;
-    }
-    await connectionManager.deleteBookmark(id);
-  });
-
-  reg("rapidb.clearBookmarks", async () => {
+  reg(
+    CMD.deleteBookmark,
+    async (node?: {
+      entry?: {
+        id?: string;
+      };
+      id?: string;
+    }) => {
+      const id = node?.entry?.id ?? node?.id;
+      if (!id) {
+        return;
+      }
+      await confirmBookmarkRemoval(connectionManager, id);
+    },
+  );
+  reg(CMD.clearBookmarks, async () => {
     const answer = await vscode.window.showWarningMessage(
       "[RapiDB] Clear all bookmarks?",
       { modal: true },
@@ -384,8 +403,7 @@ export function activate(context: vscode.ExtensionContext): void {
       vscode.window.showInformationMessage("[RapiDB] All bookmarks cleared.");
     }
   });
-
-  reg("rapidb.clearHistory", async () => {
+  reg(CMD.clearHistory, async () => {
     const answer = await vscode.window.showWarningMessage(
       "[RapiDB] Clear all query history?",
       { modal: true },
@@ -396,24 +414,19 @@ export function activate(context: vscode.ExtensionContext): void {
       vscode.window.showInformationMessage("[RapiDB] Query history cleared.");
     }
   });
-
-  reg("rapidb.disconnectAll", async () => {
+  reg(CMD.disconnectAll, async () => {
     await connectionManager.disconnectAll();
     refresh();
   });
-
-  reg("rapidb.refresh", () => {
+  reg(CMD.refresh, () => {
     refresh();
   });
 }
-
 export function deactivate(): void {
   _activated = false;
-
   QueryPanel.disposeAll();
   TablePanel.disposeAll();
   SchemaPanel.disposeAll();
-
   try {
     _connectionManager?.disconnectAll().catch(() => {});
   } catch {}

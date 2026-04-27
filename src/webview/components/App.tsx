@@ -1,34 +1,25 @@
-// biome-ignore lint/style/useImportType: React needed for JSX
-import React from "react";
+import React, { ReactElement } from "react";
+import type {
+  QueryInitialState,
+  WebviewInitialState,
+} from "../../shared/webviewContracts";
+import { parseWebviewInitialState } from "../../shared/webviewContracts";
 import { ConnectionFormView } from "./ConnectionFormView";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { QueryView } from "./QueryView";
 import { SchemaView } from "./SchemaView";
 import { TableView } from "./TableView";
 
-type ViewName = "query" | "table" | "schema" | "connection";
-
-interface InitialState {
-  view: ViewName;
-  connectionId?: string;
-  connectionType?: string;
-  formatOnOpen?: boolean;
-  isBookmarked?: boolean;
-  database?: string;
-  schema?: string;
-  table?: string;
-  initialSql?: string;
-  existing?: any | null;
-  isView?: boolean;
-  defaultPageSize?: number;
-}
-
-const state: InitialState = (window as any).__HAPPYDB_INITIAL_STATE__ ?? {
+const fallbackState: QueryInitialState = {
   view: "query",
   connectionId: "",
+  connectionType: "",
 };
 
-export function App(): React.ReactElement {
+export function App(): ReactElement {
+  const state: WebviewInitialState =
+    parseWebviewInitialState(window.__RAPIDB_INITIAL_STATE__) ?? fallbackState;
+
   switch (state.view) {
     case "query":
       return (
@@ -73,11 +64,13 @@ export function App(): React.ReactElement {
         </ErrorBoundary>
       );
 
-    default:
+    default: {
+      const unknownView = (state as { view?: string }).view ?? "unknown";
       return (
         <div style={{ padding: 16, color: "var(--vscode-errorForeground)" }}>
-          Unknown view: {(state as any).view}
+          Unknown view: {unknownView}
         </div>
       );
+    }
   }
 }

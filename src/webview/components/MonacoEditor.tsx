@@ -6,12 +6,30 @@ import React, {
   useRef,
 } from "react";
 import { format as sqlFormatterFormat } from "sql-formatter";
-import type { SchemaTable } from "../store";
+import type { SchemaObject } from "../store";
 import { onMessage, postMessage } from "../utils/messaging";
 
-if (!(window as any).__monacoEnvSet) {
-  (window as any).__monacoEnvSet = true;
-  (self as any).MonacoEnvironment = {
+type MonacoHostWindow = Window & {
+  __monacoEnvSet?: boolean;
+};
+
+type MonacoHostGlobal = typeof globalThis & {
+  MonacoEnvironment?: {
+    getWorker(): Worker;
+  };
+};
+
+type SqlFormatterOptions = NonNullable<
+  Parameters<typeof sqlFormatterFormat>[1]
+>;
+type SqlFormatterLanguage = NonNullable<SqlFormatterOptions["language"]>;
+
+const monacoWindow = window as MonacoHostWindow;
+const monacoGlobal = self as MonacoHostGlobal;
+
+if (!monacoWindow.__monacoEnvSet) {
+  monacoWindow.__monacoEnvSet = true;
+  monacoGlobal.MonacoEnvironment = {
     getWorker(): Worker {
       const blob = new Blob(["self.onmessage=function(){}"], {
         type: "application/javascript",
@@ -25,7 +43,7 @@ if (!(window as any).__monacoEnvSet) {
   };
 }
 
-const HAPPYDB_THEME = "rapidb-vscode";
+const RAPIDB_THEME = "rapidb-vscode";
 
 function cssVar(name: string): string {
   return getComputedStyle(document.body).getPropertyValue(name).trim();
@@ -49,7 +67,7 @@ function applyVSCodeTheme(): void {
   const base = themeBase();
   const isLight = base === "vs" || base === "hc-light";
 
-  monaco.editor.defineTheme(HAPPYDB_THEME, {
+  monaco.editor.defineTheme(RAPIDB_THEME, {
     base,
     inherit: true,
 
@@ -65,7 +83,7 @@ function applyVSCodeTheme(): void {
     },
   });
 
-  monaco.editor.setTheme(HAPPYDB_THEME);
+  monaco.editor.setTheme(RAPIDB_THEME);
 }
 
 const SQL_KEYWORDS = [
@@ -154,7 +172,47 @@ const SQL_KEYWORDS = [
 
 let providerDisposable: monaco.IDisposable | null = null;
 
-let getActiveSchema: () => SchemaTable[] = () => [];
+let getActiveSchema: () => SchemaObject[] = () => [];
+
+function objectKindFor(
+  type: SchemaObject["type"],
+): monaco.languages.CompletionItemKind {
+  switch (type) {
+    case "table":
+      return monaco.languages.CompletionItemKind.Class;
+    case "view":
+      return monaco.languages.CompletionItemKind.Class;
+    case "procedure":
+      return monaco.languages.CompletionItemKind.Function;
+    case "function":
+      return monaco.languages.CompletionItemKind.Function;
+    default:
+      return monaco.languages.CompletionItemKind.Value;
+  }
+}
+
+function objectDetailLabel(
+  type: SchemaObject["type"],
+  columnCount: number,
+): string {
+  if (type === "function" || type === "procedure") {
+    return type;
+  }
+
+  if (type === "view") {
+    return columnCount > 0 ? `view (${columnCount} cols)` : "view";
+  }
+
+  if (type === "table") {
+    return columnCount > 0 ? `table (${columnCount} cols)` : "table";
+  }
+
+  if (columnCount > 0) {
+    return `table (${columnCount} cols)`;
+  }
+
+  return type ?? "table";
+}
 
 function ensureCompletionProvider() {
   if (providerDisposable) {
@@ -188,7 +246,7 @@ function ensureCompletionProvider() {
         const matched = schema.find(
           (t) =>
             t.schema.toLowerCase() === schemaHint &&
-            t.table.toLowerCase() === tableHint,
+            t.object.toLowerCase() === tableHint,
         );
         if (matched) {
           matched.columns.forEach((col, i) => {
@@ -215,13 +273,10 @@ function ensureCompletionProvider() {
         if (schemasWithHint.length > 0) {
           schemasWithHint.forEach((t, i) => {
             items.push({
-              label: t.table,
-              detail:
-                t.columns.length > 0
-                  ? `table (${t.columns.length} cols)`
-                  : "table",
-              kind: monaco.languages.CompletionItemKind.Class,
-              insertText: t.table,
+              label: t.object,
+              detail: objectDetailLabel(t.type, t.columns.length),
+              kind: objectKindFor(t.type),
+              insertText: t.object,
               range,
               sortText: String(i).padStart(5, "0"),
             });
@@ -229,7 +284,9 @@ function ensureCompletionProvider() {
           return { suggestions: items };
         }
 
-        const matchedTable = schema.find((t) => t.table.toLowerCase() === hint);
+        const matchedTable = schema.find(
+          (t) => t.object.toLowerCase() === hint,
+        );
         if (matchedTable) {
           matchedTable.columns.forEach((col, i) => {
             items.push({
@@ -272,34 +329,37 @@ function ensureCompletionProvider() {
       const primarySchema = schemaNames[0] ?? "";
       schema.forEach((t, ti) => {
         const isPrimary = t.schema === primarySchema;
+        const isRoutine = t.type === "function" || t.type === "procedure";
+        const objectKind = objectKindFor(t.type);
+        const detailLabel = objectDetailLabel(t.type, t.columns.length);
 
         items.push({
-          label: t.table,
+          label: t.object,
           detail: isPrimary
-            ? `table in ${t.schema} (${t.columns.length} cols)`
-            : `table in ${t.schema}`,
-          kind: monaco.languages.CompletionItemKind.Class,
-          insertText: t.table,
+            ? `${detailLabel} in ${t.schema}`
+            : `${detailLabel} in ${t.schema}`,
+          kind: objectKind,
+          insertText: t.object,
           range,
           sortText: `2_${isPrimary ? "0" : "1"}_${String(ti).padStart(5, "0")}_tbl`,
         });
 
         items.push({
-          label: `${t.schema}.${t.table}`,
+          label: `${t.schema}.${t.object}`,
           detail: isPrimary
-            ? `qualified (${t.columns.length} cols)`
-            : "qualified",
-          kind: monaco.languages.CompletionItemKind.Class,
-          insertText: `${t.schema}.${t.table}`,
+            ? `qualified (${detailLabel})`
+            : `qualified (${detailLabel})`,
+          kind: objectKind,
+          insertText: `${t.schema}.${t.object}`,
           range,
           sortText: `2_${isPrimary ? "0" : "1"}_${String(ti).padStart(5, "0")}_qual`,
         });
 
-        if (isPrimary) {
+        if (isPrimary && !isRoutine) {
           t.columns.forEach((col, ci) => {
             items.push({
               label: col.name,
-              detail: `${t.table}.${col.name}  ${col.type}`,
+              detail: `${t.object}.${col.name}  ${col.type}`,
               kind: monaco.languages.CompletionItemKind.Field,
               insertText: col.name,
               range,
@@ -347,17 +407,13 @@ export function formatSQLSafe(sql: string, dialect = "sql"): string {
   if (!sql.trim()) {
     return sql;
   }
-  try {
-    return sqlFormatterFormat(sql, {
-      language: dialect as any,
-      tabWidth: 2,
-      keywordCase: "upper",
-      linesBetweenQueries: 1,
-      indentStyle: "standard",
-    });
-  } catch (err) {
-    throw err;
-  }
+  return sqlFormatterFormat(sql, {
+    language: dialect as SqlFormatterLanguage,
+    tabWidth: 2,
+    keywordCase: "upper",
+    linesBetweenQueries: 1,
+    indentStyle: "standard",
+  });
 }
 
 export function formatSQLOrError(
@@ -369,25 +425,29 @@ export function formatSQLOrError(
   }
   try {
     const result = sqlFormatterFormat(sql, {
-      language: dialect as any,
+      language: dialect as SqlFormatterLanguage,
       tabWidth: 2,
       keywordCase: "upper",
       linesBetweenQueries: 1,
       indentStyle: "standard",
     });
     return { result };
-  } catch (err: any) {
-    return { error: err?.message ?? String(err) };
+  } catch (err: unknown) {
+    return {
+      error: err instanceof Error ? err.message : String(err),
+    };
   }
 }
 
 interface Props {
   initialValue?: string;
-  schema?: SchemaTable[];
+  schema?: SchemaObject[];
   dialect?: string;
   onChange?: (value: string) => void;
   onExecute?: (value: string) => void;
   height?: string | number;
+  readOnly?: boolean;
+  ariaLabel?: string;
 }
 
 export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
@@ -399,13 +459,57 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       onChange,
       onExecute,
       height = "100%",
+      readOnly = false,
+      ariaLabel = "SQL editor",
     },
     ref,
   ) {
     const containerRef = useRef<HTMLDivElement>(null);
     const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
+    const initialValueRef = useRef(initialValue);
+    const onChangeRef = useRef(onChange);
+    const onExecuteRef = useRef(onExecute);
+    const readOnlyRef = useRef(readOnly);
+    const ariaLabelRef = useRef(ariaLabel);
 
-    const schemaRef = useRef<SchemaTable[]>([]);
+    useEffect(() => {
+      initialValueRef.current = initialValue;
+    }, [initialValue]);
+
+    useEffect(() => {
+      onChangeRef.current = onChange;
+    }, [onChange]);
+
+    useEffect(() => {
+      onExecuteRef.current = onExecute;
+    }, [onExecute]);
+
+    useEffect(() => {
+      readOnlyRef.current = readOnly;
+      editorRef.current?.updateOptions({
+        readOnly,
+        domReadOnly: readOnly,
+      });
+    }, [readOnly]);
+
+    useEffect(() => {
+      ariaLabelRef.current = ariaLabel;
+      editorRef.current?.updateOptions({
+        ariaLabel,
+      });
+    }, [ariaLabel]);
+
+    useEffect(() => {
+      const editor = editorRef.current;
+      if (!editor) {
+        return;
+      }
+      if (editor.getValue() !== initialValue) {
+        editor.setValue(initialValue);
+      }
+    }, [initialValue]);
+
+    const schemaRef = useRef<SchemaObject[]>([]);
     useEffect(() => {
       schemaRef.current = schema;
     }, [schema]);
@@ -437,7 +541,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       setValue: (v) => editorRef.current?.setValue(v),
       format: (dialect = "sql") => {
         const editor = editorRef.current;
-        if (!editor) {
+        if (!editor || editor.getOption(monaco.editor.EditorOption.readOnly)) {
           return null;
         }
         const model = editor.getModel();
@@ -501,13 +605,15 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       applyVSCodeTheme();
 
       const editor = monaco.editor.create(containerRef.current, {
-        value: initialValue,
+        value: initialValueRef.current,
         language: "sql",
-        theme: HAPPYDB_THEME,
+        theme: RAPIDB_THEME,
+        ariaLabel: ariaLabelRef.current,
         fontSize: parseInt(
           getComputedStyle(document.body).getPropertyValue(
             "--vscode-editor-font-size",
           ) || "13",
+          10,
         ),
         fontFamily:
           getComputedStyle(document.body)
@@ -532,10 +638,15 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         suggestOnTriggerCharacters: true,
         quickSuggestions: { other: true, comments: false, strings: false },
         suggest: { showKeywords: true, showWords: false, filterGraceful: true },
+        readOnly: readOnlyRef.current,
+        domReadOnly: readOnlyRef.current,
       });
       editorRef.current = editor;
 
       const insertText = (text: string) => {
+        if (readOnlyRef.current) {
+          return;
+        }
         if (!text) {
           return;
         }
@@ -578,21 +689,15 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         editor.focus();
       });
 
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, () =>
-        postMessage("readClipboard"),
-      );
-      editor.addCommand(
-        monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyV,
-        () => postMessage("readClipboard"),
-      );
-
       const domNode = editor.getDomNode();
       const nativePaste = (e: ClipboardEvent) => {
+        if (readOnlyRef.current) {
+          return;
+        }
         e.preventDefault();
         e.stopImmediatePropagation();
         postMessage("readClipboard");
       };
-      domNode?.addEventListener("paste", nativePaste, true);
 
       const getExecText = () => {
         const model = editor.getModel();
@@ -603,14 +708,42 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         return editor.getValue();
       };
 
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () =>
-        onExecute?.(getExecText()),
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, () => {
+        if (readOnlyRef.current) {
+          return;
+        }
+        postMessage("readClipboard");
+      });
+      editor.addCommand(
+        monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyV,
+        () => {
+          if (readOnlyRef.current) {
+            return;
+          }
+          postMessage("readClipboard");
+        },
       );
-      editor.addCommand(monaco.KeyCode.F5, () => onExecute?.(getExecText()));
+      domNode?.addEventListener("paste", nativePaste, true);
+
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => {
+        if (readOnlyRef.current) {
+          return;
+        }
+        onExecuteRef.current?.(getExecText());
+      });
+      editor.addCommand(monaco.KeyCode.F5, () => {
+        if (readOnlyRef.current) {
+          return;
+        }
+        onExecuteRef.current?.(getExecText());
+      });
 
       editor.addCommand(
         monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyF,
         () => {
+          if (readOnlyRef.current) {
+            return;
+          }
           const model = editor.getModel();
           if (!model) {
             return;
@@ -635,7 +768,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       );
 
       const changeDisposable = editor.onDidChangeModelContent(() => {
-        onChange?.(editor.getValue());
+        onChangeRef.current?.(editor.getValue());
       });
 
       const observer = new MutationObserver(() => {

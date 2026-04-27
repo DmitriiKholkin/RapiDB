@@ -1,7 +1,9 @@
 import { create } from "zustand";
+import type { QueryColumnMeta } from "../../shared/tableTypes";
 
 export interface QueryResult {
   columns: string[];
+  columnMeta: QueryColumnMeta[];
   rows: Record<string, unknown>[];
   rowCount: number;
   executionTimeMs: number;
@@ -23,6 +25,13 @@ export interface QueryState {
   reset: () => void;
 }
 
+function normalizeQueryResult(result: QueryResult): QueryResult {
+  return {
+    ...result,
+    columnMeta: Array.isArray(result.columnMeta) ? result.columnMeta : [],
+  };
+}
+
 export interface ConnectionEntry {
   id: string;
   name: string;
@@ -41,27 +50,36 @@ export interface SchemaColumn {
   type: string;
 }
 
-export interface SchemaTable {
+export interface SchemaObject {
   schema: string;
-  table: string;
+  object: string;
+  type?: "table" | "view" | "function" | "procedure";
   columns: SchemaColumn[];
 }
 
 export interface SchemaState {
-  schemaByConnection: Record<string, SchemaTable[]>;
-  setSchema: (connectionId: string, schema: SchemaTable[]) => void;
-  getSchema: (connectionId: string) => SchemaTable[];
+  schemaByConnection: Record<string, SchemaObject[]>;
+  setSchema: (connectionId: string, schema: SchemaObject[]) => void;
+  getSchema: (connectionId: string) => SchemaObject[];
 }
 
 export const useQueryStore = create<QueryState>((set) => ({
   status: "idle",
   result: null,
   setRunning: () => set({ status: "running", result: null }),
-  setResult: (result) => set({ status: "success", result }),
+  setResult: (result) =>
+    set({ status: "success", result: normalizeQueryResult(result) }),
   setError: (error) =>
     set({
       status: "error",
-      result: { columns: [], rows: [], rowCount: 0, executionTimeMs: 0, error },
+      result: {
+        columns: [],
+        columnMeta: [],
+        rows: [],
+        rowCount: 0,
+        executionTimeMs: 0,
+        error,
+      },
     }),
   reset: () => set({ status: "idle", result: null }),
 }));
@@ -76,6 +94,8 @@ export const useConnectionStore = create<ConnectionState>((set) => ({
 export const useSchemaStore = create<SchemaState>((set, get) => ({
   schemaByConnection: {},
   setSchema: (connectionId, schema) =>
-    set((s) => ({ schemaByConnection: { ...s.schemaByConnection, [connectionId]: schema } })),
+    set((s) => ({
+      schemaByConnection: { ...s.schemaByConnection, [connectionId]: schema },
+    })),
   getSchema: (connectionId) => get().schemaByConnection[connectionId] ?? [],
 }));

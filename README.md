@@ -65,7 +65,7 @@ The **Database Explorer** tree expands into databases → schemas → tables, vi
 
 ### 🗂️ Query History & Bookmarks
 
-Every query you run lands in **Query History** — click any entry to reopen it in the editor. Queries you want to keep forever go into **Bookmarks** with a single press. Both limits are configurable.
+Every query you run lands in **Query History** — click any entry to reopen it in the editor. Queries you want to keep forever go into **Bookmarks** with a single press. Query History limit is configurable.
 
 <br/>
 
@@ -73,7 +73,7 @@ Every query you run lands in **Query History** — click any entry to reopen it 
 
 The query editor runs on **Monaco** — the same engine as VS Code itself. You get:
 
-- 🎨 Syntax highlighting & auto-formatting
+- 🎨 Syntax highlighting & SQL formatting (button / `Shift+Alt+F`)
 - 🧠 Schema-aware autocompletion — knows your actual tables and columns
 - ⌨️ `Ctrl+Enter` / `F5` to run · Select a fragment to run just that part
 - ↕️ Drag the divider to resize editor vs results
@@ -106,7 +106,7 @@ Click any table → the **Table Data Viewer** opens:
 | Inline editing | Click a cell → type → Enter |
 | New rows | Insert bar at the bottom |
 | Deletion | Select rows and delete |
-| Safety | Every write goes through a transaction — nothing half-applied |
+| Safety | Preview-first apply flow with verification; transactional where applicable |
 
 <br/>
 
@@ -174,6 +174,7 @@ Everything you'd normally Google `information_schema` for — **one click away**
 PRs and contributions are welcome at [github.com/DmitriiKholkin/RapiDB](https://github.com/DmitriiKholkin/RapiDB).
 
 </details>
+
 
 ---
 

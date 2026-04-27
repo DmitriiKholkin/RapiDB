@@ -1,9 +1,20 @@
-interface VSCodeAPI {
-  postMessage(message: unknown): void;
+import type { WebviewInitialState } from "../shared/webviewContracts";
 
-  getState<T = unknown>(): T | undefined;
+declare module "*.css";
 
-  setState<T = unknown>(state: T): void;
+declare global {
+  interface VSCodeAPI {
+    postMessage(message: unknown): void;
+
+    getState<T = unknown>(): T | undefined;
+
+    setState<T = unknown>(state: T): void;
+  }
+
+  function acquireVsCodeApi(): VSCodeAPI;
+
+  interface Window {
+    __vscode?: VSCodeAPI;
+    __RAPIDB_INITIAL_STATE__?: WebviewInitialState;
+  }
 }
-
-declare function acquireVsCodeApi(): VSCodeAPI;

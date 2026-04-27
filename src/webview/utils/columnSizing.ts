@@ -33,7 +33,7 @@ function measureText(s: string): number {
   return c ? c.measureText(s).width : s.length * 10;
 }
 
-export const COL_MIN = 60;
+export const COL_MIN = 100;
 export const COL_MAX = 420;
 const H_PAD = 16;
 const SORT_ICON_W = 20;
@@ -58,7 +58,8 @@ export function calcColWidth(
   const max = opts.max ?? COL_MAX;
   const sampleRows = opts.sampleRows ?? SAMPLE_ROWS;
 
-  let maxContentW = measureText(isPrimaryKey ? `${colName}key` : colName) + SORT_ICON_W;
+  let maxContentW =
+    measureText(isPrimaryKey ? `${colName}key` : colName) + SORT_ICON_W;
 
   const rowKey = dataKey ?? colName;
   const limit = Math.min(rows.length, sampleRows);
@@ -75,7 +76,7 @@ export function calcColWidth(
 
 export interface Column {
   name: string;
-  
+
   dataKey?: string;
   isPrimaryKey: boolean;
 }

@@ -1,44 +1,26 @@
-// biome-ignore lint/style/useImportType: <explanation>
-import React, { useEffect, useState } from "react";
+import React, {
+  type CSSProperties,
+  type ReactNode,
+  useEffect,
+  useState,
+} from "react";
+import type { ColumnMeta, ForeignKeyMeta, IndexMeta } from "../types";
+import { getStructuralBadgePresentation } from "../types";
 import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
 
-interface ColumnMeta {
-  name: string;
-  type: string;
-  nullable: boolean;
-  defaultValue?: string;
-  isPrimaryKey: boolean;
-  isForeignKey: boolean;
-  isAutoIncrement?: boolean;
-}
-interface IndexMeta {
-  name: string;
-  columns: string[];
-  unique: boolean;
-  primary: boolean;
-}
-interface ForeignKeyMeta {
-  constraintName: string;
-  column: string;
-  referencedSchema: string;
-  referencedTable: string;
-  referencedColumn: string;
-}
 interface SchemaData {
   columns: ColumnMeta[];
   indexes: IndexMeta[];
   foreignKeys: ForeignKeyMeta[];
 }
-
 interface Props {
   connectionId: string;
   database: string;
   schema: string;
   table: string;
 }
-
-const th: React.CSSProperties = {
+const th: CSSProperties = {
   padding: "5px 12px",
   textAlign: "left",
   background: "var(--vscode-editorGroupHeader-tabsBackground)",
@@ -52,8 +34,7 @@ const th: React.CSSProperties = {
   zIndex: 1,
   userSelect: "none",
 };
-
-const td = (extra?: React.CSSProperties): React.CSSProperties => ({
+const td = (extra?: CSSProperties): CSSProperties => ({
   padding: "4px 12px",
   borderBottom: "1px solid var(--vscode-panel-border)",
   borderRight: "1px solid var(--vscode-panel-border)",
@@ -63,31 +44,32 @@ const td = (extra?: React.CSSProperties): React.CSSProperties => ({
   whiteSpace: "nowrap",
   ...extra,
 });
-
-export function SchemaView({ connectionId, database, schema, table }: Props) {
+export function SchemaView({
+  connectionId: _connectionId,
+  database: _database,
+  schema,
+  table,
+}: Props) {
   const [data, setData] = useState<SchemaData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-
   useEffect(() => {
     const unData = onMessage<SchemaData>("schemaData", (d) => {
       setData(d);
       setLoading(false);
     });
-    const unErr = onMessage<{ error: string }>(
-      "schemaError",
-      ({ error: e }) => {
-        setError(e);
-        setLoading(false);
-      },
-    );
+    const unErr = onMessage<{
+      error: string;
+    }>("schemaError", ({ error: e }) => {
+      setError(e);
+      setLoading(false);
+    });
     postMessage("ready");
     return () => {
       unData();
       unErr();
     };
   }, []);
-
   if (loading) {
     return (
       <div style={{ padding: 20, opacity: 0.5, fontSize: 13 }}>
@@ -96,7 +78,6 @@ export function SchemaView({ connectionId, database, schema, table }: Props) {
       </div>
     );
   }
-
   if (error) {
     return (
       <div
@@ -114,16 +95,12 @@ export function SchemaView({ connectionId, database, schema, table }: Props) {
       </div>
     );
   }
-
   if (!data) {
     return null;
   }
-
   const { columns, indexes, foreignKeys } = data;
-
   return (
     <div style={{ padding: "16px 20px", overflow: "auto", height: "100vh" }}>
-      {}
       <div style={{ marginBottom: 20 }}>
         <h1 style={{ fontSize: 15, fontWeight: 600, margin: 0 }}>
           {schema ? `${schema}.` : ""}
@@ -138,7 +115,6 @@ export function SchemaView({ connectionId, database, schema, table }: Props) {
         />
       </div>
 
-      {}
       <Section title="Columns" count={columns.length}>
         <table
           style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}
@@ -165,7 +141,6 @@ export function SchemaView({ connectionId, database, schema, table }: Props) {
         </table>
       </Section>
 
-      {}
       {foreignKeys.length > 0 && (
         <Section title="Foreign Keys" count={foreignKeys.length}>
           <table
@@ -181,7 +156,7 @@ export function SchemaView({ connectionId, database, schema, table }: Props) {
             <tbody>
               {foreignKeys.map((fk, i) => (
                 <FKRow
-                  key={fk.constraintName + i}
+                  key={`${fk.constraintName}:${fk.column}`}
                   fk={fk}
                   isEven={i % 2 === 0}
                   currentSchema={schema}
@@ -192,7 +167,6 @@ export function SchemaView({ connectionId, database, schema, table }: Props) {
         </Section>
       )}
 
-      {}
       {indexes.length > 0 && (
         <Section title="Indexes" count={indexes.length}>
           <table
@@ -216,7 +190,6 @@ export function SchemaView({ connectionId, database, schema, table }: Props) {
     </div>
   );
 }
-
 function Section({
   title,
   count,
@@ -224,7 +197,7 @@ function Section({
 }: {
   title: string;
   count: number;
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   return (
     <div style={{ marginBottom: 28 }}>
@@ -272,7 +245,6 @@ function Section({
     </div>
   );
 }
-
 function ColRow({
   col,
   index,
@@ -289,38 +261,59 @@ function ColRow({
     : isEven
       ? "var(--vscode-editor-background)"
       : "var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.04))";
-
   const badges: React.ReactNode[] = [];
   if (col.isPrimaryKey) {
+    const presentation = getStructuralBadgePresentation("pk");
     badges.push(
       <Badge
         key="pk"
-        label="PK"
-        color="var(--vscode-charts-yellow, #cca700)"
+        label={presentation.label}
+        color={presentation.foreground}
+        background={presentation.badgeBackground}
+        border={presentation.badgeBorder}
       />,
     );
   }
   if (col.isForeignKey || foreignKeys.some((fk) => fk.column === col.name)) {
-    badges.push(
-      <Badge key="fk" label="FK" color="var(--vscode-charts-blue, #4fc3f7)" />,
-    );
-  }
-  if (col.isAutoIncrement) {
+    const presentation = getStructuralBadgePresentation("fk");
     badges.push(
       <Badge
-        key="ai"
-        label="AI"
-        color="var(--vscode-charts-purple, #b48ead)"
+        key="fk"
+        label={presentation.label}
+        color={presentation.foreground}
+        background={presentation.badgeBackground}
+        border={presentation.badgeBorder}
       />,
     );
   }
-
+  if (col.isAutoIncrement) {
+    const presentation = getStructuralBadgePresentation("ai");
+    badges.push(
+      <Badge
+        key="ai"
+        label={presentation.label}
+        color={presentation.foreground}
+        background={presentation.badgeBackground}
+        border={presentation.badgeBorder}
+      />,
+    );
+  }
+  if (col.isComputed) {
+    badges.push(
+      <Badge
+        key="computed"
+        label="CMP"
+        color="var(--vscode-terminal-ansiBlue, #356fa8)"
+        background="rgba(53, 111, 168, 0.16)"
+        border="none"
+      />,
+    );
+  }
   const rawDefault = col.defaultValue;
   const displayDefault =
     rawDefault != null
       ? rawDefault.replace(/::[A-Za-z_][\w. ]*/g, "").trim()
       : null;
-
   return (
     <tr
       style={{ background: bg, transition: "background 60ms" }}
@@ -367,7 +360,6 @@ function ColRow({
     </tr>
   );
 }
-
 function FKRow({
   fk,
   isEven,
@@ -383,12 +375,10 @@ function FKRow({
     : isEven
       ? "var(--vscode-editor-background)"
       : "var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.04))";
-
   const refLabel =
     fk.referencedSchema && fk.referencedSchema !== currentSchema
       ? `${fk.referencedSchema}.${fk.referencedTable}.${fk.referencedColumn}`
       : `${fk.referencedTable}.${fk.referencedColumn}`;
-
   return (
     <tr
       style={{ background: bg, transition: "background 60ms" }}
@@ -403,7 +393,6 @@ function FKRow({
     </tr>
   );
 }
-
 function IdxRow({ idx, isEven }: { idx: IndexMeta; isEven: boolean }) {
   const [hov, setHov] = useState(false);
   const bg = hov
@@ -411,29 +400,41 @@ function IdxRow({ idx, isEven }: { idx: IndexMeta; isEven: boolean }) {
     : isEven
       ? "var(--vscode-editor-background)"
       : "var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.04))";
-
   const typeBadges: React.ReactNode[] = [];
-  if (idx.primary)
+  if (idx.primary) {
+    const presentation = getStructuralBadgePresentation("primary");
     typeBadges.push(
       <Badge
         key="pk"
-        label="PRIMARY"
-        color="var(--vscode-charts-yellow, #cca700)"
+        label={presentation.label}
+        color={presentation.foreground}
+        background={presentation.badgeBackground}
+        border={presentation.badgeBorder}
       />,
     );
-  else if (idx.unique)
+  } else if (idx.unique) {
+    const presentation = getStructuralBadgePresentation("unique");
     typeBadges.push(
       <Badge
         key="u"
-        label="UNIQUE"
-        color="var(--vscode-charts-blue, #4fc3f7)"
+        label={presentation.label}
+        color={presentation.foreground}
+        background={presentation.badgeBackground}
+        border={presentation.badgeBorder}
       />,
     );
-  else
+  } else {
+    const presentation = getStructuralBadgePresentation("index");
     typeBadges.push(
-      <Badge key="i" label="INDEX" color="var(--vscode-disabledForeground)" />,
+      <Badge
+        key="i"
+        label={presentation.label}
+        color={presentation.foreground}
+        background={presentation.badgeBackground}
+        border={presentation.badgeBorder}
+      />,
     );
-
+  }
   return (
     <tr
       style={{ background: bg, transition: "background 60ms" }}
@@ -448,17 +449,26 @@ function IdxRow({ idx, isEven }: { idx: IndexMeta; isEven: boolean }) {
     </tr>
   );
 }
-
-function Badge({ label, color }: { label: string; color: string }) {
+function Badge({
+  label,
+  color,
+  background = "var(--vscode-badge-background, rgba(128,128,128,0.16))",
+  border = "none",
+}: {
+  label: string;
+  color: string;
+  background?: string;
+  border?: CSSProperties["border"];
+}) {
   return (
     <span
       style={{
         fontSize: 9,
         padding: "1px 5px",
         borderRadius: 2,
-        background: `${color}22`,
+        backgroundColor: background,
         color,
-        border: `1px solid ${color}55`,
+        border,
         fontWeight: 700,
         letterSpacing: "0.05em",
         fontFamily: "var(--vscode-font-family, system-ui)",

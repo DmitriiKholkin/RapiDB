@@ -1,5 +1,15 @@
 import * as vscode from "vscode";
+import {
+  type ConnectionFormExistingState,
+  type ConnectionFormSubmission,
+  parseConnectionFormPanelMessage,
+} from "../../shared/webviewContracts";
 import type { ConnectionConfig, ConnectionManager } from "../connectionManager";
+import {
+  logErrorWithContext,
+  normalizeUnknownError,
+} from "../utils/errorHandling";
+import { createWebviewShell } from "./webviewShell";
 
 export class ConnectionFormPanel {
   private static readonly viewType = "rapidb.connectionForm";
@@ -19,26 +29,23 @@ export class ConnectionFormPanel {
     this.context = context;
     this.connectionManager = connectionManager;
 
-    this.panel.webview.options = {
-      enableScripts: true,
-      localResourceRoots: [
-        vscode.Uri.joinPath(context.extensionUri, "dist"),
-        vscode.Uri.joinPath(context.extensionUri, "media"),
-      ],
-    };
-
     this.panel.webview.html = this.buildHtml(context, existing);
     this.panel.webview.onDidReceiveMessage(async (msg) => {
       try {
         await this.handleMessage(msg);
-      } catch (err: any) {
-        console.error(
-          "[RapiDB] ConnectionFormPanel unhandled error:",
-          err?.message ?? err,
+      } catch (err: unknown) {
+        const error = logErrorWithContext(
+          "ConnectionFormPanel unhandled error",
+          err,
         );
+        const isSaveConnectionMessage =
+          typeof msg === "object" &&
+          msg !== null &&
+          "type" in msg &&
+          (msg as { type?: unknown }).type === "saveConnection";
         this.panel.webview.postMessage({
-          type: "testResult",
-          payload: { success: false, error: err?.message ?? String(err) },
+          type: isSaveConnectionMessage ? "saveResult" : "testResult",
+          payload: { success: false, error: error.message },
         });
       }
     });
@@ -54,14 +61,21 @@ export class ConnectionFormPanel {
   ): Promise<ConnectionConfig | undefined> {
     const title = existing ? `Edit — ${existing.name}` : "New Connection";
 
-    let existingForForm = existing;
-    if (existing?.useSecretStorage && existing.id) {
-      try {
-        const stored = await context.secrets.get(existing.id);
-        if (stored !== undefined) {
-          existingForForm = { ...existing, password: stored };
-        }
-      } catch {}
+    let existingForForm: ConnectionFormExistingState | undefined;
+    if (existing) {
+      let hasStoredSecret = false;
+      if (existing.useSecretStorage && existing.id) {
+        try {
+          hasStoredSecret =
+            (await context.secrets.get(existing.id)) !== undefined;
+        } catch {}
+      }
+
+      const { password: _password, ...rest } = existing;
+      existingForForm = {
+        ...rest,
+        hasStoredSecret: hasStoredSecret || undefined,
+      };
     }
 
     const panel = vscode.window.createWebviewPanel(
@@ -83,24 +97,77 @@ export class ConnectionFormPanel {
     });
   }
 
-  private async handleMessage(msg: {
-    type: string;
-    payload?: any;
-  }): Promise<void> {
-    switch (msg.type) {
+  private async resolveSubmittedPassword(
+    payload: ConnectionFormSubmission,
+  ): Promise<string> {
+    if (payload.password !== undefined && payload.password !== "") {
+      return payload.password;
+    }
+
+    if (payload.useSecretStorage && payload.hasStoredSecret) {
+      try {
+        return (await this.context.secrets.get(payload.id)) ?? "";
+      } catch {
+        return "";
+      }
+    }
+
+    const existing = this.connectionManager.getConnection(payload.id);
+    if (payload.useSecretStorage && existing?.useSecretStorage) {
+      try {
+        return (await this.context.secrets.get(payload.id)) ?? "";
+      } catch {
+        return "";
+      }
+    }
+
+    return existing?.password ?? payload.password ?? "";
+  }
+
+  private async resolveSubmittedConfig(
+    payload: ConnectionFormSubmission,
+  ): Promise<ConnectionConfig> {
+    const password = await this.resolveSubmittedPassword(payload);
+    const { hasStoredSecret: _hasStoredSecret, ...rest } = payload;
+    return { ...rest, password };
+  }
+
+  private async handleMessage(msg: unknown): Promise<void> {
+    const parsed = parseConnectionFormPanelMessage(msg);
+    if (!parsed) {
+      return;
+    }
+
+    switch (parsed.type) {
       case "saveConnection": {
-        const raw: ConnectionConfig = msg.payload;
+        const payload = parsed.payload;
+        if (!payload) {
+          return;
+        }
+        if (!payload.name.trim()) {
+          this.panel.webview.postMessage({
+            type: "saveResult",
+            payload: { success: false, error: "Name is required." },
+          });
+          return;
+        }
+        const raw = await this.resolveSubmittedConfig(payload);
 
         if (raw.useSecretStorage) {
+          const shouldReuseStored =
+            payload.hasStoredSecret === true && (payload.password ?? "") === "";
           const password = raw.password ?? "";
           try {
-            await this.context.secrets.store(raw.id, password);
-          } catch (err: any) {
+            if (!shouldReuseStored) {
+              await this.context.secrets.store(raw.id, password);
+            }
+          } catch (err: unknown) {
+            const error = normalizeUnknownError(err);
             this.panel.webview.postMessage({
-              type: "testResult",
+              type: "saveResult",
               payload: {
                 success: false,
-                error: `SecretStorage unavailable: ${err?.message ?? String(err)}. Password was not saved.`,
+                error: `SecretStorage unavailable: ${error.message}. Password was not saved.`,
               },
             });
             return;
@@ -122,7 +189,12 @@ export class ConnectionFormPanel {
         break;
       }
       case "testConnection": {
-        const result = await this.connectionManager.testConnection(msg.payload);
+        const payload = parsed.payload;
+        if (!payload) {
+          return;
+        }
+        const raw = await this.resolveSubmittedConfig(payload);
+        const result = await this.connectionManager.testConnection(raw);
         this.panel.webview.postMessage({ type: "testResult", payload: result });
         break;
       }
@@ -139,49 +211,15 @@ export class ConnectionFormPanel {
     context: vscode.ExtensionContext,
     existing?: ConnectionConfig,
   ): string {
-    const webview = this.panel.webview;
-
-    const webviewJs = webview.asWebviewUri(
-      vscode.Uri.joinPath(context.extensionUri, "dist", "webview.js"),
-    );
-    const webviewCss = webview.asWebviewUri(
-      vscode.Uri.joinPath(context.extensionUri, "dist", "webview.css"),
-    );
-
-    const nonce = crypto.randomUUID();
-    const initialState = JSON.stringify({
-      view: "connection",
-      existing: existing ?? null,
+    return createWebviewShell({
+      context,
+      webview: this.panel.webview,
+      title: "RapiDB - Connection",
+      initialState: {
+        view: "connection",
+        existing: existing ?? null,
+      },
+      includeMediaRoot: true,
     });
-
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy"
-    content="default-src 'none';
-             script-src 'nonce-${nonce}' ${webview.cspSource};
-             style-src ${webview.cspSource} 'unsafe-inline';
-             font-src ${webview.cspSource} data:;
-             img-src ${webview.cspSource} https: data:;" />
-  <title>RapiDB — Connection</title>
-  <link rel="stylesheet" href="${webviewCss}" />
-  <style nonce="${nonce}">
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: var(--vscode-editor-background); color: var(--vscode-foreground);
-           font-family: var(--vscode-font-family, system-ui, sans-serif);
-           font-size: var(--vscode-font-size, 13px); }
-    #root { height: 100vh; overflow: auto; }
-  </style>
-</head>
-<body>
-  <div id="root"></div>
-  <script nonce="${nonce}">
-    window.__HAPPYDB_INITIAL_STATE__ = ${initialState};
-  </script>
-  <script nonce="${nonce}" src="${webviewJs}"></script>
-</body>
-</html>`;
   }
 }
