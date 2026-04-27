@@ -87,7 +87,7 @@ The query editor runs on **Monaco** — the same engine as VS Code itself. You g
 Results land in a **virtualized table** — no jank, no browser tab hanging:
 
 - Sort by any column · Resize columns · Alternating row stripes
-- NULL values are styled differently · Booleans are colored
+- NULL values are styled differently · Values are colored by types
 - Execution time shown right in the toolbar
 - **Export to CSV or JSON** in one click
 
