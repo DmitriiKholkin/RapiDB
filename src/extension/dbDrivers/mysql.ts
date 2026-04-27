@@ -122,15 +122,21 @@ export function splitMySQLScript(sql: string): string[] {
       continue;
     }
     if (consumeKeyword("LOOP")) {
-      compoundDepth++;
+      if (compoundDepth > 0) {
+        compoundDepth++;
+      }
       continue;
     }
     if (consumeKeyword("REPEAT")) {
-      compoundDepth++;
+      if (compoundDepth > 0) {
+        compoundDepth++;
+      }
       continue;
     }
     if (consumeKeyword("WHILE")) {
-      compoundDepth++;
+      if (compoundDepth > 0) {
+        compoundDepth++;
+      }
       continue;
     }
     if (consumeKeyword("END")) {
@@ -407,6 +413,18 @@ function toMysqlIntegerFilterParam(val: string): number | string {
     }
   }
   return Number(val);
+}
+function normalizeMysqlJsonFilterValue(value: string): string | null {
+  const trimmed = value.trim();
+  if (trimmed === "") {
+    return null;
+  }
+
+  try {
+    return JSON.stringify(JSON.parse(trimmed));
+  } catch {
+    return null;
+  }
 }
 function mysqlBitMaxValue(nativeType: string): bigint | null {
   const width = parseMysqlBitWidth(nativeType);
@@ -1242,6 +1260,18 @@ export class MySQLDriver extends BaseDBDriver {
         return { sql: `${col} ${op} ?`, params: [boolVal] };
       }
     }
+    if (column.category === "json" && typeof val === "string") {
+      const normalizedJson = normalizeMysqlJsonFilterValue(val);
+      if (
+        normalizedJson !== null &&
+        (operator === "like" || operator === "ilike")
+      ) {
+        return {
+          sql: `JSON_CONTAINS(${col}, ?)`,
+          params: [normalizedJson],
+        };
+      }
+    }
     if (this.hasBitSemantics(column)) {
       const parseFilterValue = (raw: string): number | string => {
         const parsed = parseMysqlBitValue(raw, column.nativeType);
@@ -1404,7 +1434,9 @@ export class MySQLDriver extends BaseDBDriver {
       const param =
         column.category === "integer"
           ? toMysqlIntegerFilterParam(val)
-          : Number(val);
+          : column.category === "decimal"
+            ? val
+            : Number(val);
       return { sql: `${col} ${sqlOp} ?`, params: [param] };
     }
     if (operator === "between" && Array.isArray(val)) {

@@ -21,6 +21,7 @@ import {
   logErrorWithContext,
   normalizeUnknownError,
 } from "./utils/errorHandling";
+
 let _activated = false;
 const CMD = {
   addConnection: "rapidb.addConnection",
@@ -419,6 +420,7 @@ export function activate(context: vscode.ExtensionContext): void {
     refresh();
   });
   reg(CMD.refresh, () => {
+    connectionManager.refreshSchemaCache();
     refresh();
   });
 }

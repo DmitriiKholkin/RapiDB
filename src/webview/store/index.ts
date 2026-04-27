@@ -51,6 +51,7 @@ export interface SchemaColumn {
 }
 
 export interface SchemaObject {
+  database: string;
   schema: string;
   object: string;
   type?: "table" | "view" | "function" | "procedure";

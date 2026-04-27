@@ -8,6 +8,10 @@ import React, {
 import { format as sqlFormatterFormat } from "sql-formatter";
 import type { SchemaObject } from "../store";
 import { onMessage, postMessage } from "../utils/messaging";
+import {
+  buildSqlCompletionSuggestions,
+  type SqlCompletionSuggestionKind,
+} from "./sqlCompletionSuggestions";
 
 type MonacoHostWindow = Window & {
   __monacoEnvSet?: boolean;
@@ -86,132 +90,27 @@ function applyVSCodeTheme(): void {
   monaco.editor.setTheme(RAPIDB_THEME);
 }
 
-const SQL_KEYWORDS = [
-  "SELECT",
-  "FROM",
-  "WHERE",
-  "JOIN",
-  "LEFT",
-  "RIGHT",
-  "INNER",
-  "OUTER",
-  "FULL",
-  "CROSS",
-  "ON",
-  "AS",
-  "AND",
-  "OR",
-  "NOT",
-  "IN",
-  "IS",
-  "NULL",
-  "LIKE",
-  "BETWEEN",
-  "EXISTS",
-  "INSERT",
-  "INTO",
-  "VALUES",
-  "UPDATE",
-  "SET",
-  "DELETE",
-  "TRUNCATE",
-  "CREATE",
-  "ALTER",
-  "DROP",
-  "TABLE",
-  "VIEW",
-  "INDEX",
-  "DATABASE",
-  "SCHEMA",
-  "GROUP BY",
-  "ORDER BY",
-  "HAVING",
-  "LIMIT",
-  "OFFSET",
-  "DISTINCT",
-  "ALL",
-  "UNION",
-  "WITH",
-  "CASE",
-  "WHEN",
-  "THEN",
-  "ELSE",
-  "END",
-  "CAST",
-  "COALESCE",
-  "NULLIF",
-  "COUNT",
-  "SUM",
-  "AVG",
-  "MIN",
-  "MAX",
-  "NOW",
-  "CURRENT_TIMESTAMP",
-  "CURRENT_DATE",
-  "PRIMARY KEY",
-  "FOREIGN KEY",
-  "REFERENCES",
-  "UNIQUE",
-  "NOT NULL",
-  "DEFAULT",
-  "BEGIN",
-  "COMMIT",
-  "ROLLBACK",
-  "TRANSACTION",
-  "EXPLAIN",
-  "ANALYZE",
-  "ASC",
-  "DESC",
-  "TRUE",
-  "FALSE",
-  "RETURNING",
-  "ILIKE",
-  "SIMILAR TO",
-  "CALL",
-];
-
 let providerDisposable: monaco.IDisposable | null = null;
 
 let getActiveSchema: () => SchemaObject[] = () => [];
 
-function objectKindFor(
-  type: SchemaObject["type"],
+function monacoCompletionKindFor(
+  kind: SqlCompletionSuggestionKind,
 ): monaco.languages.CompletionItemKind {
-  switch (type) {
-    case "table":
+  switch (kind) {
+    case "class":
       return monaco.languages.CompletionItemKind.Class;
-    case "view":
-      return monaco.languages.CompletionItemKind.Class;
-    case "procedure":
-      return monaco.languages.CompletionItemKind.Function;
+    case "field":
+      return monaco.languages.CompletionItemKind.Field;
     case "function":
       return monaco.languages.CompletionItemKind.Function;
+    case "keyword":
+      return monaco.languages.CompletionItemKind.Keyword;
+    case "module":
+      return monaco.languages.CompletionItemKind.Module;
     default:
       return monaco.languages.CompletionItemKind.Value;
   }
-}
-
-function objectDetailLabel(
-  type: SchemaObject["type"],
-  columnCount: number,
-): string {
-  if (type === "function" || type === "procedure") {
-    return type;
-  }
-
-  if (type === "view") {
-    return columnCount > 0 ? `view (${columnCount} cols)` : "view";
-  }
-
-  if (type === "table") {
-    return columnCount > 0 ? `table (${columnCount} cols)` : "table";
-  }
-
-  if (columnCount > 0) {
-    return `table (${columnCount} cols)`;
-  }
-
-  return type ?? "table";
 }
 
 function ensureCompletionProvider() {
@@ -233,143 +132,18 @@ function ensureCompletionProvider() {
         endColumn: word.endColumn,
       };
 
-      const items: monaco.languages.CompletionItem[] = [];
-
       const lineUpToCursor = model
         .getLineContent(position.lineNumber)
         .slice(0, position.column - 1);
-
-      const schemaDotTableDot = lineUpToCursor.match(/(\w+)\.(\w+)\.\s*(\w*)$/);
-      if (schemaDotTableDot) {
-        const schemaHint = schemaDotTableDot[1].toLowerCase();
-        const tableHint = schemaDotTableDot[2].toLowerCase();
-        const matched = schema.find(
-          (t) =>
-            t.schema.toLowerCase() === schemaHint &&
-            t.object.toLowerCase() === tableHint,
-        );
-        if (matched) {
-          matched.columns.forEach((col, i) => {
-            items.push({
-              label: col.name,
-              detail: col.type,
-              kind: monaco.languages.CompletionItemKind.Field,
-              insertText: col.name,
-              range,
-              sortText: String(i).padStart(5, "0"),
-            });
-          });
-          return { suggestions: items };
-        }
-      }
-
-      const dotMatch = lineUpToCursor.match(/(\w+)\.(\w*)$/);
-      if (dotMatch) {
-        const hint = dotMatch[1].toLowerCase();
-
-        const schemasWithHint = schema.filter(
-          (t) => t.schema.toLowerCase() === hint,
-        );
-        if (schemasWithHint.length > 0) {
-          schemasWithHint.forEach((t, i) => {
-            items.push({
-              label: t.object,
-              detail: objectDetailLabel(t.type, t.columns.length),
-              kind: objectKindFor(t.type),
-              insertText: t.object,
-              range,
-              sortText: String(i).padStart(5, "0"),
-            });
-          });
-          return { suggestions: items };
-        }
-
-        const matchedTable = schema.find(
-          (t) => t.object.toLowerCase() === hint,
-        );
-        if (matchedTable) {
-          matchedTable.columns.forEach((col, i) => {
-            items.push({
-              label: col.name,
-              detail: col.type,
-              kind: monaco.languages.CompletionItemKind.Field,
-              insertText: col.name,
-              range,
-              sortText: String(i).padStart(5, "0"),
-            });
-          });
-          return { suggestions: items };
-        }
-
-        return { suggestions: [] };
-      }
-
-      SQL_KEYWORDS.forEach((kw, i) => {
-        items.push({
-          label: kw,
-          kind: monaco.languages.CompletionItemKind.Keyword,
-          insertText: kw,
-          range,
-          sortText: `3_${String(i).padStart(5, "0")}`,
-        });
-      });
-
-      const schemaNames = [...new Set(schema.map((t) => t.schema))];
-      schemaNames.forEach((sn, i) => {
-        items.push({
-          label: sn,
-          detail: "schema / database",
-          kind: monaco.languages.CompletionItemKind.Module,
-          insertText: sn,
-          range,
-          sortText: `1_${String(i).padStart(5, "0")}`,
-        });
-      });
-
-      const primarySchema = schemaNames[0] ?? "";
-      schema.forEach((t, ti) => {
-        const isPrimary = t.schema === primarySchema;
-        const isRoutine = t.type === "function" || t.type === "procedure";
-        const objectKind = objectKindFor(t.type);
-        const detailLabel = objectDetailLabel(t.type, t.columns.length);
-
-        items.push({
-          label: t.object,
-          detail: isPrimary
-            ? `${detailLabel} in ${t.schema}`
-            : `${detailLabel} in ${t.schema}`,
-          kind: objectKind,
-          insertText: t.object,
-          range,
-          sortText: `2_${isPrimary ? "0" : "1"}_${String(ti).padStart(5, "0")}_tbl`,
-        });
-
-        items.push({
-          label: `${t.schema}.${t.object}`,
-          detail: isPrimary
-            ? `qualified (${detailLabel})`
-            : `qualified (${detailLabel})`,
-          kind: objectKind,
-          insertText: `${t.schema}.${t.object}`,
-          range,
-          sortText: `2_${isPrimary ? "0" : "1"}_${String(ti).padStart(5, "0")}_qual`,
-        });
-
-        if (isPrimary && !isRoutine) {
-          t.columns.forEach((col, ci) => {
-            items.push({
-              label: col.name,
-              detail: `${t.object}.${col.name}  ${col.type}`,
-              kind: monaco.languages.CompletionItemKind.Field,
-              insertText: col.name,
-              range,
-              sortText: `2_0_${String(ti).padStart(5, "0")}_col_${String(ci).padStart(5, "0")}`,
-            });
-          });
-        }
-      });
-
-      return { suggestions: items };
+      return {
+        suggestions: buildSqlCompletionSuggestions(schema, lineUpToCursor).map(
+          (item) => ({
+            ...item,
+            kind: monacoCompletionKindFor(item.kind),
+            range,
+          }),
+        ),
+      };
     },
   });
 }

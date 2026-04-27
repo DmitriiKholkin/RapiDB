@@ -116,7 +116,14 @@ describe("QueryView", () => {
     ]);
     dispatchIncomingMessage("schema", {
       connectionId: "conn-1",
-      schema: [{ schema: "public", table: "users", columns: [] }],
+      schema: [
+        {
+          database: "app_db",
+          schema: "public",
+          object: "users",
+          columns: [],
+        },
+      ],
     });
 
     await waitFor(() => {

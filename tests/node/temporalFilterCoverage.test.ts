@@ -21,7 +21,6 @@ const expandedTemporalOperators: FilterOperator[] = [
   "lte",
   "between",
   "in",
-  "like",
   "is_null",
   "is_not_null",
 ];

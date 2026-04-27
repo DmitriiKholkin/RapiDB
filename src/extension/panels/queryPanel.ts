@@ -80,10 +80,22 @@ export class QueryPanel {
         void this.controller.handleSchemaLoaded(loadedConnectionId);
       },
     );
+    const connectWatcher = connectionManager.onDidConnect(() => {
+      this.controller.handleConnectionsChanged();
+    });
+    const disconnectWatcher = connectionManager.onDidDisconnect(() => {
+      this.controller.handleConnectionsChanged();
+    });
+    const schemaRefreshWatcher = connectionManager.onDidRefreshSchemas(() => {
+      this.controller.handleConnectionsChanged();
+    });
 
     this.panel.onDidDispose(() => {
       configWatcher.dispose();
       schemaWatcher.dispose();
+      connectWatcher.dispose();
+      disconnectWatcher.dispose();
+      schemaRefreshWatcher.dispose();
     });
   }
 

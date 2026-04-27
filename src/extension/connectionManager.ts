@@ -6,6 +6,9 @@ import {
   type ConnectionConfig,
   type HistoryEntry,
   type SchemaObjectEntry,
+  type SchemaSnapshot,
+  type SchemaSnapshotDatabaseEntry,
+  type SchemaSnapshotObjectEntry,
   type StoredConnectionConfig,
   type TestConnectionResult,
 } from "./connectionManagerModels";
@@ -19,20 +22,44 @@ import { OracleDriver } from "./dbDrivers/oracle";
 import { PostgresDriver } from "./dbDrivers/postgres";
 import { SQLiteDriver } from "./dbDrivers/sqlite";
 import type { IDBDriver } from "./dbDrivers/types";
-import { normalizeUnknownError } from "./utils/errorHandling";
 import { pMapWithLimit } from "./utils/concurrency";
+import { normalizeUnknownError } from "./utils/errorHandling";
+
 export type {
   BookmarkEntry,
   ConnectAttempt,
   ConnectionConfig,
   HistoryEntry,
   SchemaObjectEntry,
+  SchemaSnapshot,
+  SchemaSnapshotDatabaseEntry,
+  SchemaSnapshotSchemaEntry,
   TestConnectionResult,
 } from "./connectionManagerModels";
+
 interface SchemaCacheEntry {
-  objects: SchemaObjectEntry[];
+  snapshot: SchemaSnapshot;
   loading: Promise<void> | null;
 }
+
+function createEmptySchemaSnapshot(): SchemaSnapshot {
+  return { databases: [] };
+}
+
+function flattenSchemaSnapshot(snapshot: SchemaSnapshot): SchemaObjectEntry[] {
+  return snapshot.databases.flatMap((database) =>
+    database.schemas.flatMap((schema) =>
+      schema.objects.map<SchemaObjectEntry>((object) => ({
+        database: database.name,
+        schema: schema.name,
+        object: object.name,
+        type: object.type,
+        columns: object.columns,
+      })),
+    ),
+  );
+}
+
 const TEST_CONNECTION_ID = "__test__";
 export class ConnectionManager {
   private readonly store: ConnectionManagerStore;
@@ -50,6 +77,8 @@ export class ConnectionManager {
   private readonly _onDidConnect = new vscode.EventEmitter<void>();
   readonly onDidSchemaLoad: vscode.Event<string>;
   private readonly _onDidSchemaLoad = new vscode.EventEmitter<string>();
+  readonly onDidRefreshSchemas: vscode.Event<void>;
+  private readonly _onDidRefreshSchemas = new vscode.EventEmitter<void>();
   private _connectionsCache: ConnectionConfig[] | null = null;
   private readonly _schemaCacheMap = new Map<string, SchemaCacheEntry>();
   constructor(
@@ -63,6 +92,7 @@ export class ConnectionManager {
     this.onDidConnect = this._onDidConnect.event;
     this.onDidDisconnect = this._onDidDisconnect.event;
     this.onDidSchemaLoad = this._onDidSchemaLoad.event;
+    this.onDidRefreshSchemas = this._onDidRefreshSchemas.event;
     this.store.onDidChangeConfiguration(async (e) => {
       this._connectionsCache = null;
       if (e.affectsConfiguration("rapidb.queryHistoryLimit")) {
@@ -270,11 +300,36 @@ export class ConnectionManager {
     return this.driverMap.get(id);
   }
   getSchema(connectionId: string): SchemaObjectEntry[] {
-    return this._schemaCacheMap.get(connectionId)?.objects ?? [];
+    return flattenSchemaSnapshot(this.getSchemaSnapshot(connectionId));
   }
+
+  getSchemaSnapshot(connectionId: string): SchemaSnapshot {
+    return (
+      this._schemaCacheMap.get(connectionId)?.snapshot ??
+      createEmptySchemaSnapshot()
+    );
+  }
+
+  refreshSchemaCache(connectionId?: string): void {
+    if (connectionId) {
+      this._schemaCacheMap.delete(connectionId);
+    } else {
+      this._schemaCacheMap.clear();
+    }
+    this._onDidRefreshSchemas.fire();
+  }
+
   async getSchemaAsync(connectionId: string): Promise<SchemaObjectEntry[]> {
+    const snapshot = await this.getSchemaSnapshotAsync(connectionId);
+    return flattenSchemaSnapshot(snapshot);
+  }
+
+  async getSchemaSnapshotAsync(connectionId: string): Promise<SchemaSnapshot> {
     const existing = this._schemaCacheMap.get(connectionId);
-    if (!existing || (!existing.loading && existing.objects.length === 0)) {
+    if (
+      !existing ||
+      (!existing.loading && existing.snapshot.databases.length === 0)
+    ) {
       this._startSchemaLoad(connectionId);
     }
     const entry = this._schemaCacheMap.get(connectionId);
@@ -283,7 +338,7 @@ export class ConnectionManager {
         await entry.loading;
       } catch {}
     }
-    return this._schemaCacheMap.get(connectionId)?.objects ?? [];
+    return this.getSchemaSnapshot(connectionId);
   }
   private _startSchemaLoad(connectionId: string): void {
     const driver = this.getDriver(connectionId);
@@ -293,7 +348,7 @@ export class ConnectionManager {
     }
     let entry = this._schemaCacheMap.get(connectionId);
     if (!entry) {
-      entry = { objects: [], loading: null };
+      entry = { snapshot: createEmptySchemaSnapshot(), loading: null };
       this._schemaCacheMap.set(connectionId, entry);
     }
     if (entry.loading) {
@@ -301,10 +356,10 @@ export class ConnectionManager {
     }
     const capturedEntry = entry;
     capturedEntry.loading = this._loadSchemaInternal(driver, config)
-      .then((objects) => {
+      .then((snapshot) => {
         const live = this._schemaCacheMap.get(connectionId);
         if (live === capturedEntry) {
-          live.objects = objects;
+          live.snapshot = snapshot;
           live.loading = null;
         }
         this._onDidSchemaLoad.fire(connectionId);
@@ -319,53 +374,94 @@ export class ConnectionManager {
   private async _loadSchemaInternal(
     driver: IDBDriver,
     config: ConnectionConfig,
-  ): Promise<SchemaObjectEntry[]> {
-    const result: SchemaObjectEntry[] = [];
-    const configuredDb = config.database || (config.filePath ? "main" : "");
+  ): Promise<SchemaSnapshot> {
+    const configuredDb =
+      config.database || config.serviceName || (config.filePath ? "main" : "");
     const allDbs = await driver.listDatabases().catch(() => []);
-    const primaryDb = configuredDb || allDbs[0]?.name || "";
-    if (!primaryDb) {
-      return result;
+    const databaseInfoMap = new Map(
+      allDbs.map((database) => [database.name, database] as const),
+    );
+    const databaseNames = [
+      ...new Set(
+        [configuredDb, ...allDbs.map((database) => database.name)].filter(
+          (name): name is string => typeof name === "string" && name.length > 0,
+        ),
+      ),
+    ];
+    if (databaseNames.length === 0) {
+      return createEmptySchemaSnapshot();
     }
-    const primarySchemas = await driver
-      .listSchemas(primaryDb)
-      .catch(() => [{ name: primaryDb }]);
-    for (const schema of primarySchemas.slice(0, 10)) {
-      const objects = await driver
-        .listObjects(primaryDb, schema.name)
-        .catch(() => []);
-      const objectsForSchema = objects
-        .filter(
-          (o) =>
-            o.type === "table" ||
-            o.type === "view" ||
-            o.type === "function" ||
-            o.type === "procedure",
-        )
-        .slice(0, 1000);
-      const allCols = await pMapWithLimit(objectsForSchema, 10, async (tbl) => {
-        if (tbl.type === "table" || tbl.type === "view") {
-          try {
-            return await driver.describeTable(primaryDb, schema.name, tbl.name);
-          } catch {
-            return [];
-          }
-        }
-        return [];
-      });
-      objectsForSchema.forEach((tbl, i) => {
-        result.push({
-          schema: schema.name,
-          object: tbl.name,
-          type: tbl.type,
-          columns:
-            tbl.type === "table" || tbl.type === "view"
-              ? allCols[i].map((c) => ({ name: c.name, type: c.type }))
-              : [],
-        });
-      });
-    }
-    return result;
+
+    const columnMetadataDatabase = configuredDb || databaseNames[0] || "";
+    const databases = await pMapWithLimit(
+      databaseNames,
+      4,
+      async (databaseName): Promise<SchemaSnapshotDatabaseEntry> => {
+        const schemasFromDatabase = databaseInfoMap.get(databaseName)?.schemas;
+        const schemas =
+          schemasFromDatabase && schemasFromDatabase.length > 0
+            ? schemasFromDatabase
+            : await driver
+                .listSchemas(databaseName)
+                .catch(() => [{ name: databaseName }]);
+        const perSchemaResults = await pMapWithLimit(
+          schemas,
+          4,
+          async (schema) => {
+            const objects = await driver
+              .listObjects(databaseName, schema.name)
+              .catch(() => []);
+            const objectsForSchema = objects.filter(
+              (object) =>
+                object.type === "table" ||
+                object.type === "view" ||
+                object.type === "function" ||
+                object.type === "procedure",
+            );
+            const loadColumns = databaseName === columnMetadataDatabase;
+            const allColumns = loadColumns
+              ? await pMapWithLimit(objectsForSchema, 10, async (object) => {
+                  if (object.type === "table" || object.type === "view") {
+                    try {
+                      return await driver.describeTable(
+                        databaseName,
+                        schema.name,
+                        object.name,
+                      );
+                    } catch {
+                      return [];
+                    }
+                  }
+                  return [];
+                })
+              : objectsForSchema.map(() => []);
+
+            return {
+              name: schema.name,
+              objects: objectsForSchema.map<SchemaSnapshotObjectEntry>(
+                (object, index) => ({
+                  name: object.name,
+                  type: object.type,
+                  columns:
+                    object.type === "table" || object.type === "view"
+                      ? allColumns[index].map((column) => ({
+                          name: column.name,
+                          type: column.type,
+                        }))
+                      : [],
+                }),
+              ),
+            };
+          },
+        );
+        return {
+          name: databaseName,
+          schemas: perSchemaResults,
+        };
+      },
+    );
+
+    return { databases };
   }
   async testConnection(
     config: Omit<ConnectionConfig, "id">,

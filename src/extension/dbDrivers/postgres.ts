@@ -166,28 +166,19 @@ export class PostgresDriver extends BaseDBDriver {
   private pool: Pool | null = null;
   private readonly config: ConnectionConfig;
   private _connected = false;
+  private connectedDatabaseName = "";
   private requirePool(): Pool {
     if (!this.pool) {
       throw new Error("[RapiDB] PostgreSQL connection is not open");
     }
     return this.pool;
   }
-  constructor(config: ConnectionConfig) {
-    super();
-    this.config = config;
-  }
-  async connect(): Promise<void> {
-    if (this.pool !== null) {
-      try {
-        await this.pool.end();
-      } catch {}
-      this.pool = null;
-    }
+  private createPool(database: string): Pool {
     const sslEnabled = this.config.ssl ?? false;
-    this.pool = new Pool({
+    return new Pool({
       host: this.config.host,
       port: this.config.port,
-      database: this.config.database,
+      database,
       user: this.config.username,
       password: this.config.password,
       max: 5,
@@ -201,16 +192,59 @@ export class PostgresDriver extends BaseDBDriver {
           }
         : undefined,
     });
+  }
+  private async withDatabasePool<T>(
+    database: string,
+    run: (pool: Pool) => Promise<T>,
+  ): Promise<T> {
+    if (
+      !database ||
+      database === this.connectedDatabaseName ||
+      database === this.config.database
+    ) {
+      return run(this.requirePool());
+    }
+
+    const pool = this.createPool(database);
+    try {
+      const client = await pool.connect();
+      client.release();
+      return await run(pool);
+    } finally {
+      await pool.end().catch(() => undefined);
+    }
+  }
+  constructor(config: ConnectionConfig) {
+    super();
+    this.config = config;
+  }
+  async connect(): Promise<void> {
+    if (this.pool !== null) {
+      try {
+        await this.pool.end();
+      } catch {}
+      this.pool = null;
+    }
+    this.pool = this.createPool(this.config.database ?? "");
     this.pool.on("error", (err) => {
       console.error("[RapiDB] PostgreSQL pool error:", err.message);
       this._connected = false;
     });
     const client = await this.pool.connect();
-    client.release();
+    try {
+      const databaseRes = await client.query<{ name: string }>(
+        `SELECT current_database() AS name`,
+      );
+      this.connectedDatabaseName =
+        databaseRes.rows[0]?.name ?? this.config.database ?? "";
+    } finally {
+      client.release();
+    }
     this._connected = true;
   }
   async disconnect(): Promise<void> {
     this._connected = false;
+    this.connectedDatabaseName = "";
     await this.pool?.end();
     this.pool = null;
   }
@@ -218,70 +252,85 @@ export class PostgresDriver extends BaseDBDriver {
     return this.pool !== null && this._connected;
   }
   async listDatabases(): Promise<DatabaseInfo[]> {
-    const res = await this.requirePool().query(
-      `SELECT current_database() AS name`,
-    );
-    const name =
-      (res.rows[0]?.name as string) ?? this.config.database ?? "postgres";
-    return [{ name, schemas: [] }];
-  }
-  async listSchemas(_database: string): Promise<SchemaInfo[]> {
-    const res =
-      await this.requirePool().query(`SELECT schema_name FROM information_schema.schemata
-       WHERE schema_name NOT IN ('information_schema','pg_catalog','pg_toast','pg_temp_1','pg_toast_temp_1')
-       ORDER BY schema_name`);
-    return res.rows.map((r) => ({ name: r.schema_name as string }));
-  }
-  async listObjects(_database: string, schema: string): Promise<TableInfo[]> {
-    const objects: TableInfo[] = [];
-    const pool = this.requirePool();
-    const tableRes = await pool.query(
-      `SELECT table_name AS name, table_type AS type
-       FROM information_schema.tables WHERE table_schema = $1 ORDER BY table_name`,
-      [schema],
-    );
-    for (const r of tableRes.rows) {
-      objects.push({
-        schema,
-        name: r.name as string,
-        type: (r.type === "VIEW" ? "view" : "table") as TableInfo["type"],
-      });
-    }
     try {
-      const routineRes = await pool.query(
-        `SELECT p.proname AS name,
-                CASE p.prokind WHEN 'f' THEN 'function' WHEN 'p' THEN 'procedure'
-                               WHEN 'a' THEN 'function'  ELSE 'function' END AS type
-         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-         WHERE n.nspname = $1 AND p.prokind IN ('f','p','a') ORDER BY p.proname`,
+      const res = await this.requirePool().query<{ name: string }>(
+        `SELECT datname AS name
+         FROM pg_database
+         WHERE datistemplate = FALSE
+           AND datallowconn = TRUE
+         ORDER BY CASE WHEN datname = current_database() THEN 0 ELSE 1 END,
+                  datname`,
+      );
+      if (res.rows.length > 0) {
+        return res.rows.map((row) => ({ name: row.name, schemas: [] }));
+      }
+    } catch {}
+
+    const fallbackName =
+      this.connectedDatabaseName || this.config.database || "postgres";
+    return [{ name: fallbackName, schemas: [] }];
+  }
+  async listSchemas(database: string): Promise<SchemaInfo[]> {
+    const res = await this.withDatabasePool(database, (pool) =>
+      pool.query<{
+        schema_name: string;
+      }>(`SELECT schema_name FROM information_schema.schemata
+       WHERE schema_name NOT IN ('information_schema','pg_catalog','pg_toast','pg_temp_1','pg_toast_temp_1')
+       ORDER BY schema_name`),
+    );
+    return res.rows.map((r) => ({ name: r.schema_name }));
+  }
+  async listObjects(database: string, schema: string): Promise<TableInfo[]> {
+    return this.withDatabasePool(database, async (pool) => {
+      const objects: TableInfo[] = [];
+      const tableRes = await pool.query(
+        `SELECT table_name AS name, table_type AS type
+         FROM information_schema.tables WHERE table_schema = $1 ORDER BY table_name`,
         [schema],
       );
-      for (const r of routineRes.rows) {
+      for (const r of tableRes.rows) {
         objects.push({
           schema,
           name: r.name as string,
-          type: r.type as TableInfo["type"],
+          type: (r.type === "VIEW" ? "view" : "table") as TableInfo["type"],
         });
       }
-    } catch {
       try {
         const routineRes = await pool.query(
-          `SELECT routine_name AS name, routine_type AS type
-           FROM information_schema.routines WHERE routine_schema = $1 ORDER BY routine_name`,
+          `SELECT p.proname AS name,
+                  CASE p.prokind WHEN 'f' THEN 'function' WHEN 'p' THEN 'procedure'
+                                 WHEN 'a' THEN 'function'  ELSE 'function' END AS type
+           FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+           WHERE n.nspname = $1 AND p.prokind IN ('f','p','a') ORDER BY p.proname`,
           [schema],
         );
         for (const r of routineRes.rows) {
           objects.push({
             schema,
             name: r.name as string,
-            type: (r.type === "PROCEDURE"
-              ? "procedure"
-              : "function") as TableInfo["type"],
+            type: r.type as TableInfo["type"],
           });
         }
-      } catch {}
-    }
-    return objects;
+      } catch {
+        try {
+          const routineRes = await pool.query(
+            `SELECT routine_name AS name, routine_type AS type
+             FROM information_schema.routines WHERE routine_schema = $1 ORDER BY routine_name`,
+            [schema],
+          );
+          for (const r of routineRes.rows) {
+            objects.push({
+              schema,
+              name: r.name as string,
+              type: (r.type === "PROCEDURE"
+                ? "procedure"
+                : "function") as TableInfo["type"],
+            });
+          }
+        } catch {}
+      }
+      return objects;
+    });
   }
   async describeTable(
     _database: string,

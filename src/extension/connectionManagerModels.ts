@@ -1,4 +1,5 @@
 import type { ConnectionConfig } from "../shared/connectionConfig";
+
 export type { ConnectionConfig } from "../shared/connectionConfig";
 export interface TestConnectionResult {
   success: boolean;
@@ -21,6 +22,7 @@ export interface ConnectAttempt {
   isNew: boolean;
 }
 export interface SchemaObjectEntry {
+  database: string;
   schema: string;
   object: string;
   type?: "table" | "view" | "function" | "procedure";
@@ -28,6 +30,31 @@ export interface SchemaObjectEntry {
     name: string;
     type: string;
   }[];
+}
+
+export interface SchemaColumnEntry {
+  name: string;
+  type: string;
+}
+
+export interface SchemaSnapshotObjectEntry {
+  name: string;
+  type: "table" | "view" | "function" | "procedure";
+  columns: SchemaColumnEntry[];
+}
+
+export interface SchemaSnapshotSchemaEntry {
+  name: string;
+  objects: SchemaSnapshotObjectEntry[];
+}
+
+export interface SchemaSnapshotDatabaseEntry {
+  name: string;
+  schemas: SchemaSnapshotSchemaEntry[];
+}
+
+export interface SchemaSnapshot {
+  databases: SchemaSnapshotDatabaseEntry[];
 }
 export interface StoredConnectionConfig extends ConnectionConfig {
   user?: string;

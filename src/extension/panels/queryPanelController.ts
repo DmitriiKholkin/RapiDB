@@ -78,6 +78,7 @@ export class QueryPanelController {
   handleConnectionsChanged(): void {
     this.pushConnections();
     this.view.syncTitle();
+    void this.pushSchema();
   }
 
   async handleSchemaLoaded(connectionId: string): Promise<void> {
@@ -100,6 +101,7 @@ export class QueryPanelController {
   private handleActiveConnectionChanged(connectionId: string): void {
     this.view.setActiveConnectionId(connectionId);
     this.view.syncTitle();
+    void this.pushSchema(connectionId);
   }
 
   private async handleExecuteQuery(

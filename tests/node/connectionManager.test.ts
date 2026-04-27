@@ -2,7 +2,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
+  DatabaseInfo,
   IDBDriver,
+  SchemaInfo,
+  TableInfo,
 } from "../../src/extension/dbDrivers/types";
 import {
   createExtensionContextStub,
@@ -11,7 +14,11 @@ import {
 import { MockEventEmitter } from "../support/mockVscode";
 
 interface DriverBehavior {
-  connectError?: Error;
+  connectError?: unknown;
+  listDatabases?: DatabaseInfo[];
+  listSchemasByDatabase?: Record<string, SchemaInfo[]>;
+  listObjectsByScope?: Record<string, TableInfo[]>;
+  describeTableByScope?: Record<string, ColumnMeta[]>;
 }
 
 const driverBehaviors = new Map<string, DriverBehavior>();
@@ -20,6 +27,7 @@ const driverInstances: FakeDriver[] = [];
 class FakeDriver implements IDBDriver {
   connectCalls = 0;
   disconnectCalls = 0;
+  describeTableCalls: string[] = [];
   private connected = false;
 
   constructor(readonly config: { id: string }) {
@@ -45,19 +53,40 @@ class FakeDriver implements IDBDriver {
   }
 
   async listDatabases() {
-    return [{ name: "main", schemas: [] }];
+    return (
+      driverBehaviors.get(this.config.id)?.listDatabases ?? [
+        { name: "main", schemas: [] },
+      ]
+    );
   }
 
-  async listSchemas() {
-    return [{ name: "public" }];
+  async listSchemas(database = "") {
+    return (
+      driverBehaviors.get(this.config.id)?.listSchemasByDatabase?.[
+        database
+      ] ?? [{ name: "public" }]
+    );
   }
 
-  async listObjects() {
-    return [];
+  async listObjects(database = "", schema = "") {
+    return (
+      driverBehaviors.get(this.config.id)?.listObjectsByScope?.[
+        `${database}.${schema}`
+      ] ?? []
+    );
   }
 
-  async describeTable(): Promise<ColumnMeta[]> {
-    return [];
+  async describeTable(
+    database = "",
+    schema = "",
+    table = "",
+  ): Promise<ColumnMeta[]> {
+    this.describeTableCalls.push(`${database}.${schema}.${table}`);
+    return (
+      driverBehaviors.get(this.config.id)?.describeTableByScope?.[
+        `${database}.${schema}.${table}`
+      ] ?? []
+    );
   }
 
   async describeColumns(): Promise<ColumnTypeMeta[]> {
@@ -328,7 +357,12 @@ describe("ConnectionManager", () => {
     );
 
     driverBehaviors.set("__test__", {
-      connectError: new Error("Cannot connect"),
+      connectError: {
+        message: "",
+        code: "ECONNREFUSED",
+        errno: -61,
+        name: "Error",
+      },
     });
 
     const manager = new ConnectionManager(
@@ -342,9 +376,287 @@ describe("ConnectionManager", () => {
     });
 
     expect(result.success).toBe(false);
-    expect(result.error).toContain("Cannot connect");
+    expect(result.error).toContain("ECONNREFUSED");
     expect(driverInstances).toHaveLength(1);
     expect(driverInstances[0]?.disconnectCalls).toBe(1);
+  });
+
+  it("loads schema cache across all databases but only fetches columns for the configured database", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    driverBehaviors.set("conn-1", {
+      listDatabases: [
+        { name: "app_db", schemas: [] },
+        { name: "archive_db", schemas: [] },
+      ],
+      listSchemasByDatabase: {
+        app_db: [{ name: "public" }, { name: "audit" }],
+        archive_db: [{ name: "public" }],
+      },
+      listObjectsByScope: {
+        "app_db.public": [
+          { schema: "public", name: "users", type: "table" },
+          { schema: "public", name: "active_users", type: "view" },
+          { schema: "public", name: "rebuild_cache", type: "procedure" },
+        ],
+        "app_db.audit": [
+          { schema: "audit", name: "event_feed", type: "table" },
+        ],
+        "archive_db.public": [
+          { schema: "public", name: "users_archive", type: "table" },
+          { schema: "public", name: "summarize_archive", type: "function" },
+        ],
+      },
+      describeTableByScope: {
+        "app_db.public.users": [
+          {
+            name: "id",
+            type: "int",
+            nullable: false,
+            isPrimaryKey: false,
+            isForeignKey: false,
+          },
+        ],
+        "app_db.public.active_users": [
+          {
+            name: "id",
+            type: "int",
+            nullable: false,
+            isPrimaryKey: false,
+            isForeignKey: false,
+          },
+        ],
+        "app_db.audit.event_feed": [
+          {
+            name: "event_id",
+            type: "bigint",
+            nullable: false,
+            isPrimaryKey: false,
+            isForeignKey: false,
+          },
+        ],
+        "archive_db.public.users_archive": [
+          {
+            name: "archived_id",
+            type: "int",
+            nullable: false,
+            isPrimaryKey: false,
+            isForeignKey: false,
+          },
+        ],
+      },
+    });
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        database: "app_db",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo("conn-1");
+
+    const snapshot = await manager.getSchemaSnapshotAsync("conn-1");
+    const schema = await manager.getSchemaAsync("conn-1");
+
+    expect(snapshot).toEqual(
+      expect.objectContaining({
+        databases: expect.arrayContaining([
+          expect.objectContaining({
+            name: "app_db",
+            schemas: expect.arrayContaining([
+              expect.objectContaining({
+                name: "public",
+                objects: expect.arrayContaining([
+                  expect.objectContaining({
+                    name: "users",
+                    type: "table",
+                    columns: [{ name: "id", type: "int" }],
+                  }),
+                ]),
+              }),
+            ]),
+          }),
+          expect.objectContaining({
+            name: "archive_db",
+            schemas: expect.arrayContaining([
+              expect.objectContaining({
+                name: "public",
+                objects: expect.arrayContaining([
+                  expect.objectContaining({
+                    name: "users_archive",
+                    type: "table",
+                    columns: [],
+                  }),
+                ]),
+              }),
+            ]),
+          }),
+        ]),
+      }),
+    );
+
+    expect(schema).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          database: "app_db",
+          schema: "public",
+          object: "users",
+          columns: [{ name: "id", type: "int" }],
+        }),
+        expect.objectContaining({
+          database: "archive_db",
+          schema: "public",
+          object: "users_archive",
+          columns: [],
+        }),
+        expect.objectContaining({
+          database: "archive_db",
+          schema: "public",
+          object: "summarize_archive",
+          columns: [],
+        }),
+      ]),
+    );
+
+    expect(driverInstances[0]?.describeTableCalls).toEqual([
+      "app_db.public.users",
+      "app_db.public.active_users",
+      "app_db.audit.event_feed",
+    ]);
+  });
+
+  it("refreshes cached schema metadata after a manual refresh request", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    driverBehaviors.set("conn-1", {
+      listDatabases: [{ name: "app_db", schemas: [] }],
+      listSchemasByDatabase: {
+        app_db: [{ name: "public" }],
+      },
+      listObjectsByScope: {
+        "app_db.public": [{ schema: "public", name: "users", type: "table" }],
+      },
+      describeTableByScope: {
+        "app_db.public.users": [
+          {
+            name: "id",
+            type: "int",
+            nullable: false,
+            isPrimaryKey: false,
+            isForeignKey: false,
+          },
+        ],
+      },
+    });
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "mysql",
+        database: "app_db",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo("conn-1");
+
+    const initialSchema = await manager.getSchemaAsync("conn-1");
+    expect(initialSchema).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          database: "app_db",
+          schema: "public",
+          object: "users",
+          columns: [{ name: "id", type: "int" }],
+        }),
+      ]),
+    );
+
+    driverBehaviors.set("conn-1", {
+      listDatabases: [{ name: "app_db", schemas: [] }],
+      listSchemasByDatabase: {
+        app_db: [{ name: "public" }, { name: "audit" }],
+      },
+      listObjectsByScope: {
+        "app_db.public": [{ schema: "public", name: "users", type: "table" }],
+        "app_db.audit": [
+          { schema: "audit", name: "event_feed", type: "table" },
+        ],
+      },
+      describeTableByScope: {
+        "app_db.public.users": [
+          {
+            name: "id",
+            type: "int",
+            nullable: false,
+            isPrimaryKey: false,
+            isForeignKey: false,
+          },
+        ],
+        "app_db.audit.event_feed": [
+          {
+            name: "event_id",
+            type: "bigint",
+            nullable: false,
+            isPrimaryKey: false,
+            isForeignKey: false,
+          },
+        ],
+      },
+    });
+
+    manager.refreshSchemaCache("conn-1");
+
+    const refreshedSnapshot = await manager.getSchemaSnapshotAsync("conn-1");
+    const refreshedSchema = await manager.getSchemaAsync("conn-1");
+    expect(refreshedSnapshot).toEqual(
+      expect.objectContaining({
+        databases: expect.arrayContaining([
+          expect.objectContaining({
+            name: "app_db",
+            schemas: expect.arrayContaining([
+              expect.objectContaining({
+                name: "audit",
+                objects: expect.arrayContaining([
+                  expect.objectContaining({
+                    name: "event_feed",
+                    columns: [{ name: "event_id", type: "bigint" }],
+                  }),
+                ]),
+              }),
+            ]),
+          }),
+        ]),
+      }),
+    );
+    expect(refreshedSchema).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          database: "app_db",
+          schema: "audit",
+          object: "event_feed",
+          columns: [{ name: "event_id", type: "bigint" }],
+        }),
+      ]),
+    );
+    expect(refreshedSchema).toHaveLength(2);
   });
 
   it("deduplicates identical trailing history entries and trims to the configured limit", async () => {
