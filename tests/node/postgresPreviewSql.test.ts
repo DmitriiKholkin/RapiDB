@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
+import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 
 const driver = new PostgresDriver({
   id: "preview-test",
@@ -11,6 +12,28 @@ const driver = new PostgresDriver({
   username: "postgres",
   password: "postgres",
 });
+
+function column(
+  name: string,
+  nativeType: string,
+  category: ColumnTypeMeta["category"],
+): ColumnTypeMeta {
+  return {
+    name,
+    type: nativeType,
+    nativeType,
+    category,
+    nullable: true,
+    defaultValue: undefined,
+    isPrimaryKey: false,
+    primaryKeyOrdinal: undefined,
+    isForeignKey: false,
+    isAutoIncrement: false,
+    filterable: true,
+    filterOperators: ["is_null", "is_not_null"],
+    valueSemantics: "plain",
+  };
+}
 
 describe("postgres preview SQL materialization", () => {
   it("renders executable PostgreSQL array and bytea literals", () => {
@@ -34,5 +57,46 @@ describe("postgres preview SQL materialization", () => {
     expect(preview).toBe(
       "INSERT INTO probe(payload, note) VALUES ('{}', 'ok')",
     );
+  });
+
+  it("casts typed insert array previews to the target PostgreSQL array type", () => {
+    const sql =
+      'INSERT INTO "public"."probe" ("col_jsonb_array", "col_text_array") VALUES ($1, $2)';
+    const preview = driver.materializePreviewInsertSql(
+      sql,
+      [
+        ['{"a":1}', '{"b":2}'],
+        ["one", "two"],
+      ],
+      [
+        column("col_jsonb_array", "jsonb[]", "array"),
+        column("col_text_array", "text[]", "array"),
+      ],
+    );
+
+    expect(preview).toContain(`CAST(ARRAY['{"a":1}', '{"b":2}'] AS jsonb[])`);
+    expect(preview).toContain(`CAST(ARRAY['one', 'two'] AS text[])`);
+  });
+
+  it("casts typed update array previews to the target PostgreSQL array type", () => {
+    const sql =
+      'UPDATE "public"."probe" SET "col_jsonb_array" = $1, "col_text_array" = $2 WHERE "id" = $3';
+    const preview = driver.materializePreviewColumnSql(
+      sql,
+      [['{"a":1}', '{"b":3}'], ["one", "two", "three"], 1],
+      [
+        column("col_jsonb_array", "jsonb[]", "array"),
+        column("col_text_array", "text[]", "array"),
+        column("id", "integer", "integer"),
+      ],
+    );
+
+    expect(preview).toContain(
+      `"col_jsonb_array" = CAST(ARRAY['{"a":1}', '{"b":3}'] AS jsonb[])`,
+    );
+    expect(preview).toContain(
+      `"col_text_array" = CAST(ARRAY['one', 'two', 'three'] AS text[])`,
+    );
+    expect(preview).toContain('WHERE "id" = 1');
   });
 });

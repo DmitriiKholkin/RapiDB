@@ -1221,6 +1221,16 @@ export class MySQLDriver extends BaseDBDriver {
     if (!column.filterable) return null;
     if (value === undefined) return null;
     const val = typeof value === "string" ? value.trim() : value;
+    if (column.category === "array") {
+      if (operator !== "like" && operator !== "ilike") {
+        return null;
+      }
+      const arrayValue = typeof val === "string" ? val : val[0];
+      return {
+        sql: `CAST(${col} AS CHAR) LIKE ?`,
+        params: [`%${arrayValue}%`],
+      };
+    }
     if (
       this.hasBooleanSemantics(column) &&
       (operator === "eq" || operator === "neq")
@@ -1280,6 +1290,17 @@ export class MySQLDriver extends BaseDBDriver {
           ],
         };
       }
+      if (typeof val === "string" && operator === "in") {
+        const parts = val
+          .split(",")
+          .map((part) => part.trim())
+          .filter(Boolean)
+          .map((part) => normalizeMysqlDateInput(part) ?? part);
+        return {
+          sql: `${col} IN (${parts.map(() => "CAST(? AS DATE)").join(", ")})`,
+          params: parts,
+        };
+      }
       if (
         typeof val === "string" &&
         ["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)
@@ -1288,6 +1309,66 @@ export class MySQLDriver extends BaseDBDriver {
         return {
           sql: `${col} ${sqlOp} CAST(? AS DATE)`,
           params: [normalizeMysqlDateInput(val) ?? val],
+        };
+      }
+    }
+    if (column.category === "time") {
+      if (operator === "between" && Array.isArray(val)) {
+        return {
+          sql: `CAST(${col} AS TIME) BETWEEN CAST(? AS TIME) AND CAST(? AS TIME)`,
+          params: [val[0], val[1]],
+        };
+      }
+      if (typeof val === "string" && operator === "in") {
+        const parts = val
+          .split(",")
+          .map((part) => part.trim())
+          .filter(Boolean);
+        return {
+          sql: `CAST(${col} AS TIME) IN (${parts.map(() => "CAST(? AS TIME)").join(", ")})`,
+          params: parts,
+        };
+      }
+      if (
+        typeof val === "string" &&
+        ["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)
+      ) {
+        const sqlOp = operator === "neq" ? "!=" : this.sqlOperator(operator);
+        return {
+          sql: `CAST(${col} AS TIME) ${sqlOp} CAST(? AS TIME)`,
+          params: [val],
+        };
+      }
+    }
+    if (column.category === "datetime") {
+      if (operator === "between" && Array.isArray(val)) {
+        return {
+          sql: `CAST(${col} AS DATETIME) BETWEEN CAST(? AS DATETIME) AND CAST(? AS DATETIME)`,
+          params: [
+            normalizeMysqlDatetimeInput(val[0]) ?? val[0],
+            normalizeMysqlDatetimeInput(val[1]) ?? val[1],
+          ],
+        };
+      }
+      if (typeof val === "string" && operator === "in") {
+        const parts = val
+          .split(",")
+          .map((part) => part.trim())
+          .filter(Boolean)
+          .map((part) => normalizeMysqlDatetimeInput(part) ?? part);
+        return {
+          sql: `CAST(${col} AS DATETIME) IN (${parts.map(() => "CAST(? AS DATETIME)").join(", ")})`,
+          params: parts,
+        };
+      }
+      if (
+        typeof val === "string" &&
+        ["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)
+      ) {
+        const sqlOp = operator === "neq" ? "!=" : this.sqlOperator(operator);
+        return {
+          sql: `CAST(${col} AS DATETIME) ${sqlOp} CAST(? AS DATETIME)`,
+          params: [normalizeMysqlDatetimeInput(val) ?? val],
         };
       }
     }

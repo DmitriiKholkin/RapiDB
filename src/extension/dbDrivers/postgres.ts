@@ -24,6 +24,7 @@ import type {
   ValueSemantics,
 } from "./types";
 import { DATETIME_SQL_RE, ISO_DATETIME_RE, NULL_SENTINEL } from "./types";
+
 const PG_OID_DATE = 1082;
 const PG_OID_TIMESTAMP = 1114;
 const PG_OID_TIMESTAMPTZ = 1184;
@@ -54,6 +55,20 @@ function jsonToPgCircle(val: string): string {
   } catch {}
   return trimmed;
 }
+
+function normalizeJsonFilterValue(value: string): string | null {
+  const trimmed = value.trim();
+  if (trimmed === "") {
+    return null;
+  }
+
+  try {
+    return JSON.stringify(JSON.parse(trimmed));
+  } catch {
+    return null;
+  }
+}
+
 function isPointValue(value: object): value is {
   x: unknown;
   y: unknown;
@@ -115,6 +130,32 @@ function normalizeTemporalSearchValue(value: string): string {
       .replace(/[+-]\d{2}(?::?\d{2})?$/, "");
   }
   return trimmed;
+}
+function normalizePostgresTemporalValue(value: string): string {
+  const trimmed = value.trim().replace(/^(["'])(.*)\1$/s, "$2");
+  const normalizedSql = normalizeSqlDatetimeOffsetSpacing(
+    trimmed.replace("T", " "),
+  );
+  if (ISO_DATETIME_RE.test(trimmed) || DATETIME_SQL_RE.test(normalizedSql)) {
+    return normalizedSql
+      .replace(/(\.\d*?[1-9])0+(?=[Zz+-]|$)/, "$1")
+      .replace(/\.0+(?=[Zz+-]|$)/, "");
+  }
+  return trimmed;
+}
+function postgresTemporalCastType(
+  column: Pick<ColumnTypeMeta, "category" | "nativeType">,
+): "date" | "time" | "timetz" | "timestamp" | "timestamptz" {
+  const nativeType = column.nativeType.toLowerCase();
+  if (column.category === "date") {
+    return "date";
+  }
+  if (column.category === "time") {
+    return nativeType.includes("with time zone") || nativeType === "timetz"
+      ? "timetz"
+      : "time";
+  }
+  return nativeType.includes("with time zone") ? "timestamptz" : "timestamp";
 }
 function approximateNumericFilterTolerance(rawValue: string): number {
   const fraction = /\.(\d+)/.exec(rawValue)?.[1].length ?? 0;
@@ -696,6 +737,51 @@ export class PostgresDriver extends BaseDBDriver {
   override buildSetExpr(column: ColumnTypeMeta, paramIndex: number): string {
     return `${this.quoteIdentifier(column.name)} = $${paramIndex}`;
   }
+  materializePreviewColumnSql(
+    sql: string,
+    params: readonly unknown[] | undefined,
+    columns: readonly (ColumnTypeMeta | undefined)[],
+  ): string {
+    if (!params || params.length === 0 || columns.length === 0) {
+      return this.materializePreviewSql(sql, params);
+    }
+    return sql.replace(/\$(\d+)/g, (match, rawIndex: string) => {
+      const index = Number.parseInt(rawIndex, 10) - 1;
+      if (index < 0 || index >= params.length) {
+        return match;
+      }
+      return this.formatColumnAwarePreviewLiteral(
+        params[index],
+        columns[index],
+      );
+    });
+  }
+  materializePreviewInsertSql(
+    sql: string,
+    params: readonly unknown[] | undefined,
+    columns: readonly ColumnTypeMeta[],
+  ): string {
+    return this.materializePreviewColumnSql(sql, params, columns);
+  }
+  private formatColumnAwarePreviewLiteral(
+    value: unknown,
+    column: ColumnTypeMeta | undefined,
+  ): string {
+    if (column?.category === "array" && Array.isArray(value)) {
+      return this.formatTypedPostgresArrayLiteral(value, column.nativeType);
+    }
+    return this.formatPreviewSqlLiteral(value);
+  }
+  private formatTypedPostgresArrayLiteral(
+    value: readonly unknown[],
+    nativeType: string,
+  ): string {
+    const arrayLiteral =
+      value.length === 0
+        ? "ARRAY[]"
+        : this.formatPostgresArrayLiteralValue(value);
+    return `CAST(${arrayLiteral} AS ${nativeType})`;
+  }
   private formatPostgresArrayLiteralValue(value: unknown): string {
     if (value === null || value === undefined || value === NULL_SENTINEL) {
       return "NULL";
@@ -879,6 +965,16 @@ export class PostgresDriver extends BaseDBDriver {
     if (!column.filterable) return null;
     if (value === undefined) return null;
     const val = typeof value === "string" ? value.trim() : value;
+    if (column.category === "array") {
+      if (operator !== "like" && operator !== "ilike") {
+        return null;
+      }
+      const arrayValue = typeof val === "string" ? val : val[0];
+      return {
+        sql: `to_jsonb(${col})::text ILIKE $${paramIndex}`,
+        params: [`%${arrayValue}%`],
+      };
+    }
     if (
       this.hasBooleanSemantics(column) &&
       (operator === "eq" || operator === "neq")
@@ -888,6 +984,29 @@ export class PostgresDriver extends BaseDBDriver {
         const boolVal = strVal === "true";
         const op = operator === "neq" ? "!=" : "=";
         return { sql: `${col} ${op} $${paramIndex}`, params: [boolVal] };
+      }
+    }
+    if (column.category === "json" && typeof val === "string") {
+      const normalizedJson = normalizeJsonFilterValue(val);
+      if (normalizedJson !== null) {
+        if (operator === "eq") {
+          return {
+            sql: `(${col})::jsonb = $${paramIndex}::jsonb`,
+            params: [normalizedJson],
+          };
+        }
+        if (operator === "neq") {
+          return {
+            sql: `(${col})::jsonb <> $${paramIndex}::jsonb`,
+            params: [normalizedJson],
+          };
+        }
+        if (operator === "like" || operator === "ilike") {
+          return {
+            sql: `(${col})::jsonb @> $${paramIndex}::jsonb`,
+            params: [normalizedJson],
+          };
+        }
       }
     }
     if (column.category === "date" && typeof val === "string") {
@@ -902,6 +1021,22 @@ export class PostgresDriver extends BaseDBDriver {
           params: [`%${searchValue}%`],
         };
       }
+      if (operator === "between" && Array.isArray(val)) {
+        return {
+          sql: `${col} BETWEEN $${paramIndex}::date AND $${paramIndex + 1}::date`,
+          params: [val[0], val[1]],
+        };
+      }
+      if (operator === "in") {
+        const parts = val
+          .split(",")
+          .map((part) => part.trim())
+          .filter(Boolean);
+        const placeholders = parts
+          .map((_, index) => `$${paramIndex + index}::date`)
+          .join(", ");
+        return { sql: `${col} IN (${placeholders})`, params: parts };
+      }
       const sqlOp = this.sqlOperator(operator);
       return {
         sql: `${col} ${sqlOp} $${paramIndex}::date`,
@@ -909,7 +1044,7 @@ export class PostgresDriver extends BaseDBDriver {
       };
     }
     if (column.category === "datetime" || column.category === "time") {
-      if (operator === "eq" || operator === "like" || operator === "ilike") {
+      if (operator === "like" || operator === "ilike") {
         const v = typeof val === "string" ? val : val[0];
         const searchValue = normalizeTemporalSearchValue(v);
         return {
@@ -917,18 +1052,32 @@ export class PostgresDriver extends BaseDBDriver {
           params: [`%${searchValue}%`],
         };
       }
+      const castType = postgresTemporalCastType(column);
       if (operator === "between" && Array.isArray(val)) {
+        const startValue = normalizePostgresTemporalValue(val[0]);
+        const endValue = normalizePostgresTemporalValue(val[1]);
         return {
-          sql: `${col} BETWEEN $${paramIndex}::timestamp AND $${paramIndex + 1}::timestamp`,
-          params: [val[0], val[1]],
+          sql: `${col} BETWEEN $${paramIndex}::${castType} AND $${paramIndex + 1}::${castType}`,
+          params: [startValue, endValue],
         };
       }
-      const v = typeof val === "string" ? val : val[0];
-      const searchValue = normalizeTemporalSearchValue(v);
-      return {
-        sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex}`,
-        params: [`%${searchValue}%`],
-      };
+      if (operator === "in" && typeof val === "string") {
+        const parts = val
+          .split(",")
+          .map((part) => normalizePostgresTemporalValue(part))
+          .filter(Boolean);
+        const placeholders = parts
+          .map((_, index) => `$${paramIndex + index}::${castType}`)
+          .join(", ");
+        return { sql: `${col} IN (${placeholders})`, params: parts };
+      }
+      if (typeof val === "string") {
+        const sqlOp = operator === "neq" ? "<>" : this.sqlOperator(operator);
+        return {
+          sql: `${col} ${sqlOp} $${paramIndex}::${castType}`,
+          params: [normalizePostgresTemporalValue(val)],
+        };
+      }
     }
     if (
       this.isNumericCategory(column.category) &&

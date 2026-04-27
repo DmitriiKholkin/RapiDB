@@ -6,8 +6,8 @@ import type {
   IndexMeta,
   QueryColumnMeta,
   TypeCategory,
-  ValueSemantics,
 } from "../../shared/tableTypes";
+
 export {
   type ColumnMeta,
   type ColumnTypeMeta,
@@ -149,34 +149,14 @@ export interface TransactionOperation {
   params?: unknown[];
   checkAffectedRows?: boolean;
 }
-const NUMERIC_OPS: FilterOperator[] = [
-  "eq",
-  "neq",
-  "gt",
-  "gte",
-  "lt",
-  "lte",
-  "between",
-  "in",
-  "is_null",
-  "is_not_null",
-];
-const FLOAT_OPS: FilterOperator[] = [
-  "eq",
-  "neq",
-  "gt",
-  "gte",
-  "lt",
-  "lte",
-  "between",
-  "in",
-  "is_null",
-  "is_not_null",
-];
 const TEXT_OPS: FilterOperator[] = ["like", "is_null", "is_not_null"];
 const UUID_OPS: FilterOperator[] = ["like", "in", "is_null", "is_not_null"];
 const ENUM_OPS: FilterOperator[] = ["like", "in", "is_null", "is_not_null"];
-const DATE_OPS: FilterOperator[] = [
+const BOOL_OPS: FilterOperator[] = ["eq", "neq", "is_null", "is_not_null"];
+const SEARCH_OPS: FilterOperator[] = ["like", "is_null", "is_not_null"];
+const ARRAY_OPS: FilterOperator[] = ["like", "is_null", "is_not_null"];
+const NULL_ONLY_OPS: FilterOperator[] = ["is_null", "is_not_null"];
+const EXTENDED_OPS: FilterOperator[] = [
   "eq",
   "neq",
   "gt",
@@ -184,43 +164,44 @@ const DATE_OPS: FilterOperator[] = [
   "lt",
   "lte",
   "between",
-  "like",
+  "in",
   "is_null",
   "is_not_null",
 ];
-const TEMPORAL_OPS: FilterOperator[] = ["like", "is_null", "is_not_null"];
-const BOOL_OPS: FilterOperator[] = ["eq", "neq", "is_null", "is_not_null"];
-const SEARCH_OPS: FilterOperator[] = ["like", "is_null", "is_not_null"];
-const NULL_ONLY_OPS: FilterOperator[] = ["is_null", "is_not_null"];
 export function filterOperatorsForCategory(
   cat: TypeCategory,
 ): FilterOperator[] {
   switch (cat) {
     case "integer":
+      return EXTENDED_OPS;
     case "decimal":
-      return NUMERIC_OPS;
+      return EXTENDED_OPS;
     case "float":
-      return FLOAT_OPS;
+      return EXTENDED_OPS;
     case "uuid":
       return UUID_OPS;
     case "text":
+      return TEXT_OPS;
     case "json":
       return TEXT_OPS;
     case "enum":
       return ENUM_OPS;
     case "date":
-      return DATE_OPS;
+      return EXTENDED_OPS;
     case "time":
+      return EXTENDED_OPS;
     case "datetime":
-      return TEMPORAL_OPS;
+      return EXTENDED_OPS;
     case "interval":
       return NULL_ONLY_OPS;
     case "boolean":
       return BOOL_OPS;
     case "binary":
-    case "spatial":
-    case "array":
       return NULL_ONLY_OPS;
+    case "spatial":
+      return NULL_ONLY_OPS;
+    case "array":
+      return ARRAY_OPS;
     case "other":
       return SEARCH_OPS;
     default:

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import type {
   ColumnTypeMeta,
   IDBDriver,
@@ -7,6 +8,7 @@ import { buildWhere } from "../../src/extension/table/filterSql";
 import { buildInsertRowOperation } from "../../src/extension/table/insertSql";
 import { prepareApplyChangesPlan } from "../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
+import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
 const columns: ColumnTypeMeta[] = [
   {
@@ -350,6 +352,76 @@ describe("table helpers", () => {
       "UPDATE public.fixture_rows",
     );
     expect(result.plan.skippedRows).toEqual([1]);
+  });
+
+  it("uses column-aware PostgreSQL preview materialization for typed array updates", () => {
+    const postgresDriver = new PostgresDriver({
+      id: "pg-preview-test",
+      name: "pg-preview-test",
+      type: "pg",
+      host: "localhost",
+      port: 5432,
+      database: "postgres",
+      username: "postgres",
+      password: "postgres",
+    } as ConnectionConfig);
+
+    const postgresColumns: ColumnTypeMeta[] = [
+      {
+        name: "id",
+        type: "integer",
+        nativeType: "integer",
+        nullable: false,
+        isPrimaryKey: true,
+        primaryKeyOrdinal: 1,
+        isForeignKey: false,
+        isAutoIncrement: false,
+        category: "integer",
+        filterable: true,
+        filterOperators: ["eq", "is_null", "is_not_null"],
+        valueSemantics: "plain",
+      },
+      {
+        name: "col_jsonb_array",
+        type: "jsonb[]",
+        nativeType: "jsonb[]",
+        nullable: true,
+        isPrimaryKey: false,
+        isForeignKey: false,
+        isAutoIncrement: false,
+        category: "array",
+        filterable: true,
+        filterOperators: ["like", "is_null", "is_not_null"],
+        valueSemantics: "plain",
+      },
+    ];
+
+    const result = prepareApplyChangesPlan(
+      {
+        getDriver: () => postgresDriver,
+      } as never,
+      "conn-pg",
+      "main",
+      "public",
+      "fixture_rows",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { col_jsonb_array: ['{"a":1}', '{"b":3}'] },
+        },
+      ],
+      postgresColumns,
+    );
+
+    expect(result.executable).toBe(true);
+    if (!result.executable) {
+      throw new Error("Expected executable plan");
+    }
+
+    expect(result.plan.previewStatements).toHaveLength(1);
+    expect(result.plan.previewStatements[0]).toContain(
+      `"col_jsonb_array" = CAST(ARRAY['{"a":1}', '{"b":3}'] AS jsonb[])`,
+    );
   });
 
   it("requires the full primary key for delete previews", async () => {

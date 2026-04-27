@@ -1785,6 +1785,16 @@ export class OracleDriver extends BaseDBDriver {
     if (!column.filterable) return null;
     if (value === undefined) return null;
     const val = typeof value === "string" ? value.trim() : value;
+    if (column.category === "array") {
+      if (operator !== "like" && operator !== "ilike") {
+        return null;
+      }
+      const arrayValue = typeof val === "string" ? val : val[0];
+      return {
+        sql: `UPPER(${col}) LIKE UPPER(:${paramIndex})`,
+        params: [`%${arrayValue}%`],
+      };
+    }
     if (
       this.isNumericCategory(column.category) &&
       typeof val === "string" &&
@@ -1817,6 +1827,57 @@ export class OracleDriver extends BaseDBDriver {
         params: [column.category === "float" ? Number(val) : val],
       };
     }
+    if (this.isDatetimeWithTime(column.nativeType)) {
+      const v = typeof val === "string" ? val : val[0];
+      const temporalExpr = oracleTemporalFilterExpr(column);
+      const normalizeComparable = (rawValue: string) => {
+        const normalized =
+          normalizeOracleTemporalValue(rawValue, {
+            preserveExplicitTimezoneText: !isTimezoneAwareOracleTemporal(
+              column.nativeType,
+            ),
+          }) ?? rawValue.trim();
+        return oracleTypeName(column.nativeType) === "DATE"
+          ? normalized.replace(/\.\d+$/, "")
+          : normalized;
+      };
+      if (operator === "between" && Array.isArray(val)) {
+        return {
+          sql: `${temporalExpr} BETWEEN :${paramIndex} AND :${paramIndex + 1}`,
+          params: [normalizeComparable(val[0]), normalizeComparable(val[1])],
+        };
+      }
+      if (operator === "in") {
+        const parts = v
+          .split(",")
+          .map((part) => normalizeComparable(part.trim()));
+        return {
+          sql: `${temporalExpr} IN (${parts.map((_, index) => `:${paramIndex + index}`).join(", ")})`,
+          params: parts,
+        };
+      }
+      const normalized =
+        normalizeOracleTemporalValue(v, {
+          preserveExplicitTimezoneText: !isTimezoneAwareOracleTemporal(
+            column.nativeType,
+          ),
+        }) ?? v.trim();
+      const comparable =
+        oracleTypeName(column.nativeType) === "DATE"
+          ? normalized.replace(/\.\d+$/, "")
+          : normalized;
+      if (["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)) {
+        const sqlOp = operator === "neq" ? "<>" : this.sqlOperator(operator);
+        return {
+          sql: `${temporalExpr} ${sqlOp} :${paramIndex}`,
+          params: [comparable],
+        };
+      }
+      return {
+        sql: `${temporalExpr} LIKE :${paramIndex}`,
+        params: [`%${comparable}%`],
+      };
+    }
     if (operator === "between" && Array.isArray(val)) {
       return {
         sql: `${col} BETWEEN :${paramIndex} AND :${paramIndex + 1}`,
@@ -1828,23 +1889,6 @@ export class OracleDriver extends BaseDBDriver {
       return {
         sql: `${col} IN (${parts.map((_, i) => `:${paramIndex + i}`).join(", ")})`,
         params: parts,
-      };
-    }
-    if (this.isDatetimeWithTime(column.nativeType)) {
-      const v = typeof val === "string" ? val : val[0];
-      const normalized =
-        normalizeOracleTemporalValue(v, {
-          preserveExplicitTimezoneText: !isTimezoneAwareOracleTemporal(
-            column.nativeType,
-          ),
-        }) ?? v.trim();
-      const comparable =
-        oracleTypeName(column.nativeType) === "DATE"
-          ? normalized.replace(/\.\d+$/, "")
-          : normalized;
-      return {
-        sql: `${oracleTemporalFilterExpr(column)} LIKE :${paramIndex}`,
-        params: [`%${comparable}%`],
       };
     }
     const v = typeof val === "string" ? val : val[0];

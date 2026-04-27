@@ -85,8 +85,8 @@ const edgeFilterabilityExpectations: Record<
     },
     {
       nativeType: "integer[]",
-      expectedFilterable: false,
-      expectedOperators: ["is_null", "is_not_null"],
+      expectedFilterable: true,
+      expectedOperators: ["like", "is_null", "is_not_null"],
     },
     {
       nativeType: "interval",
@@ -715,7 +715,7 @@ describe("filter SQL compatibility for complex null-only types", () => {
     expect(result).toBeNull();
   });
 
-  it("returns null for Postgres array like filters", () => {
+  it("builds PostgreSQL array like filters against the displayed JSON text", () => {
     const driver = new PostgresDriver({
       ...baseConfig,
       type: "pg",
@@ -723,15 +723,108 @@ describe("filter SQL compatibility for complex null-only types", () => {
     const result = driver.buildFilterCondition(
       {
         ...buildFilterColumn("integer[]", "array"),
-        filterable: false,
-        filterOperators: ["is_null", "is_not_null"],
+        filterable: true,
+        filterOperators: ["like", "is_null", "is_not_null"],
       },
       "like",
       "1",
       1,
     );
 
-    expect(result).toBeNull();
+    expect(result).toEqual({
+      sql: 'to_jsonb("probe_col")::text ILIKE $1',
+      params: ["%1%"],
+    });
+  });
+
+  it("builds MySQL array like filters against JSON text", () => {
+    const driver = new MySQLDriver({
+      ...baseConfig,
+      type: "mysql",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      {
+        ...buildFilterColumn("json", "array"),
+        filterable: true,
+        filterOperators: ["like", "is_null", "is_not_null"],
+      },
+      "like",
+      '"alpha"',
+      1,
+    );
+
+    expect(result).toEqual({
+      sql: "CAST(`probe_col` AS CHAR) LIKE ?",
+      params: ['%"alpha"%'],
+    });
+  });
+
+  it("builds SQLite array like filters against JSON text", () => {
+    const driver = new SQLiteDriver({
+      ...baseConfig,
+      type: "sqlite",
+      filePath: ":memory:",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      {
+        ...buildFilterColumn("JSON", "array"),
+        filterable: true,
+        filterOperators: ["like", "is_null", "is_not_null"],
+      },
+      "like",
+      '"alpha"',
+      1,
+    );
+
+    expect(result).toEqual({
+      sql: '"probe_col" LIKE ?',
+      params: ['%"alpha"%'],
+    });
+  });
+
+  it("builds MSSQL array like filters against JSON text", () => {
+    const driver = new MSSQLDriver({
+      ...baseConfig,
+      type: "mssql",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      {
+        ...buildFilterColumn("nvarchar(max)", "array"),
+        filterable: true,
+        filterOperators: ["like", "is_null", "is_not_null"],
+      },
+      "like",
+      '"alpha"',
+      1,
+    );
+
+    expect(result).toEqual({
+      sql: "CHARINDEX(CAST(? AS NVARCHAR(MAX)), CAST([probe_col] AS NVARCHAR(MAX))) > 0",
+      params: ['"alpha"'],
+    });
+  });
+
+  it("builds Oracle array like filters against JSON text", () => {
+    const driver = new OracleDriver({
+      ...baseConfig,
+      type: "oracle",
+      serviceName: "FREEPDB1",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      {
+        ...buildFilterColumn("JSON", "array"),
+        filterable: true,
+        filterOperators: ["like", "is_null", "is_not_null"],
+      },
+      "like",
+      '"alpha"',
+      1,
+    );
+
+    expect(result).toEqual({
+      sql: 'UPPER("probe_col") LIKE UPPER(:1)',
+      params: ['%"alpha"%'],
+    });
   });
 
   it("returns null for Postgres point like filters", () => {

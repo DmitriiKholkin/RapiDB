@@ -789,9 +789,7 @@ export abstract class BaseDBDriver implements IDBDriver {
     };
   }
   protected isFilterable(_nativeType: string, category: TypeCategory): boolean {
-    return !["lob", "binary", "spatial", "array", "interval"].includes(
-      category,
-    );
+    return !["lob", "binary", "spatial", "interval"].includes(category);
   }
   quoteIdentifier(name: string): string {
     return `"${name.replace(/"/g, '""')}"`;
@@ -1286,6 +1284,13 @@ export abstract class BaseDBDriver implements IDBDriver {
     if (!column.filterable) return null;
     if (value === undefined) return null;
     const val = typeof value === "string" ? value.trim() : value;
+    if (column.category === "array") {
+      if (operator !== "like" && operator !== "ilike") {
+        return null;
+      }
+      const arrayValue = typeof val === "string" ? val : val[0];
+      return this.buildArrayLikeFilter(col, arrayValue, paramIndex);
+    }
     if (
       this.hasBooleanSemantics(column) &&
       (operator === "eq" || operator === "neq")
@@ -1375,6 +1380,13 @@ export abstract class BaseDBDriver implements IDBDriver {
       };
     }
     return { sql: `${col} ${sqlOp} ?`, params: [val] };
+  }
+  protected buildArrayLikeFilter(
+    col: string,
+    val: string,
+    _paramIndex: number,
+  ): FilterConditionResult {
+    return { sql: `CAST(${col} AS CHAR) LIKE ?`, params: [`%${val}%`] };
   }
   protected sqlOperator(op: FilterOperator): string {
     switch (op) {

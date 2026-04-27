@@ -925,6 +925,99 @@ describe("TableView", () => {
     });
   });
 
+  it("keeps insert draft editing left-aligned but aligns committed values by column type", async () => {
+    const user = userEvent.setup();
+
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+
+    const tableEl = screen.getByRole("table");
+    const headerCells = Array.from(
+      tableEl.querySelectorAll("thead tr:first-child th"),
+    );
+    const idColumnIndex = headerCells.findIndex((cell) =>
+      (cell.textContent ?? "").includes("id"),
+    );
+    const nameColumnIndex = headerCells.findIndex((cell) =>
+      (cell.textContent ?? "").includes("name"),
+    );
+
+    if (idColumnIndex < 0 || nameColumnIndex < 0) {
+      throw new Error("Expected id and name column headers");
+    }
+
+    const draftRow = tableEl.querySelector("tbody tr");
+    const draftCells = Array.from(draftRow?.querySelectorAll("td") ?? []);
+    const idCell = draftCells[idColumnIndex] ?? null;
+    const nameCell = draftCells[nameColumnIndex] ?? null;
+
+    if (
+      !(idCell instanceof HTMLTableCellElement) ||
+      !(nameCell instanceof HTMLTableCellElement)
+    ) {
+      throw new Error("Expected insert draft cells");
+    }
+
+    fireEvent.doubleClick(idCell);
+    const idInput = screen.getByLabelText("Cell value") as HTMLInputElement;
+    expect(idInput.style.textAlign).not.toBe("right");
+    await user.type(idInput, "42");
+    fireEvent.blur(idInput);
+
+    await waitFor(() => {
+      expect(screen.queryByLabelText("Cell value")).toBeNull();
+    });
+
+    const idDisplayContainer = idCell.querySelector("div > div");
+    if (!(idDisplayContainer instanceof HTMLDivElement)) {
+      throw new Error("Expected numeric draft display container");
+    }
+
+    expect(idDisplayContainer.style.justifyContent).toBe("flex-end");
+    expect(idCell.textContent ?? "").toContain("42");
+
+    fireEvent.doubleClick(nameCell);
+    const nameInput = screen.getByLabelText("Cell value") as HTMLInputElement;
+    expect(nameInput.style.textAlign).not.toBe("right");
+    await user.type(nameInput, "Alicia");
+    fireEvent.blur(nameInput);
+
+    await waitFor(() => {
+      expect(screen.queryByLabelText("Cell value")).toBeNull();
+    });
+
+    const nameDisplayContainer = nameCell.querySelector("div > div");
+    if (!(nameDisplayContainer instanceof HTMLDivElement)) {
+      throw new Error("Expected text draft display container");
+    }
+
+    expect(nameDisplayContainer.style.justifyContent).toBe("flex-start");
+    expect(nameCell.textContent ?? "").toContain("Alicia");
+  });
+
   it("restores normal toolbar state after reverting inline insert mode", async () => {
     const user = userEvent.setup();
 

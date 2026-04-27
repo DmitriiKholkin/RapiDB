@@ -449,7 +449,6 @@ const VirtualRow = React.memo(function VirtualRow({
       {row.getVisibleCells().map((cell) => {
         const raw = cell.getValue();
         const isNull = raw === null || raw === undefined;
-        const isNumeric = typeof raw === "number" || typeof raw === "bigint";
         const isEditing =
           activeCell?.rowIndex === index &&
           activeCell.columnId === cell.column.id;
@@ -461,14 +460,14 @@ const VirtualRow = React.memo(function VirtualRow({
               height: ROW_H,
               padding: isEditing ? "0" : "0 8px",
               border: "1px solid var(--vscode-panel-border)",
-              textAlign: isNumeric ? "right" : "left",
+              textAlign: "left",
               whiteSpace: "nowrap",
               overflow: "hidden",
               textOverflow: "ellipsis",
               boxSizing: "border-box",
               verticalAlign: "middle",
               cursor: "pointer",
-              userSelect: "text",
+              userSelect: "none",
             }}
             title={isNull ? "" : String(raw)}
             onDoubleClick={() => onActivateCell(index, cell.column.id)}

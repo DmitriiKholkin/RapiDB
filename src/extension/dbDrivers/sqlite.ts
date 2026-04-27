@@ -15,6 +15,7 @@ import type {
   TypeCategory,
   ValueSemantics,
 } from "./types";
+
 type SqlStatementKind = "select" | "dml";
 interface SQLiteTableXInfoRow {
   name: string;
@@ -865,11 +866,35 @@ export class SQLiteDriver extends BaseDBDriver {
         }
         return [startLiteral, endLiteral];
       }
+      if (operator === "in" && typeof normalized === "string") {
+        const parts = normalized
+          .split(",")
+          .map((part) => part.trim())
+          .filter(Boolean);
+        if (parts.length === 0) {
+          throw invalidSqliteTemporalFilterError(column.name, "time");
+        }
+        const literals = parts.map((part) => {
+          const literal = normalizeSqliteTimeLiteral(part);
+          if (!literal) {
+            throw invalidSqliteTemporalFilterError(column.name, "time");
+          }
+          return literal;
+        });
+        return literals.join(", ");
+      }
       if (
-        (operator === "eq" || operator === "neq") &&
+        ["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator) &&
         typeof normalized === "string"
       ) {
-        return normalizeSqliteTimeLiteral(normalized) ?? normalized;
+        const literal = normalizeSqliteTimeLiteral(normalized);
+        if (literal) {
+          return literal;
+        }
+        if (operator !== "eq" && operator !== "neq") {
+          throw invalidSqliteTemporalFilterError(column.name, "time");
+        }
+        return normalized;
       }
     }
     if (column.category === "datetime") {
@@ -881,11 +906,35 @@ export class SQLiteDriver extends BaseDBDriver {
         }
         return [startLiteral, endLiteral];
       }
+      if (operator === "in" && typeof normalized === "string") {
+        const parts = normalized
+          .split(",")
+          .map((part) => part.trim())
+          .filter(Boolean);
+        if (parts.length === 0) {
+          throw invalidSqliteTemporalFilterError(column.name, "datetime");
+        }
+        const literals = parts.map((part) => {
+          const literal = normalizeSqliteDatetimeLiteral(part);
+          if (!literal) {
+            throw invalidSqliteTemporalFilterError(column.name, "datetime");
+          }
+          return literal;
+        });
+        return literals.join(", ");
+      }
       if (
-        (operator === "eq" || operator === "neq") &&
+        ["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator) &&
         typeof normalized === "string"
       ) {
-        return normalizeSqliteDatetimeLiteral(normalized) ?? normalized;
+        const literal = normalizeSqliteDatetimeLiteral(normalized);
+        if (literal) {
+          return literal;
+        }
+        if (operator !== "eq" && operator !== "neq") {
+          throw invalidSqliteTemporalFilterError(column.name, "datetime");
+        }
+        return normalized;
       }
     }
     return normalized;
@@ -903,6 +952,13 @@ export class SQLiteDriver extends BaseDBDriver {
     if (!column.filterable) return null;
     if (value === undefined) return null;
     const val = typeof value === "string" ? value.trim() : value;
+    if (column.category === "array") {
+      if (operator !== "like" && operator !== "ilike") {
+        return null;
+      }
+      const arrayValue = typeof val === "string" ? val : val[0];
+      return { sql: `${col} LIKE ?`, params: [`%${arrayValue}%`] };
+    }
     const fallbackTemporalLike = (rawValue: string, negate = false) => ({
       sql: `${col} ${negate ? "NOT LIKE" : "LIKE"} ?`,
       params: [`%${rawValue}%`],
@@ -959,6 +1015,16 @@ export class SQLiteDriver extends BaseDBDriver {
           params: [val[0], val[1]],
         };
       }
+      if (typeof val === "string" && operator === "in") {
+        const parts = val
+          .split(",")
+          .map((part) => part.trim())
+          .filter(Boolean);
+        return {
+          sql: `DATE(${col}) IN (${parts.map(() => "DATE(?)").join(", ")})`,
+          params: parts,
+        };
+      }
       if (
         typeof val === "string" &&
         ["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)
@@ -979,16 +1045,28 @@ export class SQLiteDriver extends BaseDBDriver {
           params: [startLiteral, endLiteral],
         };
       }
+      if (operator === "in" && typeof val === "string") {
+        const parts = val
+          .split(",")
+          .map((part) => part.trim())
+          .filter(Boolean);
+        return {
+          sql: `TIME(${col}) IN (${parts.map(() => "TIME(?)").join(", ")})`,
+          params: parts,
+        };
+      }
       if (
-        (operator === "eq" || operator === "neq") &&
+        ["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator) &&
         typeof val === "string"
       ) {
         const literal = normalizeSqliteTimeLiteral(val);
         if (literal) {
-          const sqlOp = operator === "neq" ? "!=" : "=";
+          const sqlOp = operator === "neq" ? "!=" : this.sqlOperator(operator);
           return { sql: `TIME(${col}) ${sqlOp} TIME(?)`, params: [literal] };
         }
-        return fallbackTemporalLike(val, operator === "neq");
+        if (operator === "eq" || operator === "neq") {
+          return fallbackTemporalLike(val, operator === "neq");
+        }
       }
     }
     if (column.category === "datetime") {
@@ -1003,19 +1081,31 @@ export class SQLiteDriver extends BaseDBDriver {
           params: [startLiteral, endLiteral],
         };
       }
+      if (operator === "in" && typeof val === "string") {
+        const parts = val
+          .split(",")
+          .map((part) => part.trim())
+          .filter(Boolean);
+        return {
+          sql: `DATETIME(${col}) IN (${parts.map(() => "DATETIME(?)").join(", ")})`,
+          params: parts,
+        };
+      }
       if (
-        (operator === "eq" || operator === "neq") &&
+        ["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator) &&
         typeof val === "string"
       ) {
         const literal = normalizeSqliteDatetimeLiteral(val);
         if (literal) {
-          const sqlOp = operator === "neq" ? "!=" : "=";
+          const sqlOp = operator === "neq" ? "!=" : this.sqlOperator(operator);
           return {
             sql: `DATETIME(${col}) ${sqlOp} DATETIME(?)`,
             params: [literal],
           };
         }
-        return fallbackTemporalLike(val, operator === "neq");
+        if (operator === "eq" || operator === "neq") {
+          return fallbackTemporalLike(val, operator === "neq");
+        }
       }
     }
     if (operator === "between" && Array.isArray(val)) {

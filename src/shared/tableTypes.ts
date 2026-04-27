@@ -251,7 +251,12 @@ export function defaultFilterOperator(
     return "eq";
   }
 
-  if (isNumericCategory(column.category) || column.category === "date") {
+  if (
+    isNumericCategory(column.category) ||
+    column.category === "date" ||
+    column.category === "time" ||
+    column.category === "datetime"
+  ) {
     return "eq";
   }
   return "like";

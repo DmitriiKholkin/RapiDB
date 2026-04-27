@@ -2185,6 +2185,9 @@ const DraftTableRow = React.memo(function DraftTableRow({
                   height: "100%",
                   display: "flex",
                   alignItems: "center",
+                  justifyContent: isNumericCategory(colDef.category)
+                    ? "flex-end"
+                    : "flex-start",
                 }}
               >
                 {isEditing ? (

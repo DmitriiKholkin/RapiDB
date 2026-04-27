@@ -13,7 +13,7 @@ describe("parseTablePanelMessage export payload", () => {
       type: "exportCSV",
       payload: {
         sort: { column: "id", direction: "asc" },
-        filters: [{ column: "name", op: "contains", value: "alpha" }],
+        filters: [{ column: "name", op: "like", value: "alpha" }],
         limitToPage: { page: "2", pageSize: "50" },
       },
     });
@@ -22,7 +22,7 @@ describe("parseTablePanelMessage export payload", () => {
       type: "exportCSV",
       payload: {
         sort: { column: "id", direction: "asc" },
-        filters: [{ column: "name", op: "contains", value: "alpha" }],
+        filters: [{ column: "name", op: "like", value: "alpha" }],
         limitToPage: { page: 2, pageSize: 50 },
       },
     });

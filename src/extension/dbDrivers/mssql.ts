@@ -28,6 +28,7 @@ import {
   ISO_DATETIME_RE,
   NULL_SENTINEL,
 } from "./types";
+
 type MssqlSqlType = Parameters<mssql.Request["input"]>[1];
 interface NamedRow {
   name: string;
@@ -1275,6 +1276,22 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     if (!column.filterable || value === undefined) return null;
     const val = typeof value === "string" ? value.trim() : value;
+    if (column.category === "array") {
+      if (operator !== "like" && operator !== "ilike") {
+        return null;
+      }
+      const arrayValue = typeof val === "string" ? val : val[0];
+      if (arrayValue.length > MSSQL_LIKE_MAX_NVARCHAR_CHARS) {
+        return {
+          sql: `CAST(${col} AS NVARCHAR(MAX)) = CAST(? AS NVARCHAR(MAX))`,
+          params: [arrayValue],
+        };
+      }
+      return {
+        sql: `CHARINDEX(CAST(? AS NVARCHAR(MAX)), CAST(${col} AS NVARCHAR(MAX))) > 0`,
+        params: [arrayValue],
+      };
+    }
     if (
       (this.hasBooleanSemantics(column) || this.hasBitSemantics(column)) &&
       (operator === "eq" || operator === "neq")
@@ -1368,13 +1385,23 @@ export class MSSQLDriver extends BaseDBDriver {
     if (column.category === "time") {
       const v = typeof val === "string" ? val : val[0];
       if (Array.isArray(val)) {
-        return { sql: `${col} BETWEEN ? AND ?`, params: [val[0], val[1]] };
+        return {
+          sql: `CAST(${col} AS time) BETWEEN CAST(? AS time) AND CAST(? AS time)`,
+          params: [val[0], val[1]],
+        };
       }
       if (operator === "in") {
         const parts = v.split(",").map((part) => part.trim());
         return {
-          sql: `${col} IN (${parts.map(() => "?").join(", ")})`,
+          sql: `CAST(${col} AS time) IN (${parts.map(() => "CAST(? AS time)").join(", ")})`,
           params: parts,
+        };
+      }
+      if (["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)) {
+        const sqlOp = operator === "neq" ? "<>" : this.sqlOperator(operator);
+        return {
+          sql: `CAST(${col} AS time) ${sqlOp} CAST(? AS time)`,
+          params: [v],
         };
       }
       return {
@@ -1382,18 +1409,26 @@ export class MSSQLDriver extends BaseDBDriver {
         params: [`%${v}%`],
       };
     }
-    if (operator === "between" && Array.isArray(val)) {
-      return { sql: `${col} BETWEEN ? AND ?`, params: [val[0], val[1]] };
-    }
-    if (operator === "in" && typeof val === "string") {
-      const parts = val.split(",").map((part) => part.trim());
-      return {
-        sql: `${col} IN (${parts.map(() => "?").join(", ")})`,
-        params: parts,
-      };
-    }
     if (this.isDatetimeWithTime(column.nativeType)) {
       const v = typeof val === "string" ? val : val[0];
+      if (Array.isArray(val)) {
+        return {
+          sql: `${col} BETWEEN ? AND ?`,
+          params: [
+            normalizeDatetimeLiteral(val[0]),
+            normalizeDatetimeLiteral(val[1]),
+          ],
+        };
+      }
+      if (operator === "in") {
+        const parts = v
+          .split(",")
+          .map((part) => normalizeDatetimeLiteral(part.trim()));
+        return {
+          sql: `${col} IN (${parts.map(() => "?").join(", ")})`,
+          params: parts,
+        };
+      }
       if (["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)) {
         const sqlOp = operator === "neq" ? "<>" : this.sqlOperator(operator);
         return {
@@ -1411,6 +1446,16 @@ export class MSSQLDriver extends BaseDBDriver {
       return {
         sql: `CONVERT(VARCHAR(33), ${col}, 126) LIKE ?`,
         params: [`%${temporalSearchLiteral(v)}%`],
+      };
+    }
+    if (operator === "between" && Array.isArray(val)) {
+      return { sql: `${col} BETWEEN ? AND ?`, params: [val[0], val[1]] };
+    }
+    if (operator === "in" && typeof val === "string") {
+      const parts = val.split(",").map((part) => part.trim());
+      return {
+        sql: `${col} IN (${parts.map(() => "?").join(", ")})`,
+        params: parts,
       };
     }
     const v = typeof val === "string" ? val : val[0];

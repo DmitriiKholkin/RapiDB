@@ -12,6 +12,7 @@ import type {
   VerificationTarget,
 } from "./tableDataContracts";
 import { buildUpdateRowSql } from "./updateSql";
+
 interface VerificationFailure {
   rowIndex: number;
   columns: string[];
@@ -62,6 +63,13 @@ export function prepareApplyChangesPlan(
   const columnMetaByName = new Map(
     columns.map((column) => [column.name, column]),
   );
+  const previewDriver = driver as typeof driver & {
+    materializePreviewColumnSql?: (
+      sql: string,
+      params: readonly unknown[] | undefined,
+      columns: readonly (ColumnTypeMeta | undefined)[],
+    ) => string;
+  };
   const operations: PreparedApplyPlan["operations"] = [];
   const previewStatements: string[] = [];
   const verificationTargets: VerificationTarget[] = [];
@@ -103,8 +111,19 @@ export function prepareApplyChangesPlan(
       params: operation.params,
       checkAffectedRows: true,
     });
+    const previewColumns = buildUpdatePreviewColumns(
+      changes,
+      primaryKeys,
+      columnMetaByName,
+    );
     previewStatements.push(
-      driver.materializePreviewSql(operation.sql, operation.params),
+      typeof previewDriver.materializePreviewColumnSql === "function"
+        ? previewDriver.materializePreviewColumnSql(
+            operation.sql,
+            operation.params,
+            previewColumns,
+          )
+        : driver.materializePreviewSql(operation.sql, operation.params),
     );
     verificationTargets.push({
       rowIndex,
@@ -138,6 +157,23 @@ export function prepareApplyChangesPlan(
       verificationTargets,
     },
   };
+}
+
+function buildUpdatePreviewColumns(
+  changes: Record<string, unknown>,
+  primaryKeys: Record<string, unknown>,
+  columnMetaByName: ReadonlyMap<string, ColumnTypeMeta>,
+): Array<ColumnTypeMeta | undefined> {
+  const setColumns = Object.entries(changes)
+    .filter(
+      ([columnName, value]) =>
+        value !== undefined && columnMetaByName.has(columnName),
+    )
+    .map(([columnName]) => columnMetaByName.get(columnName));
+  const whereColumns = Object.keys(primaryKeys).map((columnName) =>
+    columnMetaByName.get(columnName),
+  );
+  return [...setColumns, ...whereColumns];
 }
 export async function executePreparedApplyPlan(
   connectionManager: ConnectionManager,
