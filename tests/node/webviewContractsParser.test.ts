@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  parseConnectionFormPanelMessage,
+  parseQueryPanelMessage,
+  parseSchemaPanelMessage,
   parseTablePanelMessage,
   parseWebviewInitialState,
 } from "../../src/shared/webviewContracts";
@@ -111,6 +114,122 @@ describe("parseTablePanelMessage applyChanges payload", () => {
   });
 });
 
+describe("parseQueryPanelMessage", () => {
+  it("parses executeQuery payloads", () => {
+    const parsed = parseQueryPanelMessage({
+      type: "executeQuery",
+      payload: {
+        sql: "select 1",
+        connectionId: "conn-1",
+      },
+    });
+
+    expect(parsed).toEqual({
+      type: "executeQuery",
+      payload: {
+        sql: "select 1",
+        connectionId: "conn-1",
+      },
+    });
+  });
+
+  it("rejects malformed executeQuery payloads", () => {
+    const parsed = parseQueryPanelMessage({
+      type: "executeQuery",
+      payload: {
+        sql: 123,
+      },
+    });
+
+    expect(parsed).toBeNull();
+  });
+});
+
+describe("parseSchemaPanelMessage", () => {
+  it("parses openRelatedSchema payloads", () => {
+    const parsed = parseSchemaPanelMessage({
+      type: "openRelatedSchema",
+      payload: {
+        table: "orders",
+        schema: "public",
+        database: "app_db",
+      },
+    });
+
+    expect(parsed).toEqual({
+      type: "openRelatedSchema",
+      payload: {
+        table: "orders",
+        schema: "public",
+        database: "app_db",
+      },
+    });
+  });
+
+  it("rejects malformed openRelatedSchema payloads", () => {
+    const parsed = parseSchemaPanelMessage({
+      type: "openRelatedSchema",
+      payload: {
+        schema: "public",
+      },
+    });
+
+    expect(parsed).toBeNull();
+  });
+});
+
+describe("parseConnectionFormPanelMessage", () => {
+  it("parses saveConnection payloads", () => {
+    const parsed = parseConnectionFormPanelMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        host: "localhost",
+        password: "secret",
+      },
+    });
+
+    expect(parsed).toEqual({
+      type: "saveConnection",
+      payload: {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        host: "localhost",
+        port: undefined,
+        database: undefined,
+        username: undefined,
+        filePath: undefined,
+        ssl: undefined,
+        rejectUnauthorized: undefined,
+        folder: undefined,
+        serviceName: undefined,
+        thickMode: undefined,
+        clientPath: undefined,
+        useSecretStorage: undefined,
+        password: "secret",
+        hasStoredSecret: undefined,
+      },
+    });
+  });
+
+  it("rejects malformed saveConnection payloads", () => {
+    const parsed = parseConnectionFormPanelMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-1",
+        name: "Primary",
+        type: "postgres",
+        password: 123,
+      },
+    });
+
+    expect(parsed).toBeNull();
+  });
+});
+
 describe("parseWebviewInitialState", () => {
   it("parses a valid query state", () => {
     const parsed = parseWebviewInitialState({
@@ -167,6 +286,59 @@ describe("parseWebviewInitialState", () => {
       table: "users",
       isView: undefined,
       defaultPageSize: 100,
+    });
+  });
+
+  it("parses a valid schema state", () => {
+    const parsed = parseWebviewInitialState({
+      view: "schema",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+      table: "users",
+    });
+
+    expect(parsed).toEqual({
+      view: "schema",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+      table: "users",
+    });
+  });
+
+  it("parses a valid connection state", () => {
+    const parsed = parseWebviewInitialState({
+      view: "connection",
+      existing: {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        host: "localhost",
+        hasStoredSecret: true,
+      },
+    });
+
+    expect(parsed).toEqual({
+      view: "connection",
+      existing: {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        host: "localhost",
+        port: undefined,
+        database: undefined,
+        username: undefined,
+        filePath: undefined,
+        ssl: undefined,
+        rejectUnauthorized: undefined,
+        folder: undefined,
+        serviceName: undefined,
+        thickMode: undefined,
+        clientPath: undefined,
+        useSecretStorage: undefined,
+        hasStoredSecret: true,
+      },
     });
   });
 
