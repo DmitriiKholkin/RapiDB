@@ -734,6 +734,7 @@ export class MySQLDriver extends BaseDBDriver {
       connectTimeout: 10000,
       idleTimeout: 30000,
       dateStrings: true,
+      decimalNumbers: false,
       bigNumberStrings: true,
       supportBigNumbers: true,
       ssl: sslEnabled

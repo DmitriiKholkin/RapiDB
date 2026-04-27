@@ -157,6 +157,44 @@ export function registerTableServiceIntegrationTests(
       expect(fallbackPage.rows).toHaveLength(5);
     });
 
+    it.runIf(engineId !== "sqlite")(
+      "preserves exact numeric strings in table pages",
+      async () => {
+        const columns = await readService.getColumns(
+          connectionId,
+          harness.databaseName,
+          harness.schemaName,
+          fixtureTableName(engineId, "exactNumericSamples"),
+        );
+        const idColumn = findColumnName(columns, "id");
+
+        const page = await readService.getPage(
+          connectionId,
+          harness.databaseName,
+          harness.schemaName,
+          fixtureTableName(engineId, "exactNumericSamples"),
+          1,
+          10,
+          [],
+          { column: idColumn, direction: "asc" },
+        );
+
+        expect(page.rows).toHaveLength(3);
+        expect(String(caseInsensitiveValue(page.rows[0], "exact_amount"))).toBe(
+          "123456789012.123456",
+        );
+        expect(String(caseInsensitiveValue(page.rows[0], "ratio"))).toBe(
+          "1.2500",
+        );
+        expect(String(caseInsensitiveValue(page.rows[1], "exact_amount"))).toBe(
+          "-45.600100",
+        );
+        expect(String(caseInsensitiveValue(page.rows[2], "ratio"))).toBe(
+          "0.3333",
+        );
+      },
+    );
+
     it("exports rows in deterministic chunks", async () => {
       const chunkSizes: number[] = [];
       let totalRows = 0;

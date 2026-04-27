@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
+import { buildInsertRowOperation } from "../../src/extension/table/insertSql";
 
 const driver = new PostgresDriver({
   id: "preview-test",
@@ -98,5 +99,21 @@ describe("postgres preview SQL materialization", () => {
       `"col_text_array" = CAST(ARRAY['one', 'two', 'three'] AS text[])`,
     );
     expect(preview).toContain('WHERE "id" = 1');
+  });
+
+  it("preserves full exact numeric literals in insert previews", () => {
+    const operation = buildInsertRowOperation(
+      driver,
+      "main",
+      "public",
+      "probe",
+      { amount: "9999999999.1234567890" },
+      [column("amount", "numeric(28,10)", "decimal")],
+    );
+
+    expect(operation.params).toEqual(["9999999999.1234567890"]);
+    expect(driver.materializePreviewSql(operation.sql, operation.params)).toBe(
+      'INSERT INTO "public"."probe" ("amount") VALUES (\'9999999999.1234567890\')',
+    );
   });
 });

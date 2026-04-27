@@ -26,9 +26,13 @@ import type {
 import { DATETIME_SQL_RE, ISO_DATETIME_RE, NULL_SENTINEL } from "./types";
 
 const PG_OID_DATE = 1082;
+const PG_OID_MONEY = 790;
+const PG_OID_NUMERIC = 1700;
 const PG_OID_TIMESTAMP = 1114;
 const PG_OID_TIMESTAMPTZ = 1184;
 pgTypes.setTypeParser(PG_OID_DATE, (val: string) => val);
+pgTypes.setTypeParser(PG_OID_MONEY, (val: string) => val);
+pgTypes.setTypeParser(PG_OID_NUMERIC, (val: string) => val);
 pgTypes.setTypeParser(PG_OID_TIMESTAMP, (val: string) => val);
 pgTypes.setTypeParser(PG_OID_TIMESTAMPTZ, (val: string) => val);
 const PG_GEOMETRIC_TYPES = new Set([

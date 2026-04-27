@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { OracleDriver } from "../../src/extension/dbDrivers/oracle";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
+import { buildInsertRowOperation } from "../../src/extension/table/insertSql";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
 const baseConfig = {
@@ -94,5 +95,56 @@ describe("Oracle preview SQL literals", () => {
     expect(preview).toContain("TO_TIMESTAMP('");
     expect(preview).toContain("TO_TIMESTAMP_TZ('");
     expect(preview).toContain("+00:00");
+  });
+
+  it("preserves full exact numeric literals in insert previews", () => {
+    const driver = new OracleDriver(baseConfig as ConnectionConfig);
+    const operation = buildInsertRowOperation(
+      driver,
+      "db",
+      "APP",
+      "T",
+      { amount: "9999999999.1234567890" },
+      [
+        {
+          name: "amount",
+          type: "NUMBER(28,10)",
+          nativeType: "NUMBER(28,10)",
+          category: "decimal",
+          nullable: true,
+          defaultValue: undefined,
+          isPrimaryKey: false,
+          primaryKeyOrdinal: undefined,
+          isForeignKey: false,
+          isAutoIncrement: false,
+          filterable: true,
+          filterOperators: ["is_null", "is_not_null"],
+          valueSemantics: "plain",
+        },
+      ],
+    );
+
+    expect(operation.params).toEqual(["9999999999.1234567890"]);
+    expect(
+      driver.materializePreviewInsertSql(operation.sql, operation.params, [
+        {
+          name: "amount",
+          type: "NUMBER(28,10)",
+          nativeType: "NUMBER(28,10)",
+          category: "decimal",
+          nullable: true,
+          defaultValue: undefined,
+          isPrimaryKey: false,
+          primaryKeyOrdinal: undefined,
+          isForeignKey: false,
+          isAutoIncrement: false,
+          filterable: true,
+          filterOperators: ["is_null", "is_not_null"],
+          valueSemantics: "plain",
+        },
+      ]),
+    ).toBe(
+      'INSERT INTO "APP"."T" ("amount") VALUES (\'9999999999.1234567890\')',
+    );
   });
 });

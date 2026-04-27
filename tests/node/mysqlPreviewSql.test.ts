@@ -39,6 +39,25 @@ function column(
 }
 
 describe("mysql preview SQL literals", () => {
+  it("preserves full exact numeric literals in insert previews", () => {
+    const amountColumn = column("amount", "decimal(28,10)", "decimal");
+    const operation = buildInsertRowOperation(
+      driver,
+      "rtest",
+      "",
+      "all_types",
+      {
+        amount: "9999999999.1234567890",
+      },
+      [amountColumn],
+    );
+
+    expect(operation.params).toEqual(["9999999999.1234567890"]);
+    expect(driver.materializePreviewSql(operation.sql, operation.params)).toBe(
+      "INSERT INTO `rtest`.`all_types` (`amount`) VALUES ('9999999999.1234567890')",
+    );
+  });
+
   it("casts BIT(64) insert placeholders to unsigned numeric values", () => {
     const bitColumn = column("col_bit64", "bit(64)", "integer", "bit");
     const operation = buildInsertRowOperation(

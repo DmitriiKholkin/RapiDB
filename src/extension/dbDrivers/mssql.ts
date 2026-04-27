@@ -29,6 +29,33 @@ import {
   NULL_SENTINEL,
 } from "./types";
 
+const MSSQL_TEDIOUS_EXACT_NUMERIC_PATCH_KEY = Symbol.for(
+  "rapidb.mssqlTediousExactNumericPatch",
+);
+
+type TediousReadValueResult = {
+  value: unknown;
+  offset: number;
+};
+
+type TediousValueParserModule = {
+  readValue: (
+    buf: Buffer,
+    offset: number,
+    metadata: {
+      type?: { name?: string };
+      precision?: number;
+      scale?: number;
+    },
+    options: unknown,
+  ) => TediousReadValueResult;
+};
+
+type TediousHelpersModule = {
+  Result: new <T>(value: T, offset: number) => TediousReadValueResult;
+  NotEnoughDataError: new (byteCount: number) => Error;
+};
+
 type MssqlSqlType = Parameters<mssql.Request["input"]>[1];
 interface NamedRow {
   name: string;
@@ -124,6 +151,164 @@ interface MssqlArrayColumnMeta {
 interface MssqlArrayResult extends mssql.IResult<unknown[]> {
   columns?: MssqlArrayColumnMeta[][];
 }
+
+function ensureTediousBufferLength(
+  buf: Buffer,
+  offset: number,
+  byteLength: number,
+  helpers: TediousHelpersModule,
+): void {
+  if (buf.length < offset + byteLength) {
+    throw new helpers.NotEnoughDataError(offset + byteLength);
+  }
+}
+
+function readTediousUInt8(
+  buf: Buffer,
+  offset: number,
+  helpers: TediousHelpersModule,
+): TediousReadValueResult {
+  ensureTediousBufferLength(buf, offset, 1, helpers);
+  return new helpers.Result(buf.readUInt8(offset), offset + 1);
+}
+
+function readTediousUnsignedBigIntLE(
+  buf: Buffer,
+  offset: number,
+  byteLength: number,
+  helpers: TediousHelpersModule,
+): TediousReadValueResult {
+  ensureTediousBufferLength(buf, offset, byteLength, helpers);
+  let value = 0n;
+  for (let index = 0; index < byteLength; index += 1) {
+    value |= BigInt(buf[offset + index]) << BigInt(index * 8);
+  }
+  return new helpers.Result(value, offset + byteLength);
+}
+
+function formatScaledBigInt(value: bigint, scale: number): string {
+  const negative = value < 0n;
+  const absoluteValue = negative ? -value : value;
+  const digits = absoluteValue.toString();
+  if (scale <= 0) {
+    return `${negative ? "-" : ""}${digits}`;
+  }
+  const paddedDigits = digits.padStart(scale + 1, "0");
+  const integerPart = paddedDigits.slice(0, -scale);
+  const fractionPart = paddedDigits.slice(-scale);
+  return `${negative ? "-" : ""}${integerPart}.${fractionPart}`;
+}
+
+function readTediousExactNumericValue(
+  buf: Buffer,
+  offset: number,
+  metadata: { precision?: number; scale?: number },
+  helpers: TediousHelpersModule,
+): TediousReadValueResult {
+  const dataLengthResult = readTediousUInt8(buf, offset, helpers);
+  const dataLength = dataLengthResult.value as number;
+  offset = dataLengthResult.offset;
+  if (dataLength === 0) {
+    return new helpers.Result(null, offset);
+  }
+  const signResult = readTediousUInt8(buf, offset, helpers);
+  const sign = (signResult.value as number) === 1 ? 1n : -1n;
+  offset = signResult.offset;
+  const magnitudeResult = readTediousUnsignedBigIntLE(
+    buf,
+    offset,
+    dataLength - 1,
+    helpers,
+  );
+  const magnitude = magnitudeResult.value as bigint;
+  return new helpers.Result(
+    formatScaledBigInt(magnitude * sign, metadata.scale ?? 0),
+    magnitudeResult.offset,
+  );
+}
+
+function readTediousSmallMoneyValue(
+  buf: Buffer,
+  offset: number,
+  helpers: TediousHelpersModule,
+): TediousReadValueResult {
+  ensureTediousBufferLength(buf, offset, 4, helpers);
+  return new helpers.Result(
+    formatScaledBigInt(BigInt(buf.readInt32LE(offset)), 4),
+    offset + 4,
+  );
+}
+
+function readTediousMoneyValue(
+  buf: Buffer,
+  offset: number,
+  helpers: TediousHelpersModule,
+): TediousReadValueResult {
+  ensureTediousBufferLength(buf, offset, 8, helpers);
+  const value =
+    (BigInt(buf.readInt32LE(offset)) << 32n) +
+    BigInt(buf.readUInt32LE(offset + 4));
+  return new helpers.Result(formatScaledBigInt(value, 4), offset + 8);
+}
+
+function readTediousMoneyNValue(
+  buf: Buffer,
+  offset: number,
+  helpers: TediousHelpersModule,
+): TediousReadValueResult {
+  const dataLengthResult = readTediousUInt8(buf, offset, helpers);
+  const dataLength = dataLengthResult.value as number;
+  offset = dataLengthResult.offset;
+  if (dataLength === 0) {
+    return new helpers.Result(null, offset);
+  }
+  if (dataLength === 4) {
+    return readTediousSmallMoneyValue(buf, offset, helpers);
+  }
+  if (dataLength === 8) {
+    return readTediousMoneyValue(buf, offset, helpers);
+  }
+  throw new Error(`Unsupported MoneyN dataLength ${String(dataLength)}`);
+}
+
+function patchMssqlTediousExactNumericParsing(): void {
+  const globalScope = globalThis as Record<PropertyKey, unknown>;
+  if (globalScope[MSSQL_TEDIOUS_EXACT_NUMERIC_PATCH_KEY]) {
+    return;
+  }
+
+  const tediousValueParser =
+    require("tedious/lib/value-parser") as TediousValueParserModule;
+  const tediousHelpers =
+    require("tedious/lib/token/helpers") as TediousHelpersModule;
+  const originalReadValue = tediousValueParser.readValue;
+
+  tediousValueParser.readValue = (buf, offset, metadata, options) => {
+    switch (metadata.type?.name) {
+      case "NumericN":
+      case "DecimalN":
+        return readTediousExactNumericValue(
+          buf,
+          offset,
+          metadata,
+          tediousHelpers,
+        );
+      case "SmallMoney":
+        return readTediousSmallMoneyValue(buf, offset, tediousHelpers);
+      case "Money":
+        return readTediousMoneyValue(buf, offset, tediousHelpers);
+      case "MoneyN":
+        return readTediousMoneyNValue(buf, offset, tediousHelpers);
+      default:
+        return originalReadValue(buf, offset, metadata, options);
+    }
+  };
+
+  globalScope[MSSQL_TEDIOUS_EXACT_NUMERIC_PATCH_KEY] = true;
+}
+
+patchMssqlTediousExactNumericParsing();
+
 const MSSQL_TIME_RE = /^\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?$/;
 const MSSQL_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -150,6 +335,11 @@ function mssqlNumericFilterParam(
     return BigInt(rawValue);
   }
   return Number(rawValue);
+}
+function mssqlNumericParamExpr(column: ColumnTypeMeta): string {
+  return column.category === "decimal"
+    ? `CAST(? AS ${column.nativeType})`
+    : "?";
 }
 function mssqlDisplayedTemporalDiffUpperBound(rawValue: string): number | null {
   const fractionMatch = /\.(\d+)(?: ?(?:Z|[+-]\d{2}(?::?\d{2})?))?$/i.exec(
@@ -1373,7 +1563,7 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     if (this.isNumericCategory(column.category) && Array.isArray(val)) {
       return {
-        sql: `${col} BETWEEN ? AND ?`,
+        sql: `${col} BETWEEN ${mssqlNumericParamExpr(column)} AND ${mssqlNumericParamExpr(column)}`,
         params: [
           mssqlNumericFilterParam(column, val[0]),
           mssqlNumericFilterParam(column, val[1]),
@@ -1386,7 +1576,7 @@ export class MSSQLDriver extends BaseDBDriver {
           .split(",")
           .map((part) => mssqlNumericFilterParam(column, part.trim()));
         return {
-          sql: `${col} IN (${parts.map(() => "?").join(", ")})`,
+          sql: `${col} IN (${parts.map(() => mssqlNumericParamExpr(column)).join(", ")})`,
           params: parts,
         };
       }
@@ -1418,7 +1608,7 @@ export class MSSQLDriver extends BaseDBDriver {
         }
         const sqlOp = this.sqlOperator(operator);
         return {
-          sql: `${col} ${sqlOp} ?`,
+          sql: `${col} ${sqlOp} ${mssqlNumericParamExpr(column)}`,
           params: [mssqlNumericFilterParam(column, val)],
         };
       }

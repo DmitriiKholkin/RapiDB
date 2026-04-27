@@ -129,7 +129,46 @@ describe("numeric filter normalization", () => {
     );
 
     expect(condition).toEqual({
-      sql: "[col_money] = ?",
+      sql: "[col_money] = CAST(? AS money)",
+      params: ["9999999999.123455"],
+    });
+  });
+
+  it("preserves precision for numeric(28,10) values in MSSQL filter SQL", () => {
+    const numericColumn: ColumnTypeMeta = {
+      name: "col_numeric",
+      type: "numeric(28,10)",
+      nativeType: "numeric(28,10)",
+      category: "decimal",
+      nullable: true,
+      isPrimaryKey: false,
+      isForeignKey: false,
+      isAutoIncrement: false,
+      filterable: true,
+      filterOperators: [
+        "eq",
+        "neq",
+        "gt",
+        "gte",
+        "lt",
+        "lte",
+        "between",
+        "in",
+        "is_null",
+        "is_not_null",
+      ],
+      valueSemantics: "plain",
+    };
+
+    const condition = mssqlDriver.buildFilterCondition(
+      numericColumn,
+      "eq",
+      "9999999999.123455",
+      1,
+    );
+
+    expect(condition).toEqual({
+      sql: "[col_numeric] = CAST(? AS numeric(28,10))",
       params: ["9999999999.123455"],
     });
   });

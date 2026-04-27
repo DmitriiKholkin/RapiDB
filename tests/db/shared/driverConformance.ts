@@ -415,12 +415,32 @@ export function registerLiveDriverConformanceTests(engineId: DbEngineId): void {
         fixtureTableName(engineId, "exactNumericSamples"),
       );
       const exactAmountColumn = findColumn(numericColumns, "exact_amount");
+      const ratioColumn = findColumn(numericColumns, "ratio");
       const persistedCheck = harness.driver.checkPersistedEdit(
         exactAmountColumn,
         "123.450000",
         { persistedValue: "123.450000" },
       );
       expect(persistedCheck?.ok ?? true).toBe(true);
+
+      if (engineId !== "sqlite") {
+        const exactNumericResult = await harness.driver.query(
+          `SELECT ${harness.driver.quoteIdentifier(exactAmountColumn.name)}, ${harness.driver.quoteIdentifier(ratioColumn.name)} FROM ${harness.driver.qualifiedTableName(harness.databaseName, harness.schemaName, fixtureTableName(engineId, "exactNumericSamples"))} ORDER BY ${harness.driver.quoteIdentifier(findColumn(numericColumns, "id").name)}`,
+        );
+        const exactNumericRows = rowsFromQuery(exactNumericResult);
+        expect(
+          String(getCaseInsensitive(exactNumericRows[0] ?? {}, "exact_amount")),
+        ).toBe("123456789012.123456");
+        expect(
+          String(getCaseInsensitive(exactNumericRows[0] ?? {}, "ratio")),
+        ).toBe("1.2500");
+        expect(
+          String(getCaseInsensitive(exactNumericRows[1] ?? {}, "exact_amount")),
+        ).toBe("-45.600100");
+        expect(
+          String(getCaseInsensitive(exactNumericRows[2] ?? {}, "ratio")),
+        ).toBe("0.3333");
+      }
 
       const moneyProbeTable = `rapidb_money_probe_${engineId}_${Date.now()}`;
       const qualifiedMoneyProbeTable = harness.driver.qualifiedTableName(

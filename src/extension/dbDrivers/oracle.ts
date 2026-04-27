@@ -105,6 +105,14 @@ function normalizeOracleNumberValue(
       return trimmed;
     }
   }
+  if (typeof metaData.scale === "number" && metaData.scale > 0) {
+    if (!/[eE]/.test(trimmed)) {
+      const sign = /^[+-]/.test(trimmed) ? trimmed[0] : "";
+      const unsigned = sign ? trimmed.slice(1) : trimmed;
+      const [integerPart, fractionPart = ""] = unsigned.split(".");
+      return `${sign}${integerPart === "" ? "0" : integerPart}.${fractionPart.padEnd(metaData.scale, "0")}`;
+    }
+  }
   return trimmed;
 }
 function oracleFloatPrecision(nativeType?: string): number | null {
