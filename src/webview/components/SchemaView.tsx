@@ -7,7 +7,7 @@ import React, {
 import type { ColumnMeta, ForeignKeyMeta, IndexMeta } from "../types";
 import { getStructuralBadgePresentation } from "../types";
 import { onMessage, postMessage } from "../utils/messaging";
-import { Icon } from "./Icon";
+import { ShimmerBar } from "./Shimmer";
 
 interface SchemaData {
   columns: ColumnMeta[];
@@ -80,9 +80,16 @@ export function SchemaView({
   }, []);
   if (loading) {
     return (
-      <div style={{ padding: 20, opacity: 0.5, fontSize: 13 }}>
-        <Icon name="sync" size={13} spin style={{ marginRight: 6 }} />
-        Loading schema…
+      <div style={{ padding: "16px 20px", overflow: "hidden" }}>
+        <ShimmerBar width={220} height={15} style={{ marginBottom: 8 }} />
+        <div
+          style={{
+            height: 1,
+            background: "var(--vscode-panel-border)",
+            margin: "8px 0 20px",
+          }}
+        />
+        <ShimmerBar width={90} height={10} style={{ marginBottom: 12 }} />
       </div>
     );
   }

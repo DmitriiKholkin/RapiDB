@@ -1,12 +1,16 @@
 import * as vscode from "vscode";
 import type { ConnectionConfig, ConnectionManager } from "../connectionManager";
-import type { SchemaSnapshotSchemaEntry } from "../connectionManagerModels";
-import { normalizeUnknownError } from "../utils/errorHandling";
+import type {
+  SchemaSnapshotSchemaEntry,
+  SchemaSnapshotState,
+} from "../connectionManagerModels";
 
 export type NodeKind =
   | "connectionNode_disconnected"
   | "connectionNode_connecting"
   | "connectionNode_connected"
+  | "status_loading"
+  | "status_error"
   | "folder"
   | "database"
   | "schema"
@@ -29,6 +33,8 @@ const ICON_MAP: Record<NodeKind, string> = {
   connectionNode_disconnected: "server",
   connectionNode_connecting: "sync~spin",
   connectionNode_connected: "server",
+  status_loading: "sync~spin",
+  status_error: "error",
   folder: "folder",
   database: "database",
   schema: "symbol-namespace",
@@ -92,23 +98,49 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
   private readonly _subscriptions: vscode.Disposable[] = [];
+  private readonly _connectionNodes = new Map<string, RapiDBNode>();
+  private readonly _pendingConnectionRefreshIds = new Set<string>();
   private _refreshTimer: ReturnType<typeof setTimeout> | null = null;
+  private _refreshAllPending = false;
 
   constructor(private readonly connectionManager: ConnectionManager) {
-    const scheduleRefresh = () => {
+    const scheduleRefresh = (connectionId?: string) => {
+      if (connectionId) {
+        this._pendingConnectionRefreshIds.add(connectionId);
+      } else {
+        this._refreshAllPending = true;
+      }
       if (this._refreshTimer !== null) {
         clearTimeout(this._refreshTimer);
       }
       this._refreshTimer = setTimeout(() => {
         this._refreshTimer = null;
-        this.refresh();
+        const pendingConnectionIds = [...this._pendingConnectionRefreshIds];
+        const refreshAll =
+          this._refreshAllPending || pendingConnectionIds.length === 0;
+
+        this._pendingConnectionRefreshIds.clear();
+        this._refreshAllPending = false;
+
+        if (refreshAll) {
+          this.refresh();
+          return;
+        }
+
+        for (const pendingConnectionId of pendingConnectionIds) {
+          this.refreshConnectionTree(pendingConnectionId);
+        }
       }, 50);
     };
     this._subscriptions.push(
       connectionManager.onDidConnect(() => scheduleRefresh()),
-      connectionManager.onDidDisconnect(() => scheduleRefresh()),
+      connectionManager.onDidDisconnect((connectionId) =>
+        scheduleRefresh(connectionId),
+      ),
       connectionManager.onDidChangeConnections(() => scheduleRefresh()),
-      connectionManager.onDidSchemaLoad(() => scheduleRefresh()),
+      connectionManager.onDidChangeSchemaState((connectionId) =>
+        scheduleRefresh(connectionId),
+      ),
       connectionManager.onDidRefreshSchemas(() => scheduleRefresh()),
     );
   }
@@ -130,6 +162,15 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
 
   refresh(node?: RapiDBNode): void {
     this._onDidChangeTreeData.fire(node ?? undefined);
+  }
+
+  refreshConnectionTree(connectionId?: string): void {
+    if (!connectionId) {
+      this.refresh();
+      return;
+    }
+
+    this.refresh(this._connectionNodes.get(connectionId));
   }
 
   getTreeItem(element: RapiDBNode): vscode.TreeItem {
@@ -169,6 +210,7 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
 
   private getRootChildren(): RapiDBNode[] {
     const connections = this.connectionManager.getConnections();
+    this.syncConnectionNodeCache(connections);
     const groupedConnections = connections.filter((connection) =>
       connection.folder?.trim(),
     );
@@ -213,16 +255,16 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       return [];
     }
 
-    try {
-      const snapshot = await this.connectionManager.getSchemaSnapshotAsync(
-        element.connectionId,
-      );
-      return snapshot.databases.map((database) =>
-        this.makeDatabaseNode(element.connectionId, database.name),
-      );
-    } catch (err: unknown) {
-      return this.makeErrorNodes(element.connectionId, err);
-    }
+    const state = this.getSchemaState(element.connectionId);
+    const databaseNodes = state.snapshot.databases.map((database) =>
+      this.makeDatabaseNode(element.connectionId, database.name),
+    );
+    return this.appendStateNodes(
+      element.connectionId,
+      databaseNodes,
+      state,
+      "Loading schema…",
+    );
   }
 
   private async getDatabaseChildren(
@@ -233,27 +275,29 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       return [];
     }
 
-    try {
-      const snapshot = await this.connectionManager.getSchemaSnapshotAsync(
+    const state = this.getSchemaState(element.connectionId);
+    const database = state.snapshot.databases.find(
+      (entry) => entry.name === databaseName,
+    );
+    if (!database) {
+      return this.pendingStateNodes(
         element.connectionId,
+        state,
+        `Loading ${databaseName}…`,
       );
-      const database = snapshot.databases.find(
-        (entry) => entry.name === databaseName,
-      );
-      const schemas = database?.schemas ?? [];
-
-      if (schemas.length <= 1) {
-        return schemas[0]
-          ? this.categoryNodes(element.connectionId, databaseName, schemas[0])
-          : [];
-      }
-
-      return schemas.map((schema) =>
-        this.makeSchemaNode(element.connectionId, databaseName, schema.name),
-      );
-    } catch (err: unknown) {
-      return this.makeErrorNodes(element.connectionId, err);
     }
+
+    const schemas = database.schemas;
+
+    if (schemas.length <= 1) {
+      return schemas[0]
+        ? this.categoryNodes(element.connectionId, databaseName, schemas[0])
+        : [];
+    }
+
+    return schemas.map((schema) =>
+      this.makeSchemaNode(element.connectionId, databaseName, schema.name),
+    );
   }
 
   private async getSchemaChildren(element: RapiDBNode): Promise<RapiDBNode[]> {
@@ -263,15 +307,19 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       return [];
     }
 
-    const snapshot = await this.connectionManager.getSchemaSnapshotAsync(
-      element.connectionId,
-    );
-    const schema = snapshot.databases
+    const state = this.getSchemaState(element.connectionId);
+    const schema = state.snapshot.databases
       .find((entry) => entry.name === databaseName)
       ?.schemas.find((entry) => entry.name === schemaName);
-    return schema
-      ? this.categoryNodes(element.connectionId, databaseName, schema)
-      : [];
+    if (!schema) {
+      return this.pendingStateNodes(
+        element.connectionId,
+        state,
+        `Loading ${schemaName}…`,
+      );
+    }
+
+    return this.categoryNodes(element.connectionId, databaseName, schema);
   }
 
   private async getCategoryChildren(
@@ -284,36 +332,76 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       return [];
     }
 
-    try {
-      const snapshot = await this.connectionManager.getSchemaSnapshotAsync(
+    const state = this.getSchemaState(element.connectionId);
+    const schema = state.snapshot.databases
+      .find((entry) => entry.name === databaseName)
+      ?.schemas.find((entry) => entry.name === schemaName);
+    if (!schema) {
+      return this.pendingStateNodes(
         element.connectionId,
+        state,
+        `Loading ${schemaName}…`,
       );
-      const schema = snapshot.databases
-        .find((entry) => entry.name === databaseName)
-        ?.schemas.find((entry) => entry.name === schemaName);
-      const filteredObjects = (schema?.objects ?? []).filter((object) =>
-        CATEGORY_TYPES[kind].includes(object.type),
-      );
-      const childKind = CATEGORY_NODE_KIND[kind];
-
-      element.description = `(${filteredObjects.length})`;
-
-      if (filteredObjects.length === 0) {
-        return [];
-      }
-
-      return filteredObjects.map((object) =>
-        this.makeObjectNode(
-          childKind,
-          element.connectionId,
-          databaseName,
-          schemaName,
-          object.name,
-        ),
-      );
-    } catch (err: unknown) {
-      return this.makeErrorNodes(element.connectionId, err);
     }
+
+    const filteredObjects = schema.objects.filter((object) =>
+      CATEGORY_TYPES[kind].includes(object.type),
+    );
+    const childKind = CATEGORY_NODE_KIND[kind];
+
+    element.description = `(${filteredObjects.length})`;
+
+    if (filteredObjects.length === 0) {
+      return [];
+    }
+
+    return filteredObjects.map((object) =>
+      this.makeObjectNode(
+        childKind,
+        element.connectionId,
+        databaseName,
+        schemaName,
+        object.name,
+      ),
+    );
+  }
+
+  private getSchemaState(connectionId: string): SchemaSnapshotState {
+    this.connectionManager.ensureSchemaSnapshotLoading(connectionId);
+    return this.connectionManager.getSchemaSnapshotState(connectionId);
+  }
+
+  private appendStateNodes(
+    connectionId: string,
+    nodes: RapiDBNode[],
+    state: SchemaSnapshotState,
+    loadingLabel: string,
+  ): RapiDBNode[] {
+    if (state.status === "loading") {
+      return [...nodes, this.makeLoadingNode(connectionId, loadingLabel)];
+    }
+
+    if (state.status === "error") {
+      return [...nodes, ...this.makeErrorNodes(connectionId, state.error)];
+    }
+
+    return nodes;
+  }
+
+  private pendingStateNodes(
+    connectionId: string,
+    state: SchemaSnapshotState,
+    loadingLabel: string,
+  ): RapiDBNode[] {
+    if (state.status === "error") {
+      return this.makeErrorNodes(connectionId, state.error);
+    }
+
+    if (state.status === "loading") {
+      return [this.makeLoadingNode(connectionId, loadingLabel)];
+    }
+
+    return [];
   }
 
   private isCategoryKind(kind: NodeKind): kind is CategoryKind {
@@ -326,6 +414,17 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     return connections
       .slice()
       .sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  private syncConnectionNodeCache(connections: ConnectionConfig[]): void {
+    const liveConnectionIds = new Set(
+      connections.map((connection) => connection.id),
+    );
+    for (const connectionId of this._connectionNodes.keys()) {
+      if (!liveConnectionIds.has(connectionId)) {
+        this._connectionNodes.delete(connectionId);
+      }
+    }
   }
 
   private makeDatabaseNode(
@@ -395,8 +494,23 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     return node;
   }
 
-  private makeErrorNodes(connectionId: string, error: unknown): RapiDBNode[] {
-    return [this.makeError(connectionId, normalizeUnknownError(error).message)];
+  private makeErrorNodes(
+    connectionId: string,
+    message = "Failed to load schema",
+  ): RapiDBNode[] {
+    return [this.makeError(connectionId, message)];
+  }
+
+  private makeLoadingNode(connectionId: string, label: string): RapiDBNode {
+    const node = new RapiDBNode(
+      label,
+      "status_loading",
+      vscode.TreeItemCollapsibleState.None,
+      connectionId,
+    );
+    node.contextValue = "_status";
+    node.tooltip = label;
+    return node;
   }
 
   private makeFolderNode(folderName: string): RapiDBNode {
@@ -438,6 +552,8 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
         : vscode.TreeItemCollapsibleState.None,
       config.id,
     );
+
+    this._connectionNodes.set(config.id, node);
 
     node.description = config.type;
 
@@ -534,7 +650,7 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
   private makeError(connectionId: string, message: string): RapiDBNode {
     const node = new RapiDBNode(
       message,
-      "connectionNode_disconnected",
+      "status_error",
       vscode.TreeItemCollapsibleState.None,
       connectionId,
     );

@@ -313,6 +313,15 @@ export function QueryView({
             ))
           )}
         </select>
+        {connections.length === 0 && (
+          <Icon
+            name="sync"
+            size={11}
+            spin
+            style={{ opacity: 0.55, marginLeft: 2, flexShrink: 0 }}
+            title="Loading connections…"
+          />
+        )}
 
         {}
         <button
@@ -374,6 +383,24 @@ export function QueryView({
         </button>
 
         <div style={{ flex: 1 }} />
+
+        {connections.length > 0 &&
+          schemaByConnection[activeConnectionId || connectionId] ===
+            undefined && (
+            <span
+              style={{
+                fontSize: 11,
+                opacity: 0.45,
+                display: "flex",
+                alignItems: "center",
+                gap: 4,
+                flexShrink: 0,
+              }}
+            >
+              <Icon name="sync" size={11} spin />
+              Indexing schema…
+            </span>
+          )}
 
         <span style={{ fontSize: 11, opacity: 0.35 }}>Ctrl+Enter</span>
       </div>

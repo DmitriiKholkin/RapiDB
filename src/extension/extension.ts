@@ -424,9 +424,9 @@ function registerCommands(
     refresh();
   });
 
-  reg(CMD.refresh, () => {
-    connectionManager.refreshSchemaCache();
-    connectionProvider.refresh();
+  reg(CMD.refresh, (node?: RapiDBNode) => {
+    connectionManager.refreshSchemaCache(node?.connectionId);
+    connectionProvider.refreshConnectionTree(node?.connectionId);
   });
 }
 

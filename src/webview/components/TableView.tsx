@@ -34,6 +34,7 @@ import {
   type Column as WidthColumn,
 } from "../utils/columnSizing";
 import { onMessage, postMessage } from "../utils/messaging";
+import { GridLoadingOverlay } from "./GridOverlay";
 import { Icon } from "./Icon";
 import { MonacoEditor } from "./MonacoEditor";
 import { CellDisplay } from "./table/CellDisplay";
@@ -1088,6 +1089,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
   }
 
   const busy = loading || applying || deleting || inserting;
+  const isPaginationLoad = loading && columns.length > 0;
 
   return (
     <main
@@ -1206,7 +1208,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
         <button
           type="button"
           style={btn("ghost", busy)}
-          disabled={busy}
+          disabled={busy || isPaginationLoad}
           onClick={fetchPage}
         >
           <Icon name="refresh" size={13} style={{ marginRight: 4 }} />
@@ -1215,6 +1217,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
         <button
           type="button"
           style={btn("ghost")}
+          disabled={busy || isPaginationLoad}
           onClick={() => {
             const activeFilters = serializeFilterDrafts(
               columns,
@@ -1233,6 +1236,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
         <button
           type="button"
           style={btn("ghost")}
+          disabled={busy || isPaginationLoad}
           onClick={() => {
             const activeFilters = serializeFilterDrafts(
               columns,
@@ -1382,246 +1386,255 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
         ref={scrollRef}
         style={{ flex: 1, overflow: "auto", position: "relative" }}
       >
-        <table
-          style={{
-            width: tanTable.getTotalSize(),
-            borderCollapse: "collapse",
-            tableLayout: "fixed",
-            fontSize: 12,
-            fontFamily: "var(--vscode-editor-font-family, monospace)",
-          }}
-        >
-          <thead>
-            {tanTable.getHeaderGroups().map((hg) => (
-              <tr key={hg.id}>
-                {hg.headers.map((h) => {
-                  const isSel = h.column.id === "__sel";
-                  const colId = h.column.id;
-                  const isSorted = sort?.column === colId;
-                  const sortDir = isSorted ? (sort?.direction ?? null) : null;
-                  return (
-                    <th
-                      key={h.id}
-                      style={{
-                        width: h.getSize(),
-                        height: HEADER_H,
-                        padding: isSel ? "0 6px" : "0 8px",
-                        textAlign: isSel ? "center" : "left",
-                        background: isSorted
-                          ? "var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.1))"
-                          : "var(--vscode-editorGroupHeader-tabsBackground)",
-                        borderRight: "1px solid var(--vscode-panel-border)",
-                        position: "sticky",
-                        top: 0,
-                        zIndex: 2,
-                        whiteSpace: "nowrap",
-                        overflow: "hidden",
-                        fontWeight: 600,
-                        boxSizing: "border-box",
-                        userSelect: "none",
-                        cursor: isSel ? "default" : "pointer",
-                      }}
-                      onClick={() => {
-                        if (!isSel) {
-                          handleSort(colId);
-                        }
-                      }}
-                      title={isSel ? undefined : `Sort by ${colId}`}
-                    >
-                      <div
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: isSel ? "center" : "flex-start",
-                          gap: 4,
-                          overflow: "hidden",
-                        }}
-                      >
-                        <span
+        {
+          <>
+            {isPaginationLoad && <GridLoadingOverlay />}
+            <table
+              style={{
+                width: tanTable.getTotalSize(),
+                borderCollapse: "collapse",
+                tableLayout: "fixed",
+                fontSize: 12,
+                fontFamily: "var(--vscode-editor-font-family, monospace)",
+              }}
+            >
+              <thead>
+                {tanTable.getHeaderGroups().map((hg) => (
+                  <tr key={hg.id}>
+                    {hg.headers.map((h) => {
+                      const isSel = h.column.id === "__sel";
+                      const colId = h.column.id;
+                      const isSorted = sort?.column === colId;
+                      const sortDir = isSorted
+                        ? (sort?.direction ?? null)
+                        : null;
+                      return (
+                        <th
+                          key={h.id}
                           style={{
+                            width: h.getSize(),
+                            height: HEADER_H,
+                            padding: isSel ? "0 6px" : "0 8px",
+                            textAlign: isSel ? "center" : "left",
+                            background: isSorted
+                              ? "var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.1))"
+                              : "var(--vscode-editorGroupHeader-tabsBackground)",
+                            borderRight: "1px solid var(--vscode-panel-border)",
+                            position: "sticky",
+                            top: 0,
+                            zIndex: 2,
+                            whiteSpace: "nowrap",
                             overflow: "hidden",
-                            textOverflow: "ellipsis",
+                            fontWeight: 600,
+                            boxSizing: "border-box",
+                            userSelect: "none",
+                            cursor: isSel ? "default" : "pointer",
                           }}
+                          onClick={() => {
+                            if (!isSel) {
+                              handleSort(colId);
+                            }
+                          }}
+                          title={isSel ? undefined : `Sort by ${colId}`}
                         >
-                          {flexRender(
-                            h.column.columnDef.header,
-                            h.getContext(),
-                          )}
-                        </span>
-                        {!isSel && (
-                          <span
+                          <div
                             style={{
-                              opacity: isSorted ? 1 : 0.25,
-                              fontSize: 10,
-                              flexShrink: 0,
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: isSel ? "center" : "flex-start",
+                              gap: 4,
+                              overflow: "hidden",
                             }}
                           >
-                            {sortDir === "asc" ? (
-                              <Icon name="triangle-up" size={10} />
-                            ) : sortDir === "desc" ? (
-                              <Icon name="triangle-down" size={10} />
-                            ) : (
-                              <Icon name="unfold" size={10} />
+                            <span
+                              style={{
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                              }}
+                            >
+                              {flexRender(
+                                h.column.columnDef.header,
+                                h.getContext(),
+                              )}
+                            </span>
+                            {!isSel && (
+                              <span
+                                style={{
+                                  opacity: isSorted ? 1 : 0.25,
+                                  fontSize: 10,
+                                  flexShrink: 0,
+                                }}
+                              >
+                                {sortDir === "asc" ? (
+                                  <Icon name="triangle-up" size={10} />
+                                ) : sortDir === "desc" ? (
+                                  <Icon name="triangle-down" size={10} />
+                                ) : (
+                                  <Icon name="unfold" size={10} />
+                                )}
+                              </span>
                             )}
-                          </span>
-                        )}
-                      </div>
-                      {!isSel && h.column.getCanResize() && (
-                        <button
-                          type="button"
-                          aria-label={`Resize ${colId} column`}
-                          tabIndex={-1}
-                          onMouseDown={(event) => {
-                            event.stopPropagation();
-                            h.getResizeHandler()(event);
-                          }}
-                          onClick={(e) => e.stopPropagation()}
-                          style={{
-                            position: "absolute",
-                            right: 0,
-                            top: 0,
-                            height: "100%",
-                            width: 5,
-                            padding: 0,
-                            border: "none",
-                            cursor: "col-resize",
-                            background: h.column.getIsResizing()
-                              ? "var(--vscode-focusBorder)"
-                              : "transparent",
-                          }}
-                        />
-                      )}
-                    </th>
-                  );
-                })}
-              </tr>
-            ))}
-            {}
-            <tr>
-              {tanTable.getHeaderGroups()[0]?.headers.map((h) => {
-                const isSel = h.column.id === "__sel";
-                const col = columnsMap.get(h.column.id);
-                return (
-                  <th
-                    key={`${h.id}_f`}
-                    style={{
-                      width: h.getSize(),
-                      height: FILTER_H,
-                      padding: isSel ? 0 : "2px 4px",
-                      background:
-                        "var(--vscode-editorGroupHeader-tabsBackground)",
-                      borderBottom: "2px solid var(--vscode-panel-border)",
-                      borderRight: "1px solid var(--vscode-panel-border)",
-                      position: "sticky",
-                      top: HEADER_H,
-                      zIndex: 2,
-                      boxSizing: "border-box",
+                          </div>
+                          {!isSel && h.column.getCanResize() && (
+                            <button
+                              type="button"
+                              aria-label={`Resize ${colId} column`}
+                              tabIndex={-1}
+                              onMouseDown={(event) => {
+                                event.stopPropagation();
+                                h.getResizeHandler()(event);
+                              }}
+                              onClick={(e) => e.stopPropagation()}
+                              style={{
+                                position: "absolute",
+                                right: 0,
+                                top: 0,
+                                height: "100%",
+                                width: 5,
+                                padding: 0,
+                                border: "none",
+                                cursor: "col-resize",
+                                background: h.column.getIsResizing()
+                                  ? "var(--vscode-focusBorder)"
+                                  : "transparent",
+                              }}
+                            />
+                          )}
+                        </th>
+                      );
+                    })}
+                  </tr>
+                ))}
+                {}
+                <tr>
+                  {tanTable.getHeaderGroups()[0]?.headers.map((h) => {
+                    const isSel = h.column.id === "__sel";
+                    const col = columnsMap.get(h.column.id);
+                    return (
+                      <th
+                        key={`${h.id}_f`}
+                        style={{
+                          width: h.getSize(),
+                          height: FILTER_H,
+                          padding: isSel ? 0 : "2px 4px",
+                          background:
+                            "var(--vscode-editorGroupHeader-tabsBackground)",
+                          borderBottom: "2px solid var(--vscode-panel-border)",
+                          borderRight: "1px solid var(--vscode-panel-border)",
+                          position: "sticky",
+                          top: HEADER_H,
+                          zIndex: 2,
+                          boxSizing: "border-box",
 
-                      boxShadow:
-                        "0 -1px 0 0 var(--vscode-editorGroupHeader-tabsBackground)",
-                    }}
-                  >
-                    {isSel ? (
-                      <span style={SR_ONLY_STYLE}>Selection column</span>
-                    ) : col ? (
-                      <ColumnFilterControl
-                        column={col}
-                        draft={filterDrafts[h.column.id]}
-                        onChange={(nextDraft) =>
-                          updateFilterDraft(h.column.id, nextDraft)
-                        }
-                      />
-                    ) : null}
-                  </th>
-                );
-              })}
-            </tr>
-          </thead>
-          <tbody>
-            {virtItems.length > 0 && virtItems[0].start > 0 && (
-              <tr>
-                <td
-                  colSpan={tanColumns.length}
-                  style={{
-                    height: virtItems[0].start,
-                    padding: 0,
-                    border: "none",
-                  }}
-                />
-              </tr>
-            )}
-            {virtItems.map((vRow) => {
-              if (hasDraftRow && vRow.index === 0) {
-                return (
-                  <DraftTableRow
-                    key={vRow.key}
-                    columns={columns}
-                    visibleColumns={visibleColumns}
-                    draft={newRow}
-                    editingCol={
-                      editCell?.kind === "draft" ? editCell.col : null
-                    }
-                    onStartEdit={handleStartDraftEdit}
-                    onCommit={commitDraftCellEdit}
-                    onCancelEdit={() => setEditCell(null)}
-                  />
-                );
-              }
-
-              const persistedIndex = hasDraftRow ? vRow.index - 1 : vRow.index;
-              const row = tableRows[persistedIndex];
-              const isSelected = selected.has(persistedIndex);
-              const editingCol =
-                editCell?.kind === "persisted" &&
-                editCell.rowIdx === persistedIndex
-                  ? editCell.col
-                  : null;
-
-              return (
-                <TableRow
-                  key={vRow.key}
-                  row={row}
-                  visualIndex={vRow.index}
-                  rowIndex={persistedIndex}
-                  isSelected={isSelected}
-                  pendingCols={pendingEdits.get(persistedIndex)}
-                  columnsMap={columnsMap}
-                  editingCol={editingCol}
-                  onStartEdit={handleStartEdit}
-                />
-              );
-            })}
-            {virtItems.length > 0 &&
-              (() => {
-                const last = virtItems[virtItems.length - 1];
-                const rem = totalVirtH - last.end;
-                return rem > 0 ? (
+                          boxShadow:
+                            "0 -1px 0 0 var(--vscode-editorGroupHeader-tabsBackground)",
+                        }}
+                      >
+                        {isSel ? (
+                          <span style={SR_ONLY_STYLE}>Selection column</span>
+                        ) : col ? (
+                          <ColumnFilterControl
+                            column={col}
+                            draft={filterDrafts[h.column.id]}
+                            onChange={(nextDraft) =>
+                              updateFilterDraft(h.column.id, nextDraft)
+                            }
+                          />
+                        ) : null}
+                      </th>
+                    );
+                  })}
+                </tr>
+              </thead>
+              <tbody>
+                {virtItems.length > 0 && virtItems[0].start > 0 && (
                   <tr>
                     <td
                       colSpan={tanColumns.length}
-                      style={{ height: rem, padding: 0, border: "none" }}
+                      style={{
+                        height: virtItems[0].start,
+                        padding: 0,
+                        border: "none",
+                      }}
                     />
                   </tr>
-                ) : null;
-              })()}
-          </tbody>
-        </table>
-        {!loading && rows.length === 0 && !hasDraftRow && (
-          <div
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              alignItems: "center",
-              justifyContent: "center",
-              height: 200,
-              opacity: 0.4,
-              userSelect: "none",
-            }}
-          >
-            <Icon name="inbox" size={28} style={{ opacity: 0.4 }} />
-            <div style={{ fontSize: 13, marginTop: 8 }}>No rows found</div>
-          </div>
-        )}
+                )}
+                {virtItems.map((vRow) => {
+                  if (hasDraftRow && vRow.index === 0) {
+                    return (
+                      <DraftTableRow
+                        key={vRow.key}
+                        columns={columns}
+                        visibleColumns={visibleColumns}
+                        draft={newRow}
+                        editingCol={
+                          editCell?.kind === "draft" ? editCell.col : null
+                        }
+                        onStartEdit={handleStartDraftEdit}
+                        onCommit={commitDraftCellEdit}
+                        onCancelEdit={() => setEditCell(null)}
+                      />
+                    );
+                  }
+
+                  const persistedIndex = hasDraftRow
+                    ? vRow.index - 1
+                    : vRow.index;
+                  const row = tableRows[persistedIndex];
+                  const isSelected = selected.has(persistedIndex);
+                  const editingCol =
+                    editCell?.kind === "persisted" &&
+                    editCell.rowIdx === persistedIndex
+                      ? editCell.col
+                      : null;
+
+                  return (
+                    <TableRow
+                      key={vRow.key}
+                      row={row}
+                      visualIndex={vRow.index}
+                      rowIndex={persistedIndex}
+                      isSelected={isSelected}
+                      pendingCols={pendingEdits.get(persistedIndex)}
+                      columnsMap={columnsMap}
+                      editingCol={editingCol}
+                      onStartEdit={handleStartEdit}
+                    />
+                  );
+                })}
+                {virtItems.length > 0 &&
+                  (() => {
+                    const last = virtItems[virtItems.length - 1];
+                    const rem = totalVirtH - last.end;
+                    return rem > 0 ? (
+                      <tr>
+                        <td
+                          colSpan={tanColumns.length}
+                          style={{ height: rem, padding: 0, border: "none" }}
+                        />
+                      </tr>
+                    ) : null;
+                  })()}
+              </tbody>
+            </table>
+            {!loading && rows.length === 0 && !hasDraftRow && (
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  height: 200,
+                  opacity: 0.4,
+                  userSelect: "none",
+                }}
+              >
+                <Icon name="inbox" size={28} style={{ opacity: 0.4 }} />
+                <div style={{ fontSize: 13, marginTop: 8 }}>No rows found</div>
+              </div>
+            )}
+          </>
+        }
       </div>
 
       <div

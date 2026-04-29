@@ -56,6 +56,16 @@ export interface SchemaSnapshotDatabaseEntry {
 export interface SchemaSnapshot {
   databases: SchemaSnapshotDatabaseEntry[];
 }
+
+export type SchemaLoadStatus = "idle" | "loading" | "loaded" | "error";
+
+export interface SchemaSnapshotState {
+  snapshot: SchemaSnapshot;
+  status: SchemaLoadStatus;
+  isPartial: boolean;
+  error?: string;
+}
+
 export interface StoredConnectionConfig extends ConnectionConfig {
   user?: string;
 }

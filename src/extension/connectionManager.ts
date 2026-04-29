@@ -5,10 +5,12 @@ import {
   type ConnectAttempt,
   type ConnectionConfig,
   type HistoryEntry,
+  type SchemaLoadStatus,
   type SchemaObjectEntry,
   type SchemaSnapshot,
   type SchemaSnapshotDatabaseEntry,
   type SchemaSnapshotObjectEntry,
+  type SchemaSnapshotState,
   type StoredConnectionConfig,
   type TestConnectionResult,
 } from "./connectionManagerModels";
@@ -30,20 +32,57 @@ export type {
   ConnectAttempt,
   ConnectionConfig,
   HistoryEntry,
+  SchemaLoadStatus,
   SchemaObjectEntry,
   SchemaSnapshot,
   SchemaSnapshotDatabaseEntry,
   SchemaSnapshotSchemaEntry,
+  SchemaSnapshotState,
   TestConnectionResult,
 } from "./connectionManagerModels";
 
-interface SchemaCacheEntry {
-  snapshot: SchemaSnapshot;
+interface SchemaCacheEntry extends SchemaSnapshotState {
   loading: Promise<void> | null;
+  generation: number;
 }
 
 function createEmptySchemaSnapshot(): SchemaSnapshot {
   return { databases: [] };
+}
+
+function createEmptySchemaSnapshotState(): SchemaSnapshotState {
+  return {
+    snapshot: createEmptySchemaSnapshot(),
+    status: "idle",
+    isPartial: false,
+  };
+}
+
+function createSchemaCacheEntry(generation: number): SchemaCacheEntry {
+  return {
+    ...createEmptySchemaSnapshotState(),
+    loading: null,
+    generation,
+  };
+}
+
+function cloneSchemaSnapshotState(
+  state: SchemaSnapshotState,
+): SchemaSnapshotState {
+  if (state.error) {
+    return {
+      snapshot: state.snapshot,
+      status: state.status,
+      isPartial: state.isPartial,
+      error: state.error,
+    };
+  }
+
+  return {
+    snapshot: state.snapshot,
+    status: state.status,
+    isPartial: state.isPartial,
+  };
 }
 
 function flattenSchemaSnapshot(snapshot: SchemaSnapshot): SchemaObjectEntry[] {
@@ -77,10 +116,13 @@ export class ConnectionManager {
   private readonly _onDidConnect = new vscode.EventEmitter<void>();
   readonly onDidSchemaLoad: vscode.Event<string>;
   private readonly _onDidSchemaLoad = new vscode.EventEmitter<string>();
+  readonly onDidChangeSchemaState: vscode.Event<string>;
+  private readonly _onDidChangeSchemaState = new vscode.EventEmitter<string>();
   readonly onDidRefreshSchemas: vscode.Event<void>;
   private readonly _onDidRefreshSchemas = new vscode.EventEmitter<void>();
   private _connectionsCache: ConnectionConfig[] | null = null;
   private readonly _schemaCacheMap = new Map<string, SchemaCacheEntry>();
+  private readonly _schemaGenerationMap = new Map<string, number>();
   constructor(
     context: vscode.ExtensionContext,
     store: ConnectionManagerStore = new VSCodeConnectionManagerStore(context),
@@ -92,6 +134,7 @@ export class ConnectionManager {
     this.onDidConnect = this._onDidConnect.event;
     this.onDidDisconnect = this._onDidDisconnect.event;
     this.onDidSchemaLoad = this._onDidSchemaLoad.event;
+    this.onDidChangeSchemaState = this._onDidChangeSchemaState.event;
     this.onDidRefreshSchemas = this._onDidRefreshSchemas.event;
     this.store.onDidChangeConfiguration(async (e) => {
       this._connectionsCache = null;
@@ -260,7 +303,7 @@ export class ConnectionManager {
           throw err;
         }
         this.driverMap.set(id, driver);
-        this._schemaCacheMap.delete(id);
+        this._invalidateSchemaState(id);
         this._onDidConnect.fire();
         resolveAttempt();
       } catch (err) {
@@ -282,7 +325,7 @@ export class ConnectionManager {
         await driver.disconnect();
       } catch {}
       this.driverMap.delete(id);
-      this._schemaCacheMap.delete(id);
+      this._invalidateSchemaState(id);
       this._onDidDisconnect.fire(id);
     }
   }
@@ -304,16 +347,32 @@ export class ConnectionManager {
   }
 
   getSchemaSnapshot(connectionId: string): SchemaSnapshot {
-    return (
-      this._schemaCacheMap.get(connectionId)?.snapshot ??
-      createEmptySchemaSnapshot()
-    );
+    return this.getSchemaSnapshotState(connectionId).snapshot;
+  }
+
+  getSchemaSnapshotState(connectionId: string): SchemaSnapshotState {
+    const state = this._schemaCacheMap.get(connectionId);
+    if (!state) {
+      return createEmptySchemaSnapshotState();
+    }
+
+    return cloneSchemaSnapshotState(state);
+  }
+
+  ensureSchemaSnapshotLoading(connectionId: string): void {
+    this._startSchemaLoad(connectionId, false);
   }
 
   refreshSchemaCache(connectionId?: string): void {
     if (connectionId) {
-      this._schemaCacheMap.delete(connectionId);
+      this._invalidateSchemaState(connectionId);
     } else {
+      for (const id of new Set([
+        ...this._schemaCacheMap.keys(),
+        ...this._schemaGenerationMap.keys(),
+      ])) {
+        this._invalidateSchemaState(id);
+      }
       this._schemaCacheMap.clear();
     }
     this._onDidRefreshSchemas.fire();
@@ -325,13 +384,7 @@ export class ConnectionManager {
   }
 
   async getSchemaSnapshotAsync(connectionId: string): Promise<SchemaSnapshot> {
-    const existing = this._schemaCacheMap.get(connectionId);
-    if (
-      !existing ||
-      (!existing.loading && existing.snapshot.databases.length === 0)
-    ) {
-      this._startSchemaLoad(connectionId);
-    }
+    this._startSchemaLoad(connectionId, true);
     const entry = this._schemaCacheMap.get(connectionId);
     if (entry?.loading) {
       try {
@@ -340,40 +393,122 @@ export class ConnectionManager {
     }
     return this.getSchemaSnapshot(connectionId);
   }
-  private _startSchemaLoad(connectionId: string): void {
+
+  private _getSchemaGeneration(connectionId: string): number {
+    return this._schemaGenerationMap.get(connectionId) ?? 0;
+  }
+
+  private _invalidateSchemaState(connectionId: string): void {
+    this._schemaGenerationMap.set(
+      connectionId,
+      this._getSchemaGeneration(connectionId) + 1,
+    );
+    this._schemaCacheMap.delete(connectionId);
+    this._onDidChangeSchemaState.fire(connectionId);
+  }
+
+  private _publishSchemaState(
+    connectionId: string,
+    entry: SchemaCacheEntry,
+    generation: number,
+    state: SchemaSnapshotState,
+    fireLoadedEvent = false,
+  ): boolean {
+    const live = this._schemaCacheMap.get(connectionId);
+    if (
+      live !== entry ||
+      live?.generation !== generation ||
+      this._getSchemaGeneration(connectionId) !== generation
+    ) {
+      return false;
+    }
+
+    live.snapshot = state.snapshot;
+    live.status = state.status;
+    live.isPartial = state.isPartial;
+    if (state.error) {
+      live.error = state.error;
+    } else {
+      delete live.error;
+    }
+    if (state.status !== "loading") {
+      live.loading = null;
+    }
+
+    this._onDidChangeSchemaState.fire(connectionId);
+    if (fireLoadedEvent) {
+      this._onDidSchemaLoad.fire(connectionId);
+    }
+    return true;
+  }
+
+  private _startSchemaLoad(connectionId: string, allowRetry: boolean): void {
     const driver = this.getDriver(connectionId);
     const config = this.getConnection(connectionId);
     if (!driver || !config) {
       return;
     }
+    const generation = this._getSchemaGeneration(connectionId);
     let entry = this._schemaCacheMap.get(connectionId);
-    if (!entry) {
-      entry = { snapshot: createEmptySchemaSnapshot(), loading: null };
+    if (!entry || entry.generation !== generation) {
+      entry = createSchemaCacheEntry(generation);
       this._schemaCacheMap.set(connectionId, entry);
     }
     if (entry.loading) {
       return;
     }
+    if (entry.status === "loaded") {
+      return;
+    }
+    if (entry.status === "error" && !allowRetry) {
+      return;
+    }
+
     const capturedEntry = entry;
-    capturedEntry.loading = this._loadSchemaInternal(driver, config)
+    this._publishSchemaState(connectionId, capturedEntry, generation, {
+      snapshot: capturedEntry.snapshot,
+      status: "loading",
+      isPartial: capturedEntry.snapshot.databases.length > 0,
+    });
+
+    capturedEntry.loading = this._loadSchemaInternal(
+      driver,
+      config,
+      (snapshot) => {
+        this._publishSchemaState(connectionId, capturedEntry, generation, {
+          snapshot,
+          status: "loading",
+          isPartial: true,
+        });
+      },
+    )
       .then((snapshot) => {
-        const live = this._schemaCacheMap.get(connectionId);
-        if (live === capturedEntry) {
-          live.snapshot = snapshot;
-          live.loading = null;
-        }
-        this._onDidSchemaLoad.fire(connectionId);
+        this._publishSchemaState(
+          connectionId,
+          capturedEntry,
+          generation,
+          {
+            snapshot,
+            status: "loaded",
+            isPartial: false,
+          },
+          true,
+        );
       })
-      .catch(() => {
-        const live = this._schemaCacheMap.get(connectionId);
-        if (live === capturedEntry) {
-          live.loading = null;
-        }
+      .catch((err: unknown) => {
+        const error = normalizeUnknownError(err);
+        this._publishSchemaState(connectionId, capturedEntry, generation, {
+          snapshot: capturedEntry.snapshot,
+          status: "error",
+          isPartial: capturedEntry.snapshot.databases.length > 0,
+          error: error.message,
+        });
       });
   }
   private async _loadSchemaInternal(
     driver: IDBDriver,
     config: ConnectionConfig,
+    onProgress?: (snapshot: SchemaSnapshot) => void,
   ): Promise<SchemaSnapshot> {
     const configuredDb =
       config.database || config.serviceName || (config.filePath ? "main" : "");
@@ -393,10 +528,12 @@ export class ConnectionManager {
     }
 
     const columnMetadataDatabase = configuredDb || databaseNames[0] || "";
+    const partialDatabases: Array<SchemaSnapshotDatabaseEntry | undefined> =
+      new Array(databaseNames.length);
     const databases = await pMapWithLimit(
-      databaseNames,
+      databaseNames.map((databaseName, index) => ({ databaseName, index })),
       4,
-      async (databaseName): Promise<SchemaSnapshotDatabaseEntry> => {
+      async ({ databaseName, index }): Promise<SchemaSnapshotDatabaseEntry> => {
         const schemasFromDatabase = databaseInfoMap.get(databaseName)?.schemas;
         const schemas =
           schemasFromDatabase && schemasFromDatabase.length > 0
@@ -454,10 +591,20 @@ export class ConnectionManager {
             };
           },
         );
-        return {
+        const databaseEntry = {
           name: databaseName,
           schemas: perSchemaResults,
         };
+
+        partialDatabases[index] = databaseEntry;
+        onProgress?.({
+          databases: partialDatabases.filter(
+            (database): database is SchemaSnapshotDatabaseEntry =>
+              database !== undefined,
+          ),
+        });
+
+        return databaseEntry;
       },
     );
 
