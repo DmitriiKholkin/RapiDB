@@ -153,12 +153,12 @@ export interface TransactionOperation {
   params?: unknown[];
   checkAffectedRows?: boolean;
 }
-const TEXT_OPS: FilterOperator[] = ["like", "is_null", "is_not_null"];
-const UUID_OPS: FilterOperator[] = ["like", "in", "is_null", "is_not_null"];
-const ENUM_OPS: FilterOperator[] = ["like", "in", "is_null", "is_not_null"];
-const BOOL_OPS: FilterOperator[] = ["eq", "neq", "is_null", "is_not_null"];
-const SEARCH_OPS: FilterOperator[] = ["like", "is_null", "is_not_null"];
-const ARRAY_OPS: FilterOperator[] = ["like", "is_null", "is_not_null"];
+const TEXT_OPS: FilterOperator[] = ["like"];
+const UUID_OPS: FilterOperator[] = ["like", "in"];
+const ENUM_OPS: FilterOperator[] = ["like", "in"];
+const BOOL_OPS: FilterOperator[] = ["eq", "neq"];
+const SEARCH_OPS: FilterOperator[] = ["like"];
+const ARRAY_OPS: FilterOperator[] = ["like"];
 const NULL_ONLY_OPS: FilterOperator[] = ["is_null", "is_not_null"];
 const EXTENDED_OPS: FilterOperator[] = [
   "eq",
@@ -169,9 +169,33 @@ const EXTENDED_OPS: FilterOperator[] = [
   "lte",
   "between",
   "in",
-  "is_null",
-  "is_not_null",
 ];
+
+export function composeFilterOperators(
+  operators: readonly FilterOperator[],
+  nullable: boolean,
+): FilterOperator[] {
+  const scalarOperators = operators.filter(
+    (operator) => operator !== "is_null" && operator !== "is_not_null",
+  );
+
+  return nullable ? [...scalarOperators, ...NULL_ONLY_OPS] : scalarOperators;
+}
+
+export function resolveFilterOperators(
+  cat: TypeCategory,
+  options: { filterable: boolean; nullable: boolean },
+): FilterOperator[] {
+  if (!options.filterable) {
+    return options.nullable ? [...NULL_ONLY_OPS] : [];
+  }
+
+  return composeFilterOperators(
+    filterOperatorsForCategory(cat),
+    options.nullable,
+  );
+}
+
 export function filterOperatorsForCategory(
   cat: TypeCategory,
 ): FilterOperator[] {
@@ -197,13 +221,13 @@ export function filterOperatorsForCategory(
     case "datetime":
       return EXTENDED_OPS;
     case "interval":
-      return NULL_ONLY_OPS;
+      return [];
     case "boolean":
       return BOOL_OPS;
     case "binary":
-      return NULL_ONLY_OPS;
+      return [];
     case "spatial":
-      return NULL_ONLY_OPS;
+      return [];
     case "array":
       return ARRAY_OPS;
     case "other":

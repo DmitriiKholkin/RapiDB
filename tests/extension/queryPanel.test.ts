@@ -68,6 +68,26 @@ function createdPanel() {
   return vscodeMock.createWebviewPanel.mock.results[0]?.value;
 }
 
+function createEventSource<T>() {
+  const listeners = new Set<(value: T) => void>();
+
+  return {
+    event: vi.fn((listener: (value: T) => void) => {
+      listeners.add(listener);
+      return {
+        dispose: () => {
+          listeners.delete(listener);
+        },
+      };
+    }),
+    fire(value: T) {
+      for (const listener of listeners) {
+        listener(value);
+      }
+    },
+  };
+}
+
 describe("QueryPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -168,5 +188,98 @@ describe("QueryPanel", () => {
       type: "schema",
       payload: { connectionId: "conn-1", schema: [] },
     });
+  });
+
+  it("pushes incremental shared-cache schema updates and refresh reloads into the webview", async () => {
+    const schemaLoad = createEventSource<string>();
+    const refreshSchemas = createEventSource<void>();
+    const mergedSchema = [
+      {
+        database: "app_db",
+        schema: "public",
+        object: "users",
+        columns: [],
+      },
+      {
+        database: "app_db",
+        schema: "audit",
+        object: "sync_events",
+        columns: [],
+      },
+    ];
+    const refreshedSchema = [
+      ...mergedSchema,
+      {
+        database: "app_db",
+        schema: "audit",
+        object: "sync_event_archive",
+        columns: [],
+      },
+    ];
+
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+      })),
+      onDidSchemaLoad: schemaLoad.event,
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: refreshSchemas.event,
+      isConnected: vi.fn((id: string) => id === "conn-1"),
+      getSchema: vi.fn(() => mergedSchema),
+      getSchemaAsync: vi.fn(async () => refreshedSchema),
+      getConnections: vi.fn(() => [
+        { id: "conn-1", name: "Primary", type: "pg" },
+      ]),
+      getConnectedCount: vi.fn(() => 1),
+    };
+
+    const { QueryPanel } = await import(
+      "../../src/extension/panels/queryPanel"
+    );
+
+    QueryPanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      "select 1",
+    );
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected a webview panel to be created.");
+    }
+
+    panel.webview.postMessage.mockClear();
+
+    schemaLoad.fire("conn-1");
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(connectionManager.getSchema).toHaveBeenCalledWith("conn-1");
+    expect(connectionManager.getSchemaAsync).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "schema",
+      payload: { connectionId: "conn-1", schema: mergedSchema },
+    });
+
+    panel.webview.postMessage.mockClear();
+    connectionManager.getSchemaAsync.mockClear();
+
+    refreshSchemas.fire(undefined);
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(connectionManager.getSchemaAsync).toHaveBeenCalledWith("conn-1");
+    expect(panel.webview.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "schema",
+        payload: { connectionId: "conn-1", schema: refreshedSchema },
+      }),
+    );
   });
 });

@@ -112,7 +112,7 @@ describe("ConnectionProvider", () => {
       ]),
       isConnected: vi.fn(() => true),
       isConnecting: vi.fn(() => false),
-      ensureSchemaSnapshotLoading: vi.fn(),
+      ensureSchemaScopeLoading: vi.fn(),
       getSchemaSnapshotState: vi.fn(() => loadedState({ databases: [] })),
       getDriver: vi.fn(() => {
         throw new Error("ConnectionProvider should not query drivers directly");
@@ -153,7 +153,7 @@ describe("ConnectionProvider", () => {
       ]),
       isConnected: vi.fn(() => false),
       isConnecting: vi.fn(() => false),
-      ensureSchemaSnapshotLoading: vi.fn(),
+      ensureSchemaScopeLoading: vi.fn(),
       getSchemaSnapshotState: vi.fn(() => loadedState({ databases: [] })),
       getDriver: vi.fn(() => {
         throw new Error("ConnectionProvider should not query drivers directly");
@@ -195,7 +195,7 @@ describe("ConnectionProvider", () => {
       ]),
       isConnected: vi.fn((id: string) => id === "conn-1"),
       isConnecting: vi.fn(() => false),
-      ensureSchemaSnapshotLoading: vi.fn(),
+      ensureSchemaScopeLoading: vi.fn(),
       getSchemaSnapshotState: vi.fn(() =>
         loadedState({
           databases: [
@@ -272,7 +272,7 @@ describe("ConnectionProvider", () => {
       ]),
       isConnected: vi.fn((id: string) => id === "conn-1"),
       isConnecting: vi.fn(() => false),
-      ensureSchemaSnapshotLoading: vi.fn(),
+      ensureSchemaScopeLoading: vi.fn(),
       getSchemaSnapshotState: vi.fn(() =>
         loadedState({
           databases: [
@@ -330,7 +330,7 @@ describe("ConnectionProvider", () => {
       ]),
       isConnected: vi.fn((id: string) => id === "conn-1"),
       isConnecting: vi.fn(() => false),
-      ensureSchemaSnapshotLoading: vi.fn(),
+      ensureSchemaScopeLoading: vi.fn(),
       getSchemaSnapshotState: vi.fn(() =>
         loadedState({
           databases: [
@@ -401,7 +401,7 @@ describe("ConnectionProvider", () => {
       ]),
       isConnected: vi.fn((id: string) => id === "conn-1"),
       isConnecting: vi.fn(() => false),
-      ensureSchemaSnapshotLoading: vi.fn(),
+      ensureSchemaScopeLoading: vi.fn(),
       getSchemaSnapshotState: vi.fn(() => loadingState({ databases: [] })),
       getSchemaSnapshotAsync,
       getDriver: vi.fn(() => {
@@ -430,20 +430,171 @@ describe("ConnectionProvider", () => {
       contextValue: "_status",
       tooltip: "Loading schema…",
     });
-    expect(connectionManager.ensureSchemaSnapshotLoading).toHaveBeenCalledWith(
+    expect(connectionManager.ensureSchemaScopeLoading).toHaveBeenCalledWith(
       "conn-1",
+      { kind: "connectionRoot" },
     );
     expect(getSchemaSnapshotAsync).not.toHaveBeenCalled();
   });
 
-  it("renders partial snapshot databases while the remaining schema load is still in progress", async () => {
+  it("loads database scopes lazily and shows a database-level placeholder while that scope is pending", async () => {
+    const ensureSchemaScopeLoading = vi.fn();
+    const getSchemaSnapshotState = vi.fn(
+      (_connectionId: string, scope?: { kind: string; database?: string }) => {
+        if (scope?.kind === "connectionRoot") {
+          return loadedState({
+            databases: [{ name: "app_db", schemas: [] }],
+          });
+        }
+
+        if (scope?.kind === "database" && scope.database === "app_db") {
+          return loadingState({ databases: [] });
+        }
+
+        return loadedState({ databases: [] });
+      },
+    );
     const connectionManager = {
       getConnections: vi.fn(() => [
         { id: "conn-1", name: "Primary", type: "pg" },
       ]),
       isConnected: vi.fn((id: string) => id === "conn-1"),
       isConnecting: vi.fn(() => false),
-      ensureSchemaSnapshotLoading: vi.fn(),
+      ensureSchemaScopeLoading,
+      getSchemaSnapshotState,
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+
+    const roots = await provider.getChildren();
+    const databases = await provider.getChildren(roots[0]);
+    const children = await provider.getChildren(databases[0]);
+
+    expect(children).toHaveLength(1);
+    expect(children[0]).toMatchObject({
+      id: "status_loading:conn-1",
+      label: "Loading app_db…",
+      contextValue: "_status",
+      tooltip: "Loading app_db…",
+    });
+    expect(ensureSchemaScopeLoading).toHaveBeenNthCalledWith(1, "conn-1", {
+      kind: "connectionRoot",
+    });
+    expect(ensureSchemaScopeLoading).toHaveBeenNthCalledWith(2, "conn-1", {
+      kind: "database",
+      database: "app_db",
+    });
+  });
+
+  it("loads schema scopes lazily and shows a schema-level placeholder while that scope is pending", async () => {
+    const ensureSchemaScopeLoading = vi.fn();
+    const getSchemaSnapshotState = vi.fn(
+      (
+        _connectionId: string,
+        scope?: { kind: string; database?: string; schema?: string },
+      ) => {
+        if (scope?.kind === "connectionRoot") {
+          return loadedState({
+            databases: [{ name: "app_db", schemas: [] }],
+          });
+        }
+
+        if (scope?.kind === "database" && scope.database === "app_db") {
+          return loadedState({
+            databases: [
+              {
+                name: "app_db",
+                schemas: [
+                  { name: "public", objects: [] },
+                  { name: "audit", objects: [] },
+                ],
+              },
+            ],
+          });
+        }
+
+        if (
+          scope?.kind === "schema" &&
+          scope.database === "app_db" &&
+          scope.schema === "public"
+        ) {
+          return loadingState({ databases: [] });
+        }
+
+        return loadedState({ databases: [] });
+      },
+    );
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-1", name: "Primary", type: "pg" },
+      ]),
+      isConnected: vi.fn((id: string) => id === "conn-1"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading,
+      getSchemaSnapshotState,
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+
+    const roots = await provider.getChildren();
+    const databases = await provider.getChildren(roots[0]);
+    const schemas = await provider.getChildren(databases[0]);
+    const children = await provider.getChildren(schemas[0]);
+
+    expect(schemas.map((node) => node.label)).toEqual(["public", "audit"]);
+    expect(children).toHaveLength(1);
+    expect(children[0]).toMatchObject({
+      id: "status_loading:conn-1",
+      label: "Loading public…",
+      contextValue: "_status",
+      tooltip: "Loading public…",
+    });
+    expect(ensureSchemaScopeLoading).toHaveBeenNthCalledWith(1, "conn-1", {
+      kind: "connectionRoot",
+    });
+    expect(ensureSchemaScopeLoading).toHaveBeenNthCalledWith(2, "conn-1", {
+      kind: "database",
+      database: "app_db",
+    });
+    expect(ensureSchemaScopeLoading).toHaveBeenNthCalledWith(3, "conn-1", {
+      kind: "schema",
+      database: "app_db",
+      schema: "public",
+    });
+  });
+
+  it("does not append a trailing loading node when a level already has visible children", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-1", name: "Primary", type: "pg" },
+      ]),
+      isConnected: vi.fn((id: string) => id === "conn-1"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
       getSchemaSnapshotState: vi.fn(() =>
         loadingState(
           {
@@ -480,10 +631,7 @@ describe("ConnectionProvider", () => {
 
     const roots = await provider.getChildren();
     const connectionChildren = await provider.getChildren(roots[0]);
-    expect(connectionChildren.map((node) => node.label)).toEqual([
-      "app_db",
-      "Loading schema…",
-    ]);
+    expect(connectionChildren.map((node) => node.label)).toEqual(["app_db"]);
 
     const categories = await provider.getChildren(connectionChildren[0]);
     expect(
@@ -509,7 +657,7 @@ describe("ConnectionProvider", () => {
       ]),
       isConnected: vi.fn((id: string) => id === "conn-1"),
       isConnecting: vi.fn(() => false),
-      ensureSchemaSnapshotLoading: vi.fn(),
+      ensureSchemaScopeLoading: vi.fn(),
       getSchemaSnapshotState: vi.fn(() => errorState("Snapshot failed")),
       getDriver: vi.fn(() => {
         throw new Error("ConnectionProvider should not query drivers directly");

@@ -22,7 +22,7 @@ const columns: ColumnTypeMeta[] = [
     isAutoIncrement: true,
     category: "integer",
     filterable: true,
-    filterOperators: ["eq", "gt", "lt", "is_null", "is_not_null"],
+    filterOperators: ["eq", "gt", "lt"],
     valueSemantics: "plain",
   },
   {
@@ -35,7 +35,7 @@ const columns: ColumnTypeMeta[] = [
     isAutoIncrement: false,
     category: "text",
     filterable: true,
-    filterOperators: ["eq", "like", "is_null", "is_not_null"],
+    filterOperators: ["eq", "like"],
     valueSemantics: "plain",
   },
   {
@@ -48,7 +48,7 @@ const columns: ColumnTypeMeta[] = [
     isAutoIncrement: false,
     category: "decimal",
     filterable: true,
-    filterOperators: ["eq", "between", "is_null", "is_not_null"],
+    filterOperators: ["eq", "between"],
     valueSemantics: "plain",
   },
   {
@@ -80,7 +80,7 @@ const compositePrimaryKeyColumns: ColumnTypeMeta[] = [
     isAutoIncrement: false,
     category: "integer",
     filterable: true,
-    filterOperators: ["eq", "gt", "lt", "is_null", "is_not_null"],
+    filterOperators: ["eq", "gt", "lt"],
     valueSemantics: "plain",
   },
   {
@@ -94,7 +94,7 @@ const compositePrimaryKeyColumns: ColumnTypeMeta[] = [
     isAutoIncrement: false,
     category: "integer",
     filterable: true,
-    filterOperators: ["eq", "gt", "lt", "is_null", "is_not_null"],
+    filterOperators: ["eq", "gt", "lt"],
     valueSemantics: "plain",
   },
   {
@@ -107,7 +107,7 @@ const compositePrimaryKeyColumns: ColumnTypeMeta[] = [
     isAutoIncrement: false,
     category: "text",
     filterable: true,
-    filterOperators: ["eq", "like", "is_null", "is_not_null"],
+    filterOperators: ["eq", "like"],
     valueSemantics: "plain",
   },
 ];
@@ -188,6 +188,44 @@ describe("table helpers", () => {
       "WHERE display_name like $1 AND amount BETWEEN $2 AND $3",
     );
     expect(result.params).toEqual(["Alpha", "10", "20"]);
+  });
+
+  it("rejects forged null-only filters when a column policy excludes them", () => {
+    const nonNullableColumns: ColumnTypeMeta[] = [
+      {
+        name: "display_name",
+        type: "TEXT",
+        nativeType: "TEXT",
+        nullable: false,
+        isPrimaryKey: false,
+        isForeignKey: false,
+        isAutoIncrement: false,
+        category: "text",
+        filterable: true,
+        filterOperators: ["eq", "like"],
+        valueSemantics: "plain",
+      },
+    ];
+
+    expect(() =>
+      buildWhere(
+        fakeDriver,
+        [{ column: "display_name", operator: "is_null" }],
+        nonNullableColumns,
+      ),
+    ).toThrow(
+      "[RapiDB Filter] Column display_name does not support is_null filters.",
+    );
+
+    expect(() =>
+      buildWhere(
+        fakeDriver,
+        [{ column: "display_name", operator: "is_not_null" }],
+        nonNullableColumns,
+      ),
+    ).toThrow(
+      "[RapiDB Filter] Column display_name does not support is_not_null filters.",
+    );
   });
 
   it("builds an insert operation including explicit key and identity values", () => {
@@ -378,7 +416,7 @@ describe("table helpers", () => {
         isAutoIncrement: false,
         category: "integer",
         filterable: true,
-        filterOperators: ["eq", "is_null", "is_not_null"],
+        filterOperators: ["eq"],
         valueSemantics: "plain",
       },
       {

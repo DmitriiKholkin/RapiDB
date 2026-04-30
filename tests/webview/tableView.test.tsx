@@ -171,6 +171,19 @@ const operatorVisibilityColumns: ColumnTypeMeta[] = [
     valueSemantics: "plain",
   },
   {
+    name: "title",
+    type: "TEXT",
+    nativeType: "TEXT",
+    nullable: false,
+    isPrimaryKey: false,
+    isForeignKey: false,
+    isAutoIncrement: false,
+    category: "text",
+    filterable: true,
+    filterOperators: ["eq", "like"],
+    valueSemantics: "plain",
+  },
+  {
     name: "geom",
     type: "GEOMETRY",
     nativeType: "GEOMETRY",
@@ -222,6 +235,58 @@ afterEach(() => {
 });
 
 describe("TableView", () => {
+  it("shows only a fullscreen loader until the first dataset is committed", async () => {
+    renderTableView();
+
+    expect(
+      screen.getByRole("status", { name: "Loading data..." }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("table")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Add Row" })).toBeNull();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({
+          page: 1,
+          pageSize: 25,
+          filters: [],
+          sort: null,
+        }),
+      });
+    });
+
+    expect(
+      screen.getByRole("status", { name: "Loading data..." }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("table")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Add Row" })).toBeNull();
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("table")).toBeTruthy();
+    });
+
+    expect(
+      screen.queryByRole("status", { name: "Loading data..." }),
+    ).toBeNull();
+    expect(screen.getByRole("button", { name: "Add Row" })).toBeTruthy();
+  });
+
   it("preserves repeated spaces in rendered text cells", async () => {
     renderTableView();
 
@@ -308,6 +373,13 @@ describe("TableView", () => {
       payload: expect.objectContaining({ page: 2, pageSize: 25 }),
     });
 
+    expect(
+      screen.getByRole("status", { name: "Loading data..." }),
+    ).toBeTruthy();
+    expect(screen.getByText("51 rows total")).toBeTruthy();
+    expect(screen.getByText("Page 1 of 3")).toBeTruthy();
+    expect(screen.getByText("Alice")).toBeTruthy();
+
     const nextPageFetch = lastFetchPayload();
 
     await act(async () => {
@@ -316,6 +388,10 @@ describe("TableView", () => {
         rows,
         totalCount: 51,
       });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Page 2 of 3")).toBeTruthy();
     });
 
     clearPostedMessages();
@@ -338,6 +414,13 @@ describe("TableView", () => {
       }),
     });
 
+    expect(
+      screen.getByRole("status", { name: "Loading data..." }),
+    ).toBeTruthy();
+    expect(screen.getByText("51 rows total")).toBeTruthy();
+    expect(screen.getByText("Page 2 of 3")).toBeTruthy();
+    expect(screen.getByText("Alice")).toBeTruthy();
+
     const filteredFetch = lastFetchPayload();
 
     await act(async () => {
@@ -349,10 +432,221 @@ describe("TableView", () => {
     });
 
     expect(screen.getByText(/Bad filter expression/)).toBeTruthy();
+    expect(screen.getByText("51 rows total")).toBeTruthy();
+    expect(screen.getByText("Page 2 of 3")).toBeTruthy();
+    expect(screen.getByText("Alice")).toBeTruthy();
+    expect(
+      screen.queryByRole("status", { name: "Loading data..." }),
+    ).toBeNull();
 
     fireEvent.click(screen.getByTitle("Dismiss"));
 
     expect(screen.queryByText("Bad filter expression")).toBeNull();
+  });
+
+  it("preserves committed rows when a refetch fails with a read error", async () => {
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({
+          page: 1,
+          pageSize: 25,
+          filters: [],
+          sort: null,
+        }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows,
+        totalCount: 51,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Page 1 of 3")).toBeTruthy();
+    });
+
+    clearPostedMessages();
+
+    fireEvent.click(screen.getByRole("button", { name: "Next →" }));
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 2, pageSize: 25 }),
+      });
+    });
+
+    expect(
+      screen.getByRole("status", { name: "Loading data..." }),
+    ).toBeTruthy();
+    expect(screen.getByText("51 rows total")).toBeTruthy();
+    expect(screen.getByText("Page 1 of 3")).toBeTruthy();
+    expect(screen.getByText("Alice")).toBeTruthy();
+
+    const nextPageFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableError", {
+        fetchId: nextPageFetch.fetchId,
+        error: "Read failed",
+      });
+    });
+
+    expect(screen.getByText("Read failed")).toBeTruthy();
+    expect(screen.getByText("51 rows total")).toBeTruthy();
+    expect(screen.getByText("Page 1 of 3")).toBeTruthy();
+    expect(screen.getByText("Alice")).toBeTruthy();
+    expect(
+      screen.queryByRole("status", { name: "Loading data..." }),
+    ).toBeNull();
+
+    fireEvent.click(screen.getByTitle("Dismiss"));
+
+    expect(screen.queryByText("Read failed")).toBeNull();
+  });
+
+  it("resets page, sort, and filters when a new table is initialized", async () => {
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({
+          page: 1,
+          pageSize: 25,
+          filters: [],
+          sort: null,
+        }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows,
+        totalCount: 51,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("table")).toBeTruthy();
+    });
+
+    clearPostedMessages();
+
+    fireEvent.click(screen.getByText("id"));
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({
+          page: 1,
+          sort: { column: "id", direction: "asc" },
+        }),
+      });
+    });
+
+    const sortedFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: sortedFetch.fetchId,
+        rows,
+        totalCount: 51,
+      });
+    });
+
+    fireEvent.change(screen.getByLabelText("Rows per page"), {
+      target: { value: "100" },
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({
+          page: 1,
+          pageSize: 100,
+          sort: { column: "id", direction: "asc" },
+        }),
+      });
+    });
+
+    const resizedFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: resizedFetch.fetchId,
+        rows,
+        totalCount: 51,
+      });
+    });
+
+    fireEvent.change(screen.getByLabelText("name filter value"), {
+      target: { value: "ali" },
+    });
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 450));
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({
+          page: 1,
+          filters: [{ column: "name", operator: "like", value: "ali" }],
+          sort: { column: "id", direction: "asc" },
+        }),
+      });
+    });
+
+    clearPostedMessages();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableInit", {
+        columns: noPkColumns,
+        primaryKeyColumns: [],
+      });
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("status", { name: "Loading data..." }),
+      ).toBeTruthy();
+      expect(screen.queryByRole("table")).toBeNull();
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({
+          page: 1,
+          pageSize: 25,
+          filters: [],
+          sort: null,
+        }),
+      });
+    });
   });
 
   it("treats reopened NULL cell as empty unless NULL is clicked again", async () => {
@@ -1291,6 +1585,22 @@ describe("TableView", () => {
       });
     });
 
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows: [],
+        totalCount: 0,
+      });
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: "tags filter operator" }),
+      ).toBeTruthy();
+    });
+
     fireEvent.click(
       screen.getByRole("button", { name: "tags filter operator" }),
     );
@@ -1312,6 +1622,28 @@ describe("TableView", () => {
     ).toBeTruthy();
     expect(
       within(tagsMenu).queryByRole("menuitemradio", { name: /Greater than/i }),
+    ).toBeNull();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "title filter operator" }),
+    );
+
+    const titleMenu = screen.getByRole("menu", {
+      name: "title filter operators",
+    });
+    expect(
+      within(titleMenu).getByRole("menuitemradio", { name: /Equals/i }),
+    ).toBeTruthy();
+    expect(
+      within(titleMenu).getByRole("menuitemradio", { name: /Contains/i }),
+    ).toBeTruthy();
+    expect(
+      within(titleMenu).queryByRole("menuitemradio", { name: /Is NULL/i }),
+    ).toBeNull();
+    expect(
+      within(titleMenu).queryByRole("menuitemradio", {
+        name: /Is NOT NULL/i,
+      }),
     ).toBeNull();
 
     fireEvent.click(

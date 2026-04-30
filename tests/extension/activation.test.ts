@@ -55,6 +55,10 @@ describe("extension activation", () => {
       onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      markSchemaScopeExpanded: vi.fn(),
+      markSchemaScopeCollapsed: vi.fn(),
+      ensureSchemaScopeLoading: vi.fn(),
+      refreshSchemaCache: vi.fn(),
       isConnected: vi.fn(() => false),
       isConnecting: vi.fn(() => false),
       getConnection: vi.fn(() => ({ id: "conn-1", name: "Primary" })),
@@ -152,6 +156,112 @@ describe("extension activation", () => {
       vscodeState.registerCommand.mock.calls.map(([command]) => command),
     ).toEqual(expectedCommands);
     expect(connectionProviderInstances).toHaveLength(1);
+  });
+
+  it("tracks explorer expand and collapse events with durable schema scopes", async () => {
+    const extension = await import("../../src/extension/extension");
+    const context = { subscriptions: [] as Array<{ dispose(): void }> };
+
+    extension.activate(context as never);
+
+    const explorerView = vscodeState.treeViews.find(
+      (treeView) => treeView.id === "rapidb-explorer",
+    );
+    if (!explorerView) {
+      throw new Error("Explorer tree view was not created.");
+    }
+
+    explorerView.fireDidExpandElement({
+      kind: "connectionNode_connected",
+      connectionId: "conn-1",
+    });
+    explorerView.fireDidExpandElement({
+      kind: "database",
+      connectionId: "conn-1",
+      database: "app_db",
+    });
+    explorerView.fireDidExpandElement({
+      kind: "schema",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+    });
+    explorerView.fireDidExpandElement({
+      kind: "table",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+      objectName: "users",
+    });
+
+    expect(
+      connectionManagerInstance.markSchemaScopeExpanded,
+    ).toHaveBeenCalledTimes(3);
+    expect(
+      connectionManagerInstance.markSchemaScopeExpanded,
+    ).toHaveBeenNthCalledWith(1, "conn-1", { kind: "connectionRoot" });
+    expect(
+      connectionManagerInstance.markSchemaScopeExpanded,
+    ).toHaveBeenNthCalledWith(2, "conn-1", {
+      kind: "database",
+      database: "app_db",
+    });
+    expect(
+      connectionManagerInstance.markSchemaScopeExpanded,
+    ).toHaveBeenNthCalledWith(3, "conn-1", {
+      kind: "schema",
+      database: "app_db",
+      schema: "public",
+    });
+    expect(
+      connectionManagerInstance.ensureSchemaScopeLoading,
+    ).toHaveBeenCalledTimes(3);
+    expect(
+      connectionManagerInstance.ensureSchemaScopeLoading,
+    ).toHaveBeenNthCalledWith(1, "conn-1", { kind: "connectionRoot" });
+    expect(
+      connectionManagerInstance.ensureSchemaScopeLoading,
+    ).toHaveBeenNthCalledWith(2, "conn-1", {
+      kind: "database",
+      database: "app_db",
+    });
+    expect(
+      connectionManagerInstance.ensureSchemaScopeLoading,
+    ).toHaveBeenNthCalledWith(3, "conn-1", {
+      kind: "schema",
+      database: "app_db",
+      schema: "public",
+    });
+
+    explorerView.fireDidCollapseElement({
+      kind: "database",
+      connectionId: "conn-1",
+      database: "app_db",
+    });
+    explorerView.fireDidCollapseElement({
+      kind: "connectionNode_connected",
+      connectionId: "conn-1",
+    });
+    explorerView.fireDidCollapseElement({
+      kind: "table",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+      objectName: "users",
+    });
+
+    expect(
+      connectionManagerInstance.markSchemaScopeCollapsed,
+    ).toHaveBeenCalledTimes(2);
+    expect(
+      connectionManagerInstance.markSchemaScopeCollapsed,
+    ).toHaveBeenNthCalledWith(1, "conn-1", {
+      kind: "database",
+      database: "app_db",
+    });
+    expect(
+      connectionManagerInstance.markSchemaScopeCollapsed,
+    ).toHaveBeenNthCalledWith(2, "conn-1", { kind: "connectionRoot" });
   });
 
   it("invokes the add-connection command and refreshes the explorer when a connection is saved", async () => {

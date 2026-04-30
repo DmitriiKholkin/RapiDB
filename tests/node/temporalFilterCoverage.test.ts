@@ -8,11 +8,14 @@ import type {
   ColumnTypeMeta,
   FilterOperator,
 } from "../../src/extension/dbDrivers/types";
-import { filterOperatorsForCategory } from "../../src/extension/dbDrivers/types";
+import {
+  filterOperatorsForCategory,
+  resolveFilterOperators,
+} from "../../src/extension/dbDrivers/types";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 import { defaultFilterOperator } from "../../src/shared/tableTypes";
 
-const expandedTemporalOperators: FilterOperator[] = [
+const scalarTemporalOperators: FilterOperator[] = [
   "eq",
   "neq",
   "gt",
@@ -21,6 +24,10 @@ const expandedTemporalOperators: FilterOperator[] = [
   "lte",
   "between",
   "in",
+];
+
+const expandedTemporalOperators: FilterOperator[] = [
+  ...scalarTemporalOperators,
   "is_null",
   "is_not_null",
 ];
@@ -42,7 +49,10 @@ function column(
     isForeignKey: false,
     isAutoIncrement: false,
     filterable: true,
-    filterOperators: filterOperatorsForCategory(category),
+    filterOperators: resolveFilterOperators(category, {
+      filterable: true,
+      nullable: true,
+    }),
     valueSemantics: "plain",
   };
 }
@@ -58,16 +68,67 @@ const baseConfig = {
 };
 
 describe("temporal filter operator coverage", () => {
-  it("exposes numeric-like operators for date, time, and datetime categories", () => {
-    expect(filterOperatorsForCategory("date")).toEqual(
-      expandedTemporalOperators,
-    );
-    expect(filterOperatorsForCategory("time")).toEqual(
-      expandedTemporalOperators,
-    );
+  it("exposes scalar operators by category and adds null operators only for nullable columns", () => {
+    expect(filterOperatorsForCategory("date")).toEqual(scalarTemporalOperators);
+    expect(filterOperatorsForCategory("time")).toEqual(scalarTemporalOperators);
     expect(filterOperatorsForCategory("datetime")).toEqual(
-      expandedTemporalOperators,
+      scalarTemporalOperators,
     );
+    expect(
+      resolveFilterOperators("date", { filterable: true, nullable: true }),
+    ).toEqual(expandedTemporalOperators);
+    expect(
+      resolveFilterOperators("time", { filterable: true, nullable: true }),
+    ).toEqual(expandedTemporalOperators);
+    expect(
+      resolveFilterOperators("datetime", {
+        filterable: true,
+        nullable: true,
+      }),
+    ).toEqual(expandedTemporalOperators);
+    expect(
+      resolveFilterOperators("datetime", {
+        filterable: true,
+        nullable: false,
+      }),
+    ).toEqual(scalarTemporalOperators);
+  });
+
+  it("describes SQLite explicit temporal columns with nullable-aware scalar operators", async () => {
+    const driver = new SQLiteDriver({
+      ...baseConfig,
+      type: "sqlite",
+      filePath: ":memory:",
+    } as ConnectionConfig);
+
+    await driver.connect();
+
+    try {
+      await driver.query(
+        "CREATE TABLE temporal_probe (event_time TIME NOT NULL, created_at DATETIME)",
+      );
+
+      const describedColumns = await driver.describeColumns(
+        "main",
+        "",
+        "temporal_probe",
+      );
+      const eventTimeColumn = describedColumns.find(
+        (describedColumn) => describedColumn.name === "event_time",
+      );
+      const createdAtColumn = describedColumns.find(
+        (describedColumn) => describedColumn.name === "created_at",
+      );
+
+      expect(eventTimeColumn?.category).toBe("time");
+      expect(eventTimeColumn?.filterOperators).toEqual(scalarTemporalOperators);
+      expect(createdAtColumn?.category).toBe("datetime");
+      expect(createdAtColumn?.filterOperators).toEqual(
+        expandedTemporalOperators,
+      );
+    } finally {
+      await driver.disconnect();
+    }
   });
 
   it("uses eq as the default operator for date, time, and datetime columns", () => {

@@ -678,20 +678,9 @@ export class SQLiteDriver extends BaseDBDriver {
     table: string,
   ): Promise<ColumnTypeMeta[]> {
     const metadata = this.readTableMetadata(table);
-    return metadata.rows.map((row) => {
-      const column = this.enrichColumn(this.toColumnMeta(row, metadata));
-      const declaredType = sqliteDeclaredTypeBase(row.type);
-      const isExplicitTemporal =
-        declaredType === "TIME" ||
-        declaredType === "DATETIME" ||
-        declaredType === "TIMESTAMP";
-      return {
-        ...column,
-        filterOperators: isExplicitTemporal
-          ? ["eq", "neq", "between", "like", "is_null", "is_not_null"]
-          : column.filterOperators,
-      };
-    });
+    return metadata.rows.map((row) =>
+      this.enrichColumn(this.toColumnMeta(row, metadata)),
+    );
   }
   async query(sql: string, params?: unknown[]): Promise<QueryResult> {
     const start = Date.now();

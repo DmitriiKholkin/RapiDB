@@ -38,6 +38,20 @@ export interface MockWebviewPanel {
   readonly dispose: () => void;
 }
 
+export interface MockTreeView<T = unknown> {
+  id: string;
+  badge: unknown;
+  dispose: ReturnType<typeof vi.fn>;
+  onDidExpandElement(listener: (event: { element: T }) => void): {
+    dispose(): void;
+  };
+  onDidCollapseElement(listener: (event: { element: T }) => void): {
+    dispose(): void;
+  };
+  fireDidExpandElement(element: T): void;
+  fireDidCollapseElement(element: T): void;
+}
+
 export interface MockVscodeState {
   registerCommand: ReturnType<typeof vi.fn>;
   createTreeView: ReturnType<typeof vi.fn>;
@@ -48,6 +62,7 @@ export interface MockVscodeState {
   writeClipboard: ReturnType<typeof vi.fn>;
   createWebviewPanel: ReturnType<typeof vi.fn>;
   panels: MockWebviewPanel[];
+  treeViews: MockTreeView[];
 }
 
 function createMockWebview(): MockWebview {
@@ -99,6 +114,7 @@ export function createMockVscodeModule(): {
   state: MockVscodeState;
 } {
   const panels: MockWebviewPanel[] = [];
+  const treeViews: MockTreeView[] = [];
 
   const state: MockVscodeState = {
     registerCommand: vi.fn(
@@ -108,11 +124,53 @@ export function createMockVscodeModule(): {
         dispose: vi.fn(),
       }),
     ),
-    createTreeView: vi.fn((id: string) => ({
-      id,
-      badge: undefined,
-      dispose: vi.fn(),
-    })),
+    createTreeView: vi.fn((id: string) => {
+      const expandListeners = new Set<(event: { element: unknown }) => void>();
+      const collapseListeners = new Set<
+        (event: { element: unknown }) => void
+      >();
+      const treeView: MockTreeView = {
+        id,
+        badge: undefined,
+        dispose: vi.fn(),
+        onDidExpandElement(listener) {
+          expandListeners.add(
+            listener as (event: { element: unknown }) => void,
+          );
+          return {
+            dispose: () => {
+              expandListeners.delete(
+                listener as (event: { element: unknown }) => void,
+              );
+            },
+          };
+        },
+        onDidCollapseElement(listener) {
+          collapseListeners.add(
+            listener as (event: { element: unknown }) => void,
+          );
+          return {
+            dispose: () => {
+              collapseListeners.delete(
+                listener as (event: { element: unknown }) => void,
+              );
+            },
+          };
+        },
+        fireDidExpandElement(element) {
+          for (const listener of expandListeners) {
+            listener({ element });
+          }
+        },
+        fireDidCollapseElement(element) {
+          for (const listener of collapseListeners) {
+            listener({ element });
+          }
+        },
+      };
+      treeViews.push(treeView);
+      return treeView;
+    }),
     showInformationMessage: vi.fn(),
     showWarningMessage: vi.fn(),
     showErrorMessage: vi.fn(),
@@ -126,6 +184,7 @@ export function createMockVscodeModule(): {
       return panel;
     }),
     panels,
+    treeViews,
   };
 
   return {

@@ -169,4 +169,61 @@ describe("QueryPanelController", () => {
     expect(exportQueryResultsAsCsv).not.toHaveBeenCalled();
     expect(exportQueryResultsAsJson).not.toHaveBeenCalled();
   });
+
+  it("pushes merged cached schema only for the active or initial connection when schema loads", async () => {
+    const getSchema = vi.fn((connectionId: string) => [
+      {
+        database: "app_db",
+        schema: connectionId === "conn-1" ? "public" : "audit",
+        object: connectionId === "conn-1" ? "users" : "events",
+        columns: [],
+      },
+    ]);
+    const connectionManager = {
+      getSchema,
+    };
+
+    const view = {
+      getActiveConnectionId: vi.fn(() => "conn-2"),
+      getInitialConnectionId: vi.fn(() => "conn-1"),
+      getLastQueryResult: vi.fn(() => null),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+
+    await controller.handleSchemaLoaded("conn-1");
+
+    expect(getSchema).toHaveBeenCalledWith("conn-1");
+    expect(view.postMessage).toHaveBeenCalledWith({
+      type: "schema",
+      payload: {
+        connectionId: "conn-1",
+        schema: [
+          {
+            database: "app_db",
+            schema: "public",
+            object: "users",
+            columns: [],
+          },
+        ],
+      },
+    });
+
+    view.postMessage.mockClear();
+
+    await controller.handleSchemaLoaded("conn-3");
+
+    expect(getSchema).toHaveBeenCalledTimes(1);
+    expect(view.postMessage).not.toHaveBeenCalled();
+  });
 });

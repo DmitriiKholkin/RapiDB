@@ -56,6 +56,31 @@ function createDeferred<T>(): Deferred<T> {
   };
 }
 
+async function waitForSchemaCondition(
+  manager: {
+    onDidSchemaLoad(listener: (connectionId: string) => void): {
+      dispose(): void;
+    };
+  },
+  connectionId: string,
+  predicate: () => boolean,
+): Promise<void> {
+  if (predicate()) {
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    const subscription = manager.onDidSchemaLoad((loadedConnectionId) => {
+      if (loadedConnectionId !== connectionId || !predicate()) {
+        return;
+      }
+
+      subscription.dispose();
+      resolve();
+    });
+  });
+}
+
 class FakeDriver implements IDBDriver {
   connectCalls = 0;
   disconnectCalls = 0;
@@ -419,7 +444,7 @@ describe("ConnectionManager", () => {
     expect(driverInstances[0]?.disconnectCalls).toBe(1);
   });
 
-  it("loads schema cache across all databases but only fetches columns for the configured database", async () => {
+  it("loads the baseline database and leaves other databases catalog-only until expanded", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
     );
@@ -526,18 +551,7 @@ describe("ConnectionManager", () => {
           }),
           expect.objectContaining({
             name: "archive_db",
-            schemas: expect.arrayContaining([
-              expect.objectContaining({
-                name: "public",
-                objects: expect.arrayContaining([
-                  expect.objectContaining({
-                    name: "users_archive",
-                    type: "table",
-                    columns: [],
-                  }),
-                ]),
-              }),
-            ]),
+            schemas: [],
           }),
         ]),
       }),
@@ -551,20 +565,9 @@ describe("ConnectionManager", () => {
           object: "users",
           columns: [{ name: "id", type: "int" }],
         }),
-        expect.objectContaining({
-          database: "archive_db",
-          schema: "public",
-          object: "users_archive",
-          columns: [],
-        }),
-        expect.objectContaining({
-          database: "archive_db",
-          schema: "public",
-          object: "summarize_archive",
-          columns: [],
-        }),
       ]),
     );
+    expect(schema).toHaveLength(4);
 
     expect(driverInstances[0]?.describeTableCalls).toEqual([
       "app_db.public.users",
@@ -840,13 +843,14 @@ describe("ConnectionManager", () => {
     });
   });
 
-  it("returns the final schema snapshot from getSchemaSnapshotAsync after partial progress", async () => {
+  it("awaits only the baseline root/default load in getSchemaSnapshotAsync", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
     );
 
-    const archiveSchemas = createDeferred<SchemaInfo[]>();
-    const sawPartialState = createDeferred<void>();
+    const archiveSchemas = vi.fn(
+      async (): Promise<SchemaInfo[]> => [{ name: "public" }],
+    );
 
     driverBehaviors.set("conn-1", {
       listDatabases: [
@@ -855,7 +859,7 @@ describe("ConnectionManager", () => {
       ],
       listSchemasImpl: (database) => {
         if (database === "archive_db") {
-          return archiveSchemas.promise;
+          return archiveSchemas();
         }
 
         return [{ name: "public" }];
@@ -894,6 +898,7 @@ describe("ConnectionManager", () => {
         id: "conn-1",
         name: "Primary",
         type: "pg",
+        database: "app_db",
       },
     ]);
 
@@ -903,52 +908,7 @@ describe("ConnectionManager", () => {
     );
     await manager.connectTo("conn-1");
 
-    const subscription = manager.onDidChangeSchemaState((connectionId) => {
-      if (connectionId !== "conn-1") {
-        return;
-      }
-
-      const state = manager.getSchemaSnapshotState("conn-1");
-      if (
-        state.status === "loading" &&
-        state.isPartial &&
-        state.snapshot.databases.length === 1
-      ) {
-        sawPartialState.resolve();
-      }
-    });
-
-    const snapshotPromise = manager.getSchemaSnapshotAsync("conn-1");
-
-    await sawPartialState.promise;
-
-    expect(manager.getSchemaSnapshotState("conn-1")).toEqual({
-      snapshot: {
-        databases: [
-          {
-            name: "app_db",
-            schemas: [
-              {
-                name: "public",
-                objects: [
-                  {
-                    name: "users",
-                    type: "table",
-                    columns: [{ name: "id", type: "int" }],
-                  },
-                ],
-              },
-            ],
-          },
-        ],
-      },
-      status: "loading",
-      isPartial: true,
-    });
-
-    archiveSchemas.resolve([{ name: "public" }]);
-
-    await expect(snapshotPromise).resolves.toEqual({
+    await expect(manager.getSchemaSnapshotAsync("conn-1")).resolves.toEqual({
       databases: [
         {
           name: "app_db",
@@ -967,27 +927,726 @@ describe("ConnectionManager", () => {
         },
         {
           name: "archive_db",
-          schemas: [
-            {
-              name: "public",
-              objects: [
-                {
-                  name: "users_archive",
-                  type: "table",
-                  columns: [],
-                },
-              ],
-            },
-          ],
+          schemas: [],
         },
       ],
     });
-    expect(manager.getSchemaSnapshotState("conn-1")).toMatchObject({
+    expect(manager.getSchema("conn-1")).toEqual([
+      {
+        database: "app_db",
+        schema: "public",
+        object: "users",
+        type: "table",
+        columns: [{ name: "id", type: "int" }],
+      },
+    ]);
+    expect(archiveSchemas).not.toHaveBeenCalled();
+  });
+
+  it("keeps the connection-root tree state loaded once the database catalog is available even if baseline loading is still pending", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const appSchemas = createDeferred<SchemaInfo[]>();
+
+    driverBehaviors.set("conn-1", {
+      listDatabases: [
+        { name: "app_db", schemas: [] },
+        { name: "archive_db", schemas: [] },
+      ],
+      listSchemasImpl: (database) => {
+        if (database === "app_db") {
+          return appSchemas.promise;
+        }
+
+        return [{ name: "public" }];
+      },
+      listObjectsByScope: {
+        "app_db.public": [{ schema: "public", name: "users", type: "table" }],
+      },
+      describeTableByScope: {
+        "app_db.public.users": [
+          {
+            name: "id",
+            type: "int",
+            nullable: false,
+            isPrimaryKey: false,
+            isForeignKey: false,
+          },
+        ],
+      },
+    });
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        database: "app_db",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo("conn-1");
+
+    manager.ensureSchemaScopeLoading("conn-1", { kind: "connectionRoot" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(
+      manager.getSchemaSnapshotState("conn-1", { kind: "connectionRoot" }),
+    ).toEqual({
+      snapshot: {
+        databases: [
+          { name: "app_db", schemas: [] },
+          { name: "archive_db", schemas: [] },
+        ],
+      },
       status: "loaded",
       isPartial: false,
     });
+    expect(manager.getSchemaSnapshotState("conn-1")).toMatchObject({
+      status: "loading",
+    });
 
-    subscription.dispose();
+    appSchemas.resolve([{ name: "public" }]);
+    await waitForSchemaCondition(
+      manager,
+      "conn-1",
+      () => manager.getSchemaSnapshotState("conn-1").status === "loaded",
+    );
+  });
+
+  it("deduplicates expanded database and schema scope loads", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const listSchemasCalls: string[] = [];
+    const listObjectsCalls: string[] = [];
+
+    driverBehaviors.set("conn-1", {
+      listDatabases: [
+        { name: "app_db", schemas: [] },
+        { name: "archive_db", schemas: [] },
+      ],
+      listSchemasImpl: (database) => {
+        listSchemasCalls.push(database);
+        if (database === "archive_db") {
+          return [{ name: "public" }, { name: "audit" }];
+        }
+
+        return [{ name: "public" }];
+      },
+      listObjectsImpl: (database, schema) => {
+        listObjectsCalls.push(`${database}.${schema}`);
+        if (database === "archive_db" && schema === "audit") {
+          return [{ schema: "audit", name: "audit_log", type: "table" }];
+        }
+
+        if (database === "app_db" && schema === "public") {
+          return [{ schema: "public", name: "users", type: "table" }];
+        }
+
+        return [];
+      },
+      describeTableByScope: {
+        "app_db.public.users": [
+          {
+            name: "id",
+            type: "int",
+            nullable: false,
+            isPrimaryKey: false,
+            isForeignKey: false,
+          },
+        ],
+        "archive_db.audit.audit_log": [
+          {
+            name: "event_id",
+            type: "bigint",
+            nullable: false,
+            isPrimaryKey: false,
+            isForeignKey: false,
+          },
+        ],
+      },
+    });
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        database: "app_db",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo("conn-1");
+    await manager.getSchemaSnapshotAsync("conn-1");
+
+    listSchemasCalls.length = 0;
+    listObjectsCalls.length = 0;
+
+    manager.ensureSchemaScopeLoading("conn-1", {
+      kind: "database",
+      database: "archive_db",
+    });
+    manager.ensureSchemaScopeLoading("conn-1", {
+      kind: "database",
+      database: "archive_db",
+    });
+
+    await waitForSchemaCondition(
+      manager,
+      "conn-1",
+      () =>
+        manager.getSchemaSnapshotState("conn-1", {
+          kind: "database",
+          database: "archive_db",
+        }).status === "loaded",
+    );
+
+    expect(listSchemasCalls).toEqual(["archive_db"]);
+    expect(listObjectsCalls).toEqual([]);
+
+    manager.ensureSchemaScopeLoading("conn-1", {
+      kind: "schema",
+      database: "archive_db",
+      schema: "audit",
+    });
+    manager.ensureSchemaScopeLoading("conn-1", {
+      kind: "schema",
+      database: "archive_db",
+      schema: "audit",
+    });
+
+    await waitForSchemaCondition(manager, "conn-1", () =>
+      manager
+        .getSchema("conn-1")
+        .some((entry) => entry.database === "archive_db"),
+    );
+
+    expect(listObjectsCalls).toEqual(["archive_db.audit"]);
+    expect(manager.getSchema("conn-1")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          database: "archive_db",
+          schema: "audit",
+          object: "audit_log",
+          columns: [{ name: "event_id", type: "bigint" }],
+        }),
+      ]),
+    );
+  });
+
+  it("reuses loaded non-baseline scopes from cache after collapse and re-expand", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const listSchemasCalls: string[] = [];
+    const listObjectsCalls: string[] = [];
+
+    driverBehaviors.set("conn-1", {
+      listDatabases: [
+        { name: "app_db", schemas: [] },
+        { name: "archive_db", schemas: [] },
+      ],
+      listSchemasImpl: (database) => {
+        listSchemasCalls.push(database);
+        if (database === "archive_db") {
+          return [{ name: "public" }, { name: "audit" }];
+        }
+
+        return [{ name: "public" }];
+      },
+      listObjectsImpl: (database, schema) => {
+        listObjectsCalls.push(`${database}.${schema}`);
+        if (database === "app_db" && schema === "public") {
+          return [{ schema: "public", name: "users", type: "table" }];
+        }
+
+        if (database === "archive_db" && schema === "audit") {
+          return [{ schema: "audit", name: "audit_log", type: "table" }];
+        }
+
+        return [];
+      },
+      describeTableByScope: {
+        "app_db.public.users": [
+          {
+            name: "id",
+            type: "int",
+            nullable: false,
+            isPrimaryKey: false,
+            isForeignKey: false,
+          },
+        ],
+        "archive_db.audit.audit_log": [
+          {
+            name: "event_id",
+            type: "bigint",
+            nullable: false,
+            isPrimaryKey: false,
+            isForeignKey: false,
+          },
+        ],
+      },
+    });
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        database: "app_db",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo("conn-1");
+    await manager.getSchemaSnapshotAsync("conn-1");
+
+    manager.ensureSchemaScopeLoading("conn-1", {
+      kind: "database",
+      database: "archive_db",
+    });
+    await waitForSchemaCondition(
+      manager,
+      "conn-1",
+      () =>
+        manager.getSchemaSnapshotState("conn-1", {
+          kind: "database",
+          database: "archive_db",
+        }).status === "loaded",
+    );
+
+    manager.ensureSchemaScopeLoading("conn-1", {
+      kind: "schema",
+      database: "archive_db",
+      schema: "audit",
+    });
+    await waitForSchemaCondition(manager, "conn-1", () =>
+      manager
+        .getSchema("conn-1")
+        .some((entry) => entry.database === "archive_db"),
+    );
+
+    expect(listSchemasCalls).toEqual(["app_db", "archive_db"]);
+    expect(listObjectsCalls).toEqual(["app_db.public", "archive_db.audit"]);
+
+    manager.markSchemaScopeCollapsed("conn-1", {
+      kind: "database",
+      database: "archive_db",
+    });
+
+    expect(manager.getSchema("conn-1")).toEqual(
+      expect.arrayContaining([
+        {
+          database: "app_db",
+          schema: "public",
+          object: "users",
+          type: "table",
+          columns: [{ name: "id", type: "int" }],
+        },
+        {
+          database: "archive_db",
+          schema: "audit",
+          object: "audit_log",
+          type: "table",
+          columns: [{ name: "event_id", type: "bigint" }],
+        },
+      ]),
+    );
+    expect(
+      manager.getSchemaSnapshotState("conn-1", {
+        kind: "database",
+        database: "archive_db",
+      }),
+    ).toMatchObject({
+      status: "loaded",
+      snapshot: {
+        databases: [
+          {
+            name: "archive_db",
+            schemas: [
+              { name: "public", objects: [] },
+              {
+                name: "audit",
+                objects: [],
+              },
+            ],
+          },
+        ],
+      },
+    });
+    expect(
+      manager.getSchemaSnapshotState("conn-1", {
+        kind: "schema",
+        database: "archive_db",
+        schema: "audit",
+      }),
+    ).toMatchObject({
+      status: "loaded",
+      snapshot: {
+        databases: [
+          {
+            name: "archive_db",
+            schemas: [
+              {
+                name: "audit",
+                objects: [
+                  {
+                    name: "audit_log",
+                    type: "table",
+                    columns: [{ name: "event_id", type: "bigint" }],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    manager.ensureSchemaScopeLoading("conn-1", {
+      kind: "database",
+      database: "archive_db",
+    });
+    manager.ensureSchemaScopeLoading("conn-1", {
+      kind: "schema",
+      database: "archive_db",
+      schema: "audit",
+    });
+
+    expect(listSchemasCalls).toEqual(["app_db", "archive_db"]);
+    expect(listObjectsCalls).toEqual(["app_db.public", "archive_db.audit"]);
+
+    manager.markSchemaScopeCollapsed("conn-1", {
+      kind: "database",
+      database: "archive_db",
+    });
+
+    manager.refreshSchemaCache({
+      connectionId: "conn-1",
+      reason: "manual",
+    });
+
+    await waitForSchemaCondition(
+      manager,
+      "conn-1",
+      () =>
+        manager.getSchemaSnapshotState("conn-1").status === "loaded" &&
+        manager
+          .getSchema("conn-1")
+          .every((entry) => entry.database === "app_db"),
+    );
+
+    expect(manager.getSchema("conn-1")).toEqual([
+      {
+        database: "app_db",
+        schema: "public",
+        object: "users",
+        type: "table",
+        columns: [{ name: "id", type: "int" }],
+      },
+    ]);
+
+    manager.ensureSchemaScopeLoading("conn-1", {
+      kind: "database",
+      database: "archive_db",
+    });
+    await waitForSchemaCondition(
+      manager,
+      "conn-1",
+      () =>
+        manager.getSchemaSnapshotState("conn-1", {
+          kind: "database",
+          database: "archive_db",
+        }).status === "loaded",
+    );
+
+    manager.ensureSchemaScopeLoading("conn-1", {
+      kind: "schema",
+      database: "archive_db",
+      schema: "audit",
+    });
+    await waitForSchemaCondition(manager, "conn-1", () =>
+      manager
+        .getSchema("conn-1")
+        .some((entry) => entry.database === "archive_db"),
+    );
+
+    expect(listSchemasCalls).toEqual([
+      "app_db",
+      "archive_db",
+      "app_db",
+      "archive_db",
+    ]);
+    expect(listObjectsCalls).toEqual([
+      "app_db.public",
+      "archive_db.audit",
+      "app_db.public",
+      "archive_db.audit",
+    ]);
+  });
+
+  it("reloads only the baseline and expanded scopes during a manual refresh", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const listSchemasCalls: string[] = [];
+    const listObjectsCalls: string[] = [];
+    let phase = 1;
+
+    driverBehaviors.set("conn-1", {
+      listDatabases: [
+        { name: "app_db", schemas: [] },
+        { name: "archive_db", schemas: [] },
+        { name: "hidden_db", schemas: [] },
+      ],
+      listSchemasImpl: (database) => {
+        listSchemasCalls.push(database);
+        if (database === "archive_db") {
+          return [{ name: "public" }, { name: "audit" }];
+        }
+
+        return [{ name: "public" }];
+      },
+      listObjectsImpl: (database, schema) => {
+        listObjectsCalls.push(`${database}.${schema}`);
+        if (database === "app_db" && schema === "public") {
+          return phase === 1
+            ? [{ schema: "public", name: "users", type: "table" }]
+            : [
+                { schema: "public", name: "users", type: "table" },
+                { schema: "public", name: "profiles", type: "table" },
+              ];
+        }
+
+        if (database === "archive_db" && schema === "audit") {
+          return phase === 1
+            ? [{ schema: "audit", name: "audit_log", type: "table" }]
+            : [{ schema: "audit", name: "audit_log_v2", type: "table" }];
+        }
+
+        if (database === "hidden_db" && schema === "public") {
+          return [{ schema: "public", name: "shadow", type: "table" }];
+        }
+
+        return [];
+      },
+      describeTableImpl: (database, schema, table) => [
+        {
+          name: `${database}_${schema}_${table}_id`,
+          type: "int",
+          nullable: false,
+          isPrimaryKey: false,
+          isForeignKey: false,
+        },
+      ],
+    });
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        database: "app_db",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo("conn-1");
+    await manager.getSchemaSnapshotAsync("conn-1");
+
+    manager.ensureSchemaScopeLoading("conn-1", {
+      kind: "database",
+      database: "archive_db",
+    });
+    await waitForSchemaCondition(
+      manager,
+      "conn-1",
+      () =>
+        manager.getSchemaSnapshotState("conn-1", {
+          kind: "database",
+          database: "archive_db",
+        }).status === "loaded",
+    );
+
+    manager.ensureSchemaScopeLoading("conn-1", {
+      kind: "schema",
+      database: "archive_db",
+      schema: "audit",
+    });
+    await waitForSchemaCondition(manager, "conn-1", () =>
+      manager.getSchema("conn-1").some((entry) => entry.object === "audit_log"),
+    );
+
+    listSchemasCalls.length = 0;
+    listObjectsCalls.length = 0;
+    phase = 2;
+
+    manager.refreshSchemaCache({
+      connectionId: "conn-1",
+      reason: "manual",
+    });
+
+    await waitForSchemaCondition(
+      manager,
+      "conn-1",
+      () =>
+        manager
+          .getSchema("conn-1")
+          .some((entry) => entry.object === "profiles") &&
+        manager
+          .getSchema("conn-1")
+          .some((entry) => entry.object === "audit_log_v2"),
+    );
+
+    expect(listSchemasCalls).toEqual(
+      expect.arrayContaining(["app_db", "archive_db"]),
+    );
+    expect(listSchemasCalls).not.toContain("hidden_db");
+    expect(listObjectsCalls).toEqual(
+      expect.arrayContaining(["app_db.public", "archive_db.audit"]),
+    );
+    expect(listObjectsCalls).not.toContain("hidden_db.public");
+  });
+
+  it("suppresses stale scope merges after refresh invalidates an in-flight generation", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const firstArchiveObjects = createDeferred<TableInfo[]>();
+    const secondArchiveObjects = createDeferred<TableInfo[]>();
+    let archiveSchemaLoadCount = 0;
+
+    driverBehaviors.set("conn-1", {
+      listDatabases: [
+        { name: "app_db", schemas: [] },
+        { name: "archive_db", schemas: [] },
+      ],
+      listSchemasImpl: (database) => {
+        if (database === "archive_db") {
+          return [{ name: "public" }, { name: "audit" }];
+        }
+
+        return [{ name: "public" }];
+      },
+      listObjectsImpl: (database, schema) => {
+        if (database === "archive_db" && schema === "audit") {
+          archiveSchemaLoadCount += 1;
+          return archiveSchemaLoadCount === 1
+            ? firstArchiveObjects.promise
+            : secondArchiveObjects.promise;
+        }
+
+        if (database === "app_db" && schema === "public") {
+          return [{ schema: "public", name: "users", type: "table" }];
+        }
+
+        return [];
+      },
+      describeTableImpl: (database, schema, table) => [
+        {
+          name: `${database}_${schema}_${table}_id`,
+          type: "int",
+          nullable: false,
+          isPrimaryKey: false,
+          isForeignKey: false,
+        },
+      ],
+    });
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        database: "app_db",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo("conn-1");
+    await manager.getSchemaSnapshotAsync("conn-1");
+
+    manager.ensureSchemaScopeLoading("conn-1", {
+      kind: "database",
+      database: "archive_db",
+    });
+    await waitForSchemaCondition(
+      manager,
+      "conn-1",
+      () =>
+        manager.getSchemaSnapshotState("conn-1", {
+          kind: "database",
+          database: "archive_db",
+        }).status === "loaded",
+    );
+
+    manager.ensureSchemaScopeLoading("conn-1", {
+      kind: "schema",
+      database: "archive_db",
+      schema: "audit",
+    });
+
+    manager.refreshSchemaCache({
+      connectionId: "conn-1",
+      reason: "manual",
+    });
+
+    firstArchiveObjects.resolve([
+      { schema: "audit", name: "stale_audit_log", type: "table" },
+    ]);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(
+      manager
+        .getSchema("conn-1")
+        .some((entry) => entry.object === "stale_audit_log"),
+    ).toBe(false);
+
+    secondArchiveObjects.resolve([
+      { schema: "audit", name: "fresh_audit_log", type: "table" },
+    ]);
+
+    await waitForSchemaCondition(manager, "conn-1", () =>
+      manager
+        .getSchema("conn-1")
+        .some((entry) => entry.object === "fresh_audit_log"),
+    );
+
+    expect(
+      manager
+        .getSchema("conn-1")
+        .some((entry) => entry.object === "stale_audit_log"),
+    ).toBe(false);
   });
 
   it("deduplicates identical trailing history entries and trims to the configured limit", async () => {

@@ -4,13 +4,20 @@ import {
   type BookmarkEntry,
   type ConnectAttempt,
   type ConnectionConfig,
+  type ExplorerSchemaScope,
   type HistoryEntry,
+  type RefreshSchemaRequest,
   type SchemaLoadStatus,
   type SchemaObjectEntry,
+  type SchemaScopeKey,
   type SchemaSnapshot,
   type SchemaSnapshotDatabaseEntry,
   type SchemaSnapshotObjectEntry,
+  type SchemaSnapshotSchemaEntry,
   type SchemaSnapshotState,
+  type ScopeAwareConnectionManagerApi,
+  type ScopedSchemaCacheEntry,
+  type ScopedSchemaFragment,
   type StoredConnectionConfig,
   type TestConnectionResult,
 } from "./connectionManagerModels";
@@ -31,57 +38,435 @@ export type {
   BookmarkEntry,
   ConnectAttempt,
   ConnectionConfig,
+  ExplorerSchemaScope,
   HistoryEntry,
+  RefreshSchemaRequest,
   SchemaLoadStatus,
   SchemaObjectEntry,
+  SchemaScopeKey,
   SchemaSnapshot,
   SchemaSnapshotDatabaseEntry,
   SchemaSnapshotSchemaEntry,
   SchemaSnapshotState,
+  ScopeAwareConnectionManagerApi,
+  ScopedSchemaCacheEntry,
   TestConnectionResult,
 } from "./connectionManagerModels";
 
-interface SchemaCacheEntry extends SchemaSnapshotState {
+interface InternalScopedSchemaCacheEntry extends ScopedSchemaCacheEntry {
+  loading: Promise<void> | null;
+  retainOnCollapse: boolean;
+  fullyLoaded: boolean;
+}
+
+interface ConnectionSchemaCacheEntry extends SchemaSnapshotState {
   loading: Promise<void> | null;
   generation: number;
+  defaultDatabaseName: string;
+  scopes: Map<SchemaScopeKey, InternalScopedSchemaCacheEntry>;
+  expandedScopeKeys: Set<SchemaScopeKey>;
+}
+
+interface DatabaseScopeLoadResult {
+  database: SchemaSnapshotDatabaseEntry;
+  loadedSchemas: SchemaSnapshotSchemaEntry[];
+}
+
+type DatabaseLoadMode = "baseline" | "expanded";
+
+const CONNECTION_ROOT_SCOPE: ExplorerSchemaScope = { kind: "connectionRoot" };
+
+export function createConnectionRootSchemaScope(): ExplorerSchemaScope {
+  return { kind: "connectionRoot" };
+}
+
+export function getExplorerSchemaScopeKey(
+  scope: ExplorerSchemaScope,
+): SchemaScopeKey {
+  switch (scope.kind) {
+    case "connectionRoot":
+      return "connectionRoot";
+    case "database":
+      return `database:${encodeURIComponent(scope.database)}`;
+    case "schema":
+      return `schema:${encodeURIComponent(scope.database)}:${encodeURIComponent(scope.schema)}`;
+  }
+}
+
+function parseExplorerSchemaScopeKey(
+  key: SchemaScopeKey,
+): ExplorerSchemaScope | undefined {
+  if (key === "connectionRoot") {
+    return createConnectionRootSchemaScope();
+  }
+
+  if (key.startsWith("database:")) {
+    return {
+      kind: "database",
+      database: decodeURIComponent(key.slice("database:".length)),
+    };
+  }
+
+  if (key.startsWith("schema:")) {
+    const encodedParts = key.slice("schema:".length).split(":");
+    if (encodedParts.length !== 2) {
+      return undefined;
+    }
+
+    return {
+      kind: "schema",
+      database: decodeURIComponent(encodedParts[0]),
+      schema: decodeURIComponent(encodedParts[1]),
+    };
+  }
+
+  return undefined;
+}
+
+function isConnectionRootScope(scope?: ExplorerSchemaScope): boolean {
+  return !scope || scope.kind === "connectionRoot";
 }
 
 function createEmptySchemaSnapshot(): SchemaSnapshot {
   return { databases: [] };
 }
 
-function createEmptySchemaSnapshotState(): SchemaSnapshotState {
+function createSchemaSnapshotState(
+  snapshot: SchemaSnapshot,
+  status: SchemaLoadStatus,
+  isPartial: boolean,
+  error?: string,
+): SchemaSnapshotState {
+  if (error) {
+    return {
+      snapshot,
+      status,
+      isPartial,
+      error,
+    };
+  }
+
   return {
-    snapshot: createEmptySchemaSnapshot(),
-    status: "idle",
-    isPartial: false,
+    snapshot,
+    status,
+    isPartial,
   };
 }
 
-function createSchemaCacheEntry(generation: number): SchemaCacheEntry {
+function createEmptySchemaSnapshotState(): SchemaSnapshotState {
+  return createSchemaSnapshotState(createEmptySchemaSnapshot(), "idle", false);
+}
+
+function cloneSchemaSnapshotObjectEntry(
+  object: SchemaSnapshotObjectEntry,
+): SchemaSnapshotObjectEntry {
   return {
-    ...createEmptySchemaSnapshotState(),
+    name: object.name,
+    type: object.type,
+    columns: object.columns.map((column) => ({
+      name: column.name,
+      type: column.type,
+    })),
+  };
+}
+
+function cloneSchemaSnapshotSchemaEntry(
+  schema: SchemaSnapshotSchemaEntry,
+): SchemaSnapshotSchemaEntry {
+  return {
+    name: schema.name,
+    objects: schema.objects.map(cloneSchemaSnapshotObjectEntry),
+  };
+}
+
+function cloneSchemaSnapshotDatabaseEntry(
+  database: SchemaSnapshotDatabaseEntry,
+): SchemaSnapshotDatabaseEntry {
+  return {
+    name: database.name,
+    schemas: database.schemas.map(cloneSchemaSnapshotSchemaEntry),
+  };
+}
+
+function cloneSchemaSnapshot(snapshot: SchemaSnapshot): SchemaSnapshot {
+  return {
+    databases: snapshot.databases.map(cloneSchemaSnapshotDatabaseEntry),
+  };
+}
+
+function cloneExplorerSchemaScope(
+  scope: ExplorerSchemaScope,
+): ExplorerSchemaScope {
+  switch (scope.kind) {
+    case "connectionRoot":
+      return createConnectionRootSchemaScope();
+    case "database":
+      return { kind: "database", database: scope.database };
+    case "schema":
+      return {
+        kind: "schema",
+        database: scope.database,
+        schema: scope.schema,
+      };
+  }
+}
+
+function createScopeSnapshotForDatabase(
+  database: SchemaSnapshotDatabaseEntry,
+): SchemaSnapshot {
+  return {
+    databases: [database],
+  };
+}
+
+function createScopeSnapshotForSchema(
+  databaseName: string,
+  schema: SchemaSnapshotSchemaEntry,
+): SchemaSnapshot {
+  return {
+    databases: [
+      {
+        name: databaseName,
+        schemas: [schema],
+      },
+    ],
+  };
+}
+
+function createScopedSchemaCacheEntry(
+  scope: ExplorerSchemaScope,
+  generation: number,
+  state: SchemaSnapshotState,
+  fragment: ScopedSchemaFragment = {},
+  retainOnCollapse = false,
+): InternalScopedSchemaCacheEntry {
+  return {
+    ...createSchemaSnapshotState(
+      cloneSchemaSnapshot(state.snapshot),
+      state.status,
+      state.isPartial,
+      state.error,
+    ),
+    scope: cloneExplorerSchemaScope(scope),
+    key: getExplorerSchemaScopeKey(scope),
+    fragment,
+    generation,
+    loading: null,
+    retainOnCollapse,
+    fullyLoaded: false,
+  };
+}
+
+function createConnectionSchemaCacheEntry(
+  generation: number,
+  expandedScopeKeys: Set<SchemaScopeKey>,
+  defaultDatabaseName: string,
+): ConnectionSchemaCacheEntry {
+  const state = createEmptySchemaSnapshotState();
+  const rootScope = createConnectionRootSchemaScope();
+  const scopes = new Map<SchemaScopeKey, InternalScopedSchemaCacheEntry>([
+    [
+      getExplorerSchemaScopeKey(rootScope),
+      createScopedSchemaCacheEntry(rootScope, generation, state, {}, true),
+    ],
+  ]);
+
+  return {
+    ...state,
     loading: null,
     generation,
+    defaultDatabaseName,
+    scopes,
+    expandedScopeKeys,
   };
 }
 
 function cloneSchemaSnapshotState(
   state: SchemaSnapshotState,
 ): SchemaSnapshotState {
-  if (state.error) {
-    return {
-      snapshot: state.snapshot,
-      status: state.status,
-      isPartial: state.isPartial,
-      error: state.error,
+  return createSchemaSnapshotState(
+    cloneSchemaSnapshot(state.snapshot),
+    state.status,
+    state.isPartial,
+    state.error,
+  );
+}
+
+function getConfiguredDefaultDatabaseName(config: ConnectionConfig): string {
+  return (
+    config.database || config.serviceName || (config.filePath ? "main" : "")
+  );
+}
+
+function isDescendantScope(
+  scope: ExplorerSchemaScope,
+  ancestor: ExplorerSchemaScope,
+): boolean {
+  switch (ancestor.kind) {
+    case "connectionRoot":
+      return scope.kind !== "connectionRoot";
+    case "database":
+      return scope.kind === "schema" && scope.database === ancestor.database;
+    case "schema":
+      return false;
+  }
+}
+
+function mergeSchemaIntoDatabase(
+  database: SchemaSnapshotDatabaseEntry,
+  schema: SchemaSnapshotSchemaEntry,
+): SchemaSnapshotDatabaseEntry {
+  const nextDatabase = cloneSchemaSnapshotDatabaseEntry(database);
+  const schemaIndex = nextDatabase.schemas.findIndex(
+    (entry) => entry.name === schema.name,
+  );
+  const nextSchema = cloneSchemaSnapshotSchemaEntry(schema);
+
+  if (schemaIndex >= 0) {
+    nextDatabase.schemas[schemaIndex] = nextSchema;
+    return nextDatabase;
+  }
+
+  nextDatabase.schemas.push(nextSchema);
+  nextDatabase.schemas.sort((left, right) =>
+    left.name.localeCompare(right.name),
+  );
+  return nextDatabase;
+}
+
+function buildAggregateSchemaSnapshot(
+  entry: ConnectionSchemaCacheEntry,
+): SchemaSnapshot {
+  const rootEntry = entry.scopes.get(
+    getExplorerSchemaScopeKey(CONNECTION_ROOT_SCOPE),
+  ) as InternalScopedSchemaCacheEntry | undefined;
+  const orderedDatabaseNames: string[] = [];
+  const databaseMap = new Map<string, SchemaSnapshotDatabaseEntry>();
+
+  const ensureDatabaseSlot = (databaseName: string): void => {
+    if (!orderedDatabaseNames.includes(databaseName)) {
+      orderedDatabaseNames.push(databaseName);
+    }
+    if (!databaseMap.has(databaseName)) {
+      databaseMap.set(databaseName, {
+        name: databaseName,
+        schemas: [],
+      });
+    }
+  };
+
+  for (const database of rootEntry?.snapshot.databases ?? []) {
+    ensureDatabaseSlot(database.name);
+  }
+
+  for (const scopedEntry of entry.scopes.values()) {
+    if (
+      scopedEntry.scope.kind !== "database" ||
+      !scopedEntry.fragment.database
+    ) {
+      continue;
+    }
+
+    ensureDatabaseSlot(scopedEntry.fragment.database.name);
+    databaseMap.set(
+      scopedEntry.fragment.database.name,
+      cloneSchemaSnapshotDatabaseEntry(scopedEntry.fragment.database),
+    );
+  }
+
+  for (const scopedEntry of entry.scopes.values()) {
+    if (scopedEntry.scope.kind !== "schema" || !scopedEntry.fragment.schema) {
+      continue;
+    }
+
+    ensureDatabaseSlot(scopedEntry.scope.database);
+    const currentDatabase = databaseMap.get(scopedEntry.scope.database) ?? {
+      name: scopedEntry.scope.database,
+      schemas: [],
     };
+    databaseMap.set(
+      scopedEntry.scope.database,
+      mergeSchemaIntoDatabase(currentDatabase, scopedEntry.fragment.schema),
+    );
   }
 
   return {
-    snapshot: state.snapshot,
-    status: state.status,
-    isPartial: state.isPartial,
+    databases: orderedDatabaseNames
+      .map((databaseName) => databaseMap.get(databaseName))
+      .filter(
+        (database): database is SchemaSnapshotDatabaseEntry =>
+          database !== undefined,
+      ),
+  };
+}
+
+function deriveAggregateSchemaState(
+  entry: ConnectionSchemaCacheEntry,
+  snapshot: SchemaSnapshot,
+): Omit<SchemaSnapshotState, "snapshot"> {
+  const rootEntry = entry.scopes.get(
+    getExplorerSchemaScopeKey(CONNECTION_ROOT_SCOPE),
+  ) as InternalScopedSchemaCacheEntry | undefined;
+  const baselineEntry = entry.defaultDatabaseName
+    ? (entry.scopes.get(
+        getExplorerSchemaScopeKey({
+          kind: "database",
+          database: entry.defaultDatabaseName,
+        }),
+      ) as InternalScopedSchemaCacheEntry | undefined)
+    : undefined;
+
+  if (!rootEntry || rootEntry.status === "idle") {
+    return {
+      status: "idle",
+      isPartial: false,
+    };
+  }
+
+  if (rootEntry.status === "error") {
+    const state = {
+      status: "error",
+      isPartial: snapshot.databases.length > 0,
+    } satisfies Omit<SchemaSnapshotState, "snapshot">;
+    return rootEntry.error ? { ...state, error: rootEntry.error } : state;
+  }
+
+  if (rootEntry.status === "loading") {
+    return {
+      status: "loading",
+      isPartial: snapshot.databases.length > 0,
+    };
+  }
+
+  if (entry.defaultDatabaseName) {
+    if (!baselineEntry || baselineEntry.status === "idle") {
+      return {
+        status: "loading",
+        isPartial: snapshot.databases.length > 0,
+      };
+    }
+
+    if (baselineEntry.status === "loading") {
+      return {
+        status: "loading",
+        isPartial: snapshot.databases.length > 0,
+      };
+    }
+
+    if (baselineEntry.status === "error") {
+      const state = {
+        status: "error",
+        isPartial: snapshot.databases.length > 0,
+      } satisfies Omit<SchemaSnapshotState, "snapshot">;
+      return baselineEntry.error
+        ? { ...state, error: baselineEntry.error }
+        : state;
+    }
+  }
+
+  return {
+    status: "loaded",
+    isPartial: false,
   };
 }
 
@@ -100,7 +485,7 @@ function flattenSchemaSnapshot(snapshot: SchemaSnapshot): SchemaObjectEntry[] {
 }
 
 const TEST_CONNECTION_ID = "__test__";
-export class ConnectionManager {
+export class ConnectionManager implements ScopeAwareConnectionManagerApi {
   private readonly store: ConnectionManagerStore;
   private driverMap = new Map<string, IDBDriver>();
   private readonly _connectingMap = new Map<string, Promise<void>>();
@@ -121,8 +506,15 @@ export class ConnectionManager {
   readonly onDidRefreshSchemas: vscode.Event<void>;
   private readonly _onDidRefreshSchemas = new vscode.EventEmitter<void>();
   private _connectionsCache: ConnectionConfig[] | null = null;
-  private readonly _schemaCacheMap = new Map<string, SchemaCacheEntry>();
+  private readonly _schemaCacheMap = new Map<
+    string,
+    ConnectionSchemaCacheEntry
+  >();
   private readonly _schemaGenerationMap = new Map<string, number>();
+  private readonly _schemaExpandedScopeKeyMap = new Map<
+    string,
+    Set<SchemaScopeKey>
+  >();
   constructor(
     context: vscode.ExtensionContext,
     store: ConnectionManagerStore = new VSCodeConnectionManagerStore(context),
@@ -350,31 +742,170 @@ export class ConnectionManager {
     return this.getSchemaSnapshotState(connectionId).snapshot;
   }
 
-  getSchemaSnapshotState(connectionId: string): SchemaSnapshotState {
+  getSchemaSnapshotState(
+    connectionId: string,
+    scope?: ExplorerSchemaScope,
+  ): SchemaSnapshotState {
     const state = this._schemaCacheMap.get(connectionId);
     if (!state) {
       return createEmptySchemaSnapshotState();
     }
 
-    return cloneSchemaSnapshotState(state);
+    if (!scope) {
+      return cloneSchemaSnapshotState(state);
+    }
+
+    if (isConnectionRootScope(scope)) {
+      const rootState = state.scopes.get(
+        getExplorerSchemaScopeKey(CONNECTION_ROOT_SCOPE),
+      );
+      return rootState
+        ? cloneSchemaSnapshotState(rootState)
+        : createEmptySchemaSnapshotState();
+    }
+
+    const scopedState = state.scopes.get(getExplorerSchemaScopeKey(scope));
+    if (scopedState) {
+      return cloneSchemaSnapshotState(scopedState);
+    }
+
+    if (state.status === "loading") {
+      return createSchemaSnapshotState(
+        createEmptySchemaSnapshot(),
+        "loading",
+        false,
+      );
+    }
+
+    if (state.status === "error") {
+      return createSchemaSnapshotState(
+        createEmptySchemaSnapshot(),
+        "error",
+        false,
+        state.error,
+      );
+    }
+
+    return createEmptySchemaSnapshotState();
   }
 
   ensureSchemaSnapshotLoading(connectionId: string): void {
-    this._startSchemaLoad(connectionId, false);
+    this.ensureSchemaScopeLoading(
+      connectionId,
+      createConnectionRootSchemaScope(),
+    );
   }
 
-  refreshSchemaCache(connectionId?: string): void {
-    if (connectionId) {
-      this._invalidateSchemaState(connectionId);
-    } else {
-      for (const id of new Set([
-        ...this._schemaCacheMap.keys(),
-        ...this._schemaGenerationMap.keys(),
-      ])) {
-        this._invalidateSchemaState(id);
+  ensureSchemaScopeLoading(
+    connectionId: string,
+    scope: ExplorerSchemaScope,
+  ): void {
+    this.markSchemaScopeExpanded(connectionId, scope);
+
+    const config = this.getConnection(connectionId);
+    const configuredDefaultDatabase = config
+      ? getConfiguredDefaultDatabaseName(config)
+      : "";
+
+    switch (scope.kind) {
+      case "connectionRoot":
+        this._startRootSchemaLoad(connectionId, false);
+        return;
+      case "database": {
+        this._startRootSchemaLoad(connectionId, false);
+        const loadMode: DatabaseLoadMode =
+          configuredDefaultDatabase === scope.database
+            ? "baseline"
+            : "expanded";
+        this._startDatabaseScopeLoad(
+          connectionId,
+          scope.database,
+          false,
+          loadMode === "baseline",
+          loadMode,
+        );
+        return;
       }
-      this._schemaCacheMap.clear();
+      case "schema":
+        this._startRootSchemaLoad(connectionId, false);
+        this._startSchemaScopeLoad(
+          connectionId,
+          scope.database,
+          scope.schema,
+          false,
+          configuredDefaultDatabase === scope.database,
+        );
+        return;
     }
+  }
+
+  markSchemaScopeExpanded(
+    connectionId: string,
+    scope: ExplorerSchemaScope,
+  ): void {
+    const expandedScopeKeys = this._getExpandedScopeKeys(connectionId);
+    expandedScopeKeys.add(getExplorerSchemaScopeKey(scope));
+
+    const entry = this._schemaCacheMap.get(connectionId);
+    if (entry) {
+      entry.expandedScopeKeys = expandedScopeKeys;
+    }
+  }
+
+  markSchemaScopeCollapsed(
+    connectionId: string,
+    scope: ExplorerSchemaScope,
+  ): void {
+    const expandedScopeKeys = this._getExpandedScopeKeys(connectionId);
+
+    for (const expandedScopeKey of [...expandedScopeKeys]) {
+      if (
+        expandedScopeKey === getExplorerSchemaScopeKey(CONNECTION_ROOT_SCOPE)
+      ) {
+        continue;
+      }
+
+      const expandedScope = parseExplorerSchemaScopeKey(expandedScopeKey);
+      if (!expandedScope) {
+        expandedScopeKeys.delete(expandedScopeKey);
+        continue;
+      }
+
+      if (
+        expandedScopeKey === getExplorerSchemaScopeKey(scope) ||
+        isDescendantScope(expandedScope, scope)
+      ) {
+        expandedScopeKeys.delete(expandedScopeKey);
+      }
+    }
+
+    const entry = this._schemaCacheMap.get(connectionId);
+    if (!entry) {
+      return;
+    }
+
+    entry.expandedScopeKeys = expandedScopeKeys;
+  }
+
+  refreshSchemaCache(request?: string | RefreshSchemaRequest): void {
+    const connectionId =
+      typeof request === "string" ? request : request?.connectionId;
+
+    const connectionIds = connectionId
+      ? [connectionId]
+      : [
+          ...new Set([
+            ...this.getConnections().map((connection) => connection.id),
+            ...this._schemaCacheMap.keys(),
+            ...this._schemaGenerationMap.keys(),
+          ]),
+        ];
+
+    for (const nextConnectionId of connectionIds) {
+      this._invalidateSchemaState(nextConnectionId);
+      this._restoreExpandedSchemaLoads(nextConnectionId);
+    }
+
     this._onDidRefreshSchemas.fire();
   }
 
@@ -384,7 +915,7 @@ export class ConnectionManager {
   }
 
   async getSchemaSnapshotAsync(connectionId: string): Promise<SchemaSnapshot> {
-    this._startSchemaLoad(connectionId, true);
+    this._startRootSchemaLoad(connectionId, true);
     const entry = this._schemaCacheMap.get(connectionId);
     if (entry?.loading) {
       try {
@@ -398,6 +929,18 @@ export class ConnectionManager {
     return this._schemaGenerationMap.get(connectionId) ?? 0;
   }
 
+  private _getExpandedScopeKeys(connectionId: string): Set<SchemaScopeKey> {
+    let expandedScopeKeys = this._schemaExpandedScopeKeyMap.get(connectionId);
+    if (!expandedScopeKeys) {
+      expandedScopeKeys = new Set<SchemaScopeKey>([
+        getExplorerSchemaScopeKey(CONNECTION_ROOT_SCOPE),
+      ]);
+      this._schemaExpandedScopeKeyMap.set(connectionId, expandedScopeKeys);
+    }
+
+    return expandedScopeKeys;
+  }
+
   private _invalidateSchemaState(connectionId: string): void {
     this._schemaGenerationMap.set(
       connectionId,
@@ -407,115 +950,500 @@ export class ConnectionManager {
     this._onDidChangeSchemaState.fire(connectionId);
   }
 
-  private _publishSchemaState(
+  private _restoreExpandedSchemaLoads(connectionId: string): void {
+    if (!this.isConnected(connectionId)) {
+      return;
+    }
+
+    this.ensureSchemaSnapshotLoading(connectionId);
+    for (const scopeKey of this._getExpandedScopeKeys(connectionId)) {
+      if (scopeKey === getExplorerSchemaScopeKey(CONNECTION_ROOT_SCOPE)) {
+        continue;
+      }
+
+      const scope = parseExplorerSchemaScopeKey(scopeKey);
+      if (!scope) {
+        continue;
+      }
+
+      this.ensureSchemaScopeLoading(connectionId, scope);
+    }
+  }
+
+  private _isLiveConnectionEntry(
     connectionId: string,
-    entry: SchemaCacheEntry,
-    generation: number,
-    state: SchemaSnapshotState,
-    fireLoadedEvent = false,
+    entry: ConnectionSchemaCacheEntry,
   ): boolean {
     const live = this._schemaCacheMap.get(connectionId);
     if (
       live !== entry ||
-      live?.generation !== generation ||
-      this._getSchemaGeneration(connectionId) !== generation
+      live?.generation !== entry.generation ||
+      this._getSchemaGeneration(connectionId) !== entry.generation
     ) {
       return false;
     }
 
-    live.snapshot = state.snapshot;
-    live.status = state.status;
-    live.isPartial = state.isPartial;
-    if (state.error) {
-      live.error = state.error;
-    } else {
-      delete live.error;
+    return true;
+  }
+
+  private _isLiveScopeEntry(
+    connectionId: string,
+    entry: ConnectionSchemaCacheEntry,
+    scopeEntry: InternalScopedSchemaCacheEntry,
+  ): boolean {
+    if (!this._isLiveConnectionEntry(connectionId, entry)) {
+      return false;
     }
-    if (state.status !== "loading") {
-      live.loading = null;
+
+    return entry.scopes.get(scopeEntry.key) === scopeEntry;
+  }
+
+  private _getOrCreateSchemaCacheEntry(
+    connectionId: string,
+    config: ConnectionConfig,
+  ): ConnectionSchemaCacheEntry {
+    const generation = this._getSchemaGeneration(connectionId);
+    let entry = this._schemaCacheMap.get(connectionId);
+
+    if (!entry || entry.generation !== generation) {
+      entry = createConnectionSchemaCacheEntry(
+        generation,
+        this._getExpandedScopeKeys(connectionId),
+        getConfiguredDefaultDatabaseName(config),
+      );
+      this._schemaCacheMap.set(connectionId, entry);
+    }
+
+    if (!entry.defaultDatabaseName) {
+      entry.defaultDatabaseName = getConfiguredDefaultDatabaseName(config);
+    }
+
+    return entry;
+  }
+
+  private _getOrCreateScopeEntry(
+    entry: ConnectionSchemaCacheEntry,
+    scope: ExplorerSchemaScope,
+    retainOnCollapse = false,
+  ): InternalScopedSchemaCacheEntry {
+    const scopeKey = getExplorerSchemaScopeKey(scope);
+    let scopeEntry = entry.scopes.get(scopeKey);
+
+    if (!scopeEntry || scopeEntry.generation !== entry.generation) {
+      scopeEntry = createScopedSchemaCacheEntry(
+        scope,
+        entry.generation,
+        createEmptySchemaSnapshotState(),
+        {},
+        retainOnCollapse,
+      );
+      entry.scopes.set(scopeKey, scopeEntry);
+    }
+
+    if (retainOnCollapse) {
+      scopeEntry.retainOnCollapse = true;
+    }
+
+    return scopeEntry;
+  }
+
+  private _commitAggregateSchemaState(
+    connectionId: string,
+    entry: ConnectionSchemaCacheEntry,
+    fireSchemaLoadEvent = false,
+  ): boolean {
+    if (!this._isLiveConnectionEntry(connectionId, entry)) {
+      return false;
+    }
+
+    const nextSnapshot = buildAggregateSchemaSnapshot(entry);
+    const nextState = deriveAggregateSchemaState(entry, nextSnapshot);
+
+    entry.snapshot = nextSnapshot;
+    entry.status = nextState.status;
+    entry.isPartial = nextState.isPartial;
+    if (nextState.error) {
+      entry.error = nextState.error;
+    } else {
+      delete entry.error;
     }
 
     this._onDidChangeSchemaState.fire(connectionId);
-    if (fireLoadedEvent) {
+    if (fireSchemaLoadEvent) {
       this._onDidSchemaLoad.fire(connectionId);
     }
     return true;
   }
 
-  private _startSchemaLoad(connectionId: string, allowRetry: boolean): void {
+  private _startRootSchemaLoad(
+    connectionId: string,
+    allowRetry: boolean,
+  ): void {
     const driver = this.getDriver(connectionId);
     const config = this.getConnection(connectionId);
     if (!driver || !config) {
       return;
     }
-    const generation = this._getSchemaGeneration(connectionId);
-    let entry = this._schemaCacheMap.get(connectionId);
-    if (!entry || entry.generation !== generation) {
-      entry = createSchemaCacheEntry(generation);
-      this._schemaCacheMap.set(connectionId, entry);
-    }
+
+    const entry = this._getOrCreateSchemaCacheEntry(connectionId, config);
+    const rootEntry = this._getOrCreateScopeEntry(
+      entry,
+      CONNECTION_ROOT_SCOPE,
+      true,
+    );
+
     if (entry.loading) {
       return;
     }
-    if (entry.status === "loaded") {
-      return;
-    }
-    if (entry.status === "error" && !allowRetry) {
+
+    const baselineKey = entry.defaultDatabaseName
+      ? getExplorerSchemaScopeKey({
+          kind: "database",
+          database: entry.defaultDatabaseName,
+        })
+      : undefined;
+    const baselineEntry = baselineKey
+      ? entry.scopes.get(baselineKey)
+      : undefined;
+
+    if (
+      rootEntry.status === "loaded" &&
+      (!entry.defaultDatabaseName || baselineEntry?.status === "loaded")
+    ) {
       return;
     }
 
-    const capturedEntry = entry;
-    this._publishSchemaState(connectionId, capturedEntry, generation, {
-      snapshot: capturedEntry.snapshot,
-      status: "loading",
-      isPartial: capturedEntry.snapshot.databases.length > 0,
-    });
+    if (rootEntry.status === "error" && !allowRetry) {
+      return;
+    }
 
-    capturedEntry.loading = this._loadSchemaInternal(
-      driver,
-      config,
-      (snapshot) => {
-        this._publishSchemaState(connectionId, capturedEntry, generation, {
-          snapshot,
-          status: "loading",
-          isPartial: true,
-        });
-      },
-    )
-      .then((snapshot) => {
-        this._publishSchemaState(
+    rootEntry.status = "loading";
+    rootEntry.isPartial = rootEntry.snapshot.databases.length > 0;
+    delete rootEntry.error;
+    this._commitAggregateSchemaState(connectionId, entry);
+
+    let rootLoadPromise: Promise<void> | null = null;
+    rootLoadPromise = (async () => {
+      try {
+        const { catalogSnapshot, defaultDatabaseName } =
+          await this._loadConnectionRootCatalog(driver, config);
+        if (!this._isLiveScopeEntry(connectionId, entry, rootEntry)) {
+          return;
+        }
+
+        entry.defaultDatabaseName = defaultDatabaseName;
+        rootEntry.snapshot = catalogSnapshot;
+        rootEntry.status = "loaded";
+        rootEntry.isPartial = false;
+        rootEntry.fullyLoaded = true;
+        delete rootEntry.error;
+
+        if (defaultDatabaseName) {
+          const defaultDatabaseEntry = this._getOrCreateScopeEntry(
+            entry,
+            {
+              kind: "database",
+              database: defaultDatabaseName,
+            },
+            true,
+          );
+
+          defaultDatabaseEntry.retainOnCollapse = true;
+          if (
+            !defaultDatabaseEntry.loading &&
+            defaultDatabaseEntry.status !== "loaded"
+          ) {
+            defaultDatabaseEntry.status = "loading";
+            defaultDatabaseEntry.isPartial =
+              defaultDatabaseEntry.snapshot.databases.length > 0;
+            delete defaultDatabaseEntry.error;
+          }
+        }
+
+        if (!this._commitAggregateSchemaState(connectionId, entry)) {
+          return;
+        }
+
+        if (!defaultDatabaseName) {
+          return;
+        }
+
+        this._startDatabaseScopeLoad(
           connectionId,
-          capturedEntry,
-          generation,
-          {
-            snapshot,
-            status: "loaded",
-            isPartial: false,
-          },
+          defaultDatabaseName,
           true,
+          true,
+          "baseline",
         );
-      })
-      .catch((err: unknown) => {
+
+        const liveBaselineEntry = entry.scopes.get(
+          getExplorerSchemaScopeKey({
+            kind: "database",
+            database: defaultDatabaseName,
+          }),
+        );
+        if (liveBaselineEntry?.loading) {
+          try {
+            await liveBaselineEntry.loading;
+          } catch {}
+        }
+      } catch (err: unknown) {
+        if (!this._isLiveScopeEntry(connectionId, entry, rootEntry)) {
+          return;
+        }
+
         const error = normalizeUnknownError(err);
-        this._publishSchemaState(connectionId, capturedEntry, generation, {
-          snapshot: capturedEntry.snapshot,
-          status: "error",
-          isPartial: capturedEntry.snapshot.databases.length > 0,
-          error: error.message,
-        });
-      });
+        rootEntry.status = "error";
+        rootEntry.isPartial = rootEntry.snapshot.databases.length > 0;
+        rootEntry.error = error.message;
+        this._commitAggregateSchemaState(connectionId, entry);
+      } finally {
+        if (
+          rootLoadPromise &&
+          this._schemaCacheMap.get(connectionId) === entry &&
+          entry.loading === rootLoadPromise
+        ) {
+          entry.loading = null;
+        }
+      }
+    })();
+
+    entry.loading = rootLoadPromise;
   }
-  private async _loadSchemaInternal(
+
+  private _startDatabaseScopeLoad(
+    connectionId: string,
+    databaseName: string,
+    allowRetry: boolean,
+    retainOnCollapse: boolean,
+    loadMode: DatabaseLoadMode,
+  ): void {
+    const driver = this.getDriver(connectionId);
+    const config = this.getConnection(connectionId);
+    if (!driver || !config) {
+      return;
+    }
+
+    const entry = this._getOrCreateSchemaCacheEntry(connectionId, config);
+    const databaseScope: ExplorerSchemaScope = {
+      kind: "database",
+      database: databaseName,
+    };
+    const databaseEntry = this._getOrCreateScopeEntry(
+      entry,
+      databaseScope,
+      retainOnCollapse,
+    );
+
+    if (retainOnCollapse) {
+      databaseEntry.retainOnCollapse = true;
+    }
+
+    if (databaseEntry.loading) {
+      return;
+    }
+
+    if (databaseEntry.status === "loaded") {
+      if (loadMode === "expanded" || databaseEntry.fullyLoaded) {
+        return;
+      }
+    }
+
+    if (databaseEntry.status === "error" && !allowRetry) {
+      return;
+    }
+
+    databaseEntry.status = "loading";
+    databaseEntry.isPartial = databaseEntry.snapshot.databases.length > 0;
+    delete databaseEntry.error;
+    this._commitAggregateSchemaState(connectionId, entry);
+
+    let databaseLoadPromise: Promise<void> | null = null;
+    databaseLoadPromise = (async () => {
+      try {
+        const result = await this._loadDatabaseScopeInternal(
+          driver,
+          databaseName,
+          loadMode,
+        );
+        if (!this._isLiveScopeEntry(connectionId, entry, databaseEntry)) {
+          return;
+        }
+
+        databaseEntry.snapshot = createScopeSnapshotForDatabase(
+          result.database,
+        );
+        databaseEntry.status = "loaded";
+        databaseEntry.isPartial = false;
+        databaseEntry.fragment = {
+          database: cloneSchemaSnapshotDatabaseEntry(result.database),
+        };
+        databaseEntry.fullyLoaded =
+          loadMode === "baseline" || result.database.schemas.length <= 1;
+        delete databaseEntry.error;
+
+        for (const schema of result.loadedSchemas) {
+          this._upsertLoadedSchemaScope(
+            entry,
+            databaseName,
+            schema,
+            retainOnCollapse,
+          );
+        }
+
+        this._commitAggregateSchemaState(connectionId, entry, true);
+      } catch (err: unknown) {
+        if (!this._isLiveScopeEntry(connectionId, entry, databaseEntry)) {
+          return;
+        }
+
+        const error = normalizeUnknownError(err);
+        databaseEntry.status = "error";
+        databaseEntry.isPartial = databaseEntry.snapshot.databases.length > 0;
+        databaseEntry.error = error.message;
+        this._commitAggregateSchemaState(connectionId, entry);
+      } finally {
+        if (
+          databaseLoadPromise &&
+          this._isLiveScopeEntry(connectionId, entry, databaseEntry) &&
+          databaseEntry.loading === databaseLoadPromise
+        ) {
+          databaseEntry.loading = null;
+        }
+      }
+    })();
+
+    databaseEntry.loading = databaseLoadPromise;
+  }
+
+  private _startSchemaScopeLoad(
+    connectionId: string,
+    databaseName: string,
+    schemaName: string,
+    allowRetry: boolean,
+    retainOnCollapse: boolean,
+  ): void {
+    const driver = this.getDriver(connectionId);
+    const config = this.getConnection(connectionId);
+    if (!driver || !config) {
+      return;
+    }
+
+    const entry = this._getOrCreateSchemaCacheEntry(connectionId, config);
+    const schemaScope: ExplorerSchemaScope = {
+      kind: "schema",
+      database: databaseName,
+      schema: schemaName,
+    };
+    const schemaEntry = this._getOrCreateScopeEntry(
+      entry,
+      schemaScope,
+      retainOnCollapse,
+    );
+
+    if (retainOnCollapse) {
+      schemaEntry.retainOnCollapse = true;
+    }
+
+    if (schemaEntry.loading || schemaEntry.status === "loaded") {
+      return;
+    }
+
+    if (schemaEntry.status === "error" && !allowRetry) {
+      return;
+    }
+
+    schemaEntry.status = "loading";
+    schemaEntry.isPartial = schemaEntry.snapshot.databases.length > 0;
+    delete schemaEntry.error;
+    this._commitAggregateSchemaState(connectionId, entry);
+
+    let schemaLoadPromise: Promise<void> | null = null;
+    schemaLoadPromise = (async () => {
+      try {
+        const schema = await this._loadSchemaScopeInternal(
+          driver,
+          databaseName,
+          schemaName,
+        );
+        if (!this._isLiveScopeEntry(connectionId, entry, schemaEntry)) {
+          return;
+        }
+
+        schemaEntry.snapshot = createScopeSnapshotForSchema(
+          databaseName,
+          schema,
+        );
+        schemaEntry.status = "loaded";
+        schemaEntry.isPartial = false;
+        schemaEntry.fragment = {
+          schema: cloneSchemaSnapshotSchemaEntry(schema),
+        };
+        schemaEntry.fullyLoaded = true;
+        delete schemaEntry.error;
+        this._commitAggregateSchemaState(connectionId, entry, true);
+      } catch (err: unknown) {
+        if (!this._isLiveScopeEntry(connectionId, entry, schemaEntry)) {
+          return;
+        }
+
+        const error = normalizeUnknownError(err);
+        schemaEntry.status = "error";
+        schemaEntry.isPartial = schemaEntry.snapshot.databases.length > 0;
+        schemaEntry.error = error.message;
+        this._commitAggregateSchemaState(connectionId, entry);
+      } finally {
+        if (
+          schemaLoadPromise &&
+          this._isLiveScopeEntry(connectionId, entry, schemaEntry) &&
+          schemaEntry.loading === schemaLoadPromise
+        ) {
+          schemaEntry.loading = null;
+        }
+      }
+    })();
+
+    schemaEntry.loading = schemaLoadPromise;
+  }
+
+  private _upsertLoadedSchemaScope(
+    entry: ConnectionSchemaCacheEntry,
+    databaseName: string,
+    schema: SchemaSnapshotSchemaEntry,
+    retainOnCollapse: boolean,
+  ): void {
+    const schemaEntry = this._getOrCreateScopeEntry(
+      entry,
+      {
+        kind: "schema",
+        database: databaseName,
+        schema: schema.name,
+      },
+      retainOnCollapse,
+    );
+
+    schemaEntry.snapshot = createScopeSnapshotForSchema(databaseName, schema);
+    schemaEntry.status = "loaded";
+    schemaEntry.isPartial = false;
+    schemaEntry.fragment = {
+      schema: cloneSchemaSnapshotSchemaEntry(schema),
+    };
+    schemaEntry.retainOnCollapse =
+      schemaEntry.retainOnCollapse || retainOnCollapse;
+    schemaEntry.fullyLoaded = true;
+    schemaEntry.loading = null;
+    delete schemaEntry.error;
+  }
+
+  private async _loadConnectionRootCatalog(
     driver: IDBDriver,
     config: ConnectionConfig,
-    onProgress?: (snapshot: SchemaSnapshot) => void,
-  ): Promise<SchemaSnapshot> {
-    const configuredDb =
-      config.database || config.serviceName || (config.filePath ? "main" : "");
+  ): Promise<{
+    catalogSnapshot: SchemaSnapshot;
+    defaultDatabaseName: string;
+  }> {
+    const configuredDb = getConfiguredDefaultDatabaseName(config);
     const allDbs = await driver.listDatabases().catch(() => []);
-    const databaseInfoMap = new Map(
-      allDbs.map((database) => [database.name, database] as const),
-    );
     const databaseNames = [
       ...new Set(
         [configuredDb, ...allDbs.map((database) => database.name)].filter(
@@ -523,92 +1451,131 @@ export class ConnectionManager {
         ),
       ),
     ];
-    if (databaseNames.length === 0) {
-      return createEmptySchemaSnapshot();
+
+    return {
+      catalogSnapshot: {
+        databases: databaseNames.map((databaseName) => ({
+          name: databaseName,
+          schemas: [],
+        })),
+      },
+      defaultDatabaseName: configuredDb || databaseNames[0] || "",
+    };
+  }
+
+  private async _loadDatabaseScopeInternal(
+    driver: IDBDriver,
+    databaseName: string,
+    loadMode: DatabaseLoadMode,
+  ): Promise<DatabaseScopeLoadResult> {
+    const schemas = await driver.listSchemas(databaseName).catch(() => []);
+    const schemaNames = [
+      ...new Set(
+        (schemas.length > 0 ? schemas : [{ name: databaseName }])
+          .map((schema) => schema.name)
+          .filter(
+            (name): name is string =>
+              typeof name === "string" && name.length > 0,
+          ),
+      ),
+    ];
+
+    if (schemaNames.length <= 1) {
+      const schema = await this._loadSchemaScopeInternal(
+        driver,
+        databaseName,
+        schemaNames[0] ?? databaseName,
+      );
+
+      return {
+        database: {
+          name: databaseName,
+          schemas: [schema],
+        },
+        loadedSchemas: [schema],
+      };
     }
 
-    const columnMetadataDatabase = configuredDb || databaseNames[0] || "";
-    const partialDatabases: Array<SchemaSnapshotDatabaseEntry | undefined> =
-      new Array(databaseNames.length);
-    const databases = await pMapWithLimit(
-      databaseNames.map((databaseName, index) => ({ databaseName, index })),
-      4,
-      async ({ databaseName, index }): Promise<SchemaSnapshotDatabaseEntry> => {
-        const schemasFromDatabase = databaseInfoMap.get(databaseName)?.schemas;
-        const schemas =
-          schemasFromDatabase && schemasFromDatabase.length > 0
-            ? schemasFromDatabase
-            : await driver
-                .listSchemas(databaseName)
-                .catch(() => [{ name: databaseName }]);
-        const perSchemaResults = await pMapWithLimit(
-          schemas,
-          4,
-          async (schema) => {
-            const objects = await driver
-              .listObjects(databaseName, schema.name)
-              .catch(() => []);
-            const objectsForSchema = objects.filter(
-              (object) =>
-                object.type === "table" ||
-                object.type === "view" ||
-                object.type === "function" ||
-                object.type === "procedure",
-            );
-            const loadColumns = databaseName === columnMetadataDatabase;
-            const allColumns = loadColumns
-              ? await pMapWithLimit(objectsForSchema, 10, async (object) => {
-                  if (object.type === "table" || object.type === "view") {
-                    try {
-                      return await driver.describeTable(
-                        databaseName,
-                        schema.name,
-                        object.name,
-                      );
-                    } catch {
-                      return [];
-                    }
-                  }
-                  return [];
-                })
-              : objectsForSchema.map(() => []);
-
-            return {
-              name: schema.name,
-              objects: objectsForSchema.map<SchemaSnapshotObjectEntry>(
-                (object, index) => ({
-                  name: object.name,
-                  type: object.type,
-                  columns:
-                    object.type === "table" || object.type === "view"
-                      ? allColumns[index].map((column) => ({
-                          name: column.name,
-                          type: column.type,
-                        }))
-                      : [],
-                }),
-              ),
-            };
-          },
-        );
-        const databaseEntry = {
+    if (loadMode === "expanded") {
+      return {
+        database: {
           name: databaseName,
-          schemas: perSchemaResults,
-        };
+          schemas: schemaNames.map((schemaName) => ({
+            name: schemaName,
+            objects: [],
+          })),
+        },
+        loadedSchemas: [],
+      };
+    }
 
-        partialDatabases[index] = databaseEntry;
-        onProgress?.({
-          databases: partialDatabases.filter(
-            (database): database is SchemaSnapshotDatabaseEntry =>
-              database !== undefined,
-          ),
-        });
+    const loadedSchemas = await pMapWithLimit(
+      schemaNames,
+      4,
+      async (schemaName) =>
+        this._loadSchemaScopeInternal(driver, databaseName, schemaName),
+    );
 
-        return databaseEntry;
+    return {
+      database: {
+        name: databaseName,
+        schemas: loadedSchemas,
+      },
+      loadedSchemas,
+    };
+  }
+
+  private async _loadSchemaScopeInternal(
+    driver: IDBDriver,
+    databaseName: string,
+    schemaName: string,
+  ): Promise<SchemaSnapshotSchemaEntry> {
+    const objects = await driver
+      .listObjects(databaseName, schemaName)
+      .catch(() => []);
+    const objectsForSchema = objects.filter(
+      (object) =>
+        object.type === "table" ||
+        object.type === "view" ||
+        object.type === "function" ||
+        object.type === "procedure",
+    );
+    const describedColumns = await pMapWithLimit(
+      objectsForSchema,
+      10,
+      async (object) => {
+        if (object.type !== "table" && object.type !== "view") {
+          return [];
+        }
+
+        try {
+          return await driver.describeTable(
+            databaseName,
+            schemaName,
+            object.name,
+          );
+        } catch {
+          return [];
+        }
       },
     );
 
-    return { databases };
+    return {
+      name: schemaName,
+      objects: objectsForSchema.map<SchemaSnapshotObjectEntry>(
+        (object, index) => ({
+          name: object.name,
+          type: object.type,
+          columns:
+            object.type === "table" || object.type === "view"
+              ? describedColumns[index].map((column) => ({
+                  name: column.name,
+                  type: column.type,
+                }))
+              : [],
+        }),
+      ),
+    };
   }
   async testConnection(
     config: Omit<ConnectionConfig, "id">,

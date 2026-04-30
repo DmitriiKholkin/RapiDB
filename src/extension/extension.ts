@@ -1,5 +1,9 @@
 import * as vscode from "vscode";
-import type { BookmarkEntry, HistoryEntry } from "./connectionManager";
+import type {
+  BookmarkEntry,
+  ExplorerSchemaScope,
+  HistoryEntry,
+} from "./connectionManager";
 import { ConnectionManager } from "./connectionManager";
 import {
   confirmBookmarkRemoval,
@@ -78,6 +82,38 @@ function createBadgeUpdater(
           }
         : undefined;
   };
+}
+
+function getExplorerSchemaScopeForNode(
+  node: RapiDBNode | undefined,
+): ExplorerSchemaScope | undefined {
+  if (!node?.connectionId) {
+    return undefined;
+  }
+
+  if (
+    node.kind === "connectionNode_connected" ||
+    node.kind === "connectionNode_disconnected"
+  ) {
+    return { kind: "connectionRoot" };
+  }
+
+  if (node.kind === "database" && node.database) {
+    return {
+      kind: "database",
+      database: node.database,
+    };
+  }
+
+  if (node.kind === "schema" && node.database && node.schema) {
+    return {
+      kind: "schema",
+      database: node.database,
+      schema: node.schema,
+    };
+  }
+
+  return undefined;
 }
 
 function showSavedQuery(
@@ -425,7 +461,10 @@ function registerCommands(
   });
 
   reg(CMD.refresh, (node?: RapiDBNode) => {
-    connectionManager.refreshSchemaCache(node?.connectionId);
+    connectionManager.refreshSchemaCache({
+      connectionId: node?.connectionId,
+      reason: "manual",
+    });
     connectionProvider.refreshConnectionTree(node?.connectionId);
   });
 }
@@ -446,6 +485,25 @@ export function activate(context: vscode.ExtensionContext): void {
     treeDataProvider: connectionProvider,
     showCollapseAll: true,
   });
+  context.subscriptions.push(
+    treeView.onDidExpandElement(({ element }) => {
+      const scope = getExplorerSchemaScopeForNode(element);
+      if (!scope) {
+        return;
+      }
+
+      connectionManager.markSchemaScopeExpanded(element.connectionId, scope);
+      connectionManager.ensureSchemaScopeLoading(element.connectionId, scope);
+    }),
+    treeView.onDidCollapseElement(({ element }) => {
+      const scope = getExplorerSchemaScopeForNode(element);
+      if (!scope) {
+        return;
+      }
+
+      connectionManager.markSchemaScopeCollapsed(element.connectionId, scope);
+    }),
+  );
   const updateExplorerBadge = createBadgeUpdater(treeView, connectionManager);
   updateExplorerBadge();
   context.subscriptions.push(treeView, connectionProvider.disposable);

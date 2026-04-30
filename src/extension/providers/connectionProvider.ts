@@ -1,5 +1,9 @@
 import * as vscode from "vscode";
-import type { ConnectionConfig, ConnectionManager } from "../connectionManager";
+import type {
+  ConnectionConfig,
+  ConnectionManager,
+  ExplorerSchemaScope,
+} from "../connectionManager";
 import type {
   SchemaSnapshotSchemaEntry,
   SchemaSnapshotState,
@@ -255,7 +259,9 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       return [];
     }
 
-    const state = this.getSchemaState(element.connectionId);
+    const state = this.getSchemaState(element.connectionId, {
+      kind: "connectionRoot",
+    });
     const databaseNodes = state.snapshot.databases.map((database) =>
       this.makeDatabaseNode(element.connectionId, database.name),
     );
@@ -275,7 +281,10 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       return [];
     }
 
-    const state = this.getSchemaState(element.connectionId);
+    const state = this.getSchemaState(element.connectionId, {
+      kind: "database",
+      database: databaseName,
+    });
     const database = state.snapshot.databases.find(
       (entry) => entry.name === databaseName,
     );
@@ -307,7 +316,11 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       return [];
     }
 
-    const state = this.getSchemaState(element.connectionId);
+    const state = this.getSchemaState(element.connectionId, {
+      kind: "schema",
+      database: databaseName,
+      schema: schemaName,
+    });
     const schema = state.snapshot.databases
       .find((entry) => entry.name === databaseName)
       ?.schemas.find((entry) => entry.name === schemaName);
@@ -332,7 +345,11 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       return [];
     }
 
-    const state = this.getSchemaState(element.connectionId);
+    const state = this.getSchemaState(element.connectionId, {
+      kind: "schema",
+      database: databaseName,
+      schema: schemaName,
+    });
     const schema = state.snapshot.databases
       .find((entry) => entry.name === databaseName)
       ?.schemas.find((entry) => entry.name === schemaName);
@@ -366,9 +383,12 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     );
   }
 
-  private getSchemaState(connectionId: string): SchemaSnapshotState {
-    this.connectionManager.ensureSchemaSnapshotLoading(connectionId);
-    return this.connectionManager.getSchemaSnapshotState(connectionId);
+  private getSchemaState(
+    connectionId: string,
+    scope: ExplorerSchemaScope,
+  ): SchemaSnapshotState {
+    this.connectionManager.ensureSchemaScopeLoading(connectionId, scope);
+    return this.connectionManager.getSchemaSnapshotState(connectionId, scope);
   }
 
   private appendStateNodes(
@@ -378,7 +398,9 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     loadingLabel: string,
   ): RapiDBNode[] {
     if (state.status === "loading") {
-      return [...nodes, this.makeLoadingNode(connectionId, loadingLabel)];
+      return nodes.length > 0
+        ? nodes
+        : [this.makeLoadingNode(connectionId, loadingLabel)];
     }
 
     if (state.status === "error") {

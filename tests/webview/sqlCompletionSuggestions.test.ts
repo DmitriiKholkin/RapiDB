@@ -38,6 +38,55 @@ describe("buildSqlCompletionSuggestions", () => {
     ).toContain("id");
   });
 
+  it("surfaces newly expanded scope columns only after the shared cache merges them", () => {
+    const partialSchema = [
+      {
+        database: "app_db",
+        schema: "public",
+        object: "users",
+        type: "table" as const,
+        columns: [{ name: "id", type: "int" }],
+      },
+      {
+        database: "archive_db",
+        schema: "audit",
+        object: "sync_events",
+        type: "table" as const,
+        columns: [],
+      },
+    ];
+    const mergedSchema = [
+      partialSchema[0],
+      {
+        database: "archive_db",
+        schema: "audit",
+        object: "sync_events",
+        type: "table" as const,
+        columns: [{ name: "payload", type: "jsonb" }],
+      },
+    ];
+
+    expect(
+      buildSqlCompletionSuggestions(partialSchema, "archive_db.audit.").map(
+        (item) => item.label,
+      ),
+    ).toContain("sync_events");
+
+    expect(
+      buildSqlCompletionSuggestions(
+        partialSchema,
+        "archive_db.audit.sync_events.",
+      ),
+    ).toEqual([]);
+
+    expect(
+      buildSqlCompletionSuggestions(
+        mergedSchema,
+        "archive_db.audit.sync_events.",
+      ).map((item) => item.label),
+    ).toContain("payload");
+  });
+
   it("treats collapsed database/schema names as direct object containers", () => {
     const schema = [
       {

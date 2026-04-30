@@ -9,7 +9,7 @@ import type {
   TypeCategory,
   ValueSemantics,
 } from "../../src/extension/dbDrivers/types";
-import { filterOperatorsForCategory } from "../../src/extension/dbDrivers/types";
+import { resolveFilterOperators } from "../../src/extension/dbDrivers/types";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 import { formatScalarValueForDisplay } from "../../src/webview/utils/valueFormatting";
 
@@ -60,9 +60,10 @@ function buildColumn(
     isForeignKey: false,
     isAutoIncrement: false,
     filterable,
-    filterOperators: filterable
-      ? filterOperatorsForCategory(category)
-      : ["is_null", "is_not_null"],
+    filterOperators: resolveFilterOperators(category, {
+      filterable,
+      nullable: true,
+    }),
     valueSemantics,
   };
 }
@@ -152,6 +153,29 @@ const edgeFilterabilityExpectations: Record<
   ],
   sqlite: [],
 };
+
+describe("resolveFilterOperators", () => {
+  it("includes null operators only for nullable columns", () => {
+    expect(
+      resolveFilterOperators("text", { filterable: true, nullable: true }),
+    ).toEqual(["like", "is_null", "is_not_null"]);
+    expect(
+      resolveFilterOperators("text", { filterable: true, nullable: false }),
+    ).toEqual(["like"]);
+  });
+
+  it("returns null-only operators for nullable non-filterable columns", () => {
+    expect(
+      resolveFilterOperators("spatial", { filterable: false, nullable: true }),
+    ).toEqual(["is_null", "is_not_null"]);
+    expect(
+      resolveFilterOperators("spatial", {
+        filterable: false,
+        nullable: false,
+      }),
+    ).toEqual([]);
+  });
+});
 
 function sampleValueFor(
   category: TypeCategory,
@@ -295,7 +319,10 @@ function buildFilterColumn(
     isForeignKey: false,
     isAutoIncrement: false,
     filterable: true,
-    filterOperators: filterOperatorsForCategory(category),
+    filterOperators: resolveFilterOperators(category, {
+      filterable: true,
+      nullable: true,
+    }),
     valueSemantics: "plain",
   };
 }

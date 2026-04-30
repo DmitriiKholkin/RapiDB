@@ -134,6 +134,15 @@ function toDraftEditInitialValue(value: unknown): string {
 
 type PendingRestoreState = Map<string, Map<string, unknown>>;
 
+interface FetchSnapshot {
+  page: number;
+  pageSize: number;
+  sort: {
+    column: string;
+    direction: "asc" | "desc";
+  } | null;
+}
+
 function stablePrimaryKeyPart(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map((item) => stablePrimaryKeyPart(item));
@@ -356,10 +365,14 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
   const [rows, setRows] = useState<Row[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [hasCommittedData, setHasCommittedData] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [readError, setReadError] = useState<string | null>(null);
   const [filterError, setFilterError] = useState<string | null>(null);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(initialPageSize);
+  const [requestedPage, setRequestedPage] = useState(1);
+  const [requestedPageSize, setRequestedPageSize] = useState(initialPageSize);
   const [filterDrafts, setFilterDrafts] = useState<FilterDraftMap>({});
   const [debouncedFilterDrafts, setDebouncedFilterDrafts] =
     useState<FilterDraftMap>({});
@@ -379,6 +392,10 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
     column: string;
     direction: "asc" | "desc";
   } | null>(null);
+  const [requestedSort, setRequestedSort] = useState<{
+    column: string;
+    direction: "asc" | "desc";
+  } | null>(null);
   const [mutationPreview, setMutationPreview] =
     useState<TableMutationPreviewPayload | null>(null);
   const [exportChoice, setExportChoice] = useState<{
@@ -394,13 +411,17 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
   const colSizesInitedRef = useRef(false);
 
   const columnsRef = useRef<ColumnMeta[]>([]);
+  const pendingPrimaryKeyColumnsRef = useRef<string[]>([]);
+  const pendingReadOnlyTableRef = useRef(isView);
   const applyPendingSnapshotRef = useRef<PendingEdits>(new Map());
   const applyRowIndexesRef = useRef<number[]>([]);
   const pendingRestoreRef = useRef<PendingRestoreState | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const scrollPreserveRef = useRef<number | null>(null);
-  const sortRef = useRef(sort);
+  const requestedSortRef = useRef(requestedSort);
+  const fetchSnapshotsRef = useRef<Map<number, FetchSnapshot>>(new Map());
+  const hasCommittedDataRef = useRef(hasCommittedData);
 
   const selectedRef = useRef(selected);
   const rowsRef = useRef(rows);
@@ -412,9 +433,10 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
   pendingEditsRef.current = pendingEdits;
 
   selectedRef.current = selected;
-  sortRef.current = sort;
+  requestedSortRef.current = requestedSort;
   rowsRef.current = rows;
   pkColsRef.current = pkCols;
+  hasCommittedDataRef.current = hasCommittedData;
 
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
   const pendingCount = pendingEdits.size;
@@ -432,42 +454,59 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
   const fetchEpochRef = useRef(0);
   const [initTick, setInitTick] = useState(0);
   const showMissingPrimaryKeyNotice =
-    !readOnlyTable && initializedRef.current && !hasPrimaryKey;
+    hasCommittedData &&
+    !readOnlyTable &&
+    initializedRef.current &&
+    !hasPrimaryKey;
 
-  const pageRef = useRef(page);
-  const pageSizeRef = useRef(pageSize);
+  const requestedPageRef = useRef(requestedPage);
+  const requestedPageSizeRef = useRef(requestedPageSize);
   const debouncedFilterDraftsRef = useRef(debouncedFilterDrafts);
-  pageRef.current = page;
-  pageSizeRef.current = pageSize;
+  requestedPageRef.current = requestedPage;
+  requestedPageSizeRef.current = requestedPageSize;
   debouncedFilterDraftsRef.current = debouncedFilterDrafts;
 
   const fetchTrigger = useMemo(
     () =>
       JSON.stringify({
         initTick,
-        page,
-        pageSize,
+        page: requestedPage,
+        pageSize: requestedPageSize,
         filters: debouncedFilterDrafts,
-        sortColumn: sort?.column ?? null,
-        sortDirection: sort?.direction ?? null,
+        sortColumn: requestedSort?.column ?? null,
+        sortDirection: requestedSort?.direction ?? null,
       }),
-    [debouncedFilterDrafts, initTick, page, pageSize, sort],
+    [
+      debouncedFilterDrafts,
+      initTick,
+      requestedPage,
+      requestedPageSize,
+      requestedSort,
+    ],
   );
 
   const fetchPage = useCallback(() => {
     if (!initializedRef.current) return;
     const epoch = ++fetchEpochRef.current;
+    const snapshot: FetchSnapshot = {
+      page: requestedPageRef.current,
+      pageSize: requestedPageSizeRef.current,
+      sort: requestedSortRef.current,
+    };
+    fetchSnapshotsRef.current.clear();
+    fetchSnapshotsRef.current.set(epoch, snapshot);
     setLoading(true);
+    setReadError(null);
     const activeFilters = serializeFilterDrafts(
       columnsRef.current,
       debouncedFilterDraftsRef.current,
     );
     postMessage("fetchPage", {
       fetchId: epoch,
-      page: pageRef.current,
-      pageSize: pageSizeRef.current,
+      page: snapshot.page,
+      pageSize: snapshot.pageSize,
       filters: activeFilters,
-      sort: sortRef.current,
+      sort: snapshot.sort,
     });
   }, []);
 
@@ -482,6 +521,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
 
   useEffect(() => {
     setReadOnlyTable(isView);
+    pendingReadOnlyTableRef.current = isView;
   }, [isView]);
 
   useEffect(() => {
@@ -490,14 +530,47 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
       primaryKeyColumns: string[];
     }>("tableInit", ({ columns: cols, primaryKeyColumns }) => {
       columnsRef.current = cols;
+      pendingPrimaryKeyColumnsRef.current = primaryKeyColumns;
+      pendingReadOnlyTableRef.current = isView;
 
       initializedRef.current = true;
-      setColumns(cols);
-      setPkCols(primaryKeyColumns);
-      setReadOnlyTable(isView);
+      fetchEpochRef.current += 1;
+      fetchSnapshotsRef.current.clear();
+      pendingRestoreRef.current = null;
+      scrollPreserveRef.current = null;
+      colSizesInitedRef.current = false;
+      applyPendingSnapshotRef.current = new Map();
+      applyRowIndexesRef.current = [];
+
+      setLoading(true);
+      setHasCommittedData(false);
+      setColumns([]);
+      setPkCols([]);
+      setRows([]);
+      setTotalCount(0);
+      setError(null);
+      setReadError(null);
+      setFilterError(null);
+      setPage(1);
+      setPageSize(initialPageSize);
+      setRequestedPage(1);
+      setRequestedPageSize(initialPageSize);
+      setSort(null);
+      setRequestedSort(null);
+      setFilterDrafts({});
+      setDebouncedFilterDrafts({});
+      setSelected(new Set());
+      setPending(new Map());
+      setApplying(false);
+      setDeleting(false);
+      setInserting(false);
+      setMutationPreview(null);
+      setExportChoice(null);
       setNewRow(null);
       setEditCell(null);
       setMutErr(null);
+      setApplyStatus(null);
+      setColSizes({});
 
       setInitTick((t) => t + 1);
     });
@@ -507,6 +580,13 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
       totalCount: number;
     }>("tableData", ({ fetchId, rows: r, totalCount: t }) => {
       if (fetchId !== undefined && fetchId !== fetchEpochRef.current) return;
+      const snapshot = (fetchId !== undefined
+        ? fetchSnapshotsRef.current.get(fetchId)
+        : fetchSnapshotsRef.current.get(fetchEpochRef.current)) ?? {
+        page: requestedPageRef.current,
+        pageSize: requestedPageSizeRef.current,
+        sort: requestedSortRef.current,
+      };
       if (!colSizesInitedRef.current && columnsRef.current.length > 0) {
         colSizesInitedRef.current = true;
         setColSizes(
@@ -521,20 +601,29 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
           ),
         );
       }
+      setColumns(columnsRef.current);
+      setPkCols(pendingPrimaryKeyColumnsRef.current);
+      setReadOnlyTable(pendingReadOnlyTableRef.current);
       setRows(r);
       setTotalCount(t);
+      setPage(snapshot.page);
+      setPageSize(snapshot.pageSize);
+      setSort(snapshot.sort);
       setLoading(false);
+      setHasCommittedData(true);
       setError(null);
+      setReadError(null);
       setFilterError(null);
       setSelected(new Set());
       const restoredPending = restorePendingEdits(
         pendingRestoreRef.current,
         r,
-        pkColsRef.current,
+        pendingPrimaryKeyColumnsRef.current,
       );
       pendingRestoreRef.current = null;
       setPending(restoredPending);
       setEditCell(null);
+      fetchSnapshotsRef.current.delete(fetchId ?? fetchEpochRef.current);
 
       const savedScroll = scrollPreserveRef.current;
       scrollPreserveRef.current = null;
@@ -552,14 +641,15 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
       isFilterError?: boolean;
     }>("tableError", ({ fetchId, error: e, isFilterError }) => {
       if (fetchId !== undefined && fetchId !== fetchEpochRef.current) return;
-      if (isFilterError) {
-        setFilterError(e);
-        setRows([]);
-        setTotalCount(0);
-      } else {
+      if (!hasCommittedDataRef.current) {
         setError(e);
+      } else if (isFilterError) {
+        setFilterError(e);
+      } else {
+        setReadError(e);
       }
       setLoading(false);
+      fetchSnapshotsRef.current.delete(fetchId ?? fetchEpochRef.current);
     });
 
     const unApply = onMessage<ApplyResultPayload>(
@@ -683,7 +773,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
       unDelete();
       unMutationPreview();
     };
-  }, [buildPendingUpdatesPayload, fetchPage, isView]);
+  }, [buildPendingUpdatesPayload, fetchPage, initialPageSize, isView]);
 
   useEffect(() => {
     if (!initializedRef.current || fetchTrigger === "") return;
@@ -698,15 +788,15 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
     }
     const t = setTimeout(() => {
       setFilterError(null);
-      setPage(1);
+      setRequestedPage(1);
       setDebouncedFilterDrafts(filterDrafts);
     }, DEBOUNCE);
     return () => clearTimeout(t);
   }, [filterDrafts]);
 
   const handleSort = useCallback((column: string) => {
-    setPage(1);
-    setSort((prev) => {
+    setRequestedPage(1);
+    setRequestedSort((prev) => {
       if (prev?.column === column) {
         if (prev.direction === "asc") {
           return { column, direction: "desc" as const };
@@ -1088,12 +1178,31 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
     );
   }
 
-  const busy = loading || applying || deleting || inserting;
-  const isPaginationLoad = loading && columns.length > 0;
+  const mutationBusy = applying || deleting || inserting;
+  const showRefetchOverlay = loading && hasCommittedData;
+
+  if (!hasCommittedData) {
+    return (
+      <main
+        aria-label={`Table data for ${table}`}
+        aria-busy="true"
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          height: "100vh",
+          overflow: "hidden",
+          position: "relative",
+        }}
+      >
+        <GridLoadingOverlay mode="fullscreen" message="Loading data..." />
+      </main>
+    );
+  }
 
   return (
     <main
       aria-label={`Table data for ${table}`}
+      aria-busy={showRefetchOverlay}
       style={{
         display: "flex",
         flexDirection: "column",
@@ -1102,8 +1211,17 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
         position: "relative",
       }}
     >
+      {showRefetchOverlay && (
+        <GridLoadingOverlay
+          mode="overlay"
+          message="Loading data..."
+          trapFocus
+        />
+      )}
       {filterError && (
         <div
+          role="status"
+          aria-live="polite"
           style={{
             flexShrink: 0,
             padding: "6px 12px",
@@ -1122,6 +1240,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
           <span style={{ flex: 1 }}>{filterError}</span>
           <button
             type="button"
+            aria-label="Dismiss filter error"
             style={{
               background: "none",
               border: "none",
@@ -1134,6 +1253,43 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
             }}
             title="Dismiss"
             onClick={() => setFilterError(null)}
+          >
+            ×
+          </button>
+        </div>
+      )}
+      {readError && (
+        <div
+          role="alert"
+          style={{
+            flexShrink: 0,
+            padding: "6px 12px",
+            fontSize: 12,
+            background: "var(--vscode-inputValidation-errorBackground)",
+            borderBottom: "1px solid var(--vscode-inputValidation-errorBorder)",
+            color: "var(--vscode-errorForeground)",
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+          }}
+        >
+          <span style={{ fontWeight: 600 }}>Error:</span>
+          <span style={{ flex: 1 }}>{readError}</span>
+          <button
+            type="button"
+            aria-label="Dismiss read error"
+            style={{
+              background: "none",
+              border: "none",
+              cursor: "pointer",
+              color: "inherit",
+              opacity: 0.7,
+              fontSize: 14,
+              lineHeight: 1,
+              padding: "0 2px",
+            }}
+            title="Dismiss"
+            onClick={() => setReadError(null)}
           >
             ×
           </button>
@@ -1163,7 +1319,6 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
           </span>
         </div>
       )}
-      {}
       <div
         style={{
           height: TOOLBAR_H,
@@ -1180,8 +1335,8 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
           <>
             <button
               type="button"
-              style={btn("primary", busy || !!newRow)}
-              disabled={busy || !!newRow}
+              style={btn("primary", mutationBusy || !!newRow)}
+              disabled={mutationBusy || !!newRow}
               onClick={() => {
                 setNewRow(createInsertDraft(columnsRef.current));
                 setEditCell(null);
@@ -1194,8 +1349,8 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
             {canSelectAndDeleteRows && (
               <button
                 type="button"
-                style={btn("danger", selected.size === 0 || busy)}
-                disabled={selected.size === 0 || busy}
+                style={btn("danger", selected.size === 0 || mutationBusy)}
+                disabled={selected.size === 0 || mutationBusy}
                 onClick={deleteSelected}
               >
                 <Icon name="trash" size={13} style={{ marginRight: 4 }} />
@@ -1207,8 +1362,8 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
 
         <button
           type="button"
-          style={btn("ghost", busy)}
-          disabled={busy || isPaginationLoad}
+          style={btn("ghost", mutationBusy)}
+          disabled={mutationBusy}
           onClick={fetchPage}
         >
           <Icon name="refresh" size={13} style={{ marginRight: 4 }} />
@@ -1217,7 +1372,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
         <button
           type="button"
           style={btn("ghost")}
-          disabled={busy || isPaginationLoad}
+          disabled={mutationBusy}
           onClick={() => {
             const activeFilters = serializeFilterDrafts(
               columns,
@@ -1236,7 +1391,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
         <button
           type="button"
           style={btn("ghost")}
-          disabled={busy || isPaginationLoad}
+          disabled={mutationBusy}
           onClick={() => {
             const activeFilters = serializeFilterDrafts(
               columns,
@@ -1254,11 +1409,10 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
         </button>
         <div style={{ flex: 1 }} />
         <span style={{ fontSize: 11, opacity: 0.5 }}>
-          {loading ? "Loading…" : `${totalCount.toLocaleString()} rows total`}
+          {`${totalCount.toLocaleString()} rows total`}
         </span>
       </div>
 
-      {}
       {!readOnlyTable && (unsavedRowCount > 0 || applyStatus) && (
         <div
           style={{
@@ -1345,7 +1499,6 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
         </div>
       )}
 
-      {}
       {!readOnlyTable && mutErr && (
         <div
           style={{
@@ -1381,260 +1534,248 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
         </div>
       )}
 
-      {}
       <div
         ref={scrollRef}
         style={{ flex: 1, overflow: "auto", position: "relative" }}
       >
-        {
-          <>
-            {isPaginationLoad && <GridLoadingOverlay />}
-            <table
-              style={{
-                width: tanTable.getTotalSize(),
-                borderCollapse: "collapse",
-                tableLayout: "fixed",
-                fontSize: 12,
-                fontFamily: "var(--vscode-editor-font-family, monospace)",
-              }}
-            >
-              <thead>
-                {tanTable.getHeaderGroups().map((hg) => (
-                  <tr key={hg.id}>
-                    {hg.headers.map((h) => {
-                      const isSel = h.column.id === "__sel";
-                      const colId = h.column.id;
-                      const isSorted = sort?.column === colId;
-                      const sortDir = isSorted
-                        ? (sort?.direction ?? null)
-                        : null;
-                      return (
-                        <th
-                          key={h.id}
-                          style={{
-                            width: h.getSize(),
-                            height: HEADER_H,
-                            padding: isSel ? "0 6px" : "0 8px",
-                            textAlign: isSel ? "center" : "left",
-                            background: isSorted
-                              ? "var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.1))"
-                              : "var(--vscode-editorGroupHeader-tabsBackground)",
-                            borderRight: "1px solid var(--vscode-panel-border)",
-                            position: "sticky",
-                            top: 0,
-                            zIndex: 2,
-                            whiteSpace: "nowrap",
-                            overflow: "hidden",
-                            fontWeight: 600,
-                            boxSizing: "border-box",
-                            userSelect: "none",
-                            cursor: isSel ? "default" : "pointer",
-                          }}
-                          onClick={() => {
-                            if (!isSel) {
-                              handleSort(colId);
-                            }
-                          }}
-                          title={isSel ? undefined : `Sort by ${colId}`}
-                        >
-                          <div
-                            style={{
-                              display: "flex",
-                              alignItems: "center",
-                              justifyContent: isSel ? "center" : "flex-start",
-                              gap: 4,
-                              overflow: "hidden",
-                            }}
-                          >
-                            <span
-                              style={{
-                                overflow: "hidden",
-                                textOverflow: "ellipsis",
-                              }}
-                            >
-                              {flexRender(
-                                h.column.columnDef.header,
-                                h.getContext(),
-                              )}
-                            </span>
-                            {!isSel && (
-                              <span
-                                style={{
-                                  opacity: isSorted ? 1 : 0.25,
-                                  fontSize: 10,
-                                  flexShrink: 0,
-                                }}
-                              >
-                                {sortDir === "asc" ? (
-                                  <Icon name="triangle-up" size={10} />
-                                ) : sortDir === "desc" ? (
-                                  <Icon name="triangle-down" size={10} />
-                                ) : (
-                                  <Icon name="unfold" size={10} />
-                                )}
-                              </span>
-                            )}
-                          </div>
-                          {!isSel && h.column.getCanResize() && (
-                            <button
-                              type="button"
-                              aria-label={`Resize ${colId} column`}
-                              tabIndex={-1}
-                              onMouseDown={(event) => {
-                                event.stopPropagation();
-                                h.getResizeHandler()(event);
-                              }}
-                              onClick={(e) => e.stopPropagation()}
-                              style={{
-                                position: "absolute",
-                                right: 0,
-                                top: 0,
-                                height: "100%",
-                                width: 5,
-                                padding: 0,
-                                border: "none",
-                                cursor: "col-resize",
-                                background: h.column.getIsResizing()
-                                  ? "var(--vscode-focusBorder)"
-                                  : "transparent",
-                              }}
-                            />
-                          )}
-                        </th>
-                      );
-                    })}
-                  </tr>
-                ))}
-                {}
-                <tr>
-                  {tanTable.getHeaderGroups()[0]?.headers.map((h) => {
-                    const isSel = h.column.id === "__sel";
-                    const col = columnsMap.get(h.column.id);
-                    return (
-                      <th
-                        key={`${h.id}_f`}
+        <table
+          style={{
+            width: tanTable.getTotalSize(),
+            borderCollapse: "collapse",
+            tableLayout: "fixed",
+            fontSize: 12,
+            fontFamily: "var(--vscode-editor-font-family, monospace)",
+          }}
+        >
+          <thead>
+            {tanTable.getHeaderGroups().map((hg) => (
+              <tr key={hg.id}>
+                {hg.headers.map((h) => {
+                  const isSel = h.column.id === "__sel";
+                  const colId = h.column.id;
+                  const isSorted = sort?.column === colId;
+                  const sortDir = isSorted ? (sort?.direction ?? null) : null;
+                  return (
+                    <th
+                      key={h.id}
+                      style={{
+                        width: h.getSize(),
+                        height: HEADER_H,
+                        padding: isSel ? "0 6px" : "0 8px",
+                        textAlign: isSel ? "center" : "left",
+                        background: isSorted
+                          ? "var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.1))"
+                          : "var(--vscode-editorGroupHeader-tabsBackground)",
+                        borderRight: "1px solid var(--vscode-panel-border)",
+                        position: "sticky",
+                        top: 0,
+                        zIndex: 2,
+                        whiteSpace: "nowrap",
+                        overflow: "hidden",
+                        fontWeight: 600,
+                        boxSizing: "border-box",
+                        userSelect: "none",
+                        cursor: isSel ? "default" : "pointer",
+                      }}
+                      onClick={() => {
+                        if (!isSel) {
+                          handleSort(colId);
+                        }
+                      }}
+                      title={isSel ? undefined : `Sort by ${colId}`}
+                    >
+                      <div
                         style={{
-                          width: h.getSize(),
-                          height: FILTER_H,
-                          padding: isSel ? 0 : "2px 4px",
-                          background:
-                            "var(--vscode-editorGroupHeader-tabsBackground)",
-                          borderBottom: "2px solid var(--vscode-panel-border)",
-                          borderRight: "1px solid var(--vscode-panel-border)",
-                          position: "sticky",
-                          top: HEADER_H,
-                          zIndex: 2,
-                          boxSizing: "border-box",
-
-                          boxShadow:
-                            "0 -1px 0 0 var(--vscode-editorGroupHeader-tabsBackground)",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: isSel ? "center" : "flex-start",
+                          gap: 4,
+                          overflow: "hidden",
                         }}
                       >
-                        {isSel ? (
-                          <span style={SR_ONLY_STYLE}>Selection column</span>
-                        ) : col ? (
-                          <ColumnFilterControl
-                            column={col}
-                            draft={filterDrafts[h.column.id]}
-                            onChange={(nextDraft) =>
-                              updateFilterDraft(h.column.id, nextDraft)
-                            }
-                          />
-                        ) : null}
-                      </th>
-                    );
-                  })}
-                </tr>
-              </thead>
-              <tbody>
-                {virtItems.length > 0 && virtItems[0].start > 0 && (
+                        <span
+                          style={{
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                          }}
+                        >
+                          {flexRender(
+                            h.column.columnDef.header,
+                            h.getContext(),
+                          )}
+                        </span>
+                        {!isSel && (
+                          <span
+                            style={{
+                              opacity: isSorted ? 1 : 0.25,
+                              fontSize: 10,
+                              flexShrink: 0,
+                            }}
+                          >
+                            {sortDir === "asc" ? (
+                              <Icon name="triangle-up" size={10} />
+                            ) : sortDir === "desc" ? (
+                              <Icon name="triangle-down" size={10} />
+                            ) : (
+                              <Icon name="unfold" size={10} />
+                            )}
+                          </span>
+                        )}
+                      </div>
+                      {!isSel && h.column.getCanResize() && (
+                        <button
+                          type="button"
+                          aria-label={`Resize ${colId} column`}
+                          tabIndex={-1}
+                          onMouseDown={(event) => {
+                            event.stopPropagation();
+                            h.getResizeHandler()(event);
+                          }}
+                          onClick={(e) => e.stopPropagation()}
+                          style={{
+                            position: "absolute",
+                            right: 0,
+                            top: 0,
+                            height: "100%",
+                            width: 5,
+                            padding: 0,
+                            border: "none",
+                            cursor: "col-resize",
+                            background: h.column.getIsResizing()
+                              ? "var(--vscode-focusBorder)"
+                              : "transparent",
+                          }}
+                        />
+                      )}
+                    </th>
+                  );
+                })}
+              </tr>
+            ))}
+            <tr>
+              {tanTable.getHeaderGroups()[0]?.headers.map((h) => {
+                const isSel = h.column.id === "__sel";
+                const col = columnsMap.get(h.column.id);
+                return (
+                  <th
+                    key={`${h.id}_f`}
+                    style={{
+                      width: h.getSize(),
+                      height: FILTER_H,
+                      padding: isSel ? 0 : "2px 4px",
+                      background:
+                        "var(--vscode-editorGroupHeader-tabsBackground)",
+                      borderBottom: "2px solid var(--vscode-panel-border)",
+                      borderRight: "1px solid var(--vscode-panel-border)",
+                      position: "sticky",
+                      top: HEADER_H,
+                      zIndex: 2,
+                      boxSizing: "border-box",
+                      boxShadow:
+                        "0 -1px 0 0 var(--vscode-editorGroupHeader-tabsBackground)",
+                    }}
+                  >
+                    {isSel ? (
+                      <span style={SR_ONLY_STYLE}>Selection column</span>
+                    ) : col ? (
+                      <ColumnFilterControl
+                        column={col}
+                        draft={filterDrafts[h.column.id]}
+                        onChange={(nextDraft) =>
+                          updateFilterDraft(h.column.id, nextDraft)
+                        }
+                      />
+                    ) : null}
+                  </th>
+                );
+              })}
+            </tr>
+          </thead>
+          <tbody>
+            {virtItems.length > 0 && virtItems[0].start > 0 && (
+              <tr>
+                <td
+                  colSpan={tanColumns.length}
+                  style={{
+                    height: virtItems[0].start,
+                    padding: 0,
+                    border: "none",
+                  }}
+                />
+              </tr>
+            )}
+            {virtItems.map((vRow) => {
+              if (hasDraftRow && vRow.index === 0) {
+                return (
+                  <DraftTableRow
+                    key={vRow.key}
+                    columns={columns}
+                    visibleColumns={visibleColumns}
+                    draft={newRow}
+                    editingCol={
+                      editCell?.kind === "draft" ? editCell.col : null
+                    }
+                    onStartEdit={handleStartDraftEdit}
+                    onCommit={commitDraftCellEdit}
+                    onCancelEdit={() => setEditCell(null)}
+                  />
+                );
+              }
+
+              const persistedIndex = hasDraftRow ? vRow.index - 1 : vRow.index;
+              const row = tableRows[persistedIndex];
+              const isSelected = selected.has(persistedIndex);
+              const editingCol =
+                editCell?.kind === "persisted" &&
+                editCell.rowIdx === persistedIndex
+                  ? editCell.col
+                  : null;
+
+              return (
+                <TableRow
+                  key={vRow.key}
+                  row={row}
+                  visualIndex={vRow.index}
+                  rowIndex={persistedIndex}
+                  isSelected={isSelected}
+                  pendingCols={pendingEdits.get(persistedIndex)}
+                  columnsMap={columnsMap}
+                  editingCol={editingCol}
+                  onStartEdit={handleStartEdit}
+                />
+              );
+            })}
+            {virtItems.length > 0 &&
+              (() => {
+                const last = virtItems[virtItems.length - 1];
+                const rem = totalVirtH - last.end;
+                return rem > 0 ? (
                   <tr>
                     <td
                       colSpan={tanColumns.length}
-                      style={{
-                        height: virtItems[0].start,
-                        padding: 0,
-                        border: "none",
-                      }}
+                      style={{ height: rem, padding: 0, border: "none" }}
                     />
                   </tr>
-                )}
-                {virtItems.map((vRow) => {
-                  if (hasDraftRow && vRow.index === 0) {
-                    return (
-                      <DraftTableRow
-                        key={vRow.key}
-                        columns={columns}
-                        visibleColumns={visibleColumns}
-                        draft={newRow}
-                        editingCol={
-                          editCell?.kind === "draft" ? editCell.col : null
-                        }
-                        onStartEdit={handleStartDraftEdit}
-                        onCommit={commitDraftCellEdit}
-                        onCancelEdit={() => setEditCell(null)}
-                      />
-                    );
-                  }
-
-                  const persistedIndex = hasDraftRow
-                    ? vRow.index - 1
-                    : vRow.index;
-                  const row = tableRows[persistedIndex];
-                  const isSelected = selected.has(persistedIndex);
-                  const editingCol =
-                    editCell?.kind === "persisted" &&
-                    editCell.rowIdx === persistedIndex
-                      ? editCell.col
-                      : null;
-
-                  return (
-                    <TableRow
-                      key={vRow.key}
-                      row={row}
-                      visualIndex={vRow.index}
-                      rowIndex={persistedIndex}
-                      isSelected={isSelected}
-                      pendingCols={pendingEdits.get(persistedIndex)}
-                      columnsMap={columnsMap}
-                      editingCol={editingCol}
-                      onStartEdit={handleStartEdit}
-                    />
-                  );
-                })}
-                {virtItems.length > 0 &&
-                  (() => {
-                    const last = virtItems[virtItems.length - 1];
-                    const rem = totalVirtH - last.end;
-                    return rem > 0 ? (
-                      <tr>
-                        <td
-                          colSpan={tanColumns.length}
-                          style={{ height: rem, padding: 0, border: "none" }}
-                        />
-                      </tr>
-                    ) : null;
-                  })()}
-              </tbody>
-            </table>
-            {!loading && rows.length === 0 && !hasDraftRow && (
-              <div
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  height: 200,
-                  opacity: 0.4,
-                  userSelect: "none",
-                }}
-              >
-                <Icon name="inbox" size={28} style={{ opacity: 0.4 }} />
-                <div style={{ fontSize: 13, marginTop: 8 }}>No rows found</div>
-              </div>
-            )}
-          </>
-        }
+                ) : null;
+              })()}
+          </tbody>
+        </table>
+        {!loading && rows.length === 0 && !hasDraftRow && (
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              height: 200,
+              opacity: 0.4,
+              userSelect: "none",
+            }}
+          >
+            <Icon name="inbox" size={28} style={{ opacity: 0.4 }} />
+            <div style={{ fontSize: 13, marginTop: 8 }}>No rows found</div>
+          </div>
+        )}
       </div>
 
       <div
@@ -1652,9 +1793,9 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
       >
         <button
           type="button"
-          style={btn("ghost", page <= 1 || loading)}
-          disabled={page <= 1 || loading}
-          onClick={() => setPage((p) => Math.max(1, p - 1))}
+          style={btn("ghost", page <= 1)}
+          disabled={page <= 1}
+          onClick={() => setRequestedPage((p) => Math.max(1, p - 1))}
         >
           ← Prev
         </button>
@@ -1663,9 +1804,9 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
         </span>
         <button
           type="button"
-          style={btn("ghost", page >= totalPages || loading)}
-          disabled={page >= totalPages || loading}
-          onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+          style={btn("ghost", page >= totalPages)}
+          disabled={page >= totalPages}
+          onClick={() => setRequestedPage((p) => Math.min(totalPages, p + 1))}
         >
           Next →
         </button>
@@ -1675,8 +1816,8 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
           aria-label="Rows per page"
           value={pageSize}
           onChange={(e) => {
-            setPageSize(Number(e.target.value));
-            setPage(1);
+            setRequestedPageSize(Number(e.target.value));
+            setRequestedPage(1);
           }}
           style={{
             padding: "2px 4px",

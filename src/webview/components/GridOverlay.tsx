@@ -1,29 +1,64 @@
-import React from "react";
+import React, { useEffect, useRef } from "react";
 import { Icon } from "./Icon";
 
-/**
- * Semi-transparent overlay displayed over the grid during pagination
- * and filter fetches. Uses `position: absolute` so it must be placed
- * inside a container with `position: relative`.
- */
-export function GridLoadingOverlay(): React.ReactElement {
+interface GridLoadingOverlayProps {
+  mode?: "overlay" | "fullscreen";
+  message?: string;
+  trapFocus?: boolean;
+}
+
+export function GridLoadingOverlay({
+  mode = "overlay",
+  message = "Loading data...",
+  trapFocus = false,
+}: GridLoadingOverlayProps): React.ReactElement {
+  const isFullscreen = mode === "fullscreen";
+  const overlayRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!trapFocus) {
+      return;
+    }
+
+    const previousActiveElement =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+
+    overlayRef.current?.focus();
+
+    return () => {
+      previousActiveElement?.focus();
+    };
+  }, [trapFocus]);
+
   return (
     <div
+      ref={overlayRef}
       role="status"
       aria-live="polite"
-      aria-label="Loading data"
+      aria-atomic="true"
+      aria-label={message}
+      tabIndex={trapFocus ? 0 : undefined}
+      onKeyDown={(event) => {
+        if (trapFocus && event.key === "Tab") {
+          event.preventDefault();
+        }
+      }}
       style={{
         position: "absolute",
         inset: 0,
-        zIndex: 10,
+        zIndex: isFullscreen ? 30 : 20,
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        background:
-          "color-mix(in srgb, var(--vscode-editor-background) 68%, transparent)",
+        background: isFullscreen
+          ? "var(--vscode-editor-background)"
+          : "color-mix(in srgb, var(--vscode-editor-background) 68%, transparent)",
         pointerEvents: "all",
         userSelect: "none",
         WebkitUserSelect: "none",
+        outline: "none",
       }}
     >
       <div
@@ -42,7 +77,7 @@ export function GridLoadingOverlay(): React.ReactElement {
         }}
       >
         <Icon name="sync" size={13} spin />
-        Loading…
+        {message}
       </div>
     </div>
   );

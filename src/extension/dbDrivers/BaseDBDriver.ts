@@ -21,9 +21,9 @@ import type {
 import {
   DATE_ONLY_RE,
   DATETIME_SQL_RE,
-  filterOperatorsForCategory,
   ISO_DATETIME_RE,
   NULL_SENTINEL,
+  resolveFilterOperators,
 } from "./types";
 
 const pad2 = (n: number) => String(n).padStart(2, "0");
@@ -863,11 +863,10 @@ export abstract class BaseDBDriver implements IDBDriver {
     const category = this.mapTypeCategory(col.type);
     const valueSemantics = this.getValueSemantics(col.type, category);
     const filterable = this.isFilterable(col.type, category);
-    const filterOperators: FilterOperator[] = filterable
-      ? filterOperatorsForCategory(category)
-      : col.nullable
-        ? ["is_null", "is_not_null"]
-        : [];
+    const filterOperators: FilterOperator[] = resolveFilterOperators(category, {
+      filterable,
+      nullable: col.nullable,
+    });
     return {
       ...col,
       category,

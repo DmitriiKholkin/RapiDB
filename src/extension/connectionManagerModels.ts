@@ -59,11 +59,56 @@ export interface SchemaSnapshot {
 
 export type SchemaLoadStatus = "idle" | "loading" | "loaded" | "error";
 
+export type ExplorerSchemaScope =
+  | { kind: "connectionRoot" }
+  | { kind: "database"; database: string }
+  | { kind: "schema"; database: string; schema: string };
+
+export type SchemaScopeKey = string;
+
+export interface RefreshSchemaRequest {
+  connectionId?: string;
+  reason?: "manual" | "reconnect" | "config-change";
+}
+
 export interface SchemaSnapshotState {
   snapshot: SchemaSnapshot;
   status: SchemaLoadStatus;
   isPartial: boolean;
   error?: string;
+}
+
+export interface ScopedSchemaFragment {
+  database?: SchemaSnapshotDatabaseEntry;
+  schema?: SchemaSnapshotSchemaEntry;
+}
+
+export interface ScopedSchemaCacheEntry extends SchemaSnapshotState {
+  scope: ExplorerSchemaScope;
+  key: SchemaScopeKey;
+  fragment: ScopedSchemaFragment;
+  generation: number;
+}
+
+export interface ScopeAwareConnectionManagerApi {
+  ensureSchemaScopeLoading(
+    connectionId: string,
+    scope: ExplorerSchemaScope,
+  ): void;
+  getSchemaSnapshotState(
+    connectionId: string,
+    scope?: ExplorerSchemaScope,
+  ): SchemaSnapshotState;
+  markSchemaScopeExpanded(
+    connectionId: string,
+    scope: ExplorerSchemaScope,
+  ): void;
+  markSchemaScopeCollapsed(
+    connectionId: string,
+    scope: ExplorerSchemaScope,
+  ): void;
+  refreshSchemaCache(request?: RefreshSchemaRequest): void;
+  getSchemaAsync(connectionId: string): Promise<SchemaObjectEntry[]>;
 }
 
 export interface StoredConnectionConfig extends ConnectionConfig {

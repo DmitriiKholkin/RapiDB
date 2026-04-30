@@ -152,6 +152,74 @@ describe("QueryView", () => {
     });
   });
 
+  it("replaces the active connection flattened schema array as shared-cache scopes expand", async () => {
+    render(
+      <QueryView
+        connectionId="conn-1"
+        initialSql="select * from users"
+        connectionType="pg"
+      />,
+    );
+
+    dispatchIncomingMessage("connections", [
+      { id: "conn-1", name: "Primary", type: "pg" },
+    ]);
+
+    dispatchIncomingMessage("schema", {
+      connectionId: "conn-1",
+      schema: [
+        {
+          database: "app_db",
+          schema: "public",
+          object: "users",
+          columns: [{ name: "id", type: "int" }],
+        },
+      ],
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("monaco-schema-count").textContent).toBe("1");
+    });
+
+    dispatchIncomingMessage("schema", {
+      connectionId: "conn-1",
+      schema: [
+        {
+          database: "app_db",
+          schema: "public",
+          object: "users",
+          columns: [{ name: "id", type: "int" }],
+        },
+        {
+          database: "app_db",
+          schema: "audit",
+          object: "sync_events",
+          columns: [],
+        },
+      ],
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("monaco-schema-count").textContent).toBe("2");
+    });
+
+    dispatchIncomingMessage("schema", {
+      connectionId: "conn-1",
+      schema: [
+        {
+          database: "app_db",
+          schema: "public",
+          object: "users",
+          columns: [{ name: "id", type: "int" }],
+        },
+      ],
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("monaco-schema-count").textContent).toBe("1");
+    });
+  });
+
   it("executes queries, shows result errors, and resets bookmark state after edits", async () => {
     const user = userEvent.setup();
 
