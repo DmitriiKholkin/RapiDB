@@ -9,6 +9,7 @@ import type {
 import * as mysql from "mysql2/promise";
 import type { ConnectionConfig } from "../connectionManager";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
+import type { DriverTimeoutSettingsProvider } from "./timeout";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -711,10 +712,25 @@ function isMysqlSelectRows(
 export class MySQLDriver extends BaseDBDriver {
   private pool: Pool | null = null;
   private readonly config: ConnectionConfig;
-  constructor(config: ConnectionConfig) {
-    super();
+  constructor(
+    config: ConnectionConfig,
+    timeoutSettingsProvider?: DriverTimeoutSettingsProvider,
+  ) {
+    super(timeoutSettingsProvider);
     this.config = config;
   }
+
+  private createQueryOptions(
+    sql: string,
+    params?: QueryOptions["values"],
+  ): QueryOptions {
+    return {
+      sql,
+      values: params,
+      timeout: this.getDbOperationTimeoutMs(),
+    };
+  }
+
   async connect(): Promise<void> {
     if (this.pool !== null) {
       try {
@@ -731,7 +747,7 @@ export class MySQLDriver extends BaseDBDriver {
       password: this.config.password,
       waitForConnections: true,
       connectionLimit: 5,
-      connectTimeout: 10000,
+      connectTimeout: this.getConnectionTimeoutMs(),
       idleTimeout: 30000,
       dateStrings: true,
       decimalNumbers: false,
@@ -763,7 +779,9 @@ export class MySQLDriver extends BaseDBDriver {
     sql: string,
     params?: QueryOptions["values"],
   ): Promise<TRow[]> {
-    const [rows] = await this.requirePool().query<TRow[]>(sql, params);
+    const [rows] = await this.requirePool().query<TRow[]>(
+      this.createQueryOptions(sql, params),
+    );
     return rows;
   }
   private async queryArrayRows(
@@ -772,6 +790,7 @@ export class MySQLDriver extends BaseDBDriver {
   ): Promise<[MysqlQueryRows, FieldPacket[]]> {
     const [rows, fields] = await queryable.query({
       ...options,
+      timeout: this.getDbOperationTimeoutMs(),
       rowsAsArray: true,
     });
     return [rows as MysqlQueryRows, fields as FieldPacket[]];
@@ -1155,7 +1174,9 @@ export class MySQLDriver extends BaseDBDriver {
     await conn.beginTransaction();
     try {
       for (const op of operations) {
-        const [rows] = await conn.query<ResultSetHeader>(op.sql, op.params);
+        const [rows] = await conn.query<ResultSetHeader>(
+          this.createQueryOptions(op.sql, op.params as QueryOptions["values"]),
+        );
         if (op.checkAffectedRows) {
           const affectedRows = rows.affectedRows;
           if (affectedRows === 0) {

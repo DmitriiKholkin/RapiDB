@@ -1567,6 +1567,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
                           ? "var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.1))"
                           : "var(--vscode-editorGroupHeader-tabsBackground)",
                         borderRight: "1px solid var(--vscode-panel-border)",
+                        borderLeft: "1px solid var(--vscode-panel-border)",
                         position: "sticky",
                         top: 0,
                         zIndex: 2,
@@ -1665,8 +1666,8 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
                       padding: isSel ? 0 : "2px 4px",
                       background:
                         "var(--vscode-editorGroupHeader-tabsBackground)",
-                      borderBottom: "2px solid var(--vscode-panel-border)",
                       borderRight: "1px solid var(--vscode-panel-border)",
+                      borderLeft: "1px solid var(--vscode-panel-border)",
                       position: "sticky",
                       top: HEADER_H,
                       zIndex: 2,

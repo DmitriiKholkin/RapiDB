@@ -6,6 +6,7 @@ import {
   isoToLocalDateStr,
   normalizeSqlDatetimeOffsetSpacing,
 } from "./BaseDBDriver";
+import type { DriverTimeoutSettingsProvider } from "./timeout";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -179,6 +180,7 @@ export class PostgresDriver extends BaseDBDriver {
   }
   private createPool(database: string): Pool {
     const sslEnabled = this.config.ssl ?? false;
+    const dbOperationTimeoutMs = this.getDbOperationTimeoutMs();
     return new Pool({
       host: this.config.host,
       port: this.config.port,
@@ -188,7 +190,9 @@ export class PostgresDriver extends BaseDBDriver {
       max: 5,
       keepAlive: true,
       keepAliveInitialDelayMillis: 60000,
-      connectionTimeoutMillis: 10000,
+      connectionTimeoutMillis: this.getConnectionTimeoutMs(),
+      query_timeout: dbOperationTimeoutMs,
+      statement_timeout: dbOperationTimeoutMs,
       idleTimeoutMillis: 30000,
       ssl: sslEnabled
         ? {
@@ -218,8 +222,11 @@ export class PostgresDriver extends BaseDBDriver {
       await pool.end().catch(() => undefined);
     }
   }
-  constructor(config: ConnectionConfig) {
-    super();
+  constructor(
+    config: ConnectionConfig,
+    timeoutSettingsProvider?: DriverTimeoutSettingsProvider,
+  ) {
+    super(timeoutSettingsProvider);
     this.config = config;
   }
   async connect(): Promise<void> {

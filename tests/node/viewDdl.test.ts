@@ -48,10 +48,17 @@ const sqliteConfig = {
 describe("view DDL generation", () => {
   it("MySQL returns SHOW CREATE VIEW output when the object is a view", async () => {
     const driver = new MySQLDriver(mysqlConfig as ConnectionConfig);
-    const query = vi.fn(async (sql: string) => {
-      expect(sql).toBe("SHOW CREATE TABLE `test_db`.`v_employees`");
-      return [[{ "Create View": "CREATE VIEW `v_employees` AS select 1" }], []];
-    });
+    const query = vi.fn(
+      async (options: string | { sql: string; timeout?: number }) => {
+        expect(typeof options === "string" ? options : options.sql).toBe(
+          "SHOW CREATE TABLE `test_db`.`v_employees`",
+        );
+        return [
+          [{ "Create View": "CREATE VIEW `v_employees` AS select 1" }],
+          [],
+        ];
+      },
+    );
     (driver as unknown as { pool: { query: typeof query } }).pool = {
       query,
     } as never;

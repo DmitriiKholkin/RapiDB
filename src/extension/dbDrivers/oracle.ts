@@ -1,6 +1,7 @@
 import oracledb from "oracledb";
 import type { ConnectionConfig } from "../connectionManager";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
+import type { DriverTimeoutSettingsProvider } from "./timeout";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -726,8 +727,11 @@ const ORACLE_FILTER_DENYLIST = new Set([
 export class OracleDriver extends BaseDBDriver {
   private pool: oracledb.Pool | null = null;
   private readonly config: ConnectionConfig;
-  constructor(config: ConnectionConfig) {
-    super();
+  constructor(
+    config: ConnectionConfig,
+    timeoutSettingsProvider?: DriverTimeoutSettingsProvider,
+  ) {
+    super(timeoutSettingsProvider);
     this.config = config;
   }
   async connect(): Promise<void> {
@@ -750,6 +754,9 @@ export class OracleDriver extends BaseDBDriver {
       user: this.config.username ?? "",
       password: this.config.password ?? "",
       connectString,
+      connectTimeout: this.getTimeoutSettings().connectionTimeoutSeconds,
+      transportConnectTimeout:
+        this.getTimeoutSettings().connectionTimeoutSeconds,
       poolMin: 1,
       poolMax: 5,
       poolIncrement: 1,
@@ -758,6 +765,7 @@ export class OracleDriver extends BaseDBDriver {
     })) as unknown as oracledb.Pool;
     const conn = await this.pool.getConnection();
     try {
+      conn.callTimeout = this.getDbOperationTimeoutMs();
       await conn.ping();
     } finally {
       await conn.close();
@@ -781,7 +789,9 @@ export class OracleDriver extends BaseDBDriver {
     if (!this.pool) {
       throw new Error("[RapiDB] Oracle connection pool is not initialized.");
     }
-    return this.pool.getConnection();
+    const connection = await this.pool.getConnection();
+    connection.callTimeout = this.getDbOperationTimeoutMs();
+    return connection;
   }
   async listDatabases(): Promise<DatabaseInfo[]> {
     const conn = await this.getConnection();

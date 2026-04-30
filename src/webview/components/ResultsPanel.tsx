@@ -280,8 +280,8 @@ function DataTable({ result }: { result: QueryResult }) {
                         textAlign: "left",
                         background:
                           "var(--vscode-editorGroupHeader-tabsBackground)",
-                        borderBottom: "2px solid var(--vscode-panel-border)",
                         borderRight: "1px solid var(--vscode-panel-border)",
+                        borderLeft: "1px solid var(--vscode-panel-border)",
                         position: "sticky",
                         top: 0,
                         zIndex: 2,

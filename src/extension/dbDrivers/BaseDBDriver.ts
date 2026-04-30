@@ -1,3 +1,8 @@
+import {
+  type DriverTimeoutSettingsProvider,
+  type DriverTimeoutSettingsSnapshot,
+  getDefaultDriverTimeoutSettings,
+} from "./timeout";
 import type {
   ColumnDefaultKind,
   ColumnMeta,
@@ -789,6 +794,10 @@ function findApproximateNumericPrecisionLoss(
   };
 }
 export abstract class BaseDBDriver implements IDBDriver {
+  protected constructor(
+    private readonly timeoutSettingsProvider: DriverTimeoutSettingsProvider = getDefaultDriverTimeoutSettings,
+  ) {}
+
   abstract connect(): Promise<void>;
   abstract disconnect(): Promise<void>;
   abstract isConnected(): boolean;
@@ -823,6 +832,19 @@ export abstract class BaseDBDriver implements IDBDriver {
   ): Promise<string>;
   abstract query(sql: string, params?: unknown[]): Promise<QueryResult>;
   abstract runTransaction(operations: TransactionOperation[]): Promise<void>;
+
+  protected getTimeoutSettings(): DriverTimeoutSettingsSnapshot {
+    return this.timeoutSettingsProvider();
+  }
+
+  protected getConnectionTimeoutMs(): number {
+    return this.getTimeoutSettings().connectionTimeoutMs;
+  }
+
+  protected getDbOperationTimeoutMs(): number {
+    return this.getTimeoutSettings().dbOperationTimeoutMs;
+  }
+
   async getMutationAtomicityRisk(
     _database: string,
     _schema: string,

@@ -1,6 +1,7 @@
 import { Database } from "node-sqlite3-wasm";
 import type { ConnectionConfig } from "../connectionManager";
 import { BaseDBDriver } from "./BaseDBDriver";
+import type { DriverTimeoutSettingsProvider } from "./timeout";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -529,8 +530,11 @@ function invalidSqliteTemporalFilterError(
 export class SQLiteDriver extends BaseDBDriver {
   private db: Database | null = null;
   private readonly config: ConnectionConfig;
-  constructor(config: ConnectionConfig) {
-    super();
+  constructor(
+    config: ConnectionConfig,
+    timeoutSettingsProvider?: DriverTimeoutSettingsProvider,
+  ) {
+    super(timeoutSettingsProvider);
     this.config = config;
   }
   async connect(): Promise<void> {

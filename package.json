@@ -439,6 +439,22 @@
           "description": "Maximum number of rows returned by a query in the SQL editor. If the result exceeds this limit, rows are trimmed and a warning is shown. Range: 100–100 000. Set to 100000 to effectively disable the limit.",
           "scope": "machine"
         },
+        "rapidb.connectionTimeoutSeconds": {
+          "type": "number",
+          "default": 15,
+          "minimum": 1,
+          "maximum": 3600,
+          "description": "Timeout in seconds for establishing a database connection. Applies to all drivers.",
+          "scope": "machine"
+        },
+        "rapidb.dbOperationTimeoutSeconds": {
+          "type": "number",
+          "default": 180,
+          "minimum": 1,
+          "maximum": 3600,
+          "description": "Timeout in seconds for database operations, including SQL editor queries, table/view reads, metadata, DDL, and routine loading. Applies to all drivers.",
+          "scope": "machine"
+        },
         "rapidb.queryHistoryLimit": {
           "type": "number",
           "default": 100,

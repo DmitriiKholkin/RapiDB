@@ -709,7 +709,23 @@ describe("TableView", () => {
       columns,
       primaryKeyColumns: ["id"],
     });
-    dispatchIncomingMessage("tableData", { rows, totalCount: rows.length });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
 
     await waitFor(() => {
       expect(screen.getByText("Alice")).toBeTruthy();
@@ -814,12 +830,17 @@ describe("TableView", () => {
       });
     });
 
-    dispatchIncomingMessage("tableData", {
-      rows: [
-        { id: 1, name: "Alice" },
-        { id: 2, name: "Bob" },
-      ],
-      totalCount: 2,
+    const refetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: refetch.fetchId,
+        rows: [
+          { id: 1, name: "Alice" },
+          { id: 2, name: "Bob" },
+        ],
+        totalCount: 2,
+      });
     });
 
     await waitFor(() => {

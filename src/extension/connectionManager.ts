@@ -30,6 +30,7 @@ import { MySQLDriver } from "./dbDrivers/mysql";
 import { OracleDriver } from "./dbDrivers/oracle";
 import { PostgresDriver } from "./dbDrivers/postgres";
 import { SQLiteDriver } from "./dbDrivers/sqlite";
+import { createTimeoutAwareDriver } from "./dbDrivers/timeout";
 import type { IDBDriver } from "./dbDrivers/types";
 import { pMapWithLimit } from "./utils/concurrency";
 import { normalizeUnknownError } from "./utils/errorHandling";
@@ -642,22 +643,28 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
     );
   }
   private createDriver(config: ConnectionConfig): IDBDriver {
-    switch (config.type) {
-      case "mysql":
-        return new MySQLDriver(config);
-      case "pg":
-        return new PostgresDriver(config);
-      case "sqlite":
-        return new SQLiteDriver(config);
-      case "mssql":
-        return new MSSQLDriver(config);
-      case "oracle":
-        return new OracleDriver(config);
-      default: {
-        const unknownType: never = config.type;
-        throw new Error(`[RapiDB] Unknown driver type: ${unknownType}`);
+    const timeoutSettingsProvider = () => this.store.getTimeoutSettings();
+
+    const driver = (() => {
+      switch (config.type) {
+        case "mysql":
+          return new MySQLDriver(config, timeoutSettingsProvider);
+        case "pg":
+          return new PostgresDriver(config, timeoutSettingsProvider);
+        case "sqlite":
+          return new SQLiteDriver(config, timeoutSettingsProvider);
+        case "mssql":
+          return new MSSQLDriver(config, timeoutSettingsProvider);
+        case "oracle":
+          return new OracleDriver(config, timeoutSettingsProvider);
+        default: {
+          const unknownType: never = config.type;
+          throw new Error(`[RapiDB] Unknown driver type: ${unknownType}`);
+        }
       }
-    }
+    })();
+
+    return createTimeoutAwareDriver(driver, timeoutSettingsProvider);
   }
   beginConnect(id: string): ConnectAttempt {
     const pending = this._connectingMap.get(id);

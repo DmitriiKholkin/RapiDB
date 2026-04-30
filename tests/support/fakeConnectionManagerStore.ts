@@ -5,6 +5,10 @@ import type {
   StoredConnectionConfig,
 } from "../../src/extension/connectionManagerModels";
 import type { ConnectionManagerStore } from "../../src/extension/connectionManagerStore";
+import {
+  createDriverTimeoutSettingsSnapshot,
+  type DriverTimeoutSettingsSnapshot,
+} from "../../src/extension/dbDrivers/timeout";
 
 type ConfigurationListener = (event: {
   affectsConfiguration(section: string): boolean;
@@ -19,6 +23,7 @@ export class FakeConnectionManagerStore implements ConnectionManagerStore {
   private historyLimit = 100;
   private defaultPageSize = 25;
   private queryRowLimit = 10_000;
+  private timeoutSettings = createDriverTimeoutSettingsSnapshot();
 
   onDidChangeConfiguration(
     listener: ConfigurationListener,
@@ -79,6 +84,10 @@ export class FakeConnectionManagerStore implements ConnectionManagerStore {
     return this.queryRowLimit;
   }
 
+  getTimeoutSettings(): DriverTimeoutSettingsSnapshot {
+    return { ...this.timeoutSettings };
+  }
+
   setConnections(connections: StoredConnectionConfig[]): void {
     this.connections = connections.map((connection) => ({ ...connection }));
   }
@@ -105,6 +114,13 @@ export class FakeConnectionManagerStore implements ConnectionManagerStore {
 
   setQueryRowLimit(limit: number): void {
     this.queryRowLimit = limit;
+  }
+
+  setTimeoutSettings(settings: {
+    connectionTimeoutSeconds?: number;
+    dbOperationTimeoutSeconds?: number;
+  }): void {
+    this.timeoutSettings = createDriverTimeoutSettingsSnapshot(settings);
   }
 
   fireConfigurationChange(...sections: string[]): void {

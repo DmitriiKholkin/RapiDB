@@ -7,6 +7,7 @@ import {
   isoToLocalDateStr,
   normalizeSqlDatetimeOffsetSpacing,
 } from "./BaseDBDriver";
+import type { DriverTimeoutSettingsProvider } from "./timeout";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -587,8 +588,11 @@ const MSSQL_FILTER_DENYLIST = new Set([
 export class MSSQLDriver extends BaseDBDriver {
   private pool: mssql.ConnectionPool | null = null;
   private readonly config: ConnectionConfig;
-  constructor(config: ConnectionConfig) {
-    super();
+  constructor(
+    config: ConnectionConfig,
+    timeoutSettingsProvider?: DriverTimeoutSettingsProvider,
+  ) {
+    super(timeoutSettingsProvider);
     this.config = config;
   }
   private requirePool(): mssql.ConnectionPool {
@@ -609,8 +613,8 @@ export class MSSQLDriver extends BaseDBDriver {
       database: this.config.database,
       user: this.config.username,
       password: this.config.password,
-      connectionTimeout: 10000,
-      requestTimeout: 30000,
+      connectionTimeout: this.getConnectionTimeoutMs(),
+      requestTimeout: this.getDbOperationTimeoutMs(),
       options: {
         encrypt: sslEnabled,
         trustServerCertificate: trustCert,

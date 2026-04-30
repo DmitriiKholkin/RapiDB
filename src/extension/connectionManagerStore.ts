@@ -5,6 +5,12 @@ import type {
   HistoryEntry,
   StoredConnectionConfig,
 } from "./connectionManagerModels";
+import {
+  CONNECTION_TIMEOUT_SECONDS_DEFAULT,
+  createDriverTimeoutSettingsSnapshot,
+  DB_OPERATION_TIMEOUT_SECONDS_DEFAULT,
+  type DriverTimeoutSettingsSnapshot,
+} from "./dbDrivers/timeout";
 
 const HISTORY_STATE_KEY = "rapidb.queryHistory";
 const BOOKMARKS_STATE_KEY = "rapidb.bookmarks";
@@ -28,6 +34,7 @@ export interface ConnectionManagerStore {
   getHistoryLimit(): number;
   getDefaultPageSize(): number;
   getQueryRowLimit(): number;
+  getTimeoutSettings(): DriverTimeoutSettingsSnapshot;
 }
 
 export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
@@ -105,5 +112,19 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
       .getConfiguration("rapidb")
       .get<number>("queryRowLimit", 10000);
     return Math.max(100, Math.min(100000, Math.round(raw)));
+  }
+
+  getTimeoutSettings(): DriverTimeoutSettingsSnapshot {
+    const configuration = vscode.workspace.getConfiguration("rapidb");
+    return createDriverTimeoutSettingsSnapshot({
+      connectionTimeoutSeconds: configuration.get<number>(
+        "connectionTimeoutSeconds",
+        CONNECTION_TIMEOUT_SECONDS_DEFAULT,
+      ),
+      dbOperationTimeoutSeconds: configuration.get<number>(
+        "dbOperationTimeoutSeconds",
+        DB_OPERATION_TIMEOUT_SECONDS_DEFAULT,
+      ),
+    });
   }
 }

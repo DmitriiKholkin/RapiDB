@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { DriverTimeoutSettingsProvider } from "../../src/extension/dbDrivers/timeout";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -87,7 +88,10 @@ class FakeDriver implements IDBDriver {
   describeTableCalls: string[] = [];
   private connected = false;
 
-  constructor(readonly config: { id: string }) {
+  constructor(
+    readonly config: { id: string },
+    readonly timeoutSettingsProvider?: DriverTimeoutSettingsProvider,
+  ) {
     driverInstances.push(this);
   }
 
@@ -309,6 +313,45 @@ describe("ConnectionManager", () => {
     expect(driverInstances).toHaveLength(1);
     expect(driverInstances[0]?.connectCalls).toBe(1);
     expect(manager.isConnected("conn-1")).toBe(true);
+  });
+
+  it("passes a live timeout settings provider to created drivers", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+      },
+    ]);
+    store.setTimeoutSettings({
+      connectionTimeoutSeconds: 21,
+      dbOperationTimeoutSeconds: 75,
+    });
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await manager.connectTo("conn-1");
+
+    const timeoutSettingsProvider = driverInstances[0]?.timeoutSettingsProvider;
+    expect(timeoutSettingsProvider).toBeTypeOf("function");
+    expect(timeoutSettingsProvider?.().connectionTimeoutSeconds).toBe(21);
+    expect(timeoutSettingsProvider?.().dbOperationTimeoutSeconds).toBe(75);
+
+    store.setTimeoutSettings({
+      connectionTimeoutSeconds: 8,
+      dbOperationTimeoutSeconds: 12,
+    });
+
+    expect(timeoutSettingsProvider?.().connectionTimeoutSeconds).toBe(8);
+    expect(timeoutSettingsProvider?.().dbOperationTimeoutSeconds).toBe(12);
   });
 
   it("disconnects an edited connection after saving updated settings", async () => {
