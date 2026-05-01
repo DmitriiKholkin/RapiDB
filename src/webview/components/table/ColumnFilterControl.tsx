@@ -1,5 +1,6 @@
 import React, { type CSSProperties, useEffect, useRef, useState } from "react";
 import {
+  buildFilterExpressionFromDraft,
   type ColumnTypeMeta as ColumnMeta,
   defaultFilterOperator,
   type FilterDraft,
@@ -195,7 +196,10 @@ function nextDraftForOperator(
 interface ColumnFilterControlProps {
   column: ColumnMeta;
   draft?: FilterDraft;
-  onChange: (nextDraft: FilterDraft | undefined) => void;
+  onChange: (
+    nextDraft: FilterDraft | undefined,
+    options?: { applyImmediately?: boolean },
+  ) => void;
 }
 
 export function ColumnFilterControl({
@@ -261,11 +265,15 @@ export function ColumnFilterControl({
     setMenuOpen(false);
 
     if (operator === CLEAR_FILTER) {
-      onChange(undefined);
+      onChange(undefined, { applyImmediately: true });
       return;
     }
 
-    onChange(nextDraftForOperator(operator, normalizedDraft));
+    const nextDraft = nextDraftForOperator(operator, normalizedDraft);
+    onChange(nextDraft, {
+      applyImmediately:
+        buildFilterExpressionFromDraft(column, nextDraft) !== null,
+    });
   };
 
   return (

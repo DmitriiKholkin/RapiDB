@@ -347,6 +347,23 @@ export function serializeFilterDrafts(
   });
 }
 
+export function deriveApplicableFilterDrafts(
+  columns: readonly FilterDraftColumn[],
+  drafts: FilterDraftMap | null | undefined,
+): FilterDraftMap {
+  if (!drafts) return {};
+
+  return columns.reduce<FilterDraftMap>((activeDrafts, column) => {
+    const draft = drafts[column.name];
+    if (!draft || !buildFilterExpressionFromDraft(column, draft)) {
+      return activeDrafts;
+    }
+
+    activeDrafts[column.name] = draft;
+    return activeDrafts;
+  }, {});
+}
+
 export function buildFilterExpression(
   column: Pick<
     ColumnTypeMeta,

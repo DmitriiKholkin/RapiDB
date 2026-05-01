@@ -444,6 +444,126 @@ describe("TableView", () => {
     expect(screen.queryByText("Bad filter expression")).toBeNull();
   });
 
+  it("does not refetch when switching to a value-based operator with an empty draft", async () => {
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({
+          page: 1,
+          pageSize: 25,
+          filters: [],
+          sort: null,
+        }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    clearPostedMessages();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "name filter operator" }),
+    );
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /Equals/i }));
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 450));
+    });
+
+    expect(getPostedMessages()).toEqual([]);
+  });
+
+  it("refetches immediately when changing a value-based operator with an existing value", async () => {
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({
+          page: 1,
+          pageSize: 25,
+          filters: [],
+          sort: null,
+        }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    clearPostedMessages();
+
+    fireEvent.change(screen.getByLabelText("name filter value"), {
+      target: { value: "ali" },
+    });
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 450));
+    });
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "fetchPage",
+      payload: expect.objectContaining({
+        page: 1,
+        filters: [{ column: "name", operator: "like", value: "ali" }],
+      }),
+    });
+
+    const filteredFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: filteredFetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    clearPostedMessages();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "name filter operator" }),
+    );
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /Equals/i }));
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({
+          page: 1,
+          filters: [{ column: "name", operator: "eq", value: "ali" }],
+        }),
+      });
+    });
+  });
+
   it("preserves committed rows when a refetch fails with a read error", async () => {
     renderTableView();
 

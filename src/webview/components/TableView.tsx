@@ -17,6 +17,7 @@ import React, {
 } from "react";
 import {
   type ColumnTypeMeta as ColumnMeta,
+  deriveApplicableFilterDrafts,
   type FilterDraft,
   type FilterDraftMap,
   isNumericCategory,
@@ -114,6 +115,13 @@ function createInsertDraft(columns: readonly ColumnMeta[]): InsertDraftRow {
       },
     ]),
   );
+}
+
+function buildActiveFilterDrafts(
+  columns: readonly ColumnMeta[],
+  drafts: FilterDraftMap,
+): FilterDraftMap {
+  return deriveApplicableFilterDrafts(columns, drafts);
 }
 
 function buildInsertValues(draft: InsertDraftRow): Record<string, unknown> {
@@ -789,7 +797,9 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
     const t = setTimeout(() => {
       setFilterError(null);
       setRequestedPage(1);
-      setDebouncedFilterDrafts(filterDrafts);
+      setDebouncedFilterDrafts(
+        buildActiveFilterDrafts(columnsRef.current, filterDrafts),
+      );
     }, DEBOUNCE);
     return () => clearTimeout(t);
   }, [filterDrafts]);
@@ -808,22 +818,37 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
   }, []);
 
   const updateFilterDraft = useCallback(
-    (columnName: string, nextDraft: FilterDraft | undefined) => {
+    (
+      columnName: string,
+      nextDraft: FilterDraft | undefined,
+      options?: { applyImmediately?: boolean },
+    ) => {
       setFilterDrafts((current) => {
+        let next = current;
+
         if (!nextDraft) {
           if (current[columnName] === undefined) {
             return current;
           }
 
-          const next = { ...current };
+          next = { ...current };
           delete next[columnName];
-          return next;
+        } else {
+          next = {
+            ...current,
+            [columnName]: nextDraft,
+          };
         }
 
-        return {
-          ...current,
-          [columnName]: nextDraft,
-        };
+        if (options?.applyImmediately) {
+          setFilterError(null);
+          setRequestedPage(1);
+          setDebouncedFilterDrafts(
+            buildActiveFilterDrafts(columnsRef.current, next),
+          );
+        }
+
+        return next;
       });
     },
     [],
