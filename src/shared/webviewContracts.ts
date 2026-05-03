@@ -59,6 +59,58 @@ export interface SchemaInitialState {
   table: string;
 }
 
+export interface ErdInitialState {
+  view: "erd";
+  connectionId: string;
+  database?: string;
+  schema?: string;
+}
+
+export interface ErdNodeColumn {
+  name: string;
+  type: string;
+  isPrimaryKey: boolean;
+  isForeignKey: boolean;
+  nullable: boolean;
+}
+
+export interface ErdNodePosition {
+  x: number;
+  y: number;
+}
+
+export interface ErdTableNode {
+  id: string;
+  database: string;
+  schema: string;
+  table: string;
+  isView: boolean;
+  columns: ErdNodeColumn[];
+  position: ErdNodePosition;
+}
+
+export interface ErdRelationshipEdge {
+  id: string;
+  fromTableId: string;
+  toTableId: string;
+  fromColumn: string;
+  toColumn: string;
+  constraintName: string;
+  cardinality: "one-to-one" | "many-to-one" | "unknown";
+  sourceNullable: boolean;
+}
+
+export interface ErdGraphScope {
+  database?: string;
+  schema?: string;
+}
+
+export interface ErdGraph {
+  nodes: ErdTableNode[];
+  edges: ErdRelationshipEdge[];
+  scope: ErdGraphScope;
+}
+
 export type SanitizedConnectionConfig = Omit<ConnectionConfig, "password">;
 
 export interface ConnectionFormExistingState extends SanitizedConnectionConfig {
@@ -79,6 +131,7 @@ export type WebviewInitialState =
   | QueryInitialState
   | TableInitialState
   | SchemaInitialState
+  | ErdInitialState
   | ConnectionFormInitialState;
 
 export type QueryPanelMessage =
@@ -172,6 +225,18 @@ export type SchemaPanelMessage =
   | WebviewMessageEnvelope<"ready">
   | WebviewMessageEnvelope<
       "openRelatedSchema",
+      { table: string; schema?: string; database?: string }
+    >;
+
+export type ErdPanelMessage =
+  | WebviewMessageEnvelope<"ready">
+  | WebviewMessageEnvelope<"reload">
+  | WebviewMessageEnvelope<
+      "openTableData",
+      { table: string; schema?: string; database?: string; isView?: boolean }
+    >
+  | WebviewMessageEnvelope<
+      "openSchema",
       { table: string; schema?: string; database?: string }
     >;
 
@@ -393,6 +458,20 @@ export function parseWebviewInitialState(
         database,
         schema,
         table,
+      };
+    }
+
+    case "erd": {
+      const connectionId = readRequiredString(input, "connectionId");
+      if (!connectionId) {
+        return null;
+      }
+
+      return {
+        view: "erd",
+        connectionId,
+        database: readOptionalString(input, "database"),
+        schema: readOptionalString(input, "schema"),
       };
     }
 
@@ -692,6 +771,59 @@ export function parseConnectionFormPanelMessage(
     case "testConnection": {
       const payload = parseConnectionFormSubmission(envelope.payload);
       return payload ? { type: envelope.type, payload } : null;
+    }
+
+    default:
+      return null;
+  }
+}
+
+export function parseErdPanelMessage(input: unknown): ErdPanelMessage | null {
+  const envelope = parseEnvelope(input);
+  if (!envelope) {
+    return null;
+  }
+
+  switch (envelope.type) {
+    case "ready":
+    case "reload":
+      return { type: envelope.type };
+
+    case "openTableData": {
+      if (!isRecord(envelope.payload)) {
+        return null;
+      }
+      const table = readRequiredString(envelope.payload, "table");
+      if (!table) {
+        return null;
+      }
+      return {
+        type: envelope.type,
+        payload: {
+          table,
+          schema: readOptionalString(envelope.payload, "schema"),
+          database: readOptionalString(envelope.payload, "database"),
+          isView: readOptionalBoolean(envelope.payload, "isView"),
+        },
+      };
+    }
+
+    case "openSchema": {
+      if (!isRecord(envelope.payload)) {
+        return null;
+      }
+      const table = readRequiredString(envelope.payload, "table");
+      if (!table) {
+        return null;
+      }
+      return {
+        type: envelope.type,
+        payload: {
+          table,
+          schema: readOptionalString(envelope.payload, "schema"),
+          database: readOptionalString(envelope.payload, "database"),
+        },
+      };
     }
 
     default:

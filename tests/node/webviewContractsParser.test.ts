@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   parseConnectionFormPanelMessage,
+  parseErdPanelMessage,
   parseQueryPanelMessage,
   parseSchemaPanelMessage,
   parseTablePanelMessage,
@@ -342,6 +343,22 @@ describe("parseWebviewInitialState", () => {
     });
   });
 
+  it("parses a valid erd state", () => {
+    const parsed = parseWebviewInitialState({
+      view: "erd",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+    });
+
+    expect(parsed).toEqual({
+      view: "erd",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+    });
+  });
+
   it("returns null for invalid query state", () => {
     const parsed = parseWebviewInitialState({
       view: "query",
@@ -356,6 +373,46 @@ describe("parseWebviewInitialState", () => {
       view: "query",
       connectionId: "conn-1",
       connectionType: "invalid",
+    });
+
+    expect(parsed).toBeNull();
+  });
+});
+
+describe("parseErdPanelMessage", () => {
+  it("parses a reload message", () => {
+    const parsed = parseErdPanelMessage({ type: "reload" });
+    expect(parsed).toEqual({ type: "reload" });
+  });
+
+  it("parses openTableData payloads", () => {
+    const parsed = parseErdPanelMessage({
+      type: "openTableData",
+      payload: {
+        table: "orders",
+        schema: "public",
+        database: "app_db",
+        isView: false,
+      },
+    });
+
+    expect(parsed).toEqual({
+      type: "openTableData",
+      payload: {
+        table: "orders",
+        schema: "public",
+        database: "app_db",
+        isView: false,
+      },
+    });
+  });
+
+  it("rejects malformed openSchema payloads", () => {
+    const parsed = parseErdPanelMessage({
+      type: "openSchema",
+      payload: {
+        schema: "public",
+      },
     });
 
     expect(parsed).toBeNull();

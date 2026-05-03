@@ -618,7 +618,7 @@ export class SQLiteDriver extends BaseDBDriver {
       : undefined;
     return {
       name: row.name,
-      type: row.type || "TEXT",
+      type: row.type.toLowerCase() || "text",
       nullable: row.notnull === 0,
       defaultValue,
       defaultKind:

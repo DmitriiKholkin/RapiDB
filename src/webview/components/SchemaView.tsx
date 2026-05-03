@@ -7,7 +7,7 @@ import React, {
 import type { ColumnMeta, ForeignKeyMeta, IndexMeta } from "../types";
 import { getStructuralBadgePresentation } from "../types";
 import { onMessage, postMessage } from "../utils/messaging";
-import { ShimmerBar } from "./Shimmer";
+import { GridLoadingOverlay } from "./GridOverlay";
 
 interface SchemaData {
   columns: ColumnMeta[];
@@ -80,17 +80,19 @@ export function SchemaView({
   }, []);
   if (loading) {
     return (
-      <div style={{ padding: "16px 20px", overflow: "hidden" }}>
-        <ShimmerBar width={220} height={15} style={{ marginBottom: 8 }} />
-        <div
-          style={{
-            height: 1,
-            background: "var(--vscode-panel-border)",
-            margin: "8px 0 20px",
-          }}
-        />
-        <ShimmerBar width={90} height={10} style={{ marginBottom: 12 }} />
-      </div>
+      <main
+        aria-label={`Table structure for ${table}`}
+        aria-busy="true"
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          height: "100vh",
+          overflow: "hidden",
+          position: "relative",
+        }}
+      >
+        <GridLoadingOverlay mode="fullscreen" message="Loading data..." />
+      </main>
     );
   }
   if (error) {
@@ -142,7 +144,7 @@ export function SchemaView({
           <colgroup>
             <col style={{ width: "26%" }} />
             <col style={{ width: "22%" }} />
-            <col style={{ width: 80 }} />
+            <col style={{ width: 100 }} />
             <col />
           </colgroup>
           <thead>
@@ -154,7 +156,7 @@ export function SchemaView({
                 Type
               </th>
               <th scope="col" style={th({ textAlign: "center" })}>
-                Null
+                Nullable
               </th>
               <th scope="col" style={th({ borderRight: "none" })}>
                 Default / Generated

@@ -27,6 +27,12 @@ vi.mock("../../src/webview/components/TableView", () => ({
   TableView: ({ table }: { table: string }) => <div>Table:{table}</div>,
 }));
 
+vi.mock("../../src/webview/components/ErdView", () => ({
+  ErdView: ({ schema }: { schema?: string }) => (
+    <div>ERD:{schema ?? "all"}</div>
+  ),
+}));
+
 import { App } from "../../src/webview/components/App";
 
 describe("App", () => {
@@ -68,5 +74,18 @@ describe("App", () => {
     render(<App />);
 
     expect(screen.getByText("Query:")).toBeTruthy();
+  });
+
+  it("renders erd view when requested by initial state", () => {
+    window.__RAPIDB_INITIAL_STATE__ = {
+      view: "erd",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+    };
+
+    render(<App />);
+
+    expect(screen.getByText("ERD:public")).toBeTruthy();
   });
 });

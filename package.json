@@ -111,6 +111,12 @@
         "icon": "$(symbol-namespace)"
       },
       {
+        "command": "rapidb.openErd",
+        "title": "Open ERD",
+        "category": "RapiDB",
+        "icon": "$(graph)"
+      },
+      {
         "command": "rapidb.openRoutine",
         "title": "Open Definition",
         "category": "RapiDB"
@@ -194,6 +200,10 @@
         },
         {
           "command": "rapidb.openTableData",
+          "when": "false"
+        },
+        {
+          "command": "rapidb.openErd",
           "when": "false"
         },
         {
@@ -336,9 +346,19 @@
           "group": "2_copy"
         },
         {
+          "command": "rapidb.openErd",
+          "when": "view == rapidb-explorer && viewItem == database",
+          "group": "1_open"
+        },
+        {
           "command": "rapidb.copyNodeName",
           "when": "view == rapidb-explorer && viewItem == schema",
           "group": "2_copy"
+        },
+        {
+          "command": "rapidb.openErd",
+          "when": "view == rapidb-explorer && viewItem == schema",
+          "group": "1_open"
         },
         {
           "command": "rapidb.deleteBookmark",
@@ -542,9 +562,11 @@
     "vitest": "^4.1.4"
   },
   "dependencies": {
+    "@dagrejs/dagre": "^3.0.0",
     "@tanstack/react-table": "^8.21.3",
     "@tanstack/react-virtual": "^3.13.23",
     "@vscode/codicons": "^0.0.45",
+    "@xyflow/react": "^12.10.2",
     "monaco-editor": "^0.53.0",
     "mssql": "^12.2.0",
     "mysql2": "^3.20.0",

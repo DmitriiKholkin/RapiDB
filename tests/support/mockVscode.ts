@@ -55,6 +55,7 @@ export interface MockTreeView<T = unknown> {
 export interface MockVscodeState {
   registerCommand: ReturnType<typeof vi.fn>;
   createTreeView: ReturnType<typeof vi.fn>;
+  getConfiguration: ReturnType<typeof vi.fn>;
   showInformationMessage: ReturnType<typeof vi.fn>;
   showWarningMessage: ReturnType<typeof vi.fn>;
   showErrorMessage: ReturnType<typeof vi.fn>;
@@ -171,6 +172,10 @@ export function createMockVscodeModule(): {
       treeViews.push(treeView);
       return treeView;
     }),
+    getConfiguration: vi.fn(() => ({
+      get: vi.fn(),
+      update: vi.fn(),
+    })),
     showInformationMessage: vi.fn(),
     showWarningMessage: vi.fn(),
     showErrorMessage: vi.fn(),
@@ -211,10 +216,7 @@ export function createMockVscodeModule(): {
       },
       workspace: {
         onDidChangeConfiguration: vi.fn(),
-        getConfiguration: vi.fn(() => ({
-          get: vi.fn(),
-          update: vi.fn(),
-        })),
+        getConfiguration: state.getConfiguration,
       },
       ThemeIcon: class ThemeIcon {
         constructor(

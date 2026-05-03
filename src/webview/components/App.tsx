@@ -5,6 +5,7 @@ import type {
 } from "../../shared/webviewContracts";
 import { parseWebviewInitialState } from "../../shared/webviewContracts";
 import { ConnectionFormView } from "./ConnectionFormView";
+import { ErdView } from "./ErdView";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { QueryView } from "./QueryView";
 import { SchemaView } from "./SchemaView";
@@ -54,6 +55,16 @@ export function App(): ReactElement {
             database={state.database ?? ""}
             schema={state.schema ?? ""}
             table={state.table ?? ""}
+          />
+        </ErrorBoundary>
+      );
+    case "erd":
+      return (
+        <ErrorBoundary context="ErdView">
+          <ErdView
+            connectionId={state.connectionId ?? ""}
+            database={state.database}
+            schema={state.schema}
           />
         </ErrorBoundary>
       );

@@ -11,6 +11,7 @@ import {
   pickConnectionWithPrompt,
 } from "./connectionManagerPrompts";
 import { ConnectionFormPanel } from "./panels/connectionFormPanel";
+import { ErdPanel } from "./panels/erdPanel";
 import { QueryPanel } from "./panels/queryPanel";
 import { SchemaPanel } from "./panels/schemaPanel";
 import { TablePanel } from "./panels/tablePanel";
@@ -41,6 +42,7 @@ const CMD = {
   openRoutine: "rapidb.openRoutine",
   openHistoryEntry: "rapidb.openHistoryEntry",
   openBookmarkEntry: "rapidb.openBookmarkEntry",
+  openErd: "rapidb.openErd",
   deleteBookmark: "rapidb.deleteBookmark",
   clearBookmarks: "rapidb.clearBookmarks",
   clearHistory: "rapidb.clearHistory",
@@ -114,6 +116,20 @@ function getExplorerSchemaScopeForNode(
   }
 
   return undefined;
+}
+
+function getErdScopeForNode(node: RapiDBNode | undefined): {
+  database?: string;
+  schema?: string;
+} {
+  if (!node) {
+    return {};
+  }
+
+  return {
+    database: node.database,
+    schema: node.schema,
+  };
 }
 
 function showSavedQuery(
@@ -358,6 +374,47 @@ function registerCommands(
     );
   });
 
+  reg(CMD.openErd, async (node?: RapiDBNode) => {
+    const connectionId = await resolveConnectionId(node, connectionManager);
+    if (!connectionId) {
+      return;
+    }
+
+    if (!connectionManager.isConnected(connectionId)) {
+      try {
+        await connectWithProgress(
+          connectionManager,
+          connectionId,
+          "RapiDB: Connecting…",
+          true,
+        );
+        refresh();
+      } catch (err: unknown) {
+        const error = logErrorWithContext(
+          `Open ERD connect failed for ${connectionId}`,
+          err,
+        );
+        vscode.window.showErrorMessage(
+          `[RapiDB] Cannot connect: ${error.message}`,
+        );
+        return;
+      }
+    }
+
+    const scope = getErdScopeForNode(node);
+    if (!scope.database) {
+      vscode.window.showInformationMessage(
+        "[RapiDB] Please open ERD from a database or schema node.",
+      );
+      return;
+    }
+    ErdPanel.createOrShow(context, connectionManager, {
+      connectionId,
+      database: scope.database,
+      schema: scope.schema,
+    });
+  });
+
   reg(CMD.openRoutine, async (node?: RapiDBNode) => {
     if (!node?.connectionId || !node.objectName) {
       return;
@@ -554,6 +611,7 @@ export function deactivate(): void {
   QueryPanel.disposeAll();
   TablePanel.disposeAll();
   SchemaPanel.disposeAll();
+  ErdPanel.disposeAll();
   try {
     _connectionManager?.disconnectAll().catch(() => {});
   } catch {}

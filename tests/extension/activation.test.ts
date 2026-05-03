@@ -12,6 +12,7 @@ const expectedCommands = [
   "rapidb.showDDL",
   "rapidb.copyNodeName",
   "rapidb.openSchema",
+  "rapidb.openErd",
   "rapidb.openRoutine",
   "rapidb.openHistoryEntry",
   "rapidb.openBookmarkEntry",
@@ -35,6 +36,8 @@ describe("extension activation", () => {
   let queryPanelDisposeAll: ReturnType<typeof vi.fn>;
   let tablePanelDisposeAll: ReturnType<typeof vi.fn>;
   let schemaPanelDisposeAll: ReturnType<typeof vi.fn>;
+  let erdPanelCreateOrShow: ReturnType<typeof vi.fn>;
+  let erdPanelDisposeAll: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     vi.resetModules();
@@ -45,9 +48,15 @@ describe("extension activation", () => {
     queryPanelDisposeAll = vi.fn();
     tablePanelDisposeAll = vi.fn();
     schemaPanelDisposeAll = vi.fn();
+    erdPanelCreateOrShow = vi.fn();
+    erdPanelDisposeAll = vi.fn();
 
     const vscodeMock = createMockVscodeModule();
     vscodeState = vscodeMock.state;
+    vscodeState.getConfiguration.mockReturnValue({
+      get: vi.fn((_section: string, fallback?: unknown) => fallback),
+      update: vi.fn(),
+    });
     vi.doMock("vscode", () => vscodeMock.module);
 
     connectionManagerInstance = {
@@ -124,6 +133,12 @@ describe("extension activation", () => {
       TablePanel: {
         createOrShow: vi.fn(),
         disposeAll: tablePanelDisposeAll,
+      },
+    }));
+    vi.doMock("../../src/extension/panels/erdPanel", () => ({
+      ErdPanel: {
+        createOrShow: erdPanelCreateOrShow,
+        disposeAll: erdPanelDisposeAll,
       },
     }));
     vi.doMock("../../src/extension/connectionManagerPrompts", () => ({
@@ -396,6 +411,47 @@ describe("extension activation", () => {
     );
   });
 
+  it("opens ERD with selected node scope", async () => {
+    const extension = await import("../../src/extension/extension");
+    const context = { subscriptions: [] as Array<{ dispose(): void }> };
+
+    (
+      connectionManagerInstance.isConnected as ReturnType<typeof vi.fn>
+    ).mockReturnValue(true);
+
+    extension.activate(context as never);
+
+    const openErdCommand = vscodeState.registerCommand.mock.calls.find(
+      ([command]) => command === "rapidb.openErd",
+    )?.[1] as
+      | ((node: {
+          connectionId?: string;
+          database?: string;
+          schema?: string;
+        }) => Promise<void>)
+      | undefined;
+
+    if (!openErdCommand) {
+      throw new Error("Open ERD command was not registered.");
+    }
+
+    await openErdCommand({
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+    });
+
+    expect(erdPanelCreateOrShow).toHaveBeenCalledWith(
+      context,
+      connectionManagerInstance,
+      {
+        connectionId: "conn-1",
+        database: "app_db",
+        schema: "public",
+      },
+    );
+  });
+
   it("deactivates panels and disconnects all active connections", async () => {
     const extension = await import("../../src/extension/extension");
     const context = { subscriptions: [] as Array<{ dispose(): void }> };
@@ -406,6 +462,7 @@ describe("extension activation", () => {
     expect(queryPanelDisposeAll).toHaveBeenCalledTimes(1);
     expect(tablePanelDisposeAll).toHaveBeenCalledTimes(1);
     expect(schemaPanelDisposeAll).toHaveBeenCalledTimes(1);
+    expect(erdPanelDisposeAll).toHaveBeenCalledTimes(1);
     expect(connectionManagerInstance.disconnectAll).toHaveBeenCalledTimes(1);
   });
 });
