@@ -222,7 +222,13 @@ function sampleGraph(): ErdGraph {
 
 describe("ErdView", () => {
   it("restores persisted search and filter state", async () => {
-    window.__vscode?.getState.mockReturnValue({
+    const vscodeApi = window.__vscode as
+      | (NonNullable<Window["__vscode"]> & {
+          getState: ReturnType<typeof vi.fn>;
+        })
+      | undefined;
+
+    vscodeApi?.getState.mockReturnValue({
       search: "users",
       hideUnmatched: true,
       hideIsolated: true,

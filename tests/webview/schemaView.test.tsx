@@ -147,7 +147,9 @@ describe("SchemaView", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByRole("columnheader", { name: "Null" })).toBeTruthy();
+      expect(
+        screen.getByRole("columnheader", { name: "Nullable" }),
+      ).toBeTruthy();
       expect(
         screen.getByRole("columnheader", { name: "Default / Generated" }),
       ).toBeTruthy();
