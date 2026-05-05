@@ -47,4 +47,35 @@ describe("ERD manifest", () => {
       ),
     ).toBe(true);
   });
+
+  it("declares context menu entries for materialized views, functions, procedures, sequences, and types", () => {
+    const manifest = readManifest();
+    const contextEntries =
+      manifest.contributes?.menus?.["view/item/context"] ?? [];
+
+    expect(contextEntries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          command: "rapidb.showDDL",
+          when: expect.stringContaining("viewItem == materializedView"),
+        }),
+        expect.objectContaining({
+          command: "rapidb.showDDL",
+          when: expect.stringContaining("viewItem == function"),
+        }),
+        expect.objectContaining({
+          command: "rapidb.showDDL",
+          when: expect.stringContaining("viewItem == procedure"),
+        }),
+        expect.objectContaining({
+          command: "rapidb.showDDL",
+          when: expect.stringContaining("viewItem == sequence"),
+        }),
+        expect.objectContaining({
+          command: "rapidb.showDDL",
+          when: expect.stringContaining("viewItem == type"),
+        }),
+      ]),
+    );
+  });
 });

@@ -2,7 +2,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const getGraphMock = vi.hoisted(() => vi.fn());
 const tableCreateOrShowMock = vi.hoisted(() => vi.fn());
-const schemaCreateOrShowMock = vi.hoisted(() => vi.fn());
 
 const vscodeMock = vi.hoisted(() => {
   const createWebviewPanel = vi.fn(() => {
@@ -79,12 +78,6 @@ vi.mock("../../src/extension/services/erdGraphService", () => ({
 vi.mock("../../src/extension/panels/tablePanel", () => ({
   TablePanel: {
     createOrShow: tableCreateOrShowMock,
-  },
-}));
-
-vi.mock("../../src/extension/panels/schemaPanel", () => ({
-  SchemaPanel: {
-    createOrShow: schemaCreateOrShowMock,
   },
 }));
 
@@ -224,7 +217,7 @@ describe("ErdPanel", () => {
     ErdPanel.disposeAll();
   });
 
-  it("delegates schema and data actions", async () => {
+  it("delegates table data actions", async () => {
     const { ErdPanel } = await import("../../src/extension/panels/erdPanel");
 
     const connectionManager = {
@@ -246,15 +239,6 @@ describe("ErdPanel", () => {
     }
 
     await panel.webview.dispatchMessage({
-      type: "openSchema",
-      payload: {
-        table: "users",
-        database: "app_db",
-        schema: "public",
-      },
-    });
-
-    await panel.webview.dispatchMessage({
       type: "openTableData",
       payload: {
         table: "users",
@@ -263,15 +247,6 @@ describe("ErdPanel", () => {
         isView: false,
       },
     });
-
-    expect(schemaCreateOrShowMock).toHaveBeenCalledWith(
-      expect.anything(),
-      connectionManager,
-      "conn-1",
-      "app_db",
-      "public",
-      "users",
-    );
 
     expect(tableCreateOrShowMock).toHaveBeenCalledWith(
       expect.anything(),

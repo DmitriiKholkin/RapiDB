@@ -3,7 +3,6 @@ import {
   parseConnectionFormPanelMessage,
   parseErdPanelMessage,
   parseQueryPanelMessage,
-  parseSchemaPanelMessage,
   parseTablePanelMessage,
   parseWebviewInitialState,
 } from "../../src/shared/webviewContracts";
@@ -146,39 +145,6 @@ describe("parseQueryPanelMessage", () => {
   });
 });
 
-describe("parseSchemaPanelMessage", () => {
-  it("parses openRelatedSchema payloads", () => {
-    const parsed = parseSchemaPanelMessage({
-      type: "openRelatedSchema",
-      payload: {
-        table: "orders",
-        schema: "public",
-        database: "app_db",
-      },
-    });
-
-    expect(parsed).toEqual({
-      type: "openRelatedSchema",
-      payload: {
-        table: "orders",
-        schema: "public",
-        database: "app_db",
-      },
-    });
-  });
-
-  it("rejects malformed openRelatedSchema payloads", () => {
-    const parsed = parseSchemaPanelMessage({
-      type: "openRelatedSchema",
-      payload: {
-        schema: "public",
-      },
-    });
-
-    expect(parsed).toBeNull();
-  });
-});
-
 describe("parseConnectionFormPanelMessage", () => {
   it("parses saveConnection payloads", () => {
     const parsed = parseConnectionFormPanelMessage({
@@ -290,24 +256,6 @@ describe("parseWebviewInitialState", () => {
     });
   });
 
-  it("parses a valid schema state", () => {
-    const parsed = parseWebviewInitialState({
-      view: "schema",
-      connectionId: "conn-1",
-      database: "app_db",
-      schema: "public",
-      table: "users",
-    });
-
-    expect(parsed).toEqual({
-      view: "schema",
-      connectionId: "conn-1",
-      database: "app_db",
-      schema: "public",
-      table: "users",
-    });
-  });
-
   it("parses a valid connection state", () => {
     const parsed = parseWebviewInitialState({
       view: "connection",
@@ -407,9 +355,9 @@ describe("parseErdPanelMessage", () => {
     });
   });
 
-  it("rejects malformed openSchema payloads", () => {
+  it("rejects malformed openTableData payloads", () => {
     const parsed = parseErdPanelMessage({
-      type: "openSchema",
+      type: "openTableData",
       payload: {
         schema: "public",
       },

@@ -1,4 +1,5 @@
 import { Database } from "node-sqlite3-wasm";
+import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { ConnectionConfig } from "../connectionManager";
 import { BaseDBDriver } from "./BaseDBDriver";
 import type { DriverTimeoutSettingsProvider } from "./timeout";
@@ -838,6 +839,136 @@ export class SQLiteDriver extends BaseDBDriver {
       referencedColumn: r.to,
     }));
   }
+  async getConstraints(
+    database: string,
+    schema: string,
+    table: string,
+  ): Promise<import("./types").TableConstraintMeta[]> {
+    const constraints = await super.getConstraints(database, schema, table);
+    const row = this.requireDb().get(
+      `SELECT sql FROM sqlite_master WHERE type='table' AND name=?`,
+      [table],
+    ) as { sql: string | null } | null;
+    const createSql = row?.sql ?? "";
+    const matches = createSql.matchAll(
+      /(?:CONSTRAINT\s+([^\s]+)\s+)?CHECK\s*\(([^)]+)\)/gi,
+    );
+    let unnamedIndex = 1;
+    for (const match of matches) {
+      constraints.push({
+        name: match[1] ?? `check_${table}_${unnamedIndex++}`,
+        kind: "check",
+        columns: [],
+        checkExpression: match[2]?.trim(),
+        source: "catalog",
+      });
+    }
+    return constraints;
+  }
+  async getTriggers(
+    _database: string,
+    _schema: string,
+    table: string,
+  ): Promise<import("./types").TriggerMeta[] | null> {
+    const rows = this.requireDb().all(
+      `SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name=? ORDER BY name`,
+      [table],
+    ) as { name: string; sql: string | null }[];
+    return rows.map((row) => {
+      const sql = row.sql ?? "";
+      const triggerTypeMatch = sql.match(
+        /\b(BEFORE|AFTER|INSTEAD OF)\b([\s\S]*?)\bON\b/i,
+      );
+      const typeSegment = triggerTypeMatch?.[0] ?? "";
+      const events: import("./types").TriggerMeta["events"] = [];
+      if (/\bINSERT\b/i.test(typeSegment)) {
+        events.push("insert");
+      }
+      if (/\bUPDATE\b/i.test(typeSegment)) {
+        events.push("update");
+      }
+      if (/\bDELETE\b/i.test(typeSegment)) {
+        events.push("delete");
+      }
+      if (events.length === 0) {
+        events.push("unknown");
+      }
+      return {
+        name: row.name,
+        timing: /\bBEFORE\b/i.test(typeSegment)
+          ? "before"
+          : /\bINSTEAD OF\b/i.test(typeSegment)
+            ? "instead_of"
+            : /\bAFTER\b/i.test(typeSegment)
+              ? "after"
+              : "unknown",
+        events,
+        orientation: "row",
+        enabled: true,
+        definition: row.sql ?? undefined,
+      };
+    });
+  }
+  override async getConstraintDDL(
+    database: string,
+    schema: string,
+    table: string,
+    constraintName: string,
+  ): Promise<string> {
+    const constraint = (
+      await this.getConstraints(database, schema, table)
+    ).find((entry) => entry.name === constraintName);
+    if (!constraint) {
+      throw new Error(`Constraint "${constraintName}" not found`);
+    }
+
+    const tableDdl = await this.getCreateTableDDL(database, schema, table);
+    return `-- SQLite stores table constraints inside CREATE TABLE statements.\n-- Constraint: ${constraint.name}\n${tableDdl}`;
+  }
+  override async getIndexDDL(
+    database: string,
+    schema: string,
+    table: string,
+    indexName: string,
+  ): Promise<string> {
+    const row = this.requireDb().get(
+      `SELECT sql FROM sqlite_master WHERE type='index' AND name = ?`,
+      [indexName],
+    ) as { sql: string | null } | null;
+    if (row?.sql) {
+      return row.sql.endsWith(";") ? row.sql : `${row.sql};`;
+    }
+
+    const index = (await this.getIndexes(database, schema, table)).find(
+      (entry) => entry.name === indexName,
+    );
+    if (!index) {
+      throw new Error(`Index "${indexName}" not found`);
+    }
+
+    if (index.primary) {
+      const tableDdl = await this.getCreateTableDDL(database, schema, table);
+      return `-- SQLite stores PRIMARY KEY indexes inside CREATE TABLE statements.\n-- Index: ${index.name}\n${tableDdl}`;
+    }
+
+    return super.getIndexDDL(database, schema, table, indexName);
+  }
+  override async getTriggerDDL(
+    _database: string,
+    _schema: string,
+    table: string,
+    triggerName: string,
+  ): Promise<string> {
+    const row = this.requireDb().get(
+      `SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name = ? AND name = ?`,
+      [table, triggerName],
+    ) as { sql: string | null } | null;
+    const sql = row?.sql?.trim();
+    if (!sql) {
+      throw new Error(`Trigger "${triggerName}" not found`);
+    }
+    return sql.endsWith(";") ? sql : `${sql};`;
+  }
   async getCreateTableDDL(
     _database: string,
     _schema: string,
@@ -850,6 +981,14 @@ export class SQLiteDriver extends BaseDBDriver {
       sql: string;
     } | null;
     return row?.sql ?? `-- DDL not available for "${table}"`;
+  }
+  async getObjectDefinition(
+    _database: string,
+    _schema: string,
+    _name: string,
+    _kind: DdlOnlyDbObjectKind,
+  ): Promise<string | null> {
+    return null;
   }
   async getRoutineDefinition(
     _database: string,

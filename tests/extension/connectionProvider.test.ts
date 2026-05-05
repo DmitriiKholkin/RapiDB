@@ -97,6 +97,118 @@ describe("ConnectionProvider", () => {
     };
   }
 
+  function loadedTableDetailState() {
+    return {
+      request: {
+        connectionId: "conn-1",
+        database: "app_db",
+        schema: "app_db",
+        table: "users",
+      },
+      status: "loaded",
+      isPartial: false,
+      snapshot: {
+        columns: {
+          status: "loaded",
+          items: [
+            {
+              name: "id",
+              type: "integer",
+              nativeType: "integer",
+              nullable: false,
+              defaultValue: "nextval('users_id_seq'::regclass)",
+              isPrimaryKey: true,
+              primaryKeyOrdinal: 1,
+              isForeignKey: false,
+              filterable: true,
+              filterOperators: [],
+              category: "integer",
+              valueSemantics: "plain",
+            },
+            {
+              name: "uid",
+              type: "uuid",
+              nativeType: "uuid",
+              nullable: true,
+              defaultValue: "gen_random_uuid()",
+              isPrimaryKey: false,
+              isForeignKey: true,
+              filterable: true,
+              filterOperators: [],
+              category: "uuid",
+              valueSemantics: "plain",
+            },
+          ],
+        },
+        constraints: {
+          status: "loaded",
+          items: [
+            {
+              name: "pk_users",
+              kind: "primary_key",
+              columns: ["id"],
+              source: "catalog",
+            },
+          ],
+        },
+        indexes: {
+          status: "loaded",
+          items: [
+            {
+              name: "users_uid_key",
+              columns: ["uid"],
+              unique: true,
+              primary: false,
+            },
+          ],
+        },
+        triggers: {
+          status: "loaded",
+          items: [
+            {
+              name: "users_audit_trigger",
+              timing: "after",
+              events: ["insert", "update"],
+              orientation: "row",
+              enabled: true,
+            },
+          ],
+        },
+      },
+    };
+  }
+
+  function loadingTableDetailState() {
+    return {
+      request: {
+        connectionId: "conn-1",
+        database: "app_db",
+        schema: "app_db",
+        table: "users",
+      },
+      status: "loading",
+      isPartial: false,
+      snapshot: {
+        columns: {
+          status: "loading",
+          items: [],
+        },
+        constraints: {
+          status: "loading",
+          items: [],
+        },
+        indexes: {
+          status: "loading",
+          items: [],
+        },
+        triggers: {
+          status: "loading",
+          items: [],
+        },
+      },
+    };
+  }
+
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -256,8 +368,11 @@ describe("ConnectionProvider", () => {
     ).toEqual([
       { label: "Tables", description: "(1)" },
       { label: "Views", description: "(1)" },
+      { label: "Materialized Views", description: "(0)" },
       { label: "Functions", description: "(0)" },
       { label: "Procedures", description: "(0)" },
+      { label: "Sequences", description: "(0)" },
+      { label: "Types", description: "(0)" },
     ]);
 
     const tableNodes = await provider.getChildren(categories[0]);
@@ -283,7 +398,15 @@ describe("ConnectionProvider", () => {
                   name: "app_db",
                   objects: [
                     { name: "users", type: "table", columns: [] },
+                    {
+                      name: "latest_users",
+                      type: "materializedView",
+                      columns: [],
+                    },
+                    { name: "users_total", type: "function", columns: [] },
                     { name: "refresh_users", type: "procedure", columns: [] },
+                    { name: "users_seq", type: "sequence", columns: [] },
+                    { name: "user_status", type: "type", columns: [] },
                   ],
                 },
               ],
@@ -314,12 +437,46 @@ describe("ConnectionProvider", () => {
     expect(categories.map((node) => node.label)).toEqual([
       "Tables",
       "Views",
+      "Materialized Views",
       "Functions",
       "Procedures",
+      "Sequences",
+      "Types",
     ]);
 
-    const procedureNodes = await provider.getChildren(categories[3]);
+    const procedureCategory = categories.find(
+      (node) => node.label === "Procedures",
+    );
+    const materializedViewCategory = categories.find(
+      (node) => node.label === "Materialized Views",
+    );
+    const sequenceCategory = categories.find(
+      (node) => node.label === "Sequences",
+    );
+    const typeCategory = categories.find((node) => node.label === "Types");
+
+    if (
+      !procedureCategory ||
+      !materializedViewCategory ||
+      !sequenceCategory ||
+      !typeCategory
+    ) {
+      throw new Error("Expected all schema categories to be present");
+    }
+
+    const procedureNodes = await provider.getChildren(procedureCategory);
+    const materializedViewNodes = await provider.getChildren(
+      materializedViewCategory,
+    );
+    const sequenceNodes = await provider.getChildren(sequenceCategory);
+    const typeNodes = await provider.getChildren(typeCategory);
+
     expect(procedureNodes.map((node) => node.label)).toEqual(["refresh_users"]);
+    expect(materializedViewNodes.map((node) => node.label)).toEqual([
+      "latest_users",
+    ]);
+    expect(sequenceNodes.map((node) => node.label)).toEqual(["users_seq"]);
+    expect(typeNodes.map((node) => node.label)).toEqual(["user_status"]);
     expect(connectionManager.getDriver).not.toHaveBeenCalled();
   });
 
@@ -341,7 +498,15 @@ describe("ConnectionProvider", () => {
                   name: "app_db",
                   objects: [
                     { name: "users", type: "table", columns: [] },
+                    {
+                      name: "latest_users",
+                      type: "materializedView",
+                      columns: [],
+                    },
+                    { name: "users_total", type: "function", columns: [] },
                     { name: "refresh_users", type: "procedure", columns: [] },
+                    { name: "users_seq", type: "sequence", columns: [] },
+                    { name: "user_status", type: "type", columns: [] },
                   ],
                 },
               ],
@@ -369,7 +534,37 @@ describe("ConnectionProvider", () => {
     const databases = await provider.getChildren(roots[0]);
     const categories = await provider.getChildren(databases[0]);
     const tableNode = (await provider.getChildren(categories[0]))[0];
-    const procedureNode = (await provider.getChildren(categories[3]))[0];
+    const materializedViewCategory = categories.find(
+      (node) => node.label === "Materialized Views",
+    );
+    const functionCategory = categories.find(
+      (node) => node.label === "Functions",
+    );
+    const procedureCategory = categories.find(
+      (node) => node.label === "Procedures",
+    );
+    const sequenceCategory = categories.find(
+      (node) => node.label === "Sequences",
+    );
+    const typeCategory = categories.find((node) => node.label === "Types");
+
+    if (
+      !materializedViewCategory ||
+      !functionCategory ||
+      !procedureCategory ||
+      !sequenceCategory ||
+      !typeCategory
+    ) {
+      throw new Error("Expected all object categories to be present");
+    }
+
+    const materializedViewNode = (
+      await provider.getChildren(materializedViewCategory)
+    )[0];
+    const functionNode = (await provider.getChildren(functionCategory))[0];
+    const procedureNode = (await provider.getChildren(procedureCategory))[0];
+    const sequenceNode = (await provider.getChildren(sequenceCategory))[0];
+    const typeNode = (await provider.getChildren(typeCategory))[0];
 
     expect(tableNode).toMatchObject({
       id: "table:conn-1:app_db:app_db:users",
@@ -381,16 +576,31 @@ describe("ConnectionProvider", () => {
       title: "Open Data",
       arguments: [tableNode],
     });
+    expect(materializedViewNode).toMatchObject({
+      id: "materializedView:conn-1:app_db:app_db:latest_users",
+      contextValue: "materializedView",
+      tooltip:
+        "materializedView: latest_users\nSchema: app_db\nDatabase: app_db",
+    });
+    expect(materializedViewNode?.command).toEqual({
+      command: "rapidb.openTableData",
+      title: "Open Data",
+      arguments: [materializedViewNode],
+    });
+    expect(functionNode).toMatchObject({
+      id: "function:conn-1:app_db:app_db:users_total",
+      contextValue: "function",
+      tooltip: "function: users_total\nSchema: app_db\nDatabase: app_db",
+    });
+    expect(functionNode?.command).toBeUndefined();
     expect(procedureNode).toMatchObject({
       id: "procedure:conn-1:app_db:app_db:refresh_users",
       contextValue: "procedure",
       tooltip: "procedure: refresh_users\nSchema: app_db\nDatabase: app_db",
     });
-    expect(procedureNode?.command).toEqual({
-      command: "rapidb.openRoutine",
-      title: "Open Definition",
-      arguments: [procedureNode],
-    });
+    expect(procedureNode?.command).toBeUndefined();
+    expect(sequenceNode?.command).toBeUndefined();
+    expect(typeNode?.command).toBeUndefined();
   });
 
   it("returns a loading status node immediately instead of awaiting the full schema load", async () => {
@@ -642,8 +852,11 @@ describe("ConnectionProvider", () => {
     ).toEqual([
       { label: "Tables", description: "(1)" },
       { label: "Views", description: "(0)" },
+      { label: "Materialized Views", description: "(0)" },
       { label: "Functions", description: "(0)" },
       { label: "Procedures", description: "(0)" },
+      { label: "Sequences", description: "(0)" },
+      { label: "Types", description: "(0)" },
     ]);
 
     const tables = await provider.getChildren(categories[0]);
@@ -684,6 +897,184 @@ describe("ConnectionProvider", () => {
       label: "Snapshot failed",
       contextValue: "_error",
       tooltip: "Error: Snapshot failed",
+    });
+  });
+
+  it("keeps table click wiring and exposes cached detail sections under expanded tables", async () => {
+    const ensureTableDetailLoading = vi.fn();
+    const getTableDetailState = vi.fn(() => loadedTableDetailState());
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-1", name: "Primary", type: "mysql" },
+      ]),
+      isConnected: vi.fn((id: string) => id === "conn-1"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      ensureTableDetailLoading,
+      getTableDetailState,
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "app_db",
+              schemas: [
+                {
+                  name: "app_db",
+                  objects: [{ name: "users", type: "table", columns: [] }],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+
+    const roots = await provider.getChildren();
+    const databases = await provider.getChildren(roots[0]);
+    const categories = await provider.getChildren(databases[0]);
+    const tableNode = (await provider.getChildren(categories[0]))[0];
+    const sections = await provider.getChildren(tableNode);
+    const columnRows = await provider.getChildren(sections[0]);
+    const constraintRows = await provider.getChildren(sections[1]);
+    const indexRows = await provider.getChildren(sections[2]);
+    const triggerRows = await provider.getChildren(sections[3]);
+
+    expect(tableNode?.command).toEqual({
+      command: "rapidb.openTableData",
+      title: "Open Data",
+      arguments: [tableNode],
+    });
+    expect(tableNode?.collapsibleState).toBe(1);
+    expect(sections.map((node) => node.label)).toEqual([
+      "Columns",
+      "Constraints",
+      "Indexes",
+      "Triggers",
+    ]);
+    expect(columnRows.map((node) => node.label)).toEqual(["id", "uid"]);
+    expect(columnRows.map((node) => node.description)).toEqual([
+      "integer, default: nextval('users_id_seq'::regclass)",
+      "uuid?, default: gen_random_uuid()",
+    ]);
+    expect(columnRows[0]?.iconPath).toMatchObject({
+      id: "key",
+      color: { id: "charts.yellow" },
+    });
+    expect(columnRows[1]?.iconPath).toMatchObject({
+      id: "key",
+      color: undefined,
+    });
+    expect(constraintRows[0]?.command).toBeUndefined();
+    expect(indexRows[0]?.command).toBeUndefined();
+    expect(triggerRows[0]?.command).toBeUndefined();
+    expect(constraintRows[0]).toMatchObject({
+      label: "pk_users",
+      description: "primary key - id",
+    });
+    expect(indexRows[0]).toMatchObject({
+      label: "users_uid_key",
+      description: "unique - uid",
+    });
+    expect(triggerRows[0]).toMatchObject({
+      label: "users_audit_trigger",
+      description: "after insert, update",
+      tooltip: "users_audit_trigger after insert, update",
+    });
+    expect(ensureTableDetailLoading).toHaveBeenCalledWith({
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "app_db",
+      table: "users",
+    });
+    expect(getTableDetailState).toHaveBeenCalledWith({
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "app_db",
+      table: "users",
+    });
+  });
+
+  it("shows a single table-level loader until all table detail sections are ready", async () => {
+    const ensureTableDetailLoading = vi.fn();
+    const getTableDetailState = vi.fn(() => loadingTableDetailState());
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-1", name: "Primary", type: "mysql" },
+      ]),
+      isConnected: vi.fn((id: string) => id === "conn-1"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      ensureTableDetailLoading,
+      getTableDetailState,
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "app_db",
+              schemas: [
+                {
+                  name: "app_db",
+                  objects: [{ name: "users", type: "table", columns: [] }],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+
+    const roots = await provider.getChildren();
+    const databases = await provider.getChildren(roots[0]);
+    const categories = await provider.getChildren(databases[0]);
+    const tableNode = (await provider.getChildren(categories[0]))[0];
+    const children = await provider.getChildren(tableNode);
+
+    expect(children).toHaveLength(1);
+    expect(children[0]).toMatchObject({
+      id: "status_loading:conn-1",
+      label: "Loading users…",
+      contextValue: "_status",
+      tooltip: "Loading users…",
+    });
+    expect(ensureTableDetailLoading).toHaveBeenCalledWith({
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "app_db",
+      table: "users",
+    });
+    expect(getTableDetailState).toHaveBeenCalledWith({
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "app_db",
+      table: "users",
     });
   });
 });

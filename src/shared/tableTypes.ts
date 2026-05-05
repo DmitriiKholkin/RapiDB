@@ -25,6 +25,19 @@ export type ColumnDefaultKind = "literal" | "expression";
 
 export type GeneratedKind = "virtual" | "stored";
 
+export type ConstraintKind = "primary_key" | "foreign_key" | "unique" | "check";
+
+export type TriggerTiming = "before" | "after" | "instead_of" | "unknown";
+
+export type TriggerEvent =
+  | "insert"
+  | "update"
+  | "delete"
+  | "truncate"
+  | "unknown";
+
+export type TriggerOrientation = "row" | "statement" | "unknown";
+
 export interface QueryColumnMeta {
   category: TypeCategory | null;
 }
@@ -244,6 +257,26 @@ export interface ForeignKeyMeta {
   referencedTable: string;
   referencedColumn: string;
   constraintName: string;
+}
+
+export interface TableConstraintMeta {
+  name: string;
+  kind: ConstraintKind;
+  columns: string[];
+  referencedSchema?: string;
+  referencedTable?: string;
+  referencedColumns?: string[];
+  checkExpression?: string;
+  source: "catalog" | "derived";
+}
+
+export interface TriggerMeta {
+  name: string;
+  timing: TriggerTiming;
+  events: TriggerEvent[];
+  orientation?: TriggerOrientation;
+  enabled?: boolean;
+  definition?: string;
 }
 
 export function isNumericCategory(category: TypeCategory): boolean {

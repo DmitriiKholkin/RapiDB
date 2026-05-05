@@ -11,7 +11,7 @@ import { onMessage, postMessage } from "../utils/messaging";
 import {
   buildSqlCompletionSuggestions,
   type SqlCompletionSuggestionKind,
-} from "./sqlCompletionSuggestions";
+} from "../utils/sqlCompletionSuggestions";
 
 type MonacoHostWindow = Window & {
   __monacoEnvSet?: boolean;

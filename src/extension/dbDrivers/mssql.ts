@@ -1,4 +1,5 @@
 import * as mssql from "mssql";
+import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { ConnectionConfig } from "../connectionManager";
 import {
   BaseDBDriver,
@@ -894,6 +895,40 @@ export class MSSQLDriver extends BaseDBDriver {
         });
       }
     } catch {}
+    try {
+      const sequenceRes = await this.requirePool()
+        .request()
+        .query<NamedRow>(`SELECT seq.name
+           FROM [${escapeMssqlId(database)}].sys.sequences seq
+           JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = seq.schema_id
+           WHERE s.name = '${esc(schema)}'
+           ORDER BY seq.name`);
+      for (const row of sequenceRes.recordset) {
+        objects.push({
+          schema,
+          name: row.name,
+          type: "sequence",
+        });
+      }
+    } catch {}
+    try {
+      const typeRes = await this.requirePool()
+        .request()
+        .query<NamedRow>(`SELECT t.name
+           FROM [${escapeMssqlId(database)}].sys.types t
+           JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = t.schema_id
+           WHERE s.name = '${esc(schema)}'
+             AND t.is_user_defined = 1
+             AND t.is_table_type = 0
+           ORDER BY t.name`);
+      for (const row of typeRes.recordset) {
+        objects.push({
+          schema,
+          name: row.name,
+          type: "type",
+        });
+      }
+    } catch {}
     return objects;
   }
   async describeTable(
@@ -1123,6 +1158,114 @@ export class MSSQLDriver extends BaseDBDriver {
       referencedColumn: row.ref_column,
     }));
   }
+  async getConstraints(
+    database: string,
+    schema: string,
+    table: string,
+  ): Promise<import("./types").TableConstraintMeta[]> {
+    const constraints = await super.getConstraints(database, schema, table);
+    const esc = (value: string) => value.replace(/'/g, "''");
+    const res = await this.requirePool()
+      .request()
+      .query<{
+        constraint_name: string;
+        definition: string | null;
+      }>(`SELECT cc.name AS constraint_name,
+               cc.definition AS definition
+        FROM [${escapeMssqlId(database)}].sys.check_constraints cc
+        JOIN [${escapeMssqlId(database)}].sys.objects o ON o.object_id = cc.parent_object_id
+        JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = o.schema_id
+        WHERE s.name = '${esc(schema)}' AND o.name = '${esc(table)}'
+        ORDER BY cc.name`);
+    constraints.push(
+      ...res.recordset.map((row) => ({
+        name: row.constraint_name,
+        kind: "check" as const,
+        columns: [],
+        checkExpression: row.definition ?? undefined,
+        source: "catalog" as const,
+      })),
+    );
+    return constraints;
+  }
+  async getTriggers(
+    database: string,
+    schema: string,
+    table: string,
+  ): Promise<import("./types").TriggerMeta[] | null> {
+    const esc = (value: string) => value.replace(/'/g, "''");
+    const res = await this.requirePool()
+      .request()
+      .query<{
+        trigger_name: string;
+        is_disabled: boolean | number | null;
+        is_instead_of_trigger: boolean | number | null;
+        is_insert: boolean | number | null;
+        is_update: boolean | number | null;
+        is_delete: boolean | number | null;
+        definition: string | null;
+      }>(`SELECT tr.name AS trigger_name,
+               tr.is_disabled,
+               tr.is_instead_of_trigger,
+               OBJECTPROPERTY(tr.object_id, 'ExecIsInsertTrigger') AS is_insert,
+               OBJECTPROPERTY(tr.object_id, 'ExecIsUpdateTrigger') AS is_update,
+               OBJECTPROPERTY(tr.object_id, 'ExecIsDeleteTrigger') AS is_delete,
+               sm.definition AS definition
+        FROM [${escapeMssqlId(database)}].sys.triggers tr
+        JOIN [${escapeMssqlId(database)}].sys.tables tbl ON tbl.object_id = tr.parent_id
+        JOIN [${escapeMssqlId(database)}].sys.schemas sch ON sch.schema_id = tbl.schema_id
+        LEFT JOIN [${escapeMssqlId(database)}].sys.sql_modules sm ON sm.object_id = tr.object_id
+        WHERE sch.name = '${esc(schema)}' AND tbl.name = '${esc(table)}'
+        ORDER BY tr.name`);
+    return res.recordset.map((row) => {
+      const events: import("./types").TriggerMeta["events"] = [];
+      if (isSetFlag(row.is_insert)) {
+        events.push("insert");
+      }
+      if (isSetFlag(row.is_update)) {
+        events.push("update");
+      }
+      if (isSetFlag(row.is_delete)) {
+        events.push("delete");
+      }
+      if (events.length === 0) {
+        events.push("unknown");
+      }
+      return {
+        name: row.trigger_name,
+        timing: isSetFlag(row.is_instead_of_trigger) ? "instead_of" : "after",
+        events,
+        orientation: "statement",
+        enabled: !isSetFlag(row.is_disabled),
+        definition: row.definition ?? undefined,
+      };
+    });
+  }
+  override async getTriggerDDL(
+    database: string,
+    schema: string,
+    table: string,
+    triggerName: string,
+  ): Promise<string> {
+    const esc = (value: string) => value.replace(/'/g, "''");
+    const res = await this.requirePool()
+      .request()
+      .query<{ definition: string | null }>(
+        `SELECT sm.definition AS definition
+       FROM [${escapeMssqlId(database)}].sys.triggers tr
+       JOIN [${escapeMssqlId(database)}].sys.tables tbl ON tbl.object_id = tr.parent_id
+       JOIN [${escapeMssqlId(database)}].sys.schemas sch ON sch.schema_id = tbl.schema_id
+       LEFT JOIN [${escapeMssqlId(database)}].sys.sql_modules sm ON sm.object_id = tr.object_id
+       WHERE sch.name = '${esc(schema)}'
+         AND tbl.name = '${esc(table)}'
+         AND tr.name = '${esc(triggerName)}'`,
+      );
+    const definition = res.recordset[0]?.definition?.trim();
+    if (!definition) {
+      throw new Error(`Trigger "${triggerName}" not found`);
+    }
+    return definition.endsWith(";") ? definition : `${definition};`;
+  }
   async getCreateTableDDL(
     database: string,
     schema: string,
@@ -1205,6 +1348,16 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     return `CREATE TABLE ${this.qualifiedTableName("", schema, table)} (\n${colDefs.join(",\n")}\n);`;
   }
+  async getObjectDefinition(
+    database: string,
+    schema: string,
+    name: string,
+    kind: DdlOnlyDbObjectKind,
+  ): Promise<string | null> {
+    return kind === "sequence"
+      ? this.getSequenceDefinition(database, schema, name)
+      : this.getTypeDefinition(database, schema, name);
+  }
   async getRoutineDefinition(
     database: string,
     schema: string,
@@ -1218,6 +1371,89 @@ export class MSSQLDriver extends BaseDBDriver {
       );
     const def = res.recordset[0]?.def ?? null;
     return def ?? `-- Definition not available for [${schema}].[${name}]`;
+  }
+
+  private async getSequenceDefinition(
+    database: string,
+    schema: string,
+    name: string,
+  ): Promise<string | null> {
+    const esc = (value: string) => value.replace(/'/g, "''");
+    const res = await this.requirePool()
+      .request()
+      .query<{
+        start_value: string | number;
+        increment: string | number;
+        minimum_value: string | number;
+        maximum_value: string | number;
+        is_cycling: boolean | number;
+        cache_size: string | number;
+      }>(`SELECT start_value,
+                 increment,
+                 minimum_value,
+                 maximum_value,
+                 is_cycling,
+                 cache_size
+          FROM [${escapeMssqlId(database)}].sys.sequences seq
+          JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = seq.schema_id
+          WHERE s.name = '${esc(schema)}'
+            AND seq.name = '${esc(name)}'`);
+    const row = res.recordset[0];
+    if (!row) {
+      return null;
+    }
+
+    const clauses = [
+      `CREATE SEQUENCE ${this.qualifiedTableName("", schema, name)}`,
+      `START WITH ${row.start_value}`,
+      `INCREMENT BY ${row.increment}`,
+      `MINVALUE ${row.minimum_value}`,
+      `MAXVALUE ${row.maximum_value}`,
+      isSetFlag(row.is_cycling) ? "CYCLE" : "NO CYCLE",
+      `CACHE ${row.cache_size}`,
+    ];
+    return `${clauses.join(" ")};`;
+  }
+
+  private async getTypeDefinition(
+    database: string,
+    schema: string,
+    name: string,
+  ): Promise<string | null> {
+    const esc = (value: string) => value.replace(/'/g, "''");
+    const res = await this.requirePool()
+      .request()
+      .query<{
+        base_type: string;
+        max_length: number;
+        precision: number;
+        scale: number;
+        is_nullable: boolean | number;
+      }>(`SELECT bt.name AS base_type,
+                 t.max_length,
+                 t.precision,
+                 t.scale,
+                 t.is_nullable
+          FROM [${escapeMssqlId(database)}].sys.types t
+          JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = t.schema_id
+          JOIN [${escapeMssqlId(database)}].sys.types bt ON bt.user_type_id = t.system_type_id AND bt.user_type_id = bt.system_type_id
+          WHERE s.name = '${esc(schema)}'
+            AND t.name = '${esc(name)}'
+            AND t.is_user_defined = 1
+            AND t.is_table_type = 0`);
+    const row = res.recordset[0];
+    if (!row) {
+      return null;
+    }
+
+    const baseType = mssqlFullType(
+      row.base_type,
+      row.max_length,
+      row.precision,
+      row.scale,
+    );
+    const nullability = isSetFlag(row.is_nullable) ? "NULL" : "NOT NULL";
+    return `CREATE TYPE ${this.qualifiedTableName("", schema, name)} FROM ${baseType} ${nullability};`;
   }
   async runTransaction(
     operations: import("./types").TransactionOperation[],

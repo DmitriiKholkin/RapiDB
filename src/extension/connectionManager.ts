@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
+import { isDataDbObjectKind, isDbObjectKind } from "../shared/dbObjectKinds";
 import {
   type BookmarkEntry,
   type ConnectAttempt,
@@ -19,6 +20,9 @@ import {
   type ScopedSchemaCacheEntry,
   type ScopedSchemaFragment,
   type StoredConnectionConfig,
+  type TableDetailRequest,
+  type TableDetailState,
+  type TableStructureSnapshot,
   type TestConnectionResult,
 } from "./connectionManagerModels";
 import {
@@ -51,6 +55,9 @@ export type {
   SchemaSnapshotState,
   ScopeAwareConnectionManagerApi,
   ScopedSchemaCacheEntry,
+  TableDetailRequest,
+  TableDetailState,
+  TableStructureSnapshot,
   TestConnectionResult,
 } from "./connectionManagerModels";
 
@@ -58,6 +65,12 @@ interface InternalScopedSchemaCacheEntry extends ScopedSchemaCacheEntry {
   loading: Promise<void> | null;
   retainOnCollapse: boolean;
   fullyLoaded: boolean;
+  tableDetails: Map<string, InternalTableDetailCacheEntry>;
+}
+
+interface InternalTableDetailCacheEntry extends TableDetailState {
+  generation: number;
+  loading: Promise<void> | null;
 }
 
 interface ConnectionSchemaCacheEntry extends SchemaSnapshotState {
@@ -158,6 +171,110 @@ function createEmptySchemaSnapshotState(): SchemaSnapshotState {
   return createSchemaSnapshotState(createEmptySchemaSnapshot(), "idle", false);
 }
 
+function createEmptyTableStructureSnapshot(): TableStructureSnapshot {
+  return {
+    columns: {
+      status: "idle",
+      items: [],
+    },
+    constraints: {
+      status: "idle",
+      items: [],
+    },
+    indexes: {
+      status: "idle",
+      items: [],
+    },
+    triggers: {
+      status: "idle",
+      items: [],
+    },
+  };
+}
+
+function createEmptyTableDetailState(
+  request: TableDetailRequest,
+): TableDetailState {
+  return {
+    request: { ...request },
+    snapshot: createEmptyTableStructureSnapshot(),
+    status: "idle",
+    isPartial: false,
+  };
+}
+
+function cloneTableStructureSnapshot(
+  snapshot: TableStructureSnapshot,
+): TableStructureSnapshot {
+  return {
+    columns: {
+      status: snapshot.columns.status,
+      items: snapshot.columns.items.map((column) => ({ ...column })),
+      unsupported: snapshot.columns.unsupported,
+      error: snapshot.columns.error,
+    },
+    constraints: {
+      status: snapshot.constraints.status,
+      items: snapshot.constraints.items.map((constraint) => ({
+        ...constraint,
+        columns: [...constraint.columns],
+        referencedColumns: constraint.referencedColumns
+          ? [...constraint.referencedColumns]
+          : undefined,
+      })),
+      unsupported: snapshot.constraints.unsupported,
+      error: snapshot.constraints.error,
+    },
+    indexes: {
+      status: snapshot.indexes.status,
+      items: snapshot.indexes.items.map((index) => ({
+        ...index,
+        columns: [...index.columns],
+      })),
+      unsupported: snapshot.indexes.unsupported,
+      error: snapshot.indexes.error,
+    },
+    triggers: {
+      status: snapshot.triggers.status,
+      items: snapshot.triggers.items.map((trigger) => ({
+        ...trigger,
+        events: [...trigger.events],
+      })),
+      unsupported: snapshot.triggers.unsupported,
+      error: snapshot.triggers.error,
+    },
+  };
+}
+
+function cloneTableDetailState(state: TableDetailState): TableDetailState {
+  return {
+    request: { ...state.request },
+    snapshot: cloneTableStructureSnapshot(state.snapshot),
+    status: state.status,
+    isPartial: state.isPartial,
+    error: state.error,
+  };
+}
+
+function createInternalTableDetailCacheEntry(
+  request: TableDetailRequest,
+  generation: number,
+): InternalTableDetailCacheEntry {
+  return {
+    ...createEmptyTableDetailState(request),
+    generation,
+    loading: null,
+  };
+}
+
+function getTableDetailCacheKey(
+  request: Omit<TableDetailRequest, "connectionId">,
+): string {
+  return [request.database, request.schema, request.table]
+    .map((part) => encodeURIComponent(part))
+    .join(":");
+}
+
 function cloneSchemaSnapshotObjectEntry(
   object: SchemaSnapshotObjectEntry,
 ): SchemaSnapshotObjectEntry {
@@ -255,6 +372,7 @@ function createScopedSchemaCacheEntry(
     loading: null,
     retainOnCollapse,
     fullyLoaded: false,
+    tableDetails: new Map<string, InternalTableDetailCacheEntry>(),
   };
 }
 
@@ -796,11 +914,190 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
     return createEmptySchemaSnapshotState();
   }
 
+  getTableDetailState(request: TableDetailRequest): TableDetailState {
+    const entry = this._schemaCacheMap.get(request.connectionId);
+    if (!entry) {
+      return createEmptyTableDetailState(request);
+    }
+
+    const schemaEntry = entry.scopes.get(
+      getExplorerSchemaScopeKey({
+        kind: "schema",
+        database: request.database,
+        schema: request.schema,
+      }),
+    );
+    const tableDetail = schemaEntry?.tableDetails.get(
+      getTableDetailCacheKey(request),
+    );
+
+    if (tableDetail) {
+      return cloneTableDetailState(tableDetail);
+    }
+
+    if (schemaEntry?.status === "loading") {
+      return {
+        ...createEmptyTableDetailState(request),
+        status: "loading",
+      };
+    }
+
+    if (schemaEntry?.status === "error") {
+      return {
+        ...createEmptyTableDetailState(request),
+        status: "error",
+        error: schemaEntry.error,
+      };
+    }
+
+    return createEmptyTableDetailState(request);
+  }
+
   ensureSchemaSnapshotLoading(connectionId: string): void {
     this.ensureSchemaScopeLoading(
       connectionId,
       createConnectionRootSchemaScope(),
     );
+  }
+
+  ensureTableDetailLoading(request: TableDetailRequest): void {
+    this.ensureSchemaScopeLoading(request.connectionId, {
+      kind: "schema",
+      database: request.database,
+      schema: request.schema,
+    });
+
+    const driver = this.getDriver(request.connectionId);
+    const config = this.getConnection(request.connectionId);
+    if (!driver || !config) {
+      return;
+    }
+
+    const entry = this._getOrCreateSchemaCacheEntry(
+      request.connectionId,
+      config,
+    );
+    const schemaEntry = this._getOrCreateScopeEntry(
+      entry,
+      {
+        kind: "schema",
+        database: request.database,
+        schema: request.schema,
+      },
+      getConfiguredDefaultDatabaseName(config) === request.database,
+    );
+    const tableDetailKey = getTableDetailCacheKey(request);
+    let tableDetailEntry = schemaEntry.tableDetails.get(tableDetailKey);
+
+    if (!tableDetailEntry || tableDetailEntry.generation !== entry.generation) {
+      tableDetailEntry = createInternalTableDetailCacheEntry(
+        request,
+        entry.generation,
+      );
+      schemaEntry.tableDetails.set(tableDetailKey, tableDetailEntry);
+    }
+
+    if (tableDetailEntry.loading || tableDetailEntry.status === "loaded") {
+      return;
+    }
+
+    if (tableDetailEntry.status === "error") {
+      return;
+    }
+
+    tableDetailEntry.status = "loading";
+    tableDetailEntry.isPartial = false;
+    delete tableDetailEntry.error;
+    tableDetailEntry.snapshot = {
+      columns: { status: "loading", items: [] },
+      constraints: { status: "loading", items: [] },
+      indexes: { status: "loading", items: [] },
+      triggers: { status: "loading", items: [] },
+    };
+    this._onDidChangeSchemaState.fire(request.connectionId);
+
+    let loadPromise: Promise<void> | null = null;
+    loadPromise = (async () => {
+      try {
+        if (schemaEntry.loading) {
+          try {
+            await schemaEntry.loading;
+          } catch {}
+        }
+
+        if (
+          !this._isLiveTableDetailEntry(
+            request.connectionId,
+            entry,
+            schemaEntry,
+            tableDetailKey,
+            tableDetailEntry,
+          )
+        ) {
+          return;
+        }
+
+        if (schemaEntry.status === "error") {
+          tableDetailEntry.status = "error";
+          tableDetailEntry.error =
+            schemaEntry.error ??
+            `Failed to load schema ${request.database}.${request.schema}`;
+          return;
+        }
+
+        const nextState = await this._loadTableDetailInternal(driver, request);
+        if (
+          !this._isLiveTableDetailEntry(
+            request.connectionId,
+            entry,
+            schemaEntry,
+            tableDetailKey,
+            tableDetailEntry,
+          )
+        ) {
+          return;
+        }
+
+        tableDetailEntry.snapshot = nextState.snapshot;
+        tableDetailEntry.status = nextState.status;
+        tableDetailEntry.isPartial = nextState.isPartial;
+        tableDetailEntry.error = nextState.error;
+      } catch (err: unknown) {
+        if (
+          !this._isLiveTableDetailEntry(
+            request.connectionId,
+            entry,
+            schemaEntry,
+            tableDetailKey,
+            tableDetailEntry,
+          )
+        ) {
+          return;
+        }
+
+        const error = normalizeUnknownError(err);
+        tableDetailEntry.status = "error";
+        tableDetailEntry.isPartial = false;
+        tableDetailEntry.error = error.message;
+      } finally {
+        if (
+          loadPromise &&
+          this._isLiveTableDetailEntry(
+            request.connectionId,
+            entry,
+            schemaEntry,
+            tableDetailKey,
+            tableDetailEntry,
+          ) &&
+          tableDetailEntry.loading === loadPromise
+        ) {
+          tableDetailEntry.loading = null;
+        }
+        this._onDidChangeSchemaState.fire(request.connectionId);
+      }
+    })();
+
+    tableDetailEntry.loading = loadPromise;
   }
 
   ensureSchemaScopeLoading(
@@ -1003,6 +1300,20 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
     }
 
     return entry.scopes.get(scopeEntry.key) === scopeEntry;
+  }
+
+  private _isLiveTableDetailEntry(
+    connectionId: string,
+    entry: ConnectionSchemaCacheEntry,
+    scopeEntry: InternalScopedSchemaCacheEntry,
+    tableDetailKey: string,
+    tableDetailEntry: InternalTableDetailCacheEntry,
+  ): boolean {
+    if (!this._isLiveScopeEntry(connectionId, entry, scopeEntry)) {
+      return false;
+    }
+
+    return scopeEntry.tableDetails.get(tableDetailKey) === tableDetailEntry;
   }
 
   private _getOrCreateSchemaCacheEntry(
@@ -1540,18 +1851,14 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
     const objects = await driver
       .listObjects(databaseName, schemaName)
       .catch(() => []);
-    const objectsForSchema = objects.filter(
-      (object) =>
-        object.type === "table" ||
-        object.type === "view" ||
-        object.type === "function" ||
-        object.type === "procedure",
+    const objectsForSchema = objects.filter((object) =>
+      isDbObjectKind(object.type),
     );
     const describedColumns = await pMapWithLimit(
       objectsForSchema,
       10,
       async (object) => {
-        if (object.type !== "table" && object.type !== "view") {
+        if (!isDataDbObjectKind(object.type)) {
           return [];
         }
 
@@ -1573,15 +1880,104 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
         (object, index) => ({
           name: object.name,
           type: object.type,
-          columns:
-            object.type === "table" || object.type === "view"
-              ? describedColumns[index].map((column) => ({
-                  name: column.name,
-                  type: column.type,
-                }))
-              : [],
+          columns: isDataDbObjectKind(object.type)
+            ? describedColumns[index].map((column) => ({
+                name: column.name,
+                type: column.type,
+              }))
+            : [],
         }),
       ),
+    };
+  }
+
+  private async _loadTableDetailInternal(
+    driver: IDBDriver,
+    request: TableDetailRequest,
+  ): Promise<
+    Pick<TableDetailState, "snapshot" | "status" | "isPartial" | "error">
+  > {
+    const results = await Promise.allSettled([
+      driver.describeColumns(request.database, request.schema, request.table),
+      driver.getConstraints(request.database, request.schema, request.table),
+      driver.getIndexes(request.database, request.schema, request.table),
+      driver.getTriggers(request.database, request.schema, request.table),
+    ]);
+
+    const columnsResult = results[0];
+    const constraintsResult = results[1];
+    const indexesResult = results[2];
+    const triggersResult = results[3];
+
+    const snapshot: TableStructureSnapshot = {
+      columns:
+        columnsResult.status === "fulfilled"
+          ? {
+              status: "loaded",
+              items: columnsResult.value,
+            }
+          : {
+              status: "error",
+              items: [],
+              error: normalizeUnknownError(columnsResult.reason).message,
+            },
+      constraints:
+        constraintsResult.status === "fulfilled"
+          ? {
+              status: "loaded",
+              items: constraintsResult.value,
+            }
+          : {
+              status: "error",
+              items: [],
+              error: normalizeUnknownError(constraintsResult.reason).message,
+            },
+      indexes:
+        indexesResult.status === "fulfilled"
+          ? {
+              status: "loaded",
+              items: indexesResult.value,
+            }
+          : {
+              status: "error",
+              items: [],
+              error: normalizeUnknownError(indexesResult.reason).message,
+            },
+      triggers:
+        triggersResult.status === "fulfilled"
+          ? triggersResult.value === null
+            ? {
+                status: "loaded",
+                items: [],
+                unsupported: true,
+              }
+            : {
+                status: "loaded",
+                items: triggersResult.value,
+              }
+          : {
+              status: "error",
+              items: [],
+              error: normalizeUnknownError(triggersResult.reason).message,
+            },
+    };
+
+    const sectionStates = [
+      snapshot.columns,
+      snapshot.constraints,
+      snapshot.indexes,
+      snapshot.triggers,
+    ];
+    const allErrored = sectionStates.every((state) => state.status === "error");
+    const hasError = sectionStates.some((state) => state.status === "error");
+
+    return {
+      snapshot,
+      status: allErrored ? "error" : "loaded",
+      isPartial: hasError,
+      error: allErrored
+        ? sectionStates.find((state) => state.error)?.error
+        : undefined,
     };
   }
   async testConnection(

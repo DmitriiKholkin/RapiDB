@@ -1,4 +1,11 @@
 import type { ConnectionConfig } from "../shared/connectionConfig";
+import type { DbObjectKind } from "../shared/dbObjectKinds";
+import type {
+  ColumnTypeMeta,
+  IndexMeta,
+  TableConstraintMeta,
+  TriggerMeta,
+} from "./dbDrivers/types";
 
 export type { ConnectionConfig } from "../shared/connectionConfig";
 export interface TestConnectionResult {
@@ -25,7 +32,7 @@ export interface SchemaObjectEntry {
   database: string;
   schema: string;
   object: string;
-  type?: "table" | "view" | "function" | "procedure";
+  type?: DbObjectKind;
   columns: {
     name: string;
     type: string;
@@ -39,7 +46,7 @@ export interface SchemaColumnEntry {
 
 export interface SchemaSnapshotObjectEntry {
   name: string;
-  type: "table" | "view" | "function" | "procedure";
+  type: DbObjectKind;
   columns: SchemaColumnEntry[];
 }
 
@@ -90,6 +97,41 @@ export interface ScopedSchemaCacheEntry extends SchemaSnapshotState {
   generation: number;
 }
 
+export type TableDetailSectionKind =
+  | "columns"
+  | "constraints"
+  | "indexes"
+  | "triggers";
+
+export interface TableDetailRequest {
+  connectionId: string;
+  database: string;
+  schema: string;
+  table: string;
+}
+
+export interface TableDetailSectionState<T> {
+  status: SchemaLoadStatus;
+  items: T[];
+  unsupported?: boolean;
+  error?: string;
+}
+
+export interface TableStructureSnapshot {
+  columns: TableDetailSectionState<ColumnTypeMeta>;
+  constraints: TableDetailSectionState<TableConstraintMeta>;
+  indexes: TableDetailSectionState<IndexMeta>;
+  triggers: TableDetailSectionState<TriggerMeta>;
+}
+
+export interface TableDetailState {
+  request: TableDetailRequest;
+  snapshot: TableStructureSnapshot;
+  status: SchemaLoadStatus;
+  isPartial: boolean;
+  error?: string;
+}
+
 export interface ScopeAwareConnectionManagerApi {
   ensureSchemaScopeLoading(
     connectionId: string,
@@ -109,6 +151,8 @@ export interface ScopeAwareConnectionManagerApi {
   ): void;
   refreshSchemaCache(request?: RefreshSchemaRequest): void;
   getSchemaAsync(connectionId: string): Promise<SchemaObjectEntry[]>;
+  ensureTableDetailLoading(request: TableDetailRequest): void;
+  getTableDetailState(request: TableDetailRequest): TableDetailState;
 }
 
 export interface StoredConnectionConfig extends ConnectionConfig {

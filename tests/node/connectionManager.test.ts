@@ -6,7 +6,9 @@ import type {
   DatabaseInfo,
   IDBDriver,
   SchemaInfo,
+  TableConstraintMeta,
   TableInfo,
+  TriggerMeta,
 } from "../../src/extension/dbDrivers/types";
 import {
   createExtensionContextStub,
@@ -31,6 +33,18 @@ interface DriverBehavior {
     schema: string,
     table: string,
   ) => ColumnMeta[] | Promise<ColumnMeta[]>;
+  getConstraintsByScope?: Record<string, TableConstraintMeta[]>;
+  getConstraintsImpl?: (
+    database: string,
+    schema: string,
+    table: string,
+  ) => TableConstraintMeta[] | Promise<TableConstraintMeta[]>;
+  getTriggersByScope?: Record<string, TriggerMeta[] | null>;
+  getTriggersImpl?: (
+    database: string,
+    schema: string,
+    table: string,
+  ) => TriggerMeta[] | null | Promise<TriggerMeta[] | null>;
 }
 
 const driverBehaviors = new Map<string, DriverBehavior>();
@@ -82,10 +96,40 @@ async function waitForSchemaCondition(
   });
 }
 
+async function waitForTableDetailCondition(
+  manager: {
+    onDidChangeSchemaState(listener: (connectionId: string) => void): {
+      dispose(): void;
+    };
+  },
+  connectionId: string,
+  predicate: () => boolean,
+): Promise<void> {
+  if (predicate()) {
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    const subscription = manager.onDidChangeSchemaState(
+      (changedConnectionId) => {
+        if (changedConnectionId !== connectionId || !predicate()) {
+          return;
+        }
+
+        subscription.dispose();
+        resolve();
+      },
+    );
+  });
+}
+
 class FakeDriver implements IDBDriver {
   connectCalls = 0;
   disconnectCalls = 0;
   describeTableCalls: string[] = [];
+  describeColumnsCalls: string[] = [];
+  getConstraintsCalls: string[] = [];
+  getTriggersCalls: string[] = [];
   private connected = false;
 
   constructor(
@@ -156,8 +200,21 @@ class FakeDriver implements IDBDriver {
     );
   }
 
-  async describeColumns(): Promise<ColumnTypeMeta[]> {
-    return [];
+  async describeColumns(
+    database = "",
+    schema = "",
+    table = "",
+  ): Promise<ColumnTypeMeta[]> {
+    this.describeColumnsCalls.push(`${database}.${schema}.${table}`);
+    const columns = await this.describeTable(database, schema, table);
+    return columns.map((column) => ({
+      ...column,
+      category: "other",
+      nativeType: column.type,
+      filterable: true,
+      filterOperators: [],
+      valueSemantics: "plain",
+    }));
   }
 
   async getIndexes() {
@@ -168,8 +225,56 @@ class FakeDriver implements IDBDriver {
     return [];
   }
 
+  async getConstraints(
+    database = "",
+    schema = "",
+    table = "",
+  ): Promise<TableConstraintMeta[]> {
+    this.getConstraintsCalls.push(`${database}.${schema}.${table}`);
+    const behavior = driverBehaviors.get(this.config.id);
+    if (behavior?.getConstraintsImpl) {
+      return behavior.getConstraintsImpl(database, schema, table);
+    }
+
+    return (
+      behavior?.getConstraintsByScope?.[`${database}.${schema}.${table}`] ?? []
+    );
+  }
+
+  async getTriggers(
+    database = "",
+    schema = "",
+    table = "",
+  ): Promise<TriggerMeta[] | null> {
+    this.getTriggersCalls.push(`${database}.${schema}.${table}`);
+    const behavior = driverBehaviors.get(this.config.id);
+    if (behavior?.getTriggersImpl) {
+      return behavior.getTriggersImpl(database, schema, table);
+    }
+
+    return (
+      behavior?.getTriggersByScope?.[`${database}.${schema}.${table}`] ?? []
+    );
+  }
+
+  async getConstraintDDL(): Promise<string> {
+    return "";
+  }
+
+  async getIndexDDL(): Promise<string> {
+    return "";
+  }
+
+  async getTriggerDDL(): Promise<string> {
+    return "";
+  }
+
   async getCreateTableDDL(): Promise<string> {
     return "";
+  }
+
+  async getObjectDefinition(): Promise<string | null> {
+    return null;
   }
 
   async getRoutineDefinition(): Promise<string> {
@@ -505,7 +610,14 @@ describe("ConnectionManager", () => {
         "app_db.public": [
           { schema: "public", name: "users", type: "table" },
           { schema: "public", name: "active_users", type: "view" },
+          {
+            schema: "public",
+            name: "daily_users",
+            type: "materializedView",
+          },
           { schema: "public", name: "rebuild_cache", type: "procedure" },
+          { schema: "public", name: "users_id_seq", type: "sequence" },
+          { schema: "public", name: "user_status", type: "type" },
         ],
         "app_db.audit": [
           { schema: "audit", name: "event_feed", type: "table" },
@@ -526,6 +638,15 @@ describe("ConnectionManager", () => {
           },
         ],
         "app_db.public.active_users": [
+          {
+            name: "id",
+            type: "int",
+            nullable: false,
+            isPrimaryKey: false,
+            isForeignKey: false,
+          },
+        ],
+        "app_db.public.daily_users": [
           {
             name: "id",
             type: "int",
@@ -608,13 +729,35 @@ describe("ConnectionManager", () => {
           object: "users",
           columns: [{ name: "id", type: "int" }],
         }),
+        expect.objectContaining({
+          database: "app_db",
+          schema: "public",
+          object: "daily_users",
+          type: "materializedView",
+          columns: [{ name: "id", type: "int" }],
+        }),
+        expect.objectContaining({
+          database: "app_db",
+          schema: "public",
+          object: "users_id_seq",
+          type: "sequence",
+          columns: [],
+        }),
+        expect.objectContaining({
+          database: "app_db",
+          schema: "public",
+          object: "user_status",
+          type: "type",
+          columns: [],
+        }),
       ]),
     );
-    expect(schema).toHaveLength(4);
+    expect(schema).toHaveLength(7);
 
     expect(driverInstances[0]?.describeTableCalls).toEqual([
       "app_db.public.users",
       "app_db.public.active_users",
+      "app_db.public.daily_users",
       "app_db.audit.event_feed",
     ]);
   });
@@ -1713,6 +1856,238 @@ describe("ConnectionManager", () => {
     expect(store.readHistory().map((entry) => entry.sql)).toEqual([
       "select 3",
       "select 2",
+    ]);
+  });
+
+  it("reuses loaded table detail metadata after schema collapse and re-expand", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    driverBehaviors.set("conn-1", {
+      listDatabases: [{ name: "app_db", schemas: [] }],
+      listSchemasByDatabase: {
+        app_db: [{ name: "public" }],
+      },
+      listObjectsByScope: {
+        "app_db.public": [{ schema: "public", name: "users", type: "table" }],
+      },
+      describeTableByScope: {
+        "app_db.public.users": [
+          {
+            name: "id",
+            type: "int",
+            nullable: false,
+            isPrimaryKey: true,
+            primaryKeyOrdinal: 1,
+            isForeignKey: false,
+          },
+        ],
+      },
+      getConstraintsByScope: {
+        "app_db.public.users": [
+          {
+            name: "pk_users",
+            kind: "primary_key",
+            columns: ["id"],
+            source: "catalog",
+          },
+        ],
+      },
+      getTriggersByScope: {
+        "app_db.public.users": [
+          {
+            name: "users_audit_trigger",
+            timing: "after",
+            events: ["insert"],
+            orientation: "row",
+            enabled: true,
+          },
+        ],
+      },
+    });
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        database: "app_db",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo("conn-1");
+    await manager.getSchemaSnapshotAsync("conn-1");
+
+    const request = {
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+      table: "users",
+    };
+
+    manager.ensureTableDetailLoading(request);
+    await waitForTableDetailCondition(
+      manager,
+      "conn-1",
+      () => manager.getTableDetailState(request).status === "loaded",
+    );
+
+    expect(
+      manager.getTableDetailState(request).snapshot.triggers.items,
+    ).toEqual([expect.objectContaining({ name: "users_audit_trigger" })]);
+
+    manager.markSchemaScopeCollapsed("conn-1", {
+      kind: "schema",
+      database: "app_db",
+      schema: "public",
+    });
+    manager.ensureSchemaScopeLoading("conn-1", {
+      kind: "schema",
+      database: "app_db",
+      schema: "public",
+    });
+    manager.ensureTableDetailLoading(request);
+
+    expect(driverInstances[0]?.describeColumnsCalls).toEqual([
+      "app_db.public.users",
+    ]);
+    expect(driverInstances[0]?.getConstraintsCalls).toEqual([
+      "app_db.public.users",
+    ]);
+    expect(driverInstances[0]?.getTriggersCalls).toEqual([
+      "app_db.public.users",
+    ]);
+  });
+
+  it("invalidates table detail metadata on manual refresh and reloads it on demand", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    driverBehaviors.set("conn-1", {
+      listDatabases: [{ name: "app_db", schemas: [] }],
+      listSchemasByDatabase: {
+        app_db: [{ name: "public" }],
+      },
+      listObjectsByScope: {
+        "app_db.public": [{ schema: "public", name: "users", type: "table" }],
+      },
+      describeTableByScope: {
+        "app_db.public.users": [
+          {
+            name: "id",
+            type: "int",
+            nullable: false,
+            isPrimaryKey: true,
+            primaryKeyOrdinal: 1,
+            isForeignKey: false,
+          },
+        ],
+      },
+      getTriggersByScope: {
+        "app_db.public.users": [
+          {
+            name: "users_trigger_v1",
+            timing: "after",
+            events: ["insert"],
+            orientation: "row",
+          },
+        ],
+      },
+    });
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        database: "app_db",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo("conn-1");
+    await manager.getSchemaSnapshotAsync("conn-1");
+
+    const request = {
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+      table: "users",
+    };
+
+    manager.ensureTableDetailLoading(request);
+    await waitForTableDetailCondition(
+      manager,
+      "conn-1",
+      () => manager.getTableDetailState(request).status === "loaded",
+    );
+
+    expect(
+      manager.getTableDetailState(request).snapshot.triggers.items,
+    ).toEqual([expect.objectContaining({ name: "users_trigger_v1" })]);
+
+    driverBehaviors.set("conn-1", {
+      listDatabases: [{ name: "app_db", schemas: [] }],
+      listSchemasByDatabase: {
+        app_db: [{ name: "public" }],
+      },
+      listObjectsByScope: {
+        "app_db.public": [{ schema: "public", name: "users", type: "table" }],
+      },
+      describeTableByScope: {
+        "app_db.public.users": [
+          {
+            name: "id",
+            type: "int",
+            nullable: false,
+            isPrimaryKey: true,
+            primaryKeyOrdinal: 1,
+            isForeignKey: false,
+          },
+        ],
+      },
+      getTriggersByScope: {
+        "app_db.public.users": [
+          {
+            name: "users_trigger_v2",
+            timing: "after",
+            events: ["update"],
+            orientation: "row",
+          },
+        ],
+      },
+    });
+
+    manager.refreshSchemaCache({
+      connectionId: "conn-1",
+      reason: "manual",
+    });
+    await manager.getSchemaSnapshotAsync("conn-1");
+
+    manager.ensureTableDetailLoading(request);
+    await waitForTableDetailCondition(
+      manager,
+      "conn-1",
+      () => manager.getTableDetailState(request).status === "loaded",
+    );
+
+    expect(
+      manager.getTableDetailState(request).snapshot.triggers.items,
+    ).toEqual([expect.objectContaining({ name: "users_trigger_v2" })]);
+    expect(driverInstances[0]?.getTriggersCalls).toEqual([
+      "app_db.public.users",
+      "app_db.public.users",
     ]);
   });
 });

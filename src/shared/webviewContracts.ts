@@ -51,14 +51,6 @@ export interface TableInitialState {
   defaultPageSize?: number;
 }
 
-export interface SchemaInitialState {
-  view: "schema";
-  connectionId: string;
-  database: string;
-  schema: string;
-  table: string;
-}
-
 export interface ErdInitialState {
   view: "erd";
   connectionId: string;
@@ -130,7 +122,6 @@ export interface ConnectionFormInitialState {
 export type WebviewInitialState =
   | QueryInitialState
   | TableInitialState
-  | SchemaInitialState
   | ErdInitialState
   | ConnectionFormInitialState;
 
@@ -221,23 +212,12 @@ export type TablePanelMessage =
       TableMutationPreviewDecisionPayload
     >;
 
-export type SchemaPanelMessage =
-  | WebviewMessageEnvelope<"ready">
-  | WebviewMessageEnvelope<
-      "openRelatedSchema",
-      { table: string; schema?: string; database?: string }
-    >;
-
 export type ErdPanelMessage =
   | WebviewMessageEnvelope<"ready">
   | WebviewMessageEnvelope<"reload">
   | WebviewMessageEnvelope<
       "openTableData",
       { table: string; schema?: string; database?: string; isView?: boolean }
-    >
-  | WebviewMessageEnvelope<
-      "openSchema",
-      { table: string; schema?: string; database?: string }
     >;
 
 export type ConnectionFormPanelMessage =
@@ -436,28 +416,6 @@ export function parseWebviewInitialState(
         table,
         isView: readOptionalBoolean(input, "isView"),
         defaultPageSize: readOptionalNumber(input, "defaultPageSize"),
-      };
-    }
-
-    case "schema": {
-      const connectionId = readRequiredString(input, "connectionId");
-      const database = readOptionalString(input, "database");
-      const schema = readOptionalString(input, "schema");
-      const table = readRequiredString(input, "table");
-      if (
-        !connectionId ||
-        database === undefined ||
-        schema === undefined ||
-        !table
-      ) {
-        return null;
-      }
-      return {
-        view: "schema",
-        connectionId,
-        database,
-        schema,
-        table,
       };
     }
 
@@ -720,41 +678,6 @@ export function parseTablePanelMessage(
   }
 }
 
-export function parseSchemaPanelMessage(
-  input: unknown,
-): SchemaPanelMessage | null {
-  const envelope = parseEnvelope(input);
-  if (!envelope) {
-    return null;
-  }
-
-  switch (envelope.type) {
-    case "ready":
-      return { type: envelope.type };
-
-    case "openRelatedSchema": {
-      if (!isRecord(envelope.payload)) {
-        return null;
-      }
-      const table = readRequiredString(envelope.payload, "table");
-      if (!table) {
-        return null;
-      }
-      return {
-        type: envelope.type,
-        payload: {
-          table,
-          schema: readOptionalString(envelope.payload, "schema"),
-          database: readOptionalString(envelope.payload, "database"),
-        },
-      };
-    }
-
-    default:
-      return null;
-  }
-}
-
 export function parseConnectionFormPanelMessage(
   input: unknown,
 ): ConnectionFormPanelMessage | null {
@@ -804,24 +727,6 @@ export function parseErdPanelMessage(input: unknown): ErdPanelMessage | null {
           schema: readOptionalString(envelope.payload, "schema"),
           database: readOptionalString(envelope.payload, "database"),
           isView: readOptionalBoolean(envelope.payload, "isView"),
-        },
-      };
-    }
-
-    case "openSchema": {
-      if (!isRecord(envelope.payload)) {
-        return null;
-      }
-      const table = readRequiredString(envelope.payload, "table");
-      if (!table) {
-        return null;
-      }
-      return {
-        type: envelope.type,
-        payload: {
-          table,
-          schema: readOptionalString(envelope.payload, "schema"),
-          database: readOptionalString(envelope.payload, "database"),
         },
       };
     }

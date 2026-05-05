@@ -1,4 +1,9 @@
 import * as vscode from "vscode";
+import {
+  isDbObjectKind,
+  isDdlOnlyDbObjectKind,
+  isRoutineDbObjectKind,
+} from "../shared/dbObjectKinds";
 import type {
   BookmarkEntry,
   ExplorerSchemaScope,
@@ -13,7 +18,6 @@ import {
 import { ConnectionFormPanel } from "./panels/connectionFormPanel";
 import { ErdPanel } from "./panels/erdPanel";
 import { QueryPanel } from "./panels/queryPanel";
-import { SchemaPanel } from "./panels/schemaPanel";
 import { TablePanel } from "./panels/tablePanel";
 import { BookmarksProvider } from "./providers/bookmarksProvider";
 import {
@@ -38,7 +42,6 @@ const CMD = {
   openTableData: "rapidb.openTableData",
   showDDL: "rapidb.showDDL",
   copyNodeName: "rapidb.copyNodeName",
-  openSchema: "rapidb.openSchema",
   openRoutine: "rapidb.openRoutine",
   openHistoryEntry: "rapidb.openHistoryEntry",
   openBookmarkEntry: "rapidb.openBookmarkEntry",
@@ -306,7 +309,7 @@ function registerCommands(
     if (!node?.connectionId || !node.objectName) {
       return;
     }
-    const isView = node.kind === "view";
+    const isView = node.kind === "view" || node.kind === "materializedView";
     TablePanel.createOrShow(
       context,
       connectionManager,
@@ -319,9 +322,9 @@ function registerCommands(
   });
 
   reg(CMD.showDDL, async (node?: RapiDBNode) => {
-    if (!node?.connectionId || !node.objectName) {
+    if (!node?.connectionId) {
       vscode.window.showWarningMessage(
-        "[RapiDB] Select a table or view node first.",
+        "[RapiDB] Select a table, view, materialized view, function, procedure, sequence, type, constraint, index, or trigger node first.",
       );
       return;
     }
@@ -331,19 +334,98 @@ function registerCommands(
       return;
     }
     try {
-      const ddl = await driver.getCreateTableDDL(
-        node.database ?? "",
-        node.schema ?? "",
-        node.objectName,
-      );
-      QueryPanel.createOrShow(
-        context,
-        connectionManager,
-        node.connectionId,
-        ddl,
-        true,
-        true,
-      );
+      let ddl: string | null = null;
+      const objectKind = isDbObjectKind(node.kind) ? node.kind : undefined;
+      if (
+        (node.kind === "table" ||
+          node.kind === "view" ||
+          node.kind === "materializedView") &&
+        node.objectName
+      ) {
+        ddl = await driver.getCreateTableDDL(
+          node.database ?? "",
+          node.schema ?? "",
+          node.objectName,
+        );
+      } else if (
+        objectKind &&
+        isRoutineDbObjectKind(objectKind) &&
+        node.objectName
+      ) {
+        ddl = await driver.getRoutineDefinition(
+          node.database ?? "",
+          node.schema ?? "",
+          node.objectName,
+          objectKind,
+        );
+      } else if (
+        objectKind &&
+        isDdlOnlyDbObjectKind(objectKind) &&
+        node.objectName
+      ) {
+        ddl = await driver.getObjectDefinition(
+          node.database ?? "",
+          node.schema ?? "",
+          node.objectName,
+          objectKind,
+        );
+      } else if (
+        node.kind === "table_detail_constraint" &&
+        node.parentTable &&
+        node.objectName
+      ) {
+        ddl = await driver.getConstraintDDL(
+          node.database ?? "",
+          node.schema ?? "",
+          node.parentTable,
+          node.objectName,
+        );
+      } else if (
+        node.kind === "table_detail_index" &&
+        node.parentTable &&
+        node.objectName
+      ) {
+        ddl = await driver.getIndexDDL(
+          node.database ?? "",
+          node.schema ?? "",
+          node.parentTable,
+          node.objectName,
+        );
+      } else if (
+        node.kind === "table_detail_trigger" &&
+        node.parentTable &&
+        node.objectName
+      ) {
+        ddl = await driver.getTriggerDDL(
+          node.database ?? "",
+          node.schema ?? "",
+          node.parentTable,
+          node.objectName,
+        );
+      }
+      if (!ddl) {
+        vscode.window.showWarningMessage(
+          "[RapiDB] DDL is available only for table, view, materialized view, function, procedure, sequence, type, constraint, index, and trigger nodes.",
+        );
+        return;
+      }
+      if (objectKind && isRoutineDbObjectKind(objectKind)) {
+        QueryPanel.createOrShow(
+          context,
+          connectionManager,
+          node.connectionId,
+          ddl,
+        );
+      } else {
+        QueryPanel.createOrShow(
+          context,
+          connectionManager,
+          node.connectionId,
+          ddl,
+          true,
+          true,
+        );
+      }
     } catch (err: unknown) {
       const error = logErrorWithContext(
         `Load DDL failed for ${node.objectName}`,
@@ -358,20 +440,6 @@ function registerCommands(
     if (name) {
       await vscode.env.clipboard.writeText(name);
     }
-  });
-
-  reg(CMD.openSchema, (node?: RapiDBNode) => {
-    if (!node?.connectionId || !node.objectName) {
-      return;
-    }
-    SchemaPanel.createOrShow(
-      context,
-      connectionManager,
-      node.connectionId,
-      node.database ?? "",
-      node.schema ?? "",
-      node.objectName,
-    );
   });
 
   reg(CMD.openErd, async (node?: RapiDBNode) => {
@@ -419,7 +487,11 @@ function registerCommands(
     if (!node?.connectionId || !node.objectName) {
       return;
     }
-    const kind = node.kind as "function" | "procedure";
+    const objectKind = isDbObjectKind(node.kind) ? node.kind : undefined;
+    if (!objectKind || !isRoutineDbObjectKind(objectKind)) {
+      return;
+    }
+    const kind = objectKind;
     if (!connectionManager.isConnected(node.connectionId)) {
       try {
         await connectWithProgress(
@@ -610,7 +682,6 @@ export function deactivate(): void {
   _activated = false;
   QueryPanel.disposeAll();
   TablePanel.disposeAll();
-  SchemaPanel.disposeAll();
   ErdPanel.disposeAll();
   try {
     _connectionManager?.disconnectAll().catch(() => {});

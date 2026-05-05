@@ -3,7 +3,6 @@ import { parseErdPanelMessage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import { ErdGraphService } from "../services/erdGraphService";
 import { normalizeUnknownError } from "../utils/errorHandling";
-import { SchemaPanel } from "./schemaPanel";
 import { TablePanel } from "./tablePanel";
 import { createWebviewShell } from "./webviewShell";
 
@@ -159,22 +158,6 @@ export class ErdPanel {
           payload.schema ?? this.scope.schema ?? "",
           payload.table,
           payload.isView ?? false,
-        );
-        break;
-      }
-
-      case "openSchema": {
-        const payload = parsed.payload;
-        if (!payload) {
-          return;
-        }
-        SchemaPanel.createOrShow(
-          this.context,
-          this.connectionManager,
-          this.scope.connectionId,
-          payload.database ?? this.scope.database ?? "",
-          payload.schema ?? this.scope.schema ?? "",
-          payload.table,
         );
         break;
       }

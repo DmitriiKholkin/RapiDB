@@ -1,4 +1,5 @@
 import oracledb from "oracledb";
+import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { ConnectionConfig } from "../connectionManager";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
 import type { DriverTimeoutSettingsProvider } from "./timeout";
@@ -864,7 +865,7 @@ export class OracleDriver extends BaseDBDriver {
         `SELECT object_name, object_type
          FROM all_objects
          WHERE owner = :1
-           AND object_type IN ('TABLE','VIEW','FUNCTION','PROCEDURE','PACKAGE')
+           AND object_type IN ('TABLE','VIEW','MATERIALIZED VIEW','FUNCTION','PROCEDURE','PACKAGE','SEQUENCE','TYPE')
            AND status = 'VALID'
          ORDER BY object_type, object_name`,
         [schema.toUpperCase()],
@@ -877,10 +878,16 @@ export class OracleDriver extends BaseDBDriver {
           type = "table";
         } else if (rawType === "VIEW") {
           type = "view";
+        } else if (rawType === "MATERIALIZED VIEW") {
+          type = "materializedView";
         } else if (rawType === "FUNCTION") {
           type = "function";
         } else if (rawType === "PROCEDURE" || rawType === "PACKAGE") {
           type = "procedure";
+        } else if (rawType === "SEQUENCE") {
+          type = "sequence";
+        } else if (rawType === "TYPE") {
+          type = "type";
         } else {
           continue;
         }
@@ -1089,6 +1096,197 @@ export class OracleDriver extends BaseDBDriver {
       await conn.close();
     }
   }
+  async getConstraints(
+    _database: string,
+    schema: string,
+    table: string,
+  ): Promise<import("./types").TableConstraintMeta[]> {
+    const conn = await this.getConnection();
+    try {
+      const keyRes = await conn.execute<{
+        CONSTRAINT_NAME: string;
+        CONSTRAINT_TYPE: string;
+        COLUMN_NAME: string;
+      }>(
+        `SELECT cons.constraint_name, cons.constraint_type, cols.column_name
+         FROM all_constraints cons
+         JOIN all_cons_columns cols
+           ON cols.constraint_name = cons.constraint_name
+          AND cols.owner = cons.owner
+         WHERE cons.owner = :1
+           AND cons.table_name = :2
+           AND cons.constraint_type IN ('P', 'U')
+         ORDER BY cons.constraint_name, cols.position`,
+        [schema.toUpperCase(), table.toUpperCase()],
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
+      );
+      const constraints = new Map<
+        string,
+        import("./types").TableConstraintMeta
+      >();
+      for (const row of keyRes.rows ?? []) {
+        const existing = constraints.get(row.CONSTRAINT_NAME);
+        if (existing) {
+          existing.columns.push(row.COLUMN_NAME);
+          continue;
+        }
+
+        constraints.set(row.CONSTRAINT_NAME, {
+          name: row.CONSTRAINT_NAME,
+          kind: row.CONSTRAINT_TYPE === "P" ? "primary_key" : "unique",
+          columns: [row.COLUMN_NAME],
+          source: "catalog",
+        });
+      }
+
+      const foreignKeys = await this.getForeignKeys("", schema, table);
+      for (const foreignKey of foreignKeys) {
+        const existing = constraints.get(foreignKey.constraintName);
+        if (existing) {
+          existing.columns.push(foreignKey.column);
+          existing.referencedColumns = [
+            ...(existing.referencedColumns ?? []),
+            foreignKey.referencedColumn,
+          ];
+          continue;
+        }
+
+        constraints.set(foreignKey.constraintName, {
+          name: foreignKey.constraintName,
+          kind: "foreign_key",
+          columns: [foreignKey.column],
+          referencedSchema: foreignKey.referencedSchema,
+          referencedTable: foreignKey.referencedTable,
+          referencedColumns: [foreignKey.referencedColumn],
+          source: "catalog",
+        });
+      }
+
+      const res = await conn.execute<{
+        CONSTRAINT_NAME: string;
+        SEARCH_CONDITION_VC: string | null;
+      }>(
+        `SELECT constraint_name, search_condition_vc
+         FROM all_constraints
+         WHERE owner = :1
+           AND table_name = :2
+           AND constraint_type = 'C'
+         ORDER BY constraint_name`,
+        [schema.toUpperCase(), table.toUpperCase()],
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
+      );
+      const checkConstraints = (res.rows ?? []).map((row) => ({
+        name: row.CONSTRAINT_NAME,
+        kind: "check" as const,
+        columns: [],
+        checkExpression: row.SEARCH_CONDITION_VC ?? undefined,
+        source: "catalog" as const,
+      }));
+      return [...constraints.values(), ...checkConstraints];
+    } finally {
+      await conn.close();
+    }
+  }
+  async getTriggers(
+    _database: string,
+    schema: string,
+    table: string,
+  ): Promise<import("./types").TriggerMeta[] | null> {
+    const conn = await this.getConnection();
+    try {
+      const res = await conn.execute<{
+        TRIGGER_NAME: string;
+        TRIGGER_TYPE: string;
+        TRIGGERING_EVENT: string;
+        STATUS: string;
+        TRIGGER_BODY: string | null;
+      }>(
+        `SELECT trigger_name, trigger_type, triggering_event, status, trigger_body
+         FROM all_triggers
+         WHERE table_owner = :1
+           AND table_name = :2
+         ORDER BY trigger_name`,
+        [schema.toUpperCase(), table.toUpperCase()],
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
+      );
+      return (res.rows ?? []).map((row) => {
+        const triggerType = row.TRIGGER_TYPE.toUpperCase();
+        const triggeringEvent = row.TRIGGERING_EVENT.toUpperCase();
+        const events: import("./types").TriggerMeta["events"] = [];
+        if (triggeringEvent.includes("INSERT")) {
+          events.push("insert");
+        }
+        if (triggeringEvent.includes("UPDATE")) {
+          events.push("update");
+        }
+        if (triggeringEvent.includes("DELETE")) {
+          events.push("delete");
+        }
+        if (events.length === 0) {
+          events.push("unknown");
+        }
+
+        return {
+          name: row.TRIGGER_NAME,
+          timing: triggerType.includes("BEFORE")
+            ? "before"
+            : triggerType.includes("INSTEAD OF")
+              ? "instead_of"
+              : triggerType.includes("AFTER")
+                ? "after"
+                : "unknown",
+          events,
+          orientation: triggerType.includes("EACH ROW") ? "row" : "statement",
+          enabled: row.STATUS === "ENABLED",
+          definition: row.TRIGGER_BODY ?? undefined,
+        };
+      });
+    } finally {
+      await conn.close();
+    }
+  }
+  override async getTriggerDDL(
+    _database: string,
+    schema: string,
+    table: string,
+    triggerName: string,
+  ): Promise<string> {
+    const conn = await this.getConnection();
+    try {
+      const res = await conn.execute<{
+        TRIGGER_TYPE: string;
+        TRIGGERING_EVENT: string;
+        TRIGGER_BODY: string | null;
+      }>(
+        `SELECT trigger_type, triggering_event, trigger_body
+         FROM all_triggers
+         WHERE table_owner = :1
+           AND table_name = :2
+           AND trigger_name = :3`,
+        [schema.toUpperCase(), table.toUpperCase(), triggerName.toUpperCase()],
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
+      );
+      const row = res.rows?.[0];
+      if (!row) {
+        throw new Error(`Trigger "${triggerName}" not found`);
+      }
+
+      const triggerType = row.TRIGGER_TYPE.toUpperCase();
+      const timingClause = triggerType.replace(/\s+EACH ROW/i, "");
+      const forEachRowClause = triggerType.includes("EACH ROW")
+        ? "\nFOR EACH ROW"
+        : "";
+      const body = row.TRIGGER_BODY?.trim() || "BEGIN\n  NULL;\nEND;";
+      return [
+        `CREATE OR REPLACE TRIGGER ${this.quoteIdentifier(schema.toUpperCase())}.${this.quoteIdentifier(triggerName.toUpperCase())}`,
+        `${timingClause} ${row.TRIGGERING_EVENT.toUpperCase()}`,
+        `ON ${this.qualifiedTableName("", schema.toUpperCase(), table.toUpperCase())}${forEachRowClause}`,
+        body,
+      ].join("\n");
+    } finally {
+      await conn.close();
+    }
+  }
   async getCreateTableDDL(
     _database: string,
     schema: string,
@@ -1098,7 +1296,14 @@ export class OracleDriver extends BaseDBDriver {
     try {
       const objectType = await this._resolveDdlObjectType(conn, schema, table);
       if (objectType) {
-        const ddl = await this._getMetadataDDL(conn, objectType, schema, table);
+        const metadataObjectType =
+          objectType === "MATERIALIZED VIEW" ? "MATERIALIZED_VIEW" : objectType;
+        const ddl = await this._getMetadataDDL(
+          conn,
+          metadataObjectType,
+          schema,
+          table,
+        );
         if (ddl) {
           return ddl;
         }
@@ -1128,11 +1333,25 @@ export class OracleDriver extends BaseDBDriver {
       await conn.close();
     }
   }
+  async getObjectDefinition(
+    _database: string,
+    schema: string,
+    name: string,
+    kind: DdlOnlyDbObjectKind,
+  ): Promise<string | null> {
+    const conn = await this.getConnection();
+    try {
+      const metadataObjectType = kind === "sequence" ? "SEQUENCE" : "TYPE";
+      return await this._getMetadataDDL(conn, metadataObjectType, schema, name);
+    } finally {
+      await conn.close();
+    }
+  }
   private async _resolveDdlObjectType(
     conn: oracledb.Connection,
     schema: string,
     objectName: string,
-  ): Promise<"TABLE" | "VIEW" | null> {
+  ): Promise<"TABLE" | "VIEW" | "MATERIALIZED VIEW" | null> {
     const owner = schema.toUpperCase();
     const name = objectName.toUpperCase();
     const obj = oracledb.OUT_FORMAT_OBJECT;
@@ -1142,12 +1361,16 @@ export class OracleDriver extends BaseDBDriver {
       }>(
         `SELECT object_type FROM all_objects
          WHERE owner = :1 AND object_name = :2
-           AND object_type IN ('TABLE','VIEW') AND ROWNUM = 1`,
+           AND object_type IN ('TABLE','VIEW','MATERIALIZED VIEW') AND ROWNUM = 1`,
         [owner, name],
         { outFormat: obj },
       );
       const objectType = objRes.rows?.[0]?.OBJECT_TYPE;
-      if (objectType === "TABLE" || objectType === "VIEW") {
+      if (
+        objectType === "TABLE" ||
+        objectType === "VIEW" ||
+        objectType === "MATERIALIZED VIEW"
+      ) {
         return objectType;
       }
     } catch {}
@@ -1203,7 +1426,7 @@ export class OracleDriver extends BaseDBDriver {
   }
   private async _getMetadataDDL(
     conn: oracledb.Connection,
-    objectType: "TABLE" | "VIEW",
+    objectType: "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "SEQUENCE" | "TYPE",
     schema: string,
     objectName: string,
   ): Promise<string | null> {

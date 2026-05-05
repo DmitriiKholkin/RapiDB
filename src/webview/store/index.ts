@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import type { DbObjectKind } from "../../shared/dbObjectKinds";
 import type { QueryColumnMeta } from "../../shared/tableTypes";
 
 export interface QueryResult {
@@ -54,7 +55,7 @@ export interface SchemaObject {
   database: string;
   schema: string;
   object: string;
-  type?: "table" | "view" | "function" | "procedure";
+  type?: DbObjectKind;
   columns: SchemaColumn[];
 }
 

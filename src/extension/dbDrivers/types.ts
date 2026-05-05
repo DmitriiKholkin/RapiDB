@@ -1,4 +1,8 @@
 import type {
+  DbObjectKind,
+  DdlOnlyDbObjectKind,
+} from "../../shared/dbObjectKinds";
+import type {
   ColumnDefaultKind,
   ColumnMeta,
   ColumnTypeMeta,
@@ -7,6 +11,8 @@ import type {
   GeneratedKind,
   IndexMeta,
   QueryColumnMeta,
+  TableConstraintMeta,
+  TriggerMeta,
   TypeCategory,
 } from "../../shared/tableTypes";
 
@@ -22,6 +28,8 @@ export {
   NULL_SENTINEL,
   type QueryColumnMeta,
   type ScalarFilterOperator,
+  type TableConstraintMeta,
+  type TriggerMeta,
   type TypeCategory,
   type ValueSemantics,
 } from "../../shared/tableTypes";
@@ -33,7 +41,7 @@ export const DATETIME_SQL_RE =
 export interface TableInfo {
   schema: string;
   name: string;
-  type: "table" | "view" | "function" | "procedure";
+  type: DbObjectKind;
 }
 export interface QueryResult {
   columns: string[];
@@ -96,11 +104,45 @@ export interface IDBDriver {
     schema: string,
     table: string,
   ): Promise<ForeignKeyMeta[]>;
+  getConstraints(
+    database: string,
+    schema: string,
+    table: string,
+  ): Promise<TableConstraintMeta[]>;
+  getTriggers(
+    database: string,
+    schema: string,
+    table: string,
+  ): Promise<TriggerMeta[] | null>;
+  getConstraintDDL(
+    database: string,
+    schema: string,
+    table: string,
+    constraintName: string,
+  ): Promise<string>;
+  getIndexDDL(
+    database: string,
+    schema: string,
+    table: string,
+    indexName: string,
+  ): Promise<string>;
+  getTriggerDDL(
+    database: string,
+    schema: string,
+    table: string,
+    triggerName: string,
+  ): Promise<string>;
   getCreateTableDDL(
     database: string,
     schema: string,
     table: string,
   ): Promise<string>;
+  getObjectDefinition(
+    database: string,
+    schema: string,
+    name: string,
+    kind: DdlOnlyDbObjectKind,
+  ): Promise<string | null>;
   getRoutineDefinition(
     database: string,
     schema: string,

@@ -382,7 +382,7 @@ describe("ErdView", () => {
     expect(getPostedMessages()).toContainEqual({ type: "reload" });
   });
 
-  it("opens schema and table data from node actions", async () => {
+  it("opens table data from node actions", async () => {
     const user = userEvent.setup();
     render(<ErdView connectionId="conn-1" database="app_db" schema="public" />);
 
@@ -401,20 +401,9 @@ describe("ErdView", () => {
     clearPostedMessages();
 
     await user.click(
-      screen.getByRole("button", { name: "Open schema public.users" }),
-    );
-    await user.click(
       screen.getByRole("button", { name: "Open data public.users" }),
     );
 
-    expect(getPostedMessages()).toContainEqual({
-      type: "openSchema",
-      payload: {
-        database: "app_db",
-        schema: "public",
-        table: "users",
-      },
-    });
     expect(getPostedMessages()).toContainEqual({
       type: "openTableData",
       payload: {

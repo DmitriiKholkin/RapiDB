@@ -123,7 +123,13 @@ const fakeDriver: IDBDriver = {
   describeColumns: async () => columns,
   getIndexes: async () => [],
   getForeignKeys: async () => [],
+  getConstraints: async () => [],
+  getTriggers: async () => [],
+  getConstraintDDL: async () => "",
+  getIndexDDL: async () => "",
+  getTriggerDDL: async () => "",
   getCreateTableDDL: async () => "",
+  getObjectDefinition: async () => null,
   getRoutineDefinition: async () => "",
   query: async () => ({
     columns: [],

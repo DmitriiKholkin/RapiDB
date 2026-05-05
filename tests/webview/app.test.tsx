@@ -19,10 +19,6 @@ vi.mock("../../src/webview/components/QueryView", () => ({
   ),
 }));
 
-vi.mock("../../src/webview/components/SchemaView", () => ({
-  SchemaView: ({ table }: { table: string }) => <div>Schema:{table}</div>,
-}));
-
 vi.mock("../../src/webview/components/TableView", () => ({
   TableView: ({ table }: { table: string }) => <div>Table:{table}</div>,
 }));

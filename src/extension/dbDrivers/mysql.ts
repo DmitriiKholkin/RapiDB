@@ -7,6 +7,7 @@ import type {
   RowDataPacket,
 } from "mysql2/promise";
 import * as mysql from "mysql2/promise";
+import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { ConnectionConfig } from "../connectionManager";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
 import type { DriverTimeoutSettingsProvider } from "./timeout";
@@ -1132,6 +1133,170 @@ export class MySQLDriver extends BaseDBDriver {
       referencedColumn: r.REFERENCED_COLUMN_NAME,
     }));
   }
+  async getConstraints(
+    database: string,
+    _schema: string,
+    table: string,
+  ): Promise<import("./types").TableConstraintMeta[]> {
+    const rows = await this.queryObjectRows<
+      RowDataPacket & {
+        CONSTRAINT_NAME: string;
+        CONSTRAINT_TYPE: string;
+        COLUMN_NAME: string | null;
+        REFERENCED_TABLE_SCHEMA: string | null;
+        REFERENCED_TABLE_NAME: string | null;
+        REFERENCED_COLUMN_NAME: string | null;
+        CHECK_CLAUSE: string | null;
+      }
+    >(
+      `SELECT tc.CONSTRAINT_NAME,
+              tc.CONSTRAINT_TYPE,
+              kcu.COLUMN_NAME,
+              kcu.REFERENCED_TABLE_SCHEMA,
+              kcu.REFERENCED_TABLE_NAME,
+              kcu.REFERENCED_COLUMN_NAME,
+              cc.CHECK_CLAUSE
+       FROM information_schema.TABLE_CONSTRAINTS tc
+       LEFT JOIN information_schema.KEY_COLUMN_USAGE kcu
+         ON kcu.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
+        AND kcu.TABLE_SCHEMA = tc.TABLE_SCHEMA
+        AND kcu.TABLE_NAME = tc.TABLE_NAME
+        AND kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+       LEFT JOIN information_schema.CHECK_CONSTRAINTS cc
+         ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
+        AND cc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+       WHERE tc.TABLE_SCHEMA = ?
+         AND tc.TABLE_NAME = ?
+         AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK')
+       ORDER BY tc.CONSTRAINT_NAME, kcu.ORDINAL_POSITION`,
+      [database, table],
+    );
+    const map = new Map<string, import("./types").TableConstraintMeta>();
+    for (const row of rows) {
+      const name = row.CONSTRAINT_NAME;
+      const existing = map.get(name);
+      if (existing) {
+        if (row.COLUMN_NAME) {
+          existing.columns.push(row.COLUMN_NAME);
+        }
+        if (row.REFERENCED_COLUMN_NAME) {
+          existing.referencedColumns = [
+            ...(existing.referencedColumns ?? []),
+            row.REFERENCED_COLUMN_NAME,
+          ];
+        }
+        continue;
+      }
+
+      map.set(name, {
+        name,
+        kind:
+          row.CONSTRAINT_TYPE === "PRIMARY KEY"
+            ? "primary_key"
+            : row.CONSTRAINT_TYPE === "UNIQUE"
+              ? "unique"
+              : row.CONSTRAINT_TYPE === "FOREIGN KEY"
+                ? "foreign_key"
+                : "check",
+        columns: row.COLUMN_NAME ? [row.COLUMN_NAME] : [],
+        referencedSchema: row.REFERENCED_TABLE_SCHEMA ?? undefined,
+        referencedTable: row.REFERENCED_TABLE_NAME ?? undefined,
+        referencedColumns: row.REFERENCED_COLUMN_NAME
+          ? [row.REFERENCED_COLUMN_NAME]
+          : undefined,
+        checkExpression: row.CHECK_CLAUSE ?? undefined,
+        source: "catalog",
+      });
+    }
+    return [...map.values()];
+  }
+  async getTriggers(
+    database: string,
+    _schema: string,
+    table: string,
+  ): Promise<import("./types").TriggerMeta[] | null> {
+    const rows = await this.queryObjectRows<
+      RowDataPacket & {
+        TRIGGER_NAME: string;
+        ACTION_TIMING: string;
+        EVENT_MANIPULATION: string;
+        ACTION_STATEMENT: string | null;
+      }
+    >(
+      `SELECT TRIGGER_NAME, ACTION_TIMING, EVENT_MANIPULATION, ACTION_STATEMENT
+       FROM information_schema.TRIGGERS
+       WHERE EVENT_OBJECT_SCHEMA = ?
+         AND EVENT_OBJECT_TABLE = ?
+       ORDER BY TRIGGER_NAME`,
+      [database, table],
+    );
+    return rows.map((row) => ({
+      name: row.TRIGGER_NAME,
+      timing:
+        row.ACTION_TIMING === "BEFORE"
+          ? "before"
+          : row.ACTION_TIMING === "AFTER"
+            ? "after"
+            : "unknown",
+      events: [
+        row.EVENT_MANIPULATION === "INSERT"
+          ? "insert"
+          : row.EVENT_MANIPULATION === "UPDATE"
+            ? "update"
+            : row.EVENT_MANIPULATION === "DELETE"
+              ? "delete"
+              : "unknown",
+      ],
+      orientation: "row",
+      enabled: true,
+      definition: row.ACTION_STATEMENT ?? undefined,
+    }));
+  }
+  override async getTriggerDDL(
+    database: string,
+    _schema: string,
+    table: string,
+    triggerName: string,
+  ): Promise<string> {
+    const rows = await this.queryObjectRows<
+      RowDataPacket & {
+        TRIGGER_NAME: string;
+        ACTION_TIMING: string;
+        EVENT_MANIPULATION: string;
+        ACTION_ORIENTATION: string;
+        ACTION_STATEMENT: string | null;
+      }
+    >(
+      `SELECT TRIGGER_NAME, ACTION_TIMING, EVENT_MANIPULATION, ACTION_ORIENTATION, ACTION_STATEMENT
+       FROM information_schema.TRIGGERS
+       WHERE EVENT_OBJECT_SCHEMA = ?
+         AND EVENT_OBJECT_TABLE = ?
+         AND TRIGGER_NAME = ?
+       LIMIT 1`,
+      [database, table, triggerName],
+    );
+    const trigger = rows[0];
+    if (!trigger) {
+      throw new Error(`Trigger "${triggerName}" not found`);
+    }
+
+    const orientation =
+      trigger.ACTION_ORIENTATION === "ROW" ? "FOR EACH ROW" : "";
+    const body =
+      trigger.ACTION_STATEMENT?.trim() ||
+      "BEGIN\n  -- trigger body is not available\nEND";
+    const ddl = [
+      `CREATE TRIGGER ${this.quoteIdentifier(trigger.TRIGGER_NAME)}`,
+      `${trigger.ACTION_TIMING.toUpperCase()} ${trigger.EVENT_MANIPULATION.toUpperCase()}`,
+      `ON ${this.qualifiedTableName(database, "", table)}`,
+      orientation,
+      body,
+    ]
+      .filter((part) => part)
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n");
+    return ddl.endsWith(";") ? ddl : `${ddl};`;
+  }
   async getCreateTableDDL(
     database: string,
     _schema: string,
@@ -1166,6 +1331,14 @@ export class MySQLDriver extends BaseDBDriver {
     const row = rows[0];
     const key = type === "FUNCTION" ? "Create Function" : "Create Procedure";
     return row?.[key] ?? `-- Definition not available for ${name}`;
+  }
+  async getObjectDefinition(
+    _database: string,
+    _schema: string,
+    _name: string,
+    _kind: DdlOnlyDbObjectKind,
+  ): Promise<string | null> {
+    return null;
   }
   async runTransaction(
     operations: import("./types").TransactionOperation[],
@@ -1311,6 +1484,13 @@ export class MySQLDriver extends BaseDBDriver {
     return database
       ? `${this.quoteIdentifier(database)}.${this.quoteIdentifier(table)}`
       : this.quoteIdentifier(table);
+  }
+  protected override qualifiedReferencedTableName(
+    _database: string,
+    schema: string | undefined,
+    table: string,
+  ): string {
+    return this.qualifiedTableName(schema ?? "", "", table);
   }
   override buildInsertDefaultValuesSql(
     qualifiedTableName: string,

@@ -115,9 +115,11 @@ function objectKindFor(
     case "table":
       return "class";
     case "view":
+    case "materializedView":
+    case "sequence":
+    case "type":
       return "class";
     case "procedure":
-      return "function";
     case "function":
       return "function";
     default:
@@ -135,6 +137,12 @@ function objectDetailLabel(
 
   if (type === "view") {
     return columnCount > 0 ? `view (${columnCount} cols)` : "view";
+  }
+
+  if (type === "materializedView") {
+    return columnCount > 0
+      ? `materialized view (${columnCount} cols)`
+      : "materialized view";
   }
 
   if (type === "table") {

@@ -8,7 +8,6 @@ import { ConnectionFormView } from "./ConnectionFormView";
 import { ErdView } from "./ErdView";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { QueryView } from "./QueryView";
-import { SchemaView } from "./SchemaView";
 import { TableView } from "./TableView";
 
 const fallbackState: QueryInitialState = {
@@ -44,17 +43,6 @@ export function App(): ReactElement {
             table={state.table ?? ""}
             isView={state.isView ?? false}
             defaultPageSize={state.defaultPageSize}
-          />
-        </ErrorBoundary>
-      );
-    case "schema":
-      return (
-        <ErrorBoundary context="SchemaView">
-          <SchemaView
-            connectionId={state.connectionId ?? ""}
-            database={state.database ?? ""}
-            schema={state.schema ?? ""}
-            table={state.table ?? ""}
           />
         </ErrorBoundary>
       );

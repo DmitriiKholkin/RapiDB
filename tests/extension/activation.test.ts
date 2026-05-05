@@ -11,7 +11,6 @@ const expectedCommands = [
   "rapidb.openTableData",
   "rapidb.showDDL",
   "rapidb.copyNodeName",
-  "rapidb.openSchema",
   "rapidb.openErd",
   "rapidb.openRoutine",
   "rapidb.openHistoryEntry",
@@ -34,8 +33,8 @@ describe("extension activation", () => {
   let connectWithProgress: ReturnType<typeof vi.fn>;
   let queryPanelCreateOrShow: ReturnType<typeof vi.fn>;
   let queryPanelDisposeAll: ReturnType<typeof vi.fn>;
+  let tablePanelCreateOrShow: ReturnType<typeof vi.fn>;
   let tablePanelDisposeAll: ReturnType<typeof vi.fn>;
-  let schemaPanelDisposeAll: ReturnType<typeof vi.fn>;
   let erdPanelCreateOrShow: ReturnType<typeof vi.fn>;
   let erdPanelDisposeAll: ReturnType<typeof vi.fn>;
 
@@ -46,8 +45,8 @@ describe("extension activation", () => {
     connectWithProgress = vi.fn();
     queryPanelCreateOrShow = vi.fn();
     queryPanelDisposeAll = vi.fn();
+    tablePanelCreateOrShow = vi.fn();
     tablePanelDisposeAll = vi.fn();
-    schemaPanelDisposeAll = vi.fn();
     erdPanelCreateOrShow = vi.fn();
     erdPanelDisposeAll = vi.fn();
 
@@ -123,15 +122,9 @@ describe("extension activation", () => {
         disposeAll: queryPanelDisposeAll,
       },
     }));
-    vi.doMock("../../src/extension/panels/schemaPanel", () => ({
-      SchemaPanel: {
-        createOrShow: vi.fn(),
-        disposeAll: schemaPanelDisposeAll,
-      },
-    }));
     vi.doMock("../../src/extension/panels/tablePanel", () => ({
       TablePanel: {
-        createOrShow: vi.fn(),
+        createOrShow: tablePanelCreateOrShow,
         disposeAll: tablePanelDisposeAll,
       },
     }));
@@ -452,6 +445,345 @@ describe("extension activation", () => {
     );
   });
 
+  it("opens materialized views as read-only data panels", async () => {
+    const extension = await import("../../src/extension/extension");
+    const context = { subscriptions: [] as Array<{ dispose(): void }> };
+
+    extension.activate(context as never);
+
+    const openTableDataCommand = vscodeState.registerCommand.mock.calls.find(
+      ([command]) => command === "rapidb.openTableData",
+    )?.[1] as ((node: Record<string, unknown>) => void) | undefined;
+
+    if (!openTableDataCommand) {
+      throw new Error("Open Data command was not registered.");
+    }
+
+    openTableDataCommand({
+      kind: "materializedView",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+      objectName: "daily_users",
+    });
+
+    expect(tablePanelCreateOrShow).toHaveBeenCalledWith(
+      context,
+      connectionManagerInstance,
+      "conn-1",
+      "app_db",
+      "public",
+      "daily_users",
+      true,
+    );
+  });
+
+  it("opens materialized view, function, procedure, sequence, and type definitions in the SQL editor", async () => {
+    const extension = await import("../../src/extension/extension");
+    const context = { subscriptions: [] as Array<{ dispose(): void }> };
+    const driver = {
+      getCreateTableDDL: vi
+        .fn()
+        .mockResolvedValue(
+          'CREATE MATERIALIZED VIEW "public"."daily_users" AS SELECT 1;',
+        ),
+      getRoutineDefinition: vi
+        .fn()
+        .mockImplementation(
+          async (
+            _database: string,
+            _schema: string,
+            name: string,
+            kind: string,
+          ) => `CREATE ${kind.toUpperCase()} "public"."${name}" AS SELECT 1;`,
+        ),
+      getObjectDefinition: vi
+        .fn()
+        .mockImplementation(
+          async (
+            _database: string,
+            _schema: string,
+            name: string,
+            kind: string,
+          ) =>
+            kind === "sequence"
+              ? `CREATE SEQUENCE "public"."${name}" START WITH 1;`
+              : `CREATE TYPE "public"."${name}" AS ENUM ('active');`,
+        ),
+    };
+
+    (
+      connectionManagerInstance.getDriver as ReturnType<typeof vi.fn>
+    ).mockReturnValue(driver);
+
+    extension.activate(context as never);
+
+    const showDdlCommand = vscodeState.registerCommand.mock.calls.find(
+      ([command]) => command === "rapidb.showDDL",
+    )?.[1] as ((node: Record<string, unknown>) => Promise<void>) | undefined;
+
+    if (!showDdlCommand) {
+      throw new Error("Show DDL command was not registered.");
+    }
+
+    await showDdlCommand({
+      kind: "materializedView",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+      objectName: "daily_users",
+    });
+    await showDdlCommand({
+      kind: "function",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+      objectName: "users_total",
+    });
+    await showDdlCommand({
+      kind: "procedure",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+      objectName: "refresh_users",
+    });
+    await showDdlCommand({
+      kind: "sequence",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+      objectName: "users_id_seq",
+    });
+    await showDdlCommand({
+      kind: "type",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+      objectName: "user_status",
+    });
+
+    expect(driver.getCreateTableDDL).toHaveBeenCalledWith(
+      "app_db",
+      "public",
+      "daily_users",
+    );
+    expect(driver.getRoutineDefinition).toHaveBeenNthCalledWith(
+      1,
+      "app_db",
+      "public",
+      "users_total",
+      "function",
+    );
+    expect(driver.getRoutineDefinition).toHaveBeenNthCalledWith(
+      2,
+      "app_db",
+      "public",
+      "refresh_users",
+      "procedure",
+    );
+    expect(driver.getObjectDefinition).toHaveBeenNthCalledWith(
+      1,
+      "app_db",
+      "public",
+      "users_id_seq",
+      "sequence",
+    );
+    expect(driver.getObjectDefinition).toHaveBeenNthCalledWith(
+      2,
+      "app_db",
+      "public",
+      "user_status",
+      "type",
+    );
+    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
+      1,
+      context,
+      connectionManagerInstance,
+      "conn-1",
+      'CREATE MATERIALIZED VIEW "public"."daily_users" AS SELECT 1;',
+      true,
+      true,
+    );
+    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
+      2,
+      context,
+      connectionManagerInstance,
+      "conn-1",
+      'CREATE FUNCTION "public"."users_total" AS SELECT 1;',
+    );
+    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
+      3,
+      context,
+      connectionManagerInstance,
+      "conn-1",
+      'CREATE PROCEDURE "public"."refresh_users" AS SELECT 1;',
+    );
+    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
+      4,
+      context,
+      connectionManagerInstance,
+      "conn-1",
+      'CREATE SEQUENCE "public"."users_id_seq" START WITH 1;',
+      true,
+      true,
+    );
+    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
+      5,
+      context,
+      connectionManagerInstance,
+      "conn-1",
+      'CREATE TYPE "public"."user_status" AS ENUM (\'active\');',
+      true,
+      true,
+    );
+  });
+
+  it("warns when DDL for a new schema object kind is unavailable", async () => {
+    const extension = await import("../../src/extension/extension");
+    const context = { subscriptions: [] as Array<{ dispose(): void }> };
+    const driver = {
+      getObjectDefinition: vi.fn().mockResolvedValue(null),
+    };
+
+    (
+      connectionManagerInstance.getDriver as ReturnType<typeof vi.fn>
+    ).mockReturnValue(driver);
+
+    extension.activate(context as never);
+
+    const showDdlCommand = vscodeState.registerCommand.mock.calls.find(
+      ([command]) => command === "rapidb.showDDL",
+    )?.[1] as ((node: Record<string, unknown>) => Promise<void>) | undefined;
+
+    if (!showDdlCommand) {
+      throw new Error("Show DDL command was not registered.");
+    }
+
+    await showDdlCommand({
+      kind: "sequence",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+      objectName: "users_id_seq",
+    });
+
+    expect(driver.getObjectDefinition).toHaveBeenCalledWith(
+      "app_db",
+      "public",
+      "users_id_seq",
+      "sequence",
+    );
+    expect(queryPanelCreateOrShow).not.toHaveBeenCalled();
+    expect(vscodeState.showWarningMessage).toHaveBeenCalledWith(
+      "[RapiDB] DDL is available only for table, view, materialized view, function, procedure, sequence, type, constraint, index, and trigger nodes.",
+    );
+  });
+
+  it("opens detail-node DDL in the SQL editor", async () => {
+    const extension = await import("../../src/extension/extension");
+    const context = { subscriptions: [] as Array<{ dispose(): void }> };
+    const driver = {
+      getConstraintDDL: vi
+        .fn()
+        .mockResolvedValue(
+          "ALTER TABLE users ADD CONSTRAINT pk_users PRIMARY KEY (id);",
+        ),
+      getIndexDDL: vi
+        .fn()
+        .mockResolvedValue("CREATE INDEX users_uid_idx ON users (uid);"),
+      getTriggerDDL: vi
+        .fn()
+        .mockResolvedValue(
+          "CREATE TRIGGER users_audit AFTER INSERT ON users BEGIN SELECT 1; END;",
+        ),
+    };
+
+    (
+      connectionManagerInstance.getDriver as ReturnType<typeof vi.fn>
+    ).mockReturnValue(driver);
+
+    extension.activate(context as never);
+
+    const showDdlCommand = vscodeState.registerCommand.mock.calls.find(
+      ([command]) => command === "rapidb.showDDL",
+    )?.[1] as ((node: Record<string, unknown>) => Promise<void>) | undefined;
+
+    if (!showDdlCommand) {
+      throw new Error("Show DDL command was not registered.");
+    }
+
+    await showDdlCommand({
+      kind: "table_detail_constraint",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+      parentTable: "users",
+      objectName: "pk_users",
+    });
+    await showDdlCommand({
+      kind: "table_detail_index",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+      parentTable: "users",
+      objectName: "users_uid_idx",
+    });
+    await showDdlCommand({
+      kind: "table_detail_trigger",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+      parentTable: "users",
+      objectName: "users_audit",
+    });
+
+    expect(driver.getConstraintDDL).toHaveBeenCalledWith(
+      "app_db",
+      "public",
+      "users",
+      "pk_users",
+    );
+    expect(driver.getIndexDDL).toHaveBeenCalledWith(
+      "app_db",
+      "public",
+      "users",
+      "users_uid_idx",
+    );
+    expect(driver.getTriggerDDL).toHaveBeenCalledWith(
+      "app_db",
+      "public",
+      "users",
+      "users_audit",
+    );
+    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
+      1,
+      context,
+      connectionManagerInstance,
+      "conn-1",
+      "ALTER TABLE users ADD CONSTRAINT pk_users PRIMARY KEY (id);",
+      true,
+      true,
+    );
+    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
+      2,
+      context,
+      connectionManagerInstance,
+      "conn-1",
+      "CREATE INDEX users_uid_idx ON users (uid);",
+      true,
+      true,
+    );
+    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
+      3,
+      context,
+      connectionManagerInstance,
+      "conn-1",
+      "CREATE TRIGGER users_audit AFTER INSERT ON users BEGIN SELECT 1; END;",
+      true,
+      true,
+    );
+  });
+
   it("deactivates panels and disconnects all active connections", async () => {
     const extension = await import("../../src/extension/extension");
     const context = { subscriptions: [] as Array<{ dispose(): void }> };
@@ -461,7 +793,6 @@ describe("extension activation", () => {
 
     expect(queryPanelDisposeAll).toHaveBeenCalledTimes(1);
     expect(tablePanelDisposeAll).toHaveBeenCalledTimes(1);
-    expect(schemaPanelDisposeAll).toHaveBeenCalledTimes(1);
     expect(erdPanelDisposeAll).toHaveBeenCalledTimes(1);
     expect(connectionManagerInstance.disconnectAll).toHaveBeenCalledTimes(1);
   });

@@ -57,7 +57,6 @@ interface TableNodeData extends Record<string, unknown> {
   node: ErdGraph["nodes"][number];
   isDimmed: boolean;
   lodLevel: LODLevel;
-  onOpenSchema: (node: ErdGraph["nodes"][number]) => void;
   onOpenData: (node: ErdGraph["nodes"][number]) => void;
 }
 
@@ -374,17 +373,6 @@ const TableNode = React.memo(function TableNode({
               flexShrink: 0,
             }}
           >
-            <button
-              aria-label={`Open schema ${node.schema}.${node.table}`}
-              type="button"
-              onClick={(event) => {
-                event.stopPropagation();
-                data.onOpenSchema(node);
-              }}
-              style={miniButtonStyle}
-            >
-              Schema
-            </button>
             <button
               aria-label={`Open data ${node.schema}.${node.table}`}
               type="button"
@@ -1065,14 +1053,6 @@ export function ErdView({
     return layoutGraph(visibleGraph.nodes, visibleGraph.edges);
   }, [visibleGraph.edges, visibleGraph.nodes]);
 
-  const openSchema = useCallback((node: ErdGraph["nodes"][number]) => {
-    postMessage("openSchema", {
-      database: node.database,
-      schema: node.schema,
-      table: node.table,
-    });
-  }, []);
-
   const openData = useCallback((node: ErdGraph["nodes"][number]) => {
     postMessage("openTableData", {
       database: node.database,
@@ -1097,7 +1077,6 @@ export function ErdView({
           node,
           isDimmed,
           lodLevel,
-          onOpenSchema: openSchema,
           onOpenData: openData,
         },
       };
@@ -1109,7 +1088,6 @@ export function ErdView({
     normalizedSearch,
     openData,
     lodLevel,
-    openSchema,
     visibleGraph.nodes,
   ]);
 

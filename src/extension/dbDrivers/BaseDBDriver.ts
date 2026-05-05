@@ -1,3 +1,4 @@
+import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import {
   type DriverTimeoutSettingsProvider,
   type DriverTimeoutSettingsSnapshot,
@@ -18,8 +19,10 @@ import type {
   PersistedEditCheckResult,
   QueryResult,
   SchemaInfo,
+  TableConstraintMeta,
   TableInfo,
   TransactionOperation,
+  TriggerMeta,
   TypeCategory,
   ValueSemantics,
 } from "./types";
@@ -73,6 +76,12 @@ export function hexFromBuffer(val: Buffer): string {
 function escapePreviewSqlString(value: string): string {
   return value.replace(/'/g, "''");
 }
+
+function ensureSqlTerminator(sql: string): string {
+  const trimmed = sql.trimEnd();
+  return trimmed.endsWith(";") ? trimmed : `${trimmed};`;
+}
+
 function stripOuterSqlParens(value: string): string {
   let current = value.trim();
   while (current.startsWith("(") && current.endsWith(")")) {
@@ -824,6 +833,12 @@ export abstract class BaseDBDriver implements IDBDriver {
     schema: string,
     table: string,
   ): Promise<string>;
+  abstract getObjectDefinition(
+    database: string,
+    schema: string,
+    name: string,
+    kind: DdlOnlyDbObjectKind,
+  ): Promise<string | null>;
   abstract getRoutineDefinition(
     database: string,
     schema: string,
@@ -881,6 +896,199 @@ export abstract class BaseDBDriver implements IDBDriver {
     const cols = await this.describeTable(database, schema, table);
     return cols.map((c) => this.enrichColumn(c));
   }
+  async getConstraints(
+    database: string,
+    schema: string,
+    table: string,
+  ): Promise<TableConstraintMeta[]> {
+    const [columns, indexes, foreignKeys] = await Promise.all([
+      this.describeColumns(database, schema, table),
+      this.getIndexes(database, schema, table),
+      this.getForeignKeys(database, schema, table),
+    ]);
+    const constraints: TableConstraintMeta[] = [];
+
+    const primaryKeyColumns = columns
+      .filter((column) => column.isPrimaryKey)
+      .sort((left, right) => {
+        const leftOrdinal = left.primaryKeyOrdinal ?? Number.MAX_SAFE_INTEGER;
+        const rightOrdinal = right.primaryKeyOrdinal ?? Number.MAX_SAFE_INTEGER;
+        return leftOrdinal - rightOrdinal;
+      })
+      .map((column) => column.name);
+
+    if (primaryKeyColumns.length > 0) {
+      const primaryIndex = indexes.find((index) => index.primary);
+      constraints.push({
+        name: primaryIndex?.name ?? `pk_${table}`,
+        kind: "primary_key",
+        columns: primaryKeyColumns,
+        source: "derived",
+      });
+    }
+
+    for (const index of indexes) {
+      if (index.primary || !index.unique) {
+        continue;
+      }
+
+      constraints.push({
+        name: index.name,
+        kind: "unique",
+        columns: [...index.columns],
+        source: "derived",
+      });
+    }
+
+    const foreignKeyMap = new Map<string, TableConstraintMeta>();
+    for (const foreignKey of foreignKeys) {
+      const existing = foreignKeyMap.get(foreignKey.constraintName);
+      if (existing) {
+        existing.columns.push(foreignKey.column);
+        if (foreignKey.referencedColumn) {
+          existing.referencedColumns = [
+            ...(existing.referencedColumns ?? []),
+            foreignKey.referencedColumn,
+          ];
+        }
+        continue;
+      }
+
+      foreignKeyMap.set(foreignKey.constraintName, {
+        name: foreignKey.constraintName,
+        kind: "foreign_key",
+        columns: [foreignKey.column],
+        referencedSchema: foreignKey.referencedSchema,
+        referencedTable: foreignKey.referencedTable,
+        referencedColumns: foreignKey.referencedColumn
+          ? [foreignKey.referencedColumn]
+          : [],
+        source: "derived",
+      });
+    }
+
+    constraints.push(...foreignKeyMap.values());
+    return constraints;
+  }
+  async getTriggers(
+    _database: string,
+    _schema: string,
+    _table: string,
+  ): Promise<TriggerMeta[] | null> {
+    return null;
+  }
+  async getConstraintDDL(
+    database: string,
+    schema: string,
+    table: string,
+    constraintName: string,
+  ): Promise<string> {
+    const constraint = (
+      await this.getConstraints(database, schema, table)
+    ).find((entry) => entry.name === constraintName);
+    if (!constraint) {
+      throw new Error(`Constraint "${constraintName}" not found`);
+    }
+
+    const qualifiedTableName = this.qualifiedTableName(database, schema, table);
+    const quotedConstraintName = this.quoteIdentifier(constraint.name);
+    const quotedColumns = constraint.columns.map((columnName) =>
+      this.quoteIdentifier(columnName),
+    );
+
+    switch (constraint.kind) {
+      case "primary_key":
+        return `ALTER TABLE ${qualifiedTableName} ADD CONSTRAINT ${quotedConstraintName} PRIMARY KEY (${quotedColumns.join(", ")});`;
+      case "unique":
+        return `ALTER TABLE ${qualifiedTableName} ADD CONSTRAINT ${quotedConstraintName} UNIQUE (${quotedColumns.join(", ")});`;
+      case "foreign_key": {
+        const referencedTable = constraint.referencedTable;
+        if (!referencedTable) {
+          throw new Error(
+            `Constraint "${constraint.name}" is missing the referenced table`,
+          );
+        }
+        const referencedColumns = (constraint.referencedColumns ?? []).map(
+          (columnName) => this.quoteIdentifier(columnName),
+        );
+        const referencedQualifiedName = this.qualifiedReferencedTableName(
+          database,
+          constraint.referencedSchema,
+          referencedTable,
+        );
+        return `ALTER TABLE ${qualifiedTableName} ADD CONSTRAINT ${quotedConstraintName} FOREIGN KEY (${quotedColumns.join(", ")}) REFERENCES ${referencedQualifiedName} (${referencedColumns.join(", ")});`;
+      }
+      case "check": {
+        const expression = constraint.checkExpression?.trim();
+        if (!expression) {
+          throw new Error(
+            `Constraint "${constraint.name}" is missing the check expression`,
+          );
+        }
+        const normalizedExpression = /^CHECK\b/i.test(expression)
+          ? expression
+          : `CHECK (${expression})`;
+        return `ALTER TABLE ${qualifiedTableName} ADD CONSTRAINT ${quotedConstraintName} ${normalizedExpression};`;
+      }
+    }
+  }
+  async getIndexDDL(
+    database: string,
+    schema: string,
+    table: string,
+    indexName: string,
+  ): Promise<string> {
+    const index = (await this.getIndexes(database, schema, table)).find(
+      (entry) => entry.name === indexName,
+    );
+    if (!index) {
+      throw new Error(`Index "${indexName}" not found`);
+    }
+
+    const qualifiedTableName = this.qualifiedTableName(database, schema, table);
+    const quotedColumns = index.columns.map((columnName) =>
+      this.quoteIdentifier(columnName),
+    );
+    if (index.primary) {
+      return `ALTER TABLE ${qualifiedTableName} ADD PRIMARY KEY (${quotedColumns.join(", ")});`;
+    }
+
+    const uniqueKeyword = index.unique ? "UNIQUE " : "";
+    return `CREATE ${uniqueKeyword}INDEX ${this.quoteIdentifier(index.name)} ON ${qualifiedTableName} (${quotedColumns.join(", ")});`;
+  }
+  async getTriggerDDL(
+    database: string,
+    schema: string,
+    table: string,
+    triggerName: string,
+  ): Promise<string> {
+    const trigger = (await this.getTriggers(database, schema, table))?.find(
+      (entry) => entry.name === triggerName,
+    );
+    if (!trigger) {
+      throw new Error(`Trigger "${triggerName}" not found`);
+    }
+
+    if (trigger.definition?.trim()) {
+      return ensureSqlTerminator(trigger.definition);
+    }
+
+    const timing =
+      trigger.timing === "instead_of"
+        ? "INSTEAD OF"
+        : trigger.timing.toUpperCase();
+    const events = trigger.events
+      .map((event) => event.toUpperCase())
+      .join(" OR ");
+    const orientation =
+      trigger.orientation === "row"
+        ? " FOR EACH ROW"
+        : trigger.orientation === "statement"
+          ? " FOR EACH STATEMENT"
+          : "";
+    const ddl = `CREATE TRIGGER ${this.quoteIdentifier(trigger.name)} ${timing} ${events} ON ${this.qualifiedTableName(database, schema, table)}${orientation}\nBEGIN\n  -- trigger body is not available\nEND`;
+    return ensureSqlTerminator(ddl);
+  }
   protected enrichColumn(col: ColumnMeta): ColumnTypeMeta {
     const category = this.mapTypeCategory(col.type);
     const valueSemantics = this.getValueSemantics(col.type, category);
@@ -903,6 +1111,13 @@ export abstract class BaseDBDriver implements IDBDriver {
   }
   quoteIdentifier(name: string): string {
     return `"${name.replace(/"/g, '""')}"`;
+  }
+  protected qualifiedReferencedTableName(
+    database: string,
+    schema: string | undefined,
+    table: string,
+  ): string {
+    return this.qualifiedTableName(database, schema ?? "", table);
   }
   qualifiedTableName(_database: string, schema: string, table: string): string {
     const parts: string[] = [];

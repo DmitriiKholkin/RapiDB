@@ -1,4 +1,5 @@
 import { Pool, types as pgTypes } from "pg";
+import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { ConnectionConfig } from "../connectionManager";
 import {
   BaseDBDriver,
@@ -307,6 +308,22 @@ export class PostgresDriver extends BaseDBDriver {
         });
       }
       try {
+        const materializedViewRes = await pool.query(
+          `SELECT matviewname AS name
+           FROM pg_matviews
+           WHERE schemaname = $1
+           ORDER BY matviewname`,
+          [schema],
+        );
+        for (const r of materializedViewRes.rows) {
+          objects.push({
+            schema,
+            name: r.name as string,
+            type: "materializedView",
+          });
+        }
+      } catch {}
+      try {
         const routineRes = await pool.query(
           `SELECT p.proname AS name,
                   CASE p.prokind WHEN 'f' THEN 'function' WHEN 'p' THEN 'procedure'
@@ -340,6 +357,44 @@ export class PostgresDriver extends BaseDBDriver {
           }
         } catch {}
       }
+      try {
+        const sequenceRes = await pool.query(
+          `SELECT sequence_name AS name
+           FROM information_schema.sequences
+           WHERE sequence_schema = $1
+           ORDER BY sequence_name`,
+          [schema],
+        );
+        for (const r of sequenceRes.rows) {
+          objects.push({
+            schema,
+            name: r.name as string,
+            type: "sequence",
+          });
+        }
+      } catch {}
+      try {
+        const typeRes = await pool.query(
+          `SELECT t.typname AS name
+           FROM pg_type t
+           JOIN pg_namespace n ON n.oid = t.typnamespace
+           LEFT JOIN pg_class c ON c.oid = t.typrelid
+           WHERE n.nspname = $1
+             AND (
+               t.typtype IN ('e', 'd')
+               OR (t.typtype = 'c' AND c.relkind = 'c')
+             )
+           ORDER BY t.typname`,
+          [schema],
+        );
+        for (const r of typeRes.rows) {
+          objects.push({
+            schema,
+            name: r.name as string,
+            type: "type",
+          });
+        }
+      } catch {}
       return objects;
     });
   }
@@ -559,6 +614,169 @@ export class PostgresDriver extends BaseDBDriver {
       referencedColumn: r.ref_column,
     }));
   }
+  async getConstraints(
+    database: string,
+    schema: string,
+    table: string,
+  ): Promise<import("./types").TableConstraintMeta[]> {
+    const constraints = await super.getConstraints(database, schema, table);
+    const res = await this.requirePool().query<{
+      constraint_name: string;
+      check_expression: string;
+    }>(
+      `SELECT con.conname AS constraint_name,
+              pg_get_constraintdef(con.oid, true) AS check_expression
+       FROM pg_constraint con
+       JOIN pg_class tbl ON tbl.oid = con.conrelid
+       JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+       WHERE con.contype = 'c'
+         AND ns.nspname = $1
+         AND tbl.relname = $2
+       ORDER BY con.conname`,
+      [schema, table],
+    );
+    constraints.push(
+      ...res.rows.map((row) => ({
+        name: row.constraint_name,
+        kind: "check" as const,
+        columns: [],
+        checkExpression: row.check_expression,
+        source: "catalog" as const,
+      })),
+    );
+    return constraints;
+  }
+  async getTriggers(
+    _database: string,
+    schema: string,
+    table: string,
+  ): Promise<import("./types").TriggerMeta[] | null> {
+    const res = await this.requirePool().query<{
+      trigger_name: string;
+      trigger_type: number | string;
+      enabled_state: string;
+      definition: string;
+    }>(
+      `SELECT t.tgname AS trigger_name,
+              t.tgtype AS trigger_type,
+              t.tgenabled AS enabled_state,
+              pg_get_triggerdef(t.oid, true) AS definition
+       FROM pg_trigger t
+       JOIN pg_class c ON c.oid = t.tgrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = $1
+         AND c.relname = $2
+         AND NOT t.tgisinternal
+       ORDER BY t.tgname`,
+      [schema, table],
+    );
+    return res.rows.map((row) => {
+      const triggerType = Number(row.trigger_type);
+      const events: import("./types").TriggerMeta["events"] = [];
+      if ((triggerType & 4) === 4) {
+        events.push("insert");
+      }
+      if ((triggerType & 8) === 8) {
+        events.push("delete");
+      }
+      if ((triggerType & 16) === 16) {
+        events.push("update");
+      }
+      if ((triggerType & 32) === 32) {
+        events.push("truncate");
+      }
+      if (events.length === 0) {
+        events.push("unknown");
+      }
+
+      return {
+        name: row.trigger_name,
+        timing:
+          (triggerType & 64) === 64
+            ? "instead_of"
+            : (triggerType & 2) === 2
+              ? "before"
+              : "after",
+        events,
+        orientation: (triggerType & 1) === 1 ? "row" : "statement",
+        enabled: row.enabled_state !== "D",
+        definition: row.definition,
+      };
+    });
+  }
+  override async getConstraintDDL(
+    _database: string,
+    schema: string,
+    table: string,
+    constraintName: string,
+  ): Promise<string> {
+    const res = await this.requirePool().query<{ ddl: string }>(
+      `SELECT 'ALTER TABLE ' || quote_ident(ns.nspname) || '.' || quote_ident(tbl.relname) ||
+              ' ADD CONSTRAINT ' || quote_ident(con.conname) || ' ' ||
+              pg_get_constraintdef(con.oid, true) || ';' AS ddl
+       FROM pg_constraint con
+       JOIN pg_class tbl ON tbl.oid = con.conrelid
+       JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+       WHERE ns.nspname = $1
+         AND tbl.relname = $2
+         AND con.conname = $3
+       LIMIT 1`,
+      [schema, table, constraintName],
+    );
+    const ddl = res.rows[0]?.ddl;
+    if (!ddl) {
+      throw new Error(`Constraint "${constraintName}" not found`);
+    }
+    return ddl;
+  }
+  override async getIndexDDL(
+    _database: string,
+    schema: string,
+    table: string,
+    indexName: string,
+  ): Promise<string> {
+    const res = await this.requirePool().query<{ ddl: string }>(
+      `SELECT pg_get_indexdef(idx.oid, 0, true) || ';' AS ddl
+       FROM pg_class tbl
+       JOIN pg_index pg_idx ON pg_idx.indrelid = tbl.oid
+       JOIN pg_class idx ON idx.oid = pg_idx.indexrelid
+       JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+       WHERE ns.nspname = $1
+         AND tbl.relname = $2
+         AND idx.relname = $3
+       LIMIT 1`,
+      [schema, table, indexName],
+    );
+    const ddl = res.rows[0]?.ddl;
+    if (!ddl) {
+      throw new Error(`Index "${indexName}" not found`);
+    }
+    return ddl;
+  }
+  override async getTriggerDDL(
+    _database: string,
+    schema: string,
+    table: string,
+    triggerName: string,
+  ): Promise<string> {
+    const res = await this.requirePool().query<{ ddl: string }>(
+      `SELECT pg_get_triggerdef(trg.oid, true) || ';' AS ddl
+       FROM pg_trigger trg
+       JOIN pg_class tbl ON tbl.oid = trg.tgrelid
+       JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+       WHERE ns.nspname = $1
+         AND tbl.relname = $2
+         AND trg.tgname = $3
+         AND NOT trg.tgisinternal
+       LIMIT 1`,
+      [schema, table, triggerName],
+    );
+    const ddl = res.rows[0]?.ddl;
+    if (!ddl) {
+      throw new Error(`Trigger "${triggerName}" not found`);
+    }
+    return ddl;
+  }
   async getCreateTableDDL(
     _database: string,
     schema: string,
@@ -574,14 +792,19 @@ export class PostgresDriver extends BaseDBDriver {
     };
     const pool = this.requirePool();
     const kindRes = await pool.query<{
-      table_type: string;
+      relkind: string;
     }>(
-      `SELECT table_type FROM information_schema.tables
-       WHERE table_schema = $1 AND table_name = $2 LIMIT 1`,
+      `SELECT c.relkind
+       FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = $1
+         AND c.relname = $2
+         AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+       LIMIT 1`,
       [schema, table],
     );
-    const isView = kindRes.rows[0]?.table_type === "VIEW";
-    if (isView) {
+    const relkind = kindRes.rows[0]?.relkind;
+    if (relkind === "v") {
       const res = await pool.query<{
         def: string;
       }>(
@@ -596,6 +819,23 @@ export class PostgresDriver extends BaseDBDriver {
       return (
         res.rows[0]?.def ??
         `-- View definition not available for "${schema}"."${table}"`
+      );
+    }
+    if (relkind === "m") {
+      const res = await pool.query<{
+        def: string;
+      }>(
+        `SELECT 'CREATE MATERIALIZED VIEW "' || n.nspname || '"."' || c.relname || '" AS\n' ||
+                pg_get_viewdef(c.oid, true) || ';' AS def
+         FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'm'
+         LIMIT 1`,
+        [schema, table],
+      );
+      return (
+        res.rows[0]?.def ??
+        `-- Materialized view definition not available for "${schema}"."${table}"`
       );
     }
     const colRes = await pool.query<DdlColumnRow>(
@@ -660,6 +900,17 @@ export class PostgresDriver extends BaseDBDriver {
     }
     return `CREATE TABLE ${this.qualifiedTableName("", schema, table)} (\n${cols.join(",\n")}\n);`;
   }
+  async getObjectDefinition(
+    _database: string,
+    schema: string,
+    name: string,
+    kind: DdlOnlyDbObjectKind,
+  ): Promise<string | null> {
+    if (kind === "sequence") {
+      return this.getSequenceDefinition(schema, name);
+    }
+    return this.getTypeDefinition(schema, name);
+  }
   async getRoutineDefinition(
     _database: string,
     schema: string,
@@ -677,6 +928,135 @@ export class PostgresDriver extends BaseDBDriver {
       [schema, name],
     );
     return res.rows[0]?.def ?? `-- Definition not available for ${name}`;
+  }
+
+  private async getSequenceDefinition(
+    schema: string,
+    name: string,
+  ): Promise<string | null> {
+    const res = await this.requirePool().query<{
+      data_type: string;
+      start_value: string | number;
+      min_value: string | number;
+      max_value: string | number;
+      increment_by: string | number;
+      cycle: boolean;
+      cache_size: string | number;
+    }>(
+      `SELECT data_type,
+              start_value,
+              min_value,
+              max_value,
+              increment_by,
+              cycle,
+              cache_size
+       FROM pg_sequences
+       WHERE schemaname = $1 AND sequencename = $2
+       LIMIT 1`,
+      [schema, name],
+    );
+    const row = res.rows[0];
+    if (!row) {
+      return null;
+    }
+
+    const clauses = [
+      `CREATE SEQUENCE ${this.qualifiedTableName("", schema, name)}`,
+      row.data_type && row.data_type !== "bigint"
+        ? `AS ${row.data_type}`
+        : undefined,
+      `INCREMENT BY ${row.increment_by}`,
+      `MINVALUE ${row.min_value}`,
+      `MAXVALUE ${row.max_value}`,
+      `START WITH ${row.start_value}`,
+      `CACHE ${row.cache_size}`,
+      row.cycle ? "CYCLE" : "NO CYCLE",
+    ].filter((value): value is string => Boolean(value));
+
+    return `${clauses.join(" ")};`;
+  }
+
+  private async getTypeDefinition(
+    schema: string,
+    name: string,
+  ): Promise<string | null> {
+    const metaRes = await this.requirePool().query<{
+      typtype: string;
+      typnotnull: boolean;
+      typdefault: string | null;
+      base_type: string | null;
+    }>(
+      `SELECT t.typtype,
+              t.typnotnull,
+              t.typdefault,
+              format_type(t.typbasetype, t.typtypmod) AS base_type
+       FROM pg_type t
+       JOIN pg_namespace n ON n.oid = t.typnamespace
+       LEFT JOIN pg_class c ON c.oid = t.typrelid
+       WHERE n.nspname = $1
+         AND t.typname = $2
+         AND (
+           t.typtype IN ('e', 'd')
+           OR (t.typtype = 'c' AND c.relkind = 'c')
+         )
+       LIMIT 1`,
+      [schema, name],
+    );
+    const meta = metaRes.rows[0];
+    if (!meta) {
+      return null;
+    }
+
+    const qualifiedName = this.qualifiedTableName("", schema, name);
+    if (meta.typtype === "e") {
+      const labelsRes = await this.requirePool().query<{
+        enumlabel: string;
+      }>(
+        `SELECT e.enumlabel
+         FROM pg_enum e
+         JOIN pg_type t ON t.oid = e.enumtypid
+         JOIN pg_namespace n ON n.oid = t.typnamespace
+         WHERE n.nspname = $1 AND t.typname = $2
+         ORDER BY e.enumsortorder`,
+        [schema, name],
+      );
+      const labels = labelsRes.rows.map(
+        (row) => `'${row.enumlabel.replace(/'/g, "''")}'`,
+      );
+      return `CREATE TYPE ${qualifiedName} AS ENUM (${labels.join(", ")});`;
+    }
+
+    if (meta.typtype === "d") {
+      const clauses = [
+        `CREATE DOMAIN ${qualifiedName} AS ${meta.base_type ?? "text"}`,
+        meta.typdefault ? `DEFAULT ${meta.typdefault}` : undefined,
+        meta.typnotnull ? "NOT NULL" : undefined,
+      ].filter((value): value is string => Boolean(value));
+      return `${clauses.join(" ")};`;
+    }
+
+    const attributesRes = await this.requirePool().query<{
+      column_name: string;
+      data_type: string;
+    }>(
+      `SELECT a.attname AS column_name,
+              format_type(a.atttypid, a.atttypmod) AS data_type
+       FROM pg_type t
+       JOIN pg_namespace n ON n.oid = t.typnamespace
+       JOIN pg_class c ON c.oid = t.typrelid
+       JOIN pg_attribute a ON a.attrelid = c.oid
+       WHERE n.nspname = $1
+         AND t.typname = $2
+         AND c.relkind = 'c'
+         AND a.attnum > 0
+         AND NOT a.attisdropped
+       ORDER BY a.attnum`,
+      [schema, name],
+    );
+    const attributes = attributesRes.rows.map(
+      (row) => `  ${this.quoteIdentifier(row.column_name)} ${row.data_type}`,
+    );
+    return `CREATE TYPE ${qualifiedName} AS (\n${attributes.join(",\n")}\n);`;
   }
   async runTransaction(
     operations: import("./types").TransactionOperation[],

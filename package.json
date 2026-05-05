@@ -105,12 +105,6 @@
         "icon": "$(copy)"
       },
       {
-        "command": "rapidb.openSchema",
-        "title": "Open Schema",
-        "category": "RapiDB",
-        "icon": "$(symbol-namespace)"
-      },
-      {
         "command": "rapidb.openErd",
         "title": "Open ERD",
         "category": "RapiDB",
@@ -182,10 +176,6 @@
     },
     "menus": {
       "commandPalette": [
-        {
-          "command": "rapidb.openSchema",
-          "when": "false"
-        },
         {
           "command": "rapidb.showDDL",
           "when": "false"
@@ -306,11 +296,6 @@
           "group": "inline"
         },
         {
-          "command": "rapidb.openSchema",
-          "when": "view == rapidb-explorer && viewItem == table",
-          "group": "1_open"
-        },
-        {
           "command": "rapidb.showDDL",
           "when": "view == rapidb-explorer && viewItem == table",
           "group": "1_open"
@@ -323,6 +308,51 @@
         {
           "command": "rapidb.copyNodeName",
           "when": "view == rapidb-explorer && viewItem == view",
+          "group": "2_copy"
+        },
+        {
+          "command": "rapidb.showDDL",
+          "when": "view == rapidb-explorer && viewItem == materializedView",
+          "group": "1_open"
+        },
+        {
+          "command": "rapidb.copyNodeName",
+          "when": "view == rapidb-explorer && viewItem == materializedView",
+          "group": "2_copy"
+        },
+        {
+          "command": "rapidb.copyNodeName",
+          "when": "view == rapidb-explorer && viewItem == table_detail_column",
+          "group": "2_copy"
+        },
+        {
+          "command": "rapidb.showDDL",
+          "when": "view == rapidb-explorer && viewItem == table_detail_constraint",
+          "group": "1_open"
+        },
+        {
+          "command": "rapidb.copyNodeName",
+          "when": "view == rapidb-explorer && viewItem == table_detail_constraint",
+          "group": "2_copy"
+        },
+        {
+          "command": "rapidb.showDDL",
+          "when": "view == rapidb-explorer && viewItem == table_detail_index",
+          "group": "1_open"
+        },
+        {
+          "command": "rapidb.copyNodeName",
+          "when": "view == rapidb-explorer && viewItem == table_detail_index",
+          "group": "2_copy"
+        },
+        {
+          "command": "rapidb.showDDL",
+          "when": "view == rapidb-explorer && viewItem == table_detail_trigger",
+          "group": "1_open"
+        },
+        {
+          "command": "rapidb.copyNodeName",
+          "when": "view == rapidb-explorer && viewItem == table_detail_trigger",
           "group": "2_copy"
         },
         {
@@ -336,8 +366,38 @@
           "group": "2_copy"
         },
         {
+          "command": "rapidb.showDDL",
+          "when": "view == rapidb-explorer && viewItem == function",
+          "group": "1_open"
+        },
+        {
           "command": "rapidb.copyNodeName",
           "when": "view == rapidb-explorer && viewItem == procedure",
+          "group": "2_copy"
+        },
+        {
+          "command": "rapidb.showDDL",
+          "when": "view == rapidb-explorer && viewItem == procedure",
+          "group": "1_open"
+        },
+        {
+          "command": "rapidb.showDDL",
+          "when": "view == rapidb-explorer && viewItem == sequence",
+          "group": "1_open"
+        },
+        {
+          "command": "rapidb.copyNodeName",
+          "when": "view == rapidb-explorer && viewItem == sequence",
+          "group": "2_copy"
+        },
+        {
+          "command": "rapidb.showDDL",
+          "when": "view == rapidb-explorer && viewItem == type",
+          "group": "1_open"
+        },
+        {
+          "command": "rapidb.copyNodeName",
+          "when": "view == rapidb-explorer && viewItem == type",
           "group": "2_copy"
         },
         {

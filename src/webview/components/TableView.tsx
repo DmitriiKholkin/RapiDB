@@ -1693,6 +1693,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
                         "var(--vscode-editorGroupHeader-tabsBackground)",
                       borderRight: "1px solid var(--vscode-panel-border)",
                       borderLeft: "1px solid var(--vscode-panel-border)",
+                      borderBottom: "1px solid var(--vscode-panel-border)",
                       position: "sticky",
                       top: HEADER_H,
                       zIndex: 2,
