@@ -3,12 +3,12 @@ import type {
   DdlOnlyDbObjectKind,
 } from "../../shared/dbObjectKinds";
 import type {
-  ColumnDefaultKind,
   ColumnMeta,
   ColumnTypeMeta,
   FilterOperator,
   ForeignKeyMeta,
   GeneratedKind,
+  IdentityGenerationKind,
   IndexMeta,
   QueryColumnMeta,
   TableConstraintMeta,
@@ -17,13 +17,13 @@ import type {
 } from "../../shared/tableTypes";
 
 export {
-  type ColumnDefaultKind,
   type ColumnMeta,
   type ColumnTypeMeta,
   type FilterExpression,
   type FilterOperator,
   type ForeignKeyMeta,
   type GeneratedKind,
+  type IdentityGenerationKind,
   type IndexMeta,
   NULL_SENTINEL,
   type QueryColumnMeta,

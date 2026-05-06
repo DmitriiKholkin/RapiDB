@@ -21,9 +21,9 @@ export type TypeCategory =
 
 export type ValueSemantics = "plain" | "boolean" | "bit";
 
-export type ColumnDefaultKind = "literal" | "expression";
-
 export type GeneratedKind = "virtual" | "stored";
+
+export type IdentityGenerationKind = "always" | "by_default" | "auto_increment";
 
 export type ConstraintKind = "primary_key" | "foreign_key" | "unique" | "check";
 
@@ -50,9 +50,33 @@ const DATE_VALUE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_VALUE_RE = /^\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
 const DATETIME_VALUE_RE =
   /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?: ?(?:Z|[+-]\d{2}:\d{2}))?$/i;
-const HEX_BINARY_VALUE_RE = /^\\x[0-9a-f]+$/i;
+const HEX_BINARY_DIGITS_RE = /^[0-9a-f]+$/i;
 const SPATIAL_VALUE_RE =
   /^(?:srid=\d+;)?\s*(?:point|linestring|polygon|multipoint|multilinestring|multipolygon|geometrycollection|circularstring|compoundcurve|curvepolygon|multicurve|multisurface|polyhedralsurface|tin|triangle)\s*\(/i;
+
+export function normalizeBinaryHexDisplayPrefix(value: string): string {
+  if (
+    value.startsWith("\\x") ||
+    value.startsWith("\\X") ||
+    value.startsWith("0x") ||
+    value.startsWith("0X")
+  ) {
+    return `0x${value.slice(2)}`;
+  }
+  return value;
+}
+
+function isPrefixedHexBinaryValue(value: string): boolean {
+  if (
+    value.startsWith("\\x") ||
+    value.startsWith("\\X") ||
+    value.startsWith("0x") ||
+    value.startsWith("0X")
+  ) {
+    return value.length > 2 && HEX_BINARY_DIGITS_RE.test(value.slice(2));
+  }
+  return false;
+}
 
 export function inferValueCategory(value: unknown): TypeCategory | null {
   if (value === null || value === undefined) {
@@ -96,7 +120,7 @@ export function inferValueCategory(value: unknown): TypeCategory | null {
     return null;
   }
 
-  if (HEX_BINARY_VALUE_RE.test(trimmed)) {
+  if (isPrefixedHexBinaryValue(trimmed)) {
     return "binary";
   }
 
@@ -224,7 +248,7 @@ export interface ColumnMeta {
   type: string;
   nullable: boolean;
   defaultValue?: string;
-  defaultKind?: ColumnDefaultKind;
+  identityGeneration?: IdentityGenerationKind;
   onUpdateExpression?: string;
   isComputed?: boolean;
   computedExpression?: string;
@@ -233,7 +257,6 @@ export interface ColumnMeta {
   isPrimaryKey: boolean;
   primaryKeyOrdinal?: number;
   isForeignKey: boolean;
-  isAutoIncrement?: boolean;
 }
 
 export interface ColumnTypeMeta extends ColumnMeta {
@@ -277,6 +300,129 @@ export interface TriggerMeta {
   orientation?: TriggerOrientation;
   enabled?: boolean;
   definition?: string;
+}
+
+function formatGeneratedColumnDetail(
+  column: Pick<
+    ColumnMeta,
+    | "isComputed"
+    | "generatedKind"
+    | "computedExpression"
+    | "isPersisted"
+    | "onUpdateExpression"
+  >,
+): string | undefined {
+  if (!column.isComputed && !column.generatedKind) {
+    return undefined;
+  }
+
+  const parts = [
+    column.generatedKind ? `generated ${column.generatedKind}` : "generated",
+    column.computedExpression,
+    column.isPersisted ? "persisted" : undefined,
+    column.onUpdateExpression
+      ? `on update: ${column.onUpdateExpression}`
+      : undefined,
+  ].filter((value): value is string => Boolean(value));
+
+  return parts.join(", ");
+}
+
+function stripOuterDetailParens(value: string): string {
+  let current = value.trim();
+  while (current.startsWith("(") && current.endsWith(")")) {
+    let depth = 0;
+    let wrapsWholeValue = true;
+    for (let index = 0; index < current.length; index++) {
+      const char = current[index];
+      if (char === "(") {
+        depth++;
+        continue;
+      }
+      if (char === ")") {
+        depth--;
+        if (depth === 0 && index < current.length - 1) {
+          wrapsWholeValue = false;
+          break;
+        }
+      }
+    }
+    if (!wrapsWholeValue || depth !== 0) {
+      break;
+    }
+    current = current.slice(1, -1).trim();
+  }
+  return current;
+}
+
+export function isColumnAutoIncrement(
+  column: Pick<ColumnMeta, "defaultValue" | "identityGeneration">,
+): boolean {
+  if (column.identityGeneration !== undefined) {
+    return true;
+  }
+
+  const defaultValue = column.defaultValue?.trim();
+  if (!defaultValue) {
+    return false;
+  }
+
+  const normalizedDefault = stripOuterDetailParens(defaultValue);
+  return /^(?:nextval\s*\(|next value for\b)/i.test(normalizedDefault);
+}
+
+export function formatColumnDetailDescription(
+  column: Pick<
+    ColumnMeta,
+    | "type"
+    | "nullable"
+    | "defaultValue"
+    | "identityGeneration"
+    | "isComputed"
+    | "generatedKind"
+    | "computedExpression"
+    | "isPersisted"
+    | "onUpdateExpression"
+  >,
+): string {
+  const generated = formatGeneratedColumnDetail(column);
+  const autoIncrement = isColumnAutoIncrement(column);
+  const extras = [
+    autoIncrement
+      ? "auto increment"
+      : column.defaultValue
+        ? `default: ${column.defaultValue}`
+        : undefined,
+    generated,
+  ].filter((value): value is string => Boolean(value));
+
+  return `${column.type}${column.nullable ? "?" : ""}${extras.length > 0 ? `, ${extras.join(", ")}` : ""}`;
+}
+
+export function formatColumnDetailTooltip(
+  column: Pick<
+    ColumnMeta,
+    | "name"
+    | "type"
+    | "nullable"
+    | "defaultValue"
+    | "identityGeneration"
+    | "isComputed"
+    | "generatedKind"
+    | "computedExpression"
+    | "isPersisted"
+    | "onUpdateExpression"
+    | "isPrimaryKey"
+    | "isForeignKey"
+  >,
+): string {
+  return [
+    `${column.name} ${formatColumnDetailDescription(column)}`,
+    column.isPrimaryKey ? "Primary key" : undefined,
+    column.isForeignKey ? "Foreign key" : undefined,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .join("\n");
 }
 
 export function isNumericCategory(category: TypeCategory): boolean {

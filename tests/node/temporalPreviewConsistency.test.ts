@@ -34,7 +34,6 @@ function column(
     isPrimaryKey: false,
     primaryKeyOrdinal: undefined,
     isForeignKey: false,
-    isAutoIncrement: false,
     filterable: true,
     filterOperators: ["is_null", "is_not_null"],
     valueSemantics: "plain",

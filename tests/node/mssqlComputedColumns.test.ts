@@ -87,7 +87,6 @@ describe("MSSQL computed columns", () => {
     const computed = columns.find((column) => column.name === "col_computed");
 
     expect(createdAt?.defaultValue).toBe("sysdatetime()");
-    expect(createdAt?.defaultKind).toBe("expression");
     expect(computed).toBeTruthy();
     expect(computed?.type).toBe("int");
     expect(computed?.isComputed).toBe(true);

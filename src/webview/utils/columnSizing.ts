@@ -50,6 +50,7 @@ export interface ColSizeOpts {
 export function calcColWidth(
   colName: string,
   isPrimaryKey: boolean,
+  isForeignKey: boolean,
   rows: Record<string, unknown>[],
   opts: ColSizeOpts = {},
   dataKey?: string,
@@ -58,8 +59,8 @@ export function calcColWidth(
   const max = opts.max ?? COL_MAX;
   const sampleRows = opts.sampleRows ?? SAMPLE_ROWS;
 
-  let maxContentW =
-    measureText(isPrimaryKey ? `${colName}key` : colName) + SORT_ICON_W;
+  const iconSuffix = `${isPrimaryKey ? "key" : ""}${isForeignKey ? "key" : ""}`;
+  let maxContentW = measureText(`${colName}${iconSuffix}`) + SORT_ICON_W;
 
   const rowKey = dataKey ?? colName;
   const limit = Math.min(rows.length, sampleRows);
@@ -79,6 +80,7 @@ export interface Column {
 
   dataKey?: string;
   isPrimaryKey: boolean;
+  isForeignKey: boolean;
 }
 
 export function calcColWidths(
@@ -92,6 +94,7 @@ export function calcColWidths(
     result[column.dataKey ?? column.name] = calcColWidth(
       column.name,
       column.isPrimaryKey,
+      column.isForeignKey,
       rows,
       opts,
       column.dataKey,

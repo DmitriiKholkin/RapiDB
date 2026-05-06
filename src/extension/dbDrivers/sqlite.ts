@@ -622,10 +622,11 @@ export class SQLiteDriver extends BaseDBDriver {
       type: row.type.toLowerCase() || "text",
       nullable: row.notnull === 0,
       defaultValue,
-      defaultKind:
-        defaultValue === undefined
-          ? undefined
-          : this.inferDefaultKind(defaultValue),
+      identityGeneration: metadata.autoIncrementColumns.has(
+        row.name.toLowerCase(),
+      )
+        ? "auto_increment"
+        : undefined,
       isComputed,
       computedExpression: generatedDetail?.expression,
       generatedKind: generatedDetail?.generatedKind,
@@ -636,9 +637,6 @@ export class SQLiteDriver extends BaseDBDriver {
       isPrimaryKey: row.pk > 0,
       primaryKeyOrdinal: row.pk > 0 ? row.pk : undefined,
       isForeignKey: metadata.foreignKeyColumns.has(row.name),
-      isAutoIncrement: metadata.autoIncrementColumns.has(
-        row.name.toLowerCase(),
-      ),
     };
   }
   async disconnect(): Promise<void> {

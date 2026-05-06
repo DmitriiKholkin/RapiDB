@@ -106,13 +106,11 @@ describe("describeTable schema metadata", () => {
         expect.objectContaining({
           name: "created_at",
           defaultValue: "CURRENT_TIMESTAMP(6)",
-          defaultKind: "expression",
           onUpdateExpression: "CURRENT_TIMESTAMP(6)",
         }),
         expect.objectContaining({
           name: "public_id",
           defaultValue: "uuid()",
-          defaultKind: "expression",
         }),
         expect.objectContaining({
           name: "slug",
@@ -173,7 +171,6 @@ describe("describeTable schema metadata", () => {
         expect.objectContaining({
           name: "created_at",
           defaultValue: "CURRENT_TIMESTAMP",
-          defaultKind: "expression",
           isComputed: false,
         }),
         expect.objectContaining({
@@ -249,7 +246,6 @@ describe("describeTable schema metadata", () => {
         expect.objectContaining({
           name: "CREATED_AT",
           defaultValue: "CURRENT_TIMESTAMP",
-          defaultKind: "expression",
           isComputed: false,
         }),
         expect.objectContaining({
@@ -360,7 +356,6 @@ describe("describeTable schema metadata", () => {
         expect.objectContaining({
           name: "updated_at",
           defaultValue: "CURRENT_TIMESTAMP",
-          defaultKind: "expression",
         }),
       ]),
     );

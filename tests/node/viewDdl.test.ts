@@ -71,15 +71,17 @@ describe("view DDL generation", () => {
   it("Postgres uses pg_get_viewdef for view DDL", async () => {
     const driver = new PostgresDriver(postgresConfig as ConnectionConfig);
     const query = vi.fn(async (sql: string, params?: unknown[]) => {
-      if (sql.includes("information_schema.tables")) {
+      if (sql.includes("pg_get_viewdef")) {
         expect(params).toEqual(["public", "v_employees"]);
-        return { rows: [{ table_type: "VIEW" }] };
+        return {
+          rows: [{ def: 'CREATE VIEW "public"."v_employees" AS SELECT 1' }],
+        };
       }
-      expect(sql).toContain("pg_get_viewdef");
-      expect(params).toEqual(["public", "v_employees"]);
-      return {
-        rows: [{ def: 'CREATE VIEW "public"."v_employees" AS SELECT 1' }],
-      };
+      if (sql.includes("pg_class c")) {
+        expect(params).toEqual(["public", "v_employees"]);
+        return { rows: [{ relkind: "v" }] };
+      }
+      throw new Error(`Unexpected SQL: ${sql}`);
     });
     (driver as unknown as { pool: { query: typeof query } }).pool = {
       query,

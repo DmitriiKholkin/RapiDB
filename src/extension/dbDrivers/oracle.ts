@@ -987,10 +987,12 @@ export class OracleDriver extends BaseDBDriver {
           ),
           nullable: r.NULLABLE === "Y",
           defaultValue,
-          defaultKind:
-            defaultValue === undefined
+          identityGeneration:
+            genType === undefined
               ? undefined
-              : this.inferDefaultKind(defaultValue),
+              : genType === "ALWAYS"
+                ? "always"
+                : "by_default",
           isComputed,
           computedExpression,
           generatedKind: isComputed ? "virtual" : undefined,
@@ -998,7 +1000,6 @@ export class OracleDriver extends BaseDBDriver {
           isPrimaryKey: primaryKeyOrdinal !== undefined,
           primaryKeyOrdinal,
           isForeignKey: fkCols.has(r.COLUMN_NAME),
-          isAutoIncrement: genType !== undefined,
         };
       });
     } finally {

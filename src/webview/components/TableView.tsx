@@ -20,6 +20,7 @@ import {
   deriveApplicableFilterDrafts,
   type FilterDraft,
   type FilterDraftMap,
+  formatColumnDetailDescription,
   isNumericCategory,
   NULL_SENTINEL,
   serializeFilterDrafts,
@@ -603,6 +604,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
               return {
                 name: c.name,
                 isPrimaryKey: c.isPrimaryKey,
+                isForeignKey: c.isForeignKey,
               };
             }),
             r,
@@ -1105,19 +1107,36 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
         (col): TanColumnDef<Row> => ({
           id: col.name,
           accessorKey: col.name,
+          meta: col,
 
           size: colSizes[col.name] ?? colSizes[`${col.name}key`] ?? 160,
           minSize: 40,
           maxSize: 800,
           header: () => (
-            <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <span
+              title={[
+                formatColumnDetailDescription(col),
+                col.isPrimaryKey ? "Primary key" : undefined,
+                col.isForeignKey ? "Foreign key" : undefined,
+              ]
+                .filter((value): value is string => Boolean(value))
+                .join("\n")}
+              style={{ display: "flex", alignItems: "center", gap: 4 }}
+            >
               {col.name}
               {col.isPrimaryKey && (
                 <Icon
                   name="key"
                   size={13}
                   color="var(--vscode-charts-yellow, #cca700)"
-                  title="Primary Key"
+                  style={{ marginLeft: 2 }}
+                />
+              )}
+              {col.isForeignKey && (
+                <Icon
+                  name="key"
+                  size={13}
+                  color="var(--vscode-foreground)"
                   style={{ marginLeft: 2 }}
                 />
               )}
@@ -1580,9 +1599,29 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
                   const colId = h.column.id;
                   const isSorted = sort?.column === colId;
                   const sortDir = isSorted ? (sort?.direction ?? null) : null;
+                  const columnMeta = h.column.columnDef.meta as
+                    | ColumnMeta
+                    | undefined;
                   return (
                     <th
                       key={h.id}
+                      title={
+                        isSel || !columnMeta
+                          ? undefined
+                          : [
+                              formatColumnDetailDescription(columnMeta),
+                              columnMeta.isPrimaryKey
+                                ? "Primary key"
+                                : undefined,
+                              columnMeta.isForeignKey
+                                ? "Foreign key"
+                                : undefined,
+                            ]
+                              .filter((value): value is string =>
+                                Boolean(value),
+                              )
+                              .join("\n")
+                      }
                       style={{
                         width: h.getSize(),
                         height: HEADER_H,
@@ -1608,7 +1647,6 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
                           handleSort(colId);
                         }
                       }}
-                      title={isSel ? undefined : `Sort by ${colId}`}
                     >
                       <div
                         style={{

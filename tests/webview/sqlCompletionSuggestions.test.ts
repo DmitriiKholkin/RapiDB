@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildSqlCompletionSuggestions } from "../../src/webview/components/sqlCompletionSuggestions";
+import { buildSqlCompletionSuggestions } from "../../src/webview/utils/sqlCompletionSuggestions";
 
 describe("buildSqlCompletionSuggestions", () => {
   it("returns objects from every database but columns only for the configured database cache", () => {

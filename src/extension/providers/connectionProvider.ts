@@ -6,6 +6,10 @@ import {
   type ExplorerCategoryId,
   isDataDbObjectKind,
 } from "../../shared/dbObjectKinds";
+import {
+  formatColumnDetailDescription,
+  formatColumnDetailTooltip,
+} from "../../shared/tableTypes";
 import type {
   ConnectionConfig,
   ConnectionManager,
@@ -798,12 +802,7 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     request: TableDetailRequest,
     column: ColumnTypeMeta,
   ): RapiDBNode {
-    const generated = this.formatGeneratedDetail(column);
-    const extras = [
-      column.defaultValue ? `default: ${column.defaultValue}` : undefined,
-      generated,
-    ].filter((value): value is string => Boolean(value));
-    const description = `${column.type}${column.nullable ? "?" : ""}${extras.length > 0 ? `, ${extras.join(", ")}` : ""}`;
+    const description = formatColumnDetailDescription(column);
     const node = new RapiDBNode(
       column.name,
       "table_detail_column",
@@ -822,14 +821,7 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       node.iconPath = new vscode.ThemeIcon("key");
     }
     node.description = description;
-    node.tooltip = [
-      `${column.name} ${description}`,
-      column.isPrimaryKey ? "Primary key" : undefined,
-      column.isForeignKey ? "Foreign key" : undefined,
-      column.isAutoIncrement ? "Auto increment" : undefined,
-    ]
-      .filter((value): value is string => Boolean(value))
-      .join("\n");
+    node.tooltip = formatColumnDetailTooltip(column);
     return node;
   }
 
@@ -924,22 +916,6 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
 
   private formatConstraintKind(kind: TableConstraintMeta["kind"]): string {
     return kind.replace(/_/g, " ");
-  }
-
-  private formatGeneratedDetail(column: ColumnTypeMeta): string | undefined {
-    if (!column.isComputed && !column.generatedKind) {
-      return undefined;
-    }
-
-    const parts = [
-      column.generatedKind ? `generated ${column.generatedKind}` : "generated",
-      column.computedExpression,
-      column.isPersisted ? "persisted" : undefined,
-      column.onUpdateExpression
-        ? `on update: ${column.onUpdateExpression}`
-        : undefined,
-    ].filter((value): value is string => Boolean(value));
-    return parts.join(", ");
   }
 
   private makeErrorNodes(

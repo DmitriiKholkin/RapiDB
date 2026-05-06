@@ -1,9 +1,24 @@
 import React, { useLayoutEffect, useRef, useState } from "react";
-import { NULL_SENTINEL, type TypeCategory } from "../../../shared/tableTypes";
+import {
+  NULL_SENTINEL,
+  normalizeBinaryHexDisplayPrefix,
+  type TypeCategory,
+} from "../../../shared/tableTypes";
 import { placeholderForCategory } from "../../types";
 import { buildButtonStyle } from "../../utils/buttonStyles";
 import { buildTextInputStyle } from "../../utils/controlStyles";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
+
+function normalizeEditInitialValue(
+  value: string,
+  category?: TypeCategory,
+): string {
+  if (category === "binary") {
+    return normalizeBinaryHexDisplayPrefix(value);
+  }
+  return value;
+}
+
 export function EditInput({
   initial,
   nullable,
@@ -27,7 +42,9 @@ export function EditInput({
 }) {
   const isInitiallyNull = initial === NULL_SENTINEL;
   const [isNull, setIsNull] = useState(false);
-  const [val, setVal] = useState(isInitiallyNull ? "" : initial);
+  const [val, setVal] = useState(
+    isInitiallyNull ? "" : normalizeEditInitialValue(initial, category),
+  );
   const ref = useRef<HTMLInputElement>(null);
   useLayoutEffect(() => {
     ref.current?.focus();
@@ -35,7 +52,9 @@ export function EditInput({
       ref.current.select();
     }
   }, []);
-  const commit = () => onCommit(isNull ? NULL_SENTINEL : val);
+  const normalizedValue = normalizeEditInitialValue(val, category);
+  const commit = () =>
+    onCommit(isNull ? NULL_SENTINEL : normalizeEditInitialValue(val, category));
   const inputStyle: React.CSSProperties = {
     ...buildTextInputStyle("sm"),
     flex: 1,
@@ -74,7 +93,7 @@ export function EditInput({
       <input
         ref={ref}
         aria-label="Cell value"
-        value={val}
+        value={normalizedValue}
         readOnly={readOnly}
         onChange={(e) => {
           if (isNull) {

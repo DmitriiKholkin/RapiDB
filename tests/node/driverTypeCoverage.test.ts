@@ -58,7 +58,6 @@ function buildColumn(
     isPrimaryKey: false,
     primaryKeyOrdinal: undefined,
     isForeignKey: false,
-    isAutoIncrement: false,
     filterable,
     filterOperators: resolveFilterOperators(category, {
       filterable,
@@ -203,7 +202,7 @@ function sampleValueFor(
     case "datetime":
       return "2026-04-23T12:34:56Z";
     case "binary":
-      return "\\x0a";
+      return "0x0a";
     case "json":
       return '{"a":1}';
     case "uuid":
@@ -317,7 +316,6 @@ function buildFilterColumn(
     isPrimaryKey: false,
     primaryKeyOrdinal: undefined,
     isForeignKey: false,
-    isAutoIncrement: false,
     filterable: true,
     filterOperators: resolveFilterOperators(category, {
       filterable: true,
@@ -966,7 +964,6 @@ describe("filter SQL compatibility for complex null-only types", () => {
         isPrimaryKey: false,
         primaryKeyOrdinal: undefined,
         isForeignKey: false,
-        isAutoIncrement: false,
       },
     );
 

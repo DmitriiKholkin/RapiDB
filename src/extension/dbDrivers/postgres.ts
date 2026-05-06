@@ -46,6 +46,19 @@ const PG_GEOMETRIC_TYPES = new Set([
   "polygon",
   "circle",
 ]);
+
+function pgIdentityGenerationKind(
+  identityKind: string | null | undefined,
+): ColumnMeta["identityGeneration"] {
+  if (identityKind === "a") {
+    return "always";
+  }
+  if (identityKind === "d") {
+    return "by_default";
+  }
+  return undefined;
+}
+
 function jsonToPgCircle(val: string): string {
   const trimmed = val.trim();
   if (!trimmed.startsWith("{")) return trimmed;
@@ -105,9 +118,6 @@ function toOptionalNumber(value: unknown): number | undefined {
 }
 function pgIdentityKind(value: unknown): "" | "a" | "d" {
   return value === "a" || value === "d" ? value : "";
-}
-function isPgIdentityColumn(value: unknown): boolean {
-  return pgIdentityKind(value) !== "";
 }
 function pgIdentityClause(value: unknown): string {
   const identityKind = pgIdentityKind(value);
@@ -453,23 +463,19 @@ export class PostgresDriver extends BaseDBDriver {
     return res.rows.map((r) => {
       const rawDefault = r.column_default as string | null | undefined;
       const generatedKind = r.generated_kind as string | null | undefined;
+      const identityGeneration = pgIdentityGenerationKind(
+        r.identity_kind as string | null | undefined,
+      );
       const isComputed = generatedKind === "s";
-      const isAutoIncrement =
-        isPgIdentityColumn(r.identity_kind) ||
-        (typeof rawDefault === "string" && rawDefault.startsWith("nextval("));
       const computedExpression =
         isComputed && typeof rawDefault === "string" ? rawDefault : undefined;
-      const defaultValue =
-        !isComputed && !isAutoIncrement ? (rawDefault ?? undefined) : undefined;
+      const defaultValue = !isComputed ? (rawDefault ?? undefined) : undefined;
       return {
         name: r.column_name as string,
         type: r.data_type as string,
         nullable: isPgTrue(r.is_nullable),
         defaultValue,
-        defaultKind:
-          defaultValue === undefined
-            ? undefined
-            : this.inferDefaultKind(defaultValue),
+        identityGeneration,
         isComputed,
         computedExpression,
         generatedKind: isComputed ? "stored" : undefined,
@@ -477,7 +483,6 @@ export class PostgresDriver extends BaseDBDriver {
         isPrimaryKey: isPgTrue(r.is_pk),
         primaryKeyOrdinal: toOptionalNumber(r.pk_ordinal),
         isForeignKey: isPgTrue(r.is_fk),
-        isAutoIncrement,
       };
     });
   }

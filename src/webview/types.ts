@@ -180,7 +180,7 @@ export function placeholderForCategory(cat: TypeCategory): string {
     case "datetime":
       return "YYYY-MM-DD HH:MM:SS";
     case "binary":
-      return "\\xHEX";
+      return "0xHEX";
     default:
       return "";
   }

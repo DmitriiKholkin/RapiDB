@@ -2,6 +2,7 @@ import React from "react";
 import type { TypeCategory } from "../../../shared/tableTypes";
 import { getCategoryPresentation } from "../../types";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
+
 const PENDING_COLOR = "var(--vscode-editorWarning-foreground, #cca700)";
 export function CellDisplay({
   value,
@@ -20,7 +21,7 @@ export function CellDisplay({
     : undefined;
   const resolvedColor = isPending ? PENDING_COLOR : categoryColor;
   const str = formatScalarValueForDisplay(value);
-  if (category === "binary" && str.startsWith("\\x")) {
+  if (category === "binary") {
     return (
       <span
         style={{

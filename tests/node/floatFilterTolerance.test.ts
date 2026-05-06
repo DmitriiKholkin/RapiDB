@@ -13,7 +13,6 @@ const floatColumn: ColumnTypeMeta = {
   nullable: true,
   isPrimaryKey: false,
   isForeignKey: false,
-  isAutoIncrement: false,
   filterable: true,
   filterOperators: [
     "eq",

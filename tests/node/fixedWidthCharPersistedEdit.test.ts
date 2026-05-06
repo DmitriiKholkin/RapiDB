@@ -27,7 +27,6 @@ function buildColumn(
     nullable: true,
     isPrimaryKey: false,
     isForeignKey: false,
-    isAutoIncrement: false,
     category,
     filterable: true,
     filterOperators: ["eq", "like", "is_null", "is_not_null"],

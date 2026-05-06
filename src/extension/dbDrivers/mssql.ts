@@ -354,8 +354,10 @@ function mssqlDisplayedTemporalDiffUpperBound(rawValue: string): number | null {
   if (digits > 3) {
     return null;
   }
+
   return 10 ** (3 - digits) - 1;
 }
+
 function mssqlFloatSignificantDigits(nativeType: string): number {
   const normalized = nativeType.toLowerCase().trim();
   if (normalized.startsWith("real")) {
@@ -989,10 +991,7 @@ export class MSSQLDriver extends BaseDBDriver {
         ),
         nullable: isSetFlag(row.IS_NULLABLE),
         defaultValue,
-        defaultKind:
-          defaultValue === undefined
-            ? undefined
-            : this.inferDefaultKind(defaultValue),
+        identityGeneration: isSetFlag(row.is_identity) ? "always" : undefined,
         isComputed,
         computedExpression: row.COMPUTED_DEFINITION ?? undefined,
         generatedKind: isComputed
@@ -1004,7 +1003,6 @@ export class MSSQLDriver extends BaseDBDriver {
         isPrimaryKey: row.IS_PK === 1,
         primaryKeyOrdinal: row.PK_ORDINAL ?? undefined,
         isForeignKey: row.IS_FK === 1,
-        isAutoIncrement: isSetFlag(row.is_identity),
       };
     });
   }

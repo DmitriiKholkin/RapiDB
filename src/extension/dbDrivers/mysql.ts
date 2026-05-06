@@ -198,22 +198,20 @@ function mysqlGeneratedKind(
   return undefined;
 }
 function parseMysqlExtraMetadata(extra: string | null | undefined): {
-  defaultKind: ColumnMeta["defaultKind"];
   onUpdateExpression: string | undefined;
   generatedKind: ColumnMeta["generatedKind"];
-  isAutoIncrement: boolean;
+  identityGeneration: ColumnMeta["identityGeneration"];
 } {
   const normalizedExtra = extra?.trim() ?? "";
   const onUpdateExpression = /\bon update\s+(.+)$/i
     .exec(normalizedExtra)?.[1]
     ?.trim();
   return {
-    defaultKind: /\bdefault_generated\b/i.test(normalizedExtra)
-      ? "expression"
-      : undefined,
     onUpdateExpression,
     generatedKind: mysqlGeneratedKind(normalizedExtra),
-    isAutoIncrement: /\bauto_increment\b/i.test(normalizedExtra),
+    identityGeneration: /\bauto_increment\b/i.test(normalizedExtra)
+      ? "auto_increment"
+      : undefined,
   };
 }
 function isValidMysqlDateParts(
@@ -925,11 +923,7 @@ export class MySQLDriver extends BaseDBDriver {
         type: r.COLUMN_TYPE as string,
         nullable: r.IS_NULLABLE === "YES",
         defaultValue,
-        defaultKind:
-          defaultValue === undefined
-            ? undefined
-            : (extraMetadata.defaultKind ??
-              this.inferDefaultKind(defaultValue)),
+        identityGeneration: extraMetadata.identityGeneration,
         onUpdateExpression: extraMetadata.onUpdateExpression,
         isComputed,
         computedExpression: generationExpression,
@@ -944,7 +938,6 @@ export class MySQLDriver extends BaseDBDriver {
             ? undefined
             : Number(r.PRIMARY_KEY_ORDINAL),
         isForeignKey: Number(r.IS_FOREIGN_KEY) === 1,
-        isAutoIncrement: extraMetadata.isAutoIncrement,
       };
     });
   }

@@ -22,7 +22,6 @@ const jsonColumn: ColumnTypeMeta = {
   nullable: true,
   isPrimaryKey: false,
   isForeignKey: false,
-  isAutoIncrement: false,
   filterable: true,
   filterOperators: ["like", "is_null", "is_not_null"],
   valueSemantics: "plain",

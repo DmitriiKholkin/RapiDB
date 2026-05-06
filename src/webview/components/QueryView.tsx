@@ -40,7 +40,7 @@ const TOOLBAR_H = 36;
 const DIVIDER_H = 5;
 const MIN_EDITOR_H = 80;
 
-const DEFAULT_EDITOR_RATIO = 0.5;
+const DEFAULT_EDITOR_RATIO = 0.7;
 const DEFAULT_EDITOR_H = 400;
 
 export function QueryView({

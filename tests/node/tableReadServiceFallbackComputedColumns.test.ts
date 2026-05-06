@@ -12,7 +12,6 @@ const columns: ColumnTypeMeta[] = [
     isPrimaryKey: true,
     primaryKeyOrdinal: 1,
     isForeignKey: false,
-    isAutoIncrement: false,
     filterable: true,
     filterOperators: [
       "eq",
@@ -36,7 +35,6 @@ const columns: ColumnTypeMeta[] = [
     nullable: true,
     isPrimaryKey: false,
     isForeignKey: false,
-    isAutoIncrement: false,
     filterable: true,
     filterOperators: [
       "eq",

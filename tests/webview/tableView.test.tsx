@@ -65,7 +65,6 @@ const columns: ColumnTypeMeta[] = [
     isPrimaryKey: true,
     primaryKeyOrdinal: 1,
     isForeignKey: false,
-    isAutoIncrement: false,
     category: "integer",
     filterable: true,
     filterOperators: ["eq", "gt", "lt"],
@@ -78,7 +77,6 @@ const columns: ColumnTypeMeta[] = [
     nullable: true,
     isPrimaryKey: false,
     isForeignKey: false,
-    isAutoIncrement: false,
     category: "text",
     filterable: true,
     filterOperators: ["eq", "like"],
@@ -91,6 +89,36 @@ const rows = [
   { id: 2, name: "Bob" },
 ];
 
+const fkColumns: ColumnTypeMeta[] = [
+  {
+    name: "id",
+    type: "INTEGER",
+    nativeType: "INTEGER",
+    nullable: false,
+    isPrimaryKey: true,
+    primaryKeyOrdinal: 1,
+    isForeignKey: false,
+    category: "integer",
+    filterable: true,
+    filterOperators: ["eq", "gt", "lt"],
+    valueSemantics: "plain",
+  },
+  {
+    name: "role_id",
+    type: "INTEGER",
+    nativeType: "INTEGER",
+    nullable: false,
+    isPrimaryKey: false,
+    isForeignKey: true,
+    category: "integer",
+    filterable: true,
+    filterOperators: ["eq", "gt", "lt"],
+    valueSemantics: "plain",
+  },
+];
+
+const fkRows = [{ id: 1, role_id: 10 }];
+
 const noPkColumns: ColumnTypeMeta[] = [
   {
     name: "code",
@@ -99,7 +127,6 @@ const noPkColumns: ColumnTypeMeta[] = [
     nullable: false,
     isPrimaryKey: false,
     isForeignKey: false,
-    isAutoIncrement: false,
     category: "text",
     filterable: true,
     filterOperators: ["eq", "like"],
@@ -112,7 +139,6 @@ const noPkColumns: ColumnTypeMeta[] = [
     nullable: false,
     isPrimaryKey: false,
     isForeignKey: false,
-    isAutoIncrement: false,
     category: "text",
     filterable: true,
     filterOperators: ["eq", "like"],
@@ -133,7 +159,7 @@ const autoIncrementColumns: ColumnTypeMeta[] = [
     nullable: false,
     isPrimaryKey: false,
     isForeignKey: false,
-    isAutoIncrement: true,
+    identityGeneration: "auto_increment",
     category: "integer",
     filterable: true,
     filterOperators: ["eq", "gt", "lt"],
@@ -146,7 +172,6 @@ const autoIncrementColumns: ColumnTypeMeta[] = [
     nullable: false,
     isPrimaryKey: false,
     isForeignKey: false,
-    isAutoIncrement: false,
     category: "text",
     filterable: true,
     filterOperators: ["eq", "like"],
@@ -164,7 +189,6 @@ const operatorVisibilityColumns: ColumnTypeMeta[] = [
     nullable: true,
     isPrimaryKey: false,
     isForeignKey: false,
-    isAutoIncrement: false,
     category: "text",
     filterable: true,
     filterOperators: ["eq", "in", "is_null", "is_not_null"],
@@ -177,7 +201,6 @@ const operatorVisibilityColumns: ColumnTypeMeta[] = [
     nullable: false,
     isPrimaryKey: false,
     isForeignKey: false,
-    isAutoIncrement: false,
     category: "text",
     filterable: true,
     filterOperators: ["eq", "like"],
@@ -190,7 +213,6 @@ const operatorVisibilityColumns: ColumnTypeMeta[] = [
     nullable: true,
     isPrimaryKey: false,
     isForeignKey: false,
-    isAutoIncrement: false,
     category: "json",
     filterable: false,
     filterOperators: ["is_null", "is_not_null"],
@@ -232,6 +254,7 @@ function renderTableView() {
 
 afterEach(() => {
   vi.useRealTimers();
+  clearPostedMessages();
 });
 
 describe("TableView", () => {
@@ -285,6 +308,83 @@ describe("TableView", () => {
       screen.queryByRole("status", { name: "Loading data..." }),
     ).toBeNull();
     expect(screen.getByRole("button", { name: "Add Row" })).toBeTruthy();
+  });
+
+  it("shows key icons for both primary and foreign key columns", async () => {
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns: fkColumns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows: fkRows,
+        totalCount: fkRows.length,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("table")).toBeTruthy();
+    });
+
+    expect(screen.getByTitle("Primary Key")).toBeTruthy();
+    expect(screen.getByTitle("Foreign Key")).toBeTruthy();
+  });
+
+  it("shows column detail tooltip on header hover text", async () => {
+    renderTableView();
+
+    const tooltipColumn: ColumnTypeMeta = {
+      ...fkColumns[1],
+      defaultValue: "42",
+    };
+
+    dispatchIncomingMessage("tableInit", {
+      columns: [tooltipColumn],
+      primaryKeyColumns: [],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows: [{ role_id: 10 }],
+        totalCount: 1,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("table")).toBeTruthy();
+    });
+
+    const headerCell = screen.getByText("role_id").closest("th");
+    if (!(headerCell instanceof HTMLTableCellElement)) {
+      throw new Error("Expected role_id header cell to be rendered");
+    }
+
+    const headerTitle = headerCell.getAttribute("title");
+    expect(headerTitle).toContain("INTEGER, default: 42");
+    expect(headerTitle).toContain("Foreign key");
   });
 
   it("preserves repeated spaces in rendered text cells", async () => {

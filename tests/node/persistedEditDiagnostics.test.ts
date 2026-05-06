@@ -22,7 +22,6 @@ describe("persisted edit diagnostics", () => {
       nullable: true,
       isPrimaryKey: false,
       isForeignKey: false,
-      isAutoIncrement: false,
       category: "text",
       filterable: true,
       filterOperators: ["eq", "like"],

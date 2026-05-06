@@ -116,10 +116,10 @@ describe("ConnectionProvider", () => {
               type: "integer",
               nativeType: "integer",
               nullable: false,
-              defaultValue: "nextval('users_id_seq'::regclass)",
               isPrimaryKey: true,
               primaryKeyOrdinal: 1,
               isForeignKey: false,
+              identityGeneration: "always",
               filterable: true,
               filterOperators: [],
               category: "integer",
@@ -967,9 +967,12 @@ describe("ConnectionProvider", () => {
     ]);
     expect(columnRows.map((node) => node.label)).toEqual(["id", "uid"]);
     expect(columnRows.map((node) => node.description)).toEqual([
-      "integer, default: nextval('users_id_seq'::regclass)",
+      "integer, auto increment",
       "uuid?, default: gen_random_uuid()",
     ]);
+    expect(columnRows[0]?.tooltip).toBe(
+      "id integer, auto increment\nPrimary key",
+    );
     expect(columnRows[0]?.iconPath).toMatchObject({
       id: "key",
       color: { id: "charts.yellow" },

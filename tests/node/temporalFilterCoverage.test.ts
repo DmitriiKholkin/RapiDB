@@ -47,7 +47,6 @@ function column(
     isPrimaryKey: false,
     primaryKeyOrdinal: undefined,
     isForeignKey: false,
-    isAutoIncrement: false,
     filterable: true,
     filterOperators: resolveFilterOperators(category, {
       filterable: true,

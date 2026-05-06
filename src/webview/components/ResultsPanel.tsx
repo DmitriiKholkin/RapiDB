@@ -94,6 +94,7 @@ export function ResultsPanel({ status, result }: Props): React.ReactElement {
 function DataTable({ result }: { result: QueryResult }) {
   const {
     columns: colNames,
+    columnMeta,
     rows,
     rowCount,
     executionTimeMs,
@@ -117,6 +118,7 @@ function DataTable({ result }: { result: QueryResult }) {
             name,
             dataKey: `__col_${i}`,
             isPrimaryKey: false,
+            isForeignKey: false,
           }),
         ),
         rows,
@@ -129,6 +131,7 @@ function DataTable({ result }: { result: QueryResult }) {
     () =>
       colNames.map((name, i) => {
         const key = `__col_${i}`;
+        const category = columnMeta[i]?.category;
         return {
           id: key,
           accessorKey: key,
@@ -137,11 +140,15 @@ function DataTable({ result }: { result: QueryResult }) {
           minSize: 40,
           maxSize: 800,
           cell: (info) => (
-            <CellDisplay value={info.getValue()} isPending={false} />
+            <CellDisplay
+              value={info.getValue()}
+              isPending={false}
+              category={category ?? undefined}
+            />
           ),
         };
       }),
-    [colNames, colSizes],
+    [colNames, colSizes, columnMeta],
   );
 
   const table = useReactTable({
@@ -386,6 +393,7 @@ function DataTable({ result }: { result: QueryResult }) {
                   key={vRow.key}
                   row={row}
                   index={vRow.index}
+                  columnMeta={columnMeta}
                   activeCell={activeCell}
                   onActivateCell={(rowIndex, columnId) =>
                     setActiveCell({ rowIndex, columnId })
@@ -430,12 +438,14 @@ if (
 const VirtualRow = React.memo(function VirtualRow({
   row,
   index,
+  columnMeta,
   activeCell,
   onActivateCell,
   onDeactivateCell,
 }: {
   row: ReturnType<ReturnType<typeof useReactTable>["getRowModel"]>["rows"][0];
   index: number;
+  columnMeta: QueryResult["columnMeta"];
   activeCell: { rowIndex: number; columnId: string } | null;
   onActivateCell: (rowIndex: number, columnId: string) => void;
   onDeactivateCell: () => void;
@@ -452,6 +462,13 @@ const VirtualRow = React.memo(function VirtualRow({
         const isEditing =
           activeCell?.rowIndex === index &&
           activeCell.columnId === cell.column.id;
+        const columnIndex = Number.parseInt(
+          cell.column.id.replace("__col_", ""),
+          10,
+        );
+        const category = Number.isNaN(columnIndex)
+          ? undefined
+          : (columnMeta[columnIndex]?.category ?? undefined);
         return (
           <td
             key={cell.id}
@@ -475,6 +492,7 @@ const VirtualRow = React.memo(function VirtualRow({
             {isEditing ? (
               <EditInput
                 initial={valueToEditString(raw)}
+                category={category}
                 nullable
                 readOnly
                 onCommit={onDeactivateCell}
