@@ -8,6 +8,7 @@ vitest.config.ts
 vitest.workspace.ts
 tests/
 dist/*.tsbuildinfo
+logs
 
 # Dev environment
 .vscode/

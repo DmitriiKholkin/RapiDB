@@ -339,8 +339,11 @@ describe("TableView", () => {
       expect(screen.getByRole("table")).toBeTruthy();
     });
 
-    expect(screen.getByTitle("Primary Key")).toBeTruthy();
-    expect(screen.getByTitle("Foreign Key")).toBeTruthy();
+    const pkHeader = screen.getByText("id").closest("th");
+    const fkHeader = screen.getByText("role_id").closest("th");
+
+    expect(pkHeader?.querySelectorAll(".codicon-key")).toHaveLength(1);
+    expect(fkHeader?.querySelectorAll(".codicon-key")).toHaveLength(1);
   });
 
   it("shows column detail tooltip on header hover text", async () => {

@@ -2,14 +2,14 @@
 
 <br/>
 
-<img src="media/img-market-6.png" alt="RapiDB" width="100%"/>
+<img src="media/img-market-6.png" alt="RapiDB" width="100%" />
 
 <br/>
 <br/>
 
 # RapiDB — Database Client for VS Code
 
-### PostgreSQL · MySQL · MSSQL · SQLite · MariaDB · Oracle
+### PostgreSQL · MSSQL · MySQL · MariaDB · SQLite · Oracle
 #### All in one place. Never leaving your editor.
 
 <br/>
@@ -49,23 +49,31 @@ Your database lives in the sidebar — same window, same shortcuts, same theme.
 
 ### 🔌 Connect to anything
 
-PostgreSQL, MySQL, MS SQL Server, SQLite, MariaDB, Oracle — all supported out of the box. SSL, self-signed certs, Oracle service names and Thick Mode with Instant Client, connection folders to keep things organized.
+PostgreSQL, MS SQL Server, MySQL, MariaDB, SQLite, Oracle — all supported out of the box. SSL, self-signed certs, Oracle service names and Thick Mode with Instant Client, connection folders to keep things organized.
 
-<img src="media/img-market-3.png" alt="Connection Form" width="600"/>
+<img src="media/img-market-3.png" alt="Connection Form" width="100%" />
 
 <br/>
 
 ### 🌲 Browse your schema without a single query
 
-The **Database Explorer** tree expands into databases → schemas → tables, views, functions, and stored procedures. Right-click any table to grab its name, open the data viewer, inspect the schema, or pull the DDL — no typing required.
+Saved connections can be grouped into folders, and each connection expands into databases → schemas → tables, views, materialized views, functions, procedures, sequences, and types. Right-click any object to copy its name, inspect columns with PK/FK badges, constraints, indexes, and triggers, open the data viewer where it applies, or pull the DDL / definition — no typing required.
 
-<img src="media/img-market-5.png" width="320" alt="Database Explorer tree" />
+<img src="media/img-market-5.png" alt="Database Explorer tree" width="250" />
 
 <br/>
 
 ### 🗂️ Query History & Bookmarks
 
 Every query you run lands in **Query History** — click any entry to reopen it in the editor. Queries you want to keep forever go into **Bookmarks** with a single press. Query History limit is configurable.
+
+<br/>
+
+### 🧩 ERD with foreign key links
+
+Open ERD from a database or schema node to visualize tables and the foreign key relationships between them. The diagram is built from live schema metadata, so it stays aligned with the current database snapshot.
+
+<img src="media/img-market-4.png" alt="Database Explorer tree" width="100%" />
 
 <br/>
 
@@ -78,7 +86,7 @@ The query editor runs on **Monaco** — the same engine as VS Code itself. You g
 - ⌨️ `Ctrl+Enter` / `F5` to run · Select a fragment to run just that part
 - ↕️ Drag the divider to resize editor vs results
 
-<img src="media/img-market-2.png" alt="SQL Editor with results" width="700"/>
+<img src="media/img-market-2.png" alt="SQL Editor with results" width="700" />
 
 <br/>
 
@@ -102,25 +110,15 @@ Click any table → the **Table Data Viewer** opens:
 | Feature | Detail |
 |---|---|
 | Pagination | 25 / 100 / 500 / 1000 rows per page |
-| Filtering | Per-column filters |
+| Filtering | Draft-aware per-column filters |
 | Inline editing | Click a cell → type → Enter |
-| New rows | Insert bar at the bottom |
+| New rows | Insert bar at the top |
 | Deletion | Select rows and delete |
 | Safety | Preview-first apply flow with verification; transactional where applicable |
 
 <br/>
 
-<img src="media/img-market-1.png" alt="Table Data Viewer" width="700"/>
-
-<br/>
-
-### 🔍 Schema inspector
-
-Right-click → **Open Schema** to see every column with its type, nullability, default value, and PK / FK badges. Indexes and foreign keys get their own sections.
-
-Everything you'd normally Google `information_schema` for — **one click away**.
-
-<img src="media/img-market-4.png" alt="Schema Inspector" width="700"/>
+<img src="media/img-market-1.png" alt="Table Data Viewer" width="700" />
 
 <br/>
 
@@ -130,6 +128,9 @@ Everything you'd normally Google `information_schema` for — **one click away**
 
 | Setting | Default | What it does |
 |---|---|---|
+| `rapidb.connections` | `[]` | Saved connections, including folders and other data |
+| `rapidb.connectionTimeoutSeconds` | `15` | Timeout for establishing a database connection |
+| `rapidb.dbOperationTimeoutSeconds` | `180` | Timeout for queries, metadata, DDL, and routine loading |
 | `rapidb.queryRowLimit` | `10 000` | Cap on rows returned per query (100–100 000) |
 | `rapidb.queryHistoryLimit` | `100` | How many past queries to remember |
 | `rapidb.defaultPageSize` | `25` | Default rows per page in the Table Data Viewer |
@@ -167,6 +168,7 @@ Everything you'd normally Google `information_schema` for — **one click away**
 |---|---|
 | Extension host | TypeScript, VS Code Extension API |
 | Webview UI | React 19, Monaco Editor, TanStack Table, TanStack Virtual, Zustand |
+| ERD | `@xyflow/react`, `@dagrejs/dagre` |
 | SQL formatting | sql-formatter |
 | DB drivers | `pg`, `mysql2`, `mssql`, `oracledb`, `node-sqlite3-wasm` |
 | Bundler | esbuild |
