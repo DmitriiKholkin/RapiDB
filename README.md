@@ -86,7 +86,7 @@ The query editor runs on **Monaco** — the same engine as VS Code itself. You g
 - ⌨️ `Ctrl+Enter` / `F5` to run · Select a fragment to run just that part
 - ↕️ Drag the divider to resize editor vs results
 
-<img src="media/img-market-2.png" alt="SQL Editor with results" width="700" />
+<img src="media/img-market-2.png" alt="SQL Editor with results" width="100%" />
 
 <br/>
 
@@ -118,7 +118,7 @@ Click any table → the **Table Data Viewer** opens:
 
 <br/>
 
-<img src="media/img-market-1.png" alt="Table Data Viewer" width="700" />
+<img src="media/img-market-1.png" alt="Table Data Viewer" width="100%" />
 
 <br/>
 
