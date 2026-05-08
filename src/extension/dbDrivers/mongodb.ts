@@ -14,6 +14,7 @@ import type {
   ColumnTypeMeta,
   DatabaseInfo,
   DriverDeleteRowsRequest,
+  DriverEntityManifest,
   DriverInsertRowRequest,
   DriverMutationResult,
   DriverTablePageRequest,
@@ -30,6 +31,16 @@ import type {
   TransactionOperation,
   TriggerMeta,
 } from "./types";
+
+const MONGODB_ENTITY_MANIFEST: DriverEntityManifest = {
+  dbObjectKinds: ["table"],
+  tableSections: {
+    columns: "supported",
+    constraints: "not_applicable",
+    indexes: "supported",
+    triggers: "not_applicable",
+  },
+};
 
 export class MongoDBDriver implements IDBDriver {
   private client: MongoClient | null = null;
@@ -62,6 +73,10 @@ export class MongoDBDriver implements IDBDriver {
 
   isConnected(): boolean {
     return this.connected;
+  }
+
+  getEntityManifest(): DriverEntityManifest {
+    return MONGODB_ENTITY_MANIFEST;
   }
 
   getCapabilities() {

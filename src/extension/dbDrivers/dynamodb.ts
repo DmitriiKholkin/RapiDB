@@ -26,6 +26,7 @@ import type {
   ColumnTypeMeta,
   DatabaseInfo,
   DriverDeleteRowsRequest,
+  DriverEntityManifest,
   DriverInsertRowRequest,
   DriverMutationResult,
   DriverTablePageRequest,
@@ -42,6 +43,16 @@ import type {
   TransactionOperation,
   TriggerMeta,
 } from "./types";
+
+const DYNAMODB_ENTITY_MANIFEST: DriverEntityManifest = {
+  dbObjectKinds: ["table"],
+  tableSections: {
+    columns: "supported",
+    constraints: "not_applicable",
+    indexes: "supported",
+    triggers: "not_applicable",
+  },
+};
 
 export class DynamoDBDriver implements IDBDriver {
   private client: DynamoDBClient | null = null;
@@ -86,6 +97,10 @@ export class DynamoDBDriver implements IDBDriver {
 
   isConnected(): boolean {
     return this.connected;
+  }
+
+  getEntityManifest(): DriverEntityManifest {
+    return DYNAMODB_ENTITY_MANIFEST;
   }
 
   getCapabilities() {
@@ -135,19 +150,22 @@ export class DynamoDBDriver implements IDBDriver {
       this.getTableSchema(table),
     ]);
     const columns = inferColumnsFromRows(rows, keys[0] ?? "id");
-    return columns.map((column) => ({
-      name: column.name,
-      type: attrTypes.has(column.name)
-        ? this.dynamoAttrTypeToNative(attrTypes.get(column.name)!)
-        : column.nativeType,
-      nullable: !keys.includes(column.name),
-      defaultValue: undefined,
-      isPrimaryKey: keys.includes(column.name),
-      primaryKeyOrdinal: keys.includes(column.name)
-        ? keys.indexOf(column.name) + 1
-        : undefined,
-      isForeignKey: false,
-    }));
+    return columns.map((column) => {
+      const attrType = attrTypes.get(column.name);
+      return {
+        name: column.name,
+        type: attrType
+          ? this.dynamoAttrTypeToNative(attrType)
+          : column.nativeType,
+        nullable: !keys.includes(column.name),
+        defaultValue: undefined,
+        isPrimaryKey: keys.includes(column.name),
+        primaryKeyOrdinal: keys.includes(column.name)
+          ? keys.indexOf(column.name) + 1
+          : undefined,
+        isForeignKey: false,
+      };
+    });
   }
 
   async describeColumns(
@@ -161,8 +179,9 @@ export class DynamoDBDriver implements IDBDriver {
     ]);
     const columns = inferColumnsFromRows(rows, keys[0] ?? "id");
     return columns.map((column) => {
-      const nativeType = attrTypes.has(column.name)
-        ? this.dynamoAttrTypeToNative(attrTypes.get(column.name)!)
+      const attrType = attrTypes.get(column.name);
+      const nativeType = attrType
+        ? this.dynamoAttrTypeToNative(attrType)
         : column.nativeType;
       return {
         ...column,

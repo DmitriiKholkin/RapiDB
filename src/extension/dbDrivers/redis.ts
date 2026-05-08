@@ -14,6 +14,7 @@ import type {
   ColumnTypeMeta,
   DatabaseInfo,
   DriverDeleteRowsRequest,
+  DriverEntityManifest,
   DriverInsertRowRequest,
   DriverMutationResult,
   DriverTablePageRequest,
@@ -30,6 +31,16 @@ import type {
   TransactionOperation,
   TriggerMeta,
 } from "./types";
+
+const REDIS_ENTITY_MANIFEST: DriverEntityManifest = {
+  dbObjectKinds: ["table"],
+  tableSections: {
+    columns: "supported",
+    constraints: "not_applicable",
+    indexes: "not_applicable",
+    triggers: "not_applicable",
+  },
+};
 
 export class RedisDriver implements IDBDriver {
   private client: ReturnType<typeof createClient> | null = null;
@@ -77,6 +88,10 @@ export class RedisDriver implements IDBDriver {
 
   isConnected(): boolean {
     return this.connected;
+  }
+
+  getEntityManifest(): DriverEntityManifest {
+    return REDIS_ENTITY_MANIFEST;
   }
 
   getCapabilities() {

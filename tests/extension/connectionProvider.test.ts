@@ -1080,4 +1080,137 @@ describe("ConnectionProvider", () => {
       table: "users",
     });
   });
+
+  it("filters schema category nodes using the driver entity manifest from manager", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-1", name: "Primary", type: "mysql" },
+      ]),
+      isConnected: vi.fn((id: string) => id === "conn-1"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "app_db",
+              schemas: [
+                {
+                  name: "app_db",
+                  objects: [
+                    { name: "users", type: "table", columns: [] },
+                    { name: "active_users", type: "view", columns: [] },
+                    {
+                      name: "daily_users",
+                      type: "materializedView",
+                      columns: [],
+                    },
+                    { name: "users_total", type: "function", columns: [] },
+                    { name: "refresh_users", type: "procedure", columns: [] },
+                    { name: "users_seq", type: "sequence", columns: [] },
+                    { name: "user_status", type: "type", columns: [] },
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      getDriverEntityManifest: vi.fn(() => ({
+        dbObjectKinds: ["table", "view"],
+        tableSections: {
+          columns: "supported",
+          constraints: "supported",
+          indexes: "supported",
+          triggers: "supported",
+        },
+      })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+
+    const roots = await provider.getChildren();
+    const databases = await provider.getChildren(roots[0]);
+    const categories = await provider.getChildren(databases[0]);
+
+    expect(categories.map((node) => node.label)).toEqual(["Tables", "Views"]);
+    expect(connectionManager.getDriverEntityManifest).toHaveBeenCalledWith(
+      "conn-1",
+    );
+  });
+
+  it("hides non-applicable table sections", async () => {
+    const ensureTableDetailLoading = vi.fn();
+    const getTableDetailState = vi.fn(() => loadedTableDetailState());
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-1", name: "Primary", type: "redis" },
+      ]),
+      isConnected: vi.fn((id: string) => id === "conn-1"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      ensureTableDetailLoading,
+      getTableDetailState,
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "app_db",
+              schemas: [
+                {
+                  name: "app_db",
+                  objects: [{ name: "users", type: "table", columns: [] }],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      getDriverEntityManifest: vi.fn(() => ({
+        dbObjectKinds: ["table"],
+        tableSections: {
+          columns: "supported",
+          constraints: "not_applicable",
+          indexes: "not_applicable",
+          triggers: "not_applicable",
+        },
+      })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+
+    const roots = await provider.getChildren();
+    const databases = await provider.getChildren(roots[0]);
+    const categories = await provider.getChildren(databases[0]);
+    const tableNode = (await provider.getChildren(categories[0]))[0];
+    const sections = await provider.getChildren(tableNode);
+
+    expect(sections.map((node) => node.label)).toEqual(["Columns"]);
+    expect(ensureTableDetailLoading).toHaveBeenCalled();
+    expect(getTableDetailState).toHaveBeenCalled();
+  });
 });

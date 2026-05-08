@@ -14,6 +14,7 @@ import type {
   ColumnTypeMeta,
   DatabaseInfo,
   DriverDeleteRowsRequest,
+  DriverEntityManifest,
   DriverInsertRowRequest,
   DriverMutationResult,
   DriverTablePageRequest,
@@ -30,6 +31,16 @@ import type {
   TransactionOperation,
   TriggerMeta,
 } from "./types";
+
+const ELASTICSEARCH_ENTITY_MANIFEST: DriverEntityManifest = {
+  dbObjectKinds: ["table"],
+  tableSections: {
+    columns: "supported",
+    constraints: "not_applicable",
+    indexes: "supported",
+    triggers: "not_applicable",
+  },
+};
 
 export class ElasticsearchDriver implements IDBDriver {
   private client: Client | null = null;
@@ -80,6 +91,10 @@ export class ElasticsearchDriver implements IDBDriver {
 
   isConnected(): boolean {
     return this.connected;
+  }
+
+  getEntityManifest(): DriverEntityManifest {
+    return ELASTICSEARCH_ENTITY_MANIFEST;
   }
 
   getCapabilities() {

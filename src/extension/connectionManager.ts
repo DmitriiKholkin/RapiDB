@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
-import { isDataDbObjectKind, isDbObjectKind } from "../shared/dbObjectKinds";
+import { isDataDbObjectKind } from "../shared/dbObjectKinds";
 import {
   type BookmarkEntry,
   type ConnectAttempt,
@@ -39,7 +39,12 @@ import { PostgresDriver } from "./dbDrivers/postgres";
 import { RedisDriver } from "./dbDrivers/redis";
 import { SQLiteDriver } from "./dbDrivers/sqlite";
 import { createTimeoutAwareDriver } from "./dbDrivers/timeout";
-import type { IDBDriver } from "./dbDrivers/types";
+import {
+  DEFAULT_DRIVER_ENTITY_MANIFEST,
+  type DriverEntityAvailability,
+  type DriverEntityManifest,
+  type IDBDriver,
+} from "./dbDrivers/types";
 import { pMapWithLimit } from "./utils/concurrency";
 import { normalizeUnknownError } from "./utils/errorHandling";
 
@@ -145,6 +150,12 @@ function isConnectionRootScope(scope?: ExplorerSchemaScope): boolean {
   return !scope || scope.kind === "connectionRoot";
 }
 
+function resolveDriverEntityManifest(
+  driver: IDBDriver | undefined,
+): DriverEntityManifest {
+  return driver?.getEntityManifest?.() ?? DEFAULT_DRIVER_ENTITY_MANIFEST;
+}
+
 function createEmptySchemaSnapshot(): SchemaSnapshot {
   return { databases: [] };
 }
@@ -214,7 +225,6 @@ function cloneTableStructureSnapshot(
     columns: {
       status: snapshot.columns.status,
       items: snapshot.columns.items.map((column) => ({ ...column })),
-      unsupported: snapshot.columns.unsupported,
       error: snapshot.columns.error,
     },
     constraints: {
@@ -226,7 +236,6 @@ function cloneTableStructureSnapshot(
           ? [...constraint.referencedColumns]
           : undefined,
       })),
-      unsupported: snapshot.constraints.unsupported,
       error: snapshot.constraints.error,
     },
     indexes: {
@@ -235,7 +244,6 @@ function cloneTableStructureSnapshot(
         ...index,
         columns: [...index.columns],
       })),
-      unsupported: snapshot.indexes.unsupported,
       error: snapshot.indexes.error,
     },
     triggers: {
@@ -244,7 +252,6 @@ function cloneTableStructureSnapshot(
         ...trigger,
         events: [...trigger.events],
       })),
-      unsupported: snapshot.triggers.unsupported,
       error: snapshot.triggers.error,
     },
   };
@@ -870,6 +877,10 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
   }
   getDriver(id: string): IDBDriver | undefined {
     return this.driverMap.get(id);
+  }
+
+  getDriverEntityManifest(connectionId: string): DriverEntityManifest {
+    return resolveDriverEntityManifest(this.getDriver(connectionId));
   }
   getSchema(connectionId: string): SchemaObjectEntry[] {
     return flattenSchemaSnapshot(this.getSchemaSnapshot(connectionId));
@@ -1860,11 +1871,13 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
     databaseName: string,
     schemaName: string,
   ): Promise<SchemaSnapshotSchemaEntry> {
+    const manifest = resolveDriverEntityManifest(driver);
+    const supportedKinds = new Set(manifest.dbObjectKinds);
     const objects = await driver
       .listObjects(databaseName, schemaName)
       .catch(() => []);
     const objectsForSchema = objects.filter((object) =>
-      isDbObjectKind(object.type),
+      supportedKinds.has(object.type),
     );
     const describedColumns = await pMapWithLimit(
       objectsForSchema,
@@ -1909,69 +1922,64 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
   ): Promise<
     Pick<TableDetailState, "snapshot" | "status" | "isPartial" | "error">
   > {
-    const results = await Promise.allSettled([
-      driver.describeColumns(request.database, request.schema, request.table),
-      driver.getConstraints(request.database, request.schema, request.table),
-      driver.getIndexes(request.database, request.schema, request.table),
-      driver.getTriggers(request.database, request.schema, request.table),
+    const manifest = resolveDriverEntityManifest(driver);
+
+    const loadSection = async <T>(
+      availability: DriverEntityAvailability,
+      loader: () => Promise<T[] | null>,
+    ): Promise<{
+      status: SchemaLoadStatus;
+      items: T[];
+      error?: string;
+    }> => {
+      if (availability === "not_applicable") {
+        return {
+          status: "loaded",
+          items: [],
+        };
+      }
+
+      try {
+        const items = await loader();
+        if (items === null) {
+          return {
+            status: "loaded",
+            items: [],
+          };
+        }
+        return {
+          status: "loaded",
+          items,
+        };
+      } catch (error: unknown) {
+        return {
+          status: "error",
+          items: [],
+          error: normalizeUnknownError(error).message,
+        };
+      }
+    };
+
+    const [columns, constraints, indexes, triggers] = await Promise.all([
+      loadSection(manifest.tableSections.columns, async () =>
+        driver.describeColumns(request.database, request.schema, request.table),
+      ),
+      loadSection(manifest.tableSections.constraints, async () =>
+        driver.getConstraints(request.database, request.schema, request.table),
+      ),
+      loadSection(manifest.tableSections.indexes, async () =>
+        driver.getIndexes(request.database, request.schema, request.table),
+      ),
+      loadSection(manifest.tableSections.triggers, async () =>
+        driver.getTriggers(request.database, request.schema, request.table),
+      ),
     ]);
 
-    const columnsResult = results[0];
-    const constraintsResult = results[1];
-    const indexesResult = results[2];
-    const triggersResult = results[3];
-
     const snapshot: TableStructureSnapshot = {
-      columns:
-        columnsResult.status === "fulfilled"
-          ? {
-              status: "loaded",
-              items: columnsResult.value,
-            }
-          : {
-              status: "error",
-              items: [],
-              error: normalizeUnknownError(columnsResult.reason).message,
-            },
-      constraints:
-        constraintsResult.status === "fulfilled"
-          ? {
-              status: "loaded",
-              items: constraintsResult.value,
-            }
-          : {
-              status: "error",
-              items: [],
-              error: normalizeUnknownError(constraintsResult.reason).message,
-            },
-      indexes:
-        indexesResult.status === "fulfilled"
-          ? {
-              status: "loaded",
-              items: indexesResult.value,
-            }
-          : {
-              status: "error",
-              items: [],
-              error: normalizeUnknownError(indexesResult.reason).message,
-            },
-      triggers:
-        triggersResult.status === "fulfilled"
-          ? triggersResult.value === null
-            ? {
-                status: "loaded",
-                items: [],
-                unsupported: true,
-              }
-            : {
-                status: "loaded",
-                items: triggersResult.value,
-              }
-          : {
-              status: "error",
-              items: [],
-              error: normalizeUnknownError(triggersResult.reason).message,
-            },
+      columns,
+      constraints,
+      indexes,
+      triggers,
     };
 
     const sectionStates = [

@@ -13,6 +13,7 @@ import type {
   ColumnMeta,
   ColumnTypeMeta,
   DatabaseInfo,
+  DriverEntityManifest,
   FilterConditionResult,
   FilterOperator,
   PaginationResult,
@@ -153,6 +154,16 @@ interface MssqlArrayColumnMeta {
 interface MssqlArrayResult extends mssql.IResult<unknown[]> {
   columns?: MssqlArrayColumnMeta[][];
 }
+
+const MSSQL_ENTITY_MANIFEST: DriverEntityManifest = {
+  dbObjectKinds: ["table", "view", "function", "procedure", "sequence", "type"],
+  tableSections: {
+    columns: "supported",
+    constraints: "supported",
+    indexes: "supported",
+    triggers: "supported",
+  },
+};
 
 function ensureTediousBufferLength(
   buf: Buffer,
@@ -839,6 +850,11 @@ export class MSSQLDriver extends BaseDBDriver {
   isConnected(): boolean {
     return this.pool?.connected ?? false;
   }
+
+  getEntityManifest(): DriverEntityManifest {
+    return MSSQL_ENTITY_MANIFEST;
+  }
+
   async listDatabases(): Promise<DatabaseInfo[]> {
     const res = await this.requirePool()
       .request()

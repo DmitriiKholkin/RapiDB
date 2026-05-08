@@ -12,6 +12,7 @@ import type {
   ColumnMeta,
   ColumnTypeMeta,
   DatabaseInfo,
+  DriverEntityManifest,
   FilterConditionResult,
   FilterOperator,
   ForeignKeyMeta,
@@ -26,6 +27,24 @@ import type {
   ValueSemantics,
 } from "./types";
 import { DATETIME_SQL_RE, ISO_DATETIME_RE, NULL_SENTINEL } from "./types";
+
+const POSTGRES_ENTITY_MANIFEST: DriverEntityManifest = {
+  dbObjectKinds: [
+    "table",
+    "view",
+    "materializedView",
+    "function",
+    "procedure",
+    "sequence",
+    "type",
+  ],
+  tableSections: {
+    columns: "supported",
+    constraints: "supported",
+    indexes: "supported",
+    triggers: "supported",
+  },
+};
 
 const PG_OID_DATE = 1082;
 const PG_OID_MONEY = 790;
@@ -272,6 +291,10 @@ export class PostgresDriver extends BaseDBDriver {
   }
   isConnected(): boolean {
     return this.pool !== null && this._connected;
+  }
+
+  getEntityManifest(): DriverEntityManifest {
+    return POSTGRES_ENTITY_MANIFEST;
   }
   async listDatabases(): Promise<DatabaseInfo[]> {
     try {

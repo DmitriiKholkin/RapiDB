@@ -2,6 +2,7 @@ import type {
   DbObjectKind,
   DdlOnlyDbObjectKind,
 } from "../../shared/dbObjectKinds";
+import { DB_OBJECT_KINDS } from "../../shared/dbObjectKinds";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -73,6 +74,31 @@ export interface DriverCapabilities {
   supportsMutations?: boolean;
 }
 
+export type DriverTableSectionKind =
+  | "columns"
+  | "constraints"
+  | "indexes"
+  | "triggers";
+
+export type DriverEntityAvailability = "supported" | "not_applicable";
+
+export interface DriverEntityManifest {
+  dbObjectKinds: readonly DbObjectKind[];
+  tableSections: Readonly<
+    Record<DriverTableSectionKind, DriverEntityAvailability>
+  >;
+}
+
+export const DEFAULT_DRIVER_ENTITY_MANIFEST: DriverEntityManifest = {
+  dbObjectKinds: DB_OBJECT_KINDS,
+  tableSections: {
+    columns: "supported",
+    constraints: "supported",
+    indexes: "supported",
+    triggers: "supported",
+  },
+};
+
 export interface DriverSortConfig {
   column: string;
   direction: "asc" | "desc";
@@ -138,6 +164,7 @@ export interface IDBDriver {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   isConnected(): boolean;
+  getEntityManifest?(): DriverEntityManifest;
   getCapabilities?(): DriverCapabilities;
   listDatabases(): Promise<DatabaseInfo[]>;
   listSchemas(database: string): Promise<SchemaInfo[]>;

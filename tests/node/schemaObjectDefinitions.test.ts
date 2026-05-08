@@ -1,8 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
+import { DynamoDBDriver } from "../../src/extension/dbDrivers/dynamodb";
+import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
+import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
 import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
 import { OracleDriver } from "../../src/extension/dbDrivers/oracle";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
+import { RedisDriver } from "../../src/extension/dbDrivers/redis";
 import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
@@ -55,6 +59,39 @@ const sqliteConfig = {
   name: "SQLite Schema Objects",
   type: "sqlite",
   filePath: "/tmp/rapidb-schema-object-definitions.sqlite",
+} as const satisfies Partial<ConnectionConfig>;
+
+const mongodbConfig = {
+  id: "mongodb-schema-object-definitions",
+  name: "MongoDB Schema Objects",
+  type: "mongodb",
+  host: "127.0.0.1",
+  port: 27017,
+  database: "rapidb",
+} as const satisfies Partial<ConnectionConfig>;
+
+const dynamodbConfig = {
+  id: "dynamodb-schema-object-definitions",
+  name: "DynamoDB Schema Objects",
+  type: "dynamodb",
+  region: "us-east-1",
+} as const satisfies Partial<ConnectionConfig>;
+
+const elasticsearchConfig = {
+  id: "elasticsearch-schema-object-definitions",
+  name: "Elasticsearch Schema Objects",
+  type: "elasticsearch",
+  host: "127.0.0.1",
+  port: 9200,
+  database: "rapidb",
+} as const satisfies Partial<ConnectionConfig>;
+
+const redisConfig = {
+  id: "redis-schema-object-definitions",
+  name: "Redis Schema Objects",
+  type: "redis",
+  host: "127.0.0.1",
+  port: 6379,
 } as const satisfies Partial<ConnectionConfig>;
 
 describe("schema object definitions", () => {
@@ -439,5 +476,144 @@ describe("schema object definitions", () => {
     ).resolves.toBe(
       'CREATE TYPE "APP"."USER_STATUS" AS OBJECT (STATUS VARCHAR2(32));',
     );
+  });
+
+  it("declares driver-specific entity manifests for all supported drivers", () => {
+    const manifests = {
+      mssql: new MSSQLDriver(
+        mssqlConfig as ConnectionConfig,
+      ).getEntityManifest(),
+      mysql: new MySQLDriver(
+        mysqlConfig as ConnectionConfig,
+      ).getEntityManifest(),
+      postgres: new PostgresDriver(
+        postgresConfig as ConnectionConfig,
+      ).getEntityManifest(),
+      sqlite: new SQLiteDriver(
+        sqliteConfig as ConnectionConfig,
+      ).getEntityManifest(),
+      oracle: new OracleDriver(
+        oracleConfig as ConnectionConfig,
+      ).getEntityManifest(),
+      mongodb: new MongoDBDriver(
+        mongodbConfig as ConnectionConfig,
+      ).getEntityManifest(),
+      dynamodb: new DynamoDBDriver(
+        dynamodbConfig as ConnectionConfig,
+      ).getEntityManifest(),
+      elasticsearch: new ElasticsearchDriver(
+        elasticsearchConfig as ConnectionConfig,
+      ).getEntityManifest(),
+      redis: new RedisDriver(
+        redisConfig as ConnectionConfig,
+      ).getEntityManifest(),
+    };
+
+    expect(manifests).toEqual({
+      mssql: {
+        dbObjectKinds: [
+          "table",
+          "view",
+          "function",
+          "procedure",
+          "sequence",
+          "type",
+        ],
+        tableSections: {
+          columns: "supported",
+          constraints: "supported",
+          indexes: "supported",
+          triggers: "supported",
+        },
+      },
+      mysql: {
+        dbObjectKinds: ["table", "view", "function", "procedure"],
+        tableSections: {
+          columns: "supported",
+          constraints: "supported",
+          indexes: "supported",
+          triggers: "supported",
+        },
+      },
+      postgres: {
+        dbObjectKinds: [
+          "table",
+          "view",
+          "materializedView",
+          "function",
+          "procedure",
+          "sequence",
+          "type",
+        ],
+        tableSections: {
+          columns: "supported",
+          constraints: "supported",
+          indexes: "supported",
+          triggers: "supported",
+        },
+      },
+      sqlite: {
+        dbObjectKinds: ["table", "view"],
+        tableSections: {
+          columns: "supported",
+          constraints: "supported",
+          indexes: "supported",
+          triggers: "supported",
+        },
+      },
+      oracle: {
+        dbObjectKinds: [
+          "table",
+          "view",
+          "materializedView",
+          "function",
+          "procedure",
+          "sequence",
+          "type",
+        ],
+        tableSections: {
+          columns: "supported",
+          constraints: "supported",
+          indexes: "supported",
+          triggers: "supported",
+        },
+      },
+      mongodb: {
+        dbObjectKinds: ["table"],
+        tableSections: {
+          columns: "supported",
+          constraints: "not_applicable",
+          indexes: "supported",
+          triggers: "not_applicable",
+        },
+      },
+      dynamodb: {
+        dbObjectKinds: ["table"],
+        tableSections: {
+          columns: "supported",
+          constraints: "not_applicable",
+          indexes: "supported",
+          triggers: "not_applicable",
+        },
+      },
+      elasticsearch: {
+        dbObjectKinds: ["table"],
+        tableSections: {
+          columns: "supported",
+          constraints: "not_applicable",
+          indexes: "supported",
+          triggers: "not_applicable",
+        },
+      },
+      redis: {
+        dbObjectKinds: ["table"],
+        tableSections: {
+          columns: "supported",
+          constraints: "not_applicable",
+          indexes: "not_applicable",
+          triggers: "not_applicable",
+        },
+      },
+    });
   });
 });
