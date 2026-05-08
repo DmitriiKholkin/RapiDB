@@ -21,6 +21,9 @@ describe("ConnectionFormView", () => {
 
     render(<ConnectionFormView existing={null} />);
 
+    expect(
+      screen.getByRole("button", { name: /mysql \/ mariadb/i }),
+    ).toBeTruthy();
     expect(screen.getByLabelText("Host")).toBeTruthy();
     expect(screen.queryByLabelText("Database file path")).toBeNull();
 
