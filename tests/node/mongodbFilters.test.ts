@@ -53,6 +53,7 @@ const rows: Row[] = [
 
 function createDriverWithRows(sampleRows: Row[]): MongoDBDriver {
   const driver = new MongoDBDriver({
+    id: "mongodb-filter-coverage",
     type: "mongodb",
     name: "mongo-filter-test",
     host: "localhost",

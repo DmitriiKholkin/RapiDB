@@ -74,7 +74,7 @@ const dynamodbConfig = {
   id: "dynamodb-schema-object-definitions",
   name: "DynamoDB Schema Objects",
   type: "dynamodb",
-  region: "us-east-1",
+  awsRegion: "us-east-1",
 } as const satisfies Partial<ConnectionConfig>;
 
 const elasticsearchConfig = {

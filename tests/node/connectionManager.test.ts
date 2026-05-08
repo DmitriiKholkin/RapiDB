@@ -11,6 +11,7 @@ import type {
   TableInfo,
   TriggerMeta,
 } from "../../src/extension/dbDrivers/types";
+import { DEFAULT_DRIVER_ENTITY_MANIFEST } from "../../src/extension/dbDrivers/types";
 import {
   createExtensionContextStub,
   FakeConnectionManagerStore,
@@ -159,8 +160,11 @@ class FakeDriver implements IDBDriver {
     return this.connected;
   }
 
-  getEntityManifest(): DriverEntityManifest | undefined {
-    return driverBehaviors.get(this.config.id)?.entityManifest;
+  getEntityManifest(): DriverEntityManifest {
+    return (
+      driverBehaviors.get(this.config.id)?.entityManifest ??
+      DEFAULT_DRIVER_ENTITY_MANIFEST
+    );
   }
 
   async listDatabases() {
