@@ -1,4 +1,9 @@
 services:
+
+  # ─────────────────────────────────────────────
+  # PostgreSQL
+  # ─────────────────────────────────────────────
+
   postgres:
     image: postgres:15-alpine
     container_name: rapidb-pg
@@ -14,6 +19,10 @@ services:
       timeout: 5s
       retries: 20
       start_period: 5s
+
+  # ─────────────────────────────────────────────
+  # MySQL
+  # ─────────────────────────────────────────────
 
   mysql:
     image: mysql:8.0
@@ -32,6 +41,10 @@ services:
       retries: 24
       start_period: 20s
 
+  # ─────────────────────────────────────────────
+  # MSSQL
+  # ─────────────────────────────────────────────
+
   mssql:
     image: mcr.microsoft.com/azure-sql-edge:latest
     container_name: rapidb-mssql
@@ -46,6 +59,10 @@ services:
       timeout: 5s
       retries: 30
       start_period: 40s
+
+  # ─────────────────────────────────────────────
+  # Oracle
+  # ─────────────────────────────────────────────
 
   oracle:
     image: gvenzl/oracle-free:latest
@@ -62,3 +79,263 @@ services:
       timeout: 10s
       retries: 24
       start_period: 120s
+
+  # ─────────────────────────────────────────────
+  # MongoDB
+  # ─────────────────────────────────────────────
+
+  mongo:
+    image: mongo:7
+    container_name: rapidb-mongo
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: mongo_admin
+      MONGO_INITDB_ROOT_PASSWORD: mongo_pass123
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: [ "CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok" ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  mongo-seed:
+    image: mongo:7
+    container_name: rapidb-mongo-seed
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: on-failure
+    entrypoint: [ "mongosh", "mongodb://mongo_admin:mongo_pass123@mongo:27017/admin" ]
+    command:
+      - --eval
+      - |
+        db.getSiblingDB("rapidb_mongo_db").createUser({
+          user: "mongo_user",
+          pwd:  "mongo_pass123",
+          roles: [{ role: "readWrite", db: "rapidb_mongo_db" }]
+        });
+
+        const mdb = db.getSiblingDB("rapidb_mongo_db");
+
+        mdb.users.insertMany([
+          { name: "Alice", email: "alice@example.com", age: 30,
+            tags: ["admin","beta"], address: { city: "Berlin",    country: "DE" }, createdAt: new Date() },
+          { name: "Bob",   email: "bob@example.com",   age: 25,
+            tags: ["user"],          address: { city: "Amsterdam", country: "NL" }, createdAt: new Date() },
+          { name: "Carol", email: "carol@example.com", age: 35,
+            tags: ["user","beta"],   address: { city: "Paris",     country: "FR" }, createdAt: new Date() }
+        ]);
+        mdb.users.createIndex({ email: 1 }, { unique: true });
+
+        mdb.products.insertMany([
+          { sku: "PROD-001", name: "Widget A", price: 9.99,  stock: 100, active: true  },
+          { sku: "PROD-002", name: "Widget B", price: 19.99, stock: 0,   active: false }
+        ]);
+
+        print("MongoDB seed done.");
+
+  # ─────────────────────────────────────────────
+  # Redis
+  # ─────────────────────────────────────────────
+
+  redis:
+    image: redis:7-alpine
+    container_name: rapidb-redis
+    command: >
+      redis-server --requirepass redis_pass123 --appendonly yes --loglevel warning
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "redis_pass123", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  redis-seed:
+    image: redis:7-alpine
+    container_name: rapidb-redis-seed
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: on-failure
+    entrypoint: [ "/bin/sh", "-c" ]
+    command:
+      - |
+        cli="redis-cli -h redis -a redis_pass123"
+
+        $cli SET  "session:abc123" '{"userId":"1","role":"admin"}'
+        $cli EXPIRE "session:abc123" 3600
+
+        $cli HSET "user:1" name Alice  email alice@example.com age 30
+        $cli HSET "user:2" name Bob    email bob@example.com   age 25
+        $cli HSET "user:3" name Carol  email carol@example.com age 35
+
+        $cli RPUSH "queue:tasks" '{"type":"email","to":"alice@example.com"}'
+        $cli RPUSH "queue:tasks" '{"type":"email","to":"bob@example.com"}'
+
+        $cli ZADD "leaderboard" 1500 alice 1200 bob 900 carol
+
+        $cli SET "config:app:theme" dark
+        $cli SET "config:app:lang"  en
+
+        echo "Redis seed done."
+
+  # ─────────────────────────────────────────────
+  # Elasticsearch
+  # ─────────────────────────────────────────────
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    container_name: rapidb-es
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - xpack.security.transport.ssl.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'" ]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  elasticsearch-seed:
+    image: curlimages/curl:latest
+    container_name: rapidb-es-seed
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: on-failure
+    entrypoint: [ "/bin/sh", "-c" ]
+    command:
+      - |
+        BASE="http://elasticsearch:9200"
+
+        echo "Creating index: users"
+        curl -sf -X PUT "$BASE/users" -H "Content-Type: application/json" -d '{
+          "mappings": {
+            "properties": {
+              "name":      { "type": "text",    "fields": { "keyword": { "type": "keyword" } } },
+              "email":     { "type": "keyword" },
+              "age":       { "type": "integer" },
+              "tags":      { "type": "keyword" },
+              "city":      { "type": "keyword" },
+              "createdAt": { "type": "date" }
+            }
+          }
+        }'
+
+        curl -sf -X POST "$BASE/users/_bulk" -H "Content-Type: application/x-ndjson" -d '
+        {"index":{}}
+        {"name":"Alice","email":"alice@example.com","age":30,"tags":["admin","beta"],"city":"Berlin","createdAt":"2024-01-01T00:00:00Z"}
+        {"index":{}}
+        {"name":"Bob","email":"bob@example.com","age":25,"tags":["user"],"city":"Amsterdam","createdAt":"2024-02-01T00:00:00Z"}
+        {"index":{}}
+        {"name":"Carol","email":"carol@example.com","age":35,"tags":["user","beta"],"city":"Paris","createdAt":"2024-03-01T00:00:00Z"}
+        '
+
+        echo "Creating index: products"
+        curl -sf -X PUT "$BASE/products" -H "Content-Type: application/json" -d '{
+          "mappings": {
+            "properties": {
+              "sku":    { "type": "keyword" },
+              "name":   { "type": "text", "fields": { "keyword": { "type": "keyword" } } },
+              "price":  { "type": "float" },
+              "stock":  { "type": "integer" },
+              "active": { "type": "boolean" }
+            }
+          }
+        }'
+
+        curl -sf -X POST "$BASE/products/_bulk" -H "Content-Type: application/x-ndjson" -d '
+        {"index":{}}
+        {"sku":"PROD-001","name":"Widget A","price":9.99,"stock":100,"active":true}
+        {"index":{}}
+        {"sku":"PROD-002","name":"Widget B","price":19.99,"stock":0,"active":false}
+        '
+
+        echo "Elasticsearch seed done."
+
+  # ─────────────────────────────────────────────
+  # DynamoDB Local
+  # ─────────────────────────────────────────────
+
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    container_name: rapidb-dynamodb
+    command: [ "-jar", "DynamoDBLocal.jar", "-sharedDb", "-dbPath", "/home/dynamodblocal/data" ]
+    ports:
+      - "8000:8000"
+    volumes:
+      - dynamodb_data:/home/dynamodblocal/data
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sf http://localhost:8000/shell/ | grep -q DynamoDB" ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  dynamodb-seed:
+    image: amazon/aws-cli:latest
+    container_name: rapidb-dynamodb-seed
+    depends_on:
+      dynamodb:
+        condition: service_healthy
+    restart: on-failure
+    environment:
+      AWS_ACCESS_KEY_ID: dummy
+      AWS_SECRET_ACCESS_KEY: dummy
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: [ "/bin/sh", "-c" ]
+    command:
+      - |
+        EP="--endpoint-url http://dynamodb:8000"
+
+        echo "Creating table Users..."
+        aws dynamodb create-table $EP \
+          --table-name Users \
+          --attribute-definitions \
+            AttributeName=userId,AttributeType=S \
+            AttributeName=email,AttributeType=S \
+          --key-schema \
+            AttributeName=userId,KeyType=HASH \
+          --global-secondary-indexes '[{
+            "IndexName":"email-index",
+            "KeySchema":[{"AttributeName":"email","KeyType":"HASH"}],
+            "Projection":{"ProjectionType":"ALL"},
+            "ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}
+          }]' \
+          --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5
+
+        echo "Creating table Products..."
+        aws dynamodb create-table $EP \
+          --table-name Products \
+          --attribute-definitions \
+            AttributeName=sku,AttributeType=S \
+          --key-schema \
+            AttributeName=sku,KeyType=HASH \
+          --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5
+
+        echo "Seeding Users..."
+        aws dynamodb put-item $EP --table-name Users \
+          --item '{"userId":{"S":"1"},"email":{"S":"alice@example.com"},"name":{"S":"Alice"},"age":{"N":"30"},"tags":{"L":[{"S":"admin"},{"S":"beta"}]}}'
+        aws dynamodb put-item $EP --table-name Users \
+          --item '{"userId":{"S":"2"},"email":{"S":"bob@example.com"},"name":{"S":"Bob"},"age":{"N":"25"},"tags":{"L":[{"S":"user"}]}}'
+        aws dynamodb put-item $EP --table-name Users \
+          --item '{"userId":{"S":"3"},"email":{"S":"carol@example.com"},"name":{"S":"Carol"},"age":{"N":"35"},"tags":{"L":[{"S":"user"},{"S":"beta"}]}}'
+
+        echo "Seeding Products..."
+        aws dynamodb put-item $EP --table-name Products \
+          --item '{"sku":{"S":"PROD-001"},"name":{"S":"Widget A"},"price":{"N":"9.99"},"stock":{"N":"100"},"active":{"BOOL":true}}'
+        aws dynamodb put-item $EP --table-name Products \
+          --item '{"sku":{"S":"PROD-002"},"name":{"S":"Widget B"},"price":{"N":"19.99"},"stock":{"N":"0"},"active":{"BOOL":false}}'
+
+        echo "DynamoDB seed done."
+
+volumes:
+  dynamodb_data:

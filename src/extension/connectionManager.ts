@@ -29,10 +29,14 @@ import {
   type ConnectionManagerStore,
   VSCodeConnectionManagerStore,
 } from "./connectionManagerStore";
+import { DynamoDBDriver } from "./dbDrivers/dynamodb";
+import { ElasticsearchDriver } from "./dbDrivers/elasticsearch";
+import { MongoDBDriver } from "./dbDrivers/mongodb";
 import { MSSQLDriver } from "./dbDrivers/mssql";
 import { MySQLDriver } from "./dbDrivers/mysql";
 import { OracleDriver } from "./dbDrivers/oracle";
 import { PostgresDriver } from "./dbDrivers/postgres";
+import { RedisDriver } from "./dbDrivers/redis";
 import { SQLiteDriver } from "./dbDrivers/sqlite";
 import { createTimeoutAwareDriver } from "./dbDrivers/timeout";
 import type { IDBDriver } from "./dbDrivers/types";
@@ -775,6 +779,14 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
           return new MSSQLDriver(config, timeoutSettingsProvider);
         case "oracle":
           return new OracleDriver(config, timeoutSettingsProvider);
+        case "mongodb":
+          return new MongoDBDriver(config);
+        case "redis":
+          return new RedisDriver(config);
+        case "elasticsearch":
+          return new ElasticsearchDriver(config);
+        case "dynamodb":
+          return new DynamoDBDriver(config);
         default: {
           const unknownType: never = config.type;
           throw new Error(`[RapiDB] Unknown driver type: ${unknownType}`);

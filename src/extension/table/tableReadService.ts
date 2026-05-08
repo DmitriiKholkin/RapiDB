@@ -50,6 +50,19 @@ export class TableReadService {
     skipCount = false,
   ): Promise<TablePage> {
     const { driver } = this.getConnectionDriver(connectionId);
+    if (driver.readTablePage) {
+      return driver.readTablePage({
+        database,
+        schema,
+        table,
+        page,
+        pageSize,
+        filters,
+        sort,
+        skipCount,
+      });
+    }
+
     const qualifiedTableName = driver.qualifiedTableName(
       database,
       schema,

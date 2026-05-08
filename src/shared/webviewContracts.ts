@@ -339,6 +339,30 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
     serviceName: readOptionalString(input, "serviceName"),
     thickMode: readOptionalBoolean(input, "thickMode"),
     clientPath: readOptionalString(input, "clientPath"),
+    connectionUri:
+      readOptionalString(input, "connectionUri") ??
+      readOptionalString(input, "uri"),
+    authDatabase:
+      readOptionalString(input, "authDatabase") ??
+      readOptionalString(input, "authSource"),
+    replicaSet: readOptionalString(input, "replicaSet"),
+    directConnection: readOptionalBoolean(input, "directConnection"),
+    redisUsername: readOptionalString(input, "redisUsername"),
+    keyPrefix: readOptionalString(input, "keyPrefix"),
+    awsProfile: readOptionalString(input, "awsProfile"),
+    endpoint:
+      readOptionalString(input, "endpoint") ??
+      readOptionalString(input, "awsEndpoint"),
+    apiKey: readOptionalString(input, "apiKey"),
+    cloudId: readOptionalString(input, "cloudId"),
+    uri: readOptionalString(input, "uri"),
+    authSource: readOptionalString(input, "authSource"),
+    redisDb: readOptionalNumber(input, "redisDb"),
+    awsRegion: readOptionalString(input, "awsRegion"),
+    awsAccessKeyId: readOptionalString(input, "awsAccessKeyId"),
+    awsSecretAccessKey: readOptionalString(input, "awsSecretAccessKey"),
+    awsSessionToken: readOptionalString(input, "awsSessionToken"),
+    awsEndpoint: readOptionalString(input, "awsEndpoint"),
     useSecretStorage: readOptionalBoolean(input, "useSecretStorage"),
   };
 }

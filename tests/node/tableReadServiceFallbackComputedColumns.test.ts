@@ -90,4 +90,64 @@ describe("TableReadService arithmetic overflow handling", () => {
 
     expect(query).toHaveBeenCalledTimes(1);
   });
+
+  it("uses driver-native table page reads when available", async () => {
+    const readTablePage = vi.fn().mockResolvedValue({
+      columns,
+      rows: [{ id: 1, calc: 2 }],
+      totalCount: 1,
+    });
+    const query = vi.fn();
+
+    const driver = {
+      readTablePage,
+      qualifiedTableName: vi.fn(() => "[db].[dbo].[t]"),
+      describeColumns: vi.fn().mockResolvedValue(columns),
+      buildOrderByDefault: vi.fn(() => "ORDER BY [id] ASC"),
+      buildPagination: vi.fn(() => ({
+        sql: "OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
+        params: [0, 50],
+      })),
+      query,
+      quoteIdentifier: vi.fn((name: string) => `[${name}]`),
+      formatOutputValue: vi.fn((value: unknown) => value),
+      buildFilterCondition: vi.fn(),
+      normalizeFilterValue: vi.fn(),
+    };
+
+    const connectionManager = {
+      getConnection: vi.fn(() => ({ id: "c1" })),
+      getDriver: vi.fn(() => driver),
+    };
+
+    const service = new TableReadService(connectionManager as never);
+    const result = await service.getPage(
+      "c1",
+      "db",
+      "dbo",
+      "t",
+      2,
+      25,
+      [],
+      { column: "id", direction: "asc" },
+      true,
+    );
+
+    expect(result).toEqual({
+      columns,
+      rows: [{ id: 1, calc: 2 }],
+      totalCount: 1,
+    });
+    expect(readTablePage).toHaveBeenCalledWith({
+      database: "db",
+      schema: "dbo",
+      table: "t",
+      page: 2,
+      pageSize: 25,
+      filters: [],
+      sort: { column: "id", direction: "asc" },
+      skipCount: true,
+    });
+    expect(query).not.toHaveBeenCalled();
+  });
 });

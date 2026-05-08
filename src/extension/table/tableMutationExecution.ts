@@ -60,6 +60,39 @@ export function prepareApplyChangesPlan(
       result: { success: false, error: "Not connected" },
     };
   }
+
+  if (driver.updateRows) {
+    return {
+      executable: true,
+      plan: {
+        connectionId,
+        database,
+        schema,
+        table,
+        mode: "driver",
+        cols: columns,
+        updates,
+        operations: [],
+        previewStatements: updates.map(({ primaryKeys, changes }) =>
+          driver.buildMutationPreviewStatement
+            ? driver.buildMutationPreviewStatement(
+                "update",
+                database,
+                schema,
+                table,
+                {
+                  primaryKeys,
+                  changes,
+                },
+              )
+            : `UPDATE ${driver.qualifiedTableName(database, schema, table)} ${JSON.stringify({ primaryKeys, changes })}`,
+        ),
+        skippedRows: [],
+        verificationTargets: [],
+      },
+    };
+  }
+
   const columnMetaByName = new Map(
     columns.map((column) => [column.name, column]),
   );
@@ -184,6 +217,50 @@ export async function executePreparedApplyPlan(
     return { success: false, error: "Not connected" };
   }
   const skippedRows = new Set(plan.skippedRows);
+  if (plan.mode === "driver") {
+    if (!driver.updateRows) {
+      return { success: false, error: "Driver does not support updates." };
+    }
+    try {
+      const result = await driver.updateRows({
+        database: plan.database,
+        schema: plan.schema,
+        table: plan.table,
+        updates: plan.updates.map((update) => ({
+          primaryKeys: update.primaryKeys,
+          changes: update.changes,
+        })),
+      });
+      const rowOutcomes = plan.updates.map((_, rowIndex) => ({
+        rowIndex,
+        success: true,
+        status: "applied",
+      })) satisfies ApplyRowOutcome[];
+      if (result.affectedRows < plan.updates.length) {
+        return {
+          success: true,
+          warning:
+            "Some updates may not have matched a row in the source backend.",
+          rowOutcomes,
+        };
+      }
+      return { success: true, rowOutcomes };
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        success: false,
+        error: message,
+        rowOutcomes: plan.updates.map((_, rowIndex) =>
+          buildSkippedOutcome(
+            rowIndex,
+            `The update operation failed: ${message}`,
+            false,
+          ),
+        ),
+      };
+    }
+  }
+
   try {
     await driver.runTransaction(plan.operations);
     const verificationFailures = await verifyExactNumericUpdates(

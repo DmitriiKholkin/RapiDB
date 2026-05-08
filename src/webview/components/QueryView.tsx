@@ -43,6 +43,12 @@ const MIN_EDITOR_H = 80;
 const DEFAULT_EDITOR_RATIO = 0.7;
 const DEFAULT_EDITOR_H = 400;
 
+function isSqlConnectionType(connectionType?: string): boolean {
+  return ["pg", "mysql", "sqlite", "mssql", "oracle"].includes(
+    connectionType ?? "",
+  );
+}
+
 export function QueryView({
   connectionId,
   initialSql,
@@ -98,7 +104,11 @@ export function QueryView({
   const activeConn = connections.find(
     (c) => c.id === (activeConnectionId || connectionId),
   );
-  const sqlDialect = connTypeToDialect(activeConn?.type ?? connectionType);
+  const activeConnectionType = activeConn?.type ?? connectionType;
+  const sqlDialect = isSqlConnectionType(activeConnectionType)
+    ? connTypeToDialect(activeConnectionType)
+    : undefined;
+  const editorLabel = sqlDialect ? "SQL editor" : "Query editor";
 
   useEffect(() => {
     setActiveConnection(connectionId);
@@ -177,7 +187,7 @@ export function QueryView({
   );
 
   useEffect(() => {
-    if (!formatOnOpen || !initialSql || didAutoFormat.current) {
+    if (!formatOnOpen || !initialSql || didAutoFormat.current || !sqlDialect) {
       return;
     }
     if (connections.length === 0) {
@@ -349,8 +359,12 @@ export function QueryView({
         {}
         <button
           type="button"
-          style={btnGhostStyle(false)}
+          style={btnGhostStyle(!sqlDialect)}
+          disabled={!sqlDialect}
           onClick={() => {
+            if (!sqlDialect) {
+              return;
+            }
             const err = editorRef.current?.format(sqlDialect) ?? null;
             if (err) {
               setError(`SQL format error: ${err}`);
@@ -412,6 +426,7 @@ export function QueryView({
           initialValue={initialSql || ""}
           schema={schema}
           dialect={sqlDialect}
+          ariaLabel={editorLabel}
           onExecute={executeQuery}
           onChange={handleEditorChange}
           height="100%"

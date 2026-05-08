@@ -361,10 +361,14 @@ class FakeDriver implements IDBDriver {
 
 function driverFactory() {
   return {
+    DynamoDBDriver: FakeDriver,
+    ElasticsearchDriver: FakeDriver,
     MSSQLDriver: FakeDriver,
+    MongoDBDriver: FakeDriver,
     MySQLDriver: FakeDriver,
     OracleDriver: FakeDriver,
     PostgresDriver: FakeDriver,
+    RedisDriver: FakeDriver,
     SQLiteDriver: FakeDriver,
   };
 }
@@ -375,10 +379,14 @@ vi.mock("vscode", () => ({
   window: {},
 }));
 
+vi.mock("../../src/extension/dbDrivers/dynamodb", driverFactory);
+vi.mock("../../src/extension/dbDrivers/elasticsearch", driverFactory);
 vi.mock("../../src/extension/dbDrivers/mssql", driverFactory);
+vi.mock("../../src/extension/dbDrivers/mongodb", driverFactory);
 vi.mock("../../src/extension/dbDrivers/mysql", driverFactory);
 vi.mock("../../src/extension/dbDrivers/oracle", driverFactory);
 vi.mock("../../src/extension/dbDrivers/postgres", driverFactory);
+vi.mock("../../src/extension/dbDrivers/redis", driverFactory);
 vi.mock("../../src/extension/dbDrivers/sqlite", driverFactory);
 
 beforeEach(() => {

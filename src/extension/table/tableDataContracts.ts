@@ -24,6 +24,8 @@ export interface PreparedInsertPlan {
   database: string;
   schema: string;
   table: string;
+  mode?: "sql" | "driver";
+  values?: Record<string, unknown>;
   operation: TransactionOperation;
   previewStatements: string[];
   verificationCriteria: Record<string, unknown> | null;
@@ -34,7 +36,9 @@ export interface PreparedDeletePlan {
   database: string;
   schema: string;
   table: string;
+  mode?: "sql" | "driver";
   executionMode: "sequential" | "transaction";
+  primaryKeyValuesList?: Record<string, unknown>[];
   operations: TransactionOperation[];
   previewStatements: string[];
   verificationCriteriaList: Record<string, unknown>[];
@@ -54,6 +58,7 @@ export interface PreparedApplyPlan {
   database: string;
   schema: string;
   table: string;
+  mode?: "sql" | "driver";
   cols: ColumnTypeMeta[];
   updates: RowUpdate[];
   operations: TransactionOperation[];

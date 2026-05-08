@@ -21,6 +21,21 @@ export class TableMutationService {
     changes: Record<string, unknown>,
   ): Promise<void> {
     const { driver } = this.getConnectionDriver(connectionId);
+    if (driver.updateRows) {
+      const result = await driver.updateRows({
+        database,
+        schema,
+        table,
+        updates: [{ primaryKeys: primaryKeyValues, changes }],
+      });
+      if (result.affectedRows === 0) {
+        throw new Error(
+          "Row not found — the row may have been modified or deleted by another user",
+        );
+      }
+      return;
+    }
+
     const columns = await this.columnsProvider.getColumns(
       connectionId,
       database,
@@ -71,6 +86,32 @@ export class TableMutationService {
     values: Record<string, unknown>,
   ): Promise<PreparedInsertPlan> {
     const { driver } = this.getConnectionDriver(connectionId);
+    if (driver.insertRow) {
+      const previewSql = driver.buildMutationPreviewStatement
+        ? driver.buildMutationPreviewStatement(
+            "insert",
+            database,
+            schema,
+            table,
+            { values },
+          )
+        : `INSERT ${driver.qualifiedTableName(database, schema, table)} ${JSON.stringify(values)}`;
+      return {
+        connectionId,
+        database,
+        schema,
+        table,
+        mode: "driver",
+        values,
+        operation: {
+          sql: "-- driver-hook-insert",
+          params: [],
+        },
+        previewStatements: [previewSql],
+        verificationCriteria: null,
+      };
+    }
+
     const columns = await this.columnsProvider.getColumns(
       connectionId,
       database,
@@ -142,6 +183,24 @@ export class TableMutationService {
   }
   async executePreparedInsertPlan(plan: PreparedInsertPlan): Promise<void> {
     const { driver } = this.getConnectionDriver(plan.connectionId);
+    if (plan.mode === "driver") {
+      if (!driver.insertRow) {
+        throw new Error("Insert is not supported by this driver.");
+      }
+      const result = await driver.insertRow({
+        database: plan.database,
+        schema: plan.schema,
+        table: plan.table,
+        values: plan.values ?? {},
+      });
+      if (result.affectedRows === 0) {
+        throw new Error(
+          "Insert failed: the database reported 0 rows affected.",
+        );
+      }
+      return;
+    }
+
     const result = await driver.query(
       plan.operation.sql,
       plan.operation.params,
@@ -205,6 +264,37 @@ export class TableMutationService {
       return null;
     }
     const { driver } = this.getConnectionDriver(connectionId);
+    if (driver.deleteRows) {
+      const previewStatements = driver.buildMutationPreviewStatement
+        ? [
+            driver.buildMutationPreviewStatement(
+              "delete",
+              database,
+              schema,
+              table,
+              {
+                primaryKeyValuesList,
+              },
+            ),
+          ]
+        : primaryKeyValuesList.map(
+            (criteria) =>
+              `DELETE ${driver.qualifiedTableName(database, schema, table)} ${JSON.stringify(criteria)}`,
+          );
+      return {
+        connectionId,
+        database,
+        schema,
+        table,
+        mode: "driver",
+        executionMode: "sequential",
+        primaryKeyValuesList,
+        operations: [],
+        previewStatements,
+        verificationCriteriaList: primaryKeyValuesList,
+      };
+    }
+
     const qualifiedTableName = driver.qualifiedTableName(
       database,
       schema,
@@ -285,6 +375,24 @@ export class TableMutationService {
   }
   async executePreparedDeletePlan(plan: PreparedDeletePlan): Promise<void> {
     const { driver } = this.getConnectionDriver(plan.connectionId);
+    if (plan.mode === "driver") {
+      if (!driver.deleteRows) {
+        throw new Error("Delete is not supported by this driver.");
+      }
+      const result = await driver.deleteRows({
+        database: plan.database,
+        schema: plan.schema,
+        table: plan.table,
+        primaryKeyValuesList: plan.primaryKeyValuesList ?? [],
+      });
+      if (result.affectedRows < (plan.primaryKeyValuesList?.length ?? 0)) {
+        throw new Error(
+          "Delete failed for one or more selected rows because they no longer exist in the source backend.",
+        );
+      }
+      return;
+    }
+
     if (plan.executionMode === "sequential") {
       for (const operation of plan.operations) {
         await driver.query(operation.sql, operation.params);

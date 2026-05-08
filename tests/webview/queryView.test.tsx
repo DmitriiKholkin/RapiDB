@@ -285,4 +285,36 @@ describe("QueryView", () => {
       expect((bookmarkButton as HTMLButtonElement).disabled).toBe(false);
     });
   });
+
+  it("disables SQL formatting affordances for non-SQL connections", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <QueryView
+        connectionId="conn-1"
+        initialSql='find {"collection":"users"}'
+        connectionType="mongodb"
+      />,
+    );
+
+    dispatchIncomingMessage("connections", [
+      { id: "conn-1", name: "Mongo", type: "mongodb" },
+    ]);
+
+    expect(screen.getByLabelText("Query editor")).toBeTruthy();
+
+    const formatButton = screen.getByRole("button", { name: "Format" });
+    expect((formatButton as HTMLButtonElement).disabled).toBe(true);
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Run" }));
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "executeQuery",
+      payload: {
+        sql: 'find {"collection":"users"}',
+        connectionId: "conn-1",
+      },
+    });
+  });
 });
