@@ -307,6 +307,11 @@
         },
         {
           "command": "rapidb.copyNodeName",
+          "when": "view == rapidb-explorer && viewItem == table_noDdl",
+          "group": "2_copy"
+        },
+        {
+          "command": "rapidb.copyNodeName",
           "when": "view == rapidb-explorer && viewItem == view",
           "group": "2_copy"
         },
@@ -343,6 +348,11 @@
         {
           "command": "rapidb.copyNodeName",
           "when": "view == rapidb-explorer && viewItem == table_detail_index",
+          "group": "2_copy"
+        },
+        {
+          "command": "rapidb.copyNodeName",
+          "when": "view == rapidb-explorer && viewItem == table_detail_index_noDdl",
           "group": "2_copy"
         },
         {

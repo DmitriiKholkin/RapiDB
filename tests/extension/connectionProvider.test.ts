@@ -647,6 +647,81 @@ describe("ConnectionProvider", () => {
     expect(getSchemaSnapshotAsync).not.toHaveBeenCalled();
   });
 
+  it("marks unsupported NoSQL Open DDL nodes with noDdl context values", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-1", name: "NoSQL", type: "mongodb" },
+      ]),
+      getConnection: vi.fn(() => ({
+        id: "conn-1",
+        name: "NoSQL",
+        type: "mongodb",
+      })),
+      isConnected: vi.fn((id: string) => id === "conn-1"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      ensureTableDetailLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "rapidb",
+              schemas: [
+                {
+                  name: "rapidb",
+                  objects: [{ name: "users", type: "table", columns: [] }],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      getTableDetailState: vi.fn(() => loadedTableDetailState()),
+      getDriverEntityManifest: vi.fn(() => ({
+        dbObjectKinds: ["table"],
+        tableSections: {
+          columns: "supported",
+          constraints: "not_applicable",
+          indexes: "supported",
+          triggers: "not_applicable",
+        },
+      })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+
+    const roots = await provider.getChildren();
+    const databases = await provider.getChildren(roots[0]);
+    const categories = await provider.getChildren(databases[0]);
+    const tableNode = (await provider.getChildren(categories[0]))[0];
+
+    const tableSections = await provider.getChildren(tableNode);
+    const indexesSection = tableSections.find(
+      (node) => node.label === "Indexes",
+    );
+
+    if (!indexesSection) {
+      throw new Error("Expected indexes section to be present");
+    }
+
+    const indexNode = (await provider.getChildren(indexesSection))[0];
+
+    expect(tableNode?.contextValue).toBe("table_noDdl");
+    expect(indexNode?.contextValue).toBe("table_detail_index_noDdl");
+  });
+
   it("loads database scopes lazily and shows a database-level placeholder while that scope is pending", async () => {
     const ensureSchemaScopeLoading = vi.fn();
     const getSchemaSnapshotState = vi.fn(

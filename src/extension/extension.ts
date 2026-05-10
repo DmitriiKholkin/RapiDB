@@ -15,6 +15,7 @@ import {
   confirmConnectionRemoval,
   pickConnectionWithPrompt,
 } from "./connectionManagerPrompts";
+import { DEFAULT_DRIVER_ENTITY_MANIFEST } from "./dbDrivers/types";
 import { ConnectionFormPanel } from "./panels/connectionFormPanel";
 import { ErdPanel } from "./panels/erdPanel";
 import { QueryPanel } from "./panels/queryPanel";
@@ -30,6 +31,7 @@ import {
   logErrorWithContext,
   normalizeUnknownError,
 } from "./utils/errorHandling";
+import { isOpenDdlSupportedForNode } from "./utils/openDdlEligibility";
 
 let _activated = false;
 const CMD = {
@@ -328,6 +330,24 @@ function registerCommands(
       );
       return;
     }
+    const connectionType = connectionManager.getConnection(
+      node.connectionId,
+    )?.type;
+    const managerWithManifest = connectionManager as ConnectionManager & {
+      getDriverEntityManifest?: (
+        id: string,
+      ) => typeof DEFAULT_DRIVER_ENTITY_MANIFEST;
+    };
+    const entityManifest =
+      managerWithManifest.getDriverEntityManifest?.(node.connectionId) ??
+      DEFAULT_DRIVER_ENTITY_MANIFEST;
+    if (!isOpenDdlSupportedForNode(node.kind, connectionType, entityManifest)) {
+      vscode.window.showWarningMessage(
+        "[RapiDB] DDL is available only for table, view, materialized view, function, procedure, sequence, type, constraint, index, and trigger nodes.",
+      );
+      return;
+    }
+
     const driver = connectionManager.getDriver(node.connectionId);
     if (!driver) {
       vscode.window.showErrorMessage("[RapiDB] Not connected. Connect first.");

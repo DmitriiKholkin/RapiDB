@@ -30,6 +30,10 @@ import type {
   TriggerMeta,
 } from "../dbDrivers/types";
 import { DEFAULT_DRIVER_ENTITY_MANIFEST as DEFAULT_ENTITY_MANIFEST } from "../dbDrivers/types";
+import {
+  composeOpenDdlAwareContextValue,
+  type OpenDdlNodeKind,
+} from "../utils/openDdlEligibility";
 
 export type NodeKind =
   | "connectionNode_disconnected"
@@ -728,6 +732,7 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       objectName,
     );
     node.tooltip = `${kind}: ${objectName}\nSchema: ${schemaName}\nDatabase: ${databaseName}`;
+    node.contextValue = this.composeContextValue(kind, connectionId);
 
     if (isDataDbObjectKind(kind)) {
       node.command = {
@@ -863,6 +868,10 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       "constraints",
       constraint.name,
     );
+    node.contextValue = this.composeContextValue(
+      "table_detail_constraint",
+      request.connectionId,
+    );
     node.description = parts.join(" - ");
     node.tooltip = this.makeDetailTooltip(constraint.name, node.description);
     return node;
@@ -892,6 +901,10 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       "indexes",
       index.name,
     );
+    node.contextValue = this.composeContextValue(
+      "table_detail_index",
+      request.connectionId,
+    );
     node.description = descriptionParts.join(" - ");
     node.tooltip = this.makeDetailTooltip(index.name, node.description);
     return node;
@@ -917,9 +930,30 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       "triggers",
       trigger.name,
     );
+    node.contextValue = this.composeContextValue(
+      "table_detail_trigger",
+      request.connectionId,
+    );
     node.description = detail.join(", ");
     node.tooltip = this.makeDetailTooltip(trigger.name, node.description);
     return node;
+  }
+
+  private composeContextValue(
+    kind: OpenDdlNodeKind,
+    connectionId: string,
+  ): string {
+    const managerWithConnectionLookup = this
+      .connectionManager as ConnectionManager & {
+      getConnection?: (id: string) => ConnectionConfig | undefined;
+    };
+    const connectionType =
+      managerWithConnectionLookup.getConnection?.(connectionId)?.type;
+    return composeOpenDdlAwareContextValue(
+      kind,
+      connectionType,
+      this.getEntityManifest(connectionId),
+    );
   }
 
   private makeDetailTooltip(name: string, description?: string): string {
@@ -941,18 +975,6 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     const node = new RapiDBNode(
       label,
       "status_loading",
-      vscode.TreeItemCollapsibleState.None,
-      connectionId,
-    );
-    node.contextValue = "_status";
-    node.tooltip = label;
-    return node;
-  }
-
-  private makeInfoNode(connectionId: string, label: string): RapiDBNode {
-    const node = new RapiDBNode(
-      label,
-      "status_info",
       vscode.TreeItemCollapsibleState.None,
       connectionId,
     );

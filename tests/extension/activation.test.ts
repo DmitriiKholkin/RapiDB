@@ -69,7 +69,11 @@ describe("extension activation", () => {
       refreshSchemaCache: vi.fn(),
       isConnected: vi.fn(() => false),
       isConnecting: vi.fn(() => false),
-      getConnection: vi.fn(() => ({ id: "conn-1", name: "Primary" })),
+      getConnection: vi.fn(() => ({
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+      })),
       disconnectFrom: vi.fn(),
       disconnectAll: vi.fn().mockResolvedValue(undefined),
       clearBookmarks: vi.fn(),
@@ -781,6 +785,45 @@ describe("extension activation", () => {
       "CREATE TRIGGER users_audit AFTER INSERT ON users BEGIN SELECT 1; END;",
       true,
       true,
+    );
+  });
+
+  it("guards Show DDL for unsupported NoSQL table nodes", async () => {
+    const extension = await import("../../src/extension/extension");
+    const context = { subscriptions: [] as Array<{ dispose(): void }> };
+    const driver = {
+      getCreateTableDDL: vi.fn(),
+    };
+
+    (
+      connectionManagerInstance.getConnection as ReturnType<typeof vi.fn>
+    ).mockReturnValue({ id: "conn-1", name: "Cache", type: "redis" });
+    (
+      connectionManagerInstance.getDriver as ReturnType<typeof vi.fn>
+    ).mockReturnValue(driver);
+
+    extension.activate(context as never);
+
+    const showDdlCommand = vscodeState.registerCommand.mock.calls.find(
+      ([command]) => command === "rapidb.showDDL",
+    )?.[1] as ((node: Record<string, unknown>) => Promise<void>) | undefined;
+
+    if (!showDdlCommand) {
+      throw new Error("Show DDL command was not registered.");
+    }
+
+    await showDdlCommand({
+      kind: "table",
+      connectionId: "conn-1",
+      database: "0",
+      schema: "0",
+      objectName: "session:*",
+    });
+
+    expect(driver.getCreateTableDDL).not.toHaveBeenCalled();
+    expect(queryPanelCreateOrShow).not.toHaveBeenCalled();
+    expect(vscodeState.showWarningMessage).toHaveBeenCalledWith(
+      "[RapiDB] DDL is available only for table, view, materialized view, function, procedure, sequence, type, constraint, index, and trigger nodes.",
     );
   });
 

@@ -163,23 +163,18 @@ services:
     entrypoint: [ "/bin/sh", "-c" ]
     command:
       - |
-        cli="redis-cli -h redis -a redis_pass123"
-
-        $cli SET  "session:abc123" '{"userId":"1","role":"admin"}'
-        $cli EXPIRE "session:abc123" 3600
-
-        $cli HSET "user:1" name Alice  email alice@example.com age 30
-        $cli HSET "user:2" name Bob    email bob@example.com   age 25
-        $cli HSET "user:3" name Carol  email carol@example.com age 35
-
-        $cli RPUSH "queue:tasks" '{"type":"email","to":"alice@example.com"}'
-        $cli RPUSH "queue:tasks" '{"type":"email","to":"bob@example.com"}'
-
-        $cli ZADD "leaderboard" 1500 alice 1200 bob 900 carol
-
-        $cli SET "config:app:theme" dark
-        $cli SET "config:app:lang"  en
-
+        redis-cli -h redis -a redis_pass123 --pipe <<-EOF
+        SET "config:mode" "production"
+        SET "user:100:settings" "{\"theme\":\"dark\",\"notifications\":true}"
+        HSET "user:100" name "Ivan" email "ivan@example.com" age 28 status "active"
+        RPUSH "logs:system" "auth_success" "db_connected" "cleanup_started"
+        SADD "tags:python" "backend" "django" "fastapi" "async"
+        ZADD "tournament:scores" 500 "player_1" 750 "player_2" 300 "player_3"
+        GEOADD "locations:cities" 37.6173 55.7558 "Moscow" 30.3351 59.9343 "St.Petersburg"
+        SETBIT "activity:2024-05" 1 1
+        SETBIT "activity:2024-05" 2 1
+        SETBIT "activity:2024-05" 5 1
+        EOF
         echo "Redis seed done."
 
   # ─────────────────────────────────────────────

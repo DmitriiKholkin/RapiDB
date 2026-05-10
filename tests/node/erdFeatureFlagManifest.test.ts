@@ -78,4 +78,46 @@ describe("ERD manifest", () => {
       ]),
     );
   });
+
+  it("keeps Show DDL bound to canonical viewItem kinds and excludes noDdl variants", () => {
+    const manifest = readManifest();
+    const contextEntries =
+      manifest.contributes?.menus?.["view/item/context"] ?? [];
+    const showDdlEntries = contextEntries.filter(
+      (entry) => entry.command === "rapidb.showDDL",
+    );
+
+    expect(showDdlEntries.some((entry) => entry.when?.includes("_noDdl"))).toBe(
+      false,
+    );
+    expect(showDdlEntries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          when: expect.stringContaining("viewItem == table"),
+        }),
+        expect.objectContaining({
+          when: expect.stringContaining("viewItem == table_detail_index"),
+        }),
+      ]),
+    );
+  });
+
+  it("adds Copy Name entries for noDdl viewItem variants", () => {
+    const manifest = readManifest();
+    const contextEntries =
+      manifest.contributes?.menus?.["view/item/context"] ?? [];
+
+    expect(contextEntries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          command: "rapidb.copyNodeName",
+          when: expect.stringContaining("viewItem == table_noDdl"),
+        }),
+        expect.objectContaining({
+          command: "rapidb.copyNodeName",
+          when: expect.stringContaining("viewItem == table_detail_index_noDdl"),
+        }),
+      ]),
+    );
+  });
 });
