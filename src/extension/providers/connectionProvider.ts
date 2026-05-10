@@ -411,18 +411,6 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     }
 
     const schemas = database.schemas;
-    const manifest = this.getEntityManifest(element.connectionId);
-
-    if (schemas.length <= 1) {
-      return schemas[0]
-        ? this.categoryNodes(
-            element.connectionId,
-            databaseName,
-            schemas[0],
-            manifest,
-          )
-        : [];
-    }
 
     return schemas.map((schema) =>
       this.makeSchemaNode(element.connectionId, databaseName, schema.name),

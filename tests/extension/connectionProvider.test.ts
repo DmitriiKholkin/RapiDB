@@ -380,7 +380,7 @@ describe("ConnectionProvider", () => {
     expect(connectionManager.getDriver).not.toHaveBeenCalled();
   });
 
-  it("renders single-schema databases without an extra schema level", async () => {
+  it("keeps single-schema databases visible in the tree", async () => {
     const connectionManager = {
       getConnections: vi.fn(() => [
         { id: "conn-1", name: "Primary", type: "mysql" },
@@ -432,7 +432,11 @@ describe("ConnectionProvider", () => {
 
     const roots = await provider.getChildren();
     const databases = await provider.getChildren(roots[0]);
-    const categories = await provider.getChildren(databases[0]);
+    const schemas = await provider.getChildren(databases[0]);
+
+    expect(schemas.map((node) => node.label)).toEqual(["app_db"]);
+
+    const categories = await provider.getChildren(schemas[0]);
 
     expect(categories.map((node) => node.label)).toEqual([
       "Tables",
@@ -532,7 +536,8 @@ describe("ConnectionProvider", () => {
 
     const roots = await provider.getChildren();
     const databases = await provider.getChildren(roots[0]);
-    const categories = await provider.getChildren(databases[0]);
+    const schemas = await provider.getChildren(databases[0]);
+    const categories = await provider.getChildren(schemas[0]);
     const tableNode = (await provider.getChildren(categories[0]))[0];
     const materializedViewCategory = categories.find(
       (node) => node.label === "Materialized Views",
@@ -704,7 +709,8 @@ describe("ConnectionProvider", () => {
 
     const roots = await provider.getChildren();
     const databases = await provider.getChildren(roots[0]);
-    const categories = await provider.getChildren(databases[0]);
+    const schemas = await provider.getChildren(databases[0]);
+    const categories = await provider.getChildren(schemas[0]);
     const tableNode = (await provider.getChildren(categories[0]))[0];
 
     const tableSections = await provider.getChildren(tableNode);
@@ -918,7 +924,10 @@ describe("ConnectionProvider", () => {
     const connectionChildren = await provider.getChildren(roots[0]);
     expect(connectionChildren.map((node) => node.label)).toEqual(["app_db"]);
 
-    const categories = await provider.getChildren(connectionChildren[0]);
+    const schemas = await provider.getChildren(connectionChildren[0]);
+    expect(schemas.map((node) => node.label)).toEqual(["public"]);
+
+    const categories = await provider.getChildren(schemas[0]);
     expect(
       categories.map((node) => ({
         label: node.label,
@@ -1020,7 +1029,8 @@ describe("ConnectionProvider", () => {
 
     const roots = await provider.getChildren();
     const databases = await provider.getChildren(roots[0]);
-    const categories = await provider.getChildren(databases[0]);
+    const schemas = await provider.getChildren(databases[0]);
+    const categories = await provider.getChildren(schemas[0]);
     const tableNode = (await provider.getChildren(categories[0]))[0];
     const sections = await provider.getChildren(tableNode);
     const columnRows = await provider.getChildren(sections[0]);
@@ -1131,7 +1141,8 @@ describe("ConnectionProvider", () => {
 
     const roots = await provider.getChildren();
     const databases = await provider.getChildren(roots[0]);
-    const categories = await provider.getChildren(databases[0]);
+    const schemas = await provider.getChildren(databases[0]);
+    const categories = await provider.getChildren(schemas[0]);
     const tableNode = (await provider.getChildren(categories[0]))[0];
     const children = await provider.getChildren(tableNode);
 
@@ -1218,7 +1229,8 @@ describe("ConnectionProvider", () => {
 
     const roots = await provider.getChildren();
     const databases = await provider.getChildren(roots[0]);
-    const categories = await provider.getChildren(databases[0]);
+    const schemas = await provider.getChildren(databases[0]);
+    const categories = await provider.getChildren(schemas[0]);
 
     expect(categories.map((node) => node.label)).toEqual(["Tables", "Views"]);
     expect(connectionManager.getDriverEntityManifest).toHaveBeenCalledWith(
@@ -1280,7 +1292,8 @@ describe("ConnectionProvider", () => {
 
     const roots = await provider.getChildren();
     const databases = await provider.getChildren(roots[0]);
-    const categories = await provider.getChildren(databases[0]);
+    const schemas = await provider.getChildren(databases[0]);
+    const categories = await provider.getChildren(schemas[0]);
     const tableNode = (await provider.getChildren(categories[0]))[0];
     const sections = await provider.getChildren(tableNode);
 
