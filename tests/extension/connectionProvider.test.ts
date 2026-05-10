@@ -487,6 +487,129 @@ describe("ConnectionProvider", () => {
     expect(connectionManager.getDriver).not.toHaveBeenCalled();
   });
 
+  it("flattens MongoDB schema level and shows Collections category", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-mongo", name: "Mongo", type: "mongodb" },
+      ]),
+      isConnected: vi.fn((id: string) => id === "conn-mongo"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "app_db",
+              schemas: [
+                {
+                  name: "app_db",
+                  objects: [
+                    { name: "users", type: "table", columns: [] },
+                    { name: "orders", type: "table", columns: [] },
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+
+    const roots = await provider.getChildren();
+    const databases = await provider.getChildren(roots[0]);
+
+    expect(databases.map((node) => node.label)).toEqual(["app_db"]);
+
+    const databaseChildren = await provider.getChildren(databases[0]);
+    expect(databaseChildren.map((node) => node.label)).toContain("Collections");
+    expect(databaseChildren.map((node) => node.label)).not.toContain("app_db");
+
+    const collectionsCategory = databaseChildren.find(
+      (node) => node.label === "Collections",
+    );
+    if (!collectionsCategory) {
+      throw new Error("Expected Collections category for MongoDB");
+    }
+
+    const collections = await provider.getChildren(collectionsCategory);
+    expect(collections.map((node) => node.label)).toEqual(["users", "orders"]);
+    expect(collectionsCategory.tooltip).not.toContain("Schema:");
+    expect(collectionsCategory.tooltip).toContain("Collections in app_db");
+    expect(collections[0]?.tooltip).toContain("Database: app_db");
+    expect(collections[0]?.tooltip).not.toContain("Schema:");
+  });
+
+  it("keeps schema level for other NoSQL drivers", async () => {
+    const baseDatabases = {
+      redis: {
+        name: "db0",
+        schemas: [{ name: "default", objects: [] }],
+      },
+      elasticsearch: {
+        name: "default",
+        schemas: [{ name: "indices", objects: [] }],
+      },
+      dynamodb: {
+        name: "us-east-1",
+        schemas: [{ name: "public", objects: [] }],
+      },
+    } as const;
+
+    for (const [type, database] of Object.entries(baseDatabases)) {
+      const connectionId = `conn-${type}`;
+      const connectionManager = {
+        getConnections: vi.fn(() => [
+          { id: connectionId, name: `${type}-conn`, type },
+        ]),
+        isConnected: vi.fn((id: string) => id === connectionId),
+        isConnecting: vi.fn(() => false),
+        ensureSchemaScopeLoading: vi.fn(),
+        getSchemaSnapshotState: vi.fn(() =>
+          loadedState({
+            databases: [database],
+          }),
+        ),
+        getDriver: vi.fn(() => {
+          throw new Error(
+            "ConnectionProvider should not query drivers directly",
+          );
+        }),
+        onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+        onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+        onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+        onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+        onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+      };
+
+      const { ConnectionProvider } = await import(
+        "../../src/extension/providers/connectionProvider"
+      );
+
+      const provider = new ConnectionProvider(connectionManager as never);
+      const roots = await provider.getChildren();
+      const databases = await provider.getChildren(roots[0]);
+      const schemas = await provider.getChildren(databases[0]);
+
+      expect(schemas.map((node) => node.label)).toEqual([
+        database.schemas[0].name,
+      ]);
+    }
+  });
+
   it("keeps single-schema databases visible in the tree", async () => {
     const connectionManager = {
       getConnections: vi.fn(() => [
@@ -816,8 +939,7 @@ describe("ConnectionProvider", () => {
 
     const roots = await provider.getChildren();
     const databases = await provider.getChildren(roots[0]);
-    const schemas = await provider.getChildren(databases[0]);
-    const categories = await provider.getChildren(schemas[0]);
+    const categories = await provider.getChildren(databases[0]);
     const tableNode = (await provider.getChildren(categories[0]))[0];
 
     const tableSections = await provider.getChildren(tableNode);

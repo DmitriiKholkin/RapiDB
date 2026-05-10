@@ -335,7 +335,7 @@ function registerCommands(
       node.kind === "connectionNode_disconnected"
         ? generateCreateDatabaseTemplate(connectionType)
         : node.kind === "database"
-          ? generateCreateSchemaTemplate(connectionType)
+          ? generateCreateSchemaTemplate(connectionType, node.database)
           : undefined;
 
     if (!template) {

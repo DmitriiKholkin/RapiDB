@@ -32,6 +32,13 @@ export function formatMutationPreviewSql(
   statements: readonly string[],
   connectionType: ConnectionType | undefined,
 ): string {
+  if (connectionType === "mongodb") {
+    return statements
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+      .join("\n\n");
+  }
+
   const language = formatterLanguageForConnection(connectionType);
 
   return statements

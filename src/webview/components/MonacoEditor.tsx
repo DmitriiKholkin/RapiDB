@@ -217,6 +217,7 @@ interface Props {
   initialValue?: string;
   schema?: SchemaObject[];
   dialect?: string;
+  language?: string;
   onChange?: (value: string) => void;
   onExecute?: (value: string) => void;
   height?: string | number;
@@ -230,6 +231,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       initialValue = "",
       schema = [],
       dialect = "sql",
+      language = "sql",
       onChange,
       onExecute,
       height = "100%",
@@ -245,6 +247,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
     const onExecuteRef = useRef(onExecute);
     const readOnlyRef = useRef(readOnly);
     const ariaLabelRef = useRef(ariaLabel);
+    const languageRef = useRef(language);
 
     useEffect(() => {
       initialValueRef.current = initialValue;
@@ -299,6 +302,17 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
     useEffect(() => {
       dialectRef.current = dialect;
     }, [dialect]);
+
+    useEffect(() => {
+      languageRef.current = language;
+      const editor = editorRef.current;
+      if (editor) {
+        const model = editor.getModel();
+        if (model) {
+          monaco.editor.setModelLanguage(model, language);
+        }
+      }
+    }, [language]);
 
     useImperativeHandle(ref, () => ({
       getValue: () => editorRef.current?.getValue() ?? "",
@@ -380,7 +394,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
 
       const editor = monaco.editor.create(containerRef.current, {
         value: initialValueRef.current,
-        language: "sql",
+        language: languageRef.current,
         theme: RAPIDB_THEME,
         ariaLabel: ariaLabelRef.current,
         fontSize: parseInt(

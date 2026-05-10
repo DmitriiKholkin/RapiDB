@@ -1,3 +1,4 @@
+import vm from "node:vm";
 import { MongoClient, ObjectId } from "mongodb";
 import type { ConnectionConfig } from "../connectionManager";
 import {
@@ -6,7 +7,6 @@ import {
   flattenRootRecord,
   inferColumnsFromRows,
   pageRows,
-  stringifyCommandPayload,
   unsupported,
 } from "./nosqlUtils";
 import type {
@@ -207,35 +207,159 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   async query(sql: string, _params?: unknown[]): Promise<QueryResult> {
-    const trimmed = sql.trim().replace(/;+$/, "");
+    const trimmed = sql
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("//"))
+      .join("\n")
+      .trim()
+      .replace(/;+\s*$/, "")
+      .trim();
+
     if (trimmed.length === 0) {
-      return {
-        columns: [],
-        rows: [],
-        rowCount: 0,
-        executionTimeMs: 0,
-      };
+      return { columns: [], rows: [], rowCount: 0, executionTimeMs: 0 };
     }
 
     const startedAt = Date.now();
-    if (trimmed.startsWith("find ")) {
-      const payload = JSON.parse(trimmed.slice("find ".length)) as {
-        database?: string;
-        collection: string;
-        filter?: Record<string, unknown>;
-        limit?: number;
+
+    let dbName: string | undefined;
+    let collName: string | undefined;
+    let opName: string | undefined;
+    let opArgs: unknown[] = [];
+    const chainOps: Array<{ op: string; args: unknown[] }> = [];
+
+    const createChainProxy = (): object => {
+      return new Proxy({} as Record<string, unknown>, {
+        get(_t, method: string | symbol) {
+          if (typeof method !== "string") return undefined;
+          return (...a: unknown[]) => {
+            chainOps.push({ op: method, args: a });
+            return createChainProxy();
+          };
+        },
+      });
+    };
+
+    const createCollProxy = (coll: string): object => {
+      return new Proxy({} as Record<string, unknown>, {
+        get(_t, method: string | symbol) {
+          if (typeof method !== "string") return undefined;
+          if (method === "then") return undefined;
+          return (...a: unknown[]) => {
+            collName = coll;
+            opName = method;
+            opArgs = a;
+            return createChainProxy();
+          };
+        },
+      });
+    };
+
+    const createDbProxy = (): object => {
+      return new Proxy({} as Record<string, unknown>, {
+        get(_t, prop: string | symbol) {
+          if (typeof prop !== "string") return undefined;
+          if (prop === "getSiblingDB") {
+            return (name: string) => {
+              dbName = name;
+              return createDbProxy();
+            };
+          }
+          if (prop === "runCommand") {
+            return (cmd: unknown) => {
+              opName = "runCommand";
+              opArgs = [cmd];
+              return createChainProxy();
+            };
+          }
+          if (prop === "createCollection") {
+            return (name: string) => {
+              opName = "createCollection";
+              opArgs = [name];
+            };
+          }
+          return createCollProxy(prop);
+        },
+      });
+    };
+
+    const sandbox = {
+      db: createDbProxy(),
+      ObjectId: (hex: string) => new ObjectId(hex),
+      ISODate: (s: string) => new Date(s),
+      NumberLong: (n: number | string) => Number(n),
+      NumberInt: (n: number | string) => Number(n),
+      NumberDecimal: (s: string) => parseFloat(s),
+    };
+
+    try {
+      vm.runInNewContext(trimmed, sandbox, { timeout: 5000 });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(
+        `mongosh error: ${msg}\n\nExamples:\n  db.users.find({})\n  db.users.find({ name: "Alice" }).limit(10)\n  db.users.insertOne({ name: "Alice" })\n  db.users.updateMany({ status: "active" }, { $set: { updated: true } })\n  db.users.deleteMany({ _id: ObjectId("507f1f77bcf86cd799439011") })\n  db.runCommand({ ping: 1 })\n  db.getSiblingDB("mydb").users.find({})`,
+      );
+    }
+
+    const op = opName;
+    if (!op) {
+      throw new Error(
+        'No operation found in mongosh expression.\n\nExamples:\n  db.users.find({})\n  db.users.insertOne({ name: "Alice" })\n  db.runCommand({ ping: 1 })',
+      );
+    }
+
+    const limitOp = chainOps.find((c) => c.op === "limit");
+    const limit = typeof limitOp?.args[0] === "number" ? limitOp.args[0] : 100;
+    const skipOp = chainOps.find((c) => c.op === "skip");
+    const skip = typeof skipOp?.args[0] === "number" ? skipOp.args[0] : 0;
+
+    if (op === "runCommand") {
+      const cmd = this.normalizeFilterCriteria(
+        opArgs[0] as Record<string, unknown>,
+      );
+      const result = await this.requireDb(dbName).command(cmd);
+      const row = flattenRootRecord(result as Record<string, unknown>);
+      const columns = Object.keys(row);
+      return {
+        columns,
+        rows: [this.mapRowToQueryRow(row, columns)],
+        rowCount: 1,
+        executionTimeMs: Date.now() - startedAt,
       };
-      const docs = await this.requireDb(payload.database)
-        .collection(payload.collection)
-        .find(this.normalizeFilterCriteria(payload.filter ?? {}))
-        .limit(payload.limit ?? 100)
+    }
+
+    if (op === "createCollection") {
+      const name = String(opArgs[0]);
+      await this.requireDb(dbName).createCollection(name);
+      const row = { ok: 1, name };
+      const columns = Object.keys(row);
+      return {
+        columns,
+        rows: [this.mapRowToQueryRow(row, columns)],
+        rowCount: 1,
+        executionTimeMs: Date.now() - startedAt,
+      };
+    }
+
+    if (!collName) {
+      throw new Error(`Collection name is required for operation "${op}"`);
+    }
+
+    const mongoCollection = this.requireDb(dbName).collection(collName);
+
+    if (op === "find" || op === "findOne") {
+      const filter = this.normalizeFilterCriteria(
+        (opArgs[0] as Record<string, unknown>) ?? {},
+      );
+      const actualLimit = op === "findOne" ? 1 : limit;
+      const docs = await mongoCollection
+        .find(filter)
+        .limit(actualLimit)
+        .skip(skip)
         .toArray();
       const rows = docs.map((doc) =>
         this.toRow(doc as Record<string, unknown>),
       );
-      const columns = inferColumnsFromRows(rows, "_id").map(
-        (column) => column.name,
-      );
+      const columns = inferColumnsFromRows(rows, "_id").map((c) => c.name);
       return {
         columns,
         rows: rows.map((row) => this.mapRowToQueryRow(row, columns)),
@@ -244,18 +368,60 @@ export class MongoDBDriver implements IDBDriver {
       };
     }
 
-    if (trimmed.startsWith("update ")) {
-      const payload = JSON.parse(trimmed.slice("update ".length)) as {
-        database?: string;
-        collection: string;
-        filter: Record<string, unknown>;
-        set: Record<string, unknown>;
+    if (op === "countDocuments") {
+      const filter = this.normalizeFilterCriteria(
+        (opArgs[0] as Record<string, unknown>) ?? {},
+      );
+      const count = await mongoCollection.countDocuments(filter);
+      return {
+        columns: ["count"],
+        rows: [this.mapRowToQueryRow({ count }, ["count"])],
+        rowCount: 1,
+        executionTimeMs: Date.now() - startedAt,
       };
-      const result = await this.requireDb(payload.database)
-        .collection(payload.collection)
-        .updateMany(this.normalizeFilterCriteria(payload.filter), {
-          $set: payload.set,
-        });
+    }
+
+    if (op === "insertOne") {
+      const doc = opArgs[0] as Record<string, unknown>;
+      const result = await mongoCollection.insertOne(doc);
+      const row = {
+        acknowledged: result.acknowledged,
+        insertedId: String(result.insertedId),
+      };
+      return {
+        columns: Object.keys(row),
+        rows: [this.mapRowToQueryRow(row, Object.keys(row))],
+        rowCount: 1,
+        affectedRows: result.acknowledged ? 1 : 0,
+        executionTimeMs: Date.now() - startedAt,
+      };
+    }
+
+    if (op === "insertMany") {
+      const docs = opArgs[0] as Record<string, unknown>[];
+      const result = await mongoCollection.insertMany(docs);
+      const row = {
+        acknowledged: result.acknowledged,
+        insertedCount: result.insertedCount,
+      };
+      return {
+        columns: Object.keys(row),
+        rows: [this.mapRowToQueryRow(row, Object.keys(row))],
+        rowCount: 1,
+        affectedRows: result.insertedCount,
+        executionTimeMs: Date.now() - startedAt,
+      };
+    }
+
+    if (op === "updateOne" || op === "updateMany") {
+      const filter = this.normalizeFilterCriteria(
+        opArgs[0] as Record<string, unknown>,
+      );
+      const update = opArgs[1] as Record<string, unknown>;
+      const result =
+        op === "updateOne"
+          ? await mongoCollection.updateOne(filter, update)
+          : await mongoCollection.updateMany(filter, update);
       const row = {
         matchedCount: result.matchedCount,
         modifiedCount: result.modifiedCount,
@@ -269,15 +435,14 @@ export class MongoDBDriver implements IDBDriver {
       };
     }
 
-    if (trimmed.startsWith("delete ")) {
-      const payload = JSON.parse(trimmed.slice("delete ".length)) as {
-        database?: string;
-        collection: string;
-        filter: Record<string, unknown>;
-      };
-      const result = await this.requireDb(payload.database)
-        .collection(payload.collection)
-        .deleteMany(this.normalizeFilterCriteria(payload.filter));
+    if (op === "deleteOne" || op === "deleteMany") {
+      const filter = this.normalizeFilterCriteria(
+        opArgs[0] as Record<string, unknown>,
+      );
+      const result =
+        op === "deleteOne"
+          ? await mongoCollection.deleteOne(filter)
+          : await mongoCollection.deleteMany(filter);
       const row = { deletedCount: result.deletedCount };
       return {
         columns: Object.keys(row),
@@ -288,26 +453,23 @@ export class MongoDBDriver implements IDBDriver {
       };
     }
 
-    if (trimmed.startsWith("command ")) {
-      const payload = JSON.parse(trimmed.slice("command ".length)) as {
-        database?: string;
-        command: Record<string, unknown>;
-      };
-      const result = await this.requireDb(payload.database).command(
-        payload.command,
+    if (op === "aggregate") {
+      const pipeline = opArgs[0] as Record<string, unknown>[];
+      const docs = await mongoCollection.aggregate(pipeline).toArray();
+      const rows = docs.map((doc) =>
+        this.toRow(doc as Record<string, unknown>),
       );
-      const row = flattenRootRecord(result as Record<string, unknown>);
-      const columns = Object.keys(row);
+      const columns = inferColumnsFromRows(rows, "_id").map((c) => c.name);
       return {
         columns,
-        rows: [this.mapRowToQueryRow(row, columns)],
-        rowCount: 1,
+        rows: rows.map((row) => this.mapRowToQueryRow(row, columns)),
+        rowCount: rows.length,
         executionTimeMs: Date.now() - startedAt,
       };
     }
 
     throw new Error(
-      'MongoDB query mode expects commands like:\n  find {"collection":"users","filter":{}}\n  update {"collection":"users","filter":{"_id":"..."},"set":{"field":"value"}}\n  delete {"collection":"users","filter":{"_id":"..."}}\n  command {"command":{"ping":1}}',
+      `Unsupported mongosh operation: "${op}".\n\nSupported: find, findOne, countDocuments, insertOne, insertMany, updateOne, updateMany, deleteOne, deleteMany, aggregate, runCommand, createCollection`,
     );
   }
 
@@ -385,31 +547,26 @@ export class MongoDBDriver implements IDBDriver {
       primaryKeyValuesList?: Array<Record<string, unknown>>;
     },
   ): string {
+    const dbRef = database
+      ? `db.getSiblingDB(${JSON.stringify(database)})`
+      : "db";
+
     if (operation === "insert") {
-      return stringifyCommandPayload("command", {
-        database,
-        command: { insert: table, documents: [data.values ?? {}] },
-      });
+      const doc = this.serializeMongosh(data.values ?? {});
+      return `${dbRef}.${table}.insertOne(${doc})`;
     }
     if (operation === "update") {
-      return stringifyCommandPayload("update", {
-        collection: table,
-        database,
-        filter: data.primaryKeys ?? {},
-        set: data.changes ?? {},
-      });
+      const filter = this.serializeMongosh(data.primaryKeys ?? {});
+      const update = this.serializeMongosh({ $set: data.changes ?? {} });
+      return `${dbRef}.${table}.updateMany(\n  ${filter},\n  ${update}\n)`;
     }
     // delete
-    const filter = data.primaryKeyValuesList?.length
+    const filterValue = data.primaryKeyValuesList?.length
       ? data.primaryKeyValuesList.length === 1
         ? data.primaryKeyValuesList[0]
         : { $or: data.primaryKeyValuesList }
       : (data.primaryKeys ?? {});
-    return stringifyCommandPayload("delete", {
-      collection: table,
-      database,
-      filter,
-    });
+    return `${dbRef}.${table}.deleteMany(${this.serializeMongosh(filterValue)})`;
   }
 
   async runTransaction(operations: TransactionOperation[]): Promise<void> {
@@ -479,7 +636,12 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   buildInsertDefaultValuesSql(qualifiedTableName: string): string {
-    return stringifyCommandPayload("insert", { table: qualifiedTableName });
+    const dotIdx = qualifiedTableName.indexOf(".");
+    const db = dotIdx !== -1 ? qualifiedTableName.slice(0, dotIdx) : "";
+    const coll =
+      dotIdx !== -1 ? qualifiedTableName.slice(dotIdx + 1) : qualifiedTableName;
+    const dbRef = db ? `db.getSiblingDB(${JSON.stringify(db)})` : "db";
+    return `${dbRef}.${coll}.insertOne({ })`;
   }
 
   buildInsertValueExpr(_column: ColumnTypeMeta, _paramIndex: number): string {
@@ -591,6 +753,32 @@ export class MongoDBDriver implements IDBDriver {
       );
     }
     return normalized;
+  }
+
+  private serializeMongosh(value: unknown): string {
+    if (value === null || value === undefined) return "null";
+    if (typeof value === "boolean") return String(value);
+    if (typeof value === "number") return String(value);
+    if (typeof value === "string") {
+      if (ObjectId.isValid(value) && value.length === 24) {
+        return `ObjectId(${JSON.stringify(value)})`;
+      }
+      return JSON.stringify(value);
+    }
+    if (value instanceof ObjectId) {
+      return `ObjectId(${JSON.stringify(value.toHexString())})`;
+    }
+    if (Array.isArray(value)) {
+      return `[${value.map((v) => this.serializeMongosh(v)).join(", ")}]`;
+    }
+    if (typeof value === "object") {
+      const entries = Object.entries(value as Record<string, unknown>).map(
+        ([k, v]) => `${k}: ${this.serializeMongosh(v)}`,
+      );
+      if (entries.length === 0) return "{}";
+      return `{ ${entries.join(", ")} }`;
+    }
+    return JSON.stringify(value);
   }
 
   private mapRowToQueryRow(

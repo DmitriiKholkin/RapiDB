@@ -415,6 +415,14 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     }
 
     const schemas = database.schemas;
+    if (this.shouldFlattenSchemaLevel(element.connectionId, schemas)) {
+      return this.categoryNodes(
+        element.connectionId,
+        databaseName,
+        schemas[0],
+        this.getEntityManifest(element.connectionId),
+      );
+    }
 
     return schemas.map((schema) =>
       this.makeSchemaNode(element.connectionId, databaseName, schema.name),
@@ -704,7 +712,9 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       databaseName,
       schemaName,
     );
-    node.tooltip = `Schema: ${schemaName}`;
+    node.tooltip = this.hasSchemaConcept(connectionId)
+      ? `Schema: ${schemaName}`
+      : `Database: ${databaseName}`;
     return node;
   }
 
@@ -726,7 +736,10 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       schemaName,
       objectName,
     );
-    node.tooltip = `${kind}: ${objectName}\nSchema: ${schemaName}\nDatabase: ${databaseName}`;
+    const includeSchema = this.hasSchemaConcept(connectionId);
+    node.tooltip = includeSchema
+      ? `${kind}: ${objectName}\nSchema: ${schemaName}\nDatabase: ${databaseName}`
+      : `${kind}: ${objectName}\nDatabase: ${databaseName}`;
     node.contextValue = this.composeContextValue(kind, connectionId);
 
     if (isDataDbObjectKind(kind)) {
@@ -790,7 +803,9 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
           section,
         );
         node.description = this.describeTableSection(section, sectionState);
-        node.tooltip = `${TABLE_SECTION_LABELS[section]} for ${request.schema}.${request.table}`;
+        node.tooltip = this.hasSchemaConcept(request.connectionId)
+          ? `${TABLE_SECTION_LABELS[section]} for ${request.schema}.${request.table}`
+          : `${TABLE_SECTION_LABELS[section]} for ${request.table}`;
         return node;
       });
   }
@@ -1089,6 +1104,7 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     schema: SchemaSnapshotSchemaEntry,
     manifest: DriverEntityManifest,
   ): RapiDBNode[] {
+    const connectionType = this.getConnectionType(connectionId);
     const supportedKinds = new Set(manifest.dbObjectKinds);
     const visibleCategoryIds = EXPLORER_CATEGORY_ORDER.filter((categoryId) =>
       EXPLORER_CATEGORY_CONFIG[categoryId].objectKinds.some((kind) =>
@@ -1111,10 +1127,14 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     return visibleCategoryIds.map((categoryId) => {
       const categoryKind = CATEGORY_NODE_KIND_BY_ID[categoryId];
       const categoryConfig = EXPLORER_CATEGORY_CONFIG[categoryId];
+      const categoryLabel =
+        connectionType === "mongodb" && categoryId === "tables"
+          ? "Collections"
+          : categoryConfig.label;
       const count = counts.get(categoryKind) ?? 0;
       const hasItems = count > 0;
       const node = new RapiDBNode(
-        categoryConfig.label,
+        categoryLabel,
         categoryKind,
 
         hasItems
@@ -1125,9 +1145,24 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
         schema.name,
       );
       node.description = `(${count})`;
-      node.tooltip = `${categoryConfig.label} in ${schema.name ? `${schema.name}.` : ""}${database} - ${count} item${count !== 1 ? "s" : ""}`;
+      const scopeLabel = this.hasSchemaConcept(connectionId)
+        ? `${schema.name ? `${schema.name}.` : ""}${database}`
+        : database;
+      node.tooltip = `${categoryLabel} in ${scopeLabel} - ${count} item${count !== 1 ? "s" : ""}`;
       return node;
     });
+  }
+
+  private shouldFlattenSchemaLevel(
+    connectionId: string,
+    schemas: readonly SchemaSnapshotSchemaEntry[],
+  ): boolean {
+    const connectionType = this.getConnectionType(connectionId);
+    return connectionType === "mongodb" && schemas.length === 1;
+  }
+
+  private hasSchemaConcept(connectionId: string): boolean {
+    return this.getConnectionType(connectionId) !== "mongodb";
   }
 
   private getEntityManifest(connectionId: string): DriverEntityManifest {

@@ -108,6 +108,8 @@ export function QueryView({
   const sqlDialect = isSqlConnectionType(activeConnectionType)
     ? connTypeToDialect(activeConnectionType)
     : undefined;
+  const monacoLanguage =
+    activeConnectionType === "mongodb" ? "javascript" : "sql";
   const editorLabel = sqlDialect ? "SQL editor" : "Query editor";
 
   useEffect(() => {
@@ -426,6 +428,7 @@ export function QueryView({
           initialValue={initialSql || ""}
           schema={schema}
           dialect={sqlDialect}
+          language={monacoLanguage}
           ariaLabel={editorLabel}
           onExecute={executeQuery}
           onChange={handleEditorChange}

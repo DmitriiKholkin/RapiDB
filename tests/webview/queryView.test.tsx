@@ -292,7 +292,7 @@ describe("QueryView", () => {
     render(
       <QueryView
         connectionId="conn-1"
-        initialSql='find {"collection":"users"}'
+        initialSql="db.users.find({})"
         connectionType="mongodb"
       />,
     );
@@ -312,7 +312,7 @@ describe("QueryView", () => {
     expect(getLastPostedMessage()).toEqual({
       type: "executeQuery",
       payload: {
-        sql: 'find {"collection":"users"}',
+        sql: "db.users.find({})",
         connectionId: "conn-1",
       },
     });

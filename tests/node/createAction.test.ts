@@ -60,7 +60,7 @@ describe("create action policy", () => {
         [
           "mongodb",
           {
-            connectionCreateDb: "mongo_shell",
+            connectionCreateDb: false,
             databaseCreateSchema: false,
           },
         ],
@@ -95,7 +95,6 @@ describe("create action policy", () => {
       ["mysql", true, "CREATE DATABASE"],
       ["sqlite", false, "ATTACH DATABASE"],
       ["mssql", true, "CREATE DATABASE"],
-      ["mongodb", false, 'command {"database":"app_db"'],
     ];
 
     for (const [connectionType, formatOnOpen, token] of expectations) {
@@ -106,6 +105,7 @@ describe("create action policy", () => {
     }
 
     expect(generateCreateDatabaseTemplate("oracle")).toBeUndefined();
+    expect(generateCreateDatabaseTemplate("mongodb")).toBeUndefined();
     expect(generateCreateDatabaseTemplate("redis")).toBeUndefined();
     expect(generateCreateDatabaseTemplate("elasticsearch")).toBeUndefined();
     expect(generateCreateDatabaseTemplate("dynamodb")).toBeUndefined();
@@ -152,5 +152,30 @@ describe("create action policy", () => {
     expect(composeCreateAwareDatabaseContextValue("mysql")).toBe(
       "database_noCreateSchema",
     );
+  });
+
+  it("includes selected database context in schema templates", () => {
+    const pg = generateCreateSchemaTemplate("pg", "tenant_db");
+    expect(pg?.script).toContain("\\c tenant_db");
+    expect(pg?.script).toContain("CREATE SCHEMA app;");
+
+    const mssql = generateCreateSchemaTemplate("mssql", "TenantDb");
+    expect(mssql?.script).toContain("USE [TenantDb];");
+    expect(mssql?.script).toContain("CREATE SCHEMA [app];");
+
+    const oracle = generateCreateSchemaTemplate("oracle", "ORCLPDB1");
+    expect(oracle?.script).toContain("-- Database: ORCLPDB1");
+    expect(oracle?.script).toContain("CREATE USER app IDENTIFIED BY");
+  });
+
+  it("keeps schema templates valid without selected database", () => {
+    const pg = generateCreateSchemaTemplate("pg");
+    expect(pg?.script).not.toContain("\\c");
+
+    const mssql = generateCreateSchemaTemplate("mssql");
+    expect(mssql?.script).not.toContain("USE [");
+
+    const oracle = generateCreateSchemaTemplate("oracle");
+    expect(oracle?.script).not.toContain("-- Database:");
   });
 });

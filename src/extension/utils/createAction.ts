@@ -1,10 +1,6 @@
 import type { ConnectionType } from "../../shared/connectionTypes";
 
-type ConnectionCreateDatabasePolicy =
-  | false
-  | true
-  | "limited_attach"
-  | "mongo_shell";
+type ConnectionCreateDatabasePolicy = false | true | "limited_attach";
 type DatabaseCreateSchemaPolicy = false | true | "create_user";
 
 export type CreateCapabilityPolicy = {
@@ -44,7 +40,7 @@ const CREATE_POLICY: Readonly<Record<ConnectionType, CreateCapabilityPolicy>> =
       databaseCreateSchema: "create_user",
     },
     mongodb: {
-      connectionCreateDb: "mongo_shell",
+      connectionCreateDb: false,
       databaseCreateSchema: false,
     },
     redis: {
@@ -137,11 +133,7 @@ export function generateCreateDatabaseTemplate(
     case "oracle":
       return undefined;
     case "mongodb":
-      return {
-        script:
-          'command {"database":"app_db","command":{"create":"sample_collection"}}',
-        formatOnOpen: false,
-      };
+      return undefined;
     case "redis":
       return undefined;
     case "elasticsearch":
@@ -155,31 +147,50 @@ export function generateCreateDatabaseTemplate(
 
 export function generateCreateSchemaTemplate(
   connectionType: ConnectionType,
+  databaseName?: string,
 ): CreateTemplate | undefined {
   switch (connectionType) {
-    case "pg":
+    case "pg": {
+      const lines = ["-- PostgreSQL"];
+      if (databaseName) {
+        lines.push(`-- Connect to database: ${databaseName}`);
+        lines.push(`\\c ${databaseName}`);
+      }
+      lines.push("CREATE SCHEMA app;");
       return {
-        script: ["-- PostgreSQL", "CREATE SCHEMA app;"].join("\n"),
+        script: lines.join("\n"),
         formatOnOpen: true,
       };
+    }
     case "mysql":
       return undefined;
     case "sqlite":
       return undefined;
-    case "mssql":
+    case "mssql": {
+      const lines = ["-- SQL Server (MSSQL)"];
+      if (databaseName) {
+        lines.push(`USE [${databaseName}];`);
+      }
+      lines.push("CREATE SCHEMA [app];");
       return {
-        script: ["-- SQL Server (MSSQL)", "CREATE SCHEMA [app];"].join("\n"),
+        script: lines.join("\n"),
         formatOnOpen: true,
       };
-    case "oracle":
+    }
+    case "oracle": {
+      const lines = [
+        "-- Oracle creates a schema through a user",
+        'CREATE USER app IDENTIFIED BY "ChangeMe123!";',
+        "GRANT CONNECT, RESOURCE TO app;",
+      ];
+      if (databaseName) {
+        lines.unshift(`-- Database: ${databaseName}`);
+      }
       return {
-        script: [
-          "-- Oracle creates a schema through a user",
-          'CREATE USER app IDENTIFIED BY "ChangeMe123!";',
-          "GRANT CONNECT, RESOURCE TO app;",
-        ].join("\n"),
+        script: lines.join("\n"),
         formatOnOpen: true,
       };
+    }
     case "mongodb":
       return undefined;
     case "redis":
