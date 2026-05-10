@@ -63,6 +63,12 @@
         "icon": "$(code)"
       },
       {
+        "command": "rapidb.create",
+        "title": "Create",
+        "category": "RapiDB",
+        "icon": "$(new-file)"
+      },
+      {
         "command": "rapidb.disconnectAll",
         "title": "Disconnect All",
         "category": "RapiDB",
@@ -193,6 +199,10 @@
           "when": "false"
         },
         {
+          "command": "rapidb.create",
+          "when": "false"
+        },
+        {
           "command": "rapidb.openErd",
           "when": "false"
         },
@@ -247,53 +257,63 @@
       "view/item/context": [
         {
           "command": "rapidb.connect",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_disconnected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_disconnected || viewItem == connectionNode_disconnected_canCreateDatabase || viewItem == connectionNode_disconnected_noCreateDatabase)",
           "group": "2_conn"
         },
         {
           "command": "rapidb.editConnection",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_disconnected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_disconnected || viewItem == connectionNode_disconnected_canCreateDatabase || viewItem == connectionNode_disconnected_noCreateDatabase)",
           "group": "3_manage"
         },
         {
           "command": "rapidb.deleteConnection",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_disconnected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_disconnected || viewItem == connectionNode_disconnected_canCreateDatabase || viewItem == connectionNode_disconnected_noCreateDatabase)",
           "group": "3_manage"
         },
         {
           "command": "rapidb.refresh",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_disconnected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_disconnected || viewItem == connectionNode_disconnected_canCreateDatabase || viewItem == connectionNode_disconnected_noCreateDatabase)",
           "group": "4_refresh"
         },
         {
           "command": "rapidb.newQuery",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_disconnected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_disconnected || viewItem == connectionNode_disconnected_canCreateDatabase || viewItem == connectionNode_disconnected_noCreateDatabase)",
           "group": "inline"
+        },
+        {
+          "command": "rapidb.create",
+          "when": "view == rapidb-explorer && viewItem == connectionNode_disconnected_canCreateDatabase",
+          "group": "1_create"
         },
         {
           "command": "rapidb.disconnect",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_connected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_connected || viewItem == connectionNode_connected_canCreateDatabase || viewItem == connectionNode_connected_noCreateDatabase)",
           "group": "2_conn"
         },
         {
           "command": "rapidb.editConnection",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_connected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_connected || viewItem == connectionNode_connected_canCreateDatabase || viewItem == connectionNode_connected_noCreateDatabase)",
           "group": "3_manage"
         },
         {
           "command": "rapidb.deleteConnection",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_connected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_connected || viewItem == connectionNode_connected_canCreateDatabase || viewItem == connectionNode_connected_noCreateDatabase)",
           "group": "3_manage"
         },
         {
           "command": "rapidb.refresh",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_connected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_connected || viewItem == connectionNode_connected_canCreateDatabase || viewItem == connectionNode_connected_noCreateDatabase)",
           "group": "4_refresh"
         },
         {
           "command": "rapidb.newQuery",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_connected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_connected || viewItem == connectionNode_connected_canCreateDatabase || viewItem == connectionNode_connected_noCreateDatabase)",
           "group": "inline"
+        },
+        {
+          "command": "rapidb.create",
+          "when": "view == rapidb-explorer && viewItem == connectionNode_connected_canCreateDatabase",
+          "group": "1_create"
         },
         {
           "command": "rapidb.showDDL",
@@ -412,12 +432,17 @@
         },
         {
           "command": "rapidb.copyNodeName",
-          "when": "view == rapidb-explorer && viewItem == database",
+          "when": "view == rapidb-explorer && (viewItem == database || viewItem == database_canCreateSchema || viewItem == database_noCreateSchema)",
           "group": "2_copy"
         },
         {
+          "command": "rapidb.create",
+          "when": "view == rapidb-explorer && viewItem == database_canCreateSchema",
+          "group": "1_create"
+        },
+        {
           "command": "rapidb.openErd",
-          "when": "view == rapidb-explorer && viewItem == database",
+          "when": "view == rapidb-explorer && (viewItem == database || viewItem == database_canCreateSchema || viewItem == database_noCreateSchema)",
           "group": "1_open"
         },
         {

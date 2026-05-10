@@ -31,6 +31,10 @@ import type {
 } from "../dbDrivers/types";
 import { DEFAULT_DRIVER_ENTITY_MANIFEST as DEFAULT_ENTITY_MANIFEST } from "../dbDrivers/types";
 import {
+  composeCreateAwareConnectionContextValue,
+  composeCreateAwareDatabaseContextValue,
+} from "../utils/createAction";
+import {
   composeOpenDdlAwareContextValue,
   type OpenDdlNodeKind,
 } from "../utils/openDdlEligibility";
@@ -680,6 +684,9 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       connectionId,
       databaseName,
     );
+    node.contextValue = composeCreateAwareDatabaseContextValue(
+      this.getConnectionType(connectionId),
+    );
     node.tooltip = `Database: ${databaseName}`;
     return node;
   }
@@ -931,17 +938,30 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     kind: OpenDdlNodeKind,
     connectionId: string,
   ): string {
-    const managerWithConnectionLookup = this
-      .connectionManager as ConnectionManager & {
-      getConnection?: (id: string) => ConnectionConfig | undefined;
-    };
-    const connectionType =
-      managerWithConnectionLookup.getConnection?.(connectionId)?.type;
+    const connectionType = this.getConnectionType(connectionId);
     return composeOpenDdlAwareContextValue(
       kind,
       connectionType,
       this.getEntityManifest(connectionId),
     );
+  }
+
+  private getConnectionType(
+    connectionId: string,
+  ): ConnectionConfig["type"] | undefined {
+    const managerWithConnectionLookup = this
+      .connectionManager as ConnectionManager & {
+      getConnection?: (id: string) => ConnectionConfig | undefined;
+    };
+    const directMatch =
+      managerWithConnectionLookup.getConnection?.(connectionId);
+    if (directMatch?.type) {
+      return directMatch.type;
+    }
+
+    return this.connectionManager
+      .getConnections()
+      .find((connection) => connection.id === connectionId)?.type;
   }
 
   private makeDetailTooltip(name: string, description?: string): string {
@@ -1048,6 +1068,16 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
         title: "Connect",
         arguments: [node],
       };
+    }
+
+    if (
+      kind === "connectionNode_connected" ||
+      kind === "connectionNode_disconnected"
+    ) {
+      node.contextValue = composeCreateAwareConnectionContextValue(
+        kind,
+        config.type,
+      );
     }
 
     return node;

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 function readManifest(): {
   contributes?: {
+    commands?: Array<{ command?: string }>;
     configuration?: {
       properties?: Record<string, { default?: unknown }>;
     };
@@ -15,6 +16,17 @@ function readManifest(): {
 }
 
 describe("ERD manifest", () => {
+  it("declares a create command contribution", () => {
+    const manifest = readManifest();
+    const commands = manifest.contributes?.commands ?? [];
+
+    expect(commands).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ command: "rapidb.create" }),
+      ]),
+    );
+  });
+
   it("does not declare an ERD enable setting", () => {
     const manifest = readManifest();
 
@@ -119,5 +131,49 @@ describe("ERD manifest", () => {
         }),
       ]),
     );
+  });
+
+  it("wires Create context menus to create-aware connection and database view items", () => {
+    const manifest = readManifest();
+    const contextEntries =
+      manifest.contributes?.menus?.["view/item/context"] ?? [];
+
+    expect(contextEntries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          command: "rapidb.create",
+          when: expect.stringContaining(
+            "viewItem == connectionNode_connected_canCreateDatabase",
+          ),
+        }),
+        expect.objectContaining({
+          command: "rapidb.create",
+          when: expect.stringContaining(
+            "viewItem == connectionNode_disconnected_canCreateDatabase",
+          ),
+        }),
+        expect.objectContaining({
+          command: "rapidb.create",
+          when: expect.stringContaining("viewItem == database_canCreateSchema"),
+        }),
+      ]),
+    );
+  });
+
+  it("keeps legacy viewItem conditions for non-create connection/database commands", () => {
+    const manifest = readManifest();
+    const contextEntries =
+      manifest.contributes?.menus?.["view/item/context"] ?? [];
+
+    const findWhen = (command: string) =>
+      contextEntries.find((entry) => entry.command === command)?.when ?? "";
+
+    expect(findWhen("rapidb.connect")).toContain(
+      "viewItem == connectionNode_disconnected",
+    );
+    expect(findWhen("rapidb.disconnect")).toContain(
+      "viewItem == connectionNode_connected",
+    );
+    expect(findWhen("rapidb.openErd")).toContain("viewItem == database");
   });
 });

@@ -300,6 +300,113 @@ describe("ConnectionProvider", () => {
     ]);
   });
 
+  it("composes create-aware context values for connected and disconnected connection nodes", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-can", name: "Connected PG", type: "pg" },
+        { id: "conn-no", name: "Disconnected Redis", type: "redis" },
+        { id: "conn-limited", name: "Disconnected SQLite", type: "sqlite" },
+      ]),
+      isConnected: vi.fn((id: string) => id === "conn-can"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() => loadedState({ databases: [] })),
+      getConnection: vi.fn((id: string) =>
+        [
+          { id: "conn-can", name: "Connected PG", type: "pg" },
+          { id: "conn-no", name: "Disconnected Redis", type: "redis" },
+          {
+            id: "conn-limited",
+            name: "Disconnected SQLite",
+            type: "sqlite",
+          },
+        ].find((connection) => connection.id === id),
+      ),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    const roots = await provider.getChildren();
+
+    const connectedPg = roots.find((node) => node.connectionId === "conn-can");
+    const disconnectedRedis = roots.find(
+      (node) => node.connectionId === "conn-no",
+    );
+    const disconnectedSqlite = roots.find(
+      (node) => node.connectionId === "conn-limited",
+    );
+
+    expect(connectedPg?.contextValue).toBe(
+      "connectionNode_connected_canCreateDatabase",
+    );
+    expect(disconnectedRedis?.contextValue).toBe(
+      "connectionNode_disconnected_noCreateDatabase",
+    );
+    expect(disconnectedSqlite?.contextValue).toBe(
+      "connectionNode_disconnected_canCreateDatabase",
+    );
+  });
+
+  it("composes create-aware database context values for can/no schema support", async () => {
+    const connections = [
+      { id: "conn-pg", name: "PG", type: "pg" },
+      { id: "conn-oracle", name: "Oracle", type: "oracle" },
+      { id: "conn-mysql", name: "MySQL", type: "mysql" },
+      { id: "conn-redis", name: "Redis", type: "redis" },
+    ];
+    const connectionManager = {
+      getConnections: vi.fn(() => connections),
+      isConnected: vi.fn(() => true),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [{ name: "app_db", schemas: [] }],
+        }),
+      ),
+      getConnection: vi.fn((id: string) =>
+        connections.find((connection) => connection.id === id),
+      ),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    const roots = await provider.getChildren();
+
+    const byConnectionId = new Map<string, string | undefined>();
+    for (const root of roots) {
+      const databaseNodes = await provider.getChildren(root);
+      byConnectionId.set(root.connectionId, databaseNodes[0]?.contextValue);
+    }
+
+    expect(byConnectionId.get("conn-pg")).toBe("database_canCreateSchema");
+    expect(byConnectionId.get("conn-oracle")).toBe("database_canCreateSchema");
+    expect(byConnectionId.get("conn-mysql")).toBe("database_noCreateSchema");
+    expect(byConnectionId.get("conn-redis")).toBe("database_noCreateSchema");
+  });
+
   it("renders multi-schema databases from the shared schema snapshot", async () => {
     const connectionManager = {
       getConnections: vi.fn(() => [
