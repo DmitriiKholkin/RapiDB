@@ -265,6 +265,7 @@ export interface ColumnMeta {
 export interface ColumnTypeMeta extends ColumnMeta {
   category: TypeCategory;
   nativeType: string;
+  bsonSubtype?: number;
   filterable: boolean;
   filterOperators: FilterOperator[];
   valueSemantics: ValueSemantics;

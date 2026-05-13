@@ -1,7 +1,9 @@
 import {
   Binary,
   BSONRegExp,
+  BSONSymbol,
   Code,
+  DBRef,
   Decimal128,
   Int32,
   Long,
@@ -293,18 +295,26 @@ describe("MongoDBDriver schema type inference", () => {
           Buffer.from("00112233445566778899aabbccddeeff", "hex"),
           4,
         ),
+        t_dbpointer: new DBRef(
+          "users",
+          new ObjectId("64a1b2c3d4e5f67890abcdeb"),
+          "test",
+        ),
         t_objectid: new ObjectId("64a1b2c3d4e5f67890abcdea"),
         t_bool: true,
         t_date: new Date("2024-07-04T12:00:00.000Z"),
         t_null: null,
         t_regex: new BSONRegExp("quick\\s+fox", "i"),
         t_js: new Code("function() { return this.score > 100; }"),
+        t_js_scope: new Code("function() { return x; }", { x: 1 }),
+        t_symbol: new BSONSymbol("alpha"),
         t_int32: new Int32(2147483647),
         t_int64: Long.fromString("9223372036854775807"),
         t_decimal128: Decimal128.fromString("123456789.987654321"),
         t_timestamp: new Timestamp({ t: 1720094400, i: 1 }),
         t_minkey: new MinKey(),
         t_maxkey: new MaxKey(),
+        t_undefined: undefined,
         t_empty_obj: {},
         t_empty_arr: [],
       },
@@ -335,28 +345,39 @@ describe("MongoDBDriver schema type inference", () => {
     expect(typeByName.get("t_object")).toBe("object");
     expect(typeByName.get("t_array")).toBe("array");
     expect(typeByName.get("t_binary")).toBe("binData");
-    expect(typeByName.get("t_binary_uuid")).toBe("uuid");
+    expect(typeByName.get("t_binary_uuid")).toBe("binData");
+    expect(typeByName.get("t_dbpointer")).toBe("dbPointer");
     expect(typeByName.get("t_objectid")).toBe("objectId");
     expect(typeByName.get("t_bool")).toBe("bool");
     expect(typeByName.get("t_date")).toBe("date");
     expect(typeByName.get("t_null")).toBe("null");
     expect(typeByName.get("t_regex")).toBe("regex");
     expect(typeByName.get("t_js")).toBe("javascript");
-    expect(typeByName.get("t_int32")).toBe("int32");
-    expect(typeByName.get("t_int64")).toBe("int64");
-    expect(typeByName.get("t_decimal128")).toBe("decimal128");
+    expect(typeByName.get("t_js_scope")).toBe("javascriptWithScope");
+    expect(typeByName.get("t_symbol")).toBe("symbol");
+    expect(typeByName.get("t_int32")).toBe("int");
+    expect(typeByName.get("t_int64")).toBe("long");
+    expect(typeByName.get("t_decimal128")).toBe("decimal");
     expect(typeByName.get("t_timestamp")).toBe("timestamp");
     expect(typeByName.get("t_minkey")).toBe("minKey");
     expect(typeByName.get("t_maxkey")).toBe("maxKey");
+    expect(typeByName.get("t_undefined")).toBe("undefined");
     expect(typeByName.get("t_empty_obj")).toBe("object");
     expect(typeByName.get("t_empty_arr")).toBe("array");
 
     expect(categoryByName.get("t_object")).toBe("json");
     expect(categoryByName.get("t_array")).toBe("array");
     expect(categoryByName.get("t_binary")).toBe("binary");
-    expect(categoryByName.get("t_binary_uuid")).toBe("uuid");
+    expect(categoryByName.get("t_binary_uuid")).toBe("binary");
+    expect(categoryByName.get("t_dbpointer")).toBe("other");
+    expect(categoryByName.get("t_js_scope")).toBe("other");
+    expect(categoryByName.get("t_symbol")).toBe("text");
     expect(categoryByName.get("t_decimal128")).toBe("decimal");
     expect(categoryByName.get("t_timestamp")).toBe("datetime");
+
+    expect(
+      columns.find((column) => column.name === "t_binary_uuid")?.bsonSubtype,
+    ).toBe(4);
 
     expect(describedTypeByName).toEqual(typeByName);
   });
@@ -389,7 +410,7 @@ describe("MongoDBDriver schema type inference", () => {
       {
         _id: "64a1b2c3d4e5f67890abcdef",
         t_binary: "AQIDBAUGB/8=",
-        t_binary_uuid: "11223344-5566-7788-99aa-bbccddeeffff",
+        t_binary_uuid: "ESIzRFVmd4iZqrvM3e7//w==",
         t_date: "2024-07-04 12:00:00",
         t_decimal128: "123456789.987654321",
         t_int64: "9223372036854775807",
@@ -427,24 +448,61 @@ describe("MongoDBDriver schema type inference", () => {
 
     expect(columnsByName.get("t_binary")?.type).toBe("binData");
     expect(columnsByName.get("t_binary")?.category).toBe("binary");
-    expect(columnsByName.get("t_binary_uuid")?.type).toBe("uuid");
-    expect(columnsByName.get("t_binary_uuid")?.category).toBe("uuid");
+    expect(columnsByName.get("t_binary_uuid")?.type).toBe("binData");
+    expect(columnsByName.get("t_binary_uuid")?.category).toBe("binary");
+    expect(columnsByName.get("t_binary_uuid")?.bsonSubtype).toBe(4);
     expect(columnsByName.get("t_date")?.type).toBe("date");
     expect(columnsByName.get("t_date")?.category).toBe("datetime");
-    expect(columnsByName.get("t_decimal128")?.type).toBe("decimal128");
-    expect(columnsByName.get("t_int64")?.type).toBe("int64");
+    expect(columnsByName.get("t_decimal128")?.type).toBe("decimal");
+    expect(columnsByName.get("t_int64")?.type).toBe("long");
     expect(columnsByName.get("t_timestamp")?.type).toBe("timestamp");
     expect(columnsByName.get("t_timestamp")?.category).toBe("datetime");
 
     expect(page.rows[0]).toEqual({
       _id: "64a1b2c3d4e5f67890abcdef",
       t_binary: "AQIDBAUGB/8=",
-      t_binary_uuid: "11223344-5566-7788-99aa-bbccddeeffff",
+      t_binary_uuid: "ESIzRFVmd4iZqrvM3e7//w==",
       t_date: "2024-07-04 12:00:00",
       t_decimal128: "123456789.987654321",
       t_int64: "9223372036854775807",
       t_timestamp: "2024-07-04 12:00:00",
     });
+  });
+
+  it("prefers non-null samples for nullable MongoDB fields", async () => {
+    const driver = new MongoDBDriver({
+      id: "mongodb-nullable-sample-types",
+      type: "mongodb",
+      name: "mongo-nullable-sample-types",
+      host: "localhost",
+      port: 27017,
+      database: "test",
+    });
+
+    const readSchemaDocumentsMock = vi.fn().mockResolvedValue([
+      {
+        _id: new ObjectId("64a1b2c3d4e5f67890abcdef"),
+        notes: null,
+      },
+      {
+        _id: new ObjectId("64a1b2c3d4e5f67890abcdee"),
+        notes: "Priority order - handle with care",
+      },
+    ]);
+
+    (
+      driver as unknown as {
+        readSchemaDocuments: typeof readSchemaDocumentsMock;
+      }
+    ).readSchemaDocuments = readSchemaDocumentsMock;
+
+    const columns = await driver.describeColumns("test", "test", "orders");
+    const notesColumn = columns.find((column) => column.name === "notes");
+
+    expect(notesColumn?.type).toBe("string");
+    expect(notesColumn?.nativeType).toBe("string");
+    expect(notesColumn?.category).toBe("text");
+    expect(notesColumn?.nullable).toBe(true);
   });
 
   it("normalizes datetime filters against Mongo display values", async () => {

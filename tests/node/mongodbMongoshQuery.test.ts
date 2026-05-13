@@ -1,4 +1,16 @@
-import { Binary, Decimal128, Long, Timestamp, UUID } from "mongodb";
+import {
+  Binary,
+  BSONSymbol,
+  Code,
+  DBRef,
+  Decimal128,
+  Int32,
+  Long,
+  MaxKey,
+  MinKey,
+  ObjectId,
+  Timestamp,
+} from "mongodb";
 import { describe, expect, it, vi } from "vitest";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
@@ -162,7 +174,7 @@ describe("MongoDBDriver — mongosh query()", () => {
     expect(byColumn).toMatchObject({
       _id: "64a1b2c3d4e5f67890abcdef",
       t_binary: "AQIDBAUGB/8=",
-      t_binary_uuid: "11223344-5566-7788-99aa-bbccddeeffff",
+      t_binary_uuid: "ESIzRFVmd4iZqrvM3e7//w==",
       t_date: "2024-07-04 12:00:00",
       t_decimal128: "123456789.987654321",
       t_int64: "9223372036854775807",
@@ -259,7 +271,6 @@ describe("MongoDBDriver — mongosh query()", () => {
 
   it("handles ObjectId() in filter", async () => {
     const { driver, mockFind } = createMockDriver();
-    const { ObjectId } = await import("mongodb");
     await driver.query(
       'db.users.find({ _id: ObjectId("507f1f77bcf86cd799439011") })',
     );
@@ -272,6 +283,77 @@ describe("MongoDBDriver — mongosh query()", () => {
         bsonRegExp: true,
       },
     );
+  });
+
+  it("executes generated mutation preview with BSON literals", async () => {
+    const { driver, mockUpdateMany } = createMockDriver();
+    const preview = driver.buildMutationPreviewStatement(
+      "update",
+      "rapidb_mongo_db",
+      "rapidb_mongo_db",
+      "bson_types",
+      {
+        primaryKeys: { _id: "6a0412be9e2b63ce6b3d8c69" },
+        changes: {
+          t_binary_uuid: new Binary(
+            Buffer.from("ESIzRFVmd4iZqrvM3e6//w==", "base64"),
+            4,
+          ),
+          t_dbpointer: new DBRef(
+            "users",
+            new ObjectId("507f1f77bcf86cd799439011"),
+            "rapidb_mongo_db",
+          ),
+          t_date: new Date("2024-07-04T12:00:00.000Z"),
+          t_timestamp: new Timestamp({ t: 1720094400, i: 1 }),
+          t_decimal128: Decimal128.fromString("123456789.987654321"),
+          t_int32: new Int32(42),
+          t_int64: Long.fromString("9223372036854775807"),
+          t_js: new Code("function() { return true; }"),
+          t_js_scope: new Code("function() { return x; }", { x: 1 }),
+          t_symbol: new BSONSymbol("alpha"),
+          t_minkey: new MinKey(),
+          t_maxkey: new MaxKey(),
+          t_undefined: undefined,
+        },
+      },
+    );
+
+    await driver.query(preview);
+
+    expect(mockUpdateMany).toHaveBeenCalledTimes(1);
+    const [criteria, update] = mockUpdateMany.mock.calls[0] ?? [];
+    expect(criteria).toEqual({
+      _id: new ObjectId("6a0412be9e2b63ce6b3d8c69"),
+    });
+
+    const setClause = (update as { $set?: Record<string, unknown> }).$set ?? {};
+    const binaryValue = setClause.t_binary_uuid as Binary;
+    const binaryWithBuffer = binaryValue as unknown as {
+      buffer?: Buffer;
+      position?: number;
+      sub_type?: number;
+    };
+
+    expect(binaryValue).toBeInstanceOf(Binary);
+    expect(binaryWithBuffer.sub_type).toBe(4);
+    expect(
+      binaryWithBuffer.buffer
+        ?.subarray(0, binaryWithBuffer.position)
+        .toString("base64"),
+    ).toBe("ESIzRFVmd4iZqrvM3e6//w==");
+    expect(setClause.t_date).toBeInstanceOf(Date);
+    expect(setClause.t_timestamp).toBeInstanceOf(Timestamp);
+    expect(setClause.t_decimal128).toBeInstanceOf(Decimal128);
+    expect(setClause.t_int32).toBeInstanceOf(Int32);
+    expect(setClause.t_int64).toBeInstanceOf(Long);
+    expect(setClause.t_dbpointer).toBeInstanceOf(DBRef);
+    expect(setClause.t_js).toBeInstanceOf(Code);
+    expect((setClause.t_js_scope as Code).scope).toEqual({ x: 1 });
+    expect(setClause.t_symbol).toBeInstanceOf(BSONSymbol);
+    expect(setClause.t_minkey).toBeInstanceOf(MinKey);
+    expect(setClause.t_maxkey).toBeInstanceOf(MaxKey);
+    expect(setClause).toHaveProperty("t_undefined", undefined);
   });
 
   it("returns empty result for empty input", async () => {
@@ -371,16 +453,17 @@ describe("MongoDBDriver — buildMutationPreviewStatement()", () => {
   });
 
   it("serializes coerced BSON values as valid mongosh literals", () => {
-    const uuidColumn: ColumnTypeMeta = {
+    const binData4Column: ColumnTypeMeta = {
       name: "t_binary_uuid",
-      type: "uuid",
-      nativeType: "uuid",
+      type: "binData",
+      nativeType: "binData",
+      bsonSubtype: 4,
       nullable: true,
       isPrimaryKey: false,
       isForeignKey: false,
-      category: "uuid",
-      filterable: true,
-      filterOperators: ["eq"],
+      category: "binary",
+      filterable: false,
+      filterOperators: [],
       valueSemantics: "plain",
     };
     const dateColumn: ColumnTypeMeta = {
@@ -416,8 +499,8 @@ describe("MongoDBDriver — buildMutationPreviewStatement()", () => {
       {
         values: {
           t_binary_uuid: driver.coerceInputValue(
-            "11223344-5566-7788-99aa-bbccddeeffff",
-            uuidColumn,
+            "ESIzRFVmd4iZqrvM3e7//w==",
+            binData4Column,
           ),
           t_date: driver.coerceInputValue("2024-07-04 12:00:00", dateColumn),
           t_timestamp: driver.coerceInputValue(
@@ -434,16 +517,17 @@ describe("MongoDBDriver — buildMutationPreviewStatement()", () => {
   });
 
   it("round-trips displayed Mongo values back into canonical display format", () => {
-    const uuidColumn: ColumnTypeMeta = {
+    const binData4Column: ColumnTypeMeta = {
       name: "t_binary_uuid",
-      type: "uuid",
-      nativeType: "uuid",
+      type: "binData",
+      nativeType: "binData",
+      bsonSubtype: 4,
       nullable: true,
       isPrimaryKey: false,
       isForeignKey: false,
-      category: "uuid",
-      filterable: true,
-      filterOperators: ["eq"],
+      category: "binary",
+      filterable: false,
+      filterOperators: [],
       valueSemantics: "plain",
     };
     const dateColumn: ColumnTypeMeta = {
@@ -473,10 +557,19 @@ describe("MongoDBDriver — buildMutationPreviewStatement()", () => {
 
     expect(
       driver.coerceInputValue(
-        "11223344-5566-7788-99aa-bbccddeeffff",
-        uuidColumn,
+        'BinData(4, "ESIzRFVmd4iZqrvM3e7//w==")',
+        binData4Column,
       ),
-    ).toBeInstanceOf(UUID);
+    ).toBeInstanceOf(Binary);
+    expect(
+      driver.formatOutputValue(
+        driver.coerceInputValue(
+          'BinData(4, "ESIzRFVmd4iZqrvM3e7//w==")',
+          binData4Column,
+        ),
+        binData4Column,
+      ),
+    ).toBe("ESIzRFVmd4iZqrvM3e7//w==");
     expect(
       driver.formatOutputValue(
         driver.coerceInputValue("2024-07-04T12:00:00.000Z", dateColumn),

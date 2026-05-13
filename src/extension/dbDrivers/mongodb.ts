@@ -2,7 +2,9 @@ import vm from "node:vm";
 import {
   Binary,
   BSONRegExp,
+  BSONSymbol,
   Code,
+  DBRef,
   Decimal128,
   Int32,
   Long,
@@ -62,6 +64,7 @@ const MONGODB_ENTITY_MANIFEST: DriverEntityManifest = {
 type MongoSchemaType = {
   category: TypeCategory;
   nativeType: string;
+  bsonSubtype?: number;
 };
 
 const MONGO_SCALAR_MISS = Symbol("mongo-scalar-miss");
@@ -90,6 +93,16 @@ function binarySubtypeFromNativeType(nativeType: string): number {
   return match ? Number.parseInt(match[1], 10) : 0;
 }
 
+function binarySubtypeFromColumn(
+  column: Pick<ColumnTypeMeta, "nativeType"> & {
+    bsonSubtype?: number;
+  },
+): number {
+  return typeof column.bsonSubtype === "number"
+    ? column.bsonSubtype
+    : binarySubtypeFromNativeType(column.nativeType);
+}
+
 function parseMongoBase64(value: string): Buffer | null {
   const trimmed = unwrapQuotedMongoDisplay(value);
   if (!trimmed || trimmed.length % 4 !== 0 || !BASE64_VALUE_RE.test(trimmed)) {
@@ -97,6 +110,71 @@ function parseMongoBase64(value: string): Buffer | null {
   }
   try {
     return Buffer.from(trimmed, "base64");
+  } catch {
+    return null;
+  }
+}
+
+function parseMongoDisplayBinData(
+  value: string,
+): { subtype: number; bytes: Buffer } | null {
+  const match = /^(?:new\s+)?BinData\(\s*(\d+)\s*,\s*"([^"]*)"\s*\)$/i.exec(
+    value.trim(),
+  );
+  if (!match) return null;
+  const subtype = Number.parseInt(match[1], 10);
+  const bytes = parseMongoBase64(match[2]);
+  return bytes !== null ? { subtype, bytes } : null;
+}
+
+function parseMongoDisplayJavascriptWithScope(value: string): Code | null {
+  try {
+    const parsed = JSON.parse(value) as {
+      code?: unknown;
+      scope?: unknown;
+    };
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      typeof parsed.code !== "string"
+    ) {
+      return null;
+    }
+    const scope = parsed.scope;
+    return scope !== null && typeof scope === "object" && !Array.isArray(scope)
+      ? new Code(parsed.code, scope as Record<string, unknown>)
+      : new Code(parsed.code);
+  } catch {
+    return null;
+  }
+}
+
+function parseMongoDisplayDbPointer(value: string): DBRef | null {
+  try {
+    const parsed = JSON.parse(value) as {
+      $ref?: unknown;
+      $id?: unknown;
+      $db?: unknown;
+    };
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      typeof parsed.$ref !== "string"
+    ) {
+      return null;
+    }
+    const rawId = parsed.$id;
+    const oid =
+      typeof rawId === "string" &&
+      ObjectId.isValid(rawId) &&
+      rawId.length === 24
+        ? new ObjectId(rawId)
+        : rawId;
+    return new DBRef(
+      parsed.$ref,
+      oid as ObjectId,
+      typeof parsed.$db === "string" ? parsed.$db : undefined,
+    );
   } catch {
     return null;
   }
@@ -164,6 +242,37 @@ function parseMongoRegexInput(value: string): RegExp | null {
   } catch {
     return null;
   }
+}
+
+function bsonCodeScope(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const scope = (value as { scope?: unknown }).scope;
+  return scope !== null && typeof scope === "object" && !Array.isArray(scope)
+    ? (scope as Record<string, unknown>)
+    : null;
+}
+
+function bsonDbRefValue(value: unknown): {
+  collection: string;
+  oid: unknown;
+  database?: string;
+} | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const collection = (value as { collection?: unknown }).collection;
+  if (typeof collection !== "string") {
+    return null;
+  }
+  const oid = (value as { oid?: unknown }).oid;
+  const database = (value as { db?: unknown }).db;
+  return {
+    collection,
+    oid,
+    database: typeof database === "string" ? database : undefined,
+  };
 }
 
 function bsonTypeTag(value: unknown): string | undefined {
@@ -242,21 +351,7 @@ function formatMongoScalarValue(
   const ctorName = bsonCtorName(value);
   const binarySubtype = bsonBinarySubtype(value);
 
-  if (ctorName === "UUID") {
-    // Already promoted to UUID by the driver — toString() returns hyphenated hex
-    return String(value);
-  }
-
-  if (tag === "Binary" && binarySubtype === 4) {
-    // Binary(4) that was NOT auto-promoted: try converting, fall back to base64
-    const toUuid = (value as { toUUID?: unknown }).toUUID;
-    if (typeof toUuid === "function") {
-      try {
-        return String(toUuid.call(value));
-      } catch {
-        // Not a valid 16-byte UUID — encode as base64 instead
-      }
-    }
+  if (ctorName === "UUID" || (tag === "Binary" && binarySubtype === 4)) {
     const bytes = bsonBinaryBytes(value);
     return bytes ? bytes.toString("base64") : String(value);
   }
@@ -268,12 +363,28 @@ function formatMongoScalarValue(
     }
     case "Code": {
       const code = (value as { code?: unknown }).code;
+      const scope = bsonCodeScope(value);
+      if (typeof code === "string" && scope) {
+        return JSON.stringify({ code, scope });
+      }
       return typeof code === "string" ? code : String(value);
+    }
+    case "DBRef": {
+      const dbRef = bsonDbRefValue(value);
+      return dbRef
+        ? JSON.stringify({
+            $ref: dbRef.collection,
+            $id: toMongoJsonValue(dbRef.oid),
+            ...(dbRef.database ? { $db: dbRef.database } : {}),
+          })
+        : String(value);
     }
     case "Decimal128":
     case "Double":
     case "Int32":
     case "Long":
+      return String(value);
+    case "BSONSymbol":
       return String(value);
     case "Timestamp": {
       const increment = (value as { low?: unknown }).low;
@@ -358,14 +469,16 @@ function inferMongoSchemaType(value: unknown): MongoSchemaType {
   }
 
   if (typeof value === "number") {
+    const isInt32 =
+      Number.isInteger(value) && value >= -2147483648 && value <= 2147483647;
     return {
       category: Number.isInteger(value) ? "integer" : "float",
-      nativeType: Number.isInteger(value) ? "number" : "double",
+      nativeType: Number.isInteger(value) && isInt32 ? "int" : "double",
     };
   }
 
   if (typeof value === "bigint") {
-    return { category: "integer", nativeType: "int64" };
+    return { category: "integer", nativeType: "long" };
   }
 
   if (value instanceof Date) {
@@ -387,35 +500,33 @@ function inferMongoSchemaType(value: unknown): MongoSchemaType {
   const tag = bsonTypeTag(value);
   const ctorName = bsonCtorName(value);
   if (ctorName === "UUID" || bsonBinarySubtype(value) === 4) {
-    return { category: "uuid", nativeType: "uuid" };
+    return { category: "binary", nativeType: "binData", bsonSubtype: 4 };
   }
 
   switch (tag) {
     case "Binary": {
       const subtype = bsonBinarySubtype(value);
-      if (subtype === 4) {
-        return { category: "uuid", nativeType: "uuid" };
-      }
       return {
         category: "binary",
-        nativeType:
-          typeof subtype === "number" && subtype !== 0
-            ? `binData(${subtype})`
-            : "binData",
+        nativeType: "binData",
+        bsonSubtype: typeof subtype === "number" ? subtype : 0,
       };
     }
     case "Code":
-      return { category: "other", nativeType: "javascript" };
+      return {
+        category: "other",
+        nativeType: bsonCodeScope(value) ? "javascriptWithScope" : "javascript",
+      };
     case "DBRef":
-      return { category: "other", nativeType: "dbRef" };
+      return { category: "other", nativeType: "dbPointer" };
     case "Decimal128":
-      return { category: "decimal", nativeType: "decimal128" };
+      return { category: "decimal", nativeType: "decimal" };
     case "Double":
       return { category: "float", nativeType: "double" };
     case "Int32":
-      return { category: "integer", nativeType: "int32" };
+      return { category: "integer", nativeType: "int" };
     case "Long":
-      return { category: "integer", nativeType: "int64" };
+      return { category: "integer", nativeType: "long" };
     case "MaxKey":
       return { category: "other", nativeType: "maxKey" };
     case "MinKey":
@@ -424,11 +535,37 @@ function inferMongoSchemaType(value: unknown): MongoSchemaType {
       return { category: "text", nativeType: "objectId" };
     case "BSONRegExp":
       return { category: "other", nativeType: "regex" };
+    case "BSONSymbol":
+      return { category: "text", nativeType: "symbol" };
     case "Timestamp":
       return { category: "datetime", nativeType: "timestamp" };
     default:
       return { category: "json", nativeType: "object" };
   }
+}
+
+function selectMongoSchemaSample(
+  documents: readonly Record<string, unknown>[],
+  fieldName: string,
+): unknown {
+  let fallbackSample: unknown;
+
+  for (const document of documents) {
+    if (!Object.hasOwn(document, fieldName)) {
+      continue;
+    }
+
+    const value = document[fieldName];
+    if (fallbackSample === undefined) {
+      fallbackSample = value;
+    }
+
+    if (value !== null && value !== undefined) {
+      return value;
+    }
+  }
+
+  return fallbackSample;
 }
 
 export class MongoDBDriver implements IDBDriver {
@@ -680,11 +817,81 @@ export class MongoDBDriver implements IDBDriver {
 
     const sandbox = {
       db: createDbProxy(),
-      ObjectId: (hex: string) => new ObjectId(hex),
-      ISODate: (s: string) => new Date(s),
-      NumberLong: (n: number | string) => Number(n),
-      NumberInt: (n: number | string) => Number(n),
-      NumberDecimal: (s: string) => parseFloat(s),
+      Date: function mongoDate(value: string) {
+        return new globalThis.Date(value);
+      },
+      RegExp: function mongoRegExp(pattern: string, flags?: string) {
+        return new globalThis.RegExp(pattern, flags);
+      },
+      ObjectId: function mongoObjectId(hex: string) {
+        return new ObjectId(hex);
+      },
+      ISODate: function mongoIsoDate(value: string) {
+        return new Date(value);
+      },
+      BinData: function mongoBinData(subtype: number | string, base64: string) {
+        return new Binary(
+          Buffer.from(String(base64), "base64"),
+          Number(subtype),
+        );
+      },
+      DBRef: function mongoDBRef(
+        collection: string,
+        oid: unknown,
+        db?: string,
+      ) {
+        return new DBRef(
+          String(collection),
+          oid as ObjectId,
+          db ? String(db) : undefined,
+        );
+      },
+      BSONSymbol: function mongoBSONSymbol(value: string) {
+        return new BSONSymbol(String(value));
+      },
+      NumberLong: function mongoNumberLong(value: number | string) {
+        return Long.fromString(String(value));
+      },
+      NumberInt: function mongoNumberInt(value: number | string) {
+        return new Int32(Number.parseInt(String(value), 10));
+      },
+      NumberDecimal: function mongoNumberDecimal(value: string) {
+        return Decimal128.fromString(String(value));
+      },
+      Timestamp: function mongoTimestamp(
+        secondsOrSpec:
+          | number
+          | string
+          | {
+              t?: unknown;
+              i?: unknown;
+            },
+        increment?: number | string,
+      ) {
+        if (secondsOrSpec && typeof secondsOrSpec === "object") {
+          return new Timestamp({
+            t: Number((secondsOrSpec as { t?: unknown }).t ?? 0),
+            i: Number((secondsOrSpec as { i?: unknown }).i ?? 0),
+          });
+        }
+        return new Timestamp({
+          t: Number(secondsOrSpec),
+          i: Number(increment ?? 0),
+        });
+      },
+      Code: function mongoCode(source: string, scope?: unknown) {
+        return scope !== undefined &&
+          scope !== null &&
+          typeof scope === "object"
+          ? new Code(String(source), scope as Record<string, unknown>)
+          : new Code(String(source));
+      },
+      MinKey: function mongoMinKey() {
+        return new MinKey();
+      },
+      MaxKey: function mongoMaxKey() {
+        return new MaxKey();
+      },
     };
 
     try {
@@ -1034,6 +1241,14 @@ export class MongoDBDriver implements IDBDriver {
         : normalized;
     }
 
+    if (column.nativeType === "null") {
+      return /^null$/i.test(normalized) ? null : normalized;
+    }
+
+    if (column.nativeType === "undefined") {
+      return /^undefined$/i.test(normalized) ? undefined : normalized;
+    }
+
     if (column.nativeType === "uuid") {
       return UUID_VALUE_RE.test(normalized)
         ? UUID.createFromHexString(normalized.replace(/-/g, ""))
@@ -1048,7 +1263,7 @@ export class MongoDBDriver implements IDBDriver {
       return parseMongoTimestampInput(normalized) ?? normalized;
     }
 
-    if (column.nativeType === "decimal128") {
+    if (column.nativeType === "decimal" || column.nativeType === "decimal128") {
       try {
         return Decimal128.fromString(normalized);
       } catch {
@@ -1056,13 +1271,13 @@ export class MongoDBDriver implements IDBDriver {
       }
     }
 
-    if (column.nativeType === "int32") {
+    if (column.nativeType === "int" || column.nativeType === "int32") {
       return /^[+-]?\d+$/.test(normalized)
         ? new Int32(Number.parseInt(normalized, 10))
         : normalized;
     }
 
-    if (column.nativeType === "int64") {
+    if (column.nativeType === "long" || column.nativeType === "int64") {
       return /^[+-]?\d+$/.test(normalized)
         ? Long.fromString(normalized)
         : normalized;
@@ -1084,6 +1299,18 @@ export class MongoDBDriver implements IDBDriver {
       return new Code(normalized);
     }
 
+    if (column.nativeType === "javascriptWithScope") {
+      return parseMongoDisplayJavascriptWithScope(normalized) ?? normalized;
+    }
+
+    if (column.nativeType === "dbPointer" || column.nativeType === "dbRef") {
+      return parseMongoDisplayDbPointer(normalized) ?? normalized;
+    }
+
+    if (column.nativeType === "symbol") {
+      return new BSONSymbol(normalized);
+    }
+
     if (column.nativeType === "regex") {
       return parseMongoRegexInput(normalized) ?? normalized;
     }
@@ -1097,9 +1324,13 @@ export class MongoDBDriver implements IDBDriver {
     }
 
     if (/^binData(?:\(\d+\))?$/i.test(column.nativeType)) {
+      const binDataParsed = parseMongoDisplayBinData(normalized);
+      if (binDataParsed) {
+        return new Binary(binDataParsed.bytes, binDataParsed.subtype);
+      }
       const bytes = parseMongoBase64(normalized);
       return bytes
-        ? new Binary(bytes, binarySubtypeFromNativeType(column.nativeType))
+        ? new Binary(bytes, binarySubtypeFromColumn(column))
         : normalized;
     }
 
@@ -1244,16 +1475,16 @@ export class MongoDBDriver implements IDBDriver {
       .sort((left, right) => left.localeCompare(right))
       .map((name) => {
         const isPrimaryKey = name === "_id";
-        const sample = documents.find((document) =>
-          Object.hasOwn(document, name),
-        )?.[name];
-        const { category, nativeType } = inferMongoSchemaType(sample);
+        const sample = selectMongoSchemaSample(documents, name);
+        const { category, nativeType, bsonSubtype } =
+          inferMongoSchemaType(sample);
         const filterable = category !== "binary" && category !== "spatial";
 
         return {
           name,
           type: nativeType,
           nativeType,
+          bsonSubtype,
           category,
           nullable: isPrimaryKey ? false : true,
           defaultValue: undefined,
@@ -1351,7 +1582,8 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   private serializeMongosh(value: unknown): string {
-    if (value === null || value === undefined) return "null";
+    if (value === null) return "null";
+    if (value === undefined) return "undefined";
     if (typeof value === "boolean") return String(value);
     if (typeof value === "number") return String(value);
     if (typeof value === "bigint") return value.toString();
@@ -1378,6 +1610,12 @@ export class MongoDBDriver implements IDBDriver {
       const bytes = bsonBinaryBytes(value);
       return `new BinData(${bsonBinarySubtype(value) ?? 0}, ${JSON.stringify(bytes?.toString("base64") ?? "")})`;
     }
+    if (value instanceof DBRef) {
+      return `new DBRef(${JSON.stringify(value.collection)}, ${this.serializeMongosh(value.oid)}${value.db ? `, ${JSON.stringify(value.db)}` : ""})`;
+    }
+    if (value instanceof BSONSymbol) {
+      return `new BSONSymbol(${JSON.stringify(String(value))})`;
+    }
     if (value instanceof Decimal128) {
       return `new NumberDecimal(${JSON.stringify(value.toString())})`;
     }
@@ -1391,7 +1629,10 @@ export class MongoDBDriver implements IDBDriver {
       return `new NumberLong(${JSON.stringify(value.toString())})`;
     }
     if (value instanceof Code) {
-      return `new Code(${JSON.stringify(value.code)})`;
+      const scope = bsonCodeScope(value);
+      return scope
+        ? `new Code(${JSON.stringify(value.code)}, ${this.serializeMongosh(scope)})`
+        : `new Code(${JSON.stringify(value.code)})`;
     }
     if (value instanceof BSONRegExp) {
       return `new RegExp(${JSON.stringify(value.pattern)}, ${JSON.stringify(value.options)})`;
@@ -1455,7 +1696,6 @@ export class MongoDBDriver implements IDBDriver {
       column.category === "datetime" ||
       column.nativeType === "date" ||
       column.nativeType === "timestamp" ||
-      column.nativeType === "uuid" ||
       column.nativeType === "objectId"
     ) {
       const coerced = this.coerceInputValue(trimmed, column);
