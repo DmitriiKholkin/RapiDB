@@ -1,5 +1,6 @@
 import type { ConnectionConfig } from "./connectionConfig";
 import { CONNECTION_TYPES, type ConnectionType } from "./connectionTypes";
+import type { PrimaryKeyRole } from "./tableTypes";
 
 export interface WebviewMessageEnvelope<
   TType extends string = string,
@@ -62,6 +63,7 @@ export interface ErdNodeColumn {
   name: string;
   type: string;
   isPrimaryKey: boolean;
+  primaryKeyRole?: PrimaryKeyRole;
   isForeignKey: boolean;
   nullable: boolean;
 }

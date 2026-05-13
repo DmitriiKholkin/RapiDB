@@ -153,13 +153,15 @@ export class RedisDriver implements IDBDriver {
     table: string,
   ): Promise<ColumnMeta[]> {
     const rows = await this.readRows(table, 200);
-    return inferColumnsFromRows(rows, "key").map((column) => ({
+    return inferColumnsFromRows(rows, "key", {
+      nullableMode: "schemaLess",
+    }).map((column) => ({
       name: column.name,
       type: column.nativeType,
-      nullable: column.name !== "key" && column.nullable,
+      nullable: column.nullable,
       defaultValue: undefined,
-      isPrimaryKey: column.name === "key",
-      primaryKeyOrdinal: column.name === "key" ? 1 : undefined,
+      isPrimaryKey: column.isPrimaryKey,
+      primaryKeyOrdinal: column.primaryKeyOrdinal,
       isForeignKey: false,
     }));
   }
@@ -170,10 +172,9 @@ export class RedisDriver implements IDBDriver {
     table: string,
   ): Promise<ColumnTypeMeta[]> {
     const rows = await this.readRows(table, 200);
-    return inferColumnsFromRows(rows, "key").map((column) => ({
-      ...column,
-      nullable: column.name !== "key" && column.nullable,
-    }));
+    return inferColumnsFromRows(rows, "key", {
+      nullableMode: "schemaLess",
+    });
   }
 
   async getIndexes(): Promise<IndexMeta[]> {
@@ -252,7 +253,9 @@ export class RedisDriver implements IDBDriver {
     const sorted = applySort(filtered, request.sort);
     const paged = pageRows(sorted, request.page, request.pageSize);
     return {
-      columns: inferColumnsFromRows(sorted, "key"),
+      columns: inferColumnsFromRows(sorted, "key", {
+        nullableMode: "schemaLess",
+      }),
       rows: paged,
       totalCount: request.skipCount ? 0 : sorted.length,
     };

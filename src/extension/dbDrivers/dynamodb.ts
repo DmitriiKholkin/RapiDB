@@ -5,12 +5,10 @@ import {
 } from "@aws-sdk/client-dynamodb";
 import { fromIni } from "@aws-sdk/credential-providers";
 import {
-  DeleteCommand,
   DynamoDBDocumentClient,
-  PutCommand,
-  ScanCommand,
-  UpdateCommand,
+  ExecuteStatementCommand,
 } from "@aws-sdk/lib-dynamodb";
+import type { PrimaryKeyRole } from "../../shared/tableTypes";
 import type { ConnectionConfig } from "../connectionManager";
 import {
   applyFilters,
@@ -18,7 +16,6 @@ import {
   flattenRootRecord,
   inferColumnsFromRows,
   pageRows,
-  stringifyCommandPayload,
   unsupported,
 } from "./nosqlUtils";
 import type {
@@ -29,9 +26,13 @@ import type {
   DriverEntityManifest,
   DriverInsertRowRequest,
   DriverMutationResult,
+  DriverSortConfig,
   DriverTablePageRequest,
   DriverTablePageResult,
   DriverUpdateRowsRequest,
+  FilterConditionResult,
+  FilterExpression,
+  FilterOperator,
   ForeignKeyMeta,
   IDBDriver,
   IndexMeta,
@@ -53,6 +54,9 @@ const DYNAMODB_ENTITY_MANIFEST: DriverEntityManifest = {
     triggers: "not_applicable",
   },
 };
+
+const DYNAMODB_MAX_TABLE_ROWS = 5000;
+const DYNAMODB_READ_BATCH_SIZE = 200;
 
 export class DynamoDBDriver implements IDBDriver {
   private client: DynamoDBClient | null = null;
@@ -111,27 +115,32 @@ export class DynamoDBDriver implements IDBDriver {
     };
   }
 
+  private databaseName(): string {
+    return this.config.database || this.config.awsRegion || "default";
+  }
+
   async listDatabases(): Promise<DatabaseInfo[]> {
     return [
       {
-        name: this.config.database || this.config.awsRegion || "default",
+        name: this.databaseName(),
         schemas: [],
       },
     ];
   }
 
-  async listSchemas(): Promise<SchemaInfo[]> {
-    return [{ name: "public" }];
+  async listSchemas(database: string): Promise<SchemaInfo[]> {
+    return [{ name: database || this.databaseName() }];
   }
 
-  async listObjects(): Promise<TableInfo[]> {
+  async listObjects(database: string): Promise<TableInfo[]> {
     try {
       const result = await this.requireClient().send(new ListTablesCommand({}));
+      const schemaName = database || this.databaseName();
       return (result.TableNames ?? [])
         .slice()
         .sort((left, right) => left.localeCompare(right))
         .map((tableName) => ({
-          schema: "public",
+          schema: schemaName,
           name: tableName,
           type: "table",
         }));
@@ -145,11 +154,14 @@ export class DynamoDBDriver implements IDBDriver {
     _schema: string,
     table: string,
   ): Promise<ColumnMeta[]> {
-    const [rows, { keys, attrTypes }] = await Promise.all([
+    const [rows, { keys, keyRoles, attrTypes }] = await Promise.all([
       this.readRows(table, 1000),
       this.getTableSchema(table),
     ]);
-    const columns = inferColumnsFromRows(rows, keys[0] ?? "id");
+    const columns = inferColumnsFromRows(rows, keys[0] ?? "id", {
+      primaryKeyNames: keys,
+      nullableMode: "schemaLess",
+    });
     return columns.map((column) => {
       const attrType = attrTypes.get(column.name);
       return {
@@ -157,12 +169,11 @@ export class DynamoDBDriver implements IDBDriver {
         type: attrType
           ? this.dynamoAttrTypeToNative(attrType)
           : column.nativeType,
-        nullable: !keys.includes(column.name),
+        nullable: column.nullable,
         defaultValue: undefined,
-        isPrimaryKey: keys.includes(column.name),
-        primaryKeyOrdinal: keys.includes(column.name)
-          ? keys.indexOf(column.name) + 1
-          : undefined,
+        isPrimaryKey: column.isPrimaryKey,
+        primaryKeyOrdinal: column.primaryKeyOrdinal,
+        primaryKeyRole: keyRoles.get(column.name),
         isForeignKey: false,
       };
     });
@@ -173,11 +184,14 @@ export class DynamoDBDriver implements IDBDriver {
     _schema: string,
     table: string,
   ): Promise<ColumnTypeMeta[]> {
-    const [rows, { keys, attrTypes }] = await Promise.all([
+    const [rows, { keys, keyRoles, attrTypes }] = await Promise.all([
       this.readRows(table, 1000),
       this.getTableSchema(table),
     ]);
-    const columns = inferColumnsFromRows(rows, keys[0] ?? "id");
+    const columns = inferColumnsFromRows(rows, keys[0] ?? "id", {
+      primaryKeyNames: keys,
+      nullableMode: "schemaLess",
+    });
     return columns.map((column) => {
       const attrType = attrTypes.get(column.name);
       const nativeType = attrType
@@ -187,11 +201,7 @@ export class DynamoDBDriver implements IDBDriver {
         ...column,
         type: nativeType,
         nativeType,
-        nullable: !keys.includes(column.name),
-        isPrimaryKey: keys.includes(column.name),
-        primaryKeyOrdinal: keys.includes(column.name)
-          ? keys.indexOf(column.name) + 1
-          : undefined,
+        primaryKeyRole: keyRoles.get(column.name),
       };
     });
   }
@@ -267,116 +277,84 @@ export class DynamoDBDriver implements IDBDriver {
     }
 
     const startedAt = Date.now();
-    if (trimmed.startsWith("scan ")) {
-      const payload = JSON.parse(trimmed.slice("scan ".length)) as {
-        table: string;
-        limit?: number;
-      };
-      const rows = await this.readRows(payload.table, payload.limit ?? 200);
-      const columns = inferColumnsFromRows(rows, "id").map(
-        (column) => column.name,
+    const statementKind = this.detectPartiqlStatementKind(trimmed);
+    if (!statementKind) {
+      throw new Error(
+        'DynamoDB query mode expects a PartiQL statement, for example:\n  SELECT * FROM "Users"\n  INSERT INTO "Users" VALUE {\'id\': \'user-1\'}\n  UPDATE "Users" SET "email" = \'person@example.com\' WHERE "id" = \'user-1\'\n  DELETE FROM "Users" WHERE "id" = \'user-1\'',
       );
-      return {
-        columns,
-        rows: rows.map((row) => this.mapRowToQueryRow(row, columns)),
-        rowCount: rows.length,
-        executionTimeMs: Date.now() - startedAt,
-      };
     }
 
-    if (trimmed.startsWith("put ")) {
-      const payload = JSON.parse(trimmed.slice("put ".length)) as {
-        table: string;
-        item: Record<string, unknown>;
-      };
-      await this.requireDocumentClient().send(
-        new PutCommand({ TableName: payload.table, Item: payload.item }),
-      );
-      const row = { result: "ok", table: payload.table };
-      return {
-        columns: Object.keys(row),
-        rows: [this.mapRowToQueryRow(row, Object.keys(row))],
-        rowCount: 1,
-        affectedRows: 1,
-        executionTimeMs: Date.now() - startedAt,
-      };
-    }
-
-    if (trimmed.startsWith("update ")) {
-      const payload = JSON.parse(trimmed.slice("update ".length)) as {
-        table: string;
-        key: Record<string, unknown>;
-        set: Record<string, unknown>;
-      };
-      const entries = Object.entries(payload.set);
-      const expressionParts = entries.map(
-        ([,], index) => `#n${index} = :v${index}`,
-      );
-      const names = Object.fromEntries(
-        entries.map(([name], index) => [`#n${index}`, name]),
-      );
-      const values = Object.fromEntries(
-        entries.map(([, value], index) => [`:v${index}`, value]),
-      );
-      await this.requireDocumentClient().send(
-        new UpdateCommand({
-          TableName: payload.table,
-          Key: payload.key,
-          UpdateExpression: `SET ${expressionParts.join(", ")}`,
-          ExpressionAttributeNames: names,
-          ExpressionAttributeValues: values,
-        }),
-      );
-      const row = { result: "ok", table: payload.table };
-      return {
-        columns: Object.keys(row),
-        rows: [this.mapRowToQueryRow(row, Object.keys(row))],
-        rowCount: 1,
-        affectedRows: 1,
-        executionTimeMs: Date.now() - startedAt,
-      };
-    }
-
-    if (trimmed.startsWith("delete ")) {
-      const payload = JSON.parse(trimmed.slice("delete ".length)) as {
-        table: string;
-        key: Record<string, unknown>;
-      };
-      await this.requireDocumentClient().send(
-        new DeleteCommand({ TableName: payload.table, Key: payload.key }),
-      );
-      const row = { result: "ok", table: payload.table };
-      return {
-        columns: Object.keys(row),
-        rows: [this.mapRowToQueryRow(row, Object.keys(row))],
-        rowCount: 1,
-        affectedRows: 1,
-        executionTimeMs: Date.now() - startedAt,
-      };
-    }
-
-    throw new Error(
-      'DynamoDB query mode expects:\n  scan {"table":"Users","limit":100}\n  put {"table":"Users","item":{...}}\n  update {"table":"Users","key":{"id":"..."},"set":{"field":"value"}}\n  delete {"table":"Users","key":{"id":"..."}}',
+    const response = await this.executeStatement(trimmed, _params);
+    const rows = (response.Items ?? []).map((item) =>
+      flattenRootRecord(item as Record<string, unknown>),
     );
+    const columns = inferColumnsFromRows(rows, "id").map(
+      (column) => column.name,
+    );
+    const rowCount = rows.length;
+    const affectedRows =
+      statementKind === "select"
+        ? undefined
+        : rowCount > 0
+          ? rowCount
+          : statementKind === "delete"
+            ? 0
+            : 1;
+
+    return {
+      columns,
+      rows: rows.map((row) => this.mapRowToQueryRow(row, columns)),
+      rowCount,
+      affectedRows,
+      executionTimeMs: Date.now() - startedAt,
+    };
   }
 
   async readTablePage(
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
-    const rows = await this.readRows(request.table, 5000);
+    const schema = await this.getTableSchema(request.table);
+    const describedColumns = await this.describeColumns(
+      request.database,
+      request.schema,
+      request.table,
+    );
+    const rows = await this.readRows(request.table, DYNAMODB_MAX_TABLE_ROWS, {
+      filters: request.filters,
+      columns: describedColumns,
+      sort: request.sort,
+    });
     const filtered = applyFilters(rows, request.filters);
     const sorted = applySort(filtered, request.sort);
     const paged = pageRows(sorted, request.page, request.pageSize);
-    const keySchema = await this.getTableKeyNames(request.table);
-    const columns = inferColumnsFromRows(sorted, keySchema[0] ?? "id").map(
-      (column) => ({
-        ...column,
-        isPrimaryKey: keySchema.includes(column.name),
-        primaryKeyOrdinal: keySchema.includes(column.name)
-          ? keySchema.indexOf(column.name) + 1
-          : undefined,
-      }),
+    const describedByName = new Map(
+      describedColumns.map((column) => [column.name, column]),
     );
+    const sourceColumns =
+      sorted.length > 0
+        ? inferColumnsFromRows(sorted, schema.keys[0] ?? "id", {
+            primaryKeyNames: schema.keys,
+            nullableMode: "schemaLess",
+          })
+        : describedColumns;
+    const columns = sourceColumns.map((column) => {
+      const described = describedByName.get(column.name);
+      return {
+        ...column,
+        type: described?.type ?? column.type,
+        nativeType: described?.nativeType ?? column.nativeType,
+        category: described?.category ?? column.category,
+        nullable: described?.nullable ?? column.nullable,
+        filterable: described?.filterable ?? column.filterable,
+        filterOperators: described?.filterOperators ?? column.filterOperators,
+        valueSemantics: described?.valueSemantics ?? column.valueSemantics,
+        isPrimaryKey: schema.keys.includes(column.name),
+        primaryKeyOrdinal: schema.keys.includes(column.name)
+          ? schema.keys.indexOf(column.name) + 1
+          : undefined,
+        primaryKeyRole: schema.keyRoles.get(column.name),
+      };
+    });
     return {
       columns,
       rows: paged,
@@ -395,17 +373,13 @@ export class DynamoDBDriver implements IDBDriver {
 
     let affectedRows = 0;
     for (const update of request.updates) {
-      const key = Object.fromEntries(
-        keys
-          .filter((name) => update.primaryKeys[name] !== undefined)
-          .map((name) => [name, update.primaryKeys[name]]),
-      );
-      if (Object.keys(key).length === 0) {
-        continue;
+      const keyWhere = this.buildKeyWhereClause(keys, update.primaryKeys);
+      if (!keyWhere) {
+        throw new Error("DynamoDB update requires the full primary key.");
       }
 
       const entries = Object.entries(update.changes).filter(
-        ([name]) => !keys.includes(name),
+        ([name, value]) => !keys.includes(name) && value !== undefined,
       );
       for (const keyName of keys) {
         if (
@@ -421,35 +395,18 @@ export class DynamoDBDriver implements IDBDriver {
         continue;
       }
 
-      const expressionParts = entries.map(
-        ([, _value], index) => `#n${index} = :v${index}`,
+      const setClauses = entries.map(
+        ([name]) => `SET ${this.quoteIdentifier(name)} = ?`,
       );
-      const names = Object.fromEntries(
-        entries.map(([name], index) => [`#n${index}`, name]),
-      );
-      const values = Object.fromEntries(
-        entries.map(([, value], index) => [`:v${index}`, value]),
-      );
-      const conditionNames = Object.fromEntries(
-        keys.map((name, index) => [`#k${index}`, name]),
-      );
-      const conditionExpression = keys
-        .map((_, index) => `attribute_exists(#k${index})`)
-        .join(" AND ");
+      const parameters = [
+        ...entries.map(([, value]) => value),
+        ...keyWhere.params,
+      ];
 
       try {
-        await this.requireDocumentClient().send(
-          new UpdateCommand({
-            TableName: request.table,
-            Key: key,
-            UpdateExpression: `SET ${expressionParts.join(", ")}`,
-            ConditionExpression: conditionExpression,
-            ExpressionAttributeNames: {
-              ...names,
-              ...conditionNames,
-            },
-            ExpressionAttributeValues: values,
-          }),
+        await this.executeStatement(
+          `UPDATE ${this.quoteIdentifier(request.table)} ${setClauses.join(" ")} WHERE ${keyWhere.sql} RETURNING ALL NEW *`,
+          parameters,
         );
         affectedRows += 1;
       } catch (error: unknown) {
@@ -466,30 +423,13 @@ export class DynamoDBDriver implements IDBDriver {
   async insertRow(
     request: DriverInsertRowRequest,
   ): Promise<DriverMutationResult> {
-    const keys = await this.getTableKeyNames(request.table);
-    const conditionNames = Object.fromEntries(
-      keys.map((name, index) => [`#k${index}`, name]),
-    );
-    const conditionExpression =
-      keys.length === 0
-        ? undefined
-        : keys
-            .map((_, index) => `attribute_not_exists(#k${index})`)
-            .join(" AND ");
+    const statement = this.buildInsertStatement(request.table, request.values);
 
     try {
-      await this.requireDocumentClient().send(
-        new PutCommand({
-          TableName: request.table,
-          Item: request.values,
-          ConditionExpression: conditionExpression,
-          ExpressionAttributeNames:
-            conditionExpression === undefined ? undefined : conditionNames,
-        }),
-      );
+      await this.executeStatement(statement.sql, statement.params);
       return { affectedRows: 1 };
     } catch (error: unknown) {
-      if (this.isConditionalCheckFailure(error)) {
+      if (this.isDuplicateItemError(error)) {
         return { affectedRows: 0 };
       }
       throw error;
@@ -502,30 +442,16 @@ export class DynamoDBDriver implements IDBDriver {
     const keys = await this.getTableKeyNames(request.table);
     let affectedRows = 0;
     for (const criteria of request.primaryKeyValuesList) {
-      const key = Object.fromEntries(
-        keys
-          .filter((name) => criteria[name] !== undefined)
-          .map((name) => [name, criteria[name]]),
-      );
-      if (Object.keys(key).length === 0) {
-        continue;
+      const keyWhere = this.buildKeyWhereClause(keys, criteria);
+      if (!keyWhere) {
+        throw new Error("DynamoDB delete requires the full primary key.");
       }
-      const conditionNames = Object.fromEntries(
-        keys.map((name, index) => [`#k${index}`, name]),
-      );
-      const conditionExpression = keys
-        .map((_, index) => `attribute_exists(#k${index})`)
-        .join(" AND ");
       try {
-        await this.requireDocumentClient().send(
-          new DeleteCommand({
-            TableName: request.table,
-            Key: key,
-            ConditionExpression: conditionExpression,
-            ExpressionAttributeNames: conditionNames,
-          }),
+        const response = await this.executeStatement(
+          `DELETE FROM ${this.quoteIdentifier(request.table)} WHERE ${keyWhere.sql} RETURNING ALL OLD *`,
+          keyWhere.params,
         );
-        affectedRows += 1;
+        affectedRows += response.Items && response.Items.length > 0 ? 1 : 0;
       } catch (error: unknown) {
         if (this.isConditionalCheckFailure(error)) {
           continue;
@@ -549,14 +475,41 @@ export class DynamoDBDriver implements IDBDriver {
     },
   ): string {
     if (operation === "insert") {
-      return `put ${JSON.stringify({ table, item: data.values ?? {} })}`;
+      const statement = this.buildInsertStatement(table, data.values ?? {});
+      return this.materializePreviewSql(statement.sql, statement.params);
     }
     if (operation === "update") {
-      return `update ${JSON.stringify({ table, key: data.primaryKeys ?? {}, set: data.changes ?? {} })}`;
+      const keyNames = Object.keys(data.primaryKeys ?? {});
+      const keyWhere = this.buildKeyWhereClause(
+        keyNames,
+        data.primaryKeys ?? {},
+      );
+      const entries = Object.entries(data.changes ?? {}).filter(
+        ([, value]) => value !== undefined,
+      );
+      const statement = `UPDATE ${this.quoteIdentifier(table)} ${entries
+        .map(([name]) => `SET ${this.quoteIdentifier(name)} = ?`)
+        .join(" ")} WHERE ${keyWhere?.sql ?? "1 = 1"} RETURNING ALL NEW *`;
+      const params = [
+        ...entries.map(([, value]) => value),
+        ...(keyWhere?.params ?? []),
+      ];
+      return this.materializePreviewSql(statement, params);
     }
-    // delete — show the first (or only) key
-    const key = data.primaryKeyValuesList?.[0] ?? data.primaryKeys ?? {};
-    return `delete ${JSON.stringify({ table, key })}`;
+    return (
+      data.primaryKeyValuesList?.length
+        ? data.primaryKeyValuesList
+        : [data.primaryKeys ?? {}]
+    )
+      .map((criteria) => {
+        const keyNames = Object.keys(criteria);
+        const keyWhere = this.buildKeyWhereClause(keyNames, criteria);
+        return this.materializePreviewSql(
+          `DELETE FROM ${this.quoteIdentifier(table)} WHERE ${keyWhere?.sql ?? "1 = 1"} RETURNING ALL OLD *`,
+          keyWhere?.params,
+        );
+      })
+      .join(";\n");
   }
 
   async runTransaction(operations: TransactionOperation[]): Promise<void> {
@@ -566,7 +519,7 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   quoteIdentifier(name: string): string {
-    return name;
+    return `"${name.replace(/"/g, '""')}"`;
   }
 
   qualifiedTableName(
@@ -574,7 +527,7 @@ export class DynamoDBDriver implements IDBDriver {
     _schema: string,
     table: string,
   ): string {
-    return table;
+    return this.quoteIdentifier(table);
   }
 
   buildPagination(
@@ -583,8 +536,8 @@ export class DynamoDBDriver implements IDBDriver {
     _paramIndex: number,
   ): PaginationResult {
     return {
-      sql: "LIMIT ? OFFSET ?",
-      params: [limit, offset],
+      sql: offset > 0 ? "LIMIT ?" : "LIMIT ?",
+      params: [limit],
     };
   }
 
@@ -610,26 +563,99 @@ export class DynamoDBDriver implements IDBDriver {
 
   normalizeFilterValue(
     _column: ColumnTypeMeta,
-    _operator: never,
+    operator: FilterOperator,
     value: string | [string, string] | undefined,
   ) {
-    return value;
+    if (operator === "is_null" || operator === "is_not_null") {
+      return undefined;
+    }
+    if (value === undefined) {
+      return undefined;
+    }
+    if (Array.isArray(value)) {
+      return value.map((entry) => entry.trim()) as [string, string];
+    }
+    return value.trim();
   }
 
   buildFilterCondition(
     column: ColumnTypeMeta,
-    operator: never,
+    operator: FilterOperator,
     value: string | [string, string] | undefined,
     _paramIndex: number,
-  ) {
-    return {
-      sql: `${column.name}:${String(operator)}`,
-      params: value === undefined ? [] : Array.isArray(value) ? value : [value],
-    };
+  ): FilterConditionResult | null {
+    const identifier = this.quoteIdentifier(column.name);
+    if (operator === "is_null") {
+      return {
+        sql: `(${identifier} IS MISSING OR ${identifier} IS NULL)`,
+        params: [],
+      };
+    }
+    if (operator === "is_not_null") {
+      return {
+        sql: `NOT (${identifier} IS MISSING OR ${identifier} IS NULL)`,
+        params: [],
+      };
+    }
+    if (value === undefined) {
+      return null;
+    }
+    if (operator === "between") {
+      if (!Array.isArray(value)) {
+        return null;
+      }
+      return {
+        sql: `${identifier} BETWEEN ? AND ?`,
+        params: value.map((entry) => this.coerceFilterParameter(column, entry)),
+      };
+    }
+    if (operator === "in") {
+      if (typeof value !== "string") {
+        return null;
+      }
+      const parts = this.splitFilterList(value);
+      if (parts.length === 0) {
+        return null;
+      }
+      return {
+        sql: `${identifier} IN [${parts.map(() => "?").join(", ")}]`,
+        params: parts.map((entry) => this.coerceFilterParameter(column, entry)),
+      };
+    }
+    if (operator === "like" || operator === "ilike") {
+      if (typeof value !== "string") {
+        return null;
+      }
+      const needle = value.replace(/%/g, "");
+      return {
+        sql: `contains(${identifier}, ?)`,
+        params: [needle],
+      };
+    }
+    if (typeof value !== "string") {
+      return null;
+    }
+    const param = this.coerceFilterParameter(column, value);
+    switch (operator) {
+      case "eq":
+        return { sql: `${identifier} = ?`, params: [param] };
+      case "neq":
+        return { sql: `${identifier} <> ?`, params: [param] };
+      case "gt":
+        return { sql: `${identifier} > ?`, params: [param] };
+      case "gte":
+        return { sql: `${identifier} >= ?`, params: [param] };
+      case "lt":
+        return { sql: `${identifier} < ?`, params: [param] };
+      case "lte":
+        return { sql: `${identifier} <= ?`, params: [param] };
+      default:
+        return null;
+    }
   }
 
   buildInsertDefaultValuesSql(qualifiedTableName: string): string {
-    return stringifyCommandPayload("ddb_insert", { table: qualifiedTableName });
+    return `INSERT INTO ${qualifiedTableName} VALUE {}`;
   }
 
   buildInsertValueExpr(_column: ColumnTypeMeta, _paramIndex: number): string {
@@ -637,11 +663,20 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   buildSetExpr(column: ColumnTypeMeta): string {
-    return `${column.name} = ?`;
+    return `${this.quoteIdentifier(column.name)} = ?`;
   }
 
-  materializePreviewSql(sql: string): string {
-    return sql;
+  materializePreviewSql(sql: string, params?: readonly unknown[]): string {
+    if (!params || params.length === 0) {
+      return sql;
+    }
+
+    let paramIndex = 0;
+    return sql.replace(/\?/g, () => {
+      const value = params[paramIndex];
+      paramIndex += 1;
+      return this.formatPartiqlLiteral(value);
+    });
   }
 
   private requireClient(): DynamoDBClient {
@@ -658,30 +693,71 @@ export class DynamoDBDriver implements IDBDriver {
     return this.documentClient;
   }
 
-  private async getTableSchema(
-    table: string,
-  ): Promise<{ keys: string[]; attrTypes: Map<string, string> }> {
+  private async getTableSchema(table: string): Promise<{
+    keys: string[];
+    keyRoles: Map<string, PrimaryKeyRole>;
+    attrTypes: Map<string, string>;
+  }> {
     try {
       const description = await this.requireClient().send(
         new DescribeTableCommand({ TableName: table }),
       );
-      const keys = (description.Table?.KeySchema ?? [])
-        .map((entry) => entry.AttributeName)
-        .filter((name): name is string => Boolean(name));
+      const keyRoles = new Map<string, PrimaryKeyRole>();
+      const keys = (description.Table?.KeySchema ?? []).flatMap((entry) => {
+        const name = entry.AttributeName;
+        if (!name) {
+          return [];
+        }
+
+        if (entry.KeyType === "HASH") {
+          keyRoles.set(name, "partition");
+        } else if (entry.KeyType === "RANGE") {
+          keyRoles.set(name, "sort");
+        }
+
+        return [name];
+      });
       const attrTypes = new Map(
         (description.Table?.AttributeDefinitions ?? []).map((attr) => [
           attr.AttributeName ?? "",
           attr.AttributeType ?? "S",
         ]),
       );
-      return { keys, attrTypes };
+      return { keys, keyRoles, attrTypes };
     } catch {
-      return { keys: [], attrTypes: new Map() };
+      return { keys: [], keyRoles: new Map(), attrTypes: new Map() };
     }
   }
 
   private async getTableKeyNames(table: string): Promise<string[]> {
     return (await this.getTableSchema(table)).keys;
+  }
+
+  private async executeStatement(
+    statement: string,
+    parameters?: readonly unknown[],
+    options?: { limit?: number; nextToken?: string },
+  ) {
+    return this.requireDocumentClient().send(
+      new ExecuteStatementCommand({
+        Statement: statement,
+        Parameters:
+          parameters && parameters.length > 0 ? [...parameters] : undefined,
+        Limit: options?.limit,
+        NextToken: options?.nextToken,
+      }),
+    );
+  }
+
+  private detectPartiqlStatementKind(
+    statement: string,
+  ): "select" | "insert" | "update" | "delete" | null {
+    const match = /^\s*(select|insert|update|delete)\b/i.exec(statement);
+    if (!match) {
+      return null;
+    }
+
+    return match[1].toLowerCase() as "select" | "insert" | "update" | "delete";
   }
 
   private dynamoAttrTypeToNative(attributeType: string): string {
@@ -700,17 +776,54 @@ export class DynamoDBDriver implements IDBDriver {
   private async readRows(
     table: string,
     limit: number,
+    options?: {
+      filters?: readonly FilterExpression[];
+      columns?: readonly ColumnTypeMeta[];
+      sort?: DriverSortConfig | null;
+    },
   ): Promise<Record<string, unknown>[]> {
     try {
-      const result = await this.requireDocumentClient().send(
-        new ScanCommand({
-          TableName: table,
-          Limit: limit,
-        }),
+      const serverFilter = this.buildServerFilterClause(
+        options?.filters ?? [],
+        options?.columns ?? [],
       );
-      return (result.Items ?? []).map((item) =>
-        flattenRootRecord(item as Record<string, unknown>),
+      const serverSort = await this.buildServerSortClause(
+        table,
+        options?.sort ?? null,
       );
+      const statement = [
+        `SELECT * FROM ${this.quoteIdentifier(table)}`,
+        serverFilter.clause,
+        serverSort,
+      ]
+        .filter(Boolean)
+        .join(" ");
+      const rows: Record<string, unknown>[] = [];
+      let nextToken: string | undefined;
+
+      do {
+        const remaining = limit - rows.length;
+        if (remaining <= 0) {
+          break;
+        }
+
+        const result = await this.executeStatement(
+          statement,
+          serverFilter.params,
+          {
+            limit: Math.min(remaining, DYNAMODB_READ_BATCH_SIZE),
+            nextToken,
+          },
+        );
+        rows.push(
+          ...(result.Items ?? []).map((item) =>
+            flattenRootRecord(item as Record<string, unknown>),
+          ),
+        );
+        nextToken = result.NextToken;
+      } while (nextToken);
+
+      return rows;
     } catch {
       return [];
     }
@@ -734,5 +847,194 @@ export class DynamoDBDriver implements IDBDriver {
       "name" in error &&
       (error as { name?: unknown }).name === "ConditionalCheckFailedException"
     );
+  }
+
+  private isDuplicateItemError(error: unknown): boolean {
+    return (
+      typeof error === "object" &&
+      error !== null &&
+      "name" in error &&
+      (error as { name?: unknown }).name === "DuplicateItemException"
+    );
+  }
+
+  private buildServerFilterClause(
+    filters: readonly FilterExpression[],
+    columns: readonly ColumnTypeMeta[],
+  ): { clause: string; params: unknown[] } {
+    if (filters.length === 0 || columns.length === 0) {
+      return { clause: "", params: [] };
+    }
+
+    const columnMap = new Map(columns.map((column) => [column.name, column]));
+    const conditions: string[] = [];
+    const params: unknown[] = [];
+
+    for (const filter of filters) {
+      const column = columnMap.get(filter.column);
+      if (!column) {
+        continue;
+      }
+
+      const normalizedValue = this.normalizeFilterValue(
+        column,
+        filter.operator,
+        "value" in filter ? filter.value : undefined,
+      );
+      const condition = this.buildFilterCondition(
+        column,
+        filter.operator,
+        normalizedValue,
+        params.length + 1,
+      );
+      if (!condition) {
+        continue;
+      }
+
+      conditions.push(condition.sql);
+      params.push(...condition.params);
+    }
+
+    if (conditions.length === 0) {
+      return { clause: "", params: [] };
+    }
+
+    return {
+      clause: `WHERE ${conditions.join(" AND ")}`,
+      params,
+    };
+  }
+
+  private async buildServerSortClause(
+    table: string,
+    sort: DriverSortConfig | null,
+  ): Promise<string> {
+    if (!sort) {
+      return "";
+    }
+
+    const keyNames = await this.getTableKeyNames(table);
+    if (!keyNames.includes(sort.column)) {
+      return "";
+    }
+
+    return `ORDER BY ${this.quoteIdentifier(sort.column)} ${sort.direction === "desc" ? "DESC" : "ASC"}`;
+  }
+
+  private splitFilterList(value: string): string[] {
+    return value
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+  }
+
+  private coerceFilterParameter(
+    column: ColumnTypeMeta,
+    rawValue: string,
+  ): unknown {
+    const value = rawValue.trim();
+    if (
+      column.category === "integer" ||
+      column.category === "float" ||
+      column.category === "decimal"
+    ) {
+      const numeric = Number(value);
+      return Number.isFinite(numeric) ? numeric : value;
+    }
+    if (column.category === "boolean" || column.valueSemantics === "boolean") {
+      if (/^(true|1)$/i.test(value)) {
+        return true;
+      }
+      if (/^(false|0)$/i.test(value)) {
+        return false;
+      }
+    }
+    if (column.category === "json" || column.category === "array") {
+      try {
+        return JSON.parse(value) as unknown;
+      } catch {
+        return value;
+      }
+    }
+    return value;
+  }
+
+  private buildInsertStatement(
+    table: string,
+    values: Record<string, unknown>,
+  ): TransactionOperation {
+    const entries = Object.entries(values).filter(
+      ([, value]) => value !== undefined,
+    );
+    const sql = `INSERT INTO ${this.quoteIdentifier(table)} VALUE {${entries
+      .map(([name]) => `${this.quoteItemKey(name)}: ?`)
+      .join(", ")}}`;
+    return {
+      sql,
+      params: entries.map(([, value]) => value),
+    };
+  }
+
+  private buildKeyWhereClause(
+    keyNames: readonly string[],
+    criteria: Record<string, unknown>,
+  ): { sql: string; params: unknown[] } | null {
+    if (
+      keyNames.length === 0 ||
+      keyNames.some((name) => criteria[name] === undefined)
+    ) {
+      return null;
+    }
+
+    return {
+      sql: keyNames
+        .map((name) => `${this.quoteIdentifier(name)} = ?`)
+        .join(" AND "),
+      params: keyNames.map((name) => criteria[name]),
+    };
+  }
+
+  private quoteItemKey(name: string): string {
+    return `'${name.replace(/'/g, "''")}'`;
+  }
+
+  private formatPartiqlLiteral(value: unknown): string {
+    if (value === null) {
+      return "NULL";
+    }
+    if (value === undefined) {
+      return "MISSING";
+    }
+    if (typeof value === "string") {
+      return `'${value.replace(/'/g, "''")}'`;
+    }
+    if (typeof value === "number" || typeof value === "bigint") {
+      return String(value);
+    }
+    if (typeof value === "boolean") {
+      return value ? "true" : "false";
+    }
+    if (value instanceof Date) {
+      return `'${value.toISOString().replace(/'/g, "''")}'`;
+    }
+    if (value instanceof Set) {
+      return `<<${[...value].map((entry) => this.formatPartiqlLiteral(entry)).join(", ")}>>`;
+    }
+    if (Array.isArray(value)) {
+      return `[${value.map((entry) => this.formatPartiqlLiteral(entry)).join(", ")}]`;
+    }
+    if (Buffer.isBuffer(value)) {
+      return `'${value.toString("base64")}'`;
+    }
+    if (typeof value === "object") {
+      return `{${Object.entries(value as Record<string, unknown>)
+        .map(
+          ([key, entryValue]) =>
+            `${this.quoteItemKey(key)}: ${this.formatPartiqlLiteral(entryValue)}`,
+        )
+        .join(", ")}}`;
+    }
+
+    return `'${String(value).replace(/'/g, "''")}'`;
   }
 }

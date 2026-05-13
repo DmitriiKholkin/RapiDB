@@ -142,16 +142,18 @@ export class ElasticsearchDriver implements IDBDriver {
       this.readRows(table, 1000),
       this.fetchMappingMeta(table),
     ]);
-    return inferColumnsFromRows(rows, "_id").map((column) => {
+    return inferColumnsFromRows(rows, "_id", {
+      nullableMode: "schemaLess",
+    }).map((column) => {
       const meta = mapping.get(column.name);
       return {
         name: column.name,
         type: meta ? this.esTypeToNative(meta.type) : column.nativeType,
-        nullable: column.name !== "_id",
+        nullable: column.nullable,
         defaultValue:
           meta?.nullValue !== undefined ? String(meta.nullValue) : undefined,
-        isPrimaryKey: column.name === "_id",
-        primaryKeyOrdinal: column.name === "_id" ? 1 : undefined,
+        isPrimaryKey: column.isPrimaryKey,
+        primaryKeyOrdinal: column.primaryKeyOrdinal,
         isForeignKey: false,
       };
     });
@@ -166,7 +168,9 @@ export class ElasticsearchDriver implements IDBDriver {
       this.readRows(table, 1000),
       this.fetchMappingMeta(table),
     ]);
-    return inferColumnsFromRows(rows, "_id").map((column) => {
+    return inferColumnsFromRows(rows, "_id", {
+      nullableMode: "schemaLess",
+    }).map((column) => {
       const meta = mapping.get(column.name);
       const nativeType = meta
         ? this.esTypeToNative(meta.type)
@@ -176,7 +180,6 @@ export class ElasticsearchDriver implements IDBDriver {
         type: nativeType,
         nativeType,
         category: column.name !== "_id" ? column.category : column.category,
-        nullable: column.name !== "_id",
         defaultValue:
           meta?.nullValue !== undefined ? String(meta.nullValue) : undefined,
       };
@@ -353,7 +356,9 @@ export class ElasticsearchDriver implements IDBDriver {
     const sorted = applySort(filtered, request.sort);
     const paged = pageRows(sorted, request.page, request.pageSize);
     return {
-      columns: inferColumnsFromRows(sorted, "_id"),
+      columns: inferColumnsFromRows(sorted, "_id", {
+        nullableMode: "schemaLess",
+      }),
       rows: paged,
       totalCount: request.skipCount ? 0 : sorted.length,
     };

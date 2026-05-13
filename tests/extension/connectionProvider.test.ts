@@ -506,6 +506,7 @@ describe("ConnectionProvider", () => {
                   objects: [
                     { name: "users", type: "table", columns: [] },
                     { name: "orders", type: "table", columns: [] },
+                    { name: "active_users", type: "view", columns: [] },
                   ],
                 },
               ],
@@ -536,6 +537,7 @@ describe("ConnectionProvider", () => {
 
     const databaseChildren = await provider.getChildren(databases[0]);
     expect(databaseChildren.map((node) => node.label)).toContain("Collections");
+    expect(databaseChildren.map((node) => node.label)).toContain("Views");
     expect(databaseChildren.map((node) => node.label)).not.toContain("app_db");
 
     const collectionsCategory = databaseChildren.find(
@@ -551,9 +553,21 @@ describe("ConnectionProvider", () => {
     expect(collectionsCategory.tooltip).toContain("Collections in app_db");
     expect(collections[0]?.tooltip).toContain("Database: app_db");
     expect(collections[0]?.tooltip).not.toContain("Schema:");
+
+    const viewsCategory = databaseChildren.find(
+      (node) => node.label === "Views",
+    );
+    if (!viewsCategory) {
+      throw new Error("Expected Views category for MongoDB");
+    }
+
+    const views = await provider.getChildren(viewsCategory);
+    expect(views.map((node) => node.label)).toEqual(["active_users"]);
+    expect(viewsCategory.tooltip).toContain("Views in app_db");
+    expect(views[0]?.tooltip).toContain("view: active_users");
   });
 
-  it("keeps schema level for other NoSQL drivers", async () => {
+  it("keeps schema level for Redis and Elasticsearch", async () => {
     const baseDatabases = {
       redis: {
         name: "db0",
@@ -562,10 +576,6 @@ describe("ConnectionProvider", () => {
       elasticsearch: {
         name: "default",
         schemas: [{ name: "indices", objects: [] }],
-      },
-      dynamodb: {
-        name: "us-east-1",
-        schemas: [{ name: "public", objects: [] }],
       },
     } as const;
 
@@ -608,6 +618,73 @@ describe("ConnectionProvider", () => {
         database.schemas[0].name,
       ]);
     }
+  });
+
+  it("flattens DynamoDB schema level and hides schema wording", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-ddb", name: "Dynamo", type: "dynamodb" },
+      ]),
+      isConnected: vi.fn((id: string) => id === "conn-ddb"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "us-east-1",
+              schemas: [
+                {
+                  name: "us-east-1",
+                  objects: [
+                    { name: "users", type: "table", columns: [] },
+                    { name: "orders", type: "table", columns: [] },
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    const roots = await provider.getChildren();
+    const databases = await provider.getChildren(roots[0]);
+
+    expect(databases.map((node) => node.label)).toEqual(["us-east-1"]);
+
+    const databaseChildren = await provider.getChildren(databases[0]);
+    expect(databaseChildren.map((node) => node.label)).toContain("Tables");
+    expect(databaseChildren.map((node) => node.label)).not.toContain(
+      "us-east-1",
+    );
+
+    const tablesCategory = databaseChildren.find(
+      (node) => node.label === "Tables",
+    );
+    if (!tablesCategory) {
+      throw new Error("Expected Tables category for DynamoDB");
+    }
+
+    const tables = await provider.getChildren(tablesCategory);
+    expect(tables.map((node) => node.label)).toEqual(["users", "orders"]);
+    expect(tablesCategory.tooltip).toContain("Tables in us-east-1");
+    expect(tablesCategory.tooltip).not.toContain("Schema:");
+    expect(tables[0]?.tooltip).toContain("Database: us-east-1");
+    expect(tables[0]?.tooltip).not.toContain("Schema:");
   });
 
   it("keeps single-schema databases visible in the tree", async () => {
@@ -1322,6 +1399,118 @@ describe("ConnectionProvider", () => {
       database: "app_db",
       schema: "app_db",
       table: "users",
+    });
+  });
+
+  it("distinguishes DynamoDB partition and sort keys in column details", async () => {
+    const ensureTableDetailLoading = vi.fn();
+    const getTableDetailState = vi.fn(() => ({
+      request: {
+        connectionId: "conn-ddb",
+        database: "us-east-1",
+        schema: "us-east-1",
+        table: "users",
+      },
+      status: "loaded",
+      isPartial: false,
+      snapshot: {
+        columns: {
+          status: "loaded",
+          items: [
+            {
+              name: "tenant_id",
+              type: "text",
+              nativeType: "text",
+              nullable: false,
+              isPrimaryKey: true,
+              primaryKeyOrdinal: 1,
+              primaryKeyRole: "partition",
+              isForeignKey: false,
+              filterable: true,
+              filterOperators: [],
+              category: "text",
+              valueSemantics: "plain",
+            },
+            {
+              name: "user_id",
+              type: "text",
+              nativeType: "text",
+              nullable: false,
+              isPrimaryKey: true,
+              primaryKeyOrdinal: 2,
+              primaryKeyRole: "sort",
+              isForeignKey: false,
+              filterable: true,
+              filterOperators: [],
+              category: "text",
+              valueSemantics: "plain",
+            },
+          ],
+        },
+        constraints: { status: "loaded", items: [] },
+        indexes: { status: "loaded", items: [] },
+        triggers: { status: "loaded", items: [] },
+      },
+    }));
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-ddb", name: "Dynamo", type: "dynamodb" },
+      ]),
+      isConnected: vi.fn((id: string) => id === "conn-ddb"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      ensureTableDetailLoading,
+      getTableDetailState,
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "us-east-1",
+              schemas: [
+                {
+                  name: "us-east-1",
+                  objects: [{ name: "users", type: "table", columns: [] }],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    const roots = await provider.getChildren();
+    const databases = await provider.getChildren(roots[0]);
+    const categories = await provider.getChildren(databases[0]);
+    const tableNode = (await provider.getChildren(categories[0]))[0];
+    const sections = await provider.getChildren(tableNode);
+    const columnRows = await provider.getChildren(sections[0]);
+
+    expect(columnRows.map((node) => node.description)).toEqual([
+      "text - partition key",
+      "text - sort key",
+    ]);
+    expect(columnRows[0]?.tooltip).toBe("tenant_id text\nPartition key");
+    expect(columnRows[1]?.tooltip).toBe("user_id text\nSort key");
+    expect(columnRows[0]?.iconPath).toMatchObject({
+      id: "key",
+      color: { id: "charts.yellow" },
+    });
+    expect(columnRows[1]?.iconPath).toMatchObject({
+      id: "key",
+      color: { id: "textLink.foreground" },
     });
   });
 

@@ -33,7 +33,7 @@ import type {
 } from "./types";
 
 const MONGODB_ENTITY_MANIFEST: DriverEntityManifest = {
-  dbObjectKinds: ["table"],
+  dbObjectKinds: ["table", "view"],
   tableSections: {
     columns: "supported",
     constraints: "not_applicable",
@@ -108,13 +108,15 @@ export class MongoDBDriver implements IDBDriver {
     try {
       const db = this.requireDb(database);
       const collections = await db
-        .listCollections({}, { nameOnly: true })
+        .listCollections({}, { nameOnly: false })
         .toArray();
-      return collections.map((collection) => ({
-        schema: database || this.defaultDatabaseName(),
-        name: collection.name,
-        type: "table",
-      }));
+      return collections
+        .filter((collection) => !this.isSystemNamespace(collection.name))
+        .map((collection) => ({
+          schema: database || this.defaultDatabaseName(),
+          name: collection.name,
+          type: collection.type === "view" ? "view" : "table",
+        }));
     } catch {
       return [];
     }
@@ -126,13 +128,15 @@ export class MongoDBDriver implements IDBDriver {
     table: string,
   ): Promise<ColumnMeta[]> {
     const rows = await this.readRows(database, table, 50);
-    return inferColumnsFromRows(rows, "_id").map((column) => ({
+    return inferColumnsFromRows(rows, "_id", {
+      nullableMode: "schemaLess",
+    }).map((column) => ({
       name: column.name,
       type: column.nativeType,
-      nullable: column.name !== "_id" && column.nullable,
-      defaultValue: column.name === "_id" ? "ObjectId()" : undefined,
-      isPrimaryKey: column.name === "_id",
-      primaryKeyOrdinal: column.name === "_id" ? 1 : undefined,
+      nullable: column.nullable,
+      defaultValue: column.isPrimaryKey ? "ObjectId()" : undefined,
+      isPrimaryKey: column.isPrimaryKey,
+      primaryKeyOrdinal: column.primaryKeyOrdinal,
       isForeignKey: false,
     }));
   }
@@ -143,10 +147,11 @@ export class MongoDBDriver implements IDBDriver {
     table: string,
   ): Promise<ColumnTypeMeta[]> {
     const rows = await this.readRows(database, table, 50);
-    return inferColumnsFromRows(rows, "_id").map((column) => ({
+    return inferColumnsFromRows(rows, "_id", {
+      nullableMode: "schemaLess",
+    }).map((column) => ({
       ...column,
-      nullable: column.name !== "_id" && column.nullable,
-      defaultValue: column.name === "_id" ? "ObjectId()" : undefined,
+      defaultValue: column.isPrimaryKey ? "ObjectId()" : undefined,
     }));
   }
 
@@ -481,7 +486,9 @@ export class MongoDBDriver implements IDBDriver {
     const sorted = applySort(filtered, request.sort);
     const paged = pageRows(sorted, request.page, request.pageSize);
     return {
-      columns: inferColumnsFromRows(sorted, "_id"),
+      columns: inferColumnsFromRows(sorted, "_id", {
+        nullableMode: "schemaLess",
+      }),
       rows: paged,
       totalCount: request.skipCount ? 0 : sorted.length,
     };
@@ -790,5 +797,9 @@ export class MongoDBDriver implements IDBDriver {
       mapped[`__col_${index}`] = row[columnName];
     });
     return mapped;
+  }
+
+  private isSystemNamespace(name: string): boolean {
+    return /^system\./i.test(name);
   }
 }

@@ -97,6 +97,7 @@ const fkColumns: ColumnTypeMeta[] = [
     nullable: false,
     isPrimaryKey: true,
     primaryKeyOrdinal: 1,
+    primaryKeyRole: "partition",
     isForeignKey: false,
     category: "integer",
     filterable: true,
@@ -118,6 +119,39 @@ const fkColumns: ColumnTypeMeta[] = [
 ];
 
 const fkRows = [{ id: 1, role_id: 10 }];
+
+const compositeKeyColumns: ColumnTypeMeta[] = [
+  {
+    name: "tenant_id",
+    type: "TEXT",
+    nativeType: "TEXT",
+    nullable: false,
+    isPrimaryKey: true,
+    primaryKeyOrdinal: 1,
+    primaryKeyRole: "partition",
+    isForeignKey: false,
+    category: "text",
+    filterable: true,
+    filterOperators: ["eq", "like"],
+    valueSemantics: "plain",
+  },
+  {
+    name: "user_id",
+    type: "TEXT",
+    nativeType: "TEXT",
+    nullable: false,
+    isPrimaryKey: true,
+    primaryKeyOrdinal: 2,
+    primaryKeyRole: "sort",
+    isForeignKey: false,
+    category: "text",
+    filterable: true,
+    filterOperators: ["eq", "like"],
+    valueSemantics: "plain",
+  },
+];
+
+const compositeKeyRows = [{ tenant_id: "tenant-1", user_id: "user-1" }];
 
 const noPkColumns: ColumnTypeMeta[] = [
   {
@@ -344,6 +378,56 @@ describe("TableView", () => {
 
     expect(pkHeader?.querySelectorAll(".codicon-key")).toHaveLength(1);
     expect(fkHeader?.querySelectorAll(".codicon-key")).toHaveLength(1);
+    expect(
+      (pkHeader?.querySelector(".codicon-key") as HTMLElement | null)?.style
+        .color,
+    ).toBe("var(--vscode-editorWarning-foreground, #8f5b00)");
+  });
+
+  it("uses different key icon colors for partition and sort keys", async () => {
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns: compositeKeyColumns,
+      primaryKeyColumns: ["tenant_id", "user_id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows: compositeKeyRows,
+        totalCount: compositeKeyRows.length,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("table")).toBeTruthy();
+    });
+
+    const partitionKeyIcon = screen
+      .getByText("tenant_id")
+      .closest("th")
+      ?.querySelector(".codicon-key");
+    const sortKeyIcon = screen
+      .getByText("user_id")
+      .closest("th")
+      ?.querySelector(".codicon-key");
+
+    expect((partitionKeyIcon as HTMLElement | null)?.style.color).toBe(
+      "var(--vscode-editorWarning-foreground, #8f5b00)",
+    );
+    expect((sortKeyIcon as HTMLElement | null)?.style.color).toBe(
+      "var(--vscode-textLink-foreground, #2f6f9f)",
+    );
   });
 
   it("shows column detail tooltip on header hover text", async () => {

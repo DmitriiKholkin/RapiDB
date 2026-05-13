@@ -483,6 +483,39 @@ describe("extension activation", () => {
     );
   });
 
+  it("opens views as read-only data panels", async () => {
+    const extension = await import("../../src/extension/extension");
+    const context = { subscriptions: [] as Array<{ dispose(): void }> };
+
+    extension.activate(context as never);
+
+    const openTableDataCommand = vscodeState.registerCommand.mock.calls.find(
+      ([command]) => command === "rapidb.openTableData",
+    )?.[1] as ((node: Record<string, unknown>) => void) | undefined;
+
+    if (!openTableDataCommand) {
+      throw new Error("Open Data command was not registered.");
+    }
+
+    openTableDataCommand({
+      kind: "view",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "app_db",
+      objectName: "active_users",
+    });
+
+    expect(tablePanelCreateOrShow).toHaveBeenCalledWith(
+      context,
+      connectionManagerInstance,
+      "conn-1",
+      "app_db",
+      "app_db",
+      "active_users",
+      true,
+    );
+  });
+
   it("opens create templates with DB-specific formatting behavior", async () => {
     const extension = await import("../../src/extension/extension");
     const context = { subscriptions: [] as Array<{ dispose(): void }> };

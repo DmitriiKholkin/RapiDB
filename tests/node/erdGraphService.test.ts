@@ -33,6 +33,7 @@ describe("ErdGraphService", () => {
         name: "id",
         nativeType: "int4",
         isPrimaryKey: true,
+        primaryKeyRole: "partition",
         isForeignKey: false,
         nullable: false,
       },
@@ -99,6 +100,11 @@ describe("ErdGraphService", () => {
       "orders",
       "users",
     ]);
+    expect(result.graph.nodes[0]?.columns[0]).toMatchObject({
+      name: "id",
+      isPrimaryKey: true,
+      primaryKeyRole: "partition",
+    });
     expect(result.graph.edges).toEqual([
       {
         id: "app_db.public.orders::app_db.public.users::orders_user_id_fkey::user_id::id",

@@ -2390,7 +2390,29 @@ services:
         mdb.inventory.createIndex({ location: "2dsphere" });
         mdb.inventory.createIndex({ warehouseId: 1 }, { unique: true });
 
-        print("MongoDB seed complete. Collections: users="+mdb.users.countDocuments()+", products="+mdb.products.countDocuments()+", orders="+mdb.orders.countDocuments()+", events="+mdb.events.countDocuments()+", bson_types="+mdb.bson_types.countDocuments()+", logs="+mdb.logs.countDocuments()+", inventory="+mdb.inventory.countDocuments());
+        // ── MongoDB views — read-only projections of seeded data ───
+        try { mdb.runCommand({ drop: "view_active_users" }); } catch (e) {}
+        try { mdb.runCommand({ drop: "view_top_products" }); } catch (e) {}
+
+        mdb.createCollection("view_active_users", {
+          viewOn: "users",
+          pipeline: [
+            { $$match: { status: "active" } },
+            { $$project: { _id: 1, userId: 1, name: 1, email: 1, city: "$$address.city", role: 1, plan: 1, score: 1, lastLogin: "$$stats.lastLogin" } },
+            { $$sort: { score: -1 } }
+          ]
+        });
+
+        mdb.createCollection("view_top_products", {
+          viewOn: "products",
+          pipeline: [
+            { $$match: { active: true, stock: { $$gt: 0 } } },
+            { $$project: { _id: 1, sku: 1, name: 1, category: 1, price: 1, rating: 1, reviewCount: 1, stock: 1 } },
+            { $$sort: { rating: -1, reviewCount: -1 } }
+          ]
+        });
+
+        print("MongoDB seed complete. Collections: users="+mdb.users.countDocuments()+", products="+mdb.products.countDocuments()+", orders="+mdb.orders.countDocuments()+", events="+mdb.events.countDocuments()+", bson_types="+mdb.bson_types.countDocuments()+", logs="+mdb.logs.countDocuments()+", inventory="+mdb.inventory.countDocuments()+", views="+[mdb.view_active_users.countDocuments(), mdb.view_top_products.countDocuments()].join(", ")); 
 
   # ─────────────────────────────────────────────
   # Redis 7
@@ -3103,6 +3125,3 @@ services:
         echo "Users count: $$(ddb scan --table-name Users --select COUNT --query 'Count' --output text)"
         echo "Products count: $$(ddb scan --table-name Products --select COUNT --query 'Count' --output text)"
         echo "Orders count: $$(ddb scan --table-name Orders --select COUNT --query 'Count' --output text)"
-
-volumes:
-  dynamodb_data:

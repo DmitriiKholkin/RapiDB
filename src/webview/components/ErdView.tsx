@@ -25,6 +25,7 @@ import React, {
   useState,
 } from "react";
 import "@xyflow/react/dist/style.css";
+import { formatPrimaryKeyBadgeLabel } from "../../shared/tableTypes";
 import type { ErdGraph } from "../../shared/webviewContracts";
 import { onMessage, postMessage } from "../utils/messaging";
 import { GridLoadingOverlay } from "./GridOverlay";
@@ -514,7 +515,9 @@ const TableNode = React.memo(function TableNode({
                   {column.name}
                 </span>
                 {isFullLOD && column.isPrimaryKey ? (
-                  <span style={columnBadgeStyle}>PK</span>
+                  <span style={primaryKeyBadgeStyle(column.primaryKeyRole)}>
+                    {formatPrimaryKeyBadgeLabel(column.primaryKeyRole)}
+                  </span>
                 ) : null}
                 {isFullLOD && column.isForeignKey ? (
                   <span style={columnBadgeStyle}>FK</span>
@@ -1505,6 +1508,21 @@ const columnBadgeStyle: React.CSSProperties = {
   background: "var(--vscode-editor-background)",
   opacity: 0.9,
 };
+
+function primaryKeyBadgeStyle(
+  role?: "partition" | "sort",
+): React.CSSProperties {
+  const isSortKey = role === "sort";
+  return {
+    ...columnBadgeStyle,
+    color: isSortKey
+      ? "var(--vscode-textLink-foreground, #2f6f9f)"
+      : "var(--vscode-editorWarning-foreground, #8f5b00)",
+    background: isSortKey
+      ? "rgba(47, 111, 159, 0.16)"
+      : "rgba(143, 91, 0, 0.16)",
+  };
+}
 
 const columnNameAndBadgesStyle: React.CSSProperties = {
   display: "flex",

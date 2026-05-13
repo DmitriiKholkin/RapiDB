@@ -391,6 +391,29 @@ describe("schema object definitions", () => {
     ).resolves.toBeNull();
   });
 
+  it("lists MongoDB collections and views while hiding system namespaces", async () => {
+    const driver = new MongoDBDriver(mongodbConfig as ConnectionConfig);
+    const toArray = vi.fn().mockResolvedValue([
+      { name: "system.views", type: "collection" },
+      { name: "users", type: "collection" },
+      { name: "active_users", type: "view" },
+    ]);
+    const listCollections = vi.fn().mockReturnValue({ toArray });
+
+    (
+      driver as unknown as { client: { db: typeof db }; connected: boolean }
+    ).client = {
+      db: vi.fn().mockReturnValue({ listCollections }),
+    };
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    await expect(driver.listObjects("rapidb", "ignored")).resolves.toEqual([
+      { schema: "rapidb", name: "users", type: "table" },
+      { schema: "rapidb", name: "active_users", type: "view" },
+    ]);
+    expect(listCollections).toHaveBeenCalledWith({}, { nameOnly: false });
+  });
+
   it("lists Oracle materialized views, sequences, and types and renders metadata DDL", async () => {
     const driver = new OracleDriver(oracleConfig as ConnectionConfig);
     const execute = vi.fn(async (sql: string) => {
@@ -579,7 +602,7 @@ describe("schema object definitions", () => {
         },
       },
       mongodb: {
-        dbObjectKinds: ["table"],
+        dbObjectKinds: ["table", "view"],
         tableSections: {
           columns: "supported",
           constraints: "not_applicable",

@@ -34,7 +34,17 @@ export function flattenRootRecord(
 export function inferColumnsFromRows(
   rows: readonly Record<string, unknown>[],
   primaryKeyName = "id",
+  options?: {
+    primaryKeyNames?: readonly string[];
+    nullableMode?: "sample" | "schemaLess";
+  },
 ): ColumnTypeMeta[] {
+  const primaryKeyNames =
+    options?.primaryKeyNames && options.primaryKeyNames.length > 0
+      ? options.primaryKeyNames
+      : [primaryKeyName];
+  const primaryKeyNameSet = new Set(primaryKeyNames);
+
   const keys = new Set<string>();
   for (const row of rows) {
     for (const key of Object.keys(row)) {
@@ -45,13 +55,18 @@ export function inferColumnsFromRows(
   return [...keys]
     .sort((left, right) => left.localeCompare(right))
     .map((name) => {
+      const isPrimaryKey = primaryKeyNameSet.has(name);
       const sample = rows.find((row) => row[name] !== undefined)?.[name];
       const category =
         inferValueCategory(sample) ??
         (typeof sample === "string" && sample.trim().length > 0
           ? "text"
           : "other");
-      const nullable = rows.some((row) => row[name] == null);
+      const nullable = isPrimaryKey
+        ? false
+        : options?.nullableMode === "schemaLess"
+          ? true
+          : rows.some((row) => row[name] == null);
       const filterable = category !== "binary" && category !== "spatial";
       return {
         name,
@@ -60,12 +75,10 @@ export function inferColumnsFromRows(
         category,
         nullable,
         defaultValue: undefined,
-        isPrimaryKey:
-          name === primaryKeyName || name === "_id" || name === "key",
-        primaryKeyOrdinal:
-          name === primaryKeyName || name === "_id" || name === "key"
-            ? 1
-            : undefined,
+        isPrimaryKey,
+        primaryKeyOrdinal: isPrimaryKey
+          ? primaryKeyNames.indexOf(name) + 1
+          : undefined,
         isForeignKey: false,
         filterable,
         filterOperators: resolveFilterOperators(category, {

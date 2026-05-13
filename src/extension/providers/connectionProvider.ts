@@ -9,6 +9,7 @@ import {
 import {
   formatColumnDetailDescription,
   formatColumnDetailTooltip,
+  formatPrimaryKeyRoleLabel,
 } from "../../shared/tableTypes";
 import type {
   ConnectionConfig,
@@ -133,6 +134,7 @@ const TABLE_SECTION_LABELS: Record<TableDetailSectionKind, string> = {
 };
 
 const PRIMARY_KEY_ICON_COLOR = new vscode.ThemeColor("charts.yellow");
+const SORT_KEY_ICON_COLOR = new vscode.ThemeColor("textLink.foreground");
 
 export class RapiDBNode extends vscode.TreeItem {
   constructor(
@@ -830,6 +832,9 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     column: ColumnTypeMeta,
   ): RapiDBNode {
     const description = formatColumnDetailDescription(column);
+    const keyRoleDescription = column.isPrimaryKey
+      ? formatPrimaryKeyRoleLabel(column.primaryKeyRole)
+      : undefined;
     const node = new RapiDBNode(
       column.name,
       "table_detail_column",
@@ -843,11 +848,18 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       column.name,
     );
     if (column.isPrimaryKey) {
-      node.iconPath = new vscode.ThemeIcon("key", PRIMARY_KEY_ICON_COLOR);
+      node.iconPath = new vscode.ThemeIcon(
+        "key",
+        column.primaryKeyRole === "sort"
+          ? SORT_KEY_ICON_COLOR
+          : PRIMARY_KEY_ICON_COLOR,
+      );
     } else if (column.isForeignKey) {
       node.iconPath = new vscode.ThemeIcon("key");
     }
-    node.description = description;
+    node.description = keyRoleDescription
+      ? `${description} - ${keyRoleDescription.toLowerCase()}`
+      : description;
     node.tooltip = formatColumnDetailTooltip(column);
     return node;
   }
@@ -1158,11 +1170,15 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     schemas: readonly SchemaSnapshotSchemaEntry[],
   ): boolean {
     const connectionType = this.getConnectionType(connectionId);
-    return connectionType === "mongodb" && schemas.length === 1;
+    return (
+      (connectionType === "mongodb" || connectionType === "dynamodb") &&
+      schemas.length === 1
+    );
   }
 
   private hasSchemaConcept(connectionId: string): boolean {
-    return this.getConnectionType(connectionId) !== "mongodb";
+    const connectionType = this.getConnectionType(connectionId);
+    return connectionType !== "mongodb" && connectionType !== "dynamodb";
   }
 
   private getEntityManifest(connectionId: string): DriverEntityManifest {
