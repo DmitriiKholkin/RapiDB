@@ -1,3 +1,15 @@
+import {
+  Binary,
+  BSONRegExp,
+  Code,
+  Decimal128,
+  Int32,
+  Long,
+  MaxKey,
+  MinKey,
+  ObjectId,
+  Timestamp,
+} from "mongodb";
 import { describe, expect, it, vi } from "vitest";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import type { FilterExpression } from "../../src/shared/tableTypes";
@@ -255,5 +267,220 @@ describe("MongoDBDriver readTablePage filter coverage", () => {
         );
       }
     }
+  });
+});
+
+describe("MongoDBDriver schema type inference", () => {
+  it("preserves detailed BSON native types for schema metadata", async () => {
+    const driver = new MongoDBDriver({
+      id: "mongodb-schema-types",
+      type: "mongodb",
+      name: "mongo-schema-types",
+      host: "localhost",
+      port: 27017,
+      database: "test",
+    });
+
+    const readSchemaDocumentsMock = vi.fn().mockResolvedValue([
+      {
+        _id: new ObjectId("64a1b2c3d4e5f67890abcdef"),
+        t_double: Math.PI,
+        t_string: "Hello, World!",
+        t_object: { nested: { value: 42 } },
+        t_array: [1, "two", true],
+        t_binary: new Binary(Buffer.from([1, 2, 3]), 0),
+        t_binary_uuid: new Binary(
+          Buffer.from("00112233445566778899aabbccddeeff", "hex"),
+          4,
+        ),
+        t_objectid: new ObjectId("64a1b2c3d4e5f67890abcdea"),
+        t_bool: true,
+        t_date: new Date("2024-07-04T12:00:00.000Z"),
+        t_null: null,
+        t_regex: new BSONRegExp("quick\\s+fox", "i"),
+        t_js: new Code("function() { return this.score > 100; }"),
+        t_int32: new Int32(2147483647),
+        t_int64: Long.fromString("9223372036854775807"),
+        t_decimal128: Decimal128.fromString("123456789.987654321"),
+        t_timestamp: new Timestamp({ t: 1720094400, i: 1 }),
+        t_minkey: new MinKey(),
+        t_maxkey: new MaxKey(),
+        t_empty_obj: {},
+        t_empty_arr: [],
+      },
+    ]);
+
+    (
+      driver as unknown as {
+        readSchemaDocuments: typeof readSchemaDocumentsMock;
+      }
+    ).readSchemaDocuments = readSchemaDocumentsMock;
+
+    const columns = await driver.describeColumns("test", "test", "bson_types");
+    const described = await driver.describeTable("test", "test", "bson_types");
+
+    const typeByName = new Map(
+      columns.map((column) => [column.name, column.type]),
+    );
+    const categoryByName = new Map(
+      columns.map((column) => [column.name, column.category]),
+    );
+    const describedTypeByName = new Map(
+      described.map((column) => [column.name, column.type]),
+    );
+
+    expect(typeByName.get("_id")).toBe("objectId");
+    expect(typeByName.get("t_double")).toBe("double");
+    expect(typeByName.get("t_string")).toBe("string");
+    expect(typeByName.get("t_object")).toBe("object");
+    expect(typeByName.get("t_array")).toBe("array");
+    expect(typeByName.get("t_binary")).toBe("binData");
+    expect(typeByName.get("t_binary_uuid")).toBe("uuid");
+    expect(typeByName.get("t_objectid")).toBe("objectId");
+    expect(typeByName.get("t_bool")).toBe("bool");
+    expect(typeByName.get("t_date")).toBe("date");
+    expect(typeByName.get("t_null")).toBe("null");
+    expect(typeByName.get("t_regex")).toBe("regex");
+    expect(typeByName.get("t_js")).toBe("javascript");
+    expect(typeByName.get("t_int32")).toBe("int32");
+    expect(typeByName.get("t_int64")).toBe("int64");
+    expect(typeByName.get("t_decimal128")).toBe("decimal128");
+    expect(typeByName.get("t_timestamp")).toBe("timestamp");
+    expect(typeByName.get("t_minkey")).toBe("minKey");
+    expect(typeByName.get("t_maxkey")).toBe("maxKey");
+    expect(typeByName.get("t_empty_obj")).toBe("object");
+    expect(typeByName.get("t_empty_arr")).toBe("array");
+
+    expect(categoryByName.get("t_object")).toBe("json");
+    expect(categoryByName.get("t_array")).toBe("array");
+    expect(categoryByName.get("t_binary")).toBe("binary");
+    expect(categoryByName.get("t_binary_uuid")).toBe("uuid");
+    expect(categoryByName.get("t_decimal128")).toBe("decimal");
+    expect(categoryByName.get("t_timestamp")).toBe("datetime");
+
+    expect(describedTypeByName).toEqual(typeByName);
+  });
+
+  it("keeps table page column types from BSON schema sampling", async () => {
+    const driver = new MongoDBDriver({
+      id: "mongodb-table-page-types",
+      type: "mongodb",
+      name: "mongo-table-page-types",
+      host: "localhost",
+      port: 27017,
+      database: "test",
+    });
+
+    const readSchemaDocumentsMock = vi.fn().mockResolvedValue([
+      {
+        _id: new ObjectId("64a1b2c3d4e5f67890abcdef"),
+        t_binary: new Binary(Buffer.from([1, 2, 3, 4, 5, 6, 7, 255]), 0),
+        t_binary_uuid: new Binary(
+          Buffer.from("112233445566778899aabbccddeeffff", "hex"),
+          4,
+        ),
+        t_date: new Date("2024-07-04T12:00:00.000Z"),
+        t_decimal128: Decimal128.fromString("123456789.987654321"),
+        t_int64: Long.fromString("9223372036854775807"),
+        t_timestamp: new Timestamp({ t: 1720094400, i: 1 }),
+      },
+    ]);
+    const readRowsMock = vi.fn().mockResolvedValue([
+      {
+        _id: "64a1b2c3d4e5f67890abcdef",
+        t_binary: "AQIDBAUGB/8=",
+        t_binary_uuid: "11223344-5566-7788-99aa-bbccddeeffff",
+        t_date: "2024-07-04 12:00:00",
+        t_decimal128: "123456789.987654321",
+        t_int64: "9223372036854775807",
+        t_timestamp: "2024-07-04 12:00:00",
+      },
+    ]);
+
+    (
+      driver as unknown as {
+        readSchemaDocuments: typeof readSchemaDocumentsMock;
+        readRows: typeof readRowsMock;
+      }
+    ).readSchemaDocuments = readSchemaDocumentsMock;
+    (
+      driver as unknown as {
+        readSchemaDocuments: typeof readSchemaDocumentsMock;
+        readRows: typeof readRowsMock;
+      }
+    ).readRows = readRowsMock;
+
+    const page = await driver.readTablePage({
+      database: "test",
+      schema: "test",
+      table: "bson_types",
+      page: 1,
+      pageSize: 50,
+      filters: [],
+      sort: null,
+      skipCount: false,
+    });
+
+    const columnsByName = new Map(
+      page.columns.map((column) => [column.name, column]),
+    );
+
+    expect(columnsByName.get("t_binary")?.type).toBe("binData");
+    expect(columnsByName.get("t_binary")?.category).toBe("binary");
+    expect(columnsByName.get("t_binary_uuid")?.type).toBe("uuid");
+    expect(columnsByName.get("t_binary_uuid")?.category).toBe("uuid");
+    expect(columnsByName.get("t_date")?.type).toBe("date");
+    expect(columnsByName.get("t_date")?.category).toBe("datetime");
+    expect(columnsByName.get("t_decimal128")?.type).toBe("decimal128");
+    expect(columnsByName.get("t_int64")?.type).toBe("int64");
+    expect(columnsByName.get("t_timestamp")?.type).toBe("timestamp");
+    expect(columnsByName.get("t_timestamp")?.category).toBe("datetime");
+
+    expect(page.rows[0]).toEqual({
+      _id: "64a1b2c3d4e5f67890abcdef",
+      t_binary: "AQIDBAUGB/8=",
+      t_binary_uuid: "11223344-5566-7788-99aa-bbccddeeffff",
+      t_date: "2024-07-04 12:00:00",
+      t_decimal128: "123456789.987654321",
+      t_int64: "9223372036854775807",
+      t_timestamp: "2024-07-04 12:00:00",
+    });
+  });
+
+  it("normalizes datetime filters against Mongo display values", async () => {
+    const driver = createDriverWithRows([
+      {
+        _id: "507f1f77bcf86cd799439011",
+        t_date: "2024-07-04 12:00:00",
+        t_timestamp: "2024-07-04 12:00:00",
+      },
+    ]);
+
+    const readSchemaDocumentsMock = vi.fn().mockResolvedValue([
+      {
+        _id: new ObjectId("507f1f77bcf86cd799439011"),
+        t_date: new Date("2024-07-04T12:00:00.000Z"),
+        t_timestamp: new Timestamp({ t: 1720094400, i: 1 }),
+      },
+    ]);
+    (
+      driver as unknown as {
+        readSchemaDocuments: typeof readSchemaDocumentsMock;
+      }
+    ).readSchemaDocuments = readSchemaDocumentsMock;
+
+    const dateMatches = await applyFilter(driver, {
+      column: "t_date",
+      operator: "eq",
+      value: "2024-07-04T12:00:00.000Z",
+    });
+    const timestampMatches = await applyFilter(driver, {
+      column: "t_timestamp",
+      operator: "eq",
+      value: "Timestamp(1720094400, 1)",
+    });
+
+    expect(dateMatches).toEqual(["507f1f77bcf86cd799439011"]);
+    expect(timestampMatches).toEqual(["507f1f77bcf86cd799439011"]);
   });
 });

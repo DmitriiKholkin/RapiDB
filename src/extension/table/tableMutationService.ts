@@ -21,12 +21,30 @@ export class TableMutationService {
     changes: Record<string, unknown>,
   ): Promise<void> {
     const { driver } = this.getConnectionDriver(connectionId);
+    const columns = await this.columnsProvider.getColumns(
+      connectionId,
+      database,
+      schema,
+      table,
+    );
+    const columnMetaByName = new Map(
+      columns.map((column) => [column.name, column]),
+    );
     if (driver.updateRows) {
       const result = await driver.updateRows({
         database,
         schema,
         table,
-        updates: [{ primaryKeys: primaryKeyValues, changes }],
+        updates: [
+          {
+            primaryKeys: coerceRecord(
+              driver,
+              primaryKeyValues,
+              columnMetaByName,
+            ),
+            changes: coerceRecord(driver, changes, columnMetaByName),
+          },
+        ],
       });
       if (result.affectedRows === 0) {
         throw new Error(
@@ -36,12 +54,6 @@ export class TableMutationService {
       return;
     }
 
-    const columns = await this.columnsProvider.getColumns(
-      connectionId,
-      database,
-      schema,
-      table,
-    );
     const operation = buildUpdateRowSql(
       driver,
       database,
@@ -86,32 +98,6 @@ export class TableMutationService {
     values: Record<string, unknown>,
   ): Promise<PreparedInsertPlan> {
     const { driver } = this.getConnectionDriver(connectionId);
-    if (driver.insertRow) {
-      const previewSql = driver.buildMutationPreviewStatement
-        ? driver.buildMutationPreviewStatement(
-            "insert",
-            database,
-            schema,
-            table,
-            { values },
-          )
-        : `INSERT ${driver.qualifiedTableName(database, schema, table)} ${JSON.stringify(values)}`;
-      return {
-        connectionId,
-        database,
-        schema,
-        table,
-        mode: "driver",
-        values,
-        operation: {
-          sql: "-- driver-hook-insert",
-          params: [],
-        },
-        previewStatements: [previewSql],
-        verificationCriteria: null,
-      };
-    }
-
     const columns = await this.columnsProvider.getColumns(
       connectionId,
       database,
@@ -121,6 +107,40 @@ export class TableMutationService {
     const columnMetaByName = new Map(
       columns.map((column) => [column.name, column]),
     );
+    if (driver.insertRow) {
+      const writableValues = Object.fromEntries(
+        writableEntries(values, columnMetaByName),
+      );
+      const coercedValues = coerceRecord(
+        driver,
+        writableValues,
+        columnMetaByName,
+      );
+      const previewSql = driver.buildMutationPreviewStatement
+        ? driver.buildMutationPreviewStatement(
+            "insert",
+            database,
+            schema,
+            table,
+            { values: coercedValues },
+          )
+        : `INSERT ${driver.qualifiedTableName(database, schema, table)} ${JSON.stringify(coercedValues)}`;
+      return {
+        connectionId,
+        database,
+        schema,
+        table,
+        mode: "driver",
+        values: coercedValues,
+        operation: {
+          sql: "-- driver-hook-insert",
+          params: [],
+        },
+        previewStatements: [previewSql],
+        verificationCriteria: null,
+      };
+    }
+
     const writableValues = Object.fromEntries(
       writableEntries(values, columnMetaByName),
     );
@@ -264,7 +284,19 @@ export class TableMutationService {
       return null;
     }
     const { driver } = this.getConnectionDriver(connectionId);
+    const columns = await this.columnsProvider.getColumns(
+      connectionId,
+      database,
+      schema,
+      table,
+    );
+    const columnMetaByName = new Map(
+      columns.map((column) => [column.name, column]),
+    );
     if (driver.deleteRows) {
+      const coercedPrimaryKeyValuesList = primaryKeyValuesList.map((criteria) =>
+        coerceRecord(driver, criteria, columnMetaByName),
+      );
       const previewStatements = driver.buildMutationPreviewStatement
         ? [
             driver.buildMutationPreviewStatement(
@@ -273,11 +305,11 @@ export class TableMutationService {
               schema,
               table,
               {
-                primaryKeyValuesList,
+                primaryKeyValuesList: coercedPrimaryKeyValuesList,
               },
             ),
           ]
-        : primaryKeyValuesList.map(
+        : coercedPrimaryKeyValuesList.map(
             (criteria) =>
               `DELETE ${driver.qualifiedTableName(database, schema, table)} ${JSON.stringify(criteria)}`,
           );
@@ -288,20 +320,14 @@ export class TableMutationService {
         table,
         mode: "driver",
         executionMode: "sequential",
-        primaryKeyValuesList,
+        primaryKeyValuesList: coercedPrimaryKeyValuesList,
         operations: [],
         previewStatements,
-        verificationCriteriaList: primaryKeyValuesList,
+        verificationCriteriaList: coercedPrimaryKeyValuesList,
       };
     }
 
     const qualifiedTableName = driver.qualifiedTableName(
-      database,
-      schema,
-      table,
-    );
-    const columns = await this.columnsProvider.getColumns(
-      connectionId,
       database,
       schema,
       table,
@@ -312,9 +338,6 @@ export class TableMutationService {
         "Delete requires a primary key so the affected rows can be targeted safely.",
       );
     }
-    const columnMetaByName = new Map(
-      columns.map((column) => [column.name, column]),
-    );
     const primaryKeyColumnNames = primaryKeyColumns.map(
       (column) => column.name,
     );

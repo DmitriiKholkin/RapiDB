@@ -1,10 +1,23 @@
 import vm from "node:vm";
-import { MongoClient, ObjectId } from "mongodb";
+import {
+  Binary,
+  BSONRegExp,
+  Code,
+  Decimal128,
+  Int32,
+  Long,
+  MaxKey,
+  MinKey,
+  MongoClient,
+  ObjectId,
+  Timestamp,
+  UUID,
+} from "mongodb";
 import type { ConnectionConfig } from "../connectionManager";
+import { formatDatetimeForDisplay } from "./BaseDBDriver";
 import {
   applyFilters,
   applySort,
-  flattenRootRecord,
   inferColumnsFromRows,
   pageRows,
   unsupported,
@@ -20,6 +33,8 @@ import type {
   DriverTablePageRequest,
   DriverTablePageResult,
   DriverUpdateRowsRequest,
+  FilterExpression,
+  FilterOperator,
   ForeignKeyMeta,
   IDBDriver,
   IndexMeta,
@@ -30,7 +45,9 @@ import type {
   TableInfo,
   TransactionOperation,
   TriggerMeta,
+  TypeCategory,
 } from "./types";
+import { resolveFilterOperators } from "./types";
 
 const MONGODB_ENTITY_MANIFEST: DriverEntityManifest = {
   dbObjectKinds: ["table", "view"],
@@ -41,6 +58,378 @@ const MONGODB_ENTITY_MANIFEST: DriverEntityManifest = {
     triggers: "not_applicable",
   },
 };
+
+type MongoSchemaType = {
+  category: TypeCategory;
+  nativeType: string;
+};
+
+const MONGO_SCALAR_MISS = Symbol("mongo-scalar-miss");
+const UUID_VALUE_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const BASE64_VALUE_RE =
+  /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+const DISPLAY_DATETIME_RE =
+  /^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}:\d{2})(\.\d{1,3})?)?(?: ?(Z|[+-]\d{2}(?::?\d{2})?))?$/;
+const TIMESTAMP_LITERAL_RE = /^Timestamp\((\d+),\s*(\d+)\)$/i;
+
+function unwrapQuotedMongoDisplay(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length >= 2) {
+    const first = trimmed[0];
+    const last = trimmed[trimmed.length - 1];
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      return trimmed.slice(1, -1);
+    }
+  }
+  return trimmed;
+}
+
+function binarySubtypeFromNativeType(nativeType: string): number {
+  const match = /^binData\((\d+)\)$/i.exec(nativeType.trim());
+  return match ? Number.parseInt(match[1], 10) : 0;
+}
+
+function parseMongoBase64(value: string): Buffer | null {
+  const trimmed = unwrapQuotedMongoDisplay(value);
+  if (!trimmed || trimmed.length % 4 !== 0 || !BASE64_VALUE_RE.test(trimmed)) {
+    return null;
+  }
+  try {
+    return Buffer.from(trimmed, "base64");
+  } catch {
+    return null;
+  }
+}
+
+function parseMongoDisplayDate(value: string): Date | null {
+  const trimmed = unwrapQuotedMongoDisplay(value);
+  const displayMatch = DISPLAY_DATETIME_RE.exec(trimmed);
+  if (displayMatch) {
+    const [, datePart, timePart = "00:00:00", fractionPart = "", timezone] =
+      displayMatch;
+    const fractionDigits = fractionPart
+      ? fractionPart.slice(1).padEnd(3, "0").slice(0, 3)
+      : "000";
+    const isoString = `${datePart}T${timePart}.${fractionDigits}${timezone ?? "Z"}`;
+    const parsed = new Date(isoString);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  const parsed = new Date(trimmed);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function formatMongoTimestampDisplay(seconds: number): string {
+  return formatDatetimeForDisplay(new Date(seconds * 1000)) ?? String(seconds);
+}
+
+function parseMongoTimestampInput(value: string): Timestamp | null {
+  const trimmed = unwrapQuotedMongoDisplay(value);
+  const literalMatch = TIMESTAMP_LITERAL_RE.exec(trimmed);
+  if (literalMatch) {
+    return new Timestamp({
+      t: Number.parseInt(literalMatch[1], 10),
+      i: Number.parseInt(literalMatch[2], 10),
+    });
+  }
+
+  const parsedDate = parseMongoDisplayDate(trimmed);
+  if (!parsedDate) {
+    return null;
+  }
+
+  return new Timestamp({
+    t: Math.floor(parsedDate.getTime() / 1000),
+    i: 1,
+  });
+}
+
+function parseMongoRegexInput(value: string): RegExp | null {
+  const trimmed = unwrapQuotedMongoDisplay(value);
+  if (!trimmed.startsWith("/")) {
+    return null;
+  }
+
+  const lastSlash = trimmed.lastIndexOf("/");
+  if (lastSlash <= 0) {
+    return null;
+  }
+
+  try {
+    return new RegExp(
+      trimmed.slice(1, lastSlash),
+      trimmed.slice(lastSlash + 1),
+    );
+  } catch {
+    return null;
+  }
+}
+
+function bsonTypeTag(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const tag = (value as { _bsontype?: unknown })._bsontype;
+  return typeof tag === "string" ? tag : undefined;
+}
+
+function bsonCtorName(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const ctorName = (value as { constructor?: { name?: unknown } }).constructor
+    ?.name;
+  return typeof ctorName === "string" ? ctorName : undefined;
+}
+
+function bsonBinarySubtype(value: unknown): number | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const subtype = (value as { sub_type?: unknown }).sub_type;
+  return typeof subtype === "number" ? subtype : undefined;
+}
+
+function bsonBinaryBytes(value: unknown): Buffer | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const buffer = (value as { buffer?: unknown }).buffer;
+  if (!Buffer.isBuffer(buffer)) {
+    return null;
+  }
+  const position = (value as { position?: unknown }).position;
+  const end =
+    typeof position === "number" && Number.isFinite(position)
+      ? Math.max(0, Math.min(buffer.length, position))
+      : buffer.length;
+  return buffer.subarray(0, end);
+}
+
+function formatMongoScalarValue(
+  value: unknown,
+): unknown | typeof MONGO_SCALAR_MISS {
+  if (
+    value === null ||
+    value === undefined ||
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime())
+      ? String(value)
+      : (formatDatetimeForDisplay(value) ?? value.toISOString());
+  }
+
+  if (value instanceof RegExp) {
+    return value.toString();
+  }
+
+  if (value instanceof ObjectId) {
+    return value.toHexString();
+  }
+
+  const tag = bsonTypeTag(value);
+  const ctorName = bsonCtorName(value);
+  const binarySubtype = bsonBinarySubtype(value);
+
+  if (ctorName === "UUID") {
+    // Already promoted to UUID by the driver — toString() returns hyphenated hex
+    return String(value);
+  }
+
+  if (tag === "Binary" && binarySubtype === 4) {
+    // Binary(4) that was NOT auto-promoted: try converting, fall back to base64
+    const toUuid = (value as { toUUID?: unknown }).toUUID;
+    if (typeof toUuid === "function") {
+      try {
+        return String(toUuid.call(value));
+      } catch {
+        // Not a valid 16-byte UUID — encode as base64 instead
+      }
+    }
+    const bytes = bsonBinaryBytes(value);
+    return bytes ? bytes.toString("base64") : String(value);
+  }
+
+  switch (tag) {
+    case "Binary": {
+      const bytes = bsonBinaryBytes(value);
+      return bytes ? bytes.toString("base64") : String(value);
+    }
+    case "Code": {
+      const code = (value as { code?: unknown }).code;
+      return typeof code === "string" ? code : String(value);
+    }
+    case "Decimal128":
+    case "Double":
+    case "Int32":
+    case "Long":
+      return String(value);
+    case "Timestamp": {
+      const increment = (value as { low?: unknown }).low;
+      const seconds = (value as { high?: unknown }).high;
+      return typeof seconds === "number" && typeof increment === "number"
+        ? formatMongoTimestampDisplay(seconds)
+        : String(value);
+    }
+    case "BSONRegExp": {
+      const pattern = (value as { pattern?: unknown }).pattern;
+      const options = (value as { options?: unknown }).options;
+      if (typeof pattern === "string") {
+        return `/${pattern}/${typeof options === "string" ? options : ""}`;
+      }
+      return String(value);
+    }
+    case "MinKey":
+      return "MinKey()";
+    case "MaxKey":
+      return "MaxKey()";
+    case "ObjectId":
+      return String(value);
+    default:
+      return MONGO_SCALAR_MISS;
+  }
+}
+
+function toMongoJsonValue(value: unknown): unknown {
+  const scalar = formatMongoScalarValue(value);
+  if (scalar !== MONGO_SCALAR_MISS) {
+    return scalar;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => toMongoJsonValue(entry));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
+        key,
+        toMongoJsonValue(entry),
+      ]),
+    );
+  }
+
+  return String(value);
+}
+
+function formatMongoDisplayValue(value: unknown): unknown {
+  const scalar = formatMongoScalarValue(value);
+  if (scalar !== MONGO_SCALAR_MISS) {
+    return scalar;
+  }
+
+  if (Array.isArray(value) || (value !== null && typeof value === "object")) {
+    try {
+      return JSON.stringify(toMongoJsonValue(value));
+    } catch {
+      return String(value);
+    }
+  }
+
+  return value;
+}
+
+function inferMongoSchemaType(value: unknown): MongoSchemaType {
+  if (value === null) {
+    return { category: "other", nativeType: "null" };
+  }
+
+  if (value === undefined) {
+    return { category: "other", nativeType: "undefined" };
+  }
+
+  if (typeof value === "string") {
+    return { category: "text", nativeType: "string" };
+  }
+
+  if (typeof value === "boolean") {
+    return { category: "boolean", nativeType: "bool" };
+  }
+
+  if (typeof value === "number") {
+    return {
+      category: Number.isInteger(value) ? "integer" : "float",
+      nativeType: Number.isInteger(value) ? "number" : "double",
+    };
+  }
+
+  if (typeof value === "bigint") {
+    return { category: "integer", nativeType: "int64" };
+  }
+
+  if (value instanceof Date) {
+    return { category: "datetime", nativeType: "date" };
+  }
+
+  if (Array.isArray(value)) {
+    return { category: "array", nativeType: "array" };
+  }
+
+  if (value instanceof RegExp) {
+    return { category: "other", nativeType: "regex" };
+  }
+
+  if (value instanceof ObjectId) {
+    return { category: "text", nativeType: "objectId" };
+  }
+
+  const tag = bsonTypeTag(value);
+  const ctorName = bsonCtorName(value);
+  if (ctorName === "UUID" || bsonBinarySubtype(value) === 4) {
+    return { category: "uuid", nativeType: "uuid" };
+  }
+
+  switch (tag) {
+    case "Binary": {
+      const subtype = bsonBinarySubtype(value);
+      if (subtype === 4) {
+        return { category: "uuid", nativeType: "uuid" };
+      }
+      return {
+        category: "binary",
+        nativeType:
+          typeof subtype === "number" && subtype !== 0
+            ? `binData(${subtype})`
+            : "binData",
+      };
+    }
+    case "Code":
+      return { category: "other", nativeType: "javascript" };
+    case "DBRef":
+      return { category: "other", nativeType: "dbRef" };
+    case "Decimal128":
+      return { category: "decimal", nativeType: "decimal128" };
+    case "Double":
+      return { category: "float", nativeType: "double" };
+    case "Int32":
+      return { category: "integer", nativeType: "int32" };
+    case "Long":
+      return { category: "integer", nativeType: "int64" };
+    case "MaxKey":
+      return { category: "other", nativeType: "maxKey" };
+    case "MinKey":
+      return { category: "other", nativeType: "minKey" };
+    case "ObjectId":
+      return { category: "text", nativeType: "objectId" };
+    case "BSONRegExp":
+      return { category: "other", nativeType: "regex" };
+    case "Timestamp":
+      return { category: "datetime", nativeType: "timestamp" };
+    default:
+      return { category: "json", nativeType: "object" };
+  }
+}
 
 export class MongoDBDriver implements IDBDriver {
   private client: MongoClient | null = null;
@@ -127,14 +516,15 @@ export class MongoDBDriver implements IDBDriver {
     _schema: string,
     table: string,
   ): Promise<ColumnMeta[]> {
-    const rows = await this.readRows(database, table, 50);
-    return inferColumnsFromRows(rows, "_id", {
-      nullableMode: "schemaLess",
-    }).map((column) => ({
+    const columns = await this.describeSchemaColumns(database, table, 50);
+    return columns.map((column) => ({
       name: column.name,
-      type: column.nativeType,
+      type: column.type,
       nullable: column.nullable,
-      defaultValue: column.isPrimaryKey ? "ObjectId()" : undefined,
+      defaultValue:
+        column.isPrimaryKey && column.nativeType === "objectId"
+          ? "ObjectId()"
+          : undefined,
       isPrimaryKey: column.isPrimaryKey,
       primaryKeyOrdinal: column.primaryKeyOrdinal,
       isForeignKey: false,
@@ -146,12 +536,13 @@ export class MongoDBDriver implements IDBDriver {
     _schema: string,
     table: string,
   ): Promise<ColumnTypeMeta[]> {
-    const rows = await this.readRows(database, table, 50);
-    return inferColumnsFromRows(rows, "_id", {
-      nullableMode: "schemaLess",
-    }).map((column) => ({
+    const columns = await this.describeSchemaColumns(database, table, 50);
+    return columns.map((column) => ({
       ...column,
-      defaultValue: column.isPrimaryKey ? "ObjectId()" : undefined,
+      defaultValue:
+        column.isPrimaryKey && column.nativeType === "objectId"
+          ? "ObjectId()"
+          : undefined,
     }));
   }
 
@@ -322,7 +713,7 @@ export class MongoDBDriver implements IDBDriver {
         opArgs[0] as Record<string, unknown>,
       );
       const result = await this.requireDb(dbName).command(cmd);
-      const row = flattenRootRecord(result as Record<string, unknown>);
+      const row = this.toRow(result as Record<string, unknown>);
       const columns = Object.keys(row);
       return {
         columns,
@@ -357,7 +748,10 @@ export class MongoDBDriver implements IDBDriver {
       );
       const actualLimit = op === "findOne" ? 1 : limit;
       const docs = await mongoCollection
-        .find(filter)
+        .find(filter, {
+          promoteValues: false,
+          bsonRegExp: true,
+        })
         .limit(actualLimit)
         .skip(skip)
         .toArray();
@@ -460,7 +854,12 @@ export class MongoDBDriver implements IDBDriver {
 
     if (op === "aggregate") {
       const pipeline = opArgs[0] as Record<string, unknown>[];
-      const docs = await mongoCollection.aggregate(pipeline).toArray();
+      const docs = await mongoCollection
+        .aggregate(pipeline, {
+          promoteValues: false,
+          bsonRegExp: true,
+        })
+        .toArray();
       const rows = docs.map((doc) =>
         this.toRow(doc as Record<string, unknown>),
       );
@@ -482,13 +881,25 @@ export class MongoDBDriver implements IDBDriver {
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
     const rows = await this.readRows(request.database, request.table, 2000);
-    const filtered = applyFilters(rows, request.filters);
+    const schemaColumns = await this.describeSchemaColumns(
+      request.database,
+      request.table,
+      2000,
+    );
+    const normalizedFilters = this.normalizeInlineFilters(
+      request.filters,
+      schemaColumns,
+    );
+    const filtered = applyFilters(rows, normalizedFilters);
     const sorted = applySort(filtered, request.sort);
     const paged = pageRows(sorted, request.page, request.pageSize);
     return {
-      columns: inferColumnsFromRows(sorted, "_id", {
-        nullableMode: "schemaLess",
-      }),
+      columns:
+        schemaColumns.length > 0
+          ? schemaColumns
+          : inferColumnsFromRows(sorted, "_id", {
+              nullableMode: "schemaLess",
+            }),
       rows: paged,
       totalCount: request.skipCount ? 0 : sorted.length,
     };
@@ -606,12 +1017,111 @@ export class MongoDBDriver implements IDBDriver {
     return "ORDER BY _id";
   }
 
-  coerceInputValue(value: unknown, _column: ColumnTypeMeta): unknown {
-    return value;
+  coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (value === null || value === undefined || value === "") {
+      return value;
+    }
+
+    if (typeof value !== "string") {
+      return value;
+    }
+
+    const normalized = unwrapQuotedMongoDisplay(value);
+
+    if (column.nativeType === "objectId") {
+      return ObjectId.isValid(normalized) && normalized.length === 24
+        ? new ObjectId(normalized)
+        : normalized;
+    }
+
+    if (column.nativeType === "uuid") {
+      return UUID_VALUE_RE.test(normalized)
+        ? UUID.createFromHexString(normalized.replace(/-/g, ""))
+        : normalized;
+    }
+
+    if (column.nativeType === "date") {
+      return parseMongoDisplayDate(normalized) ?? normalized;
+    }
+
+    if (column.nativeType === "timestamp") {
+      return parseMongoTimestampInput(normalized) ?? normalized;
+    }
+
+    if (column.nativeType === "decimal128") {
+      try {
+        return Decimal128.fromString(normalized);
+      } catch {
+        return normalized;
+      }
+    }
+
+    if (column.nativeType === "int32") {
+      return /^[+-]?\d+$/.test(normalized)
+        ? new Int32(Number.parseInt(normalized, 10))
+        : normalized;
+    }
+
+    if (column.nativeType === "int64") {
+      return /^[+-]?\d+$/.test(normalized)
+        ? Long.fromString(normalized)
+        : normalized;
+    }
+
+    if (column.nativeType === "double" || column.nativeType === "number") {
+      const numeric = Number(normalized);
+      return Number.isFinite(numeric) ? numeric : normalized;
+    }
+
+    if (column.nativeType === "bool") {
+      const lower = normalized.toLowerCase();
+      if (lower === "true" || lower === "1") return true;
+      if (lower === "false" || lower === "0") return false;
+      return normalized;
+    }
+
+    if (column.nativeType === "javascript") {
+      return new Code(normalized);
+    }
+
+    if (column.nativeType === "regex") {
+      return parseMongoRegexInput(normalized) ?? normalized;
+    }
+
+    if (column.nativeType === "minKey") {
+      return /^MinKey\(\)$/i.test(normalized) ? new MinKey() : normalized;
+    }
+
+    if (column.nativeType === "maxKey") {
+      return /^MaxKey\(\)$/i.test(normalized) ? new MaxKey() : normalized;
+    }
+
+    if (/^binData(?:\(\d+\))?$/i.test(column.nativeType)) {
+      const bytes = parseMongoBase64(normalized);
+      return bytes
+        ? new Binary(bytes, binarySubtypeFromNativeType(column.nativeType))
+        : normalized;
+    }
+
+    if (column.category === "array" || column.category === "json") {
+      try {
+        return JSON.parse(normalized) as unknown;
+      } catch {
+        return normalized;
+      }
+    }
+
+    return normalized;
   }
 
-  formatOutputValue(value: unknown, _column: ColumnTypeMeta): unknown {
-    return value;
+  formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (typeof value === "string") {
+      const coerced = this.coerceInputValue(value, column);
+      if (coerced !== value) {
+        return formatMongoDisplayValue(coerced);
+      }
+    }
+    return formatMongoDisplayValue(value);
   }
 
   checkPersistedEdit(
@@ -623,11 +1133,19 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   normalizeFilterValue(
-    _column: ColumnTypeMeta,
-    _operator: never,
+    column: ColumnTypeMeta,
+    _operator: FilterOperator,
     value: string | [string, string] | undefined,
   ) {
-    return value;
+    if (value === undefined) {
+      return undefined;
+    }
+    if (Array.isArray(value)) {
+      return value.map((entry) =>
+        this.normalizeInlineFilterScalar(column, entry),
+      ) as [string, string];
+    }
+    return this.normalizeInlineFilterScalar(column, value);
   }
 
   buildFilterCondition(
@@ -701,14 +1219,78 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   private toRow(document: Record<string, unknown>): Record<string, unknown> {
-    const withStringId = {
-      ...document,
-      _id:
-        document._id instanceof ObjectId
-          ? document._id.toHexString()
-          : document._id,
-    };
-    return flattenRootRecord(withStringId);
+    return Object.fromEntries(
+      Object.entries(document).map(([key, value]) => [
+        key,
+        formatMongoDisplayValue(value),
+      ]),
+    );
+  }
+
+  private async describeSchemaColumns(
+    database: string,
+    table: string,
+    limit: number,
+  ): Promise<ColumnTypeMeta[]> {
+    const documents = await this.readSchemaDocuments(database, table, limit);
+    const keys = new Set<string>();
+    for (const document of documents) {
+      for (const key of Object.keys(document)) {
+        keys.add(key);
+      }
+    }
+
+    return [...keys]
+      .sort((left, right) => left.localeCompare(right))
+      .map((name) => {
+        const isPrimaryKey = name === "_id";
+        const sample = documents.find((document) =>
+          Object.hasOwn(document, name),
+        )?.[name];
+        const { category, nativeType } = inferMongoSchemaType(sample);
+        const filterable = category !== "binary" && category !== "spatial";
+
+        return {
+          name,
+          type: nativeType,
+          nativeType,
+          category,
+          nullable: isPrimaryKey ? false : true,
+          defaultValue: undefined,
+          isPrimaryKey,
+          primaryKeyOrdinal: isPrimaryKey ? 1 : undefined,
+          isForeignKey: false,
+          filterable,
+          filterOperators: resolveFilterOperators(category, {
+            filterable,
+            nullable: !isPrimaryKey,
+          }),
+          valueSemantics: "plain",
+        } satisfies ColumnTypeMeta;
+      });
+  }
+
+  private async readSchemaDocuments(
+    database: string,
+    table: string,
+    limit: number,
+  ): Promise<Record<string, unknown>[]> {
+    try {
+      const docs = await this.requireDb(database)
+        .collection(table)
+        .find(
+          {},
+          {
+            promoteValues: false,
+            bsonRegExp: true,
+          },
+        )
+        .limit(limit)
+        .toArray();
+      return docs as Record<string, unknown>[];
+    } catch {
+      return [];
+    }
   }
 
   private async readRows(
@@ -719,7 +1301,13 @@ export class MongoDBDriver implements IDBDriver {
     try {
       const docs = await this.requireDb(database)
         .collection(table)
-        .find({})
+        .find(
+          {},
+          {
+            promoteValues: false,
+            bsonRegExp: true,
+          },
+        )
         .limit(limit)
         .toArray();
       return docs.map((doc) => this.toRow(doc as Record<string, unknown>));
@@ -766,26 +1354,116 @@ export class MongoDBDriver implements IDBDriver {
     if (value === null || value === undefined) return "null";
     if (typeof value === "boolean") return String(value);
     if (typeof value === "number") return String(value);
+    if (typeof value === "bigint") return value.toString();
     if (typeof value === "string") {
       if (ObjectId.isValid(value) && value.length === 24) {
         return `ObjectId(${JSON.stringify(value)})`;
       }
       return JSON.stringify(value);
     }
+    if (value instanceof Date) {
+      return `new Date(${JSON.stringify(value.toISOString())})`;
+    }
     if (value instanceof ObjectId) {
       return `ObjectId(${JSON.stringify(value.toHexString())})`;
+    }
+    if (value instanceof RegExp) {
+      return `new RegExp(${JSON.stringify(value.source)}, ${JSON.stringify(value.flags)})`;
+    }
+    if (value instanceof UUID) {
+      const bytes = bsonBinaryBytes(value);
+      return `new BinData(4, ${JSON.stringify(bytes?.toString("base64") ?? "")})`;
+    }
+    if (value instanceof Binary) {
+      const bytes = bsonBinaryBytes(value);
+      return `new BinData(${bsonBinarySubtype(value) ?? 0}, ${JSON.stringify(bytes?.toString("base64") ?? "")})`;
+    }
+    if (value instanceof Decimal128) {
+      return `new NumberDecimal(${JSON.stringify(value.toString())})`;
+    }
+    if (value instanceof Int32) {
+      return `new NumberInt(${JSON.stringify(value.toString())})`;
+    }
+    if (value instanceof Timestamp) {
+      return `new Timestamp(${value.high}, ${value.low})`;
+    }
+    if (value instanceof Long) {
+      return `new NumberLong(${JSON.stringify(value.toString())})`;
+    }
+    if (value instanceof Code) {
+      return `new Code(${JSON.stringify(value.code)})`;
+    }
+    if (value instanceof BSONRegExp) {
+      return `new RegExp(${JSON.stringify(value.pattern)}, ${JSON.stringify(value.options)})`;
+    }
+    if (value instanceof MinKey) {
+      return "MinKey()";
+    }
+    if (value instanceof MaxKey) {
+      return "MaxKey()";
     }
     if (Array.isArray(value)) {
       return `[${value.map((v) => this.serializeMongosh(v)).join(", ")}]`;
     }
     if (typeof value === "object") {
       const entries = Object.entries(value as Record<string, unknown>).map(
-        ([k, v]) => `${k}: ${this.serializeMongosh(v)}`,
+        ([k, v]) => `${JSON.stringify(k)}: ${this.serializeMongosh(v)}`,
       );
       if (entries.length === 0) return "{}";
       return `{ ${entries.join(", ")} }`;
     }
     return JSON.stringify(value);
+  }
+
+  private normalizeInlineFilters(
+    filters: readonly FilterExpression[],
+    columns: readonly ColumnTypeMeta[],
+  ): FilterExpression[] {
+    if (filters.length === 0 || columns.length === 0) {
+      return [...filters];
+    }
+
+    const columnMap = new Map(columns.map((column) => [column.name, column]));
+    return filters.map((filter) => {
+      const column = columnMap.get(filter.column);
+      if (!column || !("value" in filter)) {
+        return filter;
+      }
+
+      const normalized = this.normalizeFilterValue(
+        column,
+        filter.operator,
+        filter.value,
+      );
+      if (normalized === undefined) {
+        return filter;
+      }
+
+      return {
+        ...filter,
+        value: normalized,
+      } as FilterExpression;
+    });
+  }
+
+  private normalizeInlineFilterScalar(
+    column: ColumnTypeMeta,
+    value: string,
+  ): string {
+    const trimmed = unwrapQuotedMongoDisplay(value);
+    if (
+      column.category === "datetime" ||
+      column.nativeType === "date" ||
+      column.nativeType === "timestamp" ||
+      column.nativeType === "uuid" ||
+      column.nativeType === "objectId"
+    ) {
+      const coerced = this.coerceInputValue(trimmed, column);
+      const formatted = this.formatOutputValue(coerced, column);
+      return typeof formatted === "string" ? formatted : String(formatted);
+    }
+
+    return trimmed;
   }
 
   private mapRowToQueryRow(

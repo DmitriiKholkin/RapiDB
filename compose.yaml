@@ -2310,7 +2310,7 @@ services:
           t_object:       { nested: { deep: { value: 42 } }, arr: [1,2,3] },
           t_array:        [1,"two",3.0,true,null,{ k:"v" },[7,8,9]],
           t_binary:       new BinData(0,"AQIDBAUGB/8="),
-          t_binary_uuid:  new BinData(4,"ESIzRFVmd4iZqrvM3e7/"),
+          t_binary_uuid:  new BinData(4,"ESIzRFVmd4iZqrvM3e7//w=="),
           t_objectid:     new ObjectId("64a1b2c3d4e5f67890abcdef"),
           t_bool_true:    true,
           t_bool_false:   false,

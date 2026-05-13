@@ -11,7 +11,7 @@ import type {
   RowUpdate,
   VerificationTarget,
 } from "./tableDataContracts";
-import { buildUpdateRowSql } from "./updateSql";
+import { buildUpdateRowSql, coerceRecord } from "./updateSql";
 
 interface VerificationFailure {
   rowIndex: number;
@@ -62,6 +62,13 @@ export function prepareApplyChangesPlan(
   }
 
   if (driver.updateRows) {
+    const columnMetaByName = new Map(
+      columns.map((column) => [column.name, column]),
+    );
+    const coercedUpdates = updates.map((update) => ({
+      primaryKeys: coerceRecord(driver, update.primaryKeys, columnMetaByName),
+      changes: coerceRecord(driver, update.changes, columnMetaByName),
+    }));
     return {
       executable: true,
       plan: {
@@ -71,9 +78,9 @@ export function prepareApplyChangesPlan(
         table,
         mode: "driver",
         cols: columns,
-        updates,
+        updates: coercedUpdates,
         operations: [],
-        previewStatements: updates.map(({ primaryKeys, changes }) =>
+        previewStatements: coercedUpdates.map(({ primaryKeys, changes }) =>
           driver.buildMutationPreviewStatement
             ? driver.buildMutationPreviewStatement(
                 "update",

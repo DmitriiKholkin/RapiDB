@@ -497,6 +497,18 @@ describe("table helpers", () => {
   it("builds and executes driver-backed update plans with warning on partial matches", async () => {
     const driver: IDBDriver = {
       ...fakeDriver,
+      coerceInputValue: (value, column) => {
+        if (typeof value !== "string") {
+          return value;
+        }
+        if (column.category === "integer") {
+          return Number.parseInt(value, 10);
+        }
+        if (column.name === "display_name") {
+          return value.trim().toUpperCase();
+        }
+        return value;
+      },
       updateRows: async () => ({ affectedRows: 1 }),
     };
 
@@ -510,12 +522,12 @@ describe("table helpers", () => {
       "fixture_rows",
       [
         {
-          primaryKeys: { id: 1 },
-          changes: { display_name: "Alpha Updated" },
+          primaryKeys: { id: "1" },
+          changes: { display_name: " Alpha Updated " },
         },
         {
-          primaryKeys: { id: 2 },
-          changes: { display_name: "Beta Updated" },
+          primaryKeys: { id: "2" },
+          changes: { display_name: " Beta Updated " },
         },
       ],
       columns,
@@ -528,8 +540,8 @@ describe("table helpers", () => {
 
     expect(prepared.plan.mode).toBe("driver");
     expect(prepared.plan.previewStatements).toEqual([
-      'UPDATE public.fixture_rows {"primaryKeys":{"id":1},"changes":{"display_name":"Alpha Updated"}}',
-      'UPDATE public.fixture_rows {"primaryKeys":{"id":2},"changes":{"display_name":"Beta Updated"}}',
+      'UPDATE public.fixture_rows {"primaryKeys":{"id":1},"changes":{"display_name":"ALPHA UPDATED"}}',
+      'UPDATE public.fixture_rows {"primaryKeys":{"id":2},"changes":{"display_name":"BETA UPDATED"}}',
     ]);
 
     const result = await executePreparedApplyPlan(
@@ -555,6 +567,18 @@ describe("table helpers", () => {
     const deleteRows = async () => ({ affectedRows: 2 });
     const driver: IDBDriver = {
       ...fakeDriver,
+      coerceInputValue: (value, column) => {
+        if (typeof value !== "string") {
+          return value;
+        }
+        if (column.category === "integer") {
+          return Number.parseInt(value, 10);
+        }
+        if (column.name === "display_name") {
+          return value.trim().toUpperCase();
+        }
+        return value;
+      },
       updateRows,
       insertRow,
       deleteRows,
@@ -578,8 +602,8 @@ describe("table helpers", () => {
       "main",
       "public",
       "fixture_rows",
-      { id: 1 },
-      { display_name: "Updated" },
+      { id: "1" },
+      { display_name: "  Updated  " },
     );
 
     expect(updateRowsSpy).toHaveBeenCalledWith({
@@ -589,7 +613,7 @@ describe("table helpers", () => {
       updates: [
         {
           primaryKeys: { id: 1 },
-          changes: { display_name: "Updated" },
+          changes: { display_name: "UPDATED" },
         },
       ],
     });
@@ -599,12 +623,12 @@ describe("table helpers", () => {
       "main",
       "public",
       "fixture_rows",
-      { id: 3, display_name: "Inserted" },
+      { id: "3", display_name: " inserted " },
     );
 
     expect(insertPlan.mode).toBe("driver");
     expect(insertPlan.previewStatements).toEqual([
-      'INSERT public.fixture_rows {"id":3,"display_name":"Inserted"}',
+      'INSERT public.fixture_rows {"id":3,"display_name":"INSERTED"}',
     ]);
 
     await mutationService.executePreparedInsertPlan(insertPlan);
@@ -613,7 +637,7 @@ describe("table helpers", () => {
       database: "main",
       schema: "public",
       table: "fixture_rows",
-      values: { id: 3, display_name: "Inserted" },
+      values: { id: 3, display_name: "INSERTED" },
     });
 
     const deletePlan = await mutationService.prepareDeleteRowsPlan(
@@ -621,7 +645,7 @@ describe("table helpers", () => {
       "main",
       "public",
       "fixture_rows",
-      [{ id: 1 }, { id: 2 }],
+      [{ id: "1" }, { id: "2" }],
     );
 
     expect(deletePlan).not.toBeNull();
