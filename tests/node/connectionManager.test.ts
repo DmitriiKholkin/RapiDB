@@ -610,6 +610,47 @@ describe("ConnectionManager", () => {
     expect(driverInstances[0]?.disconnectCalls).toBe(1);
   });
 
+  it("hydrates stored DynamoDB credentials from Secret Storage before connecting", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-ddb",
+        name: "Dynamo",
+        type: "dynamodb",
+        awsRegion: "us-east-1",
+        useSecretStorage: true,
+      },
+    ]);
+    store.setSecret(
+      "conn-ddb",
+      JSON.stringify({
+        awsAccessKeyId: "AKIA123",
+        awsSecretAccessKey: "secret-key",
+        awsSessionToken: "session-token",
+      }),
+    );
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await manager.connectTo("conn-ddb");
+
+    expect(driverInstances[0]?.config).toMatchObject({
+      id: "conn-ddb",
+      type: "dynamodb",
+      awsRegion: "us-east-1",
+      awsAccessKeyId: "AKIA123",
+      awsSecretAccessKey: "secret-key",
+      awsSessionToken: "session-token",
+    });
+  });
+
   it("loads the baseline database and leaves other databases catalog-only until expanded", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"

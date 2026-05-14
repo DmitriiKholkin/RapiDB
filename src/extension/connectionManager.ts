@@ -733,13 +733,57 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
     this._onDidChangeConnections.fire();
     return true;
   }
+
+  private parseStoredSecrets(value: string | undefined): {
+    password?: string;
+    awsAccessKeyId?: string;
+    awsSecretAccessKey?: string;
+    awsSessionToken?: string;
+  } {
+    if (!value) {
+      return {};
+    }
+
+    try {
+      const parsed = JSON.parse(value) as Record<string, unknown>;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return {
+          password:
+            typeof parsed.password === "string" ? parsed.password : undefined,
+          awsAccessKeyId:
+            typeof parsed.awsAccessKeyId === "string"
+              ? parsed.awsAccessKeyId
+              : undefined,
+          awsSecretAccessKey:
+            typeof parsed.awsSecretAccessKey === "string"
+              ? parsed.awsSecretAccessKey
+              : undefined,
+          awsSessionToken:
+            typeof parsed.awsSessionToken === "string"
+              ? parsed.awsSessionToken
+              : undefined,
+        };
+      }
+    } catch {}
+
+    return { password: value };
+  }
+
   async _hydratePassword(config: ConnectionConfig): Promise<ConnectionConfig> {
     if (!config.useSecretStorage) {
       return config;
     }
     try {
       const stored = await this.store.getSecret(config.id);
-      return { ...config, password: stored ?? "" };
+      const secrets = this.parseStoredSecrets(stored);
+      return {
+        ...config,
+        password: secrets.password ?? config.password ?? "",
+        awsAccessKeyId: secrets.awsAccessKeyId ?? config.awsAccessKeyId,
+        awsSecretAccessKey:
+          secrets.awsSecretAccessKey ?? config.awsSecretAccessKey,
+        awsSessionToken: secrets.awsSessionToken ?? config.awsSessionToken,
+      };
     } catch {
       return { ...config, password: "" };
     }

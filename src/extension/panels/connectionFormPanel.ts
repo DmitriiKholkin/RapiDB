@@ -11,6 +11,70 @@ import {
 } from "../utils/errorHandling";
 import { createWebviewShell } from "./webviewShell";
 
+type StoredConnectionSecrets = {
+  password?: string;
+  awsAccessKeyId?: string;
+  awsSecretAccessKey?: string;
+  awsSessionToken?: string;
+};
+
+function trimOptionalSecret(value: string | undefined): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function parseStoredConnectionSecrets(
+  value: string | undefined,
+): StoredConnectionSecrets {
+  if (!value) {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return {
+        password:
+          typeof parsed.password === "string" ? parsed.password : undefined,
+        awsAccessKeyId:
+          typeof parsed.awsAccessKeyId === "string"
+            ? parsed.awsAccessKeyId
+            : undefined,
+        awsSecretAccessKey:
+          typeof parsed.awsSecretAccessKey === "string"
+            ? parsed.awsSecretAccessKey
+            : undefined,
+        awsSessionToken:
+          typeof parsed.awsSessionToken === "string"
+            ? parsed.awsSessionToken
+            : undefined,
+      };
+    }
+  } catch {}
+
+  return { password: value };
+}
+
+function serializeStoredConnectionSecrets(
+  secrets: StoredConnectionSecrets,
+): string | undefined {
+  const filtered = Object.fromEntries(
+    Object.entries(secrets).filter(([, value]) => typeof value === "string"),
+  );
+
+  return Object.keys(filtered).length > 0
+    ? JSON.stringify(filtered)
+    : undefined;
+}
+
+function shouldUseSecretStorage(payload: ConnectionFormSubmission): boolean {
+  return payload.type === "dynamodb" || payload.useSecretStorage === true;
+}
+
 export class ConnectionFormPanel {
   private static readonly viewType = "rapidb.connectionForm";
 
@@ -99,37 +163,61 @@ export class ConnectionFormPanel {
 
   private async resolveSubmittedPassword(
     payload: ConnectionFormSubmission,
+    storedSecrets: StoredConnectionSecrets,
   ): Promise<string> {
     if (payload.password !== undefined && payload.password !== "") {
       return payload.password;
     }
 
-    if (payload.useSecretStorage && payload.hasStoredSecret) {
-      try {
-        return (await this.context.secrets.get(payload.id)) ?? "";
-      } catch {
-        return "";
-      }
+    if (
+      shouldUseSecretStorage(payload) &&
+      storedSecrets.password !== undefined
+    ) {
+      return storedSecrets.password;
     }
 
     const existing = this.connectionManager.getConnection(payload.id);
-    if (payload.useSecretStorage && existing?.useSecretStorage) {
-      try {
-        return (await this.context.secrets.get(payload.id)) ?? "";
-      } catch {
-        return "";
-      }
-    }
-
     return existing?.password ?? payload.password ?? "";
+  }
+
+  private async loadStoredSecrets(
+    id: string,
+  ): Promise<StoredConnectionSecrets> {
+    try {
+      return parseStoredConnectionSecrets(await this.context.secrets.get(id));
+    } catch {
+      return {};
+    }
   }
 
   private async resolveSubmittedConfig(
     payload: ConnectionFormSubmission,
   ): Promise<ConnectionConfig> {
-    const password = await this.resolveSubmittedPassword(payload);
+    const storedSecrets = await this.loadStoredSecrets(payload.id);
+    const password = await this.resolveSubmittedPassword(
+      payload,
+      storedSecrets,
+    );
     const { hasStoredSecret: _hasStoredSecret, ...rest } = payload;
-    return { ...rest, password };
+    const existing = this.connectionManager.getConnection(payload.id);
+    const useSecretStorage = shouldUseSecretStorage(payload);
+    return {
+      ...rest,
+      useSecretStorage,
+      password,
+      awsAccessKeyId:
+        trimOptionalSecret(payload.awsAccessKeyId) ??
+        (useSecretStorage ? storedSecrets.awsAccessKeyId : undefined) ??
+        existing?.awsAccessKeyId,
+      awsSecretAccessKey:
+        trimOptionalSecret(payload.awsSecretAccessKey) ??
+        (useSecretStorage ? storedSecrets.awsSecretAccessKey : undefined) ??
+        existing?.awsSecretAccessKey,
+      awsSessionToken:
+        trimOptionalSecret(payload.awsSessionToken) ??
+        (useSecretStorage ? storedSecrets.awsSessionToken : undefined) ??
+        existing?.awsSessionToken,
+    };
   }
 
   private async handleMessage(msg: unknown): Promise<void> {
@@ -154,12 +242,29 @@ export class ConnectionFormPanel {
         const raw = await this.resolveSubmittedConfig(payload);
 
         if (raw.useSecretStorage) {
-          const shouldReuseStored =
-            payload.hasStoredSecret === true && (payload.password ?? "") === "";
-          const password = raw.password ?? "";
+          const nextSecrets = serializeStoredConnectionSecrets({
+            password: trimOptionalSecret(raw.password),
+            awsAccessKeyId:
+              raw.type === "dynamodb"
+                ? trimOptionalSecret(raw.awsAccessKeyId)
+                : undefined,
+            awsSecretAccessKey:
+              raw.type === "dynamodb"
+                ? trimOptionalSecret(raw.awsSecretAccessKey)
+                : undefined,
+            awsSessionToken:
+              raw.type === "dynamodb"
+                ? trimOptionalSecret(raw.awsSessionToken)
+                : undefined,
+          });
+          const currentSecrets = serializeStoredConnectionSecrets(
+            await this.loadStoredSecrets(raw.id),
+          );
           try {
-            if (!shouldReuseStored) {
-              await this.context.secrets.store(raw.id, password);
+            if (nextSecrets && nextSecrets !== currentSecrets) {
+              await this.context.secrets.store(raw.id, nextSecrets);
+            } else if (!nextSecrets) {
+              await this.context.secrets.delete(raw.id);
             }
           } catch (err: unknown) {
             const error = normalizeUnknownError(err);
@@ -172,8 +277,14 @@ export class ConnectionFormPanel {
             });
             return;
           }
-          const { password: _pw, ...configWithoutPassword } = raw;
-          const config = configWithoutPassword as ConnectionConfig;
+          const {
+            password: _pw,
+            awsAccessKeyId: _awsAccessKeyId,
+            awsSecretAccessKey: _awsSecretAccessKey,
+            awsSessionToken: _awsSessionToken,
+            ...configWithoutSecrets
+          } = raw;
+          const config = configWithoutSecrets as ConnectionConfig;
           await this.connectionManager.saveConnection(config);
           this.resolveFn?.(config);
         } else {
