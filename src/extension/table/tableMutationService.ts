@@ -6,7 +6,12 @@ import type {
   PreparedInsertPlan,
   TableColumnsProvider,
 } from "./tableDataContracts";
-import { buildUpdateRowSql, coerceRecord, writableEntries } from "./updateSql";
+import {
+  buildUpdateRowSql,
+  coerceRecord,
+  filterWritableRecord,
+  writableEntries,
+} from "./updateSql";
 export class TableMutationService {
   constructor(
     private readonly connectionManager: ConnectionManager,
@@ -31,6 +36,10 @@ export class TableMutationService {
       columns.map((column) => [column.name, column]),
     );
     if (driver.updateRows) {
+      const writableChanges = filterWritableRecord(changes, columnMetaByName);
+      if (Object.keys(writableChanges).length === 0) {
+        return;
+      }
       const result = await driver.updateRows({
         database,
         schema,
@@ -42,7 +51,7 @@ export class TableMutationService {
               primaryKeyValues,
               columnMetaByName,
             ),
-            changes: coerceRecord(driver, changes, columnMetaByName),
+            changes: coerceRecord(driver, writableChanges, columnMetaByName),
           },
         ],
       });
