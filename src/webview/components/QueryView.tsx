@@ -51,6 +51,18 @@ function isSqlConnectionType(connectionType?: string): boolean {
   );
 }
 
+function deriveEditorLanguage(connectionType?: string): QueryEditorLanguage {
+  switch (connectionType) {
+    case "mongodb":
+      return "javascript";
+    case "redis":
+    case "elasticsearch":
+      return "plaintext";
+    default:
+      return "sql";
+  }
+}
+
 export function QueryView({
   connectionId,
   initialSql,
@@ -108,8 +120,7 @@ export function QueryView({
     (c) => c.id === (activeConnectionId || connectionId),
   );
   const activeConnectionType = activeConn?.type ?? connectionType;
-  const derivedEditorLanguage: QueryEditorLanguage =
-    activeConnectionType === "mongodb" ? "javascript" : "sql";
+  const derivedEditorLanguage = deriveEditorLanguage(activeConnectionType);
   const monacoLanguage = editorLanguage ?? derivedEditorLanguage;
   const sqlDialect =
     monacoLanguage === "sql"

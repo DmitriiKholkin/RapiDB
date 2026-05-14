@@ -179,6 +179,26 @@ describe("ConnectionFormView", () => {
     expect(dynamoMessage?.payload).not.toHaveProperty("awsEndpoint");
   });
 
+  it("rejects invalid Redis DB input instead of coercing it to 0", async () => {
+    const user = userEvent.setup();
+
+    render(<ConnectionFormView existing={null} />);
+
+    await user.clear(screen.getByLabelText("Connection name"));
+    await user.type(screen.getByLabelText("Connection name"), "Redis Cache");
+    await user.click(screen.getByRole("button", { name: /redis/i }));
+    await user.clear(screen.getByLabelText("Redis DB"));
+    await user.type(screen.getByLabelText("Redis DB"), "abc");
+
+    clearPostedMessages();
+    await submitCreateConnection(user);
+
+    expect(getLastPostedMessage()).toBeUndefined();
+    expect(
+      screen.getByText("Redis DB must be a non-negative integer."),
+    ).toBeTruthy();
+  });
+
   it("posts test, save, and cancel messages and reacts to result messages", async () => {
     const user = userEvent.setup();
     const existing = {

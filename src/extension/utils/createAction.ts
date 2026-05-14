@@ -117,8 +117,8 @@ export function generateCreateDatabaseTemplate(
     case "sqlite":
       return {
         script: [
-          "SQLite does not support CREATE DATABASE.",
-          "Create a new file and optionally attach it in the current session:",
+          "-- SQLite does not support CREATE DATABASE.",
+          "-- Create a new file and optionally attach it in the current session:",
           "ATTACH DATABASE '/absolute/path/app.db' AS app;",
         ].join("\n"),
         formatOnOpen: false,

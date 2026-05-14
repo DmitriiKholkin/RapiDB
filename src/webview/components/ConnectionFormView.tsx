@@ -51,6 +51,27 @@ const DB_TYPES: Array<{
   { type: "dynamodb", label: "DynamoDB", short: "DY", color: "#4053d6" },
 ];
 
+function parseRedisDbInput(value: string): {
+  value?: number;
+  error?: string;
+} {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return {};
+  }
+
+  if (!/^\d+$/.test(trimmed)) {
+    return { error: "Redis DB must be a non-negative integer." };
+  }
+
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed)) {
+    return { error: "Redis DB must be a non-negative integer." };
+  }
+
+  return { value: parsed };
+}
+
 function FocusInput(props: InputHTMLAttributes<HTMLInputElement>) {
   const [focused, setFocused] = useState(false);
   return (
@@ -455,6 +476,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   >("idle");
   const [testError, setTestError] = useState("");
   const [nameError, setNameError] = useState("");
+  const [redisDbError, setRedisDbError] = useState("");
   const [saving, setSaving] = useState(false);
 
   const isSQLite = type === "sqlite";
@@ -493,10 +515,13 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     setTestState("idle");
     setSslEnabled(false);
     setRejectUnauthorized(true);
+    setRedisDbError("");
   };
 
-  const buildPayload = useCallback(
-    (): ConnectionFormSubmission => ({
+  const buildPayload = useCallback((): ConnectionFormSubmission => {
+    const parsedRedisDb = parseRedisDbInput(redisDb);
+
+    return {
       id: existing?.id ?? crypto.randomUUID(),
       name: name.trim(),
       type,
@@ -534,8 +559,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
               ...(isRedis
                 ? {
                     redisUsername: redisUsername.trim() || undefined,
-                    redisDb:
-                      redisDb.trim() === "" ? undefined : Number(redisDb) || 0,
+                    redisDb: parsedRedisDb.value,
                     keyPrefix: redisKeyPrefix.trim() || undefined,
                   }
                 : {}),
@@ -557,50 +581,63 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                   }
                 : {}),
             }),
-    }),
-    [
-      existing,
-      name,
-      type,
-      folder,
-      useSecretStorage,
-      hasStoredSecret,
-      isSQLite,
-      filePath,
-      host,
-      port,
-      database,
-      awsProfile,
-      awsRegion,
-      awsAccessKeyId,
-      awsSecretAccessKey,
-      awsSessionToken,
-      dynamoEndpoint,
-      username,
-      password,
-      sslEnabled,
-      rejectUnauthorized,
-      supportsSsl,
-      isOracle,
-      oracleServiceName,
-      oracleThickMode,
-      oracleClientPath,
-      mongoConnectionUri,
-      mongoAuthDatabase,
-      redisUsername,
-      redisKeyPrefix,
-      elasticsearchEndpoint,
-      elasticsearchApiKey,
-      elasticsearchCloudId,
-      redisDb,
-      isMongo,
-      isRedis,
-      isElasticsearch,
-      isDynamo,
-    ],
-  );
+    };
+  }, [
+    existing,
+    name,
+    type,
+    folder,
+    useSecretStorage,
+    hasStoredSecret,
+    isSQLite,
+    filePath,
+    host,
+    port,
+    database,
+    awsProfile,
+    awsRegion,
+    awsAccessKeyId,
+    awsSecretAccessKey,
+    awsSessionToken,
+    dynamoEndpoint,
+    username,
+    password,
+    sslEnabled,
+    rejectUnauthorized,
+    supportsSsl,
+    isOracle,
+    oracleServiceName,
+    oracleThickMode,
+    oracleClientPath,
+    mongoConnectionUri,
+    mongoAuthDatabase,
+    redisUsername,
+    redisKeyPrefix,
+    elasticsearchEndpoint,
+    elasticsearchApiKey,
+    elasticsearchCloudId,
+    redisDb,
+    isMongo,
+    isRedis,
+    isElasticsearch,
+    isDynamo,
+  ]);
+
+  const validateRedisDb = useCallback((): boolean => {
+    if (!isRedis) {
+      setRedisDbError("");
+      return true;
+    }
+
+    const { error } = parseRedisDbInput(redisDb);
+    setRedisDbError(error ?? "");
+    return !error;
+  }, [isRedis, redisDb]);
 
   const handleTest = () => {
+    if (!validateRedisDb()) {
+      return;
+    }
     setTestState("testing");
     setTestError("");
     postMessage("testConnection", buildPayload());
@@ -609,6 +646,9 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const handleSave = () => {
     if (!name.trim()) {
       setNameError("Name is required");
+      return;
+    }
+    if (!validateRedisDb()) {
       return;
     }
     setSaving(true);
@@ -813,11 +853,15 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                 <Field
                   label="Redis DB"
                   hint="Numeric Redis database index, usually 0."
+                  error={redisDbError}
                 >
                   <FocusInput
                     aria-label="Redis DB"
                     value={redisDb}
-                    onChange={(e) => setRedisDb(e.target.value)}
+                    onChange={(e) => {
+                      setRedisDb(e.target.value);
+                      setRedisDbError("");
+                    }}
                     placeholder="0"
                   />
                 </Field>

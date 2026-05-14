@@ -348,6 +348,58 @@ describe("QueryView", () => {
     });
   });
 
+  it("defaults Redis queries to plaintext and disables formatting", async () => {
+    formatMock.mockClear();
+
+    render(
+      <QueryView
+        connectionId="conn-1"
+        initialSql="GET app:key"
+        connectionType="redis"
+        formatOnOpen
+      />,
+    );
+
+    dispatchIncomingMessage("connections", [
+      { id: "conn-1", name: "Redis", type: "redis" },
+    ]);
+
+    expect(screen.getByLabelText("Query editor")).toBeTruthy();
+    expect(screen.getByTestId("monaco-language").textContent).toBe("plaintext");
+    expect(screen.getByTestId("monaco-dialect").textContent).toBe("none");
+
+    const formatButton = screen.getByRole("button", { name: "Format" });
+    expect((formatButton as HTMLButtonElement).disabled).toBe(true);
+    expect(formatMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps DynamoDB PartiQL in SQL mode", async () => {
+    formatMock.mockClear();
+
+    render(
+      <QueryView
+        connectionId="conn-1"
+        initialSql={'SELECT * FROM "Users"'}
+        connectionType="dynamodb"
+        formatOnOpen
+      />,
+    );
+
+    dispatchIncomingMessage("connections", [
+      { id: "conn-1", name: "Dynamo", type: "dynamodb" },
+    ]);
+
+    expect(screen.getByLabelText("SQL editor")).toBeTruthy();
+    expect(screen.getByTestId("monaco-language").textContent).toBe("sql");
+
+    await waitFor(() => {
+      expect(formatMock).toHaveBeenCalledWith("sql");
+    });
+
+    const formatButton = screen.getByRole("button", { name: "Format" });
+    expect((formatButton as HTMLButtonElement).disabled).toBe(false);
+  });
+
   it("prefers explicit editorLanguage over connection-derived SQL mode", async () => {
     formatMock.mockClear();
 

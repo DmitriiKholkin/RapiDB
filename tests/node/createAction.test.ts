@@ -104,6 +104,11 @@ describe("create action policy", () => {
       expect(template?.script).toContain(token);
     }
 
+    const sqliteTemplate = generateCreateDatabaseTemplate("sqlite");
+    expect(sqliteTemplate?.script).toContain(
+      "-- SQLite does not support CREATE DATABASE.",
+    );
+
     expect(generateCreateDatabaseTemplate("oracle")).toBeUndefined();
     expect(generateCreateDatabaseTemplate("mongodb")).toBeUndefined();
     expect(generateCreateDatabaseTemplate("redis")).toBeUndefined();

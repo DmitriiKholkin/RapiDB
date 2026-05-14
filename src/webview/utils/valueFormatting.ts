@@ -36,5 +36,5 @@ export function formatBinaryValueForViewer(value: unknown): string {
   if (!match) {
     return formatted;
   }
-  return `BinData(${match[1]}, ${match[3]})`;
+  return `BinData(${match[1]}, ${match[2]}${match[3]}${match[2]})`;
 }
