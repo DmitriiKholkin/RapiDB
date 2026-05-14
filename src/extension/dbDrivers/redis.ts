@@ -42,6 +42,74 @@ const REDIS_ENTITY_MANIFEST: DriverEntityManifest = {
   },
 };
 
+function tokenizeRedisCommand(input: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+  let escaping = false;
+  let tokenStarted = false;
+
+  const pushCurrent = () => {
+    if (tokenStarted) {
+      tokens.push(current);
+    }
+    current = "";
+    tokenStarted = false;
+  };
+
+  for (const char of input) {
+    if (escaping) {
+      current += char;
+      tokenStarted = true;
+      escaping = false;
+      continue;
+    }
+
+    if (char === "\\") {
+      escaping = true;
+      tokenStarted = true;
+      continue;
+    }
+
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+        tokenStarted = true;
+        continue;
+      }
+      current += char;
+      tokenStarted = true;
+      continue;
+    }
+
+    if (char === '"' || char === "'") {
+      quote = char;
+      tokenStarted = true;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      pushCurrent();
+      continue;
+    }
+
+    current += char;
+    tokenStarted = true;
+  }
+
+  if (escaping) {
+    current += "\\";
+    tokenStarted = true;
+  }
+
+  if (quote) {
+    throw new Error("Redis query has an unterminated quoted argument.");
+  }
+
+  pushCurrent();
+  return tokens;
+}
+
 export class RedisDriver implements IDBDriver {
   private client: ReturnType<typeof createClient> | null = null;
   private connected = false;
@@ -229,7 +297,7 @@ export class RedisDriver implements IDBDriver {
     }
 
     const startedAt = Date.now();
-    const parts = trimmed.split(/\s+/);
+    const parts = tokenizeRedisCommand(trimmed);
     const [command, ...args] = parts;
     const result = await this.requireClient().sendCommand([
       command.toUpperCase(),
