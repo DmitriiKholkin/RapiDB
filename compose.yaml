@@ -1,4 +1,9 @@
 services:
+
+  # ─────────────────────────────────────────────
+  # PostgreSQL 15
+  # ─────────────────────────────────────────────
+
   postgres:
     image: postgres:15-alpine
     container_name: rapidb-pg
@@ -14,6 +19,800 @@ services:
       timeout: 5s
       retries: 20
       start_period: 5s
+
+  postgres-seed:
+    image: postgres:15-alpine
+    container_name: rapidb-pg-seed
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+    environment:
+      PGPASSWORD: pg_pass123
+    entrypoint: [ "/bin/sh", "-c" ]
+    command:
+      - |
+        set -eu
+        psql -v ON_ERROR_STOP=1 -h postgres -U db_admin -d rapidb_pg_db << 'EOSQL'
+
+        -- Reset schema so reruns after partial failures are deterministic.
+        DROP SCHEMA IF EXISTS public CASCADE;
+        CREATE SCHEMA public;
+        GRANT ALL ON SCHEMA public TO db_admin;
+        GRANT ALL ON SCHEMA public TO public;
+
+        -- ── Extensions ────────────────────────────────────────────
+        CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+        CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+        CREATE EXTENSION IF NOT EXISTS "pg_trgm";
+        CREATE EXTENSION IF NOT EXISTS "btree_gin";
+
+        -- ── Reference table ───────────────────────────────────────
+        CREATE TABLE pg_category (
+          category_id   SMALLINT    PRIMARY KEY,
+          category_name VARCHAR(50) NOT NULL UNIQUE,
+          description   TEXT
+        );
+        INSERT INTO pg_category VALUES
+          (1,'alpha','First category'),
+          (2,'beta','Second category'),
+          (3,'gamma','Third category'),
+          (4,'delta','Fourth category'),
+          (5,'epsilon','Fifth category');
+
+        -- ── Master table — every PG type ──────────────────────────
+        CREATE TABLE pg_master (
+          id                BIGSERIAL PRIMARY KEY,
+          category_id       SMALLINT  NOT NULL REFERENCES pg_category(category_id) ON DELETE RESTRICT ON UPDATE CASCADE,
+          unique_code       VARCHAR(40) NOT NULL UNIQUE,
+          unique_uuid       UUID        NOT NULL UNIQUE DEFAULT gen_random_uuid(),
+          -- numeric
+          col_smallint      SMALLINT,
+          col_int           INTEGER,
+          col_bigint        BIGINT,
+          col_decimal       DECIMAL(18,6),
+          col_numeric       NUMERIC(18,6),
+          col_real          REAL,
+          col_double        DOUBLE PRECISION,
+          col_money         MONEY,
+          -- character
+          col_char          CHAR(10),
+          col_varchar       VARCHAR(255),
+          col_text          TEXT,
+          col_name_type     NAME,
+          -- binary
+          col_bytea         BYTEA,
+          -- datetime
+          col_date          DATE,
+          col_time          TIME WITHOUT TIME ZONE,
+          col_timetz        TIME WITH TIME ZONE,
+          col_timestamp     TIMESTAMP WITHOUT TIME ZONE,
+          col_timestamptz   TIMESTAMP WITH TIME ZONE,
+          col_interval      INTERVAL,
+          -- bool
+          col_bool          BOOLEAN,
+          -- json / xml / uuid
+          col_json          JSON,
+          col_jsonb         JSONB,
+          col_xml           XML,
+          -- network
+          col_cidr          CIDR,
+          col_inet          INET,
+          col_macaddr       MACADDR,
+          col_macaddr8      MACADDR8,
+          -- geometric
+          col_point         POINT,
+          col_line          LINE,
+          col_lseg          LSEG,
+          col_box           BOX,
+          col_path          PATH,
+          col_polygon       POLYGON,
+          col_circle        CIRCLE,
+          -- arrays
+          col_int_arr       INTEGER[],
+          col_text_arr      TEXT[],
+          col_bool_arr      BOOLEAN[],
+          -- ranges
+          col_int4range     INT4RANGE,
+          col_int8range     INT8RANGE,
+          col_numrange      NUMRANGE,
+          col_tsrange       TSRANGE,
+          col_tstzrange     TSTZRANGE,
+          col_daterange     DATERANGE,
+          -- fts
+          col_tsvector      TSVECTOR,
+          col_tsquery       TSQUERY,
+          -- bit
+          col_bit           BIT(8),
+          col_varbit        BIT VARYING(64),
+          -- misc
+          col_oid           OID,
+          col_pg_lsn        PG_LSN,
+          -- meta
+          created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+          is_active         BOOLEAN     NOT NULL DEFAULT TRUE,
+          score             INTEGER     NOT NULL DEFAULT 0,
+          tags              TEXT[]      NOT NULL DEFAULT '{}',
+          -- constraints
+          CONSTRAINT chk_score       CHECK (score BETWEEN -1000 AND 1000),
+          CONSTRAINT chk_code_len    CHECK (char_length(unique_code) >= 3)
+        );
+
+        -- indexes
+        CREATE INDEX idx_pg_int         ON pg_master(col_int);
+        CREATE INDEX idx_pg_cat_score   ON pg_master(category_id, score DESC);
+        CREATE INDEX idx_pg_active      ON pg_master(created_at) WHERE is_active = TRUE;
+        CREATE INDEX idx_pg_jsonb       ON pg_master USING GIN(col_jsonb);
+        CREATE INDEX idx_pg_tags        ON pg_master USING GIN(tags);
+        CREATE INDEX idx_pg_tsvec       ON pg_master USING GIN(col_tsvector);
+        CREATE INDEX idx_pg_brin        ON pg_master USING BRIN(created_at);
+        CREATE INDEX idx_pg_hash_code   ON pg_master USING HASH(unique_code);
+        CREATE INDEX idx_pg_trgm        ON pg_master USING GIN(col_varchar gin_trgm_ops);
+
+        -- row 1: maximum values
+        INSERT INTO pg_master (
+          category_id, unique_code,
+          col_smallint, col_int, col_bigint, col_decimal, col_numeric, col_real, col_double, col_money,
+          col_char, col_varchar, col_text, col_name_type,
+          col_bytea,
+          col_date, col_time, col_timetz, col_timestamp, col_timestamptz, col_interval,
+          col_bool,
+          col_json, col_jsonb, col_xml,
+          col_cidr, col_inet, col_macaddr, col_macaddr8,
+          col_point, col_line, col_lseg, col_box, col_path, col_polygon, col_circle,
+          col_int_arr, col_text_arr, col_bool_arr,
+          col_int4range, col_int8range, col_numrange, col_tsrange, col_tstzrange, col_daterange,
+          col_tsvector, col_tsquery,
+          col_bit, col_varbit, col_oid, col_pg_lsn,
+          score, tags
+        ) VALUES (
+          1,'CODE-MAX-001',
+          32767, 2147483647, 9223372036854775807, 123456.789012, 999999.999999, 3.14159, 2.718281828459045, 99.99,
+          'Hello     ','Привет мир! Hello World 😀 Unicode тест','Очень длинный TEXT: Arabic العربية, Chinese 中文, Japanese 日本語, Korean 한국어, Emoji 🔥💯😀🎉',
+          'pg_name_val',
+          E'\\xDEADBEEF0102030405060708090A0B0C0D0E0F',
+          '2024-02-29','23:59:59.999','12:00:00+03','2024-01-01 00:00:00','2024-07-04 12:00:00+00',
+          '1 year 2 months 3 days 4 hours 5 minutes 6 seconds',
+          TRUE,
+          '{"key":"value","num":42,"arr":[1,2,3],"nested":{"x":true},"unicode":"Привет"}',
+          '{"tags":["a","b","c"],"score":100,"active":true,"meta":{"version":1}}',
+          '<root><child id="1" attr="val">Text &amp; More</child><item flag="true"/></root>',
+          '192.168.1.0/24','192.168.1.100','AA:BB:CC:DD:EE:FF','AA:BB:CC:DD:EE:FF:00:11',
+          '(1,2)','{1,2,3}','((0,0),(1,1))','((0,0),(1,1))','((0,0),(1,1),(2,2))','((0,0),(1,0),(1,1),(0,1))','<(0,0),5>',
+          '{1,2,3,NULL,5}','{"hello","world",NULL,"emoji 😀"}','{true,false,NULL}',
+          '[1,10]','[100,200)','[0.5,1.5]',
+          '[2024-01-01 00:00, 2024-12-31 23:59]','[2024-01-01 00:00+00, 2024-12-31 23:59+00]','[2024-01-01,2024-12-31]',
+          to_tsvector('english','The quick brown fox jumps over the lazy dog'),
+          to_tsquery('english','quick & fox'),
+          B'10101010', B'1111000011110000', 1234, '0/1234ABCD',
+          1000, '{postgres,master,test,maxval}'
+        );
+
+        -- row 2: minimum / negative values
+        INSERT INTO pg_master (
+          category_id, unique_code,
+          col_smallint, col_int, col_bigint, col_decimal, col_numeric, col_real, col_double, col_money,
+          col_char, col_varchar, col_text,
+          col_bytea,
+          col_date, col_time, col_timetz, col_timestamp, col_timestamptz, col_interval,
+          col_bool,
+          col_json, col_jsonb,
+          col_cidr, col_inet, col_macaddr,
+          col_int_arr, col_text_arr, col_bool_arr,
+          col_int4range, col_daterange,
+          col_bit, col_varbit,
+          score, tags
+        ) VALUES (
+          2,'CODE-MIN-002',
+          -32768,-2147483648,-9223372036854775808,-999999.999999,-0.000001,-3.14159,-2.718281828459045,-1.00,
+          '          ','','Минимальные значения. Backslash: \\ newline test.',
+          E'\\x00',
+          '0001-01-01','00:00:00','00:00:00+00','1970-01-01 00:00:00','1970-01-01 00:00:00+00','-1 day',
+          FALSE,
+          'null','{"empty":{}}',
+          '::1/128','::1','00:00:00:00:00:00',
+          '{}','{""}','{}',
+          '(,)','[2000-01-01,2000-01-01]',
+          B'00000000',B'0',
+          -1000,'{}'
+        );
+
+        -- row 3: all NULLs
+        INSERT INTO pg_master (category_id, unique_code, score) VALUES (3,'CODE-NULL-003',0);
+
+        -- row 4: special chars, IPv6, nested JSON
+        INSERT INTO pg_master (
+          category_id, unique_code,
+          col_int, col_varchar, col_text,
+          col_inet, col_cidr,
+          col_int_arr, col_text_arr,
+          col_int4range, col_numrange,
+          col_jsonb, col_tsvector,
+          col_bool, score, tags
+        ) VALUES (
+          4,'CODE-SPEC-004',
+          42,'IPv6 + nested arrays + XSS test',
+          '<script>alert("XSS")</script> & "quotes" ''apostrophe'' <img src=x onerror=1>',
+          '2001:db8::1','2001:db8::/32',
+          '{{1,2},{3,4},{5,NULL}}','{"line1\nline2","tab\there","quote\"here"}',
+          '(5,15)','(0.1,0.9)',
+          '{"nested":{"deep":{"deeper":[1,2,3]}},"unicode":"Привет 你好 مرحبا 🔥"}',
+          to_tsvector('russian','Быстрая коричневая лиса прыгает через ленивую собаку'),
+          TRUE, 50, '{ipv6,special,unicode,xss}'
+        );
+
+        -- row 5: geometric types focus
+        INSERT INTO pg_master (
+          category_id, unique_code,
+          col_point, col_line, col_lseg, col_box, col_path, col_polygon, col_circle,
+          col_inet, score, tags
+        ) VALUES (
+          5,'CODE-GEO-005',
+          '(10.5,-20.3)','{1,0,-5}','((0,0),(10,10))','((0,0),(100,100))',
+          '[(0,0),(5,5),(10,0),(15,5)]','((0,0),(10,0),(10,10),(0,10),(0,0))','<(5,5),7.5>',
+          '10.0.0.1', 75, '{geometry,geo,shapes}'
+        );
+
+        -- row 6: range types focus
+        INSERT INTO pg_master (
+          category_id, unique_code,
+          col_int4range, col_int8range, col_numrange,
+          col_tsrange, col_tstzrange, col_daterange,
+          col_int_arr, score, tags
+        ) VALUES (
+          1,'CODE-RANGE-006',
+          '[1,100]','[1000,9999]','[0.001,999.999]',
+          '[2023-01-01 00:00,2023-12-31 23:59]',
+          '[2023-01-01 00:00+00,2023-12-31 23:59+00]',
+          '[2023-01-01,2023-12-31]',
+          '{10,20,30,40,50}', 60, '{ranges,intervals}'
+        );
+
+        -- row 7: FTS focus — multiple languages
+        INSERT INTO pg_master (
+          category_id, unique_code,
+          col_varchar, col_text,
+          col_tsvector, col_tsquery,
+          col_jsonb, score, tags
+        ) VALUES (
+          2,'CODE-FTS-007',
+          'Full text search test row — English and Russian',
+          'The quick brown fox. Быстрая коричневая лиса. 日本語テスト. Ελληνικά κείμενα.',
+          to_tsvector('english','quick brown fox lazy dog jumps search index'),
+          to_tsquery('english','search & index'),
+          '{"fts":true,"lang":"multi"}', 30, '{fts,search,multilang}'
+        );
+
+        -- row 8: network types focus
+        INSERT INTO pg_master (
+          category_id, unique_code,
+          col_cidr, col_inet, col_macaddr, col_macaddr8,
+          col_varchar, score, tags
+        ) VALUES (
+          3,'CODE-NET-008',
+          '10.0.0.0/8','10.10.20.30','DE:AD:BE:EF:CA:FE','DE:AD:BE:EF:CA:FE:00:01',
+          'Network types focus row', 20, '{network,cidr,macaddr}'
+        );
+
+        -- row 9: binary / bytea large
+        INSERT INTO pg_master (
+          category_id, unique_code,
+          col_bytea, col_bit, col_varbit,
+          col_varchar, score, tags
+        ) VALUES (
+          4,'CODE-BIN-009',
+          decode(repeat('DEADBEEF',32),'hex'),
+          B'11110000', B'1010101010101010',
+          'Binary and bit types focus', 10, '{binary,bytea,bit}'
+        );
+
+        -- row 10: long text stress
+        INSERT INTO pg_master (
+          category_id, unique_code,
+          col_varchar, col_text,
+          col_jsonb, col_xml,
+          score, tags
+        ) VALUES (
+          5,'CODE-LONG-010',
+          repeat('VarcharRepeat_',18),
+          repeat('Этот текст повторяется снова и снова для проверки длинных строк. ',50),
+          ('{"long_array":' || (
+            SELECT '[' || string_agg(n::text,',') || ']'
+            FROM generate_series(1,100) AS n
+          ) || '}')::jsonb,
+          ('<data>' || repeat('<item>test</item>',20) || '</data>')::xml,
+          5, '{longtext,stress}'
+        );
+
+        -- bulk 50 000 rows
+        INSERT INTO pg_master (
+          category_id, unique_code,
+          col_int, col_bigint, col_decimal, col_real,
+          col_varchar, col_text,
+          col_date, col_timestamp, col_timestamptz,
+          col_bool, col_jsonb,
+          col_int_arr, col_tsvector,
+          score, tags, is_active
+        )
+        SELECT
+          (mod(gs,5)+1)::SMALLINT,
+          'CODE-BULK-'||lpad(gs::text,8,'0'),
+          (random()*2000000000-1000000000)::INTEGER,
+          (random()*9000000000000000000)::BIGINT,
+          round((random()*999999)::NUMERIC,6),
+          (random()*1000)::REAL,
+          'varchar_'||md5(gs::text),
+          repeat('bulk text row '||gs||' ',3),
+          date'2000-01-01'+(random()*9000)::INTEGER,
+          timestamp'2000-01-01'+(random()*9000)::INTEGER*interval'1 day',
+          timestamptz'2000-01-01'+(random()*9000)::INTEGER*interval'1 day',
+          (random()>0.5),
+          ('{"row":'||gs||',"val":'||round(random()::NUMERIC,4)||'}')::JSONB,
+          ARRAY[(random()*100)::INTEGER,(random()*100)::INTEGER,(random()*100)::INTEGER],
+          to_tsvector('english','bulk row '||gs||' test data content'),
+          (random()*2000-1000)::INTEGER,
+          ARRAY['bulk','row_'||(mod(gs,10))::text],
+          (random()>0.2)
+        FROM generate_series(1,50000) AS gs;
+
+        -- ── Views ─────────────────────────────────────────────────
+        CREATE VIEW pg_master_active AS
+          SELECT id,category_id,unique_code,unique_uuid,col_int,col_bigint,col_decimal,
+                 col_varchar,col_text,col_bool,col_jsonb,col_date,col_timestamptz,
+                 score,tags,created_at
+          FROM pg_master WHERE is_active=TRUE;
+
+        CREATE VIEW pg_master_stats AS
+          SELECT m.category_id, c.category_name,
+                 count(*) AS total_rows,
+                 count(*) FILTER (WHERE m.is_active) AS active_rows,
+                 max(m.col_int) AS max_int, min(m.col_int) AS min_int,
+                 round(avg(m.col_decimal)::NUMERIC,4) AS avg_decimal,
+                 sum(m.score) AS total_score,
+                 max(m.created_at) AS last_created
+          FROM pg_master m JOIN pg_category c USING (category_id)
+          GROUP BY m.category_id, c.category_name;
+
+        CREATE VIEW pg_master_json_view AS
+          SELECT id, unique_code,
+                 col_jsonb->'tags'           AS json_tags,
+                 col_jsonb->>'score'         AS json_score,
+                 col_jsonb?'active'          AS has_active_key,
+                 col_int_arr[1]              AS first_int,
+                 array_length(col_text_arr,1) AS text_arr_len,
+                 col_tsvector @@ to_tsquery('english','quick') AS matches_quick
+          FROM pg_master WHERE col_jsonb IS NOT NULL;
+
+        -- ── Functions ─────────────────────────────────────────────
+        CREATE OR REPLACE FUNCTION pg_fn_rank_record(p_id BIGINT)
+        RETURNS TABLE(id BIGINT, unique_code VARCHAR, score INTEGER, rank BIGINT) AS $$$$
+        BEGIN
+          RETURN QUERY
+          SELECT m.id, m.unique_code, m.score,
+                 rank() OVER (ORDER BY m.score DESC)
+          FROM pg_master m WHERE m.id=p_id OR p_id IS NULL ORDER BY rank;
+        END; $$$$ LANGUAGE plpgsql;
+
+        CREATE OR REPLACE FUNCTION pg_fn_fts_search(p_query TEXT)
+        RETURNS SETOF pg_master AS $$$$
+        BEGIN
+          RETURN QUERY
+          SELECT * FROM pg_master
+          WHERE col_tsvector @@ plainto_tsquery('english',p_query)
+          ORDER BY ts_rank(col_tsvector,plainto_tsquery('english',p_query)) DESC;
+        END; $$$$ LANGUAGE plpgsql;
+
+        CREATE OR REPLACE FUNCTION pg_fn_score_stats(p_min INT, p_max INT)
+        RETURNS TABLE(cnt BIGINT, avg_score NUMERIC, min_int BIGINT, max_int BIGINT) AS $$$$
+        BEGIN
+          RETURN QUERY
+          SELECT count(*), round(avg(score)::NUMERIC,2), min(col_bigint), max(col_bigint)
+          FROM pg_master WHERE score BETWEEN p_min AND p_max;
+        END; $$$$ LANGUAGE plpgsql;
+
+        -- ── Procedures ────────────────────────────────────────────
+        CREATE OR REPLACE PROCEDURE pg_proc_insert(
+          p_category_id SMALLINT, p_code VARCHAR, p_int INTEGER,
+          p_varchar VARCHAR, p_bool BOOLEAN, p_score INTEGER, p_tags TEXT[]
+        ) LANGUAGE plpgsql AS $$$$
+        BEGIN
+          INSERT INTO pg_master(category_id,unique_code,col_int,col_varchar,col_bool,score,tags)
+          VALUES(p_category_id,p_code,p_int,p_varchar,p_bool,p_score,p_tags);
+          COMMIT;
+        END; $$$$;
+
+        CREATE OR REPLACE PROCEDURE pg_proc_update_category(
+          p_category_id SMALLINT, p_score_delta INTEGER, p_tag TEXT
+        ) LANGUAGE plpgsql AS $$$$
+        BEGIN
+          UPDATE pg_master
+          SET score=LEAST(1000,score+p_score_delta), tags=array_append(tags,p_tag), updated_at=now()
+          WHERE category_id=p_category_id;
+          COMMIT;
+        END; $$$$;
+
+        CREATE OR REPLACE PROCEDURE pg_proc_deactivate_old(p_days INTEGER)
+        LANGUAGE plpgsql AS $$$$
+        DECLARE v_count INTEGER;
+        BEGIN
+          UPDATE pg_master SET is_active=FALSE, updated_at=now()
+          WHERE created_at < now()-(p_days||' days')::INTERVAL AND is_active=TRUE;
+          GET DIAGNOSTICS v_count=ROW_COUNT;
+          RAISE NOTICE 'Deactivated % rows', v_count;
+          COMMIT;
+        END; $$$$;
+
+        -- ══════════════════════════════════════════════════════════════
+        -- CUSTOM TYPES
+        -- ══════════════════════════════════════════════════════════════
+
+        -- ENUM types
+        CREATE TYPE pg_status_enum AS ENUM
+          ('pending','active','disabled','archived','deleted','banned','verified');
+        CREATE TYPE pg_role_enum AS ENUM
+          ('superuser','admin','moderator','editor','viewer','guest');
+        CREATE TYPE pg_plan_enum AS ENUM
+          ('free','starter','pro','business','enterprise');
+        CREATE TYPE pg_priority_enum AS ENUM
+          ('critical','high','medium','low','none');
+        CREATE TYPE pg_log_level_enum AS ENUM
+          ('DEBUG','INFO','WARN','ERROR','FATAL');
+
+        -- Composite types
+        CREATE TYPE pg_address_type AS (
+          street   VARCHAR(255),
+          city     VARCHAR(100),
+          country  CHAR(2),
+          zip      VARCHAR(20),
+          lat      DOUBLE PRECISION,
+          lon      DOUBLE PRECISION
+        );
+        CREATE TYPE pg_money_amount_type AS (
+          amount   NUMERIC(18,4),
+          currency CHAR(3)
+        );
+        CREATE TYPE pg_rgb_type AS (r SMALLINT, g SMALLINT, b SMALLINT);
+
+        -- Domain types
+        CREATE DOMAIN pg_email_domain AS TEXT
+          CHECK (VALUE ~ '^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$$');
+        CREATE DOMAIN pg_positive_int AS INTEGER
+          CONSTRAINT positive_check CHECK (VALUE > 0);
+        CREATE DOMAIN pg_score_domain AS INTEGER
+          DEFAULT 0
+          CONSTRAINT score_range CHECK (VALUE BETWEEN -1000 AND 1000);
+        CREATE DOMAIN pg_percentage AS NUMERIC(5,2)
+          DEFAULT 0.00
+          CONSTRAINT pct_range CHECK (VALUE BETWEEN 0.00 AND 100.00);
+        CREATE DOMAIN pg_slug_domain AS TEXT
+          CHECK (VALUE ~ '^[a-z0-9]+(?:-[a-z0-9]+)*$$');
+        CREATE DOMAIN pg_country_code AS CHAR(2)
+          CHECK (VALUE ~ '^[A-Z]{2}$$');
+
+        -- Custom range type over float8
+        CREATE TYPE pg_float8_range AS RANGE (
+          subtype      = float8,
+          subtype_diff = float8mi
+        );
+
+        -- Table using custom types
+        CREATE TABLE pg_typed_profiles (
+          id           BIGSERIAL            PRIMARY KEY,
+          user_status  pg_status_enum       NOT NULL DEFAULT 'pending',
+          user_role    pg_role_enum         NOT NULL DEFAULT 'guest',
+          user_plan    pg_plan_enum         NOT NULL DEFAULT 'free',
+          priority     pg_priority_enum     NOT NULL DEFAULT 'medium',
+          email        pg_email_domain      NOT NULL UNIQUE,
+          score        pg_score_domain,
+          completion   pg_percentage        DEFAULT 0.00,
+          country      pg_country_code,
+          address      pg_address_type,
+          wallet       pg_money_amount_type,
+          accent_color pg_rgb_type,
+          price_range  pg_float8_range,
+          created_at   TIMESTAMPTZ          NOT NULL DEFAULT now(),
+          updated_at   TIMESTAMPTZ          NOT NULL DEFAULT now()
+        );
+
+        INSERT INTO pg_typed_profiles
+          (user_status,user_role,user_plan,priority,email,score,completion,country,address,wallet,accent_color,price_range)
+        VALUES
+          ('active','admin','enterprise','critical','alice@example.com',
+           1000,98.50,'DE',
+           ROW('1 Main St','Berlin','DE','10115',52.52,13.405)::pg_address_type,
+           ROW(15234.56,'USD')::pg_money_amount_type,
+           ROW(255,87,34)::pg_rgb_type,
+           '[9.99,999.99)'),
+          ('verified','editor','pro','high','carol@example.com',
+           500,75.00,'FR',
+           ROW('3 Pine Rd','Paris','FR','75001',48.86,2.35)::pg_address_type,
+           ROW(8750.25,'EUR')::pg_money_amount_type,
+           ROW(52,152,219)::pg_rgb_type,
+           '[0.0,99.99)'),
+          ('active','moderator','pro','medium','eve@example.com',
+           250,60.25,'RU',
+           ROW('5 Maple Blvd','Moscow','RU','101000',55.76,37.62)::pg_address_type,
+           ROW(6300.75,'RUB')::pg_money_amount_type,
+           ROW(46,204,113)::pg_rgb_type,
+           '[0.0,49.99)'),
+          ('pending','viewer','free','low','bob@example.com',
+           0,10.00,'NL',
+           ROW('2 Oak Ave','Amsterdam','NL','1012',52.37,4.90)::pg_address_type,
+           ROW(2100.00,'EUR')::pg_money_amount_type,
+           ROW(155,89,182)::pg_rgb_type,
+           '[0.0,29.99)'),
+          ('disabled','guest','starter','none','dave@example.com',
+           -100,5.00,'GB',
+           NULL,NULL,NULL,NULL),
+          ('banned','guest','free','none','spammer@evil.com',
+           -1000,0.00,'US',
+           NULL,NULL,NULL,NULL);
+
+        -- ══════════════════════════════════════════════════════════════
+        -- SEQUENCES (standalone)
+        -- ══════════════════════════════════════════════════════════════
+        CREATE SEQUENCE pg_invoice_seq
+          AS BIGINT
+          START WITH 1000
+          INCREMENT BY 1
+          MINVALUE 1000
+          MAXVALUE 9999999
+          NO CYCLE
+          CACHE 10;
+
+        CREATE SEQUENCE pg_order_seq
+          AS BIGINT
+          START WITH 500000
+          INCREMENT BY 5
+          MINVALUE 500000
+          MAXVALUE 99999999
+          CYCLE
+          CACHE 20;
+
+        CREATE SEQUENCE pg_batch_seq
+          AS INTEGER
+          START WITH 1
+          INCREMENT BY 100
+          MINVALUE 1
+          NO CYCLE
+          CACHE 1;
+
+        CREATE SEQUENCE pg_sku_seq
+          AS INTEGER
+          START WITH 10000
+          INCREMENT BY 1
+          MINVALUE 10000
+          MAXVALUE 99999
+          NO CYCLE
+          CACHE 50;
+
+        -- Advance sequences to non-trivial state
+        SELECT nextval('pg_invoice_seq') FROM generate_series(1,25);
+        SELECT nextval('pg_order_seq')   FROM generate_series(1,10);
+        SELECT nextval('pg_batch_seq')   FROM generate_series(1,5);
+        SELECT nextval('pg_sku_seq')     FROM generate_series(1,42);
+
+        -- Table that uses the sequence explicitly (not SERIAL)
+        CREATE TABLE pg_invoices (
+          invoice_no   BIGINT       PRIMARY KEY DEFAULT nextval('pg_invoice_seq'),
+          order_no     BIGINT       DEFAULT nextval('pg_order_seq'),
+          master_id    BIGINT       REFERENCES pg_master(id) ON DELETE SET NULL,
+          amount       pg_money_amount_type,
+          status       pg_status_enum DEFAULT 'pending',
+          issued_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+          due_at       TIMESTAMPTZ  NOT NULL DEFAULT (now() + INTERVAL '30 days'),
+          paid_at      TIMESTAMPTZ
+        );
+
+        INSERT INTO pg_invoices (master_id, amount, status)
+        SELECT id,
+               ROW(round((random()*9000+100)::NUMERIC,2),'USD')::pg_money_amount_type,
+               (ARRAY['pending','active','archived']::pg_status_enum[])[floor(random()*3+1)]
+        FROM pg_master
+        WHERE id <= 20;
+
+        -- ══════════════════════════════════════════════════════════════
+        -- TRIGGER FUNCTIONS & TRIGGERS
+        -- ══════════════════════════════════════════════════════════════
+
+        -- Audit log table
+        CREATE TABLE pg_master_audit (
+          audit_id    BIGSERIAL   PRIMARY KEY,
+          operation   CHAR(1)     NOT NULL CHECK (operation IN ('I','U','D')),
+          master_id   BIGINT,
+          old_score   INTEGER,
+          new_score   INTEGER,
+          old_active  BOOLEAN,
+          new_active  BOOLEAN,
+          old_code    VARCHAR(40),
+          new_code    VARCHAR(40),
+          changed_by  TEXT        NOT NULL DEFAULT current_user,
+          changed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+          client_addr INET        DEFAULT inet_client_addr()
+        );
+
+        -- Function: auto-update updated_at
+        CREATE OR REPLACE FUNCTION fn_pg_set_updated_at()
+        RETURNS TRIGGER LANGUAGE plpgsql AS $$$$
+        BEGIN
+          NEW.updated_at := now();
+          RETURN NEW;
+        END; $$$$;
+
+        -- Function: audit INSERT / UPDATE / DELETE
+        CREATE OR REPLACE FUNCTION fn_pg_master_audit()
+        RETURNS TRIGGER LANGUAGE plpgsql AS $$$$
+        BEGIN
+          IF TG_OP = 'INSERT' THEN
+            INSERT INTO pg_master_audit(operation,master_id,new_score,new_active,new_code)
+            VALUES('I',NEW.id,NEW.score,NEW.is_active,NEW.unique_code);
+          ELSIF TG_OP = 'UPDATE' THEN
+            INSERT INTO pg_master_audit(operation,master_id,old_score,new_score,old_active,new_active,old_code,new_code)
+            VALUES('U',NEW.id,OLD.score,NEW.score,OLD.is_active,NEW.is_active,OLD.unique_code,NEW.unique_code);
+          ELSIF TG_OP = 'DELETE' THEN
+            INSERT INTO pg_master_audit(operation,master_id,old_score,old_active,old_code)
+            VALUES('D',OLD.id,OLD.score,OLD.is_active,OLD.unique_code);
+          END IF;
+          RETURN NULL;
+        END; $$$$;
+
+        -- Function: clamp score, ensure tags not null
+        CREATE OR REPLACE FUNCTION fn_pg_normalize_before_write()
+        RETURNS TRIGGER LANGUAGE plpgsql AS $$$$
+        BEGIN
+          NEW.score := GREATEST(-1000, LEAST(1000, COALESCE(NEW.score,0)));
+          IF NEW.tags IS NULL THEN NEW.tags := '{}'; END IF;
+          RETURN NEW;
+        END; $$$$;
+
+        -- Function: prevent deletion of high-score active rows
+        CREATE OR REPLACE FUNCTION fn_pg_protect_high_score()
+        RETURNS TRIGGER LANGUAGE plpgsql AS $$$$
+        BEGIN
+          IF OLD.score > 900 AND OLD.is_active THEN
+            RAISE EXCEPTION
+              'Cannot delete active row id=% score=% > 900. Deactivate first.',
+              OLD.id, OLD.score;
+          END IF;
+          RETURN OLD;
+        END; $$$$;
+
+        -- Function: statement-level trigger logging bulk ops
+        CREATE OR REPLACE FUNCTION fn_pg_log_bulk_op()
+        RETURNS TRIGGER LANGUAGE plpgsql AS $$$$
+        BEGIN
+          RAISE NOTICE 'Bulk % on pg_master at %', TG_OP, now();
+          RETURN NULL;
+        END; $$$$;
+
+        -- Attach triggers to pg_master
+        CREATE TRIGGER trg_pg_master_updated_at
+          BEFORE UPDATE ON pg_master
+          FOR EACH ROW EXECUTE FUNCTION fn_pg_set_updated_at();
+
+        CREATE TRIGGER trg_pg_master_normalize
+          BEFORE INSERT OR UPDATE ON pg_master
+          FOR EACH ROW EXECUTE FUNCTION fn_pg_normalize_before_write();
+
+        CREATE TRIGGER trg_pg_master_audit
+          AFTER INSERT OR UPDATE OR DELETE ON pg_master
+          FOR EACH ROW EXECUTE FUNCTION fn_pg_master_audit();
+
+        CREATE TRIGGER trg_pg_protect_high_score
+          BEFORE DELETE ON pg_master
+          FOR EACH ROW EXECUTE FUNCTION fn_pg_protect_high_score();
+
+        CREATE TRIGGER trg_pg_master_bulk_log
+          AFTER INSERT OR UPDATE OR DELETE ON pg_master
+          FOR EACH STATEMENT EXECUTE FUNCTION fn_pg_log_bulk_op();
+
+        -- Attach triggers to pg_typed_profiles
+        CREATE TRIGGER trg_pg_typed_profiles_updated_at
+          BEFORE UPDATE ON pg_typed_profiles
+          FOR EACH ROW EXECUTE FUNCTION fn_pg_set_updated_at();
+
+        -- Fire some audit records via DML
+        UPDATE pg_master SET score = 500,  is_active = TRUE  WHERE unique_code = 'CODE-MAX-001';
+        UPDATE pg_master SET score = -500, is_active = FALSE WHERE unique_code = 'CODE-MIN-002';
+        UPDATE pg_master SET score = 1     WHERE unique_code = 'CODE-NULL-003';
+        UPDATE pg_master SET score = 75    WHERE unique_code = 'CODE-SPEC-004';
+
+        -- ══════════════════════════════════════════════════════════════
+        -- MATERIALIZED VIEWS
+        -- ══════════════════════════════════════════════════════════════
+
+        CREATE MATERIALIZED VIEW pg_matview_category_stats AS
+          SELECT
+            m.category_id,
+            c.category_name,
+            count(*)                                                    AS total_rows,
+            count(*) FILTER (WHERE m.is_active)                        AS active_rows,
+            count(*) FILTER (WHERE NOT m.is_active)                    AS inactive_rows,
+            max(m.score)                                                AS max_score,
+            min(m.score)                                                AS min_score,
+            round(avg(m.score)::NUMERIC,2)                             AS avg_score,
+            sum(m.score)                                                AS total_score,
+            percentile_cont(0.5)  WITHIN GROUP (ORDER BY m.score)      AS median_score,
+            percentile_cont(0.95) WITHIN GROUP (ORDER BY m.score)      AS p95_score,
+            percentile_cont(0.05) WITHIN GROUP (ORDER BY m.score)      AS p05_score,
+            max(m.col_int)                                              AS max_int,
+            min(m.col_int)                                              AS min_int,
+            round(avg(m.col_decimal)::NUMERIC,4)                       AS avg_decimal,
+            count(*) FILTER (WHERE m.col_jsonb IS NOT NULL)            AS rows_with_jsonb,
+            count(*) FILTER (WHERE m.col_tsvector IS NOT NULL)         AS rows_with_fts,
+            max(m.created_at)                                           AS last_created,
+            min(m.created_at)                                           AS first_created,
+            now()                                                       AS refreshed_at
+          FROM pg_master m
+          JOIN pg_category c USING (category_id)
+          GROUP BY m.category_id, c.category_name
+        WITH DATA;
+
+        CREATE UNIQUE INDEX idx_pg_matview_cat_id
+          ON pg_matview_category_stats(category_id);
+        CREATE INDEX idx_pg_matview_total_rows
+          ON pg_matview_category_stats(total_rows DESC);
+
+        -- Top scorers matview with window functions
+        CREATE MATERIALIZED VIEW pg_matview_top_scorers AS
+          SELECT
+            id, category_id, unique_code, unique_uuid,
+            col_int, col_bigint, col_varchar, col_bool, col_jsonb,
+            score,
+            rank()   OVER (ORDER BY score DESC)                         AS global_rank,
+            rank()   OVER (PARTITION BY category_id ORDER BY score DESC) AS category_rank,
+            percent_rank() OVER (ORDER BY score DESC)                   AS pct_rank,
+            ntile(4) OVER (ORDER BY score DESC)                         AS quartile,
+            ntile(10) OVER (ORDER BY score DESC)                        AS decile,
+            sum(score) OVER (PARTITION BY category_id)                  AS cat_total_score,
+            avg(score) OVER ()                                          AS global_avg_score,
+            created_at
+          FROM pg_master
+          WHERE is_active = TRUE
+        WITH DATA;
+
+        CREATE INDEX idx_pg_matview_top_global
+          ON pg_matview_top_scorers(global_rank);
+        CREATE INDEX idx_pg_matview_top_cat
+          ON pg_matview_top_scorers(category_id, category_rank);
+
+        -- JSON / array / FTS statistics matview
+        CREATE MATERIALIZED VIEW pg_matview_type_coverage AS
+          SELECT
+            count(*)                                                         AS total,
+            round(count(*) FILTER (WHERE col_smallint   IS NOT NULL)*100.0/count(*),1) AS pct_smallint,
+            round(count(*) FILTER (WHERE col_jsonb       IS NOT NULL)*100.0/count(*),1) AS pct_jsonb,
+            round(count(*) FILTER (WHERE col_int_arr     IS NOT NULL)*100.0/count(*),1) AS pct_arrays,
+            round(count(*) FILTER (WHERE col_tsvector    IS NOT NULL)*100.0/count(*),1) AS pct_fts,
+            round(count(*) FILTER (WHERE col_inet        IS NOT NULL)*100.0/count(*),1) AS pct_inet,
+            round(count(*) FILTER (WHERE col_bytea       IS NOT NULL)*100.0/count(*),1) AS pct_bytea,
+            round(count(*) FILTER (WHERE col_point       IS NOT NULL)*100.0/count(*),1) AS pct_geo,
+            round(count(*) FILTER (WHERE col_int4range   IS NOT NULL)*100.0/count(*),1) AS pct_ranges,
+            round(count(*) FILTER (WHERE col_xml         IS NOT NULL)*100.0/count(*),1) AS pct_xml,
+            round(count(*) FILTER (WHERE col_bool = TRUE)*100.0/count(*),1)            AS pct_bool_true,
+            now()                                                            AS refreshed_at
+          FROM pg_master
+        WITH DATA;
+
+        -- Inactive records summary (WITH NO DATA — must REFRESH manually)
+        CREATE MATERIALIZED VIEW pg_matview_inactive_summary AS
+          SELECT
+            category_id,
+            count(*)         AS cnt,
+            avg(score)::NUMERIC AS avg_score,
+            max(updated_at)  AS last_updated
+          FROM pg_master
+          WHERE is_active = FALSE
+          GROUP BY category_id
+        WITH NO DATA;
+
+        SELECT 'PostgreSQL seed complete: '||count(*)||' rows in pg_master' FROM pg_master;
+        EOSQL
+
+  # ─────────────────────────────────────────────
+  # MySQL 8.0
+  # ─────────────────────────────────────────────
 
   mysql:
     image: mysql:8.0
@@ -32,6 +831,437 @@ services:
       retries: 24
       start_period: 20s
 
+  mysql-seed:
+    image: mysql:8.0
+    container_name: rapidb-mysql-seed
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: on-failure
+    entrypoint: [ "/bin/sh", "-c" ]
+    command:
+      - |
+        mysql -h mysql -u root -proot_pass123 rapidb_mysql_db << 'EOSQL'
+
+        SET NAMES utf8mb4;
+        SET foreign_key_checks = 0;
+
+        -- clean up from previous/partial runs
+        DROP VIEW IF EXISTS mysql_master_json_view;
+        DROP VIEW IF EXISTS mysql_master_stats;
+        DROP VIEW IF EXISTS mysql_master_active;
+        DROP FUNCTION IF EXISTS mysql_fn_format_code;
+        DROP FUNCTION IF EXISTS mysql_fn_top_score;
+        DROP PROCEDURE IF EXISTS mysql_proc_update_scores;
+        DROP PROCEDURE IF EXISTS mysql_proc_insert;
+        DROP TABLE IF EXISTS mysql_score_history;
+        DROP TABLE IF EXISTS mysql_master_audit;
+        DROP TABLE IF EXISTS mysql_master;
+        DROP TABLE IF EXISTS mysql_category;
+
+        -- reference table
+        CREATE TABLE mysql_category (
+          category_id   TINYINT UNSIGNED PRIMARY KEY,
+          category_name VARCHAR(50) NOT NULL UNIQUE,
+          description   TEXT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+        INSERT INTO mysql_category VALUES
+          (1,'alpha','First'),(2,'beta','Second'),(3,'gamma','Third'),
+          (4,'delta','Fourth'),(5,'epsilon','Fifth');
+
+        -- master table — every MySQL type
+        CREATE TABLE mysql_master (
+          id              BIGINT UNSIGNED   NOT NULL AUTO_INCREMENT PRIMARY KEY,
+          category_id     TINYINT UNSIGNED  NOT NULL,
+          unique_code     VARCHAR(40)       NOT NULL,
+          unique_uuid     CHAR(36)          NOT NULL DEFAULT (UUID()),
+          -- exact numeric
+          col_tinyint     TINYINT,
+          col_tinyint_u   TINYINT UNSIGNED,
+          col_smallint    SMALLINT,
+          col_mediumint   MEDIUMINT,
+          col_int         INT,
+          col_bigint      BIGINT,
+          col_decimal     DECIMAL(18,6),
+          col_bit         BIT(8),
+          col_bool        BOOLEAN,
+          -- approximate numeric
+          col_float       FLOAT,
+          col_double      DOUBLE,
+          -- character
+          col_char        CHAR(10),
+          col_varchar     VARCHAR(500),
+          col_tinytext    TINYTEXT,
+          col_text        TEXT,
+          col_mediumtext  MEDIUMTEXT,
+          col_longtext    LONGTEXT,
+          -- binary
+          col_binary      BINARY(16),
+          col_varbinary   VARBINARY(255),
+          col_tinyblob    TINYBLOB,
+          col_blob        BLOB,
+          col_mediumblob  MEDIUMBLOB,
+          col_longblob    LONGBLOB,
+          -- datetime
+          col_date        DATE,
+          col_time        TIME(6),
+          col_datetime    DATETIME(6),
+          col_timestamp   TIMESTAMP(6) NULL DEFAULT NULL,
+          col_year        YEAR,
+          -- enum / set
+          col_enum        ENUM('pending','active','disabled','archived','deleted'),
+          col_set         SET('read','write','execute','admin','superuser'),
+          -- json
+          col_json        JSON,
+          -- spatial
+          col_geometry    GEOMETRY,
+          col_point       POINT,
+          col_linestring  LINESTRING,
+          col_polygon     POLYGON,
+          -- meta
+          created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+          updated_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+          is_active       BOOLEAN     NOT NULL DEFAULT TRUE,
+          score           INT         NOT NULL DEFAULT 0,
+          -- constraints
+          CONSTRAINT uq_mysql_code   UNIQUE (unique_code),
+          CONSTRAINT uq_mysql_uuid   UNIQUE (unique_uuid),
+          CONSTRAINT fk_mysql_cat    FOREIGN KEY (category_id) REFERENCES mysql_category(category_id) ON DELETE RESTRICT ON UPDATE CASCADE,
+          CONSTRAINT chk_mysql_score CHECK (score BETWEEN -1000 AND 1000),
+          CONSTRAINT chk_mysql_code  CHECK (char_length(unique_code) >= 3)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+        -- indexes
+        CREATE INDEX idx_mysql_int        ON mysql_master(col_int);
+        CREATE INDEX idx_mysql_cat_score  ON mysql_master(category_id, score DESC);
+        CREATE INDEX idx_mysql_date       ON mysql_master(col_date);
+        CREATE INDEX idx_mysql_enum       ON mysql_master(col_enum);
+        CREATE INDEX idx_mysql_json_score ON mysql_master((CAST(col_json->>'$$.score' AS UNSIGNED)));
+        ALTER TABLE mysql_master ADD FULLTEXT INDEX idx_mysql_fulltext(col_varchar, col_text);
+
+        -- row 1: maximum values
+        INSERT INTO mysql_master (
+          category_id, unique_code,
+          col_tinyint, col_tinyint_u, col_smallint, col_mediumint, col_int, col_bigint,
+          col_decimal, col_bit, col_bool, col_float, col_double,
+          col_char, col_varchar, col_tinytext, col_text, col_mediumtext, col_longtext,
+          col_binary, col_varbinary, col_tinyblob, col_blob,
+          col_date, col_time, col_datetime, col_timestamp, col_year,
+          col_enum, col_set, col_json,
+          col_geometry, col_point, col_linestring, col_polygon, score
+        ) VALUES (
+          1,'CODE-MAX-001',
+          127,255,32767,8388607,2147483647,9223372036854775807,
+          123456.789012,b'10101010',1,3.14159,2.718281828459045,
+          'Hello     ','Привет мир! 😀 Unicode VARCHAR тест — всё работает',
+          'TinyText value','TEXT поле: Arabic العربية, Chinese 中文, Emoji 🔥💯',
+          REPEAT('MediumText содержимое для теста. ',100),REPEAT('LongText content row. ',500),
+          UNHEX('DEADBEEF00000000000000000000CAFE'),UNHEX('CAFEBABE0102030405'),
+          0xAB,0xDEADBEEF,
+          '2024-02-29','23:59:59.999999','2024-07-04 12:34:56.123456','2024-01-01 00:00:00.000000',2024,
+          'active','read,write,admin',
+          '{"name":"max","score":100,"tags":["a","b","c"],"nested":{"x":1},"unicode":"Привет"}',
+          ST_GeomFromText('POINT(55.7558 37.6173)'),
+          ST_PointFromText('POINT(10 20)'),
+          ST_LineFromText('LINESTRING(0 0,5 5,10 0,15 5)'),
+          ST_PolyFromText('POLYGON((0 0,10 0,10 10,0 10,0 0))'),
+          1000
+        );
+
+        -- row 2: minimum / negative values
+        INSERT INTO mysql_master (
+          category_id, unique_code,
+          col_tinyint, col_tinyint_u, col_smallint, col_mediumint, col_int, col_bigint,
+          col_decimal, col_bit, col_bool, col_float, col_double,
+          col_char, col_varchar, col_text,
+          col_date, col_time, col_datetime, col_year,
+          col_enum, col_set, col_json, score
+        ) VALUES (
+          2,'CODE-MIN-002',
+          -128,0,-32768,-8388608,-2147483648,-9223372036854775808,
+          -999999.999999,b'00000000',0,-3.14159,-2.718281828459045,
+          '          ','','Минимальные значения. <script>alert(1)</script>',
+          '1000-01-01','-838:59:59','1000-01-01 00:00:00.000000',1901,
+          'pending','','null',-1000
+        );
+
+        -- row 3: NULLs
+        INSERT INTO mysql_master(category_id,unique_code,score) VALUES(3,'CODE-NULL-003',0);
+
+        -- row 4: special chars
+        INSERT INTO mysql_master (
+          category_id, unique_code, col_varchar, col_text, col_json, col_enum, score
+        ) VALUES (
+          4,'CODE-SPEC-004',
+          'Quote: "double" and ''single'', backslash: \\, tab: char',
+          'Arabic: مرحبا, Chinese: 你好, Japanese: こんにちは, Korean: 안녕하세요',
+          '{"key":"value with \\"quotes\\"","unicode":"Привет","array":[1,null,true,false]}',
+          'archived',42
+        );
+
+        -- row 5: JSON deep nesting
+        INSERT INTO mysql_master (
+          category_id, unique_code, col_varchar, col_json,
+          col_enum, col_set, score
+        ) VALUES (
+          5,'CODE-JSON-005',
+          'Deep nested JSON test',
+          '{"level1":{"level2":{"level3":{"level4":{"value":42,"arr":[1,2,3],"flag":true}}},"sibling":"data"},"root_arr":[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}],"nullval":null}',
+          'active','read,write,execute',88
+        );
+
+        -- row 6: spatial focus
+        INSERT INTO mysql_master (
+          category_id, unique_code, col_varchar,
+          col_geometry, col_point, col_linestring, col_polygon,
+          col_enum, score
+        ) VALUES (
+          1,'CODE-GEO-006','Spatial types focus',
+          ST_GeomFromText('MULTIPOINT((0 0),(1 1),(2 2))'),
+          ST_PointFromText('POINT(51.5074 -0.1278)'),
+          ST_LineFromText('LINESTRING(0 0,1 1,2 0,3 1,4 0)'),
+          ST_PolyFromText('POLYGON((0 0,5 0,5 5,0 5,0 0),(1 1,2 1,2 2,1 2,1 1))'),
+          'active',70
+        );
+
+        -- row 7: enum/set all combos
+        INSERT INTO mysql_master(category_id,unique_code,col_enum,col_set,col_varchar,score)
+          VALUES(2,'CODE-ENUM-007-1','pending','read','Pending read only',10),
+                (2,'CODE-ENUM-007-2','active','read,write','Active read+write',20),
+                (2,'CODE-ENUM-007-3','disabled','execute,admin','Disabled exec+admin',30),
+                (2,'CODE-ENUM-007-4','archived','read,write,execute,admin,superuser','Archived all perms',40),
+                (2,'CODE-ENUM-007-5','deleted','','Deleted no perms',5);
+
+        -- row 8: binary blobs
+        INSERT INTO mysql_master (
+          category_id, unique_code,
+          col_binary, col_varbinary, col_tinyblob, col_blob, col_mediumblob, col_longblob,
+          col_varchar, score
+        ) VALUES (
+          3,'CODE-BLOB-008',
+          UNHEX(RPAD('DEADBEEF',32,'00')),
+          UNHEX(REPEAT('CAFEBABE',8)),
+          REPEAT(0x41,255),
+          REPEAT(0x42,65535),
+          0xFF,0xFE,
+          'Binary blobs focus row',15
+        );
+
+        -- row 9: datetime edge cases
+        INSERT INTO mysql_master (
+          category_id, unique_code,
+          col_date, col_time, col_datetime, col_timestamp, col_year,
+          col_varchar, score
+        ) VALUES
+          (4,'CODE-DT-009-1','2024-02-29','23:59:59.999999','2024-12-31 23:59:59.999999','2024-01-01 00:00:00.000001',2024,'Leap year max time',5),
+          (4,'CODE-DT-009-2','1000-01-01','-838:59:59','1000-01-01 00:00:00.000000',NULL,1901,'Min date min time',5),
+          (4,'CODE-DT-009-3','2038-01-18','00:00:01.000000','2038-01-19 03:14:07.000000','2038-01-19 03:14:07.000000',2155,'Near epoch overflow',5);
+
+        -- bulk 50 000 rows
+        SET SESSION cte_max_recursion_depth = 50001;
+        INSERT INTO mysql_master (
+          category_id, unique_code,
+          col_int, col_bigint, col_decimal, col_float, col_double,
+          col_varchar, col_text,
+          col_date, col_datetime, col_timestamp,
+          col_bool, col_enum, col_set, col_json, score, is_active
+        )
+        WITH RECURSIVE cte(n) AS (
+          SELECT 1 UNION ALL SELECT n+1 FROM cte WHERE n<50000
+        )
+        SELECT
+          MOD(n,5)+1,
+          CONCAT('CODE-BULK-',LPAD(n,8,'0')),
+          FLOOR(RAND()*4294967295)-2147483648,
+          FLOOR(RAND()*9000000000),
+          ROUND(RAND()*999999,6),
+          RAND()*1000,
+          RAND()*1000000,
+          CONCAT('varchar_',MD5(n)),
+          CONCAT(REPEAT('bulk row ',3),n),
+          DATE_ADD('2000-01-01',INTERVAL FLOOR(RAND()*9000) DAY),
+          DATE_ADD('2000-01-01 00:00:00',INTERVAL FLOOR(RAND()*777600000) SECOND),
+          IF(RAND()>0.3,DATE_ADD('2020-01-01',INTERVAL FLOOR(RAND()*1826) DAY),NULL),
+          ROUND(RAND()),
+          ELT(FLOOR(RAND()*5)+1,'pending','active','disabled','archived','deleted'),
+          IF(RAND()>0.5,'read,write','admin'),
+          JSON_OBJECT('row',n,'val',ROUND(RAND(),4),'active',IF(RAND()>0.3,TRUE,FALSE)),
+          FLOOR(RAND()*2001)-1000,
+          RAND()>0.2
+        FROM cte;
+
+        -- views
+        CREATE OR REPLACE VIEW mysql_master_active AS
+          SELECT m.id,m.category_id,c.category_name,m.unique_code,m.unique_uuid,
+                 m.col_int,m.col_bigint,m.col_decimal,m.col_varchar,m.col_text,
+                 m.col_bool,m.col_enum,m.col_set,m.col_json,m.col_date,m.col_datetime,
+                 m.score,m.created_at
+          FROM mysql_master m JOIN mysql_category c USING(category_id)
+          WHERE m.is_active=TRUE;
+
+        CREATE OR REPLACE VIEW mysql_master_stats AS
+          SELECT m.category_id, c.category_name,
+                 COUNT(*) AS total_rows, SUM(m.is_active) AS active_rows,
+                 MAX(m.col_int) AS max_int, MIN(m.col_int) AS min_int,
+                 ROUND(AVG(m.col_decimal),4) AS avg_decimal,
+                 SUM(m.score) AS total_score, MAX(m.created_at) AS last_created
+          FROM mysql_master m JOIN mysql_category c USING(category_id)
+          GROUP BY m.category_id,c.category_name;
+
+        CREATE OR REPLACE VIEW mysql_master_json_view AS
+          SELECT id, unique_code, col_json,
+                 col_json->>'$$.name'   AS json_name,
+                 col_json->>'$$.score'  AS json_score,
+                 JSON_TYPE(col_json)   AS json_root_type,
+                 col_enum, col_set, score
+          FROM mysql_master WHERE col_json IS NOT NULL AND col_json!='null';
+
+        -- procedures & functions
+        DELIMITER //
+        DROP PROCEDURE IF EXISTS mysql_proc_insert;
+        CREATE PROCEDURE mysql_proc_insert(
+          IN p_category_id TINYINT UNSIGNED, IN p_code VARCHAR(40),
+          IN p_int INT, IN p_varchar VARCHAR(500), IN p_enum VARCHAR(20), IN p_score INT
+        ) BEGIN
+          INSERT INTO mysql_master(category_id,unique_code,col_int,col_varchar,col_enum,score)
+          VALUES(p_category_id,p_code,p_int,p_varchar,p_enum,p_score);
+        END //
+        DROP PROCEDURE IF EXISTS mysql_proc_update_scores;
+        CREATE PROCEDURE mysql_proc_update_scores(
+          IN p_category_id TINYINT UNSIGNED, IN p_delta INT
+        ) BEGIN
+          UPDATE mysql_master
+          SET score=GREATEST(-1000,LEAST(1000,score+p_delta)), updated_at=CURRENT_TIMESTAMP(6)
+          WHERE category_id=p_category_id;
+          SELECT ROW_COUNT() AS rows_updated;
+        END //
+        DROP FUNCTION IF EXISTS mysql_fn_top_score;
+        CREATE FUNCTION mysql_fn_top_score(p_category_id TINYINT UNSIGNED)
+        RETURNS INT DETERMINISTIC BEGIN
+          DECLARE v INT;
+          SELECT MAX(score) INTO v FROM mysql_master WHERE category_id=p_category_id;
+          RETURN IFNULL(v,0);
+        END //
+        DROP FUNCTION IF EXISTS mysql_fn_format_code;
+        CREATE FUNCTION mysql_fn_format_code(p_code VARCHAR(40))
+        RETURNS VARCHAR(45) DETERMINISTIC BEGIN
+          RETURN CONCAT('[',UPPER(p_code),']');
+        END //
+        DELIMITER ;
+
+        -- ══════════════════════════════════════════════════════════════
+        -- TRIGGERS (MySQL has no sequences or materialized views)
+        -- ══════════════════════════════════════════════════════════════
+
+        -- Audit table
+        CREATE TABLE mysql_master_audit (
+          audit_id    BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+          operation   CHAR(1)         NOT NULL COMMENT 'I=Insert U=Update D=Delete',
+          master_id   BIGINT UNSIGNED,
+          old_score   INT,
+          new_score   INT,
+          old_enum    VARCHAR(20),
+          new_enum    VARCHAR(20),
+          old_active  BOOLEAN,
+          new_active  BOOLEAN,
+          old_code    VARCHAR(40),
+          new_code    VARCHAR(40),
+          changed_at  DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+        -- Score history table (one row per score change)
+        CREATE TABLE mysql_score_history (
+          history_id  BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+          master_id   BIGINT UNSIGNED NOT NULL,
+          old_score   INT             NOT NULL,
+          new_score   INT             NOT NULL,
+          delta       INT GENERATED ALWAYS AS (new_score - old_score) STORED,
+          changed_at  DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+          INDEX idx_msh_master (master_id),
+          INDEX idx_msh_changed (changed_at)
+        ) ENGINE=InnoDB;
+
+        DELIMITER //
+
+        -- BEFORE INSERT: normalize score, generate uuid if missing
+        CREATE TRIGGER trg_mysql_master_before_insert
+        BEFORE INSERT ON mysql_master FOR EACH ROW
+        BEGIN
+          IF NEW.score > 1000  THEN SET NEW.score  = 1000;  END IF;
+          IF NEW.score < -1000 THEN SET NEW.score  = -1000; END IF;
+          IF NEW.unique_uuid IS NULL OR NEW.unique_uuid = '' THEN
+            SET NEW.unique_uuid = UUID();
+          END IF;
+          SET NEW.updated_at = CURRENT_TIMESTAMP(6);
+        END //
+
+        -- AFTER INSERT: write audit record
+        CREATE TRIGGER trg_mysql_master_after_insert
+        AFTER INSERT ON mysql_master FOR EACH ROW
+        BEGIN
+          INSERT INTO mysql_master_audit(operation,master_id,new_score,new_enum,new_active,new_code)
+          VALUES('I',NEW.id,NEW.score,NEW.col_enum,NEW.is_active,NEW.unique_code);
+        END //
+
+        -- BEFORE UPDATE: clamp score
+        CREATE TRIGGER trg_mysql_master_before_update
+        BEFORE UPDATE ON mysql_master FOR EACH ROW
+        BEGIN
+          IF NEW.score > 1000  THEN SET NEW.score = 1000;  END IF;
+          IF NEW.score < -1000 THEN SET NEW.score = -1000; END IF;
+          SET NEW.updated_at = CURRENT_TIMESTAMP(6);
+        END //
+
+        -- AFTER UPDATE: write audit + score history
+        CREATE TRIGGER trg_mysql_master_after_update
+        AFTER UPDATE ON mysql_master FOR EACH ROW
+        BEGIN
+          INSERT INTO mysql_master_audit(
+            operation,master_id,
+            old_score,new_score,old_enum,new_enum,
+            old_active,new_active,old_code,new_code
+          )
+          VALUES('U',NEW.id,OLD.score,NEW.score,OLD.col_enum,NEW.col_enum,OLD.is_active,NEW.is_active,OLD.unique_code,NEW.unique_code);
+
+          IF OLD.score <> NEW.score THEN
+            INSERT INTO mysql_score_history(master_id,old_score,new_score)
+            VALUES(NEW.id,OLD.score,NEW.score);
+          END IF;
+        END //
+
+        -- BEFORE DELETE: soft-delete guard for active high-score rows
+        CREATE TRIGGER trg_mysql_master_before_delete
+        BEFORE DELETE ON mysql_master FOR EACH ROW
+        BEGIN
+          IF OLD.score > 900 AND OLD.is_active = TRUE THEN
+            SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Cannot delete active row with score > 900. Deactivate first.';
+          END IF;
+        END //
+
+        -- AFTER DELETE: audit record
+        CREATE TRIGGER trg_mysql_master_after_delete
+        AFTER DELETE ON mysql_master FOR EACH ROW
+        BEGIN
+          INSERT INTO mysql_master_audit(operation,master_id,old_score,old_enum,old_active,old_code)
+          VALUES('D',OLD.id,OLD.score,OLD.col_enum,OLD.is_active,OLD.unique_code);
+        END //
+
+        DELIMITER ;
+
+        -- Fire some audit records via DML (triggers will populate audit tables)
+        UPDATE mysql_master SET score = 500, col_enum = 'active'   WHERE unique_code = 'CODE-MAX-001';
+        UPDATE mysql_master SET score = -200, is_active = FALSE      WHERE unique_code = 'CODE-MIN-002';
+        UPDATE mysql_master SET score = 10                           WHERE unique_code = 'CODE-NULL-003';
+
+        SELECT CONCAT('MySQL seed complete: ',COUNT(*),' rows in mysql_master') FROM mysql_master;
+        EOSQL
+
+  # ─────────────────────────────────────────────
+  # MSSQL (Azure SQL Edge)
+  # ─────────────────────────────────────────────
+
   mssql:
     image: mcr.microsoft.com/azure-sql-edge:latest
     container_name: rapidb-mssql
@@ -46,6 +1276,534 @@ services:
       timeout: 5s
       retries: 30
       start_period: 40s
+
+  mssql-seed:
+    image: mcr.microsoft.com/mssql-tools:latest
+    container_name: rapidb-mssql-seed
+    depends_on:
+      mssql:
+        condition: service_healthy
+    restart: on-failure
+    entrypoint: [ "/bin/sh", "-c" ]
+    command:
+      - |
+        set -eu
+        SQLCMD_BIN="/opt/mssql-tools18/bin/sqlcmd"
+        if [ ! -x "$$SQLCMD_BIN" ]; then SQLCMD_BIN="/opt/mssql-tools/bin/sqlcmd"; fi
+        if [ ! -x "$$SQLCMD_BIN" ]; then echo "sqlcmd not found in sql edge image"; exit 1; fi
+
+        "$$SQLCMD_BIN" -b -S mssql -U sa -P 'Rapidb_Pass123!' -Q "
+          IF DB_ID('rapidb_mssql_db') IS NOT NULL
+          BEGIN
+            ALTER DATABASE rapidb_mssql_db SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+            DROP DATABASE rapidb_mssql_db;
+          END;
+          CREATE DATABASE rapidb_mssql_db;
+        "
+        "$$SQLCMD_BIN" -b -S mssql -U sa -P 'Rapidb_Pass123!' -d rapidb_mssql_db << 'EOSQL'
+
+        SET ANSI_NULLS ON;
+        SET QUOTED_IDENTIFIER ON;
+        SET ANSI_PADDING ON;
+        SET ANSI_WARNINGS ON;
+        SET CONCAT_NULL_YIELDS_NULL ON;
+        SET ARITHABORT ON;
+        GO
+
+        -- reference table
+        CREATE TABLE mssql_category (
+          category_id   TINYINT      PRIMARY KEY,
+          category_name NVARCHAR(50) NOT NULL,
+          description   NVARCHAR(255),
+          CONSTRAINT uq_mssql_cat UNIQUE(category_name)
+        );
+        INSERT INTO mssql_category VALUES
+          (1,N'alpha',N'First'),(2,N'beta',N'Second'),(3,N'gamma',N'Third'),
+          (4,N'delta',N'Fourth'),(5,N'epsilon',N'Fifth');
+        GO
+
+        -- master table — every MSSQL type
+        CREATE TABLE mssql_master (
+          id                   BIGINT           NOT NULL IDENTITY(1,1),
+          category_id          TINYINT          NOT NULL,
+          unique_code          NVARCHAR(40)     NOT NULL,
+          unique_guid          UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID(),
+          -- exact numeric
+          col_tinyint          TINYINT,
+          col_smallint         SMALLINT,
+          col_int              INT,
+          col_bigint           BIGINT,
+          col_bit              BIT,
+          col_decimal          DECIMAL(18,6),
+          col_numeric          NUMERIC(18,6),
+          col_money            MONEY,
+          col_smallmoney       SMALLMONEY,
+          -- approximate numeric
+          col_float            FLOAT(53),
+          col_real             REAL,
+          -- character
+          col_char             CHAR(10),
+          col_varchar          VARCHAR(500),
+          col_varchar_max      VARCHAR(MAX),
+          col_nchar            NCHAR(10),
+          col_nvarchar         NVARCHAR(500),
+          col_nvarchar_max     NVARCHAR(MAX),
+          col_text             TEXT,
+          col_ntext            NTEXT,
+          -- binary
+          col_binary           BINARY(16),
+          col_varbinary        VARBINARY(255),
+          col_varbinary_max    VARBINARY(MAX),
+          col_image            IMAGE,
+          -- datetime
+          col_date             DATE,
+          col_time             TIME(7),
+          col_datetime         DATETIME,
+          col_datetime2        DATETIME2(7),
+          col_datetimeoffset   DATETIMEOFFSET(7),
+          col_smalldatetime    SMALLDATETIME,
+          -- special
+          col_uniqueidentifier UNIQUEIDENTIFIER DEFAULT NEWID(),
+          col_rowversion       ROWVERSION,
+          col_sql_variant      SQL_VARIANT,
+          col_xml              XML,
+          -- spatial
+          col_geography        GEOGRAPHY,
+          col_geometry         GEOMETRY,
+          -- meta
+          created_at           DATETIME2(7)     NOT NULL DEFAULT SYSUTCDATETIME(),
+          updated_at           DATETIME2(7)     NOT NULL DEFAULT SYSUTCDATETIME(),
+          is_active            BIT              NOT NULL DEFAULT 1,
+          score                INT              NOT NULL DEFAULT 0,
+          CONSTRAINT pk_mssql_master  PRIMARY KEY CLUSTERED(id),
+          CONSTRAINT uq_mssql_code    UNIQUE(unique_code),
+          CONSTRAINT uq_mssql_guid    UNIQUE(unique_guid),
+          CONSTRAINT fk_mssql_cat     FOREIGN KEY(category_id) REFERENCES mssql_category(category_id) ON UPDATE CASCADE,
+          CONSTRAINT chk_mssql_score  CHECK(score BETWEEN -1000 AND 1000),
+          CONSTRAINT chk_mssql_code   CHECK(LEN(unique_code)>=3)
+        );
+        GO
+
+        -- indexes
+        CREATE NONCLUSTERED INDEX idx_mssql_int       ON mssql_master(col_int);
+        CREATE NONCLUSTERED INDEX idx_mssql_cat_score ON mssql_master(category_id,score DESC);
+        CREATE NONCLUSTERED INDEX idx_mssql_active    ON mssql_master(created_at) WHERE is_active=1;
+        CREATE UNIQUE NONCLUSTERED INDEX idx_mssql_guid ON mssql_master(unique_guid);
+        CREATE NONCLUSTERED INDEX idx_mssql_covering  ON mssql_master(category_id,col_date) INCLUDE(unique_code,score,col_nvarchar);
+        CREATE PRIMARY XML INDEX idx_mssql_xml ON mssql_master(col_xml);
+        GO
+
+        -- row 1: maximum values
+        INSERT INTO mssql_master (
+          category_id,unique_code,
+          col_tinyint,col_smallint,col_int,col_bigint,col_bit,
+          col_decimal,col_numeric,col_money,col_smallmoney,col_float,col_real,
+          col_char,col_varchar,col_varchar_max,col_nchar,col_nvarchar,col_nvarchar_max,
+          col_text,col_ntext,
+          col_binary,col_varbinary,col_varbinary_max,col_image,
+          col_date,col_time,col_datetime,col_datetime2,col_datetimeoffset,col_smalldatetime,
+          col_sql_variant,col_xml,
+          col_geography,col_geometry,score
+        ) VALUES (
+          1,N'CODE-MAX-001',
+          255,32767,2147483647,9223372036854775807,1,
+          123456.789012,999999.999999,922337203685477.5807,214748.3647,
+          1.7976931348623158E+38,3.402823E+38,
+          'Hello     ','VARCHAR value ASCII content',
+          REPLICATE(CONVERT(VARCHAR(MAX),'Long varchar max content repeating '),50),
+          N'NChar test',N'NVarChar: Привет мир! 你好世界 😀',
+          REPLICATE(CONVERT(NVARCHAR(MAX),N'Long nvarchar max Unicode: Привет '),50),
+          'Text column value legacy',N'NText: Привет мир Unicode',
+          0xDEADBEEF00000000000000000000CAFE,
+          0xCAFEBABE,
+          CONVERT(VARBINARY(MAX), REPLICATE('FF',50), 2),
+          0xDEAD,
+          '2024-02-29','23:59:59.9999999',
+          '2024-01-01 00:00:00.000','2024-07-04 12:34:56.1234567',
+          '2024-07-04 12:34:56.1234567 +03:00','2024-01-01 12:00',
+          CAST(42 AS INT),
+          N'<root><child id="1">Value &amp; More</child><item flag="true"/></root>',
+          NULL,
+          NULL,
+          1000
+        );
+        GO
+
+        -- row 2: minimum values
+        INSERT INTO mssql_master (
+          category_id,unique_code,
+          col_tinyint,col_smallint,col_int,col_bigint,col_bit,
+          col_decimal,col_money,col_float,col_real,
+          col_char,col_varchar,col_nvarchar,
+          col_date,col_time,col_datetime,col_datetime2,col_smalldatetime,
+          col_sql_variant,score
+        ) VALUES (
+          2,N'CODE-MIN-002',
+          0,-32768,-2147483648,-9223372036854775808,0,
+          -999999.999999,-922337203685477.5808,
+          -1.7976931348623158E+38,-3.402823E+38,
+          '          ','',N'',
+          '0001-01-01','00:00:00.0000000',
+          '1753-01-01 00:00:00.000','0001-01-01 00:00:00.0000000','1900-01-01 00:00',
+          CAST(N'Variant string' AS NVARCHAR(50)),-1000
+        );
+        GO
+
+        -- row 3: NULLs
+        INSERT INTO mssql_master(category_id,unique_code,score) VALUES(3,N'CODE-NULL-003',0);
+        GO
+
+        -- row 4: Unicode / XML / geography / geometry
+        INSERT INTO mssql_master (
+          category_id,unique_code,col_nvarchar,col_nvarchar_max,
+          col_xml,col_sql_variant,
+          col_geography,col_geometry,score
+        ) VALUES (
+          4,N'CODE-SPEC-004',
+          N'Кириллица, Αλφάβητο, العربية, 中文, 한국어, 🔥😀',
+          REPLICATE(CONVERT(NVARCHAR(MAX),N'Unicode repeating: Привет мир! '),100),
+          N'<data><users><user id="1" active="true"><name>Alice</name><email>alice@test.com</email></user><user id="2" active="false"><name>Bob</name></user></users></data>',
+          CAST(GETDATE() AS DATETIME2),
+          NULL,
+          NULL,
+          42
+        );
+        GO
+
+        -- row 5: SQL_VARIANT different subtypes
+        INSERT INTO mssql_master(category_id,unique_code,col_sql_variant,col_nvarchar,score)
+          VALUES(5,N'CODE-VAR-005-INT',   CAST(2147483647 AS INT), N'SQL_VARIANT stores INT',5);
+        INSERT INTO mssql_master(category_id,unique_code,col_sql_variant,col_nvarchar,score)
+          VALUES(5,N'CODE-VAR-005-DATE',  CAST('2024-07-04' AS DATE), N'SQL_VARIANT stores DATE',5);
+        INSERT INTO mssql_master(category_id,unique_code,col_sql_variant,col_nvarchar,score)
+          VALUES(5,N'CODE-VAR-005-MONEY', CAST(9999.99 AS MONEY), N'SQL_VARIANT stores MONEY',5);
+        INSERT INTO mssql_master(category_id,unique_code,col_sql_variant,col_nvarchar,score)
+          VALUES(5,N'CODE-VAR-005-GUID',  CAST(NEWID() AS UNIQUEIDENTIFIER), N'SQL_VARIANT stores GUID',5);
+        GO
+
+        -- row 6: spatial focus — SQL Edge exposes the spatial types,
+        -- but CLR-backed constructors are unavailable in this image.
+        INSERT INTO mssql_master (
+          category_id,unique_code,col_nvarchar,
+          col_geography,col_geometry,score
+        ) VALUES
+          (1,N'CODE-GEO-006-POINT',  N'Point: Moscow',
+           NULL,
+           NULL,10),
+          (1,N'CODE-GEO-006-LINE',   N'Line: Route',
+           NULL,
+           NULL,10),
+          (1,N'CODE-GEO-006-POLY',   N'Polygon: Area',
+           NULL,
+           NULL,10);
+        GO
+
+        -- bulk 50 000 rows
+        ;WITH bulk_rows AS (
+          SELECT TOP 50000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+          FROM sys.all_objects a CROSS JOIN sys.all_objects b
+        )
+        INSERT INTO mssql_master (
+          category_id,unique_code,col_int,col_bigint,col_decimal,
+          col_varchar,col_nvarchar,col_date,col_datetime2,
+          col_bit,score,is_active
+        )
+        SELECT
+          (ABS(CHECKSUM(NEWID()))%5)+1,
+          N'CODE-BULK-'+RIGHT('00000000'+CAST(n AS NVARCHAR),8),
+          ABS(CHECKSUM(NEWID()))%2000000000-1000000000,
+          ABS(CAST(CHECKSUM(NEWID()) AS BIGINT)),
+          CAST(ABS(CHECKSUM(NEWID()))%1000000 AS DECIMAL(18,6))/1000,
+          'varchar_'+CAST(NEWID() AS VARCHAR(36)),
+          N'nvarchar row '+CAST(n AS NVARCHAR),
+          DATEADD(DAY,ABS(CHECKSUM(NEWID()))%9000,'2000-01-01'),
+          DATEADD(SECOND,ABS(CHECKSUM(NEWID()))%777600000,'2000-01-01'),
+          ABS(CHECKSUM(NEWID()))%2,
+          ABS(CHECKSUM(NEWID()))%2001-1000,
+          CASE WHEN ABS(CHECKSUM(NEWID()))%5>0 THEN 1 ELSE 0 END
+        FROM bulk_rows;
+        GO
+
+        -- views
+        CREATE OR ALTER VIEW mssql_master_active AS
+          SELECT m.id,m.category_id,c.category_name,m.unique_code,m.unique_guid,
+                 m.col_int,m.col_bigint,m.col_decimal,m.col_nvarchar,m.col_bit,
+                 m.col_date,m.col_datetime2,m.score,m.created_at
+          FROM mssql_master m JOIN mssql_category c ON m.category_id=c.category_id
+          WHERE m.is_active=1;
+        GO
+
+        CREATE OR ALTER VIEW mssql_master_stats AS
+          SELECT m.category_id, c.category_name,
+                 COUNT(*) AS total_rows, SUM(CAST(m.is_active AS INT)) AS active_rows,
+                 MAX(m.col_int) AS max_int, MIN(m.col_int) AS min_int,
+                 ROUND(AVG(CAST(m.col_decimal AS FLOAT)),4) AS avg_decimal,
+                 SUM(m.score) AS total_score, MAX(m.created_at) AS last_created
+          FROM mssql_master m JOIN mssql_category c ON m.category_id=c.category_id
+          GROUP BY m.category_id,c.category_name;
+        GO
+
+        CREATE OR ALTER VIEW mssql_master_xml_view AS
+          SELECT id, unique_code, col_xml,
+                 col_xml.value('(/root/child/@id)[1]','INT')              AS xml_child_id,
+                 col_xml.value('(/root/child/text())[1]','NVARCHAR(100)') AS xml_child_text,
+                 col_uniqueidentifier,score
+          FROM mssql_master WHERE col_xml IS NOT NULL;
+        GO
+
+        -- procedures & functions
+        CREATE OR ALTER PROCEDURE mssql_proc_insert
+          @category_id TINYINT, @code NVARCHAR(40), @col_int INT,
+          @col_nvarchar NVARCHAR(500), @score INT
+        AS BEGIN
+          SET NOCOUNT ON;
+          INSERT INTO mssql_master(category_id,unique_code,col_int,col_nvarchar,score)
+          VALUES(@category_id,@code,@col_int,@col_nvarchar,@score);
+          SELECT SCOPE_IDENTITY() AS new_id;
+        END;
+        GO
+
+        CREATE OR ALTER PROCEDURE mssql_proc_update_scores
+          @category_id TINYINT, @delta INT
+        AS BEGIN
+          SET NOCOUNT ON;
+          UPDATE mssql_master
+          SET score=CASE WHEN score+@delta>1000 THEN 1000
+                         WHEN score+@delta<-1000 THEN -1000
+                         ELSE score+@delta END,
+              updated_at=SYSUTCDATETIME()
+          WHERE category_id=@category_id;
+          SELECT @@ROWCOUNT AS rows_updated;
+        END;
+        GO
+
+        CREATE OR ALTER FUNCTION mssql_fn_top_score(@category_id TINYINT) RETURNS INT AS BEGIN
+          DECLARE @r INT;
+          SELECT @r=MAX(score) FROM mssql_master WHERE category_id=@category_id;
+          RETURN ISNULL(@r,0);
+        END;
+        GO
+
+        CREATE OR ALTER FUNCTION mssql_fn_format_code(@code NVARCHAR(40)) RETURNS NVARCHAR(45) AS BEGIN
+          RETURN N'['+UPPER(@code)+N']';
+        END;
+        GO
+
+        -- ══════════════════════════════════════════════════════════════
+        -- USER-DEFINED TYPES
+        -- ══════════════════════════════════════════════════════════════
+        CREATE TYPE dbo.EmailType      FROM NVARCHAR(255) NOT NULL;
+        CREATE TYPE dbo.PhoneType      FROM NVARCHAR(30)  NULL;
+        CREATE TYPE dbo.ScoreType      FROM INT           NOT NULL;
+        CREATE TYPE dbo.CountryCode    FROM CHAR(2)       NOT NULL;
+        CREATE TYPE dbo.CurrencyCode   FROM CHAR(3)       NOT NULL;
+        GO
+
+        -- Table-valued user-defined type (for passing id lists to procedures)
+        CREATE TYPE dbo.IdListType AS TABLE (id BIGINT NOT NULL PRIMARY KEY);
+        GO
+
+        -- ══════════════════════════════════════════════════════════════
+        -- SEQUENCES
+        -- ══════════════════════════════════════════════════════════════
+        CREATE SEQUENCE dbo.seq_invoice_number
+          AS BIGINT
+          START WITH 100000
+          INCREMENT BY 1
+          MINVALUE 100000
+          MAXVALUE 9999999
+          NO CYCLE
+          CACHE 20;
+        GO
+
+        CREATE SEQUENCE dbo.seq_order_number
+          AS BIGINT
+          START WITH 500000
+          INCREMENT BY 5
+          MINVALUE 500000
+          MAXVALUE 99999999
+          CYCLE
+          CACHE 50;
+        GO
+
+        CREATE SEQUENCE dbo.seq_batch_id
+          AS INT
+          START WITH 1
+          INCREMENT BY 100
+          MINVALUE 1
+          NO CYCLE
+          CACHE 10;
+        GO
+
+        CREATE SEQUENCE dbo.seq_sku_number
+          AS INT
+          START WITH 10000
+          INCREMENT BY 1
+          MINVALUE 10000
+          MAXVALUE 99999
+          NO CYCLE
+          CACHE 100;
+        GO
+
+        -- Advance sequences to non-trivial state
+        SELECT NEXT VALUE FOR dbo.seq_invoice_number;
+        SELECT NEXT VALUE FOR dbo.seq_invoice_number;
+        SELECT NEXT VALUE FOR dbo.seq_order_number;
+        SELECT NEXT VALUE FOR dbo.seq_batch_id;
+        GO
+
+        -- Table using sequences explicitly
+        CREATE TABLE mssql_invoices (
+          invoice_no   BIGINT           NOT NULL DEFAULT (NEXT VALUE FOR dbo.seq_invoice_number),
+          order_no     BIGINT           NOT NULL DEFAULT (NEXT VALUE FOR dbo.seq_order_number),
+          master_id    BIGINT           NULL REFERENCES mssql_master(id) ON DELETE SET NULL,
+          amount       MONEY            NOT NULL,
+          currency     dbo.CurrencyCode NOT NULL DEFAULT 'USD',
+          status       NVARCHAR(20)     NOT NULL DEFAULT 'pending',
+          issued_at    DATETIME2(7)     NOT NULL DEFAULT SYSUTCDATETIME(),
+          due_at       DATETIME2(7)     NOT NULL DEFAULT DATEADD(DAY,30,SYSUTCDATETIME()),
+          paid_at      DATETIME2(7)     NULL,
+          CONSTRAINT pk_mssql_invoices PRIMARY KEY (invoice_no)
+        );
+        GO
+
+        INSERT INTO mssql_invoices(master_id, amount, currency, status)
+        SELECT TOP 20 id,
+          ABS(CHECKSUM(NEWID()))%10000 + 99.99,
+          N'USD',
+          CASE ABS(CHECKSUM(NEWID()))%3 WHEN 0 THEN 'pending' WHEN 1 THEN 'paid' ELSE 'overdue' END
+        FROM mssql_master
+        ORDER BY id;
+        GO
+
+        -- ══════════════════════════════════════════════════════════════
+        -- AGGREGATE VIEW
+        -- ══════════════════════════════════════════════════════════════
+        CREATE OR ALTER VIEW dbo.mssql_indexed_view_category_stats
+        AS
+          SELECT
+            m.category_id,
+            COUNT_BIG(*)                            AS total_rows,
+            COUNT_BIG(CASE WHEN m.is_active=1 THEN 1 END) AS active_rows,
+            SUM(CONVERT(BIGINT,m.score))            AS total_score,
+            MAX(m.score)                            AS max_score,
+            MIN(m.score)                            AS min_score,
+            COUNT_BIG(m.col_int)                    AS non_null_int_count,
+            SUM(CONVERT(BIGINT, ISNULL(m.col_int,0))) AS sum_int
+          FROM mssql_master m
+          GROUP BY m.category_id;
+        GO
+
+        -- ══════════════════════════════════════════════════════════════
+        -- TRIGGERS
+        -- ══════════════════════════════════════════════════════════════
+
+        -- Audit table
+        CREATE TABLE mssql_master_audit (
+          audit_id    BIGINT       NOT NULL IDENTITY(1,1) PRIMARY KEY,
+          operation   CHAR(1)      NOT NULL CHECK (operation IN ('I','U','D')),
+          master_id   BIGINT,
+          old_score   INT,
+          new_score   INT,
+          old_active  BIT,
+          new_active  BIT,
+          old_code    NVARCHAR(40),
+          new_code    NVARCHAR(40),
+          changed_by  NVARCHAR(128) NOT NULL DEFAULT SYSTEM_USER,
+          changed_at  DATETIME2(7)  NOT NULL DEFAULT SYSUTCDATETIME()
+        );
+        GO
+
+        -- Score history table
+        CREATE TABLE mssql_score_history (
+          history_id  BIGINT   NOT NULL IDENTITY(1,1) PRIMARY KEY,
+          master_id   BIGINT   NOT NULL,
+          old_score   INT      NOT NULL,
+          new_score   INT      NOT NULL,
+          delta       AS (new_score - old_score) PERSISTED,
+          changed_at  DATETIME2(7) NOT NULL DEFAULT SYSUTCDATETIME(),
+          INDEX idx_mssh_master (master_id),
+          INDEX idx_mssh_changed (changed_at)
+        );
+        GO
+
+        -- AFTER INSERT trigger: audit
+        CREATE OR ALTER TRIGGER trg_mssql_master_after_insert
+        ON mssql_master AFTER INSERT AS
+        BEGIN
+          SET NOCOUNT ON;
+          INSERT INTO mssql_master_audit(operation,master_id,new_score,new_active,new_code)
+          SELECT 'I',i.id,i.score,i.is_active,i.unique_code FROM inserted i;
+        END;
+        GO
+
+        -- AFTER UPDATE trigger: audit + score history + clamp score
+        CREATE OR ALTER TRIGGER trg_mssql_master_after_update
+        ON mssql_master AFTER UPDATE AS
+        BEGIN
+          SET NOCOUNT ON;
+          -- Audit
+          INSERT INTO mssql_master_audit(operation,master_id,old_score,new_score,old_active,new_active,old_code,new_code)
+          SELECT 'U',i.id,d.score,i.score,d.is_active,i.is_active,d.unique_code,i.unique_code
+          FROM inserted i JOIN deleted d ON i.id=d.id;
+          -- Score history
+          INSERT INTO mssql_score_history(master_id,old_score,new_score)
+          SELECT i.id,d.score,i.score
+          FROM inserted i JOIN deleted d ON i.id=d.id WHERE i.score<>d.score;
+          -- Clamp score that slipped past CHECK (defensive)
+          UPDATE mssql_master
+          SET score = CASE WHEN i.score>1000 THEN 1000 WHEN i.score<-1000 THEN -1000 ELSE i.score END,
+              updated_at = SYSUTCDATETIME()
+          FROM mssql_master m JOIN inserted i ON m.id=i.id
+          WHERE i.score>1000 OR i.score<-1000;
+        END;
+        GO
+
+        -- INSTEAD OF DELETE trigger: soft-delete guard, then hard-delete
+        CREATE OR ALTER TRIGGER trg_mssql_master_instead_delete
+        ON mssql_master INSTEAD OF DELETE AS
+        BEGIN
+          SET NOCOUNT ON;
+          -- Protect active high-score rows
+          IF EXISTS (SELECT 1 FROM deleted WHERE score>900 AND is_active=1)
+          BEGIN
+            RAISERROR('Cannot delete active rows with score > 900. Deactivate first.',16,1);
+            ROLLBACK;
+            RETURN;
+          END;
+          -- Audit
+          INSERT INTO mssql_master_audit(operation,master_id,old_score,old_active,old_code)
+          SELECT 'D',id,score,is_active,unique_code FROM deleted;
+          -- Actual delete
+          DELETE m FROM mssql_master m JOIN deleted d ON m.id=d.id;
+        END;
+        GO
+
+        -- DDL trigger: log schema changes (database-level)
+        CREATE OR ALTER TRIGGER trg_mssql_ddl_log
+        ON DATABASE FOR CREATE_TABLE, ALTER_TABLE, DROP_TABLE, CREATE_INDEX, DROP_INDEX AS
+        BEGIN
+          SET NOCOUNT ON;
+          DECLARE @data XML = EVENTDATA();
+          INSERT INTO mssql_master_audit(operation,changed_by,new_code)
+          VALUES('U', SYSTEM_USER,
+            CAST(@data.value('(/EVENT_INSTANCE/ObjectName)[1]','NVARCHAR(128)') AS NVARCHAR(40)));
+        END;
+        GO
+
+        -- Fire some DML to populate audit tables
+        UPDATE mssql_master SET score=500,  is_active=1 WHERE unique_code=N'CODE-MAX-001';
+        UPDATE mssql_master SET score=-200, is_active=0 WHERE unique_code=N'CODE-MIN-002';
+        UPDATE mssql_master SET score=10              WHERE unique_code=N'CODE-NULL-003';
+        GO
+
+        SELECT CONCAT('MSSQL seed complete: ',COUNT(*),' rows in mssql_master') FROM mssql_master;
+        GO
+        EOSQL
+
+  # ─────────────────────────────────────────────
+  # Oracle Free
+  # ─────────────────────────────────────────────
 
   oracle:
     image: gvenzl/oracle-free:latest
@@ -62,3 +1820,1308 @@ services:
       timeout: 10s
       retries: 24
       start_period: 120s
+
+  oracle-seed:
+    image: gvenzl/oracle-free:latest
+    container_name: rapidb-oracle-seed
+    depends_on:
+      oracle:
+        condition: service_healthy
+    restart: on-failure
+    environment:
+      ORACLE_PASSWORD: root_oracle_pass123
+    entrypoint: [ "/bin/sh", "-c" ]
+    command:
+      - |
+        set -eu
+        sqlplus -s oracle_test_user/oracle_pass123@oracle:1521/FREEPDB1 << 'EOSQL'
+        SET DEFINE OFF
+        WHENEVER SQLERROR EXIT SQL.SQLCODE
+
+        BEGIN EXECUTE IMMEDIATE 'DROP VIEW oracle_master_json_view'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        /
+        BEGIN EXECUTE IMMEDIATE 'DROP VIEW oracle_master_stats'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        /
+        BEGIN EXECUTE IMMEDIATE 'DROP VIEW oracle_master_active'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        /
+        BEGIN EXECUTE IMMEDIATE 'DROP FUNCTION oracle_fn_top_score'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        /
+        BEGIN EXECUTE IMMEDIATE 'DROP PROCEDURE oracle_proc_adjust_scores'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        /
+        BEGIN EXECUTE IMMEDIATE 'DROP TABLE oracle_invoices CASCADE CONSTRAINTS'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        /
+        BEGIN EXECUTE IMMEDIATE 'DROP TABLE oracle_master_audit CASCADE CONSTRAINTS'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        /
+        BEGIN EXECUTE IMMEDIATE 'DROP TABLE oracle_master CASCADE CONSTRAINTS'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        /
+        BEGIN EXECUTE IMMEDIATE 'DROP TABLE oracle_category CASCADE CONSTRAINTS'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        /
+        BEGIN EXECUTE IMMEDIATE 'DROP SEQUENCE oracle_invoice_seq'; EXCEPTION WHEN OTHERS THEN NULL; END;
+        /
+
+        CREATE TABLE oracle_category (
+          category_id   NUMBER(3)    PRIMARY KEY,
+          category_name VARCHAR2(50) NOT NULL UNIQUE,
+          description   VARCHAR2(255)
+        );
+
+        INSERT INTO oracle_category VALUES (1,'alpha','First');
+        INSERT INTO oracle_category VALUES (2,'beta','Second');
+        INSERT INTO oracle_category VALUES (3,'gamma','Third');
+        INSERT INTO oracle_category VALUES (4,'delta','Fourth');
+        INSERT INTO oracle_category VALUES (5,'epsilon','Fifth');
+
+        CREATE TABLE oracle_master (
+          id                NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          category_id       NUMBER(3)    NOT NULL REFERENCES oracle_category(category_id),
+          unique_code       VARCHAR2(40) NOT NULL UNIQUE,
+          unique_guid       RAW(16)      DEFAULT SYS_GUID() NOT NULL,
+          col_number        NUMBER(18,6),
+          col_integer       NUMBER(10),
+          col_binary_float  BINARY_FLOAT,
+          col_binary_double BINARY_DOUBLE,
+          col_char          CHAR(10),
+          col_varchar2      VARCHAR2(500),
+          col_nvarchar2     NVARCHAR2(500),
+          col_clob          CLOB,
+          col_blob          BLOB,
+          col_raw           RAW(255),
+          col_date          DATE,
+          col_timestamp     TIMESTAMP(6),
+          col_timestamp_tz  TIMESTAMP(6) WITH TIME ZONE,
+          col_interval_ym   INTERVAL YEAR(2) TO MONTH,
+          col_interval_ds   INTERVAL DAY(3) TO SECOND(6),
+          col_xmltype       XMLTYPE,
+          col_json_doc      CLOB CHECK (col_json_doc IS JSON),
+          is_active         NUMBER(1) DEFAULT 1 NOT NULL,
+          score             NUMBER(5) DEFAULT 0 NOT NULL,
+          created_at        TIMESTAMP(6) WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL,
+          updated_at        TIMESTAMP(6) WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL,
+          CONSTRAINT chk_ora_score CHECK(score BETWEEN -1000 AND 1000),
+          CONSTRAINT chk_ora_active CHECK(is_active IN(0,1))
+        );
+
+        CREATE INDEX idx_ora_number ON oracle_master(col_number);
+        CREATE INDEX idx_ora_cat_score ON oracle_master(category_id, score DESC);
+        CREATE INDEX idx_ora_date ON oracle_master(col_date);
+
+        INSERT INTO oracle_master (
+          category_id, unique_code, col_number, col_integer, col_binary_float, col_binary_double,
+          col_char, col_varchar2, col_nvarchar2, col_clob, col_blob, col_raw,
+          col_date, col_timestamp, col_timestamp_tz, col_interval_ym, col_interval_ds,
+          col_xmltype, col_json_doc, is_active, score
+        ) VALUES (
+          1, 'CODE-MAX-001', 123456.789012, 2147483647, 3.14f, 2.7182818284d,
+          'Hello     ', 'Oracle max row', N'Юникод 你好', TO_CLOB('Oracle CLOB sample text'),
+          TO_BLOB(HEXTORAW('DEADBEEF')), HEXTORAW('CAFEBABE0102'),
+          DATE'2024-02-29', TIMESTAMP'2024-07-04 12:34:56.123456', TIMESTAMP'2024-07-04 12:34:56.123456 +03:00',
+          INTERVAL'10-6' YEAR TO MONTH, INTERVAL'123 12:30:06.250000' DAY(3) TO SECOND(6),
+          XMLTYPE('<root><child id="1">Value</child></root>'),
+          q'~{"profile":{"name":"Alice","role":"admin"},"flags":[true,false],"score":1000,"locale":"de-DE"}~', 1, 1000
+        );
+
+        INSERT INTO oracle_master (category_id, unique_code, score) VALUES (2, 'CODE-MIN-002', -1000);
+        INSERT INTO oracle_master (category_id, unique_code, score) VALUES (3, 'CODE-NULL-003', 0);
+        INSERT INTO oracle_master (category_id, unique_code, col_varchar2, col_nvarchar2, col_json_doc, score)
+          VALUES (4, 'CODE-SPEC-004', q'[Special: "quotes", 'apostrophe', <tag>]', N'Unicode: Привет 你好', q'~{"message":"Special characters","unicode":"Привет 你好","xss":"<script>alert(1)</script>"}~', 42);
+
+        INSERT INTO oracle_master (category_id, unique_code, col_varchar2, col_json_doc, score)
+          VALUES (5, 'CODE-JSON-005', 'Oracle JSON payload row', q'~{"profile":{"name":"Eve","tags":["json","oracle","test"]},"totals":{"orders":12,"revenue":6300.75},"active":true}~', 88);
+
+        BEGIN
+          FOR i IN 1..50000 LOOP
+            INSERT INTO oracle_master (
+              category_id, unique_code, col_number, col_integer,
+              col_varchar2, col_nvarchar2,
+              col_date, col_timestamp, col_timestamp_tz,
+              is_active, score
+            ) VALUES (
+              MOD(i,5)+1,
+              'CODE-BULK-'||LPAD(i,8,'0'),
+              ROUND(DBMS_RANDOM.VALUE(-999999,999999),6),
+              TRUNC(DBMS_RANDOM.VALUE(-2000000000,2000000000)),
+              'varchar2_'||DBMS_RANDOM.STRING('x',20),
+              'nvarchar2_row_'||i,
+              DATE'2000-01-01' + TRUNC(DBMS_RANDOM.VALUE(0,9000)),
+              TIMESTAMP'2000-01-01 00:00:00' + NUMTODSINTERVAL(TRUNC(DBMS_RANDOM.VALUE(0,9000*86400)), 'SECOND'),
+              SYSTIMESTAMP - NUMTODSINTERVAL(TRUNC(DBMS_RANDOM.VALUE(0,9000*86400)), 'SECOND'),
+              CASE WHEN DBMS_RANDOM.VALUE(0,1)>0.2 THEN 1 ELSE 0 END,
+              TRUNC(DBMS_RANDOM.VALUE(-1000,1000))
+            );
+            IF MOD(i,1000)=0 THEN COMMIT; END IF;
+          END LOOP;
+          COMMIT;
+        END;
+        /
+
+        CREATE OR REPLACE TRIGGER trg_oracle_master_updated
+        BEFORE UPDATE ON oracle_master FOR EACH ROW
+        BEGIN
+          :NEW.updated_at := SYSTIMESTAMP;
+        END;
+        /
+
+        CREATE TABLE oracle_master_audit (
+          audit_id    NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          operation   CHAR(1) NOT NULL,
+          master_id   NUMBER,
+          old_score   NUMBER(5),
+          new_score   NUMBER(5),
+          changed_at  TIMESTAMP(6) WITH TIME ZONE DEFAULT SYSTIMESTAMP
+        );
+
+        CREATE OR REPLACE TRIGGER trg_oracle_master_audit
+        AFTER INSERT OR UPDATE OR DELETE ON oracle_master
+        FOR EACH ROW
+        BEGIN
+          IF INSERTING THEN
+            INSERT INTO oracle_master_audit(operation,master_id,new_score)
+            VALUES('I',:NEW.id,:NEW.score);
+          ELSIF UPDATING THEN
+            INSERT INTO oracle_master_audit(operation,master_id,old_score,new_score)
+            VALUES('U',:NEW.id,:OLD.score,:NEW.score);
+          ELSIF DELETING THEN
+            INSERT INTO oracle_master_audit(operation,master_id,old_score)
+            VALUES('D',:OLD.id,:OLD.score);
+          END IF;
+        END;
+        /
+
+        CREATE OR REPLACE VIEW oracle_master_active AS
+          SELECT m.id,m.category_id,c.category_name,m.unique_code,m.col_number,m.col_varchar2,m.col_date,m.score,m.created_at
+          FROM oracle_master m JOIN oracle_category c ON c.category_id=m.category_id
+          WHERE m.is_active=1;
+
+        CREATE OR REPLACE VIEW oracle_master_stats AS
+          SELECT m.category_id,c.category_name,
+                 COUNT(*) AS total_rows,
+                 SUM(m.is_active) AS active_rows,
+                 MIN(m.col_number) AS min_number,
+                 MAX(m.col_number) AS max_number,
+                 ROUND(AVG(m.col_number),4) AS avg_number,
+                 SUM(m.score) AS total_score
+          FROM oracle_master m
+          JOIN oracle_category c ON c.category_id=m.category_id
+          GROUP BY m.category_id,c.category_name;
+
+        CREATE OR REPLACE VIEW oracle_master_json_view AS
+          SELECT id,
+                 unique_code,
+                 JSON_VALUE(col_json_doc, '$.profile.name') AS json_profile_name,
+                 JSON_VALUE(col_json_doc, '$.totals.orders' RETURNING NUMBER) AS json_orders,
+                 JSON_VALUE(col_json_doc, '$.active' RETURNING VARCHAR2(10)) AS json_active_flag,
+                 score
+          FROM oracle_master
+          WHERE col_json_doc IS NOT NULL;
+
+        CREATE OR REPLACE FUNCTION oracle_fn_top_score(p_category_id IN NUMBER)
+        RETURN NUMBER
+        IS
+          v_score NUMBER;
+        BEGIN
+          SELECT NVL(MAX(score),0) INTO v_score
+          FROM oracle_master
+          WHERE category_id = p_category_id;
+          RETURN v_score;
+        END;
+        /
+
+        CREATE OR REPLACE PROCEDURE oracle_proc_adjust_scores(
+          p_category_id IN NUMBER,
+          p_delta IN NUMBER
+        )
+        IS
+        BEGIN
+          UPDATE oracle_master
+          SET score = LEAST(1000, GREATEST(-1000, score + p_delta)),
+              updated_at = SYSTIMESTAMP
+          WHERE category_id = p_category_id;
+        END;
+        /
+
+        CREATE SEQUENCE oracle_invoice_seq START WITH 100000 INCREMENT BY 1 NOCACHE;
+
+        CREATE TABLE oracle_invoices (
+          invoice_no NUMBER DEFAULT oracle_invoice_seq.NEXTVAL PRIMARY KEY,
+          master_id  NUMBER REFERENCES oracle_master(id),
+          amount     NUMBER(18,2) NOT NULL,
+          status     VARCHAR2(20) DEFAULT 'pending' NOT NULL,
+          issued_at  TIMESTAMP(6) WITH TIME ZONE DEFAULT SYSTIMESTAMP
+        );
+
+        INSERT INTO oracle_invoices(master_id, amount, status)
+        SELECT id, ROUND(DBMS_RANDOM.VALUE(100,9999),2),
+               CASE MOD(id,3) WHEN 0 THEN 'pending' WHEN 1 THEN 'paid' ELSE 'overdue' END
+        FROM oracle_master
+        WHERE ROWNUM <= 20;
+
+        BEGIN
+          oracle_proc_adjust_scores(4, 10);
+        END;
+        /
+
+        COMMIT;
+        SELECT 'Oracle seed complete: '||COUNT(*)||' rows in oracle_master' FROM oracle_master;
+        EXIT
+        EOSQL
+
+  # ─────────────────────────────────────────────
+  # MongoDB 7
+  # ─────────────────────────────────────────────
+
+  mongo:
+    image: mongo:7
+    container_name: rapidb-mongo
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: mongo_admin
+      MONGO_INITDB_ROOT_PASSWORD: mongo_pass123
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: [ "CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok" ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  mongo-seed:
+    image: mongo:7
+    container_name: rapidb-mongo-seed
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: on-failure
+    entrypoint: [ "mongosh", "mongodb://mongo_admin:mongo_pass123@mongo:27017/admin" ]
+    command:
+      - --eval
+      - |
+        // ── Create user ───────────────────────────────────────────
+        db.getSiblingDB("rapidb_mongo_db").createUser({
+          user: "mongo_user", pwd: "mongo_pass123",
+          roles: [{ role: "readWrite", db: "rapidb_mongo_db" }]
+        });
+        const mdb = db.getSiblingDB("rapidb_mongo_db");
+
+        // ── users collection — rich nested docs ───────────────────
+        const users = [];
+        const cities = ["Berlin","Amsterdam","Paris","London","Moscow","Tokyo","New York","Sydney","Dubai","Singapore"];
+        const countries = ["DE","NL","FR","GB","RU","JP","US","AU","AE","SG"];
+        const roles = ["admin","editor","viewer","moderator","superuser"];
+        const statuses = ["active","inactive","pending","banned","verified"];
+        const plans = ["free","starter","pro","enterprise"];
+
+        for (let i = 1; i <= 200; i++) {
+          const ci = i % 10;
+          users.push({
+            _id: new ObjectId(),
+            userId: "user-" + String(i).padStart(4,"0"),
+            name: ["Alice","Bob","Carol","Dave","Eve","Frank","Grace","Hank","Ivy","Jack"][i%10] + " " + ["Smith","Jones","Brown","Taylor","Wilson","Davis","Evans","Harris","Clark","Lewis"][Math.floor(i/10)%10],
+            email: "user" + i + "@example.com",
+            age: 18 + (i % 62),
+            birthDate: new Date(1960 + (i%40), i%12, (i%28)+1),
+            phone: "+1-555-" + String(1000+i).padStart(4,"0"),
+            isVerified: i % 3 !== 0,
+            score: Math.floor(Math.random()*10000),
+            balance: parseFloat((Math.random()*50000).toFixed(2)),
+            role: roles[i%5],
+            status: statuses[i%5],
+            plan: plans[i%4],
+            tags: [roles[i%5], statuses[i%5], "user", i%2===0?"premium":"standard"],
+            address: {
+              street: (i*7+1) + " " + ["Main St","Oak Ave","Pine Rd","Elm Dr","Maple Blvd"][i%5],
+              city: cities[ci], country: countries[ci],
+              zip: String(10000 + i*17).substring(0,5),
+              geo: { type:"Point", coordinates: [parseFloat((-180+i*1.7).toFixed(4)), parseFloat((-90+i*0.85).toFixed(4))] }
+            },
+            preferences: {
+              language: ["en","de","fr","ru","ja","ar","zh","ko","es","pt"][i%10],
+              timezone: ["UTC","America/New_York","Europe/Berlin","Asia/Tokyo","Europe/Moscow"][i%5],
+              theme: i%2===0?"dark":"light",
+              notifications: { email: i%2===0, sms: i%3===0, push: i%4===0 }
+            },
+            stats: {
+              loginCount: i*3, lastLogin: new Date(Date.now()-i*86400000),
+              sessionDuration: i*120, pageViews: i*50, purchases: i%10
+            },
+            metadata: {
+              createdAt: new Date(Date.now()-i*86400000*30),
+              updatedAt: new Date(),
+              source: ["web","mobile","api","admin"][i%4],
+              ipAddress: "192.168." + (i%256) + "." + ((i*7)%256),
+              userAgent: ["Chrome/120","Firefox/121","Safari/17","Edge/120"][i%4]
+            },
+            // BSON type variety
+            profilePic: new BinData(0, "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="),
+            rating: new NumberDecimal((3.0+Math.random()*2).toFixed(2)),
+            luckyNumber: new NumberLong(i * 1000000),
+            flags: new NumberInt(i % 256),
+            regexPattern: new RegExp("user"+i, "i"),
+            nullField: null,
+            undefinedLikeField: "N/A",
+            embeddedTS: new Timestamp(Math.floor(Date.now()/1000), i)
+          });
+        }
+        mdb.users.insertMany(users);
+        mdb.users.createIndex({ email: 1 }, { unique: true });
+        mdb.users.createIndex({ "address.geo": "2dsphere" });
+        mdb.users.createIndex({ role: 1, status: 1 });
+        mdb.users.createIndex({ score: -1 });
+        mdb.users.createIndex({ name: "text", "address.city": "text" });
+        mdb.users.createIndex({ plan: 1, "stats.loginCount": -1 });
+
+        // ── products collection — e-commerce catalog ───────────────
+        const categories = ["Electronics","Clothing","Books","Home","Sports","Toys","Food","Beauty","Garden","Tools"];
+        const products = [];
+        for (let i = 1; i <= 100; i++) {
+          const cat = categories[i%10];
+          products.push({
+            _id: new ObjectId(),
+            sku: "SKU-" + String(i).padStart(5,"0"),
+            name: cat + " Item " + i,
+            slug: cat.toLowerCase() + "-item-" + i,
+            category: cat,
+            subcategory: cat + " Sub " + (i%5+1),
+            brand: ["BrandA","BrandB","BrandC","BrandD","BrandE"][i%5],
+            price: parseFloat((9.99 + i*5.5).toFixed(2)),
+            compareAtPrice: parseFloat((9.99 + i*5.5 + 20).toFixed(2)),
+            cost: parseFloat((9.99 + i*3).toFixed(2)),
+            currency: "USD",
+            stock: i%7===0 ? 0 : i*10,
+            lowStockThreshold: 10,
+            active: i%7!==0,
+            featured: i%5===0,
+            rating: parseFloat((1+Math.random()*4).toFixed(1)),
+            reviewCount: i*3,
+            tags: [cat.toLowerCase(), "item", i%2===0?"sale":"regular", i%3===0?"new":""],
+            attributes: {
+              weight: parseFloat((0.1*i).toFixed(2)),
+              dimensions: { length:i*2, width:i, height:Math.ceil(i/2), unit:"cm" },
+              color: ["red","blue","green","black","white","yellow"][i%6],
+              size: ["XS","S","M","L","XL","XXL"][i%6],
+              material: ["cotton","polyester","leather","metal","plastic","wood"][i%6]
+            },
+            variants: [
+              { variantId: "v-"+i+"-1", color:"black", size:"M", stock:i*3, price:parseFloat((9.99+i*5.5).toFixed(2)) },
+              { variantId: "v-"+i+"-2", color:"white", size:"L", stock:i*2, price:parseFloat((9.99+i*5.5+2).toFixed(2)) }
+            ],
+            images: [
+              { url:"https://cdn.example.com/"+cat.toLowerCase()+"/"+i+"-main.jpg", alt:"Main image", primary:true },
+              { url:"https://cdn.example.com/"+cat.toLowerCase()+"/"+i+"-thumb.jpg", alt:"Thumbnail", primary:false }
+            ],
+            seo: { title: cat+" Item "+i+" - Best Price", description:"Buy "+cat+" Item "+i+" online", keywords:[cat.toLowerCase(),"buy","online","best"] },
+            metadata: { createdAt:new Date(Date.now()-i*86400000*60), updatedAt:new Date(), views:i*100, sales:i*5 }
+          });
+        }
+        mdb.products.insertMany(products);
+        mdb.products.createIndex({ sku: 1 }, { unique: true });
+        mdb.products.createIndex({ category: 1, price: 1 });
+        mdb.products.createIndex({ active: 1, featured: -1 });
+        mdb.products.createIndex({ name: "text", "seo.description": "text" });
+        mdb.products.createIndex({ rating: -1, reviewCount: -1 });
+
+        // ── orders collection — transactions with all BSON types ───
+        const orders = [];
+        for (let i = 1; i <= 150; i++) {
+          const uid = "user-" + String((i%200)+1).padStart(4,"0");
+          const total = parseFloat((19.99 + i*12.5).toFixed(2));
+          orders.push({
+            _id: new ObjectId(),
+            orderId: "ORD-2024-" + String(i).padStart(6,"0"),
+            customerId: uid,
+            status: ["pending","processing","shipped","delivered","cancelled","refunded"][i%6],
+            paymentStatus: ["unpaid","paid","refunded","partial"][i%4],
+            paymentMethod: ["credit_card","paypal","crypto","bank_transfer","wallet"][i%5],
+            currency: "USD",
+            subtotal: new NumberDecimal((total-10).toFixed(2)),
+            discount: new NumberDecimal((i%5*2).toFixed(2)),
+            tax: new NumberDecimal((total*0.1).toFixed(2)),
+            shipping: new NumberDecimal("9.99"),
+            total: new NumberDecimal(total.toFixed(2)),
+            items: [
+              { sku:"SKU-"+String((i%100)+1).padStart(5,"0"), name:"Product "+i, qty:1+(i%5), price:parseFloat((9.99+i*2).toFixed(2)), discount:0 },
+              { sku:"SKU-"+String((i%50)+51).padStart(5,"0"), name:"Product "+(i+50), qty:1+(i%3), price:parseFloat((4.99+i).toFixed(2)), discount:parseFloat((i%3).toFixed(2)) }
+            ],
+            shippingAddress: {
+              name:"Recipient "+i, street:(i*3)+" Delivery Rd",
+              city:["New York","Berlin","Tokyo","London","Paris"][i%5],
+              country:["US","DE","JP","GB","FR"][i%5], zip:String(10000+i*13).substring(0,5)
+            },
+            billingAddress: {
+              name:"Billing "+i, street:(i*7)+" Invoice Ave",
+              city:["New York","Berlin","Tokyo","London","Paris"][i%5],
+              country:["US","DE","JP","GB","FR"][i%5], zip:String(20000+i*11).substring(0,5)
+            },
+            timeline: [
+              { event:"created",  ts:new Date(Date.now()-i*86400000*5) },
+              { event:"paid",     ts:new Date(Date.now()-i*86400000*4) },
+              { event:"shipped",  ts:new Date(Date.now()-i*86400000*2) },
+              { event:"delivered",ts:new Date(Date.now()-i*86400000) }
+            ],
+            metadata: {
+              createdAt: new Date(Date.now()-i*86400000*5),
+              updatedAt: new Date(),
+              source: ["web","mobile","api"][i%3],
+              ipAddress: "10.0." + (i%256) + "." + ((i*3)%256),
+              trackingNumber: "TRACK-"+String(i*123456789).substring(0,10)
+            },
+            notes: i%7===0 ? "Priority order — handle with care" : null,
+            tags: ["order", i%2===0?"retail":"wholesale", ["pending","processing","shipped","delivered","cancelled","refunded"][i%6]]
+          });
+        }
+        mdb.orders.insertMany(orders);
+        mdb.orders.createIndex({ orderId: 1 }, { unique: true });
+        mdb.orders.createIndex({ customerId: 1, status: 1 });
+        mdb.orders.createIndex({ "metadata.createdAt": -1 });
+        mdb.orders.createIndex({ status: 1, paymentStatus: 1 });
+        mdb.orders.createIndex({ total: -1 });
+
+        // ── events collection — time-series / analytics ────────────
+        const events = [];
+        const eventTypes = ["page_view","click","purchase","signup","logout","search","add_to_cart","remove_from_cart","checkout","refund"];
+        for (let i = 1; i <= 500; i++) {
+          events.push({
+            _id: new ObjectId(),
+            eventId: "EVT-"+String(i).padStart(8,"0"),
+            type: eventTypes[i%10],
+            userId: i<=200 ? "user-"+String(i%200+1).padStart(4,"0") : null,
+            sessionId: "sess-"+String(Math.floor(i/5)).padStart(8,"0"),
+            timestamp: new Date(Date.now()-i*600000),
+            page: ["/home","/products","/cart","/checkout","/account","/search"][i%6],
+            referrer: ["https://google.com","https://facebook.com","direct","https://twitter.com",null][i%5],
+            device: { type:["desktop","mobile","tablet"][i%3], os:["Windows","macOS","iOS","Android","Linux"][i%5], browser:["Chrome","Firefox","Safari","Edge"][i%4] },
+            geo: { country:["US","DE","JP","FR","GB","RU","CN","BR","IN","AU"][i%10], city:["New York","Berlin","Tokyo","Paris","London"][i%5], lat:parseFloat((-90+i*0.35).toFixed(4)), lon:parseFloat((-180+i*0.71).toFixed(4)) },
+            properties: { productId: i%2===0?"SKU-"+String((i%100)+1).padStart(5,"0"):null, searchQuery:i%10===7?"product search "+i:null, value: i%10===2?parseFloat((9.99+i).toFixed(2)):null },
+            flags: { isBot:i%50===0, isFirstVisit:i%10===1, isDuplicate:false },
+            metadata: { processedAt:new Date(), schemaVersion:1 }
+          });
+        }
+        mdb.events.insertMany(events);
+        mdb.events.createIndex({ type: 1, timestamp: -1 });
+        mdb.events.createIndex({ userId: 1, timestamp: -1 });
+        mdb.events.createIndex({ sessionId: 1 });
+        mdb.events.createIndex({ timestamp: -1 }, { expireAfterSeconds: 7776000 });
+
+        // ── bson_types collection — every BSON type ────────────────
+        mdb.bson_types.insertOne({
+          _id: new ObjectId(),
+          label: "All BSON types showcase",
+          t_double:       3.14159265358979,
+          t_string:       "Hello, World! Привет мир! 你好世界 🔥😀",
+          t_object:       { nested: { deep: { value: 42 } }, arr: [1,2,3] },
+          t_array:        [1,"two",3.0,true,null,{ k:"v" },[7,8,9]],
+          t_binary:       new BinData(0,"AQIDBAUGB/8="),
+          t_binary_uuid:  new BinData(4,"ESIzRFVmd4iZqrvM3e7//w=="),
+          t_objectid:     new ObjectId("64a1b2c3d4e5f67890abcdef"),
+          t_bool_true:    true,
+          t_bool_false:   false,
+          t_date:         new Date("2024-07-04T12:00:00.000Z"),
+          t_null:         null,
+          t_regex:        /quick\s+fox/gi,
+          t_js:           new Code("function() { return this.score > 100; }"),
+          t_int32:        new NumberInt(2147483647),
+          t_int64:        new NumberLong("9223372036854775807"),
+          t_decimal128:   new NumberDecimal("123456789.987654321"),
+          t_timestamp:    new Timestamp(1720094400, 1),
+          t_minkey:       MinKey(),
+          t_maxkey:       MaxKey(),
+          t_undefined_str:"N/A (undefined not supported in modern BSON)",
+          t_nested_array: [[1,2],[3,4],[5,null,7]],
+          t_empty_obj:    {},
+          t_empty_arr:    [],
+          t_long_string:  "x".repeat(1000),
+          t_unicode_keys: { "ключ1":"значение1", "键":"值", "مفتاح":"قيمة" }
+        });
+
+        // ── logs collection — mixed schema (schemaless) ────────────
+        const logLevels = ["DEBUG","INFO","WARN","ERROR","FATAL"];
+        const services = ["auth","api","payment","notification","search","cache","db","cdn"];
+        const logDocs = [];
+        for (let i = 1; i <= 300; i++) {
+          const level = logLevels[i%5];
+          const svc = services[i%8];
+          const doc = {
+            _id: new ObjectId(),
+            timestamp: new Date(Date.now()-i*60000),
+            level,
+            service: svc,
+            message: "[" + level + "] " + svc + ": Event number " + i + " processed successfully",
+            traceId: "trace-"+String(i*987654).padStart(12,"0"),
+            spanId:  "span-"+String(i*123456).padStart(10,"0"),
+            pid: 1000+i%1000,
+            host: "server-" + ((i%10)+1) + ".example.com",
+            version: "1." + Math.floor(i/100) + "." + (i%100)
+          };
+          if (level==="ERROR"||level==="FATAL") {
+            doc.error = { code:500+i%100, type:["TimeoutError","DatabaseError","NetworkError","ValidationError"][i%4], message:"Detailed error: "+i, stack:"Error: line "+i+"\n  at function"+i+"\n  at main" };
+          }
+          if (level==="DEBUG") {
+            doc.debug = { sql:"SELECT * FROM table WHERE id="+i, duration:i%500, rows:i%100, cached:i%2===0 };
+          }
+          if (svc==="payment") {
+            doc.payment = { amount:parseFloat((i*9.99).toFixed(2)), currency:"USD", status:["success","failure","pending"][i%3], provider:["stripe","paypal","braintree"][i%3] };
+          }
+          logDocs.push(doc);
+        }
+        mdb.logs.insertMany(logDocs);
+        mdb.logs.createIndex({ level: 1, service: 1, timestamp: -1 });
+        mdb.logs.createIndex({ traceId: 1 });
+        mdb.logs.createIndex({ timestamp: -1 }, { expireAfterSeconds: 2592000 });
+
+        // ── inventory collection — geospatial + arrays ─────────────
+        const warehouses = [];
+        const whCities = [["New York",-74.006,40.7128],["Berlin",13.405,52.52],["Tokyo",139.6917,35.6895],["London",-0.1276,51.5074],["Sydney",151.2093,-33.8688]];
+        for (let i = 0; i < 5; i++) {
+          const [city,lon,lat] = whCities[i];
+          warehouses.push({
+            _id: new ObjectId(),
+            warehouseId: "WH-"+String(i+1).padStart(3,"0"),
+            name: city+" Warehouse",
+            city, country: ["US","DE","JP","GB","AU"][i],
+            location: { type:"Point", coordinates:[lon,lat] },
+            capacity: 10000*(i+1),
+            zones: ["A","B","C","D"].map(z=>({ zone:z, rows:10*(i+1), capacity:2500*(i+1), used:Math.floor(Math.random()*2500*(i+1)) })),
+            items: Array.from({length:20},(_,j)=>({ sku:"SKU-"+String(j+1+i*20).padStart(5,"0"), qty:(j+1)*10+i*5, location:"WH-"+String(i+1).padStart(3,"0")+"-"+["A","B","C","D"][j%4]+"-"+Math.ceil((j+1)/4), lastStockCheck:new Date() })),
+            operatingHours: { mon:"09:00-18:00",tue:"09:00-18:00",wed:"09:00-18:00",thu:"09:00-18:00",fri:"09:00-17:00",sat:"10:00-14:00",sun:"closed" },
+            contact: { manager:"Manager "+i, phone:"+1-555-"+String(1000+i*111), email:"wh"+(i+1)+"@example.com" },
+            metadata: { createdAt:new Date(2020,i,1), updatedAt:new Date(), active:true }
+          });
+        }
+        mdb.inventory.insertMany(warehouses);
+        mdb.inventory.createIndex({ location: "2dsphere" });
+        mdb.inventory.createIndex({ warehouseId: 1 }, { unique: true });
+
+        // ── MongoDB views — read-only projections of seeded data ───
+        try { mdb.runCommand({ drop: "view_active_users" }); } catch (e) {}
+        try { mdb.runCommand({ drop: "view_top_products" }); } catch (e) {}
+
+        mdb.createCollection("view_active_users", {
+          viewOn: "users",
+          pipeline: [
+            { $$match: { status: "active" } },
+            { $$project: { _id: 1, userId: 1, name: 1, email: 1, city: "$$address.city", role: 1, plan: 1, score: 1, lastLogin: "$$stats.lastLogin" } },
+            { $$sort: { score: -1 } }
+          ]
+        });
+
+        mdb.createCollection("view_top_products", {
+          viewOn: "products",
+          pipeline: [
+            { $$match: { active: true, stock: { $$gt: 0 } } },
+            { $$project: { _id: 1, sku: 1, name: 1, category: 1, price: 1, rating: 1, reviewCount: 1, stock: 1 } },
+            { $$sort: { rating: -1, reviewCount: -1 } }
+          ]
+        });
+
+        print("MongoDB seed complete. Collections: users="+mdb.users.countDocuments()+", products="+mdb.products.countDocuments()+", orders="+mdb.orders.countDocuments()+", events="+mdb.events.countDocuments()+", bson_types="+mdb.bson_types.countDocuments()+", logs="+mdb.logs.countDocuments()+", inventory="+mdb.inventory.countDocuments()+", views="+[mdb.view_active_users.countDocuments(), mdb.view_top_products.countDocuments()].join(", ")); 
+
+  # ─────────────────────────────────────────────
+  # Redis 7
+  # ─────────────────────────────────────────────
+
+  redis:
+    image: redis:7-alpine
+    container_name: rapidb-redis
+    command: >
+      redis-server --requirepass redis_pass123 --appendonly yes --loglevel warning
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "redis_pass123", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  redis-seed:
+    image: redis:7-alpine
+    container_name: rapidb-redis-seed
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: on-failure
+    entrypoint: [ "/bin/sh", "-c" ]
+    command:
+      - |
+        set -eu
+        C="redis-cli -h redis -a redis_pass123 --no-auth-warning"
+        LONG_A="$$(printf '%01000d' 0 | tr '0' 'A')"
+
+        # ── STRING — all value types ──────────────────────────────
+        $$C SET "str:plain"            "Hello, World!"
+        $$C SET "str:integer"          "42"
+        $$C SET "str:float"            "3.14159265"
+        $$C SET "str:bool_true"        "true"
+        $$C SET "str:bool_false"       "false"
+        $$C SET "str:null_like"        "null"
+        $$C SET "str:empty"            ""
+        $$C SET "str:unicode"          "Привет мир! 你好世界 Arabic: مرحبا Emoji: 🔥💯😀"
+        $$C SET "str:json"             '{"name":"Alice","age":30,"active":true,"tags":["admin","beta"]}'
+        $$C SET "str:long"             "$$LONG_A"
+        $$C SET "str:binary_like"      "\x00\x01\x02\xDE\xAD\xBE\xEF"
+        $$C SET "str:special_chars"    "Line1\nLine2\tTab\"Quote\"'Single'"
+        $$C SET "str:url"              "https://example.com/path?key=value&other=test#anchor"
+        $$C SET "str:xml"              "<root><child id=\"1\">Text &amp; More</child></root>"
+        $$C SET "str:counter"          "0"
+        $$C INCR "str:counter"
+        $$C INCRBY "str:counter" 41
+        $$C INCRBYFLOAT "str:float_counter" 1.5
+        $$C INCRBYFLOAT "str:float_counter" 1.5
+
+        # String with TTL
+        $$C SET  "str:session:abc123" '{"userId":"user-0001","role":"admin","loginAt":"2024-07-04T12:00:00Z"}'
+        $$C EXPIRE "str:session:abc123" 3600
+        $$C SET  "str:session:def456" '{"userId":"user-0002","role":"editor","loginAt":"2024-07-04T11:00:00Z"}'
+        $$C EXPIRE "str:session:def456" 1800
+        $$C SET  "str:cache:product:SKU-00001" '{"sku":"SKU-00001","name":"Electronics Item 1","price":15.49,"stock":10}'
+        $$C EXPIRE "str:cache:product:SKU-00001" 300
+
+        # ── HASH — user profiles ──────────────────────────────────
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+          name=$$(echo "Alice Bob Carol Dave Eve Frank Grace Hank Ivy Jack" | cut -d' ' -f$$i)
+          balance_cents=$$((i*123456))
+          balance="$$(printf '%d.%02d' $$((balance_cents/100)) $$((balance_cents%100)))"
+          $$C HSET "hash:user:$$i" \
+            name     "$$name" \
+            email    "$$(printf '%s' "$$name" | tr '[:upper:]' '[:lower:]')@example.com" \
+            age      "$$((18+i*5))" \
+            role     "$$(echo 'admin editor viewer moderator superuser' | cut -d' ' -f$$((i%5+1)))" \
+            status   "$$(echo 'active inactive pending banned verified' | cut -d' ' -f$$((i%5+1)))" \
+            plan     "$$(echo 'free starter pro enterprise' | cut -d' ' -f$$((i%4+1)))" \
+            score    "$$((i*157))" \
+            balance  "$$balance" \
+            language "$$(echo 'en de fr ru ja ar zh ko es pt' | cut -d' ' -f$$i)" \
+            timezone "UTC" \
+            theme    "$$([ $$((i%2)) -eq 0 ] && echo dark || echo light)" \
+            city     "$$(echo 'Berlin Amsterdam Paris London Moscow Tokyo NewYork Sydney Dubai Singapore' | cut -d' ' -f$$i)" \
+            country  "$$(echo 'DE NL FR GB RU JP US AU AE SG' | cut -d' ' -f$$i)" \
+            login_count "$$((i*30))" \
+            created_at "2024-0$$((i%9+1))-01T00:00:00Z" \
+            is_verified "$$([ $$((i%3)) -ne 0 ] && echo true || echo false)"
+        done
+
+        # Product hashes
+        for i in 1 2 3 4 5; do
+          price_cents=$$((i*999))
+          price="$$(printf '%d.%02d' $$((price_cents/100)) $$((price_cents%100)))"
+          $$C HSET "hash:product:SKU-$$(printf '%05d' $$i)" \
+            sku       "SKU-$$(printf '%05d' $$i)" \
+            name      "Product $$i" \
+            category  "$$(echo 'Electronics Clothing Books Home Sports' | cut -d' ' -f$$i)" \
+            price     "$$price" \
+            stock     "$$((i*50))" \
+            active    "true" \
+            rating    "$$i.$$(($$i*2))" \
+            reviews   "$$((i*25))"
+        done
+
+        # Config hash
+        $$C HSET "hash:config:app" \
+          theme        dark \
+          language     en \
+          timezone     UTC \
+          currency     USD \
+          max_upload   "10485760" \
+          maintenance  false \
+          version      "2.5.1" \
+          debug        false \
+          log_level    INFO \
+          api_url      "https://api.example.com/v2"
+
+        # ── LIST — queues and logs ────────────────────────────────
+        # Task queue
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+          $$C RPUSH "list:queue:tasks" "{\"id\":\"task-$$i\",\"type\":\"$$(echo 'email sms push webhook batch report export import notify audit' | cut -d' ' -f$$i)\",\"priority\":$$((11-i)),\"payload\":{\"userId\":\"user-$$(printf '%04d' $$i)\"},\"createdAt\":\"2024-07-04T$$(printf '%02d' $$i):00:00Z\"}"
+        done
+
+        # Priority queue (simulate with separate lists)
+        $$C RPUSH "list:queue:high"   '{"id":"high-1","type":"payment","amount":999.99}' '{"id":"high-2","type":"alert","message":"System critical"}'
+        $$C RPUSH "list:queue:medium" '{"id":"med-1","type":"email","to":"user@example.com"}' '{"id":"med-2","type":"sms","to":"+1555000001"}'
+        $$C RPUSH "list:queue:low"    '{"id":"low-1","type":"report","name":"weekly"}' '{"id":"low-2","type":"export","format":"csv"}'
+
+        # Recent activity log (capped with LTRIM)
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+          $$C LPUSH "list:activity:recent" "{\"id\":\"act-$$i\",\"user\":\"user-$$(printf '%04d' $$i)\",\"action\":\"$$(echo 'login logout view_product add_to_cart purchase search update_profile delete_account download upload' | cut -d' ' -f$$((i%10+1)))\",\"ts\":\"2024-07-04T$$(printf '%02d' $$((i%24))):00:00Z\"}"
+        done
+        $$C LTRIM "list:activity:recent" 0 9   # keep only last 10
+
+        # Browser history style list
+        $$C RPUSH "list:history:user-0001" "/home" "/products" "/products/SKU-00001" "/cart" "/checkout" "/order/ORD-2024-000001"
+
+        # ── SET — unique collections ──────────────────────────────
+        # Online users
+        $$C SADD "set:online_users" "user-0001" "user-0003" "user-0007" "user-0012" "user-0025" "user-0050" "user-0099" "user-0150" "user-0178" "user-0200"
+        # Blocked IPs
+        $$C SADD "set:blocked_ips" "192.168.1.100" "10.0.0.50" "172.16.0.1" "1.2.3.4" "255.255.255.0"
+        # Feature flags (enabled features)
+        $$C SADD "set:features:enabled"  "dark_mode" "notifications" "beta_editor" "api_v2" "new_checkout"
+        $$C SADD "set:features:disabled" "ai_assistant" "crypto_payment" "video_call"
+        # Tags
+        $$C SADD "set:tags:popular"  "electronics" "sale" "new" "trending" "premium"
+        $$C SADD "set:tags:category" "electronics" "clothing" "books" "home" "sports" "toys" "food" "beauty" "garden" "tools"
+        # Set operations demo
+        $$C SADD "set:group:admin"   "user-0001" "user-0006"
+        $$C SADD "set:group:premium" "user-0001" "user-0003" "user-0006" "user-0012"
+        $$C SADD "set:group:verified" "user-0001" "user-0002" "user-0003" "user-0006" "user-0007" "user-0012"
+
+        # ── SORTED SET — leaderboards & priorities ────────────────
+        # Game leaderboard
+        $$C ZADD "zset:leaderboard:global" \
+          15000 "user-0001" 12500 "user-0006" 11000 "user-0003" \
+          9500  "user-0012" 8750  "user-0025" 7200  "user-0050" \
+          6100  "user-0099" 5400  "user-0150" 4300  "user-0178" \
+          3100  "user-0200"
+
+        # Time-based sorted set (Unix timestamp as score)
+        $$C ZADD "zset:events:timeline" \
+          1720000000 "evt:login:user-0001" \
+          1720003600 "evt:purchase:user-0003" \
+          1720007200 "evt:signup:user-0050" \
+          1720010800 "evt:logout:user-0001" \
+          1720014400 "evt:view:user-0012" \
+          1720018000 "evt:search:user-0025" \
+          1720021600 "evt:cart:user-0099"
+
+        # Rate limiting (requests per minute)
+        $$C ZADD "zset:ratelimit:api:user-0001" \
+          1720000001 "req-001" 1720000005 "req-002" 1720000010 "req-003" \
+          1720000015 "req-004" 1720000020 "req-005"
+
+        # Priority queue (score = priority)
+        $$C ZADD "zset:queue:priority" \
+          100 "task:critical:001" 90 "task:high:002" 80 "task:high:003" \
+          50  "task:medium:004" 50 "task:medium:005" 10 "task:low:006"
+
+        # Geographic distance sorted set (score = distance from origin in km)
+        $$C ZADD "zset:stores:nearby" \
+          0.5 "store:001:downtown" 1.2 "store:002:midtown" 2.8 "store:003:uptown" \
+          5.1 "store:004:suburb" 12.4 "store:005:outskirts"
+
+        # ── STREAM — event streaming ──────────────────────────────
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+          etype=$$(echo "user.login user.logout product.view order.created order.paid order.shipped order.delivered cart.add cart.remove search.query" | cut -d' ' -f$$i)
+          $$C XADD "stream:events" "*" \
+            type    "$$etype" \
+            userId  "user-$$(printf '%04d' $$i)" \
+            payload "{\"event\":\"$$etype\",\"seq\":$$i}" \
+            ts      "2024-07-04T$$(printf '%02d' $$i):00:00Z" \
+            version "1" \
+            source  "$$(echo 'web mobile api' | cut -d' ' -f$$((i%3+1)))"
+        done
+        # Create consumer group
+        $$C XGROUP CREATE "stream:events" "processors" "$$" MKSTREAM 2>/dev/null || true
+        $$C XGROUP CREATE "stream:events" "analytics"  "0" 2>/dev/null || true
+
+        # Order events stream
+        for i in 1 2 3 4 5; do
+          $$C XADD "stream:orders" "*" \
+            orderId "ORD-2024-$$(printf '%06d' $$i)" \
+            status  "$$(echo 'created paid shipped delivered cancelled' | cut -d' ' -f$$i)" \
+            amount  "$$(printf '%d.%02d' $$(((i*4999)/100)) $$(((i*4999)%100)))" \
+            userId  "user-$$(printf '%04d' $$i)"
+        done
+
+        # ── BITMAP ───────────────────────────────────────────────
+        # User activity bitmap: bit position = userId, 1 = active today
+        $$C SETBIT "bitmap:active:2024-07-04" 1  1
+        $$C SETBIT "bitmap:active:2024-07-04" 3  1
+        $$C SETBIT "bitmap:active:2024-07-04" 7  1
+        $$C SETBIT "bitmap:active:2024-07-04" 12 1
+        $$C SETBIT "bitmap:active:2024-07-04" 25 1
+        $$C SETBIT "bitmap:active:2024-07-04" 50 1
+        $$C SETBIT "bitmap:active:2024-07-04" 99 1
+        # Feature flags bitmap
+        $$C SETBIT "bitmap:feature:dark_mode"    1 1
+        $$C SETBIT "bitmap:feature:dark_mode"    3 1
+        $$C SETBIT "bitmap:feature:dark_mode"    7 1
+        $$C SETBIT "bitmap:feature:notifications" 1 1
+        $$C SETBIT "bitmap:feature:notifications" 3 1
+        $$C SETBIT "bitmap:feature:notifications" 12 1
+
+        # ── HYPERLOGLOG — cardinality estimation ──────────────────
+        $$C PFADD "hll:unique_visitors:2024-07-04" "user-0001" "user-0002" "user-0003" "user-0004" "user-0005" "anon-abc" "anon-def" "anon-xyz" "bot-001" "crawler-goog"
+        $$C PFADD "hll:unique_ips:2024-07-04"      "192.168.1.1" "10.0.0.1" "172.16.0.1" "8.8.8.8" "1.1.1.1"
+        $$C PFADD "hll:unique_visitors:2024-07-03" "user-0001" "user-0010" "user-0020" "anon-111" "anon-222"
+
+        # ── GEO — geospatial ──────────────────────────────────────
+        $$C GEOADD "geo:stores" \
+          -73.9857  40.7484  "store:NYC" \
+          13.4050   52.5200  "store:BER" \
+          139.6917  35.6895  "store:TYO" \
+          -0.1276   51.5074  "store:LON" \
+          151.2093 -33.8688  "store:SYD" \
+          37.6173   55.7558  "store:MSK" \
+          2.3522    48.8566  "store:PAR" \
+          121.4737  31.2304  "store:SHA" \
+          -43.1729 -22.9068  "store:RIO" \
+          77.2090   28.6139  "store:DEL"
+        $$C GEOADD "geo:warehouses" \
+          -74.006  40.7128 "wh:NY" \
+          13.405   52.520  "wh:BE" \
+          139.692  35.690  "wh:TK" \
+          -0.128   51.507  "wh:LN" \
+          151.209 -33.869  "wh:SY"
+
+        # ── Summary info ─────────────────────────────────────────
+        echo "Redis seed complete."
+        $$C INFO keyspace
+        echo "Redis key count: $$($$C DBSIZE)"
+
+  # ─────────────────────────────────────────────
+  # Elasticsearch 8.13
+  # ─────────────────────────────────────────────
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    container_name: rapidb-es
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - xpack.security.transport.ssl.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'" ]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  elasticsearch-seed:
+    image: curlimages/curl:latest
+    container_name: rapidb-es-seed
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: on-failure
+    entrypoint: [ "/bin/sh", "-c" ]
+    command:
+      - |
+        B="http://elasticsearch:9200"
+        H="-H Content-Type:application/json"
+
+        # ── users index — full mapping with all field types ────────
+        curl -sf -X PUT "$$B/users" $$H -d '{
+          "settings": { "number_of_shards":1,"number_of_replicas":0,"analysis":{"analyzer":{"email_analyzer":{"type":"custom","tokenizer":"uax_url_email","filter":["lowercase"]},"autocomplete":{"type":"custom","tokenizer":"standard","filter":["lowercase","autocomplete_filter"]}}},"analysis":{"filter":{"autocomplete_filter":{"type":"edge_ngram","min_gram":2,"max_gram":20}}} },
+          "mappings": { "properties": {
+            "userId":    {"type":"keyword"},
+            "name":      {"type":"text","fields":{"keyword":{"type":"keyword"},"autocomplete":{"type":"text","analyzer":"standard"}}},
+            "email":     {"type":"keyword"},
+            "age":       {"type":"integer"},
+            "birthDate": {"type":"date"},
+            "score":     {"type":"long"},
+            "balance":   {"type":"double"},
+            "role":      {"type":"keyword"},
+            "status":    {"type":"keyword"},
+            "plan":      {"type":"keyword"},
+            "tags":      {"type":"keyword"},
+            "isVerified":{"type":"boolean"},
+            "address":   {"properties":{"city":{"type":"keyword"},"country":{"type":"keyword"},"zip":{"type":"keyword"},"street":{"type":"text"},"location":{"type":"geo_point"}}},
+            "preferences":{"properties":{"language":{"type":"keyword"},"timezone":{"type":"keyword"},"theme":{"type":"keyword"}}},
+            "stats":     {"properties":{"loginCount":{"type":"integer"},"lastLogin":{"type":"date"},"sessionDuration":{"type":"integer"},"pageViews":{"type":"long"},"purchases":{"type":"integer"}}},
+            "bio":       {"type":"text","analyzer":"standard"},
+            "joinedAt":  {"type":"date"},
+            "updatedAt": {"type":"date"}
+          }}
+        }' && echo "users index created"
+
+        # Bulk index users
+        curl -sf -X POST "$$B/users/_bulk" $$H -d '
+        {"index":{"_id":"user-0001"}}
+        {"userId":"user-0001","name":"Alice Smith","email":"alice@example.com","age":30,"birthDate":"1994-03-15","score":9500,"balance":15234.56,"role":"admin","status":"active","plan":"enterprise","tags":["admin","beta","premium"],"isVerified":true,"address":{"city":"Berlin","country":"DE","zip":"10115","street":"1 Main St","location":{"lat":52.52,"lon":13.405}},"preferences":{"language":"en","timezone":"Europe/Berlin","theme":"dark"},"stats":{"loginCount":450,"lastLogin":"2024-07-04T10:00:00Z","sessionDuration":3600,"pageViews":22500,"purchases":50},"bio":"Senior administrator managing platform operations and user experience.","joinedAt":"2020-01-15T00:00:00Z","updatedAt":"2024-07-04T00:00:00Z"}
+        {"index":{"_id":"user-0002"}}
+        {"userId":"user-0002","name":"Bob Jones","email":"bob@example.com","age":25,"birthDate":"1999-07-20","score":3200,"balance":2100.00,"role":"viewer","status":"active","plan":"free","tags":["user","standard"],"isVerified":false,"address":{"city":"Amsterdam","country":"NL","zip":"1012","street":"2 Oak Ave","location":{"lat":52.3676,"lon":4.9041}},"preferences":{"language":"nl","timezone":"Europe/Amsterdam","theme":"light"},"stats":{"loginCount":30,"lastLogin":"2024-07-03T20:00:00Z","sessionDuration":900,"pageViews":1500,"purchases":2},"bio":"Junior developer exploring the platform features.","joinedAt":"2023-06-01T00:00:00Z","updatedAt":"2024-07-03T00:00:00Z"}
+        {"index":{"_id":"user-0003"}}
+        {"userId":"user-0003","name":"Carol Brown","email":"carol@example.com","age":35,"birthDate":"1989-11-05","score":7100,"balance":8750.25,"role":"editor","status":"verified","plan":"pro","tags":["editor","beta","verified"],"isVerified":true,"address":{"city":"Paris","country":"FR","zip":"75001","street":"3 Pine Rd","location":{"lat":48.8566,"lon":2.3522}},"preferences":{"language":"fr","timezone":"Europe/Paris","theme":"dark"},"stats":{"loginCount":280,"lastLogin":"2024-07-04T08:30:00Z","sessionDuration":2700,"pageViews":14000,"purchases":25},"bio":"Content editor specialising in technical documentation and UX copy.","joinedAt":"2021-03-20T00:00:00Z","updatedAt":"2024-07-04T00:00:00Z"}
+        {"index":{"_id":"user-0004"}}
+        {"userId":"user-0004","name":"Dave Taylor","email":"dave@example.com","age":42,"birthDate":"1982-05-30","score":1200,"balance":500.00,"role":"viewer","status":"inactive","plan":"starter","tags":["user","standard"],"isVerified":false,"address":{"city":"London","country":"GB","zip":"SW1A","street":"4 Elm Dr","location":{"lat":51.5074,"lon":-0.1278}},"preferences":{"language":"en","timezone":"Europe/London","theme":"light"},"stats":{"loginCount":15,"lastLogin":"2024-01-10T15:00:00Z","sessionDuration":300,"pageViews":750,"purchases":1},"bio":"Occasional user interested in product updates.","joinedAt":"2022-09-01T00:00:00Z","updatedAt":"2024-01-10T00:00:00Z"}
+        {"index":{"_id":"user-0005"}}
+        {"userId":"user-0005","name":"Eve Wilson","email":"eve@example.com","age":28,"birthDate":"1996-02-14","score":5500,"balance":6300.75,"role":"moderator","status":"active","plan":"pro","tags":["moderator","premium","verified"],"isVerified":true,"address":{"city":"Moscow","country":"RU","zip":"101000","street":"5 Maple Blvd","location":{"lat":55.7558,"lon":37.6173}},"preferences":{"language":"ru","timezone":"Europe/Moscow","theme":"dark"},"stats":{"loginCount":190,"lastLogin":"2024-07-04T12:00:00Z","sessionDuration":5400,"pageViews":9500,"purchases":18},"bio":"Сообщество-менеджер и модератор контента на платформе.","joinedAt":"2021-11-15T00:00:00Z","updatedAt":"2024-07-04T00:00:00Z"}
+        ' && echo "users bulk indexed"
+
+        # ── products index — e-commerce ────────────────────────────
+        curl -sf -X PUT "$$B/products" $$H -d '{
+          "settings":{"number_of_shards":1,"number_of_replicas":0},
+          "mappings":{"properties":{
+            "sku":          {"type":"keyword"},
+            "name":         {"type":"text","fields":{"keyword":{"type":"keyword"}}},
+            "description":  {"type":"text","analyzer":"standard"},
+            "category":     {"type":"keyword"},
+            "brand":        {"type":"keyword"},
+            "price":        {"type":"float"},
+            "compareAtPrice":{"type":"float"},
+            "stock":        {"type":"integer"},
+            "active":       {"type":"boolean"},
+            "featured":     {"type":"boolean"},
+            "rating":       {"type":"half_float"},
+            "reviewCount":  {"type":"integer"},
+            "tags":         {"type":"keyword"},
+            "attributes":   {"properties":{"color":{"type":"keyword"},"size":{"type":"keyword"},"weight":{"type":"float"},"material":{"type":"keyword"}}},
+            "location":     {"type":"geo_point"},
+            "priceRange":   {"type":"integer_range"},
+            "saleWindow":   {"type":"date_range"},
+            "metadata":     {"properties":{"createdAt":{"type":"date"},"updatedAt":{"type":"date"},"views":{"type":"long"},"sales":{"type":"integer"}}},
+            "embedding":    {"type":"dense_vector","dims":4,"index":true,"similarity":"cosine"}
+          }}
+        }' && echo "products index created"
+
+        curl -sf -X POST "$$B/products/_bulk" $$H -d '
+        {"index":{"_id":"SKU-00001"}}
+        {"sku":"SKU-00001","name":"Wireless Noise-Cancelling Headphones","description":"Premium over-ear headphones with active noise cancellation, 30h battery, and foldable design. Compatible with all Bluetooth 5.0 devices.","category":"Electronics","brand":"BrandA","price":149.99,"compareAtPrice":199.99,"stock":250,"active":true,"featured":true,"rating":4.7,"reviewCount":1250,"tags":["electronics","headphones","wireless","sale","featured"],"attributes":{"color":"black","size":"universal","weight":0.29,"material":"plastic"},"location":{"lat":40.7128,"lon":-74.006},"priceRange":{"gte":100,"lte":200},"saleWindow":{"gte":"2024-07-01","lte":"2024-07-31"},"metadata":{"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-07-04T00:00:00Z","views":52000,"sales":3200},"embedding":[0.1,0.9,0.3,0.7]}
+        {"index":{"_id":"SKU-00002"}}
+        {"sku":"SKU-00002","name":"Organic Cotton T-Shirt","description":"100% organic cotton, pre-shrunk, available in 6 colours. Ethically sourced and manufactured.","category":"Clothing","brand":"BrandB","price":29.99,"compareAtPrice":39.99,"stock":500,"active":true,"featured":false,"rating":4.2,"reviewCount":380,"tags":["clothing","cotton","organic","sustainable"],"attributes":{"color":"white","size":"M","weight":0.18,"material":"cotton"},"location":{"lat":52.52,"lon":13.405},"priceRange":{"gte":20,"lte":50},"saleWindow":{"gte":"2024-06-01","lte":"2024-08-31"},"metadata":{"createdAt":"2024-02-01T00:00:00Z","updatedAt":"2024-07-04T00:00:00Z","views":18000,"sales":950},"embedding":[0.5,0.2,0.8,0.4]}
+        {"index":{"_id":"SKU-00003"}}
+        {"sku":"SKU-00003","name":"Advanced SQL Patterns Book","description":"Comprehensive guide to advanced SQL query patterns, indexing strategies, and performance tuning for PostgreSQL, MySQL, and MSSQL.","category":"Books","brand":"BrandC","price":49.99,"compareAtPrice":59.99,"stock":120,"active":true,"featured":true,"rating":4.9,"reviewCount":210,"tags":["books","sql","database","programming","bestseller"],"attributes":{"color":"blue","size":"paperback","weight":0.52,"material":"paper"},"location":{"lat":35.6895,"lon":139.6917},"priceRange":{"gte":40,"lte":60},"saleWindow":{"gte":"2024-07-01","lte":"2024-12-31"},"metadata":{"createdAt":"2024-03-01T00:00:00Z","updatedAt":"2024-07-04T00:00:00Z","views":9500,"sales":420},"embedding":[0.8,0.6,0.2,0.1]}
+        {"index":{"_id":"SKU-00004"}}
+        {"sku":"SKU-00004","name":"Smart Home Hub","description":"Central smart home controller supporting Zigbee, Z-Wave, WiFi, and Bluetooth. Compatible with 2000+ devices and all major voice assistants.","category":"Electronics","brand":"BrandD","price":89.99,"compareAtPrice":129.99,"stock":0,"active":false,"featured":false,"rating":3.8,"reviewCount":95,"tags":["electronics","smarthome","iot","hub"],"attributes":{"color":"white","size":"compact","weight":0.35,"material":"plastic"},"location":{"lat":51.5074,"lon":-0.1278},"priceRange":{"gte":80,"lte":130},"saleWindow":{"gte":"2024-08-01","lte":"2024-09-30"},"metadata":{"createdAt":"2024-04-01T00:00:00Z","updatedAt":"2024-07-04T00:00:00Z","views":6200,"sales":85},"embedding":[0.3,0.7,0.9,0.5]}
+        {"index":{"_id":"SKU-00005"}}
+        {"sku":"SKU-00005","name":"Yoga Mat Premium","description":"6mm thick non-slip yoga mat with alignment lines. Eco-friendly TPE material. Comes with carry strap.","category":"Sports","brand":"BrandE","price":39.99,"compareAtPrice":54.99,"stock":300,"active":true,"featured":false,"rating":4.5,"reviewCount":620,"tags":["sports","yoga","fitness","eco","new"],"attributes":{"color":"purple","size":"183x61cm","weight":1.0,"material":"tpe"},"location":{"lat":48.8566,"lon":2.3522},"priceRange":{"gte":30,"lte":60},"saleWindow":{"gte":"2024-07-15","lte":"2024-08-15"},"metadata":{"createdAt":"2024-05-01T00:00:00Z","updatedAt":"2024-07-04T00:00:00Z","views":28000,"sales":1800},"embedding":[0.6,0.4,0.5,0.9]}
+        ' && echo "products bulk indexed"
+
+        # ── logs index — all ES field types ───────────────────────
+        curl -sf -X PUT "$$B/app_logs" $$H -d '{
+          "settings":{"number_of_shards":1,"number_of_replicas":0},
+          "mappings":{"properties":{
+            "timestamp":    {"type":"date"},
+            "level":        {"type":"keyword"},
+            "service":      {"type":"keyword"},
+            "message":      {"type":"text","fields":{"keyword":{"type":"keyword"}}},
+            "traceId":      {"type":"keyword"},
+            "spanId":       {"type":"keyword"},
+            "duration_ms":  {"type":"integer"},
+            "status_code":  {"type":"short"},
+            "request_size": {"type":"long"},
+            "response_size":{"type":"long"},
+            "success":      {"type":"boolean"},
+            "error":        {"properties":{"code":{"type":"integer"},"type":{"type":"keyword"},"message":{"type":"text"}}},
+            "tags":         {"type":"keyword"},
+            "host":         {"type":"keyword"},
+            "ip":           {"type":"ip"},
+            "geo":          {"type":"geo_point"},
+            "metadata":     {"type":"object","enabled":false},
+            "ttl":          {"type":"date"}
+          }}
+        }' && echo "app_logs index created"
+
+        curl -sf -X POST "$$B/app_logs/_bulk" $$H -d '
+        {"index":{}}
+        {"timestamp":"2024-07-04T12:00:00Z","level":"INFO","service":"auth","message":"User user-0001 logged in successfully","traceId":"trace-001","spanId":"span-001","duration_ms":45,"status_code":200,"request_size":512,"response_size":1024,"success":true,"tags":["auth","login","success"],"host":"server-1.example.com","ip":"192.168.1.100","geo":{"lat":52.52,"lon":13.405}}
+        {"index":{}}
+        {"timestamp":"2024-07-04T12:01:00Z","level":"ERROR","service":"payment","message":"Payment processing failed: timeout after 30s","traceId":"trace-002","spanId":"span-002","duration_ms":30000,"status_code":504,"request_size":2048,"response_size":256,"success":false,"error":{"code":504,"type":"TimeoutError","message":"Payment gateway did not respond within 30 seconds"},"tags":["payment","error","timeout"],"host":"server-2.example.com","ip":"10.0.0.50","geo":{"lat":40.7128,"lon":-74.006}}
+        {"index":{}}
+        {"timestamp":"2024-07-04T12:02:00Z","level":"WARN","service":"api","message":"Rate limit approaching for user-0001: 90/100 requests","traceId":"trace-003","spanId":"span-003","duration_ms":12,"status_code":200,"request_size":256,"response_size":512,"success":true,"tags":["api","ratelimit","warn"],"host":"server-1.example.com","ip":"192.168.1.100","geo":{"lat":52.52,"lon":13.405}}
+        {"index":{}}
+        {"timestamp":"2024-07-04T12:03:00Z","level":"DEBUG","service":"search","message":"Full-text search executed: query=headphones, results=42, took=8ms","traceId":"trace-004","spanId":"span-004","duration_ms":8,"status_code":200,"request_size":128,"response_size":8192,"success":true,"tags":["search","debug","fulltext"],"host":"server-3.example.com","ip":"172.16.0.1","geo":{"lat":35.6895,"lon":139.6917}}
+        {"index":{}}
+        {"timestamp":"2024-07-04T12:04:00Z","level":"FATAL","service":"db","message":"Database connection pool exhausted — all 100 connections in use","traceId":"trace-005","spanId":"span-005","duration_ms":0,"status_code":503,"request_size":0,"response_size":128,"success":false,"error":{"code":503,"type":"ConnectionPoolExhausted","message":"Cannot acquire connection from pool: all 100 connections are active"},"tags":["db","fatal","connection","alert"],"host":"server-4.example.com","ip":"10.10.10.10","geo":{"lat":48.8566,"lon":2.3522}}
+        {"index":{}}
+        {"timestamp":"2024-07-04T12:05:00Z","level":"INFO","service":"notification","message":"Email batch sent: 500 emails delivered in 12.3s","traceId":"trace-006","spanId":"span-006","duration_ms":12300,"status_code":200,"request_size":102400,"response_size":1024,"success":true,"tags":["notification","email","batch"],"host":"server-5.example.com","ip":"192.168.2.1","geo":{"lat":55.7558,"lon":37.6173}}
+        ' && echo "app_logs bulk indexed"
+
+        # ── metrics index — numeric/time-series all types ──────────
+        curl -sf -X PUT "$$B/metrics" $$H -d '{
+          "settings":{"number_of_shards":1,"number_of_replicas":0},
+          "mappings":{"properties":{
+            "timestamp":      {"type":"date"},
+            "service":        {"type":"keyword"},
+            "host":           {"type":"keyword"},
+            "metric":         {"type":"keyword"},
+            "value_int":      {"type":"integer"},
+            "value_long":     {"type":"long"},
+            "value_float":    {"type":"float"},
+            "value_double":   {"type":"double"},
+            "value_half":     {"type":"half_float"},
+            "value_byte":     {"type":"byte"},
+            "value_short":    {"type":"short"},
+            "value_unsigned": {"type":"unsigned_long"},
+            "value_scaled":   {"type":"scaled_float","scaling_factor":100},
+            "tags":           {"type":"keyword"},
+            "percentiles":    {"type":"double"},
+            "histogram":      {"type":"histogram"}
+          }}
+        }' && echo "metrics index created"
+
+        curl -sf -X POST "$$B/metrics/_bulk" $$H -d '
+        {"index":{}}
+        {"timestamp":"2024-07-04T12:00:00Z","service":"api","host":"server-1","metric":"cpu_usage","value_int":72,"value_long":72000,"value_float":72.45,"value_double":72.4512345678,"value_half":72.5,"value_byte":72,"value_short":724,"value_unsigned":7245,"value_scaled":72.45,"tags":["cpu","performance"],"percentiles":72.45}
+        {"index":{}}
+        {"timestamp":"2024-07-04T12:00:00Z","service":"api","host":"server-1","metric":"memory_bytes","value_int":4096,"value_long":4294967296,"value_float":4096.5,"value_double":4294967296.123,"value_half":4096.0,"value_byte":127,"value_short":32767,"value_unsigned":4294967295,"value_scaled":4096.12,"tags":["memory","performance"]}
+        {"index":{}}
+        {"timestamp":"2024-07-04T12:00:00Z","service":"db","host":"server-4","metric":"query_duration_ms","value_int":8,"value_long":8500,"value_float":8.423,"value_double":8.42312345,"value_half":8.5,"value_byte":8,"value_short":84,"value_unsigned":8423,"value_scaled":8.42,"tags":["db","query","latency"]}
+        {"index":{}}
+        {"timestamp":"2024-07-04T12:00:00Z","service":"cache","host":"server-3","metric":"hit_rate","value_int":95,"value_long":9500,"value_float":0.9512,"value_double":0.951234567890,"value_half":0.95,"value_byte":95,"value_short":951,"value_unsigned":9512,"value_scaled":0.95,"tags":["cache","redis","performance"]}
+        ' && echo "metrics bulk indexed"
+
+        # ── geo_index — all geo types ──────────────────────────────
+        curl -sf -X PUT "$$B/geo_locations" $$H -d '{
+          "settings":{"number_of_shards":1,"number_of_replicas":0},
+          "mappings":{"properties":{
+            "name":         {"type":"keyword"},
+            "type":         {"type":"keyword"},
+            "point":        {"type":"geo_point"},
+            "shape":        {"type":"geo_shape"},
+            "distance_km":  {"type":"float"},
+            "tags":         {"type":"keyword"}
+          }}
+        }' && echo "geo_locations index created"
+
+        curl -sf -X POST "$$B/geo_locations/_bulk" $$H -d '
+        {"index":{"_id":"nyc"}}
+        {"name":"New York City","type":"city","point":{"lat":40.7128,"lon":-74.006},"shape":{"type":"Point","coordinates":[-74.006,40.7128]},"distance_km":0,"tags":["city","us","americas"]}
+        {"index":{"_id":"berlin"}}
+        {"name":"Berlin","type":"city","point":{"lat":52.52,"lon":13.405},"shape":{"type":"Point","coordinates":[13.405,52.52]},"distance_km":6390,"tags":["city","de","europe"]}
+        {"index":{"_id":"central-park"}}
+        {"name":"Central Park","type":"park","point":{"lat":40.7851,"lon":-73.9683},"shape":{"type":"Polygon","coordinates":[[[-73.973,40.764],[-73.982,40.800],[-73.958,40.800],[-73.949,40.796],[-73.973,40.764]]]},"distance_km":5,"tags":["park","landmark","us"]}
+        {"index":{"_id":"route66"}}
+        {"name":"Route 66 segment","type":"road","point":{"lat":35.4676,"lon":-97.5164},"shape":{"type":"LineString","coordinates":[[-87.63,41.85],[-93.09,44.97],[-104.98,39.74],[-112.07,33.45]]},"distance_km":3940,"tags":["road","landmark","historic","us"]}
+        ' && echo "geo_locations bulk indexed"
+
+        # ── Flush and verify ───────────────────────────────────────
+        curl -sf -X POST "$$B/_all/_refresh" > /dev/null
+        echo "Elasticsearch seed complete:"
+        curl -sf "$$B/_cat/indices?v"
+
+  # ─────────────────────────────────────────────
+  # DynamoDB Local
+  # ─────────────────────────────────────────────
+
+  dynamodb:
+    image: amazon/dynamodb-local:2.5.4
+    platform: linux/amd64
+    container_name: rapidb-dynamodb
+    command: [ "-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory" ]
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: [ "CMD-SHELL", "grep -aq DynamoDBLocal /proc/1/cmdline" ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  dynamodb-seed:
+    image: amazon/aws-cli:latest
+    container_name: rapidb-dynamodb-seed
+    depends_on:
+      dynamodb:
+        condition: service_healthy
+    restart: on-failure
+    environment:
+      AWS_ACCESS_KEY_ID: dummy
+      AWS_SECRET_ACCESS_KEY: dummy
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: [ "/bin/sh", "-c" ]
+    command:
+      - |
+        set -eu
+        ddb() { command aws --cli-connect-timeout 10 --cli-read-timeout 300 --no-cli-pager --endpoint-url http://dynamodb:8000 dynamodb "$@"; }
+
+        table_exists() {
+          ddb describe-table --table-name "$1" >/dev/null 2>&1
+        }
+
+        wait_for_table() {
+          ddb wait table-exists --table-name "$1"
+        }
+
+        delete_table_if_exists() {
+          table="$1"
+          if table_exists "$$table"; then
+            echo "Deleting existing DynamoDB table: $$table"
+            ddb delete-table --table-name "$$table" >/dev/null
+            tries=0
+            while table_exists "$$table"; do
+              tries=$$((tries+1))
+              if [ $$tries -ge 60 ]; then
+                echo "Timed out waiting for DynamoDB table deletion: $$table"
+                exit 1
+              fi
+              sleep 1
+            done
+          fi
+        }
+
+        echo "Waiting for DynamoDB endpoint..."
+        tries=0
+        until ddb list-tables >/dev/null 2>&1; do
+          tries=$$((tries+1))
+          if [ $$tries -ge 60 ]; then
+            echo "DynamoDB endpoint did not become ready in time"
+            exit 1
+          fi
+          echo "DynamoDB not ready yet ($$tries/60)"
+          sleep 2
+        done
+
+        for table in Users Products Orders Sessions ConfigStore; do
+          delete_table_if_exists "$$table"
+        done
+
+        # ── Users table — hash key + GSI on email ─────────────────
+        ddb create-table \
+          --table-name Users \
+          --attribute-definitions \
+            AttributeName=userId,AttributeType=S \
+            AttributeName=email,AttributeType=S \
+            AttributeName=role,AttributeType=S \
+            AttributeName=score,AttributeType=N \
+          --key-schema AttributeName=userId,KeyType=HASH \
+          --global-secondary-indexes '[
+            {"IndexName":"email-index","KeySchema":[{"AttributeName":"email","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}},
+            {"IndexName":"role-score-index","KeySchema":[{"AttributeName":"role","KeyType":"HASH"},{"AttributeName":"score","KeyType":"RANGE"}],"Projection":{"ProjectionType":"INCLUDE","NonKeyAttributes":["userId","name","email","status","plan"]},"ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}
+          ]' \
+          --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5
+        wait_for_table Users
+
+        # ── Products table — hash + sort key + LSI + GSI ──────────
+        ddb create-table \
+          --table-name Products \
+          --attribute-definitions \
+            AttributeName=category,AttributeType=S \
+            AttributeName=sku,AttributeType=S \
+            AttributeName=price,AttributeType=N \
+            AttributeName=rating,AttributeType=N \
+          --key-schema \
+            AttributeName=category,KeyType=HASH \
+            AttributeName=sku,KeyType=RANGE \
+          --local-secondary-indexes '[
+            {"IndexName":"category-price-index","KeySchema":[{"AttributeName":"category","KeyType":"HASH"},{"AttributeName":"price","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}},
+            {"IndexName":"category-rating-index","KeySchema":[{"AttributeName":"category","KeyType":"HASH"},{"AttributeName":"rating","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}}
+          ]' \
+          --global-secondary-indexes '[
+            {"IndexName":"sku-index","KeySchema":[{"AttributeName":"sku","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}
+          ]' \
+          --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5
+        wait_for_table Products
+
+        # ── Orders table — hash + sort key (composite) ─────────────
+        ddb create-table \
+          --table-name Orders \
+          --attribute-definitions \
+            AttributeName=customerId,AttributeType=S \
+            AttributeName=orderId,AttributeType=S \
+            AttributeName=status,AttributeType=S \
+            AttributeName=createdAt,AttributeType=S \
+          --key-schema \
+            AttributeName=customerId,KeyType=HASH \
+            AttributeName=orderId,KeyType=RANGE \
+          --global-secondary-indexes '[
+            {"IndexName":"status-date-index","KeySchema":[{"AttributeName":"status","KeyType":"HASH"},{"AttributeName":"createdAt","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"},"ProvisionedThroughput":{"ReadCapacityUnits":5,"WriteCapacityUnits":5}}
+          ]' \
+          --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5
+        wait_for_table Orders
+
+        # ── Sessions table — with TTL ──────────────────────────────
+        ddb create-table \
+          --table-name Sessions \
+          --attribute-definitions AttributeName=sessionId,AttributeType=S \
+          --key-schema AttributeName=sessionId,KeyType=HASH \
+          --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5
+        wait_for_table Sessions
+        ddb update-time-to-live \
+          --table-name Sessions \
+          --time-to-live-specification Enabled=true,AttributeName=expiresAt
+
+        # ── ConfigStore table — key/value store pattern ────────────
+        ddb create-table \
+          --table-name ConfigStore \
+          --attribute-definitions \
+            AttributeName=namespace,AttributeType=S \
+            AttributeName=key,AttributeType=S \
+          --key-schema \
+            AttributeName=namespace,KeyType=HASH \
+            AttributeName=key,KeyType=RANGE \
+          --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5
+        wait_for_table ConfigStore
+
+        # ── Seed Users — all DynamoDB attribute types ──────────────
+        ddb put-item --table-name Users --item \
+          '{"userId":{"S":"user-0001"},"email":{"S":"alice@example.com"},"name":{"S":"Alice Smith"},"age":{"N":"30"},"score":{"N":"9500"},"balance":{"N":"15234.56"},"role":{"S":"admin"},"status":{"S":"active"},"plan":{"S":"enterprise"},"isVerified":{"BOOL":true},"tags":{"L":[{"S":"admin"},{"S":"beta"},{"S":"premium"}]},"address":{"M":{"city":{"S":"Berlin"},"country":{"S":"DE"},"zip":{"S":"10115"},"lat":{"N":"52.52"},"lon":{"N":"13.405"}}},"preferences":{"M":{"language":{"S":"en"},"theme":{"S":"dark"},"timezone":{"S":"Europe/Berlin"}}},"stats":{"M":{"loginCount":{"N":"450"},"pageViews":{"N":"22500"},"purchases":{"N":"50"}}},"rawData":{"B":"AQIDBAUGB/8="},"nullField":{"NULL":true},"joinedAt":{"S":"2020-01-15T00:00:00Z"},"updatedAt":{"S":"2024-07-04T00:00:00Z"}}'
+
+        ddb put-item --table-name Users --item \
+          '{"userId":{"S":"user-0002"},"email":{"S":"bob@example.com"},"name":{"S":"Bob Jones"},"age":{"N":"25"},"score":{"N":"3200"},"balance":{"N":"2100.00"},"role":{"S":"viewer"},"status":{"S":"active"},"plan":{"S":"free"},"isVerified":{"BOOL":false},"tags":{"L":[{"S":"user"},{"S":"standard"}]},"address":{"M":{"city":{"S":"Amsterdam"},"country":{"S":"NL"},"zip":{"S":"1012"},"lat":{"N":"52.37"},"lon":{"N":"4.90"}}},"preferences":{"M":{"language":{"S":"nl"},"theme":{"S":"light"},"timezone":{"S":"Europe/Amsterdam"}}},"stats":{"M":{"loginCount":{"N":"30"},"pageViews":{"N":"1500"},"purchases":{"N":"2"}}},"nullField":{"NULL":true},"joinedAt":{"S":"2023-06-01T00:00:00Z"},"updatedAt":{"S":"2024-07-03T00:00:00Z"}}'
+
+        ddb put-item --table-name Users --item \
+          '{"userId":{"S":"user-0003"},"email":{"S":"carol@example.com"},"name":{"S":"Carol Brown"},"age":{"N":"35"},"score":{"N":"7100"},"balance":{"N":"8750.25"},"role":{"S":"editor"},"status":{"S":"verified"},"plan":{"S":"pro"},"isVerified":{"BOOL":true},"tags":{"L":[{"S":"editor"},{"S":"beta"},{"S":"verified"}]},"address":{"M":{"city":{"S":"Paris"},"country":{"S":"FR"},"zip":{"S":"75001"},"lat":{"N":"48.8566"},"lon":{"N":"2.3522"}}},"preferences":{"M":{"language":{"S":"fr"},"theme":{"S":"dark"},"timezone":{"S":"Europe/Paris"}}},"stats":{"M":{"loginCount":{"N":"280"},"pageViews":{"N":"14000"},"purchases":{"N":"25"}}},"joinedAt":{"S":"2021-03-20T00:00:00Z"},"updatedAt":{"S":"2024-07-04T00:00:00Z"}}'
+
+        ddb put-item --table-name Users --item \
+          '{"userId":{"S":"user-0004"},"email":{"S":"dave@example.com"},"name":{"S":"Dave Taylor"},"age":{"N":"42"},"score":{"N":"1200"},"balance":{"N":"500.00"},"role":{"S":"viewer"},"status":{"S":"inactive"},"plan":{"S":"starter"},"isVerified":{"BOOL":false},"tags":{"L":[{"S":"user"},{"S":"standard"}]},"address":{"M":{"city":{"S":"London"},"country":{"S":"GB"},"zip":{"S":"SW1A"}}},"nullField":{"NULL":true},"emptyMap":{"M":{}},"emptyList":{"L":[]},"joinedAt":{"S":"2022-09-01T00:00:00Z"}}'
+
+        ddb put-item --table-name Users --item \
+          '{"userId":{"S":"user-0005"},"email":{"S":"eve@example.com"},"name":{"S":"Eve Wilson"},"age":{"N":"28"},"score":{"N":"5500"},"balance":{"N":"6300.75"},"role":{"S":"moderator"},"status":{"S":"active"},"plan":{"S":"pro"},"isVerified":{"BOOL":true},"tags":{"L":[{"S":"moderator"},{"S":"premium"}]},"address":{"M":{"city":{"S":"Moscow"},"country":{"S":"RU"},"lat":{"N":"55.7558"},"lon":{"N":"37.6173"}}},"nestedDeep":{"M":{"level1":{"M":{"level2":{"M":{"level3":{"S":"deep value"},"num":{"N":"42"}}}}}}},"joinedAt":{"S":"2021-11-15T00:00:00Z"}}'
+
+        # Number set, String set, Binary set items
+        ddb put-item --table-name Users --item \
+          '{"userId":{"S":"user-0006"},"email":{"S":"frank@example.com"},"name":{"S":"Frank Davis"},"age":{"N":"38"},"score":{"N":"4400"},"role":{"S":"admin"},"status":{"S":"active"},"plan":{"S":"enterprise"},"isVerified":{"BOOL":true},"numberSet":{"NS":["1","2","3","4","5"]},"stringSet":{"SS":["tag1","tag2","tag3","premium","featured"]},"binarySet":{"BS":["AQID","BAUG"]}}'
+
+        # ── Seed Products ─────────────────────────────────────────
+        for i in 1 2 3 4 5; do
+          cat=$$(echo "Electronics Clothing Books Home Sports" | cut -d' ' -f$$i)
+          price_cents=$$((i*999 + 999))
+          price="$$(printf '%d.%02d' $$((price_cents/100)) $$((price_cents%100)))"
+          rating_tenths=$$((30 + i*3))
+          rating="$$(printf '%d.%01d' $$((rating_tenths/10)) $$((rating_tenths%10)))"
+          weight_tenths=$$((i))
+          weight="$$(printf '%d.%01d' $$((weight_tenths/10)) $$((weight_tenths%10)))"
+          ddb put-item --table-name Products --item \
+            "{\"category\":{\"S\":\"$$cat\"},\"sku\":{\"S\":\"SKU-$$(printf '%05d' $$i)\"},\"name\":{\"S\":\"$$cat Item $$i\"},\"price\":{\"N\":\"$$price\"},\"stock\":{\"N\":\"$$(($$i*50))\"},\"active\":{\"BOOL\":true},\"rating\":{\"N\":\"$$rating\"},\"reviewCount\":{\"N\":\"$$((i*25))\"},\"tags\":{\"L\":[{\"S\":\"$$(printf '%s' "$$cat" | tr '[:upper:]' '[:lower:]')\"},{\"S\":\"item\"}]},\"attributes\":{\"M\":{\"weight\":{\"N\":\"$$weight\"},\"color\":{\"S\":\"$$(echo 'red blue green black white' | cut -d' ' -f$$i)\"}}}}"
+        done
+
+        # Out-of-stock product (BOOL false)
+        ddb put-item --table-name Products --item \
+          '{"category":{"S":"Electronics"},"sku":{"S":"SKU-00099"},"name":{"S":"Out of Stock Widget"},"price":{"N":"199.99"},"stock":{"N":"0"},"active":{"BOOL":false},"rating":{"N":"2.5"},"reviewCount":{"N":"12"},"tags":{"SS":["electronics","unavailable"]}}'
+
+        # ── Seed Orders ───────────────────────────────────────────
+        for i in 1 2 3 4 5 6 7 8; do
+          uid="user-$$(printf '%04d' $$((i%5+1)))"
+          status=$$(echo "pending processing shipped delivered cancelled refunded pending processing" | cut -d' ' -f$$i)
+          total_cents=$$((i*4999))
+          total="$$(printf '%d.%02d' $$((total_cents/100)) $$((total_cents%100)))"
+          item_cents=$$((i*999))
+          item_price="$$(printf '%d.%02d' $$((item_cents/100)) $$((item_cents%100)))"
+          if [ $$((i%3)) -eq 0 ]; then
+            notes_attr='{"NULL":true}'
+          else
+            notes_attr='{"S":"Priority notes for seeded order"}'
+          fi
+          ddb put-item --table-name Orders --item \
+            "{\"customerId\":{\"S\":\"$$uid\"},\"orderId\":{\"S\":\"ORD-2024-$$(printf '%06d' $$i)\"},\"status\":{\"S\":\"$$status\"},\"createdAt\":{\"S\":\"2024-07-0$$((i%9+1))T12:00:00Z\"},\"total\":{\"N\":\"$$total\"},\"currency\":{\"S\":\"USD\"},\"itemCount\":{\"N\":\"$$i\"},\"items\":{\"L\":[{\"M\":{\"sku\":{\"S\":\"SKU-$$(printf '%05d' $$i)\"},\"qty\":{\"N\":\"$$i\"},\"price\":{\"N\":\"$$item_price\"}}}]},\"shippingAddress\":{\"M\":{\"city\":{\"S\":\"Berlin\"},\"country\":{\"S\":\"DE\"}}},\"notes\":$$notes_attr}"
+        done
+
+        # ── Seed Sessions ─────────────────────────────────────────
+        FUTURE_TS=$$(($$(date +%s) + 3600))
+        FUTURE_SHORT=$$(($$(date +%s) + 900))
+        ddb put-item --table-name Sessions --item \
+          "{\"sessionId\":{\"S\":\"sess-abc123\"},\"userId\":{\"S\":\"user-0001\"},\"role\":{\"S\":\"admin\"},\"createdAt\":{\"S\":\"2024-07-04T12:00:00Z\"},\"expiresAt\":{\"N\":\"$$FUTURE_TS\"},\"data\":{\"M\":{\"cart\":{\"L\":[{\"S\":\"SKU-00001\"},{\"S\":\"SKU-00003\"}]},\"preferences\":{\"M\":{\"theme\":{\"S\":\"dark\"}}}}}}"
+        ddb put-item --table-name Sessions --item \
+          "{\"sessionId\":{\"S\":\"sess-def456\"},\"userId\":{\"S\":\"user-0003\"},\"role\":{\"S\":\"editor\"},\"createdAt\":{\"S\":\"2024-07-04T11:00:00Z\"},\"expiresAt\":{\"N\":\"$$FUTURE_SHORT\"},\"data\":{\"M\":{\"lastPage\":{\"S\":\"/products\"}}}}"
+
+        # ── Seed ConfigStore ──────────────────────────────────────
+        configs='
+        app theme dark
+        app language en
+        app currency USD
+        app max_upload_mb 10
+        app maintenance false
+        app version 2.5.1
+        feature dark_mode true
+        feature new_checkout true
+        feature ai_assistant false
+        feature crypto_payment false
+        limits api_rate_per_min 100
+        limits max_file_size_mb 50
+        limits session_timeout_min 60
+        limits max_login_attempts 5
+        '
+        echo "$$configs" | grep -v "^$$" | while read ns key val; do
+          ddb put-item --table-name ConfigStore --item \
+            "{\"namespace\":{\"S\":\"$$ns\"},\"key\":{\"S\":\"$$key\"},\"value\":{\"S\":\"$$val\"},\"updatedAt\":{\"S\":\"2024-07-04T00:00:00Z\"}}"
+        done
+
+        echo "DynamoDB seed complete."
+        echo "Tables:"
+        ddb list-tables
+        echo "Users count: $$(ddb scan --table-name Users --select COUNT --query 'Count' --output text)"
+        echo "Products count: $$(ddb scan --table-name Products --select COUNT --query 'Count' --output text)"
+        echo "Orders count: $$(ddb scan --table-name Orders --select COUNT --query 'Count' --output text)"

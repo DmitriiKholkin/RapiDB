@@ -21,6 +21,7 @@ import {
   type FilterDraft,
   type FilterDraftMap,
   formatColumnDetailDescription,
+  formatPrimaryKeyRoleLabel,
   isNumericCategory,
   NULL_SENTINEL,
   serializeFilterDrafts,
@@ -116,6 +117,12 @@ function createInsertDraft(columns: readonly ColumnMeta[]): InsertDraftRow {
       },
     ]),
   );
+}
+
+function keyIconColor(role: ColumnMeta["primaryKeyRole"]): string {
+  return role === "sort"
+    ? "var(--vscode-textLink-foreground, #2f6f9f)"
+    : "var(--vscode-editorWarning-foreground, #8f5b00)";
 }
 
 function buildActiveFilterDrafts(
@@ -604,6 +611,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
               return {
                 name: c.name,
                 isPrimaryKey: c.isPrimaryKey,
+                primaryKeyRole: c.primaryKeyRole,
                 isForeignKey: c.isForeignKey,
               };
             }),
@@ -1116,7 +1124,10 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
             <span
               title={[
                 formatColumnDetailDescription(col),
-                col.isPrimaryKey ? "Primary key" : undefined,
+                col.isPrimaryKey
+                  ? (formatPrimaryKeyRoleLabel(col.primaryKeyRole) ??
+                    "Primary key")
+                  : undefined,
                 col.isForeignKey ? "Foreign key" : undefined,
               ]
                 .filter((value): value is string => Boolean(value))
@@ -1128,7 +1139,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
                 <Icon
                   name="key"
                   size={13}
-                  color="var(--vscode-charts-yellow, #cca700)"
+                  color={keyIconColor(col.primaryKeyRole)}
                   style={{ marginLeft: 2 }}
                 />
               )}
@@ -1611,7 +1622,9 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
                           : [
                               formatColumnDetailDescription(columnMeta),
                               columnMeta.isPrimaryKey
-                                ? "Primary key"
+                                ? (formatPrimaryKeyRoleLabel(
+                                    columnMeta.primaryKeyRole,
+                                  ) ?? "Primary key")
                                 : undefined,
                               columnMeta.isForeignKey
                                 ? "Foreign key"
@@ -2275,6 +2288,9 @@ const TableRow = React.memo(function TableRow({
         const colId = cell.column.id;
         const colDef = columnsMap.get(colId);
         const isPk = colDef?.isPrimaryKey ?? false;
+        const keyLabel = isPk
+          ? (formatPrimaryKeyRoleLabel(colDef?.primaryKeyRole) ?? "Primary key")
+          : undefined;
         const isSel = colId === "__sel";
         const isCellPending = pendingCols?.has(colId) ?? false;
         const isEditing = colId === editingCol;
@@ -2300,7 +2316,7 @@ const TableRow = React.memo(function TableRow({
               userSelect: isSel ? "auto" : "none",
               background: isCellPending ? "rgba(200, 150, 0, 0.23)" : undefined,
             }}
-            title={isPk ? `PK: ${String(cell.getValue())}` : undefined}
+            title={isPk ? `${keyLabel}: ${String(cell.getValue())}` : undefined}
             onDoubleClick={() => {
               if (colDef && !isSel && canEditColumn(colDef)) {
                 onStartEdit(rowIndex, colDef);

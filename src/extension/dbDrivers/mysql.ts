@@ -15,6 +15,7 @@ import type {
   ColumnMeta,
   ColumnTypeMeta,
   DatabaseInfo,
+  DriverEntityManifest,
   FilterConditionResult,
   FilterOperator,
   PersistedEditCheckOptions,
@@ -26,6 +27,17 @@ import type {
   ValueSemantics,
 } from "./types";
 import { DATETIME_SQL_RE, ISO_DATETIME_RE, NULL_SENTINEL } from "./types";
+
+const MYSQL_ENTITY_MANIFEST: DriverEntityManifest = {
+  dbObjectKinds: ["table", "view", "function", "procedure"],
+  tableSections: {
+    columns: "supported",
+    constraints: "supported",
+    indexes: "supported",
+    triggers: "supported",
+  },
+};
+
 export function splitMySQLScript(sql: string): string[] {
   const stmts: string[] = [];
   let delim = ";";
@@ -767,6 +779,10 @@ export class MySQLDriver extends BaseDBDriver {
   }
   isConnected(): boolean {
     return this.pool !== null;
+  }
+
+  getEntityManifest(): DriverEntityManifest {
+    return MYSQL_ENTITY_MANIFEST;
   }
   private requirePool(): Pool {
     if (!this.pool) {

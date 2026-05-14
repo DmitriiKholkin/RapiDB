@@ -1,9 +1,11 @@
 import * as vscode from "vscode";
+import type { ConnectionType } from "../shared/connectionTypes";
 import {
   isDbObjectKind,
   isDdlOnlyDbObjectKind,
   isRoutineDbObjectKind,
 } from "../shared/dbObjectKinds";
+import type { QueryEditorLanguage } from "../shared/webviewContracts";
 import type {
   BookmarkEntry,
   ExplorerSchemaScope,
@@ -15,6 +17,7 @@ import {
   confirmConnectionRemoval,
   pickConnectionWithPrompt,
 } from "./connectionManagerPrompts";
+import { DEFAULT_DRIVER_ENTITY_MANIFEST } from "./dbDrivers/types";
 import { ConnectionFormPanel } from "./panels/connectionFormPanel";
 import { ErdPanel } from "./panels/erdPanel";
 import { QueryPanel } from "./panels/queryPanel";
@@ -27,9 +30,14 @@ import {
 import { HistoryProvider } from "./providers/historyProvider";
 import { connectWithProgress } from "./utils/connectOrchestration";
 import {
+  generateCreateDatabaseTemplate,
+  generateCreateSchemaTemplate,
+} from "./utils/createAction";
+import {
   logErrorWithContext,
   normalizeUnknownError,
 } from "./utils/errorHandling";
+import { isOpenDdlSupportedForNode } from "./utils/openDdlEligibility";
 
 let _activated = false;
 const CMD = {
@@ -39,6 +47,7 @@ const CMD = {
   connect: "rapidb.connect",
   disconnect: "rapidb.disconnect",
   newQuery: "rapidb.newQuery",
+  create: "rapidb.create",
   openTableData: "rapidb.openTableData",
   showDDL: "rapidb.showDDL",
   copyNodeName: "rapidb.copyNodeName",
@@ -158,6 +167,29 @@ function showSavedQuery(
     options?.formatOnOpen,
     options?.isBookmarked,
   );
+}
+
+function getOpenDdlPresentation(connectionType: ConnectionType | undefined): {
+  formatOnOpen: boolean;
+  editorLanguage?: QueryEditorLanguage;
+} {
+  switch (connectionType) {
+    case "mongodb":
+      return {
+        formatOnOpen: false,
+        editorLanguage: "javascript",
+      };
+    case "dynamodb":
+    case "elasticsearch":
+      return {
+        formatOnOpen: false,
+        editorLanguage: "plaintext",
+      };
+    default:
+      return {
+        formatOnOpen: true,
+      };
+  }
 }
 
 async function clearSavedEntries(
@@ -305,6 +337,49 @@ function registerCommands(
     );
   });
 
+  reg(CMD.create, (node?: RapiDBNode) => {
+    if (!node?.connectionId) {
+      vscode.window.showWarningMessage(
+        "[RapiDB] Select a connection or database node first.",
+      );
+      return;
+    }
+
+    const connectionType = connectionManager.getConnection(
+      node.connectionId,
+    )?.type;
+    if (!connectionType) {
+      vscode.window.showWarningMessage(
+        "[RapiDB] Cannot detect connection type for this node.",
+      );
+      return;
+    }
+
+    const template =
+      node.kind === "connectionNode_connected" ||
+      node.kind === "connectionNode_disconnected"
+        ? generateCreateDatabaseTemplate(connectionType)
+        : node.kind === "database"
+          ? generateCreateSchemaTemplate(connectionType, node.database)
+          : undefined;
+
+    if (!template) {
+      vscode.window.showWarningMessage(
+        "[RapiDB] Create is not supported for the selected node or database type.",
+      );
+      return;
+    }
+
+    QueryPanel.createOrShow(
+      context,
+      connectionManager,
+      node.connectionId,
+      template.script,
+      true,
+      template.formatOnOpen,
+    );
+  });
+
   reg(CMD.openTableData, (node?: RapiDBNode) => {
     if (!node?.connectionId || !node.objectName) {
       return;
@@ -328,6 +403,28 @@ function registerCommands(
       );
       return;
     }
+    const connectionType = connectionManager.getConnection(
+      node.connectionId,
+    )?.type;
+    const managerWithManifest = connectionManager as ConnectionManager & {
+      getDriverEntityManifest?: (
+        id: string,
+      ) => typeof DEFAULT_DRIVER_ENTITY_MANIFEST;
+    };
+    const entityManifest =
+      managerWithManifest.getDriverEntityManifest?.(node.connectionId) ??
+      DEFAULT_DRIVER_ENTITY_MANIFEST;
+    if (
+      !isOpenDdlSupportedForNode(node.kind, connectionType, entityManifest, {
+        indexDdlSupport: node.ddlSupport,
+      })
+    ) {
+      vscode.window.showWarningMessage(
+        "[RapiDB] DDL is available only for table, view, materialized view, function, procedure, sequence, type, constraint, index, and trigger nodes.",
+      );
+      return;
+    }
+
     const driver = connectionManager.getDriver(node.connectionId);
     if (!driver) {
       vscode.window.showErrorMessage("[RapiDB] Not connected. Connect first.");
@@ -409,6 +506,7 @@ function registerCommands(
         );
         return;
       }
+      const ddlPresentation = getOpenDdlPresentation(connectionType);
       if (objectKind && isRoutineDbObjectKind(objectKind)) {
         QueryPanel.createOrShow(
           context,
@@ -417,14 +515,27 @@ function registerCommands(
           ddl,
         );
       } else {
-        QueryPanel.createOrShow(
-          context,
-          connectionManager,
-          node.connectionId,
-          ddl,
-          true,
-          true,
-        );
+        if (ddlPresentation.editorLanguage) {
+          QueryPanel.createOrShow(
+            context,
+            connectionManager,
+            node.connectionId,
+            ddl,
+            true,
+            ddlPresentation.formatOnOpen,
+            false,
+            ddlPresentation.editorLanguage,
+          );
+        } else {
+          QueryPanel.createOrShow(
+            context,
+            connectionManager,
+            node.connectionId,
+            ddl,
+            true,
+            ddlPresentation.formatOnOpen,
+          );
+        }
       }
     } catch (err: unknown) {
       const error = logErrorWithContext(

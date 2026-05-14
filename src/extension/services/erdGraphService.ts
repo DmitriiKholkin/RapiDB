@@ -193,6 +193,7 @@ export class ErdGraphService {
         name: column.name,
         type: column.nativeType,
         isPrimaryKey: column.isPrimaryKey,
+        primaryKeyRole: column.primaryKeyRole,
         isForeignKey: column.isForeignKey,
         nullable: column.nullable,
       })),

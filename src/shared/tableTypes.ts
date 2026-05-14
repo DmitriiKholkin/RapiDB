@@ -243,6 +243,8 @@ type FilterDraftColumn = Pick<
   "name" | "filterable" | "filterOperators"
 >;
 
+export type PrimaryKeyRole = "partition" | "sort";
+
 export interface ColumnMeta {
   name: string;
   type: string;
@@ -256,22 +258,27 @@ export interface ColumnMeta {
   isPersisted?: boolean;
   isPrimaryKey: boolean;
   primaryKeyOrdinal?: number;
+  primaryKeyRole?: PrimaryKeyRole;
   isForeignKey: boolean;
 }
 
 export interface ColumnTypeMeta extends ColumnMeta {
   category: TypeCategory;
   nativeType: string;
+  bsonSubtype?: number;
   filterable: boolean;
   filterOperators: FilterOperator[];
   valueSemantics: ValueSemantics;
 }
+
+export type IndexDdlSupport = "supported" | "unsupported";
 
 export interface IndexMeta {
   name: string;
   columns: string[];
   unique: boolean;
   primary: boolean;
+  ddlSupport?: IndexDdlSupport;
 }
 
 export interface ForeignKeyMeta {
@@ -355,6 +362,23 @@ function stripOuterDetailParens(value: string): string {
   return current;
 }
 
+export function formatPrimaryKeyRoleLabel(
+  role?: PrimaryKeyRole,
+): string | undefined {
+  switch (role) {
+    case "partition":
+      return "Partition key";
+    case "sort":
+      return "Sort key";
+    default:
+      return undefined;
+  }
+}
+
+export function formatPrimaryKeyBadgeLabel(role?: PrimaryKeyRole): "PK" | "SK" {
+  return role === "sort" ? "SK" : "PK";
+}
+
 export function isColumnAutoIncrement(
   column: Pick<ColumnMeta, "defaultValue" | "identityGeneration">,
 ): boolean {
@@ -413,12 +437,15 @@ export function formatColumnDetailTooltip(
     | "isPersisted"
     | "onUpdateExpression"
     | "isPrimaryKey"
+    | "primaryKeyRole"
     | "isForeignKey"
   >,
 ): string {
   return [
     `${column.name} ${formatColumnDetailDescription(column)}`,
-    column.isPrimaryKey ? "Primary key" : undefined,
+    column.isPrimaryKey
+      ? (formatPrimaryKeyRoleLabel(column.primaryKeyRole) ?? "Primary key")
+      : undefined,
     column.isForeignKey ? "Foreign key" : undefined,
   ]
     .filter((value): value is string => Boolean(value))

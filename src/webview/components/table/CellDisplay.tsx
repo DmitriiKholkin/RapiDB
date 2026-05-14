@@ -1,7 +1,10 @@
 import React from "react";
 import type { TypeCategory } from "../../../shared/tableTypes";
 import { getCategoryPresentation } from "../../types";
-import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
+import {
+  formatBinaryValueForViewer,
+  formatScalarValueForDisplay,
+} from "../../utils/valueFormatting";
 
 const PENDING_COLOR = "var(--vscode-editorWarning-foreground, #cca700)";
 export function CellDisplay({
@@ -22,6 +25,7 @@ export function CellDisplay({
   const resolvedColor = isPending ? PENDING_COLOR : categoryColor;
   const str = formatScalarValueForDisplay(value);
   if (category === "binary") {
+    const binaryStr = formatBinaryValueForViewer(value);
     return (
       <span
         style={{
@@ -29,7 +33,7 @@ export function CellDisplay({
           opacity: 0.85,
         }}
       >
-        {str}
+        {binaryStr}
       </span>
     );
   }

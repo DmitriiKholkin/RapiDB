@@ -7,6 +7,7 @@ import type {
   ColumnMeta,
   ColumnTypeMeta,
   DatabaseInfo,
+  DriverEntityManifest,
   FilterConditionResult,
   FilterOperator,
   ForeignKeyMeta,
@@ -21,6 +22,24 @@ import type {
   ValueSemantics,
 } from "./types";
 import { DATETIME_SQL_RE, NULL_SENTINEL } from "./types";
+
+const ORACLE_ENTITY_MANIFEST: DriverEntityManifest = {
+  dbObjectKinds: [
+    "table",
+    "view",
+    "materializedView",
+    "function",
+    "procedure",
+    "sequence",
+    "type",
+  ],
+  tableSections: {
+    columns: "supported",
+    constraints: "supported",
+    indexes: "supported",
+    triggers: "supported",
+  },
+};
 
 function oracleFullType(
   dataType: string,
@@ -786,6 +805,11 @@ export class OracleDriver extends BaseDBDriver {
     }
     return this.pool.connectionsInUse > 0 || this.pool.connectionsOpen > 0;
   }
+
+  getEntityManifest(): DriverEntityManifest {
+    return ORACLE_ENTITY_MANIFEST;
+  }
+
   private async getConnection(): Promise<oracledb.Connection> {
     if (!this.pool) {
       throw new Error("[RapiDB] Oracle connection pool is not initialized.");

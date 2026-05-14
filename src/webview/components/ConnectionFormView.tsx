@@ -31,11 +31,46 @@ const DB_TYPES: Array<{
   color: string;
 }> = [
   { type: "pg", label: "PostgreSQL", short: "PG", color: "#336791" },
-  { type: "mysql", label: "MySQL", short: "MY", color: "#c47900" },
+  {
+    type: "mysql",
+    label: "MySQL / MariaDB",
+    short: "MY",
+    color: "#c47900",
+  },
   { type: "mssql", label: "SQL Server", short: "MS", color: "#cc2927" },
   { type: "oracle", label: "Oracle", short: "OR", color: "#c74634" },
   { type: "sqlite", label: "SQLite", short: "SQ", color: "#0a7bc4" },
+  { type: "mongodb", label: "MongoDB", short: "MO", color: "#00a35c" },
+  { type: "redis", label: "Redis", short: "RE", color: "#dc382d" },
+  {
+    type: "elasticsearch",
+    label: "Elasticsearch",
+    short: "ES",
+    color: "#005571",
+  },
+  { type: "dynamodb", label: "DynamoDB", short: "DY", color: "#4053d6" },
 ];
+
+function parseRedisDbInput(value: string): {
+  value?: number;
+  error?: string;
+} {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return {};
+  }
+
+  if (!/^\d+$/.test(trimmed)) {
+    return { error: "Redis DB must be a non-negative integer." };
+  }
+
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed)) {
+    return { error: "Redis DB must be a non-negative integer." };
+  }
+
+  return { value: parsed };
+}
 
 function FocusInput(props: InputHTMLAttributes<HTMLInputElement>) {
   const [focused, setFocused] = useState(false);
@@ -285,8 +320,8 @@ function DBTypeSelector({
     <div
       style={{
         display: "grid",
-        gridTemplateColumns: "repeat(5, 1fr)",
-        gap: 6,
+        gridTemplateColumns: "repeat(auto-fit, minmax(138px, 1fr))",
+        gap: 10,
         marginBottom: 4,
       }}
     >
@@ -301,52 +336,59 @@ function DBTypeSelector({
             aria-pressed={selected}
             onClick={() => onChange(type)}
             style={{
-              padding: "10px 6px 9px",
-              borderRadius: 6,
+              padding: "11px 12px 12px",
+              minHeight: 92,
+              borderRadius: 12,
               border: selected
-                ? `2px solid ${color}`
+                ? `1px solid ${color}`
                 : "1px solid var(--vscode-panel-border)",
-              background: selected ? `${color}1a` : "transparent",
+              background: selected
+                ? `linear-gradient(180deg, ${color}2e 0%, ${color}18 100%)`
+                : `linear-gradient(180deg, var(--vscode-editorWidget-background, var(--vscode-input-background)) 0%, ${color}10 100%)`,
+              boxShadow: selected
+                ? `0 0 0 1px ${color}22 inset`
+                : "0 1px 0 rgba(255,255,255,0.04) inset",
               cursor: "pointer",
               display: "flex",
               flexDirection: "column",
-              alignItems: "center",
-              gap: 6,
+              alignItems: "flex-start",
+              justifyContent: "space-between",
+              gap: 10,
+              textAlign: "left",
+              transition: "background 0.15s ease, border-color 0.15s ease",
             }}
           >
             <div
               style={{
-                width: 30,
-                height: 30,
-                borderRadius: "50%",
-                background: selected ? color : "var(--vscode-input-background)",
-                border: selected
-                  ? "none"
-                  : "1px solid var(--vscode-panel-border)",
+                width: 36,
+                height: 36,
+                borderRadius: 10,
+                background: selected ? color : `${color}24`,
+                border: selected ? "none" : `1px solid ${color}55`,
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
-                fontSize: 10,
-                fontWeight: 700,
-                letterSpacing: 0.3,
-                color: selected ? "#fff" : "var(--vscode-foreground)",
+                fontSize: 11,
+                fontWeight: 800,
+                letterSpacing: 0.5,
+                color: selected ? "#fff" : color,
                 flexShrink: 0,
               }}
             >
               {short}
             </div>
-            <span
-              style={{
-                fontSize: 10,
-                fontWeight: selected ? 600 : 400,
-                opacity: selected ? 1 : 0.6,
-                textAlign: "center",
-                lineHeight: 1.2,
-                color: selected ? color : "inherit",
-              }}
-            >
-              {label}
-            </span>
+            <div style={{ display: "grid", gap: 3, width: "100%" }}>
+              <span
+                style={{
+                  fontSize: 12,
+                  fontWeight: selected ? 700 : 600,
+                  lineHeight: 1.25,
+                  color: "var(--vscode-foreground)",
+                }}
+              >
+                {label}
+              </span>
+            </div>
           </button>
         );
       })}
@@ -381,6 +423,44 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const [oracleClientPath, setOracleClientPath] = useState(
     existing?.clientPath ?? "",
   );
+  const [mongoConnectionUri, setMongoConnectionUri] = useState(
+    existing?.connectionUri ?? existing?.uri ?? "",
+  );
+  const [mongoAuthDatabase, setMongoAuthDatabase] = useState(
+    existing?.authDatabase ?? existing?.authSource ?? "",
+  );
+  const [redisUsername, setRedisUsername] = useState(
+    existing?.redisUsername ?? existing?.username ?? "",
+  );
+  const [redisKeyPrefix, setRedisKeyPrefix] = useState(
+    existing?.keyPrefix ?? "",
+  );
+  const [elasticsearchEndpoint, setElasticsearchEndpoint] = useState(
+    existing?.endpoint ?? existing?.connectionUri ?? "",
+  );
+  const [elasticsearchApiKey, setElasticsearchApiKey] = useState(
+    existing?.apiKey ?? "",
+  );
+  const [elasticsearchCloudId, setElasticsearchCloudId] = useState(
+    existing?.cloudId ?? "",
+  );
+  const [redisDb, setRedisDb] = useState(
+    existing?.redisDb === undefined ? "0" : String(existing.redisDb),
+  );
+  const [awsRegion, setAwsRegion] = useState(existing?.awsRegion ?? "");
+  const [awsAccessKeyId, setAwsAccessKeyId] = useState(
+    existing?.awsAccessKeyId ?? "",
+  );
+  const [awsSecretAccessKey, setAwsSecretAccessKey] = useState(
+    existing?.awsSecretAccessKey ?? "",
+  );
+  const [awsSessionToken, setAwsSessionToken] = useState(
+    existing?.awsSessionToken ?? "",
+  );
+  const [awsProfile, setAwsProfile] = useState(existing?.awsProfile ?? "");
+  const [dynamoEndpoint, setDynamoEndpoint] = useState(
+    existing?.endpoint ?? existing?.awsEndpoint ?? "",
+  );
 
   const [sslEnabled, setSslEnabled] = useState(existing?.ssl ?? false);
   const [rejectUnauthorized, setRejectUnauthorized] = useState(
@@ -396,11 +476,16 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   >("idle");
   const [testError, setTestError] = useState("");
   const [nameError, setNameError] = useState("");
+  const [redisDbError, setRedisDbError] = useState("");
   const [saving, setSaving] = useState(false);
 
   const isSQLite = type === "sqlite";
   const isOracle = type === "oracle";
-  const supportsSsl = type !== "sqlite";
+  const isMongo = type === "mongodb";
+  const isRedis = type === "redis";
+  const isElasticsearch = type === "elasticsearch";
+  const isDynamo = type === "dynamodb";
+  const supportsSsl = !isSQLite && !isDynamo;
 
   useEffect(
     () =>
@@ -430,10 +515,13 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     setTestState("idle");
     setSslEnabled(false);
     setRejectUnauthorized(true);
+    setRedisDbError("");
   };
 
-  const buildPayload = useCallback(
-    (): ConnectionFormSubmission => ({
+  const buildPayload = useCallback((): ConnectionFormSubmission => {
+    const parsedRedisDb = parseRedisDbInput(redisDb);
+
+    return {
       id: existing?.id ?? crypto.randomUUID(),
       name: name.trim(),
       type,
@@ -442,52 +530,114 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       hasStoredSecret: hasStoredSecret || undefined,
       ...(isSQLite
         ? { filePath: filePath.trim() }
-        : {
-            host: host.trim(),
-            port: Number(port) || DEFAULT_PORT_BY_CONNECTION_TYPE[type],
-            database: database.trim(),
-            username: username.trim(),
-            password,
-            ssl: supportsSsl ? sslEnabled : undefined,
-            rejectUnauthorized:
-              supportsSsl && sslEnabled ? rejectUnauthorized : undefined,
-            ...(isOracle
-              ? {
-                  serviceName: oracleServiceName.trim() || undefined,
-                  thickMode: oracleThickMode || undefined,
-                  clientPath:
-                    oracleThickMode && oracleClientPath.trim()
-                      ? oracleClientPath.trim()
-                      : undefined,
-                }
-              : {}),
-          }),
-    }),
-    [
-      existing,
-      name,
-      type,
-      folder,
-      useSecretStorage,
-      hasStoredSecret,
-      isSQLite,
-      filePath,
-      host,
-      port,
-      database,
-      username,
-      password,
-      sslEnabled,
-      rejectUnauthorized,
-      supportsSsl,
-      isOracle,
-      oracleServiceName,
-      oracleThickMode,
-      oracleClientPath,
-    ],
-  );
+        : isDynamo
+          ? {
+              database: database.trim() || undefined,
+              awsRegion: awsRegion.trim() || undefined,
+              awsAccessKeyId: awsAccessKeyId.trim() || undefined,
+              awsSecretAccessKey: awsSecretAccessKey.trim() || undefined,
+              awsSessionToken: awsSessionToken.trim() || undefined,
+              awsProfile: awsProfile.trim() || undefined,
+              endpoint: dynamoEndpoint.trim() || undefined,
+            }
+          : {
+              host: host.trim(),
+              port: Number(port) || DEFAULT_PORT_BY_CONNECTION_TYPE[type],
+              database:
+                isRedis || isElasticsearch ? undefined : database.trim(),
+              username: isRedis ? undefined : username.trim(),
+              password,
+              ssl: supportsSsl ? sslEnabled : undefined,
+              rejectUnauthorized:
+                supportsSsl && sslEnabled ? rejectUnauthorized : undefined,
+              ...(isMongo
+                ? {
+                    connectionUri: mongoConnectionUri.trim() || undefined,
+                    authDatabase: mongoAuthDatabase.trim() || undefined,
+                  }
+                : {}),
+              ...(isRedis
+                ? {
+                    redisUsername: redisUsername.trim() || undefined,
+                    redisDb: parsedRedisDb.value,
+                    keyPrefix: redisKeyPrefix.trim() || undefined,
+                  }
+                : {}),
+              ...(isElasticsearch
+                ? {
+                    endpoint: elasticsearchEndpoint.trim() || undefined,
+                    apiKey: elasticsearchApiKey.trim() || undefined,
+                    cloudId: elasticsearchCloudId.trim() || undefined,
+                  }
+                : {}),
+              ...(isOracle
+                ? {
+                    serviceName: oracleServiceName.trim() || undefined,
+                    thickMode: oracleThickMode || undefined,
+                    clientPath:
+                      oracleThickMode && oracleClientPath.trim()
+                        ? oracleClientPath.trim()
+                        : undefined,
+                  }
+                : {}),
+            }),
+    };
+  }, [
+    existing,
+    name,
+    type,
+    folder,
+    useSecretStorage,
+    hasStoredSecret,
+    isSQLite,
+    filePath,
+    host,
+    port,
+    database,
+    awsProfile,
+    awsRegion,
+    awsAccessKeyId,
+    awsSecretAccessKey,
+    awsSessionToken,
+    dynamoEndpoint,
+    username,
+    password,
+    sslEnabled,
+    rejectUnauthorized,
+    supportsSsl,
+    isOracle,
+    oracleServiceName,
+    oracleThickMode,
+    oracleClientPath,
+    mongoConnectionUri,
+    mongoAuthDatabase,
+    redisUsername,
+    redisKeyPrefix,
+    elasticsearchEndpoint,
+    elasticsearchApiKey,
+    elasticsearchCloudId,
+    redisDb,
+    isMongo,
+    isRedis,
+    isElasticsearch,
+    isDynamo,
+  ]);
+
+  const validateRedisDb = useCallback((): boolean => {
+    if (!isRedis) {
+      setRedisDbError("");
+      return true;
+    }
+
+    const { error } = parseRedisDbInput(redisDb);
+    setRedisDbError(error ?? "");
+    return !error;
+  }, [isRedis, redisDb]);
 
   const handleTest = () => {
+    if (!validateRedisDb()) {
+      return;
+    }
     setTestState("testing");
     setTestError("");
     postMessage("testConnection", buildPayload());
@@ -496,6 +646,9 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const handleSave = () => {
     if (!name.trim()) {
       setNameError("Name is required");
+      return;
+    }
+    if (!validateRedisDb()) {
       return;
     }
     setSaving(true);
@@ -547,6 +700,72 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
               placeholder="/absolute/path/to/database.db"
             />
           </Field>
+        ) : isDynamo ? (
+          <>
+            <Field label="Region" hint="AWS region, for example us-east-1.">
+              <FocusInput
+                aria-label="AWS region"
+                value={awsRegion}
+                onChange={(e) => setAwsRegion(e.target.value)}
+                placeholder="us-east-1"
+              />
+            </Field>
+            <Field
+              label="AWS Profile"
+              hint="Optional shared credentials profile to use instead of explicit keys."
+            >
+              <FocusInput
+                aria-label="AWS profile"
+                value={awsProfile}
+                onChange={(e) => setAwsProfile(e.target.value)}
+                placeholder="default"
+              />
+            </Field>
+            <Field
+              label="Endpoint"
+              hint="Optional custom endpoint for DynamoDB Local or AWS-compatible services."
+            >
+              <FocusInput
+                aria-label="DynamoDB endpoint"
+                value={dynamoEndpoint}
+                onChange={(e) => setDynamoEndpoint(e.target.value)}
+                placeholder="http://localhost:8000"
+              />
+            </Field>
+            <Field label="Table Namespace" hint="Optional logical namespace.">
+              <FocusInput
+                aria-label="DynamoDB namespace"
+                value={database}
+                onChange={(e) => setDatabase(e.target.value)}
+                placeholder="default"
+              />
+            </Field>
+            <Field label="Access Key ID">
+              <FocusInput
+                aria-label="AWS access key id"
+                value={awsAccessKeyId}
+                onChange={(e) => setAwsAccessKeyId(e.target.value)}
+                placeholder="AKIA..."
+              />
+            </Field>
+            <Field label="Secret Access Key">
+              <FocusInput
+                aria-label="AWS secret access key"
+                value={awsSecretAccessKey}
+                onChange={(e) => setAwsSecretAccessKey(e.target.value)}
+                type="password"
+                placeholder="••••••••"
+              />
+            </Field>
+            <Field label="Session Token (optional)">
+              <FocusInput
+                aria-label="AWS session token"
+                value={awsSessionToken}
+                onChange={(e) => setAwsSessionToken(e.target.value)}
+                placeholder="IQoJ..."
+              />
+            </Field>
+          </>
         ) : (
           <>
             <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
@@ -577,27 +796,130 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                 />
               </div>
             </div>
-            <Field label="Database">
-              <FocusInput
-                aria-label="Database"
-                value={database}
-                onChange={(e) => setDatabase(e.target.value)}
-                placeholder="mydb"
-              />
-            </Field>
-            <Field label="Username">
-              <FocusInput
-                aria-label="Username"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="admin"
-              />
-            </Field>
+            {!isRedis && !isElasticsearch && (
+              <Field label="Database">
+                <FocusInput
+                  aria-label="Database"
+                  value={database}
+                  onChange={(e) => setDatabase(e.target.value)}
+                  placeholder="mydb"
+                />
+              </Field>
+            )}
+            {isRedis ? (
+              <Field label="Redis Username">
+                <FocusInput
+                  aria-label="Redis username"
+                  value={redisUsername}
+                  onChange={(e) => setRedisUsername(e.target.value)}
+                  placeholder="default"
+                />
+              </Field>
+            ) : (
+              <Field label="Username">
+                <FocusInput
+                  aria-label="Username"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  placeholder="admin"
+                />
+              </Field>
+            )}
+            {isMongo && (
+              <>
+                <Field
+                  label="Connection URI"
+                  hint="Optional. When set, this URI is used instead of host/port/user fields."
+                >
+                  <FocusInput
+                    aria-label="MongoDB connection URI"
+                    value={mongoConnectionUri}
+                    onChange={(e) => setMongoConnectionUri(e.target.value)}
+                    placeholder="mongodb://user:pass@localhost:27017/mydb"
+                  />
+                </Field>
+                <Field label="Auth Database">
+                  <FocusInput
+                    aria-label="MongoDB auth database"
+                    value={mongoAuthDatabase}
+                    onChange={(e) => setMongoAuthDatabase(e.target.value)}
+                    placeholder="admin"
+                  />
+                </Field>
+              </>
+            )}
+            {isRedis && (
+              <>
+                <Field
+                  label="Redis DB"
+                  hint="Numeric Redis database index, usually 0."
+                  error={redisDbError}
+                >
+                  <FocusInput
+                    aria-label="Redis DB"
+                    value={redisDb}
+                    onChange={(e) => {
+                      setRedisDb(e.target.value);
+                      setRedisDbError("");
+                    }}
+                    placeholder="0"
+                  />
+                </Field>
+                <Field
+                  label="Key Prefix"
+                  hint="Optional prefix applied when browsing or editing keys."
+                >
+                  <FocusInput
+                    aria-label="Redis key prefix"
+                    value={redisKeyPrefix}
+                    onChange={(e) => setRedisKeyPrefix(e.target.value)}
+                    placeholder="app:"
+                  />
+                </Field>
+              </>
+            )}
+            {isElasticsearch && (
+              <>
+                <Field
+                  label="Endpoint"
+                  hint="HTTP endpoint or connection URI for the cluster. Leave empty when using Cloud ID only."
+                >
+                  <FocusInput
+                    aria-label="Elasticsearch endpoint"
+                    value={elasticsearchEndpoint}
+                    onChange={(e) => setElasticsearchEndpoint(e.target.value)}
+                    placeholder="http://localhost:9200"
+                  />
+                </Field>
+                <Field
+                  label="API Key"
+                  hint="Optional API key for Elasticsearch authentication."
+                >
+                  <FocusInput
+                    aria-label="Elasticsearch API key"
+                    value={elasticsearchApiKey}
+                    onChange={(e) => setElasticsearchApiKey(e.target.value)}
+                    placeholder="base64ApiKey"
+                  />
+                </Field>
+                <Field
+                  label="Cloud ID"
+                  hint="Optional Elastic Cloud deployment identifier."
+                >
+                  <FocusInput
+                    aria-label="Elasticsearch cloud id"
+                    value={elasticsearchCloudId}
+                    onChange={(e) => setElasticsearchCloudId(e.target.value)}
+                    placeholder="deployment-name:base64..."
+                  />
+                </Field>
+              </>
+            )}
           </>
         )}
       </Card>
 
-      {!isSQLite && (
+      {!isSQLite && !isDynamo && (
         <Card>
           <CardHeader icon="shield" label="Password & Security" />
 

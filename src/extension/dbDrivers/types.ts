@@ -2,9 +2,11 @@ import type {
   DbObjectKind,
   DdlOnlyDbObjectKind,
 } from "../../shared/dbObjectKinds";
+import { DB_OBJECT_KINDS } from "../../shared/dbObjectKinds";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
+  FilterExpression,
   FilterOperator,
   ForeignKeyMeta,
   GeneratedKind,
@@ -65,6 +67,87 @@ export interface FilterConditionResult {
   sql: string;
   params: unknown[];
 }
+
+export interface DriverCapabilities {
+  tabularRead: "sql" | "nosql";
+  queryMode?: "sql" | "text";
+  supportsMutations?: boolean;
+}
+
+export type DriverTableSectionKind =
+  | "columns"
+  | "constraints"
+  | "indexes"
+  | "triggers";
+
+export type DriverEntityAvailability = "supported" | "not_applicable";
+
+export interface DriverEntityManifest {
+  dbObjectKinds: readonly DbObjectKind[];
+  tableSections: Readonly<
+    Record<DriverTableSectionKind, DriverEntityAvailability>
+  >;
+}
+
+export const DEFAULT_DRIVER_ENTITY_MANIFEST: DriverEntityManifest = {
+  dbObjectKinds: DB_OBJECT_KINDS,
+  tableSections: {
+    columns: "supported",
+    constraints: "supported",
+    indexes: "supported",
+    triggers: "supported",
+  },
+};
+
+export interface DriverSortConfig {
+  column: string;
+  direction: "asc" | "desc";
+}
+
+export interface DriverTablePageRequest {
+  database: string;
+  schema: string;
+  table: string;
+  page: number;
+  pageSize: number;
+  filters: FilterExpression[];
+  sort: DriverSortConfig | null;
+  skipCount: boolean;
+}
+
+export interface DriverTablePageResult {
+  columns: ColumnTypeMeta[];
+  rows: Record<string, unknown>[];
+  totalCount: number;
+}
+
+export interface DriverUpdateRowsRequest {
+  database: string;
+  schema: string;
+  table: string;
+  updates: Array<{
+    primaryKeys: Record<string, unknown>;
+    changes: Record<string, unknown>;
+  }>;
+}
+
+export interface DriverInsertRowRequest {
+  database: string;
+  schema: string;
+  table: string;
+  values: Record<string, unknown>;
+}
+
+export interface DriverDeleteRowsRequest {
+  database: string;
+  schema: string;
+  table: string;
+  primaryKeyValuesList: Record<string, unknown>[];
+}
+
+export interface DriverMutationResult {
+  affectedRows: number;
+}
 export interface PaginationResult {
   sql: string;
   params: unknown[];
@@ -81,6 +164,8 @@ export interface IDBDriver {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   isConnected(): boolean;
+  getEntityManifest?(): DriverEntityManifest;
+  getCapabilities?(): DriverCapabilities;
   listDatabases(): Promise<DatabaseInfo[]>;
   listSchemas(database: string): Promise<SchemaInfo[]>;
   listObjects(database: string, schema: string): Promise<TableInfo[]>;
@@ -150,6 +235,24 @@ export interface IDBDriver {
     kind: "function" | "procedure",
   ): Promise<string>;
   query(sql: string, params?: unknown[]): Promise<QueryResult>;
+  readTablePage?(
+    request: DriverTablePageRequest,
+  ): Promise<DriverTablePageResult>;
+  updateRows?(request: DriverUpdateRowsRequest): Promise<DriverMutationResult>;
+  insertRow?(request: DriverInsertRowRequest): Promise<DriverMutationResult>;
+  deleteRows?(request: DriverDeleteRowsRequest): Promise<DriverMutationResult>;
+  buildMutationPreviewStatement?(
+    operation: "insert" | "update" | "delete",
+    database: string,
+    schema: string,
+    table: string,
+    data: {
+      primaryKeys?: Record<string, unknown>;
+      changes?: Record<string, unknown>;
+      values?: Record<string, unknown>;
+      primaryKeyValuesList?: Array<Record<string, unknown>>;
+    },
+  ): string;
   runTransaction(operations: TransactionOperation[]): Promise<void>;
   getMutationAtomicityRisk?(
     database: string,

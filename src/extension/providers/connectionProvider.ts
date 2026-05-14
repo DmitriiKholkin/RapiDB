@@ -9,6 +9,8 @@ import {
 import {
   formatColumnDetailDescription,
   formatColumnDetailTooltip,
+  formatPrimaryKeyRoleLabel,
+  type IndexDdlSupport,
 } from "../../shared/tableTypes";
 import type {
   ConnectionConfig,
@@ -24,10 +26,21 @@ import type {
 } from "../connectionManagerModels";
 import type {
   ColumnTypeMeta,
+  DriverEntityManifest,
   IndexMeta,
   TableConstraintMeta,
   TriggerMeta,
 } from "../dbDrivers/types";
+import { DEFAULT_DRIVER_ENTITY_MANIFEST as DEFAULT_ENTITY_MANIFEST } from "../dbDrivers/types";
+import {
+  composeCreateAwareConnectionContextValue,
+  composeCreateAwareDatabaseContextValue,
+} from "../utils/createAction";
+import {
+  composeOpenDdlAwareContextValue,
+  type OpenDdlNodeKind,
+  type OpenDdlSupportHints,
+} from "../utils/openDdlEligibility";
 
 export type NodeKind =
   | "connectionNode_disconnected"
@@ -123,6 +136,7 @@ const TABLE_SECTION_LABELS: Record<TableDetailSectionKind, string> = {
 };
 
 const PRIMARY_KEY_ICON_COLOR = new vscode.ThemeColor("charts.yellow");
+const SORT_KEY_ICON_COLOR = new vscode.ThemeColor("textLink.foreground");
 
 export class RapiDBNode extends vscode.TreeItem {
   constructor(
@@ -136,6 +150,7 @@ export class RapiDBNode extends vscode.TreeItem {
     public readonly parentTable?: string,
     public readonly section?: TableDetailSectionKind,
     public readonly detailKey?: string,
+    public readonly ddlSupport?: IndexDdlSupport,
   ) {
     super(label, collapsibleState);
 
@@ -405,11 +420,15 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     }
 
     const schemas = database.schemas;
-
-    if (schemas.length <= 1) {
-      return schemas[0]
-        ? this.categoryNodes(element.connectionId, databaseName, schemas[0])
-        : [];
+    if (
+      this.shouldFlattenSchemaLevel(element.connectionId, databaseName, schemas)
+    ) {
+      return this.categoryNodes(
+        element.connectionId,
+        databaseName,
+        schemas[0],
+        this.getEntityManifest(element.connectionId),
+      );
     }
 
     return schemas.map((schema) =>
@@ -440,7 +459,12 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       );
     }
 
-    return this.categoryNodes(element.connectionId, databaseName, schema);
+    return this.categoryNodes(
+      element.connectionId,
+      databaseName,
+      schema,
+      this.getEntityManifest(element.connectionId),
+    );
   }
 
   private async getCategoryChildren(
@@ -513,7 +537,11 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       );
     }
 
-    return this.makeTableSectionNodes(request, state);
+    return this.makeTableSectionNodes(
+      request,
+      state,
+      this.getEntityManifest(request.connectionId),
+    );
   }
 
   private async getTableSectionChildren(
@@ -521,6 +549,12 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
   ): Promise<RapiDBNode[]> {
     const request = this.toTableDetailRequest(element);
     if (!request || !element.section) {
+      return [];
+    }
+
+    const manifest = this.getEntityManifest(request.connectionId);
+    const availability = manifest.tableSections[element.section];
+    if (availability === "not_applicable") {
       return [];
     }
 
@@ -557,15 +591,6 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
         sectionState.error ??
           `Failed to load ${TABLE_SECTION_LABELS[element.section]}`,
       );
-    }
-
-    if (sectionState.unsupported) {
-      return [
-        this.makeInfoNode(
-          request.connectionId,
-          `${TABLE_SECTION_LABELS[element.section]} are not supported for this driver.`,
-        ),
-      ];
     }
 
     switch (element.section) {
@@ -674,6 +699,9 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       connectionId,
       databaseName,
     );
+    node.contextValue = composeCreateAwareDatabaseContextValue(
+      this.getConnectionType(connectionId),
+    );
     node.tooltip = `Database: ${databaseName}`;
     return node;
   }
@@ -691,7 +719,9 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       databaseName,
       schemaName,
     );
-    node.tooltip = `Schema: ${schemaName}`;
+    node.tooltip = this.hasSchemaConcept(connectionId)
+      ? `Schema: ${schemaName}`
+      : `Database: ${databaseName}`;
     return node;
   }
 
@@ -713,7 +743,11 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       schemaName,
       objectName,
     );
-    node.tooltip = `${kind}: ${objectName}\nSchema: ${schemaName}\nDatabase: ${databaseName}`;
+    const includeSchema = this.hasSchemaConcept(connectionId);
+    node.tooltip = includeSchema
+      ? `${kind}: ${objectName}\nSchema: ${schemaName}\nDatabase: ${databaseName}`
+      : `${kind}: ${objectName}\nDatabase: ${databaseName}`;
+    node.contextValue = this.composeContextValue(kind, connectionId);
 
     if (isDataDbObjectKind(kind)) {
       node.command = {
@@ -745,6 +779,7 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
   private makeTableSectionNodes(
     request: TableDetailRequest,
     state: TableDetailState,
+    manifest: DriverEntityManifest,
   ): RapiDBNode[] {
     const sections: TableDetailSectionKind[] = [
       "columns",
@@ -753,30 +788,33 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       "triggers",
     ];
 
-    return sections.map((section) => {
-      const sectionState = state.snapshot[section];
-      const hasChildren =
-        sectionState.status !== "loaded" ||
-        sectionState.unsupported === true ||
-        sectionState.items.length > 0 ||
-        Boolean(sectionState.error);
-      const node = new RapiDBNode(
-        TABLE_SECTION_LABELS[section],
-        TABLE_SECTION_KIND_TO_NODE_KIND[section],
-        hasChildren
-          ? vscode.TreeItemCollapsibleState.Collapsed
-          : vscode.TreeItemCollapsibleState.None,
-        request.connectionId,
-        request.database,
-        request.schema,
-        request.table,
-        request.table,
-        section,
-      );
-      node.description = this.describeTableSection(section, sectionState);
-      node.tooltip = `${TABLE_SECTION_LABELS[section]} for ${request.schema}.${request.table}`;
-      return node;
-    });
+    return sections
+      .filter((section) => manifest.tableSections[section] === "supported")
+      .map((section) => {
+        const sectionState = state.snapshot[section];
+        const hasChildren =
+          sectionState.status !== "loaded" ||
+          sectionState.items.length > 0 ||
+          Boolean(sectionState.error);
+        const node = new RapiDBNode(
+          TABLE_SECTION_LABELS[section],
+          TABLE_SECTION_KIND_TO_NODE_KIND[section],
+          hasChildren
+            ? vscode.TreeItemCollapsibleState.Collapsed
+            : vscode.TreeItemCollapsibleState.None,
+          request.connectionId,
+          request.database,
+          request.schema,
+          request.table,
+          request.table,
+          section,
+        );
+        node.description = this.describeTableSection(section, sectionState);
+        node.tooltip = this.hasSchemaConcept(request.connectionId)
+          ? `${TABLE_SECTION_LABELS[section]} for ${request.schema}.${request.table}`
+          : `${TABLE_SECTION_LABELS[section]} for ${request.table}`;
+        return node;
+      });
   }
 
   private describeTableSection(
@@ -785,10 +823,6 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
   ): string {
     if (state.status === "error") {
       return "error";
-    }
-
-    if (state.unsupported) {
-      return "unsupported";
     }
 
     if (section === "triggers") {
@@ -803,6 +837,9 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     column: ColumnTypeMeta,
   ): RapiDBNode {
     const description = formatColumnDetailDescription(column);
+    const keyRoleDescription = column.isPrimaryKey
+      ? formatPrimaryKeyRoleLabel(column.primaryKeyRole)
+      : undefined;
     const node = new RapiDBNode(
       column.name,
       "table_detail_column",
@@ -816,11 +853,18 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       column.name,
     );
     if (column.isPrimaryKey) {
-      node.iconPath = new vscode.ThemeIcon("key", PRIMARY_KEY_ICON_COLOR);
+      node.iconPath = new vscode.ThemeIcon(
+        "key",
+        column.primaryKeyRole === "sort"
+          ? SORT_KEY_ICON_COLOR
+          : PRIMARY_KEY_ICON_COLOR,
+      );
     } else if (column.isForeignKey) {
       node.iconPath = new vscode.ThemeIcon("key");
     }
-    node.description = description;
+    node.description = keyRoleDescription
+      ? `${description} - ${keyRoleDescription.toLowerCase()}`
+      : description;
     node.tooltip = formatColumnDetailTooltip(column);
     return node;
   }
@@ -851,6 +895,10 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       "constraints",
       constraint.name,
     );
+    node.contextValue = this.composeContextValue(
+      "table_detail_constraint",
+      request.connectionId,
+    );
     node.description = parts.join(" - ");
     node.tooltip = this.makeDetailTooltip(constraint.name, node.description);
     return node;
@@ -879,6 +927,12 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       request.table,
       "indexes",
       index.name,
+      index.ddlSupport,
+    );
+    node.contextValue = this.composeContextValue(
+      "table_detail_index",
+      request.connectionId,
+      { indexDdlSupport: index.ddlSupport },
     );
     node.description = descriptionParts.join(" - ");
     node.tooltip = this.makeDetailTooltip(index.name, node.description);
@@ -905,9 +959,45 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       "triggers",
       trigger.name,
     );
+    node.contextValue = this.composeContextValue(
+      "table_detail_trigger",
+      request.connectionId,
+    );
     node.description = detail.join(", ");
     node.tooltip = this.makeDetailTooltip(trigger.name, node.description);
     return node;
+  }
+
+  private composeContextValue(
+    kind: OpenDdlNodeKind,
+    connectionId: string,
+    hints?: OpenDdlSupportHints,
+  ): string {
+    const connectionType = this.getConnectionType(connectionId);
+    return composeOpenDdlAwareContextValue(
+      kind,
+      connectionType,
+      this.getEntityManifest(connectionId),
+      hints,
+    );
+  }
+
+  private getConnectionType(
+    connectionId: string,
+  ): ConnectionConfig["type"] | undefined {
+    const managerWithConnectionLookup = this
+      .connectionManager as ConnectionManager & {
+      getConnection?: (id: string) => ConnectionConfig | undefined;
+    };
+    const directMatch =
+      managerWithConnectionLookup.getConnection?.(connectionId);
+    if (directMatch?.type) {
+      return directMatch.type;
+    }
+
+    return this.connectionManager
+      .getConnections()
+      .find((connection) => connection.id === connectionId)?.type;
   }
 
   private makeDetailTooltip(name: string, description?: string): string {
@@ -929,18 +1019,6 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     const node = new RapiDBNode(
       label,
       "status_loading",
-      vscode.TreeItemCollapsibleState.None,
-      connectionId,
-    );
-    node.contextValue = "_status";
-    node.tooltip = label;
-    return node;
-  }
-
-  private makeInfoNode(connectionId: string, label: string): RapiDBNode {
-    const node = new RapiDBNode(
-      label,
-      "status_info",
       vscode.TreeItemCollapsibleState.None,
       connectionId,
     );
@@ -1028,6 +1106,16 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       };
     }
 
+    if (
+      kind === "connectionNode_connected" ||
+      kind === "connectionNode_disconnected"
+    ) {
+      node.contextValue = composeCreateAwareConnectionContextValue(
+        kind,
+        config.type,
+      );
+    }
+
     return node;
   }
 
@@ -1035,10 +1123,18 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     connectionId: string,
     database: string,
     schema: SchemaSnapshotSchemaEntry,
+    manifest: DriverEntityManifest,
   ): RapiDBNode[] {
+    const connectionType = this.getConnectionType(connectionId);
+    const supportedKinds = new Set(manifest.dbObjectKinds);
+    const visibleCategoryIds = EXPLORER_CATEGORY_ORDER.filter((categoryId) =>
+      EXPLORER_CATEGORY_CONFIG[categoryId].objectKinds.some((kind) =>
+        supportedKinds.has(kind),
+      ),
+    );
     const counts = new Map<CategoryKind, number>();
 
-    for (const categoryId of EXPLORER_CATEGORY_ORDER) {
+    for (const categoryId of visibleCategoryIds) {
       const categoryKind = CATEGORY_NODE_KIND_BY_ID[categoryId];
       const categoryConfig = EXPLORER_CATEGORY_CONFIG[categoryId];
       counts.set(
@@ -1049,13 +1145,17 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       );
     }
 
-    return EXPLORER_CATEGORY_ORDER.map((categoryId) => {
+    return visibleCategoryIds.map((categoryId) => {
       const categoryKind = CATEGORY_NODE_KIND_BY_ID[categoryId];
       const categoryConfig = EXPLORER_CATEGORY_CONFIG[categoryId];
+      const categoryLabel =
+        connectionType === "mongodb" && categoryId === "tables"
+          ? "Collections"
+          : categoryConfig.label;
       const count = counts.get(categoryKind) ?? 0;
       const hasItems = count > 0;
       const node = new RapiDBNode(
-        categoryConfig.label,
+        categoryLabel,
         categoryKind,
 
         hasItems
@@ -1066,9 +1166,48 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
         schema.name,
       );
       node.description = `(${count})`;
-      node.tooltip = `${categoryConfig.label} in ${schema.name ? `${schema.name}.` : ""}${database} - ${count} item${count !== 1 ? "s" : ""}`;
+      const scopeLabel = this.hasSchemaConcept(connectionId)
+        ? `${schema.name ? `${schema.name}.` : ""}${database}`
+        : database;
+      node.tooltip = `${categoryLabel} in ${scopeLabel} - ${count} item${count !== 1 ? "s" : ""}`;
       return node;
     });
+  }
+
+  private shouldFlattenSchemaLevel(
+    connectionId: string,
+    databaseName: string,
+    schemas: readonly SchemaSnapshotSchemaEntry[],
+  ): boolean {
+    if (schemas.length !== 1) {
+      return false;
+    }
+
+    const connectionType = this.getConnectionType(connectionId);
+    if (connectionType === "mongodb" || connectionType === "dynamodb") {
+      return true;
+    }
+
+    if (connectionType === "redis" || connectionType === "elasticsearch") {
+      return false;
+    }
+
+    return schemas[0]?.name === databaseName;
+  }
+
+  private hasSchemaConcept(connectionId: string): boolean {
+    const connectionType = this.getConnectionType(connectionId);
+    return connectionType !== "mongodb" && connectionType !== "dynamodb";
+  }
+
+  private getEntityManifest(connectionId: string): DriverEntityManifest {
+    const managerWithManifest = this.connectionManager as ConnectionManager & {
+      getDriverEntityManifest?: (id: string) => DriverEntityManifest;
+    };
+    return (
+      managerWithManifest.getDriverEntityManifest?.(connectionId) ??
+      DEFAULT_ENTITY_MANIFEST
+    );
   }
 
   private makeError(connectionId: string, message: string): RapiDBNode {

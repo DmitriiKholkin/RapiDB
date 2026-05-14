@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import type { QueryEditorLanguage } from "../../shared/webviewContracts";
 import {
   type QueryResult,
   type SchemaObject,
@@ -23,6 +24,7 @@ interface Props {
   formatOnOpen?: boolean;
   connectionType?: string;
   isBookmarked?: boolean;
+  editorLanguage?: QueryEditorLanguage;
 }
 
 const btnStyle = (disabled = false): React.CSSProperties =>
@@ -43,12 +45,31 @@ const MIN_EDITOR_H = 80;
 const DEFAULT_EDITOR_RATIO = 0.7;
 const DEFAULT_EDITOR_H = 400;
 
+function isSqlConnectionType(connectionType?: string): boolean {
+  return ["pg", "mysql", "sqlite", "mssql", "oracle"].includes(
+    connectionType ?? "",
+  );
+}
+
+function deriveEditorLanguage(connectionType?: string): QueryEditorLanguage {
+  switch (connectionType) {
+    case "mongodb":
+      return "javascript";
+    case "redis":
+    case "elasticsearch":
+      return "plaintext";
+    default:
+      return "sql";
+  }
+}
+
 export function QueryView({
   connectionId,
   initialSql,
   formatOnOpen = false,
   connectionType = "",
   isBookmarked: initialIsBookmarked = false,
+  editorLanguage,
 }: Props): React.ReactElement {
   const editorRef = useRef<MonacoEditorHandle>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -98,7 +119,16 @@ export function QueryView({
   const activeConn = connections.find(
     (c) => c.id === (activeConnectionId || connectionId),
   );
-  const sqlDialect = connTypeToDialect(activeConn?.type ?? connectionType);
+  const activeConnectionType = activeConn?.type ?? connectionType;
+  const derivedEditorLanguage = deriveEditorLanguage(activeConnectionType);
+  const monacoLanguage = editorLanguage ?? derivedEditorLanguage;
+  const sqlDialect =
+    monacoLanguage === "sql"
+      ? isSqlConnectionType(activeConnectionType)
+        ? connTypeToDialect(activeConnectionType)
+        : "sql"
+      : undefined;
+  const editorLabel = monacoLanguage === "sql" ? "SQL editor" : "Query editor";
 
   useEffect(() => {
     setActiveConnection(connectionId);
@@ -177,7 +207,7 @@ export function QueryView({
   );
 
   useEffect(() => {
-    if (!formatOnOpen || !initialSql || didAutoFormat.current) {
+    if (!formatOnOpen || !initialSql || didAutoFormat.current || !sqlDialect) {
       return;
     }
     if (connections.length === 0) {
@@ -349,8 +379,12 @@ export function QueryView({
         {}
         <button
           type="button"
-          style={btnGhostStyle(false)}
+          style={btnGhostStyle(!sqlDialect)}
+          disabled={!sqlDialect}
           onClick={() => {
+            if (!sqlDialect) {
+              return;
+            }
             const err = editorRef.current?.format(sqlDialect) ?? null;
             if (err) {
               setError(`SQL format error: ${err}`);
@@ -412,6 +446,8 @@ export function QueryView({
           initialValue={initialSql || ""}
           schema={schema}
           dialect={sqlDialect}
+          language={monacoLanguage}
+          ariaLabel={editorLabel}
           onExecute={executeQuery}
           onChange={handleEditorChange}
           height="100%"

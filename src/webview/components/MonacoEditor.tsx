@@ -217,6 +217,7 @@ interface Props {
   initialValue?: string;
   schema?: SchemaObject[];
   dialect?: string;
+  language?: string;
   onChange?: (value: string) => void;
   onExecute?: (value: string) => void;
   height?: string | number;
@@ -230,6 +231,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       initialValue = "",
       schema = [],
       dialect = "sql",
+      language = "sql",
       onChange,
       onExecute,
       height = "100%",
@@ -245,6 +247,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
     const onExecuteRef = useRef(onExecute);
     const readOnlyRef = useRef(readOnly);
     const ariaLabelRef = useRef(ariaLabel);
+    const languageRef = useRef(language);
 
     useEffect(() => {
       initialValueRef.current = initialValue;
@@ -300,6 +303,17 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       dialectRef.current = dialect;
     }, [dialect]);
 
+    useEffect(() => {
+      languageRef.current = language;
+      const editor = editorRef.current;
+      if (editor) {
+        const model = editor.getModel();
+        if (model) {
+          monaco.editor.setModelLanguage(model, language);
+        }
+      }
+    }, [language]);
+
     useImperativeHandle(ref, () => ({
       getValue: () => editorRef.current?.getValue() ?? "",
       getSelectionOrValue: () => {
@@ -313,9 +327,12 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         return editor.getValue() ?? "";
       },
       setValue: (v) => editorRef.current?.setValue(v),
-      format: (dialect = "sql") => {
+      format: (requestedDialect?: string) => {
         const editor = editorRef.current;
         if (!editor || editor.getOption(monaco.editor.EditorOption.readOnly)) {
+          return null;
+        }
+        if (languageRef.current !== "sql") {
           return null;
         }
         const model = editor.getModel();
@@ -323,7 +340,10 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
           return null;
         }
         const raw = editor.getValue();
-        const out = formatSQLOrError(raw, dialect);
+        const out = formatSQLOrError(
+          raw,
+          requestedDialect ?? dialectRef.current ?? "sql",
+        );
         if ("error" in out) {
           return out.error;
         }
@@ -380,7 +400,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
 
       const editor = monaco.editor.create(containerRef.current, {
         value: initialValueRef.current,
-        language: "sql",
+        language: languageRef.current,
         theme: RAPIDB_THEME,
         ariaLabel: ariaLabelRef.current,
         fontSize: parseInt(
@@ -516,6 +536,9 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyF,
         () => {
           if (readOnlyRef.current) {
+            return;
+          }
+          if (languageRef.current !== "sql") {
             return;
           }
           const model = editor.getModel();

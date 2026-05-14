@@ -4,12 +4,14 @@ import type {
   ColumnMeta,
   ColumnTypeMeta,
   DatabaseInfo,
+  DriverEntityManifest,
   IDBDriver,
   SchemaInfo,
   TableConstraintMeta,
   TableInfo,
   TriggerMeta,
 } from "../../src/extension/dbDrivers/types";
+import { DEFAULT_DRIVER_ENTITY_MANIFEST } from "../../src/extension/dbDrivers/types";
 import {
   createExtensionContextStub,
   FakeConnectionManagerStore,
@@ -45,6 +47,7 @@ interface DriverBehavior {
     schema: string,
     table: string,
   ) => TriggerMeta[] | null | Promise<TriggerMeta[] | null>;
+  entityManifest?: DriverEntityManifest;
 }
 
 const driverBehaviors = new Map<string, DriverBehavior>();
@@ -155,6 +158,13 @@ class FakeDriver implements IDBDriver {
 
   isConnected(): boolean {
     return this.connected;
+  }
+
+  getEntityManifest(): DriverEntityManifest {
+    return (
+      driverBehaviors.get(this.config.id)?.entityManifest ??
+      DEFAULT_DRIVER_ENTITY_MANIFEST
+    );
   }
 
   async listDatabases() {
@@ -361,10 +371,14 @@ class FakeDriver implements IDBDriver {
 
 function driverFactory() {
   return {
+    DynamoDBDriver: FakeDriver,
+    ElasticsearchDriver: FakeDriver,
     MSSQLDriver: FakeDriver,
+    MongoDBDriver: FakeDriver,
     MySQLDriver: FakeDriver,
     OracleDriver: FakeDriver,
     PostgresDriver: FakeDriver,
+    RedisDriver: FakeDriver,
     SQLiteDriver: FakeDriver,
   };
 }
@@ -375,10 +389,14 @@ vi.mock("vscode", () => ({
   window: {},
 }));
 
+vi.mock("../../src/extension/dbDrivers/dynamodb", driverFactory);
+vi.mock("../../src/extension/dbDrivers/elasticsearch", driverFactory);
 vi.mock("../../src/extension/dbDrivers/mssql", driverFactory);
+vi.mock("../../src/extension/dbDrivers/mongodb", driverFactory);
 vi.mock("../../src/extension/dbDrivers/mysql", driverFactory);
 vi.mock("../../src/extension/dbDrivers/oracle", driverFactory);
 vi.mock("../../src/extension/dbDrivers/postgres", driverFactory);
+vi.mock("../../src/extension/dbDrivers/redis", driverFactory);
 vi.mock("../../src/extension/dbDrivers/sqlite", driverFactory);
 
 beforeEach(() => {
@@ -592,6 +610,47 @@ describe("ConnectionManager", () => {
     expect(driverInstances[0]?.disconnectCalls).toBe(1);
   });
 
+  it("hydrates stored DynamoDB credentials from Secret Storage before connecting", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-ddb",
+        name: "Dynamo",
+        type: "dynamodb",
+        awsRegion: "us-east-1",
+        useSecretStorage: true,
+      },
+    ]);
+    store.setSecret(
+      "conn-ddb",
+      JSON.stringify({
+        awsAccessKeyId: "AKIA123",
+        awsSecretAccessKey: "secret-key",
+        awsSessionToken: "session-token",
+      }),
+    );
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await manager.connectTo("conn-ddb");
+
+    expect(driverInstances[0]?.config).toMatchObject({
+      id: "conn-ddb",
+      type: "dynamodb",
+      awsRegion: "us-east-1",
+      awsAccessKeyId: "AKIA123",
+      awsSecretAccessKey: "secret-key",
+      awsSessionToken: "session-token",
+    });
+  });
+
   it("loads the baseline database and leaves other databases catalog-only until expanded", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
@@ -760,6 +819,83 @@ describe("ConnectionManager", () => {
       "app_db.public.daily_users",
       "app_db.audit.event_feed",
     ]);
+  });
+
+  it("filters schema objects by driver entity manifest kinds", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    driverBehaviors.set("conn-manifest", {
+      entityManifest: {
+        dbObjectKinds: ["table", "view", "function", "procedure"],
+        tableSections: {
+          columns: "supported",
+          constraints: "supported",
+          indexes: "supported",
+          triggers: "supported",
+        },
+      },
+      listDatabases: [{ name: "app_db", schemas: [] }],
+      listSchemasByDatabase: {
+        app_db: [{ name: "public" }],
+      },
+      listObjectsByScope: {
+        "app_db.public": [
+          { schema: "public", name: "users", type: "table" },
+          { schema: "public", name: "active_users", type: "view" },
+          {
+            schema: "public",
+            name: "daily_users",
+            type: "materializedView",
+          },
+          { schema: "public", name: "users_id_seq", type: "sequence" },
+          { schema: "public", name: "user_status", type: "type" },
+        ],
+      },
+      describeTableByScope: {
+        "app_db.public.users": [
+          {
+            name: "id",
+            type: "int",
+            nullable: false,
+            isPrimaryKey: false,
+            isForeignKey: false,
+          },
+        ],
+        "app_db.public.active_users": [
+          {
+            name: "id",
+            type: "int",
+            nullable: false,
+            isPrimaryKey: false,
+            isForeignKey: false,
+          },
+        ],
+      },
+    });
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-manifest",
+        name: "Manifested",
+        type: "mysql",
+        database: "app_db",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo("conn-manifest");
+
+    const schema = await manager.getSchemaAsync("conn-manifest");
+    expect(schema.map((entry) => entry.type)).toEqual(["table", "view"]);
+    expect(schema.find((entry) => entry.object === "daily_users")).toBeFalsy();
+    expect(schema.find((entry) => entry.object === "users_id_seq")).toBeFalsy();
+    expect(schema.find((entry) => entry.object === "user_status")).toBeFalsy();
   });
 
   it("refreshes cached schema metadata after a manual refresh request", async () => {
@@ -2089,5 +2225,84 @@ describe("ConnectionManager", () => {
       "app_db.public.users",
       "app_db.public.users",
     ]);
+  });
+
+  it("skips non-applicable table detail loaders per manifest", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    driverBehaviors.set("conn-sections", {
+      entityManifest: {
+        dbObjectKinds: ["table"],
+        tableSections: {
+          columns: "supported",
+          constraints: "not_applicable",
+          indexes: "supported",
+          triggers: "not_applicable",
+        },
+      },
+      listDatabases: [{ name: "app_db", schemas: [] }],
+      listSchemasByDatabase: {
+        app_db: [{ name: "public" }],
+      },
+      listObjectsByScope: {
+        "app_db.public": [{ schema: "public", name: "users", type: "table" }],
+      },
+      describeTableByScope: {
+        "app_db.public.users": [
+          {
+            name: "id",
+            type: "int",
+            nullable: false,
+            isPrimaryKey: true,
+            primaryKeyOrdinal: 1,
+            isForeignKey: false,
+          },
+        ],
+      },
+    });
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-sections",
+        name: "Sectioned",
+        type: "redis",
+        database: "app_db",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo("conn-sections");
+    await manager.getSchemaSnapshotAsync("conn-sections");
+
+    const request = {
+      connectionId: "conn-sections",
+      database: "app_db",
+      schema: "public",
+      table: "users",
+    };
+
+    manager.ensureTableDetailLoading(request);
+    await waitForTableDetailCondition(
+      manager,
+      "conn-sections",
+      () => manager.getTableDetailState(request).status === "loaded",
+    );
+
+    const state = manager.getTableDetailState(request);
+    expect(state.snapshot.columns.status).toBe("loaded");
+    expect(state.snapshot.constraints.items).toEqual([]);
+    expect(state.snapshot.triggers.items).toEqual([]);
+
+    expect(driverInstances[0]?.describeColumnsCalls).toEqual([
+      "app_db.public.users",
+    ]);
+    expect(driverInstances[0]?.getConstraintsCalls).toEqual([]);
+    expect(driverInstances[0]?.getTriggersCalls).toEqual([]);
   });
 });

@@ -7,6 +7,7 @@ import type {
   ColumnMeta,
   ColumnTypeMeta,
   DatabaseInfo,
+  DriverEntityManifest,
   FilterConditionResult,
   FilterOperator,
   GeneratedKind,
@@ -18,6 +19,16 @@ import type {
   TypeCategory,
   ValueSemantics,
 } from "./types";
+
+const SQLITE_ENTITY_MANIFEST: DriverEntityManifest = {
+  dbObjectKinds: ["table", "view"],
+  tableSections: {
+    columns: "supported",
+    constraints: "supported",
+    indexes: "supported",
+    triggers: "supported",
+  },
+};
 
 type SqlStatementKind = "select" | "dml";
 interface SQLiteTableXInfoRow {
@@ -646,6 +657,11 @@ export class SQLiteDriver extends BaseDBDriver {
   isConnected(): boolean {
     return this.db?.isOpen ?? false;
   }
+
+  getEntityManifest(): DriverEntityManifest {
+    return SQLITE_ENTITY_MANIFEST;
+  }
+
   async listDatabases(): Promise<DatabaseInfo[]> {
     return [{ name: "main", schemas: [] }];
   }

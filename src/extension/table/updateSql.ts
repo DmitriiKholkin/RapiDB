@@ -23,6 +23,13 @@ export function writableEntries(
   });
 }
 
+export function filterWritableRecord(
+  record: Record<string, unknown>,
+  colMap: Map<string, ColumnTypeMeta>,
+): Record<string, unknown> {
+  return Object.fromEntries(writableEntries(record, colMap));
+}
+
 export function buildUpdateRowSql(
   drv: IDBDriver,
   database: string,
@@ -69,13 +76,6 @@ export function buildUpdateRowSql(
     sql: `UPDATE ${qt} SET ${setParts.join(", ")} WHERE ${whereParts.join(" AND ")}`,
     params,
   };
-}
-
-function filterWritableRecord(
-  record: Record<string, unknown>,
-  colMap: Map<string, ColumnTypeMeta>,
-): Record<string, unknown> {
-  return Object.fromEntries(writableEntries(record, colMap));
 }
 
 function isWritableColumn(

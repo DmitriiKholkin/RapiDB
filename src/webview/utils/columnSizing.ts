@@ -37,6 +37,7 @@ export const COL_MIN = 100;
 export const COL_MAX = 420;
 const H_PAD = 16;
 const SORT_ICON_W = 20;
+const KEY_ICON_W = 16;
 const SAMPLE_ROWS = 50;
 
 export interface ColSizeOpts {
@@ -59,8 +60,9 @@ export function calcColWidth(
   const max = opts.max ?? COL_MAX;
   const sampleRows = opts.sampleRows ?? SAMPLE_ROWS;
 
-  const iconSuffix = `${isPrimaryKey ? "key" : ""}${isForeignKey ? "key" : ""}`;
-  let maxContentW = measureText(`${colName}${iconSuffix}`) + SORT_ICON_W;
+  const indicatorWidth =
+    (isPrimaryKey ? KEY_ICON_W : 0) + (isForeignKey ? KEY_ICON_W : 0);
+  let maxContentW = measureText(colName) + indicatorWidth + SORT_ICON_W;
 
   const rowKey = dataKey ?? colName;
   const limit = Math.min(rows.length, sampleRows);
@@ -80,6 +82,7 @@ export interface Column {
 
   dataKey?: string;
   isPrimaryKey: boolean;
+  primaryKeyRole?: "partition" | "sort";
   isForeignKey: boolean;
 }
 

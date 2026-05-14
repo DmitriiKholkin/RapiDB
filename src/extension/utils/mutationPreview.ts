@@ -1,6 +1,16 @@
 import { format as formatSql } from "sql-formatter";
 import type { ConnectionType } from "../../shared/connectionTypes";
 
+function usesSqlPreviewFormatting(
+  connectionType: ConnectionType | undefined,
+): boolean {
+  return (
+    connectionType !== "mongodb" &&
+    connectionType !== "redis" &&
+    connectionType !== "elasticsearch"
+  );
+}
+
 function formatterLanguageForConnection(
   connectionType: ConnectionType | undefined,
 ): "postgresql" | "mysql" | "transactsql" | "sqlite" | "plsql" | "sql" {
@@ -32,6 +42,13 @@ export function formatMutationPreviewSql(
   statements: readonly string[],
   connectionType: ConnectionType | undefined,
 ): string {
+  if (!usesSqlPreviewFormatting(connectionType)) {
+    return statements
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+      .join("\n\n");
+  }
+
   const language = formatterLanguageForConnection(connectionType);
 
   return statements

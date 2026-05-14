@@ -1,5 +1,6 @@
 import type { ConnectionConfig } from "./connectionConfig";
 import { CONNECTION_TYPES, type ConnectionType } from "./connectionTypes";
+import type { PrimaryKeyRole } from "./tableTypes";
 
 export interface WebviewMessageEnvelope<
   TType extends string = string,
@@ -32,6 +33,8 @@ export interface ApplyResultPayload {
   insertApplied?: boolean;
 }
 
+export type QueryEditorLanguage = "sql" | "javascript" | "plaintext";
+
 export interface QueryInitialState {
   view: "query";
   connectionId: string;
@@ -39,6 +42,7 @@ export interface QueryInitialState {
   initialSql?: string;
   formatOnOpen?: boolean;
   isBookmarked?: boolean;
+  editorLanguage?: QueryEditorLanguage;
 }
 
 export interface TableInitialState {
@@ -62,6 +66,7 @@ export interface ErdNodeColumn {
   name: string;
   type: string;
   isPrimaryKey: boolean;
+  primaryKeyRole?: PrimaryKeyRole;
   isForeignKey: boolean;
   nullable: boolean;
 }
@@ -290,6 +295,14 @@ function readConnectionType(value: unknown): ConnectionType | "" | undefined {
     : undefined;
 }
 
+function readQueryEditorLanguage(
+  value: unknown,
+): QueryEditorLanguage | undefined {
+  return value === "sql" || value === "javascript" || value === "plaintext"
+    ? value
+    : undefined;
+}
+
 function parseEnvelope(input: unknown): WebviewMessageEnvelope | null {
   if (!isRecord(input)) {
     return null;
@@ -339,6 +352,30 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
     serviceName: readOptionalString(input, "serviceName"),
     thickMode: readOptionalBoolean(input, "thickMode"),
     clientPath: readOptionalString(input, "clientPath"),
+    connectionUri:
+      readOptionalString(input, "connectionUri") ??
+      readOptionalString(input, "uri"),
+    authDatabase:
+      readOptionalString(input, "authDatabase") ??
+      readOptionalString(input, "authSource"),
+    replicaSet: readOptionalString(input, "replicaSet"),
+    directConnection: readOptionalBoolean(input, "directConnection"),
+    redisUsername: readOptionalString(input, "redisUsername"),
+    keyPrefix: readOptionalString(input, "keyPrefix"),
+    awsProfile: readOptionalString(input, "awsProfile"),
+    endpoint:
+      readOptionalString(input, "endpoint") ??
+      readOptionalString(input, "awsEndpoint"),
+    apiKey: readOptionalString(input, "apiKey"),
+    cloudId: readOptionalString(input, "cloudId"),
+    uri: readOptionalString(input, "uri"),
+    authSource: readOptionalString(input, "authSource"),
+    redisDb: readOptionalNumber(input, "redisDb"),
+    awsRegion: readOptionalString(input, "awsRegion"),
+    awsAccessKeyId: readOptionalString(input, "awsAccessKeyId"),
+    awsSecretAccessKey: readOptionalString(input, "awsSecretAccessKey"),
+    awsSessionToken: readOptionalString(input, "awsSessionToken"),
+    awsEndpoint: readOptionalString(input, "awsEndpoint"),
     useSecretStorage: readOptionalBoolean(input, "useSecretStorage"),
   };
 }
@@ -392,6 +429,7 @@ export function parseWebviewInitialState(
         initialSql: readOptionalString(input, "initialSql"),
         formatOnOpen: readOptionalBoolean(input, "formatOnOpen"),
         isBookmarked: readOptionalBoolean(input, "isBookmarked"),
+        editorLanguage: readQueryEditorLanguage(input.editorLanguage),
       };
     }
 

@@ -175,8 +175,82 @@ describe("parseConnectionFormPanelMessage", () => {
         serviceName: undefined,
         thickMode: undefined,
         clientPath: undefined,
+        connectionUri: undefined,
+        authDatabase: undefined,
+        replicaSet: undefined,
+        directConnection: undefined,
+        redisUsername: undefined,
+        keyPrefix: undefined,
+        awsProfile: undefined,
+        endpoint: undefined,
+        apiKey: undefined,
+        cloudId: undefined,
+        uri: undefined,
+        authSource: undefined,
+        redisDb: undefined,
+        awsRegion: undefined,
+        awsAccessKeyId: undefined,
+        awsSecretAccessKey: undefined,
+        awsSessionToken: undefined,
+        awsEndpoint: undefined,
         useSecretStorage: undefined,
         password: "secret",
+        hasStoredSecret: undefined,
+      },
+    });
+  });
+
+  it("normalizes alias fields for new NoSQL connection payloads", () => {
+    const parsed = parseConnectionFormPanelMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-nosql",
+        name: "Mongo Local",
+        type: "mongodb",
+        uri: "mongodb://localhost:27017/app",
+        authSource: "admin",
+        awsEndpoint: "http://localhost:8000",
+        redisDb: 2,
+      },
+    });
+
+    expect(parsed).toEqual({
+      type: "saveConnection",
+      payload: {
+        id: "conn-nosql",
+        name: "Mongo Local",
+        type: "mongodb",
+        host: undefined,
+        port: undefined,
+        database: undefined,
+        username: undefined,
+        filePath: undefined,
+        ssl: undefined,
+        rejectUnauthorized: undefined,
+        folder: undefined,
+        serviceName: undefined,
+        thickMode: undefined,
+        clientPath: undefined,
+        connectionUri: "mongodb://localhost:27017/app",
+        authDatabase: "admin",
+        replicaSet: undefined,
+        directConnection: undefined,
+        redisUsername: undefined,
+        keyPrefix: undefined,
+        awsProfile: undefined,
+        endpoint: "http://localhost:8000",
+        apiKey: undefined,
+        cloudId: undefined,
+        uri: "mongodb://localhost:27017/app",
+        authSource: "admin",
+        redisDb: 2,
+        awsRegion: undefined,
+        awsAccessKeyId: undefined,
+        awsSecretAccessKey: undefined,
+        awsSessionToken: undefined,
+        awsEndpoint: "http://localhost:8000",
+        useSecretStorage: undefined,
+        password: undefined,
         hasStoredSecret: undefined,
       },
     });
@@ -206,6 +280,7 @@ describe("parseWebviewInitialState", () => {
       initialSql: "select 1",
       formatOnOpen: true,
       isBookmarked: false,
+      editorLanguage: "sql",
     });
 
     expect(parsed).toEqual({
@@ -215,6 +290,7 @@ describe("parseWebviewInitialState", () => {
       initialSql: "select 1",
       formatOnOpen: true,
       isBookmarked: false,
+      editorLanguage: "sql",
     });
   });
 
@@ -232,6 +308,43 @@ describe("parseWebviewInitialState", () => {
       initialSql: undefined,
       formatOnOpen: undefined,
       isBookmarked: undefined,
+      editorLanguage: undefined,
+    });
+  });
+
+  it("parses NoSQL editor language overrides for query state", () => {
+    expect(
+      parseWebviewInitialState({
+        view: "query",
+        connectionId: "conn-js",
+        connectionType: "mongodb",
+        editorLanguage: "javascript",
+      }),
+    ).toEqual({
+      view: "query",
+      connectionId: "conn-js",
+      connectionType: "mongodb",
+      initialSql: undefined,
+      formatOnOpen: undefined,
+      isBookmarked: undefined,
+      editorLanguage: "javascript",
+    });
+
+    expect(
+      parseWebviewInitialState({
+        view: "query",
+        connectionId: "conn-text",
+        connectionType: "elasticsearch",
+        editorLanguage: "plaintext",
+      }),
+    ).toEqual({
+      view: "query",
+      connectionId: "conn-text",
+      connectionType: "elasticsearch",
+      initialSql: undefined,
+      formatOnOpen: undefined,
+      isBookmarked: undefined,
+      editorLanguage: "plaintext",
     });
   });
 
@@ -285,6 +398,24 @@ describe("parseWebviewInitialState", () => {
         serviceName: undefined,
         thickMode: undefined,
         clientPath: undefined,
+        connectionUri: undefined,
+        authDatabase: undefined,
+        replicaSet: undefined,
+        directConnection: undefined,
+        redisUsername: undefined,
+        keyPrefix: undefined,
+        awsProfile: undefined,
+        endpoint: undefined,
+        apiKey: undefined,
+        cloudId: undefined,
+        uri: undefined,
+        authSource: undefined,
+        redisDb: undefined,
+        awsRegion: undefined,
+        awsAccessKeyId: undefined,
+        awsSecretAccessKey: undefined,
+        awsSessionToken: undefined,
+        awsEndpoint: undefined,
         useSecretStorage: undefined,
         hasStoredSecret: true,
       },

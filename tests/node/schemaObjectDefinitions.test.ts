@@ -1,8 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
+import { DynamoDBDriver } from "../../src/extension/dbDrivers/dynamodb";
+import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
+import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
 import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
 import { OracleDriver } from "../../src/extension/dbDrivers/oracle";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
+import { RedisDriver } from "../../src/extension/dbDrivers/redis";
 import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
@@ -55,6 +59,39 @@ const sqliteConfig = {
   name: "SQLite Schema Objects",
   type: "sqlite",
   filePath: "/tmp/rapidb-schema-object-definitions.sqlite",
+} as const satisfies Partial<ConnectionConfig>;
+
+const mongodbConfig = {
+  id: "mongodb-schema-object-definitions",
+  name: "MongoDB Schema Objects",
+  type: "mongodb",
+  host: "127.0.0.1",
+  port: 27017,
+  database: "rapidb",
+} as const satisfies Partial<ConnectionConfig>;
+
+const dynamodbConfig = {
+  id: "dynamodb-schema-object-definitions",
+  name: "DynamoDB Schema Objects",
+  type: "dynamodb",
+  awsRegion: "us-east-1",
+} as const satisfies Partial<ConnectionConfig>;
+
+const elasticsearchConfig = {
+  id: "elasticsearch-schema-object-definitions",
+  name: "Elasticsearch Schema Objects",
+  type: "elasticsearch",
+  host: "127.0.0.1",
+  port: 9200,
+  database: "rapidb",
+} as const satisfies Partial<ConnectionConfig>;
+
+const redisConfig = {
+  id: "redis-schema-object-definitions",
+  name: "Redis Schema Objects",
+  type: "redis",
+  host: "127.0.0.1",
+  port: 6379,
 } as const satisfies Partial<ConnectionConfig>;
 
 describe("schema object definitions", () => {
@@ -354,6 +391,226 @@ describe("schema object definitions", () => {
     ).resolves.toBeNull();
   });
 
+  it("lists MongoDB collections and views while hiding system namespaces", async () => {
+    const driver = new MongoDBDriver(mongodbConfig as ConnectionConfig);
+    const toArray = vi.fn().mockResolvedValue([
+      { name: "system.views", type: "collection" },
+      { name: "users", type: "collection" },
+      { name: "active_users", type: "view" },
+    ]);
+    const listCollections = vi.fn().mockReturnValue({ toArray });
+
+    (
+      driver as unknown as {
+        client: {
+          db: (database?: string) => {
+            listCollections: typeof listCollections;
+          };
+        };
+        connected: boolean;
+      }
+    ).client = {
+      db: vi.fn().mockReturnValue({ listCollections }),
+    };
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    await expect(driver.listObjects("rapidb")).resolves.toEqual([
+      { schema: "rapidb", name: "users", type: "table" },
+      { schema: "rapidb", name: "active_users", type: "view" },
+    ]);
+    expect(listCollections).toHaveBeenCalledWith({}, { nameOnly: false });
+  });
+
+  it("renders MongoDB collection, view, and index DDL in mongosh syntax", async () => {
+    const driver = new MongoDBDriver(mongodbConfig as ConnectionConfig);
+    const listCollections = vi.fn(({ name }: { name?: string }) => ({
+      toArray: vi.fn().mockResolvedValue(
+        name === "active_users"
+          ? [
+              {
+                name: "active_users",
+                type: "view",
+                options: {
+                  viewOn: "users",
+                  pipeline: [{ $match: { active: true } }],
+                },
+              },
+            ]
+          : [
+              {
+                name: "users",
+                type: "collection",
+                options: {
+                  validator: { $jsonSchema: { bsonType: "object" } },
+                },
+              },
+            ],
+      ),
+    }));
+    const indexes = vi.fn().mockResolvedValue([
+      {
+        name: "users_by_email",
+        key: { email: 1 },
+        unique: true,
+      },
+    ]);
+
+    (
+      driver as unknown as {
+        client: {
+          db: (database: string) => {
+            listCollections: typeof listCollections;
+            collection: (name: string) => { indexes: typeof indexes };
+          };
+        };
+        connected: boolean;
+      }
+    ).client = {
+      db: vi.fn((_database: string) => ({
+        listCollections,
+        collection: vi.fn((_name: string) => ({ indexes })),
+      })),
+    };
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    await expect(
+      driver.getCreateTableDDL("rapidb", "ignored", "users"),
+    ).resolves.toBe(
+      'db.getSiblingDB("rapidb").createCollection(\n  "users",\n  { "validator": { "$jsonSchema": { "bsonType": "object" } } }\n);',
+    );
+    await expect(
+      driver.getCreateTableDDL("rapidb", "ignored", "active_users"),
+    ).resolves.toBe(
+      'db.getSiblingDB("rapidb").createView(\n  "active_users",\n  "users",\n  [{ "$match": { "active": true } }]\n);',
+    );
+    await expect(
+      driver.getIndexDDL("rapidb", "ignored", "users", "users_by_email"),
+    ).resolves.toBe(
+      'db.getSiblingDB("rapidb").getCollection("users").createIndex(\n  { "email": 1 },\n  { "name": "users_by_email", "unique": true }\n);',
+    );
+  });
+
+  it("renders DynamoDB table and GSI DDL while marking LSIs unsupported", async () => {
+    const driver = new DynamoDBDriver(dynamodbConfig as ConnectionConfig);
+    const send = vi.fn(async (_command: unknown) => ({
+      Table: {
+        TableName: "Users",
+        AttributeDefinitions: [
+          { AttributeName: "pk", AttributeType: "S" },
+          { AttributeName: "sk", AttributeType: "S" },
+          { AttributeName: "email", AttributeType: "S" },
+        ],
+        KeySchema: [
+          { AttributeName: "pk", KeyType: "HASH" },
+          { AttributeName: "sk", KeyType: "RANGE" },
+        ],
+        BillingModeSummary: { BillingMode: "PAY_PER_REQUEST" },
+        GlobalSecondaryIndexes: [
+          {
+            IndexName: "UsersByEmail",
+            KeySchema: [{ AttributeName: "email", KeyType: "HASH" }],
+            Projection: { ProjectionType: "ALL" },
+          },
+        ],
+        LocalSecondaryIndexes: [
+          {
+            IndexName: "UsersBySortKey",
+            KeySchema: [
+              { AttributeName: "pk", KeyType: "HASH" },
+              { AttributeName: "sk", KeyType: "RANGE" },
+            ],
+            Projection: { ProjectionType: "KEYS_ONLY" },
+          },
+        ],
+      },
+    }));
+
+    (
+      driver as unknown as {
+        client: { send: typeof send };
+        connected: boolean;
+      }
+    ).client = { send };
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    await expect(
+      driver.getIndexes("us-east-1", "ignored", "Users"),
+    ).resolves.toEqual([
+      {
+        name: "UsersByEmail",
+        columns: ["email"],
+        unique: false,
+        primary: false,
+        ddlSupport: "supported",
+      },
+      {
+        name: "UsersBySortKey",
+        columns: ["pk", "sk"],
+        unique: false,
+        primary: false,
+        ddlSupport: "unsupported",
+      },
+    ]);
+    await expect(
+      driver.getCreateTableDDL("us-east-1", "ignored", "Users"),
+    ).resolves.toContain("aws dynamodb create-table");
+    await expect(
+      driver.getIndexDDL("us-east-1", "ignored", "Users", "UsersByEmail"),
+    ).resolves.toContain("--global-secondary-index-updates");
+    await expect(
+      driver.getIndexDDL("us-east-1", "ignored", "Users", "UsersBySortKey"),
+    ).rejects.toThrow(/only global secondary indexes/i);
+  });
+
+  it("renders Elasticsearch index DDL with filtered settings, mappings, and aliases", async () => {
+    const driver = new ElasticsearchDriver(
+      elasticsearchConfig as ConnectionConfig,
+    );
+
+    (
+      driver as unknown as {
+        client: {
+          indices: {
+            get: typeof vi.fn;
+          };
+        };
+        connected: boolean;
+      }
+    ).client = {
+      indices: {
+        get: vi.fn().mockResolvedValue({
+          users: {
+            settings: {
+              index: {
+                number_of_shards: "1",
+                number_of_replicas: "1",
+                provided_name: "users",
+                creation_date: "1700000000000",
+                uuid: "abc123",
+                version: { created: "8500000" },
+              },
+            },
+            mappings: {
+              properties: {
+                email: { type: "keyword" },
+              },
+            },
+            aliases: {
+              users_read: {},
+            },
+          },
+        }),
+      },
+    };
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    await expect(
+      driver.getCreateTableDDL("default", "indices", "users"),
+    ).resolves.toBe(
+      'PUT /users\n{\n  "settings": {\n    "number_of_shards": "1",\n    "number_of_replicas": "1"\n  },\n  "mappings": {\n    "properties": {\n      "email": {\n        "type": "keyword"\n      }\n    }\n  },\n  "aliases": {\n    "users_read": {}\n  }\n}',
+    );
+  });
+
   it("lists Oracle materialized views, sequences, and types and renders metadata DDL", async () => {
     const driver = new OracleDriver(oracleConfig as ConnectionConfig);
     const execute = vi.fn(async (sql: string) => {
@@ -439,5 +696,144 @@ describe("schema object definitions", () => {
     ).resolves.toBe(
       'CREATE TYPE "APP"."USER_STATUS" AS OBJECT (STATUS VARCHAR2(32));',
     );
+  });
+
+  it("declares driver-specific entity manifests for all supported drivers", () => {
+    const manifests = {
+      mssql: new MSSQLDriver(
+        mssqlConfig as ConnectionConfig,
+      ).getEntityManifest(),
+      mysql: new MySQLDriver(
+        mysqlConfig as ConnectionConfig,
+      ).getEntityManifest(),
+      postgres: new PostgresDriver(
+        postgresConfig as ConnectionConfig,
+      ).getEntityManifest(),
+      sqlite: new SQLiteDriver(
+        sqliteConfig as ConnectionConfig,
+      ).getEntityManifest(),
+      oracle: new OracleDriver(
+        oracleConfig as ConnectionConfig,
+      ).getEntityManifest(),
+      mongodb: new MongoDBDriver(
+        mongodbConfig as ConnectionConfig,
+      ).getEntityManifest(),
+      dynamodb: new DynamoDBDriver(
+        dynamodbConfig as ConnectionConfig,
+      ).getEntityManifest(),
+      elasticsearch: new ElasticsearchDriver(
+        elasticsearchConfig as ConnectionConfig,
+      ).getEntityManifest(),
+      redis: new RedisDriver(
+        redisConfig as ConnectionConfig,
+      ).getEntityManifest(),
+    };
+
+    expect(manifests).toEqual({
+      mssql: {
+        dbObjectKinds: [
+          "table",
+          "view",
+          "function",
+          "procedure",
+          "sequence",
+          "type",
+        ],
+        tableSections: {
+          columns: "supported",
+          constraints: "supported",
+          indexes: "supported",
+          triggers: "supported",
+        },
+      },
+      mysql: {
+        dbObjectKinds: ["table", "view", "function", "procedure"],
+        tableSections: {
+          columns: "supported",
+          constraints: "supported",
+          indexes: "supported",
+          triggers: "supported",
+        },
+      },
+      postgres: {
+        dbObjectKinds: [
+          "table",
+          "view",
+          "materializedView",
+          "function",
+          "procedure",
+          "sequence",
+          "type",
+        ],
+        tableSections: {
+          columns: "supported",
+          constraints: "supported",
+          indexes: "supported",
+          triggers: "supported",
+        },
+      },
+      sqlite: {
+        dbObjectKinds: ["table", "view"],
+        tableSections: {
+          columns: "supported",
+          constraints: "supported",
+          indexes: "supported",
+          triggers: "supported",
+        },
+      },
+      oracle: {
+        dbObjectKinds: [
+          "table",
+          "view",
+          "materializedView",
+          "function",
+          "procedure",
+          "sequence",
+          "type",
+        ],
+        tableSections: {
+          columns: "supported",
+          constraints: "supported",
+          indexes: "supported",
+          triggers: "supported",
+        },
+      },
+      mongodb: {
+        dbObjectKinds: ["table", "view"],
+        tableSections: {
+          columns: "supported",
+          constraints: "not_applicable",
+          indexes: "supported",
+          triggers: "not_applicable",
+        },
+      },
+      dynamodb: {
+        dbObjectKinds: ["table"],
+        tableSections: {
+          columns: "supported",
+          constraints: "not_applicable",
+          indexes: "supported",
+          triggers: "not_applicable",
+        },
+      },
+      elasticsearch: {
+        dbObjectKinds: ["table"],
+        tableSections: {
+          columns: "supported",
+          constraints: "not_applicable",
+          indexes: "supported",
+          triggers: "not_applicable",
+        },
+      },
+      redis: {
+        dbObjectKinds: ["table"],
+        tableSections: {
+          columns: "supported",
+          constraints: "not_applicable",
+          indexes: "not_applicable",
+          triggers: "not_applicable",
+        },
+      },
+    });
   });
 });

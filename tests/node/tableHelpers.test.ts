@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import type {
   ColumnTypeMeta,
@@ -6,7 +6,10 @@ import type {
 } from "../../src/extension/dbDrivers/types";
 import { buildWhere } from "../../src/extension/table/filterSql";
 import { buildInsertRowOperation } from "../../src/extension/table/insertSql";
-import { prepareApplyChangesPlan } from "../../src/extension/table/tableMutationExecution";
+import {
+  executePreparedApplyPlan,
+  prepareApplyChangesPlan,
+} from "../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
@@ -489,5 +492,307 @@ describe("table helpers", () => {
         [{ tenant_id: 1, external_id: 2, description: "extra" }],
       ),
     ).rejects.toThrow(/full primary key/i);
+  });
+
+  it("builds and executes driver-backed update plans with warning on partial matches", async () => {
+    const driver: IDBDriver = {
+      ...fakeDriver,
+      coerceInputValue: (value, column) => {
+        if (typeof value !== "string") {
+          return value;
+        }
+        if (column.category === "integer") {
+          return Number.parseInt(value, 10);
+        }
+        if (column.name === "display_name") {
+          return value.trim().toUpperCase();
+        }
+        return value;
+      },
+      updateRows: async () => ({ affectedRows: 1 }),
+    };
+
+    const prepared = prepareApplyChangesPlan(
+      {
+        getDriver: () => driver,
+      } as never,
+      "conn-1",
+      "main",
+      "public",
+      "fixture_rows",
+      [
+        {
+          primaryKeys: { id: "1" },
+          changes: { display_name: " Alpha Updated " },
+        },
+        {
+          primaryKeys: { id: "2" },
+          changes: { display_name: " Beta Updated " },
+        },
+      ],
+      columns,
+    );
+
+    expect(prepared.executable).toBe(true);
+    if (!prepared.executable) {
+      throw new Error("Expected executable plan");
+    }
+
+    expect(prepared.plan.mode).toBe("driver");
+    expect(prepared.plan.previewStatements).toEqual([
+      'UPDATE public.fixture_rows {"primaryKeys":{"id":1},"changes":{"display_name":"ALPHA UPDATED"}}',
+      'UPDATE public.fixture_rows {"primaryKeys":{"id":2},"changes":{"display_name":"BETA UPDATED"}}',
+    ]);
+
+    const result = await executePreparedApplyPlan(
+      {
+        getDriver: () => driver,
+      } as never,
+      prepared.plan,
+    );
+
+    expect(result).toEqual({
+      success: true,
+      warning: "Some updates may not have matched a row in the source backend.",
+      rowOutcomes: [
+        { rowIndex: 0, success: true, status: "applied" },
+        { rowIndex: 1, success: true, status: "applied" },
+      ],
+    });
+  });
+
+  it("skips driver-backed updates whose writable change set becomes empty", async () => {
+    const updateRowsSpy = vi.fn(async () => ({ affectedRows: 1 }));
+    const driver: IDBDriver = {
+      ...fakeDriver,
+      updateRows: updateRowsSpy,
+    };
+
+    const prepared = prepareApplyChangesPlan(
+      {
+        getDriver: () => driver,
+      } as never,
+      "conn-1",
+      "main",
+      "public",
+      "fixture_rows",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { display_name: undefined, missing: "ignored" },
+        },
+        {
+          primaryKeys: { id: 2 },
+          changes: { display_name: "Updated" },
+        },
+      ],
+      columns,
+    );
+
+    expect(prepared.executable).toBe(true);
+    if (!prepared.executable) {
+      throw new Error("Expected executable plan");
+    }
+
+    expect(prepared.plan.previewStatements).toEqual([
+      'UPDATE public.fixture_rows {"primaryKeys":{"id":2},"changes":{"display_name":"Updated"}}',
+    ]);
+    expect(prepared.plan.skippedRows).toEqual([0]);
+
+    const result = await executePreparedApplyPlan(
+      {
+        getDriver: () => driver,
+      } as never,
+      prepared.plan,
+    );
+
+    expect(updateRowsSpy).toHaveBeenCalledWith({
+      database: "main",
+      schema: "public",
+      table: "fixture_rows",
+      updates: [
+        {
+          primaryKeys: { id: 2 },
+          changes: { display_name: "Updated" },
+        },
+      ],
+    });
+    expect(result).toEqual({
+      success: true,
+      rowOutcomes: [
+        {
+          rowIndex: 0,
+          success: true,
+          status: "skipped",
+          message: "No changes to apply.",
+        },
+        { rowIndex: 1, success: true, status: "applied" },
+      ],
+    });
+  });
+
+  it("uses driver mutation hooks for update, insert, and delete flows", async () => {
+    const updateRows = async () => ({ affectedRows: 1 });
+    const insertRow = async () => ({ affectedRows: 1 });
+    const deleteRows = async () => ({ affectedRows: 2 });
+    const driver: IDBDriver = {
+      ...fakeDriver,
+      coerceInputValue: (value, column) => {
+        if (typeof value !== "string") {
+          return value;
+        }
+        if (column.category === "integer") {
+          return Number.parseInt(value, 10);
+        }
+        if (column.name === "display_name") {
+          return value.trim().toUpperCase();
+        }
+        return value;
+      },
+      updateRows,
+      insertRow,
+      deleteRows,
+    };
+    const updateRowsSpy = vi.spyOn(driver, "updateRows");
+    const insertRowSpy = vi.spyOn(driver, "insertRow");
+    const deleteRowsSpy = vi.spyOn(driver, "deleteRows");
+
+    const mutationService = new TableMutationService(
+      {
+        getConnection: () => ({ id: "conn-1" }),
+        getDriver: () => driver,
+      } as never,
+      {
+        getColumns: async () => columns,
+      },
+    );
+
+    await mutationService.updateRow(
+      "conn-1",
+      "main",
+      "public",
+      "fixture_rows",
+      { id: "1" },
+      { display_name: "  Updated  " },
+    );
+
+    expect(updateRowsSpy).toHaveBeenCalledWith({
+      database: "main",
+      schema: "public",
+      table: "fixture_rows",
+      updates: [
+        {
+          primaryKeys: { id: 1 },
+          changes: { display_name: "UPDATED" },
+        },
+      ],
+    });
+
+    const insertPlan = await mutationService.prepareInsertRow(
+      "conn-1",
+      "main",
+      "public",
+      "fixture_rows",
+      { id: "3", display_name: " inserted " },
+    );
+
+    expect(insertPlan.mode).toBe("driver");
+    expect(insertPlan.previewStatements).toEqual([
+      'INSERT public.fixture_rows {"id":3,"display_name":"INSERTED"}',
+    ]);
+
+    await mutationService.executePreparedInsertPlan(insertPlan);
+
+    expect(insertRowSpy).toHaveBeenCalledWith({
+      database: "main",
+      schema: "public",
+      table: "fixture_rows",
+      values: { id: 3, display_name: "INSERTED" },
+    });
+
+    const deletePlan = await mutationService.prepareDeleteRowsPlan(
+      "conn-1",
+      "main",
+      "public",
+      "fixture_rows",
+      [{ id: "1" }, { id: "2" }],
+    );
+
+    expect(deletePlan).not.toBeNull();
+    expect(deletePlan?.mode).toBe("driver");
+    expect(deletePlan?.previewStatements).toEqual([
+      'DELETE public.fixture_rows {"id":1}',
+      'DELETE public.fixture_rows {"id":2}',
+    ]);
+
+    if (!deletePlan) {
+      throw new Error("Expected delete plan");
+    }
+
+    await mutationService.executePreparedDeletePlan(deletePlan);
+
+    expect(deleteRowsSpy).toHaveBeenCalledWith({
+      database: "main",
+      schema: "public",
+      table: "fixture_rows",
+      primaryKeyValuesList: [{ id: 1 }, { id: 2 }],
+    });
+  });
+
+  it("throws when a driver-backed update reports no affected rows", async () => {
+    const driver: IDBDriver = {
+      ...fakeDriver,
+      updateRows: async () => ({ affectedRows: 0 }),
+    };
+
+    const mutationService = new TableMutationService(
+      {
+        getConnection: () => ({ id: "conn-1" }),
+        getDriver: () => driver,
+      } as never,
+      {
+        getColumns: async () => columns,
+      },
+    );
+
+    await expect(
+      mutationService.updateRow(
+        "conn-1",
+        "main",
+        "public",
+        "fixture_rows",
+        { id: 1 },
+        { display_name: "Missing" },
+      ),
+    ).rejects.toThrow(/row not found/i);
+  });
+
+  it("does not call driver-backed update hooks when no writable changes remain", async () => {
+    const updateRowsSpy = vi.fn(async () => ({ affectedRows: 1 }));
+    const driver: IDBDriver = {
+      ...fakeDriver,
+      updateRows: updateRowsSpy,
+    };
+
+    const mutationService = new TableMutationService(
+      {
+        getConnection: () => ({ id: "conn-1" }),
+        getDriver: () => driver,
+      } as never,
+      {
+        getColumns: async () => columns,
+      },
+    );
+
+    await mutationService.updateRow(
+      "conn-1",
+      "main",
+      "public",
+      "fixture_rows",
+      { id: 1 },
+      { display_name: undefined, missing: "ignored" },
+    );
+
+    expect(updateRowsSpy).not.toHaveBeenCalled();
   });
 });

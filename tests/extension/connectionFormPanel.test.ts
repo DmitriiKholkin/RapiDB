@@ -186,6 +186,70 @@ describe("ConnectionFormPanel", () => {
     await expect(promise).resolves.toBeUndefined();
   });
 
+  it("stores DynamoDB credentials in Secret Storage and saves a sanitized config", async () => {
+    const context = {
+      secrets: {
+        get: vi.fn(async () => undefined),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn().mockResolvedValue(undefined),
+      getConnection: vi.fn(() => undefined),
+      testConnection: vi.fn(),
+    };
+
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+    );
+
+    await Promise.resolve();
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected a webview panel to be created.");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-ddb",
+        name: "Dynamo Local",
+        type: "dynamodb",
+        awsRegion: "us-east-1",
+        awsAccessKeyId: "AKIA123",
+        awsSecretAccessKey: "secret-key",
+        awsSessionToken: "session-token",
+        endpoint: "http://localhost:8000",
+      },
+    });
+
+    await expect(promise).resolves.toEqual(
+      expect.objectContaining({
+        id: "conn-ddb",
+        type: "dynamodb",
+        awsRegion: "us-east-1",
+      }),
+    );
+    expect(context.secrets.store).toHaveBeenCalledWith(
+      "conn-ddb",
+      JSON.stringify({
+        awsAccessKeyId: "AKIA123",
+        awsSecretAccessKey: "secret-key",
+        awsSessionToken: "session-token",
+      }),
+    );
+    expect(connectionManager.saveConnection).toHaveBeenCalledWith(
+      expect.not.objectContaining({
+        awsAccessKeyId: expect.anything(),
+        awsSecretAccessKey: expect.anything(),
+        awsSessionToken: expect.anything(),
+      }),
+    );
+  });
+
   it("falls back to a testResult message when unhandled errors occur for malformed input", async () => {
     const context = {
       secrets: {

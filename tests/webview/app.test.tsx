@@ -14,8 +14,16 @@ vi.mock("../../src/webview/components/ConnectionFormView", () => ({
 }));
 
 vi.mock("../../src/webview/components/QueryView", () => ({
-  QueryView: ({ connectionId }: { connectionId: string }) => (
-    <div>Query:{connectionId}</div>
+  QueryView: ({
+    connectionId,
+    editorLanguage,
+  }: {
+    connectionId: string;
+    editorLanguage?: string;
+  }) => (
+    <div>
+      Query:{connectionId}:{editorLanguage ?? "default"}
+    </div>
   ),
 }));
 
@@ -40,6 +48,7 @@ describe("App", () => {
       initialSql: "select 1",
       formatOnOpen: false,
       isBookmarked: false,
+      editorLanguage: "sql",
     };
     const tableState: TableInitialState = {
       view: "table",
@@ -54,7 +63,7 @@ describe("App", () => {
     window.__RAPIDB_INITIAL_STATE__ = queryState;
 
     const { rerender } = render(<App />);
-    expect(screen.getByText("Query:conn-1")).toBeTruthy();
+    expect(screen.getByText("Query:conn-1:sql")).toBeTruthy();
 
     window.__RAPIDB_INITIAL_STATE__ = tableState;
     rerender(<App />);
@@ -69,7 +78,7 @@ describe("App", () => {
 
     render(<App />);
 
-    expect(screen.getByText("Query:")).toBeTruthy();
+    expect(screen.getByText("Query::default")).toBeTruthy();
   });
 
   it("renders erd view when requested by initial state", () => {

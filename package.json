@@ -63,6 +63,12 @@
         "icon": "$(code)"
       },
       {
+        "command": "rapidb.create",
+        "title": "Create",
+        "category": "RapiDB",
+        "icon": "$(new-file)"
+      },
+      {
         "command": "rapidb.disconnectAll",
         "title": "Disconnect All",
         "category": "RapiDB",
@@ -193,6 +199,10 @@
           "when": "false"
         },
         {
+          "command": "rapidb.create",
+          "when": "false"
+        },
+        {
           "command": "rapidb.openErd",
           "when": "false"
         },
@@ -247,53 +257,63 @@
       "view/item/context": [
         {
           "command": "rapidb.connect",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_disconnected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_disconnected || viewItem == connectionNode_disconnected_canCreateDatabase || viewItem == connectionNode_disconnected_noCreateDatabase)",
           "group": "2_conn"
         },
         {
           "command": "rapidb.editConnection",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_disconnected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_disconnected || viewItem == connectionNode_disconnected_canCreateDatabase || viewItem == connectionNode_disconnected_noCreateDatabase)",
           "group": "3_manage"
         },
         {
           "command": "rapidb.deleteConnection",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_disconnected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_disconnected || viewItem == connectionNode_disconnected_canCreateDatabase || viewItem == connectionNode_disconnected_noCreateDatabase)",
           "group": "3_manage"
         },
         {
           "command": "rapidb.refresh",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_disconnected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_disconnected || viewItem == connectionNode_disconnected_canCreateDatabase || viewItem == connectionNode_disconnected_noCreateDatabase)",
           "group": "4_refresh"
         },
         {
           "command": "rapidb.newQuery",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_disconnected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_disconnected || viewItem == connectionNode_disconnected_canCreateDatabase || viewItem == connectionNode_disconnected_noCreateDatabase)",
           "group": "inline"
+        },
+        {
+          "command": "rapidb.create",
+          "when": "view == rapidb-explorer && viewItem == connectionNode_disconnected_canCreateDatabase",
+          "group": "1_create"
         },
         {
           "command": "rapidb.disconnect",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_connected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_connected || viewItem == connectionNode_connected_canCreateDatabase || viewItem == connectionNode_connected_noCreateDatabase)",
           "group": "2_conn"
         },
         {
           "command": "rapidb.editConnection",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_connected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_connected || viewItem == connectionNode_connected_canCreateDatabase || viewItem == connectionNode_connected_noCreateDatabase)",
           "group": "3_manage"
         },
         {
           "command": "rapidb.deleteConnection",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_connected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_connected || viewItem == connectionNode_connected_canCreateDatabase || viewItem == connectionNode_connected_noCreateDatabase)",
           "group": "3_manage"
         },
         {
           "command": "rapidb.refresh",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_connected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_connected || viewItem == connectionNode_connected_canCreateDatabase || viewItem == connectionNode_connected_noCreateDatabase)",
           "group": "4_refresh"
         },
         {
           "command": "rapidb.newQuery",
-          "when": "view == rapidb-explorer && viewItem == connectionNode_connected",
+          "when": "view == rapidb-explorer && (viewItem == connectionNode_connected || viewItem == connectionNode_connected_canCreateDatabase || viewItem == connectionNode_connected_noCreateDatabase)",
           "group": "inline"
+        },
+        {
+          "command": "rapidb.create",
+          "when": "view == rapidb-explorer && viewItem == connectionNode_connected_canCreateDatabase",
+          "group": "1_create"
         },
         {
           "command": "rapidb.showDDL",
@@ -303,6 +323,11 @@
         {
           "command": "rapidb.copyNodeName",
           "when": "view == rapidb-explorer && viewItem == table",
+          "group": "2_copy"
+        },
+        {
+          "command": "rapidb.copyNodeName",
+          "when": "view == rapidb-explorer && viewItem == table_noDdl",
           "group": "2_copy"
         },
         {
@@ -346,6 +371,11 @@
           "group": "2_copy"
         },
         {
+          "command": "rapidb.copyNodeName",
+          "when": "view == rapidb-explorer && viewItem == table_detail_index_noDdl",
+          "group": "2_copy"
+        },
+        {
           "command": "rapidb.showDDL",
           "when": "view == rapidb-explorer && viewItem == table_detail_trigger",
           "group": "1_open"
@@ -402,12 +432,17 @@
         },
         {
           "command": "rapidb.copyNodeName",
-          "when": "view == rapidb-explorer && viewItem == database",
+          "when": "view == rapidb-explorer && (viewItem == database || viewItem == database_canCreateSchema || viewItem == database_noCreateSchema)",
           "group": "2_copy"
         },
         {
+          "command": "rapidb.create",
+          "when": "view == rapidb-explorer && viewItem == database_canCreateSchema",
+          "group": "1_create"
+        },
+        {
           "command": "rapidb.openErd",
-          "when": "view == rapidb-explorer && viewItem == database",
+          "when": "view == rapidb-explorer && (viewItem == database || viewItem == database_canCreateSchema || viewItem == database_noCreateSchema)",
           "group": "1_open"
         },
         {
@@ -452,7 +487,11 @@
                   "pg",
                   "sqlite",
                   "mssql",
-                  "oracle"
+                  "oracle",
+                  "mongodb",
+                  "redis",
+                  "elasticsearch",
+                  "dynamodb"
                 ],
                 "description": "Database engine type"
               },
@@ -506,10 +545,62 @@
               "clientPath": {
                 "type": "string",
                 "description": "Path to Oracle Instant Client libraries directory. Only used when thickMode is true."
+              },
+              "connectionUri": {
+                "type": "string",
+                "description": "Connection URI for MongoDB or other URI-based drivers."
+              },
+              "authDatabase": {
+                "type": "string",
+                "description": "MongoDB authentication database used with connectionUri or host-based connections."
+              },
+              "redisDb": {
+                "type": "number",
+                "description": "Redis database index to select after connecting."
+              },
+              "redisUsername": {
+                "type": "string",
+                "description": "Redis ACL username for authenticated connections."
+              },
+              "keyPrefix": {
+                "type": "string",
+                "description": "Optional Redis key prefix applied when browsing keys."
+              },
+              "endpoint": {
+                "type": "string",
+                "description": "Custom service endpoint for Elasticsearch or DynamoDB."
+              },
+              "apiKey": {
+                "type": "string",
+                "description": "Elasticsearch API key used instead of basic auth."
+              },
+              "cloudId": {
+                "type": "string",
+                "description": "Elastic Cloud deployment identifier."
+              },
+              "awsRegion": {
+                "type": "string",
+                "description": "AWS region for DynamoDB connections."
+              },
+              "awsAccessKeyId": {
+                "type": "string",
+                "description": "AWS access key ID for DynamoDB."
+              },
+              "awsSecretAccessKey": {
+                "type": "string",
+                "description": "AWS secret access key for DynamoDB."
+              },
+              "awsSessionToken": {
+                "type": "string",
+                "description": "Optional AWS session token for temporary credentials."
+              },
+              "awsProfile": {
+                "type": "string",
+                "description": "Shared AWS profile name to use for DynamoDB credentials."
               }
             }
           },
-          "scope": "machine"
+          "scope": "application"
         },
         "rapidb.queryRowLimit": {
           "type": "number",
@@ -517,7 +608,7 @@
           "minimum": 100,
           "maximum": 100000,
           "description": "Maximum number of rows returned by a query in the SQL editor. If the result exceeds this limit, rows are trimmed and a warning is shown. Range: 100–100 000. Set to 100000 to effectively disable the limit.",
-          "scope": "machine"
+          "scope": "application"
         },
         "rapidb.connectionTimeoutSeconds": {
           "type": "number",
@@ -525,7 +616,7 @@
           "minimum": 1,
           "maximum": 3600,
           "description": "Timeout in seconds for establishing a database connection. Applies to all drivers.",
-          "scope": "machine"
+          "scope": "application"
         },
         "rapidb.dbOperationTimeoutSeconds": {
           "type": "number",
@@ -533,7 +624,7 @@
           "minimum": 1,
           "maximum": 3600,
           "description": "Timeout in seconds for database operations, including SQL editor queries, table/view reads, metadata, DDL, and routine loading. Applies to all drivers.",
-          "scope": "machine"
+          "scope": "application"
         },
         "rapidb.queryHistoryLimit": {
           "type": "number",
@@ -541,7 +632,7 @@
           "minimum": 1,
           "maximum": 10000,
           "description": "Maximum number of queries stored in history (shared across all connections). Must be between 1 and 10000. If you lower this value, excess entries are trimmed immediately.",
-          "scope": "machine"
+          "scope": "application"
         },
         "rapidb.defaultPageSize": {
           "type": "number",
@@ -553,7 +644,7 @@
             1000
           ],
           "description": "Default number of rows per page in the Table Data Viewer. Allowed values: 25, 100, 500, 1000. Any other value will be ignored and 25 will be used.",
-          "scope": "machine"
+          "scope": "application"
         }
       }
     },
@@ -622,12 +713,17 @@
     "vitest": "^4.1.4"
   },
   "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1044.0",
+    "@aws-sdk/credential-providers": "^3.1044.0",
+    "@aws-sdk/lib-dynamodb": "^3.1044.0",
     "@dagrejs/dagre": "^3.0.0",
+    "@elastic/elasticsearch": "^8.19.1",
     "@tanstack/react-table": "^8.21.3",
     "@tanstack/react-virtual": "^3.13.23",
     "@vscode/codicons": "^0.0.45",
     "@xyflow/react": "^12.10.2",
     "monaco-editor": "^0.53.0",
+    "mongodb": "^6.21.0",
     "mssql": "^12.2.0",
     "mysql2": "^3.20.0",
     "node-sqlite3-wasm": "^0.8.55",
@@ -635,6 +731,7 @@
     "pg": "^8.20.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
+    "redis": "^5.12.1",
     "sql-formatter": "^15.7.2",
     "zustand": "^5.0.12"
   }

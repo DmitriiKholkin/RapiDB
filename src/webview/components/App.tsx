@@ -30,6 +30,7 @@ export function App(): ReactElement {
             initialSql={state.initialSql ?? ""}
             formatOnOpen={state.formatOnOpen ?? false}
             isBookmarked={state.isBookmarked ?? false}
+            editorLanguage={state.editorLanguage}
           />
         </ErrorBoundary>
       );

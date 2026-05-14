@@ -2,6 +2,7 @@ import type { ConnectionConfig } from "../shared/connectionConfig";
 import type { DbObjectKind } from "../shared/dbObjectKinds";
 import type {
   ColumnTypeMeta,
+  DriverTableSectionKind,
   IndexMeta,
   TableConstraintMeta,
   TriggerMeta,
@@ -97,11 +98,7 @@ export interface ScopedSchemaCacheEntry extends SchemaSnapshotState {
   generation: number;
 }
 
-export type TableDetailSectionKind =
-  | "columns"
-  | "constraints"
-  | "indexes"
-  | "triggers";
+export type TableDetailSectionKind = DriverTableSectionKind;
 
 export interface TableDetailRequest {
   connectionId: string;
@@ -113,7 +110,6 @@ export interface TableDetailRequest {
 export interface TableDetailSectionState<T> {
   status: SchemaLoadStatus;
   items: T[];
-  unsupported?: boolean;
   error?: string;
 }
 

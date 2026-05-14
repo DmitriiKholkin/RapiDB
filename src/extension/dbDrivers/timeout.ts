@@ -62,6 +62,10 @@ const DB_OPERATION_METHODS = new Set([
   "getObjectDefinition",
   "getRoutineDefinition",
   "query",
+  "readTablePage",
+  "updateRows",
+  "insertRow",
+  "deleteRows",
   "runTransaction",
   "getMutationAtomicityRisk",
 ]);
