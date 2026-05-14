@@ -2,6 +2,8 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
+const formatMock = vi.hoisted(() => vi.fn((_dialect?: string) => null));
+
 vi.mock("../../src/webview/components/MonacoEditor", async () => {
   const React = await import("react");
 
@@ -20,6 +22,7 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
     ariaLabel?: string;
     schema?: Array<unknown>;
     dialect?: string;
+    language?: string;
   }
 
   const MonacoEditor = React.forwardRef<
@@ -37,7 +40,7 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
           setValue(nextValue);
           props.onChange?.(nextValue);
         },
-        format: () => null,
+        format: (dialect?: string) => formatMock(dialect),
         placeCursor: () => undefined,
       }),
       [props, value],
@@ -48,6 +51,8 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
         <div data-testid="monaco-schema-count">
           {String(props.schema?.length ?? 0)}
         </div>
+        <div data-testid="monaco-language">{props.language ?? "sql"}</div>
+        <div data-testid="monaco-dialect">{props.dialect ?? "none"}</div>
         <textarea
           aria-label={props.ariaLabel ?? "SQL editor"}
           readOnly={props.readOnly}
@@ -91,7 +96,29 @@ import {
 } from "./testUtils";
 
 describe("QueryView", () => {
+  it("auto-formats on open for SQL editors", async () => {
+    formatMock.mockClear();
+
+    render(
+      <QueryView
+        connectionId="conn-1"
+        initialSql="select 1"
+        connectionType="pg"
+        formatOnOpen
+      />,
+    );
+
+    dispatchIncomingMessage("connections", [
+      { id: "conn-1", name: "Primary", type: "pg" },
+    ]);
+
+    await waitFor(() => {
+      expect(formatMock).toHaveBeenCalledWith("pg");
+    });
+  });
+
   it("requests connections and schema, updates the active connection, and reacts to schema messages", async () => {
+    formatMock.mockClear();
     const user = userEvent.setup();
     const { container } = render(
       <QueryView
@@ -153,6 +180,7 @@ describe("QueryView", () => {
   });
 
   it("replaces the active connection flattened schema array as shared-cache scopes expand", async () => {
+    formatMock.mockClear();
     render(
       <QueryView
         connectionId="conn-1"
@@ -221,6 +249,7 @@ describe("QueryView", () => {
   });
 
   it("executes queries, shows result errors, and resets bookmark state after edits", async () => {
+    formatMock.mockClear();
     const user = userEvent.setup();
 
     render(
@@ -287,6 +316,7 @@ describe("QueryView", () => {
   });
 
   it("disables SQL formatting affordances for non-SQL connections", async () => {
+    formatMock.mockClear();
     const user = userEvent.setup();
 
     render(
@@ -316,5 +346,31 @@ describe("QueryView", () => {
         connectionId: "conn-1",
       },
     });
+  });
+
+  it("prefers explicit editorLanguage over connection-derived SQL mode", async () => {
+    formatMock.mockClear();
+
+    render(
+      <QueryView
+        connectionId="conn-1"
+        initialSql="db.users.find({})"
+        connectionType="pg"
+        editorLanguage="plaintext"
+        formatOnOpen
+      />,
+    );
+
+    dispatchIncomingMessage("connections", [
+      { id: "conn-1", name: "Primary", type: "pg" },
+    ]);
+
+    expect(screen.getByLabelText("Query editor")).toBeTruthy();
+    expect(screen.getByTestId("monaco-language").textContent).toBe("plaintext");
+    expect(screen.getByTestId("monaco-dialect").textContent).toBe("none");
+
+    const formatButton = screen.getByRole("button", { name: "Format" });
+    expect((formatButton as HTMLButtonElement).disabled).toBe(true);
+    expect(formatMock).not.toHaveBeenCalled();
   });
 });

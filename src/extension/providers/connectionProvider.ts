@@ -10,6 +10,7 @@ import {
   formatColumnDetailDescription,
   formatColumnDetailTooltip,
   formatPrimaryKeyRoleLabel,
+  type IndexDdlSupport,
 } from "../../shared/tableTypes";
 import type {
   ConnectionConfig,
@@ -38,6 +39,7 @@ import {
 import {
   composeOpenDdlAwareContextValue,
   type OpenDdlNodeKind,
+  type OpenDdlSupportHints,
 } from "../utils/openDdlEligibility";
 
 export type NodeKind =
@@ -148,6 +150,7 @@ export class RapiDBNode extends vscode.TreeItem {
     public readonly parentTable?: string,
     public readonly section?: TableDetailSectionKind,
     public readonly detailKey?: string,
+    public readonly ddlSupport?: IndexDdlSupport,
   ) {
     super(label, collapsibleState);
 
@@ -922,10 +925,12 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       request.table,
       "indexes",
       index.name,
+      index.ddlSupport,
     );
     node.contextValue = this.composeContextValue(
       "table_detail_index",
       request.connectionId,
+      { indexDdlSupport: index.ddlSupport },
     );
     node.description = descriptionParts.join(" - ");
     node.tooltip = this.makeDetailTooltip(index.name, node.description);
@@ -964,12 +969,14 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
   private composeContextValue(
     kind: OpenDdlNodeKind,
     connectionId: string,
+    hints?: OpenDdlSupportHints,
   ): string {
     const connectionType = this.getConnectionType(connectionId);
     return composeOpenDdlAwareContextValue(
       kind,
       connectionType,
       this.getEntityManifest(connectionId),
+      hints,
     );
   }
 

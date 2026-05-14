@@ -1,5 +1,6 @@
 import type { ConnectionType } from "../../shared/connectionTypes";
 import type { DbObjectKind } from "../../shared/dbObjectKinds";
+import type { IndexDdlSupport } from "../../shared/tableTypes";
 import type { DriverEntityManifest } from "../dbDrivers/types";
 
 export type OpenDdlNodeKind =
@@ -8,14 +9,16 @@ export type OpenDdlNodeKind =
   | "table_detail_index"
   | "table_detail_trigger";
 
+export interface OpenDdlSupportHints {
+  indexDdlSupport?: IndexDdlSupport;
+}
+
 const OPEN_DDL_CONTEXT_VALUE_UNSUPPORTED_SUFFIX = "_noDdl";
 
 const OPEN_DDL_UNSUPPORTED_BY_CONNECTION_TYPE: Readonly<
   Partial<Record<ConnectionType, readonly OpenDdlNodeKind[]>>
 > = {
-  mongodb: ["table", "table_detail_index"],
-  dynamodb: ["table", "table_detail_index"],
-  elasticsearch: ["table", "table_detail_index"],
+  elasticsearch: ["table_detail_index"],
   redis: ["table"],
 };
 
@@ -56,7 +59,18 @@ function isSupportedByManifest(
 function isOverriddenAsUnsupported(
   kind: OpenDdlNodeKind,
   connectionType?: ConnectionType,
+  hints?: OpenDdlSupportHints,
 ): boolean {
+  if (kind === "table_detail_index") {
+    if (hints?.indexDdlSupport === "supported") {
+      return false;
+    }
+
+    if (hints?.indexDdlSupport === "unsupported") {
+      return true;
+    }
+  }
+
   if (!connectionType) {
     return false;
   }
@@ -71,6 +85,7 @@ export function isOpenDdlSupportedForNode(
   kind: string,
   connectionType: ConnectionType | undefined,
   manifest: DriverEntityManifest,
+  hints?: OpenDdlSupportHints,
 ): boolean {
   if (!isOpenDdlNodeKind(kind)) {
     return false;
@@ -78,7 +93,7 @@ export function isOpenDdlSupportedForNode(
 
   return (
     isSupportedByManifest(kind, manifest) &&
-    !isOverriddenAsUnsupported(kind, connectionType)
+    !isOverriddenAsUnsupported(kind, connectionType, hints)
   );
 }
 
@@ -86,12 +101,13 @@ export function composeOpenDdlAwareContextValue(
   kind: string,
   connectionType: ConnectionType | undefined,
   manifest: DriverEntityManifest,
+  hints?: OpenDdlSupportHints,
 ): string {
   if (!isOpenDdlNodeKind(kind)) {
     return kind;
   }
 
-  if (isOpenDdlSupportedForNode(kind, connectionType, manifest)) {
+  if (isOpenDdlSupportedForNode(kind, connectionType, manifest, hints)) {
     return kind;
   }
 

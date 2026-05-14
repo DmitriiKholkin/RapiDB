@@ -719,16 +719,86 @@ export class MongoDBDriver implements IDBDriver {
     unsupported("MongoDB constraints DDL");
   }
 
-  async getIndexDDL(): Promise<string> {
-    unsupported("MongoDB index DDL");
+  async getIndexDDL(
+    database: string,
+    _schema: string,
+    table: string,
+    indexName: string,
+  ): Promise<string> {
+    const index = (
+      await this.requireDb(database).collection(table).indexes()
+    ).find((entry) => entry.name === indexName);
+    if (!index) {
+      throw new Error(`Index "${indexName}" not found`);
+    }
+
+    const key =
+      index.key && typeof index.key === "object" && !Array.isArray(index.key)
+        ? index.key
+        : {};
+    const options = Object.fromEntries(
+      Object.entries(index as Record<string, unknown>).filter(
+        ([keyName, value]) => {
+          if (
+            keyName === "key" ||
+            keyName === "v" ||
+            keyName === "ns" ||
+            keyName === "background"
+          ) {
+            return false;
+          }
+
+          return value !== undefined && value !== false;
+        },
+      ),
+    );
+    const collectionRef = `${this.buildDbRef(database)}.getCollection(${JSON.stringify(table)})`;
+
+    return `${collectionRef}.createIndex(\n  ${this.serializeMongosh(key)},\n  ${this.serializeMongosh(options)}\n);`;
   }
 
   async getTriggerDDL(): Promise<string> {
     unsupported("MongoDB trigger DDL");
   }
 
-  async getCreateTableDDL(): Promise<string> {
-    unsupported("MongoDB create collection DDL");
+  async getCreateTableDDL(
+    database: string,
+    _schema: string,
+    table: string,
+  ): Promise<string> {
+    const collection = await this.getCollectionDefinition(database, table);
+    const dbRef = this.buildDbRef(database);
+
+    if (collection.type === "view") {
+      const viewOn =
+        typeof collection.options.viewOn === "string"
+          ? collection.options.viewOn
+          : table;
+      const pipeline = Array.isArray(collection.options.pipeline)
+        ? collection.options.pipeline
+        : [];
+      const viewOptions = Object.fromEntries(
+        Object.entries(collection.options).filter(
+          ([key]) => key !== "viewOn" && key !== "pipeline",
+        ),
+      );
+      const args = [
+        JSON.stringify(table),
+        JSON.stringify(viewOn),
+        this.serializeMongosh(pipeline),
+      ];
+      if (Object.keys(viewOptions).length > 0) {
+        args.push(this.serializeMongosh(viewOptions));
+      }
+
+      return `${dbRef}.createView(\n  ${args.join(",\n  ")}\n);`;
+    }
+
+    if (Object.keys(collection.options).length === 0) {
+      return `${dbRef}.createCollection(${JSON.stringify(table)});`;
+    }
+
+    return `${dbRef}.createCollection(\n  ${JSON.stringify(table)},\n  ${this.serializeMongosh(collection.options)}\n);`;
   }
 
   async getObjectDefinition(): Promise<string | null> {
@@ -797,6 +867,9 @@ export class MongoDBDriver implements IDBDriver {
               return createDbProxy();
             };
           }
+          if (prop === "getCollection") {
+            return (name: string) => createCollProxy(String(name));
+          }
           if (prop === "runCommand") {
             return (cmd: unknown) => {
               opName = "runCommand";
@@ -805,9 +878,20 @@ export class MongoDBDriver implements IDBDriver {
             };
           }
           if (prop === "createCollection") {
-            return (name: string) => {
+            return (name: string, options?: unknown) => {
               opName = "createCollection";
-              opArgs = [name];
+              opArgs = [name, options];
+            };
+          }
+          if (prop === "createView") {
+            return (
+              name: string,
+              viewOn: string,
+              pipeline?: unknown,
+              options?: unknown,
+            ) => {
+              opName = "createView";
+              opArgs = [name, viewOn, pipeline, options];
             };
           }
           return createCollProxy(prop);
@@ -932,8 +1016,39 @@ export class MongoDBDriver implements IDBDriver {
 
     if (op === "createCollection") {
       const name = String(opArgs[0]);
-      await this.requireDb(dbName).createCollection(name);
-      const row = { ok: 1, name };
+      const options =
+        opArgs[1] !== null && typeof opArgs[1] === "object"
+          ? (opArgs[1] as Record<string, unknown>)
+          : undefined;
+      if (options) {
+        await this.requireDb(dbName).createCollection(name, options);
+      } else {
+        await this.requireDb(dbName).createCollection(name);
+      }
+      const row = { ok: 1, name, type: "collection" };
+      const columns = Object.keys(row);
+      return {
+        columns,
+        rows: [this.mapRowToQueryRow(row, columns)],
+        rowCount: 1,
+        executionTimeMs: Date.now() - startedAt,
+      };
+    }
+
+    if (op === "createView") {
+      const name = String(opArgs[0]);
+      const viewOn = String(opArgs[1]);
+      const pipeline = Array.isArray(opArgs[2]) ? opArgs[2] : [];
+      const options =
+        opArgs[3] !== null && typeof opArgs[3] === "object"
+          ? (opArgs[3] as Record<string, unknown>)
+          : undefined;
+      await this.requireDb(dbName).createCollection(name, {
+        viewOn,
+        pipeline,
+        ...(options ?? {}),
+      });
+      const row = { ok: 1, name, type: "view", viewOn };
       const columns = Object.keys(row);
       return {
         columns,
@@ -1079,8 +1194,31 @@ export class MongoDBDriver implements IDBDriver {
       };
     }
 
+    if (op === "createIndex") {
+      const key =
+        opArgs[0] && typeof opArgs[0] === "object" && !Array.isArray(opArgs[0])
+          ? (opArgs[0] as Record<string, unknown>)
+          : {};
+      const options =
+        opArgs[1] && typeof opArgs[1] === "object" && !Array.isArray(opArgs[1])
+          ? (opArgs[1] as Record<string, unknown>)
+          : undefined;
+      const name = await mongoCollection.createIndex(
+        key as Parameters<typeof mongoCollection.createIndex>[0],
+        options as Parameters<typeof mongoCollection.createIndex>[1],
+      );
+      const row = { ok: 1, name };
+      const columns = Object.keys(row);
+      return {
+        columns,
+        rows: [this.mapRowToQueryRow(row, columns)],
+        rowCount: 1,
+        executionTimeMs: Date.now() - startedAt,
+      };
+    }
+
     throw new Error(
-      `Unsupported mongosh operation: "${op}".\n\nSupported: find, findOne, countDocuments, insertOne, insertMany, updateOne, updateMany, deleteOne, deleteMany, aggregate, runCommand, createCollection`,
+      `Unsupported mongosh operation: "${op}".\n\nSupported: find, findOne, countDocuments, insertOne, insertMany, updateOne, updateMany, deleteOne, deleteMany, aggregate, runCommand, createCollection, createView, createIndex`,
     );
   }
 
@@ -1447,6 +1585,41 @@ export class MongoDBDriver implements IDBDriver {
 
   private requireDb(database?: string) {
     return this.requireClient().db(database || this.defaultDatabaseName());
+  }
+
+  private buildDbRef(database?: string): string {
+    return `db.getSiblingDB(${JSON.stringify(database || this.defaultDatabaseName())})`;
+  }
+
+  private async getCollectionDefinition(
+    database: string,
+    table: string,
+  ): Promise<{
+    type: "collection" | "view";
+    options: Record<string, unknown>;
+  }> {
+    const collection = (
+      await this.requireDb(database)
+        .listCollections({ name: table }, { nameOnly: false })
+        .toArray()
+    ).find((entry) => entry.name === table);
+
+    if (!collection) {
+      throw new Error(`Collection "${table}" not found`);
+    }
+
+    const options =
+      collection.options &&
+      typeof collection.options === "object" &&
+      !Array.isArray(collection.options)
+        ? { ...(collection.options as Record<string, unknown>) }
+        : {};
+    delete options.uuid;
+
+    return {
+      type: collection.type === "view" ? "view" : "collection",
+      options,
+    };
   }
 
   private toRow(document: Record<string, unknown>): Record<string, unknown> {

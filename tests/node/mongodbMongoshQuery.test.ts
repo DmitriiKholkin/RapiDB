@@ -54,6 +54,7 @@ function createMockDriver() {
     .mockReturnValue({ toArray: mockAggregateToArray });
   const mockCommand = vi.fn().mockResolvedValue({ ok: 1 });
   const mockCreateCollection = vi.fn().mockResolvedValue({});
+  const mockCreateIndex = vi.fn().mockResolvedValue("users_by_email");
 
   const mockCollection = {
     find: mockFind,
@@ -65,6 +66,7 @@ function createMockDriver() {
     deleteMany: mockDeleteMany,
     countDocuments: mockCountDocuments,
     aggregate: mockAggregate,
+    createIndex: mockCreateIndex,
   };
 
   const mockDb = {
@@ -94,6 +96,7 @@ function createMockDriver() {
     mockAggregate,
     mockCommand,
     mockCreateCollection,
+    mockCreateIndex,
   };
 }
 
@@ -261,6 +264,41 @@ describe("MongoDBDriver — mongosh query()", () => {
     const result = await driver.query('db.createCollection("newcoll")');
     expect(mockCreateCollection).toHaveBeenCalledWith("newcoll");
     expect(result.columns).toContain("ok");
+  });
+
+  it("executes createCollection with options from generated DDL", async () => {
+    const { driver, mockCreateCollection } = createMockDriver();
+    await driver.query(
+      'db.createCollection("users", { validator: { $jsonSchema: { bsonType: "object" } } })',
+    );
+    expect(mockCreateCollection).toHaveBeenCalledWith("users", {
+      validator: { $jsonSchema: { bsonType: "object" } },
+    });
+  });
+
+  it("executes createView from generated DDL", async () => {
+    const { driver, mockCreateCollection } = createMockDriver();
+    const result = await driver.query(
+      'db.getSiblingDB("otherdb").createView("active_users", "users", [{ $match: { active: true } }])',
+    );
+    expect(mockCreateCollection).toHaveBeenCalledWith("active_users", {
+      viewOn: "users",
+      pipeline: [{ $match: { active: true } }],
+    });
+    expect(result.columns).toContain("viewOn");
+  });
+
+  it("executes createIndex via getCollection from generated DDL", async () => {
+    const { driver, mockDb, mockCreateIndex } = createMockDriver();
+    const result = await driver.query(
+      'db.getSiblingDB("otherdb").getCollection("users").createIndex({ email: 1 }, { name: "users_by_email", unique: true })',
+    );
+    expect(mockDb.collection).toHaveBeenCalledWith("users");
+    expect(mockCreateIndex).toHaveBeenCalledWith(
+      { email: 1 },
+      { name: "users_by_email", unique: true },
+    );
+    expect(result.rows[0]?.__col_1).toBe("users_by_email");
   });
 
   it("supports getSiblingDB for cross-database queries", async () => {

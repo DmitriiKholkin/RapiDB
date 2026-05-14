@@ -271,11 +271,14 @@ export interface ColumnTypeMeta extends ColumnMeta {
   valueSemantics: ValueSemantics;
 }
 
+export type IndexDdlSupport = "supported" | "unsupported";
+
 export interface IndexMeta {
   name: string;
   columns: string[];
   unique: boolean;
   primary: boolean;
+  ddlSupport?: IndexDdlSupport;
 }
 
 export interface ForeignKeyMeta {

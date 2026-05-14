@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import type { QueryEditorLanguage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import { logErrorWithContext } from "../utils/errorHandling";
 import {
@@ -18,6 +19,7 @@ export class QueryPanel {
   readonly initialConnectionId: string;
   private formatOnOpen = false;
   private isBookmarked = false;
+  private editorLanguage: QueryEditorLanguage | undefined;
   private lastQueryResult: QueryPanelCachedResult | null = null;
   private activeConnectionId: string;
 
@@ -29,6 +31,7 @@ export class QueryPanel {
     initialSql?: string,
     formatOnOpen?: boolean,
     isBookmarked?: boolean,
+    editorLanguage?: QueryEditorLanguage,
   ) {
     this.panel = panel;
     this.connectionManager = connectionManager;
@@ -36,6 +39,7 @@ export class QueryPanel {
     this.activeConnectionId = connectionId;
     this.formatOnOpen = formatOnOpen ?? false;
     this.isBookmarked = isBookmarked ?? false;
+    this.editorLanguage = editorLanguage;
     this.controller = new QueryPanelController(connectionManager, {
       getActiveConnectionId: () => this.activeConnectionId,
       getInitialConnectionId: () => this.initialConnectionId,
@@ -116,6 +120,7 @@ export class QueryPanel {
     forceNew = false,
     formatOnOpen = false,
     isBookmarked = false,
+    editorLanguage?: QueryEditorLanguage,
   ): QueryPanel {
     const connection = connectionManager.getConnection(connectionId);
     const title = `SQL [${connection?.name ?? connectionId}]`;
@@ -145,6 +150,7 @@ export class QueryPanel {
       initialSql,
       formatOnOpen,
       isBookmarked,
+      editorLanguage,
     );
     QueryPanel.panels.set(panelId, instance);
     webviewPanel.onDidDispose(() => QueryPanel.panels.delete(panelId));
@@ -178,6 +184,7 @@ export class QueryPanel {
         initialSql: initialSql ?? "",
         formatOnOpen: this.formatOnOpen ?? false,
         isBookmarked: this.isBookmarked ?? false,
+        editorLanguage: this.editorLanguage,
       },
       includeMediaRoot: true,
       extraCspDirectives: ["worker-src blob:"],

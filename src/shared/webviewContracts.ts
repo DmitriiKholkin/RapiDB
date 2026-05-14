@@ -33,6 +33,8 @@ export interface ApplyResultPayload {
   insertApplied?: boolean;
 }
 
+export type QueryEditorLanguage = "sql" | "javascript" | "plaintext";
+
 export interface QueryInitialState {
   view: "query";
   connectionId: string;
@@ -40,6 +42,7 @@ export interface QueryInitialState {
   initialSql?: string;
   formatOnOpen?: boolean;
   isBookmarked?: boolean;
+  editorLanguage?: QueryEditorLanguage;
 }
 
 export interface TableInitialState {
@@ -292,6 +295,14 @@ function readConnectionType(value: unknown): ConnectionType | "" | undefined {
     : undefined;
 }
 
+function readQueryEditorLanguage(
+  value: unknown,
+): QueryEditorLanguage | undefined {
+  return value === "sql" || value === "javascript" || value === "plaintext"
+    ? value
+    : undefined;
+}
+
 function parseEnvelope(input: unknown): WebviewMessageEnvelope | null {
   if (!isRecord(input)) {
     return null;
@@ -418,6 +429,7 @@ export function parseWebviewInitialState(
         initialSql: readOptionalString(input, "initialSql"),
         formatOnOpen: readOptionalBoolean(input, "formatOnOpen"),
         isBookmarked: readOptionalBoolean(input, "isBookmarked"),
+        editorLanguage: readQueryEditorLanguage(input.editorLanguage),
       };
     }
 

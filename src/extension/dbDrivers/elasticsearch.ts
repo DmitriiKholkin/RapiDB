@@ -230,8 +230,34 @@ export class ElasticsearchDriver implements IDBDriver {
     unsupported("Elasticsearch trigger DDL");
   }
 
-  async getCreateTableDDL(): Promise<string> {
-    unsupported("Elasticsearch create index DDL");
+  async getCreateTableDDL(
+    _database: string,
+    _schema: string,
+    table: string,
+  ): Promise<string> {
+    const response = await this.requireClient().indices.get({ index: table });
+    const definition = this.extractIndexDefinition(response, table);
+    if (!definition) {
+      throw new Error(`Index "${table}" not found`);
+    }
+
+    const payload: Record<string, unknown> = {};
+    const settings = this.filterCreateIndexSettings(definition.settings?.index);
+    if (settings && Object.keys(settings).length > 0) {
+      payload.settings = settings;
+    }
+    if (definition.mappings && Object.keys(definition.mappings).length > 0) {
+      payload.mappings = definition.mappings;
+    }
+    if (definition.aliases && Object.keys(definition.aliases).length > 0) {
+      payload.aliases = definition.aliases;
+    }
+
+    const body =
+      Object.keys(payload).length > 0
+        ? `\n${JSON.stringify(payload, null, 2)}`
+        : "";
+    return `PUT /${table}${body}`;
   }
 
   async getObjectDefinition(): Promise<string | null> {
@@ -553,6 +579,83 @@ export class ElasticsearchDriver implements IDBDriver {
       throw new Error("Elasticsearch is not connected.");
     }
     return this.client;
+  }
+
+  private extractIndexDefinition(
+    response: unknown,
+    index: string,
+  ):
+    | {
+        settings?: { index?: Record<string, unknown> };
+        mappings?: Record<string, unknown>;
+        aliases?: Record<string, unknown>;
+      }
+    | undefined {
+    if (!response || typeof response !== "object" || Array.isArray(response)) {
+      return undefined;
+    }
+
+    const entry = (response as Record<string, unknown>)[index];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return undefined;
+    }
+
+    const typedEntry = entry as {
+      settings?: { index?: Record<string, unknown> };
+      mappings?: Record<string, unknown>;
+      aliases?: Record<string, unknown>;
+    };
+
+    return {
+      settings: typedEntry.settings,
+      mappings: typedEntry.mappings,
+      aliases: typedEntry.aliases,
+    };
+  }
+
+  private filterCreateIndexSettings(
+    settings: Record<string, unknown> | undefined,
+    path: readonly string[] = [],
+  ): Record<string, unknown> | undefined {
+    if (!settings) {
+      return undefined;
+    }
+
+    const filteredSettings = Object.entries(settings).reduce<
+      Record<string, unknown>
+    >((result, [key, value]) => {
+      const nextPath = [...path, key];
+      const pathKey = nextPath.join(".");
+      if (
+        key === "creation_date" ||
+        key === "provided_name" ||
+        key === "uuid" ||
+        key === "version" ||
+        pathKey === "routing.allocation.initial_recovery._id"
+      ) {
+        return result;
+      }
+
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        const nested = this.filterCreateIndexSettings(
+          value as Record<string, unknown>,
+          nextPath,
+        );
+        if (nested && Object.keys(nested).length > 0) {
+          result[key] = nested;
+        }
+        return result;
+      }
+
+      if (value !== undefined) {
+        result[key] = value;
+      }
+      return result;
+    }, {});
+
+    return Object.keys(filteredSettings).length > 0
+      ? filteredSettings
+      : undefined;
   }
 
   private async fetchMappingMeta(

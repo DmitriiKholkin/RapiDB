@@ -959,7 +959,7 @@ describe("ConnectionProvider", () => {
     expect(getSchemaSnapshotAsync).not.toHaveBeenCalled();
   });
 
-  it("marks unsupported NoSQL Open DDL nodes with noDdl context values", async () => {
+  it("keeps MongoDB collection and index nodes Open DDL enabled", async () => {
     const connectionManager = {
       getConnections: vi.fn(() => [
         { id: "conn-1", name: "NoSQL", type: "mongodb" },
@@ -990,7 +990,7 @@ describe("ConnectionProvider", () => {
       ),
       getTableDetailState: vi.fn(() => loadedTableDetailState()),
       getDriverEntityManifest: vi.fn(() => ({
-        dbObjectKinds: ["table"],
+        dbObjectKinds: ["table", "view"],
         tableSections: {
           columns: "supported",
           constraints: "not_applicable",
@@ -1030,7 +1030,189 @@ describe("ConnectionProvider", () => {
 
     const indexNode = (await provider.getChildren(indexesSection))[0];
 
-    expect(tableNode?.contextValue).toBe("table_noDdl");
+    expect(tableNode?.contextValue).toBe("table");
+    expect(indexNode?.contextValue).toBe("table_detail_index");
+  });
+
+  it("marks unsupported DynamoDB index detail nodes with noDdl context values", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-1", name: "NoSQL", type: "dynamodb" },
+      ]),
+      getConnection: vi.fn(() => ({
+        id: "conn-1",
+        name: "NoSQL",
+        type: "dynamodb",
+      })),
+      isConnected: vi.fn((id: string) => id === "conn-1"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      ensureTableDetailLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "us-east-1",
+              schemas: [
+                {
+                  name: "us-east-1",
+                  objects: [{ name: "users", type: "table", columns: [] }],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      getTableDetailState: vi.fn(() => ({
+        ...loadedTableDetailState(),
+        snapshot: {
+          ...loadedTableDetailState().snapshot,
+          indexes: {
+            status: "loaded",
+            items: [
+              {
+                name: "users_by_email",
+                columns: ["email"],
+                unique: false,
+                primary: false,
+                ddlSupport: "unsupported",
+              },
+            ],
+          },
+        },
+      })),
+      getDriverEntityManifest: vi.fn(() => ({
+        dbObjectKinds: ["table"],
+        tableSections: {
+          columns: "supported",
+          constraints: "not_applicable",
+          indexes: "supported",
+          triggers: "not_applicable",
+        },
+      })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+
+    const roots = await provider.getChildren();
+    const databases = await provider.getChildren(roots[0]);
+    const categories = await provider.getChildren(databases[0]);
+    const tableNode = (await provider.getChildren(categories[0]))[0];
+    const tableSections = await provider.getChildren(tableNode);
+    const indexesSection = tableSections.find(
+      (node) => node.label === "Indexes",
+    );
+
+    if (!indexesSection) {
+      throw new Error("Expected indexes section to be present");
+    }
+
+    const indexNode = (await provider.getChildren(indexesSection))[0];
+
+    expect(tableNode?.contextValue).toBe("table");
+    expect(indexNode?.contextValue).toBe("table_detail_index_noDdl");
+  });
+
+  it("marks Elasticsearch index detail nodes with noDdl context values via connection-type override", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-1", name: "Search", type: "elasticsearch" },
+      ]),
+      getConnection: vi.fn(() => ({
+        id: "conn-1",
+        name: "Search",
+        type: "elasticsearch",
+      })),
+      isConnected: vi.fn((id: string) => id === "conn-1"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      ensureTableDetailLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "default",
+              schemas: [
+                {
+                  name: "indices",
+                  objects: [{ name: "users", type: "table", columns: [] }],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      getTableDetailState: vi.fn(() => ({
+        ...loadedTableDetailState(),
+        snapshot: {
+          ...loadedTableDetailState().snapshot,
+          indexes: {
+            status: "loaded",
+            items: [
+              {
+                name: "users_id_idx",
+                columns: ["_id"],
+                unique: true,
+                primary: true,
+              },
+            ],
+          },
+        },
+      })),
+      getDriverEntityManifest: vi.fn(() => ({
+        dbObjectKinds: ["table"],
+        tableSections: {
+          columns: "supported",
+          constraints: "not_applicable",
+          indexes: "supported",
+          triggers: "not_applicable",
+        },
+      })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+
+    const roots = await provider.getChildren();
+    const databases = await provider.getChildren(roots[0]);
+    const schemas = await provider.getChildren(databases[0]);
+    const categories = await provider.getChildren(schemas[0]);
+    const tableNode = (await provider.getChildren(categories[0]))[0];
+    const tableSections = await provider.getChildren(tableNode);
+    const indexesSection = tableSections.find(
+      (node) => node.label === "Indexes",
+    );
+
+    if (!indexesSection) {
+      throw new Error("Expected indexes section to be present");
+    }
+
+    const indexNode = (await provider.getChildren(indexesSection))[0];
+
+    expect(tableNode?.contextValue).toBe("table");
     expect(indexNode?.contextValue).toBe("table_detail_index_noDdl");
   });
 

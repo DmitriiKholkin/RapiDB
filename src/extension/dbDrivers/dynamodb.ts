@@ -1,7 +1,12 @@
 import {
   DescribeTableCommand,
   DynamoDBClient,
+  type GlobalSecondaryIndexDescription,
   ListTablesCommand,
+  type LocalSecondaryIndexDescription,
+  type Projection,
+  type ProvisionedThroughputDescription,
+  type TableDescription,
 } from "@aws-sdk/client-dynamodb";
 import { fromIni } from "@aws-sdk/credential-providers";
 import {
@@ -215,15 +220,29 @@ export class DynamoDBDriver implements IDBDriver {
       const description = await this.requireClient().send(
         new DescribeTableCommand({ TableName: table }),
       );
-      const indexes = description.Table?.GlobalSecondaryIndexes ?? [];
-      return indexes.map((index) => ({
+      const globalIndexes = (
+        description.Table?.GlobalSecondaryIndexes ?? []
+      ).map((index) => ({
         name: index.IndexName ?? "index",
         columns: (index.KeySchema ?? [])
           .map((entry) => entry.AttributeName)
           .filter((name): name is string => Boolean(name)),
         unique: false,
         primary: false,
+        ddlSupport: "supported" as const,
       }));
+      const localIndexes = (description.Table?.LocalSecondaryIndexes ?? []).map(
+        (index) => ({
+          name: index.IndexName ?? "index",
+          columns: (index.KeySchema ?? [])
+            .map((entry) => entry.AttributeName)
+            .filter((name): name is string => Boolean(name)),
+          unique: false,
+          primary: false,
+          ddlSupport: "unsupported" as const,
+        }),
+      );
+      return [...globalIndexes, ...localIndexes];
     } catch {
       return [];
     }
@@ -245,16 +264,129 @@ export class DynamoDBDriver implements IDBDriver {
     unsupported("DynamoDB constraints DDL");
   }
 
-  async getIndexDDL(): Promise<string> {
-    unsupported("DynamoDB index DDL");
+  async getIndexDDL(
+    _database: string,
+    _schema: string,
+    table: string,
+    indexName: string,
+  ): Promise<string> {
+    const description = await this.describeTableDefinition(table);
+    const globalIndex = (description.GlobalSecondaryIndexes ?? []).find(
+      (index) => index.IndexName === indexName,
+    );
+    if (!globalIndex) {
+      const localIndex = (description.LocalSecondaryIndexes ?? []).find(
+        (index) => index.IndexName === indexName,
+      );
+      if (localIndex) {
+        throw new Error(
+          `DynamoDB Open DDL currently supports only global secondary indexes. "${indexName}" is a local secondary index.`,
+        );
+      }
+
+      throw new Error(`Index "${indexName}" not found`);
+    }
+
+    const createPayload: Record<string, unknown> = {
+      IndexName: globalIndex.IndexName,
+      KeySchema: globalIndex.KeySchema ?? [],
+      Projection: this.normalizeProjection(globalIndex.Projection),
+    };
+    const throughput = this.normalizeProvisionedThroughput(
+      globalIndex.ProvisionedThroughput,
+    );
+    if (this.resolveBillingMode(description) === "PROVISIONED" && throughput) {
+      createPayload.ProvisionedThroughput = throughput;
+    }
+
+    return this.buildAwsCliCommand("aws dynamodb update-table", [
+      ["--table-name", JSON.stringify(table)],
+      [
+        "--attribute-definitions",
+        this.formatCliJson(description.AttributeDefinitions ?? []),
+      ],
+      [
+        "--global-secondary-index-updates",
+        this.formatCliJson([{ Create: createPayload }]),
+      ],
+    ]);
   }
 
   async getTriggerDDL(): Promise<string> {
     unsupported("DynamoDB trigger DDL");
   }
 
-  async getCreateTableDDL(): Promise<string> {
-    unsupported("DynamoDB create table DDL");
+  async getCreateTableDDL(
+    _database: string,
+    _schema: string,
+    table: string,
+  ): Promise<string> {
+    const description = await this.describeTableDefinition(table);
+    const billingMode = this.resolveBillingMode(description);
+    const globalSecondaryIndexes = (
+      description.GlobalSecondaryIndexes ?? []
+    ).map((index) => this.serializeCreateIndex(index, billingMode));
+    const localSecondaryIndexes = (description.LocalSecondaryIndexes ?? []).map(
+      (index) => this.serializeCreateIndex(index),
+    );
+
+    return this.buildAwsCliCommand("aws dynamodb create-table", [
+      ["--table-name", JSON.stringify(description.TableName ?? table)],
+      [
+        "--attribute-definitions",
+        this.formatCliJson(description.AttributeDefinitions ?? []),
+      ],
+      ["--key-schema", this.formatCliJson(description.KeySchema ?? [])],
+      ["--billing-mode", billingMode],
+      [
+        "--provisioned-throughput",
+        billingMode === "PROVISIONED"
+          ? this.formatCliJson(
+              this.normalizeProvisionedThroughput(
+                description.ProvisionedThroughput,
+              ) ?? {
+                ReadCapacityUnits: 5,
+                WriteCapacityUnits: 5,
+              },
+            )
+          : undefined,
+      ],
+      [
+        "--local-secondary-indexes",
+        localSecondaryIndexes.length > 0
+          ? this.formatCliJson(localSecondaryIndexes)
+          : undefined,
+      ],
+      [
+        "--global-secondary-indexes",
+        globalSecondaryIndexes.length > 0
+          ? this.formatCliJson(globalSecondaryIndexes)
+          : undefined,
+      ],
+      [
+        "--stream-specification",
+        description.StreamSpecification?.StreamEnabled
+          ? this.formatCliJson(description.StreamSpecification)
+          : undefined,
+      ],
+      [
+        "--sse-specification",
+        description.SSEDescription?.Status
+          ? this.formatCliJson({
+              Enabled: description.SSEDescription.Status === "ENABLED",
+              SSEType: description.SSEDescription.SSEType,
+              KMSMasterKeyId: description.SSEDescription.KMSMasterKeyArn,
+            })
+          : undefined,
+      ],
+      ["--table-class", description.TableClassSummary?.TableClass ?? undefined],
+      [
+        "--deletion-protection-enabled",
+        description.DeletionProtectionEnabled === undefined
+          ? undefined
+          : String(description.DeletionProtectionEnabled),
+      ],
+    ]);
   }
 
   async getObjectDefinition(): Promise<string | null> {
@@ -691,6 +823,100 @@ export class DynamoDBDriver implements IDBDriver {
       throw new Error("DynamoDB document client is not connected.");
     }
     return this.documentClient;
+  }
+
+  private async describeTableDefinition(
+    table: string,
+  ): Promise<TableDescription> {
+    const response = await this.requireClient().send(
+      new DescribeTableCommand({ TableName: table }),
+    );
+    if (!response.Table) {
+      throw new Error(`Table "${table}" not found`);
+    }
+
+    return response.Table;
+  }
+
+  private buildAwsCliCommand(
+    baseCommand: string,
+    args: Array<readonly [string, string | undefined]>,
+  ): string {
+    const definedArgs = args.filter(([, value]) => value !== undefined);
+    return [
+      `${baseCommand} \\`,
+      ...definedArgs.map(
+        ([flag, value], index) =>
+          `  ${flag} ${value}${index === definedArgs.length - 1 ? "" : " \\"}`,
+      ),
+    ].join("\n");
+  }
+
+  private formatCliJson(value: unknown): string {
+    return `'${JSON.stringify(value).replaceAll("'", "'\\''")}'`;
+  }
+
+  private resolveBillingMode(
+    table: TableDescription,
+  ): "PAY_PER_REQUEST" | "PROVISIONED" {
+    const summaryMode = table.BillingModeSummary?.BillingMode;
+    if (summaryMode === "PAY_PER_REQUEST" || summaryMode === "PROVISIONED") {
+      return summaryMode;
+    }
+
+    const throughput = table.ProvisionedThroughput;
+    return throughput?.ReadCapacityUnits !== undefined ||
+      throughput?.WriteCapacityUnits !== undefined
+      ? "PROVISIONED"
+      : "PAY_PER_REQUEST";
+  }
+
+  private normalizeProvisionedThroughput(
+    throughput: ProvisionedThroughputDescription | undefined,
+  ): { ReadCapacityUnits: number; WriteCapacityUnits: number } | undefined {
+    const readCapacityUnits = throughput?.ReadCapacityUnits;
+    const writeCapacityUnits = throughput?.WriteCapacityUnits;
+    if (readCapacityUnits === undefined || writeCapacityUnits === undefined) {
+      return undefined;
+    }
+
+    return {
+      ReadCapacityUnits: Number(readCapacityUnits),
+      WriteCapacityUnits: Number(writeCapacityUnits),
+    };
+  }
+
+  private normalizeProjection(projection: Projection | undefined): Projection {
+    return {
+      ProjectionType: projection?.ProjectionType ?? "ALL",
+      NonKeyAttributes: projection?.NonKeyAttributes,
+    };
+  }
+
+  private serializeCreateIndex(
+    index: GlobalSecondaryIndexDescription | LocalSecondaryIndexDescription,
+    billingMode?: "PAY_PER_REQUEST" | "PROVISIONED",
+  ): Record<string, unknown> {
+    const payload: Record<string, unknown> = {
+      IndexName: index.IndexName,
+      KeySchema: index.KeySchema ?? [],
+      Projection: this.normalizeProjection(index.Projection),
+    };
+
+    if (
+      billingMode === "PROVISIONED" &&
+      "ProvisionedThroughput" in index &&
+      index.ProvisionedThroughput
+    ) {
+      const throughput = this.normalizeProvisionedThroughput(
+        index.ProvisionedThroughput,
+      );
+      if (throughput) {
+        payload.ProvisionedThroughput = throughput;
+      }
+    }
+
+    return payload;
   }
 
   private async getTableSchema(table: string): Promise<{

@@ -77,7 +77,7 @@ const MANIFESTS: Record<ConnectionType, DriverEntityManifest> = {
     },
   },
   mongodb: {
-    dbObjectKinds: ["table"],
+    dbObjectKinds: ["table", "view"],
     tableSections: {
       columns: "supported",
       constraints: "not_applicable",
@@ -115,28 +115,31 @@ const MANIFESTS: Record<ConnectionType, DriverEntityManifest> = {
 };
 
 describe("open DDL eligibility", () => {
-  it("matches the canonical unsupported matrix for non-SQL table and index nodes", () => {
+  it("matches the canonical support matrix for NoSQL table and index nodes", () => {
     expect(
       isOpenDdlSupportedForNode("table", "mongodb", MANIFESTS.mongodb),
-    ).toBe(false);
+    ).toBe(true);
+    expect(
+      isOpenDdlSupportedForNode("view", "mongodb", MANIFESTS.mongodb),
+    ).toBe(true);
     expect(
       isOpenDdlSupportedForNode(
         "table_detail_index",
         "mongodb",
         MANIFESTS.mongodb,
       ),
-    ).toBe(false);
+    ).toBe(true);
 
     expect(
       isOpenDdlSupportedForNode("table", "dynamodb", MANIFESTS.dynamodb),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       isOpenDdlSupportedForNode(
         "table_detail_index",
         "dynamodb",
         MANIFESTS.dynamodb,
       ),
-    ).toBe(false);
+    ).toBe(true);
 
     expect(
       isOpenDdlSupportedForNode(
@@ -144,7 +147,7 @@ describe("open DDL eligibility", () => {
         "elasticsearch",
         MANIFESTS.elasticsearch,
       ),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       isOpenDdlSupportedForNode(
         "table_detail_index",
@@ -174,7 +177,7 @@ describe("open DDL eligibility", () => {
   it("adds noDdl suffix to unsupported node context values", () => {
     expect(
       composeOpenDdlAwareContextValue("table", "mongodb", MANIFESTS.mongodb),
-    ).toBe("table_noDdl");
+    ).toBe("table");
     expect(
       composeOpenDdlAwareContextValue(
         "table_detail_index",
@@ -185,6 +188,33 @@ describe("open DDL eligibility", () => {
     expect(composeOpenDdlAwareContextValue("table", "pg", MANIFESTS.pg)).toBe(
       "table",
     );
+  });
+
+  it("uses per-index hints to suppress unsupported detail nodes", () => {
+    expect(
+      isOpenDdlSupportedForNode(
+        "table_detail_index",
+        "dynamodb",
+        MANIFESTS.dynamodb,
+        { indexDdlSupport: "unsupported" },
+      ),
+    ).toBe(false);
+    expect(
+      composeOpenDdlAwareContextValue(
+        "table_detail_index",
+        "dynamodb",
+        MANIFESTS.dynamodb,
+        { indexDdlSupport: "unsupported" },
+      ),
+    ).toBe("table_detail_index_noDdl");
+    expect(
+      isOpenDdlSupportedForNode(
+        "table_detail_index",
+        "dynamodb",
+        MANIFESTS.dynamodb,
+        { indexDdlSupport: "supported" },
+      ),
+    ).toBe(true);
   });
 
   it("handles unknown kinds and keeps context value unchanged", () => {

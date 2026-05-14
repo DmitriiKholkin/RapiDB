@@ -893,6 +893,238 @@ describe("extension activation", () => {
     );
   });
 
+  it("opens NoSQL DDL with non-SQL presentation hints", async () => {
+    const extension = await import("../../src/extension/extension");
+    const context = { subscriptions: [] as Array<{ dispose(): void }> };
+    const mongoDriver = {
+      getCreateTableDDL: vi
+        .fn()
+        .mockResolvedValue(
+          'db.getSiblingDB("rapidb").createView("active_users", "users", []);',
+        ),
+      getIndexDDL: vi
+        .fn()
+        .mockResolvedValue(
+          'db.getSiblingDB("rapidb").getCollection("users").createIndex({ "email": 1 }, { "name": "users_by_email" });',
+        ),
+    };
+    const dynamoDriver = {
+      getCreateTableDDL: vi
+        .fn()
+        .mockResolvedValue(
+          'aws dynamodb create-table \\\n+  --table-name "Users" \\\n+  --attribute-definitions \'[{"AttributeName":"pk","AttributeType":"S"}]\' \\\n+  --key-schema \'[{"AttributeName":"pk","KeyType":"HASH"}]\' \\\n+  --billing-mode PAY_PER_REQUEST',
+        ),
+    };
+    const elasticsearchDriver = {
+      getCreateTableDDL: vi
+        .fn()
+        .mockResolvedValue(
+          'PUT /users\n{\n  "settings": {\n    "number_of_shards": "1"\n  }\n}',
+        ),
+    };
+
+    (
+      connectionManagerInstance.getConnection as ReturnType<typeof vi.fn>
+    ).mockImplementation((id: string) => {
+      if (id === "conn-mongo") {
+        return { id, name: "Mongo", type: "mongodb" };
+      }
+      if (id === "conn-ddb") {
+        return { id, name: "Dynamo", type: "dynamodb" };
+      }
+      if (id === "conn-es") {
+        return { id, name: "Elastic", type: "elasticsearch" };
+      }
+
+      return { id, name: "Primary", type: "pg" };
+    });
+    (
+      connectionManagerInstance.getDriver as ReturnType<typeof vi.fn>
+    ).mockImplementation((id: string) => {
+      if (id === "conn-mongo") {
+        return mongoDriver;
+      }
+      if (id === "conn-ddb") {
+        return dynamoDriver;
+      }
+      if (id === "conn-es") {
+        return elasticsearchDriver;
+      }
+
+      return undefined;
+    });
+
+    extension.activate(context as never);
+
+    const showDdlCommand = vscodeState.registerCommand.mock.calls.find(
+      ([command]) => command === "rapidb.showDDL",
+    )?.[1] as ((node: Record<string, unknown>) => Promise<void>) | undefined;
+
+    if (!showDdlCommand) {
+      throw new Error("Show DDL command was not registered.");
+    }
+
+    await showDdlCommand({
+      kind: "view",
+      connectionId: "conn-mongo",
+      database: "rapidb",
+      schema: "rapidb",
+      objectName: "active_users",
+    });
+    await showDdlCommand({
+      kind: "table_detail_index",
+      connectionId: "conn-mongo",
+      database: "rapidb",
+      schema: "rapidb",
+      parentTable: "users",
+      objectName: "users_by_email",
+    });
+    await showDdlCommand({
+      kind: "table",
+      connectionId: "conn-ddb",
+      database: "us-east-1",
+      schema: "us-east-1",
+      objectName: "Users",
+    });
+    await showDdlCommand({
+      kind: "table",
+      connectionId: "conn-es",
+      database: "default",
+      schema: "indices",
+      objectName: "users",
+    });
+
+    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
+      1,
+      context,
+      connectionManagerInstance,
+      "conn-mongo",
+      'db.getSiblingDB("rapidb").createView("active_users", "users", []);',
+      true,
+      false,
+      false,
+      "javascript",
+    );
+    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
+      2,
+      context,
+      connectionManagerInstance,
+      "conn-mongo",
+      'db.getSiblingDB("rapidb").getCollection("users").createIndex({ "email": 1 }, { "name": "users_by_email" });',
+      true,
+      false,
+      false,
+      "javascript",
+    );
+    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
+      3,
+      context,
+      connectionManagerInstance,
+      "conn-ddb",
+      expect.stringContaining("aws dynamodb create-table"),
+      true,
+      false,
+      false,
+      "plaintext",
+    );
+    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
+      4,
+      context,
+      connectionManagerInstance,
+      "conn-es",
+      expect.stringContaining("PUT /users"),
+      true,
+      false,
+      false,
+      "plaintext",
+    );
+  });
+
+  it("guards Show DDL for per-index unsupported NoSQL detail nodes", async () => {
+    const extension = await import("../../src/extension/extension");
+    const context = { subscriptions: [] as Array<{ dispose(): void }> };
+    const driver = {
+      getIndexDDL: vi.fn(),
+    };
+
+    (
+      connectionManagerInstance.getConnection as ReturnType<typeof vi.fn>
+    ).mockReturnValue({ id: "conn-1", name: "Dynamo", type: "dynamodb" });
+    (
+      connectionManagerInstance.getDriver as ReturnType<typeof vi.fn>
+    ).mockReturnValue(driver);
+
+    extension.activate(context as never);
+
+    const showDdlCommand = vscodeState.registerCommand.mock.calls.find(
+      ([command]) => command === "rapidb.showDDL",
+    )?.[1] as ((node: Record<string, unknown>) => Promise<void>) | undefined;
+
+    if (!showDdlCommand) {
+      throw new Error("Show DDL command was not registered.");
+    }
+
+    await showDdlCommand({
+      kind: "table_detail_index",
+      connectionId: "conn-1",
+      database: "us-east-1",
+      schema: "us-east-1",
+      parentTable: "Users",
+      objectName: "UsersByEmail",
+      ddlSupport: "unsupported",
+    });
+
+    expect(driver.getIndexDDL).not.toHaveBeenCalled();
+    expect(queryPanelCreateOrShow).not.toHaveBeenCalled();
+    expect(vscodeState.showWarningMessage).toHaveBeenCalledWith(
+      "[RapiDB] DDL is available only for table, view, materialized view, function, procedure, sequence, type, constraint, index, and trigger nodes.",
+    );
+  });
+
+  it("guards Show DDL for Elasticsearch index detail nodes via connection-type override", async () => {
+    const extension = await import("../../src/extension/extension");
+    const context = { subscriptions: [] as Array<{ dispose(): void }> };
+    const driver = {
+      getIndexDDL: vi.fn(),
+    };
+
+    (
+      connectionManagerInstance.getConnection as ReturnType<typeof vi.fn>
+    ).mockReturnValue({
+      id: "conn-1",
+      name: "Search",
+      type: "elasticsearch",
+    });
+    (
+      connectionManagerInstance.getDriver as ReturnType<typeof vi.fn>
+    ).mockReturnValue(driver);
+
+    extension.activate(context as never);
+
+    const showDdlCommand = vscodeState.registerCommand.mock.calls.find(
+      ([command]) => command === "rapidb.showDDL",
+    )?.[1] as ((node: Record<string, unknown>) => Promise<void>) | undefined;
+
+    if (!showDdlCommand) {
+      throw new Error("Show DDL command was not registered.");
+    }
+
+    await showDdlCommand({
+      kind: "table_detail_index",
+      connectionId: "conn-1",
+      database: "default",
+      schema: "indices",
+      parentTable: "users",
+      objectName: "users_id_idx",
+    });
+
+    expect(driver.getIndexDDL).not.toHaveBeenCalled();
+    expect(queryPanelCreateOrShow).not.toHaveBeenCalled();
+    expect(vscodeState.showWarningMessage).toHaveBeenCalledWith(
+      "[RapiDB] DDL is available only for table, view, materialized view, function, procedure, sequence, type, constraint, index, and trigger nodes.",
+    );
+  });
+
   it("guards Show DDL for unsupported NoSQL table nodes", async () => {
     const extension = await import("../../src/extension/extension");
     const context = { subscriptions: [] as Array<{ dispose(): void }> };

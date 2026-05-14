@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import type { QueryEditorLanguage } from "../../shared/webviewContracts";
 import {
   type QueryResult,
   type SchemaObject,
@@ -23,6 +24,7 @@ interface Props {
   formatOnOpen?: boolean;
   connectionType?: string;
   isBookmarked?: boolean;
+  editorLanguage?: QueryEditorLanguage;
 }
 
 const btnStyle = (disabled = false): React.CSSProperties =>
@@ -55,6 +57,7 @@ export function QueryView({
   formatOnOpen = false,
   connectionType = "",
   isBookmarked: initialIsBookmarked = false,
+  editorLanguage,
 }: Props): React.ReactElement {
   const editorRef = useRef<MonacoEditorHandle>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -105,12 +108,16 @@ export function QueryView({
     (c) => c.id === (activeConnectionId || connectionId),
   );
   const activeConnectionType = activeConn?.type ?? connectionType;
-  const sqlDialect = isSqlConnectionType(activeConnectionType)
-    ? connTypeToDialect(activeConnectionType)
-    : undefined;
-  const monacoLanguage =
+  const derivedEditorLanguage: QueryEditorLanguage =
     activeConnectionType === "mongodb" ? "javascript" : "sql";
-  const editorLabel = sqlDialect ? "SQL editor" : "Query editor";
+  const monacoLanguage = editorLanguage ?? derivedEditorLanguage;
+  const sqlDialect =
+    monacoLanguage === "sql"
+      ? isSqlConnectionType(activeConnectionType)
+        ? connTypeToDialect(activeConnectionType)
+        : "sql"
+      : undefined;
+  const editorLabel = monacoLanguage === "sql" ? "SQL editor" : "Query editor";
 
   useEffect(() => {
     setActiveConnection(connectionId);

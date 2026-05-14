@@ -1,9 +1,11 @@
 import * as vscode from "vscode";
+import type { ConnectionType } from "../shared/connectionTypes";
 import {
   isDbObjectKind,
   isDdlOnlyDbObjectKind,
   isRoutineDbObjectKind,
 } from "../shared/dbObjectKinds";
+import type { QueryEditorLanguage } from "../shared/webviewContracts";
 import type {
   BookmarkEntry,
   ExplorerSchemaScope,
@@ -165,6 +167,29 @@ function showSavedQuery(
     options?.formatOnOpen,
     options?.isBookmarked,
   );
+}
+
+function getOpenDdlPresentation(connectionType: ConnectionType | undefined): {
+  formatOnOpen: boolean;
+  editorLanguage?: QueryEditorLanguage;
+} {
+  switch (connectionType) {
+    case "mongodb":
+      return {
+        formatOnOpen: false,
+        editorLanguage: "javascript",
+      };
+    case "dynamodb":
+    case "elasticsearch":
+      return {
+        formatOnOpen: false,
+        editorLanguage: "plaintext",
+      };
+    default:
+      return {
+        formatOnOpen: true,
+      };
+  }
 }
 
 async function clearSavedEntries(
@@ -389,7 +414,11 @@ function registerCommands(
     const entityManifest =
       managerWithManifest.getDriverEntityManifest?.(node.connectionId) ??
       DEFAULT_DRIVER_ENTITY_MANIFEST;
-    if (!isOpenDdlSupportedForNode(node.kind, connectionType, entityManifest)) {
+    if (
+      !isOpenDdlSupportedForNode(node.kind, connectionType, entityManifest, {
+        indexDdlSupport: node.ddlSupport,
+      })
+    ) {
       vscode.window.showWarningMessage(
         "[RapiDB] DDL is available only for table, view, materialized view, function, procedure, sequence, type, constraint, index, and trigger nodes.",
       );
@@ -477,6 +506,7 @@ function registerCommands(
         );
         return;
       }
+      const ddlPresentation = getOpenDdlPresentation(connectionType);
       if (objectKind && isRoutineDbObjectKind(objectKind)) {
         QueryPanel.createOrShow(
           context,
@@ -485,14 +515,27 @@ function registerCommands(
           ddl,
         );
       } else {
-        QueryPanel.createOrShow(
-          context,
-          connectionManager,
-          node.connectionId,
-          ddl,
-          true,
-          true,
-        );
+        if (ddlPresentation.editorLanguage) {
+          QueryPanel.createOrShow(
+            context,
+            connectionManager,
+            node.connectionId,
+            ddl,
+            true,
+            ddlPresentation.formatOnOpen,
+            false,
+            ddlPresentation.editorLanguage,
+          );
+        } else {
+          QueryPanel.createOrShow(
+            context,
+            connectionManager,
+            node.connectionId,
+            ddl,
+            true,
+            ddlPresentation.formatOnOpen,
+          );
+        }
       }
     } catch (err: unknown) {
       const error = logErrorWithContext(

@@ -401,17 +401,214 @@ describe("schema object definitions", () => {
     const listCollections = vi.fn().mockReturnValue({ toArray });
 
     (
-      driver as unknown as { client: { db: typeof db }; connected: boolean }
+      driver as unknown as {
+        client: {
+          db: (database?: string) => {
+            listCollections: typeof listCollections;
+          };
+        };
+        connected: boolean;
+      }
     ).client = {
       db: vi.fn().mockReturnValue({ listCollections }),
     };
     (driver as unknown as { connected: boolean }).connected = true;
 
-    await expect(driver.listObjects("rapidb", "ignored")).resolves.toEqual([
+    await expect(driver.listObjects("rapidb")).resolves.toEqual([
       { schema: "rapidb", name: "users", type: "table" },
       { schema: "rapidb", name: "active_users", type: "view" },
     ]);
     expect(listCollections).toHaveBeenCalledWith({}, { nameOnly: false });
+  });
+
+  it("renders MongoDB collection, view, and index DDL in mongosh syntax", async () => {
+    const driver = new MongoDBDriver(mongodbConfig as ConnectionConfig);
+    const listCollections = vi.fn(({ name }: { name?: string }) => ({
+      toArray: vi.fn().mockResolvedValue(
+        name === "active_users"
+          ? [
+              {
+                name: "active_users",
+                type: "view",
+                options: {
+                  viewOn: "users",
+                  pipeline: [{ $match: { active: true } }],
+                },
+              },
+            ]
+          : [
+              {
+                name: "users",
+                type: "collection",
+                options: {
+                  validator: { $jsonSchema: { bsonType: "object" } },
+                },
+              },
+            ],
+      ),
+    }));
+    const indexes = vi.fn().mockResolvedValue([
+      {
+        name: "users_by_email",
+        key: { email: 1 },
+        unique: true,
+      },
+    ]);
+
+    (
+      driver as unknown as {
+        client: {
+          db: (database: string) => {
+            listCollections: typeof listCollections;
+            collection: (name: string) => { indexes: typeof indexes };
+          };
+        };
+        connected: boolean;
+      }
+    ).client = {
+      db: vi.fn((_database: string) => ({
+        listCollections,
+        collection: vi.fn((_name: string) => ({ indexes })),
+      })),
+    };
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    await expect(
+      driver.getCreateTableDDL("rapidb", "ignored", "users"),
+    ).resolves.toBe(
+      'db.getSiblingDB("rapidb").createCollection(\n  "users",\n  { "validator": { "$jsonSchema": { "bsonType": "object" } } }\n);',
+    );
+    await expect(
+      driver.getCreateTableDDL("rapidb", "ignored", "active_users"),
+    ).resolves.toBe(
+      'db.getSiblingDB("rapidb").createView(\n  "active_users",\n  "users",\n  [{ "$match": { "active": true } }]\n);',
+    );
+    await expect(
+      driver.getIndexDDL("rapidb", "ignored", "users", "users_by_email"),
+    ).resolves.toBe(
+      'db.getSiblingDB("rapidb").getCollection("users").createIndex(\n  { "email": 1 },\n  { "name": "users_by_email", "unique": true }\n);',
+    );
+  });
+
+  it("renders DynamoDB table and GSI DDL while marking LSIs unsupported", async () => {
+    const driver = new DynamoDBDriver(dynamodbConfig as ConnectionConfig);
+    const send = vi.fn(async (_command: unknown) => ({
+      Table: {
+        TableName: "Users",
+        AttributeDefinitions: [
+          { AttributeName: "pk", AttributeType: "S" },
+          { AttributeName: "sk", AttributeType: "S" },
+          { AttributeName: "email", AttributeType: "S" },
+        ],
+        KeySchema: [
+          { AttributeName: "pk", KeyType: "HASH" },
+          { AttributeName: "sk", KeyType: "RANGE" },
+        ],
+        BillingModeSummary: { BillingMode: "PAY_PER_REQUEST" },
+        GlobalSecondaryIndexes: [
+          {
+            IndexName: "UsersByEmail",
+            KeySchema: [{ AttributeName: "email", KeyType: "HASH" }],
+            Projection: { ProjectionType: "ALL" },
+          },
+        ],
+        LocalSecondaryIndexes: [
+          {
+            IndexName: "UsersBySortKey",
+            KeySchema: [
+              { AttributeName: "pk", KeyType: "HASH" },
+              { AttributeName: "sk", KeyType: "RANGE" },
+            ],
+            Projection: { ProjectionType: "KEYS_ONLY" },
+          },
+        ],
+      },
+    }));
+
+    (
+      driver as unknown as {
+        client: { send: typeof send };
+        connected: boolean;
+      }
+    ).client = { send };
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    await expect(
+      driver.getIndexes("us-east-1", "ignored", "Users"),
+    ).resolves.toEqual([
+      {
+        name: "UsersByEmail",
+        columns: ["email"],
+        unique: false,
+        primary: false,
+        ddlSupport: "supported",
+      },
+      {
+        name: "UsersBySortKey",
+        columns: ["pk", "sk"],
+        unique: false,
+        primary: false,
+        ddlSupport: "unsupported",
+      },
+    ]);
+    await expect(
+      driver.getCreateTableDDL("us-east-1", "ignored", "Users"),
+    ).resolves.toContain("aws dynamodb create-table");
+    await expect(
+      driver.getIndexDDL("us-east-1", "ignored", "Users", "UsersByEmail"),
+    ).resolves.toContain("--global-secondary-index-updates");
+    await expect(
+      driver.getIndexDDL("us-east-1", "ignored", "Users", "UsersBySortKey"),
+    ).rejects.toThrow(/only global secondary indexes/i);
+  });
+
+  it("renders Elasticsearch index DDL with filtered settings, mappings, and aliases", async () => {
+    const driver = new ElasticsearchDriver(
+      elasticsearchConfig as ConnectionConfig,
+    );
+
+    (
+      driver as unknown as {
+        client: {
+          indices: {
+            get: typeof vi.fn;
+          };
+        };
+        connected: boolean;
+      }
+    ).client = {
+      indices: {
+        get: vi.fn().mockResolvedValue({
+          users: {
+            settings: {
+              index: {
+                number_of_shards: "1",
+                number_of_replicas: "1",
+                provided_name: "users",
+                creation_date: "1700000000000",
+                uuid: "abc123",
+                version: { created: "8500000" },
+              },
+            },
+            mappings: {
+              properties: {
+                email: { type: "keyword" },
+              },
+            },
+            aliases: {
+              users_read: {},
+            },
+          },
+        }),
+      },
+    };
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    await expect(
+      driver.getCreateTableDDL("default", "indices", "users"),
+    ).resolves.toBe(
+      'PUT /users\n{\n  "settings": {\n    "number_of_shards": "1",\n    "number_of_replicas": "1"\n  },\n  "mappings": {\n    "properties": {\n      "email": {\n        "type": "keyword"\n      }\n    }\n  },\n  "aliases": {\n    "users_read": {}\n  }\n}',
+    );
   });
 
   it("lists Oracle materialized views, sequences, and types and renders metadata DDL", async () => {

@@ -93,6 +93,52 @@ describe("QueryPanel", () => {
     vi.clearAllMocks();
   });
 
+  it("passes editor language overrides through the webview initial state", async () => {
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "conn-1",
+        name: "Mongo",
+        type: "mongodb",
+      })),
+      onDidSchemaLoad: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+      getConnections: vi.fn(() => [
+        { id: "conn-1", name: "Mongo", type: "mongodb" },
+      ]),
+      getConnectedCount: vi.fn(() => 1),
+    };
+
+    const { createWebviewShell } = await import(
+      "../../src/extension/panels/webviewShell"
+    );
+    const { QueryPanel } = await import(
+      "../../src/extension/panels/queryPanel"
+    );
+
+    QueryPanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      'db.users.createCollection("users")',
+      true,
+      false,
+      false,
+      "javascript",
+    );
+
+    expect(createWebviewShell).toHaveBeenCalledWith(
+      expect.objectContaining({
+        initialState: expect.objectContaining({
+          connectionType: "mongodb",
+          editorLanguage: "javascript",
+          formatOnOpen: false,
+        }),
+      }),
+    );
+  });
+
   it("refreshes schema in an open editor when the connection becomes available", async () => {
     let connectListener: (() => void) | undefined;
     let disconnectListener: (() => void) | undefined;

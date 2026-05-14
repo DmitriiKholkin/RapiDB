@@ -280,6 +280,7 @@ describe("parseWebviewInitialState", () => {
       initialSql: "select 1",
       formatOnOpen: true,
       isBookmarked: false,
+      editorLanguage: "sql",
     });
 
     expect(parsed).toEqual({
@@ -289,6 +290,7 @@ describe("parseWebviewInitialState", () => {
       initialSql: "select 1",
       formatOnOpen: true,
       isBookmarked: false,
+      editorLanguage: "sql",
     });
   });
 
@@ -306,6 +308,43 @@ describe("parseWebviewInitialState", () => {
       initialSql: undefined,
       formatOnOpen: undefined,
       isBookmarked: undefined,
+      editorLanguage: undefined,
+    });
+  });
+
+  it("parses NoSQL editor language overrides for query state", () => {
+    expect(
+      parseWebviewInitialState({
+        view: "query",
+        connectionId: "conn-js",
+        connectionType: "mongodb",
+        editorLanguage: "javascript",
+      }),
+    ).toEqual({
+      view: "query",
+      connectionId: "conn-js",
+      connectionType: "mongodb",
+      initialSql: undefined,
+      formatOnOpen: undefined,
+      isBookmarked: undefined,
+      editorLanguage: "javascript",
+    });
+
+    expect(
+      parseWebviewInitialState({
+        view: "query",
+        connectionId: "conn-text",
+        connectionType: "elasticsearch",
+        editorLanguage: "plaintext",
+      }),
+    ).toEqual({
+      view: "query",
+      connectionId: "conn-text",
+      connectionType: "elasticsearch",
+      initialSql: undefined,
+      formatOnOpen: undefined,
+      isBookmarked: undefined,
+      editorLanguage: "plaintext",
     });
   });
 
