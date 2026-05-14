@@ -420,7 +420,9 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     }
 
     const schemas = database.schemas;
-    if (this.shouldFlattenSchemaLevel(element.connectionId, schemas)) {
+    if (
+      this.shouldFlattenSchemaLevel(element.connectionId, databaseName, schemas)
+    ) {
       return this.categoryNodes(
         element.connectionId,
         databaseName,
@@ -1174,13 +1176,23 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
 
   private shouldFlattenSchemaLevel(
     connectionId: string,
+    databaseName: string,
     schemas: readonly SchemaSnapshotSchemaEntry[],
   ): boolean {
+    if (schemas.length !== 1) {
+      return false;
+    }
+
     const connectionType = this.getConnectionType(connectionId);
-    return (
-      (connectionType === "mongodb" || connectionType === "dynamodb") &&
-      schemas.length === 1
-    );
+    if (connectionType === "mongodb" || connectionType === "dynamodb") {
+      return true;
+    }
+
+    if (connectionType === "redis" || connectionType === "elasticsearch") {
+      return false;
+    }
+
+    return schemas[0]?.name === databaseName;
   }
 
   private hasSchemaConcept(connectionId: string): boolean {
