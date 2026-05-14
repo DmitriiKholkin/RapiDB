@@ -327,9 +327,12 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         return editor.getValue() ?? "";
       },
       setValue: (v) => editorRef.current?.setValue(v),
-      format: (dialect = "sql") => {
+      format: (requestedDialect?: string) => {
         const editor = editorRef.current;
         if (!editor || editor.getOption(monaco.editor.EditorOption.readOnly)) {
+          return null;
+        }
+        if (languageRef.current !== "sql") {
           return null;
         }
         const model = editor.getModel();
@@ -337,7 +340,10 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
           return null;
         }
         const raw = editor.getValue();
-        const out = formatSQLOrError(raw, dialect);
+        const out = formatSQLOrError(
+          raw,
+          requestedDialect ?? dialectRef.current ?? "sql",
+        );
         if ("error" in out) {
           return out.error;
         }
@@ -530,6 +536,9 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyF,
         () => {
           if (readOnlyRef.current) {
+            return;
+          }
+          if (languageRef.current !== "sql") {
             return;
           }
           const model = editor.getModel();
