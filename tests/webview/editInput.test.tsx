@@ -29,4 +29,20 @@ describe("EditInput", () => {
 
     expect(onCommit).toHaveBeenCalledWith("0xfeed");
   });
+
+  it("selects the full value from the start when focused", () => {
+    render(
+      <EditInput
+        initial="abcdefghijklmno"
+        nullable
+        onCommit={() => undefined}
+        onCancel={() => undefined}
+      />,
+    );
+
+    const input = screen.getByLabelText("Cell value") as HTMLInputElement;
+
+    expect(input.selectionStart).toBe(0);
+    expect(input.selectionEnd).toBe(input.value.length);
+  });
 });

@@ -380,10 +380,13 @@ function formatMongoScalarValue(
         : String(value);
     }
     case "Decimal128":
-    case "Double":
-    case "Int32":
     case "Long":
       return String(value);
+    case "Double":
+    case "Int32": {
+      const numeric = Number(value);
+      return Number.isFinite(numeric) ? numeric : String(value);
+    }
     case "BSONSymbol":
       return String(value);
     case "Timestamp": {
@@ -1072,7 +1075,7 @@ export class MongoDBDriver implements IDBDriver {
       const docs = await mongoCollection
         .find(filter, {
           promoteValues: false,
-          bsonRegExp: true,
+          bsonRegExp: false,
         })
         .limit(actualLimit)
         .skip(skip)
@@ -1179,7 +1182,7 @@ export class MongoDBDriver implements IDBDriver {
       const docs = await mongoCollection
         .aggregate(pipeline, {
           promoteValues: false,
-          bsonRegExp: true,
+          bsonRegExp: false,
         })
         .toArray();
       const rows = docs.map((doc) =>
@@ -1686,7 +1689,7 @@ export class MongoDBDriver implements IDBDriver {
           {},
           {
             promoteValues: false,
-            bsonRegExp: true,
+            bsonRegExp: false,
           },
         )
         .limit(limit)
@@ -1709,7 +1712,7 @@ export class MongoDBDriver implements IDBDriver {
           {},
           {
             promoteValues: false,
-            bsonRegExp: true,
+            bsonRegExp: false,
           },
         )
         .limit(limit)

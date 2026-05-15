@@ -108,11 +108,70 @@ describe("MongoDBDriver — mongosh query()", () => {
       {},
       {
         promoteValues: false,
-        bsonRegExp: true,
+        bsonRegExp: false,
       },
     );
     expect(result.columns).toContain("name");
     expect(result.rowCount).toBe(1);
+  });
+
+  it("formats MongoDB readRows output with canonical nested values", async () => {
+    const driver = new MongoDBDriver({
+      id: "test-read-rows",
+      type: "mongodb",
+      name: "test",
+      host: "localhost",
+      port: 27017,
+      database: "testdb",
+    });
+
+    const findMock = vi.fn().mockReturnValue({
+      limit: vi.fn().mockReturnThis(),
+      toArray: vi.fn().mockResolvedValue([
+        {
+          _id: new ObjectId("64a1b2c3d4e5f67890abcdef"),
+          t_array: [
+            new Int32(1),
+            "two",
+            new Int32(3),
+            true,
+            null,
+            { k: "v" },
+            [new Int32(7), new Int32(8), new Int32(9)],
+          ],
+          t_nested_array: [
+            [new Int32(1), new Int32(2)],
+            [new Int32(3), new Int32(4)],
+            [new Int32(5), null, new Int32(7)],
+          ],
+          t_regex: /quick\s+fox/gi,
+        },
+      ]),
+    });
+    const mockDb = {
+      collection: vi.fn().mockReturnValue({ find: findMock }),
+    };
+    (driver as unknown as { client: unknown; connected: boolean }).client = {
+      db: vi.fn().mockReturnValue(mockDb),
+    };
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    const rows = await (
+      driver as unknown as {
+        readRows: (
+          database: string,
+          table: string,
+          limit: number,
+        ) => Promise<Record<string, unknown>[]>;
+      }
+    ).readRows("testdb", "bson_types", 10);
+
+    expect(rows[0]).toEqual({
+      _id: "64a1b2c3d4e5f67890abcdef",
+      t_array: '[1,"two",3,true,null,{"k":"v"},[7,8,9]]',
+      t_nested_array: "[[1,2],[3,4],[5,null,7]]",
+      t_regex: "/quick\\s+fox/gi",
+    });
   });
 
   it("executes find with filter and limit chain", async () => {
@@ -125,7 +184,7 @@ describe("MongoDBDriver — mongosh query()", () => {
     await driver.query('db.users.find({ name: "Alice" }).limit(5)');
     expect(findReturn).toHaveBeenCalledWith(
       { name: "Alice" },
-      { promoteValues: false, bsonRegExp: true },
+      { promoteValues: false, bsonRegExp: false },
     );
   });
 
@@ -156,6 +215,21 @@ describe("MongoDBDriver — mongosh query()", () => {
       t_date: new Date("2024-07-04T12:00:00.000Z"),
       t_decimal128: Decimal128.fromString("123456789.987654321"),
       t_int64: Long.fromString("9223372036854775807"),
+      t_array: [
+        new Int32(1),
+        "two",
+        new Int32(3),
+        true,
+        null,
+        { k: "v" },
+        [new Int32(7), new Int32(8), new Int32(9)],
+      ],
+      t_nested_array: [
+        [new Int32(1), new Int32(2)],
+        [new Int32(3), new Int32(4)],
+        [new Int32(5), null, new Int32(7)],
+      ],
+      t_regex: /quick\s+fox/gi,
       t_timestamp: new Timestamp({ t: 1720094400, i: 1 }),
     };
     const mockFindChain = {
@@ -181,6 +255,9 @@ describe("MongoDBDriver — mongosh query()", () => {
       t_date: "2024-07-04 12:00:00",
       t_decimal128: "123456789.987654321",
       t_int64: "9223372036854775807",
+      t_array: '[1,"two",3,true,null,{"k":"v"},[7,8,9]]',
+      t_nested_array: "[[1,2],[3,4],[5,null,7]]",
+      t_regex: "/quick\\s+fox/gi",
       t_timestamp: "2024-07-04 12:00:00",
     });
   });
@@ -318,7 +395,7 @@ describe("MongoDBDriver — mongosh query()", () => {
       },
       {
         promoteValues: false,
-        bsonRegExp: true,
+        bsonRegExp: false,
       },
     );
   });
@@ -528,7 +605,6 @@ describe("MongoDBDriver — buildMutationPreviewStatement()", () => {
       filterOperators: ["eq"],
       valueSemantics: "plain",
     };
-
     const preview = driver.buildMutationPreviewStatement(
       "insert",
       "mydb",
@@ -592,6 +668,30 @@ describe("MongoDBDriver — buildMutationPreviewStatement()", () => {
       filterOperators: ["eq"],
       valueSemantics: "plain",
     };
+    const regexColumn: ColumnTypeMeta = {
+      name: "t_regex",
+      type: "regex",
+      nativeType: "regex",
+      nullable: true,
+      isPrimaryKey: false,
+      isForeignKey: false,
+      category: "other",
+      filterable: true,
+      filterOperators: ["eq"],
+      valueSemantics: "plain",
+    };
+    const arrayColumn: ColumnTypeMeta = {
+      name: "t_array",
+      type: "array",
+      nativeType: "array",
+      nullable: true,
+      isPrimaryKey: false,
+      isForeignKey: false,
+      category: "array",
+      filterable: true,
+      filterOperators: ["eq"],
+      valueSemantics: "plain",
+    };
 
     expect(
       driver.coerceInputValue(
@@ -620,5 +720,20 @@ describe("MongoDBDriver — buildMutationPreviewStatement()", () => {
         timestampColumn,
       ),
     ).toBe("2024-07-04 12:00:00");
+    expect(
+      driver.formatOutputValue(
+        driver.coerceInputValue("/quick\\s+fox/gi", regexColumn),
+        regexColumn,
+      ),
+    ).toBe("/quick\\s+fox/gi");
+    expect(
+      driver.formatOutputValue(
+        driver.coerceInputValue(
+          '[1,"two",3,true,null,{"k":"v"},[7,8,9]]',
+          arrayColumn,
+        ),
+        arrayColumn,
+      ),
+    ).toBe('[1,"two",3,true,null,{"k":"v"},[7,8,9]]');
   });
 });

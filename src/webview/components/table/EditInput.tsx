@@ -47,9 +47,10 @@ export function EditInput({
   );
   const ref = useRef<HTMLInputElement>(null);
   useLayoutEffect(() => {
-    ref.current?.focus();
     if (ref.current instanceof HTMLInputElement) {
-      ref.current.select();
+      ref.current.focus({ preventScroll: true });
+      ref.current.setSelectionRange(0, ref.current.value.length);
+      ref.current.scrollLeft = 0;
     }
   }, []);
   const normalizedValue = normalizeEditInitialValue(val, category);

@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { coerceFilterExpressions } from "../../shared/tableTypes";
 import { parseTablePanelMessage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
-import type { FilterExpression } from "../dbDrivers/types";
+import type { ColumnTypeMeta, FilterExpression } from "../dbDrivers/types";
 import {
   prepareApplyChangesPlan,
   type SortConfig,
@@ -474,7 +474,7 @@ export class TablePanel {
     filters: FilterExpression[],
     signal: AbortSignal,
   ): AsyncGenerator<{
-    columns: { name: string }[];
+    columns: ColumnTypeMeta[];
     rows: Record<string, unknown>[];
   }> {
     if (signal.aborted) return;

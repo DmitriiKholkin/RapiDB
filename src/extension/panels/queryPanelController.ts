@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { parseQueryPanelMessage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
+import type { QueryColumnMeta } from "../dbDrivers/types";
 import { normalizeUnknownError } from "../utils/errorHandling";
 import {
   exportQueryResultsAsCsv,
@@ -10,6 +11,7 @@ import { formatQueryResult } from "../utils/queryResultFormatting";
 
 export interface QueryPanelCachedResult {
   columns: string[];
+  columnMeta?: QueryColumnMeta[];
   rows: Record<string, unknown>[];
 }
 
@@ -158,6 +160,7 @@ export class QueryPanelController {
 
       this.view.setLastQueryResult({
         columns: formattedResult.columns,
+        columnMeta: formattedResult.columnMeta,
         rows: formattedResult.rows,
       });
       this.view.postMessage({
