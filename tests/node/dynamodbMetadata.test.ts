@@ -205,4 +205,25 @@ describe("DynamoDBDriver metadata", () => {
       }),
     ]);
   });
+
+  it("destroys the client and clears driver state on disconnect", async () => {
+    const driver = new DynamoDBDriver(config);
+    const destroy = vi.fn();
+    const driverState = driver as unknown as {
+      client: { destroy: typeof destroy } | null;
+      documentClient: { marker: string } | null;
+      connected: boolean;
+    };
+
+    driverState.client = { destroy };
+    driverState.documentClient = { marker: "document-client" };
+    driverState.connected = true;
+
+    await driver.disconnect();
+
+    expect(destroy).toHaveBeenCalledTimes(1);
+    expect(driverState.client).toBeNull();
+    expect(driverState.documentClient).toBeNull();
+    expect(driver.isConnected()).toBe(false);
+  });
 });

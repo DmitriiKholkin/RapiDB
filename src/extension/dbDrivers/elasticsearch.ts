@@ -57,7 +57,7 @@ export class ElasticsearchDriver implements IDBDriver {
       this.config.connectionUri ??
       this.config.endpoint ??
       `${protocol}://${this.config.host || "localhost"}:${this.config.port ?? 9200}`;
-    this.client = new Client({
+    const client = new Client({
       node: this.config.cloudId ? undefined : node,
       cloud: this.config.cloudId
         ? {
@@ -80,13 +80,21 @@ export class ElasticsearchDriver implements IDBDriver {
           }
         : undefined,
     });
-    await this.client.ping();
+    try {
+      await client.ping();
+    } catch (error) {
+      await client.close().catch(() => undefined);
+      throw error;
+    }
+    this.client = client;
     this.connected = true;
   }
 
   async disconnect(): Promise<void> {
+    const client = this.client;
     this.client = null;
     this.connected = false;
+    await client?.close();
   }
 
   isConnected(): boolean {
@@ -353,10 +361,11 @@ export class ElasticsearchDriver implements IDBDriver {
         id?: string;
         document: Record<string, unknown>;
       };
+      const document = this.stripDocumentId(payload.document);
       const response = await this.requireClient().index({
         index: payload.index,
         id: payload.id,
-        document: payload.document,
+        document,
         refresh: "wait_for",
       });
       const row = { result: response.result, id: response._id };
@@ -421,13 +430,14 @@ export class ElasticsearchDriver implements IDBDriver {
     request: DriverInsertRowRequest,
   ): Promise<DriverMutationResult> {
     const id = request.values._id;
+    const document = this.stripDocumentId(request.values);
     await this.requireClient().index({
       index: request.table,
       id:
         typeof id === "string" || typeof id === "number"
           ? String(id)
           : undefined,
-      document: request.values,
+      document,
       op_type:
         typeof id === "string" || typeof id === "number" ? "create" : undefined,
       refresh: "wait_for",
@@ -468,10 +478,11 @@ export class ElasticsearchDriver implements IDBDriver {
   ): string {
     if (operation === "insert") {
       const id = data.values?._id;
+      const document = this.stripDocumentId(data.values ?? {});
       return `index ${JSON.stringify({
         index: table,
         ...(id !== undefined ? { id: String(id) } : {}),
-        document: data.values ?? {},
+        document,
       })}`;
     }
     const id = data.primaryKeys?._id ?? data.primaryKeyValuesList?.[0]?._id;
@@ -767,5 +778,12 @@ export class ElasticsearchDriver implements IDBDriver {
       mapped[`__col_${index}`] = row[columnName];
     });
     return mapped;
+  }
+
+  private stripDocumentId(
+    document: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const { _id: _ignored, ...rest } = document;
+    return rest;
   }
 }

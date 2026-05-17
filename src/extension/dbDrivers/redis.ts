@@ -137,21 +137,35 @@ export class RedisDriver implements IDBDriver {
       username: this.config.redisUsername ?? this.config.username,
       password: this.config.password,
     });
-    await client.connect();
-    const dbIndex = this.resolveDbIndex();
-    if (dbIndex > 0) {
-      await client.select(dbIndex);
+    client.on("error", (error) => {
+      console.error(
+        "[RapiDB] Redis client error:",
+        error instanceof Error ? error.message : error,
+      );
+    });
+    try {
+      await client.connect();
+      const dbIndex = this.resolveDbIndex();
+      if (dbIndex > 0) {
+        await client.select(dbIndex);
+      }
+    } catch (error) {
+      if (client.isOpen) {
+        client.destroy();
+      }
+      throw error;
     }
     this.client = client;
     this.connected = true;
   }
 
   async disconnect(): Promise<void> {
-    if (this.client) {
-      await this.client.quit();
-    }
+    const client = this.client;
     this.client = null;
     this.connected = false;
+    if (client?.isOpen) {
+      await client.close();
+    }
   }
 
   isConnected(): boolean {
@@ -556,9 +570,9 @@ export class RedisDriver implements IDBDriver {
   ): Promise<Record<string, unknown>[]> {
     try {
       const pattern = table === "default" ? "*" : `${table}:*`;
-      const keys = (
-        await this.scanKeys(this.prefixedPattern(pattern), maxRows)
-      ).slice(0, maxRows);
+      const keys = (await this.scanKeys(this.prefixedPattern(pattern), maxRows))
+        .slice(0, maxRows)
+        .sort((left, right) => left.localeCompare(right));
       const rows: Record<string, unknown>[] = [];
       for (const key of keys) {
         const type = await this.requireClient().type(key);

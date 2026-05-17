@@ -263,6 +263,9 @@ describe("ConnectionFormPanel", () => {
       getConnection: vi.fn(() => undefined),
       testConnection: vi.fn(),
     };
+    const consoleErrorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
 
     const handleMessageSpy = vi
       .spyOn(
@@ -281,15 +284,21 @@ describe("ConnectionFormPanel", () => {
       throw new Error("Expected a webview panel to be created.");
     }
 
-    await expect(panel.webview.dispatchMessage(null)).resolves.toBeUndefined();
+    try {
+      await expect(
+        panel.webview.dispatchMessage(null),
+      ).resolves.toBeUndefined();
 
-    expect(panel.webview.postMessage).toHaveBeenCalledWith({
-      type: "testResult",
-      payload: { success: false, error: "boom" },
-    });
+      expect(panel.webview.postMessage).toHaveBeenCalledWith({
+        type: "testResult",
+        payload: { success: false, error: "boom" },
+      });
 
-    panel.dispose();
-    await expect(promise).resolves.toBeUndefined();
-    handleMessageSpy.mockRestore();
+      panel.dispose();
+      await expect(promise).resolves.toBeUndefined();
+    } finally {
+      handleMessageSpy.mockRestore();
+      consoleErrorSpy.mockRestore();
+    }
   });
 });

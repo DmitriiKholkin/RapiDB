@@ -414,7 +414,7 @@ describe("DynamoDBDriver PartiQL", () => {
     expect(documentSend).toHaveBeenCalledTimes(1);
     expect(documentSend.mock.calls[0]?.[0].input).toMatchObject({
       Statement:
-        'SELECT * FROM "users" WHERE contains("email", ?) AND "age" >= ? ORDER BY "user_id" ASC',
+        'SELECT * FROM "users" WHERE contains("email", ?) AND "age" >= ?',
       Parameters: ["example", 30],
       Limit: 200,
     });

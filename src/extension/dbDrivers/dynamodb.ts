@@ -92,7 +92,12 @@ export class DynamoDBDriver implements IDBDriver {
             : undefined,
     });
 
-    await client.send(new ListTablesCommand({ Limit: 1 }));
+    try {
+      await client.send(new ListTablesCommand({ Limit: 1 }));
+    } catch (error) {
+      client.destroy();
+      throw error;
+    }
     this.client = client;
     this.documentClient = DynamoDBDocumentClient.from(client, {
       marshallOptions: { removeUndefinedValues: true },
@@ -101,9 +106,11 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   async disconnect(): Promise<void> {
+    const client = this.client;
     this.client = null;
     this.documentClient = null;
     this.connected = false;
+    client?.destroy();
   }
 
   isConnected(): boolean {
@@ -1175,19 +1182,12 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   private async buildServerSortClause(
-    table: string,
-    sort: DriverSortConfig | null,
+    _table: string,
+    _sort: DriverSortConfig | null,
   ): Promise<string> {
-    if (!sort) {
-      return "";
-    }
-
-    const keyNames = await this.getTableKeyNames(table);
-    if (!keyNames.includes(sort.column)) {
-      return "";
-    }
-
-    return `ORDER BY ${this.quoteIdentifier(sort.column)} ${sort.direction === "desc" ? "DESC" : "ASC"}`;
+    // DynamoDB PartiQL does not support ORDER BY for table reads.
+    // Read the rows first and apply sorting client-side below in readTablePage().
+    return "";
   }
 
   private splitFilterList(value: string): string[] {
