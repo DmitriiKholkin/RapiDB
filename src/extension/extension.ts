@@ -179,7 +179,6 @@ function getOpenDdlPresentation(connectionType: ConnectionType | undefined): {
         formatOnOpen: false,
         editorLanguage: "javascript",
       };
-    case "dynamodb":
     case "elasticsearch":
       return {
         formatOnOpen: false,

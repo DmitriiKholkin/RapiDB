@@ -1029,7 +1029,7 @@ describe("ConnectionProvider", () => {
     expect(indexNode?.contextValue).toBe("table_detail_index");
   });
 
-  it("marks unsupported DynamoDB index detail nodes with noDdl context values", async () => {
+  it("marks DynamoDB table and index detail nodes with noDdl context values", async () => {
     const connectionManager = {
       getConnections: vi.fn(() => [
         { id: "conn-1", name: "NoSQL", type: "dynamodb" },
@@ -1116,7 +1116,7 @@ describe("ConnectionProvider", () => {
 
     const indexNode = (await provider.getChildren(indexesSection))[0];
 
-    expect(tableNode?.contextValue).toBe("table");
+    expect(tableNode?.contextValue).toBe("table_noDdl");
     expect(indexNode?.contextValue).toBe("table_detail_index_noDdl");
   });
 

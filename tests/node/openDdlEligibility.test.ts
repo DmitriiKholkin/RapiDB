@@ -132,14 +132,14 @@ describe("open DDL eligibility", () => {
 
     expect(
       isOpenDdlSupportedForNode("table", "dynamodb", MANIFESTS.dynamodb),
-    ).toBe(true);
+    ).toBe(false);
     expect(
       isOpenDdlSupportedForNode(
         "table_detail_index",
         "dynamodb",
         MANIFESTS.dynamodb,
       ),
-    ).toBe(true);
+    ).toBe(false);
 
     expect(
       isOpenDdlSupportedForNode(
@@ -185,12 +185,15 @@ describe("open DDL eligibility", () => {
         MANIFESTS.elasticsearch,
       ),
     ).toBe("table_detail_index_noDdl");
+    expect(
+      composeOpenDdlAwareContextValue("table", "dynamodb", MANIFESTS.dynamodb),
+    ).toBe("table_noDdl");
     expect(composeOpenDdlAwareContextValue("table", "pg", MANIFESTS.pg)).toBe(
       "table",
     );
   });
 
-  it("uses per-index hints to suppress unsupported detail nodes", () => {
+  it("keeps DynamoDB detail nodes unsupported regardless of index hints", () => {
     expect(
       isOpenDdlSupportedForNode(
         "table_detail_index",
@@ -214,7 +217,7 @@ describe("open DDL eligibility", () => {
         MANIFESTS.dynamodb,
         { indexDdlSupport: "supported" },
       ),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("handles unknown kinds and keeps context value unchanged", () => {

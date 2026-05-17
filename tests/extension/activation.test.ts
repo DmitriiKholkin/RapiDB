@@ -908,13 +908,6 @@ describe("extension activation", () => {
           'db.getSiblingDB("rapidb").getCollection("users").createIndex({ "email": 1 }, { "name": "users_by_email" });',
         ),
     };
-    const dynamoDriver = {
-      getCreateTableDDL: vi
-        .fn()
-        .mockResolvedValue(
-          'aws dynamodb create-table \\\n+  --table-name "Users" \\\n+  --attribute-definitions \'[{"AttributeName":"pk","AttributeType":"S"}]\' \\\n+  --key-schema \'[{"AttributeName":"pk","KeyType":"HASH"}]\' \\\n+  --billing-mode PAY_PER_REQUEST',
-        ),
-    };
     const elasticsearchDriver = {
       getCreateTableDDL: vi
         .fn()
@@ -929,9 +922,6 @@ describe("extension activation", () => {
       if (id === "conn-mongo") {
         return { id, name: "Mongo", type: "mongodb" };
       }
-      if (id === "conn-ddb") {
-        return { id, name: "Dynamo", type: "dynamodb" };
-      }
       if (id === "conn-es") {
         return { id, name: "Elastic", type: "elasticsearch" };
       }
@@ -943,9 +933,6 @@ describe("extension activation", () => {
     ).mockImplementation((id: string) => {
       if (id === "conn-mongo") {
         return mongoDriver;
-      }
-      if (id === "conn-ddb") {
-        return dynamoDriver;
       }
       if (id === "conn-es") {
         return elasticsearchDriver;
@@ -981,13 +968,6 @@ describe("extension activation", () => {
     });
     await showDdlCommand({
       kind: "table",
-      connectionId: "conn-ddb",
-      database: "us-east-1",
-      schema: "us-east-1",
-      objectName: "Users",
-    });
-    await showDdlCommand({
-      kind: "table",
       connectionId: "conn-es",
       database: "default",
       schema: "indices",
@@ -1020,17 +1000,6 @@ describe("extension activation", () => {
       3,
       context,
       connectionManagerInstance,
-      "conn-ddb",
-      expect.stringContaining("aws dynamodb create-table"),
-      true,
-      false,
-      false,
-      "plaintext",
-    );
-    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
-      4,
-      context,
-      connectionManagerInstance,
       "conn-es",
       expect.stringContaining("PUT /users"),
       true,
@@ -1040,7 +1009,7 @@ describe("extension activation", () => {
     );
   });
 
-  it("guards Show DDL for per-index unsupported NoSQL detail nodes", async () => {
+  it("guards Show DDL for DynamoDB detail index nodes", async () => {
     const extension = await import("../../src/extension/extension");
     const context = { subscriptions: [] as Array<{ dispose(): void }> };
     const driver = {
@@ -1071,10 +1040,48 @@ describe("extension activation", () => {
       schema: "us-east-1",
       parentTable: "Users",
       objectName: "UsersByEmail",
-      ddlSupport: "unsupported",
     });
 
     expect(driver.getIndexDDL).not.toHaveBeenCalled();
+    expect(queryPanelCreateOrShow).not.toHaveBeenCalled();
+    expect(vscodeState.showWarningMessage).toHaveBeenCalledWith(
+      "[RapiDB] DDL is available only for table, view, materialized view, function, procedure, sequence, type, constraint, index, and trigger nodes.",
+    );
+  });
+
+  it("guards Show DDL for DynamoDB table nodes", async () => {
+    const extension = await import("../../src/extension/extension");
+    const context = { subscriptions: [] as Array<{ dispose(): void }> };
+    const driver = {
+      getCreateTableDDL: vi.fn(),
+    };
+
+    (
+      connectionManagerInstance.getConnection as ReturnType<typeof vi.fn>
+    ).mockReturnValue({ id: "conn-1", name: "Dynamo", type: "dynamodb" });
+    (
+      connectionManagerInstance.getDriver as ReturnType<typeof vi.fn>
+    ).mockReturnValue(driver);
+
+    extension.activate(context as never);
+
+    const showDdlCommand = vscodeState.registerCommand.mock.calls.find(
+      ([command]) => command === "rapidb.showDDL",
+    )?.[1] as ((node: Record<string, unknown>) => Promise<void>) | undefined;
+
+    if (!showDdlCommand) {
+      throw new Error("Show DDL command was not registered.");
+    }
+
+    await showDdlCommand({
+      kind: "table",
+      connectionId: "conn-1",
+      database: "us-east-1",
+      schema: "us-east-1",
+      objectName: "Orders",
+    });
+
+    expect(driver.getCreateTableDDL).not.toHaveBeenCalled();
     expect(queryPanelCreateOrShow).not.toHaveBeenCalled();
     expect(vscodeState.showWarningMessage).toHaveBeenCalledWith(
       "[RapiDB] DDL is available only for table, view, materialized view, function, procedure, sequence, type, constraint, index, and trigger nodes.",

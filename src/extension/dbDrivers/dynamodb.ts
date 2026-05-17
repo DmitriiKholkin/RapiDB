@@ -18,7 +18,6 @@ import type { ConnectionConfig } from "../connectionManager";
 import {
   applyFilters,
   applySort,
-  flattenRootRecord,
   inferColumnsFromRows,
   pageRows,
   unsupported,
@@ -48,7 +47,10 @@ import type {
   TableInfo,
   TransactionOperation,
   TriggerMeta,
+  TypeCategory,
+  ValueSemantics,
 } from "./types";
+import { NULL_SENTINEL, resolveFilterOperators } from "./types";
 
 const DYNAMODB_ENTITY_MANIFEST: DriverEntityManifest = {
   dbObjectKinds: ["table"],
@@ -159,26 +161,20 @@ export class DynamoDBDriver implements IDBDriver {
     _schema: string,
     table: string,
   ): Promise<ColumnMeta[]> {
-    const [rows, { keys, keyRoles, attrTypes }] = await Promise.all([
+    const [rows, schema] = await Promise.all([
       this.readRows(table, 1000),
       this.getTableSchema(table),
     ]);
-    const columns = inferColumnsFromRows(rows, keys[0] ?? "id", {
-      primaryKeyNames: keys,
-      nullableMode: "schemaLess",
-    });
+    const columns = this.buildDynamoColumns(rows, schema);
     return columns.map((column) => {
-      const attrType = attrTypes.get(column.name);
       return {
         name: column.name,
-        type: attrType
-          ? this.dynamoAttrTypeToNative(attrType)
-          : column.nativeType,
+        type: column.type,
         nullable: column.nullable,
         defaultValue: undefined,
         isPrimaryKey: column.isPrimaryKey,
         primaryKeyOrdinal: column.primaryKeyOrdinal,
-        primaryKeyRole: keyRoles.get(column.name),
+        primaryKeyRole: column.primaryKeyRole,
         isForeignKey: false,
       };
     });
@@ -189,26 +185,11 @@ export class DynamoDBDriver implements IDBDriver {
     _schema: string,
     table: string,
   ): Promise<ColumnTypeMeta[]> {
-    const [rows, { keys, keyRoles, attrTypes }] = await Promise.all([
+    const [rows, schema] = await Promise.all([
       this.readRows(table, 1000),
       this.getTableSchema(table),
     ]);
-    const columns = inferColumnsFromRows(rows, keys[0] ?? "id", {
-      primaryKeyNames: keys,
-      nullableMode: "schemaLess",
-    });
-    return columns.map((column) => {
-      const attrType = attrTypes.get(column.name);
-      const nativeType = attrType
-        ? this.dynamoAttrTypeToNative(attrType)
-        : column.nativeType;
-      return {
-        ...column,
-        type: nativeType,
-        nativeType,
-        primaryKeyRole: keyRoles.get(column.name),
-      };
-    });
+    return this.buildDynamoColumns(rows, schema);
   }
 
   async getIndexes(
@@ -417,13 +398,14 @@ export class DynamoDBDriver implements IDBDriver {
     }
 
     const response = await this.executeStatement(trimmed, _params);
-    const rows = (response.Items ?? []).map((item) =>
-      flattenRootRecord(item as Record<string, unknown>),
+    const rawRows = (response.Items ?? []).map(
+      (item) => item as Record<string, unknown>,
     );
-    const columns = inferColumnsFromRows(rows, "id").map(
+    const columns = inferColumnsFromRows(rawRows, "id").map(
       (column) => column.name,
     );
-    const rowCount = rows.length;
+    const rows = rawRows.map((row) => this.formatDynamoRowForDisplay(row));
+    const rowCount = rawRows.length;
     const affectedRows =
       statementKind === "select"
         ? undefined
@@ -456,18 +438,18 @@ export class DynamoDBDriver implements IDBDriver {
       columns: describedColumns,
       sort: request.sort,
     });
-    const filtered = applyFilters(rows, request.filters);
-    const sorted = applySort(filtered, request.sort);
-    const paged = pageRows(sorted, request.page, request.pageSize);
     const describedByName = new Map(
       describedColumns.map((column) => [column.name, column]),
     );
+    const formattedRows = rows.map((row) =>
+      this.formatDynamoRowForDisplay(row, describedByName),
+    );
+    const filtered = applyFilters(formattedRows, request.filters);
+    const sorted = applySort(filtered, request.sort);
+    const paged = pageRows(sorted, request.page, request.pageSize);
     const sourceColumns =
       sorted.length > 0
-        ? inferColumnsFromRows(sorted, schema.keys[0] ?? "id", {
-            primaryKeyNames: schema.keys,
-            nullableMode: "schemaLess",
-          })
+        ? this.buildDynamoColumns(rows, schema)
         : describedColumns;
     const columns = sourceColumns.map((column) => {
       const described = describedByName.get(column.name);
@@ -678,11 +660,89 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   coerceInputValue(value: unknown, _column: ColumnTypeMeta): unknown {
-    return value;
+    if (value === NULL_SENTINEL) {
+      return null;
+    }
+    if (value === null || value === undefined) {
+      return value;
+    }
+    if (typeof value !== "string") {
+      return value;
+    }
+
+    const trimmed = value.trim();
+    const nativeType = _column.nativeType.toLowerCase();
+
+    switch (nativeType) {
+      case "null":
+        return /^null$/i.test(trimmed) ? null : value;
+      case "boolean": {
+        if (/^(true|1)$/i.test(trimmed)) {
+          return true;
+        }
+        if (/^(false|0)$/i.test(trimmed)) {
+          return false;
+        }
+        return value;
+      }
+      case "number": {
+        const numeric = Number(trimmed);
+        return Number.isFinite(numeric) ? numeric : value;
+      }
+      case "binary":
+        return this.parseBinaryInput(trimmed) ?? value;
+      case "string set":
+        return this.parseSetInput(trimmed, "string") ?? value;
+      case "number set":
+        return this.parseSetInput(trimmed, "number") ?? value;
+      case "binary set":
+        return this.parseSetInput(trimmed, "binary") ?? value;
+      case "list": {
+        const parsed = this.parseJsonValue(trimmed);
+        return Array.isArray(parsed) ? parsed : value;
+      }
+      case "map": {
+        const parsed = this.parseJsonValue(trimmed);
+        return this.isPlainObject(parsed) ? parsed : value;
+      }
+      default:
+        if (_column.category === "array") {
+          const parsed = this.parseJsonValue(trimmed);
+          return Array.isArray(parsed) ? parsed : value;
+        }
+        if (_column.category === "json") {
+          return this.parseJsonValue(trimmed) ?? value;
+        }
+        return value;
+    }
   }
 
   formatOutputValue(value: unknown, _column: ColumnTypeMeta): unknown {
-    return value;
+    if (value === null || value === undefined) {
+      return null;
+    }
+
+    const nativeType = _column.nativeType.toLowerCase();
+    if (nativeType === "binary") {
+      return this.formatBinaryForDisplay(value);
+    }
+    if (nativeType.endsWith(" set")) {
+      return this.formatSetForDisplay(value);
+    }
+    if (nativeType === "list" || nativeType === "map") {
+      const normalized = this.normalizeValueForDisplay(value);
+      return typeof normalized === "string"
+        ? normalized
+        : JSON.stringify(normalized);
+    }
+
+    const normalized = this.normalizeValueForDisplay(value);
+    return typeof normalized === "string" ||
+      typeof normalized === "number" ||
+      typeof normalized === "boolean" ||
+      normalized === null
+      ? normalized
+      : JSON.stringify(normalized);
   }
 
   checkPersistedEdit(
@@ -986,19 +1046,6 @@ export class DynamoDBDriver implements IDBDriver {
     return match[1].toLowerCase() as "select" | "insert" | "update" | "delete";
   }
 
-  private dynamoAttrTypeToNative(attributeType: string): string {
-    switch (attributeType) {
-      case "S":
-        return "text";
-      case "N":
-        return "float";
-      case "B":
-        return "binary";
-      default:
-        return "text";
-    }
-  }
-
   private async readRows(
     table: string,
     limit: number,
@@ -1041,11 +1088,7 @@ export class DynamoDBDriver implements IDBDriver {
             nextToken,
           },
         );
-        rows.push(
-          ...(result.Items ?? []).map((item) =>
-            flattenRootRecord(item as Record<string, unknown>),
-          ),
-        );
+        rows.push(...((result.Items ?? []) as Record<string, unknown>[]));
         nextToken = result.NextToken;
       } while (nextToken);
 
@@ -1224,6 +1267,515 @@ export class DynamoDBDriver implements IDBDriver {
     return `'${name.replace(/'/g, "''")}'`;
   }
 
+  private buildDynamoColumns(
+    rows: readonly Record<string, unknown>[],
+    schema: {
+      keys: string[];
+      keyRoles: Map<string, PrimaryKeyRole>;
+      attrTypes: Map<string, string>;
+    },
+  ): ColumnTypeMeta[] {
+    const columnNames = new Set<string>(schema.attrTypes.keys());
+    for (const row of rows) {
+      for (const key of Object.keys(row)) {
+        columnNames.add(key);
+      }
+    }
+
+    return [...columnNames]
+      .sort((left, right) => left.localeCompare(right))
+      .map((name) => {
+        const descriptor = this.resolveDynamoColumnDescriptor(
+          rows.map((row) => row[name]),
+          schema.attrTypes.get(name),
+        );
+        const isPrimaryKey = schema.keys.includes(name);
+        const nullable = isPrimaryKey ? false : true;
+        const filterable = descriptor.category !== "binary";
+        return {
+          name,
+          type: descriptor.nativeType,
+          nativeType: descriptor.nativeType,
+          category: descriptor.category,
+          nullable,
+          defaultValue: undefined,
+          isPrimaryKey,
+          primaryKeyOrdinal: isPrimaryKey
+            ? schema.keys.indexOf(name) + 1
+            : undefined,
+          primaryKeyRole: schema.keyRoles.get(name),
+          isForeignKey: false,
+          filterable,
+          filterOperators: resolveFilterOperators(descriptor.category, {
+            filterable,
+            nullable,
+          }),
+          valueSemantics: descriptor.valueSemantics,
+        } satisfies ColumnTypeMeta;
+      });
+  }
+
+  private resolveDynamoColumnDescriptor(
+    samples: readonly unknown[],
+    attrType?: string,
+  ): {
+    nativeType: string;
+    category: TypeCategory;
+    valueSemantics: ValueSemantics;
+  } {
+    const schemaDescriptor = attrType
+      ? this.dynamoAttrTypeToDescriptor(attrType)
+      : null;
+    const sampleDescriptor = this.describeSampleValues(samples);
+
+    if (schemaDescriptor) {
+      return {
+        nativeType: schemaDescriptor.nativeType,
+        category: sampleDescriptor?.category ?? schemaDescriptor.category,
+        valueSemantics:
+          sampleDescriptor?.valueSemantics ?? schemaDescriptor.valueSemantics,
+      };
+    }
+
+    return (
+      sampleDescriptor ?? {
+        nativeType: "other",
+        category: "other",
+        valueSemantics: "plain",
+      }
+    );
+  }
+
+  private dynamoAttrTypeToDescriptor(attributeType: string): {
+    nativeType: string;
+    category: TypeCategory;
+    valueSemantics: ValueSemantics;
+  } {
+    switch (attributeType) {
+      case "S":
+        return {
+          nativeType: "string",
+          category: "text",
+          valueSemantics: "plain",
+        };
+      case "N":
+        return {
+          nativeType: "number",
+          category: "decimal",
+          valueSemantics: "plain",
+        };
+      case "B":
+        return {
+          nativeType: "binary",
+          category: "binary",
+          valueSemantics: "plain",
+        };
+      default:
+        return {
+          nativeType: "string",
+          category: "text",
+          valueSemantics: "plain",
+        };
+    }
+  }
+
+  private describeSampleValues(samples: readonly unknown[]): {
+    nativeType: string;
+    category: TypeCategory;
+    valueSemantics: ValueSemantics;
+  } | null {
+    let nullDescriptor: {
+      nativeType: string;
+      category: TypeCategory;
+      valueSemantics: ValueSemantics;
+    } | null = null;
+
+    for (const sample of samples) {
+      if (sample === undefined) {
+        continue;
+      }
+      const descriptor = this.describeDynamoValue(sample);
+      if (descriptor.nativeType !== "null") {
+        return descriptor;
+      }
+      nullDescriptor = descriptor;
+    }
+
+    return nullDescriptor;
+  }
+
+  private describeDynamoValue(value: unknown): {
+    nativeType: string;
+    category: TypeCategory;
+    valueSemantics: ValueSemantics;
+  } {
+    if (value === null || value === undefined) {
+      return {
+        nativeType: "null",
+        category: "other",
+        valueSemantics: "plain",
+      };
+    }
+    if (typeof value === "string") {
+      return {
+        nativeType: "string",
+        category: "text",
+        valueSemantics: "plain",
+      };
+    }
+    if (typeof value === "number") {
+      return {
+        nativeType: "number",
+        category: Number.isInteger(value) ? "integer" : "float",
+        valueSemantics: "plain",
+      };
+    }
+    if (typeof value === "bigint") {
+      return {
+        nativeType: "number",
+        category: "integer",
+        valueSemantics: "plain",
+      };
+    }
+    if (typeof value === "boolean") {
+      return {
+        nativeType: "boolean",
+        category: "boolean",
+        valueSemantics: "boolean",
+      };
+    }
+    if (this.isBinaryValue(value)) {
+      return {
+        nativeType: "binary",
+        category: "binary",
+        valueSemantics: "plain",
+      };
+    }
+    if (value instanceof Set) {
+      const nativeType = this.describeSetType(value);
+      return {
+        nativeType,
+        category: "array",
+        valueSemantics: "plain",
+      };
+    }
+    if (Array.isArray(value)) {
+      return {
+        nativeType: "list",
+        category: "array",
+        valueSemantics: "plain",
+      };
+    }
+    return {
+      nativeType: "map",
+      category: "json",
+      valueSemantics: "plain",
+    };
+  }
+
+  private describeSetType(value: Set<unknown>): string {
+    const entries = [...value];
+    if (entries.length === 0) {
+      return "string set";
+    }
+    if (entries.every((entry) => typeof entry === "string")) {
+      return "string set";
+    }
+    if (
+      entries.every(
+        (entry) => typeof entry === "number" || typeof entry === "bigint",
+      )
+    ) {
+      return "number set";
+    }
+    if (entries.every((entry) => this.isBinaryValue(entry))) {
+      return "binary set";
+    }
+    return "string set";
+  }
+
+  private formatDynamoRowForDisplay(
+    row: Record<string, unknown>,
+    columnsByName?: ReadonlyMap<string, ColumnTypeMeta>,
+  ): Record<string, unknown> {
+    return Object.fromEntries(
+      Object.entries(row).map(([name, value]) => {
+        const column = columnsByName?.get(name);
+        return [
+          name,
+          column
+            ? this.formatOutputValue(value, column)
+            : this.formatGenericDisplayValue(value),
+        ];
+      }),
+    );
+  }
+
+  private formatGenericDisplayValue(value: unknown): unknown {
+    if (value === null || value === undefined) {
+      return null;
+    }
+    if (this.isBinaryValue(value)) {
+      return this.formatBinaryForDisplay(value);
+    }
+    if (value instanceof Set) {
+      return this.formatSetForDisplay(value);
+    }
+    const normalized = this.normalizeValueForDisplay(value);
+    return typeof normalized === "string" ||
+      typeof normalized === "number" ||
+      typeof normalized === "boolean" ||
+      normalized === null
+      ? normalized
+      : JSON.stringify(normalized);
+  }
+
+  private normalizeValueForDisplay(value: unknown): unknown {
+    if (value === null || value === undefined) {
+      return null;
+    }
+    if (
+      typeof value === "string" ||
+      typeof value === "number" ||
+      typeof value === "boolean"
+    ) {
+      return value;
+    }
+    if (typeof value === "bigint") {
+      return value.toString();
+    }
+    if (value instanceof Date) {
+      return value.toISOString();
+    }
+    if (this.isBinaryValue(value)) {
+      return this.formatBinaryForDisplay(value);
+    }
+    if (value instanceof Set) {
+      return this.formatSetForDisplay(value);
+    }
+    if (Array.isArray(value)) {
+      return value.map((entry) => this.normalizeValueForDisplay(entry));
+    }
+    if (this.isPlainObject(value)) {
+      return Object.fromEntries(
+        Object.entries(value).map(([key, entry]) => [
+          key,
+          this.normalizeValueForDisplay(entry),
+        ]),
+      );
+    }
+    return String(value);
+  }
+
+  private formatSetForDisplay(value: unknown): string {
+    if (typeof value === "string") {
+      return value;
+    }
+    if (value instanceof Set) {
+      return `<<${[...value]
+        .map((entry) => this.formatSetEntryForDisplay(entry))
+        .join(", ")}>>`;
+    }
+    if (Array.isArray(value)) {
+      return `<<${value.map((entry) => this.formatSetEntryForDisplay(entry)).join(", ")}>>`;
+    }
+    return String(value);
+  }
+
+  private formatSetEntryForDisplay(value: unknown): string {
+    if (typeof value === "string") {
+      return this.quoteItemKey(value);
+    }
+    if (typeof value === "number" || typeof value === "bigint") {
+      return String(value);
+    }
+    if (typeof value === "boolean") {
+      return value ? "true" : "false";
+    }
+    if (value === null) {
+      return "NULL";
+    }
+    if (this.isBinaryValue(value)) {
+      return this.formatBinaryForDisplay(value);
+    }
+    return JSON.stringify(this.normalizeValueForDisplay(value));
+  }
+
+  private formatBinaryForDisplay(value: unknown): string {
+    const bytes = this.toBinaryBuffer(value);
+    return bytes ? `0x${bytes.toString("hex")}` : String(value);
+  }
+
+  private parseBinaryInput(value: string): Buffer | null {
+    const normalized = value.trim();
+    const hex = this.extractBinaryHex(normalized);
+    if (hex !== null) {
+      return Buffer.from(hex, "hex");
+    }
+    if (
+      normalized.length > 0 &&
+      normalized.length % 4 === 0 &&
+      /^[A-Za-z0-9+/]+={0,2}$/.test(normalized)
+    ) {
+      try {
+        return Buffer.from(normalized, "base64");
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  private parseSetInput(
+    value: string,
+    subtype: "string" | "number" | "binary",
+  ): Set<unknown> | null {
+    const parsedJson = this.parseJsonValue(value);
+    if (Array.isArray(parsedJson)) {
+      return new Set(
+        parsedJson.map((entry) => this.coerceSetEntryValue(entry, subtype)),
+      );
+    }
+
+    const entries = this.parsePartiqlSetEntries(value);
+    if (!entries) {
+      return null;
+    }
+    return new Set(
+      entries.map((entry) => this.coerceSetEntryValue(entry, subtype)),
+    );
+  }
+
+  private coerceSetEntryValue(
+    value: unknown,
+    subtype: "string" | "number" | "binary",
+  ): unknown {
+    if (subtype === "string") {
+      return typeof value === "string"
+        ? (this.unwrapPartiqlStringLiteral(value) ?? value)
+        : String(value);
+    }
+    if (subtype === "number") {
+      if (typeof value === "number") {
+        return value;
+      }
+      if (typeof value === "bigint") {
+        return Number(value);
+      }
+      const source =
+        typeof value === "string"
+          ? (this.unwrapPartiqlStringLiteral(value) ?? value).trim()
+          : String(value);
+      const numeric = Number(source);
+      return Number.isFinite(numeric) ? numeric : source;
+    }
+    if (this.isBinaryValue(value)) {
+      return value;
+    }
+    const source =
+      typeof value === "string"
+        ? (this.unwrapPartiqlStringLiteral(value) ?? value).trim()
+        : String(value);
+    return this.parseBinaryInput(source) ?? source;
+  }
+
+  private parsePartiqlSetEntries(value: string): string[] | null {
+    const trimmed = value.trim();
+    if (!trimmed.startsWith("<<") || !trimmed.endsWith(">>")) {
+      return null;
+    }
+
+    const inner = trimmed.slice(2, -2).trim();
+    if (inner.length === 0) {
+      return [];
+    }
+
+    const entries: string[] = [];
+    let current = "";
+    let inString = false;
+
+    for (let index = 0; index < inner.length; index += 1) {
+      const char = inner[index];
+      if (char === "'") {
+        current += char;
+        if (inString && inner[index + 1] === "'") {
+          current += "'";
+          index += 1;
+          continue;
+        }
+        inString = !inString;
+        continue;
+      }
+      if (char === "," && !inString) {
+        entries.push(current.trim());
+        current = "";
+        continue;
+      }
+      current += char;
+    }
+
+    if (current.trim().length > 0) {
+      entries.push(current.trim());
+    }
+
+    return entries;
+  }
+
+  private unwrapPartiqlStringLiteral(value: string): string | null {
+    if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
+      return value.slice(1, -1).replace(/''/g, "'");
+    }
+    return null;
+  }
+
+  private parseJsonValue(value: string): unknown {
+    try {
+      return JSON.parse(value) as unknown;
+    } catch {
+      return null;
+    }
+  }
+
+  private extractBinaryHex(value: string): string | null {
+    let hex = value;
+    if (
+      value.startsWith("0x") ||
+      value.startsWith("0X") ||
+      value.startsWith("\\x") ||
+      value.startsWith("\\X")
+    ) {
+      hex = value.slice(2);
+    }
+    if (hex.length === 0 || hex.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(hex)) {
+      return null;
+    }
+    return hex;
+  }
+
+  private isBinaryValue(value: unknown): boolean {
+    return this.toBinaryBuffer(value) !== null;
+  }
+
+  private toBinaryBuffer(value: unknown): Buffer | null {
+    if (Buffer.isBuffer(value)) {
+      return value;
+    }
+    if (value instanceof Uint8Array) {
+      return Buffer.from(value);
+    }
+    if (ArrayBuffer.isView(value)) {
+      return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    }
+    if (value instanceof ArrayBuffer) {
+      return Buffer.from(value);
+    }
+    return null;
+  }
+
+  private isPlainObject(value: unknown): value is Record<string, unknown> {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
+  }
+
   private formatPartiqlLiteral(value: unknown): string {
     if (value === null) {
       return "NULL";
@@ -1249,8 +1801,8 @@ export class DynamoDBDriver implements IDBDriver {
     if (Array.isArray(value)) {
       return `[${value.map((entry) => this.formatPartiqlLiteral(entry)).join(", ")}]`;
     }
-    if (Buffer.isBuffer(value)) {
-      return `'${value.toString("base64")}'`;
+    if (this.isBinaryValue(value)) {
+      return `'${this.toBinaryBuffer(value)?.toString("base64") ?? ""}'`;
     }
     if (typeof value === "object") {
       return `{${Object.entries(value as Record<string, unknown>)

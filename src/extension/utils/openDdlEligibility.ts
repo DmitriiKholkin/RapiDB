@@ -18,6 +18,7 @@ const OPEN_DDL_CONTEXT_VALUE_UNSUPPORTED_SUFFIX = "_noDdl";
 const OPEN_DDL_UNSUPPORTED_BY_CONNECTION_TYPE: Readonly<
   Partial<Record<ConnectionType, readonly OpenDdlNodeKind[]>>
 > = {
+  dynamodb: ["table", "table_detail_index"],
   elasticsearch: ["table_detail_index"],
   redis: ["table"],
 };
@@ -61,6 +62,14 @@ function isOverriddenAsUnsupported(
   connectionType?: ConnectionType,
   hints?: OpenDdlSupportHints,
 ): boolean {
+  if (
+    connectionType &&
+    (OPEN_DDL_UNSUPPORTED_BY_CONNECTION_TYPE[connectionType]?.includes(kind) ??
+      false)
+  ) {
+    return true;
+  }
+
   if (kind === "table_detail_index") {
     if (hints?.indexDdlSupport === "supported") {
       return false;
@@ -71,14 +80,7 @@ function isOverriddenAsUnsupported(
     }
   }
 
-  if (!connectionType) {
-    return false;
-  }
-
-  return (
-    OPEN_DDL_UNSUPPORTED_BY_CONNECTION_TYPE[connectionType]?.includes(kind) ??
-    false
-  );
+  return false;
 }
 
 export function isOpenDdlSupportedForNode(

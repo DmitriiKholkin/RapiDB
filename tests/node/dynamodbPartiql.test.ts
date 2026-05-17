@@ -4,6 +4,7 @@ import type {
   ColumnTypeMeta,
   FilterExpression,
 } from "../../src/extension/dbDrivers/types";
+import { TableMutationService } from "../../src/extension/table/tableMutationService";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
 const config: ConnectionConfig = {
@@ -17,8 +18,8 @@ function createColumns(): ColumnTypeMeta[] {
   return [
     {
       name: "tenant_id",
-      type: "text",
-      nativeType: "text",
+      type: "string",
+      nativeType: "string",
       category: "text",
       nullable: false,
       isPrimaryKey: true,
@@ -31,8 +32,8 @@ function createColumns(): ColumnTypeMeta[] {
     },
     {
       name: "user_id",
-      type: "text",
-      nativeType: "text",
+      type: "string",
+      nativeType: "string",
       category: "text",
       nullable: false,
       isPrimaryKey: true,
@@ -45,8 +46,8 @@ function createColumns(): ColumnTypeMeta[] {
     },
     {
       name: "email",
-      type: "text",
-      nativeType: "text",
+      type: "string",
+      nativeType: "string",
       category: "text",
       nullable: true,
       isPrimaryKey: false,
@@ -57,8 +58,8 @@ function createColumns(): ColumnTypeMeta[] {
     },
     {
       name: "age",
-      type: "float",
-      nativeType: "float",
+      type: "number",
+      nativeType: "number",
       category: "float",
       nullable: true,
       isPrimaryKey: false,
@@ -204,6 +205,113 @@ describe("DynamoDBDriver PartiQL", () => {
     expect(deletePreview).toBe(
       'DELETE FROM "users" WHERE "tenant_id" = \'tenant-1\' AND "user_id" = \'user-1\' RETURNING ALL OLD *;\nDELETE FROM "users" WHERE "tenant_id" = \'tenant-2\' AND "user_id" = \'user-2\' RETURNING ALL OLD *',
     );
+  });
+
+  it("coerces edited DynamoDB values into native types before building previews", async () => {
+    const { driver } = createDriver();
+    const mutationService = new TableMutationService(
+      {
+        getConnection: () => ({ id: "conn-ddb" }),
+        getDriver: () => driver,
+      } as never,
+      {
+        getColumns: async () => [
+          ...createColumns(),
+          {
+            name: "active",
+            type: "boolean",
+            nativeType: "boolean",
+            category: "boolean",
+            nullable: true,
+            isPrimaryKey: false,
+            isForeignKey: false,
+            filterable: true,
+            filterOperators: ["eq", "neq", "is_null", "is_not_null"],
+            valueSemantics: "boolean",
+          },
+          {
+            name: "profile",
+            type: "map",
+            nativeType: "map",
+            category: "json",
+            nullable: true,
+            isPrimaryKey: false,
+            isForeignKey: false,
+            filterable: true,
+            filterOperators: ["like", "is_null", "is_not_null"],
+            valueSemantics: "plain",
+          },
+          {
+            name: "tags",
+            type: "string set",
+            nativeType: "string set",
+            category: "array",
+            nullable: true,
+            isPrimaryKey: false,
+            isForeignKey: false,
+            filterable: true,
+            filterOperators: ["like", "is_null", "is_not_null"],
+            valueSemantics: "plain",
+          },
+          {
+            name: "history",
+            type: "list",
+            nativeType: "list",
+            category: "array",
+            nullable: true,
+            isPrimaryKey: false,
+            isForeignKey: false,
+            filterable: true,
+            filterOperators: ["like", "is_null", "is_not_null"],
+            valueSemantics: "plain",
+          },
+          {
+            name: "payload",
+            type: "binary",
+            nativeType: "binary",
+            category: "binary",
+            nullable: true,
+            isPrimaryKey: false,
+            isForeignKey: false,
+            filterable: false,
+            filterOperators: ["is_null", "is_not_null"],
+            valueSemantics: "plain",
+          },
+        ],
+      },
+    );
+
+    const plan = await mutationService.prepareInsertRow(
+      "conn-ddb",
+      "us-east-1",
+      "us-east-1",
+      "users",
+      {
+        tenant_id: "tenant-1",
+        user_id: "user-1",
+        age: "31",
+        active: "true",
+        profile: '{"tier":"pro","visits":3}',
+        tags: '["alpha","beta"]',
+        history: '[1,"two",true]',
+        payload: "0xdeadbeef",
+      },
+    );
+
+    expect(plan.mode).toBe("driver");
+    expect(plan.values).toEqual({
+      tenant_id: "tenant-1",
+      user_id: "user-1",
+      age: 31,
+      active: true,
+      profile: { tier: "pro", visits: 3 },
+      tags: new Set(["alpha", "beta"]),
+      history: [1, "two", true],
+      payload: Buffer.from([0xde, 0xad, 0xbe, 0xef]),
+    });
+    expect(plan.previewStatements).toEqual([
+      "INSERT INTO \"users\" VALUE {'tenant_id': 'tenant-1', 'user_id': 'user-1', 'age': 31, 'active': true, 'profile': {'tier': 'pro', 'visits': 3}, 'tags': <<'alpha', 'beta'>>, 'history': [1, 'two', true], 'payload': '3q2+7w=='}",
+    ]);
   });
 
   it("executes PartiQL statements for insert, update, and delete operations", async () => {

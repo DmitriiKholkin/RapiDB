@@ -23,6 +23,14 @@ function createDriver() {
       tenant_id: "tenant-1",
       user_id: "user-1",
       email: "person@example.com",
+      age: 31,
+      active: true,
+      profile: { tier: "pro", visits: 3 },
+      tags: new Set(["alpha", "beta"]),
+      scores: new Set([1, 2.5]),
+      history: [1, "two", true],
+      payload: Uint8Array.from([0xde, 0xad, 0xbe, 0xef]),
+      deleted_at: null,
     },
   ]);
   driverState.client = {
@@ -83,15 +91,73 @@ describe("DynamoDBDriver metadata", () => {
       expect.arrayContaining([
         expect.objectContaining({
           name: "tenant_id",
+          type: "string",
+          nativeType: "string",
           isPrimaryKey: true,
           primaryKeyOrdinal: 1,
           primaryKeyRole: "partition",
         }),
         expect.objectContaining({
           name: "user_id",
+          type: "string",
+          nativeType: "string",
           isPrimaryKey: true,
           primaryKeyOrdinal: 2,
           primaryKeyRole: "sort",
+        }),
+        expect.objectContaining({
+          name: "email",
+          type: "string",
+          nativeType: "string",
+          category: "text",
+        }),
+        expect.objectContaining({
+          name: "age",
+          type: "number",
+          nativeType: "number",
+          category: "integer",
+        }),
+        expect.objectContaining({
+          name: "active",
+          type: "boolean",
+          nativeType: "boolean",
+          category: "boolean",
+        }),
+        expect.objectContaining({
+          name: "profile",
+          type: "map",
+          nativeType: "map",
+          category: "json",
+        }),
+        expect.objectContaining({
+          name: "history",
+          type: "list",
+          nativeType: "list",
+          category: "array",
+        }),
+        expect.objectContaining({
+          name: "tags",
+          type: "string set",
+          nativeType: "string set",
+          category: "array",
+        }),
+        expect.objectContaining({
+          name: "scores",
+          type: "number set",
+          nativeType: "number set",
+          category: "array",
+        }),
+        expect.objectContaining({
+          name: "payload",
+          type: "binary",
+          nativeType: "binary",
+          category: "binary",
+        }),
+        expect.objectContaining({
+          name: "deleted_at",
+          type: "null",
+          nativeType: "null",
+          category: "other",
         }),
       ]),
     );
@@ -123,5 +189,20 @@ describe("DynamoDBDriver metadata", () => {
         }),
       ]),
     );
+    expect(page.rows).toEqual([
+      expect.objectContaining({
+        tenant_id: "tenant-1",
+        user_id: "user-1",
+        email: "person@example.com",
+        age: 31,
+        active: true,
+        profile: '{"tier":"pro","visits":3}',
+        history: '[1,"two",true]',
+        tags: "<<'alpha', 'beta'>>",
+        scores: "<<1, 2.5>>",
+        payload: "0xdeadbeef",
+        deleted_at: null,
+      }),
+    ]);
   });
 });
