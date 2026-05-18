@@ -745,6 +745,10 @@ const ORACLE_FILTER_DENYLIST = new Set([
   "anytype",
 ]);
 export class OracleDriver extends BaseDBDriver {
+  protected override getQueryEditorSqlDialect() {
+    return "plsql" as const;
+  }
+
   private pool: oracledb.Pool | null = null;
   private readonly config: ConnectionConfig;
   constructor(

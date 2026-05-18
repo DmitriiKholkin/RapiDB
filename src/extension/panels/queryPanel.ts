@@ -17,7 +17,7 @@ export class QueryPanel {
   private readonly connectionManager: ConnectionManager;
   private readonly controller: QueryPanelController;
   readonly initialConnectionId: string;
-  private formatOnOpen = false;
+  private readonly formatOnOpen: boolean | undefined;
   private isBookmarked = false;
   private editorLanguage: QueryEditorLanguage | undefined;
   private lastQueryResult: QueryPanelCachedResult | null = null;
@@ -37,7 +37,7 @@ export class QueryPanel {
     this.connectionManager = connectionManager;
     this.initialConnectionId = connectionId;
     this.activeConnectionId = connectionId;
-    this.formatOnOpen = formatOnOpen ?? false;
+    this.formatOnOpen = formatOnOpen;
     this.isBookmarked = isBookmarked ?? false;
     this.editorLanguage = editorLanguage;
     this.controller = new QueryPanelController(connectionManager, {
@@ -118,7 +118,7 @@ export class QueryPanel {
     connectionId: string,
     initialSql?: string,
     forceNew = false,
-    formatOnOpen = false,
+    formatOnOpen?: boolean,
     isBookmarked = false,
     editorLanguage?: QueryEditorLanguage,
   ): QueryPanel {
@@ -172,6 +172,34 @@ export class QueryPanel {
       this.initialConnectionId,
     );
     const connectionType = connection?.type ?? "";
+    const managerWithPresentation = this
+      .connectionManager as ConnectionManager & {
+      getQueryEditorPresentation?: (
+        connectionId: string,
+      ) =>
+        | import("../../shared/webviewContracts").QueryEditorPresentation
+        | undefined;
+    };
+    const driverEditorPresentation =
+      managerWithPresentation.getQueryEditorPresentation?.(
+        this.initialConnectionId,
+      );
+    const editorPresentation = driverEditorPresentation
+      ? {
+          ...driverEditorPresentation,
+          ...(this.formatOnOpen !== undefined
+            ? { formatOnOpen: this.formatOnOpen }
+            : {}),
+          ...(this.editorLanguage !== undefined
+            ? { editorLanguage: this.editorLanguage }
+            : {}),
+        }
+      : this.editorLanguage !== undefined || this.formatOnOpen !== undefined
+        ? {
+            formatOnOpen: this.formatOnOpen,
+            editorLanguage: this.editorLanguage,
+          }
+        : undefined;
 
     return createWebviewShell({
       context,
@@ -182,9 +210,10 @@ export class QueryPanel {
         connectionId: this.initialConnectionId,
         connectionType,
         initialSql: initialSql ?? "",
-        formatOnOpen: this.formatOnOpen ?? false,
+        formatOnOpen: this.formatOnOpen,
         isBookmarked: this.isBookmarked ?? false,
         editorLanguage: this.editorLanguage,
+        editorPresentation,
       },
       includeMediaRoot: true,
       extraCspDirectives: ["worker-src blob:"],

@@ -613,6 +613,10 @@ export class MongoDBDriver implements IDBDriver {
       tabularRead: "nosql" as const,
       queryMode: "text" as const,
       supportsMutations: true,
+      editorPresentation: {
+        formatOnOpen: false,
+        editorLanguage: "javascript" as const,
+      },
     };
   }
 

@@ -87,6 +87,7 @@ export class TableReadService {
       : driver.buildOrderByDefault(columns);
 
     let totalCount = 0;
+    let countFailed = false;
     if (!skipCount) {
       try {
         const countSql = `SELECT COUNT(*) AS cnt FROM ${qualifiedTableName} ${whereClause}`;
@@ -102,8 +103,9 @@ export class TableReadService {
             0,
         );
       } catch (error: unknown) {
+        countFailed = true;
         console.error(
-          "[RapiDB] COUNT query failed, totalCount will be 0:",
+          "[RapiDB] COUNT query failed, falling back to a lower-bound totalCount:",
           error instanceof Error ? error.message : error,
         );
       }
@@ -153,6 +155,10 @@ export class TableReadService {
 
       return formattedRow;
     });
+
+    if (countFailed) {
+      totalCount = offset + rows.length;
+    }
 
     return { columns, rows, totalCount };
   }

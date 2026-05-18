@@ -17,6 +17,7 @@ import type {
   TriggerMeta,
   TypeCategory,
 } from "../../shared/tableTypes";
+import type { QueryEditorPresentation } from "../../shared/webviewContracts";
 
 export {
   type ColumnMeta,
@@ -72,6 +73,8 @@ export interface DriverCapabilities {
   tabularRead: "sql" | "nosql";
   queryMode?: "sql" | "text";
   supportsMutations?: boolean;
+  editorPresentation?: QueryEditorPresentation;
+  isTableFilterError?: (message: string) => boolean;
 }
 
 export type DriverTableSectionKind =

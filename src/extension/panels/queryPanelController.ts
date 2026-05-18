@@ -144,12 +144,15 @@ export class QueryPanelController {
       }
     }
 
-    await this.connectionManager.addToHistory(connectionId, sql);
-
     const driver = this.connectionManager.getDriver(connectionId);
     if (!driver) {
+      this.postQueryError(
+        `[RapiDB] Cannot execute query: driver is unavailable for ${connectionId}.`,
+      );
       return;
     }
+
+    await this.connectionManager.addToHistory(connectionId, sql);
 
     try {
       const result = await driver.query(sql);
@@ -174,12 +177,22 @@ export class QueryPanelController {
   }
 
   private pushConnections(): void {
+    const managerWithPresentation = this
+      .connectionManager as ConnectionManager & {
+      getQueryEditorPresentation?: (
+        connectionId: string,
+      ) =>
+        | import("../../shared/webviewContracts").QueryEditorPresentation
+        | undefined;
+    };
     const connections = this.connectionManager
       .getConnections()
       .map((connection) => ({
         id: connection.id,
         name: connection.name,
         type: connection.type,
+        editorPresentation:
+          managerWithPresentation.getQueryEditorPresentation?.(connection.id),
       }));
     this.view.postMessage({ type: "connections", payload: connections });
   }

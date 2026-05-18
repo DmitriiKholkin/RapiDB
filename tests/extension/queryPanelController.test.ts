@@ -226,4 +226,143 @@ describe("QueryPanelController", () => {
     expect(getSchema).toHaveBeenCalledTimes(1);
     expect(view.postMessage).not.toHaveBeenCalled();
   });
+
+  it("includes driver-owned editor presentation in pushed connection metadata", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-1", name: "Primary", type: "pg" },
+        { id: "conn-2", name: "Mongo", type: "mongodb" },
+        { id: "conn-3", name: "Redis", type: "redis" },
+      ]),
+      getQueryEditorPresentation: vi.fn((connectionId: string) => {
+        switch (connectionId) {
+          case "conn-1":
+            return {
+              formatOnOpen: true,
+              editorLanguage: "sql" as const,
+              sqlDialect: "postgresql" as const,
+            };
+          case "conn-2":
+            return {
+              formatOnOpen: false,
+              editorLanguage: "javascript" as const,
+            };
+          case "conn-3":
+            return {
+              formatOnOpen: false,
+              editorLanguage: "plaintext" as const,
+            };
+          default:
+            return undefined;
+        }
+      }),
+    };
+
+    const view = {
+      getActiveConnectionId: vi.fn(() => "conn-1"),
+      getInitialConnectionId: vi.fn(() => "conn-1"),
+      getLastQueryResult: vi.fn(() => null),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+
+    await controller.handleMessage({ type: "getConnections" });
+
+    expect(connectionManager.getQueryEditorPresentation).toHaveBeenCalledTimes(
+      3,
+    );
+    expect(view.postMessage).toHaveBeenCalledWith({
+      type: "connections",
+      payload: [
+        {
+          id: "conn-1",
+          name: "Primary",
+          type: "pg",
+          editorPresentation: {
+            formatOnOpen: true,
+            editorLanguage: "sql",
+            sqlDialect: "postgresql",
+          },
+        },
+        {
+          id: "conn-2",
+          name: "Mongo",
+          type: "mongodb",
+          editorPresentation: {
+            formatOnOpen: false,
+            editorLanguage: "javascript",
+          },
+        },
+        {
+          id: "conn-3",
+          name: "Redis",
+          type: "redis",
+          editorPresentation: {
+            formatOnOpen: false,
+            editorLanguage: "plaintext",
+          },
+        },
+      ],
+    });
+  });
+
+  it("posts a query error instead of silently returning when the driver is unavailable", async () => {
+    const addToHistory = vi.fn(async () => undefined);
+    const connectionManager = {
+      isConnected: vi.fn(() => true),
+      connectTo: vi.fn(async () => undefined),
+      addToHistory,
+      addBookmark: vi.fn(async () => undefined),
+      getDriver: vi.fn(() => undefined),
+      getQueryRowLimit: vi.fn(() => 100),
+      getSchemaAsync: vi.fn(async () => []),
+    };
+
+    const view = {
+      getActiveConnectionId: vi.fn(() => "active"),
+      getInitialConnectionId: vi.fn(() => "initial"),
+      getLastQueryResult: vi.fn(() => null),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+
+    await controller.handleMessage({
+      type: "executeQuery",
+      payload: { sql: "select 1", connectionId: "active" },
+    });
+
+    expect(addToHistory).not.toHaveBeenCalled();
+    expect(view.postMessage).toHaveBeenCalledWith({
+      type: "queryResult",
+      payload: {
+        columns: [],
+        columnMeta: [],
+        rows: [],
+        rowCount: 0,
+        executionTimeMs: 0,
+        error:
+          "[RapiDB] Cannot execute query: driver is unavailable for active.",
+      },
+    });
+  });
 });

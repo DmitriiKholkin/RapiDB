@@ -26,8 +26,6 @@ type ExportPayload = {
   filters?: unknown[];
   limitToPage?: { page: number; pageSize: number };
 };
-const FILTER_ERROR_RE =
-  /^\[RapiDB Filter\]|invalid input syntax|invalid cidr|malformed array|not a valid (binary|hex|uuid)|syntax error in input|invalid value for type|invalid number|operator does not exist|conversion failed|arithmetic overflow|ORA-0(1841|1843|1858|1861|6502)|ORA-01722|incorrect (date|datetime|time)|Incorrect integer value|Truncated incorrect|data truncat/i;
 
 export class TablePanel {
   private static readonly viewType = "rapidb.tablePanel";
@@ -282,10 +280,19 @@ export class TablePanel {
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
       const errMsg = error.message;
+      const managerWithCapabilities = this
+        .connectionManager as ConnectionManager & {
+        getDriverCapabilities?: (
+          connectionId: string,
+        ) => { isTableFilterError?: (message: string) => boolean } | undefined;
+      };
       const isFilterError =
         filters.length > 0 &&
-        FILTER_ERROR_RE.test(errMsg) &&
-        !/arithmetic overflow/i.test(errMsg);
+        Boolean(
+          managerWithCapabilities
+            .getDriverCapabilities?.(this.connectionId)
+            ?.isTableFilterError?.(errMsg),
+        );
       this.postMessage("tableError", { fetchId, error: errMsg, isFilterError });
     }
   }

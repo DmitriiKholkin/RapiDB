@@ -5,6 +5,10 @@ import type {
   TableInitialState,
 } from "../../src/shared/webviewContracts";
 
+type AppHostWindow = Window & {
+  __RAPIDB_INITIAL_STATE__?: unknown;
+};
+
 vi.mock("../../src/webview/components/ConnectionFormView", () => ({
   ConnectionFormView: ({
     existing,
@@ -17,12 +21,15 @@ vi.mock("../../src/webview/components/QueryView", () => ({
   QueryView: ({
     connectionId,
     editorLanguage,
+    editorPresentation,
   }: {
     connectionId: string;
     editorLanguage?: string;
+    editorPresentation?: { sqlDialect?: string };
   }) => (
     <div>
-      Query:{connectionId}:{editorLanguage ?? "default"}
+      Query:{connectionId}:{editorLanguage ?? "default"}:
+      {editorPresentation?.sqlDialect ?? "none"}
     </div>
   ),
 }));
@@ -41,6 +48,7 @@ import { App } from "../../src/webview/components/App";
 
 describe("App", () => {
   it("selects the current view from window state on each render", () => {
+    const hostWindow = window as AppHostWindow;
     const queryState: QueryInitialState = {
       view: "query",
       connectionId: "conn-1",
@@ -49,6 +57,11 @@ describe("App", () => {
       formatOnOpen: false,
       isBookmarked: false,
       editorLanguage: "sql",
+      editorPresentation: {
+        formatOnOpen: false,
+        editorLanguage: "sql",
+        sqlDialect: "postgresql",
+      },
     };
     const tableState: TableInitialState = {
       view: "table",
@@ -60,29 +73,35 @@ describe("App", () => {
       defaultPageSize: 25,
     };
 
-    window.__RAPIDB_INITIAL_STATE__ = queryState;
+    hostWindow.__RAPIDB_INITIAL_STATE__ = queryState;
 
     const { rerender } = render(<App />);
-    expect(screen.getByText("Query:conn-1:sql")).toBeTruthy();
+    expect(screen.getByText("Query:conn-1:sql:postgresql")).toBeTruthy();
 
-    window.__RAPIDB_INITIAL_STATE__ = tableState;
+    hostWindow.__RAPIDB_INITIAL_STATE__ = tableState;
     rerender(<App />);
 
     expect(screen.getByText("Table:users")).toBeTruthy();
   });
 
   it("falls back to the default query state when the initial state is invalid", () => {
-    window.__RAPIDB_INITIAL_STATE__ = {
-      view: "query",
-    } as unknown as Window["__RAPIDB_INITIAL_STATE__"];
+    Reflect.set(
+      window as unknown as Record<string, unknown>,
+      "__RAPIDB_INITIAL_STATE__",
+      {
+        view: "query",
+      },
+    );
 
     render(<App />);
 
-    expect(screen.getByText("Query::default")).toBeTruthy();
+    expect(screen.getByText("Query::default:none")).toBeTruthy();
   });
 
   it("renders erd view when requested by initial state", () => {
-    window.__RAPIDB_INITIAL_STATE__ = {
+    const hostWindow = window as AppHostWindow;
+
+    hostWindow.__RAPIDB_INITIAL_STATE__ = {
       view: "erd",
       connectionId: "conn-1",
       database: "app_db",

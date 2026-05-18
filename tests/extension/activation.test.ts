@@ -75,6 +75,30 @@ describe("extension activation", () => {
         name: "Primary",
         type: "pg",
       })),
+      getQueryEditorPresentation: vi.fn((connectionId: string) => {
+        const getConnection =
+          connectionManagerInstance.getConnection as unknown as (
+            id: string,
+          ) => { type?: string } | undefined;
+        const connection = getConnection(connectionId);
+        switch (connection?.type) {
+          case "mongodb":
+            return {
+              formatOnOpen: false,
+              editorLanguage: "javascript",
+            };
+          case "elasticsearch":
+          case "redis":
+            return {
+              formatOnOpen: false,
+              editorLanguage: "plaintext",
+            };
+          default:
+            return {
+              formatOnOpen: true,
+            };
+        }
+      }),
       disconnectFrom: vi.fn(),
       disconnectAll: vi.fn().mockResolvedValue(undefined),
       clearBookmarks: vi.fn(),

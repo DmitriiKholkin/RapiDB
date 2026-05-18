@@ -600,6 +600,10 @@ const MSSQL_FILTER_DENYLIST = new Set([
   "rowversion",
 ]);
 export class MSSQLDriver extends BaseDBDriver {
+  protected override getQueryEditorSqlDialect() {
+    return "transactsql" as const;
+  }
+
   private pool: mssql.ConnectionPool | null = null;
   private readonly config: ConnectionConfig;
   constructor(

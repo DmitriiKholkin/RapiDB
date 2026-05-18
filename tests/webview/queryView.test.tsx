@@ -1,6 +1,6 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const formatMock = vi.hoisted(() => vi.fn((_dialect?: string) => null));
 
@@ -68,7 +68,22 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
 
   return {
     MonacoEditor,
-    connTypeToDialect: (type: string) => type || "sql",
+    connTypeToDialect: (type: string) => {
+      switch (type) {
+        case "mysql":
+          return "mysql";
+        case "pg":
+          return "postgresql";
+        case "sqlite":
+          return "sqlite";
+        case "mssql":
+          return "transactsql";
+        case "oracle":
+          return "plsql";
+        default:
+          return "sql";
+      }
+    },
   };
 });
 
@@ -88,6 +103,11 @@ vi.mock("../../src/webview/components/ResultsPanel", () => ({
 
 import { QueryView } from "../../src/webview/components/QueryView";
 import {
+  useConnectionStore,
+  useQueryStore,
+  useSchemaStore,
+} from "../../src/webview/store";
+import {
   clearPostedMessages,
   dispatchIncomingMessage,
   expectNoAxeViolations,
@@ -96,35 +116,76 @@ import {
 } from "./testUtils";
 
 describe("QueryView", () => {
-  it("auto-formats on open for SQL editors", async () => {
+  beforeEach(() => {
+    clearPostedMessages();
     formatMock.mockClear();
+    useQueryStore.setState({ status: "idle", result: null });
+    useConnectionStore.setState({ connections: [], activeConnectionId: "" });
+    useSchemaStore.setState({ schemaByConnection: {} });
+  });
 
+  it("auto-formats on open for SQL editors", async () => {
     render(
       <QueryView
         connectionId="conn-1"
         initialSql="select 1"
-        connectionType="pg"
-        formatOnOpen
+        editorPresentation={{
+          formatOnOpen: true,
+          editorLanguage: "sql",
+          sqlDialect: "postgresql",
+        }}
       />,
     );
 
     dispatchIncomingMessage("connections", [
-      { id: "conn-1", name: "Primary", type: "pg" },
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        editorPresentation: {
+          editorLanguage: "sql",
+          sqlDialect: "postgresql",
+        },
+      },
     ]);
 
     await waitFor(() => {
-      expect(formatMock).toHaveBeenCalledWith("pg");
+      expect(formatMock).toHaveBeenCalledWith("postgresql");
+    });
+  });
+
+  it("auto-formats when the active connection presentation arrives after mount", async () => {
+    render(<QueryView connectionId="conn-1" initialSql="select 1" />);
+
+    dispatchIncomingMessage("connections", [
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        editorPresentation: {
+          formatOnOpen: true,
+          editorLanguage: "sql",
+          sqlDialect: "postgresql",
+        },
+      },
+    ]);
+
+    await waitFor(() => {
+      expect(formatMock).toHaveBeenCalledWith("postgresql");
     });
   });
 
   it("requests connections and schema, updates the active connection, and reacts to schema messages", async () => {
-    formatMock.mockClear();
     const user = userEvent.setup();
     const { container } = render(
       <QueryView
         connectionId="conn-1"
         initialSql="select * from users"
         connectionType="pg"
+        editorPresentation={{
+          editorLanguage: "sql",
+          sqlDialect: "postgresql",
+        }}
       />,
     );
 
@@ -138,8 +199,40 @@ describe("QueryView", () => {
     });
 
     dispatchIncomingMessage("connections", [
-      { id: "conn-1", name: "Primary", type: "pg" },
-      { id: "conn-2", name: "Replica", type: "mysql" },
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        editorPresentation: {
+          editorLanguage: "sql",
+          sqlDialect: "postgresql",
+        },
+      },
+      {
+        id: "conn-2",
+        name: "Mongo",
+        type: "mongodb",
+        editorPresentation: {
+          editorLanguage: "javascript",
+        },
+      },
+      {
+        id: "conn-3",
+        name: "Redis",
+        type: "redis",
+        editorPresentation: {
+          editorLanguage: "plaintext",
+        },
+      },
+      {
+        id: "conn-4",
+        name: "Dynamo",
+        type: "dynamodb",
+        editorPresentation: {
+          editorLanguage: "sql",
+          sqlDialect: "sql",
+        },
+      },
     ]);
     dispatchIncomingMessage("schema", {
       connectionId: "conn-1",
@@ -177,20 +270,92 @@ describe("QueryView", () => {
         ]),
       );
     });
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Query editor")).toBeTruthy();
+      expect(screen.getByTestId("monaco-language").textContent).toBe(
+        "javascript",
+      );
+      expect(screen.getByTestId("monaco-dialect").textContent).toBe("none");
+      expect(
+        (screen.getByRole("button", { name: "Format" }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(true);
+    });
+
+    clearPostedMessages();
+
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Active connection" }),
+      "conn-3",
+    );
+
+    await waitFor(() => {
+      expect(getPostedMessages()).toEqual(
+        expect.arrayContaining([
+          {
+            type: "activeConnectionChanged",
+            payload: { connectionId: "conn-3" },
+          },
+          { type: "getSchema", payload: { connectionId: "conn-3" } },
+        ]),
+      );
+      expect(screen.getByLabelText("Query editor")).toBeTruthy();
+      expect(screen.getByTestId("monaco-language").textContent).toBe(
+        "plaintext",
+      );
+      expect(screen.getByTestId("monaco-dialect").textContent).toBe("none");
+    });
+
+    clearPostedMessages();
+
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Active connection" }),
+      "conn-4",
+    );
+
+    await waitFor(() => {
+      expect(getPostedMessages()).toEqual(
+        expect.arrayContaining([
+          {
+            type: "activeConnectionChanged",
+            payload: { connectionId: "conn-4" },
+          },
+          { type: "getSchema", payload: { connectionId: "conn-4" } },
+        ]),
+      );
+      expect(screen.getByLabelText("SQL editor")).toBeTruthy();
+      expect(screen.getByTestId("monaco-language").textContent).toBe("sql");
+      expect(screen.getByTestId("monaco-dialect").textContent).toBe("sql");
+      expect(
+        (screen.getByRole("button", { name: "Format" }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(false);
+    });
   });
 
   it("replaces the active connection flattened schema array as shared-cache scopes expand", async () => {
-    formatMock.mockClear();
     render(
       <QueryView
         connectionId="conn-1"
         initialSql="select * from users"
-        connectionType="pg"
+        editorPresentation={{
+          editorLanguage: "sql",
+          sqlDialect: "postgresql",
+        }}
       />,
     );
 
     dispatchIncomingMessage("connections", [
-      { id: "conn-1", name: "Primary", type: "pg" },
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        editorPresentation: {
+          editorLanguage: "sql",
+          sqlDialect: "postgresql",
+        },
+      },
     ]);
 
     dispatchIncomingMessage("schema", {
@@ -249,19 +414,29 @@ describe("QueryView", () => {
   });
 
   it("executes queries, shows result errors, and resets bookmark state after edits", async () => {
-    formatMock.mockClear();
     const user = userEvent.setup();
 
     render(
       <QueryView
         connectionId="conn-1"
         initialSql="select 1"
-        connectionType="pg"
+        editorPresentation={{
+          editorLanguage: "sql",
+          sqlDialect: "postgresql",
+        }}
       />,
     );
 
     dispatchIncomingMessage("connections", [
-      { id: "conn-1", name: "Primary", type: "pg" },
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        editorPresentation: {
+          editorLanguage: "sql",
+          sqlDialect: "postgresql",
+        },
+      },
     ]);
 
     const editor = screen.getByLabelText("SQL editor");
@@ -316,19 +491,29 @@ describe("QueryView", () => {
   });
 
   it("disables SQL formatting affordances for non-SQL connections", async () => {
-    formatMock.mockClear();
     const user = userEvent.setup();
 
     render(
       <QueryView
         connectionId="conn-1"
         initialSql="db.users.find({})"
-        connectionType="mongodb"
+        editorPresentation={{
+          editorLanguage: "javascript",
+          formatOnOpen: false,
+        }}
       />,
     );
 
     dispatchIncomingMessage("connections", [
-      { id: "conn-1", name: "Mongo", type: "mongodb" },
+      {
+        id: "conn-1",
+        name: "Mongo",
+        type: "mongodb",
+        editorPresentation: {
+          editorLanguage: "javascript",
+          formatOnOpen: false,
+        },
+      },
     ]);
 
     expect(screen.getByLabelText("Query editor")).toBeTruthy();
@@ -349,19 +534,28 @@ describe("QueryView", () => {
   });
 
   it("defaults Redis queries to plaintext and disables formatting", async () => {
-    formatMock.mockClear();
-
     render(
       <QueryView
         connectionId="conn-1"
         initialSql="GET app:key"
-        connectionType="redis"
         formatOnOpen
+        editorPresentation={{
+          editorLanguage: "plaintext",
+          formatOnOpen: false,
+        }}
       />,
     );
 
     dispatchIncomingMessage("connections", [
-      { id: "conn-1", name: "Redis", type: "redis" },
+      {
+        id: "conn-1",
+        name: "Redis",
+        type: "redis",
+        editorPresentation: {
+          editorLanguage: "plaintext",
+          formatOnOpen: false,
+        },
+      },
     ]);
 
     expect(screen.getByLabelText("Query editor")).toBeTruthy();
@@ -374,19 +568,30 @@ describe("QueryView", () => {
   });
 
   it("keeps DynamoDB PartiQL in SQL mode", async () => {
-    formatMock.mockClear();
-
     render(
       <QueryView
         connectionId="conn-1"
         initialSql={'SELECT * FROM "Users"'}
-        connectionType="dynamodb"
         formatOnOpen
+        editorPresentation={{
+          editorLanguage: "sql",
+          sqlDialect: "sql",
+          formatOnOpen: true,
+        }}
       />,
     );
 
     dispatchIncomingMessage("connections", [
-      { id: "conn-1", name: "Dynamo", type: "dynamodb" },
+      {
+        id: "conn-1",
+        name: "Dynamo",
+        type: "dynamodb",
+        editorPresentation: {
+          editorLanguage: "sql",
+          sqlDialect: "sql",
+          formatOnOpen: true,
+        },
+      },
     ]);
 
     expect(screen.getByLabelText("SQL editor")).toBeTruthy();
@@ -401,8 +606,6 @@ describe("QueryView", () => {
   });
 
   it("prefers explicit editorLanguage over connection-derived SQL mode", async () => {
-    formatMock.mockClear();
-
     render(
       <QueryView
         connectionId="conn-1"
@@ -414,7 +617,15 @@ describe("QueryView", () => {
     );
 
     dispatchIncomingMessage("connections", [
-      { id: "conn-1", name: "Primary", type: "pg" },
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        editorPresentation: {
+          editorLanguage: "sql",
+          sqlDialect: "postgresql",
+        },
+      },
     ]);
 
     expect(screen.getByLabelText("Query editor")).toBeTruthy();

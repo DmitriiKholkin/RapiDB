@@ -1,5 +1,4 @@
 import * as vscode from "vscode";
-import type { ConnectionType } from "../shared/connectionTypes";
 import {
   isDbObjectKind,
   isDdlOnlyDbObjectKind,
@@ -169,26 +168,13 @@ function showSavedQuery(
   );
 }
 
-function getOpenDdlPresentation(connectionType: ConnectionType | undefined): {
+function getOpenDdlPresentation(): {
   formatOnOpen: boolean;
   editorLanguage?: QueryEditorLanguage;
 } {
-  switch (connectionType) {
-    case "mongodb":
-      return {
-        formatOnOpen: false,
-        editorLanguage: "javascript",
-      };
-    case "elasticsearch":
-      return {
-        formatOnOpen: false,
-        editorLanguage: "plaintext",
-      };
-    default:
-      return {
-        formatOnOpen: true,
-      };
-  }
+  return {
+    formatOnOpen: true,
+  };
 }
 
 async function clearSavedEntries(
@@ -505,7 +491,18 @@ function registerCommands(
         );
         return;
       }
-      const ddlPresentation = getOpenDdlPresentation(connectionType);
+      const managerWithPresentation = connectionManager as ConnectionManager & {
+        getQueryEditorPresentation?: (connectionId: string) =>
+          | {
+              formatOnOpen?: boolean;
+              editorLanguage?: QueryEditorLanguage;
+            }
+          | undefined;
+      };
+      const ddlPresentation =
+        managerWithPresentation.getQueryEditorPresentation?.(
+          node.connectionId,
+        ) ?? getOpenDdlPresentation();
       if (objectKind && isRoutineDbObjectKind(objectKind)) {
         QueryPanel.createOrShow(
           context,

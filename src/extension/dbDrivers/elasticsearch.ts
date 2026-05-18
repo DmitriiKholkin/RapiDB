@@ -110,6 +110,10 @@ export class ElasticsearchDriver implements IDBDriver {
       tabularRead: "nosql" as const,
       queryMode: "text" as const,
       supportsMutations: true,
+      editorPresentation: {
+        formatOnOpen: false,
+        editorLanguage: "plaintext" as const,
+      },
     };
   }
 

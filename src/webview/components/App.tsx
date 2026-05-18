@@ -31,6 +31,7 @@ export function App(): ReactElement {
             formatOnOpen={state.formatOnOpen ?? false}
             isBookmarked={state.isBookmarked ?? false}
             editorLanguage={state.editorLanguage}
+            editorPresentation={state.editorPresentation}
           />
         </ErrorBoundary>
       );

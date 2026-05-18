@@ -153,7 +153,7 @@ export function registerTableServiceIntegrationTests(
         [],
       );
 
-      expect(fallbackPage.totalCount).toBe(0);
+      expect(fallbackPage.totalCount).toBe(5);
       expect(fallbackPage.rows).toHaveLength(5);
     });
 

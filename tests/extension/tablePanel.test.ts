@@ -314,4 +314,54 @@ describe("TablePanel", () => {
       payload: { success: false, error: "Plan failed" },
     });
   });
+
+  it("uses driver capabilities to classify filter errors", async () => {
+    getPageMock.mockRejectedValueOnce(
+      new Error("invalid input syntax for type uuid"),
+    );
+
+    const connectionManager = {
+      getConnection: vi.fn(() => ({ name: "Main" })),
+      getDriverCapabilities: vi.fn(() => ({
+        isTableFilterError: (message: string) =>
+          /invalid input syntax/i.test(message),
+      })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      getDefaultPageSize: vi.fn(() => 25),
+    };
+
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      "db1",
+      "public",
+      "users",
+    );
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected table panel instance");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "fetchPage",
+      payload: {
+        fetchId: 3,
+        page: 1,
+        pageSize: 25,
+        filters: [{ column: "id", operator: "eq", value: "bad-uuid" }],
+        sort: null,
+      },
+    });
+
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "tableError",
+      payload: {
+        fetchId: 3,
+        error: "invalid input syntax for type uuid",
+        isFilterError: true,
+      },
+    });
+  });
 });

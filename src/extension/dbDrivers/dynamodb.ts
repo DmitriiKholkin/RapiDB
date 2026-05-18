@@ -124,8 +124,13 @@ export class DynamoDBDriver implements IDBDriver {
   getCapabilities() {
     return {
       tabularRead: "nosql" as const,
-      queryMode: "text" as const,
+      queryMode: "sql" as const,
       supportsMutations: true,
+      editorPresentation: {
+        formatOnOpen: true,
+        editorLanguage: "sql" as const,
+        sqlDialect: "sql" as const,
+      },
     };
   }
 

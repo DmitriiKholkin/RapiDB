@@ -1,33 +1,13 @@
 import { format as formatSql } from "sql-formatter";
-import type { ConnectionType } from "../../shared/connectionTypes";
+import type { QueryEditorPresentation } from "../../shared/webviewContracts";
 
 function usesSqlPreviewFormatting(
-  connectionType: ConnectionType | undefined,
+  editorPresentation: QueryEditorPresentation | undefined,
 ): boolean {
   return (
-    connectionType !== "mongodb" &&
-    connectionType !== "redis" &&
-    connectionType !== "elasticsearch"
+    editorPresentation?.editorLanguage !== "javascript" &&
+    editorPresentation?.editorLanguage !== "plaintext"
   );
-}
-
-function formatterLanguageForConnection(
-  connectionType: ConnectionType | undefined,
-): "postgresql" | "mysql" | "transactsql" | "sqlite" | "plsql" | "sql" {
-  switch (connectionType) {
-    case "pg":
-      return "postgresql";
-    case "mysql":
-      return "mysql";
-    case "mssql":
-      return "transactsql";
-    case "sqlite":
-      return "sqlite";
-    case "oracle":
-      return "plsql";
-    default:
-      return "sql";
-  }
 }
 
 function ensureStatementTerminator(sql: string): string {
@@ -40,16 +20,16 @@ function ensureStatementTerminator(sql: string): string {
 
 export function formatMutationPreviewSql(
   statements: readonly string[],
-  connectionType: ConnectionType | undefined,
+  editorPresentation: QueryEditorPresentation | undefined,
 ): string {
-  if (!usesSqlPreviewFormatting(connectionType)) {
+  if (!usesSqlPreviewFormatting(editorPresentation)) {
     return statements
       .map((s) => s.trim())
       .filter((s) => s.length > 0)
       .join("\n\n");
   }
 
-  const language = formatterLanguageForConnection(connectionType);
+  const language = editorPresentation?.sqlDialect ?? "sql";
 
   return statements
     .map((statement) => ensureStatementTerminator(statement))

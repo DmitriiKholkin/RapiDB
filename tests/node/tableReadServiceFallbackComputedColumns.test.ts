@@ -150,4 +150,56 @@ describe("TableReadService arithmetic overflow handling", () => {
     });
     expect(query).not.toHaveBeenCalled();
   });
+
+  it("falls back to a lower-bound totalCount when COUNT fails", async () => {
+    const query = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("count failed"))
+      .mockResolvedValueOnce({
+        columns: ["id", "calc"],
+        rows: [
+          { __col_0: 51, __col_1: 99 },
+          { __col_0: 52, __col_1: 100 },
+        ],
+      });
+
+    const driver = {
+      qualifiedTableName: vi.fn(() => "[db].[dbo].[t]"),
+      describeColumns: vi.fn().mockResolvedValue(columns),
+      buildOrderByDefault: vi.fn(() => "ORDER BY [id] ASC"),
+      buildPagination: vi.fn(() => ({
+        sql: "OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
+        params: [50, 25],
+      })),
+      query,
+      quoteIdentifier: vi.fn((name: string) => `[${name}]`),
+      formatOutputValue: vi.fn((value: unknown) => value),
+      buildFilterCondition: vi.fn(),
+      normalizeFilterValue: vi.fn(),
+    };
+
+    const connectionManager = {
+      getConnection: vi.fn(() => ({ id: "c1" })),
+      getDriver: vi.fn(() => driver),
+    };
+
+    const service = new TableReadService(connectionManager as never);
+    const result = await service.getPage(
+      "c1",
+      "db",
+      "dbo",
+      "t",
+      3,
+      25,
+      [],
+      null,
+      false,
+    );
+
+    expect(result.totalCount).toBe(52);
+    expect(result.rows).toEqual([
+      { id: 51, calc: 99 },
+      { id: 52, calc: 100 },
+    ]);
+  });
 });

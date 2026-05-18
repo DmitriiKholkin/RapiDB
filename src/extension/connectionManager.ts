@@ -41,6 +41,7 @@ import { SQLiteDriver } from "./dbDrivers/sqlite";
 import { createTimeoutAwareDriver } from "./dbDrivers/timeout";
 import {
   DEFAULT_DRIVER_ENTITY_MANIFEST,
+  type DriverCapabilities,
   type DriverEntityAvailability,
   type DriverEntityManifest,
   type IDBDriver,
@@ -154,6 +155,12 @@ function resolveDriverEntityManifest(
   driver: IDBDriver | undefined,
 ): DriverEntityManifest {
   return driver?.getEntityManifest?.() ?? DEFAULT_DRIVER_ENTITY_MANIFEST;
+}
+
+function resolveDriverCapabilities(
+  driver: IDBDriver | undefined,
+): DriverCapabilities | undefined {
+  return driver?.getCapabilities?.();
 }
 
 function createEmptySchemaSnapshot(): SchemaSnapshot {
@@ -921,6 +928,24 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
   }
   getDriver(id: string): IDBDriver | undefined {
     return this.driverMap.get(id);
+  }
+
+  getDriverCapabilities(connectionId: string): DriverCapabilities | undefined {
+    const connectedDriver = this.getDriver(connectionId);
+    if (connectedDriver) {
+      return resolveDriverCapabilities(connectedDriver);
+    }
+
+    const config = this.getConnection(connectionId);
+    if (!config) {
+      return undefined;
+    }
+
+    return resolveDriverCapabilities(this.createDriver(config));
+  }
+
+  getQueryEditorPresentation(connectionId: string) {
+    return this.getDriverCapabilities(connectionId)?.editorPresentation;
   }
 
   getDriverEntityManifest(connectionId: string): DriverEntityManifest {

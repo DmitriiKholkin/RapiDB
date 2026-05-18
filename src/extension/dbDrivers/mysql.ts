@@ -721,6 +721,10 @@ function isMysqlSelectRows(
   );
 }
 export class MySQLDriver extends BaseDBDriver {
+  protected override getQueryEditorSqlDialect() {
+    return "mysql" as const;
+  }
+
   private pool: Pool | null = null;
   private readonly config: ConnectionConfig;
   constructor(

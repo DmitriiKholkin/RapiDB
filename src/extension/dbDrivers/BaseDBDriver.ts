@@ -1,5 +1,9 @@
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import { normalizeBinaryHexDisplayPrefix } from "../../shared/tableTypes";
+import type {
+  QueryEditorPresentation,
+  QueryEditorSqlDialect,
+} from "../../shared/webviewContracts";
 import {
   type DriverTimeoutSettingsProvider,
   type DriverTimeoutSettingsSnapshot,
@@ -9,6 +13,7 @@ import type {
   ColumnMeta,
   ColumnTypeMeta,
   DatabaseInfo,
+  DriverCapabilities,
   FilterConditionResult,
   FilterOperator,
   ForeignKeyMeta,
@@ -35,6 +40,8 @@ import {
 } from "./types";
 
 const pad2 = (n: number) => String(n).padStart(2, "0");
+const SQL_FILTER_ERROR_RE =
+  /^\[RapiDB Filter\]|invalid input syntax|invalid cidr|malformed array|not a valid (binary|hex|uuid)|syntax error in input|invalid value for type|invalid number|operator does not exist|conversion failed|arithmetic overflow|ORA-0(1841|1843|1858|1861|6502)|ORA-01722|incorrect (date|datetime|time)|Incorrect integer value|Truncated incorrect|data truncat/i;
 export function formatDatetimeForDisplay(val: unknown): string | null {
   if (val instanceof Date) {
     if (Number.isNaN(val.getTime())) return null;
@@ -772,6 +779,30 @@ export abstract class BaseDBDriver implements IDBDriver {
 
   protected getDbOperationTimeoutMs(): number {
     return this.getTimeoutSettings().dbOperationTimeoutMs;
+  }
+
+  protected getQueryEditorPresentation(): QueryEditorPresentation {
+    return {
+      formatOnOpen: true,
+      editorLanguage: "sql",
+      sqlDialect: this.getQueryEditorSqlDialect(),
+    };
+  }
+
+  protected getQueryEditorSqlDialect(): QueryEditorSqlDialect {
+    return "sql";
+  }
+
+  getCapabilities(): DriverCapabilities {
+    return {
+      tabularRead: "sql",
+      queryMode: "sql",
+      supportsMutations: true,
+      editorPresentation: this.getQueryEditorPresentation(),
+      isTableFilterError: (message: string) =>
+        SQL_FILTER_ERROR_RE.test(message) &&
+        !/arithmetic overflow/i.test(message),
+    };
   }
 
   async getMutationAtomicityRisk(

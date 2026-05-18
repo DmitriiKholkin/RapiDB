@@ -35,6 +35,20 @@ export interface ApplyResultPayload {
 
 export type QueryEditorLanguage = "sql" | "javascript" | "plaintext";
 
+export type QueryEditorSqlDialect =
+  | "postgresql"
+  | "mysql"
+  | "transactsql"
+  | "sqlite"
+  | "plsql"
+  | "sql";
+
+export interface QueryEditorPresentation {
+  formatOnOpen?: boolean;
+  editorLanguage?: QueryEditorLanguage;
+  sqlDialect?: QueryEditorSqlDialect;
+}
+
 export interface QueryInitialState {
   view: "query";
   connectionId: string;
@@ -43,6 +57,7 @@ export interface QueryInitialState {
   formatOnOpen?: boolean;
   isBookmarked?: boolean;
   editorLanguage?: QueryEditorLanguage;
+  editorPresentation?: QueryEditorPresentation;
 }
 
 export interface TableInitialState {
@@ -303,6 +318,45 @@ function readQueryEditorLanguage(
     : undefined;
 }
 
+function readQueryEditorSqlDialect(
+  value: unknown,
+): QueryEditorSqlDialect | undefined {
+  return value === "postgresql" ||
+    value === "mysql" ||
+    value === "transactsql" ||
+    value === "sqlite" ||
+    value === "plsql" ||
+    value === "sql"
+    ? value
+    : undefined;
+}
+
+function readQueryEditorPresentation(
+  value: unknown,
+): QueryEditorPresentation | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  const formatOnOpen = readOptionalBoolean(value, "formatOnOpen");
+  const editorLanguage = readQueryEditorLanguage(value.editorLanguage);
+  const sqlDialect = readQueryEditorSqlDialect(value.sqlDialect);
+
+  if (
+    formatOnOpen === undefined &&
+    editorLanguage === undefined &&
+    sqlDialect === undefined
+  ) {
+    return undefined;
+  }
+
+  return {
+    formatOnOpen,
+    editorLanguage,
+    sqlDialect,
+  };
+}
+
 function parseEnvelope(input: unknown): WebviewMessageEnvelope | null {
   if (!isRecord(input)) {
     return null;
@@ -422,14 +476,38 @@ export function parseWebviewInitialState(
       if (!connectionId || connectionType === undefined) {
         return null;
       }
+
+      const editorPresentation = readQueryEditorPresentation(
+        input.editorPresentation,
+      );
+      const formatOnOpen =
+        editorPresentation?.formatOnOpen ??
+        readOptionalBoolean(input, "formatOnOpen");
+      const editorLanguage =
+        editorPresentation?.editorLanguage ??
+        readQueryEditorLanguage(input.editorLanguage);
+      const sqlDialect =
+        editorPresentation?.sqlDialect ??
+        readQueryEditorSqlDialect(input.sqlDialect);
+
       return {
         view: "query",
         connectionId,
         connectionType,
         initialSql: readOptionalString(input, "initialSql"),
-        formatOnOpen: readOptionalBoolean(input, "formatOnOpen"),
+        formatOnOpen,
         isBookmarked: readOptionalBoolean(input, "isBookmarked"),
-        editorLanguage: readQueryEditorLanguage(input.editorLanguage),
+        editorLanguage,
+        editorPresentation:
+          formatOnOpen === undefined &&
+          editorLanguage === undefined &&
+          sqlDialect === undefined
+            ? undefined
+            : {
+                formatOnOpen,
+                editorLanguage,
+                sqlDialect,
+              },
       };
     }
 

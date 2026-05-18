@@ -195,9 +195,16 @@ export class TableMutationPreviewController {
     previewToken: string,
     preview: PendingTableMutationPreview,
   ): TableMutationPreviewPayload {
-    const connectionType = this.connectionManager.getConnection(
-      this.connectionId,
-    )?.type;
+    const managerWithPresentation = this
+      .connectionManager as ConnectionManager & {
+      getQueryEditorPresentation?: (
+        connectionId: string,
+      ) =>
+        | import("../../shared/webviewContracts").QueryEditorPresentation
+        | undefined;
+    };
+    const editorPresentation =
+      managerWithPresentation.getQueryEditorPresentation?.(this.connectionId);
     const previewStatements =
       preview.kind === "applyChanges"
         ? [
@@ -216,7 +223,7 @@ export class TableMutationPreviewController {
       previewToken,
       kind: preview.kind,
       title,
-      sql: formatMutationPreviewSql(previewStatements, connectionType),
+      sql: formatMutationPreviewSql(previewStatements, editorPresentation),
       statementCount: previewStatements.length,
     };
   }

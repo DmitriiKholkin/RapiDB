@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { DbObjectKind } from "../../shared/dbObjectKinds";
 import type { QueryColumnMeta } from "../../shared/tableTypes";
+import type { QueryEditorPresentation } from "../../shared/webviewContracts";
 
 export interface QueryResult {
   columns: string[];
@@ -37,6 +38,7 @@ export interface ConnectionEntry {
   id: string;
   name: string;
   type: string;
+  editorPresentation?: QueryEditorPresentation;
 }
 
 export interface ConnectionState {

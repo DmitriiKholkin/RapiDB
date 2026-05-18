@@ -93,12 +93,67 @@ describe("QueryPanel", () => {
     vi.clearAllMocks();
   });
 
+  it("preserves driver-owned formatOnOpen defaults when no explicit override is provided", async () => {
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+      })),
+      getQueryEditorPresentation: vi.fn(() => ({
+        formatOnOpen: true,
+        editorLanguage: "sql",
+        sqlDialect: "postgresql",
+      })),
+      onDidSchemaLoad: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+      getConnections: vi.fn(() => [
+        { id: "conn-1", name: "Primary", type: "pg" },
+      ]),
+      getConnectedCount: vi.fn(() => 1),
+    };
+
+    const { createWebviewShell } = await import(
+      "../../src/extension/panels/webviewShell"
+    );
+    const { QueryPanel } = await import(
+      "../../src/extension/panels/queryPanel"
+    );
+
+    QueryPanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      "select 1",
+      true,
+    );
+
+    const initialState = (createWebviewShell as ReturnType<typeof vi.fn>).mock
+      .calls[0]?.[0]?.initialState;
+
+    expect(initialState).toMatchObject({
+      connectionType: "pg",
+      editorPresentation: {
+        formatOnOpen: true,
+        editorLanguage: "sql",
+        sqlDialect: "postgresql",
+      },
+    });
+    expect(initialState.formatOnOpen).toBeUndefined();
+  });
+
   it("passes editor language overrides through the webview initial state", async () => {
     const connectionManager = {
       getConnection: vi.fn(() => ({
         id: "conn-1",
         name: "Mongo",
         type: "mongodb",
+      })),
+      getQueryEditorPresentation: vi.fn(() => ({
+        formatOnOpen: false,
+        editorLanguage: "javascript",
       })),
       onDidSchemaLoad: vi.fn(() => ({ dispose: vi.fn() })),
       onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
@@ -134,6 +189,10 @@ describe("QueryPanel", () => {
           connectionType: "mongodb",
           editorLanguage: "javascript",
           formatOnOpen: false,
+          editorPresentation: {
+            formatOnOpen: false,
+            editorLanguage: "javascript",
+          },
         }),
       }),
     );

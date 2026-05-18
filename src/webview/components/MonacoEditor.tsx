@@ -6,6 +6,7 @@ import React, {
   useRef,
 } from "react";
 import { format as sqlFormatterFormat } from "sql-formatter";
+import type { QueryEditorSqlDialect } from "../../shared/webviewContracts";
 import type { SchemaObject } from "../store";
 import { onMessage, postMessage } from "../utils/messaging";
 import {
@@ -160,7 +161,7 @@ export interface MonacoEditorHandle {
   placeCursor(): void;
 }
 
-export function connTypeToDialect(connType: string): string {
+export function connTypeToDialect(connType: string): QueryEditorSqlDialect {
   switch (connType) {
     case "mysql":
       return "mysql";
@@ -169,7 +170,7 @@ export function connTypeToDialect(connType: string): string {
     case "sqlite":
       return "sqlite";
     case "mssql":
-      return "tsql";
+      return "transactsql";
     case "oracle":
       return "plsql";
     default:

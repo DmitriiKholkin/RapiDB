@@ -198,6 +198,10 @@ function approximateNumericFilterTolerance(rawValue: string): number {
   return 10 ** -precision;
 }
 export class PostgresDriver extends BaseDBDriver {
+  protected override getQueryEditorSqlDialect() {
+    return "postgresql" as const;
+  }
+
   private pool: Pool | null = null;
   private readonly config: ConnectionConfig;
   private _connected = false;

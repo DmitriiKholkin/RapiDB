@@ -291,6 +291,11 @@ describe("parseWebviewInitialState", () => {
       formatOnOpen: true,
       isBookmarked: false,
       editorLanguage: "sql",
+      editorPresentation: {
+        formatOnOpen: true,
+        editorLanguage: "sql",
+        sqlDialect: undefined,
+      },
     });
   });
 
@@ -309,6 +314,7 @@ describe("parseWebviewInitialState", () => {
       formatOnOpen: undefined,
       isBookmarked: undefined,
       editorLanguage: undefined,
+      editorPresentation: undefined,
     });
   });
 
@@ -328,6 +334,11 @@ describe("parseWebviewInitialState", () => {
       formatOnOpen: undefined,
       isBookmarked: undefined,
       editorLanguage: "javascript",
+      editorPresentation: {
+        formatOnOpen: undefined,
+        editorLanguage: "javascript",
+        sqlDialect: undefined,
+      },
     });
 
     expect(
@@ -345,6 +356,41 @@ describe("parseWebviewInitialState", () => {
       formatOnOpen: undefined,
       isBookmarked: undefined,
       editorLanguage: "plaintext",
+      editorPresentation: {
+        formatOnOpen: undefined,
+        editorLanguage: "plaintext",
+        sqlDialect: undefined,
+      },
+    });
+  });
+
+  it("prefers the shared editorPresentation contract while keeping top-level query fields populated", () => {
+    const parsed = parseWebviewInitialState({
+      view: "query",
+      connectionId: "conn-1",
+      connectionType: "pg",
+      editorPresentation: {
+        formatOnOpen: true,
+        editorLanguage: "sql",
+        sqlDialect: "postgresql",
+      },
+      formatOnOpen: false,
+      editorLanguage: "plaintext",
+    });
+
+    expect(parsed).toEqual({
+      view: "query",
+      connectionId: "conn-1",
+      connectionType: "pg",
+      initialSql: undefined,
+      formatOnOpen: true,
+      isBookmarked: undefined,
+      editorLanguage: "sql",
+      editorPresentation: {
+        formatOnOpen: true,
+        editorLanguage: "sql",
+        sqlDialect: "postgresql",
+      },
     });
   });
 

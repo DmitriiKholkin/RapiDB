@@ -1,6 +1,10 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import type { QueryEditorLanguage } from "../../shared/webviewContracts";
+import type {
+  QueryEditorLanguage,
+  QueryEditorPresentation,
+} from "../../shared/webviewContracts";
 import {
+  type ConnectionEntry,
   type QueryResult,
   type SchemaObject,
   useConnectionStore,
@@ -11,11 +15,7 @@ import { buildButtonStyle } from "../utils/buttonStyles";
 import { buildSelectControlStyle } from "../utils/controlStyles";
 import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
-import {
-  connTypeToDialect,
-  MonacoEditor,
-  type MonacoEditorHandle,
-} from "./MonacoEditor";
+import { MonacoEditor, type MonacoEditorHandle } from "./MonacoEditor";
 import { ResultsPanel } from "./ResultsPanel";
 
 interface Props {
@@ -25,6 +25,7 @@ interface Props {
   connectionType?: string;
   isBookmarked?: boolean;
   editorLanguage?: QueryEditorLanguage;
+  editorPresentation?: QueryEditorPresentation;
 }
 
 const btnStyle = (disabled = false): React.CSSProperties =>
@@ -45,31 +46,28 @@ const MIN_EDITOR_H = 80;
 const DEFAULT_EDITOR_RATIO = 0.7;
 const DEFAULT_EDITOR_H = 400;
 
-function isSqlConnectionType(connectionType?: string): boolean {
-  return ["pg", "mysql", "sqlite", "mssql", "oracle"].includes(
-    connectionType ?? "",
+function resolveActiveEditorPresentation(
+  resolvedConnectionId: string,
+  initialConnectionId: string,
+  activeConnection: ConnectionEntry | undefined,
+  initialEditorPresentation?: QueryEditorPresentation,
+): QueryEditorPresentation | undefined {
+  return (
+    activeConnection?.editorPresentation ??
+    (resolvedConnectionId === initialConnectionId
+      ? initialEditorPresentation
+      : undefined)
   );
-}
-
-function deriveEditorLanguage(connectionType?: string): QueryEditorLanguage {
-  switch (connectionType) {
-    case "mongodb":
-      return "javascript";
-    case "redis":
-    case "elasticsearch":
-      return "plaintext";
-    default:
-      return "sql";
-  }
 }
 
 export function QueryView({
   connectionId,
   initialSql,
   formatOnOpen = false,
-  connectionType = "",
+  connectionType: _connectionType = "",
   isBookmarked: initialIsBookmarked = false,
   editorLanguage,
+  editorPresentation,
 }: Props): React.ReactElement {
   const editorRef = useRef<MonacoEditorHandle>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -116,17 +114,23 @@ export function QueryView({
   const schema: SchemaObject[] =
     schemaByConnection[activeConnectionId || connectionId] ?? [];
 
-  const activeConn = connections.find(
-    (c) => c.id === (activeConnectionId || connectionId),
+  const resolvedConnectionId = activeConnectionId || connectionId;
+  const activeConn = connections.find((c) => c.id === resolvedConnectionId);
+  const activeEditorPresentation = resolveActiveEditorPresentation(
+    resolvedConnectionId,
+    connectionId,
+    activeConn,
+    editorPresentation,
   );
-  const activeConnectionType = activeConn?.type ?? connectionType;
-  const derivedEditorLanguage = deriveEditorLanguage(activeConnectionType);
-  const monacoLanguage = editorLanguage ?? derivedEditorLanguage;
+  const shouldFormatOnOpen =
+    activeEditorPresentation?.formatOnOpen ??
+    editorPresentation?.formatOnOpen ??
+    formatOnOpen;
+  const monacoLanguage =
+    editorLanguage ?? activeEditorPresentation?.editorLanguage ?? "sql";
   const sqlDialect =
     monacoLanguage === "sql"
-      ? isSqlConnectionType(activeConnectionType)
-        ? connTypeToDialect(activeConnectionType)
-        : "sql"
+      ? (activeEditorPresentation?.sqlDialect ?? "sql")
       : undefined;
   const editorLabel = monacoLanguage === "sql" ? "SQL editor" : "Query editor";
 
@@ -161,7 +165,7 @@ export function QueryView({
       }
     });
 
-    const unsubConns = onMessage<{ id: string; name: string; type: string }[]>(
+    const unsubConns = onMessage<ConnectionEntry[]>(
       "connections",
       (payload) => {
         setConnections(payload);
@@ -207,7 +211,12 @@ export function QueryView({
   );
 
   useEffect(() => {
-    if (!formatOnOpen || !initialSql || didAutoFormat.current || !sqlDialect) {
+    if (
+      !shouldFormatOnOpen ||
+      !initialSql ||
+      didAutoFormat.current ||
+      !sqlDialect
+    ) {
       return;
     }
     if (connections.length === 0) {
@@ -222,11 +231,11 @@ export function QueryView({
         editorRef.current?.placeCursor();
       });
     });
-  }, [connections, formatOnOpen, initialSql, sqlDialect]);
+  }, [connections, initialSql, shouldFormatOnOpen, sqlDialect]);
 
   const didPlaceCursor = useRef(false);
   useEffect(() => {
-    if (formatOnOpen) {
+    if (shouldFormatOnOpen) {
       return;
     }
     if (didPlaceCursor.current) {
@@ -236,7 +245,7 @@ export function QueryView({
     requestAnimationFrame(() => {
       editorRef.current?.placeCursor();
     });
-  }, [formatOnOpen]);
+  }, [shouldFormatOnOpen]);
 
   const executeQuery = useCallback(() => {
     const sql = editorRef.current?.getSelectionOrValue().trim() ?? "";

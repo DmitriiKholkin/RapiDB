@@ -540,6 +540,10 @@ function invalidSqliteTemporalFilterError(
   );
 }
 export class SQLiteDriver extends BaseDBDriver {
+  protected override getQueryEditorSqlDialect() {
+    return "sqlite" as const;
+  }
+
   private db: Database | null = null;
   private readonly config: ConnectionConfig;
   constructor(
