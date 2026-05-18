@@ -127,11 +127,15 @@ export function QueryView({
     editorPresentation?.formatOnOpen ??
     formatOnOpen;
   const monacoLanguage =
-    editorLanguage ?? activeEditorPresentation?.editorLanguage ?? "sql";
+    activeEditorPresentation?.editorLanguage ?? editorLanguage ?? "sql";
   const sqlDialect =
     monacoLanguage === "sql"
       ? (activeEditorPresentation?.sqlDialect ?? "sql")
       : undefined;
+  const allowFormatting =
+    monacoLanguage === "sql"
+      ? (activeEditorPresentation?.allowFormatting ?? true)
+      : false;
   const editorLabel = monacoLanguage === "sql" ? "SQL editor" : "Query editor";
 
   useEffect(() => {
@@ -215,7 +219,8 @@ export function QueryView({
       !shouldFormatOnOpen ||
       !initialSql ||
       didAutoFormat.current ||
-      !sqlDialect
+      !sqlDialect ||
+      !allowFormatting
     ) {
       return;
     }
@@ -231,7 +236,13 @@ export function QueryView({
         editorRef.current?.placeCursor();
       });
     });
-  }, [connections, initialSql, shouldFormatOnOpen, sqlDialect]);
+  }, [
+    allowFormatting,
+    connections,
+    initialSql,
+    shouldFormatOnOpen,
+    sqlDialect,
+  ]);
 
   const didPlaceCursor = useRef(false);
   useEffect(() => {
@@ -388,10 +399,10 @@ export function QueryView({
         {}
         <button
           type="button"
-          style={btnGhostStyle(!sqlDialect)}
-          disabled={!sqlDialect}
+          style={btnGhostStyle(!sqlDialect || !allowFormatting)}
+          disabled={!sqlDialect || !allowFormatting}
           onClick={() => {
-            if (!sqlDialect) {
+            if (!sqlDialect || !allowFormatting) {
               return;
             }
             const err = editorRef.current?.format(sqlDialect) ?? null;

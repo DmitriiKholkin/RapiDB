@@ -6,7 +6,8 @@ function usesSqlPreviewFormatting(
 ): boolean {
   return (
     editorPresentation?.editorLanguage !== "javascript" &&
-    editorPresentation?.editorLanguage !== "plaintext"
+    editorPresentation?.editorLanguage !== "plaintext" &&
+    editorPresentation?.allowFormatting !== false
   );
 }
 

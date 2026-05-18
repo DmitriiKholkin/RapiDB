@@ -82,6 +82,21 @@ function createColumns(): ColumnTypeMeta[] {
   ];
 }
 
+function createMapColumn(): ColumnTypeMeta {
+  return {
+    name: "address",
+    type: "map",
+    nativeType: "map",
+    category: "json",
+    nullable: true,
+    isPrimaryKey: false,
+    isForeignKey: false,
+    filterable: true,
+    filterOperators: ["eq", "neq", "like", "is_null", "is_not_null"],
+    valueSemantics: "plain",
+  };
+}
+
 function createDriver() {
   const driver = new DynamoDBDriver(config);
   const driverState = driver as unknown as {
@@ -438,5 +453,96 @@ describe("DynamoDBDriver PartiQL", () => {
         }),
       ]),
     );
+  });
+
+  it("falls back to client-side filtering for map attributes", async () => {
+    const { driver, documentSend } = createDriver();
+    const driverState = driver as unknown as {
+      describeColumns: ReturnType<typeof vi.fn>;
+    };
+    driverState.describeColumns = vi.fn(async () => [
+      ...createColumns(),
+      createMapColumn(),
+    ]);
+    documentSend.mockResolvedValueOnce({
+      Items: [
+        {
+          tenant_id: "tenant-1",
+          user_id: "user-1",
+          address: {
+            country: "RU",
+            lon: 37.6173,
+            city: "Moscow",
+            lat: 55.7558,
+          },
+        },
+        {
+          tenant_id: "tenant-1",
+          user_id: "user-2",
+          address: {
+            country: "DE",
+            lon: 13.405,
+            city: "Berlin",
+            lat: 52.52,
+          },
+        },
+      ],
+    });
+
+    const page = await driver.readTablePage({
+      database: "us-east-1",
+      schema: "us-east-1",
+      table: "users",
+      page: 1,
+      pageSize: 25,
+      filters: [
+        {
+          column: "address",
+          operator: "like",
+          value: '{"country":"RU","lon":37.6173,"city":"Moscow","lat":55.7558}',
+        },
+      ],
+      sort: null,
+      skipCount: false,
+    });
+
+    expect(documentSend).toHaveBeenCalledTimes(1);
+    expect(documentSend.mock.calls[0]?.[0].input).toMatchObject({
+      Statement: 'SELECT * FROM "users"',
+      Parameters: undefined,
+      Limit: 200,
+    });
+    expect(page.rows).toEqual([
+      expect.objectContaining({
+        address: '{"country":"RU","lon":37.6173,"city":"Moscow","lat":55.7558}',
+      }),
+    ]);
+  });
+
+  it("executes multiple PartiQL statements from the editor sequentially", async () => {
+    const { driver, documentSend } = createDriver();
+    documentSend
+      .mockResolvedValueOnce({
+        Items: [{ userId: "user-0001", age: 11 }],
+      })
+      .mockResolvedValueOnce({
+        Items: [{ userId: "user-0003", balance: 8750.11 }],
+      });
+
+    const result = await driver.query(
+      "UPDATE \"Users\" SET \"address\" = {'zip': '10115', 'country': 'DE', 'lon': 11, 'city': 'Berlin', 'lat': 52.52} SET \"age\" = 11 SET \"rawData\" = 'AQETBAUGB/8=' WHERE \"userId\" = 'user-0001' RETURNING ALL NEW *;\n\nUPDATE \"Users\" SET \"balance\" = 8750.11 SET \"email\" = 'carol@example.11' SET \"isVerified\" = false SET \"preferences\" = {'language': '11', 'theme': 'dark', 'timezone': 'Europe/Paris'} SET \"stats\" = {'pageViews': 14000, 'purchases': 11, 'loginCount': 280} SET \"tags\" = ['editor', '11', 'verified'] SET \"updatedAt\" = '2024-07-04T00:00:11Z' WHERE \"userId\" = 'user-0003' RETURNING ALL NEW *;",
+    );
+
+    expect(documentSend).toHaveBeenCalledTimes(2);
+    expect(documentSend.mock.calls[0]?.[0].input).toMatchObject({
+      Statement:
+        "UPDATE \"Users\" SET \"address\" = {'zip': '10115', 'country': 'DE', 'lon': 11, 'city': 'Berlin', 'lat': 52.52} SET \"age\" = 11 SET \"rawData\" = 'AQETBAUGB/8=' WHERE \"userId\" = 'user-0001' RETURNING ALL NEW *",
+    });
+    expect(documentSend.mock.calls[1]?.[0].input).toMatchObject({
+      Statement:
+        "UPDATE \"Users\" SET \"balance\" = 8750.11 SET \"email\" = 'carol@example.11' SET \"isVerified\" = false SET \"preferences\" = {'language': '11', 'theme': 'dark', 'timezone': 'Europe/Paris'} SET \"stats\" = {'pageViews': 14000, 'purchases': 11, 'loginCount': 280} SET \"tags\" = ['editor', '11', 'verified'] SET \"updatedAt\" = '2024-07-04T00:00:11Z' WHERE \"userId\" = 'user-0003' RETURNING ALL NEW *",
+    });
+    expect(result.affectedRows).toBe(2);
+    expect(result.rowCount).toBe(2);
   });
 });

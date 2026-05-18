@@ -161,6 +161,10 @@ describe("DynamoDBDriver metadata", () => {
         }),
       ]),
     );
+    expect(described.slice(0, 2).map((column) => column.name)).toEqual([
+      "tenant_id",
+      "user_id",
+    ]);
 
     const page = await driver.readTablePage({
       database: "us-east-1",
@@ -189,6 +193,10 @@ describe("DynamoDBDriver metadata", () => {
         }),
       ]),
     );
+    expect(page.columns.slice(0, 2).map((column) => column.name)).toEqual([
+      "tenant_id",
+      "user_id",
+    ]);
     expect(page.rows).toEqual([
       expect.objectContaining({
         tenant_id: "tenant-1",

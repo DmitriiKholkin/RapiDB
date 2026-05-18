@@ -294,6 +294,34 @@ describe("MongoDBDriver — mongosh query()", () => {
     expect(result.affectedRows).toBe(2);
   });
 
+  it("executes multiple updateMany statements sequentially without semicolons", async () => {
+    const { driver, mockUpdateMany } = createMockDriver();
+    const result =
+      await driver.query(`db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
+  { "_id": ObjectId("6a0b8a4021e40394d6f8796d") },
+  { "$set": { "t_string": "first" } }
+)
+
+db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
+  { "_id": ObjectId("6a0b8a5321e40394d6f8796e") },
+  { "$set": { "t_bool_false": true } }
+)`);
+
+    expect(mockUpdateMany).toHaveBeenCalledTimes(2);
+    expect(mockUpdateMany).toHaveBeenNthCalledWith(
+      1,
+      { _id: new ObjectId("6a0b8a4021e40394d6f8796d") },
+      { $set: { t_string: "first" } },
+    );
+    expect(mockUpdateMany).toHaveBeenNthCalledWith(
+      2,
+      { _id: new ObjectId("6a0b8a5321e40394d6f8796e") },
+      { $set: { t_bool_false: true } },
+    );
+    expect(result.rowCount).toBe(2);
+    expect(result.affectedRows).toBe(4);
+  });
+
   it("executes updateOne", async () => {
     const { driver, mockUpdateOne } = createMockDriver();
     await driver.query(

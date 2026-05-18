@@ -334,6 +334,63 @@ describe("QueryView", () => {
     });
   });
 
+  it("lets active connection presentation override the initial editor language", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <QueryView
+        connectionId="conn-1"
+        initialSql={"db.users.find({ active: true })"}
+        editorLanguage="javascript"
+        editorPresentation={{
+          formatOnOpen: false,
+          editorLanguage: "javascript",
+        }}
+      />,
+    );
+
+    dispatchIncomingMessage("connections", [
+      {
+        id: "conn-1",
+        name: "Mongo",
+        type: "mongodb",
+        editorPresentation: {
+          formatOnOpen: false,
+          editorLanguage: "javascript",
+        },
+      },
+      {
+        id: "conn-2",
+        name: "Primary",
+        type: "pg",
+        editorPresentation: {
+          formatOnOpen: true,
+          editorLanguage: "sql",
+          sqlDialect: "postgresql",
+        },
+      },
+    ]);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("monaco-language").textContent).toBe(
+        "javascript",
+      );
+    });
+
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Active connection" }),
+      "conn-2",
+    );
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("SQL editor")).toBeTruthy();
+      expect(screen.getByTestId("monaco-language").textContent).toBe("sql");
+      expect(screen.getByTestId("monaco-dialect").textContent).toBe(
+        "postgresql",
+      );
+    });
+  });
+
   it("replaces the active connection flattened schema array as shared-cache scopes expand", async () => {
     render(
       <QueryView
@@ -567,7 +624,7 @@ describe("QueryView", () => {
     expect(formatMock).not.toHaveBeenCalled();
   });
 
-  it("keeps DynamoDB PartiQL in SQL mode", async () => {
+  it("keeps DynamoDB PartiQL in SQL mode while disabling formatting", async () => {
     render(
       <QueryView
         connectionId="conn-1"
@@ -576,7 +633,8 @@ describe("QueryView", () => {
         editorPresentation={{
           editorLanguage: "sql",
           sqlDialect: "sql",
-          formatOnOpen: true,
+          formatOnOpen: false,
+          allowFormatting: false,
         }}
       />,
     );
@@ -589,20 +647,18 @@ describe("QueryView", () => {
         editorPresentation: {
           editorLanguage: "sql",
           sqlDialect: "sql",
-          formatOnOpen: true,
+          formatOnOpen: false,
+          allowFormatting: false,
         },
       },
     ]);
 
     expect(screen.getByLabelText("SQL editor")).toBeTruthy();
     expect(screen.getByTestId("monaco-language").textContent).toBe("sql");
-
-    await waitFor(() => {
-      expect(formatMock).toHaveBeenCalledWith("sql");
-    });
+    expect(formatMock).not.toHaveBeenCalled();
 
     const formatButton = screen.getByRole("button", { name: "Format" });
-    expect((formatButton as HTMLButtonElement).disabled).toBe(false);
+    expect((formatButton as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("prefers explicit editorLanguage over connection-derived SQL mode", async () => {

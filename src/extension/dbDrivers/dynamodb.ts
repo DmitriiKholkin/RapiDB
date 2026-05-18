@@ -13,6 +13,7 @@ import {
   DynamoDBDocumentClient,
   ExecuteStatementCommand,
 } from "@aws-sdk/lib-dynamodb";
+import { splitDynamoPartiqlStatements } from "../../shared/dynamodbPartiql";
 import type { PrimaryKeyRole } from "../../shared/tableTypes";
 import type { ConnectionConfig } from "../connectionManager";
 import {
@@ -127,9 +128,10 @@ export class DynamoDBDriver implements IDBDriver {
       queryMode: "sql" as const,
       supportsMutations: true,
       editorPresentation: {
-        formatOnOpen: true,
+        formatOnOpen: false,
         editorLanguage: "sql" as const,
         sqlDialect: "sql" as const,
+        allowFormatting: false,
       },
     };
   }
@@ -391,8 +393,8 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   async query(sql: string, _params?: unknown[]): Promise<QueryResult> {
-    const trimmed = sql.trim().replace(/;+$/, "");
-    if (!trimmed) {
+    const statements = splitDynamoPartiqlStatements(sql);
+    if (statements.length === 0) {
       return {
         columns: [],
         rows: [],
@@ -402,36 +404,45 @@ export class DynamoDBDriver implements IDBDriver {
     }
 
     const startedAt = Date.now();
-    const statementKind = this.detectPartiqlStatementKind(trimmed);
-    if (!statementKind) {
-      throw new Error(
-        'DynamoDB query mode expects a PartiQL statement, for example:\n  SELECT * FROM "Users"\n  INSERT INTO "Users" VALUE {\'id\': \'user-1\'}\n  UPDATE "Users" SET "email" = \'person@example.com\' WHERE "id" = \'user-1\'\n  DELETE FROM "Users" WHERE "id" = \'user-1\'',
-      );
-    }
+    const rawRows: Record<string, unknown>[] = [];
+    let affectedRows = 0;
+    let sawMutation = false;
 
-    const response = await this.executeStatement(trimmed, _params);
-    const rawRows = (response.Items ?? []).map(
-      (item) => item as Record<string, unknown>,
-    );
+    for (const statement of statements) {
+      const statementKind = this.detectPartiqlStatementKind(statement);
+      if (!statementKind) {
+        throw new Error(
+          'DynamoDB query mode expects a PartiQL statement, for example:\n  SELECT * FROM "Users"\n  INSERT INTO "Users" VALUE {\'id\': \'user-1\'}\n  UPDATE "Users" SET "email" = \'person@example.com\' WHERE "id" = \'user-1\'\n  DELETE FROM "Users" WHERE "id" = \'user-1\'',
+        );
+      }
+
+      const response = await this.executeStatement(statement, _params);
+      const statementRows = (response.Items ?? []).map(
+        (item) => item as Record<string, unknown>,
+      );
+      rawRows.push(...statementRows);
+
+      if (statementKind !== "select") {
+        sawMutation = true;
+        affectedRows +=
+          statementRows.length > 0
+            ? statementRows.length
+            : statementKind === "delete"
+              ? 0
+              : 1;
+      }
+    }
     const columns = inferColumnsFromRows(rawRows, "id").map(
       (column) => column.name,
     );
     const rows = rawRows.map((row) => this.formatDynamoRowForDisplay(row));
     const rowCount = rawRows.length;
-    const affectedRows =
-      statementKind === "select"
-        ? undefined
-        : rowCount > 0
-          ? rowCount
-          : statementKind === "delete"
-            ? 0
-            : 1;
 
     return {
       columns,
       rows: rows.map((row) => this.mapRowToQueryRow(row, columns)),
       rowCount,
-      affectedRows,
+      affectedRows: sawMutation ? affectedRows : undefined,
       executionTimeMs: Date.now() - startedAt,
     };
   }
@@ -1156,6 +1167,9 @@ export class DynamoDBDriver implements IDBDriver {
       if (!column) {
         continue;
       }
+      if (!this.supportsServerFilter(column, filter.operator)) {
+        continue;
+      }
 
       const normalizedValue = this.normalizeFilterValue(
         column,
@@ -1200,6 +1214,36 @@ export class DynamoDBDriver implements IDBDriver {
       .split(",")
       .map((entry) => entry.trim())
       .filter((entry) => entry.length > 0);
+  }
+
+  private supportsServerFilter(
+    column: ColumnTypeMeta,
+    operator: FilterOperator,
+  ): boolean {
+    if (operator === "is_null" || operator === "is_not_null") {
+      return true;
+    }
+
+    const nativeType = column.nativeType.toLowerCase();
+    if (
+      operator === "like" ||
+      operator === "ilike" ||
+      operator === "eq" ||
+      operator === "neq" ||
+      operator === "in"
+    ) {
+      if (
+        nativeType === "map" ||
+        nativeType === "list" ||
+        nativeType.endsWith(" set") ||
+        column.category === "json" ||
+        column.category === "array"
+      ) {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   private coerceFilterParameter(
@@ -1287,8 +1331,27 @@ export class DynamoDBDriver implements IDBDriver {
       }
     }
 
+    const keyOrder = new Map(
+      schema.keys.map((key, index) => [key, index] as const),
+    );
+
     return [...columnNames]
-      .sort((left, right) => left.localeCompare(right))
+      .sort((left, right) => {
+        const leftKeyOrder = keyOrder.get(left);
+        const rightKeyOrder = keyOrder.get(right);
+
+        if (leftKeyOrder !== undefined || rightKeyOrder !== undefined) {
+          if (leftKeyOrder === undefined) {
+            return 1;
+          }
+          if (rightKeyOrder === undefined) {
+            return -1;
+          }
+          return leftKeyOrder - rightKeyOrder;
+        }
+
+        return left.localeCompare(right);
+      })
       .map((name) => {
         const descriptor = this.resolveDynamoColumnDescriptor(
           rows.map((row) => row[name]),

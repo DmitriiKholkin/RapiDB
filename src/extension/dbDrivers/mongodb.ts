@@ -67,6 +67,19 @@ type MongoSchemaType = {
   bsonSubtype?: number;
 };
 
+type MongoshChainOperation = {
+  op: string;
+  args: unknown[];
+};
+
+type MongoshOperation = {
+  dbName?: string;
+  collName?: string;
+  op: string;
+  args: unknown[];
+  chainOps: MongoshChainOperation[];
+};
+
 const MONGO_SCALAR_MISS = Symbol("mongo-scalar-miss");
 const UUID_VALUE_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -831,63 +844,75 @@ export class MongoDBDriver implements IDBDriver {
 
     const startedAt = Date.now();
 
-    let dbName: string | undefined;
-    let collName: string | undefined;
-    let opName: string | undefined;
-    let opArgs: unknown[] = [];
-    const chainOps: Array<{ op: string; args: unknown[] }> = [];
+    const operations: MongoshOperation[] = [];
 
-    const createChainProxy = (): object => {
+    const createChainProxy = (operation: MongoshOperation): object => {
       return new Proxy({} as Record<string, unknown>, {
         get(_t, method: string | symbol) {
           if (typeof method !== "string") return undefined;
           return (...a: unknown[]) => {
-            chainOps.push({ op: method, args: a });
-            return createChainProxy();
+            operation.chainOps.push({ op: method, args: a });
+            return createChainProxy(operation);
           };
         },
       });
     };
 
-    const createCollProxy = (coll: string): object => {
+    const createCollProxy = (
+      dbName: string | undefined,
+      coll: string,
+    ): object => {
       return new Proxy({} as Record<string, unknown>, {
         get(_t, method: string | symbol) {
           if (typeof method !== "string") return undefined;
           if (method === "then") return undefined;
           return (...a: unknown[]) => {
-            collName = coll;
-            opName = method;
-            opArgs = a;
-            return createChainProxy();
+            const operation: MongoshOperation = {
+              dbName,
+              collName: coll,
+              op: method,
+              args: a,
+              chainOps: [],
+            };
+            operations.push(operation);
+            return createChainProxy(operation);
           };
         },
       });
     };
 
-    const createDbProxy = (): object => {
+    const createDbProxy = (dbName?: string): object => {
       return new Proxy({} as Record<string, unknown>, {
         get(_t, prop: string | symbol) {
           if (typeof prop !== "string") return undefined;
           if (prop === "getSiblingDB") {
             return (name: string) => {
-              dbName = name;
-              return createDbProxy();
+              return createDbProxy(name);
             };
           }
           if (prop === "getCollection") {
-            return (name: string) => createCollProxy(String(name));
+            return (name: string) => createCollProxy(dbName, String(name));
           }
           if (prop === "runCommand") {
             return (cmd: unknown) => {
-              opName = "runCommand";
-              opArgs = [cmd];
-              return createChainProxy();
+              const operation: MongoshOperation = {
+                dbName,
+                op: "runCommand",
+                args: [cmd],
+                chainOps: [],
+              };
+              operations.push(operation);
+              return createChainProxy(operation);
             };
           }
           if (prop === "createCollection") {
             return (name: string, options?: unknown) => {
-              opName = "createCollection";
-              opArgs = [name, options];
+              operations.push({
+                dbName,
+                op: "createCollection",
+                args: [name, options],
+                chainOps: [],
+              });
             };
           }
           if (prop === "createView") {
@@ -897,11 +922,15 @@ export class MongoDBDriver implements IDBDriver {
               pipeline?: unknown,
               options?: unknown,
             ) => {
-              opName = "createView";
-              opArgs = [name, viewOn, pipeline, options];
+              operations.push({
+                dbName,
+                op: "createView",
+                args: [name, viewOn, pipeline, options],
+                chainOps: [],
+              });
             };
           }
-          return createCollProxy(prop);
+          return createCollProxy(dbName, prop);
         },
       });
     };
@@ -994,239 +1023,288 @@ export class MongoDBDriver implements IDBDriver {
       );
     }
 
-    const op = opName;
-    if (!op) {
+    if (operations.length === 0) {
       throw new Error(
         'No operation found in mongosh expression.\n\nExamples:\n  db.users.find({})\n  db.users.insertOne({ name: "Alice" })\n  db.runCommand({ ping: 1 })',
       );
     }
 
-    const limitOp = chainOps.find((c) => c.op === "limit");
-    const limit = typeof limitOp?.args[0] === "number" ? limitOp.args[0] : 100;
-    const skipOp = chainOps.find((c) => c.op === "skip");
-    const skip = typeof skipOp?.args[0] === "number" ? skipOp.args[0] : 0;
-
-    if (op === "runCommand") {
-      const cmd = this.normalizeFilterCriteria(
-        opArgs[0] as Record<string, unknown>,
+    const mapQueryRowsToObjects = (
+      result: QueryResult,
+    ): Record<string, unknown>[] => {
+      return result.rows.map((row) =>
+        Object.fromEntries(
+          result.columns.map((column, index) => [
+            column,
+            row[`__col_${index}`],
+          ]),
+        ),
       );
-      const result = await this.requireDb(dbName).command(cmd);
-      const row = this.toRow(result as Record<string, unknown>);
-      const columns = Object.keys(row);
-      return {
-        columns,
-        rows: [this.mapRowToQueryRow(row, columns)],
-        rowCount: 1,
-        executionTimeMs: Date.now() - startedAt,
-      };
-    }
+    };
 
-    if (op === "createCollection") {
-      const name = String(opArgs[0]);
-      const options =
-        opArgs[1] !== null && typeof opArgs[1] === "object"
-          ? (opArgs[1] as Record<string, unknown>)
-          : undefined;
-      if (options) {
-        await this.requireDb(dbName).createCollection(name, options);
-      } else {
-        await this.requireDb(dbName).createCollection(name);
+    const executeOperation = async (
+      operation: MongoshOperation,
+    ): Promise<QueryResult> => {
+      const { dbName, collName, op, args: opArgs, chainOps } = operation;
+
+      const limitOp = chainOps.find((c) => c.op === "limit");
+      const limit =
+        typeof limitOp?.args[0] === "number" ? limitOp.args[0] : 100;
+      const skipOp = chainOps.find((c) => c.op === "skip");
+      const skip = typeof skipOp?.args[0] === "number" ? skipOp.args[0] : 0;
+
+      if (op === "runCommand") {
+        const cmd = this.normalizeFilterCriteria(
+          opArgs[0] as Record<string, unknown>,
+        );
+        const result = await this.requireDb(dbName).command(cmd);
+        const row = this.toRow(result as Record<string, unknown>);
+        const columns = Object.keys(row);
+        return {
+          columns,
+          rows: [this.mapRowToQueryRow(row, columns)],
+          rowCount: 1,
+          executionTimeMs: Date.now() - startedAt,
+        };
       }
-      const row = { ok: 1, name, type: "collection" };
-      const columns = Object.keys(row);
-      return {
-        columns,
-        rows: [this.mapRowToQueryRow(row, columns)],
-        rowCount: 1,
-        executionTimeMs: Date.now() - startedAt,
-      };
-    }
 
-    if (op === "createView") {
-      const name = String(opArgs[0]);
-      const viewOn = String(opArgs[1]);
-      const pipeline = Array.isArray(opArgs[2]) ? opArgs[2] : [];
-      const options =
-        opArgs[3] !== null && typeof opArgs[3] === "object"
-          ? (opArgs[3] as Record<string, unknown>)
-          : undefined;
-      await this.requireDb(dbName).createCollection(name, {
-        viewOn,
-        pipeline,
-        ...(options ?? {}),
-      });
-      const row = { ok: 1, name, type: "view", viewOn };
-      const columns = Object.keys(row);
-      return {
-        columns,
-        rows: [this.mapRowToQueryRow(row, columns)],
-        rowCount: 1,
-        executionTimeMs: Date.now() - startedAt,
-      };
-    }
+      if (op === "createCollection") {
+        const name = String(opArgs[0]);
+        const options =
+          opArgs[1] !== null && typeof opArgs[1] === "object"
+            ? (opArgs[1] as Record<string, unknown>)
+            : undefined;
+        if (options) {
+          await this.requireDb(dbName).createCollection(name, options);
+        } else {
+          await this.requireDb(dbName).createCollection(name);
+        }
+        const row = { ok: 1, name, type: "collection" };
+        const columns = Object.keys(row);
+        return {
+          columns,
+          rows: [this.mapRowToQueryRow(row, columns)],
+          rowCount: 1,
+          executionTimeMs: Date.now() - startedAt,
+        };
+      }
 
-    if (!collName) {
-      throw new Error(`Collection name is required for operation "${op}"`);
-    }
+      if (op === "createView") {
+        const name = String(opArgs[0]);
+        const viewOn = String(opArgs[1]);
+        const pipeline = Array.isArray(opArgs[2]) ? opArgs[2] : [];
+        const options =
+          opArgs[3] !== null && typeof opArgs[3] === "object"
+            ? (opArgs[3] as Record<string, unknown>)
+            : undefined;
+        await this.requireDb(dbName).createCollection(name, {
+          viewOn,
+          pipeline,
+          ...(options ?? {}),
+        });
+        const row = { ok: 1, name, type: "view", viewOn };
+        const columns = Object.keys(row);
+        return {
+          columns,
+          rows: [this.mapRowToQueryRow(row, columns)],
+          rowCount: 1,
+          executionTimeMs: Date.now() - startedAt,
+        };
+      }
 
-    const mongoCollection = this.requireDb(dbName).collection(collName);
+      if (!collName) {
+        throw new Error(`Collection name is required for operation "${op}"`);
+      }
 
-    if (op === "find" || op === "findOne") {
-      const filter = this.normalizeFilterCriteria(
-        (opArgs[0] as Record<string, unknown>) ?? {},
+      const mongoCollection = this.requireDb(dbName).collection(collName);
+
+      if (op === "find" || op === "findOne") {
+        const filter = this.normalizeFilterCriteria(
+          (opArgs[0] as Record<string, unknown>) ?? {},
+        );
+        const actualLimit = op === "findOne" ? 1 : limit;
+        const docs = await mongoCollection
+          .find(filter, {
+            promoteValues: false,
+            bsonRegExp: false,
+          })
+          .limit(actualLimit)
+          .skip(skip)
+          .toArray();
+        const rows = docs.map((doc) =>
+          this.toRow(doc as Record<string, unknown>),
+        );
+        const columns = inferColumnsFromRows(rows, "_id").map((c) => c.name);
+        return {
+          columns,
+          rows: rows.map((row) => this.mapRowToQueryRow(row, columns)),
+          rowCount: rows.length,
+          executionTimeMs: Date.now() - startedAt,
+        };
+      }
+
+      if (op === "countDocuments") {
+        const filter = this.normalizeFilterCriteria(
+          (opArgs[0] as Record<string, unknown>) ?? {},
+        );
+        const count = await mongoCollection.countDocuments(filter);
+        return {
+          columns: ["count"],
+          rows: [this.mapRowToQueryRow({ count }, ["count"])],
+          rowCount: 1,
+          executionTimeMs: Date.now() - startedAt,
+        };
+      }
+
+      if (op === "insertOne") {
+        const doc = opArgs[0] as Record<string, unknown>;
+        const result = await mongoCollection.insertOne(doc);
+        const row = {
+          acknowledged: result.acknowledged,
+          insertedId: String(result.insertedId),
+        };
+        return {
+          columns: Object.keys(row),
+          rows: [this.mapRowToQueryRow(row, Object.keys(row))],
+          rowCount: 1,
+          affectedRows: result.acknowledged ? 1 : 0,
+          executionTimeMs: Date.now() - startedAt,
+        };
+      }
+
+      if (op === "insertMany") {
+        const docs = opArgs[0] as Record<string, unknown>[];
+        const result = await mongoCollection.insertMany(docs);
+        const row = {
+          acknowledged: result.acknowledged,
+          insertedCount: result.insertedCount,
+        };
+        return {
+          columns: Object.keys(row),
+          rows: [this.mapRowToQueryRow(row, Object.keys(row))],
+          rowCount: 1,
+          affectedRows: result.insertedCount,
+          executionTimeMs: Date.now() - startedAt,
+        };
+      }
+
+      if (op === "updateOne" || op === "updateMany") {
+        const filter = this.normalizeFilterCriteria(
+          opArgs[0] as Record<string, unknown>,
+        );
+        const update = opArgs[1] as Record<string, unknown>;
+        const result =
+          op === "updateOne"
+            ? await mongoCollection.updateOne(filter, update)
+            : await mongoCollection.updateMany(filter, update);
+        const row = {
+          matchedCount: result.matchedCount,
+          modifiedCount: result.modifiedCount,
+        };
+        return {
+          columns: Object.keys(row),
+          rows: [this.mapRowToQueryRow(row, Object.keys(row))],
+          rowCount: 1,
+          affectedRows: result.modifiedCount,
+          executionTimeMs: Date.now() - startedAt,
+        };
+      }
+
+      if (op === "deleteOne" || op === "deleteMany") {
+        const filter = this.normalizeFilterCriteria(
+          opArgs[0] as Record<string, unknown>,
+        );
+        const result =
+          op === "deleteOne"
+            ? await mongoCollection.deleteOne(filter)
+            : await mongoCollection.deleteMany(filter);
+        const row = { deletedCount: result.deletedCount };
+        return {
+          columns: Object.keys(row),
+          rows: [this.mapRowToQueryRow(row, Object.keys(row))],
+          rowCount: 1,
+          affectedRows: result.deletedCount,
+          executionTimeMs: Date.now() - startedAt,
+        };
+      }
+
+      if (op === "aggregate") {
+        const pipeline = opArgs[0] as Record<string, unknown>[];
+        const docs = await mongoCollection
+          .aggregate(pipeline, {
+            promoteValues: false,
+            bsonRegExp: false,
+          })
+          .toArray();
+        const rows = docs.map((doc) =>
+          this.toRow(doc as Record<string, unknown>),
+        );
+        const columns = inferColumnsFromRows(rows, "_id").map((c) => c.name);
+        return {
+          columns,
+          rows: rows.map((row) => this.mapRowToQueryRow(row, columns)),
+          rowCount: rows.length,
+          executionTimeMs: Date.now() - startedAt,
+        };
+      }
+
+      if (op === "createIndex") {
+        const key =
+          opArgs[0] &&
+          typeof opArgs[0] === "object" &&
+          !Array.isArray(opArgs[0])
+            ? (opArgs[0] as Record<string, unknown>)
+            : {};
+        const options =
+          opArgs[1] &&
+          typeof opArgs[1] === "object" &&
+          !Array.isArray(opArgs[1])
+            ? (opArgs[1] as Record<string, unknown>)
+            : undefined;
+        const name = await mongoCollection.createIndex(
+          key as Parameters<typeof mongoCollection.createIndex>[0],
+          options as Parameters<typeof mongoCollection.createIndex>[1],
+        );
+        const row = { ok: 1, name };
+        const columns = Object.keys(row);
+        return {
+          columns,
+          rows: [this.mapRowToQueryRow(row, columns)],
+          rowCount: 1,
+          executionTimeMs: Date.now() - startedAt,
+        };
+      }
+
+      throw new Error(
+        `Unsupported mongosh operation: "${op}".\n\nSupported: find, findOne, countDocuments, insertOne, insertMany, updateOne, updateMany, deleteOne, deleteMany, aggregate, runCommand, createCollection, createView, createIndex`,
       );
-      const actualLimit = op === "findOne" ? 1 : limit;
-      const docs = await mongoCollection
-        .find(filter, {
-          promoteValues: false,
-          bsonRegExp: false,
-        })
-        .limit(actualLimit)
-        .skip(skip)
-        .toArray();
-      const rows = docs.map((doc) =>
-        this.toRow(doc as Record<string, unknown>),
-      );
-      const columns = inferColumnsFromRows(rows, "_id").map((c) => c.name);
-      return {
-        columns,
-        rows: rows.map((row) => this.mapRowToQueryRow(row, columns)),
-        rowCount: rows.length,
-        executionTimeMs: Date.now() - startedAt,
-      };
+    };
+
+    if (operations.length === 1) {
+      return executeOperation(operations[0]);
     }
 
-    if (op === "countDocuments") {
-      const filter = this.normalizeFilterCriteria(
-        (opArgs[0] as Record<string, unknown>) ?? {},
-      );
-      const count = await mongoCollection.countDocuments(filter);
-      return {
-        columns: ["count"],
-        rows: [this.mapRowToQueryRow({ count }, ["count"])],
-        rowCount: 1,
-        executionTimeMs: Date.now() - startedAt,
-      };
+    const rawRows: Record<string, unknown>[] = [];
+    let affectedRows = 0;
+    let sawAffectedRows = false;
+
+    for (const operation of operations) {
+      const result = await executeOperation(operation);
+      rawRows.push(...mapQueryRowsToObjects(result));
+      if (typeof result.affectedRows === "number") {
+        affectedRows += result.affectedRows;
+        sawAffectedRows = true;
+      }
     }
 
-    if (op === "insertOne") {
-      const doc = opArgs[0] as Record<string, unknown>;
-      const result = await mongoCollection.insertOne(doc);
-      const row = {
-        acknowledged: result.acknowledged,
-        insertedId: String(result.insertedId),
-      };
-      return {
-        columns: Object.keys(row),
-        rows: [this.mapRowToQueryRow(row, Object.keys(row))],
-        rowCount: 1,
-        affectedRows: result.acknowledged ? 1 : 0,
-        executionTimeMs: Date.now() - startedAt,
-      };
-    }
-
-    if (op === "insertMany") {
-      const docs = opArgs[0] as Record<string, unknown>[];
-      const result = await mongoCollection.insertMany(docs);
-      const row = {
-        acknowledged: result.acknowledged,
-        insertedCount: result.insertedCount,
-      };
-      return {
-        columns: Object.keys(row),
-        rows: [this.mapRowToQueryRow(row, Object.keys(row))],
-        rowCount: 1,
-        affectedRows: result.insertedCount,
-        executionTimeMs: Date.now() - startedAt,
-      };
-    }
-
-    if (op === "updateOne" || op === "updateMany") {
-      const filter = this.normalizeFilterCriteria(
-        opArgs[0] as Record<string, unknown>,
-      );
-      const update = opArgs[1] as Record<string, unknown>;
-      const result =
-        op === "updateOne"
-          ? await mongoCollection.updateOne(filter, update)
-          : await mongoCollection.updateMany(filter, update);
-      const row = {
-        matchedCount: result.matchedCount,
-        modifiedCount: result.modifiedCount,
-      };
-      return {
-        columns: Object.keys(row),
-        rows: [this.mapRowToQueryRow(row, Object.keys(row))],
-        rowCount: 1,
-        affectedRows: result.modifiedCount,
-        executionTimeMs: Date.now() - startedAt,
-      };
-    }
-
-    if (op === "deleteOne" || op === "deleteMany") {
-      const filter = this.normalizeFilterCriteria(
-        opArgs[0] as Record<string, unknown>,
-      );
-      const result =
-        op === "deleteOne"
-          ? await mongoCollection.deleteOne(filter)
-          : await mongoCollection.deleteMany(filter);
-      const row = { deletedCount: result.deletedCount };
-      return {
-        columns: Object.keys(row),
-        rows: [this.mapRowToQueryRow(row, Object.keys(row))],
-        rowCount: 1,
-        affectedRows: result.deletedCount,
-        executionTimeMs: Date.now() - startedAt,
-      };
-    }
-
-    if (op === "aggregate") {
-      const pipeline = opArgs[0] as Record<string, unknown>[];
-      const docs = await mongoCollection
-        .aggregate(pipeline, {
-          promoteValues: false,
-          bsonRegExp: false,
-        })
-        .toArray();
-      const rows = docs.map((doc) =>
-        this.toRow(doc as Record<string, unknown>),
-      );
-      const columns = inferColumnsFromRows(rows, "_id").map((c) => c.name);
-      return {
-        columns,
-        rows: rows.map((row) => this.mapRowToQueryRow(row, columns)),
-        rowCount: rows.length,
-        executionTimeMs: Date.now() - startedAt,
-      };
-    }
-
-    if (op === "createIndex") {
-      const key =
-        opArgs[0] && typeof opArgs[0] === "object" && !Array.isArray(opArgs[0])
-          ? (opArgs[0] as Record<string, unknown>)
-          : {};
-      const options =
-        opArgs[1] && typeof opArgs[1] === "object" && !Array.isArray(opArgs[1])
-          ? (opArgs[1] as Record<string, unknown>)
-          : undefined;
-      const name = await mongoCollection.createIndex(
-        key as Parameters<typeof mongoCollection.createIndex>[0],
-        options as Parameters<typeof mongoCollection.createIndex>[1],
-      );
-      const row = { ok: 1, name };
-      const columns = Object.keys(row);
-      return {
-        columns,
-        rows: [this.mapRowToQueryRow(row, columns)],
-        rowCount: 1,
-        executionTimeMs: Date.now() - startedAt,
-      };
-    }
-
-    throw new Error(
-      `Unsupported mongosh operation: "${op}".\n\nSupported: find, findOne, countDocuments, insertOne, insertMany, updateOne, updateMany, deleteOne, deleteMany, aggregate, runCommand, createCollection, createView, createIndex`,
-    );
+    const columns = inferColumnsFromRows(rawRows, "_id").map((c) => c.name);
+    return {
+      columns,
+      rows: rawRows.map((row) => this.mapRowToQueryRow(row, columns)),
+      rowCount: rawRows.length,
+      affectedRows: sawAffectedRows ? affectedRows : undefined,
+      executionTimeMs: Date.now() - startedAt,
+    };
   }
 
   async readTablePage(

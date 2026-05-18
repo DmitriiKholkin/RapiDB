@@ -295,6 +295,7 @@ describe("parseWebviewInitialState", () => {
         formatOnOpen: true,
         editorLanguage: "sql",
         sqlDialect: undefined,
+        allowFormatting: undefined,
       },
     });
   });
@@ -338,6 +339,7 @@ describe("parseWebviewInitialState", () => {
         formatOnOpen: undefined,
         editorLanguage: "javascript",
         sqlDialect: undefined,
+        allowFormatting: undefined,
       },
     });
 
@@ -360,6 +362,7 @@ describe("parseWebviewInitialState", () => {
         formatOnOpen: undefined,
         editorLanguage: "plaintext",
         sqlDialect: undefined,
+        allowFormatting: undefined,
       },
     });
   });
@@ -390,6 +393,37 @@ describe("parseWebviewInitialState", () => {
         formatOnOpen: true,
         editorLanguage: "sql",
         sqlDialect: "postgresql",
+        allowFormatting: undefined,
+      },
+    });
+  });
+
+  it("parses query editor formatting capability overrides", () => {
+    expect(
+      parseWebviewInitialState({
+        view: "query",
+        connectionId: "conn-ddb",
+        connectionType: "dynamodb",
+        editorPresentation: {
+          formatOnOpen: false,
+          editorLanguage: "sql",
+          sqlDialect: "sql",
+          allowFormatting: false,
+        },
+      }),
+    ).toEqual({
+      view: "query",
+      connectionId: "conn-ddb",
+      connectionType: "dynamodb",
+      initialSql: undefined,
+      formatOnOpen: false,
+      isBookmarked: undefined,
+      editorLanguage: "sql",
+      editorPresentation: {
+        formatOnOpen: false,
+        editorLanguage: "sql",
+        sqlDialect: "sql",
+        allowFormatting: false,
       },
     });
   });

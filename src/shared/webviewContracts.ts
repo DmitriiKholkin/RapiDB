@@ -47,6 +47,7 @@ export interface QueryEditorPresentation {
   formatOnOpen?: boolean;
   editorLanguage?: QueryEditorLanguage;
   sqlDialect?: QueryEditorSqlDialect;
+  allowFormatting?: boolean;
 }
 
 export interface QueryInitialState {
@@ -341,11 +342,13 @@ function readQueryEditorPresentation(
   const formatOnOpen = readOptionalBoolean(value, "formatOnOpen");
   const editorLanguage = readQueryEditorLanguage(value.editorLanguage);
   const sqlDialect = readQueryEditorSqlDialect(value.sqlDialect);
+  const allowFormatting = readOptionalBoolean(value, "allowFormatting");
 
   if (
     formatOnOpen === undefined &&
     editorLanguage === undefined &&
-    sqlDialect === undefined
+    sqlDialect === undefined &&
+    allowFormatting === undefined
   ) {
     return undefined;
   }
@@ -354,6 +357,7 @@ function readQueryEditorPresentation(
     formatOnOpen,
     editorLanguage,
     sqlDialect,
+    allowFormatting,
   };
 }
 
@@ -489,6 +493,9 @@ export function parseWebviewInitialState(
       const sqlDialect =
         editorPresentation?.sqlDialect ??
         readQueryEditorSqlDialect(input.sqlDialect);
+      const allowFormatting =
+        editorPresentation?.allowFormatting ??
+        readOptionalBoolean(input, "allowFormatting");
 
       return {
         view: "query",
@@ -501,12 +508,14 @@ export function parseWebviewInitialState(
         editorPresentation:
           formatOnOpen === undefined &&
           editorLanguage === undefined &&
-          sqlDialect === undefined
+          sqlDialect === undefined &&
+          allowFormatting === undefined
             ? undefined
             : {
                 formatOnOpen,
                 editorLanguage,
                 sqlDialect,
+                allowFormatting,
               },
       };
     }

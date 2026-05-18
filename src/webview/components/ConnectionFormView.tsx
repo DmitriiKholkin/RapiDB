@@ -838,7 +838,10 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                     placeholder="mongodb://user:pass@localhost:27017/mydb"
                   />
                 </Field>
-                <Field label="Auth Database">
+                <Field
+                  label="Auth Database"
+                  hint="Optional. For root/admin users, set to admin; otherwise leave blank to authenticate against the selected database."
+                >
                   <FocusInput
                     aria-label="MongoDB auth database"
                     value={mongoAuthDatabase}
