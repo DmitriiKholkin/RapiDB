@@ -16,18 +16,21 @@ export class HistoryNode extends vscode.TreeItem {
 
     const dateStr = new Date(entry.executedAt).toLocaleString();
     this.tooltip = new vscode.MarkdownString(
-      `**${connectionName}** — ${dateStr}\n\`\`\`sql\n${entry.sql}\n\`\`\``,
+      `**${connectionName}** — ${dateStr}\n\`\`\`\n${entry.sql}\n\`\`\``,
     );
 
     this.command = {
       command: "rapidb.openHistoryEntry",
-      title: "Open in SQL Editor",
+      title: "Open in Query Editor",
       arguments: [entry],
     };
   }
 }
 
-export class HistoryProvider extends SqlEntryProvider<HistoryEntry, HistoryNode> {
+export class HistoryProvider extends SqlEntryProvider<
+  HistoryEntry,
+  HistoryNode
+> {
   constructor(cm: ConnectionManager) {
     super(cm, cm.onDidChangeHistory);
   }

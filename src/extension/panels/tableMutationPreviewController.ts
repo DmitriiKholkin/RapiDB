@@ -14,6 +14,21 @@ import {
 import { normalizeUnknownError } from "../utils/errorHandling";
 import { formatMutationPreviewSql } from "../utils/mutationPreview";
 
+function resolvePreviewContentType(
+  editorPresentation:
+    | import("../../shared/webviewContracts").QueryEditorPresentation
+    | undefined,
+): "application/sql" | "application/json" | "text/plain" {
+  switch (editorPresentation?.editorLanguage) {
+    case "json":
+      return "application/json";
+    case "sql":
+      return "application/sql";
+    default:
+      return "text/plain";
+  }
+}
+
 type PendingTableMutationPreview =
   | {
       kind: "applyChanges";
@@ -218,12 +233,19 @@ export class TableMutationPreviewController {
         : preview.kind === "insertRow"
           ? `Insert row into ${this.tableName}`
           : `Apply changes to ${this.tableName}`;
+    const text = formatMutationPreviewSql(
+      previewStatements,
+      editorPresentation,
+    );
+    const contentType = resolvePreviewContentType(editorPresentation);
 
     return {
       previewToken,
       kind: preview.kind,
       title,
-      sql: formatMutationPreviewSql(previewStatements, editorPresentation),
+      text,
+      contentType,
+      sql: text,
       statementCount: previewStatements.length,
     };
   }

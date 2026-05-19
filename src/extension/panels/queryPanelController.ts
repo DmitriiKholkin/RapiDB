@@ -64,7 +64,7 @@ export class QueryPanelController {
       case "executeQuery":
         if (parsed.payload) {
           await this.handleExecuteQuery(
-            parsed.payload.sql,
+            parsed.payload.queryText,
             parsed.payload.connectionId,
           );
         }
@@ -87,7 +87,7 @@ export class QueryPanelController {
       case "addBookmark":
         if (parsed.payload) {
           await this.handleAddBookmark(
-            parsed.payload.sql,
+            parsed.payload.queryText,
             parsed.payload.connectionId,
           );
         }
@@ -125,10 +125,10 @@ export class QueryPanelController {
   }
 
   private async handleExecuteQuery(
-    sql: string,
+    queryText: string,
     connectionIdOverride?: string,
   ): Promise<void> {
-    if (!sql.trim()) {
+    if (!queryText.trim()) {
       return;
     }
 
@@ -152,10 +152,10 @@ export class QueryPanelController {
       return;
     }
 
-    await this.connectionManager.addToHistory(connectionId, sql);
+    await this.connectionManager.addToHistory(connectionId, queryText);
 
     try {
-      const result = await driver.query(sql);
+      const result = await driver.query(queryText);
       const formattedResult = formatQueryResult(
         result,
         this.connectionManager.getQueryRowLimit(),
@@ -261,17 +261,17 @@ export class QueryPanelController {
   }
 
   private async handleAddBookmark(
-    sql: string,
+    queryText: string,
     connectionIdOverride?: string,
   ): Promise<void> {
-    if (!sql?.trim()) {
+    if (!queryText?.trim()) {
       return;
     }
 
     const connectionId = this.resolveConnectionId(connectionIdOverride);
 
     try {
-      await this.connectionManager.addBookmark(connectionId, sql);
+      await this.connectionManager.addBookmark(connectionId, queryText);
       this.view.postMessage({
         type: "bookmarkSaved",
         payload: { ok: true },

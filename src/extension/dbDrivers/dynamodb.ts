@@ -1,19 +1,50 @@
 import {
+  type AttributeValue,
+  BatchGetItemCommand,
+  type BatchGetItemCommandInput,
+  type BatchGetItemCommandOutput,
+  BatchWriteItemCommand,
+  type BatchWriteItemCommandInput,
+  type BatchWriteItemCommandOutput,
+  DeleteItemCommand,
+  type DeleteItemCommandInput,
+  type DeleteItemCommandOutput,
   DescribeTableCommand,
   DynamoDBClient,
+  GetItemCommand,
+  type GetItemCommandInput,
+  type GetItemCommandOutput,
   type GlobalSecondaryIndexDescription,
   ListTablesCommand,
   type LocalSecondaryIndexDescription,
   type Projection,
   type ProvisionedThroughputDescription,
+  PutItemCommand,
+  type PutItemCommandInput,
+  type PutItemCommandOutput,
+  QueryCommand,
+  type QueryCommandInput,
+  type QueryCommandOutput,
+  ScanCommand,
+  type ScanCommandInput,
+  type ScanCommandOutput,
   type TableDescription,
+  TransactGetItemsCommand,
+  type TransactGetItemsCommandInput,
+  type TransactGetItemsCommandOutput,
+  TransactWriteItemsCommand,
+  type TransactWriteItemsCommandInput,
+  UpdateItemCommand,
+  type UpdateItemCommandInput,
+  type UpdateItemCommandOutput,
 } from "@aws-sdk/client-dynamodb";
 import { fromIni } from "@aws-sdk/credential-providers";
+import { marshall, unmarshall } from "@aws-sdk/util-dynamodb";
 import {
-  DynamoDBDocumentClient,
-  ExecuteStatementCommand,
-} from "@aws-sdk/lib-dynamodb";
-import { splitDynamoPartiqlStatements } from "../../shared/dynamodbPartiql";
+  type DynamoDbNativeOperationName,
+  inferDynamoDbNativeOperationName,
+  parseDynamoDbNativeQueryInputs,
+} from "../../shared/dynamodbNative";
 import type { PrimaryKeyRole } from "../../shared/tableTypes";
 import type { ConnectionConfig } from "../connectionManager";
 import {
@@ -63,13 +94,107 @@ const DYNAMODB_ENTITY_MANIFEST: DriverEntityManifest = {
   },
 };
 
-const DYNAMODB_MAX_TABLE_ROWS = 5000;
-const DYNAMODB_READ_BATCH_SIZE = 200;
+const DYNAMODB_CURSOR_FETCH_LIMIT = 200;
+const DYNAMODB_MAX_MATERIALIZED_ROWS = 5000;
+
+type IndexedFilter = {
+  index: number;
+  filter: FilterExpression;
+};
+
+type ExpressionState = {
+  names: Record<string, string>;
+  values: Record<string, AttributeValue>;
+  nameCounter: number;
+  valueCounter: number;
+  nameByColumn: Map<string, string>;
+};
+
+type DynamoSecondaryIndexSchema = {
+  name: string;
+  partitionKey: string;
+  sortKey?: string;
+  type: "global" | "local";
+};
+
+type DynamoTableSchema = {
+  keys: string[];
+  keyRoles: Map<string, PrimaryKeyRole>;
+  attrTypes: Map<string, string>;
+  partitionKey?: string;
+  sortKey?: string;
+  secondaryIndexes: DynamoSecondaryIndexSchema[];
+};
+
+type GetItemReadPlan = {
+  kind: "getItem";
+  table: string;
+  schema: DynamoTableSchema;
+  key: Record<string, unknown>;
+  requestSignature: string;
+};
+
+type QueryReadPlan = {
+  kind: "query";
+  table: string;
+  schema: DynamoTableSchema;
+  baseInput: Omit<QueryCommandInput, "ExclusiveStartKey" | "Limit">;
+  requestSignature: string;
+  sortKeyName?: string;
+};
+
+type ScanReadPlan = {
+  kind: "scan";
+  table: string;
+  schema: DynamoTableSchema;
+  baseInput: Omit<ScanCommandInput, "ExclusiveStartKey" | "Limit">;
+  requestSignature: string;
+};
+
+type DynamoReadPlan = GetItemReadPlan | QueryReadPlan | ScanReadPlan;
+
+type ReadStepResult = {
+  rows: Record<string, unknown>[];
+  nextCursor?: Record<string, AttributeValue>;
+};
+
+type MaterializedReadResult = {
+  rows: Record<string, unknown>[];
+  truncated: boolean;
+};
+
+type DynamoCursorSession = {
+  pageStarts: Map<number, Record<string, AttributeValue> | undefined>;
+  terminalPage: number | null;
+  totalCount?: number;
+};
+
+type QueryDispatchResult = {
+  rows: Record<string, unknown>[];
+  affectedRows?: number;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => stableStringify(entry)).join(",")}]`;
+  }
+  if (isRecord(value)) {
+    return `{${Object.keys(value)
+      .sort((left, right) => left.localeCompare(right))
+      .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
 
 export class DynamoDBDriver implements IDBDriver {
   private client: DynamoDBClient | null = null;
-  private documentClient: DynamoDBDocumentClient | null = null;
   private connected = false;
+  private readonly cursorCache = new Map<string, DynamoCursorSession>();
 
   constructor(private readonly config: ConnectionConfig) {}
 
@@ -99,18 +224,17 @@ export class DynamoDBDriver implements IDBDriver {
       client.destroy();
       throw error;
     }
+
     this.client = client;
-    this.documentClient = DynamoDBDocumentClient.from(client, {
-      marshallOptions: { removeUndefinedValues: true },
-    });
     this.connected = true;
+    this.cursorCache.clear();
   }
 
   async disconnect(): Promise<void> {
     const client = this.client;
     this.client = null;
-    this.documentClient = null;
     this.connected = false;
+    this.cursorCache.clear();
     client?.destroy();
   }
 
@@ -125,12 +249,12 @@ export class DynamoDBDriver implements IDBDriver {
   getCapabilities() {
     return {
       tabularRead: "nosql" as const,
-      queryMode: "sql" as const,
+      queryMode: "text" as const,
       supportsMutations: true,
       editorPresentation: {
+        queryMode: "text" as const,
         formatOnOpen: false,
-        editorLanguage: "sql" as const,
-        sqlDialect: "sql" as const,
+        editorLanguage: "json" as const,
         allowFormatting: false,
       },
     };
@@ -163,7 +287,7 @@ export class DynamoDBDriver implements IDBDriver {
         .map((tableName) => ({
           schema: schemaName,
           name: tableName,
-          type: "table",
+          type: "table" as const,
         }));
     } catch {
       return [];
@@ -176,22 +300,20 @@ export class DynamoDBDriver implements IDBDriver {
     table: string,
   ): Promise<ColumnMeta[]> {
     const [rows, schema] = await Promise.all([
-      this.readRows(table, 1000),
+      this.readRowsForDescription(table, 1000),
       this.getTableSchema(table),
     ]);
     const columns = this.buildDynamoColumns(rows, schema);
-    return columns.map((column) => {
-      return {
-        name: column.name,
-        type: column.type,
-        nullable: column.nullable,
-        defaultValue: undefined,
-        isPrimaryKey: column.isPrimaryKey,
-        primaryKeyOrdinal: column.primaryKeyOrdinal,
-        primaryKeyRole: column.primaryKeyRole,
-        isForeignKey: false,
-      };
-    });
+    return columns.map((column) => ({
+      name: column.name,
+      type: column.type,
+      nullable: column.nullable,
+      defaultValue: undefined,
+      isPrimaryKey: column.isPrimaryKey,
+      primaryKeyOrdinal: column.primaryKeyOrdinal,
+      primaryKeyRole: column.primaryKeyRole,
+      isForeignKey: false,
+    }));
   }
 
   async describeColumns(
@@ -200,7 +322,7 @@ export class DynamoDBDriver implements IDBDriver {
     table: string,
   ): Promise<ColumnTypeMeta[]> {
     const [rows, schema] = await Promise.all([
-      this.readRows(table, 1000),
+      this.readRowsForDescription(table, 1000),
       this.getTableSchema(table),
     ]);
     return this.buildDynamoColumns(rows, schema);
@@ -392,56 +514,31 @@ export class DynamoDBDriver implements IDBDriver {
     unsupported("DynamoDB routine definition");
   }
 
-  async query(sql: string, _params?: unknown[]): Promise<QueryResult> {
-    const statements = splitDynamoPartiqlStatements(sql);
-    if (statements.length === 0) {
-      return {
-        columns: [],
-        rows: [],
-        rowCount: 0,
-        executionTimeMs: 0,
-      };
-    }
-
+  async query(queryText: string, _params?: unknown[]): Promise<QueryResult> {
+    const inputs = parseDynamoDbNativeQueryInputs(queryText);
+    const operation = this.resolveNativeOperation(inputs);
     const startedAt = Date.now();
     const rawRows: Record<string, unknown>[] = [];
     let affectedRows = 0;
     let sawMutation = false;
 
-    for (const statement of statements) {
-      const statementKind = this.detectPartiqlStatementKind(statement);
-      if (!statementKind) {
-        throw new Error(
-          'DynamoDB query mode expects a PartiQL statement, for example:\n  SELECT * FROM "Users"\n  INSERT INTO "Users" VALUE {\'id\': \'user-1\'}\n  UPDATE "Users" SET "email" = \'person@example.com\' WHERE "id" = \'user-1\'\n  DELETE FROM "Users" WHERE "id" = \'user-1\'',
-        );
-      }
-
-      const response = await this.executeStatement(statement, _params);
-      const statementRows = (response.Items ?? []).map(
-        (item) => item as Record<string, unknown>,
-      );
-      rawRows.push(...statementRows);
-
-      if (statementKind !== "select") {
+    for (const input of inputs) {
+      const result = await this.dispatchNativeCommand(operation, input);
+      rawRows.push(...result.rows);
+      if (result.affectedRows !== undefined) {
         sawMutation = true;
-        affectedRows +=
-          statementRows.length > 0
-            ? statementRows.length
-            : statementKind === "delete"
-              ? 0
-              : 1;
+        affectedRows += result.affectedRows;
       }
     }
+
     const columns = inferColumnsFromRows(rawRows, "id").map(
       (column) => column.name,
     );
-    const rows = rawRows.map((row) => this.formatDynamoRowForDisplay(row));
-    const rowCount = rawRows.length;
 
     return {
       columns,
-      rows: rows.map((row) => this.mapRowToQueryRow(row, columns)),
-      rowCount,
+      rows: rawRows.map((row) => this.mapRowToQueryRow(row, columns)),
+      rowCount: rawRows.length,
       affectedRows: sawMutation ? affectedRows : undefined,
       executionTimeMs: Date.now() - startedAt,
     };
@@ -456,96 +553,95 @@ export class DynamoDBDriver implements IDBDriver {
       request.schema,
       request.table,
     );
-    const rows = await this.readRows(request.table, DYNAMODB_MAX_TABLE_ROWS, {
-      filters: request.filters,
-      columns: describedColumns,
-      sort: request.sort,
-    });
     const describedByName = new Map(
       describedColumns.map((column) => [column.name, column]),
     );
-    const formattedRows = rows.map((row) =>
+    const plan = this.buildReadPlan(request, schema, describedColumns);
+    const requiresMaterializedFiltering = this.requiresClientSideFiltering(
+      request.filters,
+      describedColumns,
+    );
+    const requiresMaterializedSort =
+      request.sort !== null && !this.supportsServerSort(plan, request.sort);
+
+    if (requiresMaterializedSort || requiresMaterializedFiltering) {
+      const materialized = await this.materializeReadPlanRows(
+        plan,
+        DYNAMODB_MAX_MATERIALIZED_ROWS,
+      );
+      if (materialized.truncated) {
+        const reason = requiresMaterializedSort ? "sorting" : "filtering";
+        throw new Error(
+          `${reason[0]?.toUpperCase() ?? "F"}${reason.slice(1)} DynamoDB data with the current request requires materializing up to ${DYNAMODB_MAX_MATERIALIZED_ROWS} rows. Narrow the filters or sort by the key-compatible order instead.`,
+        );
+      }
+
+      const formattedRows = materialized.rows.map((row) =>
+        this.formatDynamoRowForDisplay(row, describedByName),
+      );
+      const filteredRows = applyFilters(formattedRows, request.filters);
+      const sortedRows = applySort(filteredRows, request.sort);
+      const columns = this.mergeDescribedColumns(
+        sortedRows.length > 0
+          ? this.buildDynamoColumns(materialized.rows, schema)
+          : describedColumns,
+        describedColumns,
+        schema,
+      );
+      return {
+        columns,
+        rows: pageRows(sortedRows, request.page, request.pageSize),
+        totalCount: request.skipCount ? 0 : sortedRows.length,
+      };
+    }
+
+    const pageResult = await this.readCursorBackedPage(
+      plan,
+      request.page,
+      request.pageSize,
+      request.sort,
+    );
+    const formattedRows = pageResult.rows.map((row) =>
       this.formatDynamoRowForDisplay(row, describedByName),
     );
-    const filtered = applyFilters(formattedRows, request.filters);
-    const sorted = applySort(filtered, request.sort);
-    const paged = pageRows(sorted, request.page, request.pageSize);
-    const sourceColumns =
-      sorted.length > 0
-        ? this.buildDynamoColumns(rows, schema)
-        : describedColumns;
-    const columns = sourceColumns.map((column) => {
-      const described = describedByName.get(column.name);
-      return {
-        ...column,
-        type: described?.type ?? column.type,
-        nativeType: described?.nativeType ?? column.nativeType,
-        category: described?.category ?? column.category,
-        nullable: described?.nullable ?? column.nullable,
-        filterable: described?.filterable ?? column.filterable,
-        filterOperators: described?.filterOperators ?? column.filterOperators,
-        valueSemantics: described?.valueSemantics ?? column.valueSemantics,
-        isPrimaryKey: schema.keys.includes(column.name),
-        primaryKeyOrdinal: schema.keys.includes(column.name)
-          ? schema.keys.indexOf(column.name) + 1
-          : undefined,
-        primaryKeyRole: schema.keyRoles.get(column.name),
-      };
-    });
+    const columns = this.mergeDescribedColumns(
+      pageResult.rows.length > 0
+        ? this.buildDynamoColumns(pageResult.rows, schema)
+        : describedColumns,
+      describedColumns,
+      schema,
+    );
+
     return {
       columns,
-      rows: paged,
-      totalCount: request.skipCount ? 0 : sorted.length,
+      rows: formattedRows,
+      totalCount: request.skipCount ? 0 : await this.countReadPlan(plan),
     };
   }
 
   async updateRows(
     request: DriverUpdateRowsRequest,
   ): Promise<DriverMutationResult> {
-    const keys = await this.getTableKeyNames(request.table);
-    const partitionKey = keys[0];
+    const schema = await this.getTableSchema(request.table);
+    const keys = schema.keys;
+    const partitionKey = schema.partitionKey;
     if (!partitionKey) {
       throw new Error("DynamoDB update requires a table partition key.");
     }
 
     let affectedRows = 0;
     for (const update of request.updates) {
-      const keyWhere = this.buildKeyWhereClause(keys, update.primaryKeys);
-      if (!keyWhere) {
-        throw new Error("DynamoDB update requires the full primary key.");
-      }
-
-      const entries = Object.entries(update.changes).filter(
-        ([name, value]) => !keys.includes(name) && value !== undefined,
-      );
-      for (const keyName of keys) {
-        if (
-          Object.hasOwn(update.changes, keyName) &&
-          update.changes[keyName] !== update.primaryKeys[keyName]
-        ) {
-          throw new Error(
-            `DynamoDB does not support updating key attribute '${keyName}'.`,
-          );
-        }
-      }
-      if (entries.length === 0) {
+      const input = this.buildUpdateItemInput(request.table, keys, update);
+      if (!input) {
         continue;
       }
-
-      const setClauses = entries.map(
-        ([name]) => `SET ${this.quoteIdentifier(name)} = ?`,
-      );
-      const parameters = [
-        ...entries.map(([, value]) => value),
-        ...keyWhere.params,
-      ];
-
       try {
-        await this.executeStatement(
-          `UPDATE ${this.quoteIdentifier(request.table)} ${setClauses.join(" ")} WHERE ${keyWhere.sql} RETURNING ALL NEW *`,
-          parameters,
+        const response = await this.requireClient().send(
+          new UpdateItemCommand(input),
         );
-        affectedRows += 1;
+        if (response.Attributes) {
+          affectedRows += 1;
+        }
       } catch (error: unknown) {
         if (this.isConditionalCheckFailure(error)) {
           continue;
@@ -554,19 +650,26 @@ export class DynamoDBDriver implements IDBDriver {
       }
     }
 
+    this.invalidateCursorCacheForTable(request.table);
     return { affectedRows };
   }
 
   async insertRow(
     request: DriverInsertRowRequest,
   ): Promise<DriverMutationResult> {
-    const statement = this.buildInsertStatement(request.table, request.values);
+    const schema = await this.getTableSchema(request.table);
+    const input = this.buildPutItemInput(
+      request.table,
+      schema.keys,
+      request.values,
+    );
 
     try {
-      await this.executeStatement(statement.sql, statement.params);
+      await this.requireClient().send(new PutItemCommand(input));
+      this.invalidateCursorCacheForTable(request.table);
       return { affectedRows: 1 };
     } catch (error: unknown) {
-      if (this.isDuplicateItemError(error)) {
+      if (this.isConditionalCheckFailure(error)) {
         return { affectedRows: 0 };
       }
       throw error;
@@ -576,19 +679,19 @@ export class DynamoDBDriver implements IDBDriver {
   async deleteRows(
     request: DriverDeleteRowsRequest,
   ): Promise<DriverMutationResult> {
-    const keys = await this.getTableKeyNames(request.table);
+    const schema = await this.getTableSchema(request.table);
+    const keys = schema.keys;
     let affectedRows = 0;
+
     for (const criteria of request.primaryKeyValuesList) {
-      const keyWhere = this.buildKeyWhereClause(keys, criteria);
-      if (!keyWhere) {
-        throw new Error("DynamoDB delete requires the full primary key.");
-      }
+      const input = this.buildDeleteItemInput(request.table, keys, criteria);
       try {
-        const response = await this.executeStatement(
-          `DELETE FROM ${this.quoteIdentifier(request.table)} WHERE ${keyWhere.sql} RETURNING ALL OLD *`,
-          keyWhere.params,
+        const response = await this.requireClient().send(
+          new DeleteItemCommand(input),
         );
-        affectedRows += response.Items && response.Items.length > 0 ? 1 : 0;
+        if (response.Attributes) {
+          affectedRows += 1;
+        }
       } catch (error: unknown) {
         if (this.isConditionalCheckFailure(error)) {
           continue;
@@ -596,6 +699,8 @@ export class DynamoDBDriver implements IDBDriver {
         throw error;
       }
     }
+
+    this.invalidateCursorCacheForTable(request.table);
     return { affectedRows };
   }
 
@@ -611,42 +716,33 @@ export class DynamoDBDriver implements IDBDriver {
       primaryKeyValuesList?: Array<Record<string, unknown>>;
     },
   ): string {
-    if (operation === "insert") {
-      const statement = this.buildInsertStatement(table, data.values ?? {});
-      return this.materializePreviewSql(statement.sql, statement.params);
-    }
-    if (operation === "update") {
-      const keyNames = Object.keys(data.primaryKeys ?? {});
-      const keyWhere = this.buildKeyWhereClause(
-        keyNames,
-        data.primaryKeys ?? {},
-      );
-      const entries = Object.entries(data.changes ?? {}).filter(
-        ([, value]) => value !== undefined,
-      );
-      const statement = `UPDATE ${this.quoteIdentifier(table)} ${entries
-        .map(([name]) => `SET ${this.quoteIdentifier(name)} = ?`)
-        .join(" ")} WHERE ${keyWhere?.sql ?? "1 = 1"} RETURNING ALL NEW *`;
-      const params = [
-        ...entries.map(([, value]) => value),
-        ...(keyWhere?.params ?? []),
-      ];
-      return this.materializePreviewSql(statement, params);
-    }
-    return (
-      data.primaryKeyValuesList?.length
-        ? data.primaryKeyValuesList
-        : [data.primaryKeys ?? {}]
-    )
-      .map((criteria) => {
-        const keyNames = Object.keys(criteria);
-        const keyWhere = this.buildKeyWhereClause(keyNames, criteria);
-        return this.materializePreviewSql(
-          `DELETE FROM ${this.quoteIdentifier(table)} WHERE ${keyWhere?.sql ?? "1 = 1"} RETURNING ALL OLD *`,
-          keyWhere?.params,
-        );
-      })
-      .join(";\n");
+    return this.buildMutationPreviewDocuments(operation, table, data)
+      .map((document) => this.formatNativePreviewEnvelope(document))
+      .join("\n\n");
+  }
+
+  async buildMutationPreviewStatements(
+    operation: "insert" | "update" | "delete",
+    _database: string,
+    _schema: string,
+    table: string,
+    data: {
+      primaryKeys?: Record<string, unknown>;
+      changes?: Record<string, unknown>;
+      values?: Record<string, unknown>;
+      primaryKeyValuesList?: Array<Record<string, unknown>>;
+    },
+  ): Promise<string[]> {
+    const keyNames =
+      operation === "insert"
+        ? (await this.getTableSchema(table)).keys
+        : undefined;
+    return this.buildMutationPreviewDocuments(
+      operation,
+      table,
+      data,
+      keyNames,
+    ).map((document) => this.formatNativePreviewEnvelope(document));
   }
 
   async runTransaction(operations: TransactionOperation[]): Promise<void> {
@@ -668,12 +764,12 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   buildPagination(
-    offset: number,
+    _offset: number,
     limit: number,
     _paramIndex: number,
   ): PaginationResult {
     return {
-      sql: offset > 0 ? "LIMIT ?" : "LIMIT ?",
+      sql: "LIMIT ?",
       params: [limit],
     };
   }
@@ -682,7 +778,7 @@ export class DynamoDBDriver implements IDBDriver {
     return "";
   }
 
-  coerceInputValue(value: unknown, _column: ColumnTypeMeta): unknown {
+  coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (value === NULL_SENTINEL) {
       return null;
     }
@@ -694,12 +790,12 @@ export class DynamoDBDriver implements IDBDriver {
     }
 
     const trimmed = value.trim();
-    const nativeType = _column.nativeType.toLowerCase();
+    const nativeType = column.nativeType.toLowerCase();
 
     switch (nativeType) {
       case "null":
         return /^null$/i.test(trimmed) ? null : value;
-      case "boolean": {
+      case "boolean":
         if (/^(true|1)$/i.test(trimmed)) {
           return true;
         }
@@ -707,7 +803,6 @@ export class DynamoDBDriver implements IDBDriver {
           return false;
         }
         return value;
-      }
       case "number": {
         const numeric = Number(trimmed);
         return Number.isFinite(numeric) ? numeric : value;
@@ -729,23 +824,23 @@ export class DynamoDBDriver implements IDBDriver {
         return this.isPlainObject(parsed) ? parsed : value;
       }
       default:
-        if (_column.category === "array") {
+        if (column.category === "array") {
           const parsed = this.parseJsonValue(trimmed);
           return Array.isArray(parsed) ? parsed : value;
         }
-        if (_column.category === "json") {
+        if (column.category === "json") {
           return this.parseJsonValue(trimmed) ?? value;
         }
         return value;
     }
   }
 
-  formatOutputValue(value: unknown, _column: ColumnTypeMeta): unknown {
+  formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (value === null || value === undefined) {
       return null;
     }
 
-    const nativeType = _column.nativeType.toLowerCase();
+    const nativeType = column.nativeType.toLowerCase();
     if (nativeType === "binary") {
       return this.formatBinaryForDisplay(value);
     }
@@ -802,13 +897,13 @@ export class DynamoDBDriver implements IDBDriver {
     const identifier = this.quoteIdentifier(column.name);
     if (operator === "is_null") {
       return {
-        sql: `(${identifier} IS MISSING OR ${identifier} IS NULL)`,
+        sql: `(${identifier} IS NULL OR ${identifier} IS MISSING)`,
         params: [],
       };
     }
     if (operator === "is_not_null") {
       return {
-        sql: `NOT (${identifier} IS MISSING OR ${identifier} IS NULL)`,
+        sql: `${identifier} IS NOT NULL`,
         params: [],
       };
     }
@@ -833,7 +928,7 @@ export class DynamoDBDriver implements IDBDriver {
         return null;
       }
       return {
-        sql: `${identifier} IN [${parts.map(() => "?").join(", ")}]`,
+        sql: `${identifier} IN (${parts.map(() => "?").join(", ")})`,
         params: parts.map((entry) => this.coerceFilterParameter(column, entry)),
       };
     }
@@ -841,10 +936,9 @@ export class DynamoDBDriver implements IDBDriver {
       if (typeof value !== "string") {
         return null;
       }
-      const needle = value.replace(/%/g, "");
       return {
         sql: `contains(${identifier}, ?)`,
-        params: [needle],
+        params: [value.replace(/%/g, "")],
       };
     }
     if (typeof value !== "string") {
@@ -870,7 +964,13 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   buildInsertDefaultValuesSql(qualifiedTableName: string): string {
-    return `INSERT INTO ${qualifiedTableName} VALUE {}`;
+    return this.formatNativePreviewEnvelope({
+      operation: "PutItem",
+      input: {
+        TableName: qualifiedTableName,
+        Item: {},
+      },
+    });
   }
 
   buildInsertValueExpr(_column: ColumnTypeMeta, _paramIndex: number): string {
@@ -881,17 +981,8 @@ export class DynamoDBDriver implements IDBDriver {
     return `${this.quoteIdentifier(column.name)} = ?`;
   }
 
-  materializePreviewSql(sql: string, params?: readonly unknown[]): string {
-    if (!params || params.length === 0) {
-      return sql;
-    }
-
-    let paramIndex = 0;
-    return sql.replace(/\?/g, () => {
-      const value = params[paramIndex];
-      paramIndex += 1;
-      return this.formatPartiqlLiteral(value);
-    });
+  materializePreviewSql(sql: string, _params?: readonly unknown[]): string {
+    return sql;
   }
 
   private requireClient(): DynamoDBClient {
@@ -901,11 +992,15 @@ export class DynamoDBDriver implements IDBDriver {
     return this.client;
   }
 
-  private requireDocumentClient(): DynamoDBDocumentClient {
-    if (!this.documentClient || !this.connected) {
-      throw new Error("DynamoDB document client is not connected.");
+  private invalidateCursorCacheForTable(table: string): void {
+    if (!table) {
+      return;
     }
-    return this.documentClient;
+    for (const key of [...this.cursorCache.keys()]) {
+      if (key.includes(`"table":"${table}"`)) {
+        this.cursorCache.delete(key);
+      }
+    }
   }
 
   private async describeTableDefinition(
@@ -1002,11 +1097,7 @@ export class DynamoDBDriver implements IDBDriver {
     return payload;
   }
 
-  private async getTableSchema(table: string): Promise<{
-    keys: string[];
-    keyRoles: Map<string, PrimaryKeyRole>;
-    attrTypes: Map<string, string>;
-  }> {
+  private async getTableSchema(table: string): Promise<DynamoTableSchema> {
     try {
       const description = await this.requireClient().send(
         new DescribeTableCommand({ TableName: table }),
@@ -1032,93 +1123,1293 @@ export class DynamoDBDriver implements IDBDriver {
           attr.AttributeType ?? "S",
         ]),
       );
-      return { keys, keyRoles, attrTypes };
+      return {
+        keys,
+        keyRoles,
+        attrTypes,
+        partitionKey: keys[0],
+        sortKey: keys[1],
+        secondaryIndexes: [
+          ...this.extractSecondaryIndexes(
+            description.Table?.GlobalSecondaryIndexes ?? [],
+            "global",
+          ),
+          ...this.extractSecondaryIndexes(
+            description.Table?.LocalSecondaryIndexes ?? [],
+            "local",
+          ),
+        ],
+      };
     } catch {
-      return { keys: [], keyRoles: new Map(), attrTypes: new Map() };
+      return {
+        keys: [],
+        keyRoles: new Map(),
+        attrTypes: new Map(),
+        secondaryIndexes: [],
+      };
     }
   }
 
-  private async getTableKeyNames(table: string): Promise<string[]> {
-    return (await this.getTableSchema(table)).keys;
+  private extractSecondaryIndexes(
+    indexes: ReadonlyArray<
+      GlobalSecondaryIndexDescription | LocalSecondaryIndexDescription
+    >,
+    type: "global" | "local",
+  ): DynamoSecondaryIndexSchema[] {
+    return indexes
+      .map((index): DynamoSecondaryIndexSchema | null => {
+        const keyNames = (index.KeySchema ?? [])
+          .map((entry) => entry.AttributeName)
+          .filter((name): name is string => Boolean(name));
+        const partitionKey = keyNames[0];
+        if (!partitionKey || !index.IndexName) {
+          return null;
+        }
+        const sortKey = keyNames[1];
+        return {
+          name: index.IndexName,
+          partitionKey,
+          ...(sortKey ? { sortKey } : {}),
+          type,
+        } satisfies DynamoSecondaryIndexSchema;
+      })
+      .filter((index): index is DynamoSecondaryIndexSchema => index !== null);
   }
 
-  private async executeStatement(
-    statement: string,
-    parameters?: readonly unknown[],
-    options?: { limit?: number; nextToken?: string },
-  ) {
-    return this.requireDocumentClient().send(
-      new ExecuteStatementCommand({
-        Statement: statement,
-        Parameters:
-          parameters && parameters.length > 0 ? [...parameters] : undefined,
-        Limit: options?.limit,
-        NextToken: options?.nextToken,
-      }),
+  private buildReadPlan(
+    request: DriverTablePageRequest,
+    schema: DynamoTableSchema,
+    columns: readonly ColumnTypeMeta[],
+  ): DynamoReadPlan {
+    const indexedFilters = request.filters.map((filter, index) => ({
+      filter,
+      index,
+    }));
+    const columnsByName = new Map(
+      columns.map((column) => [column.name, column]),
+    );
+    const fullPrimaryKey = this.resolveFullPrimaryKeyEquality(
+      indexedFilters,
+      schema.keys,
+      columnsByName,
+    );
+    if (fullPrimaryKey) {
+      return {
+        kind: "getItem",
+        table: request.table,
+        schema,
+        key: fullPrimaryKey,
+        requestSignature: stableStringify({
+          kind: "getItem",
+          table: request.table,
+          key: fullPrimaryKey,
+        }),
+      };
+    }
+
+    const queryCandidates = [
+      {
+        indexName: undefined,
+        partitionKey: schema.partitionKey,
+        sortKey: schema.sortKey,
+      },
+      ...schema.secondaryIndexes.map((index) => ({
+        indexName: index.name,
+        partitionKey: index.partitionKey,
+        sortKey: index.sortKey,
+      })),
+    ];
+
+    for (const candidate of queryCandidates) {
+      const plan = this.buildQueryReadPlan(
+        request.table,
+        schema,
+        candidate.indexName,
+        candidate.partitionKey,
+        candidate.sortKey,
+        indexedFilters,
+        columnsByName,
+      );
+      if (plan) {
+        return plan;
+      }
+    }
+
+    return this.buildScanReadPlan(
+      request.table,
+      schema,
+      indexedFilters,
+      columnsByName,
     );
   }
 
-  private detectPartiqlStatementKind(
-    statement: string,
-  ): "select" | "insert" | "update" | "delete" | null {
-    const match = /^\s*(select|insert|update|delete)\b/i.exec(statement);
-    if (!match) {
+  private resolveFullPrimaryKeyEquality(
+    indexedFilters: readonly IndexedFilter[],
+    keyNames: readonly string[],
+    columnsByName: ReadonlyMap<string, ColumnTypeMeta>,
+  ): Record<string, unknown> | null {
+    if (keyNames.length === 0) {
       return null;
     }
 
-    return match[1].toLowerCase() as "select" | "insert" | "update" | "delete";
+    const key: Record<string, unknown> = {};
+    for (const keyName of keyNames) {
+      const eqFilter = indexedFilters.find(
+        ({ filter }) => filter.column === keyName && filter.operator === "eq",
+      );
+      if (!eqFilter || !("value" in eqFilter.filter)) {
+        return null;
+      }
+      key[keyName] = this.coerceFilterValueForColumn(
+        columnsByName.get(keyName),
+        eqFilter.filter.value,
+      );
+    }
+    return key;
   }
 
-  private async readRows(
+  private buildQueryReadPlan(
+    table: string,
+    schema: DynamoTableSchema,
+    indexName: string | undefined,
+    partitionKey: string | undefined,
+    sortKey: string | undefined,
+    indexedFilters: readonly IndexedFilter[],
+    columnsByName: ReadonlyMap<string, ColumnTypeMeta>,
+  ): QueryReadPlan | null {
+    if (!partitionKey) {
+      return null;
+    }
+
+    const state = this.createExpressionState();
+    const consumed = new Set<number>();
+    const partitionFilter = indexedFilters.find(
+      ({ filter }) =>
+        filter.column === partitionKey && filter.operator === "eq",
+    );
+    if (!partitionFilter || !("value" in partitionFilter.filter)) {
+      return null;
+    }
+    consumed.add(partitionFilter.index);
+
+    const partitionName = this.addNamePlaceholder(state, partitionKey);
+    const partitionValue = this.addValuePlaceholder(
+      state,
+      this.coerceFilterValueForColumn(
+        columnsByName.get(partitionKey),
+        partitionFilter.filter.value,
+      ),
+    );
+    let keyConditionExpression = `${partitionName} = ${partitionValue}`;
+
+    if (sortKey) {
+      const sortCondition = this.buildSortKeyCondition(
+        sortKey,
+        indexedFilters,
+        columnsByName.get(sortKey),
+        state,
+      );
+      if (sortCondition) {
+        keyConditionExpression += ` AND ${sortCondition.expression}`;
+        sortCondition.consumedIndexes.forEach((index) => {
+          consumed.add(index);
+        });
+      }
+    }
+
+    const filterExpression = this.buildNativeFilterExpression(
+      indexedFilters.filter(({ index }) => !consumed.has(index)),
+      columnsByName,
+      state,
+    );
+
+    const baseInput: Omit<QueryCommandInput, "ExclusiveStartKey" | "Limit"> = {
+      TableName: table,
+      KeyConditionExpression: keyConditionExpression,
+      ...(indexName ? { IndexName: indexName } : {}),
+      ...(filterExpression ? { FilterExpression: filterExpression } : {}),
+      ...(Object.keys(state.names).length > 0
+        ? { ExpressionAttributeNames: state.names }
+        : {}),
+      ...(Object.keys(state.values).length > 0
+        ? { ExpressionAttributeValues: state.values }
+        : {}),
+    };
+
+    return {
+      kind: "query",
+      table,
+      schema,
+      baseInput,
+      sortKeyName: sortKey,
+      requestSignature: stableStringify({
+        kind: "query",
+        table,
+        indexName,
+        keyConditionExpression,
+        filterExpression,
+        names: state.names,
+        values: state.values,
+      }),
+    };
+  }
+
+  private buildScanReadPlan(
+    table: string,
+    schema: DynamoTableSchema,
+    indexedFilters: readonly IndexedFilter[],
+    columnsByName: ReadonlyMap<string, ColumnTypeMeta>,
+  ): ScanReadPlan {
+    const state = this.createExpressionState();
+    const filterExpression = this.buildNativeFilterExpression(
+      indexedFilters,
+      columnsByName,
+      state,
+    );
+
+    return {
+      kind: "scan",
+      table,
+      schema,
+      baseInput: {
+        TableName: table,
+        ...(filterExpression ? { FilterExpression: filterExpression } : {}),
+        ...(Object.keys(state.names).length > 0
+          ? { ExpressionAttributeNames: state.names }
+          : {}),
+        ...(Object.keys(state.values).length > 0
+          ? { ExpressionAttributeValues: state.values }
+          : {}),
+      },
+      requestSignature: stableStringify({
+        kind: "scan",
+        table,
+        filterExpression,
+        names: state.names,
+        values: state.values,
+      }),
+    };
+  }
+
+  private buildSortKeyCondition(
+    sortKey: string,
+    indexedFilters: readonly IndexedFilter[],
+    column: ColumnTypeMeta | undefined,
+    state: ExpressionState,
+  ): { expression: string; consumedIndexes: number[] } | null {
+    const keyFilters = indexedFilters.filter(
+      ({ filter }) => filter.column === sortKey,
+    );
+    if (keyFilters.length === 0) {
+      return null;
+    }
+
+    const eqFilter = keyFilters.find(({ filter }) => filter.operator === "eq");
+    if (eqFilter && "value" in eqFilter.filter) {
+      const name = this.addNamePlaceholder(state, sortKey);
+      const value = this.addValuePlaceholder(
+        state,
+        this.coerceFilterValueForColumn(column, eqFilter.filter.value),
+      );
+      return {
+        expression: `${name} = ${value}`,
+        consumedIndexes: [eqFilter.index],
+      };
+    }
+
+    const betweenFilter = keyFilters.find(
+      ({ filter }) => filter.operator === "between",
+    );
+    if (
+      betweenFilter &&
+      "value" in betweenFilter.filter &&
+      Array.isArray(betweenFilter.filter.value)
+    ) {
+      const name = this.addNamePlaceholder(state, sortKey);
+      const [leftRaw, rightRaw] = betweenFilter.filter.value;
+      const left = this.addValuePlaceholder(
+        state,
+        this.coerceFilterValueForColumn(column, leftRaw),
+      );
+      const right = this.addValuePlaceholder(
+        state,
+        this.coerceFilterValueForColumn(column, rightRaw),
+      );
+      return {
+        expression: `${name} BETWEEN ${left} AND ${right}`,
+        consumedIndexes: [betweenFilter.index],
+      };
+    }
+
+    const comparator = keyFilters.find(({ filter }) =>
+      ["gte", "gt", "lte", "lt"].includes(filter.operator),
+    );
+    if (comparator && "value" in comparator.filter) {
+      const name = this.addNamePlaceholder(state, sortKey);
+      const value = this.addValuePlaceholder(
+        state,
+        this.coerceFilterValueForColumn(column, comparator.filter.value),
+      );
+      const operator =
+        comparator.filter.operator === "gte"
+          ? ">="
+          : comparator.filter.operator === "gt"
+            ? ">"
+            : comparator.filter.operator === "lte"
+              ? "<="
+              : "<";
+      return {
+        expression: `${name} ${operator} ${value}`,
+        consumedIndexes: [comparator.index],
+      };
+    }
+
+    return null;
+  }
+
+  private createExpressionState(): ExpressionState {
+    return {
+      names: {},
+      values: {},
+      nameCounter: 0,
+      valueCounter: 0,
+      nameByColumn: new Map(),
+    };
+  }
+
+  private addNamePlaceholder(
+    state: ExpressionState,
+    columnName: string,
+  ): string {
+    const existing = state.nameByColumn.get(columnName);
+    if (existing) {
+      return existing;
+    }
+    const placeholder = `#n${state.nameCounter}`;
+    state.nameCounter += 1;
+    state.nameByColumn.set(columnName, placeholder);
+    state.names[placeholder] = columnName;
+    return placeholder;
+  }
+
+  private addValuePlaceholder(state: ExpressionState, value: unknown): string {
+    const placeholder = `:v${state.valueCounter}`;
+    state.valueCounter += 1;
+    state.values[placeholder] = this.toAttributeValue(value);
+    return placeholder;
+  }
+
+  private buildNativeFilterExpression(
+    indexedFilters: readonly IndexedFilter[],
+    columnsByName: ReadonlyMap<string, ColumnTypeMeta>,
+    state: ExpressionState,
+  ): string | undefined {
+    const parts = indexedFilters.flatMap(({ filter }) => {
+      const column = columnsByName.get(filter.column);
+      if (this.requiresClientSideFilter(filter, column)) {
+        return [];
+      }
+      const expression = this.buildNativeFilterExpressionPart(
+        filter,
+        column,
+        state,
+      );
+      return expression ? [expression] : [];
+    });
+    return parts.length > 0 ? parts.join(" AND ") : undefined;
+  }
+
+  private buildNativeFilterExpressionPart(
+    filter: FilterExpression,
+    column: ColumnTypeMeta | undefined,
+    state: ExpressionState,
+  ): string | null {
+    const name = this.addNamePlaceholder(state, filter.column);
+    switch (filter.operator) {
+      case "is_null": {
+        const nullType = this.addValuePlaceholder(state, "NULL");
+        return `(attribute_not_exists(${name}) OR attribute_type(${name}, ${nullType}))`;
+      }
+      case "is_not_null": {
+        const nullType = this.addValuePlaceholder(state, "NULL");
+        return `(attribute_exists(${name}) AND NOT attribute_type(${name}, ${nullType}))`;
+      }
+      case "between": {
+        if (!("value" in filter) || !Array.isArray(filter.value)) {
+          return null;
+        }
+        const left = this.addValuePlaceholder(
+          state,
+          this.coerceFilterValueForColumn(column, filter.value[0]),
+        );
+        const right = this.addValuePlaceholder(
+          state,
+          this.coerceFilterValueForColumn(column, filter.value[1]),
+        );
+        return `${name} BETWEEN ${left} AND ${right}`;
+      }
+      case "in": {
+        if (!("value" in filter) || typeof filter.value !== "string") {
+          return null;
+        }
+        const values = this.splitFilterList(filter.value);
+        if (values.length === 0) {
+          return null;
+        }
+        const placeholders = values.map((entry) =>
+          this.addValuePlaceholder(
+            state,
+            this.coerceFilterValueForColumn(column, entry),
+          ),
+        );
+        return `${name} IN (${placeholders.join(", ")})`;
+      }
+      case "like":
+      case "ilike": {
+        if (!("value" in filter) || typeof filter.value !== "string") {
+          return null;
+        }
+        const value = this.addValuePlaceholder(
+          state,
+          filter.value.replace(/%/g, ""),
+        );
+        return `contains(${name}, ${value})`;
+      }
+      case "eq":
+      case "neq":
+      case "gt":
+      case "gte":
+      case "lt":
+      case "lte": {
+        if (!("value" in filter)) {
+          return null;
+        }
+        const value = this.addValuePlaceholder(
+          state,
+          this.coerceFilterValueForColumn(column, filter.value),
+        );
+        const operator =
+          filter.operator === "eq"
+            ? "="
+            : filter.operator === "neq"
+              ? "<>"
+              : filter.operator === "gt"
+                ? ">"
+                : filter.operator === "gte"
+                  ? ">="
+                  : filter.operator === "lt"
+                    ? "<"
+                    : "<=";
+        return `${name} ${operator} ${value}`;
+      }
+      default:
+        return null;
+    }
+  }
+
+  private supportsServerSort(
+    plan: DynamoReadPlan,
+    sort: DriverSortConfig,
+  ): boolean {
+    return plan.kind === "query" && plan.sortKeyName === sort.column;
+  }
+
+  private requiresClientSideFiltering(
+    filters: readonly FilterExpression[],
+    columns: readonly ColumnTypeMeta[],
+  ): boolean {
+    if (filters.length === 0) {
+      return false;
+    }
+    const columnsByName = new Map(
+      columns.map((column) => [column.name, column]),
+    );
+    return filters.some((filter) =>
+      this.requiresClientSideFilter(filter, columnsByName.get(filter.column)),
+    );
+  }
+
+  private requiresClientSideFilter(
+    filter: FilterExpression,
+    column: ColumnTypeMeta | undefined,
+  ): boolean {
+    if (!column) {
+      return false;
+    }
+    if (filter.operator === "ilike") {
+      return true;
+    }
+    const nativeType = column.nativeType.toLowerCase();
+    return (
+      column.category === "json" ||
+      column.category === "array" ||
+      column.category === "binary" ||
+      nativeType === "map" ||
+      nativeType === "list" ||
+      nativeType.endsWith(" set")
+    );
+  }
+
+  private async readCursorBackedPage(
+    plan: DynamoReadPlan,
+    page: number,
+    pageSize: number,
+    sort: DriverSortConfig | null,
+  ): Promise<{ rows: Record<string, unknown>[] }> {
+    if (plan.kind === "getItem") {
+      const response = await this.requireClient().send(
+        new GetItemCommand({
+          TableName: plan.table,
+          Key: this.marshallKey(plan.key),
+        }),
+      );
+      return {
+        rows: response.Item ? [unmarshall(response.Item)] : [],
+      };
+    }
+
+    const cacheKey = `${plan.requestSignature}::${pageSize}`;
+    const session = this.getCursorSession(cacheKey);
+    if (session.terminalPage !== null && page >= session.terminalPage) {
+      return { rows: [] };
+    }
+
+    let currentPage = 1;
+    let cursor = session.pageStarts.get(1);
+    for (const candidatePage of [...session.pageStarts.keys()].sort(
+      (a, b) => a - b,
+    )) {
+      if (candidatePage <= page) {
+        currentPage = candidatePage;
+        cursor = session.pageStarts.get(candidatePage);
+      }
+    }
+
+    while (currentPage <= page) {
+      const step = await this.executeReadPlanStep(plan, cursor, pageSize, sort);
+      const nextPage = currentPage + 1;
+      if (step.nextCursor === undefined) {
+        session.terminalPage = step.rows.length === 0 ? currentPage : nextPage;
+      } else {
+        session.pageStarts.set(nextPage, step.nextCursor);
+      }
+
+      if (currentPage === page) {
+        return { rows: step.rows };
+      }
+      if (step.nextCursor === undefined) {
+        return { rows: [] };
+      }
+
+      cursor = step.nextCursor;
+      currentPage = nextPage;
+    }
+
+    return { rows: [] };
+  }
+
+  private getCursorSession(cacheKey: string): DynamoCursorSession {
+    const existing = this.cursorCache.get(cacheKey);
+    if (existing) {
+      return existing;
+    }
+    const session: DynamoCursorSession = {
+      pageStarts: new Map([[1, undefined]]),
+      terminalPage: null,
+    };
+    this.cursorCache.set(cacheKey, session);
+    return session;
+  }
+
+  private async executeReadPlanStep(
+    plan: QueryReadPlan | ScanReadPlan,
+    cursor: Record<string, AttributeValue> | undefined,
+    pageSize: number,
+    sort: DriverSortConfig | null,
+  ): Promise<ReadStepResult> {
+    if (plan.kind === "query") {
+      const input: QueryCommandInput = {
+        ...plan.baseInput,
+        Limit: pageSize,
+        ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+      };
+      if (sort && plan.sortKeyName === sort.column) {
+        input.ScanIndexForward = sort.direction !== "desc";
+      }
+      const response = await this.requireClient().send(new QueryCommand(input));
+      return {
+        rows: (response.Items ?? []).map((item) => unmarshall(item)),
+        nextCursor: response.LastEvaluatedKey,
+      };
+    }
+
+    const input: ScanCommandInput = {
+      ...plan.baseInput,
+      Limit: pageSize,
+      ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+    };
+    const response = await this.requireClient().send(new ScanCommand(input));
+    return {
+      rows: (response.Items ?? []).map((item) => unmarshall(item)),
+      nextCursor: response.LastEvaluatedKey,
+    };
+  }
+
+  private async countReadPlan(plan: DynamoReadPlan): Promise<number> {
+    if (plan.kind === "getItem") {
+      const response = await this.requireClient().send(
+        new GetItemCommand({
+          TableName: plan.table,
+          Key: this.marshallKey(plan.key),
+        }),
+      );
+      return response.Item ? 1 : 0;
+    }
+
+    const cacheKey = `${plan.requestSignature}::count`;
+    const session = this.getCursorSession(cacheKey);
+    if (session.totalCount !== undefined) {
+      return session.totalCount;
+    }
+
+    let totalCount = 0;
+    let cursor: Record<string, AttributeValue> | undefined;
+    do {
+      if (plan.kind === "query") {
+        const response = await this.requireClient().send(
+          new QueryCommand({
+            ...plan.baseInput,
+            Select: "COUNT",
+            ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+          }),
+        );
+        totalCount += response.Count ?? 0;
+        cursor = response.LastEvaluatedKey;
+      } else {
+        const response = await this.requireClient().send(
+          new ScanCommand({
+            ...plan.baseInput,
+            Select: "COUNT",
+            ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+          }),
+        );
+        totalCount += response.Count ?? 0;
+        cursor = response.LastEvaluatedKey;
+      }
+    } while (cursor !== undefined);
+
+    session.totalCount = totalCount;
+    return totalCount;
+  }
+
+  private async materializeReadPlanRows(
+    plan: DynamoReadPlan,
+    maxRows: number,
+  ): Promise<MaterializedReadResult> {
+    if (plan.kind === "getItem") {
+      const response = await this.requireClient().send(
+        new GetItemCommand({
+          TableName: plan.table,
+          Key: this.marshallKey(plan.key),
+        }),
+      );
+      return {
+        rows: response.Item ? [unmarshall(response.Item)] : [],
+        truncated: false,
+      };
+    }
+
+    const rows: Record<string, unknown>[] = [];
+    let cursor: Record<string, AttributeValue> | undefined;
+    let truncated = false;
+    do {
+      const step = await this.executeReadPlanStep(
+        plan,
+        cursor,
+        Math.min(maxRows - rows.length, DYNAMODB_CURSOR_FETCH_LIMIT),
+        null,
+      );
+      rows.push(...step.rows);
+      cursor = step.nextCursor;
+      if (rows.length >= maxRows && cursor !== undefined) {
+        truncated = true;
+        break;
+      }
+    } while (cursor !== undefined && rows.length < maxRows);
+
+    return { rows, truncated };
+  }
+
+  private buildPutItemInput(
+    table: string,
+    keyNames: readonly string[],
+    values: Record<string, unknown>,
+  ): PutItemCommandInput {
+    return {
+      TableName: table,
+      Item: this.marshallItem(values),
+      ConditionExpression: this.buildMissingItemConditionExpression(keyNames),
+    };
+  }
+
+  private buildUpdateItemInput(
+    table: string,
+    keyNames: readonly string[],
+    update: DriverUpdateRowsRequest["updates"][number],
+  ): UpdateItemCommandInput | null {
+    const key = this.extractCompleteKey(keyNames, update.primaryKeys);
+    const entries = Object.entries(update.changes).filter(
+      ([name, value]) => !keyNames.includes(name) && value !== undefined,
+    );
+    for (const keyName of keyNames) {
+      if (
+        Object.hasOwn(update.changes, keyName) &&
+        update.changes[keyName] !== update.primaryKeys[keyName]
+      ) {
+        throw new Error(
+          `DynamoDB does not support updating key attribute '${keyName}'.`,
+        );
+      }
+    }
+    if (!key || entries.length === 0) {
+      return null;
+    }
+
+    const names: Record<string, string> = {};
+    const values: Record<string, AttributeValue> = {};
+    const assignments = entries.map(([name, value], index) => {
+      const namePlaceholder = `#u${index}`;
+      const valuePlaceholder = `:u${index}`;
+      names[namePlaceholder] = name;
+      values[valuePlaceholder] = this.toAttributeValue(value);
+      return `${namePlaceholder} = ${valuePlaceholder}`;
+    });
+
+    return {
+      TableName: table,
+      Key: this.marshallKey(key),
+      UpdateExpression: `SET ${assignments.join(", ")}`,
+      ConditionExpression: this.buildExistingItemConditionExpression(keyNames),
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
+      ReturnValues: "ALL_NEW",
+    };
+  }
+
+  private buildDeleteItemInput(
+    table: string,
+    keyNames: readonly string[],
+    criteria: Record<string, unknown>,
+  ): DeleteItemCommandInput {
+    const key = this.extractCompleteKey(keyNames, criteria);
+    if (!key) {
+      throw new Error("DynamoDB delete requires the full primary key.");
+    }
+    return {
+      TableName: table,
+      Key: this.marshallKey(key),
+      ConditionExpression: this.buildExistingItemConditionExpression(keyNames),
+      ReturnValues: "ALL_OLD",
+    };
+  }
+
+  private extractCompleteKey(
+    keyNames: readonly string[],
+    source: Record<string, unknown>,
+  ): Record<string, unknown> | null {
+    if (keyNames.length === 0) {
+      return null;
+    }
+    const key: Record<string, unknown> = {};
+    for (const keyName of keyNames) {
+      if (source[keyName] === undefined) {
+        return null;
+      }
+      key[keyName] = source[keyName];
+    }
+    return key;
+  }
+
+  private buildExistingItemConditionExpression(
+    keyNames: readonly string[],
+  ): string {
+    return keyNames
+      .map((keyName) => `attribute_exists(${keyName})`)
+      .join(" AND ");
+  }
+
+  private buildMissingItemConditionExpression(
+    keyNames: readonly string[],
+  ): string {
+    return keyNames
+      .map((keyName) => `attribute_not_exists(${keyName})`)
+      .join(" AND ");
+  }
+
+  private marshallItem(
+    item: Record<string, unknown>,
+  ): Record<string, AttributeValue> {
+    return marshall(item, { removeUndefinedValues: true });
+  }
+
+  private marshallKey(
+    key: Record<string, unknown>,
+  ): Record<string, AttributeValue> {
+    return marshall(key, { removeUndefinedValues: true });
+  }
+
+  private toAttributeValue(value: unknown): AttributeValue {
+    return marshall({ value }, { removeUndefinedValues: true })
+      .value as AttributeValue;
+  }
+
+  private async dispatchNativeCommand(
+    operation: DynamoDbNativeOperationName,
+    rawInput: Record<string, unknown>,
+  ): Promise<QueryDispatchResult> {
+    const input = this.requireInputRecord(rawInput);
+    switch (operation) {
+      case "GetItem": {
+        const output = await this.requireClient().send(
+          new GetItemCommand(input as unknown as GetItemCommandInput),
+        );
+        return this.toQueryDispatchResult(operation, output);
+      }
+      case "Query": {
+        const output = await this.requireClient().send(
+          new QueryCommand(input as unknown as QueryCommandInput),
+        );
+        return this.toQueryDispatchResult(operation, output);
+      }
+      case "Scan": {
+        const output = await this.requireClient().send(
+          new ScanCommand(input as unknown as ScanCommandInput),
+        );
+        return this.toQueryDispatchResult(operation, output);
+      }
+      case "PutItem": {
+        const output = await this.requireClient().send(
+          new PutItemCommand(input as unknown as PutItemCommandInput),
+        );
+        this.invalidateCursorCacheForTable(String(input.TableName ?? ""));
+        return this.toQueryDispatchResult(operation, output, input);
+      }
+      case "UpdateItem": {
+        const output = await this.requireClient().send(
+          new UpdateItemCommand(input as unknown as UpdateItemCommandInput),
+        );
+        this.invalidateCursorCacheForTable(String(input.TableName ?? ""));
+        return this.toQueryDispatchResult(operation, output, input);
+      }
+      case "DeleteItem": {
+        const output = await this.requireClient().send(
+          new DeleteItemCommand(input as unknown as DeleteItemCommandInput),
+        );
+        this.invalidateCursorCacheForTable(String(input.TableName ?? ""));
+        return this.toQueryDispatchResult(operation, output, input);
+      }
+      case "BatchGetItem": {
+        const output = await this.requireClient().send(
+          new BatchGetItemCommand(input as unknown as BatchGetItemCommandInput),
+        );
+        return this.toQueryDispatchResult(operation, output);
+      }
+      case "BatchWriteItem": {
+        const output = await this.requireClient().send(
+          new BatchWriteItemCommand(
+            input as unknown as BatchWriteItemCommandInput,
+          ),
+        );
+        this.invalidateAllTablesInRequest(input);
+        return this.toQueryDispatchResult(operation, output, input);
+      }
+      case "TransactGetItems": {
+        const output = await this.requireClient().send(
+          new TransactGetItemsCommand(
+            input as unknown as TransactGetItemsCommandInput,
+          ),
+        );
+        return this.toQueryDispatchResult(operation, output);
+      }
+      case "TransactWriteItems": {
+        const output = await this.requireClient().send(
+          new TransactWriteItemsCommand(
+            input as unknown as TransactWriteItemsCommandInput,
+          ),
+        );
+        this.invalidateTablesInTransaction(input);
+        return this.toQueryDispatchResult(operation, output, input);
+      }
+      default:
+        throw new Error(`Unsupported DynamoDB native operation: ${operation}`);
+    }
+  }
+
+  private invalidateAllTablesInRequest(input: Record<string, unknown>): void {
+    if (!isRecord(input.RequestItems)) {
+      return;
+    }
+    for (const tableName of Object.keys(input.RequestItems)) {
+      this.invalidateCursorCacheForTable(tableName);
+    }
+  }
+
+  private invalidateTablesInTransaction(input: Record<string, unknown>): void {
+    const transactItems = Array.isArray(input.TransactItems)
+      ? input.TransactItems
+      : [];
+    for (const transactItem of transactItems) {
+      if (!isRecord(transactItem)) {
+        continue;
+      }
+      for (const value of Object.values(transactItem)) {
+        if (isRecord(value) && typeof value.TableName === "string") {
+          this.invalidateCursorCacheForTable(value.TableName);
+        }
+      }
+    }
+  }
+
+  private requireInputRecord(input: unknown): Record<string, unknown> {
+    if (input === undefined) {
+      return {};
+    }
+    if (!isRecord(input)) {
+      throw new Error("DynamoDB native command input must be a JSON object.");
+    }
+    return this.normalizeNativeInputValue(input) as Record<string, unknown>;
+  }
+
+  private resolveNativeOperation(
+    inputs: readonly Record<string, unknown>[],
+  ): DynamoDbNativeOperationName {
+    const inferredOperations = new Set<DynamoDbNativeOperationName>();
+    for (const input of inputs) {
+      const inferred = inferDynamoDbNativeOperationName(input);
+      if (inferred) {
+        inferredOperations.add(inferred);
+      }
+    }
+
+    if (inferredOperations.size > 1) {
+      throw new Error(
+        "DynamoDB native query text contains request bodies for multiple different actions. Split them by action or run them separately.",
+      );
+    }
+
+    const inferredOperation = inferredOperations.values().next().value as
+      | DynamoDbNativeOperationName
+      | undefined;
+
+    if (inferredOperation) {
+      return inferredOperation;
+    }
+
+    throw new Error(
+      "DynamoDB request type could not be determined from the JSON body. Use an unambiguous AWS request shape.",
+    );
+  }
+
+  private normalizeNativeInputValue(value: unknown): unknown {
+    if (Array.isArray(value)) {
+      return value.map((entry) => this.normalizeNativeInputValue(entry));
+    }
+    if (!isRecord(value)) {
+      return value;
+    }
+    const attributeValue = this.normalizeAttributeValueEnvelope(value);
+    if (attributeValue !== null) {
+      return attributeValue;
+    }
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [
+        key,
+        this.normalizeNativeInputValue(entry),
+      ]),
+    );
+  }
+
+  private normalizeAttributeValueEnvelope(
+    value: Record<string, unknown>,
+  ): AttributeValue | null {
+    const keys = Object.keys(value);
+    if (keys.length !== 1) {
+      return null;
+    }
+
+    const [key] = keys;
+    switch (key) {
+      case "B": {
+        if (typeof value.B !== "string") {
+          return null;
+        }
+        return { B: this.parseBinaryInput(value.B) ?? Buffer.from(value.B) };
+      }
+      case "BS": {
+        if (!Array.isArray(value.BS)) {
+          return null;
+        }
+        return {
+          BS: value.BS.map((entry) => {
+            if (typeof entry !== "string") {
+              return Buffer.from(String(entry));
+            }
+            return this.parseBinaryInput(entry) ?? Buffer.from(entry);
+          }),
+        };
+      }
+      case "L": {
+        if (!Array.isArray(value.L)) {
+          return null;
+        }
+        return {
+          L: value.L.map(
+            (entry) => this.normalizeNativeInputValue(entry) as AttributeValue,
+          ),
+        };
+      }
+      case "M": {
+        if (!isRecord(value.M)) {
+          return null;
+        }
+        return {
+          M: Object.fromEntries(
+            Object.entries(value.M).map(([entryKey, entryValue]) => [
+              entryKey,
+              this.normalizeNativeInputValue(entryValue) as AttributeValue,
+            ]),
+          ),
+        };
+      }
+      case "S":
+      case "N":
+      case "BOOL":
+      case "NULL":
+      case "SS":
+      case "NS":
+        return value as unknown as AttributeValue;
+      default:
+        return null;
+    }
+  }
+
+  private toQueryDispatchResult(
+    operation: DynamoDbNativeOperationName,
+    output:
+      | GetItemCommandOutput
+      | QueryCommandOutput
+      | ScanCommandOutput
+      | PutItemCommandOutput
+      | UpdateItemCommandOutput
+      | DeleteItemCommandOutput
+      | BatchGetItemCommandOutput
+      | TransactGetItemsCommandOutput
+      | Record<string, unknown>,
+    input?: Record<string, unknown>,
+  ): QueryDispatchResult {
+    switch (operation) {
+      case "GetItem": {
+        const typedOutput = output as GetItemCommandOutput;
+        return {
+          rows: typedOutput.Item ? [unmarshall(typedOutput.Item)] : [],
+        };
+      }
+      case "Query": {
+        const typedOutput = output as QueryCommandOutput;
+        return {
+          rows: (typedOutput.Items ?? []).map(
+            (item: Record<string, AttributeValue>) => unmarshall(item),
+          ),
+        };
+      }
+      case "Scan": {
+        const typedOutput = output as ScanCommandOutput;
+        return {
+          rows: (typedOutput.Items ?? []).map(
+            (item: Record<string, AttributeValue>) => unmarshall(item),
+          ),
+        };
+      }
+      case "BatchGetItem": {
+        const typedOutput = output as BatchGetItemCommandOutput;
+        const responses = isRecord(typedOutput.Responses)
+          ? typedOutput.Responses
+          : {};
+        const tableNames = Object.keys(responses);
+        return {
+          rows: tableNames.flatMap((tableName) => {
+            const items = Array.isArray(responses[tableName])
+              ? (responses[tableName] as Array<Record<string, AttributeValue>>)
+              : [];
+            return items.map((item) => {
+              const row = unmarshall(item);
+              return tableNames.length > 1
+                ? { __tableName: tableName, ...row }
+                : row;
+            });
+          }),
+        };
+      }
+      case "TransactGetItems": {
+        const typedOutput = output as TransactGetItemsCommandOutput;
+        const responses = Array.isArray(typedOutput.Responses)
+          ? typedOutput.Responses
+          : [];
+        return {
+          rows: responses.flatMap(
+            (response: { Item?: Record<string, AttributeValue> }) =>
+              response.Item ? [unmarshall(response.Item)] : [],
+          ),
+        };
+      }
+      case "PutItem":
+      case "UpdateItem":
+      case "DeleteItem": {
+        const typedOutput = output as
+          | PutItemCommandOutput
+          | UpdateItemCommandOutput
+          | DeleteItemCommandOutput;
+        return {
+          rows: typedOutput.Attributes
+            ? [unmarshall(typedOutput.Attributes)]
+            : [],
+          affectedRows: 1,
+        };
+      }
+      case "BatchWriteItem": {
+        const typedOutput = output as BatchWriteItemCommandOutput;
+        const requestedCount = this.countBatchWriteRequests(
+          input?.RequestItems,
+        );
+        const unprocessedCount = this.countBatchWriteRequests(
+          typedOutput.UnprocessedItems,
+        );
+        return {
+          rows: [],
+          affectedRows: Math.max(0, requestedCount - unprocessedCount),
+        };
+      }
+      case "TransactWriteItems":
+        return {
+          rows: [],
+          affectedRows: Array.isArray(input?.TransactItems)
+            ? input.TransactItems.length
+            : 0,
+        };
+      default:
+        return { rows: [] };
+    }
+  }
+
+  private buildMutationPreviewDocuments(
+    operation: "insert" | "update" | "delete",
+    table: string,
+    data: {
+      primaryKeys?: Record<string, unknown>;
+      changes?: Record<string, unknown>;
+      values?: Record<string, unknown>;
+      primaryKeyValuesList?: Array<Record<string, unknown>>;
+    },
+    keyNames?: readonly string[],
+  ): Record<string, unknown>[] {
+    if (operation === "insert") {
+      return [
+        this.buildPutItemInput(
+          table,
+          keyNames ?? Object.keys(data.values ?? {}),
+          data.values ?? {},
+        ) as unknown as Record<string, unknown>,
+      ];
+    }
+
+    if (operation === "update") {
+      const input = this.buildUpdateItemInput(
+        table,
+        Object.keys(data.primaryKeys ?? {}),
+        {
+          primaryKeys: data.primaryKeys ?? {},
+          changes: data.changes ?? {},
+        },
+      );
+      return input ? [input as unknown as Record<string, unknown>] : [];
+    }
+
+    const criteriaList =
+      data.primaryKeyValuesList && data.primaryKeyValuesList.length > 0
+        ? data.primaryKeyValuesList
+        : [data.primaryKeys ?? {}];
+    return criteriaList.map(
+      (criteria) =>
+        this.buildDeleteItemInput(
+          table,
+          Object.keys(criteria),
+          criteria,
+        ) as unknown as Record<string, unknown>,
+    );
+  }
+
+  private formatNativePreviewEnvelope(
+    document: Record<string, unknown>,
+  ): string {
+    return JSON.stringify(this.serializeNativePreviewValue(document), null, 2);
+  }
+
+  private countBatchWriteRequests(requestItems: unknown): number {
+    if (!isRecord(requestItems)) {
+      return 0;
+    }
+
+    return Object.values(requestItems).reduce<number>(
+      (total, value) => total + (Array.isArray(value) ? value.length : 0),
+      0,
+    );
+  }
+
+  private serializeNativePreviewValue(value: unknown): unknown {
+    if (value === null || value === undefined) {
+      return value;
+    }
+    if (this.isBinaryValue(value)) {
+      const buffer = this.toBinaryBuffer(value);
+      return buffer ? buffer.toString("base64") : value;
+    }
+    if (Array.isArray(value)) {
+      return value.map((entry) => this.serializeNativePreviewValue(entry));
+    }
+    if (value instanceof Set) {
+      return [...value].map((entry) => this.serializeNativePreviewValue(entry));
+    }
+    if (this.isPlainObject(value)) {
+      return Object.fromEntries(
+        Object.entries(value).map(([key, entry]) => [
+          key,
+          this.serializeNativePreviewValue(entry),
+        ]),
+      );
+    }
+    return value;
+  }
+
+  private async readRowsForDescription(
     table: string,
     limit: number,
-    options?: {
-      filters?: readonly FilterExpression[];
-      columns?: readonly ColumnTypeMeta[];
-      sort?: DriverSortConfig | null;
-    },
   ): Promise<Record<string, unknown>[]> {
-    try {
-      const serverFilter = this.buildServerFilterClause(
-        options?.filters ?? [],
-        options?.columns ?? [],
-      );
-      const serverSort = await this.buildServerSortClause(
+    const result = await this.materializeReadPlanRows(
+      {
+        kind: "scan",
         table,
-        options?.sort ?? null,
-      );
-      const statement = [
-        `SELECT * FROM ${this.quoteIdentifier(table)}`,
-        serverFilter.clause,
-        serverSort,
-      ]
-        .filter(Boolean)
-        .join(" ");
-      const rows: Record<string, unknown>[] = [];
-      let nextToken: string | undefined;
-
-      do {
-        const remaining = limit - rows.length;
-        if (remaining <= 0) {
-          break;
-        }
-
-        const result = await this.executeStatement(
-          statement,
-          serverFilter.params,
-          {
-            limit: Math.min(remaining, DYNAMODB_READ_BATCH_SIZE),
-            nextToken,
-          },
-        );
-        rows.push(...((result.Items ?? []) as Record<string, unknown>[]));
-        nextToken = result.NextToken;
-      } while (nextToken);
-
-      return rows;
-    } catch {
-      return [];
-    }
+        schema: {
+          keys: [],
+          keyRoles: new Map(),
+          attrTypes: new Map(),
+          secondaryIndexes: [],
+        },
+        baseInput: { TableName: table },
+        requestSignature: stableStringify({ kind: "scan", table }),
+      },
+      limit,
+    );
+    return result.rows;
   }
 
   private mapRowToQueryRow(
@@ -1141,72 +2432,35 @@ export class DynamoDBDriver implements IDBDriver {
     );
   }
 
-  private isDuplicateItemError(error: unknown): boolean {
-    return (
-      typeof error === "object" &&
-      error !== null &&
-      "name" in error &&
-      (error as { name?: unknown }).name === "DuplicateItemException"
+  private mergeDescribedColumns(
+    sourceColumns: readonly ColumnTypeMeta[],
+    describedColumns: readonly ColumnTypeMeta[],
+    schema: DynamoTableSchema,
+  ): ColumnTypeMeta[] {
+    const describedByName = new Map(
+      describedColumns.map((column) => [column.name, column]),
     );
-  }
-
-  private buildServerFilterClause(
-    filters: readonly FilterExpression[],
-    columns: readonly ColumnTypeMeta[],
-  ): { clause: string; params: unknown[] } {
-    if (filters.length === 0 || columns.length === 0) {
-      return { clause: "", params: [] };
-    }
-
-    const columnMap = new Map(columns.map((column) => [column.name, column]));
-    const conditions: string[] = [];
-    const params: unknown[] = [];
-
-    for (const filter of filters) {
-      const column = columnMap.get(filter.column);
-      if (!column) {
-        continue;
-      }
-      if (!this.supportsServerFilter(column, filter.operator)) {
-        continue;
-      }
-
-      const normalizedValue = this.normalizeFilterValue(
-        column,
-        filter.operator,
-        "value" in filter ? filter.value : undefined,
-      );
-      const condition = this.buildFilterCondition(
-        column,
-        filter.operator,
-        normalizedValue,
-        params.length + 1,
-      );
-      if (!condition) {
-        continue;
-      }
-
-      conditions.push(condition.sql);
-      params.push(...condition.params);
-    }
-
-    if (conditions.length === 0) {
-      return { clause: "", params: [] };
-    }
-
-    return {
-      clause: `WHERE ${conditions.join(" AND ")}`,
-      params,
-    };
-  }
-
-  private async buildServerSortClause(
-    _table: string,
-    _sort: DriverSortConfig | null,
-  ): Promise<string> {
-    // DynamoDB PartiQL does not support ORDER BY for table reads.
-    // Read the rows first and apply sorting client-side below in readTablePage().
-    return "";
+    return sourceColumns.map((column) => ({
+      ...column,
+      type: describedByName.get(column.name)?.type ?? column.type,
+      nativeType:
+        describedByName.get(column.name)?.nativeType ?? column.nativeType,
+      category: describedByName.get(column.name)?.category ?? column.category,
+      nullable: describedByName.get(column.name)?.nullable ?? column.nullable,
+      filterable:
+        describedByName.get(column.name)?.filterable ?? column.filterable,
+      filterOperators:
+        describedByName.get(column.name)?.filterOperators ??
+        column.filterOperators,
+      valueSemantics:
+        describedByName.get(column.name)?.valueSemantics ??
+        column.valueSemantics,
+      isPrimaryKey: schema.keys.includes(column.name),
+      primaryKeyOrdinal: schema.keys.includes(column.name)
+        ? schema.keys.indexOf(column.name) + 1
+        : undefined,
+      primaryKeyRole: schema.keyRoles.get(column.name),
+    }));
   }
 
   private splitFilterList(value: string): string[] {
@@ -1216,41 +2470,27 @@ export class DynamoDBDriver implements IDBDriver {
       .filter((entry) => entry.length > 0);
   }
 
-  private supportsServerFilter(
-    column: ColumnTypeMeta,
-    operator: FilterOperator,
-  ): boolean {
-    if (operator === "is_null" || operator === "is_not_null") {
-      return true;
+  private coerceFilterValueForColumn(
+    column: ColumnTypeMeta | undefined,
+    rawValue: string | [string, string] | undefined,
+  ): unknown {
+    if (rawValue === undefined) {
+      return undefined;
     }
-
-    const nativeType = column.nativeType.toLowerCase();
-    if (
-      operator === "like" ||
-      operator === "ilike" ||
-      operator === "eq" ||
-      operator === "neq" ||
-      operator === "in"
-    ) {
-      if (
-        nativeType === "map" ||
-        nativeType === "list" ||
-        nativeType.endsWith(" set") ||
-        column.category === "json" ||
-        column.category === "array"
-      ) {
-        return false;
-      }
+    if (Array.isArray(rawValue)) {
+      return rawValue.map((entry) => this.coerceFilterParameter(column, entry));
     }
-
-    return true;
+    return this.coerceFilterParameter(column, rawValue);
   }
 
   private coerceFilterParameter(
-    column: ColumnTypeMeta,
+    column: ColumnTypeMeta | undefined,
     rawValue: string,
   ): unknown {
     const value = rawValue.trim();
+    if (!column) {
+      return value;
+    }
     if (
       column.category === "integer" ||
       column.category === "float" ||
@@ -1277,52 +2517,9 @@ export class DynamoDBDriver implements IDBDriver {
     return value;
   }
 
-  private buildInsertStatement(
-    table: string,
-    values: Record<string, unknown>,
-  ): TransactionOperation {
-    const entries = Object.entries(values).filter(
-      ([, value]) => value !== undefined,
-    );
-    const sql = `INSERT INTO ${this.quoteIdentifier(table)} VALUE {${entries
-      .map(([name]) => `${this.quoteItemKey(name)}: ?`)
-      .join(", ")}}`;
-    return {
-      sql,
-      params: entries.map(([, value]) => value),
-    };
-  }
-
-  private buildKeyWhereClause(
-    keyNames: readonly string[],
-    criteria: Record<string, unknown>,
-  ): { sql: string; params: unknown[] } | null {
-    if (
-      keyNames.length === 0 ||
-      keyNames.some((name) => criteria[name] === undefined)
-    ) {
-      return null;
-    }
-
-    return {
-      sql: keyNames
-        .map((name) => `${this.quoteIdentifier(name)} = ?`)
-        .join(" AND "),
-      params: keyNames.map((name) => criteria[name]),
-    };
-  }
-
-  private quoteItemKey(name: string): string {
-    return `'${name.replace(/'/g, "''")}'`;
-  }
-
   private buildDynamoColumns(
     rows: readonly Record<string, unknown>[],
-    schema: {
-      keys: string[];
-      keyRoles: Map<string, PrimaryKeyRole>;
-      attrTypes: Map<string, string>;
-    },
+    schema: DynamoTableSchema,
   ): ColumnTypeMeta[] {
     const columnNames = new Set<string>(schema.attrTypes.keys());
     for (const row of rows) {
@@ -1339,7 +2536,6 @@ export class DynamoDBDriver implements IDBDriver {
       .sort((left, right) => {
         const leftKeyOrder = keyOrder.get(left);
         const rightKeyOrder = keyOrder.get(right);
-
         if (leftKeyOrder !== undefined || rightKeyOrder !== undefined) {
           if (leftKeyOrder === undefined) {
             return 1;
@@ -1349,7 +2545,6 @@ export class DynamoDBDriver implements IDBDriver {
           }
           return leftKeyOrder - rightKeyOrder;
         }
-
         return left.localeCompare(right);
       })
       .map((name) => {
@@ -1520,9 +2715,8 @@ export class DynamoDBDriver implements IDBDriver {
       };
     }
     if (value instanceof Set) {
-      const nativeType = this.describeSetType(value);
       return {
-        nativeType,
+        nativeType: this.describeSetType(value),
         category: "array",
         valueSemantics: "plain",
       };
@@ -1652,7 +2846,7 @@ export class DynamoDBDriver implements IDBDriver {
 
   private formatSetEntryForDisplay(value: unknown): string {
     if (typeof value === "string") {
-      return this.quoteItemKey(value);
+      return `'${value.replace(/'/g, "''")}'`;
     }
     if (typeof value === "number" || typeof value === "bigint") {
       return String(value);
@@ -1705,12 +2899,16 @@ export class DynamoDBDriver implements IDBDriver {
       );
     }
 
-    const entries = this.parsePartiqlSetEntries(value);
-    if (!entries) {
+    const trimmed = value.trim();
+    if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) {
+      return null;
+    }
+    const parsed = this.parseJsonValue(trimmed);
+    if (!Array.isArray(parsed)) {
       return null;
     }
     return new Set(
-      entries.map((entry) => this.coerceSetEntryValue(entry, subtype)),
+      parsed.map((entry) => this.coerceSetEntryValue(entry, subtype)),
     );
   }
 
@@ -1719,9 +2917,7 @@ export class DynamoDBDriver implements IDBDriver {
     subtype: "string" | "number" | "binary",
   ): unknown {
     if (subtype === "string") {
-      return typeof value === "string"
-        ? (this.unwrapPartiqlStringLiteral(value) ?? value)
-        : String(value);
+      return typeof value === "string" ? value : String(value);
     }
     if (subtype === "number") {
       if (typeof value === "number") {
@@ -1730,70 +2926,13 @@ export class DynamoDBDriver implements IDBDriver {
       if (typeof value === "bigint") {
         return Number(value);
       }
-      const source =
-        typeof value === "string"
-          ? (this.unwrapPartiqlStringLiteral(value) ?? value).trim()
-          : String(value);
-      const numeric = Number(source);
-      return Number.isFinite(numeric) ? numeric : source;
+      const numeric = Number(String(value));
+      return Number.isFinite(numeric) ? numeric : value;
     }
     if (this.isBinaryValue(value)) {
       return value;
     }
-    const source =
-      typeof value === "string"
-        ? (this.unwrapPartiqlStringLiteral(value) ?? value).trim()
-        : String(value);
-    return this.parseBinaryInput(source) ?? source;
-  }
-
-  private parsePartiqlSetEntries(value: string): string[] | null {
-    const trimmed = value.trim();
-    if (!trimmed.startsWith("<<") || !trimmed.endsWith(">>")) {
-      return null;
-    }
-
-    const inner = trimmed.slice(2, -2).trim();
-    if (inner.length === 0) {
-      return [];
-    }
-
-    const entries: string[] = [];
-    let current = "";
-    let inString = false;
-
-    for (let index = 0; index < inner.length; index += 1) {
-      const char = inner[index];
-      if (char === "'") {
-        current += char;
-        if (inString && inner[index + 1] === "'") {
-          current += "'";
-          index += 1;
-          continue;
-        }
-        inString = !inString;
-        continue;
-      }
-      if (char === "," && !inString) {
-        entries.push(current.trim());
-        current = "";
-        continue;
-      }
-      current += char;
-    }
-
-    if (current.trim().length > 0) {
-      entries.push(current.trim());
-    }
-
-    return entries;
-  }
-
-  private unwrapPartiqlStringLiteral(value: string): string | null {
-    if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
-      return value.slice(1, -1).replace(/''/g, "'");
-    }
-    return null;
+    return this.parseBinaryInput(String(value).trim()) ?? value;
   }
 
   private parseJsonValue(value: string): unknown {
@@ -1842,45 +2981,5 @@ export class DynamoDBDriver implements IDBDriver {
 
   private isPlainObject(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === "object" && !Array.isArray(value);
-  }
-
-  private formatPartiqlLiteral(value: unknown): string {
-    if (value === null) {
-      return "NULL";
-    }
-    if (value === undefined) {
-      return "MISSING";
-    }
-    if (typeof value === "string") {
-      return `'${value.replace(/'/g, "''")}'`;
-    }
-    if (typeof value === "number" || typeof value === "bigint") {
-      return String(value);
-    }
-    if (typeof value === "boolean") {
-      return value ? "true" : "false";
-    }
-    if (value instanceof Date) {
-      return `'${value.toISOString().replace(/'/g, "''")}'`;
-    }
-    if (value instanceof Set) {
-      return `<<${[...value].map((entry) => this.formatPartiqlLiteral(entry)).join(", ")}>>`;
-    }
-    if (Array.isArray(value)) {
-      return `[${value.map((entry) => this.formatPartiqlLiteral(entry)).join(", ")}]`;
-    }
-    if (this.isBinaryValue(value)) {
-      return `'${this.toBinaryBuffer(value)?.toString("base64") ?? ""}'`;
-    }
-    if (typeof value === "object") {
-      return `{${Object.entries(value as Record<string, unknown>)
-        .map(
-          ([key, entryValue]) =>
-            `${this.quoteItemKey(key)}: ${this.formatPartiqlLiteral(entryValue)}`,
-        )
-        .join(", ")}}`;
-    }
-
-    return `'${String(value).replace(/'/g, "''")}'`;
   }
 }

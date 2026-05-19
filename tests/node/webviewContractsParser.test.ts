@@ -115,7 +115,26 @@ describe("parseTablePanelMessage applyChanges payload", () => {
 });
 
 describe("parseQueryPanelMessage", () => {
-  it("parses executeQuery payloads", () => {
+  it("parses executeQuery payloads with canonical queryText and sql alias", () => {
+    const parsed = parseQueryPanelMessage({
+      type: "executeQuery",
+      payload: {
+        queryText: "select 1",
+        connectionId: "conn-1",
+      },
+    });
+
+    expect(parsed).toEqual({
+      type: "executeQuery",
+      payload: {
+        queryText: "select 1",
+        sql: "select 1",
+        connectionId: "conn-1",
+      },
+    });
+  });
+
+  it("accepts sql as an alias for executeQuery payloads", () => {
     const parsed = parseQueryPanelMessage({
       type: "executeQuery",
       payload: {
@@ -127,6 +146,7 @@ describe("parseQueryPanelMessage", () => {
     expect(parsed).toEqual({
       type: "executeQuery",
       payload: {
+        queryText: "select 1",
         sql: "select 1",
         connectionId: "conn-1",
       },
@@ -137,7 +157,7 @@ describe("parseQueryPanelMessage", () => {
     const parsed = parseQueryPanelMessage({
       type: "executeQuery",
       payload: {
-        sql: 123,
+        queryText: 123,
       },
     });
 
@@ -287,11 +307,13 @@ describe("parseWebviewInitialState", () => {
       view: "query",
       connectionId: "conn-1",
       connectionType: "pg",
+      queryText: "select 1",
       initialSql: "select 1",
       formatOnOpen: true,
       isBookmarked: false,
       editorLanguage: "sql",
       editorPresentation: {
+        queryMode: undefined,
         formatOnOpen: true,
         editorLanguage: "sql",
         sqlDialect: undefined,
@@ -311,6 +333,7 @@ describe("parseWebviewInitialState", () => {
       view: "query",
       connectionId: "conn-1",
       connectionType: "",
+      queryText: undefined,
       initialSql: undefined,
       formatOnOpen: undefined,
       isBookmarked: undefined,

@@ -100,7 +100,7 @@ describe("QueryPanelController", () => {
 
     await controller.handleMessage({
       type: "executeQuery",
-      payload: { sql: "select 1", connectionId: "override" },
+      payload: { queryText: "select 1", connectionId: "override" },
     });
 
     expect(isConnected).toHaveBeenNthCalledWith(1, "override");
@@ -109,7 +109,7 @@ describe("QueryPanelController", () => {
 
     await controller.handleMessage({
       type: "addBookmark",
-      payload: { sql: "select 2" },
+      payload: { queryText: "select 2" },
     });
 
     expect(addBookmark).toHaveBeenCalledWith("active", "select 2");
@@ -348,7 +348,7 @@ describe("QueryPanelController", () => {
 
     await controller.handleMessage({
       type: "executeQuery",
-      payload: { sql: "select 1", connectionId: "active" },
+      payload: { queryText: "select 1", connectionId: "active" },
     });
 
     expect(addToHistory).not.toHaveBeenCalled();

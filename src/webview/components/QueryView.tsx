@@ -20,7 +20,7 @@ import { ResultsPanel } from "./ResultsPanel";
 
 interface Props {
   connectionId: string;
-  initialSql: string;
+  initialQueryText: string;
   formatOnOpen?: boolean;
   connectionType?: string;
   isBookmarked?: boolean;
@@ -62,7 +62,7 @@ function resolveActiveEditorPresentation(
 
 export function QueryView({
   connectionId,
-  initialSql,
+  initialQueryText,
   formatOnOpen = false,
   connectionType: _connectionType = "",
   isBookmarked: initialIsBookmarked = false,
@@ -132,11 +132,23 @@ export function QueryView({
     monacoLanguage === "sql"
       ? (activeEditorPresentation?.sqlDialect ?? "sql")
       : undefined;
-  const allowFormatting =
+  const allowSqlFormatting =
     monacoLanguage === "sql"
       ? (activeEditorPresentation?.allowFormatting ?? true)
       : false;
+  const canFormat =
+    monacoLanguage === "json"
+      ? true
+      : monacoLanguage === "sql"
+        ? allowSqlFormatting
+        : false;
   const editorLabel = monacoLanguage === "sql" ? "SQL editor" : "Query editor";
+  const formatErrorPrefix =
+    monacoLanguage === "json" ? "JSON parse error" : "SQL format error";
+  const formatButtonTitle =
+    monacoLanguage === "json"
+      ? "Format JSON (Shift+Alt+F)"
+      : "Format SQL (Shift+Alt+F)";
 
   useEffect(() => {
     setActiveConnection(connectionId);
@@ -217,10 +229,10 @@ export function QueryView({
   useEffect(() => {
     if (
       !shouldFormatOnOpen ||
-      !initialSql ||
+      !initialQueryText ||
       didAutoFormat.current ||
-      !sqlDialect ||
-      !allowFormatting
+      !canFormat ||
+      (monacoLanguage === "sql" && !sqlDialect)
     ) {
       return;
     }
@@ -237,9 +249,10 @@ export function QueryView({
       });
     });
   }, [
-    allowFormatting,
+    canFormat,
     connections,
-    initialSql,
+    initialQueryText,
+    monacoLanguage,
     shouldFormatOnOpen,
     sqlDialect,
   ]);
@@ -259,13 +272,13 @@ export function QueryView({
   }, [shouldFormatOnOpen]);
 
   const executeQuery = useCallback(() => {
-    const sql = editorRef.current?.getSelectionOrValue().trim() ?? "";
-    if (!sql) {
+    const queryText = editorRef.current?.getSelectionOrValue().trim() ?? "";
+    if (!queryText) {
       return;
     }
     setRunning();
     postMessage("executeQuery", {
-      sql,
+      queryText,
       connectionId: activeConnectionId || connectionId,
     });
   }, [activeConnectionId, connectionId, setRunning]);
@@ -274,13 +287,13 @@ export function QueryView({
     if (bookmarked || bookmarking) {
       return;
     }
-    const sql = editorRef.current?.getValue().trim() ?? "";
-    if (!sql) {
+    const queryText = editorRef.current?.getValue().trim() ?? "";
+    if (!queryText) {
       return;
     }
     setBookmarking(true);
     postMessage("addBookmark", {
-      sql,
+      queryText,
       connectionId: activeConnectionId || connectionId,
     });
   }, [bookmarked, bookmarking, activeConnectionId, connectionId]);
@@ -390,7 +403,7 @@ export function QueryView({
           type="button"
           style={btnGhostStyle(false)}
           onClick={() => editorRef.current?.setValue("")}
-          title="Clear SQL"
+          title="Clear query"
         >
           <Icon name="close" size={13} style={{ marginRight: 4 }} />
           Clear
@@ -399,18 +412,18 @@ export function QueryView({
         {}
         <button
           type="button"
-          style={btnGhostStyle(!sqlDialect || !allowFormatting)}
-          disabled={!sqlDialect || !allowFormatting}
+          style={btnGhostStyle(!canFormat)}
+          disabled={!canFormat}
           onClick={() => {
-            if (!sqlDialect || !allowFormatting) {
+            if (!canFormat) {
               return;
             }
             const err = editorRef.current?.format(sqlDialect) ?? null;
             if (err) {
-              setError(`SQL format error: ${err}`);
+              setError(`${formatErrorPrefix}: ${err}`);
             }
           }}
-          title="Format SQL (Shift+Alt+F)"
+          title={formatButtonTitle}
         >
           <Icon name="symbol-color" size={13} style={{ marginRight: 4 }} />
           Format
@@ -463,7 +476,7 @@ export function QueryView({
       <div style={{ height: editorHeight, flexShrink: 0, overflow: "hidden" }}>
         <MonacoEditor
           ref={editorRef}
-          initialValue={initialSql || ""}
+          initialValue={initialQueryText || ""}
           schema={schema}
           dialect={sqlDialect}
           language={monacoLanguage}

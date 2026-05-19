@@ -31,16 +31,20 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
     initialValue?: string;
     ariaLabel?: string;
     readOnly?: boolean;
+    language?: string;
   }
 
   function MonacoEditor(props: MockMonacoEditorProps) {
     return (
-      <textarea
-        aria-label={props.ariaLabel ?? "SQL editor"}
-        readOnly={props.readOnly}
-        value={props.initialValue ?? ""}
-        onChange={() => undefined}
-      />
+      <div>
+        <div data-testid="monaco-language">{props.language ?? "sql"}</div>
+        <textarea
+          aria-label={props.ariaLabel ?? "SQL editor"}
+          readOnly={props.readOnly}
+          value={props.initialValue ?? ""}
+          onChange={() => undefined}
+        />
+      </div>
     );
   }
 
@@ -1069,6 +1073,8 @@ describe("TableView", () => {
       previewToken: "preview-1",
       kind: "applyChanges",
       title: "Preview changes",
+      text: "update users set name = 'Alicia' where id = 1;",
+      contentType: "application/sql",
       sql: "update users set name = 'Alicia' where id = 1;",
       statementCount: 1,
     });
@@ -1077,7 +1083,7 @@ describe("TableView", () => {
       expect(screen.getByRole("dialog")).toBeTruthy();
     });
 
-    fireEvent.keyDown(window, { key: "Escape" });
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
 
     await waitFor(() => {
       expect(getLastPostedMessage()).toEqual({
@@ -1098,6 +1104,8 @@ describe("TableView", () => {
       previewToken: "preview-2",
       kind: "applyChanges",
       title: "Preview changes",
+      text: "update users set name = 'Alicia' where id = 1;",
+      contentType: "application/sql",
       sql: "update users set name = 'Alicia' where id = 1;",
       statementCount: 1,
     });
@@ -1292,6 +1300,8 @@ describe("TableView", () => {
         previewToken: "delete-preview-1",
         kind: "deleteRows",
         title: "Apply changes to users",
+        text: "delete from users where id = 1;",
+        contentType: "application/sql",
         sql: "delete from users where id = 1;",
         statementCount: 1,
       });
@@ -1353,6 +1363,8 @@ describe("TableView", () => {
       previewToken: "delete-preview-cancel",
       kind: "deleteRows",
       title: "Apply changes to users",
+      text: "delete from users where id = 1;",
+      contentType: "application/sql",
       sql: "delete from users where id = 1;",
       statementCount: 1,
     });
@@ -1380,6 +1392,62 @@ describe("TableView", () => {
       type: "deleteRows",
       payload: { primaryKeysList: [{ id: 1 }] },
     });
+  });
+
+  it("renders JSON mutation previews with the preview text and JSON editor mode", async () => {
+    const previewText = JSON.stringify(
+      {
+        TableName: "Users",
+        Key: { userId: { S: "user-1" } },
+      },
+      null,
+      2,
+    );
+
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    await act(async () => {
+      dispatchIncomingMessage("tableMutationPreview", {
+        previewToken: "preview-json",
+        kind: "deleteRows",
+        title: "Apply changes to users",
+        text: previewText,
+        contentType: "application/json",
+        sql: "legacy fallback",
+        statementCount: 1,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("dialog")).toBeTruthy();
+    });
+
+    expect(screen.getByTestId("monaco-language").textContent).toBe("json");
+    expect(
+      (screen.getByLabelText("Mutation preview") as HTMLTextAreaElement).value,
+    ).toBe(previewText);
   });
 
   it("supports insert with all DEFAULT fields and explicit draft edits", async () => {

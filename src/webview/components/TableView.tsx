@@ -2183,14 +2183,14 @@ function MutationPreviewDialog({
             >
               {preview.statementCount} statement
               {preview.statementCount === 1 ? "" : "s"} will be executed. The
-              SQL below is read only and matches the prepared mutation plan.
+              preview below is read only and matches the prepared mutation plan.
             </div>
           </div>
           <button
             type="button"
             ref={closeButtonRef}
             onClick={onCancel}
-            aria-label="Close SQL preview"
+            aria-label="Close mutation preview"
             style={{
               background: "transparent",
               border: "none",
@@ -2222,10 +2222,17 @@ function MutationPreviewDialog({
           >
             <MonacoEditor
               key={preview.previewToken}
-              initialValue={preview.sql}
+              initialValue={preview.text ?? preview.sql}
               height="100%"
               readOnly
-              ariaLabel="SQL mutation preview"
+              language={
+                preview.contentType === "application/json"
+                  ? "json"
+                  : preview.contentType === "application/sql"
+                    ? "sql"
+                    : "plaintext"
+              }
+              ariaLabel="Mutation preview"
             />
           </div>
 

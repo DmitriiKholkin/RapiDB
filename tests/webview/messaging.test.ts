@@ -12,13 +12,16 @@ describe("messaging", () => {
     clearPostedMessages();
 
     postMessage("getConnections");
-    postMessage("executeQuery", { sql: "select 1", connectionId: "conn-1" });
+    postMessage("executeQuery", {
+      queryText: "select 1",
+      connectionId: "conn-1",
+    });
 
     expect(getPostedMessages()).toEqual([
       { type: "getConnections" },
       {
         type: "executeQuery",
-        payload: { sql: "select 1", connectionId: "conn-1" },
+        payload: { queryText: "select 1", connectionId: "conn-1" },
       },
     ]);
   });

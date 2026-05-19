@@ -27,7 +27,7 @@ export function App(): ReactElement {
           <QueryView
             connectionId={state.connectionId ?? ""}
             connectionType={state.connectionType ?? ""}
-            initialSql={state.initialSql ?? ""}
+            initialQueryText={state.queryText ?? state.initialSql ?? ""}
             formatOnOpen={state.formatOnOpen ?? false}
             isBookmarked={state.isBookmarked ?? false}
             editorLanguage={state.editorLanguage}

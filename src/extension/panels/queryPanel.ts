@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { unwrapLegacyDynamoDbEnvelope } from "../../shared/dynamodbNative";
 import type { QueryEditorLanguage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import { logErrorWithContext } from "../utils/errorHandling";
@@ -28,7 +29,7 @@ export class QueryPanel {
     context: vscode.ExtensionContext,
     connectionManager: ConnectionManager,
     connectionId: string,
-    initialSql?: string,
+    initialQueryText?: string,
     formatOnOpen?: boolean,
     isBookmarked?: boolean,
     editorLanguage?: QueryEditorLanguage,
@@ -57,7 +58,7 @@ export class QueryPanel {
         this.syncTitle();
       },
     });
-    this.panel.webview.html = this.buildHtml(context, initialSql);
+    this.panel.webview.html = this.buildHtml(context, initialQueryText);
     this.panel.webview.onDidReceiveMessage(async (message) => {
       try {
         await this.controller.handleMessage(message);
@@ -116,16 +117,16 @@ export class QueryPanel {
     context: vscode.ExtensionContext,
     connectionManager: ConnectionManager,
     connectionId: string,
-    initialSql?: string,
+    initialQueryText?: string,
     forceNew = false,
     formatOnOpen?: boolean,
     isBookmarked = false,
     editorLanguage?: QueryEditorLanguage,
   ): QueryPanel {
     const connection = connectionManager.getConnection(connectionId);
-    const title = `SQL [${connection?.name ?? connectionId}]`;
+    const title = `Query [${connection?.name ?? connectionId}]`;
 
-    if (!initialSql && !forceNew) {
+    if (!initialQueryText && !forceNew) {
       for (const panel of QueryPanel.panels.values()) {
         if (panel.initialConnectionId === connectionId) {
           panel.panel.reveal(vscode.ViewColumn.One);
@@ -147,7 +148,7 @@ export class QueryPanel {
       context,
       connectionManager,
       connectionId,
-      initialSql,
+      initialQueryText,
       formatOnOpen,
       isBookmarked,
       editorLanguage,
@@ -166,12 +167,17 @@ export class QueryPanel {
 
   private buildHtml(
     context: vscode.ExtensionContext,
-    initialSql?: string,
+    initialQueryText?: string,
   ): string {
     const connection = this.connectionManager.getConnection(
       this.initialConnectionId,
     );
     const connectionType = connection?.type ?? "";
+    const migratedLegacyQuery =
+      connectionType === "dynamodb" && initialQueryText
+        ? unwrapLegacyDynamoDbEnvelope(initialQueryText)
+        : null;
+    const resolvedQueryText = migratedLegacyQuery ?? initialQueryText;
     const managerWithPresentation = this
       .connectionManager as ConnectionManager & {
       getQueryEditorPresentation?: (
@@ -209,7 +215,8 @@ export class QueryPanel {
         view: "query",
         connectionId: this.initialConnectionId,
         connectionType,
-        initialSql: initialSql ?? "",
+        queryText: resolvedQueryText ?? "",
+        initialSql: resolvedQueryText ?? "",
         formatOnOpen: this.formatOnOpen,
         isBookmarked: this.isBookmarked ?? false,
         editorLanguage: this.editorLanguage,

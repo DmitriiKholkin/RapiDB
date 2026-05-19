@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { formatMutationPreviewSql } from "../../src/extension/utils/mutationPreview";
-import { splitDynamoPartiqlStatements } from "../../src/shared/dynamodbPartiql";
 
 describe("formatMutationPreviewSql", () => {
   it("keeps Redis and Elasticsearch previews unformatted and without SQL terminators", () => {
@@ -19,31 +18,59 @@ describe("formatMutationPreviewSql", () => {
     ).toBe('PUT /users {"mappings":{"properties":{"id":{"type":"keyword"}}}}');
   });
 
-  it("skips formatting for DynamoDB PartiQL when formatting is disabled", () => {
+  it("keeps DynamoDB native JSON previews stable when formatting is disabled", () => {
     expect(
       formatMutationPreviewSql(
         [
-          'UPDATE "users" SET "email" = \'next@example.com\' WHERE "id" = \'u1\'',
+          JSON.stringify(
+            {
+              TableName: "users",
+              Key: { id: { S: "u1" } },
+              UpdateExpression: "SET #email = :email",
+              ExpressionAttributeNames: { "#email": "email" },
+              ExpressionAttributeValues: {
+                ":email": { S: "next@example.com" },
+              },
+            },
+            null,
+            2,
+          ),
         ],
         {
           formatOnOpen: false,
-          editorLanguage: "sql",
-          sqlDialect: "sql",
+          editorLanguage: "json",
           allowFormatting: false,
         },
       ),
-    ).toBe(
-      'UPDATE "users" SET "email" = \'next@example.com\' WHERE "id" = \'u1\'',
-    );
+    ).toContain('"UpdateExpression": "SET #email = :email"');
   });
 
-  it("splits multi-statement DynamoDB PartiQL without formatting it", () => {
-    const sql =
-      "UPDATE \"Users\" SET \"payload\" = {'country': 'RU'} WHERE \"userId\" = 'user-1' RETURNING ALL NEW *;\nUPDATE \"Users\" SET \"tags\" = ['one', 'two'] WHERE \"userId\" = 'user-2' RETURNING ALL NEW *;";
+  it("joins multiple DynamoDB native preview requests with blank lines", () => {
+    const previews = [
+      JSON.stringify(
+        {
+          TableName: "Users",
+          Key: { userId: { S: "user-1" } },
+        },
+        null,
+        2,
+      ),
+      JSON.stringify(
+        {
+          TableName: "Users",
+          Key: { userId: { S: "user-2" } },
+        },
+        null,
+        2,
+      ),
+    ];
 
-    expect(splitDynamoPartiqlStatements(sql)).toEqual([
-      "UPDATE \"Users\" SET \"payload\" = {'country': 'RU'} WHERE \"userId\" = 'user-1' RETURNING ALL NEW *",
-      "UPDATE \"Users\" SET \"tags\" = ['one', 'two'] WHERE \"userId\" = 'user-2' RETURNING ALL NEW *",
-    ]);
+    expect(
+      formatMutationPreviewSql(previews, {
+        formatOnOpen: false,
+        editorLanguage: "json",
+        allowFormatting: false,
+      }),
+    ).toBe(`${previews[0]}\n\n${previews[1]}`);
   });
 });

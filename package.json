@@ -123,7 +123,7 @@
       },
       {
         "command": "rapidb.openHistoryEntry",
-        "title": "Open in SQL Editor",
+        "title": "Open in Query Editor",
         "category": "RapiDB",
         "icon": "$(go-to-file)"
       },
@@ -135,7 +135,7 @@
       },
       {
         "command": "rapidb.openBookmarkEntry",
-        "title": "Open in SQL Editor",
+        "title": "Open in Query Editor",
         "category": "RapiDB",
         "icon": "$(go-to-file)"
       },
@@ -718,6 +718,7 @@
     "@aws-sdk/client-dynamodb": "^3.1044.0",
     "@aws-sdk/credential-providers": "^3.1044.0",
     "@aws-sdk/lib-dynamodb": "^3.1044.0",
+    "@aws-sdk/util-dynamodb": "^3.996.2",
     "@dagrejs/dagre": "^3.0.0",
     "@elastic/elasticsearch": "^8.19.1",
     "@tanstack/react-table": "^8.21.3",

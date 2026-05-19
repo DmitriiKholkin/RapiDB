@@ -40,7 +40,30 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
           setValue(nextValue);
           props.onChange?.(nextValue);
         },
-        format: (dialect?: string) => formatMock(dialect),
+        format: (dialect?: string) => {
+          formatMock(dialect);
+
+          if (props.language === "json") {
+            try {
+              const nextValue = JSON.stringify(
+                JSON.parse(value) as unknown,
+                null,
+                2,
+              );
+
+              if (nextValue !== value) {
+                setValue(nextValue);
+                props.onChange?.(nextValue);
+              }
+
+              return null;
+            } catch (error: unknown) {
+              return error instanceof Error ? error.message : String(error);
+            }
+          }
+
+          return null;
+        },
         placeCursor: () => undefined,
       }),
       [props, value],
@@ -128,7 +151,7 @@ describe("QueryView", () => {
     render(
       <QueryView
         connectionId="conn-1"
-        initialSql="select 1"
+        initialQueryText="select 1"
         editorPresentation={{
           formatOnOpen: true,
           editorLanguage: "sql",
@@ -155,7 +178,7 @@ describe("QueryView", () => {
   });
 
   it("auto-formats when the active connection presentation arrives after mount", async () => {
-    render(<QueryView connectionId="conn-1" initialSql="select 1" />);
+    render(<QueryView connectionId="conn-1" initialQueryText="select 1" />);
 
     dispatchIncomingMessage("connections", [
       {
@@ -180,7 +203,7 @@ describe("QueryView", () => {
     const { container } = render(
       <QueryView
         connectionId="conn-1"
-        initialSql="select * from users"
+        initialQueryText="select * from users"
         connectionType="pg"
         editorPresentation={{
           editorLanguage: "sql",
@@ -229,8 +252,10 @@ describe("QueryView", () => {
         name: "Dynamo",
         type: "dynamodb",
         editorPresentation: {
-          editorLanguage: "sql",
-          sqlDialect: "sql",
+          queryMode: "text",
+          editorLanguage: "json",
+          formatOnOpen: false,
+          allowFormatting: false,
         },
       },
     ]);
@@ -324,9 +349,9 @@ describe("QueryView", () => {
           { type: "getSchema", payload: { connectionId: "conn-4" } },
         ]),
       );
-      expect(screen.getByLabelText("SQL editor")).toBeTruthy();
-      expect(screen.getByTestId("monaco-language").textContent).toBe("sql");
-      expect(screen.getByTestId("monaco-dialect").textContent).toBe("sql");
+      expect(screen.getByLabelText("Query editor")).toBeTruthy();
+      expect(screen.getByTestId("monaco-language").textContent).toBe("json");
+      expect(screen.getByTestId("monaco-dialect").textContent).toBe("none");
       expect(
         (screen.getByRole("button", { name: "Format" }) as HTMLButtonElement)
           .disabled,
@@ -340,7 +365,7 @@ describe("QueryView", () => {
     render(
       <QueryView
         connectionId="conn-1"
-        initialSql={"db.users.find({ active: true })"}
+        initialQueryText={"db.users.find({ active: true })"}
         editorLanguage="javascript"
         editorPresentation={{
           formatOnOpen: false,
@@ -395,7 +420,7 @@ describe("QueryView", () => {
     render(
       <QueryView
         connectionId="conn-1"
-        initialSql="select * from users"
+        initialQueryText="select * from users"
         editorPresentation={{
           editorLanguage: "sql",
           sqlDialect: "postgresql",
@@ -476,7 +501,7 @@ describe("QueryView", () => {
     render(
       <QueryView
         connectionId="conn-1"
-        initialSql="select 1"
+        initialQueryText="select 1"
         editorPresentation={{
           editorLanguage: "sql",
           sqlDialect: "postgresql",
@@ -506,7 +531,7 @@ describe("QueryView", () => {
 
     expect(getLastPostedMessage()).toEqual({
       type: "executeQuery",
-      payload: { sql: "select 42", connectionId: "conn-1" },
+      payload: { queryText: "select 42", connectionId: "conn-1" },
     });
 
     dispatchIncomingMessage("queryResult", {
@@ -531,7 +556,7 @@ describe("QueryView", () => {
 
     expect(getLastPostedMessage()).toEqual({
       type: "addBookmark",
-      payload: { sql: "select 42", connectionId: "conn-1" },
+      payload: { queryText: "select 42", connectionId: "conn-1" },
     });
 
     dispatchIncomingMessage("bookmarkSaved", { ok: true });
@@ -553,7 +578,7 @@ describe("QueryView", () => {
     render(
       <QueryView
         connectionId="conn-1"
-        initialSql="db.users.find({})"
+        initialQueryText="db.users.find({})"
         editorPresentation={{
           editorLanguage: "javascript",
           formatOnOpen: false,
@@ -584,7 +609,7 @@ describe("QueryView", () => {
     expect(getLastPostedMessage()).toEqual({
       type: "executeQuery",
       payload: {
-        sql: "db.users.find({})",
+        queryText: "db.users.find({})",
         connectionId: "conn-1",
       },
     });
@@ -594,7 +619,7 @@ describe("QueryView", () => {
     render(
       <QueryView
         connectionId="conn-1"
-        initialSql="GET app:key"
+        initialQueryText="GET app:key"
         formatOnOpen
         editorPresentation={{
           editorLanguage: "plaintext",
@@ -624,15 +649,19 @@ describe("QueryView", () => {
     expect(formatMock).not.toHaveBeenCalled();
   });
 
-  it("keeps DynamoDB PartiQL in SQL mode while disabling formatting", async () => {
+  it("uses DynamoDB native mode in JSON editor language and formats valid JSON", async () => {
+    const user = userEvent.setup();
+    const initialValue = '{"TableName":"Users"}';
+    const formattedValue = JSON.stringify({ TableName: "Users" }, null, 2);
+
     render(
       <QueryView
         connectionId="conn-1"
-        initialSql={'SELECT * FROM "Users"'}
+        initialQueryText={initialValue}
         formatOnOpen
         editorPresentation={{
-          editorLanguage: "sql",
-          sqlDialect: "sql",
+          queryMode: "text",
+          editorLanguage: "json",
           formatOnOpen: false,
           allowFormatting: false,
         }}
@@ -645,27 +674,83 @@ describe("QueryView", () => {
         name: "Dynamo",
         type: "dynamodb",
         editorPresentation: {
-          editorLanguage: "sql",
-          sqlDialect: "sql",
+          queryMode: "text",
+          editorLanguage: "json",
           formatOnOpen: false,
           allowFormatting: false,
         },
       },
     ]);
 
-    expect(screen.getByLabelText("SQL editor")).toBeTruthy();
-    expect(screen.getByTestId("monaco-language").textContent).toBe("sql");
-    expect(formatMock).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("Query editor")).toBeTruthy();
+    expect(screen.getByTestId("monaco-language").textContent).toBe("json");
 
     const formatButton = screen.getByRole("button", { name: "Format" });
-    expect((formatButton as HTMLButtonElement).disabled).toBe(true);
+    expect((formatButton as HTMLButtonElement).disabled).toBe(false);
+
+    await user.click(formatButton);
+
+    expect(formatMock).toHaveBeenCalledWith(undefined);
+    expect(
+      (screen.getByLabelText("Query editor") as HTMLTextAreaElement).value,
+    ).toBe(formattedValue);
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Run" }));
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "executeQuery",
+      payload: {
+        queryText: formattedValue,
+        connectionId: "conn-1",
+      },
+    });
+  });
+
+  it("shows JSON parse failures when formatting invalid DynamoDB native queries", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <QueryView
+        connectionId="conn-1"
+        initialQueryText='{"TableName":'
+        editorPresentation={{
+          queryMode: "text",
+          editorLanguage: "json",
+          formatOnOpen: false,
+          allowFormatting: false,
+        }}
+      />,
+    );
+
+    dispatchIncomingMessage("connections", [
+      {
+        id: "conn-1",
+        name: "Dynamo",
+        type: "dynamodb",
+        editorPresentation: {
+          queryMode: "text",
+          editorLanguage: "json",
+          formatOnOpen: false,
+          allowFormatting: false,
+        },
+      },
+    ]);
+
+    await user.click(screen.getByRole("button", { name: "Format" }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("results-panel").textContent).toContain(
+        "error:JSON parse error:",
+      );
+    });
   });
 
   it("prefers explicit editorLanguage over connection-derived SQL mode", async () => {
     render(
       <QueryView
         connectionId="conn-1"
-        initialSql="db.users.find({})"
+        initialQueryText="db.users.find({})"
         connectionType="pg"
         editorLanguage="plaintext"
         formatOnOpen

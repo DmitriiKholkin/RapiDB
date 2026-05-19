@@ -53,6 +53,7 @@ describe("App", () => {
       view: "query",
       connectionId: "conn-1",
       connectionType: "pg",
+      queryText: "select 1",
       initialSql: "select 1",
       formatOnOpen: false,
       isBookmarked: false,

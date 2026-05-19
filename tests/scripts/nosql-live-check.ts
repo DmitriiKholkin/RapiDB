@@ -739,7 +739,17 @@ async function verifyDynamoDriver(): Promise<void> {
     );
 
     const queryResult = await driver.query(
-      'SELECT * FROM "users" WHERE "tenant_id" = \'tenant-1\'',
+      JSON.stringify({
+        TableName: "users",
+        FilterExpression: "#tenant = :tenant",
+        ExpressionAttributeNames: {
+          "#tenant": "tenant_id",
+        },
+        ExpressionAttributeValues: {
+          ":tenant": { S: "tenant-1" },
+        },
+      }),
+      ["Scan"],
     );
     const queryRows = rowsFromQuery(queryResult);
     assert.equal(queryRows.length, 1);

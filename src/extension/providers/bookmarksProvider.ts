@@ -16,18 +16,21 @@ export class BookmarkNode extends vscode.TreeItem {
 
     const dateStr = new Date(entry.savedAt).toLocaleString();
     this.tooltip = new vscode.MarkdownString(
-      `**${connectionName}** — ${dateStr}\n\`\`\`sql\n${entry.sql}\n\`\`\``,
+      `**${connectionName}** — ${dateStr}\n\`\`\`\n${entry.sql}\n\`\`\``,
     );
 
     this.command = {
       command: "rapidb.openBookmarkEntry",
-      title: "Open in SQL Editor",
+      title: "Open in Query Editor",
       arguments: [entry],
     };
   }
 }
 
-export class BookmarksProvider extends SqlEntryProvider<BookmarkEntry, BookmarkNode> {
+export class BookmarksProvider extends SqlEntryProvider<
+  BookmarkEntry,
+  BookmarkNode
+> {
   constructor(cm: ConnectionManager) {
     super(cm, cm.onDidChangeBookmarks);
   }
@@ -36,7 +39,10 @@ export class BookmarksProvider extends SqlEntryProvider<BookmarkEntry, BookmarkN
     return this.cm.getBookmarks();
   }
 
-  protected makeNode(entry: BookmarkEntry, connectionName: string): BookmarkNode {
+  protected makeNode(
+    entry: BookmarkEntry,
+    connectionName: string,
+  ): BookmarkNode {
     return new BookmarkNode(entry, connectionName);
   }
 }

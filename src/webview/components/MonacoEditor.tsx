@@ -214,6 +214,42 @@ export function formatSQLOrError(
   }
 }
 
+export function formatJSONOrError(
+  input: string,
+): { result: string } | { error: string } {
+  if (!input.trim()) {
+    return { result: input };
+  }
+
+  try {
+    return {
+      result: JSON.stringify(JSON.parse(input) as unknown, null, 2),
+    };
+  } catch (err: unknown) {
+    return {
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+function formatEditorValueOrError(options: {
+  value: string;
+  language: string;
+  dialect?: string;
+}): { result: string } | { error: string } | null {
+  const { value, language, dialect } = options;
+
+  if (language === "sql") {
+    return formatSQLOrError(value, dialect ?? "sql");
+  }
+
+  if (language === "json") {
+    return formatJSONOrError(value);
+  }
+
+  return null;
+}
+
 interface Props {
   initialValue?: string;
   schema?: SchemaObject[];
@@ -333,18 +369,19 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         if (!editor || editor.getOption(monaco.editor.EditorOption.readOnly)) {
           return null;
         }
-        if (languageRef.current !== "sql") {
-          return null;
-        }
         const model = editor.getModel();
         if (!model) {
           return null;
         }
         const raw = editor.getValue();
-        const out = formatSQLOrError(
-          raw,
-          requestedDialect ?? dialectRef.current ?? "sql",
-        );
+        const out = formatEditorValueOrError({
+          value: raw,
+          language: languageRef.current,
+          dialect: requestedDialect ?? dialectRef.current,
+        });
+        if (!out) {
+          return null;
+        }
         if ("error" in out) {
           return out.error;
         }
@@ -539,15 +576,19 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
           if (readOnlyRef.current) {
             return;
           }
-          if (languageRef.current !== "sql") {
-            return;
-          }
           const model = editor.getModel();
           if (!model) {
             return;
           }
           const raw = editor.getValue();
-          const out = formatSQLOrError(raw, dialectRef.current ?? "sql");
+          const out = formatEditorValueOrError({
+            value: raw,
+            language: languageRef.current,
+            dialect: dialectRef.current,
+          });
+          if (!out) {
+            return;
+          }
           if ("error" in out) {
             return;
           }

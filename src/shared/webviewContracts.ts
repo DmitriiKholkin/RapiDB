@@ -33,7 +33,9 @@ export interface ApplyResultPayload {
   insertApplied?: boolean;
 }
 
-export type QueryEditorLanguage = "sql" | "javascript" | "plaintext";
+export type QueryEditorLanguage = "sql" | "javascript" | "plaintext" | "json";
+
+export type QueryEditorMode = "sql" | "text";
 
 export type QueryEditorSqlDialect =
   | "postgresql"
@@ -44,6 +46,7 @@ export type QueryEditorSqlDialect =
   | "sql";
 
 export interface QueryEditorPresentation {
+  queryMode?: QueryEditorMode;
   formatOnOpen?: boolean;
   editorLanguage?: QueryEditorLanguage;
   sqlDialect?: QueryEditorSqlDialect;
@@ -54,6 +57,7 @@ export interface QueryInitialState {
   view: "query";
   connectionId: string;
   connectionType?: ConnectionType | "";
+  queryText?: string;
   initialSql?: string;
   formatOnOpen?: boolean;
   isBookmarked?: boolean;
@@ -150,7 +154,7 @@ export type QueryPanelMessage =
   | WebviewMessageEnvelope<"activeConnectionChanged", { connectionId: string }>
   | WebviewMessageEnvelope<
       "executeQuery",
-      { sql: string; connectionId?: string }
+      { queryText: string; sql?: string; connectionId?: string }
     >
   | WebviewMessageEnvelope<"getConnections">
   | WebviewMessageEnvelope<"getSchema", { connectionId?: string }>
@@ -159,7 +163,7 @@ export type QueryPanelMessage =
   | WebviewMessageEnvelope<"readClipboard">
   | WebviewMessageEnvelope<
       "addBookmark",
-      { sql: string; connectionId?: string }
+      { queryText: string; sql?: string; connectionId?: string }
     >;
 
 export interface RowUpdateMessagePayload {
@@ -176,6 +180,8 @@ export interface TableMutationPreviewPayload {
   previewToken: string;
   kind: TableMutationPreviewKind;
   title: string;
+  text: string;
+  contentType: "application/sql" | "application/json" | "text/plain";
   sql: string;
   statementCount: number;
 }
@@ -314,9 +320,16 @@ function readConnectionType(value: unknown): ConnectionType | "" | undefined {
 function readQueryEditorLanguage(
   value: unknown,
 ): QueryEditorLanguage | undefined {
-  return value === "sql" || value === "javascript" || value === "plaintext"
+  return value === "sql" ||
+    value === "javascript" ||
+    value === "plaintext" ||
+    value === "json"
     ? value
     : undefined;
+}
+
+function readQueryEditorMode(value: unknown): QueryEditorMode | undefined {
+  return value === "sql" || value === "text" ? value : undefined;
 }
 
 function readQueryEditorSqlDialect(
@@ -340,11 +353,13 @@ function readQueryEditorPresentation(
   }
 
   const formatOnOpen = readOptionalBoolean(value, "formatOnOpen");
+  const queryMode = readQueryEditorMode(value.queryMode);
   const editorLanguage = readQueryEditorLanguage(value.editorLanguage);
   const sqlDialect = readQueryEditorSqlDialect(value.sqlDialect);
   const allowFormatting = readOptionalBoolean(value, "allowFormatting");
 
   if (
+    queryMode === undefined &&
     formatOnOpen === undefined &&
     editorLanguage === undefined &&
     sqlDialect === undefined &&
@@ -354,6 +369,7 @@ function readQueryEditorPresentation(
   }
 
   return {
+    queryMode,
     formatOnOpen,
     editorLanguage,
     sqlDialect,
@@ -484,6 +500,8 @@ export function parseWebviewInitialState(
       const editorPresentation = readQueryEditorPresentation(
         input.editorPresentation,
       );
+      const queryMode =
+        editorPresentation?.queryMode ?? readQueryEditorMode(input.queryMode);
       const formatOnOpen =
         editorPresentation?.formatOnOpen ??
         readOptionalBoolean(input, "formatOnOpen");
@@ -497,21 +515,28 @@ export function parseWebviewInitialState(
         editorPresentation?.allowFormatting ??
         readOptionalBoolean(input, "allowFormatting");
 
+      const queryText =
+        readOptionalString(input, "queryText") ??
+        readOptionalString(input, "initialSql");
+
       return {
         view: "query",
         connectionId,
         connectionType,
-        initialSql: readOptionalString(input, "initialSql"),
+        queryText,
+        initialSql: queryText,
         formatOnOpen,
         isBookmarked: readOptionalBoolean(input, "isBookmarked"),
         editorLanguage,
         editorPresentation:
+          queryMode === undefined &&
           formatOnOpen === undefined &&
           editorLanguage === undefined &&
           sqlDialect === undefined &&
           allowFormatting === undefined
             ? undefined
             : {
+                queryMode,
                 formatOnOpen,
                 editorLanguage,
                 sqlDialect,
@@ -598,14 +623,17 @@ export function parseQueryPanelMessage(
       if (!isRecord(envelope.payload)) {
         return null;
       }
-      const sql = readRequiredString(envelope.payload, "sql");
-      if (!sql) {
+      const queryText =
+        readRequiredString(envelope.payload, "queryText") ??
+        readRequiredString(envelope.payload, "sql");
+      if (!queryText) {
         return null;
       }
       return {
         type: envelope.type,
         payload: {
-          sql,
+          queryText,
+          sql: queryText,
           connectionId: readOptionalString(envelope.payload, "connectionId"),
         },
       };
@@ -642,14 +670,17 @@ export function parseQueryPanelMessage(
       if (!isRecord(envelope.payload)) {
         return null;
       }
-      const sql = readRequiredString(envelope.payload, "sql");
-      if (!sql) {
+      const queryText =
+        readRequiredString(envelope.payload, "queryText") ??
+        readRequiredString(envelope.payload, "sql");
+      if (!queryText) {
         return null;
       }
       return {
         type: envelope.type,
         payload: {
-          sql,
+          queryText,
+          sql: queryText,
           connectionId: readOptionalString(envelope.payload, "connectionId"),
         },
       };

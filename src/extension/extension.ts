@@ -318,6 +318,7 @@ function registerCommands(
       connectionManager,
       connectionId,
       undefined,
+      undefined,
       true,
     );
   });
@@ -360,6 +361,7 @@ function registerCommands(
       connectionManager,
       node.connectionId,
       template.script,
+      undefined,
       true,
       template.formatOnOpen,
     );
