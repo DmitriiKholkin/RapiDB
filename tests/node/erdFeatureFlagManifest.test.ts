@@ -7,7 +7,10 @@ function readManifest(): {
     configuration?: {
       properties?: Record<string, { default?: unknown }>;
     };
-    menus?: Record<string, Array<{ command?: string; when?: string }>>;
+    menus?: Record<
+      string,
+      Array<{ command?: string; when?: string; group?: string }>
+    >;
   };
 } {
   return JSON.parse(
@@ -16,14 +19,12 @@ function readManifest(): {
 }
 
 describe("ERD manifest", () => {
-  it("declares a create command contribution", () => {
+  it("does not declare a create command contribution", () => {
     const manifest = readManifest();
     const commands = manifest.contributes?.commands ?? [];
 
-    expect(commands).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ command: "rapidb.create" }),
-      ]),
+    expect(commands.some((entry) => entry.command === "rapidb.create")).toBe(
+      false,
     );
   });
 
@@ -133,34 +134,17 @@ describe("ERD manifest", () => {
     );
   });
 
-  it("wires Create context menus to create-aware connection and database view items", () => {
+  it("does not wire Create context menus into explorer items", () => {
     const manifest = readManifest();
     const contextEntries =
       manifest.contributes?.menus?.["view/item/context"] ?? [];
 
-    expect(contextEntries).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          command: "rapidb.create",
-          when: expect.stringContaining(
-            "viewItem == connectionNode_connected_canCreateDatabase",
-          ),
-        }),
-        expect.objectContaining({
-          command: "rapidb.create",
-          when: expect.stringContaining(
-            "viewItem == connectionNode_disconnected_canCreateDatabase",
-          ),
-        }),
-        expect.objectContaining({
-          command: "rapidb.create",
-          when: expect.stringContaining("viewItem == database_canCreateSchema"),
-        }),
-      ]),
-    );
+    expect(
+      contextEntries.some((entry) => entry.command === "rapidb.create"),
+    ).toBe(false);
   });
 
-  it("keeps legacy viewItem conditions for non-create connection/database commands", () => {
+  it("uses canonical viewItem conditions for connection and database commands", () => {
     const manifest = readManifest();
     const contextEntries =
       manifest.contributes?.menus?.["view/item/context"] ?? [];
@@ -175,5 +159,25 @@ describe("ERD manifest", () => {
       "viewItem == connectionNode_connected",
     );
     expect(findWhen("rapidb.openErd")).toContain("viewItem == database");
+  });
+
+  it("keeps database copy and ERD actions in post-create menu groups", () => {
+    const manifest = readManifest();
+    const contextEntries =
+      manifest.contributes?.menus?.["view/item/context"] ?? [];
+
+    const databaseCopyEntry = contextEntries.find(
+      (entry) =>
+        entry.command === "rapidb.copyNodeName" &&
+        entry.when?.includes("viewItem == database"),
+    );
+    const databaseErdEntry = contextEntries.find(
+      (entry) =>
+        entry.command === "rapidb.openErd" &&
+        entry.when?.includes("viewItem == database"),
+    );
+
+    expect(databaseCopyEntry?.group).toBe("2_copy");
+    expect(databaseErdEntry?.group).toBe("1_open");
   });
 });

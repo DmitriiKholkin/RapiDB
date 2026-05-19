@@ -29,10 +29,6 @@ import {
 import { HistoryProvider } from "./providers/historyProvider";
 import { connectWithProgress } from "./utils/connectOrchestration";
 import {
-  generateCreateDatabaseTemplate,
-  generateCreateSchemaTemplate,
-} from "./utils/createAction";
-import {
   logErrorWithContext,
   normalizeUnknownError,
 } from "./utils/errorHandling";
@@ -46,7 +42,6 @@ const CMD = {
   connect: "rapidb.connect",
   disconnect: "rapidb.disconnect",
   newQuery: "rapidb.newQuery",
-  create: "rapidb.create",
   openTableData: "rapidb.openTableData",
   showDDL: "rapidb.showDDL",
   copyNodeName: "rapidb.copyNodeName",
@@ -320,50 +315,6 @@ function registerCommands(
       undefined,
       undefined,
       true,
-    );
-  });
-
-  reg(CMD.create, (node?: RapiDBNode) => {
-    if (!node?.connectionId) {
-      vscode.window.showWarningMessage(
-        "[RapiDB] Select a connection or database node first.",
-      );
-      return;
-    }
-
-    const connectionType = connectionManager.getConnection(
-      node.connectionId,
-    )?.type;
-    if (!connectionType) {
-      vscode.window.showWarningMessage(
-        "[RapiDB] Cannot detect connection type for this node.",
-      );
-      return;
-    }
-
-    const template =
-      node.kind === "connectionNode_connected" ||
-      node.kind === "connectionNode_disconnected"
-        ? generateCreateDatabaseTemplate(connectionType)
-        : node.kind === "database"
-          ? generateCreateSchemaTemplate(connectionType, node.database)
-          : undefined;
-
-    if (!template) {
-      vscode.window.showWarningMessage(
-        "[RapiDB] Create is not supported for the selected node or database type.",
-      );
-      return;
-    }
-
-    QueryPanel.createOrShow(
-      context,
-      connectionManager,
-      node.connectionId,
-      template.script,
-      undefined,
-      true,
-      template.formatOnOpen,
     );
   });
 

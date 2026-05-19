@@ -300,7 +300,7 @@ describe("ConnectionProvider", () => {
     ]);
   });
 
-  it("composes create-aware context values for connected and disconnected connection nodes", async () => {
+  it("uses canonical context values for connected and disconnected connection nodes", async () => {
     const connectionManager = {
       getConnections: vi.fn(() => [
         { id: "conn-can", name: "Connected PG", type: "pg" },
@@ -347,18 +347,14 @@ describe("ConnectionProvider", () => {
       (node) => node.connectionId === "conn-limited",
     );
 
-    expect(connectedPg?.contextValue).toBe(
-      "connectionNode_connected_canCreateDatabase",
-    );
-    expect(disconnectedRedis?.contextValue).toBe(
-      "connectionNode_disconnected_noCreateDatabase",
-    );
+    expect(connectedPg?.contextValue).toBe("connectionNode_connected");
+    expect(disconnectedRedis?.contextValue).toBe("connectionNode_disconnected");
     expect(disconnectedSqlite?.contextValue).toBe(
-      "connectionNode_disconnected_canCreateDatabase",
+      "connectionNode_disconnected",
     );
   });
 
-  it("composes create-aware database context values for can/no schema support", async () => {
+  it("uses canonical database context values across connection types", async () => {
     const connections = [
       { id: "conn-pg", name: "PG", type: "pg" },
       { id: "conn-oracle", name: "Oracle", type: "oracle" },
@@ -401,10 +397,10 @@ describe("ConnectionProvider", () => {
       byConnectionId.set(root.connectionId, databaseNodes[0]?.contextValue);
     }
 
-    expect(byConnectionId.get("conn-pg")).toBe("database_canCreateSchema");
-    expect(byConnectionId.get("conn-oracle")).toBe("database_canCreateSchema");
-    expect(byConnectionId.get("conn-mysql")).toBe("database_noCreateSchema");
-    expect(byConnectionId.get("conn-redis")).toBe("database_noCreateSchema");
+    expect(byConnectionId.get("conn-pg")).toBe("database");
+    expect(byConnectionId.get("conn-oracle")).toBe("database");
+    expect(byConnectionId.get("conn-mysql")).toBe("database");
+    expect(byConnectionId.get("conn-redis")).toBe("database");
   });
 
   it("renders multi-schema databases from the shared schema snapshot", async () => {

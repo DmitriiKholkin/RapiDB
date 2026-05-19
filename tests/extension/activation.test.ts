@@ -8,7 +8,6 @@ const expectedCommands = [
   "rapidb.connect",
   "rapidb.disconnect",
   "rapidb.newQuery",
-  "rapidb.create",
   "rapidb.openTableData",
   "rapidb.showDDL",
   "rapidb.copyNodeName",
@@ -504,6 +503,7 @@ describe("extension activation", () => {
       "public",
       "daily_users",
       true,
+      "materializedView",
     );
   });
 
@@ -537,77 +537,7 @@ describe("extension activation", () => {
       "app_db",
       "active_users",
       true,
-    );
-  });
-
-  it("opens create templates with DB-specific formatting behavior", async () => {
-    const extension = await import("../../src/extension/extension");
-    const context = { subscriptions: [] as Array<{ dispose(): void }> };
-
-    (
-      connectionManagerInstance.getConnection as ReturnType<typeof vi.fn>
-    ).mockImplementation((id: string) => {
-      if (id === "conn-2") {
-        return { id, name: "Local SQLite", type: "sqlite" };
-      }
-
-      if (id === "conn-3") {
-        return { id, name: "Oracle Main", type: "oracle" };
-      }
-
-      return { id, name: "Primary", type: "pg" };
-    });
-
-    extension.activate(context as never);
-
-    const createCommand = vscodeState.registerCommand.mock.calls.find(
-      ([command]) => command === "rapidb.create",
-    )?.[1] as ((node: Record<string, unknown>) => void) | undefined;
-
-    if (!createCommand) {
-      throw new Error("Create command was not registered.");
-    }
-
-    createCommand({
-      kind: "connectionNode_connected",
-      connectionId: "conn-1",
-    });
-    createCommand({
-      kind: "connectionNode_disconnected",
-      connectionId: "conn-2",
-    });
-    createCommand({
-      kind: "database",
-      connectionId: "conn-3",
-      database: "ORCLPDB1",
-    });
-
-    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
-      1,
-      context,
-      connectionManagerInstance,
-      "conn-1",
-      expect.stringContaining("CREATE DATABASE"),
-      true,
-      true,
-    );
-    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
-      2,
-      context,
-      connectionManagerInstance,
-      "conn-2",
-      expect.stringContaining("ATTACH DATABASE"),
-      true,
-      false,
-    );
-    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
-      3,
-      context,
-      connectionManagerInstance,
-      "conn-3",
-      expect.stringContaining("CREATE USER"),
-      true,
-      true,
+      "view",
     );
   });
 

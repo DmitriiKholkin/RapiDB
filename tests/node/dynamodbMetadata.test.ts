@@ -1,3 +1,4 @@
+import { marshall } from "@aws-sdk/util-dynamodb";
 import { describe, expect, it, vi } from "vitest";
 import { DynamoDBDriver } from "../../src/extension/dbDrivers/dynamodb";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
@@ -14,28 +15,12 @@ function createDriver() {
   const driverState = driver as unknown as {
     client: { send: ReturnType<typeof vi.fn> } | null;
     connected: boolean;
-    readRows: ReturnType<typeof vi.fn>;
   };
 
   driverState.connected = true;
-  driverState.readRows = vi.fn(async () => [
-    {
-      tenant_id: "tenant-1",
-      user_id: "user-1",
-      email: "person@example.com",
-      age: 31,
-      active: true,
-      profile: { tier: "pro", visits: 3 },
-      tags: new Set(["alpha", "beta"]),
-      scores: new Set([1, 2.5]),
-      history: [1, "two", true],
-      payload: Uint8Array.from([0xde, 0xad, 0xbe, 0xef]),
-      deleted_at: null,
-    },
-  ]);
   driverState.client = {
     send: vi.fn(async (command: { input?: Record<string, unknown> }) => {
-      if (command.input?.TableName) {
+      if (command.constructor.name === "DescribeTableCommand") {
         return {
           Table: {
             KeySchema: [
@@ -48,6 +33,28 @@ function createDriver() {
             ],
           },
         };
+      }
+
+      if (command.constructor.name === "ScanCommand") {
+        return command.input?.Select === "COUNT"
+          ? { Count: 1 }
+          : {
+              Items: [
+                marshall({
+                  tenant_id: "tenant-1",
+                  user_id: "user-1",
+                  email: "person@example.com",
+                  age: 31,
+                  active: true,
+                  profile: { tier: "pro", visits: 3 },
+                  tags: new Set(["alpha", "beta"]),
+                  scores: new Set([1, 2.5]),
+                  history: [1, "two", true],
+                  payload: Uint8Array.from([0xde, 0xad, 0xbe, 0xef]),
+                  deleted_at: null,
+                }),
+              ],
+            };
       }
 
       return {
@@ -219,19 +226,16 @@ describe("DynamoDBDriver metadata", () => {
     const destroy = vi.fn();
     const driverState = driver as unknown as {
       client: { destroy: typeof destroy } | null;
-      documentClient: { marker: string } | null;
       connected: boolean;
     };
 
     driverState.client = { destroy };
-    driverState.documentClient = { marker: "document-client" };
     driverState.connected = true;
 
     await driver.disconnect();
 
     expect(destroy).toHaveBeenCalledTimes(1);
     expect(driverState.client).toBeNull();
-    expect(driverState.documentClient).toBeNull();
     expect(driver.isConnected()).toBe(false);
   });
 });

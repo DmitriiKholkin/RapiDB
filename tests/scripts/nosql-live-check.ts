@@ -606,7 +606,7 @@ async function verifyDynamoDriver(): Promise<void> {
   const documentClient = DynamoDBDocumentClient.from(adminClient, {
     marshallOptions: { removeUndefinedValues: true },
   });
-  const tableName = "users";
+  const tableName = `users-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   try {
     try {
       await adminClient.send(new DeleteTableCommand({ TableName: tableName }));
@@ -629,7 +629,10 @@ async function verifyDynamoDriver(): Promise<void> {
           { AttributeName: "tenant_id", KeyType: "HASH" },
           { AttributeName: "user_id", KeyType: "RANGE" },
         ],
-        BillingMode: "PAY_PER_REQUEST",
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 1,
+          WriteCapacityUnits: 1,
+        },
         GlobalSecondaryIndexes: [
           {
             IndexName: "email-index",
@@ -638,6 +641,10 @@ async function verifyDynamoDriver(): Promise<void> {
               { AttributeName: "user_id", KeyType: "RANGE" },
             ],
             Projection: { ProjectionType: "ALL" },
+            ProvisionedThroughput: {
+              ReadCapacityUnits: 1,
+              WriteCapacityUnits: 1,
+            },
           },
         ],
       }),
@@ -697,27 +704,29 @@ async function verifyDynamoDriver(): Promise<void> {
     assert.deepEqual(databases, [{ name: "us-east-1", schemas: [] }]);
 
     const objects = await driver.listObjects("us-east-1");
-    assert.deepEqual(objects, [
-      { schema: "us-east-1", name: "users", type: "table" },
-    ]);
+    assert(objects.some((object) => object.name === tableName));
 
     const columns = await driver.describeColumns(
       "us-east-1",
       "us-east-1",
-      "users",
+      tableName,
     );
     assert.equal(findColumn(columns, "tenant_id").primaryKeyRole, "partition");
     assert.equal(findColumn(columns, "user_id").primaryKeyRole, "sort");
     assert.equal(findColumn(columns, "email").category, "text");
     assert.equal(findColumn(columns, "profile").category, "json");
 
-    const indexes = await driver.getIndexes("us-east-1", "us-east-1", "users");
+    const indexes = await driver.getIndexes(
+      "us-east-1",
+      "us-east-1",
+      tableName,
+    );
     assert(indexes.some((index) => index.name === "email-index"));
 
     const page = await driver.readTablePage({
       database: "us-east-1",
       schema: "us-east-1",
-      table: "users",
+      table: tableName,
       page: 1,
       pageSize: 10,
       filters: [],
@@ -740,7 +749,7 @@ async function verifyDynamoDriver(): Promise<void> {
 
     const queryResult = await driver.query(
       JSON.stringify({
-        TableName: "users",
+        TableName: tableName,
         FilterExpression: "#tenant = :tenant",
         ExpressionAttributeNames: {
           "#tenant": "tenant_id",
@@ -758,7 +767,7 @@ async function verifyDynamoDriver(): Promise<void> {
     await driver.insertRow({
       database: "us-east-1",
       schema: "us-east-1",
-      table: "users",
+      table: tableName,
       values: {
         tenant_id: "tenant-3",
         user_id: "user-3",
@@ -769,7 +778,7 @@ async function verifyDynamoDriver(): Promise<void> {
     await driver.updateRows({
       database: "us-east-1",
       schema: "us-east-1",
-      table: "users",
+      table: tableName,
       updates: [
         {
           primaryKeys: { tenant_id: "tenant-3", user_id: "user-3" },
@@ -780,7 +789,7 @@ async function verifyDynamoDriver(): Promise<void> {
     await driver.deleteRows({
       database: "us-east-1",
       schema: "us-east-1",
-      table: "users",
+      table: tableName,
       primaryKeyValuesList: [{ tenant_id: "tenant-3", user_id: "user-3" }],
     });
 

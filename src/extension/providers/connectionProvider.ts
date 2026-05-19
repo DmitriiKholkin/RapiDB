@@ -35,10 +35,6 @@ import type {
 } from "../dbDrivers/types";
 import { DEFAULT_DRIVER_ENTITY_MANIFEST as DEFAULT_ENTITY_MANIFEST } from "../dbDrivers/types";
 import {
-  composeCreateAwareConnectionContextValue,
-  composeCreateAwareDatabaseContextValue,
-} from "../utils/createAction";
-import {
   composeOpenDdlAwareContextValue,
   type OpenDdlNodeKind,
   type OpenDdlSupportHints,
@@ -763,9 +759,6 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       connectionId,
       databaseName,
     );
-    node.contextValue = composeCreateAwareDatabaseContextValue(
-      this.getConnectionType(connectionId),
-    );
     node.tooltip =
       this.getConnectionType(connectionId) === "elasticsearch"
         ? "Indices"
@@ -1187,16 +1180,6 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
         title: "Connect",
         arguments: [node],
       };
-    }
-
-    if (
-      kind === "connectionNode_connected" ||
-      kind === "connectionNode_disconnected"
-    ) {
-      node.contextValue = composeCreateAwareConnectionContextValue(
-        kind,
-        config.type,
-      );
     }
 
     return node;
