@@ -511,7 +511,7 @@ async function verifyElasticsearchDriver(): Promise<void> {
     );
 
     const queryResult = await driver.query(
-      'search {"index":"users","query":{"term":{"active":true}},"size":10}',
+      'POST /users/_search\n{\n  "query": {\n    "term": {\n      "active": true\n    }\n  },\n  "size": 10\n}',
     );
     const queryRows = rowsFromQuery(queryResult);
     assert.equal(queryRows.length, 1);

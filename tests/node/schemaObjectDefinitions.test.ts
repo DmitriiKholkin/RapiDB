@@ -749,7 +749,7 @@ describe("schema object definitions", () => {
         tableSections: {
           columns: "supported",
           constraints: "not_applicable",
-          indexes: "supported",
+          indexes: "not_applicable",
           triggers: "not_applicable",
         },
       },

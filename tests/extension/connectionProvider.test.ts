@@ -567,7 +567,7 @@ describe("ConnectionProvider", () => {
     expect(views[0]?.tooltip).toContain("View: active_users");
   });
 
-  it("flattens Redis schema level and keeps Elasticsearch schema level", async () => {
+  it("flattens Redis schema level and hides Elasticsearch virtual database and schema levels", async () => {
     const redisManager = {
       getConnections: vi.fn(() => [
         { id: "conn-redis", name: "redis-conn", type: "redis" },
@@ -676,24 +676,13 @@ describe("ConnectionProvider", () => {
       elasticsearchManager as never,
     );
     const elasticsearchRoots = await elasticsearchProvider.getChildren();
-    const elasticsearchDatabases = await elasticsearchProvider.getChildren(
-      elasticsearchRoots[0],
-    );
-    const elasticsearchSchemas = await elasticsearchProvider.getChildren(
-      elasticsearchDatabases[0],
-    );
-
-    expect(elasticsearchSchemas.map((node) => node.label)).toEqual(["indices"]);
-
     const elasticsearchCategories = await elasticsearchProvider.getChildren(
-      elasticsearchSchemas[0],
+      elasticsearchRoots[0],
     );
     expect(elasticsearchCategories.map((node) => node.label)).toEqual([
       "Indices",
     ]);
-    expect(elasticsearchCategories[0]?.tooltip).toContain(
-      "Indices in indices.default",
-    );
+    expect(elasticsearchCategories[0]?.tooltip).toBe("Indices - 1 item");
 
     const elasticsearchObjects = await elasticsearchProvider.getChildren(
       elasticsearchCategories[0],
@@ -701,8 +690,82 @@ describe("ConnectionProvider", () => {
     expect(elasticsearchObjects.map((node) => node.label)).toEqual([
       "products",
     ]);
-    expect(elasticsearchObjects[0]?.tooltip).toContain("Index: products");
-    expect(elasticsearchObjects[0]?.tooltip).toContain("Schema: indices");
+    expect(elasticsearchObjects[0]?.tooltip).toBe("Index: products");
+  });
+
+  it("keeps Elasticsearch virtual database hidden while the baseline schema is still loading", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        {
+          id: "conn-elasticsearch",
+          name: "elasticsearch-conn",
+          type: "elasticsearch",
+        },
+      ]),
+      getConnection: vi.fn(() => ({
+        id: "conn-elasticsearch",
+        name: "elasticsearch-conn",
+        type: "elasticsearch",
+      })),
+      isConnected: vi.fn((id: string) => id === "conn-elasticsearch"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getDriverEntityManifest: vi.fn(() => ({
+        dbObjectKinds: ["table"],
+        tableSections: {
+          columns: "supported",
+          constraints: "not_applicable",
+          indexes: "not_applicable",
+          triggers: "not_applicable",
+        },
+      })),
+      getSchemaSnapshotState: vi.fn((connectionId: string, scope?: unknown) => {
+        expect(connectionId).toBe("conn-elasticsearch");
+
+        if (scope) {
+          return loadedState({
+            databases: [
+              {
+                name: "default",
+                schemas: [],
+              },
+            ],
+          });
+        }
+
+        return loadingState(
+          {
+            databases: [
+              {
+                name: "default",
+                schemas: [],
+              },
+            ],
+          },
+          true,
+        );
+      }),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    const roots = await provider.getChildren();
+    const children = await provider.getChildren(roots[0]);
+
+    expect(children.map((node) => node.label)).toEqual(["Loading indices…"]);
+    expect(children[0]?.kind).toBe("status_loading");
+    expect(children[0]?.tooltip).toBe("Loading indices…");
   });
 
   it("flattens DynamoDB schema level and hides schema wording", async () => {
@@ -1205,7 +1268,7 @@ describe("ConnectionProvider", () => {
     expect(indexNode?.contextValue).toBe("table_detail_index_noDdl");
   });
 
-  it("marks Elasticsearch index detail nodes with noDdl context values via connection-type override", async () => {
+  it("hides the Elasticsearch Indexes detail section", async () => {
     const connectionManager = {
       getConnections: vi.fn(() => [
         { id: "conn-1", name: "Search", type: "elasticsearch" },
@@ -1238,17 +1301,7 @@ describe("ConnectionProvider", () => {
         ...loadedTableDetailState(),
         snapshot: {
           ...loadedTableDetailState().snapshot,
-          indexes: {
-            status: "loaded",
-            items: [
-              {
-                name: "users_id_idx",
-                columns: ["_id"],
-                unique: true,
-                primary: true,
-              },
-            ],
-          },
+          indexes: { status: "loaded", items: [] },
         },
       })),
       getDriverEntityManifest: vi.fn(() => ({
@@ -1256,7 +1309,7 @@ describe("ConnectionProvider", () => {
         tableSections: {
           columns: "supported",
           constraints: "not_applicable",
-          indexes: "supported",
+          indexes: "not_applicable",
           triggers: "not_applicable",
         },
       })),
@@ -1277,23 +1330,12 @@ describe("ConnectionProvider", () => {
     const provider = new ConnectionProvider(connectionManager as never);
 
     const roots = await provider.getChildren();
-    const databases = await provider.getChildren(roots[0]);
-    const schemas = await provider.getChildren(databases[0]);
-    const categories = await provider.getChildren(schemas[0]);
+    const categories = await provider.getChildren(roots[0]);
     const tableNode = (await provider.getChildren(categories[0]))[0];
     const tableSections = await provider.getChildren(tableNode);
-    const indexesSection = tableSections.find(
-      (node) => node.label === "Indexes",
-    );
-
-    if (!indexesSection) {
-      throw new Error("Expected indexes section to be present");
-    }
-
-    const indexNode = (await provider.getChildren(indexesSection))[0];
 
     expect(tableNode?.contextValue).toBe("table");
-    expect(indexNode?.contextValue).toBe("table_detail_index_noDdl");
+    expect(tableSections.map((node) => node.label)).toEqual(["Columns"]);
   });
 
   it("loads database scopes lazily and shows a database-level placeholder while that scope is pending", async () => {

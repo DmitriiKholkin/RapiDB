@@ -60,6 +60,13 @@ describe("ConnectionFormView", () => {
     expect(screen.getByLabelText("Elasticsearch endpoint")).toBeTruthy();
     expect(screen.getByLabelText("Elasticsearch API key")).toBeTruthy();
     expect(screen.getByLabelText("Elasticsearch cloud id")).toBeTruthy();
+    expect(
+      screen
+        .getByRole("switch", {
+          name: /store secrets in vs code secret storage/i,
+        })
+        .getAttribute("aria-disabled"),
+    ).toBe("true");
 
     await user.click(screen.getByRole("button", { name: /dynamodb/i }));
 
@@ -147,6 +154,7 @@ describe("ConnectionFormView", () => {
         endpoint: "http://localhost:9200",
         apiKey: "api-key",
         cloudId: "deployment:ZXM=",
+        useSecretStorage: true,
       }),
     });
 

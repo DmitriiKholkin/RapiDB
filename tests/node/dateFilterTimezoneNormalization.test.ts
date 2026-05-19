@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  formatDatetimeForDisplay,
   hasExplicitTimezone,
   normalizeSqlDatetimeOffsetSpacing,
 } from "../../src/extension/dbDrivers/BaseDBDriver";
@@ -66,6 +67,15 @@ describe("date filter timezone normalization", () => {
     expect(
       normalizeSqlDatetimeOffsetSpacing("2019-07-24 22:24:19.395+0000"),
     ).toBe("2019-07-24 22:24:19.395+00:00");
+  });
+
+  it("formats ISO datetime strings with T separator into the shared display form", () => {
+    expect(formatDatetimeForDisplay("2026-04-01T09:00:00Z")).toBe(
+      "2026-04-01 09:00:00Z",
+    );
+    expect(formatDatetimeForDisplay("2026-04-01T09:00:00.123456+0000")).toBe(
+      "2026-04-01 09:00:00.123+00:00",
+    );
   });
 
   it("normalizes date filter value when datetime has +HH timezone", () => {

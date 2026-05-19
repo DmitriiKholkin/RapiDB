@@ -651,6 +651,43 @@ describe("ConnectionManager", () => {
     });
   });
 
+  it("hydrates stored Elasticsearch API keys from Secret Storage before connecting", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-es",
+        name: "Elastic",
+        type: "elasticsearch",
+        endpoint: "https://cluster.example.com",
+        useSecretStorage: true,
+      },
+    ]);
+    store.setSecret(
+      "conn-es",
+      JSON.stringify({
+        apiKey: "base64-api-key",
+      }),
+    );
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await manager.connectTo("conn-es");
+
+    expect(driverInstances[0]?.config).toMatchObject({
+      id: "conn-es",
+      type: "elasticsearch",
+      endpoint: "https://cluster.example.com",
+      apiKey: "base64-api-key",
+    });
+  });
+
   it("loads the baseline database and leaves other databases catalog-only until expanded", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"

@@ -486,6 +486,22 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const isElasticsearch = type === "elasticsearch";
   const isDynamo = type === "dynamodb";
   const supportsSsl = !isSQLite && !isDynamo;
+  const secretStorageRequired = isElasticsearch;
+  const effectiveUseSecretStorage = secretStorageRequired
+    ? true
+    : useSecretStorage;
+  const secretStorageLabel = isElasticsearch
+    ? "Store secrets in VS Code Secret Storage"
+    : "Store password in VS Code Secret Storage";
+  const secretStorageHint = isElasticsearch
+    ? "Elasticsearch credentials are always saved in your OS keychain and will not appear in settings.json."
+    : effectiveUseSecretStorage
+      ? "Password saved in your OS keychain — will NOT appear in settings.json."
+      : "Password will be saved in plaintext in settings.json. Enable to store securely.";
+  const elasticsearchApiKeyHint =
+    hasStoredSecret && elasticsearchApiKey.length === 0
+      ? "Leave blank to keep the stored API key unchanged."
+      : "Will be stored securely in VS Code Secret Storage (OS keychain)";
 
   useEffect(
     () =>
@@ -526,7 +542,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       name: name.trim(),
       type,
       folder: folder.trim() || undefined,
-      useSecretStorage,
+      useSecretStorage: effectiveUseSecretStorage,
       hasStoredSecret: hasStoredSecret || undefined,
       ...(isSQLite
         ? { filePath: filePath.trim() }
@@ -587,7 +603,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     name,
     type,
     folder,
-    useSecretStorage,
+    effectiveUseSecretStorage,
     hasStoredSecret,
     isSQLite,
     filePath,
@@ -896,7 +912,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                 </Field>
                 <Field
                   label="API Key"
-                  hint="Optional API key for Elasticsearch authentication."
+                  hint={`Optional API key for Elasticsearch authentication. ${elasticsearchApiKeyHint}`}
                 >
                   <FocusInput
                     aria-label="Elasticsearch API key"
@@ -924,25 +940,29 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
 
       {!isSQLite && !isDynamo && (
         <Card>
-          <CardHeader icon="shield" label="Password & Security" />
+          <CardHeader
+            icon="shield"
+            label={
+              isElasticsearch ? "Credentials & Security" : "Password & Security"
+            }
+          />
 
           <Toggle
-            label="Store password in VS Code Secret Storage"
-            hint={
-              useSecretStorage
-                ? "Password saved in your OS keychain — will NOT appear in settings.json."
-                : "Password will be saved in plaintext in settings.json. Enable to store securely."
-            }
-            checked={useSecretStorage}
+            label={secretStorageLabel}
+            hint={secretStorageHint}
+            checked={effectiveUseSecretStorage}
             onChange={setUseSecretStorage}
+            disabled={secretStorageRequired}
           />
 
           <Field
             label="Password"
             hint={
-              useSecretStorage && hasStoredSecret && password.length === 0
+              effectiveUseSecretStorage &&
+              hasStoredSecret &&
+              password.length === 0
                 ? "Leave blank to keep the stored password unchanged."
-                : useSecretStorage
+                : effectiveUseSecretStorage
                   ? "Will be stored securely in VS Code Secret Storage (OS keychain)"
                   : "Will be stored in plaintext in settings.json"
             }
@@ -957,14 +977,14 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                 style={{
                   fontFamily: "var(--vscode-editor-font-family, monospace)",
                   paddingRight: 34,
-                  borderColor: useSecretStorage
+                  borderColor: effectiveUseSecretStorage
                     ? "var(--vscode-testing-iconPassed, #4ec94e)"
                     : "var(--vscode-inputValidation-warningBorder, #b89500)",
                 }}
               />
               <span
                 title={
-                  useSecretStorage
+                  effectiveUseSecretStorage
                     ? "Stored in OS keychain"
                     : "Stored in plaintext"
                 }
@@ -978,7 +998,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                   opacity: 0.75,
                 }}
               >
-                {useSecretStorage ? "🔒" : "⚠️"}
+                {effectiveUseSecretStorage ? "🔒" : "⚠️"}
               </span>
             </div>
           </Field>

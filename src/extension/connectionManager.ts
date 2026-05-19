@@ -430,6 +430,10 @@ function cloneSchemaSnapshotState(
 }
 
 function getConfiguredDefaultDatabaseName(config: ConnectionConfig): string {
+  if (config.type === "elasticsearch") {
+    return "default";
+  }
+
   return (
     config.database || config.serviceName || (config.filePath ? "main" : "")
   );
@@ -743,6 +747,7 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
 
   private parseStoredSecrets(value: string | undefined): {
     password?: string;
+    apiKey?: string;
     awsAccessKeyId?: string;
     awsSecretAccessKey?: string;
     awsSessionToken?: string;
@@ -757,6 +762,7 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
         return {
           password:
             typeof parsed.password === "string" ? parsed.password : undefined,
+          apiKey: typeof parsed.apiKey === "string" ? parsed.apiKey : undefined,
           awsAccessKeyId:
             typeof parsed.awsAccessKeyId === "string"
               ? parsed.awsAccessKeyId
@@ -786,6 +792,7 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
       return {
         ...config,
         password: secrets.password ?? config.password ?? "",
+        apiKey: secrets.apiKey ?? config.apiKey,
         awsAccessKeyId: secrets.awsAccessKeyId ?? config.awsAccessKeyId,
         awsSecretAccessKey:
           secrets.awsSecretAccessKey ?? config.awsSecretAccessKey,

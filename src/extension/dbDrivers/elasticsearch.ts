@@ -1,6 +1,10 @@
 import { Client } from "@elastic/elasticsearch";
 import type { ConnectionConfig } from "../connectionManager";
 import {
+  formatDatetimeForDisplay,
+  normalizeSqlDatetimeOffsetSpacing,
+} from "./BaseDBDriver";
+import {
   applyFilters,
   applySort,
   flattenRootRecord,
@@ -30,17 +34,95 @@ import type {
   TableInfo,
   TransactionOperation,
   TriggerMeta,
+  TypeCategory,
 } from "./types";
+import { resolveFilterOperators } from "./types";
 
 const ELASTICSEARCH_ENTITY_MANIFEST: DriverEntityManifest = {
   dbObjectKinds: ["table"],
   tableSections: {
     columns: "supported",
     constraints: "not_applicable",
-    indexes: "supported",
+    indexes: "not_applicable",
     triggers: "not_applicable",
   },
 };
+
+type ElasticsearchFieldMeta = {
+  type: string;
+  nullValue?: unknown;
+  kind: "mapped" | "runtime" | "alias";
+  aliasPath?: string;
+  targetType?: string;
+};
+
+type ElasticsearchRestMethod = "GET" | "POST" | "PUT" | "DELETE";
+
+interface ElasticsearchRestCommand {
+  method: ElasticsearchRestMethod;
+  path: string;
+  pathSegments: string[];
+  queryParams: URLSearchParams;
+  body?: unknown;
+}
+
+const ELASTICSEARCH_TEXT_TYPES = new Set([
+  "annotated_text",
+  "completion",
+  "constant_keyword",
+  "ip",
+  "keyword",
+  "match_only_text",
+  "pattern_text",
+  "search_as_you_type",
+  "semantic_text",
+  "text",
+  "version",
+  "wildcard",
+]);
+
+const ELASTICSEARCH_INTEGER_TYPES = new Set([
+  "byte",
+  "integer",
+  "long",
+  "short",
+  "token_count",
+  "unsigned_long",
+]);
+
+const ELASTICSEARCH_FLOAT_TYPES = new Set([
+  "double",
+  "float",
+  "half_float",
+  "rank_feature",
+  "scaled_float",
+]);
+
+const ELASTICSEARCH_DATETIME_TYPES = new Set(["date", "date_nanos"]);
+
+const ELASTICSEARCH_JSON_TYPES = new Set([
+  "aggregate_metric_double",
+  "exponential_histogram",
+  "flattened",
+  "histogram",
+  "join",
+  "nested",
+  "object",
+  "passthrough",
+  "percolator",
+  "rank_features",
+  "sparse_vector",
+  "tdigest",
+]);
+
+const ELASTICSEARCH_ARRAY_TYPES = new Set(["dense_vector"]);
+
+const ELASTICSEARCH_SPATIAL_TYPES = new Set([
+  "geo_point",
+  "geo_shape",
+  "point",
+  "shape",
+]);
 
 export class ElasticsearchDriver implements IDBDriver {
   private client: Client | null = null;
@@ -118,7 +200,7 @@ export class ElasticsearchDriver implements IDBDriver {
   }
 
   async listDatabases(): Promise<DatabaseInfo[]> {
-    return [{ name: this.config.database || "default", schemas: [] }];
+    return [{ name: "default", schemas: [] }];
   }
 
   async listSchemas(): Promise<SchemaInfo[]> {
@@ -127,12 +209,26 @@ export class ElasticsearchDriver implements IDBDriver {
 
   async listObjects(): Promise<TableInfo[]> {
     try {
-      const indices = await this.requireClient().cat.indices({
-        format: "json",
+      const response = await this.requireClient().indices.resolveIndex({
+        name: "*",
+        expand_wildcards: ["open", "closed", "hidden"],
+        allow_no_indices: true,
+        ignore_unavailable: true,
       });
-      const list = indices as Array<{ index?: string }>;
-      return list
-        .map((entry) => entry.index)
+      const backingIndexNames = new Set(
+        response.data_streams.flatMap((stream) => stream.backing_indices),
+      );
+      return response.indices
+        .filter((entry) => {
+          const attributes = new Set(entry.attributes ?? []);
+          return (
+            !attributes.has("hidden") &&
+            !attributes.has("system") &&
+            !entry.data_stream &&
+            !backingIndexNames.has(entry.name)
+          );
+        })
+        .map((entry) => entry.name)
         .filter((name): name is string => Boolean(name))
         .sort((left, right) => left.localeCompare(right))
         .map((name) => ({
@@ -150,25 +246,17 @@ export class ElasticsearchDriver implements IDBDriver {
     _schema: string,
     table: string,
   ): Promise<ColumnMeta[]> {
-    const [rows, mapping] = await Promise.all([
-      this.readRows(table, 1000),
-      this.fetchMappingMeta(table),
-    ]);
-    return inferColumnsFromRows(rows, "_id", {
-      nullableMode: "schemaLess",
-    }).map((column) => {
-      const meta = mapping.get(column.name);
-      return {
-        name: column.name,
-        type: meta ? this.esTypeToNative(meta.type) : column.nativeType,
-        nullable: column.nullable,
-        defaultValue:
-          meta?.nullValue !== undefined ? String(meta.nullValue) : undefined,
-        isPrimaryKey: column.isPrimaryKey,
-        primaryKeyOrdinal: column.primaryKeyOrdinal,
-        isForeignKey: false,
-      };
-    });
+    const columns = await this.describeIndexColumns(table);
+    return columns.map(
+      ({
+        category: _category,
+        nativeType: _nativeType,
+        filterable: _filterable,
+        filterOperators: _filterOperators,
+        valueSemantics: _valueSemantics,
+        ...column
+      }) => column,
+    );
   }
 
   async describeColumns(
@@ -176,26 +264,7 @@ export class ElasticsearchDriver implements IDBDriver {
     _schema: string,
     table: string,
   ): Promise<ColumnTypeMeta[]> {
-    const [rows, mapping] = await Promise.all([
-      this.readRows(table, 1000),
-      this.fetchMappingMeta(table),
-    ]);
-    return inferColumnsFromRows(rows, "_id", {
-      nullableMode: "schemaLess",
-    }).map((column) => {
-      const meta = mapping.get(column.name);
-      const nativeType = meta
-        ? this.esTypeToNative(meta.type)
-        : column.nativeType;
-      return {
-        ...column,
-        type: nativeType,
-        nativeType,
-        category: column.name !== "_id" ? column.category : column.category,
-        defaultValue:
-          meta?.nullValue !== undefined ? String(meta.nullValue) : undefined,
-      };
-    });
+    return this.describeIndexColumns(table);
   }
 
   async getIndexes(
@@ -290,114 +359,544 @@ export class ElasticsearchDriver implements IDBDriver {
         executionTimeMs: 0,
       };
     }
-
     const startedAt = Date.now();
-    if (trimmed.startsWith("search ")) {
-      const payload = JSON.parse(trimmed.slice("search ".length)) as {
-        index: string;
-        query?: Record<string, unknown>;
-        size?: number;
+    const statements = this.splitRestStatements(trimmed);
+    if (statements.length === 0) {
+      return {
+        columns: [],
+        rows: [],
+        rowCount: 0,
+        executionTimeMs: 0,
       };
-      const response = await this.requireClient().search({
-        index: payload.index,
-        size: payload.size ?? 100,
-        query: payload.query as never,
+    }
+
+    if (statements.length === 1) {
+      const command = this.parseRestCommand(statements[0]);
+      if (!command) {
+        throw this.buildInvalidRestCommandError();
+      }
+
+      return this.executeRestCommand(command, startedAt);
+    }
+
+    const results: Array<Record<string, unknown>> = [];
+    let affectedRows = 0;
+    for (const statement of statements) {
+      const command = this.parseRestCommand(statement);
+      if (!command) {
+        throw this.buildInvalidRestCommandError();
+      }
+
+      const result = await this.executeRestCommand(command, startedAt);
+      affectedRows += result.affectedRows ?? 0;
+      results.push({
+        statement,
+        rowCount: result.rowCount,
+        affectedRows: result.affectedRows,
+        rows: this.toPlainRows(result),
       });
-      const rows = this.hitsToRows(
-        response.hits.hits as unknown as Array<Record<string, unknown>>,
+    }
+
+    const row = flattenRootRecord({ results });
+    return {
+      columns: ["results"],
+      rows: [this.mapRowToQueryRow(row, ["results"])],
+      rowCount: 1,
+      affectedRows: affectedRows > 0 ? affectedRows : undefined,
+      executionTimeMs: Date.now() - startedAt,
+    };
+  }
+
+  private splitRestStatements(input: string): string[] {
+    const statements: string[] = [];
+    let cursor = 0;
+
+    while (cursor < input.length) {
+      cursor = this.skipRestStatementSeparators(input, cursor);
+      if (cursor >= input.length) {
+        break;
+      }
+
+      const headerMatch = /^(GET|POST|PUT|DELETE)\s+\S+/i.exec(
+        input.slice(cursor),
       );
-      const columns = inferColumnsFromRows(rows, "_id").map(
-        (column) => column.name,
+      if (!headerMatch) {
+        throw new Error(
+          `Invalid Elasticsearch REST command near: ${input.slice(cursor, cursor + 80)}`,
+        );
+      }
+
+      const statementStart = cursor;
+      cursor += headerMatch[0].length;
+      const bodyStart = this.skipWhitespace(input, cursor);
+      if (bodyStart >= input.length) {
+        statements.push(input.slice(statementStart, cursor).trim());
+        break;
+      }
+
+      const remainder = input.slice(bodyStart);
+      const nextHeader = /^(GET|POST|PUT|DELETE)\s+\S+/i.exec(remainder);
+      if (nextHeader) {
+        statements.push(input.slice(statementStart, cursor).trim());
+        cursor = bodyStart;
+        continue;
+      }
+
+      const jsonEnd = this.findJsonValueEnd(input, bodyStart);
+      statements.push(input.slice(statementStart, jsonEnd).trim());
+      cursor = jsonEnd;
+    }
+
+    return statements;
+  }
+
+  private skipRestStatementSeparators(input: string, cursor: number): number {
+    let next = cursor;
+    while (next < input.length) {
+      const char = input[next];
+      if (char === ";" || /\s/.test(char)) {
+        next += 1;
+        continue;
+      }
+      break;
+    }
+    return next;
+  }
+
+  private skipWhitespace(input: string, cursor: number): number {
+    let next = cursor;
+    while (next < input.length && /\s/.test(input[next])) {
+      next += 1;
+    }
+    return next;
+  }
+
+  private findJsonValueEnd(input: string, cursor: number): number {
+    const opening = input[cursor];
+    if (opening !== "{" && opening !== "[") {
+      throw new Error(
+        `Elasticsearch REST command body must be valid JSON near: ${input.slice(cursor, cursor + 80)}`,
       );
-      return {
-        columns,
-        rows: rows.map((row) => this.mapRowToQueryRow(row, columns)),
-        rowCount: rows.length,
-        executionTimeMs: Date.now() - startedAt,
-      };
     }
 
-    if (trimmed.startsWith("update ")) {
-      const payload = JSON.parse(trimmed.slice("update ".length)) as {
-        index: string;
-        id: string;
-        doc: Record<string, unknown>;
-      };
-      await this.requireClient().update({
-        index: payload.index,
-        id: String(payload.id),
-        doc: payload.doc,
-        refresh: "wait_for",
-      });
-      const row = { result: "updated", index: payload.index, id: payload.id };
-      return {
-        columns: Object.keys(row),
-        rows: [this.mapRowToQueryRow(row, Object.keys(row))],
-        rowCount: 1,
-        affectedRows: 1,
-        executionTimeMs: Date.now() - startedAt,
-      };
-    }
+    const stack: string[] = [opening];
+    let inString = false;
+    let escaping = false;
 
-    if (trimmed.startsWith("delete ")) {
-      const payload = JSON.parse(trimmed.slice("delete ".length)) as {
-        index: string;
-        id: string;
-      };
-      await this.requireClient().delete({
-        index: payload.index,
-        id: String(payload.id),
-        refresh: "wait_for",
-      });
-      const row = { result: "deleted", index: payload.index, id: payload.id };
-      return {
-        columns: Object.keys(row),
-        rows: [this.mapRowToQueryRow(row, Object.keys(row))],
-        rowCount: 1,
-        affectedRows: 1,
-        executionTimeMs: Date.now() - startedAt,
-      };
-    }
+    for (let index = cursor + 1; index < input.length; index += 1) {
+      const char = input[index];
 
-    if (trimmed.startsWith("index ")) {
-      const payload = JSON.parse(trimmed.slice("index ".length)) as {
-        index: string;
-        id?: string;
-        document: Record<string, unknown>;
-      };
-      const document = this.stripDocumentId(payload.document);
-      const response = await this.requireClient().index({
-        index: payload.index,
-        id: payload.id,
-        document,
-        refresh: "wait_for",
-      });
-      const row = { result: response.result, id: response._id };
-      return {
-        columns: Object.keys(row),
-        rows: [this.mapRowToQueryRow(row, Object.keys(row))],
-        rowCount: 1,
-        affectedRows: 1,
-        executionTimeMs: Date.now() - startedAt,
-      };
+      if (escaping) {
+        escaping = false;
+        continue;
+      }
+
+      if (char === "\\") {
+        escaping = true;
+        continue;
+      }
+
+      if (char === '"') {
+        inString = !inString;
+        continue;
+      }
+
+      if (inString) {
+        continue;
+      }
+
+      if (char === "{" || char === "[") {
+        stack.push(char);
+        continue;
+      }
+
+      if (char === "}" || char === "]") {
+        const expected = char === "}" ? "{" : "[";
+        const actual = stack.pop();
+        if (actual !== expected) {
+          throw new Error(
+            "Elasticsearch REST command contains malformed JSON.",
+          );
+        }
+        if (stack.length === 0) {
+          return index + 1;
+        }
+      }
     }
 
     throw new Error(
-      'Elasticsearch query mode expects:\n  search {"index":"my-index","query":{"match_all":{}}}\n  update {"index":"my-index","id":"...","doc":{"field":"value"}}\n  delete {"index":"my-index","id":"..."}\n  index {"index":"my-index","document":{...}}',
+      "Elasticsearch REST command has an unterminated JSON body.",
     );
+  }
+
+  private buildInvalidRestCommandError(): Error {
+    return new Error(
+      'Elasticsearch query mode expects REST-like commands:\n  PUT /my-index\n  {"settings":{...},"mappings":{...}}\n  POST /my-index/_search\n  {"query":{"match_all":{}}}\n  PUT /my-index/_doc/my-id\n  {"field":"value"}\n  POST /my-index/_update/my-id\n  {"doc":{"field":"value"}}\n  DELETE /my-index/_doc/my-id',
+    );
+  }
+
+  private parseRestCommand(
+    commandText: string,
+  ): ElasticsearchRestCommand | null {
+    const match = /^(GET|POST|PUT|DELETE)\s+(\S+)/i.exec(commandText);
+    if (!match) {
+      return null;
+    }
+
+    const method = match[1].toUpperCase() as ElasticsearchRestMethod;
+    const rawPath = match[2];
+    const bodyText = commandText.slice(match[0].length).trim();
+    const parsedUrl = new URL(rawPath, "http://rapidb.local");
+    const pathSegments = parsedUrl.pathname
+      .split("/")
+      .filter((segment) => segment.length > 0)
+      .map((segment) => decodeURIComponent(segment));
+
+    return {
+      method,
+      path: parsedUrl.pathname,
+      pathSegments,
+      queryParams: parsedUrl.searchParams,
+      body: bodyText.length > 0 ? JSON.parse(bodyText) : undefined,
+    };
+  }
+
+  private async executeRestCommand(
+    command: ElasticsearchRestCommand,
+    startedAt: number,
+  ): Promise<QueryResult> {
+    const client = this.requireClient();
+    const queryParams = this.queryParamsToObject(command.queryParams);
+    const [firstSegment, secondSegment, thirdSegment] = command.pathSegments;
+
+    if (command.method === "PUT" && command.pathSegments.length === 1) {
+      const response = await client.indices.create({
+        index: firstSegment,
+        ...queryParams,
+        ...this.readObjectBody(command, `PUT ${command.path}`),
+      });
+      return this.buildSingleRowQueryResult(
+        {
+          acknowledged: response.acknowledged,
+          shards_acknowledged: response.shards_acknowledged,
+          index: response.index,
+        },
+        startedAt,
+        1,
+      );
+    }
+
+    if (command.method === "DELETE" && command.pathSegments.length === 1) {
+      const response = await client.indices.delete({
+        index: firstSegment,
+        ...queryParams,
+      });
+      return this.buildSingleRowQueryResult(
+        {
+          acknowledged: response.acknowledged,
+          index: firstSegment,
+        },
+        startedAt,
+        1,
+      );
+    }
+
+    if (
+      (command.method === "GET" || command.method === "POST") &&
+      thirdSegment === undefined &&
+      secondSegment === "_search"
+    ) {
+      const response = await client.search({
+        index: firstSegment,
+        ...queryParams,
+        ...this.readObjectBody(command, `${command.method} ${command.path}`, {
+          allowEmpty: true,
+        }),
+      } as never);
+      const rows = this.hitsToRows(
+        response.hits.hits as unknown as Array<Record<string, unknown>>,
+      );
+      return this.buildRowsQueryResult(rows, startedAt);
+    }
+
+    if (
+      (command.method === "GET" || command.method === "POST") &&
+      command.pathSegments.length === 1 &&
+      firstSegment === "_search"
+    ) {
+      const response = await client.search({
+        ...queryParams,
+        ...this.readObjectBody(command, `${command.method} ${command.path}`, {
+          allowEmpty: true,
+        }),
+      } as never);
+      const rows = this.hitsToRows(
+        response.hits.hits as unknown as Array<Record<string, unknown>>,
+      );
+      return this.buildRowsQueryResult(rows, startedAt);
+    }
+
+    if (
+      command.method === "GET" &&
+      command.pathSegments.length === 3 &&
+      secondSegment === "_doc"
+    ) {
+      const response = await client.get({
+        index: firstSegment,
+        id: thirdSegment,
+        ...queryParams,
+      });
+      const row = flattenRootRecord({
+        _id: response._id,
+        ...(((response as { _source?: Record<string, unknown> })._source ??
+          {}) as Record<string, unknown>),
+      });
+      return this.buildRowsQueryResult([row], startedAt);
+    }
+
+    if (
+      (command.method === "PUT" || command.method === "POST") &&
+      secondSegment === "_doc" &&
+      (command.pathSegments.length === 2 || command.pathSegments.length === 3)
+    ) {
+      const response = await client.index({
+        index: firstSegment,
+        ...(thirdSegment ? { id: thirdSegment } : {}),
+        document: this.stripDocumentId(
+          this.readObjectBody(command, `${command.method} ${command.path}`),
+        ),
+        ...queryParams,
+      });
+      return this.buildSingleRowQueryResult(
+        {
+          result: response.result,
+          index: response._index,
+          id: response._id,
+        },
+        startedAt,
+        1,
+      );
+    }
+
+    if (
+      command.method === "POST" &&
+      command.pathSegments.length === 3 &&
+      secondSegment === "_update"
+    ) {
+      const body = this.readObjectBody(command, `POST ${command.path}`);
+      const response = await client.update({
+        index: firstSegment,
+        id: thirdSegment,
+        ...queryParams,
+        ...body,
+      } as never);
+      return this.buildSingleRowQueryResult(
+        {
+          result: response.result,
+          index: firstSegment,
+          id: thirdSegment,
+        },
+        startedAt,
+        1,
+      );
+    }
+
+    if (
+      command.method === "DELETE" &&
+      command.pathSegments.length === 3 &&
+      secondSegment === "_doc"
+    ) {
+      const response = await client.delete({
+        index: firstSegment,
+        id: thirdSegment,
+        ...queryParams,
+      });
+      return this.buildSingleRowQueryResult(
+        {
+          result: response.result,
+          index: firstSegment,
+          id: thirdSegment,
+        },
+        startedAt,
+        1,
+      );
+    }
+
+    if (
+      command.method === "PUT" &&
+      command.pathSegments.length === 2 &&
+      secondSegment === "_mapping"
+    ) {
+      const response = await client.indices.putMapping({
+        index: firstSegment,
+        ...queryParams,
+        ...this.readObjectBody(command, `PUT ${command.path}`),
+      });
+      return this.buildSingleRowQueryResult(
+        {
+          acknowledged: response.acknowledged,
+          index: firstSegment,
+        },
+        startedAt,
+        1,
+      );
+    }
+
+    if (
+      command.method === "PUT" &&
+      command.pathSegments.length === 2 &&
+      secondSegment === "_settings"
+    ) {
+      const response = await client.indices.putSettings({
+        index: firstSegment,
+        ...queryParams,
+        ...this.readObjectBody(command, `PUT ${command.path}`),
+      });
+      return this.buildSingleRowQueryResult(
+        {
+          acknowledged: response.acknowledged,
+          index: firstSegment,
+        },
+        startedAt,
+        1,
+      );
+    }
+
+    if (
+      command.method === "POST" &&
+      command.pathSegments.length === 1 &&
+      firstSegment === "_aliases"
+    ) {
+      const response = await client.indices.updateAliases({
+        ...queryParams,
+        ...this.readObjectBody(command, `POST ${command.path}`),
+      });
+      return this.buildSingleRowQueryResult(
+        {
+          acknowledged: response.acknowledged,
+        },
+        startedAt,
+        1,
+      );
+    }
+
+    throw new Error(
+      `Unsupported Elasticsearch REST command: ${command.method} ${command.path}`,
+    );
+  }
+
+  private readObjectBody(
+    command: ElasticsearchRestCommand,
+    label: string,
+    options?: { allowEmpty?: boolean },
+  ): Record<string, unknown> {
+    if (command.body === undefined) {
+      if (options?.allowEmpty) {
+        return {};
+      }
+      throw new Error(`${label} expects a JSON object body.`);
+    }
+    if (
+      !command.body ||
+      typeof command.body !== "object" ||
+      Array.isArray(command.body)
+    ) {
+      throw new Error(`${label} expects a JSON object body.`);
+    }
+    return command.body as Record<string, unknown>;
+  }
+
+  private queryParamsToObject(
+    queryParams: URLSearchParams,
+  ): Record<string, unknown> {
+    const result: Record<string, unknown> = {};
+    for (const key of new Set(queryParams.keys())) {
+      const values = queryParams
+        .getAll(key)
+        .map((value) => this.coerceRestQueryParamValue(value));
+      if (values.length === 1) {
+        result[key] = values[0];
+      } else if (values.length > 1) {
+        result[key] = values;
+      }
+    }
+    return result;
+  }
+
+  private coerceRestQueryParamValue(value: string): boolean | number | string {
+    if (value === "true") {
+      return true;
+    }
+    if (value === "false") {
+      return false;
+    }
+    if (/^-?\d+(?:\.\d+)?$/.test(value)) {
+      const numeric = Number(value);
+      if (!Number.isNaN(numeric)) {
+        return numeric;
+      }
+    }
+    return value;
+  }
+
+  private buildRowsQueryResult(
+    rows: readonly Record<string, unknown>[],
+    startedAt: number,
+    affectedRows?: number,
+  ): QueryResult {
+    const columns = inferColumnsFromRows(rows, "_id").map(
+      (column) => column.name,
+    );
+    return {
+      columns,
+      rows: rows.map((row) => this.mapRowToQueryRow(row, columns)),
+      rowCount: rows.length,
+      affectedRows,
+      executionTimeMs: Date.now() - startedAt,
+    };
+  }
+
+  private buildSingleRowQueryResult(
+    row: Record<string, unknown>,
+    startedAt: number,
+    affectedRows?: number,
+  ): QueryResult {
+    const columns = Object.keys(row);
+    return {
+      columns,
+      rows: [this.mapRowToQueryRow(row, columns)],
+      rowCount: 1,
+      affectedRows,
+      executionTimeMs: Date.now() - startedAt,
+    };
   }
 
   async readTablePage(
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
-    const rows = await this.readRows(request.table, 5000);
+    const [rows, mapping] = await Promise.all([
+      this.readRows(request.table, 5000),
+      this.fetchMappingMeta(request.table),
+    ]);
+    const columns = this.buildColumnsFromMetadata(rows, mapping);
+    const columnMetaByName = new Map(
+      columns.map((column) => [column.name, column]),
+    );
     const filtered = applyFilters(rows, request.filters);
     const sorted = applySort(filtered, request.sort);
-    const paged = pageRows(sorted, request.page, request.pageSize);
+    const paged = pageRows(sorted, request.page, request.pageSize).map((row) =>
+      Object.fromEntries(
+        Object.entries(row).map(([columnName, value]) => {
+          const column = columnMetaByName.get(columnName);
+          return [
+            columnName,
+            column ? this.formatOutputValue(value, column) : value,
+          ];
+        }),
+      ),
+    );
     return {
-      columns: inferColumnsFromRows(sorted, "_id", {
-        nullableMode: "schemaLess",
-      }),
+      columns,
       rows: paged,
       totalCount: request.skipCount ? 0 : sorted.length,
     };
@@ -424,6 +923,7 @@ export class ElasticsearchDriver implements IDBDriver {
         index: request.table,
         id: String(id),
         doc: update.changes,
+        refresh: "wait_for",
       });
       affectedRows += 1;
     }
@@ -468,6 +968,37 @@ export class ElasticsearchDriver implements IDBDriver {
     return { affectedRows };
   }
 
+  async buildMutationPreviewStatements(
+    operation: "insert" | "update" | "delete",
+    database: string,
+    schema: string,
+    table: string,
+    data: {
+      primaryKeys?: Record<string, unknown>;
+      changes?: Record<string, unknown>;
+      values?: Record<string, unknown>;
+      primaryKeyValuesList?: Array<Record<string, unknown>>;
+    },
+  ): Promise<string[]> {
+    if (operation === "delete" && data.primaryKeyValuesList) {
+      return data.primaryKeyValuesList.map((primaryKeys) =>
+        this.buildMutationPreviewStatement(operation, database, schema, table, {
+          primaryKeys,
+        }),
+      );
+    }
+
+    return [
+      this.buildMutationPreviewStatement(
+        operation,
+        database,
+        schema,
+        table,
+        data,
+      ),
+    ];
+  }
+
   buildMutationPreviewStatement(
     operation: "insert" | "update" | "delete",
     _database: string,
@@ -483,25 +1014,33 @@ export class ElasticsearchDriver implements IDBDriver {
     if (operation === "insert") {
       const id = data.values?._id;
       const document = this.stripDocumentId(data.values ?? {});
-      return `index ${JSON.stringify({
-        index: table,
-        ...(id !== undefined ? { id: String(id) } : {}),
+      return this.formatRestCommand(
+        id !== undefined ? "PUT" : "POST",
+        `/${encodeURIComponent(table)}/_doc${
+          id !== undefined ? `/${encodeURIComponent(String(id))}` : ""
+        }?${new URLSearchParams({
+          ...(id !== undefined ? { op_type: "create" } : {}),
+          refresh: "wait_for",
+        }).toString()}`,
         document,
-      })}`;
+      );
     }
     const id = data.primaryKeys?._id ?? data.primaryKeyValuesList?.[0]?._id;
     if (operation === "update") {
-      return `update ${JSON.stringify({
-        index: table,
-        id: id !== undefined ? String(id) : "<id>",
-        doc: data.changes ?? {},
-      })}`;
+      return this.formatRestCommand(
+        "POST",
+        `/${encodeURIComponent(table)}/_update/${encodeURIComponent(
+          id !== undefined ? String(id) : "<id>",
+        )}?refresh=wait_for`,
+        { doc: data.changes ?? {} },
+      );
     }
-    // delete
-    return `delete ${JSON.stringify({
-      index: table,
-      id: id !== undefined ? String(id) : "<id>",
-    })}`;
+    return this.formatRestCommand(
+      "DELETE",
+      `/${encodeURIComponent(table)}/_doc/${encodeURIComponent(
+        id !== undefined ? String(id) : "<id>",
+      )}?refresh=wait_for`,
+    );
   }
 
   async runTransaction(operations: TransactionOperation[]): Promise<void> {
@@ -537,11 +1076,28 @@ export class ElasticsearchDriver implements IDBDriver {
     return "ORDER BY _id";
   }
 
-  coerceInputValue(value: unknown, _column: ColumnTypeMeta): unknown {
+  coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (typeof value === "string" && column.category === "datetime") {
+      const trimmed = normalizeSqlDatetimeOffsetSpacing(value.trim());
+      const match =
+        /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}:\d{2}|Z)?$/i.exec(
+          trimmed,
+        );
+      if (match) {
+        const [, date, time, fraction, timezone] = match;
+        return `${date}T${time}${fraction ?? ""}${timezone ?? ""}`;
+      }
+    }
     return value;
   }
 
-  formatOutputValue(value: unknown, _column: ColumnTypeMeta): unknown {
+  formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (column.category === "datetime") {
+      const formatted = formatDatetimeForDisplay(value);
+      if (formatted !== null) {
+        return formatted;
+      }
+    }
     return value;
   }
 
@@ -675,71 +1231,348 @@ export class ElasticsearchDriver implements IDBDriver {
 
   private async fetchMappingMeta(
     index: string,
-  ): Promise<Map<string, { type: string; nullValue?: unknown }>> {
+  ): Promise<Map<string, ElasticsearchFieldMeta>> {
     try {
       const response = await this.requireClient().indices.getMapping({ index });
-      const mappings =
-        (
-          response as Record<
-            string,
-            { mappings?: { properties?: Record<string, unknown> } }
-          >
-        )[index]?.mappings?.properties ?? {};
-      const result = new Map<string, { type: string; nullValue?: unknown }>();
-      for (const [field, def] of Object.entries(mappings)) {
-        const fieldDef = def as { type?: string; null_value?: unknown };
-        if (fieldDef.type) {
-          result.set(field, {
-            type: fieldDef.type,
-            nullValue: fieldDef.null_value,
-          });
+      const mappings = (
+        response as Record<
+          string,
+          {
+            mappings?: {
+              properties?: Record<string, unknown>;
+              runtime?: Record<string, unknown>;
+            };
+          }
+        >
+      )[index]?.mappings;
+      const result = new Map<string, ElasticsearchFieldMeta>();
+
+      const addField = (name: string, meta: ElasticsearchFieldMeta): void => {
+        if (!name || result.has(name)) {
+          return;
         }
+        result.set(name, meta);
+      };
+
+      const walkProperties = (
+        properties: Record<string, unknown> | undefined,
+        parentPath = "",
+      ): void => {
+        if (!properties) {
+          return;
+        }
+
+        for (const [fieldName, rawDefinition] of Object.entries(properties)) {
+          if (
+            !rawDefinition ||
+            typeof rawDefinition !== "object" ||
+            Array.isArray(rawDefinition)
+          ) {
+            continue;
+          }
+
+          const definition = rawDefinition as {
+            type?: string;
+            path?: string;
+            null_value?: unknown;
+            properties?: Record<string, unknown>;
+            fields?: Record<string, unknown>;
+          };
+          const fullPath = parentPath
+            ? `${parentPath}.${fieldName}`
+            : fieldName;
+          const hasChildren =
+            definition.properties !== undefined &&
+            Object.keys(definition.properties).length > 0;
+          const effectiveType =
+            definition.type ?? (hasChildren ? "object" : undefined);
+
+          if (effectiveType) {
+            addField(fullPath, {
+              type: effectiveType,
+              nullValue: definition.null_value,
+              kind: effectiveType === "alias" ? "alias" : "mapped",
+              aliasPath:
+                effectiveType === "alias" ? definition.path : undefined,
+            });
+          }
+
+          if (hasChildren) {
+            walkProperties(definition.properties, fullPath);
+          }
+
+          if (definition.fields && Object.keys(definition.fields).length > 0) {
+            walkProperties(definition.fields, fullPath);
+          }
+        }
+      };
+
+      walkProperties(mappings?.properties);
+
+      for (const [fieldName, rawDefinition] of Object.entries(
+        mappings?.runtime ?? {},
+      )) {
+        if (
+          !rawDefinition ||
+          typeof rawDefinition !== "object" ||
+          Array.isArray(rawDefinition)
+        ) {
+          continue;
+        }
+        const definition = rawDefinition as { type?: string };
+        addField(fieldName, {
+          type: definition.type ?? "keyword",
+          kind: "runtime",
+        });
       }
+
+      for (const [fieldName, meta] of [...result.entries()]) {
+        if (meta.kind !== "alias" || !meta.aliasPath) {
+          continue;
+        }
+
+        const target = result.get(meta.aliasPath);
+        if (!target) {
+          continue;
+        }
+
+        result.set(fieldName, {
+          ...meta,
+          nullValue: meta.nullValue ?? target.nullValue,
+          targetType: target.targetType ?? target.type,
+        });
+      }
+
       return result;
     } catch {
       return new Map();
     }
   }
 
-  private esTypeToNative(esType: string): string {
-    switch (esType) {
-      case "keyword":
-      case "text":
-      case "match_only_text":
-      case "wildcard":
-      case "ip":
-      case "version":
-        return "text";
-      case "long":
-      case "integer":
-      case "short":
-      case "byte":
-      case "unsigned_long":
-        return "integer";
-      case "float":
-      case "double":
-      case "half_float":
-      case "scaled_float":
-        return "float";
-      case "boolean":
-        return "boolean";
-      case "date":
-      case "date_nanos":
-        return "datetime";
-      case "binary":
-        return "binary";
-      case "object":
-      case "nested":
-      case "flattened":
-        return "json";
-      case "geo_point":
-      case "geo_shape":
-      case "point":
-      case "shape":
-        return "spatial";
-      default:
-        return "text";
+  private async describeIndexColumns(table: string): Promise<ColumnTypeMeta[]> {
+    const [rows, mapping] = await Promise.all([
+      this.readRows(table, 1000),
+      this.fetchMappingMeta(table),
+    ]);
+    return this.buildColumnsFromMetadata(rows, mapping);
+  }
+
+  private buildColumnsFromMetadata(
+    sampledRows: readonly Record<string, unknown>[],
+    mapping: ReadonlyMap<string, ElasticsearchFieldMeta>,
+  ): ColumnTypeMeta[] {
+    const sampledColumns = inferColumnsFromRows(sampledRows, "_id", {
+      nullableMode: "schemaLess",
+    });
+    const sampledByName = new Map(
+      sampledColumns.map((column) => [column.name, column]),
+    );
+    const orderedNames = [
+      ...mapping.keys(),
+      ...sampledColumns
+        .map((column) => column.name)
+        .filter((name) => !mapping.has(name)),
+    ].filter((name, index, list) => list.indexOf(name) === index);
+
+    const columns: ColumnTypeMeta[] = [this.makeSyntheticIdColumn()];
+
+    for (const fieldName of orderedNames) {
+      if (fieldName === "_id") {
+        continue;
+      }
+
+      const sampled = sampledByName.get(fieldName);
+      const mapped = mapping.get(fieldName);
+      if (!sampled && !mapped) {
+        continue;
+      }
+
+      if (!mapped && sampled) {
+        columns.push(sampled);
+        continue;
+      }
+
+      const resolvedType = this.resolveElasticsearchFieldType(
+        mapped?.type ?? sampled?.nativeType ?? "keyword",
+        mapped,
+        sampled,
+      );
+
+      columns.push({
+        name: fieldName,
+        type: resolvedType.type,
+        nativeType: resolvedType.nativeType,
+        category: resolvedType.category,
+        nullable: sampled?.nullable ?? true,
+        defaultValue:
+          mapped?.nullValue !== undefined
+            ? String(mapped.nullValue)
+            : undefined,
+        isPrimaryKey: false,
+        primaryKeyOrdinal: undefined,
+        isForeignKey: false,
+        filterable: resolvedType.filterable,
+        filterOperators: resolveFilterOperators(resolvedType.category, {
+          filterable: resolvedType.filterable,
+          nullable: sampled?.nullable ?? true,
+        }),
+        valueSemantics: "plain",
+      });
     }
+
+    return columns;
+  }
+
+  private makeSyntheticIdColumn(): ColumnTypeMeta {
+    const category: TypeCategory = "text";
+    return {
+      name: "_id",
+      type: "text",
+      nativeType: "text",
+      category,
+      nullable: false,
+      defaultValue: undefined,
+      isPrimaryKey: true,
+      primaryKeyOrdinal: 1,
+      isForeignKey: false,
+      filterable: true,
+      filterOperators: resolveFilterOperators(category, {
+        filterable: true,
+        nullable: false,
+      }),
+      valueSemantics: "plain",
+    };
+  }
+
+  private resolveElasticsearchFieldType(
+    esType: string,
+    mapped: ElasticsearchFieldMeta | undefined,
+    sampled: ColumnTypeMeta | undefined,
+  ): {
+    type: string;
+    nativeType: string;
+    category: TypeCategory;
+    filterable: boolean;
+  } {
+    const normalizedType = esType.toLowerCase().replace(/-/g, "_");
+
+    if (normalizedType === "alias") {
+      const targetType = mapped?.targetType;
+      const targetInfo = targetType
+        ? this.resolveElasticsearchFieldType(targetType, undefined, sampled)
+        : undefined;
+      const category = targetInfo?.category ?? sampled?.category ?? "text";
+      return {
+        type: esType,
+        nativeType: esType,
+        category,
+        filterable: this.isFilterableCategory(category),
+      };
+    }
+
+    if (ELASTICSEARCH_TEXT_TYPES.has(normalizedType)) {
+      return {
+        type: esType,
+        nativeType: esType,
+        category: "text",
+        filterable: true,
+      };
+    }
+
+    if (ELASTICSEARCH_INTEGER_TYPES.has(normalizedType)) {
+      return {
+        type: esType,
+        nativeType: esType,
+        category: "integer",
+        filterable: true,
+      };
+    }
+
+    if (ELASTICSEARCH_FLOAT_TYPES.has(normalizedType)) {
+      return {
+        type: esType,
+        nativeType: esType,
+        category: "float",
+        filterable: true,
+      };
+    }
+
+    if (ELASTICSEARCH_DATETIME_TYPES.has(normalizedType)) {
+      return {
+        type: esType,
+        nativeType: esType,
+        category: "datetime",
+        filterable: true,
+      };
+    }
+
+    if (normalizedType === "boolean") {
+      return {
+        type: esType,
+        nativeType: esType,
+        category: "boolean",
+        filterable: true,
+      };
+    }
+
+    if (normalizedType === "binary") {
+      return {
+        type: esType,
+        nativeType: esType,
+        category: "binary",
+        filterable: false,
+      };
+    }
+
+    if (ELASTICSEARCH_SPATIAL_TYPES.has(normalizedType)) {
+      return {
+        type: esType,
+        nativeType: esType,
+        category: "spatial",
+        filterable: false,
+      };
+    }
+
+    if (ELASTICSEARCH_ARRAY_TYPES.has(normalizedType)) {
+      return {
+        type: esType,
+        nativeType: esType,
+        category: "array",
+        filterable: true,
+      };
+    }
+
+    if (
+      ELASTICSEARCH_JSON_TYPES.has(normalizedType) ||
+      normalizedType.endsWith("_range")
+    ) {
+      return {
+        type: esType,
+        nativeType: esType,
+        category: "json",
+        filterable: true,
+      };
+    }
+
+    if (sampled) {
+      return {
+        type: esType,
+        nativeType: esType,
+        category: sampled.category,
+        filterable: this.isFilterableCategory(sampled.category),
+      };
+    }
+
+    return {
+      type: esType,
+      nativeType: esType,
+      category: "other",
+      filterable: true,
+    };
+  }
+
+  private isFilterableCategory(category: TypeCategory): boolean {
+    return category !== "binary" && category !== "spatial";
   }
 
   private async readRows(
@@ -789,5 +1622,27 @@ export class ElasticsearchDriver implements IDBDriver {
   ): Record<string, unknown> {
     const { _id: _ignored, ...rest } = document;
     return rest;
+  }
+
+  private formatRestCommand(
+    method: ElasticsearchRestMethod,
+    path: string,
+    body?: Record<string, unknown>,
+  ): string {
+    if (!body) {
+      return `${method} ${path}`;
+    }
+    return `${method} ${path}\n${JSON.stringify(body, null, 2)}`;
+  }
+
+  private toPlainRows(result: QueryResult): Array<Record<string, unknown>> {
+    return result.rows.map((row) =>
+      Object.fromEntries(
+        result.columns.map((columnName, index) => [
+          columnName,
+          row[`__col_${index}`],
+        ]),
+      ),
+    );
   }
 }

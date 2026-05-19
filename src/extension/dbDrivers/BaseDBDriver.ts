@@ -54,7 +54,7 @@ export function formatDatetimeForDisplay(val: unknown): string | null {
   }
   if (typeof val === "string") {
     const m =
-      /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}(:\d{2})?|Z)?$/.exec(
+      /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}(?::?\d{2})?|Z)?$/.exec(
         val,
       );
     if (m) {
@@ -67,7 +67,13 @@ export function formatDatetimeForDisplay(val: unknown): string | null {
           fracStr = `.${String(msNum).padStart(3, "0").replace(/0+$/, "")}`;
         }
       }
-      return `${date} ${time}${fracStr}${tz ?? ""}`;
+      const normalizedTimezone =
+        tz && tz !== "Z"
+          ? normalizeSqlDatetimeOffsetSpacing(`2000-01-01 00:00:00${tz}`).slice(
+              "2000-01-01 00:00:00".length,
+            )
+          : (tz ?? "");
+      return `${date} ${time}${fracStr}${normalizedTimezone}`;
     }
   }
   return null;

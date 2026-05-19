@@ -16,8 +16,8 @@ import {
 } from "../../shared/tableTypes";
 import type {
   ConnectionConfig,
-  ConnectionManager,
   ExplorerSchemaScope,
+  ScopeAwareConnectionManagerApi,
 } from "../connectionManager";
 import type {
   SchemaSnapshotSchemaEntry,
@@ -148,6 +148,21 @@ function formatTooltipObjectKindLabel(label: string): string {
 const PRIMARY_KEY_ICON_COLOR = new vscode.ThemeColor("charts.yellow");
 const SORT_KEY_ICON_COLOR = new vscode.ThemeColor("textLink.foreground");
 
+type ConnectionProviderManager = ScopeAwareConnectionManagerApi & {
+  getConnections(): ConnectionConfig[];
+  isConnected(connectionId: string): boolean;
+  isConnecting(connectionId: string): boolean;
+  onDidConnect(listener: () => void): vscode.Disposable;
+  onDidDisconnect(listener: (connectionId: string) => void): vscode.Disposable;
+  onDidChangeConnections(listener: () => void): vscode.Disposable;
+  onDidChangeSchemaState(
+    listener: (connectionId: string) => void,
+  ): vscode.Disposable;
+  onDidRefreshSchemas(listener: () => void): vscode.Disposable;
+  getConnection?(id: string): ConnectionConfig | undefined;
+  getDriverEntityManifest?(id: string): DriverEntityManifest;
+};
+
 export class RapiDBNode extends vscode.TreeItem {
   constructor(
     label: string,
@@ -232,7 +247,7 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
   private _refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private _refreshAllPending = false;
 
-  constructor(private readonly connectionManager: ConnectionManager) {
+  constructor(private readonly connectionManager: ConnectionProviderManager) {
     const scheduleRefresh = (connectionId?: string) => {
       if (connectionId) {
         this._pendingConnectionRefreshIds.add(connectionId);
@@ -392,9 +407,48 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       return [];
     }
 
-    const state = this.getSchemaState(element.connectionId, {
+    const connectionType = this.getConnectionType(element.connectionId);
+    const rootState = this.getSchemaState(element.connectionId, {
       kind: "connectionRoot",
     });
+    const state =
+      connectionType === "elasticsearch"
+        ? this.connectionManager.getSchemaSnapshotState(element.connectionId)
+        : rootState;
+    if (this.shouldFlattenConnectionLevel(element.connectionId, state)) {
+      const database = state.snapshot.databases[0];
+      const schema = database?.schemas[0];
+      const categories =
+        database && schema
+          ? this.categoryNodes(
+              element.connectionId,
+              database.name,
+              schema,
+              this.getEntityManifest(element.connectionId),
+            )
+          : [];
+      return this.appendStateNodes(
+        element.connectionId,
+        categories,
+        state,
+        "Loading indices…",
+      );
+    }
+
+    if (
+      connectionType === "elasticsearch" &&
+      state.status === "loading" &&
+      state.snapshot.databases.length <= 1 &&
+      (state.snapshot.databases[0]?.schemas.length ?? 0) === 0
+    ) {
+      return this.appendStateNodes(
+        element.connectionId,
+        [],
+        state,
+        "Loading indices…",
+      );
+    }
+
     const databaseNodes = state.snapshot.databases.map((database) =>
       this.makeDatabaseNode(element.connectionId, database.name),
     );
@@ -712,7 +766,10 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     node.contextValue = composeCreateAwareDatabaseContextValue(
       this.getConnectionType(connectionId),
     );
-    node.tooltip = `Database: ${databaseName}`;
+    node.tooltip =
+      this.getConnectionType(connectionId) === "elasticsearch"
+        ? "Indices"
+        : `Database: ${databaseName}`;
     return node;
   }
 
@@ -757,9 +814,12 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     const kindLabel = formatTooltipObjectKindLabel(
       getDbObjectKindDisplayLabel(this.getConnectionType(connectionId), kind),
     );
-    node.tooltip = includeSchema
-      ? `${kindLabel}: ${objectName}\nSchema: ${schemaName}\nDatabase: ${databaseName}`
-      : `${kindLabel}: ${objectName}\nDatabase: ${databaseName}`;
+    node.tooltip =
+      this.getConnectionType(connectionId) === "elasticsearch"
+        ? `${kindLabel}: ${objectName}`
+        : includeSchema
+          ? `${kindLabel}: ${objectName}\nSchema: ${schemaName}\nDatabase: ${databaseName}`
+          : `${kindLabel}: ${objectName}\nDatabase: ${databaseName}`;
     node.contextValue = this.composeContextValue(kind, connectionId);
 
     if (isDataDbObjectKind(kind)) {
@@ -998,12 +1058,7 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
   private getConnectionType(
     connectionId: string,
   ): ConnectionConfig["type"] | undefined {
-    const managerWithConnectionLookup = this
-      .connectionManager as ConnectionManager & {
-      getConnection?: (id: string) => ConnectionConfig | undefined;
-    };
-    const directMatch =
-      managerWithConnectionLookup.getConnection?.(connectionId);
+    const directMatch = this.connectionManager.getConnection?.(connectionId);
     if (directMatch?.type) {
       return directMatch.type;
     }
@@ -1092,6 +1147,21 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
         `File: \`${config.filePath ?? "—"}\``,
       ];
       node.tooltip = new vscode.MarkdownString(tooltipLines.join("\n\n"));
+    } else if (config.type === "elasticsearch") {
+      const authMode = config.apiKey
+        ? "api key"
+        : config.username
+          ? "basic"
+          : "none";
+      const tooltipLines = [
+        `**${config.name}**`,
+        ``,
+        `Type: \`elasticsearch\``,
+        `Endpoint: \`${config.connectionUri ?? config.endpoint ?? (config.host ? `${config.ssl ? "https" : "http"}://${config.host}${config.port ? `:${config.port}` : ""}` : "—")}\``,
+        `Cloud ID: \`${config.cloudId ?? "—"}\``,
+        `Auth: \`${authMode}\``,
+      ];
+      node.tooltip = new vscode.MarkdownString(tooltipLines.join("\n\n"));
     } else {
       const sslStatus = config.ssl
         ? config.rejectUnauthorized !== false
@@ -1178,12 +1248,32 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
         schema.name,
       );
       node.description = `(${count})`;
+      if (connectionType === "elasticsearch") {
+        node.tooltip = `${categoryLabel} - ${count} item${count !== 1 ? "s" : ""}`;
+        return node;
+      }
+
       const scopeLabel = this.hasSchemaConcept(connectionId)
         ? `${schema.name ? `${schema.name}.` : ""}${database}`
         : database;
       node.tooltip = `${categoryLabel} in ${scopeLabel} - ${count} item${count !== 1 ? "s" : ""}`;
       return node;
     });
+  }
+
+  private shouldFlattenConnectionLevel(
+    connectionId: string,
+    state: SchemaSnapshotState,
+  ): boolean {
+    if (this.getConnectionType(connectionId) !== "elasticsearch") {
+      return false;
+    }
+
+    if (state.snapshot.databases.length !== 1) {
+      return false;
+    }
+
+    return state.snapshot.databases[0]?.schemas.length === 1;
   }
 
   private shouldFlattenSchemaLevel(
@@ -1216,16 +1306,14 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     return (
       connectionType !== "mongodb" &&
       connectionType !== "dynamodb" &&
-      connectionType !== "redis"
+      connectionType !== "redis" &&
+      connectionType !== "elasticsearch"
     );
   }
 
   private getEntityManifest(connectionId: string): DriverEntityManifest {
-    const managerWithManifest = this.connectionManager as ConnectionManager & {
-      getDriverEntityManifest?: (id: string) => DriverEntityManifest;
-    };
     return (
-      managerWithManifest.getDriverEntityManifest?.(connectionId) ??
+      this.connectionManager.getDriverEntityManifest?.(connectionId) ??
       DEFAULT_ENTITY_MANIFEST
     );
   }

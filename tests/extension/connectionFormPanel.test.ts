@@ -250,6 +250,69 @@ describe("ConnectionFormPanel", () => {
     );
   });
 
+  it("forces Elasticsearch credentials into Secret Storage and saves a sanitized config", async () => {
+    const context = {
+      secrets: {
+        get: vi.fn(async () => undefined),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn().mockResolvedValue(undefined),
+      getConnection: vi.fn(() => undefined),
+      testConnection: vi.fn(),
+    };
+
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+    );
+
+    await Promise.resolve();
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected a webview panel to be created.");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-es",
+        name: "Elastic Cloud",
+        type: "elasticsearch",
+        endpoint: "https://cluster.example.com",
+        apiKey: "base64-api-key",
+        cloudId: "deployment:ZXM=",
+        useSecretStorage: false,
+      },
+    });
+
+    await expect(promise).resolves.toEqual(
+      expect.objectContaining({
+        id: "conn-es",
+        type: "elasticsearch",
+        endpoint: "https://cluster.example.com",
+        cloudId: "deployment:ZXM=",
+        useSecretStorage: true,
+      }),
+    );
+    expect(context.secrets.store).toHaveBeenCalledWith(
+      "conn-es",
+      JSON.stringify({ apiKey: "base64-api-key" }),
+    );
+    expect(connectionManager.saveConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "elasticsearch",
+        useSecretStorage: true,
+      }),
+    );
+    expect(connectionManager.saveConnection).toHaveBeenCalledWith(
+      expect.not.objectContaining({ apiKey: expect.anything() }),
+    );
+  });
+
   it("falls back to a testResult message when unhandled errors occur for malformed input", async () => {
     const context = {
       secrets: {

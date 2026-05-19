@@ -13,6 +13,7 @@ import { createWebviewShell } from "./webviewShell";
 
 type StoredConnectionSecrets = {
   password?: string;
+  apiKey?: string;
   awsAccessKeyId?: string;
   awsSecretAccessKey?: string;
   awsSessionToken?: string;
@@ -40,6 +41,7 @@ function parseStoredConnectionSecrets(
       return {
         password:
           typeof parsed.password === "string" ? parsed.password : undefined,
+        apiKey: typeof parsed.apiKey === "string" ? parsed.apiKey : undefined,
         awsAccessKeyId:
           typeof parsed.awsAccessKeyId === "string"
             ? parsed.awsAccessKeyId
@@ -72,7 +74,11 @@ function serializeStoredConnectionSecrets(
 }
 
 function shouldUseSecretStorage(payload: ConnectionFormSubmission): boolean {
-  return payload.type === "dynamodb" || payload.useSecretStorage === true;
+  return (
+    payload.type === "dynamodb" ||
+    payload.type === "elasticsearch" ||
+    payload.useSecretStorage === true
+  );
 }
 
 export class ConnectionFormPanel {
@@ -205,6 +211,10 @@ export class ConnectionFormPanel {
       ...rest,
       useSecretStorage,
       password,
+      apiKey:
+        trimOptionalSecret(payload.apiKey) ??
+        (useSecretStorage ? storedSecrets.apiKey : undefined) ??
+        existing?.apiKey,
       awsAccessKeyId:
         trimOptionalSecret(payload.awsAccessKeyId) ??
         (useSecretStorage ? storedSecrets.awsAccessKeyId : undefined) ??
@@ -244,6 +254,10 @@ export class ConnectionFormPanel {
         if (raw.useSecretStorage) {
           const nextSecrets = serializeStoredConnectionSecrets({
             password: trimOptionalSecret(raw.password),
+            apiKey:
+              raw.type === "elasticsearch"
+                ? trimOptionalSecret(raw.apiKey)
+                : undefined,
             awsAccessKeyId:
               raw.type === "dynamodb"
                 ? trimOptionalSecret(raw.awsAccessKeyId)
@@ -272,13 +286,14 @@ export class ConnectionFormPanel {
               type: "saveResult",
               payload: {
                 success: false,
-                error: `SecretStorage unavailable: ${error.message}. Password was not saved.`,
+                error: `SecretStorage unavailable: ${error.message}. Credentials were not saved.`,
               },
             });
             return;
           }
           const {
             password: _pw,
+            apiKey: _apiKey,
             awsAccessKeyId: _awsAccessKeyId,
             awsSecretAccessKey: _awsSecretAccessKey,
             awsSessionToken: _awsSessionToken,
