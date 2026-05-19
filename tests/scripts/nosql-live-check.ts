@@ -204,14 +204,13 @@ async function verifyRedisDriver(): Promise<void> {
       ["users"],
     );
 
-    const columns = await driver.describeColumns("db0", "default", "users");
+    const columns = await driver.describeColumns("db0", "db0", "users");
     assert.equal(findColumn(columns, "key").isPrimaryKey, true);
-    assert.equal(findColumn(columns, "type").category, "text");
     assert.equal(findColumn(columns, "value").category, "text");
 
     const page = await driver.readTablePage({
       database: "db0",
-      schema: "default",
+      schema: "db0",
       table: "users",
       page: 1,
       pageSize: 10,

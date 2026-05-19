@@ -315,6 +315,56 @@ describe("TablePanel", () => {
     });
   });
 
+  it("uses connection-specific object labels in the tab title", () => {
+    const redisManager = {
+      getConnection: vi.fn(() => ({ name: "Cache", type: "redis" })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      getDefaultPageSize: vi.fn(() => 25),
+    };
+
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      redisManager as never,
+      "conn-redis",
+      "db0",
+      "db0",
+      "activity",
+    );
+
+    expect(vscodeMock.createWebviewPanel).toHaveBeenLastCalledWith(
+      "rapidb.tablePanel",
+      "activity (keyspace) [Cache]",
+      expect.anything(),
+      expect.anything(),
+    );
+
+    TablePanel.disposeAll();
+
+    const mongoManager = {
+      getConnection: vi.fn(() => ({ name: "Docs", type: "mongodb" })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      getDefaultPageSize: vi.fn(() => 25),
+    };
+
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      mongoManager as never,
+      "conn-mongo",
+      "app_db",
+      "app_db",
+      "users",
+      false,
+      "table",
+    );
+
+    expect(vscodeMock.createWebviewPanel).toHaveBeenLastCalledWith(
+      "rapidb.tablePanel",
+      "users (collection) [Docs]",
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
   it("uses driver capabilities to classify filter errors", async () => {
     getPageMock.mockRejectedValueOnce(
       new Error("invalid input syntax for type uuid"),

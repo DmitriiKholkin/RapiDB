@@ -378,6 +378,11 @@ function registerCommands(
       node.schema ?? "",
       node.objectName,
       isView,
+      node.kind === "materializedView"
+        ? "materializedView"
+        : node.kind === "view"
+          ? "view"
+          : "table",
     );
   });
 

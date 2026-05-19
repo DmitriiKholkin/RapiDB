@@ -256,6 +256,18 @@ export interface IDBDriver {
       primaryKeyValuesList?: Array<Record<string, unknown>>;
     },
   ): string;
+  buildMutationPreviewStatements?(
+    operation: "insert" | "update" | "delete",
+    database: string,
+    schema: string,
+    table: string,
+    data: {
+      primaryKeys?: Record<string, unknown>;
+      changes?: Record<string, unknown>;
+      values?: Record<string, unknown>;
+      primaryKeyValuesList?: Array<Record<string, unknown>>;
+    },
+  ): Promise<string[]>;
   runTransaction(operations: TransactionOperation[]): Promise<void>;
   getMutationAtomicityRisk?(
     database: string,

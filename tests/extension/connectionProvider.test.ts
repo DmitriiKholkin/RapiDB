@@ -564,60 +564,145 @@ describe("ConnectionProvider", () => {
     const views = await provider.getChildren(viewsCategory);
     expect(views.map((node) => node.label)).toEqual(["active_users"]);
     expect(viewsCategory.tooltip).toContain("Views in app_db");
-    expect(views[0]?.tooltip).toContain("view: active_users");
+    expect(views[0]?.tooltip).toContain("View: active_users");
   });
 
-  it("keeps schema level for Redis and Elasticsearch", async () => {
-    const baseDatabases = {
-      redis: {
-        name: "db0",
-        schemas: [{ name: "default", objects: [] }],
-      },
-      elasticsearch: {
-        name: "default",
-        schemas: [{ name: "indices", objects: [] }],
-      },
-    } as const;
-
-    for (const [type, database] of Object.entries(baseDatabases)) {
-      const connectionId = `conn-${type}`;
-      const connectionManager = {
-        getConnections: vi.fn(() => [
-          { id: connectionId, name: `${type}-conn`, type },
-        ]),
-        isConnected: vi.fn((id: string) => id === connectionId),
-        isConnecting: vi.fn(() => false),
-        ensureSchemaScopeLoading: vi.fn(),
-        getSchemaSnapshotState: vi.fn(() =>
-          loadedState({
-            databases: [database],
-          }),
-        ),
-        getDriver: vi.fn(() => {
-          throw new Error(
-            "ConnectionProvider should not query drivers directly",
-          );
+  it("flattens Redis schema level and keeps Elasticsearch schema level", async () => {
+    const redisManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-redis", name: "redis-conn", type: "redis" },
+      ]),
+      isConnected: vi.fn((id: string) => id === "conn-redis"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getDriverEntityManifest: vi.fn(() => ({
+        dbObjectKinds: ["table"],
+        tableSections: {
+          columns: "supported",
+          constraints: "not_applicable",
+          indexes: "not_applicable",
+          triggers: "not_applicable",
+        },
+      })),
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "db0",
+              schemas: [
+                {
+                  name: "db0",
+                  objects: [{ name: "activity", type: "table", columns: [] }],
+                },
+              ],
+            },
+          ],
         }),
-        onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
-        onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
-        onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
-        onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
-        onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
-      };
+      ),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
 
-      const { ConnectionProvider } = await import(
-        "../../src/extension/providers/connectionProvider"
-      );
+    const elasticsearchManager = {
+      getConnections: vi.fn(() => [
+        {
+          id: "conn-elasticsearch",
+          name: "elasticsearch-conn",
+          type: "elasticsearch",
+        },
+      ]),
+      isConnected: vi.fn((id: string) => id === "conn-elasticsearch"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getDriverEntityManifest: vi.fn(() => ({
+        dbObjectKinds: ["table"],
+        tableSections: {
+          columns: "supported",
+          constraints: "not_applicable",
+          indexes: "not_applicable",
+          triggers: "not_applicable",
+        },
+      })),
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "default",
+              schemas: [
+                {
+                  name: "indices",
+                  objects: [{ name: "products", type: "table", columns: [] }],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
 
-      const provider = new ConnectionProvider(connectionManager as never);
-      const roots = await provider.getChildren();
-      const databases = await provider.getChildren(roots[0]);
-      const schemas = await provider.getChildren(databases[0]);
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
 
-      expect(schemas.map((node) => node.label)).toEqual([
-        database.schemas[0].name,
-      ]);
-    }
+    const redisProvider = new ConnectionProvider(redisManager as never);
+    const redisRoots = await redisProvider.getChildren();
+    const redisDatabases = await redisProvider.getChildren(redisRoots[0]);
+    const redisCategories = await redisProvider.getChildren(redisDatabases[0]);
+
+    expect(redisCategories.map((node) => node.label)).toEqual(["Keyspaces"]);
+    expect(redisCategories[0]?.tooltip).toContain("Keyspaces in db0");
+
+    const redisObjects = await redisProvider.getChildren(redisCategories[0]);
+    expect(redisObjects.map((node) => node.label)).toEqual(["activity"]);
+    expect(redisObjects[0]?.tooltip).toContain("Keyspace: activity");
+    expect(redisObjects[0]?.tooltip).toContain("Database: db0");
+    expect(redisObjects[0]?.tooltip).not.toContain("Schema:");
+
+    const elasticsearchProvider = new ConnectionProvider(
+      elasticsearchManager as never,
+    );
+    const elasticsearchRoots = await elasticsearchProvider.getChildren();
+    const elasticsearchDatabases = await elasticsearchProvider.getChildren(
+      elasticsearchRoots[0],
+    );
+    const elasticsearchSchemas = await elasticsearchProvider.getChildren(
+      elasticsearchDatabases[0],
+    );
+
+    expect(elasticsearchSchemas.map((node) => node.label)).toEqual(["indices"]);
+
+    const elasticsearchCategories = await elasticsearchProvider.getChildren(
+      elasticsearchSchemas[0],
+    );
+    expect(elasticsearchCategories.map((node) => node.label)).toEqual([
+      "Indices",
+    ]);
+    expect(elasticsearchCategories[0]?.tooltip).toContain(
+      "Indices in indices.default",
+    );
+
+    const elasticsearchObjects = await elasticsearchProvider.getChildren(
+      elasticsearchCategories[0],
+    );
+    expect(elasticsearchObjects.map((node) => node.label)).toEqual([
+      "products",
+    ]);
+    expect(elasticsearchObjects[0]?.tooltip).toContain("Index: products");
+    expect(elasticsearchObjects[0]?.tooltip).toContain("Schema: indices");
   });
 
   it("flattens DynamoDB schema level and hides schema wording", async () => {
@@ -876,7 +961,7 @@ describe("ConnectionProvider", () => {
     expect(tableNode).toMatchObject({
       id: "table:conn-1:app_db:app_db:users",
       contextValue: "table",
-      tooltip: "table: users\nSchema: app_db\nDatabase: app_db",
+      tooltip: "Table: users\nSchema: app_db\nDatabase: app_db",
     });
     expect(tableNode?.command).toEqual({
       command: "rapidb.openTableData",
@@ -887,7 +972,7 @@ describe("ConnectionProvider", () => {
       id: "materializedView:conn-1:app_db:app_db:latest_users",
       contextValue: "materializedView",
       tooltip:
-        "materializedView: latest_users\nSchema: app_db\nDatabase: app_db",
+        "Materialized View: latest_users\nSchema: app_db\nDatabase: app_db",
     });
     expect(materializedViewNode?.command).toEqual({
       command: "rapidb.openTableData",
@@ -897,13 +982,13 @@ describe("ConnectionProvider", () => {
     expect(functionNode).toMatchObject({
       id: "function:conn-1:app_db:app_db:users_total",
       contextValue: "function",
-      tooltip: "function: users_total\nSchema: app_db\nDatabase: app_db",
+      tooltip: "Function: users_total\nSchema: app_db\nDatabase: app_db",
     });
     expect(functionNode?.command).toBeUndefined();
     expect(procedureNode).toMatchObject({
       id: "procedure:conn-1:app_db:app_db:refresh_users",
       contextValue: "procedure",
-      tooltip: "procedure: refresh_users\nSchema: app_db\nDatabase: app_db",
+      tooltip: "Procedure: refresh_users\nSchema: app_db\nDatabase: app_db",
     });
     expect(procedureNode?.command).toBeUndefined();
     expect(sequenceNode?.command).toBeUndefined();
@@ -1884,8 +1969,7 @@ describe("ConnectionProvider", () => {
 
     const roots = await provider.getChildren();
     const databases = await provider.getChildren(roots[0]);
-    const schemas = await provider.getChildren(databases[0]);
-    const categories = await provider.getChildren(schemas[0]);
+    const categories = await provider.getChildren(databases[0]);
     const tableNode = (await provider.getChildren(categories[0]))[0];
     const sections = await provider.getChildren(tableNode);
 

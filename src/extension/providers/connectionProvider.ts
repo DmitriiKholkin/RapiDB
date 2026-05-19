@@ -4,6 +4,8 @@ import {
   EXPLORER_CATEGORY_CONFIG,
   EXPLORER_CATEGORY_ORDER,
   type ExplorerCategoryId,
+  getDbObjectKindCategoryLabel,
+  getDbObjectKindDisplayLabel,
   isDataDbObjectKind,
 } from "../../shared/dbObjectKinds";
 import {
@@ -134,6 +136,14 @@ const TABLE_SECTION_LABELS: Record<TableDetailSectionKind, string> = {
   indexes: "Indexes",
   triggers: "Triggers",
 };
+
+function formatTooltipObjectKindLabel(label: string): string {
+  return label
+    .split(/\s+/)
+    .filter((part) => part.length > 0)
+    .map((part) => part[0]?.toUpperCase() + part.slice(1))
+    .join(" ");
+}
 
 const PRIMARY_KEY_ICON_COLOR = new vscode.ThemeColor("charts.yellow");
 const SORT_KEY_ICON_COLOR = new vscode.ThemeColor("textLink.foreground");
@@ -744,9 +754,12 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
       objectName,
     );
     const includeSchema = this.hasSchemaConcept(connectionId);
+    const kindLabel = formatTooltipObjectKindLabel(
+      getDbObjectKindDisplayLabel(this.getConnectionType(connectionId), kind),
+    );
     node.tooltip = includeSchema
-      ? `${kind}: ${objectName}\nSchema: ${schemaName}\nDatabase: ${databaseName}`
-      : `${kind}: ${objectName}\nDatabase: ${databaseName}`;
+      ? `${kindLabel}: ${objectName}\nSchema: ${schemaName}\nDatabase: ${databaseName}`
+      : `${kindLabel}: ${objectName}\nDatabase: ${databaseName}`;
     node.contextValue = this.composeContextValue(kind, connectionId);
 
     if (isDataDbObjectKind(kind)) {
@@ -1147,11 +1160,10 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
 
     return visibleCategoryIds.map((categoryId) => {
       const categoryKind = CATEGORY_NODE_KIND_BY_ID[categoryId];
-      const categoryConfig = EXPLORER_CATEGORY_CONFIG[categoryId];
-      const categoryLabel =
-        connectionType === "mongodb" && categoryId === "tables"
-          ? "Collections"
-          : categoryConfig.label;
+      const categoryLabel = getDbObjectKindCategoryLabel(
+        connectionType,
+        categoryId,
+      );
       const count = counts.get(categoryKind) ?? 0;
       const hasItems = count > 0;
       const node = new RapiDBNode(
@@ -1184,11 +1196,15 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     }
 
     const connectionType = this.getConnectionType(connectionId);
-    if (connectionType === "mongodb" || connectionType === "dynamodb") {
+    if (
+      connectionType === "mongodb" ||
+      connectionType === "dynamodb" ||
+      connectionType === "redis"
+    ) {
       return true;
     }
 
-    if (connectionType === "redis" || connectionType === "elasticsearch") {
+    if (connectionType === "elasticsearch") {
       return false;
     }
 
@@ -1197,7 +1213,11 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
 
   private hasSchemaConcept(connectionId: string): boolean {
     const connectionType = this.getConnectionType(connectionId);
-    return connectionType !== "mongodb" && connectionType !== "dynamodb";
+    return (
+      connectionType !== "mongodb" &&
+      connectionType !== "dynamodb" &&
+      connectionType !== "redis"
+    );
   }
 
   private getEntityManifest(connectionId: string): DriverEntityManifest {

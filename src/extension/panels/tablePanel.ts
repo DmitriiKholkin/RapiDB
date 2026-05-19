@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { getDbObjectKindDisplayLabel } from "../../shared/dbObjectKinds";
 import { coerceFilterExpressions } from "../../shared/tableTypes";
 import { parseTablePanelMessage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
@@ -20,6 +21,23 @@ import { TableMutationPreviewController } from "./tableMutationPreviewController
 import { createWebviewShell } from "./webviewShell";
 
 const EXPORT_CHUNK_SIZE = 500;
+
+type TablePanelObjectKind = "table" | "view" | "materializedView";
+
+function titleObjectKindLabel(
+  connectionType: string | undefined,
+  objectKind: TablePanelObjectKind,
+): string {
+  return getDbObjectKindDisplayLabel(connectionType, objectKind);
+}
+
+function shouldShowSchemaPrefix(connectionType: string | undefined): boolean {
+  return (
+    connectionType !== "mongodb" &&
+    connectionType !== "dynamodb" &&
+    connectionType !== "redis"
+  );
+}
 
 type ExportPayload = {
   sort?: unknown;
@@ -137,6 +155,7 @@ export class TablePanel {
     schema: string,
     table: string,
     isView = false,
+    objectKind?: TablePanelObjectKind,
   ): void {
     const key = TablePanel.panelKey(connectionId, database, schema, table);
     const existing = TablePanel.panels.get(key);
@@ -146,10 +165,13 @@ export class TablePanel {
     }
 
     const buildTitle = () => {
-      const connName =
-        connectionManager.getConnection(connectionId)?.name ?? connectionId;
-      const objType = isView ? "view" : "table";
-      const schemaPrefix = schema ? `${schema}.` : "";
+      const connection = connectionManager.getConnection(connectionId);
+      const connName = connection?.name ?? connectionId;
+      const connectionType = connection?.type;
+      const effectiveObjectKind = objectKind ?? (isView ? "view" : "table");
+      const objType = titleObjectKindLabel(connectionType, effectiveObjectKind);
+      const schemaPrefix =
+        schema && shouldShowSchemaPrefix(connectionType) ? `${schema}.` : "";
       return `${schemaPrefix}${table} (${objType}) [${connName}]`;
     };
     const panel = vscode.window.createWebviewPanel(
@@ -312,6 +334,37 @@ export class TablePanel {
         updates ?? [],
         this.cachedColumns,
       );
+      const driver = this.connectionManager.getDriver(this.connectionId);
+      const previewBuilder = driver?.buildMutationPreviewStatements;
+      const applyPlan =
+        prepared.executable && previewBuilder
+          ? {
+              ...prepared.plan,
+              previewStatements: (
+                await Promise.all(
+                  prepared.plan.updates
+                    .filter(
+                      (_update, rowIndex) =>
+                        !prepared.plan.skippedRows.includes(rowIndex),
+                    )
+                    .map(({ primaryKeys, changes }) =>
+                      previewBuilder(
+                        "update",
+                        this.database,
+                        this.schema,
+                        this.table,
+                        {
+                          primaryKeys,
+                          changes,
+                        },
+                      ),
+                    ),
+                )
+              ).flat(),
+            }
+          : prepared.executable
+            ? prepared.plan
+            : null;
 
       const insertPlan =
         insertValues !== undefined
@@ -357,7 +410,7 @@ export class TablePanel {
       await this.postMessage(
         "tableMutationPreview",
         this.previewController.createApplyChangesPreview({
-          apply: prepared.executable ? prepared.plan : null,
+          apply: applyPlan,
           applyResultWhenEmpty: prepared.executable ? null : prepared.result,
           insert: insertPlan,
         }),

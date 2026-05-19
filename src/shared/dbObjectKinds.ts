@@ -93,3 +93,50 @@ export function isDdlOnlyDbObjectKind(
 ): kind is DdlOnlyDbObjectKind {
   return (DDL_ONLY_DB_OBJECT_KINDS as readonly string[]).includes(kind);
 }
+
+function defaultDbObjectKindLabel(kind: DbObjectKind): string {
+  switch (kind) {
+    case "materializedView":
+      return "materialized view";
+    default:
+      return kind;
+  }
+}
+
+export function getDbObjectKindDisplayLabel(
+  connectionType: string | undefined,
+  kind: DbObjectKind,
+): string {
+  if (kind !== "table") {
+    return defaultDbObjectKindLabel(kind);
+  }
+  switch (connectionType) {
+    case "mongodb":
+      return "collection";
+    case "redis":
+      return "keyspace";
+    case "elasticsearch":
+      return "index";
+    default:
+      return "table";
+  }
+}
+
+export function getDbObjectKindCategoryLabel(
+  connectionType: string | undefined,
+  categoryId: ExplorerCategoryId,
+): string {
+  if (categoryId !== "tables") {
+    return EXPLORER_CATEGORY_CONFIG[categoryId].label;
+  }
+  switch (connectionType) {
+    case "mongodb":
+      return "Collections";
+    case "redis":
+      return "Keyspaces";
+    case "elasticsearch":
+      return "Indices";
+    default:
+      return EXPLORER_CATEGORY_CONFIG[categoryId].label;
+  }
+}

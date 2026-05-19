@@ -33,6 +33,46 @@ describe("RedisDriver — query()", () => {
     expect(result.rows[0]?.__col_0).toBe("OK");
   });
 
+  it("runs multiple preview-style Redis commands sequentially", async () => {
+    const driver = new RedisDriver({
+      id: "redis-query-preview-test",
+      name: "Redis Query Preview Test",
+      type: "redis",
+      host: "localhost",
+    });
+    const sendCommand = vi
+      .fn()
+      .mockResolvedValueOnce(1)
+      .mockResolvedValueOnce(2);
+
+    (
+      driver as unknown as {
+        client: { sendCommand: typeof sendCommand } | null;
+      }
+    ).client = {
+      sendCommand,
+    };
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    const result = await driver.query(
+      'DEL "list:activity:recent"\n\nRPUSH "list:activity:recent" "{\\"id\\":\\"high-1\\",\\"type\\":\\"payment\\",\\"amount\\":999.99}" "{\\"id\\":\\"high-2\\",\\"type\\":\\"alert\\",\\"message\\":\\"System critical\\"}"',
+    );
+
+    expect(sendCommand).toHaveBeenNthCalledWith(1, [
+      "DEL",
+      "list:activity:recent",
+    ]);
+    expect(sendCommand).toHaveBeenNthCalledWith(2, [
+      "RPUSH",
+      "list:activity:recent",
+      '{"id":"high-1","type":"payment","amount":999.99}',
+      '{"id":"high-2","type":"alert","message":"System critical"}',
+    ]);
+    expect(result.rowCount).toBe(1);
+    expect(result.columns).toEqual(["results"]);
+    expect(result.rows[0]?.__col_0).toBe("[1,2]");
+  });
+
   it("treats escaped whitespace as part of the same argument", async () => {
     const { driver, sendCommand } = createDriver();
 
@@ -143,9 +183,9 @@ describe("RedisDriver — metadata and pages", () => {
       { name: "db4", schemas: [] },
     ]);
     await expect(driver.listObjects()).resolves.toEqual([
-      { schema: "default", name: "default", type: "table" },
-      { schema: "default", name: "orders", type: "table" },
-      { schema: "default", name: "users", type: "table" },
+      { schema: "", name: "default", type: "table" },
+      { schema: "", name: "orders", type: "table" },
+      { schema: "", name: "users", type: "table" },
     ]);
     expect(client.scan).toHaveBeenCalledWith("0", {
       MATCH: "*",
@@ -211,10 +251,10 @@ describe("RedisDriver — metadata and pages", () => {
     ).client = client;
     (driver as unknown as { connected: boolean }).connected = true;
 
-    const described = await driver.describeColumns("db0", "default", "users");
+    const described = await driver.describeColumns("db0", "db0", "users");
     const page = await driver.readTablePage({
       database: "db0",
-      schema: "default",
+      schema: "db0",
       table: "users",
       page: 1,
       pageSize: 10,
@@ -230,40 +270,152 @@ describe("RedisDriver — metadata and pages", () => {
           isPrimaryKey: true,
           primaryKeyOrdinal: 1,
           category: "text",
-        }),
-        expect.objectContaining({
-          name: "type",
-          category: "text",
+          type: "string",
+          nativeType: "string",
         }),
         expect.objectContaining({
           name: "value",
           category: "text",
+          type: "mixed(string, hash, list, set, zset)",
+          nativeType: "mixed(string, hash, list, set, zset)",
         }),
       ]),
     );
     expect(page.totalCount).toBe(5);
     expect(page.rows).toEqual([
-      { key: "users:1", type: "string", value: "Alice" },
+      { key: "users:1", value: "Alice" },
       {
         key: "users:2",
-        type: "hash",
         value: '{"first":"Bob","last":"Builder"}',
       },
       {
         key: "users:3",
-        type: "list",
         value: '["draft","published"]',
       },
       {
         key: "users:4",
-        type: "set",
         value: '["alpha","beta"]',
       },
       {
         key: "users:5",
-        type: "zset",
         value: '[{"value":"gold","score":10},{"value":"silver","score":5}]',
       },
+    ]);
+  });
+
+  it("uses the native Redis stream type for the value column", async () => {
+    const driver = new RedisDriver({
+      id: "redis-stream-test",
+      name: "Redis Stream Test",
+      type: "redis",
+      host: "localhost",
+    });
+    const client = {
+      scan: vi.fn().mockResolvedValue({
+        cursor: "0",
+        keys: ["events:1"],
+      }),
+      type: vi.fn().mockResolvedValue("stream"),
+      xRange: vi.fn().mockResolvedValue([
+        {
+          id: "1716115200000-0",
+          message: { event: "created", userId: "42" },
+        },
+      ]),
+    };
+
+    (
+      driver as unknown as {
+        client: typeof client | null;
+        connected: boolean;
+      }
+    ).client = client;
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    const described = await driver.describeColumns("db0", "db0", "events");
+    const page = await driver.readTablePage({
+      database: "db0",
+      schema: "db0",
+      table: "events",
+      page: 1,
+      pageSize: 10,
+      filters: [],
+      sort: { column: "key", direction: "asc" },
+      skipCount: false,
+    });
+
+    expect(described).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "value",
+          type: "stream",
+          nativeType: "stream",
+        }),
+      ]),
+    );
+    expect(page.rows).toEqual([
+      {
+        key: "events:1",
+        value:
+          '[{"id":"1716115200000-0","message":{"event":"created","userId":"42"}}]',
+      },
+    ]);
+    expect(client.xRange).toHaveBeenCalledWith("events:1", "-", "+");
+  });
+
+  it("preserves Redis list type when updating a list-backed key", async () => {
+    const driver = new RedisDriver({
+      id: "redis-list-update-test",
+      name: "Redis List Update Test",
+      type: "redis",
+      host: "localhost",
+    });
+    const client = {
+      exists: vi.fn().mockResolvedValue(1),
+      type: vi.fn().mockResolvedValue("list"),
+      del: vi.fn().mockResolvedValue(1),
+      rPush: vi.fn().mockResolvedValue(2),
+    };
+
+    (
+      driver as unknown as {
+        client: typeof client | null;
+        connected: boolean;
+      }
+    ).client = client;
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    const listJson =
+      '["{\\"id\\":\\"high-1\\",\\"type\\":\\"payment\\",\\"amount\\":999.99}","{\\"id\\":\\"high-2\\",\\"type\\":\\"alert\\",\\"message\\":\\"System critical\\"}"]';
+
+    await expect(
+      driver.buildMutationPreviewStatements("update", "db0", "db0", "list", {
+        primaryKeys: { key: "list:activity:recent" },
+        changes: { value: listJson },
+      }),
+    ).resolves.toEqual([
+      'DEL "list:activity:recent"',
+      'RPUSH "list:activity:recent" "{\\"id\\":\\"high-1\\",\\"type\\":\\"payment\\",\\"amount\\":999.99}" "{\\"id\\":\\"high-2\\",\\"type\\":\\"alert\\",\\"message\\":\\"System critical\\"}"',
+    ]);
+
+    await expect(
+      driver.updateRows({
+        database: "db0",
+        schema: "db0",
+        table: "list",
+        updates: [
+          {
+            primaryKeys: { key: "list:activity:recent" },
+            changes: { value: listJson },
+          },
+        ],
+      }),
+    ).resolves.toEqual({ affectedRows: 1 });
+
+    expect(client.del).toHaveBeenCalledWith("list:activity:recent");
+    expect(client.rPush).toHaveBeenCalledWith("list:activity:recent", [
+      '{"id":"high-1","type":"payment","amount":999.99}',
+      '{"id":"high-2","type":"alert","message":"System critical"}',
     ]);
   });
 });

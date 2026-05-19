@@ -42,6 +42,136 @@ const REDIS_ENTITY_MANIFEST: DriverEntityManifest = {
   },
 };
 
+const REDIS_VALUE_TYPE_ORDER = [
+  "string",
+  "hash",
+  "list",
+  "set",
+  "zset",
+  "stream",
+] as const;
+
+interface RedisSampleRow {
+  redisType: string;
+  row: Record<string, unknown>;
+}
+
+type RedisHashEntries = Record<string, string>;
+
+type RedisSortedSetEntry = {
+  score: number;
+  value: string;
+};
+
+function compareRedisValueTypes(left: string, right: string): number {
+  const leftIndex = REDIS_VALUE_TYPE_ORDER.indexOf(
+    left as (typeof REDIS_VALUE_TYPE_ORDER)[number],
+  );
+  const rightIndex = REDIS_VALUE_TYPE_ORDER.indexOf(
+    right as (typeof REDIS_VALUE_TYPE_ORDER)[number],
+  );
+  if (leftIndex === -1 && rightIndex === -1) {
+    return left.localeCompare(right);
+  }
+  if (leftIndex === -1) {
+    return 1;
+  }
+  if (rightIndex === -1) {
+    return -1;
+  }
+  return leftIndex - rightIndex;
+}
+
+function formatRedisValueTypeLabel(
+  entries: readonly RedisSampleRow[],
+): string | null {
+  const valueTypes = [
+    ...new Set(
+      entries
+        .map((entry) => entry.redisType)
+        .filter(
+          (value): value is string =>
+            typeof value === "string" && value.length > 0 && value !== "none",
+        ),
+    ),
+  ].sort(compareRedisValueTypes);
+  if (valueTypes.length === 0) {
+    return null;
+  }
+  if (valueTypes.length === 1) {
+    return valueTypes[0];
+  }
+  return `mixed(${valueTypes.join(", ")})`;
+}
+
+function splitRedisStatements(input: string): string[] {
+  const statements: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+  let escaping = false;
+
+  const pushCurrent = () => {
+    const trimmed = current.trim();
+    if (trimmed.length > 0) {
+      statements.push(trimmed);
+    }
+    current = "";
+  };
+
+  for (const char of input) {
+    if (escaping) {
+      current += char;
+      escaping = false;
+      continue;
+    }
+
+    if (char === "\\") {
+      current += char;
+      escaping = true;
+      continue;
+    }
+
+    if (quote) {
+      current += char;
+      if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+
+    if (char === '"' || char === "'") {
+      current += char;
+      quote = char;
+      continue;
+    }
+
+    if (char === ";" || char === "\n" || char === "\r") {
+      pushCurrent();
+      continue;
+    }
+
+    current += char;
+  }
+
+  if (quote) {
+    throw new Error("Redis query has an unterminated quoted argument.");
+  }
+
+  if (escaping) {
+    current += "\\";
+  }
+
+  pushCurrent();
+  return statements;
+}
+
+function formatRedisPreviewCommand(
+  command: string,
+  args: ReadonlyArray<string | number>,
+): string {
+  return [command, ...args.map((arg) => JSON.stringify(String(arg)))].join(" ");
+}
+
 function tokenizeRedisCommand(input: string): string[] {
   const tokens: string[] = [];
   let current = "";
@@ -206,7 +336,7 @@ export class RedisDriver implements IDBDriver {
   }
 
   async listSchemas(): Promise<SchemaInfo[]> {
-    return [{ name: "default" }];
+    return [];
   }
 
   async listObjects(): Promise<TableInfo[]> {
@@ -224,7 +354,7 @@ export class RedisDriver implements IDBDriver {
         names.add("default");
       }
       return [...names].sort().map((name) => ({
-        schema: "default",
+        schema: "",
         name,
         type: "table",
       }));
@@ -239,9 +369,7 @@ export class RedisDriver implements IDBDriver {
     table: string,
   ): Promise<ColumnMeta[]> {
     const rows = await this.readRows(table, 200);
-    return inferColumnsFromRows(rows, "key", {
-      nullableMode: "schemaLess",
-    }).map((column) => ({
+    return this.inferRedisColumns(rows).map((column) => ({
       name: column.name,
       type: column.nativeType,
       nullable: column.nullable,
@@ -258,9 +386,7 @@ export class RedisDriver implements IDBDriver {
     table: string,
   ): Promise<ColumnTypeMeta[]> {
     const rows = await this.readRows(table, 200);
-    return inferColumnsFromRows(rows, "key", {
-      nullableMode: "schemaLess",
-    });
+    return this.inferRedisColumns(rows);
   }
 
   async getIndexes(): Promise<IndexMeta[]> {
@@ -315,13 +441,21 @@ export class RedisDriver implements IDBDriver {
     }
 
     const startedAt = Date.now();
-    const parts = tokenizeRedisCommand(trimmed);
-    const [command, ...args] = parts;
-    const result = await this.requireClient().sendCommand([
-      command.toUpperCase(),
-      ...args,
-    ]);
-    const row = flattenRootRecord({ result });
+    const statements = splitRedisStatements(trimmed);
+    const results: unknown[] = [];
+    for (const statement of statements) {
+      const parts = tokenizeRedisCommand(statement);
+      const [command, ...args] = parts;
+      results.push(
+        await this.requireClient().sendCommand([
+          command.toUpperCase(),
+          ...args,
+        ]),
+      );
+    }
+    const row = flattenRootRecord(
+      statements.length === 1 ? { result: results[0] } : { results },
+    );
     const columns = Object.keys(row);
     return {
       columns,
@@ -335,13 +469,20 @@ export class RedisDriver implements IDBDriver {
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
     const rows = await this.readRows(request.table, 2000);
-    const filtered = applyFilters(rows, request.filters);
+    const filtered = applyFilters(
+      rows.map((entry) => entry.row),
+      request.filters,
+    );
     const sorted = applySort(filtered, request.sort);
     const paged = pageRows(sorted, request.page, request.pageSize);
     return {
-      columns: inferColumnsFromRows(sorted, "key", {
-        nullableMode: "schemaLess",
-      }),
+      columns: this.inferRedisColumns(
+        sorted.map((row) => ({
+          redisType:
+            rows.find((entry) => entry.row === row)?.redisType ?? "none",
+          row,
+        })),
+      ),
       rows: paged,
       totalCount: request.skipCount ? 0 : sorted.length,
     };
@@ -368,7 +509,8 @@ export class RedisDriver implements IDBDriver {
       }
       const value =
         update.changes.value ?? update.changes.json ?? update.changes.text;
-      await client.set(key, this.normalizeStoredValue(value));
+      const currentType = await client.type(key);
+      await this.writeRedisValueByType(key, currentType, value);
       affectedRows += 1;
     }
     return { affectedRows };
@@ -426,16 +568,24 @@ export class RedisDriver implements IDBDriver {
         data.values?.json ??
         data.values?.text ??
         JSON.stringify(data.values ?? {});
-      return `SET ${String(key)} ${String(value)}`;
+      return formatRedisPreviewCommand("SET", [
+        String(key),
+        this.normalizeStoredValue(value),
+      ]);
     }
     if (operation === "update") {
       const key = data.primaryKeys?.key;
       const newValue =
         data.changes?.value ?? data.changes?.json ?? data.changes?.text;
       if (key !== undefined && newValue !== undefined) {
-        return `SET ${String(key)} ${String(newValue)}`;
+        return formatRedisPreviewCommand("SET", [
+          String(key),
+          this.normalizeStoredValue(newValue),
+        ]);
       }
-      return key !== undefined ? `GET ${String(key)}` : "GET <key>";
+      return key !== undefined
+        ? formatRedisPreviewCommand("GET", [String(key)])
+        : "GET <key>";
     }
     // delete
     const keys = (
@@ -443,8 +593,70 @@ export class RedisDriver implements IDBDriver {
     )
       .map((entry) => entry.key)
       .filter((k) => k !== undefined)
-      .join(" ");
-    return keys ? `DEL ${keys}` : "DEL <key>";
+      .map((key) => String(key));
+    return keys.length > 0
+      ? formatRedisPreviewCommand("DEL", keys)
+      : "DEL <key>";
+  }
+
+  async buildMutationPreviewStatements(
+    operation: "insert" | "update" | "delete",
+    _database: string,
+    _schema: string,
+    table: string,
+    data: {
+      primaryKeys?: Record<string, unknown>;
+      changes?: Record<string, unknown>;
+      values?: Record<string, unknown>;
+      primaryKeyValuesList?: Array<Record<string, unknown>>;
+    },
+  ): Promise<string[]> {
+    if (operation === "delete") {
+      const keys = (
+        data.primaryKeyValuesList ??
+        (data.primaryKeys ? [data.primaryKeys] : [])
+      )
+        .map((entry) => entry.key)
+        .filter((key): key is unknown => key !== undefined)
+        .map((key) => String(key));
+      return keys.length > 0
+        ? [formatRedisPreviewCommand("DEL", keys)]
+        : ["DEL <key>"];
+    }
+
+    if (operation === "insert") {
+      const key = data.values?.key;
+      if (key === undefined) {
+        return ['SET "<key>" ""'];
+      }
+      const value =
+        data.values?.value ?? data.values?.json ?? data.values?.text ?? "";
+      const inferredType = await this.inferInsertRedisType(table);
+      return this.buildRedisPreviewStatementsForType(
+        String(key),
+        inferredType,
+        value,
+      );
+    }
+
+    const key = data.primaryKeys?.key;
+    if (key === undefined) {
+      return ["GET <key>"];
+    }
+    const value =
+      data.changes?.value ?? data.changes?.json ?? data.changes?.text;
+    if (value === undefined) {
+      return [formatRedisPreviewCommand("GET", [String(key)])];
+    }
+    const storedKey = this.resolveStoredKey(key);
+    const redisType = storedKey
+      ? await this.requireClient().type(storedKey)
+      : "string";
+    return this.buildRedisPreviewStatementsForType(
+      String(key),
+      redisType,
+      value,
+    );
   }
 
   async runTransaction(operations: TransactionOperation[]): Promise<void> {
@@ -571,13 +783,13 @@ export class RedisDriver implements IDBDriver {
   private async readRows(
     table: string,
     maxRows: number,
-  ): Promise<Record<string, unknown>[]> {
+  ): Promise<RedisSampleRow[]> {
     try {
       const pattern = table === "default" ? "*" : `${table}:*`;
       const keys = (await this.scanKeys(this.prefixedPattern(pattern), maxRows))
         .slice(0, maxRows)
         .sort((left, right) => left.localeCompare(right));
-      const rows: Record<string, unknown>[] = [];
+      const rows: RedisSampleRow[] = [];
       for (const key of keys) {
         const type = await this.requireClient().type(key);
         let value: unknown = null;
@@ -597,21 +809,279 @@ export class RedisDriver implements IDBDriver {
           case "zset":
             value = await this.requireClient().zRangeWithScores(key, 0, -1);
             break;
+          case "stream":
+            value = await this.readStreamEntries(key);
+            break;
           default:
             value = null;
         }
-        rows.push(
-          flattenRootRecord({
+        rows.push({
+          redisType: type,
+          row: flattenRootRecord({
             key: this.stripKeyPrefix(key),
-            type,
             value,
           }),
-        );
+        });
       }
       return rows;
     } catch {
       return [];
     }
+  }
+
+  private inferRedisColumns(rows: readonly RedisSampleRow[]): ColumnTypeMeta[] {
+    const columns = inferColumnsFromRows(
+      rows.map((entry) => entry.row),
+      "key",
+      {
+        nullableMode: "schemaLess",
+      },
+    );
+    const valueTypeLabel = formatRedisValueTypeLabel(rows);
+    return columns.map((column) =>
+      column.name === "key"
+        ? {
+            ...column,
+            type: "string",
+            nativeType: "string",
+          }
+        : column.name === "value" && valueTypeLabel
+          ? {
+              ...column,
+              type: valueTypeLabel,
+              nativeType: valueTypeLabel,
+            }
+          : column,
+    );
+  }
+
+  private async inferInsertRedisType(table: string): Promise<string> {
+    const pattern = table === "default" ? "*" : `${table}:*`;
+    const keys = (await this.scanKeys(this.prefixedPattern(pattern), 25)).slice(
+      0,
+      25,
+    );
+    const valueTypes = [
+      ...new Set(
+        await Promise.all(keys.map((key) => this.requireClient().type(key))),
+      ),
+    ].filter((type) => type !== "none");
+    if (valueTypes.length !== 1) {
+      return "string";
+    }
+    return valueTypes[0] ?? "string";
+  }
+
+  private async writeRedisValueByType(
+    key: string,
+    redisType: string,
+    value: unknown,
+  ): Promise<void> {
+    const client = this.requireClient();
+    switch (redisType) {
+      case "hash": {
+        const entries = this.parseRedisHashEntries(value);
+        await client.del(key);
+        if (Object.keys(entries).length > 0) {
+          await client.hSet(key, entries);
+        }
+        return;
+      }
+      case "list": {
+        const elements = this.parseRedisSequenceElements(value, "list");
+        await client.del(key);
+        if (elements.length > 0) {
+          await client.rPush(key, elements);
+        }
+        return;
+      }
+      case "set": {
+        const elements = this.parseRedisSequenceElements(value, "set");
+        await client.del(key);
+        if (elements.length > 0) {
+          await client.sAdd(key, elements);
+        }
+        return;
+      }
+      case "zset": {
+        const entries = this.parseRedisSortedSetEntries(value);
+        await client.del(key);
+        if (entries.length > 0) {
+          await client.zAdd(key, entries);
+        }
+        return;
+      }
+      case "stream":
+        throw new Error(
+          "Redis stream values are read-only in the table viewer.",
+        );
+      case "none":
+      case "string":
+      default:
+        await client.set(key, this.normalizeStoredValue(value));
+    }
+  }
+
+  private buildRedisPreviewStatementsForType(
+    key: string,
+    redisType: string,
+    value: unknown,
+  ): string[] {
+    switch (redisType) {
+      case "hash": {
+        const entries = this.parseRedisHashEntries(value);
+        const preview = [formatRedisPreviewCommand("DEL", [key])];
+        if (Object.keys(entries).length > 0) {
+          preview.push(
+            formatRedisPreviewCommand("HSET", [
+              key,
+              ...Object.entries(entries).flatMap(([field, fieldValue]) => [
+                field,
+                fieldValue,
+              ]),
+            ]),
+          );
+        }
+        return preview;
+      }
+      case "list": {
+        const elements = this.parseRedisSequenceElements(value, "list");
+        const preview = [formatRedisPreviewCommand("DEL", [key])];
+        if (elements.length > 0) {
+          preview.push(formatRedisPreviewCommand("RPUSH", [key, ...elements]));
+        }
+        return preview;
+      }
+      case "set": {
+        const elements = this.parseRedisSequenceElements(value, "set");
+        const preview = [formatRedisPreviewCommand("DEL", [key])];
+        if (elements.length > 0) {
+          preview.push(formatRedisPreviewCommand("SADD", [key, ...elements]));
+        }
+        return preview;
+      }
+      case "zset": {
+        const entries = this.parseRedisSortedSetEntries(value);
+        const preview = [formatRedisPreviewCommand("DEL", [key])];
+        if (entries.length > 0) {
+          preview.push(
+            formatRedisPreviewCommand("ZADD", [
+              key,
+              ...entries.flatMap((entry) => [entry.score, entry.value]),
+            ]),
+          );
+        }
+        return preview;
+      }
+      case "stream":
+        throw new Error(
+          "Redis stream values are read-only in the table viewer.",
+        );
+      case "none":
+      case "string":
+      default:
+        return [
+          formatRedisPreviewCommand("SET", [
+            key,
+            this.normalizeStoredValue(value),
+          ]),
+        ];
+    }
+  }
+
+  private parseRedisSequenceElements(
+    value: unknown,
+    redisType: "list" | "set",
+  ): string[] {
+    const parsed = this.parseRedisJsonValue(value, `${redisType} value`);
+    if (!Array.isArray(parsed)) {
+      throw new Error(
+        `Redis ${redisType} values must be edited as a JSON array.`,
+      );
+    }
+    return parsed.map((entry) => this.stringifyRedisNestedValue(entry));
+  }
+
+  private parseRedisHashEntries(value: unknown): RedisHashEntries {
+    const parsed = this.parseRedisJsonValue(value, "hash value");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("Redis hash values must be edited as a JSON object.");
+    }
+    return Object.fromEntries(
+      Object.entries(parsed).map(([field, fieldValue]) => [
+        field,
+        this.stringifyRedisNestedValue(fieldValue),
+      ]),
+    );
+  }
+
+  private parseRedisSortedSetEntries(value: unknown): RedisSortedSetEntry[] {
+    const parsed = this.parseRedisJsonValue(value, "sorted set value");
+    if (!Array.isArray(parsed)) {
+      throw new Error(
+        "Redis sorted set values must be edited as a JSON array of { value, score } objects.",
+      );
+    }
+    return parsed.map((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new Error(
+          "Redis sorted set values must be edited as a JSON array of { value, score } objects.",
+        );
+      }
+      const rawScore = (entry as { score?: unknown }).score;
+      const score =
+        typeof rawScore === "number"
+          ? rawScore
+          : typeof rawScore === "string"
+            ? Number(rawScore)
+            : Number.NaN;
+      if (!Number.isFinite(score)) {
+        throw new Error("Redis sorted set scores must be finite numbers.");
+      }
+      if (!("value" in entry)) {
+        throw new Error(
+          "Redis sorted set entries must include both value and score fields.",
+        );
+      }
+      return {
+        score,
+        value: this.stringifyRedisNestedValue(
+          (entry as { value: unknown }).value,
+        ),
+      };
+    });
+  }
+
+  private parseRedisJsonValue(value: unknown, label: string): unknown {
+    if (typeof value !== "string") {
+      return value;
+    }
+    try {
+      return JSON.parse(value);
+    } catch {
+      throw new Error(`Redis ${label} must be valid JSON.`);
+    }
+  }
+
+  private stringifyRedisNestedValue(value: unknown): string {
+    if (typeof value === "string") {
+      return value;
+    }
+    if (value === undefined) {
+      return "";
+    }
+    return JSON.stringify(value);
+  }
+
+  private async readStreamEntries(key: string): Promise<unknown> {
+    const client = this.requireClient() as ReturnType<typeof createClient> & {
+      xRange?: (key: string, start: string, end: string) => Promise<unknown>;
+      sendCommand: (args: string[]) => Promise<unknown>;
+    };
+    if (typeof client.xRange === "function") {
+      return client.xRange(key, "-", "+");
+    }
+    return client.sendCommand(["XRANGE", key, "-", "+"]);
   }
 
   private resolveStoredKey(rawKey: unknown): string {

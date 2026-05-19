@@ -125,15 +125,25 @@ export class TableMutationService {
         writableValues,
         columnMetaByName,
       );
-      const previewSql = driver.buildMutationPreviewStatement
-        ? driver.buildMutationPreviewStatement(
+      const previewStatements = driver.buildMutationPreviewStatements
+        ? await driver.buildMutationPreviewStatements(
             "insert",
             database,
             schema,
             table,
             { values: coercedValues },
           )
-        : `INSERT ${driver.qualifiedTableName(database, schema, table)} ${JSON.stringify(coercedValues)}`;
+        : [
+            driver.buildMutationPreviewStatement
+              ? driver.buildMutationPreviewStatement(
+                  "insert",
+                  database,
+                  schema,
+                  table,
+                  { values: coercedValues },
+                )
+              : `INSERT ${driver.qualifiedTableName(database, schema, table)} ${JSON.stringify(coercedValues)}`,
+          ];
       return {
         connectionId,
         database,
@@ -145,7 +155,7 @@ export class TableMutationService {
           sql: "-- driver-hook-insert",
           params: [],
         },
-        previewStatements: [previewSql],
+        previewStatements,
         verificationCriteria: null,
       };
     }
@@ -306,22 +316,32 @@ export class TableMutationService {
       const coercedPrimaryKeyValuesList = primaryKeyValuesList.map((criteria) =>
         coerceRecord(driver, criteria, columnMetaByName),
       );
-      const previewStatements = driver.buildMutationPreviewStatement
-        ? [
-            driver.buildMutationPreviewStatement(
-              "delete",
-              database,
-              schema,
-              table,
-              {
-                primaryKeyValuesList: coercedPrimaryKeyValuesList,
-              },
-            ),
-          ]
-        : coercedPrimaryKeyValuesList.map(
-            (criteria) =>
-              `DELETE ${driver.qualifiedTableName(database, schema, table)} ${JSON.stringify(criteria)}`,
-          );
+      const previewStatements = driver.buildMutationPreviewStatements
+        ? await driver.buildMutationPreviewStatements(
+            "delete",
+            database,
+            schema,
+            table,
+            {
+              primaryKeyValuesList: coercedPrimaryKeyValuesList,
+            },
+          )
+        : driver.buildMutationPreviewStatement
+          ? [
+              driver.buildMutationPreviewStatement(
+                "delete",
+                database,
+                schema,
+                table,
+                {
+                  primaryKeyValuesList: coercedPrimaryKeyValuesList,
+                },
+              ),
+            ]
+          : coercedPrimaryKeyValuesList.map(
+              (criteria) =>
+                `DELETE ${driver.qualifiedTableName(database, schema, table)} ${JSON.stringify(criteria)}`,
+            );
       return {
         connectionId,
         database,
