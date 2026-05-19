@@ -186,34 +186,6 @@ function inferBatchOperation(
   return inferred;
 }
 
-export function looksLikeLegacyDynamoDbEnvelope(
-  value: unknown,
-): value is { operation: string; input?: Record<string, unknown> } {
-  return isRecord(value) && typeof value.operation === "string";
-}
-
-export function unwrapLegacyDynamoDbEnvelope(queryText: string): string | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(queryText) as unknown;
-  } catch {
-    return null;
-  }
-
-  if (!looksLikeLegacyDynamoDbEnvelope(parsed) || !isRecord(parsed.input)) {
-    return null;
-  }
-
-  const normalizedOperation = normalizeDynamoDbNativeOperationName(
-    parsed.operation,
-  );
-  if (!normalizedOperation) {
-    return null;
-  }
-
-  return JSON.stringify(parsed.input, null, 2);
-}
-
 export function looksLikeLegacyDynamoPartiql(queryText: string): boolean {
   return /^\s*(select|insert|update|delete)\b/i.test(queryText);
 }
@@ -267,7 +239,7 @@ function validateParsedNativeQueryInputs(
   parsedValues: unknown[],
 ): DynamoDbNativeQueryInput[] {
   return parsedValues.map((parsed) => {
-    if (looksLikeLegacyDynamoDbEnvelope(parsed)) {
+    if (isRecord(parsed) && typeof parsed.operation === "string") {
       throw new Error(
         "DynamoDB native query text must match the official AWS request body only. Remove the legacy operation wrapper and keep only the JSON input block.",
       );

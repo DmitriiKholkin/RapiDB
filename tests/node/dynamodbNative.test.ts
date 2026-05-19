@@ -10,7 +10,6 @@ import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 import {
   parseDynamoDbNativeQueryInput,
   parseDynamoDbNativeQueryInputs,
-  unwrapLegacyDynamoDbEnvelope,
 } from "../../src/shared/dynamodbNative";
 
 const config: ConnectionConfig = {
@@ -224,14 +223,6 @@ describe("parseDynamoDbNativeQueryInput", () => {
         JSON.stringify({ operation: "Scan", input: { TableName: "users" } }),
       ),
     ).toThrow(/remove the legacy operation wrapper/i);
-  });
-
-  it("unwraps legacy saved envelope queries for migration", () => {
-    expect(
-      unwrapLegacyDynamoDbEnvelope(
-        JSON.stringify({ operation: "Scan", input: { TableName: "users" } }),
-      ),
-    ).toBe(JSON.stringify({ TableName: "users" }, null, 2));
   });
 });
 

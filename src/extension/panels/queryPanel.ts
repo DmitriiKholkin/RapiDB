@@ -1,5 +1,4 @@
 import * as vscode from "vscode";
-import { unwrapLegacyDynamoDbEnvelope } from "../../shared/dynamodbNative";
 import type { QueryEditorLanguage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import { logErrorWithContext } from "../utils/errorHandling";
@@ -173,11 +172,7 @@ export class QueryPanel {
       this.initialConnectionId,
     );
     const connectionType = connection?.type ?? "";
-    const migratedLegacyQuery =
-      connectionType === "dynamodb" && initialQueryText
-        ? unwrapLegacyDynamoDbEnvelope(initialQueryText)
-        : null;
-    const resolvedQueryText = migratedLegacyQuery ?? initialQueryText;
+    const resolvedQueryText = initialQueryText;
     const managerWithPresentation = this
       .connectionManager as ConnectionManager & {
       getQueryEditorPresentation?: (
