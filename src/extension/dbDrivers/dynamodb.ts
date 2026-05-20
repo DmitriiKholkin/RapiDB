@@ -1845,10 +1845,12 @@ export class DynamoDBDriver implements IDBDriver {
     keyNames: readonly string[],
     values: Record<string, unknown>,
   ): PutItemCommandInput {
+    const condition = this.buildMissingItemConditionExpression(keyNames);
     return {
       TableName: table,
       Item: this.marshallItem(values),
-      ConditionExpression: this.buildMissingItemConditionExpression(keyNames),
+      ConditionExpression: condition.expression,
+      ExpressionAttributeNames: condition.names,
     };
   }
 
@@ -1884,12 +1886,14 @@ export class DynamoDBDriver implements IDBDriver {
       values[valuePlaceholder] = this.toAttributeValue(value);
       return `${namePlaceholder} = ${valuePlaceholder}`;
     });
+    const condition = this.buildExistingItemConditionExpression(keyNames);
+    Object.assign(names, condition.names);
 
     return {
       TableName: table,
       Key: this.marshallKey(key),
       UpdateExpression: `SET ${assignments.join(", ")}`,
-      ConditionExpression: this.buildExistingItemConditionExpression(keyNames),
+      ConditionExpression: condition.expression,
       ExpressionAttributeNames: names,
       ExpressionAttributeValues: values,
       ReturnValues: "ALL_NEW",
@@ -1905,10 +1909,12 @@ export class DynamoDBDriver implements IDBDriver {
     if (!key) {
       throw new Error("DynamoDB delete requires the full primary key.");
     }
+    const condition = this.buildExistingItemConditionExpression(keyNames);
     return {
       TableName: table,
       Key: this.marshallKey(key),
-      ConditionExpression: this.buildExistingItemConditionExpression(keyNames),
+      ConditionExpression: condition.expression,
+      ExpressionAttributeNames: condition.names,
       ReturnValues: "ALL_OLD",
     };
   }
@@ -1930,20 +1936,37 @@ export class DynamoDBDriver implements IDBDriver {
     return key;
   }
 
-  private buildExistingItemConditionExpression(
-    keyNames: readonly string[],
-  ): string {
-    return keyNames
-      .map((keyName) => `attribute_exists(${keyName})`)
-      .join(" AND ");
+  private buildExistingItemConditionExpression(keyNames: readonly string[]): {
+    expression: string;
+    names: Record<string, string>;
+  } {
+    return this.buildKeyConditionExpression(keyNames, "attribute_exists");
   }
 
-  private buildMissingItemConditionExpression(
+  private buildMissingItemConditionExpression(keyNames: readonly string[]): {
+    expression: string;
+    names: Record<string, string>;
+  } {
+    return this.buildKeyConditionExpression(keyNames, "attribute_not_exists");
+  }
+
+  private buildKeyConditionExpression(
     keyNames: readonly string[],
-  ): string {
-    return keyNames
-      .map((keyName) => `attribute_not_exists(${keyName})`)
-      .join(" AND ");
+    condition: "attribute_exists" | "attribute_not_exists",
+  ): {
+    expression: string;
+    names: Record<string, string>;
+  } {
+    const names: Record<string, string> = {};
+    const clauses = keyNames.map((keyName, index) => {
+      const placeholder = `#k${index}`;
+      names[placeholder] = keyName;
+      return `${condition}(${placeholder})`;
+    });
+    return {
+      expression: clauses.join(" AND "),
+      names,
+    };
   }
 
   private marshallItem(

@@ -102,7 +102,52 @@ function createMapColumn(): ColumnTypeMeta {
   };
 }
 
-function createDriver() {
+type CreateDriverOptions = {
+  columns?: ColumnTypeMeta[];
+  describeTable?: {
+    KeySchema: Array<{
+      AttributeName: string;
+      KeyType: "HASH" | "RANGE";
+    }>;
+    AttributeDefinitions: Array<{
+      AttributeName: string;
+      AttributeType: "S" | "N" | "B";
+    }>;
+    GlobalSecondaryIndexes?: Array<{
+      IndexName: string;
+      KeySchema: Array<{
+        AttributeName: string;
+        KeyType: "HASH" | "RANGE";
+      }>;
+      Projection: { ProjectionType: "ALL" };
+    }>;
+  };
+};
+
+function createDriver(options: CreateDriverOptions = {}) {
+  const columns = options.columns ?? createColumns();
+  const describeTable = options.describeTable ?? {
+    KeySchema: [
+      { AttributeName: "tenant_id", KeyType: "HASH" },
+      { AttributeName: "user_id", KeyType: "RANGE" },
+    ],
+    AttributeDefinitions: [
+      { AttributeName: "tenant_id", AttributeType: "S" },
+      { AttributeName: "user_id", AttributeType: "S" },
+      { AttributeName: "email", AttributeType: "S" },
+    ],
+    GlobalSecondaryIndexes: [
+      {
+        IndexName: "email-index",
+        KeySchema: [
+          { AttributeName: "email", KeyType: "HASH" },
+          { AttributeName: "user_id", KeyType: "RANGE" },
+        ],
+        Projection: { ProjectionType: "ALL" },
+      },
+    ],
+  };
+
   const queuedResponses: unknown[] = [];
   const driver = new DynamoDBDriver(config);
   const clientSend = vi.fn(
@@ -114,29 +159,7 @@ function createDriver() {
         return { TableNames: ["users"] };
       }
       if (command.constructor.name === "DescribeTableCommand") {
-        return {
-          Table: {
-            KeySchema: [
-              { AttributeName: "tenant_id", KeyType: "HASH" },
-              { AttributeName: "user_id", KeyType: "RANGE" },
-            ],
-            AttributeDefinitions: [
-              { AttributeName: "tenant_id", AttributeType: "S" },
-              { AttributeName: "user_id", AttributeType: "S" },
-              { AttributeName: "email", AttributeType: "S" },
-            ],
-            GlobalSecondaryIndexes: [
-              {
-                IndexName: "email-index",
-                KeySchema: [
-                  { AttributeName: "email", KeyType: "HASH" },
-                  { AttributeName: "user_id", KeyType: "RANGE" },
-                ],
-                Projection: { ProjectionType: "ALL" },
-              },
-            ],
-          },
-        };
+        return { Table: describeTable };
       }
       return queuedResponses.shift() ?? {};
     },
@@ -149,7 +172,7 @@ function createDriver() {
   };
   driverState.connected = true;
   driverState.client = { send: clientSend };
-  driverState.describeColumns = vi.fn(async () => createColumns());
+  driverState.describeColumns = vi.fn(async () => columns);
 
   return {
     driver,
@@ -633,11 +656,16 @@ describe("DynamoDBDriver native API", () => {
 
     const preview = JSON.parse(plan.previewStatements[0] ?? "{}") as {
       ConditionExpression?: string;
+      ExpressionAttributeNames?: Record<string, unknown>;
       Item?: Record<string, unknown>;
     };
     expect(preview.ConditionExpression).toBe(
-      "attribute_not_exists(tenant_id) AND attribute_not_exists(user_id)",
+      "attribute_not_exists(#k0) AND attribute_not_exists(#k1)",
     );
+    expect(preview.ExpressionAttributeNames).toEqual({
+      "#k0": "tenant_id",
+      "#k1": "user_id",
+    });
     expect(preview.Item).toEqual(
       toJsonSafeValue(
         marshall(
@@ -709,7 +737,11 @@ describe("DynamoDBDriver native API", () => {
     expect(putInputs[0]).toMatchObject({
       TableName: "users",
       ConditionExpression:
-        "attribute_not_exists(tenant_id) AND attribute_not_exists(user_id)",
+        "attribute_not_exists(#k0) AND attribute_not_exists(#k1)",
+      ExpressionAttributeNames: {
+        "#k0": "tenant_id",
+        "#k1": "user_id",
+      },
       Item: marshall(
         {
           tenant_id: "tenant-1",
@@ -728,10 +760,13 @@ describe("DynamoDBDriver native API", () => {
         { removeUndefinedValues: true },
       ),
       UpdateExpression: "SET #u0 = :u0",
-      ConditionExpression:
-        "attribute_exists(tenant_id) AND attribute_exists(user_id)",
+      ConditionExpression: "attribute_exists(#k0) AND attribute_exists(#k1)",
       ReturnValues: "ALL_NEW",
-      ExpressionAttributeNames: { "#u0": "email" },
+      ExpressionAttributeNames: {
+        "#u0": "email",
+        "#k0": "tenant_id",
+        "#k1": "user_id",
+      },
       ExpressionAttributeValues: {
         ":u0": marshall(
           { value: "next@example.com" },
@@ -748,9 +783,167 @@ describe("DynamoDBDriver native API", () => {
         { tenant_id: "tenant-1", user_id: "user-1" },
         { removeUndefinedValues: true },
       ),
-      ConditionExpression:
-        "attribute_exists(tenant_id) AND attribute_exists(user_id)",
+      ConditionExpression: "attribute_exists(#k0) AND attribute_exists(#k1)",
       ReturnValues: "ALL_OLD",
+      ExpressionAttributeNames: {
+        "#k0": "tenant_id",
+        "#k1": "user_id",
+      },
+    });
+  });
+
+  it("aliases reserved key names in mutation conditions", async () => {
+    const { driver, clientSend, queueResponses } = createDriver({
+      columns: [
+        {
+          name: "namespace",
+          type: "string",
+          nativeType: "string",
+          category: "text",
+          nullable: false,
+          isPrimaryKey: true,
+          primaryKeyOrdinal: 1,
+          primaryKeyRole: "partition",
+          isForeignKey: false,
+          filterable: true,
+          filterOperators: ["eq", "neq", "like", "in"],
+          valueSemantics: "plain",
+        },
+        {
+          name: "key",
+          type: "string",
+          nativeType: "string",
+          category: "text",
+          nullable: false,
+          isPrimaryKey: true,
+          primaryKeyOrdinal: 2,
+          primaryKeyRole: "sort",
+          isForeignKey: false,
+          filterable: true,
+          filterOperators: ["eq", "neq", "like", "in"],
+          valueSemantics: "plain",
+        },
+        {
+          name: "value",
+          type: "string",
+          nativeType: "string",
+          category: "text",
+          nullable: true,
+          isPrimaryKey: false,
+          isForeignKey: false,
+          filterable: true,
+          filterOperators: [
+            "eq",
+            "neq",
+            "like",
+            "in",
+            "is_null",
+            "is_not_null",
+          ],
+          valueSemantics: "plain",
+        },
+      ],
+      describeTable: {
+        KeySchema: [
+          { AttributeName: "namespace", KeyType: "HASH" },
+          { AttributeName: "key", KeyType: "RANGE" },
+        ],
+        AttributeDefinitions: [
+          { AttributeName: "namespace", AttributeType: "S" },
+          { AttributeName: "key", AttributeType: "S" },
+          { AttributeName: "value", AttributeType: "S" },
+        ],
+      },
+    });
+
+    queueResponses(
+      {},
+      {
+        Attributes: marshall({
+          namespace: "limits",
+          key: "max_login_attempts",
+        }),
+      },
+      {
+        Attributes: marshall({
+          namespace: "limits",
+          key: "max_login_attempts",
+        }),
+      },
+      {},
+    );
+
+    await expect(
+      driver.insertRow({
+        database: "us-east-1",
+        schema: "us-east-1",
+        table: "ConfigStore",
+        values: {
+          namespace: "limits",
+          key: "max_login_attempts",
+          value: "111",
+        },
+      }),
+    ).resolves.toEqual({ affectedRows: 1 });
+
+    await expect(
+      driver.updateRows({
+        database: "us-east-1",
+        schema: "us-east-1",
+        table: "ConfigStore",
+        updates: [
+          {
+            primaryKeys: {
+              namespace: "limits",
+              key: "max_login_attempts",
+            },
+            changes: { value: "111" },
+          },
+        ],
+      }),
+    ).resolves.toEqual({ affectedRows: 1 });
+
+    await expect(
+      driver.deleteRows({
+        database: "us-east-1",
+        schema: "us-east-1",
+        table: "ConfigStore",
+        primaryKeyValuesList: [
+          { namespace: "limits", key: "max_login_attempts" },
+        ],
+      }),
+    ).resolves.toEqual({ affectedRows: 1 });
+
+    const putInputs = commandInputs(clientSend, "PutItemCommand");
+    expect(putInputs[0]).toMatchObject({
+      TableName: "ConfigStore",
+      ConditionExpression:
+        "attribute_not_exists(#k0) AND attribute_not_exists(#k1)",
+      ExpressionAttributeNames: {
+        "#k0": "namespace",
+        "#k1": "key",
+      },
+    });
+
+    const updateInputs = commandInputs(clientSend, "UpdateItemCommand");
+    expect(updateInputs[0]).toMatchObject({
+      TableName: "ConfigStore",
+      ConditionExpression: "attribute_exists(#k0) AND attribute_exists(#k1)",
+      ExpressionAttributeNames: {
+        "#u0": "value",
+        "#k0": "namespace",
+        "#k1": "key",
+      },
+    });
+
+    const deleteInputs = commandInputs(clientSend, "DeleteItemCommand");
+    expect(deleteInputs[0]).toMatchObject({
+      TableName: "ConfigStore",
+      ConditionExpression: "attribute_exists(#k0) AND attribute_exists(#k1)",
+      ExpressionAttributeNames: {
+        "#k0": "namespace",
+        "#k1": "key",
+      },
     });
   });
 
