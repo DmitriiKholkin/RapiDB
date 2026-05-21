@@ -44,6 +44,7 @@ import {
   type DriverCapabilities,
   type DriverEntityAvailability,
   type DriverEntityManifest,
+  type DriverStaticMetadata,
   type IDBDriver,
 } from "./dbDrivers/types";
 import { pMapWithLimit } from "./utils/concurrency";
@@ -647,6 +648,10 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
   readonly onDidRefreshSchemas: vscode.Event<void>;
   private readonly _onDidRefreshSchemas = new vscode.EventEmitter<void>();
   private _connectionsCache: ConnectionConfig[] | null = null;
+  private readonly _driverStaticMetadataCache = new Map<
+    string,
+    DriverStaticMetadata
+  >();
   private readonly _schemaCacheMap = new Map<
     string,
     ConnectionSchemaCacheEntry
@@ -708,6 +713,9 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
     this._connectionsCache = null;
     await this.store.saveConnections(conns);
   }
+  private invalidateDriverStaticMetadata(connectionId: string): void {
+    this._driverStaticMetadataCache.delete(connectionId);
+  }
   getConnection(id: string): ConnectionConfig | undefined {
     return this.getConnections().find((c) => c.id === id);
   }
@@ -720,6 +728,7 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
     } else {
       conns.push({ ...config, id: config.id || randomUUID() });
     }
+    this.invalidateDriverStaticMetadata(config.id);
     await this.saveConnections(conns);
     if (isEdit && this.isConnected(config.id)) {
       await this.disconnectFrom(config.id);
@@ -730,6 +739,7 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
     if (!this.getConnection(id)) {
       return false;
     }
+    this.invalidateDriverStaticMetadata(id);
     if (this.driverMap.has(id)) {
       await this.disconnectFrom(id);
     }
@@ -919,6 +929,7 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
         await driver.disconnect();
       } catch {}
       this.driverMap.delete(id);
+      this.invalidateDriverStaticMetadata(id);
       this._invalidateSchemaState(id);
       this._onDidDisconnect.fire(id);
     }
@@ -937,10 +948,22 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
     return this.driverMap.get(id);
   }
 
-  getDriverCapabilities(connectionId: string): DriverCapabilities | undefined {
-    const connectedDriver = this.getDriver(connectionId);
-    if (connectedDriver) {
-      return resolveDriverCapabilities(connectedDriver);
+  private resolveDriverStaticMetadata(
+    connectionId: string,
+  ): DriverStaticMetadata | undefined {
+    const driver = this.getDriver(connectionId);
+    if (driver) {
+      const capabilities = resolveDriverCapabilities(driver);
+      return {
+        manifest: resolveDriverEntityManifest(driver),
+        capabilities,
+        editorPresentation: capabilities?.editorPresentation,
+      };
+    }
+
+    const cachedMetadata = this._driverStaticMetadataCache.get(connectionId);
+    if (cachedMetadata) {
+      return cachedMetadata;
     }
 
     const config = this.getConnection(connectionId);
@@ -948,15 +971,32 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
       return undefined;
     }
 
-    return resolveDriverCapabilities(this.createDriver(config));
+    const metadataDriver = this.createDriver(config);
+    const capabilities = resolveDriverCapabilities(metadataDriver);
+    const metadata = {
+      manifest: resolveDriverEntityManifest(metadataDriver),
+      capabilities,
+      editorPresentation: capabilities?.editorPresentation,
+    };
+
+    this._driverStaticMetadataCache.set(connectionId, metadata);
+
+    return metadata;
+  }
+
+  getDriverCapabilities(connectionId: string): DriverCapabilities | undefined {
+    return this.resolveDriverStaticMetadata(connectionId)?.capabilities;
   }
 
   getQueryEditorPresentation(connectionId: string) {
-    return this.getDriverCapabilities(connectionId)?.editorPresentation;
+    return this.resolveDriverStaticMetadata(connectionId)?.editorPresentation;
   }
 
   getDriverEntityManifest(connectionId: string): DriverEntityManifest {
-    return resolveDriverEntityManifest(this.getDriver(connectionId));
+    return (
+      this.resolveDriverStaticMetadata(connectionId)?.manifest ??
+      DEFAULT_DRIVER_ENTITY_MANIFEST
+    );
   }
   getSchema(connectionId: string): SchemaObjectEntry[] {
     return flattenSchemaSnapshot(this.getSchemaSnapshot(connectionId));

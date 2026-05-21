@@ -8,6 +8,7 @@ import type {
 } from "./table/tableDataContracts";
 import { TableMutationService } from "./table/tableMutationService";
 import { TableReadService } from "./table/tableReadService";
+
 export { formatDatetimeForDisplay } from "./dbDrivers/BaseDBDriver";
 export type {
   ApplyResult,
@@ -24,6 +25,7 @@ export {
   executePreparedApplyPlan,
   prepareApplyChangesPlan,
 } from "./table/tableMutationExecution";
+
 export class TableDataService {
   private readonly readService: TableReadService;
   private readonly mutationService: TableMutationService;

@@ -4,6 +4,7 @@ import type {
   ColumnMeta,
   ColumnTypeMeta,
   DatabaseInfo,
+  DriverCapabilities,
   DriverEntityManifest,
   IDBDriver,
   SchemaInfo,
@@ -47,7 +48,10 @@ interface DriverBehavior {
     schema: string,
     table: string,
   ) => TriggerMeta[] | null | Promise<TriggerMeta[] | null>;
+  capabilities?: DriverCapabilities;
+  getCapabilitiesImpl?: (driver: FakeDriver) => DriverCapabilities;
   entityManifest?: DriverEntityManifest;
+  getEntityManifestImpl?: (driver: FakeDriver) => DriverEntityManifest;
 }
 
 const driverBehaviors = new Map<string, DriverBehavior>();
@@ -161,9 +165,24 @@ class FakeDriver implements IDBDriver {
   }
 
   getEntityManifest(): DriverEntityManifest {
+    const behavior = driverBehaviors.get(this.config.id);
+    if (behavior?.getEntityManifestImpl) {
+      return behavior.getEntityManifestImpl(this);
+    }
+
+    return behavior?.entityManifest ?? DEFAULT_DRIVER_ENTITY_MANIFEST;
+  }
+
+  getCapabilities(): DriverCapabilities {
+    const behavior = driverBehaviors.get(this.config.id);
+    if (behavior?.getCapabilitiesImpl) {
+      return behavior.getCapabilitiesImpl(this);
+    }
+
     return (
-      driverBehaviors.get(this.config.id)?.entityManifest ??
-      DEFAULT_DRIVER_ENTITY_MANIFEST
+      behavior?.capabilities ?? {
+        tabularRead: "sql",
+      }
     );
   }
 
@@ -475,6 +494,144 @@ describe("ConnectionManager", () => {
 
     expect(timeoutSettingsProvider?.().connectionTimeoutSeconds).toBe(8);
     expect(timeoutSettingsProvider?.().dbOperationTimeoutSeconds).toBe(12);
+  });
+
+  it("resolves disconnected static metadata from stored config without connecting", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const manifest: DriverEntityManifest = {
+      dbObjectKinds: ["table"],
+      tableSections: {
+        columns: "supported",
+        constraints: "not_applicable",
+        indexes: "not_applicable",
+        triggers: "not_applicable",
+      },
+    };
+    const capabilities: DriverCapabilities = {
+      tabularRead: "nosql",
+      queryMode: "text",
+      editorPresentation: {
+        queryMode: "text",
+        editorLanguage: "javascript",
+        allowFormatting: false,
+      },
+    };
+
+    driverBehaviors.set("conn-static", {
+      entityManifest: manifest,
+      capabilities,
+    });
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-static",
+        name: "Static metadata",
+        type: "redis",
+        database: "app_db",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    expect(manager.isConnected("conn-static")).toBe(false);
+    expect(manager.getDriverEntityManifest("conn-static")).toEqual(manifest);
+    expect(manager.getDriverCapabilities("conn-static")).toEqual(capabilities);
+    expect(manager.getQueryEditorPresentation("conn-static")).toEqual(
+      capabilities.editorPresentation,
+    );
+    expect(manager.getDriverEntityManifest("conn-static")).toEqual(manifest);
+    expect(driverInstances).toHaveLength(1);
+    expect(driverInstances.every((driver) => driver.connectCalls === 0)).toBe(
+      true,
+    );
+    expect(
+      driverInstances.every((driver) => driver.isConnected() === false),
+    ).toBe(true);
+  });
+
+  it("resolves connected static metadata from the live driver instance", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const disconnectedManifest: DriverEntityManifest = {
+      dbObjectKinds: ["table"],
+      tableSections: {
+        columns: "supported",
+        constraints: "not_applicable",
+        indexes: "not_applicable",
+        triggers: "not_applicable",
+      },
+    };
+    const liveManifest: DriverEntityManifest = {
+      dbObjectKinds: ["table", "view"],
+      tableSections: {
+        columns: "supported",
+        constraints: "supported",
+        indexes: "supported",
+        triggers: "not_applicable",
+      },
+    };
+    const disconnectedCapabilities: DriverCapabilities = {
+      tabularRead: "nosql",
+      queryMode: "text",
+      editorPresentation: {
+        queryMode: "text",
+        editorLanguage: "javascript",
+        allowFormatting: false,
+      },
+    };
+    const liveCapabilities: DriverCapabilities = {
+      tabularRead: "sql",
+      queryMode: "sql",
+      editorPresentation: {
+        queryMode: "sql",
+        editorLanguage: "sql",
+        allowFormatting: true,
+      },
+    };
+
+    driverBehaviors.set("conn-live-static", {
+      getEntityManifestImpl: (driver) =>
+        driver.isConnected() ? liveManifest : disconnectedManifest,
+      getCapabilitiesImpl: (driver) =>
+        driver.isConnected() ? liveCapabilities : disconnectedCapabilities,
+    });
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-live-static",
+        name: "Live metadata",
+        type: "pg",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await manager.connectTo("conn-live-static");
+
+    expect(driverInstances).toHaveLength(1);
+    expect(manager.getDriverEntityManifest("conn-live-static")).toEqual(
+      liveManifest,
+    );
+    expect(manager.getDriverCapabilities("conn-live-static")).toEqual(
+      liveCapabilities,
+    );
+    expect(manager.getQueryEditorPresentation("conn-live-static")).toEqual(
+      liveCapabilities.editorPresentation,
+    );
+    expect(driverInstances).toHaveLength(1);
   });
 
   it("disconnects an edited connection after saving updated settings", async () => {

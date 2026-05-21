@@ -915,8 +915,6 @@ export class RedisDriver implements IDBDriver {
         throw new Error(
           "Redis stream values are read-only in the table viewer.",
         );
-      case "none":
-      case "string":
       default:
         await client.set(key, this.normalizeStoredValue(value));
     }
@@ -977,8 +975,6 @@ export class RedisDriver implements IDBDriver {
         throw new Error(
           "Redis stream values are read-only in the table viewer.",
         );
-      case "none":
-      case "string":
       default:
         return [
           formatRedisPreviewCommand("SET", [

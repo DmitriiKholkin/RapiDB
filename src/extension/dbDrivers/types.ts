@@ -77,6 +77,12 @@ export interface DriverCapabilities {
   isTableFilterError?: (message: string) => boolean;
 }
 
+export interface DriverStaticMetadata {
+  manifest: DriverEntityManifest;
+  capabilities?: DriverCapabilities;
+  editorPresentation?: QueryEditorPresentation;
+}
+
 export type DriverTableSectionKind =
   | "columns"
   | "constraints"

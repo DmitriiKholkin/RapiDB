@@ -1744,7 +1744,7 @@ export class MongoDBDriver implements IDBDriver {
           nativeType,
           bsonSubtype,
           category,
-          nullable: isPrimaryKey ? false : true,
+          nullable: !isPrimaryKey,
           defaultValue: undefined,
           isPrimaryKey,
           primaryKeyOrdinal: isPrimaryKey ? 1 : undefined,

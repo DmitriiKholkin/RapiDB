@@ -1,4 +1,5 @@
 import * as esbuild from "esbuild";
+
 const isWatch = process.argv.includes("--watch");
 const isProduction = process.argv.includes("--production");
 const extensionConfig = {

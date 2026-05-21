@@ -2576,7 +2576,7 @@ export class DynamoDBDriver implements IDBDriver {
           schema.attrTypes.get(name),
         );
         const isPrimaryKey = schema.keys.includes(name);
-        const nullable = isPrimaryKey ? false : true;
+        const nullable = !isPrimaryKey;
         const filterable = descriptor.category !== "binary";
         return {
           name,

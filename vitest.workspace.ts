@@ -4,6 +4,7 @@ import {
   projectIdForEngine,
   TEST_PROJECT_IDS,
 } from "./tests/contracts/testingContracts";
+
 const dbProjects = DB_ENGINE_IDS.map((engineId) =>
   createVitestProject({
     projectId: projectIdForEngine(engineId),
