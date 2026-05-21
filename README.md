@@ -2,7 +2,7 @@
 
 <br/>
 
-<img src="media/img-market-6.png" alt="RapiDB" width="100%" />
+<img src="media/img-readme-6.png" alt="RapiDB" width="100%" />
 
 <br/>
 <br/>
@@ -10,19 +10,20 @@
 # RapiDB — Database Client for VS Code
 
 ### PostgreSQL · MSSQL · MySQL · MariaDB · SQLite · Oracle
+### ALSO EXPERIMENTAL SUPPORT FOR
+### Redis · MongoDB · Elasticsearch · DynamoDB
 #### All in one place. Never leaving your editor.
 
 <br/>
 
-[![Marketplace](https://img.shields.io/visual-studio-marketplace/v/DmitriiKholkin.rapidb?style=flat-square&label=VS%20Marketplace&logo=visualstudiocode&color=007ACC&labelColor=555555)](https://marketplace.visualstudio.com/items?itemName=DmitriiKholkin.rapidb)
-[![Open VSX](https://img.shields.io/open-vsx/v/DmitriiKholkin/rapidb?style=flat-square&label=Open%20VSX&logo=visualstudiocode&color=007ACC&labelColor=555555)](https://open-vsx.org/extension/DmitriiKholkin/rapidb)
+[![Open VSX](https://img.shields.io/open-vsx/dt/DmitriiKholkin/rapidb?style=flat-square&label=Open%20VSX&logo=visualstudiocode&color=007ACC&labelColor=555555)](https://open-vsx.org/extension/DmitriiKholkin/rapidb)
 [![GitHub](https://img.shields.io/github/v/tag/DmitriiKholkin/RapiDB?style=flat-square&label=GitHub&color=007ACC&labelColor=555555)](https://github.com/DmitriiKholkin/RapiDB)
 [![License](https://img.shields.io/badge/License-MIT-007ACC?style=flat-square&labelColor=555555)](https://opensource.org/licenses/MIT)
 
 <br/>
 
 <a href="https://marketplace.visualstudio.com/items?itemName=DmitriiKholkin.rapidb">
-  <img src="https://img.shields.io/badge/⚡ Install%20from%20Marketplace-007ACC?style=for-the-badge&logo=visualstudiocode&logoColor=white" alt="Install from Marketplace"/>
+  <img src="https://img.shields.io/badge/⚡ Install%20from%20VS%20Marketplace-007ACC?style=for-the-badge&logo=visualstudiocode&logoColor=white" alt="Install from VS Marketplace"/>
 </a>
 
 <br/>
@@ -49,9 +50,9 @@ Your database lives in the sidebar — same window, same shortcuts, same theme.
 
 ### 🔌 Connect to anything
 
-PostgreSQL, MS SQL Server, MySQL, MariaDB, SQLite, Oracle — all supported out of the box. SSL, self-signed certs, Oracle service names and Thick Mode with Instant Client, connection folders to keep things organized.
+PostgreSQL, MS SQL Server, MySQL, MariaDB, SQLite, Oracle, Redis, MongoDB, Elasticsearch, DynamoDB  — all supported out of the box. SSL, self-signed certs, connection folders to keep things organized.
 
-<img src="media/img-market-3.png" alt="Connection Form" width="100%" />
+<img src="media/img-readme-3.png" alt="Connection Form" width="100%" />
 
 <br/>
 
@@ -59,7 +60,7 @@ PostgreSQL, MS SQL Server, MySQL, MariaDB, SQLite, Oracle — all supported out 
 
 Saved connections can be grouped into folders, and each connection expands into databases → schemas → tables, views, materialized views, functions, procedures, sequences, and types. Right-click any object to copy its name, inspect columns with PK/FK badges, constraints, indexes, and triggers, open the data viewer where it applies, or pull the DDL / definition — no typing required.
 
-<img src="media/img-market-5.png" alt="Database Explorer tree" width="250" />
+<img src="media/img-readme-5.png" alt="Database Explorer tree" width="250" />
 
 <br/>
 
@@ -73,7 +74,7 @@ Every query you run lands in **Query History** — click any entry to reopen it 
 
 Open ERD from a database or schema node to visualize tables and the foreign key relationships between them. The diagram is built from live schema metadata, so it stays aligned with the current database snapshot.
 
-<img src="media/img-market-4.png" alt="Database Explorer tree" width="100%" />
+<img src="media/img-readme-4.png" alt="Database Explorer tree" width="100%" />
 
 <br/>
 
@@ -86,7 +87,7 @@ The query editor runs on **Monaco** — the same engine as VS Code itself. You g
 - ⌨️ `Ctrl+Enter` / `F5` to run · Select a fragment to run just that part
 - ↕️ Drag the divider to resize editor vs results
 
-<img src="media/img-market-2.png" alt="SQL Editor with results" width="100%" />
+<img src="media/img-readme-2.png" alt="SQL Editor with results" width="100%" />
 
 <br/>
 
@@ -118,7 +119,7 @@ Click any table → the **Table Data Viewer** opens:
 
 <br/>
 
-<img src="media/img-market-1.png" alt="Table Data Viewer" width="100%" />
+<img src="media/img-readme-1.png" alt="Table Data Viewer" width="100%" />
 
 <br/>
 
@@ -169,8 +170,9 @@ Click any table → the **Table Data Viewer** opens:
 | Extension host | TypeScript, VS Code Extension API |
 | Webview UI | React 19, Monaco Editor, TanStack Table, TanStack Virtual, Zustand |
 | ERD | `@xyflow/react`, `@dagrejs/dagre` |
-| SQL formatting | sql-formatter |
-| DB drivers | `pg`, `mysql2`, `mssql`, `oracledb`, `node-sqlite3-wasm` |
+| SQL formatting | `sql-formatter` |
+| DB drivers | `pg`, `mysql2`, `mssql`, `oracledb`, `node-sqlite3-wasm`, `redis`, `mongodb`, `@elastic/elasticsearch`, `@aws-sdk/client-dynamodb` |
+| VS Code icons | `@vscode/codicons` |
 | Bundler | esbuild |
 
 PRs and contributions are welcome at [github.com/DmitriiKholkin/RapiDB](https://github.com/DmitriiKholkin/RapiDB).
