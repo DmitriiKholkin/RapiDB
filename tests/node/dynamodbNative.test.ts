@@ -1077,6 +1077,70 @@ describe("DynamoDBDriver native API", () => {
     );
   });
 
+  it("avoids full materialization for client-side filters when skipCount is enabled", async () => {
+    const { driver, clientSend, queueResponses } = createDriver();
+    const driverState = driver as unknown as {
+      materializeReadPlanRows: ReturnType<typeof vi.fn>;
+    };
+    driverState.materializeReadPlanRows = vi.fn(async () => {
+      throw new Error("materialization should not be used");
+    });
+
+    queueResponses({
+      Items: [
+        marshall({
+          tenant_id: "tenant-1",
+          user_id: "user-1",
+          email: "alice@example.com",
+        }),
+        marshall({
+          tenant_id: "tenant-1",
+          user_id: "user-2",
+          email: "bob@sample.org",
+        }),
+      ],
+      LastEvaluatedKey: marshall(
+        { tenant_id: "tenant-1", user_id: "user-2" },
+        { removeUndefinedValues: true },
+      ),
+    });
+
+    const page = await driver.readTablePage({
+      database: "us-east-1",
+      schema: "us-east-1",
+      table: "users",
+      page: 1,
+      pageSize: 1,
+      filters: [
+        { column: "tenant_id", operator: "eq", value: "tenant-1" },
+        { column: "email", operator: "ilike", value: "%example.com%" },
+      ],
+      sort: { column: "user_id", direction: "asc" },
+      skipCount: true,
+    });
+
+    expect(driverState.materializeReadPlanRows).not.toHaveBeenCalled();
+    const queryInputs = commandInputs(clientSend, "QueryCommand");
+    expect(queryInputs).toHaveLength(1);
+    expect(queryInputs[0]).toMatchObject({
+      TableName: "users",
+      Limit: 200,
+      ScanIndexForward: true,
+      KeyConditionExpression: "#n0 = :v0",
+      ExpressionAttributeNames: {
+        "#n0": "tenant_id",
+      },
+    });
+    expect(page.totalCount).toBe(0);
+    expect(page.rows).toEqual([
+      expect.objectContaining({
+        tenant_id: "tenant-1",
+        user_id: "user-1",
+        email: "alice@example.com",
+      }),
+    ]);
+  });
+
   it("falls back to Scan planning for non-key JSON filters", async () => {
     const { driver, clientSend, queueResponses } = createDriver();
     const driverState = driver as unknown as {

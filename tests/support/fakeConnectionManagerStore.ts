@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   BookmarkEntry,
   ConnectionConfig,
@@ -13,6 +14,30 @@ import {
 type ConfigurationListener = (event: {
   affectsConfiguration(section: string): boolean;
 }) => void;
+
+function stableSerialize(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableSerialize(item)).join(",")}]`;
+  }
+
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record).sort((a, b) => a.localeCompare(b));
+    return `{${keys
+      .map((key) => `${JSON.stringify(key)}:${stableSerialize(record[key])}`)
+      .join(",")}}`;
+  }
+
+  return JSON.stringify(value);
+}
+
+function computeConnectionsRevision(
+  connections: StoredConnectionConfig[],
+): string {
+  return createHash("sha256")
+    .update(stableSerialize(connections))
+    .digest("hex");
+}
 
 export class FakeConnectionManagerStore implements ConnectionManagerStore {
   private connections: StoredConnectionConfig[] = [];
@@ -46,6 +71,22 @@ export class FakeConnectionManagerStore implements ConnectionManagerStore {
 
   async saveConnections(connections: ConnectionConfig[]): Promise<void> {
     this.connections = connections.map((connection) => ({ ...connection }));
+  }
+
+  getConnectionsRevision(): string {
+    return computeConnectionsRevision(this.connections);
+  }
+
+  async saveConnectionsIfRevision(
+    expectedRevision: string,
+    connections: ConnectionConfig[],
+  ): Promise<boolean> {
+    if (this.getConnectionsRevision() !== expectedRevision) {
+      return false;
+    }
+
+    this.connections = connections.map((connection) => ({ ...connection }));
+    return true;
   }
 
   readHistory(): HistoryEntry[] {

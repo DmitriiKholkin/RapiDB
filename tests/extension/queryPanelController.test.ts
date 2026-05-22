@@ -843,7 +843,7 @@ describe("QueryPanelController", () => {
     );
   });
 
-  it("logs telemetry when superseded cancellation is unsupported and continues safely", async () => {
+  it("rejects superseded execution when cancellation is unsupported", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     let resolveFirstQuery: ((value: unknown) => void) | undefined;
     const query = vi
@@ -920,12 +920,212 @@ describe("QueryPanelController", () => {
     });
     await first;
 
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(view.postMessage).toHaveBeenCalledWith({
+      type: "queryResult",
+      payload: expect.objectContaining({
+        error:
+          "[RapiDB] Cannot execute query while a previous query is still running for this connection.",
+      }),
+    });
+
     expect(warnSpy).toHaveBeenCalledTimes(1);
     expect(warnSpy.mock.calls[0]?.[0]).toContain(
       "Query cancellation is not supported",
     );
 
     warnSpy.mockRestore();
+  });
+
+  it("rejects superseded execution when cancellation misses deadline", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let resolveFirstQuery: ((value: unknown) => void) | undefined;
+    const cancelCurrentOperation = vi.fn(
+      () => new Promise<void>(() => undefined),
+    );
+    const query = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirstQuery = resolve;
+          }),
+      )
+      .mockImplementationOnce(async (queryText: string) => ({
+        columns: ["q"],
+        rows: [{ q: queryText }],
+        columnMeta: [],
+        rowCount: 1,
+        executionTimeMs: 1,
+      }));
+
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "active",
+        name: "Writable",
+        type: "pg",
+        readOnly: false,
+      })),
+      getDriverCapabilities: vi.fn(() => ({})),
+      isConnected: vi.fn(() => true),
+      connectTo: vi.fn(async () => undefined),
+      addToHistory: vi.fn(async () => undefined),
+      addBookmark: vi.fn(async () => undefined),
+      getDriver: vi.fn(() => ({ query, cancelCurrentOperation })),
+      getQueryRowLimit: vi.fn(() => 100),
+      getSchemaAsync: vi.fn(async () => []),
+    };
+
+    const view = {
+      getActiveConnectionId: vi.fn(() => "active"),
+      getInitialConnectionId: vi.fn(() => "initial"),
+      getLastQueryResult: vi.fn(() => null),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+
+    const first = controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText: "select slow" },
+    });
+
+    await Promise.resolve();
+
+    const second = controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText: "select fresh" },
+    });
+
+    await second;
+
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(view.postMessage).toHaveBeenCalledWith({
+      type: "queryResult",
+      payload: expect.objectContaining({
+        error:
+          "[RapiDB] Cannot execute query while a previous query is still running for this connection.",
+      }),
+    });
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Superseded query cancellation timed out"),
+    );
+
+    resolveFirstQuery?.({
+      columns: ["q"],
+      rows: [{ q: "select slow" }],
+      columnMeta: [],
+      rowCount: 1,
+      executionTimeMs: 1,
+    });
+    await first;
+
+    errorSpy.mockRestore();
+  });
+
+  it("rejects superseded execution when cancellation throws", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let resolveFirstQuery: ((value: unknown) => void) | undefined;
+    const cancelCurrentOperation = vi.fn(async () => {
+      throw new Error("cancel failed");
+    });
+    const query = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirstQuery = resolve;
+          }),
+      )
+      .mockImplementationOnce(async (queryText: string) => ({
+        columns: ["q"],
+        rows: [{ q: queryText }],
+        columnMeta: [],
+        rowCount: 1,
+        executionTimeMs: 1,
+      }));
+
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "active",
+        name: "Writable",
+        type: "pg",
+        readOnly: false,
+      })),
+      getDriverCapabilities: vi.fn(() => ({})),
+      isConnected: vi.fn(() => true),
+      connectTo: vi.fn(async () => undefined),
+      addToHistory: vi.fn(async () => undefined),
+      addBookmark: vi.fn(async () => undefined),
+      getDriver: vi.fn(() => ({ query, cancelCurrentOperation })),
+      getQueryRowLimit: vi.fn(() => 100),
+      getSchemaAsync: vi.fn(async () => []),
+    };
+
+    const view = {
+      getActiveConnectionId: vi.fn(() => "active"),
+      getInitialConnectionId: vi.fn(() => "initial"),
+      getLastQueryResult: vi.fn(() => null),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+
+    const first = controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText: "select slow" },
+    });
+
+    await Promise.resolve();
+
+    const second = controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText: "select fresh" },
+    });
+
+    await second;
+
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(view.postMessage).toHaveBeenCalledWith({
+      type: "queryResult",
+      payload: expect.objectContaining({
+        error:
+          "[RapiDB] Cannot execute query while a previous query is still running for this connection.",
+      }),
+    });
+    expect(errorSpy).toHaveBeenCalledWith(
+      "[RapiDB] Failed to cancel superseded query execution:",
+      expect.any(Error),
+    );
+
+    resolveFirstQuery?.({
+      columns: ["q"],
+      rows: [{ q: "select slow" }],
+      columnMeta: [],
+      rowCount: 1,
+      executionTimeMs: 1,
+    });
+    await first;
+
+    errorSpy.mockRestore();
   });
 
   it("handles schema load rejection and posts safe empty schema", async () => {
@@ -969,5 +1169,72 @@ describe("QueryPanelController", () => {
     });
 
     errorSpy.mockRestore();
+  });
+
+  it("clears per-connection execution handle when a request turns stale after handle registration", async () => {
+    const query = vi.fn(async () => ({
+      columns: ["id"],
+      rows: [{ id: 1 }],
+      columnMeta: [],
+      rowCount: 1,
+      executionTimeMs: 1,
+    }));
+
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "active",
+        name: "Primary",
+        type: "pg",
+        readOnly: false,
+      })),
+      getDriverCapabilities: vi.fn(() => ({})),
+      isConnected: vi.fn(() => true),
+      connectTo: vi.fn(async () => undefined),
+      addToHistory: vi.fn(async () => undefined),
+      addBookmark: vi.fn(async () => undefined),
+      getDriver: vi.fn(() => ({ query })),
+      getQueryRowLimit: vi.fn(() => 100),
+      getSchemaAsync: vi.fn(async () => []),
+    };
+
+    const view = {
+      getActiveConnectionId: vi.fn(() => "active"),
+      getInitialConnectionId: vi.fn(() => "initial"),
+      getLastQueryResult: vi.fn(() => null),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controllerInstance = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+    const controller = controllerInstance as unknown as {
+      handleMessage(message: unknown): Promise<void>;
+      isCurrentQueryRequest(requestToken: number): boolean;
+      activeQueryExecutions: Map<string, unknown>;
+    };
+
+    const currentCheck = vi
+      .spyOn(controller, "isCurrentQueryRequest")
+      .mockReturnValueOnce(true)
+      .mockReturnValueOnce(true)
+      .mockReturnValueOnce(false);
+
+    await controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText: "select 1" },
+    });
+
+    expect(query).not.toHaveBeenCalled();
+    expect(connectionManager.addToHistory).not.toHaveBeenCalled();
+    expect(controller.activeQueryExecutions.size).toBe(0);
+
+    currentCheck.mockRestore();
   });
 });

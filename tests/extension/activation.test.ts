@@ -175,7 +175,7 @@ describe("extension activation", () => {
 
   afterEach(async () => {
     const extension = await import("../../src/extension/extension");
-    extension.deactivate();
+    await extension.deactivate();
   });
 
   it("registers commands and tree views exactly once on activation", async () => {
@@ -1129,9 +1129,28 @@ describe("extension activation", () => {
   it("deactivates panels and disposes the connection manager", async () => {
     const extension = await import("../../src/extension/extension");
     const context = { subscriptions: [] as Array<{ dispose(): void }> };
+    let finishDispose: (() => void) | undefined;
+    (
+      connectionManagerInstance.dispose as ReturnType<typeof vi.fn>
+    ).mockReturnValue(
+      new Promise<void>((resolve) => {
+        finishDispose = resolve;
+      }),
+    );
 
     extension.activate(context as never);
-    extension.deactivate();
+    const deactivatePromise = extension.deactivate();
+
+    await Promise.resolve();
+    let settled = false;
+    void deactivatePromise.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+
+    expect(settled).toBe(false);
+    finishDispose?.();
+    await deactivatePromise;
 
     expect(queryPanelDisposeAll).toHaveBeenCalledTimes(1);
     expect(tablePanelDisposeAll).toHaveBeenCalledTimes(1);

@@ -593,6 +593,34 @@ export class DynamoDBDriver implements IDBDriver {
     const requiresMaterializedSort =
       request.sort !== null && !this.supportsServerSort(plan, request.sort);
 
+    if (
+      requiresMaterializedFiltering &&
+      !requiresMaterializedSort &&
+      request.skipCount
+    ) {
+      const filteredPage =
+        await this.readClientFilteredPageWithoutMaterialization(
+          plan,
+          request.page,
+          request.pageSize,
+          request.sort,
+          request.filters,
+          describedByName,
+        );
+      const columns = this.mergeDescribedColumns(
+        filteredPage.rawRows.length > 0
+          ? this.buildDynamoColumns(filteredPage.rawRows, schema)
+          : describedColumns,
+        describedColumns,
+        schema,
+      );
+      return {
+        columns,
+        rows: filteredPage.formattedRows,
+        totalCount: 0,
+      };
+    }
+
     if (requiresMaterializedSort || requiresMaterializedFiltering) {
       const materialized = await this.materializeReadPlanRows(
         plan,
@@ -1867,6 +1895,86 @@ export class DynamoDBDriver implements IDBDriver {
     } while (cursor !== undefined && rows.length < maxRows);
 
     return { rows, truncated };
+  }
+
+  private async readClientFilteredPageWithoutMaterialization(
+    plan: DynamoReadPlan,
+    page: number,
+    pageSize: number,
+    sort: DriverSortConfig | null,
+    filters: readonly FilterExpression[],
+    describedByName: ReadonlyMap<string, ColumnTypeMeta>,
+  ): Promise<{
+    rawRows: Record<string, unknown>[];
+    formattedRows: Record<string, unknown>[];
+  }> {
+    const offset = Math.max(0, (page - 1) * pageSize);
+    const requiredMatches = offset + pageSize;
+
+    if (plan.kind === "getItem") {
+      const response = await this.requireClient().send(
+        new GetItemCommand({
+          TableName: plan.table,
+          Key: this.marshallKey(plan.key),
+        }),
+      );
+      const rawRows = response.Item ? [unmarshall(response.Item)] : [];
+      const formattedRows = rawRows.map((row) =>
+        this.formatDynamoRowForDisplay(row, describedByName),
+      );
+      const filteredRows = applyFilters(formattedRows, filters);
+      return {
+        rawRows: filteredRows.length > 0 ? rawRows.slice(0, 1) : [],
+        formattedRows: filteredRows.slice(offset, offset + pageSize),
+      };
+    }
+
+    let cursor: Record<string, AttributeValue> | undefined;
+    let matchedCount = 0;
+    const pageRawRows: Record<string, unknown>[] = [];
+    const pageFormattedRows: Record<string, unknown>[] = [];
+
+    do {
+      const step = await this.executeReadPlanStep(
+        plan,
+        cursor,
+        DYNAMODB_CURSOR_FETCH_LIMIT,
+        sort,
+      );
+      for (const rawRow of step.rows) {
+        const formattedRow = this.formatDynamoRowForDisplay(
+          rawRow,
+          describedByName,
+        );
+        if (applyFilters([formattedRow], filters).length === 0) {
+          continue;
+        }
+
+        matchedCount += 1;
+        if (matchedCount <= offset) {
+          continue;
+        }
+
+        if (pageFormattedRows.length < pageSize) {
+          pageRawRows.push(rawRow);
+          pageFormattedRows.push(formattedRow);
+        }
+
+        if (matchedCount >= requiredMatches) {
+          return {
+            rawRows: pageRawRows,
+            formattedRows: pageFormattedRows,
+          };
+        }
+      }
+
+      cursor = step.nextCursor;
+    } while (cursor !== undefined);
+
+    return {
+      rawRows: pageRawRows,
+      formattedRows: pageFormattedRows,
+    };
   }
 
   private buildPutItemInput(

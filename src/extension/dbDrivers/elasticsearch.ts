@@ -60,6 +60,11 @@ type ElasticsearchFieldMeta = {
 
 type ElasticsearchRestMethod = "GET" | "POST" | "PUT" | "DELETE";
 
+type ElasticsearchFilterClauses = {
+  must: unknown[];
+  mustNot: unknown[];
+};
+
 const ELASTICSEARCH_READ_ONLY_QUERY_REASON =
   "[RapiDB] Read-only Elasticsearch connections allow only GET requests and POST _search requests.";
 
@@ -925,20 +930,54 @@ export class ElasticsearchDriver implements IDBDriver {
   async readTablePage(
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
-    const [rows, mapping] = await Promise.all([
-      this.readRows(request.table, 5000),
-      this.fetchMappingMeta(request.table),
-    ]);
-    const columns = this.buildColumnsFromMetadata(rows, mapping);
+    const offset = Math.max(0, (request.page - 1) * request.pageSize);
+    const size = this.clampSearchSize(request.pageSize);
+    const mapping = await this.fetchMappingMeta(request.table);
+    const mappedColumns = this.buildColumnsFromMetadata([], mapping);
     const columnMetaByName = new Map(
+      mappedColumns.map((column) => [column.name, column]),
+    );
+    const filterClauses = this.buildElasticsearchFilterClauses(
+      request.filters,
+      columnMetaByName,
+    );
+    const query =
+      filterClauses.must.length > 0 || filterClauses.mustNot.length > 0
+        ? {
+            bool: {
+              ...(filterClauses.must.length > 0
+                ? { must: filterClauses.must }
+                : {}),
+              ...(filterClauses.mustNot.length > 0
+                ? { must_not: filterClauses.mustNot }
+                : {}),
+            },
+          }
+        : { match_all: {} };
+    const sort = request.sort
+      ? [{ [request.sort.column]: { order: request.sort.direction } }]
+      : ["_doc"];
+
+    const response = await this.requireClient().search({
+      index: request.table,
+      query,
+      sort,
+      from: offset,
+      size,
+      ...(request.skipCount ? {} : { track_total_hits: true }),
+    } as never);
+
+    const rows = this.hitsToRows(
+      response.hits.hits as unknown as Array<Record<string, unknown>>,
+    );
+    const columns = this.buildColumnsFromMetadata(rows, mapping);
+    const formattedColumnMetaByName = new Map(
       columns.map((column) => [column.name, column]),
     );
-    const filtered = applyFilters(rows, request.filters);
-    const sorted = applySort(filtered, request.sort);
-    const paged = pageRows(sorted, request.page, request.pageSize).map((row) =>
+    const paged = rows.map((row) =>
       Object.fromEntries(
         Object.entries(row).map(([columnName, value]) => {
-          const column = columnMetaByName.get(columnName);
+          const column = formattedColumnMetaByName.get(columnName);
           return [
             columnName,
             column ? this.formatOutputValue(value, column) : value,
@@ -949,8 +988,151 @@ export class ElasticsearchDriver implements IDBDriver {
     return {
       columns,
       rows: paged,
-      totalCount: request.skipCount ? 0 : sorted.length,
+      totalCount: request.skipCount
+        ? 0
+        : this.resolveElasticsearchTotalCount(response.hits.total),
     };
+  }
+
+  private resolveElasticsearchTotalCount(totalHits: unknown): number {
+    if (typeof totalHits === "number") {
+      return totalHits;
+    }
+
+    if (
+      totalHits &&
+      typeof totalHits === "object" &&
+      typeof (totalHits as { value?: unknown }).value === "number"
+    ) {
+      return (totalHits as { value: number }).value;
+    }
+
+    return 0;
+  }
+
+  private buildElasticsearchFilterClauses(
+    filters: DriverTablePageRequest["filters"],
+    columnMetaByName: ReadonlyMap<string, ColumnTypeMeta>,
+  ): ElasticsearchFilterClauses {
+    const must: unknown[] = [];
+    const mustNot: unknown[] = [];
+
+    for (const filter of filters) {
+      const column = columnMetaByName.get(filter.column);
+      switch (filter.operator) {
+        case "is_null":
+          mustNot.push({ exists: { field: filter.column } });
+          break;
+        case "is_not_null":
+          must.push({ exists: { field: filter.column } });
+          break;
+        case "between": {
+          const start = this.coerceFilterValue(filter.value[0], column);
+          const end = this.coerceFilterValue(filter.value[1], column);
+          must.push({
+            range: {
+              [filter.column]: {
+                gte: start,
+                lte: end,
+              },
+            },
+          });
+          break;
+        }
+        case "eq": {
+          const value = this.coerceFilterValue(filter.value, column);
+          must.push(this.buildElasticsearchExactClause(filter.column, value));
+          break;
+        }
+        case "neq": {
+          const value = this.coerceFilterValue(filter.value, column);
+          mustNot.push(
+            this.buildElasticsearchExactClause(filter.column, value),
+          );
+          break;
+        }
+        case "gt":
+        case "gte":
+        case "lt":
+        case "lte": {
+          const value = this.coerceFilterValue(filter.value, column);
+          must.push({
+            range: {
+              [filter.column]: {
+                [filter.operator]: value,
+              },
+            },
+          });
+          break;
+        }
+        case "in": {
+          const values = this.splitInFilterValues(filter.value).map((entry) =>
+            this.coerceFilterValue(entry, column),
+          );
+          if (values.length > 0) {
+            must.push({
+              terms: {
+                [filter.column]: values,
+              },
+            });
+          }
+          break;
+        }
+        case "like":
+        case "ilike": {
+          must.push({
+            wildcard: {
+              [filter.column]: {
+                value: this.toElasticsearchWildcard(filter.value),
+                ...(filter.operator === "ilike"
+                  ? { case_insensitive: true }
+                  : {}),
+              },
+            },
+          });
+          break;
+        }
+      }
+    }
+
+    return { must, mustNot };
+  }
+
+  private buildElasticsearchExactClause(
+    column: string,
+    value: unknown,
+  ): Record<string, unknown> {
+    return {
+      term: {
+        [column]: value,
+      },
+    };
+  }
+
+  private coerceFilterValue(
+    value: string,
+    column: ColumnTypeMeta | undefined,
+  ): unknown {
+    if (!column) {
+      return value;
+    }
+    return this.coerceInputValue(value, column);
+  }
+
+  private splitInFilterValues(value: string): string[] {
+    return value
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+  }
+
+  private toElasticsearchWildcard(value: string): string {
+    const escaped = value
+      .replace(/\\/g, "\\\\")
+      .replace(/\*/g, "\\*")
+      .replace(/\?/g, "\\?");
+    const normalized = escaped.replace(/%/g, "*").replace(/_/g, "?").trim();
+    return normalized.length > 0 ? normalized : "*";
   }
 
   async updateRows(

@@ -1486,29 +1486,202 @@ export class MongoDBDriver implements IDBDriver {
   async readTablePage(
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
-    const rows = await this.readRows(request.database, request.table, 2000);
+    const schemaSampleLimit = Math.max(
+      100,
+      Math.min(500, request.pageSize * 2),
+    );
     const schemaColumns = await this.describeSchemaColumns(
       request.database,
       request.table,
-      2000,
+      schemaSampleLimit,
     );
     const normalizedFilters = this.normalizeInlineFilters(
       request.filters,
       schemaColumns,
     );
-    const filtered = applyFilters(rows, normalizedFilters);
-    const sorted = applySort(filtered, request.sort);
-    const paged = pageRows(sorted, request.page, request.pageSize);
-    return {
-      columns:
-        schemaColumns.length > 0
-          ? schemaColumns
-          : inferColumnsFromRows(sorted, "_id", {
-              nullableMode: "schemaLess",
-            }),
-      rows: paged,
-      totalCount: request.skipCount ? 0 : sorted.length,
-    };
+    const offset = Math.max(0, (request.page - 1) * request.pageSize);
+
+    try {
+      const criteria = this.buildMongoFilterCriteria(
+        normalizedFilters,
+        schemaColumns,
+      );
+      const sort = request.sort
+        ? ([
+            [request.sort.column, request.sort.direction === "desc" ? -1 : 1],
+          ] as Array<[string, 1 | -1]>)
+        : ([["_id", 1]] as Array<[string, 1 | -1]>);
+      const docs = await this.requireDb(request.database)
+        .collection(request.table)
+        .find(criteria, {
+          promoteValues: false,
+          bsonRegExp: false,
+        })
+        .sort(sort)
+        .skip(offset)
+        .limit(request.pageSize)
+        .toArray();
+      const rows = docs.map((doc) =>
+        this.toRow(doc as Record<string, unknown>),
+      );
+      const totalCount = request.skipCount
+        ? 0
+        : await this.requireDb(request.database)
+            .collection(request.table)
+            .countDocuments(criteria);
+
+      return {
+        columns:
+          schemaColumns.length > 0
+            ? schemaColumns
+            : inferColumnsFromRows(rows, "_id", {
+                nullableMode: "schemaLess",
+              }),
+        rows,
+        totalCount,
+      };
+    } catch {
+      const fallbackReadLimit = Math.max(
+        request.page * request.pageSize * 2,
+        request.pageSize * 10,
+      );
+      const boundedReadLimit = Math.min(
+        MONGODB_QUERY_HARD_CAP,
+        fallbackReadLimit,
+      );
+      const rows = await this.readRows(
+        request.database,
+        request.table,
+        boundedReadLimit,
+      );
+      const filtered = applyFilters(rows, normalizedFilters);
+      const sorted = applySort(filtered, request.sort);
+      const paged = pageRows(sorted, request.page, request.pageSize);
+      return {
+        columns:
+          schemaColumns.length > 0
+            ? schemaColumns
+            : inferColumnsFromRows(sorted, "_id", {
+                nullableMode: "schemaLess",
+              }),
+        rows: paged,
+        totalCount: request.skipCount ? 0 : sorted.length,
+      };
+    }
+  }
+
+  private buildMongoFilterCriteria(
+    filters: readonly FilterExpression[],
+    columns: readonly ColumnTypeMeta[],
+  ): Record<string, unknown> {
+    if (filters.length === 0) {
+      return {};
+    }
+
+    const columnMap = new Map(columns.map((column) => [column.name, column]));
+    const andClauses: Array<Record<string, unknown>> = [];
+
+    for (const filter of filters) {
+      const column = columnMap.get(filter.column);
+      switch (filter.operator) {
+        case "is_null":
+          andClauses.push({ [filter.column]: null });
+          break;
+        case "is_not_null":
+          andClauses.push({ [filter.column]: { $ne: null } });
+          break;
+        case "between": {
+          const start = this.coerceFilterInput(filter.value[0], column);
+          const end = this.coerceFilterInput(filter.value[1], column);
+          andClauses.push({
+            [filter.column]: {
+              $gte: start,
+              $lte: end,
+            },
+          });
+          break;
+        }
+        case "eq": {
+          andClauses.push({
+            [filter.column]: this.coerceFilterInput(filter.value, column),
+          });
+          break;
+        }
+        case "neq": {
+          andClauses.push({
+            [filter.column]: {
+              $ne: this.coerceFilterInput(filter.value, column),
+            },
+          });
+          break;
+        }
+        case "gt":
+        case "gte":
+        case "lt":
+        case "lte": {
+          const operatorMap = {
+            gt: "$gt",
+            gte: "$gte",
+            lt: "$lt",
+            lte: "$lte",
+          } as const;
+          andClauses.push({
+            [filter.column]: {
+              [operatorMap[filter.operator]]: this.coerceFilterInput(
+                filter.value,
+                column,
+              ),
+            },
+          });
+          break;
+        }
+        case "in": {
+          const entries = filter.value
+            .split(",")
+            .map((entry) => entry.trim())
+            .filter((entry) => entry.length > 0)
+            .map((entry) => this.coerceFilterInput(entry, column));
+          if (entries.length > 0) {
+            andClauses.push({ [filter.column]: { $in: entries } });
+          }
+          break;
+        }
+        case "like":
+        case "ilike": {
+          andClauses.push({
+            [filter.column]: {
+              $regex: this.buildContainsRegex(filter.value),
+              ...(filter.operator === "ilike" ? { $options: "i" } : {}),
+            },
+          });
+          break;
+        }
+      }
+    }
+
+    if (andClauses.length === 0) {
+      return {};
+    }
+
+    const criteria =
+      andClauses.length === 1 ? andClauses[0] : { $and: andClauses };
+    return this.normalizeFilterCriteria(criteria);
+  }
+
+  private coerceFilterInput(
+    value: string,
+    column: ColumnTypeMeta | undefined,
+  ): unknown {
+    if (!column) {
+      return value;
+    }
+    return this.coerceInputValue(value, column);
+  }
+
+  private buildContainsRegex(value: string): string {
+    const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const normalized = escaped.replace(/%/g, ".*").replace(/_/g, ".").trim();
+    return normalized.length > 0 ? normalized : ".*";
   }
 
   async updateRows(

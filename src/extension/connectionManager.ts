@@ -954,6 +954,7 @@ export class ConnectionManager
       return;
     }
 
+    const expectedRevision = this.store.getConnectionsRevision();
     const storedConnections = this.getConnections();
     const index = storedConnections.findIndex(
       (connection) => connection.id === config.id,
@@ -963,10 +964,14 @@ export class ConnectionManager
     }
 
     storedConnections[index] = persisted;
-    await this.saveConnections(storedConnections);
+    await this.saveConnections(storedConnections, {
+      expectedRevision,
+      skipIfRevisionMismatch: true,
+    });
   }
 
   private async _migrateAllStoredConnectionSecrets(): Promise<void> {
+    const expectedRevision = this.store.getConnectionsRevision();
     const storedConnections = this.getConnections();
     let hasChanges = false;
 
@@ -998,8 +1003,13 @@ export class ConnectionManager
     }
 
     if (hasChanges) {
-      await this.saveConnections(storedConnections);
-      this._onDidChangeConnections.fire();
+      const persisted = await this.saveConnections(storedConnections, {
+        expectedRevision,
+        skipIfRevisionMismatch: true,
+      });
+      if (persisted) {
+        this._onDidChangeConnections.fire();
+      }
     }
   }
 
@@ -1019,9 +1029,29 @@ export class ConnectionManager
     }));
     return this._connectionsCache;
   }
-  private async saveConnections(conns: ConnectionConfig[]): Promise<void> {
+  private async saveConnections(
+    conns: ConnectionConfig[],
+    options?: {
+      expectedRevision?: string;
+      skipIfRevisionMismatch?: boolean;
+    },
+  ): Promise<boolean> {
     this._connectionsCache = null;
+    if (options?.expectedRevision) {
+      const saved = await this.store.saveConnectionsIfRevision(
+        options.expectedRevision,
+        conns,
+      );
+      if (!saved && !options.skipIfRevisionMismatch) {
+        throw new Error(
+          "[RapiDB] Cannot persist connections: configuration changed concurrently.",
+        );
+      }
+      return saved;
+    }
+
     await this.store.saveConnections(conns);
+    return true;
   }
   private invalidateDriverStaticMetadata(connectionId: string): void {
     this._driverStaticMetadataCache.delete(connectionId);

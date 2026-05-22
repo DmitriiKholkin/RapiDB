@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as vscode from "vscode";
 import { QUERY_LIMIT_POLICY } from "../shared/safetyContracts";
 import type {
@@ -26,6 +27,11 @@ export interface ConnectionManagerStore {
   ): void;
   getConnections(): StoredConnectionConfig[];
   saveConnections(connections: ConnectionConfig[]): Promise<void>;
+  getConnectionsRevision(): string;
+  saveConnectionsIfRevision(
+    expectedRevision: string,
+    connections: ConnectionConfig[],
+  ): Promise<boolean>;
   readHistory(): HistoryEntry[];
   writeHistory(entries: HistoryEntry[]): Promise<void>;
   readBookmarks(): BookmarkEntry[];
@@ -37,6 +43,30 @@ export interface ConnectionManagerStore {
   getDefaultPageSize(): number;
   getQueryRowLimit(): number;
   getTimeoutSettings(): DriverTimeoutSettingsSnapshot;
+}
+
+function stableSerialize(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableSerialize(item)).join(",")}]`;
+  }
+
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record).sort((a, b) => a.localeCompare(b));
+    return `{${keys
+      .map((key) => `${JSON.stringify(key)}:${stableSerialize(record[key])}`)
+      .join(",")}}`;
+  }
+
+  return JSON.stringify(value);
+}
+
+function computeConnectionsRevision(
+  connections: StoredConnectionConfig[],
+): string {
+  return createHash("sha256")
+    .update(stableSerialize(connections))
+    .digest("hex");
 }
 
 export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
@@ -65,6 +95,30 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
     await vscode.workspace
       .getConfiguration("rapidb")
       .update("connections", connections, vscode.ConfigurationTarget.Global);
+  }
+
+  getConnectionsRevision(): string {
+    return computeConnectionsRevision(this.getConnections());
+  }
+
+  async saveConnectionsIfRevision(
+    expectedRevision: string,
+    connections: ConnectionConfig[],
+  ): Promise<boolean> {
+    const configuration = vscode.workspace.getConfiguration("rapidb");
+    const current =
+      configuration.get<StoredConnectionConfig[]>("connections") ?? [];
+    const currentRevision = computeConnectionsRevision(current);
+    if (currentRevision !== expectedRevision) {
+      return false;
+    }
+
+    await configuration.update(
+      "connections",
+      connections,
+      vscode.ConfigurationTarget.Global,
+    );
+    return true;
   }
 
   readHistory(): HistoryEntry[] {

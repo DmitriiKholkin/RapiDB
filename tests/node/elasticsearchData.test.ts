@@ -125,6 +125,7 @@ describe("ElasticsearchDriver — metadata and pages", () => {
     const { driver, search, getMapping } = createDriver();
     search.mockResolvedValue({
       hits: {
+        total: { value: 2, relation: "eq" },
         hits: [
           {
             _id: "doc-2",
@@ -275,6 +276,14 @@ describe("ElasticsearchDriver — metadata and pages", () => {
     expect(page.totalCount).toBe(2);
     expect(page.rows).toEqual([
       {
+        _id: "doc-2",
+        active: false,
+        created_at: "2026-04-02 10:30:00Z",
+        dynamic_seen: "yes",
+        email: "bravo@example.com",
+        profile: '{"tier":"pro"}',
+      },
+      {
         _id: "doc-1",
         active: true,
         created_at: "2026-04-01 09:00:00Z",
@@ -283,20 +292,20 @@ describe("ElasticsearchDriver — metadata and pages", () => {
         profile: '{"tier":"free"}',
         status: null,
       },
-      {
-        _id: "doc-2",
-        active: false,
-        created_at: "2026-04-02 10:30:00Z",
-        dynamic_seen: "yes",
-        email: "bravo@example.com",
-        profile: '{"tier":"pro"}',
-      },
     ]);
-    expect(search).toHaveBeenCalledWith({
+    expect(search).toHaveBeenNthCalledWith(1, {
       index: "users",
       size: 1000,
       query: { match_all: {} },
       sort: ["_doc"],
+    });
+    expect(search).toHaveBeenNthCalledWith(2, {
+      index: "users",
+      query: { match_all: {} },
+      sort: [{ _id: { order: "asc" } }],
+      from: 0,
+      size: 10,
+      track_total_hits: true,
     });
   });
 
@@ -767,17 +776,10 @@ describe("ElasticsearchDriver — metadata and pages", () => {
 
   it("keeps mapped columns available when filters eliminate every row", async () => {
     const { driver, search, getMapping } = createDriver();
-    search.mockResolvedValue({
+    search.mockResolvedValueOnce({
       hits: {
-        hits: [
-          {
-            _id: "doc-1",
-            _source: {
-              email: "alpha@example.com",
-              created_at: "2026-04-01T09:00:00Z",
-            },
-          },
-        ],
+        total: { value: 0, relation: "eq" },
+        hits: [],
       },
     });
     getMapping.mockResolvedValue({

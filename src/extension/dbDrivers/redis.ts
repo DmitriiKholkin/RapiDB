@@ -543,24 +543,62 @@ export class RedisDriver implements IDBDriver {
   async readTablePage(
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
-    const rows = await this.readRows(request.table, 2000);
-    const filtered = applyFilters(
-      rows.map((entry) => entry.row),
-      request.filters,
+    if (this.canUseKeyOnlyPaging(request)) {
+      const pattern = request.table === "default" ? "*" : `${request.table}:*`;
+      const offset = Math.max(0, (request.page - 1) * request.pageSize);
+      const scanLimit = request.skipCount
+        ? Math.min(REDIS_READ_BUDGET.maxScanKeys, offset + request.pageSize)
+        : REDIS_READ_BUDGET.maxScanKeys;
+      const keys = (
+        await this.scanKeys(this.prefixedPattern(pattern), scanLimit)
+      ).sort((left, right) => left.localeCompare(right));
+      const pageKeys = keys.slice(offset, offset + request.pageSize);
+      const rows = await this.readRowsForKeys(pageKeys);
+      return {
+        columns: this.inferRedisColumns(rows),
+        rows: rows.map((entry) => entry.row),
+        totalCount: request.skipCount ? 0 : keys.length,
+      };
+    }
+
+    const fallbackReadLimit = Math.max(
+      request.page * request.pageSize * 2,
+      request.pageSize * 10,
     );
+    const boundedReadLimit = Math.min(
+      REDIS_READ_BUDGET.maxValueReads,
+      fallbackReadLimit,
+    );
+    const rows = await this.readRows(request.table, boundedReadLimit);
+    const rowRecords = rows.map((entry) => entry.row);
+    const filtered = applyFilters(rowRecords, request.filters);
     const sorted = applySort(filtered, request.sort);
     const paged = pageRows(sorted, request.page, request.pageSize);
+    const redisTypeByKey = new Map(
+      rows.map((entry) => [String(entry.row.key ?? ""), entry.redisType]),
+    );
     return {
       columns: this.inferRedisColumns(
         sorted.map((row) => ({
-          redisType:
-            rows.find((entry) => entry.row === row)?.redisType ?? "none",
+          redisType: redisTypeByKey.get(String(row.key ?? "")) ?? "none",
           row,
         })),
       ),
       rows: paged,
       totalCount: request.skipCount ? 0 : sorted.length,
     };
+  }
+
+  private canUseKeyOnlyPaging(request: DriverTablePageRequest): boolean {
+    if (request.filters.length > 0) {
+      return false;
+    }
+
+    if (!request.sort) {
+      return true;
+    }
+
+    return request.sort.column === "key";
   }
 
   async updateRows(
@@ -867,48 +905,54 @@ export class RedisDriver implements IDBDriver {
       )
         .slice(0, readLimit)
         .sort((left, right) => left.localeCompare(right));
-      return await pMapWithLimit(
-        keys,
-        REDIS_READ_BUDGET.parallelValueReads,
-        async (key) => {
-          const client = this.requireClient();
-          const type = await client.type(key);
-          let value: unknown = null;
-          switch (type) {
-            case "string":
-              value = await client.get(key);
-              break;
-            case "hash":
-              value = await client.hGetAll(key);
-              break;
-            case "list":
-              value = await client.lRange(key, 0, -1);
-              break;
-            case "set":
-              value = await client.sMembers(key);
-              break;
-            case "zset":
-              value = await client.zRangeWithScores(key, 0, -1);
-              break;
-            case "stream":
-              value = await this.readStreamEntries(key);
-              break;
-            default:
-              value = null;
-          }
-
-          return {
-            redisType: type,
-            row: flattenRootRecord({
-              key: this.stripKeyPrefix(key),
-              value,
-            }),
-          };
-        },
-      );
+      return await this.readRowsForKeys(keys);
     } catch {
       return [];
     }
+  }
+
+  private async readRowsForKeys(
+    keys: readonly string[],
+  ): Promise<RedisSampleRow[]> {
+    return pMapWithLimit(
+      [...keys],
+      REDIS_READ_BUDGET.parallelValueReads,
+      async (key) => {
+        const client = this.requireClient();
+        const type = await client.type(key);
+        let value: unknown = null;
+        switch (type) {
+          case "string":
+            value = await client.get(key);
+            break;
+          case "hash":
+            value = await client.hGetAll(key);
+            break;
+          case "list":
+            value = await client.lRange(key, 0, -1);
+            break;
+          case "set":
+            value = await client.sMembers(key);
+            break;
+          case "zset":
+            value = await client.zRangeWithScores(key, 0, -1);
+            break;
+          case "stream":
+            value = await this.readStreamEntries(key);
+            break;
+          default:
+            value = null;
+        }
+
+        return {
+          redisType: type,
+          row: flattenRootRecord({
+            key: this.stripKeyPrefix(key),
+            value,
+          }),
+        };
+      },
+    );
   }
 
   private inferRedisColumns(rows: readonly RedisSampleRow[]): ColumnTypeMeta[] {

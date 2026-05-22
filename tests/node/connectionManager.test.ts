@@ -1401,6 +1401,129 @@ describe("ConnectionManager", () => {
     });
   });
 
+  it("does not overwrite a newer saveConnection while background secret migration is in-flight", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-race-save",
+        name: "Legacy",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+        password: "legacy-password",
+        useSecretStorage: false,
+      },
+    ]);
+
+    const casGate = createDeferred<void>();
+    const originalSaveIfRevision = store.saveConnectionsIfRevision.bind(store);
+    const casSpy = vi
+      .spyOn(store, "saveConnectionsIfRevision")
+      .mockImplementation(async (expectedRevision, connections) => {
+        await casGate.promise;
+        return originalSaveIfRevision(expectedRevision, connections);
+      });
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    manager.getConnections();
+    await Promise.resolve();
+
+    await manager.saveConnection({
+      id: "conn-race-save",
+      name: "Updated",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "postgres",
+      password: "new-password",
+      useSecretStorage: true,
+    });
+
+    casGate.resolve();
+    await (
+      manager as unknown as {
+        _pendingSecretMigration: Promise<void> | null;
+      }
+    )._pendingSecretMigration;
+
+    const persisted = store
+      .getConnections()
+      .find((connection) => connection.id === "conn-race-save");
+    expect(persisted?.name).toBe("Updated");
+    expect(persisted?.useSecretStorage).toBe(true);
+    expect(casSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not resurrect a removed connection when background secret migration commits stale state", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-race-remove",
+        name: "Legacy",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+        password: "legacy-password",
+        useSecretStorage: false,
+      },
+      {
+        id: "conn-keep",
+        name: "Keep",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+      },
+    ]);
+
+    const casGate = createDeferred<void>();
+    const originalSaveIfRevision = store.saveConnectionsIfRevision.bind(store);
+    const casSpy = vi
+      .spyOn(store, "saveConnectionsIfRevision")
+      .mockImplementation(async (expectedRevision, connections) => {
+        await casGate.promise;
+        return originalSaveIfRevision(expectedRevision, connections);
+      });
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    manager.getConnections();
+    await Promise.resolve();
+
+    await expect(manager.removeConnection("conn-race-remove")).resolves.toBe(
+      true,
+    );
+
+    casGate.resolve();
+    await (
+      manager as unknown as {
+        _pendingSecretMigration: Promise<void> | null;
+      }
+    )._pendingSecretMigration;
+
+    expect(store.getConnections().map((connection) => connection.id)).toEqual([
+      "conn-keep",
+    ]);
+    expect(casSpy).toHaveBeenCalledTimes(1);
+  });
+
   it("disposes active drivers and rejects future manager operations", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"

@@ -29,6 +29,7 @@ function createMockDriver() {
     .fn()
     .mockResolvedValue([{ _id: "abc", name: "Alice" }]);
   const mockFind = vi.fn().mockReturnValue({
+    sort: vi.fn().mockReturnThis(),
     limit: vi.fn().mockReturnThis(),
     skip: vi.fn().mockReturnThis(),
     toArray: mockToArray,
@@ -524,6 +525,57 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
     await expect(driver.query("SELECT * FROM users")).rejects.toThrow(
       /mongosh error/,
     );
+  });
+});
+
+describe("MongoDBDriver — readTablePage()", () => {
+  it("uses MongoDB server-side filters, sort, and pagination", async () => {
+    const { driver, mockFind, mockCountDocuments } = createMockDriver();
+
+    await driver.readTablePage({
+      database: "testdb",
+      schema: "",
+      table: "users",
+      page: 2,
+      pageSize: 5,
+      filters: [
+        {
+          column: "name",
+          operator: "ilike",
+          value: "ali",
+        },
+      ],
+      sort: { column: "name", direction: "desc" },
+      skipCount: false,
+    });
+
+    expect(mockFind).toHaveBeenNthCalledWith(
+      2,
+      {
+        name: {
+          $regex: "ali",
+          $options: "i",
+        },
+      },
+      {
+        promoteValues: false,
+        bsonRegExp: false,
+      },
+    );
+    const readCursor = mockFind.mock.results.at(-1)?.value as {
+      sort: ReturnType<typeof vi.fn>;
+      skip: ReturnType<typeof vi.fn>;
+      limit: ReturnType<typeof vi.fn>;
+    };
+    expect(readCursor.sort).toHaveBeenCalledWith([["name", -1]]);
+    expect(readCursor.skip).toHaveBeenCalledWith(5);
+    expect(readCursor.limit).toHaveBeenCalledWith(5);
+    expect(mockCountDocuments).toHaveBeenCalledWith({
+      name: {
+        $regex: "ali",
+        $options: "i",
+      },
+    });
   });
 });
 

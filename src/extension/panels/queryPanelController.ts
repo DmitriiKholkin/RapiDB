@@ -27,6 +27,9 @@ const SQL_CONNECTION_TYPES = new Set<ConnectionType>([
 
 const LIMITABLE_QUERY_PREFIX = /^\s*(with|select|values)\b/i;
 const WITH_QUERY_PREFIX = /^\s*with\b/i;
+const SUPERSEDED_QUERY_REJECTED_MESSAGE =
+  "[RapiDB] Cannot execute query while a previous query is still running for this connection.";
+const SUPERSEDED_QUERY_CANCEL_TIMEOUT_MS = 1_500;
 
 function trimTrailingSemicolons(queryText: string): string {
   return queryText.replace(/[\s;]+$/g, "");
@@ -140,7 +143,10 @@ export class QueryPanelController {
 
   private queryRequestToken = 0;
 
-  private activeQueryExecution: QueryExecutionCancellationHandle | null = null;
+  private readonly activeQueryExecutions = new Map<
+    string,
+    QueryExecutionCancellationHandle
+  >();
 
   constructor(
     private readonly connectionManager: ConnectionManager,
@@ -250,7 +256,14 @@ export class QueryPanelController {
 
     const connectionId = this.resolveConnectionId(connectionIdOverride);
     const requestToken = ++this.queryRequestToken;
-    await this.cancelSupersededQueryExecution(requestToken);
+    const canProceed = await this.cancelSupersededQueryExecution(
+      connectionId,
+      requestToken,
+    );
+    if (!canProceed) {
+      this.postQueryError(SUPERSEDED_QUERY_REJECTED_MESSAGE, requestToken);
+      return;
+    }
     const readOnlyDecision = decideReadOnlyQueryExecution(
       this.connectionManager,
       connectionId,
@@ -308,13 +321,16 @@ export class QueryPanelController {
       return;
     }
 
-    this.activeQueryExecution = this.createQueryExecutionHandle(
+    this.activeQueryExecutions.set(
       connectionId,
-      requestToken,
-      driver,
+      this.createQueryExecutionHandle(connectionId, requestToken, driver),
     );
 
     if (!this.isCurrentQueryRequest(requestToken)) {
+      const active = this.activeQueryExecutions.get(connectionId);
+      if (active?.requestToken === requestToken) {
+        this.activeQueryExecutions.delete(connectionId);
+      }
       return;
     }
 
@@ -345,8 +361,9 @@ export class QueryPanelController {
       const normalized = normalizeUnknownError(error);
       this.postQueryError(normalized.message, requestToken);
     } finally {
-      if (this.activeQueryExecution?.requestToken === requestToken) {
-        this.activeQueryExecution = null;
+      const active = this.activeQueryExecutions.get(connectionId);
+      if (active?.requestToken === requestToken) {
+        this.activeQueryExecutions.delete(connectionId);
       }
     }
   }
@@ -385,34 +402,62 @@ export class QueryPanelController {
   }
 
   private async cancelSupersededQueryExecution(
+    connectionId: string,
     supersededByRequestToken: number,
-  ): Promise<void> {
-    const previous = this.activeQueryExecution;
+  ): Promise<boolean> {
+    const previous = this.activeQueryExecutions.get(connectionId);
     if (!previous) {
-      return;
+      return true;
     }
 
-    this.activeQueryExecution = null;
     if (!previous.supportsCancellation) {
       console.warn(
         `[RapiDB] Query cancellation is not supported for connection ${previous.connectionId}; superseded request ${previous.requestToken} may continue executing in the backend.`,
       );
-      return;
+      return false;
     }
 
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     try {
-      await previous.cancel({
-        reason: "superseded",
-        operationName: previous.operationName,
-        connectionId: previous.connectionId,
-        requestToken: previous.requestToken,
-        supersededByRequestToken,
-      });
+      const cancellationResult = await Promise.race([
+        previous
+          .cancel({
+            reason: "superseded",
+            operationName: previous.operationName,
+            connectionId: previous.connectionId,
+            requestToken: previous.requestToken,
+            supersededByRequestToken,
+          })
+          .then(() => "cancelled" as const),
+        new Promise<"timed-out">((resolve) => {
+          timeoutHandle = setTimeout(() => {
+            resolve("timed-out");
+          }, SUPERSEDED_QUERY_CANCEL_TIMEOUT_MS);
+        }),
+      ]);
+
+      if (cancellationResult !== "cancelled") {
+        console.error(
+          `[RapiDB] Superseded query cancellation timed out for connection ${previous.connectionId}.`,
+        );
+        return false;
+      }
+
+      const active = this.activeQueryExecutions.get(connectionId);
+      if (active?.requestToken === previous.requestToken) {
+        this.activeQueryExecutions.delete(connectionId);
+      }
+      return true;
     } catch (error) {
       console.error(
         "[RapiDB] Failed to cancel superseded query execution:",
         error,
       );
+      return false;
+    } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+      }
     }
   }
 

@@ -743,14 +743,17 @@ export function activate(context: vscode.ExtensionContext): void {
     reg,
   );
 }
-export function deactivate(): void {
+export async function deactivate(): Promise<void> {
   _activated = false;
   QueryPanel.disposeAll();
   TablePanel.disposeAll();
   ErdPanel.disposeAll();
-  try {
-    _connectionManager?.dispose().catch(() => {});
-  } catch {}
+  const connectionManager = _connectionManager;
   _connectionManager = null;
+  try {
+    if (connectionManager) {
+      await connectionManager.dispose();
+    }
+  } catch {}
   console.log("[RapiDB] Extension deactivated");
 }

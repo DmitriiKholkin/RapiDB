@@ -346,6 +346,53 @@ describe("RedisDriver — metadata and pages", () => {
     ]);
   });
 
+  it("reads only page keys when key-sort paging has no filters", async () => {
+    const driver = new RedisDriver({
+      id: "redis-key-page-test",
+      name: "Redis Key Page Test",
+      type: "redis",
+      host: "localhost",
+    });
+    const client = {
+      scan: vi.fn().mockResolvedValue({
+        cursor: "0",
+        keys: ["users:5", "users:3", "users:4", "users:2", "users:1"],
+      }),
+      type: vi.fn(async (key: string) =>
+        key === "users:2" ? "hash" : "string",
+      ),
+      get: vi.fn(async (key: string) => `value:${key}`),
+      hGetAll: vi.fn(async () => ({ first: "Bob", last: "Builder" })),
+      lRange: vi.fn(async () => []),
+      sMembers: vi.fn(async () => []),
+      zRangeWithScores: vi.fn(async () => []),
+    };
+
+    (
+      driver as unknown as {
+        client: typeof client | null;
+        connected: boolean;
+      }
+    ).client = client;
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    const page = await driver.readTablePage({
+      database: "db0",
+      schema: "db0",
+      table: "users",
+      page: 2,
+      pageSize: 2,
+      filters: [],
+      sort: { column: "key", direction: "asc" },
+      skipCount: false,
+    });
+
+    expect(page.rows.map((row) => row.key)).toEqual(["users:3", "users:4"]);
+    expect(client.type).toHaveBeenCalledTimes(2);
+    expect(client.type).toHaveBeenNthCalledWith(1, "users:3");
+    expect(client.type).toHaveBeenNthCalledWith(2, "users:4");
+  });
+
   it("uses the native Redis stream type for the value column", async () => {
     const driver = new RedisDriver({
       id: "redis-stream-test",
