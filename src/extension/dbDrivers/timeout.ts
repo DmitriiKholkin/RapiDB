@@ -41,7 +41,14 @@ export class DriverTimeoutError extends Error {
 }
 
 interface TimeoutAwareDriverHooks {
-  cancelCurrentOperation?(): void | Promise<void>;
+  cancelCurrentOperation?(context: {
+    timeoutKind: DriverTimeoutKind;
+    operationName: string;
+  }): void | Promise<void>;
+  recycleConnectionAfterTimeout?(context: {
+    timeoutKind: DriverTimeoutKind;
+    operationName: string;
+  }): void | Promise<void>;
 }
 
 const CONNECT_METHODS = new Set(["connect"]);
@@ -230,14 +237,25 @@ export function createTimeoutAwareDriver<T extends object>(
             timeoutKind,
             operationName: property,
             timeoutSettingsProvider,
-            onTimeout:
-              typeof (target as TimeoutAwareDriverHooks)
-                .cancelCurrentOperation === "function"
-                ? () =>
-                    (
-                      target as TimeoutAwareDriverHooks
-                    ).cancelCurrentOperation?.()
-                : undefined,
+            onTimeout: async () => {
+              const timeoutHooks = target as TimeoutAwareDriverHooks;
+              const timeoutContext = {
+                timeoutKind,
+                operationName: property,
+              };
+
+              if (typeof timeoutHooks.cancelCurrentOperation === "function") {
+                await timeoutHooks.cancelCurrentOperation(timeoutContext);
+              }
+
+              if (
+                typeof timeoutHooks.recycleConnectionAfterTimeout === "function"
+              ) {
+                await timeoutHooks.recycleConnectionAfterTimeout(
+                  timeoutContext,
+                );
+              }
+            },
           },
         );
 

@@ -17,10 +17,12 @@ import {
   exportTableDataAsCsv,
   exportTableDataAsJson,
 } from "../utils/exportService";
+import { createPanelWebviewOptions } from "./panelRetentionPolicy";
 import { TableMutationPreviewController } from "./tableMutationPreviewController";
 import { createWebviewShell } from "./webviewShell";
 
 const EXPORT_CHUNK_SIZE = 500;
+const TABLE_PANEL_RETENTION_MODE = "rehydrate" as const;
 
 type TablePanelObjectKind = "table" | "view" | "materializedView";
 
@@ -184,7 +186,7 @@ export class TablePanel {
       TablePanel.viewType,
       buildTitle(),
       vscode.ViewColumn.One,
-      { enableScripts: true, retainContextWhenHidden: true },
+      createPanelWebviewOptions(TABLE_PANEL_RETENTION_MODE),
     );
 
     const instance = new TablePanel(
@@ -591,6 +593,7 @@ export class TablePanel {
         isView: this.isView,
         connectionReadOnly: this.isConnectionReadOnly(),
         defaultPageSize: this.connectionManager.getDefaultPageSize(),
+        panelRetentionMode: TABLE_PANEL_RETENTION_MODE,
       },
       htmlStyles: "height: 100%; overflow: hidden;",
       bodyStyles: "height: 100%; overflow: hidden;",

@@ -130,6 +130,16 @@ describe("QueryPanel", () => {
       true,
     );
 
+    expect(vscodeMock.createWebviewPanel).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(String),
+      1,
+      expect.objectContaining({
+        enableScripts: true,
+        retainContextWhenHidden: true,
+      }),
+    );
+
     const initialState = (createWebviewShell as ReturnType<typeof vi.fn>).mock
       .calls[0]?.[0]?.initialState;
 

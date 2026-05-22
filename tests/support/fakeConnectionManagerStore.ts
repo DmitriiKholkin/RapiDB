@@ -68,6 +68,10 @@ export class FakeConnectionManagerStore implements ConnectionManagerStore {
     return this.secrets.get(id);
   }
 
+  async storeSecret(id: string, value: string): Promise<void> {
+    this.secrets.set(id, value);
+  }
+
   async deleteSecret(id: string): Promise<void> {
     this.secrets.delete(id);
   }

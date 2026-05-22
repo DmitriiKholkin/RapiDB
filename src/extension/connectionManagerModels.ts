@@ -1,4 +1,5 @@
 import type { ConnectionConfig } from "../shared/connectionConfig";
+import type { ConnectionValidationResult } from "../shared/connectionValidation";
 import type { DbObjectKind } from "../shared/dbObjectKinds";
 import type {
   ColumnTypeMeta,
@@ -12,6 +13,7 @@ export type { ConnectionConfig } from "../shared/connectionConfig";
 export interface TestConnectionResult {
   success: boolean;
   error?: string;
+  validation?: ConnectionValidationResult;
 }
 export interface HistoryEntry {
   id: string;
@@ -149,6 +151,10 @@ export interface ScopeAwareConnectionManagerApi {
   getSchemaAsync(connectionId: string): Promise<SchemaObjectEntry[]>;
   ensureTableDetailLoading(request: TableDetailRequest): void;
   getTableDetailState(request: TableDetailRequest): TableDetailState;
+}
+
+export interface ConnectionManagerLifecycleApi {
+  dispose(): Promise<void>;
 }
 
 export interface StoredConnectionConfig extends ConnectionConfig {

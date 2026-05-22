@@ -5,10 +5,12 @@ import {
   parseConnectionFormPanelMessage,
 } from "../../shared/webviewContracts";
 import type { ConnectionConfig, ConnectionManager } from "../connectionManager";
+import { ConnectionValidationService } from "../services/connectionValidationService";
 import {
   logErrorWithContext,
   normalizeUnknownError,
 } from "../utils/errorHandling";
+import { createPanelWebviewOptions } from "./panelRetentionPolicy";
 import { createWebviewShell } from "./webviewShell";
 
 type StoredConnectionSecrets = {
@@ -18,6 +20,8 @@ type StoredConnectionSecrets = {
   awsSecretAccessKey?: string;
   awsSessionToken?: string;
 };
+
+const CONNECTION_FORM_RETENTION_MODE = "rehydrate" as const;
 
 function trimOptionalSecret(value: string | undefined): string | undefined {
   if (typeof value !== "string") {
@@ -83,6 +87,7 @@ function shouldUseSecretStorage(payload: ConnectionFormSubmission): boolean {
 
 export class ConnectionFormPanel {
   private static readonly viewType = "rapidb.connectionForm";
+  private readonly validationService = new ConnectionValidationService();
 
   private readonly panel: vscode.WebviewPanel;
   private readonly context: vscode.ExtensionContext;
@@ -152,7 +157,7 @@ export class ConnectionFormPanel {
       ConnectionFormPanel.viewType,
       title,
       vscode.ViewColumn.One,
-      { enableScripts: true, retainContextWhenHidden: true },
+      createPanelWebviewOptions(CONNECTION_FORM_RETENTION_MODE),
     );
 
     const instance = new ConnectionFormPanel(
@@ -242,14 +247,19 @@ export class ConnectionFormPanel {
         if (!payload) {
           return;
         }
-        if (!payload.name.trim()) {
+        const raw = await this.resolveSubmittedConfig(payload);
+        const validation = this.validationService.validate(raw);
+        if (!validation.valid) {
           this.panel.webview.postMessage({
             type: "saveResult",
-            payload: { success: false, error: "Name is required." },
+            payload: {
+              success: false,
+              error: validation.message ?? "Connection settings are invalid.",
+              validation,
+            },
           });
           return;
         }
-        const raw = await this.resolveSubmittedConfig(payload);
 
         if (raw.useSecretStorage) {
           const nextSecrets = serializeStoredConnectionSecrets({
@@ -320,6 +330,18 @@ export class ConnectionFormPanel {
           return;
         }
         const raw = await this.resolveSubmittedConfig(payload);
+        const validation = this.validationService.validate(raw);
+        if (!validation.valid) {
+          this.panel.webview.postMessage({
+            type: "testResult",
+            payload: {
+              success: false,
+              error: validation.message ?? "Connection settings are invalid.",
+              validation,
+            },
+          });
+          return;
+        }
         const result = await this.connectionManager.testConnection(raw);
         this.panel.webview.postMessage({ type: "testResult", payload: result });
         break;
@@ -344,6 +366,7 @@ export class ConnectionFormPanel {
       initialState: {
         view: "connection",
         existing: existing ?? null,
+        panelRetentionMode: CONNECTION_FORM_RETENTION_MODE,
       },
       includeMediaRoot: true,
     });

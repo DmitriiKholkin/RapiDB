@@ -5,6 +5,7 @@ import {
   type BookmarkEntry,
   type ConnectAttempt,
   type ConnectionConfig,
+  type ConnectionManagerLifecycleApi,
   type ExplorerSchemaScope,
   type HistoryEntry,
   type RefreshSchemaRequest,
@@ -47,6 +48,7 @@ import {
   type DriverStaticMetadata,
   type IDBDriver,
 } from "./dbDrivers/types";
+import { ConnectionValidationService } from "./services/connectionValidationService";
 import { pMapWithLimit } from "./utils/concurrency";
 import { normalizeUnknownError } from "./utils/errorHandling";
 
@@ -54,6 +56,7 @@ export type {
   BookmarkEntry,
   ConnectAttempt,
   ConnectionConfig,
+  ConnectionManagerLifecycleApi,
   ExplorerSchemaScope,
   HistoryEntry,
   RefreshSchemaRequest,
@@ -627,10 +630,110 @@ function flattenSchemaSnapshot(snapshot: SchemaSnapshot): SchemaObjectEntry[] {
 }
 
 const TEST_CONNECTION_ID = "__test__";
-export class ConnectionManager implements ScopeAwareConnectionManagerApi {
+
+interface ConnectionSecretSnapshot {
+  password?: string;
+  apiKey?: string;
+  awsAccessKeyId?: string;
+  awsSecretAccessKey?: string;
+  awsSessionToken?: string;
+}
+
+function trimOptionalSecretValue(
+  value: string | undefined,
+): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function serializeConnectionSecrets(
+  secrets: ConnectionSecretSnapshot,
+): string | undefined {
+  const filtered = Object.fromEntries(
+    Object.entries(secrets).filter(([, value]) => typeof value === "string"),
+  );
+
+  return Object.keys(filtered).length > 0
+    ? JSON.stringify(filtered)
+    : undefined;
+}
+
+function shouldForceSecretStorage(config: ConnectionConfig): boolean {
+  return (
+    config.type === "dynamodb" ||
+    config.type === "elasticsearch" ||
+    trimOptionalSecretValue(config.password) !== undefined ||
+    trimOptionalSecretValue(config.apiKey) !== undefined ||
+    trimOptionalSecretValue(config.awsAccessKeyId) !== undefined ||
+    trimOptionalSecretValue(config.awsSecretAccessKey) !== undefined ||
+    trimOptionalSecretValue(config.awsSessionToken) !== undefined ||
+    config.useSecretStorage === true
+  );
+}
+
+function extractConnectionSecrets(
+  config: ConnectionConfig,
+): ConnectionSecretSnapshot {
+  return {
+    password: trimOptionalSecretValue(config.password),
+    apiKey:
+      config.type === "elasticsearch"
+        ? trimOptionalSecretValue(config.apiKey)
+        : undefined,
+    awsAccessKeyId:
+      config.type === "dynamodb"
+        ? trimOptionalSecretValue(config.awsAccessKeyId)
+        : undefined,
+    awsSecretAccessKey:
+      config.type === "dynamodb"
+        ? trimOptionalSecretValue(config.awsSecretAccessKey)
+        : undefined,
+    awsSessionToken:
+      config.type === "dynamodb"
+        ? trimOptionalSecretValue(config.awsSessionToken)
+        : undefined,
+  };
+}
+
+function sanitizePersistedConnectionConfig(
+  config: ConnectionConfig,
+): ConnectionConfig {
+  if (!shouldForceSecretStorage(config)) {
+    return { ...config };
+  }
+
+  const {
+    password: _password,
+    apiKey: _apiKey,
+    awsAccessKeyId: _awsAccessKeyId,
+    awsSecretAccessKey: _awsSecretAccessKey,
+    awsSessionToken: _awsSessionToken,
+    ...rest
+  } = config;
+
+  return {
+    ...rest,
+    useSecretStorage: true,
+  };
+}
+
+export class ConnectionManager
+  implements ScopeAwareConnectionManagerApi, ConnectionManagerLifecycleApi
+{
+  private readonly validationService = new ConnectionValidationService();
   private readonly store: ConnectionManagerStore;
   private driverMap = new Map<string, IDBDriver>();
-  private readonly _connectingMap = new Map<string, Promise<void>>();
+  private readonly _connectingMap = new Map<
+    string,
+    {
+      promise: Promise<void>;
+      epoch: number;
+    }
+  >();
   readonly onDidChangeConnections: vscode.Event<void>;
   private readonly _onDidChangeConnections = new vscode.EventEmitter<void>();
   readonly onDidChangeHistory: vscode.Event<void>;
@@ -661,6 +764,9 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
     string,
     Set<SchemaScopeKey>
   >();
+  private readonly _connectionEpochMap = new Map<string, number>();
+  private _pendingSecretMigration: Promise<void> | null = null;
+  private _disposed = false;
   constructor(
     context: vscode.ExtensionContext,
     store: ConnectionManagerStore = new VSCodeConnectionManagerStore(context),
@@ -698,10 +804,137 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
       this._onDidChangeHistory.fire();
     }
   }
+
+  private _assertNotDisposed(): void {
+    if (this._disposed) {
+      throw new Error("[RapiDB] ConnectionManager has been disposed");
+    }
+  }
+
+  private _nextConnectionEpoch(connectionId: string): number {
+    const nextEpoch = (this._connectionEpochMap.get(connectionId) ?? 0) + 1;
+    this._connectionEpochMap.set(connectionId, nextEpoch);
+    return nextEpoch;
+  }
+
+  private _isStaleConnectEpoch(connectionId: string, epoch: number): boolean {
+    return (
+      this._disposed ||
+      (this._connectionEpochMap.get(connectionId) ?? 0) !== epoch
+    );
+  }
+
+  private _scheduleSecretMigration(): void {
+    if (this._pendingSecretMigration) {
+      return;
+    }
+
+    const pending = Promise.resolve()
+      .then(() => this._migrateAllStoredConnectionSecrets())
+      .catch(() => undefined)
+      .finally(() => {
+        this._pendingSecretMigration = null;
+      });
+
+    this._pendingSecretMigration = pending;
+  }
+
+  private async _persistConnectionSecretsIfNeeded(
+    config: ConnectionConfig,
+  ): Promise<void> {
+    if (!shouldForceSecretStorage(config)) {
+      return;
+    }
+
+    const serializedSecrets = serializeConnectionSecrets(
+      extractConnectionSecrets(config),
+    );
+
+    if (!serializedSecrets) {
+      return;
+    }
+
+    await this.store.storeSecret(config.id, serializedSecrets);
+  }
+
+  private async _migrateSingleConnectionSecretsIfNeeded(
+    config: ConnectionConfig,
+  ): Promise<void> {
+    if (!shouldForceSecretStorage(config)) {
+      return;
+    }
+
+    const persisted = sanitizePersistedConnectionConfig(config);
+    const needsPersistedConfigUpdate =
+      persisted.useSecretStorage !== config.useSecretStorage ||
+      persisted.password !== config.password ||
+      persisted.apiKey !== config.apiKey ||
+      persisted.awsAccessKeyId !== config.awsAccessKeyId ||
+      persisted.awsSecretAccessKey !== config.awsSecretAccessKey ||
+      persisted.awsSessionToken !== config.awsSessionToken;
+
+    await this._persistConnectionSecretsIfNeeded(config);
+
+    if (!needsPersistedConfigUpdate) {
+      return;
+    }
+
+    const storedConnections = this.getConnections();
+    const index = storedConnections.findIndex(
+      (connection) => connection.id === config.id,
+    );
+    if (index < 0) {
+      return;
+    }
+
+    storedConnections[index] = persisted;
+    await this.saveConnections(storedConnections);
+  }
+
+  private async _migrateAllStoredConnectionSecrets(): Promise<void> {
+    const storedConnections = this.getConnections();
+    let hasChanges = false;
+
+    for (const connection of storedConnections) {
+      if (!shouldForceSecretStorage(connection)) {
+        continue;
+      }
+
+      await this._persistConnectionSecretsIfNeeded(connection);
+      const persisted = sanitizePersistedConnectionConfig(connection);
+      if (
+        persisted.useSecretStorage !== connection.useSecretStorage ||
+        persisted.password !== connection.password ||
+        persisted.apiKey !== connection.apiKey ||
+        persisted.awsAccessKeyId !== connection.awsAccessKeyId ||
+        persisted.awsSecretAccessKey !== connection.awsSecretAccessKey ||
+        persisted.awsSessionToken !== connection.awsSessionToken
+      ) {
+        const index = storedConnections.findIndex(
+          (item) => item.id === connection.id,
+        );
+        if (index >= 0) {
+          storedConnections[index] = persisted;
+          hasChanges = true;
+        }
+      }
+    }
+
+    if (hasChanges) {
+      await this.saveConnections(storedConnections);
+      this._onDidChangeConnections.fire();
+    }
+  }
+
   getConnections(): ConnectionConfig[] {
+    this._assertNotDisposed();
+
     if (this._connectionsCache) {
       return this._connectionsCache;
     }
+
+    this._scheduleSecretMigration();
+
     this._connectionsCache = this.store.getConnections().map((c) => ({
       ...c,
       id: c.id ?? randomUUID(),
@@ -720,13 +953,27 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
     return this.getConnections().find((c) => c.id === id);
   }
   async saveConnection(config: ConnectionConfig): Promise<void> {
+    this._assertNotDisposed();
+
+    const validation = this.validationService.validate(config);
+    if (!validation.valid) {
+      throw new Error(validation.message ?? "Connection settings are invalid.");
+    }
+
+    await this._persistConnectionSecretsIfNeeded(config);
+
+    const persistedConfig = sanitizePersistedConnectionConfig(config);
+
     const conns = this.getConnections();
     const idx = conns.findIndex((c) => c.id === config.id);
     const isEdit = idx >= 0;
     if (isEdit) {
-      conns[idx] = config;
+      conns[idx] = persistedConfig;
     } else {
-      conns.push({ ...config, id: config.id || randomUUID() });
+      conns.push({
+        ...persistedConfig,
+        id: persistedConfig.id || randomUUID(),
+      });
     }
     this.invalidateDriverStaticMetadata(config.id);
     await this.saveConnections(conns);
@@ -736,6 +983,8 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
     this._onDidChangeConnections.fire();
   }
   async removeConnection(id: string): Promise<boolean> {
+    this._assertNotDisposed();
+
     if (!this.getConnection(id)) {
       return false;
     }
@@ -872,9 +1121,11 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
     return createTimeoutAwareDriver(driver, timeoutSettingsProvider);
   }
   beginConnect(id: string): ConnectAttempt {
+    this._assertNotDisposed();
+
     const pending = this._connectingMap.get(id);
     if (pending) {
-      return { promise: pending, isNew: false };
+      return { promise: pending.promise, isNew: false };
     }
     if (this.isConnected(id)) {
       return { promise: Promise.resolve(), isNew: false };
@@ -885,7 +1136,11 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
       resolveAttempt = resolve;
       rejectAttempt = reject;
     });
-    this._connectingMap.set(id, attempt);
+    const connectEpoch = this._nextConnectionEpoch(id);
+    this._connectingMap.set(id, {
+      promise: attempt,
+      epoch: connectEpoch,
+    });
     this._onDidChangeConnections.fire();
     void (async () => {
       try {
@@ -896,7 +1151,22 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
         if (!config) {
           throw new Error(`[RapiDB] Connection "${id}" not found`);
         }
-        const fullConfig = await this._hydratePassword(config);
+
+        await this._migrateSingleConnectionSecretsIfNeeded(config);
+
+        if (this._isStaleConnectEpoch(id, connectEpoch)) {
+          resolveAttempt();
+          return;
+        }
+
+        const liveConfig = this.getConnection(id) ?? config;
+        const fullConfig = await this._hydratePassword(liveConfig);
+        const validation = this.validationService.validate(fullConfig);
+        if (!validation.valid) {
+          throw new Error(
+            validation.message ?? "Connection settings are invalid.",
+          );
+        }
         const driver = this.createDriver(fullConfig);
         try {
           await driver.connect();
@@ -906,6 +1176,15 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
           } catch {}
           throw err;
         }
+
+        if (this._isStaleConnectEpoch(id, connectEpoch)) {
+          try {
+            await driver.disconnect();
+          } catch {}
+          resolveAttempt();
+          return;
+        }
+
         this.driverMap.set(id, driver);
         this._invalidateSchemaState(id);
         this._onDidConnect.fire();
@@ -913,7 +1192,10 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
       } catch (err) {
         rejectAttempt(err);
       } finally {
-        this._connectingMap.delete(id);
+        const pendingAttempt = this._connectingMap.get(id);
+        if (pendingAttempt?.epoch === connectEpoch) {
+          this._connectingMap.delete(id);
+        }
         this._onDidChangeConnections.fire();
       }
     })();
@@ -923,6 +1205,9 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
     await this.beginConnect(id).promise;
   }
   async disconnectFrom(id: string): Promise<void> {
+    this._nextConnectionEpoch(id);
+    this._connectingMap.delete(id);
+
     const driver = this.driverMap.get(id);
     if (driver) {
       try {
@@ -2119,7 +2404,16 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
   async testConnection(
     config: Omit<ConnectionConfig, "id">,
   ): Promise<TestConnectionResult> {
-    const driver = this.createDriver({ ...config, id: TEST_CONNECTION_ID });
+    const configWithId = { ...config, id: TEST_CONNECTION_ID };
+    const validation = this.validationService.validate(configWithId);
+    if (!validation.valid) {
+      return {
+        success: false,
+        error: validation.message ?? "Connection settings are invalid.",
+        validation,
+      };
+    }
+    const driver = this.createDriver(configWithId);
     try {
       await driver.connect();
       await driver.disconnect();
@@ -2136,6 +2430,39 @@ export class ConnectionManager implements ScopeAwareConnectionManagerApi {
     await Promise.allSettled(
       [...this.driverMap.keys()].map((id) => this.disconnectFrom(id)),
     );
+  }
+
+  async dispose(): Promise<void> {
+    if (this._disposed) {
+      return;
+    }
+
+    this._disposed = true;
+
+    for (const connectionId of this._connectingMap.keys()) {
+      this._nextConnectionEpoch(connectionId);
+    }
+    for (const connectionId of this.driverMap.keys()) {
+      this._nextConnectionEpoch(connectionId);
+    }
+
+    await this.disconnectAll();
+    this.driverMap.clear();
+    this._connectingMap.clear();
+    this._connectionsCache = null;
+    this._driverStaticMetadataCache.clear();
+    this._schemaCacheMap.clear();
+    this._schemaGenerationMap.clear();
+    this._schemaExpandedScopeKeyMap.clear();
+
+    this._onDidChangeConnections.dispose();
+    this._onDidChangeHistory.dispose();
+    this._onDidChangeBookmarks.dispose();
+    this._onDidDisconnect.dispose();
+    this._onDidConnect.dispose();
+    this._onDidSchemaLoad.dispose();
+    this._onDidChangeSchemaState.dispose();
+    this._onDidRefreshSchemas.dispose();
   }
   getHistory(connectionId?: string): HistoryEntry[] {
     const all = this.store.readHistory();

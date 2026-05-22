@@ -180,6 +180,14 @@ export interface IDBDriver {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   isConnected(): boolean;
+  cancelCurrentOperation?(context?: {
+    timeoutKind?: "connection" | "dbOperation";
+    operationName?: string;
+  }): Promise<void> | void;
+  recycleConnectionAfterTimeout?(context?: {
+    timeoutKind?: "connection" | "dbOperation";
+    operationName?: string;
+  }): Promise<void> | void;
   getEntityManifest?(): DriverEntityManifest;
   getCapabilities?(): DriverCapabilities;
   listDatabases(): Promise<DatabaseInfo[]>;

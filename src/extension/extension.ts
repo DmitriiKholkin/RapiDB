@@ -749,7 +749,7 @@ export function deactivate(): void {
   TablePanel.disposeAll();
   ErdPanel.disposeAll();
   try {
-    _connectionManager?.disconnectAll().catch(() => {});
+    _connectionManager?.dispose().catch(() => {});
   } catch {}
   _connectionManager = null;
   console.log("[RapiDB] Extension deactivated");

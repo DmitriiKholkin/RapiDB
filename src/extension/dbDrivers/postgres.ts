@@ -206,6 +206,7 @@ export class PostgresDriver extends BaseDBDriver {
   private readonly config: ConnectionConfig;
   private _connected = false;
   private connectedDatabaseName = "";
+  private timeoutRecoveryInFlight: Promise<void> | null = null;
   private requirePool(): Pool {
     if (!this.pool) {
       throw new Error("[RapiDB] PostgreSQL connection is not open");
@@ -293,6 +294,38 @@ export class PostgresDriver extends BaseDBDriver {
     await this.pool?.end();
     this.pool = null;
   }
+
+  async cancelCurrentOperation(): Promise<void> {
+    await this.recycleConnectionAfterTimeout({
+      timeoutKind: "dbOperation",
+      operationName: "cancelCurrentOperation",
+    });
+  }
+
+  async recycleConnectionAfterTimeout(_context?: {
+    timeoutKind?: "connection" | "dbOperation";
+    operationName?: string;
+  }): Promise<void> {
+    if (this.timeoutRecoveryInFlight) {
+      await this.timeoutRecoveryInFlight;
+      return;
+    }
+
+    const recover = async () => {
+      const wasConnected = this.isConnected();
+      await this.disconnect().catch(() => undefined);
+      if (wasConnected) {
+        await this.connect().catch(() => undefined);
+      }
+    };
+
+    this.timeoutRecoveryInFlight = recover().finally(() => {
+      this.timeoutRecoveryInFlight = null;
+    });
+
+    await this.timeoutRecoveryInFlight;
+  }
+
   isConnected(): boolean {
     return this.pool !== null && this._connected;
   }

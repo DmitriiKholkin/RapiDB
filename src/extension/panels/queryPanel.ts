@@ -2,11 +2,14 @@ import * as vscode from "vscode";
 import type { QueryEditorLanguage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import { logErrorWithContext } from "../utils/errorHandling";
+import { createPanelWebviewOptions } from "./panelRetentionPolicy";
 import {
   type QueryPanelCachedResult,
   QueryPanelController,
 } from "./queryPanelController";
 import { createWebviewShell } from "./webviewShell";
+
+const QUERY_PANEL_RETENTION_MODE = "retain" as const;
 
 export class QueryPanel {
   private static readonly viewType = "rapidb.queryPanel";
@@ -139,7 +142,7 @@ export class QueryPanel {
       QueryPanel.viewType,
       title,
       vscode.ViewColumn.One,
-      { enableScripts: true, retainContextWhenHidden: true },
+      createPanelWebviewOptions(QUERY_PANEL_RETENTION_MODE),
     );
 
     const instance = new QueryPanel(
@@ -216,6 +219,7 @@ export class QueryPanel {
         isBookmarked: this.isBookmarked ?? false,
         editorLanguage: this.editorLanguage,
         editorPresentation,
+        panelRetentionMode: QUERY_PANEL_RETENTION_MODE,
       },
       includeMediaRoot: true,
       extraCspDirectives: ["worker-src blob:"],

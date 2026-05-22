@@ -143,14 +143,24 @@ describe("driver timeout helpers", () => {
 
     const deferred = createDeferred<string[]>();
     const cancelCurrentOperation = vi.fn();
+    const recycleConnectionAfterTimeout = vi.fn();
     const driver = createTimeoutAwareDriver(
       {
         async connect(): Promise<void> {},
         async listDatabases(): Promise<string[]> {
           return deferred.promise;
         },
-        async cancelCurrentOperation(): Promise<void> {
-          cancelCurrentOperation();
+        async cancelCurrentOperation(context: {
+          timeoutKind: "connection" | "dbOperation";
+          operationName: string;
+        }): Promise<void> {
+          cancelCurrentOperation(context);
+        },
+        async recycleConnectionAfterTimeout(context: {
+          timeoutKind: "connection" | "dbOperation";
+          operationName: string;
+        }): Promise<void> {
+          recycleConnectionAfterTimeout(context);
         },
         quoteIdentifier(name: string): string {
           return name;
@@ -172,12 +182,26 @@ describe("driver timeout helpers", () => {
 
     await rejection;
     expect(cancelCurrentOperation).toHaveBeenCalledTimes(1);
+    expect(recycleConnectionAfterTimeout).toHaveBeenCalledTimes(1);
+    expect(cancelCurrentOperation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        timeoutKind: "dbOperation",
+        operationName: "listDatabases",
+      }),
+    );
+    expect(recycleConnectionAfterTimeout).toHaveBeenCalledWith(
+      expect.objectContaining({
+        timeoutKind: "dbOperation",
+        operationName: "listDatabases",
+      }),
+    );
   });
 
   it("clears the timeout timer when a wrapped method fails synchronously", async () => {
     vi.useFakeTimers();
 
     const cancelCurrentOperation = vi.fn();
+    const recycleConnectionAfterTimeout = vi.fn();
     const driver = createTimeoutAwareDriver(
       {
         async connect(): Promise<void> {},
@@ -186,6 +210,9 @@ describe("driver timeout helpers", () => {
         },
         async cancelCurrentOperation(): Promise<void> {
           cancelCurrentOperation();
+        },
+        async recycleConnectionAfterTimeout(): Promise<void> {
+          recycleConnectionAfterTimeout();
         },
         quoteIdentifier(name: string): string {
           return name;
@@ -204,5 +231,6 @@ describe("driver timeout helpers", () => {
     await vi.advanceTimersByTimeAsync(25);
 
     expect(cancelCurrentOperation).not.toHaveBeenCalled();
+    expect(recycleConnectionAfterTimeout).not.toHaveBeenCalled();
   });
 });

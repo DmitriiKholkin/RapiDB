@@ -606,6 +606,8 @@ export class MSSQLDriver extends BaseDBDriver {
 
   private pool: mssql.ConnectionPool | null = null;
   private readonly config: ConnectionConfig;
+  private readonly activeRequests = new Set<mssql.Request>();
+  private timeoutRecoveryInFlight: Promise<void> | null = null;
   constructor(
     config: ConnectionConfig,
     timeoutSettingsProvider?: DriverTimeoutSettingsProvider,
@@ -851,6 +853,48 @@ export class MSSQLDriver extends BaseDBDriver {
     await this.pool?.close();
     this.pool = null;
   }
+
+  async cancelCurrentOperation(): Promise<void> {
+    for (const request of [...this.activeRequests]) {
+      try {
+        request.cancel();
+      } catch {}
+    }
+  }
+
+  async recycleConnectionAfterTimeout(): Promise<void> {
+    if (this.timeoutRecoveryInFlight) {
+      await this.timeoutRecoveryInFlight;
+      return;
+    }
+
+    const recover = async () => {
+      const wasConnected = this.isConnected();
+      await this.disconnect().catch(() => undefined);
+      if (wasConnected) {
+        await this.connect().catch(() => undefined);
+      }
+    };
+
+    this.timeoutRecoveryInFlight = recover().finally(() => {
+      this.timeoutRecoveryInFlight = null;
+    });
+
+    await this.timeoutRecoveryInFlight;
+  }
+
+  private async executeTrackedRequest<T>(
+    request: mssql.Request,
+    operation: (request: mssql.Request) => Promise<T>,
+  ): Promise<T> {
+    this.activeRequests.add(request);
+    try {
+      return await operation(request);
+    } finally {
+      this.activeRequests.delete(request);
+    }
+  }
+
   isConnected(): boolean {
     return this.pool?.connected ?? false;
   }
@@ -1079,8 +1123,10 @@ export class MSSQLDriver extends BaseDBDriver {
   ): Promise<QueryResult> {
     const req = this.requirePool().request();
     req.arrayRowMode = true;
-    const finalSql = this.bindPositionalParameters(req, sql, params);
-    const res = (await req.query(finalSql)) as MssqlArrayResult;
+    const res = (await this.executeTrackedRequest(req, async (trackedReq) => {
+      const finalSql = this.bindPositionalParameters(trackedReq, sql, params);
+      return await trackedReq.query(finalSql);
+    })) as MssqlArrayResult;
     const executionTimeMs = Date.now() - start;
     const columnsMeta = res.columns?.[0] ?? [];
     const affectedRows = res.rowsAffected.at(-1) ?? 0;
@@ -1481,8 +1527,17 @@ export class MSSQLDriver extends BaseDBDriver {
     try {
       for (const op of operations) {
         const req = tx.request();
-        const finalSql = this.bindPositionalParameters(req, op.sql, op.params);
-        const res = await req.query(finalSql);
+        const res = await this.executeTrackedRequest(
+          req,
+          async (trackedReq) => {
+            const finalSql = this.bindPositionalParameters(
+              trackedReq,
+              op.sql,
+              op.params,
+            );
+            return await trackedReq.query(finalSql);
+          },
+        );
         if (op.checkAffectedRows && (res.rowsAffected?.[0] ?? 0) === 0) {
           throw new Error(
             "Row not found — the row may have been modified or deleted by another user",

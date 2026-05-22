@@ -39,6 +39,7 @@ describe("VSCodeConnectionManagerStore", () => {
       },
       secrets: {
         get: vi.fn(),
+        store: vi.fn(),
         delete: vi.fn(),
       },
     } as never);

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { ConnectionConfig } from "../../src/extension/connectionManagerModels";
 import type { DriverTimeoutSettingsProvider } from "../../src/extension/dbDrivers/timeout";
 import type {
   ColumnMeta,
@@ -21,6 +22,7 @@ import { MockEventEmitter } from "../support/mockVscode";
 
 interface DriverBehavior {
   connectError?: unknown;
+  connectImpl?: () => Promise<void>;
   listDatabases?: DatabaseInfo[];
   listDatabasesImpl?: () => DatabaseInfo[] | Promise<DatabaseInfo[]>;
   listSchemasByDatabase?: Record<string, SchemaInfo[]>;
@@ -149,6 +151,9 @@ class FakeDriver implements IDBDriver {
   async connect(): Promise<void> {
     this.connectCalls += 1;
     const behavior = driverBehaviors.get(this.config.id);
+    if (behavior?.connectImpl) {
+      await behavior.connectImpl();
+    }
     if (behavior?.connectError) {
       throw behavior.connectError;
     }
@@ -425,6 +430,220 @@ beforeEach(() => {
 });
 
 describe("ConnectionManager", () => {
+  it("connects successfully across all supported driver types with minimal valid configs", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    const scenarios: ConnectionConfig[] = [
+      {
+        id: "conn-pg",
+        name: "Postgres",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+      },
+      {
+        id: "conn-mysql",
+        name: "MySQL",
+        type: "mysql",
+        host: "localhost",
+        database: "app",
+        username: "root",
+      },
+      {
+        id: "conn-sqlite",
+        name: "SQLite",
+        type: "sqlite",
+        filePath: "/tmp/app.db",
+      },
+      {
+        id: "conn-mssql",
+        name: "MSSQL",
+        type: "mssql",
+        host: "localhost",
+        database: "app",
+      },
+      {
+        id: "conn-oracle",
+        name: "Oracle",
+        type: "oracle",
+        database: "FREEPDB1",
+      },
+      {
+        id: "conn-mongodb",
+        name: "MongoDB",
+        type: "mongodb",
+        uri: "mongodb://localhost:27017/app",
+        authDatabase: "admin",
+        authSource: "legacy-admin",
+      },
+      {
+        id: "conn-redis",
+        name: "Redis",
+        type: "redis",
+        connectionUri: "redis://localhost:6379",
+      },
+      {
+        id: "conn-elasticsearch",
+        name: "Elasticsearch",
+        type: "elasticsearch",
+        cloudId: "deployment:ZXM=",
+      },
+      {
+        id: "conn-dynamodb",
+        name: "DynamoDB",
+        type: "dynamodb",
+        awsRegion: "us-east-1",
+      },
+    ];
+    store.setConnections(scenarios);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    for (const scenario of scenarios) {
+      await manager.connectTo(scenario.id);
+    }
+
+    expect(driverInstances).toHaveLength(9);
+    for (const scenario of scenarios) {
+      expect(manager.isConnected(scenario.id)).toBe(true);
+    }
+  });
+
+  it("returns validation errors for invalid testConnection requests across all drivers", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      new FakeConnectionManagerStore(),
+    );
+
+    const scenarios: Array<{
+      config: Omit<ConnectionConfig, "id">;
+      expected: string;
+    }> = [
+      {
+        config: {
+          name: "Broken PG",
+          type: "pg",
+          host: "localhost",
+          database: "app",
+        },
+        expected: "username",
+      },
+      {
+        config: {
+          name: "Broken MySQL",
+          type: "mysql",
+          host: "localhost",
+          database: "app",
+        },
+        expected: "username",
+      },
+      {
+        config: {
+          name: "Broken SQLite",
+          type: "sqlite",
+        },
+        expected: "filePath",
+      },
+      {
+        config: {
+          name: "Broken MSSQL",
+          type: "mssql",
+          database: "app",
+        },
+        expected: "host",
+      },
+      {
+        config: {
+          name: "Broken Oracle",
+          type: "oracle",
+        },
+        expected: "serviceName",
+      },
+      {
+        config: {
+          name: "Broken MongoDB",
+          type: "mongodb",
+        },
+        expected: "connectionUri",
+      },
+      {
+        config: {
+          name: "Broken Redis",
+          type: "redis",
+        },
+        expected: "connectionUri",
+      },
+      {
+        config: {
+          name: "Broken Elasticsearch",
+          type: "elasticsearch",
+        },
+        expected: "endpoint",
+      },
+      {
+        config: {
+          name: "Broken DynamoDB",
+          type: "dynamodb",
+        },
+        expected: "awsRegion",
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      driverInstances.splice(0, driverInstances.length);
+      const result = await manager.testConnection(scenario.config);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain(scenario.expected);
+      expect(result.validation).toEqual(
+        expect.objectContaining({
+          valid: false,
+          issues: expect.any(Array),
+        }),
+      );
+      expect(driverInstances).toHaveLength(0);
+    }
+  });
+
+  it("rejects connectTo for invalid stored configs and does not create a driver", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-invalid-pg",
+        name: "Broken PG",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await expect(manager.connectTo("conn-invalid-pg")).rejects.toThrow(
+      /username/i,
+    );
+    expect(manager.isConnected("conn-invalid-pg")).toBe(false);
+    expect(driverInstances).toHaveLength(0);
+  });
+
   it("deduplicates concurrent connect attempts for the same connection", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
@@ -436,6 +655,9 @@ describe("ConnectionManager", () => {
         id: "conn-1",
         name: "Primary",
         type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
       },
     ]);
 
@@ -457,6 +679,94 @@ describe("ConnectionManager", () => {
     expect(manager.isConnected("conn-1")).toBe(true);
   });
 
+  it("fences stale in-flight connect completion after disconnect", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const connectDeferred = createDeferred<void>();
+    driverBehaviors.set("conn-1", {
+      connectImpl: () => connectDeferred.promise,
+    });
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    const connectPromise = manager.connectTo("conn-1");
+    await Promise.resolve();
+
+    await manager.disconnectFrom("conn-1");
+    connectDeferred.resolve();
+    await connectPromise;
+
+    expect(manager.isConnected("conn-1")).toBe(false);
+    expect(driverInstances).toHaveLength(1);
+    expect(driverInstances[0]?.disconnectCalls).toBeGreaterThanOrEqual(1);
+  });
+
+  it("allows a fresh connect attempt after disconnect fences a stale in-flight attempt", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const firstConnectDeferred = createDeferred<void>();
+    let shouldBlockFirstConnect = true;
+    driverBehaviors.set("conn-1", {
+      connectImpl: async () => {
+        if (shouldBlockFirstConnect) {
+          await firstConnectDeferred.promise;
+        }
+      },
+    });
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    const staleAttempt = manager.connectTo("conn-1");
+    await Promise.resolve();
+
+    await manager.disconnectFrom("conn-1");
+
+    shouldBlockFirstConnect = false;
+    const freshAttempt = manager.connectTo("conn-1");
+    firstConnectDeferred.resolve();
+
+    await Promise.all([staleAttempt, freshAttempt]);
+
+    expect(driverInstances).toHaveLength(2);
+    expect(driverInstances[0]?.disconnectCalls).toBeGreaterThanOrEqual(1);
+    expect(driverInstances[1]?.connectCalls).toBe(1);
+    expect(manager.isConnected("conn-1")).toBe(true);
+  });
+
   it("passes a live timeout settings provider to created drivers", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
@@ -468,6 +778,9 @@ describe("ConnectionManager", () => {
         id: "conn-1",
         name: "Primary",
         type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
       },
     ]);
     store.setTimeoutSettings({
@@ -611,6 +924,9 @@ describe("ConnectionManager", () => {
         id: "conn-live-static",
         name: "Live metadata",
         type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
       },
     ]);
 
@@ -645,6 +961,9 @@ describe("ConnectionManager", () => {
         id: "conn-1",
         name: "Primary",
         type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
       },
     ]);
 
@@ -661,12 +980,57 @@ describe("ConnectionManager", () => {
       id: "conn-1",
       name: "Primary Updated",
       type: "pg",
+      host: "localhost",
       database: "next_db",
+      username: "postgres",
     });
 
     expect(connectedDriver?.disconnectCalls).toBe(1);
     expect(manager.isConnected("conn-1")).toBe(false);
     expect(store.getConnections()[0]?.name).toBe("Primary Updated");
+  });
+
+  it("rejects invalid saveConnection payloads and keeps persisted settings unchanged", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await expect(
+      manager.saveConnection({
+        id: "conn-1",
+        name: "Primary Updated",
+        type: "pg",
+        database: "next_db",
+      }),
+    ).rejects.toThrow(/username|host/i);
+
+    expect(store.getConnections()[0]).toEqual(
+      expect.objectContaining({
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+      }),
+    );
   });
 
   it("removes a connection and purges associated history, bookmarks, and secrets", async () => {
@@ -759,6 +1123,9 @@ describe("ConnectionManager", () => {
     const result = await manager.testConnection({
       name: "Broken",
       type: "mysql",
+      host: "localhost",
+      database: "app",
+      username: "root",
     });
 
     expect(result.success).toBe(false);
@@ -806,6 +1173,111 @@ describe("ConnectionManager", () => {
       awsSecretAccessKey: "secret-key",
       awsSessionToken: "session-token",
     });
+  });
+
+  it("migrates persisted plaintext password to Secret Storage on connect", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-legacy",
+        name: "Legacy",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+        password: "legacy-password",
+        useSecretStorage: false,
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await manager.connectTo("conn-legacy");
+
+    const persisted = store
+      .getConnections()
+      .find((connection) => connection.id === "conn-legacy");
+    expect(persisted).toMatchObject({
+      id: "conn-legacy",
+      useSecretStorage: true,
+    });
+    expect(persisted?.password).toBeUndefined();
+
+    await expect(store.getSecret("conn-legacy")).resolves.toContain(
+      "legacy-password",
+    );
+  });
+
+  it("redacts plaintext API key from persisted config when saving to Secret Storage", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await manager.saveConnection({
+      id: "conn-es-legacy",
+      name: "Legacy Elasticsearch",
+      type: "elasticsearch",
+      endpoint: "https://cluster.example.com",
+      apiKey: "plaintext-key",
+      useSecretStorage: false,
+    });
+
+    const persisted = store
+      .getConnections()
+      .find((connection) => connection.id === "conn-es-legacy");
+    expect(persisted).toMatchObject({
+      id: "conn-es-legacy",
+      useSecretStorage: true,
+    });
+    expect(persisted?.apiKey).toBeUndefined();
+
+    await expect(store.getSecret("conn-es-legacy")).resolves.toContain(
+      "plaintext-key",
+    );
+  });
+
+  it("disposes active drivers and rejects future manager operations", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await manager.connectTo("conn-1");
+    await manager.dispose();
+
+    expect(manager.isConnected("conn-1")).toBe(false);
+    await expect(manager.connectTo("conn-1")).rejects.toThrow(/disposed/i);
+    expect(driverInstances[0]?.disconnectCalls).toBe(1);
   });
 
   it("hydrates stored Elasticsearch API keys from Secret Storage before connecting", async () => {
@@ -936,6 +1408,8 @@ describe("ConnectionManager", () => {
         name: "Primary",
         type: "pg",
         database: "app_db",
+        host: "localhost",
+        username: "postgres",
       },
     ]);
 
@@ -1076,6 +1550,8 @@ describe("ConnectionManager", () => {
         name: "Manifested",
         type: "mysql",
         database: "app_db",
+        host: "localhost",
+        username: "root",
       },
     ]);
 
@@ -1125,6 +1601,8 @@ describe("ConnectionManager", () => {
         name: "Primary",
         type: "mysql",
         database: "app_db",
+        host: "localhost",
+        username: "root",
       },
     ]);
 
@@ -1279,12 +1757,16 @@ describe("ConnectionManager", () => {
         name: "Primary",
         type: "pg",
         database: "app_db",
+        host: "localhost",
+        username: "postgres",
       },
       {
         id: "conn-2",
         name: "Audit",
         type: "mysql",
         database: "audit_db",
+        host: "localhost",
+        username: "root",
       },
     ]);
 
@@ -1415,6 +1897,8 @@ describe("ConnectionManager", () => {
         name: "Primary",
         type: "pg",
         database: "app_db",
+        host: "localhost",
+        username: "postgres",
       },
     ]);
 
@@ -1501,6 +1985,8 @@ describe("ConnectionManager", () => {
         name: "Primary",
         type: "pg",
         database: "app_db",
+        host: "localhost",
+        username: "postgres",
       },
     ]);
 
@@ -1599,6 +2085,8 @@ describe("ConnectionManager", () => {
         name: "Primary",
         type: "pg",
         database: "app_db",
+        host: "localhost",
+        username: "postgres",
       },
     ]);
 
@@ -1726,6 +2214,8 @@ describe("ConnectionManager", () => {
         name: "Primary",
         type: "pg",
         database: "app_db",
+        host: "localhost",
+        username: "postgres",
       },
     ]);
 
@@ -1984,6 +2474,8 @@ describe("ConnectionManager", () => {
         name: "Primary",
         type: "pg",
         database: "app_db",
+        host: "localhost",
+        username: "postgres",
       },
     ]);
 
@@ -2101,6 +2593,8 @@ describe("ConnectionManager", () => {
         name: "Primary",
         type: "pg",
         database: "app_db",
+        host: "localhost",
+        username: "postgres",
       },
     ]);
 
@@ -2244,6 +2738,8 @@ describe("ConnectionManager", () => {
         name: "Primary",
         type: "pg",
         database: "app_db",
+        host: "localhost",
+        username: "postgres",
       },
     ]);
 
@@ -2339,6 +2835,8 @@ describe("ConnectionManager", () => {
         name: "Primary",
         type: "pg",
         database: "app_db",
+        host: "localhost",
+        username: "postgres",
       },
     ]);
 
@@ -2464,6 +2962,7 @@ describe("ConnectionManager", () => {
         name: "Sectioned",
         type: "redis",
         database: "app_db",
+        host: "localhost",
       },
     ]);
 

@@ -3,6 +3,7 @@ import { parseErdPanelMessage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import { ErdGraphService } from "../services/erdGraphService";
 import { normalizeUnknownError } from "../utils/errorHandling";
+import { createPanelWebviewOptions } from "./panelRetentionPolicy";
 import { TablePanel } from "./tablePanel";
 import { createWebviewShell } from "./webviewShell";
 
@@ -11,6 +12,8 @@ interface ErdPanelScope {
   database?: string;
   schema?: string;
 }
+
+const ERD_PANEL_RETENTION_MODE = "rehydrate" as const;
 
 export class ErdPanel {
   private static readonly viewType = "rapidb.erdPanel";
@@ -97,10 +100,7 @@ export class ErdPanel {
       ErdPanel.viewType,
       buildTitle(),
       vscode.ViewColumn.One,
-      {
-        enableScripts: true,
-        retainContextWhenHidden: true,
-      },
+      createPanelWebviewOptions(ERD_PANEL_RETENTION_MODE),
     );
 
     const instance = new ErdPanel(panel, context, connectionManager, scope);
@@ -205,6 +205,7 @@ export class ErdPanel {
         connectionId: this.scope.connectionId,
         database: this.scope.database,
         schema: this.scope.schema,
+        panelRetentionMode: ERD_PANEL_RETENTION_MODE,
       },
       htmlStyles: "height: 100%; overflow: hidden;",
       bodyStyles: "height: 100%; overflow: hidden;",

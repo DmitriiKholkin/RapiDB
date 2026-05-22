@@ -27,6 +27,8 @@ interface GraphSourceObject {
   isView: boolean;
 }
 
+const ERD_SCOPE_WARMUP_TIMEOUT_MS = 4000;
+
 interface ScopeCacheWarmupApi {
   ensureSchemaScopeLoading(
     connectionId: string,
@@ -63,6 +65,7 @@ function supportsScopeCacheWarmup(
 export class ErdGraphService {
   private readonly cache = new Map<string, ErdGraph>();
   private readonly subscriptions: Disposable[];
+  private readonly lifecycleAbortController = new AbortController();
 
   constructor(private readonly connectionManager: ConnectionManager) {
     this.subscriptions = [
@@ -79,6 +82,7 @@ export class ErdGraphService {
   }
 
   dispose(): void {
+    this.lifecycleAbortController.abort();
     for (const subscription of this.subscriptions) {
       subscription.dispose();
     }
@@ -391,28 +395,90 @@ export class ErdGraphService {
         loadingState.error ?? `Failed to load ${database} database scope`,
       );
     }
+    if (loadingState.status === "idle") {
+      return;
+    }
 
     await new Promise<void>((resolve, reject) => {
+      let settled = false;
       let subscription: Disposable | undefined;
+      let abortListener: (() => void) | undefined;
+      const timer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        subscription?.dispose();
+        resolve();
+      }, ERD_SCOPE_WARMUP_TIMEOUT_MS);
+
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        subscription?.dispose();
+        if (abortListener) {
+          this.lifecycleAbortController.signal.removeEventListener(
+            "abort",
+            abortListener,
+          );
+        }
+      };
+
       const settle = (): void => {
+        if (settled || this.lifecycleAbortController.signal.aborted) {
+          return;
+        }
+
+        const activeDriver = this.connectionManager.getDriver(connectionId);
+        if (!activeDriver?.isConnected()) {
+          settled = true;
+          cleanup();
+          resolve();
+          return;
+        }
+
         const nextState = this.connectionManager.getSchemaSnapshotState(
           connectionId,
           scope,
         );
         if (nextState.status === "loaded") {
-          subscription?.dispose();
+          settled = true;
+          cleanup();
           resolve();
           return;
         }
         if (nextState.status === "error") {
-          subscription?.dispose();
+          settled = true;
+          cleanup();
           reject(
             new Error(
               nextState.error ?? `Failed to load ${database} database scope`,
             ),
           );
+          return;
+        }
+        if (nextState.status === "idle") {
+          settled = true;
+          cleanup();
+          resolve();
         }
       };
+
+      abortListener = (): void => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+        resolve();
+      };
+
+      this.lifecycleAbortController.signal.addEventListener(
+        "abort",
+        abortListener,
+        { once: true },
+      );
 
       subscription = this.connectionManager.onDidChangeSchemaState(
         (changedConnectionId) => {
@@ -501,28 +567,90 @@ export class ErdGraphService {
         loadingState.error ?? `Failed to load ${database}.${schema} schema`,
       );
     }
+    if (loadingState.status === "idle") {
+      return;
+    }
 
     await new Promise<void>((resolve, reject) => {
+      let settled = false;
       let subscription: Disposable | undefined;
+      let abortListener: (() => void) | undefined;
+      const timer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        subscription?.dispose();
+        resolve();
+      }, ERD_SCOPE_WARMUP_TIMEOUT_MS);
+
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        subscription?.dispose();
+        if (abortListener) {
+          this.lifecycleAbortController.signal.removeEventListener(
+            "abort",
+            abortListener,
+          );
+        }
+      };
+
       const settle = (): void => {
+        if (settled || this.lifecycleAbortController.signal.aborted) {
+          return;
+        }
+
+        const activeDriver = this.connectionManager.getDriver(connectionId);
+        if (!activeDriver?.isConnected()) {
+          settled = true;
+          cleanup();
+          resolve();
+          return;
+        }
+
         const nextState = this.connectionManager.getSchemaSnapshotState(
           connectionId,
           scope,
         );
         if (nextState.status === "loaded") {
-          subscription?.dispose();
+          settled = true;
+          cleanup();
           resolve();
           return;
         }
         if (nextState.status === "error") {
-          subscription?.dispose();
+          settled = true;
+          cleanup();
           reject(
             new Error(
               nextState.error ?? `Failed to load ${database}.${schema} schema`,
             ),
           );
+          return;
+        }
+        if (nextState.status === "idle") {
+          settled = true;
+          cleanup();
+          resolve();
         }
       };
+
+      abortListener = (): void => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+        resolve();
+      };
+
+      this.lifecycleAbortController.signal.addEventListener(
+        "abort",
+        abortListener,
+        { once: true },
+      );
 
       subscription = this.connectionManager.onDidChangeSchemaState(
         (changedConnectionId) => {

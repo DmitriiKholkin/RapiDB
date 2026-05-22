@@ -102,6 +102,16 @@ describe("ConnectionFormPanel", () => {
 
     await Promise.resolve();
 
+    expect(vscodeMock.createWebviewPanel).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(String),
+      1,
+      expect.objectContaining({
+        enableScripts: true,
+        retainContextWhenHidden: false,
+      }),
+    );
+
     const panel = createdPanel();
     if (!panel) {
       throw new Error("Expected a webview panel to be created.");
@@ -248,6 +258,110 @@ describe("ConnectionFormPanel", () => {
         awsSessionToken: expect.anything(),
       }),
     );
+  });
+
+  it("returns validation details on save and does not call saveConnection for invalid payload", async () => {
+    const context = {
+      secrets: {
+        get: vi.fn(async () => undefined),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn().mockResolvedValue(undefined),
+      getConnection: vi.fn(() => undefined),
+      testConnection: vi.fn(),
+    };
+
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+    );
+
+    await Promise.resolve();
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected a webview panel to be created.");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-invalid-sqlite",
+        name: "SQLite Missing File",
+        type: "sqlite",
+      },
+    });
+
+    expect(connectionManager.saveConnection).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "saveResult",
+      payload: expect.objectContaining({
+        success: false,
+        error: expect.stringContaining("filePath"),
+        validation: expect.objectContaining({
+          valid: false,
+          missingRequired: expect.arrayContaining(["filePath"]),
+        }),
+      }),
+    });
+
+    panel.dispose();
+    await expect(promise).resolves.toBeUndefined();
+  });
+
+  it("returns validation details on test and does not call manager testConnection for invalid payload", async () => {
+    const context = {
+      secrets: {
+        get: vi.fn(async () => undefined),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn(),
+      getConnection: vi.fn(() => undefined),
+      testConnection: vi.fn(async () => ({ success: true })),
+    };
+
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+    );
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected a webview panel to be created.");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "testConnection",
+      payload: {
+        id: "conn-invalid-mysql",
+        name: "MySQL Missing Host",
+        type: "mysql",
+        database: "app",
+        username: "root",
+      },
+    });
+
+    expect(connectionManager.testConnection).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "testResult",
+      payload: expect.objectContaining({
+        success: false,
+        error: expect.stringContaining("host"),
+        validation: expect.objectContaining({
+          valid: false,
+          missingRequired: expect.arrayContaining(["host"]),
+        }),
+      }),
+    });
+
+    panel.dispose();
+    await expect(promise).resolves.toBeUndefined();
   });
 
   it("forces Elasticsearch credentials into Secret Storage and saves a sanitized config", async () => {

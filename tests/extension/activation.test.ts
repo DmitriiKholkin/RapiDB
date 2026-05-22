@@ -100,6 +100,7 @@ describe("extension activation", () => {
       }),
       disconnectFrom: vi.fn(),
       disconnectAll: vi.fn().mockResolvedValue(undefined),
+      dispose: vi.fn().mockResolvedValue(undefined),
       clearBookmarks: vi.fn(),
       clearHistory: vi.fn(),
       getDriver: vi.fn(),
@@ -1125,7 +1126,7 @@ describe("extension activation", () => {
     );
   });
 
-  it("deactivates panels and disconnects all active connections", async () => {
+  it("deactivates panels and disposes the connection manager", async () => {
     const extension = await import("../../src/extension/extension");
     const context = { subscriptions: [] as Array<{ dispose(): void }> };
 
@@ -1135,6 +1136,6 @@ describe("extension activation", () => {
     expect(queryPanelDisposeAll).toHaveBeenCalledTimes(1);
     expect(tablePanelDisposeAll).toHaveBeenCalledTimes(1);
     expect(erdPanelDisposeAll).toHaveBeenCalledTimes(1);
-    expect(connectionManagerInstance.disconnectAll).toHaveBeenCalledTimes(1);
+    expect(connectionManagerInstance.dispose).toHaveBeenCalledTimes(1);
   });
 });

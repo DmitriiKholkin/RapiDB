@@ -30,6 +30,7 @@ export interface ConnectionManagerStore {
   readBookmarks(): BookmarkEntry[];
   writeBookmarks(entries: BookmarkEntry[]): Promise<void>;
   getSecret(id: string): Promise<string | undefined>;
+  storeSecret(id: string, value: string): Promise<void>;
   deleteSecret(id: string): Promise<void>;
   getHistoryLimit(): number;
   getDefaultPageSize(): number;
@@ -87,6 +88,10 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
 
   async getSecret(id: string): Promise<string | undefined> {
     return await this.context.secrets.get(id);
+  }
+
+  async storeSecret(id: string, value: string): Promise<void> {
+    await this.context.secrets.store(id, value);
   }
 
   async deleteSecret(id: string): Promise<void> {

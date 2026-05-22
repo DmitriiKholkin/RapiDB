@@ -1,7 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TablePanel } from "../../src/extension/panels/tablePanel";
 
-const getColumnsMock = vi.hoisted(() => vi.fn(async () => []));
+type MockColumn = { name: string; isPrimaryKey: boolean };
+
+const getColumnsMock = vi.hoisted(() =>
+  vi.fn(async (): Promise<MockColumn[]> => []),
+);
 const getPageMock = vi.hoisted(() =>
   vi.fn(async () => ({ rows: [], totalCount: 0, columns: [] })),
 );
@@ -165,6 +169,16 @@ describe("TablePanel", () => {
       "users",
     );
 
+    expect(vscodeMock.createWebviewPanel).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(String),
+      1,
+      expect.objectContaining({
+        enableScripts: true,
+        retainContextWhenHidden: false,
+      }),
+    );
+
     const panel = createdPanel();
     if (!panel) {
       throw new Error("Expected table panel instance");
@@ -242,7 +256,7 @@ describe("TablePanel", () => {
 
     expect(createWebviewShellMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        initialState: {
+        initialState: expect.objectContaining({
           view: "table",
           connectionId: "conn-1",
           database: "db1",
@@ -251,7 +265,7 @@ describe("TablePanel", () => {
           isView: false,
           connectionReadOnly: true,
           defaultPageSize: 50,
-        },
+        }),
       }),
     );
 

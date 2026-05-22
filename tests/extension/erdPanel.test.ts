@@ -116,6 +116,16 @@ describe("ErdPanel", () => {
       },
     );
 
+    expect(vscodeMock.createWebviewPanel).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(String),
+      1,
+      expect.objectContaining({
+        enableScripts: true,
+        retainContextWhenHidden: false,
+      }),
+    );
+
     const panel = createdPanel();
     if (!panel) {
       throw new Error("Expected ERD panel instance");

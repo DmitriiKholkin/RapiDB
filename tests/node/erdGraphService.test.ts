@@ -572,4 +572,190 @@ describe("ErdGraphService", () => {
 
     service.dispose();
   });
+
+  it("bounds scope warmup waiting when schema-state events are never emitted", async () => {
+    vi.useFakeTimers();
+
+    const disconnect = createEventSource<string>();
+    const refresh = createEventSource<void>();
+    const schemaState = createEventSource<string>();
+
+    const connectionManager = {
+      getDriver: vi.fn(() => ({
+        listSchemas: vi.fn(async () => [{ name: "public" }]),
+        listObjects: vi.fn(async () => [{ name: "users", type: "table" }]),
+        describeColumns: vi.fn(async () => [
+          {
+            name: "id",
+            nativeType: "int",
+            isPrimaryKey: true,
+            isForeignKey: false,
+            nullable: false,
+          },
+        ]),
+        getForeignKeys: vi.fn(async () => []),
+        getIndexes: vi.fn(async () => []),
+      })),
+      getSchemaSnapshotAsync: vi.fn(async () => ({
+        databases: [
+          {
+            name: "archive_db",
+            schemas: [],
+          },
+        ],
+      })),
+      getSchemaSnapshot: vi.fn(() => ({
+        databases: [
+          {
+            name: "archive_db",
+            schemas: [],
+          },
+        ],
+      })),
+      getSchemaSnapshotState: vi.fn(() => ({
+        snapshot: { databases: [] },
+        status: "loading",
+        isPartial: false,
+      })),
+      ensureSchemaScopeLoading: vi.fn(),
+      onDidDisconnect: disconnect.event,
+      onDidRefreshSchemas: refresh.event,
+      onDidChangeSchemaState: schemaState.event,
+    };
+
+    const service = new ErdGraphService(connectionManager as never);
+
+    const graphPromise = service.getGraph({
+      connectionId: "conn-1",
+      database: "archive_db",
+    });
+
+    await vi.advanceTimersByTimeAsync(9000);
+
+    await expect(graphPromise).resolves.toMatchObject({
+      graph: {
+        nodes: [expect.objectContaining({ table: "users", schema: "public" })],
+      },
+      fromCache: false,
+    });
+
+    service.dispose();
+    vi.useRealTimers();
+  });
+
+  it("treats idle scope state as a terminal warmup condition", async () => {
+    const disconnect = createEventSource<string>();
+    const refresh = createEventSource<void>();
+    const schemaState = createEventSource<string>();
+
+    const getSchemaSnapshotState = vi
+      .fn()
+      .mockReturnValueOnce({
+        snapshot: { databases: [] },
+        status: "idle",
+        isPartial: false,
+      })
+      .mockReturnValueOnce({
+        snapshot: { databases: [] },
+        status: "idle",
+        isPartial: false,
+      });
+
+    const connectionManager = {
+      getDriver: vi.fn(() => ({
+        isConnected: () => true,
+        listSchemas: vi.fn(async () => [{ name: "public" }]),
+        listObjects: vi.fn(async () => [{ name: "users", type: "table" }]),
+        describeColumns: vi.fn(async () => [
+          {
+            name: "id",
+            nativeType: "int",
+            isPrimaryKey: true,
+            isForeignKey: false,
+            nullable: false,
+          },
+        ]),
+        getForeignKeys: vi.fn(async () => []),
+        getIndexes: vi.fn(async () => []),
+      })),
+      getSchemaSnapshotAsync: vi.fn(async () => ({
+        databases: [{ name: "archive_db", schemas: [] }],
+      })),
+      getSchemaSnapshot: vi.fn(() => ({
+        databases: [{ name: "archive_db", schemas: [] }],
+      })),
+      getSchemaSnapshotState,
+      ensureSchemaScopeLoading: vi.fn(),
+      onDidDisconnect: disconnect.event,
+      onDidRefreshSchemas: refresh.event,
+      onDidChangeSchemaState: schemaState.event,
+    };
+
+    const service = new ErdGraphService(connectionManager as never);
+
+    await expect(
+      service.getGraph({
+        connectionId: "conn-1",
+        database: "archive_db",
+      }),
+    ).resolves.toMatchObject({
+      graph: {
+        nodes: [expect.objectContaining({ table: "users", schema: "public" })],
+      },
+    });
+
+    expect(connectionManager.ensureSchemaScopeLoading).toHaveBeenCalledTimes(1);
+
+    service.dispose();
+  });
+
+  it("stops warmup waiting when connection is no longer active", async () => {
+    const disconnect = createEventSource<string>();
+    const refresh = createEventSource<void>();
+    const schemaState = createEventSource<string>();
+
+    const liveDriver = {
+      isConnected: vi.fn(() => false),
+      listSchemas: vi.fn(async () => []),
+      listObjects: vi.fn(async () => []),
+      describeColumns: vi.fn(async () => []),
+      getForeignKeys: vi.fn(async () => []),
+      getIndexes: vi.fn(async () => []),
+    };
+
+    const connectionManager = {
+      getDriver: vi.fn(() => liveDriver),
+      getSchemaSnapshotAsync: vi.fn(async () => ({
+        databases: [{ name: "archive_db", schemas: [] }],
+      })),
+      getSchemaSnapshot: vi.fn(() => ({
+        databases: [{ name: "archive_db", schemas: [] }],
+      })),
+      getSchemaSnapshotState: vi.fn(() => ({
+        snapshot: { databases: [] },
+        status: "loading",
+        isPartial: false,
+      })),
+      ensureSchemaScopeLoading: vi.fn(),
+      onDidDisconnect: disconnect.event,
+      onDidRefreshSchemas: refresh.event,
+      onDidChangeSchemaState: schemaState.event,
+    };
+
+    const service = new ErdGraphService(connectionManager as never);
+
+    await expect(
+      service.getGraph({
+        connectionId: "conn-1",
+        database: "archive_db",
+      }),
+    ).resolves.toMatchObject({
+      graph: {
+        nodes: [],
+      },
+      fromCache: false,
+    });
+
+    service.dispose();
+  });
 });

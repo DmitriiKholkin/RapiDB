@@ -53,7 +53,13 @@ export interface QueryEditorPresentation {
   allowFormatting?: boolean;
 }
 
-export interface QueryInitialState {
+export type PanelRetentionMode = "retain" | "rehydrate";
+
+interface PanelRetentionState {
+  panelRetentionMode?: PanelRetentionMode;
+}
+
+export interface QueryInitialState extends PanelRetentionState {
   view: "query";
   connectionId: string;
   connectionType?: ConnectionType | "";
@@ -65,7 +71,7 @@ export interface QueryInitialState {
   editorPresentation?: QueryEditorPresentation;
 }
 
-export interface TableInitialState {
+export interface TableInitialState extends PanelRetentionState {
   view: "table";
   connectionId: string;
   database: string;
@@ -76,7 +82,7 @@ export interface TableInitialState {
   defaultPageSize?: number;
 }
 
-export interface ErdInitialState {
+export interface ErdInitialState extends PanelRetentionState {
   view: "erd";
   connectionId: string;
   database?: string;
@@ -140,7 +146,7 @@ export interface ConnectionFormSubmission extends SanitizedConnectionConfig {
   hasStoredSecret?: boolean;
 }
 
-export interface ConnectionFormInitialState {
+export interface ConnectionFormInitialState extends PanelRetentionState {
   view: "connection";
   existing: ConnectionFormExistingState | null;
 }

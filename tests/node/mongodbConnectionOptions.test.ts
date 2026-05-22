@@ -110,4 +110,26 @@ describe("MongoDBDriver — connect()", () => {
       }),
     ]);
   });
+
+  it("uses legacy uri when connectionUri is absent and still applies authDatabase precedence", async () => {
+    const driver = new MongoDBDriver({
+      id: "mongodb-connect-legacy-uri",
+      name: "Mongo Connect Legacy URI",
+      type: "mongodb",
+      uri: "mongodb://legacy.example:27017/legacydb",
+      authDatabase: "admin-auth",
+      authSource: "legacy-auth",
+    });
+
+    await driver.connect();
+
+    expect(mongoClientMocks.constructorCalls).toEqual([
+      expect.objectContaining({
+        uri: "mongodb://legacy.example:27017/legacydb",
+        options: expect.objectContaining({
+          authSource: "admin-auth",
+        }),
+      }),
+    ]);
+  });
 });
