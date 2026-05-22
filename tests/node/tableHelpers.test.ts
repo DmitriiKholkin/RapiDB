@@ -795,4 +795,150 @@ describe("table helpers", () => {
 
     expect(updateRowsSpy).not.toHaveBeenCalled();
   });
+
+  it("blocks readonly connections in prepare-time mutation paths", async () => {
+    const readonlyManager = {
+      getConnection: () => ({
+        id: "conn-1",
+        name: "Readonly",
+        readOnly: true,
+      }),
+      getDriver: () => fakeDriver,
+    };
+    const readonlyMutationService = new TableMutationService(
+      readonlyManager as never,
+      {
+        getColumns: async () => columns,
+      },
+    );
+
+    await expect(
+      readonlyMutationService.updateRow(
+        "conn-1",
+        "main",
+        "public",
+        "fixture_rows",
+        { id: 1 },
+        { display_name: "Updated" },
+      ),
+    ).rejects.toThrow(/read-only/i);
+
+    await expect(
+      readonlyMutationService.prepareInsertRow(
+        "conn-1",
+        "main",
+        "public",
+        "fixture_rows",
+        { id: 3, display_name: "Inserted" },
+      ),
+    ).rejects.toThrow(/read-only/i);
+
+    await expect(
+      readonlyMutationService.prepareDeleteRowsPlan(
+        "conn-1",
+        "main",
+        "public",
+        "fixture_rows",
+        [{ id: 1 }],
+      ),
+    ).rejects.toThrow(/read-only/i);
+
+    expect(() =>
+      prepareApplyChangesPlan(
+        readonlyManager as never,
+        "conn-1",
+        "main",
+        "public",
+        "fixture_rows",
+        [
+          {
+            primaryKeys: { id: 1 },
+            changes: { display_name: "Updated" },
+          },
+        ],
+        columns,
+      ),
+    ).toThrow(/read-only/i);
+  });
+
+  it("blocks readonly connections in prepared execution paths", async () => {
+    const writableManager = {
+      getConnection: () => ({
+        id: "conn-1",
+        name: "Writable",
+        readOnly: false,
+      }),
+      getDriver: () => fakeDriver,
+    };
+    const readonlyManager = {
+      getConnection: () => ({
+        id: "conn-1",
+        name: "Readonly",
+        readOnly: true,
+      }),
+      getDriver: () => fakeDriver,
+    };
+    const writableMutationService = new TableMutationService(
+      writableManager as never,
+      {
+        getColumns: async () => columns,
+      },
+    );
+    const readonlyMutationService = new TableMutationService(
+      readonlyManager as never,
+      {
+        getColumns: async () => columns,
+      },
+    );
+
+    const insertPlan = await writableMutationService.prepareInsertRow(
+      "conn-1",
+      "main",
+      "public",
+      "fixture_rows",
+      { id: 3, display_name: "Inserted" },
+    );
+    await expect(
+      readonlyMutationService.executePreparedInsertPlan(insertPlan),
+    ).rejects.toThrow(/read-only/i);
+
+    const deletePlan = await writableMutationService.prepareDeleteRowsPlan(
+      "conn-1",
+      "main",
+      "public",
+      "fixture_rows",
+      [{ id: 1 }],
+    );
+    if (!deletePlan) {
+      throw new Error("Expected delete plan");
+    }
+    await expect(
+      readonlyMutationService.executePreparedDeletePlan(deletePlan),
+    ).rejects.toThrow(/read-only/i);
+
+    const preparedApply = prepareApplyChangesPlan(
+      writableManager as never,
+      "conn-1",
+      "main",
+      "public",
+      "fixture_rows",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { display_name: "Updated" },
+        },
+      ],
+      columns,
+    );
+    if (!preparedApply.executable) {
+      throw new Error("Expected executable apply plan");
+    }
+
+    await expect(
+      executePreparedApplyPlan(readonlyManager as never, preparedApply.plan),
+    ).resolves.toEqual({
+      success: false,
+      error: expect.stringMatching(/read-only/i),
+    });
+  });
 });

@@ -8,6 +8,7 @@ import {
   exportQueryResultsAsJson,
 } from "../utils/exportService";
 import { formatQueryResult } from "../utils/queryResultFormatting";
+import { decideReadOnlyQueryExecution } from "../utils/readOnlyGuards";
 
 export interface QueryPanelCachedResult {
   columns: string[];
@@ -133,6 +134,15 @@ export class QueryPanelController {
     }
 
     const connectionId = this.resolveConnectionId(connectionIdOverride);
+    const readOnlyDecision = decideReadOnlyQueryExecution(
+      this.connectionManager,
+      connectionId,
+      queryText,
+    );
+    if (!readOnlyDecision.allowed) {
+      this.postQueryError(readOnlyDecision.reason);
+      return;
+    }
 
     if (!this.connectionManager.isConnected(connectionId)) {
       try {

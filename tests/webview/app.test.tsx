@@ -35,7 +35,19 @@ vi.mock("../../src/webview/components/QueryView", () => ({
 }));
 
 vi.mock("../../src/webview/components/TableView", () => ({
-  TableView: ({ table }: { table: string }) => <div>Table:{table}</div>,
+  TableView: ({
+    table,
+    isView,
+    connectionReadOnly,
+  }: {
+    table: string;
+    isView?: boolean;
+    connectionReadOnly?: boolean;
+  }) => (
+    <div>
+      Table:{table}:{String(isView)}:{String(connectionReadOnly)}
+    </div>
+  ),
 }));
 
 vi.mock("../../src/webview/components/ErdView", () => ({
@@ -71,6 +83,7 @@ describe("App", () => {
       schema: "public",
       table: "users",
       isView: false,
+      connectionReadOnly: true,
       defaultPageSize: 25,
     };
 
@@ -82,7 +95,7 @@ describe("App", () => {
     hostWindow.__RAPIDB_INITIAL_STATE__ = tableState;
     rerender(<App />);
 
-    expect(screen.getByText("Table:users")).toBeTruthy();
+    expect(screen.getByText("Table:users:false:true")).toBeTruthy();
   });
 
   it("falls back to the default query state when the initial state is invalid", () => {

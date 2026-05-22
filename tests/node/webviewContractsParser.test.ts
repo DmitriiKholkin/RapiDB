@@ -184,6 +184,7 @@ describe("parseConnectionFormPanelMessage", () => {
         id: "conn-1",
         name: "Primary",
         type: "pg",
+        readOnly: undefined,
         host: "localhost",
         port: undefined,
         database: undefined,
@@ -240,6 +241,7 @@ describe("parseConnectionFormPanelMessage", () => {
         id: "conn-nosql",
         name: "Mongo Local",
         type: "mongodb",
+        readOnly: undefined,
         host: undefined,
         port: undefined,
         database: undefined,
@@ -288,6 +290,23 @@ describe("parseConnectionFormPanelMessage", () => {
     });
 
     expect(parsed).toBeNull();
+  });
+
+  it("parses readonly flags in connection payloads", () => {
+    const parsed = parseConnectionFormPanelMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-ro",
+        name: "Readonly",
+        type: "pg",
+        readOnly: true,
+      },
+    });
+
+    expect(parsed).toMatchObject({
+      type: "saveConnection",
+      payload: { id: "conn-ro", readOnly: true },
+    });
   });
 });
 
@@ -468,7 +487,30 @@ describe("parseWebviewInitialState", () => {
       schema: "public",
       table: "users",
       isView: undefined,
+      connectionReadOnly: undefined,
       defaultPageSize: 100,
+    });
+  });
+
+  it("parses readonly flags in table state", () => {
+    const parsed = parseWebviewInitialState({
+      view: "table",
+      connectionId: "conn-ro",
+      database: "main",
+      schema: "public",
+      table: "users",
+      connectionReadOnly: true,
+    });
+
+    expect(parsed).toEqual({
+      view: "table",
+      connectionId: "conn-ro",
+      database: "main",
+      schema: "public",
+      table: "users",
+      isView: undefined,
+      connectionReadOnly: true,
+      defaultPageSize: undefined,
     });
   });
 
@@ -490,6 +532,7 @@ describe("parseWebviewInitialState", () => {
         id: "conn-1",
         name: "Primary",
         type: "pg",
+        readOnly: undefined,
         host: "localhost",
         port: undefined,
         database: undefined,

@@ -44,6 +44,7 @@ export function App(): ReactElement {
             schema={state.schema ?? ""}
             table={state.table ?? ""}
             isView={state.isView ?? false}
+            connectionReadOnly={state.connectionReadOnly ?? false}
             defaultPageSize={state.defaultPageSize}
           />
         </ErrorBoundary>

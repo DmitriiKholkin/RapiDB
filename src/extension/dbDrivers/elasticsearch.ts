@@ -1,5 +1,6 @@
 import { Client } from "@elastic/elasticsearch";
 import type { ConnectionConfig } from "../connectionManager";
+import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import {
   formatDatetimeForDisplay,
   normalizeSqlDatetimeOffsetSpacing,
@@ -57,6 +58,9 @@ type ElasticsearchFieldMeta = {
 };
 
 type ElasticsearchRestMethod = "GET" | "POST" | "PUT" | "DELETE";
+
+const ELASTICSEARCH_READ_ONLY_QUERY_REASON =
+  "[RapiDB] Read-only Elasticsearch connections allow only GET requests and POST _search requests.";
 
 interface ElasticsearchRestCommand {
   method: ElasticsearchRestMethod;
@@ -192,11 +196,51 @@ export class ElasticsearchDriver implements IDBDriver {
       tabularRead: "nosql" as const,
       queryMode: "text" as const,
       supportsMutations: true,
+      readOnlyQueryGuard: (queryText: string) =>
+        this.decideReadOnlyQuery(queryText),
       editorPresentation: {
         formatOnOpen: false,
         editorLanguage: "plaintext" as const,
       },
     };
+  }
+
+  private decideReadOnlyQuery(queryText: string) {
+    const trimmed = queryText.trim().replace(/;+$/, "");
+    if (!trimmed) {
+      return denyReadOnlyQuery(ELASTICSEARCH_READ_ONLY_QUERY_REASON);
+    }
+
+    try {
+      const statements = this.splitRestStatements(trimmed);
+      if (statements.length === 0) {
+        return denyReadOnlyQuery(ELASTICSEARCH_READ_ONLY_QUERY_REASON);
+      }
+
+      return statements.every((statement) => {
+        const command = this.parseRestCommand(statement);
+        return command ? this.isReadOnlyRestCommand(command) : false;
+      })
+        ? allowReadOnlyQuery()
+        : denyReadOnlyQuery(ELASTICSEARCH_READ_ONLY_QUERY_REASON);
+    } catch (error: unknown) {
+      return denyReadOnlyQuery(
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  private isReadOnlyRestCommand(command: ElasticsearchRestCommand): boolean {
+    const [firstSegment, secondSegment, thirdSegment] = command.pathSegments;
+    if (command.method === "GET") {
+      return true;
+    }
+
+    return (
+      command.method === "POST" &&
+      ((command.pathSegments.length === 1 && firstSegment === "_search") ||
+        (secondSegment === "_search" && thirdSegment === undefined))
+    );
   }
 
   async listDatabases(): Promise<DatabaseInfo[]> {

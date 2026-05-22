@@ -75,6 +75,20 @@ describe("ConnectionFormView", () => {
     expect(screen.getByLabelText("DynamoDB endpoint")).toBeTruthy();
   });
 
+  it("associates the read-only toggle with its explanatory hint", () => {
+    render(<ConnectionFormView existing={null} />);
+
+    const toggle = screen.getByRole("switch", {
+      name: /open connection as read-only/i,
+    });
+    const hint = screen.getByText(/Blocks data mutations/i);
+
+    expect(toggle.getAttribute("aria-describedby")).toBeTruthy();
+    expect(toggle.getAttribute("aria-describedby")).toBe(
+      hint.getAttribute("id"),
+    );
+  });
+
   it("posts modern NoSQL root fields in save payloads", async () => {
     const user = userEvent.setup();
 
@@ -290,5 +304,54 @@ describe("ConnectionFormView", () => {
     await user.click(screen.getByRole("button", { name: "Cancel" }));
 
     expect(getLastPostedMessage()).toEqual({ type: "cancel" });
+  });
+
+  it("tracks the read-only toggle through edit state, test, and save payloads", async () => {
+    const user = userEvent.setup();
+    const existing = {
+      id: "conn-1",
+      name: "Warehouse",
+      type: "pg" as const,
+      host: "db.local",
+      port: 5432,
+      database: "app_db",
+      username: "admin",
+      readOnly: true,
+      useSecretStorage: true,
+      hasStoredSecret: true,
+    };
+
+    render(<ConnectionFormView existing={existing} />);
+
+    const toggle = screen.getByRole("switch", {
+      name: /open connection as read-only/i,
+    });
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+
+    await user.click(toggle);
+
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Test Connection" }));
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "testConnection",
+      payload: expect.objectContaining({
+        id: "conn-1",
+        readOnly: false,
+      }),
+    });
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "saveConnection",
+      payload: expect.objectContaining({
+        id: "conn-1",
+        readOnly: false,
+      }),
+    });
   });
 });

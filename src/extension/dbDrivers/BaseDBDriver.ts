@@ -4,6 +4,7 @@ import type {
   QueryEditorPresentation,
   QueryEditorSqlDialect,
 } from "../../shared/webviewContracts";
+import { createSqlReadOnlyQueryGuard } from "../utils/readOnlyGuards";
 import {
   type DriverTimeoutSettingsProvider,
   type DriverTimeoutSettingsSnapshot,
@@ -808,6 +809,9 @@ export abstract class BaseDBDriver implements IDBDriver {
       isTableFilterError: (message: string) =>
         SQL_FILTER_ERROR_RE.test(message) &&
         !/arithmetic overflow/i.test(message),
+      readOnlyQueryGuard: createSqlReadOnlyQueryGuard(
+        this.getQueryEditorSqlDialect(),
+      ),
     };
   }
 

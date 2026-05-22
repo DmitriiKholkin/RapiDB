@@ -72,6 +72,7 @@ export interface TableInitialState {
   schema: string;
   table: string;
   isView?: boolean;
+  connectionReadOnly?: boolean;
   defaultPageSize?: number;
 }
 
@@ -415,6 +416,7 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
     id,
     name,
     type,
+    readOnly: readOptionalBoolean(input, "readOnly"),
     host: readOptionalString(input, "host"),
     port: readOptionalNumber(input, "port"),
     database: readOptionalString(input, "database"),
@@ -565,6 +567,7 @@ export function parseWebviewInitialState(
         schema,
         table,
         isView: readOptionalBoolean(input, "isView"),
+        connectionReadOnly: readOptionalBoolean(input, "connectionReadOnly"),
         defaultPageSize: readOptionalNumber(input, "defaultPageSize"),
       };
     }

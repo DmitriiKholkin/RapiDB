@@ -508,6 +508,11 @@
                 "type": "string",
                 "description": "Optional folder name for grouping connections in the explorer tree"
               },
+              "readOnly": {
+                "type": "boolean",
+                "default": false,
+                "description": "Open the connection in read-only mode. Query execution is limited to read operations and table edits are blocked."
+              },
               "serviceName": {
                 "type": "string",
                 "description": "Oracle service name (e.g. XEPDB1). Preferred over SID. If omitted, the database field is used."

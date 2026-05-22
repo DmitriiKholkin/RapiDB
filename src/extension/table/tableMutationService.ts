@@ -1,5 +1,6 @@
 import type { ConnectionManager } from "../connectionManager";
 import type { ColumnTypeMeta } from "../dbDrivers/types";
+import { assertConnectionWritable } from "../utils/readOnlyGuards";
 import { buildInsertRowOperation } from "./insertSql";
 import type {
   PreparedDeletePlan,
@@ -25,6 +26,11 @@ export class TableMutationService {
     primaryKeyValues: Record<string, unknown>,
     changes: Record<string, unknown>,
   ): Promise<void> {
+    assertConnectionWritable(
+      this.connectionManager,
+      connectionId,
+      "update data",
+    );
     const { driver } = this.getConnectionDriver(connectionId);
     const columns = await this.columnsProvider.getColumns(
       connectionId,
@@ -106,6 +112,11 @@ export class TableMutationService {
     table: string,
     values: Record<string, unknown>,
   ): Promise<PreparedInsertPlan> {
+    assertConnectionWritable(
+      this.connectionManager,
+      connectionId,
+      "insert data",
+    );
     const { driver } = this.getConnectionDriver(connectionId);
     const columns = await this.columnsProvider.getColumns(
       connectionId,
@@ -221,6 +232,11 @@ export class TableMutationService {
     };
   }
   async executePreparedInsertPlan(plan: PreparedInsertPlan): Promise<void> {
+    assertConnectionWritable(
+      this.connectionManager,
+      plan.connectionId,
+      "insert data",
+    );
     const { driver } = this.getConnectionDriver(plan.connectionId);
     if (plan.mode === "driver") {
       if (!driver.insertRow) {
@@ -302,6 +318,11 @@ export class TableMutationService {
     if (primaryKeyValuesList.length === 0) {
       return null;
     }
+    assertConnectionWritable(
+      this.connectionManager,
+      connectionId,
+      "delete data",
+    );
     const { driver } = this.getConnectionDriver(connectionId);
     const columns = await this.columnsProvider.getColumns(
       connectionId,
@@ -426,6 +447,11 @@ export class TableMutationService {
     };
   }
   async executePreparedDeletePlan(plan: PreparedDeletePlan): Promise<void> {
+    assertConnectionWritable(
+      this.connectionManager,
+      plan.connectionId,
+      "delete data",
+    );
     const { driver } = this.getConnectionDriver(plan.connectionId);
     if (plan.mode === "driver") {
       if (!driver.deleteRows) {

@@ -16,6 +16,7 @@ import {
   UUID,
 } from "mongodb";
 import type { ConnectionConfig } from "../connectionManager";
+import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import { formatDatetimeForDisplay } from "./BaseDBDriver";
 import {
   applyFilters,
@@ -88,6 +89,238 @@ const BASE64_VALUE_RE =
 const DISPLAY_DATETIME_RE =
   /^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}:\d{2})(\.\d{1,3})?)?(?: ?(Z|[+-]\d{2}(?::?\d{2})?))?$/;
 const TIMESTAMP_LITERAL_RE = /^Timestamp\((\d+),\s*(\d+)\)$/i;
+
+const MONGODB_READ_ONLY_QUERY_REASON =
+  "[RapiDB] Read-only MongoDB connections allow only find, findOne, countDocuments, and aggregate queries without $out or $merge.";
+
+function normalizeMongoshQueryText(queryText: string): string {
+  return queryText
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("//"))
+    .join("\n")
+    .trim()
+    .replace(/;+\s*$/, "")
+    .trim();
+}
+
+function parseMongoshOperations(queryText: string): MongoshOperation[] {
+  const operations: MongoshOperation[] = [];
+
+  const createChainProxy = (operation: MongoshOperation): object => {
+    return new Proxy({} as Record<string, unknown>, {
+      get(_t, method: string | symbol) {
+        if (typeof method !== "string") return undefined;
+        return (...args: unknown[]) => {
+          operation.chainOps.push({ op: method, args });
+          return createChainProxy(operation);
+        };
+      },
+    });
+  };
+
+  const createCollProxy = (
+    dbName: string | undefined,
+    coll: string,
+  ): object => {
+    return new Proxy({} as Record<string, unknown>, {
+      get(_t, method: string | symbol) {
+        if (typeof method !== "string") return undefined;
+        if (method === "then") return undefined;
+        return (...args: unknown[]) => {
+          const operation: MongoshOperation = {
+            dbName,
+            collName: coll,
+            op: method,
+            args,
+            chainOps: [],
+          };
+          operations.push(operation);
+          return createChainProxy(operation);
+        };
+      },
+    });
+  };
+
+  const createDbProxy = (dbName?: string): object => {
+    return new Proxy({} as Record<string, unknown>, {
+      get(_t, prop: string | symbol) {
+        if (typeof prop !== "string") return undefined;
+        if (prop === "getSiblingDB") {
+          return (name: string) => createDbProxy(name);
+        }
+        if (prop === "getCollection") {
+          return (name: string) => createCollProxy(dbName, String(name));
+        }
+        if (prop === "runCommand") {
+          return (cmd: unknown) => {
+            const operation: MongoshOperation = {
+              dbName,
+              op: "runCommand",
+              args: [cmd],
+              chainOps: [],
+            };
+            operations.push(operation);
+            return createChainProxy(operation);
+          };
+        }
+        if (prop === "createCollection") {
+          return (name: string, options?: unknown) => {
+            operations.push({
+              dbName,
+              op: "createCollection",
+              args: [name, options],
+              chainOps: [],
+            });
+          };
+        }
+        if (prop === "createView") {
+          return (
+            name: string,
+            viewOn: string,
+            pipeline?: unknown,
+            options?: unknown,
+          ) => {
+            operations.push({
+              dbName,
+              op: "createView",
+              args: [name, viewOn, pipeline, options],
+              chainOps: [],
+            });
+          };
+        }
+        return createCollProxy(dbName, prop);
+      },
+    });
+  };
+
+  const sandbox = {
+    db: createDbProxy(),
+    Date: function mongoDate(value: string) {
+      return new globalThis.Date(value);
+    },
+    RegExp: function mongoRegExp(pattern: string, flags?: string) {
+      return new globalThis.RegExp(pattern, flags);
+    },
+    ObjectId: function mongoObjectId(hex: string) {
+      return new ObjectId(hex);
+    },
+    ISODate: function mongoIsoDate(value: string) {
+      return new Date(value);
+    },
+    BinData: function mongoBinData(subtype: number | string, base64: string) {
+      return new Binary(Buffer.from(String(base64), "base64"), Number(subtype));
+    },
+    DBRef: function mongoDBRef(collection: string, oid: unknown, db?: string) {
+      return new DBRef(
+        String(collection),
+        oid as ObjectId,
+        db ? String(db) : undefined,
+      );
+    },
+    BSONSymbol: function mongoBSONSymbol(value: string) {
+      return new BSONSymbol(String(value));
+    },
+    NumberLong: function mongoNumberLong(value: number | string) {
+      return Long.fromString(String(value));
+    },
+    NumberInt: function mongoNumberInt(value: number | string) {
+      return new Int32(Number.parseInt(String(value), 10));
+    },
+    NumberDecimal: function mongoNumberDecimal(value: string) {
+      return Decimal128.fromString(value);
+    },
+    Timestamp: function mongoTimestamp(
+      secondsOrSpec:
+        | number
+        | string
+        | {
+            t?: unknown;
+            i?: unknown;
+          },
+      increment?: number | string,
+    ) {
+      if (secondsOrSpec && typeof secondsOrSpec === "object") {
+        return new Timestamp({
+          t: Number((secondsOrSpec as { t?: unknown }).t ?? 0),
+          i: Number((secondsOrSpec as { i?: unknown }).i ?? 0),
+        });
+      }
+      return new Timestamp({
+        t: Number(secondsOrSpec),
+        i: Number(increment ?? 0),
+      });
+    },
+    Code: function mongoCode(source: string, scope?: unknown) {
+      return scope !== undefined && scope !== null && typeof scope === "object"
+        ? new Code(String(source), scope as Record<string, unknown>)
+        : new Code(String(source));
+    },
+    MinKey: function mongoMinKey() {
+      return new MinKey();
+    },
+    MaxKey: function mongoMaxKey() {
+      return new MaxKey();
+    },
+  };
+
+  try {
+    vm.runInNewContext(queryText, sandbox, { timeout: 5000 });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `mongosh error: ${message}\n\nExamples:\n  db.users.find({})\n  db.users.find({ name: "Alice" }).limit(10)\n  db.users.insertOne({ name: "Alice" })\n  db.users.updateMany({ status: "active" }, { $set: { updated: true } })\n  db.users.deleteMany({ _id: ObjectId("507f1f77bcf86cd799439011") })\n  db.runCommand({ ping: 1 })\n  db.getSiblingDB("mydb").users.find({})`,
+    );
+  }
+
+  if (operations.length === 0) {
+    throw new Error(
+      'No operation found in mongosh expression.\n\nExamples:\n  db.users.find({})\n  db.users.insertOne({ name: "Alice" })\n  db.runCommand({ ping: 1 })',
+    );
+  }
+
+  return operations;
+}
+
+function isReadOnlyMongoOperation(operation: MongoshOperation): boolean {
+  switch (operation.op) {
+    case "find":
+    case "findOne":
+    case "countDocuments":
+      return true;
+    case "aggregate":
+      return (
+        Array.isArray(operation.args[0]) &&
+        operation.args[0].every(
+          (stage) =>
+            stage !== null &&
+            typeof stage === "object" &&
+            !Array.isArray(stage) &&
+            !Object.hasOwn(stage, "$merge") &&
+            !Object.hasOwn(stage, "$out"),
+        )
+      );
+    default:
+      return false;
+  }
+}
+
+function decideMongoReadOnlyQuery(queryText: string) {
+  const normalizedQuery = normalizeMongoshQueryText(queryText);
+  if (!normalizedQuery) {
+    return denyReadOnlyQuery(MONGODB_READ_ONLY_QUERY_REASON);
+  }
+
+  try {
+    const operations = parseMongoshOperations(normalizedQuery);
+    return operations.every(isReadOnlyMongoOperation)
+      ? allowReadOnlyQuery()
+      : denyReadOnlyQuery(MONGODB_READ_ONLY_QUERY_REASON);
+  } catch (error: unknown) {
+    return denyReadOnlyQuery(
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+}
 
 function unwrapQuotedMongoDisplay(value: string): string {
   const trimmed = value.trim();
@@ -626,6 +859,7 @@ export class MongoDBDriver implements IDBDriver {
       tabularRead: "nosql" as const,
       queryMode: "text" as const,
       supportsMutations: true,
+      readOnlyQueryGuard: decideMongoReadOnlyQuery,
       editorPresentation: {
         formatOnOpen: false,
         editorLanguage: "javascript" as const,

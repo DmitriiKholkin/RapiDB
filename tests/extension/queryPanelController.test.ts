@@ -316,6 +316,80 @@ describe("QueryPanelController", () => {
     });
   });
 
+  it("blocks non-read queries on readonly connections before connect and history", async () => {
+    const query = vi.fn(async () => ({
+      columns: ["id"],
+      rows: [{ id: 1 }],
+      rowCount: 1,
+      executionTimeMs: 5,
+    }));
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "active",
+        name: "Readonly",
+        type: "pg",
+        readOnly: true,
+      })),
+      getDriverCapabilities: vi.fn(() => ({
+        readOnlyQueryGuard: (queryText: string) =>
+          /^\s*select\b/i.test(queryText)
+            ? { allowed: true as const }
+            : {
+                allowed: false as const,
+                reason:
+                  "[RapiDB] Read-only SQL connections allow only read-only queries.",
+              },
+      })),
+      isConnected: vi.fn(() => false),
+      connectTo: vi.fn(async () => undefined),
+      addToHistory: vi.fn(async () => undefined),
+      addBookmark: vi.fn(async () => undefined),
+      getDriver: vi.fn(() => ({ query })),
+      getQueryRowLimit: vi.fn(() => 100),
+      getSchemaAsync: vi.fn(async () => []),
+    };
+
+    const view = {
+      getActiveConnectionId: vi.fn(() => "active"),
+      getInitialConnectionId: vi.fn(() => "initial"),
+      getLastQueryResult: vi.fn(() => null),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+
+    await controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText: "update users set name = 'Alice'" },
+    });
+
+    expect(connectionManager.isConnected).not.toHaveBeenCalled();
+    expect(connectionManager.connectTo).not.toHaveBeenCalled();
+    expect(connectionManager.addToHistory).not.toHaveBeenCalled();
+    expect(query).not.toHaveBeenCalled();
+    expect(view.postMessage).toHaveBeenCalledWith({
+      type: "queryResult",
+      payload: {
+        columns: [],
+        columnMeta: [],
+        rows: [],
+        rowCount: 0,
+        executionTimeMs: 0,
+        error:
+          "[RapiDB] Read-only SQL connections allow only read-only queries.",
+      },
+    });
+  });
+
   it("posts a query error instead of silently returning when the driver is unavailable", async () => {
     const addToHistory = vi.fn(async () => undefined);
     const connectionManager = {

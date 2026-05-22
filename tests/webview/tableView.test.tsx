@@ -279,13 +279,21 @@ function lastFetchPayload(): {
   };
 }
 
-function renderTableView() {
+function renderTableView(overrides?: {
+  connectionReadOnly?: boolean;
+  defaultPageSize?: number;
+  isView?: boolean;
+  table?: string;
+}) {
   return render(
     <TableView
       connectionId="conn-1"
       database="main"
       schema="public"
-      table="users"
+      connectionReadOnly={overrides?.connectionReadOnly}
+      defaultPageSize={overrides?.defaultPageSize}
+      isView={overrides?.isView}
+      table={overrides?.table ?? "users"}
     />,
   );
 }
@@ -1241,6 +1249,114 @@ describe("TableView", () => {
 
     const editInput = screen.getByLabelText("Cell value");
     expect((editInput as HTMLInputElement).readOnly).toBe(true);
+  });
+
+  it("uses view-style readonly behavior for readonly connections", async () => {
+    renderTableView({ connectionReadOnly: true });
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    expect(screen.queryByRole("button", { name: "Add Row" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Delete \(/ })).toBeNull();
+    expect(screen.queryByLabelText("Select all rows")).toBeNull();
+    expect(screen.queryByLabelText("Select row 1")).toBeNull();
+
+    const aliceCell = screen.getByText("Alice").closest("td");
+    if (!(aliceCell instanceof HTMLTableCellElement)) {
+      throw new Error("Expected readonly cell");
+    }
+
+    fireEvent.doubleClick(aliceCell);
+
+    const editInput = screen.getByLabelText("Cell value");
+    expect((editInput as HTMLInputElement).readOnly).toBe(true);
+    expect(screen.queryByRole("button", { name: "NULL" })).toBeNull();
+  });
+
+  it("applies readonly state from a later tableInit payload", async () => {
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+      connectionReadOnly: false,
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({
+          page: 1,
+          pageSize: 25,
+        }),
+      });
+    });
+
+    let fetchPayload = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: fetchPayload.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Add Row" })).toBeTruthy();
+    });
+
+    clearPostedMessages();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+      connectionReadOnly: true,
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({
+          page: 1,
+          pageSize: 25,
+        }),
+      });
+    });
+
+    fetchPayload = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: fetchPayload.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "Add Row" })).toBeNull();
+    });
   });
 
   it("requests delete preview with selected primary keys", async () => {

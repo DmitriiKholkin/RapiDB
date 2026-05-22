@@ -1,5 +1,6 @@
 import { createClient } from "redis";
 import type { ConnectionConfig } from "../connectionManager";
+import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import {
   applyFilters,
   applySort,
@@ -50,6 +51,49 @@ const REDIS_VALUE_TYPE_ORDER = [
   "zset",
   "stream",
 ] as const;
+
+const REDIS_READ_ONLY_QUERY_REASON =
+  "[RapiDB] Read-only Redis connections allow only read commands.";
+
+const READ_ONLY_REDIS_COMMANDS = new Set([
+  "DBSIZE",
+  "EXISTS",
+  "GET",
+  "GETRANGE",
+  "HGET",
+  "HGETALL",
+  "HEXISTS",
+  "HKEYS",
+  "HLEN",
+  "HMGET",
+  "HSCAN",
+  "HVALS",
+  "KEYS",
+  "LINDEX",
+  "LLEN",
+  "LRANGE",
+  "MGET",
+  "PTTL",
+  "SCAN",
+  "SCARD",
+  "SISMEMBER",
+  "SMEMBERS",
+  "SRANDMEMBER",
+  "SSCAN",
+  "STRLEN",
+  "TTL",
+  "TYPE",
+  "XLEN",
+  "XRANGE",
+  "XREVRANGE",
+  "ZCARD",
+  "ZRANGE",
+  "ZRANK",
+  "ZREVRANGE",
+  "ZREVRANK",
+  "ZSCORE",
+  "ZSCAN",
+]);
 
 interface RedisSampleRow {
   redisType: string;
@@ -240,6 +284,31 @@ function tokenizeRedisCommand(input: string): string[] {
   return tokens;
 }
 
+function decideRedisReadOnlyQuery(queryText: string) {
+  const trimmed = queryText.trim().replace(/;+$/, "");
+  if (!trimmed) {
+    return denyReadOnlyQuery(REDIS_READ_ONLY_QUERY_REASON);
+  }
+
+  try {
+    const statements = splitRedisStatements(trimmed);
+    if (statements.length === 0) {
+      return denyReadOnlyQuery(REDIS_READ_ONLY_QUERY_REASON);
+    }
+
+    return statements.every((statement) => {
+      const command = tokenizeRedisCommand(statement)[0]?.toUpperCase();
+      return command ? READ_ONLY_REDIS_COMMANDS.has(command) : false;
+    })
+      ? allowReadOnlyQuery()
+      : denyReadOnlyQuery(REDIS_READ_ONLY_QUERY_REASON);
+  } catch (error: unknown) {
+    return denyReadOnlyQuery(
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+}
+
 export class RedisDriver implements IDBDriver {
   private client: ReturnType<typeof createClient> | null = null;
   private connected = false;
@@ -311,6 +380,7 @@ export class RedisDriver implements IDBDriver {
       tabularRead: "nosql" as const,
       queryMode: "text" as const,
       supportsMutations: true,
+      readOnlyQueryGuard: decideRedisReadOnlyQuery,
       editorPresentation: {
         formatOnOpen: false,
         editorLanguage: "plaintext" as const,

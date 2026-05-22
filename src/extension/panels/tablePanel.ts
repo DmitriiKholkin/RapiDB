@@ -125,6 +125,12 @@ export class TablePanel {
     return this.panel.webview.postMessage({ type, payload });
   }
 
+  private isConnectionReadOnly(): boolean {
+    return (
+      this.connectionManager.getConnection(this.connectionId)?.readOnly === true
+    );
+  }
+
   private normalizePageRequest(
     page: number | string | undefined,
     pageSize: number | string | undefined,
@@ -196,6 +202,7 @@ export class TablePanel {
     const confSub = vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("rapidb.connections")) {
         panel.title = buildTitle();
+        void instance._handleReady();
       }
     });
     const disconnSub = connectionManager.onDidDisconnect((id) => {
@@ -261,6 +268,7 @@ export class TablePanel {
         columns: cols,
         primaryKeyColumns: pkCols,
         isView: this.isView,
+        connectionReadOnly: this.isConnectionReadOnly(),
       });
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
@@ -581,6 +589,7 @@ export class TablePanel {
         schema: this.schema,
         table: this.table,
         isView: this.isView,
+        connectionReadOnly: this.isConnectionReadOnly(),
         defaultPageSize: this.connectionManager.getDefaultPageSize(),
       },
       htmlStyles: "height: 100%; overflow: hidden;",

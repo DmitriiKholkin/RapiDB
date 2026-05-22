@@ -69,12 +69,19 @@ export interface FilterConditionResult {
   params: unknown[];
 }
 
+export type ReadOnlyQueryDecision =
+  | { allowed: true }
+  | { allowed: false; reason: string };
+
+export type ReadOnlyQueryGuard = (queryText: string) => ReadOnlyQueryDecision;
+
 export interface DriverCapabilities {
   tabularRead: "sql" | "nosql";
   queryMode?: "sql" | "text";
   supportsMutations?: boolean;
   editorPresentation?: QueryEditorPresentation;
   isTableFilterError?: (message: string) => boolean;
+  readOnlyQueryGuard?: ReadOnlyQueryGuard;
 }
 
 export interface DriverStaticMetadata {

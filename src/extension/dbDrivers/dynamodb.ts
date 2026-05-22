@@ -47,6 +47,7 @@ import {
 } from "../../shared/dynamodbNative";
 import type { PrimaryKeyRole } from "../../shared/tableTypes";
 import type { ConnectionConfig } from "../connectionManager";
+import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import {
   applyFilters,
   applySort,
@@ -82,6 +83,18 @@ import type {
   TypeCategory,
   ValueSemantics,
 } from "./types";
+
+const DYNAMODB_READ_ONLY_QUERY_REASON =
+  "[RapiDB] Read-only DynamoDB connections allow only GetItem, BatchGetItem, Query, Scan, and TransactGetItems requests.";
+
+const READ_ONLY_DYNAMODB_OPERATIONS = new Set<DynamoDbNativeOperationName>([
+  "BatchGetItem",
+  "GetItem",
+  "Query",
+  "Scan",
+  "TransactGetItems",
+]);
+
 import { NULL_SENTINEL, resolveFilterOperators } from "./types";
 
 const DYNAMODB_ENTITY_MANIFEST: DriverEntityManifest = {
@@ -251,6 +264,8 @@ export class DynamoDBDriver implements IDBDriver {
       tabularRead: "nosql" as const,
       queryMode: "text" as const,
       supportsMutations: true,
+      readOnlyQueryGuard: (queryText: string) =>
+        this.decideReadOnlyQuery(queryText),
       editorPresentation: {
         queryMode: "text" as const,
         formatOnOpen: false,
@@ -542,6 +557,20 @@ export class DynamoDBDriver implements IDBDriver {
       affectedRows: sawMutation ? affectedRows : undefined,
       executionTimeMs: Date.now() - startedAt,
     };
+  }
+
+  private decideReadOnlyQuery(queryText: string) {
+    try {
+      const inputs = parseDynamoDbNativeQueryInputs(queryText);
+      const operation = this.resolveNativeOperation(inputs);
+      return READ_ONLY_DYNAMODB_OPERATIONS.has(operation)
+        ? allowReadOnlyQuery()
+        : denyReadOnlyQuery(DYNAMODB_READ_ONLY_QUERY_REASON);
+    } catch (error: unknown) {
+      return denyReadOnlyQuery(
+        error instanceof Error ? error.message : String(error),
+      );
+    }
   }
 
   async readTablePage(

@@ -28,7 +28,7 @@ import {
 
 interface UseTableDataControllerParams {
   initialPageSize: number;
-  isView: boolean;
+  readOnlyTable: boolean;
   columnsRef: MutableRefObject<ColumnMeta[]>;
   rowsRef: MutableRefObject<Row[]>;
   pkColsRef: MutableRefObject<string[]>;
@@ -44,7 +44,7 @@ interface UseTableDataControllerParams {
 
 export function useTableDataController({
   initialPageSize,
-  isView,
+  readOnlyTable: initialReadOnlyTable,
   columnsRef,
   rowsRef,
   pkColsRef,
@@ -72,13 +72,13 @@ export function useTableDataController({
     useState<FilterDraftMap>({});
   const [sort, setSort] = useState<TableSortState>(null);
   const [requestedSort, setRequestedSort] = useState<TableSortState>(null);
-  const [readOnlyTable, setReadOnlyTable] = useState(isView);
+  const [readOnlyTable, setReadOnlyTable] = useState(initialReadOnlyTable);
   const [colSizes, setColSizes] = useState<Record<string, number>>({});
   const [isInitialized, setIsInitialized] = useState(false);
 
   const colSizesInitedRef = useRef(false);
   const pendingPrimaryKeyColumnsRef = useRef<string[]>([]);
-  const pendingReadOnlyTableRef = useRef(isView);
+  const pendingReadOnlyTableRef = useRef(initialReadOnlyTable);
   const scrollPreserveRef = useRef<number | null>(null);
   const requestedSortRef = useRef<TableSortState>(requestedSort);
   const fetchSnapshotsRef = useRef<Map<number, FetchSnapshot>>(new Map());
@@ -90,12 +90,11 @@ export function useTableDataController({
   const fetchEpochRef = useRef(0);
   const filtersMountedRef = useRef(false);
   const [initTick, setInitTick] = useState(0);
-  const isViewRef = useRef(isView);
+  const readOnlyTableRef = useRef(initialReadOnlyTable);
   const initialPageSizeRef = useRef(initialPageSize);
   const onTableInitRef = useRef(onTableInit);
   const onRowsCommittedRef = useRef(onRowsCommitted);
 
-  isViewRef.current = isView;
   initialPageSizeRef.current = initialPageSize;
   requestedSortRef.current = requestedSort;
   hasCommittedDataRef.current = hasCommittedData;
@@ -144,48 +143,69 @@ export function useTableDataController({
   };
 
   useEffect(() => {
-    setReadOnlyTable(isView);
-    pendingReadOnlyTableRef.current = isView;
-  }, [isView]);
+    setReadOnlyTable(initialReadOnlyTable);
+    pendingReadOnlyTableRef.current = initialReadOnlyTable;
+    readOnlyTableRef.current = initialReadOnlyTable;
+  }, [initialReadOnlyTable]);
+
+  useEffect(() => {
+    readOnlyTableRef.current = readOnlyTable;
+  }, [readOnlyTable]);
 
   useEffect(() => {
     const unInit = onMessage<{
       columns: ColumnMeta[];
       primaryKeyColumns: string[];
-    }>("tableInit", ({ columns: nextColumns, primaryKeyColumns }) => {
-      columnsRef.current = nextColumns;
-      pendingPrimaryKeyColumnsRef.current = primaryKeyColumns;
-      pendingReadOnlyTableRef.current = isViewRef.current;
+      isView?: boolean;
+      connectionReadOnly?: boolean;
+    }>(
+      "tableInit",
+      ({
+        columns: nextColumns,
+        primaryKeyColumns,
+        isView,
+        connectionReadOnly,
+      }) => {
+        const nextReadOnlyTable =
+          isView !== undefined || connectionReadOnly !== undefined
+            ? Boolean(isView) || Boolean(connectionReadOnly)
+            : readOnlyTableRef.current;
 
-      initializedRef.current = true;
-      setIsInitialized(true);
-      fetchEpochRef.current += 1;
-      fetchSnapshotsRef.current.clear();
-      scrollPreserveRef.current = null;
-      colSizesInitedRef.current = false;
+        columnsRef.current = nextColumns;
+        pendingPrimaryKeyColumnsRef.current = primaryKeyColumns;
+        pendingReadOnlyTableRef.current = nextReadOnlyTable;
 
-      setLoading(true);
-      setHasCommittedData(false);
-      setColumns([]);
-      setPkCols([]);
-      setRows([]);
-      setTotalCount(0);
-      setError(null);
-      setReadError(null);
-      setFilterError(null);
-      setPage(1);
-      setPageSize(initialPageSizeRef.current);
-      setRequestedPage(1);
-      setRequestedPageSize(initialPageSizeRef.current);
-      setSort(null);
-      setRequestedSort(null);
-      setFilterDrafts({});
-      setDebouncedFilterDrafts({});
-      setColSizes({});
+        initializedRef.current = true;
+        setIsInitialized(true);
+        fetchEpochRef.current += 1;
+        fetchSnapshotsRef.current.clear();
+        scrollPreserveRef.current = null;
+        colSizesInitedRef.current = false;
 
-      onTableInitRef.current();
-      setInitTick((tick) => tick + 1);
-    });
+        setLoading(true);
+        setHasCommittedData(false);
+        setColumns([]);
+        setPkCols([]);
+        setRows([]);
+        setTotalCount(0);
+        setError(null);
+        setReadError(null);
+        setFilterError(null);
+        setPage(1);
+        setPageSize(initialPageSizeRef.current);
+        setRequestedPage(1);
+        setRequestedPageSize(initialPageSizeRef.current);
+        setReadOnlyTable(nextReadOnlyTable);
+        setSort(null);
+        setRequestedSort(null);
+        setFilterDrafts({});
+        setDebouncedFilterDrafts({});
+        setColSizes({});
+
+        onTableInitRef.current();
+        setInitTick((tick) => tick + 1);
+      },
+    );
 
     const unData = onMessage<{
       fetchId?: number;

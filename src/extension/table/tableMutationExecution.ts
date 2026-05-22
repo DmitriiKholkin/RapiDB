@@ -4,6 +4,7 @@ import type {
 } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import type { ColumnTypeMeta } from "../dbDrivers/types";
+import { assertConnectionWritable } from "../utils/readOnlyGuards";
 import type {
   ApplyResult,
   PreparedApplyPlan,
@@ -57,6 +58,7 @@ export function prepareApplyChangesPlan(
   if (updates.length === 0) {
     return { executable: false, result: { success: true, rowOutcomes: [] } };
   }
+  assertConnectionWritable(connectionManager, connectionId, "apply changes");
   const driver = connectionManager.getDriver(connectionId);
   if (!driver) {
     return {
@@ -247,6 +249,19 @@ export async function executePreparedApplyPlan(
   connectionManager: ConnectionManager,
   plan: PreparedApplyPlan,
 ): Promise<ApplyResultPayload> {
+  try {
+    assertConnectionWritable(
+      connectionManager,
+      plan.connectionId,
+      "apply changes",
+    );
+  } catch (error: unknown) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+
   const driver = connectionManager.getDriver(plan.connectionId);
   if (!driver) {
     return { success: false, error: "Not connected" };

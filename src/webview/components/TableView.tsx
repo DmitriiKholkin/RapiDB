@@ -25,6 +25,7 @@ interface Props {
   schema: string;
   table: string;
   isView?: boolean;
+  connectionReadOnly?: boolean;
   defaultPageSize?: number;
 }
 
@@ -34,8 +35,14 @@ interface ExportChoiceState {
   sort: TableSortState;
 }
 
-export function TableView({ table, isView = false, defaultPageSize }: Props) {
+export function TableView({
+  table,
+  isView = false,
+  connectionReadOnly = false,
+  defaultPageSize,
+}: Props) {
   const initialPageSize = getInitialPageSize(defaultPageSize);
+  const effectiveReadOnly = isView || connectionReadOnly;
   const columnsRef = useRef<ColumnMeta[]>([]);
   const rowsRef = useRef<Row[]>([]);
   const pkColsRef = useRef<string[]>([]);
@@ -60,7 +67,7 @@ export function TableView({ table, isView = false, defaultPageSize }: Props) {
 
   const data = useTableDataController({
     initialPageSize,
-    isView,
+    readOnlyTable: effectiveReadOnly,
     columnsRef,
     rowsRef,
     pkColsRef,

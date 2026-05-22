@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TablePanel } from "../../src/extension/panels/tablePanel";
 
+const getColumnsMock = vi.hoisted(() => vi.fn(async () => []));
 const getPageMock = vi.hoisted(() =>
   vi.fn(async () => ({ rows: [], totalCount: 0, columns: [] })),
 );
@@ -16,8 +17,12 @@ const prepareDeleteRowsPlanMock = vi.hoisted(() =>
   >(async () => null),
 );
 const createDeleteRowsPreviewMock = vi.hoisted(() => vi.fn());
+const createWebviewShellMock = vi.hoisted(() => vi.fn(() => "<html></html>"));
 
 const vscodeMock = vi.hoisted(() => {
+  const configurationListeners = new Set<
+    (event: { affectsConfiguration: (section: string) => boolean }) => void
+  >();
   const createWebviewPanel = vi.fn(() => {
     const disposeListeners = new Set<() => void>();
     const messageListeners = new Set<
@@ -64,6 +69,14 @@ const vscodeMock = vi.hoisted(() => {
 
   return {
     createWebviewPanel,
+    dispatchConfigurationChange(section: string) {
+      const event = {
+        affectsConfiguration: (candidate: string) => candidate === section,
+      };
+      for (const listener of configurationListeners) {
+        listener(event);
+      }
+    },
     module: {
       ViewColumn: { One: 1 },
       window: {
@@ -72,7 +85,14 @@ const vscodeMock = vi.hoisted(() => {
         showErrorMessage: vi.fn(),
       },
       workspace: {
-        onDidChangeConfiguration: vi.fn(() => ({ dispose: vi.fn() })),
+        onDidChangeConfiguration: vi.fn((listener) => {
+          configurationListeners.add(listener);
+          return {
+            dispose: () => {
+              configurationListeners.delete(listener);
+            },
+          };
+        }),
       },
     },
   };
@@ -81,12 +101,12 @@ const vscodeMock = vi.hoisted(() => {
 vi.mock("vscode", () => vscodeMock.module);
 
 vi.mock("../../src/extension/panels/webviewShell", () => ({
-  createWebviewShell: vi.fn(() => "<html></html>"),
+  createWebviewShell: createWebviewShellMock,
 }));
 
 vi.mock("../../src/extension/tableDataService", () => ({
   TableDataService: class {
-    getColumns = vi.fn(async () => []);
+    getColumns = getColumnsMock;
     getPage = getPageMock;
     prepareDeleteRowsPlan = prepareDeleteRowsPlanMock;
     clearForConnection = vi.fn();
@@ -113,6 +133,8 @@ describe("TablePanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     TablePanel.disposeAll();
+    getColumnsMock.mockReset();
+    getColumnsMock.mockResolvedValue([]);
     getPageMock.mockClear();
     prepareDeleteRowsPlanMock.mockReset();
     prepareDeleteRowsPlanMock.mockResolvedValue(null);
@@ -124,6 +146,7 @@ describe("TablePanel", () => {
       sql: "DELETE FROM users WHERE id = 1;",
       statementCount: 1,
     });
+    createWebviewShellMock.mockClear();
   });
 
   it("normalizes fetchPage pagination before querying data service", async () => {
@@ -192,6 +215,115 @@ describe("TablePanel", () => {
       [],
       null,
     );
+  });
+
+  it("wires readonly state into the table webview initial state and ready payload", async () => {
+    const columns = [{ name: "id", isPrimaryKey: true }];
+    getColumnsMock.mockResolvedValueOnce(columns);
+
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        name: "Readonly",
+        type: "pg",
+        readOnly: true,
+      })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      getDefaultPageSize: vi.fn(() => 50),
+    };
+
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      "db1",
+      "public",
+      "users",
+    );
+
+    expect(createWebviewShellMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        initialState: {
+          view: "table",
+          connectionId: "conn-1",
+          database: "db1",
+          schema: "public",
+          table: "users",
+          isView: false,
+          connectionReadOnly: true,
+          defaultPageSize: 50,
+        },
+      }),
+    );
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected table panel instance");
+    }
+
+    await panel.webview.dispatchMessage({ type: "ready" });
+
+    expect(getColumnsMock).toHaveBeenCalledWith(
+      "conn-1",
+      "db1",
+      "public",
+      "users",
+    );
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "tableInit",
+      payload: {
+        columns,
+        primaryKeyColumns: ["id"],
+        isView: false,
+        connectionReadOnly: true,
+      },
+    });
+  });
+
+  it("refreshes readonly state for an open panel after connection settings change", async () => {
+    const columns = [{ name: "id", isPrimaryKey: true }];
+    getColumnsMock.mockResolvedValue(columns);
+
+    let readOnly = false;
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        name: "Main",
+        type: "pg",
+        readOnly,
+      })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      getDefaultPageSize: vi.fn(() => 25),
+    };
+
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      "db1",
+      "public",
+      "users",
+    );
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected table panel instance");
+    }
+
+    await panel.webview.dispatchMessage({ type: "ready" });
+
+    expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+      type: "tableInit",
+      payload: expect.objectContaining({ connectionReadOnly: false }),
+    });
+
+    readOnly = true;
+    vscodeMock.dispatchConfigurationChange("rapidb.connections");
+
+    await vi.waitFor(() => {
+      expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+        type: "tableInit",
+        payload: expect.objectContaining({ connectionReadOnly: true }),
+      });
+    });
   });
 
   it("routes deleteRows through mutation preview when prepared plan exists", async () => {

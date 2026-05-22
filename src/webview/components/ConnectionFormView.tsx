@@ -5,6 +5,7 @@ import React, {
   type ReactNode,
   useCallback,
   useEffect,
+  useId,
   useState,
 } from "react";
 import {
@@ -202,20 +203,27 @@ function ToggleSwitch({
   checked,
   disabled,
   label,
+  descriptionId,
   onKeyToggle,
 }: {
   checked: boolean;
   disabled?: boolean;
   label: string;
+  descriptionId?: string;
   onKeyToggle: () => void;
 }) {
+  const [focused, setFocused] = useState(false);
+
   return (
     <div
       role="switch"
       aria-label={label}
       aria-checked={checked}
       aria-disabled={disabled}
+      aria-describedby={descriptionId}
       tabIndex={disabled ? -1 : 0}
+      onFocus={() => setFocused(true)}
+      onBlur={() => setFocused(false)}
       onKeyDown={(e) => {
         if ((e.key === " " || e.key === "Enter") && !disabled) {
           e.preventDefault();
@@ -232,7 +240,10 @@ function ToggleSwitch({
         position: "relative",
         flexShrink: 0,
         opacity: disabled ? 0.45 : 1,
-        outline: "none",
+        outline: focused
+          ? "2px solid var(--vscode-focusBorder, var(--vscode-button-background))"
+          : "none",
+        outlineOffset: 2,
         transition: "background 0.15s",
       }}
     >
@@ -266,6 +277,8 @@ function Toggle({
   onChange: (v: boolean) => void;
   disabled?: boolean;
 }) {
+  const hintId = useId();
+
   return (
     <label
       style={{
@@ -288,12 +301,14 @@ function Toggle({
         checked={checked}
         disabled={disabled}
         label={label}
+        descriptionId={hint ? hintId : undefined}
         onKeyToggle={() => onChange(!checked)}
       />
       <div style={{ paddingTop: 1 }}>
         <div style={{ fontSize: 13, lineHeight: 1.3 }}>{label}</div>
         {hint && (
           <div
+            id={hintId}
             style={{
               fontSize: 11,
               opacity: 0.55,
@@ -413,6 +428,9 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const [password, setPassword] = useState("");
   const [filePath, setFilePath] = useState(existing?.filePath ?? "");
   const [folder, setFolder] = useState(existing?.folder ?? "");
+  const [connectionReadOnly, setConnectionReadOnly] = useState(
+    existing?.readOnly ?? false,
+  );
 
   const [oracleServiceName, setOracleServiceName] = useState(
     existing?.serviceName ?? "",
@@ -541,6 +559,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       id: existing?.id ?? crypto.randomUUID(),
       name: name.trim(),
       type,
+      readOnly: connectionReadOnly,
       folder: folder.trim() || undefined,
       useSecretStorage: effectiveUseSecretStorage,
       hasStoredSecret: hasStoredSecret || undefined,
@@ -602,6 +621,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     existing,
     name,
     type,
+    connectionReadOnly,
     folder,
     effectiveUseSecretStorage,
     hasStoredSecret,
@@ -703,6 +723,16 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       <Card>
         <CardHeader icon="database" label="Database Type" />
         <DBTypeSelector value={type} onChange={handleTypeChange} />
+      </Card>
+
+      <Card>
+        <CardHeader icon="shield" label="Access" />
+        <Toggle
+          label="Open connection as read-only"
+          hint="Blocks data mutations and shows table data in the same read-only mode used for views. Query text stays editable."
+          checked={connectionReadOnly}
+          onChange={setConnectionReadOnly}
+        />
       </Card>
 
       <Card>
