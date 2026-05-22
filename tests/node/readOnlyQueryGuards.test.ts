@@ -105,6 +105,14 @@ describe("readonly query guards", () => {
       reason:
         "[RapiDB] Read-only SQL connections allow only read-only queries.",
     });
+    expect(sqliteGuard("pragma journal_mode(wal)")).toEqual({
+      allowed: false,
+      reason:
+        "[RapiDB] Read-only SQL connections allow only read-only queries.",
+    });
+    expect(sqliteGuard('pragma table_info("users")')).toEqual({
+      allowed: true,
+    });
   });
 
   it("keeps readonly SQL coverage for MSSQL and Oracle dialects", () => {

@@ -18,6 +18,7 @@ import {
   isConnectionReadOnly,
 } from "../../src/extension/utils/readOnlyGuards";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
+import { QUERY_LIMIT_POLICY } from "../../src/shared/safetyContracts";
 
 /**
  * PHASE 4 CRITICAL VALIDATION TEST SUITE
@@ -45,9 +46,11 @@ describe("Phase 4 — Critical Validation", () => {
       });
 
       const mockToArray = vi.fn().mockResolvedValue([]);
+      const mockLimit = vi.fn().mockReturnThis();
+      const mockSkip = vi.fn().mockReturnThis();
       const mockFind = vi.fn().mockReturnValue({
-        limit: vi.fn().mockReturnThis(),
-        skip: vi.fn().mockReturnThis(),
+        limit: mockLimit,
+        skip: mockSkip,
         toArray: mockToArray,
       });
 
@@ -59,7 +62,7 @@ describe("Phase 4 — Critical Validation", () => {
       };
       (driver as unknown as { connected: boolean }).connected = true;
 
-      return { driver, mockFind };
+      return { driver, mockFind, mockLimit, mockSkip };
     }
 
     it("rejects prototype pollution attempts", async () => {
@@ -166,6 +169,15 @@ describe("Phase 4 — Critical Validation", () => {
       const result = await driver.query("db.users.find({})");
       expect(mockFind).toHaveBeenCalled();
       expect(result).toHaveProperty("rowCount");
+    });
+
+    it("caps mongosh find limit to the safety hard cap", async () => {
+      const { driver, mockLimit, mockSkip } = createMongoDriver();
+
+      await driver.query("db.users.find({}).skip(7).limit(999999)");
+
+      expect(mockSkip).toHaveBeenCalledWith(7);
+      expect(mockLimit).toHaveBeenCalledWith(QUERY_LIMIT_POLICY.hardCap);
     });
 
     it("allows safe aggregation without $out", async () => {
@@ -304,7 +316,9 @@ describe("Phase 4 — Critical Validation", () => {
         "DELETE FROM users",
       );
       expect(result.allowed).toBe(false);
-      expect(result.reason).toContain("Mutation not allowed");
+      if (!result.allowed) {
+        expect(result.reason).toContain("Mutation not allowed");
+      }
     });
 
     it("allows all queries on writable connections", () => {
@@ -337,7 +351,8 @@ describe("Phase 4 — Critical Validation", () => {
         qualifiedTableName: vi.fn().mockReturnValue("public.users"),
         quoteIdentifier: vi.fn((id: string) => `"${id}"`),
         materializePreviewSql: vi.fn((sql: string) => sql),
-        buildInsertValueExpr: vi.fn((col: any, i: number) => `$${i}`),
+        buildInsertValueExpr: vi.fn((_column: unknown, i: number) => `$${i}`),
+        coerceInputValue: vi.fn((value: unknown) => value),
       }),
     });
 
@@ -374,7 +389,7 @@ describe("Phase 4 — Critical Validation", () => {
     it("blocks update on read-only connection", async () => {
       const manager = createMutationManager(true);
       const service = new TableMutationService(
-        manager as any,
+        manager as never,
         mockColumnsProvider,
       );
 
@@ -393,7 +408,7 @@ describe("Phase 4 — Critical Validation", () => {
     it("blocks insert on read-only connection", async () => {
       const manager = createMutationManager(true);
       const service = new TableMutationService(
-        manager as any,
+        manager as never,
         mockColumnsProvider,
       );
 
@@ -408,7 +423,7 @@ describe("Phase 4 — Critical Validation", () => {
     it("blocks delete on read-only connection", async () => {
       const manager = createMutationManager(true);
       const service = new TableMutationService(
-        manager as any,
+        manager as never,
         mockColumnsProvider,
       );
 
@@ -425,7 +440,7 @@ describe("Phase 4 — Critical Validation", () => {
       driver.updateRows = vi.fn().mockResolvedValue({ affectedRows: 1 });
 
       const service = new TableMutationService(
-        manager as any,
+        manager as never,
         mockColumnsProvider,
       );
 
@@ -448,7 +463,7 @@ describe("Phase 4 — Critical Validation", () => {
       driver.insertRow = vi.fn().mockResolvedValue({ affectedRows: 1 });
 
       const service = new TableMutationService(
-        manager as any,
+        manager as never,
         mockColumnsProvider,
       );
 
@@ -467,7 +482,7 @@ describe("Phase 4 — Critical Validation", () => {
       driver.deleteRows = vi.fn().mockResolvedValue({ affectedRows: 1 });
 
       const service = new TableMutationService(
-        manager as any,
+        manager as never,
         mockColumnsProvider,
       );
 
@@ -482,7 +497,7 @@ describe("Phase 4 — Critical Validation", () => {
     it("verifies prepared insert plan enforces read-only guard", async () => {
       const manager = createMutationManager(true);
       const service = new TableMutationService(
-        manager as any,
+        manager as never,
         mockColumnsProvider,
       );
 
@@ -497,7 +512,7 @@ describe("Phase 4 — Critical Validation", () => {
     it("verifies prepared delete plan enforces read-only guard", async () => {
       const manager = createMutationManager(true);
       const service = new TableMutationService(
-        manager as any,
+        manager as never,
         mockColumnsProvider,
       );
 
@@ -518,26 +533,40 @@ describe("Phase 4 — Critical Validation", () => {
   // ============================================================================
 
   describe("Cross-database read-only consistency", () => {
-    const databases = [
-      { name: "PostgreSQL", Driver: PostgresDriver },
-      { name: "MySQL", Driver: MySQLDriver },
-      { name: "SQLite", Driver: SQLiteDriver },
-      { name: "MSSQL", Driver: MSSQLDriver },
-      { name: "Oracle", Driver: OracleDriver },
-      { name: "MongoDB", Driver: MongoDBDriver },
-      { name: "Redis", Driver: RedisDriver },
-      { name: "Elasticsearch", Driver: ElasticsearchDriver },
-      { name: "DynamoDB", Driver: DynamoDBDriver },
+    const databases: Array<{
+      name: string;
+      type: ConnectionConfig["type"];
+      Driver: new (
+        config: ConnectionConfig,
+      ) => {
+        getCapabilities?: () => {
+          readOnlyQueryGuard?: unknown;
+        };
+      };
+    }> = [
+      { name: "PostgreSQL", type: "pg", Driver: PostgresDriver },
+      { name: "MySQL", type: "mysql", Driver: MySQLDriver },
+      { name: "SQLite", type: "sqlite", Driver: SQLiteDriver },
+      { name: "MSSQL", type: "mssql", Driver: MSSQLDriver },
+      { name: "Oracle", type: "oracle", Driver: OracleDriver },
+      { name: "MongoDB", type: "mongodb", Driver: MongoDBDriver },
+      { name: "Redis", type: "redis", Driver: RedisDriver },
+      {
+        name: "Elasticsearch",
+        type: "elasticsearch",
+        Driver: ElasticsearchDriver,
+      },
+      { name: "DynamoDB", type: "dynamodb", Driver: DynamoDBDriver },
     ];
 
-    for (const { name, Driver } of databases) {
+    for (const { name, type, Driver } of databases) {
       it(`${name} driver has readOnlyQueryGuard capability defined`, () => {
         const config: ConnectionConfig = {
           id: `test-${name.toLowerCase()}`,
-          type: name.toLowerCase() as any,
+          type,
           name: `Test ${name}`,
           host: "localhost",
-        } as any;
+        };
 
         const driver = new Driver(config);
         const capabilities = driver.getCapabilities?.();

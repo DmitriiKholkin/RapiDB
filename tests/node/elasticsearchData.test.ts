@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
+import { ELASTICSEARCH_READ_BUDGET } from "../../src/shared/safetyContracts";
 
 const elasticDatetimeColumn: ColumnTypeMeta = {
   name: "created_at",
@@ -620,6 +621,37 @@ describe("ElasticsearchDriver — metadata and pages", () => {
         __col_2: "Release note",
       },
     ]);
+  });
+
+  it("clamps REST-style search body size to hard cap", async () => {
+    const { driver, search } = createDriver();
+    search.mockResolvedValue({ hits: { hits: [] } });
+
+    await driver.query(
+      `POST /notes/_search\n{\n  "query": {\n    "match_all": {}\n  },\n  "size": ${ELASTICSEARCH_READ_BUDGET.hardCap + 5000}\n}`,
+    );
+
+    expect(search).toHaveBeenCalledWith(
+      expect.objectContaining({
+        index: "notes",
+        size: ELASTICSEARCH_READ_BUDGET.hardCap,
+      }),
+    );
+  });
+
+  it("clamps REST-style search query param size to hard cap", async () => {
+    const { driver, search } = createDriver();
+    search.mockResolvedValue({ hits: { hits: [] } });
+
+    await driver.query(
+      `POST /_search?size=${ELASTICSEARCH_READ_BUDGET.hardCap + 3000}\n{\n  "query": {\n    "match_all": {}\n  }\n}`,
+    );
+
+    expect(search).toHaveBeenCalledWith(
+      expect.objectContaining({
+        size: ELASTICSEARCH_READ_BUDGET.hardCap,
+      }),
+    );
   });
 
   it("executes REST-style update and delete document commands", async () => {

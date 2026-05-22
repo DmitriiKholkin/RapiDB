@@ -1,3 +1,5 @@
+import type { OperationCancellationContext } from "../../shared/safetyContracts";
+
 export const CONNECTION_TIMEOUT_SECONDS_DEFAULT = 15;
 export const DB_OPERATION_TIMEOUT_SECONDS_DEFAULT = 180;
 
@@ -41,14 +43,12 @@ export class DriverTimeoutError extends Error {
 }
 
 interface TimeoutAwareDriverHooks {
-  cancelCurrentOperation?(context: {
-    timeoutKind: DriverTimeoutKind;
-    operationName: string;
-  }): void | Promise<void>;
-  recycleConnectionAfterTimeout?(context: {
-    timeoutKind: DriverTimeoutKind;
-    operationName: string;
-  }): void | Promise<void>;
+  cancelCurrentOperation?(
+    context: OperationCancellationContext,
+  ): void | Promise<void>;
+  recycleConnectionAfterTimeout?(
+    context: OperationCancellationContext,
+  ): void | Promise<void>;
 }
 
 const CONNECT_METHODS = new Set(["connect"]);
@@ -145,6 +145,7 @@ async function withDriverTimeout<T>(
     operationName: string;
     timeoutSettingsProvider: DriverTimeoutSettingsProvider;
     onTimeout?: () => void | Promise<void>;
+    onLateSettlementAfterTimeout?: () => void | Promise<void>;
   },
 ): Promise<T> {
   const timeoutMs = timeoutMsForKind(
@@ -158,20 +159,26 @@ async function withDriverTimeout<T>(
 
   return await new Promise<T>((resolve, reject) => {
     let settled = false;
+    let timedOut = false;
     const timer = setTimeout(() => {
       if (settled) {
         return;
       }
 
       settled = true;
-      void Promise.resolve(options.onTimeout?.()).catch(() => undefined);
-      reject(
-        new DriverTimeoutError(
-          options.timeoutKind,
-          options.operationName,
-          timeoutMs,
-        ),
-      );
+      timedOut = true;
+      clearTimeout(timer);
+      void Promise.resolve(options.onTimeout?.())
+        .catch(() => undefined)
+        .finally(() => {
+          reject(
+            new DriverTimeoutError(
+              options.timeoutKind,
+              options.operationName,
+              timeoutMs,
+            ),
+          );
+        });
     }, timeoutMs);
 
     let pendingPromise: Promise<T>;
@@ -187,6 +194,11 @@ async function withDriverTimeout<T>(
     void pendingPromise.then(
       (value) => {
         if (settled) {
+          if (timedOut) {
+            void Promise.resolve(
+              options.onLateSettlementAfterTimeout?.(),
+            ).catch(() => undefined);
+          }
           return;
         }
 
@@ -196,6 +208,11 @@ async function withDriverTimeout<T>(
       },
       (error) => {
         if (settled) {
+          if (timedOut) {
+            void Promise.resolve(
+              options.onLateSettlementAfterTimeout?.(),
+            ).catch(() => undefined);
+          }
           return;
         }
 
@@ -239,7 +256,8 @@ export function createTimeoutAwareDriver<T extends object>(
             timeoutSettingsProvider,
             onTimeout: async () => {
               const timeoutHooks = target as TimeoutAwareDriverHooks;
-              const timeoutContext = {
+              const timeoutContext: OperationCancellationContext = {
+                reason: "timeout",
                 timeoutKind,
                 operationName: property,
               };
@@ -255,6 +273,21 @@ export function createTimeoutAwareDriver<T extends object>(
                   timeoutContext,
                 );
               }
+            },
+            onLateSettlementAfterTimeout: async () => {
+              const timeoutHooks = target as TimeoutAwareDriverHooks;
+              if (
+                typeof timeoutHooks.recycleConnectionAfterTimeout !== "function"
+              ) {
+                return;
+              }
+
+              const timeoutContext: OperationCancellationContext = {
+                reason: "late_settlement_after_timeout",
+                timeoutKind,
+                operationName: property,
+              };
+              await timeoutHooks.recycleConnectionAfterTimeout(timeoutContext);
             },
           },
         );

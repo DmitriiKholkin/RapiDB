@@ -718,6 +718,55 @@ describe("ConnectionManager", () => {
     expect(driverInstances[0]?.disconnectCalls).toBeGreaterThanOrEqual(1);
   });
 
+  it("cleans per-connection runtime maps on disconnect", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    const managerState = manager as unknown as {
+      _driverStaticMetadataCache: Map<string, unknown>;
+      _schemaCacheMap: Map<string, unknown>;
+      _schemaGenerationMap: Map<string, number>;
+      _schemaExpandedScopeKeyMap: Map<string, Set<string>>;
+      _connectionEpochMap: Map<string, number>;
+    };
+    managerState._driverStaticMetadataCache.set("conn-1", {
+      manifest: { dbObjectKinds: ["table"] },
+    });
+    managerState._schemaCacheMap.set("conn-1", { status: "loaded" });
+    managerState._schemaGenerationMap.set("conn-1", 2);
+    managerState._schemaExpandedScopeKeyMap.set(
+      "conn-1",
+      new Set(["connectionRoot"]),
+    );
+    managerState._connectionEpochMap.set("conn-1", 5);
+
+    await manager.disconnectFrom("conn-1");
+
+    expect(managerState._driverStaticMetadataCache.has("conn-1")).toBe(false);
+    expect(managerState._schemaCacheMap.has("conn-1")).toBe(false);
+    expect(managerState._schemaGenerationMap.has("conn-1")).toBe(false);
+    expect(managerState._schemaExpandedScopeKeyMap.has("conn-1")).toBe(false);
+    expect(managerState._connectionEpochMap.get("conn-1")).toBe(6);
+  });
+
   it("allows a fresh connect attempt after disconnect fences a stale in-flight attempt", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
@@ -1087,6 +1136,24 @@ describe("ConnectionManager", () => {
       store,
     );
 
+    const managerState = manager as unknown as {
+      _driverStaticMetadataCache: Map<string, unknown>;
+      _schemaCacheMap: Map<string, unknown>;
+      _schemaGenerationMap: Map<string, number>;
+      _schemaExpandedScopeKeyMap: Map<string, Set<string>>;
+      _connectionEpochMap: Map<string, number>;
+    };
+    managerState._driverStaticMetadataCache.set("conn-1", {
+      manifest: { dbObjectKinds: ["table"] },
+    });
+    managerState._schemaCacheMap.set("conn-1", { status: "loaded" });
+    managerState._schemaGenerationMap.set("conn-1", 7);
+    managerState._schemaExpandedScopeKeyMap.set(
+      "conn-1",
+      new Set(["connectionRoot"]),
+    );
+    managerState._connectionEpochMap.set("conn-1", 3);
+
     await expect(manager.removeConnection("conn-1")).resolves.toBe(true);
 
     expect(store.getConnections().map((connection) => connection.id)).toEqual([
@@ -1099,6 +1166,11 @@ describe("ConnectionManager", () => {
       "conn-2",
     ]);
     await expect(store.getSecret("conn-1")).resolves.toBeUndefined();
+    expect(managerState._driverStaticMetadataCache.has("conn-1")).toBe(false);
+    expect(managerState._schemaCacheMap.has("conn-1")).toBe(false);
+    expect(managerState._schemaGenerationMap.has("conn-1")).toBe(false);
+    expect(managerState._schemaExpandedScopeKeyMap.has("conn-1")).toBe(false);
+    expect(managerState._connectionEpochMap.get("conn-1")).toBe(4);
   });
 
   it("disconnects a failed test connection and returns a normalized error", async () => {
@@ -1248,6 +1320,85 @@ describe("ConnectionManager", () => {
     await expect(store.getSecret("conn-es-legacy")).resolves.toContain(
       "plaintext-key",
     );
+  });
+
+  it("redacts credential-bearing Mongo URI in persisted config and hydrates before connect", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await manager.saveConnection({
+      id: "conn-mongo-uri",
+      name: "Mongo With URI Secret",
+      type: "mongodb",
+      uri: "mongodb://db-user:db-pass@localhost:27017/app",
+      useSecretStorage: false,
+    });
+
+    const persisted = store
+      .getConnections()
+      .find((connection) => connection.id === "conn-mongo-uri");
+    expect(persisted).toMatchObject({
+      id: "conn-mongo-uri",
+      useSecretStorage: true,
+      uri: "mongodb://localhost:27017/app",
+    });
+
+    const secret = await store.getSecret("conn-mongo-uri");
+    expect(secret).toContain("mongodb://db-user:db-pass@localhost:27017/app");
+
+    await manager.connectTo("conn-mongo-uri");
+    expect(driverInstances[0]?.config).toMatchObject({
+      id: "conn-mongo-uri",
+      uri: "mongodb://db-user:db-pass@localhost:27017/app",
+    });
+  });
+
+  it("migrates plaintext credential-bearing connection URI to Secret Storage on connect", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-redis-legacy",
+        name: "Legacy Redis",
+        type: "redis",
+        connectionUri: "redis://user:pass@localhost:6379",
+        useSecretStorage: false,
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await manager.connectTo("conn-redis-legacy");
+
+    const persisted = store
+      .getConnections()
+      .find((connection) => connection.id === "conn-redis-legacy");
+    expect(persisted).toMatchObject({
+      id: "conn-redis-legacy",
+      useSecretStorage: true,
+      connectionUri: "redis://localhost:6379",
+    });
+
+    const secret = await store.getSecret("conn-redis-legacy");
+    expect(secret).toContain("redis://user:pass@localhost:6379");
+
+    expect(driverInstances[0]?.config).toMatchObject({
+      id: "conn-redis-legacy",
+      connectionUri: "redis://user:pass@localhost:6379",
+    });
   });
 
   it("disposes active drivers and rejects future manager operations", async () => {

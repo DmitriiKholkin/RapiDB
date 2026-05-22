@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
+import { REDIS_READ_BUDGET } from "../../src/shared/safetyContracts";
 
 function createDriver() {
   const driver = new RedisDriver({
@@ -151,6 +152,48 @@ describe("RedisDriver — disconnect()", () => {
 });
 
 describe("RedisDriver — metadata and pages", () => {
+  it("uses bounded scan COUNT for small finite insert-type discovery limits", async () => {
+    const driver = new RedisDriver({
+      id: "redis-insert-infer-scan-limit",
+      name: "Redis Insert Infer Scan Limit",
+      type: "redis",
+      host: "localhost",
+    });
+    const client = {
+      scan: vi.fn().mockResolvedValue({
+        cursor: "0",
+        keys: ["users:1", "users:2"],
+      }),
+      type: vi.fn().mockResolvedValue("list"),
+    };
+
+    (
+      driver as unknown as {
+        client: typeof client | null;
+        connected: boolean;
+      }
+    ).client = client;
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    await driver.buildMutationPreviewStatements(
+      "insert",
+      "db0",
+      "db0",
+      "users",
+      {
+        values: {
+          key: "users:3",
+          value: '["a","b"]',
+        },
+      },
+    );
+
+    expect(client.scan).toHaveBeenCalledWith("0", {
+      MATCH: "users:*",
+      COUNT: 25,
+    });
+  });
+
   it("lists logical databases and groups keys into table-like prefixes", async () => {
     const driver = new RedisDriver({
       id: "redis-metadata-test",
@@ -417,5 +460,40 @@ describe("RedisDriver — metadata and pages", () => {
       '{"id":"high-1","type":"payment","amount":999.99}',
       '{"id":"high-2","type":"alert","message":"System critical"}',
     ]);
+  });
+
+  it("caps key scans when discovering Redis objects", async () => {
+    const driver = new RedisDriver({
+      id: "redis-object-cap-test",
+      name: "Redis Object Cap Test",
+      type: "redis",
+      host: "localhost",
+    });
+
+    const keyBatch = Array.from(
+      { length: 250 },
+      (_value, index) => `ns:${index}`,
+    );
+    const client = {
+      scan: vi.fn().mockResolvedValue({
+        cursor: "1",
+        keys: keyBatch,
+      }),
+    };
+
+    (
+      driver as unknown as {
+        client: typeof client | null;
+        connected: boolean;
+      }
+    ).client = client;
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    await driver.listObjects();
+
+    const expectedCalls = Math.ceil(
+      REDIS_READ_BUDGET.maxScanKeys / keyBatch.length,
+    );
+    expect(client.scan).toHaveBeenCalledTimes(expectedCalls);
   });
 });

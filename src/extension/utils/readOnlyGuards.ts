@@ -64,6 +64,18 @@ const SQLITE_READ_ONLY_PRAGMAS = new Set([
   "wal_autocheckpoint",
 ]);
 
+const SQLITE_PRAGMA_ARGUMENT_SAFE_ALLOWLIST = new Set([
+  "foreign_key_check",
+  "foreign_key_list",
+  "index_info",
+  "index_xinfo",
+  "integrity_check",
+  "quick_check",
+  "table_info",
+  "table_list",
+  "table_xinfo",
+]);
+
 const DIALECT_ALLOWLISTS: Readonly<
   Partial<Record<QueryEditorSqlDialect, ReadonlySet<string>>>
 > = {
@@ -496,13 +508,29 @@ function isReadOnlySqlitePragma(statement: string, tokens: string[]): boolean {
     return false;
   }
 
-  const normalizedStatement = statement.toLowerCase();
+  const normalizedStatement = statement.toLowerCase().trim();
   if (normalizedStatement.includes("=")) {
     return false;
   }
 
   const pragmaName = tokens[1]?.toLowerCase();
-  return pragmaName ? SQLITE_READ_ONLY_PRAGMAS.has(pragmaName) : false;
+  if (!pragmaName || !SQLITE_READ_ONLY_PRAGMAS.has(pragmaName)) {
+    return false;
+  }
+
+  const hasPragmaArguments = new RegExp(
+    `^pragma\\s+(?:[a-z_][a-z0-9_]*\\.)?${pragmaName}\\s*\\(`,
+    "i",
+  ).test(normalizedStatement);
+
+  if (
+    hasPragmaArguments &&
+    !SQLITE_PRAGMA_ARGUMENT_SAFE_ALLOWLIST.has(pragmaName)
+  ) {
+    return false;
+  }
+
+  return true;
 }
 
 function isReadOnlyCteTokens(tokens: string[]): boolean {

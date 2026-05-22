@@ -1,4 +1,5 @@
 import { Client } from "@elastic/elasticsearch";
+import { ELASTICSEARCH_READ_BUDGET } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import {
@@ -650,12 +651,15 @@ export class ElasticsearchDriver implements IDBDriver {
       thirdSegment === undefined &&
       secondSegment === "_search"
     ) {
-      const response = await client.search({
-        index: firstSegment,
-        ...queryParams,
-        ...this.readObjectBody(command, `${command.method} ${command.path}`, {
+      const body = this.enforceSearchRequestHardCap(
+        this.readObjectBody(command, `${command.method} ${command.path}`, {
           allowEmpty: true,
         }),
+      );
+      const response = await client.search({
+        index: firstSegment,
+        ...this.enforceSearchQueryParamsHardCap(queryParams),
+        ...body,
       } as never);
       const rows = this.hitsToRows(
         response.hits.hits as unknown as Array<Record<string, unknown>>,
@@ -668,11 +672,14 @@ export class ElasticsearchDriver implements IDBDriver {
       command.pathSegments.length === 1 &&
       firstSegment === "_search"
     ) {
-      const response = await client.search({
-        ...queryParams,
-        ...this.readObjectBody(command, `${command.method} ${command.path}`, {
+      const body = this.enforceSearchRequestHardCap(
+        this.readObjectBody(command, `${command.method} ${command.path}`, {
           allowEmpty: true,
         }),
+      );
+      const response = await client.search({
+        ...this.enforceSearchQueryParamsHardCap(queryParams),
+        ...body,
       } as never);
       const rows = this.hitsToRows(
         response.hits.hits as unknown as Array<Record<string, unknown>>,
@@ -1626,7 +1633,7 @@ export class ElasticsearchDriver implements IDBDriver {
     try {
       const response = await this.requireClient().search({
         index,
-        size,
+        size: this.clampSearchSize(size),
         query: { match_all: {} },
         sort: ["_doc"],
       });
@@ -1688,5 +1695,45 @@ export class ElasticsearchDriver implements IDBDriver {
         ]),
       ),
     );
+  }
+
+  private enforceSearchQueryParamsHardCap(
+    queryParams: Record<string, unknown>,
+  ): Record<string, unknown> {
+    if (!Object.hasOwn(queryParams, "size")) {
+      return queryParams;
+    }
+
+    return {
+      ...queryParams,
+      size: this.clampSearchSize(queryParams.size),
+    };
+  }
+
+  private enforceSearchRequestHardCap(
+    body: Record<string, unknown>,
+  ): Record<string, unknown> {
+    if (!Object.hasOwn(body, "size")) {
+      return body;
+    }
+
+    return {
+      ...body,
+      size: this.clampSearchSize(body.size),
+    };
+  }
+
+  private clampSearchSize(value: unknown): number {
+    const fallback = ELASTICSEARCH_READ_BUDGET.hardCap;
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      return fallback;
+    }
+
+    const normalized = Math.trunc(value);
+    if (normalized < 1) {
+      return 1;
+    }
+
+    return Math.min(normalized, ELASTICSEARCH_READ_BUDGET.hardCap);
   }
 }

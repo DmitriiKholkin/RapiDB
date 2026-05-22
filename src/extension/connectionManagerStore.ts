@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { QUERY_LIMIT_POLICY } from "../shared/safetyContracts";
 import type {
   BookmarkEntry,
   ConnectionConfig,
@@ -115,8 +116,8 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
   getQueryRowLimit(): number {
     const raw = vscode.workspace
       .getConfiguration("rapidb")
-      .get<number>("queryRowLimit", 10000);
-    return Math.max(100, Math.min(100000, Math.round(raw)));
+      .get<number>("queryRowLimit", 1000);
+    return Math.max(100, Math.min(QUERY_LIMIT_POLICY.hardCap, Math.round(raw)));
   }
 
   getTimeoutSettings(): DriverTimeoutSettingsSnapshot {

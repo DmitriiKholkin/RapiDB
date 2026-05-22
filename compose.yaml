@@ -1498,9 +1498,9 @@ services:
            NULL,10);
         GO
 
-        -- bulk 50 000 rows
+        -- bulk 500 000 rows
         ;WITH bulk_rows AS (
-          SELECT TOP 50000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+          SELECT TOP 500000 ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
           FROM sys.all_objects a CROSS JOIN sys.all_objects b
         )
         INSERT INTO mssql_master (

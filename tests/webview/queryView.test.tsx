@@ -1,6 +1,7 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { QUERY_LIMIT_POLICY } from "../../src/shared/safetyContracts";
 
 const formatMock = vi.hoisted(() => vi.fn((_dialect?: string) => null));
 
@@ -569,6 +570,52 @@ describe("QueryView", () => {
 
     await waitFor(() => {
       expect((bookmarkButton as HTMLButtonElement).disabled).toBe(false);
+    });
+  });
+
+  it("caps oversized query results in webview state as a defensive fallback", async () => {
+    const hardCap = QUERY_LIMIT_POLICY.hardCap;
+
+    render(
+      <QueryView
+        connectionId="conn-1"
+        initialQueryText="select 1"
+        editorPresentation={{
+          editorLanguage: "sql",
+          sqlDialect: "postgresql",
+        }}
+      />,
+    );
+
+    dispatchIncomingMessage("connections", [
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        editorPresentation: {
+          editorLanguage: "sql",
+          sqlDialect: "postgresql",
+        },
+      },
+    ]);
+
+    const oversizedRows = Array.from({ length: hardCap + 2 }, (_, index) => ({
+      __col_0: index,
+    }));
+
+    dispatchIncomingMessage("queryResult", {
+      columns: ["n"],
+      columnMeta: [],
+      rows: oversizedRows,
+      rowCount: oversizedRows.length,
+      executionTimeMs: 1,
+    });
+
+    await waitFor(() => {
+      const result = useQueryStore.getState().result;
+      expect(result?.rows.length).toBe(hardCap);
+      expect(result?.truncated).toBe(true);
+      expect(result?.truncatedAt).toBe(hardCap);
     });
   });
 

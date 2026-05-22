@@ -1,5 +1,7 @@
 import { createClient } from "redis";
+import { REDIS_READ_BUDGET } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
+import { pMapWithLimit } from "../utils/concurrency";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import {
   applyFilters,
@@ -411,7 +413,10 @@ export class RedisDriver implements IDBDriver {
 
   async listObjects(): Promise<TableInfo[]> {
     try {
-      const keys = await this.scanKeys(this.prefixedPattern("*"));
+      const keys = await this.scanKeys(
+        this.prefixedPattern("*"),
+        REDIS_READ_BUDGET.maxScanKeys,
+      );
       const names = new Set<string>();
       for (const key of keys) {
         const logicalKey = this.stripKeyPrefix(key);
@@ -856,44 +861,51 @@ export class RedisDriver implements IDBDriver {
   ): Promise<RedisSampleRow[]> {
     try {
       const pattern = table === "default" ? "*" : `${table}:*`;
-      const keys = (await this.scanKeys(this.prefixedPattern(pattern), maxRows))
-        .slice(0, maxRows)
+      const readLimit = Math.min(maxRows, REDIS_READ_BUDGET.maxValueReads);
+      const keys = (
+        await this.scanKeys(this.prefixedPattern(pattern), readLimit)
+      )
+        .slice(0, readLimit)
         .sort((left, right) => left.localeCompare(right));
-      const rows: RedisSampleRow[] = [];
-      for (const key of keys) {
-        const type = await this.requireClient().type(key);
-        let value: unknown = null;
-        switch (type) {
-          case "string":
-            value = await this.requireClient().get(key);
-            break;
-          case "hash":
-            value = await this.requireClient().hGetAll(key);
-            break;
-          case "list":
-            value = await this.requireClient().lRange(key, 0, -1);
-            break;
-          case "set":
-            value = await this.requireClient().sMembers(key);
-            break;
-          case "zset":
-            value = await this.requireClient().zRangeWithScores(key, 0, -1);
-            break;
-          case "stream":
-            value = await this.readStreamEntries(key);
-            break;
-          default:
-            value = null;
-        }
-        rows.push({
-          redisType: type,
-          row: flattenRootRecord({
-            key: this.stripKeyPrefix(key),
-            value,
-          }),
-        });
-      }
-      return rows;
+      return await pMapWithLimit(
+        keys,
+        REDIS_READ_BUDGET.parallelValueReads,
+        async (key) => {
+          const client = this.requireClient();
+          const type = await client.type(key);
+          let value: unknown = null;
+          switch (type) {
+            case "string":
+              value = await client.get(key);
+              break;
+            case "hash":
+              value = await client.hGetAll(key);
+              break;
+            case "list":
+              value = await client.lRange(key, 0, -1);
+              break;
+            case "set":
+              value = await client.sMembers(key);
+              break;
+            case "zset":
+              value = await client.zRangeWithScores(key, 0, -1);
+              break;
+            case "stream":
+              value = await this.readStreamEntries(key);
+              break;
+            default:
+              value = null;
+          }
+
+          return {
+            redisType: type,
+            row: flattenRootRecord({
+              key: this.stripKeyPrefix(key),
+              value,
+            }),
+          };
+        },
+      );
     } catch {
       return [];
     }
@@ -1176,7 +1188,7 @@ export class RedisDriver implements IDBDriver {
     let cursor = "0";
     do {
       const count = Number.isFinite(limit)
-        ? Math.min(500, Math.max(100, limit - keys.length))
+        ? Math.min(500, Math.max(1, limit - keys.length))
         : 500;
       const response = await client.scan(cursor, {
         MATCH: pattern,

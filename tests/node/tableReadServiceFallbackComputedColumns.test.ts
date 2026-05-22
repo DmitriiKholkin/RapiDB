@@ -202,4 +202,152 @@ describe("TableReadService arithmetic overflow handling", () => {
       { id: 52, calc: 100 },
     ]);
   });
+
+  it("uses keyset-first export for fallback SQL reads to avoid duplicates under concurrent inserts", async () => {
+    const keysetColumns: ColumnTypeMeta[] = [
+      {
+        name: "id",
+        type: "int",
+        nativeType: "int",
+        category: "integer",
+        nullable: false,
+        isPrimaryKey: true,
+        primaryKeyOrdinal: 1,
+        isForeignKey: false,
+        filterable: true,
+        filterOperators: ["eq", "gt", "gte", "lt", "lte", "in"],
+        valueSemantics: "plain",
+      },
+    ];
+    const dataset = [1, 2, 3, 4, 5].map((id) => ({ id }));
+    let dataQueryCount = 0;
+
+    const buildPagination = vi.fn((offset: number, limit: number) => ({
+      sql: "LIMIT ? OFFSET ?",
+      params: [limit, offset],
+    }));
+
+    const query = vi.fn(async (_sql: string, params: unknown[] = []) => {
+      dataQueryCount += 1;
+      if (dataQueryCount === 2) {
+        dataset.unshift({ id: 0 });
+      }
+
+      const limit = Number(params[params.length - 2] ?? 2);
+      const cursorId = params.length > 2 ? Number(params[0]) : undefined;
+      const rows = dataset
+        .filter((row) => (cursorId === undefined ? true : row.id > cursorId))
+        .slice(0, limit)
+        .map((row) => ({ __col_0: row.id }));
+      return {
+        columns: ["id"],
+        rows,
+        rowCount: rows.length,
+        executionTimeMs: 1,
+      };
+    });
+
+    const driver = {
+      qualifiedTableName: vi.fn(() => "tbl"),
+      describeColumns: vi.fn().mockResolvedValue(keysetColumns),
+      buildOrderByDefault: vi.fn(() => "ORDER BY id ASC"),
+      buildPagination,
+      query,
+      quoteIdentifier: vi.fn((name: string) => name),
+      formatOutputValue: vi.fn((value: unknown) => value),
+      buildFilterCondition: vi.fn(
+        (column: ColumnTypeMeta, operator: string, value: unknown) => ({
+          sql: `${column.name} ${operator === "eq" ? "=" : ">"} ?`,
+          params: [value],
+        }),
+      ),
+      normalizeFilterValue: vi.fn(),
+    };
+
+    const connectionManager = {
+      getConnection: vi.fn(() => ({ id: "c1" })),
+      getDriver: vi.fn(() => driver),
+    };
+
+    const service = new TableReadService(connectionManager as never);
+    const exportedIds: number[] = [];
+    for await (const chunk of service.exportAll("c1", "db", "dbo", "t", 2)) {
+      for (const row of chunk.rows) {
+        exportedIds.push(Number(row.id));
+      }
+    }
+
+    expect(exportedIds).toEqual([1, 2, 3, 4, 5]);
+    expect(new Set(exportedIds).size).toBe(exportedIds.length);
+    expect(buildPagination).toHaveBeenCalled();
+    for (const [offset] of buildPagination.mock.calls) {
+      expect(offset).toBe(0);
+    }
+  });
+
+  it("falls back to offset export when keyset ordering is unavailable", async () => {
+    const nonKeysetColumns: ColumnTypeMeta[] = [
+      {
+        name: "name",
+        type: "text",
+        nativeType: "text",
+        category: "text",
+        nullable: true,
+        isPrimaryKey: false,
+        isForeignKey: false,
+        filterable: true,
+        filterOperators: ["eq", "like"],
+        valueSemantics: "plain",
+      },
+    ];
+    const dataset = ["a", "b", "c", "d", "e"];
+
+    const buildPagination = vi.fn((offset: number, limit: number) => ({
+      sql: "OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
+      params: [offset, limit],
+    }));
+    const query = vi.fn(async (_sql: string, params: unknown[] = []) => {
+      const offset = Number(params[0] ?? 0);
+      const limit = Number(params[1] ?? 2);
+      const rows = dataset
+        .slice(offset, offset + limit)
+        .map((value) => ({ __col_0: value }));
+      return {
+        columns: ["name"],
+        rows,
+        rowCount: rows.length,
+        executionTimeMs: 1,
+      };
+    });
+
+    const driver = {
+      qualifiedTableName: vi.fn(() => "tbl"),
+      describeColumns: vi.fn().mockResolvedValue(nonKeysetColumns),
+      buildOrderByDefault: vi.fn(() => "ORDER BY name ASC"),
+      buildPagination,
+      query,
+      quoteIdentifier: vi.fn((name: string) => name),
+      formatOutputValue: vi.fn((value: unknown) => value),
+      buildFilterCondition: vi.fn(),
+      normalizeFilterValue: vi.fn(),
+    };
+
+    const connectionManager = {
+      getConnection: vi.fn(() => ({ id: "c1" })),
+      getDriver: vi.fn(() => driver),
+    };
+
+    const service = new TableReadService(connectionManager as never);
+    const exported: string[] = [];
+    for await (const chunk of service.exportAll("c1", "db", "dbo", "t", 2)) {
+      for (const row of chunk.rows) {
+        exported.push(String(row.name));
+      }
+    }
+
+    expect(exported).toEqual(dataset);
+    expect(
+      buildPagination.mock.calls.some(([offset]) => Number(offset) > 0),
+    ).toBe(true);
+  });
 });

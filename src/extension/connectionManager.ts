@@ -637,6 +637,8 @@ interface ConnectionSecretSnapshot {
   awsAccessKeyId?: string;
   awsSecretAccessKey?: string;
   awsSessionToken?: string;
+  connectionUri?: string;
+  uri?: string;
 }
 
 function trimOptionalSecretValue(
@@ -648,6 +650,52 @@ function trimOptionalSecretValue(
 
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function redactCredentialBearingUri(uri: string): string {
+  return uri.replace(/^([a-z][a-z\d+.-]*:\/\/)([^@/?#\s]+)@/i, "$1");
+}
+
+function extractCredentialBearingUriSecret(
+  value: string | undefined,
+): string | undefined {
+  const normalized = trimOptionalSecretValue(value);
+  if (!normalized) {
+    return undefined;
+  }
+
+  return redactCredentialBearingUri(normalized) !== normalized
+    ? normalized
+    : undefined;
+}
+
+function sanitizeUriForPersistence(
+  value: string | undefined,
+): string | undefined {
+  const normalized = trimOptionalSecretValue(value);
+  if (!normalized) {
+    return normalized;
+  }
+
+  return redactCredentialBearingUri(normalized);
+}
+
+function resolvePersistedUriSecret(
+  currentValue: string | undefined,
+  previousSecret: string | undefined,
+): string | undefined {
+  const explicitSecret = extractCredentialBearingUriSecret(currentValue);
+  if (explicitSecret) {
+    return explicitSecret;
+  }
+
+  const normalizedCurrent = trimOptionalSecretValue(currentValue);
+  if (!normalizedCurrent || !previousSecret) {
+    return undefined;
+  }
+
+  const previousRedacted = sanitizeUriForPersistence(previousSecret);
+  return previousRedacted === normalizedCurrent ? previousSecret : undefined;
 }
 
 function serializeConnectionSecrets(
@@ -666,6 +714,8 @@ function shouldForceSecretStorage(config: ConnectionConfig): boolean {
   return (
     config.type === "dynamodb" ||
     config.type === "elasticsearch" ||
+    extractCredentialBearingUriSecret(config.connectionUri) !== undefined ||
+    extractCredentialBearingUriSecret(config.uri) !== undefined ||
     trimOptionalSecretValue(config.password) !== undefined ||
     trimOptionalSecretValue(config.apiKey) !== undefined ||
     trimOptionalSecretValue(config.awsAccessKeyId) !== undefined ||
@@ -677,25 +727,35 @@ function shouldForceSecretStorage(config: ConnectionConfig): boolean {
 
 function extractConnectionSecrets(
   config: ConnectionConfig,
+  previousSecrets?: ConnectionSecretSnapshot,
 ): ConnectionSecretSnapshot {
   return {
-    password: trimOptionalSecretValue(config.password),
+    password:
+      trimOptionalSecretValue(config.password) ?? previousSecrets?.password,
     apiKey:
       config.type === "elasticsearch"
-        ? trimOptionalSecretValue(config.apiKey)
+        ? (trimOptionalSecretValue(config.apiKey) ?? previousSecrets?.apiKey)
         : undefined,
     awsAccessKeyId:
       config.type === "dynamodb"
-        ? trimOptionalSecretValue(config.awsAccessKeyId)
+        ? (trimOptionalSecretValue(config.awsAccessKeyId) ??
+          previousSecrets?.awsAccessKeyId)
         : undefined,
     awsSecretAccessKey:
       config.type === "dynamodb"
-        ? trimOptionalSecretValue(config.awsSecretAccessKey)
+        ? (trimOptionalSecretValue(config.awsSecretAccessKey) ??
+          previousSecrets?.awsSecretAccessKey)
         : undefined,
     awsSessionToken:
       config.type === "dynamodb"
-        ? trimOptionalSecretValue(config.awsSessionToken)
+        ? (trimOptionalSecretValue(config.awsSessionToken) ??
+          previousSecrets?.awsSessionToken)
         : undefined,
+    connectionUri: resolvePersistedUriSecret(
+      config.connectionUri,
+      previousSecrets?.connectionUri,
+    ),
+    uri: resolvePersistedUriSecret(config.uri, previousSecrets?.uri),
   };
 }
 
@@ -712,11 +772,15 @@ function sanitizePersistedConnectionConfig(
     awsAccessKeyId: _awsAccessKeyId,
     awsSecretAccessKey: _awsSecretAccessKey,
     awsSessionToken: _awsSessionToken,
+    connectionUri: rawConnectionUri,
+    uri: rawUri,
     ...rest
   } = config;
 
   return {
     ...rest,
+    connectionUri: sanitizeUriForPersistence(rawConnectionUri),
+    uri: sanitizeUriForPersistence(rawUri),
     useSecretStorage: true,
   };
 }
@@ -846,11 +910,20 @@ export class ConnectionManager
       return;
     }
 
+    const previousSecretSnapshot = await this.store.getSecret(config.id);
     const serializedSecrets = serializeConnectionSecrets(
-      extractConnectionSecrets(config),
+      extractConnectionSecrets(
+        config,
+        this.parseStoredSecrets(previousSecretSnapshot),
+      ),
     );
 
+    if (serializedSecrets === previousSecretSnapshot) {
+      return;
+    }
+
     if (!serializedSecrets) {
+      await this.store.deleteSecret(config.id);
       return;
     }
 
@@ -871,7 +944,9 @@ export class ConnectionManager
       persisted.apiKey !== config.apiKey ||
       persisted.awsAccessKeyId !== config.awsAccessKeyId ||
       persisted.awsSecretAccessKey !== config.awsSecretAccessKey ||
-      persisted.awsSessionToken !== config.awsSessionToken;
+      persisted.awsSessionToken !== config.awsSessionToken ||
+      persisted.connectionUri !== config.connectionUri ||
+      persisted.uri !== config.uri;
 
     await this._persistConnectionSecretsIfNeeded(config);
 
@@ -908,7 +983,9 @@ export class ConnectionManager
         persisted.apiKey !== connection.apiKey ||
         persisted.awsAccessKeyId !== connection.awsAccessKeyId ||
         persisted.awsSecretAccessKey !== connection.awsSecretAccessKey ||
-        persisted.awsSessionToken !== connection.awsSessionToken
+        persisted.awsSessionToken !== connection.awsSessionToken ||
+        persisted.connectionUri !== connection.connectionUri ||
+        persisted.uri !== connection.uri
       ) {
         const index = storedConnections.findIndex(
           (item) => item.id === connection.id,
@@ -989,9 +1066,7 @@ export class ConnectionManager
       return false;
     }
     this.invalidateDriverStaticMetadata(id);
-    if (this.driverMap.has(id)) {
-      await this.disconnectFrom(id);
-    }
+    await this.disconnectFrom(id);
     await this.saveConnections(
       this.getConnections().filter((c) => c.id !== id),
     );
@@ -1010,6 +1085,8 @@ export class ConnectionManager
     awsAccessKeyId?: string;
     awsSecretAccessKey?: string;
     awsSessionToken?: string;
+    connectionUri?: string;
+    uri?: string;
   } {
     if (!value) {
       return {};
@@ -1034,6 +1111,11 @@ export class ConnectionManager
             typeof parsed.awsSessionToken === "string"
               ? parsed.awsSessionToken
               : undefined,
+          connectionUri:
+            typeof parsed.connectionUri === "string"
+              ? parsed.connectionUri
+              : undefined,
+          uri: typeof parsed.uri === "string" ? parsed.uri : undefined,
         };
       }
     } catch {}
@@ -1056,6 +1138,8 @@ export class ConnectionManager
         awsSecretAccessKey:
           secrets.awsSecretAccessKey ?? config.awsSecretAccessKey,
         awsSessionToken: secrets.awsSessionToken ?? config.awsSessionToken,
+        connectionUri: secrets.connectionUri ?? config.connectionUri,
+        uri: secrets.uri ?? config.uri,
       };
     } catch {
       return { ...config, password: "" };
@@ -1206,6 +1290,8 @@ export class ConnectionManager
   }
   async disconnectFrom(id: string): Promise<void> {
     this._nextConnectionEpoch(id);
+    const hadDriver = this.driverMap.has(id);
+    const hadPendingConnect = this._connectingMap.has(id);
     this._connectingMap.delete(id);
 
     const driver = this.driverMap.get(id);
@@ -1213,9 +1299,11 @@ export class ConnectionManager
       try {
         await driver.disconnect();
       } catch {}
-      this.driverMap.delete(id);
-      this.invalidateDriverStaticMetadata(id);
-      this._invalidateSchemaState(id);
+    }
+
+    this._cleanupConnectionRuntimeState(id);
+
+    if (hadDriver || hadPendingConnect) {
       this._onDidDisconnect.fire(id);
     }
   }
@@ -1675,6 +1763,18 @@ export class ConnectionManager
       this._getSchemaGeneration(connectionId) + 1,
     );
     this._schemaCacheMap.delete(connectionId);
+    this._onDidChangeSchemaState.fire(connectionId);
+  }
+
+  private _cleanupConnectionRuntimeState(connectionId: string): void {
+    this.driverMap.delete(connectionId);
+    this._connectingMap.delete(connectionId);
+    this.invalidateDriverStaticMetadata(connectionId);
+    this._schemaCacheMap.delete(connectionId);
+    this._schemaGenerationMap.delete(connectionId);
+    this._schemaExpandedScopeKeyMap.delete(connectionId);
+    // Keep epoch fences to ensure stale in-flight connect attempts remain stale
+    // even if a fresh connect starts immediately after disconnect.
     this._onDidChangeSchemaState.fire(connectionId);
   }
 

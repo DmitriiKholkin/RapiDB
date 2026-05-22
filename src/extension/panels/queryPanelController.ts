@@ -1,4 +1,11 @@
 import * as vscode from "vscode";
+import type { ConnectionType } from "../../shared/connectionTypes";
+import {
+  type OperationCancellationContext,
+  QUERY_LIMIT_POLICY,
+  type QueryExecutionCancellationHandle,
+  type SqlHardCapRewriteDecision,
+} from "../../shared/safetyContracts";
 import { parseQueryPanelMessage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import type { QueryColumnMeta } from "../dbDrivers/types";
@@ -9,6 +16,108 @@ import {
 } from "../utils/exportService";
 import { formatQueryResult } from "../utils/queryResultFormatting";
 import { decideReadOnlyQueryExecution } from "../utils/readOnlyGuards";
+
+const SQL_CONNECTION_TYPES = new Set<ConnectionType>([
+  "pg",
+  "mysql",
+  "sqlite",
+  "mssql",
+  "oracle",
+]);
+
+const LIMITABLE_QUERY_PREFIX = /^\s*(with|select|values)\b/i;
+const WITH_QUERY_PREFIX = /^\s*with\b/i;
+
+function trimTrailingSemicolons(queryText: string): string {
+  return queryText.replace(/[\s;]+$/g, "");
+}
+
+function stripLeadingSqlComments(queryText: string): string {
+  let cursor = queryText;
+
+  while (cursor.length > 0) {
+    const trimmed = cursor.trimStart();
+    if (trimmed.startsWith("--")) {
+      const nextLineBreak = trimmed.indexOf("\n");
+      cursor = nextLineBreak >= 0 ? trimmed.slice(nextLineBreak + 1) : "";
+      continue;
+    }
+
+    if (trimmed.startsWith("/*")) {
+      const blockEnd = trimmed.indexOf("*/", 2);
+      if (blockEnd < 0) {
+        return "";
+      }
+      cursor = trimmed.slice(blockEnd + 2);
+      continue;
+    }
+
+    return trimmed;
+  }
+
+  return "";
+}
+
+function applyHardCapToSqlQuery(
+  queryText: string,
+  connectionType: ConnectionType | undefined,
+  hardCap: number,
+): { queryText: string; decision: SqlHardCapRewriteDecision } {
+  if (!connectionType || !SQL_CONNECTION_TYPES.has(connectionType)) {
+    return {
+      queryText,
+      decision: { applied: false, reason: "unsupported_connection" },
+    };
+  }
+
+  const normalizedQuery = trimTrailingSemicolons(queryText);
+  if (!normalizedQuery) {
+    return {
+      queryText,
+      decision: { applied: false, reason: "non_limitable_statement" },
+    };
+  }
+
+  const classificationQuery = stripLeadingSqlComments(normalizedQuery);
+  if (!classificationQuery) {
+    return {
+      queryText,
+      decision: { applied: false, reason: "non_limitable_statement" },
+    };
+  }
+
+  if (WITH_QUERY_PREFIX.test(classificationQuery)) {
+    return {
+      queryText,
+      decision: { applied: false, reason: "unsafe_with_clause" },
+    };
+  }
+
+  if (!LIMITABLE_QUERY_PREFIX.test(classificationQuery)) {
+    return {
+      queryText,
+      decision: { applied: false, reason: "non_limitable_statement" },
+    };
+  }
+
+  switch (connectionType) {
+    case "mssql":
+      return {
+        queryText: `SELECT TOP (${hardCap}) * FROM (${normalizedQuery}) AS [rapidb_query_cap]`,
+        decision: { applied: true },
+      };
+    case "oracle":
+      return {
+        queryText: `SELECT * FROM (${normalizedQuery}) rapidb_query_cap FETCH FIRST ${hardCap} ROWS ONLY`,
+        decision: { applied: true },
+      };
+    default:
+      return {
+        queryText: `SELECT * FROM (${normalizedQuery}) AS rapidb_query_cap LIMIT ${hardCap}`,
+        decision: { applied: true },
+      };
+  }
+}
 
 export interface QueryPanelCachedResult {
   columns: string[];
@@ -27,6 +136,12 @@ interface QueryPanelView {
 }
 
 export class QueryPanelController {
+  private schemaRequestToken = 0;
+
+  private queryRequestToken = 0;
+
+  private activeQueryExecution: QueryExecutionCancellationHandle | null = null;
+
   constructor(
     private readonly connectionManager: ConnectionManager,
     private readonly view: QueryPanelView,
@@ -134,42 +249,88 @@ export class QueryPanelController {
     }
 
     const connectionId = this.resolveConnectionId(connectionIdOverride);
+    const requestToken = ++this.queryRequestToken;
+    await this.cancelSupersededQueryExecution(requestToken);
     const readOnlyDecision = decideReadOnlyQueryExecution(
       this.connectionManager,
       connectionId,
       queryText,
     );
     if (!readOnlyDecision.allowed) {
-      this.postQueryError(readOnlyDecision.reason);
+      this.postQueryError(readOnlyDecision.reason, requestToken);
       return;
     }
+
+    if (!this.isCurrentQueryRequest(requestToken)) {
+      return;
+    }
+
+    const managerWithConnections = this
+      .connectionManager as ConnectionManager & {
+      getConnection?: (id: string) => { type?: ConnectionType } | undefined;
+    };
+    const connectionType =
+      managerWithConnections.getConnection?.(connectionId)?.type;
+    const effectiveRowLimit = Math.min(
+      this.connectionManager.getQueryRowLimit(),
+      QUERY_LIMIT_POLICY.hardCap,
+    );
+    const rewrite = applyHardCapToSqlQuery(
+      queryText,
+      connectionType,
+      effectiveRowLimit,
+    );
+    const cappedQueryText = rewrite.queryText;
 
     if (!this.connectionManager.isConnected(connectionId)) {
       try {
         await this.connectionManager.connectTo(connectionId);
       } catch (error: unknown) {
         const normalized = normalizeUnknownError(error);
-        this.postQueryError(`Cannot connect: ${normalized.message}`);
+        this.postQueryError(
+          `Cannot connect: ${normalized.message}`,
+          requestToken,
+        );
         return;
       }
+    }
+
+    if (!this.isCurrentQueryRequest(requestToken)) {
+      return;
     }
 
     const driver = this.connectionManager.getDriver(connectionId);
     if (!driver) {
       this.postQueryError(
         `[RapiDB] Cannot execute query: driver is unavailable for ${connectionId}.`,
+        requestToken,
       );
       return;
     }
 
-    await this.connectionManager.addToHistory(connectionId, queryText);
+    this.activeQueryExecution = this.createQueryExecutionHandle(
+      connectionId,
+      requestToken,
+      driver,
+    );
+
+    if (!this.isCurrentQueryRequest(requestToken)) {
+      return;
+    }
+
+    // History persistence must not block query execution.
+    void this.connectionManager
+      .addToHistory(connectionId, queryText)
+      .catch((error) => {
+        console.error("[RapiDB] Failed to save query history:", error);
+      });
 
     try {
-      const result = await driver.query(queryText);
-      const formattedResult = formatQueryResult(
-        result,
-        this.connectionManager.getQueryRowLimit(),
-      );
+      const result = await driver.query(cappedQueryText);
+      if (!this.isCurrentQueryRequest(requestToken)) {
+        return;
+      }
+      const formattedResult = formatQueryResult(result, effectiveRowLimit);
 
       this.view.setLastQueryResult({
         columns: formattedResult.columns,
@@ -182,7 +343,76 @@ export class QueryPanelController {
       });
     } catch (error: unknown) {
       const normalized = normalizeUnknownError(error);
-      this.postQueryError(normalized.message);
+      this.postQueryError(normalized.message, requestToken);
+    } finally {
+      if (this.activeQueryExecution?.requestToken === requestToken) {
+        this.activeQueryExecution = null;
+      }
+    }
+  }
+
+  private createQueryExecutionHandle(
+    connectionId: string,
+    requestToken: number,
+    driver: {
+      query: (queryText: string) => Promise<unknown>;
+      cancelCurrentOperation?: (
+        context?: OperationCancellationContext,
+      ) => void | Promise<void>;
+    },
+  ): QueryExecutionCancellationHandle {
+    const cancelCurrentOperation = driver.cancelCurrentOperation;
+    const supportsCancellation = typeof cancelCurrentOperation === "function";
+
+    return {
+      requestToken,
+      connectionId,
+      operationName: "query",
+      supportsCancellation,
+      cancel: async (context: OperationCancellationContext) => {
+        if (!supportsCancellation) {
+          return;
+        }
+
+        await cancelCurrentOperation({
+          ...context,
+          operationName: "query",
+          connectionId,
+          requestToken,
+        });
+      },
+    };
+  }
+
+  private async cancelSupersededQueryExecution(
+    supersededByRequestToken: number,
+  ): Promise<void> {
+    const previous = this.activeQueryExecution;
+    if (!previous) {
+      return;
+    }
+
+    this.activeQueryExecution = null;
+    if (!previous.supportsCancellation) {
+      console.warn(
+        `[RapiDB] Query cancellation is not supported for connection ${previous.connectionId}; superseded request ${previous.requestToken} may continue executing in the backend.`,
+      );
+      return;
+    }
+
+    try {
+      await previous.cancel({
+        reason: "superseded",
+        operationName: previous.operationName,
+        connectionId: previous.connectionId,
+        requestToken: previous.requestToken,
+        supersededByRequestToken,
+      });
+    } catch (error) {
+      console.error(
+        "[RapiDB] Failed to cancel superseded query execution:",
+        error,
+      );
     }
   }
 
@@ -208,9 +438,13 @@ export class QueryPanelController {
   }
 
   private async pushSchema(connectionIdOverride?: string): Promise<void> {
+    const requestToken = ++this.schemaRequestToken;
     const connectionId = this.resolveConnectionId(connectionIdOverride);
 
     if (!this.connectionManager.isConnected(connectionId)) {
+      if (!this.isCurrentSchemaRequest(requestToken)) {
+        return;
+      }
       this.view.postMessage({
         type: "schema",
         payload: { connectionId, schema: [] },
@@ -218,14 +452,42 @@ export class QueryPanelController {
       return;
     }
 
-    const schema = await this.connectionManager.getSchemaAsync(connectionId);
-    this.view.postMessage({
-      type: "schema",
-      payload: { connectionId, schema },
-    });
+    try {
+      const schema = await this.connectionManager.getSchemaAsync(connectionId);
+      if (!this.isCurrentSchemaRequest(requestToken)) {
+        return;
+      }
+      this.view.postMessage({
+        type: "schema",
+        payload: { connectionId, schema },
+      });
+    } catch (error: unknown) {
+      if (!this.isCurrentSchemaRequest(requestToken)) {
+        return;
+      }
+      console.error("[RapiDB] Failed to load schema:", error);
+      this.view.postMessage({
+        type: "schema",
+        payload: { connectionId, schema: [] },
+      });
+    }
   }
 
-  private postQueryError(error: string): void {
+  private isCurrentSchemaRequest(requestToken: number): boolean {
+    return requestToken === this.schemaRequestToken;
+  }
+
+  private isCurrentQueryRequest(requestToken: number): boolean {
+    return requestToken === this.queryRequestToken;
+  }
+
+  private postQueryError(error: string, requestToken?: number): void {
+    if (
+      requestToken !== undefined &&
+      !this.isCurrentQueryRequest(requestToken)
+    ) {
+      return;
+    }
     this.view.postMessage({
       type: "queryResult",
       payload: {

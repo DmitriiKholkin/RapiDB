@@ -197,6 +197,85 @@ describe("driver timeout helpers", () => {
     );
   });
 
+  it("waits for timeout cleanup hooks before surfacing timeout errors", async () => {
+    vi.useFakeTimers();
+
+    const deferred = createDeferred<string[]>();
+    const cleanupStarted = vi.fn();
+    const cleanupFinished = vi.fn();
+    const driver = createTimeoutAwareDriver(
+      {
+        async connect(): Promise<void> {},
+        async listDatabases(): Promise<string[]> {
+          return deferred.promise;
+        },
+        async cancelCurrentOperation(): Promise<void> {
+          cleanupStarted();
+          await Promise.resolve();
+          cleanupFinished();
+        },
+        quoteIdentifier(name: string): string {
+          return name;
+        },
+      },
+      () => ({
+        connectionTimeoutSeconds: 15,
+        dbOperationTimeoutSeconds: 1,
+        connectionTimeoutMs: 15000,
+        dbOperationTimeoutMs: 25,
+      }),
+    );
+
+    const pending = driver.listDatabases();
+    const assertion =
+      expect(pending).rejects.toBeInstanceOf(DriverTimeoutError);
+
+    await vi.advanceTimersByTimeAsync(25);
+    expect(cleanupStarted).toHaveBeenCalledTimes(1);
+
+    await assertion;
+    expect(cleanupFinished).toHaveBeenCalledTimes(1);
+  });
+
+  it("recycles connection again when a timed-out operation settles late", async () => {
+    vi.useFakeTimers();
+
+    const deferred = createDeferred<string[]>();
+    const recycleConnectionAfterTimeout = vi.fn();
+    const driver = createTimeoutAwareDriver(
+      {
+        async connect(): Promise<void> {},
+        async listDatabases(): Promise<string[]> {
+          return deferred.promise;
+        },
+        async recycleConnectionAfterTimeout(): Promise<void> {
+          recycleConnectionAfterTimeout();
+        },
+        quoteIdentifier(name: string): string {
+          return name;
+        },
+      },
+      () => ({
+        connectionTimeoutSeconds: 15,
+        dbOperationTimeoutSeconds: 1,
+        connectionTimeoutMs: 15000,
+        dbOperationTimeoutMs: 25,
+      }),
+    );
+
+    const pending = driver.listDatabases();
+    const rejection =
+      expect(pending).rejects.toBeInstanceOf(DriverTimeoutError);
+    await vi.advanceTimersByTimeAsync(25);
+    await rejection;
+
+    deferred.resolve([]);
+    await vi.runAllTimersAsync();
+    await Promise.resolve();
+
+    expect(recycleConnectionAfterTimeout).toHaveBeenCalledTimes(2);
+  });
+
   it("clears the timeout timer when a wrapped method fails synchronously", async () => {
     vi.useFakeTimers();
 

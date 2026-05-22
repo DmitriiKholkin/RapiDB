@@ -1,5 +1,6 @@
 import type { ConnectionManager } from "../connectionManager";
 import type { ColumnTypeMeta } from "../dbDrivers/types";
+import { pMapWithLimit } from "../utils/concurrency";
 import { assertConnectionWritable } from "../utils/readOnlyGuards";
 import { buildInsertRowOperation } from "./insertSql";
 import type {
@@ -13,6 +14,8 @@ import {
   filterWritableRecord,
   writableEntries,
 } from "./updateSql";
+
+const DELETE_VERIFICATION_CONCURRENCY_LIMIT = 8;
 export class TableMutationService {
   constructor(
     private readonly connectionManager: ConnectionManager,
@@ -501,20 +504,23 @@ export class TableMutationService {
     columns: ColumnTypeMeta[],
     criteriaList: Record<string, unknown>[],
   ): Promise<void> {
-    for (const criteria of criteriaList) {
-      const exists = await this.rowExistsByCriteria(
-        driver,
-        database,
-        schema,
-        table,
-        columns,
-        criteria,
+    const existenceChecks = await pMapWithLimit(
+      criteriaList,
+      DELETE_VERIFICATION_CONCURRENCY_LIMIT,
+      async (criteria) =>
+        await this.rowExistsByCriteria(
+          driver,
+          database,
+          schema,
+          table,
+          columns,
+          criteria,
+        ),
+    );
+    if (existenceChecks.some((exists) => exists)) {
+      throw new Error(
+        "Delete verification failed: at least one row is still visible after delete.",
       );
-      if (exists) {
-        throw new Error(
-          "Delete verification failed: at least one row is still visible after delete.",
-        );
-      }
     }
   }
   private async rowExistsByCriteria(

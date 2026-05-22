@@ -427,6 +427,217 @@ describe("ConnectionFormPanel", () => {
     );
   });
 
+  it("prevents credential loss when disabling secret storage if keychain cannot return existing secret", async () => {
+    const context = {
+      secrets: {
+        get: vi.fn(async () => {
+          throw new Error("keychain unavailable");
+        }),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn().mockResolvedValue(undefined),
+      getConnection: vi.fn(() => ({
+        id: "conn-legacy",
+        name: "Legacy",
+        type: "pg",
+        useSecretStorage: true,
+      })),
+      testConnection: vi.fn(),
+    };
+
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+      {
+        id: "conn-legacy",
+        name: "Legacy",
+        type: "pg",
+        useSecretStorage: true,
+      },
+    );
+
+    await Promise.resolve();
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected a webview panel to be created.");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-legacy",
+        name: "Legacy",
+        type: "pg",
+        host: "db.local",
+        database: "legacy",
+        username: "reader",
+        useSecretStorage: false,
+        hasStoredSecret: true,
+        password: "",
+      },
+    });
+
+    expect(connectionManager.saveConnection).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "saveResult",
+      payload: expect.objectContaining({
+        success: false,
+        error: expect.stringContaining("SecretStorage unavailable"),
+      }),
+    });
+
+    panel.dispose();
+    await expect(promise).resolves.toBeUndefined();
+  });
+
+  it("blocks secret mutation when previous snapshot cannot be read", async () => {
+    const context = {
+      secrets: {
+        get: vi.fn(async () => {
+          throw new Error("keychain unavailable");
+        }),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn().mockResolvedValue(undefined),
+      getConnection: vi.fn(() => ({
+        id: "conn-secret-read-failed",
+        name: "Secret Read Failed",
+        type: "pg",
+        useSecretStorage: true,
+      })),
+      testConnection: vi.fn(),
+    };
+
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+      {
+        id: "conn-secret-read-failed",
+        name: "Secret Read Failed",
+        type: "pg",
+        useSecretStorage: true,
+      },
+    );
+
+    await Promise.resolve();
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected a webview panel to be created.");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-secret-read-failed",
+        name: "Secret Read Failed",
+        type: "pg",
+        host: "db.local",
+        database: "app",
+        username: "reader",
+        useSecretStorage: true,
+        password: "new-secret",
+      },
+    });
+
+    expect(connectionManager.saveConnection).not.toHaveBeenCalled();
+    expect(context.secrets.store).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "saveResult",
+      payload: expect.objectContaining({
+        success: false,
+        error: expect.stringContaining("SecretStorage unavailable"),
+      }),
+    });
+
+    panel.dispose();
+    await expect(promise).resolves.toBeUndefined();
+  });
+
+  it("rolls back secret storage snapshot when config save fails after secret update", async () => {
+    const previousSecretSnapshot = JSON.stringify({ password: "old-secret" });
+    const context = {
+      secrets: {
+        get: vi.fn(async () => previousSecretSnapshot),
+        store: vi.fn(async () => undefined),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn(async () => {
+        throw new Error("config write failed");
+      }),
+      getConnection: vi.fn(() => ({
+        id: "conn-rollback",
+        name: "Rollback",
+        type: "pg",
+        useSecretStorage: true,
+      })),
+      testConnection: vi.fn(),
+    };
+
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+      {
+        id: "conn-rollback",
+        name: "Rollback",
+        type: "pg",
+        useSecretStorage: true,
+      },
+    );
+
+    await Promise.resolve();
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected a webview panel to be created.");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-rollback",
+        name: "Rollback",
+        type: "pg",
+        host: "db.local",
+        database: "app",
+        username: "reader",
+        useSecretStorage: true,
+        password: "new-secret",
+      },
+    });
+
+    expect(connectionManager.saveConnection).toHaveBeenCalledTimes(1);
+    expect(context.secrets.store).toHaveBeenNthCalledWith(
+      1,
+      "conn-rollback",
+      JSON.stringify({ password: "new-secret" }),
+    );
+    expect(context.secrets.store).toHaveBeenNthCalledWith(
+      2,
+      "conn-rollback",
+      previousSecretSnapshot,
+    );
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "saveResult",
+      payload: expect.objectContaining({
+        success: false,
+        error: expect.stringContaining("SecretStorage unavailable"),
+      }),
+    });
+
+    panel.dispose();
+    await expect(promise).resolves.toBeUndefined();
+  });
+
   it("falls back to a testResult message when unhandled errors occur for malformed input", async () => {
     const context = {
       secrets: {

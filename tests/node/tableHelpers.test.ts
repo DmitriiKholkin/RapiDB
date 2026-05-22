@@ -941,4 +941,89 @@ describe("table helpers", () => {
       error: expect.stringMatching(/read-only/i),
     });
   });
+
+  it("verifies deleted rows with bounded concurrent existence checks", async () => {
+    const pendingExistenceResolvers: Array<() => void> = [];
+    let inFlightExistenceChecks = 0;
+    let maxInFlightExistenceChecks = 0;
+
+    const driver: IDBDriver = {
+      ...fakeDriver,
+      query: async (sql: string) => {
+        if (sql.startsWith("SELECT 1 FROM")) {
+          inFlightExistenceChecks += 1;
+          maxInFlightExistenceChecks = Math.max(
+            maxInFlightExistenceChecks,
+            inFlightExistenceChecks,
+          );
+          await new Promise<void>((resolve) => {
+            pendingExistenceResolvers.push(() => {
+              inFlightExistenceChecks -= 1;
+              resolve();
+            });
+          });
+        }
+
+        return {
+          columns: [],
+          rows: [],
+          rowCount: 0,
+          executionTimeMs: 0,
+        };
+      },
+    };
+
+    const mutationService = new TableMutationService(
+      {
+        getConnection: () => ({
+          id: "conn-1",
+          name: "Writable",
+          readOnly: false,
+        }),
+        getDriver: () => driver,
+      } as never,
+      {
+        getColumns: async () => columns,
+      },
+    );
+
+    const deletePlan = await mutationService.prepareDeleteRowsPlan(
+      "conn-1",
+      "main",
+      "public",
+      "fixture_rows",
+      Array.from({ length: 16 }, (_, index) => ({ id: index + 1 })),
+    );
+
+    if (!deletePlan) {
+      throw new Error("Expected delete plan");
+    }
+
+    const pendingExecution =
+      mutationService.executePreparedDeletePlan(deletePlan);
+    for (let index = 0; index < 20; index += 1) {
+      if (pendingExistenceResolvers.length > 0) {
+        break;
+      }
+      await Promise.resolve();
+    }
+
+    expect(pendingExistenceResolvers.length).toBeGreaterThan(1);
+
+    let releasedChecks = 0;
+    while (releasedChecks < 16) {
+      const release = pendingExistenceResolvers.shift();
+      if (!release) {
+        await Promise.resolve();
+        continue;
+      }
+
+      release();
+      releasedChecks += 1;
+    }
+
+    await pendingExecution;
+    expect(maxInFlightExistenceChecks).toBeGreaterThan(1);
+    expect(maxInFlightExistenceChecks).toBeLessThanOrEqual(8);
+  });
 });

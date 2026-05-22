@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { DbObjectKind } from "../../shared/dbObjectKinds";
+import { QUERY_LIMIT_POLICY } from "../../shared/safetyContracts";
 import type { QueryColumnMeta } from "../../shared/tableTypes";
 import type { QueryEditorPresentation } from "../../shared/webviewContracts";
 
@@ -27,11 +28,38 @@ export interface QueryState {
   reset: () => void;
 }
 
+const WEBVIEW_QUERY_RESULT_HARD_CAP = QUERY_LIMIT_POLICY.hardCap;
+
 function normalizeQueryResult(result: QueryResult): QueryResult {
-  return {
+  const columnMeta = Array.isArray(result.columnMeta) ? result.columnMeta : [];
+  const rows = Array.isArray(result.rows) ? result.rows : [];
+  const rowCount =
+    Number.isFinite(result.rowCount) && result.rowCount >= 0
+      ? result.rowCount
+      : rows.length;
+  const rowsExceedHardCap = rows.length > WEBVIEW_QUERY_RESULT_HARD_CAP;
+
+  if (!rowsExceedHardCap && columnMeta === result.columnMeta) {
+    return result;
+  }
+
+  const cappedRows = rowsExceedHardCap
+    ? rows.slice(0, WEBVIEW_QUERY_RESULT_HARD_CAP)
+    : rows;
+  const normalizedTruncated = result.truncated || rowsExceedHardCap;
+  const normalized: QueryResult = {
     ...result,
-    columnMeta: Array.isArray(result.columnMeta) ? result.columnMeta : [],
+    columnMeta,
+    rows: cappedRows,
+    rowCount: rowsExceedHardCap ? Math.max(rowCount, rows.length) : rowCount,
+    truncated: normalizedTruncated,
   };
+
+  if (normalizedTruncated && normalized.truncatedAt === undefined) {
+    normalized.truncatedAt = cappedRows.length;
+  }
+
+  return normalized;
 }
 
 export interface ConnectionEntry {

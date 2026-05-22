@@ -7,6 +7,13 @@ import type {
 import { buildWhere } from "./filterSql";
 import type { SortConfig, TablePage } from "./tableDataContracts";
 
+type ExportOrderColumn = {
+  column: ColumnTypeMeta;
+  direction: "asc" | "desc";
+};
+
+type ExportCursor = Record<string, unknown>;
+
 export class TableReadService {
   private readonly columnCache = new Map<string, ColumnTypeMeta[]>();
 
@@ -182,6 +189,30 @@ export class TableReadService {
     columns: ColumnTypeMeta[];
     rows: Record<string, unknown>[];
   }> {
+    const { driver } = this.getConnectionDriver(connectionId);
+    if (!driver.readTablePage) {
+      const keysetOrder = await this.resolveKeysetExportOrder(
+        connectionId,
+        database,
+        schema,
+        table,
+        sort,
+      );
+      if (keysetOrder) {
+        yield* this.exportAllWithKeysetPagination(
+          connectionId,
+          database,
+          schema,
+          table,
+          chunkSize,
+          filters,
+          keysetOrder,
+          signal,
+        );
+        return;
+      }
+    }
+
     let page = 1;
 
     while (true) {
@@ -213,6 +244,260 @@ export class TableReadService {
 
       page += 1;
     }
+  }
+
+  private async *exportAllWithKeysetPagination(
+    connectionId: string,
+    database: string,
+    schema: string,
+    table: string,
+    chunkSize: number,
+    filters: FilterExpression[],
+    order: readonly ExportOrderColumn[],
+    signal?: AbortSignal,
+  ): AsyncGenerator<{
+    columns: ColumnTypeMeta[];
+    rows: Record<string, unknown>[];
+  }> {
+    const { driver } = this.getConnectionDriver(connectionId);
+    const qualifiedTableName = driver.qualifiedTableName(
+      database,
+      schema,
+      table,
+    );
+    const columns = await this.getColumns(
+      connectionId,
+      database,
+      schema,
+      table,
+    );
+    const columnMetaByName = new Map(
+      columns.map((column) => [column.name, column]),
+    );
+    const orderByClause = this.buildOrderByClause(driver, order);
+    let cursor: ExportCursor | null = null;
+
+    while (true) {
+      if (signal?.aborted) {
+        throw new DOMException("Export cancelled by user", "AbortError");
+      }
+
+      const { clause: baseWhereClause, params: baseWhereParams } = buildWhere(
+        driver,
+        filters,
+        columns,
+      );
+      const cursorCondition = cursor
+        ? this.buildCursorCondition(
+            driver,
+            order,
+            cursor,
+            baseWhereParams.length + 1,
+          )
+        : null;
+      const whereClause = this.combineWhereClauses(
+        baseWhereClause,
+        cursorCondition?.clause,
+      );
+      const pagination = driver.buildPagination(
+        0,
+        chunkSize,
+        baseWhereParams.length + (cursorCondition?.params.length ?? 0) + 1,
+      );
+      const sql = `SELECT * FROM ${qualifiedTableName} ${whereClause} ${orderByClause} ${pagination.sql}`;
+      const params = [
+        ...baseWhereParams,
+        ...(cursorCondition?.params ?? []),
+        ...pagination.params,
+      ];
+      const dataResult = await driver.query(sql, params);
+      const rows = dataResult.rows.map((row) => {
+        const formattedRow: Record<string, unknown> = {};
+        dataResult.columns.forEach((columnName, index) => {
+          const value = row[`__col_${index}`];
+          const column = columnMetaByName.get(columnName);
+          formattedRow[columnName] = column
+            ? driver.formatOutputValue(value, column)
+            : value;
+        });
+        return formattedRow;
+      });
+
+      if (rows.length === 0) {
+        break;
+      }
+
+      yield { columns, rows };
+
+      if (rows.length < chunkSize) {
+        break;
+      }
+
+      cursor = this.createCursorFromRow(rows[rows.length - 1], order);
+    }
+  }
+
+  private async resolveKeysetExportOrder(
+    connectionId: string,
+    database: string,
+    schema: string,
+    table: string,
+    sort: SortConfig | null,
+  ): Promise<ExportOrderColumn[] | null> {
+    const columns = await this.getColumns(
+      connectionId,
+      database,
+      schema,
+      table,
+    );
+    const byName = new Map(columns.map((column) => [column.name, column]));
+    const primaryKeys = columns
+      .filter((column) => column.isPrimaryKey)
+      .sort(
+        (left, right) =>
+          (left.primaryKeyOrdinal ?? Number.MAX_SAFE_INTEGER) -
+          (right.primaryKeyOrdinal ?? Number.MAX_SAFE_INTEGER),
+      );
+
+    if (primaryKeys.length === 0) {
+      return null;
+    }
+
+    const order: ExportOrderColumn[] = [];
+    if (sort) {
+      const sortedColumn = byName.get(sort.column);
+      if (!sortedColumn || sortedColumn.nullable) {
+        return null;
+      }
+
+      order.push({
+        column: sortedColumn,
+        direction: sort.direction,
+      });
+    }
+
+    for (const primaryKeyColumn of primaryKeys) {
+      if (!order.some((entry) => entry.column.name === primaryKeyColumn.name)) {
+        order.push({ column: primaryKeyColumn, direction: "asc" });
+      }
+    }
+
+    const canBuildCursor = order.every((entry) => {
+      const operators = new Set(entry.column.filterOperators);
+      return (
+        entry.column.filterable &&
+        !entry.column.nullable &&
+        operators.has("eq") &&
+        (entry.direction === "asc" ? operators.has("gt") : operators.has("lt"))
+      );
+    });
+
+    return canBuildCursor ? order : null;
+  }
+
+  private buildOrderByClause(
+    driver: ReturnType<TableReadService["getConnectionDriver"]>["driver"],
+    order: readonly ExportOrderColumn[],
+  ): string {
+    const clauses = order.map(
+      (entry) =>
+        `${driver.quoteIdentifier(entry.column.name)} ${entry.direction === "desc" ? "DESC" : "ASC"}`,
+    );
+    return `ORDER BY ${clauses.join(", ")}`;
+  }
+
+  private createCursorFromRow(
+    row: Record<string, unknown>,
+    order: readonly ExportOrderColumn[],
+  ): ExportCursor {
+    return Object.fromEntries(
+      order.map((entry) => [entry.column.name, row[entry.column.name]]),
+    );
+  }
+
+  private buildCursorCondition(
+    driver: ReturnType<TableReadService["getConnectionDriver"]>["driver"],
+    order: readonly ExportOrderColumn[],
+    cursor: ExportCursor,
+    paramIndex: number,
+  ): { clause: string; params: unknown[] } {
+    const disjunctionParts: string[] = [];
+    const params: unknown[] = [];
+
+    for (let index = 0; index < order.length; index += 1) {
+      const prefixParts: string[] = [];
+      for (let prefix = 0; prefix < index; prefix += 1) {
+        const prefixColumn = order[prefix].column;
+        const prefixValue = this.toCursorFilterValue(cursor[prefixColumn.name]);
+        const equality = driver.buildFilterCondition(
+          prefixColumn,
+          "eq",
+          prefixValue,
+          paramIndex + params.length,
+        );
+        if (!equality) {
+          continue;
+        }
+        prefixParts.push(`(${equality.sql})`);
+        params.push(...equality.params);
+      }
+
+      const current = order[index];
+      const currentValue = this.toCursorFilterValue(
+        cursor[current.column.name],
+      );
+      const operator = current.direction === "desc" ? "lt" : "gt";
+      const comparison = driver.buildFilterCondition(
+        current.column,
+        operator,
+        currentValue,
+        paramIndex + params.length,
+      );
+      if (!comparison) {
+        continue;
+      }
+
+      params.push(...comparison.params);
+      const segment = [...prefixParts, `(${comparison.sql})`].join(" AND ");
+      disjunctionParts.push(`(${segment})`);
+    }
+
+    return {
+      clause: disjunctionParts.join(" OR "),
+      params,
+    };
+  }
+
+  private toCursorFilterValue(value: unknown): string | undefined {
+    if (value === null || value === undefined) {
+      return undefined;
+    }
+
+    if (value instanceof Date) {
+      return value.toISOString();
+    }
+
+    return String(value);
+  }
+
+  private combineWhereClauses(
+    baseWhereClause: string,
+    cursorClause?: string,
+  ): string {
+    const trimmedCursorClause = cursorClause?.trim();
+    if (!trimmedCursorClause) {
+      return baseWhereClause;
+    }
+
+    if (!baseWhereClause) {
+      return `WHERE (${trimmedCursorClause})`;
+    }
+
+    const normalizedBase = baseWhereClause.trim();
+    const withoutWhere = /^where\s+/i.test(normalizedBase)
+      ? normalizedBase.replace(/^where\s+/i, "")
+      : normalizedBase;
+    return `WHERE (${withoutWhere}) AND (${trimmedCursorClause})`;
   }
 
   private columnCacheKey(

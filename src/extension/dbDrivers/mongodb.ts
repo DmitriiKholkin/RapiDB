@@ -15,6 +15,7 @@ import {
   Timestamp,
   UUID,
 } from "mongodb";
+import { QUERY_LIMIT_POLICY } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import { formatDatetimeForDisplay } from "./BaseDBDriver";
@@ -92,6 +93,33 @@ const TIMESTAMP_LITERAL_RE = /^Timestamp\((\d+),\s*(\d+)\)$/i;
 
 const MONGODB_READ_ONLY_QUERY_REASON =
   "[RapiDB] Read-only MongoDB connections allow only find, findOne, countDocuments, and aggregate queries without $out or $merge.";
+const MONGODB_QUERY_HARD_CAP = QUERY_LIMIT_POLICY.hardCap;
+const MONGOSH_VM_TIMEOUT_MS = 5000;
+const MONGOSH_UNSAFE_TOKENS = [
+  "process",
+  "globalThis",
+  "Function",
+  "eval",
+  "require",
+  "import",
+  "module",
+  "constructor",
+  "prototype",
+] as const;
+const MONGOSH_UNSAFE_TOKEN_RE = new RegExp(
+  `(^|[^\\w$])(${MONGOSH_UNSAFE_TOKENS.join("|")})(?=$|[^\\w$])`,
+);
+const MONGOSH_UNSAFE_PATTERN_RULES: Array<{
+  re: RegExp;
+  reason: string;
+}> = [
+  { re: /(^|[^\w$])(__\w+__)(?=$|[^\w$])/, reason: "double-underscore key" },
+  {
+    re: /(^|[^\w$])(while|for|try|catch)(?=$|[^\w$])/,
+    reason: "control-flow statement",
+  },
+  { re: /=>/, reason: "arrow function" },
+];
 
 function normalizeMongoshQueryText(queryText: string): string {
   return queryText
@@ -101,6 +129,39 @@ function normalizeMongoshQueryText(queryText: string): string {
     .trim()
     .replace(/;+\s*$/, "")
     .trim();
+}
+
+function ensureMongoshQueryIsSafe(queryText: string): void {
+  const tokenMatch = MONGOSH_UNSAFE_TOKEN_RE.exec(queryText);
+  if (tokenMatch) {
+    throw new Error(
+      `[RapiDB] Unsafe mongosh query blocked: disallowed token "${tokenMatch[2]}".`,
+    );
+  }
+
+  for (const rule of MONGOSH_UNSAFE_PATTERN_RULES) {
+    if (rule.re.test(queryText)) {
+      throw new Error(
+        `[RapiDB] Unsafe mongosh query blocked: disallowed ${rule.reason}.`,
+      );
+    }
+  }
+}
+
+function executeMongoshParserInVm(
+  queryText: string,
+  sandbox: Record<string, unknown>,
+): void {
+  ensureMongoshQueryIsSafe(queryText);
+  const context = vm.createContext(sandbox, {
+    codeGeneration: {
+      strings: false,
+      wasm: false,
+    },
+  });
+  vm.runInContext(queryText, context, {
+    timeout: MONGOSH_VM_TIMEOUT_MS,
+  });
 }
 
 function parseMongoshOperations(queryText: string): MongoshOperation[] {
@@ -195,6 +256,15 @@ function parseMongoshOperations(queryText: string): MongoshOperation[] {
 
   const sandbox = {
     db: createDbProxy(),
+    process: undefined,
+    globalThis: undefined,
+    Function: undefined,
+    eval: undefined,
+    require: undefined,
+    import: undefined,
+    module: undefined,
+    constructor: undefined,
+    prototype: undefined,
     Date: function mongoDate(value: string) {
       return new globalThis.Date(value);
     },
@@ -264,9 +334,14 @@ function parseMongoshOperations(queryText: string): MongoshOperation[] {
   };
 
   try {
-    vm.runInNewContext(queryText, sandbox, { timeout: 5000 });
+    executeMongoshParserInVm(queryText, sandbox);
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
+    if (message.includes(".then") || message.includes(".catch")) {
+      throw new Error(
+        `[RapiDB] Promise chaining is not allowed in mongosh queries. Use basic operations only.\n\nExamples:\n  db.users.find({})\n  db.users.find({ name: "Alice" }).limit(10)\n  db.users.insertOne({ name: "Alice" })\n  db.users.updateMany({ status: "active" }, { $set: { updated: true } })\n  db.users.deleteMany({ _id: ObjectId("507f1f77bcf86cd799439011") })\n  db.runCommand({ ping: 1 })\n  db.getSiblingDB("mydb").users.find({})`,
+      );
+    }
     throw new Error(
       `mongosh error: ${message}\n\nExamples:\n  db.users.find({})\n  db.users.find({ name: "Alice" }).limit(10)\n  db.users.insertOne({ name: "Alice" })\n  db.users.updateMany({ status: "active" }, { $set: { updated: true } })\n  db.users.deleteMany({ _id: ObjectId("507f1f77bcf86cd799439011") })\n  db.runCommand({ ping: 1 })\n  db.getSiblingDB("mydb").users.find({})`,
     );
@@ -820,6 +895,7 @@ function selectMongoSchemaSample(
 export class MongoDBDriver implements IDBDriver {
   private client: MongoClient | null = null;
   private connected = false;
+  private timeoutRecoveryInFlight: Promise<void> | null = null;
 
   constructor(private readonly config: ConnectionConfig) {}
 
@@ -844,6 +920,42 @@ export class MongoDBDriver implements IDBDriver {
     await this.client?.close();
     this.client = null;
     this.connected = false;
+  }
+
+  async cancelCurrentOperation(): Promise<void> {
+    await this.recycleConnectionAfterTimeout({
+      timeoutKind: "dbOperation",
+      operationName: "cancelCurrentOperation",
+    });
+  }
+
+  async recycleConnectionAfterTimeout(_context?: {
+    timeoutKind?: "connection" | "dbOperation";
+    operationName?: string;
+  }): Promise<void> {
+    if (this.timeoutRecoveryInFlight) {
+      await this.timeoutRecoveryInFlight;
+      return;
+    }
+
+    const recover = async () => {
+      const wasConnected = this.isConnected();
+      try {
+        await this.disconnect();
+      } catch {}
+
+      if (wasConnected) {
+        try {
+          await this.connect();
+        } catch {}
+      }
+    };
+
+    this.timeoutRecoveryInFlight = recover().finally(() => {
+      this.timeoutRecoveryInFlight = null;
+    });
+
+    await this.timeoutRecoveryInFlight;
   }
 
   isConnected(): boolean {
@@ -1064,204 +1176,14 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   async query(sql: string, _params?: unknown[]): Promise<QueryResult> {
-    const trimmed = sql
-      .split("\n")
-      .filter((line) => !line.trim().startsWith("//"))
-      .join("\n")
-      .trim()
-      .replace(/;+\s*$/, "")
-      .trim();
+    const trimmed = normalizeMongoshQueryText(sql);
 
     if (trimmed.length === 0) {
       return { columns: [], rows: [], rowCount: 0, executionTimeMs: 0 };
     }
 
     const startedAt = Date.now();
-
-    const operations: MongoshOperation[] = [];
-
-    const createChainProxy = (operation: MongoshOperation): object => {
-      return new Proxy({} as Record<string, unknown>, {
-        get(_t, method: string | symbol) {
-          if (typeof method !== "string") return undefined;
-          return (...a: unknown[]) => {
-            operation.chainOps.push({ op: method, args: a });
-            return createChainProxy(operation);
-          };
-        },
-      });
-    };
-
-    const createCollProxy = (
-      dbName: string | undefined,
-      coll: string,
-    ): object => {
-      return new Proxy({} as Record<string, unknown>, {
-        get(_t, method: string | symbol) {
-          if (typeof method !== "string") return undefined;
-          if (method === "then") return undefined;
-          return (...a: unknown[]) => {
-            const operation: MongoshOperation = {
-              dbName,
-              collName: coll,
-              op: method,
-              args: a,
-              chainOps: [],
-            };
-            operations.push(operation);
-            return createChainProxy(operation);
-          };
-        },
-      });
-    };
-
-    const createDbProxy = (dbName?: string): object => {
-      return new Proxy({} as Record<string, unknown>, {
-        get(_t, prop: string | symbol) {
-          if (typeof prop !== "string") return undefined;
-          if (prop === "getSiblingDB") {
-            return (name: string) => {
-              return createDbProxy(name);
-            };
-          }
-          if (prop === "getCollection") {
-            return (name: string) => createCollProxy(dbName, String(name));
-          }
-          if (prop === "runCommand") {
-            return (cmd: unknown) => {
-              const operation: MongoshOperation = {
-                dbName,
-                op: "runCommand",
-                args: [cmd],
-                chainOps: [],
-              };
-              operations.push(operation);
-              return createChainProxy(operation);
-            };
-          }
-          if (prop === "createCollection") {
-            return (name: string, options?: unknown) => {
-              operations.push({
-                dbName,
-                op: "createCollection",
-                args: [name, options],
-                chainOps: [],
-              });
-            };
-          }
-          if (prop === "createView") {
-            return (
-              name: string,
-              viewOn: string,
-              pipeline?: unknown,
-              options?: unknown,
-            ) => {
-              operations.push({
-                dbName,
-                op: "createView",
-                args: [name, viewOn, pipeline, options],
-                chainOps: [],
-              });
-            };
-          }
-          return createCollProxy(dbName, prop);
-        },
-      });
-    };
-
-    const sandbox = {
-      db: createDbProxy(),
-      Date: function mongoDate(value: string) {
-        return new globalThis.Date(value);
-      },
-      RegExp: function mongoRegExp(pattern: string, flags?: string) {
-        return new globalThis.RegExp(pattern, flags);
-      },
-      ObjectId: function mongoObjectId(hex: string) {
-        return new ObjectId(hex);
-      },
-      ISODate: function mongoIsoDate(value: string) {
-        return new Date(value);
-      },
-      BinData: function mongoBinData(subtype: number | string, base64: string) {
-        return new Binary(
-          Buffer.from(String(base64), "base64"),
-          Number(subtype),
-        );
-      },
-      DBRef: function mongoDBRef(
-        collection: string,
-        oid: unknown,
-        db?: string,
-      ) {
-        return new DBRef(
-          String(collection),
-          oid as ObjectId,
-          db ? String(db) : undefined,
-        );
-      },
-      BSONSymbol: function mongoBSONSymbol(value: string) {
-        return new BSONSymbol(String(value));
-      },
-      NumberLong: function mongoNumberLong(value: number | string) {
-        return Long.fromString(String(value));
-      },
-      NumberInt: function mongoNumberInt(value: number | string) {
-        return new Int32(Number.parseInt(String(value), 10));
-      },
-      NumberDecimal: function mongoNumberDecimal(value: string) {
-        return Decimal128.fromString(String(value));
-      },
-      Timestamp: function mongoTimestamp(
-        secondsOrSpec:
-          | number
-          | string
-          | {
-              t?: unknown;
-              i?: unknown;
-            },
-        increment?: number | string,
-      ) {
-        if (secondsOrSpec && typeof secondsOrSpec === "object") {
-          return new Timestamp({
-            t: Number((secondsOrSpec as { t?: unknown }).t ?? 0),
-            i: Number((secondsOrSpec as { i?: unknown }).i ?? 0),
-          });
-        }
-        return new Timestamp({
-          t: Number(secondsOrSpec),
-          i: Number(increment ?? 0),
-        });
-      },
-      Code: function mongoCode(source: string, scope?: unknown) {
-        return scope !== undefined &&
-          scope !== null &&
-          typeof scope === "object"
-          ? new Code(String(source), scope as Record<string, unknown>)
-          : new Code(String(source));
-      },
-      MinKey: function mongoMinKey() {
-        return new MinKey();
-      },
-      MaxKey: function mongoMaxKey() {
-        return new MaxKey();
-      },
-    };
-
-    try {
-      vm.runInNewContext(trimmed, sandbox, { timeout: 5000 });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      throw new Error(
-        `mongosh error: ${msg}\n\nExamples:\n  db.users.find({})\n  db.users.find({ name: "Alice" }).limit(10)\n  db.users.insertOne({ name: "Alice" })\n  db.users.updateMany({ status: "active" }, { $set: { updated: true } })\n  db.users.deleteMany({ _id: ObjectId("507f1f77bcf86cd799439011") })\n  db.runCommand({ ping: 1 })\n  db.getSiblingDB("mydb").users.find({})`,
-      );
-    }
-
-    if (operations.length === 0) {
-      throw new Error(
-        'No operation found in mongosh expression.\n\nExamples:\n  db.users.find({})\n  db.users.insertOne({ name: "Alice" })\n  db.runCommand({ ping: 1 })',
-      );
-    }
+    const operations = parseMongoshOperations(trimmed);
 
     const mapQueryRowsToObjects = (
       result: QueryResult,
@@ -1282,10 +1204,19 @@ export class MongoDBDriver implements IDBDriver {
       const { dbName, collName, op, args: opArgs, chainOps } = operation;
 
       const limitOp = chainOps.find((c) => c.op === "limit");
-      const limit =
-        typeof limitOp?.args[0] === "number" ? limitOp.args[0] : 100;
+      const normalizedRequestedLimit =
+        typeof limitOp?.args[0] === "number" && Number.isFinite(limitOp.args[0])
+          ? Math.floor(limitOp.args[0])
+          : 100;
+      const limit = Math.max(
+        0,
+        Math.min(MONGODB_QUERY_HARD_CAP, normalizedRequestedLimit),
+      );
       const skipOp = chainOps.find((c) => c.op === "skip");
-      const skip = typeof skipOp?.args[0] === "number" ? skipOp.args[0] : 0;
+      const skip =
+        typeof skipOp?.args[0] === "number" && Number.isFinite(skipOp.args[0])
+          ? Math.max(0, Math.floor(skipOp.args[0]))
+          : 0;
 
       if (op === "runCommand") {
         const cmd = this.normalizeFilterCriteria(
@@ -1362,8 +1293,8 @@ export class MongoDBDriver implements IDBDriver {
             promoteValues: false,
             bsonRegExp: false,
           })
-          .limit(actualLimit)
           .skip(skip)
+          .limit(actualLimit)
           .toArray();
         const rows = docs.map((doc) =>
           this.toRow(doc as Record<string, unknown>),
@@ -1464,8 +1395,13 @@ export class MongoDBDriver implements IDBDriver {
 
       if (op === "aggregate") {
         const pipeline = opArgs[0] as Record<string, unknown>[];
+        const boundedPipeline = [...pipeline];
+        if (skip > 0) {
+          boundedPipeline.push({ $skip: skip });
+        }
+        boundedPipeline.push({ $limit: limit });
         const docs = await mongoCollection
-          .aggregate(pipeline, {
+          .aggregate(boundedPipeline, {
             promoteValues: false,
             bsonRegExp: false,
           })
@@ -1521,10 +1457,16 @@ export class MongoDBDriver implements IDBDriver {
     const rawRows: Record<string, unknown>[] = [];
     let affectedRows = 0;
     let sawAffectedRows = false;
+    let totalRowCount = 0;
 
     for (const operation of operations) {
       const result = await executeOperation(operation);
-      rawRows.push(...mapQueryRowsToObjects(result));
+      const mappedRows = mapQueryRowsToObjects(result);
+      totalRowCount += mappedRows.length;
+      const availableSlots = MONGODB_QUERY_HARD_CAP - rawRows.length;
+      if (availableSlots > 0) {
+        rawRows.push(...mappedRows.slice(0, availableSlots));
+      }
       if (typeof result.affectedRows === "number") {
         affectedRows += result.affectedRows;
         sawAffectedRows = true;
@@ -1535,7 +1477,7 @@ export class MongoDBDriver implements IDBDriver {
     return {
       columns,
       rows: rawRows.map((row) => this.mapRowToQueryRow(row, columns)),
-      rowCount: rawRows.length,
+      rowCount: totalRowCount,
       affectedRows: sawAffectedRows ? affectedRows : undefined,
       executionTimeMs: Date.now() - startedAt,
     };

@@ -22,7 +22,7 @@ export class FakeConnectionManagerStore implements ConnectionManagerStore {
   private readonly listeners: ConfigurationListener[] = [];
   private historyLimit = 100;
   private defaultPageSize = 25;
-  private queryRowLimit = 10_000;
+  private queryRowLimit = 1_000;
   private timeoutSettings = createDriverTimeoutSettingsSnapshot();
 
   onDidChangeConfiguration(

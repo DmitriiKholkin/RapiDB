@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import type { ConnectionSecretUpdateTransaction } from "../../shared/safetyContracts";
 import {
   type ConnectionFormExistingState,
   type ConnectionFormSubmission,
@@ -19,6 +20,8 @@ type StoredConnectionSecrets = {
   awsAccessKeyId?: string;
   awsSecretAccessKey?: string;
   awsSessionToken?: string;
+  connectionUri?: string;
+  uri?: string;
 };
 
 const CONNECTION_FORM_RETENTION_MODE = "rehydrate" as const;
@@ -30,6 +33,43 @@ function trimOptionalSecret(value: string | undefined): string | undefined {
 
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function redactCredentialBearingUri(uri: string): string {
+  return uri.replace(/^([a-z][a-z\d+.-]*:\/\/)([^@/?#\s]+)@/i, "$1");
+}
+
+function extractCredentialBearingUriSecret(
+  value: string | undefined,
+): string | undefined {
+  const normalized = trimOptionalSecret(value);
+  if (!normalized) {
+    return undefined;
+  }
+
+  return redactCredentialBearingUri(normalized) !== normalized
+    ? normalized
+    : undefined;
+}
+
+function resolvePersistedUriSecret(
+  currentValue: string | undefined,
+  previousSecret: string | undefined,
+): string | undefined {
+  const explicitSecret = extractCredentialBearingUriSecret(currentValue);
+  if (explicitSecret) {
+    return explicitSecret;
+  }
+
+  const normalizedCurrent = trimOptionalSecret(currentValue);
+  if (!normalizedCurrent || !previousSecret) {
+    return undefined;
+  }
+
+  const previousRedacted = trimOptionalSecret(
+    redactCredentialBearingUri(previousSecret),
+  );
+  return previousRedacted === normalizedCurrent ? previousSecret : undefined;
 }
 
 function parseStoredConnectionSecrets(
@@ -58,6 +98,11 @@ function parseStoredConnectionSecrets(
           typeof parsed.awsSessionToken === "string"
             ? parsed.awsSessionToken
             : undefined,
+        connectionUri:
+          typeof parsed.connectionUri === "string"
+            ? parsed.connectionUri
+            : undefined,
+        uri: typeof parsed.uri === "string" ? parsed.uri : undefined,
       };
     }
   } catch {}
@@ -187,6 +232,10 @@ export class ConnectionFormPanel {
       return storedSecrets.password;
     }
 
+    if (payload.hasStoredSecret && storedSecrets.password !== undefined) {
+      return storedSecrets.password;
+    }
+
     const existing = this.connectionManager.getConnection(payload.id);
     return existing?.password ?? payload.password ?? "";
   }
@@ -198,6 +247,76 @@ export class ConnectionFormPanel {
       return parseStoredConnectionSecrets(await this.context.secrets.get(id));
     } catch {
       return {};
+    }
+  }
+
+  private async readStoredSecretsSnapshot(id: string): Promise<{
+    serialized: string | undefined;
+    parsed: StoredConnectionSecrets;
+    readError?: string;
+  }> {
+    try {
+      const serialized = await this.context.secrets.get(id);
+      return {
+        serialized,
+        parsed: parseStoredConnectionSecrets(serialized),
+      };
+    } catch (err: unknown) {
+      return {
+        serialized: undefined,
+        parsed: {},
+        readError: normalizeUnknownError(err).message,
+      };
+    }
+  }
+
+  private async restoreSecretsSnapshot(
+    snapshot: string | undefined,
+    id: string,
+  ): Promise<void> {
+    if (snapshot === undefined) {
+      await this.context.secrets.delete(id);
+      return;
+    }
+
+    await this.context.secrets.store(id, snapshot);
+  }
+
+  private async commitSecretUpdateTransaction(
+    transaction: ConnectionSecretUpdateTransaction,
+    saveConfig: () => Promise<void>,
+  ): Promise<void> {
+    const nextSecretSnapshot = transaction.nextSecretSnapshot;
+    const shouldStoreNextSecret =
+      nextSecretSnapshot !== undefined &&
+      nextSecretSnapshot !== transaction.previousSecretSnapshot;
+    const shouldDeleteSecret =
+      transaction.nextSecretSnapshot === undefined &&
+      transaction.previousSecretSnapshot !== undefined;
+    const secretMutationNeeded = shouldStoreNextSecret || shouldDeleteSecret;
+
+    if (shouldStoreNextSecret) {
+      await this.context.secrets.store(
+        transaction.connectionId,
+        nextSecretSnapshot,
+      );
+    } else if (shouldDeleteSecret) {
+      await this.context.secrets.delete(transaction.connectionId);
+    }
+
+    try {
+      await saveConfig();
+    } catch (err: unknown) {
+      if (secretMutationNeeded) {
+        try {
+          await this.restoreSecretsSnapshot(
+            transaction.previousSecretSnapshot,
+            transaction.connectionId,
+          );
+        } catch {}
+      }
+
+      throw err;
     }
   }
 
@@ -261,9 +380,34 @@ export class ConnectionFormPanel {
           return;
         }
 
+        const previousSecretSnapshot = await this.readStoredSecretsSnapshot(
+          raw.id,
+        );
+        const inlinePassword = trimOptionalSecret(raw.password);
+        const requiresStoredPasswordRecovery =
+          !raw.useSecretStorage && payload.hasStoredSecret === true;
+        if (
+          requiresStoredPasswordRecovery &&
+          inlinePassword === undefined &&
+          previousSecretSnapshot.parsed.password === undefined
+        ) {
+          this.panel.webview.postMessage({
+            type: "saveResult",
+            payload: {
+              success: false,
+              error: previousSecretSnapshot.readError
+                ? `SecretStorage unavailable: ${previousSecretSnapshot.readError}. Existing credentials were preserved; re-enter password to continue.`
+                : "Existing stored password could not be loaded. Existing credentials were preserved; re-enter password to continue.",
+            },
+          });
+          return;
+        }
+
         if (raw.useSecretStorage) {
+          const normalizedPreviousSecretSnapshot =
+            serializeStoredConnectionSecrets(previousSecretSnapshot.parsed);
           const nextSecrets = serializeStoredConnectionSecrets({
-            password: trimOptionalSecret(raw.password),
+            password: inlinePassword,
             apiKey:
               raw.type === "elasticsearch"
                 ? trimOptionalSecret(raw.apiKey)
@@ -280,16 +424,52 @@ export class ConnectionFormPanel {
               raw.type === "dynamodb"
                 ? trimOptionalSecret(raw.awsSessionToken)
                 : undefined,
+            connectionUri: resolvePersistedUriSecret(
+              raw.connectionUri,
+              previousSecretSnapshot.parsed.connectionUri,
+            ),
+            uri: resolvePersistedUriSecret(
+              raw.uri,
+              previousSecretSnapshot.parsed.uri,
+            ),
           });
-          const currentSecrets = serializeStoredConnectionSecrets(
-            await this.loadStoredSecrets(raw.id),
-          );
+          const secretMutationNeeded =
+            nextSecrets !== normalizedPreviousSecretSnapshot;
+          if (
+            secretMutationNeeded &&
+            previousSecretSnapshot.readError &&
+            normalizedPreviousSecretSnapshot === undefined
+          ) {
+            this.panel.webview.postMessage({
+              type: "saveResult",
+              payload: {
+                success: false,
+                error: `SecretStorage unavailable: ${previousSecretSnapshot.readError}. Existing credentials were preserved; retry once Secret Storage is available.`,
+              },
+            });
+            return;
+          }
+
+          const transaction: ConnectionSecretUpdateTransaction = {
+            connectionId: raw.id,
+            useSecretStorage: true,
+            previousSecretSnapshot: normalizedPreviousSecretSnapshot,
+            nextSecretSnapshot: nextSecrets,
+          };
           try {
-            if (nextSecrets && nextSecrets !== currentSecrets) {
-              await this.context.secrets.store(raw.id, nextSecrets);
-            } else if (!nextSecrets) {
-              await this.context.secrets.delete(raw.id);
-            }
+            const {
+              password: _pw,
+              apiKey: _apiKey,
+              awsAccessKeyId: _awsAccessKeyId,
+              awsSecretAccessKey: _awsSecretAccessKey,
+              awsSessionToken: _awsSessionToken,
+              ...configWithoutSecrets
+            } = raw;
+            const config = configWithoutSecrets as ConnectionConfig;
+
+            await this.commitSecretUpdateTransaction(transaction, async () => {
+              await this.connectionManager.saveConnection(config);
+            });
           } catch (err: unknown) {
             const error = normalizeUnknownError(err);
             this.panel.webview.postMessage({
@@ -310,13 +490,14 @@ export class ConnectionFormPanel {
             ...configWithoutSecrets
           } = raw;
           const config = configWithoutSecrets as ConnectionConfig;
-          await this.connectionManager.saveConnection(config);
           this.resolveFn?.(config);
         } else {
-          try {
-            await this.context.secrets.delete(raw.id);
-          } catch {}
           await this.connectionManager.saveConnection(raw);
+          if (previousSecretSnapshot.serialized !== undefined) {
+            try {
+              await this.context.secrets.delete(raw.id);
+            } catch {}
+          }
           this.resolveFn?.(raw);
         }
 
