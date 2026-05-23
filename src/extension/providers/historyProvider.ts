@@ -1,29 +1,16 @@
-import * as vscode from "vscode";
 import type { ConnectionManager, HistoryEntry } from "../connectionManager";
-import { extractFirstSqlLine, SqlEntryProvider } from "./sqlEntryProvider";
+import { SqlEntryNode, SqlEntryProvider } from "./sqlEntryProvider";
 
-export class HistoryNode extends vscode.TreeItem {
-  constructor(
-    public readonly entry: HistoryEntry,
-    connectionName: string,
-  ) {
-    super(extractFirstSqlLine(entry.sql), vscode.TreeItemCollapsibleState.None);
-
-    this.id = entry.id;
-    this.contextValue = "historyEntry";
-    this.iconPath = new vscode.ThemeIcon("history");
-    this.description = connectionName;
-
-    const dateStr = new Date(entry.executedAt).toLocaleString();
-    this.tooltip = new vscode.MarkdownString(
-      `**${connectionName}** — ${dateStr}\n\`\`\`\n${entry.sql}\n\`\`\``,
-    );
-
-    this.command = {
+export class HistoryNode extends SqlEntryNode<HistoryEntry> {
+  constructor(entry: HistoryEntry, connectionName: string) {
+    super(entry, {
+      connectionName,
+      iconId: "history",
+      contextValue: "historyEntry",
+      dateLabel: new Date(entry.executedAt).toLocaleString(),
       command: "rapidb.openHistoryEntry",
-      title: "Open in Query Editor",
-      arguments: [entry],
-    };
+      commandTitle: "Open in Query Editor",
+    });
   }
 }
 

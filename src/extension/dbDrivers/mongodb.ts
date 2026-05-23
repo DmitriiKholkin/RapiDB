@@ -22,6 +22,7 @@ import { formatDatetimeForDisplay } from "./BaseDBDriver";
 import {
   applyFilters,
   applySort,
+  createNoSqlUnsupportedMetadataHandlers,
   inferColumnsFromRows,
   pageRows,
   unsupported,
@@ -95,6 +96,8 @@ const MONGODB_READ_ONLY_QUERY_REASON =
   "[RapiDB] Read-only MongoDB connections allow only find, findOne, countDocuments, and aggregate queries without $out or $merge.";
 const MONGODB_QUERY_HARD_CAP = QUERY_LIMIT_POLICY.hardCap;
 const MONGOSH_VM_TIMEOUT_MS = 5000;
+const MONGODB_UNSUPPORTED_METADATA =
+  createNoSqlUnsupportedMetadataHandlers("MongoDB");
 const MONGOSH_UNSAFE_TOKENS = [
   "process",
   "globalThis",
@@ -1069,21 +1072,13 @@ export class MongoDBDriver implements IDBDriver {
     }
   }
 
-  async getForeignKeys(): Promise<ForeignKeyMeta[]> {
-    return [];
-  }
+  getForeignKeys = MONGODB_UNSUPPORTED_METADATA.getForeignKeys;
 
-  async getConstraints(): Promise<TableConstraintMeta[]> {
-    return [];
-  }
+  getConstraints = MONGODB_UNSUPPORTED_METADATA.getConstraints;
 
-  async getTriggers(): Promise<TriggerMeta[] | null> {
-    return null;
-  }
+  getTriggers = MONGODB_UNSUPPORTED_METADATA.getTriggers;
 
-  async getConstraintDDL(): Promise<string> {
-    unsupported("MongoDB constraints DDL");
-  }
+  getConstraintDDL = MONGODB_UNSUPPORTED_METADATA.getConstraintDDL;
 
   async getIndexDDL(
     database: string,
@@ -1123,9 +1118,7 @@ export class MongoDBDriver implements IDBDriver {
     return `${collectionRef}.createIndex(\n  ${this.serializeMongosh(key)},\n  ${this.serializeMongosh(options)}\n);`;
   }
 
-  async getTriggerDDL(): Promise<string> {
-    unsupported("MongoDB trigger DDL");
-  }
+  getTriggerDDL = MONGODB_UNSUPPORTED_METADATA.getTriggerDDL;
 
   async getCreateTableDDL(
     database: string,
@@ -1167,13 +1160,9 @@ export class MongoDBDriver implements IDBDriver {
     return `${dbRef}.createCollection(\n  ${JSON.stringify(table)},\n  ${this.serializeMongosh(collection.options)}\n);`;
   }
 
-  async getObjectDefinition(): Promise<string | null> {
-    return null;
-  }
+  getObjectDefinition = MONGODB_UNSUPPORTED_METADATA.getObjectDefinition;
 
-  async getRoutineDefinition(): Promise<string> {
-    unsupported("MongoDB routine definition");
-  }
+  getRoutineDefinition = MONGODB_UNSUPPORTED_METADATA.getRoutineDefinition;
 
   async query(sql: string, _params?: unknown[]): Promise<QueryResult> {
     const trimmed = normalizeMongoshQueryText(sql);
@@ -1184,19 +1173,6 @@ export class MongoDBDriver implements IDBDriver {
 
     const startedAt = Date.now();
     const operations = parseMongoshOperations(trimmed);
-
-    const mapQueryRowsToObjects = (
-      result: QueryResult,
-    ): Record<string, unknown>[] => {
-      return result.rows.map((row) =>
-        Object.fromEntries(
-          result.columns.map((column, index) => [
-            column,
-            row[`__col_${index}`],
-          ]),
-        ),
-      );
-    };
 
     const executeOperation = async (
       operation: MongoshOperation,
@@ -1218,63 +1194,56 @@ export class MongoDBDriver implements IDBDriver {
           ? Math.max(0, Math.floor(skipOp.args[0]))
           : 0;
 
-      if (op === "runCommand") {
-        const cmd = this.normalizeFilterCriteria(
-          opArgs[0] as Record<string, unknown>,
-        );
-        const result = await this.requireDb(dbName).command(cmd);
-        const row = this.toRow(result as Record<string, unknown>);
-        const columns = Object.keys(row);
-        return {
-          columns,
-          rows: [this.mapRowToQueryRow(row, columns)],
-          rowCount: 1,
-          executionTimeMs: Date.now() - startedAt,
-        };
-      }
+      const dbHandlers: Record<string, () => Promise<QueryResult>> = {
+        runCommand: async () => {
+          const cmd = this.normalizeFilterCriteria(
+            opArgs[0] as Record<string, unknown>,
+          );
+          const result = await this.requireDb(dbName).command(cmd);
+          return this.buildMongoSingleRowQueryResult(
+            this.toRow(result as Record<string, unknown>),
+            startedAt,
+          );
+        },
+        createCollection: async () => {
+          const name = String(opArgs[0]);
+          const options =
+            opArgs[1] !== null && typeof opArgs[1] === "object"
+              ? (opArgs[1] as Record<string, unknown>)
+              : undefined;
+          if (options) {
+            await this.requireDb(dbName).createCollection(name, options);
+          } else {
+            await this.requireDb(dbName).createCollection(name);
+          }
+          return this.buildMongoSingleRowQueryResult(
+            { ok: 1, name, type: "collection" },
+            startedAt,
+          );
+        },
+        createView: async () => {
+          const name = String(opArgs[0]);
+          const viewOn = String(opArgs[1]);
+          const pipeline = Array.isArray(opArgs[2]) ? opArgs[2] : [];
+          const options =
+            opArgs[3] !== null && typeof opArgs[3] === "object"
+              ? (opArgs[3] as Record<string, unknown>)
+              : undefined;
+          await this.requireDb(dbName).createCollection(name, {
+            viewOn,
+            pipeline,
+            ...(options ?? {}),
+          });
+          return this.buildMongoSingleRowQueryResult(
+            { ok: 1, name, type: "view", viewOn },
+            startedAt,
+          );
+        },
+      };
 
-      if (op === "createCollection") {
-        const name = String(opArgs[0]);
-        const options =
-          opArgs[1] !== null && typeof opArgs[1] === "object"
-            ? (opArgs[1] as Record<string, unknown>)
-            : undefined;
-        if (options) {
-          await this.requireDb(dbName).createCollection(name, options);
-        } else {
-          await this.requireDb(dbName).createCollection(name);
-        }
-        const row = { ok: 1, name, type: "collection" };
-        const columns = Object.keys(row);
-        return {
-          columns,
-          rows: [this.mapRowToQueryRow(row, columns)],
-          rowCount: 1,
-          executionTimeMs: Date.now() - startedAt,
-        };
-      }
-
-      if (op === "createView") {
-        const name = String(opArgs[0]);
-        const viewOn = String(opArgs[1]);
-        const pipeline = Array.isArray(opArgs[2]) ? opArgs[2] : [];
-        const options =
-          opArgs[3] !== null && typeof opArgs[3] === "object"
-            ? (opArgs[3] as Record<string, unknown>)
-            : undefined;
-        await this.requireDb(dbName).createCollection(name, {
-          viewOn,
-          pipeline,
-          ...(options ?? {}),
-        });
-        const row = { ok: 1, name, type: "view", viewOn };
-        const columns = Object.keys(row);
-        return {
-          columns,
-          rows: [this.mapRowToQueryRow(row, columns)],
-          rowCount: 1,
-          executionTimeMs: Date.now() - startedAt,
-        };
+      const dbHandler = dbHandlers[op];
+      if (dbHandler) {
+        return dbHandler();
       }
 
       if (!collName) {
@@ -1282,167 +1251,156 @@ export class MongoDBDriver implements IDBDriver {
       }
 
       const mongoCollection = this.requireDb(dbName).collection(collName);
-
-      if (op === "find" || op === "findOne") {
-        const filter = this.normalizeFilterCriteria(
-          (opArgs[0] as Record<string, unknown>) ?? {},
+      const normalizeCriteria = (index = 0): Record<string, unknown> =>
+        this.normalizeFilterCriteria(
+          (opArgs[index] as Record<string, unknown>) ?? {},
         );
-        const actualLimit = op === "findOne" ? 1 : limit;
-        const docs = await mongoCollection
-          .find(filter, {
+      const findDocuments = async (limitValue: number) =>
+        mongoCollection
+          .find(normalizeCriteria(), {
             promoteValues: false,
             bsonRegExp: false,
           })
           .skip(skip)
-          .limit(actualLimit)
+          .limit(limitValue)
           .toArray();
-        const rows = docs.map((doc) =>
-          this.toRow(doc as Record<string, unknown>),
-        );
-        const columns = inferColumnsFromRows(rows, "_id").map((c) => c.name);
-        return {
-          columns,
-          rows: rows.map((row) => this.mapRowToQueryRow(row, columns)),
-          rowCount: rows.length,
-          executionTimeMs: Date.now() - startedAt,
-        };
-      }
-
-      if (op === "countDocuments") {
-        const filter = this.normalizeFilterCriteria(
-          (opArgs[0] as Record<string, unknown>) ?? {},
-        );
-        const count = await mongoCollection.countDocuments(filter);
-        return {
-          columns: ["count"],
-          rows: [this.mapRowToQueryRow({ count }, ["count"])],
-          rowCount: 1,
-          executionTimeMs: Date.now() - startedAt,
-        };
-      }
-
-      if (op === "insertOne") {
-        const doc = opArgs[0] as Record<string, unknown>;
-        const result = await mongoCollection.insertOne(doc);
-        const row = {
-          acknowledged: result.acknowledged,
-          insertedId: String(result.insertedId),
-        };
-        return {
-          columns: Object.keys(row),
-          rows: [this.mapRowToQueryRow(row, Object.keys(row))],
-          rowCount: 1,
-          affectedRows: result.acknowledged ? 1 : 0,
-          executionTimeMs: Date.now() - startedAt,
-        };
-      }
-
-      if (op === "insertMany") {
-        const docs = opArgs[0] as Record<string, unknown>[];
-        const result = await mongoCollection.insertMany(docs);
-        const row = {
-          acknowledged: result.acknowledged,
-          insertedCount: result.insertedCount,
-        };
-        return {
-          columns: Object.keys(row),
-          rows: [this.mapRowToQueryRow(row, Object.keys(row))],
-          rowCount: 1,
-          affectedRows: result.insertedCount,
-          executionTimeMs: Date.now() - startedAt,
-        };
-      }
-
-      if (op === "updateOne" || op === "updateMany") {
-        const filter = this.normalizeFilterCriteria(
-          opArgs[0] as Record<string, unknown>,
-        );
+      const runUpdate = async (single: boolean) => {
         const update = opArgs[1] as Record<string, unknown>;
-        const result =
-          op === "updateOne"
-            ? await mongoCollection.updateOne(filter, update)
-            : await mongoCollection.updateMany(filter, update);
-        const row = {
-          matchedCount: result.matchedCount,
-          modifiedCount: result.modifiedCount,
-        };
-        return {
-          columns: Object.keys(row),
-          rows: [this.mapRowToQueryRow(row, Object.keys(row))],
-          rowCount: 1,
-          affectedRows: result.modifiedCount,
-          executionTimeMs: Date.now() - startedAt,
-        };
-      }
+        return single
+          ? mongoCollection.updateOne(normalizeCriteria(), update)
+          : mongoCollection.updateMany(normalizeCriteria(), update);
+      };
+      const runDelete = async (single: boolean) =>
+        single
+          ? mongoCollection.deleteOne(normalizeCriteria())
+          : mongoCollection.deleteMany(normalizeCriteria());
 
-      if (op === "deleteOne" || op === "deleteMany") {
-        const filter = this.normalizeFilterCriteria(
-          opArgs[0] as Record<string, unknown>,
-        );
-        const result =
-          op === "deleteOne"
-            ? await mongoCollection.deleteOne(filter)
-            : await mongoCollection.deleteMany(filter);
-        const row = { deletedCount: result.deletedCount };
-        return {
-          columns: Object.keys(row),
-          rows: [this.mapRowToQueryRow(row, Object.keys(row))],
-          rowCount: 1,
-          affectedRows: result.deletedCount,
-          executionTimeMs: Date.now() - startedAt,
-        };
-      }
+      const collectionHandlers: Record<string, () => Promise<QueryResult>> = {
+        find: async () =>
+          this.buildMongoDocumentRowsQueryResult(
+            await findDocuments(limit),
+            startedAt,
+          ),
+        findOne: async () =>
+          this.buildMongoDocumentRowsQueryResult(
+            await findDocuments(1),
+            startedAt,
+          ),
+        countDocuments: async () => {
+          const count = await mongoCollection.countDocuments(
+            normalizeCriteria(),
+          );
+          return this.buildMongoSingleRowQueryResult({ count }, startedAt);
+        },
+        insertOne: async () => {
+          const doc = opArgs[0] as Record<string, unknown>;
+          const result = await mongoCollection.insertOne(doc);
+          return this.buildMongoSingleRowQueryResult(
+            {
+              acknowledged: result.acknowledged,
+              insertedId: String(result.insertedId),
+            },
+            startedAt,
+            result.acknowledged ? 1 : 0,
+          );
+        },
+        insertMany: async () => {
+          const docs = opArgs[0] as Record<string, unknown>[];
+          const result = await mongoCollection.insertMany(docs);
+          return this.buildMongoSingleRowQueryResult(
+            {
+              acknowledged: result.acknowledged,
+              insertedCount: result.insertedCount,
+            },
+            startedAt,
+            result.insertedCount,
+          );
+        },
+        updateOne: async () => {
+          const result = await runUpdate(true);
+          return this.buildMongoSingleRowQueryResult(
+            {
+              matchedCount: result.matchedCount,
+              modifiedCount: result.modifiedCount,
+            },
+            startedAt,
+            result.modifiedCount,
+          );
+        },
+        updateMany: async () => {
+          const result = await runUpdate(false);
+          return this.buildMongoSingleRowQueryResult(
+            {
+              matchedCount: result.matchedCount,
+              modifiedCount: result.modifiedCount,
+            },
+            startedAt,
+            result.modifiedCount,
+          );
+        },
+        deleteOne: async () => {
+          const result = await runDelete(true);
+          return this.buildMongoSingleRowQueryResult(
+            { deletedCount: result.deletedCount },
+            startedAt,
+            result.deletedCount,
+          );
+        },
+        deleteMany: async () => {
+          const result = await runDelete(false);
+          return this.buildMongoSingleRowQueryResult(
+            { deletedCount: result.deletedCount },
+            startedAt,
+            result.deletedCount,
+          );
+        },
+        aggregate: async () => {
+          if (!Array.isArray(opArgs[0])) {
+            throw new Error(
+              "MongoDB aggregate expects a pipeline array as the first argument.",
+            );
+          }
+          const pipeline = opArgs[0] as Record<string, unknown>[];
+          const boundedPipeline = [...pipeline];
+          if (skip > 0) {
+            boundedPipeline.push({ $skip: skip });
+          }
+          boundedPipeline.push({ $limit: limit });
+          const docs = await mongoCollection
+            .aggregate(boundedPipeline, {
+              promoteValues: false,
+              bsonRegExp: false,
+            })
+            .toArray();
+          return this.buildMongoDocumentRowsQueryResult(docs, startedAt);
+        },
+        createIndex: async () => {
+          const key =
+            opArgs[0] &&
+            typeof opArgs[0] === "object" &&
+            !Array.isArray(opArgs[0])
+              ? (opArgs[0] as Record<string, unknown>)
+              : {};
+          const options =
+            opArgs[1] &&
+            typeof opArgs[1] === "object" &&
+            !Array.isArray(opArgs[1])
+              ? (opArgs[1] as Record<string, unknown>)
+              : undefined;
+          const name = await mongoCollection.createIndex(
+            key as Parameters<typeof mongoCollection.createIndex>[0],
+            options as Parameters<typeof mongoCollection.createIndex>[1],
+          );
+          return this.buildMongoSingleRowQueryResult(
+            { ok: 1, name },
+            startedAt,
+          );
+        },
+      };
 
-      if (op === "aggregate") {
-        const pipeline = opArgs[0] as Record<string, unknown>[];
-        const boundedPipeline = [...pipeline];
-        if (skip > 0) {
-          boundedPipeline.push({ $skip: skip });
-        }
-        boundedPipeline.push({ $limit: limit });
-        const docs = await mongoCollection
-          .aggregate(boundedPipeline, {
-            promoteValues: false,
-            bsonRegExp: false,
-          })
-          .toArray();
-        const rows = docs.map((doc) =>
-          this.toRow(doc as Record<string, unknown>),
-        );
-        const columns = inferColumnsFromRows(rows, "_id").map((c) => c.name);
-        return {
-          columns,
-          rows: rows.map((row) => this.mapRowToQueryRow(row, columns)),
-          rowCount: rows.length,
-          executionTimeMs: Date.now() - startedAt,
-        };
-      }
-
-      if (op === "createIndex") {
-        const key =
-          opArgs[0] &&
-          typeof opArgs[0] === "object" &&
-          !Array.isArray(opArgs[0])
-            ? (opArgs[0] as Record<string, unknown>)
-            : {};
-        const options =
-          opArgs[1] &&
-          typeof opArgs[1] === "object" &&
-          !Array.isArray(opArgs[1])
-            ? (opArgs[1] as Record<string, unknown>)
-            : undefined;
-        const name = await mongoCollection.createIndex(
-          key as Parameters<typeof mongoCollection.createIndex>[0],
-          options as Parameters<typeof mongoCollection.createIndex>[1],
-        );
-        const row = { ok: 1, name };
-        const columns = Object.keys(row);
-        return {
-          columns,
-          rows: [this.mapRowToQueryRow(row, columns)],
-          rowCount: 1,
-          executionTimeMs: Date.now() - startedAt,
-        };
+      const collectionHandler = collectionHandlers[op];
+      if (collectionHandler) {
+        return collectionHandler();
       }
 
       throw new Error(
@@ -1461,7 +1419,7 @@ export class MongoDBDriver implements IDBDriver {
 
     for (const operation of operations) {
       const result = await executeOperation(operation);
-      const mappedRows = mapQueryRowsToObjects(result);
+      const mappedRows = this.mapQueryResultRowsToObjects(result);
       totalRowCount += mappedRows.length;
       const availableSlots = MONGODB_QUERY_HARD_CAP - rawRows.length;
       if (availableSlots > 0) {
@@ -1747,15 +1705,16 @@ export class MongoDBDriver implements IDBDriver {
     const dbRef = database
       ? `db.getSiblingDB(${JSON.stringify(database)})`
       : "db";
+    const collectionRef = this.buildCollectionRef(dbRef, table);
 
     if (operation === "insert") {
       const doc = this.serializeMongosh(data.values ?? {});
-      return `${dbRef}.${table}.insertOne(${doc})`;
+      return `${collectionRef}.insertOne(${doc})`;
     }
     if (operation === "update") {
       const filter = this.serializeMongosh(data.primaryKeys ?? {});
       const update = this.serializeMongosh({ $set: data.changes ?? {} });
-      return `${dbRef}.${table}.updateMany(\n  ${filter},\n  ${update}\n)`;
+      return `${collectionRef}.updateMany(\n  ${filter},\n  ${update}\n)`;
     }
     // delete
     const filterValue = data.primaryKeyValuesList?.length
@@ -1763,7 +1722,7 @@ export class MongoDBDriver implements IDBDriver {
         ? data.primaryKeyValuesList[0]
         : { $or: data.primaryKeyValuesList }
       : (data.primaryKeys ?? {});
-    return `${dbRef}.${table}.deleteMany(${this.serializeMongosh(filterValue)})`;
+    return `${collectionRef}.deleteMany(${this.serializeMongosh(filterValue)})`;
   }
 
   async runTransaction(operations: TransactionOperation[]): Promise<void> {
@@ -1969,7 +1928,7 @@ export class MongoDBDriver implements IDBDriver {
     const coll =
       dotIdx !== -1 ? qualifiedTableName.slice(dotIdx + 1) : qualifiedTableName;
     const dbRef = db ? `db.getSiblingDB(${JSON.stringify(db)})` : "db";
-    return `${dbRef}.${coll}.insertOne({ })`;
+    return `${this.buildCollectionRef(dbRef, coll)}.insertOne({ })`;
   }
 
   buildInsertValueExpr(_column: ColumnTypeMeta, _paramIndex: number): string {
@@ -2023,6 +1982,12 @@ export class MongoDBDriver implements IDBDriver {
 
   private buildDbRef(database?: string): string {
     return `db.getSiblingDB(${JSON.stringify(database || this.defaultDatabaseName())})`;
+  }
+
+  private buildCollectionRef(dbRef: string, collectionName: string): string {
+    return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(collectionName)
+      ? `${dbRef}.${collectionName}`
+      : `${dbRef}.getCollection(${JSON.stringify(collectionName)})`;
   }
 
   private async getCollectionDefinition(
@@ -2311,6 +2276,47 @@ export class MongoDBDriver implements IDBDriver {
     }
 
     return trimmed;
+  }
+
+  private buildMongoSingleRowQueryResult(
+    row: Record<string, unknown>,
+    startedAt: number,
+    affectedRows?: number,
+  ): QueryResult {
+    const columns = Object.keys(row);
+    return {
+      columns,
+      rows: [this.mapRowToQueryRow(row, columns)],
+      rowCount: 1,
+      affectedRows,
+      executionTimeMs: Date.now() - startedAt,
+    };
+  }
+
+  private buildMongoDocumentRowsQueryResult(
+    docs: readonly Record<string, unknown>[],
+    startedAt: number,
+  ): QueryResult {
+    const rows = docs.map((doc) => this.toRow(doc));
+    const columns = inferColumnsFromRows(rows, "_id").map(
+      (column) => column.name,
+    );
+    return {
+      columns,
+      rows: rows.map((row) => this.mapRowToQueryRow(row, columns)),
+      rowCount: rows.length,
+      executionTimeMs: Date.now() - startedAt,
+    };
+  }
+
+  private mapQueryResultRowsToObjects(
+    result: QueryResult,
+  ): Record<string, unknown>[] {
+    return result.rows.map((row) =>
+      Object.fromEntries(
+        result.columns.map((column, index) => [column, row[`__col_${index}`]]),
+      ),
+    );
   }
 
   private mapRowToQueryRow(

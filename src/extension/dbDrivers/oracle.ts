@@ -2,6 +2,11 @@ import oracledb from "oracledb";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { ConnectionConfig } from "../connectionManager";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
+import {
+  escapeSqlPreviewStringLiteral,
+  formatHexSqlPreviewLiteral,
+  formatSqlPreviewStringLiteral,
+} from "./sqlPreviewLiterals";
 import type { DriverTimeoutSettingsProvider } from "./timeout";
 import type {
   ColumnMeta,
@@ -221,15 +226,6 @@ function oracleTimestampPreviewText(value: Date, useUtc: boolean): string {
       : "";
   return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}${fraction}`;
 }
-function escapeOraclePreviewSqlString(value: string): string {
-  return value.replace(/'/g, "''");
-}
-function formatOracleQuotedStringLiteral(
-  value: string,
-  useNationalCharacterSet = false,
-): string {
-  return `${useNationalCharacterSet ? "N" : ""}'${escapeOraclePreviewSqlString(value)}'`;
-}
 function splitOraclePreviewLiteral(value: string): string[] {
   const characters = Array.from(value);
   if (characters.length === 0) {
@@ -259,15 +255,12 @@ function formatOracleLobPreviewExpression(
   return splitOraclePreviewLiteral(value)
     .map(
       (chunk) =>
-        `${options.converter}(${formatOracleQuotedStringLiteral(chunk, options.useNationalCharacterSet)})`,
+        `${options.converter}(${formatSqlPreviewStringLiteral(chunk, options.useNationalCharacterSet ? "N" : "")})`,
     )
     .join(" || ");
 }
 function formatOracleXmlPreviewExpression(value: string): string {
   return `XMLTYPE(${formatOracleLobPreviewExpression(value, { converter: "TO_CLOB" })})`;
-}
-function formatOracleBinaryPreviewLiteral(value: Buffer): string {
-  return `HEXTORAW('${value.toString("hex")}')`;
 }
 function isUnavailableOracleDdl(ddl: string): boolean {
   return ddl.startsWith("-- ");
@@ -1965,15 +1958,15 @@ export class OracleDriver extends BaseDBDriver {
             0,
             19,
           );
-          return `TO_DATE('${escapeOraclePreviewSqlString(temporalText)}', 'YYYY-MM-DD HH24:MI:SS')`;
+          return `TO_DATE('${escapeSqlPreviewStringLiteral(temporalText)}', 'YYYY-MM-DD HH24:MI:SS')`;
         }
         if (isTimezoneAwareOracleTemporal(column.nativeType)) {
           const temporalText = oracleTimestampPreviewText(value, true);
-          return `TO_TIMESTAMP_TZ('${escapeOraclePreviewSqlString(temporalText)} +00:00', 'YYYY-MM-DD HH24:MI:SS.FF3 TZH:TZM')`;
+          return `TO_TIMESTAMP_TZ('${escapeSqlPreviewStringLiteral(temporalText)} +00:00', 'YYYY-MM-DD HH24:MI:SS.FF3 TZH:TZM')`;
         }
         if (typeName.startsWith("TIMESTAMP")) {
           const temporalText = oracleTimestampPreviewText(value, false);
-          return `TO_TIMESTAMP('${escapeOraclePreviewSqlString(temporalText)}', 'YYYY-MM-DD HH24:MI:SS.FF3')`;
+          return `TO_TIMESTAMP('${escapeSqlPreviewStringLiteral(temporalText)}', 'YYYY-MM-DD HH24:MI:SS.FF3')`;
         }
       }
       if (typeof value === "string") {
@@ -1993,22 +1986,18 @@ export class OracleDriver extends BaseDBDriver {
           });
         }
         if (typeName === "NCHAR" || typeName === "NVARCHAR2") {
-          return formatOracleQuotedStringLiteral(value, true);
+          return formatSqlPreviewStringLiteral(value, "N");
         }
       }
     }
     if (Buffer.isBuffer(value)) {
-      return formatOracleBinaryPreviewLiteral(value);
+      return `HEXTORAW('${formatHexSqlPreviewLiteral(value)}')`;
     }
     if (value instanceof ArrayBuffer) {
-      return formatOracleBinaryPreviewLiteral(
-        Buffer.from(new Uint8Array(value)),
-      );
+      return `HEXTORAW('${formatHexSqlPreviewLiteral(Buffer.from(new Uint8Array(value)))}')`;
     }
     if (ArrayBuffer.isView(value)) {
-      return formatOracleBinaryPreviewLiteral(
-        Buffer.from(value.buffer, value.byteOffset, value.byteLength),
-      );
+      return `HEXTORAW('${formatHexSqlPreviewLiteral(Buffer.from(value.buffer, value.byteOffset, value.byteLength))}')`;
     }
     return this.formatPreviewSqlLiteral(value);
   }
@@ -2017,17 +2006,13 @@ export class OracleDriver extends BaseDBDriver {
       return oracleTimestampPreviewLiteral(value);
     }
     if (Buffer.isBuffer(value)) {
-      return formatOracleBinaryPreviewLiteral(value);
+      return `HEXTORAW('${formatHexSqlPreviewLiteral(value)}')`;
     }
     if (value instanceof ArrayBuffer) {
-      return formatOracleBinaryPreviewLiteral(
-        Buffer.from(new Uint8Array(value)),
-      );
+      return `HEXTORAW('${formatHexSqlPreviewLiteral(Buffer.from(new Uint8Array(value)))}')`;
     }
     if (ArrayBuffer.isView(value)) {
-      return formatOracleBinaryPreviewLiteral(
-        Buffer.from(value.buffer, value.byteOffset, value.byteLength),
-      );
+      return `HEXTORAW('${formatHexSqlPreviewLiteral(Buffer.from(value.buffer, value.byteOffset, value.byteLength))}')`;
     }
     return super.formatPreviewSqlLiteral(value);
   }
@@ -2185,13 +2170,15 @@ export class OracleDriver extends BaseDBDriver {
     value: string | [string, string] | undefined,
     paramIndex: number,
   ): FilterConditionResult | null {
-    const col = this.quoteIdentifier(column.name);
-    if (operator === "is_null") return { sql: `${col} IS NULL`, params: [] };
-    if (operator === "is_not_null")
-      return { sql: `${col} IS NOT NULL`, params: [] };
-    if (!column.filterable) return null;
-    if (value === undefined) return null;
-    const val = typeof value === "string" ? value.trim() : value;
+    const preamble = this.createFilterConditionPreamble(
+      column,
+      operator,
+      value,
+    );
+    if (!preamble) return null;
+    if (preamble.kind === "resolved") return preamble.condition;
+    const col = preamble.columnSql;
+    const val = preamble.value;
     if (oracleTypeName(column.nativeType) === "XMLTYPE") {
       if (
         operator !== "like" &&

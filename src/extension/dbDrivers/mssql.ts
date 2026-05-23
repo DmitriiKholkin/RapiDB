@@ -8,6 +8,10 @@ import {
   isoToLocalDateStr,
   normalizeSqlDatetimeOffsetSpacing,
 } from "./BaseDBDriver";
+import {
+  formatHexSqlPreviewLiteral,
+  formatSqlPreviewStringLiteral,
+} from "./sqlPreviewLiterals";
 import type { DriverTimeoutSettingsProvider } from "./timeout";
 import type {
   ColumnMeta,
@@ -417,15 +421,9 @@ function cleanMssqlDefault(raw: string): string {
   }
   return s;
 }
-function escapeMssqlPreviewSqlString(value: string): string {
-  return value.replace(/'/g, "''");
-}
 const escapeMssqlId = (s: string) => s.replace(/]/g, "]]");
 function baseTypeName(typeName: string): string {
   return typeName.toLowerCase().split("(")[0].trim();
-}
-function formatMssqlBinaryPreviewLiteral(value: Buffer): string {
-  return `0x${value.toString("hex")}`;
 }
 function isUnicodeMssqlLiteralType(nativeType: string): boolean {
   return ["nchar", "nvarchar", "ntext", "xml"].includes(
@@ -436,11 +434,12 @@ function formatMssqlStringPreviewLiteral(
   value: string,
   nativeType?: string,
 ): string {
-  const prefix =
+  return formatSqlPreviewStringLiteral(
+    value,
     nativeType !== undefined && isUnicodeMssqlLiteralType(nativeType)
       ? "N"
-      : "";
-  return `${prefix}'${escapeMssqlPreviewSqlString(value)}'`;
+      : "",
+  );
 }
 function normalizeDatetimeLiteral(value: string): string {
   return normalizeSqlDatetimeOffsetSpacing(value.trim());
@@ -1673,16 +1672,17 @@ export class MSSQLDriver extends BaseDBDriver {
       return value ? "1" : "0";
     }
     if (Buffer.isBuffer(value)) {
-      return formatMssqlBinaryPreviewLiteral(value);
+      return formatHexSqlPreviewLiteral(value, { prefix: "0x" });
     }
     if (value instanceof ArrayBuffer) {
-      return formatMssqlBinaryPreviewLiteral(
-        Buffer.from(new Uint8Array(value)),
-      );
+      return formatHexSqlPreviewLiteral(Buffer.from(new Uint8Array(value)), {
+        prefix: "0x",
+      });
     }
     if (ArrayBuffer.isView(value)) {
-      return formatMssqlBinaryPreviewLiteral(
+      return formatHexSqlPreviewLiteral(
         Buffer.from(value.buffer, value.byteOffset, value.byteLength),
+        { prefix: "0x" },
       );
     }
     return super.formatPreviewSqlLiteral(value);
@@ -1835,13 +1835,15 @@ export class MSSQLDriver extends BaseDBDriver {
     value: string | [string, string] | undefined,
     _paramIndex: number,
   ): FilterConditionResult | null {
-    const col = this.quoteIdentifier(column.name);
-    if (operator === "is_null") return { sql: `${col} IS NULL`, params: [] };
-    if (operator === "is_not_null") {
-      return { sql: `${col} IS NOT NULL`, params: [] };
-    }
-    if (!column.filterable || value === undefined) return null;
-    const val = typeof value === "string" ? value.trim() : value;
+    const preamble = this.createFilterConditionPreamble(
+      column,
+      operator,
+      value,
+    );
+    if (!preamble) return null;
+    if (preamble.kind === "resolved") return preamble.condition;
+    const col = preamble.columnSql;
+    const val = preamble.value;
     if (column.category === "array") {
       if (operator !== "like" && operator !== "ilike") {
         return null;

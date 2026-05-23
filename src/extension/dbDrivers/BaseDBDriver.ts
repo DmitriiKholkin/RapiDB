@@ -6,6 +6,10 @@ import type {
 } from "../../shared/webviewContracts";
 import { createSqlReadOnlyQueryGuard } from "../utils/readOnlyGuards";
 import {
+  createSqlFilterPreamble,
+  type SqlFilterPreambleResult,
+} from "./sqlFilterPrelude";
+import {
   type DriverTimeoutSettingsProvider,
   type DriverTimeoutSettingsSnapshot,
   getDefaultDriverTimeoutSettings,
@@ -1563,13 +1567,15 @@ export abstract class BaseDBDriver implements IDBDriver {
     value: string | [string, string] | undefined,
     paramIndex: number,
   ): FilterConditionResult | null {
-    const col = this.quoteIdentifier(column.name);
-    if (operator === "is_null") return { sql: `${col} IS NULL`, params: [] };
-    if (operator === "is_not_null")
-      return { sql: `${col} IS NOT NULL`, params: [] };
-    if (!column.filterable) return null;
-    if (value === undefined) return null;
-    const val = typeof value === "string" ? value.trim() : value;
+    const preamble = this.createFilterConditionPreamble(
+      column,
+      operator,
+      value,
+    );
+    if (!preamble) return null;
+    if (preamble.kind === "resolved") return preamble.condition;
+    const col = preamble.columnSql;
+    const val = preamble.value;
     if (column.category === "array") {
       if (operator !== "like" && operator !== "ilike") {
         return null;
@@ -1673,6 +1679,18 @@ export abstract class BaseDBDriver implements IDBDriver {
     _paramIndex: number,
   ): FilterConditionResult {
     return { sql: `CAST(${col} AS CHAR) LIKE ?`, params: [`%${val}%`] };
+  }
+  protected createFilterConditionPreamble(
+    column: ColumnTypeMeta,
+    operator: FilterOperator,
+    value: string | [string, string] | undefined,
+  ): SqlFilterPreambleResult {
+    return createSqlFilterPreamble({
+      column,
+      operator,
+      value,
+      quoteIdentifier: (identifier) => this.quoteIdentifier(identifier),
+    });
   }
   protected sqlOperator(op: FilterOperator): string {
     switch (op) {

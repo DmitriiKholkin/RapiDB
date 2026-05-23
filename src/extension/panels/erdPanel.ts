@@ -2,7 +2,14 @@ import * as vscode from "vscode";
 import { parseErdPanelMessage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import { ErdGraphService } from "../services/erdGraphService";
-import { normalizeUnknownError } from "../utils/errorHandling";
+import {
+  logErrorWithContext,
+  normalizeUnknownError,
+} from "../utils/errorHandling";
+import {
+  attachPanelDisposables,
+  disposePanelInstances,
+} from "./panelLifecycle";
 import { createPanelWebviewOptions } from "./panelRetentionPolicy";
 import { TablePanel } from "./tablePanel";
 import { createWebviewShell } from "./webviewShell";
@@ -44,16 +51,24 @@ export class ErdPanel {
     });
 
     this.panel.webview.onDidReceiveMessage(async (message) => {
-      await this.handleMessage(message);
+      try {
+        await this.handleMessage(message);
+      } catch (error: unknown) {
+        const normalized = logErrorWithContext(
+          "ErdPanel unhandled error",
+          error,
+        );
+        vscode.window.showErrorMessage(
+          `[RapiDB] Unexpected error: ${normalized.message}`,
+        );
+      }
     });
   }
 
   static disposeAll(): void {
-    for (const panel of ErdPanel.panels.values()) {
-      try {
-        panel.panel.dispose();
-      } catch {}
-    }
+    disposePanelInstances(ErdPanel.panels.values(), (panel) => {
+      panel.panel.dispose();
+    });
     ErdPanel.panels.clear();
 
     ErdPanel.graphService?.dispose();
@@ -118,10 +133,7 @@ export class ErdPanel {
       }
     });
 
-    panel.onDidDispose(() => {
-      confSub.dispose();
-      disconnectSub.dispose();
-    });
+    attachPanelDisposables(panel, confSub, disconnectSub);
   }
 
   private static key(scope: ErdPanelScope): string {

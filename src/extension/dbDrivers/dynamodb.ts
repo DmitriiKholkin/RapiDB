@@ -51,6 +51,7 @@ import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import {
   applyFilters,
   applySort,
+  createNoSqlUnsupportedMetadataHandlers,
   inferColumnsFromRows,
   pageRows,
   unsupported,
@@ -109,6 +110,8 @@ const DYNAMODB_ENTITY_MANIFEST: DriverEntityManifest = {
 
 const DYNAMODB_CURSOR_FETCH_LIMIT = 200;
 const DYNAMODB_MAX_MATERIALIZED_ROWS = 5000;
+const DYNAMODB_UNSUPPORTED_METADATA =
+  createNoSqlUnsupportedMetadataHandlers("DynamoDB");
 
 type IndexedFilter = {
   index: number;
@@ -185,6 +188,80 @@ type DynamoCursorSession = {
 type QueryDispatchResult = {
   rows: Record<string, unknown>[];
   affectedRows?: number;
+};
+
+type DynamoNativeCommandCtor = new (input: never) => object;
+
+type DynamoNativeDispatchSpec = {
+  readonly ctor: DynamoNativeCommandCtor;
+  readonly invalidation: "none" | "table" | "requestItems" | "transactItems";
+  readonly includeInputInResult: boolean;
+};
+
+const DYNAMO_SCALAR_FILTER_OPERATORS: Readonly<
+  Partial<Record<FilterOperator, string>>
+> = {
+  eq: "=",
+  neq: "<>",
+  gt: ">",
+  gte: ">=",
+  lt: "<",
+  lte: "<=",
+};
+
+const DYNAMO_NATIVE_DISPATCH_MAP: Readonly<
+  Record<DynamoDbNativeOperationName, DynamoNativeDispatchSpec>
+> = {
+  GetItem: {
+    ctor: GetItemCommand as unknown as DynamoNativeCommandCtor,
+    invalidation: "none",
+    includeInputInResult: false,
+  },
+  Query: {
+    ctor: QueryCommand as unknown as DynamoNativeCommandCtor,
+    invalidation: "none",
+    includeInputInResult: false,
+  },
+  Scan: {
+    ctor: ScanCommand as unknown as DynamoNativeCommandCtor,
+    invalidation: "none",
+    includeInputInResult: false,
+  },
+  PutItem: {
+    ctor: PutItemCommand as unknown as DynamoNativeCommandCtor,
+    invalidation: "table",
+    includeInputInResult: true,
+  },
+  UpdateItem: {
+    ctor: UpdateItemCommand as unknown as DynamoNativeCommandCtor,
+    invalidation: "table",
+    includeInputInResult: true,
+  },
+  DeleteItem: {
+    ctor: DeleteItemCommand as unknown as DynamoNativeCommandCtor,
+    invalidation: "table",
+    includeInputInResult: true,
+  },
+  BatchGetItem: {
+    ctor: BatchGetItemCommand as unknown as DynamoNativeCommandCtor,
+    invalidation: "none",
+    includeInputInResult: false,
+  },
+  BatchWriteItem: {
+    ctor: BatchWriteItemCommand as unknown as DynamoNativeCommandCtor,
+    invalidation: "requestItems",
+    includeInputInResult: true,
+  },
+  TransactGetItems: {
+    ctor: TransactGetItemsCommand as unknown as DynamoNativeCommandCtor,
+    invalidation: "none",
+    includeInputInResult: false,
+  },
+  TransactWriteItems: {
+    ctor: TransactWriteItemsCommand as unknown as DynamoNativeCommandCtor,
+    invalidation: "transactItems",
+    includeInputInResult: true,
+  },
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -380,21 +457,13 @@ export class DynamoDBDriver implements IDBDriver {
     }
   }
 
-  async getForeignKeys(): Promise<ForeignKeyMeta[]> {
-    return [];
-  }
+  getForeignKeys = DYNAMODB_UNSUPPORTED_METADATA.getForeignKeys;
 
-  async getConstraints(): Promise<TableConstraintMeta[]> {
-    return [];
-  }
+  getConstraints = DYNAMODB_UNSUPPORTED_METADATA.getConstraints;
 
-  async getTriggers(): Promise<TriggerMeta[] | null> {
-    return null;
-  }
+  getTriggers = DYNAMODB_UNSUPPORTED_METADATA.getTriggers;
 
-  async getConstraintDDL(): Promise<string> {
-    unsupported("DynamoDB constraints DDL");
-  }
+  getConstraintDDL = DYNAMODB_UNSUPPORTED_METADATA.getConstraintDDL;
 
   async getIndexDDL(
     _database: string,
@@ -444,9 +513,7 @@ export class DynamoDBDriver implements IDBDriver {
     ]);
   }
 
-  async getTriggerDDL(): Promise<string> {
-    unsupported("DynamoDB trigger DDL");
-  }
+  getTriggerDDL = DYNAMODB_UNSUPPORTED_METADATA.getTriggerDDL;
 
   async getCreateTableDDL(
     _database: string,
@@ -521,13 +588,9 @@ export class DynamoDBDriver implements IDBDriver {
     ]);
   }
 
-  async getObjectDefinition(): Promise<string | null> {
-    return null;
-  }
+  getObjectDefinition = DYNAMODB_UNSUPPORTED_METADATA.getObjectDefinition;
 
-  async getRoutineDefinition(): Promise<string> {
-    unsupported("DynamoDB routine definition");
-  }
+  getRoutineDefinition = DYNAMODB_UNSUPPORTED_METADATA.getRoutineDefinition;
 
   async query(queryText: string, _params?: unknown[]): Promise<QueryResult> {
     const inputs = parseDynamoDbNativeQueryInputs(queryText);
@@ -607,15 +670,12 @@ export class DynamoDBDriver implements IDBDriver {
           request.filters,
           describedByName,
         );
-      const columns = this.mergeDescribedColumns(
-        filteredPage.rawRows.length > 0
-          ? this.buildDynamoColumns(filteredPage.rawRows, schema)
-          : describedColumns,
-        describedColumns,
-        schema,
-      );
       return {
-        columns,
+        columns: this.resolveReadTablePageColumns(
+          filteredPage.rawRows,
+          schema,
+          describedColumns,
+        ),
         rows: filteredPage.formattedRows,
         totalCount: 0,
       };
@@ -638,15 +698,12 @@ export class DynamoDBDriver implements IDBDriver {
       );
       const filteredRows = applyFilters(formattedRows, request.filters);
       const sortedRows = applySort(filteredRows, request.sort);
-      const columns = this.mergeDescribedColumns(
-        sortedRows.length > 0
-          ? this.buildDynamoColumns(materialized.rows, schema)
-          : describedColumns,
-        describedColumns,
-        schema,
-      );
       return {
-        columns,
+        columns: this.resolveReadTablePageColumns(
+          sortedRows.length > 0 ? materialized.rows : [],
+          schema,
+          describedColumns,
+        ),
         rows: pageRows(sortedRows, request.page, request.pageSize),
         totalCount: request.skipCount ? 0 : sortedRows.length,
       };
@@ -661,16 +718,13 @@ export class DynamoDBDriver implements IDBDriver {
     const formattedRows = pageResult.rows.map((row) =>
       this.formatDynamoRowForDisplay(row, describedByName),
     );
-    const columns = this.mergeDescribedColumns(
-      pageResult.rows.length > 0
-        ? this.buildDynamoColumns(pageResult.rows, schema)
-        : describedColumns,
-      describedColumns,
-      schema,
-    );
 
     return {
-      columns,
+      columns: this.resolveReadTablePageColumns(
+        pageResult.rows,
+        schema,
+        describedColumns,
+      ),
       rows: formattedRows,
       totalCount: request.skipCount ? 0 : await this.countReadPlan(plan),
     };
@@ -1002,22 +1056,10 @@ export class DynamoDBDriver implements IDBDriver {
       return null;
     }
     const param = this.coerceFilterParameter(column, value);
-    switch (operator) {
-      case "eq":
-        return { sql: `${identifier} = ?`, params: [param] };
-      case "neq":
-        return { sql: `${identifier} <> ?`, params: [param] };
-      case "gt":
-        return { sql: `${identifier} > ?`, params: [param] };
-      case "gte":
-        return { sql: `${identifier} >= ?`, params: [param] };
-      case "lt":
-        return { sql: `${identifier} < ?`, params: [param] };
-      case "lte":
-        return { sql: `${identifier} <= ?`, params: [param] };
-      default:
-        return null;
-    }
+    const scalarOperator = this.resolveScalarFilterOperator(operator);
+    return scalarOperator
+      ? { sql: `${identifier} ${scalarOperator} ?`, params: [param] }
+      : null;
   }
 
   buildInsertDefaultValuesSql(qualifiedTableName: string): string {
@@ -1053,8 +1095,9 @@ export class DynamoDBDriver implements IDBDriver {
     if (!table) {
       return;
     }
+    const serializedTable = JSON.stringify(table).slice(1, -1);
     for (const key of [...this.cursorCache.keys()]) {
-      if (key.includes(`"table":"${table}"`)) {
+      if (key.includes(`"table":"${serializedTable}"`)) {
         this.cursorCache.delete(key);
       }
     }
@@ -1507,14 +1550,12 @@ export class DynamoDBDriver implements IDBDriver {
         state,
         this.coerceFilterValueForColumn(column, comparator.filter.value),
       );
-      const operator =
-        comparator.filter.operator === "gte"
-          ? ">="
-          : comparator.filter.operator === "gt"
-            ? ">"
-            : comparator.filter.operator === "lte"
-              ? "<="
-              : "<";
+      const operator = this.resolveScalarFilterOperator(
+        comparator.filter.operator,
+      );
+      if (!operator) {
+        return null;
+      }
       return {
         expression: `${name} ${operator} ${value}`,
         consumedIndexes: [comparator.index],
@@ -1645,23 +1686,18 @@ export class DynamoDBDriver implements IDBDriver {
           state,
           this.coerceFilterValueForColumn(column, filter.value),
         );
-        const operator =
-          filter.operator === "eq"
-            ? "="
-            : filter.operator === "neq"
-              ? "<>"
-              : filter.operator === "gt"
-                ? ">"
-                : filter.operator === "gte"
-                  ? ">="
-                  : filter.operator === "lt"
-                    ? "<"
-                    : "<=";
-        return `${name} ${operator} ${value}`;
+        const operator = this.resolveScalarFilterOperator(filter.operator);
+        return operator ? `${name} ${operator} ${value}` : null;
       }
       default:
         return null;
     }
+  }
+
+  private resolveScalarFilterOperator(
+    operator: FilterOperator,
+  ): string | undefined {
+    return DYNAMO_SCALAR_FILTER_OPERATORS[operator];
   }
 
   private supportsServerSort(
@@ -2128,80 +2164,41 @@ export class DynamoDBDriver implements IDBDriver {
     rawInput: Record<string, unknown>,
   ): Promise<QueryDispatchResult> {
     const input = this.requireInputRecord(rawInput);
-    switch (operation) {
-      case "GetItem": {
-        const output = await this.requireClient().send(
-          new GetItemCommand(input as unknown as GetItemCommandInput),
+    const spec = DYNAMO_NATIVE_DISPATCH_MAP[operation];
+    const output = await this.requireClient().send(
+      new spec.ctor(input as never) as never,
+    );
+
+    this.applyNativeDispatchInvalidation(spec.invalidation, input);
+
+    return spec.includeInputInResult
+      ? this.toQueryDispatchResult(
+          operation,
+          output as unknown as Record<string, unknown>,
+          input,
+        )
+      : this.toQueryDispatchResult(
+          operation,
+          output as unknown as Record<string, unknown>,
         );
-        return this.toQueryDispatchResult(operation, output);
-      }
-      case "Query": {
-        const output = await this.requireClient().send(
-          new QueryCommand(input as unknown as QueryCommandInput),
-        );
-        return this.toQueryDispatchResult(operation, output);
-      }
-      case "Scan": {
-        const output = await this.requireClient().send(
-          new ScanCommand(input as unknown as ScanCommandInput),
-        );
-        return this.toQueryDispatchResult(operation, output);
-      }
-      case "PutItem": {
-        const output = await this.requireClient().send(
-          new PutItemCommand(input as unknown as PutItemCommandInput),
-        );
+  }
+
+  private applyNativeDispatchInvalidation(
+    invalidation: DynamoNativeDispatchSpec["invalidation"],
+    input: Record<string, unknown>,
+  ): void {
+    switch (invalidation) {
+      case "table":
         this.invalidateCursorCacheForTable(String(input.TableName ?? ""));
-        return this.toQueryDispatchResult(operation, output, input);
-      }
-      case "UpdateItem": {
-        const output = await this.requireClient().send(
-          new UpdateItemCommand(input as unknown as UpdateItemCommandInput),
-        );
-        this.invalidateCursorCacheForTable(String(input.TableName ?? ""));
-        return this.toQueryDispatchResult(operation, output, input);
-      }
-      case "DeleteItem": {
-        const output = await this.requireClient().send(
-          new DeleteItemCommand(input as unknown as DeleteItemCommandInput),
-        );
-        this.invalidateCursorCacheForTable(String(input.TableName ?? ""));
-        return this.toQueryDispatchResult(operation, output, input);
-      }
-      case "BatchGetItem": {
-        const output = await this.requireClient().send(
-          new BatchGetItemCommand(input as unknown as BatchGetItemCommandInput),
-        );
-        return this.toQueryDispatchResult(operation, output);
-      }
-      case "BatchWriteItem": {
-        const output = await this.requireClient().send(
-          new BatchWriteItemCommand(
-            input as unknown as BatchWriteItemCommandInput,
-          ),
-        );
+        return;
+      case "requestItems":
         this.invalidateAllTablesInRequest(input);
-        return this.toQueryDispatchResult(operation, output, input);
-      }
-      case "TransactGetItems": {
-        const output = await this.requireClient().send(
-          new TransactGetItemsCommand(
-            input as unknown as TransactGetItemsCommandInput,
-          ),
-        );
-        return this.toQueryDispatchResult(operation, output);
-      }
-      case "TransactWriteItems": {
-        const output = await this.requireClient().send(
-          new TransactWriteItemsCommand(
-            input as unknown as TransactWriteItemsCommandInput,
-          ),
-        );
+        return;
+      case "transactItems":
         this.invalidateTablesInTransaction(input);
-        return this.toQueryDispatchResult(operation, output, input);
-      }
+        return;
       default:
-        throw new Error(`Unsupported DynamoDB native operation: ${operation}`);
+        return;
     }
   }
 
@@ -2590,6 +2587,18 @@ export class DynamoDBDriver implements IDBDriver {
       "name" in error &&
       (error as { name?: unknown }).name === "ConditionalCheckFailedException"
     );
+  }
+
+  private resolveReadTablePageColumns(
+    rows: readonly Record<string, unknown>[],
+    schema: DynamoTableSchema,
+    describedColumns: readonly ColumnTypeMeta[],
+  ): ColumnTypeMeta[] {
+    const sourceColumns =
+      rows.length > 0
+        ? this.buildDynamoColumns(rows, schema)
+        : describedColumns;
+    return this.mergeDescribedColumns(sourceColumns, describedColumns, schema);
   }
 
   private mergeDescribedColumns(

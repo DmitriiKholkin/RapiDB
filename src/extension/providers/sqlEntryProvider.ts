@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import type { ConnectionManager } from "../connectionManager";
+
 export function extractFirstSqlLine(sql: string): string {
   return (
     sql
@@ -8,6 +9,43 @@ export function extractFirstSqlLine(sql: string): string {
       .find((line) => line.length > 0) ?? sql
   );
 }
+
+interface SqlEntryNodeOptions {
+  connectionName: string;
+  iconId: string;
+  contextValue: string;
+  dateLabel: string;
+  command: string;
+  commandTitle: string;
+}
+
+export abstract class SqlEntryNode<
+  TEntry extends {
+    id: string;
+    sql: string;
+  },
+> extends vscode.TreeItem {
+  constructor(
+    public readonly entry: TEntry,
+    options: SqlEntryNodeOptions,
+  ) {
+    super(extractFirstSqlLine(entry.sql), vscode.TreeItemCollapsibleState.None);
+
+    this.id = entry.id;
+    this.contextValue = options.contextValue;
+    this.iconPath = new vscode.ThemeIcon(options.iconId);
+    this.description = options.connectionName;
+    this.tooltip = new vscode.MarkdownString(
+      `**${options.connectionName}** — ${options.dateLabel}\n\`\`\`\n${entry.sql}\n\`\`\``,
+    );
+    this.command = {
+      command: options.command,
+      title: options.commandTitle,
+      arguments: [entry],
+    };
+  }
+}
+
 export abstract class SqlEntryProvider<
   TEntry extends {
     id: string;

@@ -2,6 +2,10 @@ import * as vscode from "vscode";
 import type { QueryEditorLanguage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import { logErrorWithContext } from "../utils/errorHandling";
+import {
+  attachPanelDisposables,
+  disposePanelInstances,
+} from "./panelLifecycle";
 import { createPanelWebviewOptions } from "./panelRetentionPolicy";
 import {
   type QueryPanelCachedResult,
@@ -97,21 +101,20 @@ export class QueryPanel {
       this.controller.handleConnectionsChanged();
     });
 
-    this.panel.onDidDispose(() => {
-      configWatcher.dispose();
-      schemaWatcher.dispose();
-      connectWatcher.dispose();
-      disconnectWatcher.dispose();
-      schemaRefreshWatcher.dispose();
-    });
+    attachPanelDisposables(
+      this.panel,
+      configWatcher,
+      schemaWatcher,
+      connectWatcher,
+      disconnectWatcher,
+      schemaRefreshWatcher,
+    );
   }
 
   static disposeAll(): void {
-    for (const panel of QueryPanel.panels.values()) {
-      try {
-        panel.panel.dispose();
-      } catch {}
-    }
+    disposePanelInstances(QueryPanel.panels.values(), (panel) => {
+      panel.panel.dispose();
+    });
     QueryPanel.panels.clear();
   }
 

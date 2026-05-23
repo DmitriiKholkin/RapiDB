@@ -17,6 +17,10 @@ import {
   exportTableDataAsCsv,
   exportTableDataAsJson,
 } from "../utils/exportService";
+import {
+  attachPanelDisposables,
+  disposePanelInstances,
+} from "./panelLifecycle";
 import { createPanelWebviewOptions } from "./panelRetentionPolicy";
 import { TableMutationPreviewController } from "./tableMutationPreviewController";
 import { createWebviewShell } from "./webviewShell";
@@ -147,11 +151,9 @@ export class TablePanel {
   }
 
   static disposeAll(): void {
-    for (const panel of TablePanel.panels.values()) {
-      try {
-        panel.panel.dispose();
-      } catch {}
-    }
+    disposePanelInstances(TablePanel.panels.values(), (panel) => {
+      panel.panel.dispose();
+    });
     TablePanel.panels.clear();
   }
 
@@ -212,10 +214,7 @@ export class TablePanel {
         panel.dispose();
       }
     });
-    panel.onDidDispose(() => {
-      confSub.dispose();
-      disconnSub.dispose();
-    });
+    attachPanelDisposables(panel, confSub, disconnSub);
   }
 
   private async handleMessage(msg: unknown): Promise<void> {

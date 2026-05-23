@@ -1,29 +1,16 @@
-import * as vscode from "vscode";
 import type { BookmarkEntry, ConnectionManager } from "../connectionManager";
-import { extractFirstSqlLine, SqlEntryProvider } from "./sqlEntryProvider";
+import { SqlEntryNode, SqlEntryProvider } from "./sqlEntryProvider";
 
-export class BookmarkNode extends vscode.TreeItem {
-  constructor(
-    public readonly entry: BookmarkEntry,
-    connectionName: string,
-  ) {
-    super(extractFirstSqlLine(entry.sql), vscode.TreeItemCollapsibleState.None);
-
-    this.id = entry.id;
-    this.contextValue = "bookmarkEntry";
-    this.iconPath = new vscode.ThemeIcon("bookmark");
-    this.description = connectionName;
-
-    const dateStr = new Date(entry.savedAt).toLocaleString();
-    this.tooltip = new vscode.MarkdownString(
-      `**${connectionName}** — ${dateStr}\n\`\`\`\n${entry.sql}\n\`\`\``,
-    );
-
-    this.command = {
+export class BookmarkNode extends SqlEntryNode<BookmarkEntry> {
+  constructor(entry: BookmarkEntry, connectionName: string) {
+    super(entry, {
+      connectionName,
+      iconId: "bookmark",
+      contextValue: "bookmarkEntry",
+      dateLabel: new Date(entry.savedAt).toLocaleString(),
       command: "rapidb.openBookmarkEntry",
-      title: "Open in Query Editor",
-      arguments: [entry],
-    };
+      commandTitle: "Open in Query Editor",
+    });
   }
 }
 

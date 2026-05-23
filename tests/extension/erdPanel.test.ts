@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const getGraphMock = vi.hoisted(() => vi.fn());
 const tableCreateOrShowMock = vi.hoisted(() => vi.fn());
+const showErrorMessageMock = vi.hoisted(() => vi.fn());
 
 const vscodeMock = vi.hoisted(() => {
   const createWebviewPanel = vi.fn(() => {
@@ -54,6 +55,7 @@ const vscodeMock = vi.hoisted(() => {
       ViewColumn: { One: 1 },
       window: {
         createWebviewPanel,
+        showErrorMessage: showErrorMessageMock,
       },
       workspace: {
         onDidChangeConfiguration: vi.fn(() => ({ dispose: vi.fn() })),
@@ -88,6 +90,7 @@ function createdPanel() {
 describe("ErdPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    showErrorMessageMock.mockReset();
     getGraphMock.mockResolvedValue({
       graph: {
         nodes: [],
@@ -266,6 +269,46 @@ describe("ErdPanel", () => {
       "public",
       "users",
       false,
+    );
+
+    ErdPanel.disposeAll();
+  });
+
+  it("reports unexpected panel message errors instead of rejecting", async () => {
+    const { ErdPanel } = await import("../../src/extension/panels/erdPanel");
+    tableCreateOrShowMock.mockImplementationOnce(() => {
+      throw new Error("table open failed");
+    });
+
+    const connectionManager = {
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      getConnection: vi.fn(() => ({ name: "Primary" })),
+    };
+
+    ErdPanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      {
+        connectionId: "conn-1",
+      },
+    );
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected ERD panel instance");
+    }
+
+    await expect(
+      panel.webview.dispatchMessage({
+        type: "openTableData",
+        payload: {
+          table: "users",
+        },
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(showErrorMessageMock).toHaveBeenCalledWith(
+      "[RapiDB] Unexpected error: table open failed",
     );
 
     ErdPanel.disposeAll();

@@ -4,7 +4,13 @@ import {
   inferValueCategory,
   type ScalarFilterOperator,
 } from "../../shared/tableTypes";
-import type { ColumnTypeMeta, DriverSortConfig } from "./types";
+import type {
+  ColumnTypeMeta,
+  DriverSortConfig,
+  ForeignKeyMeta,
+  TableConstraintMeta,
+  TriggerMeta,
+} from "./types";
 import { resolveFilterOperators } from "./types";
 
 function stringifyNested(value: unknown): unknown {
@@ -260,4 +266,25 @@ export function hasOperator(
   supported: readonly FilterOperator[],
 ): boolean {
   return supported.includes(operator);
+}
+
+export function createNoSqlUnsupportedMetadataHandlers(driverName: string): {
+  getForeignKeys: () => Promise<ForeignKeyMeta[]>;
+  getConstraints: () => Promise<TableConstraintMeta[]>;
+  getTriggers: () => Promise<TriggerMeta[] | null>;
+  getConstraintDDL: () => Promise<string>;
+  getTriggerDDL: () => Promise<string>;
+  getObjectDefinition: () => Promise<string | null>;
+  getRoutineDefinition: () => Promise<string>;
+} {
+  return {
+    getForeignKeys: async () => [],
+    getConstraints: async () => [],
+    getTriggers: async () => null,
+    getConstraintDDL: async () => unsupported(`${driverName} constraints DDL`),
+    getTriggerDDL: async () => unsupported(`${driverName} trigger DDL`),
+    getObjectDefinition: async () => null,
+    getRoutineDefinition: async () =>
+      unsupported(`${driverName} routine definition`),
+  };
 }

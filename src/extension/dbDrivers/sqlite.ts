@@ -1254,13 +1254,15 @@ export class SQLiteDriver extends BaseDBDriver {
     value: string | [string, string] | undefined,
     _paramIndex: number,
   ): FilterConditionResult | null {
-    const col = this.quoteIdentifier(column.name);
-    if (operator === "is_null") return { sql: `${col} IS NULL`, params: [] };
-    if (operator === "is_not_null")
-      return { sql: `${col} IS NOT NULL`, params: [] };
-    if (!column.filterable) return null;
-    if (value === undefined) return null;
-    const val = typeof value === "string" ? value.trim() : value;
+    const preamble = this.createFilterConditionPreamble(
+      column,
+      operator,
+      value,
+    );
+    if (!preamble) return null;
+    if (preamble.kind === "resolved") return preamble.condition;
+    const col = preamble.columnSql;
+    const val = preamble.value;
     if (column.category === "array") {
       if (operator !== "like" && operator !== "ilike") {
         return null;

@@ -30,6 +30,13 @@ import {
   type ConnectionManagerStore,
   VSCodeConnectionManagerStore,
 } from "./connectionManagerStore";
+import {
+  type ConnectionSecretSnapshot,
+  hasPersistedConnectionConfigChanges,
+  sanitizePersistedConnectionConfig,
+  serializeConnectionSecretsForConfig,
+  shouldForceSecretStorage,
+} from "./connectionSecrets";
 import { DynamoDBDriver } from "./dbDrivers/dynamodb";
 import { ElasticsearchDriver } from "./dbDrivers/elasticsearch";
 import { MongoDBDriver } from "./dbDrivers/mongodb";
@@ -631,160 +638,6 @@ function flattenSchemaSnapshot(snapshot: SchemaSnapshot): SchemaObjectEntry[] {
 
 const TEST_CONNECTION_ID = "__test__";
 
-interface ConnectionSecretSnapshot {
-  password?: string;
-  apiKey?: string;
-  awsAccessKeyId?: string;
-  awsSecretAccessKey?: string;
-  awsSessionToken?: string;
-  connectionUri?: string;
-  uri?: string;
-}
-
-function trimOptionalSecretValue(
-  value: string | undefined,
-): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
-function redactCredentialBearingUri(uri: string): string {
-  return uri.replace(/^([a-z][a-z\d+.-]*:\/\/)([^@/?#\s]+)@/i, "$1");
-}
-
-function extractCredentialBearingUriSecret(
-  value: string | undefined,
-): string | undefined {
-  const normalized = trimOptionalSecretValue(value);
-  if (!normalized) {
-    return undefined;
-  }
-
-  return redactCredentialBearingUri(normalized) !== normalized
-    ? normalized
-    : undefined;
-}
-
-function sanitizeUriForPersistence(
-  value: string | undefined,
-): string | undefined {
-  const normalized = trimOptionalSecretValue(value);
-  if (!normalized) {
-    return normalized;
-  }
-
-  return redactCredentialBearingUri(normalized);
-}
-
-function resolvePersistedUriSecret(
-  currentValue: string | undefined,
-  previousSecret: string | undefined,
-): string | undefined {
-  const explicitSecret = extractCredentialBearingUriSecret(currentValue);
-  if (explicitSecret) {
-    return explicitSecret;
-  }
-
-  const normalizedCurrent = trimOptionalSecretValue(currentValue);
-  if (!normalizedCurrent || !previousSecret) {
-    return undefined;
-  }
-
-  const previousRedacted = sanitizeUriForPersistence(previousSecret);
-  return previousRedacted === normalizedCurrent ? previousSecret : undefined;
-}
-
-function serializeConnectionSecrets(
-  secrets: ConnectionSecretSnapshot,
-): string | undefined {
-  const filtered = Object.fromEntries(
-    Object.entries(secrets).filter(([, value]) => typeof value === "string"),
-  );
-
-  return Object.keys(filtered).length > 0
-    ? JSON.stringify(filtered)
-    : undefined;
-}
-
-function shouldForceSecretStorage(config: ConnectionConfig): boolean {
-  return (
-    config.type === "dynamodb" ||
-    config.type === "elasticsearch" ||
-    extractCredentialBearingUriSecret(config.connectionUri) !== undefined ||
-    extractCredentialBearingUriSecret(config.uri) !== undefined ||
-    trimOptionalSecretValue(config.password) !== undefined ||
-    trimOptionalSecretValue(config.apiKey) !== undefined ||
-    trimOptionalSecretValue(config.awsAccessKeyId) !== undefined ||
-    trimOptionalSecretValue(config.awsSecretAccessKey) !== undefined ||
-    trimOptionalSecretValue(config.awsSessionToken) !== undefined ||
-    config.useSecretStorage === true
-  );
-}
-
-function extractConnectionSecrets(
-  config: ConnectionConfig,
-  previousSecrets?: ConnectionSecretSnapshot,
-): ConnectionSecretSnapshot {
-  return {
-    password:
-      trimOptionalSecretValue(config.password) ?? previousSecrets?.password,
-    apiKey:
-      config.type === "elasticsearch"
-        ? (trimOptionalSecretValue(config.apiKey) ?? previousSecrets?.apiKey)
-        : undefined,
-    awsAccessKeyId:
-      config.type === "dynamodb"
-        ? (trimOptionalSecretValue(config.awsAccessKeyId) ??
-          previousSecrets?.awsAccessKeyId)
-        : undefined,
-    awsSecretAccessKey:
-      config.type === "dynamodb"
-        ? (trimOptionalSecretValue(config.awsSecretAccessKey) ??
-          previousSecrets?.awsSecretAccessKey)
-        : undefined,
-    awsSessionToken:
-      config.type === "dynamodb"
-        ? (trimOptionalSecretValue(config.awsSessionToken) ??
-          previousSecrets?.awsSessionToken)
-        : undefined,
-    connectionUri: resolvePersistedUriSecret(
-      config.connectionUri,
-      previousSecrets?.connectionUri,
-    ),
-    uri: resolvePersistedUriSecret(config.uri, previousSecrets?.uri),
-  };
-}
-
-function sanitizePersistedConnectionConfig(
-  config: ConnectionConfig,
-): ConnectionConfig {
-  if (!shouldForceSecretStorage(config)) {
-    return { ...config };
-  }
-
-  const {
-    password: _password,
-    apiKey: _apiKey,
-    awsAccessKeyId: _awsAccessKeyId,
-    awsSecretAccessKey: _awsSecretAccessKey,
-    awsSessionToken: _awsSessionToken,
-    connectionUri: rawConnectionUri,
-    uri: rawUri,
-    ...rest
-  } = config;
-
-  return {
-    ...rest,
-    connectionUri: sanitizeUriForPersistence(rawConnectionUri),
-    uri: sanitizeUriForPersistence(rawUri),
-    useSecretStorage: true,
-  };
-}
-
 export class ConnectionManager
   implements ScopeAwareConnectionManagerApi, ConnectionManagerLifecycleApi
 {
@@ -911,11 +764,9 @@ export class ConnectionManager
     }
 
     const previousSecretSnapshot = await this.store.getSecret(config.id);
-    const serializedSecrets = serializeConnectionSecrets(
-      extractConnectionSecrets(
-        config,
-        this.parseStoredSecrets(previousSecretSnapshot),
-      ),
+    const serializedSecrets = serializeConnectionSecretsForConfig(
+      config,
+      this.parseStoredSecrets(previousSecretSnapshot),
     );
 
     if (serializedSecrets === previousSecretSnapshot) {
@@ -938,15 +789,10 @@ export class ConnectionManager
     }
 
     const persisted = sanitizePersistedConnectionConfig(config);
-    const needsPersistedConfigUpdate =
-      persisted.useSecretStorage !== config.useSecretStorage ||
-      persisted.password !== config.password ||
-      persisted.apiKey !== config.apiKey ||
-      persisted.awsAccessKeyId !== config.awsAccessKeyId ||
-      persisted.awsSecretAccessKey !== config.awsSecretAccessKey ||
-      persisted.awsSessionToken !== config.awsSessionToken ||
-      persisted.connectionUri !== config.connectionUri ||
-      persisted.uri !== config.uri;
+    const needsPersistedConfigUpdate = hasPersistedConnectionConfigChanges(
+      persisted,
+      config,
+    );
 
     await this._persistConnectionSecretsIfNeeded(config);
 
@@ -982,16 +828,7 @@ export class ConnectionManager
 
       await this._persistConnectionSecretsIfNeeded(connection);
       const persisted = sanitizePersistedConnectionConfig(connection);
-      if (
-        persisted.useSecretStorage !== connection.useSecretStorage ||
-        persisted.password !== connection.password ||
-        persisted.apiKey !== connection.apiKey ||
-        persisted.awsAccessKeyId !== connection.awsAccessKeyId ||
-        persisted.awsSecretAccessKey !== connection.awsSecretAccessKey ||
-        persisted.awsSessionToken !== connection.awsSessionToken ||
-        persisted.connectionUri !== connection.connectionUri ||
-        persisted.uri !== connection.uri
-      ) {
+      if (hasPersistedConnectionConfigChanges(persisted, connection)) {
         const index = storedConnections.findIndex(
           (item) => item.id === connection.id,
         );
@@ -1642,17 +1479,11 @@ export class ConnectionManager
     tableDetailEntry.loading = loadPromise;
   }
 
-  ensureSchemaScopeLoading(
+  private _startScopeLoadForScope(
     connectionId: string,
     scope: ExplorerSchemaScope,
+    configuredDefaultDatabase: string,
   ): void {
-    this.markSchemaScopeExpanded(connectionId, scope);
-
-    const config = this.getConnection(connectionId);
-    const configuredDefaultDatabase = config
-      ? getConfiguredDefaultDatabaseName(config)
-      : "";
-
     switch (scope.kind) {
       case "connectionRoot":
         this._startRootSchemaLoad(connectionId, false);
@@ -1683,6 +1514,24 @@ export class ConnectionManager
         );
         return;
     }
+  }
+
+  ensureSchemaScopeLoading(
+    connectionId: string,
+    scope: ExplorerSchemaScope,
+  ): void {
+    this.markSchemaScopeExpanded(connectionId, scope);
+
+    const config = this.getConnection(connectionId);
+    const configuredDefaultDatabase = config
+      ? getConfiguredDefaultDatabaseName(config)
+      : "";
+
+    this._startScopeLoadForScope(
+      connectionId,
+      scope,
+      configuredDefaultDatabase,
+    );
   }
 
   markSchemaScopeExpanded(
@@ -1919,6 +1768,30 @@ export class ConnectionManager
     return scopeEntry;
   }
 
+  private _enterScopeLoadingState(
+    connectionId: string,
+    entry: ConnectionSchemaCacheEntry,
+    scopeEntry: InternalScopedSchemaCacheEntry,
+  ): void {
+    scopeEntry.status = "loading";
+    scopeEntry.isPartial = scopeEntry.snapshot.databases.length > 0;
+    delete scopeEntry.error;
+    this._commitAggregateSchemaState(connectionId, entry);
+  }
+
+  private _markScopeLoadError(
+    connectionId: string,
+    entry: ConnectionSchemaCacheEntry,
+    scopeEntry: InternalScopedSchemaCacheEntry,
+    err: unknown,
+  ): void {
+    const error = normalizeUnknownError(err);
+    scopeEntry.status = "error";
+    scopeEntry.isPartial = scopeEntry.snapshot.databases.length > 0;
+    scopeEntry.error = error.message;
+    this._commitAggregateSchemaState(connectionId, entry);
+  }
+
   private _commitAggregateSchemaState(
     connectionId: string,
     entry: ConnectionSchemaCacheEntry,
@@ -2083,6 +1956,46 @@ export class ConnectionManager
     entry.loading = rootLoadPromise;
   }
 
+  private _prepareScopeLoadContext(
+    connectionId: string,
+    scope: ExplorerSchemaScope,
+    allowRetry: boolean,
+    retainOnCollapse: boolean,
+  ):
+    | {
+        driver: IDBDriver;
+        entry: ConnectionSchemaCacheEntry;
+        scopeEntry: InternalScopedSchemaCacheEntry;
+      }
+    | undefined {
+    const driver = this.getDriver(connectionId);
+    const config = this.getConnection(connectionId);
+    if (!driver || !config) {
+      return undefined;
+    }
+
+    const entry = this._getOrCreateSchemaCacheEntry(connectionId, config);
+    const scopeEntry = this._getOrCreateScopeEntry(
+      entry,
+      scope,
+      retainOnCollapse,
+    );
+
+    if (retainOnCollapse) {
+      scopeEntry.retainOnCollapse = true;
+    }
+
+    if (scopeEntry.loading) {
+      return undefined;
+    }
+
+    if (scopeEntry.status === "error" && !allowRetry) {
+      return undefined;
+    }
+
+    return { driver, entry, scopeEntry };
+  }
+
   private _startDatabaseScopeLoad(
     connectionId: string,
     databaseName: string,
@@ -2090,30 +2003,20 @@ export class ConnectionManager
     retainOnCollapse: boolean,
     loadMode: DatabaseLoadMode,
   ): void {
-    const driver = this.getDriver(connectionId);
-    const config = this.getConnection(connectionId);
-    if (!driver || !config) {
-      return;
-    }
-
-    const entry = this._getOrCreateSchemaCacheEntry(connectionId, config);
     const databaseScope: ExplorerSchemaScope = {
       kind: "database",
       database: databaseName,
     };
-    const databaseEntry = this._getOrCreateScopeEntry(
-      entry,
+    const scopeContext = this._prepareScopeLoadContext(
+      connectionId,
       databaseScope,
+      allowRetry,
       retainOnCollapse,
     );
-
-    if (retainOnCollapse) {
-      databaseEntry.retainOnCollapse = true;
-    }
-
-    if (databaseEntry.loading) {
+    if (!scopeContext) {
       return;
     }
+    const { driver, entry, scopeEntry: databaseEntry } = scopeContext;
 
     if (databaseEntry.status === "loaded") {
       if (loadMode === "expanded" || databaseEntry.fullyLoaded) {
@@ -2121,14 +2024,7 @@ export class ConnectionManager
       }
     }
 
-    if (databaseEntry.status === "error" && !allowRetry) {
-      return;
-    }
-
-    databaseEntry.status = "loading";
-    databaseEntry.isPartial = databaseEntry.snapshot.databases.length > 0;
-    delete databaseEntry.error;
-    this._commitAggregateSchemaState(connectionId, entry);
+    this._enterScopeLoadingState(connectionId, entry, databaseEntry);
 
     let databaseLoadPromise: Promise<void> | null = null;
     databaseLoadPromise = (async () => {
@@ -2168,12 +2064,7 @@ export class ConnectionManager
         if (!this._isLiveScopeEntry(connectionId, entry, databaseEntry)) {
           return;
         }
-
-        const error = normalizeUnknownError(err);
-        databaseEntry.status = "error";
-        databaseEntry.isPartial = databaseEntry.snapshot.databases.length > 0;
-        databaseEntry.error = error.message;
-        this._commitAggregateSchemaState(connectionId, entry);
+        this._markScopeLoadError(connectionId, entry, databaseEntry, err);
       } finally {
         if (
           databaseLoadPromise &&
@@ -2195,40 +2086,27 @@ export class ConnectionManager
     allowRetry: boolean,
     retainOnCollapse: boolean,
   ): void {
-    const driver = this.getDriver(connectionId);
-    const config = this.getConnection(connectionId);
-    if (!driver || !config) {
-      return;
-    }
-
-    const entry = this._getOrCreateSchemaCacheEntry(connectionId, config);
     const schemaScope: ExplorerSchemaScope = {
       kind: "schema",
       database: databaseName,
       schema: schemaName,
     };
-    const schemaEntry = this._getOrCreateScopeEntry(
-      entry,
+    const scopeContext = this._prepareScopeLoadContext(
+      connectionId,
       schemaScope,
+      allowRetry,
       retainOnCollapse,
     );
-
-    if (retainOnCollapse) {
-      schemaEntry.retainOnCollapse = true;
+    if (!scopeContext) {
+      return;
     }
+    const { driver, entry, scopeEntry: schemaEntry } = scopeContext;
 
-    if (schemaEntry.loading || schemaEntry.status === "loaded") {
+    if (schemaEntry.status === "loaded") {
       return;
     }
 
-    if (schemaEntry.status === "error" && !allowRetry) {
-      return;
-    }
-
-    schemaEntry.status = "loading";
-    schemaEntry.isPartial = schemaEntry.snapshot.databases.length > 0;
-    delete schemaEntry.error;
-    this._commitAggregateSchemaState(connectionId, entry);
+    this._enterScopeLoadingState(connectionId, entry, schemaEntry);
 
     let schemaLoadPromise: Promise<void> | null = null;
     schemaLoadPromise = (async () => {
@@ -2258,12 +2136,7 @@ export class ConnectionManager
         if (!this._isLiveScopeEntry(connectionId, entry, schemaEntry)) {
           return;
         }
-
-        const error = normalizeUnknownError(err);
-        schemaEntry.status = "error";
-        schemaEntry.isPartial = schemaEntry.snapshot.databases.length > 0;
-        schemaEntry.error = error.message;
-        this._commitAggregateSchemaState(connectionId, entry);
+        this._markScopeLoadError(connectionId, entry, schemaEntry, err);
       } finally {
         if (
           schemaLoadPromise &&
