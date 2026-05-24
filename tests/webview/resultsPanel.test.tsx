@@ -1,6 +1,6 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tanstack/react-virtual", () => ({
   useVirtualizer: ({ count }: { count: number }) => ({
@@ -15,12 +15,26 @@ vi.mock("@tanstack/react-virtual", () => ({
   }),
 }));
 
-import { ResultsPanel } from "../../src/webview/components/ResultsPanel";
+import { TableGrid } from "../../src/webview/components/table/TableGrid";
+import { clearPostedMessages, getPostedMessages } from "./testUtils";
 
-describe("ResultsPanel", () => {
+afterEach(() => {
+  clearPostedMessages();
+});
+
+function dragResizeHandle(handle: HTMLElement, deltaX: number): void {
+  const startX = 200;
+  const endX = Math.max(0, startX + deltaX);
+  fireEvent.mouseDown(handle, { clientX: startX, buttons: 1 });
+  fireEvent.mouseMove(document, { clientX: endX, buttons: 1 });
+  fireEvent.mouseUp(document, { clientX: endX, buttons: 0 });
+}
+
+describe("TableGrid query mode", () => {
   it("left-aligns numeric query results", () => {
     render(
-      <ResultsPanel
+      <TableGrid
+        mode="query"
         status="success"
         result={{
           columns: ["id", "name"],
@@ -44,7 +58,8 @@ describe("ResultsPanel", () => {
     const user = userEvent.setup();
 
     render(
-      <ResultsPanel
+      <TableGrid
+        mode="query"
         status="success"
         result={{
           columns: ["id"],
@@ -59,5 +74,72 @@ describe("ResultsPanel", () => {
     await user.dblClick(screen.getByRole("cell"));
 
     expect(screen.getByLabelText("Cell value")).toBeDefined();
+  });
+
+  it("collapses and reopens a result column from the resize divider", async () => {
+    render(
+      <TableGrid
+        mode="query"
+        status="success"
+        result={{
+          columns: ["id", "name"],
+          columnMeta: [],
+          rows: [{ __col_0: 1, __col_1: "Alice" }],
+          rowCount: 1,
+          executionTimeMs: 5,
+        }}
+      />,
+    );
+
+    const nameHeader = screen.getByText("name").closest("th");
+    if (!(nameHeader instanceof HTMLTableCellElement)) {
+      throw new Error("Expected name header cell to be rendered");
+    }
+
+    const resizeHandle = screen.getByRole("button", {
+      name: "Resize name column",
+    });
+
+    dragResizeHandle(resizeHandle, -500);
+
+    await waitFor(() => {
+      expect(nameHeader.style.width).toBe("0px");
+    });
+
+    expect(screen.queryByText("Alice")).toBeNull();
+
+    dragResizeHandle(resizeHandle, 320);
+
+    await waitFor(() => {
+      expect(Number.parseFloat(nameHeader.style.width)).toBeGreaterThan(0);
+    });
+
+    expect(screen.getByText("Alice")).toBeTruthy();
+  });
+
+  it("posts exportResults messages from result toolbar actions", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <TableGrid
+        mode="query"
+        status="success"
+        result={{
+          columns: ["id"],
+          columnMeta: [],
+          rows: [{ __col_0: 1 }],
+          rowCount: 1,
+          executionTimeMs: 5,
+        }}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Export CSV" }));
+    await user.click(screen.getByRole("button", { name: "Export JSON" }));
+
+    expect(getPostedMessages()).toEqual([
+      { type: "exportResultsCSV" },
+      { type: "exportResultsJSON" },
+    ]);
   });
 });

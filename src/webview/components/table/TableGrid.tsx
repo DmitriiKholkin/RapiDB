@@ -2,13 +2,16 @@ import {
   type CellContext,
   flexRender,
   getCoreRowModel,
+  getSortedRowModel,
+  type OnChangeFn,
+  type SortingState,
   type ColumnDef as TanColumnDef,
   type Column as TanStackColumn,
   type Row as TanStackRow,
   useReactTable,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import React, { useMemo } from "react";
+import React, { useMemo, useState } from "react";
 import {
   type ColumnTypeMeta as ColumnMeta,
   type FilterDraft,
@@ -16,12 +19,19 @@ import {
   isNumericCategory,
   NULL_SENTINEL,
 } from "../../../shared/tableTypes";
+import type { QueryResult, QueryStatus } from "../../store";
 import type {
   EditTarget,
   InsertDraftRow,
   PendingEdits,
   Row,
 } from "../../types";
+import { buildButtonStyle } from "../../utils/buttonStyles";
+import {
+  calcColWidths,
+  type Column as SizingColumn,
+} from "../../utils/columnSizing";
+import { postMessage } from "../../utils/messaging";
 import { Icon } from "../Icon";
 import { CellDisplay } from "./CellDisplay";
 import { ColumnFilterControl } from "./ColumnFilterControl";
@@ -54,6 +64,386 @@ if (
   document.head.appendChild(styleElement);
 }
 
+const RESIZE_HANDLE_WIDTH = 12;
+const RESIZE_HANDLE_OVERHANG = 6;
+const QUERY_TOOLBAR_H = 28;
+
+const QUERY_RESULTS_ROW_STYLE_ID = "rapidb-results-row-style";
+if (
+  typeof document !== "undefined" &&
+  !document.getElementById(QUERY_RESULTS_ROW_STYLE_ID)
+) {
+  const styleElement = document.createElement("style");
+  styleElement.id = QUERY_RESULTS_ROW_STYLE_ID;
+  styleElement.textContent = [
+    ".rdb-rrow { transition: background 60ms; }",
+    '.rdb-rrow[data-even="true"]  { background: var(--vscode-editor-background); }',
+    '.rdb-rrow[data-even="false"] { background: var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.04)); }',
+    ".rdb-rrow:hover { background: var(--vscode-list-hoverBackground); }",
+  ].join("\n");
+  document.head.appendChild(styleElement);
+}
+
+function isCollapsedWidth(width: number): boolean {
+  return width <= 1;
+}
+
+function getDisplaySize(width: number): number {
+  return isCollapsedWidth(width) ? 0 : width;
+}
+
+function getBaseTableStyle(width: number): React.CSSProperties {
+  return {
+    width,
+    borderCollapse: "collapse",
+    tableLayout: "fixed",
+    fontSize: 12,
+    fontFamily: "var(--vscode-editor-font-family, monospace)",
+  };
+}
+
+function HeaderContent({
+  isCollapsed,
+  justifyContent,
+  children,
+}: {
+  isCollapsed: boolean;
+  justifyContent: "flex-start" | "center";
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent,
+        gap: 4,
+        width: "100%",
+        overflow: "hidden",
+        opacity: isCollapsed ? 0 : 1,
+        pointerEvents: isCollapsed ? "none" : "auto",
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function ColumnResizeHandle({
+  ariaLabel,
+  onMouseDown,
+  onTouchStart,
+  onClick,
+  isResizing,
+  tabIndex,
+}: {
+  ariaLabel: string;
+  onMouseDown: React.MouseEventHandler<HTMLButtonElement>;
+  onTouchStart?: React.TouchEventHandler<HTMLButtonElement>;
+  onClick?: React.MouseEventHandler<HTMLButtonElement>;
+  isResizing: boolean;
+  tabIndex?: number;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={ariaLabel}
+      tabIndex={tabIndex}
+      onMouseDown={onMouseDown}
+      onTouchStart={onTouchStart}
+      onClick={onClick}
+      style={{
+        position: "absolute",
+        right: -RESIZE_HANDLE_OVERHANG,
+        top: 0,
+        height: "100%",
+        width: RESIZE_HANDLE_WIDTH,
+        padding: 0,
+        border: "none",
+        cursor: "col-resize",
+        userSelect: "none",
+        touchAction: "none",
+        zIndex: 3,
+        background: isResizing ? "var(--vscode-focusBorder)" : "transparent",
+      }}
+    />
+  );
+}
+
+function TopSpacerRow({
+  height,
+  colSpan,
+}: {
+  height: number;
+  colSpan: number;
+}) {
+  if (height <= 0) {
+    return null;
+  }
+
+  return (
+    <tr>
+      <td
+        colSpan={colSpan}
+        style={{
+          height,
+          padding: 0,
+          border: "none",
+        }}
+      />
+    </tr>
+  );
+}
+
+function BottomSpacerRow({
+  virtualItems,
+  totalVirtualHeight,
+  colSpan,
+}: {
+  virtualItems: readonly { end: number }[];
+  totalVirtualHeight: number;
+  colSpan: number;
+}) {
+  if (virtualItems.length === 0) {
+    return null;
+  }
+
+  const lastVirtualRow = virtualItems[virtualItems.length - 1];
+  const remainingHeight = totalVirtualHeight - lastVirtualRow.end;
+  if (remainingHeight <= 0) {
+    return null;
+  }
+
+  return (
+    <tr>
+      <td
+        colSpan={colSpan}
+        style={{
+          height: remainingHeight,
+          padding: 0,
+          border: "none",
+        }}
+      />
+    </tr>
+  );
+}
+
+interface QueryResultsGridProps {
+  result: QueryResult;
+}
+
+function QueryResultsGrid({ result }: QueryResultsGridProps) {
+  const { columns: colNames, columnMeta, rows } = result;
+  const [sorting, setSorting] = useState<SortingState>([]);
+  const [activeCell, setActiveCell] = useState<{
+    rowIndex: number;
+    columnId: string;
+  } | null>(null);
+  const [columnSizing, setColumnSizing] = useState<Record<string, number>>({});
+  const scrollRef = React.useRef<HTMLDivElement>(null);
+
+  const colSizes = useMemo(
+    () =>
+      calcColWidths(
+        colNames.map(
+          (name, index): SizingColumn => ({
+            name,
+            dataKey: `__col_${index}`,
+            isPrimaryKey: false,
+            isForeignKey: false,
+          }),
+        ),
+        rows,
+        { hPad: 19 },
+      ),
+    [colNames, rows],
+  );
+
+  const columns = useMemo<TanColumnDef<Record<string, unknown>>[]>(
+    () =>
+      colNames.map((name, index) => {
+        const key = `__col_${index}`;
+        const category = columnMeta[index]?.category;
+        return {
+          id: key,
+          accessorKey: key,
+          header: name,
+          size: colSizes[key] ?? 160,
+          minSize: 1,
+          maxSize: 800,
+          cell: (info) => (
+            <CellDisplay
+              value={info.getValue()}
+              isPending={false}
+              category={category ?? undefined}
+            />
+          ),
+        };
+      }),
+    [colNames, colSizes, columnMeta],
+  );
+
+  const handleSortingChange = React.useCallback<OnChangeFn<SortingState>>(
+    (updater) => {
+      // Sorted position changes invalidate index-based active cell tracking.
+      setActiveCell(null);
+      setSorting(updater);
+    },
+    [],
+  );
+
+  const table = useReactTable({
+    data: rows,
+    columns,
+    state: { sorting, columnSizing },
+    onSortingChange: handleSortingChange,
+    onColumnSizingChange: setColumnSizing,
+    getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+    columnResizeMode: "onChange",
+    enableColumnResizing: true,
+  });
+
+  const tableRows = table.getRowModel().rows;
+  const virtualizer = useVirtualizer({
+    count: tableRows.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => ROW_H,
+    overscan: 20,
+  });
+  const virtualItems = virtualizer.getVirtualItems();
+  const totalVirtualHeight = virtualizer.getTotalSize();
+
+  return (
+    <div
+      ref={scrollRef}
+      style={{ flex: 1, overflow: "auto", position: "relative" }}
+    >
+      <table style={getBaseTableStyle(table.getTotalSize())}>
+        <thead>
+          {table.getHeaderGroups().map((headerGroup) => (
+            <tr key={headerGroup.id}>
+              {headerGroup.headers.map((header) => {
+                const sorted = header.column.getIsSorted();
+                const headerSize = header.getSize();
+                const isCollapsed = isCollapsedWidth(headerSize);
+                const displayHeaderSize = getDisplaySize(headerSize);
+
+                return (
+                  <th
+                    key={header.id}
+                    style={{
+                      width: displayHeaderSize,
+                      height: HEADER_H,
+                      padding: isCollapsed ? 0 : "0 8px",
+                      textAlign: "left",
+                      background:
+                        "var(--vscode-editorGroupHeader-tabsBackground)",
+                      borderRight: "1px solid var(--vscode-panel-border)",
+                      borderLeft: "1px solid var(--vscode-panel-border)",
+                      position: "sticky",
+                      top: 0,
+                      zIndex: 2,
+                      whiteSpace: "nowrap",
+                      overflow: "visible",
+                      textOverflow: "ellipsis",
+                      userSelect: "none",
+                      cursor: header.column.getCanSort()
+                        ? "pointer"
+                        : "default",
+                      fontWeight: 600,
+                      color: "var(--vscode-foreground)",
+                      boxSizing: "border-box",
+                    }}
+                    onClick={header.column.getToggleSortingHandler()}
+                  >
+                    <HeaderContent
+                      isCollapsed={isCollapsed}
+                      justifyContent="flex-start"
+                    >
+                      <span
+                        style={{
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                        }}
+                      >
+                        {flexRender(
+                          header.column.columnDef.header,
+                          header.getContext(),
+                        )}
+                      </span>
+                      {sorted === "asc" && (
+                        <Icon
+                          name="triangle-up"
+                          size={10}
+                          style={{ opacity: 0.7 }}
+                        />
+                      )}
+                      {sorted === "desc" && (
+                        <Icon
+                          name="triangle-down"
+                          size={10}
+                          style={{ opacity: 0.7 }}
+                        />
+                      )}
+                      {!sorted && header.column.getCanSort() && (
+                        <Icon
+                          name="unfold"
+                          size={10}
+                          style={{ opacity: 0.2 }}
+                        />
+                      )}
+                    </HeaderContent>
+
+                    {header.column.getCanResize() && (
+                      <ColumnResizeHandle
+                        ariaLabel={`Resize ${typeof header.column.columnDef.header === "string" ? header.column.columnDef.header : header.column.id} column`}
+                        onMouseDown={header.getResizeHandler()}
+                        onTouchStart={header.getResizeHandler()}
+                        onClick={(event) => event.stopPropagation()}
+                        isResizing={header.column.getIsResizing()}
+                      />
+                    )}
+                  </th>
+                );
+              })}
+            </tr>
+          ))}
+        </thead>
+        <tbody>
+          <TopSpacerRow
+            colSpan={columns.length}
+            height={virtualItems[0]?.start ?? 0}
+          />
+
+          {virtualItems.map((virtualRow) => {
+            const row = tableRows[virtualRow.index];
+            return (
+              <QueryTableRow
+                key={virtualRow.key}
+                row={row}
+                index={virtualRow.index}
+                columnMeta={columnMeta}
+                activeCell={activeCell}
+                onActivateCell={(rowIndex, columnId) =>
+                  setActiveCell({ rowIndex, columnId })
+                }
+                onDeactivateCell={() => setActiveCell(null)}
+              />
+            );
+          })}
+
+          <BottomSpacerRow
+            virtualItems={virtualItems}
+            totalVirtualHeight={totalVirtualHeight}
+            colSpan={columns.length}
+          />
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function toDraftEditInitialValue(value: unknown): string {
   if (value === INSERT_DEFAULT_SENTINEL) {
     return "";
@@ -61,6 +451,88 @@ function toDraftEditInitialValue(value: unknown): string {
 
   return valueToEditString(value);
 }
+
+const QueryTableRow = React.memo(function QueryTableRow({
+  row,
+  index,
+  columnMeta,
+  activeCell,
+  onActivateCell,
+  onDeactivateCell,
+}: {
+  row: TanStackRow<Record<string, unknown>>;
+  index: number;
+  columnMeta: QueryResult["columnMeta"];
+  activeCell: { rowIndex: number; columnId: string } | null;
+  onActivateCell: (rowIndex: number, columnId: string) => void;
+  onDeactivateCell: () => void;
+}) {
+  return (
+    <tr
+      className="rdb-rrow"
+      data-even={String(index % 2 === 0)}
+      style={{ height: ROW_H }}
+    >
+      {row.getVisibleCells().map((cell) => {
+        const raw = cell.getValue();
+        const isNull = raw === null || raw === undefined;
+        const isEditing =
+          activeCell?.rowIndex === index &&
+          activeCell.columnId === cell.column.id;
+        const cellSize = cell.column.getSize();
+        const isCollapsed = isCollapsedWidth(cellSize);
+        const displayCellSize = isCollapsed ? 0 : cellSize;
+        const columnIndex = Number.parseInt(
+          cell.column.id.replace("__col_", ""),
+          10,
+        );
+        const category = Number.isNaN(columnIndex)
+          ? undefined
+          : (columnMeta[columnIndex]?.category ?? undefined);
+
+        return (
+          <td
+            key={cell.id}
+            style={{
+              width: displayCellSize,
+              height: ROW_H,
+              padding: isEditing ? "0" : isCollapsed ? 0 : "0 8px",
+              border: "1px solid var(--vscode-panel-border)",
+              textAlign: "left",
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              boxSizing: "border-box",
+              verticalAlign: "middle",
+              cursor: isCollapsed ? "default" : "pointer",
+              userSelect: "none",
+            }}
+            title={isNull ? "" : String(raw)}
+            onDoubleClick={() => {
+              if (!isCollapsed) {
+                onActivateCell(index, cell.column.id);
+              }
+            }}
+          >
+            {!isCollapsed && isEditing ? (
+              <EditInput
+                initial={valueToEditString(raw)}
+                category={category}
+                nullable
+                readOnly
+                onCommit={onDeactivateCell}
+                onCancel={onDeactivateCell}
+              />
+            ) : (
+              !isCollapsed &&
+              flexRender(cell.column.columnDef.cell, cell.getContext())
+            )}
+          </td>
+        );
+      })}
+    </tr>
+  );
+});
 
 interface TableGridProps {
   canEditRows: boolean;
@@ -95,7 +567,24 @@ interface TableGridProps {
   sort: TableSortState;
 }
 
-export function TableGrid({
+interface QueryModeTableGridProps {
+  mode: "query";
+  status: QueryStatus;
+  result: QueryResult | null;
+}
+
+type UnifiedTableGridProps = TableGridProps | QueryModeTableGridProps;
+
+export function TableGrid(props: UnifiedTableGridProps) {
+  if ("mode" in props && props.mode === "query") {
+    return <QueryModeTableGrid status={props.status} result={props.result} />;
+  }
+
+  const tableProps = props as TableGridProps;
+  return <TableDataGrid {...tableProps} />;
+}
+
+function TableDataGrid({
   canEditRows,
   canSelectAndDeleteRows,
   colSizes,
@@ -122,6 +611,8 @@ export function TableGrid({
     () => new Map(columns.map((column) => [column.name, column])),
     [columns],
   );
+
+  const [columnSizing, setColumnSizing] = useState<Record<string, number>>({});
 
   const tanColumns = useMemo<TanColumnDef<Row>[]>(
     () => [
@@ -185,7 +676,7 @@ export function TableGrid({
           accessorKey: column.name,
           meta: column,
           size: colSizes[column.name] ?? colSizes[`${column.name}key`] ?? 160,
-          minSize: 40,
+          minSize: 1,
           maxSize: 800,
           header: () => (
             <span
@@ -268,6 +759,8 @@ export function TableGrid({
   const tanTable = useReactTable({
     data: rows,
     columns: tanColumns,
+    state: { columnSizing },
+    onColumnSizingChange: setColumnSizing,
     getCoreRowModel: getCoreRowModel(),
     columnResizeMode: "onChange",
     enableColumnResizing: true,
@@ -289,21 +782,16 @@ export function TableGrid({
       ref={scrollRef}
       style={{ flex: 1, overflow: "auto", position: "relative" }}
     >
-      <table
-        style={{
-          width: tanTable.getTotalSize(),
-          borderCollapse: "collapse",
-          tableLayout: "fixed",
-          fontSize: 12,
-          fontFamily: "var(--vscode-editor-font-family, monospace)",
-        }}
-      >
+      <table style={getBaseTableStyle(tanTable.getTotalSize())}>
         <thead>
           {tanTable.getHeaderGroups().map((headerGroup) => (
             <tr key={headerGroup.id}>
               {headerGroup.headers.map((header) => {
                 const isSelectionColumn = header.column.id === "__sel";
                 const columnId = header.column.id;
+                const headerSize = header.getSize();
+                const isCollapsed = isCollapsedWidth(headerSize);
+                const displayHeaderSize = getDisplaySize(headerSize);
                 const isSorted = sort?.column === columnId;
                 const sortDirection = isSorted
                   ? (sort?.direction ?? null)
@@ -321,9 +809,13 @@ export function TableGrid({
                         : buildColumnHeaderTitle(columnMeta)
                     }
                     style={{
-                      width: header.getSize(),
+                      width: displayHeaderSize,
                       height: HEADER_H,
-                      padding: isSelectionColumn ? "0 6px" : "0 8px",
+                      padding: isSelectionColumn
+                        ? "0 6px"
+                        : isCollapsed
+                          ? 0
+                          : "0 8px",
                       textAlign: isSelectionColumn ? "center" : "left",
                       background: isSorted
                         ? "var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.1))"
@@ -334,7 +826,7 @@ export function TableGrid({
                       top: 0,
                       zIndex: 2,
                       whiteSpace: "nowrap",
-                      overflow: "hidden",
+                      overflow: "visible",
                       fontWeight: 600,
                       boxSizing: "border-box",
                       userSelect: "none",
@@ -346,16 +838,11 @@ export function TableGrid({
                       }
                     }}
                   >
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: isSelectionColumn
-                          ? "center"
-                          : "flex-start",
-                        gap: 4,
-                        overflow: "hidden",
-                      }}
+                    <HeaderContent
+                      isCollapsed={isCollapsed}
+                      justifyContent={
+                        isSelectionColumn ? "center" : "flex-start"
+                      }
                     >
                       <span
                         style={{ overflow: "hidden", textOverflow: "ellipsis" }}
@@ -382,30 +869,44 @@ export function TableGrid({
                           )}
                         </span>
                       )}
-                    </div>
+                    </HeaderContent>
                     {!isSelectionColumn && header.column.getCanResize() && (
-                      <button
-                        type="button"
-                        aria-label={`Resize ${columnId} column`}
+                      <ColumnResizeHandle
+                        ariaLabel={`Resize ${columnId} column`}
                         tabIndex={-1}
                         onMouseDown={(event) => {
+                          event.preventDefault();
                           event.stopPropagation();
-                          header.getResizeHandler()(event);
+
+                          const startSize = Math.max(headerSize, 1);
+                          const startX = event.clientX;
+
+                          const applyWidth = (clientX: number) => {
+                            const nextWidth = Math.max(
+                              1,
+                              startSize + (clientX - startX),
+                            );
+                            setColumnSizing((previous) => ({
+                              ...previous,
+                              [columnId]: nextWidth,
+                            }));
+                          };
+
+                          const onMove = (moveEvent: MouseEvent) => {
+                            applyWidth(moveEvent.clientX);
+                          };
+
+                          const onUp = (upEvent: MouseEvent) => {
+                            applyWidth(upEvent.clientX);
+                            document.removeEventListener("mousemove", onMove);
+                            document.removeEventListener("mouseup", onUp);
+                          };
+
+                          document.addEventListener("mousemove", onMove);
+                          document.addEventListener("mouseup", onUp);
                         }}
                         onClick={(event) => event.stopPropagation()}
-                        style={{
-                          position: "absolute",
-                          right: 0,
-                          top: 0,
-                          height: "100%",
-                          width: 5,
-                          padding: 0,
-                          border: "none",
-                          cursor: "col-resize",
-                          background: header.column.getIsResizing()
-                            ? "var(--vscode-focusBorder)"
-                            : "transparent",
-                        }}
+                        isResizing={header.column.getIsResizing()}
                       />
                     )}
                   </th>
@@ -417,14 +918,17 @@ export function TableGrid({
             {tanTable.getHeaderGroups()[0]?.headers.map((header) => {
               const isSelectionColumn = header.column.id === "__sel";
               const column = columnsMap.get(header.column.id);
+              const headerSize = header.getSize();
+              const isCollapsed = isCollapsedWidth(headerSize);
+              const displayHeaderSize = getDisplaySize(headerSize);
 
               return (
                 <th
                   key={`${header.id}_f`}
                   style={{
-                    width: header.getSize(),
+                    width: displayHeaderSize,
                     height: FILTER_H,
-                    padding: isSelectionColumn ? 0 : "2px 4px",
+                    padding: isSelectionColumn || isCollapsed ? 0 : "2px 4px",
                     background:
                       "var(--vscode-editorGroupHeader-tabsBackground)",
                     borderRight: "1px solid var(--vscode-panel-border)",
@@ -436,9 +940,10 @@ export function TableGrid({
                     boxSizing: "border-box",
                     boxShadow:
                       "0 -1px 0 0 var(--vscode-editorGroupHeader-tabsBackground)",
+                    overflow: "visible",
                   }}
                 >
-                  {isSelectionColumn ? (
+                  {isSelectionColumn || isCollapsed ? (
                     <span style={SR_ONLY_STYLE}>Selection column</span>
                   ) : column ? (
                     <ColumnFilterControl
@@ -459,18 +964,10 @@ export function TableGrid({
           </tr>
         </thead>
         <tbody>
-          {virtualItems.length > 0 && virtualItems[0].start > 0 && (
-            <tr>
-              <td
-                colSpan={tanColumns.length}
-                style={{
-                  height: virtualItems[0].start,
-                  padding: 0,
-                  border: "none",
-                }}
-              />
-            </tr>
-          )}
+          <TopSpacerRow
+            colSpan={tanColumns.length}
+            height={virtualItems[0]?.start ?? 0}
+          />
           {virtualItems.map((virtualRow) => {
             if (hasDraftRow && virtualRow.index === 0) {
               return (
@@ -512,24 +1009,11 @@ export function TableGrid({
               />
             );
           })}
-          {virtualItems.length > 0 &&
-            (() => {
-              const lastVirtualRow = virtualItems[virtualItems.length - 1];
-              const remainingHeight = totalVirtualHeight - lastVirtualRow.end;
-
-              return remainingHeight > 0 ? (
-                <tr>
-                  <td
-                    colSpan={tanColumns.length}
-                    style={{
-                      height: remainingHeight,
-                      padding: 0,
-                      border: "none",
-                    }}
-                  />
-                </tr>
-              ) : null;
-            })()}
+          <BottomSpacerRow
+            virtualItems={virtualItems}
+            totalVirtualHeight={totalVirtualHeight}
+            colSpan={tanColumns.length}
+          />
         </tbody>
       </table>
 
@@ -553,7 +1037,227 @@ export function TableGrid({
   );
 }
 
-const TableRow = React.memo(function TableRow({
+function QueryModeTableGrid({
+  status,
+  result,
+}: {
+  status: QueryStatus;
+  result: QueryResult | null;
+}) {
+  if (status === "idle") {
+    return (
+      <QueryEmptyState
+        icon="run"
+        primary="Run a query to see results"
+        secondary="Ctrl+Enter or F5"
+      />
+    );
+  }
+
+  if (status === "running") {
+    return (
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          padding: "12px 16px",
+          opacity: 0.7,
+          fontSize: 13,
+        }}
+      >
+        <QuerySpinner /> Executing…
+      </div>
+    );
+  }
+
+  if (status === "error" || result?.error) {
+    return (
+      <div
+        style={{
+          margin: 10,
+          padding: "10px 14px",
+          borderRadius: 3,
+          fontSize: 13,
+          background:
+            "var(--vscode-inputValidation-errorBackground, rgba(200,50,50,0.15))",
+          border:
+            "1px solid var(--vscode-inputValidation-errorBorder, rgba(200,50,50,0.5))",
+          color: "var(--vscode-errorForeground)",
+          fontFamily: "var(--vscode-editor-font-family, monospace)",
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-word",
+        }}
+      >
+        <div style={{ fontWeight: 600, marginBottom: 4 }}>Error</div>
+        <div style={{ opacity: 0.9 }}>{result?.error}</div>
+      </div>
+    );
+  }
+
+  if (!result || result.columns.length === 0) {
+    return (
+      <QueryEmptyState
+        icon="pass"
+        primary="Query executed successfully"
+        secondary={`${result?.rowCount ?? 0} rows affected · ${result?.executionTimeMs ?? 0} ms`}
+      />
+    );
+  }
+
+  const { rowCount, executionTimeMs, truncated, truncatedAt } = result;
+  const truncatedCount = truncatedAt ?? rowCount;
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        height: "100%",
+        overflow: "hidden",
+        position: "relative",
+      }}
+    >
+      <div
+        style={{
+          height: QUERY_TOOLBAR_H,
+          flexShrink: 0,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          padding: "0 10px",
+          gap: 8,
+          borderBottom: "1px solid var(--vscode-panel-border)",
+          background: "var(--vscode-editorGroupHeader-tabsBackground)",
+          fontSize: 11,
+        }}
+      >
+        <span style={{ opacity: 0.7 }}>
+          {truncated
+            ? `${truncatedCount.toLocaleString()} rows (truncated — query returned more)`
+            : `${rowCount.toLocaleString()} row${rowCount !== 1 ? "s" : ""}`}
+          <span style={{ opacity: 0.5, marginLeft: 6 }}>
+            {executionTimeMs} ms
+          </span>
+        </span>
+        <div style={{ display: "flex", gap: 4 }}>
+          <QueryToolbarBtn
+            onClick={() => postMessage("exportResultsCSV")}
+            title="Export results as CSV file"
+          >
+            <Icon name="export" size={12} style={{ marginRight: 3 }} />
+            Export CSV
+          </QueryToolbarBtn>
+          <QueryToolbarBtn
+            onClick={() => postMessage("exportResultsJSON")}
+            title="Export results as JSON file"
+          >
+            <Icon name="export" size={12} style={{ marginRight: 3 }} />
+            Export JSON
+          </QueryToolbarBtn>
+        </div>
+      </div>
+
+      {truncated && (
+        <div
+          style={{
+            flexShrink: 0,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            padding: "6px 12px",
+            fontSize: 12,
+            background:
+              "var(--vscode-inputValidation-warningBackground, rgba(180,120,0,0.15))",
+            borderBottom:
+              "1px solid var(--vscode-inputValidation-warningBorder, rgba(180,120,0,0.4))",
+            color: "var(--vscode-editorWarning-foreground, #CCA700)",
+          }}
+        >
+          <Icon
+            name="warning"
+            size={12}
+            style={{ opacity: 0.8, flexShrink: 0 }}
+          />
+          <span>
+            Result limited to <strong>{truncatedCount.toLocaleString()}</strong>{" "}
+            rows. The query returned more data. Use <code>LIMIT</code> in your
+            query or increase <em>RapiDB: Query Row Limit</em> in settings.
+          </span>
+        </div>
+      )}
+
+      <QueryResultsGrid result={result} />
+    </div>
+  );
+}
+
+function QueryToolbarBtn({
+  onClick,
+  title,
+  children,
+}: {
+  onClick: () => void;
+  title?: string;
+  children: React.ReactNode;
+}) {
+  const [hovered, setHovered] = useState(false);
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      style={{
+        ...buildButtonStyle("ghost", { size: "sm" }),
+        height: 22,
+        padding: "0 8px",
+        fontSize: 11,
+        background: hovered
+          ? "var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground))"
+          : "transparent",
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function QueryEmptyState({
+  icon,
+  primary,
+  secondary,
+}: {
+  icon: string;
+  primary: string;
+  secondary?: string;
+}) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        height: "100%",
+        gap: 6,
+        opacity: 0.45,
+        userSelect: "none",
+      }}
+    >
+      <Icon name={icon} size={28} />
+      <div style={{ fontSize: 13 }}>{primary}</div>
+      {secondary && <div style={{ fontSize: 11 }}>{secondary}</div>}
+    </div>
+  );
+}
+
+function QuerySpinner() {
+  return <Icon name="sync" size={14} spin />;
+}
+
+function TableRow({
   row,
   visualIndex,
   rowIndex,
@@ -589,6 +1293,9 @@ const TableRow = React.memo(function TableRow({
         const columnId = cell.column.id;
         const columnDef = columnsMap.get(columnId);
         const isPrimaryKey = columnDef?.isPrimaryKey ?? false;
+        const cellSize = cell.column.getSize();
+        const isCollapsed = isCollapsedWidth(cellSize);
+        const displayCellSize = isCollapsed ? 0 : cellSize;
         const keyLabel = isPrimaryKey
           ? columnDef
             ? ""
@@ -611,13 +1318,15 @@ const TableRow = React.memo(function TableRow({
           <td
             key={cell.id}
             style={{
-              width: cell.column.getSize(),
+              width: displayCellSize,
               height: ROW_H,
               padding: isEditing
                 ? "0"
                 : isSelectionColumn
                   ? "0 6px"
-                  : "0 0 0 8px",
+                  : isCollapsed
+                    ? 0
+                    : "0 0 0 8px",
               textAlign: isSelectionColumn
                 ? "center"
                 : columnDef && isNumericCategory(columnDef.category)
@@ -629,30 +1338,31 @@ const TableRow = React.memo(function TableRow({
               textOverflow: "ellipsis",
               boxSizing: "border-box",
               verticalAlign: "middle",
-              cursor: canOpenCellEditor ? "pointer" : "default",
+              cursor: canOpenCellEditor && !isCollapsed ? "pointer" : "default",
               userSelect: isSelectionColumn ? "auto" : "none",
               background: isCellPending ? "rgba(200, 150, 0, 0.23)" : undefined,
             }}
             title={
-              isPrimaryKey
+              !isCollapsed && isPrimaryKey
                 ? `${primaryKeyLabel ?? keyLabel}: ${String(cell.getValue())}`
                 : undefined
             }
             onDoubleClick={() => {
-              if (columnDef && canOpenCellEditor) {
+              if (columnDef && canOpenCellEditor && !isCollapsed) {
                 onStartEdit(rowIndex, columnDef);
               }
             }}
           >
-            {flexRender(cell.column.columnDef.cell, cell.getContext())}
+            {!isCollapsed &&
+              flexRender(cell.column.columnDef.cell, cell.getContext())}
           </td>
         );
       })}
     </tr>
   );
-});
+}
 
-const DraftTableRow = React.memo(function DraftTableRow({
+function DraftTableRow({
   columns,
   visibleColumns,
   draft,
@@ -703,14 +1413,17 @@ const DraftTableRow = React.memo(function DraftTableRow({
         const isDefault = draftCell.value === INSERT_DEFAULT_SENTINEL;
         const displayValue =
           draftCell.value === NULL_SENTINEL ? null : draftCell.value;
+        const columnSize = column.getSize();
+        const isCollapsed = isCollapsedWidth(columnSize);
+        const displayColumnSize = isCollapsed ? 0 : columnSize;
 
         return (
           <td
             key={columnId}
             style={{
-              width: column.getSize(),
+              width: displayColumnSize,
               height: ROW_H,
-              padding: isEditing ? "0" : "0 0 0 8px",
+              padding: isEditing ? "0" : isCollapsed ? "0" : "0 0 0 8px",
               textAlign: isNumericCategory(columnDef.category)
                 ? "right"
                 : "left",
@@ -720,11 +1433,15 @@ const DraftTableRow = React.memo(function DraftTableRow({
               textOverflow: "ellipsis",
               boxSizing: "border-box",
               verticalAlign: "middle",
-              cursor: "pointer",
+              cursor: isCollapsed ? "default" : "pointer",
               userSelect: "none",
               background: "rgba(200, 150, 0, 0.23)",
             }}
-            onDoubleClick={() => onStartEdit(columnDef)}
+            onDoubleClick={() => {
+              if (!isCollapsed) {
+                onStartEdit(columnDef);
+              }
+            }}
           >
             <div
               style={{
@@ -746,7 +1463,7 @@ const DraftTableRow = React.memo(function DraftTableRow({
                     : "flex-start",
                 }}
               >
-                {isEditing ? (
+                {!isCollapsed && isEditing ? (
                   <EditInput
                     initial={toDraftEditInitialValue(draftCell.value)}
                     nullable={columnDef.nullable}
@@ -759,17 +1476,17 @@ const DraftTableRow = React.memo(function DraftTableRow({
                     onCommit={(value) => onCommit(columnDef, value)}
                     onCancel={onCancelEdit}
                   />
-                ) : isDefault ? (
+                ) : !isCollapsed && isDefault ? (
                   <span style={{ fontStyle: "italic", opacity: 0.65 }}>
                     DEFAULT
                   </span>
-                ) : (
+                ) : !isCollapsed ? (
                   <CellDisplay
                     value={displayValue}
                     isPending
                     category={columnDef.category}
                   />
-                )}
+                ) : null}
               </div>
             </div>
           </td>
@@ -777,4 +1494,4 @@ const DraftTableRow = React.memo(function DraftTableRow({
       })}
     </tr>
   );
-});
+}

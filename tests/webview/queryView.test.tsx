@@ -111,16 +111,19 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
   };
 });
 
-vi.mock("../../src/webview/components/ResultsPanel", () => ({
-  ResultsPanel: ({
+vi.mock("../../src/webview/components/table/TableGrid", () => ({
+  TableGrid: ({
+    mode,
     status,
     result,
   }: {
-    status: string;
-    result: { error?: string; rowCount?: number } | null;
+    mode?: string;
+    status?: string;
+    result?: { error?: string; rowCount?: number } | null;
   }) => (
     <div data-testid="results-panel">
-      {status}:{result?.error ?? String(result?.rowCount ?? "none")}
+      {String(mode ?? "table")}:{status ?? "none"}:
+      {result?.error ?? String(result?.rowCount ?? "none")}
     </div>
   ),
 }));
@@ -546,7 +549,7 @@ describe("QueryView", () => {
 
     await waitFor(() => {
       expect(screen.getByTestId("results-panel").textContent).toBe(
-        "error:Bad SQL",
+        "query:error:Bad SQL",
       );
     });
 

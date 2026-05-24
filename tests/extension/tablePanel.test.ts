@@ -175,7 +175,7 @@ describe("TablePanel", () => {
       1,
       expect.objectContaining({
         enableScripts: true,
-        retainContextWhenHidden: false,
+        retainContextWhenHidden: true,
       }),
     );
 
@@ -293,7 +293,7 @@ describe("TablePanel", () => {
     });
   });
 
-  it("refreshes readonly state for an open panel after connection settings change", async () => {
+  it("does not force table re-init for an open panel after connection settings change", async () => {
     const columns = [{ name: "id", isPrimaryKey: true }];
     getColumnsMock.mockResolvedValue(columns);
 
@@ -328,15 +328,125 @@ describe("TablePanel", () => {
       type: "tableInit",
       payload: expect.objectContaining({ connectionReadOnly: false }),
     });
+    expect(getColumnsMock).toHaveBeenCalledTimes(1);
 
     readOnly = true;
     vscodeMock.dispatchConfigurationChange("rapidb.connections");
 
-    await vi.waitFor(() => {
-      expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
-        type: "tableInit",
-        payload: expect.objectContaining({ connectionReadOnly: true }),
-      });
+    expect(getColumnsMock).toHaveBeenCalledTimes(1);
+    expect(panel.webview.postMessage).toHaveBeenCalledTimes(1);
+    expect(panel.title).toContain("[Main]");
+  });
+
+  it("reuses existing panel on reveal without re-creating or re-initializing data", async () => {
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        name: "Main",
+        type: "pg",
+        readOnly: false,
+      })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      getDefaultPageSize: vi.fn(() => 25),
+    };
+
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      "db1",
+      "public",
+      "users",
+    );
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected table panel instance");
+    }
+
+    await panel.webview.dispatchMessage({ type: "ready" });
+    expect(getColumnsMock).toHaveBeenCalledTimes(1);
+
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      "db1",
+      "public",
+      "users",
+    );
+
+    expect(vscodeMock.createWebviewPanel).toHaveBeenCalledTimes(1);
+    expect(panel.reveal).toHaveBeenCalledTimes(1);
+    expect(getColumnsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("deduplicates concurrent fetchPage calls with identical parameters", async () => {
+    type FetchResult = { rows: []; totalCount: number; columns: [] };
+    let resolveFetch: ((value: FetchResult) => void) | undefined;
+    getPageMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveFetch = resolve;
+        }),
+    );
+
+    const connectionManager = {
+      getConnection: vi.fn(() => ({ name: "Main" })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      getDefaultPageSize: vi.fn(() => 25),
+    };
+
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      "db1",
+      "public",
+      "users",
+    );
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected table panel instance");
+    }
+
+    const firstFetchPromise = panel.webview.dispatchMessage({
+      type: "fetchPage",
+      payload: {
+        fetchId: 1,
+        page: 1,
+        pageSize: 25,
+        filters: [],
+        sort: null,
+      },
+    });
+    const secondFetchPromise = panel.webview.dispatchMessage({
+      type: "fetchPage",
+      payload: {
+        fetchId: 2,
+        page: 1,
+        pageSize: 25,
+        filters: [],
+        sort: null,
+      },
+    });
+
+    expect(getPageMock).toHaveBeenCalledTimes(1);
+
+    if (!resolveFetch) {
+      throw new Error("Expected in-flight fetch resolver");
+    }
+    resolveFetch({ rows: [], totalCount: 0, columns: [] });
+
+    await Promise.all([firstFetchPromise, secondFetchPromise]);
+
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "tableData",
+      payload: { fetchId: 1, rows: [], totalCount: 0 },
+    });
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "tableData",
+      payload: { fetchId: 2, rows: [], totalCount: 0 },
     });
   });
 

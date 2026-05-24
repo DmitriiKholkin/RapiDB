@@ -224,6 +224,7 @@ export function TableView({
       />
 
       <TableGrid
+        key={data.columns.map((column) => column.name).join("|")}
         canEditRows={canEditRows}
         canSelectAndDeleteRows={canSelectAndDeleteRows}
         colSizes={data.colSizes}

@@ -279,6 +279,10 @@ function lastFetchPayload(): {
   };
 }
 
+function postedMessagesOfType(type: string) {
+  return getPostedMessages().filter((message) => message.type === type);
+}
+
 function renderTableView(overrides?: {
   connectionReadOnly?: boolean;
   defaultPageSize?: number;
@@ -296,6 +300,14 @@ function renderTableView(overrides?: {
       table={overrides?.table ?? "users"}
     />,
   );
+}
+
+function dragResizeHandle(handle: HTMLElement, deltaX: number): void {
+  const startX = 200;
+  const endX = Math.max(0, startX + deltaX);
+  fireEvent.mouseDown(handle, { clientX: startX, buttons: 1 });
+  fireEvent.mouseMove(document, { clientX: endX, buttons: 1 });
+  fireEvent.mouseUp(document, { clientX: endX, buttons: 0 });
 }
 
 afterEach(() => {
@@ -525,6 +537,66 @@ describe("TableView", () => {
     expect(valueCell.getAttribute("style")).toContain("white-space: pre");
   });
 
+  it("collapses and reopens a table column from the resize divider", async () => {
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({
+          page: 1,
+          pageSize: 25,
+          filters: [],
+          sort: null,
+        }),
+      });
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("table")).toBeTruthy();
+    });
+
+    const nameHeader = screen.getByText("name").closest("th");
+    if (!(nameHeader instanceof HTMLTableCellElement)) {
+      throw new Error("Expected name header cell to be rendered");
+    }
+
+    const resizeHandle = screen.getByRole("button", {
+      name: "Resize name column",
+    });
+
+    dragResizeHandle(resizeHandle, -500);
+
+    await waitFor(() => {
+      expect(nameHeader.style.width).toBe("0px");
+    });
+
+    expect(screen.queryByText("Alice")).toBeNull();
+
+    dragResizeHandle(resizeHandle, 320);
+
+    await waitFor(() => {
+      expect(Number.parseFloat(nameHeader.style.width)).toBeGreaterThan(0);
+    });
+
+    expect(screen.getByText("Alice")).toBeTruthy();
+  });
+
   it("requests pages, debounces filter application, and renders filter errors", async () => {
     renderTableView();
 
@@ -641,6 +713,185 @@ describe("TableView", () => {
     fireEvent.click(screen.getByTitle("Dismiss"));
 
     expect(screen.queryByText("Bad filter expression")).toBeNull();
+  });
+
+  it("does not refetch on duplicate tableInit and preserves committed data", async () => {
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Alice")).toBeTruthy();
+    });
+
+    clearPostedMessages();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+    expect(screen.getByText("Alice")).toBeTruthy();
+    expect(screen.getByRole("table")).toBeTruthy();
+    expect(
+      screen.queryByRole("status", { name: "Loading data..." }),
+    ).toBeNull();
+  });
+
+  it("does not refetch on pure rerender with unchanged props", async () => {
+    const view = renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    });
+
+    const initialFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("table")).toBeTruthy();
+    });
+
+    clearPostedMessages();
+
+    view.rerender(
+      <TableView
+        connectionId="conn-1"
+        database="main"
+        schema="public"
+        table="users"
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+    expect(screen.getByText("Alice")).toBeTruthy();
+    expect(
+      screen.queryByRole("status", { name: "Loading data..." }),
+    ).toBeNull();
+  });
+
+  it("emits exactly one fetchPage message per paging and sorting action", async () => {
+    renderTableView();
+
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+
+    await waitFor(() => {
+      expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    });
+
+    let currentFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: currentFetch.fetchId,
+        rows,
+        totalCount: 51,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("table")).toBeTruthy();
+    });
+
+    clearPostedMessages();
+    fireEvent.click(screen.getByRole("button", { name: "Next →" }));
+
+    await waitFor(() => {
+      expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 2, pageSize: 25 }),
+      });
+    });
+
+    currentFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: currentFetch.fetchId,
+        rows,
+        totalCount: 51,
+      });
+    });
+
+    clearPostedMessages();
+    fireEvent.change(screen.getByLabelText("Rows per page"), {
+      target: { value: "100" },
+    });
+
+    await waitFor(() => {
+      expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 100 }),
+      });
+    });
+
+    currentFetch = lastFetchPayload();
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: currentFetch.fetchId,
+        rows,
+        totalCount: 51,
+      });
+    });
+
+    clearPostedMessages();
+    fireEvent.click(screen.getByText("id"));
+
+    await waitFor(() => {
+      expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({
+          page: 1,
+          pageSize: 100,
+          sort: { column: "id", direction: "asc" },
+        }),
+      });
+    });
   });
 
   it("does not refetch when switching to a value-based operator with an empty draft", async () => {
@@ -1312,7 +1563,7 @@ describe("TableView", () => {
       });
     });
 
-    let fetchPayload = lastFetchPayload();
+    const fetchPayload = lastFetchPayload();
 
     await act(async () => {
       dispatchIncomingMessage("tableData", {
@@ -1334,25 +1585,11 @@ describe("TableView", () => {
       connectionReadOnly: true,
     });
 
-    await waitFor(() => {
-      expect(getLastPostedMessage()).toEqual({
-        type: "fetchPage",
-        payload: expect.objectContaining({
-          page: 1,
-          pageSize: 25,
-        }),
-      });
-    });
-
-    fetchPayload = lastFetchPayload();
-
     await act(async () => {
-      dispatchIncomingMessage("tableData", {
-        fetchId: fetchPayload.fetchId,
-        rows,
-        totalCount: rows.length,
-      });
+      await Promise.resolve();
     });
+
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
 
     await waitFor(() => {
       expect(screen.queryByRole("button", { name: "Add Row" })).toBeNull();

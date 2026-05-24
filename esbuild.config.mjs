@@ -23,7 +23,7 @@ const webviewConfig = {
   format: "iife",
   platform: "browser",
   target: ["chrome120"],
-  sourcemap: isProduction ? false : "inline",
+  sourcemap: isProduction ? false : "external",
   sourcesContent: true,
   minify: isProduction,
   logLevel: "info",

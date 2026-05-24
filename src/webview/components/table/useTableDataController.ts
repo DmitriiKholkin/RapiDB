@@ -42,6 +42,29 @@ interface UseTableDataControllerParams {
   ) => void;
 }
 
+function buildTableInitSignature(
+  columns: readonly ColumnMeta[],
+  primaryKeyColumns: readonly string[],
+): string {
+  return JSON.stringify({
+    columns: columns.map((column) => ({
+      name: column.name,
+      type: column.type,
+      nativeType: column.nativeType,
+      nullable: column.nullable,
+      isPrimaryKey: column.isPrimaryKey,
+      primaryKeyRole: column.primaryKeyRole ?? null,
+      isForeignKey: column.isForeignKey,
+      category: column.category,
+      filterable: column.filterable,
+      filterOperators: column.filterOperators,
+      valueSemantics: column.valueSemantics,
+      identityGeneration: column.identityGeneration ?? null,
+    })),
+    primaryKeyColumns,
+  });
+}
+
 export function useTableDataController({
   initialPageSize,
   readOnlyTable: initialReadOnlyTable,
@@ -94,6 +117,7 @@ export function useTableDataController({
   const initialPageSizeRef = useRef(initialPageSize);
   const onTableInitRef = useRef(onTableInit);
   const onRowsCommittedRef = useRef(onRowsCommitted);
+  const tableInitSignatureRef = useRef<string | null>(null);
 
   initialPageSizeRef.current = initialPageSize;
   requestedSortRef.current = requestedSort;
@@ -170,10 +194,24 @@ export function useTableDataController({
           isView !== undefined || connectionReadOnly !== undefined
             ? Boolean(isView) || Boolean(connectionReadOnly)
             : readOnlyTableRef.current;
+        const nextInitSignature = buildTableInitSignature(
+          nextColumns,
+          primaryKeyColumns,
+        );
+        const isDuplicateInit =
+          tableInitSignatureRef.current !== null &&
+          tableInitSignatureRef.current === nextInitSignature;
 
         columnsRef.current = nextColumns;
         pendingPrimaryKeyColumnsRef.current = primaryKeyColumns;
         pendingReadOnlyTableRef.current = nextReadOnlyTable;
+
+        if (isDuplicateInit) {
+          setReadOnlyTable(nextReadOnlyTable);
+          return;
+        }
+
+        tableInitSignatureRef.current = nextInitSignature;
 
         initializedRef.current = true;
         setIsInitialized(true);

@@ -3,7 +3,7 @@ import React from "react";
 import type { QueryEditorSqlDialect } from "../../../shared/webviewContracts";
 import type { QueryResult, QueryStatus, SchemaObject } from "../../store";
 import { MonacoEditor, type MonacoEditorHandle } from "../MonacoEditor";
-import { ResultsPanel } from "../ResultsPanel";
+import { TableGrid } from "../table/TableGrid";
 
 interface QueryEditorPanelsProps {
   editorHeight: number;
@@ -74,7 +74,7 @@ export function QueryEditorPanels({
       />
 
       <div style={{ flex: 1, overflow: "hidden", minHeight: 0 }}>
-        <ResultsPanel status={status} result={result} />
+        <TableGrid mode="query" status={status} result={result} />
       </div>
     </>
   );

@@ -26,7 +26,7 @@ import { TableMutationPreviewController } from "./tableMutationPreviewController
 import { createWebviewShell } from "./webviewShell";
 
 const EXPORT_CHUNK_SIZE = 500;
-const TABLE_PANEL_RETENTION_MODE = "rehydrate" as const;
+const TABLE_PANEL_RETENTION_MODE = "retain" as const;
 
 type TablePanelObjectKind = "table" | "view" | "materializedView";
 
@@ -65,6 +65,13 @@ export class TablePanel {
   private readonly table: string;
   private readonly isView: boolean;
   private readonly previewController: TableMutationPreviewController;
+  private readonly inFlightPageRequests = new Map<
+    string,
+    Promise<{
+      rows: Record<string, unknown>[];
+      totalCount: number;
+    }>
+  >();
 
   private cachedColumns: import("../dbDrivers/types").ColumnTypeMeta[] = [];
 
@@ -150,6 +157,20 @@ export class TablePanel {
     };
   }
 
+  private buildPageRequestKey(
+    page: number,
+    pageSize: number,
+    filters: FilterExpression[],
+    sort: SortConfig | null,
+  ): string {
+    return JSON.stringify({
+      page,
+      pageSize,
+      sort,
+      filters,
+    });
+  }
+
   static disposeAll(): void {
     disposePanelInstances(TablePanel.panels.values(), (panel) => {
       panel.panel.dispose();
@@ -206,7 +227,6 @@ export class TablePanel {
     const confSub = vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("rapidb.connections")) {
         panel.title = buildTitle();
-        void instance._handleReady();
       }
     });
     const disconnSub = connectionManager.onDidDisconnect((id) => {
@@ -293,16 +313,34 @@ export class TablePanel {
     const filters = coerceFilterExpressions(raw.filters);
     const sort = raw.sort ?? null;
     try {
-      const result = await this.svc.getPage(
-        this.connectionId,
-        this.database,
-        this.schema,
-        this.table,
+      const normalizedFilters = filters as FilterExpression[];
+      const normalizedSort = sort as SortConfig | null;
+      const requestKey = this.buildPageRequestKey(
         page,
         pageSize,
-        filters as FilterExpression[],
-        sort as SortConfig | null,
+        normalizedFilters,
+        normalizedSort,
       );
+      let inFlightRequest = this.inFlightPageRequests.get(requestKey);
+      if (!inFlightRequest) {
+        inFlightRequest = this.svc
+          .getPage(
+            this.connectionId,
+            this.database,
+            this.schema,
+            this.table,
+            page,
+            pageSize,
+            normalizedFilters,
+            normalizedSort,
+          )
+          .finally(() => {
+            this.inFlightPageRequests.delete(requestKey);
+          });
+        this.inFlightPageRequests.set(requestKey, inFlightRequest);
+      }
+
+      const result = await inFlightRequest;
       this.postMessage("tableData", {
         fetchId,
         rows: result.rows,
