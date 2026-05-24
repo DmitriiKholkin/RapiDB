@@ -288,10 +288,11 @@ export class QueryPanelController {
       this.connectionManager.getQueryRowLimit(),
       QUERY_LIMIT_POLICY.hardCap,
     );
+    const hardCapProbeLimit = effectiveRowLimit + 1;
     const rewrite = applyHardCapToSqlQuery(
       queryText,
       connectionType,
-      effectiveRowLimit,
+      hardCapProbeLimit,
     );
     const cappedQueryText = rewrite.queryText;
 

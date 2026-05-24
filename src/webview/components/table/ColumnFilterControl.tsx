@@ -53,7 +53,7 @@ const inputStyle: CSSProperties = {
   minWidth: 0,
   height: "100%",
   padding: "0 4px",
-  border: "1px solid transparent",
+  border: "1px solid var(--vscode-widget-border, var(--vscode-panel-border))",
   fontSize: 11,
 };
 

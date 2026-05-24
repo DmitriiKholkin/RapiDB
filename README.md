@@ -132,7 +132,7 @@ Click any table → the **Table Data Viewer** opens:
 | `rapidb.connections` | `[]` | Saved connections, including folders and other data |
 | `rapidb.connectionTimeoutSeconds` | `15` | Timeout for establishing a database connection |
 | `rapidb.dbOperationTimeoutSeconds` | `180` | Timeout for queries, metadata, DDL, and routine loading |
-| `rapidb.queryRowLimit` | `1000` | Cap on rows returned per query (100–10000) |
+| `rapidb.queryRowLimit` | `10000` | Cap on rows returned per query (100–100000) |
 | `rapidb.queryHistoryLimit` | `100` | How many past queries to remember |
 | `rapidb.defaultPageSize` | `25` | Default rows per page in the Table Data Viewer |
 

@@ -217,7 +217,7 @@ describe("QueryPanelController", () => {
     });
 
     expect(query).toHaveBeenCalledWith(
-      "SELECT * FROM (select * from users) AS rapidb_query_cap LIMIT 10000",
+      "SELECT * FROM (select * from users) AS rapidb_query_cap LIMIT 10001",
     );
     expect(formatQueryResult).toHaveBeenCalledWith(
       expect.objectContaining({ rows: [{ id: 1 }] }),
@@ -331,7 +331,7 @@ describe("QueryPanelController", () => {
     });
 
     expect(query).toHaveBeenCalledWith(
-      "SELECT * FROM (/* leading block */ -- line comment\n select * from users) AS rapidb_query_cap LIMIT 10000",
+      "SELECT * FROM (/* leading block */ -- line comment\n select * from users) AS rapidb_query_cap LIMIT 10001",
     );
     expect(formatQueryResult).toHaveBeenCalledWith(
       expect.objectContaining({ rows: [{ id: 1 }] }),
@@ -749,7 +749,7 @@ describe("QueryPanelController", () => {
 
     expect(query).toHaveBeenCalledTimes(1);
     expect(query).toHaveBeenCalledWith(
-      "SELECT * FROM (select fresh) AS rapidb_query_cap LIMIT 100",
+      "SELECT * FROM (select fresh) AS rapidb_query_cap LIMIT 101",
     );
     expect(addToHistory).toHaveBeenCalledTimes(1);
     expect(addToHistory).toHaveBeenCalledWith("active", "select fresh");
