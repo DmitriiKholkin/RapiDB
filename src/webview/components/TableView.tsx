@@ -4,6 +4,7 @@ import type { Row } from "../types";
 import { postMessage } from "../utils/messaging";
 import { GridLoadingOverlay } from "./GridOverlay";
 import { TableDialogs } from "./table/TableDialogs";
+import { type ExportFormat } from "./table/TableExportActions";
 import { TableFooter } from "./table/TableFooter";
 import { TableGrid } from "./table/TableGrid";
 import {
@@ -30,9 +31,13 @@ interface Props {
 }
 
 interface ExportChoiceState {
-  format: "csv" | "json";
+  format: ExportFormat;
   filters: unknown[];
   sort: TableSortState;
+}
+
+function resolveTableExportMessageType(format: ExportFormat) {
+  return format === "csv" ? "exportCSV" : "exportJSON";
 }
 
 export function TableView({
@@ -200,7 +205,7 @@ export function TableView({
             return;
           }
 
-          postMessage(format === "csv" ? "exportCSV" : "exportJSON", {
+          postMessage(resolveTableExportMessageType(format), {
             sort: data.sort,
             filters,
           });
@@ -279,13 +284,10 @@ export function TableView({
             return;
           }
 
-          postMessage(
-            exportChoice.format === "csv" ? "exportCSV" : "exportJSON",
-            {
-              sort: exportChoice.sort,
-              filters: exportChoice.filters,
-            },
-          );
+          postMessage(resolveTableExportMessageType(exportChoice.format), {
+            sort: exportChoice.sort,
+            filters: exportChoice.filters,
+          });
           setExportChoice(null);
         }}
         onExportVisible={() => {
@@ -293,17 +295,14 @@ export function TableView({
             return;
           }
 
-          postMessage(
-            exportChoice.format === "csv" ? "exportCSV" : "exportJSON",
-            {
-              sort: exportChoice.sort,
-              filters: exportChoice.filters,
-              limitToPage: {
-                page: data.page,
-                pageSize: data.pageSize,
-              },
+          postMessage(resolveTableExportMessageType(exportChoice.format), {
+            sort: exportChoice.sort,
+            filters: exportChoice.filters,
+            limitToPage: {
+              page: data.page,
+              pageSize: data.pageSize,
             },
-          );
+          });
           setExportChoice(null);
         }}
       />

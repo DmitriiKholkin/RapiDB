@@ -26,7 +26,6 @@ import type {
   PendingEdits,
   Row,
 } from "../../types";
-import { buildButtonStyle } from "../../utils/buttonStyles";
 import {
   calcColWidths,
   type Column as SizingColumn,
@@ -36,6 +35,7 @@ import { Icon } from "../Icon";
 import { CellDisplay } from "./CellDisplay";
 import { ColumnFilterControl } from "./ColumnFilterControl";
 import { EditInput, valueToEditString } from "./EditInput";
+import { TableExportActions } from "./TableExportActions";
 import {
   buildColumnHeaderTitle,
   canEditColumn,
@@ -46,6 +46,7 @@ import {
   ROW_H,
   SR_ONLY_STYLE,
   type TableSortState,
+  tableButtonStyle,
 } from "./tableViewHelpers";
 
 const TABLE_ROW_STYLE_ID = "rapidb-table-row-style";
@@ -1132,6 +1133,25 @@ function QueryModeTableGrid({
           fontSize: 11,
         }}
       >
+        <TableExportActions
+          onExport={(format) =>
+            postMessage(
+              format === "csv" ? "exportResultsCSV" : "exportResultsJSON",
+            )
+          }
+          titleByFormat={{
+            csv: "Export results as CSV file",
+            json: "Export results as JSON file",
+          }}
+          buttonStyle={() => ({
+            ...tableButtonStyle("ghost"),
+            height: 22,
+            padding: "0 8px",
+            fontSize: 11,
+          })}
+          iconSize={12}
+          iconMarginRight={3}
+        />
         <span style={{ opacity: 0.7 }}>
           {truncated
             ? `${truncatedCount.toLocaleString()} rows (truncated — query returned more)`
@@ -1140,22 +1160,6 @@ function QueryModeTableGrid({
             {executionTimeMs} ms
           </span>
         </span>
-        <div style={{ display: "flex", gap: 4 }}>
-          <QueryToolbarBtn
-            onClick={() => postMessage("exportResultsCSV")}
-            title="Export results as CSV file"
-          >
-            <Icon name="export" size={12} style={{ marginRight: 3 }} />
-            Export CSV
-          </QueryToolbarBtn>
-          <QueryToolbarBtn
-            onClick={() => postMessage("exportResultsJSON")}
-            title="Export results as JSON file"
-          >
-            <Icon name="export" size={12} style={{ marginRight: 3 }} />
-            Export JSON
-          </QueryToolbarBtn>
-        </div>
       </div>
 
       {truncated && (
@@ -1189,38 +1193,6 @@ function QueryModeTableGrid({
 
       <QueryResultsGrid result={result} />
     </div>
-  );
-}
-
-function QueryToolbarBtn({
-  onClick,
-  title,
-  children,
-}: {
-  onClick: () => void;
-  title?: string;
-  children: React.ReactNode;
-}) {
-  const [hovered, setHovered] = useState(false);
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      title={title}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      style={{
-        ...buildButtonStyle("ghost", { size: "sm" }),
-        height: 22,
-        padding: "0 8px",
-        fontSize: 11,
-        background: hovered
-          ? "var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground))"
-          : "transparent",
-      }}
-    >
-      {children}
-    </button>
   );
 }
 
@@ -1296,11 +1268,6 @@ function TableRow({
         const cellSize = cell.column.getSize();
         const isCollapsed = isCollapsedWidth(cellSize);
         const displayCellSize = isCollapsed ? 0 : cellSize;
-        const keyLabel = isPrimaryKey
-          ? columnDef
-            ? ""
-            : undefined
-          : undefined;
         const primaryKeyLabel = isPrimaryKey
           ? columnDef?.primaryKeyRole === "sort"
             ? "Sort key"
@@ -1344,7 +1311,7 @@ function TableRow({
             }}
             title={
               !isCollapsed && isPrimaryKey
-                ? `${primaryKeyLabel ?? keyLabel}: ${String(cell.getValue())}`
+                ? `${primaryKeyLabel}: ${String(cell.getValue())}`
                 : undefined
             }
             onDoubleClick={() => {

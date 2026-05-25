@@ -310,12 +310,102 @@ function dragResizeHandle(handle: HTMLElement, deltaX: number): void {
   fireEvent.mouseUp(document, { clientX: endX, buttons: 0 });
 }
 
+async function initializeCommittedTableData(overrides?: {
+  dataRows?: typeof rows;
+  totalCount?: number;
+}) {
+  renderTableView();
+
+  dispatchIncomingMessage("tableInit", {
+    columns,
+    primaryKeyColumns: ["id"],
+  });
+
+  await waitFor(() => {
+    expect(getLastPostedMessage()).toEqual({
+      type: "fetchPage",
+      payload: expect.objectContaining({
+        page: 1,
+        pageSize: 25,
+        filters: [],
+        sort: null,
+      }),
+    });
+  });
+
+  const initialFetch = lastFetchPayload();
+  const committedRows = overrides?.dataRows ?? rows;
+  const committedCount = overrides?.totalCount ?? committedRows.length;
+
+  await act(async () => {
+    dispatchIncomingMessage("tableData", {
+      fetchId: initialFetch.fetchId,
+      rows: committedRows,
+      totalCount: committedCount,
+    });
+  });
+
+  await waitFor(() => {
+    expect(screen.getByRole("table")).toBeTruthy();
+  });
+}
+
 afterEach(() => {
   vi.useRealTimers();
   clearPostedMessages();
 });
 
 describe("TableView", () => {
+  it("dispatches table export messages directly when all rows are visible", async () => {
+    const user = userEvent.setup();
+
+    await initializeCommittedTableData();
+    clearPostedMessages();
+
+    await user.click(screen.getByRole("button", { name: "Export CSV" }));
+    await user.click(screen.getByRole("button", { name: "Export JSON" }));
+
+    expect(getPostedMessages()).toEqual([
+      {
+        type: "exportCSV",
+        payload: { sort: null, filters: [] },
+      },
+      {
+        type: "exportJSON",
+        payload: { sort: null, filters: [] },
+      },
+    ]);
+  });
+
+  it("dispatches paged export payload when exporting visible rows from the choice dialog", async () => {
+    const user = userEvent.setup();
+
+    await initializeCommittedTableData({ totalCount: rows.length + 10 });
+    clearPostedMessages();
+
+    await user.click(screen.getByRole("button", { name: "Export CSV" }));
+
+    expect(screen.getByRole("dialog")).toBeTruthy();
+
+    await user.click(
+      screen.getByRole("button", { name: "Export visible (2 rows)" }),
+    );
+
+    expect(getPostedMessages()).toEqual([
+      {
+        type: "exportCSV",
+        payload: {
+          sort: null,
+          filters: [],
+          limitToPage: {
+            page: 1,
+            pageSize: 25,
+          },
+        },
+      },
+    ]);
+  });
+
   it("shows only a fullscreen loader until the first dataset is committed", async () => {
     renderTableView();
 

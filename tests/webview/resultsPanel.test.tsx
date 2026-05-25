@@ -142,4 +142,39 @@ describe("TableGrid query mode", () => {
       { type: "exportResultsJSON" },
     ]);
   });
+
+  it("shows export actions on the left, metrics on the right, and no refresh button", () => {
+    render(
+      <TableGrid
+        mode="query"
+        status="success"
+        result={{
+          columns: ["id"],
+          columnMeta: [],
+          rows: [{ __col_0: 1 }],
+          rowCount: 1,
+          executionTimeMs: 5,
+        }}
+      />,
+    );
+
+    const exportCsvButton = screen.getByRole("button", { name: "Export CSV" });
+    const exportJsonButton = screen.getByRole("button", {
+      name: "Export JSON",
+    });
+    const queryMetrics = screen.getByText("1 row");
+
+    expect(screen.queryByRole("button", { name: "Refresh" })).toBeNull();
+
+    const exportGroup = exportCsvButton.parentElement;
+    const toolbar = exportGroup?.parentElement;
+
+    expect(exportGroup).not.toBeNull();
+    expect(toolbar).not.toBeNull();
+    expect(exportGroup?.contains(exportCsvButton)).toBe(true);
+    expect(exportGroup?.contains(exportJsonButton)).toBe(true);
+    expect(toolbar?.firstElementChild).toBe(exportGroup);
+    expect(toolbar?.lastElementChild).toBe(queryMetrics);
+    expect(screen.getByText("5 ms")).toBeTruthy();
+  });
 });

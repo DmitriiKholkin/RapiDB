@@ -5,6 +5,7 @@ import {
   serializeFilterDrafts,
 } from "../../../shared/tableTypes";
 import { Icon } from "../Icon";
+import { type ExportFormat, TableExportActions } from "./TableExportActions";
 import {
   type TableSortState,
   TOOLBAR_H,
@@ -23,7 +24,7 @@ interface TableToolbarProps {
   totalCount: number;
   onAddRow: () => void;
   onDeleteSelected: () => void;
-  onExport: (format: "csv" | "json", filters: unknown[]) => void;
+  onExport: (format: ExportFormat, filters: unknown[]) => void;
   onRefresh: () => void;
 }
 
@@ -94,24 +95,10 @@ export function TableToolbar({
         <Icon name="refresh" size={13} style={{ marginRight: 4 }} />
         Refresh
       </button>
-      <button
-        type="button"
-        style={tableButtonStyle("ghost", mutationBusy)}
+      <TableExportActions
         disabled={mutationBusy}
-        onClick={() => onExport("csv", activeFilters)}
-      >
-        <Icon name="export" size={13} style={{ marginRight: 4 }} />
-        Export CSV
-      </button>
-      <button
-        type="button"
-        style={tableButtonStyle("ghost", mutationBusy)}
-        disabled={mutationBusy}
-        onClick={() => onExport("json", activeFilters)}
-      >
-        <Icon name="export" size={13} style={{ marginRight: 4 }} />
-        Export JSON
-      </button>
+        onExport={(format) => onExport(format, activeFilters)}
+      />
       <div style={{ flex: 1 }} />
       <span style={{ fontSize: 11, opacity: 0.5 }}>
         {`${totalCount.toLocaleString()} rows total`}
