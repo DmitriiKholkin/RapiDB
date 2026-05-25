@@ -35,6 +35,10 @@ import { Icon } from "../Icon";
 import { CellDisplay } from "./CellDisplay";
 import { ColumnFilterControl } from "./ColumnFilterControl";
 import { EditInput, valueToEditString } from "./EditInput";
+import {
+  getStructuredCellDialogValue,
+  type StructuredCellDialogValue,
+} from "./structuredCellDialog";
 import { TableExportActions } from "./TableExportActions";
 import {
   buildColumnHeaderTitle,
@@ -559,6 +563,15 @@ interface TableGridProps {
   ) => void;
   onSelectionChange: (selection: Set<number>) => void;
   onSort: (column: string) => void;
+  onOpenStructuredCell: (options: {
+    rowKind: "persisted" | "draft";
+    rowIdx?: number;
+    column: ColumnMeta;
+    value: StructuredCellDialogValue;
+    currentValue: unknown;
+    originalValue: unknown;
+    readOnly: boolean;
+  }) => void;
   onStartDraftEdit: (column: ColumnMeta) => void;
   onStartEdit: (rowIdx: number, column: ColumnMeta) => void;
   pendingEdits: PendingEdits;
@@ -600,6 +613,7 @@ function TableDataGrid({
   onFilterDraftChange,
   onSelectionChange,
   onSort,
+  onOpenStructuredCell,
   onStartDraftEdit,
   onStartEdit,
   pendingEdits,
@@ -978,6 +992,7 @@ function TableDataGrid({
                   visibleColumns={visibleColumns}
                   draft={newRow}
                   editingCol={editCell?.kind === "draft" ? editCell.col : null}
+                  onOpenStructuredCell={onOpenStructuredCell}
                   onStartEdit={onStartDraftEdit}
                   onCommit={onCommitDraftCellEdit}
                   onCancelEdit={onCancelEdit}
@@ -1006,7 +1021,9 @@ function TableDataGrid({
                 pendingCols={pendingEdits.get(persistedIndex)}
                 columnsMap={columnsMap}
                 editingCol={editingCol}
+                onOpenStructuredCell={onOpenStructuredCell}
                 onStartEdit={onStartEdit}
+                readOnly={!canEditRows}
               />
             );
           })}
@@ -1237,7 +1254,9 @@ function TableRow({
   pendingCols,
   columnsMap,
   editingCol,
+  onOpenStructuredCell,
   onStartEdit,
+  readOnly,
 }: {
   row: TanStackRow<Row>;
   visualIndex: number;
@@ -1246,7 +1265,17 @@ function TableRow({
   pendingCols?: Map<string, unknown>;
   columnsMap: Map<string, ColumnMeta>;
   editingCol: string | null;
+  onOpenStructuredCell: (options: {
+    rowKind: "persisted" | "draft";
+    rowIdx?: number;
+    column: ColumnMeta;
+    value: StructuredCellDialogValue;
+    currentValue: unknown;
+    originalValue: unknown;
+    readOnly: boolean;
+  }) => void;
   onStartEdit: (rowIndex: number, column: ColumnMeta) => void;
+  readOnly: boolean;
 }) {
   return (
     <tr
@@ -1280,6 +1309,9 @@ function TableRow({
         const isEditing = columnId === editingCol;
         const canOpenCellEditor =
           !isSelectionColumn && canEditColumn(columnDef);
+        const currentValue = isCellPending
+          ? pendingCols?.get(columnId)
+          : cell.getValue();
 
         return (
           <td
@@ -1316,6 +1348,24 @@ function TableRow({
             }
             onDoubleClick={() => {
               if (columnDef && canOpenCellEditor && !isCollapsed) {
+                const structuredValue = getStructuredCellDialogValue(
+                  currentValue,
+                  columnDef,
+                );
+
+                if (structuredValue) {
+                  onOpenStructuredCell({
+                    rowKind: "persisted",
+                    rowIdx: rowIndex,
+                    column: columnDef,
+                    value: structuredValue,
+                    currentValue,
+                    originalValue: cell.getValue(),
+                    readOnly,
+                  });
+                  return;
+                }
+
                 onStartEdit(rowIndex, columnDef);
               }
             }}
@@ -1334,6 +1384,7 @@ function DraftTableRow({
   visibleColumns,
   draft,
   editingCol,
+  onOpenStructuredCell,
   onStartEdit,
   onCommit,
   onCancelEdit,
@@ -1342,6 +1393,15 @@ function DraftTableRow({
   visibleColumns: readonly TanStackColumn<Row, unknown>[];
   draft: InsertDraftRow;
   editingCol: string | null;
+  onOpenStructuredCell: (options: {
+    rowKind: "persisted" | "draft";
+    rowIdx?: number;
+    column: ColumnMeta;
+    value: StructuredCellDialogValue;
+    currentValue: unknown;
+    originalValue: unknown;
+    readOnly: boolean;
+  }) => void;
   onStartEdit: (column: ColumnMeta) => void;
   onCommit: (column: ColumnMeta, value: string) => void;
   onCancelEdit: () => void;
@@ -1406,6 +1466,27 @@ function DraftTableRow({
             }}
             onDoubleClick={() => {
               if (!isCollapsed) {
+                const structuredValue = getStructuredCellDialogValue(
+                  isDefault ? null : displayValue,
+                  columnDef,
+                );
+
+                if (structuredValue) {
+                  onOpenStructuredCell({
+                    rowKind: "draft",
+                    column: columnDef,
+                    value: structuredValue,
+                    currentValue: isDefault
+                      ? INSERT_DEFAULT_SENTINEL
+                      : displayValue,
+                    originalValue: isDefault
+                      ? INSERT_DEFAULT_SENTINEL
+                      : displayValue,
+                    readOnly: false,
+                  });
+                  return;
+                }
+
                 onStartEdit(columnDef);
               }
             }}

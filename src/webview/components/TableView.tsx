@@ -242,6 +242,7 @@ export function TableView({
         onCommitCellEdit={mutation.commitCellEdit}
         onCommitDraftCellEdit={mutation.commitDraftCellEdit}
         onFilterDraftChange={data.updateFilterDraft}
+        onOpenStructuredCell={mutation.openStructuredCellDialog}
         onSelectionChange={setSelected}
         onSort={data.handleSort}
         onStartDraftEdit={mutation.handleStartDraftEdit}
@@ -274,11 +275,15 @@ export function TableView({
       <TableDialogs
         exportChoice={exportChoice}
         mutationPreview={mutation.mutationPreview}
+        structuredCellDialog={mutation.structuredCellDialog}
         rowsLength={data.rows.length}
         totalCount={data.totalCount}
         onCancelExport={() => setExportChoice(null)}
         onCancelMutationPreview={mutation.cancelMutationPreview}
+        onCancelStructuredCellDialog={mutation.cancelStructuredCellDialog}
+        onChangeStructuredCellDialog={mutation.updateStructuredCellDialogDraft}
         onConfirmMutationPreview={mutation.confirmMutationPreview}
+        onConfirmStructuredCellDialog={mutation.confirmStructuredCellDialog}
         onExportAll={() => {
           if (!exportChoice) {
             return;
@@ -305,6 +310,7 @@ export function TableView({
           });
           setExportChoice(null);
         }}
+        onSetStructuredCellDialogNull={mutation.setStructuredCellDialogNull}
       />
     </main>
   );

@@ -27,26 +27,63 @@ vi.mock("@tanstack/react-virtual", () => ({
 }));
 
 vi.mock("../../src/webview/components/MonacoEditor", async () => {
+  const React = await import("react");
+
   interface MockMonacoEditorProps {
     initialValue?: string;
     ariaLabel?: string;
     readOnly?: boolean;
     language?: string;
+    onChange?: (value: string) => void;
   }
 
-  function MonacoEditor(props: MockMonacoEditorProps) {
+  const MonacoEditor = React.forwardRef(function MonacoEditor(
+    props: MockMonacoEditorProps,
+    ref: React.ForwardedRef<{
+      placeCursor: (options?: {
+        reveal?: boolean;
+        preserveViewport?: boolean;
+      }) => void;
+    }>,
+  ) {
+    const [value, setValue] = React.useState(props.initialValue ?? "");
+    const textAreaRef = React.useRef<HTMLTextAreaElement>(null);
+
+    React.useEffect(() => {
+      setValue(props.initialValue ?? "");
+    }, [props.initialValue]);
+
+    React.useImperativeHandle(ref, () => ({
+      placeCursor: () => {
+        const textArea = textAreaRef.current;
+        if (!textArea) {
+          return;
+        }
+
+        const end = textArea.value.length;
+        textArea.focus();
+        textArea.setSelectionRange(end, end);
+        textArea.scrollTop = 0;
+        textArea.scrollLeft = 0;
+      },
+    }));
+
     return (
       <div>
         <div data-testid="monaco-language">{props.language ?? "sql"}</div>
         <textarea
+          ref={textAreaRef}
           aria-label={props.ariaLabel ?? "SQL editor"}
           readOnly={props.readOnly}
-          value={props.initialValue ?? ""}
-          onChange={() => undefined}
+          value={value}
+          onChange={(event) => {
+            setValue(event.target.value);
+            props.onChange?.(event.target.value);
+          }}
         />
       </div>
     );
-  }
+  });
 
   return { MonacoEditor };
 });
@@ -91,6 +128,67 @@ const columns: ColumnTypeMeta[] = [
 const rows = [
   { id: 1, name: "Alice" },
   { id: 2, name: "Bob" },
+];
+
+const structuredColumns: ColumnTypeMeta[] = [
+  {
+    name: "id",
+    type: "INTEGER",
+    nativeType: "INTEGER",
+    nullable: false,
+    isPrimaryKey: true,
+    primaryKeyOrdinal: 1,
+    isForeignKey: false,
+    category: "integer",
+    filterable: true,
+    filterOperators: ["eq", "gt", "lt"],
+    valueSemantics: "plain",
+  },
+  {
+    name: "payload",
+    type: "JSON",
+    nativeType: "JSON",
+    nullable: true,
+    isPrimaryKey: false,
+    isForeignKey: false,
+    category: "json",
+    filterable: true,
+    filterOperators: ["eq", "like", "is_null", "is_not_null"],
+    valueSemantics: "plain",
+  },
+  {
+    name: "tags",
+    type: "TEXT[]",
+    nativeType: "TEXT[]",
+    nullable: true,
+    isPrimaryKey: false,
+    isForeignKey: false,
+    category: "array",
+    filterable: true,
+    filterOperators: ["eq", "like", "is_null", "is_not_null"],
+    valueSemantics: "plain",
+  },
+  {
+    name: "xml_doc",
+    type: "XML",
+    nativeType: "XML",
+    nullable: true,
+    isPrimaryKey: false,
+    isForeignKey: false,
+    category: "text",
+    filterable: true,
+    filterOperators: ["eq", "like", "is_null", "is_not_null"],
+    valueSemantics: "plain",
+  },
+];
+
+const structuredRows = [
+  {
+    id: 1,
+    payload: '{"name":"Alice","meta":{"active":true}}',
+    tags: '["alpha","beta"]',
+    xml_doc: '<root><item id="1">Alice</item></root>',
+  },
 ];
 
 const fkColumns: ColumnTypeMeta[] = [
@@ -311,14 +409,25 @@ function dragResizeHandle(handle: HTMLElement, deltaX: number): void {
 }
 
 async function initializeCommittedTableData(overrides?: {
+  columnDefs?: ColumnTypeMeta[];
+  primaryKeyColumns?: string[];
   dataRows?: typeof rows;
+  renderOverrides?: {
+    connectionReadOnly?: boolean;
+    defaultPageSize?: number;
+    isView?: boolean;
+    table?: string;
+  };
   totalCount?: number;
 }) {
-  renderTableView();
+  renderTableView(overrides?.renderOverrides);
+
+  const columnDefs = overrides?.columnDefs ?? columns;
+  const primaryKeyColumns = overrides?.primaryKeyColumns ?? ["id"];
 
   dispatchIncomingMessage("tableInit", {
-    columns,
-    primaryKeyColumns: ["id"],
+    columns: columnDefs,
+    primaryKeyColumns,
   });
 
   await waitFor(() => {
@@ -348,6 +457,28 @@ async function initializeCommittedTableData(overrides?: {
   await waitFor(() => {
     expect(screen.getByRole("table")).toBeTruthy();
   });
+}
+
+function getBodyCell(columnName: string, rowIndex = 0): HTMLTableCellElement {
+  const tableEl = screen.getByRole("table");
+  const headerCells = Array.from(
+    tableEl.querySelectorAll("thead tr:first-child th"),
+  );
+  const columnIndex = headerCells.findIndex((cell) =>
+    (cell.textContent ?? "").includes(columnName),
+  );
+
+  if (columnIndex < 0) {
+    throw new Error(`Expected ${columnName} column header`);
+  }
+
+  const bodyRows = Array.from(tableEl.querySelectorAll("tbody tr"));
+  const targetCell = bodyRows[rowIndex]?.querySelectorAll("td")[columnIndex];
+  if (!(targetCell instanceof HTMLTableCellElement)) {
+    throw new Error(`Expected ${columnName} body cell`);
+  }
+
+  return targetCell;
 }
 
 afterEach(() => {
@@ -1588,7 +1719,7 @@ describe("TableView", () => {
 
     fireEvent.doubleClick(seqCell);
 
-    const editInput = screen.getByLabelText("Cell value");
+    const editInput = await waitFor(() => screen.getByLabelText("Cell value"));
     expect((editInput as HTMLInputElement).readOnly).toBe(true);
   });
 
@@ -1684,6 +1815,247 @@ describe("TableView", () => {
     await waitFor(() => {
       expect(screen.queryByRole("button", { name: "Add Row" })).toBeNull();
     });
+  });
+
+  it("opens structured JSON cells in the large modal and marks persisted edits as pending on apply", async () => {
+    const user = userEvent.setup();
+
+    await initializeCommittedTableData({
+      columnDefs: structuredColumns,
+      primaryKeyColumns: ["id"],
+      dataRows: structuredRows,
+    });
+
+    clearPostedMessages();
+
+    await user.dblClick(getBodyCell("payload"));
+
+    const dialog = screen.getByRole("dialog");
+    expect(screen.getByText("Cell data: payload")).toBeTruthy();
+    expect(screen.getByTestId("monaco-language").textContent).toBe("json");
+
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: {
+        value:
+          '{\n  "name": "Alice",\n  "meta": {\n    "active": false\n  }\n}',
+      },
+    });
+
+    await user.click(within(dialog).getByRole("button", { name: "Apply" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+
+    expect(screen.getByRole("button", { name: "Apply Changes" })).toBeTruthy();
+    expect(getBodyCell("payload").style.background).toContain(
+      "rgba(200, 150, 0, 0.23)",
+    );
+    expect(getPostedMessages()).toEqual([]);
+  });
+
+  it("focuses the structured editor instead of the close button when the modal opens", async () => {
+    const user = userEvent.setup();
+
+    await initializeCommittedTableData({
+      columnDefs: structuredColumns,
+      primaryKeyColumns: ["id"],
+      dataRows: structuredRows,
+    });
+
+    await user.dblClick(getBodyCell("payload"));
+
+    const editor = screen.getByLabelText("Cell data") as HTMLTextAreaElement;
+    await waitFor(() => {
+      expect(document.activeElement).toBe(editor);
+    });
+    expect(editor.selectionStart).toBe(editor.value.length);
+    expect(editor.selectionEnd).toBe(editor.value.length);
+    expect(editor.scrollTop).toBe(0);
+  });
+
+  it("discards modal-only structured cell edits on cancel", async () => {
+    const user = userEvent.setup();
+
+    await initializeCommittedTableData({
+      columnDefs: structuredColumns,
+      primaryKeyColumns: ["id"],
+      dataRows: structuredRows,
+    });
+
+    await user.dblClick(getBodyCell("payload"));
+
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: '{\n  "name": "Changed"\n}' },
+    });
+
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+
+    expect(screen.queryByRole("button", { name: "Apply Changes" })).toBeNull();
+
+    await user.dblClick(getBodyCell("payload"));
+
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).value,
+    ).toBe('{\n  "name": "Alice",\n  "meta": {\n    "active": true\n  }\n}');
+  });
+
+  it("supports nullable structured cells through the modal NULL action", async () => {
+    const user = userEvent.setup();
+
+    await initializeCommittedTableData({
+      columnDefs: structuredColumns,
+      primaryKeyColumns: ["id"],
+      dataRows: structuredRows,
+    });
+
+    clearPostedMessages();
+
+    await user.dblClick(getBodyCell("payload"));
+    await user.click(screen.getByRole("button", { name: "NULL" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+
+    expect(screen.getByRole("button", { name: "Apply Changes" })).toBeTruthy();
+    expect(getBodyCell("payload").style.background).toContain(
+      "rgba(200, 150, 0, 0.23)",
+    );
+
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "applyChanges",
+      payload: {
+        updates: [
+          {
+            primaryKeys: { id: 1 },
+            changes: { payload: null },
+          },
+        ],
+      },
+    });
+  });
+
+  it("reopens nullable structured cells as pending NULL after clicking NULL", async () => {
+    const user = userEvent.setup();
+
+    await initializeCommittedTableData({
+      columnDefs: structuredColumns,
+      primaryKeyColumns: ["id"],
+      dataRows: structuredRows,
+    });
+
+    await user.dblClick(getBodyCell("payload"));
+    await user.click(screen.getByRole("button", { name: "NULL" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+
+    expect(screen.getByRole("button", { name: "Apply Changes" })).toBeTruthy();
+
+    await user.dblClick(getBodyCell("payload"));
+
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).value,
+    ).toBe("");
+  });
+
+  it("keeps json-looking text columns on the inline editor path", async () => {
+    const user = userEvent.setup();
+
+    await initializeCommittedTableData({
+      columnDefs: [
+        structuredColumns[0],
+        {
+          ...structuredColumns[1],
+          name: "notes",
+          type: "TEXT",
+          nativeType: "TEXT",
+          category: "text",
+        },
+      ],
+      primaryKeyColumns: ["id"],
+      dataRows: [{ id: 1, notes: '{"name":"Alice"}' }],
+    });
+
+    await user.dblClick(getBodyCell("notes"));
+
+    expect(screen.getByLabelText("Cell value")).toBeTruthy();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("opens structured draft array cells in the large modal and reuses existing insert commit flow", async () => {
+    const user = userEvent.setup();
+
+    await initializeCommittedTableData({
+      columnDefs: structuredColumns,
+      primaryKeyColumns: ["id"],
+      dataRows: structuredRows,
+    });
+
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    await user.dblClick(getBodyCell("tags"));
+
+    expect(screen.getByTestId("monaco-language").textContent).toBe("json");
+
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: '[\n  "one",\n  "two"\n]' },
+    });
+
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+
+    expect(screen.getByRole("button", { name: "Apply Changes" })).toBeTruthy();
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "applyChanges",
+      payload: {
+        updates: [],
+        insertValues: {
+          tags: '["one","two"]',
+        },
+      },
+    });
+  });
+
+  it("opens xml-like structured cells in readonly mode without posting mutations", async () => {
+    const user = userEvent.setup();
+
+    await initializeCommittedTableData({
+      columnDefs: structuredColumns,
+      primaryKeyColumns: ["id"],
+      dataRows: structuredRows,
+      renderOverrides: { connectionReadOnly: true },
+    });
+
+    clearPostedMessages();
+
+    await user.dblClick(getBodyCell("xml_doc"));
+
+    expect(screen.getByText("Cell data: xml_doc")).toBeTruthy();
+    expect(screen.getByTestId("monaco-language").textContent).toBe("xml");
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).readOnly,
+    ).toBe(true);
+    expect(screen.queryByRole("button", { name: "Null" })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+
+    expect(screen.queryByRole("button", { name: "Apply Changes" })).toBeNull();
+    expect(getPostedMessages()).toEqual([]);
   });
 
   it("requests delete preview with selected primary keys", async () => {

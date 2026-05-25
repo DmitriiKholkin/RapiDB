@@ -9,6 +9,7 @@ interface CreateVitestProjectOptions {
   testTimeout?: number;
   hookTimeout?: number;
   fileParallelism?: boolean;
+  resolveAlias?: Record<string, string>;
 }
 
 export function createVitestProject({
@@ -19,8 +20,14 @@ export function createVitestProject({
   testTimeout,
   hookTimeout,
   fileParallelism,
+  resolveAlias,
 }: CreateVitestProjectOptions) {
   return defineProject({
+    resolve: resolveAlias
+      ? {
+          alias: resolveAlias,
+        }
+      : undefined,
     test: {
       name: projectId,
       include,

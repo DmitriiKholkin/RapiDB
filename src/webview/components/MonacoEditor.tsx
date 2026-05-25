@@ -158,7 +158,7 @@ export interface MonacoEditorHandle {
   focus(): void;
   layout(): void;
 
-  placeCursor(): void;
+  placeCursor(options?: { reveal?: boolean; preserveViewport?: boolean }): void;
 }
 
 export function connTypeToDialect(connType: string): QueryEditorSqlDialect {
@@ -285,6 +285,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
     const readOnlyRef = useRef(readOnly);
     const ariaLabelRef = useRef(ariaLabel);
     const languageRef = useRef(language);
+    const suppressChangeEventRef = useRef(false);
 
     useEffect(() => {
       initialValueRef.current = initialValue;
@@ -319,6 +320,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         return;
       }
       if (editor.getValue() !== initialValue) {
+        suppressChangeEventRef.current = true;
         editor.setValue(initialValue);
       }
     }, [initialValue]);
@@ -400,7 +402,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       },
       focus: () => editorRef.current?.focus(),
       layout: () => editorRef.current?.layout(),
-      placeCursor: () => {
+      placeCursor: (options) => {
         const editor = editorRef.current;
         if (!editor) {
           return;
@@ -421,9 +423,26 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
             column: model.getLineMaxColumn(lastLine),
           };
         }
+
+        const preserveViewport = options?.preserveViewport ?? false;
+        const scrollTop = preserveViewport ? editor.getScrollTop() : null;
+        const scrollLeft = preserveViewport ? editor.getScrollLeft() : null;
+
         editor.setPosition(position);
-        editor.revealPosition(position);
         editor.focus();
+
+        if (options?.reveal ?? true) {
+          editor.revealPosition(position);
+        }
+
+        if (preserveViewport) {
+          if (scrollTop !== null) {
+            editor.setScrollTop(scrollTop);
+          }
+          if (scrollLeft !== null) {
+            editor.setScrollLeft(scrollLeft);
+          }
+        }
       },
     }));
 
@@ -607,6 +626,11 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       );
 
       const changeDisposable = editor.onDidChangeModelContent(() => {
+        if (suppressChangeEventRef.current) {
+          suppressChangeEventRef.current = false;
+          return;
+        }
+
         onChangeRef.current?.(editor.getValue());
       });
 

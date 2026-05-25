@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useId, useRef } from "react";
 import type { TableMutationPreviewPayload } from "../../../shared/webviewContracts";
 import { Icon } from "../Icon";
-import { MonacoEditor } from "../MonacoEditor";
+import { MonacoEditor, type MonacoEditorHandle } from "../MonacoEditor";
+import type { StructuredCellDialogState } from "./structuredCellDialog";
 import { PREVIEW_DIALOG_EDITOR_H, tableButtonStyle } from "./tableViewHelpers";
 
 const DIALOG_FOCUSABLE_SELECTOR =
@@ -247,25 +248,64 @@ interface MutationPreviewDialogProps {
   onConfirm: () => void;
 }
 
-function MutationPreviewDialog({
-  preview,
+interface LargeMonacoDialogProps {
+  title: string;
+  description: React.ReactNode;
+  value: string;
+  language: "json" | "sql" | "xml" | "plaintext";
+  ariaLabel: string;
+  readOnly?: boolean;
+  confirmLabel: string;
+  closeAriaLabel?: string;
+  onChange?: (value: string) => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+  extraActions?: React.ReactNode;
+  focusEditorOnOpen?: boolean;
+}
+
+function LargeMonacoDialog({
+  title,
+  description,
+  value,
+  language,
+  ariaLabel,
+  readOnly = false,
+  confirmLabel,
+  closeAriaLabel = "Close dialog",
+  onChange,
   onCancel,
   onConfirm,
-}: MutationPreviewDialogProps) {
-  const confirmLabel =
-    preview.kind === "applyChanges"
-      ? "Apply Changes"
-      : preview.kind === "insertRow"
-        ? "Insert Row"
-        : "Apply Changes";
+  extraActions,
+  focusEditorOnOpen = false,
+}: LargeMonacoDialogProps) {
   const titleId = useId();
   const descriptionId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const editorRef = useRef<MonacoEditorHandle>(null);
   const handleDialogKeyDown = useDialogFocusTrap({
     dialogRef,
-    initialFocusRef: closeButtonRef,
+    initialFocusRef: focusEditorOnOpen ? undefined : closeButtonRef,
+    onEscape: onCancel,
   });
+
+  useEffect(() => {
+    if (!focusEditorOnOpen) {
+      return;
+    }
+
+    const frameId = requestAnimationFrame(() => {
+      editorRef.current?.placeCursor({
+        reveal: false,
+        preserveViewport: true,
+      });
+    });
+
+    return () => {
+      cancelAnimationFrame(frameId);
+    };
+  }, [focusEditorOnOpen]);
 
   return (
     <div
@@ -314,22 +354,20 @@ function MutationPreviewDialog({
         >
           <div style={{ minWidth: 0 }}>
             <div id={titleId} style={{ fontSize: 13, fontWeight: 600 }}>
-              {preview.title}
+              {title}
             </div>
             <div
               id={descriptionId}
               style={{ marginTop: 4, fontSize: 11, opacity: 0.75 }}
             >
-              {preview.statementCount} statement
-              {preview.statementCount === 1 ? "" : "s"} will be executed. The
-              preview below is read only and matches the prepared mutation plan.
+              {description}
             </div>
           </div>
           <button
             type="button"
             ref={closeButtonRef}
             onClick={onCancel}
-            aria-label="Close mutation preview"
+            aria-label={closeAriaLabel}
             style={{
               background: "transparent",
               border: "none",
@@ -360,22 +398,18 @@ function MutationPreviewDialog({
             }}
           >
             <MonacoEditor
-              key={preview.previewToken}
-              initialValue={preview.text ?? preview.sql}
+              ref={editorRef}
+              initialValue={value}
               height="100%"
-              readOnly
-              language={
-                preview.contentType === "application/json"
-                  ? "json"
-                  : preview.contentType === "application/sql"
-                    ? "sql"
-                    : "plaintext"
-              }
-              ariaLabel="Mutation preview"
+              readOnly={readOnly}
+              language={language}
+              ariaLabel={ariaLabel}
+              onChange={onChange}
             />
           </div>
 
           <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+            {extraActions}
             <button
               type="button"
               style={tableButtonStyle("ghost")}
@@ -397,30 +431,124 @@ function MutationPreviewDialog({
   );
 }
 
+function MutationPreviewDialog({
+  preview,
+  onCancel,
+  onConfirm,
+}: MutationPreviewDialogProps) {
+  const confirmLabel =
+    preview.kind === "applyChanges"
+      ? "Apply Changes"
+      : preview.kind === "insertRow"
+        ? "Insert Row"
+        : "Apply Changes";
+
+  return (
+    <LargeMonacoDialog
+      title={preview.title}
+      description={
+        <>
+          {preview.statementCount} statement
+          {preview.statementCount === 1 ? "" : "s"} will be executed. The
+          preview below is read only and matches the prepared mutation plan.
+        </>
+      }
+      value={preview.text ?? preview.sql}
+      language={
+        preview.contentType === "application/json"
+          ? "json"
+          : preview.contentType === "application/sql"
+            ? "sql"
+            : "plaintext"
+      }
+      ariaLabel="Mutation preview"
+      readOnly
+      confirmLabel={confirmLabel}
+      closeAriaLabel="Close mutation preview"
+      onCancel={onCancel}
+      onConfirm={onConfirm}
+    />
+  );
+}
+
+interface StructuredCellDialogProps {
+  dialog: StructuredCellDialogState;
+  onCancel: () => void;
+  onConfirm: () => void;
+  onChange: (value: string) => void;
+  onSetNull: () => void;
+}
+
+function StructuredCellDialog({
+  dialog,
+  onCancel,
+  onConfirm,
+  onChange,
+  onSetNull,
+}: StructuredCellDialogProps) {
+  return (
+    <LargeMonacoDialog
+      title={dialog.title}
+      description={dialog.description}
+      value={dialog.isNull ? "" : dialog.draftText}
+      language={dialog.language}
+      ariaLabel="Cell data"
+      readOnly={dialog.readOnly}
+      confirmLabel="Apply"
+      closeAriaLabel="Close cell data"
+      onChange={onChange}
+      onCancel={onCancel}
+      onConfirm={onConfirm}
+      focusEditorOnOpen
+      extraActions={
+        dialog.nullable && !dialog.readOnly ? (
+          <button
+            type="button"
+            style={tableButtonStyle("ghost")}
+            onClick={onSetNull}
+          >
+            NULL
+          </button>
+        ) : undefined
+      }
+    />
+  );
+}
+
 interface TableDialogsProps {
   exportChoice: {
     format: "csv" | "json";
   } | null;
   mutationPreview: TableMutationPreviewPayload | null;
+  structuredCellDialog: StructuredCellDialogState | null;
   rowsLength: number;
   totalCount: number;
   onCancelExport: () => void;
   onCancelMutationPreview: () => void;
+  onCancelStructuredCellDialog: () => void;
+  onChangeStructuredCellDialog: (value: string) => void;
   onConfirmMutationPreview: () => void;
+  onConfirmStructuredCellDialog: () => void;
   onExportAll: () => void;
   onExportVisible: () => void;
+  onSetStructuredCellDialogNull: () => void;
 }
 
 export function TableDialogs({
   exportChoice,
   mutationPreview,
+  structuredCellDialog,
   rowsLength,
   totalCount,
   onCancelExport,
   onCancelMutationPreview,
+  onCancelStructuredCellDialog,
+  onChangeStructuredCellDialog,
   onConfirmMutationPreview,
+  onConfirmStructuredCellDialog,
   onExportAll,
   onExportVisible,
+  onSetStructuredCellDialogNull,
 }: TableDialogsProps) {
   return (
     <>
@@ -429,6 +557,15 @@ export function TableDialogs({
           preview={mutationPreview}
           onCancel={onCancelMutationPreview}
           onConfirm={onConfirmMutationPreview}
+        />
+      )}
+      {structuredCellDialog && (
+        <StructuredCellDialog
+          dialog={structuredCellDialog}
+          onCancel={onCancelStructuredCellDialog}
+          onConfirm={onConfirmStructuredCellDialog}
+          onChange={onChangeStructuredCellDialog}
+          onSetNull={onSetStructuredCellDialogNull}
         />
       )}
       {exportChoice && (

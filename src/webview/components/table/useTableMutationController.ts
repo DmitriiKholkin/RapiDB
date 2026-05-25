@@ -21,6 +21,11 @@ import type {
 } from "../../types";
 import { onMessage, postMessage } from "../../utils/messaging";
 import { valueToEditString } from "./EditInput";
+import type {
+  StructuredCellDialogState,
+  StructuredCellDialogValue,
+} from "./structuredCellDialog";
+import { serializeStructuredCellDialogDraft } from "./structuredCellDialog";
 import {
   buildInsertValues,
   buildPendingRestoreState,
@@ -61,6 +66,8 @@ export function useTableMutationController({
   const [deleting, setDeleting] = useState(false);
   const [mutationPreview, setMutationPreview] =
     useState<TableMutationPreviewPayload | null>(null);
+  const [structuredCellDialog, setStructuredCellDialog] =
+    useState<StructuredCellDialogState | null>(null);
 
   const applyPendingSnapshotRef = useRef<PendingEdits>(new Map());
   const applyRowIndexesRef = useRef<number[]>([]);
@@ -120,6 +127,7 @@ export function useTableMutationController({
     setDeleting(false);
     setInserting(false);
     setMutationPreview(null);
+    setStructuredCellDialog(null);
     setNewRow(null);
     setMutErr(null);
     setApplyStatus(null);
@@ -421,6 +429,119 @@ export function useTableMutationController({
     setApplyStatus(null);
   }, []);
 
+  const openStructuredCellDialog = useCallback(
+    (options: {
+      rowKind: "persisted" | "draft";
+      rowIdx?: number;
+      column: ColumnMeta;
+      value: StructuredCellDialogValue;
+      currentValue: unknown;
+      originalValue: unknown;
+      readOnly: boolean;
+    }) => {
+      const {
+        rowKind,
+        rowIdx,
+        column,
+        value,
+        currentValue,
+        originalValue,
+        readOnly,
+      } = options;
+
+      setEditCell(null);
+      setApplyStatus(null);
+      setStructuredCellDialog({
+        rowKind,
+        rowIdx: rowKind === "persisted" ? (rowIdx ?? null) : null,
+        column,
+        title: `Cell data: ${column.name}`,
+        description: readOnly
+          ? `Structured ${value.kind} data in ${column.name}. Apply closes this dialog without sending a mutation.`
+          : rowKind === "draft"
+            ? `Structured ${value.kind} data in ${column.name}. Apply updates the pending inserted row only.`
+            : `Structured ${value.kind} data in ${column.name}. Apply updates the local pending cell edit only.`,
+        language: value.language,
+        initialText: value.formattedText,
+        draftText: value.formattedText,
+        originalValue,
+        nullable: column.nullable,
+        readOnly,
+        initialIsNull: currentValue === null,
+        isNull: currentValue === null,
+      });
+    },
+    [],
+  );
+
+  const updateStructuredCellDialogDraft = useCallback((nextValue: string) => {
+    setStructuredCellDialog((currentDialog) => {
+      if (!currentDialog) {
+        return currentDialog;
+      }
+
+      return {
+        ...currentDialog,
+        draftText: nextValue,
+        isNull: false,
+      };
+    });
+  }, []);
+
+  const cancelStructuredCellDialog = useCallback(() => {
+    setStructuredCellDialog(null);
+  }, []);
+
+  const commitStructuredCellDialogValue = useCallback(
+    (dialog: StructuredCellDialogState, nextValue: string) => {
+      if (dialog.rowKind === "persisted" && dialog.rowIdx !== null) {
+        commitCellEdit(
+          dialog.rowIdx,
+          dialog.column,
+          nextValue,
+          dialog.originalValue,
+        );
+        return;
+      }
+
+      commitDraftCellEdit(dialog.column, nextValue);
+    },
+    [commitCellEdit, commitDraftCellEdit],
+  );
+
+  const confirmStructuredCellDialog = useCallback(() => {
+    const dialog = structuredCellDialog;
+    if (!dialog) {
+      return;
+    }
+
+    setStructuredCellDialog(null);
+
+    if (
+      dialog.readOnly ||
+      (dialog.draftText === dialog.initialText &&
+        dialog.isNull === dialog.initialIsNull)
+    ) {
+      return;
+    }
+
+    const nextValue = dialog.isNull
+      ? NULL_SENTINEL
+      : serializeStructuredCellDialogDraft(dialog.draftText, dialog.column);
+
+    commitStructuredCellDialogValue(dialog, nextValue);
+  }, [commitStructuredCellDialogValue, structuredCellDialog]);
+
+  const setStructuredCellDialogNull = useCallback(() => {
+    const dialog = structuredCellDialog;
+    if (!dialog || dialog.readOnly || !dialog.nullable) {
+      return;
+    }
+
+    setStructuredCellDialog(null);
+    commitStructuredCellDialogValue(dialog, NULL_SENTINEL);
+  }, [commitStructuredCellDialogValue, structuredCellDialog]);
+
   const deleteSelected = useCallback(() => {
     if (
       selectedRef.current.size === 0 ||
@@ -452,6 +573,7 @@ export function useTableMutationController({
     dismissApplyStatus: () => setApplyStatus(null),
     dismissMutationError: () => setMutErr(null),
     editCell,
+    structuredCellDialog,
     handleRowsCommitted,
     handleStartDraftEdit,
     handleStartEdit,
@@ -460,11 +582,16 @@ export function useTableMutationController({
     mutationPreview,
     newRow,
     pendingEdits,
+    openStructuredCellDialog,
     resetForTableInit,
     revertChanges,
+    cancelStructuredCellDialog,
+    confirmStructuredCellDialog,
     setEditCell,
+    setStructuredCellDialogNull,
     startInsertRow,
     applyChanges,
     cancelMutationPreview,
+    updateStructuredCellDialogDraft,
   };
 }

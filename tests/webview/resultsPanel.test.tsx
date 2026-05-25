@@ -76,6 +76,29 @@ describe("TableGrid query mode", () => {
     expect(screen.getByLabelText("Cell value")).toBeDefined();
   });
 
+  it("keeps structured-looking query results on the inline editor path", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <TableGrid
+        mode="query"
+        status="success"
+        result={{
+          columns: ["payload"],
+          columnMeta: [{ category: "json" }],
+          rows: [{ __col_0: '{"nested":{"ok":true}}' }],
+          rowCount: 1,
+          executionTimeMs: 5,
+        }}
+      />,
+    );
+
+    await user.dblClick(screen.getByRole("cell"));
+
+    expect(screen.getByLabelText("Cell value")).toBeDefined();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
   it("collapses and reopens a result column from the resize divider", async () => {
     render(
       <TableGrid

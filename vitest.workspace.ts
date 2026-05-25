@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { createVitestProject } from "./tests/config/createVitestProject";
 import {
   DB_ENGINE_IDS,
@@ -34,6 +35,9 @@ export default [
       "./tests/setup/common.setup.ts",
       "./tests/setup/webview.setup.ts",
     ],
+    resolveAlias: {
+      "monaco-editor": resolve(__dirname, "tests/mocks/monaco-editor.ts"),
+    },
   }),
   ...dbProjects,
   createVitestProject({
