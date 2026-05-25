@@ -171,6 +171,12 @@ const MSSQL_ENTITY_MANIFEST: DriverEntityManifest = {
     indexes: "supported",
     triggers: "supported",
   },
+  tableSectionOverridesByObjectKind: {
+    view: {
+      constraints: "not_applicable",
+      triggers: "not_applicable",
+    },
+  },
 };
 
 function ensureTediousBufferLength(

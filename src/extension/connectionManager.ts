@@ -54,6 +54,7 @@ import {
   type DriverEntityManifest,
   type DriverStaticMetadata,
   type IDBDriver,
+  resolveDriverTableSectionAvailability,
 } from "./dbDrivers/types";
 import type { DriverConnectionConfig } from "./driverRuntimeConfig";
 import { ConnectionValidationService } from "./services/connectionValidationService";
@@ -306,7 +307,7 @@ function createInternalTableDetailCacheEntry(
 function getTableDetailCacheKey(
   request: Omit<TableDetailRequest, "connectionId">,
 ): string {
-  return [request.database, request.schema, request.table]
+  return [request.database, request.schema, request.objectKind, request.table]
     .map((part) => encodeURIComponent(part))
     .join(":");
 }
@@ -2892,17 +2893,49 @@ export class ConnectionManager
     };
 
     const [columns, constraints, indexes, triggers] = await Promise.all([
-      loadSection(manifest.tableSections.columns, async () =>
-        driver.describeColumns(request.database, request.schema, request.table),
+      loadSection(
+        resolveDriverTableSectionAvailability(
+          manifest,
+          request.objectKind,
+          "columns",
+        ),
+        async () =>
+          driver.describeColumns(
+            request.database,
+            request.schema,
+            request.table,
+          ),
       ),
-      loadSection(manifest.tableSections.constraints, async () =>
-        driver.getConstraints(request.database, request.schema, request.table),
+      loadSection(
+        resolveDriverTableSectionAvailability(
+          manifest,
+          request.objectKind,
+          "constraints",
+        ),
+        async () =>
+          driver.getConstraints(
+            request.database,
+            request.schema,
+            request.table,
+          ),
       ),
-      loadSection(manifest.tableSections.indexes, async () =>
-        driver.getIndexes(request.database, request.schema, request.table),
+      loadSection(
+        resolveDriverTableSectionAvailability(
+          manifest,
+          request.objectKind,
+          "indexes",
+        ),
+        async () =>
+          driver.getIndexes(request.database, request.schema, request.table),
       ),
-      loadSection(manifest.tableSections.triggers, async () =>
-        driver.getTriggers(request.database, request.schema, request.table),
+      loadSection(
+        resolveDriverTableSectionAvailability(
+          manifest,
+          request.objectKind,
+          "triggers",
+        ),
+        async () =>
+          driver.getTriggers(request.database, request.schema, request.table),
       ),
     ]);
 

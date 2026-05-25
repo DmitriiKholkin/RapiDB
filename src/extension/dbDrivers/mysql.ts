@@ -41,6 +41,13 @@ const MYSQL_ENTITY_MANIFEST: DriverEntityManifest = {
     indexes: "supported",
     triggers: "supported",
   },
+  tableSectionOverridesByObjectKind: {
+    view: {
+      constraints: "not_applicable",
+      indexes: "not_applicable",
+      triggers: "not_applicable",
+    },
+  },
 };
 
 type MysqlSslOptions = Exclude<PoolOptions["ssl"], string | undefined>;

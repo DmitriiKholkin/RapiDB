@@ -1,6 +1,6 @@
 import type { ConnectionConfig } from "../shared/connectionConfig";
 import type { ConnectionValidationResult } from "../shared/connectionValidation";
-import type { DbObjectKind } from "../shared/dbObjectKinds";
+import type { DataDbObjectKind, DbObjectKind } from "../shared/dbObjectKinds";
 import type {
   ColumnTypeMeta,
   DriverTableSectionKind,
@@ -107,6 +107,7 @@ export interface TableDetailRequest {
   database: string;
   schema: string;
   table: string;
+  objectKind: DataDbObjectKind;
 }
 
 export interface TableDetailSectionState<T> {

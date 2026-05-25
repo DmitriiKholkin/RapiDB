@@ -104,6 +104,7 @@ describe("ConnectionProvider", () => {
         database: "app_db",
         schema: "app_db",
         table: "users",
+        objectKind: "table",
       },
       status: "loaded",
       isPartial: false,
@@ -185,6 +186,7 @@ describe("ConnectionProvider", () => {
         database: "app_db",
         schema: "app_db",
         table: "users",
+        objectKind: "table",
       },
       status: "loading",
       isPartial: false,
@@ -1692,12 +1694,14 @@ describe("ConnectionProvider", () => {
       database: "app_db",
       schema: "app_db",
       table: "users",
+      objectKind: "table",
     });
     expect(getTableDetailState).toHaveBeenCalledWith({
       connectionId: "conn-1",
       database: "app_db",
       schema: "app_db",
       table: "users",
+      objectKind: "table",
     });
   });
 
@@ -1874,12 +1878,117 @@ describe("ConnectionProvider", () => {
       database: "app_db",
       schema: "app_db",
       table: "users",
+      objectKind: "table",
     });
     expect(getTableDetailState).toHaveBeenCalledWith({
       connectionId: "conn-1",
       database: "app_db",
       schema: "app_db",
       table: "users",
+      objectKind: "table",
+    });
+  });
+
+  it("expands views when the resolved policy exposes detail sections", async () => {
+    const ensureTableDetailLoading = vi.fn();
+    const baseState = loadedTableDetailState();
+    const getTableDetailState = vi.fn(() => ({
+      ...baseState,
+      request: {
+        connectionId: "conn-1",
+        database: "app_db",
+        schema: "app_db",
+        table: "active_users",
+        objectKind: "view",
+      },
+      snapshot: {
+        ...baseState.snapshot,
+        constraints: { status: "loaded", items: [] },
+        indexes: { status: "loaded", items: [] },
+      },
+    }));
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-1", name: "Primary", type: "pg" },
+      ]),
+      isConnected: vi.fn((id: string) => id === "conn-1"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      ensureTableDetailLoading,
+      getTableDetailState,
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "app_db",
+              schemas: [
+                {
+                  name: "app_db",
+                  objects: [
+                    { name: "active_users", type: "view", columns: [] },
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      getDriverEntityManifest: vi.fn(() => ({
+        dbObjectKinds: ["table", "view"],
+        tableSections: {
+          columns: "supported",
+          constraints: "supported",
+          indexes: "supported",
+          triggers: "supported",
+        },
+        tableSectionOverridesByObjectKind: {
+          view: {
+            constraints: "not_applicable",
+            indexes: "not_applicable",
+          },
+        },
+      })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+
+    const roots = await provider.getChildren();
+    const databases = await provider.getChildren(roots[0]);
+    const categories = await provider.getChildren(databases[0]);
+    const viewNode = (await provider.getChildren(categories[1]))[0];
+    const sections = await provider.getChildren(viewNode);
+    const columnNodes = await provider.getChildren(sections[0]);
+
+    expect(viewNode?.collapsibleState).toBe(1);
+    expect(sections.map((node) => node.label)).toEqual(["Columns", "Triggers"]);
+    expect(columnNodes[0]?.id).toBe(
+      "table_detail_column:conn-1:app_db:app_db:id:active_users:columns:id:view",
+    );
+    expect(ensureTableDetailLoading).toHaveBeenCalledWith({
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "app_db",
+      table: "active_users",
+      objectKind: "view",
+    });
+    expect(getTableDetailState).toHaveBeenCalledWith({
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "app_db",
+      table: "active_users",
+      objectKind: "view",
     });
   });
 

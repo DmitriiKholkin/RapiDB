@@ -28,6 +28,12 @@ const SQLITE_ENTITY_MANIFEST: DriverEntityManifest = {
     indexes: "supported",
     triggers: "supported",
   },
+  tableSectionOverridesByObjectKind: {
+    view: {
+      constraints: "not_applicable",
+      indexes: "not_applicable",
+    },
+  },
 };
 
 type SqlStatementKind = "select" | "dml";

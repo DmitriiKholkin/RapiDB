@@ -1,4 +1,5 @@
 import type {
+  DataDbObjectKind,
   DbObjectKind,
   DdlOnlyDbObjectKind,
 } from "../../shared/dbObjectKinds";
@@ -98,11 +99,21 @@ export type DriverTableSectionKind =
 
 export type DriverEntityAvailability = "supported" | "not_applicable";
 
+export type DriverTableSectionOverridesByObjectKind = Readonly<
+  Partial<
+    Record<
+      DataDbObjectKind,
+      Partial<Record<DriverTableSectionKind, DriverEntityAvailability>>
+    >
+  >
+>;
+
 export interface DriverEntityManifest {
   dbObjectKinds: readonly DbObjectKind[];
   tableSections: Readonly<
     Record<DriverTableSectionKind, DriverEntityAvailability>
   >;
+  tableSectionOverridesByObjectKind?: DriverTableSectionOverridesByObjectKind;
 }
 
 export const DEFAULT_DRIVER_ENTITY_MANIFEST: DriverEntityManifest = {
@@ -114,6 +125,17 @@ export const DEFAULT_DRIVER_ENTITY_MANIFEST: DriverEntityManifest = {
     triggers: "supported",
   },
 };
+
+export function resolveDriverTableSectionAvailability(
+  manifest: DriverEntityManifest,
+  objectKind: DataDbObjectKind,
+  section: DriverTableSectionKind,
+): DriverEntityAvailability {
+  return (
+    manifest.tableSectionOverridesByObjectKind?.[objectKind]?.[section] ??
+    manifest.tableSections[section]
+  );
+}
 
 export interface DriverSortConfig {
   column: string;

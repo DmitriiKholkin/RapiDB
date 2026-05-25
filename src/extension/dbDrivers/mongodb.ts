@@ -62,6 +62,11 @@ const MONGODB_ENTITY_MANIFEST: DriverEntityManifest = {
     indexes: "supported",
     triggers: "not_applicable",
   },
+  tableSectionOverridesByObjectKind: {
+    view: {
+      indexes: "not_applicable",
+    },
+  },
 };
 
 type MongoSchemaType = {

@@ -45,6 +45,16 @@ const ORACLE_ENTITY_MANIFEST: DriverEntityManifest = {
     indexes: "supported",
     triggers: "supported",
   },
+  tableSectionOverridesByObjectKind: {
+    view: {
+      constraints: "not_applicable",
+      indexes: "not_applicable",
+    },
+    materializedView: {
+      constraints: "not_applicable",
+      triggers: "not_applicable",
+    },
+  },
 };
 
 function oracleFullType(

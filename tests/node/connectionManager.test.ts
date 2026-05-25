@@ -10,6 +10,7 @@ import type {
   DriverCapabilities,
   DriverEntityManifest,
   IDBDriver,
+  IndexMeta,
   SchemaInfo,
   TableConstraintMeta,
   TableInfo,
@@ -41,11 +42,17 @@ interface DriverBehavior {
     table: string,
   ) => ColumnMeta[] | Promise<ColumnMeta[]>;
   getConstraintsByScope?: Record<string, TableConstraintMeta[]>;
+  getIndexesByScope?: Record<string, IndexMeta[]>;
   getConstraintsImpl?: (
     database: string,
     schema: string,
     table: string,
   ) => TableConstraintMeta[] | Promise<TableConstraintMeta[]>;
+  getIndexesImpl?: (
+    database: string,
+    schema: string,
+    table: string,
+  ) => IndexMeta[] | Promise<IndexMeta[]>;
   getTriggersByScope?: Record<string, TriggerMeta[] | null>;
   getTriggersImpl?: (
     database: string,
@@ -160,6 +167,7 @@ class FakeDriver implements IDBDriver {
   describeTableCalls: string[] = [];
   describeColumnsCalls: string[] = [];
   getConstraintsCalls: string[] = [];
+  getIndexesCalls: string[] = [];
   getTriggersCalls: string[] = [];
   private connected = false;
 
@@ -273,8 +281,16 @@ class FakeDriver implements IDBDriver {
     }));
   }
 
-  async getIndexes() {
-    return [];
+  async getIndexes(database = "", schema = "", table = "") {
+    this.getIndexesCalls.push(`${database}.${schema}.${table}`);
+    const behavior = driverBehaviors.get(this.config.id);
+    if (behavior?.getIndexesImpl) {
+      return behavior.getIndexesImpl(database, schema, table);
+    }
+
+    return (
+      behavior?.getIndexesByScope?.[`${database}.${schema}.${table}`] ?? []
+    );
   }
 
   async getForeignKeys() {
@@ -3460,7 +3476,8 @@ describe("ConnectionManager", () => {
       database: "app_db",
       schema: "public",
       table: "users",
-    };
+      objectKind: "table",
+    } as const;
 
     manager.ensureTableDetailLoading(request);
     await waitForTableDetailCondition(
@@ -3557,7 +3574,8 @@ describe("ConnectionManager", () => {
       database: "app_db",
       schema: "public",
       table: "users",
-    };
+      objectKind: "table",
+    } as const;
 
     manager.ensureTableDetailLoading(request);
     await waitForTableDetailCondition(
@@ -3683,7 +3701,8 @@ describe("ConnectionManager", () => {
       database: "app_db",
       schema: "public",
       table: "users",
-    };
+      objectKind: "table",
+    } as const;
 
     manager.ensureTableDetailLoading(request);
     await waitForTableDetailCondition(
@@ -3702,5 +3721,146 @@ describe("ConnectionManager", () => {
     ]);
     expect(driverInstances[0]?.getConstraintsCalls).toEqual([]);
     expect(driverInstances[0]?.getTriggersCalls).toEqual([]);
+  });
+
+  it("separates table detail cache entries by object kind and applies object-specific sections", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    driverBehaviors.set("conn-object-kind-details", {
+      entityManifest: {
+        dbObjectKinds: ["table", "view", "materializedView"],
+        tableSections: {
+          columns: "supported",
+          constraints: "supported",
+          indexes: "supported",
+          triggers: "supported",
+        },
+        tableSectionOverridesByObjectKind: {
+          view: {
+            constraints: "not_applicable",
+            indexes: "not_applicable",
+          },
+          materializedView: {
+            constraints: "not_applicable",
+            triggers: "not_applicable",
+          },
+        },
+      },
+      listDatabases: [{ name: "app_db", schemas: [] }],
+      listSchemasByDatabase: {
+        app_db: [{ name: "public" }],
+      },
+      listObjectsByScope: {
+        "app_db.public": [
+          { schema: "public", name: "users", type: "table" },
+          { schema: "public", name: "users", type: "view" },
+          { schema: "public", name: "users_mv", type: "materializedView" },
+        ],
+      },
+      describeTableByScope: {
+        "app_db.public.users": [
+          {
+            name: "id",
+            type: "int",
+            nullable: false,
+            isPrimaryKey: true,
+            primaryKeyOrdinal: 1,
+            isForeignKey: false,
+          },
+        ],
+        "app_db.public.users_mv": [
+          {
+            name: "id",
+            type: "int",
+            nullable: false,
+            isPrimaryKey: false,
+            isForeignKey: false,
+          },
+        ],
+      },
+    });
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-object-kind-details",
+        name: "Object detail policies",
+        type: "pg",
+        host: "localhost",
+        database: "app_db",
+        username: "postgres",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo("conn-object-kind-details");
+    await manager.getSchemaSnapshotAsync("conn-object-kind-details");
+
+    const tableRequest = {
+      connectionId: "conn-object-kind-details",
+      database: "app_db",
+      schema: "public",
+      table: "users",
+      objectKind: "table",
+    } as const;
+    const viewRequest = {
+      connectionId: "conn-object-kind-details",
+      database: "app_db",
+      schema: "public",
+      table: "users",
+      objectKind: "view",
+    } as const;
+    const materializedViewRequest = {
+      connectionId: "conn-object-kind-details",
+      database: "app_db",
+      schema: "public",
+      table: "users_mv",
+      objectKind: "materializedView",
+    } as const;
+
+    manager.ensureTableDetailLoading(tableRequest);
+    await waitForTableDetailCondition(
+      manager,
+      "conn-object-kind-details",
+      () => manager.getTableDetailState(tableRequest).status === "loaded",
+    );
+
+    manager.ensureTableDetailLoading(viewRequest);
+    await waitForTableDetailCondition(
+      manager,
+      "conn-object-kind-details",
+      () => manager.getTableDetailState(viewRequest).status === "loaded",
+    );
+
+    manager.ensureTableDetailLoading(materializedViewRequest);
+    await waitForTableDetailCondition(
+      manager,
+      "conn-object-kind-details",
+      () =>
+        manager.getTableDetailState(materializedViewRequest).status ===
+        "loaded",
+    );
+
+    expect(driverInstances[0]?.describeColumnsCalls).toEqual([
+      "app_db.public.users",
+      "app_db.public.users",
+      "app_db.public.users_mv",
+    ]);
+    expect(driverInstances[0]?.getConstraintsCalls).toEqual([
+      "app_db.public.users",
+    ]);
+    expect(driverInstances[0]?.getIndexesCalls).toEqual([
+      "app_db.public.users",
+      "app_db.public.users_mv",
+    ]);
+    expect(driverInstances[0]?.getTriggersCalls).toEqual([
+      "app_db.public.users",
+      "app_db.public.users",
+    ]);
   });
 });
