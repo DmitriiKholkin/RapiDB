@@ -55,7 +55,14 @@ import {
   type DriverStaticMetadata,
   type IDBDriver,
 } from "./dbDrivers/types";
+import type { DriverConnectionConfig } from "./driverRuntimeConfig";
 import { ConnectionValidationService } from "./services/connectionValidationService";
+import {
+  type ConnectionSshSettings,
+  createSshRuntime,
+  type SshRuntime,
+  type SshRuntimeRequest,
+} from "./services/sshRuntime";
 import { pMapWithLimit } from "./utils/concurrency";
 import { normalizeUnknownError } from "./utils/errorHandling";
 
@@ -638,12 +645,18 @@ function flattenSchemaSnapshot(snapshot: SchemaSnapshot): SchemaObjectEntry[] {
 
 const TEST_CONNECTION_ID = "__test__";
 
+interface ConnectionManagerDependencies {
+  createSshRuntime?: typeof createSshRuntime;
+}
+
 export class ConnectionManager
   implements ScopeAwareConnectionManagerApi, ConnectionManagerLifecycleApi
 {
   private readonly validationService = new ConnectionValidationService();
   private readonly store: ConnectionManagerStore;
   private driverMap = new Map<string, IDBDriver>();
+  private readonly sshRuntimeMap = new Map<string, SshRuntime>();
+  private readonly createSshRuntimeForConnection: typeof createSshRuntime;
   private readonly _connectingMap = new Map<
     string,
     {
@@ -687,8 +700,11 @@ export class ConnectionManager
   constructor(
     context: vscode.ExtensionContext,
     store: ConnectionManagerStore = new VSCodeConnectionManagerStore(context),
+    dependencies: ConnectionManagerDependencies = {},
   ) {
     this.store = store;
+    this.createSshRuntimeForConnection =
+      dependencies.createSshRuntime ?? createSshRuntime;
     this.onDidChangeConnections = this._onDidChangeConnections.event;
     this.onDidChangeHistory = this._onDidChangeHistory.event;
     this.onDidChangeBookmarks = this._onDidChangeBookmarks.event;
@@ -954,6 +970,11 @@ export class ConnectionManager
     awsSessionToken?: string;
     connectionUri?: string;
     uri?: string;
+    endpoint?: string;
+    awsEndpoint?: string;
+    sshPassword?: string;
+    sshPrivateKey?: string;
+    sshPassphrase?: string;
   } {
     if (!value) {
       return {};
@@ -983,6 +1004,24 @@ export class ConnectionManager
               ? parsed.connectionUri
               : undefined,
           uri: typeof parsed.uri === "string" ? parsed.uri : undefined,
+          endpoint:
+            typeof parsed.endpoint === "string" ? parsed.endpoint : undefined,
+          awsEndpoint:
+            typeof parsed.awsEndpoint === "string"
+              ? parsed.awsEndpoint
+              : undefined,
+          sshPassword:
+            typeof parsed.sshPassword === "string"
+              ? parsed.sshPassword
+              : undefined,
+          sshPrivateKey:
+            typeof parsed.sshPrivateKey === "string"
+              ? parsed.sshPrivateKey
+              : undefined,
+          sshPassphrase:
+            typeof parsed.sshPassphrase === "string"
+              ? parsed.sshPassphrase
+              : undefined,
         };
       }
     } catch {}
@@ -1007,6 +1046,11 @@ export class ConnectionManager
         awsSessionToken: secrets.awsSessionToken ?? config.awsSessionToken,
         connectionUri: secrets.connectionUri ?? config.connectionUri,
         uri: secrets.uri ?? config.uri,
+        endpoint: secrets.endpoint ?? config.endpoint,
+        awsEndpoint: secrets.awsEndpoint ?? config.awsEndpoint,
+        sshPassword: secrets.sshPassword ?? config.sshPassword,
+        sshPrivateKey: secrets.sshPrivateKey ?? config.sshPrivateKey,
+        sshPassphrase: secrets.sshPassphrase ?? config.sshPassphrase,
       };
     } catch {
       return { ...config, password: "" };
@@ -1071,6 +1115,450 @@ export class ConnectionManager
 
     return createTimeoutAwareDriver(driver, timeoutSettingsProvider);
   }
+
+  private buildConnectionSshSettings(
+    config: ConnectionConfig,
+  ): ConnectionSshSettings | undefined {
+    if (config.sshEnabled !== true) {
+      return undefined;
+    }
+
+    const host = config.sshHost?.trim();
+    const username = config.sshUsername?.trim();
+    const fingerprintSha256 = config.sshHostFingerprintSha256?.trim();
+    const hostVerificationMode =
+      config.sshHostVerificationMode === "trustOnFirstUse"
+        ? "trustOnFirstUse"
+        : "manual";
+    if (
+      !host ||
+      !config.sshPort ||
+      !username ||
+      (hostVerificationMode === "manual" && !fingerprintSha256)
+    ) {
+      throw new Error("[RapiDB] SSH settings are incomplete.");
+    }
+
+    if (config.sshAuthMethod === "password") {
+      if (!config.sshPassword) {
+        throw new Error("[RapiDB] SSH password is missing.");
+      }
+
+      return {
+        host,
+        port: config.sshPort,
+        username,
+        hostVerificationMode,
+        fingerprintSha256,
+        auth: {
+          kind: "password",
+          password: config.sshPassword,
+        },
+      };
+    }
+
+    if (!config.sshPrivateKey) {
+      throw new Error("[RapiDB] SSH private key is missing.");
+    }
+
+    return {
+      host,
+      port: config.sshPort,
+      username,
+      hostVerificationMode,
+      fingerprintSha256,
+      auth: {
+        kind: "privateKey",
+        privateKey: config.sshPrivateKey,
+        passphrase: config.sshPassphrase,
+      },
+    };
+  }
+
+  private resolveMongoRemoteTarget(config: ConnectionConfig): {
+    host: string;
+    port: number;
+  } {
+    const rawUri = config.connectionUri ?? config.uri;
+    if (rawUri) {
+      const parsed = new URL(rawUri);
+      return {
+        host: parsed.hostname,
+        port: parsed.port ? Number.parseInt(parsed.port, 10) : 27017,
+      };
+    }
+
+    return {
+      host: config.host?.trim() || "localhost",
+      port: config.port ?? 27017,
+    };
+  }
+
+  private resolveRedisRemoteTarget(config: ConnectionConfig): {
+    host: string;
+    port: number;
+  } {
+    if (config.connectionUri) {
+      const parsed = new URL(config.connectionUri);
+      return {
+        host: parsed.hostname,
+        port: parsed.port ? Number.parseInt(parsed.port, 10) : 6379,
+      };
+    }
+
+    return {
+      host: config.host?.trim() || "127.0.0.1",
+      port: config.port ?? 6379,
+    };
+  }
+
+  private resolveUrlRemoteTarget(
+    value: string | undefined,
+    defaultPort: number,
+  ): { host: string; port: number } | undefined {
+    if (!value) {
+      return undefined;
+    }
+
+    const url = new URL(value);
+    return {
+      host: url.hostname,
+      port:
+        url.port.length > 0
+          ? Number.parseInt(url.port, 10)
+          : url.protocol === "https:"
+            ? 443
+            : defaultPort,
+    };
+  }
+
+  private resolveElasticsearchRemoteTarget(
+    config: ConnectionConfig,
+  ): { host: string; port: number } | undefined {
+    return (
+      this.resolveUrlRemoteTarget(
+        config.connectionUri ?? config.endpoint,
+        config.ssl ? 443 : 9200,
+      ) ??
+      (config.host?.trim()
+        ? {
+            host: config.host.trim(),
+            port: config.port ?? 9200,
+          }
+        : undefined)
+    );
+  }
+
+  private resolveDynamoEndpoint(config: ConnectionConfig): string {
+    if (config.endpoint) {
+      return config.endpoint;
+    }
+
+    if (config.awsEndpoint) {
+      return config.awsEndpoint;
+    }
+
+    const region = config.awsRegion?.trim() || "us-east-1";
+    return `https://dynamodb.${region}.amazonaws.com`;
+  }
+
+  private resolveDynamoRemoteTarget(config: ConnectionConfig): {
+    host: string;
+    port: number;
+  } {
+    return (
+      this.resolveUrlRemoteTarget(
+        config.endpoint ?? config.awsEndpoint,
+        443,
+      ) ?? {
+        host: `dynamodb.${config.awsRegion?.trim() || "us-east-1"}.amazonaws.com`,
+        port: 443,
+      }
+    );
+  }
+
+  private resolveTcpRemoteTarget(config: ConnectionConfig): {
+    host: string;
+    port: number;
+  } {
+    switch (config.type) {
+      case "pg":
+        return {
+          host: config.host?.trim() || "localhost",
+          port: config.port ?? 5432,
+        };
+      case "mysql":
+        return {
+          host: config.host?.trim() || "localhost",
+          port: config.port ?? 3306,
+        };
+      case "mssql":
+        return {
+          host: config.host?.trim() || "localhost",
+          port: config.port ?? 1433,
+        };
+      case "oracle":
+        return {
+          host: config.host?.trim() || "localhost",
+          port: config.port ?? 1521,
+        };
+      case "mongodb":
+        return this.resolveMongoRemoteTarget(config);
+      case "redis":
+        return this.resolveRedisRemoteTarget(config);
+      case "elasticsearch": {
+        const remoteTarget = this.resolveElasticsearchRemoteTarget(config);
+        if (remoteTarget) {
+          return remoteTarget;
+        }
+
+        throw new Error(
+          "[RapiDB] Elasticsearch over SSH requires a fixed host, endpoint, or connection URI when Cloud ID is not used.",
+        );
+      }
+      case "dynamodb":
+        return this.resolveDynamoRemoteTarget(config);
+      default: {
+        const unsupported = config.type;
+        throw new Error(
+          `[RapiDB] SSH TCP forwarding is not supported for ${unsupported}.`,
+        );
+      }
+    }
+  }
+
+  private resolveSshRuntimeRequest(
+    config: ConnectionConfig,
+  ): SshRuntimeRequest {
+    switch (config.type) {
+      case "pg":
+      case "mysql":
+      case "mssql":
+      case "oracle":
+      case "mongodb":
+      case "redis": {
+        const remoteTarget = this.resolveTcpRemoteTarget(config);
+        return {
+          kind: "tcpForward",
+          remoteHost: remoteTarget.host,
+          remotePort: remoteTarget.port,
+        };
+      }
+      case "elasticsearch": {
+        if (config.cloudId) {
+          return { kind: "httpAgent" };
+        }
+
+        const remoteTarget = this.resolveTcpRemoteTarget(config);
+        return {
+          kind: "tcpForward",
+          remoteHost: remoteTarget.host,
+          remotePort: remoteTarget.port,
+        };
+      }
+      case "dynamodb": {
+        const remoteTarget = this.resolveTcpRemoteTarget(config);
+        return {
+          kind: "tcpForward",
+          remoteHost: remoteTarget.host,
+          remotePort: remoteTarget.port,
+        };
+      }
+      default:
+        throw new Error(
+          `[RapiDB] SSH is not supported for ${config.type} connections.`,
+        );
+    }
+  }
+
+  private rewriteUriHostPort(
+    value: string | undefined,
+    host: string,
+    port: number,
+  ): string | undefined {
+    if (!value) {
+      return undefined;
+    }
+
+    const url = new URL(value);
+    url.hostname = host;
+    url.port = String(port);
+    return url.toString();
+  }
+
+  private applySshRuntimeToConfig(
+    config: ConnectionConfig,
+    runtime: SshRuntime,
+  ): DriverConnectionConfig {
+    const runtimeConfig = config as DriverConnectionConfig;
+    if (runtime.transport.kind === "httpAgent") {
+      return {
+        ...config,
+        runtimeOverrides: {
+          ...runtimeConfig.runtimeOverrides,
+          transport: runtime.transport,
+        },
+      } as DriverConnectionConfig;
+    }
+
+    const remoteTarget = this.resolveTcpRemoteTarget(config);
+    const baseConfig: DriverConnectionConfig = {
+      ...config,
+      host: runtime.transport.localHost,
+      port: runtime.transport.localPort,
+      runtimeOverrides: {
+        ...runtimeConfig.runtimeOverrides,
+        transport: runtime.transport,
+      },
+    };
+
+    switch (config.type) {
+      case "pg":
+      case "mysql":
+        baseConfig.runtimeOverrides = {
+          ...baseConfig.runtimeOverrides,
+          tlsServername: remoteTarget.host,
+        };
+        break;
+      case "mssql":
+        baseConfig.runtimeOverrides = {
+          ...baseConfig.runtimeOverrides,
+          mssqlServerName: remoteTarget.host,
+        };
+        break;
+      case "mongodb": {
+        const rewrittenConnectionUri = this.rewriteUriHostPort(
+          config.connectionUri,
+          runtime.transport.localHost,
+          runtime.transport.localPort,
+        );
+        const rewrittenLegacyUri = this.rewriteUriHostPort(
+          config.uri,
+          runtime.transport.localHost,
+          runtime.transport.localPort,
+        );
+
+        return {
+          ...baseConfig,
+          connectionUri: rewrittenConnectionUri,
+          uri: rewrittenLegacyUri,
+          directConnection: true,
+        };
+      }
+      case "redis":
+        return {
+          ...baseConfig,
+          runtimeOverrides: {
+            ...baseConfig.runtimeOverrides,
+            tlsServername: remoteTarget.host,
+          },
+          connectionUri: this.rewriteUriHostPort(
+            config.connectionUri,
+            runtime.transport.localHost,
+            runtime.transport.localPort,
+          ),
+        };
+      case "elasticsearch":
+        return {
+          ...baseConfig,
+          runtimeOverrides: {
+            ...baseConfig.runtimeOverrides,
+            tlsServername: remoteTarget.host,
+          },
+          connectionUri: this.rewriteUriHostPort(
+            config.connectionUri,
+            runtime.transport.localHost,
+            runtime.transport.localPort,
+          ),
+          endpoint: this.rewriteUriHostPort(
+            config.endpoint,
+            runtime.transport.localHost,
+            runtime.transport.localPort,
+          ),
+        };
+      case "dynamodb":
+        return {
+          ...baseConfig,
+          runtimeOverrides: {
+            ...baseConfig.runtimeOverrides,
+            tlsServername: remoteTarget.host,
+          },
+          endpoint: this.rewriteUriHostPort(
+            config.endpoint ?? this.resolveDynamoEndpoint(config),
+            runtime.transport.localHost,
+            runtime.transport.localPort,
+          ),
+          awsEndpoint: this.rewriteUriHostPort(
+            config.awsEndpoint,
+            runtime.transport.localHost,
+            runtime.transport.localPort,
+          ),
+        };
+      default:
+        break;
+    }
+
+    return baseConfig;
+  }
+
+  private async prepareDriverConfig(config: ConnectionConfig): Promise<{
+    config: DriverConnectionConfig;
+    runtime?: SshRuntime;
+  }> {
+    const sshSettings = this.buildConnectionSshSettings(config);
+    if (!sshSettings) {
+      return {
+        config: config as DriverConnectionConfig,
+      };
+    }
+
+    const runtime = await this.createSshRuntimeForConnection(
+      sshSettings,
+      this.resolveSshRuntimeRequest(config),
+    );
+
+    return {
+      config: this.applySshRuntimeToConfig(config, runtime),
+      runtime,
+    };
+  }
+
+  private async persistTrustedSshFingerprintIfNeeded(
+    connectionId: string,
+    fingerprintSha256: string,
+  ): Promise<void> {
+    const persistedConnection = this.getConnection(connectionId);
+    if (!persistedConnection || persistedConnection.sshEnabled !== true) {
+      return;
+    }
+
+    const hostVerificationMode =
+      persistedConnection.sshHostVerificationMode === "trustOnFirstUse"
+        ? "trustOnFirstUse"
+        : "manual";
+    if (hostVerificationMode !== "trustOnFirstUse") {
+      return;
+    }
+
+    if (
+      persistedConnection.sshHostFingerprintSha256?.trim() === fingerprintSha256
+    ) {
+      return;
+    }
+
+    const connections = this.getConnections().map((connection) =>
+      connection.id === connectionId
+        ? {
+            ...connection,
+            sshHostFingerprintSha256: fingerprintSha256,
+          }
+        : connection,
+    );
+
+    this.invalidateDriverStaticMetadata(connectionId);
+    await this.saveConnections(connections);
+    this._onDidChangeConnections.fire();
+  }
   beginConnect(id: string): ConnectAttempt {
     this._assertNotDisposed();
 
@@ -1094,6 +1582,7 @@ export class ConnectionManager
     });
     this._onDidChangeConnections.fire();
     void (async () => {
+      let pendingRuntime: SshRuntime | undefined;
       try {
         if (this.driverMap.has(id)) {
           await this.disconnectFrom(id);
@@ -1118,13 +1607,25 @@ export class ConnectionManager
             validation.message ?? "Connection settings are invalid.",
           );
         }
-        const driver = this.createDriver(fullConfig);
+        const prepared = await this.prepareDriverConfig(fullConfig);
+        pendingRuntime = prepared.runtime;
+        if (pendingRuntime) {
+          await this.persistTrustedSshFingerprintIfNeeded(
+            id,
+            pendingRuntime.verifiedFingerprintSha256,
+          );
+        }
+        const driver = this.createDriver(prepared.config);
         try {
           await driver.connect();
         } catch (err) {
           try {
             await driver.disconnect();
           } catch {}
+          if (pendingRuntime) {
+            await pendingRuntime.dispose().catch(() => undefined);
+            pendingRuntime = undefined;
+          }
           throw err;
         }
 
@@ -1132,15 +1633,26 @@ export class ConnectionManager
           try {
             await driver.disconnect();
           } catch {}
+          if (pendingRuntime) {
+            await pendingRuntime.dispose().catch(() => undefined);
+            pendingRuntime = undefined;
+          }
           resolveAttempt();
           return;
         }
 
         this.driverMap.set(id, driver);
+        if (pendingRuntime) {
+          this.sshRuntimeMap.set(id, pendingRuntime);
+          pendingRuntime = undefined;
+        }
         this._invalidateSchemaState(id);
         this._onDidConnect.fire();
         resolveAttempt();
       } catch (err) {
+        if (pendingRuntime) {
+          await pendingRuntime.dispose().catch(() => undefined);
+        }
         rejectAttempt(err);
       } finally {
         const pendingAttempt = this._connectingMap.get(id);
@@ -1168,7 +1680,7 @@ export class ConnectionManager
       } catch {}
     }
 
-    this._cleanupConnectionRuntimeState(id);
+    await this._cleanupConnectionRuntimeState(id);
 
     if (hadDriver || hadPendingConnect) {
       this._onDidDisconnect.fire(id);
@@ -1645,7 +2157,22 @@ export class ConnectionManager
     this._onDidChangeSchemaState.fire(connectionId);
   }
 
-  private _cleanupConnectionRuntimeState(connectionId: string): void {
+  private async _disposeSshRuntime(connectionId: string): Promise<void> {
+    const runtime = this.sshRuntimeMap.get(connectionId);
+    this.sshRuntimeMap.delete(connectionId);
+    if (!runtime) {
+      return;
+    }
+
+    try {
+      await runtime.dispose();
+    } catch {}
+  }
+
+  private async _cleanupConnectionRuntimeState(
+    connectionId: string,
+  ): Promise<void> {
+    await this._disposeSshRuntime(connectionId);
     this.driverMap.delete(connectionId);
     this._connectingMap.delete(connectionId);
     this.invalidateDriverStaticMetadata(connectionId);
@@ -2416,17 +2943,23 @@ export class ConnectionManager
         validation,
       };
     }
-    const driver = this.createDriver(configWithId);
+    let runtime: SshRuntime | undefined;
+    const prepared = await this.prepareDriverConfig(configWithId);
+    runtime = prepared.runtime;
+    const driver = this.createDriver(prepared.config);
     try {
       await driver.connect();
-      await driver.disconnect();
       return { success: true };
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
+      return { success: false, error: error.message };
+    } finally {
       try {
         await driver.disconnect();
       } catch {}
-      return { success: false, error: error.message };
+      if (runtime) {
+        await runtime.dispose().catch(() => undefined);
+      }
     }
   }
   async disconnectAll(): Promise<void> {
@@ -2451,6 +2984,7 @@ export class ConnectionManager
 
     await this.disconnectAll();
     this.driverMap.clear();
+    this.sshRuntimeMap.clear();
     this._connectingMap.clear();
     this._connectionsCache = null;
     this._driverStaticMetadataCache.clear();

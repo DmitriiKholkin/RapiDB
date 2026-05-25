@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { ColumnTypeMeta } from "../../../src/extension/dbDrivers/types";
 import type { DbEngineId } from "../../contracts/testingContracts";
 import {
@@ -7,9 +7,39 @@ import {
   fixtureRoutineName,
   fixtureSupportSummary,
   fixtureTableName,
+  type LiveDriverHarnessOptions,
   rowsFromQuery,
   truthyBoolean,
 } from "../../support/liveDbHarness";
+
+class MockEventEmitter<T> {
+  private listeners: Array<(value: T) => unknown> = [];
+
+  readonly event = (listener: (value: T) => unknown) => {
+    this.listeners.push(listener);
+    return {
+      dispose: () => {
+        this.listeners = this.listeners.filter(
+          (candidate) => candidate !== listener,
+        );
+      },
+    };
+  };
+
+  fire(value: T): void {
+    for (const listener of this.listeners) {
+      listener(value);
+    }
+  }
+
+  dispose(): void {
+    this.listeners = [];
+  }
+}
+
+vi.mock("vscode", () => ({
+  EventEmitter: MockEventEmitter,
+}));
 
 function findColumn(columns: ColumnTypeMeta[], name: string): ColumnTypeMeta {
   const column = columns.find(
@@ -137,12 +167,17 @@ function parseMonetaryLike(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-export function registerLiveDriverConformanceTests(engineId: DbEngineId): void {
-  describe(`${engineId} live driver conformance`, () => {
+export function registerLiveDriverConformanceTests(
+  engineId: DbEngineId,
+  options: LiveDriverHarnessOptions = {},
+): void {
+  const transport = options.transport ?? "direct";
+
+  describe(`${engineId} live driver conformance${transport === "ssh" ? " over SSH" : ""}`, () => {
     let harness: Awaited<ReturnType<typeof createLiveDriverHarness>>;
 
     beforeAll(async () => {
-      harness = await createLiveDriverHarness(engineId);
+      harness = await createLiveDriverHarness(engineId, options);
     });
 
     afterAll(async () => {

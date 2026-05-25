@@ -1,3 +1,5 @@
+import * as http from "node:http";
+import * as https from "node:https";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionConfig } from "../../src/extension/connectionManagerModels";
 import type { DriverTimeoutSettingsProvider } from "../../src/extension/dbDrivers/timeout";
@@ -63,6 +65,26 @@ interface Deferred<T> {
   promise: Promise<T>;
   resolve(value: T | PromiseLike<T>): void;
   reject(reason?: unknown): void;
+}
+
+function createSshPgConfig(id: string): ConnectionConfig {
+  return {
+    id,
+    name: `SSH ${id}`,
+    type: "pg",
+    host: "db.internal",
+    port: 5432,
+    database: "app",
+    username: "postgres",
+    sshEnabled: true,
+    sshHost: "bastion.example.com",
+    sshPort: 22,
+    sshUsername: "tunnel",
+    sshAuthMethod: "password",
+    sshHostVerificationMode: "manual",
+    sshPassword: "ssh-secret",
+    sshHostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+  };
 }
 
 function createDeferred<T>(): Deferred<T> {
@@ -1322,6 +1344,46 @@ describe("ConnectionManager", () => {
     );
   });
 
+  it("redacts credential-bearing Elasticsearch endpoint in persisted config and hydrates it before connect", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await manager.saveConnection({
+      id: "conn-es-endpoint-uri",
+      name: "Elastic With Endpoint Secret",
+      type: "elasticsearch",
+      endpoint: "https://elastic-user:elastic-pass@cluster.example.com",
+      useSecretStorage: false,
+    });
+
+    const persisted = store
+      .getConnections()
+      .find((connection) => connection.id === "conn-es-endpoint-uri");
+    expect(persisted).toMatchObject({
+      id: "conn-es-endpoint-uri",
+      useSecretStorage: true,
+      endpoint: "https://cluster.example.com",
+    });
+
+    const secret = await store.getSecret("conn-es-endpoint-uri");
+    expect(secret).toContain(
+      "https://elastic-user:elastic-pass@cluster.example.com",
+    );
+
+    await manager.connectTo("conn-es-endpoint-uri");
+    expect(driverInstances[0]?.config).toMatchObject({
+      id: "conn-es-endpoint-uri",
+      endpoint: "https://elastic-user:elastic-pass@cluster.example.com",
+    });
+  });
+
   it("redacts credential-bearing Mongo URI in persisted config and hydrates before connect", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
@@ -1358,6 +1420,375 @@ describe("ConnectionManager", () => {
       id: "conn-mongo-uri",
       uri: "mongodb://db-user:db-pass@localhost:27017/app",
     });
+  });
+
+  it("stores SSH private key credentials in Secret Storage and hydrates them before connect", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    const createSshRuntime = vi.fn(async () => ({
+      transport: {
+        kind: "tcpForward" as const,
+        localHost: "127.0.0.1" as const,
+        localPort: 15435,
+        remoteHost: "db.internal",
+        remotePort: 5432,
+      },
+      verifiedFingerprintSha256:
+        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      dispose: vi.fn(async () => undefined),
+    }));
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+      { createSshRuntime },
+    );
+
+    await manager.saveConnection({
+      id: "conn-ssh-pg",
+      name: "PG over SSH",
+      type: "pg",
+      host: "db.internal",
+      database: "app",
+      username: "postgres",
+      sshEnabled: true,
+      sshHost: "bastion.example.com",
+      sshPort: 22,
+      sshUsername: "tunnel",
+      sshAuthMethod: "privateKey",
+      sshPrivateKey:
+        "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+      sshPassphrase: "key-passphrase",
+      sshHostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      useSecretStorage: false,
+    });
+
+    const persisted = store
+      .getConnections()
+      .find((connection) => connection.id === "conn-ssh-pg");
+    expect(persisted).toMatchObject({
+      id: "conn-ssh-pg",
+      sshEnabled: true,
+      sshHost: "bastion.example.com",
+      sshPort: 22,
+      sshUsername: "tunnel",
+      sshAuthMethod: "privateKey",
+      sshHostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      useSecretStorage: true,
+    });
+    expect(persisted?.sshPrivateKey).toBeUndefined();
+    expect(persisted?.sshPassphrase).toBeUndefined();
+
+    await expect(store.getSecret("conn-ssh-pg")).resolves.toBe(
+      JSON.stringify({
+        sshPrivateKey:
+          "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+        sshPassphrase: "key-passphrase",
+      }),
+    );
+
+    await manager.connectTo("conn-ssh-pg");
+    expect(createSshRuntime).toHaveBeenCalledTimes(1);
+    expect(driverInstances[0]?.config).toMatchObject({
+      id: "conn-ssh-pg",
+      sshPrivateKey:
+        "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+      sshPassphrase: "key-passphrase",
+    });
+  });
+
+  it("rewrites SSH-enabled test connections to a local forward and disposes the runtime in finally", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const dispose = vi.fn(async () => undefined);
+    const createSshRuntime = vi.fn(async () => ({
+      transport: {
+        kind: "tcpForward" as const,
+        localHost: "127.0.0.1" as const,
+        localPort: 15432,
+        remoteHost: "db.internal",
+        remotePort: 5432,
+      },
+      verifiedFingerprintSha256:
+        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      dispose,
+    }));
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      new FakeConnectionManagerStore(),
+      { createSshRuntime },
+    );
+
+    const { id: _connectionId, ...connectionToTest } =
+      createSshPgConfig("conn-test-ssh");
+
+    const result = await manager.testConnection(connectionToTest);
+
+    expect(result).toEqual({ success: true });
+    expect(createSshRuntime).toHaveBeenCalledTimes(1);
+    expect(driverInstances[0]?.config).toMatchObject({
+      host: "127.0.0.1",
+      port: 15432,
+      runtimeOverrides: {
+        transport: {
+          kind: "tcpForward",
+          localHost: "127.0.0.1",
+          localPort: 15432,
+          remoteHost: "db.internal",
+          remotePort: 5432,
+        },
+        tlsServername: "db.internal",
+      },
+    });
+    expect(driverInstances[0]?.disconnectCalls).toBe(1);
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps SSH runtime alive for active connections and disposes it on disconnect", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([createSshPgConfig("conn-ssh-active")]);
+
+    const dispose = vi.fn(async () => undefined);
+    const createSshRuntime = vi.fn(async () => ({
+      transport: {
+        kind: "tcpForward" as const,
+        localHost: "127.0.0.1" as const,
+        localPort: 15433,
+        remoteHost: "db.internal",
+        remotePort: 5432,
+      },
+      verifiedFingerprintSha256:
+        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      dispose,
+    }));
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+      { createSshRuntime },
+    );
+
+    await manager.connectTo("conn-ssh-active");
+
+    expect(createSshRuntime).toHaveBeenCalledTimes(1);
+    expect(driverInstances[0]?.config).toMatchObject({
+      id: "conn-ssh-active",
+      host: "127.0.0.1",
+      port: 15433,
+      runtimeOverrides: {
+        tlsServername: "db.internal",
+      },
+    });
+    expect(dispose).not.toHaveBeenCalled();
+
+    await manager.disconnectFrom("conn-ssh-active");
+
+    expect(driverInstances[0]?.disconnectCalls).toBeGreaterThanOrEqual(1);
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps SSH HTTP-agent runtimes alive for Elasticsearch Cloud connections and disposes them on disconnect", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-es-ssh",
+        name: "Elastic SSH",
+        type: "elasticsearch",
+        cloudId: "deployment:ZXM=",
+        sshEnabled: true,
+        sshHost: "bastion.example.com",
+        sshPort: 22,
+        sshUsername: "tunnel",
+        sshAuthMethod: "password",
+        sshPassword: "ssh-secret",
+        sshHostFingerprintSha256:
+          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      },
+    ]);
+
+    const httpAgent = new http.Agent();
+    const httpsAgent = new https.Agent();
+    const dispose = vi.fn(async () => {
+      httpAgent.destroy();
+      httpsAgent.destroy();
+    });
+    const createSshRuntime = vi.fn(async () => ({
+      transport: {
+        kind: "httpAgent" as const,
+        httpAgent,
+        httpsAgent,
+      },
+      verifiedFingerprintSha256:
+        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      dispose,
+    }));
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+      { createSshRuntime },
+    );
+
+    await manager.connectTo("conn-es-ssh");
+
+    expect(createSshRuntime).toHaveBeenCalledTimes(1);
+    expect(createSshRuntime).toHaveBeenCalledWith(
+      {
+        host: "bastion.example.com",
+        port: 22,
+        username: "tunnel",
+        hostVerificationMode: "manual",
+        fingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        auth: {
+          kind: "password",
+          password: "ssh-secret",
+        },
+      },
+      {
+        kind: "httpAgent",
+      },
+    );
+    expect(driverInstances[0]?.config).toMatchObject({
+      id: "conn-es-ssh",
+      cloudId: "deployment:ZXM=",
+      runtimeOverrides: {
+        transport: {
+          kind: "httpAgent",
+          httpAgent,
+          httpsAgent,
+        },
+      },
+    });
+    expect(dispose).not.toHaveBeenCalled();
+
+    await manager.disconnectFrom("conn-es-ssh");
+
+    expect(driverInstances[0]?.disconnectCalls).toBeGreaterThanOrEqual(1);
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("pins the learned SSH fingerprint after the first trust-on-first-use handshake", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        ...createSshPgConfig("conn-ssh-tofu"),
+        sshHostVerificationMode: "trustOnFirstUse",
+        sshHostFingerprintSha256: undefined,
+      },
+    ]);
+
+    const createSshRuntime = vi.fn(async () => ({
+      transport: {
+        kind: "tcpForward" as const,
+        localHost: "127.0.0.1" as const,
+        localPort: 15436,
+        remoteHost: "db.internal",
+        remotePort: 5432,
+      },
+      verifiedFingerprintSha256:
+        "SHA256:LearnedTrustOnFirstUseFingerprint1234567890+/=",
+      dispose: vi.fn(async () => undefined),
+    }));
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+      { createSshRuntime },
+    );
+
+    await manager.connectTo("conn-ssh-tofu");
+
+    expect(createSshRuntime).toHaveBeenCalledWith(
+      {
+        host: "bastion.example.com",
+        port: 22,
+        username: "tunnel",
+        hostVerificationMode: "trustOnFirstUse",
+        fingerprintSha256: undefined,
+        auth: {
+          kind: "password",
+          password: "ssh-secret",
+        },
+      },
+      {
+        kind: "tcpForward",
+        remoteHost: "db.internal",
+        remotePort: 5432,
+      },
+    );
+
+    expect(
+      store
+        .getConnections()
+        .find((connection) => connection.id === "conn-ssh-tofu")
+        ?.sshHostFingerprintSha256,
+    ).toBe("SHA256:LearnedTrustOnFirstUseFingerprint1234567890+/=");
+  });
+
+  it("disposes SSH runtime when a connect attempt becomes stale", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([createSshPgConfig("conn-ssh-stale")]);
+
+    const connectDeferred = createDeferred<void>();
+    const connectStarted = createDeferred<void>();
+    driverBehaviors.set("conn-ssh-stale", {
+      connectImpl: async () => {
+        connectStarted.resolve();
+        await connectDeferred.promise;
+      },
+    });
+
+    const dispose = vi.fn(async () => undefined);
+    const createSshRuntime = vi.fn(async () => ({
+      transport: {
+        kind: "tcpForward" as const,
+        localHost: "127.0.0.1" as const,
+        localPort: 15434,
+        remoteHost: "db.internal",
+        remotePort: 5432,
+      },
+      verifiedFingerprintSha256:
+        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      dispose,
+    }));
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+      { createSshRuntime },
+    );
+
+    const attempt = manager.beginConnect("conn-ssh-stale");
+    await connectStarted.promise;
+    await manager.disconnectFrom("conn-ssh-stale");
+    connectDeferred.resolve();
+    await attempt.promise;
+
+    expect(manager.isConnected("conn-ssh-stale")).toBe(false);
+    expect(driverInstances[0]?.disconnectCalls).toBeGreaterThanOrEqual(1);
+    expect(dispose).toHaveBeenCalledTimes(1);
   });
 
   it("migrates plaintext credential-bearing connection URI to Secret Storage on connect", async () => {

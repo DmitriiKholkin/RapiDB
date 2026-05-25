@@ -668,7 +668,7 @@
     "test:db:nosql": "node ./tests/scripts/run-nosql-vitest.mjs",
     "test:extension": "vitest run --project extension-host",
     "db:check": "node ./tests/scripts/db-check.mjs",
-    "db:up": "npm run db:check && docker compose -f ./compose.yaml up -d postgres mysql mssql oracle redis mongo elasticsearch dynamodb",
+    "db:up": "npm run db:check && docker compose -f ./compose.yaml up -d --build ssh-bastion postgres mysql mssql oracle redis mongo elasticsearch dynamodb",
     "db:wait": "node --experimental-strip-types ./tests/scripts/db-wait.ts",
     "db:reset": "node --experimental-strip-types ./tests/scripts/db-reset.ts",
     "db:seed": "node --experimental-strip-types ./tests/scripts/db-seed.ts",
@@ -701,10 +701,12 @@
     "@aws-sdk/util-dynamodb": "^3.996.2",
     "@dagrejs/dagre": "^3.0.0",
     "@elastic/elasticsearch": "^8.19.1",
+    "@smithy/node-http-handler": "^4.7.4",
     "@tanstack/react-table": "^8.21.3",
     "@tanstack/react-virtual": "^3.13.23",
     "@vscode/codicons": "^0.0.45",
     "@xyflow/react": "^12.10.2",
+    "agent-base": "^7.1.4",
     "monaco-editor": "^0.53.0",
     "mongodb": "^6.21.0",
     "mssql": "^12.2.0",
@@ -716,6 +718,7 @@
     "react-dom": "^19.2.4",
     "redis": "^5.12.1",
     "sql-formatter": "^15.7.2",
+    "ssh2": "^1.17.0",
     "zustand": "^5.0.12"
   }
 }

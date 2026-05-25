@@ -30,6 +30,16 @@ const REDIS_URL = `redis://:redis_pass123@${LOOPBACK_HOST}:6379`;
 const MONGO_URI = `mongodb://mongo_admin:mongo_pass123@${LOOPBACK_HOST}:27017/rapidb_mongo_db?authSource=admin&directConnection=true`;
 const ELASTIC_NODE = `http://${LOOPBACK_HOST}:9200`;
 const DYNAMODB_ENDPOINT = `http://${LOOPBACK_HOST}:8000`;
+type LiveTransport = "direct" | "ssh";
+
+interface DriverSession<TDriver> {
+  driver: TDriver;
+  dispose: () => Promise<void>;
+}
+
+async function loadLiveSshManagerHarness() {
+  return import("../support/liveSshManagerHarness.ts");
+}
 
 function log(message: string): void {
   console.log(`[RapiDB:nosql-live] ${message}`);
@@ -164,7 +174,187 @@ async function waitForDynamo(): Promise<void> {
   });
 }
 
-async function verifyRedisDriver(): Promise<void> {
+async function createRedisDriverSession(
+  transport: LiveTransport,
+): Promise<DriverSession<RedisDriver>> {
+  if (transport === "direct") {
+    const driver = new RedisDriver({
+      id: "redis-live",
+      name: "Redis Live",
+      type: "redis",
+      host: LOOPBACK_HOST,
+      port: 6379,
+      password: "redis_pass123",
+    });
+    await driver.connect();
+    return {
+      driver,
+      dispose: async () => {
+        await driver.disconnect();
+      },
+    };
+  }
+
+  const {
+    connectLiveDriverViaManager,
+    disposeManagedLiveDriverSession,
+    withTrustOnFirstUseSsh,
+  } = await loadLiveSshManagerHarness();
+  const session = await connectLiveDriverViaManager(
+    withTrustOnFirstUseSsh({
+      id: "redis-live-ssh",
+      name: "Redis Live SSH",
+      type: "redis",
+      host: "redis",
+      port: 6379,
+      password: "redis_pass123",
+    }),
+  );
+
+  return {
+    driver: session.driver as RedisDriver,
+    dispose: async () => {
+      await disposeManagedLiveDriverSession(session);
+    },
+  };
+}
+
+async function createMongoDriverSession(
+  transport: LiveTransport,
+): Promise<DriverSession<MongoDBDriver>> {
+  if (transport === "direct") {
+    const driver = new MongoDBDriver({
+      id: "mongo-live",
+      name: "Mongo Live",
+      type: "mongodb",
+      connectionUri: MONGO_URI,
+      database: "rapidb_mongo_db",
+      directConnection: true,
+    });
+    await driver.connect();
+    return {
+      driver,
+      dispose: async () => {
+        await driver.disconnect();
+      },
+    };
+  }
+
+  const {
+    connectLiveDriverViaManager,
+    disposeManagedLiveDriverSession,
+    withTrustOnFirstUseSsh,
+  } = await loadLiveSshManagerHarness();
+  const session = await connectLiveDriverViaManager(
+    withTrustOnFirstUseSsh({
+      id: "mongo-live-ssh",
+      name: "Mongo Live SSH",
+      type: "mongodb",
+      connectionUri:
+        "mongodb://mongo_admin:mongo_pass123@mongo:27017/rapidb_mongo_db?authSource=admin&directConnection=true",
+      database: "rapidb_mongo_db",
+      directConnection: true,
+    }),
+  );
+
+  return {
+    driver: session.driver as MongoDBDriver,
+    dispose: async () => {
+      await disposeManagedLiveDriverSession(session);
+    },
+  };
+}
+
+async function createElasticsearchDriverSession(
+  transport: LiveTransport,
+): Promise<DriverSession<ElasticsearchDriver>> {
+  if (transport === "direct") {
+    const driver = new ElasticsearchDriver({
+      id: "elastic-live",
+      name: "Elastic Live",
+      type: "elasticsearch",
+      host: LOOPBACK_HOST,
+      port: 9200,
+    });
+    await driver.connect();
+    return {
+      driver,
+      dispose: async () => {
+        await driver.disconnect();
+      },
+    };
+  }
+
+  const {
+    connectLiveDriverViaManager,
+    disposeManagedLiveDriverSession,
+    withTrustOnFirstUseSsh,
+  } = await loadLiveSshManagerHarness();
+  const session = await connectLiveDriverViaManager(
+    withTrustOnFirstUseSsh({
+      id: "elastic-live-ssh",
+      name: "Elastic Live SSH",
+      type: "elasticsearch",
+      endpoint: "http://elasticsearch:9200",
+    }),
+  );
+
+  return {
+    driver: session.driver as ElasticsearchDriver,
+    dispose: async () => {
+      await disposeManagedLiveDriverSession(session);
+    },
+  };
+}
+
+async function createDynamoDriverSession(
+  transport: LiveTransport,
+): Promise<DriverSession<DynamoDBDriver>> {
+  if (transport === "direct") {
+    const driver = new DynamoDBDriver({
+      id: "dynamo-live",
+      name: "Dynamo Live",
+      type: "dynamodb",
+      awsRegion: "us-east-1",
+      endpoint: DYNAMODB_ENDPOINT,
+      awsAccessKeyId: "rapidb",
+      awsSecretAccessKey: "rapidb-secret",
+    });
+    await driver.connect();
+    return {
+      driver,
+      dispose: async () => {
+        await driver.disconnect();
+      },
+    };
+  }
+
+  const {
+    connectLiveDriverViaManager,
+    disposeManagedLiveDriverSession,
+    withTrustOnFirstUseSsh,
+  } = await loadLiveSshManagerHarness();
+  const session = await connectLiveDriverViaManager(
+    withTrustOnFirstUseSsh({
+      id: "dynamo-live-ssh",
+      name: "Dynamo Live SSH",
+      type: "dynamodb",
+      awsRegion: "us-east-1",
+      endpoint: "http://dynamodb:8000",
+      awsAccessKeyId: "rapidb",
+      awsSecretAccessKey: "rapidb-secret",
+    }),
+  );
+
+  return {
+    driver: session.driver as DynamoDBDriver,
+    dispose: async () => {
+      await disposeManagedLiveDriverSession(session);
+    },
+  };
+}
+
+async function verifyRedisDriver(transport: LiveTransport): Promise<void> {
   log("Seeding Redis fixtures...");
   const seedClient = createRedisClient({ url: REDIS_URL });
   seedClient.on("error", () => undefined);
@@ -183,16 +373,11 @@ async function verifyRedisDriver(): Promise<void> {
     await seedClient.close();
   }
 
-  log("Verifying RedisDriver against live Redis...");
-  const driver = new RedisDriver({
-    id: "redis-live",
-    name: "Redis Live",
-    type: "redis",
-    host: LOOPBACK_HOST,
-    port: 6379,
-    password: "redis_pass123",
-  });
-  await driver.connect();
+  log(
+    `Verifying RedisDriver against live Redis${transport === "ssh" ? " over SSH" : ""}...`,
+  );
+  const session = await createRedisDriverSession(transport);
+  const driver = session.driver;
   try {
     assert.equal(driver.isConnected(), true);
     const databases = await driver.listDatabases();
@@ -270,11 +455,11 @@ async function verifyRedisDriver(): Promise<void> {
       await verifyClient.close();
     }
   } finally {
-    await driver.disconnect();
+    await session.dispose();
   }
 }
 
-async function verifyMongoDriver(): Promise<void> {
+async function verifyMongoDriver(transport: LiveTransport): Promise<void> {
   log("Seeding MongoDB fixtures...");
   const mongoAlphaId = new ObjectId("507f1f77bcf86cd799439011");
   const mongoBravoId = new ObjectId("507f1f77bcf86cd799439012");
@@ -314,16 +499,11 @@ async function verifyMongoDriver(): Promise<void> {
     await client.close();
   }
 
-  log("Verifying MongoDBDriver against live MongoDB...");
-  const driver = new MongoDBDriver({
-    id: "mongo-live",
-    name: "Mongo Live",
-    type: "mongodb",
-    connectionUri: MONGO_URI,
-    database: "rapidb_mongo_db",
-    directConnection: true,
-  });
-  await driver.connect();
+  log(
+    `Verifying MongoDBDriver against live MongoDB${transport === "ssh" ? " over SSH" : ""}...`,
+  );
+  const session = await createMongoDriverSession(transport);
+  const driver = session.driver;
   try {
     assert.equal(driver.isConnected(), true);
     const databases = await driver.listDatabases();
@@ -422,11 +602,13 @@ async function verifyMongoDriver(): Promise<void> {
       await verifyClient.close();
     }
   } finally {
-    await driver.disconnect();
+    await session.dispose();
   }
 }
 
-async function verifyElasticsearchDriver(): Promise<void> {
+async function verifyElasticsearchDriver(
+  transport: LiveTransport,
+): Promise<void> {
   log("Seeding Elasticsearch fixtures...");
   const client = new ElasticsearchClient({ node: ELASTIC_NODE });
   try {
@@ -468,15 +650,11 @@ async function verifyElasticsearchDriver(): Promise<void> {
     await client.close();
   }
 
-  log("Verifying ElasticsearchDriver against live Elasticsearch...");
-  const driver = new ElasticsearchDriver({
-    id: "elastic-live",
-    name: "Elastic Live",
-    type: "elasticsearch",
-    host: LOOPBACK_HOST,
-    port: 9200,
-  });
-  await driver.connect();
+  log(
+    `Verifying ElasticsearchDriver against live Elasticsearch${transport === "ssh" ? " over SSH" : ""}...`,
+  );
+  const session = await createElasticsearchDriverSession(transport);
+  const driver = session.driver;
   try {
     assert.equal(driver.isConnected(), true);
     const objects = await driver.listObjects();
@@ -557,7 +735,7 @@ async function verifyElasticsearchDriver(): Promise<void> {
       await verifyClient.close();
     }
   } finally {
-    await driver.disconnect();
+    await session.dispose();
   }
 }
 
@@ -600,7 +778,7 @@ async function waitForDynamoTableActive(
   );
 }
 
-async function verifyDynamoDriver(): Promise<void> {
+async function verifyDynamoDriver(transport: LiveTransport): Promise<void> {
   log("Seeding DynamoDB Local fixtures...");
   const adminClient = createDynamoAdminClient();
   const documentClient = DynamoDBDocumentClient.from(adminClient, {
@@ -687,17 +865,11 @@ async function verifyDynamoDriver(): Promise<void> {
     adminClient.destroy();
   }
 
-  log("Verifying DynamoDBDriver against live DynamoDB Local...");
-  const driver = new DynamoDBDriver({
-    id: "dynamo-live",
-    name: "Dynamo Live",
-    type: "dynamodb",
-    awsRegion: "us-east-1",
-    endpoint: DYNAMODB_ENDPOINT,
-    awsAccessKeyId: "rapidb",
-    awsSecretAccessKey: "rapidb-secret",
-  });
-  await driver.connect();
+  log(
+    `Verifying DynamoDBDriver against live DynamoDB Local${transport === "ssh" ? " over SSH" : ""}...`,
+  );
+  const session = await createDynamoDriverSession(transport);
+  const driver = session.driver;
   try {
     assert.equal(driver.isConnected(), true);
     const databases = await driver.listDatabases();
@@ -809,7 +981,7 @@ async function verifyDynamoDriver(): Promise<void> {
       verifyClient.destroy();
     }
   } finally {
-    await driver.disconnect();
+    await session.dispose();
   }
 }
 
@@ -820,10 +992,12 @@ export async function runNoSqlLiveCheck(): Promise<void> {
   await waitForElasticsearch();
   await waitForDynamo();
 
-  await verifyRedisDriver();
-  await verifyMongoDriver();
-  await verifyElasticsearchDriver();
-  await verifyDynamoDriver();
+  for (const transport of ["direct", "ssh"] as const) {
+    await verifyRedisDriver(transport);
+    await verifyMongoDriver(transport);
+    await verifyElasticsearchDriver(transport);
+    await verifyDynamoDriver(transport);
+  }
 
   log("Live NoSQL driver verification completed successfully.");
 }

@@ -2,6 +2,10 @@ import * as mssql from "mssql";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { ConnectionConfig } from "../connectionManager";
 import {
+  getMssqlServerName,
+  getSshTcpForwardTransport,
+} from "../driverRuntimeConfig";
+import {
   BaseDBDriver,
   formatDatetimeForDisplay,
   hasExplicitTimezone,
@@ -621,14 +625,18 @@ export class MSSQLDriver extends BaseDBDriver {
     throw new Error("[RapiDB] MSSQL connection is not open");
   }
   private poolConfig(): mssql.config {
-    if (!this.config.host) {
+    const forwardedTransport = getSshTcpForwardTransport(this.config);
+    const serverHost = forwardedTransport?.localHost ?? this.config.host;
+    const serverPort = forwardedTransport?.localPort ?? this.config.port;
+    if (!serverHost) {
       throw new Error("[RapiDB] MSSQL host is required");
     }
     const sslEnabled = this.config.ssl ?? true;
     const trustCert = !(this.config.rejectUnauthorized ?? true);
+    const runtimeServerName = getMssqlServerName(this.config);
     return {
-      server: this.config.host,
-      port: this.config.port,
+      server: serverHost,
+      port: serverPort,
       database: this.config.database,
       user: this.config.username,
       password: this.config.password,
@@ -639,6 +647,9 @@ export class MSSQLDriver extends BaseDBDriver {
         trustServerCertificate: trustCert,
         enableArithAbort: true,
         abortTransactionOnError: true,
+        serverName:
+          runtimeServerName ??
+          (sslEnabled && !trustCert ? this.config.host : undefined),
         useUTC: true,
       },
     };

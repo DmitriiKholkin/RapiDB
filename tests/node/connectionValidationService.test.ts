@@ -174,4 +174,85 @@ describe("ConnectionValidationService", () => {
     expect(mongodbWithUriAlias.valid).toBe(true);
     expect(elasticsearchWithCloudId.valid).toBe(true);
   });
+
+  it("requires SSH fingerprint and auth secrets when SSH is enabled", () => {
+    const result = service.validate({
+      id: "pg-ssh-missing",
+      name: "PG over SSH",
+      type: "pg",
+      host: "db.internal",
+      database: "app",
+      username: "postgres",
+      sshEnabled: true,
+      sshHost: "bastion.example.com",
+      sshPort: 22,
+      sshUsername: "tunnel",
+      sshAuthMethod: "password",
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.issues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "required",
+          fields: ["sshHostFingerprintSha256"],
+        }),
+        expect.objectContaining({
+          code: "required",
+          fields: ["sshPassword"],
+        }),
+      ]),
+    );
+  });
+
+  it("rejects unsupported MongoDB SSH topologies", () => {
+    const result = service.validate({
+      id: "mongo-ssh-invalid",
+      name: "Mongo SSH",
+      type: "mongodb",
+      connectionUri: "mongodb://db1.internal:27017,db2.internal:27017/app",
+      directConnection: false,
+      sshEnabled: true,
+      sshHost: "bastion.example.com",
+      sshPort: 22,
+      sshUsername: "tunnel",
+      sshAuthMethod: "password",
+      sshPassword: "ssh-secret",
+      sshHostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.issues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "invalid",
+          fields: ["connectionUri", "uri"],
+        }),
+        expect.objectContaining({
+          code: "invalid",
+          fields: ["directConnection"],
+        }),
+      ]),
+    );
+  });
+
+  it("allows trust-on-first-use SSH verification without a pre-entered fingerprint", () => {
+    const result = service.validate({
+      id: "pg-ssh-tofu",
+      name: "PG SSH TOFU",
+      type: "pg",
+      host: "db.internal",
+      database: "app",
+      username: "postgres",
+      sshEnabled: true,
+      sshHost: "bastion.example.com",
+      sshPort: 22,
+      sshUsername: "tunnel",
+      sshAuthMethod: "password",
+      sshHostVerificationMode: "trustOnFirstUse",
+      sshPassword: "ssh-secret",
+    });
+
+    expect(result.valid).toBe(true);
+  });
 });

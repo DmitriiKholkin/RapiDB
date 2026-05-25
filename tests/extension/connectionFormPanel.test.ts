@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ConnectionFormPanel } from "../../src/extension/panels/connectionFormPanel";
+import { createWebviewShell } from "../../src/extension/panels/webviewShell";
 
 const vscodeMock = vi.hoisted(() => {
   const createWebviewPanel = vi.fn(() => {
@@ -141,9 +142,92 @@ describe("ConnectionFormPanel", () => {
       }),
     );
     expect(connectionManager.saveConnection).toHaveBeenCalledWith(
-      expect.not.objectContaining({ password: expect.anything() }),
+      expect.objectContaining({
+        password: "stored-secret",
+        useSecretStorage: true,
+      }),
     );
     expect(context.secrets.store).not.toHaveBeenCalled();
+  });
+
+  it("sanitizes the initial edit state before passing it into the webview", async () => {
+    const context = {
+      secrets: {
+        get: vi.fn(async () =>
+          JSON.stringify({
+            sshPrivateKey:
+              "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+            sshPassphrase: "stored-passphrase",
+          }),
+        ),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn(),
+      getConnection: vi.fn(() => undefined),
+      testConnection: vi.fn(),
+    };
+
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+      {
+        id: "conn-edit-sanitized",
+        name: "Elastic SSH",
+        type: "elasticsearch",
+        endpoint: "https://elastic-user:elastic-pass@cluster.example.com",
+        apiKey: "inline-api-key",
+        awsAccessKeyId: "AKIA123",
+        awsSecretAccessKey: "secret-key",
+        awsSessionToken: "session-token",
+        password: "db-password",
+        sshEnabled: true,
+        sshHost: "bastion.example.com",
+        sshPort: 22,
+        sshUsername: "tunnel",
+        sshAuthMethod: "privateKey",
+        sshPrivateKey:
+          "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+        sshPassphrase: "inline-passphrase",
+        sshHostFingerprintSha256:
+          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        useSecretStorage: true,
+      },
+    );
+
+    await Promise.resolve();
+
+    const shellCall = vi.mocked(createWebviewShell).mock.calls[0]?.[0];
+    expect(shellCall?.initialState).toEqual(
+      expect.objectContaining({
+        view: "connection",
+        existing: expect.objectContaining({
+          id: "conn-edit-sanitized",
+          endpoint: "https://cluster.example.com",
+          hasStoredSshPrivateKey: true,
+          hasStoredSshPassphrase: true,
+        }),
+      }),
+    );
+    expect(shellCall?.initialState).toEqual(
+      expect.not.objectContaining({
+        existing: expect.objectContaining({
+          password: expect.anything(),
+          apiKey: expect.anything(),
+          awsAccessKeyId: expect.anything(),
+          awsSecretAccessKey: expect.anything(),
+          awsSessionToken: expect.anything(),
+          sshPrivateKey: expect.anything(),
+          sshPassphrase: expect.anything(),
+        }),
+      }),
+    );
+
+    const panel = createdPanel();
+    panel?.dispose();
+    await expect(promise).resolves.toBeUndefined();
   });
 
   it("posts test results back to the webview and resolves undefined on cancel", async () => {
@@ -252,7 +336,7 @@ describe("ConnectionFormPanel", () => {
       }),
     );
     expect(connectionManager.saveConnection).toHaveBeenCalledWith(
-      expect.not.objectContaining({
+      expect.objectContaining({
         awsAccessKeyId: expect.anything(),
         awsSecretAccessKey: expect.anything(),
         awsSessionToken: expect.anything(),
@@ -396,7 +480,7 @@ describe("ConnectionFormPanel", () => {
         id: "conn-es",
         name: "Elastic Cloud",
         type: "elasticsearch",
-        endpoint: "https://cluster.example.com",
+        endpoint: "https://elastic-user:elastic-pass@cluster.example.com",
         apiKey: "base64-api-key",
         cloudId: "deployment:ZXM=",
         useSecretStorage: false,
@@ -414,16 +498,131 @@ describe("ConnectionFormPanel", () => {
     );
     expect(context.secrets.store).toHaveBeenCalledWith(
       "conn-es",
-      JSON.stringify({ apiKey: "base64-api-key" }),
+      JSON.stringify({
+        apiKey: "base64-api-key",
+        endpoint: "https://elastic-user:elastic-pass@cluster.example.com",
+      }),
     );
     expect(connectionManager.saveConnection).toHaveBeenCalledWith(
       expect.objectContaining({
         type: "elasticsearch",
+        endpoint: "https://elastic-user:elastic-pass@cluster.example.com",
+        apiKey: "base64-api-key",
         useSecretStorage: true,
       }),
     );
+  });
+
+  it("forces SSH credentials into Secret Storage and preserves stored private key secrets", async () => {
+    const previousSecretSnapshot = JSON.stringify({
+      sshPrivateKey:
+        "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+      sshPassphrase: "stored-passphrase",
+    });
+    const context = {
+      secrets: {
+        get: vi.fn(async () => previousSecretSnapshot),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn().mockResolvedValue(undefined),
+      getConnection: vi.fn(() => ({
+        id: "conn-ssh",
+        name: "PG over SSH",
+        type: "pg",
+        host: "db.internal",
+        database: "app",
+        username: "postgres",
+        sshEnabled: true,
+        sshHost: "bastion.example.com",
+        sshPort: 22,
+        sshUsername: "tunnel",
+        sshAuthMethod: "privateKey",
+        sshHostFingerprintSha256:
+          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        useSecretStorage: true,
+      })),
+      testConnection: vi.fn(),
+    };
+
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+      {
+        id: "conn-ssh",
+        name: "PG over SSH",
+        type: "pg",
+        host: "db.internal",
+        database: "app",
+        username: "postgres",
+        sshEnabled: true,
+        sshHost: "bastion.example.com",
+        sshPort: 22,
+        sshUsername: "tunnel",
+        sshAuthMethod: "privateKey",
+        sshHostFingerprintSha256:
+          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        useSecretStorage: true,
+      },
+    );
+
+    await Promise.resolve();
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected a webview panel to be created.");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-ssh",
+        name: "PG over SSH",
+        type: "pg",
+        host: "db.internal",
+        database: "app",
+        username: "postgres",
+        sshEnabled: true,
+        sshHost: "bastion.example.com",
+        sshPort: 22,
+        sshUsername: "tunnel",
+        sshAuthMethod: "privateKey",
+        sshHostFingerprintSha256:
+          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        useSecretStorage: false,
+        hasStoredSshPrivateKey: true,
+        hasStoredSshPassphrase: true,
+        sshPrivateKey: "",
+        sshPassphrase: "new-passphrase",
+      },
+    });
+
+    await expect(promise).resolves.toEqual(
+      expect.objectContaining({
+        id: "conn-ssh",
+        sshEnabled: true,
+        useSecretStorage: true,
+      }),
+    );
+    expect(context.secrets.store).toHaveBeenCalledWith(
+      "conn-ssh",
+      JSON.stringify({
+        sshPrivateKey:
+          "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+        sshPassphrase: "new-passphrase",
+      }),
+    );
     expect(connectionManager.saveConnection).toHaveBeenCalledWith(
-      expect.not.objectContaining({ apiKey: expect.anything() }),
+      expect.objectContaining({
+        id: "conn-ssh",
+        sshEnabled: true,
+        sshPrivateKey:
+          "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+        sshPassphrase: "new-passphrase",
+        useSecretStorage: true,
+      }),
     );
   });
 

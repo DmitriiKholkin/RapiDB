@@ -221,6 +221,85 @@ describe("parseConnectionFormPanelMessage", () => {
     });
   });
 
+  it("parses SSH fields and stored-secret presence flags in connection payloads", () => {
+    const parsed = parseConnectionFormPanelMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-ssh",
+        name: "SSH Primary",
+        type: "pg",
+        host: "db.internal",
+        database: "app",
+        username: "postgres",
+        sshEnabled: true,
+        sshHost: "bastion.example.com",
+        sshPort: "22",
+        sshUsername: "tunnel",
+        sshAuthMethod: "privateKey",
+        sshHostVerificationMode: "manual",
+        sshPrivateKey:
+          "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+        sshPassphrase: "key-passphrase",
+        sshHostFingerprintSha256:
+          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        hasStoredSshPrivateKey: true,
+        hasStoredSshPassphrase: true,
+      },
+    });
+
+    expect(parsed).toEqual({
+      type: "saveConnection",
+      payload: expect.objectContaining({
+        id: "conn-ssh",
+        sshEnabled: true,
+        sshHost: "bastion.example.com",
+        sshPort: 22,
+        sshUsername: "tunnel",
+        sshAuthMethod: "privateKey",
+        sshHostVerificationMode: "manual",
+        sshPrivateKey:
+          "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+        sshPassphrase: "key-passphrase",
+        sshHostFingerprintSha256:
+          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        hasStoredSshPrivateKey: true,
+        hasStoredSshPassphrase: true,
+      }),
+    });
+  });
+
+  it("parses trust-on-first-use SSH submissions without a manual fingerprint", () => {
+    const parsed = parseConnectionFormPanelMessage({
+      type: "testConnection",
+      payload: {
+        id: "conn-ssh-tofu",
+        name: "SSH TOFU",
+        type: "pg",
+        host: "db.internal",
+        database: "app",
+        username: "postgres",
+        sshEnabled: true,
+        sshHost: "bastion.example.com",
+        sshPort: "22",
+        sshUsername: "tunnel",
+        sshAuthMethod: "password",
+        sshHostVerificationMode: "trustOnFirstUse",
+        sshPassword: "ssh-secret",
+      },
+    });
+
+    expect(parsed).toEqual({
+      type: "testConnection",
+      payload: expect.objectContaining({
+        id: "conn-ssh-tofu",
+        sshEnabled: true,
+        sshHostVerificationMode: "trustOnFirstUse",
+        sshHostFingerprintSha256: undefined,
+        sshPassword: "ssh-secret",
+      }),
+    });
+  });
+
   it("normalizes alias fields for new NoSQL connection payloads", () => {
     const parsed = parseConnectionFormPanelMessage({
       type: "saveConnection",

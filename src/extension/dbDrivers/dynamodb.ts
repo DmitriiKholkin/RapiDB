@@ -1,3 +1,4 @@
+import * as https from "node:https";
 import {
   type AttributeValue,
   BatchGetItemCommand,
@@ -40,6 +41,7 @@ import {
 } from "@aws-sdk/client-dynamodb";
 import { fromIni } from "@aws-sdk/credential-providers";
 import { marshall, unmarshall } from "@aws-sdk/util-dynamodb";
+import { NodeHttpHandler } from "@smithy/node-http-handler";
 import {
   type DynamoDbNativeOperationName,
   inferDynamoDbNativeOperationName,
@@ -47,6 +49,10 @@ import {
 } from "../../shared/dynamodbNative";
 import type { PrimaryKeyRole } from "../../shared/tableTypes";
 import type { ConnectionConfig } from "../connectionManager";
+import {
+  getSshHttpAgentTransport,
+  getTlsServername,
+} from "../driverRuntimeConfig";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import {
   applyFilters,
@@ -293,9 +299,25 @@ export class DynamoDBDriver implements IDBDriver {
       return;
     }
 
+    const sshAgentTransport = getSshHttpAgentTransport(this.config);
+    const tlsServername = getTlsServername(this.config);
+
     const client = new DynamoDBClient({
       region: this.config.awsRegion || "us-east-1",
       endpoint: this.config.endpoint ?? this.config.awsEndpoint,
+      requestHandler: sshAgentTransport
+        ? new NodeHttpHandler({
+            httpAgent: sshAgentTransport.httpAgent,
+            httpsAgent: sshAgentTransport.httpsAgent,
+          })
+        : tlsServername
+          ? new NodeHttpHandler({
+              httpsAgent: new https.Agent({
+                keepAlive: true,
+                servername: tlsServername,
+              }),
+            })
+          : undefined,
       credentials:
         this.config.awsAccessKeyId && this.config.awsSecretAccessKey
           ? {

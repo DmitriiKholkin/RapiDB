@@ -8,7 +8,10 @@ import type {
   QueryResult,
 } from "../../src/extension/dbDrivers/types";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
-import type { DbEngineId } from "../contracts/testingContracts";
+import {
+  type DbEngineId,
+  ENGINE_CAPABILITY_PROFILES,
+} from "../contracts/testingContracts";
 import {
   CANONICAL_FIXTURE_DATASET,
   FIXTURE_ROUTINE_NAMES,
@@ -23,17 +26,24 @@ import {
 } from "../runtime/liveDbOrchestration";
 import { resolveConnectionSeed } from "../runtime/testRuntimeConfig";
 
+export interface LiveDriverHarnessOptions {
+  transport?: "direct" | "ssh";
+}
+
 export interface LiveDriverHarness {
   engineId: DbEngineId;
   connection: ConnectionConfig;
   driver: IDBDriver;
   databaseName: string;
   schemaName: string;
+  dispose: () => Promise<void>;
 }
 
 export async function createLiveDriverHarness(
   engineId: DbEngineId,
+  options: LiveDriverHarnessOptions = {},
 ): Promise<LiveDriverHarness> {
+  const transport = options.transport ?? "direct";
   let connection: ConnectionConfig;
 
   if (engineId === "sqlite") {
@@ -45,14 +55,46 @@ export async function createLiveDriverHarness(
     connection = await resolveConnectionSeed(engineId);
   }
 
-  const driver = createDriver(engineId, connection);
-  await driver.connect();
+  let driver: IDBDriver;
+  let dispose: () => Promise<void>;
+
+  if (transport === "ssh") {
+    if (engineId === "sqlite") {
+      throw new Error("SQLite live SSH transport is not supported.");
+    }
+
+    const {
+      connectLiveDriverViaManager,
+      disposeManagedLiveDriverSession,
+      withTrustOnFirstUseSsh,
+    } = await import("./liveSshManagerHarness");
+
+    const sshConnection = withTrustOnFirstUseSsh({
+      ...connection,
+      host:
+        ENGINE_CAPABILITY_PROFILES[engineId].dockerServiceName ??
+        connection.host,
+    });
+    const session = await connectLiveDriverViaManager(sshConnection);
+    connection = sshConnection;
+    driver = session.driver;
+    dispose = async () => {
+      await disposeManagedLiveDriverSession(session);
+    };
+  } else {
+    driver = createDriver(engineId, connection);
+    await driver.connect();
+    dispose = async () => {
+      await driver.disconnect();
+    };
+  }
 
   const namespace = resolveFixtureNamespace(engineId);
   return {
     engineId,
     connection,
     driver,
+    dispose,
     databaseName:
       namespace.physicalDatabaseName ?? connection.database ?? "main",
     schemaName: namespace.physicalSchemaName,
@@ -62,7 +104,7 @@ export async function createLiveDriverHarness(
 export async function disposeLiveDriverHarness(
   harness: LiveDriverHarness | undefined,
 ): Promise<void> {
-  await harness?.driver.disconnect();
+  await harness?.dispose();
 }
 
 export function createDriver(

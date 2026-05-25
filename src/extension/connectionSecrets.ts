@@ -8,6 +8,11 @@ export interface ConnectionSecretSnapshot {
   awsSessionToken?: string;
   connectionUri?: string;
   uri?: string;
+  endpoint?: string;
+  awsEndpoint?: string;
+  sshPassword?: string;
+  sshPrivateKey?: string;
+  sshPassphrase?: string;
 }
 
 export function trimOptionalSecretValue(
@@ -83,6 +88,22 @@ function extractConnectionSecrets(
   config: ConnectionConfig,
   previousSecrets?: ConnectionSecretSnapshot,
 ): ConnectionSecretSnapshot {
+  const sshPassword =
+    config.sshEnabled === true && config.sshAuthMethod === "password"
+      ? (trimOptionalSecretValue(config.sshPassword) ??
+        previousSecrets?.sshPassword)
+      : undefined;
+  const sshPrivateKey =
+    config.sshEnabled === true && config.sshAuthMethod === "privateKey"
+      ? (trimOptionalSecretValue(config.sshPrivateKey) ??
+        previousSecrets?.sshPrivateKey)
+      : undefined;
+  const sshPassphrase =
+    config.sshEnabled === true && config.sshAuthMethod === "privateKey"
+      ? (trimOptionalSecretValue(config.sshPassphrase) ??
+        previousSecrets?.sshPassphrase)
+      : undefined;
+
   return {
     password:
       trimOptionalSecretValue(config.password) ?? previousSecrets?.password,
@@ -110,16 +131,33 @@ function extractConnectionSecrets(
       previousSecrets?.connectionUri,
     ),
     uri: resolvePersistedUriSecret(config.uri, previousSecrets?.uri),
+    endpoint: resolvePersistedUriSecret(
+      config.endpoint,
+      previousSecrets?.endpoint,
+    ),
+    awsEndpoint: resolvePersistedUriSecret(
+      config.awsEndpoint,
+      previousSecrets?.awsEndpoint,
+    ),
+    sshPassword,
+    sshPrivateKey,
+    sshPassphrase,
   };
 }
 
 export function shouldForceSecretStorage(config: ConnectionConfig): boolean {
   return (
+    config.sshEnabled === true ||
     config.type === "dynamodb" ||
     config.type === "elasticsearch" ||
     extractCredentialBearingUriSecret(config.connectionUri) !== undefined ||
     extractCredentialBearingUriSecret(config.uri) !== undefined ||
+    extractCredentialBearingUriSecret(config.endpoint) !== undefined ||
+    extractCredentialBearingUriSecret(config.awsEndpoint) !== undefined ||
     trimOptionalSecretValue(config.password) !== undefined ||
+    trimOptionalSecretValue(config.sshPassword) !== undefined ||
+    trimOptionalSecretValue(config.sshPrivateKey) !== undefined ||
+    trimOptionalSecretValue(config.sshPassphrase) !== undefined ||
     trimOptionalSecretValue(config.apiKey) !== undefined ||
     trimOptionalSecretValue(config.awsAccessKeyId) !== undefined ||
     trimOptionalSecretValue(config.awsSecretAccessKey) !== undefined ||
@@ -141,8 +179,13 @@ export function sanitizePersistedConnectionConfig(
     awsAccessKeyId: _awsAccessKeyId,
     awsSecretAccessKey: _awsSecretAccessKey,
     awsSessionToken: _awsSessionToken,
+    sshPassword: _sshPassword,
+    sshPrivateKey: _sshPrivateKey,
+    sshPassphrase: _sshPassphrase,
     connectionUri: rawConnectionUri,
     uri: rawUri,
+    endpoint: rawEndpoint,
+    awsEndpoint: rawAwsEndpoint,
     ...rest
   } = config;
 
@@ -150,6 +193,8 @@ export function sanitizePersistedConnectionConfig(
     ...rest,
     connectionUri: sanitizeUriForPersistence(rawConnectionUri),
     uri: sanitizeUriForPersistence(rawUri),
+    endpoint: sanitizeUriForPersistence(rawEndpoint),
+    awsEndpoint: sanitizeUriForPersistence(rawAwsEndpoint),
     useSecretStorage: true,
   };
 }
@@ -165,8 +210,13 @@ export function hasPersistedConnectionConfigChanges(
     persisted.awsAccessKeyId !== original.awsAccessKeyId ||
     persisted.awsSecretAccessKey !== original.awsSecretAccessKey ||
     persisted.awsSessionToken !== original.awsSessionToken ||
+    persisted.sshPassword !== original.sshPassword ||
+    persisted.sshPrivateKey !== original.sshPrivateKey ||
+    persisted.sshPassphrase !== original.sshPassphrase ||
     persisted.connectionUri !== original.connectionUri ||
-    persisted.uri !== original.uri
+    persisted.uri !== original.uri ||
+    persisted.endpoint !== original.endpoint ||
+    persisted.awsEndpoint !== original.awsEndpoint
   );
 }
 

@@ -1,6 +1,7 @@
 import oracledb from "oracledb";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { ConnectionConfig } from "../connectionManager";
+import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
 import {
   escapeSqlPreviewStringLiteral,
@@ -762,8 +763,10 @@ export class OracleDriver extends BaseDBDriver {
       ensureThickMode(this.config.clientPath || undefined);
     }
     const serviceName = this.config.serviceName || this.config.database;
-    const host = this.config.host ?? "localhost";
-    const port = this.config.port ?? 1521;
+    const forwardedTransport = getSshTcpForwardTransport(this.config);
+    const host =
+      forwardedTransport?.localHost ?? this.config.host ?? "localhost";
+    const port = forwardedTransport?.localPort ?? this.config.port ?? 1521;
     const connectString = serviceName
       ? `${host}:${port}/${serviceName}`
       : `${host}:${port}`;

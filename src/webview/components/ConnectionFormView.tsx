@@ -3,11 +3,17 @@ import React, {
   type InputHTMLAttributes,
   type ReactElement,
   type ReactNode,
+  type SelectHTMLAttributes,
+  type TextareaHTMLAttributes,
   useCallback,
   useEffect,
   useId,
   useState,
 } from "react";
+import type {
+  ConnectionSshAuthMethod,
+  ConnectionSshHostVerificationMode,
+} from "../../shared/connectionConfig";
 import {
   type ConnectionType,
   DEFAULT_PORT_BY_CONNECTION_TYPE,
@@ -17,7 +23,10 @@ import type {
   ConnectionFormSubmission,
 } from "../../shared/webviewContracts";
 import { buildButtonStyle } from "../utils/buttonStyles";
-import { buildTextInputStyle } from "../utils/controlStyles";
+import {
+  buildSelectControlStyle,
+  buildTextInputStyle,
+} from "../utils/controlStyles";
 import { onMessage, postMessage } from "../utils/messaging";
 import { Icon } from "./Icon";
 
@@ -80,6 +89,59 @@ function FocusInput(props: InputHTMLAttributes<HTMLInputElement>) {
       {...props}
       style={{
         ...buildTextInputStyle("md", focused),
+        ...(props.style ?? {}),
+      }}
+      onFocus={(e) => {
+        setFocused(true);
+        props.onFocus?.(e);
+      }}
+      onBlur={(e) => {
+        setFocused(false);
+        props.onBlur?.(e);
+      }}
+    />
+  );
+}
+
+function FocusSelect(props: SelectHTMLAttributes<HTMLSelectElement>) {
+  const [focused, setFocused] = useState(false);
+
+  return (
+    <select
+      {...props}
+      style={{
+        ...buildSelectControlStyle("md", focused),
+        paddingRight: 28,
+        ...(props.style ?? {}),
+      }}
+      onFocus={(e) => {
+        setFocused(true);
+        props.onFocus?.(e);
+      }}
+      onBlur={(e) => {
+        setFocused(false);
+        props.onBlur?.(e);
+      }}
+    >
+      {props.children}
+    </select>
+  );
+}
+
+function FocusTextArea(props: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+  const [focused, setFocused] = useState(false);
+
+  return (
+    <textarea
+      {...props}
+      style={{
+        ...buildTextInputStyle("md", focused),
+        height: "auto",
+        minHeight: 96,
+        padding: "6px 8px",
+        resize: "vertical",
+        lineHeight: 1.45,
+        fontFamily: "var(--vscode-editor-font-family, monospace)",
         ...(props.style ?? {}),
       }}
       onFocus={(e) => {
@@ -414,6 +476,9 @@ function DBTypeSelector({
 export function ConnectionFormView({ existing }: Props): ReactElement {
   const isEdit = !!existing;
   const hasStoredSecret = existing?.hasStoredSecret ?? false;
+  const hasStoredSshPassword = existing?.hasStoredSshPassword ?? false;
+  const hasStoredSshPrivateKey = existing?.hasStoredSshPrivateKey ?? false;
+  const hasStoredSshPassphrase = existing?.hasStoredSshPassphrase ?? false;
 
   const [name, setName] = useState(existing?.name ?? "");
   const [type, setType] = useState<ConnectionType>(existing?.type ?? "pg");
@@ -456,9 +521,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const [elasticsearchEndpoint, setElasticsearchEndpoint] = useState(
     existing?.endpoint ?? existing?.connectionUri ?? "",
   );
-  const [elasticsearchApiKey, setElasticsearchApiKey] = useState(
-    existing?.apiKey ?? "",
-  );
+  const [elasticsearchApiKey, setElasticsearchApiKey] = useState("");
   const [elasticsearchCloudId, setElasticsearchCloudId] = useState(
     existing?.cloudId ?? "",
   );
@@ -466,18 +529,29 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     existing?.redisDb === undefined ? "0" : String(existing.redisDb),
   );
   const [awsRegion, setAwsRegion] = useState(existing?.awsRegion ?? "");
-  const [awsAccessKeyId, setAwsAccessKeyId] = useState(
-    existing?.awsAccessKeyId ?? "",
-  );
-  const [awsSecretAccessKey, setAwsSecretAccessKey] = useState(
-    existing?.awsSecretAccessKey ?? "",
-  );
-  const [awsSessionToken, setAwsSessionToken] = useState(
-    existing?.awsSessionToken ?? "",
-  );
+  const [awsAccessKeyId, setAwsAccessKeyId] = useState("");
+  const [awsSecretAccessKey, setAwsSecretAccessKey] = useState("");
+  const [awsSessionToken, setAwsSessionToken] = useState("");
   const [awsProfile, setAwsProfile] = useState(existing?.awsProfile ?? "");
   const [dynamoEndpoint, setDynamoEndpoint] = useState(
     existing?.endpoint ?? existing?.awsEndpoint ?? "",
+  );
+  const [sshEnabled, setSshEnabled] = useState(existing?.sshEnabled ?? false);
+  const [sshHost, setSshHost] = useState(existing?.sshHost ?? "");
+  const [sshPort, setSshPort] = useState(String(existing?.sshPort ?? 22));
+  const [sshUsername, setSshUsername] = useState(existing?.sshUsername ?? "");
+  const [sshAuthMethod, setSshAuthMethod] = useState<ConnectionSshAuthMethod>(
+    existing?.sshAuthMethod ?? "privateKey",
+  );
+  const [sshHostVerificationMode, setSshHostVerificationMode] =
+    useState<ConnectionSshHostVerificationMode>(
+      existing?.sshHostVerificationMode ?? "manual",
+    );
+  const [sshPassword, setSshPassword] = useState("");
+  const [sshPrivateKey, setSshPrivateKey] = useState("");
+  const [sshPassphrase, setSshPassphrase] = useState("");
+  const [sshHostFingerprintSha256, setSshHostFingerprintSha256] = useState(
+    existing?.sshHostFingerprintSha256 ?? "",
   );
 
   const [sslEnabled, setSslEnabled] = useState(existing?.ssl ?? false);
@@ -504,22 +578,45 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const isElasticsearch = type === "elasticsearch";
   const isDynamo = type === "dynamodb";
   const supportsSsl = !isSQLite && !isDynamo;
-  const secretStorageRequired = isElasticsearch;
+  const effectiveSshEnabled = !isSQLite && sshEnabled;
+  const secretStorageRequired =
+    isElasticsearch || isDynamo || effectiveSshEnabled;
   const effectiveUseSecretStorage = secretStorageRequired
     ? true
     : useSecretStorage;
-  const secretStorageLabel = isElasticsearch
-    ? "Store secrets in VS Code Secret Storage"
-    : "Store password in VS Code Secret Storage";
+  const secretStorageLabel =
+    isElasticsearch || effectiveSshEnabled
+      ? "Store secrets in VS Code Secret Storage"
+      : "Store password in VS Code Secret Storage";
   const secretStorageHint = isElasticsearch
     ? "Elasticsearch credentials are always saved in your OS keychain and will not appear in settings.json."
-    : effectiveUseSecretStorage
-      ? "Password saved in your OS keychain — will NOT appear in settings.json."
-      : "Password will be saved in plaintext in settings.json. Enable to store securely.";
+    : effectiveSshEnabled
+      ? "SSH is enabled, so database and SSH secrets are always saved in your OS keychain and will not appear in settings.json."
+      : effectiveUseSecretStorage
+        ? "Password saved in your OS keychain — will NOT appear in settings.json."
+        : "Password will be saved in plaintext in settings.json. Enable to store securely.";
   const elasticsearchApiKeyHint =
     hasStoredSecret && elasticsearchApiKey.length === 0
       ? "Leave blank to keep the stored API key unchanged."
       : "Will be stored securely in VS Code Secret Storage (OS keychain)";
+  const sshPasswordHint =
+    hasStoredSshPassword && sshPassword.length === 0
+      ? "Leave blank to keep the stored SSH password unchanged."
+      : "Will be stored securely in VS Code Secret Storage (OS keychain).";
+  const sshPrivateKeyHint =
+    hasStoredSshPrivateKey && sshPrivateKey.length === 0
+      ? "Leave blank to keep the stored SSH private key unchanged."
+      : "Paste the OpenSSH or PEM private key. Stored securely in VS Code Secret Storage (OS keychain).";
+  const sshPassphraseHint =
+    hasStoredSshPassphrase && sshPassphrase.length === 0
+      ? "Leave blank to keep the stored SSH passphrase unchanged."
+      : "Optional. Stored securely in VS Code Secret Storage (OS keychain).";
+  const sshFingerprintHint =
+    sshHostVerificationMode === "trustOnFirstUse"
+      ? sshHostFingerprintSha256.trim().length > 0
+        ? `The first accepted SSH fingerprint is pinned automatically. Current pinned fingerprint: ${sshHostFingerprintSha256.trim()}`
+        : "The first successful SSH handshake will pin the discovered SHA256 fingerprint automatically and enforce it on future connections."
+      : "Required. Use the OpenSSH SHA256 fingerprint format, for example SHA256:AbCdEf...";
 
   useEffect(
     () =>
@@ -554,6 +651,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
 
   const buildPayload = useCallback((): ConnectionFormSubmission => {
     const parsedRedisDb = parseRedisDbInput(redisDb);
+    const parsedSshPort = Number.parseInt(sshPort.trim(), 10);
 
     return {
       id: existing?.id ?? crypto.randomUUID(),
@@ -563,6 +661,39 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       folder: folder.trim() || undefined,
       useSecretStorage: effectiveUseSecretStorage,
       hasStoredSecret: hasStoredSecret || undefined,
+      sshEnabled: effectiveSshEnabled,
+      sshHost: effectiveSshEnabled ? sshHost.trim() || undefined : undefined,
+      sshPort:
+        effectiveSshEnabled &&
+        Number.isInteger(parsedSshPort) &&
+        parsedSshPort > 0
+          ? parsedSshPort
+          : undefined,
+      sshUsername: effectiveSshEnabled
+        ? sshUsername.trim() || undefined
+        : undefined,
+      sshAuthMethod: effectiveSshEnabled ? sshAuthMethod : undefined,
+      sshHostVerificationMode: effectiveSshEnabled
+        ? sshHostVerificationMode
+        : undefined,
+      sshPassword:
+        effectiveSshEnabled && sshAuthMethod === "password"
+          ? sshPassword
+          : undefined,
+      sshPrivateKey:
+        effectiveSshEnabled && sshAuthMethod === "privateKey"
+          ? sshPrivateKey
+          : undefined,
+      sshPassphrase:
+        effectiveSshEnabled && sshAuthMethod === "privateKey"
+          ? sshPassphrase
+          : undefined,
+      sshHostFingerprintSha256: effectiveSshEnabled
+        ? sshHostFingerprintSha256.trim() || undefined
+        : undefined,
+      hasStoredSshPassword: hasStoredSshPassword || undefined,
+      hasStoredSshPrivateKey: hasStoredSshPrivateKey || undefined,
+      hasStoredSshPassphrase: hasStoredSshPassphrase || undefined,
       ...(isSQLite
         ? { filePath: filePath.trim() }
         : isDynamo
@@ -625,6 +756,10 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     folder,
     effectiveUseSecretStorage,
     hasStoredSecret,
+    effectiveSshEnabled,
+    hasStoredSshPassword,
+    hasStoredSshPrivateKey,
+    hasStoredSshPassphrase,
     isSQLite,
     filePath,
     host,
@@ -636,6 +771,15 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     awsSecretAccessKey,
     awsSessionToken,
     dynamoEndpoint,
+    sshHost,
+    sshPort,
+    sshUsername,
+    sshAuthMethod,
+    sshHostVerificationMode,
+    sshPassword,
+    sshPrivateKey,
+    sshPassphrase,
+    sshHostFingerprintSha256,
     username,
     password,
     sslEnabled,
@@ -967,6 +1111,164 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
           </>
         )}
       </Card>
+
+      {!isSQLite && (
+        <Card>
+          <CardHeader icon="server-process" label="SSH Tunnel" />
+          <Toggle
+            label="Connect through SSH bastion"
+            hint="Tunnel the database connection through a bastion host. SSH credentials are always stored in VS Code Secret Storage."
+            checked={effectiveSshEnabled}
+            onChange={setSshEnabled}
+          />
+
+          {isMongo && (
+            <div
+              style={{
+                fontSize: 11,
+                opacity: 0.58,
+                marginTop: -2,
+                marginBottom: 12,
+                lineHeight: 1.4,
+              }}
+            >
+              MongoDB over SSH supports only single-host direct connections in
+              v1.
+            </div>
+          )}
+
+          {effectiveSshEnabled && (
+            <>
+              <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+                <div style={{ flex: 1 }}>
+                  <FieldLabel>SSH Host</FieldLabel>
+                  <FocusInput
+                    aria-label="SSH host"
+                    value={sshHost}
+                    onChange={(e) => setSshHost(e.target.value)}
+                    placeholder="bastion.example.com"
+                  />
+                </div>
+                <div style={{ width: 90 }}>
+                  <FieldLabel>SSH Port</FieldLabel>
+                  <FocusInput
+                    aria-label="SSH port"
+                    value={sshPort}
+                    onChange={(e) => setSshPort(e.target.value)}
+                    type="text"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    style={
+                      {
+                        fontFamily:
+                          "var(--vscode-editor-font-family, monospace)",
+                        MozAppearance: "textfield",
+                      } as CSSProperties
+                    }
+                  />
+                </div>
+              </div>
+
+              <Field label="SSH Username">
+                <FocusInput
+                  aria-label="SSH username"
+                  value={sshUsername}
+                  onChange={(e) => setSshUsername(e.target.value)}
+                  placeholder="tunnel"
+                />
+              </Field>
+
+              <Field label="SSH Authentication">
+                <FocusSelect
+                  aria-label="SSH auth method"
+                  value={sshAuthMethod}
+                  onChange={(e) =>
+                    setSshAuthMethod(e.target.value as ConnectionSshAuthMethod)
+                  }
+                >
+                  <option value="privateKey">Private key</option>
+                  <option value="password">Password</option>
+                </FocusSelect>
+              </Field>
+
+              <Field label="SSH Host Verification">
+                <FocusSelect
+                  aria-label="SSH host verification mode"
+                  value={sshHostVerificationMode}
+                  onChange={(e) =>
+                    setSshHostVerificationMode(
+                      e.target.value as ConnectionSshHostVerificationMode,
+                    )
+                  }
+                >
+                  <option value="manual">Enter fingerprint manually</option>
+                  <option value="trustOnFirstUse">Trust on first use</option>
+                </FocusSelect>
+              </Field>
+
+              {sshAuthMethod === "password" ? (
+                <Field label="SSH Password" hint={sshPasswordHint}>
+                  <FocusInput
+                    aria-label="SSH password"
+                    value={sshPassword}
+                    onChange={(e) => setSshPassword(e.target.value)}
+                    type="password"
+                    placeholder="••••••••"
+                    style={{
+                      fontFamily: "var(--vscode-editor-font-family, monospace)",
+                    }}
+                  />
+                </Field>
+              ) : (
+                <>
+                  <Field label="SSH Private Key" hint={sshPrivateKeyHint}>
+                    <FocusTextArea
+                      aria-label="SSH private key"
+                      value={sshPrivateKey}
+                      onChange={(e) => setSshPrivateKey(e.target.value)}
+                      placeholder="-----BEGIN OPENSSH PRIVATE KEY-----\n..."
+                      spellCheck={false}
+                    />
+                  </Field>
+                  <Field label="SSH Passphrase" hint={sshPassphraseHint}>
+                    <FocusInput
+                      aria-label="SSH passphrase"
+                      value={sshPassphrase}
+                      onChange={(e) => setSshPassphrase(e.target.value)}
+                      type="password"
+                      placeholder="Optional"
+                      style={{
+                        fontFamily:
+                          "var(--vscode-editor-font-family, monospace)",
+                      }}
+                    />
+                  </Field>
+                </>
+              )}
+
+              {sshHostVerificationMode === "manual" ? (
+                <Field label="SSH Host Fingerprint" hint={sshFingerprintHint}>
+                  <FocusInput
+                    aria-label="SSH host fingerprint SHA256"
+                    value={sshHostFingerprintSha256}
+                    onChange={(e) =>
+                      setSshHostFingerprintSha256(e.target.value)
+                    }
+                    placeholder="SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/"
+                    style={{
+                      fontFamily: "var(--vscode-editor-font-family, monospace)",
+                    }}
+                  />
+                </Field>
+              ) : (
+                <Field label="SSH Host Fingerprint" hint={sshFingerprintHint}>
+                  {null}
+                </Field>
+              )}
+            </>
+          )}
+        </Card>
+      )}
 
       {!isSQLite && !isDynamo && (
         <Card>

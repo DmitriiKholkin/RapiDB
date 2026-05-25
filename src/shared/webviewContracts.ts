@@ -135,15 +135,27 @@ export interface ErdGraph {
   scope: ErdGraphScope;
 }
 
-export type SanitizedConnectionConfig = Omit<ConnectionConfig, "password">;
+export type SanitizedConnectionConfig = Omit<
+  ConnectionConfig,
+  "password" | "sshPassword" | "sshPrivateKey" | "sshPassphrase"
+>;
 
 export interface ConnectionFormExistingState extends SanitizedConnectionConfig {
   hasStoredSecret?: boolean;
+  hasStoredSshPassword?: boolean;
+  hasStoredSshPrivateKey?: boolean;
+  hasStoredSshPassphrase?: boolean;
 }
 
 export interface ConnectionFormSubmission extends SanitizedConnectionConfig {
   password?: string;
+  sshPassword?: string;
+  sshPrivateKey?: string;
+  sshPassphrase?: string;
   hasStoredSecret?: boolean;
+  hasStoredSshPassword?: boolean;
+  hasStoredSshPrivateKey?: boolean;
+  hasStoredSshPassphrase?: boolean;
 }
 
 export interface ConnectionFormInitialState extends PanelRetentionState {
@@ -299,6 +311,18 @@ function readOptionalNumber(
     return Number.isFinite(parsed) ? parsed : undefined;
   }
   return undefined;
+}
+
+function readConnectionSshAuthMethod(
+  value: unknown,
+): ConnectionConfig["sshAuthMethod"] | undefined {
+  return value === "password" || value === "privateKey" ? value : undefined;
+}
+
+function readConnectionSshHostVerificationMode(
+  value: unknown,
+): ConnectionConfig["sshHostVerificationMode"] | undefined {
+  return value === "manual" || value === "trustOnFirstUse" ? value : undefined;
 }
 
 function readPositiveInteger(value: unknown): number | undefined {
@@ -458,6 +482,18 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
     awsSecretAccessKey: readOptionalString(input, "awsSecretAccessKey"),
     awsSessionToken: readOptionalString(input, "awsSessionToken"),
     awsEndpoint: readOptionalString(input, "awsEndpoint"),
+    sshEnabled: readOptionalBoolean(input, "sshEnabled"),
+    sshHost: readOptionalString(input, "sshHost"),
+    sshPort: readOptionalNumber(input, "sshPort"),
+    sshUsername: readOptionalString(input, "sshUsername"),
+    sshAuthMethod: readConnectionSshAuthMethod(input.sshAuthMethod),
+    sshHostVerificationMode: readConnectionSshHostVerificationMode(
+      input.sshHostVerificationMode,
+    ),
+    sshHostFingerprintSha256: readOptionalString(
+      input,
+      "sshHostFingerprintSha256",
+    ),
     useSecretStorage: readOptionalBoolean(input, "useSecretStorage"),
   };
 }
@@ -472,6 +508,15 @@ export function parseConnectionFormExistingState(
   return {
     ...base,
     hasStoredSecret: readOptionalBoolean(input, "hasStoredSecret"),
+    hasStoredSshPassword: readOptionalBoolean(input, "hasStoredSshPassword"),
+    hasStoredSshPrivateKey: readOptionalBoolean(
+      input,
+      "hasStoredSshPrivateKey",
+    ),
+    hasStoredSshPassphrase: readOptionalBoolean(
+      input,
+      "hasStoredSshPassphrase",
+    ),
   };
 }
 
@@ -483,10 +528,25 @@ export function parseConnectionFormSubmission(
     return null;
   }
   const password = readOptionalString(input, "password");
+  const sshPassword = readOptionalString(input, "sshPassword");
+  const sshPrivateKey = readOptionalString(input, "sshPrivateKey");
+  const sshPassphrase = readOptionalString(input, "sshPassphrase");
   return {
     ...base,
     password,
+    sshPassword,
+    sshPrivateKey,
+    sshPassphrase,
     hasStoredSecret: readOptionalBoolean(input, "hasStoredSecret"),
+    hasStoredSshPassword: readOptionalBoolean(input, "hasStoredSshPassword"),
+    hasStoredSshPrivateKey: readOptionalBoolean(
+      input,
+      "hasStoredSshPrivateKey",
+    ),
+    hasStoredSshPassphrase: readOptionalBoolean(
+      input,
+      "hasStoredSshPassphrase",
+    ),
   };
 }
 

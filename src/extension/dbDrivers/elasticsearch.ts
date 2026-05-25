@@ -1,6 +1,8 @@
 import { Client } from "@elastic/elasticsearch";
+import { HttpConnection } from "@elastic/transport";
 import { ELASTICSEARCH_READ_BUDGET } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
+import { getSshHttpAgentTransport } from "../driverRuntimeConfig";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import {
   formatDatetimeForDisplay,
@@ -149,12 +151,20 @@ export class ElasticsearchDriver implements IDBDriver {
       this.config.connectionUri ??
       this.config.endpoint ??
       `${protocol}://${this.config.host || "localhost"}:${this.config.port ?? 9200}`;
+    const sshAgentTransport = getSshHttpAgentTransport(this.config);
     const client = new Client({
+      ...(sshAgentTransport ? { Connection: HttpConnection } : {}),
       node: this.config.cloudId ? undefined : node,
       cloud: this.config.cloudId
         ? {
             id: this.config.cloudId,
           }
+        : undefined,
+      agent: sshAgentTransport
+        ? (options: { url: URL }) =>
+            options.url.protocol === "https:"
+              ? sshAgentTransport.httpsAgent
+              : sshAgentTransport.httpAgent
         : undefined,
       auth: this.config.apiKey
         ? {

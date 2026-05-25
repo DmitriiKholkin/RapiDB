@@ -2,6 +2,7 @@ import type {
   FieldPacket,
   Pool,
   PoolConnection,
+  PoolOptions,
   QueryOptions,
   ResultSetHeader,
   RowDataPacket,
@@ -9,6 +10,10 @@ import type {
 import * as mysql from "mysql2/promise";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { ConnectionConfig } from "../connectionManager";
+import {
+  getSshTcpForwardTransport,
+  getTlsServername,
+} from "../driverRuntimeConfig";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
 import type { DriverTimeoutSettingsProvider } from "./timeout";
 import type {
@@ -37,6 +42,8 @@ const MYSQL_ENTITY_MANIFEST: DriverEntityManifest = {
     triggers: "supported",
   },
 };
+
+type MysqlSslOptions = Exclude<PoolOptions["ssl"], string | undefined>;
 
 export function splitMySQLScript(sql: string): string[] {
   const stmts: string[] = [];
@@ -755,9 +762,21 @@ export class MySQLDriver extends BaseDBDriver {
       this.pool = null;
     }
     const sslEnabled = this.config.ssl ?? false;
+    const forwardedTransport = getSshTcpForwardTransport(this.config);
+    const ssl: MysqlSslOptions | undefined = sslEnabled
+      ? {
+          rejectUnauthorized: this.config.rejectUnauthorized ?? true,
+        }
+      : undefined;
+
+    if (ssl && this.config.rejectUnauthorized !== false) {
+      (ssl as MysqlSslOptions & { servername?: string }).servername =
+        getTlsServername(this.config);
+    }
+
     this.pool = mysql.createPool({
-      host: this.config.host,
-      port: this.config.port,
+      host: forwardedTransport?.localHost ?? this.config.host,
+      port: forwardedTransport?.localPort ?? this.config.port,
       database: this.config.database,
       user: this.config.username,
       password: this.config.password,
@@ -769,11 +788,7 @@ export class MySQLDriver extends BaseDBDriver {
       decimalNumbers: false,
       bigNumberStrings: true,
       supportBigNumbers: true,
-      ssl: sslEnabled
-        ? {
-            rejectUnauthorized: this.config.rejectUnauthorized ?? true,
-          }
-        : undefined,
+      ssl,
     });
     const conn = await this.pool.getConnection();
     conn.release();

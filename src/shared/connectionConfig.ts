@@ -1,5 +1,8 @@
 import type { ConnectionType } from "./connectionTypes";
 
+export type ConnectionSshAuthMethod = "password" | "privateKey";
+export type ConnectionSshHostVerificationMode = "manual" | "trustOnFirstUse";
+
 export interface ConnectionConfig {
   id: string;
   name: string;
@@ -35,5 +38,15 @@ export interface ConnectionConfig {
   awsSecretAccessKey?: string;
   awsSessionToken?: string;
   awsEndpoint?: string;
+  sshEnabled?: boolean;
+  sshHost?: string;
+  sshPort?: number;
+  sshUsername?: string;
+  sshAuthMethod?: ConnectionSshAuthMethod;
+  sshHostVerificationMode?: ConnectionSshHostVerificationMode;
+  sshPassword?: string;
+  sshPrivateKey?: string;
+  sshPassphrase?: string;
+  sshHostFingerprintSha256?: string;
   useSecretStorage?: boolean;
 }

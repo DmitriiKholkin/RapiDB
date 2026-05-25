@@ -6,6 +6,7 @@ import {
   parseConnectionFormPanelMessage,
 } from "../../shared/webviewContracts";
 import type { ConnectionConfig, ConnectionManager } from "../connectionManager";
+import { sanitizePersistedConnectionConfig } from "../connectionSecrets";
 import { ConnectionValidationService } from "../services/connectionValidationService";
 import {
   logErrorWithContext,
@@ -22,6 +23,11 @@ type StoredConnectionSecrets = {
   awsSessionToken?: string;
   connectionUri?: string;
   uri?: string;
+  endpoint?: string;
+  awsEndpoint?: string;
+  sshPassword?: string;
+  sshPrivateKey?: string;
+  sshPassphrase?: string;
 };
 
 const CONNECTION_FORM_RETENTION_MODE = "rehydrate" as const;
@@ -72,6 +78,42 @@ function resolvePersistedUriSecret(
   return previousRedacted === normalizedCurrent ? previousSecret : undefined;
 }
 
+function sanitizeUriForForm(value: string | undefined): string | undefined {
+  const normalized = trimOptionalSecret(value);
+  if (!normalized) {
+    return normalized;
+  }
+
+  return redactCredentialBearingUri(normalized);
+}
+
+function restoreSubmittedUriValue(
+  submittedValue: string | undefined,
+  storedValue: string | undefined,
+  existingValue: string | undefined,
+): string | undefined {
+  const normalizedSubmitted = trimOptionalSecret(submittedValue);
+  if (!normalizedSubmitted) {
+    return normalizedSubmitted;
+  }
+
+  for (const candidate of [storedValue, existingValue]) {
+    const normalizedCandidate = trimOptionalSecret(candidate);
+    if (!normalizedCandidate) {
+      continue;
+    }
+
+    if (
+      extractCredentialBearingUriSecret(normalizedCandidate) !== undefined &&
+      sanitizeUriForForm(normalizedCandidate) === normalizedSubmitted
+    ) {
+      return normalizedCandidate;
+    }
+  }
+
+  return normalizedSubmitted;
+}
+
 function parseStoredConnectionSecrets(
   value: string | undefined,
 ): StoredConnectionSecrets {
@@ -103,6 +145,24 @@ function parseStoredConnectionSecrets(
             ? parsed.connectionUri
             : undefined,
         uri: typeof parsed.uri === "string" ? parsed.uri : undefined,
+        endpoint:
+          typeof parsed.endpoint === "string" ? parsed.endpoint : undefined,
+        awsEndpoint:
+          typeof parsed.awsEndpoint === "string"
+            ? parsed.awsEndpoint
+            : undefined,
+        sshPassword:
+          typeof parsed.sshPassword === "string"
+            ? parsed.sshPassword
+            : undefined,
+        sshPrivateKey:
+          typeof parsed.sshPrivateKey === "string"
+            ? parsed.sshPrivateKey
+            : undefined,
+        sshPassphrase:
+          typeof parsed.sshPassphrase === "string"
+            ? parsed.sshPassphrase
+            : undefined,
       };
     }
   } catch {}
@@ -124,10 +184,58 @@ function serializeStoredConnectionSecrets(
 
 function shouldUseSecretStorage(payload: ConnectionFormSubmission): boolean {
   return (
+    payload.sshEnabled === true ||
     payload.type === "dynamodb" ||
     payload.type === "elasticsearch" ||
-    payload.useSecretStorage === true
+    payload.useSecretStorage === true ||
+    trimOptionalSecret(payload.password) !== undefined ||
+    trimOptionalSecret(payload.apiKey) !== undefined ||
+    trimOptionalSecret(payload.awsAccessKeyId) !== undefined ||
+    trimOptionalSecret(payload.awsSecretAccessKey) !== undefined ||
+    trimOptionalSecret(payload.awsSessionToken) !== undefined ||
+    trimOptionalSecret(payload.sshPassword) !== undefined ||
+    trimOptionalSecret(payload.sshPrivateKey) !== undefined ||
+    trimOptionalSecret(payload.sshPassphrase) !== undefined ||
+    extractCredentialBearingUriSecret(payload.connectionUri) !== undefined ||
+    extractCredentialBearingUriSecret(payload.uri) !== undefined ||
+    extractCredentialBearingUriSecret(payload.endpoint) !== undefined ||
+    extractCredentialBearingUriSecret(payload.awsEndpoint) !== undefined
   );
+}
+
+function sanitizeExistingForForm(
+  existing: ConnectionConfig,
+  storedSecrets: StoredConnectionSecrets,
+): ConnectionFormExistingState {
+  const {
+    password: _password,
+    apiKey: _apiKey,
+    awsAccessKeyId: _awsAccessKeyId,
+    awsSecretAccessKey: _awsSecretAccessKey,
+    awsSessionToken: _awsSessionToken,
+    sshPassword: _sshPassword,
+    sshPrivateKey: _sshPrivateKey,
+    sshPassphrase: _sshPassphrase,
+    connectionUri,
+    uri,
+    endpoint,
+    awsEndpoint,
+    ...rest
+  } = existing;
+
+  return {
+    ...rest,
+    connectionUri: sanitizeUriForForm(connectionUri),
+    uri: sanitizeUriForForm(uri),
+    endpoint: sanitizeUriForForm(endpoint),
+    awsEndpoint: sanitizeUriForForm(awsEndpoint),
+    hasStoredSecret: storedSecrets.password !== undefined || undefined,
+    hasStoredSshPassword: storedSecrets.sshPassword !== undefined || undefined,
+    hasStoredSshPrivateKey:
+      storedSecrets.sshPrivateKey !== undefined || undefined,
+    hasStoredSshPassphrase:
+      storedSecrets.sshPassphrase !== undefined || undefined,
+  };
 }
 
 export class ConnectionFormPanel {
@@ -183,19 +291,16 @@ export class ConnectionFormPanel {
 
     let existingForForm: ConnectionFormExistingState | undefined;
     if (existing) {
-      let hasStoredSecret = false;
-      if (existing.useSecretStorage && existing.id) {
+      let storedSecrets: StoredConnectionSecrets = {};
+      if (existing.id) {
         try {
-          hasStoredSecret =
-            (await context.secrets.get(existing.id)) !== undefined;
+          storedSecrets = parseStoredConnectionSecrets(
+            await context.secrets.get(existing.id),
+          );
         } catch {}
       }
 
-      const { password: _password, ...rest } = existing;
-      existingForForm = {
-        ...rest,
-        hasStoredSecret: hasStoredSecret || undefined,
-      };
+      existingForForm = sanitizeExistingForForm(existing, storedSecrets);
     }
 
     const panel = vscode.window.createWebviewPanel(
@@ -220,15 +325,13 @@ export class ConnectionFormPanel {
   private async resolveSubmittedPassword(
     payload: ConnectionFormSubmission,
     storedSecrets: StoredConnectionSecrets,
+    useSecretStorage: boolean,
   ): Promise<string> {
     if (payload.password !== undefined && payload.password !== "") {
       return payload.password;
     }
 
-    if (
-      shouldUseSecretStorage(payload) &&
-      storedSecrets.password !== undefined
-    ) {
+    if (useSecretStorage && storedSecrets.password !== undefined) {
       return storedSecrets.password;
     }
 
@@ -238,6 +341,18 @@ export class ConnectionFormPanel {
 
     const existing = this.connectionManager.getConnection(payload.id);
     return existing?.password ?? payload.password ?? "";
+  }
+
+  private resolveSubmittedSecret(
+    submittedValue: string | undefined,
+    storedValue: string | undefined,
+    existingValue: string | undefined,
+  ): string | undefined {
+    return (
+      trimOptionalSecret(submittedValue) ??
+      storedValue ??
+      trimOptionalSecret(existingValue)
+    );
   }
 
   private async loadStoredSecrets(
@@ -324,16 +439,81 @@ export class ConnectionFormPanel {
     payload: ConnectionFormSubmission,
   ): Promise<ConnectionConfig> {
     const storedSecrets = await this.loadStoredSecrets(payload.id);
+    const existing = this.connectionManager.getConnection(payload.id);
+    const useSecretStorage =
+      shouldUseSecretStorage(payload) ||
+      storedSecrets.connectionUri !== undefined ||
+      storedSecrets.uri !== undefined ||
+      storedSecrets.endpoint !== undefined ||
+      storedSecrets.awsEndpoint !== undefined ||
+      extractCredentialBearingUriSecret(existing?.connectionUri) !==
+        undefined ||
+      extractCredentialBearingUriSecret(existing?.uri) !== undefined ||
+      extractCredentialBearingUriSecret(existing?.endpoint) !== undefined ||
+      extractCredentialBearingUriSecret(existing?.awsEndpoint) !== undefined;
     const password = await this.resolveSubmittedPassword(
       payload,
       storedSecrets,
+      useSecretStorage,
     );
-    const { hasStoredSecret: _hasStoredSecret, ...rest } = payload;
-    const existing = this.connectionManager.getConnection(payload.id);
-    const useSecretStorage = shouldUseSecretStorage(payload);
+    const {
+      hasStoredSecret: _hasStoredSecret,
+      hasStoredSshPassword: _hasStoredSshPassword,
+      hasStoredSshPrivateKey: _hasStoredSshPrivateKey,
+      hasStoredSshPassphrase: _hasStoredSshPassphrase,
+      connectionUri: submittedConnectionUri,
+      uri: submittedUri,
+      endpoint: submittedEndpoint,
+      awsEndpoint: submittedAwsEndpoint,
+      ...rest
+    } = payload;
+    const sshPassword =
+      payload.sshEnabled === true && payload.sshAuthMethod === "password"
+        ? this.resolveSubmittedSecret(
+            payload.sshPassword,
+            useSecretStorage ? storedSecrets.sshPassword : undefined,
+            existing?.sshPassword,
+          )
+        : undefined;
+    const sshPrivateKey =
+      payload.sshEnabled === true && payload.sshAuthMethod === "privateKey"
+        ? this.resolveSubmittedSecret(
+            payload.sshPrivateKey,
+            useSecretStorage ? storedSecrets.sshPrivateKey : undefined,
+            existing?.sshPrivateKey,
+          )
+        : undefined;
+    const sshPassphrase =
+      payload.sshEnabled === true && payload.sshAuthMethod === "privateKey"
+        ? this.resolveSubmittedSecret(
+            payload.sshPassphrase,
+            useSecretStorage ? storedSecrets.sshPassphrase : undefined,
+            existing?.sshPassphrase,
+          )
+        : undefined;
     return {
       ...rest,
       useSecretStorage,
+      connectionUri: restoreSubmittedUriValue(
+        submittedConnectionUri,
+        storedSecrets.connectionUri,
+        existing?.connectionUri,
+      ),
+      uri: restoreSubmittedUriValue(
+        submittedUri,
+        storedSecrets.uri,
+        existing?.uri,
+      ),
+      endpoint: restoreSubmittedUriValue(
+        submittedEndpoint,
+        storedSecrets.endpoint,
+        existing?.endpoint,
+      ),
+      awsEndpoint: restoreSubmittedUriValue(
+        submittedAwsEndpoint,
+        storedSecrets.awsEndpoint,
+        existing?.awsEndpoint,
+      ),
       password,
       apiKey:
         trimOptionalSecret(payload.apiKey) ??
@@ -351,6 +531,9 @@ export class ConnectionFormPanel {
         trimOptionalSecret(payload.awsSessionToken) ??
         (useSecretStorage ? storedSecrets.awsSessionToken : undefined) ??
         existing?.awsSessionToken,
+      sshPassword,
+      sshPrivateKey,
+      sshPassphrase,
     };
   }
 
@@ -432,6 +615,26 @@ export class ConnectionFormPanel {
               raw.uri,
               previousSecretSnapshot.parsed.uri,
             ),
+            endpoint: resolvePersistedUriSecret(
+              raw.endpoint,
+              previousSecretSnapshot.parsed.endpoint,
+            ),
+            awsEndpoint: resolvePersistedUriSecret(
+              raw.awsEndpoint,
+              previousSecretSnapshot.parsed.awsEndpoint,
+            ),
+            sshPassword:
+              raw.sshEnabled === true && raw.sshAuthMethod === "password"
+                ? trimOptionalSecret(raw.sshPassword)
+                : undefined,
+            sshPrivateKey:
+              raw.sshEnabled === true && raw.sshAuthMethod === "privateKey"
+                ? trimOptionalSecret(raw.sshPrivateKey)
+                : undefined,
+            sshPassphrase:
+              raw.sshEnabled === true && raw.sshAuthMethod === "privateKey"
+                ? trimOptionalSecret(raw.sshPassphrase)
+                : undefined,
           });
           const secretMutationNeeded =
             nextSecrets !== normalizedPreviousSecretSnapshot;
@@ -457,18 +660,8 @@ export class ConnectionFormPanel {
             nextSecretSnapshot: nextSecrets,
           };
           try {
-            const {
-              password: _pw,
-              apiKey: _apiKey,
-              awsAccessKeyId: _awsAccessKeyId,
-              awsSecretAccessKey: _awsSecretAccessKey,
-              awsSessionToken: _awsSessionToken,
-              ...configWithoutSecrets
-            } = raw;
-            const config = configWithoutSecrets as ConnectionConfig;
-
             await this.commitSecretUpdateTransaction(transaction, async () => {
-              await this.connectionManager.saveConnection(config);
+              await this.connectionManager.saveConnection(raw);
             });
           } catch (err: unknown) {
             const error = normalizeUnknownError(err);
@@ -481,16 +674,7 @@ export class ConnectionFormPanel {
             });
             return;
           }
-          const {
-            password: _pw,
-            apiKey: _apiKey,
-            awsAccessKeyId: _awsAccessKeyId,
-            awsSecretAccessKey: _awsSecretAccessKey,
-            awsSessionToken: _awsSessionToken,
-            ...configWithoutSecrets
-          } = raw;
-          const config = configWithoutSecrets as ConnectionConfig;
-          this.resolveFn?.(config);
+          this.resolveFn?.(sanitizePersistedConnectionConfig(raw));
         } else {
           await this.connectionManager.saveConnection(raw);
           if (previousSecretSnapshot.serialized !== undefined) {

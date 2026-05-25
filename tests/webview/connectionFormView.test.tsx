@@ -75,6 +75,79 @@ describe("ConnectionFormView", () => {
     expect(screen.getByLabelText("DynamoDB endpoint")).toBeTruthy();
   });
 
+  it("renders SSH controls conditionally, forces Secret Storage, and hides SSH for SQLite", async () => {
+    const user = userEvent.setup();
+
+    const { container } = render(<ConnectionFormView existing={null} />);
+
+    const sshToggle = screen.getByRole("switch", {
+      name: /connect through ssh bastion/i,
+    });
+
+    expect(sshToggle.getAttribute("aria-checked")).toBe("false");
+    expect(screen.queryByLabelText("SSH host")).toBeNull();
+
+    await user.click(sshToggle);
+
+    expect(sshToggle.getAttribute("aria-checked")).toBe("true");
+    expect(screen.getByLabelText("SSH host")).toBeTruthy();
+    expect(screen.getByLabelText("SSH port")).toBeTruthy();
+    expect(screen.getByLabelText("SSH username")).toBeTruthy();
+    expect(screen.getByLabelText("SSH auth method")).toBeTruthy();
+    expect(screen.getByLabelText("SSH host verification mode")).toBeTruthy();
+    expect(screen.getByLabelText("SSH private key")).toBeTruthy();
+    expect(screen.getByLabelText("SSH passphrase")).toBeTruthy();
+    expect(screen.getByLabelText("SSH host fingerprint SHA256")).toBeTruthy();
+
+    await user.selectOptions(
+      screen.getByLabelText("SSH host verification mode"),
+      ["trustOnFirstUse"],
+    );
+
+    expect(screen.queryByLabelText("SSH host fingerprint SHA256")).toBeNull();
+    expect(
+      screen.getByText(
+        /first successful ssh handshake will pin the discovered sha256 fingerprint automatically/i,
+      ),
+    ).toBeTruthy();
+
+    await user.selectOptions(
+      screen.getByLabelText("SSH host verification mode"),
+      ["manual"],
+    );
+
+    await user.selectOptions(screen.getByLabelText("SSH auth method"), [
+      "password",
+    ]);
+
+    expect(screen.getByLabelText("SSH password")).toBeTruthy();
+    expect(screen.queryByLabelText("SSH private key")).toBeNull();
+    expect(screen.queryByLabelText("SSH passphrase")).toBeNull();
+
+    const secretStorageToggle = screen.getByRole("switch", {
+      name: /store secrets in vs code secret storage/i,
+    });
+    expect(secretStorageToggle.getAttribute("aria-disabled")).toBe("true");
+    expect(secretStorageToggle.getAttribute("aria-checked")).toBe("true");
+
+    await user.click(screen.getByRole("button", { name: /sqlite/i }));
+
+    expect(
+      screen.queryByRole("switch", {
+        name: /connect through ssh bastion/i,
+      }),
+    ).toBeNull();
+    expect(screen.queryByLabelText("SSH host")).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: /mongodb/i }));
+
+    expect(
+      screen.getByText(/single-host direct connections in v1/i),
+    ).toBeTruthy();
+
+    await expectNoAxeViolations(container);
+  });
+
   it("associates the read-only toggle with its explanatory hint", () => {
     render(<ConnectionFormView existing={null} />);
 
@@ -199,6 +272,152 @@ describe("ConnectionFormView", () => {
       }),
     });
     expect(dynamoMessage?.payload).not.toHaveProperty("awsEndpoint");
+  });
+
+  it("posts SSH password payloads with forced Secret Storage", async () => {
+    const user = userEvent.setup();
+
+    render(<ConnectionFormView existing={null} />);
+
+    await user.clear(screen.getByLabelText("Connection name"));
+    await user.type(screen.getByLabelText("Connection name"), "PG SSH");
+    await user.click(
+      screen.getByRole("switch", { name: /connect through ssh bastion/i }),
+    );
+    await user.type(screen.getByLabelText("SSH host"), "bastion.example.com");
+    await user.clear(screen.getByLabelText("SSH port"));
+    await user.type(screen.getByLabelText("SSH port"), "22");
+    await user.type(screen.getByLabelText("SSH username"), "tunnel");
+    await user.selectOptions(screen.getByLabelText("SSH auth method"), [
+      "password",
+    ]);
+    await user.selectOptions(
+      screen.getByLabelText("SSH host verification mode"),
+      ["manual"],
+    );
+    await user.type(screen.getByLabelText("SSH password"), "ssh-secret");
+    await user.type(
+      screen.getByLabelText("SSH host fingerprint SHA256"),
+      "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+    );
+
+    clearPostedMessages();
+    await submitCreateConnection(user);
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "saveConnection",
+      payload: expect.objectContaining({
+        type: "pg",
+        useSecretStorage: true,
+        sshEnabled: true,
+        sshHost: "bastion.example.com",
+        sshPort: 22,
+        sshUsername: "tunnel",
+        sshAuthMethod: "password",
+        sshHostVerificationMode: "manual",
+        sshPassword: "ssh-secret",
+        sshHostFingerprintSha256:
+          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      }),
+    });
+  });
+
+  it("posts trust-on-first-use SSH payloads without a manual fingerprint", async () => {
+    const user = userEvent.setup();
+
+    render(<ConnectionFormView existing={null} />);
+
+    await user.clear(screen.getByLabelText("Connection name"));
+    await user.type(screen.getByLabelText("Connection name"), "PG SSH TOFU");
+    await user.click(
+      screen.getByRole("switch", { name: /connect through ssh bastion/i }),
+    );
+    await user.type(screen.getByLabelText("SSH host"), "bastion.example.com");
+    await user.clear(screen.getByLabelText("SSH port"));
+    await user.type(screen.getByLabelText("SSH port"), "22");
+    await user.type(screen.getByLabelText("SSH username"), "tunnel");
+    await user.selectOptions(screen.getByLabelText("SSH auth method"), [
+      "password",
+    ]);
+    await user.selectOptions(
+      screen.getByLabelText("SSH host verification mode"),
+      ["trustOnFirstUse"],
+    );
+    await user.type(screen.getByLabelText("SSH password"), "ssh-secret");
+
+    clearPostedMessages();
+    await submitCreateConnection(user);
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "saveConnection",
+      payload: expect.objectContaining({
+        type: "pg",
+        useSecretStorage: true,
+        sshEnabled: true,
+        sshHost: "bastion.example.com",
+        sshPort: 22,
+        sshUsername: "tunnel",
+        sshAuthMethod: "password",
+        sshHostVerificationMode: "trustOnFirstUse",
+        sshPassword: "ssh-secret",
+        sshHostFingerprintSha256: undefined,
+      }),
+    });
+  });
+
+  it("keeps stored SSH private-key flags when edit fields stay blank", async () => {
+    const user = userEvent.setup();
+    const existing = {
+      id: "conn-ssh",
+      name: "PG SSH",
+      type: "pg" as const,
+      host: "db.internal",
+      port: 5432,
+      database: "app",
+      username: "postgres",
+      sshEnabled: true,
+      sshHost: "bastion.example.com",
+      sshPort: 22,
+      sshUsername: "tunnel",
+      sshAuthMethod: "privateKey" as const,
+      sshHostVerificationMode: "manual" as const,
+      sshHostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      useSecretStorage: true,
+      hasStoredSshPrivateKey: true,
+      hasStoredSshPassphrase: true,
+    };
+
+    render(<ConnectionFormView existing={existing} />);
+
+    expect(
+      screen.getByText(/keep the stored SSH private key unchanged/i),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/keep the stored SSH passphrase unchanged/i),
+    ).toBeTruthy();
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "saveConnection",
+      payload: expect.objectContaining({
+        id: "conn-ssh",
+        useSecretStorage: true,
+        sshEnabled: true,
+        sshAuthMethod: "privateKey",
+        sshHostVerificationMode: "manual",
+        sshHost: "bastion.example.com",
+        sshPort: 22,
+        sshUsername: "tunnel",
+        sshHostFingerprintSha256:
+          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        hasStoredSshPrivateKey: true,
+        hasStoredSshPassphrase: true,
+        sshPrivateKey: "",
+        sshPassphrase: "",
+      }),
+    });
   });
 
   it("rejects invalid Redis DB input instead of coercing it to 0", async () => {
@@ -353,5 +572,59 @@ describe("ConnectionFormView", () => {
         readOnly: false,
       }),
     });
+  });
+
+  it("does not prefill secret edit fields from existing state", async () => {
+    const user = userEvent.setup();
+
+    const elasticView = render(
+      <ConnectionFormView
+        existing={{
+          id: "conn-es",
+          name: "Elastic",
+          type: "elasticsearch",
+          endpoint: "https://cluster.example.com",
+          apiKey: "inline-api-key",
+          useSecretStorage: true,
+          hasStoredSecret: true,
+        }}
+      />,
+    );
+
+    expect(
+      (screen.getByLabelText("Elasticsearch API key") as HTMLInputElement)
+        .value,
+    ).toBe("");
+
+    elasticView.unmount();
+
+    render(
+      <ConnectionFormView
+        existing={{
+          id: "conn-ddb",
+          name: "Dynamo",
+          type: "dynamodb",
+          awsRegion: "us-east-1",
+          awsAccessKeyId: "AKIA123",
+          awsSecretAccessKey: "secret-key",
+          awsSessionToken: "session-token",
+          endpoint: "http://localhost:8000",
+          useSecretStorage: true,
+        }}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: /dynamodb/i }));
+
+    expect(
+      (screen.getByLabelText("AWS access key id") as HTMLInputElement).value,
+    ).toBe("");
+    expect(
+      (screen.getByLabelText("AWS secret access key") as HTMLInputElement)
+        .value,
+    ).toBe("");
+    expect(
+      (screen.getByLabelText("AWS session token") as HTMLInputElement).value,
+    ).toBe("");
   });
 });

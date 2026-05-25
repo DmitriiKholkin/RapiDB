@@ -2,6 +2,10 @@ import { Pool, types as pgTypes } from "pg";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { ConnectionConfig } from "../connectionManager";
 import {
+  getSshTcpForwardTransport,
+  getTlsServername,
+} from "../driverRuntimeConfig";
+import {
   BaseDBDriver,
   formatDatetimeForDisplay,
   isoToLocalDateStr,
@@ -215,10 +219,11 @@ export class PostgresDriver extends BaseDBDriver {
   }
   private createPool(database: string): Pool {
     const sslEnabled = this.config.ssl ?? false;
+    const forwardedTransport = getSshTcpForwardTransport(this.config);
     const dbOperationTimeoutMs = this.getDbOperationTimeoutMs();
     return new Pool({
-      host: this.config.host,
-      port: this.config.port,
+      host: forwardedTransport?.localHost ?? this.config.host,
+      port: forwardedTransport?.localPort ?? this.config.port,
       database,
       user: this.config.username,
       password: this.config.password,
@@ -232,6 +237,10 @@ export class PostgresDriver extends BaseDBDriver {
       ssl: sslEnabled
         ? {
             rejectUnauthorized: this.config.rejectUnauthorized ?? true,
+            servername:
+              this.config.rejectUnauthorized !== false
+                ? getTlsServername(this.config)
+                : undefined,
           }
         : undefined,
     });

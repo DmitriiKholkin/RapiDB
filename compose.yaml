@@ -1,6 +1,17 @@
 services:
 
   # ─────────────────────────────────────────────
+  # SSH Bastion
+  # ─────────────────────────────────────────────
+
+  ssh-bastion:
+    build:
+      context: ./tests/docker/ssh-bastion
+    container_name: rapidb-ssh-bastion
+    ports:
+      - "2222:22"
+
+  # ─────────────────────────────────────────────
   # PostgreSQL 15
   # ─────────────────────────────────────────────
 
