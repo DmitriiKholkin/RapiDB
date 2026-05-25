@@ -1,7 +1,7 @@
 {
   "name": "rapidb",
   "displayName": "RapiDB",
-  "description": "Database management tool inside VSCode — PostgreSQL, MSSQL, MySQL/MariaDB, SQLite, Oracle",
+  "description": "Free database management tool inside VSCode",
   "version": "0.1.6",
   "publisher": "DmitriiKholkin",
   "repository": {
@@ -29,6 +29,10 @@
     "mariadb",
     "oracle",
     "oracledb",
+    "redis",
+    "mongodb",
+    "elasticsearch",
+    "dynamodb",
     "query",
     "data",
     "explorer",

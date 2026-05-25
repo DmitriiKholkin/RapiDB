@@ -10,7 +10,6 @@
 # RapiDB — Database Client for VS Code
 
 ### PostgreSQL · MSSQL · MySQL · MariaDB · SQLite · Oracle
-### ALSO EXPERIMENTAL SUPPORT FOR
 ### Redis · MongoDB · Elasticsearch · DynamoDB
 #### All in one place. Never leaving your editor.
 
