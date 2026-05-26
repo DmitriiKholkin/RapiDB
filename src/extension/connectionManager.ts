@@ -730,6 +730,9 @@ export class ConnectionManager
   getQueryRowLimit(): number {
     return this.store.getQueryRowLimit();
   }
+  getSkipTableMutationPreview(): boolean {
+    return this.store.getSkipTableMutationPreview();
+  }
   private async _trimHistoryToLimit(): Promise<void> {
     const limit = this.getHistoryLimit();
     const all = this.store.readHistory();

@@ -42,6 +42,7 @@ export interface ConnectionManagerStore {
   getHistoryLimit(): number;
   getDefaultPageSize(): number;
   getQueryRowLimit(): number;
+  getSkipTableMutationPreview(): boolean;
   getTimeoutSettings(): DriverTimeoutSettingsSnapshot;
 }
 
@@ -172,6 +173,14 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
       .getConfiguration("rapidb")
       .get<number>("queryRowLimit", 1000);
     return Math.max(100, Math.min(QUERY_LIMIT_POLICY.hardCap, Math.round(raw)));
+  }
+
+  getSkipTableMutationPreview(): boolean {
+    return (
+      vscode.workspace
+        .getConfiguration("rapidb")
+        .get<boolean>("skipTableMutationPreview", false) === true
+    );
   }
 
   getTimeoutSettings(): DriverTimeoutSettingsSnapshot {

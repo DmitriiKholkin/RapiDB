@@ -20,6 +20,15 @@ const prepareDeleteRowsPlanMock = vi.hoisted(() =>
     ) => Promise<unknown | null>
   >(async () => null),
 );
+const prepareInsertRowMock = vi.hoisted(() =>
+  vi.fn<() => Promise<unknown | null>>(async () => null),
+);
+const prepareApplyChangesPlanMock = vi.hoisted(() => vi.fn());
+const confirmMutationPreviewMock = vi.hoisted(() =>
+  vi.fn<() => Promise<unknown | null>>(async () => null),
+);
+const createApplyChangesPreviewMock = vi.hoisted(() => vi.fn());
+const createInsertPreviewMock = vi.hoisted(() => vi.fn());
 const createDeleteRowsPreviewMock = vi.hoisted(() => vi.fn());
 const createWebviewShellMock = vi.hoisted(() => vi.fn(() => "<html></html>"));
 
@@ -112,19 +121,20 @@ vi.mock("../../src/extension/tableDataService", () => ({
   TableDataService: class {
     getColumns = getColumnsMock;
     getPage = getPageMock;
+    prepareInsertRow = prepareInsertRowMock;
     prepareDeleteRowsPlan = prepareDeleteRowsPlanMock;
     clearForConnection = vi.fn();
   },
-  prepareApplyChangesPlan: vi.fn(),
+  prepareApplyChangesPlan: prepareApplyChangesPlanMock,
 }));
 
 vi.mock("../../src/extension/panels/tableMutationPreviewController", () => ({
   TableMutationPreviewController: class {
     clear = vi.fn();
-    confirm = vi.fn(async () => null);
+    confirm = confirmMutationPreviewMock;
     cancel = vi.fn();
-    createApplyChangesPreview = vi.fn();
-    createInsertPreview = vi.fn();
+    createApplyChangesPreview = createApplyChangesPreviewMock;
+    createInsertPreview = createInsertPreviewMock;
     createDeleteRowsPreview = createDeleteRowsPreviewMock;
   },
 }));
@@ -140,8 +150,29 @@ describe("TablePanel", () => {
     getColumnsMock.mockReset();
     getColumnsMock.mockResolvedValue([]);
     getPageMock.mockClear();
+    prepareInsertRowMock.mockReset();
+    prepareInsertRowMock.mockResolvedValue(null);
+    prepareApplyChangesPlanMock.mockReset();
+    confirmMutationPreviewMock.mockReset();
+    confirmMutationPreviewMock.mockResolvedValue(null);
+    createApplyChangesPreviewMock.mockReset();
+    createInsertPreviewMock.mockReset();
     prepareDeleteRowsPlanMock.mockReset();
     prepareDeleteRowsPlanMock.mockResolvedValue(null);
+    createApplyChangesPreviewMock.mockReturnValue({
+      previewToken: "apply-preview-token",
+      kind: "applyChanges",
+      title: "Apply changes to users",
+      sql: "UPDATE users SET name = 'Ada' WHERE id = 1;",
+      statementCount: 1,
+    });
+    createInsertPreviewMock.mockReturnValue({
+      previewToken: "insert-preview-token",
+      kind: "insertRow",
+      title: "Insert row into users",
+      sql: "INSERT INTO users (id) VALUES (1);",
+      statementCount: 1,
+    });
     createDeleteRowsPreviewMock.mockReset();
     createDeleteRowsPreviewMock.mockReturnValue({
       previewToken: "preview-token",
@@ -498,6 +529,174 @@ describe("TablePanel", () => {
     expect(panel.webview.postMessage).toHaveBeenCalledWith({
       type: "tableMutationPreview",
       payload: expect.objectContaining({ kind: "deleteRows" }),
+    });
+  });
+
+  it("executes deleteRows immediately when preview skipping is enabled", async () => {
+    const connectionManager = {
+      getConnection: vi.fn(() => ({ name: "Main" })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      getDefaultPageSize: vi.fn(() => 25),
+      getSkipTableMutationPreview: vi.fn(() => true),
+    };
+
+    prepareDeleteRowsPlanMock.mockResolvedValueOnce({
+      connectionId: "conn-1",
+      database: "db1",
+      schema: "public",
+      table: "users",
+      executionMode: "sequential",
+      operations: [{ sql: "DELETE FROM users WHERE id = ?", params: [1] }],
+      previewStatements: ["DELETE FROM users WHERE id = 1"],
+      verificationCriteriaList: [{ id: 1 }],
+    });
+    confirmMutationPreviewMock.mockResolvedValueOnce({
+      type: "deleteResult",
+      payload: { success: true },
+    });
+
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      "db1",
+      "public",
+      "users",
+    );
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected table panel instance");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "deleteRows",
+      payload: { primaryKeysList: [{ id: 1 }] },
+    });
+
+    expect(confirmMutationPreviewMock).toHaveBeenCalledWith("preview-token");
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "deleteResult",
+      payload: { success: true },
+    });
+    expect(panel.webview.postMessage).not.toHaveBeenCalledWith({
+      type: "tableMutationPreview",
+      payload: expect.anything(),
+    });
+  });
+
+  it("executes insertRow immediately when preview skipping is enabled", async () => {
+    const connectionManager = {
+      getConnection: vi.fn(() => ({ name: "Main" })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      getDefaultPageSize: vi.fn(() => 25),
+      getSkipTableMutationPreview: vi.fn(() => true),
+    };
+
+    prepareInsertRowMock.mockResolvedValueOnce({
+      connectionId: "conn-1",
+      database: "db1",
+      schema: "public",
+      table: "users",
+      previewStatements: ["INSERT INTO users (id) VALUES (1)"],
+    });
+    confirmMutationPreviewMock.mockResolvedValueOnce({
+      type: "insertResult",
+      payload: { success: true },
+    });
+
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      "db1",
+      "public",
+      "users",
+    );
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected table panel instance");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "insertRow",
+      payload: { values: { id: 1 } },
+    });
+
+    expect(createInsertPreviewMock).toHaveBeenCalledOnce();
+    expect(confirmMutationPreviewMock).toHaveBeenCalledWith(
+      "insert-preview-token",
+    );
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "insertResult",
+      payload: { success: true },
+    });
+    expect(panel.webview.postMessage).not.toHaveBeenCalledWith({
+      type: "tableMutationPreview",
+      payload: expect.anything(),
+    });
+  });
+
+  it("executes applyChanges immediately when preview skipping is enabled", async () => {
+    const connectionManager = {
+      getConnection: vi.fn(() => ({ name: "Main" })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      getDefaultPageSize: vi.fn(() => 25),
+      getSkipTableMutationPreview: vi.fn(() => true),
+      getDriver: vi.fn(() => undefined),
+    };
+
+    prepareApplyChangesPlanMock.mockReturnValueOnce({
+      executable: true,
+      plan: {
+        operations: [{ sql: "UPDATE users SET name = ? WHERE id = ?" }],
+        previewStatements: ["UPDATE users SET name = 'Ada' WHERE id = 1"],
+        updates: [],
+        skippedRows: [],
+      },
+      result: {
+        success: true,
+        rowOutcomes: [],
+      },
+    });
+    confirmMutationPreviewMock.mockResolvedValueOnce({
+      type: "applyResult",
+      payload: { success: true, rowOutcomes: [] },
+    });
+
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      "db1",
+      "public",
+      "users",
+    );
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected table panel instance");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "applyChanges",
+      payload: {
+        updates: [{ primaryKeys: { id: 1 }, changes: { name: "Ada" } }],
+      },
+    });
+
+    expect(createApplyChangesPreviewMock).toHaveBeenCalledOnce();
+    expect(confirmMutationPreviewMock).toHaveBeenCalledWith(
+      "apply-preview-token",
+    );
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "applyResult",
+      payload: { success: true, rowOutcomes: [] },
+    });
+    expect(panel.webview.postMessage).not.toHaveBeenCalledWith({
+      type: "tableMutationPreview",
+      payload: expect.anything(),
     });
   });
 

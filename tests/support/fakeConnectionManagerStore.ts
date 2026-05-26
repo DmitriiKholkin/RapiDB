@@ -48,6 +48,7 @@ export class FakeConnectionManagerStore implements ConnectionManagerStore {
   private historyLimit = 100;
   private defaultPageSize = 25;
   private queryRowLimit = 1_000;
+  private skipTableMutationPreview = false;
   private timeoutSettings = createDriverTimeoutSettingsSnapshot();
 
   onDidChangeConfiguration(
@@ -129,6 +130,10 @@ export class FakeConnectionManagerStore implements ConnectionManagerStore {
     return this.queryRowLimit;
   }
 
+  getSkipTableMutationPreview(): boolean {
+    return this.skipTableMutationPreview;
+  }
+
   getTimeoutSettings(): DriverTimeoutSettingsSnapshot {
     return { ...this.timeoutSettings };
   }
@@ -159,6 +164,10 @@ export class FakeConnectionManagerStore implements ConnectionManagerStore {
 
   setQueryRowLimit(limit: number): void {
     this.queryRowLimit = limit;
+  }
+
+  setSkipTableMutationPreview(skip: boolean): void {
+    this.skipTableMutationPreview = skip;
   }
 
   setTimeoutSettings(settings: {

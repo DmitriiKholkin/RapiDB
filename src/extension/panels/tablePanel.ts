@@ -1,7 +1,10 @@
 import * as vscode from "vscode";
 import { getDbObjectKindDisplayLabel } from "../../shared/dbObjectKinds";
 import { coerceFilterExpressions } from "../../shared/tableTypes";
-import { parseTablePanelMessage } from "../../shared/webviewContracts";
+import {
+  parseTablePanelMessage,
+  type TableMutationPreviewPayload,
+} from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import type { ColumnTypeMeta, FilterExpression } from "../dbDrivers/types";
 import {
@@ -136,6 +139,30 @@ export class TablePanel {
 
   private postMessage(type: string, payload: unknown): Thenable<boolean> {
     return this.panel.webview.postMessage({ type, payload });
+  }
+
+  private shouldSkipTableMutationPreview(): boolean {
+    const managerWithPreviewSetting = this
+      .connectionManager as ConnectionManager & {
+      getSkipTableMutationPreview?: () => boolean;
+    };
+    return managerWithPreviewSetting.getSkipTableMutationPreview?.() === true;
+  }
+
+  private async presentOrExecuteMutationPreview(
+    preview: TableMutationPreviewPayload,
+  ): Promise<void> {
+    if (!this.shouldSkipTableMutationPreview()) {
+      await this.postMessage("tableMutationPreview", preview);
+      return;
+    }
+
+    const result = await this.previewController.confirm(preview.previewToken);
+    if (!result) {
+      return;
+    }
+
+    await this.postMessage(result.type, result.payload);
   }
 
   private isConnectionReadOnly(): boolean {
@@ -454,8 +481,7 @@ export class TablePanel {
         return;
       }
 
-      await this.postMessage(
-        "tableMutationPreview",
+      await this.presentOrExecuteMutationPreview(
         this.previewController.createApplyChangesPreview({
           apply: applyPlan,
           applyResultWhenEmpty: prepared.executable ? null : prepared.result,
@@ -480,8 +506,7 @@ export class TablePanel {
         this.table,
         values,
       );
-      await this.postMessage(
-        "tableMutationPreview",
+      await this.presentOrExecuteMutationPreview(
         this.previewController.createInsertPreview(plan),
       );
     } catch (err: unknown) {
@@ -511,8 +536,7 @@ export class TablePanel {
         return;
       }
 
-      await this.postMessage(
-        "tableMutationPreview",
+      await this.presentOrExecuteMutationPreview(
         this.previewController.createDeleteRowsPreview(plan),
       );
     } catch (err: unknown) {

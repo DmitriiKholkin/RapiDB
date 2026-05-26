@@ -262,6 +262,7 @@ export class ConnectionProvider
   private readonly _subscriptions: vscode.Disposable[] = [];
   private readonly _connectionNodes = new Map<string, RapiDBNode>();
   private readonly _expandedConnectionRoots = new Set<string>();
+  private readonly _connectionErrors = new Map<string, string>();
   private readonly _pendingConnectionRefreshIds = new Set<string>();
   private _refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private _refreshAllPending = false;
@@ -297,8 +298,12 @@ export class ConnectionProvider
       }, 50);
     };
     this._subscriptions.push(
-      connectionManager.onDidConnect(() => scheduleRefresh()),
+      connectionManager.onDidConnect(() => {
+        this._connectionErrors.clear();
+        scheduleRefresh();
+      }),
       connectionManager.onDidDisconnect((connectionId) => {
+        this._connectionErrors.delete(connectionId);
         this.markConnectionRootExpanded(connectionId, false);
         scheduleRefresh(connectionId);
       }),
@@ -547,14 +552,34 @@ export class ConnectionProvider
   private async getConnectionChildren(
     element: RapiDBNode,
   ): Promise<RapiDBNode[]> {
-    this.markConnectionRootExpanded(element.connectionId, true);
-
     if (!this.connectionManager.isConnected(element.connectionId)) {
+      const error = this._connectionErrors.get(element.connectionId);
+      if (error) {
+        return this.makeErrorNodes(element.connectionId, error);
+      }
+
       const attempt = this.connectionManager.beginConnect?.(
         element.connectionId,
       );
       if (attempt) {
-        void attempt.promise.catch(() => undefined);
+        void attempt.promise
+          .then(() => {
+            this._connectionErrors.delete(element.connectionId);
+          })
+          .catch((err) => {
+            this._connectionErrors.set(
+              element.connectionId,
+              err instanceof Error ? err.message : String(err),
+            );
+            this.markConnectionRootExpanded(element.connectionId, false);
+            this.refreshConnectionTree(element.connectionId);
+          });
+      }
+
+      if (attempt?.isNew) {
+        queueMicrotask(() => {
+          this.refreshConnectionTree(element.connectionId);
+        });
       }
 
       if (
@@ -564,14 +589,11 @@ export class ConnectionProvider
         return [];
       }
 
-      if (attempt?.isNew) {
-        queueMicrotask(() => {
-          this.refreshConnectionTree(element.connectionId);
-        });
-      }
-
-      return [this.makeLoadingNode(element.connectionId, "Connecting...")];
+      this.markConnectionRootExpanded(element.connectionId, true);
+      return [];
     }
+
+    this.markConnectionRootExpanded(element.connectionId, true);
 
     const connectionType = this.getConnectionType(element.connectionId);
     const rootState = this.getSchemaState(element.connectionId, {

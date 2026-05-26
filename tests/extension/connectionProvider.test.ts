@@ -690,7 +690,7 @@ describe("ConnectionProvider", () => {
     vi.useRealTimers();
   });
 
-  it("starts connecting and shows a loading child when a disconnected connection expands", async () => {
+  it("starts connecting and defers child loading until after connect succeeds", async () => {
     let connected = false;
     const beginConnect = vi.fn(() => ({
       isNew: true,
@@ -735,9 +735,7 @@ describe("ConnectionProvider", () => {
     const children = await provider.getChildren(connectionNode);
 
     expect(beginConnect).toHaveBeenCalledWith("conn-1");
-    expect(children).toHaveLength(1);
-    expect(children[0]?.contextValue).toBe("_status");
-    expect(children[0]?.label).toBe("Connecting...");
+    expect(children).toHaveLength(0);
   });
 
   it("uses canonical database context values across connection types", async () => {

@@ -134,6 +134,46 @@ describe("VSCodeConnectionManagerStore", () => {
     expect(store.getQueryRowLimit()).toBe(100);
   });
 
+  it("reads skipTableMutationPreview from the rapidb configuration", async () => {
+    vi.resetModules();
+
+    vi.doMock("vscode", () => ({
+      workspace: {
+        getConfiguration: vi.fn(() => ({
+          get: vi.fn((section: string, fallback?: boolean) => {
+            if (section === "skipTableMutationPreview") {
+              return true;
+            }
+            return fallback;
+          }),
+          update: vi.fn(),
+        })),
+        onDidChangeConfiguration: vi.fn(),
+      },
+      ConfigurationTarget: {
+        Global: 1,
+      },
+    }));
+
+    const { VSCodeConnectionManagerStore } = await import(
+      "../../src/extension/connectionManagerStore"
+    );
+
+    const store = new VSCodeConnectionManagerStore({
+      globalState: {
+        get: vi.fn(),
+        update: vi.fn(),
+      },
+      secrets: {
+        get: vi.fn(),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    } as never);
+
+    expect(store.getSkipTableMutationPreview()).toBe(true);
+  });
+
   it("saves connections when revision matches current configuration", async () => {
     vi.resetModules();
 

@@ -651,6 +651,12 @@
           ],
           "description": "Default number of rows per page in the Table Data Viewer. Allowed values: 25, 100, 500, 1000. Any other value will be ignored and 25 will be used.",
           "scope": "application"
+        },
+        "rapidb.skipTableMutationPreview": {
+          "type": "boolean",
+          "default": false,
+          "description": "Apply insert, edit, and delete actions in the Table Data Viewer without opening the mutation preview dialog.",
+          "scope": "application"
         }
       }
     },
