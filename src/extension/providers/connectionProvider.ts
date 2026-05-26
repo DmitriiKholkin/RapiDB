@@ -366,7 +366,7 @@ export class ConnectionProvider
     const connectionIds = [...new Set(source.map((node) => node.connectionId))]
       .map((connectionId) => connectionId.trim())
       .filter(
-        (connectionId, index, ids) =>
+        (connectionId, _index, ids) =>
           connectionId.length > 0 &&
           ids.includes(connectionId) &&
           source.some(
@@ -388,7 +388,7 @@ export class ConnectionProvider
   async handleDrop(
     target: RapiDBNode | undefined,
     dataTransfer: vscode.DataTransfer,
-    token: vscode.CancellationToken,
+    _token: vscode.CancellationToken,
   ): Promise<void> {
     try {
       if (target && target.kind !== "folder") {

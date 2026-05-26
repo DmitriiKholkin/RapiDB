@@ -363,7 +363,7 @@ describe("ConnectionProvider", () => {
 
     const dropToken = {
       isCancellationRequested: false,
-      onCancellationRequested: vi.fn((listener: () => void) => ({
+      onCancellationRequested: vi.fn((_listener: () => void) => ({
         dispose: vi.fn(),
       })),
     } as never;
@@ -445,7 +445,7 @@ describe("ConnectionProvider", () => {
       { set: vi.fn() } as never,
       {
         isCancellationRequested: false,
-        onCancellationRequested: vi.fn((listener: () => void) => ({
+        onCancellationRequested: vi.fn((_listener: () => void) => ({
           dispose: vi.fn(),
         })),
       } as never,
@@ -465,7 +465,7 @@ describe("ConnectionProvider", () => {
       } as never,
       {
         isCancellationRequested: false,
-        onCancellationRequested: vi.fn((listener: () => void) => ({
+        onCancellationRequested: vi.fn((_listener: () => void) => ({
           dispose: vi.fn(),
         })),
       } as never,
@@ -511,7 +511,7 @@ describe("ConnectionProvider", () => {
       { set: vi.fn() } as never,
       {
         isCancellationRequested: false,
-        onCancellationRequested: vi.fn((listener: () => void) => ({
+        onCancellationRequested: vi.fn((_listener: () => void) => ({
           dispose: vi.fn(),
         })),
       } as never,
@@ -530,7 +530,7 @@ describe("ConnectionProvider", () => {
       } as never,
       {
         isCancellationRequested: false,
-        onCancellationRequested: vi.fn((listener: () => void) => ({
+        onCancellationRequested: vi.fn((_listener: () => void) => ({
           dispose: vi.fn(),
         })),
       } as never,
