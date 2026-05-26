@@ -49,4 +49,5 @@ export interface ConnectionConfig {
   sshPassphrase?: string;
   sshHostFingerprintSha256?: string;
   useSecretStorage?: boolean;
+  color?: string;
 }

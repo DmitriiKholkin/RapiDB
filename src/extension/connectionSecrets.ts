@@ -205,6 +205,7 @@ export function hasPersistedConnectionConfigChanges(
 ): boolean {
   return (
     persisted.useSecretStorage !== original.useSecretStorage ||
+    persisted.color !== original.color ||
     persisted.password !== original.password ||
     persisted.apiKey !== original.apiKey ||
     persisted.awsAccessKeyId !== original.awsAccessKeyId ||

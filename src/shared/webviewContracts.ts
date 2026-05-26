@@ -495,6 +495,7 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
       "sshHostFingerprintSha256",
     ),
     useSecretStorage: readOptionalBoolean(input, "useSecretStorage"),
+    color: readOptionalString(input, "color"),
   };
 }
 
