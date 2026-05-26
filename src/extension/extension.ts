@@ -13,6 +13,7 @@ import type {
 import { ConnectionManager } from "./connectionManager";
 import {
   confirmBookmarkRemoval,
+  confirmConnectionFolderRemoval,
   confirmConnectionRemoval,
   pickConnectionWithPrompt,
 } from "./connectionManagerPrompts";
@@ -39,6 +40,8 @@ const CMD = {
   addConnection: "rapidb.addConnection",
   editConnection: "rapidb.editConnection",
   deleteConnection: "rapidb.deleteConnection",
+  renameConnectionFolder: "rapidb.renameConnectionFolder",
+  deleteConnectionFolder: "rapidb.deleteConnectionFolder",
   connect: "rapidb.connect",
   disconnect: "rapidb.disconnect",
   newQuery: "rapidb.newQuery",
@@ -232,6 +235,68 @@ function registerCommands(
     if (deleted) {
       refresh();
     }
+  });
+
+  reg(CMD.renameConnectionFolder, async (node?: RapiDBNode) => {
+    const currentFolderName =
+      node?.kind === "folder" ? node.objectName?.trim() : "";
+    if (!currentFolderName) {
+      return;
+    }
+
+    const nextFolderName = await vscode.window.showInputBox({
+      title: "Rename Connection Folder",
+      prompt: `Rename folder "${currentFolderName}"`,
+      value: currentFolderName,
+      ignoreFocusOut: true,
+      validateInput: (value) => {
+        const trimmedValue = value.trim();
+        if (!trimmedValue) {
+          return "Folder name cannot be empty.";
+        }
+        if (trimmedValue === currentFolderName) {
+          return "Enter a new folder name.";
+        }
+        return null;
+      },
+    });
+
+    if (nextFolderName === undefined) {
+      return;
+    }
+
+    const renamedCount = await connectionManager.renameFolder(
+      currentFolderName,
+      nextFolderName,
+    );
+    if (renamedCount === 0) {
+      return;
+    }
+
+    vscode.window.showInformationMessage(
+      `[RapiDB] Folder "${currentFolderName}" renamed to "${nextFolderName.trim()}".`,
+    );
+    refresh();
+  });
+
+  reg(CMD.deleteConnectionFolder, async (node?: RapiDBNode) => {
+    const folderName = node?.kind === "folder" ? node.objectName?.trim() : "";
+    if (!folderName) {
+      return;
+    }
+
+    const deleted = await confirmConnectionFolderRemoval(
+      connectionManager,
+      folderName,
+    );
+    if (!deleted) {
+      return;
+    }
+
+    vscode.window.showInformationMessage(
+      `[RapiDB] Folder "${folderName}" deleted. Connections moved to the root level.`,
+    );
+    refresh();
   });
 
   reg(CMD.connect, async (node?: RapiDBNode) => {
@@ -696,6 +761,15 @@ export function activate(context: vscode.ExtensionContext): void {
       }
 
       connectionManager.markSchemaScopeCollapsed(element.connectionId, scope);
+      if (
+        element.kind === "connectionNode_connected" ||
+        element.kind === "connectionNode_disconnected"
+      ) {
+        connectionProvider.markConnectionRootExpanded(
+          element.connectionId,
+          false,
+        );
+      }
     }),
   );
   const updateExplorerBadge = createBadgeUpdater(treeView, connectionManager);

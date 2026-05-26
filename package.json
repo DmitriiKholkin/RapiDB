@@ -61,6 +61,18 @@
         "icon": "$(trash)"
       },
       {
+        "command": "rapidb.renameConnectionFolder",
+        "title": "Rename Folder",
+        "category": "RapiDB",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "rapidb.deleteConnectionFolder",
+        "title": "Delete Folder",
+        "category": "RapiDB",
+        "icon": "$(trash)"
+      },
+      {
         "command": "rapidb.newQuery",
         "title": "New Query",
         "category": "RapiDB",
@@ -293,6 +305,16 @@
           "command": "rapidb.refresh",
           "when": "view == rapidb-explorer && viewItem == connectionNode_connected",
           "group": "4_refresh"
+        },
+        {
+          "command": "rapidb.renameConnectionFolder",
+          "when": "view == rapidb-explorer && viewItem == folder",
+          "group": "3_manage"
+        },
+        {
+          "command": "rapidb.deleteConnectionFolder",
+          "when": "view == rapidb-explorer && viewItem == folder",
+          "group": "3_manage"
         },
         {
           "command": "rapidb.newQuery",

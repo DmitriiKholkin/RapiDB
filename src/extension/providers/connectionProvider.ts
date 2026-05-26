@@ -150,6 +150,10 @@ const SORT_KEY_ICON_COLOR = new vscode.ThemeColor("textLink.foreground");
 
 type ConnectionProviderManager = ScopeAwareConnectionManagerApi & {
   getConnections(): ConnectionConfig[];
+  beginConnect?(connectionId: string): {
+    promise: Promise<void>;
+    isNew: boolean;
+  };
   isConnected(connectionId: string): boolean;
   isConnecting(connectionId: string): boolean;
   onDidConnect(listener: () => void): vscode.Disposable;
@@ -246,6 +250,7 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
 
   private readonly _subscriptions: vscode.Disposable[] = [];
   private readonly _connectionNodes = new Map<string, RapiDBNode>();
+  private readonly _expandedConnectionRoots = new Set<string>();
   private readonly _pendingConnectionRefreshIds = new Set<string>();
   private _refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private _refreshAllPending = false;
@@ -281,9 +286,10 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     };
     this._subscriptions.push(
       connectionManager.onDidConnect(() => scheduleRefresh()),
-      connectionManager.onDidDisconnect((connectionId) =>
-        scheduleRefresh(connectionId),
-      ),
+      connectionManager.onDidDisconnect((connectionId) => {
+        this.markConnectionRootExpanded(connectionId, false);
+        scheduleRefresh(connectionId);
+      }),
       connectionManager.onDidChangeConnections(() => scheduleRefresh()),
       connectionManager.onDidChangeSchemaState((connectionId) =>
         scheduleRefresh(connectionId),
@@ -318,6 +324,15 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     }
 
     this.refresh(this._connectionNodes.get(connectionId));
+  }
+
+  markConnectionRootExpanded(connectionId: string, expanded: boolean): void {
+    if (expanded) {
+      this._expandedConnectionRoots.add(connectionId);
+      return;
+    }
+
+    this._expandedConnectionRoots.delete(connectionId);
   }
 
   getTreeItem(element: RapiDBNode): vscode.TreeItem {
@@ -406,8 +421,30 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
   private async getConnectionChildren(
     element: RapiDBNode,
   ): Promise<RapiDBNode[]> {
+    this.markConnectionRootExpanded(element.connectionId, true);
+
     if (!this.connectionManager.isConnected(element.connectionId)) {
-      return [];
+      const attempt = this.connectionManager.beginConnect?.(
+        element.connectionId,
+      );
+      if (attempt) {
+        void attempt.promise.catch(() => undefined);
+      }
+
+      if (
+        !attempt &&
+        !this.connectionManager.isConnecting(element.connectionId)
+      ) {
+        return [];
+      }
+
+      if (attempt?.isNew) {
+        queueMicrotask(() => {
+          this.refreshConnectionTree(element.connectionId);
+        });
+      }
+
+      return [this.makeLoadingNode(element.connectionId, "Connecting...")];
     }
 
     const connectionType = this.getConnectionType(element.connectionId);
@@ -1175,10 +1212,9 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     const node = new RapiDBNode(
       config.name,
       kind,
-
-      connected
-        ? vscode.TreeItemCollapsibleState.Collapsed
-        : vscode.TreeItemCollapsibleState.None,
+      this._expandedConnectionRoots.has(config.id)
+        ? vscode.TreeItemCollapsibleState.Expanded
+        : vscode.TreeItemCollapsibleState.Collapsed,
       config.id,
     );
 

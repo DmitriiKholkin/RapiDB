@@ -5,6 +5,8 @@ const expectedCommands = [
   "rapidb.addConnection",
   "rapidb.editConnection",
   "rapidb.deleteConnection",
+  "rapidb.renameConnectionFolder",
+  "rapidb.deleteConnectionFolder",
   "rapidb.connect",
   "rapidb.disconnect",
   "rapidb.newQuery",
@@ -60,6 +62,7 @@ describe("extension activation", () => {
 
     connectionManagerInstance = {
       getConnectedCount: vi.fn(() => 2),
+      getConnections: vi.fn(() => []),
       onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
@@ -74,6 +77,8 @@ describe("extension activation", () => {
         name: "Primary",
         type: "pg",
       })),
+      renameFolder: vi.fn().mockResolvedValue(0),
+      removeFolder: vi.fn().mockResolvedValue(0),
       getQueryEditorPresentation: vi.fn((connectionId: string) => {
         const getConnection =
           connectionManagerInstance.getConnection as unknown as (
@@ -163,11 +168,21 @@ describe("extension activation", () => {
         disposeAll: erdPanelDisposeAll,
       },
     }));
-    vi.doMock("../../src/extension/connectionManagerPrompts", () => ({
-      confirmBookmarkRemoval: vi.fn(),
-      confirmConnectionRemoval: vi.fn(),
-      pickConnectionWithPrompt: vi.fn(),
-    }));
+    vi.doMock(
+      "../../src/extension/connectionManagerPrompts",
+      async (importOriginal) => {
+        const actual =
+          await importOriginal<
+            typeof import("../../src/extension/connectionManagerPrompts")
+          >();
+        return {
+          ...actual,
+          confirmBookmarkRemoval: vi.fn(),
+          confirmConnectionRemoval: vi.fn(),
+          pickConnectionWithPrompt: vi.fn(),
+        };
+      },
+    );
     vi.doMock("../../src/extension/utils/connectOrchestration", () => ({
       connectWithProgress,
     }));
@@ -374,6 +389,84 @@ describe("extension activation", () => {
       true,
       false,
       true,
+    );
+  });
+
+  it("renames a folder node and refreshes the explorer", async () => {
+    const extension = await import("../../src/extension/extension");
+    const context = { subscriptions: [] as Array<{ dispose(): void }> };
+    vscodeState.showInputBox.mockResolvedValue("Platform Team");
+    (
+      connectionManagerInstance.renameFolder as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(2);
+
+    extension.activate(context as never);
+
+    const renameFolderCommand = vscodeState.registerCommand.mock.calls.find(
+      ([command]) => command === "rapidb.renameConnectionFolder",
+    )?.[1] as
+      | ((node: { kind?: string; objectName?: string }) => Promise<void>)
+      | undefined;
+
+    if (!renameFolderCommand) {
+      throw new Error("Rename folder command was not registered.");
+    }
+
+    await renameFolderCommand({ kind: "folder", objectName: "Team" });
+
+    expect(vscodeState.showInputBox).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Rename Connection Folder",
+        value: "Team",
+      }),
+    );
+    expect(connectionManagerInstance.renameFolder).toHaveBeenCalledWith(
+      "Team",
+      "Platform Team",
+    );
+    expect(connectionProviderInstances[0]?.refresh).toHaveBeenCalledTimes(1);
+    expect(vscodeState.showInformationMessage).toHaveBeenCalledWith(
+      '[RapiDB] Folder "Team" renamed to "Platform Team".',
+    );
+  });
+
+  it("deletes a folder node and moves its connections to the root level", async () => {
+    const extension = await import("../../src/extension/extension");
+    const context = { subscriptions: [] as Array<{ dispose(): void }> };
+    (
+      connectionManagerInstance.getConnections as ReturnType<typeof vi.fn>
+    ).mockReturnValue([
+      { id: "conn-1", name: "Primary", type: "pg", folder: "Team" },
+      { id: "conn-2", name: "Analytics", type: "sqlite", folder: "Team" },
+    ]);
+    vscodeState.showWarningMessage.mockResolvedValue("Delete Folder");
+    (
+      connectionManagerInstance.removeFolder as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(2);
+
+    extension.activate(context as never);
+
+    const deleteFolderCommand = vscodeState.registerCommand.mock.calls.find(
+      ([command]) => command === "rapidb.deleteConnectionFolder",
+    )?.[1] as
+      | ((node: { kind?: string; objectName?: string }) => Promise<void>)
+      | undefined;
+
+    if (!deleteFolderCommand) {
+      throw new Error("Delete folder command was not registered.");
+    }
+
+    await deleteFolderCommand({ kind: "folder", objectName: "Team" });
+
+    expect(vscodeState.showWarningMessage).toHaveBeenCalledWith(
+      '[RapiDB] Delete folder "Team"? 2 connections will be moved to the root level.',
+      { modal: true },
+      "Delete Folder",
+    );
+    expect(connectionManagerInstance.removeFolder).toHaveBeenCalledWith("Team");
+    expect(connectionProviderInstances[0]?.refresh).toHaveBeenCalledTimes(1);
+    expect(vscodeState.showInformationMessage).toHaveBeenCalledWith(
+      '[RapiDB] Folder "Team" deleted. Connections moved to the root level.',
     );
   });
 

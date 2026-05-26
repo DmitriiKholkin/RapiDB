@@ -354,6 +354,150 @@ describe("ConnectionProvider", () => {
     expect(disconnectedSqlite?.contextValue).toBe(
       "connectionNode_disconnected",
     );
+    expect(disconnectedRedis?.collapsibleState).toBe(1);
+    expect(disconnectedSqlite?.collapsibleState).toBe(1);
+    expect(disconnectedRedis?.command).toEqual({
+      command: "rapidb.connect",
+      title: "Connect",
+      arguments: [disconnectedRedis],
+    });
+  });
+
+  it("keeps a connection root expanded when its root state is tracked", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        {
+          id: "conn-1",
+          name: "Primary",
+          type: "pg",
+        },
+      ]),
+      isConnected: vi.fn(() => false),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() => loadedState({ databases: [] })),
+      getConnection: vi.fn(() => ({
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+      })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    provider.markConnectionRootExpanded("conn-1", true);
+    const [connectionNode] = await provider.getChildren();
+
+    expect(connectionNode?.collapsibleState).toBe(2);
+  });
+
+  it("collapses an expanded connection root after disconnect events", async () => {
+    vi.useFakeTimers();
+
+    const disconnectState = createEventSource<string>();
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        {
+          id: "conn-1",
+          name: "Primary",
+          type: "pg",
+        },
+      ]),
+      isConnected: vi.fn(() => false),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() => loadedState({ databases: [] })),
+      getConnection: vi.fn(() => ({
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+      })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: disconnectState.event,
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    provider.markConnectionRootExpanded("conn-1", true);
+
+    disconnectState.fire("conn-1");
+    await vi.advanceTimersByTimeAsync(60);
+
+    const [connectionNode] = await provider.getChildren();
+
+    expect(connectionNode?.collapsibleState).toBe(1);
+
+    vi.useRealTimers();
+  });
+
+  it("starts connecting and shows a loading child when a disconnected connection expands", async () => {
+    let connected = false;
+    const beginConnect = vi.fn(() => ({
+      isNew: true,
+      promise: Promise.resolve().then(() => {
+        connected = true;
+      }),
+    }));
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        {
+          id: "conn-1",
+          name: "Primary",
+          type: "pg",
+        },
+      ]),
+      beginConnect,
+      isConnected: vi.fn(() => connected),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() => loadedState({ databases: [] })),
+      getConnection: vi.fn(() => ({
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+      })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    const [connectionNode] = await provider.getChildren();
+    const children = await provider.getChildren(connectionNode);
+
+    expect(beginConnect).toHaveBeenCalledWith("conn-1");
+    expect(children).toHaveLength(1);
+    expect(children[0]?.contextValue).toBe("_status");
+    expect(children[0]?.label).toBe("Connecting...");
   });
 
   it("uses canonical database context values across connection types", async () => {

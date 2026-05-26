@@ -56,6 +56,7 @@ export interface MockVscodeState {
   registerCommand: ReturnType<typeof vi.fn>;
   createTreeView: ReturnType<typeof vi.fn>;
   getConfiguration: ReturnType<typeof vi.fn>;
+  showInputBox: ReturnType<typeof vi.fn>;
   showInformationMessage: ReturnType<typeof vi.fn>;
   showWarningMessage: ReturnType<typeof vi.fn>;
   showErrorMessage: ReturnType<typeof vi.fn>;
@@ -176,6 +177,7 @@ export function createMockVscodeModule(): {
       get: vi.fn(),
       update: vi.fn(),
     })),
+    showInputBox: vi.fn(),
     showInformationMessage: vi.fn(),
     showWarningMessage: vi.fn(),
     showErrorMessage: vi.fn(),
@@ -201,6 +203,7 @@ export function createMockVscodeModule(): {
       window: {
         createTreeView: state.createTreeView,
         createWebviewPanel: state.createWebviewPanel,
+        showInputBox: state.showInputBox,
         showInformationMessage: state.showInformationMessage,
         showWarningMessage: state.showWarningMessage,
         showErrorMessage: state.showErrorMessage,

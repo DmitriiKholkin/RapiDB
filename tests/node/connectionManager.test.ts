@@ -1077,6 +1077,108 @@ describe("ConnectionManager", () => {
     expect(store.getConnections()[0]?.name).toBe("Primary Updated");
   });
 
+  it("renames a connection folder without disconnecting matching connections", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+        folder: "Team",
+      },
+      {
+        id: "conn-2",
+        name: "Analytics",
+        type: "sqlite",
+        folder: "Other",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo("conn-1");
+
+    const connectedDriver = driverInstances[0];
+    expect(connectedDriver?.isConnected()).toBe(true);
+
+    await expect(manager.renameFolder("Team", "Platform")).resolves.toBe(1);
+
+    expect(store.getConnections()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "conn-1",
+          folder: "Platform",
+        }),
+        expect.objectContaining({
+          id: "conn-2",
+          folder: "Other",
+        }),
+      ]),
+    );
+    expect(manager.isConnected("conn-1")).toBe(true);
+    expect(connectedDriver?.disconnectCalls).toBe(0);
+  });
+
+  it("deletes a connection folder by moving matching connections to the root level", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+        folder: "Team",
+      },
+      {
+        id: "conn-2",
+        name: "Analytics",
+        type: "sqlite",
+        folder: "Other",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo("conn-1");
+
+    const connectedDriver = driverInstances[0];
+    expect(connectedDriver?.isConnected()).toBe(true);
+
+    await expect(manager.removeFolder("Team")).resolves.toBe(1);
+
+    expect(store.getConnections()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "conn-1",
+          folder: undefined,
+        }),
+        expect.objectContaining({
+          id: "conn-2",
+          folder: "Other",
+        }),
+      ]),
+    );
+    expect(manager.isConnected("conn-1")).toBe(true);
+    expect(connectedDriver?.disconnectCalls).toBe(0);
+  });
+
   it("rejects invalid saveConnection payloads and keeps persisted settings unchanged", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"

@@ -45,6 +45,35 @@ export async function confirmConnectionRemoval(
   return connectionManager.removeConnection(connectionId);
 }
 
+export async function confirmConnectionFolderRemoval(
+  connectionManager: Pick<ConnectionManager, "getConnections" | "removeFolder">,
+  folderName: string,
+): Promise<boolean> {
+  const trimmedFolderName = folderName.trim();
+  if (!trimmedFolderName) {
+    return false;
+  }
+
+  const matchingConnections = connectionManager
+    .getConnections()
+    .filter((connection) => connection.folder?.trim() === trimmedFolderName);
+  if (matchingConnections.length === 0) {
+    return false;
+  }
+
+  const answer = await vscode.window.showWarningMessage(
+    `[RapiDB] Delete folder "${trimmedFolderName}"? ${matchingConnections.length} connection${matchingConnections.length === 1 ? "" : "s"} will be moved to the root level.`,
+    { modal: true },
+    "Delete Folder",
+  );
+
+  if (answer !== "Delete Folder") {
+    return false;
+  }
+
+  return (await connectionManager.removeFolder(trimmedFolderName)) > 0;
+}
+
 export async function confirmBookmarkRemoval(
   connectionManager: Pick<ConnectionManager, "getBookmark" | "removeBookmark">,
   bookmarkId: string,

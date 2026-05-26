@@ -158,6 +158,12 @@ describe("ERD manifest", () => {
     expect(findWhen("rapidb.disconnect")).toContain(
       "viewItem == connectionNode_connected",
     );
+    expect(findWhen("rapidb.renameConnectionFolder")).toContain(
+      "viewItem == folder",
+    );
+    expect(findWhen("rapidb.deleteConnectionFolder")).toContain(
+      "viewItem == folder",
+    );
     expect(findWhen("rapidb.openErd")).toContain("viewItem == database");
   });
 

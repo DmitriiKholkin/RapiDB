@@ -963,6 +963,74 @@ export class ConnectionManager
     return true;
   }
 
+  async renameFolder(
+    currentFolderName: string,
+    nextFolderName: string,
+  ): Promise<number> {
+    this._assertNotDisposed();
+
+    const sourceFolder = currentFolderName.trim();
+    const targetFolder = nextFolderName.trim();
+    if (!sourceFolder || !targetFolder || sourceFolder === targetFolder) {
+      return 0;
+    }
+
+    const connections = this.getConnections();
+    let renamedCount = 0;
+
+    const updatedConnections = connections.map((connection) => {
+      if (connection.folder?.trim() !== sourceFolder) {
+        return connection;
+      }
+
+      renamedCount += 1;
+      return {
+        ...connection,
+        folder: targetFolder,
+      };
+    });
+
+    if (renamedCount === 0) {
+      return 0;
+    }
+
+    await this.saveConnections(updatedConnections);
+    this._onDidChangeConnections.fire();
+    return renamedCount;
+  }
+
+  async removeFolder(folderName: string): Promise<number> {
+    this._assertNotDisposed();
+
+    const targetFolder = folderName.trim();
+    if (!targetFolder) {
+      return 0;
+    }
+
+    const connections = this.getConnections();
+    let updatedCount = 0;
+
+    const updatedConnections = connections.map((connection) => {
+      if (connection.folder?.trim() !== targetFolder) {
+        return connection;
+      }
+
+      updatedCount += 1;
+      return {
+        ...connection,
+        folder: undefined,
+      };
+    });
+
+    if (updatedCount === 0) {
+      return 0;
+    }
+
+    await this.saveConnections(updatedConnections);
+    this._onDidChangeConnections.fire();
+    return updatedCount;
+  }
+
   private parseStoredSecrets(value: string | undefined): {
     password?: string;
     apiKey?: string;
