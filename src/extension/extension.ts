@@ -742,6 +742,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const connectionProvider = new ConnectionProvider(connectionManager);
   const treeView = vscode.window.createTreeView("rapidb-explorer", {
     treeDataProvider: connectionProvider,
+    dragAndDropController: connectionProvider,
     showCollapseAll: true,
   });
   context.subscriptions.push(

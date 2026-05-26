@@ -63,6 +63,7 @@ describe("extension activation", () => {
     connectionManagerInstance = {
       getConnectedCount: vi.fn(() => 2),
       getConnections: vi.fn(() => []),
+      moveConnectionsToFolder: vi.fn().mockResolvedValue(0),
       onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
@@ -122,6 +123,7 @@ describe("extension activation", () => {
     function ConnectionProviderMock() {
       const instance = {
         refresh: vi.fn(),
+        markConnectionRootExpanded: vi.fn(),
         disposable: { dispose: vi.fn() },
       };
       connectionProviderInstances.push(instance);
@@ -208,6 +210,14 @@ describe("extension activation", () => {
       vscodeState.registerCommand.mock.calls.map(([command]) => command),
     ).toEqual(expectedCommands);
     expect(connectionProviderInstances).toHaveLength(1);
+    expect(vscodeState.createTreeView).toHaveBeenCalledWith(
+      "rapidb-explorer",
+      expect.objectContaining({
+        treeDataProvider: connectionProviderInstances[0],
+        dragAndDropController: connectionProviderInstances[0],
+        showCollapseAll: true,
+      }),
+    );
   });
 
   it("tracks explorer expand and collapse events with durable schema scopes", async () => {

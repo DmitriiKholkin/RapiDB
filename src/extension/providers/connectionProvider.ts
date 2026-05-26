@@ -147,9 +147,14 @@ function formatTooltipObjectKindLabel(label: string): string {
 
 const PRIMARY_KEY_ICON_COLOR = new vscode.ThemeColor("charts.yellow");
 const SORT_KEY_ICON_COLOR = new vscode.ThemeColor("textLink.foreground");
+const CONNECTION_NODE_MIME = "application/vnd.rapidb.connection-nodes";
 
 type ConnectionProviderManager = ScopeAwareConnectionManagerApi & {
   getConnections(): ConnectionConfig[];
+  moveConnectionsToFolder(
+    connectionIds: readonly string[],
+    folderName?: string,
+  ): Promise<number>;
   beginConnect?(connectionId: string): {
     promise: Promise<void>;
     isNew: boolean;
@@ -242,11 +247,17 @@ const CATEGORY_NODE_KIND_BY_ID: Record<ExplorerCategoryId, CategoryKind> = {
   types: "category_types",
 };
 
-export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
+export class ConnectionProvider
+  implements
+    vscode.TreeDataProvider<RapiDBNode>,
+    vscode.TreeDragAndDropController<RapiDBNode>
+{
   private readonly _onDidChangeTreeData = new vscode.EventEmitter<
     RapiDBNode | undefined | null
   >();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+  readonly dragMimeTypes = [CONNECTION_NODE_MIME];
+  readonly dropMimeTypes = [CONNECTION_NODE_MIME];
 
   private readonly _subscriptions: vscode.Disposable[] = [];
   private readonly _connectionNodes = new Map<string, RapiDBNode>();
@@ -254,6 +265,7 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
   private readonly _pendingConnectionRefreshIds = new Set<string>();
   private _refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private _refreshAllPending = false;
+  private _dragActive = false;
 
   constructor(private readonly connectionManager: ConnectionProviderManager) {
     const scheduleRefresh = (connectionId?: string) => {
@@ -339,6 +351,67 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     return element;
   }
 
+  async handleDrag(
+    source: readonly RapiDBNode[],
+    dataTransfer: vscode.DataTransfer,
+    token: vscode.CancellationToken,
+  ): Promise<void> {
+    this._dragActive = true;
+    token.onCancellationRequested(() => {
+      this._dragActive = false;
+      this.refresh();
+    });
+    this.refresh();
+
+    const connectionIds = [...new Set(source.map((node) => node.connectionId))]
+      .map((connectionId) => connectionId.trim())
+      .filter(
+        (connectionId, index, ids) =>
+          connectionId.length > 0 &&
+          ids.includes(connectionId) &&
+          source.some(
+            (node) =>
+              node.connectionId === connectionId &&
+              this.isDraggableConnectionNode(node),
+          ),
+      );
+    if (connectionIds.length === 0) {
+      return;
+    }
+
+    dataTransfer.set(
+      CONNECTION_NODE_MIME,
+      new vscode.DataTransferItem(JSON.stringify(connectionIds)),
+    );
+  }
+
+  async handleDrop(
+    target: RapiDBNode | undefined,
+    dataTransfer: vscode.DataTransfer,
+    token: vscode.CancellationToken,
+  ): Promise<void> {
+    try {
+      if (target && target.kind !== "folder") {
+        return;
+      }
+
+      const connectionIds = await this.getDraggedConnectionIds(dataTransfer);
+      if (connectionIds.length === 0) {
+        return;
+      }
+
+      await this.connectionManager.moveConnectionsToFolder(
+        connectionIds,
+        target?.objectName,
+      );
+    } finally {
+      if (this._dragActive) {
+        this._dragActive = false;
+        this.refresh();
+      }
+    }
+  }
+
   async getChildren(element?: RapiDBNode): Promise<RapiDBNode[]> {
     if (!element) {
       return this.getRootChildren();
@@ -416,6 +489,59 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
         .getConnections()
         .filter((connection) => connection.folder?.trim() === folderName),
     ).map((connection) => this.makeConnectionNode(connection));
+  }
+
+  private isDraggableConnectionNode(node: RapiDBNode): boolean {
+    return (
+      node.kind === "connectionNode_connected" ||
+      node.kind === "connectionNode_connecting" ||
+      node.kind === "connectionNode_disconnected"
+    );
+  }
+
+  private async getDraggedConnectionIds(
+    dataTransfer: vscode.DataTransfer,
+  ): Promise<string[]> {
+    const item = dataTransfer.get(CONNECTION_NODE_MIME);
+    if (!item) {
+      return [];
+    }
+
+    const payload = await this.readDataTransferString(item);
+    if (!payload) {
+      return [];
+    }
+
+    try {
+      const parsed = JSON.parse(payload);
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+
+      return [...new Set(parsed)]
+        .filter(
+          (connectionId): connectionId is string =>
+            typeof connectionId === "string" && connectionId.trim().length > 0,
+        )
+        .map((connectionId) => connectionId.trim());
+    } catch {
+      return [];
+    }
+  }
+
+  private async readDataTransferString(
+    item: vscode.DataTransferItem,
+  ): Promise<string | undefined> {
+    if (typeof item.value === "string") {
+      return item.value;
+    }
+
+    if (typeof item.asString === "function") {
+      const value = await item.asString();
+      return typeof value === "string" ? value : undefined;
+    }
+
+    return undefined;
   }
 
   private async getConnectionChildren(
@@ -1212,9 +1338,11 @@ export class ConnectionProvider implements vscode.TreeDataProvider<RapiDBNode> {
     const node = new RapiDBNode(
       config.name,
       kind,
-      this._expandedConnectionRoots.has(config.id)
-        ? vscode.TreeItemCollapsibleState.Expanded
-        : vscode.TreeItemCollapsibleState.Collapsed,
+      this._dragActive
+        ? vscode.TreeItemCollapsibleState.None
+        : this._expandedConnectionRoots.has(config.id)
+          ? vscode.TreeItemCollapsibleState.Expanded
+          : vscode.TreeItemCollapsibleState.Collapsed,
       config.id,
     );
 

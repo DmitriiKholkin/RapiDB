@@ -673,6 +673,12 @@ describe("schema object definitions", () => {
           indexes: "supported",
           triggers: "supported",
         },
+        tableSectionOverridesByObjectKind: {
+          view: {
+            constraints: "not_applicable",
+            triggers: "not_applicable",
+          },
+        },
       },
       mysql: {
         dbObjectKinds: ["table", "view", "function", "procedure"],
@@ -681,6 +687,13 @@ describe("schema object definitions", () => {
           constraints: "supported",
           indexes: "supported",
           triggers: "supported",
+        },
+        tableSectionOverridesByObjectKind: {
+          view: {
+            constraints: "not_applicable",
+            indexes: "not_applicable",
+            triggers: "not_applicable",
+          },
         },
       },
       postgres: {
@@ -699,6 +712,16 @@ describe("schema object definitions", () => {
           indexes: "supported",
           triggers: "supported",
         },
+        tableSectionOverridesByObjectKind: {
+          view: {
+            constraints: "not_applicable",
+            indexes: "not_applicable",
+          },
+          materializedView: {
+            constraints: "not_applicable",
+            triggers: "not_applicable",
+          },
+        },
       },
       sqlite: {
         dbObjectKinds: ["table", "view"],
@@ -707,6 +730,12 @@ describe("schema object definitions", () => {
           constraints: "supported",
           indexes: "supported",
           triggers: "supported",
+        },
+        tableSectionOverridesByObjectKind: {
+          view: {
+            constraints: "not_applicable",
+            indexes: "not_applicable",
+          },
         },
       },
       oracle: {
@@ -725,6 +754,16 @@ describe("schema object definitions", () => {
           indexes: "supported",
           triggers: "supported",
         },
+        tableSectionOverridesByObjectKind: {
+          view: {
+            constraints: "not_applicable",
+            indexes: "not_applicable",
+          },
+          materializedView: {
+            constraints: "not_applicable",
+            triggers: "not_applicable",
+          },
+        },
       },
       mongodb: {
         dbObjectKinds: ["table", "view"],
@@ -733,6 +772,11 @@ describe("schema object definitions", () => {
           constraints: "not_applicable",
           indexes: "supported",
           triggers: "not_applicable",
+        },
+        tableSectionOverridesByObjectKind: {
+          view: {
+            indexes: "not_applicable",
+          },
         },
       },
       dynamodb: {

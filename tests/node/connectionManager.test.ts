@@ -1179,6 +1179,61 @@ describe("ConnectionManager", () => {
     expect(connectedDriver?.disconnectCalls).toBe(0);
   });
 
+  it("moves selected connections between folders and the root level without disconnecting them", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+        folder: "Team",
+      },
+      {
+        id: "conn-2",
+        name: "Analytics",
+        type: "sqlite",
+      },
+    ]);
+
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo("conn-1");
+
+    const connectedDriver = driverInstances[0];
+    expect(connectedDriver?.isConnected()).toBe(true);
+
+    await expect(
+      manager.moveConnectionsToFolder(["conn-2"], "Team"),
+    ).resolves.toBe(1);
+    await expect(
+      manager.moveConnectionsToFolder(["conn-1"], undefined),
+    ).resolves.toBe(1);
+
+    expect(store.getConnections()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "conn-1",
+          folder: undefined,
+        }),
+        expect.objectContaining({
+          id: "conn-2",
+          folder: "Team",
+        }),
+      ]),
+    );
+    expect(manager.isConnected("conn-1")).toBe(true);
+    expect(connectedDriver?.disconnectCalls).toBe(0);
+  });
+
   it("rejects invalid saveConnection payloads and keeps persisted settings unchanged", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"

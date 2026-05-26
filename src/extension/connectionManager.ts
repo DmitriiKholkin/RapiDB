@@ -999,6 +999,49 @@ export class ConnectionManager
     return renamedCount;
   }
 
+  async moveConnectionsToFolder(
+    connectionIds: readonly string[],
+    folderName?: string,
+  ): Promise<number> {
+    this._assertNotDisposed();
+
+    const targetFolder = folderName?.trim() || undefined;
+    const idsToMove = new Set(
+      connectionIds.map((connectionId) => connectionId.trim()).filter(Boolean),
+    );
+    if (idsToMove.size === 0) {
+      return 0;
+    }
+
+    const connections = this.getConnections();
+    let updatedCount = 0;
+
+    const updatedConnections = connections.map((connection) => {
+      if (!idsToMove.has(connection.id)) {
+        return connection;
+      }
+
+      const currentFolder = connection.folder?.trim() || undefined;
+      if (currentFolder === targetFolder) {
+        return connection;
+      }
+
+      updatedCount += 1;
+      return {
+        ...connection,
+        folder: targetFolder,
+      };
+    });
+
+    if (updatedCount === 0) {
+      return 0;
+    }
+
+    await this.saveConnections(updatedConnections);
+    this._onDidChangeConnections.fire();
+    return updatedCount;
+  }
+
   async removeFolder(folderName: string): Promise<number> {
     this._assertNotDisposed();
 

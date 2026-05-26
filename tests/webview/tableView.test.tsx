@@ -411,7 +411,7 @@ function dragResizeHandle(handle: HTMLElement, deltaX: number): void {
 async function initializeCommittedTableData(overrides?: {
   columnDefs?: ColumnTypeMeta[];
   primaryKeyColumns?: string[];
-  dataRows?: typeof rows;
+  dataRows?: readonly Record<string, unknown>[];
   renderOverrides?: {
     connectionReadOnly?: boolean;
     defaultPageSize?: number;

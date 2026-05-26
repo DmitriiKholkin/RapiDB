@@ -45,6 +45,9 @@ vi.mock("vscode", () => {
       Collapsed: 1,
       Expanded: 2,
     },
+    DataTransferItem: class DataTransferItem {
+      constructor(readonly value: string) {}
+    },
     MarkdownString: class MarkdownString {
       constructor(readonly value: string) {}
     },
@@ -300,6 +303,243 @@ describe("ConnectionProvider", () => {
       "mysql",
       "pg",
     ]);
+  });
+
+  it("moves dropped connections into folders or back to the root and removes empty folders", async () => {
+    const connections = [
+      { id: "conn-a", name: "Alpha", type: "mysql", folder: "Team" },
+      { id: "conn-b", name: "Solo", type: "sqlite" },
+      { id: "conn-c", name: "Zeta", type: "pg", folder: "Other" },
+    ];
+    const moveConnectionsToFolder = vi.fn(
+      async (connectionIds: readonly string[], folderName?: string) => {
+        let movedCount = 0;
+        for (const connection of connections) {
+          if (!connectionIds.includes(connection.id)) {
+            continue;
+          }
+
+          const nextFolder = folderName?.trim() || undefined;
+          const currentFolder = connection.folder?.trim() || undefined;
+          if (currentFolder === nextFolder) {
+            continue;
+          }
+
+          connection.folder = nextFolder;
+          movedCount += 1;
+        }
+
+        return movedCount;
+      },
+    );
+    const connectionManager = {
+      getConnections: vi.fn(() => connections),
+      moveConnectionsToFolder,
+      isConnected: vi.fn(() => false),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() => loadedState({ databases: [] })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    const roots = await provider.getChildren();
+    const otherFolder = roots.find((node) => node.label === "Other");
+
+    if (!otherFolder) {
+      throw new Error("Expected folder node to exist.");
+    }
+
+    const dropToken = {
+      isCancellationRequested: false,
+      onCancellationRequested: vi.fn((listener: () => void) => ({
+        dispose: vi.fn(),
+      })),
+    } as never;
+
+    await provider.handleDrop(
+      otherFolder,
+      {
+        get: vi.fn(() => ({
+          asString: vi.fn().mockResolvedValue(JSON.stringify(["conn-b"])),
+        })),
+      } as never,
+      dropToken,
+    );
+
+    expect(moveConnectionsToFolder).toHaveBeenNthCalledWith(
+      1,
+      ["conn-b"],
+      "Other",
+    );
+    expect((await provider.getChildren()).map((node) => node.label)).toEqual([
+      "Other",
+      "Team",
+    ]);
+
+    await provider.handleDrop(
+      undefined,
+      {
+        get: vi.fn(() => ({
+          asString: vi.fn().mockResolvedValue(JSON.stringify(["conn-a"])),
+        })),
+      } as never,
+      dropToken,
+    );
+
+    expect(moveConnectionsToFolder).toHaveBeenNthCalledWith(
+      2,
+      ["conn-a"],
+      undefined,
+    );
+    expect((await provider.getChildren()).map((node) => node.label)).toEqual([
+      "Other",
+      "Alpha",
+    ]);
+  });
+
+  it("disables connection node expansion while dragging so only folders act as targets", async () => {
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-d", name: "DragMe", type: "pg", folder: "Team" },
+      ]),
+      moveConnectionsToFolder: vi.fn(async () => 1),
+      isConnected: vi.fn(() => false),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() => loadedState({ databases: [] })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    const roots = await provider.getChildren();
+    const folder = roots[0];
+    const folderChildren = await provider.getChildren(folder);
+    const dragNode = folderChildren[0];
+
+    const vscode = await import("vscode");
+    await provider.handleDrag(
+      [dragNode],
+      { set: vi.fn() } as never,
+      {
+        isCancellationRequested: false,
+        onCancellationRequested: vi.fn((listener: () => void) => ({
+          dispose: vi.fn(),
+        })),
+      } as never,
+    );
+
+    const updatedChildren = await provider.getChildren(folder);
+    expect(updatedChildren[0].collapsibleState).toBe(
+      vscode.TreeItemCollapsibleState.None,
+    );
+
+    await provider.handleDrop(
+      dragNode,
+      {
+        get: vi.fn(() => ({
+          asString: vi.fn().mockResolvedValue(JSON.stringify(["conn-d"])),
+        })),
+      } as never,
+      {
+        isCancellationRequested: false,
+        onCancellationRequested: vi.fn((listener: () => void) => ({
+          dispose: vi.fn(),
+        })),
+      } as never,
+    );
+
+    const resetChildren = await provider.getChildren(folder);
+    expect(resetChildren[0].collapsibleState).not.toBe(
+      vscode.TreeItemCollapsibleState.None,
+    );
+  });
+
+  it("keeps connection nodes non-expandable while dragging a folder and resets after the drag ends", async () => {
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-1", name: "Alpha", type: "pg", folder: "Team" },
+      ]),
+      moveConnectionsToFolder: vi.fn(async () => 0),
+      isConnected: vi.fn(() => false),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() => loadedState({ databases: [] })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    const vscode = await import("vscode");
+    const roots = await provider.getChildren();
+    const folder = roots[0];
+
+    await provider.handleDrag(
+      [folder],
+      { set: vi.fn() } as never,
+      {
+        isCancellationRequested: false,
+        onCancellationRequested: vi.fn((listener: () => void) => ({
+          dispose: vi.fn(),
+        })),
+      } as never,
+    );
+
+    const childrenDuringDrag = await provider.getChildren(folder);
+    expect(childrenDuringDrag[0].collapsibleState).toBe(
+      vscode.TreeItemCollapsibleState.None,
+    );
+
+    const draggedOverConnection = childrenDuringDrag[0];
+    await provider.handleDrop(
+      draggedOverConnection,
+      {
+        get: vi.fn(() => undefined),
+      } as never,
+      {
+        isCancellationRequested: false,
+        onCancellationRequested: vi.fn((listener: () => void) => ({
+          dispose: vi.fn(),
+        })),
+      } as never,
+    );
+
+    const childrenAfterDrag = await provider.getChildren(folder);
+    expect(childrenAfterDrag[0].collapsibleState).not.toBe(
+      vscode.TreeItemCollapsibleState.None,
+    );
   });
 
   it("uses canonical context values for connected and disconnected connection nodes", async () => {
