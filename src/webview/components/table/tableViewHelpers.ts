@@ -11,7 +11,7 @@ import type { InsertDraftRow, PendingEdits, Row } from "../../types";
 import { buildButtonStyle } from "../../utils/buttonStyles";
 
 export const PAGE_SIZES = [25, 100, 500, 1000] as const;
-export const DEBOUNCE = 400;
+export const DEBOUNCE = 1000;
 export const ROW_H = 26;
 export const HEADER_H = 28;
 export const FILTER_H = 30;
