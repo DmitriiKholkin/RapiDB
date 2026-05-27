@@ -1,13 +1,11 @@
 import mssql from "mssql";
 import mysql from "mysql2/promise";
-import sqlite3Wasm from "node-sqlite3-wasm";
 import oracledb from "oracledb";
 import { Client } from "pg";
+import { openSQLiteDatabase } from "../../src/extension/dbDrivers/sqliteRuntime.ts";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig.ts";
 import type { DbEngineId } from "../contracts/testingContracts.ts";
 import { ensureParentDirectory } from "./tempDirectories.ts";
-
-const { Database } = sqlite3Wasm;
 
 export interface SqlExecutor {
   execute(sql: string): Promise<void>;
@@ -139,8 +137,11 @@ async function openSqliteExecutor(
   }
 
   await ensureParentDirectory(connection.filePath);
-  const db = new Database(connection.filePath);
-  db.exec("PRAGMA foreign_keys = ON");
+  const db = openSQLiteDatabase({
+    filePath: connection.filePath,
+    readOnly: connection.readOnly,
+    sqliteWalMode: connection.sqliteWalMode,
+  });
   return {
     async execute(sql) {
       db.exec(sql);

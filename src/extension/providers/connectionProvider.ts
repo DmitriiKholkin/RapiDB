@@ -1407,11 +1407,20 @@ export class ConnectionProvider
     }
 
     if (config.type === "sqlite") {
+      const sqliteAccess = config.readOnly ? "read-only" : "read-write";
+      const sqliteWalStatus =
+        config.sqliteWalMode === "off"
+          ? "disabled"
+          : config.readOnly
+            ? "automatic when writable"
+            : "automatic";
       const tooltipLines = [
         `**${config.name}**`,
         ``,
         `Type: \`sqlite\``,
         `File: \`${config.filePath ?? "—"}\``,
+        `Access: \`${sqliteAccess}\``,
+        `WAL: \`${sqliteWalStatus}\``,
       ];
       node.tooltip = new vscode.MarkdownString(tooltipLines.join("\n\n"));
     } else if (config.type === "elasticsearch") {

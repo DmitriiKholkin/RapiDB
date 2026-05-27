@@ -175,6 +175,63 @@ describe("ConnectionValidationService", () => {
     expect(elasticsearchWithCloudId.valid).toBe(true);
   });
 
+  it("accepts sqlite WAL mode defaults and rejects invalid values", () => {
+    const defaultWalMode = service.validate({
+      id: "sqlite-default-wal",
+      name: "SQLite Default WAL",
+      type: "sqlite",
+      filePath: "/tmp/default-wal.db",
+    });
+    const explicitWalOff = service.validate({
+      id: "sqlite-wal-off",
+      name: "SQLite WAL Off",
+      type: "sqlite",
+      filePath: "/tmp/wal-off.db",
+      sqliteWalMode: "off",
+    });
+    const invalidWalMode = service.validate({
+      id: "sqlite-invalid-wal",
+      name: "SQLite Invalid WAL",
+      type: "sqlite",
+      filePath: "/tmp/invalid-wal.db",
+      sqliteWalMode: "always" as ConnectionConfig["sqliteWalMode"],
+    });
+
+    expect(defaultWalMode.valid).toBe(true);
+    expect(explicitWalOff.valid).toBe(true);
+    expect(invalidWalMode.valid).toBe(false);
+    expect(invalidWalMode.issues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "invalid",
+          fields: ["sqliteWalMode"],
+        }),
+      ]),
+    );
+  });
+
+  it("rejects sqlite WAL mode for non-sqlite connections", () => {
+    const result = service.validate({
+      id: "pg-with-sqlite-wal",
+      name: "PG",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "postgres",
+      sqliteWalMode: "auto",
+    });
+
+    expect(result.valid).toBe(false);
+    expect(result.issues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "invalid",
+          fields: ["sqliteWalMode"],
+        }),
+      ]),
+    );
+  });
+
   it("requires SSH fingerprint and auth secrets when SSH is enabled", () => {
     const result = service.validate({
       id: "pg-ssh-missing",

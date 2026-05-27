@@ -325,6 +325,12 @@ function readConnectionSshHostVerificationMode(
   return value === "manual" || value === "trustOnFirstUse" ? value : undefined;
 }
 
+function readSqliteWalMode(
+  value: unknown,
+): ConnectionConfig["sqliteWalMode"] | undefined {
+  return value === "auto" || value === "off" ? value : undefined;
+}
+
 function readPositiveInteger(value: unknown): number | undefined {
   if (typeof value === "number") {
     return Number.isInteger(value) && value > 0 ? value : undefined;
@@ -438,6 +444,7 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
   const id = readRequiredString(input, "id");
   const name = readOptionalString(input, "name");
   const type = readConnectionType(input.type);
+  const sqliteWalMode = readSqliteWalMode(input.sqliteWalMode);
   if (!id || name === undefined || type === undefined || type === "") {
     return null;
   }
@@ -466,6 +473,7 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
       readOptionalString(input, "authSource"),
     replicaSet: readOptionalString(input, "replicaSet"),
     directConnection: readOptionalBoolean(input, "directConnection"),
+    ...(type === "sqlite" ? { sqliteWalMode: sqliteWalMode ?? "auto" } : {}),
     redisUsername: readOptionalString(input, "redisUsername"),
     keyPrefix: readOptionalString(input, "keyPrefix"),
     awsProfile: readOptionalString(input, "awsProfile"),

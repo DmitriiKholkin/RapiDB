@@ -1,7 +1,7 @@
-import { Database } from "node-sqlite3-wasm";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { ConnectionConfig } from "../connectionManager";
 import { BaseDBDriver } from "./BaseDBDriver";
+import { openSQLiteDatabase, type SQLiteDatabase } from "./sqliteRuntime";
 import type { DriverTimeoutSettingsProvider } from "./timeout";
 import type {
   ColumnMeta,
@@ -550,7 +550,7 @@ export class SQLiteDriver extends BaseDBDriver {
     return "sqlite" as const;
   }
 
-  private db: Database | null = null;
+  private db: SQLiteDatabase | null = null;
   private readonly config: ConnectionConfig;
   constructor(
     config: ConnectionConfig,
@@ -569,9 +569,13 @@ export class SQLiteDriver extends BaseDBDriver {
       } catch {}
       this.db = null;
     }
-    this.db = new Database(this.config.filePath);
+    this.db = openSQLiteDatabase({
+      filePath: this.config.filePath,
+      readOnly: this.config.readOnly,
+      sqliteWalMode: this.config.sqliteWalMode,
+    });
   }
-  private requireDb(): Database {
+  private requireDb(): SQLiteDatabase {
     if (!this.db?.isOpen) {
       throw new Error("[RapiDB] SQLite connection is not open");
     }
@@ -740,10 +744,9 @@ export class SQLiteDriver extends BaseDBDriver {
     start: number,
   ): QueryResult {
     const kind = classifySql(sql);
-    const bindValues = params as import("node-sqlite3-wasm").BindValues;
     const db = this.requireDb();
     if (kind === "select") {
-      const rawRows = db.all(sql, bindValues) as Record<string, unknown>[];
+      const rawRows = db.all(sql, params) as Record<string, unknown>[];
       const columns = rawRows.length > 0 ? Object.keys(rawRows[0]) : [];
       const rows = rawRows.map((row) =>
         Object.fromEntries(columns.map((col, i) => [`__col_${i}`, row[col]])),
@@ -756,10 +759,7 @@ export class SQLiteDriver extends BaseDBDriver {
       };
     }
     if (canSQLiteStatementReturnRows(sql)) {
-      const returningRows = db.all(sql, bindValues) as Record<
-        string,
-        unknown
-      >[];
+      const returningRows = db.all(sql, params) as Record<string, unknown>[];
       if (returningRows.length > 0) {
         const columns = Object.keys(returningRows[0]);
         const rows = returningRows.map((row) =>
@@ -779,7 +779,7 @@ export class SQLiteDriver extends BaseDBDriver {
         executionTimeMs: Date.now() - start,
       };
     }
-    const info = db.run(sql, bindValues);
+    const info = db.run(sql, params);
     return {
       columns: [],
       rows: [],
@@ -1029,9 +1029,7 @@ export class SQLiteDriver extends BaseDBDriver {
     db.exec("BEGIN TRANSACTION");
     try {
       for (const op of operations) {
-        const bindValues = (op.params ??
-          []) as import("node-sqlite3-wasm").BindValues;
-        const info = db.run(op.sql, bindValues);
+        const info = db.run(op.sql, op.params ?? []);
         if (op.checkAffectedRows && info.changes === 0) {
           throw new Error(
             "Row not found — the row may have been modified or deleted by another user",

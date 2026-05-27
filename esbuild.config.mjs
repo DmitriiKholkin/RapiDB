@@ -6,7 +6,7 @@ const extensionConfig = {
   entryPoints: ["src/extension/extension.ts"],
   bundle: true,
   outfile: "dist/extension.js",
-  external: ["vscode", "oracledb", "node-sqlite3-wasm"],
+  external: ["vscode", "oracledb", "better-sqlite3"],
   format: "cjs",
   platform: "node",
   target: "node20",
@@ -14,6 +14,22 @@ const extensionConfig = {
   sourcesContent: true,
   minify: isProduction,
   logLevel: "info",
+};
+const browserExtensionConfig = {
+  entryPoints: ["src/browser/extension.ts"],
+  bundle: true,
+  outfile: "dist/extension-web.js",
+  external: ["vscode"],
+  format: "cjs",
+  platform: "browser",
+  target: ["chrome120"],
+  sourcemap: isProduction ? false : "inline",
+  sourcesContent: true,
+  minify: isProduction,
+  logLevel: "info",
+  define: {
+    "process.env.NODE_ENV": isProduction ? '"production"' : '"development"',
+  },
 };
 const webviewConfig = {
   entryPoints: ["src/webview/main.tsx"],
@@ -44,12 +60,13 @@ const webviewConfig = {
 };
 async function build() {
   if (isWatch) {
-    console.log("⚡ RapiDB — watch mode (extension + webview)");
-    const [extCtx, wvCtx] = await Promise.all([
+    console.log("⚡ RapiDB — watch mode (desktop + browser + webview)");
+    const [extCtx, browserCtx, wvCtx] = await Promise.all([
       esbuild.context(extensionConfig),
+      esbuild.context(browserExtensionConfig),
       esbuild.context(webviewConfig),
     ]);
-    await Promise.all([extCtx.watch(), wvCtx.watch()]);
+    await Promise.all([extCtx.watch(), browserCtx.watch(), wvCtx.watch()]);
     console.log("👀 Watching for changes...");
   } else {
     console.log(
@@ -57,6 +74,7 @@ async function build() {
     );
     await Promise.all([
       esbuild.build(extensionConfig),
+      esbuild.build(browserExtensionConfig),
       esbuild.build(webviewConfig),
     ]);
     console.log("✅ Build complete → dist/");

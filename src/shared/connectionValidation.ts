@@ -123,6 +123,16 @@ function resolveSshHostVerificationMode(
     : "manual";
 }
 
+function resolveSqliteWalMode(
+  config: Partial<ConnectionConfig>,
+): NonNullable<ConnectionConfig["sqliteWalMode"]> | undefined {
+  if (config.type !== "sqlite") {
+    return undefined;
+  }
+
+  return config.sqliteWalMode === "off" ? "off" : "auto";
+}
+
 function hasMongoSrvUri(value: string | undefined): boolean {
   return typeof value === "string" && value.trim().startsWith("mongodb+srv://");
 }
@@ -272,6 +282,40 @@ function buildSshValidationIssues(
   return issues;
 }
 
+function buildSqliteValidationIssues(
+  config: Partial<ConnectionConfig>,
+): ConnectionValidationIssue[] {
+  if (config.sqliteWalMode === undefined) {
+    return [];
+  }
+
+  if (config.type !== "sqlite") {
+    return [
+      {
+        code: "invalid",
+        fields: ["sqliteWalMode"],
+        message:
+          'Field "sqliteWalMode" is supported only for sqlite connections.',
+      },
+    ];
+  }
+
+  const normalizedWalMode = resolveSqliteWalMode(config);
+  if (normalizedWalMode === undefined) {
+    return [];
+  }
+
+  return config.sqliteWalMode === normalizedWalMode
+    ? []
+    : [
+        {
+          code: "invalid",
+          fields: ["sqliteWalMode"],
+          message: 'Field "sqliteWalMode" must be either "auto" or "off".',
+        },
+      ];
+}
+
 export function validateConnectionConfig(
   config: Partial<ConnectionConfig>,
 ): ConnectionValidationResult {
@@ -316,6 +360,7 @@ export function validateConnectionConfig(
       fields: group,
       message: `At least one of "${group.join('", "')}" is required.`,
     })),
+    ...buildSqliteValidationIssues(config),
     ...buildSshValidationIssues(config),
   ];
 

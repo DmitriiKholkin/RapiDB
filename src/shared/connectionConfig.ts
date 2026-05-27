@@ -2,6 +2,7 @@ import type { ConnectionType } from "./connectionTypes";
 
 export type ConnectionSshAuthMethod = "password" | "privateKey";
 export type ConnectionSshHostVerificationMode = "manual" | "trustOnFirstUse";
+export type SQLiteWalMode = "auto" | "off";
 
 export interface ConnectionConfig {
   id: string;
@@ -24,6 +25,7 @@ export interface ConnectionConfig {
   authDatabase?: string;
   replicaSet?: string;
   directConnection?: boolean;
+  sqliteWalMode?: SQLiteWalMode;
   redisUsername?: string;
   keyPrefix?: string;
   awsProfile?: string;

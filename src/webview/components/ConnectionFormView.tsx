@@ -13,6 +13,7 @@ import React, {
 import type {
   ConnectionSshAuthMethod,
   ConnectionSshHostVerificationMode,
+  SQLiteWalMode,
 } from "../../shared/connectionConfig";
 import {
   type ConnectionType,
@@ -494,6 +495,9 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const [username, setUsername] = useState(existing?.username ?? "");
   const [password, setPassword] = useState("");
   const [filePath, setFilePath] = useState(existing?.filePath ?? "");
+  const [sqliteWalMode, setSqliteWalMode] = useState<SQLiteWalMode>(
+    existing?.sqliteWalMode === "off" ? "off" : "auto",
+  );
   const [folder, setFolder] = useState(existing?.folder ?? "");
   const [connectionReadOnly, setConnectionReadOnly] = useState(
     existing?.readOnly ?? false,
@@ -619,6 +623,12 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
         ? `The first accepted SSH fingerprint is pinned automatically. Current pinned fingerprint: ${sshHostFingerprintSha256.trim()}`
         : "The first successful SSH handshake will pin the discovered SHA256 fingerprint automatically and enforce it on future connections."
       : "Required. Use the OpenSSH SHA256 fingerprint format, for example SHA256:AbCdEf...";
+  const sqliteWalHint =
+    sqliteWalMode === "off"
+      ? "Advanced. Automatic WAL handling is disabled for this SQLite connection."
+      : connectionReadOnly
+        ? "Advanced. WAL is enabled automatically for writable SQLite connections; this read-only session leaves the file untouched."
+        : "Advanced. WAL is enabled automatically for writable SQLite connections unless you disable it here.";
   const effectiveColor = color || "#ffffff";
 
   useEffect(
@@ -699,7 +709,10 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       hasStoredSshPrivateKey: hasStoredSshPrivateKey || undefined,
       hasStoredSshPassphrase: hasStoredSshPassphrase || undefined,
       ...(isSQLite
-        ? { filePath: filePath.trim() }
+        ? {
+            filePath: filePath.trim(),
+            sqliteWalMode,
+          }
         : isDynamo
           ? {
               database: database.trim() || undefined,
@@ -767,6 +780,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     hasStoredSshPassphrase,
     isSQLite,
     filePath,
+    sqliteWalMode,
     host,
     port,
     database,
@@ -1007,14 +1021,28 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       <Card>
         <CardHeader icon="plug" label="Connection" />
         {isSQLite ? (
-          <Field label="Database File Path">
-            <FocusInput
-              aria-label="Database file path"
-              value={filePath}
-              onChange={(e) => setFilePath(e.target.value)}
-              placeholder="/absolute/path/to/database.db"
-            />
-          </Field>
+          <>
+            <Field label="Database File Path">
+              <FocusInput
+                aria-label="Database file path"
+                value={filePath}
+                onChange={(e) => setFilePath(e.target.value)}
+                placeholder="/absolute/path/to/database.db"
+              />
+            </Field>
+            <Field label="WAL Mode" hint={sqliteWalHint}>
+              <FocusSelect
+                aria-label="SQLite WAL mode"
+                value={sqliteWalMode}
+                onChange={(e) =>
+                  setSqliteWalMode(e.target.value as SQLiteWalMode)
+                }
+              >
+                <option value="auto">Automatic (recommended)</option>
+                <option value="off">Disabled</option>
+              </FocusSelect>
+            </Field>
+          </>
         ) : isDynamo ? (
           <>
             <Field label="Region" hint="AWS region, for example us-east-1.">

@@ -547,7 +547,14 @@ describe("ConnectionProvider", () => {
       getConnections: vi.fn(() => [
         { id: "conn-can", name: "Connected PG", type: "pg" },
         { id: "conn-no", name: "Disconnected Redis", type: "redis" },
-        { id: "conn-limited", name: "Disconnected SQLite", type: "sqlite" },
+        {
+          id: "conn-limited",
+          name: "Disconnected SQLite",
+          type: "sqlite",
+          filePath: "/tmp/app.db",
+          readOnly: true,
+          sqliteWalMode: "off",
+        },
       ]),
       isConnected: vi.fn((id: string) => id === "conn-can"),
       isConnecting: vi.fn(() => false),
@@ -561,6 +568,9 @@ describe("ConnectionProvider", () => {
             id: "conn-limited",
             name: "Disconnected SQLite",
             type: "sqlite",
+            filePath: "/tmp/app.db",
+            readOnly: true,
+            sqliteWalMode: "off",
           },
         ].find((connection) => connection.id === id),
       ),
@@ -596,6 +606,15 @@ describe("ConnectionProvider", () => {
     );
     expect(disconnectedRedis?.collapsibleState).toBe(1);
     expect(disconnectedSqlite?.collapsibleState).toBe(1);
+    expect(
+      (disconnectedSqlite?.tooltip as { value?: string } | undefined)?.value,
+    ).toContain("File: `/tmp/app.db`");
+    expect(
+      (disconnectedSqlite?.tooltip as { value?: string } | undefined)?.value,
+    ).toContain("Access: `read-only`");
+    expect(
+      (disconnectedSqlite?.tooltip as { value?: string } | undefined)?.value,
+    ).toContain("WAL: `disabled`");
     expect(disconnectedRedis?.command).toEqual({
       command: "rapidb.connect",
       title: "Connect",
@@ -837,7 +856,7 @@ describe("ConnectionProvider", () => {
 
     const roots = await provider.getChildren();
     expect(roots).toHaveLength(1);
-    expect(roots[0]?.label).toBe("Primary");
+    expect(roots[0]?.label).toBe("Primary ●");
 
     const databases = await provider.getChildren(roots[0]);
     expect(databases).toHaveLength(1);

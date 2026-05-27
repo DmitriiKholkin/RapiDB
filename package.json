@@ -40,6 +40,7 @@
     "db client"
   ],
   "main": "./dist/extension.js",
+  "browser": "./dist/extension-web.js",
   "contributes": {
     "commands": [
       {
@@ -676,6 +677,8 @@
     ]
   },
   "scripts": {
+    "postinstall": "node ./scripts/prepare-vscode-sqlite-runtime.mjs --best-effort",
+    "package:prepare": "node ./scripts/prepare-vscode-package.mjs",
     "vscode:prepublish": "node esbuild.config.mjs --production",
     "build": "node esbuild.config.mjs",
     "watch": "node esbuild.config.mjs --watch",
@@ -706,9 +709,12 @@
     "db:seed": "node --experimental-strip-types ./tests/scripts/db-seed.ts",
     "db:prepare": "node ./tests/scripts/run-npm-scripts.mjs db:wait db:reset db:seed",
     "db:down": "docker compose -f ./compose.yaml down --remove-orphans",
-    "package": "vsce package"
+    "native:sqlite:vscode": "node ./scripts/prepare-vscode-sqlite-runtime.mjs --strict",
+    "native:sqlite:vscode:all": "node ./scripts/prepare-vscode-sqlite-runtime.mjs --strict --all-targets",
+    "package": "npm run package:prepare && npm run native:sqlite:vscode:all && vsce package"
   },
   "devDependencies": {
+    "@electron/rebuild": "^4.0.1",
     "@biomejs/biome": "^2.4.13",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",
@@ -743,7 +749,7 @@
     "mongodb": "^6.21.0",
     "mssql": "^12.2.0",
     "mysql2": "^3.20.0",
-    "node-sqlite3-wasm": "^0.8.55",
+    "better-sqlite3": "^12.4.1",
     "oracledb": "^6.10.0",
     "pg": "^8.20.0",
     "react": "^19.2.4",

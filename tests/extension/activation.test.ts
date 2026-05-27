@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createExtensionContextStub } from "../support/fakeConnectionManagerStore";
 import { createMockVscodeModule } from "../support/mockVscode";
 
 const expectedCommands = [
@@ -217,6 +218,25 @@ describe("extension activation", () => {
         dragAndDropController: connectionProviderInstances[0],
         showCollapseAll: true,
       }),
+    );
+  });
+
+  it("activates without eagerly loading better-sqlite3", async () => {
+    let betterSqlite3LoadAttempts = 0;
+    vi.doUnmock("../../src/extension/connectionManager");
+    vi.doMock("better-sqlite3", () => {
+      betterSqlite3LoadAttempts += 1;
+      throw new Error("better-sqlite3 should not load during activation");
+    });
+
+    const extension = await import("../../src/extension/extension");
+    const context = createExtensionContextStub();
+
+    expect(() => extension.activate(context as never)).not.toThrow();
+    expect(betterSqlite3LoadAttempts).toBe(0);
+    expect(vscodeState.createTreeView).toHaveBeenCalledTimes(3);
+    expect(vscodeState.registerCommand).toHaveBeenCalledTimes(
+      expectedCommands.length,
     );
   });
 

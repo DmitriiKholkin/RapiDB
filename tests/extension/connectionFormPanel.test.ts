@@ -396,6 +396,77 @@ describe("ConnectionFormPanel", () => {
     await expect(promise).resolves.toBeUndefined();
   });
 
+  it("preserves SQLite WAL mode in edit state and save payloads", async () => {
+    const context = {
+      secrets: {
+        get: vi.fn(async () => undefined),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn().mockResolvedValue(undefined),
+      getConnection: vi.fn(() => undefined),
+      testConnection: vi.fn(),
+    };
+
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+      {
+        id: "conn-sqlite",
+        name: "Local SQLite",
+        type: "sqlite",
+        filePath: "/tmp/app.db",
+        sqliteWalMode: "off",
+      },
+    );
+
+    await Promise.resolve();
+
+    const shellCall = vi.mocked(createWebviewShell).mock.calls.at(-1)?.[0];
+    expect(shellCall?.initialState).toEqual(
+      expect.objectContaining({
+        view: "connection",
+        existing: expect.objectContaining({
+          id: "conn-sqlite",
+          filePath: "/tmp/app.db",
+          sqliteWalMode: "off",
+        }),
+      }),
+    );
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected a webview panel to be created.");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-sqlite",
+        name: "Local SQLite",
+        type: "sqlite",
+        filePath: "/tmp/app.db",
+        sqliteWalMode: "off",
+      },
+    });
+
+    await expect(promise).resolves.toEqual(
+      expect.objectContaining({
+        id: "conn-sqlite",
+        type: "sqlite",
+        sqliteWalMode: "off",
+      }),
+    );
+    expect(connectionManager.saveConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "conn-sqlite",
+        sqliteWalMode: "off",
+      }),
+    );
+  });
+
   it("returns validation details on test and does not call manager testConnection for invalid payload", async () => {
     const context = {
       secrets: {

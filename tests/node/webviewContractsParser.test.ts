@@ -387,6 +387,50 @@ describe("parseConnectionFormPanelMessage", () => {
       payload: { id: "conn-ro", readOnly: true },
     });
   });
+
+  it("defaults sqlite WAL mode to auto in connection submissions", () => {
+    const parsed = parseConnectionFormPanelMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-sqlite-auto",
+        name: "SQLite Auto WAL",
+        type: "sqlite",
+        filePath: "/tmp/sqlite-auto.db",
+      },
+    });
+
+    expect(parsed).toEqual({
+      type: "saveConnection",
+      payload: expect.objectContaining({
+        id: "conn-sqlite-auto",
+        type: "sqlite",
+        filePath: "/tmp/sqlite-auto.db",
+        sqliteWalMode: "auto",
+      }),
+    });
+  });
+
+  it("preserves explicit sqlite WAL mode selections in connection submissions", () => {
+    const parsed = parseConnectionFormPanelMessage({
+      type: "testConnection",
+      payload: {
+        id: "conn-sqlite-off",
+        name: "SQLite WAL Off",
+        type: "sqlite",
+        filePath: "/tmp/sqlite-off.db",
+        sqliteWalMode: "off",
+      },
+    });
+
+    expect(parsed).toEqual({
+      type: "testConnection",
+      payload: expect.objectContaining({
+        id: "conn-sqlite-off",
+        type: "sqlite",
+        sqliteWalMode: "off",
+      }),
+    });
+  });
 });
 
 describe("parseWebviewInitialState", () => {
@@ -644,6 +688,28 @@ describe("parseWebviewInitialState", () => {
         useSecretStorage: undefined,
         hasStoredSecret: true,
       },
+    });
+  });
+
+  it("defaults sqlite WAL mode to auto in existing connection state", () => {
+    const parsed = parseWebviewInitialState({
+      view: "connection",
+      existing: {
+        id: "conn-sqlite-existing",
+        name: "SQLite Existing",
+        type: "sqlite",
+        filePath: "/tmp/sqlite-existing.db",
+      },
+    });
+
+    expect(parsed).toEqual({
+      view: "connection",
+      existing: expect.objectContaining({
+        id: "conn-sqlite-existing",
+        type: "sqlite",
+        filePath: "/tmp/sqlite-existing.db",
+        sqliteWalMode: "auto",
+      }),
     });
   });
 

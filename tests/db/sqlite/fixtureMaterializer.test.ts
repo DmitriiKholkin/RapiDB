@@ -1,8 +1,11 @@
-import { Database } from "node-sqlite3-wasm";
 import { afterEach, describe, expect, it } from "vitest";
+import {
+  openSQLiteDatabase,
+  type SQLiteDatabase,
+} from "../../../src/extension/dbDrivers/sqliteRuntime.ts";
 import { materializeSqliteFixture } from "../../runtime/liveDbOrchestration.ts";
 
-const openDatabases: Database[] = [];
+const openDatabases: SQLiteDatabase[] = [];
 
 afterEach(() => {
   for (const database of openDatabases.splice(0, openDatabases.length)) {
@@ -13,7 +16,7 @@ afterEach(() => {
 describe("sqlite fixture materializer", () => {
   it("creates the canonical sqlite fixture dataset on a temp file", async () => {
     const { filePath } = await materializeSqliteFixture();
-    const db = new Database(filePath);
+    const db = openSQLiteDatabase({ filePath, sqliteWalMode: "off" });
     openDatabases.push(db);
 
     const fixtureRowCount = db.get(

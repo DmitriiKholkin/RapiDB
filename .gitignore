@@ -144,6 +144,7 @@ vite.config.ts.timestamp-*
 .vite/
 
 .DS_Store
+.rapidb-vscode/
 .vscode
 biome.json
 *.vsix

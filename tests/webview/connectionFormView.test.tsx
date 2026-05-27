@@ -30,6 +30,12 @@ describe("ConnectionFormView", () => {
     await user.click(screen.getByRole("button", { name: /sqlite/i }));
 
     expect(screen.getByLabelText("Database file path")).toBeTruthy();
+    expect(screen.getByLabelText("SQLite WAL mode")).toBeTruthy();
+    expect(
+      screen.getByText(
+        /wal is enabled automatically for writable sqlite connections unless you disable it here/i,
+      ),
+    ).toBeTruthy();
     expect(screen.queryByLabelText("Host")).toBeNull();
 
     await user.click(screen.getByRole("button", { name: /oracle/i }));
@@ -570,6 +576,45 @@ describe("ConnectionFormView", () => {
       payload: expect.objectContaining({
         id: "conn-1",
         readOnly: false,
+      }),
+    });
+  });
+
+  it("tracks SQLite WAL mode through edit state and save payloads", async () => {
+    const user = userEvent.setup();
+    const existing = {
+      id: "conn-sqlite",
+      name: "Local SQLite",
+      type: "sqlite" as const,
+      filePath: "/tmp/app.db",
+      sqliteWalMode: "off" as const,
+    };
+
+    render(<ConnectionFormView existing={existing} />);
+
+    expect(
+      (screen.getByLabelText("SQLite WAL mode") as HTMLSelectElement).value,
+    ).toBe("off");
+    expect(
+      screen.getByText(
+        /automatic wal handling is disabled for this sqlite connection/i,
+      ),
+    ).toBeTruthy();
+
+    await user.selectOptions(screen.getByLabelText("SQLite WAL mode"), [
+      "auto",
+    ]);
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "saveConnection",
+      payload: expect.objectContaining({
+        id: "conn-sqlite",
+        type: "sqlite",
+        filePath: "/tmp/app.db",
+        sqliteWalMode: "auto",
       }),
     });
   });
