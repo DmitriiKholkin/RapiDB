@@ -717,6 +717,24 @@ export class ConnectionFormPanel {
         this.panel.dispose();
         break;
       }
+      case "browseFile": {
+        const uris = await vscode.window.showOpenDialog({
+          canSelectFiles: true,
+          canSelectFolders: false,
+          canSelectMany: false,
+          filters: {
+            "SQLite databases": ["db", "sqlite", "sqlite3", "db3"],
+            "All files": ["*"],
+          },
+          title: "Select SQLite database file",
+        });
+        const selected = uris?.[0];
+        this.panel.webview.postMessage({
+          type: "browseFileResult",
+          payload: { filePath: selected ? selected.fsPath : null },
+        });
+        break;
+      }
     }
   }
 

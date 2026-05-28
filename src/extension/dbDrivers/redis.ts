@@ -511,7 +511,13 @@ export class RedisDriver implements IDBDriver {
     return null;
   }
 
-  async getRoutineDefinition(): Promise<string> {
+  async getRoutineDefinition(
+    _database?: string,
+    _schema?: string,
+    _name?: string,
+    _kind?: "function" | "procedure",
+    _routineIdentity?: string,
+  ): Promise<string> {
     unsupported("Redis routine definition");
   }
 

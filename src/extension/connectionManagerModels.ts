@@ -36,6 +36,7 @@ export interface SchemaObjectEntry {
   schema: string;
   object: string;
   type?: DbObjectKind;
+  routineIdentity?: string;
   columns: {
     name: string;
     type: string;
@@ -50,6 +51,7 @@ export interface SchemaColumnEntry {
 export interface SchemaSnapshotObjectEntry {
   name: string;
   type: DbObjectKind;
+  routineIdentity?: string;
   columns: SchemaColumnEntry[];
 }
 

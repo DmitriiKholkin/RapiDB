@@ -318,6 +318,9 @@ function cloneSchemaSnapshotObjectEntry(
   return {
     name: object.name,
     type: object.type,
+    ...(object.routineIdentity
+      ? { routineIdentity: object.routineIdentity }
+      : {}),
     columns: object.columns.map((column) => ({
       name: column.name,
       type: column.type,
@@ -638,6 +641,9 @@ function flattenSchemaSnapshot(snapshot: SchemaSnapshot): SchemaObjectEntry[] {
         schema: schema.name,
         object: object.name,
         type: object.type,
+        ...(object.routineIdentity
+          ? { routineIdentity: object.routineIdentity }
+          : {}),
         columns: object.columns,
       })),
     ),
@@ -2951,6 +2957,9 @@ export class ConnectionManager
         (object, index) => ({
           name: object.name,
           type: object.type,
+          ...(object.routineIdentity
+            ? { routineIdentity: object.routineIdentity }
+            : {}),
           columns: isDataDbObjectKind(object.type)
             ? describedColumns[index].map((column) => ({
                 name: column.name,

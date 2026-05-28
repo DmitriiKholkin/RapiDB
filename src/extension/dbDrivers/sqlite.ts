@@ -1075,6 +1075,7 @@ export class SQLiteDriver extends BaseDBDriver {
     _schema: string,
     name: string,
     kind: "function" | "procedure",
+    _routineIdentity?: string,
   ): Promise<string> {
     return `-- SQLite does not support stored ${kind}s.\n-- Object: ${name}`;
   }

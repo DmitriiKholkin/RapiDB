@@ -269,7 +269,8 @@ export type ErdPanelMessage =
 export type ConnectionFormPanelMessage =
   | WebviewMessageEnvelope<"saveConnection", ConnectionFormSubmission>
   | WebviewMessageEnvelope<"testConnection", ConnectionFormSubmission>
-  | WebviewMessageEnvelope<"cancel">;
+  | WebviewMessageEnvelope<"cancel">
+  | WebviewMessageEnvelope<"browseFile">;
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -929,6 +930,9 @@ export function parseConnectionFormPanelMessage(
       const payload = parseConnectionFormSubmission(envelope.payload);
       return payload ? { type: envelope.type, payload } : null;
     }
+
+    case "browseFile":
+      return { type: envelope.type };
 
     default:
       return null;

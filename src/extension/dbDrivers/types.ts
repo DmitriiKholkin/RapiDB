@@ -46,6 +46,7 @@ export interface TableInfo {
   schema: string;
   name: string;
   type: DbObjectKind;
+  routineIdentity?: string;
 }
 export interface QueryResult {
   columns: string[];
@@ -279,6 +280,7 @@ export interface IDBDriver {
     schema: string,
     name: string,
     kind: "function" | "procedure",
+    routineIdentity?: string,
   ): Promise<string>;
   query(sql: string, params?: unknown[]): Promise<QueryResult>;
   readTablePage?(

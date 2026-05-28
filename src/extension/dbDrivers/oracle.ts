@@ -1672,6 +1672,7 @@ export class OracleDriver extends BaseDBDriver {
     schema: string,
     name: string,
     _kind: "function" | "procedure",
+    _routineIdentity?: string,
   ): Promise<string> {
     const conn = await this.getConnection();
     try {

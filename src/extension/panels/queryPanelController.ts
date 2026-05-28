@@ -31,8 +31,51 @@ const SUPERSEDED_QUERY_REJECTED_MESSAGE =
   "[RapiDB] Cannot execute query while a previous query is still running for this connection.";
 const SUPERSEDED_QUERY_CANCEL_TIMEOUT_MS = 1_500;
 
-function trimTrailingSemicolons(queryText: string): string {
-  return queryText.replace(/[\s;]+$/g, "");
+function stripTrailingBlockComment(queryText: string): string {
+  if (!queryText.endsWith("*/")) {
+    return queryText;
+  }
+
+  const blockStart = queryText.lastIndexOf("/*");
+  if (blockStart < 0) {
+    return queryText;
+  }
+
+  return queryText.slice(0, blockStart);
+}
+
+function trimTrailingSemicolonsAndComments(queryText: string): string {
+  let normalized = queryText;
+
+  while (normalized.length > 0) {
+    const withoutTrailingWhitespace = normalized.replace(/\s+$/g, "");
+    if (withoutTrailingWhitespace !== normalized) {
+      normalized = withoutTrailingWhitespace;
+      continue;
+    }
+
+    const withoutTrailingLineComment = normalized.replace(/--[^\r\n]*$/g, "");
+    if (withoutTrailingLineComment !== normalized) {
+      normalized = withoutTrailingLineComment;
+      continue;
+    }
+
+    const withoutTrailingBlockComment = stripTrailingBlockComment(normalized);
+    if (withoutTrailingBlockComment !== normalized) {
+      normalized = withoutTrailingBlockComment;
+      continue;
+    }
+
+    const withoutTrailingSemicolons = normalized.replace(/;+$/g, "");
+    if (withoutTrailingSemicolons !== normalized) {
+      normalized = withoutTrailingSemicolons;
+      continue;
+    }
+
+    break;
+  }
+
+  return normalized;
 }
 
 function stripLeadingSqlComments(queryText: string): string {
@@ -73,7 +116,7 @@ function applyHardCapToSqlQuery(
     };
   }
 
-  const normalizedQuery = trimTrailingSemicolons(queryText);
+  const normalizedQuery = trimTrailingSemicolonsAndComments(queryText);
   if (!normalizedQuery) {
     return {
       queryText,

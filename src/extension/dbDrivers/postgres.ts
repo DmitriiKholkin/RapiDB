@@ -211,6 +211,22 @@ function approximateNumericFilterTolerance(rawValue: string): number {
   const precision = Math.min(Math.max(fraction + 2, 6), 12);
   return 10 ** -precision;
 }
+
+function parsePostgresRoutineIdentity(value: string | undefined): {
+  oid: string;
+} | null {
+  if (!value) {
+    return null;
+  }
+
+  const match = /^oid:(\d+)$/.exec(value.trim());
+  if (!match) {
+    return null;
+  }
+
+  return { oid: match[1] };
+}
+
 export class PostgresDriver extends BaseDBDriver {
   protected override getQueryEditorSqlDialect() {
     return "postgresql" as const;
@@ -415,6 +431,7 @@ export class PostgresDriver extends BaseDBDriver {
       try {
         const routineRes = await pool.query(
           `SELECT p.proname AS name,
+                  p.oid::text AS routine_id,
                   CASE p.prokind WHEN 'f' THEN 'function' WHEN 'p' THEN 'procedure'
                                  WHEN 'a' THEN 'function'  ELSE 'function' END AS type
            FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -426,6 +443,10 @@ export class PostgresDriver extends BaseDBDriver {
             schema,
             name: r.name as string,
             type: r.type as TableInfo["type"],
+            routineIdentity:
+              typeof r.routine_id === "string"
+                ? `oid:${r.routine_id}`
+                : undefined,
           });
         }
       } catch {
@@ -1000,7 +1021,25 @@ export class PostgresDriver extends BaseDBDriver {
     schema: string,
     name: string,
     _kind: "function" | "procedure",
+    routineIdentity?: string,
   ): Promise<string> {
+    const parsedIdentity = parsePostgresRoutineIdentity(routineIdentity);
+    if (parsedIdentity) {
+      const byOidRes = await this.requirePool().query<{
+        def: string;
+      }>(
+        `SELECT pg_get_functiondef(p.oid) AS def
+         FROM pg_proc p
+         WHERE p.oid = $1::oid
+         LIMIT 1`,
+        [parsedIdentity.oid],
+      );
+      const byOidDefinition = byOidRes.rows[0]?.def;
+      if (byOidDefinition) {
+        return byOidDefinition;
+      }
+    }
+
     const res = await this.requirePool().query<{
       def: string;
     }>(

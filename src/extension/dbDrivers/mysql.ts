@@ -1386,6 +1386,7 @@ export class MySQLDriver extends BaseDBDriver {
     _schema: string,
     name: string,
     kind: "function" | "procedure",
+    _routineIdentity?: string,
   ): Promise<string> {
     const type = kind === "function" ? "FUNCTION" : "PROCEDURE";
     const db = database.replace(/`/g, "``");

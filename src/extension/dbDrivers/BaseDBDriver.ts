@@ -779,6 +779,7 @@ export abstract class BaseDBDriver implements IDBDriver {
     schema: string,
     name: string,
     kind: "function" | "procedure",
+    routineIdentity?: string,
   ): Promise<string>;
   abstract query(sql: string, params?: unknown[]): Promise<QueryResult>;
   abstract runTransaction(operations: TransactionOperation[]): Promise<void>;

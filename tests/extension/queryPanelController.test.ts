@@ -339,6 +339,64 @@ describe("QueryPanelController", () => {
     );
   });
 
+  it("strips trailing semicolon comments before SQL hard-cap wrapping", async () => {
+    const query = vi.fn(async () => ({
+      columns: ["database_name"],
+      rows: [{ database_name: "postgres" }],
+      columnMeta: [],
+      rowCount: 1,
+      executionTimeMs: 2,
+    }));
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "active",
+        name: "Primary",
+        type: "pg",
+      })),
+      isConnected: vi.fn(() => true),
+      connectTo: vi.fn(async () => undefined),
+      addToHistory: vi.fn(async () => undefined),
+      addBookmark: vi.fn(async () => undefined),
+      getDriver: vi.fn(() => ({ query })),
+      getQueryRowLimit: vi.fn(() => 50_000),
+      getSchemaAsync: vi.fn(async () => []),
+    };
+
+    const view = {
+      getActiveConnectionId: vi.fn(() => "active"),
+      getInitialConnectionId: vi.fn(() => "initial"),
+      getLastQueryResult: vi.fn(() => null),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+
+    await controller.handleMessage({
+      type: "executeQuery",
+      payload: {
+        queryText:
+          "SELECT datname AS database_name FROM pg_catalog.pg_database WHERE datistemplate = false; -- trailing comment",
+      },
+    });
+
+    expect(query).toHaveBeenCalledWith(
+      "SELECT * FROM (SELECT datname AS database_name FROM pg_catalog.pg_database WHERE datistemplate = false) AS rapidb_query_cap LIMIT 10001",
+    );
+    expect(formatQueryResult).toHaveBeenCalledWith(
+      expect.objectContaining({ rows: [{ database_name: "postgres" }] }),
+      10000,
+    );
+  });
+
   it("pushes merged cached schema only for the active or initial connection when schema loads", async () => {
     const getSchema = vi.fn((connectionId: string) => [
       {

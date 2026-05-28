@@ -462,6 +462,7 @@ function registerCommands(
           node.schema ?? "",
           node.objectName,
           objectKind,
+          node.detailKey,
         );
       } else if (
         objectKind &&
@@ -652,6 +653,7 @@ function registerCommands(
         node.schema ?? "",
         node.objectName,
         kind,
+        node.detailKey,
       );
       QueryPanel.createOrShow(
         context,

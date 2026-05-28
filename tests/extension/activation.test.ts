@@ -726,6 +726,7 @@ describe("extension activation", () => {
       database: "app_db",
       schema: "public",
       objectName: "users_total",
+      detailKey: "oid:12345",
     });
     await showDdlCommand({
       kind: "procedure",
@@ -760,6 +761,7 @@ describe("extension activation", () => {
       "public",
       "users_total",
       "function",
+      "oid:12345",
     );
     expect(driver.getRoutineDefinition).toHaveBeenNthCalledWith(
       2,
@@ -767,6 +769,7 @@ describe("extension activation", () => {
       "public",
       "refresh_users",
       "procedure",
+      undefined,
     );
     expect(driver.getObjectDefinition).toHaveBeenNthCalledWith(
       1,

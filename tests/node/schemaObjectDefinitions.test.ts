@@ -110,7 +110,15 @@ describe("schema object definitions", () => {
         return { rows: [{ name: "daily_users" }] };
       }
       if (sql.includes("pg_proc")) {
-        return { rows: [{ name: "refresh_users", type: "procedure" }] };
+        return {
+          rows: [
+            {
+              name: "refresh_users",
+              routine_id: "42001",
+              type: "procedure",
+            },
+          ],
+        };
       }
       if (sql.includes("information_schema.sequences")) {
         return { rows: [{ name: "users_id_seq" }] };
@@ -145,8 +153,46 @@ describe("schema object definitions", () => {
           type: "sequence",
         },
         { schema: "public", name: "user_status", type: "type" },
+        {
+          schema: "public",
+          name: "refresh_users",
+          type: "procedure",
+          routineIdentity: "oid:42001",
+        },
       ]),
     );
+  });
+
+  it("uses Postgres routine identity to fetch overloaded routine definition", async () => {
+    const driver = new PostgresDriver(postgresConfig as ConnectionConfig);
+    const query = vi.fn(async (sql: string, params?: unknown[]) => {
+      if (sql.includes("WHERE p.oid = $1::oid")) {
+        expect(params).toEqual(["16432"]);
+        return {
+          rows: [
+            {
+              def: "CREATE FUNCTION public.digest(bytea, text) RETURNS text LANGUAGE sql AS $$ SELECT 'x'; $$;",
+            },
+          ],
+        };
+      }
+
+      throw new Error(`Unexpected SQL: ${sql}`);
+    });
+
+    (driver as unknown as { pool: { query: typeof query } }).pool = {
+      query,
+    } as never;
+
+    await expect(
+      driver.getRoutineDefinition(
+        "rapidb",
+        "public",
+        "digest",
+        "function",
+        "oid:16432",
+      ),
+    ).resolves.toContain("digest(bytea, text)");
   });
 
   it("renders Postgres materialized view, sequence, and type DDL", async () => {

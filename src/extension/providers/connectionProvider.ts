@@ -91,27 +91,42 @@ type CategoryKind =
 
 const _coloredIconCache = new Map<string, vscode.Uri>();
 
-function getColoredServerIconUri(hexColor: string): vscode.Uri {
-  const cached = _coloredIconCache.get(hexColor);
+function getColoredServerIconUri(
+  hexColor: string,
+  isConnected: boolean,
+): vscode.Uri {
+  const safeHex = /^#[0-9a-fA-F]{3,8}$/.test(hexColor) ? hexColor : "#888888";
+  const stateKey = isConnected ? "connected" : "disconnected";
+  const cacheKey = `${safeHex}:${stateKey}`;
+  const cached = _coloredIconCache.get(cacheKey);
   if (cached) {
     return cached;
   }
-  const safeHex = /^#[0-9a-fA-F]{3,8}$/.test(hexColor) ? hexColor : "#888888";
   const safeKey = safeHex.replace("#", "");
-  const svgContent = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  const svgIconDisconnected = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
   <path fill="${safeHex}" d="M12 11.5a.5.5 0 1 1-1 0a.5.5 0 0 1 1 0M11.5 8a.5.5 0 1 0 0-1a.5.5 0 0 0 0 1M14 4.5c-.001.37-.14.727-.39 1c.25.273.389.63.39 1v2c-.001.37-.14.727-.39 1c.25.273.389.63.39 1v2a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 12.5v-2c.001-.37.14-.727.39-1a1.5 1.5 0 0 1-.39-1v-2c.001-.37.14-.727.39-1a1.5 1.5 0 0 1-.39-1v-2A1.5 1.5 0 0 1 3.5 1h9A1.5 1.5 0 0 1 14 2.5zm-11 0a.5.5 0 0 0 .5.5h9a.5.5 0 0 0 .5-.5v-2a.5.5 0 0 0-.5-.5h-9a.5.5 0 0 0-.5.5zM12.5 6h-9a.5.5 0 0 0-.5.5v2a.5.5 0 0 0 .5.5h9a.5.5 0 0 0 .5-.5v-2a.5.5 0 0 0-.5-.5m.5 4.5a.5.5 0 0 0-.5-.5h-9a.5.5 0 0 0-.5.5v2a.5.5 0 0 0 .5.5h9a.5.5 0 0 0 .5-.5zM11.5 4a.5.5 0 1 0 0-1a.5.5 0 0 0 0 1"/>
+  </svg>`;
+  const svgIconConnected = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <path fill="${safeHex}" d="M3.5 1h9A1.5 1.5 0 0 1 14 2.5v2c-.25.273-.389.63-.39 1c.001.37.14.727.39 1v2c-.25.273-.389.63-.39 1c.001.37.14.727.39 1v2a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 12.5v-2c.25-.273.389-.63.39-1c-.001-.37-.14-.727-.39-1v-2c.25-.273.389-.63.39-1c-.001-.37-.14-.727-.39-1v-2A1.5 1.5 0 0 1 3.5 1z"/>
+  <path fill="var(--vscode-icon-foreground)" fill-rule="evenodd" d="M12 11.5a.5.5 0 1 1-1 0a.5.5 0 0 1 1 0M11.5 8a.5.5 0 1 0 0-1a.5.5 0 0 0 0 1M14 4.5c-.001.37-.14.727-.39 1c.25.273.389.63.39 1v2c-.001.37-.14.727-.39 1c.25.273.389.63.39 1v2a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 12.5v-2c.001-.37.14-.727.39-1a1.5 1.5 0 0 1-.39-1v-2c.001-.37.14-.727.39-1a1.5 1.5 0 0 1-.39-1v-2A1.5 1.5 0 0 1 3.5 1h9A1.5 1.5 0 0 1 14 2.5zm-11 0a.5.5 0 0 0 .5.5h9a.5.5 0 0 0 .5-.5v-2a.5.5 0 0 0-.5-.5h-9a.5.5 0 0 0-.5.5zM12.5 6h-9a.5.5 0 0 0-.5.5v2a.5.5 0 0 0 .5.5h9a.5.5 0 0 0 .5-.5v-2a.5.5 0 0 0-.5-.5m.5 4.5a.5.5 0 0 0-.5-.5h-9a.5.5 0 0 0-.5.5v2a.5.5 0 0 0 .5.5h9a.5.5 0 0 0 .5-.5zM11.5 4a.5.5 0 1 0 0-1a.5.5 0 0 0 0 1"/>
   </svg>`;
   const dir = path.join(os.tmpdir(), "rapidb-icons");
   try {
     fs.mkdirSync(dir, { recursive: true });
-    const filePath = path.join(dir, `conn-${safeKey}.svg`);
-    fs.writeFileSync(filePath, svgContent, "utf8");
+    const filePath = path.join(dir, `conn-${safeKey}-${stateKey}.svg`);
+    fs.writeFileSync(
+      filePath,
+      isConnected ? svgIconConnected : svgIconDisconnected,
+      "utf8",
+    );
     const uri = vscode.Uri.file(filePath);
-    _coloredIconCache.set(hexColor, uri);
+    _coloredIconCache.set(cacheKey, uri);
     return uri;
   } catch {
-    const fallback = vscode.Uri.file(path.join(dir, `conn-${safeKey}.svg`));
-    _coloredIconCache.set(hexColor, fallback);
+    const fallback = vscode.Uri.file(
+      path.join(dir, `conn-${safeKey}-${stateKey}.svg`),
+    );
+    _coloredIconCache.set(cacheKey, fallback);
     return fallback;
   }
 }
@@ -791,6 +806,7 @@ export class ConnectionProvider
         databaseName,
         schemaName,
         object.name,
+        object.routineIdentity,
         manifest,
       ),
     );
@@ -1016,6 +1032,7 @@ export class ConnectionProvider
     databaseName: string,
     schemaName: string,
     objectName: string,
+    detailKey: string | undefined,
     manifest: DriverEntityManifest,
   ): RapiDBNode {
     const dataObjectKind = isDataDbObjectKind(kind) ? kind : undefined;
@@ -1034,7 +1051,7 @@ export class ConnectionProvider
       objectName,
       undefined,
       undefined,
-      undefined,
+      detailKey,
       undefined,
       dataObjectKind,
     );
@@ -1384,10 +1401,8 @@ export class ConnectionProvider
         ? "connectionNode_connecting"
         : "connectionNode_disconnected";
 
-    const label = connected ? `${config.name} ●` : config.name;
-
     const node = new RapiDBNode(
-      label,
+      config.name,
       kind,
       this._dragActive
         ? vscode.TreeItemCollapsibleState.None
@@ -1402,7 +1417,7 @@ export class ConnectionProvider
     node.description = config.type;
 
     if (config.color && kind !== "connectionNode_connecting") {
-      const iconUri = getColoredServerIconUri(config.color);
+      const iconUri = getColoredServerIconUri(config.color, connected);
       node.iconPath = { light: iconUri, dark: iconUri };
     }
 

@@ -633,6 +633,16 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
 
   useEffect(
     () =>
+      onMessage<{ filePath: string | null }>("browseFileResult", (p) => {
+        if (p.filePath !== null) {
+          setFilePath(p.filePath);
+        }
+      }),
+    [],
+  );
+
+  useEffect(
+    () =>
       onMessage<{ success: boolean; error?: string }>("testResult", (p) => {
         setTestState(p.success ? "ok" : "fail");
         setTestError(p.error ?? "Connection failed");
@@ -1027,12 +1037,22 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
         {isSQLite ? (
           <>
             <Field label="Database File Path">
-              <FocusInput
-                aria-label="Database file path"
-                value={filePath}
-                onChange={(e) => setFilePath(e.target.value)}
-                placeholder="/absolute/path/to/database.db"
-              />
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <FocusInput
+                  aria-label="Database file path"
+                  value={filePath}
+                  onChange={(e) => setFilePath(e.target.value)}
+                  placeholder="/absolute/path/to/database.db"
+                  style={{ flex: 1 }}
+                />
+                <button
+                  type="button"
+                  style={buildButtonStyle("secondary", { size: "sm" })}
+                  onClick={() => postMessage("browseFile")}
+                >
+                  Browse…
+                </button>
+              </div>
             </Field>
             <Field label="WAL Mode" hint={sqliteWalHint}>
               <FocusSelect
