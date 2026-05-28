@@ -970,12 +970,16 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                   });
                 }}
                 style={{
-                  background: "transparent",
+                  background: showColorPicker
+                    ? "var(--vscode-editor-background)"
+                    : "var(--vscode-editor-foreground)",
                   border:
                     "1px solid var(--vscode-input-border, var(--vscode-widget-border, #555))",
                   borderRadius: 8,
                   cursor: "pointer",
-                  color: "var(--vscode-foreground)",
+                  color: showColorPicker
+                    ? "var(--vscode-editor-foreground)"
+                    : "var(--vscode-editor-background)",
                   opacity: 0.7,
                   fontSize: 12,
                   padding: "5px 8px",

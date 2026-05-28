@@ -7,6 +7,7 @@ import {
   resolveSQLiteRuntimeTarget,
 } from "../../src/extension/dbDrivers/sqliteRuntime";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
+import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
 import { createProjectTempDir } from "../runtime/tempDirectories.ts";
 
 const openDrivers = new Set<SQLiteDriver>();
@@ -61,6 +62,80 @@ describe("SQLite better-sqlite3 runtime adapter", () => {
     await expect(
       driver.query("INSERT INTO children (id, parent_id) VALUES (1, 999)"),
     ).rejects.toThrow(/foreign key/i);
+  });
+
+  it("filters weakly typed INTEGER values using raw SQLite equality semantics", async () => {
+    const { driver } = await createDriver();
+    const typedIntegerColumn: ColumnTypeMeta = {
+      name: "typed_integer",
+      type: "INTEGER",
+      nativeType: "INTEGER",
+      category: "integer",
+      nullable: true,
+      isPrimaryKey: false,
+      isForeignKey: false,
+      filterable: true,
+      filterOperators: [
+        "eq",
+        "neq",
+        "gt",
+        "gte",
+        "lt",
+        "lte",
+        "between",
+        "in",
+        "is_null",
+        "is_not_null",
+      ],
+      valueSemantics: "plain",
+    };
+
+    await driver.connect();
+    await driver.query(
+      "CREATE TABLE weak_values (id INTEGER PRIMARY KEY, typed_integer INTEGER)",
+    );
+    await driver.query(
+      "INSERT INTO weak_values (id, typed_integer) VALUES (1, 'not_a_number'), (2, '-9223372036854776000')",
+    );
+
+    const textFilter = driver.buildFilterCondition(
+      typedIntegerColumn,
+      "eq",
+      driver.normalizeFilterValue(
+        typedIntegerColumn,
+        "eq",
+        "not_a_number",
+      ) as string,
+      1,
+    );
+    const largeIntegerFilter = driver.buildFilterCondition(
+      typedIntegerColumn,
+      "eq",
+      driver.normalizeFilterValue(
+        typedIntegerColumn,
+        "eq",
+        "-9223372036854776000",
+      ) as string,
+      1,
+    );
+
+    expect(textFilter).toBeTruthy();
+    expect(largeIntegerFilter).toBeTruthy();
+
+    const textResult = await driver.query(
+      `SELECT typed_integer FROM weak_values WHERE ${textFilter?.sql}`,
+      textFilter?.params,
+    );
+    const largeIntegerResult = await driver.query(
+      `SELECT typed_integer FROM weak_values WHERE ${largeIntegerFilter?.sql}`,
+      largeIntegerFilter?.params,
+    );
+
+    expect(textResult.rows).toEqual([{ __col_0: "not_a_number" }]);
+    expect(largeIntegerResult.rowCount).toBe(1);
+    expect(String(largeIntegerResult.rows[0]?.__col_0)).toBe(
+      "-9223372036854776000",
+    );
   });
 
   it("forces DELETE journal mode when sqliteWalMode is off", async () => {
@@ -162,6 +237,82 @@ describe("SQLite better-sqlite3 runtime adapter", () => {
     expect((error as Error).message).toContain(filePath);
     expect((error as Error).message).toContain("read-only mode");
     await expect(access(filePath)).rejects.toThrow();
+  });
+
+  it("formats non-finite REAL values as display strings", () => {
+    const driver = new SQLiteDriver({
+      id: "sqlite-runtime-special-float",
+      name: "SQLite Runtime Special Float",
+      type: "sqlite",
+      filePath: "/tmp/sqlite-runtime-special-float.sqlite",
+    } as ConnectionConfig);
+    const column: ColumnTypeMeta = {
+      name: "col_real",
+      type: "real",
+      nativeType: "REAL",
+      category: "float",
+      nullable: true,
+      defaultValue: undefined,
+      isPrimaryKey: false,
+      primaryKeyOrdinal: undefined,
+      isForeignKey: false,
+      filterable: true,
+      filterOperators: [],
+      valueSemantics: "plain",
+    };
+
+    expect(driver.formatOutputValue(Number.POSITIVE_INFINITY, column)).toBe(
+      "Infinity",
+    );
+  });
+
+  it("lists attached databases and their objects after ATTACH DATABASE", async () => {
+    const { driver } = await createDriver({ name: "SQLite Main" });
+    const { driver: billingDriver, filePath: billingPath } = await createDriver(
+      {
+        name: "SQLite Billing",
+      },
+    );
+
+    await billingDriver.connect();
+    await billingDriver.query(
+      "CREATE TABLE invoices (id INTEGER PRIMARY KEY, amount_cents INTEGER NOT NULL)",
+    );
+    await billingDriver.disconnect();
+
+    await driver.connect();
+    await driver.query("CREATE TABLE customers (id INTEGER PRIMARY KEY)");
+    await driver.query(
+      `ATTACH DATABASE '${billingPath.replace(/'/g, "''")}' AS billing`,
+    );
+
+    const databases = await driver.listDatabases();
+
+    expect(databases.map((database) => database.name)).toEqual([
+      "main",
+      "billing",
+    ]);
+    await expect(driver.listSchemas("billing")).resolves.toEqual([
+      { name: "billing" },
+    ]);
+    await expect(driver.listObjects("billing", "billing")).resolves.toEqual([
+      {
+        schema: "billing",
+        name: "invoices",
+        type: "table",
+      },
+    ]);
+
+    const columns = await driver.describeTable(
+      "billing",
+      "billing",
+      "invoices",
+    );
+
+    expect(columns.map((column) => column.name)).toEqual([
+      "id",
+      "amount_cents",
+    ]);
   });
 
   it("ships better-sqlite3 runtime helper packages in the VSIX", async () => {

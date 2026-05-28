@@ -91,6 +91,9 @@ export function isoToLocalDateStr(iso: string): string | null {
 export function hexFromBuffer(val: Buffer): string {
   return val.length === 0 ? "" : `0x${val.toString("hex")}`;
 }
+export function normalizeNumericDisplayValue(value: number): number | string {
+  return Number.isFinite(value) ? value : String(value);
+}
 function escapePreviewSqlString(value: string): string {
   return value.replace(/'/g, "''");
 }
@@ -1063,7 +1066,7 @@ export abstract class BaseDBDriver implements IDBDriver {
     };
   }
   protected isFilterable(_nativeType: string, category: TypeCategory): boolean {
-    return !["lob", "binary", "spatial", "interval"].includes(category);
+    return !["lob", "spatial", "interval"].includes(category);
   }
   quoteIdentifier(name: string): string {
     return `"${name.replace(/"/g, '""')}"`;
@@ -1186,6 +1189,9 @@ export abstract class BaseDBDriver implements IDBDriver {
   formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (value === null || value === undefined) return value;
     if (Buffer.isBuffer(value)) return hexFromBuffer(value);
+    if (typeof value === "number") {
+      return normalizeNumericDisplayValue(value);
+    }
     if (
       column.category === "binary" &&
       typeof value === "string" &&
@@ -1582,6 +1588,17 @@ export abstract class BaseDBDriver implements IDBDriver {
       }
       const arrayValue = typeof val === "string" ? val : val[0];
       return this.buildArrayLikeFilter(col, arrayValue, paramIndex);
+    }
+    if (
+      column.category === "binary" &&
+      typeof val === "string" &&
+      (operator === "eq" || operator === "neq")
+    ) {
+      const sqlOp = operator === "neq" ? "!=" : "=";
+      return {
+        sql: `${col} ${sqlOp} ?`,
+        params: [this.coerceInputValue(val, column)],
+      };
     }
     if (
       this.hasBooleanSemantics(column) &&

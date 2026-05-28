@@ -133,15 +133,24 @@ describe("view DDL generation", () => {
 
   it("SQLite returns the stored view SQL from sqlite_master", async () => {
     const driver = new SQLiteDriver(sqliteConfig as ConnectionConfig);
+    const all = vi.fn((sql: string) => {
+      expect(sql).toBe("PRAGMA database_list");
+      return [{ seq: 0, name: "main", file: "/tmp/view-ddl.sqlite" }];
+    });
     const get = vi.fn((sql: string, params?: unknown[]) => {
       expect(sql).toBe(
-        "SELECT sql FROM sqlite_master WHERE type IN ('table','view') AND name = ?",
+        "SELECT sql FROM \"main\".sqlite_master WHERE type IN ('table','view') AND name = ?",
       );
       expect(params).toEqual(["v_employees"]);
       return { sql: 'CREATE VIEW "v_employees" AS SELECT 1' };
     });
-    (driver as unknown as { db: { isOpen: boolean; get: typeof get } }).db = {
+    (
+      driver as unknown as {
+        db: { isOpen: boolean; all: typeof all; get: typeof get };
+      }
+    ).db = {
       isOpen: true,
+      all,
       get,
     } as never;
 

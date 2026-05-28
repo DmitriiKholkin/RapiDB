@@ -3,6 +3,7 @@ import {
   formatDatetimeForDisplay,
   hexFromBuffer,
   isHexLike,
+  normalizeNumericDisplayValue,
   parseHexToBuffer,
 } from "../dbDrivers/BaseDBDriver";
 import { colKey, type QueryResult } from "../dbDrivers/types";
@@ -45,6 +46,11 @@ function normalizeQueryRows(
         ? row[normalizedKey]
         : row[key];
       const category = columnMeta[index]?.category ?? null;
+
+      if (typeof value === "number") {
+        normalized[normalizedKey] = normalizeNumericDisplayValue(value);
+        continue;
+      }
 
       if (typeof value === "bigint") {
         normalized[normalizedKey] = value.toString();

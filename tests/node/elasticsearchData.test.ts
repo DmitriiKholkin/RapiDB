@@ -381,6 +381,8 @@ describe("ElasticsearchDriver — metadata and pages", () => {
           type: "binary",
           nativeType: "binary",
           category: "binary",
+          filterable: true,
+          filterOperators: ["eq", "neq", "is_null", "is_not_null"],
         }),
         expect.objectContaining({
           name: "boolean_flag",

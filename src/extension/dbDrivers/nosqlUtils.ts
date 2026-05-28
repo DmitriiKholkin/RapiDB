@@ -73,7 +73,7 @@ export function inferColumnsFromRows(
         : options?.nullableMode === "schemaLess"
           ? true
           : rows.some((row) => row[name] == null);
-      const filterable = category !== "binary" && category !== "spatial";
+      const filterable = category !== "spatial";
       return {
         name,
         type: category,

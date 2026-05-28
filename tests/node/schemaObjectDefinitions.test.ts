@@ -366,7 +366,10 @@ describe("schema object definitions", () => {
   it("keeps SQLite limited to tables and views and returns null DDL-only definitions", async () => {
     const driver = new SQLiteDriver(sqliteConfig as ConnectionConfig);
     const all = vi.fn((sql: string) => {
-      expect(sql).toContain("FROM sqlite_master");
+      if (sql === "PRAGMA database_list") {
+        return [{ seq: 0, name: "main", file: "/tmp/schema-objects.sqlite" }];
+      }
+      expect(sql).toContain('FROM "main".sqlite_master');
       expect(sql).toContain("type IN ('table','view')");
       return [
         { name: "users", type: "table" },

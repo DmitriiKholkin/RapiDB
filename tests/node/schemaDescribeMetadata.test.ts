@@ -263,7 +263,10 @@ describe("describeTable schema metadata", () => {
   it("extracts SQLite generated expressions and storage mode from CREATE TABLE SQL", async () => {
     const driver = new SQLiteDriver(sqliteConfig as ConnectionConfig);
     const all = vi.fn((sql: string, params?: unknown[]) => {
-      if (sql.startsWith('PRAGMA table_xinfo("users")')) {
+      if (sql === "PRAGMA database_list") {
+        return [{ seq: 0, name: "main", file: "/tmp/generated.sqlite" }];
+      }
+      if (sql.startsWith('PRAGMA "main".table_xinfo("users")')) {
         return [
           {
             name: "id",
@@ -307,11 +310,12 @@ describe("describeTable schema metadata", () => {
           },
         ];
       }
-      if (sql.startsWith('PRAGMA foreign_key_list("users")')) {
+      if (sql.startsWith('PRAGMA "main".foreign_key_list("users")')) {
         return [];
       }
       if (
-        sql === "SELECT sql FROM sqlite_master WHERE type='table' AND name=?"
+        sql ===
+        "SELECT sql FROM \"main\".sqlite_master WHERE type='table' AND name=?"
       ) {
         expect(params).toEqual(["users"]);
         return [

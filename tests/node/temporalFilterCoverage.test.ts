@@ -130,10 +130,11 @@ describe("temporal filter operator coverage", () => {
     }
   });
 
-  it("uses eq as the default operator for date, time, and datetime columns", () => {
+  it("uses eq as the default operator for date, time, datetime, and binary columns", () => {
     expect(defaultFilterOperator({ category: "date" })).toBe("eq");
     expect(defaultFilterOperator({ category: "time" })).toBe("eq");
     expect(defaultFilterOperator({ category: "datetime" })).toBe("eq");
+    expect(defaultFilterOperator({ category: "binary" })).toBe("eq");
   });
 
   it("builds PostgreSQL temporal gt and in filters", () => {

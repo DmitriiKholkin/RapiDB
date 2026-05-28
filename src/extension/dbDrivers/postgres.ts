@@ -1505,6 +1505,17 @@ export class PostgresDriver extends BaseDBDriver {
       };
     }
     if (
+      column.category === "binary" &&
+      typeof val === "string" &&
+      (operator === "eq" || operator === "neq")
+    ) {
+      const sqlOp = operator === "neq" ? "<>" : "=";
+      return {
+        sql: `${col} ${sqlOp} $${paramIndex}`,
+        params: [this.coerceInputValue(val, column)],
+      };
+    }
+    if (
       this.hasBooleanSemantics(column) &&
       (operator === "eq" || operator === "neq")
     ) {

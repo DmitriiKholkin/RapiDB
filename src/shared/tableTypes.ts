@@ -461,7 +461,7 @@ export function isNumericCategory(category: TypeCategory): boolean {
 export function defaultFilterOperator(
   column: Pick<ColumnTypeMeta, "category">,
 ): "eq" | "like" {
-  if (column.category === "boolean") {
+  if (column.category === "boolean" || column.category === "binary") {
     return "eq";
   }
 

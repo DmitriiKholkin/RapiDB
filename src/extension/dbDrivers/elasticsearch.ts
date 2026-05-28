@@ -1763,7 +1763,7 @@ export class ElasticsearchDriver implements IDBDriver {
         type: esType,
         nativeType: esType,
         category: "binary",
-        filterable: false,
+        filterable: true,
       };
     }
 
@@ -1815,7 +1815,7 @@ export class ElasticsearchDriver implements IDBDriver {
   }
 
   private isFilterableCategory(category: TypeCategory): boolean {
-    return category !== "binary" && category !== "spatial";
+    return category !== "spatial";
   }
 
   private async readRows(

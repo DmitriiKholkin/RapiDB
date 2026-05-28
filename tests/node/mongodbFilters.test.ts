@@ -448,8 +448,16 @@ describe("MongoDBDriver schema type inference", () => {
 
     expect(columnsByName.get("t_binary")?.type).toBe("binData");
     expect(columnsByName.get("t_binary")?.category).toBe("binary");
+    expect(columnsByName.get("t_binary")?.filterable).toBe(true);
+    expect(columnsByName.get("t_binary")?.filterOperators).toEqual([
+      "eq",
+      "neq",
+      "is_null",
+      "is_not_null",
+    ]);
     expect(columnsByName.get("t_binary_uuid")?.type).toBe("binData");
     expect(columnsByName.get("t_binary_uuid")?.category).toBe("binary");
+    expect(columnsByName.get("t_binary_uuid")?.filterable).toBe(true);
     expect(columnsByName.get("t_binary_uuid")?.bsonSubtype).toBe(4);
     expect(columnsByName.get("t_date")?.type).toBe("date");
     expect(columnsByName.get("t_date")?.category).toBe("datetime");
@@ -467,6 +475,69 @@ describe("MongoDBDriver schema type inference", () => {
       t_int64: "9223372036854775807",
       t_timestamp: "2024-07-04 12:00:00",
     });
+  });
+
+  it("filters MongoDB binary columns by their displayed base64 value", async () => {
+    const driver = new MongoDBDriver({
+      id: "mongodb-binary-filter-values",
+      type: "mongodb",
+      name: "mongo-binary-filter-values",
+      host: "localhost",
+      port: 27017,
+      database: "test",
+    });
+
+    const readSchemaDocumentsMock = vi.fn().mockResolvedValue([
+      {
+        _id: new ObjectId("64a1b2c3d4e5f67890abcdef"),
+        t_binary: new Binary(Buffer.from([1, 2, 3]), 0),
+      },
+    ]);
+    const readRowsMock = vi.fn().mockResolvedValue([
+      { _id: "64a1b2c3d4e5f67890abcdef", t_binary: "AQID" },
+      { _id: "64a1b2c3d4e5f67890abcdee", t_binary: "BAUG" },
+    ]);
+
+    (
+      driver as unknown as {
+        readSchemaDocuments: typeof readSchemaDocumentsMock;
+        readRows: typeof readRowsMock;
+      }
+    ).readSchemaDocuments = readSchemaDocumentsMock;
+    (
+      driver as unknown as {
+        readSchemaDocuments: typeof readSchemaDocumentsMock;
+        readRows: typeof readRowsMock;
+      }
+    ).readRows = readRowsMock;
+
+    const eqPage = await driver.readTablePage({
+      database: "test",
+      schema: "test",
+      table: "bson_types",
+      page: 1,
+      pageSize: 50,
+      filters: [{ column: "t_binary", operator: "eq", value: "AQID" }],
+      sort: null,
+      skipCount: false,
+    });
+    const neqPage = await driver.readTablePage({
+      database: "test",
+      schema: "test",
+      table: "bson_types",
+      page: 1,
+      pageSize: 50,
+      filters: [{ column: "t_binary", operator: "neq", value: "AQID" }],
+      sort: null,
+      skipCount: false,
+    });
+
+    expect(eqPage.rows.map((row) => row._id)).toEqual([
+      "64a1b2c3d4e5f67890abcdef",
+    ]);
+    expect(neqPage.rows.map((row) => row._id)).toEqual([
+      "64a1b2c3d4e5f67890abcdee",
+    ]);
   });
 
   it("prefers non-null samples for nullable MongoDB fields", async () => {

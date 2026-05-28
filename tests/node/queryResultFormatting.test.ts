@@ -32,4 +32,19 @@ describe("formatQueryResult", () => {
       },
     ]);
   });
+
+  it("stringifies non-finite numeric values before webview serialization", () => {
+    const formatted = formatQueryResult(
+      {
+        columns: ["col_real"],
+        columnMeta: [{ category: "float" }],
+        rows: [{ __col_0: Number.POSITIVE_INFINITY }],
+        rowCount: 1,
+        executionTimeMs: 3,
+      },
+      100,
+    );
+
+    expect(formatted.rows).toEqual([{ __col_0: "Infinity" }]);
+  });
 });

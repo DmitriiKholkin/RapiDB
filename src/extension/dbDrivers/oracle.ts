@@ -739,7 +739,6 @@ function splitOracleStatements(src: string): string[] {
   return stmts.filter((s) => s.length > 0);
 }
 const ORACLE_FILTER_DENYLIST = new Set([
-  "blob",
   "clob",
   "nclob",
   "bfile",
@@ -2192,6 +2191,28 @@ export class OracleDriver extends BaseDBDriver {
     if (preamble.kind === "resolved") return preamble.condition;
     const col = preamble.columnSql;
     const val = preamble.value;
+    if (
+      column.category === "binary" &&
+      typeof val === "string" &&
+      (operator === "eq" || operator === "neq")
+    ) {
+      const bind = `:${paramIndex}`;
+      const typeName = oracleTypeName(column.nativeType);
+      if (typeName === "BLOB") {
+        return {
+          sql:
+            operator === "neq"
+              ? `NVL(DBMS_LOB.COMPARE(${col}, ${bind}), 1) != 0`
+              : `NVL(DBMS_LOB.COMPARE(${col}, ${bind}), 1) = 0`,
+          params: [this.coerceInputValue(val, column)],
+        };
+      }
+      const sqlOp = operator === "neq" ? "!=" : "=";
+      return {
+        sql: `${col} ${sqlOp} ${bind}`,
+        params: [this.coerceInputValue(val, column)],
+      };
+    }
     if (oracleTypeName(column.nativeType) === "XMLTYPE") {
       if (
         operator !== "like" &&

@@ -124,4 +124,25 @@ describe("float filter tolerance", () => {
       1e-7,
     ]);
   });
+
+  it("uses direct equality for SQLite REAL Infinity filters", () => {
+    const driver = new SQLiteDriver({
+      id: "float-filter-sqlite-infinity",
+      name: "Float Filter SQLite Infinity",
+      type: "sqlite",
+      filePath: ":memory:",
+    } as ConnectionConfig);
+
+    const condition = driver.buildFilterCondition(
+      floatColumn,
+      "eq",
+      "Infinity",
+      1,
+    );
+
+    expect(condition).toEqual({
+      sql: '"col_real" = ?',
+      params: [Number.POSITIVE_INFINITY],
+    });
+  });
 });

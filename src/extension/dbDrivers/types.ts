@@ -360,6 +360,7 @@ const TEXT_OPS: FilterOperator[] = ["like"];
 const UUID_OPS: FilterOperator[] = ["like", "in"];
 const ENUM_OPS: FilterOperator[] = ["like", "in"];
 const BOOL_OPS: FilterOperator[] = ["eq", "neq"];
+const BINARY_OPS: FilterOperator[] = ["eq", "neq"];
 const SEARCH_OPS: FilterOperator[] = ["like"];
 const ARRAY_OPS: FilterOperator[] = ["like"];
 const NULL_ONLY_OPS: FilterOperator[] = ["is_null", "is_not_null"];
@@ -428,7 +429,7 @@ export function filterOperatorsForCategory(
     case "boolean":
       return BOOL_OPS;
     case "binary":
-      return [];
+      return BINARY_OPS;
     case "spatial":
       return [];
     case "array":

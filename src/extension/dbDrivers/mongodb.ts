@@ -2055,7 +2055,7 @@ export class MongoDBDriver implements IDBDriver {
         const sample = selectMongoSchemaSample(documents, name);
         const { category, nativeType, bsonSubtype } =
           inferMongoSchemaType(sample);
-        const filterable = category !== "binary" && category !== "spatial";
+        const filterable = category !== "spatial";
 
         return {
           name,
@@ -2270,6 +2270,7 @@ export class MongoDBDriver implements IDBDriver {
   ): string {
     const trimmed = unwrapQuotedMongoDisplay(value);
     if (
+      column.category === "binary" ||
       column.category === "datetime" ||
       column.nativeType === "date" ||
       column.nativeType === "timestamp" ||

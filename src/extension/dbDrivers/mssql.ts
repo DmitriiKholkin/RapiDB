@@ -602,7 +602,6 @@ function datetimeOffsetSearchLiteral(value: string): string {
   return `${prefix}${compactFraction}%${offset}`;
 }
 const MSSQL_FILTER_DENYLIST = new Set([
-  "image",
   "hierarchyid",
   "sql_variant",
   "timestamp",
@@ -1875,6 +1874,25 @@ export class MSSQLDriver extends BaseDBDriver {
       return {
         sql: `CHARINDEX(CAST(? AS NVARCHAR(MAX)), CAST(${col} AS NVARCHAR(MAX))) > 0`,
         params: [arrayValue],
+      };
+    }
+    if (
+      column.category === "binary" &&
+      typeof val === "string" &&
+      (operator === "eq" || operator === "neq")
+    ) {
+      const sqlOp = operator === "neq" ? "<>" : "=";
+      const leftExpr =
+        baseTypeName(column.nativeType) === "image"
+          ? `CONVERT(VARBINARY(MAX), ${col})`
+          : col;
+      const rightExpr =
+        baseTypeName(column.nativeType) === "image"
+          ? "CONVERT(VARBINARY(MAX), ?)"
+          : "?";
+      return {
+        sql: `${leftExpr} ${sqlOp} ${rightExpr}`,
+        params: [this.coerceInputValue(val, column)],
       };
     }
     if (

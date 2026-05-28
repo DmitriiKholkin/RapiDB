@@ -49,6 +49,11 @@ interface SQLiteGeneratedColumnDetail {
   expression?: string;
   generatedKind?: GeneratedKind;
 }
+interface SQLiteDatabaseListRow {
+  seq: number;
+  name: string;
+  file: string | null;
+}
 interface SQLiteTableMetadata {
   rows: SQLiteTableXInfoRow[];
   foreignKeyColumns: Set<string>;
@@ -65,6 +70,10 @@ const SQLITE_DML_STARTERS = new Set(["INSERT", "UPDATE", "DELETE", "REPLACE"]);
 const SQLITE_TIME_LITERAL_RE = /^\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
 const SQLITE_DATETIME_LITERAL_RE =
   /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?: ?(?:Z|[+-]\d{2}:\d{2}))?$/i;
+const SQLITE_INT64_MIN = -(1n << 63n);
+const SQLITE_INT64_MAX = (1n << 63n) - 1n;
+const SQLITE_JS_SAFE_INTEGER_MIN = BigInt(Number.MIN_SAFE_INTEGER);
+const SQLITE_JS_SAFE_INTEGER_MAX = BigInt(Number.MAX_SAFE_INTEGER);
 function approximateNumericFilterTolerance(rawValue: string): number {
   const fraction = /\.(\d+)/.exec(rawValue)?.[1].length ?? 0;
   const precision = Math.min(Math.max(fraction + 2, 6), 12);
@@ -545,6 +554,9 @@ function invalidSqliteTemporalFilterError(
     `[RapiDB Filter] Column ${columnName} expects a valid ${typeName} value.`,
   );
 }
+function quoteSqliteIdentifier(identifier: string): string {
+  return `"${identifier.replace(/"/g, '""')}"`;
+}
 export class SQLiteDriver extends BaseDBDriver {
   protected override getQueryEditorSqlDialect() {
     return "sqlite" as const;
@@ -581,22 +593,51 @@ export class SQLiteDriver extends BaseDBDriver {
     }
     return this.db;
   }
-  private readTableMetadata(table: string): SQLiteTableMetadata {
+  private listAttachedDatabases(): SQLiteDatabaseListRow[] {
+    return this.requireDb().all(
+      "PRAGMA database_list",
+    ) as SQLiteDatabaseListRow[];
+  }
+  private resolveSqliteSchema(database: string, schema: string): string {
+    const candidate = (schema || database || "main").trim() || "main";
+    const available = new Set(
+      this.listAttachedDatabases()
+        .map((entry) => entry.name)
+        .filter(
+          (name): name is string => typeof name === "string" && name.length > 0,
+        ),
+    );
+    if (available.has(candidate)) {
+      return candidate;
+    }
+    if (available.has(database)) {
+      return database;
+    }
+    return "main";
+  }
+  private readTableMetadata(
+    database: string,
+    schema: string,
+    table: string,
+  ): SQLiteTableMetadata {
     const db = this.requireDb();
+    const sqliteSchema = this.resolveSqliteSchema(database, schema);
     const safeName = table.replace(/"/g, '""');
     const rows = (
       db.all(
-        `PRAGMA table_xinfo("${safeName}")`,
+        `PRAGMA ${quoteSqliteIdentifier(sqliteSchema)}.table_xinfo("${safeName}")`,
       ) as unknown as SQLiteTableXInfoRow[]
     ).filter((row) => row.hidden !== 1);
-    const fkRows = db.all(`PRAGMA foreign_key_list("${safeName}")`) as {
+    const fkRows = db.all(
+      `PRAGMA ${quoteSqliteIdentifier(sqliteSchema)}.foreign_key_list("${safeName}")`,
+    ) as {
       from: string;
     }[];
     const autoIncrementColumns = new Set<string>();
     let createSql = "";
     try {
       const master = db.all(
-        `SELECT sql FROM sqlite_master WHERE type='table' AND name=?`,
+        `SELECT sql FROM ${quoteSqliteIdentifier(sqliteSchema)}.sqlite_master WHERE type='table' AND name=?`,
         [table],
       ) as {
         sql: string;
@@ -677,14 +718,18 @@ export class SQLiteDriver extends BaseDBDriver {
   }
 
   async listDatabases(): Promise<DatabaseInfo[]> {
-    return [{ name: "main", schemas: [] }];
+    return this.listAttachedDatabases().map((database) => ({
+      name: database.name,
+      schemas: [],
+    }));
   }
-  async listSchemas(_database: string): Promise<SchemaInfo[]> {
-    return [{ name: "main" }];
+  async listSchemas(database: string): Promise<SchemaInfo[]> {
+    return [{ name: this.resolveSqliteSchema(database, database) }];
   }
-  async listObjects(_database: string, _schema: string): Promise<TableInfo[]> {
+  async listObjects(database: string, schema: string): Promise<TableInfo[]> {
+    const sqliteSchema = this.resolveSqliteSchema(database, schema);
     const rows = this.requireDb().all(`SELECT name, type
-       FROM sqlite_master
+       FROM ${quoteSqliteIdentifier(sqliteSchema)}.sqlite_master
        WHERE type IN ('table','view')
          AND name NOT LIKE 'sqlite_%'
        ORDER BY type DESC, name`) as {
@@ -692,25 +737,25 @@ export class SQLiteDriver extends BaseDBDriver {
       type: string;
     }[];
     return rows.map((r) => ({
-      schema: "main",
+      schema: sqliteSchema,
       name: r.name,
       type: r.type as TableInfo["type"],
     }));
   }
   async describeTable(
-    _database: string,
-    _schema: string,
+    database: string,
+    schema: string,
     table: string,
   ): Promise<ColumnMeta[]> {
-    const metadata = this.readTableMetadata(table);
+    const metadata = this.readTableMetadata(database, schema, table);
     return metadata.rows.map((row) => this.toColumnMeta(row, metadata));
   }
   override async describeColumns(
-    _database: string,
-    _schema: string,
+    database: string,
+    schema: string,
     table: string,
   ): Promise<ColumnTypeMeta[]> {
-    const metadata = this.readTableMetadata(table);
+    const metadata = this.readTableMetadata(database, schema, table);
     return metadata.rows.map((row) =>
       this.enrichColumn(this.toColumnMeta(row, metadata)),
     );
@@ -813,13 +858,16 @@ export class SQLiteDriver extends BaseDBDriver {
     return lastResult;
   }
   async getIndexes(
-    _database: string,
-    _schema: string,
+    database: string,
+    schema: string,
     table: string,
   ): Promise<import("./types").IndexMeta[]> {
     const safeTable = table.replace(/"/g, '""');
     const db = this.requireDb();
-    const idxList = db.all(`PRAGMA index_list("${safeTable}")`) as {
+    const sqliteSchema = this.resolveSqliteSchema(database, schema);
+    const idxList = db.all(
+      `PRAGMA ${quoteSqliteIdentifier(sqliteSchema)}.index_list("${safeTable}")`,
+    ) as {
       name: string;
       unique: number;
       origin: string;
@@ -827,7 +875,9 @@ export class SQLiteDriver extends BaseDBDriver {
     const result: import("./types").IndexMeta[] = [];
     for (const idx of idxList) {
       const safeName = idx.name.replace(/"/g, '""');
-      const cols = db.all(`PRAGMA index_info("${safeName}")`) as {
+      const cols = db.all(
+        `PRAGMA ${quoteSqliteIdentifier(sqliteSchema)}.index_info("${safeName}")`,
+      ) as {
         seqno: number;
         cid: number;
         name: string;
@@ -842,13 +892,14 @@ export class SQLiteDriver extends BaseDBDriver {
     return result;
   }
   async getForeignKeys(
-    _database: string,
-    _schema: string,
+    database: string,
+    schema: string,
     table: string,
   ): Promise<import("./types").ForeignKeyMeta[]> {
     const safeTable = table.replace(/"/g, '""');
+    const sqliteSchema = this.resolveSqliteSchema(database, schema);
     const rows = this.requireDb().all(
-      `PRAGMA foreign_key_list("${safeTable}")`,
+      `PRAGMA ${quoteSqliteIdentifier(sqliteSchema)}.foreign_key_list("${safeTable}")`,
     ) as {
       from: string;
       table: string;
@@ -869,8 +920,9 @@ export class SQLiteDriver extends BaseDBDriver {
     table: string,
   ): Promise<import("./types").TableConstraintMeta[]> {
     const constraints = await super.getConstraints(database, schema, table);
+    const sqliteSchema = this.resolveSqliteSchema(database, schema);
     const row = this.requireDb().get(
-      `SELECT sql FROM sqlite_master WHERE type='table' AND name=?`,
+      `SELECT sql FROM ${quoteSqliteIdentifier(sqliteSchema)}.sqlite_master WHERE type='table' AND name=?`,
       [table],
     ) as { sql: string | null } | null;
     const createSql = row?.sql ?? "";
@@ -890,12 +942,13 @@ export class SQLiteDriver extends BaseDBDriver {
     return constraints;
   }
   async getTriggers(
-    _database: string,
-    _schema: string,
+    database: string,
+    schema: string,
     table: string,
   ): Promise<import("./types").TriggerMeta[] | null> {
+    const sqliteSchema = this.resolveSqliteSchema(database, schema);
     const rows = this.requireDb().all(
-      `SELECT name, sql FROM sqlite_master WHERE type='trigger' AND tbl_name=? ORDER BY name`,
+      `SELECT name, sql FROM ${quoteSqliteIdentifier(sqliteSchema)}.sqlite_master WHERE type='trigger' AND tbl_name=? ORDER BY name`,
       [table],
     ) as { name: string; sql: string | null }[];
     return rows.map((row) => {
@@ -955,8 +1008,9 @@ export class SQLiteDriver extends BaseDBDriver {
     table: string,
     indexName: string,
   ): Promise<string> {
+    const sqliteSchema = this.resolveSqliteSchema(database, schema);
     const row = this.requireDb().get(
-      `SELECT sql FROM sqlite_master WHERE type='index' AND name = ?`,
+      `SELECT sql FROM ${quoteSqliteIdentifier(sqliteSchema)}.sqlite_master WHERE type='index' AND name = ?`,
       [indexName],
     ) as { sql: string | null } | null;
     if (row?.sql) {
@@ -978,13 +1032,14 @@ export class SQLiteDriver extends BaseDBDriver {
     return super.getIndexDDL(database, schema, table, indexName);
   }
   override async getTriggerDDL(
-    _database: string,
-    _schema: string,
+    database: string,
+    schema: string,
     table: string,
     triggerName: string,
   ): Promise<string> {
+    const sqliteSchema = this.resolveSqliteSchema(database, schema);
     const row = this.requireDb().get(
-      `SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name = ? AND name = ?`,
+      `SELECT sql FROM ${quoteSqliteIdentifier(sqliteSchema)}.sqlite_master WHERE type='trigger' AND tbl_name = ? AND name = ?`,
       [table, triggerName],
     ) as { sql: string | null } | null;
     const sql = row?.sql?.trim();
@@ -994,12 +1049,13 @@ export class SQLiteDriver extends BaseDBDriver {
     return sql.endsWith(";") ? sql : `${sql};`;
   }
   async getCreateTableDDL(
-    _database: string,
-    _schema: string,
+    database: string,
+    schema: string,
     table: string,
   ): Promise<string> {
+    const sqliteSchema = this.resolveSqliteSchema(database, schema);
     const row = this.requireDb().get(
-      `SELECT sql FROM sqlite_master WHERE type IN ('table','view') AND name = ?`,
+      `SELECT sql FROM ${quoteSqliteIdentifier(sqliteSchema)}.sqlite_master WHERE type IN ('table','view') AND name = ?`,
       [table],
     ) as {
       sql: string;
@@ -1166,6 +1222,31 @@ export class SQLiteDriver extends BaseDBDriver {
     operator: FilterOperator,
     value: string | [string, string] | undefined,
   ): string | [string, string] | undefined {
+    if (
+      this.isNumericCategory(column.category) &&
+      typeof value === "string" &&
+      (operator === "eq" || operator === "neq" || operator === "in")
+    ) {
+      try {
+        return super.normalizeFilterValue(column, operator, value);
+      } catch (error) {
+        const trimmed = value.trim();
+        if (trimmed === "") {
+          throw error;
+        }
+        if (operator === "in") {
+          const parts = trimmed
+            .split(",")
+            .map((part) => part.trim())
+            .filter(Boolean);
+          if (parts.length === 0) {
+            throw error;
+          }
+          return parts.join(", ");
+        }
+        return trimmed;
+      }
+    }
     const normalized = super.normalizeFilterValue(column, operator, value);
     if (normalized === undefined) {
       return normalized;
@@ -1274,6 +1355,17 @@ export class SQLiteDriver extends BaseDBDriver {
       const arrayValue = typeof val === "string" ? val : val[0];
       return { sql: `${col} LIKE ?`, params: [`%${arrayValue}%`] };
     }
+    if (
+      column.category === "binary" &&
+      typeof val === "string" &&
+      (operator === "eq" || operator === "neq")
+    ) {
+      const sqlOp = operator === "neq" ? "!=" : "=";
+      return {
+        sql: `${col} ${sqlOp} ?`,
+        params: [this.coerceInputValue(val, column)],
+      };
+    }
     const fallbackTemporalLike = (rawValue: string, negate = false) => ({
       sql: `${col} ${negate ? "NOT LIKE" : "LIKE"} ?`,
       params: [`%${rawValue}%`],
@@ -1292,6 +1384,15 @@ export class SQLiteDriver extends BaseDBDriver {
     if (
       this.isNumericCategory(column.category) &&
       typeof val === "string" &&
+      (operator === "eq" || operator === "neq") &&
+      Number.isNaN(Number(val))
+    ) {
+      const sqlOp = operator === "neq" ? "!=" : this.sqlOperator(operator);
+      return { sql: `${col} ${sqlOp} ?`, params: [val] };
+    }
+    if (
+      this.isNumericCategory(column.category) &&
+      typeof val === "string" &&
       !Number.isNaN(Number(val)) &&
       val !== ""
     ) {
@@ -1300,6 +1401,10 @@ export class SQLiteDriver extends BaseDBDriver {
         (operator === "eq" || operator === "neq")
       ) {
         const numericValue = Number(val);
+        if (!Number.isFinite(numericValue)) {
+          const sqlOp = operator === "neq" ? "!=" : this.sqlOperator(operator);
+          return { sql: `${col} ${sqlOp} ?`, params: [numericValue] };
+        }
         const tolerance = approximateNumericFilterTolerance(val);
         const toleranceExpr = "MAX(?, ABS(?) * ?)";
         const deltaExpr = `ABS(CAST(${col} AS REAL) - ?)`;
@@ -1315,10 +1420,12 @@ export class SQLiteDriver extends BaseDBDriver {
       if (column.category === "integer" && /^-?\d+$/.test(val)) {
         const big = BigInt(val);
         if (
-          big > BigInt(Number.MAX_SAFE_INTEGER) ||
-          big < -BigInt(Number.MAX_SAFE_INTEGER)
+          big > SQLITE_JS_SAFE_INTEGER_MAX ||
+          big < SQLITE_JS_SAFE_INTEGER_MIN ||
+          big > SQLITE_INT64_MAX ||
+          big < SQLITE_INT64_MIN
         ) {
-          return { sql: `${col} ${sqlOp} ?`, params: [big] };
+          return { sql: `${col} ${sqlOp} ?`, params: [val] };
         }
       }
       return { sql: `${col} ${sqlOp} ?`, params: [Number(val)] };

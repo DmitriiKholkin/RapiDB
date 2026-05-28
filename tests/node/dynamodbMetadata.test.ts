@@ -159,6 +159,8 @@ describe("DynamoDBDriver metadata", () => {
           type: "binary",
           nativeType: "binary",
           category: "binary",
+          filterable: true,
+          filterOperators: ["eq", "neq", "is_null", "is_not_null"],
         }),
         expect.objectContaining({
           name: "deleted_at",

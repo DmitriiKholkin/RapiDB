@@ -124,8 +124,8 @@ const edgeFilterabilityExpectations: Record<
     },
     {
       nativeType: "image",
-      expectedFilterable: false,
-      expectedOperators: ["is_null", "is_not_null"],
+      expectedFilterable: true,
+      expectedOperators: ["eq", "neq", "is_null", "is_not_null"],
     },
   ],
   oracle: [
@@ -146,8 +146,8 @@ const edgeFilterabilityExpectations: Record<
     },
     {
       nativeType: "BLOB",
-      expectedFilterable: false,
-      expectedOperators: ["is_null", "is_not_null"],
+      expectedFilterable: true,
+      expectedOperators: ["eq", "neq", "is_null", "is_not_null"],
     },
   ],
   sqlite: [],
@@ -173,6 +173,12 @@ describe("resolveFilterOperators", () => {
         nullable: false,
       }),
     ).toEqual([]);
+  });
+
+  it("exposes exact operators for nullable binary columns", () => {
+    expect(
+      resolveFilterOperators("binary", { filterable: true, nullable: true }),
+    ).toEqual(["eq", "neq", "is_null", "is_not_null"]);
   });
 });
 
@@ -720,6 +726,87 @@ describe("filter SQL compatibility for complex null-only types", () => {
     expect(result).toBeNull();
   });
 
+  it("builds PostgreSQL binary eq filters from displayed hex input", () => {
+    const driver = new PostgresDriver({
+      ...baseConfig,
+      type: "pg",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      buildFilterColumn("bytea", "binary"),
+      "eq",
+      driver.normalizeFilterValue(
+        buildFilterColumn("bytea", "binary"),
+        "eq",
+        "0xdeadbeef",
+      ),
+      1,
+    );
+
+    expect(result).toEqual({
+      sql: '"probe_col" = $1',
+      params: [Buffer.from("deadbeef", "hex")],
+    });
+  });
+
+  it("builds SQLite binary neq filters from displayed blob text", () => {
+    const driver = new SQLiteDriver({
+      ...baseConfig,
+      type: "sqlite",
+      filePath: ":memory:",
+    } as ConnectionConfig);
+    const column = buildFilterColumn("BLOB", "binary");
+    const result = driver.buildFilterCondition(
+      column,
+      "neq",
+      driver.normalizeFilterValue(column, "neq", "0x0a0b"),
+      1,
+    );
+
+    expect(result).toEqual({
+      sql: '"probe_col" != ?',
+      params: [Buffer.from([0x0a, 0x0b])],
+    });
+  });
+
+  it("casts MSSQL image filters to varbinary for exact comparison", () => {
+    const driver = new MSSQLDriver({
+      ...baseConfig,
+      type: "mssql",
+    } as ConnectionConfig);
+    const column = buildFilterColumn("image", "binary");
+    const result = driver.buildFilterCondition(
+      column,
+      "eq",
+      driver.normalizeFilterValue(column, "eq", "0xdeadbeef"),
+      1,
+    );
+
+    expect(result).toEqual({
+      sql: "CONVERT(VARBINARY(MAX), [probe_col]) = CONVERT(VARBINARY(MAX), ?)",
+      params: [Buffer.from("deadbeef", "hex")],
+    });
+  });
+
+  it("uses DBMS_LOB.COMPARE for Oracle BLOB eq filters", () => {
+    const driver = new OracleDriver({
+      ...baseConfig,
+      type: "oracle",
+      serviceName: "FREEPDB1",
+    } as ConnectionConfig);
+    const column = buildFilterColumn("BLOB", "binary");
+    const result = driver.buildFilterCondition(
+      column,
+      "eq",
+      driver.normalizeFilterValue(column, "eq", "0xdeadbeef"),
+      1,
+    );
+
+    expect(result).toEqual({
+      sql: 'NVL(DBMS_LOB.COMPARE("probe_col", :1), 1) = 0',
+      params: [Buffer.from("deadbeef", "hex")],
+    });
+  });
+
   it("returns null for Oracle spatial like filters", () => {
     const driver = new OracleDriver({
       ...baseConfig,
@@ -805,6 +892,53 @@ describe("filter SQL compatibility for complex null-only types", () => {
       sql: '"probe_col" LIKE ?',
       params: ['%"alpha"%'],
     });
+  });
+
+  it("allows SQLite integer equality filters against non-numeric text", () => {
+    const driver = new SQLiteDriver({
+      ...baseConfig,
+      type: "sqlite",
+      filePath: ":memory:",
+    } as ConnectionConfig);
+    const column = buildFilterColumn("INTEGER", "integer");
+    const normalized = driver.normalizeFilterValue(
+      column,
+      "eq",
+      "not_a_number",
+    );
+    const result = driver.buildFilterCondition(
+      column,
+      "eq",
+      typeof normalized === "string" ? normalized : undefined,
+      1,
+    );
+
+    expect(normalized).toBe("not_a_number");
+    expect(result).toEqual({
+      sql: '"probe_col" = ?',
+      params: ["not_a_number"],
+    });
+  });
+
+  it("passes unsafe SQLite integer literals as string params", () => {
+    const driver = new SQLiteDriver({
+      ...baseConfig,
+      type: "sqlite",
+      filePath: ":memory:",
+    } as ConnectionConfig);
+    const value = "-9223372036854776000";
+    const result = driver.buildFilterCondition(
+      buildFilterColumn("INTEGER", "integer"),
+      "eq",
+      value,
+      1,
+    );
+
+    expect(result).toEqual({
+      sql: '"probe_col" = ?',
+      params: [value],
+    });
+    expect(typeof result?.params[0]).toBe("string");
   });
 
   it("builds MSSQL array like filters against JSON text", () => {

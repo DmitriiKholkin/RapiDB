@@ -2745,7 +2745,7 @@ export class DynamoDBDriver implements IDBDriver {
         );
         const isPrimaryKey = schema.keys.includes(name);
         const nullable = !isPrimaryKey;
-        const filterable = descriptor.category !== "binary";
+        const filterable = descriptor.category !== "spatial";
         return {
           name,
           type: descriptor.nativeType,
