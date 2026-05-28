@@ -4,6 +4,8 @@ function createMockEditor(initialValue: string) {
   let value = initialValue;
   const changeListeners = new Set<ChangeListener>();
   const domNode = document.createElement("div");
+  let scrollTop = 0;
+  let scrollLeft = 0;
 
   return {
     getValue: () => value,
@@ -30,9 +32,18 @@ function createMockEditor(initialValue: string) {
     getSelection: () => null,
     getPosition: () => ({ lineNumber: 1, column: value.length + 1 }),
     setPosition: () => {},
+    setSelection: () => {},
     revealPosition: () => {},
     focus: () => {},
     layout: () => {},
+    getScrollTop: () => scrollTop,
+    getScrollLeft: () => scrollLeft,
+    setScrollTop: (next: number) => {
+      scrollTop = next;
+    },
+    setScrollLeft: (next: number) => {
+      scrollLeft = next;
+    },
     addCommand: () => {},
     trigger: () => {},
     getDomNode: () => domNode,
@@ -81,8 +92,19 @@ export const KeyMod = {
 };
 
 export const KeyCode = {
+  KeyC: 0,
   KeyV: 1,
+  KeyX: 5,
   Enter: 2,
   F5: 3,
   KeyF: 4,
 };
+
+export class Selection {
+  constructor(
+    public selectionStartLineNumber: number,
+    public selectionStartColumn: number,
+    public positionLineNumber: number,
+    public positionColumn: number,
+  ) {}
+}

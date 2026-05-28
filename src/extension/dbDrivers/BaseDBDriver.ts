@@ -66,10 +66,10 @@ export function formatDatetimeForDisplay(val: unknown): string | null {
       const [, date, time, rawFrac, tz] = m;
       let fracStr = "";
       if (rawFrac && rawFrac.length > 1) {
-        const digits = rawFrac.slice(1).slice(0, 3).padEnd(3, "0");
-        const msNum = parseInt(digits, 10);
-        if (msNum > 0) {
-          fracStr = `.${String(msNum).padStart(3, "0").replace(/0+$/, "")}`;
+        // Preserve all fractional seconds (up to microseconds), removing trailing zeros
+        const digits = rawFrac.slice(1).replace(/0+$/, "");
+        if (digits.length > 0) {
+          fracStr = `.${digits}`;
         }
       }
       const normalizedTimezone =

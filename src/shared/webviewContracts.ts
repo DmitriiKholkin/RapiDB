@@ -180,6 +180,7 @@ export type QueryPanelMessage =
   | WebviewMessageEnvelope<"exportResultsCSV">
   | WebviewMessageEnvelope<"exportResultsJSON">
   | WebviewMessageEnvelope<"readClipboard">
+  | WebviewMessageEnvelope<"writeClipboard", { text: string }>
   | WebviewMessageEnvelope<
       "addBookmark",
       { queryText: string; sql?: string; connectionId?: string }
@@ -256,7 +257,9 @@ export type TablePanelMessage =
   | WebviewMessageEnvelope<
       "cancelMutationPreview",
       TableMutationPreviewDecisionPayload
-    >;
+    >
+  | WebviewMessageEnvelope<"readClipboard">
+  | WebviewMessageEnvelope<"writeClipboard", { text: string }>;
 
 export type ErdPanelMessage =
   | WebviewMessageEnvelope<"ready">
@@ -724,6 +727,14 @@ export function parseQueryPanelMessage(
     case "readClipboard":
       return { type: envelope.type };
 
+    case "writeClipboard": {
+      if (!isRecord(envelope.payload)) {
+        return null;
+      }
+      const text = readRequiredString(envelope.payload, "text");
+      return text !== null ? { type: envelope.type, payload: { text } } : null;
+    }
+
     case "getSchema": {
       if (
         envelope.payload !== undefined &&
@@ -906,6 +917,17 @@ export function parseTablePanelMessage(
       return previewToken
         ? { type: envelope.type, payload: { previewToken } }
         : null;
+    }
+
+    case "readClipboard":
+      return { type: envelope.type };
+
+    case "writeClipboard": {
+      if (!isRecord(envelope.payload)) {
+        return null;
+      }
+      const text = readRequiredString(envelope.payload, "text");
+      return text !== null ? { type: envelope.type, payload: { text } } : null;
     }
 
     default:

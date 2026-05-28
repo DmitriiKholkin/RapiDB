@@ -299,7 +299,28 @@ export class TablePanel {
       case "cancelMutationPreview":
         if (parsed.payload) this._handleCancelMutationPreview(parsed.payload);
         break;
+      case "readClipboard":
+        await this._handleReadClipboard();
+        break;
+      case "writeClipboard":
+        if (parsed.payload) {
+          await this._handleWriteClipboard(parsed.payload.text);
+        }
+        break;
     }
+  }
+
+  private async _handleReadClipboard(): Promise<void> {
+    try {
+      const text = await vscode.env.clipboard.readText();
+      await this.postMessage("clipboardText", text);
+    } catch {
+      await this.postMessage("clipboardText", "");
+    }
+  }
+
+  private async _handleWriteClipboard(text: string): Promise<void> {
+    await vscode.env.clipboard.writeText(text);
   }
 
   private async _handleReady(): Promise<void> {

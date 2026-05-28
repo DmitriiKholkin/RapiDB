@@ -296,10 +296,7 @@ function LargeMonacoDialog({
     }
 
     const frameId = requestAnimationFrame(() => {
-      editorRef.current?.placeCursor({
-        reveal: false,
-        preserveViewport: true,
-      });
+      editorRef.current?.selectAllKeepCursorEndScrollTop();
     });
 
     return () => {

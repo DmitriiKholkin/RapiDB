@@ -159,6 +159,7 @@ export interface MonacoEditorHandle {
   layout(): void;
 
   placeCursor(options?: { reveal?: boolean; preserveViewport?: boolean }): void;
+  selectAllKeepCursorEndScrollTop(): void;
 }
 
 export function connTypeToDialect(connType: string): QueryEditorSqlDialect {
@@ -444,6 +445,24 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
           }
         }
       },
+      selectAllKeepCursorEndScrollTop: () => {
+        const editor = editorRef.current;
+        if (!editor) {
+          return;
+        }
+        const model = editor.getModel();
+        if (!model) {
+          editor.focus();
+          return;
+        }
+
+        const lastLine = model.getLineCount();
+        const lastColumn = model.getLineMaxColumn(lastLine);
+        editor.setSelection(new monaco.Selection(1, 1, lastLine, lastColumn));
+        editor.setScrollTop(0);
+        editor.setScrollLeft(0);
+        editor.focus();
+      },
     }));
 
     useEffect(() => {
@@ -496,9 +515,6 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
 
       const insertText = (text: string) => {
         if (readOnlyRef.current) {
-          return;
-        }
-        if (!text) {
           return;
         }
         const model = editor.getModel();
@@ -558,6 +574,68 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         }
         return editor.getValue();
       };
+      const getSelectedText = () => {
+        const model = editor.getModel();
+        const selection = editor.getSelection();
+        if (!model || !selection || selection.isEmpty()) {
+          return "";
+        }
+        return model.getValueInRange(selection);
+      };
+      const deleteSelectedText = () => {
+        if (readOnlyRef.current) {
+          return;
+        }
+        const selection = editor.getSelection();
+        if (!selection || selection.isEmpty()) {
+          return;
+        }
+        editor.executeEdits("native-cut", [
+          {
+            range: selection,
+            text: "",
+            forceMoveMarkers: true,
+          },
+        ]);
+        editor.pushUndoStop();
+      };
+      const nativeCopy = (e: ClipboardEvent) => {
+        const selectedText = getSelectedText();
+        if (!selectedText) {
+          return;
+        }
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        postMessage("writeClipboard", { text: selectedText });
+      };
+      const nativeCut = (e: ClipboardEvent) => {
+        const selectedText = getSelectedText();
+        if (!selectedText || readOnlyRef.current) {
+          return;
+        }
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        postMessage("writeClipboard", { text: selectedText });
+        deleteSelectedText();
+      };
+
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyC, () => {
+        const selectedText = getSelectedText();
+        if (!selectedText) {
+          return;
+        }
+        postMessage("writeClipboard", { text: selectedText });
+      });
+
+      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyX, () => {
+        const selectedText = getSelectedText();
+        if (!selectedText) {
+          return;
+        }
+        postMessage("writeClipboard", { text: "" });
+        postMessage("readClipboard");
+        postMessage("writeClipboard", { text: selectedText });
+      });
 
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, () => {
         if (readOnlyRef.current) {
@@ -565,6 +643,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         }
         postMessage("readClipboard");
       });
+
       editor.addCommand(
         monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyV,
         () => {
@@ -574,6 +653,9 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
           postMessage("readClipboard");
         },
       );
+
+      domNode?.addEventListener("copy", nativeCopy, true);
+      domNode?.addEventListener("cut", nativeCut, true);
       domNode?.addEventListener("paste", nativePaste, true);
 
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => {
@@ -646,6 +728,8 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         observer.disconnect();
         changeDisposable.dispose();
         unsubClipboard();
+        domNode?.removeEventListener("copy", nativeCopy, true);
+        domNode?.removeEventListener("cut", nativeCut, true);
         domNode?.removeEventListener("paste", nativePaste, true);
         editor.dispose();
       };

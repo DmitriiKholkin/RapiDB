@@ -475,18 +475,6 @@ function toMysqlIntegerFilterParam(val: string): number | string {
   }
   return Number(val);
 }
-function normalizeMysqlJsonFilterValue(value: string): string | null {
-  const trimmed = value.trim();
-  if (trimmed === "") {
-    return null;
-  }
-
-  try {
-    return JSON.stringify(JSON.parse(trimmed));
-  } catch {
-    return null;
-  }
-}
 function mysqlBitMaxValue(nativeType: string): bigint | null {
   const width = parseMysqlBitWidth(nativeType);
   return width === null ? null : (1n << BigInt(width)) - 1n;
@@ -1540,6 +1528,9 @@ export class MySQLDriver extends BaseDBDriver {
     nativeType: string,
     category: TypeCategory,
   ): boolean {
+    if (category === "spatial") {
+      return true;
+    }
     return super.isFilterable(nativeType, category);
   }
   override quoteIdentifier(name: string): string {
@@ -1783,15 +1774,32 @@ export class MySQLDriver extends BaseDBDriver {
         return { sql: `${col} ${op} ?`, params: [boolVal] };
       }
     }
+    if (column.category === "spatial" && typeof val === "string") {
+      if (operator !== "eq" && operator !== "neq") {
+        return null;
+      }
+      const normalizedSpatial = normalizeMysqlSpatialInput(
+        val,
+        column.nativeType,
+      );
+      const searchValue = (normalizedSpatial ?? val).trim();
+      if (!searchValue) {
+        return null;
+      }
+      return {
+        sql: `ST_AsText(${col}) ${operator === "neq" ? "!=" : "="} ?`,
+        params: [searchValue],
+      };
+    }
     if (column.category === "json" && typeof val === "string") {
-      const normalizedJson = normalizeMysqlJsonFilterValue(val);
-      if (
-        normalizedJson !== null &&
-        (operator === "like" || operator === "ilike")
-      ) {
+      if (operator === "like" || operator === "ilike") {
+        const searchValue = val.trim();
+        if (!searchValue) {
+          return null;
+        }
         return {
-          sql: `JSON_CONTAINS(${col}, ?)`,
-          params: [normalizedJson],
+          sql: `CAST(${col} AS CHAR) LIKE ?`,
+          params: [`%${searchValue}%`],
         };
       }
     }

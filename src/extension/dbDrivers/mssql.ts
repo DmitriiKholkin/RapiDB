@@ -1610,6 +1610,9 @@ export class MSSQLDriver extends BaseDBDriver {
     nativeType: string,
     category: TypeCategory,
   ): boolean {
+    if (category === "spatial") {
+      return !MSSQL_FILTER_DENYLIST.has(baseTypeName(nativeType));
+    }
     return (
       super.isFilterable(nativeType, category) &&
       !MSSQL_FILTER_DENYLIST.has(baseTypeName(nativeType))
@@ -1911,6 +1914,20 @@ export class MSSQLDriver extends BaseDBDriver {
         const sqlOp = operator === "neq" ? "<>" : "=";
         return { sql: `${col} ${sqlOp} ?`, params: [Number(strVal)] };
       }
+    }
+    if (column.category === "spatial" && typeof val === "string") {
+      if (operator !== "eq" && operator !== "neq") {
+        return null;
+      }
+      const searchValue = val.trim();
+      if (!searchValue) {
+        return null;
+      }
+      const sqlOp = operator === "neq" ? "<>" : "=";
+      return {
+        sql: `${col}.ToString() ${sqlOp} ?`,
+        params: [searchValue],
+      };
     }
     if (this.isNumericCategory(column.category) && Array.isArray(val)) {
       return {

@@ -163,6 +163,38 @@ describe("parseQueryPanelMessage", () => {
 
     expect(parsed).toBeNull();
   });
+
+  it("parses writeClipboard payload", () => {
+    const parsed = parseQueryPanelMessage({
+      type: "writeClipboard",
+      payload: { text: "copied text" },
+    });
+
+    expect(parsed).toEqual({
+      type: "writeClipboard",
+      payload: { text: "copied text" },
+    });
+  });
+});
+
+describe("parseTablePanelMessage clipboard payload", () => {
+  it("parses readClipboard message", () => {
+    const parsed = parseTablePanelMessage({ type: "readClipboard" });
+
+    expect(parsed).toEqual({ type: "readClipboard" });
+  });
+
+  it("parses writeClipboard payload", () => {
+    const parsed = parseTablePanelMessage({
+      type: "writeClipboard",
+      payload: { text: "structured content" },
+    });
+
+    expect(parsed).toEqual({
+      type: "writeClipboard",
+      payload: { text: "structured content" },
+    });
+  });
 });
 
 describe("parseConnectionFormPanelMessage", () => {

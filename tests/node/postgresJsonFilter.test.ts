@@ -28,7 +28,7 @@ const jsonColumn: ColumnTypeMeta = {
 };
 
 describe("postgres json filter", () => {
-  it("uses jsonb containment when a valid JSON value is pasted into a json filter", () => {
+  it("uses text contains for valid JSON-like filter input", () => {
     const condition = driver.buildFilterCondition(
       jsonColumn,
       "like",
@@ -37,8 +37,8 @@ describe("postgres json filter", () => {
     );
 
     expect(condition).toEqual({
-      sql: '("payload")::jsonb @> $1::jsonb',
-      params: ['{"key":"value","num":42,"bool":true,"null_val":null}'],
+      sql: 'CAST("payload" AS TEXT) ILIKE $1',
+      params: ['%{"key":"value","num":42,"bool":true,"null_val":null}%'],
     });
   });
 

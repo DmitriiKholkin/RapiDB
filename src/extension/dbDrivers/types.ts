@@ -427,13 +427,13 @@ export function filterOperatorsForCategory(
     case "datetime":
       return EXTENDED_OPS;
     case "interval":
-      return [];
+      return TEXT_OPS;
     case "boolean":
       return BOOL_OPS;
     case "binary":
       return BINARY_OPS;
     case "spatial":
-      return [];
+      return BINARY_OPS;
     case "array":
       return ARRAY_OPS;
     case "other":

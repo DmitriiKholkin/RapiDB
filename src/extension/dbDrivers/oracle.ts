@@ -1883,6 +1883,9 @@ export class OracleDriver extends BaseDBDriver {
     nativeType: string,
     category: TypeCategory,
   ): boolean {
+    if (category === "spatial") {
+      return true;
+    }
     return (
       super.isFilterable(nativeType, category) &&
       !ORACLE_FILTER_DENYLIST.has(oracleTypeName(nativeType).toLowerCase())
@@ -2212,6 +2215,21 @@ export class OracleDriver extends BaseDBDriver {
       return {
         sql: `${col} ${sqlOp} ${bind}`,
         params: [this.coerceInputValue(val, column)],
+      };
+    }
+    if (column.category === "spatial" && typeof val === "string") {
+      if (operator !== "eq" && operator !== "neq") {
+        return null;
+      }
+      const searchValue = val.trim();
+      if (!searchValue) {
+        return null;
+      }
+      const spatialExpr = `SDO_UTIL.TO_WKTGEOMETRY(${col})`;
+      const compareExpr = `NVL(DBMS_LOB.COMPARE(${spatialExpr}, TO_CLOB(:${paramIndex})), 1)`;
+      return {
+        sql: `${compareExpr} ${operator === "neq" ? "!=" : "="} 0`,
+        params: [searchValue],
       };
     }
     if (oracleTypeName(column.nativeType) === "XMLTYPE") {

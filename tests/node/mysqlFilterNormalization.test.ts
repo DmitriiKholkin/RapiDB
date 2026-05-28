@@ -50,7 +50,7 @@ describe("mysql filter normalization", () => {
     });
   });
 
-  it("uses structural JSON matching for valid JSON filter input", () => {
+  it("uses text contains matching for valid JSON filter input", () => {
     const condition = driver.buildFilterCondition(
       buildColumn("payload", "json", "json"),
       "like",
@@ -59,9 +59,9 @@ describe("mysql filter normalization", () => {
     );
 
     expect(condition).toEqual({
-      sql: "JSON_CONTAINS(`payload`, ?)",
+      sql: "CAST(`payload` AS CHAR) LIKE ?",
       params: [
-        '{"arr":[1,2,3],"key":"value","num":42,"bool":true,"nested":{"a":1}}',
+        '%{"arr":[1,2,3],"key":"value","num":42,"bool":true,"nested":{"a":1}}%',
       ],
     });
   });

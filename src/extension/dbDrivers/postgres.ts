@@ -92,22 +92,6 @@ function pgIdentityGenerationKind(
   return undefined;
 }
 
-function jsonToPgCircle(val: string): string {
-  const trimmed = val.trim();
-  if (!trimmed.startsWith("{")) return trimmed;
-  try {
-    const obj = JSON.parse(trimmed) as Record<string, unknown>;
-    if (
-      typeof obj.x === "number" &&
-      typeof obj.y === "number" &&
-      typeof obj.radius === "number"
-    ) {
-      return `<(${obj.x},${obj.y}),${obj.radius}>`;
-    }
-  } catch {}
-  return trimmed;
-}
-
 function normalizeJsonFilterValue(value: string): string | null {
   const trimmed = value.trim();
   if (trimmed === "") {
@@ -126,6 +110,18 @@ function isPointValue(value: object): value is {
   y: unknown;
 } {
   return "x" in value && "y" in value && Object.keys(value).length === 2;
+}
+function isCircleValue(value: object): value is {
+  x: unknown;
+  y: unknown;
+  radius: unknown;
+} {
+  return (
+    "x" in value &&
+    "y" in value &&
+    "radius" in value &&
+    Object.keys(value).length === 3
+  );
 }
 function isPgTrue(value: unknown): boolean {
   if (typeof value === "boolean") return value;
@@ -191,6 +187,54 @@ function normalizePostgresTemporalValue(value: string): string {
       .replace(/\.0+(?=[Zz+-]|$)/, "");
   }
   return trimmed;
+}
+function canonicalizePostgresTemporalPersistedValue(
+  value: unknown,
+): { canonical: string } | null {
+  if (value === NULL_SENTINEL || value === null || value === undefined) {
+    return { canonical: "__rapidb_null__" };
+  }
+
+  const raw =
+    value instanceof Date
+      ? (formatDatetimeForDisplay(value) ?? value.toISOString())
+      : typeof value === "string"
+        ? value
+        : typeof value === "number" ||
+            typeof value === "boolean" ||
+            typeof value === "bigint"
+          ? String(value)
+          : null;
+  if (raw === null) {
+    return null;
+  }
+
+  const trimmed = raw.trim();
+  if (trimmed === "") {
+    return { canonical: "" };
+  }
+
+  const normalizedSql = normalizeSqlDatetimeOffsetSpacing(
+    trimmed.replace("T", " "),
+  );
+  const normalizedOffset = normalizedSql
+    .replace(/[zZ]$/, "+00:00")
+    .replace(/([+-]\d{2})$/, "$1:00")
+    .replace(/([+-]\d{2})(\d{2})$/, "$1:$2");
+  const normalizedFraction = normalizedOffset
+    .replace(/(\.\d*?[1-9])0+(?=[+-]\d{2}:\d{2}$|$)/, "$1")
+    .replace(/\.0+(?=[+-]\d{2}:\d{2}$|$)/, "");
+
+  return { canonical: normalizedFraction };
+}
+function isLikelyPostgresAutoUpdatedTemporalColumn(
+  column: Pick<ColumnTypeMeta, "name" | "category">,
+): boolean {
+  if (column.category !== "datetime") {
+    return false;
+  }
+
+  return /(^|_)(updated|modified)(_at|at|_on|on)?$/i.test(column.name);
 }
 function postgresTemporalCastType(
   column: Pick<ColumnTypeMeta, "category" | "nativeType">,
@@ -1275,6 +1319,15 @@ export class PostgresDriver extends BaseDBDriver {
     }
     return "plain";
   }
+  protected override isFilterable(
+    nativeType: string,
+    category: TypeCategory,
+  ): boolean {
+    if (category === "interval" || category === "spatial") {
+      return true;
+    }
+    return super.isFilterable(nativeType, category);
+  }
   isDatetimeWithTime(nativeType: string): boolean {
     const ct = nativeType.toLowerCase();
     return (
@@ -1421,8 +1474,6 @@ export class PostgresDriver extends BaseDBDriver {
     if (column.category === "binary") {
       return super.coerceInputValue(value, column);
     }
-    const ct = column.nativeType.toLowerCase().split("(")[0].trim();
-    if (ct === "circle") return jsonToPgCircle(value);
     if (ISO_DATETIME_RE.test(value) && column.category === "date") {
       return isoToLocalDateStr(value) ?? value;
     }
@@ -1437,6 +1488,9 @@ export class PostgresDriver extends BaseDBDriver {
       typeof value === "object" &&
       !(value instanceof Date)
     ) {
+      if (isCircleValue(value)) {
+        return `<(${String(value.x)},${String(value.y)}),${String(value.radius)}>`;
+      }
       if (isPointValue(value)) {
         return `(${String(value.x)}, ${String(value.y)})`;
       }
@@ -1507,6 +1561,30 @@ export class PostgresDriver extends BaseDBDriver {
       column.category === "time" ||
       column.category === "datetime"
     ) {
+      if (isLikelyPostgresAutoUpdatedTemporalColumn(column)) {
+        return {
+          ok: true,
+          shouldVerify: false,
+        };
+      }
+      if (column.category === "date" || column.category === "time") {
+        return this.checkNormalizedPersistedEdit(
+          column,
+          expectedValue,
+          options,
+          canonicalizePostgresTemporalPersistedValue,
+          `Column "${column.name}" expects a temporal value.`,
+        );
+      }
+      if (column.category === "datetime") {
+        return this.checkNormalizedPersistedEdit(
+          column,
+          expectedValue,
+          options,
+          canonicalizePostgresTemporalPersistedValue,
+          `Column "${column.name}" expects a temporal value.`,
+        );
+      }
       if (["char", "bpchar", "character"].includes(baseType)) {
         return this.checkFixedWidthCharPersistedEdit(
           column,
@@ -1565,6 +1643,24 @@ export class PostgresDriver extends BaseDBDriver {
         return { sql: `${col} ${op} $${paramIndex}`, params: [boolVal] };
       }
     }
+    if (column.category === "spatial" && typeof val === "string") {
+      if (operator !== "eq" && operator !== "neq") {
+        return null;
+      }
+      const spatialType = column.nativeType.toLowerCase().split("(")[0].trim();
+      const searchValue = val.trim();
+      if (!searchValue) {
+        return null;
+      }
+      const spatialExpr =
+        spatialType === "point"
+          ? `REPLACE(CAST(${col} AS TEXT), ',', ', ')`
+          : `CAST(${col} AS TEXT)`;
+      return {
+        sql: `${spatialExpr} ${operator === "neq" ? "<>" : "="} $${paramIndex}`,
+        params: [searchValue],
+      };
+    }
     if (column.category === "json" && typeof val === "string") {
       const normalizedJson = normalizeJsonFilterValue(val);
       if (normalizedJson !== null) {
@@ -1580,12 +1676,16 @@ export class PostgresDriver extends BaseDBDriver {
             params: [normalizedJson],
           };
         }
-        if (operator === "like" || operator === "ilike") {
-          return {
-            sql: `(${col})::jsonb @> $${paramIndex}::jsonb`,
-            params: [normalizedJson],
-          };
+      }
+      if (operator === "like" || operator === "ilike") {
+        const searchValue = val.trim();
+        if (!searchValue) {
+          return null;
         }
+        return {
+          sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex}`,
+          params: [`%${searchValue}%`],
+        };
       }
     }
     if (column.category === "date" && typeof val === "string") {
@@ -1657,6 +1757,22 @@ export class PostgresDriver extends BaseDBDriver {
           params: [normalizePostgresTemporalValue(val)],
         };
       }
+    }
+    if (column.category === "interval") {
+      if (typeof val !== "string") {
+        return null;
+      }
+      if (operator !== "like" && operator !== "ilike") {
+        return null;
+      }
+      const searchValue = val.trim();
+      if (!searchValue) {
+        return null;
+      }
+      return {
+        sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex}`,
+        params: [`%${searchValue}%`],
+      };
     }
     if (
       this.isNumericCategory(column.category) &&

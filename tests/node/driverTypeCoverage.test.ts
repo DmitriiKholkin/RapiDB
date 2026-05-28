@@ -80,8 +80,8 @@ const edgeFilterabilityExpectations: Record<
   postgres: [
     {
       nativeType: "point",
-      expectedFilterable: false,
-      expectedOperators: ["is_null", "is_not_null"],
+      expectedFilterable: true,
+      expectedOperators: ["eq", "neq", "is_null", "is_not_null"],
     },
     {
       nativeType: "integer[]",
@@ -90,15 +90,15 @@ const edgeFilterabilityExpectations: Record<
     },
     {
       nativeType: "interval",
-      expectedFilterable: false,
-      expectedOperators: ["is_null", "is_not_null"],
+      expectedFilterable: true,
+      expectedOperators: ["like", "is_null", "is_not_null"],
     },
   ],
   mysql: [
     {
       nativeType: "geometry",
-      expectedFilterable: false,
-      expectedOperators: ["is_null", "is_not_null"],
+      expectedFilterable: true,
+      expectedOperators: ["eq", "neq", "is_null", "is_not_null"],
     },
     {
       nativeType: "enum('A','B')",
@@ -109,13 +109,13 @@ const edgeFilterabilityExpectations: Record<
   mssql: [
     {
       nativeType: "geometry",
-      expectedFilterable: false,
-      expectedOperators: ["is_null", "is_not_null"],
+      expectedFilterable: true,
+      expectedOperators: ["eq", "neq", "is_null", "is_not_null"],
     },
     {
       nativeType: "geography",
-      expectedFilterable: false,
-      expectedOperators: ["is_null", "is_not_null"],
+      expectedFilterable: true,
+      expectedOperators: ["eq", "neq", "is_null", "is_not_null"],
     },
     {
       nativeType: "xml",
@@ -131,8 +131,8 @@ const edgeFilterabilityExpectations: Record<
   oracle: [
     {
       nativeType: "SDO_GEOMETRY",
-      expectedFilterable: false,
-      expectedOperators: ["is_null", "is_not_null"],
+      expectedFilterable: true,
+      expectedOperators: ["eq", "neq", "is_null", "is_not_null"],
     },
     {
       nativeType: "INTERVAL DAY TO SECOND",
@@ -173,6 +173,12 @@ describe("resolveFilterOperators", () => {
         nullable: false,
       }),
     ).toEqual([]);
+  });
+
+  it("exposes exact operators for nullable spatial columns when filterable", () => {
+    expect(
+      resolveFilterOperators("spatial", { filterable: true, nullable: true }),
+    ).toEqual(["eq", "neq", "is_null", "is_not_null"]);
   });
 
   it("exposes exact operators for nullable binary columns", () => {
@@ -219,7 +225,7 @@ function sampleValueFor(
       return "P1DT2H";
     case "spatial":
       if (lowered.includes("circle")) {
-        return '{"x":1,"y":2,"radius":3}';
+        return "<(1,2),3>";
       }
       return "POINT(1 2)";
     case "enum":
@@ -849,6 +855,139 @@ describe("filter SQL compatibility for complex null-only types", () => {
     });
   });
 
+  it("builds PostgreSQL spatial eq filters against displayed text", () => {
+    const driver = new PostgresDriver({
+      ...baseConfig,
+      type: "pg",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      {
+        ...buildFilterColumn("point", "spatial"),
+        filterable: true,
+        filterOperators: ["eq", "neq", "is_null", "is_not_null"],
+      },
+      "eq",
+      "(1, 2)",
+      1,
+    );
+
+    expect(result).toEqual({
+      sql: "REPLACE(CAST(\"probe_col\" AS TEXT), ',', ', ') = $1",
+      params: ["(1, 2)"],
+    });
+  });
+
+  it("builds PostgreSQL circle spatial eq filters from canonical text", () => {
+    const driver = new PostgresDriver({
+      ...baseConfig,
+      type: "pg",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      {
+        ...buildFilterColumn("circle", "spatial"),
+        filterable: true,
+        filterOperators: ["eq", "neq", "is_null", "is_not_null"],
+      },
+      "eq",
+      "<(0,0),5>",
+      1,
+    );
+
+    expect(result).toEqual({
+      sql: 'CAST("probe_col" AS TEXT) = $1',
+      params: ["<(0,0),5>"],
+    });
+  });
+
+  it("builds MySQL spatial eq filters against displayed text", () => {
+    const driver = new MySQLDriver({
+      ...baseConfig,
+      type: "mysql",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      {
+        ...buildFilterColumn("geometry", "spatial"),
+        filterable: true,
+        filterOperators: ["eq", "neq", "is_null", "is_not_null"],
+      },
+      "eq",
+      "POINT(1 2)",
+      1,
+    );
+
+    expect(result).toEqual({
+      sql: "ST_AsText(`probe_col`) = ?",
+      params: ["POINT(1 2)"],
+    });
+  });
+
+  it("builds MSSQL spatial neq filters against displayed text", () => {
+    const driver = new MSSQLDriver({
+      ...baseConfig,
+      type: "mssql",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      {
+        ...buildFilterColumn("geometry", "spatial"),
+        filterable: true,
+        filterOperators: ["eq", "neq", "is_null", "is_not_null"],
+      },
+      "neq",
+      "POINT (1 2)",
+      1,
+    );
+
+    expect(result).toEqual({
+      sql: "[probe_col].ToString() <> ?",
+      params: ["POINT (1 2)"],
+    });
+  });
+
+  it("builds Oracle spatial eq filters against displayed text", () => {
+    const driver = new OracleDriver({
+      ...baseConfig,
+      type: "oracle",
+      serviceName: "FREEPDB1",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      {
+        ...buildFilterColumn("SDO_GEOMETRY", "spatial"),
+        filterable: true,
+        filterOperators: ["eq", "neq", "is_null", "is_not_null"],
+      },
+      "eq",
+      "POINT (1 2)",
+      1,
+    );
+
+    expect(result).toEqual({
+      sql: 'NVL(DBMS_LOB.COMPARE(SDO_UTIL.TO_WKTGEOMETRY("probe_col"), TO_CLOB(:1)), 1) = 0',
+      params: ["POINT (1 2)"],
+    });
+  });
+
+  it("builds PostgreSQL interval like filters against text representation", () => {
+    const driver = new PostgresDriver({
+      ...baseConfig,
+      type: "pg",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      {
+        ...buildFilterColumn("interval", "interval"),
+        filterable: true,
+        filterOperators: ["like", "is_null", "is_not_null"],
+      },
+      "like",
+      "2",
+      1,
+    );
+
+    expect(result).toEqual({
+      sql: 'CAST("probe_col" AS TEXT) ILIKE $1',
+      params: ["%2%"],
+    });
+  });
+
   it("builds MySQL array like filters against JSON text", () => {
     const driver = new MySQLDriver({
       ...baseConfig,
@@ -1102,5 +1241,27 @@ describe("filter SQL compatibility for complex null-only types", () => {
     );
 
     expect(formatted).toBe("3.14159265359");
+  });
+
+  it("formats PostgreSQL circle values in canonical text form", () => {
+    const driver = new PostgresDriver({
+      ...baseConfig,
+      type: "pg",
+    } as ConnectionConfig);
+
+    const formatted = driver.formatOutputValue(
+      { x: 0, y: 0, radius: 5 },
+      {
+        ...buildFilterColumn("circle", "spatial"),
+        valueSemantics: "plain",
+        nullable: true,
+        defaultValue: undefined,
+        isPrimaryKey: false,
+        primaryKeyOrdinal: undefined,
+        isForeignKey: false,
+      },
+    );
+
+    expect(formatted).toBe("<(0,0),5>");
   });
 });

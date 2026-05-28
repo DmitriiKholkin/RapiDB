@@ -249,6 +249,11 @@ export class QueryPanelController {
       case "readClipboard":
         await this.handleReadClipboard();
         break;
+      case "writeClipboard":
+        if (parsed.payload) {
+          await this.handleWriteClipboard(parsed.payload.text);
+        }
+        break;
       case "addBookmark":
         if (parsed.payload) {
           await this.handleAddBookmark(
@@ -619,6 +624,10 @@ export class QueryPanelController {
     } catch {
       this.view.postMessage({ type: "clipboardText", payload: "" });
     }
+  }
+
+  private async handleWriteClipboard(text: string): Promise<void> {
+    await vscode.env.clipboard.writeText(text);
   }
 
   private async handleAddBookmark(

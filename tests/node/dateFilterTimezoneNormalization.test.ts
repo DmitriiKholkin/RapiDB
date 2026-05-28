@@ -74,7 +74,41 @@ describe("date filter timezone normalization", () => {
       "2026-04-01 09:00:00Z",
     );
     expect(formatDatetimeForDisplay("2026-04-01T09:00:00.123456+0000")).toBe(
-      "2026-04-01 09:00:00.123+00:00",
+      "2026-04-01 09:00:00.123456+00:00",
+    );
+  });
+
+  it("preserves microsecond precision in timestamp display", () => {
+    // PostgreSQL returns 6 digits of fractional seconds (microseconds)
+    expect(formatDatetimeForDisplay("2026-05-28T13:08:29.999999+00:00")).toBe(
+      "2026-05-28 13:08:29.999999+00:00",
+    );
+    expect(formatDatetimeForDisplay("2026-05-28 13:08:29.123456+00:00")).toBe(
+      "2026-05-28 13:08:29.123456+00:00",
+    );
+  });
+
+  it("handles mixed precision fractional seconds", () => {
+    // 3 digits (milliseconds)
+    expect(formatDatetimeForDisplay("2026-05-28 13:08:29.123+00:00")).toBe(
+      "2026-05-28 13:08:29.123+00:00",
+    );
+    // 4 digits
+    expect(formatDatetimeForDisplay("2026-05-28 13:08:29.1234+00:00")).toBe(
+      "2026-05-28 13:08:29.1234+00:00",
+    );
+    // 5 digits
+    expect(formatDatetimeForDisplay("2026-05-28 13:08:29.12345+00:00")).toBe(
+      "2026-05-28 13:08:29.12345+00:00",
+    );
+  });
+
+  it("strips trailing zeros from fractional seconds", () => {
+    expect(formatDatetimeForDisplay("2026-05-28 13:08:29.100000+00:00")).toBe(
+      "2026-05-28 13:08:29.1+00:00",
+    );
+    expect(formatDatetimeForDisplay("2026-05-28 13:08:29.120000+00:00")).toBe(
+      "2026-05-28 13:08:29.12+00:00",
     );
   });
 
