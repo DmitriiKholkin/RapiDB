@@ -1415,11 +1415,9 @@ export class ConnectionProvider
     const node = new RapiDBNode(
       config.name,
       kind,
-      this._dragActive
-        ? vscode.TreeItemCollapsibleState.None
-        : this._expandedConnectionRoots.has(config.id)
-          ? vscode.TreeItemCollapsibleState.Expanded
-          : vscode.TreeItemCollapsibleState.Collapsed,
+      this._expandedConnectionRoots.has(config.id)
+        ? vscode.TreeItemCollapsibleState.Expanded
+        : vscode.TreeItemCollapsibleState.Collapsed,
       config.id,
     );
 
