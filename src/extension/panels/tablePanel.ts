@@ -60,6 +60,7 @@ export class TablePanel {
   private static panels = new Map<string, TablePanel>();
 
   private readonly panel: vscode.WebviewPanel;
+  private readonly context: vscode.ExtensionContext;
   private readonly svc: TableDataService;
   private readonly connectionManager: ConnectionManager;
   private readonly connectionId: string;
@@ -89,6 +90,7 @@ export class TablePanel {
     isView = false,
   ) {
     this.panel = panel;
+    this.context = context;
     this.svc = new TableDataService(connectionManager);
     this.connectionManager = connectionManager;
     this.connectionId = connectionId;
@@ -612,11 +614,19 @@ export class TablePanel {
           );
 
     if (format === "csv") {
-      await exportTableDataAsCsv({ fileName, loadChunks });
+      await exportTableDataAsCsv({
+        fileName,
+        loadChunks,
+        context: this.context,
+      });
       return;
     }
 
-    await exportTableDataAsJson({ fileName, loadChunks });
+    await exportTableDataAsJson({
+      fileName,
+      loadChunks,
+      context: this.context,
+    });
   }
 
   private async *_pageAsChunks(

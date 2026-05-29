@@ -194,6 +194,7 @@ export class QueryPanelController {
   constructor(
     private readonly connectionManager: ConnectionManager,
     private readonly view: QueryPanelView,
+    private readonly context?: vscode.ExtensionContext,
   ) {}
 
   private resolveConnectionId(connectionIdOverride?: string): string {
@@ -602,11 +603,11 @@ export class QueryPanelController {
     }
 
     if (format === "csv") {
-      await exportQueryResultsAsCsv(cached);
+      await exportQueryResultsAsCsv(cached, { context: this.context });
       return;
     }
 
-    await exportQueryResultsAsJson(cached);
+    await exportQueryResultsAsJson(cached, { context: this.context });
   }
 
   private async handleExportResultsCsv(): Promise<void> {

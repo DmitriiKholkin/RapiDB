@@ -394,6 +394,89 @@ describe("table helpers", () => {
     expect(result.plan.skippedRows).toEqual([1]);
   });
 
+  it("skips strict verification for temporal on-update columns across drivers", async () => {
+    const temporalColumns: ColumnTypeMeta[] = [
+      {
+        name: "id",
+        type: "INTEGER",
+        nativeType: "INTEGER",
+        nullable: false,
+        isPrimaryKey: true,
+        primaryKeyOrdinal: 1,
+        isForeignKey: false,
+        category: "integer",
+        filterable: true,
+        filterOperators: ["eq"],
+        valueSemantics: "plain",
+      },
+      {
+        name: "updated_at",
+        type: "TIMESTAMP",
+        nativeType: "TIMESTAMP",
+        nullable: true,
+        isPrimaryKey: false,
+        isForeignKey: false,
+        onUpdateExpression: "CURRENT_TIMESTAMP",
+        category: "datetime",
+        filterable: true,
+        filterOperators: ["eq", "neq", "is_null", "is_not_null"],
+        valueSemantics: "plain",
+      },
+    ];
+
+    const strictDriver: IDBDriver = {
+      ...fakeDriver,
+      describeColumns: async () => temporalColumns,
+      checkPersistedEdit: (column) => {
+        if (column.name === "updated_at") {
+          throw new Error("updated_at should not be verified strictly");
+        }
+        return null;
+      },
+      runTransaction: async () => undefined,
+      query: async () => ({
+        columns: ["updated_at"],
+        rows: [{ __col_0: "2026-05-29 14:57:54.510808" }],
+        rowCount: 1,
+        executionTimeMs: 0,
+      }),
+    };
+
+    const prepared = prepareApplyChangesPlan(
+      {
+        getDriver: () => strictDriver,
+      } as never,
+      "conn-1",
+      "main",
+      "public",
+      "fixture_rows",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { updated_at: "2026-05-29 13:45:36.917354" },
+        },
+      ],
+      temporalColumns,
+    );
+
+    expect(prepared.executable).toBe(true);
+    if (!prepared.executable) {
+      throw new Error("Expected executable plan");
+    }
+
+    expect(prepared.plan.verificationTargets[0]?.values).toEqual([]);
+
+    const result = await executePreparedApplyPlan(
+      {
+        getDriver: () => strictDriver,
+      } as never,
+      prepared.plan,
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.warning).toBeUndefined();
+  });
+
   it("uses column-aware PostgreSQL preview materialization for typed array updates", () => {
     const postgresDriver = new PostgresDriver({
       id: "pg-preview-test",

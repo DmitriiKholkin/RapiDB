@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import * as vscode from "vscode";
 import type { ConnectionSecretUpdateTransaction } from "../../shared/safetyContracts";
 import {
@@ -31,6 +32,7 @@ type StoredConnectionSecrets = {
 };
 
 const CONNECTION_FORM_RETENTION_MODE = "rehydrate" as const;
+const LAST_SQLITE_DIRECTORY_STATE_KEY = "rapidb.lastSqliteDirectory";
 
 function trimOptionalSecret(value: string | undefined): string | undefined {
   if (typeof value !== "string") {
@@ -718,10 +720,17 @@ export class ConnectionFormPanel {
         break;
       }
       case "browseFile": {
+        const lastSqliteDirectory = this.context.globalState.get<string>(
+          LAST_SQLITE_DIRECTORY_STATE_KEY,
+        );
         const uris = await vscode.window.showOpenDialog({
           canSelectFiles: true,
           canSelectFolders: false,
           canSelectMany: false,
+          defaultUri:
+            lastSqliteDirectory && path.isAbsolute(lastSqliteDirectory)
+              ? vscode.Uri.file(lastSqliteDirectory)
+              : undefined,
           filters: {
             "SQLite databases": ["db", "sqlite", "sqlite3", "db3"],
             "All files": ["*"],
@@ -729,6 +738,15 @@ export class ConnectionFormPanel {
           title: "Select SQLite database file",
         });
         const selected = uris?.[0];
+        if (selected) {
+          const selectedDirectory = path.dirname(selected.fsPath);
+          if (path.isAbsolute(selectedDirectory)) {
+            await this.context.globalState.update(
+              LAST_SQLITE_DIRECTORY_STATE_KEY,
+              selectedDirectory,
+            );
+          }
+        }
         this.panel.webview.postMessage({
           type: "browseFileResult",
           payload: { filePath: selected ? selected.fsPath : null },

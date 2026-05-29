@@ -14,6 +14,7 @@ const DOWNLOADS_DIRECTORY = "Downloads";
 const CSV_EXTENSION = "csv";
 const JSON_EXTENSION = "json";
 const LINE_BREAK = "\n";
+const LAST_EXPORT_DIRECTORY_STATE_KEY = "rapidb.lastExportDirectory";
 
 type ExportFormat = typeof CSV_EXTENSION | typeof JSON_EXTENSION;
 
@@ -36,7 +37,12 @@ interface ExportRequest {
   progressTitle: string;
   successLabel: string;
   errorLabel: string;
+  context?: vscode.ExtensionContext;
   write: (filePath: string, signal: AbortSignal) => Promise<void>;
+}
+
+interface ExportDialogOptions {
+  context?: vscode.ExtensionContext;
 }
 
 type ExportColumnDescriptor = {
@@ -62,6 +68,7 @@ const JSON_NUMBER_LITERAL_RE = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
 
 export async function exportQueryResultsAsCsv(
   result: QueryResultExport,
+  options?: ExportDialogOptions,
 ): Promise<void> {
   await runExport({
     defaultFileName: "query_results",
@@ -69,6 +76,7 @@ export async function exportQueryResultsAsCsv(
     progressTitle: "RapiDB: Exporting query results…",
     successLabel: "query results",
     errorLabel: "CSV export failed",
+    context: options?.context,
     write: async (filePath, signal) => {
       await writeQueryResultsCsv(filePath, result, signal);
     },
@@ -77,6 +85,7 @@ export async function exportQueryResultsAsCsv(
 
 export async function exportQueryResultsAsJson(
   result: QueryResultExport,
+  options?: ExportDialogOptions,
 ): Promise<void> {
   await runExport({
     defaultFileName: "query_results",
@@ -84,6 +93,7 @@ export async function exportQueryResultsAsJson(
     progressTitle: "RapiDB: Exporting query results…",
     successLabel: "query results",
     errorLabel: "JSON export failed",
+    context: options?.context,
     write: async (filePath, signal) => {
       await writeQueryResultsJson(filePath, result, signal);
     },
@@ -93,14 +103,16 @@ export async function exportQueryResultsAsJson(
 export async function exportTableDataAsCsv(options: {
   fileName: string;
   loadChunks: (signal: AbortSignal) => AsyncIterable<ChunkedExportData>;
+  context?: vscode.ExtensionContext;
 }): Promise<void> {
-  const { fileName, loadChunks } = options;
+  const { fileName, loadChunks, context } = options;
   await runExport({
     defaultFileName: fileName,
     format: CSV_EXTENSION,
     progressTitle: `RapiDB: Exporting ${fileName}…`,
     successLabel: fileName,
     errorLabel: "CSV export failed",
+    context,
     write: async (filePath, signal) => {
       await writeChunkedCsv(filePath, loadChunks(signal), signal);
     },
@@ -110,14 +122,16 @@ export async function exportTableDataAsCsv(options: {
 export async function exportTableDataAsJson(options: {
   fileName: string;
   loadChunks: (signal: AbortSignal) => AsyncIterable<ChunkedExportData>;
+  context?: vscode.ExtensionContext;
 }): Promise<void> {
-  const { fileName, loadChunks } = options;
+  const { fileName, loadChunks, context } = options;
   await runExport({
     defaultFileName: fileName,
     format: JSON_EXTENSION,
     progressTitle: `RapiDB: Exporting ${fileName} as JSON…`,
     successLabel: fileName,
     errorLabel: "JSON export failed",
+    context,
     write: async (filePath, signal) => {
       await writeChunkedJson(filePath, loadChunks(signal), signal);
     },
@@ -125,12 +139,21 @@ export async function exportTableDataAsJson(options: {
 }
 
 async function runExport(request: ExportRequest): Promise<void> {
+  const defaultUri = buildDefaultExportUri(
+    request.context,
+    request.defaultFileName,
+    request.format,
+  );
   const saveUri = await vscode.window.showSaveDialog({
-    defaultUri: buildDefaultExportUri(request.defaultFileName, request.format),
+    defaultUri,
     filters: buildExportFilters(request.format),
   });
   if (!saveUri) {
     return;
+  }
+
+  if (request.context) {
+    await persistLastExportDirectory(request.context, saveUri.fsPath);
   }
 
   try {
@@ -170,15 +193,51 @@ async function runExport(request: ExportRequest): Promise<void> {
 }
 
 function buildDefaultExportUri(
+  context: vscode.ExtensionContext | undefined,
   defaultFileName: string,
   format: ExportFormat,
 ): vscode.Uri {
+  const savedDirectory = getLastExportDirectory(context);
+  if (savedDirectory) {
+    return vscode.Uri.file(
+      path.join(savedDirectory, `${defaultFileName}.${format}`),
+    );
+  }
+
   return vscode.Uri.file(
     path.join(
       os.homedir(),
       DOWNLOADS_DIRECTORY,
       `${defaultFileName}.${format}`,
     ),
+  );
+}
+
+function getLastExportDirectory(
+  context: vscode.ExtensionContext | undefined,
+): string | undefined {
+  const savedDirectory = context?.globalState.get<string>(
+    LAST_EXPORT_DIRECTORY_STATE_KEY,
+  );
+  if (!savedDirectory) {
+    return undefined;
+  }
+
+  return path.isAbsolute(savedDirectory) ? savedDirectory : undefined;
+}
+
+async function persistLastExportDirectory(
+  context: vscode.ExtensionContext,
+  filePath: string,
+): Promise<void> {
+  const directoryPath = path.dirname(filePath);
+  if (!path.isAbsolute(directoryPath)) {
+    return;
+  }
+
+  await context.globalState.update(
+    LAST_EXPORT_DIRECTORY_STATE_KEY,
+    directoryPath,
   );
 }
 

@@ -14,6 +14,7 @@ import {
   getSshTcpForwardTransport,
   getTlsServername,
 } from "../driverRuntimeConfig";
+import { buildWhere } from "../table/filterSql";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
 import type { DriverTimeoutSettingsProvider } from "./timeout";
 import type {
@@ -21,6 +22,8 @@ import type {
   ColumnTypeMeta,
   DatabaseInfo,
   DriverEntityManifest,
+  DriverTablePageRequest,
+  DriverTablePageResult,
   FilterConditionResult,
   FilterOperator,
   PersistedEditCheckOptions,
@@ -687,13 +690,22 @@ function normalizeMysqlSpatialInput(
     if (MYSQL_WKT_VALUE_RE.test(trimmed)) {
       return trimmed;
     }
-    try {
-      return buildMysqlSpatialWkt(JSON.parse(trimmed), nativeType);
-    } catch {
-      return null;
-    }
   }
   return buildMysqlSpatialWkt(value, nativeType);
+}
+function parseMysqlSpatialSridPrefix(value: string): {
+  wkt: string;
+  srid: number | null;
+} {
+  const trimmed = value.trim();
+  const sridMatch = /^srid=(\d+);(.*)$/i.exec(trimmed);
+  if (!sridMatch) {
+    return { wkt: trimmed, srid: null };
+  }
+  return {
+    srid: Number.parseInt(sridMatch[1], 10),
+    wkt: sridMatch[2].trim(),
+  };
 }
 function canonicalizeMysqlBitPersistedEditValue(
   value: unknown,
@@ -858,7 +870,12 @@ export class MySQLDriver extends BaseDBDriver {
     return [rows as MysqlQueryRows, fields as FieldPacket[]];
   }
   async listDatabases(): Promise<DatabaseInfo[]> {
-    const rows = await this.queryObjectRows<MysqlObjectRow>("SHOW DATABASES");
+    const rows = await this.queryObjectRows<MysqlObjectRow>(
+      `SELECT SCHEMA_NAME
+       FROM information_schema.SCHEMATA
+       WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+       ORDER BY SCHEMA_NAME`,
+    );
     return rows.map((r) => ({
       name: String(Object.values(r)[0] ?? ""),
       schemas: [],
@@ -1025,6 +1042,92 @@ export class MySQLDriver extends BaseDBDriver {
     }
     return this._executeScript(stmts, start);
   }
+  async readTablePage(
+    request: DriverTablePageRequest,
+  ): Promise<DriverTablePageResult> {
+    const columns = await this.describeColumns(
+      request.database,
+      request.schema,
+      request.table,
+    );
+    const { clause: whereClause, params: whereParams } = buildWhere(
+      this,
+      request.filters,
+      columns,
+    );
+    const qualifiedTableName = this.qualifiedTableName(
+      request.database,
+      request.schema,
+      request.table,
+    );
+    const selectList = columns
+      .map((column) => {
+        const quoted = this.quoteIdentifier(column.name);
+        if (column.category === "spatial") {
+          return `ST_AsText(${quoted}) AS ${quoted}`;
+        }
+        return quoted;
+      })
+      .join(", ");
+    const offset = (request.page - 1) * request.pageSize;
+    const orderByClause = request.sort
+      ? `ORDER BY ${this.quoteIdentifier(request.sort.column)} ${request.sort.direction === "desc" ? "DESC" : "ASC"}`
+      : this.buildOrderByDefault(columns);
+
+    let totalCount = 0;
+    let countFailed = false;
+    if (!request.skipCount) {
+      try {
+        const countResult = await this.query(
+          `SELECT COUNT(*) AS cnt FROM ${qualifiedTableName} ${whereClause}`,
+          whereParams,
+        );
+        const countRow = countResult.rows[0] as
+          | Record<string, unknown>
+          | undefined;
+        totalCount = Number(
+          countRow?.__col_0 ??
+            countRow?.cnt ??
+            countRow?.CNT ??
+            countRow?.count ??
+            0,
+        );
+      } catch {
+        countFailed = true;
+      }
+    }
+
+    const pagination = this.buildPagination(
+      offset,
+      request.pageSize,
+      whereParams.length + 1,
+    );
+    const dataResult = await this.query(
+      `SELECT ${selectList} FROM ${qualifiedTableName} ${whereClause} ${orderByClause} ${pagination.sql}`,
+      [...whereParams, ...pagination.params],
+    );
+
+    const rows = dataResult.rows.map((row) => {
+      const formattedRow: Record<string, unknown> = {};
+      columns.forEach((column, index) => {
+        formattedRow[column.name] = this.formatOutputValue(
+          row[`__col_${index}`],
+          column,
+        );
+      });
+      return formattedRow;
+    });
+
+    if (countFailed) {
+      totalCount = offset + rows.length;
+    }
+
+    return {
+      columns,
+      rows,
+      totalCount,
+    };
+  }
   private _parseQueryResult(
     rawRows: MysqlQueryRows,
     fields: FieldPacket[],
@@ -1053,9 +1156,9 @@ export class MySQLDriver extends BaseDBDriver {
             let v = val;
             if (boolCols.has(i) && v !== null && v !== undefined) {
               if (Buffer.isBuffer(v)) {
-                v = v[0] === 1;
+                v = v[0] === 1 ? 1 : 0;
               } else {
-                v = v === 1 || v === "1";
+                v = v === true || v === 1 || v === "1" ? 1 : 0;
               }
             }
             if (bitIntCols.has(i) && v !== null && v !== undefined) {
@@ -1601,9 +1704,7 @@ export class MySQLDriver extends BaseDBDriver {
     if (column.category === "spatial") {
       const normalized = normalizeMysqlSpatialInput(value, column.nativeType);
       if (normalized === null) {
-        throw new Error(
-          `[RapiDB] Column ${column.name} expects WKT text or a copied MySQL spatial JSON value.`,
-        );
+        throw new Error(`[RapiDB] Column ${column.name} expects WKT text.`);
       }
       return normalized;
     }
@@ -1635,14 +1736,34 @@ export class MySQLDriver extends BaseDBDriver {
   override formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (value === null || value === undefined) return value;
     if (Buffer.isBuffer(value)) return super.formatOutputValue(value, column);
-    if (typeof value === "bigint") return value.toString();
-    if (
-      value !== null &&
-      typeof value === "object" &&
-      !(value instanceof Date)
-    ) {
-      return JSON.stringify(value);
+    if (this.hasBooleanSemantics(column)) {
+      if (typeof value === "boolean") {
+        return value ? 1 : 0;
+      }
+      if (typeof value === "string") {
+        const normalized = this.parseBooleanInput(value);
+        if (normalized !== null) {
+          return normalized ? 1 : 0;
+        }
+      }
+      if (typeof value === "number") {
+        return value === 0 ? 0 : 1;
+      }
     }
+    if (column.category === "spatial") {
+      if (typeof value === "string") {
+        const normalized = normalizeMysqlSpatialInput(value, column.nativeType);
+        if (normalized !== null) {
+          return normalized;
+        }
+      }
+      const formattedSpatial = buildMysqlSpatialWkt(value, column.nativeType);
+      if (formattedSpatial !== null) {
+        return formattedSpatial;
+      }
+      return String(value);
+    }
+    if (typeof value === "bigint") return value.toString();
     if (this.isDatetimeWithTime(column.nativeType)) {
       if (typeof value === "string") {
         const normalized = normalizeMysqlDatetimeInput(value);
@@ -1653,11 +1774,75 @@ export class MySQLDriver extends BaseDBDriver {
     }
     return value;
   }
+  override normalizeFilterValue(
+    column: ColumnTypeMeta,
+    operator: FilterOperator,
+    value: string | [string, string] | undefined,
+  ): string | [string, string] | undefined {
+    if (!this.hasBooleanSemantics(column)) {
+      return super.normalizeFilterValue(column, operator, value);
+    }
+    if (operator === "is_null" || operator === "is_not_null") {
+      return undefined;
+    }
+    if (value === undefined) {
+      return undefined;
+    }
+    if (operator === "between" && Array.isArray(value)) {
+      const normalizedStart = value[0].trim();
+      const normalizedEnd = value[1].trim();
+      if (
+        (normalizedStart !== "0" && normalizedStart !== "1") ||
+        (normalizedEnd !== "0" && normalizedEnd !== "1")
+      ) {
+        throw new Error(
+          `[RapiDB Filter] Column ${column.name} expects boolean filter values as 0 or 1.`,
+        );
+      }
+      return [normalizedStart, normalizedEnd];
+    }
+    if (typeof value !== "string") {
+      return value;
+    }
+    const normalized = value.trim();
+    if (operator === "in") {
+      const parts = normalized
+        .split(",")
+        .map((part) => part.trim())
+        .filter(Boolean);
+      if (
+        parts.length === 0 ||
+        parts.some((part) => part !== "0" && part !== "1")
+      ) {
+        throw new Error(
+          `[RapiDB Filter] Column ${column.name} expects boolean filter values as 0 or 1.`,
+        );
+      }
+      return parts.join(", ");
+    }
+    if (normalized !== "0" && normalized !== "1") {
+      throw new Error(
+        `[RapiDB Filter] Column ${column.name} expects boolean filter values as 0 or 1.`,
+      );
+    }
+    return normalized;
+  }
   override checkPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
     options?: PersistedEditCheckOptions,
   ): PersistedEditCheckResult | null {
+    if (
+      column.onUpdateExpression &&
+      (column.category === "date" ||
+        column.category === "time" ||
+        column.category === "datetime")
+    ) {
+      return {
+        ok: true,
+        shouldVerify: false,
+      };
+    }
     if (this.hasBitSemantics(column)) {
       return this.checkNormalizedPersistedEdit(
         column,
@@ -1702,9 +1887,6 @@ export class MySQLDriver extends BaseDBDriver {
     }
     if (this.hasBooleanSemantics(column)) {
       return this.checkBooleanPersistedEdit(column, expectedValue, options);
-    }
-    if (column.category === "json") {
-      return this.checkJsonPersistedEdit(column, expectedValue, options);
     }
     if (column.category === "binary") {
       return this.checkBinaryPersistedEdit(column, expectedValue, options);
@@ -1768,11 +1950,12 @@ export class MySQLDriver extends BaseDBDriver {
       (operator === "eq" || operator === "neq")
     ) {
       const strVal = (typeof val === "string" ? val : val[0]).toLowerCase();
-      if (strVal === "true" || strVal === "false") {
-        const boolVal = strVal === "true" ? 1 : 0;
+      if (strVal === "1" || strVal === "0") {
+        const boolVal = strVal === "1" ? 1 : 0;
         const op = operator === "neq" ? "!=" : "=";
         return { sql: `${col} ${op} ?`, params: [boolVal] };
       }
+      return null;
     }
     if (column.category === "spatial" && typeof val === "string") {
       if (operator !== "eq" && operator !== "neq") {
@@ -1786,22 +1969,17 @@ export class MySQLDriver extends BaseDBDriver {
       if (!searchValue) {
         return null;
       }
-      return {
-        sql: `ST_AsText(${col}) ${operator === "neq" ? "!=" : "="} ?`,
-        params: [searchValue],
-      };
-    }
-    if (column.category === "json" && typeof val === "string") {
-      if (operator === "like" || operator === "ilike") {
-        const searchValue = val.trim();
-        if (!searchValue) {
-          return null;
-        }
+      const parsedSpatial = parseMysqlSpatialSridPrefix(searchValue);
+      if (parsedSpatial.srid !== null && Number.isFinite(parsedSpatial.srid)) {
         return {
-          sql: `CAST(${col} AS CHAR) LIKE ?`,
-          params: [`%${searchValue}%`],
+          sql: `ST_Equals(${col}, ST_GeomFromText(?, ?)) ${operator === "neq" ? "= 0" : "= 1"}`,
+          params: [parsedSpatial.wkt, parsedSpatial.srid],
         };
       }
+      return {
+        sql: `ST_Equals(${col}, ST_GeomFromText(?, ST_SRID(${col}))) ${operator === "neq" ? "= 0" : "= 1"}`,
+        params: [searchValue],
+      };
     }
     if (this.hasBitSemantics(column)) {
       const parseFilterValue = (raw: string): number | string => {

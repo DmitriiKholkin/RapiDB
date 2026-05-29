@@ -79,7 +79,7 @@ describe("mysql preview SQL literals", () => {
     );
   });
 
-  it("converts copied MySQL point JSON into WKT insert literals", () => {
+  it("converts MySQL point WKT into insert literals", () => {
     const pointColumn = column("col_point", "point", "spatial");
     const operation = buildInsertRowOperation(
       driver,
@@ -87,7 +87,7 @@ describe("mysql preview SQL literals", () => {
       "",
       "all_types",
       {
-        col_point: '{"x":10.5,"y":20.3}',
+        col_point: "POINT(10.5 20.3)",
       },
       [pointColumn],
     );
@@ -101,7 +101,7 @@ describe("mysql preview SQL literals", () => {
     );
   });
 
-  it("converts copied MySQL polygon JSON into WKT insert literals", () => {
+  it("converts MySQL polygon WKT into insert literals", () => {
     const polygonColumn = column("col_polygon", "polygon", "spatial");
     const operation = buildInsertRowOperation(
       driver,
@@ -109,8 +109,7 @@ describe("mysql preview SQL literals", () => {
       "",
       "all_types",
       {
-        col_polygon:
-          '[[{"x":0,"y":0},{"x":4,"y":0},{"x":4,"y":4},{"x":0,"y":4},{"x":0,"y":0}]]',
+        col_polygon: "POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))",
       },
       [polygonColumn],
     );

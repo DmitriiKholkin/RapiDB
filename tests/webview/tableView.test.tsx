@@ -44,6 +44,7 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
         reveal?: boolean;
         preserveViewport?: boolean;
       }) => void;
+      selectAllKeepCursorEndScrollTop: () => void;
     }>,
   ) {
     const [value, setValue] = React.useState(props.initialValue ?? "");
@@ -62,6 +63,18 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
 
         const end = textArea.value.length;
         textArea.focus();
+        textArea.setSelectionRange(end, end);
+        textArea.scrollTop = 0;
+        textArea.scrollLeft = 0;
+      },
+      selectAllKeepCursorEndScrollTop: () => {
+        const textArea = textAreaRef.current;
+        if (!textArea) {
+          return;
+        }
+
+        textArea.focus();
+        const end = textArea.value.length;
         textArea.setSelectionRange(end, end);
         textArea.scrollTop = 0;
         textArea.scrollLeft = 0;
@@ -89,6 +102,7 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
 });
 
 import { TableView } from "../../src/webview/components/TableView";
+import { DEBOUNCE } from "../../src/webview/components/table/tableViewHelpers";
 import {
   clearPostedMessages,
   dispatchIncomingMessage,
@@ -895,7 +909,7 @@ describe("TableView", () => {
     expect(getPostedMessages()).toHaveLength(0);
 
     await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 450));
+      await new Promise((resolve) => setTimeout(resolve, DEBOUNCE + 50));
     });
 
     expect(getLastPostedMessage()).toEqual({
@@ -1153,7 +1167,7 @@ describe("TableView", () => {
     fireEvent.click(screen.getByRole("menuitemradio", { name: /Equals/i }));
 
     await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 450));
+      await new Promise((resolve) => setTimeout(resolve, DEBOUNCE + 50));
     });
 
     expect(getPostedMessages()).toEqual([]);
@@ -1196,7 +1210,7 @@ describe("TableView", () => {
     });
 
     await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 450));
+      await new Promise((resolve) => setTimeout(resolve, DEBOUNCE + 50));
     });
 
     expect(getLastPostedMessage()).toEqual({
@@ -1397,7 +1411,7 @@ describe("TableView", () => {
     });
 
     await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 450));
+      await new Promise((resolve) => setTimeout(resolve, DEBOUNCE + 50));
     });
 
     await waitFor(() => {

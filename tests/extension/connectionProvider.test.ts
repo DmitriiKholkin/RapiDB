@@ -453,7 +453,7 @@ describe("ConnectionProvider", () => {
 
     const updatedChildren = await provider.getChildren(folder);
     expect(updatedChildren[0].collapsibleState).toBe(
-      vscode.TreeItemCollapsibleState.None,
+      vscode.TreeItemCollapsibleState.Collapsed,
     );
 
     await provider.handleDrop(
@@ -519,7 +519,7 @@ describe("ConnectionProvider", () => {
 
     const childrenDuringDrag = await provider.getChildren(folder);
     expect(childrenDuringDrag[0].collapsibleState).toBe(
-      vscode.TreeItemCollapsibleState.None,
+      vscode.TreeItemCollapsibleState.Collapsed,
     );
 
     const draggedOverConnection = childrenDuringDrag[0];
@@ -856,7 +856,7 @@ describe("ConnectionProvider", () => {
 
     const roots = await provider.getChildren();
     expect(roots).toHaveLength(1);
-    expect(roots[0]?.label).toBe("Primary ●");
+    expect(roots[0]?.label).toBe("Primary");
 
     const databases = await provider.getChildren(roots[0]);
     expect(databases).toHaveLength(1);

@@ -152,6 +152,9 @@ export function prepareApplyChangesPlan(
       if (!column) {
         continue;
       }
+      if (shouldSkipTemporalOnUpdateVerification(column)) {
+        continue;
+      }
       const check = driver.checkPersistedEdit(column, nextValue);
       if (check?.shouldVerify) {
         verificationValues.push({
@@ -463,6 +466,9 @@ async function verifyExactNumericUpdates(
       const mismatchColumns: string[] = [];
       const mismatchMessages: string[] = [];
       target.values.forEach(({ column, expectedValue }, index) => {
+        if (shouldSkipTemporalOnUpdateVerification(column)) {
+          return;
+        }
         const check = driver.checkPersistedEdit(column, expectedValue, {
           persistedValue: row[`__col_${index}`],
         });
@@ -493,4 +499,15 @@ async function verifyExactNumericUpdates(
     }
   }
   return failures;
+}
+
+function shouldSkipTemporalOnUpdateVerification(
+  column: Pick<ColumnTypeMeta, "onUpdateExpression" | "category">,
+): boolean {
+  return (
+    Boolean(column.onUpdateExpression) &&
+    (column.category === "date" ||
+      column.category === "time" ||
+      column.category === "datetime")
+  );
 }

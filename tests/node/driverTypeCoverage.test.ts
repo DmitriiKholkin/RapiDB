@@ -916,7 +916,7 @@ describe("filter SQL compatibility for complex null-only types", () => {
     );
 
     expect(result).toEqual({
-      sql: "ST_AsText(`probe_col`) = ?",
+      sql: "ST_Equals(`probe_col`, ST_GeomFromText(?, ST_SRID(`probe_col`))) = 1",
       params: ["POINT(1 2)"],
     });
   });

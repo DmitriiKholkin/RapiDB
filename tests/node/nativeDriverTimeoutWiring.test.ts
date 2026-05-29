@@ -53,7 +53,7 @@ describe("native driver timeout wiring", () => {
     );
     expect(pool.query).toHaveBeenCalledWith(
       expect.objectContaining({
-        sql: "SHOW DATABASES",
+        sql: expect.stringContaining("FROM information_schema.SCHEMATA"),
         timeout: 42000,
       }),
     );

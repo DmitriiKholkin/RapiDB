@@ -47,23 +47,27 @@ export class QueryPanel {
     this.formatOnOpen = formatOnOpen;
     this.isBookmarked = isBookmarked ?? false;
     this.editorLanguage = editorLanguage;
-    this.controller = new QueryPanelController(connectionManager, {
-      getActiveConnectionId: () => this.activeConnectionId,
-      getInitialConnectionId: () => this.initialConnectionId,
-      getLastQueryResult: () => this.lastQueryResult,
-      postMessage: (message) => {
-        this.panel.webview.postMessage(message);
+    this.controller = new QueryPanelController(
+      connectionManager,
+      {
+        getActiveConnectionId: () => this.activeConnectionId,
+        getInitialConnectionId: () => this.initialConnectionId,
+        getLastQueryResult: () => this.lastQueryResult,
+        postMessage: (message) => {
+          this.panel.webview.postMessage(message);
+        },
+        setActiveConnectionId: (nextConnectionId) => {
+          this.activeConnectionId = nextConnectionId;
+        },
+        setLastQueryResult: (result) => {
+          this.lastQueryResult = result;
+        },
+        syncTitle: () => {
+          this.syncTitle();
+        },
       },
-      setActiveConnectionId: (nextConnectionId) => {
-        this.activeConnectionId = nextConnectionId;
-      },
-      setLastQueryResult: (result) => {
-        this.lastQueryResult = result;
-      },
-      syncTitle: () => {
-        this.syncTitle();
-      },
-    });
+      context,
+    );
     this.panel.webview.html = this.buildHtml(context, initialQueryText);
     this.panel.webview.onDidReceiveMessage(async (message) => {
       try {
