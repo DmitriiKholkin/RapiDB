@@ -474,6 +474,13 @@ function DBTypeSelector({
   );
 }
 
+function getDefaultColor(): string {
+  if (document.body.classList.contains("vscode-light")) {
+    return "#000000";
+  }
+  return "#ffffff";
+}
+
 export function ConnectionFormView({ existing }: Props): ReactElement {
   const isEdit = !!existing;
   const hasStoredSecret = existing?.hasStoredSecret ?? false;
@@ -482,8 +489,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const hasStoredSshPassphrase = existing?.hasStoredSshPassphrase ?? false;
 
   const [name, setName] = useState(existing?.name ?? "");
-  const [color, setColor] = useState(existing?.color ?? "");
-  const [showColorPicker, setShowColorPicker] = useState(!!existing?.color);
+  const [color, setColor] = useState(existing?.color ?? getDefaultColor());
   const [type, setType] = useState<ConnectionType>(existing?.type ?? "pg");
   const [host, setHost] = useState(existing?.host ?? "localhost");
   const [port, setPort] = useState(
@@ -629,7 +635,6 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       : connectionReadOnly
         ? "Advanced. WAL is enabled automatically for writable SQLite connections; this read-only session leaves the file untouched."
         : "Advanced. WAL is enabled automatically for writable SQLite connections unless you disable it here.";
-  const effectiveColor = color || "#ffffff";
 
   useEffect(
     () =>
@@ -898,109 +903,61 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                 minWidth: 0,
               }}
             >
-              {showColorPicker && (
-                <div
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  flexShrink: 0,
+                }}
+              >
+                <label
+                  aria-label="Connection icon color"
                   style={{
-                    display: "flex",
+                    display: "inline-flex",
                     alignItems: "center",
-                    gap: 8,
+                    justifyContent: "center",
+                    width: 28,
+                    height: 28,
+                    borderRadius: 8,
+                    border:
+                      "1px solid var(--vscode-input-border, var(--vscode-widget-border, #555))",
+                    background: "var(--vscode-input-background)",
+                    cursor: "pointer",
+                    position: "relative",
                     flexShrink: 0,
+                    overflow: "hidden",
                   }}
                 >
                   <span
+                    aria-hidden="true"
                     style={{
-                      fontSize: 12,
-                      fontWeight: 600,
-                      letterSpacing: 0.1,
-                      whiteSpace: "nowrap",
-                      color: "var(--vscode-foreground)",
-                    }}
-                  >
-                    {effectiveColor.toUpperCase()}
-                  </span>
-                  <label
-                    aria-label="Connection icon color"
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      width: 28,
-                      height: 28,
-                      borderRadius: 8,
-                      border:
-                        "1px solid var(--vscode-input-border, var(--vscode-widget-border, #555))",
-                      background: "var(--vscode-input-background)",
-                      cursor: "pointer",
-                      position: "relative",
+                      width: 16,
+                      height: 16,
+                      borderRadius: 4,
+                      backgroundColor: color,
+                      border: `1px solid ${color}`,
                       flexShrink: 0,
-                      overflow: "hidden",
                     }}
-                  >
-                    <span
-                      aria-hidden="true"
-                      style={{
-                        width: 16,
-                        height: 16,
-                        borderRadius: 4,
-                        backgroundColor: effectiveColor,
-                        border: `1px solid ${effectiveColor}`,
-                        flexShrink: 0,
-                      }}
-                    />
-                    <input
-                      type="color"
-                      aria-label="Connection color"
-                      value={effectiveColor}
-                      onChange={(e) => setColor(e.target.value)}
-                      style={{
-                        opacity: 0,
-                        position: "absolute",
-                        inset: 0,
-                        width: "100%",
-                        height: "100%",
-                        cursor: "pointer",
-                        border: "none",
-                        padding: 0,
-                      }}
-                    />
-                  </label>
-                </div>
-              )}
-              <button
-                type="button"
-                aria-label="Toggle connection color picker"
-                aria-expanded={showColorPicker}
-                title="Toggle color picker"
-                onClick={() => {
-                  setShowColorPicker((value) => {
-                    if (value) {
-                      setColor("");
-                    }
-                    return !value;
-                  });
-                }}
-                style={{
-                  background: showColorPicker
-                    ? "var(--vscode-editor-background)"
-                    : "var(--vscode-editor-foreground)",
-                  border:
-                    "1px solid var(--vscode-input-border, var(--vscode-widget-border, #555))",
-                  borderRadius: 8,
-                  cursor: "pointer",
-                  color: showColorPicker
-                    ? "var(--vscode-editor-foreground)"
-                    : "var(--vscode-editor-background)",
-                  opacity: 0.7,
-                  fontSize: 12,
-                  padding: "5px 8px",
-                  lineHeight: 1.2,
-                  minWidth: 58,
-                  textTransform: "uppercase",
-                  letterSpacing: 0.4,
-                }}
-              >
-                AUTO
-              </button>
+                  />
+                  <input
+                    type="color"
+                    aria-label="Connection color"
+                    value={color}
+                    onChange={(e) => setColor(e.target.value)}
+                    style={{
+                      opacity: 0,
+                      position: "absolute",
+                      inset: 0,
+                      width: "100%",
+                      height: "100%",
+                      cursor: "pointer",
+                      border: "none",
+                      padding: 0,
+                    }}
+                  />
+                </label>
+              </div>
             </div>
           </div>
         </Field>
