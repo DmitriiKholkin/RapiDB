@@ -257,7 +257,6 @@ export function ColumnFilterControl({
       : "";
   const betweenValue =
     normalizedDraft?.operator === "between" ? normalizedDraft.value : ["", ""];
-  const scalarPlaceholder = "filter";
 
   const handleOperatorSelect = (
     operator: FilterOperator | typeof CLEAR_FILTER,
@@ -407,7 +406,13 @@ export function ColumnFilterControl({
               value: event.target.value,
             });
           }}
-          placeholder={scalarOperator ? scalarPlaceholder : ""}
+          placeholder={
+            scalarOperator === "in"
+              ? "filter, filter"
+              : scalarOperator
+                ? "filter"
+                : ""
+          }
           style={{
             ...inputStyle,
             ...(!scalarOperator ||
