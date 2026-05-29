@@ -150,6 +150,63 @@ describe("ConnectionFormPanel", () => {
     expect(context.secrets.store).not.toHaveBeenCalled();
   });
 
+  it("normalizes Oracle legacy database payloads to serviceName on save", async () => {
+    const context = {
+      secrets: {
+        get: vi.fn(async () => undefined),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn().mockResolvedValue(undefined),
+      getConnection: vi.fn(() => undefined),
+      testConnection: vi.fn(),
+    };
+
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+    );
+
+    await Promise.resolve();
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected a webview panel to be created.");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-oracle",
+        name: "Oracle",
+        type: "oracle",
+        host: "oracle.local",
+        port: 1521,
+        database: "XEPDB1",
+        username: "system",
+        password: "pw",
+      },
+    });
+
+    await expect(promise).resolves.toEqual(
+      expect.objectContaining({
+        id: "conn-oracle",
+        type: "oracle",
+        serviceName: "XEPDB1",
+      }),
+    );
+    expect(connectionManager.saveConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "conn-oracle",
+        type: "oracle",
+        serviceName: "XEPDB1",
+        database: undefined,
+      }),
+    );
+  });
+
   it("sanitizes the initial edit state before passing it into the webview", async () => {
     const context = {
       secrets: {

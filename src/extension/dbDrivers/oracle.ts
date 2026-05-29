@@ -184,6 +184,10 @@ function normalizeOracleFloatValue(
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return null;
   }
+  const normalizedType = nativeType?.toUpperCase().trim();
+  if (normalizedType === "BINARY_FLOAT") {
+    return value.toString();
+  }
   const precision = oracleFloatDisplayPrecision(nativeType);
   if (precision === null) {
     return null;
@@ -363,6 +367,41 @@ function oracleErrorMessage(error: unknown): string {
   }
   return String(error);
 }
+
+type OracleStructuredConstraintKind = "json" | "xml";
+
+function parseOracleStructuredConstraintKind(
+  expression: string | null | undefined,
+): OracleStructuredConstraintKind | null {
+  if (!expression) {
+    return null;
+  }
+  const normalized = expression.toUpperCase();
+  if (/\bIS\s+JSON\b/.test(normalized)) {
+    return "json";
+  }
+  if (/\bIS\s+XML\b/.test(normalized)) {
+    return "xml";
+  }
+  return null;
+}
+
+function parseOracleRoutineIdentity(value: string | undefined): {
+  kind: "procedure" | "package";
+} | null {
+  if (!value) {
+    return null;
+  }
+
+  const match = /^oracle:(procedure|package)$/i.exec(value.trim());
+  if (!match) {
+    return null;
+  }
+
+  return {
+    kind: match[1].toLowerCase() as "procedure" | "package",
+  };
+}
 function ensureThickMode(libDir?: string): void {
   if (_thickInitDone) {
     return;
@@ -519,10 +558,8 @@ function normalizeOracleTemporalText(value: string): {
       hasExplicitTimezone: !!rawTimezone,
     };
   }
-  const digits = rawFrac.slice(1).slice(0, 3).padEnd(3, "0");
-  const ms = Number.parseInt(digits, 10);
-  const frac =
-    ms > 0 ? `.${String(ms).padStart(3, "0").replace(/0+$/, "")}` : "";
+  const digits = rawFrac.slice(1).replace(/0+$/, "");
+  const frac = digits.length > 0 ? `.${digits}` : "";
   return {
     text: `${date} ${time}${frac}`,
     hasExplicitTimezone: !!rawTimezone,
@@ -610,9 +647,9 @@ function oracleTemporalFilterExpr(column: ColumnTypeMeta): string {
     return `TO_CHAR(${col}, 'YYYY-MM-DD HH24:MI:SS')`;
   }
   if (isTimezoneAwareOracleTemporal(column.nativeType)) {
-    return `RTRIM(RTRIM(TO_CHAR(SYS_EXTRACT_UTC(CAST(${col} AS TIMESTAMP WITH TIME ZONE)), 'YYYY-MM-DD HH24:MI:SS.FF3'), '0'), '.')`;
+    return `RTRIM(RTRIM(TO_CHAR(SYS_EXTRACT_UTC(CAST(${col} AS TIMESTAMP WITH TIME ZONE)), 'YYYY-MM-DD HH24:MI:SS.FF6'), '0'), '.')`;
   }
-  return `RTRIM(RTRIM(TO_CHAR(${col}, 'YYYY-MM-DD HH24:MI:SS.FF3'), '0'), '.')`;
+  return `RTRIM(RTRIM(TO_CHAR(${col}, 'YYYY-MM-DD HH24:MI:SS.FF6'), '0'), '.')`;
 }
 function formatOracleQueryValue(
   value: unknown,
@@ -633,10 +670,10 @@ function formatOracleQueryValue(
   if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
     return value;
   }
-  if (
-    meta.dbType === oracledb.DB_TYPE_DATE ||
-    meta.dbType === oracledb.DB_TYPE_TIMESTAMP
-  ) {
+  if (meta.dbType === oracledb.DB_TYPE_DATE) {
+    return formatDatetimeForDisplay(value)?.slice(0, 10) ?? value;
+  }
+  if (meta.dbType === oracledb.DB_TYPE_TIMESTAMP) {
     return formatOracleWallClockDate(value) ?? value;
   }
   if (
@@ -825,7 +862,60 @@ export class OracleDriver extends BaseDBDriver {
     }
     const connection = await this.pool.getConnection();
     connection.callTimeout = this.getDbOperationTimeoutMs();
+    try {
+      await connection.execute(
+        "ALTER SESSION SET NLS_TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF6'",
+      );
+      await connection.execute(
+        "ALTER SESSION SET NLS_TIMESTAMP_TZ_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM'",
+      );
+    } catch {
+      // Best effort: continue with default NLS settings when session alter is not allowed.
+    }
     return connection;
+  }
+
+  private async readStructuredConstraintKinds(
+    conn: oracledb.Connection,
+    schema: string,
+    table: string,
+  ): Promise<Map<string, OracleStructuredConstraintKind>> {
+    const result = new Map<string, OracleStructuredConstraintKind>();
+    try {
+      const res = await conn.execute<{
+        COLUMN_NAME: string;
+        SEARCH_CONDITION_VC: string | null;
+      }>(
+        `SELECT cols.column_name, cons.search_condition_vc
+         FROM all_constraints cons
+         JOIN all_cons_columns cols
+           ON cons.constraint_name = cols.constraint_name
+          AND cons.owner = cols.owner
+         WHERE cons.owner = :1
+           AND cons.table_name = :2
+           AND cons.constraint_type = 'C'
+           AND cons.search_condition_vc IS NOT NULL`,
+        [schema.toUpperCase(), table.toUpperCase()],
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
+      );
+
+      for (const row of res.rows ?? []) {
+        const kind = parseOracleStructuredConstraintKind(
+          row.SEARCH_CONDITION_VC,
+        );
+        if (!kind) {
+          continue;
+        }
+        const existing = result.get(row.COLUMN_NAME);
+        if (existing === "json") {
+          continue;
+        }
+        result.set(row.COLUMN_NAME, kind);
+      }
+    } catch {
+      // Ignore metadata lookup errors and keep base type information.
+    }
+    return result;
   }
   async listDatabases(): Promise<DatabaseInfo[]> {
     const conn = await this.getConnection();
@@ -907,6 +997,7 @@ export class OracleDriver extends BaseDBDriver {
       for (const r of tableRes.rows ?? []) {
         const rawType = r.OBJECT_TYPE.trim();
         let type: TableInfo["type"];
+        let routineIdentity: string | undefined;
         if (rawType === "TABLE") {
           type = "table";
         } else if (rawType === "VIEW") {
@@ -915,8 +1006,12 @@ export class OracleDriver extends BaseDBDriver {
           type = "materializedView";
         } else if (rawType === "FUNCTION") {
           type = "function";
-        } else if (rawType === "PROCEDURE" || rawType === "PACKAGE") {
+        } else if (rawType === "PROCEDURE") {
           type = "procedure";
+          routineIdentity = "oracle:procedure";
+        } else if (rawType === "PACKAGE") {
+          type = "procedure";
+          routineIdentity = "oracle:package";
         } else if (rawType === "SEQUENCE") {
           type = "sequence";
         } else if (rawType === "TYPE") {
@@ -924,7 +1019,12 @@ export class OracleDriver extends BaseDBDriver {
         } else {
           continue;
         }
-        objects.push({ schema, name: r.OBJECT_NAME, type });
+        objects.push({
+          schema,
+          name: r.OBJECT_NAME,
+          type,
+          ...(routineIdentity ? { routineIdentity } : {}),
+        });
       }
       return objects;
     } finally {
@@ -977,6 +1077,8 @@ export class OracleDriver extends BaseDBDriver {
         { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
       const fkCols = new Set((fkRes.rows ?? []).map((r) => r.COLUMN_NAME));
+      const structuredConstraintKinds =
+        await this.readStructuredConstraintKinds(conn, schema, table);
       const identityMap = new Map<
         string,
         "ALWAYS" | "BY DEFAULT" | "BY DEFAULT ON NULL"
@@ -1010,14 +1112,22 @@ export class OracleDriver extends BaseDBDriver {
         const primaryKeyOrdinal = pkOrdinalByColumn.get(r.COLUMN_NAME);
         const defaultValue =
           !isComputed && genType === undefined ? rawDefault : undefined;
+        const baseType = oracleFullType(
+          r.DATA_TYPE,
+          r.DATA_PRECISION,
+          r.DATA_SCALE,
+          r.DATA_LENGTH,
+        );
+        const structuredKind = structuredConstraintKinds.get(r.COLUMN_NAME);
+        const displayType =
+          structuredKind === "json"
+            ? `${baseType} IS JSON`
+            : structuredKind === "xml"
+              ? `${baseType} IS XML`
+              : baseType;
         return {
           name: r.COLUMN_NAME,
-          type: oracleFullType(
-            r.DATA_TYPE,
-            r.DATA_PRECISION,
-            r.DATA_SCALE,
-            r.DATA_LENGTH,
-          ),
+          type: displayType,
           nullable: r.NULLABLE === "Y",
           defaultValue,
           identityGeneration:
@@ -1375,8 +1485,21 @@ export class OracleDriver extends BaseDBDriver {
   ): Promise<string | null> {
     const conn = await this.getConnection();
     try {
-      const metadataObjectType = kind === "sequence" ? "SEQUENCE" : "TYPE";
-      return await this._getMetadataDDL(conn, metadataObjectType, schema, name);
+      if (kind === "sequence") {
+        const metadataDdl = await this._getMetadataDDL(
+          conn,
+          "SEQUENCE",
+          schema,
+          name,
+        );
+        if (metadataDdl) {
+          return metadataDdl;
+        }
+
+        return await this._fallbackSequenceDDL(conn, schema, name);
+      }
+
+      return await this._getMetadataDDL(conn, "TYPE", schema, name);
     } finally {
       await conn.close();
     }
@@ -1460,7 +1583,13 @@ export class OracleDriver extends BaseDBDriver {
   }
   private async _getMetadataDDL(
     conn: oracledb.Connection,
-    objectType: "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "SEQUENCE" | "TYPE",
+    objectType:
+      | "TABLE"
+      | "VIEW"
+      | "MATERIALIZED_VIEW"
+      | "SEQUENCE"
+      | "TYPE"
+      | "PACKAGE",
     schema: string,
     objectName: string,
   ): Promise<string | null> {
@@ -1479,6 +1608,75 @@ export class OracleDriver extends BaseDBDriver {
       return toOracleDdlText(ddl);
     } catch {
       return null;
+    }
+  }
+  private async _fallbackSequenceDDL(
+    conn: oracledb.Connection,
+    schema: string,
+    sequenceName: string,
+  ): Promise<string> {
+    try {
+      const res = await conn.execute<{
+        MIN_VALUE: string | number | null;
+        MAX_VALUE: string | number | null;
+        INCREMENT_BY: string | number;
+        CYCLE_FLAG: string | null;
+        ORDER_FLAG: string | null;
+        CACHE_SIZE: string | number | null;
+        LAST_NUMBER: string | number | null;
+      }>(
+        `SELECT min_value,
+                max_value,
+                increment_by,
+                cycle_flag,
+                order_flag,
+                cache_size,
+                last_number
+         FROM all_sequences
+         WHERE sequence_owner = :1
+           AND sequence_name = :2`,
+        [schema.toUpperCase(), sequenceName.toUpperCase()],
+        { outFormat: oracledb.OUT_FORMAT_OBJECT },
+      );
+
+      const row = res.rows?.[0];
+      if (!row) {
+        return `-- Sequence DDL unavailable for "${schema}"."${sequenceName}": sequence metadata not found or not accessible.`;
+      }
+
+      const minValue =
+        row.MIN_VALUE !== null && row.MIN_VALUE !== undefined
+          ? `MINVALUE ${String(row.MIN_VALUE)}`
+          : "NOMINVALUE";
+      const maxValue =
+        row.MAX_VALUE !== null && row.MAX_VALUE !== undefined
+          ? `MAXVALUE ${String(row.MAX_VALUE)}`
+          : "NOMAXVALUE";
+      const cacheValue =
+        row.CACHE_SIZE !== null && row.CACHE_SIZE !== undefined
+          ? Number(row.CACHE_SIZE) > 0
+            ? `CACHE ${String(row.CACHE_SIZE)}`
+            : "NOCACHE"
+          : "NOCACHE";
+      const startWith =
+        row.LAST_NUMBER !== null && row.LAST_NUMBER !== undefined
+          ? `START WITH ${String(row.LAST_NUMBER)}`
+          : undefined;
+
+      const parts = [
+        `CREATE SEQUENCE ${this.quoteIdentifier(schema.toUpperCase())}.${this.quoteIdentifier(sequenceName.toUpperCase())}`,
+        `INCREMENT BY ${String(row.INCREMENT_BY)}`,
+        minValue,
+        maxValue,
+        startWith,
+        cacheValue,
+        row.CYCLE_FLAG === "Y" ? "CYCLE" : "NOCYCLE",
+        row.ORDER_FLAG === "Y" ? "ORDER" : "NOORDER",
+      ].filter((part): part is string => Boolean(part));
+
+      return `${parts.join(" ")};`;
+    } catch (error: unknown) {
+      return `-- Sequence DDL unavailable for "${schema}"."${sequenceName}": ${oracleErrorMessage(error)}`;
     }
   }
   private async _consumeLob(lob: unknown): Promise<string | Buffer | null> {
@@ -1671,24 +1869,60 @@ export class OracleDriver extends BaseDBDriver {
     _database: string,
     schema: string,
     name: string,
-    _kind: "function" | "procedure",
-    _routineIdentity?: string,
+    kind: "function" | "procedure",
+    routineIdentity?: string,
   ): Promise<string> {
     const conn = await this.getConnection();
     try {
+      const parsedIdentity = parseOracleRoutineIdentity(routineIdentity);
+      if (kind === "procedure" && parsedIdentity?.kind === "package") {
+        const metadataDdl = await this._getMetadataDDL(
+          conn,
+          "PACKAGE",
+          schema,
+          name,
+        );
+        if (metadataDdl) {
+          return metadataDdl;
+        }
+
+        const packageSource = await conn.execute<{
+          TEXT: string;
+        }>(
+          `SELECT text FROM all_source
+           WHERE owner = :1 AND name = :2
+             AND type = 'PACKAGE'
+           ORDER BY line`,
+          [schema.toUpperCase(), name.toUpperCase()],
+          { outFormat: oracledb.OUT_FORMAT_OBJECT },
+        );
+        const packageLines = (packageSource.rows ?? []).map((r) => r.TEXT);
+        if (packageLines.length > 0) {
+          return `CREATE OR REPLACE ${packageLines.join("")}`;
+        }
+
+        return `-- Source not available for package ${schema}.${name}`;
+      }
+
+      const sourceType =
+        kind === "function"
+          ? "FUNCTION"
+          : parsedIdentity?.kind === "procedure"
+            ? "PROCEDURE"
+            : "PROCEDURE";
       const res = await conn.execute<{
         TEXT: string;
       }>(
         `SELECT text FROM all_source
          WHERE owner = :1 AND name = :2
-           AND type IN ('FUNCTION','PROCEDURE','PACKAGE','PACKAGE BODY')
-         ORDER BY type, line`,
-        [schema.toUpperCase(), name.toUpperCase()],
+           AND type = :3
+         ORDER BY line`,
+        [schema.toUpperCase(), name.toUpperCase(), sourceType],
         { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
       const lines = (res.rows ?? []).map((r) => r.TEXT);
       if (lines.length === 0) {
-        return `-- Source not available for ${schema}.${name}`;
+        return `-- Source not available for ${kind} ${schema}.${name}`;
       }
       return `CREATE OR REPLACE ${lines.join("")}`;
     } finally {
@@ -1874,6 +2108,49 @@ export class OracleDriver extends BaseDBDriver {
     _category: TypeCategory,
   ): ValueSemantics {
     return "plain";
+  }
+  protected override enrichColumn(col: ColumnMeta): ColumnTypeMeta {
+    const enriched = super.enrichColumn(col);
+    const typeName = oracleTypeName(enriched.nativeType);
+    const baseOperators: FilterOperator[] = enriched.filterOperators.filter(
+      (operator) => operator !== "is_null" && operator !== "is_not_null",
+    );
+    const withNullableOperators = (
+      operators: FilterOperator[],
+    ): FilterOperator[] => {
+      if (!enriched.nullable) {
+        return operators;
+      }
+      const nextOperators = operators.slice();
+      nextOperators.push("is_null", "is_not_null");
+      return nextOperators;
+    };
+
+    if (isOracleIntervalType(enriched.nativeType)) {
+      const operators: FilterOperator[] = ["eq", "neq", "like"];
+      return {
+        ...enriched,
+        filterable: true,
+        filterOperators: withNullableOperators(operators),
+      };
+    }
+
+    if (typeName === "CLOB" || typeName === "NCLOB") {
+      const operators: FilterOperator[] = [...baseOperators];
+      if (!operators.includes("eq")) {
+        operators.unshift("eq");
+      }
+      if (!operators.includes("neq")) {
+        operators.splice(1, 0, "neq");
+      }
+      return {
+        ...enriched,
+        filterable: true,
+        filterOperators: withNullableOperators(operators),
+      };
+    }
+
+    return enriched;
   }
   isDatetimeWithTime(nativeType: string): boolean {
     const ct = nativeType.toUpperCase().split("(")[0].trim();
@@ -2083,6 +2360,12 @@ export class OracleDriver extends BaseDBDriver {
     if (value === null || value === undefined) return value;
     if (Buffer.isBuffer(value)) return super.formatOutputValue(value, column);
     if (typeof value === "bigint") return value.toString();
+    if (oracleTypeName(column.nativeType) === "DATE") {
+      const formatted = formatDatetimeForDisplay(value);
+      if (formatted !== null) {
+        return formatted.slice(0, 10);
+      }
+    }
     if (column.category === "float") {
       const normalizedFloat = normalizeOracleFloatValue(
         value,
@@ -2169,6 +2452,25 @@ export class OracleDriver extends BaseDBDriver {
       column.category === "time" ||
       column.category === "datetime"
     ) {
+      if (oracleTypeName(column.nativeType) === "XMLTYPE") {
+        return this.checkNormalizedPersistedEdit(
+          column,
+          expectedValue,
+          options,
+          (value) => {
+            if (value === NULL_SENTINEL || value === null) {
+              return { canonical: "\u0000__RAPIDB_ORACLE_XML_NULL__\u0000" };
+            }
+            if (typeof value !== "string") {
+              return null;
+            }
+            return {
+              canonical: normalizeOracleXmlValue(value) ?? value.trim(),
+            };
+          },
+          `Column "${column.name}" expects XML text.`,
+        );
+      }
       if (["CHAR", "NCHAR"].includes(baseType)) {
         return this.checkFixedWidthCharPersistedEdit(
           column,
@@ -2261,6 +2563,30 @@ export class OracleDriver extends BaseDBDriver {
         sql: `UPPER(${col}) LIKE UPPER(:${paramIndex})`,
         params: [`%${arrayValue}%`],
       };
+    }
+    if (
+      isOracleIntervalType(column.nativeType) &&
+      typeof val === "string" &&
+      (operator === "eq" || operator === "neq")
+    ) {
+      const sqlOp = operator === "neq" ? "<>" : "=";
+      return {
+        sql: `TRIM(CAST(${col} AS VARCHAR2(128))) ${sqlOp} :${paramIndex}`,
+        params: [val.trim()],
+      };
+    }
+    if (typeof val === "string" && (operator === "eq" || operator === "neq")) {
+      const typeName = oracleTypeName(column.nativeType);
+      if (typeName === "CLOB" || typeName === "NCLOB") {
+        const converter = typeName === "NCLOB" ? "TO_NCLOB" : "TO_CLOB";
+        return {
+          sql:
+            operator === "neq"
+              ? `NVL(DBMS_LOB.COMPARE(${col}, ${converter}(:${paramIndex})), 1) != 0`
+              : `NVL(DBMS_LOB.COMPARE(${col}, ${converter}(:${paramIndex})), 1) = 0`,
+          params: [val],
+        };
+      }
     }
     if (
       this.isNumericCategory(column.category) &&

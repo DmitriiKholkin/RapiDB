@@ -966,6 +966,52 @@ describe("filter SQL compatibility for complex null-only types", () => {
     });
   });
 
+  it("builds Oracle INTERVAL eq filters against exact displayed text", () => {
+    const driver = new OracleDriver({
+      ...baseConfig,
+      type: "oracle",
+      serviceName: "FREEPDB1",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      {
+        ...buildFilterColumn("INTERVAL DAY TO SECOND", "interval"),
+        filterable: true,
+        filterOperators: ["eq", "neq", "like", "is_null", "is_not_null"],
+      },
+      "eq",
+      "1 02:03:04.500",
+      1,
+    );
+
+    expect(result).toEqual({
+      sql: 'TRIM(CAST("probe_col" AS VARCHAR2(128))) = :1',
+      params: ["1 02:03:04.500"],
+    });
+  });
+
+  it("builds Oracle CLOB neq filters against exact displayed text", () => {
+    const driver = new OracleDriver({
+      ...baseConfig,
+      type: "oracle",
+      serviceName: "FREEPDB1",
+    } as ConnectionConfig);
+    const result = driver.buildFilterCondition(
+      {
+        ...buildFilterColumn("CLOB", "text"),
+        filterable: true,
+        filterOperators: ["eq", "neq", "like", "is_null", "is_not_null"],
+      },
+      "neq",
+      '<root><child id="1">Value</child></root>',
+      1,
+    );
+
+    expect(result).toEqual({
+      sql: 'NVL(DBMS_LOB.COMPARE("probe_col", TO_CLOB(:1)), 1) != 0',
+      params: ['<root><child id="1">Value</child></root>'],
+    });
+  });
+
   it("builds PostgreSQL interval like filters against text representation", () => {
     const driver = new PostgresDriver({
       ...baseConfig,

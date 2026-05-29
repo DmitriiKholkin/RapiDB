@@ -66,7 +66,6 @@ export function formatDatetimeForDisplay(val: unknown): string | null {
       const [, date, time, rawFrac, tz] = m;
       let fracStr = "";
       if (rawFrac && rawFrac.length > 1) {
-        // Preserve all fractional seconds (up to microseconds), removing trailing zeros
         const digits = rawFrac.slice(1).replace(/0+$/, "");
         if (digits.length > 0) {
           fracStr = `.${digits}`;
@@ -469,6 +468,10 @@ function formatDiagnosticValue(value: unknown): string {
   if (value === null) return "NULL";
   if (value === undefined) return "<missing>";
   if (typeof value === "string") return JSON.stringify(value);
+  if (value instanceof Date) {
+    const formatted = formatDatetimeForDisplay(value) ?? value.toISOString();
+    return JSON.stringify(formatted);
+  }
   if (typeof value === "number" || typeof value === "boolean") {
     return String(value);
   }

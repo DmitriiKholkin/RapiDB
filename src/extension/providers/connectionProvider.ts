@@ -61,6 +61,7 @@ export type NodeKind =
   | "category_materializedViews"
   | "category_functions"
   | "category_procedures"
+  | "category_packages"
   | "category_sequences"
   | "category_types"
   | "table"
@@ -86,6 +87,7 @@ type CategoryKind =
   | "category_materializedViews"
   | "category_functions"
   | "category_procedures"
+  | "category_packages"
   | "category_sequences"
   | "category_types";
 
@@ -156,6 +158,7 @@ const ICON_MAP: Record<NodeKind, string> = {
   category_materializedViews: "eye",
   category_functions: "symbol-method",
   category_procedures: "symbol-event",
+  category_packages: "package",
   category_sequences: "symbol-number",
   category_types: "symbol-structure",
   table: "list-flat",
@@ -286,6 +289,7 @@ const CATEGORY_TYPES: Record<CategoryKind, DbObjectKind[]> = {
   category_materializedViews: ["materializedView"],
   category_functions: ["function"],
   category_procedures: ["procedure"],
+  category_packages: ["procedure"],
   category_sequences: ["sequence"],
   category_types: ["type"],
 };
@@ -315,7 +319,6 @@ export class ConnectionProvider
   private readonly _subscriptions: vscode.Disposable[] = [];
   private readonly _connectionNodes = new Map<string, RapiDBNode>();
   private readonly _expandedConnectionRoots = new Set<string>();
-  private readonly _connectionErrors = new Map<string, string>();
   private readonly _pendingConnectionRefreshIds = new Set<string>();
   private _refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private _refreshAllPending = false;
@@ -352,11 +355,9 @@ export class ConnectionProvider
     };
     this._subscriptions.push(
       connectionManager.onDidConnect(() => {
-        this._connectionErrors.clear();
         scheduleRefresh();
       }),
       connectionManager.onDidDisconnect((connectionId) => {
-        this._connectionErrors.delete(connectionId);
         this.markConnectionRootExpanded(connectionId, false);
         scheduleRefresh(connectionId);
       }),
@@ -606,27 +607,14 @@ export class ConnectionProvider
     element: RapiDBNode,
   ): Promise<RapiDBNode[]> {
     if (!this.connectionManager.isConnected(element.connectionId)) {
-      const error = this._connectionErrors.get(element.connectionId);
-      if (error) {
-        return this.makeErrorNodes(element.connectionId, error);
-      }
-
       const attempt = this.connectionManager.beginConnect?.(
         element.connectionId,
       );
       if (attempt) {
-        void attempt.promise
-          .then(() => {
-            this._connectionErrors.delete(element.connectionId);
-          })
-          .catch((err) => {
-            this._connectionErrors.set(
-              element.connectionId,
-              err instanceof Error ? err.message : String(err),
-            );
-            this.markConnectionRootExpanded(element.connectionId, false);
-            this.refreshConnectionTree(element.connectionId);
-          });
+        void attempt.promise.catch(() => {
+          this.markConnectionRootExpanded(element.connectionId, false);
+          this.refreshConnectionTree(element.connectionId);
+        });
       }
 
       if (attempt?.isNew) {
@@ -799,7 +787,7 @@ export class ConnectionProvider
     }
 
     const filteredObjects = schema.objects.filter((object) =>
-      CATEGORY_TYPES[kind].includes(object.type),
+      this.objectMatchesCategory(kind, object, element.connectionId),
     );
 
     element.description = `(${filteredObjects.length})`;
@@ -821,6 +809,42 @@ export class ConnectionProvider
         manifest,
       ),
     );
+  }
+
+  private isOraclePackageRoutine(
+    object: Pick<
+      SchemaSnapshotSchemaEntry["objects"][number],
+      "routineIdentity"
+    >,
+  ): boolean {
+    return (
+      typeof object.routineIdentity === "string" &&
+      object.routineIdentity.toLowerCase().startsWith("oracle:package")
+    );
+  }
+
+  private objectMatchesCategory(
+    kind: CategoryKind,
+    object: SchemaSnapshotSchemaEntry["objects"][number],
+    connectionId: string,
+  ): boolean {
+    if (!CATEGORY_TYPES[kind].includes(object.type)) {
+      return false;
+    }
+
+    if (this.getConnectionType(connectionId) !== "oracle") {
+      return kind !== "category_packages";
+    }
+
+    if (kind === "category_packages") {
+      return this.isOraclePackageRoutine(object);
+    }
+
+    if (kind === "category_procedures") {
+      return !this.isOraclePackageRoutine(object);
+    }
+
+    return true;
   }
 
   private async getTableChildren(element: RapiDBNode): Promise<RapiDBNode[]> {
@@ -1468,13 +1492,17 @@ export class ConnectionProvider
           ? "enabled"
           : "enabled (allow self-signed)"
         : "disabled";
+      const databaseLine =
+        config.type === "oracle"
+          ? `Service Name: \`${config.serviceName ?? "—"}\``
+          : `Database: \`${config.database ?? "—"}\``;
       const tooltipLines = [
         `**${config.name}**`,
         ``,
         `Type: \`${config.type}\``,
         `Host: \`${config.host ?? "—"}\``,
         `Port: \`${config.port ?? "—"}\``,
-        `Database: \`${config.database ?? "—"}\``,
+        databaseLine,
         `User: \`${config.username ?? "—"}\``,
         `SSL: \`${sslStatus}\``,
       ];
@@ -1505,25 +1533,41 @@ export class ConnectionProvider
         supportedKinds.has(kind),
       ),
     );
+    const categoryKinds: CategoryKind[] = visibleCategoryIds.map(
+      (categoryId) => CATEGORY_NODE_KIND_BY_ID[categoryId],
+    );
+    if (
+      connectionType === "oracle" &&
+      supportedKinds.has("procedure") &&
+      !categoryKinds.includes("category_packages")
+    ) {
+      const proceduresIndex = categoryKinds.indexOf("category_procedures");
+      const insertAt = proceduresIndex >= 0 ? proceduresIndex + 1 : 0;
+      categoryKinds.splice(insertAt, 0, "category_packages");
+    }
+
     const counts = new Map<CategoryKind, number>();
 
-    for (const categoryId of visibleCategoryIds) {
-      const categoryKind = CATEGORY_NODE_KIND_BY_ID[categoryId];
-      const categoryConfig = EXPLORER_CATEGORY_CONFIG[categoryId];
+    for (const categoryKind of categoryKinds) {
       counts.set(
         categoryKind,
         schema.objects.filter((object) =>
-          categoryConfig.objectKinds.includes(object.type),
+          this.objectMatchesCategory(categoryKind, object, connectionId),
         ).length,
       );
     }
 
-    return visibleCategoryIds.map((categoryId) => {
-      const categoryKind = CATEGORY_NODE_KIND_BY_ID[categoryId];
-      const categoryLabel = getDbObjectKindCategoryLabel(
-        connectionType,
-        categoryId,
-      );
+    return categoryKinds.map((categoryKind) => {
+      const categoryLabel =
+        categoryKind === "category_packages"
+          ? "Packages"
+          : getDbObjectKindCategoryLabel(
+              connectionType,
+              EXPLORER_CATEGORY_ORDER.find(
+                (categoryId) =>
+                  CATEGORY_NODE_KIND_BY_ID[categoryId] === categoryKind,
+              ) ?? "tables",
+            );
       const count = counts.get(categoryKind) ?? 0;
       const hasItems = count > 0;
       const node = new RapiDBNode(

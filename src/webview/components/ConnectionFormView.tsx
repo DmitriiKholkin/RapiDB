@@ -510,7 +510,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   );
 
   const [oracleServiceName, setOracleServiceName] = useState(
-    existing?.serviceName ?? "",
+    existing?.serviceName ?? existing?.database ?? "",
   );
   const [oracleThickMode, setOracleThickMode] = useState(
     existing?.thickMode ?? false,
@@ -742,7 +742,9 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
               host: host.trim(),
               port: Number(port) || DEFAULT_PORT_BY_CONNECTION_TYPE[type],
               database:
-                isRedis || isElasticsearch ? undefined : database.trim(),
+                isRedis || isElasticsearch || isOracle
+                  ? undefined
+                  : database.trim(),
               username: isRedis ? undefined : username.trim(),
               password,
               ssl: supportsSsl ? sslEnabled : undefined,
@@ -1120,7 +1122,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                 />
               </div>
             </div>
-            {!isRedis && !isElasticsearch && (
+            {!isRedis && !isElasticsearch && !isOracle && (
               <Field label="Database">
                 <FocusInput
                   aria-label="Database"
@@ -1513,7 +1515,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
           <CardHeader icon="settings-gear" label="Oracle Options" />
           <Field
             label="Service Name"
-            hint="e.g. XEPDB1, ORCL, or your PDB service name. Leave empty to use the Database field."
+            hint="e.g. XEPDB1, ORCL, or your PDB service name."
           >
             <FocusInput
               aria-label="Oracle service name"

@@ -456,9 +456,32 @@ function getConfiguredDefaultDatabaseName(config: ConnectionConfig): string {
     return "default";
   }
 
+  if (config.type === "oracle") {
+    return config.serviceName || config.database || "";
+  }
+
   return (
     config.database || config.serviceName || (config.filePath ? "main" : "")
   );
+}
+
+function canonicalizeOracleServiceName(
+  config: ConnectionConfig,
+): ConnectionConfig {
+  if (config.type !== "oracle") {
+    return config;
+  }
+
+  const rawServiceName =
+    (typeof config.serviceName === "string" && config.serviceName.trim()) ||
+    (typeof config.database === "string" && config.database.trim()) ||
+    undefined;
+
+  return {
+    ...config,
+    serviceName: rawServiceName,
+    database: undefined,
+  };
 }
 
 function isDescendantScope(
@@ -886,9 +909,11 @@ export class ConnectionManager
     this._scheduleSecretMigration();
 
     this._connectionsCache = this.store.getConnections().map((c) => ({
-      ...c,
-      id: c.id ?? randomUUID(),
-      username: c.username ?? c.user,
+      ...canonicalizeOracleServiceName({
+        ...c,
+        id: c.id ?? randomUUID(),
+        username: c.username ?? c.user,
+      }),
     }));
     return this._connectionsCache;
   }
@@ -925,17 +950,19 @@ export class ConnectionManager
   async saveConnection(config: ConnectionConfig): Promise<void> {
     this._assertNotDisposed();
 
-    const validation = this.validationService.validate(config);
+    const canonicalConfig = canonicalizeOracleServiceName(config);
+
+    const validation = this.validationService.validate(canonicalConfig);
     if (!validation.valid) {
       throw new Error(validation.message ?? "Connection settings are invalid.");
     }
 
-    await this._persistConnectionSecretsIfNeeded(config);
+    await this._persistConnectionSecretsIfNeeded(canonicalConfig);
 
-    const persistedConfig = sanitizePersistedConnectionConfig(config);
+    const persistedConfig = sanitizePersistedConnectionConfig(canonicalConfig);
 
     const conns = this.getConnections();
-    const idx = conns.findIndex((c) => c.id === config.id);
+    const idx = conns.findIndex((c) => c.id === canonicalConfig.id);
     const isEdit = idx >= 0;
     if (isEdit) {
       conns[idx] = persistedConfig;
@@ -945,10 +972,10 @@ export class ConnectionManager
         id: persistedConfig.id || randomUUID(),
       });
     }
-    this.invalidateDriverStaticMetadata(config.id);
+    this.invalidateDriverStaticMetadata(canonicalConfig.id);
     await this.saveConnections(conns);
-    if (isEdit && this.isConnected(config.id)) {
-      await this.disconnectFrom(config.id);
+    if (isEdit && this.isConnected(canonicalConfig.id)) {
+      await this.disconnectFrom(canonicalConfig.id);
     }
     this._onDidChangeConnections.fire();
   }
@@ -3090,7 +3117,10 @@ export class ConnectionManager
   async testConnection(
     config: Omit<ConnectionConfig, "id">,
   ): Promise<TestConnectionResult> {
-    const configWithId = { ...config, id: TEST_CONNECTION_ID };
+    const configWithId = canonicalizeOracleServiceName({
+      ...config,
+      id: TEST_CONNECTION_ID,
+    });
     const validation = this.validationService.validate(configWithId);
     if (!validation.valid) {
       return {

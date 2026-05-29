@@ -31,6 +31,7 @@ import {
   type Column as SizingColumn,
 } from "../../utils/columnSizing";
 import { postMessage } from "../../utils/messaging";
+import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
 import { Icon } from "../Icon";
 import { CellDisplay } from "./CellDisplay";
 import { ColumnFilterControl } from "./ColumnFilterControl";
@@ -512,7 +513,7 @@ const QueryTableRow = React.memo(function QueryTableRow({
               cursor: isCollapsed ? "default" : "pointer",
               userSelect: "none",
             }}
-            title={isNull ? "" : String(raw)}
+            title={isNull ? "" : formatScalarValueForDisplay(raw)}
             onDoubleClick={() => {
               if (!isCollapsed) {
                 onActivateCell(index, cell.column.id);

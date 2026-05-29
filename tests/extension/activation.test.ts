@@ -865,7 +865,7 @@ describe("extension activation", () => {
     );
     expect(queryPanelCreateOrShow).not.toHaveBeenCalled();
     expect(vscodeState.showWarningMessage).toHaveBeenCalledWith(
-      "[RapiDB] DDL is available only for table, view, materialized view, function, procedure, sequence, type, constraint, index, and trigger nodes.",
+      '[RapiDB] DDL is currently unavailable for sequence "users_id_seq". Check object permissions (for example, DBMS_METADATA access on Oracle) and retry.',
     );
   });
 

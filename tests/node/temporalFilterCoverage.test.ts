@@ -349,11 +349,11 @@ describe("temporal filter operator coverage", () => {
     );
 
     expect(gtCondition).toEqual({
-      sql: `RTRIM(RTRIM(TO_CHAR(SYS_EXTRACT_UTC(CAST("event_at" AS TIMESTAMP WITH TIME ZONE)), 'YYYY-MM-DD HH24:MI:SS.FF3'), '0'), '.') > :1`,
+      sql: `RTRIM(RTRIM(TO_CHAR(SYS_EXTRACT_UTC(CAST("event_at" AS TIMESTAMP WITH TIME ZONE)), 'YYYY-MM-DD HH24:MI:SS.FF6'), '0'), '.') > :1`,
       params: ["2026-04-23 12:34:56"],
     });
     expect(inCondition).toEqual({
-      sql: `RTRIM(RTRIM(TO_CHAR(SYS_EXTRACT_UTC(CAST("event_at" AS TIMESTAMP WITH TIME ZONE)), 'YYYY-MM-DD HH24:MI:SS.FF3'), '0'), '.') IN (:1, :2)`,
+      sql: `RTRIM(RTRIM(TO_CHAR(SYS_EXTRACT_UTC(CAST("event_at" AS TIMESTAMP WITH TIME ZONE)), 'YYYY-MM-DD HH24:MI:SS.FF6'), '0'), '.') IN (:1, :2)`,
       params: ["2026-04-23 12:34:56", "2026-04-24 08:00:00"],
     });
   });

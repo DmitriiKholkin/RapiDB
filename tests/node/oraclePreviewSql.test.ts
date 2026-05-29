@@ -235,4 +235,55 @@ describe("Oracle preview SQL literals", () => {
       params: ['%<root><child id="1">Text</child></root>%'],
     });
   });
+
+  it("preserves full binary_float display precision", () => {
+    const driver = new OracleDriver(baseConfig as ConnectionConfig);
+    const column = buildColumn("COL_BF", "BINARY_FLOAT", "float");
+
+    expect(driver.formatOutputValue(3.140000104904175, column)).toBe(
+      "3.140000104904175",
+    );
+  });
+
+  it("preserves microseconds when formatting TIMESTAMP(6) text values", () => {
+    const driver = new OracleDriver(baseConfig as ConnectionConfig);
+    const column = buildColumn("COL_TS6", "TIMESTAMP(6)", "datetime");
+
+    expect(driver.formatOutputValue("2026-05-29 10:11:12.123456", column)).toBe(
+      "2026-05-29 10:11:12.123456",
+    );
+  });
+
+  it("formats Oracle DATE values without the time portion", () => {
+    const driver = new OracleDriver(baseConfig as ConnectionConfig);
+    const column = buildColumn("COL_DATE", "DATE", "date");
+
+    expect(
+      driver.formatOutputValue(
+        new Date(Date.UTC(2016, 9, 23, 0, 0, 0, 0)),
+        column,
+      ),
+    ).toBe("2016-10-23");
+    expect(driver.formatOutputValue("2016-10-23 00:00:00", column)).toBe(
+      "2016-10-23",
+    );
+  });
+
+  it("treats semantically equivalent XMLTYPE persisted values as matches", () => {
+    const driver = new OracleDriver(baseConfig as ConnectionConfig);
+    const column = buildColumn("COL_XMLTYPE", "XMLTYPE", "text");
+
+    const check = driver.checkPersistedEdit(
+      column,
+      '<root><child id="1">Value</child></root>',
+      {
+        persistedValue: '<root>\n <child id="1">Value</child>\n</root>\n',
+      },
+    );
+
+    expect(check).toEqual({
+      ok: true,
+      shouldVerify: true,
+    });
+  });
 });

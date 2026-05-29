@@ -622,6 +622,62 @@ describe("ConnectionProvider", () => {
     });
   });
 
+  it("shows Service Name in Oracle connection tooltip instead of Database", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        {
+          id: "conn-oracle",
+          name: "OracleDB",
+          type: "oracle",
+          host: "db.example.com",
+          port: 1521,
+          serviceName: "XEPDB1",
+          username: "hr",
+        },
+      ]),
+      isConnected: vi.fn(() => false),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() => loadedState({ databases: [] })),
+      getConnection: vi.fn((id: string) =>
+        id === "conn-oracle"
+          ? {
+              id: "conn-oracle",
+              name: "OracleDB",
+              type: "oracle",
+              host: "db.example.com",
+              port: 1521,
+              serviceName: "XEPDB1",
+              username: "hr",
+            }
+          : undefined,
+      ),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    const roots = await provider.getChildren();
+    const oracleNode = roots[0];
+
+    expect(
+      (oracleNode?.tooltip as { value?: string } | undefined)?.value,
+    ).toContain("Service Name: `XEPDB1`");
+    expect(
+      (oracleNode?.tooltip as { value?: string } | undefined)?.value,
+    ).not.toContain("Database:");
+  });
+
   it("keeps a connection root expanded when its root state is tracked", async () => {
     const connectionManager = {
       getConnections: vi.fn(() => [
@@ -755,6 +811,60 @@ describe("ConnectionProvider", () => {
 
     expect(beginConnect).toHaveBeenCalledWith("conn-1");
     expect(children).toHaveLength(0);
+  });
+
+  it("keeps disconnected connection children empty when auto-connect fails", async () => {
+    vi.useFakeTimers();
+
+    const beginConnect = vi.fn(() => ({
+      isNew: true,
+      promise: Promise.reject(new Error("Failed to connect")),
+    }));
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        {
+          id: "conn-1",
+          name: "Primary",
+          type: "oracle",
+        },
+      ]),
+      beginConnect,
+      isConnected: vi.fn(() => false),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() => loadedState({ databases: [] })),
+      getConnection: vi.fn(() => ({
+        id: "conn-1",
+        name: "Primary",
+        type: "oracle",
+      })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    const [connectionNode] = await provider.getChildren();
+
+    const initialChildren = await provider.getChildren(connectionNode);
+    await vi.runAllTicks();
+    await vi.advanceTimersByTimeAsync(60);
+    const childrenAfterFailure = await provider.getChildren(connectionNode);
+
+    expect(beginConnect).toHaveBeenCalled();
+    expect(initialChildren).toHaveLength(0);
+    expect(childrenAfterFailure).toHaveLength(0);
+
+    vi.useRealTimers();
   });
 
   it("uses canonical database context values across connection types", async () => {
@@ -2524,5 +2634,204 @@ describe("ConnectionProvider", () => {
     expect(sections.map((node) => node.label)).toEqual(["Columns"]);
     expect(ensureTableDetailLoading).toHaveBeenCalled();
     expect(getTableDetailState).toHaveBeenCalled();
+  });
+
+  it("injects a Packages category after Procedures for Oracle connections with procedures", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-oracle", name: "Oracle", type: "oracle" },
+      ]),
+      isConnected: vi.fn((id: string) => id === "conn-oracle"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "app_db",
+              schemas: [
+                {
+                  name: "app_db",
+                  objects: [
+                    { name: "get_name", type: "function", columns: [] },
+                    { name: "refresh_users", type: "procedure", columns: [] },
+                    {
+                      name: "UTL_HTTP",
+                      type: "procedure",
+                      columns: [],
+                      routineIdentity: "oracle:package",
+                    },
+                    { name: "users_seq", type: "sequence", columns: [] },
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+
+    const roots = await provider.getChildren();
+    const databases = await provider.getChildren(roots[0]);
+    const categories = await provider.getChildren(databases[0]);
+    const categoryLabels = categories.map((node) => node.label);
+
+    expect(categoryLabels).toContain("Procedures");
+    expect(categoryLabels).toContain("Packages");
+
+    const proceduresIndex = categoryLabels.indexOf("Procedures");
+    const packagesIndex = categoryLabels.indexOf("Packages");
+    expect(packagesIndex).toBe(proceduresIndex + 1);
+  });
+
+  it("routes oracle:package routineIdentity objects to Packages category and plain procedures to Procedures", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-oracle", name: "Oracle", type: "oracle" },
+      ]),
+      isConnected: vi.fn((id: string) => id === "conn-oracle"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "orcl",
+              schemas: [
+                {
+                  name: "HR",
+                  objects: [
+                    { name: "hire_emp", type: "procedure", columns: [] },
+                    {
+                      name: "DBMS_OUTPUT",
+                      type: "procedure",
+                      columns: [],
+                      routineIdentity: "oracle:package",
+                    },
+                    {
+                      name: "UTL_FILE",
+                      type: "procedure",
+                      columns: [],
+                      routineIdentity: "oracle:package",
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+
+    const roots = await provider.getChildren();
+    const databases = await provider.getChildren(roots[0]);
+    const schemaNodes = await provider.getChildren(databases[0]);
+    const categories = await provider.getChildren(schemaNodes[0]);
+
+    const proceduresCategory = categories.find(
+      (node) => node.label === "Procedures",
+    );
+    const packagesCategory = categories.find(
+      (node) => node.label === "Packages",
+    );
+
+    if (!proceduresCategory || !packagesCategory) {
+      throw new Error(
+        "Expected both Procedures and Packages categories for Oracle",
+      );
+    }
+
+    const procedureNodes = await provider.getChildren(proceduresCategory);
+    const packageNodes = await provider.getChildren(packagesCategory);
+
+    expect(procedureNodes.map((node) => node.label)).toEqual(["hire_emp"]);
+    expect(packageNodes.map((node) => node.label)).toEqual([
+      "DBMS_OUTPUT",
+      "UTL_FILE",
+    ]);
+
+    expect(proceduresCategory.description).toBe("(1)");
+    expect(packagesCategory.description).toBe("(2)");
+
+    expect(packageNodes[0]).toMatchObject({
+      contextValue: "procedure",
+    });
+  });
+
+  it("does not inject a Packages category for non-Oracle connections", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [{ id: "conn-pg", name: "PG", type: "pg" }]),
+      isConnected: vi.fn((id: string) => id === "conn-pg"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "app_db",
+              schemas: [
+                {
+                  name: "public",
+                  objects: [
+                    { name: "refresh_users", type: "procedure", columns: [] },
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+
+    const roots = await provider.getChildren();
+    const databases = await provider.getChildren(roots[0]);
+    const schemaNodes = await provider.getChildren(databases[0]);
+    const categories = await provider.getChildren(schemaNodes[0]);
+    const categoryLabels = categories.map((node) => node.label);
+
+    expect(categoryLabels).not.toContain("Packages");
+    expect(categoryLabels).toContain("Procedures");
   });
 });

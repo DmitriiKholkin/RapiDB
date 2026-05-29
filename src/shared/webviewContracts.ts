@@ -453,6 +453,13 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
     return null;
   }
 
+  const database = readOptionalString(input, "database");
+  const serviceName = readOptionalString(input, "serviceName");
+  const normalizedOracleServiceName =
+    type === "oracle"
+      ? serviceName?.trim() || database?.trim() || undefined
+      : serviceName;
+
   return {
     id,
     name,
@@ -460,13 +467,13 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
     readOnly: readOptionalBoolean(input, "readOnly"),
     host: readOptionalString(input, "host"),
     port: readOptionalNumber(input, "port"),
-    database: readOptionalString(input, "database"),
+    database: type === "oracle" ? undefined : database,
     username: readOptionalString(input, "username"),
     filePath: readOptionalString(input, "filePath"),
     ssl: readOptionalBoolean(input, "ssl"),
     rejectUnauthorized: readOptionalBoolean(input, "rejectUnauthorized"),
     folder: readOptionalString(input, "folder"),
-    serviceName: readOptionalString(input, "serviceName"),
+    serviceName: normalizedOracleServiceName,
     thickMode: readOptionalBoolean(input, "thickMode"),
     clientPath: readOptionalString(input, "clientPath"),
     connectionUri:

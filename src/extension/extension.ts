@@ -440,6 +440,7 @@ function registerCommands(
     }
     try {
       let ddl: string | null = null;
+      let attemptedSupportedLookup = false;
       const objectKind = isDbObjectKind(node.kind) ? node.kind : undefined;
       if (
         (node.kind === "table" ||
@@ -447,6 +448,7 @@ function registerCommands(
           node.kind === "materializedView") &&
         node.objectName
       ) {
+        attemptedSupportedLookup = true;
         ddl = await driver.getCreateTableDDL(
           node.database ?? "",
           node.schema ?? "",
@@ -457,6 +459,7 @@ function registerCommands(
         isRoutineDbObjectKind(objectKind) &&
         node.objectName
       ) {
+        attemptedSupportedLookup = true;
         ddl = await driver.getRoutineDefinition(
           node.database ?? "",
           node.schema ?? "",
@@ -469,6 +472,7 @@ function registerCommands(
         isDdlOnlyDbObjectKind(objectKind) &&
         node.objectName
       ) {
+        attemptedSupportedLookup = true;
         ddl = await driver.getObjectDefinition(
           node.database ?? "",
           node.schema ?? "",
@@ -480,6 +484,7 @@ function registerCommands(
         node.parentTable &&
         node.objectName
       ) {
+        attemptedSupportedLookup = true;
         ddl = await driver.getConstraintDDL(
           node.database ?? "",
           node.schema ?? "",
@@ -491,6 +496,7 @@ function registerCommands(
         node.parentTable &&
         node.objectName
       ) {
+        attemptedSupportedLookup = true;
         ddl = await driver.getIndexDDL(
           node.database ?? "",
           node.schema ?? "",
@@ -502,6 +508,7 @@ function registerCommands(
         node.parentTable &&
         node.objectName
       ) {
+        attemptedSupportedLookup = true;
         ddl = await driver.getTriggerDDL(
           node.database ?? "",
           node.schema ?? "",
@@ -510,9 +517,18 @@ function registerCommands(
         );
       }
       if (!ddl) {
-        vscode.window.showWarningMessage(
-          "[RapiDB] DDL is available only for table, view, materialized view, function, procedure, sequence, type, constraint, index, and trigger nodes.",
-        );
+        if (attemptedSupportedLookup) {
+          const kindLabel = objectKind ?? node.kind;
+          const objectName =
+            node.objectName ?? node.parentTable ?? "selected node";
+          vscode.window.showWarningMessage(
+            `[RapiDB] DDL is currently unavailable for ${kindLabel} "${objectName}". Check object permissions (for example, DBMS_METADATA access on Oracle) and retry.`,
+          );
+        } else {
+          vscode.window.showWarningMessage(
+            "[RapiDB] DDL is available only for table, view, materialized view, function, procedure, sequence, type, constraint, index, and trigger nodes.",
+          );
+        }
         return;
       }
       const managerWithPresentation = connectionManager as ConnectionManager & {

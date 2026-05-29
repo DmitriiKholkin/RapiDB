@@ -389,6 +389,118 @@ describe("parseConnectionFormPanelMessage", () => {
     });
   });
 
+  it("normalizes Oracle legacy database field to serviceName", () => {
+    const parsed = parseConnectionFormPanelMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-oracle-legacy",
+        name: "Oracle Legacy",
+        type: "oracle",
+        host: "localhost",
+        database: "XEPDB1",
+      },
+    });
+
+    expect(parsed).toEqual({
+      type: "saveConnection",
+      payload: expect.objectContaining({
+        id: "conn-oracle-legacy",
+        type: "oracle",
+        database: undefined,
+        serviceName: "XEPDB1",
+      }),
+    });
+  });
+
+  it("prefers explicit Oracle serviceName over legacy database", () => {
+    const parsed = parseConnectionFormPanelMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-oracle-modern",
+        name: "Oracle Modern",
+        type: "oracle",
+        host: "localhost",
+        database: "LEGACY",
+        serviceName: "FREEPDB1",
+      },
+    });
+
+    expect(parsed).toEqual({
+      type: "saveConnection",
+      payload: expect.objectContaining({
+        id: "conn-oracle-modern",
+        type: "oracle",
+        database: undefined,
+        serviceName: "FREEPDB1",
+      }),
+    });
+  });
+
+  it("strips whitespace when normalizing Oracle serviceName from database field", () => {
+    const parsed = parseConnectionFormPanelMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-oracle-ws",
+        name: "Oracle Whitespace",
+        type: "oracle",
+        host: "localhost",
+        database: "  XEPDB1  ",
+      },
+    });
+
+    expect(parsed).toEqual({
+      type: "saveConnection",
+      payload: expect.objectContaining({
+        type: "oracle",
+        database: undefined,
+        serviceName: "XEPDB1",
+      }),
+    });
+  });
+
+  it("yields undefined serviceName when both database and serviceName are absent for Oracle", () => {
+    const parsed = parseConnectionFormPanelMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-oracle-empty",
+        name: "Oracle No SN",
+        type: "oracle",
+        host: "localhost",
+      },
+    });
+
+    expect(parsed).toEqual({
+      type: "saveConnection",
+      payload: expect.objectContaining({
+        type: "oracle",
+        database: undefined,
+        serviceName: undefined,
+      }),
+    });
+  });
+
+  it("does not alter database field for non-Oracle connection types", () => {
+    const parsed = parseConnectionFormPanelMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-pg-db",
+        name: "PG with DB",
+        type: "pg",
+        host: "localhost",
+        database: "mydb",
+      },
+    });
+
+    expect(parsed).toEqual({
+      type: "saveConnection",
+      payload: expect.objectContaining({
+        type: "pg",
+        database: "mydb",
+        serviceName: undefined,
+      }),
+    });
+  });
+
   it("rejects malformed saveConnection payloads", () => {
     const parsed = parseConnectionFormPanelMessage({
       type: "saveConnection",
@@ -720,6 +832,29 @@ describe("parseWebviewInitialState", () => {
         useSecretStorage: undefined,
         hasStoredSecret: true,
       },
+    });
+  });
+
+  it("normalizes Oracle existing state database to serviceName", () => {
+    const parsed = parseWebviewInitialState({
+      view: "connection",
+      existing: {
+        id: "conn-oracle-existing",
+        name: "Oracle Existing",
+        type: "oracle",
+        host: "localhost",
+        database: "XEPDB1",
+      },
+    });
+
+    expect(parsed).toEqual({
+      view: "connection",
+      existing: expect.objectContaining({
+        id: "conn-oracle-existing",
+        type: "oracle",
+        database: undefined,
+        serviceName: "XEPDB1",
+      }),
     });
   });
 

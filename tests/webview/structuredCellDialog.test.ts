@@ -202,6 +202,30 @@ describe("getStructuredCellDialogValue", () => {
     expect(getStructuredCellDialogValue("hello world", textColumn)).toBeNull();
   });
 
+  it("treats Oracle IS JSON and IS XML constrained text columns as structured", () => {
+    expect(
+      getStructuredCellDialogValue(null, {
+        category: "text",
+        nativeType: "VARCHAR2(4000) IS JSON",
+      }),
+    ).toEqual({
+      kind: "json",
+      language: "json",
+      formattedText: "",
+    });
+
+    expect(
+      getStructuredCellDialogValue("<root><item/></root>", {
+        category: "text",
+        nativeType: "VARCHAR2(4000) IS XML",
+      }),
+    ).toEqual({
+      kind: "xml",
+      language: "xml",
+      formattedText: "<root>\n  <item/>\n</root>",
+    });
+  });
+
   it("serializes structured drafts back to compact commit text", () => {
     expect(
       serializeStructuredCellDialogDraft(

@@ -37,6 +37,29 @@ describe("persisted edit diagnostics", () => {
     expect(check?.message).toContain('"wad  23"');
   });
 
+  it("formats Date diagnostics as SQL datetime text", () => {
+    const column: ColumnTypeMeta = {
+      name: "col_char",
+      type: "TEXT",
+      nativeType: "TEXT",
+      nullable: true,
+      isPrimaryKey: false,
+      isForeignKey: false,
+      category: "text",
+      filterable: true,
+      filterOperators: ["eq", "like"],
+      valueSemantics: "plain",
+    };
+
+    const check = driver.checkPersistedEdit(column, "expected", {
+      persistedValue: new Date(Date.UTC(2026, 4, 29, 20, 30, 57, 769)),
+    });
+
+    expect(check?.ok).toBe(false);
+    expect(check?.message).toContain('"2026-05-29 20:30:57.769"');
+    expect(check?.message).not.toContain("Fri May");
+  });
+
   it("treats equivalent timestamptz offset formats as persisted matches", () => {
     const column: ColumnTypeMeta = {
       name: "created_at",
