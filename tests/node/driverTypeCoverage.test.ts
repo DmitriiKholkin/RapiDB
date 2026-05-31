@@ -91,7 +91,7 @@ const edgeFilterabilityExpectations: Record<
     {
       nativeType: "interval",
       expectedFilterable: true,
-      expectedOperators: ["like", "is_null", "is_not_null"],
+      expectedOperators: ["like", "eq", "neq", "is_null", "is_not_null"],
     },
   ],
   mysql: [
