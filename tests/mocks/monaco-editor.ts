@@ -1,11 +1,41 @@
 type ChangeListener = () => void;
 
-function createMockEditor(initialValue: string) {
+interface MockEdit {
+  text: string;
+}
+
+let mockSelectionText = "";
+
+export function __setMockSelectionText(text: string) {
+  mockSelectionText = text;
+}
+
+export function __resetMockMonacoState() {
+  mockSelectionText = "";
+}
+
+function createMockEditor(container: HTMLElement, initialValue: string) {
   let value = initialValue;
   const changeListeners = new Set<ChangeListener>();
   const domNode = document.createElement("div");
   let scrollTop = 0;
   let scrollLeft = 0;
+  domNode.setAttribute("data-testid", "mock-monaco-dom");
+  container.appendChild(domNode);
+
+  const getSelection = () => {
+    if (!mockSelectionText) {
+      return null;
+    }
+
+    return {
+      startLineNumber: 1,
+      startColumn: 1,
+      endLineNumber: 1,
+      endColumn: mockSelectionText.length + 1,
+      isEmpty: () => false,
+    };
+  };
 
   return {
     getValue: () => value,
@@ -17,7 +47,6 @@ function createMockEditor(initialValue: string) {
     },
     updateOptions: () => {},
     getModel: () => ({
-      getValueInRange: () => value,
       getFullModelRange: () => ({
         startLineNumber: 1,
         startColumn: 1,
@@ -28,8 +57,9 @@ function createMockEditor(initialValue: string) {
       getLineMaxColumn: () => value.length + 1,
       getPositionAt: () => ({ lineNumber: 1, column: value.length + 1 }),
       getOffsetAt: () => 0,
+      getValueInRange: () => mockSelectionText || value,
     }),
-    getSelection: () => null,
+    getSelection,
     getPosition: () => ({ lineNumber: 1, column: value.length + 1 }),
     setPosition: () => {},
     setSelection: () => {},
@@ -48,7 +78,16 @@ function createMockEditor(initialValue: string) {
     trigger: () => {},
     getDomNode: () => domNode,
     getOption: () => false,
-    executeEdits: () => {},
+    executeEdits: (_source: string, edits: MockEdit[]) => {
+      const nextText = edits[0]?.text;
+      if (nextText === undefined) {
+        return;
+      }
+
+      value = mockSelectionText
+        ? value.replace(mockSelectionText, nextText)
+        : nextText;
+    },
     pushUndoStop: () => {},
     onDidChangeModelContent: (listener: ChangeListener) => {
       changeListeners.add(listener);
@@ -63,8 +102,8 @@ function createMockEditor(initialValue: string) {
 }
 
 export const editor = {
-  create: (_container: HTMLElement, options: { value?: string }) =>
-    createMockEditor(options.value ?? ""),
+  create: (container: HTMLElement, options: { value?: string }) =>
+    createMockEditor(container, options.value ?? ""),
   defineTheme: () => {},
   setTheme: () => {},
   setModelLanguage: () => {},

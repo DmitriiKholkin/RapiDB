@@ -60,30 +60,23 @@ export type SQLiteRuntimeTargetId =
   | "win32-arm64"
   | "linux-x64"
   | "linux-arm64"
-  | "alpine-x64"
-  | "alpine-arm64"
   | "darwin-x64"
   | "darwin-arm64";
 
-let cachedBetterSqlite3: BetterSqlite3Constructor | null = null;
-
-function detectLinuxLibc(): "glibc" | "musl" | "unknown" {
-  if (process.platform !== "linux") {
-    return "unknown";
-  }
-  const report = process.report?.getReport?.() as
-    | { header?: { glibcVersionRuntime?: string } }
-    | undefined;
-  const glibcVersion = report?.header?.glibcVersionRuntime;
-  return typeof glibcVersion === "string" && glibcVersion.length > 0
-    ? "glibc"
-    : "musl";
+export interface SQLiteStagedRuntimeProbe {
+  target: string;
+  packageRoot: string | null;
+  stagedPackagePath: string | null;
+  stagedPackageExists: boolean;
+  stagedBinaryPath: string | null;
+  stagedBinaryExists: boolean;
 }
+
+let cachedBetterSqlite3: BetterSqlite3Constructor | null = null;
 
 export function resolveSQLiteRuntimeTarget(
   platform = process.platform,
   arch = process.arch,
-  linuxLibc = detectLinuxLibc(),
 ): SQLiteRuntimeTargetId | null {
   if (platform === "win32") {
     if (arch === "x64") return "win32-x64";
@@ -97,10 +90,10 @@ export function resolveSQLiteRuntimeTarget(
   }
   if (platform === "linux") {
     if (arch === "x64") {
-      return linuxLibc === "musl" ? "alpine-x64" : "linux-x64";
+      return "linux-x64";
     }
     if (arch === "arm64") {
-      return linuxLibc === "musl" ? "alpine-arm64" : "linux-arm64";
+      return "linux-arm64";
     }
     return null;
   }
@@ -125,24 +118,73 @@ function findPackageRoot(startDir: string): string | null {
   }
 }
 
-function resolveStagedBetterSqlite3PackagePath(baseDir: string): string | null {
+function buildStagedRuntimeProbe(
+  baseDir: string,
+  stagedSubdir: string,
+): SQLiteStagedRuntimeProbe {
   const packageRoot = findPackageRoot(baseDir);
-  if (!packageRoot) {
-    return null;
-  }
   const runtimeTarget = resolveSQLiteRuntimeTarget();
-  if (!runtimeTarget) {
-    return null;
+  if (!packageRoot || !runtimeTarget) {
+    return {
+      target: sqliteRuntimeTarget(),
+      packageRoot,
+      stagedPackagePath: null,
+      stagedPackageExists: false,
+      stagedBinaryPath: null,
+      stagedBinaryExists: false,
+    };
   }
-  const candidate = join(
+
+  const stagedPackagePath = join(
     packageRoot,
     ".rapidb-vscode",
-    "better-sqlite3",
+    stagedSubdir,
     runtimeTarget,
     "node_modules",
     "better-sqlite3",
   );
-  return existsSync(join(candidate, "package.json")) ? candidate : null;
+  const stagedBinaryPath = join(
+    stagedPackagePath,
+    "build",
+    "Release",
+    "better_sqlite3.node",
+  );
+  return {
+    target: runtimeTarget,
+    packageRoot,
+    stagedPackagePath,
+    stagedPackageExists: existsSync(join(stagedPackagePath, "package.json")),
+    stagedBinaryPath,
+    stagedBinaryExists: existsSync(stagedBinaryPath),
+  };
+}
+
+/**
+ * Probes the staged Electron runtime (for desktop VS Code).
+ * Stored under .rapidb-vscode/better-sqlite3/<target>/.
+ */
+export function probeStagedBetterSqlite3Runtime(
+  baseDir: string,
+): SQLiteStagedRuntimeProbe {
+  return buildStagedRuntimeProbe(baseDir, "better-sqlite3");
+}
+
+/**
+ * Probes the staged Node.js runtime (for VS Code Server / remote extension host).
+ * Stored under .rapidb-vscode/better-sqlite3-node/<target>/.
+ */
+export function probeStagedNodeBetterSqlite3Runtime(
+  baseDir: string,
+): SQLiteStagedRuntimeProbe {
+  return buildStagedRuntimeProbe(baseDir, "better-sqlite3-node");
+}
+
+function resolveStagedBetterSqlite3PackagePath(
+  baseDir: string,
+  subdir: "better-sqlite3" | "better-sqlite3-node",
+): string | null {
+  const probe = buildStagedRuntimeProbe(baseDir, subdir);
+  return probe.stagedPackageExists ? probe.stagedPackagePath : null;
 }
 
 export function resolveBetterSqlite3LoadTargets(
@@ -151,7 +193,21 @@ export function resolveBetterSqlite3LoadTargets(
 ): string[] {
   const targets: string[] = [];
   if (preferStagedRuntime) {
-    const stagedPackage = resolveStagedBetterSqlite3PackagePath(baseDir);
+    // Desktop VS Code (Electron): use Electron-compiled staged binary
+    const stagedPackage = resolveStagedBetterSqlite3PackagePath(
+      baseDir,
+      "better-sqlite3",
+    );
+    if (stagedPackage) {
+      targets.push(stagedPackage);
+    }
+  } else {
+    // VS Code Server / remote extension host (plain Node.js):
+    // use the Node.js-compiled staged binary from .rapidb-vscode/better-sqlite3-node/
+    const stagedPackage = resolveStagedBetterSqlite3PackagePath(
+      baseDir,
+      "better-sqlite3-node",
+    );
     if (stagedPackage) {
       targets.push(stagedPackage);
     }
@@ -178,12 +234,56 @@ function withCause(message: string, cause: unknown): Error {
   return wrapped;
 }
 
-function sqliteRuntimeLoadError(error: unknown): Error {
+function stagedProbeDetails(probe: SQLiteStagedRuntimeProbe): string {
+  return [
+    `target=${probe.target}`,
+    `packageRoot=${probe.packageRoot ?? "<not-found>"}`,
+    `stagedPackage=${probe.stagedPackagePath ?? "<unresolved>"}`,
+    `stagedPackageExists=${probe.stagedPackageExists}`,
+    `stagedBinary=${probe.stagedBinaryPath ?? "<unresolved>"}`,
+    `stagedBinaryExists=${probe.stagedBinaryExists}`,
+  ].join("; ");
+}
+
+export function formatSQLiteRuntimeLoadErrorMessage(
+  error: unknown,
+  attemptedTargets: readonly string[],
+  probe: SQLiteStagedRuntimeProbe | null,
+): string {
+  const errorMsg = errorMessage(error);
+
+  // Detect MODULE_VERSION mismatch (common error pattern)
+  const isModuleVersionError =
+    errorMsg.includes("NODE_MODULE_VERSION") ||
+    errorMsg.includes("MODULE_VERSION") ||
+    errorMsg.includes("different Node.js version");
+
+  const versionHint = isModuleVersionError
+    ? " The SQLite binary was compiled for a different Node.js version. " +
+      "Run: npm run native:sqlite:vscode --target <platform> to rebuild, or upgrade your Node.js version. " +
+      "This commonly happens when the extension was built on a system with a different Node.js version than is currently running."
+    : "";
+
   const stagedHint = process.versions.electron
     ? ' Run "npm run native:sqlite:vscode" from the repository root to prepare a VS Code-compatible SQLite binary, or ship the staged .rapidb-vscode runtime in the VSIX for this target.'
     : "";
+  const probeHint = probe ? ` Staged probe: ${stagedProbeDetails(probe)}.` : "";
+  const attemptHint =
+    attemptedTargets.length > 0
+      ? ` Attempted load targets: ${attemptedTargets.join(", ")}.`
+      : "";
+  const runtimeHint = `Node.js ${process.version}, platform: ${process.platform}-${process.arch}`;
+
+  return `[RapiDB] SQLite runtime is unavailable because better-sqlite3 could not be loaded for ${sqliteRuntimeTarget()}.${versionHint}${stagedHint}${attemptHint}${probeHint} Runtime: ${runtimeHint}. Error: ${errorMsg}`.trim();
+}
+
+function sqliteRuntimeLoadError(
+  error: unknown,
+  attemptedTargets: readonly string[],
+  probe: SQLiteStagedRuntimeProbe | null,
+): Error {
   return withCause(
-    `[RapiDB] SQLite runtime is unavailable because better-sqlite3 could not be loaded for ${sqliteRuntimeTarget()}.${stagedHint} ${errorMessage(error)}`.trim(),
+    formatSQLiteRuntimeLoadErrorMessage(error, attemptedTargets, probe),
     error,
   );
 }
@@ -204,8 +304,18 @@ function loadBetterSqlite3(): BetterSqlite3Constructor {
     return cachedBetterSqlite3;
   }
 
+  const preferStagedRuntime = Boolean(process.versions.electron);
+  const attemptedTargets = resolveBetterSqlite3LoadTargets(
+    __dirname,
+    preferStagedRuntime,
+  );
+  // Always probe for richer diagnostics in error messages, regardless of host type.
+  const probe = preferStagedRuntime
+    ? probeStagedBetterSqlite3Runtime(__dirname)
+    : probeStagedNodeBetterSqlite3Runtime(__dirname);
+
   let lastError: unknown = null;
-  for (const target of resolveBetterSqlite3LoadTargets()) {
+  for (const target of attemptedTargets) {
     let loaded: BetterSqlite3Module;
     try {
       loaded = require(target) as BetterSqlite3Module;
@@ -230,6 +340,8 @@ function loadBetterSqlite3(): BetterSqlite3Constructor {
   throw sqliteRuntimeLoadError(
     lastError ??
       new Error("better-sqlite3 did not export a database constructor."),
+    attemptedTargets,
+    probe,
   );
 }
 

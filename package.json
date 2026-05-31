@@ -2,7 +2,7 @@
   "name": "rapidb",
   "displayName": "RapiDB",
   "description": "Free database management tool inside VSCode",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "publisher": "DmitriiKholkin",
   "repository": {
     "type": "git",
@@ -10,7 +10,8 @@
   },
   "icon": "./media/icon-market.png",
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.90.0",
+    "node": ">=20.0.0"
   },
   "categories": [
     "Data Science",
@@ -663,7 +664,8 @@
   "scripts": {
     "postinstall": "node ./scripts/prepare-vscode-sqlite-runtime.mjs --best-effort",
     "package:prepare": "node ./scripts/prepare-vscode-package.mjs",
-    "vscode:prepublish": "node esbuild.config.mjs --production",
+    "native:sqlite:vscode:verify": "node ./scripts/verify-vscode-sqlite-runtime.mjs",
+    "vscode:prepublish": "npm run package:prepare && npm run native:sqlite:vscode:all && npm run native:sqlite:vscode:verify && node esbuild.config.mjs --production",
     "build": "node esbuild.config.mjs",
     "watch": "node esbuild.config.mjs --watch",
     "compile": "npm run build",
@@ -695,7 +697,7 @@
     "db:down": "docker compose -f ./compose.yaml down --remove-orphans",
     "native:sqlite:vscode": "node ./scripts/prepare-vscode-sqlite-runtime.mjs --strict",
     "native:sqlite:vscode:all": "node ./scripts/prepare-vscode-sqlite-runtime.mjs --strict --all-targets",
-    "package": "npm run package:prepare && npm run native:sqlite:vscode:all && vsce package"
+    "package": "vsce package"
   },
   "devDependencies": {
     "@electron/rebuild": "4.0.4",

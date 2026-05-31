@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
 import {
+  formatSQLiteRuntimeLoadErrorMessage,
+  probeStagedBetterSqlite3Runtime,
   resolveBetterSqlite3LoadTargets,
   resolveSQLiteRuntimeTarget,
 } from "../../src/extension/dbDrivers/sqliteRuntime";
@@ -44,6 +46,16 @@ async function readSingleValue(
 ): Promise<unknown> {
   const result = await driver.query(sql);
   return result.rows[0]?.__col_0;
+}
+
+function requireHostRuntimeTarget(): NonNullable<
+  ReturnType<typeof resolveSQLiteRuntimeTarget>
+> {
+  const runtimeTarget = resolveSQLiteRuntimeTarget();
+  if (!runtimeTarget) {
+    throw new Error("The current platform is not a supported SQLite runtime.");
+  }
+  return runtimeTarget;
 }
 
 describe("SQLite better-sqlite3 runtime adapter", () => {
@@ -348,11 +360,12 @@ describe("SQLite better-sqlite3 runtime adapter", () => {
 
   it("prefers the staged VS Code SQLite runtime before the default package", async () => {
     const rootDir = await createProjectTempDir("sqlite-runtime-stage");
+    const runtimeTarget = requireHostRuntimeTarget();
     const stagedPackage = join(
       rootDir,
       ".rapidb-vscode",
       "better-sqlite3",
-      "darwin-arm64",
+      runtimeTarget,
       "node_modules",
       "better-sqlite3",
     );
@@ -379,20 +392,78 @@ describe("SQLite better-sqlite3 runtime adapter", () => {
   it("resolves staged runtime targets across the supported platform matrix", () => {
     expect(resolveSQLiteRuntimeTarget("win32", "x64")).toBe("win32-x64");
     expect(resolveSQLiteRuntimeTarget("win32", "arm64")).toBe("win32-arm64");
-    expect(resolveSQLiteRuntimeTarget("linux", "x64", "glibc")).toBe(
-      "linux-x64",
-    );
-    expect(resolveSQLiteRuntimeTarget("linux", "arm64", "glibc")).toBe(
-      "linux-arm64",
-    );
-    expect(resolveSQLiteRuntimeTarget("linux", "arm", "glibc")).toBeNull();
-    expect(resolveSQLiteRuntimeTarget("linux", "x64", "musl")).toBe(
-      "alpine-x64",
-    );
-    expect(resolveSQLiteRuntimeTarget("linux", "arm64", "musl")).toBe(
-      "alpine-arm64",
-    );
+    expect(resolveSQLiteRuntimeTarget("linux", "x64")).toBe("linux-x64");
+    expect(resolveSQLiteRuntimeTarget("linux", "arm64")).toBe("linux-arm64");
     expect(resolveSQLiteRuntimeTarget("darwin", "x64")).toBe("darwin-x64");
     expect(resolveSQLiteRuntimeTarget("darwin", "arm64")).toBe("darwin-arm64");
+  });
+
+  it("reports staged runtime probe details including native binary presence", async () => {
+    const rootDir = await createProjectTempDir("sqlite-runtime-probe");
+    const runtimeTarget = requireHostRuntimeTarget();
+    const stagedPackage = join(
+      rootDir,
+      ".rapidb-vscode",
+      "better-sqlite3",
+      runtimeTarget,
+      "node_modules",
+      "better-sqlite3",
+    );
+    const stagedBinary = join(
+      stagedPackage,
+      "build",
+      "Release",
+      "better_sqlite3.node",
+    );
+    await mkdir(join(stagedPackage, "build", "Release"), { recursive: true });
+    await writeFile(
+      join(rootDir, "package.json"),
+      JSON.stringify({ name: "sqlite-runtime-probe" }),
+      "utf8",
+    );
+    await writeFile(
+      join(stagedPackage, "package.json"),
+      JSON.stringify({ name: "better-sqlite3" }),
+      "utf8",
+    );
+
+    const probeBeforeBinary = probeStagedBetterSqlite3Runtime(
+      join(rootDir, "dist"),
+    );
+    expect(probeBeforeBinary.stagedPackagePath).toBe(stagedPackage);
+    expect(probeBeforeBinary.stagedPackageExists).toBe(true);
+    expect(probeBeforeBinary.stagedBinaryPath).toBe(stagedBinary);
+    expect(probeBeforeBinary.stagedBinaryExists).toBe(false);
+
+    await writeFile(stagedBinary, "stub", "utf8");
+    const probeAfterBinary = probeStagedBetterSqlite3Runtime(
+      join(rootDir, "dist"),
+    );
+    expect(probeAfterBinary.stagedBinaryExists).toBe(true);
+  });
+
+  it("formats sqlite runtime load failures with attempted targets and staged probe details", () => {
+    const message = formatSQLiteRuntimeLoadErrorMessage(
+      new Error("Cannot find module better-sqlite3"),
+      [
+        "/tmp/.rapidb-vscode/better-sqlite3/linux-x64/node_modules/better-sqlite3",
+        "better-sqlite3",
+      ],
+      {
+        target: "linux-x64",
+        packageRoot: "/tmp/workspace",
+        stagedPackagePath:
+          "/tmp/workspace/.rapidb-vscode/better-sqlite3/linux-x64/node_modules/better-sqlite3",
+        stagedPackageExists: true,
+        stagedBinaryPath:
+          "/tmp/workspace/.rapidb-vscode/better-sqlite3/linux-x64/node_modules/better-sqlite3/build/Release/better_sqlite3.node",
+        stagedBinaryExists: false,
+      },
+    );
+
+    expect(message).toContain("Attempted load targets");
+    expect(message).toContain("Staged probe:");
+    expect(message).toContain("stagedBinaryExists=false");
+    expect(message).toContain("Cannot find module better-sqlite3");
   });
 });

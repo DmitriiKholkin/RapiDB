@@ -18,6 +18,7 @@ logs
 node_modules/**
 !node_modules/oracledb/**
 !.rapidb-vscode/better-sqlite3/**
+!.rapidb-vscode/better-sqlite3-node/**
 node_modules/oracledb/examples/**
 node_modules/oracledb/package/**
 node_modules/oracledb/**/*-buildinfo.txt

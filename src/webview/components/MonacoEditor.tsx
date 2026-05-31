@@ -1,9 +1,11 @@
 import * as monaco from "monaco-editor";
 import React, {
   forwardRef,
+  useCallback,
   useEffect,
   useImperativeHandle,
   useRef,
+  useState,
 } from "react";
 import { format as sqlFormatterFormat } from "sql-formatter";
 import type { QueryEditorSqlDialect } from "../../shared/webviewContracts";
@@ -263,6 +265,13 @@ interface Props {
   ariaLabel?: string;
 }
 
+interface ContextMenuState {
+  x: number;
+  y: number;
+  hasSelection: boolean;
+  readOnly: boolean;
+}
+
 export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
   function MonacoEditor(
     {
@@ -278,6 +287,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
     },
     ref,
   ) {
+    const rootRef = useRef<HTMLDivElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
     const initialValueRef = useRef(initialValue);
@@ -287,6 +297,28 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
     const ariaLabelRef = useRef(ariaLabel);
     const languageRef = useRef(language);
     const suppressChangeEventRef = useRef(false);
+    const getSelectedTextRef = useRef<() => string>(() => "");
+    const copySelectionRef = useRef<() => void>(() => {});
+    const cutSelectionRef = useRef<() => void>(() => {});
+    const pasteClipboardRef = useRef<() => void>(() => {});
+    const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(
+      null,
+    );
+    const [hoveredItem, setHoveredItem] = useState<
+      "copy" | "cut" | "paste" | null
+    >(null);
+    const menuRef = useRef<HTMLDivElement>(null);
+
+    const closeContextMenu = useCallback(() => {
+      setHoveredItem(null);
+      setContextMenu(null);
+    }, []);
+
+    const runContextAction = (action: () => void) => {
+      action();
+      closeContextMenu();
+      editorRef.current?.focus();
+    };
 
     useEffect(() => {
       initialValueRef.current = initialValue;
@@ -599,6 +631,33 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         ]);
         editor.pushUndoStop();
       };
+      const copySelection = () => {
+        const selectedText = getSelectedText();
+        if (!selectedText) {
+          return;
+        }
+        postMessage("writeClipboard", { text: selectedText });
+      };
+      const cutSelection = () => {
+        const selectedText = getSelectedText();
+        if (!selectedText || readOnlyRef.current) {
+          return;
+        }
+        postMessage("writeClipboard", { text: selectedText });
+        deleteSelectedText();
+      };
+      const pasteClipboard = () => {
+        if (readOnlyRef.current) {
+          return;
+        }
+        postMessage("readClipboard");
+      };
+
+      getSelectedTextRef.current = getSelectedText;
+      copySelectionRef.current = copySelection;
+      cutSelectionRef.current = cutSelection;
+      pasteClipboardRef.current = pasteClipboard;
+
       const nativeCopy = (e: ClipboardEvent) => {
         const selectedText = getSelectedText();
         if (!selectedText) {
@@ -620,37 +679,21 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       };
 
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyC, () => {
-        const selectedText = getSelectedText();
-        if (!selectedText) {
-          return;
-        }
-        postMessage("writeClipboard", { text: selectedText });
+        copySelection();
       });
 
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyX, () => {
-        const selectedText = getSelectedText();
-        if (!selectedText) {
-          return;
-        }
-        postMessage("writeClipboard", { text: "" });
-        postMessage("readClipboard");
-        postMessage("writeClipboard", { text: selectedText });
+        cutSelection();
       });
 
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, () => {
-        if (readOnlyRef.current) {
-          return;
-        }
-        postMessage("readClipboard");
+        pasteClipboard();
       });
 
       editor.addCommand(
         monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyV,
         () => {
-          if (readOnlyRef.current) {
-            return;
-          }
-          postMessage("readClipboard");
+          pasteClipboard();
         },
       );
 
@@ -731,15 +774,219 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         domNode?.removeEventListener("copy", nativeCopy, true);
         domNode?.removeEventListener("cut", nativeCut, true);
         domNode?.removeEventListener("paste", nativePaste, true);
+        getSelectedTextRef.current = () => "";
+        copySelectionRef.current = () => {};
+        cutSelectionRef.current = () => {};
+        pasteClipboardRef.current = () => {};
         editor.dispose();
       };
     }, []);
 
+    useEffect(() => {
+      const root = rootRef.current;
+      if (!root) {
+        return;
+      }
+
+      const handleContextMenu = (event: MouseEvent) => {
+        event.preventDefault();
+
+        const bounds = root.getBoundingClientRect();
+        const menuWidth = 100;
+        const menuHeight = 50;
+        const x = Math.min(
+          Math.max(event.clientX - bounds.left, 4),
+          Math.max(bounds.width - menuWidth, 4),
+        );
+        const y = Math.min(
+          Math.max(event.clientY - bounds.top, 4),
+          Math.max(bounds.height - menuHeight, 4),
+        );
+
+        setContextMenu({
+          x,
+          y,
+          hasSelection: getSelectedTextRef.current().length > 0,
+          readOnly: readOnlyRef.current,
+        });
+      };
+
+      root.addEventListener("contextmenu", handleContextMenu);
+
+      return () => {
+        root.removeEventListener("contextmenu", handleContextMenu);
+      };
+    }, []);
+
+    useEffect(() => {
+      if (!contextMenu) {
+        return;
+      }
+
+      const handlePointerDown = (event: PointerEvent) => {
+        const menu = menuRef.current;
+        if (menu?.contains(event.target as Node)) {
+          return;
+        }
+
+        closeContextMenu();
+      };
+
+      const handleEscape = (event: KeyboardEvent) => {
+        if (event.key === "Escape") {
+          closeContextMenu();
+        }
+      };
+
+      window.addEventListener("pointerdown", handlePointerDown);
+      window.addEventListener("keydown", handleEscape);
+      window.addEventListener("blur", closeContextMenu);
+
+      return () => {
+        window.removeEventListener("pointerdown", handlePointerDown);
+        window.removeEventListener("keydown", handleEscape);
+        window.removeEventListener("blur", closeContextMenu);
+      };
+    }, [closeContextMenu, contextMenu]);
+
     return (
       <div
-        ref={containerRef}
-        style={{ width: "100%", height, overflow: "hidden" }}
-      />
+        ref={rootRef}
+        style={{
+          position: "relative",
+          width: "100%",
+          height,
+          overflow: "hidden",
+        }}
+      >
+        <div
+          ref={containerRef}
+          style={{ width: "100%", height: "100%", overflow: "hidden" }}
+        />
+        {contextMenu ? (
+          <div
+            ref={menuRef}
+            role="menu"
+            aria-label="Editor context menu"
+            style={{
+              position: "absolute",
+              top: contextMenu.y,
+              left: contextMenu.x,
+              minWidth: 100,
+              padding: 3,
+              display: "flex",
+              flexDirection: "column",
+              gap: 0,
+              background:
+                cssVar("--vscode-menu-background") ||
+                cssVar("--vscode-editorWidget-background") ||
+                cssVar("--vscode-editor-background") ||
+                "#252526",
+              border: `1px solid ${
+                cssVar("--vscode-menu-border") ||
+                cssVar("--vscode-contrastBorder") ||
+                "rgba(255, 255, 255, 0.12)"
+              }`,
+              borderRadius: 8,
+              boxShadow:
+                "0 10px 30px rgba(0, 0, 0, 0.24), 0 2px 8px rgba(0, 0, 0, 0.18)",
+              zIndex: 20,
+            }}
+          >
+            <button
+              type="button"
+              role="menuitem"
+              disabled={!contextMenu.hasSelection || contextMenu.readOnly}
+              onClick={() => {
+                runContextAction(cutSelectionRef.current);
+              }}
+              onMouseEnter={() => {
+                setHoveredItem("cut");
+              }}
+              onMouseLeave={() => {
+                setHoveredItem(null);
+              }}
+              style={menuButtonStyle(
+                !contextMenu.hasSelection || contextMenu.readOnly,
+                hoveredItem === "cut",
+              )}
+            >
+              Cut
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              disabled={!contextMenu.hasSelection}
+              onClick={() => {
+                runContextAction(copySelectionRef.current);
+              }}
+              onMouseEnter={() => {
+                setHoveredItem("copy");
+              }}
+              onMouseLeave={() => {
+                setHoveredItem(null);
+              }}
+              style={menuButtonStyle(
+                !contextMenu.hasSelection,
+                hoveredItem === "copy",
+              )}
+            >
+              Copy
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              disabled={contextMenu.readOnly}
+              onClick={() => {
+                runContextAction(pasteClipboardRef.current);
+              }}
+              onMouseEnter={() => {
+                setHoveredItem("paste");
+              }}
+              onMouseLeave={() => {
+                setHoveredItem(null);
+              }}
+              style={menuButtonStyle(
+                contextMenu.readOnly,
+                hoveredItem === "paste",
+              )}
+            >
+              Paste
+            </button>
+          </div>
+        ) : null}
+      </div>
     );
   },
 );
+
+function menuButtonStyle(
+  disabled: boolean,
+  hovered = false,
+): React.CSSProperties {
+  const hoverBg =
+    cssVar("--vscode-menu-selectionBackground") || "rgba(255, 255, 255, 0.10)";
+
+  return {
+    appearance: "none",
+    border: "none",
+    background: hovered && !disabled ? hoverBg : "transparent",
+    color: disabled
+      ? cssVar("--vscode-disabledForeground") || "rgba(255, 255, 255, 0.4)"
+      : hovered
+        ? cssVar("--vscode-menu-selectionForeground") ||
+          cssVar("--vscode-menu-foreground") ||
+          cssVar("--vscode-foreground") ||
+          "#ffffff"
+        : cssVar("--vscode-menu-foreground") ||
+          cssVar("--vscode-foreground") ||
+          "#cccccc",
+    borderRadius: 5,
+    padding: "5px 10px",
+    textAlign: "left",
+    font: "inherit",
+    cursor: disabled ? "default" : "pointer",
+    opacity: disabled ? 0.6 : 1,
+    width: "100%",
+  };
+}

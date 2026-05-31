@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { validateBinaryModuleVersion } from "./utils/extractModuleVersion.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const isStrict = process.argv.includes("--strict");
@@ -18,8 +19,6 @@ const SUPPORTED_TARGETS = {
   "win32-arm64": { platform: "win32", arch: "arm64" },
   "linux-x64": { platform: "linux", arch: "x64", libc: "glibc" },
   "linux-arm64": { platform: "linux", arch: "arm64", libc: "glibc" },
-  "alpine-x64": { platform: "linux", arch: "x64", libc: "musl" },
-  "alpine-arm64": { platform: "linux", arch: "arm64", libc: "musl" },
   "darwin-x64": { platform: "darwin", arch: "x64" },
   "darwin-arm64": { platform: "darwin", arch: "arm64" },
 };
@@ -33,28 +32,42 @@ const RUNTIME_KEEP_PACKAGES = new Set([
 const DOCKER_TARGETS = {
   "linux-x64": {
     platform: "linux/amd64",
-    image: "node:22-bookworm",
+    image: "node:20-bookworm",
     installCommand: "apt-get update && apt-get install -y python3 make g++",
   },
   "linux-arm64": {
     platform: "linux/arm64/v8",
-    image: "node:22-bookworm",
+    image: "node:20-bookworm",
     installCommand: "apt-get update && apt-get install -y python3 make g++",
-  },
-  "alpine-x64": {
-    platform: "linux/amd64",
-    image: "node:22-alpine",
-    installCommand: "apk add --no-cache python3 make g++",
-  },
-  "alpine-arm64": {
-    platform: "linux/arm64/v8",
-    image: "node:22-alpine",
-    installCommand: "apk add --no-cache python3 make g++",
   },
 };
 
+const NODE_SERVER_RUNTIME_TARGETS = new Set([
+  "win32-x64",
+  "win32-arm64",
+  "linux-x64",
+  "linux-arm64",
+  "darwin-x64",
+  "darwin-arm64",
+]);
+
+const VSCODE_SERVER_NODE_VERSION =
+  process.env.RAPIDB_VSCODE_SERVER_NODE_VERSION?.trim() || "20.9.0";
+const VSCODE_SERVER_MODULE_VERSION = Number.parseInt(
+  process.env.RAPIDB_VSCODE_SERVER_MODULE_VERSION?.trim() || "115",
+  10,
+);
+
 function stagedRuntimeRootFor(targetId) {
   return join(repoRoot, ".rapidb-vscode", "better-sqlite3", targetId);
+}
+
+/**
+ * Staged Node.js runtime root — used by VS Code Server (plain Node.js, not Electron).
+ * Stored separately from the Electron staged runtime because the ABIs differ.
+ */
+function stagedNodeRuntimeRootFor(targetId) {
+  return join(repoRoot, ".rapidb-vscode", "better-sqlite3-node", targetId);
 }
 
 function log(message) {
@@ -84,31 +97,22 @@ function detectHostRuntimeTarget() {
     return null;
   }
   if (process.platform === "linux") {
-    const report = process.report?.getReport?.();
-    const glibcVersion = report?.header?.glibcVersionRuntime;
-    const libc =
-      typeof glibcVersion === "string" && glibcVersion.length > 0
-        ? "glibc"
-        : "musl";
-    if (process.arch === "x64") {
-      return libc === "musl" ? "alpine-x64" : "linux-x64";
-    }
-    if (process.arch === "arm64") {
-      return libc === "musl" ? "alpine-arm64" : "linux-arm64";
-    }
+    if (process.arch === "x64") return "linux-x64";
+    if (process.arch === "arm64") return "linux-arm64";
   }
   return null;
 }
 
 function pruneUnsupportedStagedRuntimes() {
-  const stagedRoot = join(repoRoot, ".rapidb-vscode", "better-sqlite3");
-  if (!existsSync(stagedRoot)) {
-    return;
-  }
-
-  for (const entryName of readdirSync(stagedRoot)) {
-    if (!(entryName in SUPPORTED_TARGETS)) {
-      rmSync(join(stagedRoot, entryName), { recursive: true, force: true });
+  for (const subdir of ["better-sqlite3", "better-sqlite3-node"]) {
+    const stagedRoot = join(repoRoot, ".rapidb-vscode", subdir);
+    if (!existsSync(stagedRoot)) {
+      continue;
+    }
+    for (const entryName of readdirSync(stagedRoot)) {
+      if (!(entryName in SUPPORTED_TARGETS)) {
+        rmSync(join(stagedRoot, entryName), { recursive: true, force: true });
+      }
     }
   }
 }
@@ -353,6 +357,34 @@ function downloadElectronPrebuild(
   return result.status === 0;
 }
 
+function downloadNodePrebuild(stagedRuntimeRoot, targetId, nodeVersion) {
+  const target = SUPPORTED_TARGETS[targetId];
+  const betterSqlite3Path = join(
+    stagedRuntimeRoot,
+    "node_modules",
+    "better-sqlite3",
+  );
+  const args = [
+    resolvePrebuildInstallCli(stagedRuntimeRoot),
+    "--runtime",
+    "node",
+    "--target",
+    nodeVersion,
+    "--platform",
+    target.platform,
+    "--arch",
+    target.arch,
+  ];
+  if (target.libc) {
+    args.push("--libc", target.libc);
+  }
+  const result = spawnSync(process.execPath, args, {
+    cwd: betterSqlite3Path,
+    stdio: "inherit",
+  });
+  return result.status === 0 && hasNativeBinary(stagedRuntimeRoot);
+}
+
 async function rebuildStagedRuntime(
   stagedRuntimeRoot,
   electronVersion,
@@ -543,6 +575,10 @@ function isHostTarget(targetId) {
   return targetId === detectHostRuntimeTarget();
 }
 
+function shouldPrepareNodeServerRuntimeTarget(targetId) {
+  return NODE_SERVER_RUNTIME_TARGETS.has(targetId);
+}
+
 async function prepareTargetRuntime(
   targetId,
   electronVersion,
@@ -574,6 +610,85 @@ async function prepareTargetRuntime(
   log(`Staged SQLite runtime is ready at ${stagedRuntimeRoot}.`);
 }
 
+/**
+ * Prepares the Node.js staged runtime for VS Code Server.
+ * Stored in .rapidb-vscode/better-sqlite3-node/<targetId>/.
+ *
+ * This step is BEST-EFFORT: a failure here is logged but never propagates to
+ * the caller, so it cannot block `vsce package` or `native:sqlite:vscode:all`.
+ * Desktop VS Code (Electron) is unaffected — it uses the separate Electron staged
+ * runtime. VS Code Server users on a platform without a binary will see a clear
+ * error at runtime rather than a broken build.
+ */
+async function prepareNodeTargetRuntime(targetId, betterSqlite3Version) {
+  if (!shouldPrepareNodeServerRuntimeTarget(targetId)) {
+    log(
+      `Skipping Node.js staged runtime for ${targetId}: only Linux targets are required for VS Code Server packaging.`,
+    );
+    return;
+  }
+
+  const stagedRuntimeRoot = stagedNodeRuntimeRootFor(targetId);
+
+  try {
+    prepareStagingRoot(stagedRuntimeRoot);
+    installStagedRuntime(stagedRuntimeRoot, betterSqlite3Version);
+  } catch (error) {
+    log(
+      `[best-effort] Could not set up staging directory for Node.js runtime on ${targetId}: ${error instanceof Error ? error.message : error}`,
+    );
+    return;
+  }
+
+  if (
+    !downloadNodePrebuild(
+      stagedRuntimeRoot,
+      targetId,
+      VSCODE_SERVER_NODE_VERSION,
+    )
+  ) {
+    fail(
+      `[best-effort] Could not download Node.js prebuild for ${targetId} (Node ${VSCODE_SERVER_NODE_VERSION}).`,
+    );
+    return;
+  }
+
+  if (!hasNativeBinary(stagedRuntimeRoot)) {
+    fail(
+      `[best-effort] Node.js staged runtime for ${targetId} has no native binary after preparation.`,
+    );
+    return;
+  }
+
+  // Validate MODULE_VERSION for VS Code Server Node.js runtime.
+  // This prevents mismatched binaries from shipping in the VSIX.
+  const binaryPath = join(
+    stagedRuntimeRoot,
+    "node_modules",
+    "better-sqlite3",
+    "build",
+    "Release",
+    "better_sqlite3.node",
+  );
+  const versionCheck = validateBinaryModuleVersion(
+    binaryPath,
+    VSCODE_SERVER_MODULE_VERSION,
+    VSCODE_SERVER_NODE_VERSION,
+  );
+  if (!versionCheck.isValid) {
+    fail(`Binary validation failed for ${targetId}: ${versionCheck.reason}.`);
+    return;
+  }
+  log(
+    `✓ Binary MODULE_VERSION validation passed for ${targetId}: ${versionCheck.reason}`,
+  );
+
+  cleanupTargetRuntime(stagedRuntimeRoot);
+  log(
+    `Staged Node.js SQLite runtime (VS Code Server) ready at ${stagedRuntimeRoot}.`,
+  );
+}
+
 async function main() {
   pruneUnsupportedStagedRuntimes();
 
@@ -592,6 +707,14 @@ async function main() {
       `Preparing staged better-sqlite3 ${betterSqlite3Version} for VS Code Electron ${electronVersion} (${targetId}).`,
     );
     await prepareTargetRuntime(targetId, electronVersion, betterSqlite3Version);
+  }
+
+  // Also prepare Node.js binaries required by VS Code Server support.
+  for (const targetId of targetIds) {
+    log(
+      `Preparing staged better-sqlite3 ${betterSqlite3Version} for VS Code Server / Node.js (${targetId}).`,
+    );
+    await prepareNodeTargetRuntime(targetId, betterSqlite3Version);
   }
 }
 
