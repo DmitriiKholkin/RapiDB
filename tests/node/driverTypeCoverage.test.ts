@@ -1034,6 +1034,47 @@ describe("filter SQL compatibility for complex null-only types", () => {
     });
   });
 
+  it("builds PostgreSQL interval eq and neq filters from ISO-like text", () => {
+    const driver = new PostgresDriver({
+      ...baseConfig,
+      type: "pg",
+    } as ConnectionConfig);
+
+    const column = {
+      ...buildFilterColumn("interval", "interval"),
+      filterable: true,
+      filterOperators: [
+        "eq",
+        "neq",
+        "like",
+        "is_null",
+        "is_not_null",
+      ] as ColumnTypeMeta["filterOperators"],
+    };
+
+    const eqResult = driver.buildFilterCondition(
+      column,
+      "eq",
+      "P1Y2M3DT4H5M6S",
+      1,
+    );
+    const neqResult = driver.buildFilterCondition(
+      column,
+      "neq",
+      "P1Y2M3DT4H5M6S",
+      1,
+    );
+
+    expect(eqResult).toEqual({
+      sql: '"probe_col" = $1::interval',
+      params: ["P1Y2M3DT4H5M6S"],
+    });
+    expect(neqResult).toEqual({
+      sql: '"probe_col" <> $1::interval',
+      params: ["P1Y2M3DT4H5M6S"],
+    });
+  });
+
   it("builds MySQL array like filters against JSON text", () => {
     const driver = new MySQLDriver({
       ...baseConfig,
@@ -1309,5 +1350,141 @@ describe("filter SQL compatibility for complex null-only types", () => {
     );
 
     expect(formatted).toBe("<(0,0),5>");
+  });
+});
+
+describe("MySQL query result formatting parity", () => {
+  it("decodes geometry buffers to WKT strings for query results", () => {
+    const driver = new MySQLDriver({
+      ...baseConfig,
+      type: "mysql",
+    } as ConnectionConfig) as unknown as {
+      _parseQueryResult: (
+        rawRows: unknown,
+        fields: unknown[],
+        executionTimeMs: number,
+      ) => {
+        columns: string[];
+        rows: Record<string, unknown>[];
+        rowCount: number;
+        executionTimeMs: number;
+      };
+    };
+
+    const geometry = Buffer.alloc(4 + 1 + 4 + 8 + 8);
+    geometry.writeUInt32LE(4326, 0);
+    geometry.writeUInt8(1, 4);
+    geometry.writeUInt32LE(1, 5);
+    geometry.writeDoubleLE(1.25, 9);
+    geometry.writeDoubleLE(2.5, 17);
+
+    const parsed = driver._parseQueryResult(
+      [[geometry]],
+      [
+        {
+          name: "geom",
+          type: 255,
+          columnType: 255,
+          length: 0,
+          columnLength: 0,
+        },
+      ],
+      3,
+    );
+
+    expect(parsed.columns).toEqual(["geom"]);
+    expect(parsed.rows).toEqual([{ __col_0: "SRID=4326;POINT(1.25 2.5)" }]);
+  });
+
+  it("normalizes GeoJSON LineString and Polygon query values to native WKT", () => {
+    const driver = new MySQLDriver({
+      ...baseConfig,
+      type: "mysql",
+    } as ConnectionConfig) as unknown as {
+      _parseQueryResult: (
+        rawRows: unknown,
+        fields: unknown[],
+        executionTimeMs: number,
+      ) => {
+        columns: string[];
+        rows: Record<string, unknown>[];
+        rowCount: number;
+        executionTimeMs: number;
+      };
+    };
+
+    const parsed = driver._parseQueryResult(
+      [
+        [
+          {
+            type: "LineString",
+            coordinates: [
+              [0, 0],
+              [5, 5],
+            ],
+          },
+          {
+            type: "Polygon",
+            coordinates: [
+              [
+                [0, 0],
+                [0, 1],
+                [1, 1],
+                [0, 0],
+              ],
+            ],
+          },
+        ],
+      ],
+      [
+        {
+          name: "line_geom",
+          type: 255,
+          columnType: 255,
+          length: 0,
+          columnLength: 0,
+        },
+        {
+          name: "polygon_geom",
+          type: 255,
+          columnType: 255,
+          length: 0,
+          columnLength: 0,
+        },
+      ],
+      3,
+    );
+
+    expect(parsed.columns).toEqual(["line_geom", "polygon_geom"]);
+    expect(parsed.rows).toEqual([
+      {
+        __col_0: "LINESTRING(0 0, 5 5)",
+        __col_1: "POLYGON((0 0, 0 1, 1 1, 0 0))",
+      },
+    ]);
+  });
+
+  it("trims trailing zeros from MySQL datetime display output", () => {
+    const driver = new MySQLDriver({
+      ...baseConfig,
+      type: "mysql",
+    } as ConnectionConfig);
+
+    const column = {
+      ...buildFilterColumn("timestamp", "datetime"),
+      valueSemantics: "plain" as const,
+      nullable: true,
+      defaultValue: undefined,
+      isPrimaryKey: false,
+      primaryKeyOrdinal: undefined,
+      isForeignKey: false,
+    };
+
+    expect(driver.formatOutputValue("2026-04-23 12:34:56.120000", column)).toBe(
+      "2026-04-23 12:34:56.12",
+    );
+    expect(driver.formatOutputValue("2026-04-23 12:34:56.000000", column)).toBe(
+      "2026-04-23 12:34:56",
+    );
   });
 });

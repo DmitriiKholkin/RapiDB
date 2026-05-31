@@ -2072,6 +2072,32 @@ describe("TableView", () => {
     expect(getPostedMessages()).toEqual([]);
   });
 
+  it("renders XML in table cells as a single line while keeping modal formatting behavior", async () => {
+    const xmlWithSpacing =
+      '<root>\n  <item id="1">Alice</item>\n  <item id="2">Bob</item>\n</root>';
+    const expectedSingleLine = xmlWithSpacing.replace(/\r?\n/g, " ");
+
+    await initializeCommittedTableData({
+      columnDefs: structuredColumns,
+      primaryKeyColumns: ["id"],
+      dataRows: [
+        {
+          id: 1,
+          payload: '{"name":"Alice","meta":{"active":true}}',
+          tags: '["alpha","beta"]',
+          xml_doc: xmlWithSpacing,
+        },
+      ],
+    });
+
+    const xmlCell = getBodyCell("xml_doc");
+    const valueNode = xmlCell.querySelector("span");
+
+    expect(valueNode).toBeTruthy();
+    expect((valueNode as HTMLSpanElement).style.whiteSpace).toBe("pre");
+    expect(valueNode?.textContent).toBe(expectedSingleLine);
+  });
+
   it("requests delete preview with selected primary keys", async () => {
     const user = userEvent.setup();
 

@@ -351,7 +351,11 @@ function formatMysqlFraction(
   if (fractionDigits === 0) {
     return "";
   }
-  return `.${String(fractionMicros).padStart(6, "0").slice(0, fractionDigits)}`;
+  const fraction = String(fractionMicros)
+    .padStart(6, "0")
+    .slice(0, fractionDigits)
+    .replace(/0+$/, "");
+  return fraction.length > 0 ? `.${fraction}` : "";
 }
 function formatMysqlDatetimeParts(parts: ParsedMysqlDatetimeInput): string {
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -707,6 +711,307 @@ function parseMysqlSpatialSridPrefix(value: string): {
     wkt: sridMatch[2].trim(),
   };
 }
+
+type MysqlGeometryParseResult = {
+  wkt: string;
+  nextOffset: number;
+};
+
+function readMysqlGeometryUInt32(
+  view: DataView,
+  offset: number,
+  littleEndian: boolean,
+): number {
+  if (offset + 4 > view.byteLength) {
+    throw new Error("Invalid WKB: unexpected end of data while reading uint32");
+  }
+  return view.getUint32(offset, littleEndian);
+}
+
+function readMysqlGeometryDouble(
+  view: DataView,
+  offset: number,
+  littleEndian: boolean,
+): number {
+  if (offset + 8 > view.byteLength) {
+    throw new Error(
+      "Invalid WKB: unexpected end of data while reading float64",
+    );
+  }
+  return view.getFloat64(offset, littleEndian);
+}
+
+function mysqlGeometryNumber(value: number): string {
+  if (Number.isInteger(value)) {
+    return String(value);
+  }
+  return value
+    .toString()
+    .replace(/(\.\d*?[1-9])0+$/, "$1")
+    .replace(/\.0+$/, "");
+}
+
+function parseMysqlWkbGeometry(
+  view: DataView,
+  offset: number,
+): MysqlGeometryParseResult {
+  if (offset + 5 > view.byteLength) {
+    throw new Error("Invalid WKB: missing byte order or geometry type");
+  }
+
+  const byteOrder = view.getUint8(offset);
+  const littleEndian = byteOrder === 1;
+  if (!littleEndian && byteOrder !== 0) {
+    throw new Error(`Invalid WKB: unsupported byte order ${byteOrder}`);
+  }
+
+  let cursor = offset + 1;
+  const rawType = readMysqlGeometryUInt32(view, cursor, littleEndian);
+  cursor += 4;
+  const geometryType = rawType % 1000;
+
+  if (geometryType === 1) {
+    const x = readMysqlGeometryDouble(view, cursor, littleEndian);
+    cursor += 8;
+    const y = readMysqlGeometryDouble(view, cursor, littleEndian);
+    cursor += 8;
+    return {
+      wkt: `POINT(${mysqlGeometryNumber(x)} ${mysqlGeometryNumber(y)})`,
+      nextOffset: cursor,
+    };
+  }
+
+  if (geometryType === 2) {
+    const pointCount = readMysqlGeometryUInt32(view, cursor, littleEndian);
+    cursor += 4;
+    const points: string[] = [];
+    for (let index = 0; index < pointCount; index += 1) {
+      const x = readMysqlGeometryDouble(view, cursor, littleEndian);
+      cursor += 8;
+      const y = readMysqlGeometryDouble(view, cursor, littleEndian);
+      cursor += 8;
+      points.push(`${mysqlGeometryNumber(x)} ${mysqlGeometryNumber(y)}`);
+    }
+    return {
+      wkt: `LINESTRING(${points.join(", ")})`,
+      nextOffset: cursor,
+    };
+  }
+
+  if (geometryType === 3) {
+    const ringCount = readMysqlGeometryUInt32(view, cursor, littleEndian);
+    cursor += 4;
+    const rings: string[] = [];
+    for (let ringIndex = 0; ringIndex < ringCount; ringIndex += 1) {
+      const pointCount = readMysqlGeometryUInt32(view, cursor, littleEndian);
+      cursor += 4;
+      const points: string[] = [];
+      for (let pointIndex = 0; pointIndex < pointCount; pointIndex += 1) {
+        const x = readMysqlGeometryDouble(view, cursor, littleEndian);
+        cursor += 8;
+        const y = readMysqlGeometryDouble(view, cursor, littleEndian);
+        cursor += 8;
+        points.push(`${mysqlGeometryNumber(x)} ${mysqlGeometryNumber(y)}`);
+      }
+      rings.push(`(${points.join(", ")})`);
+    }
+    return {
+      wkt: `POLYGON(${rings.join(", ")})`,
+      nextOffset: cursor,
+    };
+  }
+
+  if (geometryType >= 4 && geometryType <= 7) {
+    const geometryCount = readMysqlGeometryUInt32(view, cursor, littleEndian);
+    cursor += 4;
+    const children: string[] = [];
+    for (let index = 0; index < geometryCount; index += 1) {
+      const parsedChild = parseMysqlWkbGeometry(view, cursor);
+      cursor = parsedChild.nextOffset;
+      children.push(parsedChild.wkt);
+    }
+
+    const label =
+      geometryType === 4
+        ? "MULTIPOINT"
+        : geometryType === 5
+          ? "MULTILINESTRING"
+          : geometryType === 6
+            ? "MULTIPOLYGON"
+            : "GEOMETRYCOLLECTION";
+
+    return {
+      wkt: `${label}(${children.join(", ")})`,
+      nextOffset: cursor,
+    };
+  }
+
+  throw new Error(`Unsupported WKB geometry type ${geometryType}`);
+}
+
+function decodeMysqlGeometryBuffer(value: Buffer): string | null {
+  if (value.length < 9) {
+    return null;
+  }
+
+  try {
+    const srid = value.readUInt32LE(0);
+    const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
+    const parsed = parseMysqlWkbGeometry(view, 4);
+    if (parsed.nextOffset > view.byteLength) {
+      return null;
+    }
+    return srid > 0 ? `SRID=${srid};${parsed.wkt}` : parsed.wkt;
+  } catch {
+    return null;
+  }
+}
+
+function mysqlGeoJsonCoordinateText(value: unknown): string | null {
+  if (!Array.isArray(value) || value.length < 2) {
+    return null;
+  }
+  const x = formatMysqlSpatialCoordinate(value[0]);
+  const y = formatMysqlSpatialCoordinate(value[1]);
+  if (x === null || y === null) {
+    return null;
+  }
+  return `${x} ${y}`;
+}
+
+function mysqlGeoJsonLineStringText(value: unknown): string | null {
+  if (!Array.isArray(value) || value.length === 0) {
+    return null;
+  }
+  const points = value.map((entry) => mysqlGeoJsonCoordinateText(entry));
+  if (points.some((entry) => entry === null)) {
+    return null;
+  }
+  return points.join(", ");
+}
+
+function mysqlGeoJsonPolygonText(value: unknown): string | null {
+  if (!Array.isArray(value) || value.length === 0) {
+    return null;
+  }
+  const rings = value.map((ring) => mysqlGeoJsonLineStringText(ring));
+  if (rings.some((entry) => entry === null)) {
+    return null;
+  }
+  return rings.map((ring) => `(${ring})`).join(", ");
+}
+
+function buildMysqlSpatialWktFromGeoJson(value: unknown): string | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  const type = typeof record.type === "string" ? record.type.toLowerCase() : "";
+
+  switch (type) {
+    case "point": {
+      const coords = mysqlGeoJsonCoordinateText(record.coordinates);
+      return coords === null ? null : `POINT(${coords})`;
+    }
+    case "linestring": {
+      const line = mysqlGeoJsonLineStringText(record.coordinates);
+      return line === null ? null : `LINESTRING(${line})`;
+    }
+    case "polygon": {
+      const polygon = mysqlGeoJsonPolygonText(record.coordinates);
+      return polygon === null ? null : `POLYGON(${polygon})`;
+    }
+    case "multipoint": {
+      const points = mysqlGeoJsonLineStringText(record.coordinates);
+      if (points === null) {
+        return null;
+      }
+      return `MULTIPOINT(${points
+        .split(", ")
+        .map((point) => `(${point})`)
+        .join(", ")})`;
+    }
+    case "multilinestring": {
+      if (
+        !Array.isArray(record.coordinates) ||
+        record.coordinates.length === 0
+      ) {
+        return null;
+      }
+      const lines = record.coordinates.map((entry) =>
+        mysqlGeoJsonLineStringText(entry),
+      );
+      if (lines.some((entry) => entry === null)) {
+        return null;
+      }
+      return `MULTILINESTRING(${lines.map((line) => `(${line})`).join(", ")})`;
+    }
+    case "multipolygon": {
+      if (
+        !Array.isArray(record.coordinates) ||
+        record.coordinates.length === 0
+      ) {
+        return null;
+      }
+      const polygons = record.coordinates.map((entry) =>
+        mysqlGeoJsonPolygonText(entry),
+      );
+      if (polygons.some((entry) => entry === null)) {
+        return null;
+      }
+      return `MULTIPOLYGON(${polygons.map((polygon) => `(${polygon})`).join(", ")})`;
+    }
+    case "geometrycollection": {
+      if (!Array.isArray(record.geometries) || record.geometries.length === 0) {
+        return null;
+      }
+      const geometries = record.geometries.map((entry) =>
+        buildMysqlSpatialWktFromGeoJson(entry),
+      );
+      if (geometries.some((entry) => entry === null)) {
+        return null;
+      }
+      return `GEOMETRYCOLLECTION(${geometries.join(", ")})`;
+    }
+    default:
+      return null;
+  }
+}
+
+function normalizeMysqlQuerySpatialValue(value: unknown): string | null {
+  if (Buffer.isBuffer(value)) {
+    return decodeMysqlGeometryBuffer(value);
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+    if (MYSQL_WKT_VALUE_RE.test(trimmed)) {
+      return trimmed;
+    }
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        return (
+          buildMysqlSpatialWktFromGeoJson(parsed) ??
+          inferMysqlSpatialWkt(parsed)
+        );
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+  if (value !== null && typeof value === "object") {
+    return (
+      buildMysqlSpatialWktFromGeoJson(value) ?? inferMysqlSpatialWkt(value)
+    );
+  }
+  return null;
+}
+
 function canonicalizeMysqlBitPersistedEditValue(
   value: unknown,
   nativeType?: string,
@@ -1137,6 +1442,7 @@ export class MySQLDriver extends BaseDBDriver {
       const columns = fields.map((field) => field.name);
       const boolCols = new Set<number>();
       const floatCols = new Set<number>();
+      const geometryCols = new Set<number>();
       const bitIntCols = new Map<number, number>();
       fields.forEach((field, i) => {
         const fieldType = field.type ?? field.columnType;
@@ -1145,6 +1451,8 @@ export class MySQLDriver extends BaseDBDriver {
           boolCols.add(i);
         } else if (fieldType === 16) {
           bitIntCols.set(i, fieldLength);
+        } else if (fieldType === 255) {
+          geometryCols.add(i);
         }
         if (fieldType === 4) {
           floatCols.add(i);
@@ -1164,6 +1472,18 @@ export class MySQLDriver extends BaseDBDriver {
             if (bitIntCols.has(i) && v !== null && v !== undefined) {
               if (Buffer.isBuffer(v)) {
                 v = decodeMysqlBitBuffer(v, bitIntCols.get(i) ?? 0);
+              }
+            }
+            if (geometryCols.has(i) && Buffer.isBuffer(v)) {
+              const decoded = normalizeMysqlQuerySpatialValue(v);
+              if (decoded !== null) {
+                v = decoded;
+              }
+            }
+            if (geometryCols.has(i) && !Buffer.isBuffer(v)) {
+              const decoded = normalizeMysqlQuerySpatialValue(v);
+              if (decoded !== null) {
+                v = decoded;
               }
             }
             if (

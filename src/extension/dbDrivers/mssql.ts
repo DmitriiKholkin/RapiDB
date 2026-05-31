@@ -213,6 +213,288 @@ function readTediousUnsignedBigIntLE(
   return new helpers.Result(value, offset + byteLength);
 }
 
+function formatTwoDigits(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+function formatMssqlYear(value: number): string {
+  const sign = value < 0 ? "-" : "";
+  const absolute = Math.abs(value);
+  return `${sign}${String(absolute).padStart(4, "0")}`;
+}
+
+function normalizeMssqlYearPrefix(value: string): string {
+  const dateOnlyMatch = /^(\d{1,4})-(\d{2})-(\d{2})$/.exec(value);
+  if (dateOnlyMatch) {
+    const [, year, month, day] = dateOnlyMatch;
+    return `${year.padStart(4, "0")}-${month}-${day}`;
+  }
+  const dateTimeMatch =
+    /^(\d{1,4})-(\d{2})-(\d{2})([ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?: ?(?:Z|[+-]\d{2}(?::?\d{2})?))?)$/i.exec(
+      value,
+    );
+  if (dateTimeMatch) {
+    const [, year, month, day, tail] = dateTimeMatch;
+    return `${year.padStart(4, "0")}-${month}-${day}${tail}`;
+  }
+  return value;
+}
+
+function formatMssqlOffsetMinutes(offsetMinutes: number): string {
+  const sign = offsetMinutes < 0 ? "-" : "+";
+  const absolute = Math.abs(offsetMinutes);
+  const hours = Math.floor(absolute / 60);
+  const minutes = absolute % 60;
+  return `${sign}${formatTwoDigits(hours)}:${formatTwoDigits(minutes)}`;
+}
+
+function canonicalizeMssqlTemporalPersistedEditValue(
+  value: unknown,
+  baseType: string,
+): string | null {
+  if (value === NULL_SENTINEL || value === null) {
+    return String(NULL_SENTINEL);
+  }
+  if (typeof value === "string") {
+    if (baseType === "date") {
+      return normalizeDateLiteral(value);
+    }
+    if (baseType === "time") {
+      return value.trim();
+    }
+    if (
+      baseType === "datetime" ||
+      baseType === "datetime2" ||
+      baseType === "smalldatetime" ||
+      baseType === "datetimeoffset"
+    ) {
+      return normalizeDatetimeLiteral(value).replace("T", " ");
+    }
+    return value;
+  }
+  if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
+    return null;
+  }
+  const ms = value.getMilliseconds();
+  const frac =
+    ms > 0 ? `.${String(ms).padStart(3, "0").replace(/0+$/, "")}` : "";
+  if (baseType === "date") {
+    return `${formatMssqlYear(value.getFullYear())}-${formatTwoDigits(value.getMonth() + 1)}-${formatTwoDigits(value.getDate())}`;
+  }
+  if (baseType === "time") {
+    return `${formatTwoDigits(value.getHours())}:${formatTwoDigits(value.getMinutes())}:${formatTwoDigits(value.getSeconds())}${frac}`;
+  }
+  if (baseType === "datetimeoffset") {
+    return `${formatMssqlYear(value.getFullYear())}-${formatTwoDigits(value.getMonth() + 1)}-${formatTwoDigits(value.getDate())} ${formatTwoDigits(value.getHours())}:${formatTwoDigits(value.getMinutes())}:${formatTwoDigits(value.getSeconds())}${frac}${formatMssqlOffsetMinutes(-value.getTimezoneOffset())}`;
+  }
+  if (
+    baseType === "datetime" ||
+    baseType === "datetime2" ||
+    baseType === "smalldatetime"
+  ) {
+    return `${formatMssqlYear(value.getFullYear())}-${formatTwoDigits(value.getMonth() + 1)}-${formatTwoDigits(value.getDate())} ${formatTwoDigits(value.getHours())}:${formatTwoDigits(value.getMinutes())}:${formatTwoDigits(value.getSeconds())}${frac}`;
+  }
+  return null;
+}
+
+function readTediousDateTimeOffsetValue(
+  buf: Buffer,
+  offset: number,
+  metadata: { scale?: number },
+  helpers: TediousHelpersModule,
+): TediousReadValueResult {
+  const dataLengthResult = readTediousUInt8(buf, offset, helpers);
+  const dataLength = dataLengthResult.value as number;
+  offset = dataLengthResult.offset;
+  if (dataLength === 0) {
+    return new helpers.Result(null, offset);
+  }
+
+  const scale = Math.max(0, Math.min(7, metadata.scale ?? 7));
+  const timeByteLength = dataLength - 5;
+  if (timeByteLength < 3 || timeByteLength > 5) {
+    throw new Error(
+      `Unsupported DateTimeOffset dataLength ${String(dataLength)} for scale ${String(scale)}`,
+    );
+  }
+
+  const timeUnitsResult = readTediousUnsignedBigIntLE(
+    buf,
+    offset,
+    timeByteLength,
+    helpers,
+  );
+  offset = timeUnitsResult.offset;
+  let ticks = timeUnitsResult.value as bigint;
+  for (let digit = scale; digit < 7; digit += 1) {
+    ticks *= 10n;
+  }
+
+  ensureTediousBufferLength(buf, offset, 5, helpers);
+  const days =
+    buf.readUInt8(offset) |
+    (buf.readUInt8(offset + 1) << 8) |
+    (buf.readUInt8(offset + 2) << 16);
+  offset += 3;
+  const timezoneOffsetMinutes = buf.readInt16LE(offset);
+  offset += 2;
+
+  const ticksPerSecond = 10_000_000n;
+  const ticksPerMinute = ticksPerSecond * 60n;
+  const ticksPerDay = ticksPerSecond * 86_400n;
+  let localTicksOfDay = ticks + BigInt(timezoneOffsetMinutes) * ticksPerMinute;
+  let localDays = BigInt(days);
+  if (localTicksOfDay < 0n) {
+    const dayBorrow = (-localTicksOfDay - 1n) / ticksPerDay + 1n;
+    localDays -= dayBorrow;
+    localTicksOfDay += dayBorrow * ticksPerDay;
+  } else if (localTicksOfDay >= ticksPerDay) {
+    const dayCarry = localTicksOfDay / ticksPerDay;
+    localDays += dayCarry;
+    localTicksOfDay -= dayCarry * ticksPerDay;
+  }
+
+  const secondsOfDay = localTicksOfDay / ticksPerSecond;
+  const fractionTicks = localTicksOfDay % ticksPerSecond;
+  const hours = Number(secondsOfDay / 3600n);
+  const minutes = Number((secondsOfDay % 3600n) / 60n);
+  const seconds = Number(secondsOfDay % 60n);
+
+  const date = new Date(Date.UTC(2000, 0, Number(localDays) - 730118));
+  const fractionDigits = fractionTicks.toString().padStart(7, "0");
+  const fraction = scale > 0 ? `.${fractionDigits.slice(0, scale)}` : "";
+  const formatted =
+    `${formatMssqlYear(date.getUTCFullYear())}-${formatTwoDigits(date.getUTCMonth() + 1)}-${formatTwoDigits(date.getUTCDate())} ` +
+    `${formatTwoDigits(hours)}:${formatTwoDigits(minutes)}:${formatTwoDigits(seconds)}${fraction}` +
+    formatMssqlOffsetMinutes(timezoneOffsetMinutes);
+  return new helpers.Result(formatted, offset);
+}
+
+function readTediousDateValue(
+  buf: Buffer,
+  offset: number,
+  helpers: TediousHelpersModule,
+): TediousReadValueResult {
+  const dataLengthResult = readTediousUInt8(buf, offset, helpers);
+  const dataLength = dataLengthResult.value as number;
+  offset = dataLengthResult.offset;
+  if (dataLength === 0) {
+    return new helpers.Result(null, offset);
+  }
+  if (dataLength !== 3) {
+    throw new Error(`Unsupported Date dataLength ${String(dataLength)}`);
+  }
+
+  ensureTediousBufferLength(buf, offset, 3, helpers);
+  const days =
+    buf.readUInt8(offset) |
+    (buf.readUInt8(offset + 1) << 8) |
+    (buf.readUInt8(offset + 2) << 16);
+  offset += 3;
+  const date = new Date(Date.UTC(2000, 0, days - 730118));
+  return new helpers.Result(
+    `${formatMssqlYear(date.getUTCFullYear())}-${formatTwoDigits(date.getUTCMonth() + 1)}-${formatTwoDigits(date.getUTCDate())}`,
+    offset,
+  );
+}
+
+function readTediousTimeCore(
+  buf: Buffer,
+  offset: number,
+  dataLength: number,
+  scale: number,
+  helpers: TediousHelpersModule,
+): { ticks: bigint; offset: number } {
+  const unitsResult = readTediousUnsignedBigIntLE(
+    buf,
+    offset,
+    dataLength,
+    helpers,
+  );
+  offset = unitsResult.offset;
+  let ticks = unitsResult.value as bigint;
+  for (let digit = scale; digit < 7; digit += 1) {
+    ticks *= 10n;
+  }
+  return { ticks, offset };
+}
+
+function formatTicksAsTimeString(ticks: bigint, scale: number): string {
+  const ticksPerSecond = 10_000_000n;
+  const secondsOfDay = ticks / ticksPerSecond;
+  const fractionTicks = ticks % ticksPerSecond;
+  const hours = Number(secondsOfDay / 3600n);
+  const minutes = Number((secondsOfDay % 3600n) / 60n);
+  const seconds = Number(secondsOfDay % 60n);
+  const fractionDigits = fractionTicks.toString().padStart(7, "0");
+  const fraction = scale > 0 ? `.${fractionDigits.slice(0, scale)}` : "";
+  return `${formatTwoDigits(hours)}:${formatTwoDigits(minutes)}:${formatTwoDigits(seconds)}${fraction}`;
+}
+
+function readTediousTimeValue(
+  buf: Buffer,
+  offset: number,
+  metadata: { scale?: number },
+  helpers: TediousHelpersModule,
+): TediousReadValueResult {
+  const dataLengthResult = readTediousUInt8(buf, offset, helpers);
+  const dataLength = dataLengthResult.value as number;
+  offset = dataLengthResult.offset;
+  if (dataLength === 0) {
+    return new helpers.Result(null, offset);
+  }
+  if (dataLength < 3 || dataLength > 5) {
+    throw new Error(`Unsupported Time dataLength ${String(dataLength)}`);
+  }
+  const scale = Math.max(0, Math.min(7, metadata.scale ?? 7));
+  const parsed = readTediousTimeCore(buf, offset, dataLength, scale, helpers);
+  return new helpers.Result(
+    formatTicksAsTimeString(parsed.ticks, scale),
+    parsed.offset,
+  );
+}
+
+function readTediousDateTime2Value(
+  buf: Buffer,
+  offset: number,
+  metadata: { scale?: number },
+  helpers: TediousHelpersModule,
+): TediousReadValueResult {
+  const dataLengthResult = readTediousUInt8(buf, offset, helpers);
+  const dataLength = dataLengthResult.value as number;
+  offset = dataLengthResult.offset;
+  if (dataLength === 0) {
+    return new helpers.Result(null, offset);
+  }
+  const scale = Math.max(0, Math.min(7, metadata.scale ?? 7));
+  const timeByteLength = dataLength - 3;
+  if (timeByteLength < 3 || timeByteLength > 5) {
+    throw new Error(
+      `Unsupported DateTime2 dataLength ${String(dataLength)} for scale ${String(scale)}`,
+    );
+  }
+
+  const timeParsed = readTediousTimeCore(
+    buf,
+    offset,
+    timeByteLength,
+    scale,
+    helpers,
+  );
+  offset = timeParsed.offset;
+  ensureTediousBufferLength(buf, offset, 3, helpers);
+  const days =
+    buf.readUInt8(offset) |
+    (buf.readUInt8(offset + 1) << 8) |
+    (buf.readUInt8(offset + 2) << 16);
+  offset += 3;
+
+  const date = new Date(Date.UTC(2000, 0, days - 730118));
+  const formattedDate = `${formatMssqlYear(date.getUTCFullYear())}-${formatTwoDigits(date.getUTCMonth() + 1)}-${formatTwoDigits(date.getUTCDate())}`;
+  const formattedTime = formatTicksAsTimeString(timeParsed.ticks, scale);
+  return new helpers.Result(`${formattedDate} ${formattedTime}`, offset);
+}
+
 function formatScaledBigInt(value: bigint, scale: number): string {
   const negative = value < 0n;
   const absoluteValue = negative ? -value : value;
@@ -326,6 +608,19 @@ function patchMssqlTediousExactNumericParsing(): void {
         return readTediousMoneyValue(buf, offset, tediousHelpers);
       case "MoneyN":
         return readTediousMoneyNValue(buf, offset, tediousHelpers);
+      case "Date":
+        return readTediousDateValue(buf, offset, tediousHelpers);
+      case "Time":
+        return readTediousTimeValue(buf, offset, metadata, tediousHelpers);
+      case "DateTime2":
+        return readTediousDateTime2Value(buf, offset, metadata, tediousHelpers);
+      case "DateTimeOffset":
+        return readTediousDateTimeOffsetValue(
+          buf,
+          offset,
+          metadata,
+          tediousHelpers,
+        );
       default:
         return originalReadValue(buf, offset, metadata, options);
     }
@@ -405,10 +700,10 @@ function mssqlFullType(
 ): string {
   const t = typeName.toLowerCase();
   if (["varchar", "char", "varbinary", "binary"].includes(t)) {
-    return maxLength === -1 ? `${t}(MAX)` : `${t}(${maxLength})`;
+    return maxLength === -1 ? `${t}(max)` : `${t}(${maxLength})`;
   }
   if (["nvarchar", "nchar"].includes(t)) {
-    return maxLength === -1 ? `${t}(MAX)` : `${t}(${maxLength / 2})`;
+    return maxLength === -1 ? `${t}(max)` : `${t}(${maxLength / 2})`;
   }
   if (["decimal", "numeric"].includes(t)) {
     return `${t}(${precision},${scale})`;
@@ -452,10 +747,12 @@ function formatMssqlStringPreviewLiteral(
   );
 }
 function normalizeDatetimeLiteral(value: string): string {
-  return normalizeSqlDatetimeOffsetSpacing(value.trim());
+  return normalizeSqlDatetimeOffsetSpacing(
+    normalizeMssqlYearPrefix(value.trim()),
+  );
 }
 function normalizeDateLiteral(value: string): string {
-  const trimmed = value.trim();
+  const trimmed = normalizeMssqlYearPrefix(value.trim());
   if (DATE_ONLY_RE.test(trimmed)) {
     return trimmed;
   }
@@ -498,9 +795,9 @@ function parseMssqlTimeLiteral(value: string): MssqlTemporalDate {
     throw new TypeError("Invalid time.");
   }
   const milliseconds = Number((fraction.slice(0, 3) || "0").padEnd(3, "0"));
-  const result = new Date(
-    Date.UTC(1970, 0, 1, hours, minutes, seconds, milliseconds),
-  ) as MssqlTemporalDate;
+  const result = new Date(0) as MssqlTemporalDate;
+  result.setFullYear(1970, 0, 1);
+  result.setHours(hours, minutes, seconds, milliseconds);
   const subMillisecond = fraction.slice(3);
   if (subMillisecond.length > 0) {
     result.nanosecondDelta = Number(subMillisecond) / 10 ** fraction.length;
@@ -534,17 +831,16 @@ function parseMssqlNaiveDatetimeLiteral(value: string): MssqlTemporalDate {
     throw new TypeError("Invalid datetime.");
   }
   const milliseconds = Number((fraction.slice(0, 3) || "0").padEnd(3, "0"));
-  const result = new Date(
-    Date.UTC(0, month - 1, day, hours, minutes, seconds, milliseconds),
-  ) as MssqlTemporalDate;
-  result.setUTCFullYear(year, month - 1, day);
+  const result = new Date(0) as MssqlTemporalDate;
+  result.setFullYear(year, month - 1, day);
+  result.setHours(hours, minutes, seconds, milliseconds);
   if (
-    result.getUTCFullYear() !== year ||
-    result.getUTCMonth() !== month - 1 ||
-    result.getUTCDate() !== day ||
-    result.getUTCHours() !== hours ||
-    result.getUTCMinutes() !== minutes ||
-    result.getUTCSeconds() !== seconds
+    result.getFullYear() !== year ||
+    result.getMonth() !== month - 1 ||
+    result.getDate() !== day ||
+    result.getHours() !== hours ||
+    result.getMinutes() !== minutes ||
+    result.getSeconds() !== seconds
   ) {
     throw new TypeError("Invalid datetime.");
   }
@@ -655,7 +951,7 @@ export class MSSQLDriver extends BaseDBDriver {
         serverName:
           runtimeServerName ??
           (sslEnabled && !trustCert ? this.config.host : undefined),
-        useUTC: true,
+        useUTC: false,
       },
     };
   }
@@ -735,6 +1031,9 @@ export class MSSQLDriver extends BaseDBDriver {
       if (!Number.isFinite(value) || !Number.isInteger(value)) {
         return mssql.Float;
       }
+      if (!Number.isSafeInteger(value)) {
+        return mssql.Float;
+      }
       if (value >= 0 && value <= 255) return mssql.TinyInt;
       if (value >= -32768 && value <= 32767) return mssql.SmallInt;
       if (value >= -2147483648 && value <= 2147483647) return mssql.Int;
@@ -774,6 +1073,25 @@ export class MSSQLDriver extends BaseDBDriver {
     const typeName = mssqlSqlTypeName(type);
     let value = baseValue;
     if (typeof baseValue === "string") {
+      if (
+        typeName === "Date" ||
+        typeName === "Time" ||
+        typeName === "DateTime2" ||
+        typeName === "DateTimeOffset"
+      ) {
+        const normalizedTemporalValue =
+          typeName === "Date"
+            ? normalizeDateLiteral(baseValue)
+            : typeName === "Time"
+              ? baseValue.trim()
+              : normalizeDatetimeLiteral(baseValue);
+        request.input(
+          name,
+          this.createNVarCharType(normalizedTemporalValue),
+          normalizedTemporalValue,
+        );
+        return;
+      }
       if (typeName === "Time") {
         value = parseMssqlTimeLiteral(baseValue);
       } else if (typeName === "DateTime2" && !hasExplicitTimezone(baseValue)) {
@@ -828,21 +1146,22 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     if (value instanceof Date && !Number.isNaN(value.getTime())) {
       if (typeName === "Date") {
-        return `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())}`;
+        return `${formatMssqlYear(value.getFullYear())}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`;
       }
       if (typeName === "Time") {
-        const ms = value.getUTCMilliseconds();
+        const ms = value.getMilliseconds();
         const frac =
           ms > 0 ? `.${String(ms).padStart(3, "0").replace(/0+$/, "")}` : "";
-        return `${pad(value.getUTCHours())}:${pad(value.getUTCMinutes())}:${pad(value.getUTCSeconds())}${frac}`;
+        return `${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}${frac}`;
       }
       if (typeName === "DateTimeOffset") {
-        const ms = value.getUTCMilliseconds();
+        const ms = value.getMilliseconds();
         const frac =
           ms > 0 ? `.${String(ms).padStart(3, "0").replace(/0+$/, "")}` : "";
+        const offsetMinutes = -value.getTimezoneOffset();
         return (
-          `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())} ` +
-          `${pad(value.getUTCHours())}:${pad(value.getUTCMinutes())}:${pad(value.getUTCSeconds())}${frac} +00:00`
+          `${formatMssqlYear(value.getFullYear())}-${pad(value.getMonth() + 1)}-${pad(value.getDate())} ` +
+          `${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}${frac}${formatMssqlOffsetMinutes(offsetMinutes)}`
         );
       }
     }
@@ -922,7 +1241,11 @@ export class MSSQLDriver extends BaseDBDriver {
     const res = await this.requirePool()
       .request()
       .query<NamedRow>(
-        `SELECT name FROM sys.databases WHERE state_desc = 'ONLINE' ORDER BY name`,
+        `SELECT name
+         FROM sys.databases 
+         WHERE database_id > 4 AND
+          HAS_DBACCESS(name) = 1 AND
+          state_desc = 'ONLINE' ORDER BY name`,
       );
     return res.recordset.map((row) => ({
       name: row.name,
@@ -932,11 +1255,11 @@ export class MSSQLDriver extends BaseDBDriver {
   async listSchemas(database: string): Promise<SchemaInfo[]> {
     const res = await this.requirePool()
       .request()
-      .query<NamedRow>(`SELECT SCHEMA_NAME AS name FROM [${escapeMssqlId(database)}].INFORMATION_SCHEMA.SCHEMATA
-         WHERE SCHEMA_NAME NOT IN ('sys','INFORMATION_SCHEMA','db_accessadmin','db_backupoperator',
-           'db_datareader','db_datawriter','db_ddladmin','db_denydatareader','db_denydatawriter',
-           'db_owner','db_securityadmin','guest')
-         ORDER BY SCHEMA_NAME`);
+      .query<NamedRow>(`SELECT name
+        FROM [${escapeMssqlId(database)}].sys.schemas
+        WHERE principal_id < 16384
+          AND name NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest')
+        ORDER BY name`);
     return res.recordset.map((row) => ({ name: row.name }));
   }
   async listObjects(database: string, schema: string): Promise<TableInfo[]> {
@@ -1664,6 +1987,13 @@ export class MSSQLDriver extends BaseDBDriver {
     params: readonly unknown[] | undefined,
     columns: readonly ColumnTypeMeta[],
   ): string {
+    return this.materializePreviewColumnSql(sql, params, columns);
+  }
+  materializePreviewColumnSql(
+    sql: string,
+    params: readonly unknown[] | undefined,
+    columns: readonly (ColumnTypeMeta | undefined)[],
+  ): string {
     if (!params || params.length === 0) {
       return sql;
     }
@@ -1738,19 +2068,26 @@ export class MSSQLDriver extends BaseDBDriver {
       const ct = baseTypeName(column.nativeType);
       const pad = (n: number) => String(n).padStart(2, "0");
       if (ct === "date") {
-        return `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())}`;
+        return `${formatMssqlYear(value.getFullYear())}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`;
       }
       if (ct === "time") {
-        const ms = value.getUTCMilliseconds();
+        const ms = value.getMilliseconds();
         const frac =
           ms > 0 ? `.${String(ms).padStart(3, "0").replace(/0+$/, "")}` : "";
-        return `${pad(value.getUTCHours())}:${pad(value.getUTCMinutes())}:${pad(value.getUTCSeconds())}${frac}`;
+        return `${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}${frac}`;
       }
       if (ct === "datetimeoffset") {
-        const ms = value.getUTCMilliseconds();
+        const ms = value.getMilliseconds();
         const frac =
           ms > 0 ? `.${String(ms).padStart(3, "0").replace(/0+$/, "")}` : "";
-        return `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())} ${pad(value.getUTCHours())}:${pad(value.getUTCMinutes())}:${pad(value.getUTCSeconds())}${frac} +00:00`;
+        const offsetMinutes = -value.getTimezoneOffset();
+        return `${formatMssqlYear(value.getFullYear())}-${pad(value.getMonth() + 1)}-${pad(value.getDate())} ${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}${frac}${formatMssqlOffsetMinutes(offsetMinutes)}`;
+      }
+      if (ct === "datetime" || ct === "datetime2" || ct === "smalldatetime") {
+        const ms = value.getMilliseconds();
+        const frac =
+          ms > 0 ? `.${String(ms).padStart(3, "0").replace(/0+$/, "")}` : "";
+        return `${formatMssqlYear(value.getFullYear())}-${pad(value.getMonth() + 1)}-${pad(value.getDate())} ${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}${frac}`;
       }
       const formatted = formatDatetimeForDisplay(value);
       if (formatted !== null) return formatted;
@@ -1758,9 +2095,7 @@ export class MSSQLDriver extends BaseDBDriver {
     if (typeof value === "string") {
       const ct = baseTypeName(column.nativeType);
       if (ct === "datetimeoffset") {
-        return normalizeDatetimeLiteral(value)
-          .replace("T", " ")
-          .replace(/([0-9])([+-]\d{2}:\d{2})$/, "$1 $2");
+        return normalizeDatetimeLiteral(value).replace("T", " ");
       }
     }
     return value;
@@ -1838,6 +2173,33 @@ export class MSSQLDriver extends BaseDBDriver {
       column.category === "time" ||
       column.category === "datetime"
     ) {
+      if (
+        [
+          "date",
+          "time",
+          "datetime",
+          "datetime2",
+          "datetimeoffset",
+          "smalldatetime",
+        ].includes(baseType)
+      ) {
+        return this.checkNormalizedPersistedEdit(
+          column,
+          expectedValue,
+          options,
+          (value) => {
+            if (value === NULL_SENTINEL || value === null) {
+              return { canonical: String(NULL_SENTINEL) };
+            }
+            const canonical = canonicalizeMssqlTemporalPersistedEditValue(
+              value,
+              baseType,
+            );
+            return canonical === null ? null : { canonical };
+          },
+          `Column "${column.name}" expects a temporal value.`,
+        );
+      }
       if (["char", "nchar"].includes(baseType)) {
         return this.checkFixedWidthCharPersistedEdit(
           column,
@@ -1985,20 +2347,20 @@ export class MSSQLDriver extends BaseDBDriver {
       const v = typeof val === "string" ? val : val[0];
       if (Array.isArray(val)) {
         return {
-          sql: `CONVERT(date, ${col}) BETWEEN ? AND ?`,
+          sql: `CONVERT(CHAR(10), ${col}, 23) BETWEEN ? AND ?`,
           params: [val[0], val[1]],
         };
       }
       if (operator === "in") {
         const parts = v.split(",").map((part) => part.trim());
         return {
-          sql: `CONVERT(date, ${col}) IN (${parts.map(() => "?").join(", ")})`,
+          sql: `CONVERT(CHAR(10), ${col}, 23) IN (${parts.map(() => "?").join(", ")})`,
           params: parts,
         };
       }
       if (["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)) {
         const sqlOp = operator === "neq" ? "<>" : this.sqlOperator(operator);
-        return { sql: `CONVERT(date, ${col}) ${sqlOp} ?`, params: [v] };
+        return { sql: `CONVERT(CHAR(10), ${col}, 23) ${sqlOp} ?`, params: [v] };
       }
       return {
         sql: `CONVERT(CHAR(10), ${col}, 23) LIKE ?`,
@@ -2045,6 +2407,8 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     if (this.isDatetimeWithTime(column.nativeType)) {
       const v = typeof val === "string" ? val : val[0];
+      const isDateTimeOffset =
+        baseTypeName(column.nativeType) === "datetimeoffset";
       if (Array.isArray(val)) {
         return {
           sql: `${col} BETWEEN ? AND ?`,
@@ -2067,6 +2431,16 @@ export class MSSQLDriver extends BaseDBDriver {
         if (operator === "eq" || operator === "neq") {
           const normalizedValue = normalizeDatetimeLiteral(v);
           const diffUpperBound = mssqlDisplayedTemporalDiffUpperBound(v);
+          if (isDateTimeOffset && diffUpperBound === null) {
+            const normalizedExpr = `REPLACE(REPLACE(REPLACE(CONVERT(VARCHAR(40), ${col}, 127), 'Z', '+00:00'), ' +', '+'), ' -', '-')`;
+            return {
+              sql:
+                operator === "neq"
+                  ? `NOT (${normalizedExpr} LIKE ?)`
+                  : `${normalizedExpr} LIKE ?`,
+              params: [`%${datetimeOffsetSearchLiteral(v)}%`],
+            };
+          }
           if (diffUpperBound !== null) {
             const castType =
               baseTypeName(column.nativeType) === "datetimeoffset"
@@ -2086,7 +2460,7 @@ export class MSSQLDriver extends BaseDBDriver {
           params: [normalizeDatetimeLiteral(v)],
         };
       }
-      if (baseTypeName(column.nativeType) === "datetimeoffset") {
+      if (isDateTimeOffset) {
         const normalizedExpr = `REPLACE(REPLACE(REPLACE(CONVERT(VARCHAR(40), ${col}, 127), 'Z', '+00:00'), ' +', '+'), ' -', '-')`;
         return {
           sql: `${normalizedExpr} LIKE ?`,

@@ -104,6 +104,61 @@ function stripLeadingSqlComments(queryText: string): string {
   return "";
 }
 
+function findFirstSqlTokenIndex(queryText: string): number {
+  let index = 0;
+  while (index < queryText.length) {
+    const rest = queryText.slice(index);
+    const whitespace = /^\s+/.exec(rest);
+    if (whitespace) {
+      index += whitespace[0].length;
+      continue;
+    }
+
+    if (rest.startsWith("--")) {
+      const nextLineBreak = rest.indexOf("\n");
+      index = nextLineBreak >= 0 ? index + nextLineBreak + 1 : queryText.length;
+      continue;
+    }
+
+    if (rest.startsWith("/*")) {
+      const blockEnd = rest.indexOf("*/", 2);
+      if (blockEnd < 0) {
+        return -1;
+      }
+      index += blockEnd + 2;
+      continue;
+    }
+
+    return index;
+  }
+
+  return -1;
+}
+
+function applyMssqlTopHardCap(
+  queryText: string,
+  hardCap: number,
+): string | null {
+  const tokenIndex = findFirstSqlTokenIndex(queryText);
+  if (tokenIndex < 0) {
+    return null;
+  }
+
+  const head = queryText.slice(0, tokenIndex);
+  const tail = queryText.slice(tokenIndex);
+  const selectPrefix = /^select\s+(distinct\s+|all\s+)?/i.exec(tail);
+  if (!selectPrefix) {
+    return null;
+  }
+  if (/^select\s+(?:distinct\s+|all\s+)?top\b/i.test(tail)) {
+    return null;
+  }
+
+  const matched = selectPrefix[0];
+  const topSelect = `${matched}TOP (${hardCap}) `;
+  return `${head}${topSelect}${tail.slice(matched.length)}`;
+}
+
 function applyHardCapToSqlQuery(
   queryText: string,
   connectionType: ConnectionType | undefined,
@@ -148,6 +203,18 @@ function applyHardCapToSqlQuery(
 
   switch (connectionType) {
     case "mssql":
+      if (
+        LIMITABLE_QUERY_PREFIX.test(classificationQuery) &&
+        !WITH_QUERY_PREFIX.test(classificationQuery)
+      ) {
+        const topRewritten = applyMssqlTopHardCap(normalizedQuery, hardCap);
+        if (topRewritten) {
+          return {
+            queryText: topRewritten,
+            decision: { applied: true },
+          };
+        }
+      }
       return {
         queryText: `SELECT TOP (${hardCap}) * FROM (${normalizedQuery}) AS [rapidb_query_cap]`,
         decision: { applied: true },

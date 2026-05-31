@@ -99,6 +99,59 @@ describe("TableGrid query mode", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
+  it("renders JSON query result cells as a single line", () => {
+    const rawJson = '{\n  "name": "Alice",\n  "meta": { "active":  true }\n}';
+    const expectedSingleLine = rawJson.replace(/\r?\n/g, " ");
+
+    render(
+      <TableGrid
+        mode="query"
+        status="success"
+        result={{
+          columns: ["payload"],
+          columnMeta: [{ category: "json" }],
+          rows: [{ __col_0: rawJson }],
+          rowCount: 1,
+          executionTimeMs: 5,
+        }}
+      />,
+    );
+
+    const cell = screen.getByRole("cell");
+    const valueNode = cell.querySelector("span");
+
+    expect(valueNode).toBeTruthy();
+    expect((valueNode as HTMLSpanElement).style.whiteSpace).toBe("pre");
+    expect(valueNode?.textContent).toBe(expectedSingleLine);
+  });
+
+  it("renders XML-like query result cells as a single line without native type metadata", () => {
+    const rawXml =
+      '<root>\n  <item id="1">Alice</item>\n  <item id="2">Bob</item>\n</root>';
+    const expectedSingleLine = rawXml.replace(/\r?\n/g, " ");
+
+    render(
+      <TableGrid
+        mode="query"
+        status="success"
+        result={{
+          columns: ["payload"],
+          columnMeta: [{ category: "text" }],
+          rows: [{ __col_0: rawXml }],
+          rowCount: 1,
+          executionTimeMs: 5,
+        }}
+      />,
+    );
+
+    const cell = screen.getByRole("cell");
+    const valueNode = cell.querySelector("span");
+
+    expect(valueNode).toBeTruthy();
+    expect((valueNode as HTMLSpanElement).style.whiteSpace).toBe("pre");
+    expect(valueNode?.textContent).toBe(expectedSingleLine);
+  });
+
   it("collapses and reopens a result column from the resize divider", async () => {
     render(
       <TableGrid

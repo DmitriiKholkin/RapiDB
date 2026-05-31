@@ -751,6 +751,7 @@ function TableDataGrid({
                 value={displayValue}
                 isPending={hasPending}
                 category={column.category}
+                nativeType={column.nativeType}
               />
             );
           },
@@ -1534,6 +1535,7 @@ function DraftTableRow({
                     value={displayValue}
                     isPending
                     category={columnDef.category}
+                    nativeType={columnDef.nativeType}
                   />
                 ) : null}
               </div>

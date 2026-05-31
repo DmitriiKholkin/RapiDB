@@ -91,6 +91,32 @@ describe("MSSQL preview SQL literals", () => {
     expect(preview).not.toContain("X'");
   });
 
+  it("materializes UPDATE preview SQL with Unicode prefixes for column-aware placeholders", () => {
+    const driver = new MSSQLDriver(
+      baseConfig as ConnectionConfig,
+    ) as unknown as {
+      materializePreviewColumnSql: (
+        sql: string,
+        params: readonly unknown[] | undefined,
+        columns: readonly (ColumnTypeMeta | undefined)[],
+      ) => string;
+    };
+
+    const preview = driver.materializePreviewColumnSql(
+      "UPDATE [db].[dbo].[t] SET [col_nvarchar] = ? WHERE [id] = ?",
+      ["NVarChar: Привет мир! 你好世界 😀", "3"],
+      [
+        column("col_nvarchar", "nvarchar(max)", "text"),
+        column("id", "int", "integer"),
+      ],
+    );
+
+    expect(preview).toContain(
+      "[col_nvarchar] = N'NVarChar: Привет мир! 你好世界 😀'",
+    );
+    expect(preview).toContain("WHERE [id] = '3'");
+  });
+
   it("keeps exact numeric parser values as strings for high-precision MSSQL numerics", () => {
     new MSSQLDriver(baseConfig as ConnectionConfig);
     const tediousValueParser = require("tedious/lib/value-parser") as {

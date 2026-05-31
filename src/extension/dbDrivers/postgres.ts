@@ -123,6 +123,69 @@ function isCircleValue(value: object): value is {
     Object.keys(value).length === 3
   );
 }
+function hasFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+function trimPostgresIntervalNumber(value: number): string {
+  if (Number.isInteger(value)) {
+    return String(value);
+  }
+  return value
+    .toString()
+    .replace(/(\.\d*?[1-9])0+$/, "$1")
+    .replace(/\.0+$/, "");
+}
+function formatPostgresIntervalLikeValue(value: object): string | null {
+  const record = value as Record<string, unknown>;
+  const knownKeys = new Set([
+    "years",
+    "months",
+    "days",
+    "hours",
+    "minutes",
+    "seconds",
+    "milliseconds",
+    "microseconds",
+  ]);
+  const keys = Object.keys(record);
+  if (
+    keys.length === 0 ||
+    keys.some((key) => !knownKeys.has(key)) ||
+    keys.some((key) => !hasFiniteNumber(record[key]))
+  ) {
+    return null;
+  }
+
+  const years = hasFiniteNumber(record.years) ? record.years : 0;
+  const months = hasFiniteNumber(record.months) ? record.months : 0;
+  const days = hasFiniteNumber(record.days) ? record.days : 0;
+  const hours = hasFiniteNumber(record.hours) ? record.hours : 0;
+  const minutes = hasFiniteNumber(record.minutes) ? record.minutes : 0;
+  const seconds = hasFiniteNumber(record.seconds) ? record.seconds : 0;
+  const milliseconds = hasFiniteNumber(record.milliseconds)
+    ? record.milliseconds
+    : 0;
+  const microseconds = hasFiniteNumber(record.microseconds)
+    ? record.microseconds
+    : 0;
+
+  const normalizedSeconds =
+    seconds + milliseconds / 1000 + microseconds / 1_000_000;
+  let iso = "P";
+  if (years !== 0) iso += `${trimPostgresIntervalNumber(years)}Y`;
+  if (months !== 0) iso += `${trimPostgresIntervalNumber(months)}M`;
+  if (days !== 0) iso += `${trimPostgresIntervalNumber(days)}D`;
+  if (hours !== 0 || minutes !== 0 || normalizedSeconds !== 0) {
+    iso += "T";
+    if (hours !== 0) iso += `${trimPostgresIntervalNumber(hours)}H`;
+    if (minutes !== 0) iso += `${trimPostgresIntervalNumber(minutes)}M`;
+    if (normalizedSeconds !== 0) {
+      iso += `${trimPostgresIntervalNumber(normalizedSeconds)}S`;
+    }
+  }
+
+  return iso === "P" ? "P0D" : iso;
+}
 function isPgTrue(value: unknown): boolean {
   if (typeof value === "boolean") return value;
   if (typeof value === "number") return value === 1;
@@ -269,6 +332,14 @@ function parsePostgresRoutineIdentity(value: string | undefined): {
   }
 
   return { oid: match[1] };
+}
+
+function safeJsonStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 export class PostgresDriver extends BaseDBDriver {
@@ -1488,13 +1559,17 @@ export class PostgresDriver extends BaseDBDriver {
       typeof value === "object" &&
       !(value instanceof Date)
     ) {
+      const formattedInterval = formatPostgresIntervalLikeValue(value);
+      if (formattedInterval !== null) {
+        return formattedInterval;
+      }
       if (isCircleValue(value)) {
         return `<(${String(value.x)},${String(value.y)}),${String(value.radius)}>`;
       }
       if (isPointValue(value)) {
         return `(${String(value.x)}, ${String(value.y)})`;
       }
-      return JSON.stringify(value);
+      return safeJsonStringify(value);
     }
     if (this.isDatetimeWithTime(column.nativeType)) {
       const formatted = formatDatetimeForDisplay(value);
@@ -1762,17 +1837,17 @@ export class PostgresDriver extends BaseDBDriver {
       if (typeof val !== "string") {
         return null;
       }
-      if (operator !== "like" && operator !== "ilike") {
-        return null;
+      if (operator === "eq" || operator === "neq") {
+        const intervalValue = val.trim();
+        if (!intervalValue) {
+          return null;
+        }
+        return {
+          sql: `${col} ${operator === "neq" ? "<>" : "="} $${paramIndex}::interval`,
+          params: [intervalValue],
+        };
       }
-      const searchValue = val.trim();
-      if (!searchValue) {
-        return null;
-      }
-      return {
-        sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex}`,
-        params: [`%${searchValue}%`],
-      };
+      return null;
     }
     if (
       this.isNumericCategory(column.category) &&

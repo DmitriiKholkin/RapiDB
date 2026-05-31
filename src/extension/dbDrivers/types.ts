@@ -359,6 +359,7 @@ export interface TransactionOperation {
   checkAffectedRows?: boolean;
 }
 const TEXT_OPS: FilterOperator[] = ["like"];
+const INTERVAL_OPS: FilterOperator[] = ["eq", "neq"];
 const UUID_OPS: FilterOperator[] = ["like", "in"];
 const ENUM_OPS: FilterOperator[] = ["like", "in"];
 const BOOL_OPS: FilterOperator[] = ["eq", "neq"];
@@ -427,7 +428,7 @@ export function filterOperatorsForCategory(
     case "datetime":
       return EXTENDED_OPS;
     case "interval":
-      return TEXT_OPS;
+      return INTERVAL_OPS;
     case "boolean":
       return BOOL_OPS;
     case "binary":

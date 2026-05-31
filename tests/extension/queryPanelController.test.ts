@@ -225,6 +225,60 @@ describe("QueryPanelController", () => {
     );
   });
 
+  it("rewrites MSSQL queries with TOP without wrapping in a derived table", async () => {
+    const query = vi.fn(async () => ({
+      columns: ["sequence_name"],
+      rows: [{ sequence_name: "s1" }],
+      columnMeta: [],
+      rowCount: 1,
+      executionTimeMs: 2,
+    }));
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "active",
+        name: "Primary",
+        type: "mssql",
+      })),
+      isConnected: vi.fn(() => true),
+      connectTo: vi.fn(async () => undefined),
+      addToHistory: vi.fn(async () => undefined),
+      addBookmark: vi.fn(async () => undefined),
+      getDriver: vi.fn(() => ({ query })),
+      getQueryRowLimit: vi.fn(() => 50_000),
+      getSchemaAsync: vi.fn(async () => []),
+    };
+
+    const view = {
+      getActiveConnectionId: vi.fn(() => "active"),
+      getInitialConnectionId: vi.fn(() => "initial"),
+      getLastQueryResult: vi.fn(() => null),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+
+    await controller.handleMessage({
+      type: "executeQuery",
+      payload: {
+        queryText:
+          "SELECT s.name AS sequence_name FROM sys.sequences s ORDER BY s.name",
+      },
+    });
+
+    expect(query).toHaveBeenCalledWith(
+      "SELECT TOP (10001) s.name AS sequence_name FROM sys.sequences s ORDER BY s.name",
+    );
+  });
+
   it("does not rewrite WITH queries to avoid unsafe hard-cap wrapping", async () => {
     const query = vi.fn(async () => ({
       columns: ["id"],
