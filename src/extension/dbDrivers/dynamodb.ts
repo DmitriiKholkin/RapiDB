@@ -375,7 +375,7 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   private databaseName(): string {
-    return this.config.database || this.config.awsRegion || "default";
+    return this.config.awsRegion || "default";
   }
 
   async listDatabases(): Promise<DatabaseInfo[]> {

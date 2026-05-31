@@ -696,7 +696,6 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
           }
         : isDynamo
           ? {
-              database: database.trim() || undefined,
               awsRegion: awsRegion.trim() || undefined,
               awsAccessKeyId: awsAccessKeyId.trim() || undefined,
               awsSecretAccessKey: awsSecretAccessKey.trim() || undefined,
@@ -1013,14 +1012,6 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                 value={dynamoEndpoint}
                 onChange={(e) => setDynamoEndpoint(e.target.value)}
                 placeholder="http://localhost:8000"
-              />
-            </Field>
-            <Field label="Table Namespace" hint="Optional logical namespace.">
-              <FocusInput
-                aria-label="DynamoDB namespace"
-                value={database}
-                onChange={(e) => setDatabase(e.target.value)}
-                placeholder="default"
               />
             </Field>
             <Field label="Access Key ID">

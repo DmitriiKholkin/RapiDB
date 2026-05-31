@@ -456,6 +456,10 @@ function getConfiguredDefaultDatabaseName(config: ConnectionConfig): string {
     return "default";
   }
 
+  if (config.type === "dynamodb") {
+    return config.awsRegion || "default";
+  }
+
   if (config.type === "oracle") {
     return config.serviceName || config.database || "";
   }

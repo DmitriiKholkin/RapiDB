@@ -885,8 +885,7 @@ export class ElasticsearchDriver implements IDBDriver {
       columns.map((column) => [column.name, column]),
     );
     const canDelegateToServer =
-      request.filters.length === 0 &&
-      (request.sort === null || request.sort.column === "_id");
+      request.filters.length === 0 && request.sort === null;
 
     if (canDelegateToServer) {
       const offset = Math.max(0, (request.page - 1) * request.pageSize);

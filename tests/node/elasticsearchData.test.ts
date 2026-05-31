@@ -190,24 +190,22 @@ describe("ElasticsearchDriver — metadata and pages", () => {
     expect(page.totalCount).toBe(2);
     expect(page.rows).toEqual([
       {
-        _id: "doc-2",
-        _source:
-          '{"created_at":"2026-04-02T10:30:00Z","email":"bravo@example.com","profile":{"tier":"pro"},"active":false,"dynamic_seen":"yes"}',
-      },
-      {
         _id: "doc-1",
         _source:
           '{"created_at":"2026-04-01T09:00:00Z","email":"alpha@example.com","profile":{"tier":"free"},"active":true,"status":null,"dynamic_seen":"no"}',
+      },
+      {
+        _id: "doc-2",
+        _source:
+          '{"created_at":"2026-04-02T10:30:00Z","email":"bravo@example.com","profile":{"tier":"pro"},"active":false,"dynamic_seen":"yes"}',
       },
     ]);
     expect(search).toHaveBeenCalledTimes(1);
     expect(search).toHaveBeenCalledWith({
       index: "users",
       query: { match_all: {} },
-      sort: [{ _id: { order: "asc" } }],
-      from: 0,
-      size: 10,
-      track_total_hits: true,
+      sort: ["_doc"],
+      size: ELASTICSEARCH_READ_BUDGET.hardCap,
     });
     expect(getMapping).not.toHaveBeenCalled();
   });

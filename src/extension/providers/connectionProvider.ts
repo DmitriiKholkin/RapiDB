@@ -644,6 +644,39 @@ export class ConnectionProvider
       connectionType === "elasticsearch"
         ? this.connectionManager.getSchemaSnapshotState(element.connectionId)
         : rootState;
+    if (connectionType === "dynamodb") {
+      const databaseName = state.snapshot.databases[0]?.name;
+      if (!databaseName) {
+        return this.appendStateNodes(
+          element.connectionId,
+          [],
+          state,
+          "Loading tables…",
+        );
+      }
+
+      const databaseState = this.getSchemaState(element.connectionId, {
+        kind: "database",
+        database: databaseName,
+      });
+      const database = databaseState.snapshot.databases[0];
+      const schema = database?.schemas[0];
+      const categories =
+        database && schema
+          ? this.categoryNodes(
+              element.connectionId,
+              database.name,
+              schema,
+              this.getEntityManifest(element.connectionId),
+            )
+          : [];
+      return this.appendStateNodes(
+        element.connectionId,
+        categories,
+        databaseState,
+        "Loading tables…",
+      );
+    }
     if (this.shouldFlattenConnectionLevel(element.connectionId, state)) {
       const database = state.snapshot.databases[0];
       const schema = database?.schemas[0];

@@ -1277,7 +1277,7 @@ describe("ConnectionProvider", () => {
     expect(children[0]?.tooltip).toBe("Loading indices…");
   });
 
-  it("flattens DynamoDB schema level and hides schema wording", async () => {
+  it("opens DynamoDB tables directly from the connection root", async () => {
     const connectionManager = {
       getConnections: vi.fn(() => [
         { id: "conn-ddb", name: "Dynamo", type: "dynamodb" },
@@ -1285,23 +1285,27 @@ describe("ConnectionProvider", () => {
       isConnected: vi.fn((id: string) => id === "conn-ddb"),
       isConnecting: vi.fn(() => false),
       ensureSchemaScopeLoading: vi.fn(),
-      getSchemaSnapshotState: vi.fn(() =>
-        loadedState({
-          databases: [
-            {
-              name: "us-east-1",
-              schemas: [
+      getSchemaSnapshotState: vi.fn((_, scope) =>
+        scope?.kind === "database" || scope?.kind === "schema"
+          ? loadedState({
+              databases: [
                 {
                   name: "us-east-1",
-                  objects: [
-                    { name: "users", type: "table", columns: [] },
-                    { name: "orders", type: "table", columns: [] },
+                  schemas: [
+                    {
+                      name: "us-east-1",
+                      objects: [
+                        { name: "users", type: "table", columns: [] },
+                        { name: "orders", type: "table", columns: [] },
+                      ],
+                    },
                   ],
                 },
               ],
-            },
-          ],
-        }),
+            })
+          : loadedState({
+              databases: [{ name: "us-east-1", schemas: [] }],
+            }),
       ),
       getDriver: vi.fn(() => {
         throw new Error("ConnectionProvider should not query drivers directly");
@@ -1319,19 +1323,16 @@ describe("ConnectionProvider", () => {
 
     const provider = new ConnectionProvider(connectionManager as never);
     const roots = await provider.getChildren();
-    const databases = await provider.getChildren(roots[0]);
+    const rootChildren = await provider.getChildren(roots[0]);
 
-    expect(databases.map((node) => node.label)).toEqual(["us-east-1"]);
-
-    const databaseChildren = await provider.getChildren(databases[0]);
-    expect(databaseChildren.map((node) => node.label)).toContain("Tables");
-    expect(databaseChildren.map((node) => node.label)).not.toContain(
-      "us-east-1",
+    expect(rootChildren.map((node) => node.label)).toContain("Tables");
+    expect(rootChildren.map((node) => node.label)).not.toContain("us-east-1");
+    expect(connectionManager.ensureSchemaScopeLoading).toHaveBeenCalledWith(
+      "conn-ddb",
+      { kind: "database", database: "us-east-1" },
     );
 
-    const tablesCategory = databaseChildren.find(
-      (node) => node.label === "Tables",
-    );
+    const tablesCategory = rootChildren.find((node) => node.label === "Tables");
     if (!tablesCategory) {
       throw new Error("Expected Tables category for DynamoDB");
     }
@@ -1759,8 +1760,7 @@ describe("ConnectionProvider", () => {
     const provider = new ConnectionProvider(connectionManager as never);
 
     const roots = await provider.getChildren();
-    const databases = await provider.getChildren(roots[0]);
-    const categories = await provider.getChildren(databases[0]);
+    const categories = await provider.getChildren(roots[0]);
     const tableNode = (await provider.getChildren(categories[0]))[0];
     const tableSections = await provider.getChildren(tableNode);
     const indexesSection = tableSections.find(
@@ -2306,8 +2306,7 @@ describe("ConnectionProvider", () => {
 
     const provider = new ConnectionProvider(connectionManager as never);
     const roots = await provider.getChildren();
-    const databases = await provider.getChildren(roots[0]);
-    const categories = await provider.getChildren(databases[0]);
+    const categories = await provider.getChildren(roots[0]);
     const tableNode = (await provider.getChildren(categories[0]))[0];
     const sections = await provider.getChildren(tableNode);
     const columnRows = await provider.getChildren(sections[0]);
