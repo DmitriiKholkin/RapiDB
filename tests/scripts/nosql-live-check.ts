@@ -672,8 +672,7 @@ async function verifyElasticsearchDriver(
 
     const columns = await driver.describeColumns("default", "indices", "users");
     assert.equal(findColumn(columns, "_id").isPrimaryKey, true);
-    assert.equal(findColumn(columns, "created_at").category, "datetime");
-    assert.equal(findColumn(columns, "profile").category, "json");
+    assert.equal(findColumn(columns, "_source").category, "json");
 
     const indexes = await driver.getIndexes("default", "indices", "users");
     assert(indexes.some((index) => index.name === "users_id_idx"));
@@ -685,7 +684,7 @@ async function verifyElasticsearchDriver(
       page: 1,
       pageSize: 10,
       filters: [],
-      sort: { column: "email", direction: "asc" },
+      sort: { column: "_id", direction: "asc" },
       skipCount: false,
     });
     assert.equal(page.totalCount, 2);
@@ -694,8 +693,8 @@ async function verifyElasticsearchDriver(
       ["user-1", "user-2"],
     );
     assert.equal(
-      findRow(page, (row) => row._id === "user-1").profile,
-      '{"tier":"free"}',
+      typeof findRow(page, (row) => row._id === "user-1")._source,
+      "string",
     );
 
     const queryResult = await driver.query(
@@ -703,7 +702,12 @@ async function verifyElasticsearchDriver(
     );
     const queryRows = rowsFromQuery(queryResult);
     assert.equal(queryRows.length, 1);
-    assert.equal(queryRows[0]?.email, "alpha@example.com");
+    assert.equal(queryRows[0]?._id, "user-1");
+    assert.equal(
+      typeof queryRows[0]?._source === "string" &&
+        queryRows[0]?._source.includes("alpha@example.com"),
+      true,
+    );
 
     await driver.insertRow({
       database: "default",
@@ -711,9 +715,11 @@ async function verifyElasticsearchDriver(
       table: "users",
       values: {
         _id: "user-3",
-        email: "charlie@example.com",
-        active: true,
-        profile: { tier: "starter" },
+        _source: {
+          email: "charlie@example.com",
+          active: true,
+          profile: { tier: "starter" },
+        },
       },
     });
     await driver.updateRows({
@@ -723,7 +729,13 @@ async function verifyElasticsearchDriver(
       updates: [
         {
           primaryKeys: { _id: "user-3" },
-          changes: { email: "charlie+updated@example.com", active: false },
+          changes: {
+            _source: {
+              email: "charlie+updated@example.com",
+              active: false,
+              profile: { tier: "starter" },
+            },
+          },
         },
       ],
     });

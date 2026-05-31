@@ -150,6 +150,74 @@ describe("ConnectionFormPanel", () => {
     expect(context.secrets.store).not.toHaveBeenCalled();
   });
 
+  it("prefers Elasticsearch basic auth over previously stored API key", async () => {
+    const context = {
+      secrets: {
+        get: vi.fn(async () => JSON.stringify({ apiKey: "stored-api-key" })),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn().mockResolvedValue(undefined),
+      getConnection: vi.fn(() => ({
+        id: "conn-es-basic",
+        name: "Elastic",
+        type: "elasticsearch",
+        useSecretStorage: true,
+      })),
+      testConnection: vi.fn(),
+    };
+
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+      {
+        id: "conn-es-basic",
+        name: "Elastic",
+        type: "elasticsearch",
+        endpoint: "http://localhost:9200",
+        useSecretStorage: true,
+      },
+    );
+
+    await Promise.resolve();
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected a webview panel to be created.");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-es-basic",
+        name: "Elastic",
+        type: "elasticsearch",
+        endpoint: "http://localhost:9200",
+        username: "elastic",
+        password: "basic-secret",
+        apiKey: "",
+        hasStoredApiKey: true,
+        useSecretStorage: true,
+      },
+    });
+
+    await expect(promise).resolves.toEqual(
+      expect.objectContaining({
+        id: "conn-es-basic",
+        type: "elasticsearch",
+      }),
+    );
+    expect(connectionManager.saveConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        username: "elastic",
+        password: "basic-secret",
+        apiKey: undefined,
+      }),
+    );
+  });
+
   it("normalizes Oracle legacy database payloads to serviceName on save", async () => {
     const context = {
       secrets: {

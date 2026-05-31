@@ -142,6 +142,7 @@ export type SanitizedConnectionConfig = Omit<
 
 export interface ConnectionFormExistingState extends SanitizedConnectionConfig {
   hasStoredSecret?: boolean;
+  hasStoredApiKey?: boolean;
   hasStoredSshPassword?: boolean;
   hasStoredSshPrivateKey?: boolean;
   hasStoredSshPassphrase?: boolean;
@@ -149,6 +150,7 @@ export interface ConnectionFormExistingState extends SanitizedConnectionConfig {
 
 export interface ConnectionFormSubmission extends SanitizedConnectionConfig {
   password?: string;
+  hasStoredApiKey?: boolean;
   sshPassword?: string;
   sshPrivateKey?: string;
   sshPassphrase?: string;
@@ -522,6 +524,7 @@ export function parseConnectionFormExistingState(
   return {
     ...base,
     hasStoredSecret: readOptionalBoolean(input, "hasStoredSecret"),
+    hasStoredApiKey: readOptionalBoolean(input, "hasStoredApiKey"),
     hasStoredSshPassword: readOptionalBoolean(input, "hasStoredSshPassword"),
     hasStoredSshPrivateKey: readOptionalBoolean(
       input,
@@ -548,6 +551,7 @@ export function parseConnectionFormSubmission(
   return {
     ...base,
     password,
+    hasStoredApiKey: readOptionalBoolean(input, "hasStoredApiKey"),
     sshPassword,
     sshPrivateKey,
     sshPassphrase,

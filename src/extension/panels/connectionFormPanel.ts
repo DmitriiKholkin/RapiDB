@@ -232,6 +232,7 @@ function sanitizeExistingForForm(
     endpoint: sanitizeUriForForm(endpoint),
     awsEndpoint: sanitizeUriForForm(awsEndpoint),
     hasStoredSecret: storedSecrets.password !== undefined || undefined,
+    hasStoredApiKey: storedSecrets.apiKey !== undefined || undefined,
     hasStoredSshPassword: storedSecrets.sshPassword !== undefined || undefined,
     hasStoredSshPrivateKey:
       storedSecrets.sshPrivateKey !== undefined || undefined,
@@ -460,6 +461,7 @@ export class ConnectionFormPanel {
     );
     const {
       hasStoredSecret: _hasStoredSecret,
+      hasStoredApiKey: _hasStoredApiKey,
       hasStoredSshPassword: _hasStoredSshPassword,
       hasStoredSshPrivateKey: _hasStoredSshPrivateKey,
       hasStoredSshPassphrase: _hasStoredSshPassphrase,
@@ -493,6 +495,10 @@ export class ConnectionFormPanel {
             existing?.sshPassphrase,
           )
         : undefined;
+    const prefersElasticsearchBasicAuth =
+      payload.type === "elasticsearch" &&
+      trimOptionalSecret(payload.username) !== undefined &&
+      trimOptionalSecret(payload.password) !== undefined;
     return {
       ...rest,
       useSecretStorage,
@@ -519,7 +525,9 @@ export class ConnectionFormPanel {
       password,
       apiKey:
         trimOptionalSecret(payload.apiKey) ??
-        (useSecretStorage ? storedSecrets.apiKey : undefined) ??
+        (useSecretStorage && !prefersElasticsearchBasicAuth
+          ? storedSecrets.apiKey
+          : undefined) ??
         existing?.apiKey,
       awsAccessKeyId:
         trimOptionalSecret(payload.awsAccessKeyId) ??

@@ -121,7 +121,7 @@ describe("ElasticsearchDriver — metadata and pages", () => {
     });
   });
 
-  it("derives recursive mapped column metadata and flattened rows for page reads", async () => {
+  it("returns fixed _id/_source columns and JSON row payloads for page reads", async () => {
     const { driver, search, getMapping } = createDriver();
     search.mockResolvedValue({
       hits: {
@@ -151,38 +151,7 @@ describe("ElasticsearchDriver — metadata and pages", () => {
         ],
       },
     });
-    getMapping.mockResolvedValue({
-      users: {
-        mappings: {
-          properties: {
-            created_at: { type: "date" },
-            email: {
-              type: "keyword",
-              fields: {
-                text: { type: "text" },
-              },
-            },
-            profile: {
-              properties: {
-                tier: { type: "keyword" },
-              },
-            },
-            items: {
-              type: "nested",
-              properties: {
-                sku: { type: "keyword" },
-              },
-            },
-            active: { type: "boolean" },
-            status: { type: "keyword", null_value: "unknown" },
-            email_alias: { type: "alias", path: "email" },
-          },
-          runtime: {
-            computed_score: { type: "double" },
-          },
-        },
-      },
-    });
+    getMapping.mockResolvedValue({});
 
     const described = await driver.describeColumns(
       "default",
@@ -207,99 +176,32 @@ describe("ElasticsearchDriver — metadata and pages", () => {
         primaryKeyOrdinal: 1,
       }),
     );
-    expect(described).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          name: "created_at",
-          type: "date",
-          nativeType: "date",
-          category: "datetime",
-        }),
-        expect.objectContaining({
-          name: "email",
-          type: "keyword",
-          nativeType: "keyword",
-          category: "text",
-        }),
-        expect.objectContaining({
-          name: "email.text",
-          type: "text",
-          nativeType: "text",
-          category: "text",
-        }),
-        expect.objectContaining({
-          name: "profile",
-          type: "object",
-          nativeType: "object",
-          category: "json",
-        }),
-        expect.objectContaining({
-          name: "profile.tier",
-          type: "keyword",
-          nativeType: "keyword",
-          category: "text",
-        }),
-        expect.objectContaining({
-          name: "items",
-          type: "nested",
-          nativeType: "nested",
-          category: "json",
-        }),
-        expect.objectContaining({
-          name: "items.sku",
-          type: "keyword",
-          nativeType: "keyword",
-          category: "text",
-        }),
-        expect.objectContaining({
-          name: "computed_score",
-          type: "double",
-          nativeType: "double",
-          category: "float",
-        }),
-        expect.objectContaining({
-          name: "email_alias",
-          type: "alias",
-          nativeType: "alias",
-          category: "text",
-        }),
-        expect.objectContaining({
-          name: "dynamic_seen",
-          type: "text",
-        }),
-        expect.objectContaining({
-          name: "status",
-          defaultValue: "unknown",
-        }),
-      ]),
-    );
+    expect(described).toEqual([
+      expect.objectContaining({
+        name: "_id",
+        isPrimaryKey: true,
+        primaryKeyOrdinal: 1,
+      }),
+      expect.objectContaining({
+        name: "_source",
+        category: "json",
+      }),
+    ]);
     expect(page.totalCount).toBe(2);
     expect(page.rows).toEqual([
       {
         _id: "doc-2",
-        active: false,
-        created_at: "2026-04-02 10:30:00Z",
-        dynamic_seen: "yes",
-        email: "bravo@example.com",
-        profile: '{"tier":"pro"}',
+        _source:
+          '{"created_at":"2026-04-02T10:30:00Z","email":"bravo@example.com","profile":{"tier":"pro"},"active":false,"dynamic_seen":"yes"}',
       },
       {
         _id: "doc-1",
-        active: true,
-        created_at: "2026-04-01 09:00:00Z",
-        dynamic_seen: "no",
-        email: "alpha@example.com",
-        profile: '{"tier":"free"}',
-        status: null,
+        _source:
+          '{"created_at":"2026-04-01T09:00:00Z","email":"alpha@example.com","profile":{"tier":"free"},"active":true,"status":null,"dynamic_seen":"no"}',
       },
     ]);
-    expect(search).toHaveBeenNthCalledWith(1, {
-      index: "users",
-      size: 1000,
-      query: { match_all: {} },
-      sort: ["_doc"],
-    });
-    expect(search).toHaveBeenNthCalledWith(2, {
+    expect(search).toHaveBeenCalledTimes(1);
+    expect(search).toHaveBeenCalledWith({
       index: "users",
       query: { match_all: {} },
       sort: [{ _id: { order: "asc" } }],
@@ -307,9 +209,10 @@ describe("ElasticsearchDriver — metadata and pages", () => {
       size: 10,
       track_total_hits: true,
     });
+    expect(getMapping).not.toHaveBeenCalled();
   });
 
-  it("maps documented Elasticsearch field types to exact display types and UI categories", async () => {
+  it("keeps fixed _id/_source columns regardless mapping richness", async () => {
     const { driver, search, getMapping } = createDriver();
     search.mockResolvedValue({ hits: { hits: [] } });
     getMapping.mockResolvedValue({
@@ -374,228 +277,10 @@ describe("ElasticsearchDriver — metadata and pages", () => {
       "users",
     );
 
-    expect(described).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          name: "binary_value",
-          type: "binary",
-          nativeType: "binary",
-          category: "binary",
-          filterable: true,
-          filterOperators: ["eq", "neq", "is_null", "is_not_null"],
-        }),
-        expect.objectContaining({
-          name: "boolean_flag",
-          type: "boolean",
-          nativeType: "boolean",
-          category: "boolean",
-        }),
-        expect.objectContaining({
-          name: "keyword_value",
-          type: "keyword",
-          nativeType: "keyword",
-          category: "text",
-        }),
-        expect.objectContaining({
-          name: "constant_keyword_value",
-          type: "constant_keyword",
-          nativeType: "constant_keyword",
-          category: "text",
-        }),
-        expect.objectContaining({
-          name: "wildcard_value",
-          type: "wildcard",
-          nativeType: "wildcard",
-          category: "text",
-        }),
-        expect.objectContaining({
-          name: "long_value",
-          type: "long",
-          nativeType: "long",
-          category: "integer",
-        }),
-        expect.objectContaining({
-          name: "scaled_value",
-          type: "scaled_float",
-          nativeType: "scaled_float",
-          category: "float",
-        }),
-        expect.objectContaining({
-          name: "nanos_value",
-          type: "date_nanos",
-          nativeType: "date_nanos",
-          category: "datetime",
-        }),
-        expect.objectContaining({
-          name: "alias_value",
-          type: "alias",
-          nativeType: "alias",
-          category: "text",
-        }),
-        expect.objectContaining({
-          name: "object_value",
-          type: "object",
-          nativeType: "object",
-          category: "json",
-        }),
-        expect.objectContaining({
-          name: "flattened_value",
-          type: "flattened",
-          nativeType: "flattened",
-          category: "json",
-        }),
-        expect.objectContaining({
-          name: "nested_value",
-          type: "nested",
-          nativeType: "nested",
-          category: "json",
-        }),
-        expect.objectContaining({
-          name: "join_value",
-          type: "join",
-          nativeType: "join",
-          category: "json",
-        }),
-        expect.objectContaining({
-          name: "passthrough_value",
-          type: "passthrough",
-          nativeType: "passthrough",
-          category: "json",
-        }),
-        expect.objectContaining({
-          name: "range_value",
-          type: "integer_range",
-          nativeType: "integer_range",
-          category: "json",
-        }),
-        expect.objectContaining({
-          name: "ip_value",
-          type: "ip",
-          nativeType: "ip",
-          category: "text",
-        }),
-        expect.objectContaining({
-          name: "version_value",
-          type: "version",
-          nativeType: "version",
-          category: "text",
-        }),
-        expect.objectContaining({
-          name: "murmur3_value",
-          type: "murmur3",
-          nativeType: "murmur3",
-          category: "other",
-        }),
-        expect.objectContaining({
-          name: "aggregate_metric_value",
-          type: "aggregate_metric_double",
-          nativeType: "aggregate_metric_double",
-          category: "json",
-        }),
-        expect.objectContaining({
-          name: "histogram_value",
-          type: "histogram",
-          nativeType: "histogram",
-          category: "json",
-        }),
-        expect.objectContaining({
-          name: "exponential_histogram_value",
-          type: "exponential_histogram",
-          nativeType: "exponential_histogram",
-          category: "json",
-        }),
-        expect.objectContaining({
-          name: "tdigest_value",
-          type: "tdigest",
-          nativeType: "tdigest",
-          category: "json",
-        }),
-        expect.objectContaining({
-          name: "text_value",
-          type: "text",
-          nativeType: "text",
-          category: "text",
-        }),
-        expect.objectContaining({
-          name: "match_only_text_value",
-          type: "match_only_text",
-          nativeType: "match_only_text",
-          category: "text",
-        }),
-        expect.objectContaining({
-          name: "search_as_you_type_value",
-          type: "search_as_you_type",
-          nativeType: "search_as_you_type",
-          category: "text",
-        }),
-        expect.objectContaining({
-          name: "semantic_text_value",
-          type: "semantic_text",
-          nativeType: "semantic_text",
-          category: "text",
-        }),
-        expect.objectContaining({
-          name: "token_count_value",
-          type: "token_count",
-          nativeType: "token_count",
-          category: "integer",
-        }),
-        expect.objectContaining({
-          name: "dense_vector_value",
-          type: "dense_vector",
-          nativeType: "dense_vector",
-          category: "array",
-        }),
-        expect.objectContaining({
-          name: "sparse_vector_value",
-          type: "sparse_vector",
-          nativeType: "sparse_vector",
-          category: "json",
-        }),
-        expect.objectContaining({
-          name: "rank_feature_value",
-          type: "rank_feature",
-          nativeType: "rank_feature",
-          category: "float",
-        }),
-        expect.objectContaining({
-          name: "rank_features_value",
-          type: "rank_features",
-          nativeType: "rank_features",
-          category: "json",
-        }),
-        expect.objectContaining({
-          name: "geo_point_value",
-          type: "geo_point",
-          nativeType: "geo_point",
-          category: "spatial",
-        }),
-        expect.objectContaining({
-          name: "point_value",
-          type: "point",
-          nativeType: "point",
-          category: "spatial",
-        }),
-        expect.objectContaining({
-          name: "percolator_value",
-          type: "percolator",
-          nativeType: "percolator",
-          category: "json",
-        }),
-        expect.objectContaining({
-          name: "completion_value",
-          type: "completion",
-          nativeType: "completion",
-          category: "text",
-        }),
-        expect.objectContaining({
-          name: "runtime_score",
-          type: "double",
-          nativeType: "double",
-          category: "float",
-        }),
-      ]),
-    );
+    expect(described).toEqual([
+      expect.objectContaining({ name: "_id", isPrimaryKey: true }),
+      expect.objectContaining({ name: "_source", category: "json" }),
+    ]);
   });
 
   it("returns flattened rows from REST-style search queries", async () => {
@@ -623,13 +308,12 @@ describe("ElasticsearchDriver — metadata and pages", () => {
       size: 1,
       query: { match: { title: "Release" } },
     });
-    expect(result.columns).toEqual(["_id", "title", "tags"]);
+    expect(result.columns).toEqual(["_id", "_source"]);
     expect(result.rowCount).toBe(1);
     expect(result.rows).toEqual([
       {
         __col_0: "doc-9",
-        __col_1: "Release note",
-        __col_2: '["product","beta"]',
+        __col_1: '{"title":"Release note","tags":["product","beta"]}',
       },
     ]);
   });
@@ -776,7 +460,7 @@ describe("ElasticsearchDriver — metadata and pages", () => {
     ]);
   });
 
-  it("keeps mapped columns available when filters eliminate every row", async () => {
+  it("keeps fixed columns available when _source filters eliminate every row", async () => {
     const { driver, search, getMapping } = createDriver();
     search.mockResolvedValueOnce({
       hits: {
@@ -784,16 +468,7 @@ describe("ElasticsearchDriver — metadata and pages", () => {
         hits: [],
       },
     });
-    getMapping.mockResolvedValue({
-      users: {
-        mappings: {
-          properties: {
-            created_at: { type: "date" },
-            email: { type: "keyword" },
-          },
-        },
-      },
-    });
+    getMapping.mockResolvedValue({});
 
     const page = await driver.readTablePage({
       database: "default",
@@ -803,9 +478,9 @@ describe("ElasticsearchDriver — metadata and pages", () => {
       pageSize: 10,
       filters: [
         {
-          column: "email",
-          operator: "eq",
-          value: "missing@example.com",
+          column: "_source",
+          operator: "like",
+          value: "%missing@example.com%",
         },
       ],
       sort: { column: "_id", direction: "asc" },
@@ -814,13 +489,10 @@ describe("ElasticsearchDriver — metadata and pages", () => {
 
     expect(page.rows).toEqual([]);
     expect(page.totalCount).toBe(0);
-    expect(page.columns).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ name: "_id", isPrimaryKey: true }),
-        expect.objectContaining({ name: "email", type: "keyword" }),
-        expect.objectContaining({ name: "created_at", type: "date" }),
-      ]),
-    );
+    expect(page.columns).toEqual([
+      expect.objectContaining({ name: "_id", isPrimaryKey: true }),
+      expect.objectContaining({ name: "_source", category: "json" }),
+    ]);
   });
 
   it("uses _id as request metadata instead of indexing it inside the document body", async () => {
@@ -877,9 +549,7 @@ describe("ElasticsearchDriver — metadata and pages", () => {
           changes: { active: false },
         },
       ),
-    ).toBe(
-      'POST /users/_update/doc-3?refresh=wait_for\n{\n  "doc": {\n    "active": false\n  }\n}',
-    );
+    ).toBe('PUT /users/_doc/doc-3?refresh=wait_for\n{\n  "active": false\n}');
     expect(
       driver.buildMutationPreviewStatement(
         "delete",
@@ -914,7 +584,7 @@ describe("ElasticsearchDriver — metadata and pages", () => {
         },
       ),
     ).toBe(
-      'POST /users/_update/doc-3?refresh=wait_for\n{\n  "doc": {\n    "created_at": "2026-04-01T09:00:00.123+00:00"\n  }\n}',
+      'PUT /users/_doc/doc-3?refresh=wait_for\n{\n  "created_at": "2026-04-01T09:00:00.123+00:00"\n}',
     );
   });
 });

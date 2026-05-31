@@ -463,6 +463,7 @@ function getDefaultColor(): string {
 export function ConnectionFormView({ existing }: Props): ReactElement {
   const isEdit = !!existing;
   const hasStoredSecret = existing?.hasStoredSecret ?? false;
+  const hasStoredApiKey = existing?.hasStoredApiKey ?? false;
   const hasStoredSshPassword = existing?.hasStoredSshPassword ?? false;
   const hasStoredSshPrivateKey = existing?.hasStoredSshPrivateKey ?? false;
   const hasStoredSshPassphrase = existing?.hasStoredSshPassphrase ?? false;
@@ -574,7 +575,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
         ? "Password saved in your OS keychain — will NOT appear in settings.json."
         : "Password will be saved in plaintext in settings.json. Enable to store securely.";
   const elasticsearchApiKeyHint =
-    hasStoredSecret && elasticsearchApiKey.length === 0
+    hasStoredApiKey && elasticsearchApiKey.length === 0
       ? "Leave blank to keep the stored API key unchanged."
       : "Will be stored securely in VS Code Secret Storage (OS keychain)";
   const sshPasswordHint =
@@ -654,6 +655,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       color: color.trim() || undefined,
       useSecretStorage: effectiveUseSecretStorage,
       hasStoredSecret: hasStoredSecret || undefined,
+      hasStoredApiKey: hasStoredApiKey || undefined,
       sshEnabled: effectiveSshEnabled,
       sshHost: effectiveSshEnabled ? sshHost.trim() || undefined : undefined,
       sshPort:
@@ -744,6 +746,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     color,
     effectiveUseSecretStorage,
     hasStoredSecret,
+    hasStoredApiKey,
     effectiveSshEnabled,
     hasStoredSshPassword,
     hasStoredSshPrivateKey,

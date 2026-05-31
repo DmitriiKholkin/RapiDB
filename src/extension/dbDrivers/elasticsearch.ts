@@ -52,20 +52,7 @@ const ELASTICSEARCH_ENTITY_MANIFEST: DriverEntityManifest = {
   },
 };
 
-type ElasticsearchFieldMeta = {
-  type: string;
-  nullValue?: unknown;
-  kind: "mapped" | "runtime" | "alias";
-  aliasPath?: string;
-  targetType?: string;
-};
-
 type ElasticsearchRestMethod = "GET" | "POST" | "PUT" | "DELETE";
-
-type ElasticsearchFilterClauses = {
-  must: unknown[];
-  mustNot: unknown[];
-};
 
 const ELASTICSEARCH_READ_ONLY_QUERY_REASON =
   "[RapiDB] Read-only Elasticsearch connections allow only GET requests and POST _search requests.";
@@ -81,64 +68,6 @@ interface ElasticsearchRestCommand {
   queryParams: URLSearchParams;
   body?: unknown;
 }
-
-const ELASTICSEARCH_TEXT_TYPES = new Set([
-  "annotated_text",
-  "completion",
-  "constant_keyword",
-  "ip",
-  "keyword",
-  "match_only_text",
-  "pattern_text",
-  "search_as_you_type",
-  "semantic_text",
-  "text",
-  "version",
-  "wildcard",
-]);
-
-const ELASTICSEARCH_INTEGER_TYPES = new Set([
-  "byte",
-  "integer",
-  "long",
-  "short",
-  "token_count",
-  "unsigned_long",
-]);
-
-const ELASTICSEARCH_FLOAT_TYPES = new Set([
-  "double",
-  "float",
-  "half_float",
-  "rank_feature",
-  "scaled_float",
-]);
-
-const ELASTICSEARCH_DATETIME_TYPES = new Set(["date", "date_nanos"]);
-
-const ELASTICSEARCH_JSON_TYPES = new Set([
-  "aggregate_metric_double",
-  "exponential_histogram",
-  "flattened",
-  "histogram",
-  "join",
-  "nested",
-  "object",
-  "passthrough",
-  "percolator",
-  "rank_features",
-  "sparse_vector",
-  "tdigest",
-]);
-
-const ELASTICSEARCH_ARRAY_TYPES = new Set(["dense_vector"]);
-
-const ELASTICSEARCH_SPATIAL_TYPES = new Set([
-  "geo_point",
-  "geo_shape",
-  "point",
-  "shape",
-]);
 
 export class ElasticsearchDriver implements IDBDriver {
   private client: Client | null = null;
@@ -171,14 +100,14 @@ export class ElasticsearchDriver implements IDBDriver {
               ? sshAgentTransport.httpsAgent
               : sshAgentTransport.httpAgent
         : undefined,
-      auth: this.config.apiKey
+      auth: this.config.username
         ? {
-            apiKey: this.config.apiKey,
+            username: this.config.username,
+            password: this.config.password ?? "",
           }
-        : this.config.username
+        : this.config.apiKey
           ? {
-              username: this.config.username,
-              password: this.config.password ?? "",
+              apiKey: this.config.apiKey,
             }
           : undefined,
       tls: this.config.ssl
@@ -951,54 +880,64 @@ export class ElasticsearchDriver implements IDBDriver {
   async readTablePage(
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
-    const offset = Math.max(0, (request.page - 1) * request.pageSize);
-    const size = this.clampSearchSize(request.pageSize);
-    const mapping = await this.fetchMappingMeta(request.table);
-    const mappedColumns = this.buildColumnsFromMetadata([], mapping);
+    const columns = this.describeIndexColumnsSync();
     const columnMetaByName = new Map(
-      mappedColumns.map((column) => [column.name, column]),
+      columns.map((column) => [column.name, column]),
     );
-    const filterClauses = this.buildElasticsearchFilterClauses(
-      request.filters,
-      columnMetaByName,
-    );
-    const query =
-      filterClauses.must.length > 0 || filterClauses.mustNot.length > 0
-        ? {
-            bool: {
-              ...(filterClauses.must.length > 0
-                ? { must: filterClauses.must }
-                : {}),
-              ...(filterClauses.mustNot.length > 0
-                ? { must_not: filterClauses.mustNot }
-                : {}),
-            },
-          }
-        : { match_all: {} };
-    const sort = request.sort
-      ? [{ [request.sort.column]: { order: request.sort.direction } }]
-      : ["_doc"];
+    const canDelegateToServer =
+      request.filters.length === 0 &&
+      (request.sort === null || request.sort.column === "_id");
+
+    if (canDelegateToServer) {
+      const offset = Math.max(0, (request.page - 1) * request.pageSize);
+      const size = this.clampSearchSize(request.pageSize);
+      const response = await this.requireClient().search({
+        index: request.table,
+        query: { match_all: {} },
+        sort: request.sort
+          ? [{ _id: { order: request.sort.direction } }]
+          : ["_doc"],
+        from: offset,
+        size,
+        ...(request.skipCount ? {} : { track_total_hits: true }),
+      } as never);
+      const rows = this.hitsToRows(
+        response.hits.hits as unknown as Array<Record<string, unknown>>,
+      ).map((row) =>
+        Object.fromEntries(
+          Object.entries(row).map(([columnName, value]) => {
+            const column = columnMetaByName.get(columnName);
+            return [
+              columnName,
+              column ? this.formatOutputValue(value, column) : value,
+            ];
+          }),
+        ),
+      );
+      return {
+        columns,
+        rows,
+        totalCount: request.skipCount
+          ? 0
+          : this.resolveElasticsearchTotalCount(response.hits.total),
+      };
+    }
 
     const response = await this.requireClient().search({
       index: request.table,
-      query,
-      sort,
-      from: offset,
-      size,
-      ...(request.skipCount ? {} : { track_total_hits: true }),
+      query: { match_all: {} },
+      sort: ["_doc"],
+      size: ELASTICSEARCH_READ_BUDGET.hardCap,
     } as never);
-
     const rows = this.hitsToRows(
       response.hits.hits as unknown as Array<Record<string, unknown>>,
     );
-    const columns = this.buildColumnsFromMetadata(rows, mapping);
-    const formattedColumnMetaByName = new Map(
-      columns.map((column) => [column.name, column]),
-    );
-    const paged = rows.map((row) =>
+    const filtered = applyFilters(rows, request.filters);
+    const sorted = applySort(filtered, request.sort);
+    const paged = pageRows(sorted, request.page, request.pageSize).map((row) =>
       Object.fromEntries(
         Object.entries(row).map(([columnName, value]) => {
-          const column = formattedColumnMetaByName.get(columnName);
+          const column = columnMetaByName.get(columnName);
           return [
             columnName,
             column ? this.formatOutputValue(value, column) : value,
@@ -1009,9 +948,7 @@ export class ElasticsearchDriver implements IDBDriver {
     return {
       columns,
       rows: paged,
-      totalCount: request.skipCount
-        ? 0
-        : this.resolveElasticsearchTotalCount(response.hits.total),
+      totalCount: request.skipCount ? 0 : sorted.length,
     };
   }
 
@@ -1031,131 +968,6 @@ export class ElasticsearchDriver implements IDBDriver {
     return 0;
   }
 
-  private buildElasticsearchFilterClauses(
-    filters: DriverTablePageRequest["filters"],
-    columnMetaByName: ReadonlyMap<string, ColumnTypeMeta>,
-  ): ElasticsearchFilterClauses {
-    const must: unknown[] = [];
-    const mustNot: unknown[] = [];
-
-    for (const filter of filters) {
-      const column = columnMetaByName.get(filter.column);
-      switch (filter.operator) {
-        case "is_null":
-          mustNot.push({ exists: { field: filter.column } });
-          break;
-        case "is_not_null":
-          must.push({ exists: { field: filter.column } });
-          break;
-        case "between": {
-          const start = this.coerceFilterValue(filter.value[0], column);
-          const end = this.coerceFilterValue(filter.value[1], column);
-          must.push({
-            range: {
-              [filter.column]: {
-                gte: start,
-                lte: end,
-              },
-            },
-          });
-          break;
-        }
-        case "eq": {
-          const value = this.coerceFilterValue(filter.value, column);
-          must.push(this.buildElasticsearchExactClause(filter.column, value));
-          break;
-        }
-        case "neq": {
-          const value = this.coerceFilterValue(filter.value, column);
-          mustNot.push(
-            this.buildElasticsearchExactClause(filter.column, value),
-          );
-          break;
-        }
-        case "gt":
-        case "gte":
-        case "lt":
-        case "lte": {
-          const value = this.coerceFilterValue(filter.value, column);
-          must.push({
-            range: {
-              [filter.column]: {
-                [filter.operator]: value,
-              },
-            },
-          });
-          break;
-        }
-        case "in": {
-          const values = this.splitInFilterValues(filter.value).map((entry) =>
-            this.coerceFilterValue(entry, column),
-          );
-          if (values.length > 0) {
-            must.push({
-              terms: {
-                [filter.column]: values,
-              },
-            });
-          }
-          break;
-        }
-        case "like":
-        case "ilike": {
-          must.push({
-            wildcard: {
-              [filter.column]: {
-                value: this.toElasticsearchWildcard(filter.value),
-                ...(filter.operator === "ilike"
-                  ? { case_insensitive: true }
-                  : {}),
-              },
-            },
-          });
-          break;
-        }
-      }
-    }
-
-    return { must, mustNot };
-  }
-
-  private buildElasticsearchExactClause(
-    column: string,
-    value: unknown,
-  ): Record<string, unknown> {
-    return {
-      term: {
-        [column]: value,
-      },
-    };
-  }
-
-  private coerceFilterValue(
-    value: string,
-    column: ColumnTypeMeta | undefined,
-  ): unknown {
-    if (!column) {
-      return value;
-    }
-    return this.coerceInputValue(value, column);
-  }
-
-  private splitInFilterValues(value: string): string[] {
-    return value
-      .split(",")
-      .map((entry) => entry.trim())
-      .filter((entry) => entry.length > 0);
-  }
-
-  private toElasticsearchWildcard(value: string): string {
-    const escaped = value
-      .replace(/\\/g, "\\\\")
-      .replace(/\*/g, "\\*")
-      .replace(/\?/g, "\\?");
-    const normalized = escaped.replace(/%/g, "*").replace(/_/g, "?").trim();
-    return normalized.length > 0 ? normalized : "*";
-  }
-
   async updateRows(
     request: DriverUpdateRowsRequest,
   ): Promise<DriverMutationResult> {
@@ -1173,10 +985,17 @@ export class ElasticsearchDriver implements IDBDriver {
       if (typeof id !== "string" && typeof id !== "number") {
         continue;
       }
-      await this.requireClient().update({
+      const document = this.resolveDocumentForMutation(
+        {
+          ...update.primaryKeys,
+          ...update.changes,
+        },
+        update.changes,
+      );
+      await this.requireClient().index({
         index: request.table,
         id: String(id),
-        doc: update.changes,
+        document,
         refresh: "wait_for",
       });
       affectedRows += 1;
@@ -1188,7 +1007,7 @@ export class ElasticsearchDriver implements IDBDriver {
     request: DriverInsertRowRequest,
   ): Promise<DriverMutationResult> {
     const id = request.values._id;
-    const document = this.stripDocumentId(request.values);
+    const document = this.resolveDocumentForMutation(request.values);
     await this.requireClient().index({
       index: request.table,
       id:
@@ -1267,7 +1086,7 @@ export class ElasticsearchDriver implements IDBDriver {
   ): string {
     if (operation === "insert") {
       const id = data.values?._id;
-      const document = this.stripDocumentId(data.values ?? {});
+      const document = this.resolveDocumentForMutation(data.values ?? {});
       return this.formatRestCommand(
         id !== undefined ? "PUT" : "POST",
         `/${encodeURIComponent(table)}/_doc${
@@ -1281,12 +1100,19 @@ export class ElasticsearchDriver implements IDBDriver {
     }
     const id = data.primaryKeys?._id ?? data.primaryKeyValuesList?.[0]?._id;
     if (operation === "update") {
+      const document = this.resolveDocumentForMutation(
+        {
+          ...(data.primaryKeys ?? {}),
+          ...(data.changes ?? {}),
+        },
+        data.changes,
+      );
       return this.formatRestCommand(
-        "POST",
-        `/${encodeURIComponent(table)}/_update/${encodeURIComponent(
+        "PUT",
+        `/${encodeURIComponent(table)}/_doc/${encodeURIComponent(
           id !== undefined ? String(id) : "<id>",
         )}?refresh=wait_for`,
-        { doc: data.changes ?? {} },
+        document,
       );
     }
     return this.formatRestCommand(
@@ -1331,6 +1157,34 @@ export class ElasticsearchDriver implements IDBDriver {
   }
 
   coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (column.name === "_source") {
+      if (typeof value === "string") {
+        const trimmed = value.trim();
+        if (!trimmed) {
+          return {};
+        }
+        try {
+          const parsed = JSON.parse(trimmed) as unknown;
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            throw new Error();
+          }
+          return parsed;
+        } catch {
+          throw new Error(
+            'Elasticsearch field "_source" must be a valid JSON object.',
+          );
+        }
+      }
+
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error(
+          'Elasticsearch field "_source" must be a valid JSON object.',
+        );
+      }
+
+      return value;
+    }
+
     if (typeof value === "string" && column.category === "datetime") {
       const trimmed = normalizeSqlDatetimeOffsetSpacing(value.trim());
       const match =
@@ -1483,380 +1337,62 @@ export class ElasticsearchDriver implements IDBDriver {
       : undefined;
   }
 
-  private async fetchMappingMeta(
-    index: string,
-  ): Promise<Map<string, ElasticsearchFieldMeta>> {
-    try {
-      const response = await this.requireClient().indices.getMapping({ index });
-      const mappings = (
-        response as Record<
-          string,
-          {
-            mappings?: {
-              properties?: Record<string, unknown>;
-              runtime?: Record<string, unknown>;
-            };
-          }
-        >
-      )[index]?.mappings;
-      const result = new Map<string, ElasticsearchFieldMeta>();
-
-      const addField = (name: string, meta: ElasticsearchFieldMeta): void => {
-        if (!name || result.has(name)) {
-          return;
-        }
-        result.set(name, meta);
-      };
-
-      const walkProperties = (
-        properties: Record<string, unknown> | undefined,
-        parentPath = "",
-      ): void => {
-        if (!properties) {
-          return;
-        }
-
-        for (const [fieldName, rawDefinition] of Object.entries(properties)) {
-          if (
-            !rawDefinition ||
-            typeof rawDefinition !== "object" ||
-            Array.isArray(rawDefinition)
-          ) {
-            continue;
-          }
-
-          const definition = rawDefinition as {
-            type?: string;
-            path?: string;
-            null_value?: unknown;
-            properties?: Record<string, unknown>;
-            fields?: Record<string, unknown>;
-          };
-          const fullPath = parentPath
-            ? `${parentPath}.${fieldName}`
-            : fieldName;
-          const hasChildren =
-            definition.properties !== undefined &&
-            Object.keys(definition.properties).length > 0;
-          const effectiveType =
-            definition.type ?? (hasChildren ? "object" : undefined);
-
-          if (effectiveType) {
-            addField(fullPath, {
-              type: effectiveType,
-              nullValue: definition.null_value,
-              kind: effectiveType === "alias" ? "alias" : "mapped",
-              aliasPath:
-                effectiveType === "alias" ? definition.path : undefined,
-            });
-          }
-
-          if (hasChildren) {
-            walkProperties(definition.properties, fullPath);
-          }
-
-          if (definition.fields && Object.keys(definition.fields).length > 0) {
-            walkProperties(definition.fields, fullPath);
-          }
-        }
-      };
-
-      walkProperties(mappings?.properties);
-
-      for (const [fieldName, rawDefinition] of Object.entries(
-        mappings?.runtime ?? {},
-      )) {
-        if (
-          !rawDefinition ||
-          typeof rawDefinition !== "object" ||
-          Array.isArray(rawDefinition)
-        ) {
-          continue;
-        }
-        const definition = rawDefinition as { type?: string };
-        addField(fieldName, {
-          type: definition.type ?? "keyword",
-          kind: "runtime",
-        });
-      }
-
-      for (const [fieldName, meta] of [...result.entries()]) {
-        if (meta.kind !== "alias" || !meta.aliasPath) {
-          continue;
-        }
-
-        const target = result.get(meta.aliasPath);
-        if (!target) {
-          continue;
-        }
-
-        result.set(fieldName, {
-          ...meta,
-          nullValue: meta.nullValue ?? target.nullValue,
-          targetType: target.targetType ?? target.type,
-        });
-      }
-
-      return result;
-    } catch {
-      return new Map();
-    }
+  private async describeIndexColumns(
+    _table: string,
+  ): Promise<ColumnTypeMeta[]> {
+    return this.describeIndexColumnsSync();
   }
 
-  private async describeIndexColumns(table: string): Promise<ColumnTypeMeta[]> {
-    const [rows, mapping] = await Promise.all([
-      this.readRows(table, 1000),
-      this.fetchMappingMeta(table),
-    ]);
-    return this.buildColumnsFromMetadata(rows, mapping);
-  }
-
-  private buildColumnsFromMetadata(
-    sampledRows: readonly Record<string, unknown>[],
-    mapping: ReadonlyMap<string, ElasticsearchFieldMeta>,
-  ): ColumnTypeMeta[] {
-    const sampledColumns = inferColumnsFromRows(sampledRows, "_id", {
-      nullableMode: "schemaLess",
-    });
-    const sampledByName = new Map(
-      sampledColumns.map((column) => [column.name, column]),
-    );
-    const orderedNames = [
-      ...mapping.keys(),
-      ...sampledColumns
-        .map((column) => column.name)
-        .filter((name) => !mapping.has(name)),
-    ].filter((name, index, list) => list.indexOf(name) === index);
-
-    const columns: ColumnTypeMeta[] = [this.makeSyntheticIdColumn()];
-
-    for (const fieldName of orderedNames) {
-      if (fieldName === "_id") {
-        continue;
-      }
-
-      const sampled = sampledByName.get(fieldName);
-      const mapped = mapping.get(fieldName);
-      if (!sampled && !mapped) {
-        continue;
-      }
-
-      if (!mapped && sampled) {
-        columns.push(sampled);
-        continue;
-      }
-
-      const resolvedType = this.resolveElasticsearchFieldType(
-        mapped?.type ?? sampled?.nativeType ?? "keyword",
-        mapped,
-        sampled,
-      );
-
-      columns.push({
-        name: fieldName,
-        type: resolvedType.type,
-        nativeType: resolvedType.nativeType,
-        category: resolvedType.category,
-        nullable: sampled?.nullable ?? true,
-        defaultValue:
-          mapped?.nullValue !== undefined
-            ? String(mapped.nullValue)
-            : undefined,
+  private describeIndexColumnsSync(): ColumnTypeMeta[] {
+    const idCategory: TypeCategory = "text";
+    const sourceCategory: TypeCategory = "json";
+    return [
+      {
+        name: "_id",
+        type: "text",
+        nativeType: "text",
+        category: idCategory,
+        nullable: false,
+        defaultValue: undefined,
+        isPrimaryKey: true,
+        primaryKeyOrdinal: 1,
+        isForeignKey: false,
+        filterable: true,
+        filterOperators: resolveFilterOperators(idCategory, {
+          filterable: true,
+          nullable: false,
+        }),
+        valueSemantics: "plain",
+      },
+      {
+        name: "_source",
+        type: "json",
+        nativeType: "json",
+        category: sourceCategory,
+        nullable: false,
+        defaultValue: undefined,
         isPrimaryKey: false,
         primaryKeyOrdinal: undefined,
         isForeignKey: false,
-        filterable: resolvedType.filterable,
-        filterOperators: resolveFilterOperators(resolvedType.category, {
-          filterable: resolvedType.filterable,
-          nullable: sampled?.nullable ?? true,
+        filterable: true,
+        filterOperators: resolveFilterOperators(sourceCategory, {
+          filterable: true,
+          nullable: false,
         }),
         valueSemantics: "plain",
-      });
-    }
-
-    return columns;
-  }
-
-  private makeSyntheticIdColumn(): ColumnTypeMeta {
-    const category: TypeCategory = "text";
-    return {
-      name: "_id",
-      type: "text",
-      nativeType: "text",
-      category,
-      nullable: false,
-      defaultValue: undefined,
-      isPrimaryKey: true,
-      primaryKeyOrdinal: 1,
-      isForeignKey: false,
-      filterable: true,
-      filterOperators: resolveFilterOperators(category, {
-        filterable: true,
-        nullable: false,
-      }),
-      valueSemantics: "plain",
-    };
-  }
-
-  private resolveElasticsearchFieldType(
-    esType: string,
-    mapped: ElasticsearchFieldMeta | undefined,
-    sampled: ColumnTypeMeta | undefined,
-  ): {
-    type: string;
-    nativeType: string;
-    category: TypeCategory;
-    filterable: boolean;
-  } {
-    const normalizedType = esType.toLowerCase().replace(/-/g, "_");
-
-    if (normalizedType === "alias") {
-      const targetType = mapped?.targetType;
-      const targetInfo = targetType
-        ? this.resolveElasticsearchFieldType(targetType, undefined, sampled)
-        : undefined;
-      const category = targetInfo?.category ?? sampled?.category ?? "text";
-      return {
-        type: esType,
-        nativeType: esType,
-        category,
-        filterable: this.isFilterableCategory(category),
-      };
-    }
-
-    if (ELASTICSEARCH_TEXT_TYPES.has(normalizedType)) {
-      return {
-        type: esType,
-        nativeType: esType,
-        category: "text",
-        filterable: true,
-      };
-    }
-
-    if (ELASTICSEARCH_INTEGER_TYPES.has(normalizedType)) {
-      return {
-        type: esType,
-        nativeType: esType,
-        category: "integer",
-        filterable: true,
-      };
-    }
-
-    if (ELASTICSEARCH_FLOAT_TYPES.has(normalizedType)) {
-      return {
-        type: esType,
-        nativeType: esType,
-        category: "float",
-        filterable: true,
-      };
-    }
-
-    if (ELASTICSEARCH_DATETIME_TYPES.has(normalizedType)) {
-      return {
-        type: esType,
-        nativeType: esType,
-        category: "datetime",
-        filterable: true,
-      };
-    }
-
-    if (normalizedType === "boolean") {
-      return {
-        type: esType,
-        nativeType: esType,
-        category: "boolean",
-        filterable: true,
-      };
-    }
-
-    if (normalizedType === "binary") {
-      return {
-        type: esType,
-        nativeType: esType,
-        category: "binary",
-        filterable: true,
-      };
-    }
-
-    if (ELASTICSEARCH_SPATIAL_TYPES.has(normalizedType)) {
-      return {
-        type: esType,
-        nativeType: esType,
-        category: "spatial",
-        filterable: false,
-      };
-    }
-
-    if (ELASTICSEARCH_ARRAY_TYPES.has(normalizedType)) {
-      return {
-        type: esType,
-        nativeType: esType,
-        category: "array",
-        filterable: true,
-      };
-    }
-
-    if (
-      ELASTICSEARCH_JSON_TYPES.has(normalizedType) ||
-      normalizedType.endsWith("_range")
-    ) {
-      return {
-        type: esType,
-        nativeType: esType,
-        category: "json",
-        filterable: true,
-      };
-    }
-
-    if (sampled) {
-      return {
-        type: esType,
-        nativeType: esType,
-        category: sampled.category,
-        filterable: this.isFilterableCategory(sampled.category),
-      };
-    }
-
-    return {
-      type: esType,
-      nativeType: esType,
-      category: "other",
-      filterable: true,
-    };
-  }
-
-  private isFilterableCategory(category: TypeCategory): boolean {
-    return category !== "spatial";
-  }
-
-  private async readRows(
-    index: string,
-    size: number,
-  ): Promise<Record<string, unknown>[]> {
-    try {
-      const response = await this.requireClient().search({
-        index,
-        size: this.clampSearchSize(size),
-        query: { match_all: {} },
-        sort: ["_doc"],
-      });
-      return this.hitsToRows(
-        response.hits.hits as unknown as Array<Record<string, unknown>>,
-      );
-    } catch {
-      return [];
-    }
+      },
+    ];
   }
 
   private hitsToRows(
     hits: Array<Record<string, unknown>>,
   ): Record<string, unknown>[] {
     return hits.map((hit) => {
-      const source = (hit._source ?? {}) as Record<string, unknown>;
-      return flattenRootRecord({
+      const source = this.normalizeSourceDocument(hit._source);
+      return {
         _id: hit._id,
-        ...source,
-      });
+        _source: JSON.stringify(source),
+      };
     });
   }
 
@@ -1876,6 +1412,55 @@ export class ElasticsearchDriver implements IDBDriver {
   ): Record<string, unknown> {
     const { _id: _ignored, ...rest } = document;
     return rest;
+  }
+
+  private resolveDocumentForMutation(
+    record: Record<string, unknown>,
+    changes?: Record<string, unknown>,
+  ): Record<string, unknown> {
+    if (
+      changes &&
+      Object.hasOwn(changes, "_source") &&
+      Object.keys(changes).some((key) => key !== "_source")
+    ) {
+      throw new Error(
+        'Elasticsearch updates cannot mix "_source" with other changed fields.',
+      );
+    }
+
+    if (Object.hasOwn(record, "_source")) {
+      return this.normalizeSourceDocument(record._source);
+    }
+
+    return this.stripDocumentId(record);
+  }
+
+  private normalizeSourceDocument(source: unknown): Record<string, unknown> {
+    if (typeof source === "string") {
+      const trimmed = source.trim();
+      if (!trimmed) {
+        return {};
+      }
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error(
+          'Elasticsearch field "_source" must be a valid JSON object.',
+        );
+      }
+      return parsed as Record<string, unknown>;
+    }
+
+    if (!source) {
+      return {};
+    }
+
+    if (typeof source !== "object" || Array.isArray(source)) {
+      throw new Error(
+        'Elasticsearch field "_source" must be a valid JSON object.',
+      );
+    }
+
+    return source as Record<string, unknown>;
   }
 
   private formatRestCommand(

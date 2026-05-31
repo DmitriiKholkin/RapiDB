@@ -1472,10 +1472,10 @@ export class ConnectionProvider
       ];
       node.tooltip = new vscode.MarkdownString(tooltipLines.join("\n\n"));
     } else if (config.type === "elasticsearch") {
-      const authMode = config.apiKey
-        ? "api key"
-        : config.username
-          ? "basic"
+      const authMode = config.username
+        ? "basic"
+        : config.apiKey
+          ? "api key"
           : "none";
       const tooltipLines = [
         `**${config.name}**`,
