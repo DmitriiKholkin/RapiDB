@@ -53,6 +53,14 @@ function formatJsonText(text: string): string | null {
   }
 }
 
+function formatStructuredJsonValue(value: unknown): string | null {
+  if (Array.isArray(value) || (value !== null && typeof value === "object")) {
+    return JSON.stringify(value, null, 2);
+  }
+
+  return null;
+}
+
 function isXmlLikeText(text: string, nativeType: string): boolean {
   const trimmedNativeType = nativeType.trim().toLowerCase();
   const trimmed = text.trim();
@@ -157,20 +165,15 @@ export function getStructuredCellDialogValue(
     };
   }
 
-  if (structuredKind !== "xml" && Array.isArray(value)) {
-    return {
-      kind: structuredKind,
-      language: "json",
-      formattedText: JSON.stringify(value, null, 2),
-    };
-  }
-
-  if (structuredKind !== "xml" && typeof value === "object") {
-    return {
-      kind: structuredKind,
-      language: "json",
-      formattedText: JSON.stringify(value, null, 2),
-    };
+  if (structuredKind !== "xml") {
+    const formattedStructuredValue = formatStructuredJsonValue(value);
+    if (formattedStructuredValue !== null) {
+      return {
+        kind: structuredKind,
+        language: "json",
+        formattedText: formattedStructuredValue,
+      };
+    }
   }
 
   const rawText = formatScalarValueForDisplay(value);

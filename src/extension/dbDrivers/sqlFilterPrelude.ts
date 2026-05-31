@@ -30,24 +30,26 @@ export function createSqlFilterPreamble({
   quoteIdentifier,
 }: SqlFilterPreambleInput): SqlFilterPreambleResult {
   const columnSql = quoteIdentifier(column.name);
-  if (operator === "is_null") {
-    return {
-      kind: "resolved",
-      condition: { sql: `${columnSql} IS NULL`, params: [] },
-    };
+  switch (operator) {
+    case "is_null":
+      return {
+        kind: "resolved",
+        condition: { sql: `${columnSql} IS NULL`, params: [] },
+      };
+    case "is_not_null":
+      return {
+        kind: "resolved",
+        condition: { sql: `${columnSql} IS NOT NULL`, params: [] },
+      };
+    default:
+      if (!column.filterable || value === undefined) {
+        return null;
+      }
+
+      return {
+        kind: "ready",
+        columnSql,
+        value: typeof value === "string" ? value.trim() : value,
+      };
   }
-  if (operator === "is_not_null") {
-    return {
-      kind: "resolved",
-      condition: { sql: `${columnSql} IS NOT NULL`, params: [] },
-    };
-  }
-  if (!column.filterable || value === undefined) {
-    return null;
-  }
-  return {
-    kind: "ready",
-    columnSql,
-    value: typeof value === "string" ? value.trim() : value,
-  };
 }

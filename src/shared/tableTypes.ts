@@ -493,6 +493,14 @@ function normalizeFilterValue(rawValue: string): string | null {
   return value === "" ? null : value;
 }
 
+function normalizeBetweenFilterValues(
+  rawValues: readonly [string, string],
+): [string, string] | null {
+  const start = normalizeFilterValue(rawValues[0]);
+  const end = normalizeFilterValue(rawValues[1]);
+  return start && end ? [start, end] : null;
+}
+
 export function buildFilterExpressionFromDraft(
   column: FilterDraftColumn,
   draft: FilterDraft | null | undefined,
@@ -510,14 +518,13 @@ export function buildFilterExpressionFromDraft(
         return null;
       }
 
-      const start = normalizeFilterValue(draft.value[0]);
-      const end = normalizeFilterValue(draft.value[1]);
-      if (!start || !end) return null;
+      const value = normalizeBetweenFilterValues(draft.value);
+      if (!value) return null;
 
       return {
         column: column.name,
         operator: "between",
-        value: [start, end],
+        value,
       };
     }
     default: {
@@ -616,20 +623,18 @@ export function coerceFilterExpressions(
           typeof value[0] === "string" &&
           typeof value[1] === "string"
         ) {
-          const start = normalizeFilterValue(value[0]);
-          const end = normalizeFilterValue(value[1]);
-          if (!start || !end) {
-            return [];
-          }
-
-          return [
-            {
-              column: columnName,
-              operator,
-              value: [start, end],
-            },
-          ];
+          const normalized = normalizeBetweenFilterValues([value[0], value[1]]);
+          return normalized
+            ? [
+                {
+                  column: columnName,
+                  operator,
+                  value: normalized,
+                },
+              ]
+            : [];
         }
+
         return [];
       }
 
@@ -639,17 +644,15 @@ export function coerceFilterExpressions(
         typeof filter.value === "string"
       ) {
         const value = normalizeFilterValue(filter.value);
-        if (!value) {
-          return [];
-        }
-
-        return [
-          {
-            column: columnName,
-            operator: operator as ScalarFilterOperator,
-            value,
-          },
-        ];
+        return value
+          ? [
+              {
+                column: columnName,
+                operator: operator as ScalarFilterOperator,
+                value,
+              },
+            ]
+          : [];
       }
 
       return [];

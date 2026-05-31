@@ -119,6 +119,17 @@ export function useTableDataController({
   const onRowsCommittedRef = useRef(onRowsCommitted);
   const tableInitSignatureRef = useRef<string | null>(null);
 
+  const syncRequestedFilterState = useCallback(
+    (nextDrafts: FilterDraftMap) => {
+      setFilterError(null);
+      setRequestedPage(1);
+      setDebouncedFilterDrafts(
+        buildActiveFilterDrafts(columnsRef.current, nextDrafts),
+      );
+    },
+    [columnsRef],
+  );
+
   initialPageSizeRef.current = initialPageSize;
   requestedSortRef.current = requestedSort;
   hasCommittedDataRef.current = hasCommittedData;
@@ -388,15 +399,13 @@ export function useTableDataController({
   const handleSort = useCallback((column: string) => {
     setRequestedPage(1);
     setRequestedSort((previousSort) => {
-      if (previousSort?.column === column) {
-        if (previousSort.direction === "asc") {
-          return { column, direction: "desc" };
-        }
-
-        return null;
+      if (previousSort?.column !== column) {
+        return { column, direction: "asc" };
       }
 
-      return { column, direction: "asc" };
+      return previousSort.direction === "asc"
+        ? { column, direction: "desc" }
+        : null;
     });
   }, []);
 
@@ -424,17 +433,13 @@ export function useTableDataController({
         }
 
         if (options?.applyImmediately) {
-          setFilterError(null);
-          setRequestedPage(1);
-          setDebouncedFilterDrafts(
-            buildActiveFilterDrafts(columnsRef.current, nextDrafts),
-          );
+          syncRequestedFilterState(nextDrafts);
         }
 
         return nextDrafts;
       });
     },
-    [columnsRef],
+    [syncRequestedFilterState],
   );
 
   return {

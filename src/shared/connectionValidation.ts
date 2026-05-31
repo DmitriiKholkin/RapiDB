@@ -62,24 +62,40 @@ export const CONNECTION_VALIDATION_POLICY: Readonly<
 };
 
 function hasValue(value: unknown): boolean {
-  if (typeof value === "string") {
-    return value.trim().length > 0;
-  }
-
-  return value !== undefined && value !== null;
+  return typeof value === "string"
+    ? value.trim().length > 0
+    : value !== undefined && value !== null;
 }
 
 function isSatisfied(
   config: Partial<ConnectionConfig>,
   fields: readonly (keyof ConnectionConfig)[],
 ): boolean {
-  for (const field of fields) {
-    if (hasValue(config[field])) {
-      return true;
-    }
-  }
+  return fields.some((field) => hasValue(config[field]));
+}
 
-  return false;
+function createValidationIssue(
+  code: ConnectionValidationIssue["code"],
+  fields: string[],
+  message: string,
+): ConnectionValidationIssue {
+  return { code, fields, message };
+}
+
+function createRequiredIssue(field: string): ConnectionValidationIssue {
+  return createValidationIssue(
+    "required",
+    [field],
+    `Field "${field}" is required.`,
+  );
+}
+
+function createAnyOfIssue(group: readonly string[]): ConnectionValidationIssue {
+  return createValidationIssue(
+    "anyOf",
+    [...group],
+    `At least one of "${group.join('", "')}" is required.`,
+  );
 }
 
 function buildValidationMessage(
@@ -89,20 +105,24 @@ function buildValidationMessage(
 ): string {
   const parts: string[] = [];
 
+  const appendMessages = (messages: readonly string[]) => {
+    parts.push(...messages);
+  };
+
   if (missingRequired.length > 0) {
-    parts.push(`Missing required fields: ${missingRequired.join(", ")}.`);
+    appendMessages([`Missing required fields: ${missingRequired.join(", ")}.`]);
   }
 
   if (missingAnyOf.length > 0) {
-    parts.push(
-      ...missingAnyOf.map(
+    appendMessages(
+      missingAnyOf.map(
         (group) => `Provide at least one of: ${group.join(" | ")}.`,
       ),
     );
   }
 
   if (invalidIssues.length > 0) {
-    parts.push(...invalidIssues.map((issue) => issue.message));
+    appendMessages(invalidIssues.map((issue) => issue.message));
   }
 
   return parts.join(" ");
@@ -181,13 +201,20 @@ function buildSshValidationIssues(
   }
 
   const issues: ConnectionValidationIssue[] = [];
+  const pushIssue = (
+    code: ConnectionValidationIssue["code"],
+    fields: string[],
+    message: string,
+  ) => {
+    issues.push(createValidationIssue(code, fields, message));
+  };
 
   if (config.type === "sqlite") {
-    issues.push({
-      code: "invalid",
-      fields: ["sshEnabled"],
-      message: "SSH is not supported for sqlite connections.",
-    });
+    pushIssue(
+      "invalid",
+      ["sshEnabled"],
+      "SSH is not supported for sqlite connections.",
+    );
     return issues;
   }
 
@@ -195,36 +222,35 @@ function buildSshValidationIssues(
     ...collectConditionalIssues(config, [
       {
         when: (candidate) => !isPositiveInteger(candidate.sshPort),
-        issue: {
-          code: "required",
-          fields: ["sshPort"],
-          message:
-            'Field "sshPort" is required and must be a positive integer.',
-        },
+        issue: createValidationIssue(
+          "required",
+          ["sshPort"],
+          'Field "sshPort" is required and must be a positive integer.',
+        ),
       },
       {
         when: (candidate) => !hasValue(candidate.sshHost),
-        issue: {
-          code: "required",
-          fields: ["sshHost"],
-          message: 'Field "sshHost" is required when SSH is enabled.',
-        },
+        issue: createValidationIssue(
+          "required",
+          ["sshHost"],
+          'Field "sshHost" is required when SSH is enabled.',
+        ),
       },
       {
         when: (candidate) => !hasValue(candidate.sshUsername),
-        issue: {
-          code: "required",
-          fields: ["sshUsername"],
-          message: 'Field "sshUsername" is required when SSH is enabled.',
-        },
+        issue: createValidationIssue(
+          "required",
+          ["sshUsername"],
+          'Field "sshUsername" is required when SSH is enabled.',
+        ),
       },
       {
         when: (candidate) => !hasValue(candidate.sshAuthMethod),
-        issue: {
-          code: "required",
-          fields: ["sshAuthMethod"],
-          message: 'Field "sshAuthMethod" is required when SSH is enabled.',
-        },
+        issue: createValidationIssue(
+          "required",
+          ["sshAuthMethod"],
+          'Field "sshAuthMethod" is required when SSH is enabled.',
+        ),
       },
     ]),
   );
@@ -232,20 +258,18 @@ function buildSshValidationIssues(
   const hostVerificationMode = resolveSshHostVerificationMode(config);
   if (!hasValue(config.sshHostFingerprintSha256)) {
     if (hostVerificationMode === "manual") {
-      issues.push({
-        code: "required",
-        fields: ["sshHostFingerprintSha256"],
-        message:
-          'Field "sshHostFingerprintSha256" is required when SSH host verification is manual.',
-      });
+      pushIssue(
+        "required",
+        ["sshHostFingerprintSha256"],
+        'Field "sshHostFingerprintSha256" is required when SSH host verification is manual.',
+      );
     }
   } else if (!isSshFingerprintSha256(config.sshHostFingerprintSha256)) {
-    issues.push({
-      code: "invalid",
-      fields: ["sshHostFingerprintSha256"],
-      message:
-        'Field "sshHostFingerprintSha256" must use the OpenSSH SHA256 fingerprint format.',
-    });
+    pushIssue(
+      "invalid",
+      ["sshHostFingerprintSha256"],
+      'Field "sshHostFingerprintSha256" must use the OpenSSH SHA256 fingerprint format.',
+    );
   }
 
   issues.push(
@@ -254,22 +278,21 @@ function buildSshValidationIssues(
         when: (candidate) =>
           candidate.sshAuthMethod === "password" &&
           !hasValue(candidate.sshPassword),
-        issue: {
-          code: "required",
-          fields: ["sshPassword"],
-          message: 'Field "sshPassword" is required for password SSH auth.',
-        },
+        issue: createValidationIssue(
+          "required",
+          ["sshPassword"],
+          'Field "sshPassword" is required for password SSH auth.',
+        ),
       },
       {
         when: (candidate) =>
           candidate.sshAuthMethod === "privateKey" &&
           !hasValue(candidate.sshPrivateKey),
-        issue: {
-          code: "required",
-          fields: ["sshPrivateKey"],
-          message:
-            'Field "sshPrivateKey" is required for private key SSH auth.',
-        },
+        issue: createValidationIssue(
+          "required",
+          ["sshPrivateKey"],
+          'Field "sshPrivateKey" is required for private key SSH auth.',
+        ),
       },
     ]),
   );
@@ -281,27 +304,27 @@ function buildSshValidationIssues(
         : config.uri;
 
     if (hasMongoSrvUri(mongoUri)) {
-      issues.push({
-        code: "invalid",
-        fields: ["connectionUri", "uri"],
-        message: "MongoDB over SSH does not support mongodb+srv URIs in v1.",
-      });
+      pushIssue(
+        "invalid",
+        ["connectionUri", "uri"],
+        "MongoDB over SSH does not support mongodb+srv URIs in v1.",
+      );
     }
 
     if (hasMongoMultiHostUri(mongoUri)) {
-      issues.push({
-        code: "invalid",
-        fields: ["connectionUri", "uri"],
-        message: "MongoDB over SSH supports only single-host URIs in v1.",
-      });
+      pushIssue(
+        "invalid",
+        ["connectionUri", "uri"],
+        "MongoDB over SSH supports only single-host URIs in v1.",
+      );
     }
 
     if (config.directConnection === false) {
-      issues.push({
-        code: "invalid",
-        fields: ["directConnection"],
-        message: "MongoDB over SSH requires a direct connection in v1.",
-      });
+      pushIssue(
+        "invalid",
+        ["directConnection"],
+        "MongoDB over SSH requires a direct connection in v1.",
+      );
     }
   }
 
@@ -376,16 +399,8 @@ export function validateConnectionConfig(
       : [];
 
   const issues: ConnectionValidationIssue[] = [
-    ...missingRequired.map((field) => ({
-      code: "required" as const,
-      fields: [field],
-      message: `Field "${field}" is required.`,
-    })),
-    ...missingAnyOf.map((group) => ({
-      code: "anyOf" as const,
-      fields: group,
-      message: `At least one of "${group.join('", "')}" is required.`,
-    })),
+    ...missingRequired.map(createRequiredIssue),
+    ...missingAnyOf.map(createAnyOfIssue),
     ...buildSqliteValidationIssues(config),
     ...buildSshValidationIssues(config),
   ];
