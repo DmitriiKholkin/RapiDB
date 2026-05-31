@@ -20,6 +20,11 @@ type ValidationPolicy = {
   anyOf?: readonly (readonly (keyof ConnectionConfig)[])[];
 };
 
+type ConditionalIssueRule = {
+  when: (config: Partial<ConnectionConfig>) => boolean;
+  issue: ConnectionValidationIssue;
+};
+
 export const CONNECTION_VALIDATION_POLICY: Readonly<
   Record<ConnectionType, ValidationPolicy>
 > = {
@@ -161,6 +166,13 @@ function hasMongoMultiHostUri(value: string | undefined): boolean {
   return hosts.includes(",");
 }
 
+function collectConditionalIssues(
+  config: Partial<ConnectionConfig>,
+  rules: readonly ConditionalIssueRule[],
+): ConnectionValidationIssue[] {
+  return rules.filter((rule) => rule.when(config)).map((rule) => rule.issue);
+}
+
 function buildSshValidationIssues(
   config: Partial<ConnectionConfig>,
 ): ConnectionValidationIssue[] {
@@ -179,37 +191,43 @@ function buildSshValidationIssues(
     return issues;
   }
 
-  if (!isPositiveInteger(config.sshPort)) {
-    issues.push({
-      code: "required",
-      fields: ["sshPort"],
-      message: 'Field "sshPort" is required and must be a positive integer.',
-    });
-  }
-
-  if (!hasValue(config.sshHost)) {
-    issues.push({
-      code: "required",
-      fields: ["sshHost"],
-      message: 'Field "sshHost" is required when SSH is enabled.',
-    });
-  }
-
-  if (!hasValue(config.sshUsername)) {
-    issues.push({
-      code: "required",
-      fields: ["sshUsername"],
-      message: 'Field "sshUsername" is required when SSH is enabled.',
-    });
-  }
-
-  if (!hasValue(config.sshAuthMethod)) {
-    issues.push({
-      code: "required",
-      fields: ["sshAuthMethod"],
-      message: 'Field "sshAuthMethod" is required when SSH is enabled.',
-    });
-  }
+  issues.push(
+    ...collectConditionalIssues(config, [
+      {
+        when: (candidate) => !isPositiveInteger(candidate.sshPort),
+        issue: {
+          code: "required",
+          fields: ["sshPort"],
+          message:
+            'Field "sshPort" is required and must be a positive integer.',
+        },
+      },
+      {
+        when: (candidate) => !hasValue(candidate.sshHost),
+        issue: {
+          code: "required",
+          fields: ["sshHost"],
+          message: 'Field "sshHost" is required when SSH is enabled.',
+        },
+      },
+      {
+        when: (candidate) => !hasValue(candidate.sshUsername),
+        issue: {
+          code: "required",
+          fields: ["sshUsername"],
+          message: 'Field "sshUsername" is required when SSH is enabled.',
+        },
+      },
+      {
+        when: (candidate) => !hasValue(candidate.sshAuthMethod),
+        issue: {
+          code: "required",
+          fields: ["sshAuthMethod"],
+          message: 'Field "sshAuthMethod" is required when SSH is enabled.',
+        },
+      },
+    ]),
+  );
 
   const hostVerificationMode = resolveSshHostVerificationMode(config);
   if (!hasValue(config.sshHostFingerprintSha256)) {
@@ -230,23 +248,31 @@ function buildSshValidationIssues(
     });
   }
 
-  if (config.sshAuthMethod === "password") {
-    if (!hasValue(config.sshPassword)) {
-      issues.push({
-        code: "required",
-        fields: ["sshPassword"],
-        message: 'Field "sshPassword" is required for password SSH auth.',
-      });
-    }
-  } else if (config.sshAuthMethod === "privateKey") {
-    if (!hasValue(config.sshPrivateKey)) {
-      issues.push({
-        code: "required",
-        fields: ["sshPrivateKey"],
-        message: 'Field "sshPrivateKey" is required for private key SSH auth.',
-      });
-    }
-  }
+  issues.push(
+    ...collectConditionalIssues(config, [
+      {
+        when: (candidate) =>
+          candidate.sshAuthMethod === "password" &&
+          !hasValue(candidate.sshPassword),
+        issue: {
+          code: "required",
+          fields: ["sshPassword"],
+          message: 'Field "sshPassword" is required for password SSH auth.',
+        },
+      },
+      {
+        when: (candidate) =>
+          candidate.sshAuthMethod === "privateKey" &&
+          !hasValue(candidate.sshPrivateKey),
+        issue: {
+          code: "required",
+          fields: ["sshPrivateKey"],
+          message:
+            'Field "sshPrivateKey" is required for private key SSH auth.',
+        },
+      },
+    ]),
+  );
 
   if (config.type === "mongodb") {
     const mongoUri =

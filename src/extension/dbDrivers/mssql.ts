@@ -248,6 +248,37 @@ function formatMssqlOffsetMinutes(offsetMinutes: number): string {
   return `${sign}${formatTwoDigits(hours)}:${formatTwoDigits(minutes)}`;
 }
 
+function formatMssqlFractionFromMilliseconds(value: number): string {
+  return value > 0
+    ? `.${String(value).padStart(3, "0").replace(/0+$/, "")}`
+    : "";
+}
+
+function formatMssqlDateParts(
+  year: number,
+  month: number,
+  day: number,
+): string {
+  return `${formatMssqlYear(year)}-${formatTwoDigits(month)}-${formatTwoDigits(day)}`;
+}
+
+function formatMssqlTimeParts(
+  hours: number,
+  minutes: number,
+  seconds: number,
+  fraction = "",
+): string {
+  return `${formatTwoDigits(hours)}:${formatTwoDigits(minutes)}:${formatTwoDigits(seconds)}${fraction}`;
+}
+
+function formatMssqlDateTimeParts(
+  date: { year: number; month: number; day: number },
+  time: { hours: number; minutes: number; seconds: number; fraction?: string },
+  offset?: string,
+): string {
+  return `${formatMssqlDateParts(date.year, date.month, date.day)} ${formatMssqlTimeParts(time.hours, time.minutes, time.seconds, time.fraction ?? "")}${offset ?? ""}`;
+}
+
 function canonicalizeMssqlTemporalPersistedEditValue(
   value: unknown,
   baseType: string,
@@ -275,24 +306,56 @@ function canonicalizeMssqlTemporalPersistedEditValue(
   if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
     return null;
   }
-  const ms = value.getMilliseconds();
-  const frac =
-    ms > 0 ? `.${String(ms).padStart(3, "0").replace(/0+$/, "")}` : "";
+  const fraction = formatMssqlFractionFromMilliseconds(value.getMilliseconds());
   if (baseType === "date") {
-    return `${formatMssqlYear(value.getFullYear())}-${formatTwoDigits(value.getMonth() + 1)}-${formatTwoDigits(value.getDate())}`;
+    return formatMssqlDateParts(
+      value.getFullYear(),
+      value.getMonth() + 1,
+      value.getDate(),
+    );
   }
   if (baseType === "time") {
-    return `${formatTwoDigits(value.getHours())}:${formatTwoDigits(value.getMinutes())}:${formatTwoDigits(value.getSeconds())}${frac}`;
+    return formatMssqlTimeParts(
+      value.getHours(),
+      value.getMinutes(),
+      value.getSeconds(),
+      fraction,
+    );
   }
   if (baseType === "datetimeoffset") {
-    return `${formatMssqlYear(value.getFullYear())}-${formatTwoDigits(value.getMonth() + 1)}-${formatTwoDigits(value.getDate())} ${formatTwoDigits(value.getHours())}:${formatTwoDigits(value.getMinutes())}:${formatTwoDigits(value.getSeconds())}${frac}${formatMssqlOffsetMinutes(-value.getTimezoneOffset())}`;
+    return formatMssqlDateTimeParts(
+      {
+        year: value.getFullYear(),
+        month: value.getMonth() + 1,
+        day: value.getDate(),
+      },
+      {
+        hours: value.getHours(),
+        minutes: value.getMinutes(),
+        seconds: value.getSeconds(),
+        fraction,
+      },
+      formatMssqlOffsetMinutes(-value.getTimezoneOffset()),
+    );
   }
   if (
     baseType === "datetime" ||
     baseType === "datetime2" ||
     baseType === "smalldatetime"
   ) {
-    return `${formatMssqlYear(value.getFullYear())}-${formatTwoDigits(value.getMonth() + 1)}-${formatTwoDigits(value.getDate())} ${formatTwoDigits(value.getHours())}:${formatTwoDigits(value.getMinutes())}:${formatTwoDigits(value.getSeconds())}${frac}`;
+    return formatMssqlDateTimeParts(
+      {
+        year: value.getFullYear(),
+        month: value.getMonth() + 1,
+        day: value.getDate(),
+      },
+      {
+        hours: value.getHours(),
+        minutes: value.getMinutes(),
+        seconds: value.getSeconds(),
+        fraction,
+      },
+    );
   }
   return null;
 }
@@ -363,10 +426,20 @@ function readTediousDateTimeOffsetValue(
   const date = new Date(Date.UTC(2000, 0, Number(localDays) - 730118));
   const fractionDigits = fractionTicks.toString().padStart(7, "0");
   const fraction = scale > 0 ? `.${fractionDigits.slice(0, scale)}` : "";
-  const formatted =
-    `${formatMssqlYear(date.getUTCFullYear())}-${formatTwoDigits(date.getUTCMonth() + 1)}-${formatTwoDigits(date.getUTCDate())} ` +
-    `${formatTwoDigits(hours)}:${formatTwoDigits(minutes)}:${formatTwoDigits(seconds)}${fraction}` +
-    formatMssqlOffsetMinutes(timezoneOffsetMinutes);
+  const formatted = formatMssqlDateTimeParts(
+    {
+      year: date.getUTCFullYear(),
+      month: date.getUTCMonth() + 1,
+      day: date.getUTCDate(),
+    },
+    {
+      hours,
+      minutes,
+      seconds,
+      fraction,
+    },
+    formatMssqlOffsetMinutes(timezoneOffsetMinutes),
+  );
   return new helpers.Result(formatted, offset);
 }
 
@@ -393,7 +466,11 @@ function readTediousDateValue(
   offset += 3;
   const date = new Date(Date.UTC(2000, 0, days - 730118));
   return new helpers.Result(
-    `${formatMssqlYear(date.getUTCFullYear())}-${formatTwoDigits(date.getUTCMonth() + 1)}-${formatTwoDigits(date.getUTCDate())}`,
+    formatMssqlDateParts(
+      date.getUTCFullYear(),
+      date.getUTCMonth() + 1,
+      date.getUTCDate(),
+    ),
     offset,
   );
 }
@@ -428,7 +505,7 @@ function formatTicksAsTimeString(ticks: bigint, scale: number): string {
   const seconds = Number(secondsOfDay % 60n);
   const fractionDigits = fractionTicks.toString().padStart(7, "0");
   const fraction = scale > 0 ? `.${fractionDigits.slice(0, scale)}` : "";
-  return `${formatTwoDigits(hours)}:${formatTwoDigits(minutes)}:${formatTwoDigits(seconds)}${fraction}`;
+  return formatMssqlTimeParts(hours, minutes, seconds, fraction);
 }
 
 function readTediousTimeValue(
@@ -490,9 +567,14 @@ function readTediousDateTime2Value(
   offset += 3;
 
   const date = new Date(Date.UTC(2000, 0, days - 730118));
-  const formattedDate = `${formatMssqlYear(date.getUTCFullYear())}-${formatTwoDigits(date.getUTCMonth() + 1)}-${formatTwoDigits(date.getUTCDate())}`;
-  const formattedTime = formatTicksAsTimeString(timeParsed.ticks, scale);
-  return new helpers.Result(`${formattedDate} ${formattedTime}`, offset);
+  return new helpers.Result(
+    `${formatMssqlDateParts(
+      date.getUTCFullYear(),
+      date.getUTCMonth() + 1,
+      date.getUTCDate(),
+    )} ${formatTicksAsTimeString(timeParsed.ticks, scale)}`,
+    offset,
+  );
 }
 
 function formatScaledBigInt(value: bigint, scale: number): string {

@@ -30,6 +30,17 @@ function redactCredentialBearingUri(uri: string): string {
   return uri.replace(/^([a-z][a-z\d+.-]*:\/\/)([^@/?#\s]+)@/i, "$1");
 }
 
+export function sanitizeCredentialBearingUri(
+  value: string | undefined,
+): string | undefined {
+  const normalized = trimOptionalSecretValue(value);
+  if (!normalized) {
+    return normalized;
+  }
+
+  return redactCredentialBearingUri(normalized);
+}
+
 export function extractCredentialBearingUriSecret(
   value: string | undefined,
 ): string | undefined {
@@ -43,18 +54,7 @@ export function extractCredentialBearingUriSecret(
     : undefined;
 }
 
-function sanitizeUriForPersistence(
-  value: string | undefined,
-): string | undefined {
-  const normalized = trimOptionalSecretValue(value);
-  if (!normalized) {
-    return normalized;
-  }
-
-  return redactCredentialBearingUri(normalized);
-}
-
-function resolvePersistedUriSecret(
+export function resolvePersistedCredentialBearingUriSecret(
   currentValue: string | undefined,
   previousSecret: string | undefined,
 ): string | undefined {
@@ -68,7 +68,7 @@ function resolvePersistedUriSecret(
     return undefined;
   }
 
-  const previousRedacted = sanitizeUriForPersistence(previousSecret);
+  const previousRedacted = sanitizeCredentialBearingUri(previousSecret);
   return previousRedacted === normalizedCurrent ? previousSecret : undefined;
 }
 
@@ -126,16 +126,19 @@ function extractConnectionSecrets(
         ? (trimOptionalSecretValue(config.awsSessionToken) ??
           previousSecrets?.awsSessionToken)
         : undefined,
-    connectionUri: resolvePersistedUriSecret(
+    connectionUri: resolvePersistedCredentialBearingUriSecret(
       config.connectionUri,
       previousSecrets?.connectionUri,
     ),
-    uri: resolvePersistedUriSecret(config.uri, previousSecrets?.uri),
-    endpoint: resolvePersistedUriSecret(
+    uri: resolvePersistedCredentialBearingUriSecret(
+      config.uri,
+      previousSecrets?.uri,
+    ),
+    endpoint: resolvePersistedCredentialBearingUriSecret(
       config.endpoint,
       previousSecrets?.endpoint,
     ),
-    awsEndpoint: resolvePersistedUriSecret(
+    awsEndpoint: resolvePersistedCredentialBearingUriSecret(
       config.awsEndpoint,
       previousSecrets?.awsEndpoint,
     ),
@@ -191,10 +194,10 @@ export function sanitizePersistedConnectionConfig(
 
   return {
     ...rest,
-    connectionUri: sanitizeUriForPersistence(rawConnectionUri),
-    uri: sanitizeUriForPersistence(rawUri),
-    endpoint: sanitizeUriForPersistence(rawEndpoint),
-    awsEndpoint: sanitizeUriForPersistence(rawAwsEndpoint),
+    connectionUri: sanitizeCredentialBearingUri(rawConnectionUri),
+    uri: sanitizeCredentialBearingUri(rawUri),
+    endpoint: sanitizeCredentialBearingUri(rawEndpoint),
+    awsEndpoint: sanitizeCredentialBearingUri(rawAwsEndpoint),
     useSecretStorage: true,
   };
 }

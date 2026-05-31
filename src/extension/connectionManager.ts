@@ -1711,6 +1711,89 @@ export class ConnectionManager
     await this.saveConnections(connections);
     this._onDidChangeConnections.fire();
   }
+
+  private async resolveValidatedConnectionConfig(
+    id: string,
+    fallbackConfig: ConnectionConfig,
+    connectEpoch: number,
+  ): Promise<ConnectionConfig | null> {
+    await this._migrateSingleConnectionSecretsIfNeeded(fallbackConfig);
+
+    if (this._isStaleConnectEpoch(id, connectEpoch)) {
+      return null;
+    }
+
+    const liveConfig = this.getConnection(id) ?? fallbackConfig;
+    const fullConfig = await this._hydratePassword(liveConfig);
+    const validation = this.validationService.validate(fullConfig);
+    if (!validation.valid) {
+      throw new Error(validation.message ?? "Connection settings are invalid.");
+    }
+
+    return fullConfig;
+  }
+
+  private async connectPreparedDriver(
+    id: string,
+    config: ConnectionConfig,
+  ): Promise<{
+    driver: IDBDriver;
+    runtime?: SshRuntime;
+  }> {
+    const prepared = await this.prepareDriverConfig(config);
+    if (prepared.runtime) {
+      await this.persistTrustedSshFingerprintIfNeeded(
+        id,
+        prepared.runtime.verifiedFingerprintSha256,
+      );
+    }
+
+    const driver = this.createDriver(prepared.config);
+    try {
+      await driver.connect();
+      return { driver, runtime: prepared.runtime };
+    } catch (err) {
+      await this.disposeUnboundConnectionResources(driver, prepared.runtime);
+      throw err;
+    }
+  }
+
+  private async disposeUnboundConnectionResources(
+    driver?: IDBDriver,
+    runtime?: SshRuntime,
+  ): Promise<void> {
+    if (driver) {
+      try {
+        await driver.disconnect();
+      } catch {}
+    }
+
+    if (runtime) {
+      await runtime.dispose().catch(() => undefined);
+    }
+  }
+
+  private finalizeConnectAttempt(id: string, connectEpoch: number): void {
+    const pendingAttempt = this._connectingMap.get(id);
+    if (pendingAttempt?.epoch === connectEpoch) {
+      this._connectingMap.delete(id);
+    }
+    this._onDidChangeConnections.fire();
+  }
+
+  private async disconnectRegisteredDriver(id: string): Promise<boolean> {
+    const hadDriver = this.driverMap.has(id);
+    const driver = this.driverMap.get(id);
+    if (driver) {
+      try {
+        await driver.disconnect();
+      } catch {}
+    }
+
+    await this._cleanupConnectionRuntimeState(id);
+    return hadDriver;
+  }
+
   beginConnect(id: string): ConnectAttempt {
     this._assertNotDisposed();
 
@@ -1734,7 +1817,6 @@ export class ConnectionManager
     });
     this._onDidChangeConnections.fire();
     void (async () => {
-      let pendingRuntime: SshRuntime | undefined;
       try {
         if (this.driverMap.has(id)) {
           await this.disconnectFrom(id);
@@ -1744,74 +1826,38 @@ export class ConnectionManager
           throw new Error(`[RapiDB] Connection "${id}" not found`);
         }
 
-        await this._migrateSingleConnectionSecretsIfNeeded(config);
-
-        if (this._isStaleConnectEpoch(id, connectEpoch)) {
+        const fullConfig = await this.resolveValidatedConnectionConfig(
+          id,
+          config,
+          connectEpoch,
+        );
+        if (!fullConfig) {
           resolveAttempt();
           return;
         }
 
-        const liveConfig = this.getConnection(id) ?? config;
-        const fullConfig = await this._hydratePassword(liveConfig);
-        const validation = this.validationService.validate(fullConfig);
-        if (!validation.valid) {
-          throw new Error(
-            validation.message ?? "Connection settings are invalid.",
-          );
-        }
-        const prepared = await this.prepareDriverConfig(fullConfig);
-        pendingRuntime = prepared.runtime;
-        if (pendingRuntime) {
-          await this.persistTrustedSshFingerprintIfNeeded(
-            id,
-            pendingRuntime.verifiedFingerprintSha256,
-          );
-        }
-        const driver = this.createDriver(prepared.config);
-        try {
-          await driver.connect();
-        } catch (err) {
-          try {
-            await driver.disconnect();
-          } catch {}
-          if (pendingRuntime) {
-            await pendingRuntime.dispose().catch(() => undefined);
-            pendingRuntime = undefined;
-          }
-          throw err;
-        }
+        const { driver, runtime } = await this.connectPreparedDriver(
+          id,
+          fullConfig,
+        );
 
         if (this._isStaleConnectEpoch(id, connectEpoch)) {
-          try {
-            await driver.disconnect();
-          } catch {}
-          if (pendingRuntime) {
-            await pendingRuntime.dispose().catch(() => undefined);
-            pendingRuntime = undefined;
-          }
+          await this.disposeUnboundConnectionResources(driver, runtime);
           resolveAttempt();
           return;
         }
 
         this.driverMap.set(id, driver);
-        if (pendingRuntime) {
-          this.sshRuntimeMap.set(id, pendingRuntime);
-          pendingRuntime = undefined;
+        if (runtime) {
+          this.sshRuntimeMap.set(id, runtime);
         }
         this._invalidateSchemaState(id);
         this._onDidConnect.fire();
         resolveAttempt();
       } catch (err) {
-        if (pendingRuntime) {
-          await pendingRuntime.dispose().catch(() => undefined);
-        }
         rejectAttempt(err);
       } finally {
-        const pendingAttempt = this._connectingMap.get(id);
-        if (pendingAttempt?.epoch === connectEpoch) {
-          this._connectingMap.delete(id);
-        }
-        this._onDidChangeConnections.fire();
+        this.finalizeConnectAttempt(id, connectEpoch);
       }
     })();
     return { promise: attempt, isNew: true };
@@ -1821,18 +1867,10 @@ export class ConnectionManager
   }
   async disconnectFrom(id: string): Promise<void> {
     this._nextConnectionEpoch(id);
-    const hadDriver = this.driverMap.has(id);
     const hadPendingConnect = this._connectingMap.has(id);
     this._connectingMap.delete(id);
 
-    const driver = this.driverMap.get(id);
-    if (driver) {
-      try {
-        await driver.disconnect();
-      } catch {}
-    }
-
-    await this._cleanupConnectionRuntimeState(id);
+    const hadDriver = await this.disconnectRegisteredDriver(id);
 
     if (hadDriver || hadPendingConnect) {
       this._onDidDisconnect.fire(id);

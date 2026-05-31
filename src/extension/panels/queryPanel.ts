@@ -4,6 +4,7 @@ import type { ConnectionManager } from "../connectionManager";
 import { logErrorWithContext } from "../utils/errorHandling";
 import {
   attachPanelDisposables,
+  attachPanelMessageHandler,
   disposePanelInstances,
 } from "./panelLifecycle";
 import { createPanelWebviewOptions } from "./panelRetentionPolicy";
@@ -69,10 +70,10 @@ export class QueryPanel {
       context,
     );
     this.panel.webview.html = this.buildHtml(context, initialQueryText);
-    this.panel.webview.onDidReceiveMessage(async (message) => {
-      try {
-        await this.controller.handleMessage(message);
-      } catch (error: unknown) {
+    attachPanelMessageHandler(
+      this.panel,
+      (message) => this.controller.handleMessage(message),
+      (error) => {
         const normalized = logErrorWithContext(
           "QueryPanel unhandled error",
           error,
@@ -80,8 +81,8 @@ export class QueryPanel {
         vscode.window.showErrorMessage(
           `[RapiDB] Unexpected error: ${normalized.message}`,
         );
-      }
-    });
+      },
+    );
 
     const configWatcher = vscode.workspace.onDidChangeConfiguration((event) => {
       if (!event.affectsConfiguration("rapidb.connections")) {

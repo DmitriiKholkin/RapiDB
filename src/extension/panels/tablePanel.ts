@@ -23,7 +23,7 @@ import {
 } from "../utils/exportService";
 import {
   attachConnectionScopedPanelLifecycle,
-  attachPanelDisposables,
+  attachPanelMessageHandler,
   disposePanelInstances,
 } from "./panelLifecycle";
 import { createPanelWebviewOptions } from "./panelRetentionPolicy";
@@ -120,16 +120,19 @@ export class TablePanel {
       this.svc.clearForConnection(connectionId);
     });
 
-    this.panel.webview.onDidReceiveMessage(async (msg) => {
-      try {
-        await this.handleMessage(msg);
-      } catch (err: unknown) {
-        const error = logErrorWithContext("TablePanel unhandled error", err);
-        vscode.window.showErrorMessage(
-          `[RapiDB] Unexpected error: ${error.message}`,
+    attachPanelMessageHandler(
+      this.panel,
+      (message) => this.handleMessage(message),
+      (error) => {
+        const normalized = logErrorWithContext(
+          "TablePanel unhandled error",
+          error,
         );
-      }
-    });
+        vscode.window.showErrorMessage(
+          `[RapiDB] Unexpected error: ${normalized.message}`,
+        );
+      },
+    );
   }
 
   private static panelKey(

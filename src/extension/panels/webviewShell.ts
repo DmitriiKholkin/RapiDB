@@ -16,6 +16,12 @@ interface WebviewShellOptions {
   extraStyles?: string;
 }
 
+export const FULLSCREEN_WEBVIEW_SHELL_LAYOUT = Object.freeze({
+  htmlStyles: "height: 100%; overflow: hidden;",
+  bodyStyles: "height: 100%; overflow: hidden;",
+  rootStyles: "height: 100vh; overflow: hidden;",
+});
+
 interface WebviewResourceOptions {
   context: vscode.ExtensionContext;
   webview: vscode.Webview;

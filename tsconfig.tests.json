@@ -5,21 +5,14 @@
     "moduleResolution": "Bundler",
     "allowImportingTsExtensions": true,
     "allowArbitraryExtensions": true,
-    "lib": [
-      "ES2022",
-      "DOM",
-      "DOM.Iterable"
-    ],
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
     "jsx": "react-jsx",
     "jsxImportSource": "react",
-    "types": [
-      "node",
-      "vitest/globals"
-    ]
+    "types": ["node", "vitest/globals"]
   },
   "include": [
     "tests/**/*.ts",
@@ -30,9 +23,5 @@
     "src/shared/**/*",
     "src/webview/vscode.d.ts"
   ],
-  "exclude": [
-    "node_modules",
-    "dist",
-    "out"
-  ]
+  "exclude": ["node_modules", "dist", "out"]
 }

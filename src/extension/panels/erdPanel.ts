@@ -8,6 +8,7 @@ import {
 } from "../utils/errorHandling";
 import {
   attachConnectionScopedPanelLifecycle,
+  attachPanelMessageHandler,
   disposePanelInstances,
 } from "./panelLifecycle";
 import { createPanelWebviewOptions } from "./panelRetentionPolicy";
@@ -50,10 +51,10 @@ export class ErdPanel {
       ErdPanel.panels.delete(key);
     });
 
-    this.panel.webview.onDidReceiveMessage(async (message) => {
-      try {
-        await this.handleMessage(message);
-      } catch (error: unknown) {
+    attachPanelMessageHandler(
+      this.panel,
+      (message) => this.handleMessage(message),
+      (error) => {
         const normalized = logErrorWithContext(
           "ErdPanel unhandled error",
           error,
@@ -61,8 +62,8 @@ export class ErdPanel {
         vscode.window.showErrorMessage(
           `[RapiDB] Unexpected error: ${normalized.message}`,
         );
-      }
-    });
+      },
+    );
   }
 
   static disposeAll(): void {

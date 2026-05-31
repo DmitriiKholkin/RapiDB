@@ -7,12 +7,19 @@ import {
   parseConnectionFormPanelMessage,
 } from "../../shared/webviewContracts";
 import type { ConnectionConfig, ConnectionManager } from "../connectionManager";
-import { sanitizePersistedConnectionConfig } from "../connectionSecrets";
+import {
+  extractCredentialBearingUriSecret,
+  resolvePersistedCredentialBearingUriSecret,
+  sanitizeCredentialBearingUri,
+  sanitizePersistedConnectionConfig,
+  trimOptionalSecretValue,
+} from "../connectionSecrets";
 import { ConnectionValidationService } from "../services/connectionValidationService";
 import {
   logErrorWithContext,
   normalizeUnknownError,
 } from "../utils/errorHandling";
+import { attachPanelMessageHandler } from "./panelLifecycle";
 import { createPanelWebviewOptions } from "./panelRetentionPolicy";
 import { createWebviewShell } from "./webviewShell";
 
@@ -34,80 +41,25 @@ type StoredConnectionSecrets = {
 const CONNECTION_FORM_RETENTION_MODE = "rehydrate" as const;
 const LAST_SQLITE_DIRECTORY_STATE_KEY = "rapidb.lastSqliteDirectory";
 
-function trimOptionalSecret(value: string | undefined): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
-function redactCredentialBearingUri(uri: string): string {
-  return uri.replace(/^([a-z][a-z\d+.-]*:\/\/)([^@/?#\s]+)@/i, "$1");
-}
-
-function extractCredentialBearingUriSecret(
-  value: string | undefined,
-): string | undefined {
-  const normalized = trimOptionalSecret(value);
-  if (!normalized) {
-    return undefined;
-  }
-
-  return redactCredentialBearingUri(normalized) !== normalized
-    ? normalized
-    : undefined;
-}
-
-function resolvePersistedUriSecret(
-  currentValue: string | undefined,
-  previousSecret: string | undefined,
-): string | undefined {
-  const explicitSecret = extractCredentialBearingUriSecret(currentValue);
-  if (explicitSecret) {
-    return explicitSecret;
-  }
-
-  const normalizedCurrent = trimOptionalSecret(currentValue);
-  if (!normalizedCurrent || !previousSecret) {
-    return undefined;
-  }
-
-  const previousRedacted = trimOptionalSecret(
-    redactCredentialBearingUri(previousSecret),
-  );
-  return previousRedacted === normalizedCurrent ? previousSecret : undefined;
-}
-
-function sanitizeUriForForm(value: string | undefined): string | undefined {
-  const normalized = trimOptionalSecret(value);
-  if (!normalized) {
-    return normalized;
-  }
-
-  return redactCredentialBearingUri(normalized);
-}
-
 function restoreSubmittedUriValue(
   submittedValue: string | undefined,
   storedValue: string | undefined,
   existingValue: string | undefined,
 ): string | undefined {
-  const normalizedSubmitted = trimOptionalSecret(submittedValue);
+  const normalizedSubmitted = trimOptionalSecretValue(submittedValue);
   if (!normalizedSubmitted) {
     return normalizedSubmitted;
   }
 
   for (const candidate of [storedValue, existingValue]) {
-    const normalizedCandidate = trimOptionalSecret(candidate);
+    const normalizedCandidate = trimOptionalSecretValue(candidate);
     if (!normalizedCandidate) {
       continue;
     }
 
     if (
       extractCredentialBearingUriSecret(normalizedCandidate) !== undefined &&
-      sanitizeUriForForm(normalizedCandidate) === normalizedSubmitted
+      sanitizeCredentialBearingUri(normalizedCandidate) === normalizedSubmitted
     ) {
       return normalizedCandidate;
     }
@@ -190,14 +142,14 @@ function shouldUseSecretStorage(payload: ConnectionFormSubmission): boolean {
     payload.type === "dynamodb" ||
     payload.type === "elasticsearch" ||
     payload.useSecretStorage === true ||
-    trimOptionalSecret(payload.password) !== undefined ||
-    trimOptionalSecret(payload.apiKey) !== undefined ||
-    trimOptionalSecret(payload.awsAccessKeyId) !== undefined ||
-    trimOptionalSecret(payload.awsSecretAccessKey) !== undefined ||
-    trimOptionalSecret(payload.awsSessionToken) !== undefined ||
-    trimOptionalSecret(payload.sshPassword) !== undefined ||
-    trimOptionalSecret(payload.sshPrivateKey) !== undefined ||
-    trimOptionalSecret(payload.sshPassphrase) !== undefined ||
+    trimOptionalSecretValue(payload.password) !== undefined ||
+    trimOptionalSecretValue(payload.apiKey) !== undefined ||
+    trimOptionalSecretValue(payload.awsAccessKeyId) !== undefined ||
+    trimOptionalSecretValue(payload.awsSecretAccessKey) !== undefined ||
+    trimOptionalSecretValue(payload.awsSessionToken) !== undefined ||
+    trimOptionalSecretValue(payload.sshPassword) !== undefined ||
+    trimOptionalSecretValue(payload.sshPrivateKey) !== undefined ||
+    trimOptionalSecretValue(payload.sshPassphrase) !== undefined ||
     extractCredentialBearingUriSecret(payload.connectionUri) !== undefined ||
     extractCredentialBearingUriSecret(payload.uri) !== undefined ||
     extractCredentialBearingUriSecret(payload.endpoint) !== undefined ||
@@ -227,10 +179,10 @@ function sanitizeExistingForForm(
 
   return {
     ...rest,
-    connectionUri: sanitizeUriForForm(connectionUri),
-    uri: sanitizeUriForForm(uri),
-    endpoint: sanitizeUriForForm(endpoint),
-    awsEndpoint: sanitizeUriForForm(awsEndpoint),
+    connectionUri: sanitizeCredentialBearingUri(connectionUri),
+    uri: sanitizeCredentialBearingUri(uri),
+    endpoint: sanitizeCredentialBearingUri(endpoint),
+    awsEndpoint: sanitizeCredentialBearingUri(awsEndpoint),
     hasStoredSecret: storedSecrets.password !== undefined || undefined,
     hasStoredApiKey: storedSecrets.apiKey !== undefined || undefined,
     hasStoredSshPassword: storedSecrets.sshPassword !== undefined || undefined,
@@ -261,25 +213,25 @@ export class ConnectionFormPanel {
     this.connectionManager = connectionManager;
 
     this.panel.webview.html = this.buildHtml(context, existing);
-    this.panel.webview.onDidReceiveMessage(async (msg) => {
-      try {
-        await this.handleMessage(msg);
-      } catch (err: unknown) {
-        const error = logErrorWithContext(
+    attachPanelMessageHandler(
+      this.panel,
+      (message) => this.handleMessage(message),
+      (error, message) => {
+        const normalized = logErrorWithContext(
           "ConnectionFormPanel unhandled error",
-          err,
+          error,
         );
         const isSaveConnectionMessage =
-          typeof msg === "object" &&
-          msg !== null &&
-          "type" in msg &&
-          (msg as { type?: unknown }).type === "saveConnection";
+          typeof message === "object" &&
+          message !== null &&
+          "type" in message &&
+          (message as { type?: unknown }).type === "saveConnection";
         this.panel.webview.postMessage({
           type: isSaveConnectionMessage ? "saveResult" : "testResult",
-          payload: { success: false, error: error.message },
+          payload: { success: false, error: normalized.message },
         });
-      }
-    });
+      },
+    );
     this.panel.onDidDispose(() => {
       this.resolveFn?.(undefined);
     });
@@ -352,9 +304,9 @@ export class ConnectionFormPanel {
     existingValue: string | undefined,
   ): string | undefined {
     return (
-      trimOptionalSecret(submittedValue) ??
+      trimOptionalSecretValue(submittedValue) ??
       storedValue ??
-      trimOptionalSecret(existingValue)
+      trimOptionalSecretValue(existingValue)
     );
   }
 
@@ -497,8 +449,8 @@ export class ConnectionFormPanel {
         : undefined;
     const prefersElasticsearchBasicAuth =
       payload.type === "elasticsearch" &&
-      trimOptionalSecret(payload.username) !== undefined &&
-      trimOptionalSecret(payload.password) !== undefined;
+      trimOptionalSecretValue(payload.username) !== undefined &&
+      trimOptionalSecretValue(payload.password) !== undefined;
     return {
       ...rest,
       useSecretStorage,
@@ -524,21 +476,21 @@ export class ConnectionFormPanel {
       ),
       password,
       apiKey:
-        trimOptionalSecret(payload.apiKey) ??
+        trimOptionalSecretValue(payload.apiKey) ??
         (useSecretStorage && !prefersElasticsearchBasicAuth
           ? storedSecrets.apiKey
           : undefined) ??
         existing?.apiKey,
       awsAccessKeyId:
-        trimOptionalSecret(payload.awsAccessKeyId) ??
+        trimOptionalSecretValue(payload.awsAccessKeyId) ??
         (useSecretStorage ? storedSecrets.awsAccessKeyId : undefined) ??
         existing?.awsAccessKeyId,
       awsSecretAccessKey:
-        trimOptionalSecret(payload.awsSecretAccessKey) ??
+        trimOptionalSecretValue(payload.awsSecretAccessKey) ??
         (useSecretStorage ? storedSecrets.awsSecretAccessKey : undefined) ??
         existing?.awsSecretAccessKey,
       awsSessionToken:
-        trimOptionalSecret(payload.awsSessionToken) ??
+        trimOptionalSecretValue(payload.awsSessionToken) ??
         (useSecretStorage ? storedSecrets.awsSessionToken : undefined) ??
         existing?.awsSessionToken,
       sshPassword,
@@ -576,7 +528,7 @@ export class ConnectionFormPanel {
         const previousSecretSnapshot = await this.readStoredSecretsSnapshot(
           raw.id,
         );
-        const inlinePassword = trimOptionalSecret(raw.password);
+        const inlinePassword = trimOptionalSecretValue(raw.password);
         const requiresStoredPasswordRecovery =
           !raw.useSecretStorage && payload.hasStoredSecret === true;
         if (
@@ -603,47 +555,47 @@ export class ConnectionFormPanel {
             password: inlinePassword,
             apiKey:
               raw.type === "elasticsearch"
-                ? trimOptionalSecret(raw.apiKey)
+                ? trimOptionalSecretValue(raw.apiKey)
                 : undefined,
             awsAccessKeyId:
               raw.type === "dynamodb"
-                ? trimOptionalSecret(raw.awsAccessKeyId)
+                ? trimOptionalSecretValue(raw.awsAccessKeyId)
                 : undefined,
             awsSecretAccessKey:
               raw.type === "dynamodb"
-                ? trimOptionalSecret(raw.awsSecretAccessKey)
+                ? trimOptionalSecretValue(raw.awsSecretAccessKey)
                 : undefined,
             awsSessionToken:
               raw.type === "dynamodb"
-                ? trimOptionalSecret(raw.awsSessionToken)
+                ? trimOptionalSecretValue(raw.awsSessionToken)
                 : undefined,
-            connectionUri: resolvePersistedUriSecret(
+            connectionUri: resolvePersistedCredentialBearingUriSecret(
               raw.connectionUri,
               previousSecretSnapshot.parsed.connectionUri,
             ),
-            uri: resolvePersistedUriSecret(
+            uri: resolvePersistedCredentialBearingUriSecret(
               raw.uri,
               previousSecretSnapshot.parsed.uri,
             ),
-            endpoint: resolvePersistedUriSecret(
+            endpoint: resolvePersistedCredentialBearingUriSecret(
               raw.endpoint,
               previousSecretSnapshot.parsed.endpoint,
             ),
-            awsEndpoint: resolvePersistedUriSecret(
+            awsEndpoint: resolvePersistedCredentialBearingUriSecret(
               raw.awsEndpoint,
               previousSecretSnapshot.parsed.awsEndpoint,
             ),
             sshPassword:
               raw.sshEnabled === true && raw.sshAuthMethod === "password"
-                ? trimOptionalSecret(raw.sshPassword)
+                ? trimOptionalSecretValue(raw.sshPassword)
                 : undefined,
             sshPrivateKey:
               raw.sshEnabled === true && raw.sshAuthMethod === "privateKey"
-                ? trimOptionalSecret(raw.sshPrivateKey)
+                ? trimOptionalSecretValue(raw.sshPrivateKey)
                 : undefined,
             sshPassphrase:
               raw.sshEnabled === true && raw.sshAuthMethod === "privateKey"
-                ? trimOptionalSecret(raw.sshPassphrase)
+                ? trimOptionalSecretValue(raw.sshPassphrase)
                 : undefined,
           });
           const secretMutationNeeded =

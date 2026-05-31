@@ -70,6 +70,32 @@ export class TableReadService {
       });
     }
 
+    return this.readFallbackPage(
+      connectionId,
+      database,
+      schema,
+      table,
+      page,
+      pageSize,
+      filters,
+      sort,
+      skipCount,
+    );
+  }
+
+  private async readFallbackPage(
+    connectionId: string,
+    database: string,
+    schema: string,
+    table: string,
+    page: number,
+    pageSize: number,
+    filters: FilterExpression[],
+    sort: SortConfig | null,
+    skipCount: boolean,
+  ): Promise<TablePage> {
+    const { driver } = this.getConnectionDriver(connectionId);
+
     const qualifiedTableName = driver.qualifiedTableName(
       database,
       schema,
@@ -88,36 +114,14 @@ export class TableReadService {
       columns,
     );
     const offset = (page - 1) * pageSize;
-
-    const orderByClause = sort
-      ? `ORDER BY ${driver.quoteIdentifier(sort.column)} ${sort.direction === "desc" ? "DESC" : "ASC"}`
-      : driver.buildOrderByDefault(columns);
-
-    let totalCount = 0;
-    let countFailed = false;
-    if (!skipCount) {
-      try {
-        const countSql = `SELECT COUNT(*) AS cnt FROM ${qualifiedTableName} ${whereClause}`;
-        const countResult = await driver.query(countSql, whereParams);
-        const countRow = countResult.rows[0] as
-          | Record<string, unknown>
-          | undefined;
-        totalCount = Number(
-          countRow?.__col_0 ??
-            countRow?.cnt ??
-            countRow?.CNT ??
-            countRow?.count ??
-            0,
-        );
-      } catch (error: unknown) {
-        countFailed = true;
-        console.error(
-          "[RapiDB] COUNT query failed, falling back to a lower-bound totalCount:",
-          error instanceof Error ? error.message : error,
-        );
-      }
-    }
-
+    const orderByClause = this.resolveFallbackOrderBy(driver, columns, sort);
+    const count = await this.readFallbackTotalCount(
+      driver,
+      qualifiedTableName,
+      whereClause,
+      whereParams,
+      skipCount,
+    );
     const pagination = driver.buildPagination(
       offset,
       pageSize,
@@ -127,47 +131,19 @@ export class TableReadService {
       orderByClause || driver.buildOrderByDefault(columns);
     const baseParams = [...whereParams, ...pagination.params];
     const dataSql = `SELECT * FROM ${qualifiedTableName} ${whereClause} ${effectiveOrderBy} ${pagination.sql}`;
-    let dataResult: QueryResult;
-    try {
-      dataResult = await driver.query(dataSql, baseParams);
-    } catch (error: unknown) {
-      if (this.isArithmeticOverflowError(error)) {
-        const computedColumns = columns
-          .filter((column) => column.isComputed)
-          .map((column) => column.name);
-        if (computedColumns.length > 0) {
-          const message =
-            error instanceof Error ? error.message : String(error ?? "");
-          throw new Error(
-            `${message} (computed columns: ${computedColumns.join(", ")})`,
-          );
-        }
-      }
-
-      throw error;
-    }
-    const columnMetaByName = new Map(
-      columns.map((column) => [column.name, column]),
+    const dataResult = await this.readFallbackDataResult(
+      driver,
+      dataSql,
+      baseParams,
+      columns,
     );
+    const rows = this.formatQueryRows(driver, columns, dataResult);
 
-    const rows = dataResult.rows.map((row) => {
-      const formattedRow: Record<string, unknown> = {};
-      dataResult.columns.forEach((columnName, index) => {
-        const value = row[`__col_${index}`];
-        const column = columnMetaByName.get(columnName);
-        formattedRow[columnName] = column
-          ? driver.formatOutputValue(value, column)
-          : value;
-      });
-
-      return formattedRow;
-    });
-
-    if (countFailed) {
-      totalCount = offset + rows.length;
-    }
-
-    return { columns, rows, totalCount };
+    return {
+      columns,
+      rows,
+      totalCount: count.countFailed ? offset + rows.length : count.totalCount,
+    };
   }
 
   private isArithmeticOverflowError(error: unknown): boolean {
@@ -244,6 +220,112 @@ export class TableReadService {
 
       page += 1;
     }
+  }
+
+  private resolveFallbackOrderBy(
+    driver: ReturnType<TableReadService["getConnectionDriver"]>["driver"],
+    columns: ColumnTypeMeta[],
+    sort: SortConfig | null,
+  ): string {
+    return sort
+      ? `ORDER BY ${driver.quoteIdentifier(sort.column)} ${sort.direction === "desc" ? "DESC" : "ASC"}`
+      : driver.buildOrderByDefault(columns);
+  }
+
+  private async readFallbackTotalCount(
+    driver: ReturnType<TableReadService["getConnectionDriver"]>["driver"],
+    qualifiedTableName: string,
+    whereClause: string,
+    whereParams: unknown[],
+    skipCount: boolean,
+  ): Promise<{ totalCount: number; countFailed: boolean }> {
+    if (skipCount) {
+      return { totalCount: 0, countFailed: false };
+    }
+
+    try {
+      const countSql = `SELECT COUNT(*) AS cnt FROM ${qualifiedTableName} ${whereClause}`;
+      const countResult = await driver.query(countSql, whereParams);
+      return {
+        totalCount: this.readCountQueryValue(countResult),
+        countFailed: false,
+      };
+    } catch (error: unknown) {
+      console.error(
+        "[RapiDB] COUNT query failed, falling back to a lower-bound totalCount:",
+        error instanceof Error ? error.message : error,
+      );
+      return { totalCount: 0, countFailed: true };
+    }
+  }
+
+  private readCountQueryValue(result: QueryResult): number {
+    const countRow = result.rows[0] as Record<string, unknown> | undefined;
+    return Number(
+      countRow?.__col_0 ??
+        countRow?.cnt ??
+        countRow?.CNT ??
+        countRow?.count ??
+        0,
+    );
+  }
+
+  private async readFallbackDataResult(
+    driver: ReturnType<TableReadService["getConnectionDriver"]>["driver"],
+    dataSql: string,
+    params: unknown[],
+    columns: ColumnTypeMeta[],
+  ): Promise<QueryResult> {
+    try {
+      return await driver.query(dataSql, params);
+    } catch (error: unknown) {
+      this.rethrowComputedColumnOverflow(error, columns);
+      throw error;
+    }
+  }
+
+  private rethrowComputedColumnOverflow(
+    error: unknown,
+    columns: ColumnTypeMeta[],
+  ): void {
+    if (!this.isArithmeticOverflowError(error)) {
+      return;
+    }
+
+    const computedColumns = columns
+      .filter((column) => column.isComputed)
+      .map((column) => column.name);
+    if (computedColumns.length === 0) {
+      return;
+    }
+
+    const message =
+      error instanceof Error ? error.message : String(error ?? "");
+    throw new Error(
+      `${message} (computed columns: ${computedColumns.join(", ")})`,
+    );
+  }
+
+  private formatQueryRows(
+    driver: ReturnType<TableReadService["getConnectionDriver"]>["driver"],
+    columns: ColumnTypeMeta[],
+    result: QueryResult,
+  ): Record<string, unknown>[] {
+    const columnMetaByName = new Map(
+      columns.map((column) => [column.name, column]),
+    );
+
+    return result.rows.map((row) => {
+      const formattedRow: Record<string, unknown> = {};
+      result.columns.forEach((columnName, index) => {
+        const value = row[`__col_${index}`];
+        const column = columnMetaByName.get(columnName);
+        formattedRow[columnName] = column
+          ? driver.formatOutputValue(value, column)
+          : value;
+      });
+      return formattedRow;
+    });
   }
 
   private async *exportAllWithKeysetPagination(

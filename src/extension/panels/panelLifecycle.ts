@@ -28,6 +28,20 @@ export function disposePanelInstances<T>(
   }
 }
 
+export function attachPanelMessageHandler(
+  panel: vscode.WebviewPanel,
+  handler: (message: unknown) => Promise<void>,
+  onError: (error: unknown, message: unknown) => void,
+): void {
+  panel.webview.onDidReceiveMessage(async (message) => {
+    try {
+      await handler(message);
+    } catch (error: unknown) {
+      onError(error, message);
+    }
+  });
+}
+
 type ConnectionLifecycleManager = {
   onDidDisconnect(listener: (connectionId: string) => void): vscode.Disposable;
 };

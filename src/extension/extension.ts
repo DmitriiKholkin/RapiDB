@@ -58,6 +58,11 @@ type ActivationServices = {
   refresh: () => void;
 };
 
+type ActivationCommandRegistrar = (
+  services: ActivationServices,
+  reg: RegisterCommand,
+) => void;
+
 function createBadgeUpdater(
   treeView: vscode.TreeView<RapiDBNode>,
   connectionManager: ConnectionManager,
@@ -230,11 +235,11 @@ function openDdlInQueryPanel(
   );
 }
 
-function registerCommands(
+function registerConnectionCommands(
   services: ActivationServices,
   reg: RegisterCommand,
 ): void {
-  const { context, connectionManager, connectionProvider, refresh } = services;
+  const { context, connectionManager, refresh } = services;
 
   reg(CMD.addConnection, async () => {
     const result = await ConnectionFormPanel.show(context, connectionManager);
@@ -386,6 +391,13 @@ function registerCommands(
     await connectionManager.disconnectFrom(id);
     refresh();
   });
+}
+
+function registerExplorerCommands(
+  services: ActivationServices,
+  reg: RegisterCommand,
+): void {
+  const { context, connectionManager, refresh } = services;
 
   reg(CMD.newQuery, async (node?: RapiDBNode) => {
     const connectionId = await resolveConnectionId(node, connectionManager);
@@ -683,6 +695,13 @@ function registerCommands(
       );
     }
   });
+}
+
+function registerSavedEntryCommands(
+  services: ActivationServices,
+  reg: RegisterCommand,
+): void {
+  const { context, connectionManager } = services;
 
   reg(CMD.openHistoryEntry, (entry: HistoryEntry) => {
     showSavedQuery(context, connectionManager, entry);
@@ -727,6 +746,13 @@ function registerCommands(
       () => connectionManager.clearHistory(),
     );
   });
+}
+
+function registerUtilityCommands(
+  services: ActivationServices,
+  reg: RegisterCommand,
+): void {
+  const { connectionManager, connectionProvider, refresh } = services;
 
   reg(CMD.disconnectAll, async () => {
     await connectionManager.disconnectAll();
@@ -740,6 +766,22 @@ function registerCommands(
     });
     connectionProvider.refreshConnectionTree(node?.connectionId);
   });
+}
+
+function registerCommands(
+  services: ActivationServices,
+  reg: RegisterCommand,
+): void {
+  const registrars: readonly ActivationCommandRegistrar[] = [
+    registerConnectionCommands,
+    registerExplorerCommands,
+    registerSavedEntryCommands,
+    registerUtilityCommands,
+  ];
+
+  for (const registerCommandGroup of registrars) {
+    registerCommandGroup(services, reg);
+  }
 }
 
 export function activate(context: vscode.ExtensionContext): void {

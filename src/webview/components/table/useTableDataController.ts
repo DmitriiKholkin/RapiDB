@@ -125,6 +125,7 @@ export function useTableDataController({
   requestedPageRef.current = requestedPage;
   requestedPageSizeRef.current = requestedPageSize;
   debouncedFilterDraftsRef.current = debouncedFilterDrafts;
+  readOnlyTableRef.current = readOnlyTable;
   onTableInitRef.current = onTableInit;
   onRowsCommittedRef.current = onRowsCommitted;
   rowsRef.current = rows;
@@ -169,14 +170,15 @@ export function useTableDataController({
   useEffect(() => {
     setReadOnlyTable(initialReadOnlyTable);
     pendingReadOnlyTableRef.current = initialReadOnlyTable;
-    readOnlyTableRef.current = initialReadOnlyTable;
   }, [initialReadOnlyTable]);
 
   useEffect(() => {
-    readOnlyTableRef.current = readOnlyTable;
-  }, [readOnlyTable]);
+    const clearErrors = () => {
+      setError(null);
+      setReadError(null);
+      setFilterError(null);
+    };
 
-  useEffect(() => {
     const unInit = onMessage<{
       columns: ColumnMeta[];
       primaryKeyColumns: string[];
@@ -226,9 +228,7 @@ export function useTableDataController({
         setPkCols([]);
         setRows([]);
         setTotalCount(0);
-        setError(null);
-        setReadError(null);
-        setFilterError(null);
+        clearErrors();
         setPage(1);
         setPageSize(initialPageSizeRef.current);
         setRequestedPage(1);
@@ -291,9 +291,7 @@ export function useTableDataController({
         setSort(snapshot.sort);
         setLoading(false);
         setHasCommittedData(true);
-        setError(null);
-        setReadError(null);
-        setFilterError(null);
+        clearErrors();
 
         onRowsCommittedRef.current(
           nextRows,
@@ -361,8 +359,9 @@ export function useTableDataController({
     ],
   );
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: fetchTrigger is a synthetic trigger that encodes page/sort/filter state; fetchPage reads those values from stable refs at call time.
   useEffect(() => {
-    if (!initializedRef.current || fetchTrigger === "") {
+    if (!initializedRef.current) {
       return;
     }
 

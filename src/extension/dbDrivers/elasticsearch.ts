@@ -360,8 +360,8 @@ export class ElasticsearchDriver implements IDBDriver {
       };
     }
     const startedAt = Date.now();
-    const statements = this.splitRestStatements(trimmed);
-    if (statements.length === 0) {
+    const commands = this.parseRestCommands(trimmed);
+    if (commands.length === 0) {
       return {
         columns: [],
         rows: [],
@@ -370,33 +370,52 @@ export class ElasticsearchDriver implements IDBDriver {
       };
     }
 
-    if (statements.length === 1) {
-      const command = this.parseRestCommand(statements[0]);
+    return this.executeRestCommands(commands, startedAt);
+  }
+
+  private parseRestCommands(input: string): ElasticsearchRestCommand[] {
+    return this.splitRestStatements(input).map((statement) => {
+      const command = this.parseRestCommand(statement);
       if (!command) {
         throw this.buildInvalidRestCommandError();
       }
+      return command;
+    });
+  }
 
+  private async executeRestCommands(
+    commands: readonly ElasticsearchRestCommand[],
+    startedAt: number,
+  ): Promise<QueryResult> {
+    if (commands.length === 1) {
+      const [command] = commands;
       return this.executeRestCommand(command, startedAt);
     }
 
     const results: Array<Record<string, unknown>> = [];
     let affectedRows = 0;
-    for (const statement of statements) {
-      const command = this.parseRestCommand(statement);
-      if (!command) {
-        throw this.buildInvalidRestCommandError();
-      }
-
+    for (const command of commands) {
       const result = await this.executeRestCommand(command, startedAt);
       affectedRows += result.affectedRows ?? 0;
       results.push({
-        statement,
+        statement: this.formatParsedRestCommand(command),
         rowCount: result.rowCount,
         affectedRows: result.affectedRows,
         rows: this.toPlainRows(result),
       });
     }
+    return this.buildMultiStatementQueryResult(
+      results,
+      startedAt,
+      affectedRows,
+    );
+  }
 
+  private buildMultiStatementQueryResult(
+    results: Array<Record<string, unknown>>,
+    startedAt: number,
+    affectedRows: number,
+  ): QueryResult {
     const row = flattenRootRecord({ results });
     return {
       columns: ["results"],
@@ -812,6 +831,25 @@ export class ElasticsearchDriver implements IDBDriver {
     return command.body as Record<string, unknown>;
   }
 
+  private commandBodyAsObject(
+    body: unknown,
+  ): Record<string, unknown> | undefined {
+    return body && typeof body === "object" && !Array.isArray(body)
+      ? (body as Record<string, unknown>)
+      : undefined;
+  }
+
+  private formatParsedRestCommand(command: ElasticsearchRestCommand): string {
+    const queryString = command.queryParams.toString();
+    const path =
+      queryString.length > 0 ? `${command.path}?${queryString}` : command.path;
+    return this.formatRestCommand(
+      command.method,
+      path,
+      this.commandBodyAsObject(command.body),
+    );
+  }
+
   private queryParamsToObject(
     queryParams: URLSearchParams,
   ): Record<string, unknown> {
@@ -1084,36 +1122,64 @@ export class ElasticsearchDriver implements IDBDriver {
     },
   ): string {
     if (operation === "insert") {
-      const id = data.values?._id;
-      const document = this.resolveDocumentForMutation(data.values ?? {});
-      return this.formatRestCommand(
-        id !== undefined ? "PUT" : "POST",
-        `/${encodeURIComponent(table)}/_doc${
-          id !== undefined ? `/${encodeURIComponent(String(id))}` : ""
-        }?${new URLSearchParams({
-          ...(id !== undefined ? { op_type: "create" } : {}),
-          refresh: "wait_for",
-        }).toString()}`,
-        document,
-      );
+      return this.buildInsertMutationPreviewStatement(table, data.values ?? {});
     }
-    const id = data.primaryKeys?._id ?? data.primaryKeyValuesList?.[0]?._id;
     if (operation === "update") {
-      const document = this.resolveDocumentForMutation(
-        {
-          ...(data.primaryKeys ?? {}),
-          ...(data.changes ?? {}),
-        },
-        data.changes,
-      );
-      return this.formatRestCommand(
-        "PUT",
-        `/${encodeURIComponent(table)}/_doc/${encodeURIComponent(
-          id !== undefined ? String(id) : "<id>",
-        )}?refresh=wait_for`,
-        document,
+      return this.buildUpdateMutationPreviewStatement(
+        table,
+        data.primaryKeys ?? {},
+        data.changes ?? {},
       );
     }
+    return this.buildDeleteMutationPreviewStatement(
+      table,
+      data.primaryKeys ?? data.primaryKeyValuesList?.[0] ?? {},
+    );
+  }
+
+  private buildInsertMutationPreviewStatement(
+    table: string,
+    values: Record<string, unknown>,
+  ): string {
+    const id = values._id;
+    return this.formatRestCommand(
+      id !== undefined ? "PUT" : "POST",
+      `/${encodeURIComponent(table)}/_doc${
+        id !== undefined ? `/${encodeURIComponent(String(id))}` : ""
+      }?${new URLSearchParams({
+        ...(id !== undefined ? { op_type: "create" } : {}),
+        refresh: "wait_for",
+      }).toString()}`,
+      this.resolveDocumentForMutation(values),
+    );
+  }
+
+  private buildUpdateMutationPreviewStatement(
+    table: string,
+    primaryKeys: Record<string, unknown>,
+    changes: Record<string, unknown>,
+  ): string {
+    const id = primaryKeys._id;
+    return this.formatRestCommand(
+      "PUT",
+      `/${encodeURIComponent(table)}/_doc/${encodeURIComponent(
+        id !== undefined ? String(id) : "<id>",
+      )}?refresh=wait_for`,
+      this.resolveDocumentForMutation(
+        {
+          ...primaryKeys,
+          ...changes,
+        },
+        changes,
+      ),
+    );
+  }
+
+  private buildDeleteMutationPreviewStatement(
+    table: string,
+    primaryKeys: Record<string, unknown>,
+  ): string {
+    const id = primaryKeys._id;
     return this.formatRestCommand(
       "DELETE",
       `/${encodeURIComponent(table)}/_doc/${encodeURIComponent(

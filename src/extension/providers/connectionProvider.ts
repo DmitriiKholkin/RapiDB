@@ -305,6 +305,45 @@ const CATEGORY_NODE_KIND_BY_ID: Record<ExplorerCategoryId, CategoryKind> = {
   types: "category_types",
 };
 
+function splitRootConnectionsByFolder(
+  connections: readonly ConnectionConfig[],
+): {
+  folderNames: string[];
+  ungroupedConnections: ConnectionConfig[];
+} {
+  const folderNames = [
+    ...new Set(
+      connections
+        .map((connection) => connection.folder?.trim())
+        .filter((folderName): folderName is string => Boolean(folderName)),
+    ),
+  ].sort((left, right) => left.localeCompare(right));
+
+  return {
+    folderNames,
+    ungroupedConnections: connections.filter(
+      (connection) => !connection.folder?.trim(),
+    ),
+  };
+}
+
+function findSnapshotDatabase(
+  state: SchemaSnapshotState,
+  databaseName: string,
+) {
+  return state.snapshot.databases.find((entry) => entry.name === databaseName);
+}
+
+function findSnapshotSchema(
+  state: SchemaSnapshotState,
+  databaseName: string,
+  schemaName: string,
+) {
+  return findSnapshotDatabase(state, databaseName)?.schemas.find(
+    (entry) => entry.name === schemaName,
+  );
+}
+
 export class ConnectionProvider
   implements
     vscode.TreeDataProvider<RapiDBNode>,
@@ -510,21 +549,11 @@ export class ConnectionProvider
   private getRootChildren(): RapiDBNode[] {
     const connections = this.connectionManager.getConnections();
     this.syncConnectionNodeCache(connections);
-    const groupedConnections = connections.filter((connection) =>
-      connection.folder?.trim(),
+    const { folderNames, ungroupedConnections } =
+      splitRootConnectionsByFolder(connections);
+    const folderNodes = folderNames.map((folderName) =>
+      this.makeFolderNode(folderName),
     );
-    const ungroupedConnections = connections.filter(
-      (connection) => !connection.folder?.trim(),
-    );
-    const folderNodes = [
-      ...new Set(
-        groupedConnections
-          .map((connection) => connection.folder?.trim())
-          .filter((folderName): folderName is string => !!folderName),
-      ),
-    ]
-      .sort((left, right) => left.localeCompare(right))
-      .map((folderName) => this.makeFolderNode(folderName));
 
     return [
       ...folderNodes,
@@ -731,9 +760,7 @@ export class ConnectionProvider
       kind: "database",
       database: databaseName,
     });
-    const database = state.snapshot.databases.find(
-      (entry) => entry.name === databaseName,
-    );
+    const database = findSnapshotDatabase(state, databaseName);
     if (!database) {
       return this.pendingStateNodes(
         element.connectionId,
@@ -771,9 +798,7 @@ export class ConnectionProvider
       database: databaseName,
       schema: schemaName,
     });
-    const schema = state.snapshot.databases
-      .find((entry) => entry.name === databaseName)
-      ?.schemas.find((entry) => entry.name === schemaName);
+    const schema = findSnapshotSchema(state, databaseName, schemaName);
     if (!schema) {
       return this.pendingStateNodes(
         element.connectionId,
@@ -805,9 +830,7 @@ export class ConnectionProvider
       database: databaseName,
       schema: schemaName,
     });
-    const schema = state.snapshot.databases
-      .find((entry) => entry.name === databaseName)
-      ?.schemas.find((entry) => entry.name === schemaName);
+    const schema = findSnapshotSchema(state, databaseName, schemaName);
     if (!schema) {
       return this.pendingStateNodes(
         element.connectionId,
