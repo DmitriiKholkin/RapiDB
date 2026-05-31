@@ -1837,6 +1837,16 @@ export class PostgresDriver extends BaseDBDriver {
       if (typeof val !== "string") {
         return null;
       }
+      if (operator === "like" || operator === "ilike") {
+        const searchValue = val.trim();
+        if (!searchValue) {
+          return null;
+        }
+        return {
+          sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex}`,
+          params: [`%${searchValue}%`],
+        };
+      }
       if (operator === "eq" || operator === "neq") {
         const intervalValue = val.trim();
         if (!intervalValue) {

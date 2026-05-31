@@ -11,7 +11,7 @@ export function CellDisplay({
   value,
   isPending,
   category,
-  nativeType,
+  nativeType: _nativeType,
 }: {
   value: unknown;
   isPending: boolean;

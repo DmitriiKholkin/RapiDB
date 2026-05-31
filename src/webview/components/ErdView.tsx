@@ -24,7 +24,9 @@ import React, {
   useRef,
   useState,
 } from "react";
-import "@xyflow/react/dist/style.css";
+// biome-ignore lint/suspicious/noTsIgnore: TypeScript does not resolve this bundler-only stylesheet import reliably here.
+// @ts-ignore Bundler resolves this stylesheet import for the webview bundle.
+import "../xyflow.css";
 import { formatPrimaryKeyBadgeLabel } from "../../shared/tableTypes";
 import type { ErdGraph } from "../../shared/webviewContracts";
 import { onMessage, postMessage } from "../utils/messaging";

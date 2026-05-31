@@ -69,6 +69,10 @@ type ElasticsearchFilterClauses = {
 
 const ELASTICSEARCH_READ_ONLY_QUERY_REASON =
   "[RapiDB] Read-only Elasticsearch connections allow only GET requests and POST _search requests.";
+const ELASTICSEARCH_COMPATIBILITY_HEADERS = {
+  accept: "application/vnd.elasticsearch+json; compatible-with=8",
+  "content-type": "application/vnd.elasticsearch+json; compatible-with=8",
+} as const;
 
 interface ElasticsearchRestCommand {
   method: ElasticsearchRestMethod;
@@ -155,6 +159,7 @@ export class ElasticsearchDriver implements IDBDriver {
     const client = new Client({
       ...(sshAgentTransport ? { Connection: HttpConnection } : {}),
       node: this.config.cloudId ? undefined : node,
+      headers: ELASTICSEARCH_COMPATIBILITY_HEADERS,
       cloud: this.config.cloudId
         ? {
             id: this.config.cloudId,

@@ -251,8 +251,8 @@ describe("MongoDBDriver — mongosh query()", () => {
 
     expect(byColumn).toMatchObject({
       _id: "64a1b2c3d4e5f67890abcdef",
-      t_binary: "AQIDBAUGB/8=",
-      t_binary_uuid: "ESIzRFVmd4iZqrvM3e7//w==",
+      t_binary: "0x01020304050607ff",
+      t_binary_uuid: "0x112233445566778899aabbccddeeffff",
       t_date: "2024-07-04 12:00:00",
       t_decimal128: "123456789.987654321",
       t_int64: "9223372036854775807",
@@ -787,7 +787,7 @@ describe("MongoDBDriver — buildMutationPreviewStatement()", () => {
         ),
         binData4Column,
       ),
-    ).toBe("ESIzRFVmd4iZqrvM3e7//w==");
+    ).toBe("0x112233445566778899aabbccddeeffff");
     expect(
       driver.formatOutputValue(
         driver.coerceInputValue("2024-07-04T12:00:00.000Z", dateColumn),

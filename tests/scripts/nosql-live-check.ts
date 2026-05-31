@@ -32,6 +32,16 @@ const ELASTIC_NODE = `http://${LOOPBACK_HOST}:9200`;
 const DYNAMODB_ENDPOINT = `http://${LOOPBACK_HOST}:8000`;
 type LiveTransport = "direct" | "ssh";
 
+function createElasticsearchAdminClient(): ElasticsearchClient {
+  return new ElasticsearchClient({
+    node: ELASTIC_NODE,
+    headers: {
+      accept: "application/vnd.elasticsearch+json; compatible-with=8",
+      "content-type": "application/vnd.elasticsearch+json; compatible-with=8",
+    },
+  });
+}
+
 interface DriverSession<TDriver> {
   driver: TDriver;
   dispose: () => Promise<void>;
@@ -139,7 +149,7 @@ async function waitForElasticsearch(): Promise<void> {
   await waitFor(
     "Elasticsearch",
     async () => {
-      const client = new ElasticsearchClient({ node: ELASTIC_NODE });
+      const client = createElasticsearchAdminClient();
       await client.ping();
       await client.cluster.health({
         wait_for_status: "yellow",
@@ -610,7 +620,7 @@ async function verifyElasticsearchDriver(
   transport: LiveTransport,
 ): Promise<void> {
   log("Seeding Elasticsearch fixtures...");
-  const client = new ElasticsearchClient({ node: ELASTIC_NODE });
+  const client = createElasticsearchAdminClient();
   try {
     await client.indices.delete({ index: "users", ignore_unavailable: true });
     await client.indices.create({
@@ -724,7 +734,7 @@ async function verifyElasticsearchDriver(
       primaryKeyValuesList: [{ _id: "user-3" }],
     });
 
-    const verifyClient = new ElasticsearchClient({ node: ELASTIC_NODE });
+    const verifyClient = createElasticsearchAdminClient();
     try {
       const exists = await verifyClient.exists({
         index: "users",

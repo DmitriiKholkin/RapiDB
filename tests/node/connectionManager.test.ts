@@ -515,7 +515,7 @@ describe("ConnectionManager", () => {
         name: "MongoDB",
         type: "mongodb",
         uri: "mongodb://localhost:27017/app",
-        authDatabase: "admin",
+        database: "admin",
         authSource: "legacy-admin",
       },
       {

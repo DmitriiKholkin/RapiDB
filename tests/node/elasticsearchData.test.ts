@@ -623,13 +623,13 @@ describe("ElasticsearchDriver — metadata and pages", () => {
       size: 1,
       query: { match: { title: "Release" } },
     });
-    expect(result.columns).toEqual(["_id", "tags", "title"]);
+    expect(result.columns).toEqual(["_id", "title", "tags"]);
     expect(result.rowCount).toBe(1);
     expect(result.rows).toEqual([
       {
         __col_0: "doc-9",
-        __col_1: '["product","beta"]',
-        __col_2: "Release note",
+        __col_1: "Release note",
+        __col_2: '["product","beta"]',
       },
     ]);
   });

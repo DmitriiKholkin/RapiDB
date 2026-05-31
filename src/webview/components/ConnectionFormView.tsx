@@ -62,27 +62,6 @@ const DB_TYPES: Array<{
   { type: "dynamodb", label: "DynamoDB", short: "DY", color: "#4053d6" },
 ];
 
-function parseRedisDbInput(value: string): {
-  value?: number;
-  error?: string;
-} {
-  const trimmed = value.trim();
-  if (trimmed.length === 0) {
-    return {};
-  }
-
-  if (!/^\d+$/.test(trimmed)) {
-    return { error: "Redis DB must be a non-negative integer." };
-  }
-
-  const parsed = Number(trimmed);
-  if (!Number.isSafeInteger(parsed)) {
-    return { error: "Redis DB must be a non-negative integer." };
-  }
-
-  return { value: parsed };
-}
-
 function FocusInput(props: InputHTMLAttributes<HTMLInputElement>) {
   const [focused, setFocused] = useState(false);
   return (
@@ -521,21 +500,12 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const [mongoConnectionUri, setMongoConnectionUri] = useState(
     existing?.connectionUri ?? existing?.uri ?? "",
   );
-  const [redisUsername, setRedisUsername] = useState(
-    existing?.redisUsername ?? existing?.username ?? "",
-  );
-  const [redisKeyPrefix, setRedisKeyPrefix] = useState(
-    existing?.keyPrefix ?? "",
-  );
   const [elasticsearchEndpoint, setElasticsearchEndpoint] = useState(
     existing?.endpoint ?? existing?.connectionUri ?? "",
   );
   const [elasticsearchApiKey, setElasticsearchApiKey] = useState("");
   const [elasticsearchCloudId, setElasticsearchCloudId] = useState(
     existing?.cloudId ?? "",
-  );
-  const [redisDb, setRedisDb] = useState(
-    existing?.redisDb === undefined ? "0" : String(existing.redisDb),
   );
   const [awsRegion, setAwsRegion] = useState(existing?.awsRegion ?? "");
   const [awsAccessKeyId, setAwsAccessKeyId] = useState("");
@@ -577,7 +547,6 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   >("idle");
   const [testError, setTestError] = useState("");
   const [nameError, setNameError] = useState("");
-  const [redisDbError, setRedisDbError] = useState("");
   const [saving, setSaving] = useState(false);
 
   const isSQLite = type === "sqlite";
@@ -671,11 +640,9 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     setTestState("idle");
     setSslEnabled(false);
     setRejectUnauthorized(true);
-    setRedisDbError("");
   };
 
   const buildPayload = useCallback((): ConnectionFormSubmission => {
-    const parsedRedisDb = parseRedisDbInput(redisDb);
     const parsedSshPort = Number.parseInt(sshPort.trim(), 10);
 
     return {
@@ -738,11 +705,8 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
           : {
               host: host.trim(),
               port: Number(port) || DEFAULT_PORT_BY_CONNECTION_TYPE[type],
-              database:
-                isRedis || isElasticsearch || isOracle
-                  ? undefined
-                  : database.trim(),
-              username: isRedis ? undefined : username.trim(),
+              database: database.trim(),
+              username: username.trim(),
               password,
               ssl: supportsSsl ? sslEnabled : undefined,
               rejectUnauthorized:
@@ -750,13 +714,6 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
               ...(isMongo
                 ? {
                     connectionUri: mongoConnectionUri.trim() || undefined,
-                  }
-                : {}),
-              ...(isRedis
-                ? {
-                    redisUsername: redisUsername.trim() || undefined,
-                    redisDb: parsedRedisDb.value,
-                    keyPrefix: redisKeyPrefix.trim() || undefined,
                   }
                 : {}),
               ...(isElasticsearch
@@ -822,31 +779,33 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     oracleThickMode,
     oracleClientPath,
     mongoConnectionUri,
-    redisUsername,
-    redisKeyPrefix,
     elasticsearchEndpoint,
     elasticsearchApiKey,
     elasticsearchCloudId,
-    redisDb,
     isMongo,
-    isRedis,
     isElasticsearch,
     isDynamo,
   ]);
 
-  const validateRedisDb = useCallback((): boolean => {
-    if (!isRedis) {
-      setRedisDbError("");
-      return true;
+  const validateSubmission = () => {
+    if (
+      type === "redis" &&
+      database.trim().length > 0 &&
+      !/^\d+$/.test(database.trim())
+    ) {
+      setTestState("fail");
+      setTestError("Redis database must be a non-negative integer.");
+      return false;
     }
-
-    const { error } = parseRedisDbInput(redisDb);
-    setRedisDbError(error ?? "");
-    return !error;
-  }, [isRedis, redisDb]);
+    return true;
+  };
 
   const handleTest = () => {
-    if (!validateRedisDb()) {
+    if (!name.trim()) {
+      setNameError("Name is required");
+      return;
+    }
+    if (!validateSubmission()) {
       return;
     }
     setTestState("testing");
@@ -859,7 +818,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       setNameError("Name is required");
       return;
     }
-    if (!validateRedisDb()) {
+    if (!validateSubmission()) {
       return;
     }
     setSaving(true);
@@ -1117,35 +1076,24 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                 />
               </div>
             </div>
-            {!isRedis && !isElasticsearch && !isOracle && (
+            {!isElasticsearch && !isOracle && (
               <Field label="Database">
                 <FocusInput
                   aria-label="Database"
                   value={database}
                   onChange={(e) => setDatabase(e.target.value)}
-                  placeholder="mydb"
+                  placeholder={isRedis ? "0" : "mydb"}
                 />
               </Field>
             )}
-            {isRedis ? (
-              <Field label="Redis Username">
-                <FocusInput
-                  aria-label="Redis username"
-                  value={redisUsername}
-                  onChange={(e) => setRedisUsername(e.target.value)}
-                  placeholder="default"
-                />
-              </Field>
-            ) : (
-              <Field label="Username">
-                <FocusInput
-                  aria-label="Username"
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  placeholder="admin"
-                />
-              </Field>
-            )}
+            <Field label="Username">
+              <FocusInput
+                aria-label="Username"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="admin"
+              />
+            </Field>
             {isMongo && (
               <Field
                 label="Connection URI"
@@ -1158,36 +1106,6 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                   placeholder="mongodb://user:pass@localhost:27017/mydb"
                 />
               </Field>
-            )}
-            {isRedis && (
-              <>
-                <Field
-                  label="Redis DB"
-                  hint="Numeric Redis database index, usually 0."
-                  error={redisDbError}
-                >
-                  <FocusInput
-                    aria-label="Redis DB"
-                    value={redisDb}
-                    onChange={(e) => {
-                      setRedisDb(e.target.value);
-                      setRedisDbError("");
-                    }}
-                    placeholder="0"
-                  />
-                </Field>
-                <Field
-                  label="Key Prefix"
-                  hint="Optional prefix applied when browsing or editing keys."
-                >
-                  <FocusInput
-                    aria-label="Redis key prefix"
-                    value={redisKeyPrefix}
-                    onChange={(e) => setRedisKeyPrefix(e.target.value)}
-                    placeholder="app:"
-                  />
-                </Field>
-              </>
             )}
             {isElasticsearch && (
               <>

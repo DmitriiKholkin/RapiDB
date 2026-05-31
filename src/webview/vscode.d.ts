@@ -1,6 +1,7 @@
 import type { WebviewInitialState } from "../shared/webviewContracts";
 
 declare module "*.css";
+declare module "@xyflow/react/dist/style.css";
 
 declare global {
   interface VSCodeAPI {

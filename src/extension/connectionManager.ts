@@ -1676,7 +1676,7 @@ export class ConnectionManager
     fingerprintSha256: string,
   ): Promise<void> {
     const persistedConnection = this.getConnection(connectionId);
-    if (!persistedConnection || persistedConnection.sshEnabled !== true) {
+    if (persistedConnection?.sshEnabled !== true) {
       return;
     }
 

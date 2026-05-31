@@ -326,22 +326,26 @@ describe("RedisDriver — metadata and pages", () => {
     );
     expect(page.totalCount).toBe(5);
     expect(page.rows).toEqual([
-      { key: "users:1", value: "Alice" },
+      { key: "users:1", value: "Alice", ttl: null },
       {
         key: "users:2",
         value: '{"first":"Bob","last":"Builder"}',
+        ttl: null,
       },
       {
         key: "users:3",
         value: '["draft","published"]',
+        ttl: null,
       },
       {
         key: "users:4",
         value: '["alpha","beta"]',
+        ttl: null,
       },
       {
         key: "users:5",
         value: '[{"value":"gold","score":10},{"value":"silver","score":5}]',
+        ttl: null,
       },
     ]);
   });
@@ -448,9 +452,64 @@ describe("RedisDriver — metadata and pages", () => {
         key: "events:1",
         value:
           '[{"id":"1716115200000-0","message":{"event":"created","userId":"42"}}]',
+        ttl: null,
       },
     ]);
     expect(client.xRange).toHaveBeenCalledWith("events:1", "-", "+");
+  });
+
+  it("filters rows by ttl column values", async () => {
+    const driver = new RedisDriver({
+      id: "redis-ttl-filter-test",
+      name: "Redis TTL Filter Test",
+      type: "redis",
+      host: "localhost",
+    });
+    const client = {
+      scan: vi.fn().mockResolvedValue({
+        cursor: "0",
+        keys: ["users:1", "users:2", "users:3"],
+      }),
+      type: vi.fn().mockResolvedValue("string"),
+      get: vi.fn(async (key: string) => key),
+      ttl: vi.fn(async (key: string) => {
+        if (key === "users:1") {
+          return -1;
+        }
+        if (key === "users:2") {
+          return 5;
+        }
+        return 120;
+      }),
+    };
+
+    (
+      driver as unknown as {
+        client: typeof client | null;
+        connected: boolean;
+      }
+    ).client = client;
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    const page = await driver.readTablePage({
+      database: "db0",
+      schema: "db0",
+      table: "users",
+      page: 1,
+      pageSize: 10,
+      filters: [
+        {
+          column: "ttl",
+          operator: "gt",
+          value: "10",
+        },
+      ],
+      sort: { column: "ttl", direction: "asc" },
+      skipCount: false,
+    });
+
+    expect(page.rows).toEqual([{ key: "users:3", value: "users:3", ttl: 120 }]);
+    expect(page.totalCount).toBe(1);
   });
 
   it("preserves Redis list type when updating a list-backed key", async () => {
@@ -507,6 +566,164 @@ describe("RedisDriver — metadata and pages", () => {
       '{"id":"high-1","type":"payment","amount":999.99}',
       '{"id":"high-2","type":"alert","message":"System critical"}',
     ]);
+  });
+
+  it("applies ttl-only updates without rewriting values", async () => {
+    const driver = new RedisDriver({
+      id: "redis-ttl-update-test",
+      name: "Redis TTL Update Test",
+      type: "redis",
+      host: "localhost",
+    });
+    const client = {
+      exists: vi.fn().mockResolvedValue(1),
+      expire: vi.fn().mockResolvedValue(1),
+      persist: vi.fn().mockResolvedValue(1),
+      type: vi.fn().mockResolvedValue("string"),
+      set: vi.fn().mockResolvedValue("OK"),
+      del: vi.fn().mockResolvedValue(1),
+      rPush: vi.fn().mockResolvedValue(1),
+    };
+
+    (
+      driver as unknown as {
+        client: typeof client | null;
+        connected: boolean;
+      }
+    ).client = client;
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    await expect(
+      driver.updateRows({
+        database: "db0",
+        schema: "db0",
+        table: "users",
+        updates: [
+          {
+            primaryKeys: { key: "users:1" },
+            changes: { ttl: "90" },
+          },
+        ],
+      }),
+    ).resolves.toEqual({ affectedRows: 1 });
+
+    expect(client.expire).toHaveBeenCalledWith("users:1", 90);
+    expect(client.type).not.toHaveBeenCalled();
+    expect(client.set).not.toHaveBeenCalled();
+  });
+
+  it("renames keys when key field is edited", async () => {
+    const driver = new RedisDriver({
+      id: "redis-key-rename-test",
+      name: "Redis Key Rename Test",
+      type: "redis",
+      host: "localhost",
+    });
+    const client = {
+      exists: vi.fn(async (key: string) => (key === "users:1" ? 1 : 0)),
+      rename: vi.fn().mockResolvedValue("OK"),
+      type: vi.fn().mockResolvedValue("string"),
+      set: vi.fn().mockResolvedValue("OK"),
+    };
+
+    (
+      driver as unknown as {
+        client: typeof client | null;
+        connected: boolean;
+      }
+    ).client = client;
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    await expect(
+      driver.updateRows({
+        database: "db0",
+        schema: "db0",
+        table: "users",
+        updates: [
+          {
+            primaryKeys: { key: "users:1" },
+            changes: { key: "users:1:renamed" },
+          },
+        ],
+      }),
+    ).resolves.toEqual({ affectedRows: 1 });
+
+    expect(client.rename).toHaveBeenCalledWith("users:1", "users:1:renamed");
+    expect(client.type).not.toHaveBeenCalled();
+    expect(client.set).not.toHaveBeenCalled();
+  });
+
+  it("builds RENAME preview when key field is edited", () => {
+    const driver = new RedisDriver({
+      id: "redis-key-rename-preview-test",
+      name: "Redis Key Rename Preview Test",
+      type: "redis",
+      host: "localhost",
+    });
+
+    expect(
+      driver.buildMutationPreviewStatement("update", "db0", "db0", "users", {
+        primaryKeys: { key: "users:1" },
+        changes: { key: "users:1:renamed" },
+      }),
+    ).toBe('RENAME "users:1" "users:1:renamed"');
+  });
+
+  it("applies ttl during inserts", async () => {
+    const driver = new RedisDriver({
+      id: "redis-ttl-insert-test",
+      name: "Redis TTL Insert Test",
+      type: "redis",
+      host: "localhost",
+    });
+    const client = {
+      set: vi.fn().mockResolvedValue("OK"),
+      persist: vi.fn().mockResolvedValue(1),
+    };
+
+    (
+      driver as unknown as {
+        client: typeof client | null;
+        connected: boolean;
+      }
+    ).client = client;
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    await expect(
+      driver.insertRow({
+        database: "db0",
+        schema: "db0",
+        table: "users",
+        values: {
+          key: "users:1",
+          value: "Alice",
+          ttl: "60",
+        },
+      }),
+    ).resolves.toEqual({ affectedRows: 1 });
+
+    expect(client.set).toHaveBeenCalledWith("users:1", "Alice", {
+      NX: true,
+      EX: 60,
+    });
+
+    await expect(
+      driver.insertRow({
+        database: "db0",
+        schema: "db0",
+        table: "users",
+        values: {
+          key: "users:2",
+          value: "Bob",
+          ttl: "-1",
+        },
+      }),
+    ).resolves.toEqual({ affectedRows: 1 });
+
+    expect(client.set).toHaveBeenCalledWith("users:2", "Bob", {
+      NX: true,
+    });
+    expect(client.persist).toHaveBeenCalledWith("users:2");
   });
 
   it("caps key scans when discovering Redis objects", async () => {

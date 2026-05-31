@@ -53,13 +53,12 @@ describe("ConnectionFormView", () => {
     await user.click(screen.getByRole("button", { name: /mongodb/i }));
 
     expect(screen.getByLabelText("MongoDB connection URI")).toBeTruthy();
-    expect(screen.getByLabelText("MongoDB auth database")).toBeTruthy();
+    expect(screen.getByLabelText("Database")).toBeTruthy();
 
     await user.click(screen.getByRole("button", { name: /redis/i }));
 
-    expect(screen.getByLabelText("Redis username")).toBeTruthy();
-    expect(screen.getByLabelText("Redis key prefix")).toBeTruthy();
-    expect(screen.getByLabelText("Redis DB")).toBeTruthy();
+    expect(screen.getByLabelText("Username")).toBeTruthy();
+    expect(screen.getByLabelText("Database")).toBeTruthy();
 
     await user.click(screen.getByRole("button", { name: /elasticsearch/i }));
 
@@ -180,7 +179,8 @@ describe("ConnectionFormView", () => {
       screen.getByLabelText("MongoDB connection URI"),
       "mongodb://localhost:27017/app",
     );
-    await user.type(screen.getByLabelText("MongoDB auth database"), "admin");
+    await user.clear(screen.getByLabelText("Database"));
+    await user.type(screen.getByLabelText("Database"), "admin");
 
     clearPostedMessages();
     await submitCreateConnection(user);
@@ -191,7 +191,7 @@ describe("ConnectionFormView", () => {
       payload: expect.objectContaining({
         type: "mongodb",
         connectionUri: "mongodb://localhost:27017/app",
-        authDatabase: "admin",
+        database: "admin",
       }),
     });
     expect(mongoMessage?.payload).not.toHaveProperty("uri");
@@ -203,10 +203,9 @@ describe("ConnectionFormView", () => {
     await user.clear(screen.getByLabelText("Connection name"));
     await user.type(screen.getByLabelText("Connection name"), "Redis Cache");
     await user.click(screen.getByRole("button", { name: /redis/i }));
-    await user.type(screen.getByLabelText("Redis username"), "cache-user");
-    await user.clear(screen.getByLabelText("Redis DB"));
-    await user.type(screen.getByLabelText("Redis DB"), "2");
-    await user.type(screen.getByLabelText("Redis key prefix"), "app:");
+    await user.type(screen.getByLabelText("Username"), "cache-user");
+    await user.clear(screen.getByLabelText("Database"));
+    await user.type(screen.getByLabelText("Database"), "2");
 
     clearPostedMessages();
     await submitCreateConnection(user);
@@ -215,9 +214,8 @@ describe("ConnectionFormView", () => {
       type: "saveConnection",
       payload: expect.objectContaining({
         type: "redis",
-        redisUsername: "cache-user",
-        redisDb: 2,
-        keyPrefix: "app:",
+        username: "cache-user",
+        database: "2",
       }),
     });
 
@@ -426,7 +424,7 @@ describe("ConnectionFormView", () => {
     });
   });
 
-  it("rejects invalid Redis DB input instead of coercing it to 0", async () => {
+  it("rejects invalid Redis database input instead of falling back to DB 0", async () => {
     const user = userEvent.setup();
 
     render(<ConnectionFormView existing={null} />);
@@ -434,16 +432,18 @@ describe("ConnectionFormView", () => {
     await user.clear(screen.getByLabelText("Connection name"));
     await user.type(screen.getByLabelText("Connection name"), "Redis Cache");
     await user.click(screen.getByRole("button", { name: /redis/i }));
-    await user.clear(screen.getByLabelText("Redis DB"));
-    await user.type(screen.getByLabelText("Redis DB"), "abc");
+    await user.clear(screen.getByLabelText("Database"));
+    await user.type(screen.getByLabelText("Database"), "abc");
 
     clearPostedMessages();
     await submitCreateConnection(user);
 
     expect(getLastPostedMessage()).toBeUndefined();
-    expect(
-      screen.getByText("Redis DB must be a non-negative integer."),
-    ).toBeTruthy();
+    await waitFor(() => {
+      expect(
+        screen.getByText(/Redis database must be a non-negative integer\./i),
+      ).toBeTruthy();
+    });
   });
 
   it("posts test, save, and cancel messages and reacts to result messages", async () => {

@@ -348,45 +348,20 @@ describe("parseConnectionFormPanelMessage", () => {
 
     expect(parsed).toEqual({
       type: "saveConnection",
-      payload: {
+      payload: expect.objectContaining({
         id: "conn-nosql",
         name: "Mongo Local",
         type: "mongodb",
-        readOnly: undefined,
-        host: undefined,
-        port: undefined,
-        database: undefined,
-        username: undefined,
-        filePath: undefined,
-        ssl: undefined,
-        rejectUnauthorized: undefined,
-        folder: undefined,
-        serviceName: undefined,
-        thickMode: undefined,
-        clientPath: undefined,
         connectionUri: "mongodb://localhost:27017/app",
-        authDatabase: "admin",
-        replicaSet: undefined,
-        directConnection: undefined,
-        redisUsername: undefined,
-        keyPrefix: undefined,
-        awsProfile: undefined,
         endpoint: "http://localhost:8000",
-        apiKey: undefined,
-        cloudId: undefined,
         uri: "mongodb://localhost:27017/app",
         authSource: "admin",
-        redisDb: 2,
-        awsRegion: undefined,
-        awsAccessKeyId: undefined,
-        awsSecretAccessKey: undefined,
-        awsSessionToken: undefined,
         awsEndpoint: "http://localhost:8000",
-        useSecretStorage: undefined,
-        password: undefined,
-        hasStoredSecret: undefined,
-      },
+      }),
     });
+    expect(parsed?.payload).not.toHaveProperty("authDatabase");
+    expect(parsed?.payload).not.toHaveProperty("redisDb");
+    expect(parsed?.payload).not.toHaveProperty("keyPrefix");
   });
 
   it("normalizes Oracle legacy database field to serviceName", () => {

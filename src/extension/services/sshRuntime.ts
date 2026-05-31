@@ -4,7 +4,6 @@ import * as https from "node:https";
 import * as net from "node:net";
 import { Duplex, PassThrough } from "node:stream";
 import * as tls from "node:tls";
-import { Agent as AgentBase, type AgentConnectOpts } from "agent-base";
 import type { ConnectionSshHostVerificationMode } from "../../shared/connectionConfig";
 
 export interface ConnectionSshSettings {
@@ -343,24 +342,6 @@ async function createSecureAgentSocket(
   });
 }
 
-class SshForwardAgent extends AgentBase {
-  constructor(
-    private readonly client: SshClientLike,
-    private readonly secureEndpoint: boolean,
-  ) {
-    super({ keepAlive: true });
-  }
-
-  override connect(
-    _req: http.ClientRequest,
-    options: AgentConnectOpts,
-  ): Promise<Duplex> {
-    return this.secureEndpoint
-      ? createSecureAgentSocket(this.client, options as TlsClientRequestArgs)
-      : createAgentSocket(this.client, options);
-  }
-}
-
 async function createVerifiedClient(
   ssh: ConnectionSshSettings,
   dependencies: SshRuntimeDependencies,
@@ -491,10 +472,30 @@ async function createTcpForwardRuntime(
   }
 }
 
-function createHttpAgentRuntime(
+async function createHttpAgentRuntime(
   client: SshClientLike,
   verifiedFingerprintSha256: string,
-): SshRuntime {
+): Promise<SshRuntime> {
+  const { Agent: AgentBase } = await import("agent-base");
+
+  class SshForwardAgent extends AgentBase {
+    constructor(
+      private readonly client: SshClientLike,
+      private readonly secureEndpoint: boolean,
+    ) {
+      super({ keepAlive: true });
+    }
+
+    override connect(
+      _req: http.ClientRequest,
+      options: http.ClientRequestArgs,
+    ): Promise<Duplex> {
+      return this.secureEndpoint
+        ? createSecureAgentSocket(this.client, options as TlsClientRequestArgs)
+        : createAgentSocket(this.client, options);
+    }
+  }
+
   const httpAgent = new SshForwardAgent(client, false) as unknown as http.Agent;
   const httpsAgent = new SshForwardAgent(
     client,
@@ -537,5 +538,5 @@ export async function createSshRuntime(
     return createTcpForwardRuntime(client, verifiedFingerprintSha256, request);
   }
 
-  return createHttpAgentRuntime(client, verifiedFingerprintSha256);
+  return await createHttpAgentRuntime(client, verifiedFingerprintSha256);
 }

@@ -557,18 +557,6 @@
                 "type": "string",
                 "description": "Connection URI for MongoDB or other URI-based drivers."
               },
-              "redisDb": {
-                "type": "number",
-                "description": "Redis database index to select after connecting."
-              },
-              "redisUsername": {
-                "type": "string",
-                "description": "Redis ACL username for authenticated connections."
-              },
-              "keyPrefix": {
-                "type": "string",
-                "description": "Optional Redis key prefix applied when browsing keys."
-              },
               "endpoint": {
                 "type": "string",
                 "description": "Custom service endpoint for Elasticsearch or DynamoDB."

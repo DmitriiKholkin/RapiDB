@@ -39,7 +39,7 @@ describe("MongoDBDriver — connect()", () => {
     mongoClientMocks.db.mockClear();
   });
 
-  it("builds a URI with the selected database and authDatabase precedence", async () => {
+  it("builds a URI with the selected database and authSource", async () => {
     const driver = new MongoDBDriver({
       id: "mongodb-connect-auth-database",
       name: "Mongo Connect Auth Database",
@@ -49,8 +49,7 @@ describe("MongoDBDriver — connect()", () => {
       username: "app user",
       password: "p@ss word",
       database: "appdb",
-      authDatabase: "admin-auth",
-      authSource: "legacy-auth",
+      authSource: "admin-auth",
     });
 
     await driver.connect();
@@ -111,14 +110,13 @@ describe("MongoDBDriver — connect()", () => {
     ]);
   });
 
-  it("uses legacy uri when connectionUri is absent and still applies authDatabase precedence", async () => {
+  it("uses legacy uri when connectionUri is absent and still applies authSource", async () => {
     const driver = new MongoDBDriver({
       id: "mongodb-connect-legacy-uri",
       name: "Mongo Connect Legacy URI",
       type: "mongodb",
       uri: "mongodb://legacy.example:27017/legacydb",
-      authDatabase: "admin-auth",
-      authSource: "legacy-auth",
+      authSource: "admin-auth",
     });
 
     await driver.connect();

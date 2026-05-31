@@ -482,8 +482,6 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
     replicaSet: readOptionalString(input, "replicaSet"),
     directConnection: readOptionalBoolean(input, "directConnection"),
     ...(type === "sqlite" ? { sqliteWalMode: sqliteWalMode ?? "auto" } : {}),
-    redisUsername: readOptionalString(input, "redisUsername"),
-    keyPrefix: readOptionalString(input, "keyPrefix"),
     awsProfile: readOptionalString(input, "awsProfile"),
     endpoint:
       readOptionalString(input, "endpoint") ??
@@ -492,7 +490,6 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
     cloudId: readOptionalString(input, "cloudId"),
     uri: readOptionalString(input, "uri"),
     authSource: readOptionalString(input, "authSource"),
-    redisDb: readOptionalNumber(input, "redisDb"),
     awsRegion: readOptionalString(input, "awsRegion"),
     awsAccessKeyId: readOptionalString(input, "awsAccessKeyId"),
     awsSecretAccessKey: readOptionalString(input, "awsSecretAccessKey"),

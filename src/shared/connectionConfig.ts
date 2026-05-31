@@ -25,15 +25,12 @@ export interface ConnectionConfig {
   replicaSet?: string;
   directConnection?: boolean;
   sqliteWalMode?: SQLiteWalMode;
-  redisUsername?: string;
-  keyPrefix?: string;
   awsProfile?: string;
   endpoint?: string;
   apiKey?: string;
   cloudId?: string;
   uri?: string;
   authSource?: string;
-  redisDb?: number;
   awsRegion?: string;
   awsAccessKeyId?: string;
   awsSecretAccessKey?: string;

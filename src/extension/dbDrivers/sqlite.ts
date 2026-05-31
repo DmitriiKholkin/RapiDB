@@ -425,7 +425,7 @@ function classifyWithStatement(sql: string, start: number): SqlStatementKind {
       index = skipSqlTrivia(sql, index);
     }
     const asKeyword = readSqlKeyword(sql, index);
-    if (!asKeyword || asKeyword.keyword !== "AS") return "dml";
+    if (asKeyword?.keyword !== "AS") return "dml";
     index = skipSqlTrivia(sql, asKeyword.next);
     const materializedKeyword = readSqlKeyword(sql, index);
     if (materializedKeyword?.keyword === "NOT") {

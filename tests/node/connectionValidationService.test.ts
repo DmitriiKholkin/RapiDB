@@ -162,7 +162,7 @@ describe("ConnectionValidationService", () => {
       type: "mongodb",
       name: "MongoDB",
       uri: "mongodb://localhost:27017/app",
-      authDatabase: "admin",
+      database: "admin",
       authSource: "legacy-admin",
     });
     const elasticsearchWithCloudId = service.validate({

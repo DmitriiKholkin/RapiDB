@@ -14,6 +14,7 @@ import {
 } from "mongodb";
 import { describe, expect, it, vi } from "vitest";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
+import type { FilterOperator } from "../../src/extension/dbDrivers/types";
 import type { FilterExpression } from "../../src/shared/tableTypes";
 import { NULL_SENTINEL } from "../../src/shared/tableTypes";
 
@@ -713,7 +714,7 @@ describe("MongoDBDriver schema type inference", () => {
       isPrimaryKey: false,
       isForeignKey: false,
       filterable: true,
-      filterOperators: ["is_null", "is_not_null"],
+      filterOperators: ["is_null", "is_not_null"] as FilterOperator[],
       valueSemantics: "plain",
     } as const;
 
