@@ -76,4 +76,50 @@ describe("inferColumnsFromRows", () => {
       ]),
     );
   });
+
+  it("keeps discovered column order while placing primary keys first", () => {
+    const columns = inferColumnsFromRows(
+      [
+        {
+          created_at: "2026-05-31T10:00:00Z",
+          tenant_id: "tenant-1",
+          user_id: "user-1",
+          email: "first@example.com",
+        },
+        {
+          user_id: "user-2",
+          metadata: '{"role":"admin"}',
+        },
+      ],
+      "tenant_id",
+      {
+        primaryKeyNames: ["tenant_id", "user_id"],
+        nullableMode: "schemaLess",
+      },
+    );
+
+    expect(columns.map((column) => column.name)).toEqual([
+      "tenant_id",
+      "user_id",
+      "created_at",
+      "email",
+      "metadata",
+    ]);
+  });
+
+  it("supports schema inference without any primary keys", () => {
+    const columns = inferColumnsFromRows(
+      [{ _id: "row-1", status: "active" }],
+      "_id",
+      {
+        primaryKeyNames: [],
+        nullableMode: "schemaLess",
+      },
+    );
+
+    const idColumn = columns.find((column) => column.name === "_id");
+    expect(idColumn?.isPrimaryKey).toBe(false);
+    expect(idColumn?.primaryKeyOrdinal).toBeUndefined();
+    expect(idColumn?.nullable).toBe(true);
+  });
 });

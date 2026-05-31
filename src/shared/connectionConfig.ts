@@ -22,7 +22,6 @@ export interface ConnectionConfig {
   thickMode?: boolean;
   clientPath?: string;
   connectionUri?: string;
-  authDatabase?: string;
   replicaSet?: string;
   directConnection?: boolean;
   sqliteWalMode?: SQLiteWalMode;

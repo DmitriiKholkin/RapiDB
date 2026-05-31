@@ -34,9 +34,17 @@ export function buildInsertRowOperation(
       continue;
     }
 
+    const value = drv.coerceInputValue(rawValue, column);
+
     columnNames.push(drv.quoteIdentifier(columnName));
+    if (value === null) {
+      // Inline NULL to avoid backend-specific NULL parameter typing issues.
+      valueExpressions.push("NULL");
+      continue;
+    }
+
     valueExpressions.push(drv.buildInsertValueExpr(column, params.length + 1));
-    params.push(drv.coerceInputValue(rawValue, column));
+    params.push(value);
   }
 
   if (columnNames.length === 0) {

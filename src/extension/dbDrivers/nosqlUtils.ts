@@ -46,7 +46,7 @@ export function inferColumnsFromRows(
   },
 ): ColumnTypeMeta[] {
   const primaryKeyNames =
-    options?.primaryKeyNames && options.primaryKeyNames.length > 0
+    options?.primaryKeyNames !== undefined
       ? options.primaryKeyNames
       : [primaryKeyName];
   const primaryKeyNameSet = new Set(primaryKeyNames);
@@ -58,42 +58,50 @@ export function inferColumnsFromRows(
     }
   }
 
-  return [...keys]
-    .sort((left, right) => left.localeCompare(right))
-    .map((name) => {
-      const isPrimaryKey = primaryKeyNameSet.has(name);
-      const sample = rows.find((row) => row[name] !== undefined)?.[name];
-      const category =
-        inferValueCategory(sample) ??
-        (typeof sample === "string" && sample.trim().length > 0
-          ? "text"
-          : "other");
-      const nullable = isPrimaryKey
-        ? false
-        : options?.nullableMode === "schemaLess"
-          ? true
-          : rows.some((row) => row[name] == null);
-      const filterable = category !== "spatial";
-      return {
-        name,
-        type: category,
-        nativeType: category,
-        category,
-        nullable,
-        defaultValue: undefined,
-        isPrimaryKey,
-        primaryKeyOrdinal: isPrimaryKey
-          ? primaryKeyNames.indexOf(name) + 1
-          : undefined,
-        isForeignKey: false,
+  const discoveredNames = [...keys];
+  const orderedPrimaryKeys = primaryKeyNames.filter((name) => keys.has(name));
+  const orderedNonPrimaryColumns = discoveredNames.filter(
+    (name) => !primaryKeyNameSet.has(name),
+  );
+  const orderedColumnNames = [
+    ...orderedPrimaryKeys,
+    ...orderedNonPrimaryColumns,
+  ];
+
+  return orderedColumnNames.map((name) => {
+    const isPrimaryKey = primaryKeyNameSet.has(name);
+    const sample = rows.find((row) => row[name] !== undefined)?.[name];
+    const category =
+      inferValueCategory(sample) ??
+      (typeof sample === "string" && sample.trim().length > 0
+        ? "text"
+        : "other");
+    const nullable = isPrimaryKey
+      ? false
+      : options?.nullableMode === "schemaLess"
+        ? true
+        : rows.some((row) => row[name] == null);
+    const filterable = category !== "spatial";
+    return {
+      name,
+      type: category,
+      nativeType: category,
+      category,
+      nullable,
+      defaultValue: undefined,
+      isPrimaryKey,
+      primaryKeyOrdinal: isPrimaryKey
+        ? primaryKeyNames.indexOf(name) + 1
+        : undefined,
+      isForeignKey: false,
+      filterable,
+      filterOperators: resolveFilterOperators(category, {
         filterable,
-        filterOperators: resolveFilterOperators(category, {
-          filterable,
-          nullable,
-        }),
-        valueSemantics: "plain",
-      } satisfies ColumnTypeMeta;
-    });
+        nullable,
+      }),
+      valueSemantics: "plain",
+    } satisfies ColumnTypeMeta;
+  });
 }
 
 function compareValues(left: unknown, right: unknown): number {

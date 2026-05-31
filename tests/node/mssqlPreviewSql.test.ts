@@ -161,4 +161,35 @@ describe("MSSQL preview SQL literals", () => {
       "INSERT INTO [db].[dbo].[t] ([amount]) VALUES (CAST('9999999999.1234567890' AS numeric(28,10)))",
     );
   });
+
+  it("inlines NULL insert values instead of binding NVARCHAR NULL parameters", () => {
+    const driver = new MSSQLDriver(baseConfig as ConnectionConfig);
+    const operation = buildInsertRowOperation(
+      driver,
+      "db",
+      "dbo",
+      "t",
+      {
+        col_nvarchar: "NVarChar: Привет мир! 你好世界 😀",
+        col_geography: null,
+      },
+      [
+        column("col_nvarchar", "nvarchar(max)", "text"),
+        column("col_geography", "geography", "spatial"),
+      ],
+    );
+
+    expect(operation.sql).toBe(
+      "INSERT INTO [db].[dbo].[t] ([col_nvarchar], [col_geography]) VALUES (?, NULL)",
+    );
+    expect(operation.params).toEqual(["NVarChar: Привет мир! 你好世界 😀"]);
+    expect(
+      driver.materializePreviewInsertSql(operation.sql, operation.params, [
+        column("col_nvarchar", "nvarchar(max)", "text"),
+        column("col_geography", "geography", "spatial"),
+      ]),
+    ).toBe(
+      "INSERT INTO [db].[dbo].[t] ([col_nvarchar], [col_geography]) VALUES (N'NVarChar: Привет мир! 你好世界 😀', NULL)",
+    );
+  });
 });

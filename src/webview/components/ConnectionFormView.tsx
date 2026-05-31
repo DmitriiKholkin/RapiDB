@@ -521,9 +521,6 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const [mongoConnectionUri, setMongoConnectionUri] = useState(
     existing?.connectionUri ?? existing?.uri ?? "",
   );
-  const [mongoAuthDatabase, setMongoAuthDatabase] = useState(
-    existing?.authDatabase ?? existing?.authSource ?? "",
-  );
   const [redisUsername, setRedisUsername] = useState(
     existing?.redisUsername ?? existing?.username ?? "",
   );
@@ -753,7 +750,6 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
               ...(isMongo
                 ? {
                     connectionUri: mongoConnectionUri.trim() || undefined,
-                    authDatabase: mongoAuthDatabase.trim() || undefined,
                   }
                 : {}),
               ...(isRedis
@@ -826,7 +822,6 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     oracleThickMode,
     oracleClientPath,
     mongoConnectionUri,
-    mongoAuthDatabase,
     redisUsername,
     redisKeyPrefix,
     elasticsearchEndpoint,
@@ -1152,30 +1147,17 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
               </Field>
             )}
             {isMongo && (
-              <>
-                <Field
-                  label="Connection URI"
-                  hint="Optional. When set, this URI is used instead of host/port/user fields."
-                >
-                  <FocusInput
-                    aria-label="MongoDB connection URI"
-                    value={mongoConnectionUri}
-                    onChange={(e) => setMongoConnectionUri(e.target.value)}
-                    placeholder="mongodb://user:pass@localhost:27017/mydb"
-                  />
-                </Field>
-                <Field
-                  label="Auth Database"
-                  hint="Optional. For root/admin users, set to admin; otherwise leave blank to authenticate against the selected database."
-                >
-                  <FocusInput
-                    aria-label="MongoDB auth database"
-                    value={mongoAuthDatabase}
-                    onChange={(e) => setMongoAuthDatabase(e.target.value)}
-                    placeholder="admin"
-                  />
-                </Field>
-              </>
+              <Field
+                label="Connection URI"
+                hint="Optional. When set, this URI is used instead of host/port/user fields."
+              >
+                <FocusInput
+                  aria-label="MongoDB connection URI"
+                  value={mongoConnectionUri}
+                  onChange={(e) => setMongoConnectionUri(e.target.value)}
+                  placeholder="mongodb://user:pass@localhost:27017/mydb"
+                />
+              </Field>
             )}
             {isRedis && (
               <>

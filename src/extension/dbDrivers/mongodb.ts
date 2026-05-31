@@ -18,7 +18,12 @@ import {
 import { QUERY_LIMIT_POLICY } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
-import { formatDatetimeForDisplay } from "./BaseDBDriver";
+import {
+  formatDatetimeForDisplay,
+  hexFromBuffer,
+  isHexLike,
+  parseHexToBuffer,
+} from "./BaseDBDriver";
 import {
   applyFilters,
   applySort,
@@ -52,7 +57,7 @@ import type {
   TriggerMeta,
   TypeCategory,
 } from "./types";
-import { resolveFilterOperators } from "./types";
+import { NULL_SENTINEL, resolveFilterOperators } from "./types";
 
 const MONGODB_ENTITY_MANIFEST: DriverEntityManifest = {
   dbObjectKinds: ["table", "view"],
@@ -89,6 +94,11 @@ type MongoshOperation = {
 };
 
 const MONGO_SCALAR_MISS = Symbol("mongo-scalar-miss");
+const MONGO_CLIENT_SIDE_LIKE_NATIVE_TYPES = new Set([
+  "objectId",
+  "javascript",
+  "javascriptWithScope",
+]);
 const UUID_VALUE_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const BASE64_VALUE_RE =
@@ -682,13 +692,13 @@ function formatMongoScalarValue(
 
   if (ctorName === "UUID" || (tag === "Binary" && binarySubtype === 4)) {
     const bytes = bsonBinaryBytes(value);
-    return bytes ? bytes.toString("base64") : String(value);
+    return bytes ? hexFromBuffer(bytes) : String(value);
   }
 
   switch (tag) {
     case "Binary": {
       const bytes = bsonBinaryBytes(value);
-      return bytes ? bytes.toString("base64") : String(value);
+      return bytes ? hexFromBuffer(bytes) : String(value);
     }
     case "Code": {
       const code = (value as { code?: unknown }).code;
@@ -916,7 +926,7 @@ export class MongoDBDriver implements IDBDriver {
       tls: this.config.ssl,
       tlsAllowInvalidCertificates:
         this.config.ssl && this.config.rejectUnauthorized === false,
-      authSource: this.config.authDatabase ?? this.config.authSource,
+      authSource: this.config.authSource,
       replicaSet: this.config.replicaSet,
       directConnection: this.config.directConnection,
     });
@@ -1462,75 +1472,83 @@ export class MongoDBDriver implements IDBDriver {
       request.filters,
       schemaColumns,
     );
+    const requiresClientSideFiltering = this.shouldUseClientSideFiltering(
+      normalizedFilters,
+      schemaColumns,
+    );
     const offset = Math.max(0, (request.page - 1) * request.pageSize);
 
-    try {
-      const criteria = this.buildMongoFilterCriteria(
-        normalizedFilters,
-        schemaColumns,
-      );
-      const sort = request.sort
-        ? ([
-            [request.sort.column, request.sort.direction === "desc" ? -1 : 1],
-          ] as Array<[string, 1 | -1]>)
-        : ([["_id", 1]] as Array<[string, 1 | -1]>);
-      const docs = await this.requireDb(request.database)
-        .collection(request.table)
-        .find(criteria, {
-          promoteValues: false,
-          bsonRegExp: false,
-        })
-        .sort(sort)
-        .skip(offset)
-        .limit(request.pageSize)
-        .toArray();
-      const rows = docs.map((doc) =>
-        this.toRow(doc as Record<string, unknown>),
-      );
-      const totalCount = request.skipCount
-        ? 0
-        : await this.requireDb(request.database)
-            .collection(request.table)
-            .countDocuments(criteria);
+    if (!requiresClientSideFiltering) {
+      try {
+        const criteria = this.buildMongoFilterCriteria(
+          normalizedFilters,
+          schemaColumns,
+        );
+        const sort = request.sort
+          ? ([
+              [request.sort.column, request.sort.direction === "desc" ? -1 : 1],
+            ] as Array<[string, 1 | -1]>)
+          : ([["_id", 1]] as Array<[string, 1 | -1]>);
+        const docs = await this.requireDb(request.database)
+          .collection(request.table)
+          .find(criteria, {
+            promoteValues: false,
+            bsonRegExp: false,
+          })
+          .sort(sort)
+          .skip(offset)
+          .limit(request.pageSize)
+          .toArray();
+        const rows = docs.map((doc) =>
+          this.toRow(doc as Record<string, unknown>),
+        );
+        const totalCount = request.skipCount
+          ? 0
+          : await this.requireDb(request.database)
+              .collection(request.table)
+              .countDocuments(criteria);
 
-      return {
-        columns:
-          schemaColumns.length > 0
-            ? schemaColumns
-            : inferColumnsFromRows(rows, "_id", {
-                nullableMode: "schemaLess",
-              }),
-        rows,
-        totalCount,
-      };
-    } catch {
-      const fallbackReadLimit = Math.max(
-        request.page * request.pageSize * 2,
-        request.pageSize * 10,
-      );
-      const boundedReadLimit = Math.min(
-        MONGODB_QUERY_HARD_CAP,
-        fallbackReadLimit,
-      );
-      const rows = await this.readRows(
-        request.database,
-        request.table,
-        boundedReadLimit,
-      );
-      const filtered = applyFilters(rows, normalizedFilters);
-      const sorted = applySort(filtered, request.sort);
-      const paged = pageRows(sorted, request.page, request.pageSize);
-      return {
-        columns:
-          schemaColumns.length > 0
-            ? schemaColumns
-            : inferColumnsFromRows(sorted, "_id", {
-                nullableMode: "schemaLess",
-              }),
-        rows: paged,
-        totalCount: request.skipCount ? 0 : sorted.length,
-      };
+        return {
+          columns:
+            schemaColumns.length > 0
+              ? schemaColumns
+              : inferColumnsFromRows(rows, "_id", {
+                  nullableMode: "schemaLess",
+                }),
+          rows,
+          totalCount,
+        };
+      } catch {
+        // Fall through to display-value filtering when server-side BSON coercion is unavailable.
+      }
     }
+
+    const fallbackReadLimit = Math.max(
+      request.page * request.pageSize * 2,
+      request.pageSize * 10,
+    );
+    const boundedReadLimit = Math.min(
+      MONGODB_QUERY_HARD_CAP,
+      fallbackReadLimit,
+    );
+    const rows = await this.readRows(
+      request.database,
+      request.table,
+      boundedReadLimit,
+    );
+    const filtered = applyFilters(rows, normalizedFilters);
+    const sorted = applySort(filtered, request.sort);
+    const paged = pageRows(sorted, request.page, request.pageSize);
+    return {
+      columns:
+        schemaColumns.length > 0
+          ? schemaColumns
+          : inferColumnsFromRows(sorted, "_id", {
+              nullableMode: "schemaLess",
+            }),
+      rows: paged,
+      totalCount: request.skipCount ? 0 : sorted.length,
+    };
   }
 
   private buildMongoFilterCriteria(
@@ -1765,6 +1783,10 @@ export class MongoDBDriver implements IDBDriver {
       return value;
     }
 
+    if (value === NULL_SENTINEL) {
+      return null;
+    }
+
     if (typeof value !== "string") {
       return value;
     }
@@ -1860,6 +1882,12 @@ export class MongoDBDriver implements IDBDriver {
     }
 
     if (/^binData(?:\(\d+\))?$/i.test(column.nativeType)) {
+      if (isHexLike(normalized)) {
+        return new Binary(
+          parseHexToBuffer(normalized),
+          binarySubtypeFromColumn(column),
+        );
+      }
       const binDataParsed = parseMongoDisplayBinData(normalized);
       if (binDataParsed) {
         return new Binary(binDataParsed.bytes, binDataParsed.subtype);
@@ -1956,9 +1984,8 @@ export class MongoDBDriver implements IDBDriver {
       : "";
     const database = this.defaultDatabaseName();
     const params = new URLSearchParams();
-    const authDatabase = this.config.authDatabase ?? this.config.authSource;
-    if (authDatabase) {
-      params.set("authSource", authDatabase);
+    if (this.config.authSource) {
+      params.set("authSource", this.config.authSource);
     }
     if (this.config.replicaSet) {
       params.set("replicaSet", this.config.replicaSet);
@@ -2041,41 +2068,48 @@ export class MongoDBDriver implements IDBDriver {
     limit: number,
   ): Promise<ColumnTypeMeta[]> {
     const documents = await this.readSchemaDocuments(database, table, limit);
-    const keys = new Set<string>();
-    for (const document of documents) {
-      for (const key of Object.keys(document)) {
-        keys.add(key);
-      }
-    }
+    const isView = await this.isView(database, table);
+    const inferredColumns = inferColumnsFromRows(documents, "_id", {
+      primaryKeyNames: isView ? [] : ["_id"],
+      nullableMode: "schemaLess",
+    });
 
-    return [...keys]
-      .sort((left, right) => left.localeCompare(right))
-      .map((name) => {
-        const isPrimaryKey = name === "_id";
-        const sample = selectMongoSchemaSample(documents, name);
-        const { category, nativeType, bsonSubtype } =
-          inferMongoSchemaType(sample);
-        const filterable = category !== "spatial";
+    return inferredColumns.map((inferredColumn) => {
+      const { name, isPrimaryKey, primaryKeyOrdinal } = inferredColumn;
+      const sample = selectMongoSchemaSample(documents, name);
+      const { category, nativeType, bsonSubtype } =
+        inferMongoSchemaType(sample);
+      const filterable = category !== "spatial";
+      const nullable = !isPrimaryKey;
 
-        return {
-          name,
-          type: nativeType,
-          nativeType,
-          bsonSubtype,
-          category,
-          nullable: !isPrimaryKey,
-          defaultValue: undefined,
-          isPrimaryKey,
-          primaryKeyOrdinal: isPrimaryKey ? 1 : undefined,
-          isForeignKey: false,
+      return {
+        name,
+        type: nativeType,
+        nativeType,
+        bsonSubtype,
+        category,
+        nullable,
+        defaultValue: undefined,
+        isPrimaryKey,
+        primaryKeyOrdinal,
+        isForeignKey: false,
+        filterable,
+        filterOperators: resolveFilterOperators(category, {
           filterable,
-          filterOperators: resolveFilterOperators(category, {
-            filterable,
-            nullable: !isPrimaryKey,
-          }),
-          valueSemantics: "plain",
-        } satisfies ColumnTypeMeta;
-      });
+          nullable,
+        }),
+        valueSemantics: "plain",
+      } satisfies ColumnTypeMeta;
+    });
+  }
+
+  private async isView(database: string, table: string): Promise<boolean> {
+    try {
+      const definition = await this.getCollectionDefinition(database, table);
+      return definition.type === "view";
+    } catch {
+      return false;
+    }
   }
 
   private async readSchemaDocuments(
@@ -2156,6 +2190,33 @@ export class MongoDBDriver implements IDBDriver {
       );
     }
     return normalized;
+  }
+
+  private shouldUseClientSideFiltering(
+    filters: readonly FilterExpression[],
+    columns: readonly ColumnTypeMeta[],
+  ): boolean {
+    if (filters.length === 0 || columns.length === 0) {
+      return false;
+    }
+
+    const columnMap = new Map(columns.map((column) => [column.name, column]));
+    return filters.some((filter) => {
+      if (filter.operator !== "like" && filter.operator !== "ilike") {
+        return false;
+      }
+
+      const column = columnMap.get(filter.column);
+      if (!column) {
+        return false;
+      }
+
+      return (
+        column.category === "json" ||
+        column.category === "array" ||
+        MONGO_CLIENT_SIDE_LIKE_NATIVE_TYPES.has(column.nativeType)
+      );
+    });
   }
 
   private serializeMongosh(value: unknown): string {

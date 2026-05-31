@@ -15,6 +15,7 @@ import {
 import { describe, expect, it, vi } from "vitest";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import type { FilterExpression } from "../../src/shared/tableTypes";
+import { NULL_SENTINEL } from "../../src/shared/tableTypes";
 
 type Row = Record<string, unknown> & { _id: string };
 
@@ -409,8 +410,8 @@ describe("MongoDBDriver schema type inference", () => {
     const readRowsMock = vi.fn().mockResolvedValue([
       {
         _id: "64a1b2c3d4e5f67890abcdef",
-        t_binary: "AQIDBAUGB/8=",
-        t_binary_uuid: "ESIzRFVmd4iZqrvM3e7//w==",
+        t_binary: "0x01020304050607ff",
+        t_binary_uuid: "0x112233445566778899aabbccddeeffff",
         t_date: "2024-07-04 12:00:00",
         t_decimal128: "123456789.987654321",
         t_int64: "9223372036854775807",
@@ -468,8 +469,8 @@ describe("MongoDBDriver schema type inference", () => {
 
     expect(page.rows[0]).toEqual({
       _id: "64a1b2c3d4e5f67890abcdef",
-      t_binary: "AQIDBAUGB/8=",
-      t_binary_uuid: "ESIzRFVmd4iZqrvM3e7//w==",
+      t_binary: "0x01020304050607ff",
+      t_binary_uuid: "0x112233445566778899aabbccddeeffff",
       t_date: "2024-07-04 12:00:00",
       t_decimal128: "123456789.987654321",
       t_int64: "9223372036854775807",
@@ -477,7 +478,7 @@ describe("MongoDBDriver schema type inference", () => {
     });
   });
 
-  it("filters MongoDB binary columns by their displayed base64 value", async () => {
+  it("filters MongoDB binary columns by their displayed hex value", async () => {
     const driver = new MongoDBDriver({
       id: "mongodb-binary-filter-values",
       type: "mongodb",
@@ -494,8 +495,8 @@ describe("MongoDBDriver schema type inference", () => {
       },
     ]);
     const readRowsMock = vi.fn().mockResolvedValue([
-      { _id: "64a1b2c3d4e5f67890abcdef", t_binary: "AQID" },
-      { _id: "64a1b2c3d4e5f67890abcdee", t_binary: "BAUG" },
+      { _id: "64a1b2c3d4e5f67890abcdef", t_binary: "0x010203" },
+      { _id: "64a1b2c3d4e5f67890abcdee", t_binary: "0x040506" },
     ]);
 
     (
@@ -517,7 +518,7 @@ describe("MongoDBDriver schema type inference", () => {
       table: "bson_types",
       page: 1,
       pageSize: 50,
-      filters: [{ column: "t_binary", operator: "eq", value: "AQID" }],
+      filters: [{ column: "t_binary", operator: "eq", value: "0x010203" }],
       sort: null,
       skipCount: false,
     });
@@ -527,7 +528,7 @@ describe("MongoDBDriver schema type inference", () => {
       table: "bson_types",
       page: 1,
       pageSize: 50,
-      filters: [{ column: "t_binary", operator: "neq", value: "AQID" }],
+      filters: [{ column: "t_binary", operator: "neq", value: "0x010203" }],
       sort: null,
       skipCount: false,
     });
@@ -576,6 +577,85 @@ describe("MongoDBDriver schema type inference", () => {
     expect(notesColumn?.nullable).toBe(true);
   });
 
+  it("does not mark _id as primary key for MongoDB views", async () => {
+    const driver = new MongoDBDriver({
+      id: "mongodb-view-schema",
+      type: "mongodb",
+      name: "mongo-view-schema",
+      host: "localhost",
+      port: 27017,
+      database: "test",
+    });
+
+    const readSchemaDocumentsMock = vi.fn().mockResolvedValue([
+      {
+        _id: new ObjectId("64a1b2c3d4e5f67890abcdef"),
+        status: "active",
+      },
+    ]);
+
+    (
+      driver as unknown as {
+        readSchemaDocuments: typeof readSchemaDocumentsMock;
+      }
+    ).readSchemaDocuments = readSchemaDocumentsMock;
+
+    (driver as unknown as { isView: () => Promise<boolean> }).isView = vi
+      .fn()
+      .mockResolvedValue(true);
+
+    const columns = await driver.describeColumns(
+      "test",
+      "test",
+      "active_users",
+    );
+    const idColumn = columns.find((column) => column.name === "_id");
+
+    expect(idColumn?.isPrimaryKey).toBe(false);
+    expect(idColumn?.primaryKeyOrdinal).toBeUndefined();
+  });
+
+  it("preserves MongoDB collection field order with _id forced first", async () => {
+    const driver = new MongoDBDriver({
+      id: "mongodb-column-order",
+      type: "mongodb",
+      name: "mongo-column-order",
+      host: "localhost",
+      port: 27017,
+      database: "test",
+    });
+
+    const readSchemaDocumentsMock = vi.fn().mockResolvedValue([
+      {
+        beta: "B",
+        _id: new ObjectId("64a1b2c3d4e5f67890abcdef"),
+        alpha: "A",
+      },
+      {
+        alpha: "A2",
+        gamma: "G",
+      },
+    ]);
+
+    (
+      driver as unknown as {
+        readSchemaDocuments: typeof readSchemaDocumentsMock;
+      }
+    ).readSchemaDocuments = readSchemaDocumentsMock;
+
+    (driver as unknown as { isView: () => Promise<boolean> }).isView = vi
+      .fn()
+      .mockResolvedValue(false);
+
+    const columns = await driver.describeColumns("test", "test", "events");
+    expect(columns.map((column) => column.name)).toEqual([
+      "_id",
+      "beta",
+      "alpha",
+      "gamma",
+    ]);
+  });
+
   it("normalizes datetime filters against Mongo display values", async () => {
     const driver = createDriverWithRows([
       {
@@ -611,5 +691,97 @@ describe("MongoDBDriver schema type inference", () => {
 
     expect(dateMatches).toEqual(["507f1f77bcf86cd799439011"]);
     expect(timestampMatches).toEqual(["507f1f77bcf86cd799439011"]);
+  });
+
+  it("coerces Mongo NULL sentinel values to real nulls for preview and persistence", () => {
+    const driver = new MongoDBDriver({
+      id: "mongodb-null-sentinel",
+      type: "mongodb",
+      name: "mongo-null-sentinel",
+      host: "localhost",
+      port: 27017,
+      database: "test",
+    });
+
+    const column = {
+      name: "t_null",
+      type: "null",
+      nativeType: "null",
+      category: "other",
+      nullable: true,
+      defaultValue: undefined,
+      isPrimaryKey: false,
+      isForeignKey: false,
+      filterable: true,
+      filterOperators: ["is_null", "is_not_null"],
+      valueSemantics: "plain",
+    } as const;
+
+    const coerced = driver.coerceInputValue(NULL_SENTINEL, column);
+    const preview = driver.buildMutationPreviewStatement(
+      "insert",
+      "test",
+      "test",
+      "bson_types",
+      { values: { t_null: coerced } },
+    );
+
+    expect(coerced).toBeNull();
+    expect(preview).toContain('"t_null": null');
+  });
+
+  it("routes Mongo string-search filters for complex BSON displays to client-side filtering", () => {
+    const driver = new MongoDBDriver({
+      id: "mongodb-client-filter-routing",
+      type: "mongodb",
+      name: "mongo-client-filter-routing",
+      host: "localhost",
+      port: 27017,
+      database: "test",
+    });
+
+    const shouldUseClientSideFiltering = (
+      driver as unknown as {
+        shouldUseClientSideFiltering: (
+          filters: readonly FilterExpression[],
+          columns: ReadonlyArray<{
+            name: string;
+            nativeType: string;
+            category: string;
+          }>,
+        ) => boolean;
+      }
+    ).shouldUseClientSideFiltering.bind(driver);
+
+    expect(
+      shouldUseClientSideFiltering(
+        [{ column: "id", operator: "like", value: "64a1b2c3d4e5f67890abcdef" }],
+        [{ name: "id", nativeType: "objectId", category: "text" }],
+      ),
+    ).toBe(true);
+    expect(
+      shouldUseClientSideFiltering(
+        [{ column: "payload", operator: "like", value: "nested" }],
+        [{ name: "payload", nativeType: "object", category: "json" }],
+      ),
+    ).toBe(true);
+    expect(
+      shouldUseClientSideFiltering(
+        [{ column: "items", operator: "like", value: "3" }],
+        [{ name: "items", nativeType: "array", category: "array" }],
+      ),
+    ).toBe(true);
+    expect(
+      shouldUseClientSideFiltering(
+        [{ column: "fn", operator: "like", value: "100" }],
+        [{ name: "fn", nativeType: "javascript", category: "other" }],
+      ),
+    ).toBe(true);
+    expect(
+      shouldUseClientSideFiltering(
+        [{ column: "name", operator: "like", value: "alp" }],
+        [{ name: "name", nativeType: "string", category: "text" }],
+      ),
+    ).toBe(false);
   });
 });

@@ -479,9 +479,6 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
     connectionUri:
       readOptionalString(input, "connectionUri") ??
       readOptionalString(input, "uri"),
-    authDatabase:
-      readOptionalString(input, "authDatabase") ??
-      readOptionalString(input, "authSource"),
     replicaSet: readOptionalString(input, "replicaSet"),
     directConnection: readOptionalBoolean(input, "directConnection"),
     ...(type === "sqlite" ? { sqliteWalMode: sqliteWalMode ?? "auto" } : {}),

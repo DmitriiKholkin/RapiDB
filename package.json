@@ -557,10 +557,6 @@
                 "type": "string",
                 "description": "Connection URI for MongoDB or other URI-based drivers."
               },
-              "authDatabase": {
-                "type": "string",
-                "description": "MongoDB authentication database used with connectionUri or host-based connections."
-              },
               "redisDb": {
                 "type": "number",
                 "description": "Redis database index to select after connecting."
