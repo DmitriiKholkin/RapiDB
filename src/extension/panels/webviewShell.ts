@@ -22,6 +22,24 @@ export const FULLSCREEN_WEBVIEW_SHELL_LAYOUT = Object.freeze({
   rootStyles: "height: 100vh; overflow: hidden;",
 });
 
+export const APP_WEBVIEW_SHELL_LAYOUT = Object.freeze({
+  htmlStyles: "height: 100%; overflow: hidden;",
+  bodyStyles: "height: 100%; overflow: hidden;",
+  rootStyles: "height: 100vh;",
+});
+
+export const WEBVIEW_SCROLLBAR_STYLES = `
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--vscode-scrollbarSlider-hoverBackground); }
+`;
+
+export const MONACO_SCROLLBAR_STYLES = `
+  .monaco-editor .scrollbar .slider { background: var(--vscode-scrollbarSlider-background) !important; border-radius: 4px; }
+  .monaco-editor .scrollbar .slider:hover { background: var(--vscode-scrollbarSlider-hoverBackground) !important; }
+`;
+
 interface WebviewResourceOptions {
   context: vscode.ExtensionContext;
   webview: vscode.Webview;

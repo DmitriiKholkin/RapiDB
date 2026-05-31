@@ -1,16 +1,20 @@
 import * as vscode from "vscode";
 
+function safelyDispose(action: () => void): void {
+  try {
+    action();
+  } catch {
+    // Ignore dispose errors during panel shutdown and forced cleanup.
+  }
+}
+
 export function attachPanelDisposables(
   panel: vscode.WebviewPanel,
   ...disposables: readonly vscode.Disposable[]
 ): void {
   panel.onDidDispose(() => {
     for (const disposable of disposables) {
-      try {
-        disposable.dispose();
-      } catch {
-        // Ignore dispose errors during panel shutdown.
-      }
+      safelyDispose(() => disposable.dispose());
     }
   });
 }
@@ -20,11 +24,7 @@ export function disposePanelInstances<T>(
   dispose: (instance: T) => void,
 ): void {
   for (const instance of instances) {
-    try {
-      dispose(instance);
-    } catch {
-      // Ignore dispose errors when force-closing all panels.
-    }
+    safelyDispose(() => dispose(instance));
   }
 }
 

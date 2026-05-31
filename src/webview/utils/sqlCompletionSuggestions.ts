@@ -108,23 +108,31 @@ function isRoutine(entry: SchemaObject): boolean {
   return entry.type === "function" || entry.type === "procedure";
 }
 
+const CLASS_OBJECT_TYPES = new Set<SchemaObject["type"]>([
+  "table",
+  "view",
+  "materializedView",
+  "sequence",
+  "type",
+]);
+
+function sortIndex(index: number, prefix?: string): string {
+  const normalizedIndex = String(index).padStart(5, "0");
+  return prefix ? `${prefix}_${normalizedIndex}` : normalizedIndex;
+}
+
 function objectKindFor(
   type: SchemaObject["type"],
 ): SqlCompletionSuggestionKind {
-  switch (type) {
-    case "table":
-      return "class";
-    case "view":
-    case "materializedView":
-    case "sequence":
-    case "type":
-      return "class";
-    case "procedure":
-    case "function":
-      return "function";
-    default:
-      return "value";
+  if (CLASS_OBJECT_TYPES.has(type)) {
+    return "class";
   }
+
+  return type === "procedure" || type === "function" ? "function" : "value";
+}
+
+function countedDetail(label: string, columnCount: number): string {
+  return columnCount > 0 ? `${label} (${columnCount} cols)` : label;
 }
 
 function objectDetailLabel(
@@ -136,21 +144,19 @@ function objectDetailLabel(
   }
 
   if (type === "view") {
-    return columnCount > 0 ? `view (${columnCount} cols)` : "view";
+    return countedDetail("view", columnCount);
   }
 
   if (type === "materializedView") {
-    return columnCount > 0
-      ? `materialized view (${columnCount} cols)`
-      : "materialized view";
+    return countedDetail("materialized view", columnCount);
   }
 
   if (type === "table") {
-    return columnCount > 0 ? `table (${columnCount} cols)` : "table";
+    return countedDetail("table", columnCount);
   }
 
   if (columnCount > 0) {
-    return `table (${columnCount} cols)`;
+    return countedDetail("table", columnCount);
   }
 
   return type ?? "table";
@@ -242,7 +248,7 @@ function buildColumnSuggestions(
     detail: `${objectPath}.${column.name}  ${column.type}`,
     kind: "field",
     insertText: column.name,
-    sortText: String(index).padStart(5, "0"),
+    sortText: sortIndex(index),
   }));
 }
 
@@ -257,9 +263,35 @@ function buildObjectSuggestions(
     detail: `${objectDetailLabel(entry.type, entry.columns.length)} in ${locationLabel(entry, byDatabase)}`,
     kind: objectKindFor(entry.type),
     insertText: entry.object,
-    sortText: `${normalizeName(entry.database) === normalizedPrimary ? "0" : "1"}_${String(index).padStart(5, "0")}`,
+    sortText: sortIndex(
+      index,
+      normalizeName(entry.database) === normalizedPrimary ? "0" : "1",
+    ),
   }));
 }
+
+function buildSchemaSuggestions(
+  databaseName: string,
+  schemaNames: readonly string[],
+): SqlCompletionSuggestion[] {
+  return schemaNames.map((schemaName, index) => ({
+    label: schemaName,
+    detail: `schema in ${databaseName}`,
+    kind: "module",
+    insertText: schemaName,
+    sortText: sortIndex(index, "0"),
+  }));
+}
+
+const SQL_KEYWORD_SUGGESTIONS: SqlCompletionSuggestion[] = SQL_KEYWORDS.map(
+  (keyword, index) => ({
+    label: keyword,
+    detail: undefined,
+    kind: "keyword",
+    insertText: keyword,
+    sortText: sortIndex(index, "3"),
+  }),
+);
 
 export function buildSqlCompletionSuggestions(
   schema: readonly SchemaObject[],
@@ -365,13 +397,7 @@ export function buildSqlCompletionSuggestions(
       const schemaNames = uniqueValues(
         databaseMatches.map((entry) => entry.schema),
       );
-      return schemaNames.map((schemaName, index) => ({
-        label: schemaName,
-        detail: `schema in ${databaseName}`,
-        kind: "module",
-        insertText: schemaName,
-        sortText: `0_${String(index).padStart(5, "0")}`,
-      }));
+      return buildSchemaSuggestions(databaseName, schemaNames);
     }
 
     const schemasWithHint = schema.filter(
@@ -399,17 +425,7 @@ export function buildSqlCompletionSuggestions(
     return [];
   }
 
-  const suggestions: SqlCompletionSuggestion[] = [];
-
-  SQL_KEYWORDS.forEach((keyword, index) => {
-    suggestions.push({
-      label: keyword,
-      detail: undefined,
-      kind: "keyword",
-      insertText: keyword,
-      sortText: `3_${String(index).padStart(5, "0")}`,
-    });
-  });
+  const suggestions: SqlCompletionSuggestion[] = [...SQL_KEYWORD_SUGGESTIONS];
 
   uniqueValues(schema.map((entry) => entry.database)).forEach(
     (databaseName, index) => {
@@ -418,7 +434,7 @@ export function buildSqlCompletionSuggestions(
         detail: "database",
         kind: "module",
         insertText: databaseName,
-        sortText: `0_${String(index).padStart(5, "0")}`,
+        sortText: sortIndex(index, "0"),
       });
     },
   );

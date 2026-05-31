@@ -61,6 +61,18 @@ const vscodeMock = vi.hoisted(() => {
 
 vi.mock("vscode", () => vscodeMock.module);
 vi.mock("../../src/extension/panels/webviewShell", () => ({
+  APP_WEBVIEW_SHELL_LAYOUT: {
+    htmlStyles: "height: 100%; overflow: hidden;",
+    bodyStyles: "height: 100%; overflow: hidden;",
+    rootStyles: "height: 100vh;",
+  },
+  FULLSCREEN_WEBVIEW_SHELL_LAYOUT: {
+    htmlStyles: "height: 100%; overflow: hidden;",
+    bodyStyles: "height: 100%; overflow: hidden;",
+    rootStyles: "height: 100vh; overflow: hidden;",
+  },
+  WEBVIEW_SCROLLBAR_STYLES: "",
+  MONACO_SCROLLBAR_STYLES: "",
   createWebviewShell: vi.fn(() => "<html></html>"),
 }));
 

@@ -28,7 +28,11 @@ import {
 } from "./panelLifecycle";
 import { createPanelWebviewOptions } from "./panelRetentionPolicy";
 import { TableMutationPreviewController } from "./tableMutationPreviewController";
-import { createWebviewShell } from "./webviewShell";
+import {
+  APP_WEBVIEW_SHELL_LAYOUT,
+  createWebviewShell,
+  WEBVIEW_SCROLLBAR_STYLES,
+} from "./webviewShell";
 
 const EXPORT_CHUNK_SIZE = 500;
 const TABLE_PANEL_RETENTION_MODE = "retain" as const;
@@ -673,14 +677,9 @@ export class TablePanel {
         defaultPageSize: this.connectionManager.getDefaultPageSize(),
         panelRetentionMode: TABLE_PANEL_RETENTION_MODE,
       },
-      htmlStyles: "height: 100%; overflow: hidden;",
-      bodyStyles: "height: 100%; overflow: hidden;",
-      rootStyles: "height: 100vh;",
+      ...APP_WEBVIEW_SHELL_LAYOUT,
       extraStyles: `
-        ::-webkit-scrollbar { width: 8px; height: 8px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: var(--vscode-scrollbarSlider-hoverBackground); }
+        ${WEBVIEW_SCROLLBAR_STYLES}
 
         .pk-key-icon {
           display: inline-flex; align-items: center; justify-content: center;

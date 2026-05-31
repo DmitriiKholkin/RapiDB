@@ -125,6 +125,16 @@ function getErdScopeForNode(node: RapiDBNode | undefined): {
   };
 }
 
+function readNodeLocation(node: RapiDBNode): {
+  database: string;
+  schema: string;
+} {
+  return {
+    database: node.database ?? "",
+    schema: node.schema ?? "",
+  };
+}
+
 function showSavedQuery(
   context: vscode.ExtensionContext,
   connectionManager: ConnectionManager,
@@ -428,12 +438,13 @@ function registerExplorerCommands(
       return;
     }
     const isView = node.kind === "view" || node.kind === "materializedView";
+    const location = readNodeLocation(node);
     TablePanel.createOrShow(
       context,
       connectionManager,
       node.connectionId,
-      node.database ?? "",
-      node.schema ?? "",
+      location.database,
+      location.schema,
       node.objectName,
       isView,
       node.kind === "materializedView"
@@ -482,6 +493,7 @@ function registerExplorerCommands(
       let ddl: string | null = null;
       let attemptedSupportedLookup = false;
       const objectKind = isDbObjectKind(node.kind) ? node.kind : undefined;
+      const location = readNodeLocation(node);
       if (
         (node.kind === "table" ||
           node.kind === "view" ||
@@ -490,8 +502,8 @@ function registerExplorerCommands(
       ) {
         attemptedSupportedLookup = true;
         ddl = await driver.getCreateTableDDL(
-          node.database ?? "",
-          node.schema ?? "",
+          location.database,
+          location.schema,
           node.objectName,
         );
       } else if (
@@ -501,8 +513,8 @@ function registerExplorerCommands(
       ) {
         attemptedSupportedLookup = true;
         ddl = await driver.getRoutineDefinition(
-          node.database ?? "",
-          node.schema ?? "",
+          location.database,
+          location.schema,
           node.objectName,
           objectKind,
           node.detailKey,
@@ -514,8 +526,8 @@ function registerExplorerCommands(
       ) {
         attemptedSupportedLookup = true;
         ddl = await driver.getObjectDefinition(
-          node.database ?? "",
-          node.schema ?? "",
+          location.database,
+          location.schema,
           node.objectName,
           objectKind,
         );
@@ -526,8 +538,8 @@ function registerExplorerCommands(
       ) {
         attemptedSupportedLookup = true;
         ddl = await driver.getConstraintDDL(
-          node.database ?? "",
-          node.schema ?? "",
+          location.database,
+          location.schema,
           node.parentTable,
           node.objectName,
         );
@@ -538,8 +550,8 @@ function registerExplorerCommands(
       ) {
         attemptedSupportedLookup = true;
         ddl = await driver.getIndexDDL(
-          node.database ?? "",
-          node.schema ?? "",
+          location.database,
+          location.schema,
           node.parentTable,
           node.objectName,
         );
@@ -550,8 +562,8 @@ function registerExplorerCommands(
       ) {
         attemptedSupportedLookup = true;
         ddl = await driver.getTriggerDDL(
-          node.database ?? "",
-          node.schema ?? "",
+          location.database,
+          location.schema,
           node.parentTable,
           node.objectName,
         );
@@ -672,9 +684,10 @@ function registerExplorerCommands(
       return;
     }
     try {
+      const location = readNodeLocation(node);
       const sql = await driver.getRoutineDefinition(
-        node.database ?? "",
-        node.schema ?? "",
+        location.database,
+        location.schema,
         node.objectName,
         kind,
         node.detailKey,

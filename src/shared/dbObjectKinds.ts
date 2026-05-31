@@ -72,35 +72,41 @@ export const EXPLORER_CATEGORY_CONFIG: Record<
   },
 };
 
+function includesKind<TKind extends DbObjectKind>(
+  kinds: readonly TKind[],
+  value: string,
+): value is TKind {
+  return (kinds as readonly string[]).includes(value);
+}
+
 export function isDbObjectKind(value: string): value is DbObjectKind {
-  return (DB_OBJECT_KINDS as readonly string[]).includes(value);
+  return includesKind(DB_OBJECT_KINDS, value);
 }
 
 export function isDataDbObjectKind(
   kind: DbObjectKind,
 ): kind is DataDbObjectKind {
-  return (DATA_DB_OBJECT_KINDS as readonly string[]).includes(kind);
+  return includesKind(DATA_DB_OBJECT_KINDS, kind);
 }
 
 export function isRoutineDbObjectKind(
   kind: DbObjectKind,
 ): kind is RoutineDbObjectKind {
-  return (ROUTINE_DB_OBJECT_KINDS as readonly string[]).includes(kind);
+  return includesKind(ROUTINE_DB_OBJECT_KINDS, kind);
 }
 
 export function isDdlOnlyDbObjectKind(
   kind: DbObjectKind,
 ): kind is DdlOnlyDbObjectKind {
-  return (DDL_ONLY_DB_OBJECT_KINDS as readonly string[]).includes(kind);
+  return includesKind(DDL_ONLY_DB_OBJECT_KINDS, kind);
 }
 
+const DB_OBJECT_KIND_LABELS: Partial<Record<DbObjectKind, string>> = {
+  materializedView: "materialized view",
+};
+
 function defaultDbObjectKindLabel(kind: DbObjectKind): string {
-  switch (kind) {
-    case "materializedView":
-      return "materialized view";
-    default:
-      return kind;
-  }
+  return DB_OBJECT_KIND_LABELS[kind] ?? kind;
 }
 
 const TABLE_LABEL_BY_CONNECTION_TYPE: Record<

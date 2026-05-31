@@ -242,18 +242,20 @@ function makeCategoryPresentation(
   foreground: string,
   badgeBackground: string,
 ): CategoryPresentation {
-  return {
-    label,
-    foreground,
-    badgeBackground,
-    badgeBorder: "none",
-  };
+  return makeBadgePresentation(label, foreground, badgeBackground);
 }
 function makeStructuralBadgePresentation(
   label: string,
   foreground: string,
   badgeBackground: string,
 ): StructuralBadgePresentation {
+  return makeBadgePresentation(label, foreground, badgeBackground);
+}
+function makeBadgePresentation(
+  label: string,
+  foreground: string,
+  badgeBackground: string,
+): BadgePresentation & { label: string } {
   return {
     label,
     foreground,

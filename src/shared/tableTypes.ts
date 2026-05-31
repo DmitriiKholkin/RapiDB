@@ -365,14 +365,11 @@ function stripOuterDetailParens(value: string): string {
 export function formatPrimaryKeyRoleLabel(
   role?: PrimaryKeyRole,
 ): string | undefined {
-  switch (role) {
-    case "partition":
-      return "Partition key";
-    case "sort":
-      return "Sort key";
-    default:
-      return undefined;
-  }
+  const labels: Partial<Record<PrimaryKeyRole, string>> = {
+    partition: "Partition key",
+    sort: "Sort key",
+  };
+  return role ? labels[role] : undefined;
 }
 
 export function formatPrimaryKeyBadgeLabel(role?: PrimaryKeyRole): "PK" | "SK" {
@@ -458,22 +455,21 @@ export function isNumericCategory(category: TypeCategory): boolean {
   );
 }
 
+const EQ_FILTER_CATEGORIES = new Set<TypeCategory>([
+  "integer",
+  "float",
+  "decimal",
+  "date",
+  "time",
+  "datetime",
+  "boolean",
+  "binary",
+]);
+
 export function defaultFilterOperator(
   column: Pick<ColumnTypeMeta, "category">,
 ): "eq" | "like" {
-  if (column.category === "boolean" || column.category === "binary") {
-    return "eq";
-  }
-
-  if (
-    isNumericCategory(column.category) ||
-    column.category === "date" ||
-    column.category === "time" ||
-    column.category === "datetime"
-  ) {
-    return "eq";
-  }
-  return "like";
+  return EQ_FILTER_CATEGORIES.has(column.category) ? "eq" : "like";
 }
 
 export function valueFilterOperator(

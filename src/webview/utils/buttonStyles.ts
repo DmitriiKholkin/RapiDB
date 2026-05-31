@@ -91,3 +91,7 @@ export function buildButtonStyle(
               }),
   };
 }
+
+export function buildSmallGhostButtonStyle(): React.CSSProperties {
+  return buildButtonStyle("ghost", { size: "sm" });
+}

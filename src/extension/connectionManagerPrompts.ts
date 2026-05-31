@@ -1,6 +1,29 @@
 import * as vscode from "vscode";
 import type { ConnectionManager } from "./connectionManager";
 
+function confirmDestructiveAction(
+  message: string,
+  actionLabel: string,
+): Thenable<string | undefined> {
+  return vscode.window.showWarningMessage(
+    message,
+    { modal: true },
+    actionLabel,
+  );
+}
+
+function formatConnectionQuickPickLabel(
+  isConnected: boolean,
+  name: string,
+): string {
+  return `${isConnected ? "$(circle-filled)" : "$(circle-outline)"} ${name}`;
+}
+
+function formatBookmarkPreview(sql: string): string {
+  const compactSql = sql.slice(0, 60).replace(/\s+/g, " ");
+  return compactSql + (sql.length > 60 ? "…" : "");
+}
+
 export async function pickConnectionWithPrompt(
   connectionManager: Pick<ConnectionManager, "getConnections" | "isConnected">,
 ): Promise<string | undefined> {
@@ -14,7 +37,10 @@ export async function pickConnectionWithPrompt(
 
   const pickedConnection = await vscode.window.showQuickPick(
     connections.map((connection) => ({
-      label: `${connectionManager.isConnected(connection.id) ? "$(circle-filled)" : "$(circle-outline)"} ${connection.name}`,
+      label: formatConnectionQuickPickLabel(
+        connectionManager.isConnected(connection.id),
+        connection.name,
+      ),
       description: connection.type,
       id: connection.id,
     })),
@@ -32,9 +58,8 @@ export async function confirmConnectionRemoval(
   connectionId: string,
 ): Promise<boolean> {
   const connection = connectionManager.getConnection(connectionId);
-  const answer = await vscode.window.showWarningMessage(
+  const answer = await confirmDestructiveAction(
     `Delete connection "${connection?.name ?? connectionId}"?`,
-    { modal: true },
     "Delete",
   );
 
@@ -61,9 +86,8 @@ export async function confirmConnectionFolderRemoval(
     return false;
   }
 
-  const answer = await vscode.window.showWarningMessage(
+  const answer = await confirmDestructiveAction(
     `[RapiDB] Delete folder "${trimmedFolderName}"? ${matchingConnections.length} connection${matchingConnections.length === 1 ? "" : "s"} will be moved to the root level.`,
-    { modal: true },
     "Delete Folder",
   );
 
@@ -79,14 +103,10 @@ export async function confirmBookmarkRemoval(
   bookmarkId: string,
 ): Promise<boolean> {
   const bookmark = connectionManager.getBookmark(bookmarkId);
-  const preview = bookmark
-    ? bookmark.sql.slice(0, 60).replace(/\s+/g, " ") +
-      (bookmark.sql.length > 60 ? "…" : "")
-    : bookmarkId;
+  const preview = bookmark ? formatBookmarkPreview(bookmark.sql) : bookmarkId;
 
-  const answer = await vscode.window.showWarningMessage(
+  const answer = await confirmDestructiveAction(
     `[RapiDB] Delete bookmark: "${preview}"?`,
-    { modal: true },
     "Delete",
   );
 

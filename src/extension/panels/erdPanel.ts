@@ -13,7 +13,10 @@ import {
 } from "./panelLifecycle";
 import { createPanelWebviewOptions } from "./panelRetentionPolicy";
 import { TablePanel } from "./tablePanel";
-import { createWebviewShell } from "./webviewShell";
+import {
+  createWebviewShell,
+  FULLSCREEN_WEBVIEW_SHELL_LAYOUT,
+} from "./webviewShell";
 
 interface ErdPanelScope {
   connectionId: string;
@@ -215,9 +218,7 @@ export class ErdPanel {
         schema: this.scope.schema,
         panelRetentionMode: ERD_PANEL_RETENTION_MODE,
       },
-      htmlStyles: "height: 100%; overflow: hidden;",
-      bodyStyles: "height: 100%; overflow: hidden;",
-      rootStyles: "height: 100vh; overflow: hidden;",
+      ...FULLSCREEN_WEBVIEW_SHELL_LAYOUT,
     });
   }
 

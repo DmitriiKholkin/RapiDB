@@ -30,6 +30,7 @@ import "../xyflow.css";
 import { formatPrimaryKeyBadgeLabel } from "../../shared/tableTypes";
 import type { ErdGraph } from "../../shared/webviewContracts";
 import { onMessage, postMessage } from "../utils/messaging";
+import { readWebviewState, writeWebviewState } from "../utils/vscodeState";
 import { GridLoadingOverlay } from "./GridOverlay";
 
 interface ErdGraphMessage {
@@ -83,11 +84,11 @@ const reactFlowFitViewOptions = { padding: 0.2 };
 type LODLevel = "full" | "placeholder";
 
 const persistedState = (): ErdViewState => {
-  return window.__vscode?.getState<ErdViewState>() ?? {};
+  return readWebviewState<ErdViewState>({});
 };
 
 const persistState = (state: ErdViewState): void => {
-  window.__vscode?.setState<ErdViewState>(state);
+  writeWebviewState(state);
 };
 
 function matchesSearch(

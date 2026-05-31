@@ -9,13 +9,15 @@ import {
 import type { ApplyResultPayload } from "../../../shared/webviewContracts";
 import type { InsertDraftRow, PendingEdits, Row } from "../../types";
 import { buildButtonStyle } from "../../utils/buttonStyles";
+import { TOOLBAR_H } from "../../utils/layout";
+
+export { TOOLBAR_H };
 
 export const PAGE_SIZES = [25, 100, 500, 1000] as const;
 export const DEBOUNCE = 1000;
 export const ROW_H = 26;
 export const HEADER_H = 28;
 export const FILTER_H = 30;
-export const TOOLBAR_H = 36;
 export const PREVIEW_DIALOG_EDITOR_H = "min(42vh, 360px)";
 export const INSERT_DEFAULT_SENTINEL = "__RAPIDB_INSERT_DEFAULT__";
 export const SR_ONLY_STYLE: React.CSSProperties = {

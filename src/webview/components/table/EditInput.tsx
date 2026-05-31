@@ -5,7 +5,7 @@ import {
   type TypeCategory,
 } from "../../../shared/tableTypes";
 import { placeholderForCategory } from "../../types";
-import { buildButtonStyle } from "../../utils/buttonStyles";
+import { buildSmallGhostButtonStyle } from "../../utils/buttonStyles";
 import { buildTextInputStyle } from "../../utils/controlStyles";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
 
@@ -70,7 +70,7 @@ export function EditInput({
     fontStyle: isNull ? "italic" : "normal",
   };
   const nullBtnStyle: React.CSSProperties = {
-    ...buildButtonStyle("ghost", { size: "sm" }),
+    ...buildSmallGhostButtonStyle(),
     flexShrink: 0,
     height: "100%",
     padding: "0 5px",

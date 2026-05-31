@@ -12,7 +12,12 @@ import {
   type QueryPanelCachedResult,
   QueryPanelController,
 } from "./queryPanelController";
-import { createWebviewShell } from "./webviewShell";
+import {
+  APP_WEBVIEW_SHELL_LAYOUT,
+  createWebviewShell,
+  MONACO_SCROLLBAR_STYLES,
+  WEBVIEW_SCROLLBAR_STYLES,
+} from "./webviewShell";
 
 const QUERY_PANEL_RETENTION_MODE = "retain" as const;
 
@@ -196,6 +201,7 @@ export class QueryPanel {
       managerWithPresentation.getQueryEditorPresentation?.(
         this.initialConnectionId,
       );
+    const initialSql = resolvedQueryText ?? "";
     const editorPresentation = driverEditorPresentation
       ? {
           ...driverEditorPresentation,
@@ -221,8 +227,8 @@ export class QueryPanel {
         view: "query",
         connectionId: this.initialConnectionId,
         connectionType,
-        queryText: resolvedQueryText ?? "",
-        initialSql: resolvedQueryText ?? "",
+        queryText: initialSql,
+        initialSql,
         formatOnOpen: this.formatOnOpen,
         isBookmarked: this.isBookmarked ?? false,
         editorLanguage: this.editorLanguage,
@@ -231,16 +237,10 @@ export class QueryPanel {
       },
       includeMediaRoot: true,
       extraCspDirectives: ["worker-src blob:"],
-      htmlStyles: "height: 100%; overflow: hidden;",
-      bodyStyles: "height: 100%; overflow: hidden;",
-      rootStyles: "height: 100vh;",
+      ...APP_WEBVIEW_SHELL_LAYOUT,
       extraStyles: `
-        .monaco-editor .scrollbar .slider { background: var(--vscode-scrollbarSlider-background) !important; border-radius: 4px; }
-        .monaco-editor .scrollbar .slider:hover { background: var(--vscode-scrollbarSlider-hoverBackground) !important; }
-        ::-webkit-scrollbar { width: 8px; height: 8px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: var(--vscode-scrollbarSlider-hoverBackground); }
+        ${MONACO_SCROLLBAR_STYLES}
+        ${WEBVIEW_SCROLLBAR_STYLES}
       `,
     });
   }

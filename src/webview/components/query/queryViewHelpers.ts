@@ -7,8 +7,10 @@ import type {
 import type { ConnectionEntry } from "../../store";
 import { buildButtonStyle } from "../../utils/buttonStyles";
 import { buildSelectControlStyle } from "../../utils/controlStyles";
+import { TOOLBAR_H } from "../../utils/layout";
 
-export const TOOLBAR_H = 36;
+export { TOOLBAR_H };
+
 export const DIVIDER_H = 5;
 export const MIN_EDITOR_H = 80;
 
@@ -35,12 +37,19 @@ export const queryToolbarStyle: CSSProperties = {
   background: "var(--vscode-editorGroupHeader-tabsBackground)",
 };
 
+function buildQueryButtonStyle(
+  variant: "primary" | "ghost",
+  disabled = false,
+): CSSProperties {
+  return buildButtonStyle(variant, { disabled, gap: 4, size: "sm" });
+}
+
 export function buildQueryPrimaryButtonStyle(disabled = false): CSSProperties {
-  return buildButtonStyle("primary", { disabled, gap: 4, size: "sm" });
+  return buildQueryButtonStyle("primary", disabled);
 }
 
 export function buildQueryGhostButtonStyle(disabled = false): CSSProperties {
-  return buildButtonStyle("ghost", { disabled, gap: 4, size: "sm" });
+  return buildQueryButtonStyle("ghost", disabled);
 }
 
 export const querySelectStyle: CSSProperties = {

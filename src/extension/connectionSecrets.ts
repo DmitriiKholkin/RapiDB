@@ -15,6 +15,13 @@ export interface ConnectionSecretSnapshot {
   sshPassphrase?: string;
 }
 
+const CREDENTIAL_BEARING_URI_FIELDS = [
+  "connectionUri",
+  "uri",
+  "endpoint",
+  "awsEndpoint",
+] as const satisfies readonly (keyof ConnectionSecretSnapshot)[];
+
 export function trimOptionalSecretValue(
   value: string | undefined,
 ): string | undefined {
@@ -148,15 +155,18 @@ function extractConnectionSecrets(
   };
 }
 
+function hasCredentialBearingUriSecret(config: ConnectionConfig): boolean {
+  return CREDENTIAL_BEARING_URI_FIELDS.some(
+    (field) => extractCredentialBearingUriSecret(config[field]) !== undefined,
+  );
+}
+
 export function shouldForceSecretStorage(config: ConnectionConfig): boolean {
   return (
     config.sshEnabled === true ||
     config.type === "dynamodb" ||
     config.type === "elasticsearch" ||
-    extractCredentialBearingUriSecret(config.connectionUri) !== undefined ||
-    extractCredentialBearingUriSecret(config.uri) !== undefined ||
-    extractCredentialBearingUriSecret(config.endpoint) !== undefined ||
-    extractCredentialBearingUriSecret(config.awsEndpoint) !== undefined ||
+    hasCredentialBearingUriSecret(config) ||
     trimOptionalSecretValue(config.password) !== undefined ||
     trimOptionalSecretValue(config.sshPassword) !== undefined ||
     trimOptionalSecretValue(config.sshPrivateKey) !== undefined ||

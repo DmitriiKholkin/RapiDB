@@ -7,7 +7,7 @@ import {
   type FilterOperator,
   type ScalarFilterOperator,
 } from "../../../shared/tableTypes";
-import { buildButtonStyle } from "../../utils/buttonStyles";
+import { buildSmallGhostButtonStyle } from "../../utils/buttonStyles";
 import { buildTextInputStyle } from "../../utils/controlStyles";
 
 const CLEAR_FILTER = "__clear__";
@@ -37,7 +37,7 @@ const rootStyle: CSSProperties = {
 };
 
 const triggerStyle: CSSProperties = {
-  ...buildButtonStyle("ghost", { size: "sm" }),
+  ...buildSmallGhostButtonStyle(),
   flexShrink: 0,
   width: 22,
   height: "100%",
@@ -81,7 +81,7 @@ const menuStyle: CSSProperties = {
 };
 
 const menuItemStyle: CSSProperties = {
-  ...buildButtonStyle("ghost", { size: "sm" }),
+  ...buildSmallGhostButtonStyle(),
   width: "100%",
   height: 24,
   padding: "0 6px",

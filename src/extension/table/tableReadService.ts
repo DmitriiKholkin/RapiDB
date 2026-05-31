@@ -147,9 +147,7 @@ export class TableReadService {
   }
 
   private isArithmeticOverflowError(error: unknown): boolean {
-    const message =
-      error instanceof Error ? error.message : String(error ?? "");
-    return /arithmetic overflow/i.test(message);
+    return /arithmetic overflow/i.test(this.readErrorMessage(error));
   }
 
   async *exportAll(
@@ -299,11 +297,14 @@ export class TableReadService {
       return;
     }
 
-    const message =
-      error instanceof Error ? error.message : String(error ?? "");
+    const message = this.readErrorMessage(error);
     throw new Error(
       `${message} (computed columns: ${computedColumns.join(", ")})`,
     );
+  }
+
+  private readErrorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error ?? "");
   }
 
   private formatQueryRows(
