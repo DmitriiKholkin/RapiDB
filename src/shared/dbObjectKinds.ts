@@ -103,6 +103,25 @@ function defaultDbObjectKindLabel(kind: DbObjectKind): string {
   }
 }
 
+const TABLE_LABEL_BY_CONNECTION_TYPE: Record<
+  string,
+  { singular: string; plural: string }
+> = {
+  mongodb: { singular: "collection", plural: "Collections" },
+  redis: { singular: "keyspace", plural: "Keyspaces" },
+  elasticsearch: { singular: "index", plural: "Indices" },
+};
+
+function getTableLabel(
+  connectionType: string | undefined,
+  cardinality: "singular" | "plural",
+): string | undefined {
+  if (!connectionType) {
+    return undefined;
+  }
+  return TABLE_LABEL_BY_CONNECTION_TYPE[connectionType]?.[cardinality];
+}
+
 export function getDbObjectKindDisplayLabel(
   connectionType: string | undefined,
   kind: DbObjectKind,
@@ -110,16 +129,7 @@ export function getDbObjectKindDisplayLabel(
   if (kind !== "table") {
     return defaultDbObjectKindLabel(kind);
   }
-  switch (connectionType) {
-    case "mongodb":
-      return "collection";
-    case "redis":
-      return "keyspace";
-    case "elasticsearch":
-      return "index";
-    default:
-      return "table";
-  }
+  return getTableLabel(connectionType, "singular") ?? "table";
 }
 
 export function getDbObjectKindCategoryLabel(
@@ -129,14 +139,8 @@ export function getDbObjectKindCategoryLabel(
   if (categoryId !== "tables") {
     return EXPLORER_CATEGORY_CONFIG[categoryId].label;
   }
-  switch (connectionType) {
-    case "mongodb":
-      return "Collections";
-    case "redis":
-      return "Keyspaces";
-    case "elasticsearch":
-      return "Indices";
-    default:
-      return EXPLORER_CATEGORY_CONFIG[categoryId].label;
-  }
+  return (
+    getTableLabel(connectionType, "plural") ??
+    EXPLORER_CATEGORY_CONFIG[categoryId].label
+  );
 }

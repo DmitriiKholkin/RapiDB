@@ -207,6 +207,7 @@ function formatTooltipObjectKindLabel(label: string): string {
 const PRIMARY_KEY_ICON_COLOR = new vscode.ThemeColor("charts.yellow");
 const SORT_KEY_ICON_COLOR = new vscode.ThemeColor("textLink.foreground");
 const CONNECTION_NODE_MIME = "application/vnd.rapidb.connection-nodes";
+const SCHEMA_LESS_CONNECTION_TYPES = new Set(["mongodb", "dynamodb", "redis"]);
 
 type ConnectionProviderManager = ScopeAwareConnectionManagerApi & {
   getConnections(): ConnectionConfig[];
@@ -422,18 +423,14 @@ export class ConnectionProvider
     });
     this.refresh();
 
-    const connectionIds = [...new Set(source.map((node) => node.connectionId))]
-      .map((connectionId) => connectionId.trim())
-      .filter(
-        (connectionId, _index, ids) =>
-          connectionId.length > 0 &&
-          ids.includes(connectionId) &&
-          source.some(
-            (node) =>
-              node.connectionId === connectionId &&
-              this.isDraggableConnectionNode(node),
-          ),
-      );
+    const connectionIds = [
+      ...new Set(
+        source
+          .filter((node) => this.isDraggableConnectionNode(node))
+          .map((node) => node.connectionId.trim())
+          .filter((connectionId) => connectionId.length > 0),
+      ),
+    ];
     if (connectionIds.length === 0) {
       return;
     }
@@ -1219,7 +1216,7 @@ export class ConnectionProvider
         undefined,
         request.objectKind,
       );
-      node.description = this.describeTableSection(section, sectionState);
+      node.description = this.describeTableSection(sectionState);
       node.tooltip = this.hasSchemaConcept(request.connectionId)
         ? `${TABLE_SECTION_LABELS[section]} for ${request.schema}.${request.table}`
         : `${TABLE_SECTION_LABELS[section]} for ${request.table}`;
@@ -1228,15 +1225,10 @@ export class ConnectionProvider
   }
 
   private describeTableSection(
-    section: TableDetailSectionKind,
     state: TableDetailState["snapshot"][TableDetailSectionKind],
   ): string {
     if (state.status === "error") {
       return "error";
-    }
-
-    if (section === "triggers") {
-      return `(${state.items.length})`;
     }
 
     return `(${state.items.length})`;
@@ -1486,61 +1478,7 @@ export class ConnectionProvider
       const iconUri = getColoredServerIconUri(config.color, connected);
       node.iconPath = { light: iconUri, dark: iconUri };
     }
-
-    if (config.type === "sqlite") {
-      const sqliteAccess = config.readOnly ? "read-only" : "read-write";
-      const sqliteWalStatus =
-        config.sqliteWalMode === "off"
-          ? "disabled"
-          : config.readOnly
-            ? "automatic when writable"
-            : "automatic";
-      const tooltipLines = [
-        `**${config.name}**`,
-        ``,
-        `Type: \`sqlite\``,
-        `File: \`${config.filePath ?? "—"}\``,
-        `Access: \`${sqliteAccess}\``,
-        `WAL: \`${sqliteWalStatus}\``,
-      ];
-      node.tooltip = new vscode.MarkdownString(tooltipLines.join("\n\n"));
-    } else if (config.type === "elasticsearch") {
-      const authMode = config.username
-        ? "basic"
-        : config.apiKey
-          ? "api key"
-          : "none";
-      const tooltipLines = [
-        `**${config.name}**`,
-        ``,
-        `Type: \`elasticsearch\``,
-        `Endpoint: \`${config.connectionUri ?? config.endpoint ?? (config.host ? `${config.ssl ? "https" : "http"}://${config.host}${config.port ? `:${config.port}` : ""}` : "—")}\``,
-        `Cloud ID: \`${config.cloudId ?? "—"}\``,
-        `Auth: \`${authMode}\``,
-      ];
-      node.tooltip = new vscode.MarkdownString(tooltipLines.join("\n\n"));
-    } else {
-      const sslStatus = config.ssl
-        ? config.rejectUnauthorized !== false
-          ? "enabled"
-          : "enabled (allow self-signed)"
-        : "disabled";
-      const databaseLine =
-        config.type === "oracle"
-          ? `Service Name: \`${config.serviceName ?? "—"}\``
-          : `Database: \`${config.database ?? "—"}\``;
-      const tooltipLines = [
-        `**${config.name}**`,
-        ``,
-        `Type: \`${config.type}\``,
-        `Host: \`${config.host ?? "—"}\``,
-        `Port: \`${config.port ?? "—"}\``,
-        databaseLine,
-        `User: \`${config.username ?? "—"}\``,
-        `SSL: \`${sslStatus}\``,
-      ];
-      node.tooltip = new vscode.MarkdownString(tooltipLines.join("\n\n"));
-    }
+    node.tooltip = this.buildConnectionTooltip(config);
 
     if (!connected && !connecting) {
       node.command = {
@@ -1551,6 +1489,72 @@ export class ConnectionProvider
     }
 
     return node;
+  }
+
+  private buildConnectionTooltip(
+    config: ConnectionConfig,
+  ): vscode.MarkdownString {
+    return new vscode.MarkdownString(
+      [`**${config.name}**`, "", ...this.connectionTooltipDetails(config)].join(
+        "\n\n",
+      ),
+    );
+  }
+
+  private connectionTooltipDetails(config: ConnectionConfig): string[] {
+    if (config.type === "sqlite") {
+      const sqliteAccess = config.readOnly ? "read-only" : "read-write";
+      const sqliteWalStatus =
+        config.sqliteWalMode === "off"
+          ? "disabled"
+          : config.readOnly
+            ? "automatic when writable"
+            : "automatic";
+      return [
+        "Type: `sqlite`",
+        `File: \`${config.filePath ?? "—"}\``,
+        `Access: \`${sqliteAccess}\``,
+        `WAL: \`${sqliteWalStatus}\``,
+      ];
+    }
+
+    if (config.type === "elasticsearch") {
+      const authMode = config.username
+        ? "basic"
+        : config.apiKey
+          ? "api key"
+          : "none";
+      const endpoint =
+        config.connectionUri ??
+        config.endpoint ??
+        (config.host
+          ? `${config.ssl ? "https" : "http"}://${config.host}${config.port ? `:${config.port}` : ""}`
+          : "—");
+      return [
+        "Type: `elasticsearch`",
+        `Endpoint: \`${endpoint}\``,
+        `Cloud ID: \`${config.cloudId ?? "—"}\``,
+        `Auth: \`${authMode}\``,
+      ];
+    }
+
+    const sslStatus = config.ssl
+      ? config.rejectUnauthorized !== false
+        ? "enabled"
+        : "enabled (allow self-signed)"
+      : "disabled";
+    const databaseLine =
+      config.type === "oracle"
+        ? `Service Name: \`${config.serviceName ?? "—"}\``
+        : `Database: \`${config.database ?? "—"}\``;
+    return [
+      `Type: \`${config.type}\``,
+      `Host: \`${config.host ?? "—"}\``,
+      `Port: \`${config.port ?? "—"}\``,
+      databaseLine,
+      `User: \`${config.username ?? "—"}\``,
+      `SSL: \`${sslStatus}\``,
+    ];
   }
 
   private categoryNodes(
@@ -1653,11 +1657,7 @@ export class ConnectionProvider
     }
 
     const connectionType = this.getConnectionType(connectionId);
-    if (
-      connectionType === "mongodb" ||
-      connectionType === "dynamodb" ||
-      connectionType === "redis"
-    ) {
+    if (this.isSchemaLessConnectionType(connectionType)) {
       return true;
     }
 
@@ -1671,11 +1671,17 @@ export class ConnectionProvider
   private hasSchemaConcept(connectionId: string): boolean {
     const connectionType = this.getConnectionType(connectionId);
     return (
-      connectionType !== "mongodb" &&
-      connectionType !== "dynamodb" &&
-      connectionType !== "redis" &&
+      !this.isSchemaLessConnectionType(connectionType) &&
       connectionType !== "elasticsearch"
     );
+  }
+
+  private isSchemaLessConnectionType(
+    connectionType: string | undefined,
+  ): boolean {
+    return connectionType
+      ? SCHEMA_LESS_CONNECTION_TYPES.has(connectionType)
+      : false;
   }
 
   private getEntityManifest(connectionId: string): DriverEntityManifest {

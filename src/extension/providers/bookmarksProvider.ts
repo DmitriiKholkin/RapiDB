@@ -1,5 +1,5 @@
 import type { BookmarkEntry, ConnectionManager } from "../connectionManager";
-import { SqlEntryNode, SqlEntryProvider } from "./sqlEntryProvider";
+import { createSqlEntryProvider, SqlEntryNode } from "./sqlEntryProvider";
 
 export class BookmarkNode extends SqlEntryNode<BookmarkEntry> {
   constructor(entry: BookmarkEntry, connectionName: string) {
@@ -14,22 +14,12 @@ export class BookmarkNode extends SqlEntryNode<BookmarkEntry> {
   }
 }
 
-export class BookmarksProvider extends SqlEntryProvider<
+export const BookmarksProvider = createSqlEntryProvider<
   BookmarkEntry,
   BookmarkNode
-> {
-  constructor(cm: ConnectionManager) {
-    super(cm, cm.onDidChangeBookmarks);
-  }
-
-  protected getEntries(): BookmarkEntry[] {
-    return this.cm.getBookmarks();
-  }
-
-  protected makeNode(
-    entry: BookmarkEntry,
-    connectionName: string,
-  ): BookmarkNode {
-    return new BookmarkNode(entry, connectionName);
-  }
-}
+>({
+  onDidChange: (cm: ConnectionManager) => cm.onDidChangeBookmarks,
+  getEntries: (cm: ConnectionManager) => cm.getBookmarks(),
+  makeNode: (entry: BookmarkEntry, connectionName: string) =>
+    new BookmarkNode(entry, connectionName),
+});

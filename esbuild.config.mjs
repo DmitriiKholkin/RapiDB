@@ -2,47 +2,52 @@ import * as esbuild from "esbuild";
 
 const isWatch = process.argv.includes("--watch");
 const isProduction = process.argv.includes("--production");
-const extensionConfig = {
-  entryPoints: ["src/extension/extension.ts"],
+
+const defineNodeEnv = {
+  "process.env.NODE_ENV": isProduction ? '"production"' : '"development"',
+};
+
+const baseConfig = {
   bundle: true,
+  sourcesContent: true,
+  minify: isProduction,
+  logLevel: "info",
+};
+
+const browserBaseConfig = {
+  ...baseConfig,
+  platform: "browser",
+  target: ["chrome120"],
+  define: defineNodeEnv,
+};
+
+const extensionConfig = {
+  ...baseConfig,
+  entryPoints: ["src/extension/extension.ts"],
   outfile: "dist/extension.js",
   external: ["vscode", "oracledb", "better-sqlite3"],
   format: "cjs",
   platform: "node",
   target: "node20",
   sourcemap: isProduction ? false : "inline",
-  sourcesContent: true,
-  minify: isProduction,
-  logLevel: "info",
 };
+
 const browserExtensionConfig = {
+  ...browserBaseConfig,
   entryPoints: ["src/browser/extension.ts"],
-  bundle: true,
   outfile: "dist/extension-web.js",
   external: ["vscode"],
   format: "cjs",
-  platform: "browser",
-  target: ["chrome120"],
   sourcemap: isProduction ? false : "inline",
-  sourcesContent: true,
-  minify: isProduction,
-  logLevel: "info",
-  define: {
-    "process.env.NODE_ENV": isProduction ? '"production"' : '"development"',
-  },
 };
+
 const webviewConfig = {
+  ...browserBaseConfig,
   entryPoints: ["src/webview/main.tsx"],
-  bundle: true,
   outfile: "dist/webview.js",
   external: [],
   format: "iife",
-  platform: "browser",
-  target: ["chrome120"],
   sourcemap: isProduction ? false : "external",
-  sourcesContent: true,
-  minify: isProduction,
-  logLevel: "info",
   loader: {
     ".tsx": "tsx",
     ".ts": "ts",
@@ -54,10 +59,8 @@ const webviewConfig = {
     ".woff2": "dataurl",
     ".eot": "dataurl",
   },
-  define: {
-    "process.env.NODE_ENV": isProduction ? '"production"' : '"development"',
-  },
 };
+
 async function build() {
   if (isWatch) {
     console.log("⚡ RapiDB — watch mode (desktop + browser + webview)");

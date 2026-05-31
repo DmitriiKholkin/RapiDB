@@ -12,6 +12,7 @@ import {
   type SortConfig,
   TableDataService,
 } from "../tableDataService";
+import { readClipboardTextSafe, writeClipboardText } from "../utils/clipboard";
 import {
   logErrorWithContext,
   normalizeUnknownError,
@@ -21,6 +22,7 @@ import {
   exportTableDataAsJson,
 } from "../utils/exportService";
 import {
+  attachConnectionScopedPanelLifecycle,
   attachPanelDisposables,
   disposePanelInstances,
 } from "./panelLifecycle";
@@ -253,17 +255,14 @@ export class TablePanel {
     );
     TablePanel.panels.set(key, instance);
 
-    const confSub = vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration("rapidb.connections")) {
+    attachConnectionScopedPanelLifecycle(
+      panel,
+      connectionManager,
+      connectionId,
+      () => {
         panel.title = buildTitle();
-      }
-    });
-    const disconnSub = connectionManager.onDidDisconnect((id) => {
-      if (id === connectionId) {
-        panel.dispose();
-      }
-    });
-    attachPanelDisposables(panel, confSub, disconnSub);
+      },
+    );
   }
 
   private async handleMessage(msg: unknown): Promise<void> {
@@ -289,10 +288,10 @@ export class TablePanel {
         if (parsed.payload) await this._handleDeleteRows(parsed.payload);
         break;
       case "exportCSV":
-        await this._handleExportCSV(parsed.payload);
+        await this._handleExport("csv", parsed.payload);
         break;
       case "exportJSON":
-        await this._handleExportJSON(parsed.payload);
+        await this._handleExport("json", parsed.payload);
         break;
       case "confirmMutationPreview":
         if (parsed.payload)
@@ -313,16 +312,12 @@ export class TablePanel {
   }
 
   private async _handleReadClipboard(): Promise<void> {
-    try {
-      const text = await vscode.env.clipboard.readText();
-      await this.postMessage("clipboardText", text);
-    } catch {
-      await this.postMessage("clipboardText", "");
-    }
+    const text = await readClipboardTextSafe();
+    await this.postMessage("clipboardText", text);
   }
 
   private async _handleWriteClipboard(text: string): Promise<void> {
-    await vscode.env.clipboard.writeText(text);
+    await writeClipboardText(text);
   }
 
   private async _handleReady(): Promise<void> {
@@ -569,18 +564,6 @@ export class TablePanel {
         error: error.message,
       });
     }
-  }
-
-  private async _handleExportCSV(
-    payload: ExportPayload | undefined,
-  ): Promise<void> {
-    await this._handleExport("csv", payload);
-  }
-
-  private async _handleExportJSON(
-    payload: ExportPayload | undefined,
-  ): Promise<void> {
-    await this._handleExport("json", payload);
   }
 
   private async _handleExport(

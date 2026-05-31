@@ -1,27 +1,5 @@
 import * as vscode from "vscode";
-
-const CMD = {
-  addConnection: "rapidb.addConnection",
-  editConnection: "rapidb.editConnection",
-  deleteConnection: "rapidb.deleteConnection",
-  renameConnectionFolder: "rapidb.renameConnectionFolder",
-  deleteConnectionFolder: "rapidb.deleteConnectionFolder",
-  connect: "rapidb.connect",
-  disconnect: "rapidb.disconnect",
-  newQuery: "rapidb.newQuery",
-  openTableData: "rapidb.openTableData",
-  showDDL: "rapidb.showDDL",
-  copyNodeName: "rapidb.copyNodeName",
-  openRoutine: "rapidb.openRoutine",
-  openHistoryEntry: "rapidb.openHistoryEntry",
-  openBookmarkEntry: "rapidb.openBookmarkEntry",
-  openErd: "rapidb.openErd",
-  deleteBookmark: "rapidb.deleteBookmark",
-  clearBookmarks: "rapidb.clearBookmarks",
-  clearHistory: "rapidb.clearHistory",
-  disconnectAll: "rapidb.disconnectAll",
-  refresh: "rapidb.refresh",
-} as const;
+import { RAPIDB_COMMANDS as CMD } from "../shared/commandIds";
 
 const EXPLORER_MESSAGE =
   "RapiDB runs in degraded browser mode here. SQLite and other desktop-only drivers need the desktop extension host.";

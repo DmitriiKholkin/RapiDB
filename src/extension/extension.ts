@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { RAPIDB_COMMANDS as CMD } from "../shared/commandIds";
 import {
   isDbObjectKind,
   isDdlOnlyDbObjectKind,
@@ -36,28 +37,6 @@ import {
 import { isOpenDdlSupportedForNode } from "./utils/openDdlEligibility";
 
 let _activated = false;
-const CMD = {
-  addConnection: "rapidb.addConnection",
-  editConnection: "rapidb.editConnection",
-  deleteConnection: "rapidb.deleteConnection",
-  renameConnectionFolder: "rapidb.renameConnectionFolder",
-  deleteConnectionFolder: "rapidb.deleteConnectionFolder",
-  connect: "rapidb.connect",
-  disconnect: "rapidb.disconnect",
-  newQuery: "rapidb.newQuery",
-  openTableData: "rapidb.openTableData",
-  showDDL: "rapidb.showDDL",
-  copyNodeName: "rapidb.copyNodeName",
-  openRoutine: "rapidb.openRoutine",
-  openHistoryEntry: "rapidb.openHistoryEntry",
-  openBookmarkEntry: "rapidb.openBookmarkEntry",
-  openErd: "rapidb.openErd",
-  deleteBookmark: "rapidb.deleteBookmark",
-  clearBookmarks: "rapidb.clearBookmarks",
-  clearHistory: "rapidb.clearHistory",
-  disconnectAll: "rapidb.disconnectAll",
-  refresh: "rapidb.refresh",
-} as const;
 let _connectionManager: import("./connectionManager").ConnectionManager | null =
   null;
 async function resolveConnectionId(
@@ -189,6 +168,66 @@ async function clearSavedEntries(
     await action();
     vscode.window.showInformationMessage(successMessage);
   }
+}
+
+async function ensureConnectionReady(
+  connectionManager: ConnectionManager,
+  connectionId: string,
+  refresh: () => void,
+  failureContext: string,
+): Promise<boolean> {
+  if (connectionManager.isConnected(connectionId)) {
+    return true;
+  }
+
+  try {
+    await connectWithProgress(
+      connectionManager,
+      connectionId,
+      "RapiDB: Connecting…",
+      true,
+    );
+    refresh();
+    return true;
+  } catch (err: unknown) {
+    const error = logErrorWithContext(failureContext, err);
+    vscode.window.showErrorMessage(`[RapiDB] Cannot connect: ${error.message}`);
+    return false;
+  }
+}
+
+function openDdlInQueryPanel(
+  context: vscode.ExtensionContext,
+  connectionManager: ConnectionManager,
+  connectionId: string,
+  ddl: string,
+  presentation: {
+    formatOnOpen: boolean;
+    editorLanguage?: QueryEditorLanguage;
+  },
+): void {
+  if (presentation.editorLanguage) {
+    QueryPanel.createOrShow(
+      context,
+      connectionManager,
+      connectionId,
+      ddl,
+      true,
+      presentation.formatOnOpen,
+      false,
+      presentation.editorLanguage,
+    );
+    return;
+  }
+
+  QueryPanel.createOrShow(
+    context,
+    connectionManager,
+    connectionId,
+    ddl,
+    true,
+    presentation.formatOnOpen,
+  );
 }
 
 function registerCommands(
@@ -353,25 +392,14 @@ function registerCommands(
     if (!connectionId) {
       return;
     }
-    if (!connectionManager.isConnected(connectionId)) {
-      try {
-        await connectWithProgress(
-          connectionManager,
-          connectionId,
-          "RapiDB: Connecting…",
-          true,
-        );
-        refresh();
-      } catch (err: unknown) {
-        const error = logErrorWithContext(
-          `New query connect failed for ${connectionId}`,
-          err,
-        );
-        vscode.window.showErrorMessage(
-          `[RapiDB] Cannot connect: ${error.message}`,
-        );
-        return;
-      }
+    const connected = await ensureConnectionReady(
+      connectionManager,
+      connectionId,
+      refresh,
+      `New query connect failed for ${connectionId}`,
+    );
+    if (!connected) {
+      return;
     }
     QueryPanel.createOrShow(
       context,
@@ -543,6 +571,10 @@ function registerCommands(
         managerWithPresentation.getQueryEditorPresentation?.(
           node.connectionId,
         ) ?? getOpenDdlPresentation();
+      const ddlPresentationResolved = {
+        formatOnOpen: ddlPresentation.formatOnOpen ?? false,
+        editorLanguage: ddlPresentation.editorLanguage,
+      };
       if (objectKind && isRoutineDbObjectKind(objectKind)) {
         QueryPanel.createOrShow(
           context,
@@ -551,27 +583,13 @@ function registerCommands(
           ddl,
         );
       } else {
-        if (ddlPresentation.editorLanguage) {
-          QueryPanel.createOrShow(
-            context,
-            connectionManager,
-            node.connectionId,
-            ddl,
-            true,
-            ddlPresentation.formatOnOpen,
-            false,
-            ddlPresentation.editorLanguage,
-          );
-        } else {
-          QueryPanel.createOrShow(
-            context,
-            connectionManager,
-            node.connectionId,
-            ddl,
-            true,
-            ddlPresentation.formatOnOpen,
-          );
-        }
+        openDdlInQueryPanel(
+          context,
+          connectionManager,
+          node.connectionId,
+          ddl,
+          ddlPresentationResolved,
+        );
       }
     } catch (err: unknown) {
       const error = logErrorWithContext(
@@ -595,25 +613,14 @@ function registerCommands(
       return;
     }
 
-    if (!connectionManager.isConnected(connectionId)) {
-      try {
-        await connectWithProgress(
-          connectionManager,
-          connectionId,
-          "RapiDB: Connecting…",
-          true,
-        );
-        refresh();
-      } catch (err: unknown) {
-        const error = logErrorWithContext(
-          `Open ERD connect failed for ${connectionId}`,
-          err,
-        );
-        vscode.window.showErrorMessage(
-          `[RapiDB] Cannot connect: ${error.message}`,
-        );
-        return;
-      }
+    const connected = await ensureConnectionReady(
+      connectionManager,
+      connectionId,
+      refresh,
+      `Open ERD connect failed for ${connectionId}`,
+    );
+    if (!connected) {
+      return;
     }
 
     const scope = getErdScopeForNode(node);
@@ -639,25 +646,14 @@ function registerCommands(
       return;
     }
     const kind = objectKind;
-    if (!connectionManager.isConnected(node.connectionId)) {
-      try {
-        await connectWithProgress(
-          connectionManager,
-          node.connectionId,
-          "RapiDB: Connecting…",
-          true,
-        );
-        refresh();
-      } catch (err: unknown) {
-        const error = logErrorWithContext(
-          `Open routine connect failed for ${node.objectName}`,
-          err,
-        );
-        vscode.window.showErrorMessage(
-          `[RapiDB] Cannot connect: ${error.message}`,
-        );
-        return;
-      }
+    const connected = await ensureConnectionReady(
+      connectionManager,
+      node.connectionId,
+      refresh,
+      `Open routine connect failed for ${node.objectName}`,
+    );
+    if (!connected) {
+      return;
     }
     const driver = connectionManager.getDriver(node.connectionId);
     if (!driver) {

@@ -1,4 +1,4 @@
-import type * as vscode from "vscode";
+import * as vscode from "vscode";
 
 export function attachPanelDisposables(
   panel: vscode.WebviewPanel,
@@ -26,4 +26,31 @@ export function disposePanelInstances<T>(
       // Ignore dispose errors when force-closing all panels.
     }
   }
+}
+
+type ConnectionLifecycleManager = {
+  onDidDisconnect(listener: (connectionId: string) => void): vscode.Disposable;
+};
+
+export function attachConnectionScopedPanelLifecycle(
+  panel: vscode.WebviewPanel,
+  connectionManager: ConnectionLifecycleManager,
+  connectionId: string,
+  onConnectionsConfigurationChange: () => void,
+): void {
+  const configSubscription = vscode.workspace.onDidChangeConfiguration(
+    (event) => {
+      if (event.affectsConfiguration("rapidb.connections")) {
+        onConnectionsConfigurationChange();
+      }
+    },
+  );
+
+  const disconnectSubscription = connectionManager.onDidDisconnect((id) => {
+    if (id === connectionId) {
+      panel.dispose();
+    }
+  });
+
+  attachPanelDisposables(panel, configSubscription, disconnectSubscription);
 }

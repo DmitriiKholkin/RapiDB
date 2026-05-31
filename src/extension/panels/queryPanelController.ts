@@ -9,6 +9,7 @@ import {
 import { parseQueryPanelMessage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import type { QueryColumnMeta } from "../dbDrivers/types";
+import { readClipboardTextSafe, writeClipboardText } from "../utils/clipboard";
 import { normalizeUnknownError } from "../utils/errorHandling";
 import {
   exportQueryResultsAsCsv,
@@ -203,10 +204,7 @@ function applyHardCapToSqlQuery(
 
   switch (connectionType) {
     case "mssql":
-      if (
-        LIMITABLE_QUERY_PREFIX.test(classificationQuery) &&
-        !WITH_QUERY_PREFIX.test(classificationQuery)
-      ) {
+      {
         const topRewritten = applyMssqlTopHardCap(normalizedQuery, hardCap);
         if (topRewritten) {
           return {
@@ -309,10 +307,10 @@ export class QueryPanelController {
         await this.pushSchema(parsed.payload?.connectionId);
         break;
       case "exportResultsCSV":
-        await this.handleExportResultsCsv();
+        await this.handleExportResults("csv");
         break;
       case "exportResultsJSON":
-        await this.handleExportResultsJson();
+        await this.handleExportResults("json");
         break;
       case "readClipboard":
         await this.handleReadClipboard();
@@ -677,25 +675,13 @@ export class QueryPanelController {
     await exportQueryResultsAsJson(cached, { context: this.context });
   }
 
-  private async handleExportResultsCsv(): Promise<void> {
-    await this.handleExportResults("csv");
-  }
-
-  private async handleExportResultsJson(): Promise<void> {
-    await this.handleExportResults("json");
-  }
-
   private async handleReadClipboard(): Promise<void> {
-    try {
-      const text = await vscode.env.clipboard.readText();
-      this.view.postMessage({ type: "clipboardText", payload: text });
-    } catch {
-      this.view.postMessage({ type: "clipboardText", payload: "" });
-    }
+    const text = await readClipboardTextSafe();
+    this.view.postMessage({ type: "clipboardText", payload: text });
   }
 
   private async handleWriteClipboard(text: string): Promise<void> {
-    await vscode.env.clipboard.writeText(text);
+    await writeClipboardText(text);
   }
 
   private async handleAddBookmark(

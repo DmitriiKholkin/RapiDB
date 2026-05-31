@@ -10,6 +10,10 @@ export function extractFirstSqlLine(sql: string): string {
   );
 }
 
+function escapeMarkdownCodeFence(text: string): string {
+  return text.replace(/```/g, "``\\`");
+}
+
 interface SqlEntryNodeOptions {
   connectionName: string;
   iconId: string;
@@ -36,7 +40,7 @@ export abstract class SqlEntryNode<
     this.iconPath = new vscode.ThemeIcon(options.iconId);
     this.description = options.connectionName;
     this.tooltip = new vscode.MarkdownString(
-      `**${options.connectionName}** — ${options.dateLabel}\n\`\`\`\n${entry.sql}\n\`\`\``,
+      `**${options.connectionName}** — ${options.dateLabel}\n\`\`\`\n${escapeMarkdownCodeFence(entry.sql)}\n\`\`\``,
     );
     this.command = {
       command: options.command,
@@ -90,5 +94,35 @@ export abstract class SqlEntryProvider<
     );
   }
   protected abstract getEntries(): TEntry[];
-  protected abstract makeNode(entry: TEntry, connectionName: string): TNode;
+
+  protected abstract makeNode(_entry: TEntry, _connectionName: string): TNode;
+}
+
+export function createSqlEntryProvider<
+  TEntry extends {
+    id: string;
+    sql: string;
+    connectionId: string;
+  },
+  TNode extends vscode.TreeItem,
+>(options: {
+  onDidChange: (cm: ConnectionManager) => vscode.Event<void>;
+  getEntries: (cm: ConnectionManager) => TEntry[];
+  makeNode: (entry: TEntry, connectionName: string) => TNode;
+}): new (
+  cm: ConnectionManager,
+) => SqlEntryProvider<TEntry, TNode> {
+  return class extends SqlEntryProvider<TEntry, TNode> {
+    constructor(cm: ConnectionManager) {
+      super(cm, options.onDidChange(cm));
+    }
+
+    protected override getEntries(): TEntry[] {
+      return options.getEntries(this.cm);
+    }
+
+    protected override makeNode(entry: TEntry, connectionName: string): TNode {
+      return options.makeNode(entry, connectionName);
+    }
+  };
 }

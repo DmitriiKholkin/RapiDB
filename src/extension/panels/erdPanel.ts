@@ -7,7 +7,7 @@ import {
   normalizeUnknownError,
 } from "../utils/errorHandling";
 import {
-  attachPanelDisposables,
+  attachConnectionScopedPanelLifecycle,
   disposePanelInstances,
 } from "./panelLifecycle";
 import { createPanelWebviewOptions } from "./panelRetentionPolicy";
@@ -121,19 +121,14 @@ export class ErdPanel {
     const instance = new ErdPanel(panel, context, connectionManager, scope);
     ErdPanel.panels.set(key, instance);
 
-    const confSub = vscode.workspace.onDidChangeConfiguration((event) => {
-      if (event.affectsConfiguration("rapidb.connections")) {
+    attachConnectionScopedPanelLifecycle(
+      panel,
+      connectionManager,
+      scope.connectionId,
+      () => {
         panel.title = buildTitle();
-      }
-    });
-
-    const disconnectSub = connectionManager.onDidDisconnect((connectionId) => {
-      if (connectionId === scope.connectionId) {
-        panel.dispose();
-      }
-    });
-
-    attachPanelDisposables(panel, confSub, disconnectSub);
+      },
+    );
   }
 
   private static key(scope: ErdPanelScope): string {

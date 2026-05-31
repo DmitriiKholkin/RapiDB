@@ -2,6 +2,59 @@ import React from "react";
 import { Icon } from "../Icon";
 import { type TableApplyStatus, tableButtonStyle } from "./tableViewHelpers";
 
+const bannerLayoutStyle: React.CSSProperties = {
+  flexShrink: 0,
+  padding: "6px 12px",
+  fontSize: 12,
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
+};
+
+const warningBannerToneStyle: React.CSSProperties = {
+  background:
+    "var(--vscode-inputValidation-warningBackground, rgba(180,120,0,0.15))",
+  borderBottom:
+    "1px solid var(--vscode-inputValidation-warningBorder, rgba(180,120,0,0.4))",
+  color: "var(--vscode-editorWarning-foreground, #CCA700)",
+};
+
+const errorBannerToneStyle: React.CSSProperties = {
+  background: "var(--vscode-inputValidation-errorBackground)",
+  borderBottom: "1px solid var(--vscode-inputValidation-errorBorder)",
+  color: "var(--vscode-errorForeground)",
+};
+
+const dismissTextButtonStyle: React.CSSProperties = {
+  background: "none",
+  border: "none",
+  cursor: "pointer",
+  color: "inherit",
+  opacity: 0.7,
+  fontSize: 14,
+  lineHeight: 1,
+  padding: "0 2px",
+};
+
+interface BannerDismissButtonProps {
+  ariaLabel: string;
+  onClick: () => void;
+}
+
+function BannerDismissButton({ ariaLabel, onClick }: BannerDismissButtonProps) {
+  return (
+    <button
+      type="button"
+      aria-label={ariaLabel}
+      style={dismissTextButtonStyle}
+      title="Dismiss"
+      onClick={onClick}
+    >
+      ×
+    </button>
+  );
+}
+
 interface TableStatusBannersProps {
   filterError: string | null;
   readError: string | null;
@@ -23,95 +76,33 @@ export function TableStatusBanners({
         <div
           role="status"
           aria-live="polite"
-          style={{
-            flexShrink: 0,
-            padding: "6px 12px",
-            fontSize: 12,
-            background:
-              "var(--vscode-inputValidation-warningBackground, rgba(180,120,0,0.15))",
-            borderBottom:
-              "1px solid var(--vscode-inputValidation-warningBorder, rgba(180,120,0,0.4))",
-            color: "var(--vscode-editorWarning-foreground, #CCA700)",
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-          }}
+          style={{ ...bannerLayoutStyle, ...warningBannerToneStyle }}
         >
           <span style={{ fontWeight: 600 }}>⚠ Filter:</span>
           <span style={{ flex: 1 }}>{filterError}</span>
-          <button
-            type="button"
-            aria-label="Dismiss filter error"
-            style={{
-              background: "none",
-              border: "none",
-              cursor: "pointer",
-              color: "inherit",
-              opacity: 0.7,
-              fontSize: 14,
-              lineHeight: 1,
-              padding: "0 2px",
-            }}
-            title="Dismiss"
+          <BannerDismissButton
+            ariaLabel="Dismiss filter error"
             onClick={onDismissFilterError}
-          >
-            ×
-          </button>
+          />
         </div>
       )}
       {readError && (
         <div
           role="alert"
-          style={{
-            flexShrink: 0,
-            padding: "6px 12px",
-            fontSize: 12,
-            background: "var(--vscode-inputValidation-errorBackground)",
-            borderBottom: "1px solid var(--vscode-inputValidation-errorBorder)",
-            color: "var(--vscode-errorForeground)",
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-          }}
+          style={{ ...bannerLayoutStyle, ...errorBannerToneStyle }}
         >
           <span style={{ fontWeight: 600 }}>Error:</span>
           <span style={{ flex: 1 }}>{readError}</span>
-          <button
-            type="button"
-            aria-label="Dismiss read error"
-            style={{
-              background: "none",
-              border: "none",
-              cursor: "pointer",
-              color: "inherit",
-              opacity: 0.7,
-              fontSize: 14,
-              lineHeight: 1,
-              padding: "0 2px",
-            }}
-            title="Dismiss"
+          <BannerDismissButton
+            ariaLabel="Dismiss read error"
             onClick={onDismissReadError}
-          >
-            ×
-          </button>
+          />
         </div>
       )}
       {showMissingPrimaryKeyNotice && (
         <div
           role="alert"
-          style={{
-            flexShrink: 0,
-            padding: "6px 12px",
-            fontSize: 12,
-            background:
-              "var(--vscode-inputValidation-warningBackground, rgba(180,120,0,0.15))",
-            borderBottom:
-              "1px solid var(--vscode-inputValidation-warningBorder, rgba(180,120,0,0.4))",
-            color: "var(--vscode-editorWarning-foreground, #CCA700)",
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-          }}
+          style={{ ...bannerLayoutStyle, ...warningBannerToneStyle }}
         >
           <Icon name="warning" size={13} style={{ flexShrink: 0 }} />
           <span>
@@ -266,6 +257,7 @@ export function TableMutationStatusBar({
           <button
             type="button"
             onClick={onDismissMutationError}
+            aria-label="Dismiss mutation error"
             title="Dismiss"
             style={{
               background: "none",

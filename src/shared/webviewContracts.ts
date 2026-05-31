@@ -434,6 +434,55 @@ function parseEnvelope(input: unknown): WebviewMessageEnvelope | null {
   };
 }
 
+function parseRequiredPayloadRecord(
+  envelope: WebviewMessageEnvelope,
+): UnknownRecord | null {
+  return isRecord(envelope.payload) ? envelope.payload : null;
+}
+
+function parseOptionalPayloadRecord(
+  envelope: WebviewMessageEnvelope,
+): UnknownRecord | null {
+  if (envelope.payload === undefined || envelope.payload === null) {
+    return {};
+  }
+  return isRecord(envelope.payload) ? envelope.payload : null;
+}
+
+function parseEnvelopeTextPayload(
+  envelope: WebviewMessageEnvelope,
+): { text: string } | null {
+  const payload = parseRequiredPayloadRecord(envelope);
+  if (!payload) {
+    return null;
+  }
+
+  const text = readRequiredString(payload, "text");
+  return text !== null ? { text } : null;
+}
+
+function parseEnvelopeQueryPayload(
+  envelope: WebviewMessageEnvelope,
+): { queryText: string; sql: string; connectionId?: string } | null {
+  const payload = parseRequiredPayloadRecord(envelope);
+  if (!payload) {
+    return null;
+  }
+
+  const queryText =
+    readRequiredString(payload, "queryText") ??
+    readRequiredString(payload, "sql");
+  if (!queryText) {
+    return null;
+  }
+
+  return {
+    queryText,
+    sql: queryText,
+    connectionId: readOptionalString(payload, "connectionId"),
+  };
+}
+
 function isRowUpdateMessagePayload(
   value: unknown,
 ): value is RowUpdateMessagePayload {
@@ -706,24 +755,10 @@ export function parseQueryPanelMessage(
         : null;
     }
 
-    case "executeQuery": {
-      if (!isRecord(envelope.payload)) {
-        return null;
-      }
-      const queryText =
-        readRequiredString(envelope.payload, "queryText") ??
-        readRequiredString(envelope.payload, "sql");
-      if (!queryText) {
-        return null;
-      }
-      return {
-        type: envelope.type,
-        payload: {
-          queryText,
-          sql: queryText,
-          connectionId: readOptionalString(envelope.payload, "connectionId"),
-        },
-      };
+    case "executeQuery":
+    case "addBookmark": {
+      const payload = parseEnvelopeQueryPayload(envelope);
+      return payload ? { type: envelope.type, payload } : null;
     }
 
     case "getConnections":
@@ -733,50 +768,19 @@ export function parseQueryPanelMessage(
       return { type: envelope.type };
 
     case "writeClipboard": {
-      if (!isRecord(envelope.payload)) {
-        return null;
-      }
-      const text = readRequiredString(envelope.payload, "text");
-      return text !== null ? { type: envelope.type, payload: { text } } : null;
+      const payload = parseEnvelopeTextPayload(envelope);
+      return payload ? { type: envelope.type, payload } : null;
     }
 
     case "getSchema": {
-      if (
-        envelope.payload !== undefined &&
-        envelope.payload !== null &&
-        !isRecord(envelope.payload)
-      ) {
-        return null;
-      }
-      return {
-        type: envelope.type,
-        payload: isRecord(envelope.payload)
-          ? {
-              connectionId: readOptionalString(
-                envelope.payload,
-                "connectionId",
-              ),
-            }
-          : {},
-      };
-    }
-
-    case "addBookmark": {
-      if (!isRecord(envelope.payload)) {
-        return null;
-      }
-      const queryText =
-        readRequiredString(envelope.payload, "queryText") ??
-        readRequiredString(envelope.payload, "sql");
-      if (!queryText) {
+      const payload = parseOptionalPayloadRecord(envelope);
+      if (!payload) {
         return null;
       }
       return {
         type: envelope.type,
         payload: {
-          queryText,
-          sql: queryText,
-          connectionId: readOptionalString(envelope.payload, "connectionId"),
+          connectionId: readOptionalString(payload, "connectionId"),
         },
       };
     }
@@ -799,14 +803,10 @@ export function parseTablePanelMessage(
       return { type: envelope.type };
 
     case "fetchPage": {
-      if (
-        envelope.payload !== undefined &&
-        envelope.payload !== null &&
-        !isRecord(envelope.payload)
-      ) {
+      const payload = parseOptionalPayloadRecord(envelope);
+      if (!payload) {
         return null;
       }
-      const payload = isRecord(envelope.payload) ? envelope.payload : {};
       return {
         type: envelope.type,
         payload: {
@@ -820,11 +820,12 @@ export function parseTablePanelMessage(
     }
 
     case "applyChanges": {
-      if (!isRecord(envelope.payload)) {
+      const payload = parseRequiredPayloadRecord(envelope);
+      if (!payload) {
         return null;
       }
-      const updates = envelope.payload.updates;
-      const insertValues = envelope.payload.insertValues;
+      const updates = payload.updates;
+      const insertValues = payload.insertValues;
       if (
         updates !== undefined &&
         (!Array.isArray(updates) ||
@@ -845,10 +846,11 @@ export function parseTablePanelMessage(
     }
 
     case "insertRow": {
-      if (!isRecord(envelope.payload)) {
+      const payload = parseRequiredPayloadRecord(envelope);
+      if (!payload) {
         return null;
       }
-      const values = envelope.payload.values;
+      const values = payload.values;
       if (values !== undefined && !isRecord(values)) {
         return null;
       }
@@ -861,10 +863,11 @@ export function parseTablePanelMessage(
     }
 
     case "deleteRows": {
-      if (!isRecord(envelope.payload)) {
+      const payload = parseRequiredPayloadRecord(envelope);
+      if (!payload) {
         return null;
       }
-      const primaryKeysList = envelope.payload.primaryKeysList;
+      const primaryKeysList = payload.primaryKeysList;
       if (
         primaryKeysList !== undefined &&
         (!Array.isArray(primaryKeysList) ||
@@ -884,14 +887,10 @@ export function parseTablePanelMessage(
 
     case "exportCSV":
     case "exportJSON": {
-      if (
-        envelope.payload !== undefined &&
-        envelope.payload !== null &&
-        !isRecord(envelope.payload)
-      ) {
+      const payload = parseOptionalPayloadRecord(envelope);
+      if (!payload) {
         return null;
       }
-      const payload = isRecord(envelope.payload) ? envelope.payload : {};
       if (payload.filters !== undefined && !Array.isArray(payload.filters)) {
         return null;
       }
@@ -915,10 +914,11 @@ export function parseTablePanelMessage(
 
     case "confirmMutationPreview":
     case "cancelMutationPreview": {
-      if (!isRecord(envelope.payload)) {
+      const payload = parseRequiredPayloadRecord(envelope);
+      if (!payload) {
         return null;
       }
-      const previewToken = readRequiredString(envelope.payload, "previewToken");
+      const previewToken = readRequiredString(payload, "previewToken");
       return previewToken
         ? { type: envelope.type, payload: { previewToken } }
         : null;
@@ -928,11 +928,8 @@ export function parseTablePanelMessage(
       return { type: envelope.type };
 
     case "writeClipboard": {
-      if (!isRecord(envelope.payload)) {
-        return null;
-      }
-      const text = readRequiredString(envelope.payload, "text");
-      return text !== null ? { type: envelope.type, payload: { text } } : null;
+      const payload = parseEnvelopeTextPayload(envelope);
+      return payload ? { type: envelope.type, payload } : null;
     }
 
     default:
@@ -978,10 +975,11 @@ export function parseErdPanelMessage(input: unknown): ErdPanelMessage | null {
       return { type: envelope.type };
 
     case "openTableData": {
-      if (!isRecord(envelope.payload)) {
+      const payload = parseRequiredPayloadRecord(envelope);
+      if (!payload) {
         return null;
       }
-      const table = readRequiredString(envelope.payload, "table");
+      const table = readRequiredString(payload, "table");
       if (!table) {
         return null;
       }
@@ -989,9 +987,9 @@ export function parseErdPanelMessage(input: unknown): ErdPanelMessage | null {
         type: envelope.type,
         payload: {
           table,
-          schema: readOptionalString(envelope.payload, "schema"),
-          database: readOptionalString(envelope.payload, "database"),
-          isView: readOptionalBoolean(envelope.payload, "isView"),
+          schema: readOptionalString(payload, "schema"),
+          database: readOptionalString(payload, "database"),
+          isView: readOptionalBoolean(payload, "isView"),
         },
       };
     }

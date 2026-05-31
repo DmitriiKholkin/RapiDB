@@ -22,11 +22,14 @@ export class HistoryProvider extends SqlEntryProvider<
     super(cm, cm.onDidChangeHistory);
   }
 
-  protected getEntries(): HistoryEntry[] {
+  protected override getEntries(): HistoryEntry[] {
     return this.cm.getHistory();
   }
 
-  protected makeNode(entry: HistoryEntry, connectionName: string): HistoryNode {
+  protected override makeNode(
+    entry: HistoryEntry,
+    connectionName: string,
+  ): HistoryNode {
     return new HistoryNode(entry, connectionName);
   }
 }
