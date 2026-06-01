@@ -134,6 +134,7 @@ Click any table → the **Table Data Viewer** opens:
 | `rapidb.queryRowLimit` | `10000` | Cap on rows returned per query (100–100000) |
 | `rapidb.queryHistoryLimit` | `100` | How many past queries to remember |
 | `rapidb.defaultPageSize` | `25` | Default rows per page in the Table Data Viewer |
+| `rapidb.skipTableMutationPreview` | `false` | Apply table inserts, edits, and deletes without opening the mutation preview dialog |
 
 ---
 
