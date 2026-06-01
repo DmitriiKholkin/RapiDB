@@ -2,7 +2,7 @@
   "name": "rapidb",
   "displayName": "RapiDB",
   "description": "Free database management tool inside VSCode",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "publisher": "DmitriiKholkin",
   "repository": {
     "type": "git",
@@ -690,8 +690,8 @@
     "package": "vsce package"
   },
   "devDependencies": {
-    "@electron/rebuild": "4.0.4",
     "@biomejs/biome": "2.4.16",
+    "@electron/rebuild": "4.0.4",
     "@testing-library/react": "16.3.2",
     "@testing-library/user-event": "14.6.1",
     "@types/mssql": "12.3.0",
@@ -722,11 +722,11 @@
     "@vscode/codicons": "0.0.45",
     "@xyflow/react": "12.10.2",
     "agent-base": "9.0.0",
-    "monaco-editor": "0.55.1",
+    "better-sqlite3": "12.10.0",
+    "monaco-editor": "0.53.0",
     "mongodb": "7.2.0",
     "mssql": "12.5.5",
     "mysql2": "3.22.4",
-    "better-sqlite3": "12.10.0",
     "oracledb": "6.10.0",
     "pg": "8.21.0",
     "react": "19.2.6",
