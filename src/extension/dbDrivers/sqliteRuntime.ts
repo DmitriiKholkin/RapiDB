@@ -86,12 +86,8 @@ export function resolveSQLiteRuntimeTarget(
     return null;
   }
   if (platform === "linux") {
-    if (arch === "x64") {
-      return "linux-x64";
-    }
-    if (arch === "arm64") {
-      return "linux-arm64";
-    }
+    if (arch === "x64") return "linux-x64";
+    if (arch === "arm64") return "linux-arm64";
     return null;
   }
   return null;
