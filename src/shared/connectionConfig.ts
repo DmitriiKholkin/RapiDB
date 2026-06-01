@@ -19,8 +19,6 @@ export interface ConnectionConfig {
   rejectUnauthorized?: boolean;
   folder?: string;
   serviceName?: string;
-  thickMode?: boolean;
-  clientPath?: string;
   connectionUri?: string;
   replicaSet?: string;
   directConnection?: boolean;

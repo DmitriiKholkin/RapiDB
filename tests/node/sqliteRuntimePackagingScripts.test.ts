@@ -1,83 +1,42 @@
-import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 type PackageScripts = Record<string, string>;
 
-function readScripts(): PackageScripts {
-  const manifest = JSON.parse(
-    readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
-  ) as {
-    scripts?: PackageScripts;
-  };
+type PackageManifest = {
+  activationEvents?: string[];
+  scripts?: PackageScripts;
+};
 
-  return manifest.scripts ?? {};
+function readManifest(): PackageManifest {
+  return JSON.parse(
+    readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
+  ) as PackageManifest;
 }
 
 describe("SQLite VS Code runtime packaging scripts", () => {
-  it("stages all sqlite runtime targets and verifies them during vscode:prepublish", () => {
-    const scripts = readScripts();
+  it("keeps vscode:prepublish focused on package preparation and production build", () => {
+    const scripts = readManifest().scripts ?? {};
     const prepublish = scripts["vscode:prepublish"];
 
-    expect(prepublish).toContain("npm run native:sqlite:vscode:all");
-    expect(prepublish).toContain("npm run native:sqlite:vscode:verify");
-    expect(prepublish.indexOf("native:sqlite:vscode:all")).toBeLessThan(
-      prepublish.indexOf("native:sqlite:vscode:verify"),
+    expect(prepublish).toBe(
+      "npm run package:prepare && node esbuild.config.mjs --production",
     );
+    expect(prepublish).not.toContain("native:sqlite:vscode");
   });
 
-  it("keeps explicit sqlite runtime stage and verify script commands", () => {
-    const scripts = readScripts();
+  it("removes legacy staged sqlite packaging scripts", () => {
+    const scripts = readManifest().scripts ?? {};
 
-    expect(scripts["native:sqlite:vscode"]).toBe(
-      "node ./scripts/prepare-vscode-sqlite-runtime.mjs --strict",
-    );
-    expect(scripts["native:sqlite:vscode:all"]).toBe(
-      "node ./scripts/prepare-vscode-sqlite-runtime.mjs --strict --all-targets",
-    );
-    expect(scripts["native:sqlite:vscode:verify"]).toBe(
-      "node ./scripts/verify-vscode-sqlite-runtime.mjs",
-    );
+    expect(scripts.postinstall).toBeUndefined();
+    expect(scripts["native:sqlite:vscode"]).toBeUndefined();
+    expect(scripts["native:sqlite:vscode:all"]).toBeUndefined();
+    expect(scripts["native:sqlite:vscode:verify"]).toBeUndefined();
   });
 
-  it("fails fast when verify script receives an unsupported --target", () => {
-    const scriptPath = fileURLToPath(
-      new URL(
-        "../../scripts/verify-vscode-sqlite-runtime.mjs",
-        import.meta.url,
-      ),
-    );
+  it("warms the SQLite runtime automatically after startup", () => {
+    const activationEvents = readManifest().activationEvents ?? [];
 
-    const result = spawnSync(
-      process.execPath,
-      [scriptPath, "--target", "unsupported-target"],
-      {
-        encoding: "utf8",
-      },
-    );
-
-    expect(result.status).not.toBe(0);
-    expect(`${result.stdout}\n${result.stderr}`).toContain(
-      "Unsupported SQLite runtime target: unsupported-target.",
-    );
-  });
-
-  it("fails fast when verify script receives unexpected CLI arguments", () => {
-    const scriptPath = fileURLToPath(
-      new URL(
-        "../../scripts/verify-vscode-sqlite-runtime.mjs",
-        import.meta.url,
-      ),
-    );
-
-    const result = spawnSync(process.execPath, [scriptPath, "--targets"], {
-      encoding: "utf8",
-    });
-
-    expect(result.status).not.toBe(0);
-    expect(`${result.stdout}\n${result.stderr}`).toContain(
-      "Unexpected argument: --targets.",
-    );
+    expect(activationEvents).toContain("onStartupFinished");
   });
 });

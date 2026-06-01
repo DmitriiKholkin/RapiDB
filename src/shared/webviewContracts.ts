@@ -525,8 +525,6 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
     rejectUnauthorized: readOptionalBoolean(input, "rejectUnauthorized"),
     folder: readOptionalString(input, "folder"),
     serviceName: normalizedOracleServiceName,
-    thickMode: readOptionalBoolean(input, "thickMode"),
-    clientPath: readOptionalString(input, "clientPath"),
     connectionUri:
       readOptionalString(input, "connectionUri") ??
       readOptionalString(input, "uri"),

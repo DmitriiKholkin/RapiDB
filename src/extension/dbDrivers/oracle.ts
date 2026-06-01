@@ -86,7 +86,6 @@ function oracleFullType(
 }
 oracledb.fetchAsString = [oracledb.CLOB];
 oracledb.fetchAsBuffer = [oracledb.BLOB];
-let _thickInitDone = false;
 const pad2 = (n: number) => String(n).padStart(2, "0");
 const ORACLE_DDL_TRANSFORM_BLOCK = `
 BEGIN
@@ -401,20 +400,6 @@ function parseOracleRoutineIdentity(value: string | undefined): {
   return {
     kind: match[1].toLowerCase() as "procedure" | "package",
   };
-}
-function ensureThickMode(libDir?: string): void {
-  if (_thickInitDone) {
-    return;
-  }
-  try {
-    oracledb.initOracleClient(libDir ? { libDir } : undefined);
-    _thickInitDone = true;
-  } catch (err: unknown) {
-    throw new Error(
-      `[RapiDB] Oracle thick mode init failed: ${oracleErrorMessage(err)}\n` +
-        `Make sure Oracle Instant Client is installed and the path is correct.`,
-    );
-  }
 }
 function replacePositionalParams(
   sql: string,
@@ -804,9 +789,6 @@ export class OracleDriver extends BaseDBDriver {
         await this.pool.close(0);
       } catch {}
       this.pool = null;
-    }
-    if (this.config.thickMode) {
-      ensureThickMode(this.config.clientPath || undefined);
     }
     const serviceName = this.config.serviceName || this.config.database;
     const forwardedTransport = getSshTcpForwardTransport(this.config);

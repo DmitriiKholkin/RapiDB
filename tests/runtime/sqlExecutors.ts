@@ -137,7 +137,7 @@ async function openSqliteExecutor(
   }
 
   await ensureParentDirectory(connection.filePath);
-  const db = openSQLiteDatabase({
+  const db = await openSQLiteDatabase({
     filePath: connection.filePath,
     readOnly: connection.readOnly,
     sqliteWalMode: connection.sqliteWalMode,

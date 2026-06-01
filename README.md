@@ -176,6 +176,8 @@ Click any table → the **Table Data Viewer** opens:
 
 PRs and contributions are welcome at [github.com/DmitriiKholkin/RapiDB](https://github.com/DmitriiKholkin/RapiDB).
 
+For maintainer and support documentation, start at [docs/README.md](docs/README.md) or [docs/DEVELOPER_HANDBOOK.md](docs/DEVELOPER_HANDBOOK.md).
+
 </details>
 
 

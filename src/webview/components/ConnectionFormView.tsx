@@ -492,12 +492,6 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const [oracleServiceName, setOracleServiceName] = useState(
     existing?.serviceName ?? existing?.database ?? "",
   );
-  const [oracleThickMode, setOracleThickMode] = useState(
-    existing?.thickMode ?? false,
-  );
-  const [oracleClientPath, setOracleClientPath] = useState(
-    existing?.clientPath ?? "",
-  );
   const [mongoConnectionUri, setMongoConnectionUri] = useState(
     existing?.connectionUri ?? existing?.uri ?? "",
   );
@@ -727,11 +721,6 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
               ...(isOracle
                 ? {
                     serviceName: oracleServiceName.trim() || undefined,
-                    thickMode: oracleThickMode || undefined,
-                    clientPath:
-                      oracleThickMode && oracleClientPath.trim()
-                        ? oracleClientPath.trim()
-                        : undefined,
                   }
                 : {}),
             }),
@@ -778,8 +767,6 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     supportsSsl,
     isOracle,
     oracleServiceName,
-    oracleThickMode,
-    oracleClientPath,
     mongoConnectionUri,
     elasticsearchEndpoint,
     elasticsearchApiKey,
@@ -1418,33 +1405,6 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
               placeholder="XEPDB1"
             />
           </Field>
-          <Toggle
-            label="Use thick mode (requires Oracle Instant Client)"
-            hint="Enable only if thin mode doesn't work. Requires Oracle Instant Client on this machine."
-            checked={oracleThickMode}
-            onChange={setOracleThickMode}
-          />
-          {oracleThickMode && (
-            <div
-              style={{
-                marginLeft: 44,
-                paddingLeft: 12,
-                borderLeft: "2px solid var(--vscode-panel-border)",
-              }}
-            >
-              <Field
-                label="Oracle Instant Client path"
-                hint="Directory containing libclntsh.so / oci.dll. Leave empty for system default."
-              >
-                <FocusInput
-                  aria-label="Oracle Instant Client path"
-                  value={oracleClientPath}
-                  onChange={(e) => setOracleClientPath(e.target.value)}
-                  placeholder="/opt/oracle/instantclient_21_9"
-                />
-              </Field>
-            </div>
-          )}
         </Card>
       )}
 

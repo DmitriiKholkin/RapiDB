@@ -4,10 +4,14 @@ import { afterEach, describe, expect, it } from "vitest";
 import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
 import {
   formatSQLiteRuntimeLoadErrorMessage,
-  probeStagedBetterSqlite3Runtime,
   resolveBetterSqlite3LoadTargets,
   resolveSQLiteRuntimeTarget,
 } from "../../src/extension/dbDrivers/sqliteRuntime";
+import {
+  configureSQLiteInstaller,
+  probeInstalledBetterSqlite3Runtime,
+  resetSQLiteInstallerForTests,
+} from "../../src/extension/utils/sqliteInstaller";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
 import { createProjectTempDir } from "../runtime/tempDirectories.ts";
@@ -19,7 +23,40 @@ afterEach(async () => {
     await driver.disconnect();
   }
   openDrivers.clear();
+  resetSQLiteInstallerForTests();
 });
+
+async function createManagedRuntimeFixture(prefix: string): Promise<string> {
+  const rootDir = await createProjectTempDir(prefix);
+  const betterSqlite3Root = join(rootDir, "node_modules", "better-sqlite3");
+  const bindingsRoot = join(rootDir, "node_modules", "bindings");
+  const fileUriToPathRoot = join(rootDir, "node_modules", "file-uri-to-path");
+  await mkdir(betterSqlite3Root, { recursive: true });
+  await mkdir(bindingsRoot, { recursive: true });
+  await mkdir(fileUriToPathRoot, { recursive: true });
+  await writeFile(
+    join(rootDir, "package.json"),
+    JSON.stringify({ name: prefix }),
+    "utf8",
+  );
+  await writeFile(
+    join(betterSqlite3Root, "package.json"),
+    JSON.stringify({ name: "better-sqlite3", version: "12.10.0" }),
+    "utf8",
+  );
+  await writeFile(
+    join(bindingsRoot, "package.json"),
+    JSON.stringify({ name: "bindings" }),
+    "utf8",
+  );
+  await writeFile(
+    join(fileUriToPathRoot, "package.json"),
+    JSON.stringify({ name: "file-uri-to-path" }),
+    "utf8",
+  );
+  configureSQLiteInstaller({ storageRoot: join(rootDir, ".global-storage") });
+  return rootDir;
+}
 
 async function createDriver(
   overrides: Partial<ConnectionConfig> = {},
@@ -46,16 +83,6 @@ async function readSingleValue(
 ): Promise<unknown> {
   const result = await driver.query(sql);
   return result.rows[0]?.__col_0;
-}
-
-function requireHostRuntimeTarget(): NonNullable<
-  ReturnType<typeof resolveSQLiteRuntimeTarget>
-> {
-  const runtimeTarget = resolveSQLiteRuntimeTarget();
-  if (!runtimeTarget) {
-    throw new Error("The current platform is not a supported SQLite runtime.");
-  }
-  return runtimeTarget;
 }
 
 describe("SQLite better-sqlite3 runtime adapter", () => {
@@ -327,7 +354,7 @@ describe("SQLite better-sqlite3 runtime adapter", () => {
     ]);
   });
 
-  it("ships better-sqlite3 runtime helper packages in the VSIX", async () => {
+  it("ships the better-sqlite3 scaffold but excludes native binaries from the VSIX", async () => {
     const betterSqlite3Package = JSON.parse(
       await readFile(
         new URL(
@@ -354,36 +381,35 @@ describe("SQLite better-sqlite3 runtime adapter", () => {
 
     expect(betterSqlite3Package.dependencies?.bindings).toBeTruthy();
     expect(bindingsPackage.dependencies?.["file-uri-to-path"]).toBeTruthy();
-    expect(vscodeIgnore).toContain("!.rapidb-vscode/better-sqlite3/**");
-    expect(vscodeIgnore).not.toContain("!node_modules/better-sqlite3/**");
+    expect(vscodeIgnore).toContain(
+      "!.rapidb-runtime/node_modules/better-sqlite3/**",
+    );
+    expect(vscodeIgnore).toContain("!.rapidb-runtime/node_modules/bindings/**");
+    expect(vscodeIgnore).toContain(
+      "!.rapidb-runtime/node_modules/file-uri-to-path/**",
+    );
+    expect(vscodeIgnore).not.toContain("!.rapidb-vscode/better-sqlite3/**");
   });
 
-  it("prefers the staged VS Code SQLite runtime before the default package", async () => {
-    const rootDir = await createProjectTempDir("sqlite-runtime-stage");
-    const runtimeTarget = requireHostRuntimeTarget();
-    const stagedPackage = join(
-      rootDir,
-      ".rapidb-vscode",
-      "better-sqlite3",
-      runtimeTarget,
-      "node_modules",
-      "better-sqlite3",
-    );
-    await mkdir(stagedPackage, { recursive: true });
+  it("prefers the installed SQLite runtime cache before the default package", async () => {
+    const rootDir = await createManagedRuntimeFixture("sqlite-runtime-cache");
+    const probe = probeInstalledBetterSqlite3Runtime(join(rootDir, "dist"));
+    if (!probe.installedPackagePath || !probe.installedBinaryPath) {
+      throw new Error("Managed SQLite runtime paths could not be resolved.");
+    }
+    await mkdir(join(probe.installedPackagePath, "build", "Release"), {
+      recursive: true,
+    });
     await writeFile(
-      join(rootDir, "package.json"),
-      JSON.stringify({ name: "sqlite-runtime-stage" }),
+      join(probe.installedPackagePath, "package.json"),
+      JSON.stringify({ name: "better-sqlite3", version: "12.10.0" }),
       "utf8",
     );
-    await writeFile(
-      join(stagedPackage, "package.json"),
-      JSON.stringify({ name: "better-sqlite3" }),
-      "utf8",
-    );
+    await writeFile(probe.installedBinaryPath, "stub", "utf8");
 
     expect(
       resolveBetterSqlite3LoadTargets(join(rootDir, "dist"), true),
-    ).toEqual([stagedPackage, "better-sqlite3"]);
+    ).toEqual([probe.installedPackagePath, "better-sqlite3"]);
     expect(
       resolveBetterSqlite3LoadTargets(join(rootDir, "dist"), false),
     ).toEqual(["better-sqlite3"]);
@@ -398,72 +424,67 @@ describe("SQLite better-sqlite3 runtime adapter", () => {
     expect(resolveSQLiteRuntimeTarget("darwin", "arm64")).toBe("darwin-arm64");
   });
 
-  it("reports staged runtime probe details including native binary presence", async () => {
-    const rootDir = await createProjectTempDir("sqlite-runtime-probe");
-    const runtimeTarget = requireHostRuntimeTarget();
-    const stagedPackage = join(
-      rootDir,
-      ".rapidb-vscode",
-      "better-sqlite3",
-      runtimeTarget,
-      "node_modules",
-      "better-sqlite3",
-    );
-    const stagedBinary = join(
-      stagedPackage,
-      "build",
-      "Release",
-      "better_sqlite3.node",
-    );
-    await mkdir(join(stagedPackage, "build", "Release"), { recursive: true });
-    await writeFile(
-      join(rootDir, "package.json"),
-      JSON.stringify({ name: "sqlite-runtime-probe" }),
-      "utf8",
-    );
-    await writeFile(
-      join(stagedPackage, "package.json"),
-      JSON.stringify({ name: "better-sqlite3" }),
-      "utf8",
-    );
-
-    const probeBeforeBinary = probeStagedBetterSqlite3Runtime(
+  it("reports installed runtime probe details including cached binary presence", async () => {
+    const rootDir = await createManagedRuntimeFixture("sqlite-runtime-probe");
+    const probeBeforeBinary = probeInstalledBetterSqlite3Runtime(
       join(rootDir, "dist"),
     );
-    expect(probeBeforeBinary.stagedPackagePath).toBe(stagedPackage);
-    expect(probeBeforeBinary.stagedPackageExists).toBe(true);
-    expect(probeBeforeBinary.stagedBinaryPath).toBe(stagedBinary);
-    expect(probeBeforeBinary.stagedBinaryExists).toBe(false);
+    expect(probeBeforeBinary.bundledPackageExists).toBe(true);
+    expect(probeBeforeBinary.installedPackageExists).toBe(false);
+    expect(probeBeforeBinary.installedBinaryExists).toBe(false);
 
-    await writeFile(stagedBinary, "stub", "utf8");
-    const probeAfterBinary = probeStagedBetterSqlite3Runtime(
+    if (
+      !probeBeforeBinary.installedPackagePath ||
+      !probeBeforeBinary.installedBinaryPath
+    ) {
+      throw new Error("Managed SQLite runtime paths could not be resolved.");
+    }
+
+    await mkdir(
+      join(probeBeforeBinary.installedPackagePath, "build", "Release"),
+      {
+        recursive: true,
+      },
+    );
+    await writeFile(
+      join(probeBeforeBinary.installedPackagePath, "package.json"),
+      JSON.stringify({ name: "better-sqlite3", version: "12.10.0" }),
+      "utf8",
+    );
+    await writeFile(probeBeforeBinary.installedBinaryPath, "stub", "utf8");
+
+    const probeAfterBinary = probeInstalledBetterSqlite3Runtime(
       join(rootDir, "dist"),
     );
-    expect(probeAfterBinary.stagedBinaryExists).toBe(true);
+    expect(probeAfterBinary.installedPackageExists).toBe(true);
+    expect(probeAfterBinary.installedBinaryExists).toBe(true);
   });
 
-  it("formats sqlite runtime load failures with attempted targets and staged probe details", () => {
+  it("formats sqlite runtime load failures with attempted targets and installed runtime probe details", () => {
     const message = formatSQLiteRuntimeLoadErrorMessage(
       new Error("Cannot find module better-sqlite3"),
       [
-        "/tmp/.rapidb-vscode/better-sqlite3/linux-x64/node_modules/better-sqlite3",
+        "/tmp/global-storage/sqlite-runtime/better-sqlite3/12.10.0/electron-abi-127-linux-x64/node_modules/better-sqlite3",
         "better-sqlite3",
       ],
       {
         target: "linux-x64",
+        runtime: "node",
         packageRoot: "/tmp/workspace",
-        stagedPackagePath:
-          "/tmp/workspace/.rapidb-vscode/better-sqlite3/linux-x64/node_modules/better-sqlite3",
-        stagedPackageExists: true,
-        stagedBinaryPath:
-          "/tmp/workspace/.rapidb-vscode/better-sqlite3/linux-x64/node_modules/better-sqlite3/build/Release/better_sqlite3.node",
-        stagedBinaryExists: false,
+        bundledPackagePath: "/tmp/workspace/node_modules/better-sqlite3",
+        bundledPackageExists: true,
+        installedPackagePath:
+          "/tmp/global-storage/sqlite-runtime/better-sqlite3/12.10.0/node-abi-115-linux-x64/node_modules/better-sqlite3",
+        installedPackageExists: true,
+        installedBinaryPath:
+          "/tmp/global-storage/sqlite-runtime/better-sqlite3/12.10.0/node-abi-115-linux-x64/node_modules/better-sqlite3/build/Release/better_sqlite3.node",
+        installedBinaryExists: false,
       },
     );
 
     expect(message).toContain("Attempted load targets");
-    expect(message).toContain("Staged probe:");
-    expect(message).toContain("stagedBinaryExists=false");
+    expect(message).toContain("Installed runtime probe:");
+    expect(message).toContain("installedBinaryExists=false");
     expect(message).toContain("Cannot find module better-sqlite3");
   });
 });

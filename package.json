@@ -2,7 +2,7 @@
   "name": "rapidb",
   "displayName": "RapiDB",
   "description": "Free database management tool inside VSCode",
-  "version": "0.1.7",
+  "version": "0.1.6",
   "publisher": "DmitriiKholkin",
   "repository": {
     "type": "git",
@@ -42,6 +42,9 @@
   ],
   "main": "./dist/extension.js",
   "browser": "./dist/extension-web.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "contributes": {
     "commands": [
       {
@@ -545,15 +548,6 @@
                 "type": "string",
                 "description": "Oracle service name (e.g. XEPDB1). Preferred over SID. If omitted, the database field is used."
               },
-              "thickMode": {
-                "type": "boolean",
-                "default": false,
-                "description": "Enable Oracle thick mode. Requires Oracle Instant Client installed on the host machine."
-              },
-              "clientPath": {
-                "type": "string",
-                "description": "Path to Oracle Instant Client libraries directory. Only used when thickMode is true."
-              },
               "connectionUri": {
                 "type": "string",
                 "description": "Connection URI for MongoDB or other URI-based drivers."
@@ -662,10 +656,8 @@
     ]
   },
   "scripts": {
-    "postinstall": "node ./scripts/prepare-vscode-sqlite-runtime.mjs --best-effort",
     "package:prepare": "node ./scripts/prepare-vscode-package.mjs",
-    "native:sqlite:vscode:verify": "node ./scripts/verify-vscode-sqlite-runtime.mjs",
-    "vscode:prepublish": "npm run package:prepare && npm run native:sqlite:vscode:all && npm run native:sqlite:vscode:verify && node esbuild.config.mjs --production",
+    "vscode:prepublish": "npm run package:prepare && node esbuild.config.mjs --production",
     "build": "node esbuild.config.mjs",
     "watch": "node esbuild.config.mjs --watch",
     "compile": "npm run build",
@@ -695,8 +687,6 @@
     "db:seed": "tsx ./tests/scripts/db-seed.ts",
     "db:prepare": "node ./tests/scripts/run-npm-scripts.mjs db:wait db:reset db:seed",
     "db:down": "docker compose -f ./compose.yaml down --remove-orphans",
-    "native:sqlite:vscode": "node ./scripts/prepare-vscode-sqlite-runtime.mjs --strict",
-    "native:sqlite:vscode:all": "node ./scripts/prepare-vscode-sqlite-runtime.mjs --strict --all-targets",
     "package": "vsce package"
   },
   "devDependencies": {

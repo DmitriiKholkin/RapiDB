@@ -581,7 +581,7 @@ export class SQLiteDriver extends BaseDBDriver {
       } catch {}
       this.db = null;
     }
-    this.db = openSQLiteDatabase({
+    this.db = await openSQLiteDatabase({
       filePath: this.config.filePath,
       readOnly: this.config.readOnly,
       sqliteWalMode: this.config.sqliteWalMode,

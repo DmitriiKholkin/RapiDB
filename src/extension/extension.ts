@@ -35,6 +35,10 @@ import {
   normalizeUnknownError,
 } from "./utils/errorHandling";
 import { isOpenDdlSupportedForNode } from "./utils/openDdlEligibility";
+import {
+  configureSQLiteInstaller,
+  warmupSQLiteRuntime,
+} from "./utils/sqliteInstaller";
 
 let _activated = false;
 let _connectionManager: import("./connectionManager").ConnectionManager | null =
@@ -806,6 +810,13 @@ export function activate(context: vscode.ExtensionContext): void {
   }
   _activated = true;
   console.log("[RapiDB] Extension activated");
+  if (typeof context.globalStorageUri?.fsPath === "string") {
+    configureSQLiteInstaller({
+      storageRoot: context.globalStorageUri.fsPath,
+      log: (message) => console.log(message),
+    });
+    void warmupSQLiteRuntime(__dirname);
+  }
   const connectionManager = new ConnectionManager(context);
   _connectionManager = connectionManager;
   const connectionProvider = new ConnectionProvider(connectionManager);

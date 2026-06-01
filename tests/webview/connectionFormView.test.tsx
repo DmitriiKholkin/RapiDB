@@ -41,14 +41,7 @@ describe("ConnectionFormView", () => {
     await user.click(screen.getByRole("button", { name: /oracle/i }));
 
     expect(screen.getByLabelText("Oracle service name")).toBeTruthy();
-
-    await user.click(
-      screen.getByRole("switch", {
-        name: /Use thick mode \(requires Oracle Instant Client\)/i,
-      }),
-    );
-
-    expect(screen.getByLabelText("Oracle Instant Client path")).toBeTruthy();
+    expect(screen.queryByLabelText("Oracle Instant Client path")).toBeNull();
 
     await user.click(screen.getByRole("button", { name: /mongodb/i }));
 

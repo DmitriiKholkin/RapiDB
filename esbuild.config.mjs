@@ -1,3 +1,4 @@
+import { pathToFileURL } from "node:url";
 import * as esbuild from "esbuild";
 
 const isWatch = process.argv.includes("--watch");
@@ -21,7 +22,7 @@ const browserBaseConfig = {
   define: defineNodeEnv,
 };
 
-const extensionConfig = {
+export const extensionConfig = {
   ...baseConfig,
   entryPoints: ["src/extension/extension.ts"],
   outfile: "dist/extension.js",
@@ -32,7 +33,7 @@ const extensionConfig = {
   sourcemap: isProduction ? false : "inline",
 };
 
-const browserExtensionConfig = {
+export const browserExtensionConfig = {
   ...browserBaseConfig,
   entryPoints: ["src/browser/extension.ts"],
   outfile: "dist/extension-web.js",
@@ -41,7 +42,7 @@ const browserExtensionConfig = {
   sourcemap: isProduction ? false : "inline",
 };
 
-const webviewConfig = {
+export const webviewConfig = {
   ...browserBaseConfig,
   entryPoints: ["src/webview/main.tsx"],
   outfile: "dist/webview.js",
@@ -61,7 +62,7 @@ const webviewConfig = {
   },
 };
 
-async function build() {
+export async function build() {
   if (isWatch) {
     console.log("⚡ RapiDB — watch mode (desktop + browser + webview)");
     const [extCtx, browserCtx, wvCtx] = await Promise.all([
@@ -83,7 +84,14 @@ async function build() {
     console.log("✅ Build complete → dist/");
   }
 }
-build().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+
+const isDirectRun =
+  typeof process.argv[1] === "string" &&
+  import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isDirectRun) {
+  build().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

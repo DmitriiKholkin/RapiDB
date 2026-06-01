@@ -148,3 +148,4 @@ vite.config.ts.timestamp-*
 .vscode
 biome.json
 *.vsix
+.rapidb-runtime

@@ -16,7 +16,10 @@ afterEach(() => {
 describe("sqlite fixture materializer", () => {
   it("creates the canonical sqlite fixture dataset on a temp file", async () => {
     const { filePath } = await materializeSqliteFixture();
-    const db = openSQLiteDatabase({ filePath, sqliteWalMode: "off" });
+    const db = await openSQLiteDatabase({
+      filePath,
+      sqliteWalMode: "off",
+    });
     openDatabases.push(db);
 
     const fixtureRowCount = db.get(
