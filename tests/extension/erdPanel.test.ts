@@ -288,6 +288,9 @@ describe("ErdPanel", () => {
 
   it("reports unexpected panel message errors instead of rejecting", async () => {
     const { ErdPanel } = await import("../../src/extension/panels/erdPanel");
+    const consoleErrorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
     tableCreateOrShowMock.mockImplementationOnce(() => {
       throw new Error("table open failed");
     });
@@ -310,20 +313,27 @@ describe("ErdPanel", () => {
       throw new Error("Expected ERD panel instance");
     }
 
-    await expect(
-      panel.webview.dispatchMessage({
-        type: "openTableData",
-        payload: {
-          table: "users",
-        },
-      }),
-    ).resolves.toBeUndefined();
+    try {
+      await expect(
+        panel.webview.dispatchMessage({
+          type: "openTableData",
+          payload: {
+            table: "users",
+          },
+        }),
+      ).resolves.toBeUndefined();
 
-    expect(showErrorMessageMock).toHaveBeenCalledWith(
-      "[RapiDB] Unexpected error: table open failed",
-    );
-
-    ErdPanel.disposeAll();
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        "[RapiDB] ErdPanel unhandled error:",
+        expect.stringContaining("Error: table open failed"),
+      );
+      expect(showErrorMessageMock).toHaveBeenCalledWith(
+        "[RapiDB] Unexpected error: table open failed",
+      );
+    } finally {
+      consoleErrorSpy.mockRestore();
+      ErdPanel.disposeAll();
+    }
   });
 
   it("uses database.schema title format for schema-level ERD", async () => {
