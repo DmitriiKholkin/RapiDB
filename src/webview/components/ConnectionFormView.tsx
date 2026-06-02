@@ -13,13 +13,21 @@ import React, {
 import type {
   ConnectionSshAuthMethod,
   ConnectionSshHostVerificationMode,
+  ConnectionTlsMode,
   SQLiteWalMode,
+} from "../../shared/connectionConfig";
+import {
+  deriveLegacyConnectionTlsFlags,
+  getConnectionTlsSupport,
+  isConnectionTlsEnabled,
+  resolveConnectionTlsMode,
 } from "../../shared/connectionConfig";
 import {
   type ConnectionType,
   DEFAULT_PORT_BY_CONNECTION_TYPE,
 } from "../../shared/connectionTypes";
 import type {
+  ConnectionFormBrowseTarget,
   ConnectionFormExistingState,
   ConnectionFormSubmission,
 } from "../../shared/webviewContracts";
@@ -61,6 +69,22 @@ const DB_TYPES: Array<{
   },
   { type: "dynamodb", label: "DynamoDB", short: "DY", color: "#4053d6" },
 ];
+
+const TLS_MODE_LABELS: Record<ConnectionTlsMode, string> = {
+  disabled: "Disabled",
+  requireTrustServerCertificate: "Required, trust server certificate",
+  requireVerifyCa: "Required, verify CA only",
+  requireVerifyFull: "Required, verify full",
+  mutualTls: "Mutual TLS",
+};
+
+const TLS_MODE_COLORS: Record<ConnectionTlsMode, string> = {
+  disabled: "#6b7280",
+  requireTrustServerCertificate: "#f59e0b",
+  requireVerifyCa: "#3b82f6",
+  requireVerifyFull: "#10b981",
+  mutualTls: "#8b5cf6",
+};
 
 function FocusInput(props: InputHTMLAttributes<HTMLInputElement>) {
   const [focused, setFocused] = useState(false);
@@ -467,6 +491,9 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const hasStoredSshPassword = existing?.hasStoredSshPassword ?? false;
   const hasStoredSshPrivateKey = existing?.hasStoredSshPrivateKey ?? false;
   const hasStoredSshPassphrase = existing?.hasStoredSshPassphrase ?? false;
+  const hasStoredTlsKeyPassphrase =
+    existing?.hasStoredTlsKeyPassphrase ?? false;
+  const initialTlsMode = resolveConnectionTlsMode(existing ?? {});
 
   const [name, setName] = useState(existing?.name ?? "");
   const [color, setColor] = useState(existing?.color ?? getDefaultColor());
@@ -528,9 +555,19 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     existing?.sshHostFingerprintSha256 ?? "",
   );
 
-  const [sslEnabled, setSslEnabled] = useState(existing?.ssl ?? false);
-  const [rejectUnauthorized, setRejectUnauthorized] = useState(
-    existing?.rejectUnauthorized ?? true,
+  const [tlsMode, setTlsMode] = useState<ConnectionTlsMode>(initialTlsMode);
+  const [tlsCaFilePath, setTlsCaFilePath] = useState(
+    existing?.tls?.caFilePath ?? "",
+  );
+  const [tlsCertFilePath, setTlsCertFilePath] = useState(
+    existing?.tls?.certFilePath ?? "",
+  );
+  const [tlsKeyFilePath, setTlsKeyFilePath] = useState(
+    existing?.tls?.keyFilePath ?? "",
+  );
+  const [tlsKeyPassphrase, setTlsKeyPassphrase] = useState("");
+  const [tlsServerNameOverride, setTlsServerNameOverride] = useState(
+    existing?.tls?.serverNameOverride ?? "",
   );
 
   const [useSecretStorage, setUseSecretStorage] = useState(
@@ -550,24 +587,45 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const isRedis = type === "redis";
   const isElasticsearch = type === "elasticsearch";
   const isDynamo = type === "dynamodb";
-  const supportsSsl = !isSQLite && !isDynamo;
+  const tlsSupport = getConnectionTlsSupport(type);
+  const supportsTls = tlsSupport !== undefined;
+  const tlsEnabled = supportsTls && isConnectionTlsEnabled(tlsMode);
+  const tlsUsesClientAuth = tlsEnabled && tlsMode === "mutualTls";
+  const tlsUsesCaFile =
+    tlsEnabled &&
+    tlsSupport?.supportsCaFile === true &&
+    tlsMode !== "requireTrustServerCertificate";
+  const tlsShowsServerNameOverride =
+    tlsEnabled &&
+    tlsSupport?.supportsServerNameOverride === true &&
+    tlsMode !== "requireTrustServerCertificate";
+  const tlsShouldShowConfigFields =
+    tlsUsesCaFile || tlsUsesClientAuth || tlsShowsServerNameOverride;
   const effectiveSshEnabled = !isSQLite && sshEnabled;
+  const tlsPassphraseRequiresSecretStorage =
+    tlsUsesClientAuth &&
+    (tlsKeyPassphrase.trim().length > 0 || hasStoredTlsKeyPassphrase);
   const secretStorageRequired =
-    isElasticsearch || isDynamo || effectiveSshEnabled;
+    isElasticsearch ||
+    isDynamo ||
+    effectiveSshEnabled ||
+    tlsPassphraseRequiresSecretStorage;
   const effectiveUseSecretStorage = secretStorageRequired
     ? true
     : useSecretStorage;
   const secretStorageLabel =
-    isElasticsearch || effectiveSshEnabled
+    isElasticsearch || effectiveSshEnabled || tlsPassphraseRequiresSecretStorage
       ? "Store secrets in VS Code Secret Storage"
       : "Store password in VS Code Secret Storage";
   const secretStorageHint = isElasticsearch
     ? "Elasticsearch credentials are always saved in your OS keychain and will not appear in settings.json."
     : effectiveSshEnabled
       ? "SSH is enabled, so database and SSH secrets are always saved in your OS keychain and will not appear in settings.json."
-      : effectiveUseSecretStorage
-        ? "Password saved in your OS keychain — will NOT appear in settings.json."
-        : "Password will be saved in plaintext in settings.json. Enable to store securely.";
+      : tlsPassphraseRequiresSecretStorage
+        ? "TLS client key passphrases are always saved in your OS keychain and will not appear in settings.json."
+        : effectiveUseSecretStorage
+          ? "Password saved in your OS keychain — will NOT appear in settings.json."
+          : "Password will be saved in plaintext in settings.json. Enable to store securely.";
   const elasticsearchApiKeyHint =
     hasStoredApiKey && elasticsearchApiKey.length === 0
       ? "Leave blank to keep the stored API key unchanged."
@@ -584,6 +642,16 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     hasStoredSshPassphrase && sshPassphrase.length === 0
       ? "Leave blank to keep the stored SSH passphrase unchanged."
       : "Optional. Stored securely in VS Code Secret Storage (OS keychain).";
+  const tlsKeyPassphraseHint =
+    hasStoredTlsKeyPassphrase && tlsKeyPassphrase.length === 0
+      ? "Leave blank to keep the stored TLS client key passphrase unchanged."
+      : "Optional. Stored securely in VS Code Secret Storage (OS keychain).";
+  const tlsServerNameOverrideHint =
+    tlsMode === "requireVerifyFull"
+      ? "Optional hostname used for TLS SNI and certificate hostname validation."
+      : tlsMode === "requireVerifyCa"
+        ? "Optional hostname used for TLS SNI when certificate host matching is relaxed."
+        : "Optional hostname used for TLS SNI.";
   const sshFingerprintHint =
     sshHostVerificationMode === "trustOnFirstUse"
       ? sshHostFingerprintSha256.trim().length > 0
@@ -596,12 +664,38 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       : connectionReadOnly
         ? "Advanced. WAL is enabled automatically for writable SQLite connections; this read-only session leaves the file untouched."
         : "Advanced. WAL is enabled automatically for writable SQLite connections unless you disable it here.";
+  const tlsModeHint =
+    tlsMode === "disabled"
+      ? "Connection encryption is disabled."
+      : tlsMode === "requireVerifyFull"
+        ? "Encrypt the connection and verify both the certificate chain and server hostname."
+        : tlsMode === "requireVerifyCa"
+          ? "Encrypt the connection and verify the certificate chain without strict hostname verification."
+          : tlsMode === "requireTrustServerCertificate"
+            ? "Encrypt the connection but accept self-signed or otherwise untrusted server certificates."
+            : "Encrypt the connection and present a client certificate and private key to the server.";
 
   useEffect(
     () =>
-      onMessage<{ filePath: string | null }>("browseFileResult", (p) => {
+      onMessage<{
+        target: ConnectionFormBrowseTarget;
+        filePath: string | null;
+      }>("browseFileResult", (p) => {
         if (p.filePath !== null) {
-          setFilePath(p.filePath);
+          switch (p.target) {
+            case "filePath":
+              setFilePath(p.filePath);
+              break;
+            case "tlsCaFile":
+              setTlsCaFilePath(p.filePath);
+              break;
+            case "tlsCertFile":
+              setTlsCertFilePath(p.filePath);
+              break;
+            case "tlsKeyFile":
+              setTlsKeyFilePath(p.filePath);
+              break;
+          }
         }
       }),
     [],
@@ -633,12 +727,42 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     setType(nextType);
     setPort(String(DEFAULT_PORT_BY_CONNECTION_TYPE[nextType] || ""));
     setTestState("idle");
-    setSslEnabled(false);
-    setRejectUnauthorized(true);
+    setTlsMode("disabled");
+    setTlsCaFilePath("");
+    setTlsCertFilePath("");
+    setTlsKeyFilePath("");
+    setTlsKeyPassphrase("");
+    setTlsServerNameOverride("");
   };
 
   const buildPayload = useCallback((): ConnectionFormSubmission => {
     const parsedSshPort = Number.parseInt(sshPort.trim(), 10);
+    const tlsConfig = supportsTls
+      ? {
+          mode: tlsMode,
+          caFilePath:
+            tlsUsesCaFile && tlsSupport.supportsCaFile
+              ? tlsCaFilePath.trim() || undefined
+              : undefined,
+          certFilePath:
+            tlsUsesClientAuth && tlsSupport.supportsClientCertificate
+              ? tlsCertFilePath.trim() || undefined
+              : undefined,
+          keyFilePath:
+            tlsUsesClientAuth && tlsSupport.supportsClientKey
+              ? tlsKeyFilePath.trim() || undefined
+              : undefined,
+          keyPassphrase:
+            tlsUsesClientAuth && tlsSupport.supportsClientKeyPassphrase
+              ? tlsKeyPassphrase
+              : undefined,
+          serverNameOverride:
+            tlsEnabled && tlsSupport.supportsServerNameOverride
+              ? tlsServerNameOverride.trim() || undefined
+              : undefined,
+        }
+      : undefined;
+    const legacyTlsFlags = deriveLegacyConnectionTlsFlags(tlsConfig);
 
     return {
       id: existing?.id ?? crypto.randomUUID(),
@@ -683,6 +807,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       hasStoredSshPassword: hasStoredSshPassword || undefined,
       hasStoredSshPrivateKey: hasStoredSshPrivateKey || undefined,
       hasStoredSshPassphrase: hasStoredSshPassphrase || undefined,
+      hasStoredTlsKeyPassphrase: hasStoredTlsKeyPassphrase || undefined,
       ...(isSQLite
         ? {
             filePath: filePath.trim(),
@@ -703,9 +828,11 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
               database: database.trim(),
               username: username.trim(),
               password,
-              ssl: supportsSsl ? sslEnabled : undefined,
-              rejectUnauthorized:
-                supportsSsl && sslEnabled ? rejectUnauthorized : undefined,
+              ssl: supportsTls ? legacyTlsFlags.ssl : undefined,
+              rejectUnauthorized: supportsTls
+                ? legacyTlsFlags.rejectUnauthorized
+                : undefined,
+              tls: tlsConfig,
               ...(isMongo
                 ? {
                     connectionUri: mongoConnectionUri.trim() || undefined,
@@ -739,6 +866,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     hasStoredSshPassword,
     hasStoredSshPrivateKey,
     hasStoredSshPassphrase,
+    hasStoredTlsKeyPassphrase,
     isSQLite,
     filePath,
     sqliteWalMode,
@@ -762,9 +890,17 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     sshHostFingerprintSha256,
     username,
     password,
-    sslEnabled,
-    rejectUnauthorized,
-    supportsSsl,
+    supportsTls,
+    tlsMode,
+    tlsEnabled,
+    tlsUsesClientAuth,
+    tlsUsesCaFile,
+    tlsSupport,
+    tlsCaFilePath,
+    tlsCertFilePath,
+    tlsKeyFilePath,
+    tlsKeyPassphrase,
+    tlsServerNameOverride,
     isOracle,
     oracleServiceName,
     mongoConnectionUri,
@@ -950,7 +1086,9 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                 <button
                   type="button"
                   style={buildButtonStyle("secondary", { size: "sm" })}
-                  onClick={() => postMessage("browseFile")}
+                  onClick={() =>
+                    postMessage("browseFile", { target: "filePath" })
+                  }
                 >
                   Browse…
                 </button>
@@ -1355,37 +1493,246 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
           <div
             style={{
               borderTop: "1px solid var(--vscode-panel-border)",
-              paddingTop: 12,
-              marginTop: 2,
+              paddingTop: 14,
+              marginTop: 4,
             }}
           >
-            <Toggle
-              label="Enable SSL / TLS"
-              hint={
-                type === "mssql"
-                  ? "Enable connection encryption (recommended for production)"
-                  : "Encrypt connection with SSL/TLS"
-              }
-              checked={sslEnabled}
-              onChange={setSslEnabled}
-            />
-            {sslEnabled && (
-              <div
-                style={{
-                  marginLeft: 44,
-                  paddingLeft: 12,
-                  borderLeft: "2px solid var(--vscode-panel-border)",
-                  marginBottom: 4,
-                }}
-              >
-                <Toggle
-                  label="Verify server certificate"
-                  hint="Uncheck to accept self-signed certificates"
-                  checked={rejectUnauthorized}
-                  onChange={setRejectUnauthorized}
-                />
-              </div>
-            )}
+            {supportsTls && tlsSupport ? (
+              <>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    marginBottom: 10,
+                  }}
+                >
+                  <Icon name="lock" size={11} style={{ opacity: 0.45 }} />
+                  <span
+                    style={{
+                      fontSize: 11,
+                      fontWeight: 700,
+                      textTransform: "uppercase",
+                      letterSpacing: 0.5,
+                      opacity: 0.45,
+                    }}
+                  >
+                    Encryption
+                  </span>
+                </div>
+
+                <Field
+                  hint={tlsModeHint}
+                  style={{ marginBottom: tlsEnabled ? 8 : 14 }}
+                >
+                  <div style={{ position: "relative" }}>
+                    <FocusSelect
+                      aria-label="TLS mode"
+                      value={tlsMode}
+                      onChange={(e) =>
+                        setTlsMode(e.target.value as ConnectionTlsMode)
+                      }
+                      style={{ paddingLeft: 28 }}
+                    >
+                      {tlsSupport.modes.map((mode) => (
+                        <option key={mode} value={mode}>
+                          {TLS_MODE_LABELS[mode]}
+                        </option>
+                      ))}
+                    </FocusSelect>
+                    <span
+                      style={{
+                        position: "absolute",
+                        left: 9,
+                        top: "50%",
+                        transform: "translateY(-50%)",
+                        width: 7,
+                        height: 7,
+                        borderRadius: "50%",
+                        background: TLS_MODE_COLORS[tlsMode],
+                        pointerEvents: "none",
+                        boxShadow: `0 0 0 2px ${TLS_MODE_COLORS[tlsMode]}44`,
+                      }}
+                    />
+                  </div>
+                </Field>
+
+                {tlsShouldShowConfigFields && (
+                  <div
+                    style={{
+                      border: "1px solid var(--vscode-panel-border)",
+                      borderRadius: 6,
+                      padding: "10px 12px 0",
+                      marginBottom: 14,
+                      background:
+                        "var(--vscode-editorWidget-background, var(--vscode-input-background))",
+                    }}
+                  >
+                    {tlsUsesCaFile && (
+                      <Field
+                        label="CA Certificate"
+                        hint="Optional PEM/CRT bundle used to validate the server certificate chain."
+                      >
+                        <div
+                          style={{
+                            display: "flex",
+                            gap: 8,
+                            alignItems: "center",
+                          }}
+                        >
+                          <FocusInput
+                            aria-label="TLS CA certificate file"
+                            value={tlsCaFilePath}
+                            onChange={(e) => setTlsCaFilePath(e.target.value)}
+                            placeholder="/path/to/ca.pem"
+                            style={{
+                              flex: 1,
+                              fontFamily:
+                                "var(--vscode-editor-font-family, monospace)",
+                              fontSize: 12,
+                            }}
+                          />
+                          <button
+                            type="button"
+                            style={buildButtonStyle("secondary", {
+                              size: "sm",
+                            })}
+                            onClick={() =>
+                              postMessage("browseFile", { target: "tlsCaFile" })
+                            }
+                          >
+                            Browse…
+                          </button>
+                        </div>
+                      </Field>
+                    )}
+
+                    {tlsUsesClientAuth &&
+                      tlsSupport.supportsClientCertificate && (
+                        <Field
+                          label="Client Certificate"
+                          hint="PEM or CRT file presented to the server for mutual TLS."
+                        >
+                          <div
+                            style={{
+                              display: "flex",
+                              gap: 8,
+                              alignItems: "center",
+                            }}
+                          >
+                            <FocusInput
+                              aria-label="TLS client certificate file"
+                              value={tlsCertFilePath}
+                              onChange={(e) =>
+                                setTlsCertFilePath(e.target.value)
+                              }
+                              placeholder="/path/to/client.crt"
+                              style={{
+                                flex: 1,
+                                fontFamily:
+                                  "var(--vscode-editor-font-family, monospace)",
+                                fontSize: 12,
+                              }}
+                            />
+                            <button
+                              type="button"
+                              style={buildButtonStyle("secondary", {
+                                size: "sm",
+                              })}
+                              onClick={() =>
+                                postMessage("browseFile", {
+                                  target: "tlsCertFile",
+                                })
+                              }
+                            >
+                              Browse…
+                            </button>
+                          </div>
+                        </Field>
+                      )}
+
+                    {tlsUsesClientAuth && tlsSupport.supportsClientKey && (
+                      <Field
+                        label="Client Key"
+                        hint="Private key file for mutual TLS."
+                      >
+                        <div
+                          style={{
+                            display: "flex",
+                            gap: 8,
+                            alignItems: "center",
+                          }}
+                        >
+                          <FocusInput
+                            aria-label="TLS client key file"
+                            value={tlsKeyFilePath}
+                            onChange={(e) => setTlsKeyFilePath(e.target.value)}
+                            placeholder="/path/to/client.key"
+                            style={{
+                              flex: 1,
+                              fontFamily:
+                                "var(--vscode-editor-font-family, monospace)",
+                              fontSize: 12,
+                            }}
+                          />
+                          <button
+                            type="button"
+                            style={buildButtonStyle("secondary", {
+                              size: "sm",
+                            })}
+                            onClick={() =>
+                              postMessage("browseFile", {
+                                target: "tlsKeyFile",
+                              })
+                            }
+                          >
+                            Browse…
+                          </button>
+                        </div>
+                      </Field>
+                    )}
+
+                    {tlsUsesClientAuth &&
+                      tlsSupport.supportsClientKeyPassphrase && (
+                        <Field
+                          label="Key Passphrase"
+                          hint={tlsKeyPassphraseHint}
+                        >
+                          <FocusInput
+                            aria-label="TLS client key passphrase"
+                            value={tlsKeyPassphrase}
+                            onChange={(e) =>
+                              setTlsKeyPassphrase(e.target.value)
+                            }
+                            type="password"
+                            placeholder="Optional"
+                            style={{
+                              fontFamily:
+                                "var(--vscode-editor-font-family, monospace)",
+                            }}
+                          />
+                        </Field>
+                      )}
+
+                    {tlsShowsServerNameOverride && (
+                      <Field
+                        label="Server Name Override"
+                        hint={tlsServerNameOverrideHint}
+                      >
+                        <FocusInput
+                          aria-label="TLS server name override"
+                          value={tlsServerNameOverride}
+                          onChange={(e) =>
+                            setTlsServerNameOverride(e.target.value)
+                          }
+                          placeholder="db.example.com"
+                        />
+                      </Field>
+                    )}
+                  </div>
+                )}
+              </>
+            ) : null}
           </div>
         </Card>
       )}

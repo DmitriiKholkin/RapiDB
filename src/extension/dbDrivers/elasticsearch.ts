@@ -3,6 +3,7 @@ import { HttpConnection } from "@elastic/transport";
 import { ELASTICSEARCH_READ_BUDGET } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { getSshHttpAgentTransport } from "../driverRuntimeConfig";
+import { resolveConnectionTlsSettings } from "../services/connectionTls";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import {
   formatDatetimeForDisplay,
@@ -85,6 +86,7 @@ export class ElasticsearchDriver implements IDBDriver {
       this.config.endpoint ??
       `${protocol}://${this.config.host || "localhost"}:${this.config.port ?? 9200}`;
     const sshAgentTransport = getSshHttpAgentTransport(this.config);
+    const tlsSettings = resolveConnectionTlsSettings(this.config);
     const client = new Client({
       ...(sshAgentTransport ? { Connection: HttpConnection } : {}),
       node: this.config.cloudId ? undefined : node,
@@ -110,9 +112,15 @@ export class ElasticsearchDriver implements IDBDriver {
               apiKey: this.config.apiKey,
             }
           : undefined,
-      tls: this.config.ssl
+      tls: tlsSettings
         ? {
-            rejectUnauthorized: this.config.rejectUnauthorized !== false,
+            rejectUnauthorized: tlsSettings.rejectUnauthorized,
+            ca: tlsSettings.ca,
+            cert: tlsSettings.cert,
+            key: tlsSettings.key,
+            passphrase: tlsSettings.passphrase,
+            servername: tlsSettings.servername,
+            checkServerIdentity: tlsSettings.checkServerIdentity,
           }
         : undefined,
     });

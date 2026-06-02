@@ -38,11 +38,13 @@ export function getSshHttpAgentTransport(
 }
 
 export function getTlsServername(config: ConnectionConfig): string | undefined {
-  return getRuntimeOverrides(config)?.tlsServername;
+  const override = config.tls?.serverNameOverride?.trim();
+  return override || getRuntimeOverrides(config)?.tlsServername;
 }
 
 export function getMssqlServerName(
   config: ConnectionConfig,
 ): string | undefined {
-  return getRuntimeOverrides(config)?.mssqlServerName;
+  const override = config.tls?.serverNameOverride?.trim();
+  return override || getRuntimeOverrides(config)?.mssqlServerName;
 }

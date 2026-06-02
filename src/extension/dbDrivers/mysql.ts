@@ -10,10 +10,8 @@ import type {
 import * as mysql from "mysql2/promise";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { ConnectionConfig } from "../connectionManager";
-import {
-  getSshTcpForwardTransport,
-  getTlsServername,
-} from "../driverRuntimeConfig";
+import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
+import { resolveConnectionTlsSettings } from "../services/connectionTls";
 import { buildWhere } from "../table/filterSql";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
 import type { DriverTimeoutSettingsProvider } from "./timeout";
@@ -1073,17 +1071,27 @@ export class MySQLDriver extends BaseDBDriver {
       } catch {}
       this.pool = null;
     }
-    const sslEnabled = this.config.ssl ?? false;
+    const tlsSettings = resolveConnectionTlsSettings(this.config);
     const forwardedTransport = getSshTcpForwardTransport(this.config);
-    const ssl: MysqlSslOptions | undefined = sslEnabled
+    const ssl: MysqlSslOptions | undefined = tlsSettings
       ? {
-          rejectUnauthorized: this.config.rejectUnauthorized ?? true,
+          rejectUnauthorized: tlsSettings.rejectUnauthorized,
+          ca: tlsSettings.ca,
+          cert: tlsSettings.cert,
+          key: tlsSettings.key,
+          passphrase: tlsSettings.passphrase,
         }
       : undefined;
 
-    if (ssl && this.config.rejectUnauthorized !== false) {
+    if (ssl && tlsSettings?.checkServerIdentity) {
+      (
+        ssl as MysqlSslOptions & { checkServerIdentity?: unknown }
+      ).checkServerIdentity = tlsSettings.checkServerIdentity;
+    }
+
+    if (ssl && tlsSettings?.servername) {
       (ssl as MysqlSslOptions & { servername?: string }).servername =
-        getTlsServername(this.config);
+        tlsSettings.servername;
     }
 
     this.pool = mysql.createPool({

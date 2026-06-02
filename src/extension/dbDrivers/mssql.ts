@@ -5,6 +5,7 @@ import {
   getMssqlServerName,
   getSshTcpForwardTransport,
 } from "../driverRuntimeConfig";
+import { resolveConnectionTlsSettings } from "../services/connectionTls";
 import {
   BaseDBDriver,
   formatDatetimeForDisplay,
@@ -1014,8 +1015,12 @@ export class MSSQLDriver extends BaseDBDriver {
     if (!serverHost) {
       throw new Error("[RapiDB] MSSQL host is required");
     }
-    const sslEnabled = this.config.ssl ?? true;
-    const trustCert = !(this.config.rejectUnauthorized ?? true);
+    const tlsSettings = resolveConnectionTlsSettings(this.config);
+    const sslEnabled =
+      tlsSettings !== undefined ? true : (this.config.ssl ?? true);
+    const trustCert = tlsSettings
+      ? !tlsSettings.rejectUnauthorized
+      : !(this.config.rejectUnauthorized ?? true);
     const runtimeServerName = getMssqlServerName(this.config);
     return {
       server: serverHost,

@@ -17,6 +17,7 @@ import {
 } from "mongodb";
 import { QUERY_LIMIT_POLICY } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
+import { resolveConnectionTlsSettings } from "../services/connectionTls";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import {
   formatDatetimeForDisplay,
@@ -922,10 +923,17 @@ export class MongoDBDriver implements IDBDriver {
       return;
     }
     const uri = this.config.connectionUri ?? this.config.uri ?? this.buildUri();
+    const tlsSettings = resolveConnectionTlsSettings(this.config);
     this.client = new MongoClient(uri, {
-      tls: this.config.ssl,
+      tls: tlsSettings !== undefined,
       tlsAllowInvalidCertificates:
-        this.config.ssl && this.config.rejectUnauthorized === false,
+        tlsSettings !== undefined && !tlsSettings.rejectUnauthorized,
+      tlsAllowInvalidHostnames: tlsSettings?.skipHostnameVerification === true,
+      ca: tlsSettings?.ca,
+      cert: tlsSettings?.cert,
+      key: tlsSettings?.key,
+      passphrase: tlsSettings?.passphrase,
+      servername: tlsSettings?.servername,
       authSource: this.config.authSource,
       replicaSet: this.config.replicaSet,
       directConnection: this.config.directConnection,

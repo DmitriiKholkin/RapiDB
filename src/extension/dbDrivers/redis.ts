@@ -1,10 +1,8 @@
 import { createClient } from "redis";
 import { REDIS_READ_BUDGET } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
-import {
-  getSshTcpForwardTransport,
-  getTlsServername,
-} from "../driverRuntimeConfig";
+import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
+import { resolveConnectionTlsSettings } from "../services/connectionTls";
 import { pMapWithLimit } from "../utils/concurrency";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import {
@@ -327,17 +325,20 @@ export class RedisDriver implements IDBDriver {
       return;
     }
     const forwardedTransport = getSshTcpForwardTransport(this.config);
-    const socket = this.config.ssl
+    const tlsSettings = resolveConnectionTlsSettings(this.config);
+    const socket = tlsSettings
       ? {
           host:
             (forwardedTransport?.localHost ?? this.config.host) || "127.0.0.1",
           port: forwardedTransport?.localPort ?? this.config.port ?? 6379,
           tls: true as const,
-          rejectUnauthorized: this.config.rejectUnauthorized,
-          servername:
-            this.config.rejectUnauthorized !== false
-              ? getTlsServername(this.config)
-              : undefined,
+          rejectUnauthorized: tlsSettings.rejectUnauthorized,
+          servername: tlsSettings.servername,
+          ca: tlsSettings.ca,
+          cert: tlsSettings.cert,
+          key: tlsSettings.key,
+          passphrase: tlsSettings.passphrase,
+          checkServerIdentity: tlsSettings.checkServerIdentity,
         }
       : {
           host:

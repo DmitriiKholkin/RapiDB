@@ -224,6 +224,7 @@ describe("parseConnectionFormPanelMessage", () => {
         filePath: undefined,
         ssl: undefined,
         rejectUnauthorized: undefined,
+        tls: undefined,
         folder: undefined,
         serviceName: undefined,
         connectionUri: undefined,
@@ -298,6 +299,43 @@ describe("parseConnectionFormPanelMessage", () => {
     });
   });
 
+  it("parses TLS configuration payloads", () => {
+    const parsed = parseConnectionFormPanelMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-tls",
+        name: "TLS Primary",
+        type: "pg",
+        host: "db.internal",
+        database: "app",
+        username: "postgres",
+        tls: {
+          mode: "mutualTls",
+          caFilePath: "/tmp/ca.pem",
+          certFilePath: "/tmp/client.crt",
+          keyFilePath: "/tmp/client.key",
+          keyPassphrase: "tls-passphrase",
+          serverNameOverride: "db.example.com",
+        },
+      },
+    });
+
+    expect(parsed).toEqual({
+      type: "saveConnection",
+      payload: expect.objectContaining({
+        id: "conn-tls",
+        tls: {
+          mode: "mutualTls",
+          caFilePath: "/tmp/ca.pem",
+          certFilePath: "/tmp/client.crt",
+          keyFilePath: "/tmp/client.key",
+          keyPassphrase: "tls-passphrase",
+          serverNameOverride: "db.example.com",
+        },
+      }),
+    });
+  });
+
   it("parses trust-on-first-use SSH submissions without a manual fingerprint", () => {
     const parsed = parseConnectionFormPanelMessage({
       type: "testConnection",
@@ -327,6 +365,22 @@ describe("parseConnectionFormPanelMessage", () => {
         sshHostFingerprintSha256: undefined,
         sshPassword: "ssh-secret",
       }),
+    });
+  });
+
+  it("parses targeted browse-file messages", () => {
+    const parsed = parseConnectionFormPanelMessage({
+      type: "browseFile",
+      payload: {
+        target: "tlsKeyFile",
+      },
+    });
+
+    expect(parsed).toEqual({
+      type: "browseFile",
+      payload: {
+        target: "tlsKeyFile",
+      },
     });
   });
 

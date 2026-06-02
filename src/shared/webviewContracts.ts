@@ -1,4 +1,8 @@
-import type { ConnectionConfig } from "./connectionConfig";
+import {
+  CONNECTION_TLS_MODES,
+  type ConnectionConfig,
+  type ConnectionTlsMode,
+} from "./connectionConfig";
 import { CONNECTION_TYPES, type ConnectionType } from "./connectionTypes";
 import type { PrimaryKeyRole } from "./tableTypes";
 
@@ -146,6 +150,7 @@ export interface ConnectionFormExistingState extends SanitizedConnectionConfig {
   hasStoredSshPassword?: boolean;
   hasStoredSshPrivateKey?: boolean;
   hasStoredSshPassphrase?: boolean;
+  hasStoredTlsKeyPassphrase?: boolean;
 }
 
 export interface ConnectionFormSubmission extends SanitizedConnectionConfig {
@@ -158,7 +163,14 @@ export interface ConnectionFormSubmission extends SanitizedConnectionConfig {
   hasStoredSshPassword?: boolean;
   hasStoredSshPrivateKey?: boolean;
   hasStoredSshPassphrase?: boolean;
+  hasStoredTlsKeyPassphrase?: boolean;
 }
+
+export type ConnectionFormBrowseTarget =
+  | "filePath"
+  | "tlsCaFile"
+  | "tlsCertFile"
+  | "tlsKeyFile";
 
 export interface ConnectionFormInitialState extends PanelRetentionState {
   view: "connection";
@@ -275,7 +287,10 @@ export type ConnectionFormPanelMessage =
   | WebviewMessageEnvelope<"saveConnection", ConnectionFormSubmission>
   | WebviewMessageEnvelope<"testConnection", ConnectionFormSubmission>
   | WebviewMessageEnvelope<"cancel">
-  | WebviewMessageEnvelope<"browseFile">;
+  | WebviewMessageEnvelope<
+      "browseFile",
+      { target: ConnectionFormBrowseTarget }
+    >;
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -335,6 +350,46 @@ function readSqliteWalMode(
   value: unknown,
 ): ConnectionConfig["sqliteWalMode"] | undefined {
   return value === "auto" || value === "off" ? value : undefined;
+}
+
+function readConnectionTlsMode(value: unknown): ConnectionTlsMode | undefined {
+  return typeof value === "string" &&
+    CONNECTION_TLS_MODES.includes(value as ConnectionTlsMode)
+    ? (value as ConnectionTlsMode)
+    : undefined;
+}
+
+function readConnectionTlsConfig(
+  value: unknown,
+): ConnectionConfig["tls"] | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  const mode = readConnectionTlsMode(value.mode);
+  if (mode === undefined) {
+    return undefined;
+  }
+
+  return {
+    mode,
+    caFilePath: readOptionalString(value, "caFilePath"),
+    certFilePath: readOptionalString(value, "certFilePath"),
+    keyFilePath: readOptionalString(value, "keyFilePath"),
+    keyPassphrase: readOptionalString(value, "keyPassphrase"),
+    serverNameOverride: readOptionalString(value, "serverNameOverride"),
+  };
+}
+
+function readConnectionFormBrowseTarget(
+  value: unknown,
+): ConnectionFormBrowseTarget | undefined {
+  return value === "filePath" ||
+    value === "tlsCaFile" ||
+    value === "tlsCertFile" ||
+    value === "tlsKeyFile"
+    ? value
+    : undefined;
 }
 
 function readPositiveInteger(value: unknown): number | undefined {
@@ -523,6 +578,7 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
     filePath: readOptionalString(input, "filePath"),
     ssl: readOptionalBoolean(input, "ssl"),
     rejectUnauthorized: readOptionalBoolean(input, "rejectUnauthorized"),
+    tls: readConnectionTlsConfig(input.tls),
     folder: readOptionalString(input, "folder"),
     serviceName: normalizedOracleServiceName,
     connectionUri:
@@ -581,6 +637,10 @@ export function parseConnectionFormExistingState(
       input,
       "hasStoredSshPassphrase",
     ),
+    hasStoredTlsKeyPassphrase: readOptionalBoolean(
+      input,
+      "hasStoredTlsKeyPassphrase",
+    ),
   };
 }
 
@@ -611,6 +671,10 @@ export function parseConnectionFormSubmission(
     hasStoredSshPassphrase: readOptionalBoolean(
       input,
       "hasStoredSshPassphrase",
+    ),
+    hasStoredTlsKeyPassphrase: readOptionalBoolean(
+      input,
+      "hasStoredTlsKeyPassphrase",
     ),
   };
 }
@@ -953,8 +1017,15 @@ export function parseConnectionFormPanelMessage(
       return payload ? { type: envelope.type, payload } : null;
     }
 
-    case "browseFile":
-      return { type: envelope.type };
+    case "browseFile": {
+      const payload = parseRequiredPayloadRecord(envelope);
+      if (!payload) {
+        return null;
+      }
+
+      const target = readConnectionFormBrowseTarget(payload.target);
+      return target ? { type: envelope.type, payload: { target } } : null;
+    }
 
     default:
       return null;

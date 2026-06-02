@@ -2,6 +2,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { ConnectionSecretUpdateTransaction } from "../../shared/safetyContracts";
 import {
+  type ConnectionFormBrowseTarget,
   type ConnectionFormExistingState,
   type ConnectionFormSubmission,
   parseConnectionFormPanelMessage,
@@ -36,6 +37,7 @@ type StoredConnectionSecrets = {
   sshPassword?: string;
   sshPrivateKey?: string;
   sshPassphrase?: string;
+  tlsKeyPassphrase?: string;
 };
 
 const CONNECTION_FORM_RETENTION_MODE = "rehydrate" as const;
@@ -117,6 +119,10 @@ function parseStoredConnectionSecrets(
           typeof parsed.sshPassphrase === "string"
             ? parsed.sshPassphrase
             : undefined,
+        tlsKeyPassphrase:
+          typeof parsed.tlsKeyPassphrase === "string"
+            ? parsed.tlsKeyPassphrase
+            : undefined,
       };
     }
   } catch {}
@@ -150,6 +156,7 @@ function shouldUseSecretStorage(payload: ConnectionFormSubmission): boolean {
     trimOptionalSecretValue(payload.sshPassword) !== undefined ||
     trimOptionalSecretValue(payload.sshPrivateKey) !== undefined ||
     trimOptionalSecretValue(payload.sshPassphrase) !== undefined ||
+    trimOptionalSecretValue(payload.tls?.keyPassphrase) !== undefined ||
     extractCredentialBearingUriSecret(payload.connectionUri) !== undefined ||
     extractCredentialBearingUriSecret(payload.uri) !== undefined ||
     extractCredentialBearingUriSecret(payload.endpoint) !== undefined ||
@@ -176,9 +183,17 @@ function sanitizeExistingForForm(
     awsEndpoint,
     ...rest
   } = existing;
+  const tls =
+    rest.tls !== undefined
+      ? {
+          ...rest.tls,
+          keyPassphrase: undefined,
+        }
+      : undefined;
 
   return {
     ...rest,
+    tls,
     connectionUri: sanitizeCredentialBearingUri(connectionUri),
     uri: sanitizeCredentialBearingUri(uri),
     endpoint: sanitizeCredentialBearingUri(endpoint),
@@ -190,6 +205,8 @@ function sanitizeExistingForForm(
       storedSecrets.sshPrivateKey !== undefined || undefined,
     hasStoredSshPassphrase:
       storedSecrets.sshPassphrase !== undefined || undefined,
+    hasStoredTlsKeyPassphrase:
+      storedSecrets.tlsKeyPassphrase !== undefined || undefined,
   };
 }
 
@@ -417,6 +434,7 @@ export class ConnectionFormPanel {
       hasStoredSshPassword: _hasStoredSshPassword,
       hasStoredSshPrivateKey: _hasStoredSshPrivateKey,
       hasStoredSshPassphrase: _hasStoredSshPassphrase,
+      hasStoredTlsKeyPassphrase: _hasStoredTlsKeyPassphrase,
       connectionUri: submittedConnectionUri,
       uri: submittedUri,
       endpoint: submittedEndpoint,
@@ -447,12 +465,29 @@ export class ConnectionFormPanel {
             existing?.sshPassphrase,
           )
         : undefined;
+    const tls =
+      rest.tls !== undefined
+        ? {
+            ...rest.tls,
+            keyPassphrase:
+              rest.tls.mode === "mutualTls"
+                ? this.resolveSubmittedSecret(
+                    rest.tls.keyPassphrase,
+                    useSecretStorage
+                      ? storedSecrets.tlsKeyPassphrase
+                      : undefined,
+                    existing?.tls?.keyPassphrase,
+                  )
+                : undefined,
+          }
+        : rest.tls;
     const prefersElasticsearchBasicAuth =
       payload.type === "elasticsearch" &&
       trimOptionalSecretValue(payload.username) !== undefined &&
       trimOptionalSecretValue(payload.password) !== undefined;
     return {
       ...rest,
+      tls,
       useSecretStorage,
       connectionUri: restoreSubmittedUriValue(
         submittedConnectionUri,
@@ -597,6 +632,10 @@ export class ConnectionFormPanel {
               raw.sshEnabled === true && raw.sshAuthMethod === "privateKey"
                 ? trimOptionalSecretValue(raw.sshPassphrase)
                 : undefined,
+            tlsKeyPassphrase:
+              raw.tls?.mode === "mutualTls"
+                ? trimOptionalSecretValue(raw.tls.keyPassphrase)
+                : undefined,
           });
           const secretMutationNeeded =
             nextSecrets !== normalizedPreviousSecretSnapshot;
@@ -680,25 +719,41 @@ export class ConnectionFormPanel {
         break;
       }
       case "browseFile": {
+        const target = parsed.payload?.target ?? "filePath";
         const lastSqliteDirectory = this.context.globalState.get<string>(
           LAST_SQLITE_DIRECTORY_STATE_KEY,
         );
+        const isSqliteFile = target === "filePath";
+        const filters: { [name: string]: string[] } = isSqliteFile
+          ? {
+              "SQLite databases": ["db", "sqlite", "sqlite3", "db3"],
+              "All files": ["*"],
+            }
+          : {
+              "TLS files": ["pem", "crt", "cer", "key"],
+              "All files": ["*"],
+            };
+        const titleByTarget: Record<ConnectionFormBrowseTarget, string> = {
+          filePath: "Select SQLite database file",
+          tlsCaFile: "Select CA certificate file",
+          tlsCertFile: "Select client certificate file",
+          tlsKeyFile: "Select client key file",
+        };
         const uris = await vscode.window.showOpenDialog({
           canSelectFiles: true,
           canSelectFolders: false,
           canSelectMany: false,
           defaultUri:
-            lastSqliteDirectory && path.isAbsolute(lastSqliteDirectory)
+            isSqliteFile &&
+            lastSqliteDirectory &&
+            path.isAbsolute(lastSqliteDirectory)
               ? vscode.Uri.file(lastSqliteDirectory)
               : undefined,
-          filters: {
-            "SQLite databases": ["db", "sqlite", "sqlite3", "db3"],
-            "All files": ["*"],
-          },
-          title: "Select SQLite database file",
+          filters,
+          title: titleByTarget[target],
         });
         const selected = uris?.[0];
-        if (selected) {
+        if (isSqliteFile && selected) {
           const selectedDirectory = path.dirname(selected.fsPath);
           if (path.isAbsolute(selectedDirectory)) {
             await this.context.globalState.update(
@@ -709,7 +764,10 @@ export class ConnectionFormPanel {
         }
         this.panel.webview.postMessage({
           type: "browseFileResult",
-          payload: { filePath: selected ? selected.fsPath : null },
+          payload: {
+            target,
+            filePath: selected ? selected.fsPath : null,
+          },
         });
         break;
       }

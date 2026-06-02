@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
@@ -112,6 +115,73 @@ describe("native driver timeout wiring", () => {
         }),
       }),
     );
+  });
+
+  it("passes MySQL mutual TLS file settings into the pool", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "rapidb-mysql-tls-"));
+    try {
+      const caPath = join(tempDir, "ca.pem");
+      const certPath = join(tempDir, "client.crt");
+      const keyPath = join(tempDir, "client.key");
+      writeFileSync(caPath, "ca-data");
+      writeFileSync(certPath, "cert-data");
+      writeFileSync(keyPath, "key-data");
+
+      const pool = {
+        getConnection: vi.fn(async () => ({
+          release: vi.fn(),
+        })),
+        end: vi.fn(async () => undefined),
+      };
+      const createPool = vi.fn(() => pool);
+
+      vi.doMock("mysql2/promise", () => ({
+        createPool,
+      }));
+
+      const { MySQLDriver } = await import(
+        "../../src/extension/dbDrivers/mysql"
+      );
+
+      const driver = new MySQLDriver(
+        {
+          id: "mysql-mtls",
+          name: "MySQL mTLS",
+          type: "mysql",
+          host: "127.0.0.1",
+          port: 3306,
+          database: "app_db",
+          username: "user",
+          password: "secret",
+          tls: {
+            mode: "mutualTls",
+            caFilePath: caPath,
+            certFilePath: certPath,
+            keyFilePath: keyPath,
+            keyPassphrase: "client-passphrase",
+            serverNameOverride: "mysql.internal",
+          },
+        } as ConnectionConfig,
+        timeoutSettingsProvider,
+      );
+
+      await driver.connect();
+
+      expect(createPool).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ssl: expect.objectContaining({
+            rejectUnauthorized: true,
+            servername: "mysql.internal",
+            ca: Buffer.from("ca-data"),
+            cert: Buffer.from("cert-data"),
+            key: Buffer.from("key-data"),
+            passphrase: "client-passphrase",
+          }),
+        }),
+      );
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("passes configured timeouts into the PostgreSQL pool", async () => {
@@ -233,6 +303,74 @@ describe("native driver timeout wiring", () => {
         servername: "pg.internal",
       }),
     });
+  });
+
+  it("passes PostgreSQL verify-CA-only TLS settings with hostname verification disabled", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "rapidb-pg-tls-"));
+    try {
+      const caPath = join(tempDir, "ca.pem");
+      writeFileSync(caPath, "pg-ca-data");
+
+      const poolConfigs: unknown[] = [];
+      class MockPool {
+        readonly connect = vi.fn(async () => ({
+          query: vi.fn(async () => ({
+            rows: [{ name: "app_db" }],
+          })),
+          release: vi.fn(),
+        }));
+
+        readonly end = vi.fn(async () => undefined);
+
+        readonly on = vi.fn();
+
+        constructor(config: unknown) {
+          poolConfigs.push(config);
+        }
+      }
+
+      vi.doMock("pg", () => ({
+        Pool: MockPool,
+        types: {
+          setTypeParser: vi.fn(),
+        },
+      }));
+
+      const { PostgresDriver } = await import(
+        "../../src/extension/dbDrivers/postgres"
+      );
+
+      const driver = new PostgresDriver(
+        {
+          id: "pg-verify-ca",
+          name: "Postgres Verify CA",
+          type: "pg",
+          host: "127.0.0.1",
+          port: 5432,
+          database: "app_db",
+          username: "user",
+          password: "secret",
+          tls: {
+            mode: "requireVerifyCa",
+            caFilePath: caPath,
+            serverNameOverride: "pg.internal",
+          },
+        },
+        timeoutSettingsProvider,
+      );
+
+      await driver.connect();
+
+      const ssl = (poolConfigs[0] as { ssl?: Record<string, unknown> }).ssl;
+      expect(ssl).toMatchObject({
+        rejectUnauthorized: true,
+        servername: "pg.internal",
+        ca: Buffer.from("pg-ca-data"),
+      });
+      expect(typeof ssl?.checkServerIdentity).toBe("function");
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("passes configured timeouts into the MSSQL pool", async () => {

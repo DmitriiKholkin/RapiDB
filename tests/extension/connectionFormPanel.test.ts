@@ -82,6 +82,93 @@ describe("ConnectionFormPanel", () => {
     vi.clearAllMocks();
   });
 
+  it("reuses stored TLS key passphrases and resolves a sanitized config", async () => {
+    const context = {
+      secrets: {
+        get: vi.fn(async () =>
+          JSON.stringify({ tlsKeyPassphrase: "stored-tls-passphrase" }),
+        ),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn().mockResolvedValue(undefined),
+      getConnection: vi.fn(() => ({
+        id: "conn-tls",
+        name: "Warehouse TLS",
+        type: "pg",
+        useSecretStorage: true,
+        tls: {
+          mode: "mutualTls",
+          certFilePath: "/tmp/client.crt",
+          keyFilePath: "/tmp/client.key",
+        },
+      })),
+      testConnection: vi.fn(),
+    };
+
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+      {
+        id: "conn-tls",
+        name: "Warehouse TLS",
+        type: "pg",
+        useSecretStorage: true,
+        tls: {
+          mode: "mutualTls",
+          certFilePath: "/tmp/client.crt",
+          keyFilePath: "/tmp/client.key",
+        },
+      },
+    );
+
+    await Promise.resolve();
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected a webview panel to be created.");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        id: "conn-tls",
+        name: "Warehouse TLS",
+        type: "pg",
+        host: "db.local",
+        database: "warehouse",
+        username: "reader",
+        useSecretStorage: true,
+        hasStoredTlsKeyPassphrase: true,
+        tls: {
+          mode: "mutualTls",
+          certFilePath: "/tmp/client.crt",
+          keyFilePath: "/tmp/client.key",
+          keyPassphrase: "",
+        },
+      },
+    });
+
+    await expect(promise).resolves.toEqual(
+      expect.objectContaining({
+        id: "conn-tls",
+        tls: expect.objectContaining({
+          mode: "mutualTls",
+          keyPassphrase: undefined,
+        }),
+      }),
+    );
+    expect(connectionManager.saveConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tls: expect.objectContaining({
+          keyPassphrase: "stored-tls-passphrase",
+        }),
+      }),
+    );
+  });
+
   it("reuses stored secrets on save and resolves the sanitized config", async () => {
     const context = {
       secrets: {

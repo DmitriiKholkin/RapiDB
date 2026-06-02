@@ -91,7 +91,7 @@ const edgeFilterabilityExpectations: Record<
     {
       nativeType: "interval",
       expectedFilterable: true,
-      expectedOperators: ["like", "eq", "neq", "is_null", "is_not_null"],
+      expectedOperators: ["eq", "neq", "is_null", "is_not_null"],
     },
   ],
   mysql: [
@@ -1012,25 +1012,26 @@ describe("filter SQL compatibility for complex null-only types", () => {
     });
   });
 
-  it("builds PostgreSQL interval like filters against text representation", () => {
+  it("builds PostgreSQL interval eq filters with interval casting", () => {
     const driver = new PostgresDriver({
       ...baseConfig,
       type: "pg",
     } as ConnectionConfig);
+
     const result = driver.buildFilterCondition(
       {
         ...buildFilterColumn("interval", "interval"),
         filterable: true,
-        filterOperators: ["like", "is_null", "is_not_null"],
+        filterOperators: ["eq", "neq", "is_null", "is_not_null"],
       },
-      "like",
+      "eq",
       "2",
       1,
     );
 
     expect(result).toEqual({
-      sql: 'CAST("probe_col" AS TEXT) ILIKE $1',
-      params: ["%2%"],
+      sql: '"probe_col" = $1::interval',
+      params: ["2"],
     });
   });
 

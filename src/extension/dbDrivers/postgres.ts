@@ -1,10 +1,8 @@
 import { Pool, types as pgTypes } from "pg";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { ConnectionConfig } from "../connectionManager";
-import {
-  getSshTcpForwardTransport,
-  getTlsServername,
-} from "../driverRuntimeConfig";
+import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
+import { resolveConnectionTlsSettings } from "../services/connectionTls";
 import {
   BaseDBDriver,
   formatDatetimeForDisplay,
@@ -359,7 +357,7 @@ export class PostgresDriver extends BaseDBDriver {
     return this.pool;
   }
   private createPool(database: string): Pool {
-    const sslEnabled = this.config.ssl ?? false;
+    const tlsSettings = resolveConnectionTlsSettings(this.config);
     const forwardedTransport = getSshTcpForwardTransport(this.config);
     const dbOperationTimeoutMs = this.getDbOperationTimeoutMs();
     return new Pool({
@@ -375,13 +373,15 @@ export class PostgresDriver extends BaseDBDriver {
       query_timeout: dbOperationTimeoutMs,
       statement_timeout: dbOperationTimeoutMs,
       idleTimeoutMillis: 30000,
-      ssl: sslEnabled
+      ssl: tlsSettings
         ? {
-            rejectUnauthorized: this.config.rejectUnauthorized ?? true,
-            servername:
-              this.config.rejectUnauthorized !== false
-                ? getTlsServername(this.config)
-                : undefined,
+            rejectUnauthorized: tlsSettings.rejectUnauthorized,
+            servername: tlsSettings.servername,
+            ca: tlsSettings.ca,
+            cert: tlsSettings.cert,
+            key: tlsSettings.key,
+            passphrase: tlsSettings.passphrase,
+            checkServerIdentity: tlsSettings.checkServerIdentity,
           }
         : undefined,
     });
@@ -1836,16 +1836,6 @@ export class PostgresDriver extends BaseDBDriver {
     if (column.category === "interval") {
       if (typeof val !== "string") {
         return null;
-      }
-      if (operator === "like" || operator === "ilike") {
-        const searchValue = val.trim();
-        if (!searchValue) {
-          return null;
-        }
-        return {
-          sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex}`,
-          params: [`%${searchValue}%`],
-        };
       }
       if (operator === "eq" || operator === "neq") {
         const intervalValue = val.trim();

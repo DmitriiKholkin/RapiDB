@@ -1127,6 +1127,7 @@ export class ConnectionManager
     sshPassword?: string;
     sshPrivateKey?: string;
     sshPassphrase?: string;
+    tlsKeyPassphrase?: string;
   } {
     if (!value) {
       return {};
@@ -1174,6 +1175,10 @@ export class ConnectionManager
             typeof parsed.sshPassphrase === "string"
               ? parsed.sshPassphrase
               : undefined,
+          tlsKeyPassphrase:
+            typeof parsed.tlsKeyPassphrase === "string"
+              ? parsed.tlsKeyPassphrase
+              : undefined,
         };
       }
     } catch {}
@@ -1203,6 +1208,14 @@ export class ConnectionManager
         sshPassword: secrets.sshPassword ?? config.sshPassword,
         sshPrivateKey: secrets.sshPrivateKey ?? config.sshPrivateKey,
         sshPassphrase: secrets.sshPassphrase ?? config.sshPassphrase,
+        tls:
+          config.tls !== undefined
+            ? {
+                ...config.tls,
+                keyPassphrase:
+                  secrets.tlsKeyPassphrase ?? config.tls.keyPassphrase,
+              }
+            : config.tls,
       };
     } catch {
       return { ...config, password: "" };

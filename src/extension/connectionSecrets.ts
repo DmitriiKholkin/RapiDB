@@ -13,6 +13,7 @@ export interface ConnectionSecretSnapshot {
   sshPassword?: string;
   sshPrivateKey?: string;
   sshPassphrase?: string;
+  tlsKeyPassphrase?: string;
 }
 
 const CREDENTIAL_BEARING_URI_FIELDS = [
@@ -110,6 +111,11 @@ function extractConnectionSecrets(
       ? (trimOptionalSecretValue(config.sshPassphrase) ??
         previousSecrets?.sshPassphrase)
       : undefined;
+  const tlsKeyPassphrase =
+    config.tls?.mode === "mutualTls"
+      ? (trimOptionalSecretValue(config.tls.keyPassphrase) ??
+        previousSecrets?.tlsKeyPassphrase)
+      : undefined;
 
   return {
     password:
@@ -152,6 +158,7 @@ function extractConnectionSecrets(
     sshPassword,
     sshPrivateKey,
     sshPassphrase,
+    tlsKeyPassphrase,
   };
 }
 
@@ -171,6 +178,7 @@ export function shouldForceSecretStorage(config: ConnectionConfig): boolean {
     trimOptionalSecretValue(config.sshPassword) !== undefined ||
     trimOptionalSecretValue(config.sshPrivateKey) !== undefined ||
     trimOptionalSecretValue(config.sshPassphrase) !== undefined ||
+    trimOptionalSecretValue(config.tls?.keyPassphrase) !== undefined ||
     trimOptionalSecretValue(config.apiKey) !== undefined ||
     trimOptionalSecretValue(config.awsAccessKeyId) !== undefined ||
     trimOptionalSecretValue(config.awsSecretAccessKey) !== undefined ||
@@ -202,8 +210,17 @@ export function sanitizePersistedConnectionConfig(
     ...rest
   } = config;
 
+  const tls =
+    rest.tls !== undefined
+      ? {
+          ...rest.tls,
+          keyPassphrase: undefined,
+        }
+      : undefined;
+
   return {
     ...rest,
+    tls,
     connectionUri: sanitizeCredentialBearingUri(rawConnectionUri),
     uri: sanitizeCredentialBearingUri(rawUri),
     endpoint: sanitizeCredentialBearingUri(rawEndpoint),
@@ -227,6 +244,7 @@ export function hasPersistedConnectionConfigChanges(
     persisted.sshPassword !== original.sshPassword ||
     persisted.sshPrivateKey !== original.sshPrivateKey ||
     persisted.sshPassphrase !== original.sshPassphrase ||
+    persisted.tls?.keyPassphrase !== original.tls?.keyPassphrase ||
     persisted.connectionUri !== original.connectionUri ||
     persisted.uri !== original.uri ||
     persisted.endpoint !== original.endpoint ||

@@ -16,6 +16,49 @@ async function submitCreateConnection(
 }
 
 describe("ConnectionFormView", () => {
+  it("shows TLS modes only for supported drivers and reveals mutual TLS fields", async () => {
+    const user = userEvent.setup();
+
+    render(<ConnectionFormView existing={null} />);
+
+    expect(screen.getByLabelText("TLS mode")).toBeTruthy();
+    expect(
+      screen.getByRole("option", { name: /required, verify ca only/i }),
+    ).toBeTruthy();
+    expect(screen.getByRole("option", { name: /mutual tls/i })).toBeTruthy();
+
+    await user.selectOptions(screen.getByLabelText("TLS mode"), ["mutualTls"]);
+
+    expect(screen.getByLabelText("TLS client certificate file")).toBeTruthy();
+    expect(screen.getByLabelText("TLS client key file")).toBeTruthy();
+    expect(screen.getByLabelText("TLS client key passphrase")).toBeTruthy();
+    expect(screen.getByLabelText("TLS server name override")).toBeTruthy();
+
+    await user.selectOptions(screen.getByLabelText("TLS mode"), [
+      "requireVerifyCa",
+    ]);
+    expect(screen.getByLabelText("TLS CA certificate file")).toBeTruthy();
+    expect(screen.getByLabelText("TLS server name override")).toBeTruthy();
+
+    await user.selectOptions(screen.getByLabelText("TLS mode"), [
+      "requireTrustServerCertificate",
+    ]);
+    expect(screen.queryByLabelText("TLS CA certificate file")).toBeNull();
+    expect(screen.queryByLabelText("TLS server name override")).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: /sql server/i }));
+
+    expect(screen.getByLabelText("TLS mode")).toBeTruthy();
+    expect(
+      screen.queryByRole("option", { name: /required, verify ca only/i }),
+    ).toBeNull();
+    expect(screen.queryByRole("option", { name: /mutual tls/i })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: /oracle/i }));
+
+    expect(screen.queryByLabelText("TLS mode")).toBeNull();
+  });
+
   it("shows connection-type-specific fields", async () => {
     const user = userEvent.setup();
 
@@ -269,6 +312,56 @@ describe("ConnectionFormView", () => {
       }),
     });
     expect(dynamoMessage?.payload).not.toHaveProperty("awsEndpoint");
+  });
+
+  it("posts TLS configuration and legacy compatibility flags in save payloads", async () => {
+    const user = userEvent.setup();
+
+    render(<ConnectionFormView existing={null} />);
+
+    await user.clear(screen.getByLabelText("Connection name"));
+    await user.type(screen.getByLabelText("Connection name"), "Postgres TLS");
+    await user.selectOptions(screen.getByLabelText("TLS mode"), ["mutualTls"]);
+    await user.type(
+      screen.getByLabelText("TLS CA certificate file"),
+      "/tmp/ca.pem",
+    );
+    await user.type(
+      screen.getByLabelText("TLS client certificate file"),
+      "/tmp/client.crt",
+    );
+    await user.type(
+      screen.getByLabelText("TLS client key file"),
+      "/tmp/client.key",
+    );
+    await user.type(
+      screen.getByLabelText("TLS client key passphrase"),
+      "key-passphrase",
+    );
+    await user.type(
+      screen.getByLabelText("TLS server name override"),
+      "db.example.com",
+    );
+
+    clearPostedMessages();
+    await submitCreateConnection(user);
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "saveConnection",
+      payload: expect.objectContaining({
+        type: "pg",
+        ssl: true,
+        rejectUnauthorized: true,
+        tls: {
+          mode: "mutualTls",
+          caFilePath: "/tmp/ca.pem",
+          certFilePath: "/tmp/client.crt",
+          keyFilePath: "/tmp/client.key",
+          keyPassphrase: "key-passphrase",
+          serverNameOverride: "db.example.com",
+        },
+      }),
+    });
   });
 
   it("posts SSH password payloads with forced Secret Storage", async () => {

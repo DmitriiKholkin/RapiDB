@@ -1,4 +1,8 @@
-import type { ConnectionConfig } from "./connectionConfig";
+import {
+  type ConnectionConfig,
+  getConnectionTlsSupport,
+  isConnectionTlsEnabled,
+} from "./connectionConfig";
 import type { ConnectionType } from "./connectionTypes";
 
 export interface ConnectionValidationIssue {
@@ -365,6 +369,102 @@ function buildSqliteValidationIssues(
       ];
 }
 
+function buildTlsValidationIssues(
+  config: Partial<ConnectionConfig>,
+): ConnectionValidationIssue[] {
+  const tlsConfig = config.tls;
+  if (!tlsConfig || !config.type) {
+    return [];
+  }
+
+  const support = getConnectionTlsSupport(config.type);
+  if (!support) {
+    return isConnectionTlsEnabled(tlsConfig.mode)
+      ? [
+          createValidationIssue(
+            "invalid",
+            ["tls"],
+            `TLS configuration is not supported for ${config.type} connections.`,
+          ),
+        ]
+      : [];
+  }
+
+  const issues: ConnectionValidationIssue[] = [];
+  const pushInvalidIssue = (fields: string[], message: string) => {
+    issues.push(createValidationIssue("invalid", fields, message));
+  };
+
+  if (!support.modes.includes(tlsConfig.mode)) {
+    pushInvalidIssue(
+      ["tls.mode"],
+      `TLS mode "${tlsConfig.mode}" is not supported for ${config.type} connections.`,
+    );
+  }
+
+  if (tlsConfig.mode === "mutualTls") {
+    if (!support.supportsClientCertificate) {
+      pushInvalidIssue(
+        ["tls.certFilePath"],
+        `Client certificates are not supported for ${config.type} connections.`,
+      );
+    }
+    if (!support.supportsClientKey) {
+      pushInvalidIssue(
+        ["tls.keyFilePath"],
+        `Client keys are not supported for ${config.type} connections.`,
+      );
+    }
+    if (!hasValue(tlsConfig.certFilePath)) {
+      issues.push(
+        createValidationIssue(
+          "required",
+          ["tls.certFilePath"],
+          'Field "tls.certFilePath" is required for mutual TLS.',
+        ),
+      );
+    }
+    if (!hasValue(tlsConfig.keyFilePath)) {
+      issues.push(
+        createValidationIssue(
+          "required",
+          ["tls.keyFilePath"],
+          'Field "tls.keyFilePath" is required for mutual TLS.',
+        ),
+      );
+    }
+  }
+
+  if (hasValue(tlsConfig.caFilePath) && !support.supportsCaFile) {
+    pushInvalidIssue(
+      ["tls.caFilePath"],
+      `CA certificate files are not supported for ${config.type} connections.`,
+    );
+  }
+
+  if (
+    hasValue(tlsConfig.serverNameOverride) &&
+    !support.supportsServerNameOverride
+  ) {
+    pushInvalidIssue(
+      ["tls.serverNameOverride"],
+      `TLS server name overrides are not supported for ${config.type} connections.`,
+    );
+  }
+
+  if (
+    hasValue(tlsConfig.keyPassphrase) &&
+    !support.supportsClientKeyPassphrase
+  ) {
+    pushInvalidIssue(
+      ["tls.keyPassphrase"],
+      `TLS client key passphrases are not supported for ${config.type} connections.`,
+    );
+  }
+
+  return issues;
+}
+
 export function validateConnectionConfig(
   config: Partial<ConnectionConfig>,
 ): ConnectionValidationResult {
@@ -403,6 +503,7 @@ export function validateConnectionConfig(
     ...missingAnyOf.map(createAnyOfIssue),
     ...buildSqliteValidationIssues(config),
     ...buildSshValidationIssues(config),
+    ...buildTlsValidationIssues(config),
   ];
 
   if (issues.length === 0) {
