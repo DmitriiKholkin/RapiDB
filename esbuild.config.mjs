@@ -15,7 +15,7 @@ const baseConfig = {
   logLevel: "info",
 };
 
-const browserBaseConfig = {
+const webviewBaseConfig = {
   ...baseConfig,
   platform: "browser",
   target: ["chrome120"],
@@ -33,17 +33,8 @@ export const extensionConfig = {
   sourcemap: isProduction ? false : "inline",
 };
 
-export const browserExtensionConfig = {
-  ...browserBaseConfig,
-  entryPoints: ["src/browser/extension.ts"],
-  outfile: "dist/extension-web.js",
-  external: ["vscode"],
-  format: "cjs",
-  sourcemap: isProduction ? false : "inline",
-};
-
 export const webviewConfig = {
-  ...browserBaseConfig,
+  ...webviewBaseConfig,
   entryPoints: ["src/webview/main.tsx"],
   outfile: "dist/webview.js",
   external: [],
@@ -64,13 +55,12 @@ export const webviewConfig = {
 
 export async function build() {
   if (isWatch) {
-    console.log("⚡ RapiDB — watch mode (desktop + browser + webview)");
-    const [extCtx, browserCtx, wvCtx] = await Promise.all([
+    console.log("⚡ RapiDB — watch mode (extension + webview)");
+    const [extCtx, wvCtx] = await Promise.all([
       esbuild.context(extensionConfig),
-      esbuild.context(browserExtensionConfig),
       esbuild.context(webviewConfig),
     ]);
-    await Promise.all([extCtx.watch(), browserCtx.watch(), wvCtx.watch()]);
+    await Promise.all([extCtx.watch(), wvCtx.watch()]);
     console.log("👀 Watching for changes...");
   } else {
     console.log(
@@ -78,7 +68,6 @@ export async function build() {
     );
     await Promise.all([
       esbuild.build(extensionConfig),
-      esbuild.build(browserExtensionConfig),
       esbuild.build(webviewConfig),
     ]);
     console.log("✅ Build complete → dist/");

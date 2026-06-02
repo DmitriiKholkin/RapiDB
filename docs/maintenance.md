@@ -12,7 +12,6 @@ Use this page to decide what documentation must change when the code changes.
 | A test command or fixture | [handbook/testing.md](handbook/testing.md) |
 | Packaging, sqlite runtime prep, or release behavior | [handbook/packaging.md](handbook/packaging.md) |
 | Secret handling or redaction rules | [security/secrets.md](security/secrets.md) |
-| A support-boundary or browser fallback limitation | [handbook/troubleshooting.md](handbook/troubleshooting.md), [architecture/overview.md](architecture/overview.md) |
 
 ## Maintenance Principles
 
@@ -29,5 +28,5 @@ Use this page to decide what documentation must change when the code changes.
 |---|---|
 | Link integrity | Links resolve inside the workspace. |
 | Contract fidelity | Message and state shapes match the code. |
-| Support accuracy | Secret and browser limitations are stated explicitly. |
+| Support accuracy | Secret handling and support boundaries are stated explicitly. |
 | Scope discipline | The README still reads like a product README, not a maintainer manual. |

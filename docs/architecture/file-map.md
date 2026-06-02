@@ -9,7 +9,7 @@ This page explains where the important pieces of the repository live and what ea
 | [package.json](../../package.json) | Runtime metadata, contributed commands and views, scripts, dependencies, and packaging entry points. |
 | [README.md](../../README.md) | Product-facing marketplace README. Keep it concise and user-oriented. |
 | [biome.json](../../biome.json) | Formatting and linting policy. |
-| [esbuild.config.mjs](../../esbuild.config.mjs) | Bundles the extension host, browser fallback, and webview assets. |
+| [esbuild.config.mjs](../../esbuild.config.mjs) | Bundles the extension host and webview assets. |
 | [compose.yaml](../../compose.yaml) | Docker Compose services used by live DB tests. |
 | [vitest.config.ts](../../vitest.config.ts) and [vitest.workspace.ts](../../vitest.workspace.ts) | Test project wiring. |
 | [tsconfig.extension.json](../../tsconfig.extension.json), [tsconfig.webview.json](../../tsconfig.webview.json), [tsconfig.tests.json](../../tsconfig.tests.json) | Type-checking boundaries per runtime. |
@@ -39,12 +39,6 @@ This page explains where the important pieces of the repository live and what ea
 | [services/connectionValidationService.ts](../../src/extension/services/connectionValidationService.ts) | Connection validation and health checks. |
 | [table/tableReadService.ts](../../src/extension/table/tableReadService.ts) | Read pipeline for table data. |
 | [table/tableMutationService.ts](../../src/extension/table/tableMutationService.ts) | Mutation execution and preview logic. |
-
-## src/browser
-
-| File | Responsibility |
-|---|---|
-| [extension.ts](../../src/browser/extension.ts) | Browser-target fallback entry point. It deliberately returns limited functionality and user-facing placeholders. |
 
 ## src/shared
 

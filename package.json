@@ -40,7 +40,6 @@
     "db client"
   ],
   "main": "./dist/extension.js",
-  "browser": "./dist/extension-web.js",
   "activationEvents": [
     "onStartupFinished"
   ],

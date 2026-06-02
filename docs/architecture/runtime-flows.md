@@ -110,14 +110,3 @@ sequenceDiagram
   W-->>E: reload/openTableData messages as needed
 ```
 
-## 5. Browser Fallback Flow
-
-```mermaid
-flowchart LR
-  A[Browser-target build] --> B[src/browser/extension.ts]
-  B --> C[Limited placeholder views]
-  B --> D[Unsupported-command messaging]
-  B --> E[Reduced explorer behavior]
-```
-
-The browser build should be documented as partial support. When a feature is missing in browser mode, that is usually intentional rather than a regression.

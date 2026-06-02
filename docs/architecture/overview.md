@@ -4,8 +4,7 @@ RapiDB is built as a split-runtime VS Code extension:
 
 - the extension host owns state, data access, and commands,
 - the webview owns rendering and user interaction,
-- shared modules define the message and state contracts,
-- the browser build provides a limited fallback.
+- shared modules define the message and state contracts.
 
 ## System Boundary Map
 
@@ -19,7 +18,6 @@ flowchart LR
   C --> G[Connection store]
   D <-->|postMessage| H[Webview React UI]
   H --> I[Shared contracts]
-  B --> J[Browser fallback]
 ```
 
 ## Command And View Surface
@@ -53,4 +51,3 @@ The split keeps the host authoritative and the UI disposable. That makes the sys
 | Shared types are the contract | If a message or initial state shape changes, update [reference/contracts.md](../reference/contracts.md) and the matching tests. |
 | Drivers own engine quirks | Do not push engine-specific SQL or formatting behavior into the webview. |
 | The host enforces safety | Hard caps, read-only guards, and mutation preview logic live on the extension side. |
-| Browser mode is limited | Document it as a fallback, not a feature-parity target. |

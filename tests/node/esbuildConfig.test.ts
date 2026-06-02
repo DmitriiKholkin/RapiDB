@@ -21,13 +21,11 @@ describe("esbuild config", () => {
     );
   });
 
-  it("keeps browser bundles isolated and the build script side-effect free on import", () => {
+  it("keeps the webview bundle isolated and the build script side-effect free on import", () => {
     const source = readEsbuildConfigSource();
 
-    expect(source).toContain('entryPoints: ["src/browser/extension.ts"]');
     expect(source).toContain('entryPoints: ["src/webview/main.tsx"]');
     expect(source).toContain('target: ["chrome120"]');
-    expect(source).toContain('external: ["vscode"]');
     expect(source).toContain('format: "iife"');
     expect(source).toContain("const isDirectRun =");
     expect(source).toContain("if (isDirectRun) {");

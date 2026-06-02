@@ -7,7 +7,7 @@ This folder is the maintainer and support documentation for RapiDB.
 - [Developer handbook](DEVELOPER_HANDBOOK.md) - the main entry point for maintainers and bug fixers.
 - [Architecture overview](architecture/overview.md) - runtime boundaries and major flows.
 - [File map](architecture/file-map.md) - where every major file group lives.
-- [Runtime flows](architecture/runtime-flows.md) - connect, query, table, ERD, and browser fallback flows.
+- [Runtime flows](architecture/runtime-flows.md) - connect, query, table, and ERD flows.
 - [Contracts reference](reference/contracts.md) - host/webview message and state contracts.
 - [Driver matrix](reference/driver-matrix.md) - what each database engine supports.
 - [Testing handbook](handbook/testing.md) - how to run the test slices.

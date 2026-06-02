@@ -14,8 +14,6 @@ RapiDB is a VS Code database client. The runtime is split across three surfaces:
 | Webview UI | Renders query, table, ERD, and connection-form experiences in React | [src/webview](../src/webview) |
 | Shared contracts | Defines the message envelopes, initial panel state, and cross-runtime types | [src/shared](../src/shared) |
 
-The browser build is a degraded fallback and should be documented as such, not treated as a second full runtime.
-
 ## How The Repo Is Organized
 
 Use the following mental model when navigating the code:
@@ -54,7 +52,6 @@ The host side decides what the app can do. The webview side renders whatever sta
 | Query results are truncated or filtered unexpectedly | [src/extension/tableDataService.ts](../src/extension/tableDataService.ts), [src/extension/utils/queryResultFormatting.ts](../src/extension/utils/queryResultFormatting.ts), and [src/shared/safetyContracts.ts](../src/shared/safetyContracts.ts) |
 | Table edits fail or partially apply | [src/extension/table](../src/extension/table) and [src/webview/components/table](../src/webview/components/table) |
 | ERD layout or edges are wrong | [src/extension/services/erdGraphService.ts](../src/extension/services/erdGraphService.ts) and [src/webview/components/ErdView.tsx](../src/webview/components/ErdView.tsx) |
-| Browser mode is missing features | [src/browser/extension.ts](../src/browser/extension.ts) |
 
 ## Version And Tooling Snapshot
 

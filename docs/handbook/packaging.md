@@ -16,7 +16,7 @@ flowchart LR
 
 | Command | Meaning |
 |---|---|
-| `npm run build` | Build the desktop, browser, and webview bundles. |
+| `npm run build` | Build the extension and webview bundles. |
 | `npm run watch` | Watch mode for local development. |
 | `npm run package:prepare` | Prepare package metadata and packaging inputs. |
 | `npm run vscode:prepublish` | Full publish preflight: prepare packaging inputs and produce production bundles. |
