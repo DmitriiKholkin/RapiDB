@@ -7,7 +7,7 @@ RapiDB handles database credentials, SSH credentials, and derived connection sec
 | Field family | Examples |
 |---|---|
 | Database secret | `password` |
-| SSH secret | `sshPassword`, `sshPrivateKey`, `sshPassphrase` |
+| SSH secret | `ssh.password`, `ssh.privateKey`, `ssh.passphrase` |
 | Stored-secret indicators | `hasStoredSecret`, `hasStoredSshPassword`, `hasStoredSshPrivateKey`, `hasStoredSshPassphrase`, `hasStoredApiKey` |
 
 ## Sanitized Versus Submission Shapes

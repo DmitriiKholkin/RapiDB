@@ -240,11 +240,12 @@ describe("ConnectionValidationService", () => {
       host: "db.internal",
       database: "app",
       username: "postgres",
-      sshEnabled: true,
-      sshHost: "bastion.example.com",
-      sshPort: 22,
-      sshUsername: "tunnel",
-      sshAuthMethod: "password",
+      ssh: {
+        host: "bastion.example.com",
+        port: 22,
+        username: "tunnel",
+        authMethod: "password",
+      },
     });
 
     expect(result.valid).toBe(false);
@@ -252,11 +253,7 @@ describe("ConnectionValidationService", () => {
       expect.arrayContaining([
         expect.objectContaining({
           code: "required",
-          fields: ["sshHostFingerprintSha256"],
-        }),
-        expect.objectContaining({
-          code: "required",
-          fields: ["sshPassword"],
+          fields: ["ssh"],
         }),
       ]),
     );
@@ -269,13 +266,14 @@ describe("ConnectionValidationService", () => {
       type: "mongodb",
       connectionUri: "mongodb://db1.internal:27017,db2.internal:27017/app",
       directConnection: false,
-      sshEnabled: true,
-      sshHost: "bastion.example.com",
-      sshPort: 22,
-      sshUsername: "tunnel",
-      sshAuthMethod: "password",
-      sshPassword: "ssh-secret",
-      sshHostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      ssh: {
+        host: "bastion.example.com",
+        port: 22,
+        username: "tunnel",
+        authMethod: "password",
+        password: "ssh-secret",
+        hostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      },
     });
 
     expect(result.valid).toBe(false);
@@ -301,13 +299,14 @@ describe("ConnectionValidationService", () => {
       host: "db.internal",
       database: "app",
       username: "postgres",
-      sshEnabled: true,
-      sshHost: "bastion.example.com",
-      sshPort: 22,
-      sshUsername: "tunnel",
-      sshAuthMethod: "password",
-      sshHostVerificationMode: "trustOnFirstUse",
-      sshPassword: "ssh-secret",
+      ssh: {
+        host: "bastion.example.com",
+        port: 22,
+        username: "tunnel",
+        authMethod: "password",
+        hostVerificationMode: "trustOnFirstUse",
+        password: "ssh-secret",
+      },
     });
 
     expect(result.valid).toBe(true);

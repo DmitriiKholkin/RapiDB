@@ -262,17 +262,18 @@ describe("parseConnectionFormPanelMessage", () => {
         host: "db.internal",
         database: "app",
         username: "postgres",
-        sshEnabled: true,
-        sshHost: "bastion.example.com",
-        sshPort: "22",
-        sshUsername: "tunnel",
-        sshAuthMethod: "privateKey",
-        sshHostVerificationMode: "manual",
-        sshPrivateKey:
-          "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
-        sshPassphrase: "key-passphrase",
-        sshHostFingerprintSha256:
-          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        ssh: {
+          host: "bastion.example.com",
+          port: "22",
+          username: "tunnel",
+          authMethod: "privateKey",
+          hostVerificationMode: "manual",
+          privateKey:
+            "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+          passphrase: "key-passphrase",
+          hostFingerprintSha256:
+            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        },
         hasStoredSshPrivateKey: true,
         hasStoredSshPassphrase: true,
       },
@@ -282,17 +283,19 @@ describe("parseConnectionFormPanelMessage", () => {
       type: "saveConnection",
       payload: expect.objectContaining({
         id: "conn-ssh",
-        sshEnabled: true,
-        sshHost: "bastion.example.com",
-        sshPort: 22,
-        sshUsername: "tunnel",
-        sshAuthMethod: "privateKey",
-        sshHostVerificationMode: "manual",
-        sshPrivateKey:
-          "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
-        sshPassphrase: "key-passphrase",
-        sshHostFingerprintSha256:
-          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        ssh: {
+          host: "bastion.example.com",
+          port: 22,
+          username: "tunnel",
+          authMethod: "privateKey",
+          hostVerificationMode: "manual",
+          password: undefined,
+          privateKey:
+            "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+          passphrase: "key-passphrase",
+          hostFingerprintSha256:
+            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        },
         hasStoredSshPrivateKey: true,
         hasStoredSshPassphrase: true,
       }),
@@ -346,13 +349,14 @@ describe("parseConnectionFormPanelMessage", () => {
         host: "db.internal",
         database: "app",
         username: "postgres",
-        sshEnabled: true,
-        sshHost: "bastion.example.com",
-        sshPort: "22",
-        sshUsername: "tunnel",
-        sshAuthMethod: "password",
-        sshHostVerificationMode: "trustOnFirstUse",
-        sshPassword: "ssh-secret",
+        ssh: {
+          host: "bastion.example.com",
+          port: "22",
+          username: "tunnel",
+          authMethod: "password",
+          hostVerificationMode: "trustOnFirstUse",
+          password: "ssh-secret",
+        },
       },
     });
 
@@ -360,10 +364,17 @@ describe("parseConnectionFormPanelMessage", () => {
       type: "testConnection",
       payload: expect.objectContaining({
         id: "conn-ssh-tofu",
-        sshEnabled: true,
-        sshHostVerificationMode: "trustOnFirstUse",
-        sshHostFingerprintSha256: undefined,
-        sshPassword: "ssh-secret",
+        ssh: {
+          host: "bastion.example.com",
+          port: 22,
+          username: "tunnel",
+          authMethod: "password",
+          hostVerificationMode: "trustOnFirstUse",
+          hostFingerprintSha256: undefined,
+          password: "ssh-secret",
+          privateKey: undefined,
+          passphrase: undefined,
+        },
       }),
     });
   });

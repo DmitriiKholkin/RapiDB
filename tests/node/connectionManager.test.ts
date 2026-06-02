@@ -83,14 +83,15 @@ function createSshPgConfig(id: string): ConnectionConfig {
     port: 5432,
     database: "app",
     username: "postgres",
-    sshEnabled: true,
-    sshHost: "bastion.example.com",
-    sshPort: 22,
-    sshUsername: "tunnel",
-    sshAuthMethod: "password",
-    sshHostVerificationMode: "manual",
-    sshPassword: "ssh-secret",
-    sshHostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+    ssh: {
+      host: "bastion.example.com",
+      port: 22,
+      username: "tunnel",
+      authMethod: "password",
+      hostVerificationMode: "manual",
+      password: "ssh-secret",
+      hostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+    },
   };
 }
 
@@ -1627,15 +1628,16 @@ describe("ConnectionManager", () => {
       host: "db.internal",
       database: "app",
       username: "postgres",
-      sshEnabled: true,
-      sshHost: "bastion.example.com",
-      sshPort: 22,
-      sshUsername: "tunnel",
-      sshAuthMethod: "privateKey",
-      sshPrivateKey:
-        "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
-      sshPassphrase: "key-passphrase",
-      sshHostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      ssh: {
+        host: "bastion.example.com",
+        port: 22,
+        username: "tunnel",
+        authMethod: "privateKey",
+        privateKey:
+          "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+        passphrase: "key-passphrase",
+        hostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      },
       useSecretStorage: false,
     });
 
@@ -1644,16 +1646,17 @@ describe("ConnectionManager", () => {
       .find((connection) => connection.id === "conn-ssh-pg");
     expect(persisted).toMatchObject({
       id: "conn-ssh-pg",
-      sshEnabled: true,
-      sshHost: "bastion.example.com",
-      sshPort: 22,
-      sshUsername: "tunnel",
-      sshAuthMethod: "privateKey",
-      sshHostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      ssh: {
+        host: "bastion.example.com",
+        port: 22,
+        username: "tunnel",
+        authMethod: "privateKey",
+        hostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      },
       useSecretStorage: true,
     });
-    expect(persisted?.sshPrivateKey).toBeUndefined();
-    expect(persisted?.sshPassphrase).toBeUndefined();
+    expect(persisted?.ssh?.privateKey).toBeUndefined();
+    expect(persisted?.ssh?.passphrase).toBeUndefined();
 
     await expect(store.getSecret("conn-ssh-pg")).resolves.toBe(
       JSON.stringify({
@@ -1667,9 +1670,11 @@ describe("ConnectionManager", () => {
     expect(createSshRuntime).toHaveBeenCalledTimes(1);
     expect(driverInstances[0]?.config).toMatchObject({
       id: "conn-ssh-pg",
-      sshPrivateKey:
-        "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
-      sshPassphrase: "key-passphrase",
+      ssh: {
+        privateKey:
+          "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+        passphrase: "key-passphrase",
+      },
     });
   });
 
@@ -1782,14 +1787,15 @@ describe("ConnectionManager", () => {
         name: "Elastic SSH",
         type: "elasticsearch",
         cloudId: "deployment:ZXM=",
-        sshEnabled: true,
-        sshHost: "bastion.example.com",
-        sshPort: 22,
-        sshUsername: "tunnel",
-        sshAuthMethod: "password",
-        sshPassword: "ssh-secret",
-        sshHostFingerprintSha256:
-          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        ssh: {
+          host: "bastion.example.com",
+          port: 22,
+          username: "tunnel",
+          authMethod: "password",
+          password: "ssh-secret",
+          hostFingerprintSha256:
+            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        },
       },
     ]);
 
@@ -1863,8 +1869,11 @@ describe("ConnectionManager", () => {
     store.setConnections([
       {
         ...createSshPgConfig("conn-ssh-tofu"),
-        sshHostVerificationMode: "trustOnFirstUse",
-        sshHostFingerprintSha256: undefined,
+        ssh: {
+          ...createSshPgConfig("conn-ssh-tofu").ssh,
+          hostVerificationMode: "trustOnFirstUse",
+          hostFingerprintSha256: undefined,
+        },
       },
     ]);
 
@@ -1911,8 +1920,8 @@ describe("ConnectionManager", () => {
     expect(
       store
         .getConnections()
-        .find((connection) => connection.id === "conn-ssh-tofu")
-        ?.sshHostFingerprintSha256,
+        .find((connection) => connection.id === "conn-ssh-tofu")?.ssh
+        ?.hostFingerprintSha256,
     ).toBe("SHA256:LearnedTrustOnFirstUseFingerprint1234567890+/=");
   });
 

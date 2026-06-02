@@ -76,7 +76,7 @@ export async function connectLiveDriverViaManager(
     .getConnections()
     .find((candidate) => candidate.id === connection.id);
   assert.match(
-    storedConnection?.sshHostFingerprintSha256 ?? "",
+    storedConnection?.ssh?.hostFingerprintSha256 ?? "",
     /^SHA256:/,
     `Expected TOFU fingerprint pinning for ${connection.id}.`,
   );
@@ -99,14 +99,15 @@ export function withTrustOnFirstUseSsh(
 ): ConnectionConfig {
   return {
     ...connection,
-    sshEnabled: true,
-    sshHost: TEST_SSH_BASTION.host,
-    sshPort: TEST_SSH_BASTION.port,
-    sshUsername: TEST_SSH_BASTION.username,
-    sshAuthMethod: "password",
-    sshPassword: TEST_SSH_BASTION.password,
-    sshHostVerificationMode: "trustOnFirstUse",
-    sshHostFingerprintSha256: undefined,
+    ssh: {
+      host: TEST_SSH_BASTION.host,
+      port: TEST_SSH_BASTION.port,
+      username: TEST_SSH_BASTION.username,
+      authMethod: "password",
+      password: TEST_SSH_BASTION.password,
+      hostVerificationMode: "trustOnFirstUse",
+      hostFingerprintSha256: undefined,
+    },
     useSecretStorage: false,
   };
 }

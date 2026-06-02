@@ -2,6 +2,18 @@ import type { ConnectionType } from "./connectionTypes";
 
 export type ConnectionSshAuthMethod = "password" | "privateKey";
 export type ConnectionSshHostVerificationMode = "manual" | "trustOnFirstUse";
+
+export interface ConnectionSshConfig {
+  host?: string;
+  port?: number;
+  username?: string;
+  authMethod?: ConnectionSshAuthMethod;
+  hostVerificationMode?: ConnectionSshHostVerificationMode;
+  password?: string;
+  privateKey?: string;
+  passphrase?: string;
+  hostFingerprintSha256?: string;
+}
 export type SQLiteWalMode = "auto" | "off";
 export const CONNECTION_TLS_MODES = [
   "disabled",
@@ -97,16 +109,7 @@ export interface ConnectionConfig {
   awsSecretAccessKey?: string;
   awsSessionToken?: string;
   awsEndpoint?: string;
-  sshEnabled?: boolean;
-  sshHost?: string;
-  sshPort?: number;
-  sshUsername?: string;
-  sshAuthMethod?: ConnectionSshAuthMethod;
-  sshHostVerificationMode?: ConnectionSshHostVerificationMode;
-  sshPassword?: string;
-  sshPrivateKey?: string;
-  sshPassphrase?: string;
-  sshHostFingerprintSha256?: string;
+  ssh?: ConnectionSshConfig;
   useSecretStorage?: boolean;
   color?: string;
 }

@@ -399,15 +399,18 @@ describe("ConnectionFormView", () => {
       payload: expect.objectContaining({
         type: "pg",
         useSecretStorage: true,
-        sshEnabled: true,
-        sshHost: "bastion.example.com",
-        sshPort: 22,
-        sshUsername: "tunnel",
-        sshAuthMethod: "password",
-        sshHostVerificationMode: "manual",
-        sshPassword: "ssh-secret",
-        sshHostFingerprintSha256:
-          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        ssh: {
+          host: "bastion.example.com",
+          port: 22,
+          username: "tunnel",
+          authMethod: "password",
+          hostVerificationMode: "manual",
+          password: "ssh-secret",
+          privateKey: undefined,
+          passphrase: undefined,
+          hostFingerprintSha256:
+            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        },
       }),
     });
   });
@@ -443,14 +446,17 @@ describe("ConnectionFormView", () => {
       payload: expect.objectContaining({
         type: "pg",
         useSecretStorage: true,
-        sshEnabled: true,
-        sshHost: "bastion.example.com",
-        sshPort: 22,
-        sshUsername: "tunnel",
-        sshAuthMethod: "password",
-        sshHostVerificationMode: "trustOnFirstUse",
-        sshPassword: "ssh-secret",
-        sshHostFingerprintSha256: undefined,
+        ssh: {
+          host: "bastion.example.com",
+          port: 22,
+          username: "tunnel",
+          authMethod: "password",
+          hostVerificationMode: "trustOnFirstUse",
+          password: "ssh-secret",
+          privateKey: undefined,
+          passphrase: undefined,
+          hostFingerprintSha256: undefined,
+        },
       }),
     });
   });
@@ -465,13 +471,14 @@ describe("ConnectionFormView", () => {
       port: 5432,
       database: "app",
       username: "postgres",
-      sshEnabled: true,
-      sshHost: "bastion.example.com",
-      sshPort: 22,
-      sshUsername: "tunnel",
-      sshAuthMethod: "privateKey" as const,
-      sshHostVerificationMode: "manual" as const,
-      sshHostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      ssh: {
+        host: "bastion.example.com",
+        port: 22,
+        username: "tunnel",
+        authMethod: "privateKey" as const,
+        hostVerificationMode: "manual" as const,
+        hostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      },
       useSecretStorage: true,
       hasStoredSshPrivateKey: true,
       hasStoredSshPassphrase: true,
@@ -494,18 +501,20 @@ describe("ConnectionFormView", () => {
       payload: expect.objectContaining({
         id: "conn-ssh",
         useSecretStorage: true,
-        sshEnabled: true,
-        sshAuthMethod: "privateKey",
-        sshHostVerificationMode: "manual",
-        sshHost: "bastion.example.com",
-        sshPort: 22,
-        sshUsername: "tunnel",
-        sshHostFingerprintSha256:
-          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        ssh: {
+          host: "bastion.example.com",
+          port: 22,
+          username: "tunnel",
+          authMethod: "privateKey",
+          hostVerificationMode: "manual",
+          password: undefined,
+          privateKey: "",
+          passphrase: "",
+          hostFingerprintSha256:
+            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        },
         hasStoredSshPrivateKey: true,
         hasStoredSshPassphrase: true,
-        sshPrivateKey: "",
-        sshPassphrase: "",
       }),
     });
   });

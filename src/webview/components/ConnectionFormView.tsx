@@ -537,22 +537,22 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const [dynamoEndpoint, setDynamoEndpoint] = useState(
     existing?.endpoint ?? existing?.awsEndpoint ?? "",
   );
-  const [sshEnabled, setSshEnabled] = useState(existing?.sshEnabled ?? false);
-  const [sshHost, setSshHost] = useState(existing?.sshHost ?? "");
-  const [sshPort, setSshPort] = useState(String(existing?.sshPort ?? 22));
-  const [sshUsername, setSshUsername] = useState(existing?.sshUsername ?? "");
+  const [sshEnabled, setSshEnabled] = useState(!!existing?.ssh);
+  const [sshHost, setSshHost] = useState(existing?.ssh?.host ?? "");
+  const [sshPort, setSshPort] = useState(String(existing?.ssh?.port ?? 22));
+  const [sshUsername, setSshUsername] = useState(existing?.ssh?.username ?? "");
   const [sshAuthMethod, setSshAuthMethod] = useState<ConnectionSshAuthMethod>(
-    existing?.sshAuthMethod ?? "privateKey",
+    existing?.ssh?.authMethod ?? "privateKey",
   );
   const [sshHostVerificationMode, setSshHostVerificationMode] =
     useState<ConnectionSshHostVerificationMode>(
-      existing?.sshHostVerificationMode ?? "manual",
+      existing?.ssh?.hostVerificationMode ?? "manual",
     );
   const [sshPassword, setSshPassword] = useState("");
   const [sshPrivateKey, setSshPrivateKey] = useState("");
   const [sshPassphrase, setSshPassphrase] = useState("");
   const [sshHostFingerprintSha256, setSshHostFingerprintSha256] = useState(
-    existing?.sshHostFingerprintSha256 ?? "",
+    existing?.ssh?.hostFingerprintSha256 ?? "",
   );
 
   const [tlsMode, setTlsMode] = useState<ConnectionTlsMode>(initialTlsMode);
@@ -774,35 +774,23 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       useSecretStorage: effectiveUseSecretStorage,
       hasStoredSecret: hasStoredSecret || undefined,
       hasStoredApiKey: hasStoredApiKey || undefined,
-      sshEnabled: effectiveSshEnabled,
-      sshHost: effectiveSshEnabled ? sshHost.trim() || undefined : undefined,
-      sshPort:
-        effectiveSshEnabled &&
-        Number.isInteger(parsedSshPort) &&
-        parsedSshPort > 0
-          ? parsedSshPort
-          : undefined,
-      sshUsername: effectiveSshEnabled
-        ? sshUsername.trim() || undefined
-        : undefined,
-      sshAuthMethod: effectiveSshEnabled ? sshAuthMethod : undefined,
-      sshHostVerificationMode: effectiveSshEnabled
-        ? sshHostVerificationMode
-        : undefined,
-      sshPassword:
-        effectiveSshEnabled && sshAuthMethod === "password"
-          ? sshPassword
-          : undefined,
-      sshPrivateKey:
-        effectiveSshEnabled && sshAuthMethod === "privateKey"
-          ? sshPrivateKey
-          : undefined,
-      sshPassphrase:
-        effectiveSshEnabled && sshAuthMethod === "privateKey"
-          ? sshPassphrase
-          : undefined,
-      sshHostFingerprintSha256: effectiveSshEnabled
-        ? sshHostFingerprintSha256.trim() || undefined
+      ssh: effectiveSshEnabled
+        ? {
+            host: sshHost.trim() || undefined,
+            port:
+              Number.isInteger(parsedSshPort) && parsedSshPort > 0
+                ? parsedSshPort
+                : undefined,
+            username: sshUsername.trim() || undefined,
+            authMethod: sshAuthMethod,
+            hostVerificationMode: sshHostVerificationMode,
+            password: sshAuthMethod === "password" ? sshPassword : undefined,
+            privateKey:
+              sshAuthMethod === "privateKey" ? sshPrivateKey : undefined,
+            passphrase:
+              sshAuthMethod === "privateKey" ? sshPassphrase : undefined,
+            hostFingerprintSha256: sshHostFingerprintSha256.trim() || undefined,
+          }
         : undefined,
       hasStoredSshPassword: hasStoredSshPassword || undefined,
       hasStoredSshPrivateKey: hasStoredSshPrivateKey || undefined,

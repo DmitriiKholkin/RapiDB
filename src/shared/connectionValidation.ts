@@ -146,8 +146,8 @@ function isSshFingerprintSha256(value: string | undefined): boolean {
 
 function resolveSshHostVerificationMode(
   config: Partial<ConnectionConfig>,
-): NonNullable<ConnectionConfig["sshHostVerificationMode"]> {
-  return config.sshHostVerificationMode === "trustOnFirstUse"
+): NonNullable<ConnectionConfig["ssh"]>["hostVerificationMode"] {
+  return config.ssh?.hostVerificationMode === "trustOnFirstUse"
     ? "trustOnFirstUse"
     : "manual";
 }
@@ -200,10 +200,11 @@ function collectConditionalIssues(
 function buildSshValidationIssues(
   config: Partial<ConnectionConfig>,
 ): ConnectionValidationIssue[] {
-  if (config.sshEnabled !== true) {
+  if (!config.ssh) {
     return [];
   }
 
+  const ssh = config.ssh;
   const issues: ConnectionValidationIssue[] = [];
   const pushIssue = (
     code: ConnectionValidationIssue["code"],
@@ -216,7 +217,7 @@ function buildSshValidationIssues(
   if (config.type === "sqlite") {
     pushIssue(
       "invalid",
-      ["sshEnabled"],
+      ["ssh"],
       "SSH is not supported for sqlite connections.",
     );
     return issues;
@@ -225,77 +226,74 @@ function buildSshValidationIssues(
   issues.push(
     ...collectConditionalIssues(config, [
       {
-        when: (candidate) => !isPositiveInteger(candidate.sshPort),
+        when: () => !isPositiveInteger(ssh.port),
         issue: createValidationIssue(
           "required",
-          ["sshPort"],
-          'Field "sshPort" is required and must be a positive integer.',
+          ["ssh"],
+          'Field "ssh.port" is required and must be a positive integer.',
         ),
       },
       {
-        when: (candidate) => !hasValue(candidate.sshHost),
+        when: () => !hasValue(ssh.host),
         issue: createValidationIssue(
           "required",
-          ["sshHost"],
-          'Field "sshHost" is required when SSH is enabled.',
+          ["ssh"],
+          'Field "ssh.host" is required when SSH is enabled.',
         ),
       },
       {
-        when: (candidate) => !hasValue(candidate.sshUsername),
+        when: () => !hasValue(ssh.username),
         issue: createValidationIssue(
           "required",
-          ["sshUsername"],
-          'Field "sshUsername" is required when SSH is enabled.',
+          ["ssh"],
+          'Field "ssh.username" is required when SSH is enabled.',
         ),
       },
       {
-        when: (candidate) => !hasValue(candidate.sshAuthMethod),
+        when: () => !hasValue(ssh.authMethod),
         issue: createValidationIssue(
           "required",
-          ["sshAuthMethod"],
-          'Field "sshAuthMethod" is required when SSH is enabled.',
+          ["ssh"],
+          'Field "ssh.authMethod" is required when SSH is enabled.',
         ),
       },
     ]),
   );
 
   const hostVerificationMode = resolveSshHostVerificationMode(config);
-  if (!hasValue(config.sshHostFingerprintSha256)) {
+  if (!hasValue(ssh.hostFingerprintSha256)) {
     if (hostVerificationMode === "manual") {
       pushIssue(
         "required",
-        ["sshHostFingerprintSha256"],
-        'Field "sshHostFingerprintSha256" is required when SSH host verification is manual.',
+        ["ssh"],
+        'Field "ssh.hostFingerprintSha256" is required when SSH host verification is manual.',
       );
     }
-  } else if (!isSshFingerprintSha256(config.sshHostFingerprintSha256)) {
+  } else if (!isSshFingerprintSha256(ssh.hostFingerprintSha256)) {
     pushIssue(
       "invalid",
-      ["sshHostFingerprintSha256"],
-      'Field "sshHostFingerprintSha256" must use the OpenSSH SHA256 fingerprint format.',
+      ["ssh"],
+      'Field "ssh.hostFingerprintSha256" must use the OpenSSH SHA256 fingerprint format.',
     );
   }
 
   issues.push(
     ...collectConditionalIssues(config, [
       {
-        when: (candidate) =>
-          candidate.sshAuthMethod === "password" &&
-          !hasValue(candidate.sshPassword),
+        when: () => ssh.authMethod === "password" && !hasValue(ssh.password),
         issue: createValidationIssue(
           "required",
-          ["sshPassword"],
-          'Field "sshPassword" is required for password SSH auth.',
+          ["ssh"],
+          'Field "ssh.password" is required for password SSH auth.',
         ),
       },
       {
-        when: (candidate) =>
-          candidate.sshAuthMethod === "privateKey" &&
-          !hasValue(candidate.sshPrivateKey),
+        when: () =>
+          ssh.authMethod === "privateKey" && !hasValue(ssh.privateKey),
         issue: createValidationIssue(
           "required",
-          ["sshPrivateKey"],
-          'Field "sshPrivateKey" is required for private key SSH auth.',
+          ["ssh"],
+          'Field "ssh.privateKey" is required for private key SSH auth.',
         ),
       },
     ]),

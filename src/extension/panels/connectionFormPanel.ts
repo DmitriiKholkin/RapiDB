@@ -144,7 +144,7 @@ function serializeStoredConnectionSecrets(
 
 function shouldUseSecretStorage(payload: ConnectionFormSubmission): boolean {
   return (
-    payload.sshEnabled === true ||
+    payload.ssh !== undefined ||
     payload.type === "dynamodb" ||
     payload.type === "elasticsearch" ||
     payload.useSecretStorage === true ||
@@ -153,9 +153,6 @@ function shouldUseSecretStorage(payload: ConnectionFormSubmission): boolean {
     trimOptionalSecretValue(payload.awsAccessKeyId) !== undefined ||
     trimOptionalSecretValue(payload.awsSecretAccessKey) !== undefined ||
     trimOptionalSecretValue(payload.awsSessionToken) !== undefined ||
-    trimOptionalSecretValue(payload.sshPassword) !== undefined ||
-    trimOptionalSecretValue(payload.sshPrivateKey) !== undefined ||
-    trimOptionalSecretValue(payload.sshPassphrase) !== undefined ||
     trimOptionalSecretValue(payload.tls?.keyPassphrase) !== undefined ||
     extractCredentialBearingUriSecret(payload.connectionUri) !== undefined ||
     extractCredentialBearingUriSecret(payload.uri) !== undefined ||
@@ -174,9 +171,7 @@ function sanitizeExistingForForm(
     awsAccessKeyId: _awsAccessKeyId,
     awsSecretAccessKey: _awsSecretAccessKey,
     awsSessionToken: _awsSessionToken,
-    sshPassword: _sshPassword,
-    sshPrivateKey: _sshPrivateKey,
-    sshPassphrase: _sshPassphrase,
+    ssh: _ssh,
     connectionUri,
     uri,
     endpoint,
@@ -191,8 +186,20 @@ function sanitizeExistingForForm(
         }
       : undefined;
 
+  const sanitizedSsh = _ssh
+    ? {
+        host: _ssh.host,
+        port: _ssh.port,
+        username: _ssh.username,
+        authMethod: _ssh.authMethod,
+        hostVerificationMode: _ssh.hostVerificationMode,
+        hostFingerprintSha256: _ssh.hostFingerprintSha256,
+      }
+    : undefined;
+
   return {
     ...rest,
+    ssh: sanitizedSsh,
     tls,
     connectionUri: sanitizeCredentialBearingUri(connectionUri),
     uri: sanitizeCredentialBearingUri(uri),
@@ -439,32 +446,43 @@ export class ConnectionFormPanel {
       uri: submittedUri,
       endpoint: submittedEndpoint,
       awsEndpoint: submittedAwsEndpoint,
+      ssh: submittedSsh,
       ...rest
     } = payload;
-    const sshPassword =
-      payload.sshEnabled === true && payload.sshAuthMethod === "password"
-        ? this.resolveSubmittedSecret(
-            payload.sshPassword,
-            useSecretStorage ? storedSecrets.sshPassword : undefined,
-            existing?.sshPassword,
-          )
-        : undefined;
-    const sshPrivateKey =
-      payload.sshEnabled === true && payload.sshAuthMethod === "privateKey"
-        ? this.resolveSubmittedSecret(
-            payload.sshPrivateKey,
-            useSecretStorage ? storedSecrets.sshPrivateKey : undefined,
-            existing?.sshPrivateKey,
-          )
-        : undefined;
-    const sshPassphrase =
-      payload.sshEnabled === true && payload.sshAuthMethod === "privateKey"
-        ? this.resolveSubmittedSecret(
-            payload.sshPassphrase,
-            useSecretStorage ? storedSecrets.sshPassphrase : undefined,
-            existing?.sshPassphrase,
-          )
-        : undefined;
+    const ssh = submittedSsh
+      ? {
+          host: submittedSsh.host,
+          port: submittedSsh.port,
+          username: submittedSsh.username,
+          authMethod: submittedSsh.authMethod,
+          hostVerificationMode: submittedSsh.hostVerificationMode,
+          hostFingerprintSha256: submittedSsh.hostFingerprintSha256,
+          password:
+            submittedSsh.authMethod === "password"
+              ? this.resolveSubmittedSecret(
+                  submittedSsh.password,
+                  useSecretStorage ? storedSecrets.sshPassword : undefined,
+                  existing?.ssh?.password,
+                )
+              : undefined,
+          privateKey:
+            submittedSsh.authMethod === "privateKey"
+              ? this.resolveSubmittedSecret(
+                  submittedSsh.privateKey,
+                  useSecretStorage ? storedSecrets.sshPrivateKey : undefined,
+                  existing?.ssh?.privateKey,
+                )
+              : undefined,
+          passphrase:
+            submittedSsh.authMethod === "privateKey"
+              ? this.resolveSubmittedSecret(
+                  submittedSsh.passphrase,
+                  useSecretStorage ? storedSecrets.sshPassphrase : undefined,
+                  existing?.ssh?.passphrase,
+                )
+              : undefined,
+        }
+      : undefined;
     const tls =
       rest.tls !== undefined
         ? {
@@ -528,9 +546,7 @@ export class ConnectionFormPanel {
         trimOptionalSecretValue(payload.awsSessionToken) ??
         (useSecretStorage ? storedSecrets.awsSessionToken : undefined) ??
         existing?.awsSessionToken,
-      sshPassword,
-      sshPrivateKey,
-      sshPassphrase,
+      ssh,
     };
   }
 
@@ -621,16 +637,16 @@ export class ConnectionFormPanel {
               previousSecretSnapshot.parsed.awsEndpoint,
             ),
             sshPassword:
-              raw.sshEnabled === true && raw.sshAuthMethod === "password"
-                ? trimOptionalSecretValue(raw.sshPassword)
+              raw.ssh?.authMethod === "password"
+                ? trimOptionalSecretValue(raw.ssh.password)
                 : undefined,
             sshPrivateKey:
-              raw.sshEnabled === true && raw.sshAuthMethod === "privateKey"
-                ? trimOptionalSecretValue(raw.sshPrivateKey)
+              raw.ssh?.authMethod === "privateKey"
+                ? trimOptionalSecretValue(raw.ssh.privateKey)
                 : undefined,
             sshPassphrase:
-              raw.sshEnabled === true && raw.sshAuthMethod === "privateKey"
-                ? trimOptionalSecretValue(raw.sshPassphrase)
+              raw.ssh?.authMethod === "privateKey"
+                ? trimOptionalSecretValue(raw.ssh.passphrase)
                 : undefined,
             tlsKeyPassphrase:
               raw.tls?.mode === "mutualTls"

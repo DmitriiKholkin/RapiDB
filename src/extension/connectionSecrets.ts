@@ -96,19 +96,19 @@ function extractConnectionSecrets(
   config: ConnectionConfig,
   previousSecrets?: ConnectionSecretSnapshot,
 ): ConnectionSecretSnapshot {
+  const ssh = config.ssh;
   const sshPassword =
-    config.sshEnabled === true && config.sshAuthMethod === "password"
-      ? (trimOptionalSecretValue(config.sshPassword) ??
-        previousSecrets?.sshPassword)
+    ssh && ssh.authMethod === "password"
+      ? (trimOptionalSecretValue(ssh.password) ?? previousSecrets?.sshPassword)
       : undefined;
   const sshPrivateKey =
-    config.sshEnabled === true && config.sshAuthMethod === "privateKey"
-      ? (trimOptionalSecretValue(config.sshPrivateKey) ??
+    ssh && ssh.authMethod === "privateKey"
+      ? (trimOptionalSecretValue(ssh.privateKey) ??
         previousSecrets?.sshPrivateKey)
       : undefined;
   const sshPassphrase =
-    config.sshEnabled === true && config.sshAuthMethod === "privateKey"
-      ? (trimOptionalSecretValue(config.sshPassphrase) ??
+    ssh && ssh.authMethod === "privateKey"
+      ? (trimOptionalSecretValue(ssh.passphrase) ??
         previousSecrets?.sshPassphrase)
       : undefined;
   const tlsKeyPassphrase =
@@ -170,14 +170,11 @@ function hasCredentialBearingUriSecret(config: ConnectionConfig): boolean {
 
 export function shouldForceSecretStorage(config: ConnectionConfig): boolean {
   return (
-    config.sshEnabled === true ||
+    config.ssh !== undefined ||
     config.type === "dynamodb" ||
     config.type === "elasticsearch" ||
     hasCredentialBearingUriSecret(config) ||
     trimOptionalSecretValue(config.password) !== undefined ||
-    trimOptionalSecretValue(config.sshPassword) !== undefined ||
-    trimOptionalSecretValue(config.sshPrivateKey) !== undefined ||
-    trimOptionalSecretValue(config.sshPassphrase) !== undefined ||
     trimOptionalSecretValue(config.tls?.keyPassphrase) !== undefined ||
     trimOptionalSecretValue(config.apiKey) !== undefined ||
     trimOptionalSecretValue(config.awsAccessKeyId) !== undefined ||
@@ -200,9 +197,7 @@ export function sanitizePersistedConnectionConfig(
     awsAccessKeyId: _awsAccessKeyId,
     awsSecretAccessKey: _awsSecretAccessKey,
     awsSessionToken: _awsSessionToken,
-    sshPassword: _sshPassword,
-    sshPrivateKey: _sshPrivateKey,
-    sshPassphrase: _sshPassphrase,
+    ssh: _ssh,
     connectionUri: rawConnectionUri,
     uri: rawUri,
     endpoint: rawEndpoint,
@@ -218,8 +213,20 @@ export function sanitizePersistedConnectionConfig(
         }
       : undefined;
 
+  const sanitizedSsh = _ssh
+    ? {
+        host: _ssh.host,
+        port: _ssh.port,
+        username: _ssh.username,
+        authMethod: _ssh.authMethod,
+        hostVerificationMode: _ssh.hostVerificationMode,
+        hostFingerprintSha256: _ssh.hostFingerprintSha256,
+      }
+    : undefined;
+
   return {
     ...rest,
+    ssh: sanitizedSsh,
     tls,
     connectionUri: sanitizeCredentialBearingUri(rawConnectionUri),
     uri: sanitizeCredentialBearingUri(rawUri),
@@ -241,9 +248,9 @@ export function hasPersistedConnectionConfigChanges(
     persisted.awsAccessKeyId !== original.awsAccessKeyId ||
     persisted.awsSecretAccessKey !== original.awsSecretAccessKey ||
     persisted.awsSessionToken !== original.awsSessionToken ||
-    persisted.sshPassword !== original.sshPassword ||
-    persisted.sshPrivateKey !== original.sshPrivateKey ||
-    persisted.sshPassphrase !== original.sshPassphrase ||
+    persisted.ssh?.password !== original.ssh?.password ||
+    persisted.ssh?.privateKey !== original.ssh?.privateKey ||
+    persisted.ssh?.passphrase !== original.ssh?.passphrase ||
     persisted.tls?.keyPassphrase !== original.tls?.keyPassphrase ||
     persisted.connectionUri !== original.connectionUri ||
     persisted.uri !== original.uri ||

@@ -1193,6 +1193,14 @@ export class ConnectionManager
     try {
       const stored = await this.store.getSecret(config.id);
       const secrets = this.parseStoredSecrets(stored);
+      const ssh = config.ssh
+        ? {
+            ...config.ssh,
+            password: secrets.sshPassword ?? config.ssh.password,
+            privateKey: secrets.sshPrivateKey ?? config.ssh.privateKey,
+            passphrase: secrets.sshPassphrase ?? config.ssh.passphrase,
+          }
+        : undefined;
       return {
         ...config,
         password: secrets.password ?? config.password ?? "",
@@ -1205,9 +1213,7 @@ export class ConnectionManager
         uri: secrets.uri ?? config.uri,
         endpoint: secrets.endpoint ?? config.endpoint,
         awsEndpoint: secrets.awsEndpoint ?? config.awsEndpoint,
-        sshPassword: secrets.sshPassword ?? config.sshPassword,
-        sshPrivateKey: secrets.sshPrivateKey ?? config.sshPrivateKey,
-        sshPassphrase: secrets.sshPassphrase ?? config.sshPassphrase,
+        ssh,
         tls:
           config.tls !== undefined
             ? {
@@ -1284,58 +1290,60 @@ export class ConnectionManager
   private buildConnectionSshSettings(
     config: ConnectionConfig,
   ): ConnectionSshSettings | undefined {
-    if (config.sshEnabled !== true) {
+    if (!config.ssh) {
       return undefined;
     }
 
-    const host = config.sshHost?.trim();
-    const username = config.sshUsername?.trim();
-    const fingerprintSha256 = config.sshHostFingerprintSha256?.trim();
+    const ssh = config.ssh;
+    const host = ssh.host?.trim();
+    const port = ssh.port;
+    const username = ssh.username?.trim();
+    const fingerprintSha256 = ssh.hostFingerprintSha256?.trim();
     const hostVerificationMode =
-      config.sshHostVerificationMode === "trustOnFirstUse"
+      ssh.hostVerificationMode === "trustOnFirstUse"
         ? "trustOnFirstUse"
         : "manual";
     if (
       !host ||
-      !config.sshPort ||
+      !port ||
       !username ||
       (hostVerificationMode === "manual" && !fingerprintSha256)
     ) {
       throw new Error("[RapiDB] SSH settings are incomplete.");
     }
 
-    if (config.sshAuthMethod === "password") {
-      if (!config.sshPassword) {
+    if (ssh.authMethod === "password") {
+      if (!ssh.password) {
         throw new Error("[RapiDB] SSH password is missing.");
       }
 
       return {
         host,
-        port: config.sshPort,
+        port,
         username,
         hostVerificationMode,
         fingerprintSha256,
         auth: {
           kind: "password",
-          password: config.sshPassword,
+          password: ssh.password,
         },
       };
     }
 
-    if (!config.sshPrivateKey) {
+    if (!ssh.privateKey) {
       throw new Error("[RapiDB] SSH private key is missing.");
     }
 
     return {
       host,
-      port: config.sshPort,
+      port,
       username,
       hostVerificationMode,
       fingerprintSha256,
       auth: {
         kind: "privateKey",
-        privateKey: config.sshPrivateKey,
-        passphrase: config.sshPassphrase,
+        privateKey: ssh.privateKey,
+        passphrase: ssh.passphrase,
       },
     };
   }
@@ -1693,12 +1701,12 @@ export class ConnectionManager
     fingerprintSha256: string,
   ): Promise<void> {
     const persistedConnection = this.getConnection(connectionId);
-    if (persistedConnection?.sshEnabled !== true) {
+    if (!persistedConnection?.ssh) {
       return;
     }
 
     const hostVerificationMode =
-      persistedConnection.sshHostVerificationMode === "trustOnFirstUse"
+      persistedConnection.ssh.hostVerificationMode === "trustOnFirstUse"
         ? "trustOnFirstUse"
         : "manual";
     if (hostVerificationMode !== "trustOnFirstUse") {
@@ -1706,7 +1714,8 @@ export class ConnectionManager
     }
 
     if (
-      persistedConnection.sshHostFingerprintSha256?.trim() === fingerprintSha256
+      persistedConnection.ssh.hostFingerprintSha256?.trim() ===
+      fingerprintSha256
     ) {
       return;
     }
@@ -1715,7 +1724,10 @@ export class ConnectionManager
       connection.id === connectionId
         ? {
             ...connection,
-            sshHostFingerprintSha256: fingerprintSha256,
+            ssh: {
+              ...connection.ssh,
+              hostFingerprintSha256: fingerprintSha256,
+            },
           }
         : connection,
     );

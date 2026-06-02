@@ -407,16 +407,17 @@ describe("ConnectionFormPanel", () => {
         awsSecretAccessKey: "secret-key",
         awsSessionToken: "session-token",
         password: "db-password",
-        sshEnabled: true,
-        sshHost: "bastion.example.com",
-        sshPort: 22,
-        sshUsername: "tunnel",
-        sshAuthMethod: "privateKey",
-        sshPrivateKey:
-          "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
-        sshPassphrase: "inline-passphrase",
-        sshHostFingerprintSha256:
-          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        ssh: {
+          host: "bastion.example.com",
+          port: 22,
+          username: "tunnel",
+          authMethod: "privateKey",
+          privateKey:
+            "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+          passphrase: "inline-passphrase",
+          hostFingerprintSha256:
+            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        },
         useSecretStorage: true,
       },
     );
@@ -443,8 +444,11 @@ describe("ConnectionFormPanel", () => {
           awsAccessKeyId: expect.anything(),
           awsSecretAccessKey: expect.anything(),
           awsSessionToken: expect.anything(),
-          sshPrivateKey: expect.anything(),
-          sshPassphrase: expect.anything(),
+          ssh: expect.objectContaining({
+            privateKey: expect.anything(),
+            passphrase: expect.anything(),
+            password: expect.anything(),
+          }),
         }),
       }),
     );
@@ -830,13 +834,14 @@ describe("ConnectionFormPanel", () => {
         host: "db.internal",
         database: "app",
         username: "postgres",
-        sshEnabled: true,
-        sshHost: "bastion.example.com",
-        sshPort: 22,
-        sshUsername: "tunnel",
-        sshAuthMethod: "privateKey",
-        sshHostFingerprintSha256:
-          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        ssh: {
+          host: "bastion.example.com",
+          port: 22,
+          username: "tunnel",
+          authMethod: "privateKey",
+          hostFingerprintSha256:
+            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        },
         useSecretStorage: true,
       })),
       testConnection: vi.fn(),
@@ -852,13 +857,14 @@ describe("ConnectionFormPanel", () => {
         host: "db.internal",
         database: "app",
         username: "postgres",
-        sshEnabled: true,
-        sshHost: "bastion.example.com",
-        sshPort: 22,
-        sshUsername: "tunnel",
-        sshAuthMethod: "privateKey",
-        sshHostFingerprintSha256:
-          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        ssh: {
+          host: "bastion.example.com",
+          port: 22,
+          username: "tunnel",
+          authMethod: "privateKey",
+          hostFingerprintSha256:
+            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        },
         useSecretStorage: true,
       },
     );
@@ -879,25 +885,28 @@ describe("ConnectionFormPanel", () => {
         host: "db.internal",
         database: "app",
         username: "postgres",
-        sshEnabled: true,
-        sshHost: "bastion.example.com",
-        sshPort: 22,
-        sshUsername: "tunnel",
-        sshAuthMethod: "privateKey",
-        sshHostFingerprintSha256:
-          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        ssh: {
+          host: "bastion.example.com",
+          port: 22,
+          username: "tunnel",
+          authMethod: "privateKey",
+          hostFingerprintSha256:
+            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+          privateKey: "",
+          passphrase: "new-passphrase",
+        },
         useSecretStorage: false,
         hasStoredSshPrivateKey: true,
         hasStoredSshPassphrase: true,
-        sshPrivateKey: "",
-        sshPassphrase: "new-passphrase",
       },
     });
 
     await expect(promise).resolves.toEqual(
       expect.objectContaining({
         id: "conn-ssh",
-        sshEnabled: true,
+        ssh: expect.objectContaining({
+          host: "bastion.example.com",
+        }),
         useSecretStorage: true,
       }),
     );
@@ -912,10 +921,11 @@ describe("ConnectionFormPanel", () => {
     expect(connectionManager.saveConnection).toHaveBeenCalledWith(
       expect.objectContaining({
         id: "conn-ssh",
-        sshEnabled: true,
-        sshPrivateKey:
-          "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
-        sshPassphrase: "new-passphrase",
+        ssh: expect.objectContaining({
+          privateKey:
+            "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+          passphrase: "new-passphrase",
+        }),
         useSecretStorage: true,
       }),
     );
