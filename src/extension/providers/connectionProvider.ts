@@ -3,6 +3,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import {
+  isConnectionTlsEnabled,
+  resolveConnectionTlsMode,
+} from "../../shared/connectionConfig";
+import {
   type DataDbObjectKind,
   type DbObjectKind,
   EXPLORER_CATEGORY_CONFIG,
@@ -1551,7 +1555,7 @@ export class ConnectionProvider
         config.connectionUri ??
         config.endpoint ??
         (config.host
-          ? `${config.ssl ? "https" : "http"}://${config.host}${config.port ? `:${config.port}` : ""}`
+          ? `${isConnectionTlsEnabled(resolveConnectionTlsMode(config)) ? "https" : "http"}://${config.host}${config.port ? `:${config.port}` : ""}`
           : "—");
       return [
         "Type: `elasticsearch`",
@@ -1561,8 +1565,9 @@ export class ConnectionProvider
       ];
     }
 
-    const sslStatus = config.ssl
-      ? config.rejectUnauthorized !== false
+    const tlsMode = resolveConnectionTlsMode(config);
+    const sslStatus = isConnectionTlsEnabled(tlsMode)
+      ? tlsMode !== "requireTrustServerCertificate"
         ? "enabled"
         : "enabled (allow self-signed)"
       : "disabled";

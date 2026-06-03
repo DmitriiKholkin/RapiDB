@@ -17,7 +17,6 @@ import type {
   SQLiteWalMode,
 } from "../../shared/connectionConfig";
 import {
-  deriveLegacyConnectionTlsFlags,
   getConnectionTlsSupport,
   isConnectionTlsEnabled,
   resolveConnectionTlsMode,
@@ -762,7 +761,6 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
               : undefined,
         }
       : undefined;
-    const legacyTlsFlags = deriveLegacyConnectionTlsFlags(tlsConfig);
 
     return {
       id: existing?.id ?? crypto.randomUUID(),
@@ -816,10 +814,6 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
               database: database.trim(),
               username: username.trim(),
               password,
-              ssl: supportsTls ? legacyTlsFlags.ssl : undefined,
-              rejectUnauthorized: supportsTls
-                ? legacyTlsFlags.rejectUnauthorized
-                : undefined,
               tls: tlsConfig,
               ...(isMongo
                 ? {

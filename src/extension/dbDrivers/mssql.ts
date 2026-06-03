@@ -1016,11 +1016,7 @@ export class MSSQLDriver extends BaseDBDriver {
       throw new Error("[RapiDB] MSSQL host is required");
     }
     const tlsSettings = resolveConnectionTlsSettings(this.config);
-    const sslEnabled =
-      tlsSettings !== undefined ? true : (this.config.ssl ?? true);
-    const trustCert = tlsSettings
-      ? !tlsSettings.rejectUnauthorized
-      : !(this.config.rejectUnauthorized ?? true);
+    const trustCert = tlsSettings ? !tlsSettings.rejectUnauthorized : false;
     const runtimeServerName = getMssqlServerName(this.config);
     return {
       server: serverHost,
@@ -1031,13 +1027,12 @@ export class MSSQLDriver extends BaseDBDriver {
       connectionTimeout: this.getConnectionTimeoutMs(),
       requestTimeout: this.getDbOperationTimeoutMs(),
       options: {
-        encrypt: sslEnabled,
+        encrypt: true,
         trustServerCertificate: trustCert,
         enableArithAbort: true,
         abortTransactionOnError: true,
         serverName:
-          runtimeServerName ??
-          (sslEnabled && !trustCert ? this.config.host : undefined),
+          runtimeServerName ?? (!trustCert ? this.config.host : undefined),
         useUTC: false,
       },
     };

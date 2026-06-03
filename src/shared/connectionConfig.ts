@@ -89,8 +89,6 @@ export interface ConnectionConfig {
   username?: string;
   password?: string;
   filePath?: string;
-  ssl?: boolean;
-  rejectUnauthorized?: boolean;
   tls?: ConnectionTlsConfig;
   folder?: string;
   serviceName?: string;
@@ -121,19 +119,9 @@ export function getConnectionTlsSupport(
 }
 
 export function resolveConnectionTlsMode(
-  config: Pick<ConnectionConfig, "ssl" | "rejectUnauthorized" | "tls">,
+  config: Pick<ConnectionConfig, "tls">,
 ): ConnectionTlsMode {
-  if (config.tls?.mode) {
-    return config.tls.mode;
-  }
-
-  if (config.ssl === true) {
-    return config.rejectUnauthorized === false
-      ? "requireTrustServerCertificate"
-      : "requireVerifyFull";
-  }
-
-  return "disabled";
+  return config.tls?.mode ?? "disabled";
 }
 
 export function isConnectionTlsEnabled(mode: ConnectionTlsMode): boolean {
@@ -141,36 +129,11 @@ export function isConnectionTlsEnabled(mode: ConnectionTlsMode): boolean {
 }
 
 export function normalizeConnectionTlsConfig(
-  config: Pick<ConnectionConfig, "ssl" | "rejectUnauthorized" | "tls">,
+  config: Pick<ConnectionConfig, "tls">,
 ): ConnectionTlsConfig | undefined {
-  if (config.tls?.mode) {
+  if (config.tls?.mode && config.tls.mode !== "disabled") {
     return config.tls;
   }
 
-  if (config.ssl !== true) {
-    return undefined;
-  }
-
-  return {
-    mode:
-      config.rejectUnauthorized === false
-        ? "requireTrustServerCertificate"
-        : "requireVerifyFull",
-  };
-}
-
-export function deriveLegacyConnectionTlsFlags(
-  tls: ConnectionTlsConfig | undefined,
-): Pick<ConnectionConfig, "ssl" | "rejectUnauthorized"> {
-  if (!tls || tls.mode === "disabled") {
-    return {
-      ssl: false,
-      rejectUnauthorized: undefined,
-    };
-  }
-
-  return {
-    ssl: true,
-    rejectUnauthorized: tls.mode !== "requireTrustServerCertificate",
-  };
+  return undefined;
 }

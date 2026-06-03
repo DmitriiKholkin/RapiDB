@@ -604,8 +604,6 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
     database: type === "oracle" ? undefined : database,
     username: readOptionalString(input, "username"),
     filePath: readOptionalString(input, "filePath"),
-    ssl: readOptionalBoolean(input, "ssl"),
-    rejectUnauthorized: readOptionalBoolean(input, "rejectUnauthorized"),
     tls: readConnectionTlsConfig(input.tls),
     folder: readOptionalString(input, "folder"),
     serviceName: normalizedOracleServiceName,

@@ -326,4 +326,266 @@ describe("VSCodeConnectionManagerStore", () => {
       },
     ]);
   });
+
+  it("migrates legacy ssl=true rejectUnauthorized=true to tls requireVerifyFull", async () => {
+    vi.resetModules();
+
+    const storedConnections = [
+      {
+        id: "conn-1",
+        name: "Legacy",
+        type: "pg",
+        host: "localhost",
+        ssl: true,
+        rejectUnauthorized: true,
+      },
+    ];
+    const update = vi.fn(async () => undefined);
+    const get = vi.fn((section: string, fallback?: unknown) => {
+      if (section === "connections") {
+        return storedConnections;
+      }
+      return fallback;
+    });
+
+    vi.doMock("vscode", () => ({
+      workspace: {
+        getConfiguration: vi.fn(() => ({
+          get,
+          update,
+        })),
+        onDidChangeConfiguration: vi.fn(),
+      },
+      ConfigurationTarget: {
+        Global: 1,
+      },
+    }));
+
+    const { VSCodeConnectionManagerStore } = await import(
+      "../../src/extension/connectionManagerStore"
+    );
+
+    const store = new VSCodeConnectionManagerStore({
+      globalState: {
+        get: vi.fn(),
+        update: vi.fn(),
+      },
+      secrets: {
+        get: vi.fn(),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    } as never);
+
+    const connections = store.getConnections();
+
+    expect(connections).toEqual([
+      {
+        id: "conn-1",
+        name: "Legacy",
+        type: "pg",
+        host: "localhost",
+        tls: { mode: "requireVerifyFull" },
+      },
+    ]);
+    // Should persist the migration back
+    expect(update).toHaveBeenCalledWith(
+      "connections",
+      expect.arrayContaining([
+        expect.objectContaining({
+          tls: { mode: "requireVerifyFull" },
+        }),
+      ]),
+      1,
+    );
+  });
+
+  it("migrates ssl=true rejectUnauthorized=false to tls requireTrustServerCertificate", async () => {
+    vi.resetModules();
+
+    const storedConnections = [
+      {
+        id: "conn-2",
+        name: "Legacy Trust",
+        type: "mysql",
+        host: "localhost",
+        ssl: true,
+        rejectUnauthorized: false,
+      },
+    ];
+    const update = vi.fn(async () => undefined);
+    const get = vi.fn((section: string, fallback?: unknown) => {
+      if (section === "connections") {
+        return storedConnections;
+      }
+      return fallback;
+    });
+
+    vi.doMock("vscode", () => ({
+      workspace: {
+        getConfiguration: vi.fn(() => ({
+          get,
+          update,
+        })),
+        onDidChangeConfiguration: vi.fn(),
+      },
+      ConfigurationTarget: {
+        Global: 1,
+      },
+    }));
+
+    const { VSCodeConnectionManagerStore } = await import(
+      "../../src/extension/connectionManagerStore"
+    );
+
+    const store = new VSCodeConnectionManagerStore({
+      globalState: {
+        get: vi.fn(),
+        update: vi.fn(),
+      },
+      secrets: {
+        get: vi.fn(),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    } as never);
+
+    const connections = store.getConnections();
+
+    expect(connections).toEqual([
+      {
+        id: "conn-2",
+        name: "Legacy Trust",
+        type: "mysql",
+        host: "localhost",
+        tls: { mode: "requireTrustServerCertificate" },
+      },
+    ]);
+  });
+
+  it("migrates ssl=false to tls disabled", async () => {
+    vi.resetModules();
+
+    const storedConnections = [
+      {
+        id: "conn-3",
+        name: "No TLS",
+        type: "pg",
+        host: "localhost",
+        ssl: false,
+      },
+    ];
+    const update = vi.fn(async () => undefined);
+    const get = vi.fn((section: string, fallback?: unknown) => {
+      if (section === "connections") {
+        return storedConnections;
+      }
+      return fallback;
+    });
+
+    vi.doMock("vscode", () => ({
+      workspace: {
+        getConfiguration: vi.fn(() => ({
+          get,
+          update,
+        })),
+        onDidChangeConfiguration: vi.fn(),
+      },
+      ConfigurationTarget: {
+        Global: 1,
+      },
+    }));
+
+    const { VSCodeConnectionManagerStore } = await import(
+      "../../src/extension/connectionManagerStore"
+    );
+
+    const store = new VSCodeConnectionManagerStore({
+      globalState: {
+        get: vi.fn(),
+        update: vi.fn(),
+      },
+      secrets: {
+        get: vi.fn(),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    } as never);
+
+    const connections = store.getConnections();
+
+    expect(connections).toEqual([
+      {
+        id: "conn-3",
+        name: "No TLS",
+        type: "pg",
+        host: "localhost",
+        tls: { mode: "disabled" },
+      },
+    ]);
+  });
+
+  it("does not migrate connections that already have tls", async () => {
+    vi.resetModules();
+
+    const storedConnections = [
+      {
+        id: "conn-4",
+        name: "Modern",
+        type: "pg",
+        host: "localhost",
+        tls: { mode: "requireVerifyCa", caFilePath: "/tmp/ca.pem" },
+      },
+    ];
+    const update = vi.fn();
+    const get = vi.fn((section: string, fallback?: unknown) => {
+      if (section === "connections") {
+        return storedConnections;
+      }
+      return fallback;
+    });
+
+    vi.doMock("vscode", () => ({
+      workspace: {
+        getConfiguration: vi.fn(() => ({
+          get,
+          update,
+        })),
+        onDidChangeConfiguration: vi.fn(),
+      },
+      ConfigurationTarget: {
+        Global: 1,
+      },
+    }));
+
+    const { VSCodeConnectionManagerStore } = await import(
+      "../../src/extension/connectionManagerStore"
+    );
+
+    const store = new VSCodeConnectionManagerStore({
+      globalState: {
+        get: vi.fn(),
+        update: vi.fn(),
+      },
+      secrets: {
+        get: vi.fn(),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    } as never);
+
+    const connections = store.getConnections();
+
+    expect(connections).toEqual([
+      {
+        id: "conn-4",
+        name: "Modern",
+        type: "pg",
+        host: "localhost",
+        tls: { mode: "requireVerifyCa", caFilePath: "/tmp/ca.pem" },
+      },
+    ]);
+    // No update should be triggered
+    expect(update).not.toHaveBeenCalled();
+  });
 });

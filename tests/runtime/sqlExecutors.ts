@@ -4,6 +4,10 @@ import oracledb from "oracledb";
 import { Client } from "pg";
 import { openSQLiteDatabase } from "../../src/extension/dbDrivers/sqliteRuntime.ts";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig.ts";
+import {
+  isConnectionTlsEnabled,
+  resolveConnectionTlsMode,
+} from "../../src/shared/connectionConfig.ts";
 import type { DbEngineId } from "../contracts/testingContracts.ts";
 import { ensureParentDirectory } from "./tempDirectories.ts";
 
@@ -80,8 +84,10 @@ async function openMssqlExecutor(
     connectionTimeout: 10_000,
     requestTimeout: 30_000,
     options: {
-      encrypt: connection.ssl ?? true,
-      trustServerCertificate: !(connection.rejectUnauthorized ?? false),
+      encrypt: isConnectionTlsEnabled(resolveConnectionTlsMode(connection)),
+      trustServerCertificate:
+        resolveConnectionTlsMode(connection) ===
+        "requireTrustServerCertificate",
       enableArithAbort: true,
       useUTC: true,
     },

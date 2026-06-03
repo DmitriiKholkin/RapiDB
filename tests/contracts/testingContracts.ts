@@ -330,8 +330,9 @@ export const TEST_CONNECTION_SEEDS: Record<DbEngineId, TestConnectionSeed> = {
       database: TEST_DATABASE_NAMES.mssql,
       username: TEST_MSSQL_APP_LOGIN.username,
       password: TEST_MSSQL_APP_LOGIN.password,
-      ssl: true,
-      rejectUnauthorized: false,
+      tls: {
+        mode: "requireTrustServerCertificate",
+      },
       folder: "Automated Tests",
     },
   },
@@ -389,8 +390,9 @@ export const TEST_ADMIN_CONNECTION_SEEDS: Partial<
       database: "master",
       username: "sa",
       password: "Rapidb_Pass123!",
-      ssl: true,
-      rejectUnauthorized: false,
+      tls: {
+        mode: "requireTrustServerCertificate",
+      },
       folder: "Automated Tests",
     },
   },

@@ -87,7 +87,9 @@ describe("SSH HTTP driver options", () => {
       name: "Elastic SSH",
       type: "elasticsearch",
       endpoint: "https://cluster.example.com",
-      ssl: true,
+      tls: {
+        mode: "requireVerifyFull",
+      },
       runtimeOverrides: {
         transport: {
           kind: "httpAgent",

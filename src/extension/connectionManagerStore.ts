@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
 import * as vscode from "vscode";
+import {
+  type ConnectionTlsConfig,
+  type ConnectionTlsMode,
+} from "../shared/connectionConfig";
 import { QUERY_LIMIT_POLICY } from "../shared/safetyContracts";
 import type {
   BookmarkEntry,
@@ -70,6 +74,49 @@ function computeConnectionsRevision(
     .digest("hex");
 }
 
+/**
+ * Migrate legacy `ssl` / `rejectUnauthorized` boolean flags into the
+ * structured `tls` config. Returns a new array; originals are not mutated.
+ * Connections that already use `tls` are left untouched.
+ */
+function migrateLegacyTlsFlags(
+  connections: StoredConnectionConfig[],
+): StoredConnectionConfig[] {
+  let changed = false;
+  const migrated = connections.map((conn) => {
+    const raw = conn as unknown as Record<string, unknown>;
+    const hasLegacySsl = "ssl" in raw;
+    const hasLegacyReject = "rejectUnauthorized" in raw;
+    const hasTls = conn.tls != null;
+
+    if ((!hasLegacySsl && !hasLegacyReject) || hasTls) {
+      // No legacy flags, or already has tls — strip legacy keys if present
+      if (hasLegacySsl || hasLegacyReject) {
+        changed = true;
+        const { ssl: _ssl, rejectUnauthorized: _ru, ...rest } = raw;
+        return rest as unknown as StoredConnectionConfig;
+      }
+      return conn;
+    }
+
+    changed = true;
+    const ssl = raw.ssl === true;
+    const rejectUnauthorized = raw.rejectUnauthorized !== false;
+    const mode: ConnectionTlsMode = ssl
+      ? rejectUnauthorized
+        ? "requireVerifyFull"
+        : "requireTrustServerCertificate"
+      : "disabled";
+    const { ssl: _ssl2, rejectUnauthorized: _ru2, ...rest } = raw;
+    return {
+      ...rest,
+      tls: { mode } as ConnectionTlsConfig,
+    } as unknown as StoredConnectionConfig;
+  });
+
+  return changed ? migrated : connections;
+}
+
 export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
   constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -85,11 +132,21 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
   }
 
   getConnections(): StoredConnectionConfig[] {
-    return (
+    const raw =
       vscode.workspace
         .getConfiguration("rapidb")
-        .get<StoredConnectionConfig[]>("connections") ?? []
-    );
+        .get<StoredConnectionConfig[]>("connections") ?? [];
+    const migrated = migrateLegacyTlsFlags(raw);
+    // Persist the migration so legacy keys are removed from storage
+    if (migrated !== raw) {
+      vscode.workspace
+        .getConfiguration("rapidb")
+        .update("connections", migrated, vscode.ConfigurationTarget.Global)
+        .then(undefined, () => {
+          // Best-effort; stale keys will be migrated again on next read
+        });
+    }
+    return migrated;
   }
 
   async saveConnections(connections: ConnectionConfig[]): Promise<void> {

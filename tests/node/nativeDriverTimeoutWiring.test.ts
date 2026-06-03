@@ -87,8 +87,9 @@ describe("native driver timeout wiring", () => {
         database: "app_db",
         username: "user",
         password: "secret",
-        ssl: true,
-        rejectUnauthorized: true,
+        tls: {
+          mode: "requireVerifyFull",
+        },
         runtimeOverrides: {
           transport: {
             kind: "tcpForward",
@@ -277,8 +278,9 @@ describe("native driver timeout wiring", () => {
         database: "app_db",
         username: "user",
         password: "secret",
-        ssl: true,
-        rejectUnauthorized: true,
+        tls: {
+          mode: "requireVerifyFull",
+        },
         runtimeOverrides: {
           transport: {
             kind: "tcpForward",
@@ -444,9 +446,9 @@ describe("native driver timeout wiring", () => {
         port: 11433,
         database: "app_db",
         username: "sa",
-        password: "secret",
-        ssl: true,
-        rejectUnauthorized: true,
+        tls: {
+          mode: "requireVerifyFull",
+        },
         runtimeOverrides: {
           transport: {
             kind: "tcpForward",
@@ -502,10 +504,9 @@ describe("native driver timeout wiring", () => {
         host: "127.0.0.1",
         port: 11433,
         database: "app_db",
-        username: "sa",
-        password: "secret",
-        ssl: true,
-        rejectUnauthorized: false,
+        tls: {
+          mode: "requireTrustServerCertificate",
+        },
         runtimeOverrides: {
           transport: {
             kind: "tcpForward",
@@ -672,10 +673,9 @@ describe("native driver timeout wiring", () => {
       name: "Redis SSH",
       type: "redis",
       connectionUri: "rediss://user:pass@127.0.0.1:16379/0",
-      host: "127.0.0.1",
-      port: 16379,
-      ssl: true,
-      rejectUnauthorized: true,
+      tls: {
+        mode: "requireVerifyFull",
+      },
       runtimeOverrides: {
         transport: {
           kind: "tcpForward",

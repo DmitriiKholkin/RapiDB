@@ -1,5 +1,9 @@
 import { Client } from "@elastic/elasticsearch";
 import { HttpConnection } from "@elastic/transport";
+import {
+  isConnectionTlsEnabled,
+  resolveConnectionTlsMode,
+} from "../../shared/connectionConfig";
 import { ELASTICSEARCH_READ_BUDGET } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { getSshHttpAgentTransport } from "../driverRuntimeConfig";
@@ -80,7 +84,11 @@ export class ElasticsearchDriver implements IDBDriver {
     if (this.connected) {
       return;
     }
-    const protocol = this.config.ssl ? "https" : "http";
+    const protocol = isConnectionTlsEnabled(
+      resolveConnectionTlsMode(this.config),
+    )
+      ? "https"
+      : "http";
     const node =
       this.config.connectionUri ??
       this.config.endpoint ??

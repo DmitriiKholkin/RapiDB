@@ -350,8 +350,6 @@ describe("ConnectionFormView", () => {
       type: "saveConnection",
       payload: expect.objectContaining({
         type: "pg",
-        ssl: true,
-        rejectUnauthorized: true,
         tls: {
           mode: "mutualTls",
           caFilePath: "/tmp/ca.pem",

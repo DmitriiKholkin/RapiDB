@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
+import {
+  isConnectionTlsEnabled,
+  resolveConnectionTlsMode,
+} from "../shared/connectionConfig";
 import { isDataDbObjectKind } from "../shared/dbObjectKinds";
 import {
   type BookmarkEntry,
@@ -1411,7 +1415,7 @@ export class ConnectionManager
     return (
       this.resolveUrlRemoteTarget(
         config.connectionUri ?? config.endpoint,
-        config.ssl ? 443 : 9200,
+        isConnectionTlsEnabled(resolveConnectionTlsMode(config)) ? 443 : 9200,
       ) ??
       (config.host?.trim()
         ? {
