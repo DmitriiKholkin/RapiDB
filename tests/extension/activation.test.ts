@@ -21,10 +21,10 @@ const expectedCommands = [
   "rapidb.deleteBookmark",
   "rapidb.clearBookmarks",
   "rapidb.clearHistory",
-  "rapidb.disconnectAll",
   "rapidb.refresh",
   "rapidb.showConnectedOnly",
   "rapidb.showAllConnections",
+  "rapidb.disconnectAll",
 ];
 
 describe("extension activation", () => {
