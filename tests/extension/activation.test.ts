@@ -23,6 +23,8 @@ const expectedCommands = [
   "rapidb.clearHistory",
   "rapidb.disconnectAll",
   "rapidb.refresh",
+  "rapidb.showConnectedOnly",
+  "rapidb.showAllConnections",
 ];
 
 describe("extension activation", () => {

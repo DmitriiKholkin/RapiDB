@@ -771,17 +771,25 @@ function registerUtilityCommands(
 ): void {
   const { connectionManager, connectionProvider, refresh } = services;
 
-  reg(CMD.disconnectAll, async () => {
-    await connectionManager.disconnectAll();
-    refresh();
-  });
-
   reg(CMD.refresh, (node?: RapiDBNode) => {
     connectionManager.refreshSchemaCache({
       connectionId: node?.connectionId,
       reason: "manual",
     });
     connectionProvider.refreshConnectionTree(node?.connectionId);
+  });
+
+  reg(CMD.showConnectedOnly, async () => {
+    await connectionProvider.toggleConnectedOnly();
+  });
+
+  reg(CMD.showAllConnections, async () => {
+    await connectionProvider.toggleConnectedOnly();
+  });
+
+  reg(CMD.disconnectAll, async () => {
+    await connectionManager.disconnectAll();
+    refresh();
   });
 }
 

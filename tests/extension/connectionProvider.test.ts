@@ -51,6 +51,9 @@ vi.mock("vscode", () => {
     MarkdownString: class MarkdownString {
       constructor(readonly value: string) {}
     },
+    commands: {
+      executeCommand: vi.fn(),
+    },
   };
 });
 
@@ -2832,5 +2835,162 @@ describe("ConnectionProvider", () => {
 
     expect(categoryLabels).not.toContain("Packages");
     expect(categoryLabels).toContain("Procedures");
+  });
+
+  it("shows only connected connections at root when connected-only mode is active", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-a", name: "Alpha", type: "pg", folder: "Team" },
+        { id: "conn-b", name: "Beta", type: "mysql" },
+        { id: "conn-c", name: "Gamma", type: "sqlite" },
+      ]),
+      isConnected: vi.fn((id: string) => id === "conn-a" || id === "conn-c"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() => loadedState({ databases: [] })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+
+    // Before toggle: folders + ungrouped
+    const allRoots = await provider.getChildren();
+    expect(allRoots.map((node) => node.label)).toEqual([
+      "Team",
+      "Beta",
+      "Gamma",
+    ]);
+
+    // Activate connected-only mode
+    provider.toggleConnectedOnly();
+
+    // After toggle: only connected, flat (no folders)
+    const filteredRoots = await provider.getChildren();
+    expect(filteredRoots.map((node) => node.label)).toEqual(["Alpha", "Gamma"]);
+    expect(
+      filteredRoots.every((node) => node.kind === "connectionNode_connected"),
+    ).toBe(true);
+  });
+
+  it("restores normal tree with folders when connected-only mode is deactivated", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-a", name: "Alpha", type: "pg", folder: "Team" },
+        { id: "conn-b", name: "Beta", type: "mysql" },
+      ]),
+      isConnected: vi.fn((id: string) => id === "conn-a"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() => loadedState({ databases: [] })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+
+    // Activate then deactivate
+    provider.toggleConnectedOnly();
+    provider.toggleConnectedOnly();
+
+    const roots = await provider.getChildren();
+    expect(roots.map((node) => node.label)).toEqual(["Team", "Beta"]);
+    expect(roots[0].kind).toBe("folder");
+  });
+
+  it("updates connected-only view automatically when connections change state", async () => {
+    vi.useFakeTimers();
+
+    const connectEvents = createEventSource<void>();
+    let connectedIds = new Set(["conn-a"]);
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-a", name: "Alpha", type: "pg" },
+        { id: "conn-b", name: "Beta", type: "mysql" },
+      ]),
+      isConnected: vi.fn((id: string) => connectedIds.has(id)),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() => loadedState({ databases: [] })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: connectEvents.event,
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    provider.toggleConnectedOnly();
+
+    const initialRoots = await provider.getChildren();
+    expect(initialRoots.map((node) => node.label)).toEqual(["Alpha"]);
+
+    // Simulate second connection becoming active
+    connectedIds = new Set(["conn-a", "conn-b"]);
+    connectEvents.fire();
+    await vi.advanceTimersByTimeAsync(60);
+
+    const updatedRoots = await provider.getChildren();
+    expect(updatedRoots.map((node) => node.label)).toEqual(["Alpha", "Beta"]);
+
+    vi.useRealTimers();
+  });
+
+  it("exposes connectedOnlyMode getter reflecting toggle state", async () => {
+    const connectionManager = {
+      getConnections: vi.fn(() => []),
+      isConnected: vi.fn(() => false),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() => loadedState({ databases: [] })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    expect(provider.connectedOnlyMode).toBe(false);
+
+    provider.toggleConnectedOnly();
+    expect(provider.connectedOnlyMode).toBe(true);
+
+    provider.toggleConnectedOnly();
+    expect(provider.connectedOnlyMode).toBe(false);
   });
 });

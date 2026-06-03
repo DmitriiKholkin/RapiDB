@@ -367,6 +367,7 @@ export class ConnectionProvider
   private _refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private _refreshAllPending = false;
   private _dragActive = false;
+  private _connectedOnlyMode = false;
 
   constructor(private readonly connectionManager: ConnectionProviderManager) {
     const scheduleRefresh = (connectionId?: string) => {
@@ -430,6 +431,20 @@ export class ConnectionProvider
 
   refresh(node?: RapiDBNode): void {
     this._onDidChangeTreeData.fire(node ?? undefined);
+  }
+
+  async toggleConnectedOnly(): Promise<void> {
+    this._connectedOnlyMode = !this._connectedOnlyMode;
+    await vscode.commands.executeCommand(
+      "setContext",
+      "rapidb.connectedOnlyMode",
+      this._connectedOnlyMode,
+    );
+    this.refresh();
+  }
+
+  get connectedOnlyMode(): boolean {
+    return this._connectedOnlyMode;
   }
 
   refreshConnectionTree(connectionId?: string): void {
@@ -553,6 +568,16 @@ export class ConnectionProvider
   private getRootChildren(): RapiDBNode[] {
     const connections = this.connectionManager.getConnections();
     this.syncConnectionNodeCache(connections);
+
+    if (this._connectedOnlyMode) {
+      const connectedOnly = connections.filter((c) =>
+        this.connectionManager.isConnected(c.id),
+      );
+      return this.sortConnectionsByName(connectedOnly).map((c) =>
+        this.makeConnectionNode(c),
+      );
+    }
+
     const { folderNames, ungroupedConnections } =
       splitRootConnectionsByFolder(connections);
     const folderNodes = folderNames.map((folderName) =>

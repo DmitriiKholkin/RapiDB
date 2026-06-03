@@ -82,16 +82,28 @@
         "icon": "$(code)"
       },
       {
-        "command": "rapidb.disconnectAll",
-        "title": "Disconnect All",
-        "category": "RapiDB",
-        "icon": "$(debug-disconnect)"
-      },
-      {
         "command": "rapidb.refresh",
         "title": "Refresh",
         "category": "RapiDB",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "rapidb.showConnectedOnly",
+        "title": "Show Connected Only",
+        "category": "RapiDB",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "rapidb.showAllConnections",
+        "title": "Show All Connections",
+        "category": "RapiDB",
+        "icon": "$(list-flat)"
+      },
+      {
+        "command": "rapidb.disconnectAll",
+        "title": "Disconnect All",
+        "category": "RapiDB",
+        "icon": "$(debug-disconnect)"
       },
       {
         "command": "rapidb.connect",
@@ -240,17 +252,27 @@
         {
           "command": "rapidb.addConnection",
           "when": "view == rapidb-explorer",
-          "group": "navigation"
+          "group": "navigation@1"
         },
         {
           "command": "rapidb.refresh",
           "when": "view == rapidb-explorer",
-          "group": "navigation"
+          "group": "navigation@2"
+        },
+        {
+          "command": "rapidb.showConnectedOnly",
+          "when": "view == rapidb-explorer && !rapidb.connectedOnlyMode",
+          "group": "navigation@3"
+        },
+        {
+          "command": "rapidb.showAllConnections",
+          "when": "view == rapidb-explorer && rapidb.connectedOnlyMode",
+          "group": "navigation@3"
         },
         {
           "command": "rapidb.disconnectAll",
           "when": "view == rapidb-explorer",
-          "group": "navigation"
+          "group": "navigation@4"
         },
         {
           "command": "rapidb.clearHistory",
@@ -641,7 +663,13 @@
     "viewsWelcome": [
       {
         "view": "rapidb-explorer",
+        "when": "!rapidb.connectedOnlyMode",
         "contents": "No database connections yet.\n[Add Connection](command:rapidb.addConnection)\n\nLearn how to use [RapiDB](https://github.com/rapidb/rapidb)."
+      },
+      {
+        "view": "rapidb-explorer",
+        "when": "rapidb.connectedOnlyMode",
+        "contents": "No connected databases.\n[Show All Connections](command:rapidb.showAllConnections)"
       },
       {
         "view": "rapidb-history",
