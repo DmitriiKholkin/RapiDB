@@ -432,6 +432,18 @@ const TableNode = React.memo(function TableNode({
                   minWidth: 0,
                 }}
               >
+                <Handle
+                  id={handleId("left", column.name)}
+                  type="target"
+                  position={Position.Left}
+                  style={rowLeftHandleStyle}
+                />
+                <Handle
+                  id={handleId("right", column.name)}
+                  type="source"
+                  position={Position.Right}
+                  style={rowRightHandleStyle}
+                />
                 <span
                   aria-hidden
                   style={{
@@ -1127,11 +1139,11 @@ export function ErdView({
           constraintName: edge.constraintName,
           cardinality: edge.cardinality,
           sourceNullable: edge.sourceNullable,
-          renderCardinality: lodLevel !== "placeholder",
+          renderCardinality: true,
         },
       };
     });
-  }, [focusedNodeIds, lodLevel, normalizedSearch, visibleGraph.edges]);
+  }, [focusedNodeIds, normalizedSearch, visibleGraph.edges]);
 
   useEffect(() => {
     if (!loadedAt || !reactFlowApi || loading || flowNodes.length === 0) {

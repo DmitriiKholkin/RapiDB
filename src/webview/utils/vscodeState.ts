@@ -12,19 +12,21 @@ export function syncInitialWebviewState(
   vscode: VSCodeAPI,
   initialState: WebviewInitialState | undefined,
 ): void {
-  const persistedState = vscode.getState<{
-    initialState?: WebviewInitialState;
-  }>();
+  const persistedState = vscode.getState<Record<string, unknown>>();
 
   if (
     initialState === undefined &&
     persistedState?.initialState !== undefined
   ) {
-    window.__RAPIDB_INITIAL_STATE__ = persistedState.initialState;
+    window.__RAPIDB_INITIAL_STATE__ =
+      persistedState.initialState as WebviewInitialState;
   }
 
   if (window.__RAPIDB_INITIAL_STATE__ !== undefined) {
+    // Merge initialState into the existing persisted state so that other
+    // webview data (e.g. ERD viewport, node positions) is not overwritten.
     vscode.setState({
+      ...persistedState,
       initialState: window.__RAPIDB_INITIAL_STATE__,
     });
   }

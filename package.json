@@ -482,6 +482,11 @@
           "group": "1_open"
         },
         {
+          "command": "rapidb.openErd",
+          "when": "view == rapidb-explorer && viewItem == category_tables",
+          "group": "1_open"
+        },
+        {
           "command": "rapidb.deleteBookmark",
           "when": "view == rapidb-bookmarks && viewItem == bookmarkEntry",
           "group": "1_manage"
