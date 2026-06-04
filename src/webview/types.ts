@@ -32,6 +32,11 @@ export type EditTarget =
       kind: "draft";
       col: string;
     };
+export interface MutationSnapshot {
+  pendingEdits: PendingEdits;
+  newRow: InsertDraftRow | null;
+  editCell: EditTarget | null;
+}
 export interface BadgePresentation {
   foreground: string;
   badgeBackground: string;

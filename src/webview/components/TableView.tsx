@@ -222,10 +222,14 @@ export function TableView({
         newRowExists={mutation.newRow !== null}
         readOnlyTable={data.readOnlyTable}
         unsavedRowCount={unsavedRowCount}
+        canUndo={mutation.canUndo}
+        canRedo={mutation.canRedo}
         onApplyChanges={mutation.applyChanges}
         onDismissApplyStatus={mutation.dismissApplyStatus}
         onDismissMutationError={mutation.dismissMutationError}
         onRevertChanges={mutation.revertChanges}
+        onUndo={mutation.undoAction}
+        onRedo={mutation.redoAction}
       />
 
       <TableGrid

@@ -115,6 +115,13 @@ export function TableStatusBanners({
   );
 }
 
+function platformShortcutLabel(): string {
+  const isMac =
+    typeof navigator !== "undefined" &&
+    navigator.platform.toUpperCase().includes("MAC");
+  return isMac ? "⌘" : "Ctrl+";
+}
+
 interface TableMutationStatusBarProps {
   applyStatus: TableApplyStatus | null;
   applying: boolean;
@@ -124,10 +131,14 @@ interface TableMutationStatusBarProps {
   newRowExists: boolean;
   readOnlyTable: boolean;
   unsavedRowCount: number;
+  canUndo?: boolean;
+  canRedo?: boolean;
   onApplyChanges: () => void;
   onDismissApplyStatus: () => void;
   onDismissMutationError: () => void;
   onRevertChanges: () => void;
+  onUndo?: () => void;
+  onRedo?: () => void;
 }
 
 export function TableMutationStatusBar({
@@ -139,14 +150,20 @@ export function TableMutationStatusBar({
   newRowExists,
   readOnlyTable,
   unsavedRowCount,
+  canUndo = false,
+  canRedo = false,
   onApplyChanges,
   onDismissApplyStatus,
   onDismissMutationError,
   onRevertChanges,
+  onUndo,
+  onRedo,
 }: TableMutationStatusBarProps) {
   if (readOnlyTable) {
     return null;
   }
+
+  const shortcut = platformShortcutLabel();
 
   return (
     <>
@@ -171,17 +188,71 @@ export function TableMutationStatusBar({
           }}
         >
           {unsavedRowCount > 0 && applyStatus?.tone !== "error" && (
-            <span
-              style={{
-                fontSize: 12,
-                color: "var(--vscode-editorWarning-foreground, #cca700)",
-                flex: 1,
-              }}
-            >
-              <Icon name="edit" size={12} style={{ marginRight: 4 }} />
-              {unsavedRowCount} row{unsavedRowCount !== 1 ? "s" : ""} with
-              unsaved changes
-            </span>
+            <>
+              <button
+                type="button"
+                aria-label="Undo"
+                title={`Undo (${shortcut}Z)`}
+                disabled={!canUndo || applying || inserting}
+                style={{
+                  background: "none",
+                  border: "none",
+                  cursor:
+                    canUndo && !applying && !inserting ? "pointer" : "default",
+                  color: canUndo
+                    ? "var(--vscode-editorWarning-foreground, #cca700)"
+                    : "var(--vscode-descriptionForeground, #888)",
+                  opacity: canUndo ? 0.9 : 0.4,
+                  padding: "0 2px",
+                  display: "flex",
+                  alignItems: "center",
+                }}
+                onClick={onUndo}
+              >
+                <Icon name="discard" size={14} />
+              </button>
+              <button
+                type="button"
+                aria-label="Redo"
+                title={`Redo (${shortcut}Shift+Z)`}
+                disabled={!canRedo || applying || inserting}
+                style={{
+                  background: "none",
+                  border: "none",
+                  cursor:
+                    canRedo && !applying && !inserting ? "pointer" : "default",
+                  color: canRedo
+                    ? "var(--vscode-editorWarning-foreground, #cca700)"
+                    : "var(--vscode-descriptionForeground, #888)",
+                  opacity: canRedo ? 0.9 : 0.4,
+                  padding: "0 2px",
+                  display: "flex",
+                  alignItems: "center",
+                }}
+                onClick={onRedo}
+              >
+                <Icon name="redo" size={14} />
+              </button>
+              <span
+                style={{
+                  width: 1,
+                  height: 14,
+                  background: "rgba(200,150,0,0.3)",
+                  flexShrink: 0,
+                }}
+              />
+              <span
+                style={{
+                  fontSize: 12,
+                  color: "var(--vscode-editorWarning-foreground, #cca700)",
+                  flex: 1,
+                }}
+              >
+                <Icon name="edit" size={12} style={{ marginRight: 4 }} />
+                {unsavedRowCount} row{unsavedRowCount !== 1 ? "s" : ""} with
+                unsaved changes
+              </span>
+            </>
           )}
           {applyStatus && (
             <span

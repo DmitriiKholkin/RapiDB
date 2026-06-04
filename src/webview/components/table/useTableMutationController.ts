@@ -27,8 +27,10 @@ import type {
 } from "./structuredCellDialog";
 import { serializeStructuredCellDialogDraft } from "./structuredCellDialog";
 import {
+  applyUndoRedoSnapshot,
   buildInsertValues,
   buildPendingRestoreState,
+  buildUndoRedoSnapshot,
   canEditColumn,
   clonePendingEdits,
   createInsertDraft,
@@ -36,6 +38,7 @@ import {
   restorePendingEdits,
   type TableApplyStatus,
 } from "./tableViewHelpers";
+import { useUndoRedoHistory } from "./useUndoRedoHistory";
 
 interface UseTableMutationControllerParams {
   canEditRows: boolean;
@@ -77,6 +80,16 @@ export function useTableMutationController({
   const selectedRef = useRef(selected);
   const canEditRowsRef = useRef(canEditRows);
   const mutationPreviewRef = useRef(mutationPreview);
+
+  // Refs for snapshot access inside callbacks that avoid re-creation
+  const pendingEditsRef = useRef(pendingEdits);
+  pendingEditsRef.current = pendingEdits;
+  const newRowRef = useRef(newRow);
+  newRowRef.current = newRow;
+  const editCellRef = useRef(editCell);
+  editCellRef.current = editCell;
+
+  const history = useUndoRedoHistory();
 
   selectedRef.current = selected;
   canEditRowsRef.current = canEditRows;
@@ -120,6 +133,7 @@ export function useTableMutationController({
 
   const resetForTableInit = useCallback(() => {
     clearApplyRequestState();
+    history.clear();
     pendingRestoreRef.current = null;
     setPending(new Map());
     setEditCell(null);
@@ -131,7 +145,7 @@ export function useTableMutationController({
     setNewRow(null);
     setMutErr(null);
     setApplyStatus(null);
-  }, [clearApplyRequestState]);
+  }, [clearApplyRequestState, history]);
 
   useEffect(() => {
     const unApply = onMessage<ApplyResultPayload>(
@@ -140,6 +154,7 @@ export function useTableMutationController({
         setApplying(false);
 
         if (success) {
+          history.clear();
           setNewRow(null);
           const nextPending = getRetainedPendingEdits(
             applyPendingSnapshotRef.current,
@@ -252,6 +267,7 @@ export function useTableMutationController({
   }, [
     buildPendingUpdatesPayload,
     fetchPageRef,
+    history,
     pendingEdits,
     pkColsRef,
     preserveScrollPositionRef,
@@ -312,10 +328,13 @@ export function useTableMutationController({
   }, [cancelMutationPreview, mutationPreview]);
 
   const startInsertRow = useCallback(() => {
+    history.push(
+      buildUndoRedoSnapshot(pendingEditsRef.current, newRowRef.current, null),
+    );
     setNewRow(createInsertDraft(columnsRef.current));
     setEditCell(null);
     setMutErr(null);
-  }, [columnsRef]);
+  }, [columnsRef, history]);
 
   const applyChanges = useCallback(() => {
     const unsavedRowCount = pendingEdits.size + (newRow ? 1 : 0);
@@ -338,13 +357,14 @@ export function useTableMutationController({
   }, [applying, buildPendingUpdatesPayload, newRow, pendingEdits]);
 
   const revertChanges = useCallback(() => {
+    history.clear();
     pendingRestoreRef.current = null;
     setPending(new Map());
     setNewRow(null);
     setEditCell(null);
     setMutErr(null);
     setApplyStatus(null);
-  }, []);
+  }, [history]);
 
   const commitCellEdit = useCallback(
     (
@@ -361,6 +381,11 @@ export function useTableMutationController({
 
       const coerced: unknown = newVal === NULL_SENTINEL ? null : newVal;
       const originalValueString = valueToEditString(originalVal);
+
+      // Push current state to history BEFORE making the change
+      history.push(
+        buildUndoRedoSnapshot(pendingEditsRef.current, newRowRef.current, null),
+      );
 
       if (newVal === originalValueString) {
         setPending((previousPending) => {
@@ -391,12 +416,17 @@ export function useTableMutationController({
         return nextPending;
       });
     },
-    [],
+    [history],
   );
 
   const commitDraftCellEdit = useCallback(
     (column: ColumnMeta, newVal: string) => {
       setEditCell(null);
+
+      // Push current state to history BEFORE making the change
+      history.push(
+        buildUndoRedoSnapshot(pendingEditsRef.current, newRowRef.current, null),
+      );
 
       setNewRow((currentRow) => {
         if (!currentRow) {
@@ -412,7 +442,7 @@ export function useTableMutationController({
         };
       });
     },
-    [],
+    [history],
   );
 
   const handleStartEdit = useCallback((rowIdx: number, column: ColumnMeta) => {
@@ -562,6 +592,68 @@ export function useTableMutationController({
     postMessage("deleteRows", { primaryKeysList: toDelete });
   }, [deleting, pkColsRef, rowsRef]);
 
+  const undoAction = useCallback(() => {
+    if (applying || inserting || deleting) return;
+
+    const currentSnapshot = buildUndoRedoSnapshot(
+      pendingEditsRef.current,
+      newRowRef.current,
+      editCellRef.current,
+    );
+    const previousSnapshot = history.undo(currentSnapshot);
+    if (!previousSnapshot) return;
+
+    const restored = applyUndoRedoSnapshot(previousSnapshot);
+    setPending(restored.pendingEdits);
+    setNewRow(restored.newRow);
+    setEditCell(restored.editCell);
+  }, [applying, inserting, deleting, history]);
+
+  const redoAction = useCallback(() => {
+    if (applying || inserting || deleting) return;
+
+    const currentSnapshot = buildUndoRedoSnapshot(
+      pendingEditsRef.current,
+      newRowRef.current,
+      editCellRef.current,
+    );
+    const nextSnapshot = history.redo(currentSnapshot);
+    if (!nextSnapshot) return;
+
+    const restored = applyUndoRedoSnapshot(nextSnapshot);
+    setPending(restored.pendingEdits);
+    setNewRow(restored.newRow);
+    setEditCell(restored.editCell);
+  }, [applying, inserting, deleting, history]);
+
+  useEffect(() => {
+    if (!canEditRows) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const tag = (event.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if ((event.target as HTMLElement)?.closest?.(".monaco-editor")) return;
+
+      const isMac = navigator.platform.toUpperCase().includes("MAC");
+      const mod = isMac ? event.metaKey : event.ctrlKey;
+      if (!mod) return;
+
+      if (event.code === "KeyZ" && !event.shiftKey) {
+        event.preventDefault();
+        undoAction();
+      } else if (event.code === "KeyZ" && event.shiftKey) {
+        event.preventDefault();
+        redoAction();
+      } else if (event.key === "y") {
+        event.preventDefault();
+        redoAction();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
+  }, [canEditRows, undoAction, redoAction]);
+
   return {
     applying,
     applyStatus,
@@ -593,5 +685,9 @@ export function useTableMutationController({
     applyChanges,
     cancelMutationPreview,
     updateStructuredCellDialogDraft,
+    undoAction,
+    redoAction,
+    canUndo: history.canUndo,
+    canRedo: history.canRedo,
   };
 }
