@@ -492,13 +492,21 @@ function applyElectron42V8Patch(sourceDir: string): void {
   );
   writeFileSync(macrosPath, macros, "utf8");
 
-  // 2. src/better_sqlite3.cpp — use EXTERNAL_NEW macro
+  // 2. src/better_sqlite3.cpp — use EXTERNAL_NEW macro + MSVC compat for Electron 42 headers
   const mainPath = join(sourceDir, "src", "better_sqlite3.cpp");
   let mainCpp = readFileSync(mainPath, "utf8");
   mainCpp = mainCpp.replace(
     "v8::Local<v8::External> data = v8::External::New(isolate, addon);",
     "v8::Local<v8::External> data = EXTERNAL_NEW(isolate, addon);",
   );
+  // Electron 42 V8 headers use __builtin_frame_address (GCC/Clang only)
+  if (!mainCpp.includes("__builtin_frame_address")) {
+    mainCpp =
+      "#ifdef _MSC_VER\n" +
+      "#define __builtin_frame_address(x) ((void*)0)\n" +
+      "#endif\n" +
+      mainCpp;
+  }
   writeFileSync(mainPath, mainCpp, "utf8");
 
   // 3. src/util/helpers.cpp — pass nullptr instead of 0 for missing setter
