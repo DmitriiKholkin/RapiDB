@@ -1,0 +1,136 @@
+name: Release VS Code Extension
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: "Version bump type"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - custom
+      custom_version:
+        description: "Custom version (only used if bump type is 'custom')"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Determine version
+        id: version
+        run: |
+          CURRENT=$(node -p "require('./package.json').version")
+          BUMP="${{ inputs.version_bump }}"
+
+          if [ "$BUMP" = "custom" ]; then
+            NEW_VERSION="${{ inputs.custom_version }}"
+            if [ -z "$NEW_VERSION" ]; then
+              echo "::error::Custom version is required when bump type is 'custom'"
+              exit 1
+            fi
+          else
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+            case "$BUMP" in
+              patch) NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))" ;;
+              minor) NEW_VERSION="$MAJOR.$((MINOR + 1)).0" ;;
+              major) NEW_VERSION="$((MAJOR + 1)).0.0" ;;
+            esac
+          fi
+
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "new=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Bumping version: $CURRENT → $NEW_VERSION"
+
+      - name: Bump version in package.json
+        run: |
+          NEW_VERSION="${{ steps.version.outputs.new }}"
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.version = '$NEW_VERSION';
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+          echo "package.json version set to $NEW_VERSION"
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          CURRENT_TAG="v${{ steps.version.outputs.current }}"
+          NEW_TAG="${{ steps.version.outputs.tag }}"
+
+          # Get commits since last tag (or all commits if no tags exist)
+          if git rev-parse "$CURRENT_TAG" >/dev/null 2>&1; then
+            LOG=$(git log "$CURRENT_TAG"..HEAD --pretty=format:"- %s (%h)" --no-merges)
+          else
+            LOG=$(git log --pretty=format:"- %s (%h)" --no-merges -20)
+          fi
+
+          # Write changelog to file (multiline output)
+          echo "## What's Changed" > /tmp/changelog.md
+          echo "" >> /tmp/changelog.md
+          echo "$LOG" >> /tmp/changelog.md
+          echo "" >> /tmp/changelog.md
+          echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/$CURRENT_TAG...$NEW_TAG" >> /tmp/changelog.md
+
+          cat /tmp/changelog.md
+
+      - name: Build extension
+        run: npm run vscode:prepublish
+
+      - name: Package VSIX
+        run: |
+          NEW_VERSION="${{ steps.version.outputs.new }}"
+          npx @vscode/vsce package --allow-missing-repository
+          VSIX_FILE="rapidb-${NEW_VERSION}.vsix"
+          # vsce names the file based on package.json version
+          if [ -f "$VSIX_FILE" ]; then
+            echo "VSIX created: $VSIX_FILE"
+          else
+            # Find the generated .vsix file
+            VSIX_FILE=$(ls *.vsix | head -1)
+            echo "VSIX created: $VSIX_FILE"
+          fi
+          echo "vsix=$VSIX_FILE" >> "$GITHUB_OUTPUT"
+        id: package
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          git commit -m "release: v${{ steps.version.outputs.new }}"
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin main --tags
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          body_path: /tmp/changelog.md
+          files: ${{ steps.package.outputs.vsix }}
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
