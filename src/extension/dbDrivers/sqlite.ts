@@ -791,17 +791,24 @@ export class SQLiteDriver extends BaseDBDriver {
     const kind = classifySql(sql);
     const db = this.requireDb();
     if (kind === "select") {
-      const rawRows = db.all(sql, params) as Record<string, unknown>[];
-      const columns = rawRows.length > 0 ? Object.keys(rawRows[0]) : [];
-      const rows = rawRows.map((row) =>
-        Object.fromEntries(columns.map((col, i) => [`__col_${i}`, row[col]])),
-      );
-      return {
-        columns,
-        rows,
-        rowCount: rows.length,
-        executionTimeMs: Date.now() - start,
-      };
+      try {
+        const rawRows = db.all(sql, params) as Record<string, unknown>[];
+        const columns = rawRows.length > 0 ? Object.keys(rawRows[0]) : [];
+        const rows = rawRows.map((row) =>
+          Object.fromEntries(columns.map((col, i) => [`__col_${i}`, row[col]])),
+        );
+        return {
+          columns,
+          rows,
+          rowCount: rows.length,
+          executionTimeMs: Date.now() - start,
+        };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        if (!/does not return data/i.test(msg)) {
+          throw error;
+        }
+      }
     }
     if (canSQLiteStatementReturnRows(sql)) {
       const returningRows = db.all(sql, params) as Record<string, unknown>[];

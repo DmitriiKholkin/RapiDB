@@ -127,7 +127,6 @@ function getTextPlaceholderRatio(
   slotWidthPx: number,
   minRatio: number,
 ): number {
-  // Approximate text width in this font and clamp to visible slot width.
   const approxCharWidthPx = 6.1;
   const visibleChars = Math.max(1, Math.floor(slotWidthPx / approxCharWidthPx));
   const renderedChars = Math.min(text.length, visibleChars);
@@ -608,7 +607,7 @@ function CardinalityGlyph({
     >
       {kind === "one" ? (
         <path
-          d="M -1 -7 L -1 7"
+          d="M -6 -7 L -6 7"
           stroke={color}
           strokeWidth={strokeWidth}
           fill="none"
@@ -617,19 +616,19 @@ function CardinalityGlyph({
       {kind === "many" ? (
         <>
           <path
-            d="M 0 0 L -8 -5"
+            d="M -12 0 L 0 -5"
             stroke={color}
             strokeWidth={strokeWidth}
             fill="none"
           />
           <path
-            d="M 0 0 L -8 0"
+            d="M -12 0 L 0 0"
             stroke={color}
             strokeWidth={strokeWidth}
             fill="none"
           />
           <path
-            d="M 0 0 L -8 5"
+            d="M -12 0 L 0 5"
             stroke={color}
             strokeWidth={strokeWidth}
             fill="none"
@@ -640,13 +639,13 @@ function CardinalityGlyph({
       {kind === "oneOnly" ? (
         <>
           <path
-            d="M -1 -7 L -1 7"
+            d="M -6 -7 L -6 7"
             stroke={color}
             strokeWidth={strokeWidth}
             fill="none"
           />
           <path
-            d="M -6 -7 L -6 7"
+            d="M -14 -7 L -14 7"
             stroke={color}
             strokeWidth={strokeWidth}
             fill="none"
@@ -656,9 +655,9 @@ function CardinalityGlyph({
 
       {kind === "zeroOrOne" ? (
         <circle
-          cx={-5}
+          cx={-16}
           cy={0}
-          r={3}
+          r={5}
           stroke={color}
           strokeWidth={strokeWidth}
           fill="var(--vscode-editor-background)"
@@ -667,7 +666,7 @@ function CardinalityGlyph({
 
       {kind === "zeroOrOne" ? (
         <path
-          d="M -1 -7 L -1 7"
+          d="M -6 -7 L -6 7"
           stroke={color}
           strokeWidth={strokeWidth}
           fill="none"
@@ -677,25 +676,25 @@ function CardinalityGlyph({
       {kind === "oneOrMany" ? (
         <>
           <path
-            d="M -1 -7 L -1 7"
+            d="M -14 -7 L -14 7"
             stroke={color}
             strokeWidth={strokeWidth}
             fill="none"
           />
           <path
-            d="M -5 0 L -13 -5"
+            d="M -12 0 L 0 -5"
             stroke={color}
             strokeWidth={strokeWidth}
             fill="none"
           />
           <path
-            d="M -5 0 L -13 0"
+            d="M -12 0 L 0 0"
             stroke={color}
             strokeWidth={strokeWidth}
             fill="none"
           />
           <path
-            d="M -5 0 L -13 5"
+            d="M -12 0 L 0 5"
             stroke={color}
             strokeWidth={strokeWidth}
             fill="none"
@@ -706,27 +705,27 @@ function CardinalityGlyph({
       {kind === "zeroOrMany" ? (
         <>
           <circle
-            cx={-5}
+            cx={-16}
             cy={0}
-            r={3}
+            r={5}
             stroke={color}
             strokeWidth={strokeWidth}
             fill="var(--vscode-editor-background)"
           />
           <path
-            d="M -9 0 L -17 -5"
+            d="M -12 0 L 0 -5"
             stroke={color}
             strokeWidth={strokeWidth}
             fill="none"
           />
           <path
-            d="M -9 0 L -17 0"
+            d="M -12 0 L 0 0"
             stroke={color}
             strokeWidth={strokeWidth}
             fill="none"
           />
           <path
-            d="M -9 0 L -17 5"
+            d="M -12 0 L 0 5"
             stroke={color}
             strokeWidth={strokeWidth}
             fill="none"
@@ -743,15 +742,15 @@ function outwardVector(position: Position): {
   angle: number;
 } {
   if (position === Position.Right) {
-    return { x: 1, y: 0, angle: 180 };
+    return { x: 0, y: 0, angle: 180 };
   }
   if (position === Position.Top) {
-    return { x: 0, y: -1, angle: 90 };
+    return { x: 0, y: 0, angle: 90 };
   }
   if (position === Position.Bottom) {
-    return { x: 0, y: 1, angle: -90 };
+    return { x: 0, y: 0, angle: -90 };
   }
-  return { x: -1, y: 0, angle: 0 };
+  return { x: 0, y: 0, angle: 0 };
 }
 
 const RelationshipEdge = React.memo(function RelationshipEdge(
@@ -793,7 +792,6 @@ const RelationshipEdge = React.memo(function RelationshipEdge(
   const targetOut = outwardVector(targetPosition);
   const markerOffset = 9;
 
-  // Keep glyphs outside node borders so they don't get hidden under card backgrounds.
   const startGlyphX = sourceX + sourceOut.x * markerOffset;
   const startGlyphY = sourceY + sourceOut.y * markerOffset;
   const endGlyphX = targetX + targetOut.x * markerOffset;
@@ -1119,6 +1117,7 @@ export function ErdView({
         !normalizedSearch ||
         (focusedNodeIds.has(edge.fromTableId) &&
           focusedNodeIds.has(edge.toTableId));
+      const isSelfRef = edge.fromTableId === edge.toTableId;
 
       return {
         id: edge.id,
@@ -1132,7 +1131,7 @@ export function ErdView({
           strokeWidth: 1.6,
           opacity: isFocused ? 1 : 0.25,
         },
-        zIndex: 5,
+        zIndex: isSelfRef ? -1 : 5,
         data: {
           fromColumn: edge.fromColumn,
           toColumn: edge.toColumn,
@@ -1576,12 +1575,12 @@ const rowHandleStyle: React.CSSProperties = {
 
 const rowLeftHandleStyle: React.CSSProperties = {
   ...rowHandleStyle,
-  left: 0,
+  left: -11,
 };
 
 const rowRightHandleStyle: React.CSSProperties = {
   ...rowHandleStyle,
-  right: 0,
+  right: -11,
 };
 
 const reactFlowControlsThemeCss = `

@@ -36,7 +36,7 @@ describe("ERD manifest", () => {
     ).toBeUndefined();
   });
 
-  it("shows ERD only for database and schema context menus", () => {
+  it("shows ERD only for database, schema, and category_tables context menus", () => {
     const manifest = readManifest();
     const menuBuckets = manifest.contributes?.menus ?? {};
     const erdContextEntries = (menuBuckets["view/item/context"] ?? []).filter(
@@ -51,9 +51,12 @@ describe("ERD manifest", () => {
         expect.objectContaining({
           when: expect.stringContaining("viewItem == schema"),
         }),
+        expect.objectContaining({
+          when: expect.stringContaining("viewItem == category_tables"),
+        }),
       ]),
     );
-    expect(erdContextEntries.length).toBe(2);
+    expect(erdContextEntries.length).toBe(3);
     expect(
       erdContextEntries.every(
         (entry) => !entry.when?.includes("config.rapidb.erd.enabled"),
