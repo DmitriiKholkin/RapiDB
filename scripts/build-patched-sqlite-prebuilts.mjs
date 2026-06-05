@@ -174,7 +174,7 @@ function buildDocker(platform, arch) {
     '  "v8::Local<v8::External> data = v8::External::New(isolate, addon);",',
     '  "v8::Local<v8::External> data = EXTERNAL_NEW(isolate, addon);",',
     ");",
-    '// MSVC compat: Electron 42 V8 headers use __builtin_frame_address (GCC only)',
+    "// MSVC compat: Electron 42 V8 headers use __builtin_frame_address (GCC only)",
     'if (!mainCpp.includes("__builtin_frame_address")) {',
     '  mainCpp = "#ifdef _MSC_VER\\n#define __builtin_frame_address(x) ((void*)0)\\n#endif\\n" + mainCpp;',
     "}",

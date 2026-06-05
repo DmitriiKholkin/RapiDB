@@ -422,7 +422,19 @@ async function withInstallLock<T>(
   }
 }
 
-// --- Electron 42 V8 API compatibility fallback chain --------------------------\n// Better-sqlite3 prebuilt binaries are not yet published for Electron 42\n// (NODE_MODULE_VERSION >= 146). The fallback chain is:\n//   1. Official prebuilt from GitHub releases (prebuild-install)\n//   2. Patched prebuilt from RapiDB GitHub releases (no build tools needed)\n//   3. Source build with V8 API patch via node-gyp (requires build toolchain)\n//\n// To publish patched prebuilts, build on each target platform and upload:\n//   gh release create rapidb-patched-sqlite /tmp/better-sqlite3-v12.10.0-electron-v146-darwin-arm64.tar.gz\n// ------------------------------------------------------------------------------\n\nconst PATCHED_PREBUILDS_RELEASE_URL =\n  "https://github.com/DmitriiKholkin/RapiDB/releases/download/rapidb-patched-sqlite";
+// --- Electron 42 V8 API compatibility fallback chain --------------------------
+// Better-sqlite3 prebuilt binaries are not yet published for Electron 42
+// (NODE_MODULE_VERSION >= 146). The fallback chain is:
+//   1. Official prebuilt from GitHub releases (prebuild-install)
+//   2. Patched prebuilt from RapiDB GitHub releases (no build tools needed)
+//   3. Source build with V8 API patch via node-gyp (requires build toolchain)
+//
+// To publish patched prebuilts, build on each target platform and upload:
+//   gh release create rapidb-patched-sqlite /tmp/rapidb-patched-prebuilts/*.tar.gz
+// ------------------------------------------------------------------------------
+
+const PATCHED_PREBUILDS_RELEASE_URL =
+  "https://github.com/DmitriiKholkin/RapiDB/releases/download/rapidb-patched-sqlite";
 
 function downloadToFile(url: string, destPath: string): Promise<void> {
   const { createWriteStream } = require("node:fs") as typeof import("node:fs");
