@@ -1,0 +1,147 @@
+name: Build patched better-sqlite3 prebuilts for Electron 42
+
+on:
+  workflow_dispatch:
+
+env:
+  BETTER_SQLITE3_VERSION: "12.10.0"
+  ELECTRON_VERSION: "42.2.0"
+  ELECTRON_ABI: "146"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+          - os: ubuntu-latest
+            platform: linux
+            arch: arm64
+          - os: macos-latest
+            platform: darwin
+            arch: arm64
+          - os: macos-13
+            platform: darwin
+            arch: x64
+          - os: windows-latest
+            platform: win32
+            arch: x64
+          - os: windows-latest
+            platform: win32
+            arch: arm64
+
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.platform }}-${{ matrix.arch }}
+
+    steps:
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3 g++ make
+
+      - name: Install build tools (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Download and patch better-sqlite3
+        shell: bash
+        run: |
+          mkdir -p build && cd build
+          npm pack better-sqlite3@${{ env.BETTER_SQLITE3_VERSION }}
+          tar xzf better-sqlite3-${{ env.BETTER_SQLITE3_VERSION }}.tgz --strip-components=1
+
+          # Apply Electron 42 V8 API patch
+          node -e '
+          const fs = require("fs");
+          const path = require("path");
+
+          // macros.cpp
+          const macrosPath = path.join("src", "util", "macros.cpp");
+          let macros = fs.readFileSync(macrosPath, "utf8");
+          macros = macros.replace(
+            "#define OnlyAddon static_cast<Addon*>(info.Data().As<v8::External>()->Value())",
+            [
+              "#if defined(NODE_MODULE_VERSION) && NODE_MODULE_VERSION >= 146",
+              "#define EXTERNAL_NEW(isolate, value) v8::External::New((isolate), (value), 0)",
+              "#define EXTERNAL_VALUE(value) (value)->Value(0)",
+              "#else",
+              "#define EXTERNAL_NEW(isolate, value) v8::External::New((isolate), (value))",
+              "#define EXTERNAL_VALUE(value) (value)->Value()",
+              "#endif",
+              "#define OnlyAddon static_cast<Addon*>(EXTERNAL_VALUE(info.Data().As<v8::External>()))",
+            ].join("\n"),
+          );
+          fs.writeFileSync(macrosPath, macros, "utf8");
+
+          // better_sqlite3.cpp
+          const mainPath = path.join("src", "better_sqlite3.cpp");
+          let mainCpp = fs.readFileSync(mainPath, "utf8");
+          mainCpp = mainCpp.replace(
+            "v8::Local<v8::External> data = v8::External::New(isolate, addon);",
+            "v8::Local<v8::External> data = EXTERNAL_NEW(isolate, addon);",
+          );
+          fs.writeFileSync(mainPath, mainCpp, "utf8");
+
+          // helpers.cpp
+          const helpersPath = path.join("src", "util", "helpers.cpp");
+          let helpers = fs.readFileSync(helpersPath, "utf8");
+          helpers = helpers.replace(
+            "\t\tfunc,\n\t\t0,\n\t\tdata",
+            "\t\tfunc,\n\t\tnullptr,\n\t\tdata",
+          );
+          fs.writeFileSync(helpersPath, helpers, "utf8");
+
+          console.log("Patch applied successfully");
+          '
+
+      - name: Build native module
+        shell: bash
+        working-directory: build
+        run: |
+          npx node-gyp rebuild \
+            --target=${{ env.ELECTRON_VERSION }} \
+            --arch=${{ matrix.arch }} \
+            --target_platform=${{ matrix.platform }} \
+            --dist-url=https://electronjs.org/headers \
+            --runtime=electron
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          cd build
+          tar czf ../better-sqlite3-v${{ env.BETTER_SQLITE3_VERSION }}-electron-v${{ env.ELECTRON_ABI }}-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz build/Release/better_sqlite3.node
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-${{ matrix.platform }}-${{ matrix.arch }}
+          path: "*.tar.gz"
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: prebuilts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: rapidb-patched-sqlite
+          name: Patched better-sqlite3 prebuilts for Electron 42
+          files: prebuilts/*.tar.gz
+          generate_release_notes: true

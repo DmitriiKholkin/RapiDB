@@ -422,6 +422,237 @@ async function withInstallLock<T>(
   }
 }
 
+// --- Electron 42 V8 API compatibility fallback chain --------------------------\n// Better-sqlite3 prebuilt binaries are not yet published for Electron 42\n// (NODE_MODULE_VERSION >= 146). The fallback chain is:\n//   1. Official prebuilt from GitHub releases (prebuild-install)\n//   2. Patched prebuilt from RapiDB GitHub releases (no build tools needed)\n//   3. Source build with V8 API patch via node-gyp (requires build toolchain)\n//\n// To publish patched prebuilts, build on each target platform and upload:\n//   gh release create rapidb-patched-sqlite /tmp/better-sqlite3-v12.10.0-electron-v146-darwin-arm64.tar.gz\n// ------------------------------------------------------------------------------\n\nconst PATCHED_PREBUILDS_RELEASE_URL =\n  "https://github.com/DmitriiKholkin/RapiDB/releases/download/rapidb-patched-sqlite";
+
+function downloadToFile(url: string, destPath: string): Promise<void> {
+  const { createWriteStream } = require("node:fs") as typeof import("node:fs");
+  const https = require("node:https") as typeof import("node:https");
+
+  return new Promise<void>((resolvePromise, rejectPromise) => {
+    const follow = (target: string, depth: number): void => {
+      if (depth > 5) {
+        rejectPromise(new Error(`Too many redirects downloading ${url}`));
+        return;
+      }
+      https
+        .get(target, (response) => {
+          if (
+            (response.statusCode === 301 || response.statusCode === 302) &&
+            response.headers.location
+          ) {
+            follow(response.headers.location, depth + 1);
+            return;
+          }
+          if (response.statusCode !== 200) {
+            rejectPromise(
+              new Error(`HTTP ${response.statusCode} downloading ${target}`),
+            );
+            return;
+          }
+          const file = createWriteStream(destPath);
+          response.pipe(file);
+          file.on("finish", () => {
+            file.close(() => resolvePromise());
+          });
+          file.on("error", (err: Error) => {
+            rmSync(destPath, { force: true });
+            rejectPromise(err);
+          });
+        })
+        .on("error", rejectPromise);
+    };
+    follow(url, 0);
+  });
+}
+
+/**
+ * Applies the V8 External API compatibility patch from
+ * https://github.com/WiseLibs/better-sqlite3/pull/1475
+ *
+ * The patch adds version-guarded macros for tagged v8::External
+ * creation/access (required by V8 14+ / NODE_MODULE_VERSION >= 146)
+ * and fixes a SetNativeDataProperty overload ambiguity.
+ */
+function applyElectron42V8Patch(sourceDir: string): void {
+  // 1. src/util/macros.cpp — add EXTERNAL_NEW / EXTERNAL_VALUE macros
+  const macrosPath = join(sourceDir, "src", "util", "macros.cpp");
+  let macros = readFileSync(macrosPath, "utf8");
+  macros = macros.replace(
+    "#define OnlyAddon static_cast<Addon*>(info.Data().As<v8::External>()->Value())",
+    [
+      "#if defined(NODE_MODULE_VERSION) && NODE_MODULE_VERSION >= 146",
+      "#define EXTERNAL_NEW(isolate, value) v8::External::New((isolate), (value), 0)",
+      "#define EXTERNAL_VALUE(value) (value)->Value(0)",
+      "#else",
+      "#define EXTERNAL_NEW(isolate, value) v8::External::New((isolate), (value))",
+      "#define EXTERNAL_VALUE(value) (value)->Value()",
+      "#endif",
+      "#define OnlyAddon static_cast<Addon*>(EXTERNAL_VALUE(info.Data().As<v8::External>()))",
+    ].join("\n"),
+  );
+  writeFileSync(macrosPath, macros, "utf8");
+
+  // 2. src/better_sqlite3.cpp — use EXTERNAL_NEW macro
+  const mainPath = join(sourceDir, "src", "better_sqlite3.cpp");
+  let mainCpp = readFileSync(mainPath, "utf8");
+  mainCpp = mainCpp.replace(
+    "v8::Local<v8::External> data = v8::External::New(isolate, addon);",
+    "v8::Local<v8::External> data = EXTERNAL_NEW(isolate, addon);",
+  );
+  writeFileSync(mainPath, mainCpp, "utf8");
+
+  // 3. src/util/helpers.cpp — pass nullptr instead of 0 for missing setter
+  //    (better-sqlite3 source uses tabs for indentation)
+  const helpersPath = join(sourceDir, "src", "util", "helpers.cpp");
+  let helpers = readFileSync(helpersPath, "utf8");
+  helpers = helpers.replace(
+    "\t\tfunc,\n\t\t0,\n\t\tdata",
+    "\t\tfunc,\n\t\tnullptr,\n\t\tdata",
+  );
+  writeFileSync(helpersPath, helpers, "utf8");
+}
+
+async function downloadPatchedPrebuilt(
+  runtimeRoot: string,
+  baseDir: string,
+): Promise<void> {
+  const { execSync } =
+    require("node:child_process") as typeof import("node:child_process");
+
+  const pkg = readBundledBetterSqlite3Package(baseDir);
+  if (!pkg.version) {
+    throw new Error("Cannot determine better-sqlite3 version.");
+  }
+
+  const abi = process.versions.modules;
+  const platform = process.platform;
+  const arch = process.arch;
+  const tagPrefix = "v";
+  const fileName = `better-sqlite3-${tagPrefix}${pkg.version}-electron-${tagPrefix}${abi}-${platform}-${arch}.tar.gz`;
+  const downloadUrl = `${PATCHED_PREBUILDS_RELEASE_URL}/${fileName}`;
+  const tarballPath = join(runtimeRoot, fileName);
+
+  try {
+    installerLog(`Trying patched prebuilt from ${downloadUrl}…`);
+    await downloadToFile(downloadUrl, tarballPath);
+
+    // Extract into the scaffold (tarball contains build/Release/better_sqlite3.node)
+    const scaffoldDir = join(runtimeRoot, "node_modules", "better-sqlite3");
+    execSync(`tar xzf "${tarballPath}" -C "${scaffoldDir}"`, {
+      stdio: "pipe",
+    });
+
+    const binaryPath = join(
+      scaffoldDir,
+      "build",
+      "Release",
+      "better_sqlite3.node",
+    );
+    if (!existsSync(binaryPath)) {
+      throw new Error(
+        "Patched prebuilt tarball did not contain build/Release/better_sqlite3.node.",
+      );
+    }
+
+    installerLog("Patched prebuilt installed successfully.");
+  } finally {
+    rmSync(tarballPath, { force: true });
+  }
+}
+
+async function rebuildFromSourceWithPatch(
+  runtimeRoot: string,
+  baseDir: string,
+): Promise<void> {
+  const { execSync } =
+    require("node:child_process") as typeof import("node:child_process");
+
+  const pkg = readBundledBetterSqlite3Package(baseDir);
+  if (!pkg.version) {
+    throw new Error(
+      "Cannot determine better-sqlite3 version for source build.",
+    );
+  }
+
+  // Verify npx is available (node-gyp itself is fetched via npx on demand)
+  try {
+    execSync("npx --version", { stdio: "ignore" });
+  } catch {
+    throw new Error(
+      "npx is required to build better-sqlite3 from source for Electron 42+. " +
+        "Ensure npm is installed and available on PATH.\n" +
+        "Also ensure Python 3 and a C++ compiler are available " +
+        "(Xcode Command Line Tools on macOS, build-essential on Linux, Visual Studio Build Tools on Windows).",
+    );
+  }
+
+  const sourceDir = join(runtimeRoot, "better-sqlite3-build-source");
+  const tarballPath = join(runtimeRoot, "better-sqlite3-source.tgz");
+
+  try {
+    // Download the npm package tarball (includes src/, deps/, binding.gyp)
+    const tarballUrl = `https://registry.npmjs.org/better-sqlite3/-/better-sqlite3-${pkg.version}.tgz`;
+    installerLog(`Downloading better-sqlite3 ${pkg.version} source tarball…`);
+    await downloadToFile(tarballUrl, tarballPath);
+
+    // Extract
+    mkdirSync(sourceDir, { recursive: true });
+    execSync(
+      `tar xzf "${tarballPath}" -C "${sourceDir}" --strip-components=1`,
+      { stdio: "pipe" },
+    );
+
+    // Apply the Electron 42 V8 API patch
+    installerLog("Applying Electron 42 V8 API compatibility patch…");
+    applyElectron42V8Patch(sourceDir);
+
+    // Build native module for the current Electron ABI
+    const electronVersion = process.versions.electron;
+    installerLog(
+      `Building better-sqlite3 from source for Electron ${electronVersion} (ABI ${process.versions.modules}, ${process.platform}-${process.arch})…`,
+    );
+    execSync(
+      [
+        "npx node-gyp rebuild",
+        `--target=${electronVersion}`,
+        `--arch=${process.arch}`,
+        `--target_platform=${process.platform}`,
+        "--dist-url=https://electronjs.org/headers",
+        "--runtime=electron",
+      ].join(" "),
+      { cwd: sourceDir, stdio: "pipe", timeout: 300_000 },
+    );
+
+    // Copy the built binary into the scaffold
+    const builtBinary = join(
+      sourceDir,
+      "build",
+      "Release",
+      "better_sqlite3.node",
+    );
+    if (!existsSync(builtBinary)) {
+      throw new Error("Source build did not produce better_sqlite3.node.");
+    }
+
+    const targetDir = join(
+      runtimeRoot,
+      "node_modules",
+      "better-sqlite3",
+      "build",
+      "Release",
+    );
+    mkdirSync(targetDir, { recursive: true });
+    cpSync(builtBinary, join(targetDir, "better_sqlite3.node"));
+
+    installerLog(
+      "Successfully built better-sqlite3 from source with Electron 42 V8 patch.",
+    );
+  } finally {
+    rmSync(tarballPath, { force: true });
+    rmSync(sourceDir, { recursive: true, force: true });
+  }
+}
+
 async function downloadPrebuiltBinary(
   runtimeRoot: string,
   baseDir: string,
@@ -463,30 +694,58 @@ async function downloadPrebuiltBinary(
     log: createLogger(),
   };
   const downloadUrl = prebuildInstallUtil.getDownloadUrl(options);
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    prebuildInstall.download(downloadUrl, options, (error) => {
-      if (error) {
-        rejectPromise(
-          new Error(
-            `Could not download the SQLite runtime for ${currentTargetLabel()} (${currentRuntime()}, ABI ${process.versions.modules}) from ${downloadUrl}. ${errorMessage(error)}`,
-          ),
-        );
-        return;
-      }
-      resolvePromise();
-    });
-  });
 
-  const binaryPath = join(
-    betterSqlite3PackageRoot,
-    "build",
-    "Release",
-    "better_sqlite3.node",
-  );
-  if (!existsSync(binaryPath)) {
-    throw new Error(
-      `Downloaded SQLite runtime did not produce better_sqlite3.node for ${currentTargetLabel()} (${currentRuntime()}, ABI ${process.versions.modules}).`,
+  try {
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      prebuildInstall.download(downloadUrl, options, (error) => {
+        if (error) {
+          rejectPromise(
+            new Error(
+              `Could not download the SQLite runtime for ${currentTargetLabel()} (${currentRuntime()}, ABI ${process.versions.modules}) from ${downloadUrl}. ${errorMessage(error)}`,
+            ),
+          );
+          return;
+        }
+        resolvePromise();
+      });
+    });
+
+    const binaryPath = join(
+      betterSqlite3PackageRoot,
+      "build",
+      "Release",
+      "better_sqlite3.node",
     );
+    if (!existsSync(binaryPath)) {
+      throw new Error(
+        `Downloaded SQLite runtime did not produce better_sqlite3.node for ${currentTargetLabel()} (${currentRuntime()}, ABI ${process.versions.modules}).`,
+      );
+    }
+  } catch (prebuiltError) {
+    // Electron 42+ (NODE_MODULE_VERSION >= 146) has no published prebuilts
+    // yet. Try patched prebuilt first (no build tools needed), then source build.
+    if (Number(process.versions.modules) >= 146) {
+      // Step 1: try patched prebuilt from RapiDB GitHub releases
+      try {
+        await downloadPatchedPrebuilt(runtimeRoot, baseDir);
+        return;
+      } catch (patchedError) {
+        installerLog(
+          `Patched prebuilt not available: ${errorMessage(patchedError)}`,
+        );
+      }
+
+      // Step 2: try building from source with the V8 API compat patch
+      installerLog("Attempting source build with Electron 42 V8 patch…");
+      try {
+        await rebuildFromSourceWithPatch(runtimeRoot, baseDir);
+      } catch (sourceError) {
+        installerLog(`Source build failed: ${errorMessage(sourceError)}`);
+        throw prebuiltError;
+      }
+    } else {
+      throw prebuiltError;
+    }
   }
 
   writeFileSync(
