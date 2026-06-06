@@ -702,6 +702,10 @@ export class ConnectionManager
       epoch: number;
     }
   >();
+  private readonly _connectAbortControllerMap = new Map<
+    string,
+    AbortController
+  >();
   readonly onDidChangeConnections: vscode.Event<void>;
   private readonly _onDidChangeConnections = new vscode.EventEmitter<void>();
   readonly onDidChangeHistory: vscode.Event<void>;
@@ -1765,6 +1769,7 @@ export class ConnectionManager
   private async connectPreparedDriver(
     id: string,
     config: ConnectionConfig,
+    signal: AbortSignal,
   ): Promise<{
     driver: IDBDriver;
     runtime?: SshRuntime;
@@ -1778,12 +1783,33 @@ export class ConnectionManager
     }
 
     const driver = this.createDriver(prepared.config);
+
+    const onAbort = () => {
+      void driver.disconnect().catch(() => undefined);
+    };
+    signal.addEventListener("abort", onAbort);
+
     try {
-      await driver.connect();
+      if (signal.aborted) {
+        await this.disposeUnboundConnectionResources(driver, prepared.runtime);
+        throw new DOMException("Aborted", "AbortError");
+      }
+      await Promise.race([
+        driver.connect(),
+        new Promise<never>((_resolve, reject) => {
+          signal.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        }),
+      ]);
       return { driver, runtime: prepared.runtime };
     } catch (err) {
       await this.disposeUnboundConnectionResources(driver, prepared.runtime);
       throw err;
+    } finally {
+      signal.removeEventListener("abort", onAbort);
     }
   }
 
@@ -1840,6 +1866,8 @@ export class ConnectionManager
       rejectAttempt = reject;
     });
     const connectEpoch = this._nextConnectionEpoch(id);
+    const ac = new AbortController();
+    this._connectAbortControllerMap.set(id, ac);
     this._connectingMap.set(id, {
       promise: attempt,
       epoch: connectEpoch,
@@ -1868,6 +1896,7 @@ export class ConnectionManager
         const { driver, runtime } = await this.connectPreparedDriver(
           id,
           fullConfig,
+          ac.signal,
         );
 
         if (this._isStaleConnectEpoch(id, connectEpoch)) {
@@ -1884,8 +1913,17 @@ export class ConnectionManager
         this._onDidConnect.fire();
         resolveAttempt();
       } catch (err) {
-        rejectAttempt(err);
+        if (
+          err instanceof DOMException &&
+          err.name === "AbortError" &&
+          this._isStaleConnectEpoch(id, connectEpoch)
+        ) {
+          resolveAttempt();
+        } else {
+          rejectAttempt(err);
+        }
       } finally {
+        this._connectAbortControllerMap.delete(id);
         this.finalizeConnectAttempt(id, connectEpoch);
       }
     })();
@@ -1898,6 +1936,11 @@ export class ConnectionManager
     this._nextConnectionEpoch(id);
     const hadPendingConnect = this._connectingMap.has(id);
     this._connectingMap.delete(id);
+
+    const ac = this._connectAbortControllerMap.get(id);
+    if (ac) {
+      ac.abort();
+    }
 
     const hadDriver = await this.disconnectRegisteredDriver(id);
 
@@ -3220,9 +3263,11 @@ export class ConnectionManager
     }
   }
   async disconnectAll(): Promise<void> {
-    await Promise.allSettled(
-      [...this.driverMap.keys()].map((id) => this.disconnectFrom(id)),
-    );
+    const ids = new Set([
+      ...this.driverMap.keys(),
+      ...this._connectAbortControllerMap.keys(),
+    ]);
+    await Promise.allSettled([...ids].map((id) => this.disconnectFrom(id)));
   }
 
   async dispose(): Promise<void> {
@@ -3238,6 +3283,14 @@ export class ConnectionManager
     for (const connectionId of this.driverMap.keys()) {
       this._nextConnectionEpoch(connectionId);
     }
+
+    for (const [id] of this._connectAbortControllerMap) {
+      this._nextConnectionEpoch(id);
+    }
+    for (const ac of this._connectAbortControllerMap.values()) {
+      ac.abort();
+    }
+    this._connectAbortControllerMap.clear();
 
     await this.disconnectAll();
     this.driverMap.clear();
