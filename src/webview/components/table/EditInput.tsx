@@ -1,4 +1,10 @@
-import React, { useLayoutEffect, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import {
   NULL_SENTINEL,
   normalizeBinaryHexDisplayPrefix,
@@ -7,6 +13,8 @@ import {
 import { placeholderForCategory } from "../../types";
 import { buildSmallGhostButtonStyle } from "../../utils/buttonStyles";
 import { buildTextInputStyle } from "../../utils/controlStyles";
+import { cssVar } from "../../utils/cssVar";
+import { postMessage } from "../../utils/messaging";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
 
 function normalizeEditInitialValue(
@@ -45,7 +53,13 @@ export function EditInput({
   const [val, setVal] = useState(
     isInitiallyNull ? "" : normalizeEditInitialValue(initial, category),
   );
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    hasSelection: boolean;
+  } | null>(null);
   const ref = useRef<HTMLInputElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     if (ref.current instanceof HTMLInputElement) {
       ref.current.focus({ preventScroll: true });
@@ -53,6 +67,65 @@ export function EditInput({
       ref.current.scrollLeft = 0;
     }
   }, []);
+
+  const handleContextMenu = useCallback((event: MouseEvent) => {
+    event.stopImmediatePropagation();
+    event.preventDefault();
+    const input = ref.current;
+    const hasSelection = input
+      ? input.selectionStart !== input.selectionEnd
+      : false;
+    setContextMenu({
+      x: event.clientX,
+      y: event.clientY,
+      hasSelection,
+    });
+  }, []);
+
+  useEffect(() => {
+    const input = ref.current;
+    if (!input) return;
+    input.addEventListener("contextmenu", handleContextMenu);
+    return () => {
+      input.removeEventListener("contextmenu", handleContextMenu);
+    };
+  }, [handleContextMenu]);
+
+  const closeContextMenu = useCallback(() => setContextMenu(null), []);
+
+  const handleCopy = useCallback(() => {
+    const input = ref.current;
+    if (!input) return;
+    const start = input.selectionStart ?? 0;
+    const end = input.selectionEnd ?? 0;
+    const selectedText = input.value.substring(start, end);
+    if (selectedText) {
+      postMessage("writeClipboard", { text: selectedText });
+    }
+    closeContextMenu();
+  }, [closeContextMenu]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const menu = menuRef.current;
+      if (menu?.contains(event.target as Node)) return;
+      closeContextMenu();
+    };
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeContextMenu();
+    };
+
+    window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleEscape);
+
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleEscape);
+    };
+  }, [contextMenu, closeContextMenu]);
   const normalizedValue = normalizeEditInitialValue(val, category);
   const commit = () =>
     onCommit(isNull ? NULL_SENTINEL : normalizeEditInitialValue(val, category));
@@ -114,6 +187,7 @@ export function EditInput({
         }}
         onBlur={commit}
         onClick={(e) => e.stopPropagation()}
+        onDoubleClick={(e) => e.stopPropagation()}
         placeholder={
           suppressPlaceholder
             ? undefined
@@ -147,6 +221,63 @@ export function EditInput({
         >
           NULL
         </button>
+      )}
+      {contextMenu && (
+        <div
+          ref={menuRef}
+          role="menu"
+          aria-label="Cell context menu"
+          style={{
+            position: "fixed",
+            top: contextMenu.y,
+            left: contextMenu.x,
+            minWidth: 80,
+            padding: 3,
+            display: "flex",
+            flexDirection: "column",
+            background:
+              cssVar("--vscode-menu-background") ||
+              cssVar("--vscode-editorWidget-background") ||
+              "#252526",
+            border: `1px solid ${
+              cssVar("--vscode-menu-border") || "rgba(255, 255, 255, 0.12)"
+            }`,
+            borderRadius: 6,
+            boxShadow:
+              "0 10px 30px rgba(0, 0, 0, 0.24), 0 2px 8px rgba(0, 0, 0, 0.18)",
+            zIndex: 100,
+          }}
+          onMouseDown={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+          }}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            disabled={!contextMenu.hasSelection}
+            onClick={handleCopy}
+            style={{
+              appearance: "none",
+              border: "none",
+              background: "transparent",
+              color: contextMenu.hasSelection
+                ? cssVar("--vscode-menu-foreground") ||
+                  cssVar("--vscode-foreground") ||
+                  "#cccccc"
+                : cssVar("--vscode-disabledForeground") ||
+                  "rgba(255, 255, 255, 0.4)",
+              padding: "4px 10px",
+              fontSize: 12,
+              textAlign: "left",
+              cursor: contextMenu.hasSelection ? "pointer" : "default",
+              borderRadius: 4,
+              width: "100%",
+            }}
+          >
+            Copy
+          </button>
+        </div>
       )}
     </div>
   );

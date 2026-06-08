@@ -366,6 +366,56 @@ export function useTableMutationController({
     setApplyStatus(null);
   }, [history]);
 
+  const commitBatchCellEdits = useCallback(
+    (
+      edits: Array<{
+        rowIdx: number;
+        column: ColumnMeta;
+        newVal: string;
+        originalVal: unknown;
+      }>,
+    ) => {
+      setEditCell(null);
+
+      if (!canEditRowsRef.current) {
+        return;
+      }
+
+      history.push(
+        buildUndoRedoSnapshot(pendingEditsRef.current, newRowRef.current, null),
+      );
+
+      setPending((previousPending) => {
+        const nextPending = new Map(previousPending);
+
+        for (const { rowIdx, column, newVal, originalVal } of edits) {
+          const coerced: unknown = newVal === NULL_SENTINEL ? null : newVal;
+          const originalValueString = valueToEditString(originalVal);
+
+          if (newVal === originalValueString) {
+            const rowMap = nextPending.get(rowIdx);
+            if (rowMap?.has(column.name)) {
+              const nextRowMap = new Map(rowMap);
+              nextRowMap.delete(column.name);
+              if (nextRowMap.size === 0) {
+                nextPending.delete(rowIdx);
+              } else {
+                nextPending.set(rowIdx, nextRowMap);
+              }
+            }
+          } else {
+            const nextRowMap = new Map(nextPending.get(rowIdx) ?? []);
+            nextRowMap.set(column.name, coerced);
+            nextPending.set(rowIdx, nextRowMap);
+          }
+        }
+
+        return nextPending;
+      });
+    },
+    [history],
+  );
+
   const commitCellEdit = useCallback(
     (
       rowIdx: number,
@@ -657,6 +707,7 @@ export function useTableMutationController({
   return {
     applying,
     applyStatus,
+    commitBatchCellEdits,
     commitCellEdit,
     commitDraftCellEdit,
     confirmMutationPreview,

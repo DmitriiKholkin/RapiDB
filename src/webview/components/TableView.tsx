@@ -243,6 +243,7 @@ export function TableView({
         loading={data.loading}
         newRow={mutation.newRow}
         onCancelEdit={() => mutation.setEditCell(null)}
+        onBatchCellEdit={mutation.commitBatchCellEdits}
         onCommitCellEdit={mutation.commitCellEdit}
         onCommitDraftCellEdit={mutation.commitDraftCellEdit}
         onFilterDraftChange={data.updateFilterDraft}

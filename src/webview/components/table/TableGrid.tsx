@@ -11,7 +11,13 @@ import {
   useReactTable,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import React, { useMemo, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   type ColumnTypeMeta as ColumnMeta,
   type FilterDraft,
@@ -30,12 +36,18 @@ import {
   calcColWidths,
   type Column as SizingColumn,
 } from "../../utils/columnSizing";
-import { postMessage } from "../../utils/messaging";
+import { onMessage, postMessage } from "../../utils/messaging";
+import {
+  type PasteValidationError,
+  parseTsv,
+  validatePasteData,
+} from "../../utils/pasteUtils";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
 import { Icon } from "../Icon";
 import { CellDisplay } from "./CellDisplay";
 import { ColumnFilterControl } from "./ColumnFilterControl";
 import { EditInput, valueToEditString } from "./EditInput";
+import { GridContextMenu } from "./GridContextMenu";
 import {
   getStructuredCellDialogValue,
   type StructuredCellDialogValue,
@@ -53,6 +65,7 @@ import {
   type TableSortState,
   tableButtonStyle,
 } from "./tableViewHelpers";
+import { useCellSelection } from "./useCellSelection";
 
 const TABLE_ROW_STYLE_ID = "rapidb-table-row-style";
 if (
@@ -66,6 +79,16 @@ if (
     '.rdb-trow[data-even="true"]  { background: var(--vscode-editor-background); }',
     '.rdb-trow[data-even="false"] { background: var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.04)); }',
     '.rdb-trow:not([data-selected="true"]):hover { background: var(--vscode-list-hoverBackground); }',
+    ".rdb-tcell-selected { background: var(--vscode-editor-selectionBackground, rgba(38, 79, 120, 0.6)) !important; }",
+    ".rdb-tcell-anchor { outline: 2px solid var(--vscode-focusBorder, #007fd4); outline-offset: -2px; }",
+    ".rdb-tcell-border-top { box-shadow: inset 0 2px 0 var(--vscode-focusBorder, #007fd4); }",
+    ".rdb-tcell-border-bottom { box-shadow: inset 0 -2px 0 var(--vscode-focusBorder, #007fd4); }",
+    ".rdb-tcell-border-left { box-shadow: inset 2px 0 0 var(--vscode-focusBorder, #007fd4); }",
+    ".rdb-tcell-border-right { box-shadow: inset -2px 0 0 var(--vscode-focusBorder, #007fd4); }",
+    ".rdb-tcell-border-top.rdb-tcell-border-left { box-shadow: inset 2px 2px 0 var(--vscode-focusBorder, #007fd4); }",
+    ".rdb-tcell-border-top.rdb-tcell-border-right { box-shadow: inset -2px 2px 0 var(--vscode-focusBorder, #007fd4); }",
+    ".rdb-tcell-border-bottom.rdb-tcell-border-left { box-shadow: inset 2px -2px 0 var(--vscode-focusBorder, #007fd4); }",
+    ".rdb-tcell-border-bottom.rdb-tcell-border-right { box-shadow: inset -2px -2px 0 var(--vscode-focusBorder, #007fd4); }",
   ].join("\n");
   document.head.appendChild(styleElement);
 }
@@ -86,6 +109,16 @@ if (
     '.rdb-rrow[data-even="true"]  { background: var(--vscode-editor-background); }',
     '.rdb-rrow[data-even="false"] { background: var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.04)); }',
     ".rdb-rrow:hover { background: var(--vscode-list-hoverBackground); }",
+    ".rdb-rcell-selected { background: var(--vscode-editor-selectionBackground, rgba(38, 79, 120, 0.6)) !important; }",
+    ".rdb-rcell-anchor { outline: 2px solid var(--vscode-focusBorder, #007fd4); outline-offset: -2px; }",
+    ".rdb-rcell-border-top { box-shadow: inset 0 2px 0 var(--vscode-focusBorder, #007fd4); }",
+    ".rdb-rcell-border-bottom { box-shadow: inset 0 -2px 0 var(--vscode-focusBorder, #007fd4); }",
+    ".rdb-rcell-border-left { box-shadow: inset 2px 0 0 var(--vscode-focusBorder, #007fd4); }",
+    ".rdb-rcell-border-right { box-shadow: inset -2px 0 0 var(--vscode-focusBorder, #007fd4); }",
+    ".rdb-rcell-border-top.rdb-rcell-border-left { box-shadow: inset 2px 2px 0 var(--vscode-focusBorder, #007fd4); }",
+    ".rdb-rcell-border-top.rdb-rcell-border-right { box-shadow: inset -2px 2px 0 var(--vscode-focusBorder, #007fd4); }",
+    ".rdb-rcell-border-bottom.rdb-rcell-border-left { box-shadow: inset 2px -2px 0 var(--vscode-focusBorder, #007fd4); }",
+    ".rdb-rcell-border-bottom.rdb-rcell-border-right { box-shadow: inset -2px -2px 0 var(--vscode-focusBorder, #007fd4); }",
   ].join("\n");
   document.head.appendChild(styleElement);
 }
@@ -247,6 +280,61 @@ function QueryResultsGrid({ result }: QueryResultsGridProps) {
   } | null>(null);
   const [columnSizing, setColumnSizing] = useState<Record<string, number>>({});
   const scrollRef = React.useRef<HTMLDivElement>(null);
+  const containerRef = React.useRef<HTMLDivElement>(null);
+
+  const colCount = colNames.length;
+
+  const getCellValue = useCallback(
+    (rowIndex: number, colIndex: number) => {
+      const row = rows[rowIndex];
+      if (!row) return undefined;
+      return row[`__col_${colIndex}`];
+    },
+    [rows],
+  );
+
+  const getCellFromPoint = useCallback((x: number, y: number) => {
+    const element = document.elementFromPoint(x, y) as HTMLElement | null;
+    if (!element) return null;
+    const td = element.closest("td[data-row][data-col]");
+    if (!td) return null;
+    const row = Number.parseInt(td.getAttribute("data-row") ?? "", 10);
+    const col = Number.parseInt(td.getAttribute("data-col") ?? "", 10);
+    if (Number.isNaN(row) || Number.isNaN(col)) return null;
+    return { row, col };
+  }, []);
+
+  const handleCopyText = useCallback((text: string) => {
+    postMessage("writeClipboard", { text });
+  }, []);
+
+  const selection = useCellSelection({
+    rowCount: rows.length,
+    colCount,
+    getCellValue,
+    scrollRef,
+    getCellFromPoint,
+    onCopy: handleCopyText,
+  });
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      selection.handleKeyDown(event);
+    };
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
+  }, [selection.handleKeyDown]);
+
+  const handleCopy = useCallback(() => {
+    const text = selection.copySelection();
+    if (text) {
+      postMessage("writeClipboard", { text });
+    }
+  }, [selection.copySelection]);
+
+  useEffect(() => {
+    selection.clearSelection();
+  }, [selection.clearSelection]);
 
   const colSizes = useMemo(
     () =>
@@ -322,130 +410,137 @@ function QueryResultsGrid({ result }: QueryResultsGridProps) {
 
   return (
     <div
-      ref={scrollRef}
-      style={{ flex: 1, overflow: "auto", position: "relative" }}
+      ref={containerRef}
+      style={{ flex: 1, overflow: "hidden", position: "relative" }}
     >
-      <table style={getBaseTableStyle(table.getTotalSize())}>
-        <thead>
-          {table.getHeaderGroups().map((headerGroup) => (
-            <tr key={headerGroup.id}>
-              {headerGroup.headers.map((header) => {
-                const sorted = header.column.getIsSorted();
-                const headerSize = header.getSize();
-                const isCollapsed = isCollapsedWidth(headerSize);
-                const displayHeaderSize = getDisplaySize(headerSize);
+      <div
+        ref={scrollRef}
+        style={{ width: "100%", height: "100%", overflow: "auto" }}
+      >
+        <table style={getBaseTableStyle(table.getTotalSize())}>
+          <thead>
+            {table.getHeaderGroups().map((headerGroup) => (
+              <tr key={headerGroup.id}>
+                {headerGroup.headers.map((header) => {
+                  const sorted = header.column.getIsSorted();
+                  const headerSize = header.getSize();
+                  const isCollapsed = isCollapsedWidth(headerSize);
+                  const displayHeaderSize = getDisplaySize(headerSize);
 
-                return (
-                  <th
-                    key={header.id}
-                    style={{
-                      width: displayHeaderSize,
-                      height: HEADER_H,
-                      padding: isCollapsed ? 0 : "0 8px",
-                      textAlign: "left",
-                      background:
-                        "var(--vscode-editorGroupHeader-tabsBackground)",
-                      borderRight: "1px solid var(--vscode-panel-border)",
-                      borderLeft: "1px solid var(--vscode-panel-border)",
-                      position: "sticky",
-                      top: 0,
-                      zIndex: 2,
-                      whiteSpace: "nowrap",
-                      overflow: "visible",
-                      textOverflow: "ellipsis",
-                      userSelect: "none",
-                      cursor: header.column.getCanSort()
-                        ? "pointer"
-                        : "default",
-                      fontWeight: 600,
-                      color: "var(--vscode-foreground)",
-                      boxSizing: "border-box",
-                    }}
-                    onClick={header.column.getToggleSortingHandler()}
-                  >
-                    <HeaderContent
-                      isCollapsed={isCollapsed}
-                      justifyContent="flex-start"
+                  return (
+                    <th
+                      key={header.id}
+                      style={{
+                        width: displayHeaderSize,
+                        height: HEADER_H,
+                        padding: isCollapsed ? 0 : "0 8px",
+                        textAlign: "left",
+                        background:
+                          "var(--vscode-editorGroupHeader-tabsBackground)",
+                        borderRight: "1px solid var(--vscode-panel-border)",
+                        borderLeft: "1px solid var(--vscode-panel-border)",
+                        position: "sticky",
+                        top: 0,
+                        zIndex: 2,
+                        whiteSpace: "nowrap",
+                        overflow: "visible",
+                        textOverflow: "ellipsis",
+                        userSelect: "none",
+                        cursor: header.column.getCanSort()
+                          ? "pointer"
+                          : "default",
+                        fontWeight: 600,
+                        color: "var(--vscode-foreground)",
+                        boxSizing: "border-box",
+                      }}
+                      onClick={header.column.getToggleSortingHandler()}
                     >
-                      <span
-                        style={{
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                        }}
+                      <HeaderContent
+                        isCollapsed={isCollapsed}
+                        justifyContent="flex-start"
                       >
-                        {flexRender(
-                          header.column.columnDef.header,
-                          header.getContext(),
+                        <span
+                          style={{
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                          }}
+                        >
+                          {flexRender(
+                            header.column.columnDef.header,
+                            header.getContext(),
+                          )}
+                        </span>
+                        {sorted === "asc" && (
+                          <Icon
+                            name="triangle-up"
+                            size={10}
+                            style={{ opacity: 0.7 }}
+                          />
                         )}
-                      </span>
-                      {sorted === "asc" && (
-                        <Icon
-                          name="triangle-up"
-                          size={10}
-                          style={{ opacity: 0.7 }}
+                        {sorted === "desc" && (
+                          <Icon
+                            name="triangle-down"
+                            size={10}
+                            style={{ opacity: 0.7 }}
+                          />
+                        )}
+                        {!sorted && header.column.getCanSort() && (
+                          <Icon
+                            name="unfold"
+                            size={10}
+                            style={{ opacity: 0.2 }}
+                          />
+                        )}
+                      </HeaderContent>
+
+                      {header.column.getCanResize() && (
+                        <ColumnResizeHandle
+                          ariaLabel={`Resize ${typeof header.column.columnDef.header === "string" ? header.column.columnDef.header : header.column.id} column`}
+                          onMouseDown={header.getResizeHandler()}
+                          onTouchStart={header.getResizeHandler()}
+                          onClick={(event) => event.stopPropagation()}
+                          isResizing={header.column.getIsResizing()}
                         />
                       )}
-                      {sorted === "desc" && (
-                        <Icon
-                          name="triangle-down"
-                          size={10}
-                          style={{ opacity: 0.7 }}
-                        />
-                      )}
-                      {!sorted && header.column.getCanSort() && (
-                        <Icon
-                          name="unfold"
-                          size={10}
-                          style={{ opacity: 0.2 }}
-                        />
-                      )}
-                    </HeaderContent>
+                    </th>
+                  );
+                })}
+              </tr>
+            ))}
+          </thead>
+          <tbody>
+            <TopSpacerRow
+              colSpan={columns.length}
+              height={virtualItems[0]?.start ?? 0}
+            />
 
-                    {header.column.getCanResize() && (
-                      <ColumnResizeHandle
-                        ariaLabel={`Resize ${typeof header.column.columnDef.header === "string" ? header.column.columnDef.header : header.column.id} column`}
-                        onMouseDown={header.getResizeHandler()}
-                        onTouchStart={header.getResizeHandler()}
-                        onClick={(event) => event.stopPropagation()}
-                        isResizing={header.column.getIsResizing()}
-                      />
-                    )}
-                  </th>
-                );
-              })}
-            </tr>
-          ))}
-        </thead>
-        <tbody>
-          <TopSpacerRow
-            colSpan={columns.length}
-            height={virtualItems[0]?.start ?? 0}
-          />
+            {virtualItems.map((virtualRow) => {
+              const row = tableRows[virtualRow.index];
+              return (
+                <QueryTableRow
+                  key={virtualRow.key}
+                  row={row}
+                  index={virtualRow.index}
+                  columnMeta={columnMeta}
+                  activeCell={activeCell}
+                  onActivateCell={(rowIndex, columnId) =>
+                    setActiveCell({ rowIndex, columnId })
+                  }
+                  onDeactivateCell={() => setActiveCell(null)}
+                  selection={selection}
+                />
+              );
+            })}
 
-          {virtualItems.map((virtualRow) => {
-            const row = tableRows[virtualRow.index];
-            return (
-              <QueryTableRow
-                key={virtualRow.key}
-                row={row}
-                index={virtualRow.index}
-                columnMeta={columnMeta}
-                activeCell={activeCell}
-                onActivateCell={(rowIndex, columnId) =>
-                  setActiveCell({ rowIndex, columnId })
-                }
-                onDeactivateCell={() => setActiveCell(null)}
-              />
-            );
-          })}
-
-          <BottomSpacerRow
-            virtualItems={virtualItems}
-            totalVirtualHeight={totalVirtualHeight}
-            colSpan={columns.length}
-          />
-        </tbody>
-      </table>
+            <BottomSpacerRow
+              virtualItems={virtualItems}
+              totalVirtualHeight={totalVirtualHeight}
+              colSpan={columns.length}
+            />
+          </tbody>
+        </table>
+      </div>
+      <GridContextMenu containerRef={containerRef} onCopy={handleCopy} />
     </div>
   );
 }
@@ -465,6 +560,7 @@ const QueryTableRow = React.memo(function QueryTableRow({
   activeCell,
   onActivateCell,
   onDeactivateCell,
+  selection,
 }: {
   row: TanStackRow<Record<string, unknown>>;
   index: number;
@@ -472,7 +568,33 @@ const QueryTableRow = React.memo(function QueryTableRow({
   activeCell: { rowIndex: number; columnId: string } | null;
   onActivateCell: (rowIndex: number, columnId: string) => void;
   onDeactivateCell: () => void;
+  selection: {
+    handleCellMouseDown: (
+      rowIndex: number,
+      colIndex: number,
+      event: React.MouseEvent,
+    ) => void;
+    handleCellMouseEnter: (
+      rowIndex: number,
+      colIndex: number,
+      event: React.MouseEvent,
+    ) => void;
+    isCellSelected: (rowIndex: number, colIndex: number) => boolean;
+    isCellAnchor: (rowIndex: number, colIndex: number) => boolean;
+    range: {
+      anchorRow: number;
+      anchorCol: number;
+      activeRow: number;
+      activeCol: number;
+    } | null;
+  };
 }) {
+  const { range } = selection;
+  const minRow = range ? Math.min(range.anchorRow, range.activeRow) : -1;
+  const maxRow = range ? Math.max(range.anchorRow, range.activeRow) : -1;
+  const minCol = range ? Math.min(range.anchorCol, range.activeCol) : -1;
+  const maxCol = range ? Math.max(range.anchorCol, range.activeCol) : -1;
+
   return (
     <tr
       className="rdb-rrow"
@@ -496,9 +618,27 @@ const QueryTableRow = React.memo(function QueryTableRow({
           ? undefined
           : (columnMeta[columnIndex]?.category ?? undefined);
 
+        const isSelected = selection.isCellSelected(index, columnIndex);
+        const isAnchor = selection.isCellAnchor(index, columnIndex);
+        const isTopBorder = isSelected && index === minRow;
+        const isBottomBorder = isSelected && index === maxRow;
+        const isLeftBorder = isSelected && columnIndex === minCol;
+        const isRightBorder = isSelected && columnIndex === maxCol;
+
+        const cellClasses = ["rdb-rrow-cell"];
+        if (isSelected) cellClasses.push("rdb-rcell-selected");
+        if (isAnchor) cellClasses.push("rdb-rcell-anchor");
+        if (isTopBorder) cellClasses.push("rdb-rcell-border-top");
+        if (isBottomBorder) cellClasses.push("rdb-rcell-border-bottom");
+        if (isLeftBorder) cellClasses.push("rdb-rcell-border-left");
+        if (isRightBorder) cellClasses.push("rdb-rcell-border-right");
+
         return (
           <td
             key={cell.id}
+            data-row={index}
+            data-col={columnIndex}
+            className={cellClasses.join(" ")}
             style={{
               width: displayCellSize,
               height: ROW_H,
@@ -514,8 +654,16 @@ const QueryTableRow = React.memo(function QueryTableRow({
               userSelect: "none",
             }}
             title={isNull ? "" : formatScalarValueForDisplay(raw)}
-            onDoubleClick={() => {
+            onMouseDown={(event) => {
               if (!isCollapsed) {
+                selection.handleCellMouseDown(index, columnIndex, event);
+              }
+            }}
+            onMouseEnter={(event) => {
+              selection.handleCellMouseEnter(index, columnIndex, event);
+            }}
+            onDoubleClick={() => {
+              if (!isCollapsed && !isEditing) {
                 onActivateCell(index, cell.column.id);
               }
             }}
@@ -550,6 +698,14 @@ interface TableGridProps {
   loading: boolean;
   newRow: InsertDraftRow | null;
   onCancelEdit: () => void;
+  onBatchCellEdit: (
+    edits: Array<{
+      rowIdx: number;
+      column: ColumnMeta;
+      newVal: string;
+      originalVal: unknown;
+    }>,
+  ) => void;
   onCommitCellEdit: (
     rowIdx: number,
     column: ColumnMeta,
@@ -609,6 +765,7 @@ function TableDataGrid({
   loading,
   newRow,
   onCancelEdit,
+  onBatchCellEdit,
   onCommitCellEdit,
   onCommitDraftCellEdit,
   onFilterDraftChange,
@@ -629,6 +786,168 @@ function TableDataGrid({
   );
 
   const [columnSizing, setColumnSizing] = useState<Record<string, number>>({});
+  const containerRef = React.useRef<HTMLDivElement>(null);
+  const [pasteErrors, setPasteErrors] = useState<PasteValidationError[]>([]);
+
+  const dataColCount = columns.length;
+  const selColOffset = canSelectAndDeleteRows ? 1 : 0;
+  const totalColCount = dataColCount + selColOffset;
+
+  const getCellValue = useCallback(
+    (rowIndex: number, colIndex: number) => {
+      const dataColIndex = colIndex - selColOffset;
+      if (dataColIndex < 0 || dataColIndex >= dataColCount) return undefined;
+      const row = rows[rowIndex];
+      if (!row) return undefined;
+      const columnName = columns[dataColIndex]?.name;
+      if (!columnName) return undefined;
+      return row[columnName];
+    },
+    [rows, columns, selColOffset, dataColCount],
+  );
+
+  const getCellFromPoint = useCallback((x: number, y: number) => {
+    const element = document.elementFromPoint(x, y) as HTMLElement | null;
+    if (!element) return null;
+    const td = element.closest("td[data-row][data-col]");
+    if (!td) return null;
+    const row = Number.parseInt(td.getAttribute("data-row") ?? "", 10);
+    const col = Number.parseInt(td.getAttribute("data-col") ?? "", 10);
+    if (Number.isNaN(row) || Number.isNaN(col)) return null;
+    return { row, col };
+  }, []);
+
+  const handleCopyText = useCallback((text: string) => {
+    postMessage("writeClipboard", { text });
+  }, []);
+
+  const handlePaste = useCallback(() => {
+    if (!canEditRows) return;
+    postMessage("readClipboard");
+  }, [canEditRows]);
+
+  const selection = useCellSelection({
+    rowCount: rows.length,
+    colCount: totalColCount,
+    getCellValue,
+    scrollRef,
+    getCellFromPoint,
+    onCopy: handleCopyText,
+    onPaste: handlePaste,
+  });
+
+  const selectionRangeRef = useRef(selection.range);
+  selectionRangeRef.current = selection.range;
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      selection.handleKeyDown(event);
+    };
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
+  }, [selection.handleKeyDown]);
+
+  const handleCopy = useCallback(() => {
+    const text = selection.copySelection();
+    if (text) {
+      postMessage("writeClipboard", { text });
+    }
+  }, [selection.copySelection]);
+
+  useEffect(() => {
+    const unsubscribe = onMessage<string>("clipboardText", (text) => {
+      if (!canEditRows || !selectionRangeRef.current) return;
+
+      const pasteData = parseTsv(text);
+      if (pasteData.rows.length === 0) return;
+
+      const ctxCell = selection.contextMenuCellRef.current;
+      const startRow = ctxCell
+        ? ctxCell.row
+        : selectionRangeRef.current.anchorRow;
+      const startCol = ctxCell
+        ? ctxCell.col - selColOffset
+        : selectionRangeRef.current.anchorCol - selColOffset;
+
+      selection.contextMenuCellRef.current = null;
+
+      if (startCol < 0) {
+        setPasteErrors([
+          {
+            rowIndex: startRow,
+            columnIndex: ctxCell
+              ? ctxCell.col
+              : selectionRangeRef.current.anchorCol,
+            columnName: "",
+            value: "",
+            message: "Cannot paste into selection column",
+          },
+        ]);
+        return;
+      }
+
+      const errors = validatePasteData(
+        pasteData,
+        startRow,
+        startCol,
+        [...columns],
+        rows.length,
+      );
+
+      if (errors.length > 0) {
+        setPasteErrors(errors);
+        return;
+      }
+
+      setPasteErrors([]);
+
+      const edits: Array<{
+        rowIdx: number;
+        column: ColumnMeta;
+        newVal: string;
+        originalVal: unknown;
+      }> = [];
+
+      for (let r = 0; r < pasteData.rows.length; r++) {
+        const row = pasteData.rows[r];
+        const targetRow = startRow + r;
+
+        for (let c = 0; c < row.length; c++) {
+          const value = row[c];
+          const targetCol = startCol + c;
+          const column = columns[targetCol];
+
+          if (!column) continue;
+
+          const originalValue = rows[targetRow]?.[column.name];
+          const coercedValue = value === "" ? NULL_SENTINEL : value;
+
+          edits.push({
+            rowIdx: targetRow,
+            column,
+            newVal: coercedValue,
+            originalVal: originalValue,
+          });
+        }
+      }
+
+      onBatchCellEdit(edits);
+    });
+
+    return unsubscribe;
+  }, [
+    canEditRows,
+    columns,
+    rows,
+    selColOffset,
+    onBatchCellEdit,
+    selection.contextMenuCellRef.current,
+    selection.contextMenuCellRef,
+  ]);
+
+  useEffect(() => {
+    selection.clearSelection();
+  }, [selection.clearSelection]);
 
   const tanColumns = useMemo<TanColumnDef<Row>[]>(
     () => [
@@ -796,246 +1115,257 @@ function TableDataGrid({
 
   return (
     <div
-      ref={scrollRef}
-      style={{ flex: 1, overflow: "auto", position: "relative" }}
+      ref={containerRef}
+      style={{ flex: 1, overflow: "hidden", position: "relative" }}
     >
-      <table style={getBaseTableStyle(tanTable.getTotalSize())}>
-        <thead>
-          {tanTable.getHeaderGroups().map((headerGroup) => (
-            <tr key={headerGroup.id}>
-              {headerGroup.headers.map((header) => {
+      <div
+        ref={scrollRef}
+        style={{ width: "100%", height: "100%", overflow: "auto" }}
+      >
+        <table style={getBaseTableStyle(tanTable.getTotalSize())}>
+          <thead>
+            {tanTable.getHeaderGroups().map((headerGroup) => (
+              <tr key={headerGroup.id}>
+                {headerGroup.headers.map((header) => {
+                  const isSelectionColumn = header.column.id === "__sel";
+                  const columnId = header.column.id;
+                  const headerSize = header.getSize();
+                  const isCollapsed = isCollapsedWidth(headerSize);
+                  const displayHeaderSize = getDisplaySize(headerSize);
+                  const isSorted = sort?.column === columnId;
+                  const sortDirection = isSorted
+                    ? (sort?.direction ?? null)
+                    : null;
+                  const columnMeta = header.column.columnDef.meta as
+                    | ColumnMeta
+                    | undefined;
+
+                  return (
+                    <th
+                      key={header.id}
+                      title={
+                        isSelectionColumn || !columnMeta
+                          ? undefined
+                          : buildColumnHeaderTitle(columnMeta)
+                      }
+                      style={{
+                        width: displayHeaderSize,
+                        height: HEADER_H,
+                        padding: isSelectionColumn
+                          ? "0 6px"
+                          : isCollapsed
+                            ? 0
+                            : "0 8px",
+                        textAlign: isSelectionColumn ? "center" : "left",
+                        background: isSorted
+                          ? "var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.1))"
+                          : "var(--vscode-editorGroupHeader-tabsBackground)",
+                        borderRight: "1px solid var(--vscode-panel-border)",
+                        borderLeft: "1px solid var(--vscode-panel-border)",
+                        position: "sticky",
+                        top: 0,
+                        zIndex: 2,
+                        whiteSpace: "nowrap",
+                        overflow: "visible",
+                        fontWeight: 600,
+                        boxSizing: "border-box",
+                        userSelect: "none",
+                        cursor: isSelectionColumn ? "default" : "pointer",
+                      }}
+                      onClick={() => {
+                        if (!isSelectionColumn) {
+                          onSort(columnId);
+                        }
+                      }}
+                    >
+                      <HeaderContent
+                        isCollapsed={isCollapsed}
+                        justifyContent={
+                          isSelectionColumn ? "center" : "flex-start"
+                        }
+                      >
+                        <span
+                          style={{
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                          }}
+                        >
+                          {flexRender(
+                            header.column.columnDef.header,
+                            header.getContext(),
+                          )}
+                        </span>
+                        {!isSelectionColumn && (
+                          <span
+                            style={{
+                              opacity: isSorted ? 1 : 0.25,
+                              fontSize: 10,
+                              flexShrink: 0,
+                            }}
+                          >
+                            {sortDirection === "asc" ? (
+                              <Icon name="triangle-up" size={10} />
+                            ) : sortDirection === "desc" ? (
+                              <Icon name="triangle-down" size={10} />
+                            ) : (
+                              <Icon name="unfold" size={10} />
+                            )}
+                          </span>
+                        )}
+                      </HeaderContent>
+                      {!isSelectionColumn && header.column.getCanResize() && (
+                        <ColumnResizeHandle
+                          ariaLabel={`Resize ${columnId} column`}
+                          tabIndex={-1}
+                          onMouseDown={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+
+                            const startSize = Math.max(headerSize, 1);
+                            const startX = event.clientX;
+
+                            const applyWidth = (clientX: number) => {
+                              const nextWidth = Math.max(
+                                1,
+                                startSize + (clientX - startX),
+                              );
+                              setColumnSizing((previous) => ({
+                                ...previous,
+                                [columnId]: nextWidth,
+                              }));
+                            };
+
+                            const onMove = (moveEvent: MouseEvent) => {
+                              applyWidth(moveEvent.clientX);
+                            };
+
+                            const onUp = (upEvent: MouseEvent) => {
+                              applyWidth(upEvent.clientX);
+                              document.removeEventListener("mousemove", onMove);
+                              document.removeEventListener("mouseup", onUp);
+                            };
+
+                            document.addEventListener("mousemove", onMove);
+                            document.addEventListener("mouseup", onUp);
+                          }}
+                          onClick={(event) => event.stopPropagation()}
+                          isResizing={header.column.getIsResizing()}
+                        />
+                      )}
+                    </th>
+                  );
+                })}
+              </tr>
+            ))}
+            <tr>
+              {tanTable.getHeaderGroups()[0]?.headers.map((header) => {
                 const isSelectionColumn = header.column.id === "__sel";
-                const columnId = header.column.id;
+                const column = columnsMap.get(header.column.id);
                 const headerSize = header.getSize();
                 const isCollapsed = isCollapsedWidth(headerSize);
                 const displayHeaderSize = getDisplaySize(headerSize);
-                const isSorted = sort?.column === columnId;
-                const sortDirection = isSorted
-                  ? (sort?.direction ?? null)
-                  : null;
-                const columnMeta = header.column.columnDef.meta as
-                  | ColumnMeta
-                  | undefined;
 
                 return (
                   <th
-                    key={header.id}
-                    title={
-                      isSelectionColumn || !columnMeta
-                        ? undefined
-                        : buildColumnHeaderTitle(columnMeta)
-                    }
+                    key={`${header.id}_f`}
                     style={{
                       width: displayHeaderSize,
-                      height: HEADER_H,
-                      padding: isSelectionColumn
-                        ? "0 6px"
-                        : isCollapsed
-                          ? 0
-                          : "0 8px",
-                      textAlign: isSelectionColumn ? "center" : "left",
-                      background: isSorted
-                        ? "var(--vscode-list-inactiveSelectionBackground, rgba(128,128,128,0.1))"
-                        : "var(--vscode-editorGroupHeader-tabsBackground)",
+                      height: FILTER_H,
+                      padding: isSelectionColumn || isCollapsed ? 0 : "2px 4px",
+                      background:
+                        "var(--vscode-editorGroupHeader-tabsBackground)",
                       borderRight: "1px solid var(--vscode-panel-border)",
                       borderLeft: "1px solid var(--vscode-panel-border)",
+                      borderBottom: "1px solid var(--vscode-panel-border)",
                       position: "sticky",
-                      top: 0,
+                      top: HEADER_H,
                       zIndex: 2,
-                      whiteSpace: "nowrap",
-                      overflow: "visible",
-                      fontWeight: 600,
                       boxSizing: "border-box",
-                      userSelect: "none",
-                      cursor: isSelectionColumn ? "default" : "pointer",
-                    }}
-                    onClick={() => {
-                      if (!isSelectionColumn) {
-                        onSort(columnId);
-                      }
+                      boxShadow:
+                        "0 -1px 0 0 var(--vscode-editorGroupHeader-tabsBackground)",
+                      overflow: "visible",
                     }}
                   >
-                    <HeaderContent
-                      isCollapsed={isCollapsed}
-                      justifyContent={
-                        isSelectionColumn ? "center" : "flex-start"
-                      }
-                    >
-                      <span
-                        style={{ overflow: "hidden", textOverflow: "ellipsis" }}
-                      >
-                        {flexRender(
-                          header.column.columnDef.header,
-                          header.getContext(),
-                        )}
-                      </span>
-                      {!isSelectionColumn && (
-                        <span
-                          style={{
-                            opacity: isSorted ? 1 : 0.25,
-                            fontSize: 10,
-                            flexShrink: 0,
-                          }}
-                        >
-                          {sortDirection === "asc" ? (
-                            <Icon name="triangle-up" size={10} />
-                          ) : sortDirection === "desc" ? (
-                            <Icon name="triangle-down" size={10} />
-                          ) : (
-                            <Icon name="unfold" size={10} />
-                          )}
-                        </span>
-                      )}
-                    </HeaderContent>
-                    {!isSelectionColumn && header.column.getCanResize() && (
-                      <ColumnResizeHandle
-                        ariaLabel={`Resize ${columnId} column`}
-                        tabIndex={-1}
-                        onMouseDown={(event) => {
-                          event.preventDefault();
-                          event.stopPropagation();
-
-                          const startSize = Math.max(headerSize, 1);
-                          const startX = event.clientX;
-
-                          const applyWidth = (clientX: number) => {
-                            const nextWidth = Math.max(
-                              1,
-                              startSize + (clientX - startX),
-                            );
-                            setColumnSizing((previous) => ({
-                              ...previous,
-                              [columnId]: nextWidth,
-                            }));
-                          };
-
-                          const onMove = (moveEvent: MouseEvent) => {
-                            applyWidth(moveEvent.clientX);
-                          };
-
-                          const onUp = (upEvent: MouseEvent) => {
-                            applyWidth(upEvent.clientX);
-                            document.removeEventListener("mousemove", onMove);
-                            document.removeEventListener("mouseup", onUp);
-                          };
-
-                          document.addEventListener("mousemove", onMove);
-                          document.addEventListener("mouseup", onUp);
-                        }}
-                        onClick={(event) => event.stopPropagation()}
-                        isResizing={header.column.getIsResizing()}
+                    {isSelectionColumn || isCollapsed ? (
+                      <span style={SR_ONLY_STYLE}>Selection column</span>
+                    ) : column ? (
+                      <ColumnFilterControl
+                        column={column}
+                        draft={filterDrafts[header.column.id]}
+                        onChange={(nextDraft, options) =>
+                          onFilterDraftChange(
+                            header.column.id,
+                            nextDraft,
+                            options,
+                          )
+                        }
                       />
-                    )}
+                    ) : null}
                   </th>
                 );
               })}
             </tr>
-          ))}
-          <tr>
-            {tanTable.getHeaderGroups()[0]?.headers.map((header) => {
-              const isSelectionColumn = header.column.id === "__sel";
-              const column = columnsMap.get(header.column.id);
-              const headerSize = header.getSize();
-              const isCollapsed = isCollapsedWidth(headerSize);
-              const displayHeaderSize = getDisplaySize(headerSize);
+          </thead>
+          <tbody>
+            <TopSpacerRow
+              colSpan={tanColumns.length}
+              height={virtualItems[0]?.start ?? 0}
+            />
+            {virtualItems.map((virtualRow) => {
+              if (hasDraftRow && virtualRow.index === 0) {
+                return (
+                  <DraftTableRow
+                    key={virtualRow.key}
+                    columns={columns}
+                    visibleColumns={visibleColumns}
+                    draft={newRow}
+                    editingCol={
+                      editCell?.kind === "draft" ? editCell.col : null
+                    }
+                    onOpenStructuredCell={onOpenStructuredCell}
+                    onStartEdit={onStartDraftEdit}
+                    onCommit={onCommitDraftCellEdit}
+                    onCancelEdit={onCancelEdit}
+                  />
+                );
+              }
+
+              const persistedIndex = hasDraftRow
+                ? virtualRow.index - 1
+                : virtualRow.index;
+              const row = tableRows[persistedIndex];
+              const isSelected = selected.has(persistedIndex);
+              const editingCol =
+                editCell?.kind === "persisted" &&
+                editCell.rowIdx === persistedIndex
+                  ? editCell.col
+                  : null;
 
               return (
-                <th
-                  key={`${header.id}_f`}
-                  style={{
-                    width: displayHeaderSize,
-                    height: FILTER_H,
-                    padding: isSelectionColumn || isCollapsed ? 0 : "2px 4px",
-                    background:
-                      "var(--vscode-editorGroupHeader-tabsBackground)",
-                    borderRight: "1px solid var(--vscode-panel-border)",
-                    borderLeft: "1px solid var(--vscode-panel-border)",
-                    borderBottom: "1px solid var(--vscode-panel-border)",
-                    position: "sticky",
-                    top: HEADER_H,
-                    zIndex: 2,
-                    boxSizing: "border-box",
-                    boxShadow:
-                      "0 -1px 0 0 var(--vscode-editorGroupHeader-tabsBackground)",
-                    overflow: "visible",
-                  }}
-                >
-                  {isSelectionColumn || isCollapsed ? (
-                    <span style={SR_ONLY_STYLE}>Selection column</span>
-                  ) : column ? (
-                    <ColumnFilterControl
-                      column={column}
-                      draft={filterDrafts[header.column.id]}
-                      onChange={(nextDraft, options) =>
-                        onFilterDraftChange(
-                          header.column.id,
-                          nextDraft,
-                          options,
-                        )
-                      }
-                    />
-                  ) : null}
-                </th>
-              );
-            })}
-          </tr>
-        </thead>
-        <tbody>
-          <TopSpacerRow
-            colSpan={tanColumns.length}
-            height={virtualItems[0]?.start ?? 0}
-          />
-          {virtualItems.map((virtualRow) => {
-            if (hasDraftRow && virtualRow.index === 0) {
-              return (
-                <DraftTableRow
+                <TableRow
                   key={virtualRow.key}
-                  columns={columns}
-                  visibleColumns={visibleColumns}
-                  draft={newRow}
-                  editingCol={editCell?.kind === "draft" ? editCell.col : null}
+                  row={row}
+                  visualIndex={virtualRow.index}
+                  rowIndex={persistedIndex}
+                  isSelected={isSelected}
+                  pendingCols={pendingEdits.get(persistedIndex)}
+                  columnsMap={columnsMap}
+                  editingCol={editingCol}
                   onOpenStructuredCell={onOpenStructuredCell}
-                  onStartEdit={onStartDraftEdit}
-                  onCommit={onCommitDraftCellEdit}
-                  onCancelEdit={onCancelEdit}
+                  onStartEdit={onStartEdit}
+                  readOnly={!canEditRows}
+                  selection={selection}
                 />
               );
-            }
-
-            const persistedIndex = hasDraftRow
-              ? virtualRow.index - 1
-              : virtualRow.index;
-            const row = tableRows[persistedIndex];
-            const isSelected = selected.has(persistedIndex);
-            const editingCol =
-              editCell?.kind === "persisted" &&
-              editCell.rowIdx === persistedIndex
-                ? editCell.col
-                : null;
-
-            return (
-              <TableRow
-                key={virtualRow.key}
-                row={row}
-                visualIndex={virtualRow.index}
-                rowIndex={persistedIndex}
-                isSelected={isSelected}
-                pendingCols={pendingEdits.get(persistedIndex)}
-                columnsMap={columnsMap}
-                editingCol={editingCol}
-                onOpenStructuredCell={onOpenStructuredCell}
-                onStartEdit={onStartEdit}
-                readOnly={!canEditRows}
-              />
-            );
-          })}
-          <BottomSpacerRow
-            virtualItems={virtualItems}
-            totalVirtualHeight={totalVirtualHeight}
-            colSpan={tanColumns.length}
-          />
-        </tbody>
-      </table>
+            })}
+            <BottomSpacerRow
+              virtualItems={virtualItems}
+              totalVirtualHeight={totalVirtualHeight}
+              colSpan={tanColumns.length}
+            />
+          </tbody>
+        </table>
+      </div>
 
       {!loading && rows.length === 0 && !hasDraftRow && (
         <div
@@ -1053,6 +1383,82 @@ function TableDataGrid({
           <div style={{ fontSize: 13, marginTop: 8 }}>No rows found</div>
         </div>
       )}
+
+      {pasteErrors.length > 0 && (
+        <div
+          style={{
+            position: "absolute",
+            bottom: 0,
+            left: 0,
+            right: 0,
+            padding: "8px 12px",
+            background:
+              "var(--vscode-inputValidation-errorBackground, rgba(200,50,50,0.15))",
+            borderTop:
+              "1px solid var(--vscode-inputValidation-errorBorder, rgba(200,50,50,0.5))",
+            color: "var(--vscode-errorForeground)",
+            fontSize: 12,
+            zIndex: 10,
+            display: "flex",
+            alignItems: "flex-start",
+            gap: 8,
+          }}
+        >
+          <Icon
+            name="error"
+            size={14}
+            style={{ flexShrink: 0, marginTop: 2 }}
+          />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>
+              Paste failed: {pasteErrors.length} error
+              {pasteErrors.length > 1 ? "s" : ""}
+            </div>
+            <div style={{ opacity: 0.9, maxHeight: 60, overflow: "auto" }}>
+              {pasteErrors.slice(0, 3).map((error) => (
+                <div
+                  key={`${error.rowIndex}-${error.columnIndex}-${error.columnName}`}
+                  style={{ marginBottom: 2 }}
+                >
+                  {error.columnName
+                    ? `Row ${error.rowIndex + 1}, ${error.columnName}: `
+                    : `Row ${error.rowIndex + 1}: `}
+                  {error.message}
+                </div>
+              ))}
+              {pasteErrors.length > 3 && (
+                <div style={{ opacity: 0.7, fontStyle: "italic" }}>
+                  ...and {pasteErrors.length - 3} more error
+                  {pasteErrors.length - 3 > 1 ? "s" : ""}
+                </div>
+              )}
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setPasteErrors([])}
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "var(--vscode-errorForeground)",
+              cursor: "pointer",
+              padding: "2px 6px",
+              fontSize: 14,
+              opacity: 0.7,
+            }}
+            title="Dismiss"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      <GridContextMenu
+        containerRef={containerRef}
+        onCopy={handleCopy}
+        onPaste={handlePaste}
+        canPaste={canEditRows}
+      />
     </div>
   );
 }
@@ -1259,6 +1665,7 @@ function TableRow({
   onOpenStructuredCell,
   onStartEdit,
   readOnly,
+  selection,
 }: {
   row: TanStackRow<Row>;
   visualIndex: number;
@@ -1278,7 +1685,33 @@ function TableRow({
   }) => void;
   onStartEdit: (rowIndex: number, column: ColumnMeta) => void;
   readOnly: boolean;
+  selection: {
+    handleCellMouseDown: (
+      rowIndex: number,
+      colIndex: number,
+      event: React.MouseEvent,
+    ) => void;
+    handleCellMouseEnter: (
+      rowIndex: number,
+      colIndex: number,
+      event: React.MouseEvent,
+    ) => void;
+    isCellSelected: (rowIndex: number, colIndex: number) => boolean;
+    isCellAnchor: (rowIndex: number, colIndex: number) => boolean;
+    range: {
+      anchorRow: number;
+      anchorCol: number;
+      activeRow: number;
+      activeCol: number;
+    } | null;
+  };
 }) {
+  const { range } = selection;
+  const minRow = range ? Math.min(range.anchorRow, range.activeRow) : -1;
+  const maxRow = range ? Math.max(range.anchorRow, range.activeRow) : -1;
+  const minCol = range ? Math.min(range.anchorCol, range.activeCol) : -1;
+  const maxCol = range ? Math.max(range.anchorCol, range.activeCol) : -1;
+
   return (
     <tr
       className="rdb-trow"
@@ -1292,7 +1725,7 @@ function TableRow({
           : {}),
       }}
     >
-      {row.getVisibleCells().map((cell) => {
+      {row.getVisibleCells().map((cell, cellIndex) => {
         const columnId = cell.column.id;
         const columnDef = columnsMap.get(columnId);
         const isPrimaryKey = columnDef?.isPrimaryKey ?? false;
@@ -1315,9 +1748,31 @@ function TableRow({
           ? pendingCols?.get(columnId)
           : cell.getValue();
 
+        const isDataCol = !isSelectionColumn;
+
+        const isCellSelected =
+          isDataCol && selection.isCellSelected(rowIndex, cellIndex);
+        const isCellAnchor =
+          isDataCol && selection.isCellAnchor(rowIndex, cellIndex);
+        const isTopBorder = isCellSelected && rowIndex === minRow;
+        const isBottomBorder = isCellSelected && rowIndex === maxRow;
+        const isLeftBorder = isCellSelected && cellIndex === minCol;
+        const isRightBorder = isCellSelected && cellIndex === maxCol;
+
+        const cellClasses = ["rdb-trow-cell"];
+        if (isCellSelected) cellClasses.push("rdb-tcell-selected");
+        if (isCellAnchor) cellClasses.push("rdb-tcell-anchor");
+        if (isTopBorder) cellClasses.push("rdb-tcell-border-top");
+        if (isBottomBorder) cellClasses.push("rdb-tcell-border-bottom");
+        if (isLeftBorder) cellClasses.push("rdb-tcell-border-left");
+        if (isRightBorder) cellClasses.push("rdb-tcell-border-right");
+
         return (
           <td
             key={cell.id}
+            data-row={isDataCol ? rowIndex : undefined}
+            data-col={isDataCol ? cellIndex : undefined}
+            className={cellClasses.join(" ")}
             style={{
               width: displayCellSize,
               height: ROW_H,
@@ -1348,8 +1803,23 @@ function TableRow({
                 ? `${primaryKeyLabel}: ${String(cell.getValue())}`
                 : undefined
             }
+            onMouseDown={(event) => {
+              if (isDataCol && !isCollapsed) {
+                selection.handleCellMouseDown(rowIndex, cellIndex, event);
+              }
+            }}
+            onMouseEnter={(event) => {
+              if (isDataCol) {
+                selection.handleCellMouseEnter(rowIndex, cellIndex, event);
+              }
+            }}
             onDoubleClick={() => {
-              if (columnDef && canOpenCellEditor && !isCollapsed) {
+              if (
+                !isEditing &&
+                columnDef &&
+                canOpenCellEditor &&
+                !isCollapsed
+              ) {
                 const structuredValue = getStructuredCellDialogValue(
                   currentValue,
                   columnDef,

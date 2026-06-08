@@ -179,6 +179,7 @@ describe("applyUndoRedoSnapshot", () => {
     expect(snapshot.newRow?.email).toBeUndefined();
 
     // But inner cell objects are shared references (shallow clone)
+    // biome-ignore lint/style/noNonNullAssertion: test needs direct mutation
     result.newRow!.name.value = "mutated";
     expect(snapshot.newRow?.name.value).toBe("mutated");
   });
