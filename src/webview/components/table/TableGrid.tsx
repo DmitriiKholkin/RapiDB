@@ -41,6 +41,7 @@ import {
   type PasteValidationError,
   parseTsv,
   validatePasteData,
+  validatePasteValue,
 } from "../../utils/pasteUtils";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
 import { Icon } from "../Icon";
@@ -415,7 +416,14 @@ function QueryResultsGrid({ result }: QueryResultsGridProps) {
     >
       <div
         ref={scrollRef}
-        style={{ width: "100%", height: "100%", overflow: "auto" }}
+        style={{
+          width: "100%",
+          height: "100%",
+          overflow: "auto",
+          outline: "none",
+        }}
+        // biome-ignore lint/a11y/noNoninteractiveTabindex: needed for webview keyboard focus
+        tabIndex={0}
       >
         <table style={getBaseTableStyle(table.getTotalSize())}>
           <thead>
@@ -713,6 +721,18 @@ interface TableGridProps {
     originalVal: unknown,
   ) => void;
   onCommitDraftCellEdit: (column: ColumnMeta, value: string) => void;
+  onBatchDraftCellEdit: (
+    edits: Array<{ column: ColumnMeta; newVal: string }>,
+  ) => void;
+  onMixedBatchEdit: (
+    draftEdits: Array<{ column: ColumnMeta; newVal: string }>,
+    persistedEdits: Array<{
+      rowIdx: number;
+      column: ColumnMeta;
+      newVal: string;
+      originalVal: unknown;
+    }>,
+  ) => void;
   onFilterDraftChange: (
     columnName: string,
     nextDraft: FilterDraft | undefined,
@@ -768,6 +788,8 @@ function TableDataGrid({
   onBatchCellEdit,
   onCommitCellEdit,
   onCommitDraftCellEdit,
+  onBatchDraftCellEdit,
+  onMixedBatchEdit,
   onFilterDraftChange,
   onSelectionChange,
   onSort,
@@ -788,6 +810,8 @@ function TableDataGrid({
   const [columnSizing, setColumnSizing] = useState<Record<string, number>>({});
   const containerRef = React.useRef<HTMLDivElement>(null);
   const [pasteErrors, setPasteErrors] = useState<PasteValidationError[]>([]);
+  const newRowRef = useRef(newRow);
+  newRowRef.current = newRow;
 
   const dataColCount = columns.length;
   const selColOffset = canSelectAndDeleteRows ? 1 : 0;
@@ -797,6 +821,16 @@ function TableDataGrid({
     (rowIndex: number, colIndex: number) => {
       const dataColIndex = colIndex - selColOffset;
       if (dataColIndex < 0 || dataColIndex >= dataColCount) return undefined;
+      if (rowIndex === -1) {
+        const draft = newRowRef.current;
+        if (!draft) return undefined;
+        const columnName = columns[dataColIndex]?.name;
+        if (!columnName) return undefined;
+        const dv = draft[columnName]?.value;
+        if (dv === INSERT_DEFAULT_SENTINEL) return undefined;
+        if (dv === NULL_SENTINEL) return null;
+        return dv;
+      }
       const row = rows[rowIndex];
       if (!row) return undefined;
       const columnName = columns[dataColIndex]?.name;
@@ -829,6 +863,7 @@ function TableDataGrid({
   const selection = useCellSelection({
     rowCount: rows.length,
     colCount: totalColCount,
+    minRow: newRow ? -1 : 0,
     getCellValue,
     scrollRef,
     getCellFromPoint,
@@ -846,6 +881,25 @@ function TableDataGrid({
     window.addEventListener("keydown", handleKeyDown, true);
     return () => window.removeEventListener("keydown", handleKeyDown, true);
   }, [selection.handleKeyDown]);
+
+  useEffect(() => {
+    const handlePasteEvent = (event: ClipboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (
+        target?.tagName === "INPUT" ||
+        target?.tagName === "TEXTAREA" ||
+        target?.isContentEditable
+      ) {
+        return;
+      }
+      if (!canEditRows || !selectionRangeRef.current) return;
+      event.preventDefault();
+      event.stopPropagation();
+      handlePaste();
+    };
+    window.addEventListener("paste", handlePasteEvent, true);
+    return () => window.removeEventListener("paste", handlePasteEvent, true);
+  }, [canEditRows, handlePaste]);
 
   const handleCopy = useCallback(() => {
     const text = selection.copySelection();
@@ -886,6 +940,103 @@ function TableDataGrid({
         return;
       }
 
+      if (startRow === -1) {
+        const draft = newRowRef.current;
+        if (!draft) return;
+
+        const errors: PasteValidationError[] = [];
+
+        for (let r = 0; r < pasteData.rows.length; r++) {
+          const row = pasteData.rows[r];
+          const targetRow = startRow + r;
+
+          for (let c = 0; c < row.length; c++) {
+            const value = row[c];
+            const targetCol = startCol + c;
+            const column = columns[targetCol];
+            if (!column) continue;
+
+            const validation = validatePasteValue(value, column);
+            if (!validation.valid) {
+              errors.push({
+                rowIndex: targetRow,
+                columnIndex: targetCol + selColOffset,
+                columnName: column.name,
+                value,
+                message: validation.error ?? "Validation failed",
+              });
+              continue;
+            }
+
+            if (targetRow >= rows.length) {
+              errors.push({
+                rowIndex: targetRow,
+                columnIndex: targetCol + selColOffset,
+                columnName: column.name,
+                value,
+                message: `Row ${targetRow + 1} does not exist`,
+              });
+            }
+          }
+        }
+
+        if (errors.length > 0) {
+          setPasteErrors(errors);
+          return;
+        }
+
+        setPasteErrors([]);
+
+        const batchEdits: Array<{
+          rowIdx: number;
+          column: ColumnMeta;
+          newVal: string;
+          originalVal: unknown;
+        }> = [];
+
+        const draftEdits: Array<{
+          column: ColumnMeta;
+          newVal: string;
+        }> = [];
+
+        for (let r = 0; r < pasteData.rows.length; r++) {
+          const row = pasteData.rows[r];
+          const targetRow = startRow + r;
+
+          for (let c = 0; c < row.length; c++) {
+            const value = row[c];
+            const targetCol = startCol + c;
+            const column = columns[targetCol];
+            if (!column) continue;
+
+            const coercedValue =
+              value === "" || value === "NULL" ? NULL_SENTINEL : value;
+
+            if (targetRow === -1) {
+              draftEdits.push({ column, newVal: coercedValue });
+            } else {
+              const originalValue = rows[targetRow]?.[column.name];
+              batchEdits.push({
+                rowIdx: targetRow,
+                column,
+                newVal: coercedValue,
+                originalVal: originalValue,
+              });
+            }
+          }
+        }
+
+        if (draftEdits.length > 0 && batchEdits.length > 0) {
+          onMixedBatchEdit(draftEdits, batchEdits);
+        } else if (draftEdits.length > 0) {
+          onBatchDraftCellEdit(draftEdits);
+        } else if (batchEdits.length > 0) {
+          onBatchCellEdit(batchEdits);
+        }
+
+        return;
+      }
+
       const errors = validatePasteData(
         pasteData,
         startRow,
@@ -920,7 +1071,8 @@ function TableDataGrid({
           if (!column) continue;
 
           const originalValue = rows[targetRow]?.[column.name];
-          const coercedValue = value === "" ? NULL_SENTINEL : value;
+          const coercedValue =
+            value === "" || value === "NULL" ? NULL_SENTINEL : value;
 
           edits.push({
             rowIdx: targetRow,
@@ -941,6 +1093,8 @@ function TableDataGrid({
     rows,
     selColOffset,
     onBatchCellEdit,
+    onBatchDraftCellEdit,
+    onMixedBatchEdit,
     selection.contextMenuCellRef.current,
     selection.contextMenuCellRef,
   ]);
@@ -1120,7 +1274,14 @@ function TableDataGrid({
     >
       <div
         ref={scrollRef}
-        style={{ width: "100%", height: "100%", overflow: "auto" }}
+        style={{
+          width: "100%",
+          height: "100%",
+          overflow: "auto",
+          outline: "none",
+        }}
+        // biome-ignore lint/a11y/noNoninteractiveTabindex: needed for webview keyboard focus
+        tabIndex={0}
       >
         <table style={getBaseTableStyle(tanTable.getTotalSize())}>
           <thead>
@@ -1326,6 +1487,7 @@ function TableDataGrid({
                     onStartEdit={onStartDraftEdit}
                     onCommit={onCommitDraftCellEdit}
                     onCancelEdit={onCancelEdit}
+                    selection={selection}
                   />
                 );
               }
@@ -1804,7 +1966,7 @@ function TableRow({
                 : undefined
             }
             onMouseDown={(event) => {
-              if (isDataCol && !isCollapsed) {
+              if (isDataCol && !isCollapsed && !isEditing) {
                 selection.handleCellMouseDown(rowIndex, cellIndex, event);
               }
             }}
@@ -1860,6 +2022,7 @@ function DraftTableRow({
   onStartEdit,
   onCommit,
   onCancelEdit,
+  selection,
 }: {
   columns: readonly ColumnMeta[];
   visibleColumns: readonly TanStackColumn<Row, unknown>[];
@@ -1877,6 +2040,26 @@ function DraftTableRow({
   onStartEdit: (column: ColumnMeta) => void;
   onCommit: (column: ColumnMeta, value: string) => void;
   onCancelEdit: () => void;
+  selection?: {
+    handleCellMouseDown: (
+      rowIndex: number,
+      colIndex: number,
+      event: React.MouseEvent,
+    ) => void;
+    handleCellMouseEnter: (
+      rowIndex: number,
+      colIndex: number,
+      event: React.MouseEvent,
+    ) => void;
+    isCellSelected: (rowIndex: number, colIndex: number) => boolean;
+    isCellAnchor: (rowIndex: number, colIndex: number) => boolean;
+    range: {
+      anchorRow: number;
+      anchorCol: number;
+      activeRow: number;
+      activeCol: number;
+    } | null;
+  };
 }) {
   const columnsMap = useMemo(
     () => new Map(columns.map((column) => [column.name, column])),
@@ -1915,10 +2098,37 @@ function DraftTableRow({
         const columnSize = column.getSize();
         const isCollapsed = isCollapsedWidth(columnSize);
         const displayColumnSize = isCollapsed ? 0 : columnSize;
+        const colIndex = visibleColumns.indexOf(column);
+        const isDataCol = !isSelectionColumn;
+        const selRow = -1;
+        const isCellSelected =
+          isDataCol && selection?.isCellSelected(selRow, colIndex);
+        const isCellAnchor =
+          isDataCol && selection?.isCellAnchor(selRow, colIndex);
+        const range = selection?.range;
+        const minRow = range ? Math.min(range.anchorRow, range.activeRow) : -1;
+        const maxRow = range ? Math.max(range.anchorRow, range.activeRow) : -1;
+        const minCol = range ? Math.min(range.anchorCol, range.activeCol) : -1;
+        const maxCol = range ? Math.max(range.anchorCol, range.activeCol) : -1;
+        const isTopBorder = isCellSelected && selRow === minRow;
+        const isBottomBorder = isCellSelected && selRow === maxRow;
+        const isLeftBorder = isCellSelected && colIndex === minCol;
+        const isRightBorder = isCellSelected && colIndex === maxCol;
+
+        const cellClasses = ["rdb-trow-cell"];
+        if (isCellSelected) cellClasses.push("rdb-tcell-selected");
+        if (isCellAnchor) cellClasses.push("rdb-tcell-anchor");
+        if (isTopBorder) cellClasses.push("rdb-tcell-border-top");
+        if (isBottomBorder) cellClasses.push("rdb-tcell-border-bottom");
+        if (isLeftBorder) cellClasses.push("rdb-tcell-border-left");
+        if (isRightBorder) cellClasses.push("rdb-tcell-border-right");
 
         return (
           <td
             key={columnId}
+            data-row={isDataCol ? selRow : undefined}
+            data-col={isDataCol ? colIndex : undefined}
+            className={cellClasses.join(" ")}
             style={{
               width: displayColumnSize,
               height: ROW_H,
@@ -1935,6 +2145,16 @@ function DraftTableRow({
               cursor: isCollapsed ? "default" : "pointer",
               userSelect: "none",
               background: "rgba(200, 150, 0, 0.23)",
+            }}
+            onMouseDown={(event) => {
+              if (isDataCol && !isCollapsed && selection && !isEditing) {
+                selection.handleCellMouseDown(selRow, colIndex, event);
+              }
+            }}
+            onMouseEnter={(event) => {
+              if (isDataCol && selection) {
+                selection.handleCellMouseEnter(selRow, colIndex, event);
+              }
             }}
             onDoubleClick={() => {
               if (!isCollapsed) {

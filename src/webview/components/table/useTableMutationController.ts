@@ -381,14 +381,41 @@ export function useTableMutationController({
         return;
       }
 
+      const currentPending = pendingEditsRef.current;
+
+      const effectiveEdits: Array<{
+        rowIdx: number;
+        column: ColumnMeta;
+        newVal: string;
+        originalVal: unknown;
+      }> = [];
+
+      for (const edit of edits) {
+        const { rowIdx, column, newVal, originalVal } = edit;
+        const coerced: unknown = newVal === NULL_SENTINEL ? null : newVal;
+        const originalValueString = valueToEditString(originalVal);
+
+        if (newVal === originalValueString) {
+          if (currentPending.get(rowIdx)?.has(column.name)) {
+            effectiveEdits.push(edit);
+          }
+        } else {
+          if (currentPending.get(rowIdx)?.get(column.name) !== coerced) {
+            effectiveEdits.push(edit);
+          }
+        }
+      }
+
+      if (effectiveEdits.length === 0) return;
+
       history.push(
-        buildUndoRedoSnapshot(pendingEditsRef.current, newRowRef.current, null),
+        buildUndoRedoSnapshot(currentPending, newRowRef.current, null),
       );
 
       setPending((previousPending) => {
         const nextPending = new Map(previousPending);
 
-        for (const { rowIdx, column, newVal, originalVal } of edits) {
+        for (const { rowIdx, column, newVal, originalVal } of effectiveEdits) {
           const coerced: unknown = newVal === NULL_SENTINEL ? null : newVal;
           const originalValueString = valueToEditString(originalVal);
 
@@ -404,9 +431,12 @@ export function useTableMutationController({
               }
             }
           } else {
-            const nextRowMap = new Map(nextPending.get(rowIdx) ?? []);
-            nextRowMap.set(column.name, coerced);
-            nextPending.set(rowIdx, nextRowMap);
+            const existing = nextPending.get(rowIdx)?.get(column.name);
+            if (existing !== coerced) {
+              const nextRowMap = new Map(nextPending.get(rowIdx) ?? []);
+              nextRowMap.set(column.name, coerced);
+              nextPending.set(rowIdx, nextRowMap);
+            }
           }
         }
 
@@ -431,10 +461,20 @@ export function useTableMutationController({
 
       const coerced: unknown = newVal === NULL_SENTINEL ? null : newVal;
       const originalValueString = valueToEditString(originalVal);
+      const currentPending = pendingEditsRef.current;
 
-      // Push current state to history BEFORE making the change
+      if (newVal === originalValueString) {
+        if (!currentPending.get(rowIdx)?.has(column.name)) {
+          return;
+        }
+      } else {
+        if (currentPending.get(rowIdx)?.get(column.name) === coerced) {
+          return;
+        }
+      }
+
       history.push(
-        buildUndoRedoSnapshot(pendingEditsRef.current, newRowRef.current, null),
+        buildUndoRedoSnapshot(currentPending, newRowRef.current, null),
       );
 
       if (newVal === originalValueString) {
@@ -460,6 +500,8 @@ export function useTableMutationController({
 
       setPending((previousPending) => {
         const nextPending = new Map(previousPending);
+        const existing = nextPending.get(rowIdx)?.get(column.name);
+        if (existing === coerced) return previousPending;
         const nextRowMap = new Map(nextPending.get(rowIdx) ?? []);
         nextRowMap.set(column.name, coerced);
         nextPending.set(rowIdx, nextRowMap);
@@ -473,24 +515,159 @@ export function useTableMutationController({
     (column: ColumnMeta, newVal: string) => {
       setEditCell(null);
 
-      // Push current state to history BEFORE making the change
+      const currentRow = newRowRef.current;
+      if (!currentRow) return;
+
+      const norm = newVal === NULL_SENTINEL ? NULL_SENTINEL : newVal;
+
       history.push(
-        buildUndoRedoSnapshot(pendingEditsRef.current, newRowRef.current, null),
+        buildUndoRedoSnapshot(pendingEditsRef.current, currentRow, null),
       );
 
-      setNewRow((currentRow) => {
-        if (!currentRow) {
-          return currentRow;
-        }
-
+      setNewRow((draft) => {
+        if (!draft) return draft;
         return {
-          ...currentRow,
+          ...draft,
           [column.name]: {
-            ...currentRow[column.name],
-            value: newVal === NULL_SENTINEL ? NULL_SENTINEL : newVal,
+            ...draft[column.name],
+            value: norm,
           },
         };
       });
+    },
+    [history],
+  );
+
+  const commitBatchDraftCellEdits = useCallback(
+    (edits: Array<{ column: ColumnMeta; newVal: string }>) => {
+      setEditCell(null);
+
+      const currentRow = newRowRef.current;
+      if (!currentRow) return;
+
+      const normEdits: Array<{ columnName: string; value: string }> = [];
+
+      for (const { column, newVal } of edits) {
+        const norm = newVal === NULL_SENTINEL ? NULL_SENTINEL : newVal;
+        const prev = currentRow[column.name]?.value;
+        if (prev === norm) continue;
+        normEdits.push({ columnName: column.name, value: norm });
+      }
+
+      if (normEdits.length === 0) return;
+
+      history.push(
+        buildUndoRedoSnapshot(pendingEditsRef.current, currentRow, null),
+      );
+
+      setNewRow((draft) => {
+        if (!draft) return draft;
+        const next = { ...draft };
+        for (const e of normEdits) {
+          next[e.columnName] = { ...next[e.columnName], value: e.value };
+        }
+        return next;
+      });
+    },
+    [history],
+  );
+
+  const commitMixedBatchEdits = useCallback(
+    (
+      draftEdits: Array<{ column: ColumnMeta; newVal: string }>,
+      persistedEdits: Array<{
+        rowIdx: number;
+        column: ColumnMeta;
+        newVal: string;
+        originalVal: unknown;
+      }>,
+    ) => {
+      setEditCell(null);
+
+      const currentRow = newRowRef.current;
+      const currentPending = pendingEditsRef.current;
+
+      const normDraftEdits: Array<{ columnName: string; value: string }> = [];
+      if (currentRow) {
+        for (const { column, newVal } of draftEdits) {
+          const norm = newVal === NULL_SENTINEL ? NULL_SENTINEL : newVal;
+          const prev = currentRow[column.name]?.value;
+          if (prev === norm) continue;
+          normDraftEdits.push({ columnName: column.name, value: norm });
+        }
+      }
+
+      const effectivePersistedEdits: typeof persistedEdits = [];
+      for (const edit of persistedEdits) {
+        const { rowIdx, column, newVal, originalVal } = edit;
+        const coerced: unknown = newVal === NULL_SENTINEL ? null : newVal;
+        const originalValueString = valueToEditString(originalVal);
+
+        if (newVal === originalValueString) {
+          if (currentPending.get(rowIdx)?.has(column.name)) {
+            effectivePersistedEdits.push(edit);
+          }
+        } else {
+          if (currentPending.get(rowIdx)?.get(column.name) !== coerced) {
+            effectivePersistedEdits.push(edit);
+          }
+        }
+      }
+
+      if (normDraftEdits.length === 0 && effectivePersistedEdits.length === 0) {
+        return;
+      }
+
+      history.push(buildUndoRedoSnapshot(currentPending, currentRow, null));
+
+      if (normDraftEdits.length > 0) {
+        setNewRow((draft) => {
+          if (!draft) return draft;
+          const next = { ...draft };
+          for (const e of normDraftEdits) {
+            next[e.columnName] = { ...next[e.columnName], value: e.value };
+          }
+          return next;
+        });
+      }
+
+      if (effectivePersistedEdits.length > 0) {
+        setPending((previousPending) => {
+          const nextPending = new Map(previousPending);
+
+          for (const {
+            rowIdx,
+            column,
+            newVal,
+            originalVal,
+          } of effectivePersistedEdits) {
+            const coerced: unknown = newVal === NULL_SENTINEL ? null : newVal;
+            const originalValueString = valueToEditString(originalVal);
+
+            if (newVal === originalValueString) {
+              const rowMap = nextPending.get(rowIdx);
+              if (rowMap?.has(column.name)) {
+                const nextRowMap = new Map(rowMap);
+                nextRowMap.delete(column.name);
+                if (nextRowMap.size === 0) {
+                  nextPending.delete(rowIdx);
+                } else {
+                  nextPending.set(rowIdx, nextRowMap);
+                }
+              }
+            } else {
+              const existing = nextPending.get(rowIdx)?.get(column.name);
+              if (existing !== coerced) {
+                const nextRowMap = new Map(nextPending.get(rowIdx) ?? []);
+                nextRowMap.set(column.name, coerced);
+                nextPending.set(rowIdx, nextRowMap);
+              }
+            }
+          }
+
+          return nextPending;
+        });
+      }
     },
     [history],
   );
@@ -708,6 +885,8 @@ export function useTableMutationController({
     applying,
     applyStatus,
     commitBatchCellEdits,
+    commitBatchDraftCellEdits,
+    commitMixedBatchEdits,
     commitCellEdit,
     commitDraftCellEdit,
     confirmMutationPreview,

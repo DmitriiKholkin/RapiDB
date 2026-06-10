@@ -38,6 +38,15 @@ export function GridContextMenu({
     }
 
     const handleContextMenu = (event: MouseEvent) => {
+      const target = event.target as HTMLElement;
+      if (
+        target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.isContentEditable
+      ) {
+        return;
+      }
+
       event.preventDefault();
 
       const bounds = container.getBoundingClientRect();

@@ -12,6 +12,7 @@ export interface CellRange {
 export interface UseCellSelectionOptions {
   rowCount: number;
   colCount: number;
+  minRow?: number;
   getCellValue: (rowIndex: number, colIndex: number) => unknown;
   scrollRef: React.RefObject<HTMLDivElement | null>;
   getCellFromPoint: (
@@ -85,6 +86,7 @@ function serializeToTsv(
 export function useCellSelection({
   rowCount,
   colCount,
+  minRow = 0,
   getCellValue,
   scrollRef,
   getCellFromPoint,
@@ -101,6 +103,8 @@ export function useCellSelection({
   rangeRef.current = range;
   const rowCountRef = useRef(rowCount);
   rowCountRef.current = rowCount;
+  const minRowRef = useRef(minRow);
+  minRowRef.current = minRow;
   const colCountRef = useRef(colCount);
   colCountRef.current = colCount;
   const getCellValueRef = useRef(getCellValue);
@@ -227,13 +231,16 @@ export function useCellSelection({
 
       if (event.button !== 0) {
         if (event.button === 2) {
-          if (!isInput) {
-            const activeElement = document.activeElement as HTMLElement | null;
-            if (activeElement && activeElement !== target) {
-              activeElement.blur();
-            }
-            event.preventDefault();
+          if (isInput) {
+            return;
           }
+
+          const activeElement = document.activeElement as HTMLElement | null;
+          if (activeElement && activeElement !== target) {
+            activeElement.blur();
+          }
+          event.preventDefault();
+          scrollRef.current?.focus({ preventScroll: true });
 
           contextMenuCellRef.current = { row: rowIndex, col: colIndex };
 
@@ -266,11 +273,12 @@ export function useCellSelection({
       }
 
       if (!isInput) {
+        event.preventDefault();
         const activeElement = document.activeElement as HTMLElement | null;
         if (activeElement && activeElement !== target) {
           activeElement.blur();
         }
-        event.preventDefault();
+        scrollRef.current?.focus({ preventScroll: true });
       }
 
       contextMenuCellRef.current = null;
@@ -293,7 +301,7 @@ export function useCellSelection({
         isDraggingRef.current = false;
       }
     },
-    [range],
+    [range, scrollRef],
   );
 
   const handleCellMouseEnter = useCallback(
@@ -318,6 +326,7 @@ export function useCellSelection({
   const handleKeyDown = useCallback((event: KeyboardEvent) => {
     const currentRange = rangeRef.current;
     const currentRowCount = rowCountRef.current;
+    const currentMinRow = minRowRef.current;
     const currentColCount = colCountRef.current;
     const currentGetCellValue = getCellValueRef.current;
     const currentOnCopy = onCopyRef.current;
@@ -341,7 +350,7 @@ export function useCellSelection({
     switch (event.key) {
       case "ArrowUp": {
         event.preventDefault();
-        const newRow = Math.max(0, activeRow - 1);
+        const newRow = Math.max(currentMinRow, activeRow - 1);
         if (event.shiftKey) {
           setRange({ ...currentRange, activeRow: newRow });
         } else {

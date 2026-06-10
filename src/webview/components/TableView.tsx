@@ -246,6 +246,8 @@ export function TableView({
         onBatchCellEdit={mutation.commitBatchCellEdits}
         onCommitCellEdit={mutation.commitCellEdit}
         onCommitDraftCellEdit={mutation.commitDraftCellEdit}
+        onBatchDraftCellEdit={mutation.commitBatchDraftCellEdits}
+        onMixedBatchEdit={mutation.commitMixedBatchEdits}
         onFilterDraftChange={data.updateFilterDraft}
         onOpenStructuredCell={mutation.openStructuredCellDialog}
         onSelectionChange={setSelected}

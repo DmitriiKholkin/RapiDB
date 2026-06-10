@@ -174,8 +174,9 @@ describe("applyUndoRedoSnapshot", () => {
     const result = applyUndoRedoSnapshot(snapshot);
     expect(result.newRow).not.toBeNull();
 
-    // Adding a key to the result does NOT appear in the original
-    result.newRow!.email = { value: "e@x.com" };
+    const newRow = result.newRow;
+    if (!newRow) throw new Error("Expected newRow");
+    newRow.email = { value: "e@x.com" };
     expect(snapshot.newRow?.email).toBeUndefined();
 
     // But inner cell objects are shared references (shallow clone)

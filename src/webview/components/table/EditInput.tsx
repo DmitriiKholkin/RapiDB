@@ -14,7 +14,7 @@ import { placeholderForCategory } from "../../types";
 import { buildSmallGhostButtonStyle } from "../../utils/buttonStyles";
 import { buildTextInputStyle } from "../../utils/controlStyles";
 import { cssVar } from "../../utils/cssVar";
-import { postMessage } from "../../utils/messaging";
+import { onMessage, postMessage } from "../../utils/messaging";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
 
 function normalizeEditInitialValue(
@@ -66,6 +66,9 @@ export function EditInput({
       ref.current.setSelectionRange(0, ref.current.value.length);
       ref.current.scrollLeft = 0;
     }
+    return () => {
+      pasteUnsubscribeRef.current?.();
+    };
   }, []);
 
   const handleContextMenu = useCallback((event: MouseEvent) => {
@@ -104,6 +107,37 @@ export function EditInput({
     }
     closeContextMenu();
   }, [closeContextMenu]);
+
+  const pasteUnsubscribeRef = useRef<(() => void) | null>(null);
+
+  const handlePaste = useCallback(() => {
+    const input = ref.current;
+    if (!input) return;
+    closeContextMenu();
+
+    pasteUnsubscribeRef.current?.();
+
+    pasteUnsubscribeRef.current = onMessage<string>("clipboardText", (text) => {
+      pasteUnsubscribeRef.current?.();
+      pasteUnsubscribeRef.current = null;
+
+      if (!text || !ref.current) return;
+      const start = ref.current.selectionStart ?? 0;
+      const end = ref.current.selectionEnd ?? 0;
+      const currentVal = val;
+      const newVal = currentVal.slice(0, start) + text + currentVal.slice(end);
+      setVal(newVal);
+
+      const cursorPos = start + text.length;
+      requestAnimationFrame(() => {
+        if (ref.current instanceof HTMLInputElement) {
+          ref.current.setSelectionRange(cursorPos, cursorPos);
+        }
+      });
+    });
+
+    postMessage("readClipboard");
+  }, [closeContextMenu, val]);
 
   useEffect(() => {
     if (!contextMenu) return;
@@ -276,6 +310,28 @@ export function EditInput({
             }}
           >
             Copy
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={handlePaste}
+            style={{
+              appearance: "none",
+              border: "none",
+              background: "transparent",
+              color:
+                cssVar("--vscode-menu-foreground") ||
+                cssVar("--vscode-foreground") ||
+                "#cccccc",
+              padding: "4px 10px",
+              fontSize: 12,
+              textAlign: "left",
+              cursor: "pointer",
+              borderRadius: 4,
+              width: "100%",
+            }}
+          >
+            Paste
           </button>
         </div>
       )}
