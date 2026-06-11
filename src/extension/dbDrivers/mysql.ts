@@ -1358,6 +1358,7 @@ export class MySQLDriver extends BaseDBDriver {
   async readTablePage(
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
+    const startTime = performance.now();
     const columns = await this.describeColumns(
       request.database,
       request.schema,
@@ -1439,6 +1440,7 @@ export class MySQLDriver extends BaseDBDriver {
       columns,
       rows,
       totalCount,
+      executionTimeMs: Math.round(performance.now() - startTime),
     };
   }
   private _parseQueryResult(

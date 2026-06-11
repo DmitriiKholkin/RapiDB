@@ -556,6 +556,7 @@ export class RedisDriver implements IDBDriver {
   async readTablePage(
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
+    const startTime = performance.now();
     if (this.canUseKeyOnlyPaging(request)) {
       const pattern = request.table === "default" ? "*" : `${request.table}:*`;
       const offset = Math.max(0, (request.page - 1) * request.pageSize);
@@ -571,6 +572,7 @@ export class RedisDriver implements IDBDriver {
         columns: this.inferRedisColumns(rows),
         rows: rows.map((entry) => entry.row),
         totalCount: request.skipCount ? 0 : keys.length,
+        executionTimeMs: Math.round(performance.now() - startTime),
       };
     }
 
@@ -599,6 +601,7 @@ export class RedisDriver implements IDBDriver {
       ),
       rows: paged,
       totalCount: request.skipCount ? 0 : sorted.length,
+      executionTimeMs: Math.round(performance.now() - startTime),
     };
   }
 

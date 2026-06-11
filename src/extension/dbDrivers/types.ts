@@ -158,6 +158,7 @@ export interface DriverTablePageResult {
   columns: ColumnTypeMeta[];
   rows: Record<string, unknown>[];
   totalCount: number;
+  executionTimeMs?: number;
 }
 
 export interface DriverUpdateRowsRequest {

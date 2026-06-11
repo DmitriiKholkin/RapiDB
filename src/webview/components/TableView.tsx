@@ -192,6 +192,7 @@ export function TableView({
         columns={data.columns}
         debouncedFilterDrafts={data.debouncedFilterDrafts}
         deleting={mutation.deleting}
+        executionTimeMs={data.executionTimeMs}
         mutationBusy={mutationBusy}
         newRowExists={mutation.newRow !== null}
         readOnlyTable={data.readOnlyTable}

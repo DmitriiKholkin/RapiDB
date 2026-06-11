@@ -98,6 +98,9 @@ export function useTableDataController({
   const [readOnlyTable, setReadOnlyTable] = useState(initialReadOnlyTable);
   const [colSizes, setColSizes] = useState<Record<string, number>>({});
   const [isInitialized, setIsInitialized] = useState(false);
+  const [executionTimeMs, setExecutionTimeMs] = useState<number | undefined>(
+    undefined,
+  );
 
   const colSizesInitedRef = useRef(false);
   const pendingPrimaryKeyColumnsRef = useRef<string[]>([]);
@@ -260,9 +263,15 @@ export function useTableDataController({
       fetchId?: number;
       rows: Row[];
       totalCount: number;
+      executionTimeMs?: number;
     }>(
       "tableData",
-      ({ fetchId, rows: nextRows, totalCount: nextTotalCount }) => {
+      ({
+        fetchId,
+        rows: nextRows,
+        totalCount: nextTotalCount,
+        executionTimeMs: nextExecutionTimeMs,
+      }) => {
         if (fetchId !== undefined && fetchId !== fetchEpochRef.current) {
           return;
         }
@@ -297,6 +306,7 @@ export function useTableDataController({
         setReadOnlyTable(pendingReadOnlyTableRef.current);
         setRows(nextRows);
         setTotalCount(nextTotalCount);
+        setExecutionTimeMs(nextExecutionTimeMs);
         setPage(snapshot.page);
         setPageSize(snapshot.pageSize);
         setSort(snapshot.sort);
@@ -447,6 +457,7 @@ export function useTableDataController({
     colSizes,
     debouncedFilterDrafts,
     error,
+    executionTimeMs,
     fetchPage,
     filterDrafts,
     filterError,

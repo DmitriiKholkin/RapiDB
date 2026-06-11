@@ -934,6 +934,7 @@ export class ElasticsearchDriver implements IDBDriver {
   async readTablePage(
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
+    const startTime = performance.now();
     const columns = this.describeIndexColumnsSync();
     const columnMetaByName = new Map(
       columns.map((column) => [column.name, column]),
@@ -973,6 +974,7 @@ export class ElasticsearchDriver implements IDBDriver {
         totalCount: request.skipCount
           ? 0
           : this.resolveElasticsearchTotalCount(response.hits.total),
+        executionTimeMs: Math.round(performance.now() - startTime),
       };
     }
 
@@ -1002,6 +1004,7 @@ export class ElasticsearchDriver implements IDBDriver {
       columns,
       rows: paged,
       totalCount: request.skipCount ? 0 : sorted.length,
+      executionTimeMs: Math.round(performance.now() - startTime),
     };
   }
 

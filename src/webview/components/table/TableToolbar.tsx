@@ -17,6 +17,7 @@ interface TableToolbarProps {
   columns: readonly ColumnMeta[];
   debouncedFilterDrafts: FilterDraftMap;
   deleting: boolean;
+  executionTimeMs?: number;
   mutationBusy: boolean;
   newRowExists: boolean;
   readOnlyTable: boolean;
@@ -33,6 +34,7 @@ export function TableToolbar({
   columns,
   debouncedFilterDrafts,
   deleting,
+  executionTimeMs,
   mutationBusy,
   newRowExists,
   readOnlyTable,
@@ -101,6 +103,13 @@ export function TableToolbar({
       />
       <div style={{ flex: 1 }} />
       <span style={{ fontSize: 11, opacity: 0.5 }}>
+        {executionTimeMs !== undefined && (
+          <span style={{ marginRight: 8 }}>
+            {executionTimeMs < 1000
+              ? `${executionTimeMs}ms`
+              : `${(executionTimeMs / 1000).toFixed(1)}s`}
+          </span>
+        )}
         {`${totalCount.toLocaleString()} rows total`}
       </span>
     </div>

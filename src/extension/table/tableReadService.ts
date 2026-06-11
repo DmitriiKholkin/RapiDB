@@ -94,6 +94,7 @@ export class TableReadService {
     sort: SortConfig | null,
     skipCount: boolean,
   ): Promise<TablePage> {
+    const startTime = performance.now();
     const { driver } = this.getConnectionDriver(connectionId);
 
     const qualifiedTableName = driver.qualifiedTableName(
@@ -138,11 +139,13 @@ export class TableReadService {
       columns,
     );
     const rows = this.formatQueryRows(driver, columns, dataResult);
+    const executionTimeMs = Math.round(performance.now() - startTime);
 
     return {
       columns,
       rows,
       totalCount: count.countFailed ? offset + rows.length : count.totalCount,
+      executionTimeMs,
     };
   }
 

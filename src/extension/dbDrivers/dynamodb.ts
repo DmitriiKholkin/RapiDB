@@ -661,6 +661,7 @@ export class DynamoDBDriver implements IDBDriver {
   async readTablePage(
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
+    const startTime = performance.now();
     const schema = await this.getTableSchema(request.table);
     const describedColumns = await this.describeColumns(
       request.database,
@@ -700,6 +701,7 @@ export class DynamoDBDriver implements IDBDriver {
         ),
         rows: filteredPage.formattedRows,
         totalCount: 0,
+        executionTimeMs: Math.round(performance.now() - startTime),
       };
     }
 
@@ -728,6 +730,7 @@ export class DynamoDBDriver implements IDBDriver {
         ),
         rows: pageRows(sortedRows, request.page, request.pageSize),
         totalCount: request.skipCount ? 0 : sortedRows.length,
+        executionTimeMs: Math.round(performance.now() - startTime),
       };
     }
 
@@ -749,6 +752,7 @@ export class DynamoDBDriver implements IDBDriver {
       ),
       rows: formattedRows,
       totalCount: request.skipCount ? 0 : await this.countReadPlan(plan),
+      executionTimeMs: Math.round(performance.now() - startTime),
     };
   }
 

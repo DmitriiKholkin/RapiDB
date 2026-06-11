@@ -1467,6 +1467,7 @@ export class MongoDBDriver implements IDBDriver {
   async readTablePage(
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
+    const startTime = performance.now();
     const schemaSampleLimit = Math.max(
       100,
       Math.min(500, request.pageSize * 2),
@@ -1525,6 +1526,7 @@ export class MongoDBDriver implements IDBDriver {
                 }),
           rows,
           totalCount,
+          executionTimeMs: Math.round(performance.now() - startTime),
         };
       } catch {
         // Fall through to display-value filtering when server-side BSON coercion is unavailable.
@@ -1556,6 +1558,7 @@ export class MongoDBDriver implements IDBDriver {
             }),
       rows: paged,
       totalCount: request.skipCount ? 0 : sorted.length,
+      executionTimeMs: Math.round(performance.now() - startTime),
     };
   }
 

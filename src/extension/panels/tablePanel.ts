@@ -80,6 +80,7 @@ export class TablePanel {
     Promise<{
       rows: Record<string, unknown>[];
       totalCount: number;
+      executionTimeMs?: number;
     }>
   >();
 
@@ -397,6 +398,7 @@ export class TablePanel {
         fetchId,
         rows: result.rows,
         totalCount: result.totalCount,
+        executionTimeMs: result.executionTimeMs,
       });
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
