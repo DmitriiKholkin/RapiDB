@@ -8,7 +8,7 @@ import {
 } from "../../shared/safetyContracts";
 import { parseQueryPanelMessage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
-import type { QueryColumnMeta } from "../dbDrivers/types";
+import { colKey, type QueryColumnMeta } from "../dbDrivers/types";
 import { readClipboardTextSafe, writeClipboardText } from "../utils/clipboard";
 import { normalizeUnknownError } from "../utils/errorHandling";
 import {
@@ -307,10 +307,18 @@ export class QueryPanelController {
         await this.pushSchema(parsed.payload?.connectionId);
         break;
       case "exportResultsCSV":
-        await this.handleExportResults("csv");
+        await this.handleExportResults(
+          "csv",
+          parsed.payload?.columnOrder,
+          parsed.payload?.sort,
+        );
         break;
       case "exportResultsJSON":
-        await this.handleExportResults("json");
+        await this.handleExportResults(
+          "json",
+          parsed.payload?.columnOrder,
+          parsed.payload?.sort,
+        );
         break;
       case "readClipboard":
         await this.handleReadClipboard();
@@ -661,18 +669,95 @@ export class QueryPanelController {
     });
   }
 
-  private async handleExportResults(format: "csv" | "json"): Promise<void> {
+  private async handleExportResults(
+    format: "csv" | "json",
+    columnOrder?: string[],
+    sort?: { column: string; desc: boolean }[],
+  ): Promise<void> {
     const cached = this.getCachedResultForExport();
     if (!cached) {
       return;
     }
 
+    const sortedResult =
+      sort && sort.length > 0 ? this.sortResultRows(cached, sort) : cached;
+
+    const orderedResult = columnOrder
+      ? this.reorderResultColumns(sortedResult, columnOrder)
+      : sortedResult;
+
     if (format === "csv") {
-      await exportQueryResultsAsCsv(cached, { context: this.context });
+      await exportQueryResultsAsCsv(orderedResult, { context: this.context });
       return;
     }
 
-    await exportQueryResultsAsJson(cached, { context: this.context });
+    await exportQueryResultsAsJson(orderedResult, { context: this.context });
+  }
+
+  private reorderResultColumns(
+    result: QueryPanelCachedResult,
+    columnOrder: string[],
+  ): QueryPanelCachedResult {
+    const indexMap = new Map(result.columns.map((col, i) => [col, i]));
+    const reorderedColumns: string[] = [];
+    const reorderedMeta: NonNullable<typeof result.columnMeta> = [];
+
+    for (const colId of columnOrder) {
+      const origIndex = indexMap.get(colId);
+      if (origIndex !== undefined) {
+        reorderedColumns.push(colId);
+        if (result.columnMeta) {
+          reorderedMeta.push(result.columnMeta[origIndex]);
+        }
+      }
+    }
+
+    if (reorderedColumns.length === 0) return result;
+
+    const reorderedRows = result.rows.map((row) => {
+      const newRow: Record<string, unknown> = {};
+      for (let i = 0; i < reorderedColumns.length; i++) {
+        const origIndex = indexMap.get(reorderedColumns[i]);
+        if (origIndex !== undefined) {
+          newRow[colKey(i)] = row[colKey(origIndex)];
+        }
+      }
+      return newRow;
+    });
+
+    return {
+      ...result,
+      columns: reorderedColumns,
+      ...(result.columnMeta ? { columnMeta: reorderedMeta } : {}),
+      rows: reorderedRows,
+    };
+  }
+
+  private sortResultRows(
+    result: QueryPanelCachedResult,
+    sort: { column: string; desc: boolean }[],
+  ): QueryPanelCachedResult {
+    const nameToKey = new Map(result.columns.map((col, i) => [col, colKey(i)]));
+    const sortedRows = [...result.rows].sort((a, b) => {
+      for (const { column, desc } of sort) {
+        const key = nameToKey.get(column);
+        if (key === undefined) continue;
+        const aVal = a[key];
+        const bVal = b[key];
+        let cmp = 0;
+        if (aVal == null && bVal == null) cmp = 0;
+        else if (aVal == null) cmp = -1;
+        else if (bVal == null) cmp = 1;
+        else if (typeof aVal === "number" && typeof bVal === "number")
+          cmp = aVal - bVal;
+        else if (typeof aVal === "string" && typeof bVal === "string")
+          cmp = aVal.localeCompare(bVal);
+        else cmp = String(aVal).localeCompare(String(bVal));
+        if (cmp !== 0) return desc ? -cmp : cmp;
+      }
+      return 0;
+    });
+    return { ...result, rows: sortedRows };
   }
 
   private async handleReadClipboard(): Promise<void> {

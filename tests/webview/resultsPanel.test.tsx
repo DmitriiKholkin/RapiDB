@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tanstack/react-virtual", () => ({
   useVirtualizer: ({ count }: { count: number }) => ({
@@ -18,7 +18,14 @@ vi.mock("@tanstack/react-virtual", () => ({
 import { TableGrid } from "../../src/webview/components/table/TableGrid";
 import { clearPostedMessages, getPostedMessages } from "./testUtils";
 
+let originalGetBoundingClientRect: typeof HTMLElement.prototype.getBoundingClientRect;
+
+beforeEach(() => {
+  originalGetBoundingClientRect = HTMLElement.prototype.getBoundingClientRect;
+});
+
 afterEach(() => {
+  HTMLElement.prototype.getBoundingClientRect = originalGetBoundingClientRect;
   clearPostedMessages();
 });
 
@@ -214,8 +221,8 @@ describe("TableGrid query mode", () => {
     await user.click(screen.getByRole("button", { name: "Export JSON" }));
 
     expect(getPostedMessages()).toEqual([
-      { type: "exportResultsCSV" },
-      { type: "exportResultsJSON" },
+      { type: "exportResultsCSV", payload: { columnOrder: ["id"] } },
+      { type: "exportResultsJSON", payload: { columnOrder: ["id"] } },
     ]);
   });
 
@@ -252,5 +259,174 @@ describe("TableGrid query mode", () => {
     expect(toolbar?.firstElementChild).toBe(exportGroup);
     expect(toolbar?.lastElementChild).toBe(queryMetrics);
     expect(screen.getByText("5 ms")).toBeTruthy();
+  });
+
+  it("reorders columns by dragging header across another header", () => {
+    render(
+      <TableGrid
+        mode="query"
+        status="success"
+        result={{
+          columns: ["id", "name", "email"],
+          columnMeta: [],
+          rows: [{ __col_0: 1, __col_1: "Alice", __col_2: "alice@test.com" }],
+          rowCount: 1,
+          executionTimeMs: 5,
+        }}
+      />,
+    );
+
+    const table = screen.getByRole("table");
+    const headers = Array.from(
+      table.querySelectorAll("thead tr:first-child th"),
+    );
+
+    expect(headers.map((th) => th.textContent)).toEqual([
+      "id",
+      "name",
+      "email",
+    ]);
+
+    const nameHeader = headers[1];
+    const emailHeader = headers[2];
+
+    nameHeader.getBoundingClientRect = vi.fn(() => ({
+      x: 60,
+      y: 0,
+      width: 80,
+      height: 28,
+      left: 60,
+      top: 0,
+      right: 140,
+      bottom: 28,
+      toJSON: () => {},
+    }));
+    emailHeader.getBoundingClientRect = vi.fn(() => ({
+      x: 140,
+      y: 0,
+      width: 120,
+      height: 28,
+      left: 140,
+      top: 0,
+      right: 260,
+      bottom: 28,
+      toJSON: () => {},
+    }));
+
+    const startX = 100;
+    fireEvent.mouseDown(nameHeader, {
+      clientX: startX,
+      clientY: 14,
+      buttons: 1,
+    });
+    fireEvent.mouseMove(document, {
+      clientX: startX + 10,
+      clientY: 14,
+      buttons: 1,
+    });
+    fireEvent.mouseMove(document, { clientX: 200, clientY: 14, buttons: 1 });
+    fireEvent.mouseUp(document, { clientX: 200, buttons: 0 });
+
+    const reorderedHeaders = Array.from(
+      table.querySelectorAll("thead tr:first-child th"),
+    );
+    expect(reorderedHeaders.map((th) => th.textContent)).toEqual([
+      "id",
+      "email",
+      "name",
+    ]);
+  });
+
+  it("does not trigger sorting when a drag occurs", () => {
+    render(
+      <TableGrid
+        mode="query"
+        status="success"
+        result={{
+          columns: ["id", "name"],
+          columnMeta: [],
+          rows: [{ __col_0: 1, __col_1: "Alice" }],
+          rowCount: 1,
+          executionTimeMs: 5,
+        }}
+      />,
+    );
+
+    const table = screen.getByRole("table");
+    const nameHeader = Array.from(
+      table.querySelectorAll("thead tr:first-child th"),
+    ).find((th) => th.textContent === "name");
+
+    expect(nameHeader).toBeTruthy();
+    if (!nameHeader) return;
+
+    nameHeader.getBoundingClientRect = vi.fn(() => ({
+      x: 60,
+      y: 0,
+      width: 80,
+      height: 28,
+      left: 60,
+      top: 0,
+      right: 140,
+      bottom: 28,
+      toJSON: () => {},
+    }));
+
+    const startX = 100;
+    fireEvent.mouseDown(nameHeader, {
+      clientX: startX,
+      clientY: 14,
+      buttons: 1,
+    });
+    fireEvent.mouseMove(document, {
+      clientX: startX + 10,
+      clientY: 14,
+      buttons: 1,
+    });
+    fireEvent.mouseMove(document, {
+      clientX: startX + 30,
+      clientY: 14,
+      buttons: 1,
+    });
+    fireEvent.mouseUp(document, { clientX: startX + 30, buttons: 0 });
+
+    const sortIcon = nameHeader?.querySelector(
+      'svg, [data-testid="sort-icon"]',
+    );
+    expect(sortIcon).toBeNull();
+  });
+
+  it("allows sorting via simple click without drag", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <TableGrid
+        mode="query"
+        status="success"
+        result={{
+          columns: ["id", "name"],
+          columnMeta: [],
+          rows: [
+            { __col_0: 1, __col_1: "Alice" },
+            { __col_0: 2, __col_1: "Bob" },
+          ],
+          rowCount: 2,
+          executionTimeMs: 5,
+        }}
+      />,
+    );
+
+    const nameHeader = screen.getByText("name").closest("th");
+    expect(nameHeader).toBeTruthy();
+    if (!nameHeader) return;
+
+    await user.click(nameHeader);
+
+    const table = screen.getByRole("table");
+    const cells = Array.from(table.querySelectorAll("tbody td"));
+    const nameCells = cells.filter((_, i) => i % 2 === 1);
+    const names = nameCells.map((td) => td.textContent);
+
+    expect(names).toEqual(["Alice", "Bob"]);
   });
 });

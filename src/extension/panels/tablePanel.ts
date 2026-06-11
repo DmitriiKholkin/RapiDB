@@ -18,6 +18,7 @@ import {
   normalizeUnknownError,
 } from "../utils/errorHandling";
 import {
+  type ChunkedExportData,
   exportTableDataAsCsv,
   exportTableDataAsJson,
 } from "../utils/exportService";
@@ -58,6 +59,7 @@ type ExportPayload = {
   sort?: unknown;
   filters?: unknown[];
   limitToPage?: { page: number; pageSize: number };
+  columnOrder?: string[];
 };
 
 export class TablePanel {
@@ -579,31 +581,39 @@ export class TablePanel {
     format: "csv" | "json",
     payload: ExportPayload | undefined,
   ): Promise<void> {
-    const { sort = null, filters = [], limitToPage } = payload ?? {};
+    const {
+      sort = null,
+      filters = [],
+      limitToPage,
+      columnOrder,
+    } = payload ?? {};
     const normalizedLimitToPage = limitToPage
       ? this.normalizePageRequest(limitToPage.page, limitToPage.pageSize)
       : undefined;
     const fileName = this.schema ? `${this.schema}_${this.table}` : this.table;
     const filterExpressions = coerceFilterExpressions(filters);
     const loadChunks = (signal: AbortSignal) =>
-      normalizedLimitToPage
-        ? this._pageAsChunks(
-            normalizedLimitToPage.page,
-            normalizedLimitToPage.pageSize,
-            sort as SortConfig | null,
-            filterExpressions,
-            signal,
-          )
-        : this.svc.exportAll(
-            this.connectionId,
-            this.database,
-            this.schema,
-            this.table,
-            EXPORT_CHUNK_SIZE,
-            sort as SortConfig | null,
-            filterExpressions,
-            signal,
-          );
+      this.reorderChunks(
+        normalizedLimitToPage
+          ? this._pageAsChunks(
+              normalizedLimitToPage.page,
+              normalizedLimitToPage.pageSize,
+              sort as SortConfig | null,
+              filterExpressions,
+              signal,
+            )
+          : this.svc.exportAll(
+              this.connectionId,
+              this.database,
+              this.schema,
+              this.table,
+              EXPORT_CHUNK_SIZE,
+              sort as SortConfig | null,
+              filterExpressions,
+              signal,
+            ),
+        columnOrder,
+      );
 
     if (format === "csv") {
       await exportTableDataAsCsv({
@@ -619,6 +629,42 @@ export class TablePanel {
       loadChunks,
       context: this.context,
     });
+  }
+
+  private async *reorderChunks(
+    chunks: AsyncIterable<ChunkedExportData>,
+    columnOrder?: string[],
+  ): AsyncIterable<ChunkedExportData> {
+    if (!columnOrder || columnOrder.length === 0) {
+      yield* chunks;
+      return;
+    }
+
+    for await (const chunk of chunks) {
+      const colIndex = new Map(chunk.columns.map((col, i) => [col.name, i]));
+      const reorderedColumns: Array<(typeof chunk.columns)[number]> = [];
+      for (const colId of columnOrder) {
+        const idx = colIndex.get(colId);
+        if (idx !== undefined) {
+          reorderedColumns.push(chunk.columns[idx]);
+        }
+      }
+
+      if (reorderedColumns.length === 0) {
+        yield chunk;
+        continue;
+      }
+
+      const reorderedRows = chunk.rows.map((row) => {
+        const newRow: Record<string, unknown> = {};
+        for (const col of reorderedColumns) {
+          newRow[col.name] = row[col.name];
+        }
+        return newRow;
+      });
+
+      yield { columns: reorderedColumns, rows: reorderedRows };
+    }
   }
 
   private async *_pageAsChunks(

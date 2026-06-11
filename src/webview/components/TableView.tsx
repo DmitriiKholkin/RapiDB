@@ -69,6 +69,12 @@ export function TableView({
   const [exportChoice, setExportChoice] = useState<ExportChoiceState | null>(
     null,
   );
+  const columnOrderRef = useRef<string[]>([]);
+  const hiddenColumnIdsRef = useRef<Set<string>>(new Set());
+  const getExportColumnOrder = () =>
+    columnOrderRef.current.filter(
+      (id) => id !== "__sel" && !hiddenColumnIdsRef.current.has(id),
+    );
 
   const data = useTableDataController({
     initialPageSize,
@@ -209,6 +215,7 @@ export function TableView({
           postMessage(resolveTableExportMessageType(format), {
             sort: data.sort,
             filters,
+            columnOrder: getExportColumnOrder(),
           });
         }}
         onRefresh={data.fetchPage}
@@ -235,6 +242,8 @@ export function TableView({
 
       <TableGrid
         key={data.columns.map((column) => column.name).join("|")}
+        columnOrderRef={columnOrderRef}
+        hiddenColumnIdsRef={hiddenColumnIdsRef}
         canEditRows={canEditRows}
         canSelectAndDeleteRows={canSelectAndDeleteRows}
         colSizes={data.colSizes}
@@ -300,6 +309,7 @@ export function TableView({
           postMessage(resolveTableExportMessageType(exportChoice.format), {
             sort: exportChoice.sort,
             filters: exportChoice.filters,
+            columnOrder: getExportColumnOrder(),
           });
           setExportChoice(null);
         }}
@@ -315,6 +325,7 @@ export function TableView({
               page: data.page,
               pageSize: data.pageSize,
             },
+            columnOrder: getExportColumnOrder(),
           });
           setExportChoice(null);
         }}

@@ -513,11 +513,11 @@ describe("TableView", () => {
     expect(getPostedMessages()).toEqual([
       {
         type: "exportCSV",
-        payload: { sort: null, filters: [] },
+        payload: { sort: null, filters: [], columnOrder: ["id", "name"] },
       },
       {
         type: "exportJSON",
-        payload: { sort: null, filters: [] },
+        payload: { sort: null, filters: [], columnOrder: ["id", "name"] },
       },
     ]);
   });
@@ -546,6 +546,7 @@ describe("TableView", () => {
             page: 1,
             pageSize: 25,
           },
+          columnOrder: ["id", "name"],
         },
       },
     ]);

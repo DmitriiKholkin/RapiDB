@@ -197,8 +197,14 @@ export type QueryPanelMessage =
     >
   | WebviewMessageEnvelope<"getConnections">
   | WebviewMessageEnvelope<"getSchema", { connectionId?: string }>
-  | WebviewMessageEnvelope<"exportResultsCSV">
-  | WebviewMessageEnvelope<"exportResultsJSON">
+  | WebviewMessageEnvelope<
+      "exportResultsCSV",
+      { columnOrder?: string[]; sort?: { column: string; desc: boolean }[] }
+    >
+  | WebviewMessageEnvelope<
+      "exportResultsJSON",
+      { columnOrder?: string[]; sort?: { column: string; desc: boolean }[] }
+    >
   | WebviewMessageEnvelope<"readClipboard">
   | WebviewMessageEnvelope<"writeClipboard", { text: string }>
   | WebviewMessageEnvelope<
@@ -260,6 +266,7 @@ export type TablePanelMessage =
         sort?: unknown;
         filters?: unknown[];
         limitToPage?: { page: number; pageSize: number };
+        columnOrder?: string[];
       }
     >
   | WebviewMessageEnvelope<
@@ -268,6 +275,7 @@ export type TablePanelMessage =
         sort?: unknown;
         filters?: unknown[];
         limitToPage?: { page: number; pageSize: number };
+        columnOrder?: string[];
       }
     >
   | WebviewMessageEnvelope<
@@ -835,10 +843,14 @@ export function parseQueryPanelMessage(
     }
 
     case "getConnections":
-    case "exportResultsCSV":
-    case "exportResultsJSON":
     case "readClipboard":
       return { type: envelope.type };
+
+    case "exportResultsCSV":
+    case "exportResultsJSON": {
+      const payload = parseOptionalPayloadRecord(envelope);
+      return { type: envelope.type, payload: payload ?? undefined };
+    }
 
     case "writeClipboard": {
       const payload = parseEnvelopeTextPayload(envelope);
@@ -975,12 +987,20 @@ export function parseTablePanelMessage(
           limitToPage = { page, pageSize };
         }
       }
+      let columnOrder: string[] | undefined;
+      if (Array.isArray(payload.columnOrder)) {
+        columnOrder = payload.columnOrder.filter(
+          (v): v is string => typeof v === "string",
+        );
+        if (columnOrder.length === 0) columnOrder = undefined;
+      }
       return {
         type: envelope.type,
         payload: {
           sort: payload.sort,
           filters: payload.filters as unknown[] | undefined,
           limitToPage,
+          columnOrder,
         },
       };
     }
