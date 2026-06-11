@@ -20,6 +20,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -49,6 +53,10 @@ jobs:
               echo "::error::Custom version is required when bump type is 'custom'"
               exit 1
             fi
+            if ! [[ "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+              echo "::error::Invalid semver: $NEW_VERSION"
+              exit 1
+            fi
           else
             IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
             case "$BUMP" in
@@ -74,27 +82,37 @@ jobs:
           "
           echo "package.json version set to $NEW_VERSION"
 
+      - name: Sync package-lock.json
+        run: npm install --package-lock-only --no-audit --no-fund
+
       - name: Generate changelog
         id: changelog
         run: |
-          CURRENT_TAG="v${{ steps.version.outputs.current }}"
           NEW_TAG="${{ steps.version.outputs.tag }}"
 
+          # Use last existing tag from history (not the version from package.json,
+          # which is the *pre-bump* value and may not match a real release tag)
+          CURRENT_TAG=$(git describe --tags --abbrev=0 HEAD 2>/dev/null || echo "")
+
           # Get commits since last tag (or all commits if no tags exist)
-          if git rev-parse "$CURRENT_TAG" >/dev/null 2>&1; then
+          if [ -n "$CURRENT_TAG" ] && git rev-parse "$CURRENT_TAG" >/dev/null 2>&1; then
             LOG=$(git log "$CURRENT_TAG"..HEAD --pretty=format:"- %s (%h)" --no-merges)
+            COMPARE_URL="https://github.com/${{ github.repository }}/compare/$CURRENT_TAG...$NEW_TAG"
           else
             LOG=$(git log --pretty=format:"- %s (%h)" --no-merges -20)
+            COMPARE_URL=""
           fi
 
           # Write changelog to file (multiline output)
-          echo "## What's Changed" > /tmp/changelog.md
-          echo "" >> /tmp/changelog.md
-          echo "$LOG" >> /tmp/changelog.md
-          echo "" >> /tmp/changelog.md
-          echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/$CURRENT_TAG...$NEW_TAG" >> /tmp/changelog.md
+          echo "## What's Changed" > "$GITHUB_WORKSPACE/.changelog.md"
+          echo "" >> "$GITHUB_WORKSPACE/.changelog.md"
+          echo "$LOG" >> "$GITHUB_WORKSPACE/.changelog.md"
+          if [ -n "$COMPARE_URL" ]; then
+            echo "" >> "$GITHUB_WORKSPACE/.changelog.md"
+            echo "**Full Changelog**: $COMPARE_URL" >> "$GITHUB_WORKSPACE/.changelog.md"
+          fi
 
-          cat /tmp/changelog.md
+          cat "$GITHUB_WORKSPACE/.changelog.md"
 
       - name: Build extension
         run: npm run vscode:prepublish
@@ -129,7 +147,7 @@ jobs:
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
-          body_path: /tmp/changelog.md
+          body_path: ${{ github.workspace }}/.changelog.md
           files: ${{ steps.package.outputs.vsix }}
           generate_release_notes: false
         env:
