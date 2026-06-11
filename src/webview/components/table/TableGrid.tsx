@@ -36,6 +36,7 @@ import {
   calcColWidths,
   type Column as SizingColumn,
 } from "../../utils/columnSizing";
+import { isEditableElement } from "../../utils/editableElement";
 import { onMessage, postMessage } from "../../utils/messaging";
 import {
   type PasteValidationError,
@@ -886,9 +887,8 @@ function TableDataGrid({
     const handlePasteEvent = (event: ClipboardEvent) => {
       const target = event.target as HTMLElement | null;
       if (
-        target?.tagName === "INPUT" ||
-        target?.tagName === "TEXTAREA" ||
-        target?.isContentEditable
+        isEditableElement(target) ||
+        isEditableElement(document.activeElement)
       ) {
         return;
       }

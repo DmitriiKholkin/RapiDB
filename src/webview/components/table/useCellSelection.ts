@@ -1,5 +1,6 @@
 import type { MutableRefObject } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { isEditableElement } from "../../utils/editableElement";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
 
 export interface CellRange {
@@ -332,17 +333,26 @@ export function useCellSelection({
     const currentOnCopy = onCopyRef.current;
     const currentOnPaste = onPasteRef.current;
 
+    const target = event.target as HTMLElement | null;
+    const isCut = event.key === "x" || event.key === "X";
+    const isCopy = event.key === "c" || event.key === "C";
+    const isPaste = event.key === "v" || event.key === "V";
+    const isClipboardShortcut =
+      (isCopy || isCut || isPaste) && (event.ctrlKey || event.metaKey);
+
+    if (
+      isEditableElement(target) ||
+      isEditableElement(document.activeElement)
+    ) {
+      return;
+    }
+
     if (!currentRange) {
       return;
     }
 
-    const target = event.target as HTMLElement;
-    if (
-      target.tagName === "INPUT" ||
-      target.tagName === "TEXTAREA" ||
-      target.isContentEditable
-    ) {
-      return;
+    if (isClipboardShortcut) {
+      event.stopPropagation();
     }
 
     const { activeRow, activeCol } = currentRange;
@@ -434,6 +444,19 @@ export function useCellSelection({
       }
       case "c":
       case "C": {
+        if (event.ctrlKey || event.metaKey) {
+          event.preventDefault();
+          const text = serializeToTsv(currentRange, currentGetCellValue);
+          if (text && currentOnCopy) {
+            currentOnCopy(text);
+          } else if (text) {
+            navigator.clipboard.writeText(text).catch(() => {});
+          }
+        }
+        break;
+      }
+      case "x":
+      case "X": {
         if (event.ctrlKey || event.metaKey) {
           event.preventDefault();
           const text = serializeToTsv(currentRange, currentGetCellValue);
