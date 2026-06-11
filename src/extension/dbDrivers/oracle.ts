@@ -2229,7 +2229,7 @@ export class OracleDriver extends BaseDBDriver {
       if (value instanceof Date && !Number.isNaN(value.getTime())) {
         const typeName = oracleTypeName(column.nativeType);
         if (typeName === "DATE") {
-          const temporalText = oracleTimestampPreviewText(value, false).slice(
+          const temporalText = oracleTimestampPreviewText(value, true).slice(
             0,
             19,
           );
@@ -2321,6 +2321,12 @@ export class OracleDriver extends BaseDBDriver {
         ),
       });
       if (parsed) return parsed;
+      const trimmed = value.trim();
+      const dateOnlyMatch = /^\d{4}-\d{2}-\d{2}$/.test(trimmed);
+      if (dateOnlyMatch) {
+        const dateParsed = new Date(`${trimmed}T00:00:00Z`);
+        if (!Number.isNaN(dateParsed.getTime())) return dateParsed;
+      }
     }
     return value;
   }
