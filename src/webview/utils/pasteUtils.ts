@@ -1,3 +1,4 @@
+import { normalizeNumericToken } from "../../shared/numericNormalization";
 import type { ColumnTypeMeta } from "../../shared/tableTypes";
 import { NULL_SENTINEL } from "../../shared/tableTypes";
 
@@ -18,6 +19,17 @@ export interface PasteValidationError {
   columnName: string;
   value: string;
   message: string;
+}
+
+export interface PasteValidationResult {
+  errors: PasteValidationError[];
+  rows: Array<
+    Array<{
+      column: ColumnTypeMeta;
+      value: string;
+      normalized: unknown;
+    }>
+  >;
 }
 
 export function parseTsv(text: string): PasteData {
@@ -52,6 +64,10 @@ export function validatePasteValue(
     case "integer":
     case "float":
     case "decimal": {
+      const normalized = normalizeNumericToken(value);
+      if (normalized !== null) {
+        return { valid: true, coercedValue: normalized };
+      }
       const num = Number(value);
       if (Number.isNaN(num)) {
         return {
@@ -119,12 +135,14 @@ export function validatePasteData(
   startCol: number,
   columns: ColumnTypeMeta[],
   totalRows: number,
-): PasteValidationError[] {
+): PasteValidationResult {
   const errors: PasteValidationError[] = [];
+  const rows: PasteValidationResult["rows"] = [];
 
   for (let r = 0; r < pasteData.rows.length; r++) {
     const row = pasteData.rows[r];
     const targetRow = startRow + r;
+    const normalizedRow: PasteValidationResult["rows"][number] = [];
 
     if (targetRow >= totalRows) {
       errors.push({
@@ -134,6 +152,7 @@ export function validatePasteData(
         value: "",
         message: `Paste would exceed table bounds (row ${targetRow + 1} does not exist)`,
       });
+      rows.push(normalizedRow);
       continue;
     }
 
@@ -175,9 +194,44 @@ export function validatePasteData(
           value,
           message: validation.error ?? "Validation failed",
         });
+        continue;
       }
+
+      normalizedRow.push({
+        column,
+        value,
+        normalized: validation.coercedValue,
+      });
     }
+
+    rows.push(normalizedRow);
   }
 
-  return errors;
+  return { errors, rows };
+}
+
+export function formatNormalizedPasteValue(
+  originalValue: string,
+  normalized: unknown,
+): string {
+  if (
+    originalValue === "" ||
+    originalValue === NULL_SENTINEL ||
+    originalValue === "NULL"
+  ) {
+    return NULL_SENTINEL;
+  }
+  if (normalized === null || normalized === undefined) {
+    return originalValue;
+  }
+  if (typeof normalized === "string") {
+    return normalized;
+  }
+  if (typeof normalized === "number" || typeof normalized === "boolean") {
+    return String(normalized);
+  }
+  if (typeof normalized === "bigint") {
+    return normalized.toString();
+  }
+  return originalValue;
 }

@@ -1,4 +1,5 @@
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
+import { normalizeNumericToken } from "../../shared/numericNormalization";
 import { normalizeBinaryHexDisplayPrefix } from "../../shared/tableTypes";
 import type {
   QueryEditorPresentation,
@@ -276,54 +277,8 @@ function hasValidDateTimeParts(value: string): boolean {
 function invalidFilterInputError(columnName: string, expected: string): Error {
   return new Error(`[RapiDB Filter] Column ${columnName} expects ${expected}.`);
 }
-function stripCurrencyAffixes(rawValue: string): string {
-  let value = rawValue.trim();
-  value = value.replace(/^[\p{Sc}\s]+/gu, "");
-  value = value.replace(/[\p{Sc}\s]+$/gu, "");
-  if (/^[A-Za-z]{3}(?=\s|[+-]?\d|\.)/.test(value)) {
-    value = value.slice(3).trim();
-  }
-  if (/(?:\d|\.)[A-Za-z]{3}$/.test(value)) {
-    value = value.slice(0, -3).trim();
-  }
-  return value;
-}
 function normalizeNumericFilterToken(rawValue: string): string | null {
-  let value = rawValue.trim();
-  if (value === "") return null;
-  let isNegative = false;
-  const wrappedNegative = /^\((.*)\)$/.exec(value);
-  if (wrappedNegative) {
-    isNegative = true;
-    value = wrappedNegative[1].trim();
-  }
-  value = stripCurrencyAffixes(value);
-  value = value.replace(/\s+/g, "");
-  if (value.includes("'")) {
-    const apostropheGroupedNumberPattern =
-      /^[+-]?(?:\d{1,3}(?:'\d{3})+)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
-    if (!apostropheGroupedNumberPattern.test(value)) {
-      return null;
-    }
-    value = value.replace(/'/g, "");
-  }
-  if (value.includes(",")) {
-    const groupedNumberPattern =
-      /^[+-]?(?:\d{1,3}(?:,\d{3})+)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
-    if (!groupedNumberPattern.test(value)) {
-      return null;
-    }
-    value = value.replace(/,/g, "");
-  }
-  if (isNegative) {
-    value = `-${value.replace(/^[+-]/, "")}`;
-  }
-  const numericPattern = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/;
-  if (!numericPattern.test(value)) {
-    return null;
-  }
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? value : null;
+  return normalizeNumericToken(rawValue);
 }
 function splitNumericFilterInList(rawValue: string): string[] {
   const input = rawValue.trim();

@@ -39,6 +39,7 @@ import {
 import { isEditableElement } from "../../utils/editableElement";
 import { onMessage, postMessage } from "../../utils/messaging";
 import {
+  formatNormalizedPasteValue,
   type PasteValidationError,
   parseTsv,
   validatePasteData,
@@ -945,6 +946,12 @@ function TableDataGrid({
         if (!draft) return;
 
         const errors: PasteValidationError[] = [];
+        const normalizedCells: Array<{
+          targetRow: number;
+          column: ColumnMeta;
+          value: string;
+          normalized: unknown;
+        }> = [];
 
         for (let r = 0; r < pasteData.rows.length; r++) {
           const row = pasteData.rows[r];
@@ -976,7 +983,15 @@ function TableDataGrid({
                 value,
                 message: `Row ${targetRow + 1} does not exist`,
               });
+              continue;
             }
+
+            normalizedCells.push({
+              targetRow,
+              column,
+              value,
+              normalized: validation.coercedValue,
+            });
           }
         }
 
@@ -999,30 +1014,22 @@ function TableDataGrid({
           newVal: string;
         }> = [];
 
-        for (let r = 0; r < pasteData.rows.length; r++) {
-          const row = pasteData.rows[r];
-          const targetRow = startRow + r;
+        for (const cell of normalizedCells) {
+          const coercedValue = formatNormalizedPasteValue(
+            cell.value,
+            cell.normalized,
+          );
 
-          for (let c = 0; c < row.length; c++) {
-            const value = row[c];
-            const targetCol = startCol + c;
-            const column = columns[targetCol];
-            if (!column) continue;
-
-            const coercedValue =
-              value === "" || value === "NULL" ? NULL_SENTINEL : value;
-
-            if (targetRow === -1) {
-              draftEdits.push({ column, newVal: coercedValue });
-            } else {
-              const originalValue = rows[targetRow]?.[column.name];
-              batchEdits.push({
-                rowIdx: targetRow,
-                column,
-                newVal: coercedValue,
-                originalVal: originalValue,
-              });
-            }
+          if (cell.targetRow === -1) {
+            draftEdits.push({ column: cell.column, newVal: coercedValue });
+          } else {
+            const originalValue = rows[cell.targetRow]?.[cell.column.name];
+            batchEdits.push({
+              rowIdx: cell.targetRow,
+              column: cell.column,
+              newVal: coercedValue,
+              originalVal: originalValue,
+            });
           }
         }
 
@@ -1037,7 +1044,7 @@ function TableDataGrid({
         return;
       }
 
-      const errors = validatePasteData(
+      const validationResult = validatePasteData(
         pasteData,
         startRow,
         startCol,
@@ -1045,8 +1052,8 @@ function TableDataGrid({
         rows.length,
       );
 
-      if (errors.length > 0) {
-        setPasteErrors(errors);
+      if (validationResult.errors.length > 0) {
+        setPasteErrors(validationResult.errors);
         return;
       }
 
@@ -1059,24 +1066,20 @@ function TableDataGrid({
         originalVal: unknown;
       }> = [];
 
-      for (let r = 0; r < pasteData.rows.length; r++) {
-        const row = pasteData.rows[r];
+      for (let r = 0; r < validationResult.rows.length; r++) {
+        const normalizedRow = validationResult.rows[r];
         const targetRow = startRow + r;
 
-        for (let c = 0; c < row.length; c++) {
-          const value = row[c];
-          const targetCol = startCol + c;
-          const column = columns[targetCol];
-
-          if (!column) continue;
-
-          const originalValue = rows[targetRow]?.[column.name];
-          const coercedValue =
-            value === "" || value === "NULL" ? NULL_SENTINEL : value;
+        for (const cell of normalizedRow) {
+          const originalValue = rows[targetRow]?.[cell.column.name];
+          const coercedValue = formatNormalizedPasteValue(
+            cell.value,
+            cell.normalized,
+          );
 
           edits.push({
             rowIdx: targetRow,
-            column,
+            column: cell.column,
             newVal: coercedValue,
             originalVal: originalValue,
           });
