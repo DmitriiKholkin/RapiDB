@@ -616,9 +616,9 @@
         "rapidb.queryRowLimit": {
           "type": "number",
           "default": 10000,
-          "minimum": 100,
+          "minimum": 10,
           "maximum": 100000,
-          "description": "Maximum number of rows returned by a query in the SQL editor. If the result exceeds this limit, rows are trimmed and a warning is shown. Range: 100–100 000. Set to 100000 to effectively disable the limit.",
+          "description": "Maximum number of rows returned by a query in the SQL editor. If the result exceeds this limit, rows are trimmed and a warning is shown. Range: 10–100 000. Set to 100000 to effectively disable the limit.",
           "scope": "application"
         },
         "rapidb.connectionTimeoutSeconds": {
@@ -640,9 +640,9 @@
         "rapidb.queryHistoryLimit": {
           "type": "number",
           "default": 100,
-          "minimum": 1,
+          "minimum": 0,
           "maximum": 10000,
-          "description": "Maximum number of queries stored in history (shared across all connections). Must be between 1 and 10000. If you lower this value, excess entries are trimmed immediately.",
+          "description": "Maximum number of queries stored in history (shared across all connections). Range: 0–10000. Set to 0 to disable history storage. If you lower this value, excess entries are trimmed immediately.",
           "scope": "application"
         },
         "rapidb.defaultPageSize": {

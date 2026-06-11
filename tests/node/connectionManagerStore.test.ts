@@ -131,7 +131,7 @@ describe("VSCodeConnectionManagerStore", () => {
       },
     } as never);
 
-    expect(store.getQueryRowLimit()).toBe(100);
+    expect(store.getQueryRowLimit()).toBe(10);
   });
 
   it("reads skipTableMutationPreview from the rapidb configuration", async () => {

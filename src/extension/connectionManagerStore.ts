@@ -215,7 +215,7 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
     const raw = vscode.workspace
       .getConfiguration("rapidb")
       .get<number>("queryHistoryLimit", HISTORY_LIMIT_DEFAULT);
-    return Math.max(1, Math.min(HISTORY_LIMIT_MAX, Math.round(raw)));
+    return Math.max(0, Math.min(HISTORY_LIMIT_MAX, Math.round(raw)));
   }
 
   getDefaultPageSize(): number {
@@ -229,7 +229,7 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
     const raw = vscode.workspace
       .getConfiguration("rapidb")
       .get<number>("queryRowLimit", 1000);
-    return Math.max(100, Math.min(QUERY_LIMIT_POLICY.hardCap, Math.round(raw)));
+    return Math.max(10, Math.min(QUERY_LIMIT_POLICY.hardCap, Math.round(raw)));
   }
 
   getSkipTableMutationPreview(): boolean {

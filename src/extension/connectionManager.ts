@@ -777,6 +777,13 @@ export class ConnectionManager
   private async _trimHistoryToLimit(): Promise<void> {
     const limit = this.getHistoryLimit();
     const all = this.store.readHistory();
+    if (limit === 0) {
+      if (all.length > 0) {
+        await this.store.writeHistory([]);
+        this._onDidChangeHistory.fire();
+      }
+      return;
+    }
     if (all.length > limit) {
       await this.store.writeHistory(all.slice(0, limit));
       this._onDidChangeHistory.fire();
@@ -3321,6 +3328,9 @@ export class ConnectionManager
   async addToHistory(connectionId: string, sql: string): Promise<void> {
     const trimmed = sql.trim();
     if (!trimmed) {
+      return;
+    }
+    if (this.getHistoryLimit() === 0) {
       return;
     }
     const all = this.store.readHistory();
