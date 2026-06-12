@@ -1577,6 +1577,7 @@ function TableDataGrid({
                 return (
                   <th
                     key={`${header.id}_f`}
+                    data-column-id={header.column.id}
                     style={{
                       width: displayHeaderSize,
                       height: FILTER_H,
