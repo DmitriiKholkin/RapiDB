@@ -731,6 +731,7 @@ const QueryTableRow = React.memo(function QueryTableRow({
         return (
           <td
             key={cell.id}
+            data-column-id={cell.column.id}
             data-row={index}
             data-col={columnIndex}
             className={cellClasses.join(" ")}

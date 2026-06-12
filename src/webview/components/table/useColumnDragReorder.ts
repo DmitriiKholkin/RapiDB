@@ -249,6 +249,11 @@ function findNeighborUnderCursor(
         const id = th.getAttribute("data-column-id");
         if (id && id !== excludeId) return id;
       }
+      const tdWithId = elementUnder.closest("td[data-column-id]");
+      if (tdWithId) {
+        const id = tdWithId.getAttribute("data-column-id");
+        if (id && id !== excludeId) return id;
+      }
       const td = elementUnder.closest("td[data-col]");
       if (td) {
         const colIndex = Number.parseInt(td.getAttribute("data-col") ?? "", 10);
