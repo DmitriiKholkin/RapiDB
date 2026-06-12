@@ -200,6 +200,63 @@ describe("TableGrid query mode", () => {
     expect(screen.getByText("Alice")).toBeTruthy();
   });
 
+  it("does not start a column drag when the user grabs the resize handle", () => {
+    render(
+      <TableGrid
+        mode="query"
+        status="success"
+        result={{
+          columns: ["id", "name", "email"],
+          columnMeta: [],
+          rows: [
+            {
+              __col_0: 1,
+              __col_1: "Alice",
+              __col_2: "alice@test.com",
+            },
+          ],
+          rowCount: 1,
+          executionTimeMs: 5,
+        }}
+      />,
+    );
+
+    const table = screen.getByRole("table");
+    const initialHeaders = Array.from(
+      table.querySelectorAll("thead tr:first-child th"),
+    ).map((th) => th.textContent);
+    expect(initialHeaders).toEqual(["id", "name", "email"]);
+
+    const resizeHandle = screen.getByRole("button", {
+      name: "Resize name column",
+    });
+
+    fireEvent.mouseDown(resizeHandle, {
+      clientX: 100,
+      clientY: 14,
+      buttons: 1,
+    });
+    fireEvent.mouseMove(document, {
+      clientX: 110,
+      clientY: 14,
+      buttons: 1,
+    });
+    fireEvent.mouseMove(document, {
+      clientX: 250,
+      clientY: 14,
+      buttons: 1,
+    });
+
+    expect(document.querySelector(".rapidb-column-drag-ghost")).toBeNull();
+
+    fireEvent.mouseUp(document, { clientX: 250, clientY: 14, buttons: 0 });
+
+    const finalHeaders = Array.from(
+      table.querySelectorAll("thead tr:first-child th"),
+    ).map((th) => th.textContent);
+    expect(finalHeaders).toEqual(["id", "name", "email"]);
+  });
+
   it("posts exportResults messages from result toolbar actions", async () => {
     const user = userEvent.setup();
 
@@ -428,5 +485,307 @@ describe("TableGrid query mode", () => {
     const names = nameCells.map((td) => td.textContent);
 
     expect(names).toEqual(["Alice", "Bob"]);
+  });
+
+  it("still sorts on a click that follows a completed drag", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <TableGrid
+        mode="query"
+        status="success"
+        result={{
+          columns: ["id", "name"],
+          columnMeta: [],
+          rows: [
+            { __col_0: 1, __col_1: "Charlie" },
+            { __col_0: 2, __col_1: "Alice" },
+            { __col_0: 3, __col_1: "Bob" },
+          ],
+          rowCount: 3,
+          executionTimeMs: 5,
+        }}
+      />,
+    );
+
+    const table = screen.getByRole("table");
+    const nameHeader = Array.from(
+      table.querySelectorAll("thead tr:first-child th"),
+    ).find((th) => th.textContent === "name");
+    const idHeader = Array.from(
+      table.querySelectorAll("thead tr:first-child th"),
+    ).find((th) => th.textContent === "id");
+    expect(nameHeader).toBeTruthy();
+    expect(idHeader).toBeTruthy();
+    if (!nameHeader || !idHeader) return;
+
+    (nameHeader as HTMLElement).getBoundingClientRect = vi.fn(() => ({
+      x: 0,
+      y: 0,
+      width: 50,
+      height: 28,
+      left: 0,
+      top: 0,
+      right: 50,
+      bottom: 28,
+      toJSON: () => ({}),
+    }));
+    (idHeader as HTMLElement).getBoundingClientRect = vi.fn(() => ({
+      x: 50,
+      y: 0,
+      width: 50,
+      height: 28,
+      left: 50,
+      top: 0,
+      right: 100,
+      bottom: 28,
+      toJSON: () => ({}),
+    }));
+
+    fireEvent.mouseDown(nameHeader, {
+      clientX: 25,
+      clientY: 14,
+      buttons: 1,
+    });
+    fireEvent.mouseMove(document, {
+      clientX: 90,
+      clientY: 14,
+      buttons: 1,
+    });
+    fireEvent.mouseUp(document, { clientX: 90, clientY: 14, buttons: 0 });
+
+    const newNameHeader = Array.from(
+      table.querySelectorAll("thead tr:first-child th"),
+    ).find((th) => th.textContent === "name");
+    expect(newNameHeader).toBeTruthy();
+    if (!newNameHeader) return;
+    await user.click(newNameHeader);
+
+    const cells = Array.from(table.querySelectorAll("tbody td"));
+    const nameCells = cells.filter((_, i) => i % 2 === 1);
+    const names = nameCells.map((td) => td.textContent);
+    expect(names).toEqual(["Alice", "Bob", "Charlie"]);
+  });
+
+  it("does not flicker when dragging a column across a wider neighbor (center-line hysteresis)", () => {
+    render(
+      <TableGrid
+        mode="query"
+        status="success"
+        result={{
+          columns: ["id", "name", "email"],
+          columnMeta: [],
+          rows: [
+            {
+              __col_0: 1,
+              __col_1: "Alice",
+              __col_2: "alice@test.com",
+            },
+          ],
+          rowCount: 1,
+          executionTimeMs: 5,
+        }}
+      />,
+    );
+
+    const table = screen.getByRole("table");
+    const widths: Record<string, number> = {
+      __col_0: 40,
+      __col_1: 40,
+      __col_2: 200,
+    };
+
+    HTMLElement.prototype.getBoundingClientRect = vi.fn(function (
+      this: HTMLElement,
+    ) {
+      const id = this.getAttribute("data-column-id") ?? "";
+      const order = Array.from(
+        table.querySelectorAll("thead tr:first-child th"),
+      ).map((th) => th.getAttribute("data-column-id") ?? "");
+      const indexInOrder = order.indexOf(id);
+      if (indexInOrder === -1) {
+        return {
+          x: 0,
+          y: 0,
+          width: 0,
+          height: 28,
+          left: 0,
+          top: 0,
+          right: 0,
+          bottom: 28,
+          toJSON: () => ({}),
+        };
+      }
+      let cursor = 0;
+      for (let i = 0; i < indexInOrder; i++) {
+        cursor += widths[order[i]] ?? 100;
+      }
+      const w = widths[id] ?? 100;
+      return {
+        x: cursor,
+        y: 0,
+        width: w,
+        height: 28,
+        left: cursor,
+        top: 0,
+        right: cursor + w,
+        bottom: 28,
+        toJSON: () => ({}),
+      };
+    });
+
+    function getOrderedHeaders(): HTMLElement[] {
+      return Array.from(
+        table.querySelectorAll("thead tr:first-child th"),
+      ) as HTMLElement[];
+    }
+
+    expect(getOrderedHeaders().map((th) => th.textContent)).toEqual([
+      "id",
+      "name",
+      "email",
+    ]);
+
+    const nameHeader = getOrderedHeaders()[1];
+    fireEvent.mouseDown(nameHeader, {
+      clientX: 60,
+      clientY: 14,
+      buttons: 1,
+    });
+
+    fireEvent.mouseMove(document, {
+      clientX: 100,
+      clientY: 14,
+      buttons: 1,
+    });
+    fireEvent.mouseMove(document, {
+      clientX: 140,
+      clientY: 14,
+      buttons: 1,
+    });
+    let after = getOrderedHeaders().map((th) => th.textContent);
+    expect(after).toEqual(["id", "name", "email"]);
+
+    fireEvent.mouseMove(document, {
+      clientX: 220,
+      clientY: 14,
+      buttons: 1,
+    });
+    after = getOrderedHeaders().map((th) => th.textContent);
+    expect(after).toEqual(["id", "email", "name"]);
+
+    fireEvent.mouseMove(document, {
+      clientX: 240,
+      clientY: 14,
+      buttons: 1,
+    });
+    fireEvent.mouseMove(document, {
+      clientX: 260,
+      clientY: 14,
+      buttons: 1,
+    });
+    after = getOrderedHeaders().map((th) => th.textContent);
+    expect(after).toEqual(["id", "email", "name"]);
+
+    fireEvent.mouseUp(document, { clientX: 260, buttons: 0 });
+  });
+
+  it("reverses a previous swap when the cursor crosses the center back", () => {
+    render(
+      <TableGrid
+        mode="query"
+        status="success"
+        result={{
+          columns: ["id", "name", "email"],
+          columnMeta: [],
+          rows: [
+            {
+              __col_0: 1,
+              __col_1: "Alice",
+              __col_2: "alice@test.com",
+            },
+          ],
+          rowCount: 1,
+          executionTimeMs: 5,
+        }}
+      />,
+    );
+
+    const table = screen.getByRole("table");
+    const widths: Record<string, number> = {
+      __col_0: 40,
+      __col_1: 40,
+      __col_2: 200,
+    };
+
+    HTMLElement.prototype.getBoundingClientRect = vi.fn(function (
+      this: HTMLElement,
+    ) {
+      const id = this.getAttribute("data-column-id") ?? "";
+      const order = Array.from(
+        table.querySelectorAll("thead tr:first-child th"),
+      ).map((th) => th.getAttribute("data-column-id") ?? "");
+      const indexInOrder = order.indexOf(id);
+      if (indexInOrder === -1) {
+        return {
+          x: 0,
+          y: 0,
+          width: 0,
+          height: 28,
+          left: 0,
+          top: 0,
+          right: 0,
+          bottom: 28,
+          toJSON: () => ({}),
+        };
+      }
+      let cursor = 0;
+      for (let i = 0; i < indexInOrder; i++) {
+        cursor += widths[order[i]] ?? 100;
+      }
+      const w = widths[id] ?? 100;
+      return {
+        x: cursor,
+        y: 0,
+        width: w,
+        height: 28,
+        left: cursor,
+        top: 0,
+        right: cursor + w,
+        bottom: 28,
+        toJSON: () => ({}),
+      };
+    });
+
+    function getOrderedHeaders(): HTMLElement[] {
+      return Array.from(
+        table.querySelectorAll("thead tr:first-child th"),
+      ) as HTMLElement[];
+    }
+
+    const nameHeader = getOrderedHeaders()[1];
+    fireEvent.mouseDown(nameHeader, {
+      clientX: 60,
+      clientY: 14,
+      buttons: 1,
+    });
+
+    fireEvent.mouseMove(document, {
+      clientX: 220,
+      clientY: 14,
+      buttons: 1,
+    });
+    let after = getOrderedHeaders().map((th) => th.textContent);
+    expect(after).toEqual(["id", "email", "name"]);
+
+    fireEvent.mouseMove(document, {
+      clientX: 50,
+      clientY: 14,
+      buttons: 1,
+    });
+    after = getOrderedHeaders().map((th) => th.textContent);
+    expect(after).toEqual(["id", "name", "email"]);
+
+    fireEvent.mouseUp(document, { clientX: 50, buttons: 0 });
   });
 });

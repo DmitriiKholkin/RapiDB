@@ -69,6 +69,7 @@ import {
   tableButtonStyle,
 } from "./tableViewHelpers";
 import { useCellSelection } from "./useCellSelection";
+import { useColumnDragReorder } from "./useColumnDragReorder";
 
 const TABLE_ROW_STYLE_ID = "rapidb-table-row-style";
 if (
@@ -164,61 +165,6 @@ if (
   ].join("\n");
   document.head.appendChild(styleElement);
 }
-
-function findDragTargetColumnId(
-  clientX: number,
-  clientY: number,
-  excludeId: string | null,
-): string | null {
-  if (typeof document.elementFromPoint === "function") {
-    const ghostForHit = document.querySelector(
-      ".rapidb-column-drag-ghost",
-    ) as HTMLElement | null;
-    if (ghostForHit) ghostForHit.style.pointerEvents = "none";
-    const elementUnder = document.elementFromPoint(
-      clientX,
-      clientY,
-    ) as HTMLElement | null;
-    if (ghostForHit) ghostForHit.style.pointerEvents = "";
-
-    if (elementUnder) {
-      const th = elementUnder.closest("th[data-column-id]");
-      if (th) {
-        const id = th.getAttribute("data-column-id");
-        if (id && id !== excludeId) return id;
-      }
-      const td = elementUnder.closest("td[data-col]");
-      if (td) {
-        const colIndex = Number.parseInt(td.getAttribute("data-col") ?? "", 10);
-        if (!Number.isNaN(colIndex)) {
-          const order = getColumnOrderForHitTest();
-          const id = order[colIndex] ?? null;
-          if (id && id !== excludeId) return id;
-        }
-      }
-    }
-    return null;
-  }
-
-  const allThs = document.querySelectorAll("th[data-column-id]");
-  for (const th of Array.from(allThs)) {
-    if ((th as HTMLElement).style.cursor === "col-resize") continue;
-    const rect = th.getBoundingClientRect();
-    if (
-      clientX >= rect.left &&
-      clientX <= rect.right &&
-      clientY >= rect.top &&
-      clientY <= rect.bottom
-    ) {
-      const id = th.getAttribute("data-column-id");
-      if (id && id !== excludeId) return id;
-      break;
-    }
-  }
-  return null;
-}
-
-let getColumnOrderForHitTest: () => string[] = () => [];
 
 function isCollapsedWidth(width: number): boolean {
   return width <= 1;
@@ -395,10 +341,6 @@ function QueryResultsGrid({
 
   const colCount = colNames.length;
 
-  useEffect(() => {
-    getColumnOrderForHitTest = () => columnOrder;
-  });
-
   const getCellValue = useCallback(
     (rowIndex: number, colIndex: number) => {
       const row = rows[rowIndex];
@@ -494,104 +436,28 @@ function QueryResultsGrid({
 
   const handleSortingChange = React.useCallback<OnChangeFn<SortingState>>(
     (updater) => {
-      // Sorted position changes invalidate index-based active cell tracking.
       setActiveCell(null);
       setSorting(updater);
     },
     [setSorting],
   );
 
-  const isDraggingRef = React.useRef(false);
-  const dragStartXRef = React.useRef(0);
-  const dragColumnIdRef = React.useRef<string | null>(null);
   const wasDraggedRef = React.useRef(false);
+  const columnOrderRef = React.useRef(columnOrder);
+  columnOrderRef.current = columnOrder;
 
-  const handleDragMouseDown = React.useCallback(
-    (columnId: string, event: React.MouseEvent) => {
-      if (event.button !== 0) return;
-      dragColumnIdRef.current = columnId;
-      dragStartXRef.current = event.clientX;
-      wasDraggedRef.current = false;
-
-      const draggedTh = document.querySelector(
-        `th[data-column-id="${columnId}"]`,
-      );
-      if (draggedTh) {
-        draggedTh.setAttribute("data-column-dragging", "true");
-      }
-
-      const onMouseMove = (moveEvent: MouseEvent) => {
-        const delta = Math.abs(moveEvent.clientX - dragStartXRef.current);
-        if (delta > 4 && !isDraggingRef.current) {
-          isDraggingRef.current = true;
-          wasDraggedRef.current = true;
-          document.body.style.cursor = "grabbing";
-          document.body.style.userSelect = "none";
-          if (draggedTh) {
-            const rect = draggedTh.getBoundingClientRect();
-            const ghost = document.createElement("div");
-            ghost.className = "rapidb-column-drag-ghost";
-            ghost.innerHTML = draggedTh.innerHTML;
-            ghost.style.left = `${moveEvent.clientX}px`;
-            ghost.style.top = `${rect.top}px`;
-            ghost.style.width = `${rect.width}px`;
-            document.body.appendChild(ghost);
-            (draggedTh as HTMLElement).style.opacity = "0.3";
-          }
-        }
-
-        if (!isDraggingRef.current) return;
-
-        const ghost = document.querySelector(
-          ".rapidb-column-drag-ghost",
-        ) as HTMLElement | null;
-        if (ghost) {
-          const offset = draggedTh
-            ? moveEvent.clientX - draggedTh.getBoundingClientRect().left
-            : 0;
-          ghost.style.left = `${moveEvent.clientX - offset}px`;
-        }
-
-        const targetId = findDragTargetColumnId(
-          moveEvent.clientX,
-          moveEvent.clientY,
-          columnId,
-        );
-
-        if (targetId) {
-          setColumnOrder((previous) => {
-            const fromIndex = previous.indexOf(columnId);
-            const toIndex = previous.indexOf(targetId);
-            if (fromIndex === -1 || toIndex === -1 || fromIndex === toIndex)
-              return previous;
-
-            const nextOrder = [...previous];
-            nextOrder.splice(fromIndex, 1);
-            nextOrder.splice(toIndex, 0, columnId);
-            return nextOrder;
-          });
-        }
-      };
-
-      const onMouseUp = () => {
-        document.removeEventListener("mousemove", onMouseMove);
-        document.removeEventListener("mouseup", onMouseUp);
-        isDraggingRef.current = false;
-        document.body.style.cursor = "";
-        document.body.style.userSelect = "";
-        const ghost = document.querySelector(".rapidb-column-drag-ghost");
-        if (ghost) ghost.remove();
-        if (draggedTh) {
-          (draggedTh as HTMLElement).style.opacity = "";
-          draggedTh.removeAttribute("data-column-dragging");
-        }
-      };
-
-      document.addEventListener("mousemove", onMouseMove);
-      document.addEventListener("mouseup", onMouseUp);
+  const { onHeaderMouseDown: handleHeaderMouseDown } = useColumnDragReorder({
+    getColumnOrder: () => columnOrderRef.current,
+    setColumnOrder: (updater) => setColumnOrder(updater),
+    onDragActivated: () => {
+      wasDraggedRef.current = true;
     },
-    [setColumnOrder],
-  );
+    onDragEnded: (activated) => {
+      if (!activated) {
+        wasDraggedRef.current = false;
+      }
+    },
+  });
 
   const table = useReactTable({
     data: rows,
@@ -668,10 +534,12 @@ function QueryResultsGrid({
                         boxSizing: "border-box",
                       }}
                       onMouseDown={(event) =>
-                        handleDragMouseDown(header.id, event)
+                        handleHeaderMouseDown(header.id, event)
                       }
                       onClick={(event) => {
-                        if (!wasDraggedRef.current) {
+                        const wasDragged = wasDraggedRef.current;
+                        wasDraggedRef.current = false;
+                        if (!wasDragged) {
                           header.column.getToggleSortingHandler()?.(event);
                         }
                       }}
@@ -717,8 +585,14 @@ function QueryResultsGrid({
                       {header.column.getCanResize() && (
                         <ColumnResizeHandle
                           ariaLabel={`Resize ${typeof header.column.columnDef.header === "string" ? header.column.columnDef.header : header.column.id} column`}
-                          onMouseDown={header.getResizeHandler()}
-                          onTouchStart={header.getResizeHandler()}
+                          onMouseDown={(event) => {
+                            event.stopPropagation();
+                            header.getResizeHandler()(event);
+                          }}
+                          onTouchStart={(event) => {
+                            event.stopPropagation();
+                            header.getResizeHandler()(event);
+                          }}
                           onClick={(event) => event.stopPropagation()}
                           isResizing={header.column.getIsResizing()}
                         />
@@ -1052,10 +926,6 @@ function TableDataGrid({
   const newRowRef = useRef(newRow);
   newRowRef.current = newRow;
 
-  useEffect(() => {
-    getColumnOrderForHitTest = () => columnOrder;
-  });
-
   const dataColCount = columns.length;
   const selColOffset = canSelectAndDeleteRows ? 1 : 0;
   const totalColCount = dataColCount + selColOffset;
@@ -1354,97 +1224,21 @@ function TableDataGrid({
     ]);
   }, [columns, canSelectAndDeleteRows]);
 
-  const isDraggingRef = React.useRef(false);
-  const dragStartXRef = React.useRef(0);
-  const dragColumnIdRef = React.useRef<string | null>(null);
   const wasDraggedRef = React.useRef(false);
 
-  const handleDragMouseDown = React.useCallback(
-    (columnId: string, event: React.MouseEvent) => {
-      if (event.button !== 0 || columnId === "__sel") return;
-      dragColumnIdRef.current = columnId;
-      dragStartXRef.current = event.clientX;
-      wasDraggedRef.current = false;
-
-      const draggedTh = document.querySelector(
-        `th[data-column-id="${columnId}"]`,
-      );
-      if (draggedTh) {
-        draggedTh.setAttribute("data-column-dragging", "true");
-      }
-
-      const onMouseMove = (moveEvent: MouseEvent) => {
-        const delta = Math.abs(moveEvent.clientX - dragStartXRef.current);
-        if (delta > 4 && !isDraggingRef.current) {
-          isDraggingRef.current = true;
-          wasDraggedRef.current = true;
-          document.body.style.cursor = "grabbing";
-          document.body.style.userSelect = "none";
-          if (draggedTh) {
-            const rect = draggedTh.getBoundingClientRect();
-            const ghost = document.createElement("div");
-            ghost.className = "rapidb-column-drag-ghost";
-            ghost.innerHTML = draggedTh.innerHTML;
-            ghost.style.left = `${moveEvent.clientX}px`;
-            ghost.style.top = `${rect.top}px`;
-            ghost.style.width = `${rect.width}px`;
-            document.body.appendChild(ghost);
-            (draggedTh as HTMLElement).style.opacity = "0.3";
-          }
-        }
-
-        if (!isDraggingRef.current) return;
-
-        const ghost = document.querySelector(
-          ".rapidb-column-drag-ghost",
-        ) as HTMLElement | null;
-        if (ghost) {
-          const offset = draggedTh
-            ? moveEvent.clientX - draggedTh.getBoundingClientRect().left
-            : 0;
-          ghost.style.left = `${moveEvent.clientX - offset}px`;
-        }
-
-        const targetId = findDragTargetColumnId(
-          moveEvent.clientX,
-          moveEvent.clientY,
-          columnId,
-        );
-
-        if (targetId && targetId !== "__sel") {
-          setColumnOrder((previous) => {
-            const fromIndex = previous.indexOf(columnId);
-            const toIndex = previous.indexOf(targetId);
-            if (fromIndex === -1 || toIndex === -1 || fromIndex === toIndex)
-              return previous;
-
-            const nextOrder = [...previous];
-            nextOrder.splice(fromIndex, 1);
-            nextOrder.splice(toIndex, 0, columnId);
-            return nextOrder;
-          });
-        }
-      };
-
-      const onMouseUp = () => {
-        document.removeEventListener("mousemove", onMouseMove);
-        document.removeEventListener("mouseup", onMouseUp);
-        isDraggingRef.current = false;
-        document.body.style.cursor = "";
-        document.body.style.userSelect = "";
-        const ghost = document.querySelector(".rapidb-column-drag-ghost");
-        if (ghost) ghost.remove();
-        if (draggedTh) {
-          (draggedTh as HTMLElement).style.opacity = "";
-          draggedTh.removeAttribute("data-column-dragging");
-        }
-      };
-
-      document.addEventListener("mousemove", onMouseMove);
-      document.addEventListener("mouseup", onMouseUp);
+  const { onHeaderMouseDown: handleHeaderMouseDown } = useColumnDragReorder({
+    getColumnOrder: () => columnOrderRef.current,
+    setColumnOrder: (updater) => setColumnOrder(updater),
+    excludedIds: ["__sel"],
+    onDragActivated: () => {
+      wasDraggedRef.current = true;
     },
-    [],
-  );
+    onDragEnded: (activated) => {
+      if (!activated) {
+        wasDraggedRef.current = false;
+      }
+    },
+  });
 
   const tanColumns = useMemo<TanColumnDef<Row>[]>(
     () => [
@@ -1680,12 +1474,16 @@ function TableDataGrid({
                       }}
                       onMouseDown={(event) => {
                         if (!isSelectionColumn) {
-                          handleDragMouseDown(columnId, event);
+                          handleHeaderMouseDown(columnId, event);
                         }
                       }}
                       onClick={() => {
-                        if (!isSelectionColumn && !wasDraggedRef.current) {
-                          onSort(columnId);
+                        if (!isSelectionColumn) {
+                          const wasDragged = wasDraggedRef.current;
+                          wasDraggedRef.current = false;
+                          if (!wasDragged) {
+                            onSort(columnId);
+                          }
                         }
                       }}
                     >
