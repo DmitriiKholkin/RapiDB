@@ -22,6 +22,7 @@ export interface UseCellSelectionOptions {
   ) => { row: number; col: number } | null;
   onCopy?: (text: string) => void;
   onPaste?: () => void;
+  isColumnCollapsed?: (colIndex: number) => boolean;
 }
 
 export interface UseCellSelectionReturn {
@@ -64,6 +65,7 @@ function normalizeRange(range: CellRange): {
 function serializeToTsv(
   range: CellRange,
   getCellValue: (rowIndex: number, colIndex: number) => unknown,
+  isColumnCollapsed?: (colIndex: number) => boolean,
 ): string {
   const { minRow, maxRow, minCol, maxCol } = normalizeRange(range);
   const rows: string[] = [];
@@ -71,6 +73,7 @@ function serializeToTsv(
   for (let row = minRow; row <= maxRow; row++) {
     const cells: string[] = [];
     for (let col = minCol; col <= maxCol; col++) {
+      if (isColumnCollapsed?.(col)) continue;
       const value = getCellValue(row, col);
       if (value === null || value === undefined) {
         cells.push("NULL");
@@ -93,6 +96,7 @@ export function useCellSelection({
   getCellFromPoint,
   onCopy,
   onPaste,
+  isColumnCollapsed,
 }: UseCellSelectionOptions): UseCellSelectionReturn {
   const [range, setRange] = useState<CellRange | null>(null);
   const isDraggingRef = useRef(false);
@@ -114,6 +118,8 @@ export function useCellSelection({
   onCopyRef.current = onCopy;
   const onPasteRef = useRef(onPaste);
   onPasteRef.current = onPaste;
+  const isColumnCollapsedRef = useRef(isColumnCollapsed);
+  isColumnCollapsedRef.current = isColumnCollapsed;
 
   const contextMenuCellRef = useRef<{ row: number; col: number } | null>(null);
 
@@ -332,6 +338,7 @@ export function useCellSelection({
     const currentGetCellValue = getCellValueRef.current;
     const currentOnCopy = onCopyRef.current;
     const currentOnPaste = onPasteRef.current;
+    const currentIsColumnCollapsed = isColumnCollapsedRef.current;
 
     const target = event.target as HTMLElement | null;
     const isCut = event.key === "x" || event.key === "X";
@@ -450,7 +457,7 @@ export function useCellSelection({
       case "C": {
         if (event.ctrlKey || event.metaKey) {
           event.preventDefault();
-          const text = serializeToTsv(currentRange, currentGetCellValue);
+          const text = serializeToTsv(currentRange, currentGetCellValue, currentIsColumnCollapsed);
           if (text && currentOnCopy) {
             currentOnCopy(text);
           } else if (text) {
@@ -463,7 +470,7 @@ export function useCellSelection({
       case "X": {
         if (event.ctrlKey || event.metaKey) {
           event.preventDefault();
-          const text = serializeToTsv(currentRange, currentGetCellValue);
+          const text = serializeToTsv(currentRange, currentGetCellValue, currentIsColumnCollapsed);
           if (text && currentOnCopy) {
             currentOnCopy(text);
           } else if (text) {
@@ -523,7 +530,7 @@ export function useCellSelection({
     if (!range) {
       return null;
     }
-    return serializeToTsv(range, getCellValue);
+    return serializeToTsv(range, getCellValue, isColumnCollapsedRef.current);
   }, [range, getCellValue]);
 
   return {

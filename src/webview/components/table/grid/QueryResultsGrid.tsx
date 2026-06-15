@@ -79,10 +79,12 @@ export function QueryResultsGrid({
   );
 
   const getCellValue = useCallback(
-    (rowIndex: number, colIndex: number) => {
+    (rowIndex: number, visualColIndex: number) => {
       const sortedRow = sortedRowsRef.current[rowIndex];
       if (!sortedRow) return undefined;
-      return sortedRow.original[`__col_${colIndex}`];
+      const colId = columnOrderRef.current[visualColIndex];
+      if (!colId) return undefined;
+      return sortedRow.original[colId];
     },
     [],
   );
@@ -102,6 +104,14 @@ export function QueryResultsGrid({
     postMessage("writeClipboard", { text });
   }, []);
 
+  const isColumnCollapsed = useCallback(
+    (visualColIndex: number) => {
+      const colId = columnOrderRef.current[visualColIndex];
+      return colId ? isCollapsedWidth(columnSizing[colId] ?? 160) : true;
+    },
+    [columnSizing],
+  );
+
   const selection = useCellSelection({
     rowCount: rows.length,
     colCount,
@@ -109,6 +119,7 @@ export function QueryResultsGrid({
     scrollRef,
     getCellFromPoint,
     onCopy: handleCopyText,
+    isColumnCollapsed,
   });
 
   useEffect(() => {
@@ -422,7 +433,7 @@ export const QueryTableRow = React.memo(function QueryTableRow({
       data-even={String(index % 2 === 0)}
       style={{ height: ROW_H }}
     >
-      {row.getVisibleCells().map((cell) => {
+      {row.getVisibleCells().map((cell, visualPos) => {
         const raw = cell.getValue();
         const isNull = raw === null || raw === undefined;
         const isEditing =
@@ -442,9 +453,9 @@ export const QueryTableRow = React.memo(function QueryTableRow({
         const cellSelectionState = classifyCellSelection(
           range,
           index,
-          columnIndex,
-          selection.isCellSelected(index, columnIndex),
-          selection.isCellAnchor(index, columnIndex),
+          visualPos,
+          selection.isCellSelected(index, visualPos),
+          selection.isCellAnchor(index, visualPos),
         );
         const cellClasses = buildCellSelectionClassName(cellSelectionState, {
           baseClass: "rdb-rrow-cell",
@@ -456,7 +467,7 @@ export const QueryTableRow = React.memo(function QueryTableRow({
             key={cell.id}
             data-column-id={cell.column.id}
             data-row={index}
-            data-col={columnIndex}
+            data-col={visualPos}
             className={cellClasses}
             style={{
               width: displayCellSize,
@@ -475,11 +486,11 @@ export const QueryTableRow = React.memo(function QueryTableRow({
             title={isNull ? "" : formatScalarValueForDisplay(raw)}
             onMouseDown={(event) => {
               if (!isCollapsed) {
-                selection.handleCellMouseDown(index, columnIndex, event);
+                selection.handleCellMouseDown(index, visualPos, event);
               }
             }}
             onMouseEnter={(event) => {
-              selection.handleCellMouseEnter(index, columnIndex, event);
+              selection.handleCellMouseEnter(index, visualPos, event);
             }}
             onDoubleClick={() => {
               if (!isCollapsed && !isEditing) {
