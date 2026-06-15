@@ -74,14 +74,17 @@ export function QueryResultsGrid({
   const containerRef = React.useRef<HTMLDivElement>(null);
 
   const colCount = colNames.length;
+  const sortedRowsRef = useRef<readonly TanStackRow<Record<string, unknown>>[]>(
+    [],
+  );
 
   const getCellValue = useCallback(
     (rowIndex: number, colIndex: number) => {
-      const row = rows[rowIndex];
-      if (!row) return undefined;
-      return row[`__col_${colIndex}`];
+      const sortedRow = sortedRowsRef.current[rowIndex];
+      if (!sortedRow) return undefined;
+      return sortedRow.original[`__col_${colIndex}`];
     },
-    [rows],
+    [],
   );
 
   const getCellFromPoint = useCallback((x: number, y: number) => {
@@ -207,6 +210,7 @@ export function QueryResultsGrid({
   });
 
   const tableRows = table.getRowModel().rows;
+  sortedRowsRef.current = tableRows;
   const virtualizer = useVirtualizer({
     count: tableRows.length,
     getScrollElement: () => scrollRef.current,
