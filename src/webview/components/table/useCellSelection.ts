@@ -340,6 +340,10 @@ export function useCellSelection({
     const isClipboardShortcut =
       (isCopy || isCut || isPaste) && (event.ctrlKey || event.metaKey);
 
+    if (scrollRef.current && !scrollRef.current.contains(target as Node)) {
+      return;
+    }
+
     if (
       isEditableElement(target) ||
       isEditableElement(document.activeElement)
