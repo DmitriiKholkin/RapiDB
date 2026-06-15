@@ -12,6 +12,16 @@ interface StubVsCodeApi {
   setState: ReturnType<typeof vi.fn>;
 }
 
+/**
+ * Minimal `ClipboardEvent` polyfill for JSDOM 29+, which no longer
+ * ships a default implementation. We only need a class that the
+ * paste-handler tests can `new` against — neither the test nor the
+ * production code reads the event's `clipboardData` payload.
+ */
+if (typeof globalThis.ClipboardEvent === "undefined") {
+  globalThis.ClipboardEvent = Event as unknown as typeof ClipboardEvent;
+}
+
 function createStubCanvasContext(): CanvasRenderingContext2D {
   return {
     canvas: document.createElement("canvas"),

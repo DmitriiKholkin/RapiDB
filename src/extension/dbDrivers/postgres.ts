@@ -3,6 +3,7 @@ import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { ConnectionConfig } from "../connectionManager";
 import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
+import { logger } from "../utils/logger";
 import {
   BaseDBDriver,
   formatDatetimeForDisplay,
@@ -423,7 +424,7 @@ export class PostgresDriver extends BaseDBDriver {
     }
     this.pool = this.createPool(this.config.database ?? "");
     this.pool.on("error", (err) => {
-      console.error("[RapiDB] PostgreSQL pool error:", err.message);
+      logger.error("PostgreSQL pool error", err);
       this._connected = false;
     });
     const client = await this.pool.connect();

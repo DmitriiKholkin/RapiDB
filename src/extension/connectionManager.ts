@@ -10,8 +10,11 @@ import {
   type ConnectAttempt,
   type ConnectionConfig,
   type ConnectionManagerLifecycleApi,
+  type DriverCapabilitiesApi,
+  type DriverMetadataApi,
   type ExplorerSchemaScope,
   type HistoryEntry,
+  type QueryEditorPresentationApi,
   type RefreshSchemaRequest,
   type SchemaLoadStatus,
   type SchemaObjectEntry,
@@ -76,8 +79,11 @@ export type {
   ConnectAttempt,
   ConnectionConfig,
   ConnectionManagerLifecycleApi,
+  DriverCapabilitiesApi,
+  DriverMetadataApi,
   ExplorerSchemaScope,
   HistoryEntry,
+  QueryEditorPresentationApi,
   RefreshSchemaRequest,
   SchemaLoadStatus,
   SchemaObjectEntry,
@@ -688,7 +694,12 @@ interface ConnectionManagerDependencies {
 }
 
 export class ConnectionManager
-  implements ScopeAwareConnectionManagerApi, ConnectionManagerLifecycleApi
+  implements
+    ScopeAwareConnectionManagerApi,
+    ConnectionManagerLifecycleApi,
+    QueryEditorPresentationApi,
+    DriverMetadataApi,
+    DriverCapabilitiesApi
 {
   private readonly validationService = new ConnectionValidationService();
   private readonly store: ConnectionManagerStore;

@@ -6,6 +6,7 @@ import {
   getSshTcpForwardTransport,
 } from "../driverRuntimeConfig";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
+import { logger } from "../utils/logger";
 import {
   BaseDBDriver,
   formatDatetimeForDisplay,
@@ -1258,10 +1259,7 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     const pool = new mssql.ConnectionPool(this.poolConfig());
     pool.on("error", (err: unknown) => {
-      console.error(
-        "[RapiDB] MSSQL pool error:",
-        err instanceof Error ? err.message : err,
-      );
+      logger.error("MSSQL pool error", err);
     });
     this.pool = await pool.connect();
   }

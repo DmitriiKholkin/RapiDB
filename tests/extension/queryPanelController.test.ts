@@ -67,6 +67,12 @@ describe("QueryPanelController", () => {
     let activeConnectionId = "active";
 
     const connectionManager = {
+      // No `type` field so the SQL hard-cap path stays inactive — this
+      // test focuses on connection-id precedence, not the rewrite logic.
+      getConnection: vi.fn((connectionId: string) => ({
+        id: connectionId,
+        name: "Primary",
+      })),
       isConnected,
       connectTo,
       addToHistory,
@@ -78,6 +84,10 @@ describe("QueryPanelController", () => {
       ),
       getQueryRowLimit: vi.fn(() => 100),
       getSchemaAsync,
+      getQueryEditorPresentation: vi.fn(() => undefined),
+      getDriverEntityManifest: vi.fn(() => undefined),
+      getDriverCapabilities: vi.fn(() => undefined),
+      getSkipTableMutationPreview: vi.fn(() => false),
     };
 
     const view = {
@@ -674,6 +684,7 @@ describe("QueryPanelController", () => {
   it("posts a query error instead of silently returning when the driver is unavailable", async () => {
     const addToHistory = vi.fn(async () => undefined);
     const connectionManager = {
+      getConnection: vi.fn(() => ({ id: "active", name: "Primary", type: "pg" })),
       isConnected: vi.fn(() => true),
       connectTo: vi.fn(async () => undefined),
       addToHistory,

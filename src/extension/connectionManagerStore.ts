@@ -107,7 +107,9 @@ function migrateLegacyTlsFlags(
         ? "requireVerifyFull"
         : "requireTrustServerCertificate"
       : "disabled";
-    const { ssl: _ssl2, rejectUnauthorized: _ru2, ...rest } = raw;
+    // `ssl` / `rejectUnauthorized` are intentionally discarded here so
+    // they don't leak into the sanitized record stored on disk.
+    const { ssl: _ssl, rejectUnauthorized: _ru, ...rest } = raw;
     return {
       ...rest,
       tls: { mode } as ConnectionTlsConfig,

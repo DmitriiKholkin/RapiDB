@@ -4,6 +4,7 @@ import type { ConnectionConfig } from "../connectionManager";
 import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
 import { pMapWithLimit } from "../utils/concurrency";
+import { logger } from "../utils/logger";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import {
   applyFilters,
@@ -351,11 +352,8 @@ export class RedisDriver implements IDBDriver {
       username: this.config.username,
       password: this.config.password,
     });
-    client.on("error", (error) => {
-      console.error(
-        "[RapiDB] Redis client error:",
-        error instanceof Error ? error.message : error,
-      );
+    client.on("error", (error: unknown) => {
+      logger.error("Redis client error", error);
     });
     try {
       await client.connect();

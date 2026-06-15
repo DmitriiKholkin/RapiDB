@@ -1,3 +1,13 @@
+/**
+ * Transform a raw `QueryResult` (driver output) into a
+ * `FormattedQueryResult` (webview-ready) by:
+ *  - applying a row-limit (and reporting whether truncation happened);
+ *  - resolving column metadata (one entry per column, defaulting to
+ *    `category: null`);
+ *  - normalizing each cell to a value the table renderer can display
+ *    (numbers, bigints, buffers, dates, points, intervals, etc.).
+ */
+
 import { type QueryColumnMeta } from "../../shared/tableTypes";
 import {
   formatDatetimeForDisplay,
@@ -32,11 +42,17 @@ export function formatQueryResult(
   };
 }
 
-function isPointLike(value: object): value is { x: unknown; y: unknown } {
+// ── Cell value type guards ──────────────────────────────────────────────────
+
+/** `value` has exactly `{ x, y }` — a 2D point shape. */
+export function isPointLike(
+  value: object,
+): value is { x: unknown; y: unknown } {
   return "x" in value && "y" in value && Object.keys(value).length === 2;
 }
 
-function isCircleLike(value: object): value is {
+/** `value` has exactly `{ x, y, radius }` — a circle shape. */
+export function isCircleLike(value: object): value is {
   x: unknown;
   y: unknown;
   radius: unknown;
@@ -49,7 +65,7 @@ function isCircleLike(value: object): value is {
   );
 }
 
-function hasNumericValue(value: unknown): value is number {
+function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
@@ -71,52 +87,69 @@ function safeStringify(value: unknown): string {
   }
 }
 
-function formatIntervalLikeObject(value: object): string | null {
-  const record = value as Record<string, unknown>;
-  const years = hasNumericValue(record.years) ? record.years : 0;
-  const months = hasNumericValue(record.months) ? record.months : 0;
-  const days = hasNumericValue(record.days) ? record.days : 0;
-  const hours = hasNumericValue(record.hours) ? record.hours : 0;
-  const minutes = hasNumericValue(record.minutes) ? record.minutes : 0;
-  const seconds = hasNumericValue(record.seconds) ? record.seconds : 0;
-  const milliseconds = hasNumericValue(record.milliseconds)
-    ? record.milliseconds
-    : 0;
-  const microseconds = hasNumericValue(record.microseconds)
-    ? record.microseconds
-    : 0;
+// ── Interval formatting (ISO 8601 duration) ────────────────────────────────
 
-  const knownKeys = new Set([
-    "years",
-    "months",
-    "days",
-    "hours",
-    "minutes",
-    "seconds",
-    "milliseconds",
-    "microseconds",
-  ]);
+const INTERVAL_FIELDS = [
+  "years",
+  "months",
+  "days",
+  "hours",
+  "minutes",
+  "seconds",
+  "milliseconds",
+  "microseconds",
+] as const;
+
+const INTERVAL_KEY_SET: ReadonlySet<string> = new Set(INTERVAL_FIELDS);
+
+type IntervalFieldValues = Record<(typeof INTERVAL_FIELDS)[number], number>;
+
+function readIntervalFields(
+  record: Record<string, unknown>,
+): IntervalFieldValues {
+  return {
+    years: isFiniteNumber(record.years) ? record.years : 0,
+    months: isFiniteNumber(record.months) ? record.months : 0,
+    days: isFiniteNumber(record.days) ? record.days : 0,
+    hours: isFiniteNumber(record.hours) ? record.hours : 0,
+    minutes: isFiniteNumber(record.minutes) ? record.minutes : 0,
+    seconds: isFiniteNumber(record.seconds) ? record.seconds : 0,
+    milliseconds: isFiniteNumber(record.milliseconds) ? record.milliseconds : 0,
+    microseconds: isFiniteNumber(record.microseconds) ? record.microseconds : 0,
+  };
+}
+
+function isRecognizedIntervalRecord(record: Record<string, unknown>): boolean {
   const keys = Object.keys(record);
-  if (
-    keys.length === 0 ||
-    keys.some((key) => !knownKeys.has(key)) ||
-    keys.some((key) => !hasNumericValue(record[key]))
-  ) {
-    return null;
-  }
+  if (keys.length === 0) return false;
+  return keys.every(
+    (key) => INTERVAL_KEY_SET.has(key) && isFiniteNumber(record[key]),
+  );
+}
 
+function appendIntervalSegment(
+  iso: string,
+  value: number,
+  suffix: string,
+): string {
+  return value !== 0 ? `${iso}${trimNumericFraction(value)}${suffix}` : iso;
+}
+
+function buildIntervalIso(fields: IntervalFieldValues): string {
   const normalizedSeconds =
-    seconds + milliseconds / 1000 + microseconds / 1_000_000;
+    fields.seconds +
+    fields.milliseconds / 1000 +
+    fields.microseconds / 1_000_000;
 
   let iso = "P";
-  if (years !== 0) iso += `${trimNumericFraction(years)}Y`;
-  if (months !== 0) iso += `${trimNumericFraction(months)}M`;
-  if (days !== 0) iso += `${trimNumericFraction(days)}D`;
+  iso = appendIntervalSegment(iso, fields.years, "Y");
+  iso = appendIntervalSegment(iso, fields.months, "M");
+  iso = appendIntervalSegment(iso, fields.days, "D");
 
-  if (hours !== 0 || minutes !== 0 || normalizedSeconds !== 0) {
+  if (fields.hours !== 0 || fields.minutes !== 0 || normalizedSeconds !== 0) {
     iso += "T";
-    if (hours !== 0) iso += `${trimNumericFraction(hours)}H`;
-    if (minutes !== 0) iso += `${trimNumericFraction(minutes)}M`;
+    iso = appendIntervalSegment(iso, fields.hours, "H");
+    iso = appendIntervalSegment(iso, fields.minutes, "M");
     if (normalizedSeconds !== 0) {
       iso += `${trimNumericFraction(normalizedSeconds)}S`;
     }
@@ -124,6 +157,20 @@ function formatIntervalLikeObject(value: object): string | null {
 
   return iso === "P" ? "P0D" : iso;
 }
+
+/**
+ * Try to format an object as an ISO 8601 duration (`PnYnMnDTnHnMnS`).
+ * Returns `null` if the object has unknown keys or non-numeric values.
+ */
+function formatIntervalLikeObject(value: object): string | null {
+  const record = value as Record<string, unknown>;
+  if (!isRecognizedIntervalRecord(record)) {
+    return null;
+  }
+  return buildIntervalIso(readIntervalFields(record));
+}
+
+// ── Row normalization ──────────────────────────────────────────────────────
 
 function normalizeQueryRows(
   rows: readonly Record<string, unknown>[],

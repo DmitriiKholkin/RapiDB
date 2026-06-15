@@ -210,16 +210,9 @@ export class TableMutationPreviewController {
     previewToken: string,
     preview: PendingTableMutationPreview,
   ): TableMutationPreviewPayload {
-    const managerWithPresentation = this
-      .connectionManager as ConnectionManager & {
-      getQueryEditorPresentation?: (
-        connectionId: string,
-      ) =>
-        | import("../../shared/webviewContracts").QueryEditorPresentation
-        | undefined;
-    };
-    const editorPresentation =
-      managerWithPresentation.getQueryEditorPresentation?.(this.connectionId);
+    const editorPresentation = this.connectionManager.getQueryEditorPresentation(
+      this.connectionId,
+    );
     const previewStatements =
       preview.kind === "applyChanges"
         ? [

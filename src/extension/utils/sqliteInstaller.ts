@@ -8,6 +8,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
+import { logger } from "./logger";
 
 type BetterSqlite3PackageJson = {
   name?: string;
@@ -79,7 +80,7 @@ function installerLog(message: string): void {
   const line = `[RapiDB SQLite] ${message}`;
   installerConfiguration?.log?.(line);
   if (!installerConfiguration?.log) {
-    console.log(line);
+    logger.info(line);
   }
 }
 

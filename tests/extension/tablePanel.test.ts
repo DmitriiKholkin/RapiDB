@@ -498,6 +498,7 @@ describe("TablePanel", () => {
       getConnection: vi.fn(() => ({ name: "Main" })),
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       getDefaultPageSize: vi.fn(() => 25),
+      getSkipTableMutationPreview: vi.fn(() => false),
     };
 
     prepareDeleteRowsPlanMock.mockResolvedValueOnce({

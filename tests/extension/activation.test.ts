@@ -107,6 +107,13 @@ describe("extension activation", () => {
             };
         }
       }),
+      // ConnectionManager now declares these as part of its public type
+      // contract (was previously optional via `as ConnectionManager & {...}`
+      // casts in callers). Mock returns undefined to preserve the original
+      // fallback path (e.g. DEFAULT_DRIVER_ENTITY_MANIFEST) used by callers.
+      getDriverEntityManifest: vi.fn(() => undefined),
+      getDriverCapabilities: vi.fn(() => undefined),
+      getSkipTableMutationPreview: vi.fn(() => false),
       disconnectFrom: vi.fn(),
       disconnectAll: vi.fn().mockResolvedValue(undefined),
       dispose: vi.fn().mockResolvedValue(undefined),

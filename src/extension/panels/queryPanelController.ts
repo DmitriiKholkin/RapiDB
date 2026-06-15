@@ -15,6 +15,7 @@ import {
   exportQueryResultsAsCsv,
   exportQueryResultsAsJson,
 } from "../utils/exportService";
+import { logger } from "../utils/logger";
 import { formatQueryResult } from "../utils/queryResultFormatting";
 import { decideReadOnlyQueryExecution } from "../utils/readOnlyGuards";
 
@@ -400,12 +401,8 @@ export class QueryPanelController {
       return;
     }
 
-    const managerWithConnections = this
-      .connectionManager as ConnectionManager & {
-      getConnection?: (id: string) => { type?: ConnectionType } | undefined;
-    };
     const connectionType =
-      managerWithConnections.getConnection?.(connectionId)?.type;
+      this.connectionManager.getConnection(connectionId)?.type;
     const effectiveRowLimit = Math.min(
       this.connectionManager.getQueryRowLimit(),
       QUERY_LIMIT_POLICY.hardCap,
@@ -534,8 +531,8 @@ export class QueryPanelController {
     }
 
     if (!previous.supportsCancellation) {
-      console.warn(
-        `[RapiDB] Query cancellation is not supported for connection ${previous.connectionId}; superseded request ${previous.requestToken} may continue executing in the backend.`,
+      logger.warn(
+        `Query cancellation is not supported for connection ${previous.connectionId}; superseded request ${previous.requestToken} may continue executing in the backend.`,
       );
       return false;
     }
@@ -560,6 +557,8 @@ export class QueryPanelController {
       ]);
 
       if (cancellationResult !== "cancelled") {
+        // 1-arg console.error preserves the original log shape that
+        // downstream log scrapers and tests key on.
         console.error(
           `[RapiDB] Superseded query cancellation timed out for connection ${previous.connectionId}.`,
         );
@@ -571,11 +570,8 @@ export class QueryPanelController {
         this.activeQueryExecutions.delete(connectionId);
       }
       return true;
-    } catch (error) {
-      console.error(
-        "[RapiDB] Failed to cancel superseded query execution:",
-        error,
-      );
+    } catch (error: unknown) {
+      logger.error("Failed to cancel superseded query execution", error);
       return false;
     } finally {
       if (timeoutHandle) {
@@ -585,22 +581,15 @@ export class QueryPanelController {
   }
 
   private pushConnections(): void {
-    const managerWithPresentation = this
-      .connectionManager as ConnectionManager & {
-      getQueryEditorPresentation?: (
-        connectionId: string,
-      ) =>
-        | import("../../shared/webviewContracts").QueryEditorPresentation
-        | undefined;
-    };
     const connections = this.connectionManager
       .getConnections()
       .map((connection) => ({
         id: connection.id,
         name: connection.name,
         type: connection.type,
-        editorPresentation:
-          managerWithPresentation.getQueryEditorPresentation?.(connection.id),
+        editorPresentation: this.connectionManager.getQueryEditorPresentation(
+          connection.id,
+        ),
       }));
     this.view.postMessage({ type: "connections", payload: connections });
   }

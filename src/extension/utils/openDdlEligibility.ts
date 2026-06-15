@@ -1,3 +1,19 @@
+/**
+ * Decide whether a given tree-view node kind supports a "show DDL" action.
+ *
+ * Two layers of gating:
+ *  1. **Driver manifest** — the per-driver entity manifest declares which
+ *     object kinds it can produce DDL for.
+ *  2. **Per-connection overrides** — some drivers (DynamoDB, Redis,
+ *     Elasticsearch) report support for a kind in their manifest but
+ *     cannot actually emit meaningful DDL for it; the override table
+ *     forces a no-DDL state.
+ *
+ * The function `composeOpenDdlAwareContextValue` is used to build the
+ * `contextValue` string VSCode sees — adding a `_noDdl` suffix that
+ * the `package.json` menus key on to hide the command.
+ */
+
 import type { ConnectionType } from "../../shared/connectionTypes";
 import type { DbObjectKind } from "../../shared/dbObjectKinds";
 import type { IndexDdlSupport } from "../../shared/tableTypes";
@@ -15,6 +31,7 @@ export interface OpenDdlSupportHints {
 
 const OPEN_DDL_CONTEXT_VALUE_UNSUPPORTED_SUFFIX = "_noDdl";
 
+/** Per-connection overrides that demote otherwise-supported kinds. */
 const OPEN_DDL_UNSUPPORTED_BY_CONNECTION_TYPE: Readonly<
   Partial<Record<ConnectionType, readonly OpenDdlNodeKind[]>>
 > = {
@@ -23,19 +40,22 @@ const OPEN_DDL_UNSUPPORTED_BY_CONNECTION_TYPE: Readonly<
   redis: ["table"],
 };
 
+const OPEN_DDL_NODE_KINDS: ReadonlySet<OpenDdlNodeKind> =
+  new Set<OpenDdlNodeKind>([
+    "table",
+    "view",
+    "materializedView",
+    "function",
+    "procedure",
+    "sequence",
+    "type",
+    "table_detail_constraint",
+    "table_detail_index",
+    "table_detail_trigger",
+  ]);
+
 export function isOpenDdlNodeKind(kind: string): kind is OpenDdlNodeKind {
-  return (
-    kind === "table" ||
-    kind === "view" ||
-    kind === "materializedView" ||
-    kind === "function" ||
-    kind === "procedure" ||
-    kind === "sequence" ||
-    kind === "type" ||
-    kind === "table_detail_constraint" ||
-    kind === "table_detail_index" ||
-    kind === "table_detail_trigger"
-  );
+  return OPEN_DDL_NODE_KINDS.has(kind as OpenDdlNodeKind);
 }
 
 function isSupportedByManifest(
@@ -59,8 +79,8 @@ function isSupportedByManifest(
 
 function isOverriddenAsUnsupported(
   kind: OpenDdlNodeKind,
-  connectionType?: ConnectionType,
-  hints?: OpenDdlSupportHints,
+  connectionType: ConnectionType | undefined,
+  hints: OpenDdlSupportHints | undefined,
 ): boolean {
   if (
     connectionType &&

@@ -156,11 +156,7 @@ export class TablePanel {
   }
 
   private shouldSkipTableMutationPreview(): boolean {
-    const managerWithPreviewSetting = this
-      .connectionManager as ConnectionManager & {
-      getSkipTableMutationPreview?: () => boolean;
-    };
-    return managerWithPreviewSetting.getSkipTableMutationPreview?.() === true;
+    return this.connectionManager.getSkipTableMutationPreview() === true;
   }
 
   private async presentOrExecuteMutationPreview(
@@ -405,17 +401,11 @@ export class TablePanel {
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
       const errMsg = error.message;
-      const managerWithCapabilities = this
-        .connectionManager as ConnectionManager & {
-        getDriverCapabilities?: (
-          connectionId: string,
-        ) => { isTableFilterError?: (message: string) => boolean } | undefined;
-      };
       const isFilterError =
         filters.length > 0 &&
         Boolean(
-          managerWithCapabilities
-            .getDriverCapabilities?.(this.connectionId)
+          this.connectionManager
+            .getDriverCapabilities(this.connectionId)
             ?.isTableFilterError?.(errMsg),
         );
       this.postMessage("tableError", { fetchId, error: errMsg, isFilterError });

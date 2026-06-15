@@ -160,6 +160,36 @@ export interface ConnectionManagerLifecycleApi {
   dispose(): Promise<void>;
 }
 
+/**
+ * Read-only editor-presentation metadata used by panels/commands.
+ * Implemented by {@link ConnectionManager} but declared as a standalone
+ * interface so panels/commands can depend on the smallest possible
+ * surface (no `as ConnectionManager & {...}` casts).
+ */
+export interface QueryEditorPresentationApi {
+  getQueryEditorPresentation(connectionId: string):
+    | import("../shared/webviewContracts").QueryEditorPresentation
+    | undefined;
+}
+
+/**
+ * Read-only driver-entity metadata used by the explorer to decide what
+ * kinds of DDL are supported for a given connection.
+ */
+export interface DriverMetadataApi {
+  getDriverEntityManifest(connectionId: string): import("./dbDrivers/types").DriverEntityManifest;
+}
+
+/**
+ * Read-only driver-capability metadata used to decide which read-only
+ * query guard applies for a connection.
+ */
+export interface DriverCapabilitiesApi {
+  getDriverCapabilities(
+    connectionId: string,
+  ): import("./dbDrivers/types").DriverCapabilities | undefined;
+}
+
 export interface StoredConnectionConfig extends ConnectionConfig {
   user?: string;
 }

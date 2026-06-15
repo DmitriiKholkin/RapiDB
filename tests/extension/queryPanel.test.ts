@@ -231,6 +231,7 @@ describe("QueryPanel", () => {
         name: "Primary",
         type: "pg",
       })),
+      getQueryEditorPresentation: vi.fn(() => undefined),
       onDidSchemaLoad: vi.fn(() => ({ dispose: vi.fn() })),
       onDidConnect: vi.fn((listener: () => void) => {
         connectListener = listener;
@@ -350,6 +351,7 @@ describe("QueryPanel", () => {
         name: "Primary",
         type: "pg",
       })),
+      getQueryEditorPresentation: vi.fn(() => undefined),
       onDidSchemaLoad: schemaLoad.event,
       onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),

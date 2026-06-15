@@ -2,13 +2,18 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import type {
-  ColumnTypeMeta,
-  QueryColumnMeta,
-  TypeCategory,
-} from "../dbDrivers/types";
+import type { ColumnTypeMeta, QueryColumnMeta } from "../dbDrivers/types";
 import { csvCell } from "./csvUtils";
 import { normalizeUnknownError } from "./errorHandling";
+import {
+  buildQueryExportColumns,
+  type ExportColumnDescriptor,
+  formatExportCellValue,
+  formatTableCsvExportValue,
+  type JsonExportValue,
+  queryColumnKey,
+  serializeJsonExportRecord,
+} from "./exportValueFormat";
 
 const DOWNLOADS_DIRECTORY = "Downloads";
 const CSV_EXTENSION = "csv";
@@ -44,27 +49,6 @@ interface ExportRequest {
 interface ExportDialogOptions {
   context?: vscode.ExtensionContext;
 }
-
-type ExportColumnDescriptor = {
-  key: string;
-  sourceKey: string;
-  category?: TypeCategory | null;
-  nativeType?: string;
-};
-
-type JsonExportScalar = null | boolean | number | string | RawJsonLiteral;
-
-type JsonExportValue =
-  | JsonExportScalar
-  | JsonExportValue[]
-  | { [key: string]: JsonExportValue };
-
-type RawJsonLiteral = {
-  readonly __rapidbRawJsonLiteral: unique symbol;
-  readonly literal: string;
-};
-
-const JSON_NUMBER_LITERAL_RE = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
 
 export async function exportQueryResultsAsCsv(
   result: QueryResultExport,
@@ -252,7 +236,10 @@ async function writeQueryResultsCsv(
   result: QueryResultExport,
   signal: AbortSignal,
 ): Promise<void> {
-  const exportColumns = buildQueryExportColumns(result);
+  const exportColumns = buildQueryExportColumns(
+    result.columns,
+    result.columnMeta,
+  );
 
   await withWriteStream(filePath, async (writeStream) => {
     throwIfAborted(signal);
@@ -281,7 +268,10 @@ async function writeQueryResultsJson(
   result: QueryResultExport,
   signal: AbortSignal,
 ): Promise<void> {
-  const exportColumns = buildQueryExportColumns(result);
+  const exportColumns = buildQueryExportColumns(
+    result.columns,
+    result.columnMeta,
+  );
 
   await withWriteStream(filePath, async (writeStream) => {
     throwIfAborted(signal);
@@ -373,263 +363,6 @@ async function writeChunkedJson(
   });
 }
 
-function queryColumnKey(index: number): string {
-  return `__col_${index}`;
-}
-
-function formatExportCellValue(value: unknown): string {
-  if (value == null) {
-    return "";
-  }
-
-  if (typeof value === "bigint") {
-    return value.toString();
-  }
-
-  if (value instanceof Date) {
-    if (Number.isNaN(value.getTime())) {
-      return "";
-    }
-
-    const pad = (numericValue: number) => String(numericValue).padStart(2, "0");
-
-    return (
-      `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())} ` +
-      `${pad(value.getUTCHours())}:${pad(value.getUTCMinutes())}:${pad(value.getUTCSeconds())}`
-    );
-  }
-
-  if (Array.isArray(value) || (value !== null && typeof value === "object")) {
-    try {
-      return JSON.stringify(value);
-    } catch {
-      return String(value);
-    }
-  }
-
-  return String(value);
-}
-
-function buildQueryExportColumns(
-  result: QueryResultExport,
-): ExportColumnDescriptor[] {
-  const seenColumnNames = new Map<string, number>();
-
-  return result.columns.map((columnName, index) => {
-    const seenCount = seenColumnNames.get(columnName) ?? 0;
-    seenColumnNames.set(columnName, seenCount + 1);
-
-    return {
-      key: seenCount === 0 ? columnName : `${columnName}_${seenCount + 1}`,
-      sourceKey: queryColumnKey(index),
-      category: result.columnMeta?.[index]?.category ?? null,
-    } satisfies ExportColumnDescriptor;
-  });
-}
-
-function formatTableCsvExportValue(
-  value: unknown,
-  category: TypeCategory | null,
-): string {
-  if (typeof value === "string") {
-    const parsed = tryParseStructuredExportValue(value, category);
-    if (parsed !== undefined) {
-      return formatExportCellValue(parsed);
-    }
-  }
-
-  return formatExportCellValue(value);
-}
-
-function serializeJsonExportRecord(
-  entries: ReadonlyArray<
-    ExportColumnDescriptor & {
-      value: unknown;
-    }
-  >,
-): string {
-  return `{${entries
-    .map(
-      (entry) =>
-        `${JSON.stringify(entry.key)}:${stringifyJsonExportValue(
-          normalizeJsonExportValue(entry.value, entry.category ?? null),
-        )}`,
-    )
-    .join(",")}}`;
-}
-
-function normalizeJsonExportValue(
-  value: unknown,
-  category: TypeCategory | null,
-): JsonExportValue {
-  if (value == null) {
-    return null;
-  }
-
-  if (value instanceof Date) {
-    return Number.isNaN(value.getTime()) ? null : formatExportCellValue(value);
-  }
-
-  if (typeof value === "boolean") {
-    return value;
-  }
-
-  if (typeof value === "number") {
-    return Number.isFinite(value) ? value : null;
-  }
-
-  if (typeof value === "bigint") {
-    return rawJsonLiteral(value.toString());
-  }
-
-  if (typeof value === "string") {
-    const parsed = tryParseStructuredExportValue(value, category);
-    if (parsed !== undefined) {
-      return normalizeNestedJsonExportValue(parsed);
-    }
-
-    if (category === "boolean") {
-      const lowered = value.trim().toLowerCase();
-      if (lowered === "true") return true;
-      if (lowered === "false") return false;
-    }
-
-    if (isNumericExportCategory(category)) {
-      const numericLiteral = toJsonNumericLiteral(value);
-      if (numericLiteral) {
-        return rawJsonLiteral(numericLiteral);
-      }
-    }
-
-    return value;
-  }
-
-  return normalizeNestedJsonExportValue(value);
-}
-
-function normalizeNestedJsonExportValue(value: unknown): JsonExportValue {
-  if (value == null) {
-    return null;
-  }
-
-  if (value instanceof Date) {
-    return Number.isNaN(value.getTime()) ? null : formatExportCellValue(value);
-  }
-
-  if (typeof value === "boolean") {
-    return value;
-  }
-
-  if (typeof value === "number") {
-    return Number.isFinite(value) ? value : null;
-  }
-
-  if (typeof value === "bigint") {
-    return rawJsonLiteral(value.toString());
-  }
-
-  if (typeof value === "string") {
-    return value;
-  }
-
-  if (Array.isArray(value)) {
-    return value.map((entry) => normalizeNestedJsonExportValue(entry));
-  }
-
-  if (typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
-        key,
-        normalizeNestedJsonExportValue(entry),
-      ]),
-    );
-  }
-
-  return String(value);
-}
-
-function stringifyJsonExportValue(value: JsonExportValue): string {
-  if (isRawJsonLiteral(value)) {
-    return value.literal;
-  }
-
-  if (value === null) {
-    return "null";
-  }
-
-  if (typeof value === "boolean") {
-    return value ? "true" : "false";
-  }
-
-  if (typeof value === "number") {
-    return Number.isFinite(value) ? String(value) : "null";
-  }
-
-  if (typeof value === "string") {
-    return JSON.stringify(value);
-  }
-
-  if (Array.isArray(value)) {
-    return `[${value.map((entry) => stringifyJsonExportValue(entry)).join(",")}]`;
-  }
-
-  return `{${Object.entries(value)
-    .map(
-      ([key, entry]) =>
-        `${JSON.stringify(key)}:${stringifyJsonExportValue(entry)}`,
-    )
-    .join(",")}}`;
-}
-
-function tryParseStructuredExportValue(
-  value: string,
-  category: TypeCategory | null,
-): unknown | undefined {
-  if (category !== "json" && category !== "array") {
-    return undefined;
-  }
-
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-
-  try {
-    return JSON.parse(trimmed) as unknown;
-  } catch {
-    return undefined;
-  }
-}
-
-function isNumericExportCategory(category: TypeCategory | null): boolean {
-  return (
-    category === "integer" || category === "float" || category === "decimal"
-  );
-}
-
-function toJsonNumericLiteral(value: string): string | null {
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return null;
-  }
-
-  const normalized = trimmed.startsWith("+") ? trimmed.slice(1) : trimmed;
-  return JSON_NUMBER_LITERAL_RE.test(normalized) ? normalized : null;
-}
-
-function rawJsonLiteral(literal: string): RawJsonLiteral {
-  return {
-    __rapidbRawJsonLiteral: Symbol(
-      "rapidb-raw-json",
-    ) as RawJsonLiteral["__rapidbRawJsonLiteral"],
-    literal,
-  };
-}
-
-function isRawJsonLiteral(value: JsonExportValue): value is RawJsonLiteral {
-  return typeof value === "object" && value !== null && "literal" in value;
-}
-
 function throwIfAborted(signal: AbortSignal): void {
   if (!signal.aborted) {
     return;
@@ -667,3 +400,8 @@ function closeWriteStream(writeStream: fs.WriteStream): Promise<void> {
     });
   });
 }
+
+// Re-export value-formatting types and helpers for downstream consumers
+// that need the column descriptor type.
+export type { ExportColumnDescriptor, JsonExportValue };
+export { formatExportCellValue, queryColumnKey };

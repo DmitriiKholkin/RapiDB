@@ -189,16 +189,8 @@ export class QueryPanel {
     );
     const connectionType = connection?.type ?? "";
     const resolvedQueryText = initialQueryText;
-    const managerWithPresentation = this
-      .connectionManager as ConnectionManager & {
-      getQueryEditorPresentation?: (
-        connectionId: string,
-      ) =>
-        | import("../../shared/webviewContracts").QueryEditorPresentation
-        | undefined;
-    };
     const driverEditorPresentation =
-      managerWithPresentation.getQueryEditorPresentation?.(
+      this.connectionManager.getQueryEditorPresentation(
         this.initialConnectionId,
       );
     const initialSql = resolvedQueryText ?? "";
