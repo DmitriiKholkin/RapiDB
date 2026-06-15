@@ -914,10 +914,17 @@ function TableDataGrid({
     [columns],
   );
 
+  const columnsMapRef = useRef(columnsMap);
+  columnsMapRef.current = columnsMap;
+
   const [columnSizing, setColumnSizing] = useState<Record<string, number>>({});
   const [columnOrder, setColumnOrder] = useState<string[]>([]);
   const columnOrderRef = useRef(columnOrder);
   columnOrderRef.current = columnOrder;
+  const columnSizingRef = useRef(columnSizing);
+  columnSizingRef.current = columnSizing;
+  const colSizesRef = useRef(colSizes);
+  colSizesRef.current = colSizes;
 
   useEffect(() => {
     if (exportColumnOrderRef) {
@@ -1058,11 +1065,42 @@ function TableDataGrid({
       const startRow = ctxCell
         ? ctxCell.row
         : selectionRangeRef.current.anchorRow;
-      const startCol = ctxCell
-        ? ctxCell.col - selColOffset
-        : selectionRangeRef.current.anchorCol - selColOffset;
+      const anchorCol = ctxCell
+        ? ctxCell.col
+        : selectionRangeRef.current.anchorCol;
+      const startCol = anchorCol - selColOffset;
 
       selection.contextMenuCellRef.current = null;
+
+      // Build the list of visible data columns starting from the anchor position,
+      // skipping collapsed (hidden) columns and the selection column.
+      const visiblePasteColumns: ColumnMeta[] = [];
+      for (let i = anchorCol; i < columnOrderRef.current.length; i++) {
+        const colId = columnOrderRef.current[i];
+        if (colId === "__sel") continue;
+        const size =
+          columnSizingRef.current[colId] ??
+          colSizesRef.current[colId] ??
+          160;
+        if (isCollapsedWidth(size)) continue;
+        const meta = columnsMapRef.current.get(colId);
+        if (meta) {
+          visiblePasteColumns.push(meta);
+        }
+      }
+
+      if (visiblePasteColumns.length === 0) {
+        setPasteErrors([
+          {
+            rowIndex: startRow,
+            columnIndex: anchorCol,
+            columnName: "",
+            value: "",
+            message: "No visible columns to paste into",
+          },
+        ]);
+        return;
+      }
 
       if (startCol < 0) {
         setPasteErrors([
@@ -1098,7 +1136,7 @@ function TableDataGrid({
           for (let c = 0; c < row.length; c++) {
             const value = row[c];
             const targetCol = startCol + c;
-            const column = columns[targetCol];
+            const column = visiblePasteColumns[c];
             if (!column) continue;
 
             const validation = validatePasteValue(value, column);
@@ -1185,8 +1223,8 @@ function TableDataGrid({
       const validationResult = validatePasteData(
         pasteData,
         startRow,
-        startCol,
-        [...columns],
+        0,
+        visiblePasteColumns,
         rows.length,
       );
 

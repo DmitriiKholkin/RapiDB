@@ -49,6 +49,11 @@ export interface UsePasteHandlerOptions {
     col: number;
   } | null>;
   newRowRef: MutableRefObject<InsertDraftRow | null>;
+  /** Given a visual column index, returns the visible (non-collapsed)
+   *  ColumnMeta entries starting from that position, in display order.
+   *  When omitted, paste falls back to the raw `columns` array (no
+   *  collapsed-column skipping). */
+  getVisibleColumnsFromAnchor?: (anchorCol: number) => ColumnMeta[];
 }
 
 export interface UsePasteHandlerReturn {
@@ -70,6 +75,7 @@ export function usePasteHandler({
   selectionRangeRef,
   contextMenuCellRef,
   newRowRef,
+  getVisibleColumnsFromAnchor,
 }: UsePasteHandlerOptions): UsePasteHandlerReturn {
   const [pasteErrors, setPasteErrors] = useState<PasteValidationError[]>([]);
 
@@ -104,19 +110,35 @@ export function usePasteHandler({
       const startRow = ctxCell
         ? ctxCell.row
         : selectionRangeRef.current.anchorRow;
-      const startCol = ctxCell
-        ? ctxCell.col - selectedColumnOffset
-        : selectionRangeRef.current.anchorCol - selectedColumnOffset;
+      const anchorCol = ctxCell
+        ? ctxCell.col
+        : selectionRangeRef.current.anchorCol;
+      const startCol = anchorCol - selectedColumnOffset;
 
       contextMenuCellRef.current = null;
+
+      // Resolve the set of visible (non-collapsed) columns to paste into
+      const pasteTargetColumns =
+        getVisibleColumnsFromAnchor?.(anchorCol) ?? columns;
+
+      if (pasteTargetColumns.length === 0 && getVisibleColumnsFromAnchor) {
+        setPasteErrors([
+          {
+            rowIndex: startRow,
+            columnIndex: anchorCol,
+            columnName: "",
+            value: "",
+            message: "No visible columns to paste into",
+          },
+        ]);
+        return;
+      }
 
       if (startCol < 0) {
         setPasteErrors([
           {
             rowIndex: startRow,
-            columnIndex: ctxCell
-              ? ctxCell.col
-              : selectionRangeRef.current.anchorCol,
+            columnIndex: anchorCol,
             columnName: "",
             value: "",
             message: "Cannot paste into selection column",
@@ -127,11 +149,12 @@ export function usePasteHandler({
 
       // ── Draft row paste (startRow === -1) ──────────────────────────────
       if (startRow === -1) {
+        const draftStartCol = getVisibleColumnsFromAnchor ? 0 : startCol;
         handleDraftRowPaste(
           pasteData,
           startRow,
-          startCol,
-          columns,
+          draftStartCol,
+          pasteTargetColumns,
           rows,
           selectedColumnOffset,
           newRowRef,
@@ -144,11 +167,12 @@ export function usePasteHandler({
       }
 
       // ── Persisted row paste ────────────────────────────────────────────
+      const pasteStartCol = getVisibleColumnsFromAnchor ? 0 : startCol;
       handlePersistedRowPaste(
         pasteData,
         startRow,
-        startCol,
-        columns,
+        pasteStartCol,
+        pasteTargetColumns,
         rows,
         setPasteErrors,
         onBatchCellEdit,
