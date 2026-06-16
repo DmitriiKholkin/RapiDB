@@ -955,25 +955,21 @@ function TableDataGrid({
 
   const getCellValue = useCallback(
     (rowIndex: number, colIndex: number) => {
-      const dataColIndex = colIndex - selColOffset;
-      if (dataColIndex < 0 || dataColIndex >= dataColCount) return undefined;
+      const colId = columnOrderRef.current[colIndex];
+      if (!colId || colId === "__sel") return undefined;
       if (rowIndex === -1) {
         const draft = newRowRef.current;
         if (!draft) return undefined;
-        const columnName = columns[dataColIndex]?.name;
-        if (!columnName) return undefined;
-        const dv = draft[columnName]?.value;
+        const dv = draft[colId]?.value;
         if (dv === INSERT_DEFAULT_SENTINEL) return undefined;
         if (dv === NULL_SENTINEL) return null;
         return dv;
       }
       const row = rows[rowIndex];
       if (!row) return undefined;
-      const columnName = columns[dataColIndex]?.name;
-      if (!columnName) return undefined;
-      return row[columnName];
+      return row[colId];
     },
-    [rows, columns, selColOffset, dataColCount],
+    [rows],
   );
 
   const getCellFromPoint = useCallback((x: number, y: number) => {

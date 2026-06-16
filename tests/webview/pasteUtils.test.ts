@@ -207,10 +207,10 @@ describe("validatePasteValue — money formats across drivers", () => {
 });
 
 describe("validatePasteValue — NULL handling", () => {
-  it("returns null for empty string on nullable column", () => {
+  it("returns empty string for empty input on nullable column", () => {
     const result = validatePasteValue("", NUMERIC_COLUMN);
     expect(result.valid).toBe(true);
-    expect(result.coercedValue).toBe(null);
+    expect(result.coercedValue).toBe("");
   });
 
   it("returns null for NULL sentinel on nullable column", () => {
@@ -219,15 +219,15 @@ describe("validatePasteValue — NULL handling", () => {
     expect(result.coercedValue).toBe(null);
   });
 
-  it("rejects NULL on non-nullable column", () => {
+  it("accepts empty string on non-nullable column (empty string is not NULL)", () => {
     const column = makeColumn({
       name: "col_not_null",
       category: "decimal",
       nullable: false,
     });
     const result = validatePasteValue("", column);
-    expect(result.valid).toBe(false);
-    expect(result.error).toContain("does not allow NULL");
+    expect(result.valid).toBe(true);
+    expect(result.coercedValue).toBe("");
   });
 });
 
@@ -332,9 +332,9 @@ describe("validatePasteData — bulk paste with money literals", () => {
 });
 
 describe("formatNormalizedPasteValue", () => {
-  it("returns NULL_SENTINEL for empty input", () => {
-    const sentinel = formatNormalizedPasteValue("", null);
-    expect(sentinel).toBe("\x00__NULL__\x00");
+  it("returns empty string for empty input (empty string is not NULL)", () => {
+    const result = formatNormalizedPasteValue("", null);
+    expect(result).toBe("");
   });
 
   it("returns NULL_SENTINEL for NULL keyword input", () => {

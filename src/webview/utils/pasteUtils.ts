@@ -49,7 +49,7 @@ export function validatePasteValue(
   value: string,
   column: ColumnTypeMeta,
 ): { valid: boolean; coercedValue: unknown; error?: string } {
-  if (value === "" || value === NULL_SENTINEL || value === "NULL") {
+  if (value === NULL_SENTINEL || value === "NULL") {
     if (column.nullable) {
       return { valid: true, coercedValue: null };
     }
@@ -214,11 +214,7 @@ export function formatNormalizedPasteValue(
   originalValue: string,
   normalized: unknown,
 ): string {
-  if (
-    originalValue === "" ||
-    originalValue === NULL_SENTINEL ||
-    originalValue === "NULL"
-  ) {
+  if (originalValue === NULL_SENTINEL || originalValue === "NULL") {
     return NULL_SENTINEL;
   }
   if (normalized === null || normalized === undefined) {
