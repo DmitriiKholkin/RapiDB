@@ -1075,9 +1075,7 @@ function TableDataGrid({
         const colId = columnOrderRef.current[i];
         if (colId === "__sel") continue;
         const size =
-          columnSizingRef.current[colId] ??
-          colSizesRef.current[colId] ??
-          160;
+          columnSizingRef.current[colId] ?? colSizesRef.current[colId] ?? 160;
         if (isCollapsedWidth(size)) continue;
         const meta = columnsMapRef.current.get(colId);
         if (meta) {
@@ -1264,7 +1262,6 @@ function TableDataGrid({
     return unsubscribe;
   }, [
     canEditRows,
-    columns,
     rows,
     selColOffset,
     onBatchCellEdit,

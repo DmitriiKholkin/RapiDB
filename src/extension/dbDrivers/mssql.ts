@@ -1344,12 +1344,12 @@ export class MSSQLDriver extends BaseDBDriver {
   }
   async listObjects(database: string, schema: string): Promise<TableInfo[]> {
     const objects: TableInfo[] = [];
-    const esc = (s: string) => s.replace(/'/g, "''");
     const tableRes = await this.requirePool()
       .request()
+      .input("schema", mssql.NVarChar, schema)
       .query<ObjectRow>(`SELECT TABLE_NAME AS name, TABLE_TYPE AS type
          FROM [${escapeMssqlId(database)}].INFORMATION_SCHEMA.TABLES
-         WHERE TABLE_SCHEMA = '${esc(schema)}' ORDER BY TABLE_NAME`);
+         WHERE TABLE_SCHEMA = @schema ORDER BY TABLE_NAME`);
     for (const row of tableRes.recordset) {
       objects.push({
         schema,
@@ -1362,6 +1362,7 @@ export class MSSQLDriver extends BaseDBDriver {
     try {
       const routineRes = await this.requirePool()
         .request()
+        .input("schema", mssql.NVarChar, schema)
         .query<ObjectRow>(`SELECT o.name,
                   CASE o.type WHEN 'P' THEN 'procedure' WHEN 'PC' THEN 'procedure'
                               WHEN 'FN' THEN 'function'  WHEN 'IF' THEN 'function'
@@ -1369,7 +1370,7 @@ export class MSSQLDriver extends BaseDBDriver {
                               ELSE 'function' END AS type
            FROM [${escapeMssqlId(database)}].sys.objects o
            JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = o.schema_id
-           WHERE s.name = '${esc(schema)}' AND o.type IN ('P','PC','FN','IF','TF','AF')
+           WHERE s.name = @schema AND o.type IN ('P','PC','FN','IF','TF','AF')
            ORDER BY o.name`);
       for (const row of routineRes.recordset) {
         objects.push({
@@ -1382,10 +1383,11 @@ export class MSSQLDriver extends BaseDBDriver {
     try {
       const sequenceRes = await this.requirePool()
         .request()
+        .input("schema", mssql.NVarChar, schema)
         .query<NamedRow>(`SELECT seq.name
            FROM [${escapeMssqlId(database)}].sys.sequences seq
            JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = seq.schema_id
-           WHERE s.name = '${esc(schema)}'
+           WHERE s.name = @schema
            ORDER BY seq.name`);
       for (const row of sequenceRes.recordset) {
         objects.push({
@@ -1398,10 +1400,11 @@ export class MSSQLDriver extends BaseDBDriver {
     try {
       const typeRes = await this.requirePool()
         .request()
+        .input("schema", mssql.NVarChar, schema)
         .query<NamedRow>(`SELECT t.name
            FROM [${escapeMssqlId(database)}].sys.types t
            JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = t.schema_id
-           WHERE s.name = '${esc(schema)}'
+           WHERE s.name = @schema
              AND t.is_user_defined = 1
              AND t.is_table_type = 0
            ORDER BY t.name`);
@@ -1420,9 +1423,10 @@ export class MSSQLDriver extends BaseDBDriver {
     schema: string,
     table: string,
   ): Promise<ColumnMeta[]> {
-    const esc = (s: string) => s.replace(/'/g, "''");
     const res = await this.requirePool()
       .request()
+      .input("schema", mssql.NVarChar, schema)
+      .input("table", mssql.NVarChar, table)
       .query<DescribeColumnRow>(`SELECT
            c.name                                                AS COLUMN_NAME,
            TYPE_NAME(c.user_type_id)                            AS DATA_TYPE,
@@ -1454,7 +1458,7 @@ export class MSSQLDriver extends BaseDBDriver {
            SELECT DISTINCT fkc.parent_object_id, fkc.parent_column_id
            FROM [${escapeMssqlId(database)}].sys.foreign_key_columns fkc
          ) fk ON fk.parent_object_id = c.object_id AND fk.parent_column_id = c.column_id
-         WHERE s.name = '${esc(schema)}' AND o.name = '${esc(table)}'
+         WHERE s.name = @schema AND o.name = @table
          ORDER BY c.column_id`);
     return res.recordset.map((row) => {
       const isComputed = isSetFlag(row.is_computed);
@@ -1581,9 +1585,10 @@ export class MSSQLDriver extends BaseDBDriver {
     schema: string,
     table: string,
   ): Promise<import("./types").IndexMeta[]> {
-    const esc = (s: string) => s.replace(/'/g, "''");
     const res = await this.requirePool()
       .request()
+      .input("schema", mssql.NVarChar, schema)
+      .input("table", mssql.NVarChar, table)
       .query<IndexRow>(`SELECT i.name AS idx_name, c.name AS col_name,
                 i.is_unique AS is_unique, i.is_primary_key AS is_pk
          FROM [${escapeMssqlId(database)}].sys.indexes i
@@ -1591,7 +1596,7 @@ export class MSSQLDriver extends BaseDBDriver {
          JOIN [${escapeMssqlId(database)}].sys.columns c ON c.object_id = i.object_id AND c.column_id = ic.column_id
          JOIN [${escapeMssqlId(database)}].sys.objects o ON o.object_id = i.object_id
          JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = o.schema_id
-         WHERE s.name = '${esc(schema)}' AND o.name = '${esc(table)}'
+         WHERE s.name = @schema AND o.name = @table
          ORDER BY i.name, ic.key_ordinal`);
     const map = new Map<string, import("./types").IndexMeta>();
     for (const row of res.recordset) {
@@ -1615,9 +1620,10 @@ export class MSSQLDriver extends BaseDBDriver {
     schema: string,
     table: string,
   ): Promise<import("./types").ForeignKeyMeta[]> {
-    const esc = (s: string) => s.replace(/'/g, "''");
     const res = await this.requirePool()
       .request()
+      .input("schema", mssql.NVarChar, schema)
+      .input("table", mssql.NVarChar, table)
       .query<ForeignKeyRow>(`SELECT fk.name AS constraint_name,
                 pc.name AS column_name,
                 rs.name AS ref_schema,
@@ -1631,7 +1637,7 @@ export class MSSQLDriver extends BaseDBDriver {
          JOIN [${escapeMssqlId(database)}].sys.schemas rs ON rs.schema_id = ro.schema_id
          JOIN [${escapeMssqlId(database)}].sys.objects po ON po.object_id = fkc.parent_object_id
          JOIN [${escapeMssqlId(database)}].sys.schemas ps ON ps.schema_id = po.schema_id
-         WHERE ps.name = '${esc(schema)}' AND po.name = '${esc(table)}'`);
+         WHERE ps.name = @schema AND po.name = @table`);
     return res.recordset.map((row) => ({
       constraintName: row.constraint_name,
       column: row.column_name,
@@ -1646,9 +1652,10 @@ export class MSSQLDriver extends BaseDBDriver {
     table: string,
   ): Promise<import("./types").TableConstraintMeta[]> {
     const constraints = await super.getConstraints(database, schema, table);
-    const esc = (value: string) => value.replace(/'/g, "''");
     const res = await this.requirePool()
       .request()
+      .input("schema", mssql.NVarChar, schema)
+      .input("table", mssql.NVarChar, table)
       .query<{
         constraint_name: string;
         definition: string | null;
@@ -1657,7 +1664,7 @@ export class MSSQLDriver extends BaseDBDriver {
         FROM [${escapeMssqlId(database)}].sys.check_constraints cc
         JOIN [${escapeMssqlId(database)}].sys.objects o ON o.object_id = cc.parent_object_id
         JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = o.schema_id
-        WHERE s.name = '${esc(schema)}' AND o.name = '${esc(table)}'
+        WHERE s.name = @schema AND o.name = @table
         ORDER BY cc.name`);
     constraints.push(
       ...res.recordset.map((row) => ({
@@ -1675,9 +1682,10 @@ export class MSSQLDriver extends BaseDBDriver {
     schema: string,
     table: string,
   ): Promise<import("./types").TriggerMeta[] | null> {
-    const esc = (value: string) => value.replace(/'/g, "''");
     const res = await this.requirePool()
       .request()
+      .input("schema", mssql.NVarChar, schema)
+      .input("table", mssql.NVarChar, table)
       .query<{
         trigger_name: string;
         is_disabled: boolean | number | null;
@@ -1697,7 +1705,7 @@ export class MSSQLDriver extends BaseDBDriver {
         JOIN [${escapeMssqlId(database)}].sys.tables tbl ON tbl.object_id = tr.parent_id
         JOIN [${escapeMssqlId(database)}].sys.schemas sch ON sch.schema_id = tbl.schema_id
         LEFT JOIN [${escapeMssqlId(database)}].sys.sql_modules sm ON sm.object_id = tr.object_id
-        WHERE sch.name = '${esc(schema)}' AND tbl.name = '${esc(table)}'
+        WHERE sch.name = @schema AND tbl.name = @table
         ORDER BY tr.name`);
     return res.recordset.map((row) => {
       const events: import("./types").TriggerMeta["events"] = [];
@@ -1729,18 +1737,20 @@ export class MSSQLDriver extends BaseDBDriver {
     table: string,
     triggerName: string,
   ): Promise<string> {
-    const esc = (value: string) => value.replace(/'/g, "''");
     const res = await this.requirePool()
       .request()
+      .input("schema", mssql.NVarChar, schema)
+      .input("table", mssql.NVarChar, table)
+      .input("triggerName", mssql.NVarChar, triggerName)
       .query<{ definition: string | null }>(
         `SELECT sm.definition AS definition
        FROM [${escapeMssqlId(database)}].sys.triggers tr
        JOIN [${escapeMssqlId(database)}].sys.tables tbl ON tbl.object_id = tr.parent_id
        JOIN [${escapeMssqlId(database)}].sys.schemas sch ON sch.schema_id = tbl.schema_id
        LEFT JOIN [${escapeMssqlId(database)}].sys.sql_modules sm ON sm.object_id = tr.object_id
-       WHERE sch.name = '${esc(schema)}'
-         AND tbl.name = '${esc(table)}'
-         AND tr.name = '${esc(triggerName)}'`,
+       WHERE sch.name = @schema
+         AND tbl.name = @table
+         AND tr.name = @triggerName`,
       );
     const definition = res.recordset[0]?.definition?.trim();
     if (!definition) {
@@ -1753,12 +1763,13 @@ export class MSSQLDriver extends BaseDBDriver {
     schema: string,
     table: string,
   ): Promise<string> {
-    const esc = (s: string) => s.replace(/'/g, "''");
     const objectTypeRes = await this.requirePool()
       .request()
+      .input("schema", mssql.NVarChar, schema)
+      .input("table", mssql.NVarChar, table)
       .query<ObjectTypeRow>(`SELECT TABLE_TYPE
          FROM [${escapeMssqlId(database)}].INFORMATION_SCHEMA.TABLES
-         WHERE TABLE_SCHEMA = '${esc(schema)}' AND TABLE_NAME = '${esc(table)}'`);
+         WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table`);
     if (objectTypeRes.recordset[0]?.TABLE_TYPE === "VIEW") {
       const viewDef = await this.requirePool()
         .request()
@@ -1772,6 +1783,8 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     const cols = await this.requirePool()
       .request()
+      .input("schema", mssql.NVarChar, schema)
+      .input("table", mssql.NVarChar, table)
       .query<DdlColumnRow>(`SELECT
            c.name                              AS COLUMN_NAME,
            TYPE_NAME(c.user_type_id)           AS DATA_TYPE,
@@ -1798,7 +1811,7 @@ export class MSSQLDriver extends BaseDBDriver {
              ON i.object_id = ic.object_id AND i.index_id = ic.index_id
            WHERE i.is_primary_key = 1
          ) pk ON pk.object_id = c.object_id AND pk.column_id = c.column_id
-         WHERE s.name = '${esc(schema)}' AND o.name = '${esc(table)}'
+         WHERE s.name = @schema AND o.name = @table
          ORDER BY c.column_id`);
     const pkCols = cols.recordset
       .filter((row) => row.IS_PK === 1)
@@ -1861,9 +1874,10 @@ export class MSSQLDriver extends BaseDBDriver {
     schema: string,
     name: string,
   ): Promise<string | null> {
-    const esc = (value: string) => value.replace(/'/g, "''");
     const res = await this.requirePool()
       .request()
+      .input("schema", mssql.NVarChar, schema)
+      .input("name", mssql.NVarChar, name)
       .query<{
         start_value: string | number;
         increment: string | number;
@@ -1879,8 +1893,8 @@ export class MSSQLDriver extends BaseDBDriver {
                  cache_size
           FROM [${escapeMssqlId(database)}].sys.sequences seq
           JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = seq.schema_id
-          WHERE s.name = '${esc(schema)}'
-            AND seq.name = '${esc(name)}'`);
+          WHERE s.name = @schema
+            AND seq.name = @name`);
     const row = res.recordset[0];
     if (!row) {
       return null;
@@ -1903,9 +1917,10 @@ export class MSSQLDriver extends BaseDBDriver {
     schema: string,
     name: string,
   ): Promise<string | null> {
-    const esc = (value: string) => value.replace(/'/g, "''");
     const res = await this.requirePool()
       .request()
+      .input("schema", mssql.NVarChar, schema)
+      .input("name", mssql.NVarChar, name)
       .query<{
         base_type: string;
         max_length: number;
@@ -1920,8 +1935,8 @@ export class MSSQLDriver extends BaseDBDriver {
           FROM [${escapeMssqlId(database)}].sys.types t
           JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = t.schema_id
           JOIN [${escapeMssqlId(database)}].sys.types bt ON bt.user_type_id = t.system_type_id AND bt.user_type_id = bt.system_type_id
-          WHERE s.name = '${esc(schema)}'
-            AND t.name = '${esc(name)}'
+          WHERE s.name = @schema
+            AND t.name = @name
             AND t.is_user_defined = 1
             AND t.is_table_type = 0`);
     const row = res.recordset[0];

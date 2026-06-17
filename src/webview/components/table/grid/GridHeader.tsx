@@ -50,6 +50,7 @@ export function GridHeader({
   wasDraggedRef,
   handleHeaderMouseDown,
 }: GridHeaderProps) {
+  void columnSizing;
   return (
     <thead>
       {/* Header row */}

@@ -296,7 +296,7 @@ describe("schema object definitions", () => {
       }
       if (
         sql.includes("FROM [rapidb].sys.sequences seq") &&
-        sql.includes("seq.name = 'users_id_seq'")
+        sql.includes("seq.name = @name")
       ) {
         return Promise.resolve({
           recordset: [
@@ -313,7 +313,7 @@ describe("schema object definitions", () => {
       }
       if (
         sql.includes("FROM [rapidb].sys.types t") &&
-        sql.includes("t.name = 'user_status'")
+        sql.includes("t.name = @name")
       ) {
         return Promise.resolve({
           recordset: [
@@ -329,7 +329,7 @@ describe("schema object definitions", () => {
       }
       throw new Error(`Unexpected SQL: ${sql}`);
     });
-    const request = vi.fn(() => ({ query }));
+    const request = vi.fn(() => ({ query, input: vi.fn().mockReturnThis() }));
     (driver as unknown as { pool: { request: typeof request } }).pool = {
       request,
       close: vi.fn(),

@@ -330,6 +330,7 @@ export function useCellSelection({
     [],
   );
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: all values accessed via refs, empty deps intentional
   const handleKeyDown = useCallback((event: KeyboardEvent) => {
     const currentRange = rangeRef.current;
     const currentRowCount = rowCountRef.current;
@@ -457,7 +458,11 @@ export function useCellSelection({
       case "C": {
         if (event.ctrlKey || event.metaKey) {
           event.preventDefault();
-          const text = serializeToTsv(currentRange, currentGetCellValue, currentIsColumnCollapsed);
+          const text = serializeToTsv(
+            currentRange,
+            currentGetCellValue,
+            currentIsColumnCollapsed,
+          );
           if (text && currentOnCopy) {
             currentOnCopy(text);
           } else if (text) {
@@ -470,7 +475,11 @@ export function useCellSelection({
       case "X": {
         if (event.ctrlKey || event.metaKey) {
           event.preventDefault();
-          const text = serializeToTsv(currentRange, currentGetCellValue, currentIsColumnCollapsed);
+          const text = serializeToTsv(
+            currentRange,
+            currentGetCellValue,
+            currentIsColumnCollapsed,
+          );
           if (text && currentOnCopy) {
             currentOnCopy(text);
           } else if (text) {

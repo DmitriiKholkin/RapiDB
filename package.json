@@ -700,7 +700,7 @@
     "typecheck:webview": "tsc -p tsconfig.webview.json --noEmit",
     "typecheck:tests": "tsc -p tsconfig.tests.json --noEmit",
     "test": "npm run test:all",
-    "test:all": "node ./tests/scripts/run-npm-scripts.mjs compile typecheck test:unit test:webview test:db test:extension test:workflow",
+    "test:all": "node ./tests/scripts/run-npm-scripts.mjs compile typecheck lint test:unit test:webview test:extension db:check db:up db:prepare test:db:sqlite test:db:postgres test:db:mysql test:db:mssql test:db:oracle test:db:nosql db:cleanup-mssql test:workflow:run db:down --finally-if-env-not RAPIDB_KEEP_TEST_SERVICES",
     "test:unit": "vitest run --project unit-node",
     "test:webview": "vitest run --project webview-jsdom",
     "test:db": "node ./tests/scripts/run-npm-scripts.mjs db:up db:prepare test:db:sqlite test:db:postgres test:db:mysql test:db:mssql test:db:oracle test:db:nosql db:down --finally-if-env-not RAPIDB_KEEP_TEST_SERVICES",
@@ -736,6 +736,7 @@
     "db:wait": "tsx ./tests/scripts/db-wait.ts",
     "db:reset": "tsx ./tests/scripts/db-reset.ts",
     "db:seed": "tsx ./tests/scripts/db-seed.ts",
+    "db:cleanup-mssql": "node ./tests/scripts/cleanup-mssql.mjs",
     "db:prepare": "node ./tests/scripts/run-npm-scripts.mjs db:wait db:reset db:seed",
     "db:down": "docker compose -f ./compose.yaml down --remove-orphans",
     "package": "vsce package"

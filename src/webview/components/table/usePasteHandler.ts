@@ -191,6 +191,7 @@ export function usePasteHandler({
     selectionRangeRef,
     contextMenuCellRef,
     newRowRef,
+    getVisibleColumnsFromAnchor,
   ]);
 
   return { pasteErrors, setPasteErrors };

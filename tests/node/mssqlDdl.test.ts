@@ -24,7 +24,8 @@ function attachPool(
   queryHandler: (sql: string) => QueryResult,
 ) {
   const query = vi.fn((sql: string) => Promise.resolve(queryHandler(sql)));
-  const request = vi.fn(() => ({ query }));
+  const input = vi.fn().mockReturnThis();
+  const request = vi.fn(() => ({ query, input }));
   const pool = {
     request,
     close: vi.fn(),

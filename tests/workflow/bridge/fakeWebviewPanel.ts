@@ -75,15 +75,15 @@ function extractInitialState(html: string): unknown {
   }
   let depth = 0;
   let inString = false;
-  let escape = false;
+  let isEscape = false;
   for (let i = jsonStart; i < html.length; i++) {
     const ch = html[i];
-    if (escape) {
-      escape = false;
+    if (isEscape) {
+      isEscape = false;
       continue;
     }
     if (ch === "\\") {
-      escape = true;
+      isEscape = true;
       continue;
     }
     if (ch === '"') {

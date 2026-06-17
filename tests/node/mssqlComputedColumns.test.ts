@@ -7,9 +7,12 @@ function setDriverPoolQueryResult(
   recordset: unknown[],
 ): void {
   const query = vi.fn().mockResolvedValue({ recordset });
-  const request = vi.fn().mockReturnValue({ query });
+  const input = vi.fn().mockReturnThis();
+  const request = vi.fn().mockReturnValue({ query, input });
   (
-    driver as unknown as { pool: { request: () => { query: () => unknown } } }
+    driver as unknown as {
+      pool: { request: () => { query: () => unknown; input: () => unknown } };
+    }
   ).pool = {
     request,
   };

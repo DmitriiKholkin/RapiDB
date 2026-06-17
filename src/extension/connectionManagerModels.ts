@@ -167,9 +167,9 @@ export interface ConnectionManagerLifecycleApi {
  * surface (no `as ConnectionManager & {...}` casts).
  */
 export interface QueryEditorPresentationApi {
-  getQueryEditorPresentation(connectionId: string):
-    | import("../shared/webviewContracts").QueryEditorPresentation
-    | undefined;
+  getQueryEditorPresentation(
+    connectionId: string,
+  ): import("../shared/webviewContracts").QueryEditorPresentation | undefined;
 }
 
 /**
@@ -177,7 +177,9 @@ export interface QueryEditorPresentationApi {
  * kinds of DDL are supported for a given connection.
  */
 export interface DriverMetadataApi {
-  getDriverEntityManifest(connectionId: string): import("./dbDrivers/types").DriverEntityManifest;
+  getDriverEntityManifest(
+    connectionId: string,
+  ): import("./dbDrivers/types").DriverEntityManifest;
 }
 
 /**

@@ -459,7 +459,7 @@ function isDockerAvailable(): boolean {
   // Cross-platform: use `nc` (available on macOS/Linux) or `powershell` (Windows).
   const isWin = process.platform === "win32";
   const cmd = isWin
-    ? "powershell -Command \"Test-NetConnection -ComputerName 127.0.0.1 -Port 5432 -InformationLevel Quiet\""
+    ? 'powershell -Command "Test-NetConnection -ComputerName 127.0.0.1 -Port 5432 -InformationLevel Quiet"'
     : "nc -z 127.0.0.1 5432";
   try {
     execSync(cmd, { timeout: 2000, stdio: "pipe" });

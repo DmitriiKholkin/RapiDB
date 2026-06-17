@@ -684,7 +684,11 @@ describe("QueryPanelController", () => {
   it("posts a query error instead of silently returning when the driver is unavailable", async () => {
     const addToHistory = vi.fn(async () => undefined);
     const connectionManager = {
-      getConnection: vi.fn(() => ({ id: "active", name: "Primary", type: "pg" })),
+      getConnection: vi.fn(() => ({
+        id: "active",
+        name: "Primary",
+        type: "pg",
+      })),
       isConnected: vi.fn(() => true),
       connectTo: vi.fn(async () => undefined),
       addToHistory,

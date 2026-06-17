@@ -898,11 +898,13 @@ export function useConnectionFormState(
   const derived = useMemo(
     () => computeDerivedState(state, existing),
     // eslint-disable-next-line react-hooks/exhaustive-deps
+    // biome-ignore lint/correctness/useExhaustiveDependencies: state changes every render intentionally
     [existing, state],
   );
 
   const buildPayload = useCallback(
     () => buildConnectionPayload(state, derived, existing),
+    // biome-ignore lint/correctness/useExhaustiveDependencies: state changes every render intentionally
     [state, derived, existing],
   );
 
