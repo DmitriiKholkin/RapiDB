@@ -27,6 +27,7 @@ Use the following mental model when navigating the code:
 | Table service | Read, filter, mutate, export, and preview table data | [src/extension/tableDataService.ts](../src/extension/tableDataService.ts), [src/extension/table](../src/extension/table) |
 | Webview bootstrap | React entry point, state store, and message bridge | [src/webview/main.tsx](../src/webview/main.tsx), [src/webview/store](../src/webview/store), [src/webview/utils/messaging.ts](../src/webview/utils/messaging.ts) |
 | Tests | Unit, UI, integration, and live DB coverage | [tests](../tests) |
+| Workflow bridge | `vscode` mock + host/webview glue that lets tests run real panels against real drivers | [tests/workflow](../tests/workflow) |
 
 ## Runtime Boundaries
 

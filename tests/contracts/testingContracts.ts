@@ -9,7 +9,12 @@ export const TEST_PROJECT_IDS = [
   "db-mssql",
   "db-oracle",
   "extension-host",
+  "db-workflow",
 ] as const;
+
+/** Index of the extension-host project in TEST_PROJECT_IDS. */
+export const EXTENSION_HOST_PROJECT_INDEX =
+  TEST_PROJECT_IDS.indexOf("extension-host");
 
 export type TestProjectId = (typeof TEST_PROJECT_IDS)[number];
 

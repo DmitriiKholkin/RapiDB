@@ -2,6 +2,7 @@ import { resolve } from "node:path";
 import { createVitestProject } from "./tests/config/createVitestProject";
 import {
   DB_ENGINE_IDS,
+  EXTENSION_HOST_PROJECT_INDEX,
   projectIdForEngine,
   TEST_PROJECT_IDS,
 } from "./tests/contracts/testingContracts";
@@ -41,7 +42,7 @@ export default [
   }),
   ...dbProjects,
   createVitestProject({
-    projectId: TEST_PROJECT_IDS[7],
+    projectId: TEST_PROJECT_IDS[EXTENSION_HOST_PROJECT_INDEX],
     include: ["tests/extension/**/*.test.ts"],
     environment: "node",
     setupFiles: [
@@ -51,5 +52,22 @@ export default [
     testTimeout: 60000,
     hookTimeout: 60000,
     fileParallelism: false,
+  }),
+  createVitestProject({
+    projectId: "db-workflow",
+    include: ["tests/workflow/**/*.test.ts", "tests/workflow/**/*.test.tsx"],
+    environment: "jsdom",
+    setupFiles: [
+      "./tests/setup/common.setup.ts",
+      "./tests/setup/liveDb.setup.ts",
+      "./tests/workflow/setup/workflow.setup.ts",
+    ],
+    testTimeout: 300000,
+    hookTimeout: 600000,
+    fileParallelism: false,
+    resolveAlias: {
+      "monaco-editor": resolve(__dirname, "tests/mocks/monaco-editor.ts"),
+      vscode: resolve(__dirname, "tests/mocks/vscode.ts"),
+    },
   }),
 ];

@@ -198,9 +198,26 @@ export function createExtensionContextStub(): {
     get<T>(key: string): T | undefined;
     update(key: string, value: unknown): Promise<void>;
   };
+  extensionUri: {
+    readonly scheme: string;
+    readonly path: string;
+    readonly fsPath: string;
+    toString(): string;
+    with(): never;
+  };
+  extensionPath: string;
 } {
   const secretStore = new Map<string, string>();
   const state = new Map<string, unknown>();
+  const extensionUri = {
+    scheme: "file",
+    path: "/extension",
+    fsPath: "/extension",
+    toString: () => "file:///extension",
+    with: (): never => {
+      throw new Error("extensionUri.with() is not implemented in test stub");
+    },
+  };
 
   return {
     subscriptions: [],
@@ -223,5 +240,7 @@ export function createExtensionContextStub(): {
         state.set(key, value);
       },
     },
+    extensionUri,
+    extensionPath: "/extension",
   };
 }

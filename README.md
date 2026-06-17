@@ -169,10 +169,10 @@ Click any table → the **Table Data Viewer** opens:
 |---|---|
 | Extension host | TypeScript, VS Code Extension API |
 | Webview UI | React 19, Monaco Editor, TanStack Table, TanStack Virtual, Zustand |
-| ERD | `@xyflow/react`, `@dagrejs/dagre` |
-| SQL formatting | `sql-formatter` |
-| DB drivers | `pg`, `mysql2`, `mssql`, `oracledb`, `better-sqlite3`, `redis`, `mongodb`, `@elastic/elasticsearch`, `@aws-sdk/client-dynamodb` |
-| VS Code icons | `@vscode/codicons` |
+| ERD | @xyflow/react, @dagrejs/dagre |
+| SQL formatting | sql-formatter |
+| DB drivers | pg, mysql2, mssql, oracledb, better-sqlite3, redis, mongodb, @elastic/elasticsearch, @aws-sdk/client-dynamodb |
+| VS Code icons | @vscode/codicons |
 | Bundler | esbuild |
 
 PRs and contributions are welcome at [github.com/DmitriiKholkin/RapiDB](https://github.com/DmitriiKholkin/RapiDB).
