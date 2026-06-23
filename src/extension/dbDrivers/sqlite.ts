@@ -1216,11 +1216,16 @@ export class SQLiteDriver extends BaseDBDriver {
       return this.checkUuidPersistedEdit(column, expectedValue, options);
     }
     if (
-      column.category === "text" ||
       column.category === "date" ||
       column.category === "time" ||
       column.category === "datetime"
     ) {
+      return {
+        ok: true,
+        shouldVerify: false,
+      };
+    }
+    if (column.category === "text") {
       return this.checkTextPersistedEdit(column, expectedValue, options);
     }
     return null;

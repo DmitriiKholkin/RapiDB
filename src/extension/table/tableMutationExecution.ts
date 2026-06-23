@@ -502,12 +502,11 @@ async function verifyExactNumericUpdates(
 }
 
 function shouldSkipTemporalOnUpdateVerification(
-  column: Pick<ColumnTypeMeta, "onUpdateExpression" | "category">,
+  column: Pick<ColumnTypeMeta, "category">,
 ): boolean {
   return (
-    Boolean(column.onUpdateExpression) &&
-    (column.category === "date" ||
-      column.category === "time" ||
-      column.category === "datetime")
+    column.category === "date" ||
+    column.category === "time" ||
+    column.category === "datetime"
   );
 }

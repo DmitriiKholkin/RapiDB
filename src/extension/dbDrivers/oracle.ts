@@ -2435,11 +2435,16 @@ export class OracleDriver extends BaseDBDriver {
       return this.checkBinaryPersistedEdit(column, expectedValue, options);
     }
     if (
-      column.category === "text" ||
       column.category === "date" ||
       column.category === "time" ||
       column.category === "datetime"
     ) {
+      return {
+        ok: true,
+        shouldVerify: false,
+      };
+    }
+    if (column.category === "text") {
       if (oracleTypeName(column.nativeType) === "XMLTYPE") {
         return this.checkNormalizedPersistedEdit(
           column,

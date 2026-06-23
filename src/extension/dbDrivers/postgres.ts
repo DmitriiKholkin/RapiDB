@@ -1632,35 +1632,16 @@ export class PostgresDriver extends BaseDBDriver {
       return this.checkJsonArrayPersistedEdit(column, expectedValue, options);
     }
     if (
-      column.category === "text" ||
       column.category === "date" ||
       column.category === "time" ||
       column.category === "datetime"
     ) {
-      if (isLikelyPostgresAutoUpdatedTemporalColumn(column)) {
-        return {
-          ok: true,
-          shouldVerify: false,
-        };
-      }
-      if (column.category === "date" || column.category === "time") {
-        return this.checkNormalizedPersistedEdit(
-          column,
-          expectedValue,
-          options,
-          canonicalizePostgresTemporalPersistedValue,
-          `Column "${column.name}" expects a temporal value.`,
-        );
-      }
-      if (column.category === "datetime") {
-        return this.checkNormalizedPersistedEdit(
-          column,
-          expectedValue,
-          options,
-          canonicalizePostgresTemporalPersistedValue,
-          `Column "${column.name}" expects a temporal value.`,
-        );
-      }
+      return {
+        ok: true,
+        shouldVerify: false,
+      };
+    }
+    if (column.category === "text") {
       if (["char", "bpchar", "character"].includes(baseType)) {
         return this.checkFixedWidthCharPersistedEdit(
           column,

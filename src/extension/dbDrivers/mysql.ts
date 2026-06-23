@@ -2163,10 +2163,9 @@ export class MySQLDriver extends BaseDBDriver {
     options?: PersistedEditCheckOptions,
   ): PersistedEditCheckResult | null {
     if (
-      column.onUpdateExpression &&
-      (column.category === "date" ||
-        column.category === "time" ||
-        column.category === "datetime")
+      column.category === "date" ||
+      column.category === "time" ||
+      column.category === "datetime"
     ) {
       return {
         ok: true,
@@ -2221,13 +2220,7 @@ export class MySQLDriver extends BaseDBDriver {
     if (column.category === "binary") {
       return this.checkBinaryPersistedEdit(column, expectedValue, options);
     }
-    if (
-      column.category === "enum" ||
-      column.category === "text" ||
-      column.category === "date" ||
-      column.category === "time" ||
-      column.category === "datetime"
-    ) {
+    if (column.category === "enum" || column.category === "text") {
       if (baseType === "char") {
         return this.checkFixedWidthCharPersistedEdit(
           column,

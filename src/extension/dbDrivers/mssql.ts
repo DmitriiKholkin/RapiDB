@@ -2263,38 +2263,16 @@ export class MSSQLDriver extends BaseDBDriver {
       return this.checkBinaryPersistedEdit(column, expectedValue, options);
     }
     if (
-      column.category === "text" ||
       column.category === "date" ||
       column.category === "time" ||
       column.category === "datetime"
     ) {
-      if (
-        [
-          "date",
-          "time",
-          "datetime",
-          "datetime2",
-          "datetimeoffset",
-          "smalldatetime",
-        ].includes(baseType)
-      ) {
-        return this.checkNormalizedPersistedEdit(
-          column,
-          expectedValue,
-          options,
-          (value) => {
-            if (value === NULL_SENTINEL || value === null) {
-              return { canonical: String(NULL_SENTINEL) };
-            }
-            const canonical = canonicalizeMssqlTemporalPersistedEditValue(
-              value,
-              baseType,
-            );
-            return canonical === null ? null : { canonical };
-          },
-          `Column "${column.name}" expects a temporal value.`,
-        );
-      }
+      return {
+        ok: true,
+        shouldVerify: false,
+      };
+    }
+    if (column.category === "text") {
       if (["char", "nchar"].includes(baseType)) {
         return this.checkFixedWidthCharPersistedEdit(
           column,
