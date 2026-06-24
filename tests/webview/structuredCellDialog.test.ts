@@ -226,29 +226,66 @@ describe("getStructuredCellDialogValue", () => {
     });
   });
 
-  it("serializes structured drafts back to compact commit text", () => {
+  it("returns the JSON/array draft text verbatim so trailing zeros survive", () => {
     expect(
       serializeStructuredCellDialogDraft(
-        '{\n  "name": "Alice",\n  "meta": {\n    "active": false\n  }\n}',
+        '{"amt_estimated_loan":13000.0,"rate_interest_annual":0.95}',
         {
           category: "json",
           nativeType: "JSON",
         },
       ),
-    ).toBe('{"name":"Alice","meta":{"active":false}}');
+    ).toBe('{"amt_estimated_loan":13000.0,"rate_interest_annual":0.95}');
 
     expect(
-      serializeStructuredCellDialogDraft('[\n  "one",\n  "two"\n]', {
+      serializeStructuredCellDialogDraft("[13000.0,42.5]", {
+        category: "array",
+        nativeType: "NUMERIC[]",
+      }),
+    ).toBe("[13000.0,42.5]");
+
+    expect(
+      serializeStructuredCellDialogDraft("[1, 2, 3]", {
         category: "array",
         nativeType: "TEXT[]",
       }),
-    ).toBe('["one","two"]');
+    ).toBe("[1, 2, 3]");
+  });
 
+  it("keeps XML normalization while passing through JSON/array text", () => {
     expect(
       serializeStructuredCellDialogDraft(
-        '<root>\n  <item id="1">Alice</item>\n  <item id="2"/>\n</root>',
+        '<root>\n  <item id="1">Alice</item><item id="2"/></root>',
         xmlColumn,
       ),
     ).toBe('<root><item id="1">Alice</item><item id="2"/></root>');
+  });
+
+  it("pretty-prints JSON text without losing trailing zeros", () => {
+    const result = getStructuredCellDialogValue(
+      '{"amt_estimated_loan":13000.0,"rate_interest_annual":0.95}',
+      {
+        category: "json",
+        nativeType: "JSONB",
+      },
+    );
+    expect(result).toEqual({
+      kind: "json",
+      language: "json",
+      formattedText:
+        '{\n  "amt_estimated_loan": 13000.0,\n  "rate_interest_annual": 0.95\n}',
+    });
+  });
+
+  it("pretty-prints array text with raw numeric tokens", () => {
+    const result = getStructuredCellDialogValue("[13000.0, 42.5]", {
+      category: "array",
+      nativeType: "NUMERIC[]",
+    });
+    expect(result).toEqual({
+      kind: "array",
+      language: "json",
+      formattedText: "[\n  13000.0,\n  42.5\n]",
+    });
   });
 });

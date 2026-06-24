@@ -2036,7 +2036,7 @@ describe("TableView", () => {
       payload: {
         updates: [],
         insertValues: {
-          tags: '["one","two"]',
+          tags: '[\n  "one",\n  "two"\n]',
         },
       },
     });

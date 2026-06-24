@@ -17,6 +17,7 @@ import {
   parseHexToBuffer,
 } from "../dbDrivers/BaseDBDriver";
 import { colKey, type QueryResult } from "../dbDrivers/types";
+import { serializeArrayPreservingRawTokens } from "./arraySerialization";
 
 export interface FormattedQueryResult extends QueryResult {
   columnMeta: QueryColumnMeta[];
@@ -232,6 +233,11 @@ function normalizeQueryRows(
         const intervalLike = formatIntervalLikeObject(value);
         if (intervalLike !== null) {
           normalized[normalizedKey] = intervalLike;
+          continue;
+        }
+
+        if (Array.isArray(value)) {
+          normalized[normalizedKey] = serializeArrayPreservingRawTokens(value);
           continue;
         }
 

@@ -164,34 +164,11 @@ function oracleFloatPrecision(nativeType?: string): number | null {
   if (precision <= 53) return 15;
   return null;
 }
-function oracleFloatDisplayPrecision(nativeType?: string): number | null {
-  if (!nativeType) return null;
-  const normalized = nativeType.toUpperCase().trim();
-  if (normalized === "BINARY_FLOAT") return 7;
-  if (normalized === "BINARY_DOUBLE") return 12;
-  const match = /^FLOAT(?:\((\d+)\))?$/.exec(normalized);
-  if (!match?.[1]) return null;
-  const precision = Number.parseInt(match[1], 10);
-  if (precision <= 24) return 7;
-  if (precision <= 53) return 12;
-  return null;
-}
-function normalizeOracleFloatValue(
-  value: unknown,
-  nativeType?: string,
-): string | null {
+function normalizeOracleFloatValue(value: unknown): string | null {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return null;
   }
-  const normalizedType = nativeType?.toUpperCase().trim();
-  if (normalizedType === "BINARY_FLOAT") {
-    return value.toString();
-  }
-  const precision = oracleFloatDisplayPrecision(nativeType);
-  if (precision === null) {
-    return null;
-  }
-  return Number.parseFloat(value.toPrecision(precision)).toString();
+  return value.toString();
 }
 function oracleFloatFilterTolerance(nativeType?: string): number {
   const precision = oracleFloatPrecision(nativeType);
@@ -641,10 +618,10 @@ function formatOracleQueryValue(
   meta: oracledb.Metadata<unknown>,
 ): unknown {
   if (meta.dbType === oracledb.DB_TYPE_BINARY_FLOAT) {
-    return normalizeOracleFloatValue(value, "BINARY_FLOAT") ?? value;
+    return normalizeOracleFloatValue(value) ?? value;
   }
   if (meta.dbType === oracledb.DB_TYPE_BINARY_DOUBLE) {
-    return normalizeOracleFloatValue(value, "BINARY_DOUBLE") ?? value;
+    return normalizeOracleFloatValue(value) ?? value;
   }
   if (meta.dbType === oracledb.DB_TYPE_INTERVAL_YM) {
     return normalizeOracleIntervalYMValue(value) ?? value;
@@ -2355,10 +2332,7 @@ export class OracleDriver extends BaseDBDriver {
       }
     }
     if (column.category === "float") {
-      const normalizedFloat = normalizeOracleFloatValue(
-        value,
-        column.nativeType,
-      );
+      const normalizedFloat = normalizeOracleFloatValue(value);
       if (normalizedFloat !== null) return normalizedFloat;
     }
     if (isOracleIntervalType(column.nativeType)) {

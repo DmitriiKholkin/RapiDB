@@ -1496,12 +1496,8 @@ export class MySQLDriver extends BaseDBDriver {
                 v = decoded;
               }
             }
-            if (
-              floatCols.has(i) &&
-              typeof v === "number" &&
-              !Number.isInteger(v)
-            ) {
-              v = parseFloat(v.toPrecision(7));
+            if (floatCols.has(i) && typeof v === "number") {
+              v = Number.isFinite(v) ? v : null;
             }
             return [`__col_${i}`, v];
           }),

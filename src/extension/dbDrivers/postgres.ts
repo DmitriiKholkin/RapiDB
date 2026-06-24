@@ -3,7 +3,14 @@ import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { ConnectionConfig } from "../connectionManager";
 import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
+import { serializeArrayPreservingRawTokens } from "../utils/arraySerialization";
+import {
+  canonicalizeJsonPreservingRawNumbers,
+  parseJsonPreservingRawNumbers,
+  serializeCanonicalJson,
+} from "../utils/jsonCanonical";
 import { logger } from "../utils/logger";
+import { jsonArrayLiteralToPgArrayLiteral } from "../utils/postgresArrayLiteral";
 import {
   BaseDBDriver,
   formatDatetimeForDisplay,
@@ -64,11 +71,122 @@ const PG_OID_MONEY = 790;
 const PG_OID_NUMERIC = 1700;
 const PG_OID_TIMESTAMP = 1114;
 const PG_OID_TIMESTAMPTZ = 1184;
+const PG_OID_JSON = 114;
+const PG_OID_JSONB = 3802;
+const PG_ARRAY_OIDS = [
+  1000, 1001, 1002, 1003, 1005, 1007, 1008, 1009, 1015, 1016, 1021, 1022, 1028,
+  1231,
+];
 pgTypes.setTypeParser(PG_OID_DATE, (val: string) => val);
 pgTypes.setTypeParser(PG_OID_MONEY, (val: string) => val);
 pgTypes.setTypeParser(PG_OID_NUMERIC, (val: string) => val);
 pgTypes.setTypeParser(PG_OID_TIMESTAMP, (val: string) => val);
 pgTypes.setTypeParser(PG_OID_TIMESTAMPTZ, (val: string) => val);
+pgTypes.setTypeParser(PG_OID_JSON, (val: string) => val);
+pgTypes.setTypeParser(PG_OID_JSONB, (val: string) => val);
+for (const oid of PG_ARRAY_OIDS) {
+  pgTypes.setTypeParser(oid, parsePostgresArrayLiteral);
+}
+
+function parsePostgresArrayLiteral(value: string): unknown[] {
+  if (value === "{}") {
+    return [];
+  }
+  if (!value.startsWith("{") || !value.endsWith("}")) {
+    return [];
+  }
+  const inner = value.slice(1, -1);
+  const result: unknown[] = [];
+  let i = 0;
+  while (i < inner.length) {
+    while (i < inner.length && (inner[i] === " " || inner[i] === "\t")) {
+      i++;
+    }
+    if (i >= inner.length) {
+      break;
+    }
+    if (inner[i] === "{") {
+      let depth = 1;
+      let j = i + 1;
+      while (j < inner.length && depth > 0) {
+        if (inner[j] === "{") {
+          depth++;
+        } else if (inner[j] === "}") {
+          depth--;
+        }
+        if (depth > 0) {
+          j++;
+        }
+      }
+      const nestedText = inner.slice(i, j + 1);
+      result.push(parsePostgresArrayLiteral(nestedText));
+      i = j + 1;
+    } else if (inner[i] === '"') {
+      let j = i + 1;
+      let token = "";
+      while (j < inner.length) {
+        if (inner[j] === "\\" && j + 1 < inner.length) {
+          const next = inner[j + 1];
+          if (
+            next === '"' ||
+            next === "\\" ||
+            next === "n" ||
+            next === "t" ||
+            next === "r" ||
+            next === "b" ||
+            next === "f" ||
+            next === "v"
+          ) {
+            token +=
+              next === "n"
+                ? "\n"
+                : next === "t"
+                  ? "\t"
+                  : next === "r"
+                    ? "\r"
+                    : next === "b"
+                      ? "\b"
+                      : next === "f"
+                        ? "\f"
+                        : next === "v"
+                          ? "\v"
+                          : next;
+            j += 2;
+            continue;
+          }
+        }
+        if (inner[j] === '"') {
+          j++;
+          break;
+        }
+        token += inner[j];
+        j++;
+      }
+      result.push(token);
+      i = j;
+    } else {
+      let j = i;
+      while (j < inner.length && inner[j] !== ",") {
+        j++;
+      }
+      const raw = inner.slice(i, j).trim();
+      if (raw === "NULL") {
+        result.push(null);
+      } else if (raw === "t") {
+        result.push(true);
+      } else if (raw === "f") {
+        result.push(false);
+      } else {
+        result.push(raw);
+      }
+      i = j;
+    }
+    if (i < inner.length && inner[i] === ",") {
+      i++;
+    }
+  }
+  return result;
+}
 const PG_GEOMETRIC_TYPES = new Set([
   "point",
   "line",
@@ -96,12 +214,7 @@ function normalizeJsonFilterValue(value: string): string | null {
   if (trimmed === "") {
     return null;
   }
-
-  try {
-    return JSON.stringify(JSON.parse(trimmed));
-  } catch {
-    return null;
-  }
+  return trimmed;
 }
 
 function isPointValue(value: object): value is {
@@ -250,7 +363,7 @@ function normalizePostgresTemporalValue(value: string): string {
   }
   return trimmed;
 }
-function canonicalizePostgresTemporalPersistedValue(
+function _canonicalizePostgresTemporalPersistedValue(
   value: unknown,
 ): { canonical: string } | null {
   if (value === NULL_SENTINEL || value === null || value === undefined) {
@@ -289,7 +402,7 @@ function canonicalizePostgresTemporalPersistedValue(
 
   return { canonical: normalizedFraction };
 }
-function isLikelyPostgresAutoUpdatedTemporalColumn(
+function _isLikelyPostgresAutoUpdatedTemporalColumn(
   column: Pick<ColumnTypeMeta, "name" | "category">,
 ): boolean {
   if (column.category !== "datetime") {
@@ -339,6 +452,28 @@ function safeJsonStringify(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function normalizePostgresArrayTextForDisplay(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed === "") {
+    return value;
+  }
+  if (trimmed.startsWith("{")) {
+    const parsed = parsePostgresArrayLiteral(trimmed);
+    if (Array.isArray(parsed)) {
+      return serializeArrayPreservingRawTokens(parsed);
+    }
+    return value;
+  }
+  if (trimmed.startsWith("[")) {
+    const parsed = parseJsonPreservingRawNumbers(trimmed);
+    if (parsed !== undefined && Array.isArray(parsed)) {
+      return serializeCanonicalJson(parsed);
+    }
+    return value;
+  }
+  return value;
 }
 
 export class PostgresDriver extends BaseDBDriver {
@@ -1321,6 +1456,12 @@ export class PostgresDriver extends BaseDBDriver {
   }
   mapTypeCategory(nativeType: string): TypeCategory {
     const ct = nativeType.toLowerCase().split("(")[0].trim();
+    if (
+      nativeType.toLowerCase().endsWith("[]") ||
+      nativeType.toLowerCase().startsWith("_") ||
+      ct === "array"
+    )
+      return "array";
     if (ct === "boolean" || ct === "bool") return "boolean";
     if (
       ct === "smallint" ||
@@ -1358,12 +1499,6 @@ export class PostgresDriver extends BaseDBDriver {
     if (PG_GEOMETRIC_TYPES.has(ct)) return "spatial";
     if (ct === "interval" || nativeType.toLowerCase().startsWith("interval"))
       return "interval";
-    if (
-      nativeType.toLowerCase().endsWith("[]") ||
-      nativeType.toLowerCase().startsWith("_") ||
-      ct === "array"
-    )
-      return "array";
     if (ct === "bit" || ct === "varbit") return "other";
     if (ct === "inet" || ct === "cidr" || ct === "macaddr" || ct === "macaddr8")
       return "text";
@@ -1517,12 +1652,10 @@ export class PostgresDriver extends BaseDBDriver {
       }
     }
     if (column.category === "array") {
-      if (value.startsWith("[") && value.endsWith("]")) {
-        try {
-          const parsed = JSON.parse(value);
-          if (Array.isArray(parsed)) return parsed;
-        } catch {}
-      }
+      return jsonArrayLiteralToPgArrayLiteral(value);
+    }
+    if (column.category === "json") {
+      return value;
     }
     if (column.category === "interval" && value.startsWith("{")) {
       try {
@@ -1555,11 +1688,22 @@ export class PostgresDriver extends BaseDBDriver {
     if (value === null || value === undefined) return value;
     if (Buffer.isBuffer(value)) return super.formatOutputValue(value, column);
     if (typeof value === "bigint") return value.toString();
+    if (typeof value === "string") {
+      if (column.category === "json") {
+        return value;
+      }
+      if (column.category === "array") {
+        return normalizePostgresArrayTextForDisplay(value);
+      }
+    }
     if (
       value !== null &&
       typeof value === "object" &&
       !(value instanceof Date)
     ) {
+      if (column.category === "array" && Array.isArray(value)) {
+        return serializeArrayPreservingRawTokens(value);
+      }
       const formattedInterval = formatPostgresIntervalLikeValue(value);
       if (formattedInterval !== null) {
         return formattedInterval;
@@ -1721,15 +1865,17 @@ export class PostgresDriver extends BaseDBDriver {
     if (column.category === "json" && typeof val === "string") {
       const normalizedJson = normalizeJsonFilterValue(val);
       if (normalizedJson !== null) {
+        const jsonCast =
+          column.nativeType.toLowerCase() === "jsonb" ? "jsonb" : "json";
         if (operator === "eq") {
           return {
-            sql: `(${col})::jsonb = $${paramIndex}::jsonb`,
+            sql: `(${col})::${jsonCast} = $${paramIndex}::${jsonCast}`,
             params: [normalizedJson],
           };
         }
         if (operator === "neq") {
           return {
-            sql: `(${col})::jsonb <> $${paramIndex}::jsonb`,
+            sql: `(${col})::${jsonCast} <> $${paramIndex}::${jsonCast}`,
             params: [normalizedJson],
           };
         }

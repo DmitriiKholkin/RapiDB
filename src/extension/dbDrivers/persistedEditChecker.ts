@@ -1,4 +1,9 @@
 import { formatDatetimeForDisplay } from "../utils/dateUtils";
+import {
+  canonicalizeJsonPreservingRawNumbers,
+  parseJsonPreservingRawNumbers,
+  serializeCanonicalJson,
+} from "../utils/jsonCanonical";
 import type { ColumnTypeMeta, ValueSemantics } from "./types";
 
 /**
@@ -167,15 +172,29 @@ export class PersistedEditChecker {
       return nullish;
     }
     if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (trimmed === "") {
+        return null;
+      }
+      const canonical = canonicalizeJsonPreservingRawNumbers(trimmed);
+      if (canonical === null) {
+        try {
+          return { canonical: JSON.stringify(JSON.parse(trimmed)) };
+        } catch {
+          return null;
+        }
+      }
+      return { canonical };
+    }
+    if (typeof value === "number" || typeof value === "boolean") {
+      return { canonical: JSON.stringify(value) };
+    }
+    if (value !== null && typeof value === "object") {
       try {
-        const parsed = JSON.parse(value);
-        return { canonical: JSON.stringify(parsed) };
+        return { canonical: JSON.stringify(value) };
       } catch {
         return null;
       }
-    }
-    if (typeof value === "object") {
-      return { canonical: JSON.stringify(value) };
     }
     return null;
   }
@@ -191,18 +210,25 @@ export class PersistedEditChecker {
       return nullish;
     }
     if (typeof value === "string") {
-      try {
-        const parsed = JSON.parse(value);
-        if (Array.isArray(parsed)) {
-          return { canonical: JSON.stringify(parsed) };
-        }
+      const trimmed = value.trim();
+      if (trimmed === "") {
         return null;
+      }
+      const parsed = parseJsonPreservingRawNumbers(trimmed);
+      if (parsed === undefined) {
+        return null;
+      }
+      if (!Array.isArray(parsed)) {
+        return null;
+      }
+      return { canonical: serializeCanonicalJson(parsed) };
+    }
+    if (Array.isArray(value)) {
+      try {
+        return { canonical: JSON.stringify(value) };
       } catch {
         return null;
       }
-    }
-    if (Array.isArray(value)) {
-      return { canonical: JSON.stringify(value) };
     }
     return null;
   }

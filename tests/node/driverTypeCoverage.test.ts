@@ -1328,7 +1328,7 @@ describe("filter SQL compatibility for complex null-only types", () => {
       },
     );
 
-    expect(formatted).toBe("3.14159265359");
+    expect(formatted).toBe("3.141592653589793");
   });
 
   it("formats PostgreSQL circle values in canonical text form", () => {

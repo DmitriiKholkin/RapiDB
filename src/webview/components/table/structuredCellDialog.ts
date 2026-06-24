@@ -46,11 +46,7 @@ function resolveStructuredCellKind(
 }
 
 function formatJsonText(text: string): string | null {
-  try {
-    return JSON.stringify(JSON.parse(text) as unknown, null, 2);
-  } catch {
-    return null;
-  }
+  return prettyPrintJsonPreservingRawTokens(text);
 }
 
 function formatStructuredJsonValue(value: unknown): string | null {
@@ -59,6 +55,185 @@ function formatStructuredJsonValue(value: unknown): string | null {
   }
 
   return null;
+}
+
+const JSON_STRING_RE = /"(?:\\.|[^"\\])*"/y;
+const JSON_NUMBER_RE = /-?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?/y;
+const JSON_KEYWORD_RE = /\b(?:true|false|null)\b/y;
+
+function prettyPrintJsonPreservingRawTokens(input: string): string | null {
+  const tokens = tokenizeJsonPreservingRawTokens(input);
+  if (tokens === null) {
+    return null;
+  }
+  if (!isValidJsonStructure(tokens)) {
+    return null;
+  }
+  let out = "";
+  let indent = 0;
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token === "[" || token === "{") {
+      const next = tokens[i + 1];
+      if (next === "]" || next === "}") {
+        out += token + next;
+        i++;
+        continue;
+      }
+      out += `${token}\n${"  ".repeat(indent + 1)}`;
+      indent++;
+      continue;
+    }
+    if (token === "]" || token === "}") {
+      indent = Math.max(0, indent - 1);
+      out += `\n${"  ".repeat(indent)}${token}`;
+      continue;
+    }
+    if (token === ",") {
+      out += `,\n${"  ".repeat(indent)}`;
+      continue;
+    }
+    if (token === ":") {
+      out += ": ";
+      continue;
+    }
+    out += token;
+  }
+  return out;
+}
+
+function tokenizeJsonPreservingRawTokens(input: string): string[] | null {
+  const tokens: string[] = [];
+  let pos = 0;
+  while (pos < input.length) {
+    const ch = input[pos];
+    if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") {
+      pos++;
+      continue;
+    }
+    if (ch === '"') {
+      JSON_STRING_RE.lastIndex = pos;
+      const match = JSON_STRING_RE.exec(input);
+      if (!match || match.index !== pos) {
+        return null;
+      }
+      tokens.push(match[0]);
+      pos += match[0].length;
+      continue;
+    }
+    if (ch === "-" || (ch >= "0" && ch <= "9")) {
+      JSON_NUMBER_RE.lastIndex = pos;
+      const match = JSON_NUMBER_RE.exec(input);
+      if (!match || match.index !== pos) {
+        return null;
+      }
+      tokens.push(match[0]);
+      pos += match[0].length;
+      continue;
+    }
+    if (ch === "t" || ch === "f" || ch === "n") {
+      JSON_KEYWORD_RE.lastIndex = pos;
+      const match = JSON_KEYWORD_RE.exec(input);
+      if (!match || match.index !== pos) {
+        return null;
+      }
+      tokens.push(match[0]);
+      pos += match[0].length;
+      continue;
+    }
+    if (
+      ch === "[" ||
+      ch === "]" ||
+      ch === "{" ||
+      ch === "}" ||
+      ch === "," ||
+      ch === ":"
+    ) {
+      tokens.push(ch);
+      pos++;
+      continue;
+    }
+    return null;
+  }
+  return tokens;
+}
+
+function isValidJsonStructure(tokens: string[]): boolean {
+  let pos = 0;
+  const parseValue = (): boolean => {
+    if (pos >= tokens.length) {
+      return false;
+    }
+    const token = tokens[pos];
+    if (token === "{") {
+      pos++;
+      if (tokens[pos] === "}") {
+        pos++;
+        return true;
+      }
+      while (pos < tokens.length) {
+        const key = tokens[pos];
+        if (!key?.startsWith('"')) {
+          return false;
+        }
+        pos++;
+        if (tokens[pos] !== ":") {
+          return false;
+        }
+        pos++;
+        if (!parseValue()) {
+          return false;
+        }
+        if (tokens[pos] === ",") {
+          pos++;
+          continue;
+        }
+        if (tokens[pos] === "}") {
+          pos++;
+          return true;
+        }
+        return false;
+      }
+      return false;
+    }
+    if (token === "[") {
+      pos++;
+      if (tokens[pos] === "]") {
+        pos++;
+        return true;
+      }
+      while (pos < tokens.length) {
+        if (!parseValue()) {
+          return false;
+        }
+        if (tokens[pos] === ",") {
+          pos++;
+          continue;
+        }
+        if (tokens[pos] === "]") {
+          pos++;
+          return true;
+        }
+        return false;
+      }
+      return false;
+    }
+    if (
+      token === "true" ||
+      token === "false" ||
+      token === "null" ||
+      /^-?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(token) ||
+      token.startsWith('"')
+    ) {
+      pos++;
+      return true;
+    }
+    return false;
+  };
+  if (!parseValue()) {
+    return false;
+  }
+  return pos === tokens.length;
 }
 
 function isXmlLikeText(text: string, nativeType: string): boolean {
@@ -130,15 +305,7 @@ export function serializeStructuredCellDialogDraft(
   }
 
   if (structuredKind === "json" || structuredKind === "array") {
-    if (!trimmed) {
-      return "";
-    }
-
-    try {
-      return JSON.stringify(JSON.parse(trimmed) as unknown);
-    } catch {
-      return trimmed;
-    }
+    return trimmed;
   }
 
   if (!trimmed) {

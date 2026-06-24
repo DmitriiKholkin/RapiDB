@@ -1220,12 +1220,8 @@ export class MSSQLDriver extends BaseDBDriver {
         return 0;
       }
     }
-    if (
-      typeName === "Real" &&
-      typeof value === "number" &&
-      !Number.isInteger(value)
-    ) {
-      return Number.parseFloat(value.toPrecision(7));
+    if (typeName === "Real" && typeof value === "number") {
+      return Number.isFinite(value) ? value : null;
     }
     if (value instanceof Date && !Number.isNaN(value.getTime())) {
       if (typeName === "Date") {
@@ -2267,10 +2263,19 @@ export class MSSQLDriver extends BaseDBDriver {
       column.category === "time" ||
       column.category === "datetime"
     ) {
-      return {
-        ok: true,
-        shouldVerify: false,
-      };
+      const baseType = baseTypeName(column.nativeType);
+      return this.checkNormalizedPersistedEdit(
+        column,
+        expectedValue,
+        options,
+        (value) => {
+          const canonical = canonicalizeMssqlTemporalPersistedEditValue(
+            value,
+            baseType,
+          );
+          return canonical === null ? null : { canonical };
+        },
+      );
     }
     if (column.category === "text") {
       if (["char", "nchar"].includes(baseType)) {

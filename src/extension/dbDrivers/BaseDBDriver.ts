@@ -5,6 +5,11 @@ import type {
   QueryEditorPresentation,
   QueryEditorSqlDialect,
 } from "../../shared/webviewContracts";
+import {
+  canonicalizeJsonPreservingRawNumbers,
+  parseJsonPreservingRawNumbers,
+  serializeCanonicalJson,
+} from "../utils/jsonCanonical";
 import { createSqlReadOnlyQueryGuard } from "../utils/readOnlyGuards";
 import {
   createSqlFilterPreamble,
@@ -556,23 +561,32 @@ function canonicalizeJsonPersistedEditValue(
   if (nullish) {
     return nullish;
   }
-  let parsed = value;
   if (typeof value === "string") {
     const trimmed = value.trim();
     if (trimmed === "") {
       return null;
     }
+    const canonical = canonicalizeJsonPreservingRawNumbers(trimmed);
+    if (canonical === null) {
+      try {
+        return { canonical: JSON.stringify(JSON.parse(trimmed)) };
+      } catch {
+        return null;
+      }
+    }
+    return { canonical };
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return { canonical: JSON.stringify(value) };
+  }
+  if (value !== null && typeof value === "object") {
     try {
-      parsed = JSON.parse(trimmed) as unknown;
+      return { canonical: JSON.stringify(stableJsonValue(value)) };
     } catch {
       return null;
     }
   }
-  try {
-    return { canonical: JSON.stringify(stableJsonValue(parsed)) };
-  } catch {
-    return null;
-  }
+  return null;
 }
 function canonicalizeJsonArrayPersistedEditValue(
   value: unknown,
@@ -581,26 +595,28 @@ function canonicalizeJsonArrayPersistedEditValue(
   if (nullish) {
     return nullish;
   }
-  let parsed = value;
   if (typeof value === "string") {
     const trimmed = value.trim();
     if (trimmed === "") {
       return null;
     }
+    const parsed = parseJsonPreservingRawNumbers(trimmed);
+    if (parsed === undefined) {
+      return null;
+    }
+    if (!Array.isArray(parsed)) {
+      return null;
+    }
+    return { canonical: serializeCanonicalJson(parsed) };
+  }
+  if (Array.isArray(value)) {
     try {
-      parsed = JSON.parse(trimmed) as unknown;
+      return { canonical: JSON.stringify(stableJsonValue(value)) };
     } catch {
       return null;
     }
   }
-  if (!Array.isArray(parsed)) {
-    return null;
-  }
-  try {
-    return { canonical: JSON.stringify(stableJsonValue(parsed)) };
-  } catch {
-    return null;
-  }
+  return null;
 }
 function toPersistedEditBuffer(value: unknown): Buffer | null {
   if (Buffer.isBuffer(value)) {
@@ -1166,6 +1182,12 @@ export abstract class BaseDBDriver implements IDBDriver {
         return isoToLocalDateStr(value.toISOString()) ?? value;
       }
       return formatDatetimeForDisplay(value) ?? value;
+    }
+    if (
+      typeof value === "string" &&
+      (column.category === "json" || column.category === "array")
+    ) {
+      return value;
     }
     if (value !== null && typeof value === "object") {
       return JSON.stringify(value);
