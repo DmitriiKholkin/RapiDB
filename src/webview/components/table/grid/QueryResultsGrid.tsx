@@ -77,6 +77,11 @@ export function QueryResultsGrid({
   const sortedRowsRef = useRef<readonly TanStackRow<Record<string, unknown>>[]>(
     [],
   );
+  const scrollToCellRef = useRef<(row: number, col: number) => void>(() => {});
+
+  const onCellNavigate = useCallback((row: number, col: number) => {
+    scrollToCellRef.current(row, col);
+  }, []);
 
   const getCellValue = useCallback(
     (rowIndex: number, visualColIndex: number) => {
@@ -120,6 +125,7 @@ export function QueryResultsGrid({
     getCellFromPoint,
     onCopy: handleCopyText,
     isColumnCollapsed,
+    onCellNavigate,
   });
 
   useEffect(() => {
@@ -230,6 +236,22 @@ export function QueryResultsGrid({
   });
   const virtualItems = virtualizer.getVirtualItems();
   const totalVirtualHeight = virtualizer.getTotalSize();
+
+  scrollToCellRef.current = (row: number, col: number) => {
+    virtualizer.scrollToIndex(row, { align: "auto" });
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (col === 0) {
+          scrollRef.current?.scrollTo({ left: 0 });
+          return;
+        }
+        const cell = scrollRef.current?.querySelector(
+          `td[data-row="${row}"][data-col="${col}"]`,
+        ) as HTMLElement | null;
+        cell?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      });
+    });
+  };
 
   return (
     <div

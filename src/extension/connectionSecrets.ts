@@ -169,6 +169,10 @@ function hasCredentialBearingUriSecret(config: ConnectionConfig): boolean {
 }
 
 export function shouldForceSecretStorage(config: ConnectionConfig): boolean {
+  if (config.useSecretStorage === false) {
+    return false;
+  }
+
   return (
     config.ssh !== undefined ||
     config.type === "dynamodb" ||

@@ -241,6 +241,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: schemaState.event,
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -264,6 +265,66 @@ describe("ConnectionProvider", () => {
     vi.useRealTimers();
   });
 
+  it("refreshes every affected connection subtree when a global schema refresh fires", async () => {
+    vi.useFakeTimers();
+
+    const schemaState = createEventSource<string>();
+    const refreshSchemas = createEventSource<void>();
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-1", name: "Primary", type: "pg" },
+        { id: "conn-2", name: "Audit", type: "mysql" },
+        { id: "conn-3", name: "Replica", type: "mysql" },
+      ]),
+      isConnected: vi.fn(() => true),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() => loadedState({ databases: [] })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: schemaState.event,
+      isSchemaScopeExpanded: vi.fn(() => false),
+      onDidRefreshSchemas: refreshSchemas.event,
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    const roots = await provider.getChildren();
+    const nodesByConnectionId = new Map(
+      roots.map((node) => [node.connectionId, node]),
+    );
+    const treeChangeSpy = vi.fn();
+    provider.onDidChangeTreeData(treeChangeSpy);
+
+    schemaState.fire("conn-1");
+    schemaState.fire("conn-2");
+    schemaState.fire("conn-3");
+    refreshSchemas.fire(undefined);
+    await vi.advanceTimersByTimeAsync(60);
+
+    const refreshedConnectionIds = new Set(
+      treeChangeSpy.mock.calls
+        .map(([node]) => node?.connectionId)
+        .filter((id): id is string => typeof id === "string"),
+    );
+
+    expect(refreshedConnectionIds).toEqual(
+      new Set(["conn-1", "conn-2", "conn-3"]),
+    );
+    expect(nodesByConnectionId.get("conn-1")).toBeDefined();
+    expect(nodesByConnectionId.get("conn-2")).toBeDefined();
+    expect(nodesByConnectionId.get("conn-3")).toBeDefined();
+
+    vi.useRealTimers();
+  });
+
   it("groups folder connections ahead of ungrouped roots and preserves folder metadata", async () => {
     const connectionManager = {
       getConnections: vi.fn(() => [
@@ -282,6 +343,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -349,6 +411,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -433,6 +496,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -501,6 +565,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -584,6 +649,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -662,6 +728,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -706,6 +773,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -748,6 +816,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: disconnectState.event,
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -801,6 +870,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -848,6 +918,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -897,6 +968,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -958,6 +1030,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -1033,6 +1106,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -1118,6 +1192,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -1163,6 +1238,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -1264,6 +1340,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -1317,6 +1394,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -1389,6 +1467,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -1489,6 +1568,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -1589,6 +1669,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -1661,6 +1742,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -1753,6 +1835,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -1832,6 +1915,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -1882,6 +1966,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -1964,6 +2049,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -2033,6 +2119,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -2085,6 +2172,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -2140,6 +2228,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -2300,6 +2389,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -2364,6 +2454,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -2468,6 +2559,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -2556,6 +2648,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -2618,6 +2711,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -2678,6 +2772,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -2744,6 +2839,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -2818,6 +2914,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -2855,6 +2952,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -2900,6 +2998,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -2939,6 +3038,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 
@@ -2977,6 +3077,7 @@ describe("ConnectionProvider", () => {
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
       onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
       onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
     };
 

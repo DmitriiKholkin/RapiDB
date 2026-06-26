@@ -45,6 +45,7 @@ import {
   DEFAULT_DRIVER_ENTITY_MANIFEST as DEFAULT_ENTITY_MANIFEST,
   resolveDriverTableSectionAvailability,
 } from "../dbDrivers/types";
+import { getExplorerSchemaScopeKey } from "../schemaCacheUtils";
 import {
   composeOpenDdlAwareContextValue,
   type OpenDdlNodeKind,
@@ -390,7 +391,6 @@ export class ConnectionProvider
 
         if (refreshAll) {
           this.refresh();
-          return;
         }
 
         for (const pendingConnectionId of pendingConnectionIds) {
@@ -1110,10 +1110,21 @@ export class ConnectionProvider
     connectionId: string,
     databaseName: string,
   ): RapiDBNode {
+    const scope: ExplorerSchemaScope = {
+      kind: "database",
+      database: databaseName,
+    };
+    const collapsibleState = this.connectionManager.isSchemaScopeExpanded(
+      connectionId,
+      scope,
+    )
+      ? vscode.TreeItemCollapsibleState.Expanded
+      : vscode.TreeItemCollapsibleState.Collapsed;
+
     const node = new RapiDBNode(
       databaseName,
       "database",
-      vscode.TreeItemCollapsibleState.Collapsed,
+      collapsibleState,
       connectionId,
       databaseName,
     );
@@ -1129,10 +1140,22 @@ export class ConnectionProvider
     databaseName: string,
     schemaName: string,
   ): RapiDBNode {
+    const scope: ExplorerSchemaScope = {
+      kind: "schema",
+      database: databaseName,
+      schema: schemaName,
+    };
+    const collapsibleState = this.connectionManager.isSchemaScopeExpanded(
+      connectionId,
+      scope,
+    )
+      ? vscode.TreeItemCollapsibleState.Expanded
+      : vscode.TreeItemCollapsibleState.Collapsed;
+
     const node = new RapiDBNode(
       schemaName,
       "schema",
-      vscode.TreeItemCollapsibleState.Collapsed,
+      collapsibleState,
       connectionId,
       databaseName,
       schemaName,

@@ -40,7 +40,7 @@ type StoredConnectionSecrets = {
   tlsKeyPassphrase?: string;
 };
 
-const CONNECTION_FORM_RETENTION_MODE = "rehydrate" as const;
+const CONNECTION_FORM_RETENTION_MODE = "retain" as const;
 const LAST_SQLITE_DIRECTORY_STATE_KEY = "rapidb.lastSqliteDirectory";
 
 function restoreSubmittedUriValue(

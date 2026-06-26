@@ -2374,6 +2374,14 @@ export class ConnectionManager
     entry.expandedScopeKeys = expandedScopeKeys;
   }
 
+  isSchemaScopeExpanded(
+    connectionId: string,
+    scope: ExplorerSchemaScope,
+  ): boolean {
+    const expandedScopeKeys = this._getExpandedScopeKeys(connectionId);
+    return expandedScopeKeys.has(getExplorerSchemaScopeKey(scope));
+  }
+
   refreshSchemaCache(request?: string | RefreshSchemaRequest): void {
     const connectionId =
       typeof request === "string" ? request : request?.connectionId;

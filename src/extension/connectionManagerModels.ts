@@ -150,6 +150,10 @@ export interface ScopeAwareConnectionManagerApi {
     connectionId: string,
     scope: ExplorerSchemaScope,
   ): void;
+  isSchemaScopeExpanded(
+    connectionId: string,
+    scope: ExplorerSchemaScope,
+  ): boolean;
   refreshSchemaCache(request?: RefreshSchemaRequest): void;
   getSchemaAsync(connectionId: string): Promise<SchemaObjectEntry[]>;
   ensureTableDetailLoading(request: TableDetailRequest): void;

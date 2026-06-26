@@ -1458,7 +1458,6 @@ describe("ConnectionManager", () => {
         database: "app",
         username: "postgres",
         password: "legacy-password",
-        useSecretStorage: false,
       },
     ]);
 
@@ -1501,7 +1500,6 @@ describe("ConnectionManager", () => {
       type: "elasticsearch",
       endpoint: "https://cluster.example.com",
       apiKey: "plaintext-key",
-      useSecretStorage: false,
     });
 
     const persisted = store
@@ -1534,7 +1532,6 @@ describe("ConnectionManager", () => {
       name: "Elastic With Endpoint Secret",
       type: "elasticsearch",
       endpoint: "https://elastic-user:elastic-pass@cluster.example.com",
-      useSecretStorage: false,
     });
 
     const persisted = store
@@ -1574,7 +1571,6 @@ describe("ConnectionManager", () => {
       name: "Mongo With URI Secret",
       type: "mongodb",
       uri: "mongodb://db-user:db-pass@localhost:27017/app",
-      useSecretStorage: false,
     });
 
     const persisted = store
@@ -1638,7 +1634,6 @@ describe("ConnectionManager", () => {
         passphrase: "key-passphrase",
         hostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
       },
-      useSecretStorage: false,
     });
 
     const persisted = store
@@ -1985,7 +1980,6 @@ describe("ConnectionManager", () => {
         name: "Legacy Redis",
         type: "redis",
         connectionUri: "redis://user:pass@localhost:6379",
-        useSecretStorage: false,
       },
     ]);
 
@@ -2029,7 +2023,6 @@ describe("ConnectionManager", () => {
         database: "app",
         username: "postgres",
         password: "legacy-password",
-        useSecretStorage: false,
       },
     ]);
 
@@ -2091,7 +2084,6 @@ describe("ConnectionManager", () => {
         database: "app",
         username: "postgres",
         password: "legacy-password",
-        useSecretStorage: false,
       },
       {
         id: "conn-keep",

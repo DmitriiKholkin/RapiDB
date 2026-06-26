@@ -208,7 +208,7 @@ describe("ConnectionFormPanel", () => {
       1,
       expect.objectContaining({
         enableScripts: true,
-        retainContextWhenHidden: false,
+        retainContextWhenHidden: true,
       }),
     );
 

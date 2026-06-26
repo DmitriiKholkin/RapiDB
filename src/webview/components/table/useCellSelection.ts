@@ -14,6 +14,7 @@ export interface UseCellSelectionOptions {
   rowCount: number;
   colCount: number;
   minRow?: number;
+  minCol?: number;
   getCellValue: (rowIndex: number, colIndex: number) => unknown;
   scrollRef: React.RefObject<HTMLDivElement | null>;
   getCellFromPoint: (
@@ -23,6 +24,7 @@ export interface UseCellSelectionOptions {
   onCopy?: (text: string) => void;
   onPaste?: () => void;
   isColumnCollapsed?: (colIndex: number) => boolean;
+  onCellNavigate?: (row: number, col: number) => void;
 }
 
 export interface UseCellSelectionReturn {
@@ -91,12 +93,14 @@ export function useCellSelection({
   rowCount,
   colCount,
   minRow = 0,
+  minCol = 0,
   getCellValue,
   scrollRef,
   getCellFromPoint,
   onCopy,
   onPaste,
   isColumnCollapsed,
+  onCellNavigate,
 }: UseCellSelectionOptions): UseCellSelectionReturn {
   const [range, setRange] = useState<CellRange | null>(null);
   const isDraggingRef = useRef(false);
@@ -110,6 +114,8 @@ export function useCellSelection({
   rowCountRef.current = rowCount;
   const minRowRef = useRef(minRow);
   minRowRef.current = minRow;
+  const minColRef = useRef(minCol);
+  minColRef.current = minCol;
   const colCountRef = useRef(colCount);
   colCountRef.current = colCount;
   const getCellValueRef = useRef(getCellValue);
@@ -120,6 +126,8 @@ export function useCellSelection({
   onPasteRef.current = onPaste;
   const isColumnCollapsedRef = useRef(isColumnCollapsed);
   isColumnCollapsedRef.current = isColumnCollapsed;
+  const onCellNavigateRef = useRef(onCellNavigate);
+  onCellNavigateRef.current = onCellNavigate;
 
   const contextMenuCellRef = useRef<{ row: number; col: number } | null>(null);
 
@@ -335,11 +343,13 @@ export function useCellSelection({
     const currentRange = rangeRef.current;
     const currentRowCount = rowCountRef.current;
     const currentMinRow = minRowRef.current;
+    const currentMinCol = minColRef.current;
     const currentColCount = colCountRef.current;
     const currentGetCellValue = getCellValueRef.current;
     const currentOnCopy = onCopyRef.current;
     const currentOnPaste = onPasteRef.current;
     const currentIsColumnCollapsed = isColumnCollapsedRef.current;
+    const currentOnCellNavigate = onCellNavigateRef.current;
 
     const target = event.target as HTMLElement | null;
     const isCut = event.key === "x" || event.key === "X";
@@ -369,10 +379,17 @@ export function useCellSelection({
 
     const { activeRow, activeCol } = currentRange;
 
+    const scrollToCell = (row: number, col: number) => {
+      if (currentOnCellNavigate) {
+        currentOnCellNavigate(row, col);
+      }
+    };
+
     switch (event.key) {
       case "ArrowUp": {
         event.preventDefault();
         const newRow = Math.max(currentMinRow, activeRow - 1);
+        if (newRow === activeRow) break;
         if (event.shiftKey) {
           setRange({ ...currentRange, activeRow: newRow });
         } else {
@@ -383,11 +400,13 @@ export function useCellSelection({
             activeCol: activeCol,
           });
         }
+        scrollToCell(newRow, activeCol);
         break;
       }
       case "ArrowDown": {
         event.preventDefault();
         const newRow = Math.min(currentRowCount - 1, activeRow + 1);
+        if (newRow === activeRow) break;
         if (event.shiftKey) {
           setRange({ ...currentRange, activeRow: newRow });
         } else {
@@ -398,11 +417,13 @@ export function useCellSelection({
             activeCol: activeCol,
           });
         }
+        scrollToCell(newRow, activeCol);
         break;
       }
       case "ArrowLeft": {
         event.preventDefault();
-        const newCol = Math.max(0, activeCol - 1);
+        const newCol = Math.max(currentMinCol, activeCol - 1);
+        if (newCol === activeCol) break;
         if (event.shiftKey) {
           setRange({ ...currentRange, activeCol: newCol });
         } else {
@@ -413,11 +434,13 @@ export function useCellSelection({
             activeCol: newCol,
           });
         }
+        scrollToCell(activeRow, newCol);
         break;
       }
       case "ArrowRight": {
         event.preventDefault();
         const newCol = Math.min(currentColCount - 1, activeCol + 1);
+        if (newCol === activeCol) break;
         if (event.shiftKey) {
           setRange({ ...currentRange, activeCol: newCol });
         } else {
@@ -428,30 +451,35 @@ export function useCellSelection({
             activeCol: newCol,
           });
         }
+        scrollToCell(activeRow, newCol);
         break;
       }
       case "Tab": {
         event.preventDefault();
         const newCol = event.shiftKey
-          ? Math.max(0, activeCol - 1)
+          ? Math.max(currentMinCol, activeCol - 1)
           : Math.min(currentColCount - 1, activeCol + 1);
+        if (newCol === activeCol) break;
         setRange({
           anchorRow: activeRow,
           anchorCol: newCol,
           activeRow: activeRow,
           activeCol: newCol,
         });
+        scrollToCell(activeRow, newCol);
         break;
       }
       case "Enter": {
         event.preventDefault();
         const newRow = Math.min(currentRowCount - 1, activeRow + 1);
+        if (newRow === activeRow) break;
         setRange({
           anchorRow: newRow,
           anchorCol: activeCol,
           activeRow: newRow,
           activeCol: activeCol,
         });
+        scrollToCell(newRow, activeCol);
         break;
       }
       case "c":

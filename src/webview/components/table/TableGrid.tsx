@@ -343,6 +343,11 @@ function QueryResultsGrid({
   const sortedRowsRef = useRef<readonly TanStackRow<Record<string, unknown>>[]>(
     [],
   );
+  const scrollToCellRef = useRef<(row: number, col: number) => void>(() => {});
+
+  const onCellNavigate = useCallback((row: number, col: number) => {
+    scrollToCellRef.current(row, col);
+  }, []);
 
   const getCellValue = useCallback(
     (rowIndex: number, visualColIndex: number) => {
@@ -386,6 +391,7 @@ function QueryResultsGrid({
     getCellFromPoint,
     onCopy: handleCopyText,
     isColumnCollapsed,
+    onCellNavigate,
   });
 
   useEffect(() => {
@@ -496,6 +502,22 @@ function QueryResultsGrid({
   });
   const virtualItems = virtualizer.getVirtualItems();
   const totalVirtualHeight = virtualizer.getTotalSize();
+
+  scrollToCellRef.current = (row: number, col: number) => {
+    virtualizer.scrollToIndex(row, { align: "auto" });
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (col === 0) {
+          scrollRef.current?.scrollTo({ left: 0 });
+          return;
+        }
+        const cell = scrollRef.current?.querySelector(
+          `td[data-row="${row}"][data-col="${col}"]`,
+        ) as HTMLElement | null;
+        cell?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      });
+    });
+  };
 
   return (
     <div
@@ -948,10 +970,15 @@ function TableDataGrid({
   const [pasteErrors, setPasteErrors] = useState<PasteValidationError[]>([]);
   const newRowRef = useRef(newRow);
   newRowRef.current = newRow;
+  const scrollToCellRef = useRef<(row: number, col: number) => void>(() => {});
 
   const dataColCount = columns.length;
   const selColOffset = canSelectAndDeleteRows ? 1 : 0;
   const totalColCount = dataColCount + selColOffset;
+
+  const onCellNavigate = useCallback((row: number, col: number) => {
+    scrollToCellRef.current(row, col);
+  }, []);
 
   const getCellValue = useCallback(
     (rowIndex: number, colIndex: number) => {
@@ -1006,12 +1033,14 @@ function TableDataGrid({
     rowCount: rows.length,
     colCount: totalColCount,
     minRow: newRow ? -1 : 0,
+    minCol: selColOffset,
     getCellValue,
     scrollRef,
     getCellFromPoint,
     onCopy: handleCopyText,
     onPaste: handlePaste,
     isColumnCollapsed,
+    onCellNavigate,
   });
 
   const selectionRangeRef = useRef(selection.range);
@@ -1462,6 +1491,22 @@ function TableDataGrid({
   });
   const virtualItems = virtualizer.getVirtualItems();
   const totalVirtualHeight = virtualizer.getTotalSize();
+
+  scrollToCellRef.current = (row: number, col: number) => {
+    virtualizer.scrollToIndex(row, { align: "auto" });
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (col === selColOffset) {
+          scrollRef.current?.scrollTo({ left: 0 });
+          return;
+        }
+        const cell = scrollRef.current?.querySelector(
+          `td[data-row="${row}"][data-col="${col}"]`,
+        ) as HTMLElement | null;
+        cell?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      });
+    });
+  };
 
   return (
     <div
