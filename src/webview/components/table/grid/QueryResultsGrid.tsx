@@ -243,7 +243,6 @@ export function QueryResultsGrid({
       requestAnimationFrame(() => {
         if (col === 0) {
           scrollRef.current?.scrollTo({ left: 0 });
-          return;
         }
         const cell = scrollRef.current?.querySelector(
           `td[data-row="${row}"][data-col="${col}"]`,
