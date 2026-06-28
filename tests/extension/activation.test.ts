@@ -21,6 +21,7 @@ const expectedCommands = [
   "rapidb.deleteBookmark",
   "rapidb.clearBookmarks",
   "rapidb.clearHistory",
+  "rapidb.refreshAll",
   "rapidb.refresh",
   "rapidb.showConnectedOnly",
   "rapidb.showAllConnections",
@@ -133,7 +134,9 @@ describe("extension activation", () => {
     function ConnectionProviderMock() {
       const instance = {
         refresh: vi.fn(),
+        refreshConnectionTree: vi.fn(),
         markConnectionRootExpanded: vi.fn(),
+        collapseAllConnectionRoots: vi.fn(),
         disposable: { dispose: vi.fn() },
       };
       connectionProviderInstances.push(instance);

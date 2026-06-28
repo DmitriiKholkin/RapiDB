@@ -2616,6 +2616,10 @@ export class ConnectionManager
       return false;
     }
 
+    if (!this.isConnected(connectionId)) {
+      return false;
+    }
+
     const nextSnapshot = buildAggregateSchemaSnapshot(entry);
     const nextState = deriveAggregateSchemaState(entry, nextSnapshot);
 

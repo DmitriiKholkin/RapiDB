@@ -19,6 +19,7 @@ export const RAPIDB_COMMANDS = {
   clearHistory: "rapidb.clearHistory",
   disconnectAll: "rapidb.disconnectAll",
   refresh: "rapidb.refresh",
+  refreshAll: "rapidb.refreshAll",
   showConnectedOnly: "rapidb.showConnectedOnly",
   showAllConnections: "rapidb.showAllConnections",
 } as const;

@@ -404,7 +404,6 @@ export class ConnectionProvider
       }),
       connectionManager.onDidDisconnect((connectionId) => {
         this.markConnectionRootExpanded(connectionId, false);
-        scheduleRefresh(connectionId);
       }),
       connectionManager.onDidChangeConnections(() => scheduleRefresh()),
       connectionManager.onDidChangeSchemaState((connectionId) =>
@@ -449,7 +448,12 @@ export class ConnectionProvider
 
   refreshConnectionTree(connectionId?: string): void {
     if (!connectionId) {
-      this.refresh();
+      // Refresh each connection subtree individually so VS Code preserves
+      // the expanded state of deeper nodes (databases, schemas, tables,
+      // table sections, columns) that still exist after refresh.
+      for (const node of this._connectionNodes.values()) {
+        this.refresh(node);
+      }
       return;
     }
 
@@ -463,6 +467,11 @@ export class ConnectionProvider
     }
 
     this._expandedConnectionRoots.delete(connectionId);
+  }
+
+  collapseAllConnectionRoots(): void {
+    this._expandedConnectionRoots.clear();
+    this.refresh();
   }
 
   getTreeItem(element: RapiDBNode): vscode.TreeItem {

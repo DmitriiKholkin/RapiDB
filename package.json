@@ -82,6 +82,12 @@
         "icon": "$(code)"
       },
       {
+        "command": "rapidb.refreshAll",
+        "title": "Refresh",
+        "category": "RapiDB",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "rapidb.refresh",
         "title": "Refresh",
         "category": "RapiDB",
@@ -255,7 +261,7 @@
           "group": "navigation@1"
         },
         {
-          "command": "rapidb.refresh",
+          "command": "rapidb.refreshAll",
           "when": "view == rapidb-explorer",
           "group": "navigation@2"
         },

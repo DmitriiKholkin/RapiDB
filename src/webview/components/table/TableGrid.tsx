@@ -43,11 +43,11 @@ import { CellDisplay } from "./CellDisplay";
 import { ColumnFilterControl } from "./ColumnFilterControl";
 import { EditInput, valueToEditString } from "./EditInput";
 import { GridContextMenu } from "./GridContextMenu";
+import { QueryModeTableGrid } from "./grid/QueryModeTableGrid";
 import {
   getStructuredCellDialogValue,
   type StructuredCellDialogValue,
 } from "./structuredCellDialog";
-import { QueryModeTableGrid } from "./grid/QueryModeTableGrid";
 import {
   buildColumnHeaderTitle,
   canEditColumn,

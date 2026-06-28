@@ -19,7 +19,8 @@ export interface UtilityCommandContext {
  * Registers all utility commands.
  *
  * Commands:
- * - rapidb.refresh: Refresh connection tree
+ * - rapidb.refreshAll: Refresh all connections (toolbar)
+ * - rapidb.refresh: Refresh a single connection (context menu)
  * - rapidb.showConnectedOnly: Toggle connected-only view
  * - rapidb.showAllConnections: Show all connections
  * - rapidb.disconnectAll: Disconnect from all connections
@@ -33,13 +34,20 @@ export function registerUtilityCommands(
 ): void {
   const { connectionManager, connectionProvider, refresh } = ctx;
 
-  // ─── Refresh ───────────────────────────────────────────────────────
+  // ─── Refresh All (toolbar) ─────────────────────────────────────────
+  registerCommand(CMD.refreshAll, () => {
+    connectionManager.refreshSchemaCache({ reason: "manual" });
+    connectionProvider.refreshConnectionTree();
+  });
+
+  // ─── Refresh (context menu) ────────────────────────────────────────
   registerCommand(CMD.refresh, (node?: RapiDBNode) => {
+    const connectionId = node?.connectionId;
     connectionManager.refreshSchemaCache({
-      connectionId: node?.connectionId,
+      connectionId,
       reason: "manual",
     });
-    connectionProvider.refreshConnectionTree(node?.connectionId);
+    connectionProvider.refreshConnectionTree(connectionId);
   });
 
   // ─── Show Connected Only ───────────────────────────────────────────
@@ -54,6 +62,7 @@ export function registerUtilityCommands(
 
   // ─── Disconnect All ────────────────────────────────────────────────
   registerCommand(CMD.disconnectAll, async () => {
+    connectionProvider.collapseAllConnectionRoots();
     await connectionManager.disconnectAll();
     refresh();
   });
