@@ -143,6 +143,9 @@ function serializeStoredConnectionSecrets(
 }
 
 function shouldUseSecretStorage(payload: ConnectionFormSubmission): boolean {
+  if (payload.useSecretStorage === false) {
+    return false;
+  }
   return (
     payload.ssh !== undefined ||
     payload.type === "dynamodb" ||

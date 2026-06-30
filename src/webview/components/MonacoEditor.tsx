@@ -791,16 +791,15 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       const handleContextMenu = (event: MouseEvent) => {
         event.preventDefault();
 
-        const bounds = root.getBoundingClientRect();
         const menuWidth = 100;
-        const menuHeight = 50;
+        const menuHeight = 80;
         const x = Math.min(
-          Math.max(event.clientX - bounds.left, 4),
-          Math.max(bounds.width - menuWidth, 4),
+          Math.max(event.clientX, 4),
+          window.innerWidth - menuWidth - 4,
         );
         const y = Math.min(
-          Math.max(event.clientY - bounds.top, 4),
-          Math.max(bounds.height - menuHeight, 4),
+          Math.max(event.clientY, 4),
+          window.innerHeight - menuHeight - 4,
         );
 
         setContextMenu({
@@ -869,7 +868,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
             role="menu"
             aria-label="Editor context menu"
             style={{
-              position: "absolute",
+              position: "fixed",
               top: contextMenu.y,
               left: contextMenu.x,
               minWidth: 100,
