@@ -464,7 +464,7 @@ export class ConnectionFormPanel {
             submittedSsh.authMethod === "password"
               ? this.resolveSubmittedSecret(
                   submittedSsh.password,
-                  useSecretStorage ? storedSecrets.sshPassword : undefined,
+                  storedSecrets.sshPassword,
                   existing?.ssh?.password,
                 )
               : undefined,
@@ -472,7 +472,7 @@ export class ConnectionFormPanel {
             submittedSsh.authMethod === "privateKey"
               ? this.resolveSubmittedSecret(
                   submittedSsh.privateKey,
-                  useSecretStorage ? storedSecrets.sshPrivateKey : undefined,
+                  storedSecrets.sshPrivateKey,
                   existing?.ssh?.privateKey,
                 )
               : undefined,
@@ -480,7 +480,7 @@ export class ConnectionFormPanel {
             submittedSsh.authMethod === "privateKey"
               ? this.resolveSubmittedSecret(
                   submittedSsh.passphrase,
-                  useSecretStorage ? storedSecrets.sshPassphrase : undefined,
+                  storedSecrets.sshPassphrase,
                   existing?.ssh?.passphrase,
                 )
               : undefined,

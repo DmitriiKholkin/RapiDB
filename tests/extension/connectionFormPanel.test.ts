@@ -747,7 +747,7 @@ describe("ConnectionFormPanel", () => {
     await expect(promise).resolves.toBeUndefined();
   });
 
-  it("forces Elasticsearch credentials into Secret Storage and saves a sanitized config", async () => {
+  it("respects useSecretStorage: false for Elasticsearch and stores credentials as plaintext", async () => {
     const context = {
       secrets: {
         get: vi.fn(async () => undefined),
@@ -790,29 +790,23 @@ describe("ConnectionFormPanel", () => {
       expect.objectContaining({
         id: "conn-es",
         type: "elasticsearch",
-        endpoint: "https://cluster.example.com",
-        cloudId: "deployment:ZXM=",
-        useSecretStorage: true,
-      }),
-    );
-    expect(context.secrets.store).toHaveBeenCalledWith(
-      "conn-es",
-      JSON.stringify({
-        apiKey: "base64-api-key",
         endpoint: "https://elastic-user:elastic-pass@cluster.example.com",
+        cloudId: "deployment:ZXM=",
+        useSecretStorage: false,
       }),
     );
+    expect(context.secrets.store).not.toHaveBeenCalled();
     expect(connectionManager.saveConnection).toHaveBeenCalledWith(
       expect.objectContaining({
         type: "elasticsearch",
         endpoint: "https://elastic-user:elastic-pass@cluster.example.com",
         apiKey: "base64-api-key",
-        useSecretStorage: true,
+        useSecretStorage: false,
       }),
     );
   });
 
-  it("forces SSH credentials into Secret Storage and preserves stored private key secrets", async () => {
+  it("resolves SSH secrets from keychain into plaintext config when useSecretStorage is disabled", async () => {
     const previousSecretSnapshot = JSON.stringify({
       sshPrivateKey:
         "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
@@ -906,18 +900,15 @@ describe("ConnectionFormPanel", () => {
         id: "conn-ssh",
         ssh: expect.objectContaining({
           host: "bastion.example.com",
+          privateKey:
+            "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+          passphrase: "new-passphrase",
         }),
-        useSecretStorage: true,
+        useSecretStorage: false,
       }),
     );
-    expect(context.secrets.store).toHaveBeenCalledWith(
-      "conn-ssh",
-      JSON.stringify({
-        sshPrivateKey:
-          "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
-        sshPassphrase: "new-passphrase",
-      }),
-    );
+    expect(context.secrets.store).not.toHaveBeenCalled();
+    expect(context.secrets.delete).toHaveBeenCalledWith("conn-ssh");
     expect(connectionManager.saveConnection).toHaveBeenCalledWith(
       expect.objectContaining({
         id: "conn-ssh",
@@ -926,7 +917,7 @@ describe("ConnectionFormPanel", () => {
             "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
           passphrase: "new-passphrase",
         }),
-        useSecretStorage: true,
+        useSecretStorage: false,
       }),
     );
   });
