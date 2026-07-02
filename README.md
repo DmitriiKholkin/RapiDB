@@ -49,9 +49,11 @@ Your database lives in the sidebar — same window, same shortcuts, same theme.
 
 ### 🔌 Connect to anything
 
-PostgreSQL, MS SQL Server, MySQL, MariaDB, SQLite, Oracle, Redis, MongoDB, Elasticsearch, DynamoDB  — all supported out of the box. SSL, self-signed certs, connection folders to keep things organized.
+PostgreSQL, MS SQL Server, MySQL, MariaDB, SQLite, Oracle, Redis, MongoDB, Elasticsearch, DynamoDB  — all supported out of the box. SSL, self-signed certs, SSH tunneling, connection folders to keep things organized.
 
 <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-3.png" alt="Connection Form" width="100%" />
+
+> Every connection has a **read-only mode** toggle. When enabled, query execution is limited to read operations and all table edits are blocked — useful for production databases or when you just want to look without breaking anything.
 
 <br/>
 
