@@ -768,6 +768,9 @@ export class ConnectionManager
     this.onDidRefreshSchemas = this._onDidRefreshSchemas.event;
     this.store.onDidChangeConfiguration(async (e) => {
       this._connectionsCache = null;
+      if (e.affectsConfiguration("rapidb.connections")) {
+        this._onDidChangeConnections.fire();
+      }
       if (e.affectsConfiguration("rapidb.queryHistoryLimit")) {
         await this._trimHistoryToLimit();
       }
