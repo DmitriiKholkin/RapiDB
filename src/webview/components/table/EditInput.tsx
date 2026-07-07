@@ -1,4 +1,5 @@
-import React, {
+import type React from "react";
+import {
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -233,6 +234,17 @@ export function EditInput({
         }
         style={inputStyle}
       />
+      {category === "uuid" && !readOnly && (
+        <button
+          type="button"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => onCommit(crypto.randomUUID())}
+          title="Generate a random UUID v4"
+          style={nullBtnStyle}
+        >
+          UUID
+        </button>
+      )}
       {showDefaultButton && !readOnly && onSetDefault && (
         <button
           type="button"
@@ -273,9 +285,8 @@ export function EditInput({
               cssVar("--vscode-menu-background") ||
               cssVar("--vscode-editorWidget-background") ||
               "#252526",
-            border: `1px solid ${
-              cssVar("--vscode-menu-border") || "rgba(255, 255, 255, 0.12)"
-            }`,
+            border: `1px solid ${cssVar("--vscode-menu-border") || "rgba(255, 255, 255, 0.12)"
+              }`,
             borderRadius: 6,
             boxShadow:
               "0 10px 30px rgba(0, 0, 0, 0.24), 0 2px 8px rgba(0, 0, 0, 0.18)",
@@ -297,10 +308,10 @@ export function EditInput({
               background: "transparent",
               color: contextMenu.hasSelection
                 ? cssVar("--vscode-menu-foreground") ||
-                  cssVar("--vscode-foreground") ||
-                  "#cccccc"
+                cssVar("--vscode-foreground") ||
+                "#cccccc"
                 : cssVar("--vscode-disabledForeground") ||
-                  "rgba(255, 255, 255, 0.4)",
+                "rgba(255, 255, 255, 0.4)",
               padding: "4px 10px",
               fontSize: 12,
               textAlign: "left",

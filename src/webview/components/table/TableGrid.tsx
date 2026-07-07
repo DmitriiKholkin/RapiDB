@@ -457,7 +457,7 @@ function TableDataGrid({
   const [pasteErrors, setPasteErrors] = useState<PasteValidationError[]>([]);
   const newRowRef = useRef(newRow);
   newRowRef.current = newRow;
-  const scrollToCellRef = useRef<(row: number, col: number) => void>(() => {});
+  const scrollToCellRef = useRef<(row: number, col: number) => void>(() => { });
 
   const dataColCount = columns.length;
   const selColOffset = canSelectAndDeleteRows ? 1 : 0;
@@ -818,57 +818,57 @@ function TableDataGrid({
     () => [
       ...(canSelectAndDeleteRows
         ? [
-            {
-              id: "__sel",
-              size: 36,
-              header: () => (
-                <input
-                  type="checkbox"
-                  aria-label="Select all rows"
-                  checked={rows.length > 0 && selected.size === rows.length}
-                  ref={(element) => {
-                    if (element) {
-                      element.indeterminate =
-                        selected.size > 0 && selected.size < rows.length;
-                    }
-                  }}
-                  onChange={(event) =>
-                    onSelectionChange(
-                      event.target.checked
-                        ? new Set(rows.map((_, index) => index))
-                        : new Set(),
-                    )
+          {
+            id: "__sel",
+            size: 36,
+            header: () => (
+              <input
+                type="checkbox"
+                aria-label="Select all rows"
+                checked={rows.length > 0 && selected.size === rows.length}
+                ref={(element) => {
+                  if (element) {
+                    element.indeterminate =
+                      selected.size > 0 && selected.size < rows.length;
                   }
-                  style={{
-                    cursor: "pointer",
-                    accentColor: "var(--vscode-button-background)",
-                    margin: 0,
-                  }}
-                />
-              ),
-              cell: ({ row }: CellContext<Row, unknown>) => (
-                <input
-                  type="checkbox"
-                  aria-label={`Select row ${row.index + 1}`}
-                  checked={selected.has(row.index)}
-                  onChange={(event: React.ChangeEvent<HTMLInputElement>) => {
-                    const nextSelection = new Set(selected);
-                    if (event.target.checked) {
-                      nextSelection.add(row.index);
-                    } else {
-                      nextSelection.delete(row.index);
-                    }
-                    onSelectionChange(nextSelection);
-                  }}
-                  style={{
-                    cursor: "pointer",
-                    accentColor: "var(--vscode-button-background)",
-                    margin: 0,
-                  }}
-                />
-              ),
-            } as TanColumnDef<Row>,
-          ]
+                }}
+                onChange={(event) =>
+                  onSelectionChange(
+                    event.target.checked
+                      ? new Set(rows.map((_, index) => index))
+                      : new Set(),
+                  )
+                }
+                style={{
+                  cursor: "pointer",
+                  accentColor: "var(--vscode-button-background)",
+                  margin: 0,
+                }}
+              />
+            ),
+            cell: ({ row }: CellContext<Row, unknown>) => (
+              <input
+                type="checkbox"
+                aria-label={`Select row ${row.index + 1}`}
+                checked={selected.has(row.index)}
+                onChange={(event: React.ChangeEvent<HTMLInputElement>) => {
+                  const nextSelection = new Set(selected);
+                  if (event.target.checked) {
+                    nextSelection.add(row.index);
+                  } else {
+                    nextSelection.delete(row.index);
+                  }
+                  onSelectionChange(nextSelection);
+                }}
+                style={{
+                  cursor: "pointer",
+                  accentColor: "var(--vscode-button-background)",
+                  margin: 0,
+                }}
+              />
+            ),
+          } as TanColumnDef<Row>,
+        ]
         : []),
       ...columns.map(
         (column): TanColumnDef<Row> => ({
@@ -1237,7 +1237,7 @@ function TableDataGrid({
               const isSelected = selected.has(persistedIndex);
               const editingCol =
                 editCell?.kind === "persisted" &&
-                editCell.rowIdx === persistedIndex
+                  editCell.rowIdx === persistedIndex
                   ? editCell.col
                   : null;
 

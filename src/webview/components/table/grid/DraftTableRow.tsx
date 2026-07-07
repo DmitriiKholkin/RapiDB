@@ -2,7 +2,8 @@ import {
   flexRender,
   type Column as TanStackColumn,
 } from "@tanstack/react-table";
-import React, { useMemo } from "react";
+import type React from "react";
+import { useMemo } from "react";
 import {
   type ColumnTypeMeta as ColumnMeta,
   isNumericCategory,
@@ -120,20 +121,20 @@ export function DraftTableRow({
         const selRow = -1;
         const cellSelectionState = isDataCol
           ? classifyCellSelection(
-              selection?.range ?? null,
-              selRow,
-              colIndex,
-              selection?.isCellSelected(selRow, colIndex) ?? false,
-              selection?.isCellAnchor(selRow, colIndex) ?? false,
-            )
+            selection?.range ?? null,
+            selRow,
+            colIndex,
+            selection?.isCellSelected(selRow, colIndex) ?? false,
+            selection?.isCellAnchor(selRow, colIndex) ?? false,
+          )
           : {
-              selected: false,
-              anchor: false,
-              top: false,
-              bottom: false,
-              left: false,
-              right: false,
-            };
+            selected: false,
+            anchor: false,
+            top: false,
+            bottom: false,
+            left: false,
+            right: false,
+          };
         const cellClasses = buildCellSelectionClassName(cellSelectionState);
 
         return (
