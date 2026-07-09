@@ -1817,7 +1817,10 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
         </button>
         <button
           type="button"
-          style={buildButtonStyle("ghost", { size: "md" })}
+          style={buildButtonStyle("ghost", {
+            disabled: testState === "testing",
+            size: "md",
+          })}
           disabled={testState === "testing"}
           onClick={() => postMessage("cancel")}
         >
