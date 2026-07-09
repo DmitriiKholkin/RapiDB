@@ -569,7 +569,7 @@ function TableDataGrid({
 
   useEffect(() => {
     const unsubscribe = onMessage<string>("clipboardText", (text) => {
-      if (!canEditRows || !selectionRangeRef.current) return;
+      if (!selectionRangeRef.current) return;
 
       const pasteData = parseTsv(text);
       if (pasteData.rows.length === 0) return;
@@ -584,6 +584,10 @@ function TableDataGrid({
       const startCol = anchorCol - selColOffset;
 
       selection.contextMenuCellRef.current = null;
+
+      // Block paste into persisted rows when editing is disabled
+      // (e.g. no primary key). Paste into draft rows is always allowed.
+      if (!canEditRows && startRow >= 0) return;
 
       // Build the list of visible data columns starting from the anchor position,
       // skipping collapsed (hidden) columns and the selection column.
@@ -637,7 +641,8 @@ function TableDataGrid({
         //   draft rows:  data-row -1 → virtual 0,  -2 → virtual 1, …
         //   persisted:   data-row  0 → virtual draftCount,  1 → draftCount+1, …
         const startVirtualIndex = -(startRow + 1);
-        const totalRows = rows.length + draftCount;
+        // When persisted rows are read-only (no PK), only target draft rows
+        const totalRows = canEditRows ? rows.length + draftCount : draftCount;
 
         const errors: PasteValidationError[] = [];
         const normalizedCells: Array<{
@@ -670,6 +675,7 @@ function TableDataGrid({
             }
 
             if (targetVirtualIndex >= totalRows) {
+              if (!canEditRows) continue; // silently truncate past draft rows
               errors.push({
                 rowIndex: targetVirtualIndex,
                 columnIndex: targetCol + selColOffset,
