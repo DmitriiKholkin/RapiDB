@@ -114,12 +114,15 @@ export function TableView({
 
   const totalPages = Math.max(1, Math.ceil(data.totalCount / data.pageSize));
   const pendingCount = mutation.pendingEdits.size;
-  const unsavedRowCount = pendingCount + (mutation.newRow ? 1 : 0);
-  const insertValueCount = mutation.newRow
-    ? Object.values(mutation.newRow).filter(
+  const unsavedRowCount = pendingCount + mutation.newRows.length;
+  const insertValueCount = mutation.newRows.reduce(
+    (sum, row) =>
+      sum +
+      Object.values(row).filter(
         (cell) => cell.value !== INSERT_DEFAULT_SENTINEL,
-      ).length
-    : 0;
+      ).length,
+    0,
+  );
   const showMissingPrimaryKeyNotice =
     data.hasCommittedData &&
     !data.readOnlyTable &&
@@ -200,7 +203,7 @@ export function TableView({
         deleting={mutation.deleting}
         executionTimeMs={data.executionTimeMs}
         mutationBusy={mutationBusy}
-        newRowExists={mutation.newRow !== null}
+        draftRowCount={mutation.newRows.length}
         readOnlyTable={data.readOnlyTable}
         selectedCount={selected.size}
         totalCount={data.totalCount}
@@ -227,7 +230,7 @@ export function TableView({
         inserting={mutation.inserting}
         insertValueCount={insertValueCount}
         mutErr={mutation.mutErr}
-        newRowExists={mutation.newRow !== null}
+        newRowExists={mutation.newRows.length > 0}
         readOnlyTable={data.readOnlyTable}
         unsavedRowCount={unsavedRowCount}
         canUndo={mutation.canUndo}
@@ -251,12 +254,11 @@ export function TableView({
         editCell={mutation.editCell}
         filterDrafts={data.filterDrafts}
         loading={data.loading}
-        newRow={mutation.newRow}
+        newRows={mutation.newRows}
         onCancelEdit={() => mutation.setEditCell(null)}
         onBatchCellEdit={mutation.commitBatchCellEdits}
         onCommitCellEdit={mutation.commitCellEdit}
         onCommitDraftCellEdit={mutation.commitDraftCellEdit}
-        onBatchDraftCellEdit={mutation.commitBatchDraftCellEdits}
         onMixedBatchEdit={mutation.commitMixedBatchEdits}
         onFilterDraftChange={data.updateFilterDraft}
         onOpenStructuredCell={mutation.openStructuredCellDialog}

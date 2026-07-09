@@ -26,7 +26,7 @@ function makeSnapshot(
 ): MutationSnapshot {
   return {
     pendingEdits: new Map(),
-    newRow: null,
+    newRows: [],
     editCell: null,
     ...overrides,
   };
@@ -120,7 +120,7 @@ describe("useUndoRedoHistory", () => {
     const { result } = renderHook(() => useUndoRedoHistory());
 
     const snapshot1 = makeSnapshot();
-    const currentState = makeSnapshot({ newRow: { col1: { value: "x" } } });
+    const currentState = makeSnapshot({ newRows: [{ col1: { value: "x" } }] });
 
     act(() => result.current.push(snapshot1));
     act(() => result.current.undo(currentState));
@@ -189,7 +189,7 @@ describe("useUndoRedoHistory", () => {
 
     const snapshot1 = makeSnapshot();
     const currentState = makeSnapshot();
-    const currentState2 = makeSnapshot({ newRow: { c: { value: "y" } } });
+    const currentState2 = makeSnapshot({ newRows: [{ c: { value: "y" } }] });
 
     act(() => result.current.push(snapshot1));
     act(() => result.current.undo(currentState)); // future = [currentState]
@@ -371,7 +371,7 @@ describe("useUndoRedoHistory", () => {
     // This is why buildUndoRedoSnapshot clones - the caller should use it
     // to create an independent snapshot before pushing
     const pending2 = pendingEditsFrom([[0, { a: "safe" }]]);
-    const snapshot2 = buildUndoRedoSnapshot(pending2, null, null);
+    const snapshot2 = buildUndoRedoSnapshot(pending2, [], null);
     act(() => result.current.push(snapshot2));
 
     assertPresent(pending2.get(0), "row 0").set("a", "mutated again");

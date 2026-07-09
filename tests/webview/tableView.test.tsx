@@ -2035,9 +2035,11 @@ describe("TableView", () => {
       type: "applyChanges",
       payload: {
         updates: [],
-        insertValues: {
-          tags: '[\n  "one",\n  "two"\n]',
-        },
+        insertValues: [
+          {
+            tags: '[\n  "one",\n  "two"\n]',
+          },
+        ],
       },
     });
   });
@@ -2340,7 +2342,7 @@ describe("TableView", () => {
     expect(
       (screen.getByRole("button", { name: "Add Row" }) as HTMLButtonElement)
         .disabled,
-    ).toBe(true);
+    ).toBe(false);
 
     expect(
       (
@@ -2410,7 +2412,7 @@ describe("TableView", () => {
 
     expect(getLastPostedMessage()).toEqual({
       type: "applyChanges",
-      payload: { updates: [], insertValues: { name: "" } },
+      payload: { updates: [], insertValues: [{ name: "" }] },
     });
 
     await act(async () => {
@@ -2443,7 +2445,7 @@ describe("TableView", () => {
 
     expect(getLastPostedMessage()).toEqual({
       type: "applyChanges",
-      payload: { updates: [], insertValues: {} },
+      payload: { updates: [] },
     });
 
     await act(async () => {
@@ -2467,7 +2469,7 @@ describe("TableView", () => {
 
     expect(getLastPostedMessage()).toEqual({
       type: "applyChanges",
-      payload: { updates: [], insertValues: { name: NULL_SENTINEL } },
+      payload: { updates: [], insertValues: [{ name: NULL_SENTINEL }] },
     });
   });
 
@@ -2743,7 +2745,6 @@ describe("TableView", () => {
       type: "applyChanges",
       payload: {
         updates: [{ primaryKeys: { id: 1 }, changes: { name: "Alicia" } }],
-        insertValues: {},
       },
     });
   });
@@ -2795,7 +2796,6 @@ describe("TableView", () => {
       type: "applyChanges",
       payload: {
         updates: [{ primaryKeys: { id: 1 }, changes: { name: "Alicia" } }],
-        insertValues: {},
       },
     });
 

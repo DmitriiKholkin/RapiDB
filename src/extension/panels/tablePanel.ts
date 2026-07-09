@@ -414,7 +414,7 @@ export class TablePanel {
 
   private async _handleApplyChanges(payload: {
     updates?: import("../../shared/webviewContracts").RowUpdateMessagePayload[];
-    insertValues?: Record<string, unknown>;
+    insertValues?: Record<string, unknown>[];
   }): Promise<void> {
     const { updates, insertValues } = payload;
     try {
@@ -459,19 +459,24 @@ export class TablePanel {
             ? prepared.plan
             : null;
 
-      const insertPlan =
-        insertValues !== undefined
-          ? await this.svc.prepareInsertRow(
-              this.connectionId,
-              this.database,
-              this.schema,
-              this.table,
-              insertValues,
+      const insertPlans =
+        insertValues !== undefined && insertValues.length > 0
+          ? await Promise.all(
+              insertValues.map((values) =>
+                this.svc.prepareInsertRow(
+                  this.connectionId,
+                  this.database,
+                  this.schema,
+                  this.table,
+                  values,
+                ),
+              ),
             )
           : null;
 
+      const insertCount = insertPlans?.length ?? 0;
       const mutationStatementCount =
-        (insertPlan ? 1 : 0) +
+        insertCount +
         (prepared.executable ? prepared.plan.operations.length : 0);
       if (mutationStatementCount > 1) {
         const driver = this.connectionManager.getDriver(this.connectionId);
@@ -490,7 +495,7 @@ export class TablePanel {
         }
       }
 
-      if (!prepared.executable && !insertPlan) {
+      if (!prepared.executable && insertCount === 0) {
         if (prepared.result.warning) {
           void vscode.window.showWarningMessage(
             `[RapiDB] ${prepared.result.warning}`,
@@ -504,7 +509,7 @@ export class TablePanel {
         this.previewController.createApplyChangesPreview({
           apply: applyPlan,
           applyResultWhenEmpty: prepared.executable ? null : prepared.result,
-          insert: insertPlan,
+          inserts: insertPlans,
         }),
       );
     } catch (err: unknown) {

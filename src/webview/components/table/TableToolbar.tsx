@@ -7,6 +7,7 @@ import {
 import { Icon } from "../Icon";
 import { type ExportFormat, TableExportActions } from "./TableExportActions";
 import {
+  MAX_DRAFT_ROWS,
   type TableSortState,
   TOOLBAR_H,
   tableButtonStyle,
@@ -19,7 +20,7 @@ interface TableToolbarProps {
   deleting: boolean;
   executionTimeMs?: number;
   mutationBusy: boolean;
-  newRowExists: boolean;
+  draftRowCount: number;
   readOnlyTable: boolean;
   selectedCount: number;
   totalCount: number;
@@ -36,7 +37,7 @@ export function TableToolbar({
   deleting,
   executionTimeMs,
   mutationBusy,
-  newRowExists,
+  draftRowCount,
   readOnlyTable,
   selectedCount,
   totalCount,
@@ -64,8 +65,11 @@ export function TableToolbar({
         <>
           <button
             type="button"
-            style={tableButtonStyle("primary", mutationBusy || newRowExists)}
-            disabled={mutationBusy || newRowExists}
+            style={tableButtonStyle(
+              "primary",
+              mutationBusy || draftRowCount >= MAX_DRAFT_ROWS,
+            )}
+            disabled={mutationBusy || draftRowCount >= MAX_DRAFT_ROWS}
             onClick={onAddRow}
           >
             <Icon name="add" size={13} style={{ marginRight: 4 }} />

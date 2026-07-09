@@ -34,6 +34,7 @@ export function DraftTableRow({
   columns,
   visibleColumns,
   draft,
+  rowIndex,
   editingCol,
   onOpenStructuredCell,
   onStartEdit,
@@ -44,6 +45,7 @@ export function DraftTableRow({
   columns: readonly ColumnMeta[];
   visibleColumns: readonly TanStackColumn<Row, unknown>[];
   draft: InsertDraftRow;
+  rowIndex: number;
   editingCol: string | null;
   onOpenStructuredCell: (options: {
     rowKind: "persisted" | "draft";
@@ -54,8 +56,8 @@ export function DraftTableRow({
     originalValue: unknown;
     readOnly: boolean;
   }) => void;
-  onStartEdit: (column: ColumnMeta) => void;
-  onCommit: (column: ColumnMeta, value: string) => void;
+  onStartEdit: (rowIdx: number, column: ColumnMeta) => void;
+  onCommit: (rowIdx: number, column: ColumnMeta, value: string) => void;
   onCancelEdit: () => void;
   selection?: {
     handleCellMouseDown: (
@@ -117,7 +119,7 @@ export function DraftTableRow({
         const displayColumnSize = isCollapsed ? 0 : columnSize;
         const colIndex = visibleColumns.indexOf(column);
         const isDataCol = !isSelectionColumn;
-        const selRow = -1;
+        const selRow = -(rowIndex + 1);
         const cellSelectionState = isDataCol
           ? classifyCellSelection(
               selection?.range ?? null,
@@ -179,6 +181,7 @@ export function DraftTableRow({
                 if (structuredValue) {
                   onOpenStructuredCell({
                     rowKind: "draft",
+                    rowIdx: rowIndex,
                     column: columnDef,
                     value: structuredValue,
                     currentValue: isDefault
@@ -192,7 +195,7 @@ export function DraftTableRow({
                   return;
                 }
 
-                onStartEdit(columnDef);
+                onStartEdit(rowIndex, columnDef);
               }
             }}
           >
@@ -224,9 +227,9 @@ export function DraftTableRow({
                     suppressPlaceholder
                     showDefaultButton
                     onSetDefault={() =>
-                      onCommit(columnDef, INSERT_DEFAULT_SENTINEL)
+                      onCommit(rowIndex, columnDef, INSERT_DEFAULT_SENTINEL)
                     }
-                    onCommit={(value) => onCommit(columnDef, value)}
+                    onCommit={(value) => onCommit(rowIndex, columnDef, value)}
                     onCancel={onCancelEdit}
                   />
                 ) : !isCollapsed && isDefault ? (

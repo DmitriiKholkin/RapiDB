@@ -316,7 +316,7 @@ interface TableGridProps {
   editCell: EditTarget | null;
   filterDrafts: FilterDraftMap;
   loading: boolean;
-  newRow: InsertDraftRow | null;
+  newRows: InsertDraftRow[];
   onCancelEdit: () => void;
   onBatchCellEdit: (
     edits: Array<{
@@ -332,12 +332,13 @@ interface TableGridProps {
     newVal: string,
     originalVal: unknown,
   ) => void;
-  onCommitDraftCellEdit: (column: ColumnMeta, value: string) => void;
-  onBatchDraftCellEdit: (
-    edits: Array<{ column: ColumnMeta; newVal: string }>,
+  onCommitDraftCellEdit: (
+    rowIdx: number,
+    column: ColumnMeta,
+    value: string,
   ) => void;
   onMixedBatchEdit: (
-    draftEdits: Array<{ column: ColumnMeta; newVal: string }>,
+    draftEdits: Array<{ rowIdx: number; column: ColumnMeta; newVal: string }>,
     persistedEdits: Array<{
       rowIdx: number;
       column: ColumnMeta;
@@ -361,7 +362,7 @@ interface TableGridProps {
     originalValue: unknown;
     readOnly: boolean;
   }) => void;
-  onStartDraftEdit: (column: ColumnMeta) => void;
+  onStartDraftEdit: (rowIdx: number, column: ColumnMeta) => void;
   onStartEdit: (rowIdx: number, column: ColumnMeta) => void;
   pendingEdits: PendingEdits;
   rows: Row[];
@@ -397,12 +398,11 @@ function TableDataGrid({
   editCell,
   filterDrafts,
   loading,
-  newRow,
+  newRows,
   onCancelEdit,
   onBatchCellEdit,
   onCommitCellEdit,
   onCommitDraftCellEdit,
-  onBatchDraftCellEdit,
   onMixedBatchEdit,
   onFilterDraftChange,
   onSelectionChange,
@@ -455,8 +455,8 @@ function TableDataGrid({
 
   const containerRef = React.useRef<HTMLDivElement>(null);
   const [pasteErrors, setPasteErrors] = useState<PasteValidationError[]>([]);
-  const newRowRef = useRef(newRow);
-  newRowRef.current = newRow;
+  const newRowsRef = useRef(newRows);
+  newRowsRef.current = newRows;
   const scrollToCellRef = useRef<(row: number, col: number) => void>(() => {});
 
   const dataColCount = columns.length;
@@ -471,8 +471,9 @@ function TableDataGrid({
     (rowIndex: number, colIndex: number) => {
       const colId = columnOrderRef.current[colIndex];
       if (!colId || colId === "__sel") return undefined;
-      if (rowIndex === -1) {
-        const draft = newRowRef.current;
+      if (rowIndex < 0) {
+        const draftIdx = -(rowIndex + 1);
+        const draft = newRowsRef.current[draftIdx];
         if (!draft) return undefined;
         const dv = draft[colId]?.value;
         if (dv === INSERT_DEFAULT_SENTINEL) return undefined;
@@ -519,7 +520,7 @@ function TableDataGrid({
   const selection = useCellSelection({
     rowCount: rows.length,
     colCount: totalColCount,
-    minRow: newRow ? -1 : 0,
+    minRow: newRows.length > 0 ? -newRows.length : 0,
     minCol: selColOffset,
     getCellValue,
     scrollRef,
@@ -627,13 +628,20 @@ function TableDataGrid({
         return;
       }
 
-      if (startRow === -1) {
-        const draft = newRowRef.current;
-        if (!draft) return;
+      if (startRow < 0) {
+        const draftCount = newRowsRef.current.length;
+        if (draftCount === 0) return;
+
+        // Convert startRow (a data-row value) to a virtual index that
+        // treats the visible row order as a contiguous sequence:
+        //   draft rows:  data-row -1 → virtual 0,  -2 → virtual 1, …
+        //   persisted:   data-row  0 → virtual draftCount,  1 → draftCount+1, …
+        const startVirtualIndex = -(startRow + 1);
+        const totalRows = rows.length + draftCount;
 
         const errors: PasteValidationError[] = [];
         const normalizedCells: Array<{
-          targetRow: number;
+          targetVirtualIndex: number;
           column: ColumnMeta;
           value: string;
           normalized: unknown;
@@ -641,7 +649,7 @@ function TableDataGrid({
 
         for (let r = 0; r < pasteData.rows.length; r++) {
           const row = pasteData.rows[r];
-          const targetRow = startRow + r;
+          const targetVirtualIndex = startVirtualIndex + r;
 
           for (let c = 0; c < row.length; c++) {
             const value = row[c];
@@ -652,7 +660,7 @@ function TableDataGrid({
             const validation = validatePasteValue(value, column);
             if (!validation.valid) {
               errors.push({
-                rowIndex: targetRow,
+                rowIndex: targetVirtualIndex,
                 columnIndex: targetCol + selColOffset,
                 columnName: column.name,
                 value,
@@ -661,19 +669,19 @@ function TableDataGrid({
               continue;
             }
 
-            if (targetRow >= rows.length) {
+            if (targetVirtualIndex >= totalRows) {
               errors.push({
-                rowIndex: targetRow,
+                rowIndex: targetVirtualIndex,
                 columnIndex: targetCol + selColOffset,
                 columnName: column.name,
                 value,
-                message: `Row ${targetRow + 1} does not exist`,
+                message: `Row ${targetVirtualIndex + 1} does not exist`,
               });
               continue;
             }
 
             normalizedCells.push({
-              targetRow,
+              targetVirtualIndex,
               column,
               value,
               normalized: validation.coercedValue,
@@ -696,6 +704,7 @@ function TableDataGrid({
         }> = [];
 
         const draftEdits: Array<{
+          rowIdx: number;
           column: ColumnMeta;
           newVal: string;
         }> = [];
@@ -706,12 +715,18 @@ function TableDataGrid({
             cell.normalized,
           );
 
-          if (cell.targetRow === -1) {
-            draftEdits.push({ column: cell.column, newVal: coercedValue });
+          if (cell.targetVirtualIndex < draftCount) {
+            const draftIdx = cell.targetVirtualIndex;
+            draftEdits.push({
+              rowIdx: draftIdx,
+              column: cell.column,
+              newVal: coercedValue,
+            });
           } else {
-            const originalValue = rows[cell.targetRow]?.[cell.column.name];
+            const persistedRowIdx = cell.targetVirtualIndex - draftCount;
+            const originalValue = rows[persistedRowIdx]?.[cell.column.name];
             batchEdits.push({
-              rowIdx: cell.targetRow,
+              rowIdx: persistedRowIdx,
               column: cell.column,
               newVal: coercedValue,
               originalVal: originalValue,
@@ -719,10 +734,11 @@ function TableDataGrid({
           }
         }
 
-        if (draftEdits.length > 0 && batchEdits.length > 0) {
+        // Always use onMixedBatchEdit to push a single undo snapshot
+        // instead of looping onBatchDraftCellEdit per row, which would
+        // push multiple snapshots based on a stale ref (React batch)
+        if (draftEdits.length > 0) {
           onMixedBatchEdit(draftEdits, batchEdits);
-        } else if (draftEdits.length > 0) {
-          onBatchDraftCellEdit(draftEdits);
         } else if (batchEdits.length > 0) {
           onBatchCellEdit(batchEdits);
         }
@@ -781,7 +797,6 @@ function TableDataGrid({
     rows,
     selColOffset,
     onBatchCellEdit,
-    onBatchDraftCellEdit,
     onMixedBatchEdit,
     selection.contextMenuCellRef.current,
     selection.contextMenuCellRef,
@@ -969,9 +984,10 @@ function TableDataGrid({
   });
   const tableRows = tanTable.getRowModel().rows;
   const visibleColumns = tanTable.getVisibleLeafColumns();
-  const hasDraftRow = newRow !== null;
+  const draftRowCount = newRows.length;
+  const hasDraftRow = draftRowCount > 0;
   const virtualizer = useVirtualizer({
-    count: tableRows.length + (hasDraftRow ? 1 : 0),
+    count: tableRows.length + draftRowCount,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => ROW_H,
     overscan: 15,
@@ -980,7 +996,8 @@ function TableDataGrid({
   const totalVirtualHeight = virtualizer.getTotalSize();
 
   scrollToCellRef.current = (row: number, col: number) => {
-    virtualizer.scrollToIndex(row, { align: "auto" });
+    const virtualIndex = row < 0 ? -(row + 1) : row + draftRowCount;
+    virtualizer.scrollToIndex(virtualIndex, { align: "auto" });
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         if (col === selColOffset) {
@@ -1211,15 +1228,19 @@ function TableDataGrid({
               height={virtualItems[0]?.start ?? 0}
             />
             {virtualItems.map((virtualRow) => {
-              if (hasDraftRow && virtualRow.index === 0) {
+              if (hasDraftRow && virtualRow.index < draftRowCount) {
+                const draftIdx = virtualRow.index;
                 return (
                   <DraftTableRow
                     key={virtualRow.key}
+                    rowIndex={draftIdx}
                     columns={columns}
                     visibleColumns={visibleColumns}
-                    draft={newRow}
+                    draft={newRows[draftIdx]}
                     editingCol={
-                      editCell?.kind === "draft" ? editCell.col : null
+                      editCell?.kind === "draft" && editCell.rowIdx === draftIdx
+                        ? editCell.col
+                        : null
                     }
                     onOpenStructuredCell={onOpenStructuredCell}
                     onStartEdit={onStartDraftEdit}
@@ -1230,9 +1251,7 @@ function TableDataGrid({
                 );
               }
 
-              const persistedIndex = hasDraftRow
-                ? virtualRow.index - 1
-                : virtualRow.index;
+              const persistedIndex = virtualRow.index - draftRowCount;
               const row = tableRows[persistedIndex];
               const isSelected = selected.has(persistedIndex);
               const editingCol =
@@ -1564,6 +1583,7 @@ function DraftTableRow({
   columns,
   visibleColumns,
   draft,
+  rowIndex,
   editingCol,
   onOpenStructuredCell,
   onStartEdit,
@@ -1574,6 +1594,7 @@ function DraftTableRow({
   columns: readonly ColumnMeta[];
   visibleColumns: readonly TanStackColumn<Row, unknown>[];
   draft: InsertDraftRow;
+  rowIndex: number;
   editingCol: string | null;
   onOpenStructuredCell: (options: {
     rowKind: "persisted" | "draft";
@@ -1584,8 +1605,8 @@ function DraftTableRow({
     originalValue: unknown;
     readOnly: boolean;
   }) => void;
-  onStartEdit: (column: ColumnMeta) => void;
-  onCommit: (column: ColumnMeta, value: string) => void;
+  onStartEdit: (rowIdx: number, column: ColumnMeta) => void;
+  onCommit: (rowIdx: number, column: ColumnMeta, value: string) => void;
   onCancelEdit: () => void;
   selection?: {
     handleCellMouseDown: (
@@ -1647,7 +1668,7 @@ function DraftTableRow({
         const displayColumnSize = isCollapsed ? 0 : columnSize;
         const colIndex = visibleColumns.indexOf(column);
         const isDataCol = !isSelectionColumn;
-        const selRow = -1;
+        const selRow = -(rowIndex + 1);
         const isCellSelected =
           isDataCol && selection?.isCellSelected(selRow, colIndex);
         const isCellAnchor =
@@ -1713,6 +1734,7 @@ function DraftTableRow({
                 if (structuredValue) {
                   onOpenStructuredCell({
                     rowKind: "draft",
+                    rowIdx: rowIndex,
                     column: columnDef,
                     value: structuredValue,
                     currentValue: isDefault
@@ -1726,7 +1748,7 @@ function DraftTableRow({
                   return;
                 }
 
-                onStartEdit(columnDef);
+                onStartEdit(rowIndex, columnDef);
               }
             }}
           >
@@ -1758,9 +1780,9 @@ function DraftTableRow({
                     suppressPlaceholder
                     showDefaultButton
                     onSetDefault={() =>
-                      onCommit(columnDef, INSERT_DEFAULT_SENTINEL)
+                      onCommit(rowIndex, columnDef, INSERT_DEFAULT_SENTINEL)
                     }
-                    onCommit={(value) => onCommit(columnDef, value)}
+                    onCommit={(value) => onCommit(rowIndex, columnDef, value)}
                     onCancel={onCancelEdit}
                   />
                 ) : !isCollapsed && isDefault ? (

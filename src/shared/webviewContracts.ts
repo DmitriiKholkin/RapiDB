@@ -252,7 +252,7 @@ export type TablePanelMessage =
       "applyChanges",
       {
         updates?: RowUpdateMessagePayload[];
-        insertValues?: Record<string, unknown>;
+        insertValues?: Record<string, unknown>[];
       }
     >
   | WebviewMessageEnvelope<"insertRow", { values?: Record<string, unknown> }>
@@ -918,14 +918,17 @@ export function parseTablePanelMessage(
       ) {
         return null;
       }
-      if (insertValues !== undefined && !isRecord(insertValues)) {
+      if (
+        insertValues !== undefined &&
+        (!Array.isArray(insertValues) || insertValues.some((v) => !isRecord(v)))
+      ) {
         return null;
       }
       return {
         type: envelope.type,
         payload: {
           updates: updates as RowUpdateMessagePayload[] | undefined,
-          insertValues: insertValues as Record<string, unknown> | undefined,
+          insertValues: insertValues as Record<string, unknown>[] | undefined,
         },
       };
     }

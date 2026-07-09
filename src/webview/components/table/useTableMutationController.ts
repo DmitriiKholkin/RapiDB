@@ -35,6 +35,7 @@ import {
   clonePendingEdits,
   createInsertDraft,
   getRetainedPendingEdits,
+  MAX_DRAFT_ROWS,
   restorePendingEdits,
   type TableApplyStatus,
 } from "./tableViewHelpers";
@@ -63,7 +64,7 @@ export function useTableMutationController({
   const [editCell, setEditCell] = useState<EditTarget | null>(null);
   const [applying, setApplying] = useState(false);
   const [applyStatus, setApplyStatus] = useState<TableApplyStatus | null>(null);
-  const [newRow, setNewRow] = useState<InsertDraftRow | null>(null);
+  const [newRows, setNewRows] = useState<InsertDraftRow[]>([]);
   const [inserting, setInserting] = useState(false);
   const [mutErr, setMutErr] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -84,8 +85,8 @@ export function useTableMutationController({
   // Refs for snapshot access inside callbacks that avoid re-creation
   const pendingEditsRef = useRef(pendingEdits);
   pendingEditsRef.current = pendingEdits;
-  const newRowRef = useRef(newRow);
-  newRowRef.current = newRow;
+  const newRowsRef = useRef(newRows);
+  newRowsRef.current = newRows;
   const editCellRef = useRef(editCell);
   editCellRef.current = editCell;
 
@@ -142,7 +143,7 @@ export function useTableMutationController({
     setInserting(false);
     setMutationPreview(null);
     setStructuredCellDialog(null);
-    setNewRow(null);
+    setNewRows([]);
     setMutErr(null);
     setApplyStatus(null);
   }, [clearApplyRequestState, history]);
@@ -155,7 +156,7 @@ export function useTableMutationController({
 
         if (success) {
           history.clear();
-          setNewRow(null);
+          setNewRows([]);
           const nextPending = getRetainedPendingEdits(
             applyPendingSnapshotRef.current,
             applyRowIndexesRef.current,
@@ -185,7 +186,7 @@ export function useTableMutationController({
           fetchPageRef.current();
         } else {
           if (insertApplied) {
-            setNewRow(null);
+            setNewRows([]);
             const restoreState = buildPendingRestoreState(
               pendingEdits,
               rowsRef.current,
@@ -217,7 +218,7 @@ export function useTableMutationController({
       ({ success, error }) => {
         setInserting(false);
         if (success) {
-          setNewRow(null);
+          setNewRows([]);
           setEditCell(null);
           setMutErr(null);
 
@@ -328,16 +329,17 @@ export function useTableMutationController({
   }, [cancelMutationPreview, mutationPreview]);
 
   const startInsertRow = useCallback(() => {
+    if (newRowsRef.current.length >= MAX_DRAFT_ROWS) return;
     history.push(
-      buildUndoRedoSnapshot(pendingEditsRef.current, newRowRef.current, null),
+      buildUndoRedoSnapshot(pendingEditsRef.current, newRowsRef.current, null),
     );
-    setNewRow(createInsertDraft(columnsRef.current));
+    setNewRows((prev) => [...prev, createInsertDraft(columnsRef.current)]);
     setEditCell(null);
     setMutErr(null);
   }, [columnsRef, history]);
 
   const applyChanges = useCallback(() => {
-    const unsavedRowCount = pendingEdits.size + (newRow ? 1 : 0);
+    const unsavedRowCount = pendingEdits.size + newRows.length;
     if (unsavedRowCount === 0 || applying) {
       return;
     }
@@ -350,17 +352,20 @@ export function useTableMutationController({
     setMutErr(null);
 
     const updates = buildPendingUpdatesPayload(pendingEdits);
+    const insertValues = newRows
+      .map(buildInsertValues)
+      .filter((v) => Object.keys(v).length > 0);
     postMessage("applyChanges", {
       updates,
-      ...(newRow ? { insertValues: buildInsertValues(newRow) } : {}),
+      ...(insertValues.length > 0 ? { insertValues } : {}),
     });
-  }, [applying, buildPendingUpdatesPayload, newRow, pendingEdits]);
+  }, [applying, buildPendingUpdatesPayload, newRows, pendingEdits]);
 
   const revertChanges = useCallback(() => {
     history.clear();
     pendingRestoreRef.current = null;
     setPending(new Map());
-    setNewRow(null);
+    setNewRows([]);
     setEditCell(null);
     setMutErr(null);
     setApplyStatus(null);
@@ -409,7 +414,7 @@ export function useTableMutationController({
       if (effectiveEdits.length === 0) return;
 
       history.push(
-        buildUndoRedoSnapshot(currentPending, newRowRef.current, null),
+        buildUndoRedoSnapshot(currentPending, newRowsRef.current, null),
       );
 
       setPending((previousPending) => {
@@ -474,7 +479,7 @@ export function useTableMutationController({
       }
 
       history.push(
-        buildUndoRedoSnapshot(currentPending, newRowRef.current, null),
+        buildUndoRedoSnapshot(currentPending, newRowsRef.current, null),
       );
 
       if (newVal === originalValueString) {
@@ -512,38 +517,39 @@ export function useTableMutationController({
   );
 
   const commitDraftCellEdit = useCallback(
-    (column: ColumnMeta, newVal: string) => {
+    (rowIdx: number, column: ColumnMeta, newVal: string) => {
       setEditCell(null);
 
-      const currentRow = newRowRef.current;
-      if (!currentRow) return;
+      const currentRows = newRowsRef.current;
+      if (rowIdx < 0 || rowIdx >= currentRows.length) return;
 
       const norm = newVal === NULL_SENTINEL ? NULL_SENTINEL : newVal;
 
       history.push(
-        buildUndoRedoSnapshot(pendingEditsRef.current, currentRow, null),
+        buildUndoRedoSnapshot(pendingEditsRef.current, currentRows, null),
       );
 
-      setNewRow((draft) => {
-        if (!draft) return draft;
-        return {
-          ...draft,
-          [column.name]: {
-            ...draft[column.name],
-            value: norm,
-          },
-        };
-      });
+      setNewRows((prev) =>
+        prev.map((draft, i) =>
+          i === rowIdx
+            ? {
+                ...draft,
+                [column.name]: { ...draft[column.name], value: norm },
+              }
+            : draft,
+        ),
+      );
     },
     [history],
   );
 
   const commitBatchDraftCellEdits = useCallback(
-    (edits: Array<{ column: ColumnMeta; newVal: string }>) => {
+    (rowIdx: number, edits: Array<{ column: ColumnMeta; newVal: string }>) => {
       setEditCell(null);
 
-      const currentRow = newRowRef.current;
-      if (!currentRow) return;
+      const currentRows = newRowsRef.current;
+      if (rowIdx < 0 || rowIdx >= currentRows.length) return;
+      const currentRow = currentRows[rowIdx];
 
       const normEdits: Array<{ columnName: string; value: string }> = [];
 
@@ -557,24 +563,26 @@ export function useTableMutationController({
       if (normEdits.length === 0) return;
 
       history.push(
-        buildUndoRedoSnapshot(pendingEditsRef.current, currentRow, null),
+        buildUndoRedoSnapshot(pendingEditsRef.current, currentRows, null),
       );
 
-      setNewRow((draft) => {
-        if (!draft) return draft;
-        const next = { ...draft };
-        for (const e of normEdits) {
-          next[e.columnName] = { ...next[e.columnName], value: e.value };
-        }
-        return next;
-      });
+      setNewRows((prev) =>
+        prev.map((draft, i) => {
+          if (i !== rowIdx) return draft;
+          const next = { ...draft };
+          for (const e of normEdits) {
+            next[e.columnName] = { ...next[e.columnName], value: e.value };
+          }
+          return next;
+        }),
+      );
     },
     [history],
   );
 
   const commitMixedBatchEdits = useCallback(
     (
-      draftEdits: Array<{ column: ColumnMeta; newVal: string }>,
+      draftEdits: Array<{ rowIdx: number; column: ColumnMeta; newVal: string }>,
       persistedEdits: Array<{
         rowIdx: number;
         column: ColumnMeta;
@@ -584,17 +592,24 @@ export function useTableMutationController({
     ) => {
       setEditCell(null);
 
-      const currentRow = newRowRef.current;
+      const currentRows = newRowsRef.current;
       const currentPending = pendingEditsRef.current;
 
-      const normDraftEdits: Array<{ columnName: string; value: string }> = [];
-      if (currentRow) {
-        for (const { column, newVal } of draftEdits) {
-          const norm = newVal === NULL_SENTINEL ? NULL_SENTINEL : newVal;
-          const prev = currentRow[column.name]?.value;
-          if (prev === norm) continue;
-          normDraftEdits.push({ columnName: column.name, value: norm });
+      const draftEditsByRow = new Map<
+        number,
+        Array<{ columnName: string; value: string }>
+      >();
+      for (const { rowIdx, column, newVal } of draftEdits) {
+        if (rowIdx < 0 || rowIdx >= currentRows.length) continue;
+        const norm = newVal === NULL_SENTINEL ? NULL_SENTINEL : newVal;
+        const prev = currentRows[rowIdx][column.name]?.value;
+        if (prev === norm) continue;
+        let edits = draftEditsByRow.get(rowIdx);
+        if (!edits) {
+          edits = [];
+          draftEditsByRow.set(rowIdx, edits);
         }
+        edits.push({ columnName: column.name, value: norm as string });
       }
 
       const effectivePersistedEdits: typeof persistedEdits = [];
@@ -614,21 +629,24 @@ export function useTableMutationController({
         }
       }
 
-      if (normDraftEdits.length === 0 && effectivePersistedEdits.length === 0) {
+      if (draftEditsByRow.size === 0 && effectivePersistedEdits.length === 0) {
         return;
       }
 
-      history.push(buildUndoRedoSnapshot(currentPending, currentRow, null));
+      history.push(buildUndoRedoSnapshot(currentPending, currentRows, null));
 
-      if (normDraftEdits.length > 0) {
-        setNewRow((draft) => {
-          if (!draft) return draft;
-          const next = { ...draft };
-          for (const e of normDraftEdits) {
-            next[e.columnName] = { ...next[e.columnName], value: e.value };
-          }
-          return next;
-        });
+      if (draftEditsByRow.size > 0) {
+        setNewRows((prev) =>
+          prev.map((draft, i) => {
+            const rowEdits = draftEditsByRow.get(i);
+            if (!rowEdits) return draft;
+            const next = { ...draft };
+            for (const e of rowEdits) {
+              next[e.columnName] = { ...next[e.columnName], value: e.value };
+            }
+            return next;
+          }),
+        );
       }
 
       if (effectivePersistedEdits.length > 0) {
@@ -681,10 +699,13 @@ export function useTableMutationController({
     setApplyStatus(null);
   }, []);
 
-  const handleStartDraftEdit = useCallback((column: ColumnMeta) => {
-    setEditCell({ kind: "draft", col: column.name });
-    setApplyStatus(null);
-  }, []);
+  const handleStartDraftEdit = useCallback(
+    (rowIdx: number, column: ColumnMeta) => {
+      setEditCell({ kind: "draft", rowIdx, col: column.name });
+      setApplyStatus(null);
+    },
+    [],
+  );
 
   const openStructuredCellDialog = useCallback(
     (options: {
@@ -710,7 +731,7 @@ export function useTableMutationController({
       setApplyStatus(null);
       setStructuredCellDialog({
         rowKind,
-        rowIdx: rowKind === "persisted" ? (rowIdx ?? null) : null,
+        rowIdx: rowIdx ?? null,
         column,
         title: `Cell data: ${column.name}`,
         description: readOnly
@@ -751,17 +772,19 @@ export function useTableMutationController({
 
   const commitStructuredCellDialogValue = useCallback(
     (dialog: StructuredCellDialogState, nextValue: string) => {
-      if (dialog.rowKind === "persisted" && dialog.rowIdx !== null) {
-        commitCellEdit(
-          dialog.rowIdx,
-          dialog.column,
-          nextValue,
-          dialog.originalValue,
-        );
+      if (dialog.rowIdx !== null) {
+        if (dialog.rowKind === "persisted") {
+          commitCellEdit(
+            dialog.rowIdx,
+            dialog.column,
+            nextValue,
+            dialog.originalValue,
+          );
+        } else {
+          commitDraftCellEdit(dialog.rowIdx, dialog.column, nextValue);
+        }
         return;
       }
-
-      commitDraftCellEdit(dialog.column, nextValue);
     },
     [commitCellEdit, commitDraftCellEdit],
   );
@@ -824,7 +847,7 @@ export function useTableMutationController({
 
     const currentSnapshot = buildUndoRedoSnapshot(
       pendingEditsRef.current,
-      newRowRef.current,
+      newRowsRef.current,
       editCellRef.current,
     );
     const previousSnapshot = history.undo(currentSnapshot);
@@ -832,7 +855,7 @@ export function useTableMutationController({
 
     const restored = applyUndoRedoSnapshot(previousSnapshot);
     setPending(restored.pendingEdits);
-    setNewRow(restored.newRow);
+    setNewRows(restored.newRows);
     setEditCell(restored.editCell);
   }, [applying, inserting, deleting, history]);
 
@@ -841,7 +864,7 @@ export function useTableMutationController({
 
     const currentSnapshot = buildUndoRedoSnapshot(
       pendingEditsRef.current,
-      newRowRef.current,
+      newRowsRef.current,
       editCellRef.current,
     );
     const nextSnapshot = history.redo(currentSnapshot);
@@ -849,7 +872,7 @@ export function useTableMutationController({
 
     const restored = applyUndoRedoSnapshot(nextSnapshot);
     setPending(restored.pendingEdits);
-    setNewRow(restored.newRow);
+    setNewRows(restored.newRows);
     setEditCell(restored.editCell);
   }, [applying, inserting, deleting, history]);
 
@@ -902,7 +925,7 @@ export function useTableMutationController({
     inserting,
     mutErr,
     mutationPreview,
-    newRow,
+    newRows,
     pendingEdits,
     openStructuredCellDialog,
     resetForTableInit,

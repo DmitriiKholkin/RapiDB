@@ -277,7 +277,7 @@ export function TableMutationStatusBar({
                 disabled={applying || inserting}
                 title={
                   newRowExists && insertValueCount === 0
-                    ? "Apply insert with database defaults, then updates"
+                    ? "Apply inserts with database defaults, then updates"
                     : undefined
                 }
                 onClick={onApplyChanges}

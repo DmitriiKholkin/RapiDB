@@ -35,7 +35,7 @@ type PendingTableMutationPreview =
       plan: {
         apply: PreparedApplyPlan | null;
         applyResultWhenEmpty: ApplyResultPayload | null;
-        insert: PreparedInsertPlan | null;
+        inserts: PreparedInsertPlan[];
       };
     }
   | {
@@ -101,7 +101,7 @@ export class TableMutationPreviewController {
   createApplyChangesPreview(plan: {
     apply: PreparedApplyPlan | null;
     applyResultWhenEmpty: ApplyResultPayload | null;
-    insert: PreparedInsertPlan | null;
+    inserts: PreparedInsertPlan[];
   }): TableMutationPreviewPayload {
     return this.storePreview({ kind: "applyChanges", plan });
   }
@@ -128,23 +128,39 @@ export class TableMutationPreviewController {
 
     if (preview.kind === "applyChanges") {
       let insertApplied = false;
+      let succeededCount = 0;
+      const errors: string[] = [];
 
-      if (preview.plan.insert) {
+      for (const insertPlan of preview.plan.inserts) {
         try {
-          await this.tableDataService.executePreparedInsertPlan(
-            preview.plan.insert,
-          );
+          await this.tableDataService.executePreparedInsertPlan(insertPlan);
+          succeededCount++;
           insertApplied = true;
         } catch (error: unknown) {
           const normalized = normalizeUnknownError(error);
-          return {
-            type: "applyResult",
-            payload: {
-              success: false,
-              error: normalized.message,
-            },
-          };
+          errors.push(normalized.message);
         }
+      }
+
+      if (errors.length > 0 && succeededCount === 0) {
+        return {
+          type: "applyResult",
+          payload: {
+            success: false,
+            error: `All inserts failed: ${errors.join("; ")}`,
+          },
+        };
+      }
+
+      if (errors.length > 0) {
+        return {
+          type: "applyResult",
+          payload: {
+            success: false,
+            insertApplied: true,
+            error: `${succeededCount} row(s) inserted, ${errors.length} failed: ${errors.join("; ")}`,
+          },
+        };
       }
 
       const result: ApplyResultPayload = preview.plan.apply
@@ -215,7 +231,7 @@ export class TableMutationPreviewController {
     const previewStatements =
       preview.kind === "applyChanges"
         ? [
-            ...(preview.plan.insert?.previewStatements ?? []),
+            ...preview.plan.inserts.flatMap((p) => p.previewStatements),
             ...(preview.plan.apply?.previewStatements ?? []),
           ]
         : preview.plan.previewStatements;

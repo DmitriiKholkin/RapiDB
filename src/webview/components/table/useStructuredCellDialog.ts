@@ -20,7 +20,11 @@ interface UseStructuredCellDialogOptions {
     newVal: string,
     originalVal: unknown,
   ) => void;
-  commitDraftCellEdit: (column: ColumnMeta, newVal: string) => void;
+  commitDraftCellEdit: (
+    rowIdx: number,
+    column: ColumnMeta,
+    newVal: string,
+  ) => void;
   /** Clear the active edit target (e.g. close inline editor). */
   clearEditCell: () => void;
   /** Clear apply status banner. */
@@ -91,11 +95,13 @@ export function useStructuredCellDialog({
 
   const commitValue = useCallback(
     (dlg: StructuredCellDialogState, nextValue: string) => {
-      if (dlg.rowKind === "persisted" && dlg.rowIdx !== null) {
-        commitCellEdit(dlg.rowIdx, dlg.column, nextValue, dlg.originalValue);
-        return;
+      if (dlg.rowIdx !== null) {
+        if (dlg.rowKind === "persisted") {
+          commitCellEdit(dlg.rowIdx, dlg.column, nextValue, dlg.originalValue);
+        } else {
+          commitDraftCellEdit(dlg.rowIdx, dlg.column, nextValue);
+        }
       }
-      commitDraftCellEdit(dlg.column, nextValue);
     },
     [commitCellEdit, commitDraftCellEdit],
   );

@@ -26,6 +26,7 @@ export const HEADER_H = 28;
 export const FILTER_H = 30;
 export const PREVIEW_DIALOG_EDITOR_H = "min(42vh, 360px)";
 export const INSERT_DEFAULT_SENTINEL = "__RAPIDB_INSERT_DEFAULT__";
+export const MAX_DRAFT_ROWS = 100;
 export const SR_ONLY_STYLE: React.CSSProperties = {
   position: "absolute",
   width: 1,
@@ -262,24 +263,24 @@ export function getRetainedPendingEdits(
 
 export function buildUndoRedoSnapshot(
   pendingEdits: PendingEdits,
-  newRow: InsertDraftRow | null,
+  newRows: InsertDraftRow[],
   editCell: EditTarget | null,
 ): MutationSnapshot {
   return {
     pendingEdits: clonePendingEdits(pendingEdits),
-    newRow: newRow ? { ...newRow } : null,
+    newRows: newRows.map((row) => ({ ...row })),
     editCell,
   };
 }
 
 export function applyUndoRedoSnapshot(snapshot: MutationSnapshot): {
   pendingEdits: PendingEdits;
-  newRow: InsertDraftRow | null;
+  newRows: InsertDraftRow[];
   editCell: EditTarget | null;
 } {
   return {
     pendingEdits: clonePendingEdits(snapshot.pendingEdits),
-    newRow: snapshot.newRow ? { ...snapshot.newRow } : null,
+    newRows: snapshot.newRows.map((row) => ({ ...row })),
     editCell: snapshot.editCell,
   };
 }

@@ -30,11 +30,12 @@ export type EditTarget =
     }
   | {
       kind: "draft";
+      rowIdx: number;
       col: string;
     };
 export interface MutationSnapshot {
   pendingEdits: PendingEdits;
-  newRow: InsertDraftRow | null;
+  newRows: InsertDraftRow[];
   editCell: EditTarget | null;
 }
 export interface BadgePresentation {
