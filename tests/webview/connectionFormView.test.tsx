@@ -662,6 +662,11 @@ describe("ConnectionFormView", () => {
     });
 
     clearPostedMessages();
+
+    // Cancel the test to re-enable the Save button
+    await user.click(screen.getByRole("button", { name: "Cancel Testing" }));
+
+    clearPostedMessages();
     await user.click(screen.getByRole("button", { name: "Save Changes" }));
 
     expect(getLastPostedMessage()).toEqual({

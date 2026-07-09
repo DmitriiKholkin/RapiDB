@@ -8,6 +8,7 @@ import React, {
   useCallback,
   useEffect,
   useId,
+  useRef,
   useState,
 } from "react";
 import type {
@@ -577,6 +578,8 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     "idle" | "testing" | "ok" | "fail"
   >("idle");
   const [testError, setTestError] = useState("");
+  const testStateRef = useRef(testState);
+  testStateRef.current = testState;
   const [nameError, setNameError] = useState("");
   const [saving, setSaving] = useState(false);
 
@@ -703,6 +706,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   useEffect(
     () =>
       onMessage<{ success: boolean; error?: string }>("testResult", (p) => {
+        if (testStateRef.current !== "testing") return;
         setTestState(p.success ? "ok" : "fail");
         setTestError(p.error ?? "Connection failed");
       }),
@@ -908,6 +912,12 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   };
 
   const handleTest = () => {
+    if (testState === "testing") {
+      setTestState("idle");
+      setTestError("");
+      postMessage("cancelTestConnection");
+      return;
+    }
     if (!name.trim()) {
       setNameError("Name is required");
       return;
@@ -1786,28 +1796,29 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
         <button
           type="button"
           style={buildButtonStyle("primary", {
-            disabled: !name.trim() || saving,
+            disabled: !name.trim() || saving || testState === "testing",
             size: "md",
           })}
-          disabled={!name.trim() || saving}
+          disabled={!name.trim() || saving || testState === "testing"}
           onClick={handleSave}
         >
           {saving ? "Saving…" : isEdit ? "Save Changes" : "Create Connection"}
         </button>
         <button
           type="button"
-          style={buildButtonStyle("secondary", {
-            disabled: testState === "testing",
-            size: "md",
-          })}
-          disabled={testState === "testing"}
+          style={buildButtonStyle(
+            testState === "testing" ? "danger" : "secondary",
+            { size: "md" },
+          )}
+          disabled={false}
           onClick={handleTest}
         >
-          {testState === "testing" ? "Testing…" : "Test Connection"}
+          {testState === "testing" ? "Cancel Testing" : "Test Connection"}
         </button>
         <button
           type="button"
           style={buildButtonStyle("ghost", { size: "md" })}
+          disabled={testState === "testing"}
           onClick={() => postMessage("cancel")}
         >
           Cancel

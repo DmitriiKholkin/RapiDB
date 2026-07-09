@@ -304,6 +304,7 @@ export function parseConnectionFormInitialState(
 export type ConnectionFormPanelMessage =
   | WebviewMessageEnvelope<"saveConnection", ConnectionFormSubmission>
   | WebviewMessageEnvelope<"testConnection", ConnectionFormSubmission>
+  | WebviewMessageEnvelope<"cancelTestConnection">
   | WebviewMessageEnvelope<"cancel">
   | WebviewMessageEnvelope<
       "browseFile",
@@ -322,6 +323,7 @@ export function parseConnectionFormPanelMessage(
 
   switch (envelope.type) {
     case "cancel":
+    case "cancelTestConnection":
       return { type: envelope.type };
 
     case "saveConnection":
