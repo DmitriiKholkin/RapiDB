@@ -333,7 +333,7 @@ export function useTableMutationController({
     history.push(
       buildUndoRedoSnapshot(pendingEditsRef.current, newRowsRef.current, null),
     );
-    setNewRows((prev) => [...prev, createInsertDraft(columnsRef.current)]);
+    setNewRows((prev) => [createInsertDraft(columnsRef.current), ...prev]);
     setEditCell(null);
     setMutErr(null);
   }, [columnsRef, history]);

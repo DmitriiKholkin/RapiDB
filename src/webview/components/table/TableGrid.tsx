@@ -472,7 +472,7 @@ function TableDataGrid({
       const colId = columnOrderRef.current[colIndex];
       if (!colId || colId === "__sel") return undefined;
       if (rowIndex < 0) {
-        const draftIdx = -(rowIndex + 1);
+        const draftIdx = rowIndex + newRowsRef.current.length;
         const draft = newRowsRef.current[draftIdx];
         if (!draft) return undefined;
         const dv = draft[colId]?.value;
@@ -637,9 +637,10 @@ function TableDataGrid({
 
         // Convert startRow (a data-row value) to a virtual index that
         // treats the visible row order as a contiguous sequence:
-        //   draft rows:  data-row -1 → virtual 0,  -2 → virtual 1, …
-        //   persisted:   data-row  0 → virtual draftCount,  1 → draftCount+1, …
-        const startVirtualIndex = -(startRow + 1);
+        //   drafts: data-row -draftCount → virtual 0,  -(draftCount-1) → virtual 1, …
+        //           data-row -1 → virtual draftCount-1
+        //   persisted: data-row 0 → virtual draftCount,  1 → virtual draftCount+1, …
+        const startVirtualIndex = startRow + draftCount;
         // When persisted rows are read-only (no PK), only target draft rows
         const totalRows = canEditRows ? rows.length + draftCount : draftCount;
 
@@ -1001,7 +1002,7 @@ function TableDataGrid({
   const totalVirtualHeight = virtualizer.getTotalSize();
 
   scrollToCellRef.current = (row: number, col: number) => {
-    const virtualIndex = row < 0 ? -(row + 1) : row + draftRowCount;
+    const virtualIndex = row + draftRowCount;
     virtualizer.scrollToIndex(virtualIndex, { align: "auto" });
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
@@ -1239,6 +1240,7 @@ function TableDataGrid({
                   <DraftTableRow
                     key={virtualRow.key}
                     rowIndex={draftIdx}
+                    draftRowCount={draftRowCount}
                     columns={columns}
                     visibleColumns={visibleColumns}
                     draft={newRows[draftIdx]}
@@ -1589,6 +1591,7 @@ function DraftTableRow({
   visibleColumns,
   draft,
   rowIndex,
+  draftRowCount,
   editingCol,
   onOpenStructuredCell,
   onStartEdit,
@@ -1600,6 +1603,7 @@ function DraftTableRow({
   visibleColumns: readonly TanStackColumn<Row, unknown>[];
   draft: InsertDraftRow;
   rowIndex: number;
+  draftRowCount: number;
   editingCol: string | null;
   onOpenStructuredCell: (options: {
     rowKind: "persisted" | "draft";
@@ -1673,7 +1677,7 @@ function DraftTableRow({
         const displayColumnSize = isCollapsed ? 0 : columnSize;
         const colIndex = visibleColumns.indexOf(column);
         const isDataCol = !isSelectionColumn;
-        const selRow = -(rowIndex + 1);
+        const selRow = rowIndex - draftRowCount;
         const isCellSelected =
           isDataCol && selection?.isCellSelected(selRow, colIndex);
         const isCellAnchor =
