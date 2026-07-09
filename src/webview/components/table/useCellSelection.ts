@@ -385,10 +385,29 @@ export function useCellSelection({
       }
     };
 
+    // Convert between data-row and virtual-index for arrow navigation.
+    // Draft rows use data-row -1, -2, -3... but are ordered top-to-bottom
+    // as -1 (first draft), -2 (second), ... while persisted rows use
+    // 0, 1, 2... Virtual index treats the visible order as contiguous:
+    //   draft -1 → vi 0, draft -2 → vi 1, persisted 0 → vi draftCount, …
+    const draftCount = currentMinRow < 0 ? -currentMinRow : 0;
+    const toVirtualIndex = (dataRow: number) =>
+      dataRow < 0
+        ? -(dataRow + 1)
+        : dataRow + draftCount;
+
+    const toDataRow = (virtualIndex: number) =>
+      virtualIndex < draftCount
+        ? -(virtualIndex + 1)
+        : virtualIndex - draftCount;
+
+    const totalVirtualRows = currentRowCount + draftCount;
+
     switch (event.key) {
       case "ArrowUp": {
         event.preventDefault();
-        const newRow = Math.max(currentMinRow, activeRow - 1);
+        const newVirtualIndex = Math.max(0, toVirtualIndex(activeRow) - 1);
+        const newRow = toDataRow(newVirtualIndex);
         if (newRow === activeRow) break;
         if (event.shiftKey) {
           setRange({ ...currentRange, activeRow: newRow });
@@ -405,7 +424,11 @@ export function useCellSelection({
       }
       case "ArrowDown": {
         event.preventDefault();
-        const newRow = Math.min(currentRowCount - 1, activeRow + 1);
+        const newVirtualIndex = Math.min(
+          totalVirtualRows - 1,
+          toVirtualIndex(activeRow) + 1,
+        );
+        const newRow = toDataRow(newVirtualIndex);
         if (newRow === activeRow) break;
         if (event.shiftKey) {
           setRange({ ...currentRange, activeRow: newRow });
@@ -471,7 +494,11 @@ export function useCellSelection({
       }
       case "Enter": {
         event.preventDefault();
-        const newRow = Math.min(currentRowCount - 1, activeRow + 1);
+        const newVirtualIndex = Math.min(
+          totalVirtualRows - 1,
+          toVirtualIndex(activeRow) + 1,
+        );
+        const newRow = toDataRow(newVirtualIndex);
         if (newRow === activeRow) break;
         setRange({
           anchorRow: newRow,
