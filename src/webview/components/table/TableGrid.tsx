@@ -503,9 +503,8 @@ function TableDataGrid({
   }, []);
 
   const handlePaste = useCallback(() => {
-    if (!canEditRows) return;
     postMessage("readClipboard");
-  }, [canEditRows]);
+  }, []);
 
   const isColumnCollapsed = useCallback(
     (visualColIndex: number) => {
@@ -1382,7 +1381,7 @@ function TableDataGrid({
         containerRef={containerRef}
         onCopy={handleCopy}
         onPaste={handlePaste}
-        canPaste={canEditRows}
+        canPaste={canEditRows || newRows.length > 0}
       />
     </div>
   );
