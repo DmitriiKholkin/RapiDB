@@ -7,7 +7,7 @@
 <br/>
 <br/>
 
-# RapiDB — Database Client for VS Code
+# RapiDB - Database Client for VS Code
 
 ### PostgreSQL · MSSQL · MySQL · MariaDB · SQLite · Oracle
 ### Redis · MongoDB · Elasticsearch · DynamoDB
@@ -34,7 +34,7 @@
 *click through five menus...*
 
 **RapiDB kills that context switch.**
-Your database lives in the sidebar — same window, same shortcuts, same theme.
+Your database lives in the sidebar - same window, same shortcuts, same theme.
 
 ---
 
@@ -49,17 +49,17 @@ Your database lives in the sidebar — same window, same shortcuts, same theme.
 
 ### 🔌 Connect to anything
 
-PostgreSQL, MS SQL Server, MySQL, MariaDB, SQLite, Oracle, Redis, MongoDB, Elasticsearch, DynamoDB  — all supported out of the box. SSL, self-signed certs, SSH tunneling, connection folders to keep things organized.
+PostgreSQL, MS SQL Server, MySQL, MariaDB, SQLite, Oracle, Redis, MongoDB, Elasticsearch, DynamoDB - all supported out of the box. SSL, self-signed certs, SSH tunneling, connection folders to keep things organized.
 
 <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-3.png" alt="Connection Form" width="100%" />
 
-> Every connection has a **read-only mode** toggle. When enabled, query execution is limited to read operations and all table edits are blocked — useful for production databases or when you just want to look without breaking anything.
+> Every connection has a **read-only mode** toggle. When enabled, query execution is limited to read operations and all table edits are blocked - useful for production databases or when you just want to look without breaking anything.
 
 <br/>
 
 ### 🌲 Browse your schema without a single query
 
-Saved connections can be grouped into folders, and each connection expands into databases → schemas → tables, views, materialized views, functions, procedures, sequences, and types. Right-click any object to copy its name, inspect columns with PK/FK badges, constraints, indexes, and triggers, open the data viewer where it applies, or pull the DDL / definition — no typing required.
+Saved connections can be grouped into folders, and each connection expands into databases → schemas → tables, views, materialized views, functions, procedures, sequences, and types. Right-click any object to copy its name, inspect columns with PK/FK badges, constraints, indexes, and triggers, open the data viewer where it applies, or pull the DDL / definition - no typing required.
 
 <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-5.png" alt="Database Explorer tree" width="250" />
 
@@ -67,7 +67,7 @@ Saved connections can be grouped into folders, and each connection expands into 
 
 ### 🗂️ Query History & Bookmarks
 
-Every query you run lands in **Query History** — click any entry to reopen it in the editor. Queries you want to keep forever go into **Bookmarks** with a single press. Query History limit is configurable.
+Every query you run lands in **Query History** - click any entry to reopen it in the editor. Queries you want to keep forever go into **Bookmarks** with a single press. Query History limit is configurable.
 
 <br/>
 
@@ -81,10 +81,10 @@ Open ERD from a database or schema node to visualize tables and the foreign key 
 
 ### ✏️ A real SQL editor, not a textarea
 
-The query editor runs on **Monaco** — the same engine as VS Code itself. You get:
+The query editor runs on **Monaco** - the same engine as VS Code itself. You get:
 
 - 🎨 Syntax highlighting & SQL formatting (button / `Shift+Alt+F`)
-- 🧠 Schema-aware autocompletion — knows your actual tables and columns
+- 🧠 Schema-aware autocompletion - knows your actual tables and columns
 - ⌨️ `Ctrl+Enter` / `F5` to run · Select a fragment to run just that part
 - ↕️ Drag the divider to resize editor vs results
 
@@ -94,7 +94,7 @@ The query editor runs on **Monaco** — the same engine as VS Code itself. You g
 
 ### 📊 Results that don't freeze at 10k rows
 
-Results land in a **virtualized table** — no jank, no browser tab hanging:
+Results land in a **virtualized table** - no jank, no browser tab hanging:
 
 - Sort by any column · Resize columns · Alternating row stripes
 - NULL values are styled differently · Values are colored by types
@@ -146,16 +146,16 @@ Click any table → the **Table Data Viewer** opens:
 1. Install the extension
 2. Click the RapiDB icon in the Activity Bar
 3. Hit Add Connection (+) and fill in your credentials
-4. Done — explore, query, edit
+4. Done - explore, query, edit
 ```
 
 ---
 
 ## 💬 Found a bug? Have an idea?
 
-**[⭐ Leave a review in the Marketplace](https://marketplace.visualstudio.com/items?itemName=DmitriiKholkin.rapidb&ssr=false#review-details)** — even a short one helps others decide whether RapiDB fits their workflow, and tells me what's working.
+**[⭐ Leave a review in the Marketplace](https://marketplace.visualstudio.com/items?itemName=DmitriiKholkin.rapidb&ssr=false#review-details)** - even a short one helps others decide whether RapiDB fits their workflow, and tells me what's working.
 
-**[🐛 Open an issue on GitHub](https://github.com/DmitriiKholkin/RapiDB/issues)** — I'm tracking everything there and fixing issues fast. Drop an issue with steps to reproduce and the DB type, and I'll get back to you quickly.
+**[🐛 Open an issue on GitHub](https://github.com/DmitriiKholkin/RapiDB/issues)** - I'm tracking everything there and fixing issues fast. Drop an issue with steps to reproduce and the DB type, and I'll get back to you quickly.
 
 ---
 
