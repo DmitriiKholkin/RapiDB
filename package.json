@@ -2,7 +2,7 @@
   "name": "rapidb",
   "displayName": "RapiDB",
   "description": "Free database management tool inside VSCode",
-  "version": "0.1.15",
+  "version": "0.1.16",
   "publisher": "DmitriiKholkin",
   "repository": {
     "type": "git",
