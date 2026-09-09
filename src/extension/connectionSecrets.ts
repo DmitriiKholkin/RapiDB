@@ -22,6 +22,8 @@ const CREDENTIAL_BEARING_URI_FIELDS = [
   "endpoint",
   "awsEndpoint",
 ] as const satisfies readonly (keyof ConnectionSecretSnapshot)[];
+const CREDENTIAL_QUERY_PARAMETER =
+  /^(?:password|passwd|pwd|api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|client[_-]?secret|aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key|session[_-]?token))$/i;
 
 export function trimOptionalSecretValue(
   value: string | undefined,
@@ -35,7 +37,46 @@ export function trimOptionalSecretValue(
 }
 
 function redactCredentialBearingUri(uri: string): string {
-  return uri.replace(/^([a-z][a-z\d+.-]*:\/\/)([^@/?#\s]+)@/i, "$1");
+  const authorityRedacted = uri.replace(
+    /^([a-z][a-z\d+.-]*:\/\/)([^@/?#\s]+)@/i,
+    "$1",
+  );
+  const hashIndex = authorityRedacted.indexOf("#");
+  const fragment = hashIndex >= 0 ? authorityRedacted.slice(hashIndex + 1) : "";
+  const withoutFragment =
+    hashIndex >= 0 ? authorityRedacted.slice(0, hashIndex) : authorityRedacted;
+  const queryIndex = withoutFragment.indexOf("?");
+  const query = queryIndex >= 0 ? withoutFragment.slice(queryIndex + 1) : "";
+  const base =
+    queryIndex >= 0 ? withoutFragment.slice(0, queryIndex) : withoutFragment;
+  const filteredQuery = query
+    .split("&")
+    .filter((part) => {
+      const rawKey = part.split("=", 1)[0];
+      try {
+        return !CREDENTIAL_QUERY_PARAMETER.test(decodeURIComponent(rawKey));
+      } catch {
+        return !CREDENTIAL_QUERY_PARAMETER.test(rawKey);
+      }
+    })
+    .join("&");
+  const fragmentHasCredential = fragment.split("&").some((part) => {
+    const rawKey = part.split("=", 1)[0];
+    try {
+      return CREDENTIAL_QUERY_PARAMETER.test(decodeURIComponent(rawKey));
+    } catch {
+      return CREDENTIAL_QUERY_PARAMETER.test(rawKey);
+    }
+  });
+  const keepFragment = fragment.length > 0 && !fragmentHasCredential;
+  if (
+    authorityRedacted === uri &&
+    filteredQuery === query &&
+    (fragment.length === 0 || keepFragment)
+  ) {
+    return uri;
+  }
+  return `${base}${filteredQuery ? `?${filteredQuery}` : ""}${keepFragment ? `#${fragment}` : ""}`;
 }
 
 export function sanitizeCredentialBearingUri(

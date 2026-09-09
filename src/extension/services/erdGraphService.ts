@@ -64,19 +64,28 @@ function supportsScopeCacheWarmup(
 
 export class ErdGraphService {
   private readonly cache = new Map<string, ErdGraph>();
+  private readonly connectionGenerations = new Map<string, number>();
+  private readonly connectionLifecycleGenerations = new Map<string, number>();
+  private schemaRefreshGeneration = 0;
   private readonly subscriptions: Disposable[];
   private readonly lifecycleAbortController = new AbortController();
 
   constructor(private readonly connectionManager: ConnectionManager) {
     this.subscriptions = [
       this.connectionManager.onDidDisconnect((connectionId) => {
+        this.bumpConnectionGeneration(connectionId);
+        this.bumpConnectionLifecycleGeneration(connectionId);
         this.invalidateConnection(connectionId);
       }),
-      this.connectionManager.onDidRefreshSchemas(() => {
-        this.cache.clear();
-      }),
-      this.connectionManager.onDidChangeSchemaState((connectionId) => {
-        this.invalidateConnection(connectionId);
+      this.connectionManager.onDidRefreshSchemas((connectionId) => {
+        if (connectionId) {
+          this.bumpConnectionGeneration(connectionId);
+          this.bumpConnectionLifecycleGeneration(connectionId);
+          this.invalidateConnection(connectionId);
+        } else {
+          this.schemaRefreshGeneration += 1;
+          this.cache.clear();
+        }
       }),
     ];
   }
@@ -88,6 +97,8 @@ export class ErdGraphService {
     }
     this.subscriptions.length = 0;
     this.cache.clear();
+    this.connectionGenerations.clear();
+    this.connectionLifecycleGenerations.clear();
   }
 
   async getGraph(
@@ -104,7 +115,34 @@ export class ErdGraphService {
       }
     }
 
-    const graph = await this.buildGraph(normalized);
+    const connectionLifecycleGeneration =
+      this.connectionLifecycleGenerations.get(normalized.connectionId) ?? 0;
+    const schemaRefreshGeneration = this.schemaRefreshGeneration;
+    const driver = this.connectionManager.getDriver(normalized.connectionId);
+    if (!driver) {
+      throw new Error("Not connected");
+    }
+    let snapshot = await this.connectionManager.getSchemaSnapshotAsync(
+      normalized.connectionId,
+    );
+    snapshot = await this.warmRequestedScopeSnapshot(
+      normalized,
+      driver,
+      snapshot,
+    );
+    const generation =
+      this.connectionGenerations.get(normalized.connectionId) ?? 0;
+    const graph = await this.buildGraph(normalized, driver, snapshot);
+    if (
+      generation !==
+        (this.connectionGenerations.get(normalized.connectionId) ?? 0) ||
+      connectionLifecycleGeneration !==
+        (this.connectionLifecycleGenerations.get(normalized.connectionId) ??
+          0) ||
+      schemaRefreshGeneration !== this.schemaRefreshGeneration
+    ) {
+      throw new Error("Connection changed while the ERD was loading.");
+    }
     this.cache.set(cacheKey, graph);
     return { graph, fromCache: false };
   }
@@ -133,18 +171,25 @@ export class ErdGraphService {
     }
   }
 
-  private async buildGraph(request: ErdGraphRequest): Promise<ErdGraph> {
-    const driver = this.connectionManager.getDriver(request.connectionId);
-    if (!driver) {
-      throw new Error("Not connected");
-    }
-
-    let snapshot = await this.connectionManager.getSchemaSnapshotAsync(
-      request.connectionId,
+  private bumpConnectionGeneration(connectionId: string): void {
+    this.connectionGenerations.set(
+      connectionId,
+      (this.connectionGenerations.get(connectionId) ?? 0) + 1,
     );
+  }
 
-    snapshot = await this.warmRequestedScopeSnapshot(request, driver, snapshot);
+  private bumpConnectionLifecycleGeneration(connectionId: string): void {
+    this.connectionLifecycleGenerations.set(
+      connectionId,
+      (this.connectionLifecycleGenerations.get(connectionId) ?? 0) + 1,
+    );
+  }
 
+  private async buildGraph(
+    request: ErdGraphRequest,
+    driver: IDBDriver,
+    snapshot: Awaited<ReturnType<ConnectionManager["getSchemaSnapshotAsync"]>>,
+  ): Promise<ErdGraph> {
     let objects = this.collectObjects(snapshot, request);
     if (objects.length === 0 && request.database) {
       objects = await this.discoverObjectsFromDriver(driver, request);

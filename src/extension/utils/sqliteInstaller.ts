@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import {
   cpSync,
   existsSync,
@@ -8,7 +9,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
+import { promisify } from "node:util";
 import { logger } from "./logger";
+
+const execFileAsync = promisify(execFile);
 
 type BetterSqlite3PackageJson = {
   name?: string;
@@ -537,9 +541,6 @@ async function downloadPatchedPrebuilt(
   runtimeRoot: string,
   baseDir: string,
 ): Promise<void> {
-  const { execSync } =
-    require("node:child_process") as typeof import("node:child_process");
-
   const pkg = readBundledBetterSqlite3Package(baseDir);
   if (!pkg.version) {
     throw new Error("Cannot determine better-sqlite3 version.");
@@ -559,9 +560,7 @@ async function downloadPatchedPrebuilt(
 
     // Extract into the scaffold (tarball contains build/Release/better_sqlite3.node)
     const scaffoldDir = join(runtimeRoot, "node_modules", "better-sqlite3");
-    execSync(`tar xzf "${tarballPath}" -C "${scaffoldDir}"`, {
-      stdio: "pipe",
-    });
+    await execFileAsync("tar", ["xzf", tarballPath, "-C", scaffoldDir]);
 
     const binaryPath = join(
       scaffoldDir,
@@ -585,9 +584,6 @@ async function rebuildFromSourceWithPatch(
   runtimeRoot: string,
   baseDir: string,
 ): Promise<void> {
-  const { execSync } =
-    require("node:child_process") as typeof import("node:child_process");
-
   const pkg = readBundledBetterSqlite3Package(baseDir);
   if (!pkg.version) {
     throw new Error(
@@ -596,8 +592,9 @@ async function rebuildFromSourceWithPatch(
   }
 
   // Verify npx is available (node-gyp itself is fetched via npx on demand)
+  const npxCommand = process.platform === "win32" ? "npx.cmd" : "npx";
   try {
-    execSync("npx --version", { stdio: "ignore" });
+    await execFileAsync(npxCommand, ["--version"]);
   } catch {
     throw new Error(
       "npx is required to build better-sqlite3 from source for Electron 42+. " +
@@ -618,10 +615,13 @@ async function rebuildFromSourceWithPatch(
 
     // Extract
     mkdirSync(sourceDir, { recursive: true });
-    execSync(
-      `tar xzf "${tarballPath}" -C "${sourceDir}" --strip-components=1`,
-      { stdio: "pipe" },
-    );
+    await execFileAsync("tar", [
+      "xzf",
+      tarballPath,
+      "-C",
+      sourceDir,
+      "--strip-components=1",
+    ]);
 
     // Apply the Electron 42 V8 API patch
     installerLog("Applying Electron 42 V8 API compatibility patch…");
@@ -632,16 +632,18 @@ async function rebuildFromSourceWithPatch(
     installerLog(
       `Building better-sqlite3 from source for Electron ${electronVersion} (ABI ${process.versions.modules}, ${process.platform}-${process.arch})…`,
     );
-    execSync(
+    await execFileAsync(
+      npxCommand,
       [
-        "npx node-gyp rebuild",
+        "node-gyp",
+        "rebuild",
         `--target=${electronVersion}`,
         `--arch=${process.arch}`,
         `--target_platform=${process.platform}`,
         "--dist-url=https://electronjs.org/headers",
         "--runtime=electron",
-      ].join(" "),
-      { cwd: sourceDir, stdio: "pipe", timeout: 300_000 },
+      ],
+      { cwd: sourceDir, timeout: 300_000 },
     );
 
     // Copy the built binary into the scaffold

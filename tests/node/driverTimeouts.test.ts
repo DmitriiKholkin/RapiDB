@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
+import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import {
   CONNECTION_TIMEOUT_SECONDS_DEFAULT,
   createDriverTimeoutSettingsSnapshot,
@@ -33,6 +35,95 @@ afterEach(() => {
 });
 
 describe("driver timeout helpers", () => {
+  it("cancels transaction connections without recursively recycling pools", async () => {
+    const postgres = new PostgresDriver({
+      id: "pg-timeout",
+      name: "Postgres timeout",
+      type: "pg",
+    });
+    const pgClient = { release: vi.fn() };
+    (
+      postgres as unknown as {
+        activeTransactionClients: Set<typeof pgClient>;
+      }
+    ).activeTransactionClients.add(pgClient);
+    const pgRecycle = vi.spyOn(postgres, "recycleConnectionAfterTimeout");
+
+    const mysql = new MySQLDriver({
+      id: "mysql-timeout",
+      name: "MySQL timeout",
+      type: "mysql",
+    });
+    const mysqlConnection = { destroy: vi.fn() };
+    (
+      mysql as unknown as {
+        activeTransactionConnections: Set<typeof mysqlConnection>;
+      }
+    ).activeTransactionConnections.add(mysqlConnection);
+    const mysqlRecycle = vi.spyOn(mysql, "recycleConnectionAfterTimeout");
+
+    await postgres.cancelCurrentOperation();
+    await mysql.cancelCurrentOperation();
+
+    expect(pgClient.release).toHaveBeenCalledWith(true);
+    expect(mysqlConnection.destroy).toHaveBeenCalledOnce();
+    expect(pgRecycle).not.toHaveBeenCalled();
+    expect(mysqlRecycle).not.toHaveBeenCalled();
+  });
+
+  it("cancels only the active superseded query connection", async () => {
+    const postgres = new PostgresDriver({
+      id: "pg-superseded-query",
+      name: "Postgres superseded query",
+      type: "pg",
+    });
+    const pgRecycle = vi
+      .spyOn(postgres, "recycleConnectionAfterTimeout")
+      .mockResolvedValue(undefined);
+    const pgClient = { release: vi.fn() };
+    (
+      postgres as unknown as {
+        activeQueryOperations: Set<{
+          cancelled: boolean;
+          client?: typeof pgClient;
+        }>;
+      }
+    ).activeQueryOperations.add({ cancelled: false, client: pgClient });
+
+    const mysql = new MySQLDriver({
+      id: "mysql-superseded-query",
+      name: "MySQL superseded query",
+      type: "mysql",
+    });
+    const mysqlRecycle = vi
+      .spyOn(mysql, "recycleConnectionAfterTimeout")
+      .mockResolvedValue(undefined);
+    const mysqlConnection = { destroy: vi.fn() };
+    (
+      mysql as unknown as {
+        activeQueryOperations: Set<{
+          cancelled: boolean;
+          connection?: typeof mysqlConnection;
+        }>;
+      }
+    ).activeQueryOperations.add({
+      cancelled: false,
+      connection: mysqlConnection,
+    });
+
+    const context = {
+      reason: "superseded" as const,
+      operationName: "query",
+    };
+    await postgres.cancelCurrentOperation(context);
+    await mysql.cancelCurrentOperation(context);
+
+    expect(pgClient.release).toHaveBeenCalledWith(true);
+    expect(mysqlConnection.destroy).toHaveBeenCalledOnce();
+    expect(pgRecycle).not.toHaveBeenCalled();
+    expect(mysqlRecycle).not.toHaveBeenCalled();
+  });
+
   it("normalizes timeout settings to defaults and allowed bounds", () => {
     expect(createDriverTimeoutSettingsSnapshot()).toEqual({
       connectionTimeoutSeconds: CONNECTION_TIMEOUT_SECONDS_DEFAULT,

@@ -9,6 +9,7 @@ import type {
 } from "mysql2/promise";
 import * as mysql from "mysql2/promise";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
+import type { OperationCancellationContext } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
@@ -1029,6 +1030,12 @@ type MysqlObjectRow = RowDataPacket & Record<string, unknown>;
 type MysqlArrayRow = unknown[];
 type MysqlSelectRows = MysqlArrayRow[];
 type MysqlQueryRows = MysqlSelectRows | ResultSetHeader;
+const MYSQL_POOL_CONNECTION_LIMIT = 5;
+interface MysqlQueryOperation {
+  cancelled: boolean;
+  requestToken?: number;
+  connection?: PoolConnection;
+}
 function isMysqlSelectRows(
   rawRows: MysqlQueryRows,
 ): rawRows is MysqlSelectRows {
@@ -1045,6 +1052,10 @@ export class MySQLDriver extends BaseDBDriver {
   private pool: Pool | null = null;
   private readonly config: ConnectionConfig;
   private timeoutRecoveryInFlight: Promise<void> | null = null;
+  private readonly activeTransactionConnections = new Set<PoolConnection>();
+  private readonly activeQueryConnections = new Set<PoolConnection>();
+  private readonly activeQueryOperations = new Set<MysqlQueryOperation>();
+  private activeQueryConnectionSlots = 0;
   constructor(
     config: ConnectionConfig,
     timeoutSettingsProvider?: DriverTimeoutSettingsProvider,
@@ -1118,11 +1129,44 @@ export class MySQLDriver extends BaseDBDriver {
     this.pool = null;
   }
 
-  async cancelCurrentOperation(): Promise<void> {
-    await this.recycleConnectionAfterTimeout({
-      timeoutKind: "dbOperation",
-      operationName: "cancelCurrentOperation",
-    });
+  async cancelCurrentOperation(
+    context?: OperationCancellationContext,
+  ): Promise<void> {
+    if (context?.operationName === "query") {
+      for (const operation of this.activeQueryOperations) {
+        if (
+          context.requestToken !== undefined &&
+          operation.requestToken !== context.requestToken
+        ) {
+          continue;
+        }
+        operation.cancelled = true;
+        if (operation.connection) {
+          this.activeQueryConnections.delete(operation.connection);
+          operation.connection.destroy();
+        }
+      }
+      return;
+    }
+
+    if (context?.operationName === "runTransaction" || context === undefined) {
+      const hadTransactionConnection =
+        this.activeTransactionConnections.size > 0;
+      for (const connection of [...this.activeTransactionConnections]) {
+        this.activeTransactionConnections.delete(connection);
+        connection.destroy();
+      }
+      if (context === undefined && !hadTransactionConnection) {
+        await this.recycleConnectionAfterTimeout();
+      }
+    }
+  }
+
+  protected override getQuestionMarkPlaceholderOptions() {
+    return {
+      hashLineComments: true,
+      dashCommentRequiresWhitespace: true,
+    } as const;
   }
 
   async recycleConnectionAfterTimeout(_context?: {
@@ -1334,26 +1378,88 @@ export class MySQLDriver extends BaseDBDriver {
       };
     });
   }
-  async query(sql: string, params?: unknown[]): Promise<QueryResult> {
+  async query(
+    sql: string,
+    params?: unknown[],
+    operationContext?: { requestToken?: number },
+  ): Promise<QueryResult> {
     const start = Date.now();
     if (params && params.length > 0) {
-      const [rawRows, fields] = await this.queryArrayRows(this.requirePool(), {
-        sql,
-        values: params as QueryOptions["values"],
-      });
-      return this._parseQueryResult(rawRows, fields, Date.now() - start);
+      return this.withTrackedQueryConnection(async (connection) => {
+        const [rawRows, fields] = await this.queryArrayRows(connection, {
+          sql,
+          values: params as QueryOptions["values"],
+        });
+        return this._parseQueryResult(rawRows, fields, Date.now() - start);
+      }, operationContext);
     }
     const stmts = splitMySQLScript(sql);
     if (stmts.length === 0) {
       return { columns: [], rows: [], rowCount: 0, executionTimeMs: 0 };
     }
     if (stmts.length === 1) {
-      const [rawRows, fields] = await this.queryArrayRows(this.requirePool(), {
-        sql: stmts[0],
-      });
-      return this._parseQueryResult(rawRows, fields, Date.now() - start);
+      return this.withTrackedQueryConnection(async (connection) => {
+        const [rawRows, fields] = await this.queryArrayRows(connection, {
+          sql: stmts[0],
+        });
+        return this._parseQueryResult(rawRows, fields, Date.now() - start);
+      }, operationContext);
     }
-    return this._executeScript(stmts, start);
+    return this.withTrackedQueryConnection(
+      (connection) => this._executeScript(connection, stmts, start),
+      operationContext,
+    );
+  }
+
+  private async withTrackedQueryConnection<T>(
+    operation: (connection: PoolConnection) => Promise<T>,
+    operationContext?: { requestToken?: number },
+  ): Promise<T> {
+    const queryOperation: MysqlQueryOperation = {
+      cancelled: false,
+      requestToken: operationContext?.requestToken,
+    };
+    this.activeQueryOperations.add(queryOperation);
+    let connection: PoolConnection | undefined;
+    let slotAcquired = false;
+    try {
+      await this.waitForQueryConnectionSlot(queryOperation);
+      this.activeQueryConnectionSlots += 1;
+      slotAcquired = true;
+      connection = await this.requirePool().getConnection();
+      queryOperation.connection = connection;
+      if (queryOperation.cancelled) {
+        connection.destroy();
+        throw new Error("MySQL query cancelled before execution.");
+      }
+      this.activeQueryConnections.add(connection);
+      return await operation(connection);
+    } finally {
+      this.activeQueryOperations.delete(queryOperation);
+      if (connection && this.activeQueryConnections.delete(connection)) {
+        connection.release();
+      }
+      if (slotAcquired) {
+        this.activeQueryConnectionSlots -= 1;
+      }
+    }
+  }
+
+  private async waitForQueryConnectionSlot(
+    operation: MysqlQueryOperation,
+  ): Promise<void> {
+    while (
+      this.activeQueryConnectionSlots >= MYSQL_POOL_CONNECTION_LIMIT ||
+      this.activeTransactionConnections.size >= MYSQL_POOL_CONNECTION_LIMIT
+    ) {
+      if (operation.cancelled) {
+        throw new Error("MySQL query cancelled before execution.");
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    }
+    if (operation.cancelled) {
+      throw new Error("MySQL query cancelled before execution.");
+    }
   }
   async readTablePage(
     request: DriverTablePageRequest,
@@ -1411,9 +1517,10 @@ export class MySQLDriver extends BaseDBDriver {
       }
     }
 
+    const fetchPageSize = countFailed ? request.pageSize + 1 : request.pageSize;
     const pagination = this.buildPagination(
       offset,
-      request.pageSize,
+      fetchPageSize,
       whereParams.length + 1,
     );
     const dataResult = await this.query(
@@ -1421,7 +1528,7 @@ export class MySQLDriver extends BaseDBDriver {
       [...whereParams, ...pagination.params],
     );
 
-    const rows = dataResult.rows.map((row) => {
+    const fetchedRows = dataResult.rows.map((row) => {
       const formattedRow: Record<string, unknown> = {};
       columns.forEach((column, index) => {
         formattedRow[column.name] = this.formatOutputValue(
@@ -1432,8 +1539,12 @@ export class MySQLDriver extends BaseDBDriver {
       return formattedRow;
     });
 
+    const hasMoreRows = countFailed && fetchedRows.length > request.pageSize;
+    const rows = hasMoreRows
+      ? fetchedRows.slice(0, request.pageSize)
+      : fetchedRows;
     if (countFailed) {
-      totalCount = offset + rows.length;
+      totalCount = offset + rows.length + (hasMoreRows ? 1 : 0);
     }
 
     return {
@@ -1515,10 +1626,10 @@ export class MySQLDriver extends BaseDBDriver {
     };
   }
   private async _executeScript(
+    conn: PoolConnection,
     stmts: string[],
     start: number,
   ): Promise<QueryResult> {
-    const conn = await this.requirePool().getConnection();
     let lastResult: QueryResult = {
       columns: [],
       rows: [],
@@ -1526,21 +1637,17 @@ export class MySQLDriver extends BaseDBDriver {
       executionTimeMs: 0,
     };
     let totalAffected = 0;
-    try {
-      for (const stmt of stmts) {
-        const [rawRows, fields] = await this.queryArrayRows(conn, {
-          sql: stmt,
-        });
-        const r = this._parseQueryResult(rawRows, fields, 0);
-        totalAffected += r.affectedRows ?? r.rowCount ?? 0;
-        if (r.columns.length > 0) {
-          lastResult = r;
-        } else if (lastResult.columns.length === 0) {
-          lastResult = r;
-        }
+    for (const stmt of stmts) {
+      const [rawRows, fields] = await this.queryArrayRows(conn, {
+        sql: stmt,
+      });
+      const r = this._parseQueryResult(rawRows, fields, 0);
+      totalAffected += r.affectedRows ?? r.rowCount ?? 0;
+      if (r.columns.length > 0) {
+        lastResult = r;
+      } else if (lastResult.columns.length === 0) {
+        lastResult = r;
       }
-    } finally {
-      conn.release();
     }
     lastResult.executionTimeMs = Date.now() - start;
     if (lastResult.columns.length === 0) {
@@ -1830,8 +1937,9 @@ export class MySQLDriver extends BaseDBDriver {
     operations: import("./types").TransactionOperation[],
   ): Promise<void> {
     const conn = await this.requirePool().getConnection();
-    await conn.beginTransaction();
+    this.activeTransactionConnections.add(conn);
     try {
+      await conn.beginTransaction();
       for (const op of operations) {
         const [rows] = await conn.query<ResultSetHeader>(
           this.createQueryOptions(op.sql, op.params as QueryOptions["values"]),
@@ -1847,10 +1955,12 @@ export class MySQLDriver extends BaseDBDriver {
       }
       await conn.commit();
     } catch (e) {
-      await conn.rollback();
+      await conn.rollback().catch(() => undefined);
       throw e;
     } finally {
-      conn.release();
+      if (this.activeTransactionConnections.delete(conn)) {
+        conn.release();
+      }
     }
   }
   override async getMutationAtomicityRisk(

@@ -30,6 +30,28 @@ export function filterWritableRecord(
   return Object.fromEntries(writableEntries(record, colMap));
 }
 
+export function assertExactPrimaryKeyShape(
+  primaryKeyValues: Record<string, unknown>,
+  columns: readonly ColumnTypeMeta[],
+): void {
+  const expected = columns
+    .filter((column) => column.isPrimaryKey)
+    .map((column) => column.name);
+  const provided = Object.keys(primaryKeyValues);
+  const expectedSet = new Set(expected);
+  if (
+    expected.length === 0 ||
+    provided.length !== expected.length ||
+    provided.some(
+      (columnName) =>
+        !expectedSet.has(columnName) ||
+        primaryKeyValues[columnName] === undefined,
+    )
+  ) {
+    throw new Error("Update requires the full primary key for the target row.");
+  }
+}
+
 export function buildUpdateRowSql(
   drv: IDBDriver,
   database: string,
@@ -47,11 +69,12 @@ export function buildUpdateRowSql(
     filterWritableRecord(changes, colMap),
     colMap,
   );
+  if (Object.keys(coercedChanges).length === 0) return null;
+  assertExactPrimaryKeyShape(pkValues, cols);
   const coercedPk = coerceRecord(drv, pkValues, colMap);
 
   const setCols = Object.keys(coercedChanges);
   const pkCols = Object.keys(coercedPk);
-  if (setCols.length === 0 || pkCols.length === 0) return null;
 
   const params: unknown[] = [];
 

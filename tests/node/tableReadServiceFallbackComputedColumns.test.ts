@@ -54,6 +54,44 @@ const columns: ColumnTypeMeta[] = [
 ];
 
 describe("TableReadService arithmetic overflow handling", () => {
+  it("does not repopulate the column cache with a result from before clear", async () => {
+    let resolveStaleColumns!: (value: ColumnTypeMeta[]) => void;
+    const staleColumns = columns;
+    const freshColumns = columns.map((column) => ({
+      ...column,
+      name: `${column.name}_fresh`,
+    }));
+    const describeColumns = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise<ColumnTypeMeta[]>((resolve) => {
+            resolveStaleColumns = resolve;
+          }),
+      )
+      .mockResolvedValueOnce(freshColumns);
+    const driver = { describeColumns };
+    const connectionManager = {
+      getConnection: vi.fn(() => ({ id: "c1" })),
+      getDriver: vi.fn(() => driver),
+    };
+    const service = new TableReadService(connectionManager as never);
+
+    const staleRequest = service.getColumns("c1", "db", "dbo", "t");
+    service.clearForConnection("c1");
+    await expect(service.getColumns("c1", "db", "dbo", "t")).resolves.toEqual(
+      freshColumns,
+    );
+
+    resolveStaleColumns(staleColumns);
+    await staleRequest;
+
+    await expect(service.getColumns("c1", "db", "dbo", "t")).resolves.toEqual(
+      freshColumns,
+    );
+    expect(describeColumns).toHaveBeenCalledTimes(2);
+  });
+
   it("throws fatal error with computed column names", async () => {
     const firstQueryError = new Error(
       "Arithmetic overflow error converting expression",
@@ -201,6 +239,49 @@ describe("TableReadService arithmetic overflow handling", () => {
       { id: 51, calc: 99 },
       { id: 52, calc: 100 },
     ]);
+  });
+
+  it("keeps the next page reachable when COUNT fails on a full page", async () => {
+    const query = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("count failed"))
+      .mockResolvedValueOnce({
+        columns: ["id", "calc"],
+        rows: Array.from({ length: 26 }, (_, index) => ({
+          __col_0: index + 1,
+          __col_1: index + 2,
+        })),
+      });
+    const driver = {
+      qualifiedTableName: vi.fn(() => "[db].[dbo].[t]"),
+      describeColumns: vi.fn().mockResolvedValue(columns),
+      buildOrderByDefault: vi.fn(() => "ORDER BY [id] ASC"),
+      buildPagination: vi.fn(() => ({ sql: "OFFSET ? ROWS", params: [0, 25] })),
+      query,
+      quoteIdentifier: vi.fn((name: string) => `[${name}]`),
+      formatOutputValue: vi.fn((value: unknown) => value),
+      buildFilterCondition: vi.fn(),
+      normalizeFilterValue: vi.fn(),
+    };
+    const service = new TableReadService({
+      getConnection: vi.fn(() => ({ id: "c1" })),
+      getDriver: vi.fn(() => driver),
+    } as never);
+
+    const result = await service.getPage(
+      "c1",
+      "db",
+      "dbo",
+      "t",
+      1,
+      25,
+      [],
+      null,
+      false,
+    );
+
+    expect(result.totalCount).toBe(26);
+    expect(result.rows).toHaveLength(25);
   });
 
   it("uses keyset-first export for fallback SQL reads to avoid duplicates under concurrent inserts", async () => {

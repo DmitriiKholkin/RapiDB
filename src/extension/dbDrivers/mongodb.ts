@@ -15,6 +15,7 @@ import {
   Timestamp,
   UUID,
 } from "mongodb";
+import type { OperationCancellationContext } from "../../shared/safetyContracts";
 import { QUERY_LIMIT_POLICY } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
@@ -948,11 +949,13 @@ export class MongoDBDriver implements IDBDriver {
     this.connected = false;
   }
 
-  async cancelCurrentOperation(): Promise<void> {
-    await this.recycleConnectionAfterTimeout({
-      timeoutKind: "dbOperation",
-      operationName: "cancelCurrentOperation",
-    });
+  async cancelCurrentOperation(
+    context?: OperationCancellationContext,
+  ): Promise<void> {
+    if (context?.reason === "timeout") {
+      return;
+    }
+    await this.recycleConnectionAfterTimeout(context);
   }
 
   async recycleConnectionAfterTimeout(_context?: {

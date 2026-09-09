@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
@@ -134,6 +134,23 @@ describe("MSSQL datetimeoffset filter", () => {
     expect(boundSql).toBe("SELECT 1 WHERE [score] = @p1");
     expect(recorded).toHaveLength(1);
     expect(recorded[0].typeName).toBe("Float");
+  });
+
+  it("binds only executable question-mark placeholders", () => {
+    const driver = makeDriver() as unknown as {
+      bindPositionalParameters: (
+        request: { input: () => void },
+        sql: string,
+        params: readonly unknown[],
+      ) => string;
+    };
+    const request = { input: vi.fn() };
+    const sql = "SELECT '?' AS [literal?], ? AS [value] -- ignored ?";
+
+    expect(driver.bindPositionalParameters(request, sql, [7])).toBe(
+      "SELECT '?' AS [literal?], @p1 AS [value] -- ignored ?",
+    );
+    expect(request.input).toHaveBeenCalledOnce();
   });
 
   it("supports datetimeoffset equality using copied 7-digit fractional values", () => {

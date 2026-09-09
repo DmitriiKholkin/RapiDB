@@ -232,7 +232,9 @@ type ConnectionProviderManager = ScopeAwareConnectionManagerApi & {
   onDidChangeSchemaState(
     listener: (connectionId: string) => void,
   ): vscode.Disposable;
-  onDidRefreshSchemas(listener: () => void): vscode.Disposable;
+  onDidRefreshSchemas(
+    listener: (connectionId?: string) => void,
+  ): vscode.Disposable;
   getConnection?(id: string): ConnectionConfig | undefined;
   getDriverEntityManifest?(id: string): DriverEntityManifest;
 };

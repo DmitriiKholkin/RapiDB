@@ -152,6 +152,51 @@ describe("RedisDriver — disconnect()", () => {
 });
 
 describe("RedisDriver — metadata and pages", () => {
+  it("paginates over the same sorted key set on every page", async () => {
+    const driver = new RedisDriver({
+      id: "redis-stable-pages",
+      name: "Redis Stable Pages",
+      type: "redis",
+      host: "localhost",
+    });
+    const client = {
+      scan: vi.fn().mockResolvedValue({
+        cursor: "0",
+        keys: ["users:b", "users:d", "users:a", "users:c"],
+      }),
+      type: vi.fn().mockResolvedValue("string"),
+      get: vi.fn(async (key: string) => key),
+    };
+    (
+      driver as unknown as {
+        client: typeof client | null;
+        connected: boolean;
+      }
+    ).client = client;
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    const request = {
+      database: "db0",
+      schema: "db0",
+      table: "users",
+      pageSize: 2,
+      filters: [],
+      sort: { column: "key", direction: "asc" } as const,
+      skipCount: true,
+    };
+    const firstPage = await driver.readTablePage({ ...request, page: 1 });
+    const secondPage = await driver.readTablePage({ ...request, page: 2 });
+
+    expect(firstPage.rows.map((row) => row.key)).toEqual([
+      "users:a",
+      "users:b",
+    ]);
+    expect(secondPage.rows.map((row) => row.key)).toEqual([
+      "users:c",
+      "users:d",
+    ]);
+  });
+
   it("uses bounded scan COUNT for small finite insert-type discovery limits", async () => {
     const driver = new RedisDriver({
       id: "redis-insert-infer-scan-limit",

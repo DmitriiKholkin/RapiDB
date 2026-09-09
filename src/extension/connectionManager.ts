@@ -731,8 +731,10 @@ export class ConnectionManager
   private readonly _onDidSchemaLoad = new vscode.EventEmitter<string>();
   readonly onDidChangeSchemaState: vscode.Event<string>;
   private readonly _onDidChangeSchemaState = new vscode.EventEmitter<string>();
-  readonly onDidRefreshSchemas: vscode.Event<void>;
-  private readonly _onDidRefreshSchemas = new vscode.EventEmitter<void>();
+  readonly onDidRefreshSchemas: vscode.Event<string | undefined>;
+  private readonly _onDidRefreshSchemas = new vscode.EventEmitter<
+    string | undefined
+  >();
   private _connectionsCache: ConnectionConfig[] | null = null;
   private readonly _driverStaticMetadataCache = new Map<
     string,
@@ -1007,7 +1009,11 @@ export class ConnectionManager
     }
     this.invalidateDriverStaticMetadata(canonicalConfig.id);
     await this.saveConnections(conns);
-    if (isEdit && this.isConnected(canonicalConfig.id)) {
+    if (
+      isEdit &&
+      (this.isConnected(canonicalConfig.id) ||
+        this.isConnecting(canonicalConfig.id))
+    ) {
       await this.disconnectFrom(canonicalConfig.id);
     }
     this._onDidChangeConnections.fire();
@@ -2404,7 +2410,7 @@ export class ConnectionManager
       this._restoreExpandedSchemaLoads(nextConnectionId);
     }
 
-    this._onDidRefreshSchemas.fire();
+    this._onDidRefreshSchemas.fire(connectionId);
   }
 
   async getSchemaAsync(connectionId: string): Promise<SchemaObjectEntry[]> {

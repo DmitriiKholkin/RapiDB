@@ -283,7 +283,11 @@ export interface IDBDriver {
     kind: "function" | "procedure",
     routineIdentity?: string,
   ): Promise<string>;
-  query(sql: string, params?: unknown[]): Promise<QueryResult>;
+  query(
+    sql: string,
+    params?: unknown[],
+    operationContext?: { requestToken?: number },
+  ): Promise<QueryResult>;
   readTablePage?(
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult>;

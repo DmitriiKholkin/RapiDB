@@ -39,4 +39,14 @@ describe("SQLite VS Code runtime packaging scripts", () => {
 
     expect(activationEvents).toContain("onStartupFinished");
   });
+
+  it("does not block the extension host with synchronous child processes", () => {
+    const installerSource = readFileSync(
+      new URL("../../src/extension/utils/sqliteInstaller.ts", import.meta.url),
+      "utf8",
+    );
+
+    expect(installerSource).not.toContain("execSync");
+    expect(installerSource).toContain("execFileAsync");
+  });
 });

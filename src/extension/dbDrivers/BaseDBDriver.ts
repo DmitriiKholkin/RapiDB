@@ -15,6 +15,13 @@ import {
   createSqlFilterPreamble,
   type SqlFilterPreambleResult,
 } from "./sqlFilterPrelude";
+import type { QuestionMarkPlaceholderOptions } from "./sqlPlaceholders";
+import {
+  indexedPlaceholderOffsets,
+  questionMarkPlaceholderOffsets,
+  replaceIndexedPlaceholders,
+  replaceQuestionMarkPlaceholders,
+} from "./sqlPlaceholders";
 import {
   type DriverTimeoutSettingsProvider,
   type DriverTimeoutSettingsSnapshot,
@@ -146,31 +153,33 @@ function materializeSequentialPreviewSql(
   sql: string,
   params: readonly unknown[],
   formatLiteral: (value: unknown) => string,
+  placeholderOptions: QuestionMarkPlaceholderOptions,
 ): string {
-  const placeholderCount = (sql.match(/\?/g) ?? []).length;
-  if (placeholderCount !== params.length) {
+  const offsets = questionMarkPlaceholderOffsets(sql, placeholderOptions);
+  if (offsets.length !== params.length) {
     throw new Error(
-      `[RapiDB] Preview parameter mismatch: SQL has ${placeholderCount} placeholder(s) but ${params.length} value(s) were supplied.`,
+      `[RapiDB] Preview parameter mismatch: SQL has ${offsets.length} placeholder(s) but ${params.length} value(s) were supplied.`,
     );
   }
-  let index = 0;
-  return sql.replace(/\?/g, () => formatLiteral(params[index++]));
+  return replaceQuestionMarkPlaceholders(sql, offsets, (index) =>
+    formatLiteral(params[index]),
+  );
 }
 function materializeIndexedPreviewSql(
   sql: string,
   params: readonly unknown[],
   marker: "$" | ":",
   formatLiteral: (value: unknown) => string,
+  placeholderOptions: QuestionMarkPlaceholderOptions,
 ): string {
-  const placeholderPattern = marker === "$" ? /\$(\d+)/g : /:(\d+)/g;
-  return sql.replace(placeholderPattern, (match, rawIndex: string) => {
-    const paramIndex = Number.parseInt(rawIndex, 10) - 1;
-    if (paramIndex < 0 || paramIndex >= params.length) {
+  const offsets = indexedPlaceholderOffsets(sql, marker, placeholderOptions);
+  return replaceIndexedPlaceholders(sql, offsets, (placeholder) => {
+    if (placeholder.index < 0 || placeholder.index >= params.length) {
       throw new Error(
-        `[RapiDB] Preview parameter mismatch: ${match} is out of range for ${params.length} value(s).`,
+        `[RapiDB] Preview parameter mismatch: ${placeholder.text} is out of range for ${params.length} value(s).`,
       );
     }
-    return formatLiteral(params[paramIndex]);
+    return formatLiteral(params[placeholder.index]);
   });
 }
 export function parseHexToBuffer(value: string): Buffer {
@@ -1095,22 +1104,40 @@ export abstract class BaseDBDriver implements IDBDriver {
   protected formatPreviewSqlLiteral(value: unknown): string {
     return formatGenericPreviewSqlLiteral(value);
   }
+  protected getQuestionMarkPlaceholderOptions(): QuestionMarkPlaceholderOptions {
+    return {};
+  }
   materializePreviewSql(sql: string, params?: readonly unknown[]): string {
     if (!params || params.length === 0) {
       return sql;
     }
     const formatLiteral = (value: unknown) =>
       this.formatPreviewSqlLiteral(value);
-    if (sql.includes("?")) {
-      return materializeSequentialPreviewSql(sql, params, formatLiteral);
+    const placeholderOptions = this.getQuestionMarkPlaceholderOptions();
+    if (indexedPlaceholderOffsets(sql, "$", placeholderOptions).length > 0) {
+      return materializeIndexedPreviewSql(
+        sql,
+        params,
+        "$",
+        formatLiteral,
+        placeholderOptions,
+      );
     }
-    if (/\$\d+/.test(sql)) {
-      return materializeIndexedPreviewSql(sql, params, "$", formatLiteral);
+    if (indexedPlaceholderOffsets(sql, ":", placeholderOptions).length > 0) {
+      return materializeIndexedPreviewSql(
+        sql,
+        params,
+        ":",
+        formatLiteral,
+        placeholderOptions,
+      );
     }
-    if (/:\d+/.test(sql)) {
-      return materializeIndexedPreviewSql(sql, params, ":", formatLiteral);
-    }
-    return sql;
+    return materializeSequentialPreviewSql(
+      sql,
+      params,
+      formatLiteral,
+      this.getQuestionMarkPlaceholderOptions(),
+    );
   }
   protected hasBooleanSemantics(
     column: Pick<ColumnTypeMeta, "valueSemantics">,

@@ -324,6 +324,22 @@ function sanitizeSqlForReadOnlyClassification(queryText: string): string {
   return sanitized;
 }
 
+export function mayChangeDatabaseSchema(queryText: string): boolean {
+  const sanitizedQuery = sanitizeSqlForReadOnlyClassification(queryText);
+  if (
+    /\b(?:CREATE|ALTER|DROP|TRUNCATE|RENAME|COMMENT|GRANT|REVOKE)\b/i.test(
+      sanitizedQuery,
+    )
+  ) {
+    return true;
+  }
+
+  return (
+    /^\s*DO\b/i.test(sanitizedQuery) &&
+    /\$(?:[A-Za-z_][A-Za-z0-9_]*\$|\$)/.test(queryText)
+  );
+}
+
 function readDollarQuoteTag(queryText: string, index: number): string | null {
   if (queryText[index] !== "$") {
     return null;

@@ -116,6 +116,8 @@ const DYNAMODB_ENTITY_MANIFEST: DriverEntityManifest = {
 
 const DYNAMODB_CURSOR_FETCH_LIMIT = 200;
 const DYNAMODB_MAX_MATERIALIZED_ROWS = 5000;
+const DYNAMODB_CURSOR_CACHE_MAX_SESSIONS = 100;
+const DYNAMODB_CURSOR_SESSION_MAX_PAGE_STARTS = 100;
 const DYNAMODB_UNSUPPORTED_METADATA =
   createNoSqlUnsupportedMetadataHandlers("DynamoDB");
 
@@ -1810,7 +1812,7 @@ export class DynamoDBDriver implements IDBDriver {
       if (step.nextCursor === undefined) {
         session.terminalPage = step.rows.length === 0 ? currentPage : nextPage;
       } else {
-        session.pageStarts.set(nextPage, step.nextCursor);
+        this.setCursorPageStart(session, nextPage, step.nextCursor);
       }
 
       if (currentPage === page) {
@@ -1830,14 +1832,35 @@ export class DynamoDBDriver implements IDBDriver {
   private getCursorSession(cacheKey: string): DynamoCursorSession {
     const existing = this.cursorCache.get(cacheKey);
     if (existing) {
+      this.cursorCache.delete(cacheKey);
+      this.cursorCache.set(cacheKey, existing);
       return existing;
     }
     const session: DynamoCursorSession = {
       pageStarts: new Map([[1, undefined]]),
       terminalPage: null,
     };
+    if (this.cursorCache.size >= DYNAMODB_CURSOR_CACHE_MAX_SESSIONS) {
+      const oldestKey = this.cursorCache.keys().next().value;
+      if (oldestKey !== undefined) this.cursorCache.delete(oldestKey);
+    }
     this.cursorCache.set(cacheKey, session);
     return session;
+  }
+
+  private setCursorPageStart(
+    session: DynamoCursorSession,
+    page: number,
+    cursor: Record<string, AttributeValue>,
+  ): void {
+    session.pageStarts.set(page, cursor);
+    if (session.pageStarts.size <= DYNAMODB_CURSOR_SESSION_MAX_PAGE_STARTS) {
+      return;
+    }
+    const oldestPage = [...session.pageStarts.keys()]
+      .filter((candidate) => candidate !== 1)
+      .sort((left, right) => left - right)[0];
+    if (oldestPage !== undefined) session.pageStarts.delete(oldestPage);
   }
 
   private async executeReadPlanStep(
@@ -1846,32 +1869,43 @@ export class DynamoDBDriver implements IDBDriver {
     pageSize: number,
     sort: DriverSortConfig | null,
   ): Promise<ReadStepResult> {
-    if (plan.kind === "query") {
-      const input: QueryCommandInput = {
-        ...plan.baseInput,
-        Limit: pageSize,
-        ...(cursor ? { ExclusiveStartKey: cursor } : {}),
-      };
-      if (sort && plan.sortKeyName === sort.column) {
-        input.ScanIndexForward = sort.direction !== "desc";
+    const rows: Record<string, unknown>[] = [];
+    let nextCursor = cursor;
+    do {
+      const limit = pageSize - rows.length;
+      if (plan.kind === "query") {
+        const input: QueryCommandInput = {
+          ...plan.baseInput,
+          Limit: limit,
+          ...(nextCursor ? { ExclusiveStartKey: nextCursor } : {}),
+        };
+        if (sort && plan.sortKeyName === sort.column) {
+          input.ScanIndexForward = sort.direction !== "desc";
+        }
+        const response = await this.requireClient().send(
+          new QueryCommand(input),
+        );
+        rows.push(...(response.Items ?? []).map((item) => unmarshall(item)));
+        nextCursor = response.LastEvaluatedKey;
+      } else {
+        const input: ScanCommandInput = {
+          ...plan.baseInput,
+          Limit: limit,
+          ...(nextCursor ? { ExclusiveStartKey: nextCursor } : {}),
+        };
+        const response = await this.requireClient().send(
+          new ScanCommand(input),
+        );
+        rows.push(...(response.Items ?? []).map((item) => unmarshall(item)));
+        nextCursor = response.LastEvaluatedKey;
       }
-      const response = await this.requireClient().send(new QueryCommand(input));
-      return {
-        rows: (response.Items ?? []).map((item) => unmarshall(item)),
-        nextCursor: response.LastEvaluatedKey,
-      };
-    }
+    } while (
+      rows.length < pageSize &&
+      nextCursor !== undefined &&
+      plan.baseInput.FilterExpression !== undefined
+    );
 
-    const input: ScanCommandInput = {
-      ...plan.baseInput,
-      Limit: pageSize,
-      ...(cursor ? { ExclusiveStartKey: cursor } : {}),
-    };
-    const response = await this.requireClient().send(new ScanCommand(input));
-    return {
-      rows: (response.Items ?? []).map((item) => unmarshall(item)),
-      nextCursor: response.LastEvaluatedKey,
-    };
+    return { rows, nextCursor };
   }
 
   private async countReadPlan(plan: DynamoReadPlan): Promise<number> {

@@ -205,4 +205,74 @@ describe("exportService", () => {
     expect(output).toContain('"t_int64":9223372036854775801');
     expect(output).toContain('"t_decimal128":123456789.987654311');
   });
+
+  it("removes temporary output when export fails", async () => {
+    const { exportTableDataAsCsv } = await import(
+      "../../src/extension/utils/exportService"
+    );
+
+    await exportTableDataAsCsv({
+      fileName: "failed_export",
+      loadChunks: async function* () {
+        yield {
+          columns: [{ name: "id", category: "integer", nativeType: "int" }],
+          rows: [{ id: 1 }],
+        };
+        throw new Error("read failed");
+      },
+    });
+
+    expect(fs.existsSync(outputPath)).toBe(false);
+    expect(
+      fs.readdirSync(tempDir).some((name) => name.includes(".rapidb-")),
+    ).toBe(false);
+    expect(vscodeMock.showErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("read failed"),
+    );
+  });
+
+  it("preserves an existing output when replacing it fails", async () => {
+    const previousOutput = "previous export\n";
+    fs.writeFileSync(outputPath, previousOutput);
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        renameSync: vi.fn((source: unknown, destination: unknown) => {
+          if (
+            String(source).includes(".tmp") &&
+            String(destination) === outputPath
+          ) {
+            throw new Error("replace failed");
+          }
+          return actual.renameSync(source as never, destination as never);
+        }),
+      };
+    });
+
+    try {
+      const { exportTableDataAsCsv } = await import(
+        "../../src/extension/utils/exportService"
+      );
+      await exportTableDataAsCsv({
+        fileName: "failed_replacement",
+        loadChunks: async function* () {
+          yield {
+            columns: [{ name: "id", category: "integer", nativeType: "int" }],
+            rows: [{ id: 1 }],
+          };
+        },
+      });
+    } finally {
+      vi.doUnmock("node:fs");
+    }
+
+    expect(fs.readFileSync(outputPath, "utf8")).toBe(previousOutput);
+    expect(
+      fs.readdirSync(tempDir).some((name) => name.includes(".rapidb-")),
+    ).toBe(false);
+    expect(vscodeMock.showErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("replace failed"),
+    );
+  });
 });

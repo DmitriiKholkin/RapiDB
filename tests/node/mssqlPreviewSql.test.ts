@@ -68,6 +68,16 @@ describe("MSSQL preview SQL literals", () => {
     expect(preview).not.toContain("TRUE");
   });
 
+  it("ignores question marks in literals, identifiers, and comments", () => {
+    const driver = new MSSQLDriver(baseConfig as ConnectionConfig);
+    const sql =
+      "SELECT '?' AS [literal?], ? AS [value] -- ignored ?\n/* ignored ? */";
+
+    expect(driver.materializePreviewSql(sql, [42])).toBe(
+      "SELECT '?' AS [literal?], 42 AS [value] -- ignored ?\n/* ignored ? */",
+    );
+  });
+
   it("materializes INSERT preview SQL with Unicode string prefixes for Unicode columns", () => {
     const driver = new MSSQLDriver(baseConfig as ConnectionConfig);
     const preview = driver.materializePreviewInsertSql(

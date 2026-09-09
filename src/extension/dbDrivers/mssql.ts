@@ -15,6 +15,10 @@ import {
   normalizeSqlDatetimeOffsetSpacing,
 } from "./BaseDBDriver";
 import {
+  questionMarkPlaceholderOffsets,
+  replaceQuestionMarkPlaceholders,
+} from "./sqlPlaceholders";
+import {
   formatHexSqlPreviewLiteral,
   formatSqlPreviewStringLiteral,
 } from "./sqlPreviewLiterals";
@@ -1193,16 +1197,15 @@ export class MSSQLDriver extends BaseDBDriver {
     if (!params || params.length === 0) {
       return sql;
     }
-    const placeholderCount = (sql.match(/\?/g) ?? []).length;
-    if (placeholderCount !== params.length) {
+    const offsets = questionMarkPlaceholderOffsets(sql);
+    if (offsets.length !== params.length) {
       throw new Error(
-        `[RapiDB] MSSQL parameter mismatch: SQL has ${placeholderCount} placeholder(s) but ${params.length} value(s) were supplied.`,
+        `[RapiDB] MSSQL parameter mismatch: SQL has ${offsets.length} placeholder(s) but ${params.length} value(s) were supplied.`,
       );
     }
-    let index = 0;
-    return sql.replace(/\?/g, () => {
-      const name = `p${++index}`;
-      this.bindRequestInput(request, name, params[index - 1]);
+    return replaceQuestionMarkPlaceholders(sql, offsets, (index) => {
+      const name = `p${index + 1}`;
+      this.bindRequestInput(request, name, params[index]);
       return `@${name}`;
     });
   }
@@ -2088,17 +2091,15 @@ export class MSSQLDriver extends BaseDBDriver {
     if (!params || params.length === 0) {
       return sql;
     }
-    const placeholderCount = (sql.match(/\?/g) ?? []).length;
-    if (placeholderCount !== params.length) {
+    const offsets = questionMarkPlaceholderOffsets(sql);
+    if (offsets.length !== params.length) {
       throw new Error(
-        `[RapiDB] Preview parameter mismatch: SQL has ${placeholderCount} placeholder(s) but ${params.length} value(s) were supplied.`,
+        `[RapiDB] Preview parameter mismatch: SQL has ${offsets.length} placeholder(s) but ${params.length} value(s) were supplied.`,
       );
     }
-    let index = 0;
-    return sql.replace(/\?/g, () => {
+    return replaceQuestionMarkPlaceholders(sql, offsets, (index) => {
       const value = params[index];
       const column = columns[index];
-      index += 1;
       if (typeof value === "string" && column) {
         return formatMssqlStringPreviewLiteral(value, column.nativeType);
       }

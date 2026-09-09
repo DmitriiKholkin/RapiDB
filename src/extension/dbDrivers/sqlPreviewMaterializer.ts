@@ -1,4 +1,10 @@
 import { formatDatetimeForDisplay } from "../utils/dateUtils";
+import {
+  indexedPlaceholderOffsets,
+  questionMarkPlaceholderOffsets,
+  replaceIndexedPlaceholders,
+  replaceQuestionMarkPlaceholders,
+} from "./sqlPlaceholders";
 
 /**
  * Materializes SQL preview strings by replacing parameter placeholders
@@ -20,16 +26,13 @@ export class SqlPreviewMaterializer {
     const formatter =
       formatLiteral ??
       ((value: unknown) => this.formatGenericPreviewSqlLiteral(value));
-    if (sql.includes("?")) {
-      return materializeSequentialPreviewSql(sql, params, formatter);
-    }
-    if (/\$\d+/.test(sql)) {
+    if (indexedPlaceholderOffsets(sql, "$", {}).length > 0) {
       return materializeIndexedPreviewSql(sql, params, "$", formatter);
     }
-    if (/:\d+/.test(sql)) {
+    if (indexedPlaceholderOffsets(sql, ":", {}).length > 0) {
       return materializeIndexedPreviewSql(sql, params, ":", formatter);
     }
-    return sql;
+    return materializeSequentialPreviewSql(sql, params, formatter);
   }
 
   /**
@@ -87,14 +90,15 @@ function materializeSequentialPreviewSql(
   params: readonly unknown[],
   formatLiteral: (value: unknown) => string,
 ): string {
-  const placeholderCount = (sql.match(/\?/g) ?? []).length;
-  if (placeholderCount !== params.length) {
+  const offsets = questionMarkPlaceholderOffsets(sql);
+  if (offsets.length !== params.length) {
     throw new Error(
-      `[RapiDB] Preview parameter mismatch: SQL has ${placeholderCount} placeholder(s) but ${params.length} value(s) were supplied.`,
+      `[RapiDB] Preview parameter mismatch: SQL has ${offsets.length} placeholder(s) but ${params.length} value(s) were supplied.`,
     );
   }
-  let index = 0;
-  return sql.replace(/\?/g, () => formatLiteral(params[index++]));
+  return replaceQuestionMarkPlaceholders(sql, offsets, (index) =>
+    formatLiteral(params[index]),
+  );
 }
 
 /**
@@ -106,14 +110,13 @@ function materializeIndexedPreviewSql(
   marker: "$" | ":",
   formatLiteral: (value: unknown) => string,
 ): string {
-  const placeholderPattern = marker === "$" ? /\$(\d+)/g : /:(\d+)/g;
-  return sql.replace(placeholderPattern, (match, rawIndex: string) => {
-    const paramIndex = Number.parseInt(rawIndex, 10) - 1;
-    if (paramIndex < 0 || paramIndex >= params.length) {
+  const offsets = indexedPlaceholderOffsets(sql, marker);
+  return replaceIndexedPlaceholders(sql, offsets, (placeholder) => {
+    if (placeholder.index < 0 || placeholder.index >= params.length) {
       throw new Error(
-        `[RapiDB] Preview parameter mismatch: ${match} is out of range for ${params.length} value(s).`,
+        `[RapiDB] Preview parameter mismatch: ${placeholder.text} is out of range for ${params.length} value(s).`,
       );
     }
-    return formatLiteral(params[paramIndex]);
+    return formatLiteral(params[placeholder.index]);
   });
 }

@@ -153,7 +153,7 @@ export function registerTableServiceIntegrationTests(
         [],
       );
 
-      expect(fallbackPage.totalCount).toBe(5);
+      expect(fallbackPage.totalCount).toBe(6);
       expect(fallbackPage.rows).toHaveLength(5);
     });
 
@@ -364,6 +364,14 @@ export function registerTableServiceIntegrationTests(
         }
 
         return harness.driver.query(sql, params);
+      };
+      unverifiableDriver.runTransaction = async (operations) => {
+        if (
+          operations.every((operation) => /^\s*delete\b/i.test(operation.sql))
+        ) {
+          return;
+        }
+        await harness.driver.runTransaction(operations);
       };
 
       const strictMutationService = new TableMutationService(

@@ -1078,6 +1078,43 @@ describe("ConnectionManager", () => {
     expect(store.getConnections()[0]?.name).toBe("Primary Updated");
   });
 
+  it("cancels an in-flight connection when its settings are edited", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-connecting",
+        name: "Connecting",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+      },
+    ]);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    vi.spyOn(manager, "isConnected").mockReturnValue(false);
+    vi.spyOn(manager, "isConnecting").mockReturnValue(true);
+    const disconnect = vi
+      .spyOn(manager, "disconnectFrom")
+      .mockResolvedValue(undefined);
+
+    await manager.saveConnection({
+      id: "conn-connecting",
+      name: "Connecting Updated",
+      type: "pg",
+      host: "localhost",
+      database: "next_db",
+      username: "postgres",
+    });
+
+    expect(disconnect).toHaveBeenCalledWith("conn-connecting");
+  });
+
   it("renames a connection folder without disconnecting matching connections", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"

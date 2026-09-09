@@ -115,7 +115,9 @@ describe("QueryPanelController", () => {
 
     expect(isConnected).toHaveBeenNthCalledWith(1, "override");
     expect(addToHistory).toHaveBeenNthCalledWith(1, "override", "select 1");
-    expect(query).toHaveBeenNthCalledWith(1, "select 1");
+    expect(query).toHaveBeenNthCalledWith(1, "select 1", undefined, {
+      requestToken: 1,
+    });
 
     await controller.handleMessage({
       type: "addBookmark",
@@ -228,6 +230,8 @@ describe("QueryPanelController", () => {
 
     expect(query).toHaveBeenCalledWith(
       "SELECT * FROM (select * from users) AS rapidb_query_cap LIMIT 10001",
+      undefined,
+      { requestToken: 1 },
     );
     expect(formatQueryResult).toHaveBeenCalledWith(
       expect.objectContaining({ rows: [{ id: 1 }] }),
@@ -286,6 +290,8 @@ describe("QueryPanelController", () => {
 
     expect(query).toHaveBeenCalledWith(
       "SELECT TOP (10001) s.name AS sequence_name FROM sys.sequences s ORDER BY s.name",
+      undefined,
+      { requestToken: 1 },
     );
   });
 
@@ -339,6 +345,8 @@ describe("QueryPanelController", () => {
 
     expect(query).toHaveBeenCalledWith(
       "with src as (select * from users) select * from src",
+      undefined,
+      { requestToken: 1 },
     );
     expect(formatQueryResult).toHaveBeenCalledWith(
       expect.objectContaining({ rows: [{ id: 1 }] }),
@@ -396,6 +404,8 @@ describe("QueryPanelController", () => {
 
     expect(query).toHaveBeenCalledWith(
       "SELECT * FROM (/* leading block */ -- line comment\n select * from users) AS rapidb_query_cap LIMIT 10001",
+      undefined,
+      { requestToken: 1 },
     );
     expect(formatQueryResult).toHaveBeenCalledWith(
       expect.objectContaining({ rows: [{ id: 1 }] }),
@@ -454,6 +464,8 @@ describe("QueryPanelController", () => {
 
     expect(query).toHaveBeenCalledWith(
       "SELECT * FROM (SELECT datname AS database_name FROM pg_catalog.pg_database WHERE datistemplate = false) AS rapidb_query_cap LIMIT 10001",
+      undefined,
+      { requestToken: 1 },
     );
     expect(formatQueryResult).toHaveBeenCalledWith(
       expect.objectContaining({ rows: [{ database_name: "postgres" }] }),
@@ -877,6 +889,8 @@ describe("QueryPanelController", () => {
     expect(query).toHaveBeenCalledTimes(1);
     expect(query).toHaveBeenCalledWith(
       "SELECT * FROM (select fresh) AS rapidb_query_cap LIMIT 101",
+      undefined,
+      { requestToken: 2 },
     );
     expect(addToHistory).toHaveBeenCalledTimes(1);
     expect(addToHistory).toHaveBeenCalledWith("active", "select fresh");

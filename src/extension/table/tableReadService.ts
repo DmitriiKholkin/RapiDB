@@ -16,10 +16,15 @@ type ExportCursor = Record<string, unknown>;
 
 export class TableReadService {
   private readonly columnCache = new Map<string, ColumnTypeMeta[]>();
+  private readonly columnCacheGenerations = new Map<string, number>();
 
   constructor(private readonly connectionManager: ConnectionManager) {}
 
   clearForConnection(connectionId: string): void {
+    this.columnCacheGenerations.set(
+      connectionId,
+      (this.columnCacheGenerations.get(connectionId) ?? 0) + 1,
+    );
     for (const key of this.columnCache.keys()) {
       if (key.startsWith(`${connectionId}::`)) {
         this.columnCache.delete(key);
@@ -39,9 +44,12 @@ export class TableReadService {
       return cached;
     }
 
+    const generation = this.columnCacheGenerations.get(connectionId) ?? 0;
     const { driver } = this.getConnectionDriver(connectionId);
     const columns = await driver.describeColumns(database, schema, table);
-    this.columnCache.set(cacheKey, columns);
+    if ((this.columnCacheGenerations.get(connectionId) ?? 0) === generation) {
+      this.columnCache.set(cacheKey, columns);
+    }
     return columns;
   }
 
@@ -123,9 +131,10 @@ export class TableReadService {
       whereParams,
       skipCount,
     );
+    const fetchPageSize = count.countFailed ? pageSize + 1 : pageSize;
     const pagination = driver.buildPagination(
       offset,
-      pageSize,
+      fetchPageSize,
       whereParams.length + 1,
     );
     const effectiveOrderBy =
@@ -138,13 +147,17 @@ export class TableReadService {
       baseParams,
       columns,
     );
-    const rows = this.formatQueryRows(driver, columns, dataResult);
+    const fetchedRows = this.formatQueryRows(driver, columns, dataResult);
+    const hasMoreRows = count.countFailed && fetchedRows.length > pageSize;
+    const rows = hasMoreRows ? fetchedRows.slice(0, pageSize) : fetchedRows;
     const executionTimeMs = Math.round(performance.now() - startTime);
 
     return {
       columns,
       rows,
-      totalCount: count.countFailed ? offset + rows.length : count.totalCount,
+      totalCount: count.countFailed
+        ? offset + rows.length + (hasMoreRows ? 1 : 0)
+        : count.totalCount,
       executionTimeMs,
     };
   }

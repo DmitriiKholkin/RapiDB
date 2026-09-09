@@ -394,6 +394,31 @@ describe("table helpers", () => {
     expect(result.plan.skippedRows).toEqual([1]);
   });
 
+  it("rejects updates that do not provide the complete primary key", () => {
+    const compositeColumns = [
+      { ...columns[0], name: "tenant_id", primaryKeyOrdinal: 1 },
+      { ...columns[0], name: "row_id", primaryKeyOrdinal: 2 },
+      ...columns.slice(1),
+    ];
+
+    expect(() =>
+      prepareApplyChangesPlan(
+        { getDriver: () => fakeDriver } as never,
+        "conn-1",
+        "main",
+        "public",
+        "fixture_rows",
+        [
+          {
+            primaryKeys: { tenant_id: 1 },
+            changes: { display_name: "Unsafe" },
+          },
+        ],
+        compositeColumns,
+      ),
+    ).toThrow("Update requires the full primary key");
+  });
+
   it("skips strict verification for temporal on-update columns across drivers", async () => {
     const temporalColumns: ColumnTypeMeta[] = [
       {
@@ -811,7 +836,6 @@ describe("table helpers", () => {
     if (!deletePlan) {
       throw new Error("Expected delete plan");
     }
-
     await mutationService.executePreparedDeletePlan(deletePlan);
 
     expect(deleteRowsSpy).toHaveBeenCalledWith({
@@ -995,6 +1019,7 @@ describe("table helpers", () => {
     if (!deletePlan) {
       throw new Error("Expected delete plan");
     }
+    expect(deletePlan.executionMode).toBe("transaction");
     await expect(
       readonlyMutationService.executePreparedDeletePlan(deletePlan),
     ).rejects.toThrow(/read-only/i);

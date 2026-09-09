@@ -17,7 +17,10 @@ import {
 } from "../utils/exportService";
 import { logger } from "../utils/logger";
 import { formatQueryResult } from "../utils/queryResultFormatting";
-import { decideReadOnlyQueryExecution } from "../utils/readOnlyGuards";
+import {
+  decideReadOnlyQueryExecution,
+  mayChangeDatabaseSchema,
+} from "../utils/readOnlyGuards";
 
 const SQL_CONNECTION_TYPES = new Set<ConnectionType>([
   "pg",
@@ -462,11 +465,16 @@ export class QueryPanelController {
       });
 
     try {
-      const result = await driver.query(cappedQueryText);
+      const result = await driver.query(cappedQueryText, undefined, {
+        requestToken,
+      });
       if (!this.isCurrentQueryRequest(requestToken)) {
         return;
       }
       const formattedResult = formatQueryResult(result, effectiveRowLimit);
+      if (mayChangeDatabaseSchema(cappedQueryText)) {
+        this.connectionManager.refreshSchemaCache(connectionId);
+      }
 
       this.view.setLastQueryResult({
         columns: formattedResult.columns,

@@ -87,6 +87,7 @@ export class TablePanel {
   >();
 
   private cachedColumns: import("../dbDrivers/types").ColumnTypeMeta[] = [];
+  private schemaRefreshGeneration = 0;
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -120,7 +121,26 @@ export class TablePanel {
     this.panel.webview.html = this.buildHtml(context);
 
     const key = TablePanel.panelKey(connectionId, database, schema, table);
+    const schemaRefreshSubscription = connectionManager.onDidRefreshSchemas?.(
+      (refreshedConnectionId) => {
+        if (refreshedConnectionId && refreshedConnectionId !== connectionId) {
+          return;
+        }
+        this.svc.clearForConnection(connectionId);
+        this.cachedColumns = [];
+        const generation = ++this.schemaRefreshGeneration;
+        void this.svc
+          .getColumns(connectionId, database, schema, table)
+          .then((columns) => {
+            if (generation === this.schemaRefreshGeneration) {
+              this.postTableInit(columns);
+            }
+          })
+          .catch(() => undefined);
+      },
+    );
     this.panel.onDidDispose(() => {
+      schemaRefreshSubscription?.dispose();
       this.previewController.clear();
       TablePanel.panels.delete(key);
 
@@ -328,24 +348,34 @@ export class TablePanel {
 
   private async _handleReady(): Promise<void> {
     try {
+      const generation = this.schemaRefreshGeneration;
       const cols = await this.svc.getColumns(
         this.connectionId,
         this.database,
         this.schema,
         this.table,
       );
-      this.cachedColumns = cols;
-      const pkCols = cols.filter((c) => c.isPrimaryKey).map((c) => c.name);
-      this.postMessage("tableInit", {
-        columns: cols,
-        primaryKeyColumns: pkCols,
-        isView: this.isView,
-        connectionReadOnly: this.isConnectionReadOnly(),
-      });
+      if (generation !== this.schemaRefreshGeneration) {
+        return;
+      }
+      this.postTableInit(cols);
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
       this.postMessage("tableError", { error: error.message });
     }
+  }
+
+  private postTableInit(columns: ColumnTypeMeta[]): void {
+    this.cachedColumns = columns;
+    const primaryKeyColumns = columns
+      .filter((column) => column.isPrimaryKey)
+      .map((column) => column.name);
+    void this.postMessage("tableInit", {
+      columns,
+      primaryKeyColumns,
+      isView: this.isView,
+      connectionReadOnly: this.isConnectionReadOnly(),
+    });
   }
 
   private async _handleFetchPage(
@@ -472,7 +502,7 @@ export class TablePanel {
                 ),
               ),
             )
-          : null;
+          : [];
 
       const insertCount = insertPlans?.length ?? 0;
       const mutationStatementCount =
@@ -684,6 +714,7 @@ export class TablePanel {
       sort,
       true,
     );
+    if (signal.aborted) return;
     yield { columns: result.columns, rows: result.rows };
   }
 

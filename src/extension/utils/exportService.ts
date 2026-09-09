@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -377,14 +378,55 @@ async function withWriteStream(
   filePath: string,
   writer: (writeStream: fs.WriteStream) => Promise<void>,
 ): Promise<void> {
-  const writeStream = fs.createWriteStream(filePath, { encoding: "utf8" });
+  const temporaryPath = `${filePath}.rapidb-${randomUUID()}.tmp`;
+  const writeStream = fs.createWriteStream(temporaryPath, { encoding: "utf8" });
 
   try {
+    await waitForWriteStreamOpen(writeStream);
     await writer(writeStream);
     await closeWriteStream(writeStream);
+    replaceExportFile(temporaryPath, filePath);
   } catch (error) {
     writeStream.destroy();
+    fs.rmSync(temporaryPath, { force: true });
     throw error;
+  }
+}
+
+function waitForWriteStreamOpen(writeStream: fs.WriteStream): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    writeStream.once("open", () => resolve());
+    writeStream.once("error", reject);
+  });
+}
+
+function replaceExportFile(temporaryPath: string, filePath: string): void {
+  try {
+    fs.renameSync(temporaryPath, filePath);
+    return;
+  } catch (directError) {
+    if (!fs.existsSync(filePath)) {
+      throw directError;
+    }
+  }
+
+  const backupPath = `${filePath}.rapidb-${randomUUID()}.bak`;
+  fs.renameSync(filePath, backupPath);
+  try {
+    fs.renameSync(temporaryPath, filePath);
+  } catch (replaceError) {
+    try {
+      fs.renameSync(backupPath, filePath);
+    } catch {
+      // Keep the backup if restoring the original file also fails.
+    }
+    throw replaceError;
+  }
+
+  try {
+    fs.rmSync(backupPath, { force: true });
+  } catch {
+    // The new export is already in place; cleanup can be retried manually.
   }
 }
 

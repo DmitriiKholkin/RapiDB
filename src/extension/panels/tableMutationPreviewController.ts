@@ -14,6 +14,8 @@ import {
 import { normalizeUnknownError } from "../utils/errorHandling";
 import { formatMutationPreviewSql } from "../utils/mutationPreview";
 
+const MAX_PENDING_MUTATION_PREVIEWS = 50;
+
 function resolvePreviewContentType(
   editorPresentation:
     | import("../../shared/webviewContracts").QueryEditorPresentation
@@ -218,6 +220,12 @@ export class TableMutationPreviewController {
     preview: PendingTableMutationPreview,
   ): TableMutationPreviewPayload {
     const previewToken = randomUUID();
+    if (this.pendingMutationPreviews.size >= MAX_PENDING_MUTATION_PREVIEWS) {
+      const oldestToken = this.pendingMutationPreviews.keys().next().value;
+      if (oldestToken !== undefined) {
+        this.pendingMutationPreviews.delete(oldestToken);
+      }
+    }
     this.pendingMutationPreviews.set(previewToken, preview);
     return this.buildPreviewPayload(previewToken, preview);
   }

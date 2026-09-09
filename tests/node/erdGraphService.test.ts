@@ -220,7 +220,7 @@ describe("ErdGraphService", () => {
     service.dispose();
   });
 
-  it("uses cache and invalidates on schema-state change", async () => {
+  it("uses cache and invalidates on schema refresh, not transient state changes", async () => {
     const disconnect = createEventSource<string>();
     const refresh = createEventSource<void>();
     const schemaState = createEventSource<string>();
@@ -274,6 +274,12 @@ describe("ErdGraphService", () => {
     expect(describeColumns).toHaveBeenCalledTimes(1);
 
     schemaState.fire("conn-1");
+
+    const afterStateChange = await service.getGraph(request);
+    expect(afterStateChange.fromCache).toBe(true);
+    expect(describeColumns).toHaveBeenCalledTimes(1);
+
+    refresh.fire();
 
     const third = await service.getGraph(request);
     expect(third.fromCache).toBe(false);
@@ -756,6 +762,102 @@ describe("ErdGraphService", () => {
       fromCache: false,
     });
 
+    service.dispose();
+  });
+
+  it("does not cache a graph completed after disconnect", async () => {
+    const disconnect = createEventSource<string>();
+    const refresh = createEventSource<void>();
+    const schemaState = createEventSource<string>();
+    let resolveColumns!: (value: unknown[]) => void;
+    const columns = new Promise<unknown[]>((resolve) => {
+      resolveColumns = resolve;
+    });
+    const driver = {
+      describeColumns: vi.fn(() => columns),
+      getForeignKeys: vi.fn(async () => []),
+      getIndexes: vi.fn(async () => []),
+    };
+    const connectionManager = {
+      getDriver: vi.fn(() => driver),
+      getSchemaSnapshotAsync: vi.fn(async () => ({
+        databases: [
+          {
+            name: "app_db",
+            schemas: [
+              {
+                name: "public",
+                objects: [{ name: "users", type: "table", columns: [] }],
+              },
+            ],
+          },
+        ],
+      })),
+      onDidDisconnect: disconnect.event,
+      onDidRefreshSchemas: refresh.event,
+      onDidChangeSchemaState: schemaState.event,
+    };
+    const service = new ErdGraphService(connectionManager as never);
+    const pending = service.getGraph({
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+    });
+
+    disconnect.fire("conn-1");
+    resolveColumns([]);
+
+    await expect(pending).rejects.toThrow(
+      "Connection changed while the ERD was loading",
+    );
+    service.dispose();
+  });
+
+  it("does not cache a graph completed after schema refresh", async () => {
+    const disconnect = createEventSource<string>();
+    const refresh = createEventSource<void>();
+    const schemaState = createEventSource<string>();
+    let resolveColumns!: (value: unknown[]) => void;
+    const columns = new Promise<unknown[]>((resolve) => {
+      resolveColumns = resolve;
+    });
+    const driver = {
+      describeColumns: vi.fn(() => columns),
+      getForeignKeys: vi.fn(async () => []),
+      getIndexes: vi.fn(async () => []),
+    };
+    const connectionManager = {
+      getDriver: vi.fn(() => driver),
+      getSchemaSnapshotAsync: vi.fn(async () => ({
+        databases: [
+          {
+            name: "app_db",
+            schemas: [
+              {
+                name: "public",
+                objects: [{ name: "users", type: "table", columns: [] }],
+              },
+            ],
+          },
+        ],
+      })),
+      onDidDisconnect: disconnect.event,
+      onDidRefreshSchemas: refresh.event,
+      onDidChangeSchemaState: schemaState.event,
+    };
+    const service = new ErdGraphService(connectionManager as never);
+    const pending = service.getGraph({
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+    });
+
+    refresh.fire();
+    resolveColumns([]);
+
+    await expect(pending).rejects.toThrow(
+      "Connection changed while the ERD was loading",
+    );
     service.dispose();
   });
 });

@@ -38,6 +38,24 @@ function column(
 }
 
 describe("mysql preview SQL literals", () => {
+  it("ignores question marks in MySQL hash comments", () => {
+    expect(
+      driver.materializePreviewSql("SELECT ? AS value # ignored ?", [42]),
+    ).toBe("SELECT 42 AS value # ignored ?");
+  });
+
+  it("does not treat MySQL arithmetic as a line comment", () => {
+    expect(driver.materializePreviewSql("SELECT 1--2, ?", [42])).toBe(
+      "SELECT 1--2, 42",
+    );
+  });
+
+  it("keeps indexed-looking text literals in sequential MySQL SQL", () => {
+    expect(driver.materializePreviewSql("SELECT '$1', ?", [42])).toBe(
+      "SELECT '$1', 42",
+    );
+  });
+
   it("preserves full exact numeric literals in insert previews", () => {
     const amountColumn = column("amount", "decimal(28,10)", "decimal");
     const operation = buildInsertRowOperation(

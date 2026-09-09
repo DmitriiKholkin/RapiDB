@@ -336,6 +336,77 @@ describe("TablePanel", () => {
     });
   });
 
+  it("does not let stale column metadata overwrite a schema refresh", async () => {
+    let resolveInitialColumns!: (value: MockColumn[]) => void;
+    let resolveRefreshedColumns!: (value: MockColumn[]) => void;
+    let refreshListener: ((connectionId?: string) => void) | undefined;
+    getColumnsMock
+      .mockImplementationOnce(
+        () =>
+          new Promise<MockColumn[]>((resolve) => {
+            resolveInitialColumns = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<MockColumn[]>((resolve) => {
+            resolveRefreshedColumns = resolve;
+          }),
+      );
+
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        name: "Main",
+        type: "pg",
+        readOnly: false,
+      })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(
+        (listener: (connectionId?: string) => void) => {
+          refreshListener = listener;
+          return { dispose: vi.fn() };
+        },
+      ),
+      getDefaultPageSize: vi.fn(() => 25),
+    };
+
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      "db1",
+      "public",
+      "users",
+    );
+
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected table panel instance");
+    }
+
+    const readyPromise = panel.webview.dispatchMessage({ type: "ready" });
+    refreshListener?.("conn-1");
+    resolveRefreshedColumns([{ name: "new_id", isPrimaryKey: true }]);
+    await Promise.resolve();
+    await Promise.resolve();
+    resolveInitialColumns([{ name: "old_id", isPrimaryKey: true }]);
+    await readyPromise;
+
+    expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+      type: "tableInit",
+      payload: expect.objectContaining({
+        columns: [{ name: "new_id", isPrimaryKey: true }],
+      }),
+    });
+    expect(panel.webview.postMessage).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          columns: [{ name: "old_id", isPrimaryKey: true }],
+        }),
+      }),
+    );
+  });
+
   it("does not force table re-init for an open panel after connection settings change", async () => {
     const columns = [{ name: "id", isPrimaryKey: true }];
     getColumnsMock.mockResolvedValue(columns);
@@ -700,6 +771,9 @@ describe("TablePanel", () => {
     });
 
     expect(createApplyChangesPreviewMock).toHaveBeenCalledOnce();
+    expect(createApplyChangesPreviewMock).toHaveBeenCalledWith(
+      expect.objectContaining({ inserts: [] }),
+    );
     expect(confirmMutationPreviewMock).toHaveBeenCalledWith(
       "apply-preview-token",
     );

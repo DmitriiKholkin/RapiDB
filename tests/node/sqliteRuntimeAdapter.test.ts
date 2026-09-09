@@ -86,6 +86,34 @@ async function readSingleValue(
 }
 
 describe("SQLite better-sqlite3 runtime adapter", () => {
+  it("reads CHECK constraints with nested parentheses", async () => {
+    const { driver } = await createDriver();
+    await driver.connect();
+    await driver.query(
+      `CREATE TABLE checked_values (
+        value INTEGER,
+        status TEXT,
+        CONSTRAINT "valid status" CHECK ((value > 0) AND status IN ('new', 'done'))
+      )`,
+    );
+
+    const constraints = await driver.getConstraints(
+      "main",
+      "main",
+      "checked_values",
+    );
+
+    expect(constraints).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "valid status",
+          kind: "check",
+          checkExpression: "(value > 0) AND status IN ('new', 'done')",
+        }),
+      ]),
+    );
+  });
+
   it("enables foreign keys and negotiates WAL on writable connections", async () => {
     const { driver } = await createDriver();
 

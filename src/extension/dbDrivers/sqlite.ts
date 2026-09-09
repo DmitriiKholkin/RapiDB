@@ -74,6 +74,135 @@ const SQLITE_INT64_MIN = -(1n << 63n);
 const SQLITE_INT64_MAX = (1n << 63n) - 1n;
 const SQLITE_JS_SAFE_INTEGER_MIN = BigInt(Number.MIN_SAFE_INTEGER);
 const SQLITE_JS_SAFE_INTEGER_MAX = BigInt(Number.MAX_SAFE_INTEGER);
+function findClosingSqliteParen(sql: string, openIndex: number): number {
+  let depth = 0;
+  let quote: "'" | '"' | "`" | "]" | null = null;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = openIndex; index < sql.length; index += 1) {
+    const char = sql[index];
+    const next = sql[index + 1];
+    if (lineComment) {
+      if (char === "\n" || char === "\r") lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (char === "*" && next === "/") {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (char === quote && next === quote) index += 1;
+      else if (char === quote) quote = null;
+      continue;
+    }
+    if (char === "-" && next === "-") {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === "'" || char === '"' || char === "`") {
+      quote = char;
+      continue;
+    }
+    if (char === "[") {
+      quote = "]";
+      continue;
+    }
+    if (char === "(") depth += 1;
+    else if (char === ")" && --depth === 0) return index;
+  }
+  return -1;
+}
+
+function extractSqliteCheckConstraints(
+  sql: string,
+): Array<{ name?: string; expression: string }> {
+  const checks: Array<{ name?: string; expression: string }> = [];
+  let quote: "'" | '"' | "`" | "]" | null = null;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = 0; index < sql.length; index += 1) {
+    const char = sql[index];
+    const next = sql[index + 1];
+    if (lineComment) {
+      if (char === "\n" || char === "\r") lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (char === "*" && next === "/") {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (char === quote && next === quote) index += 1;
+      else if (char === quote) quote = null;
+      continue;
+    }
+    if (char === "-" && next === "-") {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === "'" || char === '"' || char === "`") {
+      quote = char;
+      continue;
+    }
+    if (char === "[") {
+      quote = "]";
+      continue;
+    }
+    if (
+      sql.slice(index, index + 5).toUpperCase() !== "CHECK" ||
+      /[\w$]/.test(sql[index - 1] ?? "") ||
+      /[\w$]/.test(sql[index + 5] ?? "")
+    ) {
+      continue;
+    }
+    const openIndex = sql.indexOf("(", index + 5);
+    if (openIndex < 0 || sql.slice(index + 5, openIndex).trim() !== "")
+      continue;
+    const closeIndex = findClosingSqliteParen(sql, openIndex);
+    if (closeIndex < 0) continue;
+
+    const prefix = sql.slice(0, index);
+    const nameMatch =
+      /\bCONSTRAINT\s+("(?:[^"]|"")+"|`(?:[^`]|``)+`|\[(?:[^\]]|\]\])+\]|[^\s(),]+)\s*$/i.exec(
+        prefix,
+      );
+    const rawName = nameMatch?.[1];
+    const name = rawName
+      ? (rawName[0] === '"' || rawName[0] === "`" || rawName[0] === "["
+          ? rawName.slice(1, -1)
+          : rawName
+        )
+          .replace(/""/g, '"')
+          .replace(/``/g, "`")
+          .replace(/\]\]/g, "]")
+      : undefined;
+    checks.push({
+      ...(name ? { name } : {}),
+      expression: sql.slice(openIndex + 1, closeIndex).trim(),
+    });
+    index = closeIndex;
+  }
+  return checks;
+}
+
 function approximateNumericFilterTolerance(rawValue: string): number {
   const fraction = /\.(\d+)/.exec(rawValue)?.[1].length ?? 0;
   const precision = Math.min(Math.max(fraction + 2, 6), 12);
@@ -933,16 +1062,13 @@ export class SQLiteDriver extends BaseDBDriver {
       [table],
     ) as { sql: string | null } | null;
     const createSql = row?.sql ?? "";
-    const matches = createSql.matchAll(
-      /(?:CONSTRAINT\s+([^\s]+)\s+)?CHECK\s*\(([^)]+)\)/gi,
-    );
     let unnamedIndex = 1;
-    for (const match of matches) {
+    for (const check of extractSqliteCheckConstraints(createSql)) {
       constraints.push({
-        name: match[1] ?? `check_${table}_${unnamedIndex++}`,
+        name: check.name ?? `check_${table}_${unnamedIndex++}`,
         kind: "check",
         columns: [],
-        checkExpression: match[2]?.trim(),
+        checkExpression: check.expression,
         source: "catalog",
       });
     }

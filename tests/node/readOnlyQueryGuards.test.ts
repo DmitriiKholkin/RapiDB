@@ -9,6 +9,7 @@ import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
 import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
 import type { ReadOnlyQueryGuard } from "../../src/extension/dbDrivers/types";
+import { mayChangeDatabaseSchema } from "../../src/extension/utils/readOnlyGuards";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
 function requireReadOnlyQueryGuard(guard: ReadOnlyQueryGuard | undefined) {
@@ -19,6 +20,28 @@ function requireReadOnlyQueryGuard(guard: ReadOnlyQueryGuard | undefined) {
 }
 
 describe("readonly query guards", () => {
+  it("detects schema-changing SQL without matching comments or literals", () => {
+    expect(
+      mayChangeDatabaseSchema("ALTER TABLE users ADD COLUMN active int"),
+    ).toBe(true);
+    expect(
+      mayChangeDatabaseSchema("SELECT 'DROP TABLE users' -- CREATE TABLE x"),
+    ).toBe(false);
+  });
+
+  it("detects DDL hidden inside a PostgreSQL DO block", () => {
+    expect(
+      mayChangeDatabaseSchema(
+        "DO $$ BEGIN CREATE TABLE audit_log (id int); END $$;",
+      ),
+    ).toBe(true);
+    expect(
+      mayChangeDatabaseSchema(
+        "DO $migration$ BEGIN ALTER TABLE users ADD COLUMN active boolean; END $migration$;",
+      ),
+    ).toBe(true);
+  });
+
   it("allows dialect-safe read-only SQL statements", () => {
     const driver = new PostgresDriver({
       id: "pg-readonly-guard",

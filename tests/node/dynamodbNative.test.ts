@@ -1077,6 +1077,90 @@ describe("DynamoDBDriver native API", () => {
     );
   });
 
+  it("fills a logical page when DynamoDB filters out evaluated items", async () => {
+    const { driver, clientSend, queueResponses } = createDriver();
+    const skippedCursor = marshall(
+      { tenant_id: "tenant-1", user_id: "skipped" },
+      { removeUndefinedValues: true },
+    );
+    queueResponses(
+      { Items: [], LastEvaluatedKey: skippedCursor },
+      {
+        Items: [
+          marshall({
+            tenant_id: "tenant-1",
+            user_id: "matched",
+            email: "matched@example.com",
+          }),
+        ],
+      },
+    );
+
+    const page = await driver.readTablePage({
+      database: "us-east-1",
+      schema: "us-east-1",
+      table: "users",
+      page: 1,
+      pageSize: 1,
+      filters: [
+        { column: "tenant_id", operator: "eq", value: "tenant-1" },
+        { column: "email", operator: "like", value: "example.com" },
+      ],
+      sort: { column: "user_id", direction: "asc" },
+      skipCount: true,
+    });
+
+    const queryInputs = commandInputs(clientSend, "QueryCommand");
+    expect(queryInputs).toHaveLength(2);
+    expect(queryInputs[1]).toMatchObject({
+      Limit: 1,
+      ExclusiveStartKey: skippedCursor,
+    });
+    expect(page.rows).toEqual([
+      expect.objectContaining({ user_id: "matched" }),
+    ]);
+  });
+
+  it("bounds cursor sessions and saved page starts", () => {
+    const { driver } = createDriver();
+    const state = driver as unknown as {
+      cursorCache: Map<
+        string,
+        {
+          pageStarts: Map<number, Record<string, unknown> | undefined>;
+          terminalPage: number | null;
+        }
+      >;
+      getCursorSession: (key: string) => {
+        pageStarts: Map<number, Record<string, unknown> | undefined>;
+        terminalPage: number | null;
+      };
+      setCursorPageStart: (
+        session: {
+          pageStarts: Map<number, Record<string, unknown> | undefined>;
+          terminalPage: number | null;
+        },
+        page: number,
+        cursor: Record<string, unknown>,
+      ) => void;
+    };
+
+    for (let index = 0; index < 101; index += 1) {
+      state.getCursorSession(`session-${index}`);
+    }
+    expect(state.cursorCache.size).toBe(100);
+    expect(state.cursorCache.has("session-0")).toBe(false);
+
+    const session = state.getCursorSession("session-100");
+    for (let page = 2; page <= 102; page += 1) {
+      state.setCursorPageStart(session, page, { id: { S: String(page) } });
+    }
+    expect(session.pageStarts.size).toBe(100);
+    expect(session.pageStarts.has(1)).toBe(true);
+    expect(session.pageStarts.has(2)).toBe(false);
+    expect(session.pageStarts.has(102)).toBe(true);
+  });
+
   it("avoids full materialization for client-side filters when skipCount is enabled", async () => {
     const { driver, clientSend, queueResponses } = createDriver();
     const driverState = driver as unknown as {

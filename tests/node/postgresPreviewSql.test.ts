@@ -36,6 +36,30 @@ function column(
 }
 
 describe("postgres preview SQL materialization", () => {
+  it("prioritizes indexed parameters over the JSON existence operator", () => {
+    expect(
+      driver.materializePreviewSql(
+        `SELECT payload ? 'enabled' FROM probe WHERE id = $1`,
+        [7],
+      ),
+    ).toBe(`SELECT payload ? 'enabled' FROM probe WHERE id = 7`);
+  });
+
+  it("does not replace indexed markers inside literals or dollar-quoted SQL", () => {
+    expect(
+      driver.materializePreviewSql(
+        `SELECT '$1' AS text_value, $$ $2 $$ AS body WHERE id = $1`,
+        [7],
+      ),
+    ).toBe(`SELECT '$1' AS text_value, $$ $2 $$ AS body WHERE id = 7`);
+  });
+
+  it("does not replace colon markers inside dollar-quoted SQL", () => {
+    expect(
+      driver.materializePreviewSql("SELECT $$ :1 $$ AS body, :1", [7]),
+    ).toBe("SELECT $$ :1 $$ AS body, 7");
+  });
+
   it("renders executable PostgreSQL array and bytea literals", () => {
     const sql =
       'UPDATE "public"."probe" SET "tags" = $1, "payload" = $2 WHERE "id" = $3';

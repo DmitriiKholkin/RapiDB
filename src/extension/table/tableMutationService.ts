@@ -9,6 +9,7 @@ import type {
   TableColumnsProvider,
 } from "./tableDataContracts";
 import {
+  assertExactPrimaryKeyShape,
   buildUpdateRowSql,
   coerceRecord,
   filterWritableRecord,
@@ -49,6 +50,7 @@ export class TableMutationService {
       if (Object.keys(writableChanges).length === 0) {
         return;
       }
+      assertExactPrimaryKeyShape(primaryKeyValues, columns);
       const result = await driver.updateRows({
         database,
         schema,
@@ -441,7 +443,7 @@ export class TableMutationService {
       database,
       schema,
       table,
-      executionMode: isSinglePrimaryKey ? "sequential" : "transaction",
+      executionMode: "transaction",
       operations,
       previewStatements: operations.map((operation) =>
         driver.materializePreviewSql(operation.sql, operation.params),
@@ -474,13 +476,7 @@ export class TableMutationService {
       return;
     }
 
-    if (plan.executionMode === "sequential") {
-      for (const operation of plan.operations) {
-        await driver.query(operation.sql, operation.params);
-      }
-    } else {
-      await driver.runTransaction(plan.operations);
-    }
+    await driver.runTransaction(plan.operations);
     const columns = await this.columnsProvider.getColumns(
       plan.connectionId,
       plan.database,

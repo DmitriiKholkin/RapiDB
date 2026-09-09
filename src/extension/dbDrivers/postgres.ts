@@ -1,5 +1,7 @@
+import type { PoolClient } from "pg";
 import { Pool, types as pgTypes } from "pg";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
+import type { OperationCancellationContext } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
@@ -65,6 +67,13 @@ const POSTGRES_ENTITY_MANIFEST: DriverEntityManifest = {
     },
   },
 };
+const POSTGRES_POOL_MAX = 5;
+
+interface PostgresQueryOperation {
+  cancelled: boolean;
+  requestToken?: number;
+  client?: PoolClient;
+}
 
 const PG_OID_DATE = 1082;
 const PG_OID_MONEY = 790;
@@ -486,6 +495,9 @@ export class PostgresDriver extends BaseDBDriver {
   private _connected = false;
   private connectedDatabaseName = "";
   private timeoutRecoveryInFlight: Promise<void> | null = null;
+  private readonly activeTransactionClients = new Set<PoolClient>();
+  private readonly activeQueryClients = new Set<PoolClient>();
+  private readonly activeQueryOperations = new Set<PostgresQueryOperation>();
   private requirePool(): Pool {
     if (!this.pool) {
       throw new Error("[RapiDB] PostgreSQL connection is not open");
@@ -581,11 +593,36 @@ export class PostgresDriver extends BaseDBDriver {
     this.pool = null;
   }
 
-  async cancelCurrentOperation(): Promise<void> {
-    await this.recycleConnectionAfterTimeout({
-      timeoutKind: "dbOperation",
-      operationName: "cancelCurrentOperation",
-    });
+  async cancelCurrentOperation(
+    context?: OperationCancellationContext,
+  ): Promise<void> {
+    if (context?.operationName === "query") {
+      for (const operation of this.activeQueryOperations) {
+        if (
+          context.requestToken !== undefined &&
+          operation.requestToken !== context.requestToken
+        ) {
+          continue;
+        }
+        operation.cancelled = true;
+        if (operation.client) {
+          this.activeQueryClients.delete(operation.client);
+          operation.client.release(true);
+        }
+      }
+      return;
+    }
+
+    if (context?.operationName === "runTransaction" || context === undefined) {
+      const hadTransactionClient = this.activeTransactionClients.size > 0;
+      for (const client of [...this.activeTransactionClients]) {
+        this.activeTransactionClients.delete(client);
+        client.release(true);
+      }
+      if (context === undefined && !hadTransactionClient) {
+        await this.recycleConnectionAfterTimeout();
+      }
+    }
   }
 
   async recycleConnectionAfterTimeout(_context?: {
@@ -837,7 +874,11 @@ export class PostgresDriver extends BaseDBDriver {
       };
     });
   }
-  async query(sql: string, params?: unknown[]): Promise<QueryResult> {
+  async query(
+    sql: string,
+    params?: unknown[],
+    operationContext?: { requestToken?: number },
+  ): Promise<QueryResult> {
     type PgArrayField = {
       name: string;
     };
@@ -847,37 +888,76 @@ export class PostgresDriver extends BaseDBDriver {
       rowCount?: number | null;
     };
     const start = Date.now();
-    const res = await this.requirePool().query({
-      text: sql,
-      values: params ?? [],
-      rowMode: "array",
-    });
-    const executionTimeMs = Date.now() - start;
-    const result = (
-      Array.isArray(res) ? res[res.length - 1] : res
-    ) as PgArrayQueryResult;
-    const columns = result.fields?.map((field) => field.name) ?? [];
-    const rawRows: unknown[][] = result.rows ?? [];
-    const rows = rawRows.map((row) =>
-      Object.fromEntries(
-        row.map((val, i) => {
-          const normalized =
-            val !== null &&
-            typeof val === "object" &&
-            !(val instanceof Date) &&
-            isPointValue(val)
-              ? `(${String(val.x)}, ${String(val.y)})`
-              : val;
-          return [`__col_${i}`, normalized];
-        }),
-      ),
-    );
-    return {
-      columns,
-      rows,
-      rowCount: result.rowCount ?? rawRows.length,
-      executionTimeMs,
+    const operation: PostgresQueryOperation = {
+      cancelled: false,
+      requestToken: operationContext?.requestToken,
     };
+    this.activeQueryOperations.add(operation);
+    let client: PoolClient | undefined;
+    try {
+      await this.waitForQueryConnection(operation);
+      client = await this.requirePool().connect();
+      operation.client = client;
+      if (operation.cancelled) {
+        client.release(true);
+        throw new Error("PostgreSQL query cancelled before execution.");
+      }
+      this.activeQueryClients.add(client);
+      const res = await client.query({
+        text: sql,
+        values: params ?? [],
+        rowMode: "array",
+      });
+      const executionTimeMs = Date.now() - start;
+      const result = (
+        Array.isArray(res) ? res[res.length - 1] : res
+      ) as PgArrayQueryResult;
+      const columns = result.fields?.map((field) => field.name) ?? [];
+      const rawRows: unknown[][] = result.rows ?? [];
+      const rows = rawRows.map((row) =>
+        Object.fromEntries(
+          row.map((val, i) => {
+            const normalized =
+              val !== null &&
+              typeof val === "object" &&
+              !(val instanceof Date) &&
+              isPointValue(val)
+                ? `(${String(val.x)}, ${String(val.y)})`
+                : val;
+            return [`__col_${i}`, normalized];
+          }),
+        ),
+      );
+      return {
+        columns,
+        rows,
+        rowCount: result.rowCount ?? rawRows.length,
+        executionTimeMs,
+      };
+    } finally {
+      this.activeQueryOperations.delete(operation);
+      if (client && this.activeQueryClients.delete(client)) {
+        client.release();
+      }
+    }
+  }
+
+  private async waitForQueryConnection(
+    operation: PostgresQueryOperation,
+  ): Promise<void> {
+    while (true) {
+      if (operation.cancelled) {
+        throw new Error("PostgreSQL query cancelled before execution.");
+      }
+      const pool = this.requirePool();
+      if (
+        pool.waitingCount === 0 &&
+        (pool.idleCount > 0 || pool.totalCount < POSTGRES_POOL_MAX)
+      ) {
+        return;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    }
   }
   async getIndexes(
     _database: string,
@@ -1436,6 +1516,7 @@ export class PostgresDriver extends BaseDBDriver {
     operations: import("./types").TransactionOperation[],
   ): Promise<void> {
     const client = await this.requirePool().connect();
+    this.activeTransactionClients.add(client);
     try {
       await client.query("BEGIN");
       for (const op of operations) {
@@ -1448,10 +1529,12 @@ export class PostgresDriver extends BaseDBDriver {
       }
       await client.query("COMMIT");
     } catch (e) {
-      await client.query("ROLLBACK");
+      await client.query("ROLLBACK").catch(() => undefined);
       throw e;
     } finally {
-      client.release();
+      if (this.activeTransactionClients.delete(client)) {
+        client.release();
+      }
     }
   }
   mapTypeCategory(nativeType: string): TypeCategory {

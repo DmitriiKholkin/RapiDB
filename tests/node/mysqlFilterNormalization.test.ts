@@ -274,4 +274,251 @@ describe("mysql filter normalization", () => {
     ).toBe(true);
     expect(page.rows[0]?.geometry_column).toBe("MULTIPOINT((0 0),(1 1),(2 2))");
   });
+
+  it("uses a one-row lookahead when the count query fails", async () => {
+    const pageDriver = new MySQLDriver({
+      id: "mysql-filter-normalization-count-fallback",
+      name: "MySQL Filter Normalization Count Fallback",
+      type: "mysql",
+      host: "127.0.0.1",
+      port: 3306,
+      database: "test",
+      username: "root",
+      password: "root",
+    } as ConnectionConfig);
+    const idColumn: ColumnTypeMeta = {
+      ...buildColumn("id", "int", "integer"),
+      nullable: false,
+      isPrimaryKey: true,
+      primaryKeyOrdinal: 1,
+      filterOperators: ["eq", "neq", "gt", "gte", "lt", "lte"],
+    };
+    const titleColumn = buildColumn("title", "varchar(255)", "text");
+    const sqlCalls: Array<{ sql: string; params?: unknown[] }> = [];
+
+    (
+      pageDriver as unknown as {
+        describeColumns: typeof pageDriver.describeColumns;
+      }
+    ).describeColumns = async () => [idColumn, titleColumn];
+    (
+      pageDriver as unknown as {
+        query: typeof pageDriver.query;
+      }
+    ).query = async (sql, params) => {
+      sqlCalls.push({ sql, params });
+      if (/count\(\*\)/i.test(sql)) {
+        throw new Error("Count failed");
+      }
+      return {
+        columns: ["id", "title"],
+        rows: Array.from({ length: 6 }, (_, index) => ({
+          __col_0: index + 1,
+          __col_1: `row-${index + 1}`,
+        })),
+        rowCount: 6,
+        executionTimeMs: 0,
+      };
+    };
+
+    const page = await pageDriver.readTablePage({
+      database: "test",
+      schema: "",
+      table: "users",
+      page: 1,
+      pageSize: 5,
+      filters: [],
+      sort: null,
+      skipCount: false,
+    });
+
+    expect(page.rows).toHaveLength(5);
+    expect(page.totalCount).toBe(6);
+    const dataCall = sqlCalls.find((call) => /SELECT `id`/i.test(call.sql));
+    expect(dataCall?.params).toEqual([6, 0]);
+  });
+
+  it("preserves page offsets, filters, and sorting during lookahead", async () => {
+    const pageDriver = new MySQLDriver({
+      id: "mysql-filter-normalization-count-fallback-page-two",
+      name: "MySQL Filter Normalization Count Fallback Page Two",
+      type: "mysql",
+      host: "127.0.0.1",
+      port: 3306,
+      database: "test",
+      username: "root",
+      password: "root",
+    } as ConnectionConfig);
+    const idColumn: ColumnTypeMeta = {
+      ...buildColumn("id", "int", "integer"),
+      nullable: false,
+      isPrimaryKey: true,
+      primaryKeyOrdinal: 1,
+      filterOperators: ["eq", "neq", "gt", "gte", "lt", "lte"],
+    };
+    const titleColumn = buildColumn("title", "varchar(255)", "text");
+    const sqlCalls: Array<{ sql: string; params?: unknown[] }> = [];
+
+    (
+      pageDriver as unknown as {
+        describeColumns: typeof pageDriver.describeColumns;
+      }
+    ).describeColumns = async () => [idColumn, titleColumn];
+    (
+      pageDriver as unknown as {
+        query: typeof pageDriver.query;
+      }
+    ).query = async (sql, params) => {
+      sqlCalls.push({ sql, params });
+      if (/count\(\*\)/i.test(sql)) {
+        throw new Error("Count failed");
+      }
+      return {
+        columns: ["id", "title"],
+        rows: Array.from({ length: 6 }, (_, index) => ({
+          __col_0: index + 6,
+          __col_1: `row-${index + 6}`,
+        })),
+        rowCount: 6,
+        executionTimeMs: 0,
+      };
+    };
+
+    const page = await pageDriver.readTablePage({
+      database: "test",
+      schema: "",
+      table: "users",
+      page: 2,
+      pageSize: 5,
+      filters: [{ column: "title", operator: "like", value: "row" }],
+      sort: { column: "title", direction: "desc" },
+      skipCount: false,
+    });
+
+    expect(page.rows).toHaveLength(5);
+    expect(page.totalCount).toBe(11);
+    const dataCall = sqlCalls.find((call) => /SELECT `id`/i.test(call.sql));
+    expect(dataCall?.sql).toContain("WHERE CAST(`title` AS CHAR) LIKE ?");
+    expect(dataCall?.sql).toContain("ORDER BY `title` DESC");
+    expect(dataCall?.params).toEqual(["%row%", 6, 5]);
+  });
+
+  it("does not invent a next row when count fails at the end", async () => {
+    const pageDriver = new MySQLDriver({
+      id: "mysql-filter-normalization-count-fallback-end",
+      name: "MySQL Filter Normalization Count Fallback End",
+      type: "mysql",
+      host: "127.0.0.1",
+      port: 3306,
+      database: "test",
+      username: "root",
+      password: "root",
+    } as ConnectionConfig);
+    const idColumn: ColumnTypeMeta = {
+      ...buildColumn("id", "int", "integer"),
+      nullable: false,
+      isPrimaryKey: true,
+      primaryKeyOrdinal: 1,
+      filterOperators: ["eq", "neq", "gt", "gte", "lt", "lte"],
+    };
+    const titleColumn = buildColumn("title", "varchar(255)", "text");
+
+    (
+      pageDriver as unknown as {
+        describeColumns: typeof pageDriver.describeColumns;
+      }
+    ).describeColumns = async () => [idColumn, titleColumn];
+    (
+      pageDriver as unknown as {
+        query: typeof pageDriver.query;
+      }
+    ).query = async (sql) => {
+      if (/count\(\*\)/i.test(sql)) {
+        throw new Error("Count failed");
+      }
+      return {
+        columns: ["id", "title"],
+        rows: Array.from({ length: 5 }, (_, index) => ({
+          __col_0: index + 1,
+          __col_1: `row-${index + 1}`,
+        })),
+        rowCount: 5,
+        executionTimeMs: 0,
+      };
+    };
+
+    const page = await pageDriver.readTablePage({
+      database: "test",
+      schema: "",
+      table: "users",
+      page: 1,
+      pageSize: 5,
+      filters: [],
+      sort: null,
+      skipCount: false,
+    });
+
+    expect(page.rows).toHaveLength(5);
+    expect(page.totalCount).toBe(5);
+  });
+
+  it("keeps skipCount reads to a single page", async () => {
+    const pageDriver = new MySQLDriver({
+      id: "mysql-filter-normalization-skip-count",
+      name: "MySQL Filter Normalization Skip Count",
+      type: "mysql",
+      host: "127.0.0.1",
+      port: 3306,
+      database: "test",
+      username: "root",
+      password: "root",
+    } as ConnectionConfig);
+    const idColumn: ColumnTypeMeta = {
+      ...buildColumn("id", "int", "integer"),
+      nullable: false,
+      isPrimaryKey: true,
+      primaryKeyOrdinal: 1,
+      filterOperators: ["eq", "neq", "gt", "gte", "lt", "lte"],
+    };
+    const titleColumn = buildColumn("title", "varchar(255)", "text");
+    const sqlCalls: Array<{ sql: string; params?: unknown[] }> = [];
+
+    (
+      pageDriver as unknown as {
+        describeColumns: typeof pageDriver.describeColumns;
+      }
+    ).describeColumns = async () => [idColumn, titleColumn];
+    (
+      pageDriver as unknown as {
+        query: typeof pageDriver.query;
+      }
+    ).query = async (sql, params) => {
+      sqlCalls.push({ sql, params });
+      return {
+        columns: ["id", "title"],
+        rows: Array.from({ length: 5 }, (_, index) => ({
+          __col_0: index + 1,
+          __col_1: `row-${index + 1}`,
+        })),
+        rowCount: 5,
+        executionTimeMs: 0,
+      };
+    };
+
+    const page = await pageDriver.readTablePage({
+      database: "test",
+      schema: "",
+      table: "users",
+      page: 2,
+      pageSize: 5,
+      filters: [],
+      sort: null,
+      skipCount: true,
+    });
+
+    expect(page.rows).toHaveLength(5);
+    expect(page.totalCount).toBe(0);
+    expect(sqlCalls).toHaveLength(1);
+    expect(sqlCalls[0]?.params).toEqual([5, 5]);
+  });
 });

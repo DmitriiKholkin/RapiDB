@@ -13,6 +13,7 @@ import type {
   VerificationTarget,
 } from "./tableDataContracts";
 import {
+  assertExactPrimaryKeyShape,
   buildUpdateRowSql,
   coerceRecord,
   filterWritableRecord,
@@ -79,6 +80,8 @@ export function prepareApplyChangesPlan(
       );
       if (Object.keys(writableChanges).length === 0) {
         skippedRows.add(rowIndex);
+      } else {
+        assertExactPrimaryKeyShape(update.primaryKeys, columns);
       }
       return {
         primaryKeys: coerceRecord(driver, update.primaryKeys, columnMetaByName),

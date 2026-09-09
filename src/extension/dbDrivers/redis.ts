@@ -558,12 +558,9 @@ export class RedisDriver implements IDBDriver {
     if (this.canUseKeyOnlyPaging(request)) {
       const pattern = request.table === "default" ? "*" : `${request.table}:*`;
       const offset = Math.max(0, (request.page - 1) * request.pageSize);
-      const scanLimit = request.skipCount
-        ? Math.min(REDIS_READ_BUDGET.maxScanKeys, offset + request.pageSize)
-        : REDIS_READ_BUDGET.maxScanKeys;
-      const keys = (await this.scanKeys(pattern, scanLimit)).sort(
-        (left, right) => left.localeCompare(right),
-      );
+      const keys = (
+        await this.scanKeys(pattern, REDIS_READ_BUDGET.maxScanKeys)
+      ).sort((left, right) => left.localeCompare(right));
       const pageKeys = keys.slice(offset, offset + request.pageSize);
       const rows = await this.readRowsForKeys(pageKeys);
       return {

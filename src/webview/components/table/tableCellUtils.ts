@@ -6,13 +6,7 @@ import {
   formatPrimaryKeyRoleLabel,
 } from "../../../shared/tableTypes";
 import type { ApplyResultPayload } from "../../../shared/webviewContracts";
-import type {
-  EditTarget,
-  InsertDraftRow,
-  MutationSnapshot,
-  PendingEdits,
-  Row,
-} from "../../types";
+import type { InsertDraftRow, PendingEdits, Row } from "../../types";
 import { INSERT_DEFAULT_SENTINEL, PAGE_SIZES } from "./tableConstants";
 
 type PendingRestoreState = Map<string, Map<string, unknown>>;
@@ -212,28 +206,4 @@ export function getRetainedPendingEdits(
   }
 
   return nextPending;
-}
-
-export function buildUndoRedoSnapshot(
-  pendingEdits: PendingEdits,
-  newRow: InsertDraftRow | null,
-  editCell: EditTarget | null,
-): MutationSnapshot {
-  return {
-    pendingEdits: clonePendingEdits(pendingEdits),
-    newRow: newRow ? { ...newRow } : null,
-    editCell,
-  };
-}
-
-export function applyUndoRedoSnapshot(snapshot: MutationSnapshot): {
-  pendingEdits: PendingEdits;
-  newRow: InsertDraftRow | null;
-  editCell: EditTarget | null;
-} {
-  return {
-    pendingEdits: clonePendingEdits(snapshot.pendingEdits),
-    newRow: snapshot.newRow ? { ...snapshot.newRow } : null,
-    editCell: snapshot.editCell,
-  };
 }

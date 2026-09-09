@@ -88,7 +88,7 @@ describe("parseTablePanelMessage applyChanges payload", () => {
       type: "applyChanges",
       payload: {
         updates: [{ primaryKeys: { id: 1 }, changes: { name: "Alicia" } }],
-        insertValues: { name: "New user" },
+        insertValues: [{ name: "New user" }],
       },
     });
 
@@ -96,7 +96,7 @@ describe("parseTablePanelMessage applyChanges payload", () => {
       type: "applyChanges",
       payload: {
         updates: [{ primaryKeys: { id: 1 }, changes: { name: "Alicia" } }],
-        insertValues: { name: "New user" },
+        insertValues: [{ name: "New user" }],
       },
     });
   });
@@ -111,6 +111,14 @@ describe("parseTablePanelMessage applyChanges payload", () => {
     });
 
     expect(parsed).toBeNull();
+  });
+});
+
+describe("parseConnectionFormPanelMessage cancellation", () => {
+  it("parses cancelTestConnection without a payload", () => {
+    expect(
+      parseConnectionFormPanelMessage({ type: "cancelTestConnection" }),
+    ).toEqual({ type: "cancelTestConnection" });
   });
 });
 
