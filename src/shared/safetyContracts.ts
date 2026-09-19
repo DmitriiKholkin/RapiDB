@@ -68,10 +68,3 @@ export interface ProblemDetails {
   instance?: string;
   [key: string]: unknown;
 }
-
-export interface ConnectionSecretUpdateTransaction {
-  connectionId: string;
-  useSecretStorage: boolean;
-  previousSecretSnapshot?: string;
-  nextSecretSnapshot?: string;
-}

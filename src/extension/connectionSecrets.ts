@@ -1,4 +1,8 @@
 import type { ConnectionConfig } from "./connectionManagerModels";
+import {
+  CONNECTION_SECRET_KEYS,
+  parseStoredConnectionSecretDocument,
+} from "./connectionSecretsData";
 
 export interface ConnectionSecretSnapshot {
   password?: string;
@@ -32,6 +36,15 @@ export function trimOptionalSecretValue(
     return undefined;
   }
 
+  return value.length > 0 ? value : undefined;
+}
+
+export function trimOptionalUriValue(
+  value: string | undefined,
+): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
 }
@@ -82,7 +95,7 @@ function redactCredentialBearingUri(uri: string): string {
 export function sanitizeCredentialBearingUri(
   value: string | undefined,
 ): string | undefined {
-  const normalized = trimOptionalSecretValue(value);
+  const normalized = trimOptionalUriValue(value);
   if (!normalized) {
     return normalized;
   }
@@ -93,7 +106,7 @@ export function sanitizeCredentialBearingUri(
 export function extractCredentialBearingUriSecret(
   value: string | undefined,
 ): string | undefined {
-  const normalized = trimOptionalSecretValue(value);
+  const normalized = trimOptionalUriValue(value);
   if (!normalized) {
     return undefined;
   }
@@ -112,7 +125,7 @@ export function resolvePersistedCredentialBearingUriSecret(
     return explicitSecret;
   }
 
-  const normalizedCurrent = trimOptionalSecretValue(currentValue);
+  const normalizedCurrent = trimOptionalUriValue(currentValue);
   if (!normalizedCurrent || !previousSecret) {
     return undefined;
   }
@@ -311,4 +324,32 @@ export function serializeConnectionSecretsForConfig(
   return serializeConnectionSecrets(
     extractConnectionSecrets(config, previousSecrets),
   );
+}
+
+export function serializeConnectionSecretsForStoredConfig(
+  config: ConnectionConfig,
+  previousSerialized: string | undefined,
+): string | undefined {
+  const previous = parseStoredConnectionSecretDocument(previousSerialized);
+  const nextSecrets = extractConnectionSecrets(config, previous.known);
+  const knownUnchanged = CONNECTION_SECRET_KEYS.every(
+    (key) => nextSecrets[key] === previous.known[key],
+  );
+  if (knownUnchanged) {
+    return previousSerialized;
+  }
+
+  const nextRecord = { ...previous.record };
+  for (const key of CONNECTION_SECRET_KEYS) {
+    delete nextRecord[key];
+  }
+  for (const [key, value] of Object.entries(nextSecrets)) {
+    if (typeof value === "string") {
+      nextRecord[key] = value;
+    }
+  }
+
+  return Object.keys(nextRecord).length > 0
+    ? JSON.stringify(nextRecord)
+    : undefined;
 }

@@ -1,6 +1,5 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
-import type { ConnectionSecretUpdateTransaction } from "../../shared/safetyContracts";
 import {
   type ConnectionFormBrowseTarget,
   type ConnectionFormExistingState,
@@ -10,11 +9,15 @@ import {
 import type { ConnectionConfig, ConnectionManager } from "../connectionManager";
 import {
   extractCredentialBearingUriSecret,
-  resolvePersistedCredentialBearingUriSecret,
   sanitizeCredentialBearingUri,
   sanitizePersistedConnectionConfig,
   trimOptionalSecretValue,
+  trimOptionalUriValue,
 } from "../connectionSecrets";
+import {
+  parseStoredConnectionSecrets,
+  type StoredConnectionSecrets,
+} from "../connectionSecretsData";
 import { ConnectionValidationService } from "../services/connectionValidationService";
 import {
   logErrorWithContext,
@@ -24,22 +27,6 @@ import { attachPanelMessageHandler } from "./panelLifecycle";
 import { createPanelWebviewOptions } from "./panelRetentionPolicy";
 import { createWebviewShell } from "./webviewShell";
 
-type StoredConnectionSecrets = {
-  password?: string;
-  apiKey?: string;
-  awsAccessKeyId?: string;
-  awsSecretAccessKey?: string;
-  awsSessionToken?: string;
-  connectionUri?: string;
-  uri?: string;
-  endpoint?: string;
-  awsEndpoint?: string;
-  sshPassword?: string;
-  sshPrivateKey?: string;
-  sshPassphrase?: string;
-  tlsKeyPassphrase?: string;
-};
-
 const CONNECTION_FORM_RETENTION_MODE = "retain" as const;
 const LAST_SQLITE_DIRECTORY_STATE_KEY = "rapidb.lastSqliteDirectory";
 
@@ -48,13 +35,13 @@ function restoreSubmittedUriValue(
   storedValue: string | undefined,
   existingValue: string | undefined,
 ): string | undefined {
-  const normalizedSubmitted = trimOptionalSecretValue(submittedValue);
+  const normalizedSubmitted = trimOptionalUriValue(submittedValue);
   if (!normalizedSubmitted) {
     return normalizedSubmitted;
   }
 
   for (const candidate of [storedValue, existingValue]) {
-    const normalizedCandidate = trimOptionalSecretValue(candidate);
+    const normalizedCandidate = trimOptionalUriValue(candidate);
     if (!normalizedCandidate) {
       continue;
     }
@@ -68,78 +55,6 @@ function restoreSubmittedUriValue(
   }
 
   return normalizedSubmitted;
-}
-
-function parseStoredConnectionSecrets(
-  value: string | undefined,
-): StoredConnectionSecrets {
-  if (!value) {
-    return {};
-  }
-
-  try {
-    const parsed = JSON.parse(value) as Record<string, unknown>;
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return {
-        password:
-          typeof parsed.password === "string" ? parsed.password : undefined,
-        apiKey: typeof parsed.apiKey === "string" ? parsed.apiKey : undefined,
-        awsAccessKeyId:
-          typeof parsed.awsAccessKeyId === "string"
-            ? parsed.awsAccessKeyId
-            : undefined,
-        awsSecretAccessKey:
-          typeof parsed.awsSecretAccessKey === "string"
-            ? parsed.awsSecretAccessKey
-            : undefined,
-        awsSessionToken:
-          typeof parsed.awsSessionToken === "string"
-            ? parsed.awsSessionToken
-            : undefined,
-        connectionUri:
-          typeof parsed.connectionUri === "string"
-            ? parsed.connectionUri
-            : undefined,
-        uri: typeof parsed.uri === "string" ? parsed.uri : undefined,
-        endpoint:
-          typeof parsed.endpoint === "string" ? parsed.endpoint : undefined,
-        awsEndpoint:
-          typeof parsed.awsEndpoint === "string"
-            ? parsed.awsEndpoint
-            : undefined,
-        sshPassword:
-          typeof parsed.sshPassword === "string"
-            ? parsed.sshPassword
-            : undefined,
-        sshPrivateKey:
-          typeof parsed.sshPrivateKey === "string"
-            ? parsed.sshPrivateKey
-            : undefined,
-        sshPassphrase:
-          typeof parsed.sshPassphrase === "string"
-            ? parsed.sshPassphrase
-            : undefined,
-        tlsKeyPassphrase:
-          typeof parsed.tlsKeyPassphrase === "string"
-            ? parsed.tlsKeyPassphrase
-            : undefined,
-      };
-    }
-  } catch {}
-
-  return { password: value };
-}
-
-function serializeStoredConnectionSecrets(
-  secrets: StoredConnectionSecrets,
-): string | undefined {
-  const filtered = Object.fromEntries(
-    Object.entries(secrets).filter(([, value]) => typeof value === "string"),
-  );
-
-  return Object.keys(filtered).length > 0
-    ? JSON.stringify(filtered)
-    : undefined;
 }
 
 function shouldUseSecretStorage(payload: ConnectionFormSubmission): boolean {
@@ -338,97 +253,37 @@ export class ConnectionFormPanel {
     );
   }
 
-  private async loadStoredSecrets(
-    id: string,
-  ): Promise<StoredConnectionSecrets> {
-    try {
-      return parseStoredConnectionSecrets(await this.context.secrets.get(id));
-    } catch {
-      return {};
-    }
-  }
-
   private async readStoredSecretsSnapshot(id: string): Promise<{
-    serialized: string | undefined;
     parsed: StoredConnectionSecrets;
     readError?: string;
   }> {
     try {
       const serialized = await this.context.secrets.get(id);
       return {
-        serialized,
         parsed: parseStoredConnectionSecrets(serialized),
       };
     } catch (err: unknown) {
       return {
-        serialized: undefined,
         parsed: {},
         readError: normalizeUnknownError(err).message,
       };
     }
   }
 
-  private async restoreSecretsSnapshot(
-    snapshot: string | undefined,
-    id: string,
-  ): Promise<void> {
-    if (snapshot === undefined) {
-      await this.context.secrets.delete(id);
-      return;
-    }
-
-    await this.context.secrets.store(id, snapshot);
-  }
-
-  private async commitSecretUpdateTransaction(
-    transaction: ConnectionSecretUpdateTransaction,
-    saveConfig: () => Promise<void>,
-  ): Promise<void> {
-    const nextSecretSnapshot = transaction.nextSecretSnapshot;
-    const shouldStoreNextSecret =
-      nextSecretSnapshot !== undefined &&
-      nextSecretSnapshot !== transaction.previousSecretSnapshot;
-    const shouldDeleteSecret =
-      transaction.nextSecretSnapshot === undefined &&
-      transaction.previousSecretSnapshot !== undefined;
-    const secretMutationNeeded = shouldStoreNextSecret || shouldDeleteSecret;
-
-    if (shouldStoreNextSecret) {
-      await this.context.secrets.store(
-        transaction.connectionId,
-        nextSecretSnapshot,
-      );
-    } else if (shouldDeleteSecret) {
-      await this.context.secrets.delete(transaction.connectionId);
-    }
-
-    try {
-      await saveConfig();
-    } catch (err: unknown) {
-      if (secretMutationNeeded) {
-        try {
-          await this.restoreSecretsSnapshot(
-            transaction.previousSecretSnapshot,
-            transaction.connectionId,
-          );
-        } catch {}
-      }
-
-      throw err;
-    }
-  }
-
   private async resolveSubmittedConfig(
     payload: ConnectionFormSubmission,
+    storedSecrets?: StoredConnectionSecrets,
   ): Promise<ConnectionConfig> {
-    const storedSecrets = await this.loadStoredSecrets(payload.id);
+    const resolvedStoredSecrets =
+      storedSecrets ??
+      parseStoredConnectionSecrets(await this.context.secrets.get(payload.id));
     const existing = this.connectionManager.getConnection(payload.id);
     const useSecretStorage =
       shouldUseSecretStorage(payload) ||
-      storedSecrets.connectionUri !== undefined ||
-      storedSecrets.uri !== undefined ||
-      storedSecrets.endpoint !== undefined ||
-      storedSecrets.awsEndpoint !== undefined ||
+      resolvedStoredSecrets.connectionUri !== undefined ||
+      resolvedStoredSecrets.uri !== undefined ||
+      resolvedStoredSecrets.endpoint !== undefined ||
+      resolvedStoredSecrets.awsEndpoint !== undefined ||
       extractCredentialBearingUriSecret(existing?.connectionUri) !==
         undefined ||
       extractCredentialBearingUriSecret(existing?.uri) !== undefined ||
@@ -436,7 +291,7 @@ export class ConnectionFormPanel {
       extractCredentialBearingUriSecret(existing?.awsEndpoint) !== undefined;
     const password = await this.resolveSubmittedPassword(
       payload,
-      storedSecrets,
+      resolvedStoredSecrets,
       useSecretStorage,
     );
     const {
@@ -465,7 +320,7 @@ export class ConnectionFormPanel {
             submittedSsh.authMethod === "password"
               ? this.resolveSubmittedSecret(
                   submittedSsh.password,
-                  storedSecrets.sshPassword,
+                  resolvedStoredSecrets.sshPassword,
                   existing?.ssh?.password,
                 )
               : undefined,
@@ -473,7 +328,7 @@ export class ConnectionFormPanel {
             submittedSsh.authMethod === "privateKey"
               ? this.resolveSubmittedSecret(
                   submittedSsh.privateKey,
-                  storedSecrets.sshPrivateKey,
+                  resolvedStoredSecrets.sshPrivateKey,
                   existing?.ssh?.privateKey,
                 )
               : undefined,
@@ -481,7 +336,7 @@ export class ConnectionFormPanel {
             submittedSsh.authMethod === "privateKey"
               ? this.resolveSubmittedSecret(
                   submittedSsh.passphrase,
-                  storedSecrets.sshPassphrase,
+                  resolvedStoredSecrets.sshPassphrase,
                   existing?.ssh?.passphrase,
                 )
               : undefined,
@@ -496,7 +351,7 @@ export class ConnectionFormPanel {
                 ? this.resolveSubmittedSecret(
                     rest.tls.keyPassphrase,
                     useSecretStorage
-                      ? storedSecrets.tlsKeyPassphrase
+                      ? resolvedStoredSecrets.tlsKeyPassphrase
                       : undefined,
                     existing?.tls?.keyPassphrase,
                   )
@@ -505,7 +360,7 @@ export class ConnectionFormPanel {
         : rest.tls;
     const prefersElasticsearchBasicAuth =
       payload.type === "elasticsearch" &&
-      trimOptionalSecretValue(payload.username) !== undefined &&
+      Boolean(payload.username?.trim()) &&
       trimOptionalSecretValue(payload.password) !== undefined;
     return {
       ...rest,
@@ -513,42 +368,46 @@ export class ConnectionFormPanel {
       useSecretStorage,
       connectionUri: restoreSubmittedUriValue(
         submittedConnectionUri,
-        storedSecrets.connectionUri,
+        resolvedStoredSecrets.connectionUri,
         existing?.connectionUri,
       ),
       uri: restoreSubmittedUriValue(
         submittedUri,
-        storedSecrets.uri,
+        resolvedStoredSecrets.uri,
         existing?.uri,
       ),
       endpoint: restoreSubmittedUriValue(
         submittedEndpoint,
-        storedSecrets.endpoint,
+        resolvedStoredSecrets.endpoint,
         existing?.endpoint,
       ),
       awsEndpoint: restoreSubmittedUriValue(
         submittedAwsEndpoint,
-        storedSecrets.awsEndpoint,
+        resolvedStoredSecrets.awsEndpoint,
         existing?.awsEndpoint,
       ),
       password,
       apiKey:
         trimOptionalSecretValue(payload.apiKey) ??
         (useSecretStorage && !prefersElasticsearchBasicAuth
-          ? storedSecrets.apiKey
+          ? resolvedStoredSecrets.apiKey
           : undefined) ??
         existing?.apiKey,
       awsAccessKeyId:
         trimOptionalSecretValue(payload.awsAccessKeyId) ??
-        (useSecretStorage ? storedSecrets.awsAccessKeyId : undefined) ??
+        (useSecretStorage ? resolvedStoredSecrets.awsAccessKeyId : undefined) ??
         existing?.awsAccessKeyId,
       awsSecretAccessKey:
         trimOptionalSecretValue(payload.awsSecretAccessKey) ??
-        (useSecretStorage ? storedSecrets.awsSecretAccessKey : undefined) ??
+        (useSecretStorage
+          ? resolvedStoredSecrets.awsSecretAccessKey
+          : undefined) ??
         existing?.awsSecretAccessKey,
       awsSessionToken:
         trimOptionalSecretValue(payload.awsSessionToken) ??
-        (useSecretStorage ? storedSecrets.awsSessionToken : undefined) ??
+        (useSecretStorage
+          ? resolvedStoredSecrets.awsSessionToken
+          : undefined) ??
         existing?.awsSessionToken,
       ssh,
     };
@@ -566,7 +425,24 @@ export class ConnectionFormPanel {
         if (!payload) {
           return;
         }
-        const raw = await this.resolveSubmittedConfig(payload);
+        const previousSecretSnapshot = await this.readStoredSecretsSnapshot(
+          payload.id,
+        );
+        const existing = this.connectionManager.getConnection(payload.id);
+        if (previousSecretSnapshot.readError && existing?.useSecretStorage) {
+          this.panel.webview.postMessage({
+            type: "saveResult",
+            payload: {
+              success: false,
+              error: `SecretStorage unavailable: ${previousSecretSnapshot.readError}. Existing connection data was not changed.`,
+            },
+          });
+          return;
+        }
+        const raw = await this.resolveSubmittedConfig(
+          payload,
+          previousSecretSnapshot.parsed,
+        );
         const validation = this.validationService.validate(raw);
         if (!validation.valid) {
           this.panel.webview.postMessage({
@@ -580,9 +456,6 @@ export class ConnectionFormPanel {
           return;
         }
 
-        const previousSecretSnapshot = await this.readStoredSecretsSnapshot(
-          raw.id,
-        );
         const inlinePassword = trimOptionalSecretValue(raw.password);
         const requiresStoredPasswordRecovery =
           !raw.useSecretStorage && payload.hasStoredSecret === true;
@@ -603,107 +476,24 @@ export class ConnectionFormPanel {
           return;
         }
 
-        if (raw.useSecretStorage) {
-          const normalizedPreviousSecretSnapshot =
-            serializeStoredConnectionSecrets(previousSecretSnapshot.parsed);
-          const nextSecrets = serializeStoredConnectionSecrets({
-            password: inlinePassword,
-            apiKey:
-              raw.type === "elasticsearch"
-                ? trimOptionalSecretValue(raw.apiKey)
-                : undefined,
-            awsAccessKeyId:
-              raw.type === "dynamodb"
-                ? trimOptionalSecretValue(raw.awsAccessKeyId)
-                : undefined,
-            awsSecretAccessKey:
-              raw.type === "dynamodb"
-                ? trimOptionalSecretValue(raw.awsSecretAccessKey)
-                : undefined,
-            awsSessionToken:
-              raw.type === "dynamodb"
-                ? trimOptionalSecretValue(raw.awsSessionToken)
-                : undefined,
-            connectionUri: resolvePersistedCredentialBearingUriSecret(
-              raw.connectionUri,
-              previousSecretSnapshot.parsed.connectionUri,
-            ),
-            uri: resolvePersistedCredentialBearingUriSecret(
-              raw.uri,
-              previousSecretSnapshot.parsed.uri,
-            ),
-            endpoint: resolvePersistedCredentialBearingUriSecret(
-              raw.endpoint,
-              previousSecretSnapshot.parsed.endpoint,
-            ),
-            awsEndpoint: resolvePersistedCredentialBearingUriSecret(
-              raw.awsEndpoint,
-              previousSecretSnapshot.parsed.awsEndpoint,
-            ),
-            sshPassword:
-              raw.ssh?.authMethod === "password"
-                ? trimOptionalSecretValue(raw.ssh.password)
-                : undefined,
-            sshPrivateKey:
-              raw.ssh?.authMethod === "privateKey"
-                ? trimOptionalSecretValue(raw.ssh.privateKey)
-                : undefined,
-            sshPassphrase:
-              raw.ssh?.authMethod === "privateKey"
-                ? trimOptionalSecretValue(raw.ssh.passphrase)
-                : undefined,
-            tlsKeyPassphrase:
-              raw.tls?.mode === "mutualTls"
-                ? trimOptionalSecretValue(raw.tls.keyPassphrase)
-                : undefined,
+        try {
+          const saved =
+            (await this.connectionManager.saveConnection(raw)) ?? raw;
+          this.resolveFn?.(
+            saved.useSecretStorage
+              ? sanitizePersistedConnectionConfig(saved)
+              : saved,
+          );
+        } catch (err: unknown) {
+          const error = normalizeUnknownError(err);
+          this.panel.webview.postMessage({
+            type: "saveResult",
+            payload: {
+              success: false,
+              error: `Could not save connection: ${error.message}`,
+            },
           });
-          const secretMutationNeeded =
-            nextSecrets !== normalizedPreviousSecretSnapshot;
-          if (
-            secretMutationNeeded &&
-            previousSecretSnapshot.readError &&
-            normalizedPreviousSecretSnapshot === undefined
-          ) {
-            this.panel.webview.postMessage({
-              type: "saveResult",
-              payload: {
-                success: false,
-                error: `SecretStorage unavailable: ${previousSecretSnapshot.readError}. Existing credentials were preserved; retry once Secret Storage is available.`,
-              },
-            });
-            return;
-          }
-
-          const transaction: ConnectionSecretUpdateTransaction = {
-            connectionId: raw.id,
-            useSecretStorage: true,
-            previousSecretSnapshot: normalizedPreviousSecretSnapshot,
-            nextSecretSnapshot: nextSecrets,
-          };
-          try {
-            await this.commitSecretUpdateTransaction(transaction, async () => {
-              await this.connectionManager.saveConnection(raw);
-            });
-          } catch (err: unknown) {
-            const error = normalizeUnknownError(err);
-            this.panel.webview.postMessage({
-              type: "saveResult",
-              payload: {
-                success: false,
-                error: `SecretStorage unavailable: ${error.message}. Credentials were not saved.`,
-              },
-            });
-            return;
-          }
-          this.resolveFn?.(sanitizePersistedConnectionConfig(raw));
-        } else {
-          await this.connectionManager.saveConnection(raw);
-          if (previousSecretSnapshot.serialized !== undefined) {
-            try {
-              await this.context.secrets.delete(raw.id);
-            } catch {}
-          }
-          this.resolveFn?.(raw);
+          return;
         }
 
         this.resolveFn = undefined;

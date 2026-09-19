@@ -5,7 +5,10 @@ import type {
   HistoryEntry,
   StoredConnectionConfig,
 } from "../../src/extension/connectionManagerModels";
-import type { ConnectionManagerStore } from "../../src/extension/connectionManagerStore";
+import type {
+  ConnectionManagerStore,
+  ConnectionStoreMutation,
+} from "../../src/extension/connectionManagerStore";
 import {
   createDriverTimeoutSettingsSnapshot,
   type DriverTimeoutSettingsSnapshot,
@@ -50,6 +53,8 @@ export class FakeConnectionManagerStore implements ConnectionManagerStore {
   private queryRowLimit = 1_000;
   private skipTableMutationPreview = false;
   private timeoutSettings = createDriverTimeoutSettingsSnapshot();
+  private mutationTail: Promise<void> = Promise.resolve();
+  private nextMutationWriteError: Error | undefined;
 
   onDidChangeConfiguration(
     listener: ConfigurationListener,
@@ -88,6 +93,38 @@ export class FakeConnectionManagerStore implements ConnectionManagerStore {
 
     this.connections = connections.map((connection) => ({ ...connection }));
     return true;
+  }
+
+  async mutateConnections<TResult>(
+    mutate: (
+      current: StoredConnectionConfig[],
+    ) =>
+      | ConnectionStoreMutation<TResult>
+      | Promise<ConnectionStoreMutation<TResult>>,
+  ): Promise<TResult> {
+    const operation = async (): Promise<TResult> => {
+      const mutation = await mutate(this.getConnections());
+      if (mutation.connections) {
+        const writeError = this.nextMutationWriteError;
+        this.nextMutationWriteError = undefined;
+        if (writeError) {
+          if (mutation.rollback) {
+            await mutation.rollback();
+          }
+          throw writeError;
+        }
+        this.connections = mutation.connections.map((connection) => ({
+          ...connection,
+        }));
+      }
+      return mutation.result;
+    };
+    const run = this.mutationTail.then(operation, operation);
+    this.mutationTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return await run;
   }
 
   readHistory(): HistoryEntry[] {
@@ -168,6 +205,10 @@ export class FakeConnectionManagerStore implements ConnectionManagerStore {
 
   setSkipTableMutationPreview(skip: boolean): void {
     this.skipTableMutationPreview = skip;
+  }
+
+  failNextConnectionWrite(error: Error): void {
+    this.nextMutationWriteError = error;
   }
 
   setTimeoutSettings(settings: {

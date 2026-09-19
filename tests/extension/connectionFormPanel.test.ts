@@ -555,14 +555,7 @@ describe("ConnectionFormPanel", () => {
         awsRegion: "us-east-1",
       }),
     );
-    expect(context.secrets.store).toHaveBeenCalledWith(
-      "conn-ddb",
-      JSON.stringify({
-        awsAccessKeyId: "AKIA123",
-        awsSecretAccessKey: "secret-key",
-        awsSessionToken: "session-token",
-      }),
-    );
+    expect(context.secrets.store).not.toHaveBeenCalled();
     expect(connectionManager.saveConnection).toHaveBeenCalledWith(
       expect.objectContaining({
         awsAccessKeyId: expect.anything(),
@@ -908,7 +901,7 @@ describe("ConnectionFormPanel", () => {
       }),
     );
     expect(context.secrets.store).not.toHaveBeenCalled();
-    expect(context.secrets.delete).toHaveBeenCalledWith("conn-ssh");
+    expect(context.secrets.delete).not.toHaveBeenCalled();
     expect(connectionManager.saveConnection).toHaveBeenCalledWith(
       expect.objectContaining({
         id: "conn-ssh",
@@ -1056,7 +1049,7 @@ describe("ConnectionFormPanel", () => {
     await expect(promise).resolves.toBeUndefined();
   });
 
-  it("rolls back secret storage snapshot when config save fails after secret update", async () => {
+  it("delegates rollback to the connection manager when saving fails", async () => {
     const previousSecretSnapshot = JSON.stringify({ password: "old-secret" });
     const context = {
       secrets: {
@@ -1111,21 +1104,12 @@ describe("ConnectionFormPanel", () => {
     });
 
     expect(connectionManager.saveConnection).toHaveBeenCalledTimes(1);
-    expect(context.secrets.store).toHaveBeenNthCalledWith(
-      1,
-      "conn-rollback",
-      JSON.stringify({ password: "new-secret" }),
-    );
-    expect(context.secrets.store).toHaveBeenNthCalledWith(
-      2,
-      "conn-rollback",
-      previousSecretSnapshot,
-    );
+    expect(context.secrets.store).not.toHaveBeenCalled();
     expect(panel.webview.postMessage).toHaveBeenCalledWith({
       type: "saveResult",
       payload: expect.objectContaining({
         success: false,
-        error: expect.stringContaining("SecretStorage unavailable"),
+        error: expect.stringContaining("Could not save connection"),
       }),
     });
 

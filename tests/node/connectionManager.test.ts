@@ -1315,6 +1315,270 @@ describe("ConnectionManager", () => {
     );
   });
 
+  it("serializes concurrent saves without losing either connection", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await Promise.all([
+      manager.saveConnection({
+        id: "a",
+        name: "A",
+        type: "sqlite",
+        filePath: "/tmp/a.db",
+      }),
+      manager.saveConnection({
+        id: "b",
+        name: "B",
+        type: "sqlite",
+        filePath: "/tmp/b.db",
+      }),
+    ]);
+
+    expect(store.getConnections().map(({ id }) => id)).toEqual(["a", "b"]);
+  });
+
+  it("restores the exact previous secret when the config write fails", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const previous = '{ "password": "old", "futureCredential": {"keep":true} }';
+    store.setConnections([
+      {
+        id: "conn-rollback",
+        name: "Rollback",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+        useSecretStorage: true,
+      },
+    ]);
+    store.setSecret("conn-rollback", previous);
+    store.failNextConnectionWrite(new Error("config write failed"));
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await expect(
+      manager.saveConnection({
+        id: "conn-rollback",
+        name: "Rollback",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+        password: "new",
+        useSecretStorage: true,
+      }),
+    ).rejects.toThrow("config write failed");
+
+    await expect(store.getSecret("conn-rollback")).resolves.toBe(previous);
+    expect(store.getConnections()[0]?.name).toBe("Rollback");
+  });
+
+  it("attempts every migration rollback after a settings write failure", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const connections: ConnectionConfig[] = ["a", "b", "c"].map((id) => ({
+      id,
+      name: id,
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "postgres",
+      password: "new",
+    }));
+    store.setConnections(connections);
+    const previous = '{ "password": "old" }';
+    store.setSecret("a", previous);
+    store.setSecret("c", previous);
+    const rollbackError = new Error("secret rollback failed");
+    const storeSecret = store.storeSecret.bind(store);
+    const writes = vi
+      .spyOn(store, "storeSecret")
+      .mockImplementation(async (id, value) => {
+        if (id === "c" && value === previous) throw rollbackError;
+        await storeSecret(id, value);
+      });
+    const deletes = vi.spyOn(store, "deleteSecret");
+    store.failNextConnectionWrite(new Error("settings write failed"));
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await expect(
+      (
+        manager as unknown as {
+          _migrateAllStoredConnectionSecrets(): Promise<void>;
+        }
+      )._migrateAllStoredConnectionSecrets(),
+    ).rejects.toMatchObject({
+      errors: [rollbackError],
+    });
+
+    expect(writes).toHaveBeenCalledWith("c", previous);
+    expect(writes).toHaveBeenCalledWith("a", previous);
+    expect(deletes).toHaveBeenCalledWith("b");
+    await expect(store.getSecret("a")).resolves.toBe(previous);
+    await expect(store.getSecret("b")).resolves.toBeUndefined();
+    expect(store.getConnections()).toEqual(connections);
+  });
+
+  it("retains secret-only migration rollback for a store conflict", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const config: ConnectionConfig = {
+      id: "secret-only",
+      name: "Secret only",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "postgres",
+      useSecretStorage: true,
+    };
+    store.setConnections([config]);
+    const previous = '{ "password": "keep", "sshPassword": "obsolete" }';
+    store.setSecret(config.id, previous);
+    const externalConfig = { ...config, name: "External edit" };
+    const conflict = new Error("configuration changed concurrently");
+    vi.spyOn(store, "mutateConnections").mockImplementation(async (mutate) => {
+      const mutation = await mutate(store.getConnections());
+      expect(mutation.connections).toBeUndefined();
+      await expect(store.getSecret(config.id)).resolves.not.toBe(previous);
+      store.setConnections([externalConfig]);
+      expect(mutation.rollback).toBeTypeOf("function");
+      await mutation.rollback?.();
+      throw conflict;
+    });
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await expect(
+      (
+        manager as unknown as {
+          _migrateSingleConnectionSecretsIfNeeded(
+            config: ConnectionConfig,
+          ): Promise<void>;
+        }
+      )._migrateSingleConnectionSecretsIfNeeded(config),
+    ).rejects.toBe(conflict);
+    await expect(store.getSecret(config.id)).resolves.toBe(previous);
+    expect(store.getConnections()).toEqual([externalConfig]);
+  });
+
+  it.each([
+    false,
+    true,
+  ])("saves a nonsecret SQLite connection without accessing an unavailable keychain (existing: %s)", async (existing) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const reads = vi
+      .spyOn(store, "getSecret")
+      .mockRejectedValue(new Error("keychain unavailable"));
+    const writes = vi.spyOn(store, "storeSecret");
+    const deletes = vi.spyOn(store, "deleteSecret");
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    const config: ConnectionConfig = {
+      id: "sqlite-new",
+      name: "SQLite",
+      type: "sqlite",
+      filePath: "/tmp/app.db",
+    };
+    if (existing) {
+      store.setConnections([{ ...config, name: "Before edit" }]);
+    }
+
+    await expect(manager.saveConnection(config)).resolves.toEqual(config);
+    expect(store.getConnections()).toEqual([config]);
+    expect(reads).not.toHaveBeenCalled();
+    expect(writes).not.toHaveBeenCalled();
+    expect(deletes).not.toHaveBeenCalled();
+  });
+
+  it("requires secret cleanup when an existing secret-backed connection becomes nonsecret", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const config: ConnectionConfig = {
+      id: "sqlite-existing",
+      name: "SQLite",
+      type: "sqlite",
+      filePath: "/tmp/app.db",
+      useSecretStorage: true,
+    };
+    store.setConnections([config]);
+    store.setSecret(config.id, "old-secret");
+    const reads = vi
+      .spyOn(store, "getSecret")
+      .mockRejectedValueOnce(new Error("keychain unavailable"));
+    const deletes = vi.spyOn(store, "deleteSecret");
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    const next = { ...config, useSecretStorage: false };
+
+    await expect(manager.saveConnection(next)).rejects.toThrow(
+      "keychain unavailable",
+    );
+    expect(reads).toHaveBeenCalledWith(config.id);
+    expect(store.getConnections()).toEqual([config]);
+    await expect(store.getSecret(config.id)).resolves.toBe("old-secret");
+    expect(deletes).not.toHaveBeenCalled();
+
+    await manager.saveConnection(next);
+    expect(deletes).toHaveBeenCalledWith(config.id);
+    await expect(store.getSecret(config.id)).resolves.toBeUndefined();
+    expect(store.getConnections()).toEqual([next]);
+  });
+
+  it("generates an id before storing a new connection secret", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    const saved = await manager.saveConnection({
+      id: "",
+      name: "Generated",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "postgres",
+      password: "secret",
+    });
+
+    expect(saved.id).not.toBe("");
+    expect(store.getConnections()[0]?.id).toBe(saved.id);
+    await expect(store.getSecret(saved.id)).resolves.toContain("secret");
+    await expect(store.getSecret("")).resolves.toBeUndefined();
+  });
+
   it("removes a connection and purges associated history, bookmarks, and secrets", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
@@ -2063,15 +2327,6 @@ describe("ConnectionManager", () => {
       },
     ]);
 
-    const casGate = createDeferred<void>();
-    const originalSaveIfRevision = store.saveConnectionsIfRevision.bind(store);
-    const casSpy = vi
-      .spyOn(store, "saveConnectionsIfRevision")
-      .mockImplementation(async (expectedRevision, connections) => {
-        await casGate.promise;
-        return originalSaveIfRevision(expectedRevision, connections);
-      });
-
     const manager = new ConnectionManager(
       createExtensionContextStub() as never,
       store,
@@ -2091,7 +2346,6 @@ describe("ConnectionManager", () => {
       useSecretStorage: true,
     });
 
-    casGate.resolve();
     await (
       manager as unknown as {
         _pendingSecretMigration: Promise<void> | null;
@@ -2103,7 +2357,9 @@ describe("ConnectionManager", () => {
       .find((connection) => connection.id === "conn-race-save");
     expect(persisted?.name).toBe("Updated");
     expect(persisted?.useSecretStorage).toBe(true);
-    expect(casSpy).toHaveBeenCalledTimes(1);
+    await expect(store.getSecret("conn-race-save")).resolves.toContain(
+      "new-password",
+    );
   });
 
   it("does not resurrect a removed connection when background secret migration commits stale state", async () => {
@@ -2132,15 +2388,6 @@ describe("ConnectionManager", () => {
       },
     ]);
 
-    const casGate = createDeferred<void>();
-    const originalSaveIfRevision = store.saveConnectionsIfRevision.bind(store);
-    const casSpy = vi
-      .spyOn(store, "saveConnectionsIfRevision")
-      .mockImplementation(async (expectedRevision, connections) => {
-        await casGate.promise;
-        return originalSaveIfRevision(expectedRevision, connections);
-      });
-
     const manager = new ConnectionManager(
       createExtensionContextStub() as never,
       store,
@@ -2153,7 +2400,6 @@ describe("ConnectionManager", () => {
       true,
     );
 
-    casGate.resolve();
     await (
       manager as unknown as {
         _pendingSecretMigration: Promise<void> | null;
@@ -2163,7 +2409,7 @@ describe("ConnectionManager", () => {
     expect(store.getConnections().map((connection) => connection.id)).toEqual([
       "conn-keep",
     ]);
-    expect(casSpy).toHaveBeenCalledTimes(1);
+    await expect(store.getSecret("conn-race-remove")).resolves.toBeUndefined();
   });
 
   it("disposes active drivers and rejects future manager operations", async () => {

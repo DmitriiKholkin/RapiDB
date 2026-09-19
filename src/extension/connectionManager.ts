@@ -38,12 +38,12 @@ import {
   VSCodeConnectionManagerStore,
 } from "./connectionManagerStore";
 import {
-  type ConnectionSecretSnapshot,
   hasPersistedConnectionConfigChanges,
   sanitizePersistedConnectionConfig,
-  serializeConnectionSecretsForConfig,
+  serializeConnectionSecretsForStoredConfig,
   shouldForceSecretStorage,
 } from "./connectionSecrets";
+import { parseStoredConnectionSecrets } from "./connectionSecretsData";
 import { DynamoDBDriver } from "./dbDrivers/dynamodb";
 import { ElasticsearchDriver } from "./dbDrivers/elasticsearch";
 import { MongoDBDriver } from "./dbDrivers/mongodb";
@@ -842,27 +842,45 @@ export class ConnectionManager
 
   private async _persistConnectionSecretsIfNeeded(
     config: ConnectionConfig,
-  ): Promise<void> {
-    if (!shouldForceSecretStorage(config)) {
-      return;
-    }
-
+  ): Promise<(() => Promise<void>) | undefined> {
     const previousSecretSnapshot = await this.store.getSecret(config.id);
-    const serializedSecrets = serializeConnectionSecretsForConfig(
-      config,
-      this.parseStoredSecrets(previousSecretSnapshot),
-    );
-
-    if (serializedSecrets === previousSecretSnapshot) {
-      return;
+    const nextSecretSnapshot = shouldForceSecretStorage(config)
+      ? serializeConnectionSecretsForStoredConfig(
+          config,
+          previousSecretSnapshot,
+        )
+      : undefined;
+    if (nextSecretSnapshot === previousSecretSnapshot) {
+      return undefined;
     }
 
-    if (!serializedSecrets) {
-      await this.store.deleteSecret(config.id);
-      return;
+    const restore = async (): Promise<void> => {
+      if (previousSecretSnapshot === undefined) {
+        await this.store.deleteSecret(config.id);
+      } else {
+        await this.store.storeSecret(config.id, previousSecretSnapshot);
+      }
+    };
+
+    try {
+      if (nextSecretSnapshot === undefined) {
+        await this.store.deleteSecret(config.id);
+      } else {
+        await this.store.storeSecret(config.id, nextSecretSnapshot);
+      }
+    } catch (writeError) {
+      try {
+        await restore();
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [writeError, rollbackError],
+          `Secret update and rollback both failed for connection "${config.id}".`,
+        );
+      }
+      throw writeError;
     }
 
-    await this.store.storeSecret(config.id, serializedSecrets);
+    return restore;
   }
 
   private async _migrateSingleConnectionSecretsIfNeeded(
@@ -871,66 +889,96 @@ export class ConnectionManager
     if (!shouldForceSecretStorage(config)) {
       return;
     }
+    await this.store.mutateConnections(async (storedConnections) => {
+      const index = storedConnections.findIndex(
+        (connection) => connection.id === config.id,
+      );
+      if (index < 0 || !shouldForceSecretStorage(storedConnections[index])) {
+        return { result: undefined };
+      }
 
-    const persisted = sanitizePersistedConnectionConfig(config);
-    const needsPersistedConfigUpdate = hasPersistedConnectionConfigChanges(
-      persisted,
-      config,
-    );
-
-    await this._persistConnectionSecretsIfNeeded(config);
-
-    if (!needsPersistedConfigUpdate) {
-      return;
-    }
-
-    const expectedRevision = this.store.getConnectionsRevision();
-    const storedConnections = this.getConnections();
-    const index = storedConnections.findIndex(
-      (connection) => connection.id === config.id,
-    );
-    if (index < 0) {
-      return;
-    }
-
-    storedConnections[index] = persisted;
-    await this.saveConnections(storedConnections, {
-      expectedRevision,
-      skipIfRevisionMismatch: true,
+      const liveConfig = canonicalizeOracleServiceName(
+        storedConnections[index],
+      );
+      const rollback = await this._persistConnectionSecretsIfNeeded(liveConfig);
+      const persisted = sanitizePersistedConnectionConfig(liveConfig);
+      if (!hasPersistedConnectionConfigChanges(persisted, liveConfig)) {
+        return { result: undefined, rollback };
+      }
+      const next = [...storedConnections];
+      next[index] = persisted;
+      return { connections: next, result: undefined, rollback };
     });
+    this._connectionsCache = null;
   }
 
   private async _migrateAllStoredConnectionSecrets(): Promise<void> {
-    const expectedRevision = this.store.getConnectionsRevision();
-    const storedConnections = this.getConnections();
-    let hasChanges = false;
-
-    for (const connection of storedConnections) {
-      if (!shouldForceSecretStorage(connection)) {
-        continue;
-      }
-
-      await this._persistConnectionSecretsIfNeeded(connection);
-      const persisted = sanitizePersistedConnectionConfig(connection);
-      if (hasPersistedConnectionConfigChanges(persisted, connection)) {
-        const index = storedConnections.findIndex(
-          (item) => item.id === connection.id,
-        );
-        if (index >= 0) {
-          storedConnections[index] = persisted;
-          hasChanges = true;
+    const changed = await this.store.mutateConnections(
+      async (storedConnections) => {
+        const next = [...storedConnections];
+        const rollbacks: Array<() => Promise<void>> = [];
+        let hasChanges = false;
+        try {
+          for (let index = 0; index < next.length; index += 1) {
+            const connection = canonicalizeOracleServiceName(next[index]);
+            if (!shouldForceSecretStorage(connection)) {
+              continue;
+            }
+            const rollback =
+              await this._persistConnectionSecretsIfNeeded(connection);
+            if (rollback) {
+              rollbacks.push(rollback);
+            }
+            const persisted = sanitizePersistedConnectionConfig(connection);
+            if (hasPersistedConnectionConfigChanges(persisted, connection)) {
+              next[index] = persisted;
+              hasChanges = true;
+            }
+          }
+        } catch (migrationError) {
+          const rollbackErrors: unknown[] = [];
+          for (const rollback of rollbacks.reverse()) {
+            try {
+              await rollback();
+            } catch (error) {
+              rollbackErrors.push(error);
+            }
+          }
+          if (rollbackErrors.length > 0) {
+            throw new AggregateError(
+              [migrationError, ...rollbackErrors],
+              "Secret migration and rollback failed.",
+            );
+          }
+          throw migrationError;
         }
-      }
-    }
 
-    if (hasChanges) {
-      const persisted = await this.saveConnections(storedConnections, {
-        expectedRevision,
-        skipIfRevisionMismatch: true,
-      });
-      if (persisted) {
-        this._onDidChangeConnections.fire();
-      }
+        const rollback = async (): Promise<void> => {
+          const rollbackErrors: unknown[] = [];
+          for (const restore of rollbacks.reverse()) {
+            try {
+              await restore();
+            } catch (error) {
+              rollbackErrors.push(error);
+            }
+          }
+          if (rollbackErrors.length > 0) {
+            throw new AggregateError(
+              rollbackErrors,
+              "Secret migration rollback failed.",
+            );
+          }
+        };
+        return {
+          connections: hasChanges ? next : undefined,
+          result: hasChanges,
+          rollback: rollbacks.length > 0 ? rollback : undefined,
+        };
+      },
+    );
+    this._connectionsCache = null;
+    if (changed) {
+      this._onDidChangeConnections.fire();
     }
   }
 
@@ -952,63 +1000,50 @@ export class ConnectionManager
     }));
     return this._connectionsCache;
   }
-  private async saveConnections(
-    conns: ConnectionConfig[],
-    options?: {
-      expectedRevision?: string;
-      skipIfRevisionMismatch?: boolean;
-    },
-  ): Promise<boolean> {
-    this._connectionsCache = null;
-    if (options?.expectedRevision) {
-      const saved = await this.store.saveConnectionsIfRevision(
-        options.expectedRevision,
-        conns,
-      );
-      if (!saved && !options.skipIfRevisionMismatch) {
-        throw new Error(
-          "[RapiDB] Cannot persist connections: configuration changed concurrently.",
-        );
-      }
-      return saved;
-    }
-
-    await this.store.saveConnections(conns);
-    return true;
-  }
   private invalidateDriverStaticMetadata(connectionId: string): void {
     this._driverStaticMetadataCache.delete(connectionId);
   }
   getConnection(id: string): ConnectionConfig | undefined {
     return this.getConnections().find((c) => c.id === id);
   }
-  async saveConnection(config: ConnectionConfig): Promise<void> {
+  async saveConnection(config: ConnectionConfig): Promise<ConnectionConfig> {
     this._assertNotDisposed();
 
-    const canonicalConfig = canonicalizeOracleServiceName(config);
+    const canonicalConfig = canonicalizeOracleServiceName({
+      ...config,
+      id:
+        typeof config.id === "string" && config.id.trim()
+          ? config.id
+          : randomUUID(),
+    });
 
     const validation = this.validationService.validate(canonicalConfig);
     if (!validation.valid) {
       throw new Error(validation.message ?? "Connection settings are invalid.");
     }
 
-    await this._persistConnectionSecretsIfNeeded(canonicalConfig);
-
     const persistedConfig = sanitizePersistedConnectionConfig(canonicalConfig);
-
-    const conns = this.getConnections();
-    const idx = conns.findIndex((c) => c.id === canonicalConfig.id);
-    const isEdit = idx >= 0;
-    if (isEdit) {
-      conns[idx] = persistedConfig;
-    } else {
-      conns.push({
-        ...persistedConfig,
-        id: persistedConfig.id || randomUUID(),
-      });
-    }
+    const isEdit = await this.store.mutateConnections(async (connections) => {
+      const idx = connections.findIndex((c) => c.id === canonicalConfig.id);
+      const rollback =
+        connections[idx]?.useSecretStorage === true ||
+        shouldForceSecretStorage(canonicalConfig)
+          ? await this._persistConnectionSecretsIfNeeded(canonicalConfig)
+          : undefined;
+      const next = [...connections];
+      if (idx >= 0) {
+        next[idx] = persistedConfig;
+      } else {
+        next.push(persistedConfig);
+      }
+      return {
+        connections: next,
+        result: idx >= 0,
+        rollback,
+      };
+    });
+    this._connectionsCache = null;
     this.invalidateDriverStaticMetadata(canonicalConfig.id);
-    await this.saveConnections(conns);
     if (
       isEdit &&
       (this.isConnected(canonicalConfig.id) ||
@@ -1017,21 +1052,46 @@ export class ConnectionManager
       await this.disconnectFrom(canonicalConfig.id);
     }
     this._onDidChangeConnections.fire();
+    return canonicalConfig;
   }
   async removeConnection(id: string): Promise<boolean> {
     this._assertNotDisposed();
 
-    if (!this.getConnection(id)) {
+    await this.disconnectFrom(id);
+    const removed = await this.store.mutateConnections(async (connections) => {
+      if (!connections.some((connection) => connection.id === id)) {
+        return { result: false };
+      }
+      const previousSecret = await this.store.getSecret(id);
+      try {
+        await this.store.deleteSecret(id);
+      } catch (deleteError) {
+        if (previousSecret !== undefined) {
+          try {
+            await this.store.storeSecret(id, previousSecret);
+          } catch (rollbackError) {
+            throw new AggregateError(
+              [deleteError, rollbackError],
+              `Secret deletion and rollback failed for connection "${id}".`,
+            );
+          }
+        }
+        throw deleteError;
+      }
+      return {
+        connections: connections.filter((connection) => connection.id !== id),
+        result: true,
+        rollback:
+          previousSecret === undefined
+            ? undefined
+            : () => this.store.storeSecret(id, previousSecret),
+      };
+    });
+    if (!removed) {
       return false;
     }
+    this._connectionsCache = null;
     this.invalidateDriverStaticMetadata(id);
-    await this.disconnectFrom(id);
-    await this.saveConnections(
-      this.getConnections().filter((c) => c.id !== id),
-    );
-    try {
-      await this.store.deleteSecret(id);
-    } catch {}
     await this._purgeHistoryForConnection(id);
     await this._purgeBookmarksForConnection(id);
     this._onDidChangeConnections.fire();
@@ -1050,26 +1110,17 @@ export class ConnectionManager
       return 0;
     }
 
-    const connections = this.getConnections();
-    let renamedCount = 0;
-
-    const updatedConnections = connections.map((connection) => {
-      if (connection.folder?.trim() !== sourceFolder) {
-        return connection;
-      }
-
-      renamedCount += 1;
-      return {
-        ...connection,
-        folder: targetFolder,
-      };
+    const renamedCount = await this.store.mutateConnections((connections) => {
+      let count = 0;
+      const updated = connections.map((connection) => {
+        if (connection.folder?.trim() !== sourceFolder) return connection;
+        count += 1;
+        return { ...connection, folder: targetFolder };
+      });
+      return { connections: count > 0 ? updated : undefined, result: count };
     });
-
-    if (renamedCount === 0) {
-      return 0;
-    }
-
-    await this.saveConnections(updatedConnections);
+    if (renamedCount === 0) return 0;
+    this._connectionsCache = null;
     this._onDidChangeConnections.fire();
     return renamedCount;
   }
@@ -1088,31 +1139,19 @@ export class ConnectionManager
       return 0;
     }
 
-    const connections = this.getConnections();
-    let updatedCount = 0;
-
-    const updatedConnections = connections.map((connection) => {
-      if (!idsToMove.has(connection.id)) {
-        return connection;
-      }
-
-      const currentFolder = connection.folder?.trim() || undefined;
-      if (currentFolder === targetFolder) {
-        return connection;
-      }
-
-      updatedCount += 1;
-      return {
-        ...connection,
-        folder: targetFolder,
-      };
+    const updatedCount = await this.store.mutateConnections((connections) => {
+      let count = 0;
+      const updated = connections.map((connection) => {
+        if (!idsToMove.has(connection.id)) return connection;
+        const currentFolder = connection.folder?.trim() || undefined;
+        if (currentFolder === targetFolder) return connection;
+        count += 1;
+        return { ...connection, folder: targetFolder };
+      });
+      return { connections: count > 0 ? updated : undefined, result: count };
     });
-
-    if (updatedCount === 0) {
-      return 0;
-    }
-
-    await this.saveConnections(updatedConnections);
+    if (updatedCount === 0) return 0;
+    this._connectionsCache = null;
     this._onDidChangeConnections.fire();
     return updatedCount;
   }
@@ -1125,100 +1164,19 @@ export class ConnectionManager
       return 0;
     }
 
-    const connections = this.getConnections();
-    let updatedCount = 0;
-
-    const updatedConnections = connections.map((connection) => {
-      if (connection.folder?.trim() !== targetFolder) {
-        return connection;
-      }
-
-      updatedCount += 1;
-      return {
-        ...connection,
-        folder: undefined,
-      };
+    const updatedCount = await this.store.mutateConnections((connections) => {
+      let count = 0;
+      const updated = connections.map((connection) => {
+        if (connection.folder?.trim() !== targetFolder) return connection;
+        count += 1;
+        return { ...connection, folder: undefined };
+      });
+      return { connections: count > 0 ? updated : undefined, result: count };
     });
-
-    if (updatedCount === 0) {
-      return 0;
-    }
-
-    await this.saveConnections(updatedConnections);
+    if (updatedCount === 0) return 0;
+    this._connectionsCache = null;
     this._onDidChangeConnections.fire();
     return updatedCount;
-  }
-
-  private parseStoredSecrets(value: string | undefined): {
-    password?: string;
-    apiKey?: string;
-    awsAccessKeyId?: string;
-    awsSecretAccessKey?: string;
-    awsSessionToken?: string;
-    connectionUri?: string;
-    uri?: string;
-    endpoint?: string;
-    awsEndpoint?: string;
-    sshPassword?: string;
-    sshPrivateKey?: string;
-    sshPassphrase?: string;
-    tlsKeyPassphrase?: string;
-  } {
-    if (!value) {
-      return {};
-    }
-
-    try {
-      const parsed = JSON.parse(value) as Record<string, unknown>;
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return {
-          password:
-            typeof parsed.password === "string" ? parsed.password : undefined,
-          apiKey: typeof parsed.apiKey === "string" ? parsed.apiKey : undefined,
-          awsAccessKeyId:
-            typeof parsed.awsAccessKeyId === "string"
-              ? parsed.awsAccessKeyId
-              : undefined,
-          awsSecretAccessKey:
-            typeof parsed.awsSecretAccessKey === "string"
-              ? parsed.awsSecretAccessKey
-              : undefined,
-          awsSessionToken:
-            typeof parsed.awsSessionToken === "string"
-              ? parsed.awsSessionToken
-              : undefined,
-          connectionUri:
-            typeof parsed.connectionUri === "string"
-              ? parsed.connectionUri
-              : undefined,
-          uri: typeof parsed.uri === "string" ? parsed.uri : undefined,
-          endpoint:
-            typeof parsed.endpoint === "string" ? parsed.endpoint : undefined,
-          awsEndpoint:
-            typeof parsed.awsEndpoint === "string"
-              ? parsed.awsEndpoint
-              : undefined,
-          sshPassword:
-            typeof parsed.sshPassword === "string"
-              ? parsed.sshPassword
-              : undefined,
-          sshPrivateKey:
-            typeof parsed.sshPrivateKey === "string"
-              ? parsed.sshPrivateKey
-              : undefined,
-          sshPassphrase:
-            typeof parsed.sshPassphrase === "string"
-              ? parsed.sshPassphrase
-              : undefined,
-          tlsKeyPassphrase:
-            typeof parsed.tlsKeyPassphrase === "string"
-              ? parsed.tlsKeyPassphrase
-              : undefined,
-        };
-      }
-    } catch {}
-
-    return { password: value };
   }
 
   async _hydratePassword(config: ConnectionConfig): Promise<ConnectionConfig> {
@@ -1227,7 +1185,7 @@ export class ConnectionManager
     }
     try {
       const stored = await this.store.getSecret(config.id);
-      const secrets = this.parseStoredSecrets(stored);
+      const secrets = parseStoredConnectionSecrets(stored);
       const ssh = config.ssh
         ? {
             ...config.ssh,
@@ -1735,40 +1693,31 @@ export class ConnectionManager
     connectionId: string,
     fingerprintSha256: string,
   ): Promise<void> {
-    const persistedConnection = this.getConnection(connectionId);
-    if (!persistedConnection?.ssh) {
-      return;
-    }
-
-    const hostVerificationMode =
-      persistedConnection.ssh.hostVerificationMode === "trustOnFirstUse"
-        ? "trustOnFirstUse"
-        : "manual";
-    if (hostVerificationMode !== "trustOnFirstUse") {
-      return;
-    }
-
-    if (
-      persistedConnection.ssh.hostFingerprintSha256?.trim() ===
-      fingerprintSha256
-    ) {
-      return;
-    }
-
-    const connections = this.getConnections().map((connection) =>
-      connection.id === connectionId
-        ? {
-            ...connection,
-            ssh: {
-              ...connection.ssh,
-              hostFingerprintSha256: fingerprintSha256,
-            },
-          }
-        : connection,
-    );
-
+    const changed = await this.store.mutateConnections((connections) => {
+      let updated = false;
+      const next = connections.map((connection) => {
+        if (
+          connection.id !== connectionId ||
+          !connection.ssh ||
+          connection.ssh.hostVerificationMode !== "trustOnFirstUse" ||
+          connection.ssh.hostFingerprintSha256?.trim() === fingerprintSha256
+        ) {
+          return connection;
+        }
+        updated = true;
+        return {
+          ...connection,
+          ssh: {
+            ...connection.ssh,
+            hostFingerprintSha256: fingerprintSha256,
+          },
+        };
+      });
+      return { connections: updated ? next : undefined, result: updated };
+    });
+    if (!changed) return;
+    this._connectionsCache = null;
     this.invalidateDriverStaticMetadata(connectionId);
-    await this.saveConnections(connections);
     this._onDidChangeConnections.fire();
   }
 

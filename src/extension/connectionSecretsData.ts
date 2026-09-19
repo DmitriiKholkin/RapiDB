@@ -24,25 +24,26 @@ export type StoredConnectionSecrets = {
   tlsKeyPassphrase?: string;
 };
 
-const SECRET_KEYS: readonly (keyof StoredConnectionSecrets)[] = [
-  "password",
-  "apiKey",
-  "awsAccessKeyId",
-  "awsSecretAccessKey",
-  "awsSessionToken",
-  "connectionUri",
-  "uri",
-  "endpoint",
-  "awsEndpoint",
-  "sshPassword",
-  "sshPrivateKey",
-  "sshPassphrase",
-  "tlsKeyPassphrase",
-];
+export const CONNECTION_SECRET_KEYS: readonly (keyof StoredConnectionSecrets)[] =
+  [
+    "password",
+    "apiKey",
+    "awsAccessKeyId",
+    "awsSecretAccessKey",
+    "awsSessionToken",
+    "connectionUri",
+    "uri",
+    "endpoint",
+    "awsEndpoint",
+    "sshPassword",
+    "sshPrivateKey",
+    "sshPassphrase",
+    "tlsKeyPassphrase",
+  ];
 
 /**
  * Safely extract a string field from a parsed JSON record.
- * Returns the trimmed string if it exists and is non-empty, otherwise undefined.
+ * Returns the original string if it is non-empty, otherwise undefined.
  */
 function extractStringField(
   record: Record<string, unknown>,
@@ -52,8 +53,7 @@ function extractStringField(
   if (typeof value !== "string") {
     return undefined;
   }
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
+  return value.length > 0 ? value : undefined;
 }
 
 /**
@@ -76,7 +76,7 @@ export function parseStoredConnectionSecrets(
     const parsed = JSON.parse(value) as Record<string, unknown>;
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       const secrets: StoredConnectionSecrets = {};
-      for (const key of SECRET_KEYS) {
+      for (const key of CONNECTION_SECRET_KEYS) {
         const extracted = extractStringField(parsed, key);
         if (extracted !== undefined) {
           secrets[key] = extracted;
@@ -89,6 +89,39 @@ export function parseStoredConnectionSecrets(
   }
 
   return { password: value };
+}
+
+export interface StoredConnectionSecretDocument {
+  known: StoredConnectionSecrets;
+  record: Record<string, unknown>;
+  isLegacy: boolean;
+}
+
+export function parseStoredConnectionSecretDocument(
+  value: string | undefined,
+): StoredConnectionSecretDocument {
+  if (!value) {
+    return { known: {}, record: {}, isLegacy: false };
+  }
+
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return {
+        known: parseStoredConnectionSecrets(value),
+        record: { ...(parsed as Record<string, unknown>) },
+        isLegacy: false,
+      };
+    }
+  } catch {
+    // Legacy values are intentionally retained byte-for-byte as passwords.
+  }
+
+  return {
+    known: { password: value },
+    record: {},
+    isLegacy: true,
+  };
 }
 
 /**

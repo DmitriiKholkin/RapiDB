@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import {
   type ConnectionTlsConfig,
@@ -36,6 +36,13 @@ export interface ConnectionManagerStore {
     expectedRevision: string,
     connections: ConnectionConfig[],
   ): Promise<boolean>;
+  mutateConnections<TResult>(
+    mutate: (
+      current: StoredConnectionConfig[],
+    ) =>
+      | ConnectionStoreMutation<TResult>
+      | Promise<ConnectionStoreMutation<TResult>>,
+  ): Promise<TResult>;
   readHistory(): HistoryEntry[];
   writeHistory(entries: HistoryEntry[]): Promise<void>;
   readBookmarks(): BookmarkEntry[];
@@ -48,6 +55,18 @@ export interface ConnectionManagerStore {
   getQueryRowLimit(): number;
   getSkipTableMutationPreview(): boolean;
   getTimeoutSettings(): DriverTimeoutSettingsSnapshot;
+}
+
+export interface ConnectionStoreMutation<TResult> {
+  connections?: ConnectionConfig[];
+  result: TResult;
+  rollback?: () => Promise<void>;
+}
+
+interface ConnectionsConfigurationSnapshot {
+  connections: StoredConnectionConfig[];
+  target: vscode.ConfigurationTarget;
+  revision: string;
 }
 
 function stableSerialize(value: unknown): string {
@@ -119,8 +138,171 @@ function migrateLegacyTlsFlags(
   return changed ? migrated : connections;
 }
 
+function normalizeStoredConnections(connections: StoredConnectionConfig[]): {
+  connections: StoredConnectionConfig[];
+  changed: boolean;
+} {
+  const tlsMigrated = migrateLegacyTlsFlags(connections);
+  let changed = tlsMigrated !== connections;
+  const usedIds = new Set<string>();
+  const normalized = tlsMigrated.map((connection) => {
+    const rawId = (connection as { id?: unknown }).id;
+    const id = typeof rawId === "string" ? rawId.trim() : "";
+    if (id && !usedIds.has(id)) {
+      usedIds.add(id);
+      return connection;
+    }
+
+    changed = true;
+    let generatedId = randomUUID();
+    while (usedIds.has(generatedId)) {
+      generatedId = randomUUID();
+    }
+    usedIds.add(generatedId);
+    return { ...connection, id: generatedId };
+  });
+
+  return { connections: changed ? normalized : connections, changed };
+}
+
 export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
+  private static mutationTail: Promise<void> = Promise.resolve();
+  private normalizedCache:
+    | (ConnectionsConfigurationSnapshot & {
+        changed: boolean;
+        scheduled: boolean;
+      })
+    | undefined;
+
   constructor(private readonly context: vscode.ExtensionContext) {}
+
+  private readConnectionsSnapshot(): ConnectionsConfigurationSnapshot {
+    const configuration = vscode.workspace.getConfiguration("rapidb");
+    const inspected =
+      typeof configuration.inspect === "function"
+        ? configuration.inspect<StoredConnectionConfig[]>("connections")
+        : undefined;
+    let connections: StoredConnectionConfig[];
+    let target: vscode.ConfigurationTarget;
+
+    if (inspected?.workspaceFolderValue !== undefined) {
+      connections = inspected.workspaceFolderValue;
+      target = vscode.ConfigurationTarget.WorkspaceFolder;
+    } else if (inspected?.workspaceValue !== undefined) {
+      connections = inspected.workspaceValue;
+      target = vscode.ConfigurationTarget.Workspace;
+    } else if (inspected?.globalValue !== undefined) {
+      connections = inspected.globalValue;
+      target = vscode.ConfigurationTarget.Global;
+    } else {
+      connections =
+        configuration.get<StoredConnectionConfig[]>("connections") ?? [];
+      target = vscode.ConfigurationTarget.Global;
+    }
+
+    return {
+      connections,
+      target,
+      revision: computeConnectionsRevision(connections),
+    };
+  }
+
+  private enqueue<TResult>(
+    operation: () => Promise<TResult>,
+  ): Promise<TResult> {
+    const run = VSCodeConnectionManagerStore.mutationTail.then(
+      operation,
+      operation,
+    );
+    VSCodeConnectionManagerStore.mutationTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private getNormalization(snapshot: ConnectionsConfigurationSnapshot) {
+    if (
+      this.normalizedCache?.revision !== snapshot.revision ||
+      this.normalizedCache.target !== snapshot.target
+    ) {
+      this.normalizedCache = {
+        ...snapshot,
+        ...normalizeStoredConnections(snapshot.connections),
+        scheduled: false,
+      };
+    }
+    return this.normalizedCache;
+  }
+
+  private assertSnapshotCurrent(
+    snapshot: ConnectionsConfigurationSnapshot,
+  ): void {
+    const current = this.readConnectionsSnapshot();
+    if (
+      current.revision !== snapshot.revision ||
+      current.target !== snapshot.target
+    ) {
+      throw new Error(
+        "Connection settings changed during the operation. Please retry.",
+      );
+    }
+  }
+
+  private async persistNormalization(
+    snapshot: ConnectionsConfigurationSnapshot,
+  ): Promise<void> {
+    const normalized = this.getNormalization(snapshot);
+    if (!normalized.changed) return;
+    const backups: Array<{ id: string; raw: string | undefined }> = [];
+    let writeStarted = false;
+    try {
+      for (const [index, connection] of normalized.connections.entries()) {
+        const originalId = snapshot.connections[index].id;
+        if (typeof originalId !== "string" || originalId === connection.id)
+          continue;
+        const raw = await this.getSecret(originalId);
+        if (raw === undefined) continue;
+        backups.push({
+          id: connection.id,
+          raw: await this.getSecret(connection.id),
+        });
+        await this.storeSecret(connection.id, raw);
+      }
+      this.assertSnapshotCurrent(snapshot);
+      writeStarted = true;
+      await vscode.workspace
+        .getConfiguration("rapidb")
+        .update("connections", normalized.connections, snapshot.target);
+    } catch (error) {
+      const current = this.readConnectionsSnapshot();
+      if (
+        !(
+          writeStarted &&
+          current.target === snapshot.target &&
+          current.revision ===
+            computeConnectionsRevision(normalized.connections)
+        )
+      ) {
+        const errors: unknown[] = [error];
+        for (const backup of backups.reverse()) {
+          try {
+            if (backup.raw === undefined) await this.deleteSecret(backup.id);
+            else await this.storeSecret(backup.id, backup.raw);
+          } catch (rollbackError) {
+            errors.push(rollbackError);
+          }
+        }
+        if (errors.length > 1)
+          throw new AggregateError(
+            errors,
+            "Connection normalization and rollback failed.",
+          );
+        throw error;
+      }
+    }
+    if (this.normalizedCache === normalized) this.normalizedCache = undefined;
+  }
 
   onDidChangeConfiguration(
     listener: (event: vscode.ConfigurationChangeEvent) => void,
@@ -134,51 +316,113 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
   }
 
   getConnections(): StoredConnectionConfig[] {
-    const raw =
-      vscode.workspace
-        .getConfiguration("rapidb")
-        .get<StoredConnectionConfig[]>("connections") ?? [];
-    const migrated = migrateLegacyTlsFlags(raw);
-    // Persist the migration so legacy keys are removed from storage
-    if (migrated !== raw) {
-      vscode.workspace
-        .getConfiguration("rapidb")
-        .update("connections", migrated, vscode.ConfigurationTarget.Global)
-        .then(undefined, () => {
-          // Best-effort; stale keys will be migrated again on next read
+    const snapshot = this.readConnectionsSnapshot();
+    const normalized = this.getNormalization(snapshot);
+    if (normalized.changed && !normalized.scheduled) {
+      normalized.scheduled = true;
+      void this.enqueue(async () => {
+        this.assertSnapshotCurrent(snapshot);
+        await this.persistNormalization(snapshot);
+      })
+        .catch(() => {
+          // Keep the same repaired IDs and retry on the next read or mutation.
+        })
+        .finally(() => {
+          normalized.scheduled = false;
         });
     }
-    return migrated;
+    return normalized.connections.map((connection) => ({ ...connection }));
   }
 
   async saveConnections(connections: ConnectionConfig[]): Promise<void> {
-    await vscode.workspace
-      .getConfiguration("rapidb")
-      .update("connections", connections, vscode.ConfigurationTarget.Global);
+    await this.mutateConnections(() => ({ connections, result: undefined }));
   }
 
   getConnectionsRevision(): string {
-    return computeConnectionsRevision(this.getConnections());
+    return this.readConnectionsSnapshot().revision;
   }
 
   async saveConnectionsIfRevision(
     expectedRevision: string,
     connections: ConnectionConfig[],
   ): Promise<boolean> {
-    const configuration = vscode.workspace.getConfiguration("rapidb");
-    const current =
-      configuration.get<StoredConnectionConfig[]>("connections") ?? [];
-    const currentRevision = computeConnectionsRevision(current);
-    if (currentRevision !== expectedRevision) {
-      return false;
-    }
+    return await this.enqueue(async () => {
+      const snapshot = this.readConnectionsSnapshot();
+      if (snapshot.revision !== expectedRevision) {
+        return false;
+      }
 
-    await configuration.update(
-      "connections",
-      connections,
-      vscode.ConfigurationTarget.Global,
-    );
-    return true;
+      const normalizedRevision = computeConnectionsRevision(
+        this.getNormalization(snapshot).connections,
+      );
+      await this.persistNormalization(snapshot);
+      const current = this.readConnectionsSnapshot();
+      if (
+        current.revision !== normalizedRevision ||
+        current.target !== snapshot.target
+      ) {
+        return false;
+      }
+      await vscode.workspace
+        .getConfiguration("rapidb")
+        .update("connections", connections, snapshot.target);
+      this.normalizedCache = undefined;
+      return true;
+    });
+  }
+
+  async mutateConnections<TResult>(
+    mutate: (
+      current: StoredConnectionConfig[],
+    ) =>
+      | ConnectionStoreMutation<TResult>
+      | Promise<ConnectionStoreMutation<TResult>>,
+  ): Promise<TResult> {
+    return await this.enqueue(async () => {
+      await this.persistNormalization(this.readConnectionsSnapshot());
+      const snapshot = this.readConnectionsSnapshot();
+      const normalized = this.getNormalization(snapshot);
+      const mutation = await mutate(
+        normalized.connections.map((connection) => ({ ...connection })),
+      );
+      let writeStarted = false;
+      try {
+        this.assertSnapshotCurrent(snapshot);
+        if (!mutation.connections) {
+          return mutation.result;
+        }
+        writeStarted = true;
+        await vscode.workspace
+          .getConfiguration("rapidb")
+          .update("connections", mutation.connections, snapshot.target);
+        this.normalizedCache = undefined;
+      } catch (writeError) {
+        const postFailureSnapshot = this.readConnectionsSnapshot();
+        if (
+          writeStarted &&
+          mutation.connections &&
+          postFailureSnapshot.target === snapshot.target &&
+          computeConnectionsRevision(mutation.connections) ===
+            postFailureSnapshot.revision
+        ) {
+          this.normalizedCache = undefined;
+          return mutation.result;
+        }
+        if (!mutation.rollback) {
+          throw writeError;
+        }
+        try {
+          await mutation.rollback();
+        } catch (rollbackError) {
+          throw new AggregateError(
+            [writeError, rollbackError],
+            "Connection settings write and rollback both failed.",
+          );
+        }
+        throw writeError;
+      }
+      return mutation.result;
+    });
   }
 
   readHistory(): HistoryEntry[] {
