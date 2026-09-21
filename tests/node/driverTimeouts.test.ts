@@ -85,10 +85,15 @@ describe("driver timeout helpers", () => {
       postgres as unknown as {
         activeQueryOperations: Set<{
           cancelled: boolean;
+          requestToken?: number;
           client?: typeof pgClient;
         }>;
       }
-    ).activeQueryOperations.add({ cancelled: false, client: pgClient });
+    ).activeQueryOperations.add({
+      cancelled: false,
+      requestToken: 41,
+      client: pgClient,
+    });
 
     const mysql = new MySQLDriver({
       id: "mysql-superseded-query",
@@ -103,17 +108,20 @@ describe("driver timeout helpers", () => {
       mysql as unknown as {
         activeQueryOperations: Set<{
           cancelled: boolean;
+          requestToken?: number;
           connection?: typeof mysqlConnection;
         }>;
       }
     ).activeQueryOperations.add({
       cancelled: false,
+      requestToken: 41,
       connection: mysqlConnection,
     });
 
     const context = {
       reason: "superseded" as const,
       operationName: "query",
+      requestToken: 41,
     };
     await postgres.cancelCurrentOperation(context);
     await mysql.cancelCurrentOperation(context);
@@ -196,11 +204,13 @@ describe("driver timeout helpers", () => {
     vi.useFakeTimers();
 
     const deferred = createDeferred<void>();
+    const disconnect = vi.fn(async () => undefined);
     const driver = createTimeoutAwareDriver(
       {
         async connect(): Promise<void> {
           return deferred.promise;
         },
+        disconnect,
         async listDatabases(): Promise<string[]> {
           return [];
         },
@@ -227,6 +237,12 @@ describe("driver timeout helpers", () => {
     await vi.advanceTimersByTimeAsync(10);
 
     await assertion;
+    expect(disconnect).toHaveBeenCalledTimes(1);
+
+    deferred.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(disconnect).toHaveBeenCalledTimes(2);
   });
 
   it("cancels the current operation when a database timeout fires", async () => {
@@ -238,7 +254,11 @@ describe("driver timeout helpers", () => {
     const driver = createTimeoutAwareDriver(
       {
         async connect(): Promise<void> {},
-        async listDatabases(): Promise<string[]> {
+        async query(
+          _sql: string,
+          _params?: unknown[],
+          _context?: { requestToken?: number },
+        ): Promise<string[]> {
           return deferred.promise;
         },
         async cancelCurrentOperation(context: {
@@ -265,7 +285,7 @@ describe("driver timeout helpers", () => {
       }),
     );
 
-    const pending = driver.listDatabases();
+    const pending = driver.query("select 1");
     const rejection =
       expect(pending).rejects.toBeInstanceOf(DriverTimeoutError);
 
@@ -273,37 +293,33 @@ describe("driver timeout helpers", () => {
 
     await rejection;
     expect(cancelCurrentOperation).toHaveBeenCalledTimes(1);
-    expect(recycleConnectionAfterTimeout).toHaveBeenCalledTimes(1);
+    expect(recycleConnectionAfterTimeout).not.toHaveBeenCalled();
     expect(cancelCurrentOperation).toHaveBeenCalledWith(
       expect.objectContaining({
         timeoutKind: "dbOperation",
-        operationName: "listDatabases",
-      }),
-    );
-    expect(recycleConnectionAfterTimeout).toHaveBeenCalledWith(
-      expect.objectContaining({
-        timeoutKind: "dbOperation",
-        operationName: "listDatabases",
+        operationName: "query",
       }),
     );
   });
 
-  it("waits for timeout cleanup hooks before surfacing timeout errors", async () => {
+  it("surfaces timeout errors without waiting for hanging cleanup", async () => {
     vi.useFakeTimers();
 
     const deferred = createDeferred<string[]>();
     const cleanupStarted = vi.fn();
-    const cleanupFinished = vi.fn();
     const driver = createTimeoutAwareDriver(
       {
         async connect(): Promise<void> {},
-        async listDatabases(): Promise<string[]> {
+        async query(
+          _sql: string,
+          _params?: unknown[],
+          _context?: { requestToken?: number },
+        ): Promise<string[]> {
           return deferred.promise;
         },
         async cancelCurrentOperation(): Promise<void> {
           cleanupStarted();
-          await Promise.resolve();
-          cleanupFinished();
+          await new Promise<void>(() => undefined);
         },
         quoteIdentifier(name: string): string {
           return name;
@@ -317,7 +333,7 @@ describe("driver timeout helpers", () => {
       }),
     );
 
-    const pending = driver.listDatabases();
+    const pending = driver.query("select 1");
     const assertion =
       expect(pending).rejects.toBeInstanceOf(DriverTimeoutError);
 
@@ -325,10 +341,9 @@ describe("driver timeout helpers", () => {
     expect(cleanupStarted).toHaveBeenCalledTimes(1);
 
     await assertion;
-    expect(cleanupFinished).toHaveBeenCalledTimes(1);
   });
 
-  it("recycles connection again when a timed-out operation settles late", async () => {
+  it("does not recycle the pool when a timed-out operation settles late", async () => {
     vi.useFakeTimers();
 
     const deferred = createDeferred<string[]>();
@@ -364,7 +379,40 @@ describe("driver timeout helpers", () => {
     await vi.runAllTimersAsync();
     await Promise.resolve();
 
-    expect(recycleConnectionAfterTimeout).toHaveBeenCalledTimes(2);
+    expect(recycleConnectionAfterTimeout).not.toHaveBeenCalled();
+  });
+
+  it("passes the query request token to targeted timeout cancellation", async () => {
+    vi.useFakeTimers();
+    const cancelCurrentOperation = vi.fn(async () => undefined);
+    const driver = createTimeoutAwareDriver(
+      {
+        async query(
+          _sql: string,
+          _params?: unknown[],
+          _context?: { requestToken?: number },
+        ): Promise<never> {
+          return new Promise(() => undefined);
+        },
+        cancelCurrentOperation,
+      },
+      () => ({
+        connectionTimeoutSeconds: 15,
+        dbOperationTimeoutSeconds: 1,
+        connectionTimeoutMs: 15000,
+        dbOperationTimeoutMs: 25,
+      }),
+    );
+
+    const pending = driver.query("select 1", undefined, { requestToken: 73 });
+    const rejection =
+      expect(pending).rejects.toBeInstanceOf(DriverTimeoutError);
+    await vi.advanceTimersByTimeAsync(25);
+    await rejection;
+
+    expect(cancelCurrentOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ operationName: "query", requestToken: 73 }),
+    );
   });
 
   it("clears the timeout timer when a wrapped method fails synchronously", async () => {

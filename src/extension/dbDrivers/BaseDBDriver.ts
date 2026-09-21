@@ -1101,6 +1101,12 @@ export abstract class BaseDBDriver implements IDBDriver {
   buildSetExpr(column: ColumnTypeMeta, _paramIndex: number): string {
     return `${this.quoteIdentifier(column.name)} = ?`;
   }
+  buildOriginalValueComparison(
+    column: ColumnTypeMeta,
+    paramIndex: number,
+  ): string {
+    return `${this.quoteIdentifier(column.name)} = ${this.buildInsertValueExpr(column, paramIndex)}`;
+  }
   protected formatPreviewSqlLiteral(value: unknown): string {
     return formatGenericPreviewSqlLiteral(value);
   }

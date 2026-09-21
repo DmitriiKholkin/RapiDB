@@ -66,6 +66,7 @@ export class ErdGraphService {
   private readonly cache = new Map<string, ErdGraph>();
   private readonly connectionGenerations = new Map<string, number>();
   private readonly connectionLifecycleGenerations = new Map<string, number>();
+  private readonly requestGenerations = new Map<string, number>();
   private schemaRefreshGeneration = 0;
   private readonly subscriptions: Disposable[];
   private readonly lifecycleAbortController = new AbortController();
@@ -99,6 +100,7 @@ export class ErdGraphService {
     this.cache.clear();
     this.connectionGenerations.clear();
     this.connectionLifecycleGenerations.clear();
+    this.requestGenerations.clear();
   }
 
   async getGraph(
@@ -114,6 +116,8 @@ export class ErdGraphService {
         return { graph: cached, fromCache: true };
       }
     }
+    const requestGeneration = (this.requestGenerations.get(cacheKey) ?? 0) + 1;
+    this.requestGenerations.set(cacheKey, requestGeneration);
 
     const connectionLifecycleGeneration =
       this.connectionLifecycleGenerations.get(normalized.connectionId) ?? 0;
@@ -139,7 +143,8 @@ export class ErdGraphService {
       connectionLifecycleGeneration !==
         (this.connectionLifecycleGenerations.get(normalized.connectionId) ??
           0) ||
-      schemaRefreshGeneration !== this.schemaRefreshGeneration
+      schemaRefreshGeneration !== this.schemaRefreshGeneration ||
+      requestGeneration !== this.requestGenerations.get(cacheKey)
     ) {
       throw new Error("Connection changed while the ERD was loading.");
     }
@@ -156,16 +161,17 @@ export class ErdGraphService {
   }
 
   private makeCacheKey(request: ErdGraphRequest): string {
-    return [
+    return JSON.stringify([
       request.connectionId,
-      request.database ?? "*",
-      request.schema ?? "*",
-    ].join("::");
+      request.database ?? null,
+      request.schema ?? null,
+    ]);
   }
 
   private invalidateConnection(connectionId: string): void {
     for (const key of this.cache.keys()) {
-      if (key.startsWith(`${connectionId}::`)) {
+      const parsed = JSON.parse(key) as [string, string | null, string | null];
+      if (parsed[0] === connectionId) {
         this.cache.delete(key);
       }
     }
@@ -208,15 +214,9 @@ export class ErdGraphService {
 
     const details = await pMapWithLimit(objects, 3, async (object) => {
       const [columns, foreignKeys, indexes] = await Promise.all([
-        driver
-          .describeColumns(object.database, object.schema, object.table)
-          .catch(() => []),
-        driver
-          .getForeignKeys(object.database, object.schema, object.table)
-          .catch(() => []),
-        driver
-          .getIndexes(object.database, object.schema, object.table)
-          .catch(() => []),
+        driver.describeColumns(object.database, object.schema, object.table),
+        driver.getForeignKeys(object.database, object.schema, object.table),
+        driver.getIndexes(object.database, object.schema, object.table),
       ]);
 
       return {
@@ -747,13 +747,13 @@ export class ErdGraphService {
           continue;
         }
 
-        const edgeId = [
+        const edgeId = JSON.stringify([
           fromTableId,
           toTableId,
           foreignKey.constraintName,
           foreignKey.column,
           foreignKey.referencedColumn,
-        ].join("::");
+        ]);
 
         if (seen.has(edgeId)) {
           continue;
@@ -779,7 +779,7 @@ export class ErdGraphService {
   }
 
   private tableId(database: string, schema: string, table: string): string {
-    return `${database}.${schema}.${table}`;
+    return JSON.stringify([database, schema, table]);
   }
 
   private collectUniqueColumns(indexes: IndexMeta[]): Set<string> {

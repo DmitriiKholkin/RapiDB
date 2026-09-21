@@ -81,6 +81,8 @@ export function useTableMutationController({
   const selectedRef = useRef(selected);
   const canEditRowsRef = useRef(canEditRows);
   const mutationPreviewRef = useRef(mutationPreview);
+  const operationSequenceRef = useRef(0);
+  const activeOperationIdRef = useRef<string | null>(null);
 
   // Refs for snapshot access inside callbacks that avoid re-creation
   const pendingEditsRef = useRef(pendingEdits);
@@ -106,6 +108,12 @@ export function useTableMutationController({
           ]),
         ),
         changes: Object.fromEntries(columnMap),
+        originalValues: Object.fromEntries(
+          [...columnMap.keys()].map((columnName) => [
+            columnName,
+            rowsRef.current[rowIdx][columnName],
+          ]),
+        ),
       }));
     },
     [pkColsRef, rowsRef],
@@ -119,8 +127,15 @@ export function useTableMutationController({
 
   const handleRowsCommitted = useCallback(
     (rows: readonly Row[], primaryKeyColumns: readonly string[]) => {
+      const restoreSource =
+        pendingRestoreRef.current ??
+        buildPendingRestoreState(
+          pendingEditsRef.current,
+          rowsRef.current,
+          primaryKeyColumns,
+        );
       const restoredPending = restorePendingEdits(
-        pendingRestoreRef.current,
+        restoreSource,
         rows,
         primaryKeyColumns,
       );
@@ -129,7 +144,7 @@ export function useTableMutationController({
       setPending(restoredPending);
       setEditCell(null);
     },
-    [],
+    [rowsRef],
   );
 
   const resetForTableInit = useCallback(() => {
@@ -146,12 +161,24 @@ export function useTableMutationController({
     setNewRows([]);
     setMutErr(null);
     setApplyStatus(null);
+    activeOperationIdRef.current = null;
   }, [clearApplyRequestState, history]);
 
   useEffect(() => {
     const unApply = onMessage<ApplyResultPayload>(
       "applyResult",
-      ({ success, error, warning, failedRows, rowOutcomes, insertApplied }) => {
+      ({
+        operationId,
+        success,
+        error,
+        warning,
+        failedRows,
+        rowOutcomes,
+        insertApplied,
+      }) => {
+        if (!operationId || operationId !== activeOperationIdRef.current)
+          return;
+        activeOperationIdRef.current = null;
         setApplying(false);
 
         if (success) {
@@ -204,7 +231,8 @@ export function useTableMutationController({
             tone: "error",
             message: insertApplied
               ? `${error ?? "Apply failed"}. Insert was applied, but update changes were not.`
-              : (error ?? "Apply failed — all changes were rolled back"),
+              : (error ??
+                "Apply failed. Refresh and verify the data before retrying."),
           });
         }
 
@@ -213,48 +241,60 @@ export function useTableMutationController({
       },
     );
 
-    const unInsert = onMessage<{ success: boolean; error?: string }>(
-      "insertResult",
-      ({ success, error }) => {
-        setInserting(false);
-        if (success) {
-          setNewRows([]);
-          setEditCell(null);
-          setMutErr(null);
+    const unInsert = onMessage<{
+      operationId: string;
+      success: boolean;
+      error?: string;
+    }>("insertResult", ({ operationId, success, error }) => {
+      if (operationId !== activeOperationIdRef.current) return;
+      activeOperationIdRef.current = null;
+      setInserting(false);
+      if (success) {
+        setNewRows([]);
+        setEditCell(null);
+        setMutErr(null);
 
-          if (applyRowIndexesRef.current.length > 0) {
-            const updates = buildPendingUpdatesPayload(
-              applyPendingSnapshotRef.current,
-            );
-            postMessage("applyChanges", { updates });
-            return;
-          }
-
-          setApplying(false);
-          fetchPageRef.current();
-        } else {
-          setApplying(false);
-          setMutErr(error ?? "Insert failed");
+        if (applyRowIndexesRef.current.length > 0) {
+          const updates = buildPendingUpdatesPayload(
+            applyPendingSnapshotRef.current,
+          );
+          const nextOperationId = `table-mutation:${++operationSequenceRef.current}`;
+          activeOperationIdRef.current = nextOperationId;
+          postMessage("applyChanges", {
+            operationId: nextOperationId,
+            updates,
+          });
+          return;
         }
-      },
-    );
 
-    const unDelete = onMessage<{ success: boolean; error?: string }>(
-      "deleteResult",
-      ({ success, error }) => {
-        setDeleting(false);
-        if (success) {
-          setMutErr(null);
-          fetchPageRef.current();
-        } else {
-          setMutErr(error ?? "Delete failed");
-        }
-      },
-    );
+        setApplying(false);
+        fetchPageRef.current();
+      } else {
+        setApplying(false);
+        setMutErr(error ?? "Insert failed");
+      }
+    });
+
+    const unDelete = onMessage<{
+      operationId: string;
+      success: boolean;
+      error?: string;
+    }>("deleteResult", ({ operationId, success, error }) => {
+      if (operationId !== activeOperationIdRef.current) return;
+      activeOperationIdRef.current = null;
+      setDeleting(false);
+      if (success) {
+        setMutErr(null);
+        fetchPageRef.current();
+      } else {
+        setMutErr(error ?? "Delete failed");
+      }
+    });
 
     const unMutationPreview = onMessage<TableMutationPreviewPayload>(
       "tableMutationPreview",
       (payload) => {
+        if (payload.operationId !== activeOperationIdRef.current) return;
         setMutationPreview(payload);
       },
     );
@@ -293,7 +333,11 @@ export function useTableMutationController({
       setDeleting(false);
     }
 
-    postMessage("cancelMutationPreview", { previewToken });
+    postMessage("cancelMutationPreview", {
+      operationId: preview.operationId,
+      previewToken,
+    });
+    activeOperationIdRef.current = null;
   }, [clearApplyRequestState]);
 
   const confirmMutationPreview = useCallback(() => {
@@ -304,6 +348,7 @@ export function useTableMutationController({
 
     setMutationPreview(null);
     postMessage("confirmMutationPreview", {
+      operationId: preview.operationId,
       previewToken: preview.previewToken,
     });
   }, []);
@@ -329,6 +374,7 @@ export function useTableMutationController({
   }, [cancelMutationPreview, mutationPreview]);
 
   const startInsertRow = useCallback(() => {
+    if (applying || inserting || deleting) return;
     if (newRowsRef.current.length >= MAX_DRAFT_ROWS) return;
     history.push(
       buildUndoRedoSnapshot(pendingEditsRef.current, newRowsRef.current, null),
@@ -336,7 +382,7 @@ export function useTableMutationController({
     setNewRows((prev) => [createInsertDraft(columnsRef.current), ...prev]);
     setEditCell(null);
     setMutErr(null);
-  }, [columnsRef, history]);
+  }, [applying, columnsRef, deleting, history, inserting]);
 
   const applyChanges = useCallback(() => {
     const unsavedRowCount = pendingEdits.size + newRows.length;
@@ -350,12 +396,15 @@ export function useTableMutationController({
     setApplying(true);
     setApplyStatus(null);
     setMutErr(null);
+    const operationId = `table-mutation:${++operationSequenceRef.current}`;
+    activeOperationIdRef.current = operationId;
 
     const updates = buildPendingUpdatesPayload(pendingEdits);
     const insertValues = newRows
       .map(buildInsertValues)
       .filter((v) => Object.keys(v).length > 0);
     postMessage("applyChanges", {
+      operationId,
       updates,
       ...(insertValues.length > 0 ? { insertValues } : {}),
     });
@@ -826,7 +875,9 @@ export function useTableMutationController({
     if (
       selectedRef.current.size === 0 ||
       pkColsRef.current.length === 0 ||
-      deleting
+      deleting ||
+      applying ||
+      inserting
     ) {
       return;
     }
@@ -839,8 +890,10 @@ export function useTableMutationController({
     });
 
     setDeleting(true);
-    postMessage("deleteRows", { primaryKeysList: toDelete });
-  }, [deleting, pkColsRef, rowsRef]);
+    const operationId = `table-mutation:${++operationSequenceRef.current}`;
+    activeOperationIdRef.current = operationId;
+    postMessage("deleteRows", { operationId, primaryKeysList: toDelete });
+  }, [applying, deleting, inserting, pkColsRef, rowsRef]);
 
   const undoAction = useCallback(() => {
     if (applying || inserting || deleting) return;
@@ -942,5 +995,11 @@ export function useTableMutationController({
     redoAction,
     canUndo: history.canUndo,
     canRedo: history.canRedo,
+    blockNavigationWithUnsavedChanges: () =>
+      setApplyStatus({
+        tone: "warning",
+        message:
+          "Apply or revert pending changes before loading different rows.",
+      }),
   };
 }

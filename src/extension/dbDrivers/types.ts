@@ -4,6 +4,7 @@ import type {
   DdlOnlyDbObjectKind,
 } from "../../shared/dbObjectKinds";
 import { DB_OBJECT_KINDS } from "../../shared/dbObjectKinds";
+import type { OperationCancellationContext } from "../../shared/safetyContracts";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -168,6 +169,7 @@ export interface DriverUpdateRowsRequest {
   updates: Array<{
     primaryKeys: Record<string, unknown>;
     changes: Record<string, unknown>;
+    originalValues?: Record<string, unknown>;
   }>;
 }
 
@@ -201,17 +203,16 @@ export interface PersistedEditCheckResult {
   message?: string;
 }
 export interface IDBDriver {
+  readonly supportsAtomicUpdateRows?: boolean;
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   isConnected(): boolean;
-  cancelCurrentOperation?(context?: {
-    timeoutKind?: "connection" | "dbOperation";
-    operationName?: string;
-  }): Promise<void> | void;
-  recycleConnectionAfterTimeout?(context?: {
-    timeoutKind?: "connection" | "dbOperation";
-    operationName?: string;
-  }): Promise<void> | void;
+  cancelCurrentOperation?(
+    context?: OperationCancellationContext,
+  ): Promise<void> | void;
+  recycleConnectionAfterTimeout?(
+    context?: OperationCancellationContext,
+  ): Promise<void> | void;
   getEntityManifest?(): DriverEntityManifest;
   getCapabilities?(): DriverCapabilities;
   listDatabases(): Promise<DatabaseInfo[]>;
@@ -286,7 +287,7 @@ export interface IDBDriver {
   query(
     sql: string,
     params?: unknown[],
-    operationContext?: { requestToken?: number },
+    operationContext?: { requestToken?: number; readOnly?: boolean },
   ): Promise<QueryResult>;
   readTablePage?(
     request: DriverTablePageRequest,
@@ -302,6 +303,7 @@ export interface IDBDriver {
     data: {
       primaryKeys?: Record<string, unknown>;
       changes?: Record<string, unknown>;
+      originalValues?: Record<string, unknown>;
       values?: Record<string, unknown>;
       primaryKeyValuesList?: Array<Record<string, unknown>>;
     },
@@ -314,11 +316,15 @@ export interface IDBDriver {
     data: {
       primaryKeys?: Record<string, unknown>;
       changes?: Record<string, unknown>;
+      originalValues?: Record<string, unknown>;
       values?: Record<string, unknown>;
       primaryKeyValuesList?: Array<Record<string, unknown>>;
     },
   ): Promise<string[]>;
-  runTransaction(operations: TransactionOperation[]): Promise<void>;
+  runTransaction(
+    operations: TransactionOperation[],
+    context?: TransactionContext,
+  ): Promise<void>;
   getMutationAtomicityRisk?(
     database: string,
     schema: string,
@@ -333,6 +339,11 @@ export interface IDBDriver {
   ): PaginationResult;
   buildOrderByDefault(cols: ColumnTypeMeta[]): string;
   coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown;
+  coerceOriginalValue?(value: unknown, column: ColumnTypeMeta): unknown;
+  buildOriginalValueComparison?(
+    column: ColumnTypeMeta,
+    paramIndex: number,
+  ): string;
   formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown;
   checkPersistedEdit(
     column: ColumnTypeMeta,
@@ -358,6 +369,11 @@ export interface IDBDriver {
   buildSetExpr(column: ColumnTypeMeta, paramIndex: number): string;
   materializePreviewSql(sql: string, params?: readonly unknown[]): string;
 }
+export interface TransactionContext {
+  signal: AbortSignal;
+  deadline: number;
+}
+
 export interface TransactionOperation {
   sql: string;
   params?: unknown[];

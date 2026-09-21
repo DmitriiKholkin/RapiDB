@@ -435,7 +435,12 @@ export class ConnectionProvider
   }
 
   async toggleConnectedOnly(): Promise<void> {
-    this._connectedOnlyMode = !this._connectedOnlyMode;
+    await this.setConnectedOnly(!this._connectedOnlyMode);
+  }
+
+  async setConnectedOnly(enabled: boolean): Promise<void> {
+    if (this._connectedOnlyMode === enabled) return;
+    this._connectedOnlyMode = enabled;
     await vscode.commands.executeCommand(
       "setContext",
       "rapidb.connectedOnlyMode",

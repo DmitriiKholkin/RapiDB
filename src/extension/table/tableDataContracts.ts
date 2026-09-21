@@ -16,6 +16,7 @@ export interface TablePage {
 export interface RowUpdate {
   primaryKeys: Record<string, unknown>;
   changes: Record<string, unknown>;
+  originalValues?: Record<string, unknown>;
 }
 
 export type ApplyResult = ApplyResultPayload;

@@ -340,7 +340,7 @@ export function registerTableServiceIntegrationTests(
       expect(rowsFromQuery(compositeResult)).toHaveLength(0);
     });
 
-    it("fails when insert or delete cannot be verified", async () => {
+    it("accepts reported inserts and fails when delete cannot be verified", async () => {
       const probeId = 970_000 + Math.floor(Math.random() * 10_000);
       const tableName = fixtureTableName(engineId, "transactionProbe");
       const columns = await readService.getColumns(
@@ -394,7 +394,7 @@ export function registerTableServiceIntegrationTests(
 
       await expect(
         strictMutationService.executePreparedInsertPlan(plan),
-      ).rejects.toThrow(/insert verification failed/i);
+      ).resolves.toBeUndefined();
 
       await mutationService.insertRow(
         connectionId,

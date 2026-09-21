@@ -206,6 +206,7 @@ describe("ElasticsearchDriver — metadata and pages", () => {
       query: { match_all: {} },
       sort: ["_doc"],
       size: ELASTICSEARCH_READ_BUDGET.hardCap,
+      track_total_hits: true,
     });
     expect(getMapping).not.toHaveBeenCalled();
   });
@@ -584,5 +585,64 @@ describe("ElasticsearchDriver — metadata and pages", () => {
     ).toBe(
       'PUT /users/_doc/doc-3?refresh=wait_for\n{\n  "created_at": "2026-04-01T09:00:00.123+00:00"\n}',
     );
+  });
+
+  it("uses an atomic original-source condition for table updates", async () => {
+    const { driver, update } = createDriver();
+
+    await expect(
+      driver.updateRows({
+        database: "default",
+        schema: "indices",
+        table: "users",
+        updates: [
+          {
+            primaryKeys: { _id: "doc-3" },
+            changes: { _source: '{"active":false}' },
+            originalValues: { _source: '{"active":true}' },
+          },
+        ],
+      }),
+    ).resolves.toEqual({ affectedRows: 1 });
+
+    expect(update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "doc-3",
+        script: expect.objectContaining({
+          params: {
+            original: { active: true },
+            next: { active: false },
+          },
+        }),
+      }),
+    );
+  });
+
+  it("supports updates without an original snapshot for legacy callers", async () => {
+    const { driver, update, index } = createDriver();
+
+    await expect(
+      driver.updateRows({
+        database: "default",
+        schema: "indices",
+        table: "users",
+        updates: [
+          {
+            primaryKeys: { _id: "doc-3" },
+            changes: {
+              _source: '{"active":false}',
+            },
+          },
+        ],
+      }),
+    ).resolves.toEqual({ affectedRows: 1 });
+
+    expect(index).toHaveBeenCalledWith({
+      index: "users",
+      id: "doc-3",
+      document: { active: false },
+      refresh: "wait_for",
+    });
+    expect(update).not.toHaveBeenCalled();
   });
 });

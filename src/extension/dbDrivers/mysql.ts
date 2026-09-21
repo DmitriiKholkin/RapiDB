@@ -15,7 +15,10 @@ import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
 import { buildWhere } from "../table/filterSql";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
-import type { DriverTimeoutSettingsProvider } from "./timeout";
+import {
+  type DriverTimeoutSettingsProvider,
+  throwIfTransactionCancelled,
+} from "./timeout";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -138,7 +141,14 @@ export function splitMySQLScript(sql: string): string[] {
       continue;
     }
     if (consumeKeyword("BEGIN")) {
-      compoundDepth++;
+      if (
+        compoundDepth > 0 ||
+        /^\s*CREATE\s+(?:DEFINER\s*=\s*\S+\s+)?(?:PROCEDURE|FUNCTION|TRIGGER|EVENT)\b/i.test(
+          buf,
+        )
+      ) {
+        compoundDepth++;
+      }
       continue;
     }
     if (consumeKeyword("CASE")) {
@@ -1133,11 +1143,11 @@ export class MySQLDriver extends BaseDBDriver {
     context?: OperationCancellationContext,
   ): Promise<void> {
     if (context?.operationName === "query") {
+      if (context.requestToken === undefined) {
+        return;
+      }
       for (const operation of this.activeQueryOperations) {
-        if (
-          context.requestToken !== undefined &&
-          operation.requestToken !== context.requestToken
-        ) {
+        if (operation.requestToken !== context.requestToken) {
           continue;
         }
         operation.cancelled = true;
@@ -1381,39 +1391,82 @@ export class MySQLDriver extends BaseDBDriver {
   async query(
     sql: string,
     params?: unknown[],
-    operationContext?: { requestToken?: number },
+    operationContext?: { requestToken?: number; readOnly?: boolean },
   ): Promise<QueryResult> {
     const start = Date.now();
     if (params && params.length > 0) {
-      return this.withTrackedQueryConnection(async (connection) => {
-        const [rawRows, fields] = await this.queryArrayRows(connection, {
-          sql,
-          values: params as QueryOptions["values"],
-        });
-        return this._parseQueryResult(rawRows, fields, Date.now() - start);
-      }, operationContext);
+      return this.withTrackedQueryConnection(
+        (connection) =>
+          this.withReadOnlyTransaction(
+            connection,
+            operationContext,
+            async () => {
+              const [rawRows, fields] = await this.queryArrayRows(connection, {
+                sql,
+                values: params as QueryOptions["values"],
+              });
+              return this._parseQueryResult(
+                rawRows,
+                fields,
+                Date.now() - start,
+              );
+            },
+          ),
+        operationContext,
+      );
     }
     const stmts = splitMySQLScript(sql);
     if (stmts.length === 0) {
       return { columns: [], rows: [], rowCount: 0, executionTimeMs: 0 };
     }
     if (stmts.length === 1) {
-      return this.withTrackedQueryConnection(async (connection) => {
-        const [rawRows, fields] = await this.queryArrayRows(connection, {
-          sql: stmts[0],
-        });
-        return this._parseQueryResult(rawRows, fields, Date.now() - start);
-      }, operationContext);
+      return this.withTrackedQueryConnection(
+        (connection) =>
+          this.withReadOnlyTransaction(
+            connection,
+            operationContext,
+            async () => {
+              const [rawRows, fields] = await this.queryArrayRows(connection, {
+                sql: stmts[0],
+              });
+              return this._parseQueryResult(
+                rawRows,
+                fields,
+                Date.now() - start,
+              );
+            },
+          ),
+        operationContext,
+      );
     }
     return this.withTrackedQueryConnection(
-      (connection) => this._executeScript(connection, stmts, start),
+      (connection) =>
+        this.withReadOnlyTransaction(connection, operationContext, () =>
+          this._executeScript(connection, stmts, start),
+        ),
       operationContext,
     );
   }
 
+  private async withReadOnlyTransaction<T>(
+    connection: PoolConnection,
+    operationContext: { readOnly?: boolean } | undefined,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    if (!operationContext?.readOnly) {
+      return operation();
+    }
+    await connection.query("START TRANSACTION READ ONLY");
+    try {
+      return await operation();
+    } finally {
+      await connection.query("ROLLBACK").catch(() => undefined);
+    }
+  }
+
   private async withTrackedQueryConnection<T>(
     operation: (connection: PoolConnection) => Promise<T>,
-    operationContext?: { requestToken?: number },
+    operationContext?: { requestToken?: number; readOnly?: boolean },
   ): Promise<T> {
     const queryOperation: MysqlQueryOperation = {
       cancelled: false,
@@ -1491,7 +1544,20 @@ export class MySQLDriver extends BaseDBDriver {
       .join(", ");
     const offset = (request.page - 1) * request.pageSize;
     const orderByClause = request.sort
-      ? `ORDER BY ${this.quoteIdentifier(request.sort.column)} ${request.sort.direction === "desc" ? "DESC" : "ASC"}`
+      ? `ORDER BY ${[
+          `${this.quoteIdentifier(request.sort.column)} ${request.sort.direction === "desc" ? "DESC" : "ASC"}`,
+          ...columns
+            .filter(
+              (column) =>
+                column.isPrimaryKey && column.name !== request.sort?.column,
+            )
+            .sort(
+              (left, right) =>
+                (left.primaryKeyOrdinal ?? Number.MAX_SAFE_INTEGER) -
+                (right.primaryKeyOrdinal ?? Number.MAX_SAFE_INTEGER),
+            )
+            .map((column) => `${this.quoteIdentifier(column.name)} ASC`),
+        ].join(", ")}`
       : this.buildOrderByDefault(columns);
 
     let totalCount = 0;
@@ -1935,12 +2001,20 @@ export class MySQLDriver extends BaseDBDriver {
   }
   async runTransaction(
     operations: import("./types").TransactionOperation[],
+    context?: import("./types").TransactionContext,
   ): Promise<void> {
+    throwIfTransactionCancelled(context);
     const conn = await this.requirePool().getConnection();
     this.activeTransactionConnections.add(conn);
+    const cancel = () => {
+      if (this.activeTransactionConnections.delete(conn)) conn.destroy();
+    };
+    context?.signal.addEventListener("abort", cancel, { once: true });
     try {
+      throwIfTransactionCancelled(context);
       await conn.beginTransaction();
       for (const op of operations) {
+        throwIfTransactionCancelled(context);
         const [rows] = await conn.query<ResultSetHeader>(
           this.createQueryOptions(op.sql, op.params as QueryOptions["values"]),
         );
@@ -1953,11 +2027,13 @@ export class MySQLDriver extends BaseDBDriver {
           }
         }
       }
+      throwIfTransactionCancelled(context);
       await conn.commit();
     } catch (e) {
       await conn.rollback().catch(() => undefined);
       throw e;
     } finally {
+      context?.signal.removeEventListener("abort", cancel);
       if (this.activeTransactionConnections.delete(conn)) {
         conn.release();
       }
@@ -2111,6 +2187,18 @@ export class MySQLDriver extends BaseDBDriver {
   }
   override buildSetExpr(column: ColumnTypeMeta, _paramIndex: number): string {
     return `${this.quoteIdentifier(column.name)} = ${this.buildInsertValueExpr(column, _paramIndex)}`;
+  }
+  override buildOriginalValueComparison(
+    column: ColumnTypeMeta,
+    paramIndex: number,
+  ): string {
+    const name = this.quoteIdentifier(column.name);
+    if (column.category === "json") return `${name} = CAST(? AS JSON)`;
+    if (column.category === "spatial")
+      return `ST_AsBinary(${name}) = ST_AsBinary(ST_GeomFromText(?))`;
+    if (column.category === "text")
+      return `CAST(${name} AS BINARY) = CAST(? AS BINARY)`;
+    return super.buildOriginalValueComparison(column, paramIndex);
   }
   protected override coerceBooleanTrue(): unknown {
     return 1;

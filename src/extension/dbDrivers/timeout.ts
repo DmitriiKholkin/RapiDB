@@ -1,4 +1,5 @@
 import type { OperationCancellationContext } from "../../shared/safetyContracts";
+import type { TransactionContext } from "./types";
 
 export const CONNECTION_TIMEOUT_SECONDS_DEFAULT = 15;
 export const DB_OPERATION_TIMEOUT_SECONDS_DEFAULT = 180;
@@ -33,7 +34,7 @@ export class DriverTimeoutError extends Error {
         ? "Database connection"
         : "Database operation";
     super(
-      `${operationLabel} timed out after ${timeoutSeconds} second(s) while running ${operationName}.`,
+      `${operationLabel} timed out after ${timeoutSeconds} second(s) while running ${operationName}.${operationName === "runTransaction" ? " Transaction outcome may be unknown. Refresh and verify the data before retrying." : ""}`,
     );
     this.name = "DriverTimeoutError";
     this.timeoutKind = timeoutKind;
@@ -43,12 +44,34 @@ export class DriverTimeoutError extends Error {
 }
 
 interface TimeoutAwareDriverHooks {
+  disconnect?(): void | Promise<void>;
   cancelCurrentOperation?(
     context: OperationCancellationContext,
   ): void | Promise<void>;
-  recycleConnectionAfterTimeout?(
-    context: OperationCancellationContext,
-  ): void | Promise<void>;
+}
+
+const TIMEOUT_CLEANUP_BUDGET_MS = 1_000;
+let nextInternalQueryRequestToken = 0;
+
+export function throwIfTransactionCancelled(
+  context?: TransactionContext,
+): void {
+  context?.signal.throwIfAborted();
+  if (context && Date.now() >= context.deadline) {
+    throw new Error(
+      "Transaction deadline exceeded. Refresh and verify the data before retrying.",
+    );
+  }
+}
+
+function runBoundedCleanup(cleanup: () => void | Promise<void>): void {
+  void Promise.race([
+    Promise.resolve().then(cleanup),
+    new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, TIMEOUT_CLEANUP_BUDGET_MS);
+      timer.unref?.();
+    }),
+  ]).catch(() => undefined);
 }
 
 const CONNECT_METHODS = new Set(["connect"]);
@@ -144,6 +167,7 @@ async function withDriverTimeout<T>(
     timeoutKind: DriverTimeoutKind;
     operationName: string;
     timeoutSettingsProvider: DriverTimeoutSettingsProvider;
+    onDeadline?: () => void;
     onTimeout?: () => void | Promise<void>;
     onLateSettlementAfterTimeout?: () => void | Promise<void>;
   },
@@ -168,17 +192,17 @@ async function withDriverTimeout<T>(
       settled = true;
       timedOut = true;
       clearTimeout(timer);
-      void Promise.resolve(options.onTimeout?.())
-        .catch(() => undefined)
-        .finally(() => {
-          reject(
-            new DriverTimeoutError(
-              options.timeoutKind,
-              options.operationName,
-              timeoutMs,
-            ),
-          );
-        });
+      options.onDeadline?.();
+      reject(
+        new DriverTimeoutError(
+          options.timeoutKind,
+          options.operationName,
+          timeoutMs,
+        ),
+      );
+      if (options.onTimeout) {
+        runBoundedCleanup(options.onTimeout);
+      }
     }, timeoutMs);
 
     let pendingPromise: Promise<T>;
@@ -247,50 +271,84 @@ export function createTimeoutAwareDriver<T extends object>(
         return cached;
       }
 
-      const wrapped = (...args: unknown[]) =>
-        withDriverTimeout(
+      const wrapped = (...args: unknown[]) => {
+        const transactionAbort =
+          property === "runTransaction" ? new AbortController() : undefined;
+        if (transactionAbort) {
+          const timeoutMs = timeoutSettingsProvider().dbOperationTimeoutMs;
+          const supplied = args[1] as TransactionContext | undefined;
+          args[1] = {
+            signal: supplied
+              ? AbortSignal.any([supplied.signal, transactionAbort.signal])
+              : transactionAbort.signal,
+            deadline: Math.min(
+              supplied?.deadline ?? Infinity,
+              timeoutMs > 0 ? Date.now() + timeoutMs : Infinity,
+            ),
+          } satisfies TransactionContext;
+        }
+        if (property === "query") {
+          const operationContext =
+            typeof args[2] === "object" && args[2] !== null
+              ? (args[2] as { requestToken?: number })
+              : {};
+          if (operationContext.requestToken === undefined) {
+            operationContext.requestToken = --nextInternalQueryRequestToken;
+          }
+          args[2] = operationContext;
+        }
+        return withDriverTimeout(
           () => Reflect.apply(value, target, args) as Promise<unknown>,
           {
             timeoutKind,
             operationName: property,
             timeoutSettingsProvider,
-            onTimeout: async () => {
+            onDeadline: () =>
+              transactionAbort?.abort(
+                new Error(
+                  "Transaction cancelled after timeout; its outcome may be unknown. Refresh before retrying.",
+                ),
+              ),
+            onTimeout: () => {
               const timeoutHooks = target as TimeoutAwareDriverHooks;
+              const operationContext =
+                property === "query" &&
+                typeof args[2] === "object" &&
+                args[2] !== null
+                  ? (args[2] as { requestToken?: number })
+                  : undefined;
               const timeoutContext: OperationCancellationContext = {
                 reason: "timeout",
                 timeoutKind,
                 operationName: property,
+                requestToken: operationContext?.requestToken,
               };
 
-              if (typeof timeoutHooks.cancelCurrentOperation === "function") {
-                await timeoutHooks.cancelCurrentOperation(timeoutContext);
-              }
-
               if (
-                typeof timeoutHooks.recycleConnectionAfterTimeout === "function"
+                property === "query" &&
+                typeof timeoutHooks.cancelCurrentOperation === "function"
               ) {
-                await timeoutHooks.recycleConnectionAfterTimeout(
-                  timeoutContext,
-                );
+                return timeoutHooks.cancelCurrentOperation(timeoutContext);
+              }
+              if (
+                property === "connect" &&
+                typeof timeoutHooks.disconnect === "function"
+              ) {
+                return timeoutHooks.disconnect();
               }
             },
-            onLateSettlementAfterTimeout: async () => {
+            onLateSettlementAfterTimeout: () => {
               const timeoutHooks = target as TimeoutAwareDriverHooks;
               if (
-                typeof timeoutHooks.recycleConnectionAfterTimeout !== "function"
+                property === "connect" &&
+                typeof timeoutHooks.disconnect === "function"
               ) {
-                return;
+                return timeoutHooks.disconnect();
               }
-
-              const timeoutContext: OperationCancellationContext = {
-                reason: "late_settlement_after_timeout",
-                timeoutKind,
-                operationName: property,
-              };
-              await timeoutHooks.recycleConnectionAfterTimeout(timeoutContext);
             },
           },
         );
+      };
 
       wrappedMethods.set(property, wrapped);
       return wrapped;

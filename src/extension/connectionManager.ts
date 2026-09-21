@@ -750,6 +750,8 @@ export class ConnectionManager
     Set<SchemaScopeKey>
   >();
   private readonly _connectionEpochMap = new Map<string, number>();
+  private _historyMutationTail: Promise<void> = Promise.resolve();
+  private _bookmarkMutationTail: Promise<void> = Promise.resolve();
   private _pendingSecretMigration: Promise<void> | null = null;
   private _disposed = false;
   constructor(
@@ -791,19 +793,43 @@ export class ConnectionManager
     return this.store.getSkipTableMutationPreview();
   }
   private async _trimHistoryToLimit(): Promise<void> {
-    const limit = this.getHistoryLimit();
-    const all = this.store.readHistory();
-    if (limit === 0) {
-      if (all.length > 0) {
-        await this.store.writeHistory([]);
+    await this._enqueueHistoryMutation(async () => {
+      const limit = this.getHistoryLimit();
+      const all = this.store.readHistory();
+      if (limit === 0) {
+        if (all.length > 0) {
+          await this.store.writeHistory([]);
+          this._onDidChangeHistory.fire();
+        }
+        return;
+      }
+      if (all.length > limit) {
+        await this.store.writeHistory(all.slice(0, limit));
         this._onDidChangeHistory.fire();
       }
-      return;
-    }
-    if (all.length > limit) {
-      await this.store.writeHistory(all.slice(0, limit));
-      this._onDidChangeHistory.fire();
-    }
+    });
+  }
+
+  private async _enqueueHistoryMutation<T>(
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const run = this._historyMutationTail.then(operation, operation);
+    this._historyMutationTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return await run;
+  }
+
+  private async _enqueueBookmarkMutation<T>(
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const run = this._bookmarkMutationTail.then(operation, operation);
+    this._bookmarkMutationTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return await run;
   }
 
   private _assertNotDisposed(): void {
@@ -1240,11 +1266,13 @@ export class ConnectionManager
   private async _purgeHistoryForConnection(
     connectionId: string,
   ): Promise<void> {
-    await this._purgeEntriesForConnection(
-      connectionId,
-      () => this.store.readHistory(),
-      (entries) => this.store.writeHistory(entries),
-      () => this._onDidChangeHistory.fire(),
+    await this._enqueueHistoryMutation(() =>
+      this._purgeEntriesForConnection(
+        connectionId,
+        () => this.store.readHistory(),
+        (entries) => this.store.writeHistory(entries),
+        () => this._onDidChangeHistory.fire(),
+      ),
     );
   }
   private createDriver(config: ConnectionConfig): IDBDriver {
@@ -1812,7 +1840,10 @@ export class ConnectionManager
     this._onDidChangeConnections.fire();
   }
 
-  private async disconnectRegisteredDriver(id: string): Promise<boolean> {
+  private async disconnectRegisteredDriver(
+    id: string,
+    preserveConnectingAttempt = false,
+  ): Promise<boolean> {
     const hadDriver = this.driverMap.has(id);
     const driver = this.driverMap.get(id);
     if (driver) {
@@ -1821,7 +1852,7 @@ export class ConnectionManager
       } catch {}
     }
 
-    await this._cleanupConnectionRuntimeState(id);
+    await this._cleanupConnectionRuntimeState(id, preserveConnectingAttempt);
     return hadDriver;
   }
 
@@ -1852,7 +1883,8 @@ export class ConnectionManager
     void (async () => {
       try {
         if (this.driverMap.has(id)) {
-          await this.disconnectFrom(id);
+          const hadDriver = await this.disconnectRegisteredDriver(id, true);
+          if (hadDriver) this._onDidDisconnect.fire(id);
         }
         const config = this.getConnection(id);
         if (!config) {
@@ -1899,7 +1931,9 @@ export class ConnectionManager
           rejectAttempt(err);
         }
       } finally {
-        this._connectAbortControllerMap.delete(id);
+        if (this._connectAbortControllerMap.get(id) === ac) {
+          this._connectAbortControllerMap.delete(id);
+        }
         this.finalizeConnectAttempt(id, connectEpoch);
       }
     })();
@@ -2417,10 +2451,13 @@ export class ConnectionManager
 
   private async _cleanupConnectionRuntimeState(
     connectionId: string,
+    preserveConnectingAttempt = false,
   ): Promise<void> {
     await this._disposeSshRuntime(connectionId);
     this.driverMap.delete(connectionId);
-    this._connectingMap.delete(connectionId);
+    if (!preserveConnectingAttempt) {
+      this._connectingMap.delete(connectionId);
+    }
     this.invalidateDriverStaticMetadata(connectionId);
     this._schemaCacheMap.delete(connectionId);
     this._schemaGenerationMap.delete(connectionId);
@@ -3314,28 +3351,27 @@ export class ConnectionManager
     if (this.getHistoryLimit() === 0) {
       return;
     }
-    const all = this.store.readHistory();
-    const latest = all[0];
-    if (
-      latest &&
-      latest.sql === trimmed &&
-      latest.connectionId === connectionId
-    ) {
-      return;
-    }
-    const entry: HistoryEntry = {
-      id: randomUUID(),
-      sql: trimmed,
-      connectionId,
-      executedAt: new Date().toISOString(),
-    };
-    const updated = [entry, ...all].slice(0, this.getHistoryLimit());
-    await this.store.writeHistory(updated);
-    this._onDidChangeHistory.fire();
+    await this._enqueueHistoryMutation(async () => {
+      const all = this.store.readHistory();
+      const latest = all[0];
+      if (latest?.sql === trimmed && latest.connectionId === connectionId)
+        return;
+      const entry: HistoryEntry = {
+        id: randomUUID(),
+        sql: trimmed,
+        connectionId,
+        executedAt: new Date().toISOString(),
+      };
+      const updated = [entry, ...all].slice(0, this.getHistoryLimit());
+      await this.store.writeHistory(updated);
+      this._onDidChangeHistory.fire();
+    });
   }
   async clearHistory(): Promise<void> {
-    await this.store.writeHistory([]);
-    this._onDidChangeHistory.fire();
+    await this._enqueueHistoryMutation(async () => {
+      await this.store.writeHistory([]);
+      this._onDidChangeHistory.fire();
+    });
   }
   getBookmarks(connectionId?: string): BookmarkEntry[] {
     const all = this.store.readBookmarks();
@@ -3355,34 +3391,40 @@ export class ConnectionManager
       connectionId,
       savedAt: new Date().toISOString(),
     };
-    const all = this.store.readBookmarks();
-    await this.store.writeBookmarks([entry, ...all]);
-    this._onDidChangeBookmarks.fire();
-    return entry;
+    return await this._enqueueBookmarkMutation(async () => {
+      const all = this.store.readBookmarks();
+      await this.store.writeBookmarks([entry, ...all]);
+      this._onDidChangeBookmarks.fire();
+      return entry;
+    });
   }
   async removeBookmark(id: string): Promise<boolean> {
-    const all = this.store.readBookmarks();
-    if (!all.some((bookmark) => bookmark.id === id)) {
-      return false;
-    }
-    await this.store.writeBookmarks(
-      all.filter((bookmark) => bookmark.id !== id),
-    );
-    this._onDidChangeBookmarks.fire();
-    return true;
+    return await this._enqueueBookmarkMutation(async () => {
+      const all = this.store.readBookmarks();
+      if (!all.some((bookmark) => bookmark.id === id)) return false;
+      await this.store.writeBookmarks(
+        all.filter((bookmark) => bookmark.id !== id),
+      );
+      this._onDidChangeBookmarks.fire();
+      return true;
+    });
   }
   private async _purgeBookmarksForConnection(
     connectionId: string,
   ): Promise<void> {
-    await this._purgeEntriesForConnection(
-      connectionId,
-      () => this.store.readBookmarks(),
-      (entries) => this.store.writeBookmarks(entries),
-      () => this._onDidChangeBookmarks.fire(),
+    await this._enqueueBookmarkMutation(() =>
+      this._purgeEntriesForConnection(
+        connectionId,
+        () => this.store.readBookmarks(),
+        (entries) => this.store.writeBookmarks(entries),
+        () => this._onDidChangeBookmarks.fire(),
+      ),
     );
   }
   async clearBookmarks(): Promise<void> {
-    await this.store.writeBookmarks([]);
-    this._onDidChangeBookmarks.fire();
+    await this._enqueueBookmarkMutation(async () => {
+      await this.store.writeBookmarks([]);
+      this._onDidChangeBookmarks.fire();
+    });
   }
 }

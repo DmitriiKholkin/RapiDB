@@ -983,10 +983,18 @@ export class ElasticsearchDriver implements IDBDriver {
       query: { match_all: {} },
       sort: ["_doc"],
       size: ELASTICSEARCH_READ_BUDGET.hardCap,
+      track_total_hits: true,
     } as never);
     const rows = this.hitsToRows(
       response.hits.hits as unknown as Array<Record<string, unknown>>,
     );
+    if (
+      this.resolveElasticsearchTotalCount(response.hits.total) > rows.length
+    ) {
+      throw new Error(
+        `Elasticsearch filtering or sorting exceeded the ${ELASTICSEARCH_READ_BUDGET.hardCap}-row safety limit. Narrow the filter before continuing or exporting.`,
+      );
+    }
     const filtered = applyFilters(rows, request.filters);
     const sorted = applySort(filtered, request.sort);
     const paged = pageRows(sorted, request.page, request.pageSize).map((row) =>
@@ -1048,13 +1056,38 @@ export class ElasticsearchDriver implements IDBDriver {
         },
         update.changes,
       );
-      await this.requireClient().index({
-        index: request.table,
-        id: String(id),
-        document,
-        refresh: "wait_for",
-      });
-      affectedRows += 1;
+      const client = this.requireClient();
+      const response = Object.hasOwn(update.originalValues ?? {}, "_source")
+        ? await client.update({
+            index: request.table,
+            id: String(id),
+            script: {
+              lang: "painless",
+              source:
+                "if (ctx._source != params.original) { ctx.op = 'none' } else { ctx._source = params.next }",
+              params: {
+                original: this.resolveDocumentForMutation({
+                  _source: update.originalValues?._source,
+                }),
+                next: document,
+              },
+            },
+            refresh: "wait_for",
+          })
+        : Object.hasOwn(update.changes, "_source")
+          ? await client.index({
+              index: request.table,
+              id: String(id),
+              document,
+              refresh: "wait_for",
+            })
+          : await client.update({
+              index: request.table,
+              id: String(id),
+              doc: document,
+              refresh: "wait_for",
+            });
+      affectedRows += response.result === "noop" ? 0 : 1;
     }
     return { affectedRows };
   }

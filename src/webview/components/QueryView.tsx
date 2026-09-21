@@ -9,6 +9,7 @@ import { queryViewRootStyle } from "./query/queryViewHelpers";
 import { useQueryViewController } from "./query/useQueryViewController";
 
 interface Props {
+  panelId?: string;
   connectionId: string;
   initialQueryText: string;
   formatOnOpen?: boolean;
@@ -19,6 +20,7 @@ interface Props {
 }
 
 export function QueryView({
+  panelId = "query",
   connectionId,
   initialQueryText,
   formatOnOpen = false,
@@ -28,6 +30,7 @@ export function QueryView({
   editorPresentation,
 }: Props): React.ReactElement {
   const view = useQueryViewController({
+    panelId,
     connectionId,
     editorLanguage,
     editorPresentation,

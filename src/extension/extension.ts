@@ -45,10 +45,7 @@ import {
 } from "./providers/connectionProvider";
 import { HistoryProvider } from "./providers/historyProvider";
 import { logger } from "./utils/logger";
-import {
-  configureSQLiteInstaller,
-  warmupSQLiteRuntime,
-} from "./utils/sqliteInstaller";
+import { configureSQLiteInstaller } from "./utils/sqliteInstaller";
 
 function registerAllCommands(
   services: ActivationServices,
@@ -124,11 +121,16 @@ function activateOnce(context: vscode.ExtensionContext): void {
     configureSQLiteInstaller({
       storageRoot: context.globalStorageUri.fsPath,
       log: (message) => logger.info(message),
-    });
-    void warmupSQLiteRuntime(__dirname).catch((err: unknown) => {
-      // Best-effort warmup — failures shouldn't block extension activation,
-      // but unhandled rejections hide real issues in production logs.
-      logger.error("SQLite runtime warmup failed", err);
+      allowInstall: async () => {
+        if (!vscode.workspace.isTrusted) return false;
+        const install = "Install SQLite runtime";
+        const choice = await vscode.window.showWarningMessage(
+          "RapiDB needs to download and install the native better-sqlite3 runtime before opening SQLite databases.",
+          { modal: true },
+          install,
+        );
+        return choice === install;
+      },
     });
   }
 

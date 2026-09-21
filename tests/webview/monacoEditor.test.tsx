@@ -65,6 +65,10 @@ describe("MonacoEditor", () => {
 
     expect(window.__vscode?.postMessage).toHaveBeenCalledWith({
       type: "readClipboard",
+      payload: expect.objectContaining({
+        requestId: expect.any(String),
+        recipient: expect.stringContaining("monaco:"),
+      }),
     });
   });
 

@@ -569,6 +569,7 @@ describe("RedisDriver — metadata and pages", () => {
       type: vi.fn().mockResolvedValue("list"),
       del: vi.fn().mockResolvedValue(1),
       rPush: vi.fn().mockResolvedValue(2),
+      sendCommand: vi.fn().mockResolvedValue(1),
     };
 
     (
@@ -606,11 +607,17 @@ describe("RedisDriver — metadata and pages", () => {
       }),
     ).resolves.toEqual({ affectedRows: 1 });
 
-    expect(client.del).toHaveBeenCalledWith("list:activity:recent");
-    expect(client.rPush).toHaveBeenCalledWith("list:activity:recent", [
-      '{"id":"high-1","type":"payment","amount":999.99}',
-      '{"id":"high-2","type":"alert","message":"System critical"}',
-    ]);
+    expect(client.sendCommand).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        "EVAL",
+        expect.stringContaining("local ttl = redis.call('PTTL', source)"),
+        "2",
+        "list:activity:recent",
+        "list:activity:recent",
+        "list",
+      ]),
+    );
+    expect(client.del).not.toHaveBeenCalled();
   });
 
   it("applies ttl-only updates without rewriting values", async () => {
@@ -628,6 +635,7 @@ describe("RedisDriver — metadata and pages", () => {
       set: vi.fn().mockResolvedValue("OK"),
       del: vi.fn().mockResolvedValue(1),
       rPush: vi.fn().mockResolvedValue(1),
+      sendCommand: vi.fn().mockResolvedValue(1),
     };
 
     (
@@ -652,9 +660,48 @@ describe("RedisDriver — metadata and pages", () => {
       }),
     ).resolves.toEqual({ affectedRows: 1 });
 
-    expect(client.expire).toHaveBeenCalledWith("users:1", 90);
-    expect(client.type).not.toHaveBeenCalled();
+    expect(client.sendCommand).toHaveBeenCalledWith(
+      expect.arrayContaining(["users:1", "users:1", "string", "", "0"]),
+    );
+    expect(client.type).toHaveBeenCalledWith("users:1");
+    expect(client.expire).not.toHaveBeenCalled();
     expect(client.set).not.toHaveBeenCalled();
+  });
+
+  it("enables conflict detection for an empty original string", async () => {
+    const driver = new RedisDriver({
+      id: "redis-empty-string-conflict-test",
+      name: "Redis Empty String Conflict Test",
+      type: "redis",
+      host: "localhost",
+    });
+    const client = {
+      type: vi.fn().mockResolvedValue("string"),
+      sendCommand: vi.fn().mockResolvedValue(1),
+    };
+    (
+      driver as unknown as {
+        client: typeof client | null;
+        connected: boolean;
+      }
+    ).client = client;
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    await driver.updateRows({
+      database: "db0",
+      schema: "db0",
+      table: "users",
+      updates: [
+        {
+          primaryKeys: { key: "users:1" },
+          changes: { value: "next" },
+          originalValues: { value: "" },
+        },
+      ],
+    });
+
+    const command = client.sendCommand.mock.calls[0]?.[0];
+    expect(command?.at(-1)).toBe("1");
   });
 
   it("renames keys when key field is edited", async () => {
@@ -669,6 +716,7 @@ describe("RedisDriver — metadata and pages", () => {
       rename: vi.fn().mockResolvedValue("OK"),
       type: vi.fn().mockResolvedValue("string"),
       set: vi.fn().mockResolvedValue("OK"),
+      sendCommand: vi.fn().mockResolvedValue(1),
     };
 
     (
@@ -693,8 +741,11 @@ describe("RedisDriver — metadata and pages", () => {
       }),
     ).resolves.toEqual({ affectedRows: 1 });
 
-    expect(client.rename).toHaveBeenCalledWith("users:1", "users:1:renamed");
-    expect(client.type).not.toHaveBeenCalled();
+    expect(client.sendCommand).toHaveBeenCalledWith(
+      expect.arrayContaining(["users:1", "users:1:renamed", "string", "", "0"]),
+    );
+    expect(client.rename).not.toHaveBeenCalled();
+    expect(client.type).toHaveBeenCalledWith("users:1");
     expect(client.set).not.toHaveBeenCalled();
   });
 
@@ -768,7 +819,7 @@ describe("RedisDriver — metadata and pages", () => {
     expect(client.set).toHaveBeenCalledWith("users:2", "Bob", {
       NX: true,
     });
-    expect(client.persist).toHaveBeenCalledWith("users:2");
+    expect(client.persist).not.toHaveBeenCalled();
   });
 
   it("caps key scans when discovering Redis objects", async () => {

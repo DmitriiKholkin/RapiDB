@@ -8,10 +8,8 @@
  *
  * The two helpers below are intentionally narrow: they accept arbitrary
  * JSON text, produce a structural value where every numeric token is
- * kept verbatim (as a `__raw` string), and serialize the structure back
- * to JSON text in a stable key order. They are only used by the
- * persisted-edit verification pipeline and the cell-display fallback,
- * never for general-purpose JSON handling.
+ * kept verbatim, and serialize the structure back to JSON text in a stable
+ * key order. A private symbol distinguishes numeric tokens from user objects.
  */
 
 const RAW_NUMERIC_TOKEN_RE = /^-?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/;
@@ -20,7 +18,7 @@ const JSON_STRING_RE = /"(?:\\.|[^"\\])*"/y;
 const JSON_NUMBER_RE = /-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/y;
 const JSON_KEYWORD_RE = /\b(?:true|false|null)\b/y;
 
-const RAW_NUMBER_TAG = "__rapidbRawNumber" as const;
+const RAW_NUMBER_TAG = Symbol("raw JSON number");
 
 export interface RawNumberToken {
   readonly [RAW_NUMBER_TAG]: true;
@@ -35,11 +33,11 @@ export type CanonicalJsonValue =
   | CanonicalJsonValue[]
   | { [key: string]: CanonicalJsonValue };
 
-function isRawNumberToken(value: unknown): value is RawNumberToken {
+export function isRawNumberToken(value: unknown): value is RawNumberToken {
   return (
     typeof value === "object" &&
     value !== null &&
-    (value as Record<string, unknown>)[RAW_NUMBER_TAG] === true &&
+    (value as Partial<RawNumberToken>)[RAW_NUMBER_TAG] === true &&
     typeof (value as Record<string, unknown>).raw === "string"
   );
 }
@@ -151,7 +149,7 @@ class JsonTokenParser {
       return undefined;
     }
     this.pos++;
-    const obj: Record<string, CanonicalJsonValue> = {};
+    const obj: Record<string, CanonicalJsonValue> = Object.create(null);
     if (this.tokens[this.pos] === "}") {
       this.pos++;
       return obj;

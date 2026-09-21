@@ -19,7 +19,10 @@ import {
   isoToLocalDateStr,
   normalizeSqlDatetimeOffsetSpacing,
 } from "./BaseDBDriver";
-import type { DriverTimeoutSettingsProvider } from "./timeout";
+import {
+  type DriverTimeoutSettingsProvider,
+  throwIfTransactionCancelled,
+} from "./timeout";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -597,11 +600,11 @@ export class PostgresDriver extends BaseDBDriver {
     context?: OperationCancellationContext,
   ): Promise<void> {
     if (context?.operationName === "query") {
+      if (context.requestToken === undefined) {
+        return;
+      }
       for (const operation of this.activeQueryOperations) {
-        if (
-          context.requestToken !== undefined &&
-          operation.requestToken !== context.requestToken
-        ) {
+        if (operation.requestToken !== context.requestToken) {
           continue;
         }
         operation.cancelled = true;
@@ -877,7 +880,7 @@ export class PostgresDriver extends BaseDBDriver {
   async query(
     sql: string,
     params?: unknown[],
-    operationContext?: { requestToken?: number },
+    operationContext?: { requestToken?: number; readOnly?: boolean },
   ): Promise<QueryResult> {
     type PgArrayField = {
       name: string;
@@ -903,6 +906,9 @@ export class PostgresDriver extends BaseDBDriver {
         throw new Error("PostgreSQL query cancelled before execution.");
       }
       this.activeQueryClients.add(client);
+      if (operationContext?.readOnly) {
+        await client.query("BEGIN READ ONLY");
+      }
       const res = await client.query({
         text: sql,
         values: params ?? [],
@@ -928,13 +934,17 @@ export class PostgresDriver extends BaseDBDriver {
           }),
         ),
       );
-      return {
+      const queryResult = {
         columns,
         rows,
         rowCount: result.rowCount ?? rawRows.length,
         executionTimeMs,
       };
+      return queryResult;
     } finally {
+      if (client && operationContext?.readOnly) {
+        await client.query("ROLLBACK").catch(() => undefined);
+      }
       this.activeQueryOperations.delete(operation);
       if (client && this.activeQueryClients.delete(client)) {
         client.release();
@@ -1514,12 +1524,20 @@ export class PostgresDriver extends BaseDBDriver {
   }
   async runTransaction(
     operations: import("./types").TransactionOperation[],
+    context?: import("./types").TransactionContext,
   ): Promise<void> {
+    throwIfTransactionCancelled(context);
     const client = await this.requirePool().connect();
     this.activeTransactionClients.add(client);
+    const cancel = () => {
+      if (this.activeTransactionClients.delete(client)) client.release(true);
+    };
+    context?.signal.addEventListener("abort", cancel, { once: true });
     try {
+      throwIfTransactionCancelled(context);
       await client.query("BEGIN");
       for (const op of operations) {
+        throwIfTransactionCancelled(context);
         const res = await client.query(op.sql, op.params ?? []);
         if (op.checkAffectedRows && res.rowCount === 0) {
           throw new Error(
@@ -1527,11 +1545,13 @@ export class PostgresDriver extends BaseDBDriver {
           );
         }
       }
+      throwIfTransactionCancelled(context);
       await client.query("COMMIT");
     } catch (e) {
       await client.query("ROLLBACK").catch(() => undefined);
       throw e;
     } finally {
+      context?.signal.removeEventListener("abort", cancel);
       if (this.activeTransactionClients.delete(client)) {
         client.release();
       }
@@ -1645,6 +1665,24 @@ export class PostgresDriver extends BaseDBDriver {
   }
   override buildSetExpr(column: ColumnTypeMeta, paramIndex: number): string {
     return `${this.quoteIdentifier(column.name)} = $${paramIndex}`;
+  }
+  override buildOriginalValueComparison(
+    column: ColumnTypeMeta,
+    paramIndex: number,
+  ): string {
+    const name = this.quoteIdentifier(column.name);
+    const type = column.nativeType.toLowerCase();
+    if (type === "json" || type === "xml") {
+      return `${name}::text = $${paramIndex}::text`;
+    }
+    if (
+      column.category === "spatial" ||
+      type === "json[]" ||
+      type === "xml[]"
+    ) {
+      return `${name}::text = ($${paramIndex}::${column.nativeType})::text`;
+    }
+    return super.buildOriginalValueComparison(column, paramIndex);
   }
   materializePreviewColumnSql(
     sql: string,

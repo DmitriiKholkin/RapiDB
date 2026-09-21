@@ -107,9 +107,15 @@ describe("ErdGraphService", () => {
     });
     expect(result.graph.edges).toEqual([
       {
-        id: "app_db.public.orders::app_db.public.users::orders_user_id_fkey::user_id::id",
-        fromTableId: "app_db.public.orders",
-        toTableId: "app_db.public.users",
+        id: JSON.stringify([
+          JSON.stringify(["app_db", "public", "orders"]),
+          JSON.stringify(["app_db", "public", "users"]),
+          "orders_user_id_fkey",
+          "user_id",
+          "id",
+        ]),
+        fromTableId: JSON.stringify(["app_db", "public", "orders"]),
+        toTableId: JSON.stringify(["app_db", "public", "users"]),
         fromColumn: "user_id",
         toColumn: "id",
         constraintName: "orders_user_id_fkey",
@@ -206,9 +212,15 @@ describe("ErdGraphService", () => {
 
     expect(result.graph.edges).toEqual([
       {
-        id: "app_db.public.orders::app_db.public.users::orders_user_id_fkey::user_id::id",
-        fromTableId: "app_db.public.orders",
-        toTableId: "app_db.public.users",
+        id: JSON.stringify([
+          JSON.stringify(["app_db", "public", "orders"]),
+          JSON.stringify(["app_db", "public", "users"]),
+          "orders_user_id_fkey",
+          "user_id",
+          "id",
+        ]),
+        fromTableId: JSON.stringify(["app_db", "public", "orders"]),
+        toTableId: JSON.stringify(["app_db", "public", "users"]),
         fromColumn: "user_id",
         toColumn: "id",
         constraintName: "orders_user_id_fkey",

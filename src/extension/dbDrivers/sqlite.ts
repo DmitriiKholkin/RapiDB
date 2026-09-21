@@ -2,7 +2,10 @@ import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { ConnectionConfig } from "../connectionManager";
 import { BaseDBDriver } from "./BaseDBDriver";
 import { openSQLiteDatabase, type SQLiteDatabase } from "./sqliteRuntime";
-import type { DriverTimeoutSettingsProvider } from "./timeout";
+import {
+  type DriverTimeoutSettingsProvider,
+  throwIfTransactionCancelled,
+} from "./timeout";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -1214,11 +1217,14 @@ export class SQLiteDriver extends BaseDBDriver {
   }
   async runTransaction(
     operations: import("./types").TransactionOperation[],
+    context?: import("./types").TransactionContext,
   ): Promise<void> {
+    throwIfTransactionCancelled(context);
     const db = this.requireDb();
     db.exec("BEGIN TRANSACTION");
     try {
       for (const op of operations) {
+        throwIfTransactionCancelled(context);
         const info = db.run(op.sql, op.params ?? []);
         if (op.checkAffectedRows && info.changes === 0) {
           throw new Error(
@@ -1226,6 +1232,7 @@ export class SQLiteDriver extends BaseDBDriver {
           );
         }
       }
+      throwIfTransactionCancelled(context);
       db.exec("COMMIT");
     } catch (e) {
       if (db.inTransaction) {

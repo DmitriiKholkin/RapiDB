@@ -40,7 +40,7 @@ import {
   type UpdateItemCommandOutput,
 } from "@aws-sdk/client-dynamodb";
 import { fromIni } from "@aws-sdk/credential-providers";
-import { marshall, unmarshall } from "@aws-sdk/util-dynamodb";
+import { marshall, NumberValueImpl, unmarshall } from "@aws-sdk/util-dynamodb";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 import {
   type DynamoDbNativeOperationName,
@@ -53,6 +53,10 @@ import {
   getSshHttpAgentTransport,
   getTlsServername,
 } from "../driverRuntimeConfig";
+import {
+  isRawNumberToken,
+  parseJsonPreservingRawNumbers,
+} from "../utils/jsonCanonical";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import {
   applyFilters,
@@ -289,7 +293,11 @@ function stableStringify(value: unknown): string {
   return JSON.stringify(value);
 }
 
+const READ_ONLY_DYNAMO_VALUE_PREFIX =
+  "Read-only DynamoDB value (nested sets/binary): ";
+
 export class DynamoDBDriver implements IDBDriver {
+  readonly supportsAtomicUpdateRows = true;
   private client: DynamoDBClient | null = null;
   private connected = false;
   private readonly cursorCache = new Map<string, DynamoCursorSession>();
@@ -639,6 +647,11 @@ export class DynamoDBDriver implements IDBDriver {
 
     return {
       columns,
+      columnMeta: columns.map((name) => ({
+        category:
+          this.describeSampleValues(rawRows.map((row) => row[name]))
+            ?.category ?? null,
+      })),
       rows: rawRows.map((row) => this.mapRowToQueryRow(row, columns)),
       rowCount: rawRows.length,
       affectedRows: sawMutation ? affectedRows : undefined,
@@ -768,24 +781,45 @@ export class DynamoDBDriver implements IDBDriver {
       throw new Error("DynamoDB update requires a table partition key.");
     }
 
-    let affectedRows = 0;
-    for (const update of request.updates) {
+    const inputs = request.updates.flatMap((update) => {
       const input = this.buildUpdateItemInput(request.table, keys, update);
-      if (!input) {
-        continue;
+      return input ? [input] : [];
+    });
+    if (inputs.length > 1) {
+      try {
+        await this.requireClient().send(
+          new TransactWriteItemsCommand({
+            TransactItems: inputs.map((input) => ({
+              Update: {
+                TableName: input.TableName,
+                Key: input.Key,
+                UpdateExpression: input.UpdateExpression,
+                ConditionExpression: input.ConditionExpression,
+                ExpressionAttributeNames: input.ExpressionAttributeNames,
+                ExpressionAttributeValues: input.ExpressionAttributeValues,
+              },
+            })),
+          }),
+        );
+      } catch (error: unknown) {
+        if (this.isConditionalCheckFailure(error)) {
+          return { affectedRows: 0 };
+        }
+        throw error;
       }
+      this.invalidateCursorCacheForTable(request.table);
+      return { affectedRows: inputs.length };
+    }
+
+    let affectedRows = 0;
+    for (const input of inputs) {
       try {
         const response = await this.requireClient().send(
           new UpdateItemCommand(input),
         );
-        if (response.Attributes) {
-          affectedRows += 1;
-        }
+        affectedRows += response.Attributes ? 1 : 0;
       } catch (error: unknown) {
-        if (this.isConditionalCheckFailure(error)) {
-          continue;
-        }
-        throw error;
+        if (!this.isConditionalCheckFailure(error)) throw error;
       }
     }
 
@@ -930,6 +964,11 @@ export class DynamoDBDriver implements IDBDriver {
 
     const trimmed = value.trim();
     const nativeType = column.nativeType.toLowerCase();
+    if (trimmed.startsWith(READ_ONLY_DYNAMO_VALUE_PREFIX)) {
+      throw new Error(
+        "DynamoDB maps/lists containing nested sets or binary values are read-only in the table editor. Use the native DynamoDB editor to preserve their types.",
+      );
+    }
 
     switch (nativeType) {
       case "null":
@@ -943,8 +982,9 @@ export class DynamoDBDriver implements IDBDriver {
         }
         return value;
       case "number": {
-        const numeric = Number(trimmed);
-        return Number.isFinite(numeric) ? numeric : value;
+        return /^-?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(trimmed)
+          ? NumberValueImpl.from(trimmed)
+          : value;
       }
       case "binary":
         return this.parseBinaryInput(trimmed) ?? value;
@@ -955,11 +995,11 @@ export class DynamoDBDriver implements IDBDriver {
       case "binary set":
         return this.parseSetInput(trimmed, "binary") ?? value;
       case "list": {
-        const parsed = this.parseJsonValue(trimmed);
+        const parsed = this.parseExactJsonValue(trimmed);
         return Array.isArray(parsed) ? parsed : value;
       }
       case "map": {
-        const parsed = this.parseJsonValue(trimmed);
+        const parsed = this.parseExactJsonValue(trimmed);
         return this.isPlainObject(parsed) ? parsed : value;
       }
       default:
@@ -979,6 +1019,11 @@ export class DynamoDBDriver implements IDBDriver {
       return null;
     }
 
+    // DynamoDB attributes can have different types across rows.
+    if (Array.isArray(value) || this.isPlainObject(value)) {
+      return this.formatStructuredDynamoValue(value);
+    }
+
     const nativeType = column.nativeType.toLowerCase();
     if (nativeType === "binary") {
       return this.formatBinaryForDisplay(value);
@@ -987,10 +1032,7 @@ export class DynamoDBDriver implements IDBDriver {
       return this.formatSetForDisplay(value);
     }
     if (nativeType === "list" || nativeType === "map") {
-      const normalized = this.normalizeValueForDisplay(value);
-      return typeof normalized === "string"
-        ? normalized
-        : JSON.stringify(normalized);
+      return this.formatStructuredDynamoValue(value);
     }
 
     const normalized = this.normalizeValueForDisplay(value);
@@ -1785,7 +1827,7 @@ export class DynamoDBDriver implements IDBDriver {
         }),
       );
       return {
-        rows: response.Item ? [unmarshall(response.Item)] : [],
+        rows: response.Item ? [this.unmarshallItem(response.Item)] : [],
       };
     }
 
@@ -1885,7 +1927,9 @@ export class DynamoDBDriver implements IDBDriver {
         const response = await this.requireClient().send(
           new QueryCommand(input),
         );
-        rows.push(...(response.Items ?? []).map((item) => unmarshall(item)));
+        rows.push(
+          ...(response.Items ?? []).map((item) => this.unmarshallItem(item)),
+        );
         nextCursor = response.LastEvaluatedKey;
       } else {
         const input: ScanCommandInput = {
@@ -1896,7 +1940,9 @@ export class DynamoDBDriver implements IDBDriver {
         const response = await this.requireClient().send(
           new ScanCommand(input),
         );
-        rows.push(...(response.Items ?? []).map((item) => unmarshall(item)));
+        rows.push(
+          ...(response.Items ?? []).map((item) => this.unmarshallItem(item)),
+        );
         nextCursor = response.LastEvaluatedKey;
       }
     } while (
@@ -1967,7 +2013,7 @@ export class DynamoDBDriver implements IDBDriver {
         }),
       );
       return {
-        rows: response.Item ? [unmarshall(response.Item)] : [],
+        rows: response.Item ? [this.unmarshallItem(response.Item)] : [],
         truncated: false,
       };
     }
@@ -2014,7 +2060,7 @@ export class DynamoDBDriver implements IDBDriver {
           Key: this.marshallKey(plan.key),
         }),
       );
-      const rawRows = response.Item ? [unmarshall(response.Item)] : [];
+      const rawRows = response.Item ? [this.unmarshallItem(response.Item)] : [];
       const formattedRows = rawRows.map((row) =>
         this.formatDynamoRowForDisplay(row, describedByName),
       );
@@ -2121,12 +2167,28 @@ export class DynamoDBDriver implements IDBDriver {
     });
     const condition = this.buildExistingItemConditionExpression(keyNames);
     Object.assign(names, condition.names);
+    const originalConditions: string[] = [];
+    for (const [name, value] of Object.entries(update.originalValues ?? {})) {
+      if (keyNames.includes(name) || value === undefined) continue;
+      const index = originalConditions.length;
+      const namePlaceholder = `#o${index}`;
+      names[namePlaceholder] = name;
+      if (value === null) {
+        originalConditions.push(`${namePlaceholder} = :o${index}`);
+        values[`:o${index}`] = { NULL: true };
+      } else {
+        originalConditions.push(`${namePlaceholder} = :o${index}`);
+        values[`:o${index}`] = this.toAttributeValue(value);
+      }
+    }
 
     return {
       TableName: table,
       Key: this.marshallKey(key),
       UpdateExpression: `SET ${assignments.join(", ")}`,
-      ConditionExpression: condition.expression,
+      ConditionExpression: [condition.expression, ...originalConditions].join(
+        " AND ",
+      ),
       ExpressionAttributeNames: names,
       ExpressionAttributeValues: values,
       ReturnValues: "ALL_NEW",
@@ -2205,18 +2267,64 @@ export class DynamoDBDriver implements IDBDriver {
   private marshallItem(
     item: Record<string, unknown>,
   ): Record<string, AttributeValue> {
-    return marshall(item, { removeUndefinedValues: true });
+    return Object.fromEntries(
+      Object.entries(item)
+        .filter(([, value]) => value !== undefined)
+        .map(([name, value]) => [name, this.toAttributeValue(value)]),
+    );
   }
 
   private marshallKey(
     key: Record<string, unknown>,
   ): Record<string, AttributeValue> {
-    return marshall(key, { removeUndefinedValues: true });
+    return Object.fromEntries(
+      Object.entries(key).map(([name, value]) => [
+        name,
+        this.toAttributeValue(value),
+      ]),
+    );
   }
 
   private toAttributeValue(value: unknown): AttributeValue {
+    if (Array.isArray(value))
+      return {
+        L: value
+          .filter((entry) => entry !== undefined)
+          .map((entry) => this.toAttributeValue(entry)),
+      };
+    if (this.isPlainObject(value)) {
+      return {
+        M: Object.fromEntries(
+          Object.entries(value)
+            .filter(([, entry]) => entry !== undefined)
+            .map(([name, entry]) => [name, this.toAttributeValue(entry)]),
+        ),
+      };
+    }
     return marshall({ value }, { removeUndefinedValues: true })
       .value as AttributeValue;
+  }
+
+  private unmarshallItem(
+    item: Record<string, AttributeValue>,
+  ): Record<string, unknown> {
+    return Object.fromEntries(
+      Object.entries(item).map(([name, value]) => [
+        name,
+        this.fromAttributeValue(value),
+      ]),
+    );
+  }
+
+  private fromAttributeValue(value: AttributeValue): unknown {
+    if (value.M) return this.unmarshallItem(value.M);
+    if (value.L) return value.L.map((entry) => this.fromAttributeValue(entry));
+    return unmarshall(
+      { value },
+      {
+        wrapNumbers: (value) => NumberValueImpl.from(value),
+      },
+    ).value;
   }
 
   private async dispatchNativeCommand(
@@ -2428,14 +2536,14 @@ export class DynamoDBDriver implements IDBDriver {
       case "GetItem": {
         const typedOutput = output as GetItemCommandOutput;
         return {
-          rows: typedOutput.Item ? [unmarshall(typedOutput.Item)] : [],
+          rows: typedOutput.Item ? [this.unmarshallItem(typedOutput.Item)] : [],
         };
       }
       case "Query": {
         const typedOutput = output as QueryCommandOutput;
         return {
           rows: (typedOutput.Items ?? []).map(
-            (item: Record<string, AttributeValue>) => unmarshall(item),
+            (item: Record<string, AttributeValue>) => this.unmarshallItem(item),
           ),
         };
       }
@@ -2443,7 +2551,7 @@ export class DynamoDBDriver implements IDBDriver {
         const typedOutput = output as ScanCommandOutput;
         return {
           rows: (typedOutput.Items ?? []).map(
-            (item: Record<string, AttributeValue>) => unmarshall(item),
+            (item: Record<string, AttributeValue>) => this.unmarshallItem(item),
           ),
         };
       }
@@ -2459,7 +2567,7 @@ export class DynamoDBDriver implements IDBDriver {
               ? (responses[tableName] as Array<Record<string, AttributeValue>>)
               : [];
             return items.map((item) => {
-              const row = unmarshall(item);
+              const row = this.unmarshallItem(item);
               return tableNames.length > 1
                 ? { __tableName: tableName, ...row }
                 : row;
@@ -2475,7 +2583,7 @@ export class DynamoDBDriver implements IDBDriver {
         return {
           rows: responses.flatMap(
             (response: { Item?: Record<string, AttributeValue> }) =>
-              response.Item ? [unmarshall(response.Item)] : [],
+              response.Item ? [this.unmarshallItem(response.Item)] : [],
           ),
         };
       }
@@ -2488,7 +2596,7 @@ export class DynamoDBDriver implements IDBDriver {
           | DeleteItemCommandOutput;
         return {
           rows: typedOutput.Attributes
-            ? [unmarshall(typedOutput.Attributes)]
+            ? [this.unmarshallItem(typedOutput.Attributes)]
             : [],
           affectedRows: 1,
         };
@@ -2635,7 +2743,9 @@ export class DynamoDBDriver implements IDBDriver {
   ): Record<string, unknown> {
     const mapped: Record<string, unknown> = {};
     columns.forEach((columnName, index) => {
-      mapped[`__col_${index}`] = row[columnName];
+      mapped[`__col_${index}`] = this.formatGenericDisplayValue(
+        row[columnName],
+      );
     });
     return mapped;
   }
@@ -2915,6 +3025,13 @@ export class DynamoDBDriver implements IDBDriver {
         valueSemantics: "plain",
       };
     }
+    if (value instanceof NumberValueImpl) {
+      return {
+        nativeType: "number",
+        category: /^-?\d+$/.test(value.value) ? "integer" : "decimal",
+        valueSemantics: "plain",
+      };
+    }
     if (typeof value === "number") {
       return {
         nativeType: "number",
@@ -2974,7 +3091,10 @@ export class DynamoDBDriver implements IDBDriver {
     }
     if (
       entries.every(
-        (entry) => typeof entry === "number" || typeof entry === "bigint",
+        (entry) =>
+          typeof entry === "number" ||
+          typeof entry === "bigint" ||
+          entry instanceof NumberValueImpl,
       )
     ) {
       return "number set";
@@ -3012,6 +3132,9 @@ export class DynamoDBDriver implements IDBDriver {
     if (value instanceof Set) {
       return this.formatSetForDisplay(value);
     }
+    if (Array.isArray(value) || this.isPlainObject(value)) {
+      return this.formatStructuredDynamoValue(value);
+    }
     const normalized = this.normalizeValueForDisplay(value);
     return typeof normalized === "string" ||
       typeof normalized === "number" ||
@@ -3031,6 +3154,9 @@ export class DynamoDBDriver implements IDBDriver {
       typeof value === "boolean"
     ) {
       return value;
+    }
+    if (value instanceof NumberValueImpl) {
+      return value.value;
     }
     if (typeof value === "bigint") {
       return value.toString();
@@ -3074,6 +3200,9 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   private formatSetEntryForDisplay(value: unknown): string {
+    if (value instanceof NumberValueImpl) {
+      return value.value;
+    }
     if (typeof value === "string") {
       return `'${value.replace(/'/g, "''")}'`;
     }
@@ -3121,6 +3250,24 @@ export class DynamoDBDriver implements IDBDriver {
     value: string,
     subtype: "string" | "number" | "binary",
   ): Set<unknown> | null {
+    if (subtype === "number") {
+      const numericBody = value
+        .trim()
+        .replace(/^<</, "")
+        .replace(/>>$/, "")
+        .replace(/^\[/, "")
+        .replace(/\]$/, "");
+      const tokens = numericBody
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter(Boolean);
+      return tokens.length > 0 &&
+        tokens.every((entry) =>
+          /^-?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(entry),
+        )
+        ? new Set(tokens.map((entry) => NumberValueImpl.from(entry)))
+        : null;
+    }
     const parsedJson = this.parseJsonValue(value);
     if (Array.isArray(parsedJson)) {
       return new Set(
@@ -3129,10 +3276,12 @@ export class DynamoDBDriver implements IDBDriver {
     }
 
     const trimmed = value.trim();
-    if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) {
-      return null;
-    }
-    const parsed = this.parseJsonValue(trimmed);
+    const normalized =
+      trimmed.startsWith("<<") && trimmed.endsWith(">>")
+        ? `[${trimmed.slice(2, -2).replace(/'/g, '"')}]`
+        : trimmed;
+    if (!normalized.startsWith("[") || !normalized.endsWith("]")) return null;
+    const parsed = this.parseJsonValue(normalized);
     if (!Array.isArray(parsed)) {
       return null;
     }
@@ -3149,14 +3298,11 @@ export class DynamoDBDriver implements IDBDriver {
       return typeof value === "string" ? value : String(value);
     }
     if (subtype === "number") {
-      if (typeof value === "number") {
-        return value;
-      }
-      if (typeof value === "bigint") {
-        return Number(value);
-      }
-      const numeric = Number(String(value));
-      return Number.isFinite(numeric) ? numeric : value;
+      if (value instanceof NumberValueImpl) return value;
+      const token = String(value).trim();
+      return /^-?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(token)
+        ? NumberValueImpl.from(token)
+        : value;
     }
     if (this.isBinaryValue(value)) {
       return value;
@@ -3170,6 +3316,63 @@ export class DynamoDBDriver implements IDBDriver {
     } catch {
       return null;
     }
+  }
+
+  private parseExactJsonValue(value: string): unknown {
+    const parsed = parseJsonPreservingRawNumbers(value);
+    return this.replaceRawNumberTokens(parsed);
+  }
+
+  private replaceRawNumberTokens(value: unknown): unknown {
+    if (isRawNumberToken(value)) {
+      return NumberValueImpl.from(value.raw);
+    }
+    if (Array.isArray(value))
+      return value.map((entry) => this.replaceRawNumberTokens(entry));
+    if (this.isPlainObject(value)) {
+      return Object.fromEntries(
+        Object.entries(value).map(([key, entry]) => [
+          key,
+          this.replaceRawNumberTokens(entry),
+        ]),
+      );
+    }
+    return value;
+  }
+
+  private formatStructuredDynamoValue(value: unknown): string {
+    const hasSpecialValue = (entry: unknown): boolean => {
+      if (entry instanceof Set || this.isBinaryValue(entry)) return true;
+      if (Array.isArray(entry)) return entry.some(hasSpecialValue);
+      return (
+        this.isPlainObject(entry) && Object.values(entry).some(hasSpecialValue)
+      );
+    };
+    if (hasSpecialValue(value)) {
+      return (
+        READ_ONLY_DYNAMO_VALUE_PREFIX +
+        JSON.stringify(
+          this.serializeNativePreviewValue(this.toAttributeValue(value)),
+        )
+      );
+    }
+    return this.stringifyExactDynamoValue(value);
+  }
+
+  private stringifyExactDynamoValue(value: unknown): string {
+    if (value instanceof NumberValueImpl) return value.value;
+    if (Array.isArray(value)) {
+      return `[${value.map((entry) => this.stringifyExactDynamoValue(entry)).join(",")}]`;
+    }
+    if (this.isPlainObject(value)) {
+      return `{${Object.entries(value)
+        .map(
+          ([key, entry]) =>
+            `${JSON.stringify(key)}:${this.stringifyExactDynamoValue(entry)}`,
+        )
+        .join(",")}}`;
+    }
+    return JSON.stringify(this.normalizeValueForDisplay(value));
   }
 
   private extractBinaryHex(value: string): string | null {
@@ -3209,6 +3412,11 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   private isPlainObject(value: unknown): value is Record<string, unknown> {
-    return value !== null && typeof value === "object" && !Array.isArray(value);
+    return (
+      value !== null &&
+      typeof value === "object" &&
+      (Object.getPrototypeOf(value) === Object.prototype ||
+        Object.getPrototypeOf(value) === null)
+    );
   }
 }

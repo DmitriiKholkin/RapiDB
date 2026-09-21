@@ -8,7 +8,10 @@ import React, {
   useState,
 } from "react";
 import { format as sqlFormatterFormat } from "sql-formatter";
-import type { QueryEditorSqlDialect } from "../../shared/webviewContracts";
+import type {
+  ClipboardTextPayload,
+  QueryEditorSqlDialect,
+} from "../../shared/webviewContracts";
 import type { SchemaObject } from "../store";
 import { onMessage, postMessage } from "../utils/messaging";
 import {
@@ -583,10 +586,29 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         editor.revealPosition(newPos);
       };
 
-      const unsubClipboard = onMessage<string>("clipboardText", (text) => {
-        insertText(text);
-        editor.focus();
-      });
+      const clipboardRecipient = `monaco:${crypto.randomUUID()}`;
+      let pendingClipboardRequest: string | null = null;
+      const requestClipboard = () => {
+        const requestId = crypto.randomUUID();
+        pendingClipboardRequest = requestId;
+        postMessage("readClipboard", {
+          requestId,
+          recipient: clipboardRecipient,
+        });
+      };
+      const unsubClipboard = onMessage<ClipboardTextPayload>(
+        "clipboardText",
+        (payload) => {
+          if (
+            payload.recipient !== clipboardRecipient ||
+            payload.requestId !== pendingClipboardRequest
+          )
+            return;
+          pendingClipboardRequest = null;
+          insertText(payload.text);
+          editor.focus();
+        },
+      );
 
       const domNode = editor.getDomNode();
       const nativePaste = (e: ClipboardEvent) => {
@@ -595,7 +617,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         }
         e.preventDefault();
         e.stopImmediatePropagation();
-        postMessage("readClipboard");
+        requestClipboard();
       };
 
       const getExecText = () => {
@@ -650,7 +672,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         if (readOnlyRef.current) {
           return;
         }
-        postMessage("readClipboard");
+        requestClipboard();
       };
 
       getSelectedTextRef.current = getSelectedText;

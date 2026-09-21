@@ -66,6 +66,7 @@ export interface SQLiteInstalledRuntimeProbe {
 interface SQLiteInstallerConfiguration {
   storageRoot: string;
   log?: (message: string) => void;
+  allowInstall?: () => boolean | Promise<boolean>;
 }
 
 interface InstalledRuntimeManifest {
@@ -591,7 +592,7 @@ async function rebuildFromSourceWithPatch(
     );
   }
 
-  // Verify npx is available (node-gyp itself is fetched via npx on demand)
+  // Verify npx is available. The build tool version is pinned below.
   const npxCommand = process.platform === "win32" ? "npx.cmd" : "npx";
   try {
     await execFileAsync(npxCommand, ["--version"]);
@@ -635,7 +636,8 @@ async function rebuildFromSourceWithPatch(
     await execFileAsync(
       npxCommand,
       [
-        "node-gyp",
+        "--yes",
+        "node-gyp@12.4.0",
         "rebuild",
         `--target=${electronVersion}`,
         `--arch=${process.arch}`,
@@ -749,9 +751,10 @@ async function downloadPrebuiltBinary(
     // yet. Try patched prebuilt first (no build tools needed), then source build.
     if (Number(process.versions.modules) >= 146) {
       // Step 1: try patched prebuilt from RapiDB GitHub releases
+      let patchedPrebuiltInstalled = false;
       try {
         await downloadPatchedPrebuilt(runtimeRoot, baseDir);
-        return;
+        patchedPrebuiltInstalled = true;
       } catch (patchedError) {
         installerLog(
           `Patched prebuilt not available: ${errorMessage(patchedError)}`,
@@ -759,12 +762,14 @@ async function downloadPrebuiltBinary(
       }
 
       // Step 2: try building from source with the V8 API compat patch
-      installerLog("Attempting source build with Electron 42 V8 patch…");
-      try {
-        await rebuildFromSourceWithPatch(runtimeRoot, baseDir);
-      } catch (sourceError) {
-        installerLog(`Source build failed: ${errorMessage(sourceError)}`);
-        throw prebuiltError;
+      if (!patchedPrebuiltInstalled) {
+        installerLog("Attempting source build with Electron 42 V8 patch…");
+        try {
+          await rebuildFromSourceWithPatch(runtimeRoot, baseDir);
+        } catch (sourceError) {
+          installerLog(`Source build failed: ${errorMessage(sourceError)}`);
+          throw prebuiltError;
+        }
       }
     } else {
       throw prebuiltError;
@@ -818,13 +823,13 @@ async function installManagedRuntime(baseDir: string): Promise<string | null> {
   });
 }
 
-export function configureSQLiteInstaller(configuration: {
-  storageRoot: string;
-  log?: (message: string) => void;
-}): void {
+export function configureSQLiteInstaller(
+  configuration: SQLiteInstallerConfiguration,
+): void {
   installerConfiguration = {
     storageRoot: resolve(configuration.storageRoot),
     log: configuration.log,
+    allowInstall: configuration.allowInstall,
   };
 }
 
@@ -878,6 +883,14 @@ export async function ensureSQLiteRuntimeInstalled(
     return null;
   }
   if (!inFlightInstall) {
+    if (
+      installerConfiguration.allowInstall &&
+      !(await installerConfiguration.allowInstall())
+    ) {
+      throw new Error(
+        "SQLite runtime installation was not authorized. The database was not opened.",
+      );
+    }
     inFlightInstall = installManagedRuntime(baseDir).finally(() => {
       inFlightInstall = null;
     });

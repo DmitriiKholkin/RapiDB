@@ -10,6 +10,7 @@ import {
   normalizeBinaryHexDisplayPrefix,
   type TypeCategory,
 } from "../../../shared/tableTypes";
+import type { ClipboardTextPayload } from "../../../shared/webviewContracts";
 import { placeholderForCategory } from "../../types";
 import { buildSmallGhostButtonStyle } from "../../utils/buttonStyles";
 import { buildTextInputStyle } from "../../utils/controlStyles";
@@ -109,6 +110,7 @@ export function EditInput({
   }, [closeContextMenu]);
 
   const pasteUnsubscribeRef = useRef<(() => void) | null>(null);
+  const clipboardRecipientRef = useRef(`edit-input:${crypto.randomUUID()}`);
 
   const handlePaste = useCallback(() => {
     const input = ref.current;
@@ -117,26 +119,40 @@ export function EditInput({
 
     pasteUnsubscribeRef.current?.();
 
-    pasteUnsubscribeRef.current = onMessage<string>("clipboardText", (text) => {
-      pasteUnsubscribeRef.current?.();
-      pasteUnsubscribeRef.current = null;
+    const requestId = crypto.randomUUID();
+    const start = input.selectionStart ?? 0;
+    const end = input.selectionEnd ?? 0;
+    const currentVal = val;
+    pasteUnsubscribeRef.current = onMessage<ClipboardTextPayload>(
+      "clipboardText",
+      (payload) => {
+        if (
+          payload.requestId !== requestId ||
+          payload.recipient !== clipboardRecipientRef.current
+        )
+          return;
+        pasteUnsubscribeRef.current?.();
+        pasteUnsubscribeRef.current = null;
 
-      if (!text || !ref.current) return;
-      const start = ref.current.selectionStart ?? 0;
-      const end = ref.current.selectionEnd ?? 0;
-      const currentVal = val;
-      const newVal = currentVal.slice(0, start) + text + currentVal.slice(end);
-      setVal(newVal);
+        const { text } = payload;
+        if (!text || !ref.current) return;
+        const newVal =
+          currentVal.slice(0, start) + text + currentVal.slice(end);
+        setVal(newVal);
 
-      const cursorPos = start + text.length;
-      requestAnimationFrame(() => {
-        if (ref.current instanceof HTMLInputElement) {
-          ref.current.setSelectionRange(cursorPos, cursorPos);
-        }
-      });
+        const cursorPos = start + text.length;
+        requestAnimationFrame(() => {
+          if (ref.current instanceof HTMLInputElement) {
+            ref.current.setSelectionRange(cursorPos, cursorPos);
+          }
+        });
+      },
+    );
+
+    postMessage("readClipboard", {
+      requestId,
+      recipient: clipboardRecipientRef.current,
     });
-
-    postMessage("readClipboard");
   }, [closeContextMenu, val]);
 
   useEffect(() => {

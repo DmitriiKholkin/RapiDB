@@ -271,28 +271,6 @@ export class TableMutationService {
         "Insert failed: the database reported 0 rows affected. The row may have been rejected by a trigger or constraint.",
       );
     }
-    if (!plan.verificationCriteria) {
-      return;
-    }
-    const columns = await this.columnsProvider.getColumns(
-      plan.connectionId,
-      plan.database,
-      plan.schema,
-      plan.table,
-    );
-    const exists = await this.rowExistsByCriteria(
-      driver,
-      plan.database,
-      plan.schema,
-      plan.table,
-      columns,
-      plan.verificationCriteria,
-    );
-    if (!exists) {
-      throw new Error(
-        "Insert verification failed: the inserted row could not be read back by primary key.",
-      );
-    }
   }
   async deleteRows(
     connectionId: string,

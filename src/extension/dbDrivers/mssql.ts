@@ -1,5 +1,6 @@
 import * as mssql from "mssql";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
+import type { OperationCancellationContext } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import {
   getMssqlServerName,
@@ -22,7 +23,10 @@ import {
   formatHexSqlPreviewLiteral,
   formatSqlPreviewStringLiteral,
 } from "./sqlPreviewLiterals";
-import type { DriverTimeoutSettingsProvider } from "./timeout";
+import {
+  type DriverTimeoutSettingsProvider,
+  throwIfTransactionCancelled,
+} from "./timeout";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -998,7 +1002,10 @@ export class MSSQLDriver extends BaseDBDriver {
 
   private pool: mssql.ConnectionPool | null = null;
   private readonly config: ConnectionConfig;
-  private readonly activeRequests = new Set<mssql.Request>();
+  private readonly activeRequests = new Map<
+    mssql.Request,
+    number | undefined
+  >();
   private timeoutRecoveryInFlight: Promise<void> | null = null;
   constructor(
     config: ConnectionConfig,
@@ -1032,12 +1039,13 @@ export class MSSQLDriver extends BaseDBDriver {
       connectionTimeout: this.getConnectionTimeoutMs(),
       requestTimeout: this.getDbOperationTimeoutMs(),
       options: {
-        encrypt: true,
+        encrypt: tlsSettings !== undefined,
         trustServerCertificate: trustCert,
         enableArithAbort: true,
         abortTransactionOnError: true,
-        serverName:
-          runtimeServerName ?? (!trustCert ? this.config.host : undefined),
+        serverName: tlsSettings
+          ? (runtimeServerName ?? (!trustCert ? this.config.host : undefined))
+          : undefined,
         useUTC: false,
       },
     };
@@ -1267,8 +1275,19 @@ export class MSSQLDriver extends BaseDBDriver {
     this.pool = null;
   }
 
-  async cancelCurrentOperation(): Promise<void> {
-    for (const request of [...this.activeRequests]) {
+  async cancelCurrentOperation(
+    context?: OperationCancellationContext,
+  ): Promise<void> {
+    if (
+      context?.operationName !== "query" ||
+      context.requestToken === undefined
+    ) {
+      return;
+    }
+    for (const [request, requestToken] of this.activeRequests) {
+      if (requestToken !== context.requestToken) {
+        continue;
+      }
       try {
         request.cancel();
       } catch {}
@@ -1299,8 +1318,9 @@ export class MSSQLDriver extends BaseDBDriver {
   private async executeTrackedRequest<T>(
     request: mssql.Request,
     operation: (request: mssql.Request) => Promise<T>,
+    requestToken?: number,
   ): Promise<T> {
-    this.activeRequests.add(request);
+    this.activeRequests.set(request, requestToken);
     try {
       return await operation(request);
     } finally {
@@ -1491,7 +1511,11 @@ export class MSSQLDriver extends BaseDBDriver {
       };
     });
   }
-  async query(sql: string, params?: unknown[]): Promise<QueryResult> {
+  async query(
+    sql: string,
+    params?: unknown[],
+    operationContext?: { requestToken?: number; readOnly?: boolean },
+  ): Promise<QueryResult> {
     const start = Date.now();
     const batches = sql
       .split(/\r?\n/)
@@ -1532,7 +1556,12 @@ export class MSSQLDriver extends BaseDBDriver {
     };
     for (const batch of batches) {
       const currentParams = batches.length === 1 ? params : undefined;
-      lastResult = await this._executeBatch(batch, currentParams, start);
+      lastResult = await this._executeBatch(
+        batch,
+        currentParams,
+        start,
+        operationContext?.requestToken,
+      );
     }
     lastResult.executionTimeMs = Date.now() - start;
     return lastResult;
@@ -1541,13 +1570,18 @@ export class MSSQLDriver extends BaseDBDriver {
     sql: string,
     params?: unknown[],
     start = Date.now(),
+    requestToken?: number,
   ): Promise<QueryResult> {
     const req = this.requirePool().request();
     req.arrayRowMode = true;
-    const res = (await this.executeTrackedRequest(req, async (trackedReq) => {
-      const finalSql = this.bindPositionalParameters(trackedReq, sql, params);
-      return await trackedReq.query(finalSql);
-    })) as MssqlArrayResult;
+    const res = (await this.executeTrackedRequest(
+      req,
+      async (trackedReq) => {
+        const finalSql = this.bindPositionalParameters(trackedReq, sql, params);
+        return await trackedReq.query(finalSql);
+      },
+      requestToken,
+    )) as MssqlArrayResult;
     const executionTimeMs = Date.now() - start;
     const columnsMeta = res.columns?.[0] ?? [];
     const affectedRows = res.rowsAffected.at(-1) ?? 0;
@@ -1954,12 +1988,23 @@ export class MSSQLDriver extends BaseDBDriver {
   }
   async runTransaction(
     operations: import("./types").TransactionOperation[],
+    context?: import("./types").TransactionContext,
   ): Promise<void> {
+    throwIfTransactionCancelled(context);
     const tx = new mssql.Transaction(this.requirePool());
     await tx.begin();
+    let activeRequest: mssql.Request | undefined;
+    const cancel = () => {
+      try {
+        activeRequest?.cancel();
+      } catch {}
+    };
+    context?.signal.addEventListener("abort", cancel, { once: true });
     try {
       for (const op of operations) {
+        throwIfTransactionCancelled(context);
         const req = tx.request();
+        activeRequest = req;
         const res = await this.executeTrackedRequest(
           req,
           async (trackedReq) => {
@@ -1971,18 +2016,22 @@ export class MSSQLDriver extends BaseDBDriver {
             return await trackedReq.query(finalSql);
           },
         );
+        activeRequest = undefined;
         if (op.checkAffectedRows && (res.rowsAffected?.[0] ?? 0) === 0) {
           throw new Error(
             "Row not found — the row may have been modified or deleted by another user",
           );
         }
       }
+      throwIfTransactionCancelled(context);
       await tx.commit();
     } catch (e) {
       try {
         await tx.rollback();
       } catch {}
       throw e;
+    } finally {
+      context?.signal.removeEventListener("abort", cancel);
     }
   }
   mapTypeCategory(nativeType: string): TypeCategory {
@@ -2075,6 +2124,22 @@ export class MSSQLDriver extends BaseDBDriver {
   override buildSetExpr(column: ColumnTypeMeta, _paramIndex: number): string {
     const expr = this.buildInsertValueExpr(column, _paramIndex);
     return `${this.quoteIdentifier(column.name)} = ${expr}`;
+  }
+  override buildOriginalValueComparison(
+    column: ColumnTypeMeta,
+    paramIndex: number,
+  ): string {
+    const name = this.quoteIdentifier(column.name);
+    const type = baseTypeName(column.nativeType);
+    if (type === "image") return `CONVERT(varbinary(max), ${name}) = ?`;
+    if (column.category === "text" || type === "xml") {
+      const value = type === "xml" ? "CONVERT(xml, ?)" : "?";
+      return `CONVERT(varbinary(max), CONVERT(nvarchar(max), ${name})) = CONVERT(varbinary(max), CONVERT(nvarchar(max), ${value}))`;
+    }
+    if (type === "geometry" || type === "geography") {
+      return `${name}.STAsBinary() = ${type}::STGeomFromText(?, ${name}.STSrid).STAsBinary()`;
+    }
+    return super.buildOriginalValueComparison(column, paramIndex);
   }
   materializePreviewInsertSql(
     sql: string,

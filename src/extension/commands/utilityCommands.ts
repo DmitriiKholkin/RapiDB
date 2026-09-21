@@ -52,12 +52,12 @@ export function registerUtilityCommands(
 
   // ─── Show Connected Only ───────────────────────────────────────────
   registerCommand(CMD.showConnectedOnly, async () => {
-    await connectionProvider.toggleConnectedOnly();
+    await connectionProvider.setConnectedOnly(true);
   });
 
   // ─── Show All Connections ──────────────────────────────────────────
   registerCommand(CMD.showAllConnections, async () => {
-    await connectionProvider.toggleConnectedOnly();
+    await connectionProvider.setConnectedOnly(false);
   });
 
   // ─── Disconnect All ────────────────────────────────────────────────

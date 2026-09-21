@@ -61,6 +61,35 @@ const REDIS_VALUE_TYPE_ORDER = [
 const REDIS_READ_ONLY_QUERY_REASON =
   "[RapiDB] Read-only Redis connections allow only read commands.";
 
+const REDIS_ATOMIC_EDIT_SCRIPT = `
+local source = KEYS[1]
+local target = KEYS[2]
+if redis.call('EXISTS', source) == 0 then return 0 end
+if source ~= target and redis.call('EXISTS', target) ~= 0 then return -1 end
+local kind = redis.call('TYPE', source)['ok']
+if ARGV[1] ~= '' and kind ~= ARGV[1] then return -2 end
+if ARGV[7] == '1' and kind == 'string' and redis.call('GET', source) ~= ARGV[2] then return -3 end
+local ttl = redis.call('PTTL', source)
+if ARGV[3] == '1' then
+  redis.call('DEL', source)
+  local value = cjson.decode(ARGV[4])
+  if kind == 'string' then redis.call('SET', source, value)
+  elseif kind == 'hash' then for field, entry in pairs(value) do redis.call('HSET', source, field, entry) end
+  elseif kind == 'list' then for _, entry in ipairs(value) do redis.call('RPUSH', source, entry) end
+  elseif kind == 'set' then for _, entry in ipairs(value) do redis.call('SADD', source, entry) end
+  elseif kind == 'zset' then for _, entry in ipairs(value) do redis.call('ZADD', source, entry.score, entry.value) end
+  else return -2 end
+end
+if source ~= target and redis.call('EXISTS', source) ~= 0 then redis.call('RENAME', source, target) end
+local finalKey = target
+if ARGV[5] == 'set' then
+  if redis.call('EXISTS', finalKey) ~= 0 then redis.call('PEXPIRE', finalKey, tonumber(ARGV[6]) * 1000) end
+elseif ARGV[5] == 'persist' then
+  if redis.call('EXISTS', finalKey) ~= 0 then redis.call('PERSIST', finalKey) end
+elseif ttl >= 0 and redis.call('EXISTS', finalKey) ~= 0 then redis.call('PEXPIRE', finalKey, ttl) end
+return 1
+`;
+
 const READ_ONLY_REDIS_COMMANDS = new Set([
   "DBSIZE",
   "EXISTS",
@@ -559,8 +588,9 @@ export class RedisDriver implements IDBDriver {
       const pattern = request.table === "default" ? "*" : `${request.table}:*`;
       const offset = Math.max(0, (request.page - 1) * request.pageSize);
       const keys = (
-        await this.scanKeys(pattern, REDIS_READ_BUDGET.maxScanKeys)
+        await this.scanKeys(pattern, REDIS_READ_BUDGET.maxScanKeys, true)
       ).sort((left, right) => left.localeCompare(right));
+      if (request.sort?.direction === "desc") keys.reverse();
       const pageKeys = keys.slice(offset, offset + request.pageSize);
       const rows = await this.readRowsForKeys(pageKeys);
       return {
@@ -579,7 +609,7 @@ export class RedisDriver implements IDBDriver {
       REDIS_READ_BUDGET.maxValueReads,
       fallbackReadLimit,
     );
-    const rows = await this.readRows(request.table, boundedReadLimit);
+    const rows = await this.readRows(request.table, boundedReadLimit, true);
     const rowRecords = rows.map((entry) => entry.row);
     const filtered = applyFilters(rowRecords, request.filters);
     const sorted = applySort(filtered, request.sort);
@@ -631,14 +661,7 @@ export class RedisDriver implements IDBDriver {
         throw new Error("Redis key updates require a non-empty 'key' value.");
       }
 
-      if ((await client.exists(sourceKey)) === 0) {
-        continue;
-      }
-
       const keyChanged = sourceKey !== targetKey;
-      if (keyChanged && (await client.exists(targetKey)) !== 0) {
-        throw new Error(`Redis key '${targetKey}' already exists.`);
-      }
 
       const hasValueChange =
         Object.hasOwn(update.changes, "value") ||
@@ -649,26 +672,60 @@ export class RedisDriver implements IDBDriver {
         continue;
       }
 
-      if (keyChanged) {
-        await this.renameRedisKey(sourceKey, targetKey);
-      }
-
-      if (hasValueChange) {
-        const value =
-          update.changes.value ?? update.changes.json ?? update.changes.text;
-        const currentType = await client.type(targetKey);
-        await this.writeRedisValueByType(targetKey, currentType, value);
-      }
-
-      if (hasTtlChange) {
-        const ttlSeconds = this.parseRedisTtlInput(
-          update.changes.ttl,
-          "Redis TTL updates",
+      const currentType = await client.type(sourceKey);
+      if (currentType === "stream" && hasValueChange) {
+        throw new Error(
+          "Redis stream values are read-only in the table viewer.",
         );
-        await this.applyRedisTtl(targetKey, ttlSeconds);
       }
-
-      affectedRows += 1;
+      const value =
+        update.changes.value ?? update.changes.json ?? update.changes.text;
+      const encodedValue = hasValueChange
+        ? this.encodeRedisLuaValue(currentType, value)
+        : "null";
+      const ttlSeconds = hasTtlChange
+        ? this.parseRedisTtlInput(update.changes.ttl, "Redis TTL updates")
+        : undefined;
+      const originalString =
+        currentType === "string" &&
+        Object.hasOwn(update.originalValues ?? {}, "value")
+          ? this.normalizeStoredValue(update.originalValues?.value)
+          : "";
+      const hasOriginalString =
+        currentType === "string" &&
+        Object.hasOwn(update.originalValues ?? {}, "value");
+      const result = Number(
+        await client.sendCommand([
+          "EVAL",
+          REDIS_ATOMIC_EDIT_SCRIPT,
+          "2",
+          sourceKey,
+          targetKey,
+          currentType,
+          originalString,
+          hasValueChange ? "1" : "0",
+          encodedValue,
+          ttlSeconds === undefined
+            ? "keep"
+            : ttlSeconds === null
+              ? "persist"
+              : "set",
+          ttlSeconds === undefined || ttlSeconds === null
+            ? "0"
+            : String(ttlSeconds),
+          hasOriginalString ? "1" : "0",
+        ]),
+      );
+      if (result === -1) {
+        throw new Error(`Redis key '${targetKey}' already exists.`);
+      }
+      if (result === -2) {
+        throw new Error("Redis key type changed after the row was loaded.");
+      }
+      if (result === -3) {
+        throw new Error("Redis value changed after the row was loaded.");
+      }
+      affectedRows += result === 1 ? 1 : 0;
     }
     return { affectedRows };
   }
@@ -693,10 +750,6 @@ export class RedisDriver implements IDBDriver {
         ? { NX: true, EX: ttlSeconds }
         : { NX: true },
     );
-
-    if (result === "OK" && ttlSeconds === null) {
-      await this.applyRedisTtl(key, null);
-    }
 
     return { affectedRows: result === "OK" ? 1 : 0 };
   }
@@ -921,21 +974,6 @@ export class RedisDriver implements IDBDriver {
     return statements;
   }
 
-  private async renameRedisKey(sourceKey: string, targetKey: string) {
-    if (sourceKey === targetKey) {
-      return;
-    }
-    const client = this.requireClient() as ReturnType<typeof createClient> & {
-      rename?: (source: string, target: string) => Promise<unknown>;
-      sendCommand: (args: string[]) => Promise<unknown>;
-    };
-    if (typeof client.rename === "function") {
-      await client.rename(sourceKey, targetKey);
-      return;
-    }
-    await client.sendCommand(["RENAME", sourceKey, targetKey]);
-  }
-
   async runTransaction(operations: TransactionOperation[]): Promise<void> {
     for (const operation of operations) {
       await this.query(operation.sql, operation.params);
@@ -1057,17 +1095,14 @@ export class RedisDriver implements IDBDriver {
   private async readRows(
     table: string,
     maxRows: number,
+    failOnTruncation = false,
   ): Promise<RedisSampleRow[]> {
-    try {
-      const pattern = table === "default" ? "*" : `${table}:*`;
-      const readLimit = Math.min(maxRows, REDIS_READ_BUDGET.maxValueReads);
-      const keys = (await this.scanKeys(pattern, readLimit))
-        .slice(0, readLimit)
-        .sort((left, right) => left.localeCompare(right));
-      return await this.readRowsForKeys(keys);
-    } catch {
-      return [];
-    }
+    const pattern = table === "default" ? "*" : `${table}:*`;
+    const readLimit = Math.min(maxRows, REDIS_READ_BUDGET.maxValueReads);
+    const keys = (
+      await this.scanKeys(pattern, readLimit, failOnTruncation)
+    ).sort((left, right) => left.localeCompare(right));
+    return await this.readRowsForKeys(keys);
   }
 
   private async readRowsForKeys(
@@ -1204,26 +1239,6 @@ export class RedisDriver implements IDBDriver {
     throw new Error(`${source} require an integer TTL in seconds.`);
   }
 
-  private async applyRedisTtl(key: string, ttlSeconds: number | null) {
-    const client = this.requireClient() as ReturnType<typeof createClient> & {
-      expire?: (key: string, seconds: number) => Promise<number>;
-      persist?: (key: string) => Promise<number>;
-    };
-
-    if (ttlSeconds === null) {
-      if (typeof client.persist !== "function") {
-        throw new Error("Redis client does not support PERSIST.");
-      }
-      await client.persist(key);
-      return;
-    }
-
-    if (typeof client.expire !== "function") {
-      throw new Error("Redis client does not support EXPIRE.");
-    }
-    await client.expire(key, ttlSeconds);
-  }
-
   private buildRedisTtlPreviewStatement(
     key: string,
     ttlSeconds: number | null,
@@ -1247,51 +1262,18 @@ export class RedisDriver implements IDBDriver {
     return valueTypes[0] ?? "string";
   }
 
-  private async writeRedisValueByType(
-    key: string,
-    redisType: string,
-    value: unknown,
-  ): Promise<void> {
-    const client = this.requireClient();
+  private encodeRedisLuaValue(redisType: string, value: unknown): string {
     switch (redisType) {
-      case "hash": {
-        const entries = this.parseRedisHashEntries(value);
-        await client.del(key);
-        if (Object.keys(entries).length > 0) {
-          await client.hSet(key, entries);
-        }
-        return;
-      }
-      case "list": {
-        const elements = this.parseRedisSequenceElements(value, "list");
-        await client.del(key);
-        if (elements.length > 0) {
-          await client.rPush(key, elements);
-        }
-        return;
-      }
-      case "set": {
-        const elements = this.parseRedisSequenceElements(value, "set");
-        await client.del(key);
-        if (elements.length > 0) {
-          await client.sAdd(key, elements);
-        }
-        return;
-      }
-      case "zset": {
-        const entries = this.parseRedisSortedSetEntries(value);
-        await client.del(key);
-        if (entries.length > 0) {
-          await client.zAdd(key, entries);
-        }
-        return;
-      }
-      case "stream":
-        throw new Error(
-          "Redis stream values are read-only in the table viewer.",
-        );
+      case "hash":
+        return JSON.stringify(this.parseRedisHashEntries(value));
+      case "list":
+        return JSON.stringify(this.parseRedisSequenceElements(value, "list"));
+      case "set":
+        return JSON.stringify(this.parseRedisSequenceElements(value, "set"));
+      case "zset":
+        return JSON.stringify(this.parseRedisSortedSetEntries(value));
       default:
-        await client.set(key, this.normalizeStoredValue(value));
+        return JSON.stringify(this.normalizeStoredValue(value));
     }
   }
 
@@ -1465,6 +1447,7 @@ export class RedisDriver implements IDBDriver {
   private async scanKeys(
     pattern: string,
     limit = Number.POSITIVE_INFINITY,
+    failOnTruncation = false,
   ): Promise<string[]> {
     const client = this.requireClient();
     const keys: string[] = [];
@@ -1480,7 +1463,12 @@ export class RedisDriver implements IDBDriver {
       cursor = response.cursor;
       keys.push(...response.keys);
     } while (cursor !== "0" && keys.length < limit);
-    return keys;
+    if (failOnTruncation && (cursor !== "0" || keys.length > limit)) {
+      throw new Error(
+        `Redis data exceeds the ${limit}-key safety limit. Narrow the filter before continuing or exporting.`,
+      );
+    }
+    return Number.isFinite(limit) ? keys.slice(0, limit) : keys;
   }
 
   private mapRowToQueryRow(

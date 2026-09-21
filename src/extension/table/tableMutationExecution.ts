@@ -47,6 +47,64 @@ export async function applyChangesTransactional(
   }
   return executePreparedApplyPlan(connectionManager, prepared.plan);
 }
+
+export async function executeAtomicSqlApplyPlan(
+  connectionManager: ConnectionManager,
+  apply: PreparedApplyPlan | null,
+  inserts: readonly import("./tableDataContracts").PreparedInsertPlan[],
+): Promise<ApplyResultPayload> {
+  const connectionId = apply?.connectionId ?? inserts[0]?.connectionId;
+  if (!connectionId) {
+    return { success: true, rowOutcomes: [] };
+  }
+  if (
+    apply?.mode === "driver" ||
+    inserts.some((plan) => plan.mode === "driver")
+  ) {
+    const driver = connectionManager.getDriver(connectionId);
+    if (
+      apply?.mode === "driver" &&
+      inserts.length === 0 &&
+      driver?.supportsAtomicUpdateRows === true
+    ) {
+      return executePreparedApplyPlan(connectionManager, apply);
+    }
+    return {
+      success: false,
+      error:
+        "This backend cannot guarantee an atomic multi-operation apply. Apply one row at a time.",
+    };
+  }
+  try {
+    assertConnectionWritable(connectionManager, connectionId, "apply changes");
+    const driver = connectionManager.getDriver(connectionId);
+    if (!driver) {
+      return { success: false, error: "Not connected" };
+    }
+    await driver.runTransaction([
+      ...inserts.map((plan) => ({
+        ...plan.operation,
+        checkAffectedRows: true,
+      })),
+      ...(apply?.operations ?? []),
+    ]);
+    return {
+      ...(apply
+        ? await verifyAppliedPlan(driver, apply)
+        : { success: true, rowOutcomes: [] }),
+      insertApplied: inserts.length > 0,
+    };
+  } catch (error: unknown) {
+    const message = `Transaction failed; its outcome may be unknown. Refresh and verify the data before retrying. ${error instanceof Error ? error.message : String(error)}`;
+    return {
+      success: false,
+      error: message,
+      rowOutcomes: (apply?.updates ?? []).map((_, rowIndex) =>
+        buildSkippedOutcome(rowIndex, message, false),
+      ),
+    };
+  }
+}
 export function prepareApplyChangesPlan(
   connectionManager: ConnectionManager,
   connectionId: string,
@@ -86,6 +144,23 @@ export function prepareApplyChangesPlan(
       return {
         primaryKeys: coerceRecord(driver, update.primaryKeys, columnMetaByName),
         changes: coerceRecord(driver, writableChanges, columnMetaByName),
+        ...(update.originalValues
+          ? {
+              originalValues: Object.fromEntries(
+                Object.entries(update.originalValues).map(([name, value]) => {
+                  const column = columnMetaByName.get(name);
+                  return [
+                    name,
+                    column
+                      ? driver.coerceOriginalValue
+                        ? driver.coerceOriginalValue(value, column)
+                        : driver.coerceInputValue(value, column)
+                      : value,
+                  ];
+                }),
+              ),
+            }
+          : {}),
       };
     });
     const executableUpdates = coercedUpdates.filter(
@@ -113,19 +188,21 @@ export function prepareApplyChangesPlan(
         cols: columns,
         updates: coercedUpdates,
         operations: [],
-        previewStatements: executableUpdates.map(({ primaryKeys, changes }) =>
-          driver.buildMutationPreviewStatement
-            ? driver.buildMutationPreviewStatement(
-                "update",
-                database,
-                schema,
-                table,
-                {
-                  primaryKeys,
-                  changes,
-                },
-              )
-            : `UPDATE ${driver.qualifiedTableName(database, schema, table)} ${JSON.stringify({ primaryKeys, changes })}`,
+        previewStatements: executableUpdates.map(
+          ({ primaryKeys, changes, originalValues }) =>
+            driver.buildMutationPreviewStatement
+              ? driver.buildMutationPreviewStatement(
+                  "update",
+                  database,
+                  schema,
+                  table,
+                  {
+                    primaryKeys,
+                    changes,
+                    originalValues,
+                  },
+                )
+              : `UPDATE ${driver.qualifiedTableName(database, schema, table)} ${JSON.stringify({ primaryKeys, changes, originalValues })}`,
         ),
         skippedRows: [...skippedRows],
         verificationTargets: [],
@@ -147,7 +224,10 @@ export function prepareApplyChangesPlan(
   const previewStatements: string[] = [];
   const verificationTargets: VerificationTarget[] = [];
   const skippedRows = new Set<number>();
-  for (const [rowIndex, { primaryKeys, changes }] of updates.entries()) {
+  for (const [
+    rowIndex,
+    { primaryKeys, changes, originalValues },
+  ] of updates.entries()) {
     const verificationValues: VerificationTarget["values"] = [];
     const verificationPrimaryKeys = { ...primaryKeys };
     for (const [columnName, nextValue] of Object.entries(changes)) {
@@ -177,6 +257,7 @@ export function prepareApplyChangesPlan(
       primaryKeys,
       changes,
       columns,
+      originalValues,
     );
     if (!operation) {
       skippedRows.add(rowIndex);
@@ -191,6 +272,7 @@ export function prepareApplyChangesPlan(
       changes,
       primaryKeys,
       columnMetaByName,
+      originalValues,
     );
     previewStatements.push(
       typeof previewDriver.materializePreviewColumnSql === "function"
@@ -239,6 +321,7 @@ function buildUpdatePreviewColumns(
   changes: Record<string, unknown>,
   primaryKeys: Record<string, unknown>,
   columnMetaByName: ReadonlyMap<string, ColumnTypeMeta>,
+  originalValues: Record<string, unknown> = {},
 ): Array<ColumnTypeMeta | undefined> {
   const setColumns = Object.entries(changes)
     .filter(
@@ -249,7 +332,13 @@ function buildUpdatePreviewColumns(
   const whereColumns = Object.keys(primaryKeys).map((columnName) =>
     columnMetaByName.get(columnName),
   );
-  return [...setColumns, ...whereColumns];
+  const originalColumns = Object.entries(originalValues)
+    .filter(
+      ([name, value]) =>
+        value !== undefined && value !== null && columnMetaByName.has(name),
+    )
+    .map(([name]) => columnMetaByName.get(name));
+  return [...setColumns, ...whereColumns, ...originalColumns];
 }
 export async function executePreparedApplyPlan(
   connectionManager: ConnectionManager,
@@ -288,6 +377,9 @@ export async function executePreparedApplyPlan(
         updates: executableUpdates.map((update) => ({
           primaryKeys: update.primaryKeys,
           changes: update.changes,
+          ...(update.originalValues
+            ? { originalValues: update.originalValues }
+            : {}),
         })),
       });
       const rowOutcomes = plan.updates.map((_, rowIndex) =>
@@ -300,12 +392,9 @@ export async function executePreparedApplyPlan(
             },
       ) satisfies ApplyRowOutcome[];
       if (result.affectedRows < executableUpdates.length) {
-        return {
-          success: true,
-          warning:
-            "Some updates may not have matched a row in the source backend.",
-          rowOutcomes,
-        };
+        throw new Error(
+          "One or more rows changed after they were loaded. Refresh the table and retry.",
+        );
       }
       return { success: true, rowOutcomes };
     } catch (error: unknown) {
@@ -326,67 +415,71 @@ export async function executePreparedApplyPlan(
 
   try {
     await driver.runTransaction(plan.operations);
-    const verificationFailures = await verifyExactNumericUpdates(
-      driver,
-      plan.database,
-      plan.schema,
-      plan.table,
-      plan.cols,
-      plan.verificationTargets,
-    );
-    const verificationFailuresByRow = new Map(
-      verificationFailures.map((failure) => [failure.rowIndex, failure]),
-    );
-    const rowOutcomes = plan.updates.map((_, rowIndex) => {
-      if (skippedRows.has(rowIndex)) {
-        return buildSkippedOutcome(rowIndex, "No changes to apply.");
-      }
-      const verificationFailure = verificationFailuresByRow.get(rowIndex);
-      if (verificationFailure) {
-        return {
-          rowIndex,
-          success: false,
-          status: "verification_failed",
-          message: verificationFailure.message,
-          columns: verificationFailure.columns,
-        } satisfies ApplyRowOutcome;
-      }
-      return {
-        rowIndex,
-        success: true,
-        status: "applied",
-      } satisfies ApplyRowOutcome;
-    });
-    if (verificationFailures.length > 0) {
-      return {
-        success: true,
-        warning: summarizeOutcomeMessages(
-          "Some edits were written but could not be confirmed exactly.",
-          rowOutcomes.filter(
-            (outcome) => outcome.status === "verification_failed",
-          ),
-        ),
-        failedRows: verificationFailures.map((failure) => failure.rowIndex),
-        rowOutcomes,
-      };
-    }
-    return { success: true, rowOutcomes };
+    return await verifyAppliedPlan(driver, plan);
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = `Transaction failed; its outcome may be unknown. Refresh and verify the data before retrying. ${error instanceof Error ? error.message : String(error)}`;
     return {
       success: false,
       error: message,
       rowOutcomes: plan.updates.map((_, rowIndex) =>
         skippedRows.has(rowIndex)
           ? buildSkippedOutcome(rowIndex, "No changes to apply.")
-          : buildSkippedOutcome(
-              rowIndex,
-              `The transaction was rolled back: ${message}`,
-              false,
-            ),
+          : buildSkippedOutcome(rowIndex, message, false),
       ),
     };
   }
+}
+
+async function verifyAppliedPlan(
+  driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>,
+  plan: PreparedApplyPlan,
+): Promise<ApplyResultPayload> {
+  const skippedRows = new Set(plan.skippedRows);
+  const verificationFailures = await verifyExactNumericUpdates(
+    driver,
+    plan.database,
+    plan.schema,
+    plan.table,
+    plan.cols,
+    plan.verificationTargets,
+  );
+  const verificationFailuresByRow = new Map(
+    verificationFailures.map((failure) => [failure.rowIndex, failure]),
+  );
+  const rowOutcomes = plan.updates.map((_, rowIndex) => {
+    if (skippedRows.has(rowIndex)) {
+      return buildSkippedOutcome(rowIndex, "No changes to apply.");
+    }
+    const verificationFailure = verificationFailuresByRow.get(rowIndex);
+    if (verificationFailure) {
+      return {
+        rowIndex,
+        success: false,
+        status: "verification_failed",
+        message: verificationFailure.message,
+        columns: verificationFailure.columns,
+      } satisfies ApplyRowOutcome;
+    }
+    return {
+      rowIndex,
+      success: true,
+      status: "applied",
+    } satisfies ApplyRowOutcome;
+  });
+  if (verificationFailures.length > 0) {
+    return {
+      success: true,
+      warning: summarizeOutcomeMessages(
+        "Some edits were written but could not be confirmed exactly.",
+        rowOutcomes.filter(
+          (outcome) => outcome.status === "verification_failed",
+        ),
+      ),
+      failedRows: verificationFailures.map((failure) => failure.rowIndex),
+      rowOutcomes,
+    };
+  }
+  return { success: true, rowOutcomes };
 }
 function summarizeOutcomeMessages(
   prefix: string,

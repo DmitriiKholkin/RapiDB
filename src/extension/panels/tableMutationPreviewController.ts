@@ -5,6 +5,7 @@ import type {
 } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import {
+  executeAtomicSqlApplyPlan,
   executePreparedApplyPlan,
   type PreparedApplyPlan,
   type PreparedDeletePlan,
@@ -33,6 +34,7 @@ function resolvePreviewContentType(
 
 type PendingTableMutationPreview =
   | {
+      operationId: string;
       kind: "applyChanges";
       plan: {
         apply: PreparedApplyPlan | null;
@@ -41,10 +43,12 @@ type PendingTableMutationPreview =
       };
     }
   | {
+      operationId: string;
       kind: "insertRow";
       plan: PreparedInsertPlan;
     }
   | {
+      operationId: string;
       kind: "deleteRows";
       plan: PreparedDeletePlan;
     };
@@ -57,6 +61,7 @@ type MutationPreviewExecutionResult =
   | {
       type: "insertResult" | "deleteResult";
       payload: {
+        operationId: string;
         success: boolean;
         error?: string;
       };
@@ -100,35 +105,58 @@ export class TableMutationPreviewController {
     this.pendingMutationPreviews.clear();
   }
 
-  createApplyChangesPreview(plan: {
-    apply: PreparedApplyPlan | null;
-    applyResultWhenEmpty: ApplyResultPayload | null;
-    inserts: PreparedInsertPlan[];
-  }): TableMutationPreviewPayload {
-    return this.storePreview({ kind: "applyChanges", plan });
+  createApplyChangesPreview(
+    operationId: string,
+    plan: {
+      apply: PreparedApplyPlan | null;
+      applyResultWhenEmpty: ApplyResultPayload | null;
+      inserts: PreparedInsertPlan[];
+    },
+  ): TableMutationPreviewPayload {
+    return this.storePreview({ operationId, kind: "applyChanges", plan });
   }
 
-  createInsertPreview(plan: PreparedInsertPlan): TableMutationPreviewPayload {
-    return this.storePreview({ kind: "insertRow", plan });
+  createInsertPreview(
+    operationId: string,
+    plan: PreparedInsertPlan,
+  ): TableMutationPreviewPayload {
+    return this.storePreview({ operationId, kind: "insertRow", plan });
   }
 
   createDeleteRowsPreview(
+    operationId: string,
     plan: PreparedDeletePlan,
   ): TableMutationPreviewPayload {
-    return this.storePreview({ kind: "deleteRows", plan });
+    return this.storePreview({ operationId, kind: "deleteRows", plan });
   }
 
   async confirm(
     previewToken: string,
+    operationId?: string,
   ): Promise<MutationPreviewExecutionResult | null> {
     const preview = this.pendingMutationPreviews.get(previewToken);
-    if (!preview) {
+    if (!preview || (operationId && preview.operationId !== operationId)) {
       return null;
     }
 
     this.pendingMutationPreviews.delete(previewToken);
 
     if (preview.kind === "applyChanges") {
+      const operationCount =
+        preview.plan.inserts.length +
+        ((preview.plan.apply?.updates.length ?? 0) -
+          (preview.plan.apply?.skippedRows.length ?? 0));
+      if (operationCount > 1) {
+        const payload = await executeAtomicSqlApplyPlan(
+          this.connectionManager,
+          preview.plan.apply,
+          preview.plan.inserts,
+        );
+        return {
+          type: "applyResult",
+          payload: { ...payload, operationId: preview.operationId },
+        };
+      }
       let insertApplied = false;
       let succeededCount = 0;
       const errors: string[] = [];
@@ -148,6 +176,7 @@ export class TableMutationPreviewController {
         return {
           type: "applyResult",
           payload: {
+            operationId: preview.operationId,
             success: false,
             error: `All inserts failed: ${errors.join("; ")}`,
           },
@@ -158,6 +187,7 @@ export class TableMutationPreviewController {
         return {
           type: "applyResult",
           payload: {
+            operationId: preview.operationId,
             success: false,
             insertApplied: true,
             error: `${succeededCount} row(s) inserted, ${errors.length} failed: ${errors.join("; ")}`,
@@ -176,8 +206,8 @@ export class TableMutationPreviewController {
           });
 
       const payload: ApplyResultPayload = insertApplied
-        ? { ...result, insertApplied: true }
-        : result;
+        ? { ...result, operationId: preview.operationId, insertApplied: true }
+        : { ...result, operationId: preview.operationId };
 
       if (payload.warning) {
         this.notifyWarning(payload.warning);
@@ -198,13 +228,14 @@ export class TableMutationPreviewController {
 
       return {
         type: preview.kind === "insertRow" ? "insertResult" : "deleteResult",
-        payload: { success: true },
+        payload: { operationId: preview.operationId, success: true },
       };
     } catch (error: unknown) {
       const normalized = normalizeUnknownError(error);
       return {
         type: preview.kind === "insertRow" ? "insertResult" : "deleteResult",
         payload: {
+          operationId: preview.operationId,
           success: false,
           error: normalized.message,
         },
@@ -212,8 +243,11 @@ export class TableMutationPreviewController {
     }
   }
 
-  cancel(previewToken: string): void {
-    this.pendingMutationPreviews.delete(previewToken);
+  cancel(previewToken: string, operationId?: string): void {
+    const preview = this.pendingMutationPreviews.get(previewToken);
+    if (preview && (!operationId || preview.operationId === operationId)) {
+      this.pendingMutationPreviews.delete(previewToken);
+    }
   }
 
   private storePreview(
@@ -256,6 +290,7 @@ export class TableMutationPreviewController {
     const contentType = resolvePreviewContentType(editorPresentation);
 
     return {
+      operationId: preview.operationId,
       previewToken,
       kind: preview.kind,
       title,

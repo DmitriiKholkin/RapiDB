@@ -43,6 +43,12 @@
   "activationEvents": [
     "onStartupFinished"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Dynamic native SQLite runtime installation is disabled in untrusted workspaces."
+    }
+  },
   "contributes": {
     "commands": [
       {
@@ -745,7 +751,7 @@
     "db:cleanup-mssql": "node ./tests/scripts/cleanup-mssql.mjs",
     "db:prepare": "node ./tests/scripts/run-npm-scripts.mjs db:wait db:reset db:seed",
     "db:down": "docker compose -f ./compose.yaml down --remove-orphans",
-    "package": "vsce package"
+    "package": "vsce package --allow-missing-repository"
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.16",
@@ -760,12 +766,13 @@
     "@types/react-dom": "19.2.3",
     "@types/vscode": "1.90.0",
     "@vscode/test-electron": "2.5.2",
+    "@vscode/vsce": "4.0.0",
     "axe-core": "4.11.4",
     "esbuild": "0.28.1",
     "jsdom": "29.1.1",
     "tsx": "4.22.3",
     "typescript": "6.0.3",
-    "vitest": "4.1.7"
+    "vitest": "4.1.11"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "3.1057.0",
@@ -784,7 +791,7 @@
     "monaco-editor": "0.53.0",
     "mongodb": "7.2.0",
     "mssql": "12.5.5",
-    "mysql2": "3.22.4",
+    "mysql2": "3.24.4",
     "oracledb": "6.10.0",
     "pg": "8.21.0",
     "react": "19.2.6",

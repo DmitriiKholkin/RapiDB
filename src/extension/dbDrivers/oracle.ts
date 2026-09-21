@@ -1,5 +1,6 @@
 import oracledb from "oracledb";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
+import type { OperationCancellationContext } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
@@ -8,7 +9,10 @@ import {
   formatHexSqlPreviewLiteral,
   formatSqlPreviewStringLiteral,
 } from "./sqlPreviewLiterals";
-import type { DriverTimeoutSettingsProvider } from "./timeout";
+import {
+  type DriverTimeoutSettingsProvider,
+  throwIfTransactionCancelled,
+} from "./timeout";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -746,6 +750,11 @@ const ORACLE_FILTER_DENYLIST = new Set([
   "anydata",
   "anytype",
 ]);
+interface OracleQueryOperation {
+  requestToken?: number;
+  connection?: oracledb.Connection;
+  cancelled: boolean;
+}
 export class OracleDriver extends BaseDBDriver {
   protected override getQueryEditorSqlDialect() {
     return "plsql" as const;
@@ -753,6 +762,7 @@ export class OracleDriver extends BaseDBDriver {
 
   private pool: oracledb.Pool | null = null;
   private readonly config: ConnectionConfig;
+  private readonly activeQueryOperations = new Set<OracleQueryOperation>();
   constructor(
     config: ConnectionConfig,
     timeoutSettingsProvider?: DriverTimeoutSettingsProvider,
@@ -803,6 +813,25 @@ export class OracleDriver extends BaseDBDriver {
       } catch {}
       this.pool = null;
     }
+  }
+  async cancelCurrentOperation(
+    context?: OperationCancellationContext,
+  ): Promise<void> {
+    if (
+      context?.operationName !== "query" ||
+      context.requestToken === undefined
+    ) {
+      return;
+    }
+    await Promise.all(
+      [...this.activeQueryOperations].map(async (operation) => {
+        if (operation.requestToken !== context.requestToken) {
+          return;
+        }
+        operation.cancelled = true;
+        await operation.connection?.break().catch(() => undefined);
+      }),
+    );
   }
   isConnected(): boolean {
     if (!this.pool) {
@@ -1888,31 +1917,63 @@ export class OracleDriver extends BaseDBDriver {
       await conn.close();
     }
   }
-  async query(sql: string, params?: unknown[]): Promise<QueryResult> {
+  async query(
+    sql: string,
+    params?: unknown[],
+    operationContext?: { requestToken?: number; readOnly?: boolean },
+  ): Promise<QueryResult> {
     const start = Date.now();
-    if (params && params.length > 0) {
-      return this._execOne(sql, params, start);
-    }
-    const statements = splitOracleStatements(sql.trim());
-    let selectResult: QueryResult | null = null;
-    let totalAffected = 0;
-    for (const stmt of statements) {
-      const result = await this._execOne(stmt, undefined, start);
-      totalAffected += result.rowCount;
-      if (result.columns.length > 0) {
-        selectResult = result;
-      }
-    }
-    if (selectResult) {
-      return { ...selectResult, executionTimeMs: Date.now() - start };
-    }
-    return {
-      columns: [],
-      rows: [],
-      rowCount: totalAffected,
-      executionTimeMs: Date.now() - start,
-      affectedRows: totalAffected,
+    const operation: OracleQueryOperation = {
+      requestToken: operationContext?.requestToken,
+      cancelled: false,
     };
+    this.activeQueryOperations.add(operation);
+    let conn: oracledb.Connection | undefined;
+    try {
+      conn = await this.getConnection();
+      operation.connection = conn;
+      if (operationContext?.readOnly) {
+        await conn.execute("SET TRANSACTION READ ONLY");
+      }
+      const statements =
+        params && params.length > 0 ? [sql] : splitOracleStatements(sql.trim());
+      let selectResult: QueryResult | null = null;
+      let totalAffected = 0;
+      for (const stmt of statements) {
+        if (operation.cancelled) {
+          throw new Error("Oracle query cancelled before execution completed.");
+        }
+        const result = await this._execOne(conn, stmt, params, start);
+        totalAffected += result.rowCount;
+        if (result.columns.length > 0) {
+          selectResult = result;
+        }
+      }
+      if (operation.cancelled) {
+        throw new Error("Oracle query cancelled before commit.");
+      }
+      if (operationContext?.readOnly) {
+        await conn.rollback();
+      } else {
+        await conn.commit();
+      }
+      if (selectResult) {
+        return { ...selectResult, executionTimeMs: Date.now() - start };
+      }
+      return {
+        columns: [],
+        rows: [],
+        rowCount: totalAffected,
+        executionTimeMs: Date.now() - start,
+        affectedRows: totalAffected,
+      };
+    } catch (error) {
+      await conn?.rollback().catch(() => undefined);
+      throw error;
+    } finally {
+      this.activeQueryOperations.delete(operation);
+      await conn?.close();
+    }
   }
   private _fetchTypeHandler(
     metaData: oracledb.Metadata<unknown>,
@@ -1936,67 +1997,70 @@ export class OracleDriver extends BaseDBDriver {
     return undefined;
   }
   private async _execOne(
+    conn: oracledb.Connection,
     sql: string,
     params: unknown[] | undefined,
     start: number,
   ): Promise<QueryResult> {
-    const conn = await this.getConnection();
-    try {
-      let finalSql = sql;
-      let binds: unknown[] = [];
-      if (params && params.length > 0) {
-        const replaced = replacePositionalParams(sql, params);
-        finalSql = replaced.sql;
-        binds = replaced.binds;
-      }
-      const options: oracledb.ExecuteOptions = {
-        outFormat: oracledb.OUT_FORMAT_ARRAY,
-        fetchArraySize: 100,
-        autoCommit: true,
-        fetchTypeHandler: this._fetchTypeHandler.bind(this),
-      };
-      const res = await conn.execute(finalSql, binds, options);
-      const executionTimeMs = Date.now() - start;
-      if (res.metaData && res.rows && res.rows.length > 0) {
-        const metaData = res.metaData;
-        const columns = metaData.map((m) => m.name);
-        const rows = (res.rows as unknown[][]).map((row) =>
-          Object.fromEntries(
-            row.map((val, i) => [
-              `__col_${i}`,
-              formatOracleQueryValue(val, metaData[i]),
-            ]),
-          ),
-        );
-        return { columns, rows, rowCount: rows.length, executionTimeMs };
-      }
-      if (res.metaData) {
-        const columns = res.metaData.map((m) => m.name);
-        return {
-          columns,
-          rows: [],
-          rowCount: res.rowsAffected ?? 0,
-          executionTimeMs,
-        };
-      }
-      const affectedRows = res.rowsAffected ?? 0;
-      return {
-        columns: [],
-        rows: [],
-        rowCount: affectedRows,
-        executionTimeMs,
-        affectedRows,
-      };
-    } finally {
-      await conn.close();
+    let finalSql = sql;
+    let binds: unknown[] = [];
+    if (params && params.length > 0) {
+      const replaced = replacePositionalParams(sql, params);
+      finalSql = replaced.sql;
+      binds = replaced.binds;
     }
+    const options: oracledb.ExecuteOptions = {
+      outFormat: oracledb.OUT_FORMAT_ARRAY,
+      fetchArraySize: 100,
+      autoCommit: false,
+      fetchTypeHandler: this._fetchTypeHandler.bind(this),
+    };
+    const res = await conn.execute(finalSql, binds, options);
+    const executionTimeMs = Date.now() - start;
+    if (res.metaData && res.rows && res.rows.length > 0) {
+      const metaData = res.metaData;
+      const columns = metaData.map((m) => m.name);
+      const rows = (res.rows as unknown[][]).map((row) =>
+        Object.fromEntries(
+          row.map((val, i) => [
+            `__col_${i}`,
+            formatOracleQueryValue(val, metaData[i]),
+          ]),
+        ),
+      );
+      return { columns, rows, rowCount: rows.length, executionTimeMs };
+    }
+    if (res.metaData) {
+      const columns = res.metaData.map((m) => m.name);
+      return {
+        columns,
+        rows: [],
+        rowCount: res.rowsAffected ?? 0,
+        executionTimeMs,
+      };
+    }
+    const affectedRows = res.rowsAffected ?? 0;
+    return {
+      columns: [],
+      rows: [],
+      rowCount: affectedRows,
+      executionTimeMs,
+      affectedRows,
+    };
   }
   async runTransaction(
     operations: import("./types").TransactionOperation[],
+    context?: import("./types").TransactionContext,
   ): Promise<void> {
+    throwIfTransactionCancelled(context);
     const conn = await this.getConnection();
+    const cancel = () => {
+      void conn.break().catch(() => undefined);
+    };
+    context?.signal.addEventListener("abort", cancel, { once: true });
     try {
       for (const op of operations) {
+        throwIfTransactionCancelled(context);
         let finalSql = op.sql;
         let binds: Record<string, unknown> | unknown[] = {};
         if (op.params && op.params.length > 0) {
@@ -2018,6 +2082,7 @@ export class OracleDriver extends BaseDBDriver {
           );
         }
       }
+      throwIfTransactionCancelled(context);
       await conn.commit();
     } catch (e) {
       try {
@@ -2025,6 +2090,7 @@ export class OracleDriver extends BaseDBDriver {
       } catch {}
       throw e;
     } finally {
+      context?.signal.removeEventListener("abort", cancel);
       await conn.close();
     }
   }
@@ -2168,6 +2234,28 @@ export class OracleDriver extends BaseDBDriver {
   }
   override buildSetExpr(column: ColumnTypeMeta, paramIndex: number): string {
     return `${this.quoteIdentifier(column.name)} = :${paramIndex}`;
+  }
+  override buildOriginalValueComparison(
+    column: ColumnTypeMeta,
+    paramIndex: number,
+  ): string {
+    const name = this.quoteIdentifier(column.name);
+    const type = oracleTypeName(column.nativeType);
+    if (type === "CLOB" || type === "NCLOB" || type === "BLOB") {
+      return `DBMS_LOB.COMPARE(${name}, TO_${type}(:${paramIndex})) = 0`;
+    }
+    if (type === "XMLTYPE") {
+      return `DBMS_LOB.COMPARE(XMLSERIALIZE(CONTENT ${name} AS CLOB), XMLSERIALIZE(CONTENT XMLTYPE(:${paramIndex}) AS CLOB)) = 0`;
+    }
+    if (type === "SDO_GEOMETRY") {
+      return `DBMS_LOB.COMPARE(SDO_UTIL.TO_WKTGEOMETRY(${name}), TO_CLOB(:${paramIndex})) = 0`;
+    }
+    if (type === "LONG" || type === "LONG RAW") {
+      throw new Error(
+        `Optimistic conflict detection is not supported for Oracle ${type} columns. Convert ${column.name} to a LOB before editing.`,
+      );
+    }
+    return super.buildOriginalValueComparison(column, paramIndex);
   }
   materializePreviewInsertSql(
     sql: string,

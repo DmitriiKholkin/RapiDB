@@ -15,7 +15,6 @@ import {
   Timestamp,
   UUID,
 } from "mongodb";
-import type { OperationCancellationContext } from "../../shared/safetyContracts";
 import { QUERY_LIMIT_POLICY } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
@@ -949,15 +948,6 @@ export class MongoDBDriver implements IDBDriver {
     this.connected = false;
   }
 
-  async cancelCurrentOperation(
-    context?: OperationCancellationContext,
-  ): Promise<void> {
-    if (context?.reason === "timeout") {
-      return;
-    }
-    await this.recycleConnectionAfterTimeout(context);
-  }
-
   async recycleConnectionAfterTimeout(_context?: {
     timeoutKind?: "connection" | "dbOperation";
     operationName?: string;
@@ -1499,6 +1489,7 @@ export class MongoDBDriver implements IDBDriver {
         const sort = request.sort
           ? ([
               [request.sort.column, request.sort.direction === "desc" ? -1 : 1],
+              ...(request.sort.column === "_id" ? [] : [["_id", 1] as const]),
             ] as Array<[string, 1 | -1]>)
           : ([["_id", 1]] as Array<[string, 1 | -1]>);
         const docs = await this.requireDb(request.database)
@@ -1547,8 +1538,13 @@ export class MongoDBDriver implements IDBDriver {
     const rows = await this.readRows(
       request.database,
       request.table,
-      boundedReadLimit,
+      boundedReadLimit + 1,
     );
+    if (rows.length > boundedReadLimit) {
+      throw new Error(
+        `MongoDB filtering or sorting exceeded the ${boundedReadLimit}-row safety limit. Narrow the filter before continuing or exporting.`,
+      );
+    }
     const filtered = applyFilters(rows, normalizedFilters);
     const sorted = applySort(filtered, request.sort);
     const paged = pageRows(sorted, request.page, request.pageSize);
@@ -1693,7 +1689,10 @@ export class MongoDBDriver implements IDBDriver {
       ) {
         throw new Error("MongoDB does not support updating the _id field.");
       }
-      const criteria = this.normalizeCriteria(update.primaryKeys);
+      const criteria = this.normalizeCriteria({
+        ...update.primaryKeys,
+        ...(update.originalValues ?? {}),
+      });
       const result = await collection.updateOne(criteria, {
         $set: update.changes,
       });
@@ -1790,6 +1789,12 @@ export class MongoDBDriver implements IDBDriver {
 
   buildOrderByDefault(_cols: ColumnTypeMeta[]): string {
     return "ORDER BY _id";
+  }
+
+  coerceOriginalValue(value: unknown, column: ColumnTypeMeta): unknown {
+    return column.nativeType === "string"
+      ? value
+      : this.coerceInputValue(value, column);
   }
 
   coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
@@ -2154,22 +2159,18 @@ export class MongoDBDriver implements IDBDriver {
     table: string,
     limit: number,
   ): Promise<Record<string, unknown>[]> {
-    try {
-      const docs = await this.requireDb(database)
-        .collection(table)
-        .find(
-          {},
-          {
-            promoteValues: false,
-            bsonRegExp: false,
-          },
-        )
-        .limit(limit)
-        .toArray();
-      return docs.map((doc) => this.toRow(doc as Record<string, unknown>));
-    } catch {
-      return [];
-    }
+    const docs = await this.requireDb(database)
+      .collection(table)
+      .find(
+        {},
+        {
+          promoteValues: false,
+          bsonRegExp: false,
+        },
+      )
+      .limit(limit)
+      .toArray();
+    return docs.map((doc) => this.toRow(doc as Record<string, unknown>));
   }
 
   private normalizeCriteria(

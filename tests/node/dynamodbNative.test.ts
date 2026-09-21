@@ -1,4 +1,4 @@
-import { marshall } from "@aws-sdk/util-dynamodb";
+import { marshall, NumberValueImpl } from "@aws-sdk/util-dynamodb";
 import { describe, expect, it, vi } from "vitest";
 import { DynamoDBDriver } from "../../src/extension/dbDrivers/dynamodb";
 import type {
@@ -212,6 +212,66 @@ function commandInputs(
 }
 
 describe("parseDynamoDbNativeQueryInput", () => {
+  it("renders native query numbers as exact scalars with numeric metadata", async () => {
+    const { driver, queueResponses } = createDriver();
+    queueResponses({
+      Items: [
+        {
+          amount: { N: "9007199254740993.1250" },
+          count: { N: "9007199254740993" },
+        },
+      ],
+    });
+    const result = await driver.query(JSON.stringify({ TableName: "users" }));
+    expect(result.rows).toEqual([
+      { __col_0: "9007199254740993.1250", __col_1: "9007199254740993" },
+    ]);
+    expect(result.columnMeta).toEqual([
+      { category: "decimal" },
+      { category: "integer" },
+    ]);
+  });
+
+  it("preserves prototype-like keys and user objects resembling raw numeric tokens", () => {
+    const { driver } = createDriver();
+    const text =
+      '{"__proto__":{"n":9007199254740993},"nested":{"__rapidbRawNumber":true,"raw":"123","keep":"data"}}';
+    const value = driver.coerceInputValue(text, createMapColumn());
+    expect(Object.hasOwn(value as object, "__proto__")).toBe(true);
+    expect(driver.formatOutputValue(value, createMapColumn())).toBe(text);
+  });
+
+  it("guards nested special values even when another row supplied string metadata", () => {
+    const { driver } = createDriver();
+    const column = {
+      ...createMapColumn(),
+      nativeType: "string",
+      category: "text" as const,
+    };
+    const displayed = driver.formatOutputValue(
+      { nested: new Set(["a"]) },
+      column,
+    );
+    expect(displayed).toMatch(/^Read-only DynamoDB value/);
+    expect(() => driver.coerceInputValue(displayed, column)).toThrow(
+      "read-only",
+    );
+  });
+
+  it.each([
+    new Set(["a"]),
+    Buffer.from([1, 2]),
+    new Set([NumberValueImpl.from("9007199254740993")]),
+  ])("blocks lossy nested set/binary table edits (%s)", (special) => {
+    const { driver } = createDriver();
+    const column = createMapColumn();
+    const displayed = driver.formatOutputValue({ nested: [special] }, column);
+    expect(displayed).toMatch(/^Read-only DynamoDB value/);
+    expect(() => driver.coerceInputValue(displayed, column)).toThrow(
+      "read-only",
+    );
+  });
+
   it("parses a single raw AWS request body", () => {
     expect(
       parseDynamoDbNativeQueryInput(
@@ -646,11 +706,11 @@ describe("DynamoDBDriver native API", () => {
     expect(plan.values).toEqual({
       tenant_id: "tenant-1",
       user_id: "user-1",
-      age: 31,
+      age: NumberValueImpl.from("31"),
       active: true,
-      profile: { tier: "pro", visits: 3 },
+      profile: { tier: "pro", visits: NumberValueImpl.from("3") },
       tags: new Set(["alpha", "beta"]),
-      history: [1, "two", true],
+      history: [NumberValueImpl.from("1"), "two", true],
       payload: Buffer.from([0xde, 0xad, 0xbe, 0xef]),
     });
 
@@ -790,6 +850,45 @@ describe("DynamoDBDriver native API", () => {
         "#k1": "user_id",
       },
     });
+  });
+
+  it("uses TransactWriteItems for multi-row table updates", async () => {
+    const { driver, clientSend } = createDriver();
+
+    await expect(
+      driver.updateRows({
+        database: "us-east-1",
+        schema: "us-east-1",
+        table: "users",
+        updates: [
+          {
+            primaryKeys: { tenant_id: "tenant-1", user_id: "user-1" },
+            changes: { email: "one@example.com" },
+            originalValues: { email: "old-one@example.com" },
+          },
+          {
+            primaryKeys: { tenant_id: "tenant-1", user_id: "user-2" },
+            changes: { email: "two@example.com" },
+            originalValues: { email: "old-two@example.com" },
+          },
+        ],
+      }),
+    ).resolves.toEqual({ affectedRows: 2 });
+
+    const transaction = commandInputs(clientSend, "TransactWriteItemsCommand");
+    expect(transaction).toHaveLength(1);
+    expect(transaction[0]?.TransactItems).toHaveLength(2);
+    expect(transaction[0]).toEqual(
+      expect.objectContaining({
+        TransactItems: expect.arrayContaining([
+          expect.objectContaining({
+            Update: expect.objectContaining({
+              ConditionExpression: expect.stringContaining("#o0 = :o0"),
+            }),
+          }),
+        ]),
+      }),
+    );
   });
 
   it("aliases reserved key names in mutation conditions", async () => {

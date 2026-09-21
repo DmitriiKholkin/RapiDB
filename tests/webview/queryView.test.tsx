@@ -181,6 +181,40 @@ describe("QueryView", () => {
     });
   });
 
+  it("resets running state on connection switch and ignores the old completion", async () => {
+    const user = userEvent.setup();
+    render(<QueryView connectionId="conn-1" initialQueryText="select 1" />);
+    dispatchIncomingMessage("connections", [
+      { id: "conn-1", name: "First", type: "pg" },
+      { id: "conn-2", name: "Second", type: "pg" },
+    ]);
+    await user.click(screen.getByRole("button", { name: "Run" }));
+    const oldRequest = getPostedMessages().find(
+      (message) => message.type === "executeQuery",
+    )?.payload;
+    expect(oldRequest).toMatchObject({
+      connectionId: "conn-1",
+      operationId: expect.any(String),
+    });
+    expect(useQueryStore.getState().status).toBe("running");
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Active connection" }),
+      "conn-2",
+    );
+    expect(useQueryStore.getState().status).toBe("idle");
+    dispatchIncomingMessage("queryResult", {
+      ...(oldRequest as object),
+      connectionId: "conn-1",
+      columns: [],
+      rows: [],
+      rowCount: 0,
+      executionTimeMs: 0,
+    });
+    expect(useQueryStore.getState().status).toBe("idle");
+    await user.click(screen.getByRole("button", { name: "Run" }));
+    expect(useQueryStore.getState().status).toBe("running");
+  });
+
   it("auto-formats when the active connection presentation arrives after mount", async () => {
     render(<QueryView connectionId="conn-1" initialQueryText="select 1" />);
 
@@ -535,8 +569,26 @@ describe("QueryView", () => {
 
     expect(getLastPostedMessage()).toEqual({
       type: "executeQuery",
-      payload: { queryText: "select 42", connectionId: "conn-1" },
+      payload: {
+        queryText: "select 42",
+        connectionId: "conn-1",
+        operationId: "query:1",
+      },
     });
+
+    dispatchIncomingMessage("queryResult", {
+      columns: [],
+      columnMeta: [],
+      rows: [],
+      rowCount: 0,
+      executionTimeMs: 1,
+      error: "Stale error",
+      operationId: "other-panel:1",
+      connectionId: "conn-1",
+    });
+    expect(screen.getByTestId("results-panel").textContent).toBe(
+      "query:running:none",
+    );
 
     dispatchIncomingMessage("queryResult", {
       columns: [],
@@ -545,6 +597,8 @@ describe("QueryView", () => {
       rowCount: 0,
       executionTimeMs: 3,
       error: "Bad SQL",
+      operationId: "query:1",
+      connectionId: "conn-1",
     });
 
     await waitFor(() => {
@@ -577,6 +631,7 @@ describe("QueryView", () => {
   });
 
   it("caps oversized query results in webview state as a defensive fallback", async () => {
+    const user = userEvent.setup();
     const hardCap = QUERY_LIMIT_POLICY.hardCap;
 
     render(
@@ -606,12 +661,16 @@ describe("QueryView", () => {
       __col_0: index,
     }));
 
+    await user.click(screen.getByRole("button", { name: "Run" }));
+
     dispatchIncomingMessage("queryResult", {
       columns: ["n"],
       columnMeta: [],
       rows: oversizedRows,
       rowCount: oversizedRows.length,
       executionTimeMs: 1,
+      operationId: "query:1",
+      connectionId: "conn-1",
     });
 
     await waitFor(() => {
@@ -661,6 +720,7 @@ describe("QueryView", () => {
       payload: {
         queryText: "db.users.find({})",
         connectionId: "conn-1",
+        operationId: "query:1",
       },
     });
   });
@@ -753,6 +813,7 @@ describe("QueryView", () => {
       payload: {
         queryText: formattedValue,
         connectionId: "conn-1",
+        operationId: "query:1",
       },
     });
   });

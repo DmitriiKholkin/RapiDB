@@ -35,6 +35,7 @@ export class ErdPanel {
   private readonly context: vscode.ExtensionContext;
   private readonly connectionManager: ConnectionManager;
   private readonly scope: ErdPanelScope;
+  private loadGeneration = 0;
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -136,9 +137,11 @@ export class ErdPanel {
   }
 
   private static key(scope: ErdPanelScope): string {
-    return [scope.connectionId, scope.database ?? "*", scope.schema ?? "*"]
-      .map((part) => part.trim())
-      .join("::");
+    return JSON.stringify([
+      scope.connectionId.trim(),
+      scope.database?.trim() ?? null,
+      scope.schema?.trim() ?? null,
+    ]);
   }
 
   private async handleMessage(message: unknown): Promise<void> {
@@ -180,6 +183,7 @@ export class ErdPanel {
     if (!graphService) {
       return;
     }
+    const generation = ++this.loadGeneration;
 
     this.post("erdLoading", {
       forceReload,
@@ -194,6 +198,7 @@ export class ErdPanel {
         },
         forceReload,
       );
+      if (generation !== this.loadGeneration) return;
 
       this.post("erdGraph", {
         graph: result.graph,
@@ -201,6 +206,7 @@ export class ErdPanel {
         loadedAt: new Date().toISOString(),
       });
     } catch (error) {
+      if (generation !== this.loadGeneration) return;
       const normalized = normalizeUnknownError(error);
       this.post("erdError", { error: normalized.message });
     }

@@ -21,8 +21,22 @@ const CSV_EXTENSION = "csv";
 const JSON_EXTENSION = "json";
 const LINE_BREAK = "\n";
 const LAST_EXPORT_DIRECTORY_STATE_KEY = "rapidb.lastExportDirectory";
+const NUMERIC_CSV_VALUE = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
 
 type ExportFormat = typeof CSV_EXTENSION | typeof JSON_EXTENSION;
+
+function formatCsvExportCell(
+  value: unknown,
+  category: ColumnTypeMeta["category"] | QueryColumnMeta["category"] | null,
+): string {
+  const formatted = formatTableCsvExportValue(value, category);
+  const trustedNumeric =
+    (category === "integer" ||
+      category === "float" ||
+      category === "decimal") &&
+    NUMERIC_CSV_VALUE.test(formatted);
+  return csvCell(formatted, trustedNumeric);
+}
 
 export interface QueryResultExport {
   columns: readonly string[];
@@ -244,21 +258,22 @@ async function writeQueryResultsCsv(
 
   await withWriteStream(filePath, async (writeStream) => {
     throwIfAborted(signal);
-    writeStream.write(result.columns.map(csvCell).join(",") + LINE_BREAK);
+    await writeStreamChunk(
+      writeStream,
+      result.columns.map((column) => csvCell(column)).join(",") + LINE_BREAK,
+      signal,
+    );
 
     for (const row of result.rows) {
       throwIfAborted(signal);
-      writeStream.write(
+      await writeStreamChunk(
+        writeStream,
         exportColumns
           .map((column) =>
-            csvCell(
-              formatTableCsvExportValue(
-                row[column.sourceKey],
-                column.category ?? null,
-              ),
-            ),
+            formatCsvExportCell(row[column.sourceKey], column.category ?? null),
           )
           .join(",") + LINE_BREAK,
+        signal,
       );
     }
   });
@@ -276,22 +291,24 @@ async function writeQueryResultsJson(
 
   await withWriteStream(filePath, async (writeStream) => {
     throwIfAborted(signal);
-    writeStream.write("[\n");
+    await writeStreamChunk(writeStream, "[\n", signal);
 
     for (let index = 0; index < result.rows.length; index++) {
       throwIfAborted(signal);
       const row = result.rows[index];
-      writeStream.write(
+      await writeStreamChunk(
+        writeStream,
         `${index === 0 ? "" : ",\n"}${serializeJsonExportRecord(
           exportColumns.map((column) => ({
             ...column,
             value: row[column.sourceKey],
           })),
         )}`,
+        signal,
       );
     }
 
-    writeStream.write("\n]\n");
+    await writeStreamChunk(writeStream, "\n]\n", signal);
   });
 }
 
@@ -306,26 +323,25 @@ async function writeChunkedCsv(
     for await (const chunk of chunks) {
       throwIfAborted(signal);
       if (!headerWritten) {
-        writeStream.write(
+        await writeStreamChunk(
+          writeStream,
           chunk.columns.map((column) => csvCell(column.name)).join(",") +
             LINE_BREAK,
+          signal,
         );
         headerWritten = true;
       }
 
       for (const row of chunk.rows) {
         throwIfAborted(signal);
-        writeStream.write(
+        await writeStreamChunk(
+          writeStream,
           chunk.columns
             .map((column) =>
-              csvCell(
-                formatTableCsvExportValue(
-                  row[column.name],
-                  column.category ?? null,
-                ),
-              ),
+              formatCsvExportCell(row[column.name], column.category ?? null),
             )
             .join(",") + LINE_BREAK,
+          signal,
         );
       }
     }
@@ -339,13 +355,14 @@ async function writeChunkedJson(
 ): Promise<void> {
   await withWriteStream(filePath, async (writeStream) => {
     throwIfAborted(signal);
-    writeStream.write("[\n");
+    await writeStreamChunk(writeStream, "[\n", signal);
     let firstRow = true;
 
     for await (const chunk of chunks) {
       for (const row of chunk.rows) {
         throwIfAborted(signal);
-        writeStream.write(
+        await writeStreamChunk(
+          writeStream,
           `${firstRow ? "" : ",\n"}${serializeJsonExportRecord(
             chunk.columns.map((column) => ({
               key: column.name,
@@ -355,12 +372,13 @@ async function writeChunkedJson(
               value: row[column.name],
             })),
           )}`,
+          signal,
         );
         firstRow = false;
       }
     }
 
-    writeStream.write("\n]\n");
+    await writeStreamChunk(writeStream, "\n]\n", signal);
   });
 }
 
@@ -372,6 +390,40 @@ function throwIfAborted(signal: AbortSignal): void {
   const error = new Error("The operation was aborted.");
   error.name = "AbortError";
   throw error;
+}
+
+async function writeStreamChunk(
+  stream: fs.WriteStream,
+  chunk: string,
+  signal: AbortSignal,
+): Promise<void> {
+  throwIfAborted(signal);
+  if (stream.write(chunk)) return;
+
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      stream.off("drain", onDrain);
+      stream.off("error", onError);
+      signal.removeEventListener("abort", onAbort);
+    };
+    const onDrain = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onAbort = () => {
+      cleanup();
+      const error = new Error("The operation was aborted.");
+      error.name = "AbortError";
+      reject(error);
+    };
+    stream.once("drain", onDrain);
+    stream.once("error", onError);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 async function withWriteStream(

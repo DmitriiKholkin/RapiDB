@@ -7,6 +7,7 @@ import type {
 import { buildWhere } from "../../src/extension/table/filterSql";
 import { buildInsertRowOperation } from "../../src/extension/table/insertSql";
 import {
+  executeAtomicSqlApplyPlan,
   executePreparedApplyPlan,
   prepareApplyChangesPlan,
 } from "../../src/extension/table/tableMutationExecution";
@@ -360,6 +361,125 @@ describe("table helpers", () => {
     expect(result.plan.skippedRows).toEqual([]);
   });
 
+  it("adds original edited values to SQL update predicates", () => {
+    const result = prepareApplyChangesPlan(
+      { getDriver: () => fakeDriver } as never,
+      "conn-1",
+      "main",
+      "public",
+      "fixture_rows",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { display_name: "new" },
+          originalValues: { display_name: "old" },
+        },
+      ],
+      columns,
+    );
+    expect(result.executable).toBe(true);
+    if (!result.executable) throw new Error("Expected executable plan");
+    expect(result.plan.operations[0]).toEqual({
+      sql: 'UPDATE public.fixture_rows SET "display_name" = $1 WHERE "id" = $2 AND "display_name" = $3',
+      params: ["new", 1, "old"],
+      checkAffectedRows: true,
+    });
+  });
+
+  it("runs SQL inserts and updates in one transaction", async () => {
+    const runTransaction = vi.fn(async () => undefined);
+    const driver = { ...fakeDriver, runTransaction };
+    const result = await executeAtomicSqlApplyPlan(
+      {
+        getConnection: () => ({ readOnly: false }),
+        getDriver: () => driver,
+      } as never,
+      {
+        connectionId: "conn-1",
+        database: "main",
+        schema: "public",
+        table: "fixture_rows",
+        cols: columns,
+        updates: [{ primaryKeys: { id: 1 }, changes: { display_name: "new" } }],
+        operations: [
+          { sql: "UPDATE fixture_rows SET display_name = ?", params: ["new"] },
+        ],
+        previewStatements: [],
+        skippedRows: [],
+        verificationTargets: [],
+      },
+      [
+        {
+          connectionId: "conn-1",
+          database: "main",
+          schema: "public",
+          table: "fixture_rows",
+          operation: {
+            sql: "INSERT INTO fixture_rows VALUES (?)",
+            params: [2],
+          },
+          previewStatements: [],
+          verificationCriteria: null,
+        },
+      ],
+    );
+
+    expect(result.success).toBe(true);
+    expect(runTransaction).toHaveBeenCalledWith([
+      {
+        sql: "INSERT INTO fixture_rows VALUES (?)",
+        params: [2],
+        checkAffectedRows: true,
+      },
+      { sql: "UPDATE fixture_rows SET display_name = ?", params: ["new"] },
+    ]);
+  });
+
+  it("verifies persisted values after an atomic apply and retains row outcomes", async () => {
+    const query = vi.fn(async () => ({
+      columns: ["__col_0"],
+      rows: [{ __col_0: "mismatch" }],
+      rowCount: 1,
+      executionTimeMs: 0,
+    }));
+    const driver = { ...fakeDriver, query };
+    const manager = { getDriver: () => driver } as never;
+    const prepared = prepareApplyChangesPlan(
+      manager,
+      "conn-1",
+      "main",
+      "public",
+      "fixture_rows",
+      [
+        { primaryKeys: { id: 1 }, changes: { amount: "10.25" } },
+        { primaryKeys: { id: 2 }, changes: {} },
+      ],
+      columns,
+    );
+    if (!prepared.executable) throw new Error("Expected executable plan");
+    const result = await executeAtomicSqlApplyPlan(manager, prepared.plan, [
+      {
+        connectionId: "conn-1",
+        database: "main",
+        schema: "public",
+        table: "fixture_rows",
+        operation: { sql: "INSERT INTO fixture_rows VALUES (3)" },
+        previewStatements: [],
+        verificationCriteria: null,
+      },
+    ]);
+    expect(query).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      success: true,
+      insertApplied: true,
+      failedRows: [0],
+      rowOutcomes: [
+        { rowIndex: 0, status: "verification_failed", columns: ["amount"] },
+        { rowIndex: 1, status: "skipped" },
+      ],
+    });
+  });
+
   it("returns executable preview statements for valid row updates and skips empty changes", () => {
     const result = prepareApplyChangesPlan(
       {
@@ -602,7 +722,7 @@ describe("table helpers", () => {
     ).rejects.toThrow(/full primary key/i);
   });
 
-  it("builds and executes driver-backed update plans with warning on partial matches", async () => {
+  it("fails driver-backed update plans closed on partial matches", async () => {
     const driver: IDBDriver = {
       ...fakeDriver,
       coerceInputValue: (value, column) => {
@@ -659,14 +779,13 @@ describe("table helpers", () => {
       prepared.plan,
     );
 
-    expect(result).toEqual({
-      success: true,
-      warning: "Some updates may not have matched a row in the source backend.",
-      rowOutcomes: [
-        { rowIndex: 0, success: true, status: "applied" },
-        { rowIndex: 1, success: true, status: "applied" },
-      ],
-    });
+    expect(result).toEqual(
+      expect.objectContaining({
+        success: false,
+        error:
+          "One or more rows changed after they were loaded. Refresh the table and retry.",
+      }),
+    );
   });
 
   it("skips driver-backed updates whose writable change set becomes empty", async () => {

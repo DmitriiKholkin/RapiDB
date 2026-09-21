@@ -45,6 +45,7 @@ export class QueryPanel {
     formatOnOpen?: boolean,
     isBookmarked?: boolean,
     editorLanguage?: QueryEditorLanguage,
+    private readonly panelId?: string,
   ) {
     this.panel = panel;
     this.connectionManager = connectionManager;
@@ -119,6 +120,9 @@ export class QueryPanel {
       disconnectWatcher,
       schemaRefreshWatcher,
     );
+    this.panel.onDidDispose(() => {
+      void this.controller.dispose();
+    });
   }
 
   static disposeAll(): void {
@@ -167,6 +171,7 @@ export class QueryPanel {
       formatOnOpen,
       isBookmarked,
       editorLanguage,
+      panelId,
     );
     QueryPanel.panels.set(panelId, instance);
     webviewPanel.onDidDispose(() => QueryPanel.panels.delete(panelId));
@@ -217,6 +222,7 @@ export class QueryPanel {
       title: "RapiDB Query",
       initialState: {
         view: "query",
+        panelId: this.panelId,
         connectionId: this.initialConnectionId,
         connectionType,
         queryText: initialSql,

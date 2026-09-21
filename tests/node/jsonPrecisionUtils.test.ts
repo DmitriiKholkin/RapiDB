@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { serializeArrayPreservingRawTokens } from "../../src/extension/utils/arraySerialization";
 import {
   canonicalizeJsonPreservingRawNumbers,
+  isRawNumberToken,
   parseJsonPreservingRawNumbers,
   serializeCanonicalJson,
 } from "../../src/extension/utils/jsonCanonical";
@@ -43,16 +44,16 @@ describe("parseJsonPreservingRawNumbers", () => {
   it("parses objects keeping number tokens as raw strings", () => {
     const parsed = parseJsonPreservingRawNumbers('{"x":13000.0,"y":42}');
     expect(parsed).toEqual({
-      x: { __rapidbRawNumber: true, raw: "13000.0" },
-      y: { __rapidbRawNumber: true, raw: "42" },
+      x: expect.objectContaining({ raw: "13000.0" }),
+      y: expect.objectContaining({ raw: "42" }),
     });
   });
 
   it("parses arrays keeping number tokens as raw strings", () => {
     const parsed = parseJsonPreservingRawNumbers("[13000.0, 42.5]");
     expect(parsed).toEqual([
-      { __rapidbRawNumber: true, raw: "13000.0" },
-      { __rapidbRawNumber: true, raw: "42.5" },
+      expect.objectContaining({ raw: "13000.0" }),
+      expect.objectContaining({ raw: "42.5" }),
     ]);
   });
 
@@ -68,7 +69,23 @@ describe("parseJsonPreservingRawNumbers", () => {
 
   it("preserves numbers with exponent notation", () => {
     const parsed = parseJsonPreservingRawNumbers("1.5e3");
-    expect(parsed).toEqual({ __rapidbRawNumber: true, raw: "1.5e3" });
+    expect(isRawNumberToken(parsed)).toBe(true);
+    expect(parsed).toEqual(expect.objectContaining({ raw: "1.5e3" }));
+  });
+
+  it("preserves arbitrary user keys without confusing objects with private numeric tokens", () => {
+    const text =
+      '{"__proto__":{"kept":true},"constructor":1,"nested":{"__rapidbRawNumber":true,"raw":"123","keep":"data"}}';
+    const parsed = parseJsonPreservingRawNumbers(text);
+    expect(parsed).toBeDefined();
+    expect(Object.hasOwn(parsed as object, "__proto__")).toBe(true);
+    expect(isRawNumberToken({ __rapidbRawNumber: true, raw: "123" })).toBe(
+      false,
+    );
+    if (parsed === undefined) throw new Error("Expected valid JSON");
+    expect(JSON.parse(serializeCanonicalJson(parsed))).toEqual(
+      JSON.parse(text),
+    );
   });
 
   it("rejects numbers with a bare decimal point (e.g. '5.')", () => {

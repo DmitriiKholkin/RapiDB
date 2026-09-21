@@ -5,6 +5,9 @@ import type { QueryColumnMeta } from "../../shared/tableTypes";
 import type { QueryEditorPresentation } from "../../shared/webviewContracts";
 
 export interface QueryResult {
+  operationId?: string;
+  connectionId?: string;
+  requestToken?: number;
   columns: string[];
   columnMeta: QueryColumnMeta[];
   rows: Record<string, unknown>[];

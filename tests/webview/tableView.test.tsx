@@ -104,12 +104,82 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
 import { TableView } from "../../src/webview/components/TableView";
 import { DEBOUNCE } from "../../src/webview/components/table/tableViewHelpers";
 import {
-  clearPostedMessages,
-  dispatchIncomingMessage,
+  clearPostedMessages as clearRawPostedMessages,
+  dispatchIncomingMessage as dispatchRawIncomingMessage,
   expectNoAxeViolations,
-  getLastPostedMessage,
   getPostedMessages,
+  getLastPostedMessage as getRawLastPostedMessage,
+  type PostedMessage,
 } from "./testUtils";
+
+let activeTableMutationOperationId: string | undefined;
+
+function captureTableMutationOperationId(): void {
+  const payload = getRawLastPostedMessage()?.payload;
+  if (
+    payload &&
+    typeof payload === "object" &&
+    "operationId" in payload &&
+    typeof payload.operationId === "string"
+  ) {
+    expect(payload.operationId).toMatch(/^table-mutation:\d+$/);
+    activeTableMutationOperationId = payload.operationId;
+  }
+}
+
+function clearPostedMessages(): void {
+  captureTableMutationOperationId();
+  clearRawPostedMessages();
+}
+
+function getLastPostedMessage(): PostedMessage | undefined {
+  const message = getRawLastPostedMessage();
+  captureTableMutationOperationId();
+  if (
+    !message?.payload ||
+    typeof message.payload !== "object" ||
+    ![
+      "applyChanges",
+      "insertRow",
+      "deleteRows",
+      "confirmMutationPreview",
+      "cancelMutationPreview",
+    ].includes(message.type)
+  ) {
+    return message;
+  }
+  const { operationId: _operationId, ...payload } = message.payload as Record<
+    string,
+    unknown
+  >;
+  return { ...message, payload };
+}
+
+function dispatchIncomingMessage<TPayload>(
+  type: string,
+  payload?: TPayload,
+): void {
+  captureTableMutationOperationId();
+  const mutationResponseTypes = new Set([
+    "tableMutationPreview",
+    "applyResult",
+    "insertResult",
+    "deleteResult",
+  ]);
+  if (
+    mutationResponseTypes.has(type) &&
+    payload &&
+    typeof payload === "object" &&
+    activeTableMutationOperationId
+  ) {
+    dispatchRawIncomingMessage(type, {
+      ...payload,
+      operationId: activeTableMutationOperationId,
+    });
+    return;
+  }
+  dispatchRawIncomingMessage(type, payload);
+}
 
 const columns: ColumnTypeMeta[] = [
   {
@@ -1501,7 +1571,68 @@ describe("TableView", () => {
     expect(getLastPostedMessage()).toEqual({
       type: "applyChanges",
       payload: {
-        updates: [{ primaryKeys: { id: 1 }, changes: { name: "" } }],
+        updates: [
+          {
+            primaryKeys: { id: 1 },
+            changes: { name: "" },
+            originalValues: { name: null },
+          },
+        ],
+      },
+    });
+  });
+
+  it.each([
+    "context",
+    "keyboard",
+  ])("uses the correct paste target inside a selection (%s)", async (source) => {
+    const user = userEvent.setup();
+    renderTableView();
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+    await waitFor(() => expect(getLastPostedMessage()?.type).toBe("fetchPage"));
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows,
+        totalCount: rows.length,
+      }),
+    );
+    const first = screen.getByText("Alice").closest("td");
+    const second = screen.getByText("Bob").closest("td");
+    if (!first || !second) throw new Error("Expected table cells");
+    fireEvent.mouseDown(first, { button: 0 });
+    fireEvent.mouseUp(first);
+    fireEvent.mouseDown(second, { button: 0, shiftKey: true });
+    fireEvent.mouseUp(second);
+    fireEvent.mouseDown(second, { button: 2 });
+    if (source === "context") {
+      fireEvent.contextMenu(second);
+      await user.click(screen.getByRole("menuitem", { name: "Paste" }));
+    } else {
+      fireEvent.paste(window);
+    }
+    const request = getLastPostedMessage();
+    expect(request?.type).toBe("readClipboard");
+    await act(async () =>
+      dispatchIncomingMessage("clipboardText", {
+        ...(request?.payload as object),
+        text: "Pasted",
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "applyChanges",
+      payload: {
+        updates: [
+          {
+            primaryKeys: { id: source === "context" ? 2 : 1 },
+            changes: { name: "Pasted" },
+            originalValues: { name: source === "context" ? "Bob" : "Alice" },
+          },
+        ],
       },
     });
   });
@@ -1560,7 +1691,13 @@ describe("TableView", () => {
     expect(getLastPostedMessage()).toEqual({
       type: "applyChanges",
       payload: {
-        updates: [{ primaryKeys: { id: 1 }, changes: { name: "Alicia" } }],
+        updates: [
+          {
+            primaryKeys: { id: 1 },
+            changes: { name: "Alicia" },
+            originalValues: { name: "Alice" },
+          },
+        ],
       },
     });
 
@@ -1620,6 +1757,12 @@ describe("TableView", () => {
     });
 
     clearPostedMessages();
+
+    dispatchRawIncomingMessage("applyResult", {
+      operationId: "table-mutation:stale",
+      success: true,
+    });
+    expect(getRawLastPostedMessage()).toBeUndefined();
 
     dispatchIncomingMessage("applyResult", {
       success: true,
@@ -1951,6 +2094,9 @@ describe("TableView", () => {
           {
             primaryKeys: { id: 1 },
             changes: { payload: null },
+            originalValues: {
+              payload: '{"name":"Alice","meta":{"active":true}}',
+            },
           },
         ],
       },
@@ -2253,6 +2399,7 @@ describe("TableView", () => {
   });
 
   it("renders JSON mutation previews with the preview text and JSON editor mode", async () => {
+    const user = userEvent.setup();
     const previewText = JSON.stringify(
       {
         TableName: "Users",
@@ -2285,6 +2432,9 @@ describe("TableView", () => {
         totalCount: rows.length,
       });
     });
+
+    await user.click(screen.getByLabelText("Select row 1"));
+    await user.click(screen.getByRole("button", { name: "Delete (1)" }));
 
     await act(async () => {
       dispatchIncomingMessage("tableMutationPreview", {
@@ -2744,7 +2894,13 @@ describe("TableView", () => {
     expect(getLastPostedMessage()).toEqual({
       type: "applyChanges",
       payload: {
-        updates: [{ primaryKeys: { id: 1 }, changes: { name: "Alicia" } }],
+        updates: [
+          {
+            primaryKeys: { id: 1 },
+            changes: { name: "Alicia" },
+            originalValues: { name: "Alice" },
+          },
+        ],
       },
     });
   });
@@ -2795,7 +2951,13 @@ describe("TableView", () => {
     expect(getLastPostedMessage()).toEqual({
       type: "applyChanges",
       payload: {
-        updates: [{ primaryKeys: { id: 1 }, changes: { name: "Alicia" } }],
+        updates: [
+          {
+            primaryKeys: { id: 1 },
+            changes: { name: "Alicia" },
+            originalValues: { name: "Alice" },
+          },
+        ],
       },
     });
 

@@ -48,4 +48,12 @@ VALUES (
     expect(statements[0]).toContain("VALUES (REPEAT(");
     expect(statements[1]).toContain("JSON_OBJECT(");
   });
+
+  it("splits transaction BEGIN and COMMIT as ordinary statements", () => {
+    expect(splitMySQLScript("BEGIN; SELECT 1; COMMIT;")).toEqual([
+      "BEGIN",
+      "SELECT 1",
+      "COMMIT",
+    ]);
+  });
 });

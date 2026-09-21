@@ -35,6 +35,7 @@ export interface ApplyRowOutcome {
 }
 
 export interface ApplyResultPayload {
+  operationId?: string;
   success: boolean;
   error?: string;
   warning?: string;
@@ -48,6 +49,7 @@ export interface ApplyResultPayload {
 export interface RowUpdateMessagePayload {
   primaryKeys: Record<string, unknown>;
   changes: Record<string, unknown>;
+  originalValues?: Record<string, unknown>;
 }
 
 export type TableMutationPreviewKind =
@@ -56,6 +58,7 @@ export type TableMutationPreviewKind =
   | "deleteRows";
 
 export interface TableMutationPreviewPayload {
+  operationId: string;
   previewToken: string;
   kind: TableMutationPreviewKind;
   title: string;
@@ -66,7 +69,23 @@ export interface TableMutationPreviewPayload {
 }
 
 export interface TableMutationPreviewDecisionPayload {
+  operationId: string;
   previewToken: string;
+}
+
+export interface ClipboardReadPayload {
+  requestId: string;
+  recipient: string;
+}
+
+export interface ClipboardTextPayload extends ClipboardReadPayload {
+  text: string;
+}
+
+export interface TableMutationResultPayload {
+  operationId: string;
+  success: boolean;
+  error?: string;
 }
 
 // ─── Initial State ──────────────────────────────────────────────────────────
@@ -128,14 +147,21 @@ export type TablePanelMessage =
   | WebviewMessageEnvelope<
       "applyChanges",
       {
+        operationId: string;
         updates?: RowUpdateMessagePayload[];
         insertValues?: Record<string, unknown>[];
       }
     >
-  | WebviewMessageEnvelope<"insertRow", { values?: Record<string, unknown> }>
+  | WebviewMessageEnvelope<
+      "insertRow",
+      { operationId: string; values?: Record<string, unknown> }
+    >
   | WebviewMessageEnvelope<
       "deleteRows",
-      { primaryKeysList?: Array<Record<string, unknown>> }
+      {
+        operationId: string;
+        primaryKeysList?: Array<Record<string, unknown>>;
+      }
     >
   | WebviewMessageEnvelope<
       "exportCSV",
@@ -163,7 +189,7 @@ export type TablePanelMessage =
       "cancelMutationPreview",
       TableMutationPreviewDecisionPayload
     >
-  | WebviewMessageEnvelope<"readClipboard">
+  | WebviewMessageEnvelope<"readClipboard", ClipboardReadPayload>
   | WebviewMessageEnvelope<"writeClipboard", { text: string }>;
 
 // ─── Parser Helpers ─────────────────────────────────────────────────────────
@@ -172,7 +198,10 @@ function isRowUpdateMessagePayload(
   value: unknown,
 ): value is RowUpdateMessagePayload {
   return (
-    isRecord(value) && isRecord(value.primaryKeys) && isRecord(value.changes)
+    isRecord(value) &&
+    isRecord(value.primaryKeys) &&
+    isRecord(value.changes) &&
+    (value.originalValues === undefined || isRecord(value.originalValues))
   );
 }
 
@@ -202,6 +231,18 @@ function readColumnOrder(value: unknown): string[] | undefined {
   }
   const strings = value.filter((v): v is string => typeof v === "string");
   return strings.length > 0 ? strings : undefined;
+}
+
+function readOperationId(payload: Record<string, unknown>): string | null {
+  return readRequiredString(payload, "operationId");
+}
+
+function readClipboardRequest(
+  payload: Record<string, unknown>,
+): ClipboardReadPayload | null {
+  const requestId = readRequiredString(payload, "requestId");
+  const recipient = readRequiredString(payload, "recipient");
+  return requestId && recipient ? { requestId, recipient } : null;
 }
 
 // ─── Message Parser ─────────────────────────────────────────────────────────
@@ -240,6 +281,10 @@ export function parseTablePanelMessage(
       if (!payload) {
         return null;
       }
+      const operationId = readOperationId(payload);
+      if (!operationId) {
+        return null;
+      }
       const updates = payload.updates;
       const insertValues = payload.insertValues;
       if (
@@ -258,6 +303,7 @@ export function parseTablePanelMessage(
       return {
         type: envelope.type,
         payload: {
+          operationId,
           updates: updates as RowUpdateMessagePayload[] | undefined,
           insertValues: insertValues as Record<string, unknown>[] | undefined,
         },
@@ -269,6 +315,10 @@ export function parseTablePanelMessage(
       if (!payload) {
         return null;
       }
+      const operationId = readOperationId(payload);
+      if (!operationId) {
+        return null;
+      }
       const values = payload.values;
       if (values !== undefined && !isRecord(values)) {
         return null;
@@ -276,6 +326,7 @@ export function parseTablePanelMessage(
       return {
         type: envelope.type,
         payload: {
+          operationId,
           values: (values as Record<string, unknown> | undefined) ?? {},
         },
       };
@@ -286,13 +337,17 @@ export function parseTablePanelMessage(
       if (!payload) {
         return null;
       }
+      const operationId = readOperationId(payload);
+      if (!operationId) {
+        return null;
+      }
       const primaryKeysList = payload.primaryKeysList;
       if (primaryKeysList !== undefined && !isArrayOfRecords(primaryKeysList)) {
         return null;
       }
       return {
         type: envelope.type,
-        payload: { primaryKeysList },
+        payload: { operationId, primaryKeysList },
       };
     }
 
@@ -323,13 +378,17 @@ export function parseTablePanelMessage(
         return null;
       }
       const previewToken = readRequiredString(payload, "previewToken");
-      return previewToken
-        ? { type: envelope.type, payload: { previewToken } }
+      const operationId = readOperationId(payload);
+      return previewToken && operationId
+        ? { type: envelope.type, payload: { previewToken, operationId } }
         : null;
     }
 
-    case "readClipboard":
-      return { type: envelope.type };
+    case "readClipboard": {
+      const payload = parseRequiredPayloadRecord(envelope);
+      const request = payload ? readClipboardRequest(payload) : null;
+      return request ? { type: envelope.type, payload: request } : null;
+    }
 
     case "writeClipboard": {
       const payload = parseEnvelopeTextPayload(envelope);

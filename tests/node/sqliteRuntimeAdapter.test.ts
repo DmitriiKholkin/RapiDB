@@ -9,6 +9,7 @@ import {
 } from "../../src/extension/dbDrivers/sqliteRuntime";
 import {
   configureSQLiteInstaller,
+  ensureSQLiteRuntimeInstalled,
   probeInstalledBetterSqlite3Runtime,
   resetSQLiteInstallerForTests,
 } from "../../src/extension/utils/sqliteInstaller";
@@ -202,6 +203,19 @@ describe("SQLite better-sqlite3 runtime adapter", () => {
     expect(largeIntegerResult.rowCount).toBe(1);
     expect(String(largeIntegerResult.rows[0]?.__col_0)).toBe(
       "-9223372036854776000",
+    );
+  });
+
+  it("round-trips signed 64-bit integers without JavaScript precision loss", async () => {
+    const { driver } = await createDriver();
+    await driver.connect();
+    await driver.query("CREATE TABLE exact_ints (value INTEGER)");
+    await driver.query("INSERT INTO exact_ints (value) VALUES (?)", [
+      "9223372036854775807",
+    ]);
+
+    expect(await readSingleValue(driver, "SELECT value FROM exact_ints")).toBe(
+      "9223372036854775807",
     );
   });
 
@@ -441,6 +455,18 @@ describe("SQLite better-sqlite3 runtime adapter", () => {
     expect(
       resolveBetterSqlite3LoadTargets(join(rootDir, "dist"), false),
     ).toEqual(["better-sqlite3"]);
+  });
+
+  it("refuses to install a missing runtime without authorization", async () => {
+    const rootDir = await createManagedRuntimeFixture("sqlite-runtime-denied");
+    configureSQLiteInstaller({
+      storageRoot: join(rootDir, ".global-storage"),
+      allowInstall: () => false,
+    });
+
+    await expect(
+      ensureSQLiteRuntimeInstalled(join(rootDir, "dist")),
+    ).rejects.toThrow("installation was not authorized");
   });
 
   it("resolves staged runtime targets across the supported platform matrix", () => {

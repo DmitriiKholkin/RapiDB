@@ -18,6 +18,10 @@ export class TableReadService {
   private readonly columnCache = new Map<string, ColumnTypeMeta[]>();
   private readonly columnCacheGenerations = new Map<string, number>();
 
+  private encodeKeyPart(value: string): string {
+    return `${value.length}:${value}`;
+  }
+
   constructor(private readonly connectionManager: ConnectionManager) {}
 
   clearForConnection(connectionId: string): void {
@@ -26,7 +30,7 @@ export class TableReadService {
       (this.columnCacheGenerations.get(connectionId) ?? 0) + 1,
     );
     for (const key of this.columnCache.keys()) {
-      if (key.startsWith(`${connectionId}::`)) {
+      if (key.startsWith(`${this.encodeKeyPart(connectionId)}|`)) {
         this.columnCache.delete(key);
       }
     }
@@ -241,9 +245,19 @@ export class TableReadService {
     columns: ColumnTypeMeta[],
     sort: SortConfig | null,
   ): string {
-    return sort
-      ? `ORDER BY ${driver.quoteIdentifier(sort.column)} ${sort.direction === "desc" ? "DESC" : "ASC"}`
-      : driver.buildOrderByDefault(columns);
+    if (!sort) return driver.buildOrderByDefault(columns);
+    const clauses = [
+      `${driver.quoteIdentifier(sort.column)} ${sort.direction === "desc" ? "DESC" : "ASC"}`,
+      ...columns
+        .filter((column) => column.isPrimaryKey && column.name !== sort.column)
+        .sort(
+          (left, right) =>
+            (left.primaryKeyOrdinal ?? Number.MAX_SAFE_INTEGER) -
+            (right.primaryKeyOrdinal ?? Number.MAX_SAFE_INTEGER),
+        )
+        .map((column) => `${driver.quoteIdentifier(column.name)} ASC`),
+    ];
+    return `ORDER BY ${clauses.join(", ")}`;
   }
 
   private async readFallbackTotalCount(
@@ -605,7 +619,9 @@ export class TableReadService {
     schema: string,
     table: string,
   ): string {
-    return `${connectionId}::${database}::${schema}::${table}`;
+    return [connectionId, database, schema, table]
+      .map((value) => this.encodeKeyPart(value))
+      .join("|");
   }
 
   private getConnectionDriver(connectionId: string): {

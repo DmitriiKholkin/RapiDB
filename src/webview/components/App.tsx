@@ -25,6 +25,7 @@ export function App(): ReactElement {
       return (
         <ErrorBoundary context="QueryView">
           <QueryView
+            panelId={state.panelId ?? "query"}
             connectionId={state.connectionId ?? ""}
             connectionType={state.connectionType ?? ""}
             initialQueryText={state.queryText ?? state.initialSql ?? ""}

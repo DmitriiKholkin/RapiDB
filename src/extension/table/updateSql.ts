@@ -60,6 +60,7 @@ export function buildUpdateRowSql(
   pkValues: Record<string, unknown>,
   changes: Record<string, unknown>,
   cols: ColumnTypeMeta[],
+  originalValues: Record<string, unknown> = {},
 ): { sql: string; params: unknown[] } | null {
   const qt = drv.qualifiedTableName(database, schema, table);
   const colMap = new Map(cols.map((c) => [c.name, c]));
@@ -72,6 +73,11 @@ export function buildUpdateRowSql(
   if (Object.keys(coercedChanges).length === 0) return null;
   assertExactPrimaryKeyShape(pkValues, cols);
   const coercedPk = coerceRecord(drv, pkValues, colMap);
+  const coercedOriginalValues = coerceRecord(
+    drv,
+    filterWritableRecord(originalValues, colMap),
+    colMap,
+  );
 
   const setCols = Object.keys(coercedChanges);
   const pkCols = Object.keys(coercedPk);
@@ -94,6 +100,20 @@ export function buildUpdateRowSql(
       : "?";
     return `${drv.quoteIdentifier(c)} = ${placeholder}`;
   });
+  for (const [columnName, value] of Object.entries(coercedOriginalValues)) {
+    const identifier = drv.quoteIdentifier(columnName);
+    if (value === null) {
+      whereParts.push(`${identifier} IS NULL`);
+      continue;
+    }
+    params.push(value);
+    const meta = colMap.get(columnName);
+    whereParts.push(
+      meta && drv.buildOriginalValueComparison
+        ? drv.buildOriginalValueComparison(meta, params.length)
+        : `${identifier} = ${meta ? drv.buildInsertValueExpr(meta, params.length) : "?"}`,
+    );
+  }
 
   return {
     sql: `UPDATE ${qt} SET ${setParts.join(", ")} WHERE ${whereParts.join(" AND ")}`,

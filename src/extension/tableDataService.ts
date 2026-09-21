@@ -22,6 +22,7 @@ export type {
 } from "./table/tableDataContracts";
 export {
   applyChangesTransactional,
+  executeAtomicSqlApplyPlan,
   executePreparedApplyPlan,
   prepareApplyChangesPlan,
 } from "./table/tableMutationExecution";

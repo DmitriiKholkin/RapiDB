@@ -130,6 +130,14 @@ export function TableView({
     !hasPrimaryKey;
   const mutationBusy =
     mutation.applying || mutation.deleting || mutation.inserting;
+  const canLoadDifferentRows = unsavedRowCount === 0 && !mutationBusy;
+  const guardRowNavigation = (action: () => void) => {
+    if (!canLoadDifferentRows) {
+      mutation.blockNavigationWithUnsavedChanges();
+      return;
+    }
+    action();
+  };
   const showRefetchOverlay = data.loading && data.hasCommittedData;
 
   if (data.error) {
@@ -221,7 +229,7 @@ export function TableView({
             columnOrder: getExportColumnOrder(),
           });
         }}
-        onRefresh={data.fetchPage}
+        onRefresh={() => guardRowNavigation(data.fetchPage)}
       />
 
       <TableMutationStatusBar
@@ -247,8 +255,8 @@ export function TableView({
         key={data.columns.map((column) => column.name).join("|")}
         columnOrderRef={columnOrderRef}
         hiddenColumnIdsRef={hiddenColumnIdsRef}
-        canEditRows={canEditRows}
-        canSelectAndDeleteRows={canSelectAndDeleteRows}
+        canEditRows={canEditRows && !mutationBusy}
+        canSelectAndDeleteRows={canSelectAndDeleteRows && !mutationBusy}
         colSizes={data.colSizes}
         columns={data.columns}
         editCell={mutation.editCell}
@@ -260,10 +268,14 @@ export function TableView({
         onCommitCellEdit={mutation.commitCellEdit}
         onCommitDraftCellEdit={mutation.commitDraftCellEdit}
         onMixedBatchEdit={mutation.commitMixedBatchEdits}
-        onFilterDraftChange={data.updateFilterDraft}
+        onFilterDraftChange={(column, draft, options) =>
+          guardRowNavigation(() =>
+            data.updateFilterDraft(column, draft, options),
+          )
+        }
         onOpenStructuredCell={mutation.openStructuredCellDialog}
         onSelectionChange={setSelected}
-        onSort={data.handleSort}
+        onSort={(column) => guardRowNavigation(() => data.handleSort(column))}
         onStartDraftEdit={mutation.handleStartDraftEdit}
         onStartEdit={mutation.handleStartEdit}
         pendingEdits={mutation.pendingEdits}
@@ -278,17 +290,25 @@ export function TableView({
         pageSize={data.pageSize}
         totalPages={totalPages}
         onNextPage={() =>
-          data.setRequestedPage((currentPage) =>
-            Math.min(totalPages, currentPage + 1),
+          guardRowNavigation(() =>
+            data.setRequestedPage((currentPage) =>
+              Math.min(totalPages, currentPage + 1),
+            ),
           )
         }
         onPreviousPage={() =>
-          data.setRequestedPage((currentPage) => Math.max(1, currentPage - 1))
+          guardRowNavigation(() =>
+            data.setRequestedPage((currentPage) =>
+              Math.max(1, currentPage - 1),
+            ),
+          )
         }
-        onPageSizeChange={(pageSize) => {
-          data.setRequestedPageSize(pageSize);
-          data.setRequestedPage(1);
-        }}
+        onPageSizeChange={(pageSize) =>
+          guardRowNavigation(() => {
+            data.setRequestedPageSize(pageSize);
+            data.setRequestedPage(1);
+          })
+        }
       />
 
       <TableDialogs

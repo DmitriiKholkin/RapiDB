@@ -567,7 +567,10 @@ describe("MongoDBDriver — readTablePage()", () => {
       skip: ReturnType<typeof vi.fn>;
       limit: ReturnType<typeof vi.fn>;
     };
-    expect(readCursor.sort).toHaveBeenCalledWith([["name", -1]]);
+    expect(readCursor.sort).toHaveBeenCalledWith([
+      ["name", -1],
+      ["_id", 1],
+    ]);
     expect(readCursor.skip).toHaveBeenCalledWith(5);
     expect(readCursor.limit).toHaveBeenCalledWith(5);
     expect(mockCountDocuments).toHaveBeenCalledWith({

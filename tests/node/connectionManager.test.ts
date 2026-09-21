@@ -718,6 +718,45 @@ describe("ConnectionManager", () => {
     expect(manager.isConnected("conn-1")).toBe(true);
   });
 
+  it("keeps a reconnect registered while disposing the stale driver", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+      },
+    ]);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo("conn-1");
+    await driverInstances[0]?.disconnect();
+
+    const reconnectDeferred = createDeferred<void>();
+    driverBehaviors.set("conn-1", {
+      connectImpl: () => reconnectDeferred.promise,
+    });
+    const first = manager.beginConnect("conn-1");
+    await vi.waitFor(() => expect(driverInstances).toHaveLength(2));
+    const second = manager.beginConnect("conn-1");
+
+    expect(first.isNew).toBe(true);
+    expect(second.isNew).toBe(false);
+    expect(manager.isConnecting("conn-1")).toBe(true);
+    expect(driverInstances).toHaveLength(2);
+
+    reconnectDeferred.resolve();
+    await Promise.all([first.promise, second.promise]);
+  });
+
   it("fences stale in-flight connect completion after disconnect", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
@@ -3842,6 +3881,36 @@ describe("ConnectionManager", () => {
     expect(store.readHistory().map((entry) => entry.sql)).toEqual([
       "select 3",
       "select 2",
+    ]);
+  });
+
+  it("serializes concurrent history additions without losing entries", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const originalWrite = store.writeHistory.bind(store);
+    const gate = createDeferred<void>();
+    let writes = 0;
+    vi.spyOn(store, "writeHistory").mockImplementation(async (entries) => {
+      writes += 1;
+      if (writes === 1) await gate.promise;
+      await originalWrite(entries);
+    });
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    const first = manager.addToHistory("conn-1", "select 1");
+    await vi.waitFor(() => expect(writes).toBe(1));
+    const second = manager.addToHistory("conn-1", "select 2");
+    gate.resolve();
+    await Promise.all([first, second]);
+
+    expect(store.readHistory().map((entry) => entry.sql)).toEqual([
+      "select 2",
+      "select 1",
     ]);
   });
 

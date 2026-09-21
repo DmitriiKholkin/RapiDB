@@ -13,6 +13,7 @@ interface BetterSqlite3OpenOptions {
 }
 
 interface BetterSqlite3Statement {
+  safeIntegers(toggle?: boolean): BetterSqlite3Statement;
   all(...params: unknown[]): unknown[];
   get(...params: unknown[]): unknown;
   run(...params: unknown[]): {
@@ -251,11 +252,40 @@ function executeStatement<T>(
   kind: "all" | "get" | "run",
   params: readonly unknown[],
 ): T {
+  const exactStatement = statement.safeIntegers(true);
+  let result: unknown;
   if (params.length === 0) {
-    return statement[kind]() as T;
+    result = exactStatement[kind]();
+  } else {
+    result = exactStatement[kind](params);
   }
+  return normalizeSqliteIntegers(result) as T;
+}
 
-  return statement[kind](params) as T;
+function normalizeSqliteIntegers(value: unknown): unknown {
+  if (typeof value === "bigint") {
+    return value <= BigInt(Number.MAX_SAFE_INTEGER) &&
+      value >= BigInt(Number.MIN_SAFE_INTEGER)
+      ? Number(value)
+      : value.toString();
+  }
+  if (Array.isArray(value)) {
+    return value.map(normalizeSqliteIntegers);
+  }
+  if (
+    value &&
+    typeof value === "object" &&
+    !Buffer.isBuffer(value) &&
+    !(value instanceof Uint8Array)
+  ) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [
+        key,
+        normalizeSqliteIntegers(entry),
+      ]),
+    );
+  }
+  return value;
 }
 
 class BetterSqlite3DatabaseAdapter implements SQLiteDatabase {

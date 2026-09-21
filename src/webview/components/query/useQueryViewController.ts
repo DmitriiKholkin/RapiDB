@@ -23,6 +23,7 @@ import {
 } from "./queryViewHelpers";
 
 interface QueryViewControllerParams {
+  panelId: string;
   connectionId: string;
   editorLanguage?: QueryEditorLanguage;
   editorPresentation?: QueryEditorPresentation;
@@ -32,6 +33,7 @@ interface QueryViewControllerParams {
 }
 
 export function useQueryViewController({
+  panelId,
   connectionId,
   editorLanguage,
   editorPresentation,
@@ -42,7 +44,8 @@ export function useQueryViewController({
   const editorRef = useRef<MonacoEditorHandle>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  const { status, result, setRunning, setResult, setError } = useQueryStore();
+  const { status, result, setRunning, setResult, setError, reset } =
+    useQueryStore();
   const {
     connections,
     activeConnectionId,
@@ -57,6 +60,11 @@ export function useQueryViewController({
   const dragStartH = useRef(DEFAULT_EDITOR_H);
   const didAutoFormat = useRef(false);
   const didPlaceCursor = useRef(false);
+  const operationSequenceRef = useRef(0);
+  const activeOperationRef = useRef<{
+    operationId: string;
+    connectionId: string;
+  } | null>(null);
 
   const [editorHeight, setEditorHeight] = useState(DEFAULT_EDITOR_H);
   const [isResizing, setIsResizing] = useState(false);
@@ -124,6 +132,14 @@ export function useQueryViewController({
     const unsubscribeResult = onMessage<QueryResult>(
       "queryResult",
       (payload) => {
+        const activeOperation = activeOperationRef.current;
+        if (
+          !activeOperation ||
+          payload.operationId !== activeOperation.operationId ||
+          payload.connectionId !== activeOperation.connectionId
+        ) {
+          return;
+        }
         if (payload.error) {
           setError(payload.error);
           return;
@@ -167,6 +183,8 @@ export function useQueryViewController({
 
   const handleConnectionChange = useCallback(
     (nextConnectionId: string) => {
+      activeOperationRef.current = null;
+      reset();
       setActiveConnection(nextConnectionId);
       postMessage("activeConnectionChanged", {
         connectionId: nextConnectionId,
@@ -178,7 +196,7 @@ export function useQueryViewController({
         schemaFetchedRef.current.delete(nextConnectionId);
       }
     },
-    [setActiveConnection],
+    [reset, setActiveConnection],
   );
 
   useEffect(() => {
@@ -231,11 +249,17 @@ export function useQueryViewController({
     }
 
     setRunning();
+    const operationId = `${panelId}:${++operationSequenceRef.current}`;
+    activeOperationRef.current = {
+      operationId,
+      connectionId: resolvedConnectionId,
+    };
     postMessage("executeQuery", {
       queryText,
       connectionId: resolvedConnectionId,
+      operationId,
     });
-  }, [resolvedConnectionId, setRunning]);
+  }, [panelId, resolvedConnectionId, setRunning]);
 
   const clearQuery = useCallback(() => {
     editorRef.current?.setValue("");

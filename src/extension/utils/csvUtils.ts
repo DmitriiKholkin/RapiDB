@@ -9,13 +9,15 @@
 
 const NEEDS_QUOTING = /[",\r\n\t]/;
 
-export function csvCell(value: unknown): string {
+export function csvCell(value: unknown, trustedNumeric = false): string {
   if (value == null) {
     return "";
   }
   const raw = String(value);
   const s =
-    typeof value === "string" && /^[=+\-@\t\r]/.test(raw) ? `'${raw}` : raw;
+    typeof value === "string" && !trustedNumeric && /^[=+\-@\t\r]/.test(raw)
+      ? `'${raw}`
+      : raw;
   if (s === "") {
     return "";
   }

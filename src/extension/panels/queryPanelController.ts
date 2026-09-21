@@ -35,6 +35,11 @@ const WITH_QUERY_PREFIX = /^\s*with\b/i;
 const SUPERSEDED_QUERY_REJECTED_MESSAGE =
   "[RapiDB] Cannot execute query while a previous query is still running for this connection.";
 const SUPERSEDED_QUERY_CANCEL_TIMEOUT_MS = 1_500;
+const UNBOUNDED_QUERY_MESSAGE =
+  "[RapiDB] This query cannot be safely bounded by the configured row limit.";
+const MSSQL_READ_ONLY_ENFORCEMENT_MESSAGE =
+  "[RapiDB] Read-only MSSQL queries require database-enforced read permissions; client-side SQL classification is not sufficient.";
+let nextQueryRequestToken = 0;
 
 function stripTrailingBlockComment(queryText: string): string {
   if (!queryText.endsWith("*/")) {
@@ -293,7 +298,7 @@ export class QueryPanelController {
     switch (parsed.type) {
       case "activeConnectionChanged":
         if (parsed.payload) {
-          this.handleActiveConnectionChanged(parsed.payload.connectionId);
+          await this.handleActiveConnectionChanged(parsed.payload.connectionId);
         }
         break;
       case "executeQuery":
@@ -301,6 +306,7 @@ export class QueryPanelController {
           await this.handleExecuteQuery(
             parsed.payload.queryText,
             parsed.payload.connectionId,
+            parsed.payload.operationId,
           );
         }
         break;
@@ -325,7 +331,7 @@ export class QueryPanelController {
         );
         break;
       case "readClipboard":
-        await this.handleReadClipboard();
+        if (parsed.payload) await this.handleReadClipboard(parsed.payload);
         break;
       case "writeClipboard":
         if (parsed.payload) {
@@ -366,7 +372,14 @@ export class QueryPanelController {
     });
   }
 
-  private handleActiveConnectionChanged(connectionId: string): void {
+  private async handleActiveConnectionChanged(
+    connectionId: string,
+  ): Promise<void> {
+    if (connectionId === this.view.getActiveConnectionId()) {
+      return;
+    }
+    this.queryRequestToken = 0;
+    await this.cancelOwnedQueryExecutions("superseded");
     this.view.setActiveConnectionId(connectionId);
     this.view.syncTitle();
     void this.pushSchema(connectionId);
@@ -375,19 +388,28 @@ export class QueryPanelController {
   private async handleExecuteQuery(
     queryText: string,
     connectionIdOverride?: string,
+    operationId?: string,
   ): Promise<void> {
     if (!queryText.trim()) {
       return;
     }
 
     const connectionId = this.resolveConnectionId(connectionIdOverride);
-    const requestToken = ++this.queryRequestToken;
+    const requestToken = ++nextQueryRequestToken;
+    this.queryRequestToken = requestToken;
+    const resultIdentity = operationId
+      ? { connectionId, operationId, requestToken }
+      : undefined;
     const canProceed = await this.cancelSupersededQueryExecution(
       connectionId,
       requestToken,
     );
     if (!canProceed) {
-      this.postQueryError(SUPERSEDED_QUERY_REJECTED_MESSAGE, requestToken);
+      this.postQueryError(
+        SUPERSEDED_QUERY_REJECTED_MESSAGE,
+        requestToken,
+        resultIdentity,
+      );
       return;
     }
     const readOnlyDecision = decideReadOnlyQueryExecution(
@@ -396,7 +418,20 @@ export class QueryPanelController {
       queryText,
     );
     if (!readOnlyDecision.allowed) {
-      this.postQueryError(readOnlyDecision.reason, requestToken);
+      this.postQueryError(
+        readOnlyDecision.reason,
+        requestToken,
+        resultIdentity,
+      );
+      return;
+    }
+    const connection = this.connectionManager.getConnection(connectionId);
+    if (connection?.readOnly === true && connection.type === "mssql") {
+      this.postQueryError(
+        MSSQL_READ_ONLY_ENFORCEMENT_MESSAGE,
+        requestToken,
+        resultIdentity,
+      );
       return;
     }
 
@@ -404,8 +439,7 @@ export class QueryPanelController {
       return;
     }
 
-    const connectionType =
-      this.connectionManager.getConnection(connectionId)?.type;
+    const connectionType = connection?.type;
     const effectiveRowLimit = Math.min(
       this.connectionManager.getQueryRowLimit(),
       QUERY_LIMIT_POLICY.hardCap,
@@ -416,6 +450,14 @@ export class QueryPanelController {
       connectionType,
       hardCapProbeLimit,
     );
+    if (rewrite.decision.reason === "unsafe_with_clause") {
+      this.postQueryError(
+        UNBOUNDED_QUERY_MESSAGE,
+        requestToken,
+        resultIdentity,
+      );
+      return;
+    }
     const cappedQueryText = rewrite.queryText;
 
     if (!this.connectionManager.isConnected(connectionId)) {
@@ -426,6 +468,7 @@ export class QueryPanelController {
         this.postQueryError(
           `Cannot connect: ${normalized.message}`,
           requestToken,
+          resultIdentity,
         );
         return;
       }
@@ -440,6 +483,7 @@ export class QueryPanelController {
       this.postQueryError(
         `[RapiDB] Cannot execute query: driver is unavailable for ${connectionId}.`,
         requestToken,
+        resultIdentity,
       );
       return;
     }
@@ -467,6 +511,7 @@ export class QueryPanelController {
     try {
       const result = await driver.query(cappedQueryText, undefined, {
         requestToken,
+        ...(connection?.readOnly === true ? { readOnly: true } : {}),
       });
       if (!this.isCurrentQueryRequest(requestToken)) {
         return;
@@ -483,11 +528,11 @@ export class QueryPanelController {
       });
       this.view.postMessage({
         type: "queryResult",
-        payload: formattedResult,
+        payload: { ...formattedResult, ...resultIdentity },
       });
     } catch (error: unknown) {
       const normalized = normalizeUnknownError(error);
-      this.postQueryError(normalized.message, requestToken);
+      this.postQueryError(normalized.message, requestToken, resultIdentity);
     } finally {
       const active = this.activeQueryExecutions.get(connectionId);
       if (active?.requestToken === requestToken) {
@@ -588,6 +633,48 @@ export class QueryPanelController {
     }
   }
 
+  private async cancelOwnedQueryExecutions(
+    reason: OperationCancellationContext["reason"],
+  ): Promise<void> {
+    const executions = [...this.activeQueryExecutions.values()];
+    this.activeQueryExecutions.clear();
+    await Promise.all(
+      executions.map(async (execution) => {
+        if (!execution.supportsCancellation) {
+          return;
+        }
+        let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            execution.cancel({
+              reason,
+              operationName: execution.operationName,
+              connectionId: execution.connectionId,
+              requestToken: execution.requestToken,
+            }),
+            new Promise<void>((resolve) => {
+              timeoutHandle = setTimeout(
+                resolve,
+                SUPERSEDED_QUERY_CANCEL_TIMEOUT_MS,
+              );
+            }),
+          ]);
+        } catch (error: unknown) {
+          logger.error("Failed to cancel owned query execution", error);
+        } finally {
+          if (timeoutHandle) {
+            clearTimeout(timeoutHandle);
+          }
+        }
+      }),
+    );
+  }
+
+  async dispose(): Promise<void> {
+    this.queryRequestToken = 0;
+    await this.cancelOwnedQueryExecutions("lifecycle_shutdown");
+  }
+
   private pushConnections(): void {
     const connections = this.connectionManager
       .getConnections()
@@ -646,7 +733,15 @@ export class QueryPanelController {
     return requestToken === this.queryRequestToken;
   }
 
-  private postQueryError(error: string, requestToken?: number): void {
+  private postQueryError(
+    error: string,
+    requestToken?: number,
+    identity?: {
+      connectionId: string;
+      operationId?: string;
+      requestToken: number;
+    },
+  ): void {
     if (
       requestToken !== undefined &&
       !this.isCurrentQueryRequest(requestToken)
@@ -662,6 +757,7 @@ export class QueryPanelController {
         rowCount: 0,
         executionTimeMs: 0,
         error,
+        ...identity,
       },
     });
   }
@@ -757,9 +853,14 @@ export class QueryPanelController {
     return { ...result, rows: sortedRows };
   }
 
-  private async handleReadClipboard(): Promise<void> {
+  private async handleReadClipboard(
+    payload: import("../../shared/webviewContracts").ClipboardReadPayload,
+  ): Promise<void> {
     const text = await readClipboardTextSafe();
-    this.view.postMessage({ type: "clipboardText", payload: text });
+    this.view.postMessage({
+      type: "clipboardText",
+      payload: { ...payload, text },
+    });
   }
 
   private async handleWriteClipboard(text: string): Promise<void> {

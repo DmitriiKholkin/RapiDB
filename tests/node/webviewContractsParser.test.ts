@@ -87,6 +87,7 @@ describe("parseTablePanelMessage applyChanges payload", () => {
     const parsed = parseTablePanelMessage({
       type: "applyChanges",
       payload: {
+        operationId: "mutation-1",
         updates: [{ primaryKeys: { id: 1 }, changes: { name: "Alicia" } }],
         insertValues: [{ name: "New user" }],
       },
@@ -95,6 +96,7 @@ describe("parseTablePanelMessage applyChanges payload", () => {
     expect(parsed).toEqual({
       type: "applyChanges",
       payload: {
+        operationId: "mutation-1",
         updates: [{ primaryKeys: { id: 1 }, changes: { name: "Alicia" } }],
         insertValues: [{ name: "New user" }],
       },
@@ -187,9 +189,15 @@ describe("parseQueryPanelMessage", () => {
 
 describe("parseTablePanelMessage clipboard payload", () => {
   it("parses readClipboard message", () => {
-    const parsed = parseTablePanelMessage({ type: "readClipboard" });
+    const parsed = parseTablePanelMessage({
+      type: "readClipboard",
+      payload: { requestId: "request-1", recipient: "editor-1" },
+    });
 
-    expect(parsed).toEqual({ type: "readClipboard" });
+    expect(parsed).toEqual({
+      type: "readClipboard",
+      payload: { requestId: "request-1", recipient: "editor-1" },
+    });
   });
 
   it("parses writeClipboard payload", () => {

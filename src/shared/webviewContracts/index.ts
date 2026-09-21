@@ -69,6 +69,8 @@ export type {
   ApplyResultPayload,
   ApplyRowOutcome,
   ApplyRowStatus,
+  ClipboardReadPayload,
+  ClipboardTextPayload,
   RowUpdateMessagePayload,
   TableInitialState,
   TableMutationPreviewDecisionPayload,

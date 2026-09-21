@@ -295,7 +295,7 @@ describe("QueryPanelController", () => {
     );
   });
 
-  it("does not rewrite WITH queries to avoid unsafe hard-cap wrapping", async () => {
+  it("rejects WITH queries that cannot be safely hard-capped", async () => {
     const query = vi.fn(async () => ({
       columns: ["id"],
       rows: [{ id: 1 }],
@@ -343,14 +343,15 @@ describe("QueryPanelController", () => {
       },
     });
 
-    expect(query).toHaveBeenCalledWith(
-      "with src as (select * from users) select * from src",
-      undefined,
-      { requestToken: 1 },
-    );
-    expect(formatQueryResult).toHaveBeenCalledWith(
-      expect.objectContaining({ rows: [{ id: 1 }] }),
-      10000,
+    expect(query).not.toHaveBeenCalled();
+    expect(view.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "queryResult",
+        payload: expect.objectContaining({
+          error:
+            "[RapiDB] This query cannot be safely bounded by the configured row limit.",
+        }),
+      }),
     );
   });
 
@@ -690,6 +691,53 @@ describe("QueryPanelController", () => {
         error:
           "[RapiDB] Read-only SQL connections allow only read-only queries.",
       },
+    });
+  });
+
+  it("rejects readonly MSSQL queries without database-enforced permissions", async () => {
+    const query = vi.fn();
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "mssql-readonly",
+        name: "Readonly SQL Server",
+        type: "mssql",
+        readOnly: true,
+      })),
+      getDriverCapabilities: vi.fn(() => ({
+        readOnlyQueryGuard: () => ({ allowed: true as const }),
+      })),
+      isConnected: vi.fn(() => true),
+      getDriver: vi.fn(() => ({ query })),
+    };
+    const view = {
+      getActiveConnectionId: vi.fn(() => "mssql-readonly"),
+      getInitialConnectionId: vi.fn(() => "mssql-readonly"),
+      getLastQueryResult: vi.fn(() => null),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+
+    await controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText: "select 1" },
+    });
+
+    expect(query).not.toHaveBeenCalled();
+    expect(view.postMessage).toHaveBeenCalledWith({
+      type: "queryResult",
+      payload: expect.objectContaining({
+        error:
+          "[RapiDB] Read-only MSSQL queries require database-enforced read permissions; client-side SQL classification is not sufficient.",
+      }),
     });
   });
 
@@ -1377,5 +1425,94 @@ describe("QueryPanelController", () => {
     expect(controller.activeQueryExecutions.size).toBe(0);
 
     currentCheck.mockRestore();
+  });
+
+  it("cancels and invalidates the owned query on connection switch and disposal", async () => {
+    let activeConnectionId = "conn-1";
+    let resolveQuery: ((value: unknown) => void) | undefined;
+    const cancelCurrentOperation = vi.fn(async () => undefined);
+    const query = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          resolveQuery = resolve;
+        }),
+    );
+    const connectionManager = {
+      getConnection: vi.fn((id: string) => ({
+        id,
+        name: id,
+        type: "pg",
+        readOnly: false,
+      })),
+      getDriverCapabilities: vi.fn(() => ({})),
+      isConnected: vi.fn(() => true),
+      getDriver: vi.fn(() => ({ query, cancelCurrentOperation })),
+      getQueryRowLimit: vi.fn(() => 100),
+      addToHistory: vi.fn(async () => undefined),
+      getSchemaAsync: vi.fn(async () => []),
+    };
+    const view = {
+      getActiveConnectionId: vi.fn(() => activeConnectionId),
+      getInitialConnectionId: vi.fn(() => "conn-1"),
+      getLastQueryResult: vi.fn(() => null),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn((id: string) => {
+        activeConnectionId = id;
+      }),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+
+    const first = controller.handleMessage({
+      type: "executeQuery",
+      payload: {
+        queryText: "select slow",
+        connectionId: "conn-1",
+        operationId: "panel-1:1",
+      },
+    });
+    await Promise.resolve();
+    await controller.handleMessage({
+      type: "activeConnectionChanged",
+      payload: { connectionId: "conn-2" },
+    });
+
+    expect(cancelCurrentOperation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reason: "superseded",
+        connectionId: "conn-1",
+      }),
+    );
+    resolveQuery?.({ columns: [], rows: [], rowCount: 0, executionTimeMs: 1 });
+    await first;
+    expect(view.postMessage).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "queryResult" }),
+    );
+
+    const second = controller.handleMessage({
+      type: "executeQuery",
+      payload: {
+        queryText: "select slower",
+        connectionId: "conn-2",
+        operationId: "panel-1:2",
+      },
+    });
+    await Promise.resolve();
+    await controller.dispose();
+    expect(cancelCurrentOperation).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        reason: "lifecycle_shutdown",
+        connectionId: "conn-2",
+      }),
+    );
+    resolveQuery?.({ columns: [], rows: [], rowCount: 0, executionTimeMs: 1 });
+    await second;
   });
 });

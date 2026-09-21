@@ -411,4 +411,83 @@ describe("QueryPanel", () => {
       }),
     );
   });
+
+  it("disposes the controller so panel-owned queries are cancelled", async () => {
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "conn-dispose",
+        name: "Primary",
+        type: "pg",
+      })),
+      getQueryEditorPresentation: vi.fn(() => undefined),
+      onDidSchemaLoad: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const disposeSpy = vi
+      .spyOn(QueryPanelController.prototype, "dispose")
+      .mockResolvedValue(undefined);
+    const { QueryPanel } = await import(
+      "../../src/extension/panels/queryPanel"
+    );
+
+    QueryPanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-dispose",
+      "select 1",
+      true,
+    );
+    createdPanel()?.dispose();
+
+    expect(disposeSpy).toHaveBeenCalledOnce();
+    disposeSpy.mockRestore();
+  });
+
+  it("assigns distinct operation namespaces to separate query panels", async () => {
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "conn-namespace",
+        name: "Primary",
+        type: "pg",
+      })),
+      getQueryEditorPresentation: vi.fn(() => undefined),
+      onDidSchemaLoad: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+    const { createWebviewShell } = await import(
+      "../../src/extension/panels/webviewShell"
+    );
+    const { QueryPanel } = await import(
+      "../../src/extension/panels/queryPanel"
+    );
+
+    QueryPanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-namespace",
+      undefined,
+      true,
+    );
+    QueryPanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-namespace",
+      undefined,
+      true,
+    );
+
+    const calls = (createWebviewShell as ReturnType<typeof vi.fn>).mock.calls;
+    const firstPanelId = calls.at(-2)?.[0]?.initialState?.panelId;
+    const secondPanelId = calls.at(-1)?.[0]?.initialState?.panelId;
+    expect(firstPanelId).toMatch(/^qp_/);
+    expect(secondPanelId).toMatch(/^qp_/);
+    expect(secondPanelId).not.toBe(firstPanelId);
+  });
 });

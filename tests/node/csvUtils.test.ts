@@ -8,6 +8,7 @@ describe("csvCell", () => {
     );
     expect(csvCell("@SUM(A1:A2)")).toBe("'@SUM(A1:A2)");
     expect(csvCell(-42)).toBe("-42");
+    expect(csvCell("-42", true)).toBe("-42");
   });
 
   it("quotes tab-containing cells", () => {

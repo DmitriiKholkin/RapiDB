@@ -1,4 +1,4 @@
-import { marshall } from "@aws-sdk/util-dynamodb";
+import { marshall, NumberValueImpl } from "@aws-sdk/util-dynamodb";
 import { describe, expect, it, vi } from "vitest";
 import { DynamoDBDriver } from "../../src/extension/dbDrivers/dynamodb";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
@@ -49,6 +49,7 @@ function createDriver() {
                   profile: { tier: "pro", visits: 3 },
                   tags: new Set(["alpha", "beta"]),
                   scores: new Set([1, 2.5]),
+                  exact: NumberValueImpl.from("9007199254740993.1250"),
                   history: [1, "two", true],
                   payload: Uint8Array.from([0xde, 0xad, 0xbe, 0xef]),
                   deleted_at: null,
@@ -155,6 +156,11 @@ describe("DynamoDBDriver metadata", () => {
           category: "array",
         }),
         expect.objectContaining({
+          name: "exact",
+          nativeType: "number",
+          category: "decimal",
+        }),
+        expect.objectContaining({
           name: "payload",
           type: "binary",
           nativeType: "binary",
@@ -211,12 +217,13 @@ describe("DynamoDBDriver metadata", () => {
         tenant_id: "tenant-1",
         user_id: "user-1",
         email: "person@example.com",
-        age: 31,
+        age: "31",
         active: true,
         profile: '{"tier":"pro","visits":3}',
         history: '[1,"two",true]',
         tags: "<<'alpha', 'beta'>>",
         scores: "<<1, 2.5>>",
+        exact: "9007199254740993.1250",
         payload: "0xdeadbeef",
         deleted_at: null,
       }),
@@ -239,5 +246,40 @@ describe("DynamoDBDriver metadata", () => {
     expect(destroy).toHaveBeenCalledTimes(1);
     expect(driverState.client).toBeNull();
     expect(driver.isConnected()).toBe(false);
+  });
+
+  it("coerces exact scalar numbers and number sets without using JS Number", () => {
+    const driver = createDriver();
+    const numberColumn = {
+      name: "amount",
+      type: "number",
+      nativeType: "number",
+      category: "decimal",
+      nullable: false,
+      isPrimaryKey: false,
+      isForeignKey: false,
+      filterable: true,
+      filterOperators: ["eq"],
+      valueSemantics: "plain",
+    } as import("../../src/shared/tableTypes").ColumnTypeMeta;
+    const setColumn = {
+      ...numberColumn,
+      name: "amounts",
+      type: "number set",
+      nativeType: "number set",
+      category: "array",
+    } as import("../../src/shared/tableTypes").ColumnTypeMeta;
+
+    expect(
+      driver.coerceInputValue("9007199254740993.1250", numberColumn),
+    ).toEqual(expect.objectContaining({ value: "9007199254740993.1250" }));
+    expect(
+      [
+        ...(driver.coerceInputValue(
+          "<<9007199254740993, 0.10000000000000001>>",
+          setColumn,
+        ) as Set<NumberValueImpl>),
+      ].map((value) => value.value),
+    ).toEqual(["9007199254740993", "0.10000000000000001"]);
   });
 });

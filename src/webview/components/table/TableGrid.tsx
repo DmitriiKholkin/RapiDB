@@ -22,6 +22,7 @@ import {
   isNumericCategory,
   NULL_SENTINEL,
 } from "../../../shared/tableTypes";
+import type { ClipboardTextPayload } from "../../../shared/webviewContracts";
 import type { QueryResult, QueryStatus } from "../../store";
 import type {
   EditTarget,
@@ -59,7 +60,7 @@ import {
   SR_ONLY_STYLE,
   type TableSortState,
 } from "./tableViewHelpers";
-import { useCellSelection } from "./useCellSelection";
+import { type CellRange, useCellSelection } from "./useCellSelection";
 import { useColumnDragReorder } from "./useColumnDragReorder";
 
 const TABLE_ROW_STYLE_ID = "rapidb-table-row-style";
@@ -502,8 +503,37 @@ function TableDataGrid({
     postMessage("writeClipboard", { text });
   }, []);
 
-  const handlePaste = useCallback(() => {
-    postMessage("readClipboard");
+  const clipboardRecipientRef = useRef(`table-grid:${crypto.randomUUID()}`);
+  const clipboardRequestRef = useRef<string | null>(null);
+  const pendingPasteRangeRef = useRef<CellRange | null>(null);
+  const selectionRangeRef = useRef<CellRange | null>(null);
+  const pasteContextRef = useRef<{
+    current: { row: number; col: number } | null;
+  } | null>(null);
+
+  const handlePaste = useCallback((fromContextMenu = false) => {
+    const range = selectionRangeRef.current;
+    const contextCell = fromContextMenu
+      ? pasteContextRef.current?.current
+      : null;
+    if (!range && !contextCell) return;
+    const requestId = crypto.randomUUID();
+    clipboardRequestRef.current = requestId;
+    pendingPasteRangeRef.current = contextCell
+      ? {
+          anchorRow: contextCell.row,
+          anchorCol: contextCell.col,
+          activeRow: contextCell.row,
+          activeCol: contextCell.col,
+        }
+      : range
+        ? { ...range }
+        : null;
+    if (pasteContextRef.current) pasteContextRef.current.current = null;
+    postMessage("readClipboard", {
+      requestId,
+      recipient: clipboardRecipientRef.current,
+    });
   }, []);
 
   const isColumnCollapsed = useCallback(
@@ -530,8 +560,8 @@ function TableDataGrid({
     onCellNavigate,
   });
 
-  const selectionRangeRef = useRef(selection.range);
   selectionRangeRef.current = selection.range;
+  pasteContextRef.current = selection.contextMenuCellRef;
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -567,19 +597,26 @@ function TableDataGrid({
   }, [selection.copySelection]);
 
   useEffect(() => {
-    const unsubscribe = onMessage<string>("clipboardText", (text) => {
-      if (!selectionRangeRef.current) return;
+    const handleClipboardText = ({
+      requestId,
+      recipient,
+      text,
+    }: ClipboardTextPayload) => {
+      if (
+        recipient !== clipboardRecipientRef.current ||
+        requestId !== clipboardRequestRef.current
+      )
+        return;
+      clipboardRequestRef.current = null;
+      const requestedRange = pendingPasteRangeRef.current;
+      pendingPasteRangeRef.current = null;
+      if (!requestedRange) return;
 
       const pasteData = parseTsv(text);
       if (pasteData.rows.length === 0) return;
 
-      const ctxCell = selection.contextMenuCellRef.current;
-      const startRow = ctxCell
-        ? ctxCell.row
-        : selectionRangeRef.current.anchorRow;
-      const anchorCol = ctxCell
-        ? ctxCell.col
-        : selectionRangeRef.current.anchorCol;
+      const startRow = requestedRange.anchorRow;
+      const anchorCol = requestedRange.anchorCol;
       const startCol = anchorCol - selColOffset;
 
       selection.contextMenuCellRef.current = null;
@@ -620,9 +657,7 @@ function TableDataGrid({
         setPasteErrors([
           {
             rowIndex: startRow,
-            columnIndex: ctxCell
-              ? ctxCell.col
-              : selectionRangeRef.current.anchorCol,
+            columnIndex: anchorCol,
             columnName: "",
             value: "",
             message: "Cannot paste into selection column",
@@ -795,7 +830,12 @@ function TableDataGrid({
       }
 
       onBatchCellEdit(edits);
-    });
+    };
+
+    const unsubscribe = onMessage<ClipboardTextPayload>(
+      "clipboardText",
+      handleClipboardText,
+    );
 
     return unsubscribe;
   }, [
@@ -1382,7 +1422,7 @@ function TableDataGrid({
       <GridContextMenu
         containerRef={containerRef}
         onCopy={handleCopy}
-        onPaste={handlePaste}
+        onPaste={() => handlePaste(true)}
         canPaste={canEditRows || newRows.length > 0}
       />
     </div>

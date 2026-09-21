@@ -12,11 +12,13 @@ import {
   parseEnvelopeQueryPayload,
   parseEnvelopeTextPayload,
   parseOptionalPayloadRecord,
+  parseRequiredPayloadRecord,
   readConnectionType,
   readOptionalBoolean,
   readOptionalString,
   readRequiredString,
 } from "./shared";
+import type { ClipboardReadPayload } from "./table";
 
 // ─── Editor Types ───────────────────────────────────────────────────────────
 
@@ -44,6 +46,7 @@ export interface QueryEditorPresentation {
 
 export interface QueryInitialState extends PanelRetentionState {
   view: "query";
+  panelId?: string;
   connectionId: string;
   connectionType?: ConnectionType | "";
   queryText?: string;
@@ -179,6 +182,7 @@ export function parseQueryInitialState(
 
   return {
     view: "query",
+    panelId: readOptionalString(input, "panelId"),
     connectionId,
     connectionType,
     queryText,
@@ -196,7 +200,12 @@ export type QueryPanelMessage =
   | WebviewMessageEnvelope<"activeConnectionChanged", { connectionId: string }>
   | WebviewMessageEnvelope<
       "executeQuery",
-      { queryText: string; sql?: string; connectionId?: string }
+      {
+        queryText: string;
+        sql?: string;
+        connectionId?: string;
+        operationId?: string;
+      }
     >
   | WebviewMessageEnvelope<"getConnections">
   | WebviewMessageEnvelope<"getSchema", { connectionId?: string }>
@@ -208,7 +217,7 @@ export type QueryPanelMessage =
       "exportResultsJSON",
       { columnOrder?: string[]; sort?: { column: string; desc: boolean }[] }
     >
-  | WebviewMessageEnvelope<"readClipboard">
+  | WebviewMessageEnvelope<"readClipboard", ClipboardReadPayload>
   | WebviewMessageEnvelope<"writeClipboard", { text: string }>
   | WebviewMessageEnvelope<
       "addBookmark",
@@ -239,12 +248,38 @@ export function parseQueryPanelMessage(
     case "executeQuery":
     case "addBookmark": {
       const payload = parseEnvelopeQueryPayload(envelope);
-      return payload ? { type: envelope.type, payload } : null;
+      return payload
+        ? {
+            type: envelope.type,
+            payload: {
+              ...payload,
+              ...(envelope.type === "executeQuery" && isRecord(envelope.payload)
+                ? {
+                    operationId: readOptionalString(
+                      envelope.payload,
+                      "operationId",
+                    ),
+                  }
+                : {}),
+            },
+          }
+        : null;
     }
 
     case "getConnections":
-    case "readClipboard":
       return { type: envelope.type };
+
+    case "readClipboard": {
+      const payload = parseRequiredPayloadRecord(envelope);
+      if (!payload) {
+        return null;
+      }
+      const requestId = readRequiredString(payload, "requestId");
+      const recipient = readRequiredString(payload, "recipient");
+      return requestId && recipient
+        ? { type: envelope.type, payload: { requestId, recipient } }
+        : null;
+    }
 
     case "exportResultsCSV":
     case "exportResultsJSON": {

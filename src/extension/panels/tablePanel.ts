@@ -168,7 +168,7 @@ export class TablePanel {
     schema: string,
     table: string,
   ): string {
-    return `${connectionId}::${database}::${schema}::${table}`;
+    return JSON.stringify([connectionId, database, schema, table]);
   }
 
   private postMessage(type: string, payload: unknown): Thenable<boolean> {
@@ -187,7 +187,10 @@ export class TablePanel {
       return;
     }
 
-    const result = await this.previewController.confirm(preview.previewToken);
+    const result = await this.previewController.confirm(
+      preview.previewToken,
+      preview.operationId,
+    );
     if (!result) {
       return;
     }
@@ -327,7 +330,7 @@ export class TablePanel {
         if (parsed.payload) this._handleCancelMutationPreview(parsed.payload);
         break;
       case "readClipboard":
-        await this._handleReadClipboard();
+        if (parsed.payload) await this._handleReadClipboard(parsed.payload);
         break;
       case "writeClipboard":
         if (parsed.payload) {
@@ -337,9 +340,11 @@ export class TablePanel {
     }
   }
 
-  private async _handleReadClipboard(): Promise<void> {
+  private async _handleReadClipboard(
+    payload: import("../../shared/webviewContracts").ClipboardReadPayload,
+  ): Promise<void> {
     const text = await readClipboardTextSafe();
-    await this.postMessage("clipboardText", text);
+    await this.postMessage("clipboardText", { ...payload, text });
   }
 
   private async _handleWriteClipboard(text: string): Promise<void> {
@@ -443,10 +448,11 @@ export class TablePanel {
   }
 
   private async _handleApplyChanges(payload: {
+    operationId: string;
     updates?: import("../../shared/webviewContracts").RowUpdateMessagePayload[];
     insertValues?: Record<string, unknown>[];
   }): Promise<void> {
-    const { updates, insertValues } = payload;
+    const { operationId, updates, insertValues } = payload;
     try {
       const prepared = prepareApplyChangesPlan(
         this.connectionManager,
@@ -470,7 +476,7 @@ export class TablePanel {
                       (_update, rowIndex) =>
                         !prepared.plan.skippedRows.includes(rowIndex),
                     )
-                    .map(({ primaryKeys, changes }) =>
+                    .map(({ primaryKeys, changes, originalValues }) =>
                       previewBuilder(
                         "update",
                         this.database,
@@ -479,6 +485,7 @@ export class TablePanel {
                         {
                           primaryKeys,
                           changes,
+                          originalValues,
                         },
                       ),
                     ),
@@ -507,7 +514,9 @@ export class TablePanel {
       const insertCount = insertPlans?.length ?? 0;
       const mutationStatementCount =
         insertCount +
-        (prepared.executable ? prepared.plan.operations.length : 0);
+        (prepared.executable
+          ? prepared.plan.updates.length - prepared.plan.skippedRows.length
+          : 0);
       if (mutationStatementCount > 1) {
         const driver = this.connectionManager.getDriver(this.connectionId);
         const risk = await driver?.getMutationAtomicityRisk?.(
@@ -518,6 +527,7 @@ export class TablePanel {
 
         if (risk) {
           this.postMessage("applyResult", {
+            operationId,
             success: false,
             error: risk,
           });
@@ -531,12 +541,12 @@ export class TablePanel {
             `[RapiDB] ${prepared.result.warning}`,
           );
         }
-        this.postMessage("applyResult", prepared.result);
+        this.postMessage("applyResult", { ...prepared.result, operationId });
         return;
       }
 
       await this.presentOrExecuteMutationPreview(
-        this.previewController.createApplyChangesPreview({
+        this.previewController.createApplyChangesPreview(operationId, {
           apply: applyPlan,
           applyResultWhenEmpty: prepared.executable ? null : prepared.result,
           inserts: insertPlans,
@@ -544,14 +554,19 @@ export class TablePanel {
       );
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
-      this.postMessage("applyResult", { success: false, error: error.message });
+      this.postMessage("applyResult", {
+        operationId,
+        success: false,
+        error: error.message,
+      });
     }
   }
 
   private async _handleInsertRow(payload: {
+    operationId: string;
     values?: Record<string, unknown>;
   }): Promise<void> {
-    const { values = {} } = payload;
+    const { operationId, values = {} } = payload;
     try {
       const plan = await this.svc.prepareInsertRow(
         this.connectionId,
@@ -561,11 +576,12 @@ export class TablePanel {
         values,
       );
       await this.presentOrExecuteMutationPreview(
-        this.previewController.createInsertPreview(plan),
+        this.previewController.createInsertPreview(operationId, plan),
       );
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
       this.postMessage("insertResult", {
+        operationId,
         success: false,
         error: error.message,
       });
@@ -573,9 +589,10 @@ export class TablePanel {
   }
 
   private async _handleDeleteRows(payload: {
+    operationId: string;
     primaryKeysList?: Array<Record<string, unknown>>;
   }): Promise<void> {
-    const { primaryKeysList = [] } = payload;
+    const { operationId, primaryKeysList = [] } = payload;
     try {
       const plan = await this.svc.prepareDeleteRowsPlan(
         this.connectionId,
@@ -586,16 +603,17 @@ export class TablePanel {
       );
 
       if (!plan) {
-        this.postMessage("deleteResult", { success: true });
+        this.postMessage("deleteResult", { operationId, success: true });
         return;
       }
 
       await this.presentOrExecuteMutationPreview(
-        this.previewController.createDeleteRowsPreview(plan),
+        this.previewController.createDeleteRowsPreview(operationId, plan),
       );
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
       this.postMessage("deleteResult", {
+        operationId,
         success: false,
         error: error.message,
       });
@@ -719,9 +737,13 @@ export class TablePanel {
   }
 
   private async _handleConfirmMutationPreview(payload: {
+    operationId: string;
     previewToken: string;
   }): Promise<void> {
-    const result = await this.previewController.confirm(payload.previewToken);
+    const result = await this.previewController.confirm(
+      payload.previewToken,
+      payload.operationId,
+    );
     if (!result) {
       return;
     }
@@ -730,9 +752,10 @@ export class TablePanel {
   }
 
   private _handleCancelMutationPreview(payload: {
+    operationId: string;
     previewToken: string;
   }): void {
-    this.previewController.cancel(payload.previewToken);
+    this.previewController.cancel(payload.previewToken, payload.operationId);
   }
 
   private buildHtml(context: vscode.ExtensionContext): string {

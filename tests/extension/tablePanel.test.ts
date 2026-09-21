@@ -172,6 +172,7 @@ describe("TablePanel", () => {
     prepareDeleteRowsPlanMock.mockReset();
     prepareDeleteRowsPlanMock.mockResolvedValue(null);
     createApplyChangesPreviewMock.mockReturnValue({
+      operationId: "op-1",
       previewToken: "apply-preview-token",
       kind: "applyChanges",
       title: "Apply changes to users",
@@ -179,6 +180,7 @@ describe("TablePanel", () => {
       statementCount: 1,
     });
     createInsertPreviewMock.mockReturnValue({
+      operationId: "op-1",
       previewToken: "insert-preview-token",
       kind: "insertRow",
       title: "Insert row into users",
@@ -187,6 +189,7 @@ describe("TablePanel", () => {
     });
     createDeleteRowsPreviewMock.mockReset();
     createDeleteRowsPreviewMock.mockReturnValue({
+      operationId: "op-1",
       previewToken: "preview-token",
       kind: "deleteRows",
       title: "Apply changes to users",
@@ -599,7 +602,7 @@ describe("TablePanel", () => {
 
     await panel.webview.dispatchMessage({
       type: "deleteRows",
-      payload: { primaryKeysList: [{ id: 1 }] },
+      payload: { operationId: "op-1", primaryKeysList: [{ id: 1 }] },
     });
 
     expect(prepareDeleteRowsPlanMock).toHaveBeenCalledWith(
@@ -655,10 +658,13 @@ describe("TablePanel", () => {
 
     await panel.webview.dispatchMessage({
       type: "deleteRows",
-      payload: { primaryKeysList: [{ id: 1 }] },
+      payload: { operationId: "op-1", primaryKeysList: [{ id: 1 }] },
     });
 
-    expect(confirmMutationPreviewMock).toHaveBeenCalledWith("preview-token");
+    expect(confirmMutationPreviewMock).toHaveBeenCalledWith(
+      "preview-token",
+      "op-1",
+    );
     expect(panel.webview.postMessage).toHaveBeenCalledWith({
       type: "deleteResult",
       payload: { success: true },
@@ -705,12 +711,13 @@ describe("TablePanel", () => {
 
     await panel.webview.dispatchMessage({
       type: "insertRow",
-      payload: { values: { id: 1 } },
+      payload: { operationId: "op-1", values: { id: 1 } },
     });
 
     expect(createInsertPreviewMock).toHaveBeenCalledOnce();
     expect(confirmMutationPreviewMock).toHaveBeenCalledWith(
       "insert-preview-token",
+      "op-1",
     );
     expect(panel.webview.postMessage).toHaveBeenCalledWith({
       type: "insertResult",
@@ -766,16 +773,19 @@ describe("TablePanel", () => {
     await panel.webview.dispatchMessage({
       type: "applyChanges",
       payload: {
+        operationId: "op-1",
         updates: [{ primaryKeys: { id: 1 }, changes: { name: "Ada" } }],
       },
     });
 
     expect(createApplyChangesPreviewMock).toHaveBeenCalledOnce();
     expect(createApplyChangesPreviewMock).toHaveBeenCalledWith(
+      "op-1",
       expect.objectContaining({ inserts: [] }),
     );
     expect(confirmMutationPreviewMock).toHaveBeenCalledWith(
       "apply-preview-token",
+      "op-1",
     );
     expect(panel.webview.postMessage).toHaveBeenCalledWith({
       type: "applyResult",
@@ -812,13 +822,13 @@ describe("TablePanel", () => {
 
     await panel.webview.dispatchMessage({
       type: "deleteRows",
-      payload: { primaryKeysList: [] },
+      payload: { operationId: "op-1", primaryKeysList: [] },
     });
 
     expect(createDeleteRowsPreviewMock).not.toHaveBeenCalled();
     expect(panel.webview.postMessage).toHaveBeenCalledWith({
       type: "deleteResult",
-      payload: { success: true },
+      payload: { operationId: "op-1", success: true },
     });
   });
 
@@ -847,13 +857,13 @@ describe("TablePanel", () => {
 
     await panel.webview.dispatchMessage({
       type: "deleteRows",
-      payload: { primaryKeysList: [{ id: 1 }] },
+      payload: { operationId: "op-1", primaryKeysList: [{ id: 1 }] },
     });
 
     expect(createDeleteRowsPreviewMock).not.toHaveBeenCalled();
     expect(panel.webview.postMessage).toHaveBeenCalledWith({
       type: "deleteResult",
-      payload: { success: false, error: "Plan failed" },
+      payload: { operationId: "op-1", success: false, error: "Plan failed" },
     });
   });
 
