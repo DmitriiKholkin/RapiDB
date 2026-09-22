@@ -35,6 +35,7 @@ import {
   clonePendingEdits,
   createInsertDraft,
   getRetainedPendingEdits,
+  INSERT_DEFAULT_SENTINEL,
   MAX_DRAFT_ROWS,
   restorePendingEdits,
   type TableApplyStatus,
@@ -775,6 +776,8 @@ export function useTableMutationController({
         originalValue,
         readOnly,
       } = options;
+      const dataDescription =
+        value.kind === "text" ? "Text data" : `Structured ${value.kind} data`;
 
       setEditCell(null);
       setApplyStatus(null);
@@ -784,10 +787,10 @@ export function useTableMutationController({
         column,
         title: `Cell data: ${column.name}`,
         description: readOnly
-          ? `Structured ${value.kind} data in ${column.name}. Apply closes this dialog without sending a mutation.`
+          ? `${dataDescription} in ${column.name}. Apply closes this dialog without sending a mutation.`
           : rowKind === "draft"
-            ? `Structured ${value.kind} data in ${column.name}. Apply updates the pending inserted row only.`
-            : `Structured ${value.kind} data in ${column.name}. Apply updates the local pending cell edit only.`,
+            ? `${dataDescription} in ${column.name}. Apply updates the pending inserted row only.`
+            : `${dataDescription} in ${column.name}. Apply updates the local pending cell edit only.`,
         language: value.language,
         initialText: value.formattedText,
         draftText: value.formattedText,
@@ -869,6 +872,16 @@ export function useTableMutationController({
 
     setStructuredCellDialog(null);
     commitStructuredCellDialogValue(dialog, NULL_SENTINEL);
+  }, [commitStructuredCellDialogValue, structuredCellDialog]);
+
+  const setStructuredCellDialogDefault = useCallback(() => {
+    const dialog = structuredCellDialog;
+    if (!dialog || dialog.readOnly || dialog.rowKind !== "draft") {
+      return;
+    }
+
+    setStructuredCellDialog(null);
+    commitStructuredCellDialogValue(dialog, INSERT_DEFAULT_SENTINEL);
   }, [commitStructuredCellDialogValue, structuredCellDialog]);
 
   const deleteSelected = useCallback(() => {
@@ -987,6 +1000,7 @@ export function useTableMutationController({
     confirmStructuredCellDialog,
     setEditCell,
     setStructuredCellDialogNull,
+    setStructuredCellDialogDefault,
     startInsertRow,
     applyChanges,
     cancelMutationPreview,

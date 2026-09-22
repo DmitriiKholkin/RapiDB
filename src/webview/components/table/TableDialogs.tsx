@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useId, useRef } from "react";
+import { createPortal } from "react-dom";
 import type { TableMutationPreviewPayload } from "../../../shared/webviewContracts";
 import { Icon } from "../Icon";
 import { MonacoEditor, type MonacoEditorHandle } from "../MonacoEditor";
@@ -248,7 +249,7 @@ interface MutationPreviewDialogProps {
   onConfirm: () => void;
 }
 
-interface LargeMonacoDialogProps {
+export interface LargeMonacoDialogProps {
   title: string;
   description: React.ReactNode;
   value: string;
@@ -262,9 +263,11 @@ interface LargeMonacoDialogProps {
   onConfirm: () => void;
   extraActions?: React.ReactNode;
   focusEditorOnOpen?: boolean;
+  hideCancelAction?: boolean;
+  fullWindow?: boolean;
 }
 
-function LargeMonacoDialog({
+export function LargeMonacoDialog({
   title,
   description,
   value,
@@ -278,6 +281,8 @@ function LargeMonacoDialog({
   onConfirm,
   extraActions,
   focusEditorOnOpen = false,
+  hideCancelAction = false,
+  fullWindow = false,
 }: LargeMonacoDialogProps) {
   const titleId = useId();
   const descriptionId = useId();
@@ -304,10 +309,10 @@ function LargeMonacoDialog({
     };
   }, [focusEditorOnOpen]);
 
-  return (
+  const dialog = (
     <div
       style={{
-        position: "absolute",
+        position: fullWindow ? "fixed" : "absolute",
         inset: 0,
         zIndex: 30,
         display: "flex",
@@ -327,7 +332,8 @@ function LargeMonacoDialog({
         ref={dialogRef}
         onKeyDown={handleDialogKeyDown}
         style={{
-          width: "min(920px, calc(100vw - 48px))",
+          width: fullWindow ? "100%" : "min(920px, calc(100vw - 48px))",
+          minWidth: 0,
           maxHeight: "calc(100vh - 48px)",
           display: "flex",
           flexDirection: "column",
@@ -384,11 +390,14 @@ function LargeMonacoDialog({
             display: "flex",
             flexDirection: "column",
             gap: 12,
+            minHeight: fullWindow ? 0 : undefined,
+            overflow: fullWindow ? "auto" : undefined,
           }}
         >
           <div
             style={{
-              height: PREVIEW_DIALOG_EDITOR_H,
+              height: fullWindow ? "60vh" : PREVIEW_DIALOG_EDITOR_H,
+              flexShrink: fullWindow ? 0 : undefined,
               border: "1px solid var(--vscode-panel-border)",
               borderRadius: 4,
               overflow: "hidden",
@@ -407,13 +416,15 @@ function LargeMonacoDialog({
 
           <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
             {extraActions}
-            <button
-              type="button"
-              style={tableButtonStyle("ghost")}
-              onClick={onCancel}
-            >
-              Cancel
-            </button>
+            {!hideCancelAction && (
+              <button
+                type="button"
+                style={tableButtonStyle("ghost")}
+                onClick={onCancel}
+              >
+                Cancel
+              </button>
+            )}
             <button
               type="button"
               style={tableButtonStyle("primary")}
@@ -426,6 +437,8 @@ function LargeMonacoDialog({
       </div>
     </div>
   );
+
+  return fullWindow ? createPortal(dialog, document.body) : dialog;
 }
 
 function MutationPreviewDialog({
@@ -473,6 +486,7 @@ interface StructuredCellDialogProps {
   onCancel: () => void;
   onConfirm: () => void;
   onChange: (value: string) => void;
+  onSetDefault: () => void;
   onSetNull: () => void;
 }
 
@@ -481,6 +495,7 @@ function StructuredCellDialog({
   onCancel,
   onConfirm,
   onChange,
+  onSetDefault,
   onSetNull,
 }: StructuredCellDialogProps) {
   return (
@@ -498,14 +513,27 @@ function StructuredCellDialog({
       onConfirm={onConfirm}
       focusEditorOnOpen
       extraActions={
-        dialog.nullable && !dialog.readOnly ? (
-          <button
-            type="button"
-            style={tableButtonStyle("ghost")}
-            onClick={onSetNull}
-          >
-            NULL
-          </button>
+        !dialog.readOnly ? (
+          <>
+            {dialog.rowKind === "draft" && (
+              <button
+                type="button"
+                style={tableButtonStyle("ghost")}
+                onClick={onSetDefault}
+              >
+                DEF
+              </button>
+            )}
+            {dialog.nullable && (
+              <button
+                type="button"
+                style={tableButtonStyle("ghost")}
+                onClick={onSetNull}
+              >
+                NULL
+              </button>
+            )}
+          </>
         ) : undefined
       }
     />
@@ -529,6 +557,7 @@ interface TableDialogsProps {
   onExportAll: () => void;
   onExportVisible: () => void;
   onSetStructuredCellDialogNull: () => void;
+  onSetStructuredCellDialogDefault: () => void;
 }
 
 export function TableDialogs({
@@ -546,6 +575,7 @@ export function TableDialogs({
   onExportAll,
   onExportVisible,
   onSetStructuredCellDialogNull,
+  onSetStructuredCellDialogDefault,
 }: TableDialogsProps) {
   return (
     <>
@@ -562,6 +592,7 @@ export function TableDialogs({
           onCancel={onCancelStructuredCellDialog}
           onConfirm={onConfirmStructuredCellDialog}
           onChange={onChangeStructuredCellDialog}
+          onSetDefault={onSetStructuredCellDialogDefault}
           onSetNull={onSetStructuredCellDialogNull}
         />
       )}

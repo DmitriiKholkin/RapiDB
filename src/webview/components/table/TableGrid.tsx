@@ -563,13 +563,95 @@ function TableDataGrid({
   selectionRangeRef.current = selection.range;
   pasteContextRef.current = selection.contextMenuCellRef;
 
+  const openCell = useCallback(
+    (row: number, columnId: string) => {
+      const column = columnsMap.get(columnId);
+      const isDraft = row < 0;
+      const rowIdx = isDraft ? row + newRows.length : row;
+      const rowKind = isDraft ? "draft" : "persisted";
+      if (
+        !column ||
+        (!isDraft && !canEditColumn(column)) ||
+        isCollapsedWidth(columnSizing[columnId] ?? colSizes[columnId] ?? 160) ||
+        (editCell?.kind === rowKind &&
+          editCell.rowIdx === rowIdx &&
+          editCell.col === columnId)
+      ) {
+        return;
+      }
+      if (isDraft ? !newRows[rowIdx] : !rows[rowIdx]) return;
+
+      const originalValue = isDraft
+        ? (newRows[rowIdx][columnId]?.value ?? INSERT_DEFAULT_SENTINEL)
+        : rows[rowIdx][columnId];
+      const pendingRow = pendingEdits.get(rowIdx);
+      const currentValue = isDraft
+        ? originalValue === NULL_SENTINEL
+          ? null
+          : originalValue
+        : pendingRow?.has(columnId)
+          ? pendingRow.get(columnId)
+          : originalValue;
+      const structuredValue = getStructuredCellDialogValue(
+        isDraft && currentValue === INSERT_DEFAULT_SENTINEL
+          ? null
+          : currentValue,
+        column,
+      );
+      if (structuredValue) {
+        onOpenStructuredCell({
+          rowKind,
+          rowIdx,
+          column,
+          value: structuredValue,
+          currentValue,
+          originalValue: isDraft ? currentValue : originalValue,
+          readOnly: !isDraft && !canEditRows,
+        });
+      } else {
+        (isDraft ? onStartDraftEdit : onStartEdit)(rowIdx, column);
+      }
+    },
+    [
+      columnsMap,
+      newRows,
+      rows,
+      columnSizing,
+      colSizes,
+      editCell,
+      pendingEdits,
+      canEditRows,
+      onOpenStructuredCell,
+      onStartDraftEdit,
+      onStartEdit,
+    ],
+  );
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (
+        event.key === "F2" &&
+        selection.range &&
+        target &&
+        scrollRef.current?.contains(target) &&
+        target.tagName !== "SELECT" &&
+        document.activeElement?.tagName !== "SELECT" &&
+        !isEditableElement(target) &&
+        !isEditableElement(document.activeElement)
+      ) {
+        const columnId = columnOrderRef.current[selection.range.activeCol];
+        if (columnId) {
+          event.preventDefault();
+          openCell(selection.range.activeRow, columnId);
+        }
+        return;
+      }
       selection.handleKeyDown(event);
     };
     window.addEventListener("keydown", handleKeyDown, true);
     return () => window.removeEventListener("keydown", handleKeyDown, true);
-  }, [selection.handleKeyDown]);
+  }, [openCell, scrollRef, selection.handleKeyDown, selection.range]);
 
   useEffect(() => {
     const handlePasteEvent = (event: ClipboardEvent) => {
@@ -1289,8 +1371,7 @@ function TableDataGrid({
                         ? editCell.col
                         : null
                     }
-                    onOpenStructuredCell={onOpenStructuredCell}
-                    onStartEdit={onStartDraftEdit}
+                    onOpenCell={openCell}
                     onCommit={onCommitDraftCellEdit}
                     onCancelEdit={onCancelEdit}
                     selection={selection}
@@ -1317,9 +1398,7 @@ function TableDataGrid({
                   pendingCols={pendingEdits.get(persistedIndex)}
                   columnsMap={columnsMap}
                   editingCol={editingCol}
-                  onOpenStructuredCell={onOpenStructuredCell}
-                  onStartEdit={onStartEdit}
-                  readOnly={!canEditRows}
+                  onOpenCell={openCell}
                   selection={selection}
                 />
               );
@@ -1437,9 +1516,7 @@ function TableRow({
   pendingCols,
   columnsMap,
   editingCol,
-  onOpenStructuredCell,
-  onStartEdit,
-  readOnly,
+  onOpenCell,
   selection,
 }: {
   row: TanStackRow<Row>;
@@ -1449,17 +1526,7 @@ function TableRow({
   pendingCols?: Map<string, unknown>;
   columnsMap: Map<string, ColumnMeta>;
   editingCol: string | null;
-  onOpenStructuredCell: (options: {
-    rowKind: "persisted" | "draft";
-    rowIdx?: number;
-    column: ColumnMeta;
-    value: StructuredCellDialogValue;
-    currentValue: unknown;
-    originalValue: unknown;
-    readOnly: boolean;
-  }) => void;
-  onStartEdit: (rowIndex: number, column: ColumnMeta) => void;
-  readOnly: boolean;
+  onOpenCell: (rowIndex: number, columnId: string) => void;
   selection: {
     handleCellMouseDown: (
       rowIndex: number,
@@ -1519,9 +1586,6 @@ function TableRow({
         const isEditing = columnId === editingCol;
         const canOpenCellEditor =
           !isSelectionColumn && canEditColumn(columnDef);
-        const currentValue = isCellPending
-          ? pendingCols?.get(columnId)
-          : cell.getValue();
 
         const isDataCol = !isSelectionColumn;
 
@@ -1595,25 +1659,7 @@ function TableRow({
                 canOpenCellEditor &&
                 !isCollapsed
               ) {
-                const structuredValue = getStructuredCellDialogValue(
-                  currentValue,
-                  columnDef,
-                );
-
-                if (structuredValue) {
-                  onOpenStructuredCell({
-                    rowKind: "persisted",
-                    rowIdx: rowIndex,
-                    column: columnDef,
-                    value: structuredValue,
-                    currentValue,
-                    originalValue: cell.getValue(),
-                    readOnly,
-                  });
-                  return;
-                }
-
-                onStartEdit(rowIndex, columnDef);
+                onOpenCell(rowIndex, columnId);
               }
             }}
           >
@@ -1633,8 +1679,7 @@ function DraftTableRow({
   rowIndex,
   draftRowCount,
   editingCol,
-  onOpenStructuredCell,
-  onStartEdit,
+  onOpenCell,
   onCommit,
   onCancelEdit,
   selection,
@@ -1645,16 +1690,7 @@ function DraftTableRow({
   rowIndex: number;
   draftRowCount: number;
   editingCol: string | null;
-  onOpenStructuredCell: (options: {
-    rowKind: "persisted" | "draft";
-    rowIdx?: number;
-    column: ColumnMeta;
-    value: StructuredCellDialogValue;
-    currentValue: unknown;
-    originalValue: unknown;
-    readOnly: boolean;
-  }) => void;
-  onStartEdit: (rowIdx: number, column: ColumnMeta) => void;
+  onOpenCell: (rowIndex: number, columnId: string) => void;
   onCommit: (rowIdx: number, column: ColumnMeta, value: string) => void;
   onCancelEdit: () => void;
   selection?: {
@@ -1775,29 +1811,7 @@ function DraftTableRow({
             }}
             onDoubleClick={() => {
               if (!isCollapsed) {
-                const structuredValue = getStructuredCellDialogValue(
-                  isDefault ? null : displayValue,
-                  columnDef,
-                );
-
-                if (structuredValue) {
-                  onOpenStructuredCell({
-                    rowKind: "draft",
-                    rowIdx: rowIndex,
-                    column: columnDef,
-                    value: structuredValue,
-                    currentValue: isDefault
-                      ? INSERT_DEFAULT_SENTINEL
-                      : displayValue,
-                    originalValue: isDefault
-                      ? INSERT_DEFAULT_SENTINEL
-                      : displayValue,
-                    readOnly: false,
-                  });
-                  return;
-                }
-
-                onStartEdit(rowIndex, columnDef);
+                onOpenCell(selRow, columnId);
               }
             }}
           >

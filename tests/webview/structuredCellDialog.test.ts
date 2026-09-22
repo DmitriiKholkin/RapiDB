@@ -95,7 +95,11 @@ describe("getStructuredCellDialogValue", () => {
 
     expect(
       getStructuredCellDialogValue({ nested: { ok: true } }, textColumn),
-    ).toBeNull();
+    ).toEqual({
+      kind: "text",
+      language: "plaintext",
+      formattedText: '{"nested":{"ok":true}}',
+    });
   });
 
   it("uses the real column type instead of string content when choosing the dialog", () => {
@@ -134,10 +138,31 @@ describe("getStructuredCellDialogValue", () => {
 
     expect(
       getStructuredCellDialogValue('{"nested":{"ok":true}}', textColumn),
-    ).toBeNull();
+    ).toEqual({
+      kind: "text",
+      language: "plaintext",
+      formattedText: '{"nested":{"ok":true}}',
+    });
     expect(
       getStructuredCellDialogValue('["alpha","beta"]', textColumn),
-    ).toBeNull();
+    ).toEqual({
+      kind: "text",
+      language: "plaintext",
+      formattedText: '["alpha","beta"]',
+    });
+  });
+
+  it("opens multiline plain text without changing its contents", () => {
+    const multilineText = "\nfirst line\r\nsecond line\n";
+
+    expect(getStructuredCellDialogValue(multilineText, textColumn)).toEqual({
+      kind: "text",
+      language: "plaintext",
+      formattedText: multilineText,
+    });
+    expect(serializeStructuredCellDialogDraft(multilineText, textColumn)).toBe(
+      multilineText,
+    );
   });
 
   it("falls back to raw text for invalid json and array categories", () => {
@@ -197,9 +222,17 @@ describe("getStructuredCellDialogValue", () => {
         '<root><item id="1">Alice</item></root>',
         textColumn,
       ),
-    ).toBeNull();
+    ).toEqual({
+      kind: "text",
+      language: "plaintext",
+      formattedText: '<root><item id="1">Alice</item></root>',
+    });
 
-    expect(getStructuredCellDialogValue("hello world", textColumn)).toBeNull();
+    expect(getStructuredCellDialogValue("hello world", textColumn)).toEqual({
+      kind: "text",
+      language: "plaintext",
+      formattedText: "hello world",
+    });
   });
 
   it("treats Oracle IS JSON and IS XML constrained text columns as structured", () => {

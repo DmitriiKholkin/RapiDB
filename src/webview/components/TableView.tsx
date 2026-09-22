@@ -352,6 +352,9 @@ export function TableView({
           setExportChoice(null);
         }}
         onSetStructuredCellDialogNull={mutation.setStructuredCellDialogNull}
+        onSetStructuredCellDialogDefault={
+          mutation.setStructuredCellDialogDefault
+        }
       />
     </main>
   );

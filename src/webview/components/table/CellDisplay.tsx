@@ -68,7 +68,7 @@ export function CellDisplay({
       </span>
     );
   }
-  const singleLineStr = str.replace(/\r?\n/g, " ");
+  const singleLineStr = str.replace(/\r\n|\r|\n/g, "↵");
   return (
     <span
       style={{

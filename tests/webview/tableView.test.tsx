@@ -1637,6 +1637,65 @@ describe("TableView", () => {
     });
   });
 
+  it("copies and pastes a multiline cell as one cell", async () => {
+    const user = userEvent.setup();
+    const multilineText = 'first line\nsecond\tline with "quotes"';
+
+    await initializeCommittedTableData({
+      dataRows: [
+        { id: 1, name: multilineText },
+        { id: 2, name: "Target" },
+      ],
+    });
+
+    const sourceCell = screen.getByText(/first line.*second/).closest("td");
+    if (!sourceCell) throw new Error("Expected multiline source cell");
+
+    fireEvent.mouseDown(sourceCell, { button: 0 });
+    fireEvent.mouseUp(sourceCell);
+    fireEvent.contextMenu(sourceCell);
+    await user.click(screen.getByRole("menuitem", { name: "Copy" }));
+
+    const copyMessage = getLastPostedMessage();
+    expect(copyMessage).toEqual({
+      type: "writeClipboard",
+      payload: {
+        text: '"first line\nsecond\tline with ""quotes"""',
+      },
+    });
+    const clipboardText = (copyMessage?.payload as { text: string }).text;
+
+    const targetCell = screen.getByText("Target").closest("td");
+    if (!targetCell) throw new Error("Expected paste target cell");
+    fireEvent.mouseDown(targetCell, { button: 0 });
+    fireEvent.mouseUp(targetCell);
+    clearPostedMessages();
+    fireEvent.paste(window);
+
+    const pasteRequest = getLastPostedMessage();
+    expect(pasteRequest?.type).toBe("readClipboard");
+    await act(async () =>
+      dispatchIncomingMessage("clipboardText", {
+        ...(pasteRequest?.payload as object),
+        text: clipboardText,
+      }),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "applyChanges",
+      payload: {
+        updates: [
+          {
+            primaryKeys: { id: 2 },
+            changes: { name: multilineText },
+            originalValues: { name: "Target" },
+          },
+        ],
+      },
+    });
+  });
+
   it("retains failed edits across previewed apply flows", async () => {
     const user = userEvent.setup();
 
@@ -1675,11 +1734,10 @@ describe("TableView", () => {
 
     fireEvent.doubleClick(aliceCell);
 
-    const editInput = screen.getByLabelText("Cell value");
-    expect((editInput as HTMLInputElement).placeholder).toBe("");
-    await user.clear(editInput);
-    await user.type(editInput, "Alicia");
-    fireEvent.blur(editInput);
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Alicia" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
 
     expect(screen.getByText(/1 row with unsaved changes/)).toBeTruthy();
     expect(screen.getByText("Alicia")).toBeTruthy();
@@ -1840,8 +1898,8 @@ describe("TableView", () => {
 
     fireEvent.doubleClick(aliceCell);
 
-    const editInput = screen.getByLabelText("Cell value");
-    expect((editInput as HTMLInputElement).readOnly).toBe(true);
+    const editInput = screen.getByLabelText("Cell data");
+    expect((editInput as HTMLTextAreaElement).readOnly).toBe(true);
     expect(screen.queryByRole("button", { name: "NULL" })).toBeNull();
   });
 
@@ -1918,8 +1976,8 @@ describe("TableView", () => {
 
     fireEvent.doubleClick(aliceCell);
 
-    const editInput = screen.getByLabelText("Cell value");
-    expect((editInput as HTMLInputElement).readOnly).toBe(true);
+    const editInput = screen.getByLabelText("Cell data");
+    expect((editInput as HTMLTextAreaElement).readOnly).toBe(true);
     expect(screen.queryByRole("button", { name: "NULL" })).toBeNull();
   });
 
@@ -2128,7 +2186,7 @@ describe("TableView", () => {
     ).toBe("");
   });
 
-  it("keeps json-looking text columns on the inline editor path", async () => {
+  it("opens json-looking text columns as plaintext", async () => {
     const user = userEvent.setup();
 
     await initializeCommittedTableData({
@@ -2148,8 +2206,148 @@ describe("TableView", () => {
 
     await user.dblClick(getBodyCell("notes"));
 
-    expect(screen.getByLabelText("Cell value")).toBeTruthy();
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(screen.getByTestId("monaco-language").textContent).toBe("plaintext");
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).value,
+    ).toBe('{"name":"Alice"}');
+  });
+
+  it.each([
+    "text",
+    "lob",
+  ] as const)("opens persisted and draft %s cells with F2 using current values", async (category) => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData({
+      columnDefs: [columns[0], { ...columns[1], category }],
+    });
+
+    await user.click(getBodyCell("name"));
+    await user.keyboard("{F2}");
+    expect(screen.getByTestId("monaco-language").textContent).toBe("plaintext");
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).value,
+    ).toBe("Alice");
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "pending\ntext" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await user.click(getBodyCell("name"));
+    await user.keyboard("{F2}");
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).value,
+    ).toBe("pending\ntext");
+    fireEvent.keyDown(screen.getByLabelText("Cell data"), { key: "Escape" });
+
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    const draftCell = getBodyCell("name", 1);
+    expect(Number(draftCell.dataset.row)).toBeLessThan(0);
+    await user.click(draftCell);
+    await user.keyboard("{F2}");
+    // DEFAULT text stays inline until it has a value, just like double click.
     expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.change(screen.getByLabelText("Cell value"), {
+      target: { value: "draft text" },
+    });
+    await user.keyboard("{Enter}");
+    await user.click(getBodyCell("name", 1));
+    await user.keyboard("{F2}");
+    expect(screen.getByTestId("monaco-language").textContent).toBe("plaintext");
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).value,
+    ).toBe("draft text");
+      await user.click(screen.getByRole("button", { name: "NULL" }));
+    await user.click(getBodyCell("name", 1));
+    await user.keyboard("{F2}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByLabelText("Cell value")).toBeTruthy();
+  });
+
+  it.each([
+    "persisted",
+    "draft",
+  ] as const)("preserves structured, numeric and NULL routing with F2 for %s cells", async (rowKind) => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData({
+      columnDefs: [...structuredColumns, columns[1]],
+      dataRows: [{ ...structuredRows[0], name: null }],
+    });
+    if (rowKind === "draft") {
+      await user.click(screen.getByRole("button", { name: "Add Row" }));
+    }
+    for (const [name, language] of [
+      ["payload", "json"],
+      ["xml_doc", "xml"],
+      ["tags", "json"],
+    ]) {
+      await user.click(getBodyCell(name));
+      await user.keyboard("{F2}");
+      expect(screen.getByTestId("monaco-language").textContent).toBe(language);
+      fireEvent.keyDown(screen.getByLabelText("Cell data"), { key: "Escape" });
+    }
+    for (const name of ["id", "name"]) {
+      await user.click(getBodyCell(name));
+      await user.keyboard("{F2}");
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(screen.getByLabelText("Cell value")).toBeTruthy();
+      await user.keyboard("{Escape}");
+    }
+  });
+
+  it("ignores F2 outside the grid and in editable controls, and preserves readonly preview", async () => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData({
+      renderOverrides: { connectionReadOnly: true },
+    });
+    await user.click(getBodyCell("name"));
+    fireEvent.keyDown(document.body, { key: "F2" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    const filter = screen
+      .getByRole("table")
+      .querySelector("input:not([type='checkbox'])");
+    if (!(filter instanceof HTMLInputElement))
+      throw new Error("Expected filter input");
+    filter.focus();
+    fireEvent.keyDown(filter, { key: "F2" });
+    fireEvent.keyDown(screen.getByRole("table"), { key: "F2" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await user.click(getBodyCell("name"));
+    await user.keyboard("{F2}");
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).readOnly,
+    ).toBe(true);
+  });
+
+  it("opens multiline text columns in the plaintext dialog and preserves line breaks", async () => {
+    const user = userEvent.setup();
+    const multilineText = "first line\r\nsecond line";
+
+    await initializeCommittedTableData({
+      dataRows: [{ id: 1, name: multilineText }],
+    });
+
+    const textCell = getBodyCell("name");
+    expect(textCell.textContent).toBe("first line↵second line");
+
+    await user.dblClick(textCell);
+
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(screen.getByTestId("monaco-language").textContent).toBe("plaintext");
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).value,
+    ).toBe(multilineText.replace(/\r\n/g, "\n"));
+
+    const editedText = "\nupdated first line\nupdated second line\n";
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: editedText },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await user.dblClick(getBodyCell("name"));
+
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).value,
+    ).toBe(editedText);
   });
 
   it("opens structured draft array cells in the large modal and reuses existing insert commit flow", async () => {
@@ -2221,10 +2419,10 @@ describe("TableView", () => {
     expect(getPostedMessages()).toEqual([]);
   });
 
-  it("renders XML in table cells as a single line while keeping modal formatting behavior", async () => {
+  it("marks XML line breaks in table cells while keeping modal formatting behavior", async () => {
     const xmlWithSpacing =
       '<root>\n  <item id="1">Alice</item>\n  <item id="2">Bob</item>\n</root>';
-    const expectedSingleLine = xmlWithSpacing.replace(/\r?\n/g, " ");
+    const expectedSingleLine = xmlWithSpacing.replace(/\r\n|\r|\n/g, "↵");
 
     await initializeCommittedTableData({
       columnDefs: structuredColumns,
@@ -2877,10 +3075,10 @@ describe("TableView", () => {
     }
 
     fireEvent.doubleClick(aliceCell);
-    const editInput = screen.getByLabelText("Cell value");
-    await user.clear(editInput);
-    await user.type(editInput, "Alicia");
-    fireEvent.blur(editInput);
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Alicia" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
 
     await user.click(screen.getByRole("button", { name: "Add Row" }));
 
@@ -2938,10 +3136,10 @@ describe("TableView", () => {
     }
 
     fireEvent.doubleClick(aliceCell);
-    const editInput = screen.getByLabelText("Cell value");
-    await user.clear(editInput);
-    await user.type(editInput, "Alicia");
-    fireEvent.blur(editInput);
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Alicia" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
 
     await user.click(screen.getByRole("button", { name: "Add Row" }));
 

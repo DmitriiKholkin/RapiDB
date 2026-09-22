@@ -1,6 +1,7 @@
 import type { MutableRefObject } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { isEditableElement } from "../../utils/editableElement";
+import { serializeTsv } from "../../utils/pasteUtils";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
 
 export interface CellRange {
@@ -70,7 +71,7 @@ function serializeToTsv(
   isColumnCollapsed?: (colIndex: number) => boolean,
 ): string {
   const { minRow, maxRow, minCol, maxCol } = normalizeRange(range);
-  const rows: string[] = [];
+  const rows: string[][] = [];
 
   for (let row = minRow; row <= maxRow; row++) {
     const cells: string[] = [];
@@ -83,10 +84,10 @@ function serializeToTsv(
         cells.push(formatScalarValueForDisplay(value));
       }
     }
-    rows.push(cells.join("\t"));
+    rows.push(cells);
   }
 
-  return rows.join("\n");
+  return serializeTsv(rows);
 }
 
 export function useCellSelection({

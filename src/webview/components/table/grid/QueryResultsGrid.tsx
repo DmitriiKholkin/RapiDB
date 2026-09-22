@@ -25,6 +25,7 @@ import {
   calcColWidths,
   type Column as SizingColumn,
 } from "../../../utils/columnSizing";
+import { isEditableElement } from "../../../utils/editableElement";
 import { postMessage } from "../../../utils/messaging";
 import { formatScalarValueForDisplay } from "../../../utils/valueFormatting";
 import { Icon } from "../../Icon";
@@ -40,6 +41,7 @@ import {
   isCollapsedWidth,
   TopSpacerRow,
 } from "../gridSubComponents";
+import { LargeMonacoDialog } from "../TableDialogs";
 import { HEADER_H, ROW_H } from "../tableConstants";
 import { useCellSelection } from "../useCellSelection";
 import { useColumnDragReorder } from "../useColumnDragReorder";
@@ -70,6 +72,10 @@ export function QueryResultsGrid({
     rowIndex: number;
     columnId: string;
   } | null>(null);
+  const [cellPreview, setCellPreview] = useState<{
+    columnName: string;
+    value: string;
+  } | null>(null);
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const containerRef = React.useRef<HTMLDivElement>(null);
 
@@ -82,6 +88,30 @@ export function QueryResultsGrid({
   const onCellNavigate = useCallback((row: number, col: number) => {
     scrollToCellRef.current(row, col);
   }, []);
+
+  const openCell = useCallback(
+    (rowIndex: number, columnId: string) => {
+      const raw = sortedRowsRef.current[rowIndex]?.original[columnId];
+      const displayValue = formatScalarValueForDisplay(raw);
+      const columnIndex = Number.parseInt(columnId.replace("__col_", ""), 10);
+      const category = columnMeta[columnIndex]?.category;
+      const isPlainText =
+        category === "text" ||
+        category === "lob" ||
+        (category === undefined && typeof raw === "string");
+      if (isPlainText || /[\r\n]/.test(displayValue)) {
+        setActiveCell(null);
+        setCellPreview({
+          columnName: colNames[columnIndex] ?? columnId,
+          value: displayValue,
+        });
+        return;
+      }
+
+      setActiveCell({ rowIndex, columnId });
+    },
+    [colNames, columnMeta],
+  );
 
   const getCellValue = useCallback(
     (rowIndex: number, visualColIndex: number) => {
@@ -130,11 +160,27 @@ export function QueryResultsGrid({
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (
+        event.key === "F2" &&
+        selection.range &&
+        target &&
+        scrollRef.current?.contains(target) &&
+        !isEditableElement(target) &&
+        !isEditableElement(document.activeElement)
+      ) {
+        const columnId = columnOrderRef.current[selection.range.activeCol];
+        if (columnId) {
+          event.preventDefault();
+          openCell(selection.range.activeRow, columnId);
+        }
+        return;
+      }
       selection.handleKeyDown(event);
     };
     window.addEventListener("keydown", handleKeyDown, true);
     return () => window.removeEventListener("keydown", handleKeyDown, true);
-  }, [selection.handleKeyDown]);
+  }, [openCell, selection.handleKeyDown, selection.range]);
 
   const handleCopy = useCallback(() => {
     const text = selection.copySelection();
@@ -388,9 +434,7 @@ export function QueryResultsGrid({
                   index={virtualRow.index}
                   columnMeta={columnMeta}
                   activeCell={activeCell}
-                  onActivateCell={(rowIndex, columnId) =>
-                    setActiveCell({ rowIndex, columnId })
-                  }
+                  onOpenCell={openCell}
                   onDeactivateCell={() => setActiveCell(null)}
                   selection={selection}
                 />
@@ -406,6 +450,23 @@ export function QueryResultsGrid({
         </table>
       </div>
       <GridContextMenu containerRef={containerRef} onCopy={handleCopy} />
+      {cellPreview && (
+        <LargeMonacoDialog
+          title={`Cell data: ${cellPreview.columnName}`}
+          description={`Text data in ${cellPreview.columnName}.`}
+          value={cellPreview.value}
+          language="plaintext"
+          ariaLabel="Cell data"
+          readOnly
+          confirmLabel="Close"
+          closeAriaLabel="Close cell data"
+          hideCancelAction
+          fullWindow
+          focusEditorOnOpen
+          onCancel={() => setCellPreview(null)}
+          onConfirm={() => setCellPreview(null)}
+        />
+      )}
     </div>
   );
 }
@@ -415,7 +476,7 @@ export const QueryTableRow = React.memo(function QueryTableRow({
   index,
   columnMeta,
   activeCell,
-  onActivateCell,
+  onOpenCell,
   onDeactivateCell,
   selection,
 }: {
@@ -423,7 +484,7 @@ export const QueryTableRow = React.memo(function QueryTableRow({
   index: number;
   columnMeta: QueryResult["columnMeta"];
   activeCell: { rowIndex: number; columnId: string } | null;
-  onActivateCell: (rowIndex: number, columnId: string) => void;
+  onOpenCell: (rowIndex: number, columnId: string) => void;
   onDeactivateCell: () => void;
   selection: {
     handleCellMouseDown: (
@@ -515,7 +576,7 @@ export const QueryTableRow = React.memo(function QueryTableRow({
             }}
             onDoubleClick={() => {
               if (!isCollapsed && !isEditing) {
-                onActivateCell(index, cell.column.id);
+                onOpenCell(index, cell.column.id);
               }
             }}
           >

@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
 import {
   formatNormalizedPasteValue,
+  parseTsv,
+  serializeTsv,
   validatePasteData,
   validatePasteValue,
 } from "../../src/webview/utils/pasteUtils";
@@ -84,6 +86,75 @@ const FLOAT_COLUMN = makeColumn({
   type: "float8",
   nativeType: "float8",
   category: "float",
+});
+
+describe("TSV clipboard format", () => {
+  it("serializes ordinary tabular data without unnecessary quotes", () => {
+    expect(
+      serializeTsv([
+        ["a", "b"],
+        ["c", "d"],
+      ]),
+    ).toBe("a\tb\nc\td");
+  });
+
+  it("quotes multiline, tabbed, and quoted cell values", () => {
+    expect(
+      serializeTsv([["first\nsecond", "left\tright", 'say "hello"']]),
+    ).toBe('"first\nsecond"\t"left\tright"\t"say ""hello"""');
+  });
+
+  it("parses quoted multiline fields and spreadsheet-style CRLF rows", () => {
+    expect(
+      parseTsv('"first\r\nsecond"\tvalue\r\nnext\t"say ""hello"""'),
+    ).toEqual({
+      rows: [
+        ["first\r\nsecond", "value"],
+        ["next", 'say "hello"'],
+      ],
+    });
+  });
+
+  it("preserves empty and whitespace-only rows but ignores a final row delimiter", () => {
+    expect(parseTsv("a\n\n   \n\t\n")).toEqual({
+      rows: [["a"], [""], ["   "], ["", ""]],
+    });
+  });
+
+  it("round-trips a single empty cell and a trailing empty row", () => {
+    expect(serializeTsv([[""]])).toBe('""');
+    expect(parseTsv(serializeTsv([["value"], [""]])).rows).toEqual([
+      ["value"],
+      [""],
+    ]);
+  });
+
+  it("round-trips cells containing all TSV control characters", () => {
+    const rows = [
+      ["", " ", "plain", "left\tright"],
+      ["first\nsecond", "first\rsecond", "first\r\nsecond", 'a "quote"'],
+    ];
+
+    expect(parseTsv(serializeTsv(rows)).rows).toEqual(rows);
+  });
+
+  it("keeps legacy unquoted TSV compatible", () => {
+    expect(parseTsv("a\tb\nc\td")).toEqual({
+      rows: [
+        ["a", "b"],
+        ["c", "d"],
+      ],
+    });
+  });
+
+  it("preserves malformed leading quotes instead of swallowing delimiters", () => {
+    expect(parseTsv('"unterminated\nnext\tvalue')).toEqual({
+      rows: [['"unterminated'], ["next", "value"]],
+    });
+    expect(parseTsv('"abc"x\tvalue')).toEqual({
+      rows: [['"abc"x', "value"]],
+    });
+  });
 });
 
 describe("validatePasteValue — money / currency formats", () => {

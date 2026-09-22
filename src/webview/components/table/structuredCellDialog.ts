@@ -2,9 +2,10 @@ import type { ColumnTypeMeta as ColumnMeta } from "../../../shared/tableTypes";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
 
 export type StructuredCellLanguage = "json" | "xml" | "plaintext";
+type StructuredCellKind = "json" | "array" | "xml";
 
 export interface StructuredCellDialogValue {
-  kind: "json" | "array" | "xml";
+  kind: StructuredCellKind | "text";
   language: StructuredCellLanguage;
   formattedText: string;
 }
@@ -27,7 +28,7 @@ export interface StructuredCellDialogState {
 
 function resolveStructuredCellKind(
   column: Pick<ColumnMeta, "category" | "nativeType">,
-): StructuredCellDialogValue["kind"] | null {
+): StructuredCellKind | null {
   const normalizedNativeType = column.nativeType.trim().toLowerCase();
 
   if (column.category === "array" || normalizedNativeType.endsWith("[]")) {
@@ -301,7 +302,7 @@ export function serializeStructuredCellDialogDraft(
   const trimmed = draftText.trim();
 
   if (!structuredKind) {
-    return trimmed;
+    return draftText;
   }
 
   if (structuredKind === "json" || structuredKind === "array") {
@@ -321,7 +322,19 @@ export function getStructuredCellDialogValue(
 ): StructuredCellDialogValue | null {
   const structuredKind = resolveStructuredCellKind(column);
   if (!structuredKind) {
-    return null;
+    if (
+      value === null ||
+      value === undefined ||
+      (column.category !== "text" && column.category !== "lob")
+    ) {
+      return null;
+    }
+    const rawText = formatScalarValueForDisplay(value);
+    return {
+      kind: "text",
+      language: "plaintext",
+      formattedText: rawText,
+    };
   }
 
   if (value === null || value === undefined) {

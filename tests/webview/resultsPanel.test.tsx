@@ -15,6 +15,40 @@ vi.mock("@tanstack/react-virtual", () => ({
   }),
 }));
 
+vi.mock("../../src/webview/components/MonacoEditor", async () => {
+  const React = await import("react");
+  const MonacoEditor = React.forwardRef(function MonacoEditor(
+    props: {
+      initialValue?: string;
+      ariaLabel?: string;
+      readOnly?: boolean;
+      language?: string;
+    },
+    ref: React.ForwardedRef<{
+      selectAllKeepCursorEndScrollTop: () => void;
+    }>,
+  ) {
+    const textAreaRef = React.useRef<HTMLTextAreaElement>(null);
+    React.useImperativeHandle(ref, () => ({
+      selectAllKeepCursorEndScrollTop: () => textAreaRef.current?.focus(),
+    }));
+    return (
+      <div>
+        <div data-testid="monaco-language">{props.language ?? "sql"}</div>
+        <textarea
+          ref={textAreaRef}
+          aria-label={props.ariaLabel ?? "SQL editor"}
+          readOnly={props.readOnly}
+          value={props.initialValue ?? ""}
+          onChange={() => undefined}
+        />
+      </div>
+    );
+  });
+
+  return { MonacoEditor };
+});
+
 import { TableGrid } from "../../src/webview/components/table/TableGrid";
 import { clearPostedMessages, getPostedMessages } from "./testUtils";
 
@@ -106,9 +140,37 @@ describe("TableGrid query mode", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  it("renders JSON query result cells as a single line", () => {
+  it("opens single-line query text in a read-only plaintext preview", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <TableGrid
+        mode="query"
+        status="success"
+        result={{
+          columns: ["notes"],
+          columnMeta: [{ category: "text" }],
+          rows: [{ __col_0: "single line" }],
+          rowCount: 1,
+          executionTimeMs: 5,
+        }}
+      />,
+    );
+
+    await user.dblClick(screen.getByRole("cell"));
+
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).value,
+    ).toBe("single line");
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).readOnly,
+    ).toBe(true);
+  });
+
+  it("marks line breaks in JSON query result cells", () => {
     const rawJson = '{\n  "name": "Alice",\n  "meta": { "active":  true }\n}';
-    const expectedSingleLine = rawJson.replace(/\r?\n/g, " ");
+    const expectedSingleLine = rawJson.replace(/\r\n|\r|\n/g, "↵");
 
     render(
       <TableGrid
@@ -132,10 +194,10 @@ describe("TableGrid query mode", () => {
     expect(valueNode?.textContent).toBe(expectedSingleLine);
   });
 
-  it("renders XML-like query result cells as a single line without native type metadata", () => {
+  it("marks line breaks in XML-like query result cells without native type metadata", () => {
     const rawXml =
       '<root>\n  <item id="1">Alice</item>\n  <item id="2">Bob</item>\n</root>';
-    const expectedSingleLine = rawXml.replace(/\r?\n/g, " ");
+    const expectedSingleLine = rawXml.replace(/\r\n|\r|\n/g, "↵");
 
     render(
       <TableGrid
@@ -157,6 +219,107 @@ describe("TableGrid query mode", () => {
     expect(valueNode).toBeTruthy();
     expect((valueNode as HTMLSpanElement).style.whiteSpace).toBe("pre");
     expect(valueNode?.textContent).toBe(expectedSingleLine);
+  });
+
+  it("opens multiline query text in a read-only plaintext preview", async () => {
+    const user = userEvent.setup();
+    const rawText = "first line\r\nsecond line";
+
+    render(
+      <TableGrid
+        mode="query"
+        status="success"
+        result={{
+          columns: ["notes"],
+          columnMeta: [{ category: "text" }],
+          rows: [{ __col_0: rawText }],
+          rowCount: 1,
+          executionTimeMs: 5,
+        }}
+      />,
+    );
+
+    await user.dblClick(screen.getByRole("cell"));
+
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(screen.getByText("Cell data: notes")).toBeTruthy();
+    expect(screen.getByTestId("monaco-language").textContent).toBe("plaintext");
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).value,
+    ).toBe(rawText.replace(/\r\n/g, "\n"));
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).readOnly,
+    ).toBe(true);
+  });
+
+  it("opens the selected query text cell with F2", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <TableGrid
+        mode="query"
+        status="success"
+        result={{
+          columns: ["notes"],
+          columnMeta: [{ category: "text" }],
+          rows: [{ __col_0: "single line" }],
+          rowCount: 1,
+          executionTimeMs: 5,
+        }}
+      />,
+    );
+
+    fireEvent.mouseDown(screen.getByRole("cell"), { button: 0 });
+    fireEvent.mouseUp(screen.getByRole("cell"));
+    const scrollContainer = screen.getByRole("table").parentElement;
+    if (!scrollContainer)
+      throw new Error("Expected query grid scroll container");
+    fireEvent.keyDown(scrollContainer, { key: "F2" });
+
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).value,
+    ).toBe("single line");
+
+    const dialog = screen.getByRole("dialog");
+    expect(container.contains(dialog)).toBe(false);
+    expect(dialog.parentElement?.parentElement).toBe(document.body);
+    expect(dialog.parentElement?.style.position).toBe("fixed");
+    expect(dialog.parentElement?.style.inset).toBe("0px");
+    expect(dialog.parentElement?.style.padding).toBe("24px");
+    expect(dialog.style.width).toBe("100%");
+    expect(dialog.style.maxHeight).toBe("calc(100vh - 48px)");
+    expect(
+      screen.getByLabelText("Cell data").parentElement?.parentElement?.style
+        .height,
+    ).toBe("60vh");
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByLabelText("Cell data"));
+    });
+    await user.tab();
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Close" }),
+    );
+    await user.tab();
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Close cell data" }),
+    );
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Close" }),
+    );
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(scrollContainer);
+
+    await user.keyboard("{F2}");
+    await user.click(screen.getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(scrollContainer);
+
+    await user.keyboard("{F2}");
+    await user.click(screen.getByRole("button", { name: "Close cell data" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(scrollContainer);
   });
 
   it("collapses and reopens a result column from the resize divider", async () => {

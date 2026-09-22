@@ -32,14 +32,107 @@ export interface PasteValidationResult {
   >;
 }
 
-export function parseTsv(text: string): PasteData {
-  const lines = text.split("\n");
-  const rows: string[][] = [];
+function serializeTsvCell(value: string): string {
+  return value === "" || /["\t\r\n]/.test(value)
+    ? `"${value.replace(/"/g, '""')}"`
+    : value;
+}
 
-  for (const line of lines) {
-    if (line.trim() === "") continue;
-    const cells = line.split("\t");
-    rows.push(cells);
+export function serializeTsv(rows: readonly (readonly string[])[]): string {
+  return rows.map((row) => row.map(serializeTsvCell).join("\t")).join("\n");
+}
+
+function hasValidClosingQuote(text: string, openingIndex: number): boolean {
+  for (let index = openingIndex + 1; index < text.length; index++) {
+    if (text[index] !== '"') {
+      continue;
+    }
+
+    if (text[index + 1] === '"') {
+      index++;
+      continue;
+    }
+
+    const next = text[index + 1];
+    return (
+      next === undefined || next === "\t" || next === "\r" || next === "\n"
+    );
+  }
+
+  return false;
+}
+
+export function parseTsv(text: string): PasteData {
+  if (text.length === 0) {
+    return { rows: [] };
+  }
+
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let inQuotes = false;
+  let atFieldStart = true;
+  let endedWithRowDelimiter = false;
+
+  const finishField = () => {
+    row.push(field);
+    field = "";
+    atFieldStart = true;
+  };
+
+  const finishRow = () => {
+    finishField();
+    rows.push(row);
+    row = [];
+  };
+
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+
+    if (inQuotes) {
+      if (char === '"') {
+        if (text[index + 1] === '"') {
+          field += '"';
+          index++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += char;
+      }
+      endedWithRowDelimiter = false;
+      continue;
+    }
+
+    if (char === '"' && atFieldStart && hasValidClosingQuote(text, index)) {
+      inQuotes = true;
+      atFieldStart = false;
+      endedWithRowDelimiter = false;
+      continue;
+    }
+
+    if (char === "\t") {
+      finishField();
+      endedWithRowDelimiter = false;
+      continue;
+    }
+
+    if (char === "\r" || char === "\n") {
+      finishRow();
+      if (char === "\r" && text[index + 1] === "\n") {
+        index++;
+      }
+      endedWithRowDelimiter = true;
+      continue;
+    }
+
+    field += char;
+    atFieldStart = false;
+    endedWithRowDelimiter = false;
+  }
+
+  if (!endedWithRowDelimiter) {
+    finishRow();
   }
 
   return { rows };
