@@ -605,10 +605,16 @@ export function deriveAggregateSchemaState(
     }
   }
 
-  return {
-    status: "loaded",
-    isPartial: false,
-  };
+  const failedScope = [...entry.scopes.values()].find(
+    (scope) => scope.status === "error",
+  );
+  return failedScope
+    ? {
+        status: "error",
+        isPartial: snapshot.databases.length > 0,
+        error: failedScope.error,
+      }
+    : { status: "loaded", isPartial: false };
 }
 
 /**

@@ -36,6 +36,7 @@ interface UseTableDataControllerParams {
   fetchPageRef: MutableRefObject<() => void>;
   preserveScrollPositionRef: MutableRefObject<() => void>;
   onTableInit: () => void;
+  onReadFailed: () => void;
   onRowsCommitted: (
     rows: readonly Row[],
     primaryKeyColumns: readonly string[],
@@ -75,6 +76,7 @@ export function useTableDataController({
   fetchPageRef,
   preserveScrollPositionRef,
   onTableInit,
+  onReadFailed,
   onRowsCommitted,
 }: UseTableDataControllerParams) {
   const [columns, setColumns] = useState<ColumnMeta[]>([]);
@@ -82,6 +84,7 @@ export function useTableDataController({
   const [rows, setRows] = useState<Row[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [loading, setLoading] = useState(true);
+  const loadingRef = useRef(true);
   const [hasCommittedData, setHasCommittedData] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [readError, setReadError] = useState<string | null>(null);
@@ -119,6 +122,7 @@ export function useTableDataController({
   const readOnlyTableRef = useRef(initialReadOnlyTable);
   const initialPageSizeRef = useRef(initialPageSize);
   const onTableInitRef = useRef(onTableInit);
+  const onReadFailedRef = useRef(onReadFailed);
   const onRowsCommittedRef = useRef(onRowsCommitted);
   const tableInitSignatureRef = useRef<string | null>(null);
 
@@ -141,6 +145,7 @@ export function useTableDataController({
   debouncedFilterDraftsRef.current = debouncedFilterDrafts;
   readOnlyTableRef.current = readOnlyTable;
   onTableInitRef.current = onTableInit;
+  onReadFailedRef.current = onReadFailed;
   onRowsCommittedRef.current = onRowsCommitted;
   rowsRef.current = rows;
   pkColsRef.current = pkCols;
@@ -159,6 +164,7 @@ export function useTableDataController({
 
     fetchSnapshotsRef.current.clear();
     fetchSnapshotsRef.current.set(epoch, snapshot);
+    loadingRef.current = true;
     setLoading(true);
     setReadError(null);
 
@@ -177,6 +183,10 @@ export function useTableDataController({
   }, [columnsRef]);
 
   fetchPageRef.current = fetchPage;
+  // Keep callbacks blocked until the committed rows and restored edits render.
+  useEffect(() => {
+    loadingRef.current = loading;
+  });
   preserveScrollPositionRef.current = () => {
     scrollPreserveRef.current = scrollRef.current?.scrollTop ?? null;
   };
@@ -236,6 +246,7 @@ export function useTableDataController({
         scrollPreserveRef.current = null;
         colSizesInitedRef.current = false;
 
+        loadingRef.current = true;
         setLoading(true);
         setHasCommittedData(false);
         setColumns([]);
@@ -350,6 +361,7 @@ export function useTableDataController({
       }
 
       setLoading(false);
+      onReadFailedRef.current();
       fetchSnapshotsRef.current.delete(fetchId ?? fetchEpochRef.current);
     });
 
@@ -453,6 +465,8 @@ export function useTableDataController({
   );
 
   return {
+    loadingRef,
+    fetchEpochRef,
     columns,
     colSizes,
     debouncedFilterDrafts,

@@ -157,19 +157,26 @@ export function validatePasteValue(
     case "integer":
     case "float":
     case "decimal": {
-      const normalized = normalizeNumericToken(value);
-      if (normalized !== null) {
+      if (value.trim() === "") {
+        return { valid: true, coercedValue: value };
+      }
+      const normalized = normalizeNumericToken(
+        value,
+        column.category === "float",
+      );
+      // Integer drivers use decimal integer literals (including BigInt), not
+      // rounded JS numbers. Leave native ranges and decimal scale to the driver.
+      if (
+        normalized !== null &&
+        (column.category !== "integer" || /^[+-]?\d+$/.test(normalized))
+      ) {
         return { valid: true, coercedValue: normalized };
       }
-      const num = Number(value);
-      if (Number.isNaN(num)) {
-        return {
-          valid: false,
-          coercedValue: value,
-          error: `Invalid number value "${value}" for column "${column.name}"`,
-        };
-      }
-      return { valid: true, coercedValue: value };
+      return {
+        valid: false,
+        coercedValue: value,
+        error: `Invalid number value "${value}" for column "${column.name}"`,
+      };
     }
 
     case "boolean": {

@@ -51,6 +51,46 @@ const moneyColumn: ColumnTypeMeta = {
 };
 
 describe("numeric filter normalization", () => {
+  it("preserves a precise bigint in PostgreSQL filter parameters", () => {
+    const column = {
+      ...moneyColumn,
+      category: "integer" as const,
+      nativeType: "bigint",
+      type: "bigint",
+    };
+    expect(
+      postgresDriver.buildFilterCondition(
+        column,
+        "eq",
+        "9223372036854775807",
+        1,
+      ),
+    ).toEqual({
+      sql: '"col_money" = $1',
+      params: [9223372036854775807n],
+    });
+  });
+
+  it.each([
+    "abc123",
+    "10xyz",
+    "mis500",
+    "Infinity",
+    "1e999",
+  ])("rejects invalid numeric filter input %s", (value) => {
+    for (const driver of [postgresDriver, mssqlDriver]) {
+      expect(() =>
+        driver.normalizeFilterValue(moneyColumn, "eq", value),
+      ).toThrow();
+      expect(() =>
+        driver.normalizeFilterValue(moneyColumn, "in", `1, ${value}`),
+      ).toThrow();
+      expect(() =>
+        driver.normalizeFilterValue(moneyColumn, "between", ["1", value]),
+      ).toThrow();
+    }
+  });
+
   it("normalizes formatted money value for numeric equality filters", () => {
     const normalized = postgresDriver.normalizeFilterValue(
       moneyColumn,

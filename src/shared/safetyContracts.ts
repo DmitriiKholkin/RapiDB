@@ -45,6 +45,7 @@ export interface SqlHardCapRewriteDecision {
   reason?:
     | "unsupported_connection"
     | "non_limitable_statement"
+    | "unsupported_sql"
     | "unsafe_with_clause";
 }
 

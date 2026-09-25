@@ -26,6 +26,10 @@ import {
   type ConnectionType,
   DEFAULT_PORT_BY_CONNECTION_TYPE,
 } from "../../shared/connectionTypes";
+import {
+  buildConnectionPortValidationIssues,
+  isConnectionPortRelevant,
+} from "../../shared/connectionValidation";
 import type {
   ConnectionFormBrowseTarget,
   ConnectionFormExistingState,
@@ -739,7 +743,13 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   };
 
   const buildPayload = useCallback((): ConnectionFormSubmission => {
-    const parsedSshPort = Number.parseInt(sshPort.trim(), 10);
+    const parsedSshPort = sshPort.trim() === "" ? 22 : Number(sshPort);
+    const usesDatabasePort = isConnectionPortRelevant({
+      type,
+      connectionUri: isMongo ? mongoConnectionUri : undefined,
+      endpoint: isElasticsearch ? elasticsearchEndpoint : undefined,
+      cloudId: isElasticsearch ? elasticsearchCloudId : undefined,
+    });
     const tlsConfig = supportsTls
       ? {
           mode: tlsMode,
@@ -779,10 +789,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       ssh: effectiveSshEnabled
         ? {
             host: sshHost.trim() || undefined,
-            port:
-              Number.isInteger(parsedSshPort) && parsedSshPort > 0
-                ? parsedSshPort
-                : undefined,
+            port: parsedSshPort,
             username: sshUsername.trim() || undefined,
             authMethod: sshAuthMethod,
             hostVerificationMode: sshHostVerificationMode,
@@ -814,7 +821,11 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
             }
           : {
               host: host.trim(),
-              port: Number(port) || DEFAULT_PORT_BY_CONNECTION_TYPE[type],
+              port: usesDatabasePort
+                ? port.trim() === ""
+                  ? DEFAULT_PORT_BY_CONNECTION_TYPE[type]
+                  : Number(port)
+                : undefined,
               database: database.trim(),
               username: username.trim(),
               password,
@@ -899,6 +910,12 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   ]);
 
   const validateSubmission = () => {
+    const portIssues = buildConnectionPortValidationIssues(buildPayload());
+    if (portIssues.length > 0) {
+      setTestState("fail");
+      setTestError(portIssues.map((issue) => issue.message).join(" "));
+      return false;
+    }
     if (
       type === "redis" &&
       database.trim().length > 0 &&

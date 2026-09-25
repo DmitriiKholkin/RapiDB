@@ -128,13 +128,27 @@ function readConnectionTlsMode(value: unknown): ConnectionTlsMode | undefined {
 
 function readConnectionTlsConfig(
   value: unknown,
-): ConnectionConfig["tls"] | undefined {
-  if (!isRecord(value)) {
+): ConnectionConfig["tls"] | null {
+  if (value === undefined) {
     return undefined;
+  }
+  if (!isRecord(value)) {
+    return null;
   }
   const mode = readConnectionTlsMode(value.mode);
   if (mode === undefined) {
-    return undefined;
+    return null;
+  }
+  for (const field of [
+    "caFilePath",
+    "certFilePath",
+    "keyFilePath",
+    "keyPassphrase",
+    "serverNameOverride",
+  ] as const) {
+    if (value[field] !== undefined && typeof value[field] !== "string") {
+      return null;
+    }
   }
   return {
     mode,
@@ -187,8 +201,23 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
   const name = readOptionalString(input, "name");
   const type = readConnectionType(input.type);
   const sqliteWalMode = readSqliteWalMode(input.sqliteWalMode);
+  const tls = readConnectionTlsConfig(input.tls);
+  if (tls === null) {
+    return null;
+  }
   if (!id || name === undefined || type === undefined || type === "") {
     return null;
+  }
+
+  // readOptionalNumber returns undefined for malformed values as well as absent
+  // ones. Reject malformed ports instead of silently replacing them with defaults.
+  for (const source of [input, ...(isRecord(input.ssh) ? [input.ssh] : [])]) {
+    if (
+      source.port !== undefined &&
+      readOptionalNumber(source, "port") === undefined
+    ) {
+      return null;
+    }
   }
 
   const database = readOptionalString(input, "database");
@@ -208,7 +237,7 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
     database: type === "oracle" ? undefined : database,
     username: readOptionalString(input, "username"),
     filePath: readOptionalString(input, "filePath"),
-    tls: readConnectionTlsConfig(input.tls),
+    tls,
     folder: readOptionalString(input, "folder"),
     serviceName: normalizedOracleServiceName,
     connectionUri:

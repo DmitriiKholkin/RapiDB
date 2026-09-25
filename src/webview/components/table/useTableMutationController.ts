@@ -44,6 +44,7 @@ import { useUndoRedoHistory } from "./useUndoRedoHistory";
 
 interface UseTableMutationControllerParams {
   canEditRows: boolean;
+  loadingRef: MutableRefObject<boolean>;
   columnsRef: MutableRefObject<ColumnMeta[]>;
   fetchPageRef: MutableRefObject<() => void>;
   pkColsRef: MutableRefObject<string[]>;
@@ -54,6 +55,7 @@ interface UseTableMutationControllerParams {
 
 export function useTableMutationController({
   canEditRows,
+  loadingRef,
   columnsRef,
   fetchPageRef,
   pkColsRef,
@@ -66,7 +68,6 @@ export function useTableMutationController({
   const [applying, setApplying] = useState(false);
   const [applyStatus, setApplyStatus] = useState<TableApplyStatus | null>(null);
   const [newRows, setNewRows] = useState<InsertDraftRow[]>([]);
-  const [inserting, setInserting] = useState(false);
   const [mutErr, setMutErr] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [mutationPreview, setMutationPreview] =
@@ -84,6 +85,10 @@ export function useTableMutationController({
   const mutationPreviewRef = useRef(mutationPreview);
   const operationSequenceRef = useRef(0);
   const activeOperationIdRef = useRef<string | null>(null);
+  const isBusy = useCallback(
+    () => loadingRef.current || activeOperationIdRef.current !== null,
+    [loadingRef],
+  );
 
   // Refs for snapshot access inside callbacks that avoid re-creation
   const pendingEditsRef = useRef(pendingEdits);
@@ -128,6 +133,8 @@ export function useTableMutationController({
 
   const handleRowsCommitted = useCallback(
     (rows: readonly Row[], primaryKeyColumns: readonly string[]) => {
+      // History snapshots use row indexes from the previous committed dataset.
+      history.clear();
       const restoreSource =
         pendingRestoreRef.current ??
         buildPendingRestoreState(
@@ -145,7 +152,7 @@ export function useTableMutationController({
       setPending(restoredPending);
       setEditCell(null);
     },
-    [rowsRef],
+    [history, rowsRef],
   );
 
   const resetForTableInit = useCallback(() => {
@@ -156,7 +163,6 @@ export function useTableMutationController({
     setEditCell(null);
     setApplying(false);
     setDeleting(false);
-    setInserting(false);
     setMutationPreview(null);
     setStructuredCellDialog(null);
     setNewRows([]);
@@ -242,40 +248,6 @@ export function useTableMutationController({
       },
     );
 
-    const unInsert = onMessage<{
-      operationId: string;
-      success: boolean;
-      error?: string;
-    }>("insertResult", ({ operationId, success, error }) => {
-      if (operationId !== activeOperationIdRef.current) return;
-      activeOperationIdRef.current = null;
-      setInserting(false);
-      if (success) {
-        setNewRows([]);
-        setEditCell(null);
-        setMutErr(null);
-
-        if (applyRowIndexesRef.current.length > 0) {
-          const updates = buildPendingUpdatesPayload(
-            applyPendingSnapshotRef.current,
-          );
-          const nextOperationId = `table-mutation:${++operationSequenceRef.current}`;
-          activeOperationIdRef.current = nextOperationId;
-          postMessage("applyChanges", {
-            operationId: nextOperationId,
-            updates,
-          });
-          return;
-        }
-
-        setApplying(false);
-        fetchPageRef.current();
-      } else {
-        setApplying(false);
-        setMutErr(error ?? "Insert failed");
-      }
-    });
-
     const unDelete = onMessage<{
       operationId: string;
       success: boolean;
@@ -302,12 +274,10 @@ export function useTableMutationController({
 
     return () => {
       unApply();
-      unInsert();
       unDelete();
       unMutationPreview();
     };
   }, [
-    buildPendingUpdatesPayload,
     fetchPageRef,
     history,
     pendingEdits,
@@ -326,9 +296,6 @@ export function useTableMutationController({
     setMutationPreview(null);
 
     if (kind === "applyChanges") {
-      clearApplyRequestState();
-    } else if (kind === "insertRow") {
-      setInserting(false);
       clearApplyRequestState();
     } else {
       setDeleting(false);
@@ -375,7 +342,8 @@ export function useTableMutationController({
   }, [cancelMutationPreview, mutationPreview]);
 
   const startInsertRow = useCallback(() => {
-    if (applying || inserting || deleting) return;
+    if (isBusy()) return;
+    if (applying || deleting) return;
     if (newRowsRef.current.length >= MAX_DRAFT_ROWS) return;
     history.push(
       buildUndoRedoSnapshot(pendingEditsRef.current, newRowsRef.current, null),
@@ -383,9 +351,10 @@ export function useTableMutationController({
     setNewRows((prev) => [createInsertDraft(columnsRef.current), ...prev]);
     setEditCell(null);
     setMutErr(null);
-  }, [applying, columnsRef, deleting, history, inserting]);
+  }, [applying, columnsRef, deleting, history, isBusy]);
 
   const applyChanges = useCallback(() => {
+    if (isBusy()) return;
     const unsavedRowCount = pendingEdits.size + newRows.length;
     if (unsavedRowCount === 0 || applying) {
       return;
@@ -409,9 +378,10 @@ export function useTableMutationController({
       updates,
       ...(insertValues.length > 0 ? { insertValues } : {}),
     });
-  }, [applying, buildPendingUpdatesPayload, newRows, pendingEdits]);
+  }, [applying, buildPendingUpdatesPayload, newRows, pendingEdits, isBusy]);
 
   const revertChanges = useCallback(() => {
+    if (isBusy()) return;
     history.clear();
     pendingRestoreRef.current = null;
     setPending(new Map());
@@ -419,7 +389,7 @@ export function useTableMutationController({
     setEditCell(null);
     setMutErr(null);
     setApplyStatus(null);
-  }, [history]);
+  }, [history, isBusy]);
 
   const commitBatchCellEdits = useCallback(
     (
@@ -432,7 +402,7 @@ export function useTableMutationController({
     ) => {
       setEditCell(null);
 
-      if (!canEditRowsRef.current) {
+      if (isBusy() || !canEditRowsRef.current) {
         return;
       }
 
@@ -498,7 +468,7 @@ export function useTableMutationController({
         return nextPending;
       });
     },
-    [history],
+    [history, isBusy],
   );
 
   const commitCellEdit = useCallback(
@@ -510,7 +480,7 @@ export function useTableMutationController({
     ) => {
       setEditCell(null);
 
-      if (!canEditRowsRef.current) {
+      if (isBusy() || !canEditRowsRef.current) {
         return;
       }
 
@@ -563,17 +533,20 @@ export function useTableMutationController({
         return nextPending;
       });
     },
-    [history],
+    [history, isBusy],
   );
 
   const commitDraftCellEdit = useCallback(
     (rowIdx: number, column: ColumnMeta, newVal: string) => {
+      if (isBusy()) return;
       setEditCell(null);
 
       const currentRows = newRowsRef.current;
       if (rowIdx < 0 || rowIdx >= currentRows.length) return;
 
       const norm = newVal === NULL_SENTINEL ? NULL_SENTINEL : newVal;
+
+      if (currentRows[rowIdx][column.name]?.value === norm) return;
 
       history.push(
         buildUndoRedoSnapshot(pendingEditsRef.current, currentRows, null),
@@ -590,11 +563,12 @@ export function useTableMutationController({
         ),
       );
     },
-    [history],
+    [history, isBusy],
   );
 
   const commitBatchDraftCellEdits = useCallback(
     (rowIdx: number, edits: Array<{ column: ColumnMeta; newVal: string }>) => {
+      if (isBusy()) return;
       setEditCell(null);
 
       const currentRows = newRowsRef.current;
@@ -627,7 +601,7 @@ export function useTableMutationController({
         }),
       );
     },
-    [history],
+    [history, isBusy],
   );
 
   const commitMixedBatchEdits = useCallback(
@@ -640,6 +614,7 @@ export function useTableMutationController({
         originalVal: unknown;
       }>,
     ) => {
+      if (isBusy()) return;
       setEditCell(null);
 
       const currentRows = newRowsRef.current;
@@ -737,24 +712,29 @@ export function useTableMutationController({
         });
       }
     },
-    [history],
+    [history, isBusy],
   );
 
-  const handleStartEdit = useCallback((rowIdx: number, column: ColumnMeta) => {
-    if (!canEditColumn(column)) {
-      return;
-    }
+  const handleStartEdit = useCallback(
+    (rowIdx: number, column: ColumnMeta) => {
+      if (isBusy()) return;
+      if (!canEditColumn(column)) {
+        return;
+      }
 
-    setEditCell({ kind: "persisted", rowIdx, col: column.name });
-    setApplyStatus(null);
-  }, []);
+      setEditCell({ kind: "persisted", rowIdx, col: column.name });
+      setApplyStatus(null);
+    },
+    [isBusy],
+  );
 
   const handleStartDraftEdit = useCallback(
     (rowIdx: number, column: ColumnMeta) => {
+      if (isBusy()) return;
       setEditCell({ kind: "draft", rowIdx, col: column.name });
       setApplyStatus(null);
     },
-    [],
+    [isBusy],
   );
 
   const openStructuredCellDialog = useCallback(
@@ -767,6 +747,7 @@ export function useTableMutationController({
       originalValue: unknown;
       readOnly: boolean;
     }) => {
+      if (isBusy()) return;
       const {
         rowKind,
         rowIdx,
@@ -801,7 +782,7 @@ export function useTableMutationController({
         isNull: currentValue === null,
       });
     },
-    [],
+    [isBusy],
   );
 
   const updateStructuredCellDialogDraft = useCallback((nextValue: string) => {
@@ -885,12 +866,12 @@ export function useTableMutationController({
   }, [commitStructuredCellDialogValue, structuredCellDialog]);
 
   const deleteSelected = useCallback(() => {
+    if (isBusy()) return;
     if (
       selectedRef.current.size === 0 ||
       pkColsRef.current.length === 0 ||
       deleting ||
-      applying ||
-      inserting
+      applying
     ) {
       return;
     }
@@ -906,10 +887,11 @@ export function useTableMutationController({
     const operationId = `table-mutation:${++operationSequenceRef.current}`;
     activeOperationIdRef.current = operationId;
     postMessage("deleteRows", { operationId, primaryKeysList: toDelete });
-  }, [applying, deleting, inserting, pkColsRef, rowsRef]);
+  }, [applying, deleting, pkColsRef, rowsRef, isBusy]);
 
   const undoAction = useCallback(() => {
-    if (applying || inserting || deleting) return;
+    if (isBusy()) return;
+    if (applying || deleting) return;
 
     const currentSnapshot = buildUndoRedoSnapshot(
       pendingEditsRef.current,
@@ -923,10 +905,11 @@ export function useTableMutationController({
     setPending(restored.pendingEdits);
     setNewRows(restored.newRows);
     setEditCell(restored.editCell);
-  }, [applying, inserting, deleting, history]);
+  }, [applying, deleting, history, isBusy]);
 
   const redoAction = useCallback(() => {
-    if (applying || inserting || deleting) return;
+    if (isBusy()) return;
+    if (applying || deleting) return;
 
     const currentSnapshot = buildUndoRedoSnapshot(
       pendingEditsRef.current,
@@ -940,7 +923,7 @@ export function useTableMutationController({
     setPending(restored.pendingEdits);
     setNewRows(restored.newRows);
     setEditCell(restored.editCell);
-  }, [applying, inserting, deleting, history]);
+  }, [applying, deleting, history, isBusy]);
 
   useEffect(() => {
     if (!canEditRows) return;
@@ -986,9 +969,12 @@ export function useTableMutationController({
     editCell,
     structuredCellDialog,
     handleRowsCommitted,
+    handleReadFailed: () => {
+      // The old rows remain committed, so future restores must use current edits.
+      pendingRestoreRef.current = null;
+    },
     handleStartDraftEdit,
     handleStartEdit,
-    inserting,
     mutErr,
     mutationPreview,
     newRows,

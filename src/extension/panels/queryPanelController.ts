@@ -1,12 +1,13 @@
 import * as vscode from "vscode";
-import type { ConnectionType } from "../../shared/connectionTypes";
 import {
   type OperationCancellationContext,
   QUERY_LIMIT_POLICY,
   type QueryExecutionCancellationHandle,
-  type SqlHardCapRewriteDecision,
 } from "../../shared/safetyContracts";
-import { parseQueryPanelMessage } from "../../shared/webviewContracts";
+import {
+  parseQueryPanelMessage,
+  type QueryResultExportPayload,
+} from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import { colKey, type QueryColumnMeta } from "../dbDrivers/types";
 import { readClipboardTextSafe, writeClipboardText } from "../utils/clipboard";
@@ -21,223 +22,14 @@ import {
   decideReadOnlyQueryExecution,
   mayChangeDatabaseSchema,
 } from "../utils/readOnlyGuards";
+import { applyHardCapToSqlQuery } from "../utils/sqlHardCap";
 
-const SQL_CONNECTION_TYPES = new Set<ConnectionType>([
-  "pg",
-  "mysql",
-  "sqlite",
-  "mssql",
-  "oracle",
-]);
-
-const LIMITABLE_QUERY_PREFIX = /^\s*(with|select|values)\b/i;
-const WITH_QUERY_PREFIX = /^\s*with\b/i;
 const SUPERSEDED_QUERY_REJECTED_MESSAGE =
   "[RapiDB] Cannot execute query while a previous query is still running for this connection.";
 const SUPERSEDED_QUERY_CANCEL_TIMEOUT_MS = 1_500;
-const UNBOUNDED_QUERY_MESSAGE =
-  "[RapiDB] This query cannot be safely bounded by the configured row limit.";
 const MSSQL_READ_ONLY_ENFORCEMENT_MESSAGE =
   "[RapiDB] Read-only MSSQL queries require database-enforced read permissions; client-side SQL classification is not sufficient.";
 let nextQueryRequestToken = 0;
-
-function stripTrailingBlockComment(queryText: string): string {
-  if (!queryText.endsWith("*/")) {
-    return queryText;
-  }
-
-  const blockStart = queryText.lastIndexOf("/*");
-  if (blockStart < 0) {
-    return queryText;
-  }
-
-  return queryText.slice(0, blockStart);
-}
-
-function trimTrailingSemicolonsAndComments(queryText: string): string {
-  let normalized = queryText;
-
-  while (normalized.length > 0) {
-    const withoutTrailingWhitespace = normalized.replace(/\s+$/g, "");
-    if (withoutTrailingWhitespace !== normalized) {
-      normalized = withoutTrailingWhitespace;
-      continue;
-    }
-
-    const withoutTrailingLineComment = normalized.replace(/--[^\r\n]*$/g, "");
-    if (withoutTrailingLineComment !== normalized) {
-      normalized = withoutTrailingLineComment;
-      continue;
-    }
-
-    const withoutTrailingBlockComment = stripTrailingBlockComment(normalized);
-    if (withoutTrailingBlockComment !== normalized) {
-      normalized = withoutTrailingBlockComment;
-      continue;
-    }
-
-    const withoutTrailingSemicolons = normalized.replace(/;+$/g, "");
-    if (withoutTrailingSemicolons !== normalized) {
-      normalized = withoutTrailingSemicolons;
-      continue;
-    }
-
-    break;
-  }
-
-  return normalized;
-}
-
-function stripLeadingSqlComments(queryText: string): string {
-  let cursor = queryText;
-
-  while (cursor.length > 0) {
-    const trimmed = cursor.trimStart();
-    if (trimmed.startsWith("--")) {
-      const nextLineBreak = trimmed.indexOf("\n");
-      cursor = nextLineBreak >= 0 ? trimmed.slice(nextLineBreak + 1) : "";
-      continue;
-    }
-
-    if (trimmed.startsWith("/*")) {
-      const blockEnd = trimmed.indexOf("*/", 2);
-      if (blockEnd < 0) {
-        return "";
-      }
-      cursor = trimmed.slice(blockEnd + 2);
-      continue;
-    }
-
-    return trimmed;
-  }
-
-  return "";
-}
-
-function findFirstSqlTokenIndex(queryText: string): number {
-  let index = 0;
-  while (index < queryText.length) {
-    const rest = queryText.slice(index);
-    const whitespace = /^\s+/.exec(rest);
-    if (whitespace) {
-      index += whitespace[0].length;
-      continue;
-    }
-
-    if (rest.startsWith("--")) {
-      const nextLineBreak = rest.indexOf("\n");
-      index = nextLineBreak >= 0 ? index + nextLineBreak + 1 : queryText.length;
-      continue;
-    }
-
-    if (rest.startsWith("/*")) {
-      const blockEnd = rest.indexOf("*/", 2);
-      if (blockEnd < 0) {
-        return -1;
-      }
-      index += blockEnd + 2;
-      continue;
-    }
-
-    return index;
-  }
-
-  return -1;
-}
-
-function applyMssqlTopHardCap(
-  queryText: string,
-  hardCap: number,
-): string | null {
-  const tokenIndex = findFirstSqlTokenIndex(queryText);
-  if (tokenIndex < 0) {
-    return null;
-  }
-
-  const head = queryText.slice(0, tokenIndex);
-  const tail = queryText.slice(tokenIndex);
-  const selectPrefix = /^select\s+(distinct\s+|all\s+)?/i.exec(tail);
-  if (!selectPrefix) {
-    return null;
-  }
-  if (/^select\s+(?:distinct\s+|all\s+)?top\b/i.test(tail)) {
-    return null;
-  }
-
-  const matched = selectPrefix[0];
-  const topSelect = `${matched}TOP (${hardCap}) `;
-  return `${head}${topSelect}${tail.slice(matched.length)}`;
-}
-
-function applyHardCapToSqlQuery(
-  queryText: string,
-  connectionType: ConnectionType | undefined,
-  hardCap: number,
-): { queryText: string; decision: SqlHardCapRewriteDecision } {
-  if (!connectionType || !SQL_CONNECTION_TYPES.has(connectionType)) {
-    return {
-      queryText,
-      decision: { applied: false, reason: "unsupported_connection" },
-    };
-  }
-
-  const normalizedQuery = trimTrailingSemicolonsAndComments(queryText);
-  if (!normalizedQuery) {
-    return {
-      queryText,
-      decision: { applied: false, reason: "non_limitable_statement" },
-    };
-  }
-
-  const classificationQuery = stripLeadingSqlComments(normalizedQuery);
-  if (!classificationQuery) {
-    return {
-      queryText,
-      decision: { applied: false, reason: "non_limitable_statement" },
-    };
-  }
-
-  if (WITH_QUERY_PREFIX.test(classificationQuery)) {
-    return {
-      queryText,
-      decision: { applied: false, reason: "unsafe_with_clause" },
-    };
-  }
-
-  if (!LIMITABLE_QUERY_PREFIX.test(classificationQuery)) {
-    return {
-      queryText,
-      decision: { applied: false, reason: "non_limitable_statement" },
-    };
-  }
-
-  switch (connectionType) {
-    case "mssql":
-      {
-        const topRewritten = applyMssqlTopHardCap(normalizedQuery, hardCap);
-        if (topRewritten) {
-          return {
-            queryText: topRewritten,
-            decision: { applied: true },
-          };
-        }
-      }
-      return {
-        queryText: `SELECT TOP (${hardCap}) * FROM (${normalizedQuery}) AS [rapidb_query_cap]`,
-        decision: { applied: true },
-      };
-    case "oracle":
-      return {
-        queryText: `SELECT * FROM (${normalizedQuery}) rapidb_query_cap FETCH FIRST ${hardCap} ROWS ONLY`,
-        decision: { applied: true },
-      };
-    default:
-      return {
-        queryText: `SELECT * FROM (${normalizedQuery}) AS rapidb_query_cap LIMIT ${hardCap}`,
-        decision: { applied: true },
-      };
-  }
-}
 
 export interface QueryPanelCachedResult {
   columns: string[];
@@ -445,17 +237,14 @@ export class QueryPanelController {
       QUERY_LIMIT_POLICY.hardCap,
     );
     const hardCapProbeLimit = effectiveRowLimit + 1;
-    const rewrite = applyHardCapToSqlQuery(
-      queryText,
-      connectionType,
-      hardCapProbeLimit,
-    );
-    if (rewrite.decision.reason === "unsafe_with_clause") {
-      this.postQueryError(
-        UNBOUNDED_QUERY_MESSAGE,
-        requestToken,
-        resultIdentity,
-      );
+    const driverBounded =
+      this.connectionManager.getDriverCapabilities?.(connectionId)
+        ?.boundedQueryResults === true;
+    const rewrite = driverBounded
+      ? { queryText }
+      : applyHardCapToSqlQuery(queryText, connectionType, hardCapProbeLimit);
+    if ("error" in rewrite && rewrite.error) {
+      this.postQueryError(rewrite.error, requestToken, resultIdentity);
       return;
     }
     const cappedQueryText = rewrite.queryText;
@@ -511,6 +300,7 @@ export class QueryPanelController {
     try {
       const result = await driver.query(cappedQueryText, undefined, {
         requestToken,
+        ...(driverBounded ? { hardCap: hardCapProbeLimit } : {}),
         ...(connection?.readOnly === true ? { readOnly: true } : {}),
       });
       if (!this.isCurrentQueryRequest(requestToken)) {
@@ -765,10 +555,21 @@ export class QueryPanelController {
   private async handleExportResults(
     format: "csv" | "json",
     columnOrder?: string[],
-    sort?: { column: string; desc: boolean }[],
+    sort?: QueryResultExportPayload["sort"],
   ): Promise<void> {
     const cached = this.getCachedResultForExport();
     if (!cached) {
+      return;
+    }
+
+    const columnIds = new Set(cached.columns.map((_, i) => colKey(i)));
+    if (
+      columnOrder?.some((id) => !columnIds.has(id)) ||
+      sort?.some(({ id }) => !columnIds.has(id))
+    ) {
+      vscode.window.showWarningMessage(
+        "[RapiDB] Invalid query result column ID.",
+      );
       return;
     }
 
@@ -791,52 +592,35 @@ export class QueryPanelController {
     result: QueryPanelCachedResult,
     columnOrder: string[],
   ): QueryPanelCachedResult {
-    const indexMap = new Map(result.columns.map((col, i) => [col, i]));
-    const reorderedColumns: string[] = [];
-    const reorderedMeta: NonNullable<typeof result.columnMeta> = [];
-
-    for (const colId of columnOrder) {
-      const origIndex = indexMap.get(colId);
-      if (origIndex !== undefined) {
-        reorderedColumns.push(colId);
-        if (result.columnMeta) {
-          reorderedMeta.push(result.columnMeta[origIndex]);
-        }
-      }
-    }
-
-    if (reorderedColumns.length === 0) return result;
+    if (columnOrder.length === 0) return result;
+    const indices = columnOrder.map((id) => Number(id.slice(6)));
 
     const reorderedRows = result.rows.map((row) => {
       const newRow: Record<string, unknown> = {};
-      for (let i = 0; i < reorderedColumns.length; i++) {
-        const origIndex = indexMap.get(reorderedColumns[i]);
-        if (origIndex !== undefined) {
-          newRow[colKey(i)] = row[colKey(origIndex)];
-        }
+      for (let i = 0; i < columnOrder.length; i++) {
+        newRow[colKey(i)] = row[columnOrder[i]];
       }
       return newRow;
     });
 
     return {
       ...result,
-      columns: reorderedColumns,
-      ...(result.columnMeta ? { columnMeta: reorderedMeta } : {}),
+      columns: indices.map((i) => result.columns[i]),
+      ...(result.columnMeta
+        ? { columnMeta: indices.map((i) => result.columnMeta![i]) }
+        : {}),
       rows: reorderedRows,
     };
   }
 
   private sortResultRows(
     result: QueryPanelCachedResult,
-    sort: { column: string; desc: boolean }[],
+    sort: NonNullable<QueryResultExportPayload["sort"]>,
   ): QueryPanelCachedResult {
-    const nameToKey = new Map(result.columns.map((col, i) => [col, colKey(i)]));
     const sortedRows = [...result.rows].sort((a, b) => {
-      for (const { column, desc } of sort) {
-        const key = nameToKey.get(column);
-        if (key === undefined) continue;
-        const aVal = a[key];
-        const bVal = b[key];
+      for (const { id, desc } of sort) {
+        const aVal = a[id];
+        const bVal = b[id];
         let cmp = 0;
         if (aVal == null && bVal == null) cmp = 0;
         else if (aVal == null) cmp = -1;

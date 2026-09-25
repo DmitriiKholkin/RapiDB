@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { validateConnectionConfig } from "../../src/shared/connectionValidation";
 import {
   parseConnectionFormPanelMessage,
   parseErdPanelMessage,
@@ -6,6 +7,238 @@ import {
   parseTablePanelMessage,
   parseWebviewInitialState,
 } from "../../src/shared/webviewContracts";
+
+describe("connection port contract", () => {
+  const base = {
+    id: "ports",
+    name: "Ports",
+    type: "pg",
+    host: "localhost",
+    database: "app",
+    username: "user",
+  };
+  it.each([
+    NaN,
+    Infinity,
+    -Infinity,
+    "Infinity",
+    "1e999",
+    "abc",
+    "22abc",
+    "",
+    "  ",
+    null,
+    false,
+    {},
+    [],
+  ])("rejects malformed ports without dropping them: %j", (port) => {
+    for (const fields of [{ port }, { ssh: { port } }]) {
+      for (const type of ["saveConnection", "testConnection"]) {
+        expect(
+          parseConnectionFormPanelMessage({
+            type,
+            payload: { ...base, ...fields },
+          }),
+        ).toBeNull();
+      }
+      expect(
+        parseWebviewInitialState({
+          view: "connection",
+          existing: { ...base, ...fields },
+        }),
+      ).toBeNull();
+    }
+  });
+  it.each([
+    0, -1, 1.5, 65536, 70000,
+  ])("retains finite invalid ports for semantic validation: %s", (port) => {
+    for (const type of ["saveConnection", "testConnection"] as const) {
+      const parsed = parseConnectionFormPanelMessage({
+        type,
+        payload: { ...base, port, ssh: { port } },
+      });
+      expect(parsed).toMatchObject({ payload: { port, ssh: { port } } });
+      if (
+        parsed?.type !== "saveConnection" &&
+        parsed?.type !== "testConnection"
+      )
+        throw new Error("Missing submission");
+      if (!parsed.payload) throw new Error("Missing payload");
+      expect(validateConnectionConfig(parsed.payload).issues).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ code: "invalid", fields: ["port"] }),
+          expect.objectContaining({ code: "invalid", fields: ["ssh"] }),
+        ]),
+      );
+    }
+  });
+  it.each([
+    undefined,
+    1,
+    65535,
+    "5432",
+  ])("accepts absent or numeric ports: %s", (port) => {
+    for (const type of ["saveConnection", "testConnection"]) {
+      expect(
+        parseConnectionFormPanelMessage({
+          type,
+          payload: { ...base, port, ssh: { port } },
+        }),
+      ).toMatchObject({
+        payload: {
+          port: port === undefined ? undefined : Number(port),
+          ssh: { port: port === undefined ? undefined : Number(port) },
+        },
+      });
+      expect(
+        parseConnectionFormPanelMessage({ type, payload: base }),
+      ).not.toBeNull();
+    }
+  });
+});
+
+describe("connection TLS contract", () => {
+  const base = { id: "tls", name: "TLS", type: "pg" };
+  const parsers = [
+    (payload: unknown) =>
+      parseConnectionFormPanelMessage({ type: "saveConnection", payload }),
+    (payload: unknown) =>
+      parseConnectionFormPanelMessage({ type: "testConnection", payload }),
+    (existing: unknown) =>
+      parseWebviewInitialState({ view: "connection", existing }),
+  ];
+
+  it.each([
+    null,
+    false,
+    42,
+    "requireVerifyFull",
+    [],
+    {},
+    ...[
+      undefined,
+      null,
+      false,
+      1,
+      {},
+      [],
+      "",
+      "unknown",
+      "requireVerifyFull ",
+      " requireVerifyFull",
+      "\t",
+    ].map((mode) => ({ mode, caFilePath: "/certs/ca.pem" })),
+    ...[
+      "caFilePath",
+      "certFilePath",
+      "keyFilePath",
+      "keyPassphrase",
+      "serverNameOverride",
+    ].flatMap((field) =>
+      [null, false, 42, {}, []].map((value) => ({
+        mode: "requireVerifyFull",
+        [field]: value,
+      })),
+    ),
+  ])("rejects the entire save/test/edit state for malformed TLS %j", (tls) => {
+    for (const parse of parsers) {
+      expect(parse({ ...base, tls })).toBeNull();
+    }
+  });
+
+  it.each([
+    "disabled",
+    "requireTrustServerCertificate",
+    "requireVerifyCa",
+    "requireVerifyFull",
+    "mutualTls",
+  ])("preserves supported mode %s and TLS strings verbatim", (mode) => {
+    const tls = {
+      mode,
+      caFilePath: " /certs/my CA.pem ",
+      certFilePath: "",
+      keyFilePath: "C:\\certs\\client.key",
+      keyPassphrase: " secret ",
+      serverNameOverride: "db.example.com",
+    };
+    for (const parse of parsers) {
+      const result = parse({ ...base, tls });
+      expect(result).not.toBeNull();
+      expect(result).toEqual(
+        expect.objectContaining(
+          result && "existing" in result
+            ? { existing: expect.objectContaining({ tls }) }
+            : { payload: expect.objectContaining({ tls }) },
+        ),
+      );
+    }
+  });
+
+  it("accepts omitted and undefined TLS and optional TLS fields", () => {
+    for (const parse of parsers) {
+      for (const fields of [
+        {},
+        { tls: undefined },
+        { tls: { mode: "requireVerifyFull", caFilePath: undefined } },
+      ]) {
+        expect(parse({ ...base, ...fields })).not.toBeNull();
+      }
+    }
+    expect(
+      parseWebviewInitialState({ view: "connection", existing: null }),
+    ).not.toBeNull();
+  });
+});
+
+describe.each([
+  "exportResultsCSV",
+  "exportResultsJSON",
+])("%s payload", (type) => {
+  it("accepts positional column IDs and an omitted payload", () => {
+    const payload = {
+      columnOrder: ["__col_1", "__col_0"],
+      sort: [
+        { id: "__col_0", desc: false },
+        { id: "__col_1", desc: true },
+      ],
+    };
+    expect(parseQueryPanelMessage({ type, payload })).toEqual({
+      type,
+      payload,
+    });
+    expect(parseQueryPanelMessage({ type })).toEqual({ type, payload: {} });
+    expect(
+      parseQueryPanelMessage({ type, payload: { sort: [], columnOrder: [] } }),
+    ).toEqual({ type, payload: { sort: [], columnOrder: [] } });
+  });
+
+  it.each([
+    "invalid",
+    [],
+    { columnOrder: "__col_0" },
+    { columnOrder: ["name"] },
+    { columnOrder: [0] },
+    { columnOrder: ["__col_-1"] },
+    { columnOrder: ["__col_1.5"] },
+    { columnOrder: ["__col_01"] },
+    { columnOrder: ["__col_9007199254740992"] },
+    { columnOrder: ["__col_0", "__col_0"] },
+    { sort: {} },
+    { sort: [null] },
+    { sort: [{ column: "name", desc: false }] },
+    { sort: [{ id: "name", desc: false }] },
+    { sort: [{ id: "__col_0", desc: "false" }] },
+    { sort: [{ id: "__col_0" }] },
+    {
+      sort: [
+        { id: "__col_0", desc: false },
+        { id: "__col_0", desc: true },
+      ],
+    },
+  ])("rejects malformed export options: %j", (payload) => {
+    expect(parseQueryPanelMessage({ type, payload })).toBeNull();
+  });
+});
 
 describe("parseTablePanelMessage export payload", () => {
   it("parses numeric limitToPage for exportCSV", () => {

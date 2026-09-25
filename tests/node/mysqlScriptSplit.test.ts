@@ -1,7 +1,19 @@
 import { describe, expect, it } from "vitest";
 import { splitMySQLScript } from "../../src/extension/dbDrivers/mysql";
+import { applyHardCapToSqlQuery } from "../../src/extension/utils/sqlHardCap";
 
 describe("splitMySQLScript", () => {
+  it("retains a cap after CR comments and separates tokens around block comments", () => {
+    const capped = applyHardCapToSqlQuery(
+      "SELECT * FROM items -- comment\r ORDER BY id",
+      "mysql",
+      11,
+    );
+    expect(splitMySQLScript(capped.queryText)).toEqual([
+      "SELECT * FROM items LIMIT 11",
+    ]);
+    expect(splitMySQLScript("SELECT/* comment */1")).toEqual(["SELECT 1"]);
+  });
   it("splits CREATE DATABASE IF NOT EXISTS + USE + CREATE TABLE script", () => {
     const sql = `CREATE DATABASE IF NOT EXISTS rapidb_test
     CHARACTER SET utf8mb4

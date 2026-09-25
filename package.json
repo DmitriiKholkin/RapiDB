@@ -630,7 +630,7 @@
           "default": 10000,
           "minimum": 10,
           "maximum": 100000,
-          "description": "Maximum number of rows returned by a query in the SQL editor. If the result exceeds this limit, rows are trimmed and a warning is shown. Range: 10–100 000. Set to 100000 to effectively disable the limit.",
+          "description": "Maximum number of rows displayed per SQL editor result, subject to the 10,000-row safety ceiling. A truncation warning is shown when additional rows are discarded. This display limit does not limit rows affected by mutations or cancel query execution.",
           "scope": "application"
         },
         "rapidb.connectionTimeoutSeconds": {
@@ -706,12 +706,13 @@
     "compile": "npm run build",
     "check": "npm run typecheck && npm run lint",
     "lint": "biome check . --max-diagnostics=none",
-    "lint:fix": "biome check . --write --unsafe --max-diagnostics=none",
+    "lint:fix": "biome check . --write --max-diagnostics=none",
     "typecheck": "npm run typecheck:extension && npm run typecheck:webview && npm run typecheck:tests",
     "typecheck:extension": "tsc -p tsconfig.extension.json --noEmit",
     "typecheck:webview": "tsc -p tsconfig.webview.json --noEmit",
     "typecheck:tests": "tsc -p tsconfig.tests.json --noEmit",
     "test": "npm run test:all",
+    "test:core": "node ./tests/scripts/run-npm-scripts.mjs test:unit test:webview test:extension",
     "test:all": "node ./tests/scripts/run-npm-scripts.mjs compile typecheck lint test:unit test:webview test:extension db:check db:up db:prepare test:db:sqlite test:db:postgres test:db:mysql test:db:mssql test:db:oracle test:db:nosql db:cleanup-mssql test:workflow:run db:down --finally-if-env-not RAPIDB_KEEP_TEST_SERVICES",
     "test:unit": "vitest run --project unit-node",
     "test:webview": "vitest run --project webview-jsdom",

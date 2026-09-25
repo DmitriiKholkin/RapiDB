@@ -2,6 +2,25 @@ import { describe, expect, it } from "vitest";
 import { normalizeNumericToken } from "../../src/shared/numericNormalization";
 
 describe("normalizeNumericToken", () => {
+  it.each([
+    "9223372036854775807",
+    "9".repeat(400),
+    "1e999",
+    "12345678901234567890.123456789",
+  ])("preserves exact numeric text %s when JS range is not required", (value) => {
+    expect(normalizeNumericToken(value, false)).toBe(value);
+  });
+
+  it.each([
+    "abc123",
+    "10xyz",
+    "mis500",
+    "Infinity",
+    "-Infinity",
+    "NaN",
+  ])("still rejects invalid exact numeric text %s", (value) =>
+    expect(normalizeNumericToken(value, false)).toBeNull());
+
   describe("plain numeric values", () => {
     it.each([
       ["0", "0"],
@@ -72,6 +91,8 @@ describe("normalizeNumericToken", () => {
     it.each([
       ["CHF 1'234.56", "1234.56"],
       ["USD 99.99", "99.99"],
+      ["usd123", "123"],
+      ["10CHF", "10"],
     ])("normalizes %s -> %s", (input, expected) => {
       expect(normalizeNumericToken(input)).toBe(expected);
     });
@@ -91,10 +112,14 @@ describe("normalizeNumericToken", () => {
     it.each([
       [""],
       ["abc"],
+      ["abc123"],
+      ["10xyz"],
+      ["mis500"],
       ["99.99.99"],
       ["$"],
       ["NaN"],
       ["Infinity"],
+      ["1e999"],
       ["$1.00 +"],
       ["-$ -1.00"],
       ["1.234,56"],

@@ -1,3 +1,4 @@
+import type { Connection as NativeMysqlConnection } from "mysql2";
 import type {
   FieldPacket,
   Pool,
@@ -15,7 +16,10 @@ import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
 import { buildWhere } from "../table/filterSql";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
+import { BoundedQueryRows, queryCollectionLimit } from "./boundedQueryRows";
+import { discardMysqlResultHistory } from "./mysqlBoundedQuery";
 import {
+  DriverTimeoutError,
   type DriverTimeoutSettingsProvider,
   throwIfTransactionCancelled,
 } from "./timeout";
@@ -30,6 +34,7 @@ import type {
   FilterOperator,
   PersistedEditCheckOptions,
   PersistedEditCheckResult,
+  QueryExecutionOptions,
   QueryResult,
   SchemaInfo,
   TableInfo,
@@ -95,12 +100,10 @@ export function splitMySQLScript(sql: string): string[] {
     const isDashComment =
       sql[i] === "-" &&
       sql[i + 1] === "-" &&
-      (sql[i + 2] === " " ||
-        sql[i + 2] === "\t" ||
-        sql[i + 2] === "\n" ||
-        sql[i + 2] === "\r");
+      (!sql[i + 2] || /\s/.test(sql[i + 2]));
     if (isDashComment || sql[i] === "#") {
       while (i < n && sql[i] !== "\n") i++;
+      buf += " ";
       continue;
     }
     if (sql[i] === "/" && sql[i + 1] === "*") {
@@ -112,6 +115,7 @@ export function splitMySQLScript(sql: string): string[] {
         }
         i++;
       }
+      buf += " ";
       continue;
     }
     if (sql[i] === "'" || sql[i] === '"' || sql[i] === "`") {
@@ -1043,6 +1047,7 @@ type MysqlQueryRows = MysqlSelectRows | ResultSetHeader;
 const MYSQL_POOL_CONNECTION_LIMIT = 5;
 interface MysqlQueryOperation {
   cancelled: boolean;
+  reject?: (error: Error) => void;
   requestToken?: number;
   connection?: PoolConnection;
 }
@@ -1151,8 +1156,12 @@ export class MySQLDriver extends BaseDBDriver {
           continue;
         }
         operation.cancelled = true;
-        if (operation.connection) {
-          this.activeQueryConnections.delete(operation.connection);
+        if (operation.reject) {
+          operation.reject(new Error("MySQL query cancelled."));
+        } else if (
+          operation.connection &&
+          this.activeQueryConnections.delete(operation.connection)
+        ) {
           operation.connection.destroy();
         }
       }
@@ -1391,9 +1400,35 @@ export class MySQLDriver extends BaseDBDriver {
   async query(
     sql: string,
     params?: unknown[],
-    operationContext?: { requestToken?: number; readOnly?: boolean },
+    operationContext?: QueryExecutionOptions,
   ): Promise<QueryResult> {
     const start = Date.now();
+    const hardCap = queryCollectionLimit(operationContext?.hardCap);
+    if (hardCap !== undefined) {
+      const statements = params?.length ? [sql] : splitMySQLScript(sql);
+      if (statements.length === 0) {
+        return {
+          columns: [],
+          rows: [],
+          rowCount: 0,
+          executionTimeMs: 0,
+          truncated: false,
+        };
+      }
+      return this.withTrackedQueryConnection(
+        (connection) =>
+          this.withReadOnlyTransaction(connection, operationContext, () =>
+            this.executeBoundedScript(
+              connection,
+              statements,
+              params,
+              hardCap,
+              start,
+            ),
+          ),
+        operationContext,
+      );
+    }
     if (params && params.length > 0) {
       return this.withTrackedQueryConnection(
         (connection) =>
@@ -1446,6 +1481,101 @@ export class MySQLDriver extends BaseDBDriver {
         ),
       operationContext,
     );
+  }
+
+  override getCapabilities() {
+    return { ...super.getCapabilities(), boundedQueryResults: true };
+  }
+
+  private async executeBoundedScript(
+    connection: PoolConnection,
+    statements: string[],
+    params: unknown[] | undefined,
+    limit: number,
+    start: number,
+  ): Promise<QueryResult> {
+    const retained = new BoundedQueryRows<unknown[]>(limit);
+    let fields: FieldPacket[] = [];
+    let affectedRows = 0;
+    const operation = [...this.activeQueryOperations].find(
+      (entry) => entry.connection === connection,
+    );
+    for (const sql of statements) {
+      if (operation?.cancelled) throw new Error("MySQL query cancelled.");
+      await new Promise<void>((resolve, reject) => {
+        // The promise wrapper supplies a callback, causing mysql2 to accumulate
+        // every row internally. Use the underlying callback-free command instead.
+        // mysql2's promise declaration types this property as another promise
+        // connection, but its runtime value is the native Connection.
+        const native =
+          connection.connection as unknown as NativeMysqlConnection;
+        const command = native.query({
+          sql,
+          values: params as QueryOptions["values"],
+          rowsAsArray: true,
+        });
+        let settled = false;
+        // Own the timer: mysql2's inactivity timer survives destroy() on an
+        // explicitly cancelled command, retaining its listeners until it fires.
+        const timeoutMs = this.getDbOperationTimeoutMs();
+        const timer = setTimeout(
+          () => fail(new DriverTimeoutError("dbOperation", "query", timeoutMs)),
+          timeoutMs,
+        );
+        const cleanup = () => {
+          clearTimeout(timer);
+          command.off("fields", onFields);
+          command.off("result", onResult);
+          command.off("end", onEnd);
+          command.off("error", fail);
+          // Destroying a socket may still deliver a queued transport error.
+          command.on("error", () => undefined);
+          if (operation) operation.reject = undefined;
+        };
+        const fail = (error: Error) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          // A timeout is not a protocol end. Never return an undrained socket
+          // to the pool; destruction also covers cancellation and transport errors.
+          this.activeQueryConnections.delete(connection);
+          connection.destroy();
+          reject(error);
+        };
+        if (operation) operation.reject = fail;
+        const onFields = (nextFields: FieldPacket[] | undefined) => {
+          if (settled) return;
+          discardMysqlResultHistory(command, nextFields);
+          if (!nextFields) return;
+          fields = nextFields;
+          retained.reset();
+        };
+        const onResult = (row: unknown[] | ResultSetHeader) => {
+          if (settled) return;
+          if (Array.isArray(row)) retained.add(row);
+          else affectedRows += row.affectedRows ?? 0;
+        };
+        const onEnd = () => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve();
+        };
+        command.on("fields", onFields);
+        command.on("result", onResult);
+        command.on("error", fail);
+        command.on("end", onEnd);
+      });
+    }
+    const result = this._parseQueryResult(
+      retained.rows,
+      fields,
+      Date.now() - start,
+    );
+    result.rowCount = fields.length ? retained.rowCount : affectedRows;
+    result.truncated = retained.truncated;
+    if (!fields.length) result.affectedRows = affectedRows;
+    return result;
   }
 
   private async withReadOnlyTransaction<T>(
@@ -2674,6 +2804,11 @@ export class MySQLDriver extends BaseDBDriver {
         sql: `${col} IN (${parts.map(() => "?").join(", ")})`,
         params: parts,
       };
+    }
+    if (operator !== "like" && operator !== "ilike") {
+      throw new Error(
+        `[RapiDB Filter] Column ${column.name} does not support ${operator} filters for ${column.category} values.`,
+      );
     }
     const v = typeof val === "string" ? val : val[0];
     let finalVal = v;

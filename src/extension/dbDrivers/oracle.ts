@@ -3,7 +3,9 @@ import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { OperationCancellationContext } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
+import { oracleAlternativeQuoteEnd } from "../utils/sqlStatementScan";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
+import { BoundedQueryRows, queryCollectionLimit } from "./boundedQueryRows";
 import {
   escapeSqlPreviewStringLiteral,
   formatHexSqlPreviewLiteral,
@@ -396,6 +398,24 @@ function replacePositionalParams(
   while (i < len) {
     const char = sql[i];
     const nextChar = sql[i + 1];
+    const alternativeEnd = oracleAlternativeQuoteEnd(sql, i);
+    if (alternativeEnd !== undefined) {
+      resultSql += sql.slice(i, alternativeEnd);
+      i = alternativeEnd;
+      continue;
+    }
+    if (char === '"') {
+      let end = i + 1;
+      while (end < len) {
+        if (sql[end++] === '"') {
+          if (sql[end] !== '"') break;
+          end++;
+        }
+      }
+      resultSql += sql.slice(i, end);
+      i = end;
+      continue;
+    }
     if (char === "'") {
       resultSql += char;
       i++;
@@ -619,7 +639,7 @@ function oracleTemporalFilterExpr(column: ColumnTypeMeta): string {
 }
 function formatOracleQueryValue(
   value: unknown,
-  meta: oracledb.Metadata<unknown>,
+  meta: Pick<oracledb.Metadata<unknown>, "dbType">,
 ): unknown {
   if (meta.dbType === oracledb.DB_TYPE_BINARY_FLOAT) {
     return normalizeOracleFloatValue(value) ?? value;
@@ -665,7 +685,7 @@ function isPLSQLBlock(stmt: string): boolean {
     /^BEGIN\b/.test(s)
   );
 }
-function splitOracleStatements(src: string): string[] {
+export function splitOracleStatements(src: string): string[] {
   const stmts: string[] = [];
   let cur = "";
   let i = 0;
@@ -693,12 +713,19 @@ function splitOracleStatements(src: string): string[] {
       }
       continue;
     }
-    if (src[i] === "'") {
+    const alternativeEnd = oracleAlternativeQuoteEnd(src, i);
+    if (alternativeEnd !== undefined) {
+      cur += src.slice(i, alternativeEnd);
+      i = alternativeEnd;
+      continue;
+    }
+    if (src[i] === "'" || src[i] === '"') {
+      const quote = src[i];
       let j = i + 1;
       while (j < len) {
-        if (src[j] === "'" && src[j + 1] === "'") {
+        if (src[j] === quote && src[j + 1] === quote) {
           j += 2;
-        } else if (src[j] === "'") {
+        } else if (src[j] === quote) {
           j++;
           break;
         } else {
@@ -756,6 +783,9 @@ interface OracleQueryOperation {
   cancelled: boolean;
 }
 export class OracleDriver extends BaseDBDriver {
+  override getCapabilities() {
+    return { ...super.getCapabilities(), boundedQueryResults: true };
+  }
   protected override getQueryEditorSqlDialect() {
     return "plsql" as const;
   }
@@ -1920,8 +1950,13 @@ export class OracleDriver extends BaseDBDriver {
   async query(
     sql: string,
     params?: unknown[],
-    operationContext?: { requestToken?: number; readOnly?: boolean },
+    operationContext?: {
+      requestToken?: number;
+      readOnly?: boolean;
+      hardCap?: number;
+    },
   ): Promise<QueryResult> {
+    const limit = queryCollectionLimit(operationContext?.hardCap);
     const start = Date.now();
     const operation: OracleQueryOperation = {
       requestToken: operationContext?.requestToken,
@@ -1929,6 +1964,7 @@ export class OracleDriver extends BaseDBDriver {
     };
     this.activeQueryOperations.add(operation);
     let conn: oracledb.Connection | undefined;
+    let failed = false;
     try {
       conn = await this.getConnection();
       operation.connection = conn;
@@ -1943,8 +1979,15 @@ export class OracleDriver extends BaseDBDriver {
         if (operation.cancelled) {
           throw new Error("Oracle query cancelled before execution completed.");
         }
-        const result = await this._execOne(conn, stmt, params, start);
-        totalAffected += result.rowCount;
+        const result = await this._execOne(
+          conn,
+          stmt,
+          params,
+          start,
+          limit,
+          operation,
+        );
+        totalAffected += result.affectedRows ?? 0;
         if (result.columns.length > 0) {
           selectResult = result;
         }
@@ -1968,11 +2011,15 @@ export class OracleDriver extends BaseDBDriver {
         affectedRows: totalAffected,
       };
     } catch (error) {
+      failed = true;
       await conn?.rollback().catch(() => undefined);
       throw error;
     } finally {
       this.activeQueryOperations.delete(operation);
-      await conn?.close();
+      await conn?.close().catch((error: unknown) => {
+        // A broken connection can also fail release; preserve the query error.
+        if (!failed) throw error;
+      });
     }
   }
   private _fetchTypeHandler(
@@ -2001,6 +2048,8 @@ export class OracleDriver extends BaseDBDriver {
     sql: string,
     params: unknown[] | undefined,
     start: number,
+    limit: number | undefined,
+    operation: OracleQueryOperation,
   ): Promise<QueryResult> {
     let finalSql = sql;
     let binds: unknown[] = [];
@@ -2009,36 +2058,99 @@ export class OracleDriver extends BaseDBDriver {
       finalSql = replaced.sql;
       binds = replaced.binds;
     }
+    // node-oracledb uniquifies metadata names even in array mode. Capture
+    // original labels in the public fetch handler before that transformation.
+    const columnNames = new WeakMap<object, string>();
     const options: oracledb.ExecuteOptions = {
       outFormat: oracledb.OUT_FORMAT_ARRAY,
       fetchArraySize: 100,
+      prefetchRows: 0,
+      resultSet: true,
       autoCommit: false,
-      fetchTypeHandler: this._fetchTypeHandler.bind(this),
+      fetchTypeHandler: (metadata) => {
+        columnNames.set(metadata, metadata.name);
+        return this._fetchTypeHandler(metadata);
+      },
     };
     const res = await conn.execute(finalSql, binds, options);
-    const executionTimeMs = Date.now() - start;
-    if (res.metaData && res.rows && res.rows.length > 0) {
-      const metaData = res.metaData;
-      const columns = metaData.map((m) => m.name);
-      const rows = (res.rows as unknown[][]).map((row) =>
-        Object.fromEntries(
-          row.map((val, i) => [
-            `__col_${i}`,
-            formatOracleQueryValue(val, metaData[i]),
-          ]),
-        ),
-      );
-      return { columns, rows, rowCount: rows.length, executionTimeMs };
+    // Register every returned cursor before fetching any: a late fetch failure
+    // must also close cursors we have not visited yet.
+    const cursors = new Set<oracledb.ResultSet<unknown[]>>();
+    const register = (value: unknown): void => {
+      if (
+        value &&
+        typeof value === "object" &&
+        "getRows" in value &&
+        "close" in value
+      ) {
+        cursors.add(value as oracledb.ResultSet<unknown[]>);
+      } else if (Array.isArray(value)) {
+        value.forEach(register);
+      }
+    };
+    register(res.resultSet);
+    register(res.implicitResults);
+    Object.values(res.outBinds ?? {}).forEach(register);
+    let selected: QueryResult | undefined;
+    let closeError: unknown;
+    try {
+      for (const cursor of cursors) {
+        const metadata = cursor.metaData;
+        const collected = new BoundedQueryRows<Record<string, unknown>>(
+          limit ?? Infinity,
+        );
+        selected = undefined;
+        while (true) {
+          if (operation.cancelled)
+            throw new Error("Oracle query cancelled during fetch.");
+          const batch = await cursor.getRows(100);
+          if (operation.cancelled)
+            throw new Error("Oracle query cancelled during fetch.");
+          if (batch.length === 0) break;
+          for (const row of batch) {
+            // Avoid converting discarded rows while still counting all rows.
+            if (collected.rows.length < collected.limit) {
+              collected.add(
+                Object.fromEntries(
+                  row.map((value, index) => [
+                    `__col_${index}`,
+                    formatOracleQueryValue(value, metadata[index]),
+                  ]),
+                ),
+              );
+            } else {
+              collected.rowCount++;
+            }
+          }
+        }
+        selected = {
+          columns: metadata.map(
+            (column) => columnNames.get(column) ?? column.name,
+          ),
+          rows: collected.rows,
+          rowCount: collected.rowCount,
+          ...(collected.truncated ? { truncated: true } : {}),
+          executionTimeMs: Date.now() - start,
+        };
+      }
+    } finally {
+      for (const cursor of cursors) {
+        try {
+          await cursor.close();
+        } catch (error) {
+          closeError ??= error;
+        }
+      }
     }
-    if (res.metaData) {
-      const columns = res.metaData.map((m) => m.name);
+    if (closeError) throw closeError;
+    if (selected)
       return {
-        columns,
-        rows: [],
-        rowCount: res.rowsAffected ?? 0,
-        executionTimeMs,
+        ...selected,
+        ...(res.rowsAffected !== undefined
+          ? { affectedRows: res.rowsAffected }
+          : {}),
       };
-    }
+    const executionTimeMs = Date.now() - start;
     const affectedRows = res.rowsAffected ?? 0;
     return {
       columns: [],

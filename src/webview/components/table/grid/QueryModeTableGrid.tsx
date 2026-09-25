@@ -1,5 +1,6 @@
 import type { SortingState } from "@tanstack/react-table";
 import React, { useEffect, useState } from "react";
+import type { QueryResultExportPayload } from "../../../../shared/webviewContracts";
 import type { QueryResult, QueryStatus } from "../../../store";
 import { postMessage } from "../../../utils/messaging";
 import { Icon } from "../../Icon";
@@ -122,37 +123,22 @@ export function QueryModeTableGrid({
       >
         <TableExportActions
           onExport={(format) => {
-            const exportSort = sorting
-              .map((s) => {
-                const match = s.id.match(/^__col_(\d+)$/);
-                if (!match || !result) return null;
-                return {
-                  column: result.columns[parseInt(match[1], 10)],
-                  desc: s.desc,
-                };
-              })
-              .filter((v): v is NonNullable<typeof v> => v !== null);
-
             const hiddenColIds = new Set(
               Object.entries(columnSizing)
                 .filter(([, size]) => size <= 1)
                 .map(([id]) => id),
             );
 
-            const exportColumnOrder = columnOrder
-              .filter((id) => !hiddenColIds.has(id))
-              .map((id) => {
-                const match = id.match(/^__col_(\d+)$/);
-                return match ? result.columns[parseInt(match[1], 10)] : null;
-              })
-              .filter((v): v is string => v !== null);
+            const exportColumnOrder = columnOrder.filter(
+              (id) => !hiddenColIds.has(id),
+            );
 
-            const payload: Record<string, unknown> = {};
+            const payload: QueryResultExportPayload = {};
             if (exportColumnOrder.length > 0) {
               payload.columnOrder = exportColumnOrder;
             }
-            if (exportSort.length > 0) {
-              payload.sort = exportSort;
+            if (sorting.length > 0) {
+              payload.sort = sorting;
             }
 
             postMessage(

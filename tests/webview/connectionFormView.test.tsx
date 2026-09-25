@@ -16,6 +16,98 @@ async function submitCreateConnection(
 }
 
 describe("ConnectionFormView", () => {
+  it.each([
+    "Port",
+    "SSH port",
+  ])("blocks invalid %s on both Test and Save, and allows correction", async (label) => {
+    const user = userEvent.setup();
+    render(<ConnectionFormView existing={null} />);
+    await user.type(screen.getByLabelText("Connection name"), "Ports");
+    if (label === "SSH port") {
+      await user.click(
+        screen.getByRole("switch", { name: /connect through ssh bastion/i }),
+      );
+    }
+    const input = screen.getByLabelText(label);
+    for (const value of [
+      "abc",
+      "0",
+      "-1",
+      "1.5",
+      "65536",
+      "70000",
+      "Infinity",
+      "1e999",
+      "22abc",
+    ]) {
+      await user.clear(input);
+      await user.type(input, value);
+      for (const name of [/test connection/i, /create connection/i]) {
+        clearPostedMessages();
+        await user.click(screen.getByRole("button", { name }));
+        expect(getLastPostedMessage()).toBeUndefined();
+        expect(
+          screen.getByText(
+            `${label === "Port" ? "Database" : "SSH"} port must be an integer between 1 and 65535.`,
+            { exact: false },
+          ),
+        ).toBeTruthy();
+        expect((input as HTMLInputElement).value).toBe(value);
+      }
+    }
+    await user.clear(input);
+    await user.type(input, "65535");
+    await user.click(screen.getByRole("button", { name: /test connection/i }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "testConnection",
+      payload: label === "Port" ? { port: 65535 } : { ssh: { port: 65535 } },
+    });
+  });
+
+  it.each([
+    "",
+    "   ",
+    "1",
+    "65535",
+  ])("uses defaults only for empty port fields: %j", async (value) => {
+    const user = userEvent.setup();
+    render(<ConnectionFormView existing={null} />);
+    await user.type(screen.getByLabelText("Connection name"), "Ports");
+    await user.click(
+      screen.getByRole("switch", { name: /connect through ssh bastion/i }),
+    );
+    for (const label of ["Port", "SSH port"]) {
+      await user.clear(screen.getByLabelText(label));
+      if (value) await user.type(screen.getByLabelText(label), value);
+    }
+    await submitCreateConnection(user);
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "saveConnection",
+      payload: {
+        port: value.trim() ? Number(value) : 5432,
+        ssh: { port: value.trim() ? Number(value) : 22 },
+      },
+    });
+  });
+
+  it("omits an unused host port when MongoDB URI is supplied", async () => {
+    const user = userEvent.setup();
+    render(<ConnectionFormView existing={null} />);
+    await user.type(screen.getByLabelText("Connection name"), "Mongo");
+    await user.click(screen.getByRole("button", { name: /mongodb/i }));
+    await user.clear(screen.getByLabelText("Port"));
+    await user.type(screen.getByLabelText("Port"), "invalid");
+    await user.type(
+      screen.getByLabelText("MongoDB connection URI"),
+      "mongodb://host",
+    );
+    await submitCreateConnection(user);
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "saveConnection",
+      payload: { connectionUri: "mongodb://host", port: undefined },
+    });
+  });
+
   it("shows TLS modes only for supported drivers and reveals mutual TLS fields", async () => {
     const user = userEvent.setup();
 

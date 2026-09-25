@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Query as PgQuery } from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
@@ -205,6 +206,7 @@ describe("native driver timeout wiring", () => {
     }
 
     vi.doMock("pg", () => ({
+      Query: PgQuery,
       Pool: MockPool,
       types: {
         setTypeParser: vi.fn(),
@@ -258,6 +260,7 @@ describe("native driver timeout wiring", () => {
     }
 
     vi.doMock("pg", () => ({
+      Query: PgQuery,
       Pool: MockPool,
       types: {
         setTypeParser: vi.fn(),
@@ -332,6 +335,7 @@ describe("native driver timeout wiring", () => {
       }
 
       vi.doMock("pg", () => ({
+        Query: PgQuery,
         Pool: MockPool,
         types: {
           setTypeParser: vi.fn(),

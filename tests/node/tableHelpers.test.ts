@@ -183,7 +183,6 @@ describe("table helpers", () => {
       [
         { column: "display_name", operator: "like", value: "Alpha" },
         { column: "amount", operator: "between", value: ["10", "20"] },
-        { column: "missing", operator: "eq", value: "x" },
       ],
       columns,
     );

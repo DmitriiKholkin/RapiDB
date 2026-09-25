@@ -44,6 +44,7 @@ export type {
   QueryEditorSqlDialect,
   QueryInitialState,
   QueryPanelMessage,
+  QueryResultExportPayload,
 } from "./query";
 export { parseQueryPanelMessage } from "./query";
 export type {

@@ -24,6 +24,7 @@ import {
 import { MockEventEmitter } from "../support/mockVscode";
 
 interface DriverBehavior {
+  constructorError?: Error;
   connectError?: unknown;
   connectImpl?: () => Promise<void>;
   listDatabases?: DatabaseInfo[];
@@ -176,6 +177,8 @@ class FakeDriver implements IDBDriver {
     readonly config: { id: string },
     readonly timeoutSettingsProvider?: DriverTimeoutSettingsProvider,
   ) {
+    const constructorError = driverBehaviors.get(config.id)?.constructorError;
+    if (constructorError) throw constructorError;
     driverInstances.push(this);
   }
 
@@ -1822,6 +1825,72 @@ describe("ConnectionManager", () => {
     );
   });
 
+  it.each([
+    "/",
+    "?",
+    "#",
+    " ",
+    "\t",
+    "\n",
+  ])("rejects ambiguous URI credentials with %j before saving", async (delimiter) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    for (const useSecretStorage of [undefined, false, true]) {
+      for (const field of [
+        "connectionUri",
+        "uri",
+        "endpoint",
+        "awsEndpoint",
+      ] as const) {
+        await expect(
+          manager.saveConnection({
+            id: "ambiguous",
+            name: "Ambiguous",
+            type: "mongodb",
+            host: "host",
+            [field]: `mongodb://user:pa${delimiter}ss@host/db`,
+            useSecretStorage,
+          }),
+        ).rejects.toThrow("Ambiguous URI credentials");
+      }
+    }
+    expect(store.getConnections()).toEqual([]);
+    await expect(store.getSecret("ambiguous")).resolves.toBeUndefined();
+  });
+
+  it("saves complete Redis URI credentials only in Secret Storage and preserves them on resave", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    const connectionUri = "redis://user:p@ss@host:6379/0";
+    await manager.saveConnection({
+      id: "redis-uri",
+      name: "Redis",
+      type: "redis",
+      connectionUri,
+    });
+    const persisted = store.getConnections()[0];
+    expect(persisted.connectionUri).toBe("redis://host:6379/0");
+    expect(persisted.useSecretStorage).toBe(true);
+    await manager.saveConnection(persisted);
+    expect(JSON.parse((await store.getSecret("redis-uri"))!)).toEqual({
+      connectionUri,
+    });
+    await manager.connectTo("redis-uri");
+    expect(driverInstances[0]?.config).toMatchObject({ connectionUri });
+  });
+
   it("redacts plaintext API key from persisted config when saving to Secret Storage", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
@@ -2013,7 +2082,11 @@ describe("ConnectionManager", () => {
     });
   });
 
-  it("rewrites SSH-enabled test connections to a local forward and disposes the runtime in finally", async () => {
+  it.each([
+    undefined,
+    22,
+    65535,
+  ])("rewrites SSH-enabled test connections with port %s to a local forward and disposes the runtime in finally", async (port) => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
     );
@@ -2040,11 +2113,16 @@ describe("ConnectionManager", () => {
 
     const { id: _connectionId, ...connectionToTest } =
       createSshPgConfig("conn-test-ssh");
+    connectionToTest.ssh = { ...connectionToTest.ssh, port };
 
     const result = await manager.testConnection(connectionToTest);
 
     expect(result).toEqual({ success: true });
     expect(createSshRuntime).toHaveBeenCalledTimes(1);
+    expect(createSshRuntime).toHaveBeenCalledWith(
+      expect.objectContaining({ port: port ?? 22 }),
+      expect.objectContaining({ remoteHost: "db.internal", remotePort: 5432 }),
+    );
     expect(driverInstances[0]?.config).toMatchObject({
       host: "127.0.0.1",
       port: 15432,
@@ -2061,6 +2139,107 @@ describe("ConnectionManager", () => {
     });
     expect(driverInstances[0]?.disconnectCalls).toBe(1);
     expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    "connect",
+    "test",
+  ] as const)("disposes SSH runtime when the driver constructor throws during %s", async (operation) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const config = createSshPgConfig("ssh-constructor-failure");
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([config]);
+    const failure = new Error("driver constructor failed");
+    driverBehaviors.set(operation === "test" ? "__test__" : config.id, {
+      constructorError: failure,
+    });
+    const dispose = vi.fn(async () => undefined);
+    const createSshRuntime = vi.fn(async () => ({
+      transport: {
+        kind: "tcpForward" as const,
+        localHost: "127.0.0.1" as const,
+        localPort: 15432,
+        remoteHost: "db.internal",
+        remotePort: 5432,
+      },
+      verifiedFingerprintSha256: config.ssh!.hostFingerprintSha256!,
+      dispose,
+    }));
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+      { createSshRuntime },
+    );
+    try {
+      if (operation === "connect") {
+        await expect(manager.connectTo(config.id)).rejects.toBe(failure);
+      } else {
+        await expect(manager.testConnection(config)).resolves.toEqual({
+          success: false,
+          error: failure.message,
+        });
+      }
+      expect(createSshRuntime).toHaveBeenCalledOnce();
+      expect(dispose).toHaveBeenCalledOnce();
+      expect(driverInstances).toHaveLength(0);
+      expect(manager.isConnected(config.id)).toBe(false);
+      expect(manager.isConnecting(config.id)).toBe(false);
+    } finally {
+      await manager.dispose();
+    }
+    expect(dispose).toHaveBeenCalledOnce();
+  });
+
+  it("disposes the acquired SSH runtime when fingerprint persistence fails", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const config = createSshPgConfig("ssh-persist-failure");
+    config.ssh = {
+      ...config.ssh,
+      hostVerificationMode: "trustOnFirstUse",
+      hostFingerprintSha256: undefined,
+    };
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([config]);
+    const failure = new Error("fingerprint settings write failed");
+    const dispose = vi.fn(async () => undefined);
+    const createSshRuntime = vi.fn(async () => {
+      store.failNextConnectionWrite(failure);
+      return {
+        transport: {
+          kind: "tcpForward" as const,
+          localHost: "127.0.0.1" as const,
+          localPort: 15432,
+          remoteHost: "db.internal",
+          remotePort: 5432,
+        },
+        verifiedFingerprintSha256: "SHA256:learned-fingerprint",
+        dispose,
+      };
+    });
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+      { createSshRuntime },
+    );
+    try {
+      await expect(manager.connectTo(config.id)).rejects.toBe(failure);
+      expect(createSshRuntime).toHaveBeenCalledOnce();
+      expect(dispose).toHaveBeenCalledOnce();
+      expect(driverInstances).toHaveLength(0);
+      expect(manager.isConnected(config.id)).toBe(false);
+      expect(manager.isConnecting(config.id)).toBe(false);
+      expect(
+        store.getConnections()[0].ssh?.hostFingerprintSha256,
+      ).toBeUndefined();
+      expect(await store.getSecret(config.id)).toContain("ssh-secret");
+    } finally {
+      await manager.dispose();
+    }
+    expect(dispose).toHaveBeenCalledOnce();
   });
 
   it("keeps SSH runtime alive for active connections and disposes it on disconnect", async () => {
@@ -2767,6 +2946,360 @@ describe("ConnectionManager", () => {
     expect(schema.find((entry) => entry.object === "daily_users")).toBeFalsy();
     expect(schema.find((entry) => entry.object === "users_id_seq")).toBeFalsy();
     expect(schema.find((entry) => entry.object === "user_status")).toBeFalsy();
+  });
+
+  describe("schema discovery failures", () => {
+    const databaseScope = { kind: "database", database: "app_db" } as const;
+    const schemaScope = {
+      kind: "schema",
+      database: "app_db",
+      schema: "public",
+    } as const;
+    const column: ColumnMeta = {
+      name: "id",
+      type: "int",
+      nullable: false,
+      isPrimaryKey: true,
+      isForeignKey: false,
+    };
+
+    async function createManager(
+      behavior: DriverBehavior,
+      config?: ConnectionConfig,
+    ) {
+      const { ConnectionManager } = await import(
+        "../../src/extension/connectionManager"
+      );
+      driverBehaviors.set("discovery", behavior);
+      const store = new FakeConnectionManagerStore();
+      store.setConnections([
+        config ?? {
+          id: "discovery",
+          name: "Discovery",
+          type: "pg",
+          database: "app_db",
+          host: "localhost",
+          username: "postgres",
+        },
+      ]);
+      const manager = new ConnectionManager(
+        createExtensionContextStub() as never,
+        store,
+      );
+      await manager.connectTo("discovery");
+      await manager.getSchemaSnapshotAsync("discovery");
+      return manager;
+    }
+
+    function discoveryBehavior(
+      fails: (method: string) => boolean,
+    ): DriverBehavior {
+      const check = (method: string) => {
+        if (fails(method)) throw new Error(`permission denied: ${method}`);
+      };
+      return {
+        listDatabasesImpl: vi.fn(() => {
+          check("listDatabases");
+          return [{ name: "app_db", schemas: [] }];
+        }),
+        listSchemasImpl: vi.fn(() => {
+          check("listSchemas");
+          return [{ name: "public" }];
+        }),
+        listObjectsImpl: vi.fn(() => {
+          check("listObjects");
+          return [{ name: "users", schema: "public", type: "table" as const }];
+        }),
+        describeTableImpl: vi.fn(() => {
+          check("describeTable");
+          return [column];
+        }),
+      };
+    }
+
+    it.each([
+      "listDatabases",
+      "listSchemas",
+      "listObjects",
+      "describeTable",
+    ])("surfaces initial %s rejection at its scope and explicitly retries to recovery", async (method) => {
+      let denied = true;
+      const behavior = discoveryBehavior((name) => denied && name === method);
+      const manager = await createManager(behavior);
+      const scope =
+        method === "listDatabases"
+          ? ({ kind: "connectionRoot" } as const)
+          : method === "listSchemas"
+            ? databaseScope
+            : schemaScope;
+      expect(manager.getSchemaSnapshotState("discovery", scope)).toMatchObject({
+        status: "error",
+        error: expect.stringContaining(`permission denied: ${method}`),
+      });
+      expect(manager.getSchemaSnapshotState("discovery").status).toBe("error");
+      const calls = vi.mocked(behavior.listDatabasesImpl!).mock.calls.length;
+      manager.ensureSchemaSnapshotLoading("discovery");
+      manager.ensureSchemaScopeLoading("discovery", scope);
+      await Promise.resolve();
+      expect(vi.mocked(behavior.listDatabasesImpl!).mock.calls).toHaveLength(
+        calls,
+      );
+      expect(manager.getSchemaSnapshotState("discovery", scope).status).toBe(
+        "error",
+      );
+
+      denied = false;
+      await manager.getSchemaSnapshotAsync("discovery");
+      expect(manager.getSchemaSnapshotState("discovery")).toMatchObject({
+        status: "loaded",
+        isPartial: false,
+      });
+      expect(manager.getSchemaSnapshotState("discovery").error).toBeUndefined();
+      expect(manager.getSchema("discovery")[0]?.columns).toEqual([
+        { name: "id", type: "int" },
+      ]);
+      await manager.dispose();
+    });
+
+    it.each([
+      "listDatabases",
+      "listSchemas",
+      "listObjects",
+      "describeTable",
+    ])("retains usable cached data across a %s refresh rejection and removes it on genuine empty recovery", async (method) => {
+      let denied = false;
+      const behavior = discoveryBehavior((name) => denied && name === method);
+      const manager = await createManager(behavior);
+      const cached = manager.getSchema("discovery");
+      denied = true;
+      manager.refreshSchemaCache("discovery");
+      await vi.waitFor(() =>
+        expect(manager.getSchemaSnapshotState("discovery").status).toBe(
+          "error",
+        ),
+      );
+      expect(manager.getSchemaSnapshotState("discovery").isPartial).toBe(true);
+      expect(manager.getSchema("discovery")).toEqual(cached);
+
+      denied = false;
+      behavior.listObjectsImpl = vi.fn(() => []);
+      manager.refreshSchemaCache("discovery");
+      await manager.getSchemaSnapshotAsync("discovery");
+      expect(manager.getSchemaSnapshotState("discovery")).toMatchObject({
+        status: "loaded",
+        isPartial: false,
+      });
+      expect(
+        manager.getSchemaSnapshotState("discovery", schemaScope).status,
+      ).toBe("loaded");
+      expect(manager.getSchema("discovery")).toEqual([]);
+      await manager.dispose();
+    });
+
+    it("retains successful eager sibling schemas and objects when a column description is denied", async () => {
+      const behavior: DriverBehavior = {
+        listDatabases: [{ name: "app_db", schemas: [] }],
+        listSchemasByDatabase: {
+          app_db: [{ name: "public" }, { name: "audit" }],
+        },
+        listObjectsImpl: (_database, schema) => [
+          { name: "readable", schema, type: "table" },
+          { name: "restricted", schema, type: "table" },
+        ],
+        describeTableImpl: (_database, schema, table) => {
+          if (schema === "audit" && table === "restricted")
+            throw new Error("permission denied: restricted");
+          return [column];
+        },
+      };
+      const manager = await createManager(behavior);
+      expect(
+        manager.getSchemaSnapshotState("discovery", schemaScope).status,
+      ).toBe("loaded");
+      expect(
+        manager.getSchemaSnapshotState("discovery", {
+          ...schemaScope,
+          schema: "audit",
+        }),
+      ).toMatchObject({
+        status: "error",
+        isPartial: true,
+        error: expect.stringContaining("restricted"),
+      });
+      expect(manager.getSchema("discovery")).toHaveLength(4);
+      expect(
+        manager
+          .getSchema("discovery")
+          .find(
+            (entry) => entry.schema === "audit" && entry.object === "readable",
+          )?.columns,
+      ).toEqual([{ name: "id", type: "int" }]);
+      const request = {
+        connectionId: "discovery",
+        database: "app_db",
+        schema: "audit",
+        table: "readable",
+        objectKind: "table",
+      } as const;
+      manager.ensureTableDetailLoading(request);
+      await vi.waitFor(() =>
+        expect(manager.getTableDetailState(request).status).toBe("loaded"),
+      );
+      expect(
+        manager.getTableDetailState(request).snapshot.columns.items[0]?.name,
+      ).toBe("id");
+      await manager.dispose();
+    });
+
+    it.each([
+      "listSchemas",
+      "listObjects",
+      "describeTable",
+    ])("reports lazy %s rejection without losing the baseline and recovers on refresh", async (method) => {
+      let denied = true;
+      const lazyDatabase = { kind: "database", database: "archive" } as const;
+      const lazySchema = {
+        kind: "schema",
+        database: "archive",
+        schema: "audit",
+      } as const;
+      const behavior = discoveryBehavior(() => false);
+      behavior.listDatabases = [
+        { name: "app_db", schemas: [] },
+        { name: "archive", schemas: [] },
+      ];
+      delete behavior.listDatabasesImpl;
+      behavior.listSchemasImpl = (database) => {
+        if (database === "archive" && denied && method === "listSchemas")
+          throw new Error("permission denied");
+        return database === "archive"
+          ? [{ name: "audit" }, { name: "other" }]
+          : [{ name: "public" }];
+      };
+      behavior.listObjectsImpl = (database, schema) => {
+        if (database === "archive" && denied && method === "listObjects")
+          throw new Error("permission denied");
+        return [{ name: "users", schema, type: "table" }];
+      };
+      behavior.describeTableImpl = (database) => {
+        if (database === "archive" && denied && method === "describeTable")
+          throw new Error("permission denied");
+        return [column];
+      };
+      const manager = await createManager(behavior);
+      manager.ensureSchemaScopeLoading("discovery", lazyDatabase);
+      await vi.waitFor(() =>
+        expect(
+          manager.getSchemaSnapshotState("discovery", lazyDatabase).status,
+        ).toBe(method === "listSchemas" ? "error" : "loaded"),
+      );
+      if (method !== "listSchemas") {
+        manager.ensureSchemaScopeLoading("discovery", lazySchema);
+        await vi.waitFor(() =>
+          expect(
+            manager.getSchemaSnapshotState("discovery", lazySchema).status,
+          ).toBe("error"),
+        );
+      }
+      expect(manager.getSchemaSnapshotState("discovery")).toMatchObject({
+        status: "error",
+        isPartial: true,
+      });
+      expect(
+        manager.getSchemaSnapshotState("discovery", schemaScope).status,
+      ).toBe("loaded");
+      denied = false;
+      manager.refreshSchemaCache("discovery");
+      await vi.waitFor(() =>
+        expect(
+          manager.getSchemaSnapshotState(
+            "discovery",
+            method === "listSchemas" ? lazyDatabase : lazySchema,
+          ).status,
+        ).toBe("loaded"),
+      );
+      expect(manager.getSchemaSnapshotState("discovery").error).toBeUndefined();
+      await manager.dispose();
+    });
+
+    it("keeps genuine empty schema/column catalogs loaded and uses only an explicit no-namespace fallback", async () => {
+      const behavior = discoveryBehavior(() => false);
+      behavior.listSchemasImpl = vi.fn(() => []);
+      const manager = await createManager(behavior);
+      expect(
+        manager.getSchemaSnapshotState("discovery", databaseScope),
+      ).toMatchObject({
+        status: "loaded",
+        snapshot: { databases: [{ name: "app_db", schemas: [] }] },
+      });
+      expect(behavior.listObjectsImpl).not.toHaveBeenCalled();
+      behavior.capabilities = {
+        tabularRead: "nosql",
+        schemaNamespaces: "none",
+      };
+      behavior.describeTableImpl = vi.fn(() => []);
+      manager.refreshSchemaCache("discovery");
+      await manager.getSchemaSnapshotAsync("discovery");
+      expect(behavior.listObjectsImpl).toHaveBeenCalledWith("app_db", "app_db");
+      expect(manager.getSchemaSnapshotState("discovery")).toMatchObject({
+        status: "loaded",
+        isPartial: false,
+      });
+      expect(manager.getSchema("discovery")[0]?.columns).toEqual([]);
+      delete behavior.capabilities;
+      manager.refreshSchemaCache("discovery");
+      await manager.getSchemaSnapshotAsync("discovery");
+      expect(
+        manager.getSchemaSnapshotState("discovery", databaseScope),
+      ).toMatchObject({
+        status: "loaded",
+        snapshot: { databases: [{ name: "app_db", schemas: [] }] },
+      });
+      expect(manager.getSchema("discovery")).toEqual([]);
+      await manager.dispose();
+    });
+
+    it("skips column discovery when the manifest explicitly declares it not applicable", async () => {
+      const behavior = discoveryBehavior(
+        (method) => method === "describeTable",
+      );
+      behavior.entityManifest = {
+        ...DEFAULT_DRIVER_ENTITY_MANIFEST,
+        tableSections: {
+          ...DEFAULT_DRIVER_ENTITY_MANIFEST.tableSections,
+          columns: "not_applicable",
+        },
+      };
+      const manager = await createManager(behavior);
+      expect(behavior.describeTableImpl).not.toHaveBeenCalled();
+      expect(manager.getSchemaSnapshotState("discovery")).toMatchObject({
+        status: "loaded",
+        isPartial: false,
+      });
+      await manager.dispose();
+    });
+
+    it("treats a genuinely empty database catalog as loaded without discovery retries", async () => {
+      const behavior: DriverBehavior = {
+        listDatabasesImpl: vi.fn(() => []),
+        listSchemasImpl: vi.fn(() => []),
+      };
+      const manager = await createManager(behavior, {
+        id: "discovery",
+        name: "Redis",
+        type: "redis",
+        connectionUri: "redis://localhost:6379",
+      });
+      expect(manager.getSchemaSnapshotState("discovery")).toEqual({
+        status: "loaded",
+        isPartial: false,
+        snapshot: { databases: [] },
+      });
+      manager.ensureSchemaSnapshotLoading("discovery");
+      expect(behavior.listDatabasesImpl).toHaveBeenCalledTimes(1);
+      expect(behavior.listSchemasImpl).not.toHaveBeenCalled();
+      await manager.dispose();
+    });
   });
 
   it("refreshes cached schema metadata after a manual refresh request", async () => {

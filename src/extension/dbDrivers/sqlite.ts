@@ -1,6 +1,7 @@
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { ConnectionConfig } from "../connectionManager";
 import { BaseDBDriver } from "./BaseDBDriver";
+import { queryCollectionLimit } from "./boundedQueryRows";
 import { openSQLiteDatabase, type SQLiteDatabase } from "./sqliteRuntime";
 import {
   type DriverTimeoutSettingsProvider,
@@ -16,6 +17,7 @@ import type {
   GeneratedKind,
   PersistedEditCheckOptions,
   PersistedEditCheckResult,
+  QueryExecutionOptions,
   QueryResult,
   SchemaInfo,
   TableInfo,
@@ -231,6 +233,7 @@ function splitSQLiteScript(sql: string): string[] {
   while (i < n) {
     if (sql[i] === "-" && sql[i + 1] === "-") {
       while (i < n && sql[i] !== "\n") i++;
+      buf += " ";
       continue;
     }
     if (sql[i] === "/" && sql[i + 1] === "*") {
@@ -892,10 +895,15 @@ export class SQLiteDriver extends BaseDBDriver {
       this.enrichColumn(this.toColumnMeta(row, metadata)),
     );
   }
-  async query(sql: string, params?: unknown[]): Promise<QueryResult> {
+  async query(
+    sql: string,
+    params?: unknown[],
+    operationContext?: QueryExecutionOptions,
+  ): Promise<QueryResult> {
+    const hardCap = queryCollectionLimit(operationContext?.hardCap);
     const start = Date.now();
     if (params && params.length > 0) {
-      return this._executeSingle(sql, params, start);
+      return this._executeSingle(sql, params, start, hardCap);
     }
     if (isUnsafeSQLiteScript(sql)) {
       this.requireDb().exec(sql);
@@ -911,23 +919,45 @@ export class SQLiteDriver extends BaseDBDriver {
       return { columns: [], rows: [], rowCount: 0, executionTimeMs: 0 };
     }
     if (stmts.length === 1) {
-      return this._executeSingle(stmts[0], [], start);
+      return this._executeSingle(stmts[0], [], start, hardCap);
     }
-    return this._executeScript(stmts, start);
+    return this._executeScript(stmts, start, hardCap);
   }
   private _executeSingle(
     sql: string,
     params: unknown[],
     start: number,
+    hardCap?: number,
+    onResultSet?: () => void,
   ): QueryResult {
     const kind = classifySql(sql);
     const db = this.requireDb();
+    if (hardCap !== undefined) {
+      const result = db.queryBounded(sql, params, hardCap, onResultSet);
+      const affectedRows =
+        result.changes ??
+        (kind === "dml" && canSQLiteStatementReturnRows(sql)
+          ? Number(
+              (db.get("SELECT changes() AS affected") as { affected: number })
+                .affected,
+            )
+          : undefined);
+      return {
+        columns: result.columns,
+        rows: result.rows.map((row) =>
+          Object.fromEntries(row.map((value, i) => [`__col_${i}`, value])),
+        ),
+        rowCount: result.rowCount,
+        ...(affectedRows !== undefined ? { affectedRows } : {}),
+        truncated: result.truncated,
+        executionTimeMs: Date.now() - start,
+      };
+    }
     if (kind === "select") {
       try {
-        const rawRows = db.all(sql, params) as Record<string, unknown>[];
-        const columns = rawRows.length > 0 ? Object.keys(rawRows[0]) : [];
+        const { columns, rows: rawRows } = db.allRaw(sql, params);
         const rows = rawRows.map((row) =>
-          Object.fromEntries(columns.map((col, i) => [`__col_${i}`, row[col]])),
+          Object.fromEntries(row.map((value, i) => [`__col_${i}`, value])),
         );
         return {
           columns,
@@ -972,7 +1002,11 @@ export class SQLiteDriver extends BaseDBDriver {
       affectedRows: info.changes,
     };
   }
-  private _executeScript(stmts: string[], start: number): QueryResult {
+  private _executeScript(
+    stmts: string[],
+    start: number,
+    hardCap?: number,
+  ): QueryResult {
     let lastResult: QueryResult = {
       columns: [],
       rows: [],
@@ -981,7 +1015,9 @@ export class SQLiteDriver extends BaseDBDriver {
     };
     let totalAffected = 0;
     for (const stmt of stmts) {
-      const r = this._executeSingle(stmt, [], start);
+      const r = this._executeSingle(stmt, [], start, hardCap, () => {
+        lastResult.rows = [];
+      });
       totalAffected += r.affectedRows ?? 0;
       if (r.columns.length > 0) {
         lastResult = r;
@@ -995,6 +1031,9 @@ export class SQLiteDriver extends BaseDBDriver {
       lastResult.affectedRows = totalAffected;
     }
     return lastResult;
+  }
+  override getCapabilities() {
+    return { ...super.getCapabilities(), boundedQueryResults: true };
   }
   async getIndexes(
     database: string,

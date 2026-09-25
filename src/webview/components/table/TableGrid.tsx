@@ -317,6 +317,8 @@ interface TableGridProps {
   editCell: EditTarget | null;
   filterDrafts: FilterDraftMap;
   loading: boolean;
+  loadingRef: React.MutableRefObject<boolean>;
+  fetchEpochRef: React.MutableRefObject<number>;
   newRows: InsertDraftRow[];
   onCancelEdit: () => void;
   onBatchCellEdit: (
@@ -399,6 +401,8 @@ function TableDataGrid({
   editCell,
   filterDrafts,
   loading,
+  loadingRef,
+  fetchEpochRef,
   newRows,
   onCancelEdit,
   onBatchCellEdit,
@@ -505,36 +509,42 @@ function TableDataGrid({
 
   const clipboardRecipientRef = useRef(`table-grid:${crypto.randomUUID()}`);
   const clipboardRequestRef = useRef<string | null>(null);
+  const clipboardEpochRef = useRef(fetchEpochRef.current);
   const pendingPasteRangeRef = useRef<CellRange | null>(null);
   const selectionRangeRef = useRef<CellRange | null>(null);
   const pasteContextRef = useRef<{
     current: { row: number; col: number } | null;
   } | null>(null);
 
-  const handlePaste = useCallback((fromContextMenu = false) => {
-    const range = selectionRangeRef.current;
-    const contextCell = fromContextMenu
-      ? pasteContextRef.current?.current
-      : null;
-    if (!range && !contextCell) return;
-    const requestId = crypto.randomUUID();
-    clipboardRequestRef.current = requestId;
-    pendingPasteRangeRef.current = contextCell
-      ? {
-          anchorRow: contextCell.row,
-          anchorCol: contextCell.col,
-          activeRow: contextCell.row,
-          activeCol: contextCell.col,
-        }
-      : range
-        ? { ...range }
+  const handlePaste = useCallback(
+    (fromContextMenu = false) => {
+      if (loadingRef.current) return;
+      const range = selectionRangeRef.current;
+      const contextCell = fromContextMenu
+        ? pasteContextRef.current?.current
         : null;
-    if (pasteContextRef.current) pasteContextRef.current.current = null;
-    postMessage("readClipboard", {
-      requestId,
-      recipient: clipboardRecipientRef.current,
-    });
-  }, []);
+      if (!range && !contextCell) return;
+      const requestId = crypto.randomUUID();
+      clipboardRequestRef.current = requestId;
+      clipboardEpochRef.current = fetchEpochRef.current;
+      pendingPasteRangeRef.current = contextCell
+        ? {
+            anchorRow: contextCell.row,
+            anchorCol: contextCell.col,
+            activeRow: contextCell.row,
+            activeCol: contextCell.col,
+          }
+        : range
+          ? { ...range }
+          : null;
+      if (pasteContextRef.current) pasteContextRef.current.current = null;
+      postMessage("readClipboard", {
+        requestId,
+        recipient: clipboardRecipientRef.current,
+      });
+    },
+    [loadingRef, fetchEpochRef],
+  );
 
   const isColumnCollapsed = useCallback(
     (visualColIndex: number) => {
@@ -692,6 +702,14 @@ function TableDataGrid({
       clipboardRequestRef.current = null;
       const requestedRange = pendingPasteRangeRef.current;
       pendingPasteRangeRef.current = null;
+      // A reply belongs to the dataset from which the paste was requested,
+      // even if its refetch has already finished (or failed).
+      if (
+        loadingRef.current ||
+        clipboardEpochRef.current !== fetchEpochRef.current
+      ) {
+        return;
+      }
       if (!requestedRange) return;
 
       const pasteData = parseTsv(text);
@@ -926,6 +944,8 @@ function TableDataGrid({
     selColOffset,
     onBatchCellEdit,
     onMixedBatchEdit,
+    loadingRef,
+    fetchEpochRef,
     selection.contextMenuCellRef.current,
     selection.contextMenuCellRef,
   ]);

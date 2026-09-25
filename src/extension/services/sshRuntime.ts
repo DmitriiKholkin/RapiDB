@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import * as http from "node:http";
 import * as https from "node:https";
 import * as net from "node:net";
-import { Duplex, PassThrough } from "node:stream";
+import type { Duplex } from "node:stream";
 import * as tls from "node:tls";
 import type { ConnectionSshHostVerificationMode } from "../../shared/connectionConfig";
 
@@ -97,6 +97,54 @@ export interface SshRuntimeDependencies {
 }
 
 const SSH2_MODULE_NAME = "ssh2";
+
+class SshTransportLifetime {
+  private readonly abortController = new AbortController();
+  private readonly streams = new Set<Duplex>();
+  readonly pendingForwards = new Set<(error: Error) => void>();
+  private ended = false;
+
+  constructor(readonly client: SshClientLike) {
+    // Keep this listener even after close: ssh2 can report late transport errors.
+    client.on("error", (error) => this.stop(error));
+    client.on("close", () =>
+      this.stop(new Error("[RapiDB] SSH connection closed")),
+    );
+  }
+
+  get signal(): AbortSignal {
+    return this.abortController.signal;
+  }
+
+  track<T extends Duplex>(stream: T): T {
+    // A channel may emit an error before its consumer has attached listeners.
+    stream.on("error", () => stream.destroy());
+    if (this.signal.aborted) {
+      stream.destroy(this.signal.reason);
+    } else {
+      this.streams.add(stream);
+      stream.once("close", () => this.streams.delete(stream));
+    }
+    return stream;
+  }
+
+  stop(error = new Error("[RapiDB] SSH runtime disposed")): void {
+    if (this.signal.aborted) return;
+    // Destroy accepted sockets before the abort listener waits for server.close.
+    for (const stream of this.streams) stream.destroy(error);
+    this.streams.clear();
+    this.abortController.abort(error);
+    for (const reject of this.pendingForwards) reject(error);
+    this.pendingForwards.clear();
+    if (!this.ended) {
+      this.ended = true;
+      try {
+        this.client.end();
+      } catch {}
+    }
+  }
+}
+
 type TlsClientRequestArgs = http.ClientRequestArgs &
   Partial<tls.ConnectionOptions> & {
     servername?: string;
@@ -193,32 +241,50 @@ function waitForServerListening(server: net.Server): Promise<net.AddressInfo> {
 }
 
 function createForwardOutPromise(
-  client: SshClientLike,
+  lifetime: SshTransportLifetime,
   remoteHost: string,
   remotePort: number,
 ): Promise<Duplex> {
   return new Promise((resolve, reject) => {
-    client.forwardOut(
-      "127.0.0.1",
-      0,
-      remoteHost,
-      remotePort,
-      (error, stream) => {
-        if (error) {
-          reject(error);
-          return;
-        }
+    if (lifetime.signal.aborted) {
+      reject(lifetime.signal.reason);
+      return;
+    }
+    lifetime.pendingForwards.add(reject);
+    try {
+      lifetime.client.forwardOut(
+        "127.0.0.1",
+        0,
+        remoteHost,
+        remotePort,
+        (error, stream) => {
+          lifetime.pendingForwards.delete(reject);
+          if (stream) lifetime.track(stream);
+          if (lifetime.signal.aborted) {
+            stream?.destroy();
+            reject(lifetime.signal.reason);
+            return;
+          }
+          if (error) {
+            stream?.destroy();
+            reject(error);
+            return;
+          }
 
-        if (!stream) {
-          reject(
-            new Error("[RapiDB] SSH forward established without a stream"),
-          );
-          return;
-        }
+          if (!stream) {
+            reject(
+              new Error("[RapiDB] SSH forward established without a stream"),
+            );
+            return;
+          }
 
-        resolve(stream);
-      },
-    );
+          resolve(stream);
+        },
+      );
+    } catch (error) {
+      lifetime.pendingForwards.delete(reject);
+      reject(error);
+    }
   });
 }
 
@@ -272,7 +338,7 @@ function resolveSecureServername(options: TlsClientRequestArgs): string {
 }
 
 async function createAgentSocket(
-  client: SshClientLike,
+  lifetime: SshTransportLifetime,
   options: http.ClientRequestArgs,
 ): Promise<Duplex> {
   const remoteHost = resolveRequestHost(options);
@@ -281,14 +347,14 @@ async function createAgentSocket(
   }
 
   return createForwardOutPromise(
-    client,
+    lifetime,
     remoteHost,
     resolveRequestPort(options, 80),
   );
 }
 
 async function createSecureAgentSocket(
-  client: SshClientLike,
+  lifetime: SshTransportLifetime,
   options: TlsClientRequestArgs,
 ): Promise<tls.TLSSocket> {
   const remoteHost = resolveRequestHost(options);
@@ -297,60 +363,79 @@ async function createSecureAgentSocket(
   }
 
   const tunneledSocket = await createForwardOutPromise(
-    client,
+    lifetime,
     remoteHost,
     resolveRequestPort(options, 443),
   );
+  lifetime.signal.throwIfAborted();
 
-  return new Promise((resolve, reject) => {
-    const tlsSocket = tls.connect({
-      ALPNProtocols: options.ALPNProtocols,
-      ca: options.ca,
-      cert: options.cert,
-      checkServerIdentity: options.checkServerIdentity,
-      ciphers: options.ciphers,
-      clientCertEngine: options.clientCertEngine,
-      crl: options.crl,
-      dhparam: options.dhparam,
-      ecdhCurve: options.ecdhCurve,
-      honorCipherOrder: options.honorCipherOrder,
-      key: options.key,
-      maxVersion: options.maxVersion,
-      minVersion: options.minVersion,
-      passphrase: options.passphrase,
-      pfx: options.pfx,
-      rejectUnauthorized: options.rejectUnauthorized,
-      secureContext: options.secureContext,
-      secureOptions: options.secureOptions,
-      servername: resolveSecureServername(options),
-      session: options.session,
-      sigalgs: options.sigalgs,
-      socket: tunneledSocket,
+  try {
+    return await new Promise((resolve, reject) => {
+      const tlsSocket = lifetime.track(
+        tls.connect({
+          ALPNProtocols: options.ALPNProtocols,
+          ca: options.ca,
+          cert: options.cert,
+          checkServerIdentity:
+            options.checkServerIdentity ?? tls.checkServerIdentity,
+          ciphers: options.ciphers,
+          clientCertEngine: options.clientCertEngine,
+          crl: options.crl,
+          dhparam: options.dhparam,
+          ecdhCurve: options.ecdhCurve,
+          honorCipherOrder: options.honorCipherOrder,
+          key: options.key,
+          maxVersion: options.maxVersion,
+          minVersion: options.minVersion,
+          passphrase: options.passphrase,
+          pfx: options.pfx,
+          rejectUnauthorized: options.rejectUnauthorized,
+          secureContext: options.secureContext,
+          secureOptions: options.secureOptions,
+          servername: resolveSecureServername(options),
+          session: options.session,
+          sigalgs: options.sigalgs,
+          socket: tunneledSocket,
+        }),
+      );
+
+      const onError = (error: Error) => {
+        tlsSocket.removeListener("secureConnect", onSecureConnect);
+        tlsSocket.removeListener("close", onClose);
+        tunneledSocket.destroy();
+        reject(error);
+      };
+      const onClose = () =>
+        onError(
+          lifetime.signal.reason ??
+            new Error("[RapiDB] SSH TLS socket closed before handshake"),
+        );
+      const onSecureConnect = () => {
+        tlsSocket.removeListener("error", onError);
+        tlsSocket.removeListener("close", onClose);
+        resolve(tlsSocket);
+      };
+
+      tlsSocket.once("error", onError);
+      tlsSocket.once("close", onClose);
+      tlsSocket.once("secureConnect", onSecureConnect);
     });
-
-    const onError = (error: Error) => {
-      tlsSocket.removeListener("secureConnect", onSecureConnect);
-      reject(error);
-    };
-    const onSecureConnect = () => {
-      tlsSocket.removeListener("error", onError);
-      resolve(tlsSocket);
-    };
-
-    tlsSocket.once("error", onError);
-    tlsSocket.once("secureConnect", onSecureConnect);
-  });
+  } catch (error) {
+    tunneledSocket.destroy();
+    throw error;
+  }
 }
 
 async function createVerifiedClient(
   ssh: ConnectionSshSettings,
   dependencies: SshRuntimeDependencies,
 ): Promise<{
-  client: SshClientLike;
+  lifetime: SshTransportLifetime;
   verifiedFingerprintSha256: string;
 }> {
   const { Client } = await (dependencies.loadSsh2 ?? defaultLoadSsh2)();
   const client = new Client();
+  const lifetime = new SshTransportLifetime(client);
   const hostVerifierState = createHostVerifier(ssh);
 
   try {
@@ -358,7 +443,8 @@ async function createVerifiedClient(
       const onReady = () => {
         client.removeListener("error", onError);
         client.removeListener("close", onClose);
-        resolve();
+        if (lifetime.signal.aborted) reject(lifetime.signal.reason);
+        else resolve();
       };
       const onError = (error: Error) => {
         client.removeListener("ready", onReady);
@@ -369,7 +455,8 @@ async function createVerifiedClient(
         client.removeListener("ready", onReady);
         client.removeListener("error", onError);
         reject(
-          new Error("[RapiDB] SSH connection closed before it became ready"),
+          lifetime.signal.reason ??
+            new Error("[RapiDB] SSH connection closed before it became ready"),
         );
       };
 
@@ -389,60 +476,80 @@ async function createVerifiedClient(
       });
     });
   } catch (error) {
-    try {
-      client.end();
-    } catch {}
+    lifetime.stop();
     throw error;
   }
 
   const verifiedFingerprintSha256 =
     hostVerifierState.getVerifiedFingerprintSha256();
   if (!verifiedFingerprintSha256) {
-    try {
-      client.end();
-    } catch {}
+    lifetime.stop();
     throw new Error(
       "[RapiDB] SSH host fingerprint could not be verified during connection setup.",
     );
   }
 
   return {
-    client,
+    lifetime,
     verifiedFingerprintSha256,
   };
 }
 
 async function createTcpForwardRuntime(
-  client: SshClientLike,
+  lifetime: SshTransportLifetime,
   verifiedFingerprintSha256: string,
   request: Extract<SshRuntimeRequest, { kind: "tcpForward" }>,
 ): Promise<SshRuntime> {
+  lifetime.signal.throwIfAborted();
   const server = net.createServer((socket) => {
-    void createForwardOutPromise(client, request.remoteHost, request.remotePort)
+    lifetime.track(socket);
+    if (socket.destroyed) return;
+    void createForwardOutPromise(
+      lifetime,
+      request.remoteHost,
+      request.remotePort,
+    )
       .then((upstream) => {
-        socket.pipe(upstream);
-        upstream.pipe(socket);
+        if (socket.destroyed || lifetime.signal.aborted) {
+          upstream.destroy();
+          return;
+        }
 
         const destroySocket = () => {
           socket.destroy();
         };
         const destroyUpstream = () => {
-          if (typeof (upstream as PassThrough).destroy === "function") {
-            upstream.destroy();
-          }
+          upstream.destroy();
         };
 
-        socket.once("error", destroyUpstream);
-        upstream.once("error", destroySocket);
+        socket.on("error", destroyUpstream);
+        upstream.on("error", destroySocket);
+        socket.once("close", destroyUpstream);
+        upstream.once("close", destroySocket);
+        socket.pipe(upstream);
+        upstream.pipe(socket);
       })
       .catch(() => {
         socket.destroy();
       });
   });
 
+  let closing: Promise<void> | undefined;
+  const close = () => {
+    if (!server.listening && !closing) return Promise.resolve();
+    closing ??= closeServer(server);
+    return closing;
+  };
+  server.on("error", (error) => lifetime.stop(error));
+  const onAbort = () => {
+    void close();
+  };
+  lifetime.signal.addEventListener("abort", onAbort, { once: true });
+
   try {
     const address = await waitForServerListening(server);
-    let disposed = false;
+    lifetime.signal.throwIfAborted();
+    let disposal: Promise<void> | undefined;
     return {
       transport: {
         kind: "tcpForward",
@@ -452,56 +559,70 @@ async function createTcpForwardRuntime(
         remotePort: request.remotePort,
       },
       verifiedFingerprintSha256,
-      dispose: async () => {
-        if (disposed) {
-          return;
-        }
-        disposed = true;
-        await closeServer(server);
-        try {
-          client.end();
-        } catch {}
+      dispose: () => {
+        if (disposal) return disposal;
+        lifetime.stop();
+        disposal = close();
+        return disposal;
       },
     };
   } catch (error) {
-    await closeServer(server).catch(() => undefined);
-    try {
-      client.end();
-    } catch {}
+    lifetime.stop();
+    await close();
     throw error;
+  } finally {
+    if (lifetime.signal.aborted) {
+      lifetime.signal.removeEventListener("abort", onAbort);
+    }
   }
 }
 
 async function createHttpAgentRuntime(
-  client: SshClientLike,
+  lifetime: SshTransportLifetime,
   verifiedFingerprintSha256: string,
 ): Promise<SshRuntime> {
   const { Agent: AgentBase } = await import("agent-base");
 
   class SshForwardAgent extends AgentBase {
     constructor(
-      private readonly client: SshClientLike,
+      private readonly lifetime: SshTransportLifetime,
       private readonly secureEndpoint: boolean,
     ) {
       super({ keepAlive: true });
     }
 
-    override connect(
+    override async connect(
       _req: http.ClientRequest,
       options: http.ClientRequestArgs,
     ): Promise<Duplex> {
-      return this.secureEndpoint
-        ? createSecureAgentSocket(this.client, options as TlsClientRequestArgs)
-        : createAgentSocket(this.client, options);
+      const socket = await (this.secureEndpoint
+        ? createSecureAgentSocket(
+            this.lifetime,
+            options as TlsClientRequestArgs,
+          )
+        : createAgentSocket(this.lifetime, options));
+      this.lifetime.signal.throwIfAborted();
+      return socket;
     }
   }
 
-  const httpAgent = new SshForwardAgent(client, false) as unknown as http.Agent;
+  lifetime.signal.throwIfAborted();
+  const httpAgent = new SshForwardAgent(
+    lifetime,
+    false,
+  ) as unknown as http.Agent;
   const httpsAgent = new SshForwardAgent(
-    client,
+    lifetime,
     true,
   ) as unknown as https.Agent;
-  let disposed = false;
+  lifetime.signal.addEventListener(
+    "abort",
+    () => {
+      httpAgent.destroy();
+      httpsAgent.destroy();
+    },
+    { once: true },
+  );
 
   return {
     transport: {
@@ -511,15 +632,7 @@ async function createHttpAgentRuntime(
     },
     verifiedFingerprintSha256,
     dispose: async () => {
-      if (disposed) {
-        return;
-      }
-      disposed = true;
-      httpAgent.destroy();
-      httpsAgent.destroy();
-      try {
-        client.end();
-      } catch {}
+      lifetime.stop();
     },
   };
 }
@@ -529,14 +642,23 @@ export async function createSshRuntime(
   request: SshRuntimeRequest,
   dependencies: SshRuntimeDependencies = {},
 ): Promise<SshRuntime> {
-  const { client, verifiedFingerprintSha256 } = await createVerifiedClient(
+  const { lifetime, verifiedFingerprintSha256 } = await createVerifiedClient(
     ssh,
     dependencies,
   );
 
-  if (request.kind === "tcpForward") {
-    return createTcpForwardRuntime(client, verifiedFingerprintSha256, request);
-  }
+  try {
+    if (request.kind === "tcpForward") {
+      return await createTcpForwardRuntime(
+        lifetime,
+        verifiedFingerprintSha256,
+        request,
+      );
+    }
 
-  return await createHttpAgentRuntime(client, verifiedFingerprintSha256);
+    return await createHttpAgentRuntime(lifetime, verifiedFingerprintSha256);
+  } catch (error) {
+    lifetime.stop();
+    throw error;
+  }
 }

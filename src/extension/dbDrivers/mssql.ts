@@ -8,6 +8,7 @@ import {
 } from "../driverRuntimeConfig";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
 import { logger } from "../utils/logger";
+import { scanSqlForCap } from "../utils/sqlStatementScan";
 import {
   BaseDBDriver,
   formatDatetimeForDisplay,
@@ -15,6 +16,7 @@ import {
   isoToLocalDateStr,
   normalizeSqlDatetimeOffsetSpacing,
 } from "./BaseDBDriver";
+import { BoundedQueryRows, queryCollectionLimit } from "./boundedQueryRows";
 import {
   questionMarkPlaceholderOffsets,
   replaceQuestionMarkPlaceholders,
@@ -37,6 +39,7 @@ import type {
   PaginationResult,
   PersistedEditCheckOptions,
   PersistedEditCheckResult,
+  QueryExecutionOptions,
   QueryResult,
   SchemaInfo,
   TableInfo,
@@ -53,6 +56,25 @@ import {
 const MSSQL_TEDIOUS_EXACT_NUMERIC_PATCH_KEY = Symbol.for(
   "rapidb.mssqlTediousExactNumericPatch",
 );
+
+export function splitMssqlBatches(sql: string): string[] {
+  const separators = new Set(
+    scanSqlForCap(sql, "mssql")
+      .filter(
+        (token) => token.kind === "word" && token.text.toLowerCase() === "go",
+      )
+      .map((token) => token.start),
+  );
+  const batches: string[] = [];
+  let start = 0;
+  for (const match of sql.matchAll(/^[\t ]*GO(?:[\t ]+\d+)?[\t \r]*$/gim)) {
+    if (!separators.has(match.index + match[0].search(/\S/))) continue;
+    batches.push(sql.slice(start, match.index).trim());
+    start = match.index + match[0].length;
+  }
+  batches.push(sql.slice(start).trim());
+  return batches.filter(Boolean);
+}
 
 type TediousReadValueResult = {
   value: unknown;
@@ -171,6 +193,25 @@ interface MssqlArrayColumnMeta {
 }
 interface MssqlArrayResult extends mssql.IResult<unknown[]> {
   columns?: MssqlArrayColumnMeta[][];
+}
+
+function mssqlArrayRow(
+  row: unknown,
+  columns: MssqlArrayColumnMeta[],
+): unknown[] {
+  if (Array.isArray(row)) return row;
+  // node-mssql emits chunked FOR XML/JSON values as an object even with
+  // arrayRowMode enabled. In that mode its single key is usually "0".
+  const values =
+    row !== null && typeof row === "object"
+      ? (row as Record<string, unknown>)
+      : undefined;
+  return columns.map((column, index) => {
+    if (values && Object.hasOwn(values, index)) return values[index];
+    if (values && Object.hasOwn(values, column.name))
+      return values[column.name];
+    return columns.length === 1 ? row : undefined;
+  });
 }
 
 const MSSQL_ENTITY_MANIFEST: DriverEntityManifest = {
@@ -1514,26 +1555,11 @@ export class MSSQLDriver extends BaseDBDriver {
   async query(
     sql: string,
     params?: unknown[],
-    operationContext?: { requestToken?: number; readOnly?: boolean },
+    operationContext?: QueryExecutionOptions,
   ): Promise<QueryResult> {
+    const hardCap = queryCollectionLimit(operationContext?.hardCap);
     const start = Date.now();
-    const batches = sql
-      .split(/\r?\n/)
-      .reduce<string[]>(
-        (acc, line) => {
-          const isGo = /^GO(?:\s+\d+)?$/i.test(line.trim());
-          if (isGo) {
-            acc.push("");
-          } else {
-            const lastIdx = acc.length - 1;
-            acc[lastIdx] += (acc[lastIdx] ? "\n" : "") + line;
-          }
-          return acc;
-        },
-        [""],
-      )
-      .map((b) => b.trim())
-      .filter((b) => b.length > 0);
+    const batches = splitMssqlBatches(sql);
     if (batches.length === 0) {
       return {
         columns: [],
@@ -1556,11 +1582,15 @@ export class MSSQLDriver extends BaseDBDriver {
     };
     for (const batch of batches) {
       const currentParams = batches.length === 1 ? params : undefined;
+      // Only the final GO batch is returned; release the preceding collection
+      // before starting another request, rather than retaining two budgets.
+      if (hardCap !== undefined) lastResult.rows = [];
       lastResult = await this._executeBatch(
         batch,
         currentParams,
         start,
         operationContext?.requestToken,
+        hardCap,
       );
     }
     lastResult.executionTimeMs = Date.now() - start;
@@ -1571,9 +1601,78 @@ export class MSSQLDriver extends BaseDBDriver {
     params?: unknown[],
     start = Date.now(),
     requestToken?: number,
+    hardCap?: number,
   ): Promise<QueryResult> {
     const req = this.requirePool().request();
     req.arrayRowMode = true;
+    if (hardCap !== undefined) {
+      return this.executeTrackedRequest(
+        req,
+        async (trackedReq) => {
+          const finalSql = this.bindPositionalParameters(
+            trackedReq,
+            sql,
+            params,
+          );
+          const retained = new BoundedQueryRows<unknown[]>(hardCap);
+          let columnsMeta: MssqlArrayColumnMeta[] = [];
+          let recordsetIndex = -1;
+          let affectedRows = 0;
+          let streamError: Error | undefined;
+          const onRecordset = (columns: MssqlArrayColumnMeta[]) => {
+            recordsetIndex++;
+            // Preserve the existing first-recordset selection within a batch.
+            if (recordsetIndex === 0) columnsMeta = columns;
+          };
+          const onRow = (row: unknown) => {
+            if (recordsetIndex === 0)
+              retained.add(mssqlArrayRow(row, columnsMeta));
+          };
+          const onAffected = (count: number) => {
+            affectedRows = count;
+          };
+          const onError = (error: Error) => {
+            streamError ??= error;
+          };
+          trackedReq.stream = true;
+          trackedReq.on("recordset", onRecordset);
+          trackedReq.on("row", onRow);
+          trackedReq.on("rowsaffected", onAffected);
+          trackedReq.on("error", onError);
+          try {
+            // In mssql stream mode the promise may resolve after emitting errors.
+            // Wait for completion/release, then propagate the first error. Never
+            // cancel on a full display budget: triggers and mutations must drain.
+            const result = await trackedReq.query(finalSql);
+            if (streamError) throw streamError;
+            affectedRows = result.rowsAffected?.at(-1) ?? affectedRows;
+            return {
+              columns: columnsMeta.map((column) =>
+                column.name === "" ? " " : column.name,
+              ),
+              rows: retained.rows.map((row) =>
+                Object.fromEntries(
+                  row.map((value, index) => [
+                    `__col_${index}`,
+                    this.formatQueryValue(value, columnsMeta[index]),
+                  ]),
+                ),
+              ),
+              rowCount: columnsMeta.length ? retained.rowCount : affectedRows,
+              affectedRows,
+              truncated: retained.truncated,
+              executionTimeMs: Date.now() - start,
+            };
+          } finally {
+            trackedReq.off("recordset", onRecordset);
+            trackedReq.off("row", onRow);
+            trackedReq.off("rowsaffected", onAffected);
+            trackedReq.off("error", onError);
+          }
+        },
+        requestToken,
+      );
+    }
     const res = (await this.executeTrackedRequest(
       req,
       async (trackedReq) => {
@@ -1599,7 +1698,7 @@ export class MSSQLDriver extends BaseDBDriver {
     );
     const rows = ((res.recordset ?? []) as unknown[][]).map((row) =>
       Object.fromEntries(
-        row.map((value, index) => [
+        mssqlArrayRow(row, columnsMeta).map((value, index) => [
           `__col_${index}`,
           this.formatQueryValue(value, columnsMeta[index]),
         ]),
@@ -1612,6 +1711,9 @@ export class MSSQLDriver extends BaseDBDriver {
       affectedRows,
       executionTimeMs,
     };
+  }
+  override getCapabilities() {
+    return { ...super.getCapabilities(), boundedQueryResults: true };
   }
   async getIndexes(
     database: string,

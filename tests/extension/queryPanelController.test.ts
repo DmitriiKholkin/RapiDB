@@ -142,6 +142,131 @@ describe("QueryPanelController", () => {
     });
   });
 
+  it.each([
+    "exportResultsCSV",
+    "exportResultsJSON",
+  ])("%s preserves duplicate columns through default export, reorder, and sort", async (type) => {
+    const cached = {
+      columns: ["value", "value"],
+      columnMeta: [
+        { category: "integer" as const },
+        { category: "text" as const },
+      ],
+      rows: [
+        { __col_0: 2, __col_1: "a" },
+        { __col_0: 1, __col_1: "c" },
+        { __col_0: 1, __col_1: "b" },
+      ],
+    };
+    const snapshot = structuredClone(cached);
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController({} as never, {
+      getActiveConnectionId: () => "active",
+      getInitialConnectionId: () => "initial",
+      getLastQueryResult: () => cached,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    });
+    const exporter =
+      type === "exportResultsCSV"
+        ? exportQueryResultsAsCsv
+        : exportQueryResultsAsJson;
+    for (const payload of [
+      undefined,
+      { columnOrder: ["__col_0", "__col_1"] },
+    ]) {
+      await controller.handleMessage({ type, payload });
+      expect(exporter).toHaveBeenLastCalledWith(snapshot, {
+        context: undefined,
+      });
+    }
+    await controller.handleMessage({
+      type,
+      payload: { columnOrder: ["__col_1", "__col_0"] },
+    });
+    expect(exporter).toHaveBeenLastCalledWith(
+      {
+        ...cached,
+        columnMeta: [cached.columnMeta[1], cached.columnMeta[0]],
+        rows: [
+          { __col_0: "a", __col_1: 2 },
+          { __col_0: "c", __col_1: 1 },
+          { __col_0: "b", __col_1: 1 },
+        ],
+      },
+      { context: undefined },
+    );
+    for (const [id, desc, indices] of [
+      ["__col_0", false, [1, 2, 0]],
+      ["__col_1", false, [0, 2, 1]],
+      ["__col_1", true, [1, 2, 0]],
+    ] as const) {
+      await controller.handleMessage({
+        type,
+        payload: { sort: [{ id, desc }] },
+      });
+      expect(exporter).toHaveBeenLastCalledWith(
+        {
+          ...cached,
+          rows: indices.map((i) => cached.rows[i]),
+        },
+        { context: undefined },
+      );
+    }
+    await controller.handleMessage({
+      type,
+      payload: {
+        columnOrder: ["__col_1", "__col_0"],
+        sort: [
+          { id: "__col_0", desc: false },
+          { id: "__col_1", desc: false },
+        ],
+      },
+    });
+    expect(exporter).toHaveBeenLastCalledWith(
+      {
+        ...cached,
+        columnMeta: [cached.columnMeta[1], cached.columnMeta[0]],
+        rows: [
+          { __col_0: "b", __col_1: 1 },
+          { __col_0: "c", __col_1: 1 },
+          { __col_0: "a", __col_1: 2 },
+        ],
+      },
+      { context: undefined },
+    );
+    await controller.handleMessage({
+      type,
+      payload: {
+        columnOrder: ["__col_1"],
+        sort: [{ id: "__col_0", desc: false }],
+      },
+    });
+    expect(exporter).toHaveBeenLastCalledWith(
+      {
+        columns: ["value"],
+        columnMeta: [cached.columnMeta[1]],
+        rows: [{ __col_0: "c" }, { __col_0: "b" }, { __col_0: "a" }],
+      },
+      { context: undefined },
+    );
+    expect(cached).toEqual(snapshot);
+
+    exporter.mockClear();
+    for (const payload of [
+      { columnOrder: ["__col_0", "__col_2"] },
+      { sort: [{ id: "__col_2", desc: false }] },
+    ]) {
+      await controller.handleMessage({ type, payload });
+    }
+    expect(exporter).not.toHaveBeenCalled();
+    expect(showWarningMessage).toHaveBeenCalledTimes(2);
+  });
+
   it("warns and skips both exports when cached results are empty", async () => {
     const connectionManager = {
       isConnected: vi.fn(() => true),
@@ -295,6 +420,263 @@ describe("QueryPanelController", () => {
     );
   });
 
+  async function executeSqlCapCase(
+    type: string,
+    queryText: string,
+    bounded = false,
+  ) {
+    const query = vi.fn(async () => ({
+      columns: ["id"],
+      rows: [{ id: 1 }],
+      columnMeta: [],
+      rowCount: bounded ? 100 : 1,
+      ...(bounded ? { truncated: true, affectedRows: 100 } : {}),
+      executionTimeMs: 1,
+    }));
+    const connectionManager = {
+      getConnection: vi.fn(() => ({ id: "active", name: "Primary", type })),
+      isConnected: vi.fn(() => true),
+      connectTo: vi.fn(),
+      addToHistory: vi.fn(async () => undefined),
+      getDriver: vi.fn(() => ({ query })),
+      getDriverCapabilities: vi.fn(() =>
+        bounded ? { boundedQueryResults: true } : undefined,
+      ),
+      getQueryRowLimit: vi.fn(() => 10),
+      refreshSchemaCache: vi.fn(),
+    };
+    const view = {
+      getActiveConnectionId: () => "active",
+      getInitialConnectionId: () => "active",
+      getLastQueryResult: () => null,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    await new QueryPanelController(
+      connectionManager as never,
+      view,
+    ).handleMessage({
+      type: "executeQuery",
+      payload: { queryText, operationId: "cap-case", connectionId: "active" },
+    });
+    return { query, connectionManager, view };
+  }
+
+  it.each([
+    ["pg", "UPDATE items SET id = id + 1 RETURNING *; SHOW ALL"],
+    ["mssql", "SELECT * FROM a UNION ALL SELECT * FROM b; EXEC report"],
+    ["sqlite", "UPDATE items SET id = id + 1 RETURNING *; PRAGMA user_version"],
+  ])("passes original %s SQL and its collection budget to a capable driver", async (dialect, original) => {
+    const actual = await vi.importActual<
+      typeof import("../../src/extension/utils/queryResultFormatting")
+    >("../../src/extension/utils/queryResultFormatting");
+    formatQueryResult.mockImplementation(actual.formatQueryResult);
+    const { query, connectionManager, view } = await executeSqlCapCase(
+      dialect,
+      original,
+      true,
+    );
+    expect(query).toHaveBeenCalledWith(original, undefined, {
+      requestToken: 1,
+      hardCap: 11,
+    });
+    expect(connectionManager.addToHistory).toHaveBeenCalledWith(
+      "active",
+      original,
+    );
+    expect(view.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "queryResult",
+        payload: expect.objectContaining({
+          rowCount: 100,
+          affectedRows: 100,
+          truncated: true,
+          truncatedAt: 10,
+        }),
+      }),
+    );
+  });
+
+  it.each([
+    "SHOW VARIABLES",
+    "EXPLAIN SELECT 1",
+    "CALL report()",
+    "SELECT * FROM items FOR UPDATE",
+    "SELECT * FROM items LOCK IN SHARE MODE",
+    "SELECT 1; UPDATE items SET id = id + 1",
+  ])("passes MySQL SQL unchanged using the production driver's capability: %s", async (original) => {
+    const { MySQLDriver } = await import("../../src/extension/dbDrivers/mysql");
+    const driver = new MySQLDriver({
+      id: "mysql",
+      name: "MySQL",
+      type: "mysql",
+    });
+    const { query, view } = await executeSqlCapCase(
+      "mysql",
+      original,
+      driver.getCapabilities().boundedQueryResults,
+    );
+    expect(query).toHaveBeenCalledWith(original, undefined, {
+      requestToken: 1,
+      hardCap: 11,
+    });
+    expect(view.setLastQueryResult).toHaveBeenCalled();
+  });
+
+  it("passes native Oracle PL/SQL unchanged using the production driver's capability", async () => {
+    const { OracleDriver } = await import(
+      "../../src/extension/dbDrivers/oracle"
+    );
+    const driver = new OracleDriver({
+      id: "oracle",
+      name: "Oracle",
+      type: "oracle",
+    });
+    const original =
+      "DECLARE c SYS_REFCURSOR; BEGIN OPEN c FOR SELECT q'[a;b]' FROM dual; DBMS_SQL.RETURN_RESULT(c); END;\n/\nUPDATE items SET id = id + 1";
+    const { query, connectionManager, view } = await executeSqlCapCase(
+      "oracle",
+      original,
+      driver.getCapabilities().boundedQueryResults,
+    );
+    expect(query).toHaveBeenCalledWith(original, undefined, {
+      requestToken: 1,
+      hardCap: 11,
+    });
+    expect(connectionManager.addToHistory).toHaveBeenCalledWith(
+      "active",
+      original,
+    );
+    expect(view.setLastQueryResult).toHaveBeenCalled();
+  });
+
+  it.each([
+    "pg",
+    "mysql",
+    "sqlite",
+    "mssql",
+    "oracle",
+  ])("executes a bounded standard CTE on %s, preserving original history", async (dialect) => {
+    const prefix = "WITH src AS (SELECT id FROM items) ";
+    const original = `${prefix}SELECT id FROM src ORDER BY id; -- comment`;
+    const { query, connectionManager, view } = await executeSqlCapCase(
+      dialect,
+      original,
+    );
+    const expected =
+      prefix +
+      (dialect === "mssql"
+        ? "SELECT TOP (11) id FROM src ORDER BY id"
+        : dialect === "oracle"
+          ? "SELECT * FROM (SELECT id FROM src ORDER BY id) rapidb_query_cap FETCH FIRST 11 ROWS ONLY"
+          : dialect === "pg"
+            ? "SELECT * FROM (SELECT id FROM src ORDER BY id) AS rapidb_query_cap LIMIT 11"
+            : "SELECT id FROM src ORDER BY id LIMIT 11");
+    expect(query).toHaveBeenCalledWith(expected, undefined, {
+      requestToken: 1,
+    });
+    expect(connectionManager.addToHistory).toHaveBeenCalledWith(
+      "active",
+      original,
+    );
+    expect(view.setLastQueryResult).toHaveBeenCalled();
+    expect(view.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "queryResult",
+        payload: expect.objectContaining({ operationId: "cap-case" }),
+      }),
+    );
+  });
+
+  it.each([
+    [
+      "pg",
+      "((SELECT * FROM items))",
+      "SELECT * FROM (SELECT * FROM items) AS rapidb_query_cap LIMIT 11",
+    ],
+    [
+      "pg",
+      "TABLE items",
+      "SELECT * FROM (TABLE items) AS rapidb_query_cap LIMIT 11",
+    ],
+    ["pg", "INSERT INTO items VALUES (1)", "INSERT INTO items VALUES (1)"],
+    [
+      "mysql",
+      "SET STATEMENT max_statement_time = 1 FOR SELECT * FROM items",
+      "SET STATEMENT max_statement_time = 1 FOR SELECT * FROM items LIMIT 11",
+    ],
+    ["mssql", "UPDATE items SET id = 1", "UPDATE items SET id = 1"],
+    ["sqlite", "CREATE TABLE items (id int)", "CREATE TABLE items (id int)"],
+    [
+      "pg",
+      "INSERT INTO items VALUES (1); SELECT * FROM items",
+      "INSERT INTO items VALUES (1)\n;\nSELECT * FROM ( SELECT * FROM items) AS rapidb_query_cap LIMIT 11",
+    ],
+    [
+      "mysql",
+      "INSERT INTO items VALUES (1); SELECT * FROM items",
+      "INSERT INTO items VALUES (1)\n;\n SELECT * FROM items LIMIT 11",
+    ],
+    [
+      "oracle",
+      "INSERT INTO items VALUES (1); SELECT * FROM items",
+      "INSERT INTO items VALUES (1)\n;\nSELECT * FROM ( SELECT * FROM items) rapidb_query_cap FETCH FIRST 11 ROWS ONLY",
+    ],
+    [
+      "pg",
+      "DELETE FROM items RETURNING *",
+      "WITH rapidb_returning_cap AS (DELETE FROM items RETURNING *) SELECT * FROM rapidb_returning_cap LIMIT 11",
+    ],
+  ])("executes the supported %s path: %s", async (dialect, original, expected) => {
+    const { query } = await executeSqlCapCase(dialect, original);
+    expect(query).toHaveBeenCalledWith(expected, undefined, {
+      requestToken: 1,
+    });
+  });
+
+  it.each([
+    ["pg", "INSERT INTO items VALUES (1); EXPLAIN SELECT * FROM items"],
+    [
+      "sqlite",
+      "INSERT INTO items VALUES (1); UPDATE items SET id = 2 RETURNING *",
+    ],
+    ["pg", "WITH c AS (SELECT 1) INSERT INTO items SELECT * FROM c"],
+    ["mysql", "INSERT INTO items VALUES (1); SHOW TABLES"],
+    ["mysql", "SET STATEMENT max_statement_time = 1 FOR SHOW TABLES"],
+    ["sqlite", "UPDATE items SET id = 2 RETURNING *"],
+    ["mssql", "INSERT INTO items VALUES (1) SELECT * FROM items"],
+    ["mssql", "INSERT INTO items VALUES (1) (SELECT * FROM items)"],
+    ["mssql", "SELECT * FROM items (SELECT * FROM items)"],
+    [
+      "mssql",
+      "WITH c AS (SELECT id FROM items) SELECT * FROM c SELECT * FROM items",
+    ],
+    ["mssql", "UPDATE items SET id = 2 OUTPUT inserted.*"],
+    ["oracle", "INSERT INTO items VALUES (1); CALL report()"],
+  ])("rejects %s unbounded SQL before driver, history, or connection side effects: %s", async (dialect, original) => {
+    const { query, connectionManager, view } = await executeSqlCapCase(
+      dialect,
+      original,
+    );
+    expect(query).not.toHaveBeenCalled();
+    expect(connectionManager.connectTo).not.toHaveBeenCalled();
+    expect(connectionManager.addToHistory).not.toHaveBeenCalled();
+    expect(view.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "queryResult",
+        payload: expect.objectContaining({
+          error: expect.stringContaining("cannot be safely bounded"),
+          operationId: "cap-case",
+        }),
+      }),
+    );
+  });
+
   it("rejects WITH queries that cannot be safely hard-capped", async () => {
     const query = vi.fn(async () => ({
       columns: ["id"],
@@ -339,7 +721,7 @@ describe("QueryPanelController", () => {
     await controller.handleMessage({
       type: "executeQuery",
       payload: {
-        queryText: "with src as (select * from users) select * from src",
+        queryText: "with src as (select 1) insert into users select * from src",
       },
     });
 
@@ -348,8 +730,7 @@ describe("QueryPanelController", () => {
       expect.objectContaining({
         type: "queryResult",
         payload: expect.objectContaining({
-          error:
-            "[RapiDB] This query cannot be safely bounded by the configured row limit.",
+          error: expect.stringContaining("cannot be safely bounded"),
         }),
       }),
     );

@@ -4,7 +4,6 @@ import {
   isConnectionTlsEnabled,
   resolveConnectionTlsMode,
 } from "../shared/connectionConfig";
-import { isDataDbObjectKind } from "../shared/dbObjectKinds";
 import {
   type BookmarkEntry,
   type ConnectAttempt,
@@ -64,6 +63,14 @@ import {
   resolveDriverTableSectionAvailability,
 } from "./dbDrivers/types";
 import type { DriverConnectionConfig } from "./driverRuntimeConfig";
+import {
+  type DatabaseLoadMode,
+  type DatabaseScopeLoadResult,
+  loadConnectionRootCatalog,
+  loadDatabaseScope,
+  loadSchemaScope,
+  PartialSchemaLoadError,
+} from "./schema/schemaLoaders";
 import { ConnectionValidationService } from "./services/connectionValidationService";
 import {
   type ConnectionSshSettings,
@@ -71,7 +78,6 @@ import {
   type SshRuntime,
   type SshRuntimeRequest,
 } from "./services/sshRuntime";
-import { pMapWithLimit } from "./utils/concurrency";
 import { normalizeUnknownError } from "./utils/errorHandling";
 
 export type {
@@ -119,13 +125,6 @@ interface ConnectionSchemaCacheEntry extends SchemaSnapshotState {
   scopes: Map<SchemaScopeKey, InternalScopedSchemaCacheEntry>;
   expandedScopeKeys: Set<SchemaScopeKey>;
 }
-
-interface DatabaseScopeLoadResult {
-  database: SchemaSnapshotDatabaseEntry;
-  loadedSchemas: SchemaSnapshotSchemaEntry[];
-}
-
-type DatabaseLoadMode = "baseline" | "expanded";
 
 const CONNECTION_ROOT_SCOPE: ExplorerSchemaScope = { kind: "connectionRoot" };
 
@@ -664,10 +663,16 @@ function deriveAggregateSchemaState(
     }
   }
 
-  return {
-    status: "loaded",
-    isPartial: false,
-  };
+  const failedScope = [...entry.scopes.values()].find(
+    (scope) => scope.status === "error",
+  );
+  return failedScope
+    ? {
+        status: "error",
+        isPartial: snapshot.databases.length > 0,
+        error: failedScope.error,
+      }
+    : { status: "loaded", isPartial: false };
 }
 
 function flattenSchemaSnapshot(snapshot: SchemaSnapshot): SchemaObjectEntry[] {
@@ -1317,7 +1322,7 @@ export class ConnectionManager
 
     const ssh = config.ssh;
     const host = ssh.host?.trim();
-    const port = ssh.port;
+    const port = ssh.port ?? 22;
     const username = ssh.username?.trim();
     const fingerprintSha256 = ssh.hostFingerprintSha256?.trim();
     const hostVerificationMode =
@@ -1711,10 +1716,15 @@ export class ConnectionManager
       this.resolveSshRuntimeRequest(config),
     );
 
-    return {
-      config: this.applySshRuntimeToConfig(config, runtime),
-      runtime,
-    };
+    try {
+      return {
+        config: this.applySshRuntimeToConfig(config, runtime),
+        runtime,
+      };
+    } catch (error) {
+      await this.disposeUnboundConnectionResources(undefined, runtime);
+      throw error;
+    }
   }
 
   private async persistTrustedSshFingerprintIfNeeded(
@@ -1779,23 +1789,22 @@ export class ConnectionManager
     runtime?: SshRuntime;
   }> {
     const prepared = await this.prepareDriverConfig(config);
-    if (prepared.runtime) {
-      await this.persistTrustedSshFingerprintIfNeeded(
-        id,
-        prepared.runtime.verifiedFingerprintSha256,
-      );
-    }
-
-    const driver = this.createDriver(prepared.config);
+    let driver: IDBDriver | undefined;
 
     const onAbort = () => {
-      void driver.disconnect().catch(() => undefined);
+      void driver?.disconnect().catch(() => undefined);
     };
-    signal.addEventListener("abort", onAbort);
 
     try {
+      if (prepared.runtime) {
+        await this.persistTrustedSshFingerprintIfNeeded(
+          id,
+          prepared.runtime.verifiedFingerprintSha256,
+        );
+      }
+      driver = this.createDriver(prepared.config);
+      signal.addEventListener("abort", onAbort);
       if (signal.aborted) {
-        await this.disposeUnboundConnectionResources(driver, prepared.runtime);
         throw new DOMException("Aborted", "AbortError");
       }
       await Promise.race([
@@ -2200,7 +2209,14 @@ export class ConnectionManager
           return;
         }
 
-        if (schemaEntry.status === "error") {
+        if (
+          schemaEntry.status === "error" &&
+          !schemaEntry.fragment.schema?.objects.some(
+            (object) =>
+              object.name === request.table &&
+              object.type === request.objectKind,
+          )
+        ) {
           tableDetailEntry.status = "error";
           tableDetailEntry.error =
             schemaEntry.error ??
@@ -2389,7 +2405,7 @@ export class ConnectionManager
         ];
 
     for (const nextConnectionId of connectionIds) {
-      this._invalidateSchemaState(nextConnectionId);
+      this._invalidateSchemaState(nextConnectionId, true);
       this._restoreExpandedSchemaLoads(nextConnectionId);
     }
 
@@ -2428,12 +2444,42 @@ export class ConnectionManager
     return expandedScopeKeys;
   }
 
-  private _invalidateSchemaState(connectionId: string): void {
+  private _invalidateSchemaState(
+    connectionId: string,
+    retainSnapshot = false,
+  ): void {
+    const previous = retainSnapshot
+      ? this._schemaCacheMap.get(connectionId)
+      : undefined;
     this._schemaGenerationMap.set(
       connectionId,
       this._getSchemaGeneration(connectionId) + 1,
     );
     this._schemaCacheMap.delete(connectionId);
+    if (previous) {
+      const next = createConnectionSchemaCacheEntry(
+        this._getSchemaGeneration(connectionId),
+        this._getExpandedScopeKeys(connectionId),
+        previous.defaultDatabaseName,
+      );
+      for (const scope of previous.scopes.values()) {
+        if (!scope.retainOnCollapse && !next.expandedScopeKeys.has(scope.key)) {
+          continue;
+        }
+        next.scopes.set(
+          scope.key,
+          createScopedSchemaCacheEntry(
+            scope.scope,
+            next.generation,
+            { snapshot: scope.snapshot, status: "idle", isPartial: true },
+            scope.fragment,
+            scope.retainOnCollapse,
+          ),
+        );
+      }
+      next.snapshot = cloneSchemaSnapshot(previous.snapshot);
+      this._schemaCacheMap.set(connectionId, next);
+    }
     this._onDidChangeSchemaState.fire(connectionId);
   }
 
@@ -2594,12 +2640,27 @@ export class ConnectionManager
     entry: ConnectionSchemaCacheEntry,
     scopeEntry: InternalScopedSchemaCacheEntry,
     err: unknown,
+    commit = true,
   ): void {
+    if (
+      err instanceof PartialSchemaLoadError &&
+      scopeEntry.scope.kind === "schema"
+    ) {
+      const schema = err.withCachedColumns(scopeEntry.fragment.schema);
+      scopeEntry.snapshot = createScopeSnapshotForSchema(
+        scopeEntry.scope.database,
+        schema,
+      );
+      scopeEntry.fragment = { schema };
+    }
     const error = normalizeUnknownError(err);
     scopeEntry.status = "error";
+    scopeEntry.fullyLoaded = false;
     scopeEntry.isPartial = scopeEntry.snapshot.databases.length > 0;
     scopeEntry.error = error.message;
-    this._commitAggregateSchemaState(connectionId, entry);
+    if (commit) {
+      this._commitAggregateSchemaState(connectionId, entry);
+    }
   }
 
   private _commitAggregateSchemaState(
@@ -2672,7 +2733,10 @@ export class ConnectionManager
       return;
     }
 
-    if (rootEntry.status === "error" && !allowRetry) {
+    if (
+      (rootEntry.status === "error" || baselineEntry?.status === "error") &&
+      !allowRetry
+    ) {
       return;
     }
 
@@ -2696,6 +2760,17 @@ export class ConnectionManager
         rootEntry.isPartial = false;
         rootEntry.fullyLoaded = true;
         delete rootEntry.error;
+        const databaseNames = new Set(
+          catalogSnapshot.databases.map((database) => database.name),
+        );
+        for (const [key, cached] of entry.scopes) {
+          if (
+            cached.scope.kind !== "connectionRoot" &&
+            !databaseNames.has(cached.scope.database)
+          ) {
+            entry.scopes.delete(key);
+          }
+        }
 
         if (defaultDatabaseName) {
           const defaultDatabaseEntry = this._getOrCreateScopeEntry(
@@ -2863,6 +2938,18 @@ export class ConnectionManager
         databaseEntry.fullyLoaded =
           loadMode === "baseline" || result.database.schemas.length <= 1;
         delete databaseEntry.error;
+        const schemaNames = new Set(
+          result.database.schemas.map((schema) => schema.name),
+        );
+        for (const [key, cached] of entry.scopes) {
+          if (
+            cached.scope.kind === "schema" &&
+            cached.scope.database === databaseName &&
+            !schemaNames.has(cached.scope.schema)
+          ) {
+            entry.scopes.delete(key);
+          }
+        }
 
         for (const schema of result.loadedSchemas) {
           this._upsertLoadedSchemaScope(
@@ -2870,6 +2957,45 @@ export class ConnectionManager
             databaseName,
             schema,
             retainOnCollapse,
+          );
+        }
+
+        for (const failed of result.failedSchemas ?? []) {
+          const schemaEntry = this._getOrCreateScopeEntry(
+            entry,
+            { kind: "schema", database: databaseName, schema: failed.name },
+            retainOnCollapse,
+          );
+          this._markScopeLoadError(
+            connectionId,
+            entry,
+            schemaEntry,
+            failed.error,
+            false,
+          );
+        }
+        if (result.failedSchemas?.length) {
+          // Child fragments include retained columns/catalogs from earlier loads.
+          const database = buildAggregateSchemaSnapshot(entry).databases.find(
+            (database) => database.name === databaseName,
+          );
+          if (database) {
+            databaseEntry.snapshot = createScopeSnapshotForDatabase(database);
+            databaseEntry.fragment = { database };
+          }
+          this._markScopeLoadError(
+            connectionId,
+            entry,
+            databaseEntry,
+            new Error(
+              result.failedSchemas
+                .map(
+                  (failed) =>
+                    `${failed.name}: ${normalizeUnknownError(failed.error).message}`,
+                )
+                .join("; "),
+            ),
+            false,
           );
         }
 
@@ -3001,25 +3127,7 @@ export class ConnectionManager
     catalogSnapshot: SchemaSnapshot;
     defaultDatabaseName: string;
   }> {
-    const configuredDb = getConfiguredDefaultDatabaseName(config);
-    const allDbs = await driver.listDatabases().catch(() => []);
-    const databaseNames = [
-      ...new Set(
-        [configuredDb, ...allDbs.map((database) => database.name)].filter(
-          (name): name is string => typeof name === "string" && name.length > 0,
-        ),
-      ),
-    ];
-
-    return {
-      catalogSnapshot: {
-        databases: databaseNames.map((databaseName) => ({
-          name: databaseName,
-          schemas: [],
-        })),
-      },
-      defaultDatabaseName: configuredDb || databaseNames[0] || "",
-    };
+    return loadConnectionRootCatalog(driver, config);
   }
 
   private async _loadDatabaseScopeInternal(
@@ -3027,61 +3135,7 @@ export class ConnectionManager
     databaseName: string,
     loadMode: DatabaseLoadMode,
   ): Promise<DatabaseScopeLoadResult> {
-    const schemas = await driver.listSchemas(databaseName).catch(() => []);
-    const schemaNames = [
-      ...new Set(
-        (schemas.length > 0 ? schemas : [{ name: databaseName }])
-          .map((schema) => schema.name)
-          .filter(
-            (name): name is string =>
-              typeof name === "string" && name.length > 0,
-          ),
-      ),
-    ];
-
-    if (schemaNames.length <= 1) {
-      const schema = await this._loadSchemaScopeInternal(
-        driver,
-        databaseName,
-        schemaNames[0] ?? databaseName,
-      );
-
-      return {
-        database: {
-          name: databaseName,
-          schemas: [schema],
-        },
-        loadedSchemas: [schema],
-      };
-    }
-
-    if (loadMode === "expanded") {
-      return {
-        database: {
-          name: databaseName,
-          schemas: schemaNames.map((schemaName) => ({
-            name: schemaName,
-            objects: [],
-          })),
-        },
-        loadedSchemas: [],
-      };
-    }
-
-    const loadedSchemas = await pMapWithLimit(
-      schemaNames,
-      4,
-      async (schemaName) =>
-        this._loadSchemaScopeInternal(driver, databaseName, schemaName),
-    );
-
-    return {
-      database: {
-        name: databaseName,
-        schemas: loadedSchemas,
-      },
-      loadedSchemas,
-    };
+    return loadDatabaseScope(driver, databaseName, loadMode);
   }
 
   private async _loadSchemaScopeInternal(
@@ -3089,52 +3143,7 @@ export class ConnectionManager
     databaseName: string,
     schemaName: string,
   ): Promise<SchemaSnapshotSchemaEntry> {
-    const manifest = resolveDriverEntityManifest(driver);
-    const supportedKinds = new Set(manifest.dbObjectKinds);
-    const objects = await driver
-      .listObjects(databaseName, schemaName)
-      .catch(() => []);
-    const objectsForSchema = objects.filter((object) =>
-      supportedKinds.has(object.type),
-    );
-    const describedColumns = await pMapWithLimit(
-      objectsForSchema,
-      10,
-      async (object) => {
-        if (!isDataDbObjectKind(object.type)) {
-          return [];
-        }
-
-        try {
-          return await driver.describeTable(
-            databaseName,
-            schemaName,
-            object.name,
-          );
-        } catch {
-          return [];
-        }
-      },
-    );
-
-    return {
-      name: schemaName,
-      objects: objectsForSchema.map<SchemaSnapshotObjectEntry>(
-        (object, index) => ({
-          name: object.name,
-          type: object.type,
-          ...(object.routineIdentity
-            ? { routineIdentity: object.routineIdentity }
-            : {}),
-          columns: isDataDbObjectKind(object.type)
-            ? describedColumns[index].map((column) => ({
-                name: column.name,
-                type: column.type,
-              }))
-            : [],
-        }),
-      ),
-    };
+    return loadSchemaScope(driver, databaseName, schemaName);
   }
 
   private async _loadTableDetailInternal(
@@ -3269,22 +3278,18 @@ export class ConnectionManager
       };
     }
     let runtime: SshRuntime | undefined;
-    const prepared = await this.prepareDriverConfig(configWithId);
-    runtime = prepared.runtime;
-    const driver = this.createDriver(prepared.config);
+    let driver: IDBDriver | undefined;
     try {
+      const prepared = await this.prepareDriverConfig(configWithId);
+      runtime = prepared.runtime;
+      driver = this.createDriver(prepared.config);
       await driver.connect();
       return { success: true };
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
       return { success: false, error: error.message };
     } finally {
-      try {
-        await driver.disconnect();
-      } catch {}
-      if (runtime) {
-        await runtime.dispose().catch(() => undefined);
-      }
+      await this.disposeUnboundConnectionResources(driver, runtime);
     }
   }
   async disconnectAll(): Promise<void> {

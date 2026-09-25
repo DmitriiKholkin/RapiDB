@@ -310,6 +310,22 @@ describe("parseDynamoDbNativeQueryInput", () => {
 });
 
 describe("DynamoDBDriver native API", () => {
+  it.each([
+    '{"TableName":}',
+    '{"TableName":}{"TableName":"users"}',
+    '{"TableName":"users"}{"TableName":}',
+    '{"TableName":"users"}{"TableName":',
+  ])("wraps malformed JSON and executes no part of %s", async (text) => {
+    const { driver, clientSend } = createDriver();
+    expect(() => parseDynamoDbNativeQueryInputs(text)).toThrow(
+      /^DynamoDB native query text must be valid JSON\./,
+    );
+    await expect(driver.query(text)).rejects.toThrow(
+      /^DynamoDB native query text must be valid JSON\./,
+    );
+    expect(clientSend).not.toHaveBeenCalled();
+  });
+
   it("executes native JSON queries from the editor", async () => {
     const { driver, clientSend, queueResponses } = createDriver();
     queueResponses({

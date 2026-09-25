@@ -19,6 +19,8 @@ import {
   isoToLocalDateStr,
   normalizeSqlDatetimeOffsetSpacing,
 } from "./BaseDBDriver";
+import { queryCollectionLimit } from "./boundedQueryRows";
+import { BoundedPostgresQuery } from "./postgresBoundedQuery";
 import {
   type DriverTimeoutSettingsProvider,
   throwIfTransactionCancelled,
@@ -35,6 +37,7 @@ import type {
   PaginationResult,
   PersistedEditCheckOptions,
   PersistedEditCheckResult,
+  QueryExecutionOptions,
   QueryResult,
   SchemaInfo,
   TableInfo,
@@ -880,8 +883,9 @@ export class PostgresDriver extends BaseDBDriver {
   async query(
     sql: string,
     params?: unknown[],
-    operationContext?: { requestToken?: number; readOnly?: boolean },
+    operationContext?: QueryExecutionOptions,
   ): Promise<QueryResult> {
+    const hardCap = queryCollectionLimit(operationContext?.hardCap);
     type PgArrayField = {
       name: string;
     };
@@ -889,6 +893,7 @@ export class PostgresDriver extends BaseDBDriver {
       fields?: PgArrayField[];
       rows?: unknown[][];
       rowCount?: number | null;
+      command?: string;
     };
     const start = Date.now();
     const operation: PostgresQueryOperation = {
@@ -909,11 +914,37 @@ export class PostgresDriver extends BaseDBDriver {
       if (operationContext?.readOnly) {
         await client.query("BEGIN READ ONLY");
       }
-      const res = await client.query({
-        text: sql,
-        values: params ?? [],
-        rowMode: "array",
-      });
+      const queryClient = client;
+      let truncated = false;
+      const res =
+        hardCap === undefined
+          ? await client.query({
+              text: sql,
+              values: params ?? [],
+              rowMode: "array",
+            })
+          : await new Promise<PgArrayQueryResult>((resolve, reject) => {
+              const query = new BoundedPostgresQuery(
+                sql,
+                params ?? [],
+                hardCap,
+                (error, result) => {
+                  if (error) {
+                    reject(error);
+                    return;
+                  }
+                  truncated = query.retained.truncated;
+                  resolve({
+                    ...result,
+                    rows: query.retained.rows,
+                    // SHOW/EXPLAIN command tags omit a row count. The stream
+                    // still observes the complete result, not just its sample.
+                    rowCount: result?.rowCount ?? query.retained.rowCount,
+                  });
+                },
+              );
+              queryClient.query(query);
+            });
       const executionTimeMs = Date.now() - start;
       const result = (
         Array.isArray(res) ? res[res.length - 1] : res
@@ -939,10 +970,29 @@ export class PostgresDriver extends BaseDBDriver {
         rows,
         rowCount: result.rowCount ?? rawRows.length,
         executionTimeMs,
+        ...(hardCap !== undefined ? { truncated } : {}),
+        ...(hardCap !== undefined &&
+        ["INSERT", "UPDATE", "DELETE", "MERGE"].includes(result.command ?? "")
+          ? { affectedRows: result.rowCount ?? 0 }
+          : {}),
       };
       return queryResult;
+    } catch (error) {
+      // A read timeout can fire before ReadyForQuery. Never return that socket
+      // to the pool while the server is still emitting the timed-out result.
+      if (
+        hardCap !== undefined &&
+        client &&
+        this.activeQueryClients.delete(client)
+      )
+        client.release(true);
+      throw error;
     } finally {
-      if (client && operationContext?.readOnly) {
+      if (
+        client &&
+        this.activeQueryClients.has(client) &&
+        operationContext?.readOnly
+      ) {
         await client.query("ROLLBACK").catch(() => undefined);
       }
       this.activeQueryOperations.delete(operation);
@@ -950,6 +1000,9 @@ export class PostgresDriver extends BaseDBDriver {
         client.release();
       }
     }
+  }
+  override getCapabilities() {
+    return { ...super.getCapabilities(), boundedQueryResults: true };
   }
 
   private async waitForQueryConnection(
@@ -2142,6 +2195,11 @@ export class PostgresDriver extends BaseDBDriver {
       const parts = val.split(",").map((s) => s.trim());
       const placeholders = parts.map((_, i) => `$${paramIndex + i}`).join(", ");
       return { sql: `${col} IN (${placeholders})`, params: parts };
+    }
+    if (operator !== "like" && operator !== "ilike") {
+      throw new Error(
+        `[RapiDB Filter] Column ${column.name} does not support ${operator} filters for ${column.category} values.`,
+      );
     }
     const v = typeof val === "string" ? val : val[0];
     const finalVal = normalizeTemporalSearchValue(v);

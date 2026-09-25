@@ -60,9 +60,11 @@ export function TableView({
       primaryKeyColumns: readonly string[],
     ) => void;
     resetForTableInit: () => void;
+    handleReadFailed: () => void;
   }>({
     handleRowsCommitted: () => undefined,
     resetForTableInit: () => undefined,
+    handleReadFailed: () => undefined,
   });
 
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -86,6 +88,7 @@ export function TableView({
     fetchPageRef,
     preserveScrollPositionRef,
     onTableInit: () => mutationBridgeRef.current.resetForTableInit(),
+    onReadFailed: () => mutationBridgeRef.current.handleReadFailed(),
     onRowsCommitted: (rows, primaryKeyColumns) =>
       mutationBridgeRef.current.handleRowsCommitted(rows, primaryKeyColumns),
   });
@@ -96,6 +99,7 @@ export function TableView({
 
   const mutation = useTableMutationController({
     canEditRows,
+    loadingRef: data.loadingRef,
     columnsRef,
     fetchPageRef,
     pkColsRef,
@@ -106,6 +110,7 @@ export function TableView({
 
   mutationBridgeRef.current.resetForTableInit = mutation.resetForTableInit;
   mutationBridgeRef.current.handleRowsCommitted = mutation.handleRowsCommitted;
+  mutationBridgeRef.current.handleReadFailed = mutation.handleReadFailed;
 
   useEffect(() => {
     void data.rows;
@@ -128,10 +133,10 @@ export function TableView({
     !data.readOnlyTable &&
     data.isInitialized &&
     !hasPrimaryKey;
-  const mutationBusy =
-    mutation.applying || mutation.deleting || mutation.inserting;
+  const mutationBusy = data.loading || mutation.applying || mutation.deleting;
   const canLoadDifferentRows = unsavedRowCount === 0 && !mutationBusy;
   const guardRowNavigation = (action: () => void) => {
+    if (data.loadingRef.current) return;
     if (!canLoadDifferentRows) {
       mutation.blockNavigationWithUnsavedChanges();
       return;
@@ -235,7 +240,7 @@ export function TableView({
       <TableMutationStatusBar
         applyStatus={mutation.applyStatus}
         applying={mutation.applying}
-        inserting={mutation.inserting}
+        loading={data.loading}
         insertValueCount={insertValueCount}
         mutErr={mutation.mutErr}
         newRowExists={mutation.newRows.length > 0}
@@ -262,6 +267,8 @@ export function TableView({
         editCell={mutation.editCell}
         filterDrafts={data.filterDrafts}
         loading={data.loading}
+        loadingRef={data.loadingRef}
+        fetchEpochRef={data.fetchEpochRef}
         newRows={mutation.newRows}
         onCancelEdit={() => mutation.setEditCell(null)}
         onBatchCellEdit={mutation.commitBatchCellEdits}

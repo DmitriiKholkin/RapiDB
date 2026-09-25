@@ -1,5 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { MSSQLDriver } from "../../../src/extension/dbDrivers/mssql";
+import { PostgresDriver } from "../../../src/extension/dbDrivers/postgres";
 import type { ColumnTypeMeta } from "../../../src/extension/dbDrivers/types";
+import { applyHardCapToSqlQuery } from "../../../src/extension/utils/sqlHardCap";
 import type { DbEngineId } from "../../contracts/testingContracts";
 import {
   createLiveDriverHarness,
@@ -183,6 +186,449 @@ export function registerLiveDriverConformanceTests(
     afterAll(async () => {
       await disposeLiveDriverHarness(harness);
     });
+
+    if (["postgres", "mssql", "sqlite"].includes(engineId)) {
+      it("collects original SQL with a driver-owned row budget and exact result counts", async () => {
+        expect(harness.driver.getCapabilities?.().boundedQueryResults).toBe(
+          true,
+        );
+        const source =
+          "WITH src(n) AS (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) SELECT n AS same, n + 10 AS same FROM src ORDER BY n";
+        const result = await harness.driver.query(source, undefined, {
+          hardCap: 2,
+        });
+        expect(result).toMatchObject({
+          columns: ["same", "same"],
+          rowCount: 4,
+          truncated: true,
+        });
+        expect(
+          result.rows.map((row) => [Number(row.__col_0), Number(row.__col_1)]),
+        ).toEqual([
+          [1, 11],
+          [2, 12],
+        ]);
+        const empty = await harness.driver.query(
+          "SELECT 1 AS empty_result WHERE 1=0",
+          undefined,
+          { hardCap: 2 },
+        );
+        expect(empty).toMatchObject({
+          columns: ["empty_result"],
+          rows: [],
+          rowCount: 0,
+          truncated: false,
+        });
+        const parameterized = await harness.driver.query(
+          engineId === "postgres"
+            ? "SELECT $1::int AS bound_value"
+            : "SELECT ? AS bound_value",
+          [7],
+          { hardCap: 2 },
+        );
+        expect(parameterized).toMatchObject({
+          columns: ["bound_value"],
+          rowCount: 1,
+          truncated: false,
+        });
+        expect(Number(parameterized.rows[0].__col_0)).toBe(7);
+      });
+
+      it("finishes native mutations and RETURNING/OUTPUT after the retained row budget fills", async () => {
+        const table = harness.driver.qualifiedTableName(
+          harness.databaseName,
+          harness.schemaName,
+          `rapidb_stream_probe_${Date.now()}`,
+        );
+        await harness.driver.query(`CREATE TABLE ${table} (id INTEGER)`);
+        try {
+          const statements =
+            engineId === "mssql"
+              ? [
+                  `INSERT INTO ${table} (id) OUTPUT inserted.id VALUES (1), (2), (3), (4), (5)`,
+                  `UPDATE ${table} SET id = id + 100 OUTPUT inserted.id`,
+                  `DELETE FROM ${table} OUTPUT deleted.id`,
+                ]
+              : [
+                  `INSERT INTO ${table} (id) VALUES (1), (2), (3), (4), (5) RETURNING id`,
+                  `UPDATE ${table} SET id = id + 100 RETURNING id`,
+                  `DELETE FROM ${table} RETURNING id`,
+                ];
+          for (let index = 0; index < statements.length; index++) {
+            const result = await harness.driver.query(
+              statements[index],
+              undefined,
+              { hardCap: 2 },
+            );
+            expect(result.rows).toHaveLength(2);
+            expect(result).toMatchObject({
+              rowCount: 5,
+              affectedRows: 5,
+              truncated: true,
+            });
+            const state = await harness.driver.query(
+              `SELECT COUNT(*) AS count_value, SUM(id) AS sum_value FROM ${table}`,
+            );
+            expect(Number(state.rows[0].__col_0)).toBe(index === 2 ? 0 : 5);
+            if (index === 1) expect(Number(state.rows[0].__col_1)).toBe(515);
+          }
+        } finally {
+          await harness.driver.query(`DROP TABLE ${table}`);
+        }
+      });
+    }
+
+    if (engineId === "postgres") {
+      it("drains many native PostgreSQL result sets and returns only the bounded last command", async () => {
+        const source = Array.from(
+          { length: 25 },
+          (_, i) => `SELECT ${i} AS batch_number, generate_series(1, 500) AS n`,
+        ).join("; ");
+        const result = await harness.driver.query(source, undefined, {
+          hardCap: 3,
+        });
+        expect(result).toMatchObject({ rowCount: 500, truncated: true });
+        expect(result.rows).toEqual([
+          { __col_0: 24, __col_1: 1 },
+          { __col_0: 24, __col_1: 2 },
+          { __col_0: 24, __col_1: 3 },
+        ]);
+        for (const sql of [
+          "SHOW ALL",
+          "EXPLAIN SELECT * FROM generate_series(1, 20) AS n WHERE n > 0 ORDER BY n",
+        ]) {
+          const full = await harness.driver.query(sql);
+          const bounded = await harness.driver.query(sql, undefined, {
+            hardCap: 2,
+          });
+          expect(full.rows.length).toBeGreaterThan(2);
+          expect(bounded).toMatchObject({
+            rowCount: full.rows.length,
+            truncated: true,
+          });
+          expect(bounded.rows).toEqual(full.rows.slice(0, 2));
+        }
+      });
+    }
+
+    if (engineId === "postgres" || engineId === "mssql") {
+      it("propagates late native errors after a full budget and recovers the pool", async () => {
+        const source =
+          engineId === "postgres"
+            ? "SELECT generate_series(1, 20); DO $$ BEGIN RAISE EXCEPTION 'budget late failure'; END $$;"
+            : "WITH c(n) AS (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) SELECT n FROM c; THROW 50000, 'budget late failure', 1;";
+        await expect(
+          harness.driver.query(source, undefined, { hardCap: 2 }),
+        ).rejects.toThrow("budget late failure");
+        const next = await harness.driver.query(
+          "SELECT 7 AS recovered",
+          undefined,
+          { hardCap: 2 },
+        );
+        expect(Number(next.rows[0].__col_0)).toBe(7);
+        expect(next.truncated).toBe(false);
+      });
+
+      if (transport === "direct") {
+        it("keeps native timeouts effective during bounded draining and recovers afterward", async () => {
+          const timeouts = () => ({
+            connectionTimeoutSeconds: 5,
+            connectionTimeoutMs: 5000,
+            dbOperationTimeoutSeconds: 1,
+            dbOperationTimeoutMs: 1000,
+          });
+          const timed =
+            engineId === "postgres"
+              ? new PostgresDriver(harness.connection, timeouts)
+              : new MSSQLDriver(harness.connection, timeouts);
+          await timed.connect();
+          try {
+            const source =
+              engineId === "postgres"
+                ? "SELECT generate_series(1, 20); SELECT pg_sleep(3)"
+                : "WITH c(n) AS (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) SELECT n FROM c; WAITFOR DELAY '00:00:03';";
+            await expect(
+              timed.query(source, undefined, { hardCap: 2, requestToken: 81 }),
+            ).rejects.toThrow(/timeout|timed out|cancel/i);
+            expect(
+              Number(
+                (
+                  await timed.query("SELECT 7 AS recovered", undefined, {
+                    hardCap: 2,
+                  })
+                ).rows[0].__col_0,
+              ),
+            ).toBe(7);
+          } finally {
+            await timed.disconnect();
+          }
+        });
+      }
+    }
+
+    if (engineId === "mssql") {
+      it("bounds native trigger results and drains STATISTICS PROFILE result sets", async () => {
+        const tableName = `rapidb_trigger_budget_${Date.now()}`;
+        const table = harness.driver.qualifiedTableName(
+          harness.databaseName,
+          harness.schemaName,
+          tableName,
+        );
+        const trigger = `${harness.driver.quoteIdentifier(harness.schemaName)}.${harness.driver.quoteIdentifier(`${tableName}_trg`)}`;
+        await harness.driver.query(`CREATE TABLE ${table} (id INTEGER)`);
+        try {
+          await harness.driver.query(
+            `CREATE TRIGGER ${trigger} ON ${table} AFTER INSERT AS BEGIN SET NOCOUNT ON; SELECT inserted.id FROM inserted CROSS JOIN (VALUES (1), (2), (3), (4)) AS n(value); END`,
+          );
+          const result = await harness.driver.query(
+            `INSERT INTO ${table} VALUES (1), (2), (3), (4), (5)`,
+            undefined,
+            { hardCap: 2 },
+          );
+          expect(result).toMatchObject({ rowCount: 20, truncated: true });
+          expect(result.rows).toHaveLength(2);
+          expect(
+            Number(
+              (await harness.driver.query(`SELECT COUNT(*) FROM ${table}`))
+                .rows[0].__col_0,
+            ),
+          ).toBe(5);
+          const profile = await harness.driver.query(
+            `SET STATISTICS PROFILE ON; SELECT id FROM ${table} ORDER BY id; SET STATISTICS PROFILE OFF;`,
+            undefined,
+            { hardCap: 2 },
+          );
+          expect(profile).toMatchObject({
+            columns: ["id"],
+            rowCount: 5,
+            truncated: true,
+          });
+          expect(profile.rows).toHaveLength(2);
+          const json = await harness.driver.query(
+            `SELECT id FROM ${table} ORDER BY id FOR JSON PATH`,
+            undefined,
+            { hardCap: 1 },
+          );
+          expect(json).toMatchObject({ rowCount: 1, truncated: false });
+          expect(JSON.parse(String(json.rows[0].__col_0))).toHaveLength(5);
+          const xml = await harness.driver.query(
+            `SELECT id AS [@id] FROM ${table} ORDER BY id FOR XML PATH('item')`,
+            undefined,
+            { hardCap: 1 },
+          );
+          expect(xml).toMatchObject({ rowCount: 1, truncated: false });
+          expect(String(xml.rows[0].__col_0).match(/<item /g)).toHaveLength(5);
+        } finally {
+          await harness.driver.query(`DROP TABLE ${table}`);
+        }
+      });
+    }
+
+    it("executes query editor hard-cap SQL for standard and recursive CTEs", async () => {
+      const fromDual = engineId === "oracle" ? " FROM dual" : "";
+      const recursive = ["postgres", "mysql", "sqlite"].includes(engineId)
+        ? "RECURSIVE "
+        : "";
+      for (const source of [
+        `WITH src(n) AS (SELECT 1${fromDual} UNION ALL SELECT 2${fromDual} UNION ALL SELECT 3${fromDual}), final_src AS (SELECT n FROM src) SELECT n FROM final_src ORDER BY n`,
+        `WITH ${recursive}seq(n) AS (SELECT 1${fromDual} UNION ALL SELECT n + 1 FROM seq WHERE n < 50) SELECT n FROM seq ORDER BY n`,
+      ]) {
+        const rewrite = applyHardCapToSqlQuery(
+          source,
+          harness.connection.type,
+          2,
+        );
+        expect(rewrite.error).toBeUndefined();
+        expect(rewrite.decision.applied).toBe(true);
+        const result = await harness.driver.query(rewrite.queryText);
+        expect(result.rows).toHaveLength(2);
+        expect(result.rows.map((row) => Number(row.__col_0))).toEqual([1, 2]);
+      }
+    });
+
+    it("executes query editor hard-cap SQL for parentheses and quoted comment markers", async () => {
+      const fromDual = engineId === "oracle" ? " FROM dual" : "";
+      const source = `((SELECT ';--/* literal */' AS label${fromDual})); -- real comment`;
+      const rewrite = applyHardCapToSqlQuery(
+        source,
+        harness.connection.type,
+        2,
+      );
+      expect(rewrite.error).toBeUndefined();
+      const result = await harness.driver.query(rewrite.queryText);
+      expect(result.rows).toHaveLength(1);
+      expect(result.rows[0].__col_0).toBe(";--/* literal */");
+    });
+
+    if (engineId !== "mssql") {
+      it("executes preflighted ordinary scripts with bounded result statements", async () => {
+        const fromDual = engineId === "oracle" ? " FROM dual" : "";
+        const source = `SELECT 'first; result' AS label${fromDual}; WITH c(n) AS (SELECT 1${fromDual} UNION ALL SELECT 2${fromDual} UNION ALL SELECT 3${fromDual}) SELECT n FROM c ORDER BY n;`;
+        const rewrite = applyHardCapToSqlQuery(
+          source,
+          harness.connection.type,
+          2,
+        );
+        expect(rewrite.error).toBeUndefined();
+        const result = await harness.driver.query(rewrite.queryText);
+        expect(result.rows.map((row) => Number(row.__col_0))).toEqual([1, 2]);
+      });
+    }
+
+    if (engineId === "sqlite" || engineId === "mysql") {
+      it("preserves duplicate result names, set ordering and LIMIT offsets", async () => {
+        const prefix =
+          "WITH src(n) AS (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) ";
+        for (const suffix of ["", " LIMIT 100 OFFSET 1", " LIMIT 1, 100"]) {
+          const source = `${prefix}SELECT n AS same, n + 10 AS same FROM src ORDER BY n${suffix}`;
+          const rewrite = applyHardCapToSqlQuery(
+            source,
+            harness.connection.type,
+            2,
+          );
+          expect(rewrite.error).toBeUndefined();
+          const result = await harness.driver.query(rewrite.queryText);
+          expect(result.columns).toEqual(["same", "same"]);
+          expect(result.rows.map((row) => Number(row.__col_0))).toEqual(
+            suffix ? [2, 3] : [1, 2],
+          );
+          expect(Number(result.rows[0].__col_1)).toBe(suffix ? 12 : 11);
+        }
+        const commented = applyHardCapToSqlQuery(
+          `${prefix}SELECT n FROM src -- comment\r ORDER BY n`,
+          harness.connection.type,
+          2,
+        );
+        expect(
+          (await harness.driver.query(commented.queryText)).rows,
+        ).toHaveLength(2);
+      });
+    }
+
+    if (engineId === "sqlite") {
+      it("executes bounded metadata PRAGMAs and preserves empty-result columns", async () => {
+        for (const source of [
+          "PRAGMA main.table_info('sqlite_schema')",
+          "PRAGMA table_info = sqlite_schema",
+          "PRAGMA compile_options",
+        ]) {
+          const original = await harness.driver.query(source);
+          const rewrite = applyHardCapToSqlQuery(source, "sqlite", 2);
+          expect(rewrite.error).toBeUndefined();
+          const bounded = await harness.driver.query(rewrite.queryText);
+          expect(bounded.columns).toEqual(original.columns);
+          expect(bounded.rows).toEqual(original.rows.slice(0, 2));
+        }
+        const empty = applyHardCapToSqlQuery(
+          "SELECT 1 AS same, 2 AS same WHERE 0",
+          "sqlite",
+          2,
+        );
+        const result = await harness.driver.query(empty.queryText);
+        expect(result.columns).toEqual(["same", "same"]);
+        expect(result.rows).toEqual([]);
+        // A bare CR does not end a native SQLite -- comment. Check the native
+        // prepared path as well as the rewritten script path.
+        const native = await harness.driver.query(
+          "SELECT ? AS n -- comment\r UNION ALL SELECT 2",
+          [1],
+        );
+        const capped = applyHardCapToSqlQuery(
+          "SELECT 1 AS n -- comment\r UNION ALL SELECT 2",
+          "sqlite",
+          2,
+        );
+        expect(native.rows).toHaveLength(1);
+        expect((await harness.driver.query(capped.queryText)).rows).toEqual(
+          native.rows,
+        );
+        // Raw result metadata must not break the driver's existing fallback
+        // from non-reader PRAGMAs to run().
+        await expect(
+          harness.driver.query("PRAGMA user_version = 41"),
+        ).resolves.toMatchObject({ columns: [], rows: [] });
+        await harness.driver.query("PRAGMA user_version = 0");
+      });
+
+      it("executes VALUES CTEs, compound VALUES, unlimited LIMIT and bounded scripts", async () => {
+        for (const source of [
+          "WITH c(n) AS (VALUES (1), (2), (3)) SELECT n FROM c ORDER BY n",
+          "SELECT 1 AS n UNION ALL VALUES (2), (3)",
+          "WITH c(n) AS (VALUES (1), (2), (3)) SELECT n FROM c LIMIT -1",
+          "SELECT 99; WITH c(n) AS (VALUES (1), (2), (3)) SELECT n FROM c ORDER BY n;",
+        ]) {
+          const rewrite = applyHardCapToSqlQuery(source, "sqlite", 2);
+          expect(rewrite.error).toBeUndefined();
+          const result = await harness.driver.query(rewrite.queryText);
+          expect(result.rows.map((row) => Number(row.__col_0))).toEqual([1, 2]);
+        }
+      });
+    }
+
+    if (engineId === "mssql") {
+      it("executes TOP, scalar subqueries and OFFSET/FETCH caps", async () => {
+        const prefix =
+          "WITH src(n) AS (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) ";
+        for (const [query, expected] of [
+          ["SELECT TOP/* count */(100)n FROM src ORDER BY n", [1, 2]],
+          [
+            "SELECT n, (SELECT MAX(n) FROM src) AS maximum FROM src ORDER BY n",
+            [1, 2],
+          ],
+          ["SELECT n FROM src ORDER BY n OFFSET 1 ROWS", [2, 3]],
+          [
+            "SELECT n FROM src ORDER BY n OFFSET 1 ROWS FETCH NEXT 100 ROWS ONLY",
+            [2, 3],
+          ],
+        ] as const) {
+          const rewrite = applyHardCapToSqlQuery(prefix + query, "mssql", 2);
+          expect(rewrite.error).toBeUndefined();
+          const result = await harness.driver.query(rewrite.queryText);
+          expect(result.rows.map((row) => Number(row.__col_0))).toEqual(
+            expected,
+          );
+        }
+      });
+    }
+
+    if (engineId === "postgres") {
+      it("caps RETURNING while completing every mutation", async () => {
+        const table = harness.driver.qualifiedTableName(
+          harness.databaseName,
+          harness.schemaName,
+          `rapidb_cap_probe_${Date.now()}`,
+        );
+        await harness.driver.query(`CREATE TABLE ${table} (id integer)`);
+        try {
+          for (const [source, expectedCount] of [
+            [`INSERT INTO ${table} VALUES (1), (2), (3), (4) RETURNING id`, 4],
+            [
+              `WITH changed AS (UPDATE ${table} SET id = id + 10 RETURNING id) SELECT * FROM changed`,
+              4,
+            ],
+            [`DELETE FROM ${table} RETURNING id`, 0],
+          ] as const) {
+            const rewrite = applyHardCapToSqlQuery(source, "pg", 2);
+            expect(rewrite.error).toBeUndefined();
+            expect(
+              (await harness.driver.query(rewrite.queryText)).rows,
+            ).toHaveLength(2);
+            const count = await harness.driver.query(
+              `SELECT count(*) FROM ${table}`,
+            );
+            expect(Number(count.rows[0].__col_0)).toBe(expectedCount);
+            if (source.startsWith("WITH")) {
+              const updated = await harness.driver.query(
+                `SELECT count(*) FROM ${table} WHERE id >= 11`,
+              );
+              expect(Number(updated.rows[0].__col_0)).toBe(4);
+            }
+          }
+        } finally {
+          await harness.driver.query(`DROP TABLE ${table}`);
+        }
+      });
+    }
 
     it("connects, disconnects, and lists the seeded fixture namespace", async () => {
       expect(harness.driver.isConnected()).toBe(true);

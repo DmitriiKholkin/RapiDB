@@ -1,3 +1,7 @@
+import {
+  AMBIGUOUS_URI_CREDENTIALS_MESSAGE,
+  hasAmbiguousUriCredentials,
+} from "../shared/connectionUriSecurity";
 import type { ConnectionConfig } from "./connectionManagerModels";
 import {
   CONNECTION_SECRET_KEYS,
@@ -27,7 +31,7 @@ const CREDENTIAL_BEARING_URI_FIELDS = [
   "awsEndpoint",
 ] as const satisfies readonly (keyof ConnectionSecretSnapshot)[];
 const CREDENTIAL_QUERY_PARAMETER =
-  /^(?:password|passwd|pwd|api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|client[_-]?secret|aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key|session[_-]?token))$/i;
+  /^(?:password|passwd|pwd|auth|key|sig|api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|client[_-]?secret|aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key|session[_-]?token))$/i;
 
 export function trimOptionalSecretValue(
   value: string | undefined,
@@ -50,8 +54,11 @@ export function trimOptionalUriValue(
 }
 
 function redactCredentialBearingUri(uri: string): string {
+  if (hasAmbiguousUriCredentials(uri)) {
+    throw new Error(AMBIGUOUS_URI_CREDENTIALS_MESSAGE);
+  }
   const authorityRedacted = uri.replace(
-    /^([a-z][a-z\d+.-]*:\/\/)([^@/?#\s]+)@/i,
+    /^([a-z][a-z\d+.-]*:\/\/)([^/?#\s\\]*)@/i,
     "$1",
   );
   const hashIndex = authorityRedacted.indexOf("#");
@@ -223,6 +230,11 @@ function hasCredentialBearingUriSecret(config: ConnectionConfig): boolean {
 }
 
 export function shouldForceSecretStorage(config: ConnectionConfig): boolean {
+  for (const field of CREDENTIAL_BEARING_URI_FIELDS) {
+    if (hasAmbiguousUriCredentials(config[field])) {
+      throw new Error(AMBIGUOUS_URI_CREDENTIALS_MESSAGE);
+    }
+  }
   if (config.useSecretStorage === false) {
     return false;
   }

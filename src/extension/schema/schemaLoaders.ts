@@ -11,10 +11,7 @@ import {
   resolveDriverTableSectionAvailability,
 } from "../dbDrivers/types";
 import { pMapWithLimit } from "../utils/concurrency";
-import {
-  logErrorWithContext,
-  normalizeUnknownError,
-} from "../utils/errorHandling";
+import { normalizeUnknownError } from "../utils/errorHandling";
 import {
   getConfiguredDefaultDatabaseName,
   resolveDriverEntityManifest,
@@ -29,6 +26,35 @@ export interface DatabaseScopeLoadResult {
     schemas: SchemaSnapshotSchemaEntry[];
   };
   loadedSchemas: SchemaSnapshotSchemaEntry[];
+  failedSchemas?: Array<{ name: string; error: unknown }>;
+}
+
+/** A discovered object catalog remains usable even when column discovery fails. */
+export class PartialSchemaLoadError extends Error {
+  constructor(
+    readonly schema: SchemaSnapshotSchemaEntry,
+    readonly failedObjects: Set<string>,
+    errors: string[],
+  ) {
+    super(errors.join("; "));
+  }
+
+  withCachedColumns(
+    cached?: SchemaSnapshotSchemaEntry,
+  ): SchemaSnapshotSchemaEntry {
+    return {
+      ...this.schema,
+      objects: this.schema.objects.map((object) => ({
+        ...object,
+        columns: this.failedObjects.has(object.name)
+          ? (cached?.objects.find(
+              (previous) =>
+                previous.name === object.name && previous.type === object.type,
+            )?.columns ?? object.columns)
+          : object.columns,
+      })),
+    };
+  }
 }
 
 /**
@@ -51,7 +77,7 @@ export async function loadConnectionRootCatalog(
   defaultDatabaseName: string;
 }> {
   const configuredDb = getConfiguredDefaultDatabaseName(config);
-  const allDbs = await driver.listDatabases().catch(() => []);
+  const allDbs = await driver.listDatabases();
   const databaseNames = [
     ...new Set(
       [configuredDb, ...allDbs.map((database) => database.name)].filter(
@@ -84,10 +110,17 @@ export async function loadDatabaseScope(
   databaseName: string,
   loadMode: DatabaseLoadMode,
 ): Promise<DatabaseScopeLoadResult> {
-  const schemas = await driver.listSchemas(databaseName).catch(() => []);
+  // Only drivers explicitly lacking namespaces (Redis) need a synthetic scope.
+  // A rejected request or a genuinely empty catalog must not trigger fallback.
+  const schemas = await driver.listSchemas(databaseName);
+  const scopes =
+    schemas.length === 0 &&
+    driver.getCapabilities?.().schemaNamespaces === "none"
+      ? [{ name: databaseName }]
+      : schemas;
   const schemaNames = [
     ...new Set(
-      (schemas.length > 0 ? schemas : [{ name: databaseName }])
+      scopes
         .map((schema) => schema.name)
         .filter(
           (name): name is string => typeof name === "string" && name.length > 0,
@@ -95,23 +128,7 @@ export async function loadDatabaseScope(
     ),
   ];
 
-  if (schemaNames.length <= 1) {
-    const schema = await loadSchemaScope(
-      driver,
-      databaseName,
-      schemaNames[0] ?? databaseName,
-    );
-
-    return {
-      database: {
-        name: databaseName,
-        schemas: [schema],
-      },
-      loadedSchemas: [schema],
-    };
-  }
-
-  if (loadMode === "expanded") {
+  if (loadMode === "expanded" && schemaNames.length > 1) {
     return {
       database: {
         name: databaseName,
@@ -124,18 +141,36 @@ export async function loadDatabaseScope(
     };
   }
 
-  const loadedSchemas = await pMapWithLimit(
-    schemaNames,
-    4,
-    async (schemaName) => loadSchemaScope(driver, databaseName, schemaName),
+  const results = await pMapWithLimit(schemaNames, 4, async (name) => {
+    try {
+      return {
+        name,
+        schema: await loadSchemaScope(driver, databaseName, name),
+      };
+    } catch (error) {
+      return { name, error };
+    }
+  });
+  const loadedSchemas = results.flatMap((result) =>
+    result.schema ? [result.schema] : [],
+  );
+  const failedSchemas = results.flatMap((result) =>
+    result.schema ? [] : [{ name: result.name, error: result.error }],
   );
 
   return {
     database: {
       name: databaseName,
-      schemas: loadedSchemas,
+      schemas: results.map(
+        (result) =>
+          result.schema ??
+          (result.error instanceof PartialSchemaLoadError
+            ? result.error.schema
+            : { name: result.name, objects: [] }),
+      ),
     },
     loadedSchemas,
+    failedSchemas,
   };
 }
 
@@ -154,17 +189,26 @@ export async function loadSchemaScope(
 ): Promise<SchemaSnapshotSchemaEntry> {
   const manifest = resolveDriverEntityManifest(driver);
   const supportedKinds = new Set(manifest.dbObjectKinds);
-  const objects = await driver
-    .listObjects(databaseName, schemaName)
-    .catch(() => []);
+  const objects = await driver.listObjects(databaseName, schemaName);
   const objectsForSchema = objects.filter((object) =>
     supportedKinds.has(object.type),
   );
+  const failedObjects = new Set<string>();
+  const errors: string[] = [];
   const describedColumns = await pMapWithLimit(
     objectsForSchema,
     10,
     async (object) => {
       if (!isDataDbObjectKind(object.type)) {
+        return [];
+      }
+      if (
+        resolveDriverTableSectionAvailability(
+          manifest,
+          object.type,
+          "columns",
+        ) === "not_applicable"
+      ) {
         return [];
       }
 
@@ -174,13 +218,15 @@ export async function loadSchemaScope(
           schemaName,
           object.name,
         );
-      } catch {
+      } catch (error) {
+        failedObjects.add(object.name);
+        errors.push(`${object.name}: ${normalizeUnknownError(error).message}`);
         return [];
       }
     },
   );
 
-  return {
+  const schema: SchemaSnapshotSchemaEntry = {
     name: schemaName,
     objects: objectsForSchema.map((object, index) => ({
       name: object.name,
@@ -196,6 +242,10 @@ export async function loadSchemaScope(
         : [],
     })),
   };
+  if (errors.length > 0) {
+    throw new PartialSchemaLoadError(schema, failedObjects, errors);
+  }
+  return schema;
 }
 
 /**

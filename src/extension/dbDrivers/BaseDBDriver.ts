@@ -40,6 +40,7 @@ import type {
   PaginationResult,
   PersistedEditCheckOptions,
   PersistedEditCheckResult,
+  QueryExecutionOptions,
   QueryResult,
   SchemaInfo,
   TableConstraintMeta,
@@ -764,7 +765,11 @@ export abstract class BaseDBDriver implements IDBDriver {
     kind: "function" | "procedure",
     routineIdentity?: string,
   ): Promise<string>;
-  abstract query(sql: string, params?: unknown[]): Promise<QueryResult>;
+  abstract query(
+    sql: string,
+    params?: unknown[],
+    operationContext?: QueryExecutionOptions,
+  ): Promise<QueryResult>;
   abstract runTransaction(operations: TransactionOperation[]): Promise<void>;
 
   protected getTimeoutSettings(): DriverTimeoutSettingsSnapshot {

@@ -420,6 +420,7 @@ export class RedisDriver implements IDBDriver {
   getCapabilities() {
     return {
       tabularRead: "nosql" as const,
+      schemaNamespaces: "none" as const,
       queryMode: "text" as const,
       supportsMutations: true,
       readOnlyQueryGuard: decideRedisReadOnlyQuery,
@@ -452,24 +453,20 @@ export class RedisDriver implements IDBDriver {
   }
 
   async listObjects(): Promise<TableInfo[]> {
-    try {
-      const keys = await this.scanKeys("*", REDIS_READ_BUDGET.maxScanKeys);
-      const names = new Set<string>();
-      for (const key of keys) {
-        const prefix = key.includes(":") ? key.split(":")[0] : "default";
-        names.add(prefix || "default");
-      }
-      if (names.size === 0) {
-        names.add("default");
-      }
-      return [...names].sort().map((name) => ({
-        schema: "",
-        name,
-        type: "table",
-      }));
-    } catch {
-      return [];
+    const keys = await this.scanKeys("*", REDIS_READ_BUDGET.maxScanKeys);
+    const names = new Set<string>();
+    for (const key of keys) {
+      const prefix = key.includes(":") ? key.split(":")[0] : "default";
+      names.add(prefix || "default");
     }
+    if (names.size === 0) {
+      names.add("default");
+    }
+    return [...names].sort().map((name) => ({
+      schema: "",
+      name,
+      type: "table",
+    }));
   }
 
   async describeTable(

@@ -196,6 +196,20 @@ export function parseQueryInitialState(
 
 // ─── Messages ───────────────────────────────────────────────────────────────
 
+export interface QueryResultExportPayload {
+  // IDs refer to original result positions (__col_0, __col_1), not display names.
+  columnOrder?: string[];
+  sort?: { id: string; desc: boolean }[];
+}
+
+function isQueryColumnId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^__col_(0|[1-9]\d*)$/.test(value) &&
+    Number.isSafeInteger(Number(value.slice(6)))
+  );
+}
+
 export type QueryPanelMessage =
   | WebviewMessageEnvelope<"activeConnectionChanged", { connectionId: string }>
   | WebviewMessageEnvelope<
@@ -209,14 +223,8 @@ export type QueryPanelMessage =
     >
   | WebviewMessageEnvelope<"getConnections">
   | WebviewMessageEnvelope<"getSchema", { connectionId?: string }>
-  | WebviewMessageEnvelope<
-      "exportResultsCSV",
-      { columnOrder?: string[]; sort?: { column: string; desc: boolean }[] }
-    >
-  | WebviewMessageEnvelope<
-      "exportResultsJSON",
-      { columnOrder?: string[]; sort?: { column: string; desc: boolean }[] }
-    >
+  | WebviewMessageEnvelope<"exportResultsCSV", QueryResultExportPayload>
+  | WebviewMessageEnvelope<"exportResultsJSON", QueryResultExportPayload>
   | WebviewMessageEnvelope<"readClipboard", ClipboardReadPayload>
   | WebviewMessageEnvelope<"writeClipboard", { text: string }>
   | WebviewMessageEnvelope<
@@ -284,7 +292,38 @@ export function parseQueryPanelMessage(
     case "exportResultsCSV":
     case "exportResultsJSON": {
       const payload = parseOptionalPayloadRecord(envelope);
-      return { type: envelope.type, payload: payload ?? undefined };
+      if (!payload) return null;
+      const { columnOrder, sort } = payload;
+      if (
+        columnOrder !== undefined &&
+        (!Array.isArray(columnOrder) ||
+          !columnOrder.every(isQueryColumnId) ||
+          new Set(columnOrder).size !== columnOrder.length)
+      ) {
+        return null;
+      }
+      if (
+        sort !== undefined &&
+        (!Array.isArray(sort) ||
+          !sort.every(
+            (rule) =>
+              isRecord(rule) &&
+              isQueryColumnId(rule.id) &&
+              typeof rule.desc === "boolean",
+          ) ||
+          new Set(sort.map((rule) => rule.id)).size !== sort.length)
+      ) {
+        return null;
+      }
+      return {
+        type: envelope.type,
+        payload: {
+          ...(columnOrder !== undefined ? { columnOrder } : {}),
+          ...(sort !== undefined
+            ? { sort: sort.map(({ id, desc }) => ({ id, desc })) }
+            : {}),
+        },
+      };
     }
 
     case "writeClipboard": {

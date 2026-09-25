@@ -28,39 +28,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-export function normalizeDynamoDbNativeOperationName(
-  value: string,
-): DynamoDbNativeOperationName | null {
-  const normalized = value
-    .replace(/command$/i, "")
-    .trim()
-    .toLowerCase();
-  switch (normalized) {
-    case "batchgetitem":
-      return "BatchGetItem";
-    case "batchwriteitem":
-      return "BatchWriteItem";
-    case "deleteitem":
-      return "DeleteItem";
-    case "getitem":
-      return "GetItem";
-    case "putitem":
-      return "PutItem";
-    case "query":
-      return "Query";
-    case "scan":
-      return "Scan";
-    case "transactgetitems":
-      return "TransactGetItems";
-    case "transactwriteitems":
-      return "TransactWriteItems";
-    case "updateitem":
-      return "UpdateItem";
-    default:
-      return null;
-  }
-}
-
 export function inferDynamoDbNativeOperationName(
   value: unknown,
 ): DynamoDbNativeOperationName | null {
@@ -217,14 +184,11 @@ export function parseDynamoDbNativeQueryInputs(
     );
   }
 
-  const parsedDocuments = tryParseConcatenatedJsonObjects(trimmed);
-  if (parsedDocuments !== null) {
-    return validateParsedNativeQueryInputs(parsedDocuments);
-  }
-
-  let parsed: unknown;
+  let parsedDocuments: unknown[];
   try {
-    parsed = JSON.parse(trimmed) as unknown;
+    parsedDocuments = tryParseConcatenatedJsonObjects(trimmed) ?? [
+      JSON.parse(trimmed) as unknown,
+    ];
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(
@@ -232,7 +196,7 @@ export function parseDynamoDbNativeQueryInputs(
     );
   }
 
-  return validateParsedNativeQueryInputs([parsed]);
+  return validateParsedNativeQueryInputs(parsedDocuments);
 }
 
 function validateParsedNativeQueryInputs(

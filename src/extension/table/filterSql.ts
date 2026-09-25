@@ -17,13 +17,18 @@ export function buildWhere(
 
   for (const f of filters) {
     const meta = colMap.get(f.column);
-    if (!meta) continue;
+    if (!meta) {
+      throw new Error(`[RapiDB Filter] Unknown filter column ${f.column}.`);
+    }
 
     const result = normalizeFilterCondition(drv, meta, f, params.length + 1);
-    if (result) {
-      conditions.push(result.sql);
-      params.push(...result.params);
+    if (!result) {
+      throw new Error(
+        `[RapiDB Filter] Column ${f.column} could not build ${f.operator} filter.`,
+      );
     }
+    conditions.push(result.sql);
+    params.push(...result.params);
   }
 
   if (conditions.length === 0) return { clause: "", params: [] };
@@ -49,14 +54,18 @@ function normalizeFilterCondition(
     );
   }
 
-  if (!column.filterable) return null;
+  if (!column.filterable) {
+    throw new Error(`[RapiDB Filter] Column ${column.name} is not filterable.`);
+  }
 
   if (!column.filterOperators.includes(filter.operator)) {
     throw unsupportedFilterOperatorError(column.name, filter.operator);
   }
 
   if (!("value" in filter)) {
-    return null;
+    throw new Error(
+      `[RapiDB Filter] Column ${column.name} requires a value for ${filter.operator} filters.`,
+    );
   }
 
   const normalizedValue = drv.normalizeFilterValue(

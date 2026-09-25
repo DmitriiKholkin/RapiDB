@@ -4,6 +4,10 @@ import {
   isConnectionTlsEnabled,
 } from "./connectionConfig";
 import type { ConnectionType } from "./connectionTypes";
+import {
+  AMBIGUOUS_URI_CREDENTIALS_MESSAGE,
+  hasAmbiguousUriCredentials,
+} from "./connectionUriSecurity";
 
 export interface ConnectionValidationIssue {
   code: "required" | "anyOf" | "invalid";
@@ -132,8 +136,68 @@ function buildValidationMessage(
   return parts.join(" ");
 }
 
-function isPositiveInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value > 0;
+function isValidConnectionPort(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= 1 &&
+    value <= 65535
+  );
+}
+
+export function isConnectionPortRelevant(
+  config: Partial<ConnectionConfig>,
+): boolean {
+  switch (config.type) {
+    case "sqlite":
+    case "dynamodb":
+      return false;
+    case "mongodb":
+      return !hasValue(config.connectionUri) && !hasValue(config.uri);
+    case "redis":
+      return !hasValue(config.connectionUri);
+    case "elasticsearch":
+      return (
+        !hasValue(config.connectionUri) &&
+        !hasValue(config.endpoint) &&
+        !hasValue(config.cloudId)
+      );
+    default:
+      return true;
+  }
+}
+
+export function buildConnectionPortValidationIssues(
+  config: Partial<ConnectionConfig>,
+): ConnectionValidationIssue[] {
+  const issues: ConnectionValidationIssue[] = [];
+  if (
+    isConnectionPortRelevant(config) &&
+    config.port !== undefined &&
+    !isValidConnectionPort(config.port)
+  ) {
+    issues.push(
+      createValidationIssue(
+        "invalid",
+        ["port"],
+        "Database port must be an integer between 1 and 65535.",
+      ),
+    );
+  }
+  if (
+    config.type !== "sqlite" &&
+    config.ssh?.port !== undefined &&
+    !isValidConnectionPort(config.ssh.port)
+  ) {
+    issues.push(
+      createValidationIssue(
+        "invalid",
+        ["ssh"],
+        "SSH port must be an integer between 1 and 65535.",
+      ),
+    );
+  }
+  return issues;
 }
 
 function isSshFingerprintSha256(value: string | undefined): boolean {
@@ -177,12 +241,9 @@ function hasMongoMultiHostUri(value: string | undefined): boolean {
     return false;
   }
 
-  const authorityStart = schemeIndex + 3;
-  const pathStart = normalized.indexOf("/", authorityStart);
-  const authority =
-    pathStart >= 0
-      ? normalized.slice(authorityStart, pathStart)
-      : normalized.slice(authorityStart);
+  // Delimit before stripping userinfo; query/path/fragment commas and @ signs
+  // are not part of the seed list. Keep percent-encoded credentials encoded.
+  const authority = normalized.slice(schemeIndex + 3).split(/[/?#]/, 1)[0];
   const hosts = authority.includes("@")
     ? authority.slice(authority.lastIndexOf("@") + 1)
     : authority;
@@ -225,14 +286,6 @@ function buildSshValidationIssues(
 
   issues.push(
     ...collectConditionalIssues(config, [
-      {
-        when: () => !isPositiveInteger(ssh.port),
-        issue: createValidationIssue(
-          "required",
-          ["ssh"],
-          'Field "ssh.port" is required and must be a positive integer.',
-        ),
-      },
       {
         when: () => !hasValue(ssh.host),
         issue: createValidationIssue(
@@ -499,9 +552,19 @@ export function validateConnectionConfig(
   const issues: ConnectionValidationIssue[] = [
     ...missingRequired.map(createRequiredIssue),
     ...missingAnyOf.map(createAnyOfIssue),
+    ...buildConnectionPortValidationIssues(config),
     ...buildSqliteValidationIssues(config),
     ...buildSshValidationIssues(config),
     ...buildTlsValidationIssues(config),
+    ...(["connectionUri", "uri", "endpoint", "awsEndpoint"] as const)
+      .filter((field) => hasAmbiguousUriCredentials(config[field]))
+      .map((field) =>
+        createValidationIssue(
+          "invalid",
+          [field],
+          AMBIGUOUS_URI_CREDENTIALS_MESSAGE,
+        ),
+      ),
   ];
 
   if (issues.length === 0) {
@@ -515,7 +578,11 @@ export function validateConnectionConfig(
 
   return {
     valid: false,
-    message: buildValidationMessage(missingRequired, missingAnyOf, issues),
+    message: buildValidationMessage(
+      missingRequired,
+      missingAnyOf,
+      issues.filter((issue) => issue.code === "invalid"),
+    ),
     missingRequired,
     missingAnyOf,
     issues,

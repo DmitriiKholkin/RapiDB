@@ -5,6 +5,122 @@ import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 const service = new ConnectionValidationService();
 
 describe("ConnectionValidationService", () => {
+  it("summarizes required and anyOf fields once while preserving structured issues", () => {
+    const result = service.validate({ type: "oracle", port: 0 });
+    expect(result.message).toBe(
+      "Missing required fields: name. Provide at least one of: serviceName | database. Database port must be an integer between 1 and 65535.",
+    );
+    expect(result.missingRequired).toEqual(["name"]);
+    expect(result.missingAnyOf).toEqual([["serviceName", "database"]]);
+    expect(result.issues).toEqual([
+      {
+        code: "required",
+        fields: ["name"],
+        message: 'Field "name" is required.',
+      },
+      {
+        code: "anyOf",
+        fields: ["serviceName", "database"],
+        message: 'At least one of "serviceName", "database" is required.',
+      },
+      {
+        code: "invalid",
+        fields: ["port"],
+        message: "Database port must be an integer between 1 and 65535.",
+      },
+    ]);
+    expect(service.validate({ type: "pg" }).message).toBe(
+      "Missing required fields: name, host, database, username.",
+    );
+  });
+
+  const portConfig: ConnectionConfig = {
+    id: "ports",
+    name: "Ports",
+    type: "pg",
+    host: "localhost",
+    database: "app",
+    username: "user",
+  };
+  const portSsh: NonNullable<ConnectionConfig["ssh"]> = {
+    host: "bastion",
+    username: "tunnel",
+    authMethod: "password",
+    password: "secret",
+    hostVerificationMode: "trustOnFirstUse",
+  };
+
+  it.each([
+    0,
+    -1,
+    1.5,
+    65536,
+    70000,
+    NaN,
+    Infinity,
+    -Infinity,
+    null,
+    "abc",
+    "5432",
+  ])("rejects invalid provided database and SSH ports: %s", (port) => {
+    for (const type of [
+      "pg",
+      "mysql",
+      "mssql",
+      "oracle",
+      "mongodb",
+      "redis",
+      "elasticsearch",
+    ] as const) {
+      const result = service.validate({
+        ...portConfig,
+        type,
+        port: port as number,
+      });
+      expect(result.issues).toContainEqual(
+        expect.objectContaining({ code: "invalid", fields: ["port"] }),
+      );
+      expect(result.message).toContain(
+        "Database port must be an integer between 1 and 65535",
+      );
+    }
+    const result = service.validate({
+      ...portConfig,
+      ssh: { ...portSsh, port: port as number },
+    });
+    expect(result.valid).toBe(false);
+    expect(result.message).toContain(
+      "SSH port must be an integer between 1 and 65535",
+    );
+  });
+
+  it.each([
+    undefined,
+    1,
+    22,
+    5432,
+    65535,
+  ])("accepts absent/default and boundary ports: %s", (port) => {
+    expect(
+      service.validate({ ...portConfig, port, ssh: { ...portSsh, port } })
+        .valid,
+    ).toBe(true);
+  });
+
+  it.each([
+    { type: "sqlite", filePath: "/tmp/app.db" },
+    { type: "dynamodb", awsRegion: "us-east-1" },
+    { type: "mongodb", connectionUri: "mongodb://host" },
+    { type: "mongodb", uri: "mongodb://host" },
+    { type: "redis", connectionUri: "redis://host" },
+    { type: "elasticsearch", endpoint: "https://host" },
+    { type: "elasticsearch", cloudId: "deployment:ZXM=" },
+  ] as const)("ignores unused database ports: %j", (config) => {
+    expect(service.validate({ ...portConfig, ...config, port: 0 }).valid).toBe(
+      true,
+    );
+  });
+
   it("accepts minimal valid configs for all 9 drivers", () => {
     const scenarios: ConnectionConfig[] = [
       {
@@ -257,6 +373,40 @@ describe("ConnectionValidationService", () => {
         }),
       ]),
     );
+  });
+
+  it.each([
+    "connectionUri",
+    "uri",
+  ] as const)("checks only the MongoDB authority for multiple hosts via %s", (field) => {
+    const ssh: ConnectionConfig["ssh"] = {
+      host: "bastion.example.com",
+      port: 22,
+      username: "tunnel",
+      authMethod: "password",
+      password: "secret",
+      hostVerificationMode: "trustOnFirstUse",
+    };
+    const scenarios = [
+      ["mongodb://host:27017?readPreferenceTags=dc:ny,rack:1", true],
+      ["mongodb://host:27017#one,two", true],
+      ["mongodb://host:27017/db,other?tags=a,b", true],
+      ["mongodb://u%2Cser:p%40%2F%3F%23@[::1]:27017?tags=a,b", true],
+      ["mongodb://user,name:password@[2001:db8::1]:27017", true],
+      ["mongodb://host1,host2?tags=a,b", false],
+      ["mongodb://u%40:p%2C@[::1]:27017,[::2]:27018#fragment", false],
+      ["mongodb://host1,host2/path@host", false],
+    ] as const;
+    for (const [uri, valid] of scenarios) {
+      const result = service.validate({
+        name: "Mongo SSH",
+        type: "mongodb",
+        [field]: uri,
+        ssh,
+      });
+      expect(result.valid, uri).toBe(valid);
+      if (!valid) expect(result.message).toContain("single-host");
+    }
   });
 
   it("rejects unsupported MongoDB SSH topologies", () => {

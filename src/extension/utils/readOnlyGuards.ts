@@ -371,7 +371,8 @@ function isReadOnlySqlStatement(
   return isDialectReadOnlySqlStatement(statement, tokens, dialect);
 }
 
-function isReadOnlySqlTokens(tokens: string[]): boolean {
+/** Structural SELECT/CTE check; callers must establish lexical boundaries first. */
+export function isReadOnlySqlTokens(tokens: string[]): boolean {
   if (tokens.length === 0) {
     return false;
   }

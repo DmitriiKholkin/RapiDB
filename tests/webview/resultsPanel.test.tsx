@@ -441,9 +441,85 @@ describe("TableGrid query mode", () => {
     await user.click(screen.getByRole("button", { name: "Export JSON" }));
 
     expect(getPostedMessages()).toEqual([
-      { type: "exportResultsCSV", payload: { columnOrder: ["id"] } },
-      { type: "exportResultsJSON", payload: { columnOrder: ["id"] } },
+      { type: "exportResultsCSV", payload: { columnOrder: ["__col_0"] } },
+      { type: "exportResultsJSON", payload: { columnOrder: ["__col_0"] } },
     ]);
+  });
+
+  it("exports duplicate-name columns by position after sorting, dragging, and hiding", async () => {
+    const user = userEvent.setup();
+    render(
+      <TableGrid
+        mode="query"
+        status="success"
+        result={{
+          columns: ["value", "value"],
+          columnMeta: [{ category: "integer" }, { category: "text" }],
+          rows: [
+            { __col_0: 2, __col_1: "a" },
+            { __col_0: 1, __col_1: "b" },
+          ],
+          rowCount: 2,
+          executionTimeMs: 5,
+        }}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Export CSV" }));
+    expect(getPostedMessages().at(-1)).toEqual({
+      type: "exportResultsCSV",
+      payload: { columnOrder: ["__col_0", "__col_1"] },
+    });
+    const headers = screen.getAllByRole("columnheader");
+    fireEvent.click(headers[0]);
+    await user.click(screen.getByRole("button", { name: "Export JSON" }));
+    expect(getPostedMessages().at(-1)).toEqual({
+      type: "exportResultsJSON",
+      payload: {
+        columnOrder: ["__col_0", "__col_1"],
+        sort: [{ id: "__col_0", desc: true }],
+      },
+    });
+    fireEvent.click(headers[1]);
+    headers.forEach((header, i) => {
+      header.getBoundingClientRect = () => ({
+        x: i * 100,
+        y: 0,
+        width: 100,
+        height: 28,
+        left: i * 100,
+        right: (i + 1) * 100,
+        top: 0,
+        bottom: 28,
+        toJSON: () => {},
+      });
+    });
+    fireEvent.mouseDown(headers[0], { clientX: 50, clientY: 14, buttons: 1 });
+    fireEvent.mouseMove(document, { clientX: 60, clientY: 14, buttons: 1 });
+    fireEvent.mouseMove(document, { clientX: 180, clientY: 14, buttons: 1 });
+    fireEvent.mouseUp(document, { clientX: 180, buttons: 0 });
+    expect(
+      screen.getAllByRole("columnheader").map((h) => h.dataset.columnId),
+    ).toEqual(["__col_1", "__col_0"]);
+    await user.click(screen.getByRole("button", { name: "Export CSV" }));
+    expect(getPostedMessages().at(-1)).toEqual({
+      type: "exportResultsCSV",
+      payload: {
+        columnOrder: ["__col_1", "__col_0"],
+        sort: [{ id: "__col_1", desc: false }],
+      },
+    });
+    dragResizeHandle(
+      screen.getAllByRole("button", { name: "Resize value column" })[1],
+      -1000,
+    );
+    await user.click(screen.getByRole("button", { name: "Export JSON" }));
+    expect(getPostedMessages().at(-1)).toEqual({
+      type: "exportResultsJSON",
+      payload: {
+        columnOrder: ["__col_1"],
+        sort: [{ id: "__col_1", desc: false }],
+      },
+    });
   });
 
   it("shows export actions on the left, metrics on the right, and no refresh button", () => {

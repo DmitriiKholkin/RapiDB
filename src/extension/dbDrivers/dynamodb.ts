@@ -402,20 +402,16 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   async listObjects(database: string): Promise<TableInfo[]> {
-    try {
-      const result = await this.requireClient().send(new ListTablesCommand({}));
-      const schemaName = database || this.databaseName();
-      return (result.TableNames ?? [])
-        .slice()
-        .sort((left, right) => left.localeCompare(right))
-        .map((tableName) => ({
-          schema: schemaName,
-          name: tableName,
-          type: "table" as const,
-        }));
-    } catch {
-      return [];
-    }
+    const result = await this.requireClient().send(new ListTablesCommand({}));
+    const schemaName = database || this.databaseName();
+    return (result.TableNames ?? [])
+      .slice()
+      .sort((left, right) => left.localeCompare(right))
+      .map((tableName) => ({
+        schema: schemaName,
+        name: tableName,
+        type: "table" as const,
+      }));
   }
 
   async describeTable(

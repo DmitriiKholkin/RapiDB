@@ -1,5 +1,4 @@
 import * as vscode from "vscode";
-import { isDataDbObjectKind } from "../shared/dbObjectKinds";
 import type {
   BookmarkEntry,
   ConnectionConfig,
@@ -9,7 +8,6 @@ import type {
   SchemaScopeKey,
   SchemaSnapshot,
   SchemaSnapshotDatabaseEntry,
-  SchemaSnapshotObjectEntry,
   SchemaSnapshotSchemaEntry,
   SchemaSnapshotState,
   ScopedSchemaFragment,
@@ -30,12 +28,19 @@ import {
   resolveDriverCapabilities,
   resolveDriverEntityManifest,
 } from "./schema/schemaHelpers";
+import {
+  type DatabaseLoadMode,
+  type DatabaseScopeLoadResult,
+  loadConnectionRootCatalog,
+  loadDatabaseScope,
+  loadSchemaScope,
+  PartialSchemaLoadError,
+} from "./schema/schemaLoaders";
 import type {
   ConnectionSchemaCacheEntry,
   InternalScopedSchemaCacheEntry,
   InternalTableDetailCacheEntry,
 } from "./schemaCacheUtils";
-import { pMapWithLimit } from "./utils/concurrency";
 import {
   logErrorWithContext,
   normalizeUnknownError,
@@ -43,13 +48,6 @@ import {
 
 // ─── Internal Types ───────────────────────────────────────────────────────────
 // Types moved to schemaCacheUtils.ts
-
-interface DatabaseScopeLoadResult {
-  database: SchemaSnapshotDatabaseEntry;
-  loadedSchemas: SchemaSnapshotSchemaEntry[];
-}
-
-type DatabaseLoadMode = "baseline" | "expanded";
 
 // ─── Re-exported from schemaCacheUtils ───────────────────────────────────────
 import {
@@ -181,11 +179,36 @@ export class SchemaCacheManager {
   }
 
   private invalidateSchemaState(connectionId: string): void {
+    const previous = this.schemaCacheMap.get(connectionId);
     this.schemaGenerationMap.set(
       connectionId,
       this.getSchemaGeneration(connectionId) + 1,
     );
     this.schemaCacheMap.delete(connectionId);
+    if (previous) {
+      const next = createConnectionSchemaCacheEntry(
+        this.getSchemaGeneration(connectionId),
+        this.getExpandedScopeKeys(connectionId),
+        previous.defaultDatabaseName,
+      );
+      for (const scope of previous.scopes.values()) {
+        if (!scope.retainOnCollapse && !next.expandedScopeKeys.has(scope.key)) {
+          continue;
+        }
+        next.scopes.set(
+          scope.key,
+          createScopedSchemaCacheEntry(
+            scope.scope,
+            next.generation,
+            { snapshot: scope.snapshot, status: "idle", isPartial: true },
+            scope.fragment,
+            scope.retainOnCollapse,
+          ),
+        );
+      }
+      next.snapshot = cloneSchemaSnapshot(previous.snapshot);
+      this.schemaCacheMap.set(connectionId, next);
+    }
     this.onDidChangeSchemaStateEmitter.fire(connectionId);
   }
 
@@ -296,12 +319,27 @@ export class SchemaCacheManager {
     entry: ConnectionSchemaCacheEntry,
     scopeEntry: InternalScopedSchemaCacheEntry,
     err: unknown,
+    commit = true,
   ): void {
+    if (
+      err instanceof PartialSchemaLoadError &&
+      scopeEntry.scope.kind === "schema"
+    ) {
+      const schema = err.withCachedColumns(scopeEntry.fragment.schema);
+      scopeEntry.snapshot = createScopeSnapshotForSchema(
+        scopeEntry.scope.database,
+        schema,
+      );
+      scopeEntry.fragment = { schema };
+    }
     const error = normalizeUnknownError(err);
     scopeEntry.status = "error";
+    scopeEntry.fullyLoaded = false;
     scopeEntry.isPartial = scopeEntry.snapshot.databases.length > 0;
     scopeEntry.error = error.message;
-    this.commitAggregateSchemaState(connectionId, entry);
+    if (commit) {
+      this.commitAggregateSchemaState(connectionId, entry);
+    }
   }
 
   private commitAggregateSchemaState(
@@ -428,25 +466,7 @@ export class SchemaCacheManager {
     catalogSnapshot: SchemaSnapshot;
     defaultDatabaseName: string;
   }> {
-    const configuredDb = getConfiguredDefaultDatabaseName(config);
-    const allDbs = await driver.listDatabases().catch(() => []);
-    const databaseNames = [
-      ...new Set(
-        [configuredDb, ...allDbs.map((database) => database.name)].filter(
-          (name): name is string => typeof name === "string" && name.length > 0,
-        ),
-      ),
-    ];
-
-    return {
-      catalogSnapshot: {
-        databases: databaseNames.map((databaseName) => ({
-          name: databaseName,
-          schemas: [],
-        })),
-      },
-      defaultDatabaseName: configuredDb || databaseNames[0] || "",
-    };
+    return loadConnectionRootCatalog(driver, config);
   }
 
   private async loadDatabaseScopeInternal(
@@ -454,61 +474,7 @@ export class SchemaCacheManager {
     databaseName: string,
     loadMode: DatabaseLoadMode,
   ): Promise<DatabaseScopeLoadResult> {
-    const schemas = await driver.listSchemas(databaseName).catch(() => []);
-    const schemaNames = [
-      ...new Set(
-        (schemas.length > 0 ? schemas : [{ name: databaseName }])
-          .map((schema) => schema.name)
-          .filter(
-            (name): name is string =>
-              typeof name === "string" && name.length > 0,
-          ),
-      ),
-    ];
-
-    if (schemaNames.length <= 1) {
-      const schema = await this.loadSchemaScopeInternal(
-        driver,
-        databaseName,
-        schemaNames[0] ?? databaseName,
-      );
-
-      return {
-        database: {
-          name: databaseName,
-          schemas: [schema],
-        },
-        loadedSchemas: [schema],
-      };
-    }
-
-    if (loadMode === "expanded") {
-      return {
-        database: {
-          name: databaseName,
-          schemas: schemaNames.map((schemaName) => ({
-            name: schemaName,
-            objects: [],
-          })),
-        },
-        loadedSchemas: [],
-      };
-    }
-
-    const loadedSchemas = await pMapWithLimit(
-      schemaNames,
-      4,
-      async (schemaName) =>
-        this.loadSchemaScopeInternal(driver, databaseName, schemaName),
-    );
-
-    return {
-      database: {
-        name: databaseName,
-        schemas: loadedSchemas,
-      },
-      loadedSchemas,
-    };
+    return loadDatabaseScope(driver, databaseName, loadMode);
   }
 
   private async loadSchemaScopeInternal(
@@ -516,52 +482,7 @@ export class SchemaCacheManager {
     databaseName: string,
     schemaName: string,
   ): Promise<SchemaSnapshotSchemaEntry> {
-    const manifest = resolveDriverEntityManifest(driver);
-    const supportedKinds = new Set(manifest.dbObjectKinds);
-    const objects = await driver
-      .listObjects(databaseName, schemaName)
-      .catch(() => []);
-    const objectsForSchema = objects.filter((object) =>
-      supportedKinds.has(object.type),
-    );
-    const describedColumns = await pMapWithLimit(
-      objectsForSchema,
-      10,
-      async (object) => {
-        if (!isDataDbObjectKind(object.type)) {
-          return [];
-        }
-
-        try {
-          return await driver.describeTable(
-            databaseName,
-            schemaName,
-            object.name,
-          );
-        } catch {
-          return [];
-        }
-      },
-    );
-
-    return {
-      name: schemaName,
-      objects: objectsForSchema.map<SchemaSnapshotObjectEntry>(
-        (object, index) => ({
-          name: object.name,
-          type: object.type,
-          ...(object.routineIdentity
-            ? { routineIdentity: object.routineIdentity }
-            : {}),
-          columns: isDataDbObjectKind(object.type)
-            ? describedColumns[index].map((column) => ({
-                name: column.name,
-                type: column.type,
-              }))
-            : [],
-        }),
-      ),
-    };
+    return loadSchemaScope(driver, databaseName, schemaName);
   }
 
   private async loadTableDetailInternal(
@@ -859,7 +780,14 @@ export class SchemaCacheManager {
           return;
         }
 
-        if (schemaEntry.status === "error") {
+        if (
+          schemaEntry.status === "error" &&
+          !schemaEntry.fragment.schema?.objects.some(
+            (object) =>
+              object.name === request.table &&
+              object.type === request.objectKind,
+          )
+        ) {
           tableDetailEntry.status = "error";
           tableDetailEntry.error =
             schemaEntry.error ??
@@ -1102,7 +1030,10 @@ export class SchemaCacheManager {
       return;
     }
 
-    if (rootEntry.status === "error" && !allowRetry) {
+    if (
+      (rootEntry.status === "error" || baselineEntry?.status === "error") &&
+      !allowRetry
+    ) {
       return;
     }
 
@@ -1126,6 +1057,17 @@ export class SchemaCacheManager {
         rootEntry.isPartial = false;
         rootEntry.fullyLoaded = true;
         delete rootEntry.error;
+        const databaseNames = new Set(
+          catalogSnapshot.databases.map((database) => database.name),
+        );
+        for (const [key, cached] of entry.scopes) {
+          if (
+            cached.scope.kind !== "connectionRoot" &&
+            !databaseNames.has(cached.scope.database)
+          ) {
+            entry.scopes.delete(key);
+          }
+        }
 
         if (defaultDatabaseName) {
           const defaultDatabaseEntry = this.getOrCreateScopeEntry(
@@ -1255,6 +1197,18 @@ export class SchemaCacheManager {
         databaseEntry.fullyLoaded =
           loadMode === "baseline" || result.database.schemas.length <= 1;
         delete databaseEntry.error;
+        const schemaNames = new Set(
+          result.database.schemas.map((schema) => schema.name),
+        );
+        for (const [key, cached] of entry.scopes) {
+          if (
+            cached.scope.kind === "schema" &&
+            cached.scope.database === databaseName &&
+            !schemaNames.has(cached.scope.schema)
+          ) {
+            entry.scopes.delete(key);
+          }
+        }
 
         for (const schema of result.loadedSchemas) {
           this.upsertLoadedSchemaScope(
@@ -1262,6 +1216,44 @@ export class SchemaCacheManager {
             databaseName,
             schema,
             retainOnCollapse,
+          );
+        }
+
+        for (const failed of result.failedSchemas ?? []) {
+          const schemaEntry = this.getOrCreateScopeEntry(
+            entry,
+            { kind: "schema", database: databaseName, schema: failed.name },
+            retainOnCollapse,
+          );
+          this.markScopeLoadError(
+            connectionId,
+            entry,
+            schemaEntry,
+            failed.error,
+            false,
+          );
+        }
+        if (result.failedSchemas?.length) {
+          const database = buildAggregateSchemaSnapshot(entry).databases.find(
+            (database) => database.name === databaseName,
+          );
+          if (database) {
+            databaseEntry.snapshot = createScopeSnapshotForDatabase(database);
+            databaseEntry.fragment = { database };
+          }
+          this.markScopeLoadError(
+            connectionId,
+            entry,
+            databaseEntry,
+            new Error(
+              result.failedSchemas
+                .map(
+                  (failed) =>
+                    `${failed.name}: ${normalizeUnknownError(failed.error).message}`,
+                )
+                .join("; "),
+            ),
+            false,
           );
         }
 

@@ -1016,21 +1016,17 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   async listObjects(database: string): Promise<TableInfo[]> {
-    try {
-      const db = this.requireDb(database);
-      const collections = await db
-        .listCollections({}, { nameOnly: false })
-        .toArray();
-      return collections
-        .filter((collection) => !this.isSystemNamespace(collection.name))
-        .map((collection) => ({
-          schema: database || this.defaultDatabaseName(),
-          name: collection.name,
-          type: collection.type === "view" ? "view" : "table",
-        }));
-    } catch {
-      return [];
-    }
+    const db = this.requireDb(database);
+    const collections = await db
+      .listCollections({}, { nameOnly: false })
+      .toArray();
+    return collections
+      .filter((collection) => !this.isSystemNamespace(collection.name))
+      .map((collection) => ({
+        schema: database || this.defaultDatabaseName(),
+        name: collection.name,
+        type: collection.type === "view" ? "view" : "table",
+      }));
   }
 
   async describeTable(
@@ -2136,22 +2132,18 @@ export class MongoDBDriver implements IDBDriver {
     table: string,
     limit: number,
   ): Promise<Record<string, unknown>[]> {
-    try {
-      const docs = await this.requireDb(database)
-        .collection(table)
-        .find(
-          {},
-          {
-            promoteValues: false,
-            bsonRegExp: false,
-          },
-        )
-        .limit(limit)
-        .toArray();
-      return docs as Record<string, unknown>[];
-    } catch {
-      return [];
-    }
+    const docs = await this.requireDb(database)
+      .collection(table)
+      .find(
+        {},
+        {
+          promoteValues: false,
+          bsonRegExp: false,
+        },
+      )
+      .limit(limit)
+      .toArray();
+    return docs as Record<string, unknown>[];
   }
 
   private async readRows(

@@ -117,6 +117,11 @@ describe("driver timeout helpers", () => {
       requestToken: 41,
       connection: mysqlConnection,
     });
+    (
+      mysql as unknown as {
+        activeQueryConnections: Set<typeof mysqlConnection>;
+      }
+    ).activeQueryConnections.add(mysqlConnection);
 
     const context = {
       reason: "superseded" as const,

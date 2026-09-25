@@ -56,6 +56,14 @@ export interface QueryResult {
   rowCount: number;
   executionTimeMs: number;
   affectedRows?: number;
+  /** The selected result was drained, but rows beyond the collection budget were discarded. */
+  truncated?: boolean;
+}
+export interface QueryExecutionOptions {
+  requestToken?: number;
+  readOnly?: boolean;
+  /** Retained-row budget for boundedQueryResults drivers, not a mutation/drain limit. */
+  hardCap?: number;
 }
 export function colKey(index: number): string {
   return `__col_${index}`;
@@ -80,8 +88,12 @@ export type ReadOnlyQueryGuard = (queryText: string) => ReadOnlyQueryDecision;
 
 export interface DriverCapabilities {
   tabularRead: "sql" | "nosql";
+  /** No schema namespace: discover objects in a synthetic database-named scope. */
+  schemaNamespaces?: "none";
   queryMode?: "sql" | "text";
   supportsMutations?: boolean;
+  /** query(..., { hardCap }) bounds collection across every emitted result set. */
+  boundedQueryResults?: boolean;
   editorPresentation?: QueryEditorPresentation;
   isTableFilterError?: (message: string) => boolean;
   readOnlyQueryGuard?: ReadOnlyQueryGuard;
@@ -287,7 +299,7 @@ export interface IDBDriver {
   query(
     sql: string,
     params?: unknown[],
-    operationContext?: { requestToken?: number; readOnly?: boolean },
+    operationContext?: QueryExecutionOptions,
   ): Promise<QueryResult>;
   readTablePage?(
     request: DriverTablePageRequest,

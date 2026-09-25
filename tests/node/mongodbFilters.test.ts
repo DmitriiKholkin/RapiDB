@@ -80,6 +80,12 @@ function createDriverWithRows(sampleRows: Row[]): MongoDBDriver {
   const readRowsMock = vi.fn().mockResolvedValue(sampleRows);
   (driver as unknown as { readRows: typeof readRowsMock }).readRows =
     readRowsMock;
+  // This fixture exercises inference from page rows without a live connection.
+  // Explicitly model an empty sample rather than relying on swallowed errors.
+  const readSchemaDocuments = vi.fn().mockResolvedValue([]);
+  (
+    driver as unknown as { readSchemaDocuments: typeof readSchemaDocuments }
+  ).readSchemaDocuments = readSchemaDocuments;
   return driver;
 }
 

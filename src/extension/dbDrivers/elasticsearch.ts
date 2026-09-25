@@ -218,37 +218,33 @@ export class ElasticsearchDriver implements IDBDriver {
   }
 
   async listObjects(): Promise<TableInfo[]> {
-    try {
-      const response = await this.requireClient().indices.resolveIndex({
-        name: "*",
-        expand_wildcards: ["open", "closed", "hidden"],
-        allow_no_indices: true,
-        ignore_unavailable: true,
-      });
-      const backingIndexNames = new Set(
-        response.data_streams.flatMap((stream) => stream.backing_indices),
-      );
-      return response.indices
-        .filter((entry) => {
-          const attributes = new Set(entry.attributes ?? []);
-          return (
-            !attributes.has("hidden") &&
-            !attributes.has("system") &&
-            !entry.data_stream &&
-            !backingIndexNames.has(entry.name)
-          );
-        })
-        .map((entry) => entry.name)
-        .filter((name): name is string => Boolean(name))
-        .sort((left, right) => left.localeCompare(right))
-        .map((name) => ({
-          schema: "indices",
-          name,
-          type: "table",
-        }));
-    } catch {
-      return [];
-    }
+    const response = await this.requireClient().indices.resolveIndex({
+      name: "*",
+      expand_wildcards: ["open", "closed", "hidden"],
+      allow_no_indices: true,
+      ignore_unavailable: true,
+    });
+    const backingIndexNames = new Set(
+      response.data_streams.flatMap((stream) => stream.backing_indices),
+    );
+    return response.indices
+      .filter((entry) => {
+        const attributes = new Set(entry.attributes ?? []);
+        return (
+          !attributes.has("hidden") &&
+          !attributes.has("system") &&
+          !entry.data_stream &&
+          !backingIndexNames.has(entry.name)
+        );
+      })
+      .map((entry) => entry.name)
+      .filter((name): name is string => Boolean(name))
+      .sort((left, right) => left.localeCompare(right))
+      .map((name) => ({
+        schema: "indices",
+        name,
+        type: "table",
+      }));
   }
 
   async describeTable(

@@ -7,8 +7,130 @@ import {
   trimOptionalSecretValue,
 } from "../../src/extension/connectionSecrets";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
+import { validateConnectionConfig } from "../../src/shared/connectionValidation";
 
 describe("connection URI secret handling", () => {
+  it.each([
+    ["redis://user:p@ss@host:6379/0", "redis://host:6379/0"],
+    [
+      "mongodb://user:p%40%2F%3F%23%20ss@host1:27017,host2:27017/db?replicaSet=rs",
+      "mongodb://host1:27017,host2:27017/db?replicaSet=rs",
+    ],
+  ])("removes complete userinfo from %s and preserves the secret on resave", (uri, redacted) => {
+    const config: ConnectionConfig = {
+      id: "uri",
+      name: "URI",
+      type: "mongodb",
+      connectionUri: uri,
+    };
+    const persisted = sanitizePersistedConnectionConfig(config);
+    expect(persisted.connectionUri).toBe(redacted);
+    expect(validateConnectionConfig(persisted).valid).toBe(true);
+    expect(extractCredentialBearingUriSecret(uri)).toBe(uri);
+    const secret = serializeConnectionSecretsForStoredConfig(config, undefined);
+    expect(JSON.parse(secret!)).toEqual({ connectionUri: uri });
+    expect(serializeConnectionSecretsForStoredConfig(persisted, secret)).toBe(
+      secret,
+    );
+  });
+
+  it.each([
+    "/",
+    "?",
+    "#",
+    " ",
+    "\t",
+    "\n",
+    "\\",
+  ])("rejects ambiguous userinfo containing %j without echoing secrets", (delimiter) => {
+    const uri = `mongodb://user:pa${delimiter}ss@host/db`;
+    expect(() => sanitizeCredentialBearingUri(uri)).toThrow(
+      "Ambiguous URI credentials",
+    );
+    expect(() => extractCredentialBearingUriSecret(uri)).toThrow(
+      "Ambiguous URI credentials",
+    );
+    for (const useSecretStorage of [undefined, false, true]) {
+      for (const field of [
+        "connectionUri",
+        "uri",
+        "endpoint",
+        "awsEndpoint",
+      ] as const) {
+        const config: ConnectionConfig = {
+          id: "uri",
+          name: "URI",
+          type: "mongodb",
+          host: "host",
+          [field]: uri,
+          useSecretStorage,
+        };
+        const validation = validateConnectionConfig(config);
+        expect(validation.valid).toBe(false);
+        expect(validation.message).not.toContain(uri);
+        expect(() => sanitizePersistedConnectionConfig(config)).toThrow(
+          "Ambiguous URI credentials",
+        );
+      }
+    }
+  });
+
+  it.each([
+    "redis://user:123/ss@host/0",
+    "redis://user:p@ss/word@host/0",
+    "https://host:443/path@name",
+    "redis://user name@host/0",
+    "mongodb://us/er:password@host/db",
+    "mongodb://us?er:password@host/db",
+    "mongodb://us#er:password@host/db",
+  ])("rejects ambiguous URI %s rather than guessing a host or password", (uri) => {
+    expect(() => sanitizeCredentialBearingUri(uri)).toThrow(
+      "Ambiguous URI credentials",
+    );
+  });
+
+  it.each([
+    "https://host/path@name?mode=read&column=name&label=example#section",
+    "mongodb://host1:27017,host2:27017/db?replicaSet=rs",
+    "redis://host:6379/0",
+    "https://host/path%40name?label=user%40example.com",
+    "https://host:443/path%40name",
+  ])("preserves harmless URI %s", (uri) => {
+    expect(sanitizeCredentialBearingUri(uri)).toBe(uri);
+    expect(extractCredentialBearingUriSecret(uri)).toBeUndefined();
+  });
+
+  it.each([
+    "auth",
+    "key",
+    "sig",
+    "%61uth",
+    "KEY",
+    "SIG",
+  ])("stores %s query and fragment credentials only in Secret Storage", (key) => {
+    for (const delimiter of ["?", "#"]) {
+      const uri = `https://host/${delimiter}${key}=secret`;
+      const config: ConnectionConfig = {
+        id: "generic-uri-secret",
+        name: "Endpoint",
+        type: "elasticsearch",
+        endpoint: uri,
+      };
+      const persisted = sanitizePersistedConnectionConfig(config);
+      expect(persisted.endpoint).toBe("https://host/");
+      expect(persisted.useSecretStorage).toBe(true);
+      expect(extractCredentialBearingUriSecret(uri)).toBe(uri);
+      const secret = serializeConnectionSecretsForStoredConfig(
+        config,
+        undefined,
+      );
+      expect(JSON.parse(secret ?? "{}")).toEqual({ endpoint: uri });
+      expect(serializeConnectionSecretsForStoredConfig(persisted, secret)).toBe(
+        secret,
+      );
+    }
+  });
+
   it("moves query and fragment credentials out of persisted config", () => {
     const uri =
       "https://cluster.example.com/api?region=us-east-1&api_key=secret#token=fragment-secret";
@@ -34,6 +156,17 @@ describe("connection URI secret handling", () => {
     expect(sanitizeCredentialBearingUri("https://cluster.example.com")).toBe(
       "https://cluster.example.com",
     );
+  });
+
+  it("preserves the explicit plaintext opt-out for unambiguous credentials", () => {
+    const config: ConnectionConfig = {
+      id: "plaintext",
+      name: "Redis",
+      type: "redis",
+      connectionUri: "redis://user:p%40ss@host:6379/0",
+      useSecretStorage: false,
+    };
+    expect(sanitizePersistedConnectionConfig(config)).toEqual(config);
   });
 });
 

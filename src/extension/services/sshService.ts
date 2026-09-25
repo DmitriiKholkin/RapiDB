@@ -39,7 +39,7 @@ export class SshService {
 
     const ssh = config.ssh;
     const host = ssh.host?.trim();
-    const port = ssh.port;
+    const port = ssh.port ?? 22;
     const username = ssh.username?.trim();
     const fingerprintSha256 = ssh.hostFingerprintSha256?.trim();
     const hostVerificationMode =

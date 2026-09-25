@@ -221,6 +221,92 @@ describe("ConnectionProvider", () => {
     vi.clearAllMocks();
   });
 
+  it.each([
+    "pg",
+    "mysql",
+    "dynamodb",
+    "elasticsearch",
+  ])("shows permission errors alongside cached %s children and clears them after retry/empty recovery", async (type) => {
+    const snapshot = {
+      databases: [
+        {
+          name: "app_db",
+          schemas: [
+            {
+              name: type === "mysql" ? "app_db" : "public",
+              objects: [{ name: "users", type: "table", columns: [] }],
+            },
+          ],
+        },
+      ],
+    };
+    let status = "error";
+    const connectionManager = {
+      getConnections: vi.fn(() => [{ id: "conn-1", name: "Primary", type }]),
+      getConnection: vi.fn(() => ({ id: "conn-1", name: "Primary", type })),
+      isConnected: vi.fn(() => true),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() => ({
+        snapshot,
+        status,
+        isPartial: status !== "loaded",
+        ...(status === "error"
+          ? { error: "permission denied: schema discovery" }
+          : {}),
+      })),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
+    };
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+    const provider = new ConnectionProvider(connectionManager as never);
+    const [root] = await provider.getChildren();
+    let parent = root;
+    let children = await provider.getChildren(parent);
+    expect(children.some((node) => node.kind === "status_error")).toBe(true);
+    if (type === "pg" || type === "mysql") {
+      parent = children.find((node) => node.kind === "database")!;
+      children = await provider.getChildren(parent);
+      expect(children.some((node) => node.kind === "status_error")).toBe(true);
+      if (type === "pg") {
+        parent = children.find((node) => node.kind === "schema")!;
+        children = await provider.getChildren(parent);
+        expect(children.some((node) => node.kind === "status_error")).toBe(
+          true,
+        );
+      }
+    }
+    const tables = children.find((node) => node.kind === "category_tables")!;
+    const failedChildren = await provider.getChildren(tables);
+    expect(failedChildren.map((node) => node.kind)).toEqual([
+      "table",
+      "status_error",
+    ]);
+    expect(failedChildren[1].tooltip).toContain("permission denied");
+
+    status = "loading";
+    expect(
+      (await provider.getChildren(tables)).map((node) => node.kind),
+    ).toEqual(["table"]);
+    status = "loaded";
+    expect(
+      (await provider.getChildren(parent)).some(
+        (node) => node.kind === "status_error",
+      ),
+    ).toBe(false);
+    expect(
+      (await provider.getChildren(tables)).map((node) => node.kind),
+    ).toEqual(["table"]);
+    snapshot.databases[0].schemas[0].objects = [];
+    expect(await provider.getChildren(tables)).toEqual([]);
+  });
+
   it("refreshes only the affected connection subtree when schema state changes", async () => {
     vi.useFakeTimers();
 

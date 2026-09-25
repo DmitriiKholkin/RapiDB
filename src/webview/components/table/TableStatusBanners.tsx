@@ -125,7 +125,7 @@ function platformShortcutLabel(): string {
 interface TableMutationStatusBarProps {
   applyStatus: TableApplyStatus | null;
   applying: boolean;
-  inserting: boolean;
+  loading: boolean;
   insertValueCount: number;
   mutErr: string | null;
   newRowExists: boolean;
@@ -144,7 +144,7 @@ interface TableMutationStatusBarProps {
 export function TableMutationStatusBar({
   applyStatus,
   applying,
-  inserting,
+  loading,
   insertValueCount,
   mutErr,
   newRowExists,
@@ -193,12 +193,12 @@ export function TableMutationStatusBar({
                 type="button"
                 aria-label="Undo"
                 title={`Undo (${shortcut}Z)`}
-                disabled={!canUndo || applying || inserting}
+                disabled={!canUndo || applying || loading}
                 style={{
                   background: "none",
                   border: "none",
                   cursor:
-                    canUndo && !applying && !inserting ? "pointer" : "default",
+                    canUndo && !applying && !loading ? "pointer" : "default",
                   color: canUndo
                     ? "var(--vscode-editorWarning-foreground, #cca700)"
                     : "var(--vscode-descriptionForeground, #888)",
@@ -215,12 +215,12 @@ export function TableMutationStatusBar({
                 type="button"
                 aria-label="Redo"
                 title={`Redo (${shortcut}Shift+Z)`}
-                disabled={!canRedo || applying || inserting}
+                disabled={!canRedo || applying || loading}
                 style={{
                   background: "none",
                   border: "none",
                   cursor:
-                    canRedo && !applying && !inserting ? "pointer" : "default",
+                    canRedo && !applying && !loading ? "pointer" : "default",
                   color: canRedo
                     ? "var(--vscode-editorWarning-foreground, #cca700)"
                     : "var(--vscode-descriptionForeground, #888)",
@@ -273,8 +273,8 @@ export function TableMutationStatusBar({
             <>
               <button
                 type="button"
-                style={tableButtonStyle("warning", applying || inserting)}
-                disabled={applying || inserting}
+                style={tableButtonStyle("warning", applying || loading)}
+                disabled={applying || loading}
                 title={
                   newRowExists && insertValueCount === 0
                     ? "Apply inserts with database defaults, then updates"
@@ -286,8 +286,8 @@ export function TableMutationStatusBar({
               </button>
               <button
                 type="button"
-                style={tableButtonStyle("ghost", applying || inserting)}
-                disabled={applying || inserting}
+                style={tableButtonStyle("ghost", applying || loading)}
+                disabled={applying || loading}
                 onClick={onRevertChanges}
               >
                 Revert All

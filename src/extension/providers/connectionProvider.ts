@@ -744,7 +744,7 @@ export class ConnectionProvider
       return this.appendStateNodes(
         element.connectionId,
         categories,
-        databaseState,
+        state.status === "error" ? state : databaseState,
         "Loading tables…",
       );
     }
@@ -818,16 +818,32 @@ export class ConnectionProvider
     if (
       this.shouldFlattenSchemaLevel(element.connectionId, databaseName, schemas)
     ) {
-      return this.categoryNodes(
+      const schemaState = this.getSchemaState(element.connectionId, {
+        kind: "schema",
+        database: databaseName,
+        schema: schemas[0].name,
+      });
+      return this.appendStateNodes(
         element.connectionId,
-        databaseName,
-        schemas[0],
-        this.getEntityManifest(element.connectionId),
+        this.categoryNodes(
+          element.connectionId,
+          databaseName,
+          findSnapshotSchema(schemaState, databaseName, schemas[0].name) ??
+            schemas[0],
+          this.getEntityManifest(element.connectionId),
+        ),
+        state.status === "error" ? state : schemaState,
+        `Loading ${databaseName}…`,
       );
     }
 
-    return schemas.map((schema) =>
-      this.makeSchemaNode(element.connectionId, databaseName, schema.name),
+    return this.appendStateNodes(
+      element.connectionId,
+      schemas.map((schema) =>
+        this.makeSchemaNode(element.connectionId, databaseName, schema.name),
+      ),
+      state,
+      `Loading ${databaseName}…`,
     );
   }
 
@@ -852,11 +868,16 @@ export class ConnectionProvider
       );
     }
 
-    return this.categoryNodes(
+    return this.appendStateNodes(
       element.connectionId,
-      databaseName,
-      schema,
-      this.getEntityManifest(element.connectionId),
+      this.categoryNodes(
+        element.connectionId,
+        databaseName,
+        schema,
+        this.getEntityManifest(element.connectionId),
+      ),
+      state,
+      `Loading ${schemaName}…`,
     );
   }
 
@@ -890,22 +911,23 @@ export class ConnectionProvider
 
     element.description = `(${filteredObjects.length})`;
 
-    if (filteredObjects.length === 0) {
-      return [];
-    }
-
     const manifest = this.getEntityManifest(element.connectionId);
 
-    return filteredObjects.map((object) =>
-      this.makeObjectNode(
-        object.type,
-        element.connectionId,
-        databaseName,
-        schemaName,
-        object.name,
-        object.routineIdentity,
-        manifest,
+    return this.appendStateNodes(
+      element.connectionId,
+      filteredObjects.map((object) =>
+        this.makeObjectNode(
+          object.type,
+          element.connectionId,
+          databaseName,
+          schemaName,
+          object.name,
+          object.routineIdentity,
+          manifest,
+        ),
       ),
+      state,
+      `Loading ${schemaName}…`,
     );
   }
 

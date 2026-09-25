@@ -13,8 +13,12 @@ interface BetterSqlite3OpenOptions {
 }
 
 interface BetterSqlite3Statement {
+  readonly reader: boolean;
   safeIntegers(toggle?: boolean): BetterSqlite3Statement;
+  raw(toggle?: boolean): BetterSqlite3Statement;
+  columns(): { name: string }[];
   all(...params: unknown[]): unknown[];
+  iterate(...params: unknown[]): IterableIterator<unknown[]>;
   get(...params: unknown[]): unknown;
   run(...params: unknown[]): {
     changes: number;
@@ -47,6 +51,22 @@ export interface SQLiteDatabase {
   close(): void;
   exec(sql: string): void;
   all(sql: string, params?: readonly unknown[]): unknown[];
+  allRaw(
+    sql: string,
+    params?: readonly unknown[],
+  ): { columns: string[]; rows: unknown[][] };
+  queryBounded(
+    sql: string,
+    params: readonly unknown[],
+    limit: number,
+    onResultSet?: () => void,
+  ): {
+    columns: string[];
+    rows: unknown[][];
+    rowCount: number;
+    changes?: number;
+    truncated: boolean;
+  };
   get(sql: string, params?: readonly unknown[]): unknown;
   run(
     sql: string,
@@ -315,6 +335,64 @@ class BetterSqlite3DatabaseAdapter implements SQLiteDatabase {
       "all",
       params,
     );
+  }
+
+  allRaw(
+    sql: string,
+    params: readonly unknown[] = [],
+  ): { columns: string[]; rows: unknown[][] } {
+    const statement = this.database.prepare(sql);
+    // Preserve all()'s non-reader error contract: the driver uses it to fall
+    // back to run() for assignment PRAGMAs; raw() rejects non-readers with a
+    // different error message before all() can establish that contract.
+    if (!statement.reader)
+      throw new TypeError(
+        "This statement does not return data. Use run() instead.",
+      );
+    const rows = executeStatement<unknown[][]>(statement.raw(), "all", params);
+    const columns = statement.columns().map((column) => column.name);
+    return { columns, rows };
+  }
+
+  queryBounded(
+    sql: string,
+    params: readonly unknown[],
+    limit: number,
+    onResultSet?: () => void,
+  ) {
+    const statement = this.database.prepare(sql);
+    if (!statement.reader) {
+      const info = executeStatement<{ changes: number }>(
+        statement,
+        "run",
+        params,
+      );
+      return {
+        columns: [],
+        rows: [],
+        rowCount: info.changes,
+        changes: info.changes,
+        truncated: false,
+      };
+    }
+    onResultSet?.();
+    const exact = statement.raw().safeIntegers(true);
+    const iterator = params.length ? exact.iterate(params) : exact.iterate();
+    const rows: unknown[][] = [];
+    let rowCount = 0;
+    // Drain even INSERT/UPDATE/DELETE RETURNING completely. Breaking iteration
+    // at the display limit is not a safe substitute for mutation completion.
+    for (const row of iterator) {
+      rowCount++;
+      if (rows.length < limit)
+        rows.push(normalizeSqliteIntegers(row) as unknown[]);
+    }
+    return {
+      columns: statement.columns().map((column) => column.name),
+      rows,
+      rowCount,
+      truncated: rowCount > rows.length,
+    };
   }
 
   get(sql: string, params: readonly unknown[] = []): unknown {

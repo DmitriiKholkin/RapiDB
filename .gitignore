@@ -146,6 +146,5 @@ vite.config.ts.timestamp-*
 .DS_Store
 .rapidb-vscode/
 .vscode
-biome.json
 *.vsix
 .rapidb-runtime

@@ -903,6 +903,143 @@ describe("TableView", () => {
     expect(screen.getByText("Alice")).toBeTruthy();
   });
 
+  it.each([
+    "page",
+    "sort",
+    "filter",
+    "refetch",
+  ])("does not replay an undone edit against another PK after a %s commit", async (transition) => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData({ totalCount: 51 });
+
+    await user.dblClick(getBodyCell("name"));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Alice edited" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    expect(getBodyCell("name").textContent).toBe("Alice");
+
+    clearPostedMessages();
+    if (transition === "page") {
+      fireEvent.click(screen.getByRole("button", { name: "Next →" }));
+    } else if (transition === "sort") {
+      fireEvent.click(screen.getByText("id", { exact: true }));
+    } else if (transition === "filter") {
+      fireEvent.change(screen.getByLabelText("name filter value"), {
+        target: { value: "Carol" },
+      });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, DEBOUNCE + 50));
+      });
+    } else {
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    }
+    await waitFor(() => {
+      expect(getLastPostedMessage()?.type).toBe("fetchPage");
+    });
+    const fetch = lastFetchPayload();
+    if (transition === "page") expect(fetch.page).toBe(2);
+    if (transition === "sort") {
+      expect(fetch.sort).toEqual({ column: "id", direction: "asc" });
+    }
+    if (transition === "filter") {
+      expect(fetch.filters).toEqual([
+        { column: "name", operator: "like", value: "Carol" },
+      ]);
+    }
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: fetch.fetchId,
+        rows: [{ id: 26, name: "Carol" }],
+        totalCount: 51,
+      });
+      // Exercise the keyboard handler before the commit's React rerender too.
+      fireEvent.keyDown(document.body, {
+        key: "z",
+        code: "KeyZ",
+        ctrlKey: true,
+        metaKey: true,
+        shiftKey: true,
+      });
+    });
+    fireEvent.keyDown(document.body, {
+      key: "z",
+      code: "KeyZ",
+      ctrlKey: true,
+      metaKey: true,
+      shiftKey: true,
+    });
+    expect(getBodyCell("name").textContent).toBe("Carol");
+    expect(screen.queryByText(/unsaved changes/)).toBeNull();
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+
+    await user.dblClick(getBodyCell("name"));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Carol edited" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await user.click(screen.getByRole("button", { name: /Apply Changes/ }));
+    expect(getLastPostedMessage()).toEqual({
+      type: "applyChanges",
+      payload: {
+        updates: [
+          {
+            primaryKeys: { id: 26 },
+            changes: { name: "Carol edited" },
+            originalValues: { name: "Carol" },
+          },
+        ],
+      },
+    });
+  });
+
+  it("clears undo snapshots while retaining pending edits by PK on a rows commit", async () => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData();
+    await user.dblClick(getBodyCell("name"));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Alice edited" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        rows: [rows[1], rows[0]],
+        totalCount: 2,
+      });
+    });
+    expect(
+      (screen.getByRole("button", { name: "Undo" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(
+      (screen.getByRole("button", { name: "Redo" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    fireEvent.keyDown(document.body, {
+      key: "z",
+      code: "KeyZ",
+      ctrlKey: true,
+      metaKey: true,
+    });
+    expect(getBodyCell("name", 0).textContent).toBe("Bob");
+    expect(getBodyCell("name", 1).textContent).toBe("Alice edited");
+    await user.click(screen.getByRole("button", { name: /Apply Changes/ }));
+    expect(getLastPostedMessage()).toEqual({
+      type: "applyChanges",
+      payload: {
+        updates: [
+          {
+            primaryKeys: { id: 1 },
+            changes: { name: "Alice edited" },
+            originalValues: { name: "Alice" },
+          },
+        ],
+      },
+    });
+  });
+
   it("requests pages, debounces filter application, and renders filter errors", async () => {
     renderTableView();
 
@@ -1583,6 +1720,145 @@ describe("TableView", () => {
   });
 
   it.each([
+    "during",
+    "after",
+    "same-turn",
+    "read-error",
+  ])("rejects clipboard replies %s a partial-apply refetch", async (timing) => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData();
+    await user.dblClick(getBodyCell("name"));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Retained" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await user.dblClick(getBodyCell("name", 1));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Saved Bob" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    const cell = getBodyCell("name");
+    fireEvent.mouseDown(cell, { button: 0 });
+    fireEvent.mouseUp(cell);
+    fireEvent.paste(window);
+    const request = getLastPostedMessage();
+    expect(request?.type).toBe("readClipboard");
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    const reply = () =>
+      dispatchIncomingMessage("clipboardText", {
+        ...(request?.payload as object),
+        text: "Stale paste",
+      });
+    await act(async () => {
+      dispatchIncomingMessage("applyResult", {
+        success: true,
+        rowOutcomes: [
+          { rowIndex: 0, success: false, status: "verification_failed" },
+          { rowIndex: 1, success: true, status: "applied" },
+        ],
+      });
+      if (timing === "same-turn") reply();
+      fireEvent.paste(window);
+      fireEvent.keyDown(document.body, {
+        key: "z",
+        code: "KeyZ",
+        ctrlKey: true,
+        metaKey: true,
+      });
+    });
+    expect(postedMessagesOfType("readClipboard")).toHaveLength(1);
+    expect(getBodyCell("name").textContent).toBe("Retained");
+    if (timing === "during") await act(async () => reply());
+    fireEvent.paste(window);
+    expect(postedMessagesOfType("readClipboard")).toHaveLength(1);
+    if (timing === "read-error") {
+      await act(async () =>
+        dispatchIncomingMessage("tableError", {
+          fetchId: lastFetchPayload().fetchId,
+          error: "Read failed",
+        }),
+      );
+      await act(async () => reply());
+      expect(getBodyCell("name").textContent).toBe("Retained");
+      await user.dblClick(getBodyCell("name"));
+      fireEvent.change(screen.getByLabelText("Cell data"), {
+        target: { value: "Newer edit" },
+      });
+      await user.click(screen.getByRole("button", { name: "Apply" }));
+    }
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: [{ id: 2, name: "Saved Bob" }, rows[0]],
+        totalCount: 2,
+      }),
+    );
+    if (timing === "after") await act(async () => reply());
+    expect(getBodyCell("name", 0).textContent).toBe("Saved Bob");
+    const retainedValue = timing === "read-error" ? "Newer edit" : "Retained";
+    expect(getBodyCell("name", 1).textContent).toBe(retainedValue);
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "applyChanges",
+      payload: {
+        updates: [
+          {
+            primaryKeys: { id: 1 },
+            changes: { name: retainedValue },
+            originalValues: { name: "Alice" },
+          },
+        ],
+      },
+    });
+  });
+
+  it("blocks undo and redo during refetch and preserves history if the read fails", async () => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData();
+    await user.dblClick(getBodyCell("name"));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Edited" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+      fireEvent.keyDown(document.body, {
+        key: "z",
+        code: "KeyZ",
+        ctrlKey: true,
+        metaKey: true,
+        shiftKey: true,
+      });
+    });
+    expect(getBodyCell("name").textContent).toBe("Alice");
+    fireEvent.keyDown(document.body, {
+      key: "z",
+      code: "KeyZ",
+      ctrlKey: true,
+      metaKey: true,
+      shiftKey: true,
+    });
+    expect(getBodyCell("name").textContent).toBe("Alice");
+    await act(async () =>
+      dispatchIncomingMessage("tableError", {
+        fetchId: lastFetchPayload().fetchId,
+        error: "Read failed",
+      }),
+    );
+    fireEvent.keyDown(document.body, {
+      key: "z",
+      code: "KeyZ",
+      ctrlKey: true,
+      metaKey: true,
+      shiftKey: true,
+    });
+    expect(getBodyCell("name").textContent).toBe("Edited");
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    expect(getBodyCell("name").textContent).toBe("Alice");
+  });
+
+  it.each([
     "context",
     "keyboard",
   ])("uses the correct paste target inside a selection (%s)", async (source) => {
@@ -2257,7 +2533,7 @@ describe("TableView", () => {
     expect(
       (screen.getByLabelText("Cell data") as HTMLTextAreaElement).value,
     ).toBe("draft text");
-      await user.click(screen.getByRole("button", { name: "NULL" }));
+    await user.click(screen.getByRole("button", { name: "NULL" }));
     await user.click(getBodyCell("name", 1));
     await user.keyboard("{F2}");
     expect(screen.queryByRole("dialog")).toBeNull();
@@ -2654,6 +2930,63 @@ describe("TableView", () => {
     expect(
       (screen.getByLabelText("Mutation preview") as HTMLTextAreaElement).value,
     ).toBe(previewText);
+  });
+
+  it("preserves draft undo and redo across no-op commits without conflating DEFAULT, NULL or empty", async () => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData();
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    const draft = () => getBodyCell("id", 0);
+    fireEvent.doubleClick(draft());
+    await user.click(screen.getByRole("button", { name: "DEF" }));
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    expect(screen.queryByText("DEFAULT")).toBeNull();
+    fireEvent.keyDown(document.body, {
+      key: "z",
+      code: "KeyZ",
+      ctrlKey: true,
+      metaKey: true,
+      shiftKey: true,
+    });
+    expect(draft().textContent).toContain("DEFAULT");
+
+    fireEvent.doubleClick(draft());
+    fireEvent.change(screen.getByLabelText("Cell value"), {
+      target: { value: "42" },
+    });
+    fireEvent.blur(screen.getByLabelText("Cell value"));
+    fireEvent.doubleClick(draft());
+    fireEvent.change(screen.getByLabelText("Cell value"), {
+      target: { value: "43" },
+    });
+    fireEvent.keyDown(screen.getByLabelText("Cell value"), { key: "Enter" });
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    expect(draft().textContent).toBe("42");
+    fireEvent.doubleClick(draft());
+    fireEvent.blur(screen.getByLabelText("Cell value"));
+    expect(
+      (screen.getByRole("button", { name: "Redo" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Redo" }));
+    expect(draft().textContent).toBe("43");
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    expect(draft().textContent).toContain("DEFAULT");
+
+    fireEvent.doubleClick(getBodyCell("name", 0));
+    await user.click(screen.getByRole("button", { name: "NULL" }));
+    expect(getBodyCell("name", 0).textContent).toBe("NULL");
+    fireEvent.doubleClick(getBodyCell("name", 0));
+    await user.click(screen.getByRole("button", { name: "NULL" }));
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    expect(getBodyCell("name", 0).textContent).toContain("DEFAULT");
+    await user.click(screen.getByRole("button", { name: "Redo" }));
+    fireEvent.doubleClick(getBodyCell("name", 0));
+    fireEvent.keyDown(screen.getByLabelText("Cell value"), { key: "Enter" });
+    expect(getBodyCell("name", 0).textContent).toBe("");
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    expect(getBodyCell("name", 0).textContent).toBe("NULL");
   });
 
   it("supports insert with all DEFAULT fields and explicit draft edits", async () => {

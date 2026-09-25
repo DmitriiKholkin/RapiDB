@@ -82,6 +82,67 @@ describe("ConnectionFormPanel", () => {
     vi.clearAllMocks();
   });
 
+  it.each([
+    "saveConnection",
+    "testConnection",
+  ])("blocks %s with malformed TLS before accessing secrets or the manager", async (type) => {
+    const context = {
+      secrets: { get: vi.fn(), store: vi.fn(), delete: vi.fn() },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn().mockResolvedValue(undefined),
+      getConnection: vi.fn(() => undefined),
+      testConnection: vi.fn(async () => ({ success: true })),
+    };
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+    );
+    const panel = createdPanel()!;
+    const payload = {
+      id: "tls-regression",
+      name: "TLS",
+      type: "pg",
+      host: "db.local",
+      database: "app",
+      username: "reader",
+    };
+    for (const tls of [
+      null,
+      [],
+      {},
+      "requireVerifyFull",
+      { mode: "unknown", caFilePath: "/certs/ca.pem" },
+      { mode: "requireVerifyFull ", caFilePath: "/certs/ca.pem" },
+      { mode: 1 },
+      { mode: "requireVerifyFull", caFilePath: 42 },
+      { mode: "mutualTls", certFilePath: {}, keyFilePath: "/certs/key.pem" },
+    ]) {
+      await panel.webview.dispatchMessage({
+        type,
+        payload: { ...payload, tls },
+      });
+    }
+    expect(connectionManager.saveConnection).not.toHaveBeenCalled();
+    expect(connectionManager.testConnection).not.toHaveBeenCalled();
+    expect(connectionManager.getConnection).not.toHaveBeenCalled();
+    expect(context.secrets.get).not.toHaveBeenCalled();
+    expect(context.secrets.store).not.toHaveBeenCalled();
+
+    // A valid retry must retain TLS all the way to the manager.
+    const tls = { mode: "requireVerifyFull", caFilePath: "/certs/ca.pem" };
+    await panel.webview.dispatchMessage({ type, payload: { ...payload, tls } });
+    const action =
+      type === "saveConnection"
+        ? connectionManager.saveConnection
+        : connectionManager.testConnection;
+    expect(action).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ tls }),
+    );
+    panel.dispose();
+    await promise;
+  });
+
   it("reuses stored TLS key passphrases and resolves a sanitized config", async () => {
     const context = {
       secrets: {
@@ -401,7 +462,7 @@ describe("ConnectionFormPanel", () => {
         id: "conn-edit-sanitized",
         name: "Elastic SSH",
         type: "elasticsearch",
-        endpoint: "https://elastic-user:elastic-pass@cluster.example.com",
+        endpoint: "https://elastic-user:elastic-p@ss@cluster.example.com",
         apiKey: "inline-api-key",
         awsAccessKeyId: "AKIA123",
         awsSecretAccessKey: "secret-key",
@@ -455,6 +516,50 @@ describe("ConnectionFormPanel", () => {
 
     const panel = createdPanel();
     panel?.dispose();
+    await expect(promise).resolves.toBeUndefined();
+  });
+
+  it.each([
+    "/",
+    "?",
+    "#",
+    " ",
+  ])("rejects ambiguous URI credentials with %j in form saves", async (delimiter) => {
+    const context = {
+      secrets: {
+        get: vi.fn(async () => undefined),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn(),
+      getConnection: vi.fn(() => undefined),
+      testConnection: vi.fn(),
+    };
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+    );
+    const panel = createdPanel()!;
+    const connectionUri = `redis://user:pa${delimiter}ss@host:6379/0`;
+    await panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: { id: "ambiguous", name: "Redis", type: "redis", connectionUri },
+    });
+    expect(connectionManager.saveConnection).not.toHaveBeenCalled();
+    expect(context.secrets.store).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "saveResult",
+      payload: expect.objectContaining({
+        success: false,
+        error: expect.stringContaining("Ambiguous URI credentials"),
+      }),
+    });
+    expect(JSON.stringify(panel.webview.postMessage.mock.calls)).not.toContain(
+      "ss@host",
+    );
+    panel.dispose();
     await expect(promise).resolves.toBeUndefined();
   });
 

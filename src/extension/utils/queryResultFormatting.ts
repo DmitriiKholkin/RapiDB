@@ -8,7 +8,7 @@
  *    (numbers, bigints, buffers, dates, points, intervals, etc.).
  */
 
-import { type QueryColumnMeta } from "../../shared/tableTypes";
+import type { QueryColumnMeta } from "../../shared/tableTypes";
 import {
   formatDatetimeForDisplay,
   hexFromBuffer,
@@ -30,7 +30,7 @@ export function formatQueryResult(
   result: QueryResult,
   rowLimit: number,
 ): FormattedQueryResult {
-  const truncated = result.rows.length > rowLimit;
+  const truncated = result.truncated === true || result.rows.length > rowLimit;
   const sampledRows = truncated ? result.rows.slice(0, rowLimit) : result.rows;
   const columnMeta = resolveQueryColumnMeta(result.columns, result.columnMeta);
 

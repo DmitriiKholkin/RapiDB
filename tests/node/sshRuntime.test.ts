@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
+import * as http from "node:http";
 import * as net from "node:net";
-import type { Duplex } from "node:stream";
-import { PassThrough } from "node:stream";
-import { afterEach, describe, expect, it } from "vitest";
+import { Duplex, PassThrough } from "node:stream";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildSshFingerprintSha256,
   type ConnectionSshSettings,
@@ -29,6 +29,7 @@ class FakeSshClient extends EventEmitter {
     dstPort: number;
   }> = [];
   ended = false;
+  endCalls = 0;
   readonly presentedHostKey = Buffer.from("ssh-host-key");
 
   connect(options: ConnectOptions): void {
@@ -44,6 +45,7 @@ class FakeSshClient extends EventEmitter {
   }
 
   end(): void {
+    this.endCalls += 1;
     this.ended = true;
     this.emit("close");
   }
@@ -53,7 +55,7 @@ class FakeSshClient extends EventEmitter {
     srcPort: number,
     dstIP: string,
     dstPort: number,
-    callback: (error: Error | undefined, stream?: PassThrough) => void,
+    callback: (error: Error | undefined, stream?: Duplex) => void,
   ): void {
     this.forwardOutCalls.push({ srcIP, srcPort, dstIP, dstPort });
     const stream = new PassThrough();
@@ -117,6 +119,246 @@ afterEach(async () => {
 });
 
 describe("sshRuntime", () => {
+  it("propagates transport failure to an active HTTP request", async () => {
+    const runtime = await createRuntime(sshSettings, { kind: "httpAgent" });
+    if (runtime.transport.kind !== "httpAgent")
+      throw new Error("Expected agent");
+    const client = createdClients[0];
+    const channel = new Duplex({
+      read() {},
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+    vi.spyOn(client, "forwardOut").mockImplementation(
+      (_a, _b, _c, _d, callback) => {
+        callback(undefined, channel);
+      },
+    );
+    const request = http.get("http://db.internal/", {
+      agent: runtime.transport.httpAgent,
+    });
+    const error = new Promise<Error>((resolve) =>
+      request.once("error", resolve),
+    );
+    try {
+      await new Promise<void>((resolve) =>
+        request.once("socket", () => resolve()),
+      );
+      const failure = new Error("SSH transport reset");
+      expect(() => client.emit("error", failure)).not.toThrow();
+      await expect(error).resolves.toBe(failure);
+      expect(channel.destroyed).toBe(true);
+    } finally {
+      request.destroy();
+      await runtime.dispose();
+    }
+  }, 1500);
+
+  it("rejects an unfinished HTTPS handshake when disposed", async () => {
+    const runtime = await createRuntime(sshSettings, { kind: "httpAgent" });
+    if (runtime.transport.kind !== "httpAgent")
+      throw new Error("Expected agent");
+    const channel = new Duplex({
+      read() {},
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+    vi.spyOn(createdClients[0], "forwardOut").mockImplementation(
+      (_a, _b, _c, _d, callback) => {
+        callback(undefined, channel);
+      },
+    );
+    const agent = runtime.transport.httpsAgent as unknown as {
+      connect(req: unknown, options: { host: string }): Promise<Duplex>;
+    };
+    const result = agent
+      .connect({}, { host: "db.internal" })
+      .catch((error: unknown) => error);
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await runtime.dispose();
+      expect(await result).toMatchObject({
+        message: "[RapiDB] SSH runtime disposed",
+      });
+      expect(channel.destroyed).toBe(true);
+    } finally {
+      await runtime.dispose();
+    }
+  }, 1500);
+
+  it.each([
+    "tcpForward",
+    "httpAgent",
+  ] as const)("rejects errors immediately after ready during %s setup", async (kind) => {
+    const failure = new Error("transport failed immediately after ready");
+    class FailingClient extends FakeSshClient {
+      constructor() {
+        super();
+        createdClients.push(this);
+      }
+
+      override connect(options: ConnectOptions): void {
+        options.hostVerifier(this.presentedHostKey);
+        this.emit("ready");
+        this.emit("error", failure);
+      }
+    }
+    await expect(
+      createSshRuntime(
+        sshSettings,
+        kind === "tcpForward"
+          ? { kind, remoteHost: "db.internal", remotePort: 5432 }
+          : { kind },
+        { loadSsh2: async () => ({ Client: FailingClient }) },
+      ),
+    ).rejects.toBe(failure);
+    const client = createdClients[0];
+    expect(client.endCalls).toBe(1);
+    expect(() => client.emit("error", new Error("late error"))).not.toThrow();
+  });
+
+  it.each([
+    "dispose",
+    "error",
+    "close",
+  ] as const)("closes open TCP sockets and channels on %s within a bounded time", async (action) => {
+    const runtime = await createRuntime();
+    if (runtime.transport.kind !== "tcpForward")
+      throw new Error("Expected TCP");
+    const client = createdClients[0];
+    const upstream = new PassThrough();
+    vi.spyOn(client, "forwardOut").mockImplementation(
+      (_a, _b, _c, _d, callback) => {
+        callback(undefined, upstream);
+      },
+    );
+    const socket = net.createConnection(
+      runtime.transport.localPort,
+      runtime.transport.localHost,
+    );
+    socket.on("error", () => socket.destroy());
+    try {
+      await new Promise<void>((resolve) => socket.once("connect", resolve));
+      await vi.waitFor(() => expect(client.forwardOut).toHaveBeenCalledOnce());
+      const closed = new Promise<void>((resolve) =>
+        socket.once("close", () => resolve()),
+      );
+      if (action === "error") {
+        expect(() =>
+          client.emit("error", new Error("transport lost")),
+        ).not.toThrow();
+      } else if (action === "close") {
+        client.emit("close");
+      }
+      const disposal = runtime.dispose();
+      expect(runtime.dispose()).toBe(disposal);
+      await Promise.all([disposal, closed]);
+      expect(upstream.destroyed).toBe(true);
+      expect(client.endCalls).toBe(1);
+      expect(() =>
+        client.emit("error", new Error("late transport error")),
+      ).not.toThrow();
+    } finally {
+      socket.destroy();
+      upstream.destroy();
+      await runtime.dispose();
+    }
+  }, 1500);
+
+  it("destroys a TCP channel returned after repeated disposal", async () => {
+    const runtime = await createRuntime();
+    if (runtime.transport.kind !== "tcpForward")
+      throw new Error("Expected TCP");
+    const client = createdClients[0];
+    let finish:
+      | ((error: Error | undefined, stream?: PassThrough) => void)
+      | undefined;
+    vi.spyOn(client, "forwardOut").mockImplementation(
+      (_a, _b, _c, _d, callback) => {
+        finish = callback;
+      },
+    );
+    const socket = net.createConnection(
+      runtime.transport.localPort,
+      runtime.transport.localHost,
+    );
+    socket.on("error", () => socket.destroy());
+    try {
+      await vi.waitFor(() => expect(finish).toBeDefined());
+      await Promise.all([runtime.dispose(), runtime.dispose()]);
+      const late = new PassThrough();
+      finish!(undefined, late);
+      expect(late.destroyed).toBe(true);
+      expect(() =>
+        late.emit("error", new Error("late channel error")),
+      ).not.toThrow();
+      expect(client.endCalls).toBe(1);
+    } finally {
+      socket.destroy();
+      await runtime.dispose();
+    }
+  }, 1500);
+
+  it.each([
+    false,
+    true,
+  ])("rejects pending HTTP forwarding on shutdown (error=%s) and destroys late channels", async (fail) => {
+    const runtime = await createRuntime(sshSettings, { kind: "httpAgent" });
+    if (runtime.transport.kind !== "httpAgent")
+      throw new Error("Expected agent");
+    const client = createdClients[0];
+    let finish:
+      | ((error: Error | undefined, stream?: PassThrough) => void)
+      | undefined;
+    vi.spyOn(client, "forwardOut").mockImplementation(
+      (_a, _b, _c, _d, callback) => {
+        finish = callback;
+      },
+    );
+    const agent = runtime.transport.httpAgent as unknown as {
+      connect(req: unknown, options: { host: string }): Promise<Duplex>;
+    };
+    const pending = agent.connect({}, { host: "db.internal" });
+    const rejected = expect(pending).rejects.toThrow(
+      fail ? "transport lost" : "disposed",
+    );
+    if (fail) client.emit("error", new Error("transport lost"));
+    await runtime.dispose();
+    await rejected;
+    const late = new PassThrough();
+    finish!(undefined, late);
+    expect(late.destroyed).toBe(true);
+    await runtime.dispose();
+    expect(client.endCalls).toBe(1);
+  });
+
+  it("retains post-ready transport errors and rejects subsequent HTTP forwards", async () => {
+    const runtime = await createRuntime(sshSettings, { kind: "httpAgent" });
+    if (runtime.transport.kind !== "httpAgent")
+      throw new Error("Expected agent");
+    const client = createdClients[0];
+    const failure = new Error("SSH keepalive timed out");
+    expect(() => client.emit("error", failure)).not.toThrow();
+    expect(client.ended).toBe(true);
+    const agent = runtime.transport.httpAgent as unknown as {
+      connect(req: unknown, options: { host: string }): Promise<Duplex>;
+    };
+    await expect(agent.connect({}, { host: "db.internal" })).rejects.toBe(
+      failure,
+    );
+    expect(() => client.emit("error", new Error("late error"))).not.toThrow();
+    await runtime.dispose();
+  });
+
+  it("propagates host verification failures without an unhandled error", async () => {
+    await expect(
+      createRuntime({ ...sshSettings, fingerprintSha256: "SHA256:wrong" }),
+    ).rejects.toThrow("Host verification failed");
+    expect(createdClients[0].ended).toBe(true);
+  });
+
   it("verifies the exact SHA256 host fingerprint and forwards auth settings", async () => {
     const runtime = await createRuntime();
     const client = createdClients[0];

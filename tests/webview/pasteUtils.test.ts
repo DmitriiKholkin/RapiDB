@@ -88,6 +88,74 @@ const FLOAT_COLUMN = makeColumn({
   category: "float",
 });
 
+describe("type-sensitive numeric paste validation", () => {
+  it.each([
+    INTEGER_COLUMN,
+    FLOAT_COLUMN,
+    DECIMAL_COLUMN,
+  ])("rejects garbage and non-finite literals for $category", (column) => {
+    for (const value of [
+      "abc123",
+      "10xyz",
+      "mis500",
+      "Infinity",
+      "-Infinity",
+      "NaN",
+      "0x10",
+    ]) {
+      expect(validatePasteValue(value, column).valid).toBe(false);
+    }
+  });
+
+  it.each([
+    "1e999",
+    "1e3",
+    "1.5",
+    "1.0",
+    "9007199254740993.1",
+    "1e-999",
+  ])("rejects non-integer literals without rounding: %s", (value) =>
+    expect(validatePasteValue(value, INTEGER_COLUMN).valid).toBe(false));
+
+  it.each([
+    "9223372036854775807",
+    "18446744073709551615",
+    "9".repeat(400),
+  ])("preserves huge integer text: %s", (value) => {
+    for (const column of [INTEGER_COLUMN, DECIMAL_COLUMN]) {
+      expect(validatePasteValue(value, column)).toEqual({
+        valid: true,
+        coercedValue: value,
+      });
+    }
+  });
+
+  it("distinguishes float overflow from exact decimal range", () => {
+    const numeric = makeColumn({
+      name: "amount",
+      category: "decimal",
+      nativeType: "numeric",
+    });
+    for (const value of ["1e999", "9".repeat(400)]) {
+      expect(validatePasteValue(value, FLOAT_COLUMN).valid).toBe(false);
+      expect(validatePasteValue(value, numeric)).toEqual({
+        valid: true,
+        coercedValue: value,
+      });
+    }
+    for (const value of ["1.5", "1e3", "12345678901234567890.123456789"]) {
+      expect(validatePasteValue(value, FLOAT_COLUMN)).toEqual({
+        valid: true,
+        coercedValue: value,
+      });
+      expect(validatePasteValue(value, numeric)).toEqual({
+        valid: true,
+        coercedValue: value,
+      });
+    }
+  });
+});
+
 describe("TSV clipboard format", () => {
   it("serializes ordinary tabular data without unnecessary quotes", () => {
     expect(
