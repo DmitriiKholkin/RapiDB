@@ -41,7 +41,12 @@ import type {
   TypeCategory,
   ValueSemantics,
 } from "./types";
-import { DATETIME_SQL_RE, ISO_DATETIME_RE, NULL_SENTINEL } from "./types";
+import {
+  assertTransactionAffectedRows,
+  DATETIME_SQL_RE,
+  ISO_DATETIME_RE,
+  NULL_SENTINEL,
+} from "./types";
 
 const MYSQL_ENTITY_MANIFEST: DriverEntityManifest = {
   dbObjectKinds: ["table", "view", "function", "procedure"],
@@ -2148,14 +2153,7 @@ export class MySQLDriver extends BaseDBDriver {
         const [rows] = await conn.query<ResultSetHeader>(
           this.createQueryOptions(op.sql, op.params as QueryOptions["values"]),
         );
-        if (op.checkAffectedRows) {
-          const affectedRows = rows.affectedRows;
-          if (affectedRows === 0) {
-            throw new Error(
-              "Row not found — the row may have been modified or deleted by another user",
-            );
-          }
-        }
+        assertTransactionAffectedRows(op, rows.affectedRows);
       }
       throwIfTransactionCancelled(context);
       await conn.commit();
@@ -2200,7 +2198,7 @@ export class MySQLDriver extends BaseDBDriver {
     if (!nonTransactionalEngines.has(engine)) {
       return null;
     }
-    return `Table \`${database}\`.\`${table}\` uses the non-transactional MySQL engine ${engine}. Multi-row apply operations are blocked to avoid partial writes. Convert the table to InnoDB or apply rows one by one.`;
+    return `Table \`${database}\`.\`${table}\` uses the non-transactional MySQL engine ${engine}. Multi-statement table mutations are blocked to avoid partial writes. Convert the table to InnoDB or apply rows one by one.`;
   }
   mapTypeCategory(nativeType: string): TypeCategory {
     const ct = nativeType.toLowerCase();

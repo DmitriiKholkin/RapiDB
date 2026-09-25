@@ -4,6 +4,7 @@ import type {
   ColumnTypeMeta,
   IDBDriver,
 } from "../../src/extension/dbDrivers/types";
+import { assertTransactionAffectedRows } from "../../src/extension/dbDrivers/types";
 import { buildWhere } from "../../src/extension/table/filterSql";
 import { buildInsertRowOperation } from "../../src/extension/table/insertSql";
 import {
@@ -1251,5 +1252,78 @@ describe("table helpers", () => {
     await pendingExecution;
     expect(maxInFlightExistenceChecks).toBeGreaterThan(1);
     expect(maxInFlightExistenceChecks).toBeLessThanOrEqual(8);
+  });
+
+  it("adds exact affected-row expectations to chunked delete plans", async () => {
+    const getMutationAtomicityRisk = vi.fn(async () => null);
+    const mutationService = new TableMutationService(
+      {
+        getConnection: () => ({
+          id: "conn-1",
+          name: "Writable",
+          readOnly: false,
+        }),
+        getDriver: () => ({ ...fakeDriver, getMutationAtomicityRisk }),
+      } as never,
+      { getColumns: async () => columns },
+    );
+
+    const plan = await mutationService.prepareDeleteRowsPlan(
+      "conn-1",
+      "main",
+      "public",
+      "fixture_rows",
+      Array.from({ length: 1001 }, (_, index) => ({ id: index + 1 })),
+    );
+
+    expect(plan?.executionMode).toBe("transaction");
+    expect(plan?.operations).toEqual([
+      expect.objectContaining({ expectedAffectedRows: 1000 }),
+      expect.objectContaining({ expectedAffectedRows: 1 }),
+    ]);
+    expect(getMutationAtomicityRisk).toHaveBeenCalledWith(
+      "main",
+      "public",
+      "fixture_rows",
+    );
+  });
+
+  it("blocks risky multi-statement delete plans before execution", async () => {
+    const mutationService = new TableMutationService(
+      {
+        getConnection: () => ({
+          id: "conn-1",
+          name: "Writable",
+          readOnly: false,
+        }),
+        getDriver: () => ({
+          ...fakeDriver,
+          getMutationAtomicityRisk: async () => "non-transactional table",
+        }),
+      } as never,
+      { getColumns: async () => compositePrimaryKeyColumns },
+    );
+
+    await expect(
+      mutationService.prepareDeleteRowsPlan(
+        "conn-1",
+        "main",
+        "public",
+        "fixture_rows",
+        [
+          { tenant_id: 1, external_id: 1 },
+          { tenant_id: 1, external_id: 2 },
+        ],
+      ),
+    ).rejects.toThrow("non-transactional table");
+  });
+
+  it("rejects exact affected-row mismatches", () => {
+    expect(() =>
+      assertTransactionAffectedRows(
+        { sql: "DELETE", expectedAffectedRows: 2 },
+        1,
+      ),
+    ).toThrow(/affected 1 row.*expected 2/i);
   });
 });

@@ -1745,6 +1745,56 @@ describe("ConnectionManager", () => {
     expect(driverInstances[0]?.disconnectCalls).toBe(1);
   });
 
+  it.each([
+    "resolve",
+    "reject",
+  ] as const)("cleans up a cancelled test connection after late %s", async (settlement) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const connectDeferred = createDeferred<void>();
+    driverBehaviors.set("__test__", {
+      connectImpl: () => connectDeferred.promise,
+    });
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      new FakeConnectionManagerStore(),
+    );
+    const controller = new AbortController();
+
+    const pending = manager.testConnection(
+      {
+        name: "Pending",
+        type: "mysql",
+        host: "localhost",
+        database: "app",
+        username: "root",
+      },
+      controller.signal,
+    );
+    await vi.waitFor(() => expect(driverInstances[0]?.connectCalls).toBe(1));
+
+    controller.abort();
+
+    await expect(pending).resolves.toEqual({
+      success: false,
+      error: "Aborted",
+    });
+    expect(driverInstances[0]?.disconnectCalls).toBeGreaterThanOrEqual(1);
+    const disconnectCalls = driverInstances[0].disconnectCalls;
+    if (settlement === "resolve") {
+      connectDeferred.resolve();
+    } else {
+      connectDeferred.reject(new Error("Late connection failure"));
+    }
+    await vi.waitFor(() => {
+      expect(driverInstances[0].disconnectCalls).toBeGreaterThan(
+        disconnectCalls,
+      );
+      expect(driverInstances[0].isConnected()).toBe(false);
+    });
+  });
+
   it("hydrates stored DynamoDB credentials from Secret Storage before connecting", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
@@ -2122,6 +2172,7 @@ describe("ConnectionManager", () => {
     expect(createSshRuntime).toHaveBeenCalledWith(
       expect.objectContaining({ port: port ?? 22 }),
       expect.objectContaining({ remoteHost: "db.internal", remotePort: 5432 }),
+      { signal: expect.any(AbortSignal) },
     );
     expect(driverInstances[0]?.config).toMatchObject({
       host: "127.0.0.1",
@@ -2354,6 +2405,7 @@ describe("ConnectionManager", () => {
       {
         kind: "httpAgent",
       },
+      { signal: expect.any(AbortSignal) },
     );
     expect(driverInstances[0]?.config).toMatchObject({
       id: "conn-es-ssh",
@@ -2429,6 +2481,7 @@ describe("ConnectionManager", () => {
         remoteHost: "db.internal",
         remotePort: 5432,
       },
+      { signal: expect.any(AbortSignal) },
     );
 
     expect(

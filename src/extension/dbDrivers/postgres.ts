@@ -44,7 +44,12 @@ import type {
   TypeCategory,
   ValueSemantics,
 } from "./types";
-import { DATETIME_SQL_RE, ISO_DATETIME_RE, NULL_SENTINEL } from "./types";
+import {
+  assertTransactionAffectedRows,
+  DATETIME_SQL_RE,
+  ISO_DATETIME_RE,
+  NULL_SENTINEL,
+} from "./types";
 
 const POSTGRES_ENTITY_MANIFEST: DriverEntityManifest = {
   dbObjectKinds: [
@@ -1592,11 +1597,7 @@ export class PostgresDriver extends BaseDBDriver {
       for (const op of operations) {
         throwIfTransactionCancelled(context);
         const res = await client.query(op.sql, op.params ?? []);
-        if (op.checkAffectedRows && res.rowCount === 0) {
-          throw new Error(
-            "Row not found — the row may have been modified or deleted by another user",
-          );
-        }
+        assertTransactionAffectedRows(op, res.rowCount ?? 0);
       }
       throwIfTransactionCancelled(context);
       await client.query("COMMIT");

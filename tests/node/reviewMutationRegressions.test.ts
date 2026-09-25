@@ -34,6 +34,52 @@ afterEach(() => {
 
 describe("review mutation regressions", () => {
   it.each([
+    1, 0,
+  ] as const)("validates MSSQL DML count %s independently of trigger row counts", async (affectedRows) => {
+    const driver = new MSSQLDriver({ ...config, type: "mssql" });
+    (driver as unknown as { pool: unknown }).pool = { config: { options: {} } };
+    const request = {
+      output: vi.fn(),
+      query: vi.fn(async () => ({
+        rowsAffected: [1, affectedRows],
+        output: { __rapidb_affected_rows: affectedRows },
+      })),
+    };
+    vi.spyOn(mssql.Transaction.prototype, "begin").mockImplementation(
+      (async () => undefined) as never,
+    );
+    vi.spyOn(mssql.Transaction.prototype, "request").mockReturnValue(
+      request as never,
+    );
+    const commit = vi
+      .spyOn(mssql.Transaction.prototype, "commit")
+      .mockImplementation((async () => undefined) as never);
+    const rollback = vi
+      .spyOn(mssql.Transaction.prototype, "rollback")
+      .mockImplementation((async () => undefined) as never);
+
+    const pending = driver.runTransaction([
+      { sql: "DELETE FROM [items] WHERE [id] = 1", expectedAffectedRows: 1 },
+    ]);
+    if (affectedRows === 1) {
+      await expect(pending).resolves.toBeUndefined();
+      expect(commit).toHaveBeenCalledOnce();
+      expect(rollback).not.toHaveBeenCalled();
+    } else {
+      await expect(pending).rejects.toThrow("Mutation affected 0 row(s)");
+      expect(rollback).toHaveBeenCalledOnce();
+      expect(commit).not.toHaveBeenCalled();
+    }
+    expect(request.output).toHaveBeenCalledWith(
+      "__rapidb_affected_rows",
+      mssql.Int,
+    );
+    expect(request.query).toHaveBeenCalledWith(
+      "DELETE FROM [items] WHERE [id] = 1\n;SET @__rapidb_affected_rows = @@ROWCOUNT;",
+    );
+  });
+
+  it.each([
     ["pg", false],
     ["pg", true],
     ["mysql", false],

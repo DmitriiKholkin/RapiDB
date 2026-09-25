@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import * as http from "node:http";
-import * as https from "node:https";
+import type * as http from "node:http";
+import type * as https from "node:https";
 import * as net from "node:net";
 import type { Duplex } from "node:stream";
 import * as tls from "node:tls";
@@ -94,6 +94,7 @@ interface Ssh2ModuleLike {
 
 export interface SshRuntimeDependencies {
   loadSsh2?: () => Promise<Ssh2ModuleLike>;
+  signal?: AbortSignal;
 }
 
 const SSH2_MODULE_NAME = "ssh2";
@@ -103,13 +104,33 @@ class SshTransportLifetime {
   private readonly streams = new Set<Duplex>();
   readonly pendingForwards = new Set<(error: Error) => void>();
   private ended = false;
+  private readonly externalSignal?: AbortSignal;
+  private readonly onExternalAbort = () => {
+    const reason = this.externalSignal?.reason;
+    this.stop(
+      reason instanceof Error
+        ? reason
+        : new DOMException("Aborted", "AbortError"),
+    );
+  };
 
-  constructor(readonly client: SshClientLike) {
+  constructor(
+    readonly client: SshClientLike,
+    externalSignal?: AbortSignal,
+  ) {
+    this.externalSignal = externalSignal;
     // Keep this listener even after close: ssh2 can report late transport errors.
     client.on("error", (error) => this.stop(error));
     client.on("close", () =>
       this.stop(new Error("[RapiDB] SSH connection closed")),
     );
+    if (externalSignal?.aborted) {
+      this.onExternalAbort();
+    } else {
+      externalSignal?.addEventListener("abort", this.onExternalAbort, {
+        once: true,
+      });
+    }
   }
 
   get signal(): AbortSignal {
@@ -129,6 +150,7 @@ class SshTransportLifetime {
   }
 
   stop(error = new Error("[RapiDB] SSH runtime disposed")): void {
+    this.externalSignal?.removeEventListener("abort", this.onExternalAbort);
     if (this.signal.aborted) return;
     // Destroy accepted sockets before the abort listener waits for server.close.
     for (const stream of this.streams) stream.destroy(error);
@@ -433,36 +455,47 @@ async function createVerifiedClient(
   lifetime: SshTransportLifetime;
   verifiedFingerprintSha256: string;
 }> {
+  dependencies.signal?.throwIfAborted();
   const { Client } = await (dependencies.loadSsh2 ?? defaultLoadSsh2)();
+  dependencies.signal?.throwIfAborted();
   const client = new Client();
-  const lifetime = new SshTransportLifetime(client);
+  const lifetime = new SshTransportLifetime(client, dependencies.signal);
+  lifetime.signal.throwIfAborted();
   const hostVerifierState = createHostVerifier(ssh);
 
   try {
     await new Promise<void>((resolve, reject) => {
-      const onReady = () => {
+      const cleanup = () => {
+        client.removeListener("ready", onReady);
         client.removeListener("error", onError);
         client.removeListener("close", onClose);
+        lifetime.signal.removeEventListener("abort", onAbort);
+      };
+      const onReady = () => {
+        cleanup();
         if (lifetime.signal.aborted) reject(lifetime.signal.reason);
         else resolve();
       };
       const onError = (error: Error) => {
-        client.removeListener("ready", onReady);
-        client.removeListener("close", onClose);
+        cleanup();
         reject(error);
       };
       const onClose = () => {
-        client.removeListener("ready", onReady);
-        client.removeListener("error", onError);
+        cleanup();
         reject(
           lifetime.signal.reason ??
             new Error("[RapiDB] SSH connection closed before it became ready"),
         );
       };
+      const onAbort = () => {
+        cleanup();
+        reject(lifetime.signal.reason);
+      };
 
       client.once("ready", onReady);
       client.once("error", onError);
       client.once("close", onClose);
+      lifetime.signal.addEventListener("abort", onAbort, { once: true });
       client.connect({
         host: ssh.host,
         port: ssh.port,

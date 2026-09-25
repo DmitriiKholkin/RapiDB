@@ -41,6 +41,7 @@ import type {
   DriverEntityManifest,
   DriverInsertRowRequest,
   DriverMutationResult,
+  DriverOperationContext,
   DriverTablePageRequest,
   DriverTablePageResult,
   DriverUpdateRowsRequest,
@@ -1673,12 +1674,14 @@ export class MongoDBDriver implements IDBDriver {
 
   async updateRows(
     request: DriverUpdateRowsRequest,
+    context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
     const collection = this.requireDb(request.database).collection(
       request.table,
     );
     let affectedRows = 0;
     for (const update of request.updates) {
+      context?.signal.throwIfAborted();
       if (
         Object.hasOwn(update.changes, "_id") &&
         update.changes._id !== update.primaryKeys._id
@@ -1689,9 +1692,14 @@ export class MongoDBDriver implements IDBDriver {
         ...update.primaryKeys,
         ...(update.originalValues ?? {}),
       });
-      const result = await collection.updateOne(criteria, {
-        $set: update.changes,
-      });
+      const options = this.getMutationTimeoutOptions(context);
+      const result = options
+        ? await collection.updateOne(
+            criteria,
+            { $set: update.changes },
+            options,
+          )
+        : await collection.updateOne(criteria, { $set: update.changes });
       affectedRows += result.matchedCount;
     }
     return { affectedRows };
@@ -1699,16 +1707,24 @@ export class MongoDBDriver implements IDBDriver {
 
   async insertRow(
     request: DriverInsertRowRequest,
+    context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
-    const result = await this.requireDb(request.database)
-      .collection(request.table)
-      .insertOne(request.values);
+    context?.signal.throwIfAborted();
+    const collection = this.requireDb(request.database).collection(
+      request.table,
+    );
+    const options = this.getMutationTimeoutOptions(context);
+    const result = options
+      ? await collection.insertOne(request.values, options)
+      : await collection.insertOne(request.values);
     return { affectedRows: result.acknowledged ? 1 : 0 };
   }
 
   async deleteRows(
     request: DriverDeleteRowsRequest,
+    context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
+    context?.signal.throwIfAborted();
     const collection = this.requireDb(request.database).collection(
       request.table,
     );
@@ -1718,8 +1734,20 @@ export class MongoDBDriver implements IDBDriver {
     if (criteria.length === 0) {
       return { affectedRows: 0 };
     }
-    const result = await collection.deleteMany({ $or: criteria });
+    const options = this.getMutationTimeoutOptions(context);
+    const result = options
+      ? await collection.deleteMany({ $or: criteria }, options)
+      : await collection.deleteMany({ $or: criteria });
     return { affectedRows: result.deletedCount };
+  }
+
+  private getMutationTimeoutOptions(
+    context?: DriverOperationContext,
+  ): { timeoutMS: number } | undefined {
+    if (!context || !Number.isFinite(context.deadline)) {
+      return undefined;
+    }
+    return { timeoutMS: Math.max(1, Math.ceil(context.deadline - Date.now())) };
   }
 
   buildMutationPreviewStatement(

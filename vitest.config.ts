@@ -17,7 +17,6 @@ export default defineConfig({
     mockReset: true,
     unstubGlobals: true,
     unstubEnvs: true,
-    passWithNoTests: true,
     globalSetup: ["./tests/setup/globalSetup.ts"],
     reporters: ["default", new RunSummaryReporter()],
   },

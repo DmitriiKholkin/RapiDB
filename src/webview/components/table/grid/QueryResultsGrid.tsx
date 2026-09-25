@@ -190,8 +190,11 @@ export function QueryResultsGrid({
   }, [selection.copySelection]);
 
   useEffect(() => {
+    void rows;
+    void sorting;
     selection.clearSelection();
-  }, [selection.clearSelection]);
+    selection.contextMenuCellRef.current = null;
+  }, [rows, sorting, selection.clearSelection, selection.contextMenuCellRef]);
 
   const colSizes = useMemo(
     () =>

@@ -1662,9 +1662,7 @@ describe("TableView", () => {
     });
   });
 
-  it("treats reopened NULL cell as empty unless NULL is clicked again", async () => {
-    const user = userEvent.setup();
-
+  it("preserves a reopened NULL cell when editing is untouched", async () => {
     renderTableView();
 
     dispatchIncomingMessage("tableInit", {
@@ -1702,21 +1700,8 @@ describe("TableView", () => {
     const editInput = screen.getByLabelText("Cell value");
     fireEvent.blur(editInput);
 
-    clearPostedMessages();
-    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
-
-    expect(getLastPostedMessage()).toEqual({
-      type: "applyChanges",
-      payload: {
-        updates: [
-          {
-            primaryKeys: { id: 1 },
-            changes: { name: "" },
-            originalValues: { name: null },
-          },
-        ],
-      },
-    });
+    expect(screen.getByText("NULL")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Apply Changes" })).toBeNull();
   });
 
   it.each([
@@ -1856,6 +1841,31 @@ describe("TableView", () => {
     expect(getBodyCell("name").textContent).toBe("Edited");
     await user.click(screen.getByRole("button", { name: "Undo" }));
     expect(getBodyCell("name").textContent).toBe("Alice");
+  });
+
+  it("clears cell selection when refreshed rows replace the dataset", async () => {
+    await initializeCommittedTableData();
+    const selectedCell = getBodyCell("name", 0);
+    fireEvent.mouseDown(selectedCell, { button: 0 });
+    fireEvent.mouseUp(selectedCell);
+    expect(selectedCell.className).toContain("rdb-tcell-selected");
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    const refresh = lastFetchPayload();
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: refresh.fetchId,
+        rows: [
+          { id: 3, name: "Carol" },
+          { id: 4, name: "Dave" },
+        ],
+        totalCount: 2,
+      });
+    });
+
+    const replacementCell = getBodyCell("name", 0);
+    expect(replacementCell.textContent).toBe("Carol");
+    expect(replacementCell.className).not.toContain("rdb-tcell-selected");
   });
 
   it.each([
@@ -2984,9 +2994,9 @@ describe("TableView", () => {
     await user.click(screen.getByRole("button", { name: "Redo" }));
     fireEvent.doubleClick(getBodyCell("name", 0));
     fireEvent.keyDown(screen.getByLabelText("Cell value"), { key: "Enter" });
-    expect(getBodyCell("name", 0).textContent).toBe("");
-    await user.click(screen.getByRole("button", { name: "Undo" }));
     expect(getBodyCell("name", 0).textContent).toBe("NULL");
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    expect(getBodyCell("name", 0).textContent).toContain("DEFAULT");
   });
 
   it("supports insert with all DEFAULT fields and explicit draft edits", async () => {

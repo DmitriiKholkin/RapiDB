@@ -24,6 +24,7 @@ import type {
   TypeCategory,
   ValueSemantics,
 } from "./types";
+import { assertTransactionAffectedRows } from "./types";
 
 const SQLITE_ENTITY_MANIFEST: DriverEntityManifest = {
   dbObjectKinds: ["table", "view"],
@@ -1265,11 +1266,7 @@ export class SQLiteDriver extends BaseDBDriver {
       for (const op of operations) {
         throwIfTransactionCancelled(context);
         const info = db.run(op.sql, op.params ?? []);
-        if (op.checkAffectedRows && info.changes === 0) {
-          throw new Error(
-            "Row not found — the row may have been modified or deleted by another user",
-          );
-        }
+        assertTransactionAffectedRows(op, info.changes);
       }
       throwIfTransactionCancelled(context);
       db.exec("COMMIT");

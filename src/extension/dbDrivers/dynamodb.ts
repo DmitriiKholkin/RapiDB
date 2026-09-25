@@ -74,6 +74,7 @@ import type {
   DriverEntityManifest,
   DriverInsertRowRequest,
   DriverMutationResult,
+  DriverOperationContext,
   DriverSortConfig,
   DriverTablePageRequest,
   DriverTablePageResult,
@@ -769,8 +770,10 @@ export class DynamoDBDriver implements IDBDriver {
 
   async updateRows(
     request: DriverUpdateRowsRequest,
+    context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
-    const schema = await this.getTableSchema(request.table);
+    context?.signal.throwIfAborted();
+    const schema = await this.getTableSchema(request.table, context);
     const keys = schema.keys;
     const partitionKey = schema.partitionKey;
     if (!partitionKey) {
@@ -796,6 +799,7 @@ export class DynamoDBDriver implements IDBDriver {
               },
             })),
           }),
+          context ? { abortSignal: context.signal } : undefined,
         );
       } catch (error: unknown) {
         if (this.isConditionalCheckFailure(error)) {
@@ -809,9 +813,11 @@ export class DynamoDBDriver implements IDBDriver {
 
     let affectedRows = 0;
     for (const input of inputs) {
+      context?.signal.throwIfAborted();
       try {
         const response = await this.requireClient().send(
           new UpdateItemCommand(input),
+          context ? { abortSignal: context.signal } : undefined,
         );
         affectedRows += response.Attributes ? 1 : 0;
       } catch (error: unknown) {
@@ -825,8 +831,10 @@ export class DynamoDBDriver implements IDBDriver {
 
   async insertRow(
     request: DriverInsertRowRequest,
+    context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
-    const schema = await this.getTableSchema(request.table);
+    context?.signal.throwIfAborted();
+    const schema = await this.getTableSchema(request.table, context);
     const input = this.buildPutItemInput(
       request.table,
       schema.keys,
@@ -834,7 +842,10 @@ export class DynamoDBDriver implements IDBDriver {
     );
 
     try {
-      await this.requireClient().send(new PutItemCommand(input));
+      await this.requireClient().send(
+        new PutItemCommand(input),
+        context ? { abortSignal: context.signal } : undefined,
+      );
       this.invalidateCursorCacheForTable(request.table);
       return { affectedRows: 1 };
     } catch (error: unknown) {
@@ -847,16 +858,20 @@ export class DynamoDBDriver implements IDBDriver {
 
   async deleteRows(
     request: DriverDeleteRowsRequest,
+    context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
-    const schema = await this.getTableSchema(request.table);
+    context?.signal.throwIfAborted();
+    const schema = await this.getTableSchema(request.table, context);
     const keys = schema.keys;
     let affectedRows = 0;
 
     for (const criteria of request.primaryKeyValuesList) {
+      context?.signal.throwIfAborted();
       const input = this.buildDeleteItemInput(request.table, keys, criteria);
       try {
         const response = await this.requireClient().send(
           new DeleteItemCommand(input),
+          context ? { abortSignal: context.signal } : undefined,
         );
         if (response.Attributes) {
           affectedRows += 1;
@@ -1263,10 +1278,14 @@ export class DynamoDBDriver implements IDBDriver {
     return payload;
   }
 
-  private async getTableSchema(table: string): Promise<DynamoTableSchema> {
+  private async getTableSchema(
+    table: string,
+    context?: DriverOperationContext,
+  ): Promise<DynamoTableSchema> {
     try {
       const description = await this.requireClient().send(
         new DescribeTableCommand({ TableName: table }),
+        context ? { abortSignal: context.signal } : undefined,
       );
       const keyRoles = new Map<string, PrimaryKeyRole>();
       const keys = (description.Table?.KeySchema ?? []).flatMap((entry) => {
@@ -1307,6 +1326,7 @@ export class DynamoDBDriver implements IDBDriver {
         ],
       };
     } catch {
+      context?.signal.throwIfAborted();
       return {
         keys: [],
         keyRoles: new Map(),

@@ -2,7 +2,7 @@ import "./harness";
 import { execSync } from "node:child_process";
 import { cleanup, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { ConnectionManager } from "../../src/extension/connectionManager";
+import type { ConnectionManager } from "../../src/extension/connectionManager";
 import { ConnectionFormPanel } from "../../src/extension/panels/connectionFormPanel";
 import { ErdPanel } from "../../src/extension/panels/erdPanel";
 import { QueryPanel } from "../../src/extension/panels/queryPanel";
@@ -480,14 +480,12 @@ for (const engineId of enabledEngines) {
       }
     });
 
-    it(`runs the full user journey end-to-end on ${engineId}`, async () => {
-      // Live engines (postgres, mysql, mssql, oracle, mongodb, redis,
-      // elasticsearch, dynamodb) require the docker services to be up.
-      // The test exits early if they're not available.
-      if (engineId !== "sqlite" && !liveEnginesAvailable) {
-        return;
-      }
-      await runFullJourneyForEngine(engineId);
-    }, 180000);
+    it.skipIf(engineId !== "sqlite" && !liveEnginesAvailable)(
+      `runs the full user journey end-to-end on ${engineId}`,
+      async () => {
+        await runFullJourneyForEngine(engineId);
+      },
+      180000,
+    );
   });
 }

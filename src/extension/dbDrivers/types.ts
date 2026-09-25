@@ -202,6 +202,10 @@ export interface DriverDeleteRowsRequest {
 export interface DriverMutationResult {
   affectedRows: number;
 }
+export interface DriverOperationContext {
+  signal: AbortSignal;
+  deadline: number;
+}
 export interface PaginationResult {
   sql: string;
   params: unknown[];
@@ -304,9 +308,18 @@ export interface IDBDriver {
   readTablePage?(
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult>;
-  updateRows?(request: DriverUpdateRowsRequest): Promise<DriverMutationResult>;
-  insertRow?(request: DriverInsertRowRequest): Promise<DriverMutationResult>;
-  deleteRows?(request: DriverDeleteRowsRequest): Promise<DriverMutationResult>;
+  updateRows?(
+    request: DriverUpdateRowsRequest,
+    context?: DriverOperationContext,
+  ): Promise<DriverMutationResult>;
+  insertRow?(
+    request: DriverInsertRowRequest,
+    context?: DriverOperationContext,
+  ): Promise<DriverMutationResult>;
+  deleteRows?(
+    request: DriverDeleteRowsRequest,
+    context?: DriverOperationContext,
+  ): Promise<DriverMutationResult>;
   buildMutationPreviewStatement?(
     operation: "insert" | "update" | "delete",
     database: string,
@@ -381,15 +394,32 @@ export interface IDBDriver {
   buildSetExpr(column: ColumnTypeMeta, paramIndex: number): string;
   materializePreviewSql(sql: string, params?: readonly unknown[]): string;
 }
-export interface TransactionContext {
-  signal: AbortSignal;
-  deadline: number;
-}
+export interface TransactionContext extends DriverOperationContext {}
 
 export interface TransactionOperation {
   sql: string;
   params?: unknown[];
   checkAffectedRows?: boolean;
+  expectedAffectedRows?: number;
+}
+
+export function assertTransactionAffectedRows(
+  operation: TransactionOperation,
+  affectedRows: number,
+): void {
+  if (
+    operation.expectedAffectedRows !== undefined &&
+    affectedRows !== operation.expectedAffectedRows
+  ) {
+    throw new Error(
+      `Mutation affected ${affectedRows} row(s); expected ${operation.expectedAffectedRows}. One or more rows may have been modified or deleted by another user.`,
+    );
+  }
+  if (operation.checkAffectedRows && affectedRows === 0) {
+    throw new Error(
+      "Row not found — the row may have been modified or deleted by another user",
+    );
+  }
 }
 const TEXT_OPS: FilterOperator[] = ["like"];
 const INTERVAL_OPS: FilterOperator[] = ["eq", "neq"];

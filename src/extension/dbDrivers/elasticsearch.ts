@@ -30,6 +30,7 @@ import type {
   DriverEntityManifest,
   DriverInsertRowRequest,
   DriverMutationResult,
+  DriverOperationContext,
   DriverTablePageRequest,
   DriverTablePageResult,
   DriverUpdateRowsRequest,
@@ -1030,9 +1031,11 @@ export class ElasticsearchDriver implements IDBDriver {
 
   async updateRows(
     request: DriverUpdateRowsRequest,
+    context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
     let affectedRows = 0;
     for (const update of request.updates) {
+      context?.signal.throwIfAborted();
       if (
         Object.hasOwn(update.changes, "_id") &&
         update.changes._id !== update.primaryKeys._id
@@ -1054,35 +1057,44 @@ export class ElasticsearchDriver implements IDBDriver {
       );
       const client = this.requireClient();
       const response = Object.hasOwn(update.originalValues ?? {}, "_source")
-        ? await client.update({
-            index: request.table,
-            id: String(id),
-            script: {
-              lang: "painless",
-              source:
-                "if (ctx._source != params.original) { ctx.op = 'none' } else { ctx._source = params.next }",
-              params: {
-                original: this.resolveDocumentForMutation({
-                  _source: update.originalValues?._source,
-                }),
-                next: document,
+        ? await client.update(
+            {
+              index: request.table,
+              id: String(id),
+              script: {
+                lang: "painless",
+                source:
+                  "if (ctx._source != params.original) { ctx.op = 'none' } else { ctx._source = params.next }",
+                params: {
+                  original: this.resolveDocumentForMutation({
+                    _source: update.originalValues?._source,
+                  }),
+                  next: document,
+                },
               },
+              refresh: "wait_for",
             },
-            refresh: "wait_for",
-          })
+            context ? { signal: context.signal } : undefined,
+          )
         : Object.hasOwn(update.changes, "_source")
-          ? await client.index({
-              index: request.table,
-              id: String(id),
-              document,
-              refresh: "wait_for",
-            })
-          : await client.update({
-              index: request.table,
-              id: String(id),
-              doc: document,
-              refresh: "wait_for",
-            });
+          ? await client.index(
+              {
+                index: request.table,
+                id: String(id),
+                document,
+                refresh: "wait_for",
+              },
+              context ? { signal: context.signal } : undefined,
+            )
+          : await client.update(
+              {
+                index: request.table,
+                id: String(id),
+                doc: document,
+                refresh: "wait_for",
+              },
+              context ? { signal: context.signal } : undefined,
+            );
       affectedRows += response.result === "noop" ? 0 : 1;
     }
     return { affectedRows };
@@ -1090,37 +1102,49 @@ export class ElasticsearchDriver implements IDBDriver {
 
   async insertRow(
     request: DriverInsertRowRequest,
+    context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
+    context?.signal.throwIfAborted();
     const id = request.values._id;
     const document = this.resolveDocumentForMutation(request.values);
-    await this.requireClient().index({
-      index: request.table,
-      id:
-        typeof id === "string" || typeof id === "number"
-          ? String(id)
-          : undefined,
-      document,
-      op_type:
-        typeof id === "string" || typeof id === "number" ? "create" : undefined,
-      refresh: "wait_for",
-    });
+    await this.requireClient().index(
+      {
+        index: request.table,
+        id:
+          typeof id === "string" || typeof id === "number"
+            ? String(id)
+            : undefined,
+        document,
+        op_type:
+          typeof id === "string" || typeof id === "number"
+            ? "create"
+            : undefined,
+        refresh: "wait_for",
+      },
+      context ? { signal: context.signal } : undefined,
+    );
     return { affectedRows: 1 };
   }
 
   async deleteRows(
     request: DriverDeleteRowsRequest,
+    context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
     let affectedRows = 0;
     for (const entry of request.primaryKeyValuesList) {
+      context?.signal.throwIfAborted();
       const id = entry._id;
       if (typeof id !== "string" && typeof id !== "number") {
         continue;
       }
-      await this.requireClient().delete({
-        index: request.table,
-        id: String(id),
-        refresh: "wait_for",
-      });
+      await this.requireClient().delete(
+        {
+          index: request.table,
+          id: String(id),
+          refresh: "wait_for",
+        },
+        context ? { signal: context.signal } : undefined,
+      );
       affectedRows += 1;
     }
     return { affectedRows };

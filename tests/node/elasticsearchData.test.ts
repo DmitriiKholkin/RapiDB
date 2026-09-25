@@ -510,16 +510,19 @@ describe("ElasticsearchDriver — metadata and pages", () => {
       }),
     ).resolves.toEqual({ affectedRows: 1 });
 
-    expect(index).toHaveBeenCalledWith({
-      index: "users",
-      id: "doc-3",
-      document: {
-        email: "charlie@example.com",
-        active: true,
+    expect(index).toHaveBeenCalledWith(
+      {
+        index: "users",
+        id: "doc-3",
+        document: {
+          email: "charlie@example.com",
+          active: true,
+        },
+        op_type: "create",
+        refresh: "wait_for",
       },
-      op_type: "create",
-      refresh: "wait_for",
-    });
+      undefined,
+    );
     expect(
       driver.buildMutationPreviewStatement(
         "insert",
@@ -615,6 +618,7 @@ describe("ElasticsearchDriver — metadata and pages", () => {
           },
         }),
       }),
+      undefined,
     );
   });
 
@@ -637,12 +641,15 @@ describe("ElasticsearchDriver — metadata and pages", () => {
       }),
     ).resolves.toEqual({ affectedRows: 1 });
 
-    expect(index).toHaveBeenCalledWith({
-      index: "users",
-      id: "doc-3",
-      document: { active: false },
-      refresh: "wait_for",
-    });
+    expect(index).toHaveBeenCalledWith(
+      {
+        index: "users",
+        id: "doc-3",
+        document: { active: false },
+        refresh: "wait_for",
+      },
+      undefined,
+    );
     expect(update).not.toHaveBeenCalled();
   });
 });

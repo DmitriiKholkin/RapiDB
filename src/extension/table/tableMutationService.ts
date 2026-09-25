@@ -1,5 +1,5 @@
 import type { ConnectionManager } from "../connectionManager";
-import type { ColumnTypeMeta } from "../dbDrivers/types";
+import type { ColumnTypeMeta, TransactionOperation } from "../dbDrivers/types";
 import { pMapWithLimit } from "../utils/concurrency";
 import { assertConnectionWritable } from "../utils/readOnlyGuards";
 import { buildInsertRowOperation } from "./insertSql";
@@ -416,6 +416,16 @@ export class TableMutationService {
           columnMetaByName,
           coercedPrimaryKeys,
         );
+    if (operations.length > 1) {
+      const atomicityRisk = await driver.getMutationAtomicityRisk?.(
+        database,
+        schema,
+        table,
+      );
+      if (atomicityRisk) {
+        throw new Error(atomicityRisk);
+      }
+    }
     return {
       connectionId,
       database,
@@ -538,16 +548,10 @@ export class TableMutationService {
     columnMetaByName: Map<string, ColumnTypeMeta>,
     primaryKeyColumn: string,
     rows: Record<string, unknown>[],
-  ): Array<{
-    sql: string;
-    params: unknown[];
-  }> {
+  ): TransactionOperation[] {
     const values = rows.map((row) => row[primaryKeyColumn]);
     const chunkSize = 1000;
-    const operations: Array<{
-      sql: string;
-      params: unknown[];
-    }> = [];
+    const operations: TransactionOperation[] = [];
     for (let index = 0; index < values.length; index += chunkSize) {
       const chunk = values.slice(index, index + chunkSize);
       const placeholders = chunk
@@ -561,6 +565,7 @@ export class TableMutationService {
       operations.push({
         sql: `DELETE FROM ${qualifiedTableName} WHERE ${driver.quoteIdentifier(primaryKeyColumn)} IN (${placeholders})`,
         params: chunk,
+        expectedAffectedRows: chunk.length,
       });
     }
     return operations;
@@ -570,10 +575,7 @@ export class TableMutationService {
     qualifiedTableName: string,
     columnMetaByName: Map<string, ColumnTypeMeta>,
     rows: Record<string, unknown>[],
-  ): Array<{
-    sql: string;
-    params: unknown[];
-  }> {
+  ): TransactionOperation[] {
     return rows.map((row) => {
       const parameters: unknown[] = [];
       const whereParts = Object.keys(row).map((columnName) => {
@@ -587,6 +589,7 @@ export class TableMutationService {
       return {
         sql: `DELETE FROM ${qualifiedTableName} WHERE ${whereParts.join(" AND ")}`,
         params: parameters,
+        expectedAffectedRows: 1,
       };
     });
   }

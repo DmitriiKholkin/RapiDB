@@ -1,5 +1,5 @@
 import type { OperationCancellationContext } from "../../shared/safetyContracts";
-import type { TransactionContext } from "./types";
+import type { DriverOperationContext, TransactionContext } from "./types";
 
 export const CONNECTION_TIMEOUT_SECONDS_DEFAULT = 15;
 export const DB_OPERATION_TIMEOUT_SECONDS_DEFAULT = 180;
@@ -34,7 +34,7 @@ export class DriverTimeoutError extends Error {
         ? "Database connection"
         : "Database operation";
     super(
-      `${operationLabel} timed out after ${timeoutSeconds} second(s) while running ${operationName}.${operationName === "runTransaction" ? " Transaction outcome may be unknown. Refresh and verify the data before retrying." : ""}`,
+      `${operationLabel} timed out after ${timeoutSeconds} second(s) while running ${operationName}.${["updateRows", "insertRow", "deleteRows", "runTransaction"].includes(operationName) ? " Mutation outcome may be unknown. Refresh and verify the data before retrying." : ""}`,
     );
     this.name = "DriverTimeoutError";
     this.timeoutKind = timeoutKind;
@@ -98,6 +98,12 @@ const DB_OPERATION_METHODS = new Set([
   "deleteRows",
   "runTransaction",
   "getMutationAtomicityRisk",
+]);
+const CANCELLABLE_MUTATION_METHODS = new Set([
+  "updateRows",
+  "insertRow",
+  "deleteRows",
+  "runTransaction",
 ]);
 
 function normalizeTimeoutSeconds(
@@ -272,20 +278,21 @@ export function createTimeoutAwareDriver<T extends object>(
       }
 
       const wrapped = (...args: unknown[]) => {
-        const transactionAbort =
-          property === "runTransaction" ? new AbortController() : undefined;
-        if (transactionAbort) {
+        const operationAbort = CANCELLABLE_MUTATION_METHODS.has(property)
+          ? new AbortController()
+          : undefined;
+        if (operationAbort) {
           const timeoutMs = timeoutSettingsProvider().dbOperationTimeoutMs;
-          const supplied = args[1] as TransactionContext | undefined;
+          const supplied = args[1] as DriverOperationContext | undefined;
           args[1] = {
             signal: supplied
-              ? AbortSignal.any([supplied.signal, transactionAbort.signal])
-              : transactionAbort.signal,
+              ? AbortSignal.any([supplied.signal, operationAbort.signal])
+              : operationAbort.signal,
             deadline: Math.min(
               supplied?.deadline ?? Infinity,
               timeoutMs > 0 ? Date.now() + timeoutMs : Infinity,
             ),
-          } satisfies TransactionContext;
+          } satisfies DriverOperationContext;
         }
         if (property === "query") {
           const operationContext =
@@ -304,9 +311,9 @@ export function createTimeoutAwareDriver<T extends object>(
             operationName: property,
             timeoutSettingsProvider,
             onDeadline: () =>
-              transactionAbort?.abort(
+              operationAbort?.abort(
                 new Error(
-                  "Transaction cancelled after timeout; its outcome may be unknown. Refresh before retrying.",
+                  "Mutation cancelled after timeout; its outcome may be unknown. Refresh before retrying.",
                 ),
               ),
             onTimeout: () => {

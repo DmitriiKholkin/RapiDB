@@ -23,6 +23,7 @@ import type {
   DriverEntityManifest,
   DriverInsertRowRequest,
   DriverMutationResult,
+  DriverOperationContext,
   DriverTablePageRequest,
   DriverTablePageResult,
   DriverUpdateRowsRequest,
@@ -68,7 +69,38 @@ if redis.call('EXISTS', source) == 0 then return 0 end
 if source ~= target and redis.call('EXISTS', target) ~= 0 then return -1 end
 local kind = redis.call('TYPE', source)['ok']
 if ARGV[1] ~= '' and kind ~= ARGV[1] then return -2 end
-if ARGV[7] == '1' and kind == 'string' and redis.call('GET', source) ~= ARGV[2] then return -3 end
+if ARGV[7] == '1' then
+  if kind == 'string' then
+    if redis.call('GET', source) ~= ARGV[2] then return -3 end
+  elseif kind == 'hash' then
+    local expected = cjson.decode(ARGV[2])
+    local count = 0
+    for field, entry in pairs(expected) do
+      count = count + 1
+      if redis.call('HGET', source, field) ~= tostring(entry) then return -3 end
+    end
+    if redis.call('HLEN', source) ~= count then return -3 end
+  elseif kind == 'list' then
+    local expected = cjson.decode(ARGV[2])
+    if redis.call('LLEN', source) ~= #expected then return -3 end
+    for index, entry in ipairs(expected) do
+      if redis.call('LINDEX', source, index - 1) ~= tostring(entry) then return -3 end
+    end
+  elseif kind == 'set' then
+    local expected = cjson.decode(ARGV[2])
+    if redis.call('SCARD', source) ~= #expected then return -3 end
+    for _, entry in ipairs(expected) do
+      if redis.call('SISMEMBER', source, tostring(entry)) ~= 1 then return -3 end
+    end
+  elseif kind == 'zset' then
+    local expected = cjson.decode(ARGV[2])
+    if redis.call('ZCARD', source) ~= #expected then return -3 end
+    for _, entry in ipairs(expected) do
+      local score = redis.call('ZSCORE', source, tostring(entry.value))
+      if score == false or tonumber(score) ~= tonumber(entry.score) then return -3 end
+    end
+  end
+end
 local ttl = redis.call('PTTL', source)
 if ARGV[3] == '1' then
   redis.call('DEL', source)
@@ -641,10 +673,16 @@ export class RedisDriver implements IDBDriver {
 
   async updateRows(
     request: DriverUpdateRowsRequest,
+    context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
-    const client = this.requireClient();
+    context?.signal.throwIfAborted();
+    const baseClient = this.requireClient();
+    const client = context
+      ? baseClient.withAbortSignal(context.signal)
+      : baseClient;
     let affectedRows = 0;
     for (const update of request.updates) {
+      context?.signal.throwIfAborted();
       const sourceKey = this.resolveStoredKey(update.primaryKeys.key);
       if (!sourceKey) {
         continue;
@@ -683,14 +721,15 @@ export class RedisDriver implements IDBDriver {
       const ttlSeconds = hasTtlChange
         ? this.parseRedisTtlInput(update.changes.ttl, "Redis TTL updates")
         : undefined;
-      const originalString =
-        currentType === "string" &&
-        Object.hasOwn(update.originalValues ?? {}, "value")
+      const hasOriginalValue = Object.hasOwn(
+        update.originalValues ?? {},
+        "value",
+      );
+      const originalValue = hasOriginalValue
+        ? currentType === "string"
           ? this.normalizeStoredValue(update.originalValues?.value)
-          : "";
-      const hasOriginalString =
-        currentType === "string" &&
-        Object.hasOwn(update.originalValues ?? {}, "value");
+          : this.encodeRedisLuaValue(currentType, update.originalValues?.value)
+        : "";
       const result = Number(
         await client.sendCommand([
           "EVAL",
@@ -699,7 +738,7 @@ export class RedisDriver implements IDBDriver {
           sourceKey,
           targetKey,
           currentType,
-          originalString,
+          originalValue,
           hasValueChange ? "1" : "0",
           encodedValue,
           ttlSeconds === undefined
@@ -710,7 +749,7 @@ export class RedisDriver implements IDBDriver {
           ttlSeconds === undefined || ttlSeconds === null
             ? "0"
             : String(ttlSeconds),
-          hasOriginalString ? "1" : "0",
+          hasOriginalValue ? "1" : "0",
         ]),
       );
       if (result === -1) {
@@ -729,7 +768,9 @@ export class RedisDriver implements IDBDriver {
 
   async insertRow(
     request: DriverInsertRowRequest,
+    context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
+    context?.signal.throwIfAborted();
     const key = this.resolveStoredKey(request.values.key);
     if (!key) {
       throw new Error("Redis insert requires a 'key' field.");
@@ -740,7 +781,11 @@ export class RedisDriver implements IDBDriver {
       : undefined;
     const value =
       request.values.value ?? request.values.json ?? request.values.text;
-    const result = await this.requireClient().set(
+    const baseClient = this.requireClient();
+    const client = context
+      ? baseClient.withAbortSignal(context.signal)
+      : baseClient;
+    const result = await client.set(
       key,
       this.normalizeStoredValue(value),
       ttlSeconds !== undefined && ttlSeconds !== null
@@ -753,10 +798,16 @@ export class RedisDriver implements IDBDriver {
 
   async deleteRows(
     request: DriverDeleteRowsRequest,
+    context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
-    const client = this.requireClient();
+    context?.signal.throwIfAborted();
+    const baseClient = this.requireClient();
+    const client = context
+      ? baseClient.withAbortSignal(context.signal)
+      : baseClient;
     let affectedRows = 0;
     for (const entry of request.primaryKeyValuesList) {
+      context?.signal.throwIfAborted();
       const key = this.resolveStoredKey(entry.key);
       if (!key) {
         continue;

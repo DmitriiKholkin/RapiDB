@@ -33,7 +33,11 @@ import type {
   TypeCategory,
   ValueSemantics,
 } from "./types";
-import { DATETIME_SQL_RE, NULL_SENTINEL } from "./types";
+import {
+  assertTransactionAffectedRows,
+  DATETIME_SQL_RE,
+  NULL_SENTINEL,
+} from "./types";
 
 const ORACLE_ENTITY_MANIFEST: DriverEntityManifest = {
   dbObjectKinds: [
@@ -2188,11 +2192,7 @@ export class OracleDriver extends BaseDBDriver {
             autoCommit: false,
           },
         );
-        if (op.checkAffectedRows && (res.rowsAffected ?? 0) === 0) {
-          throw new Error(
-            "Row not found — the row may have been modified or deleted by another user",
-          );
-        }
+        assertTransactionAffectedRows(op, res.rowsAffected ?? 0);
       }
       throwIfTransactionCancelled(context);
       await conn.commit();

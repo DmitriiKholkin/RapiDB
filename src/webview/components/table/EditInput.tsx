@@ -1,4 +1,5 @@
-import React, {
+import type React from "react";
+import {
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -50,7 +51,7 @@ export function EditInput({
   onCancel: () => void;
 }) {
   const isInitiallyNull = initial === NULL_SENTINEL;
-  const [isNull, setIsNull] = useState(false);
+  const [isNull, setIsNull] = useState(isInitiallyNull);
   const [val, setVal] = useState(
     isInitiallyNull ? "" : normalizeEditInitialValue(initial, category),
   );
@@ -138,6 +139,7 @@ export function EditInput({
         if (!text || !ref.current) return;
         const newVal =
           currentVal.slice(0, start) + text + currentVal.slice(end);
+        setIsNull(false);
         setVal(newVal);
 
         const cursorPos = start + text.length;

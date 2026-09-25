@@ -136,9 +136,16 @@ describe("ConnectionFormPanel", () => {
       type === "saveConnection"
         ? connectionManager.saveConnection
         : connectionManager.testConnection;
-    expect(action).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({ tls }),
-    );
+    if (type === "testConnection") {
+      expect(action).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ tls }),
+        expect.any(AbortSignal),
+      );
+    } else {
+      expect(action).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ tls }),
+      );
+    }
     panel.dispose();
     await promise;
   });
@@ -602,6 +609,7 @@ describe("ConnectionFormPanel", () => {
 
     expect(connectionManager.testConnection).toHaveBeenCalledWith(
       expect.objectContaining({ password: "pw" }),
+      expect.any(AbortSignal),
     );
     expect(panel.webview.postMessage).toHaveBeenCalledWith({
       type: "testResult",
@@ -610,6 +618,67 @@ describe("ConnectionFormPanel", () => {
 
     await panel.webview.dispatchMessage({ type: "cancel" });
 
+    await expect(promise).resolves.toBeUndefined();
+  });
+
+  it.each([
+    "cancel",
+    "dispose",
+  ] as const)("aborts an active connection test on %s", async (action) => {
+    let resolveTest!: (result: { success: boolean }) => void;
+    let receivedSignal: AbortSignal | undefined;
+    const connectionManager = {
+      saveConnection: vi.fn(),
+      getConnection: vi.fn(() => undefined),
+      testConnection: vi.fn(async (_config: unknown, signal: AbortSignal) => {
+        receivedSignal = signal;
+        return await new Promise<{ success: boolean }>((resolve) => {
+          resolveTest = resolve;
+        });
+      }),
+    };
+    const promise = ConnectionFormPanel.show(
+      {
+        secrets: {
+          get: vi.fn(async () => undefined),
+          store: vi.fn(),
+          delete: vi.fn(),
+        },
+      } as never,
+      connectionManager as never,
+    );
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected a webview panel to be created.");
+
+    const pendingMessage = panel.webview.dispatchMessage({
+      type: "testConnection",
+      payload: {
+        id: "pending-test",
+        name: "Pending",
+        type: "mysql",
+        host: "db.local",
+        database: "app",
+        username: "user",
+        password: "pw",
+      },
+    });
+    await vi.waitFor(() => expect(receivedSignal).toBeDefined());
+
+    if (action === "cancel") {
+      await panel.webview.dispatchMessage({ type: "cancelTestConnection" });
+    } else {
+      panel.dispose();
+    }
+
+    expect(receivedSignal?.aborted).toBe(true);
+    resolveTest({ success: true });
+    await pendingMessage;
+    expect(panel.webview.postMessage).not.toHaveBeenCalledWith({
+      type: "testResult",
+      payload: { success: true },
+    });
+
+    if (action === "cancel") panel.dispose();
     await expect(promise).resolves.toBeUndefined();
   });
 

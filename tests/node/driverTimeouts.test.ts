@@ -307,6 +307,39 @@ describe("driver timeout helpers", () => {
     );
   });
 
+  it.each([
+    "updateRows",
+    "insertRow",
+    "deleteRows",
+  ] as const)("aborts the operation context when %s times out", async (method) => {
+    vi.useFakeTimers();
+
+    const deferred = createDeferred<{ affectedRows: number }>();
+    let capturedSignal: AbortSignal | undefined;
+    const mutation = vi.fn(
+      async (_request: unknown, context?: { signal: AbortSignal }) => {
+        capturedSignal = context?.signal;
+        return deferred.promise;
+      },
+    );
+    const driver = createTimeoutAwareDriver({ [method]: mutation }, () => ({
+      connectionTimeoutSeconds: 15,
+      dbOperationTimeoutSeconds: 1,
+      connectionTimeoutMs: 15000,
+      dbOperationTimeoutMs: 25,
+    }));
+
+    const pending = driver[method]({});
+    const rejection =
+      expect(pending).rejects.toBeInstanceOf(DriverTimeoutError);
+    expect(capturedSignal?.aborted).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(25);
+
+    await rejection;
+    expect(capturedSignal?.aborted).toBe(true);
+  });
+
   it("surfaces timeout errors without waiting for hanging cleanup", async () => {
     vi.useFakeTimers();
 

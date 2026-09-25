@@ -951,8 +951,10 @@ function TableDataGrid({
   ]);
 
   useEffect(() => {
+    void rows;
     selection.clearSelection();
-  }, [selection.clearSelection]);
+    selection.contextMenuCellRef.current = null;
+  }, [rows, selection.clearSelection, selection.contextMenuCellRef]);
 
   useEffect(() => {
     setColumnOrder([

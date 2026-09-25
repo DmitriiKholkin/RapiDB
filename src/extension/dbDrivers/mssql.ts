@@ -47,6 +47,7 @@ import type {
   ValueSemantics,
 } from "./types";
 import {
+  assertTransactionAffectedRows,
   DATE_ONLY_RE,
   DATETIME_SQL_RE,
   ISO_DATETIME_RE,
@@ -2106,6 +2107,12 @@ export class MSSQLDriver extends BaseDBDriver {
       for (const op of operations) {
         throwIfTransactionCancelled(context);
         const req = tx.request();
+        const checkAffectedRows =
+          op.checkAffectedRows || op.expectedAffectedRows !== undefined;
+        const affectedRowsParameter = "__rapidb_affected_rows";
+        if (checkAffectedRows) {
+          req.output(affectedRowsParameter, mssql.Int);
+        }
         activeRequest = req;
         const res = await this.executeTrackedRequest(
           req,
@@ -2115,13 +2122,20 @@ export class MSSQLDriver extends BaseDBDriver {
               op.sql,
               op.params,
             );
-            return await trackedReq.query(finalSql);
+            // Trigger statements contribute their own TDS row counts. Capture
+            // the outer DML's count instead of summing res.rowsAffected.
+            return await trackedReq.query(
+              checkAffectedRows
+                ? `${finalSql}\n;SET @${affectedRowsParameter} = @@ROWCOUNT;`
+                : finalSql,
+            );
           },
         );
         activeRequest = undefined;
-        if (op.checkAffectedRows && (res.rowsAffected?.[0] ?? 0) === 0) {
-          throw new Error(
-            "Row not found — the row may have been modified or deleted by another user",
+        if (checkAffectedRows) {
+          assertTransactionAffectedRows(
+            op,
+            res.output[affectedRowsParameter] ?? 0,
           );
         }
       }

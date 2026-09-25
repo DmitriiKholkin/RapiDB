@@ -176,6 +176,8 @@ export class ConnectionFormPanel {
       },
     );
     this.panel.onDidDispose(() => {
+      this.testAbortController?.abort();
+      this.testAbortController = null;
       this.resolveFn?.(undefined);
     });
   }
@@ -511,30 +513,39 @@ export class ConnectionFormPanel {
           return;
         }
         this.testAbortController?.abort();
-        this.testAbortController = new AbortController();
-        const signal = this.testAbortController.signal;
-        const raw = await this.resolveSubmittedConfig(payload);
-        if (signal.aborted) break;
-        const validation = this.validationService.validate(raw);
-        if (!validation.valid) {
+        const controller = new AbortController();
+        this.testAbortController = controller;
+        const { signal } = controller;
+        try {
+          const raw = await this.resolveSubmittedConfig(payload);
+          if (signal.aborted) break;
+          const validation = this.validationService.validate(raw);
+          if (!validation.valid) {
+            this.panel.webview.postMessage({
+              type: "testResult",
+              payload: {
+                success: false,
+                error: validation.message ?? "Connection settings are invalid.",
+                validation,
+              },
+            });
+            return;
+          }
+          if (signal.aborted) break;
+          const result = await this.connectionManager.testConnection(
+            raw,
+            signal,
+          );
+          if (signal.aborted) break;
           this.panel.webview.postMessage({
             type: "testResult",
-            payload: {
-              success: false,
-              error: validation.message ?? "Connection settings are invalid.",
-              validation,
-            },
+            payload: result,
           });
-          return;
+        } finally {
+          if (this.testAbortController === controller) {
+            this.testAbortController = null;
+          }
         }
-        if (signal.aborted) break;
-        const result = await this.connectionManager.testConnection(raw);
-        if (signal.aborted) {
-          this.testAbortController = null;
-          break;
-        }
-        this.testAbortController = null;
-        this.panel.webview.postMessage({ type: "testResult", payload: result });
         break;
       }
       case "cancel": {

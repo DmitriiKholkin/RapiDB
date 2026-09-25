@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   CANONICAL_FIXTURE_SCHEMA,
@@ -17,6 +18,31 @@ describe("testingContracts", () => {
     expect(ONE_COMMAND_TEST_MANIFEST.scripts.dbPrepare).toBe(
       "npm run db:prepare",
     );
+  });
+
+  it("registers compose teardown as a conditional finalizer", () => {
+    const packageJson = JSON.parse(
+      readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
+    ) as { scripts: Record<string, string> };
+    const composeWrappers = [
+      "test:all",
+      "test:db",
+      "test:workflow",
+      "test:workflow:postgres",
+      "test:workflow:mysql",
+      "test:workflow:mssql",
+      "test:workflow:oracle",
+      "test:workflow:mongodb",
+      "test:workflow:redis",
+      "test:workflow:elasticsearch",
+      "test:workflow:dynamodb",
+    ];
+
+    for (const scriptName of composeWrappers) {
+      expect(packageJson.scripts[scriptName]).toContain(
+        "--finally db:down --finally-if-env-not RAPIDB_KEEP_TEST_SERVICES",
+      );
+    }
   });
 
   it("declares deterministic connection seeds and a canonical fixture schema", () => {

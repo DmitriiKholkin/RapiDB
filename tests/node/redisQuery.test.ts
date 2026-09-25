@@ -704,6 +704,47 @@ describe("RedisDriver — metadata and pages", () => {
     expect(command?.at(-1)).toBe("1");
   });
 
+  it("passes the original list value to atomic conflict detection", async () => {
+    const driver = new RedisDriver({
+      id: "redis-list-conflict-test",
+      name: "Redis List Conflict Test",
+      type: "redis",
+      host: "localhost",
+    });
+    const client = {
+      type: vi.fn().mockResolvedValue("list"),
+      sendCommand: vi.fn().mockResolvedValue(1),
+    };
+    (
+      driver as unknown as {
+        client: typeof client | null;
+        connected: boolean;
+      }
+    ).client = client;
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    await driver.updateRows({
+      database: "db0",
+      schema: "db0",
+      table: "list",
+      updates: [
+        {
+          primaryKeys: { key: "list:recent" },
+          changes: { value: '["A","C"]' },
+          originalValues: { value: '["A","B"]' },
+        },
+      ],
+    });
+
+    const command = client.sendCommand.mock.calls[0]?.[0];
+    expect(command).toEqual(
+      expect.arrayContaining(["list", '["A","B"]', "1", '["A","C"]']),
+    );
+    expect(command?.at(-1)).toBe("1");
+    expect(command?.[1]).toContain("redis.call('LLEN', source)");
+    expect(command?.[1]).toContain("redis.call('ZSCORE', source");
+  });
+
   it("renames keys when key field is edited", async () => {
     const driver = new RedisDriver({
       id: "redis-key-rename-test",

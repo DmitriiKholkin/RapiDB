@@ -119,6 +119,39 @@ afterEach(async () => {
 });
 
 describe("sshRuntime", () => {
+  it("aborts a pending SSH handshake from an external signal", async () => {
+    const controller = new AbortController();
+    const pending = createSshRuntime(
+      sshSettings,
+      {
+        kind: "tcpForward",
+        remoteHost: "db.internal",
+        remotePort: 5432,
+      },
+      {
+        signal: controller.signal,
+        loadSsh2: async () => ({
+          Client: class extends FakeSshClient {
+            constructor() {
+              super();
+              createdClients.push(this);
+            }
+
+            override connect(options: ConnectOptions): void {
+              this.connectOptions = options;
+            }
+          },
+        }),
+      },
+    );
+    await vi.waitFor(() => expect(createdClients).toHaveLength(1));
+
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(createdClients[0]?.endCalls).toBe(1);
+  });
+
   it("propagates transport failure to an active HTTP request", async () => {
     const runtime = await createRuntime(sshSettings, { kind: "httpAgent" });
     if (runtime.transport.kind !== "httpAgent")

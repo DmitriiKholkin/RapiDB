@@ -4,33 +4,33 @@ import {
   isConnectionTlsEnabled,
   resolveConnectionTlsMode,
 } from "../shared/connectionConfig";
-import {
-  type BookmarkEntry,
-  type ConnectAttempt,
-  type ConnectionConfig,
-  type ConnectionManagerLifecycleApi,
-  type DriverCapabilitiesApi,
-  type DriverMetadataApi,
-  type ExplorerSchemaScope,
-  type HistoryEntry,
-  type QueryEditorPresentationApi,
-  type RefreshSchemaRequest,
-  type SchemaLoadStatus,
-  type SchemaObjectEntry,
-  type SchemaScopeKey,
-  type SchemaSnapshot,
-  type SchemaSnapshotDatabaseEntry,
-  type SchemaSnapshotObjectEntry,
-  type SchemaSnapshotSchemaEntry,
-  type SchemaSnapshotState,
-  type ScopeAwareConnectionManagerApi,
-  type ScopedSchemaCacheEntry,
-  type ScopedSchemaFragment,
-  type StoredConnectionConfig,
-  type TableDetailRequest,
-  type TableDetailState,
-  type TableStructureSnapshot,
-  type TestConnectionResult,
+import type {
+  BookmarkEntry,
+  ConnectAttempt,
+  ConnectionConfig,
+  ConnectionManagerLifecycleApi,
+  DriverCapabilitiesApi,
+  DriverMetadataApi,
+  ExplorerSchemaScope,
+  HistoryEntry,
+  QueryEditorPresentationApi,
+  RefreshSchemaRequest,
+  SchemaLoadStatus,
+  SchemaObjectEntry,
+  SchemaScopeKey,
+  SchemaSnapshot,
+  SchemaSnapshotDatabaseEntry,
+  SchemaSnapshotObjectEntry,
+  SchemaSnapshotSchemaEntry,
+  SchemaSnapshotState,
+  ScopeAwareConnectionManagerApi,
+  ScopedSchemaCacheEntry,
+  ScopedSchemaFragment,
+  StoredConnectionConfig,
+  TableDetailRequest,
+  TableDetailState,
+  TableStructureSnapshot,
+  TestConnectionResult,
 } from "./connectionManagerModels";
 import {
   type ConnectionManagerStore,
@@ -1700,7 +1700,10 @@ export class ConnectionManager
     return baseConfig;
   }
 
-  private async prepareDriverConfig(config: ConnectionConfig): Promise<{
+  private async prepareDriverConfig(
+    config: ConnectionConfig,
+    signal?: AbortSignal,
+  ): Promise<{
     config: DriverConnectionConfig;
     runtime?: SshRuntime;
   }> {
@@ -1711,10 +1714,12 @@ export class ConnectionManager
       };
     }
 
-    const runtime = await this.createSshRuntimeForConnection(
-      sshSettings,
-      this.resolveSshRuntimeRequest(config),
-    );
+    const request = this.resolveSshRuntimeRequest(config);
+    const runtime = signal
+      ? await this.createSshRuntimeForConnection(sshSettings, request, {
+          signal,
+        })
+      : await this.createSshRuntimeForConnection(sshSettings, request);
 
     try {
       return {
@@ -1784,39 +1789,46 @@ export class ConnectionManager
     id: string,
     config: ConnectionConfig,
     signal: AbortSignal,
+    persistTrustedFingerprint = true,
   ): Promise<{
     driver: IDBDriver;
     runtime?: SshRuntime;
   }> {
-    const prepared = await this.prepareDriverConfig(config);
+    const prepared = await this.prepareDriverConfig(config, signal);
     let driver: IDBDriver | undefined;
+    let rejectAbort: ((reason: DOMException) => void) | undefined;
 
     const onAbort = () => {
       void driver?.disconnect().catch(() => undefined);
+      rejectAbort?.(new DOMException("Aborted", "AbortError"));
     };
 
     try {
-      if (prepared.runtime) {
+      if (prepared.runtime && persistTrustedFingerprint) {
         await this.persistTrustedSshFingerprintIfNeeded(
           id,
           prepared.runtime.verifiedFingerprintSha256,
         );
       }
       driver = this.createDriver(prepared.config);
-      signal.addEventListener("abort", onAbort);
+      signal.addEventListener("abort", onAbort, { once: true });
       if (signal.aborted) {
         throw new DOMException("Aborted", "AbortError");
       }
-      await Promise.race([
-        driver.connect(),
-        new Promise<never>((_resolve, reject) => {
-          signal.addEventListener(
-            "abort",
-            () => reject(new DOMException("Aborted", "AbortError")),
-            { once: true },
+      const abortPromise = new Promise<never>((_resolve, reject) => {
+        rejectAbort = reject;
+      });
+      const pendingConnect = driver.connect().finally(async () => {
+        // Some drivers create their pool asynchronously, after the initial
+        // abort cleanup has already run. Dispose those late resources too.
+        if (signal.aborted) {
+          await this.disposeUnboundConnectionResources(
+            driver,
+            prepared.runtime,
           );
-        }),
-      ]);
+        }
+      });
+      await Promise.race([pendingConnect, abortPromise]);
       return { driver, runtime: prepared.runtime };
     } catch (err) {
       await this.disposeUnboundConnectionResources(driver, prepared.runtime);
@@ -3264,6 +3276,7 @@ export class ConnectionManager
   }
   async testConnection(
     config: Omit<ConnectionConfig, "id">,
+    signal?: AbortSignal,
   ): Promise<TestConnectionResult> {
     const configWithId = canonicalizeOracleServiceName({
       ...config,
@@ -3280,10 +3293,15 @@ export class ConnectionManager
     let runtime: SshRuntime | undefined;
     let driver: IDBDriver | undefined;
     try {
-      const prepared = await this.prepareDriverConfig(configWithId);
+      const testSignal = signal ?? new AbortController().signal;
+      const prepared = await this.connectPreparedDriver(
+        TEST_CONNECTION_ID,
+        configWithId,
+        testSignal,
+        false,
+      );
       runtime = prepared.runtime;
-      driver = this.createDriver(prepared.config);
-      await driver.connect();
+      driver = prepared.driver;
       return { success: true };
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
