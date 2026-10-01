@@ -25,13 +25,13 @@ import {
   isHexLike,
   parseHexToBuffer,
 } from "./BaseDBDriver";
+import { deleteRowsSequentially, prepareDeleteBatch } from "./deleteOutcomes";
 import {
   applyFilters,
   applySort,
   createNoSqlUnsupportedMetadataHandlers,
   inferColumnsFromRows,
   pageRows,
-  unsupported,
 } from "./nosqlUtils";
 import type {
   ColumnMeta,
@@ -47,16 +47,14 @@ import type {
   DriverUpdateRowsRequest,
   FilterExpression,
   FilterOperator,
-  ForeignKeyMeta,
   IDBDriver,
   IndexMeta,
   PaginationResult,
+  QueryExecutionOptions,
   QueryResult,
   SchemaInfo,
-  TableConstraintMeta,
   TableInfo,
   TransactionOperation,
-  TriggerMeta,
   TypeCategory,
 } from "./types";
 import { NULL_SENTINEL, resolveFilterOperators } from "./types";
@@ -110,7 +108,7 @@ const DISPLAY_DATETIME_RE =
 const TIMESTAMP_LITERAL_RE = /^Timestamp\((\d+),\s*(\d+)\)$/i;
 
 const MONGODB_READ_ONLY_QUERY_REASON =
-  "[RapiDB] Read-only MongoDB connections allow only find, findOne, countDocuments, and aggregate queries without $out or $merge.";
+  "[RapiDB] Read-only MongoDB connections allow only find, findOne, countDocuments, and aggregate queries without $out or $merge (read-only cursor modifiers only).";
 const MONGODB_QUERY_HARD_CAP = QUERY_LIMIT_POLICY.hardCap;
 const MONGOSH_VM_TIMEOUT_MS = 5000;
 const MONGODB_UNSUPPORTED_METADATA =
@@ -168,193 +166,289 @@ function ensureMongoshQueryIsSafe(queryText: string): void {
   }
 }
 
-function executeMongoshParserInVm(
-  queryText: string,
-  sandbox: Record<string, unknown>,
-): void {
-  ensureMongoshQueryIsSafe(queryText);
-  const context = vm.createContext(sandbox, {
-    codeGeneration: {
-      strings: false,
-      wasm: false,
+// No host objects or functions may be reachable by query code: a host
+// function's constructor provides an escape from vm's disabled code generation.
+const MONGOSH_SANDBOX_SETUP = `
+  const operations = [];
+  const nativeRegExp = globalThis.RegExp;
+  const safeApply = Reflect.apply;
+  const nativeWeakSetAdd = WeakSet.prototype.add;
+  const nativeWeakSetHas = WeakSet.prototype.has;
+  const { marker, isMarker } = (() => {
+    const markers = new WeakSet();
+    return {
+      marker: (type, args) => {
+        const value = { type, args };
+        safeApply(nativeWeakSetAdd, markers, [value]);
+        return value;
+      },
+      isMarker: (value) => safeApply(nativeWeakSetHas, markers, [value]),
+    };
+  })();
+  // Capture serialization primitives before query code can replace built-ins.
+  // Encode every object as a typed node so user objects cannot impersonate BSON.
+  const serializeOperations = (() => {
+    const entries = Object.entries;
+    const stringify = JSON.stringify;
+    const create = Object.create;
+    const setPrototype = Object.setPrototypeOf;
+    const getPrototype = Object.getPrototypeOf;
+    const regexPrototype = nativeRegExp.prototype;
+    const regexSource = Object.getOwnPropertyDescriptor(regexPrototype, 'source').get;
+    // The built-in flags getter reads mutable properties (e.g. ignoreCase).
+    // Capture their original getters instead of trusting the query's prototype.
+    const flagNames = ['hasIndices', 'global', 'ignoreCase', 'multiline', 'dotAll', 'unicode', 'unicodeSets', 'sticky'];
+    const flagLetters = 'dgimsuvy';
+    const flagGetters = flagNames.map(
+      (name) => Object.getOwnPropertyDescriptor(regexPrototype, name)?.get,
+    );
+    const isArray = Array.isArray;
+    const isFiniteNumber = Number.isFinite;
+    const bigintToString = BigInt.prototype.toString;
+    const nativeWeakSetDelete = WeakSet.prototype.delete;
+    const safeArray = () => {
+      const result = [];
+      // A null prototype prevents query-added setters and toJSON methods from
+      // changing the encoded array while it is built or serialized.
+      safeApply(setPrototype, Object, [result, null]);
+      return result;
+    };
+    const node = (kind, value, args) => {
+      const result = safeApply(create, Object, [null]);
+      result.kind = kind;
+      if (value !== undefined) result.value = value;
+      if (args !== undefined) result.args = args;
+      return result;
+    };
+    return () => {
+      const active = new WeakSet();
+      const encodeList = (values) => {
+        const result = safeArray();
+        for (let i = 0; i < values.length; i++) result[i] = encode(values[i]);
+        return result;
+      };
+      const encode = (value) => {
+        if (value === undefined) return node('undefined');
+        if (typeof value === 'bigint')
+          return node('bigint', safeApply(bigintToString, value, []));
+        if (typeof value === 'function' || typeof value === 'symbol')
+          throw new Error('Functions and symbols are not supported in mongosh queries.');
+        if (typeof value === 'number' && !isFiniteNumber(value))
+          throw new Error('Non-finite numbers are not supported in mongosh queries.');
+        if (value === null || typeof value !== 'object') return value;
+        if (safeApply(nativeWeakSetHas, active, [value]))
+          throw new Error('Cyclic mongosh values are not supported.');
+        safeApply(nativeWeakSetAdd, active, [value]);
+        // The native source getter checks the RegExp internal slot. Unlike
+        // instanceof, this cannot be changed through Symbol.hasInstance.
+        let regexpSource;
+        try {
+          regexpSource = safeApply(regexSource, value, []);
+        } catch {
+          if (safeApply(getPrototype, Object, [value]) === regexPrototype) {
+            throw new Error('Proxy-wrapped RegExp values are not supported in mongosh queries.');
+          }
+          regexpSource = undefined;
+        }
+        let result;
+        if (isMarker(value)) {
+          result = node('marker', value.type, encodeList(value.args));
+        } else if (regexpSource !== undefined) {
+          const args = safeArray();
+          args[0] = regexpSource;
+          let flags = '';
+          for (let i = 0; i < flagGetters.length; i++) {
+            if (flagGetters[i] && safeApply(flagGetters[i], value, [])) {
+              flags += flagLetters[i];
+            }
+          }
+          args[1] = flags;
+          result = node('marker', 'RegExp', args);
+        } else if (isArray(value)) {
+          result = node('array', encodeList(value));
+        } else {
+          const pairs = safeApply(entries, Object, [value]);
+          const encoded = safeArray();
+          for (let i = 0; i < pairs.length; i++) {
+            const pair = safeArray();
+            pair[0] = pairs[i][0];
+            pair[1] = encode(pairs[i][1]);
+            encoded[i] = pair;
+          }
+          result = node('object', encoded);
+        }
+        safeApply(nativeWeakSetDelete, active, [value]);
+        return result;
+      };
+      return safeApply(stringify, JSON, [encode(operations)]);
+    };
+  })();
+  const db = (() => {
+  const InternalProxy = Proxy;
+  const createChainProxy = (operation) => new InternalProxy({}, {
+    get(_target, method) {
+      if (typeof method !== 'string') return undefined;
+      return (...args) => {
+        operation.chainOps.push({ op: method, args });
+        return createChainProxy(operation);
+      };
     },
   });
-  vm.runInContext(queryText, context, {
-    timeout: MONGOSH_VM_TIMEOUT_MS,
+  const createCollProxy = (dbName, collName) => new InternalProxy({}, {
+    get(_target, method) {
+      if (typeof method !== 'string' || method === 'then') return undefined;
+      return (...args) => {
+        const operation = { dbName, collName, op: method, args, chainOps: [] };
+        operations.push(operation);
+        return createChainProxy(operation);
+      };
+    },
   });
+  const createDbProxy = (dbName) => new InternalProxy({}, {
+    get(_target, prop) {
+      if (typeof prop !== 'string') return undefined;
+      if (prop === 'getSiblingDB') return (name) => createDbProxy(name);
+      if (prop === 'getCollection') return (name) => createCollProxy(dbName, String(name));
+      if (prop === 'runCommand') return (cmd) => {
+        const operation = { dbName, op: 'runCommand', args: [cmd], chainOps: [] };
+        operations.push(operation);
+        return createChainProxy(operation);
+      };
+      if (prop === 'createCollection' || prop === 'createView') return (...args) => {
+        operations.push({ dbName, op: prop, args, chainOps: [] });
+      };
+      return createCollProxy(dbName, prop);
+    },
+  });
+  return createDbProxy();
+  })();
+  // Query code cannot create Proxy-wrapped values whose internal BSON type is
+  // invisible to the VM serializer (including RegExp proxies with fake traps).
+  globalThis.Proxy = undefined;
+  const Date = function mongoDate(...args) { return marker('Date', args); };
+  const ISODate = Date;
+  const RegExp = function mongoRegExp(pattern, flags) { return marker('RegExp', [pattern, flags]); };
+  const ObjectId = function mongoObjectId(hex) { return marker('ObjectId', [hex]); };
+  const BinData = function mongoBinData(subtype, base64) { return marker('BinData', [subtype, base64]); };
+  const DBRef = function mongoDBRef(collection, oid, database) { return marker('DBRef', [collection, oid, database]); };
+  const BSONSymbol = function mongoBSONSymbol(value) { return marker('BSONSymbol', [value]); };
+  const NumberLong = function mongoNumberLong(value) { return marker('NumberLong', [value]); };
+  const NumberInt = function mongoNumberInt(value) { return marker('NumberInt', [value]); };
+  const NumberDecimal = function mongoNumberDecimal(value) { return marker('NumberDecimal', [value]); };
+  const Timestamp = function mongoTimestamp(seconds, increment) { return marker('Timestamp', [seconds, increment]); };
+  const Code = function mongoCode(source, scope) { return marker('Code', [source, scope]); };
+  const MinKey = function mongoMinKey() { return marker('MinKey', []); };
+  const MaxKey = function mongoMaxKey() { return marker('MaxKey', []); };
+`;
+
+function reviveMongoshValue(value: unknown): unknown {
+  if (value === null || typeof value !== "object") return value;
+  const record = value as { kind: string; value?: unknown; args?: unknown[] };
+  if (record.kind === "array") {
+    return (record.value as unknown[]).map(reviveMongoshValue);
+  }
+  if (record.kind === "object") {
+    return Object.fromEntries(
+      (record.value as [string, unknown][]).map(([key, entry]) => [
+        key,
+        reviveMongoshValue(entry),
+      ]),
+    );
+  }
+  if (record.kind === "undefined") return undefined;
+  if (record.kind === "bigint") return BigInt(record.value as string);
+  if (record.kind === "marker") {
+    const args = (record.args ?? []).map(reviveMongoshValue);
+    switch (record.value) {
+      case "Date":
+        return args.length === 0
+          ? new Date()
+          : new Date(args[0] as string | number);
+      case "RegExp":
+        return new RegExp(
+          String(args[0]),
+          args[1] === undefined ? undefined : String(args[1]),
+        );
+      case "ObjectId":
+        return args[0] === undefined
+          ? new ObjectId()
+          : new ObjectId(String(args[0]));
+      case "BinData":
+        return new Binary(
+          Buffer.from(String(args[1]), "base64"),
+          Number(args[0]),
+        );
+      case "DBRef":
+        return new DBRef(
+          String(args[0]),
+          args[1] as ObjectId,
+          args[2] ? String(args[2]) : undefined,
+        );
+      case "BSONSymbol":
+        return new BSONSymbol(String(args[0]));
+      case "NumberLong":
+        return Long.fromString(String(args[0]));
+      case "NumberInt":
+        return new Int32(Number.parseInt(String(args[0]), 10));
+      case "NumberDecimal":
+        return Decimal128.fromString(String(args[0]));
+      case "Timestamp": {
+        const spec = args[0];
+        return spec && typeof spec === "object"
+          ? new Timestamp({
+              t: Number((spec as { t?: unknown }).t ?? 0),
+              i: Number((spec as { i?: unknown }).i ?? 0),
+            })
+          : new Timestamp({ t: Number(spec), i: Number(args[1] ?? 0) });
+      }
+      case "Code":
+        return args[1] && typeof args[1] === "object"
+          ? new Code(String(args[0]), args[1] as Record<string, unknown>)
+          : new Code(String(args[0]));
+      case "MinKey":
+        return new MinKey();
+      case "MaxKey":
+        return new MaxKey();
+      default:
+        throw new Error("Unsupported BSON literal in mongosh query.");
+    }
+  }
+  throw new Error("Invalid mongosh value.");
 }
 
 function parseMongoshOperations(queryText: string): MongoshOperation[] {
-  const operations: MongoshOperation[] = [];
-
-  const createChainProxy = (operation: MongoshOperation): object => {
-    return new Proxy({} as Record<string, unknown>, {
-      get(_t, method: string | symbol) {
-        if (typeof method !== "string") return undefined;
-        return (...args: unknown[]) => {
-          operation.chainOps.push({ op: method, args });
-          return createChainProxy(operation);
-        };
-      },
-    });
-  };
-
-  const createCollProxy = (
-    dbName: string | undefined,
-    coll: string,
-  ): object => {
-    return new Proxy({} as Record<string, unknown>, {
-      get(_t, method: string | symbol) {
-        if (typeof method !== "string") return undefined;
-        if (method === "then") return undefined;
-        return (...args: unknown[]) => {
-          const operation: MongoshOperation = {
-            dbName,
-            collName: coll,
-            op: method,
-            args,
-            chainOps: [],
-          };
-          operations.push(operation);
-          return createChainProxy(operation);
-        };
-      },
-    });
-  };
-
-  const createDbProxy = (dbName?: string): object => {
-    return new Proxy({} as Record<string, unknown>, {
-      get(_t, prop: string | symbol) {
-        if (typeof prop !== "string") return undefined;
-        if (prop === "getSiblingDB") {
-          return (name: string) => createDbProxy(name);
-        }
-        if (prop === "getCollection") {
-          return (name: string) => createCollProxy(dbName, String(name));
-        }
-        if (prop === "runCommand") {
-          return (cmd: unknown) => {
-            const operation: MongoshOperation = {
-              dbName,
-              op: "runCommand",
-              args: [cmd],
-              chainOps: [],
-            };
-            operations.push(operation);
-            return createChainProxy(operation);
-          };
-        }
-        if (prop === "createCollection") {
-          return (name: string, options?: unknown) => {
-            operations.push({
-              dbName,
-              op: "createCollection",
-              args: [name, options],
-              chainOps: [],
-            });
-          };
-        }
-        if (prop === "createView") {
-          return (
-            name: string,
-            viewOn: string,
-            pipeline?: unknown,
-            options?: unknown,
-          ) => {
-            operations.push({
-              dbName,
-              op: "createView",
-              args: [name, viewOn, pipeline, options],
-              chainOps: [],
-            });
-          };
-        }
-        return createCollProxy(dbName, prop);
-      },
-    });
-  };
-
-  const sandbox = {
-    db: createDbProxy(),
-    process: undefined,
-    globalThis: undefined,
-    Function: undefined,
-    eval: undefined,
-    require: undefined,
-    import: undefined,
-    module: undefined,
-    constructor: undefined,
-    prototype: undefined,
-    Date: function mongoDate(value: string) {
-      return new globalThis.Date(value);
-    },
-    RegExp: function mongoRegExp(pattern: string, flags?: string) {
-      return new globalThis.RegExp(pattern, flags);
-    },
-    ObjectId: function mongoObjectId(hex: string) {
-      return new ObjectId(hex);
-    },
-    ISODate: function mongoIsoDate(value: string) {
-      return new Date(value);
-    },
-    BinData: function mongoBinData(subtype: number | string, base64: string) {
-      return new Binary(Buffer.from(String(base64), "base64"), Number(subtype));
-    },
-    DBRef: function mongoDBRef(collection: string, oid: unknown, db?: string) {
-      return new DBRef(
-        String(collection),
-        oid as ObjectId,
-        db ? String(db) : undefined,
-      );
-    },
-    BSONSymbol: function mongoBSONSymbol(value: string) {
-      return new BSONSymbol(String(value));
-    },
-    NumberLong: function mongoNumberLong(value: number | string) {
-      return Long.fromString(String(value));
-    },
-    NumberInt: function mongoNumberInt(value: number | string) {
-      return new Int32(Number.parseInt(String(value), 10));
-    },
-    NumberDecimal: function mongoNumberDecimal(value: string) {
-      return Decimal128.fromString(value);
-    },
-    Timestamp: function mongoTimestamp(
-      secondsOrSpec:
-        | number
-        | string
-        | {
-            t?: unknown;
-            i?: unknown;
-          },
-      increment?: number | string,
-    ) {
-      if (secondsOrSpec && typeof secondsOrSpec === "object") {
-        return new Timestamp({
-          t: Number((secondsOrSpec as { t?: unknown }).t ?? 0),
-          i: Number((secondsOrSpec as { i?: unknown }).i ?? 0),
-        });
-      }
-      return new Timestamp({
-        t: Number(secondsOrSpec),
-        i: Number(increment ?? 0),
-      });
-    },
-    Code: function mongoCode(source: string, scope?: unknown) {
-      return scope !== undefined && scope !== null && typeof scope === "object"
-        ? new Code(String(source), scope as Record<string, unknown>)
-        : new Code(String(source));
-    },
-    MinKey: function mongoMinKey() {
-      return new MinKey();
-    },
-    MaxKey: function mongoMaxKey() {
-      return new MaxKey();
-    },
-  };
-
+  let operations: MongoshOperation[];
   try {
-    executeMongoshParserInVm(queryText, sandbox);
+    ensureMongoshQueryIsSafe(queryText);
+    const context = vm.createContext(Object.create(null), {
+      codeGeneration: { strings: false, wasm: false },
+      microtaskMode: "afterEvaluate",
+    });
+    // Bootstrap and serialization both run under the VM deadline. Never read
+    // query-created properties or call query-created getters in the host realm.
+    vm.runInContext(MONGOSH_SANDBOX_SETUP, context, {
+      timeout: MONGOSH_VM_TIMEOUT_MS,
+    });
+    vm.runInContext(queryText, context, { timeout: MONGOSH_VM_TIMEOUT_MS });
+    const serialized = vm.runInContext("serializeOperations()", context, {
+      timeout: MONGOSH_VM_TIMEOUT_MS,
+    }) as string;
+    operations = reviveMongoshValue(
+      JSON.parse(serialized),
+    ) as MongoshOperation[];
+    if (
+      !Array.isArray(operations) ||
+      operations.some(
+        (operation) =>
+          !operation ||
+          typeof operation !== "object" ||
+          typeof operation.op !== "string" ||
+          !Array.isArray(operation.args) ||
+          !Array.isArray(operation.chainOps),
+      )
+    ) {
+      throw new Error("Invalid mongosh operation.");
+    }
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     if (message.includes(".then") || message.includes(".catch")) {
@@ -376,7 +470,71 @@ function parseMongoshOperations(queryText: string): MongoshOperation[] {
   return operations;
 }
 
+function pipelineContainsWriteStage(pipeline: unknown[]): boolean {
+  return pipeline.some((stage) => {
+    if (stage === null || typeof stage !== "object" || Array.isArray(stage)) {
+      return true;
+    }
+    const entries = Object.entries(stage as Record<string, unknown>);
+    if (entries.some(([key]) => key === "$out" || key === "$merge")) {
+      return true;
+    }
+    return entries.some(([key, options]) => {
+      if (key === "$facet" && options && typeof options === "object") {
+        return Object.values(options).some(
+          (nested) =>
+            !Array.isArray(nested) || pipelineContainsWriteStage(nested),
+        );
+      }
+      if (
+        (key === "$lookup" || key === "$unionWith") &&
+        options &&
+        typeof options === "object" &&
+        Object.hasOwn(options, "pipeline")
+      ) {
+        const nested = (options as { pipeline?: unknown }).pipeline;
+        return !Array.isArray(nested) || pipelineContainsWriteStage(nested);
+      }
+      return false;
+    });
+  });
+}
+
+const MONGODB_READ_ONLY_CHAIN_OPS = new Set([
+  "limit",
+  "skip",
+  "sort",
+  "toArray",
+  "batchSize",
+  "maxTimeMS",
+  "hint",
+  "collation",
+  "explain",
+  // Display / cursor helpers that have no write effect (execution ignores
+  // unknown chain ops anyway; allowlist is fail-closed for the guard).
+  "pretty",
+  "comment",
+  "count",
+  "size",
+  "max",
+  "min",
+  "readConcern",
+  "readPref",
+  "noCursorTimeout",
+  "close",
+]);
+
 function isReadOnlyMongoOperation(operation: MongoshOperation): boolean {
+  // Cursor modifiers must also be read-only: db.users.find({}).deleteMany()
+  // parses as op=find + chainOp=deleteMany and must not pass the guard even
+  // though execution currently ignores unknown chain ops.
+  if (
+    operation.chainOps.some(
+      (chain) => !MONGODB_READ_ONLY_CHAIN_OPS.has(chain.op),
+    )
+  ) {
+    return false;
+  }
   switch (operation.op) {
     case "find":
     case "findOne":
@@ -385,14 +543,7 @@ function isReadOnlyMongoOperation(operation: MongoshOperation): boolean {
     case "aggregate":
       return (
         Array.isArray(operation.args[0]) &&
-        operation.args[0].every(
-          (stage) =>
-            stage !== null &&
-            typeof stage === "object" &&
-            !Array.isArray(stage) &&
-            !Object.hasOwn(stage, "$merge") &&
-            !Object.hasOwn(stage, "$out"),
-        )
+        !pipelineContainsWriteStage(operation.args[0])
       );
     default:
       return false;
@@ -913,6 +1064,20 @@ function selectMongoSchemaSample(
 }
 
 export class MongoDBDriver implements IDBDriver {
+  private readonly tableRowCategories = new WeakMap<
+    Record<string, unknown>,
+    Map<string, TypeCategory>
+  >();
+  private readonly rowValueCategory = (
+    row: Record<string, unknown>,
+    column: string,
+  ): TypeCategory =>
+    this.tableRowCategories.get(row)?.get(column) ??
+    inferMongoSchemaType(row[column]).category;
+  private readonly tableRowIdTypes = new WeakMap<
+    Record<string, unknown>,
+    "objectId" | "string" | null
+  >();
   private client: MongoClient | null = null;
   private connected = false;
   private timeoutRecoveryInFlight: Promise<void> | null = null;
@@ -1177,7 +1342,11 @@ export class MongoDBDriver implements IDBDriver {
 
   getRoutineDefinition = MONGODB_UNSUPPORTED_METADATA.getRoutineDefinition;
 
-  async query(sql: string, _params?: unknown[]): Promise<QueryResult> {
+  async query(
+    sql: string,
+    _params?: unknown[],
+    options?: QueryExecutionOptions,
+  ): Promise<QueryResult> {
     const trimmed = normalizeMongoshQueryText(sql);
 
     if (trimmed.length === 0) {
@@ -1186,6 +1355,12 @@ export class MongoDBDriver implements IDBDriver {
 
     const startedAt = Date.now();
     const operations = parseMongoshOperations(trimmed);
+    if (
+      (options?.readOnly === true || this.config.readOnly === true) &&
+      !operations.every(isReadOnlyMongoOperation)
+    ) {
+      throw new Error(MONGODB_READ_ONLY_QUERY_REASON);
+    }
 
     const executeOperation = async (
       operation: MongoshOperation,
@@ -1516,6 +1691,9 @@ export class MongoDBDriver implements IDBDriver {
                   nullableMode: "schemaLess",
                 }),
           rows,
+          mongoIdTypes: rows.map(
+            (row) => this.tableRowIdTypes.get(row) ?? null,
+          ),
           totalCount,
           executionTimeMs: Math.round(performance.now() - startTime),
         };
@@ -1542,17 +1720,57 @@ export class MongoDBDriver implements IDBDriver {
         `MongoDB filtering or sorting exceeded the ${boundedReadLimit}-row safety limit. Narrow the filter before continuing or exporting.`,
       );
     }
-    const filtered = applyFilters(rows, normalizedFilters);
-    const sorted = applySort(filtered, request.sort);
+    const comparisonColumns =
+      schemaColumns.length > 0
+        ? schemaColumns
+        : inferColumnsFromRows(rows, "_id", { nullableMode: "schemaLess" }).map(
+            (column) => {
+              const categories = new Set(
+                rows
+                  .filter((row) => row[column.name] != null)
+                  .map((row) => this.rowValueCategory(row, column.name)),
+              );
+              const category: TypeCategory =
+                categories.size === 1
+                  ? [...categories][0]
+                  : categories.size > 0 &&
+                      [...categories].every(
+                        (category) =>
+                          category === "integer" ||
+                          category === "decimal" ||
+                          category === "float",
+                      )
+                    ? "decimal"
+                    : "other";
+              return {
+                ...column,
+                category,
+                type: category,
+                nativeType: category,
+                filterOperators: resolveFilterOperators(category, {
+                  filterable: column.filterable,
+                  nullable: column.nullable,
+                }),
+              };
+            },
+          );
+    const filtered = applyFilters(
+      rows,
+      normalizedFilters,
+      comparisonColumns,
+      this.rowValueCategory,
+    );
+    const sorted = applySort(
+      filtered,
+      request.sort,
+      comparisonColumns,
+      this.rowValueCategory,
+    );
     const paged = pageRows(sorted, request.page, request.pageSize);
     return {
-      columns:
-        schemaColumns.length > 0
-          ? schemaColumns
-          : inferColumnsFromRows(sorted, "_id", {
-              nullableMode: "schemaLess",
-            }),
+      columns: comparisonColumns,
       rows: paged,
+      mongoIdTypes: paged.map((row) => this.tableRowIdTypes.get(row) ?? null),
       totalCount: request.skipCount ? 0 : sorted.length,
       executionTimeMs: Math.round(performance.now() - startTime),
     };
@@ -1676,6 +1894,17 @@ export class MongoDBDriver implements IDBDriver {
     request: DriverUpdateRowsRequest,
     context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
+    if (
+      request.updates.some(
+        ({ primaryKeys }) =>
+          Object.keys(primaryKeys).length !== 1 ||
+          !Object.hasOwn(primaryKeys, "_id") ||
+          primaryKeys._id === undefined ||
+          primaryKeys._id === null,
+      )
+    ) {
+      throw new Error("MongoDB update requires a complete _id for every row.");
+    }
     const collection = this.requireDb(request.database).collection(
       request.table,
     );
@@ -1692,6 +1921,7 @@ export class MongoDBDriver implements IDBDriver {
         ...update.primaryKeys,
         ...(update.originalValues ?? {}),
       });
+      criteria._id = { $eq: update.primaryKeys._id };
       const options = this.getMutationTimeoutOptions(context);
       const result = options
         ? await collection.updateOne(
@@ -1724,21 +1954,47 @@ export class MongoDBDriver implements IDBDriver {
     request: DriverDeleteRowsRequest,
     context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
-    context?.signal.throwIfAborted();
-    const collection = this.requireDb(request.database).collection(
-      request.table,
+    const collection = await prepareDeleteBatch(
+      request.primaryKeyValuesList,
+      context,
+      () => {
+        if (
+          request.primaryKeyValuesList.some(
+            (entry) =>
+              Object.keys(entry).length !== 1 ||
+              !Object.hasOwn(entry, "_id") ||
+              entry._id === undefined ||
+              entry._id === null,
+          )
+        ) {
+          throw new Error(
+            "MongoDB delete requires a complete _id for every row.",
+          );
+        }
+        return this.requireDb(request.database).collection(request.table);
+      },
     );
-    const criteria = request.primaryKeyValuesList.map((entry) =>
-      this.normalizeCriteria(entry),
+    return deleteRowsSequentially(
+      request.primaryKeyValuesList,
+      context,
+      (entry) => {
+        // Keep the actual BSON identity: no ObjectId/string guessing.
+        const filter = { _id: { $eq: entry._id } } as Parameters<
+          typeof collection.deleteOne
+        >[0];
+        return async () => {
+          const options = this.getMutationTimeoutOptions(context);
+          const result = options
+            ? await collection.deleteOne(filter, options)
+            : await collection.deleteOne(filter);
+          return result.acknowledged !== true
+            ? "unknown"
+            : result.deletedCount > 0
+              ? "deleted"
+              : "notfound";
+        };
+      },
     );
-    if (criteria.length === 0) {
-      return { affectedRows: 0 };
-    }
-    const options = this.getMutationTimeoutOptions(context);
-    const result = options
-      ? await collection.deleteMany({ $or: criteria }, options)
-      : await collection.deleteMany({ $or: criteria });
-    return { affectedRows: result.deletedCount };
   }
 
   private getMutationTimeoutOptions(
@@ -1772,21 +2028,45 @@ export class MongoDBDriver implements IDBDriver {
       return `${collectionRef}.insertOne(${doc})`;
     }
     if (operation === "update") {
-      const filter = this.serializeMongosh(data.primaryKeys ?? {});
+      const filter = this.serializeMongosh({
+        _id: { $eq: data.primaryKeys?._id },
+      });
       const update = this.serializeMongosh({ $set: data.changes ?? {} });
-      return `${collectionRef}.updateMany(\n  ${filter},\n  ${update}\n)`;
+      // Execution applies updateOne per row (see updateRows); the preview must
+      // match so copy-paste does not escalate to a multi-row write.
+      return `${collectionRef}.updateOne(\n  ${filter},\n  ${update}\n)`;
     }
-    // delete
-    const filterValue = data.primaryKeyValuesList?.length
-      ? data.primaryKeyValuesList.length === 1
-        ? data.primaryKeyValuesList[0]
-        : { $or: data.primaryKeyValuesList }
-      : (data.primaryKeys ?? {});
-    return `${collectionRef}.deleteMany(${this.serializeMongosh(filterValue)})`;
+    return (data.primaryKeyValuesList ?? [data.primaryKeys ?? {}])
+      .map(
+        (entry) =>
+          `${collectionRef}.deleteOne(${this.serializeMongosh({ _id: { $eq: entry._id } })})`,
+      )
+      .join(";\n");
   }
 
   async runTransaction(operations: TransactionOperation[]): Promise<void> {
+    // MongoDB multi-document transactions require sessions/replica sets and
+    // per-op retry semantics this text-protocol driver does not implement.
+    // Fail closed instead of silently applying a non-atomic prefix on error.
+    // Table mutations already avoid this path for multi-row driver applies
+    // (see executeAtomicSqlApplyPlan); single-op callers are unaffected.
+    if (operations.length > 1) {
+      throw new Error(
+        "[RapiDB] MongoDB driver does not support atomic multi-operation transactions. Apply one row at a time.",
+      );
+    }
     for (const operation of operations) {
+      // One text item can contain several statements; query() executes all of
+      // them in order. Reject before the first write rather than applying a
+      // non-atomic prefix and reporting an error on the second statement.
+      if (
+        parseMongoshOperations(normalizeMongoshQueryText(operation.sql))
+          .length !== 1
+      ) {
+        throw new Error(
+          "[RapiDB] MongoDB driver does not support atomic multi-operation transactions. Apply one row at a time.",
+        );
+      }
       await this.query(operation.sql, operation.params);
     }
   }
@@ -1821,7 +2101,57 @@ export class MongoDBDriver implements IDBDriver {
       : this.coerceInputValue(value, column);
   }
 
+  coercePrimaryKeyValue(value: unknown, column: ColumnTypeMeta): unknown {
+    // Table rows serialize _id for display. Never reinterpret an untyped string
+    // using the sampled column type: it may identify a different document.
+    if (
+      column.name !== "_id" ||
+      value === null ||
+      typeof value !== "object" ||
+      Array.isArray(value) ||
+      Object.keys(value).length !== 1 ||
+      !Object.hasOwn(value, "$rapidbMongoId")
+    ) {
+      throw new Error(
+        "MongoDB row identity requires an explicit supported _id type hint.",
+      );
+    }
+    return this.coerceInputValue(value, column);
+  }
+
   coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (
+      column.name === "_id" &&
+      value !== null &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      Object.keys(value).length === 1 &&
+      Object.hasOwn(value, "$rapidbMongoId")
+    ) {
+      const hint = (value as { $rapidbMongoId?: unknown }).$rapidbMongoId;
+      if (
+        hint !== null &&
+        typeof hint === "object" &&
+        !Array.isArray(hint) &&
+        Object.keys(hint).length === 2 &&
+        Object.hasOwn(hint, "type") &&
+        Object.hasOwn(hint, "value")
+      ) {
+        const { type, value: id } = hint as {
+          type?: unknown;
+          value?: unknown;
+        };
+        if (typeof id === "string" && type === "string") return id;
+        if (
+          typeof id === "string" &&
+          type === "objectId" &&
+          /^[0-9a-f]{24}$/i.test(id)
+        ) {
+          return new ObjectId(id);
+        }
+      }
+      throw new Error("Invalid MongoDB _id type hint.");
+    }
     if (value === null || value === undefined || value === "") {
       return value;
     }
@@ -2097,12 +2427,30 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   private toRow(document: Record<string, unknown>): Record<string, unknown> {
-    return Object.fromEntries(
+    const row = Object.fromEntries(
       Object.entries(document).map(([key, value]) => [
         key,
         formatMongoDisplayValue(value),
       ]),
     );
+    this.tableRowCategories.set(
+      row,
+      new Map(
+        Object.entries(document).map(([key, value]) => [
+          key,
+          inferMongoSchemaType(value).category,
+        ]),
+      ),
+    );
+    this.tableRowIdTypes.set(
+      row,
+      document._id instanceof ObjectId
+        ? "objectId"
+        : typeof document._id === "string"
+          ? "string"
+          : null,
+    );
+    return row;
   }
 
   private async describeSchemaColumns(
@@ -2196,14 +2544,7 @@ export class MongoDBDriver implements IDBDriver {
   private normalizeCriteria(
     criteria: Record<string, unknown>,
   ): Record<string, unknown> {
-    const normalized = { ...criteria };
-    if (
-      typeof normalized._id === "string" &&
-      ObjectId.isValid(normalized._id)
-    ) {
-      normalized._id = new ObjectId(normalized._id);
-    }
-    return normalized;
+    return { ...criteria };
   }
 
   private normalizeFilterCriteria(
@@ -2259,11 +2600,8 @@ export class MongoDBDriver implements IDBDriver {
     if (value === undefined) return "undefined";
     if (typeof value === "boolean") return String(value);
     if (typeof value === "number") return String(value);
-    if (typeof value === "bigint") return value.toString();
+    if (typeof value === "bigint") return `${value}n`;
     if (typeof value === "string") {
-      if (ObjectId.isValid(value) && value.length === 24) {
-        return `ObjectId(${JSON.stringify(value)})`;
-      }
       return JSON.stringify(value);
     }
     if (value instanceof Date) {

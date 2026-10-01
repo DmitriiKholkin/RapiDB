@@ -1313,8 +1313,11 @@ export class MSSQLDriver extends BaseDBDriver {
     this.pool = await pool.connect();
   }
   async disconnect(): Promise<void> {
-    await this.pool?.close();
-    this.pool = null;
+    try {
+      await this.pool?.close();
+    } finally {
+      this.pool = null;
+    }
   }
 
   async cancelCurrentOperation(

@@ -1,8 +1,10 @@
+import { compareNumericTokens } from "../../shared/numericNormalization";
 import {
   type FilterExpression,
   type FilterOperator,
   inferValueCategory,
   type ScalarFilterOperator,
+  type TypeCategory,
 } from "../../shared/tableTypes";
 import type {
   ColumnTypeMeta,
@@ -43,6 +45,7 @@ export function inferColumnsFromRows(
   options?: {
     primaryKeyNames?: readonly string[];
     nullableMode?: "sample" | "schemaLess";
+    consistentCategories?: boolean;
   },
 ): ColumnTypeMeta[] {
   const primaryKeyNames =
@@ -70,12 +73,28 @@ export function inferColumnsFromRows(
 
   return orderedColumnNames.map((name) => {
     const isPrimaryKey = primaryKeyNameSet.has(name);
-    const sample = rows.find((row) => row[name] !== undefined)?.[name];
+    const samples = options?.consistentCategories
+      ? rows.filter((row) => row[name] != null).map((row) => row[name])
+      : [rows.find((row) => row[name] !== undefined)?.[name]];
+    const categories = new Set(
+      samples.map(
+        (sample) =>
+          inferValueCategory(sample) ??
+          (options?.consistentCategories &&
+          typeof sample === "string" &&
+          /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(sample.trim())
+            ? "decimal"
+            : typeof sample === "string" && sample.trim()
+              ? "text"
+              : "other"),
+      ),
+    );
     const category =
-      inferValueCategory(sample) ??
-      (typeof sample === "string" && sample.trim().length > 0
-        ? "text"
-        : "other");
+      categories.size === 1
+        ? [...categories][0]
+        : categories.size > 0 && [...categories].every(isNumericCategory)
+          ? "decimal"
+          : "other";
     const nullable = isPrimaryKey
       ? false
       : options?.nullableMode === "schemaLess"
@@ -104,7 +123,37 @@ export function inferColumnsFromRows(
   });
 }
 
-function compareValues(left: unknown, right: unknown): number {
+type ComparisonColumn = Pick<ColumnTypeMeta, "name" | "category">;
+type ValueCategory = (
+  row: Record<string, unknown>,
+  column: string,
+) => TypeCategory | undefined;
+
+function isNumericCategory(category: TypeCategory | undefined): boolean {
+  return (
+    category === "integer" || category === "float" || category === "decimal"
+  );
+}
+
+function isTemporalCategory(category: TypeCategory | undefined): boolean {
+  return category === "date" || category === "datetime" || category === "time";
+}
+
+function compatibleCategory(
+  category: TypeCategory | undefined,
+  actual: TypeCategory | undefined,
+): boolean {
+  return (
+    category === actual ||
+    (isNumericCategory(category) && isNumericCategory(actual))
+  );
+}
+
+function compareValues(
+  left: unknown,
+  right: unknown,
+  category?: TypeCategory,
+): number | null {
   if (left == null && right == null) {
     return 0;
   }
@@ -115,44 +164,32 @@ function compareValues(left: unknown, right: unknown): number {
     return 1;
   }
 
-  if (typeof left === "number" && typeof right === "number") {
-    return left - right;
+  if (isNumericCategory(category)) {
+    if (
+      ![left, right].every(
+        (value) =>
+          typeof value === "string" ||
+          typeof value === "bigint" ||
+          (typeof value === "number" && Number.isFinite(value)),
+      )
+    )
+      return null;
+    return compareNumericTokens(String(left), String(right));
   }
-
-  const leftNumeric = toComparableNumber(left);
-  const rightNumeric = toComparableNumber(right);
-  if (leftNumeric !== null && rightNumeric !== null) {
-    return leftNumeric - rightNumeric;
-  }
-
-  const leftDate = new Date(String(left));
-  const rightDate = new Date(String(right));
-  if (!Number.isNaN(leftDate.getTime()) && !Number.isNaN(rightDate.getTime())) {
-    return leftDate.getTime() - rightDate.getTime();
+  if (isTemporalCategory(category)) {
+    const timestamp = (value: unknown) => {
+      if (value instanceof Date) return value.getTime();
+      return Date.parse(
+        category === "time" ? `1970-01-01T${value}Z` : String(value),
+      );
+    };
+    const a = timestamp(left);
+    const b = timestamp(right);
+    if (!Number.isNaN(a) && !Number.isNaN(b)) return a - b;
+    return null;
   }
 
   return String(left).localeCompare(String(right));
-}
-
-function toComparableNumber(value: unknown): number | null {
-  if (typeof value === "number") {
-    return Number.isFinite(value) ? value : null;
-  }
-  if (typeof value !== "string") {
-    return null;
-  }
-
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return null;
-  }
-
-  if (!/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(trimmed)) {
-    return null;
-  }
-
-  const numeric = Number(trimmed);
-  return Number.isFinite(numeric) ? numeric : null;
 }
 
 function splitInValues(value: string): string[] {
@@ -166,6 +203,7 @@ function evaluateScalarOperator(
   operator: ScalarFilterOperator,
   rawValue: unknown,
   inputValue: string,
+  category?: TypeCategory,
 ): boolean {
   if (rawValue === null || rawValue === undefined) {
     return false;
@@ -177,13 +215,19 @@ function evaluateScalarOperator(
     case "neq":
       return String(rawValue) !== inputValue;
     case "gt":
-      return compareValues(rawValue, inputValue) > 0;
     case "gte":
-      return compareValues(rawValue, inputValue) >= 0;
     case "lt":
-      return compareValues(rawValue, inputValue) < 0;
-    case "lte":
-      return compareValues(rawValue, inputValue) <= 0;
+    case "lte": {
+      const cmp = compareValues(rawValue, inputValue, category);
+      if (cmp === null) return false;
+      return operator === "gt"
+        ? cmp > 0
+        : operator === "gte"
+          ? cmp >= 0
+          : operator === "lt"
+            ? cmp < 0
+            : cmp <= 0;
+    }
     case "like":
     case "ilike": {
       const haystack = String(rawValue ?? "");
@@ -202,6 +246,8 @@ function evaluateScalarOperator(
 function evaluateFilter(
   filter: FilterExpression,
   row: Record<string, unknown>,
+  category?: TypeCategory,
+  valueCategory?: ValueCategory,
 ): boolean {
   const rawValue = row[filter.column];
   if (filter.operator === "is_null") {
@@ -210,40 +256,85 @@ function evaluateFilter(
   if (filter.operator === "is_not_null") {
     return rawValue !== null && rawValue !== undefined;
   }
+  if (rawValue == null) return false;
+  const isRange = ["gt", "gte", "lt", "lte", "between"].includes(
+    filter.operator,
+  );
+  if (
+    isRange &&
+    valueCategory &&
+    (isNumericCategory(category) || isTemporalCategory(category)) &&
+    !compatibleCategory(category, valueCategory(row, filter.column))
+  )
+    return false;
   if (filter.operator === "between") {
     const [start, end] = filter.value;
-    return (
-      compareValues(rawValue, start) >= 0 && compareValues(rawValue, end) <= 0
-    );
+    const lower = compareValues(rawValue, start, category);
+    const upper = compareValues(rawValue, end, category);
+    return lower !== null && upper !== null && lower >= 0 && upper <= 0;
   }
   if (!("value" in filter)) {
     return false;
   }
-  return evaluateScalarOperator(filter.operator, rawValue, filter.value);
+  return evaluateScalarOperator(
+    filter.operator,
+    rawValue,
+    filter.value,
+    category,
+  );
 }
 
 export function applyFilters(
   rows: readonly Record<string, unknown>[],
   filters: readonly FilterExpression[],
+  columns: readonly ComparisonColumn[] = [],
+  valueCategory?: ValueCategory,
 ): Record<string, unknown>[] {
   if (filters.length === 0) {
     return [...rows];
   }
+  const categories = new Map(
+    columns.map((column) => [column.name, column.category]),
+  );
   return rows.filter((row) =>
-    filters.every((filter) => evaluateFilter(filter, row)),
+    filters.every((filter) =>
+      evaluateFilter(filter, row, categories.get(filter.column), valueCategory),
+    ),
   );
 }
 
 export function applySort(
   rows: readonly Record<string, unknown>[],
   sort: DriverSortConfig | null,
+  columns: readonly ComparisonColumn[] = [],
+  valueCategory?: ValueCategory,
 ): Record<string, unknown>[] {
   if (!sort) {
     return [...rows];
   }
   const sorted = [...rows];
+  const declaredCategory = columns.find(
+    (column) => column.name === sort.column,
+  )?.category;
+  // A heterogeneous column must use one ordering for the entire sort. Switching
+  // between numeric and text comparison per pair would break transitivity.
+  const category = rows.some(
+    (row) =>
+      row[sort.column] != null &&
+      ((valueCategory &&
+        !compatibleCategory(
+          declaredCategory,
+          valueCategory(row, sort.column),
+        )) ||
+        compareValues(row[sort.column], row[sort.column], declaredCategory) ===
+          null),
+  )
+    ? undefined
+    : declaredCategory;
   sorted.sort((left, right) => {
-    const cmp = compareValues(left[sort.column], right[sort.column]);
+    const cmp =
+      compareValues(left[sort.column], right[sort.column], category) ??
+      String(left[sort.column]).localeCompare(String(right[sort.column]));
     return sort.direction === "desc" ? -cmp : cmp;
   });
   return sorted;

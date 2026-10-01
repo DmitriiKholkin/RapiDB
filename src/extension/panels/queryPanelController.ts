@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import type { ConnectionType } from "../../shared/connectionTypes";
 import {
   type OperationCancellationContext,
   QUERY_LIMIT_POLICY,
@@ -6,6 +7,7 @@ import {
 } from "../../shared/safetyContracts";
 import {
   parseQueryPanelMessage,
+  type QueryEditorSqlDialect,
   type QueryResultExportPayload,
 } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
@@ -29,6 +31,20 @@ const SUPERSEDED_QUERY_REJECTED_MESSAGE =
 const SUPERSEDED_QUERY_CANCEL_TIMEOUT_MS = 1_500;
 const MSSQL_READ_ONLY_ENFORCEMENT_MESSAGE =
   "[RapiDB] Read-only MSSQL queries require database-enforced read permissions; client-side SQL classification is not sufficient.";
+const CONNECTION_TYPE_TO_SCHEMA_DIALECT: Record<
+  ConnectionType,
+  QueryEditorSqlDialect
+> = {
+  pg: "postgresql",
+  mysql: "mysql",
+  sqlite: "sqlite",
+  mssql: "transactsql",
+  oracle: "plsql",
+  mongodb: "sql",
+  redis: "sql",
+  elasticsearch: "sql",
+  dynamodb: "sql",
+};
 let nextQueryRequestToken = 0;
 
 export interface QueryPanelCachedResult {
@@ -204,6 +220,12 @@ export class QueryPanelController {
       );
       return;
     }
+    const reconnectBlock =
+      this.connectionManager.getAutomaticReconnectBlockReason?.(connectionId);
+    if (reconnectBlock) {
+      this.postQueryError(reconnectBlock, requestToken, resultIdentity);
+      return;
+    }
     const readOnlyDecision = decideReadOnlyQueryExecution(
       this.connectionManager,
       connectionId,
@@ -251,7 +273,7 @@ export class QueryPanelController {
 
     if (!this.connectionManager.isConnected(connectionId)) {
       try {
-        await this.connectionManager.connectTo(connectionId);
+        await this.connectionManager.connectTo(connectionId, "automatic");
       } catch (error: unknown) {
         const normalized = normalizeUnknownError(error);
         this.postQueryError(
@@ -307,7 +329,13 @@ export class QueryPanelController {
         return;
       }
       const formattedResult = formatQueryResult(result, effectiveRowLimit);
-      if (mayChangeDatabaseSchema(cappedQueryText)) {
+      const schemaDialect: QueryEditorSqlDialect =
+        this.connectionManager.getDriverCapabilities?.(connectionId)
+          ?.editorPresentation?.sqlDialect ??
+        (connectionType
+          ? CONNECTION_TYPE_TO_SCHEMA_DIALECT[connectionType]
+          : "sql");
+      if (mayChangeDatabaseSchema(cappedQueryText, schemaDialect)) {
         this.connectionManager.refreshSchemaCache(connectionId);
       }
 
@@ -341,8 +369,8 @@ export class QueryPanelController {
       ) => void | Promise<void>;
     },
   ): QueryExecutionCancellationHandle {
-    const cancelCurrentOperation = driver.cancelCurrentOperation;
-    const supportsCancellation = typeof cancelCurrentOperation === "function";
+    const supportsCancellation =
+      typeof driver.cancelCurrentOperation === "function";
 
     return {
       requestToken,
@@ -354,7 +382,7 @@ export class QueryPanelController {
           return;
         }
 
-        await cancelCurrentOperation({
+        await driver.cancelCurrentOperation?.({
           ...context,
           operationName: "query",
           connectionId,

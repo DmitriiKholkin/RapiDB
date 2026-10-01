@@ -220,20 +220,25 @@ function sqliteOpenError(
   );
 }
 
-async function loadBetterSqlite3(): Promise<BetterSqlite3Constructor> {
+async function loadBetterSqlite3(
+  loadTargets?: readonly string[],
+): Promise<BetterSqlite3Constructor> {
   if (cachedBetterSqlite3) {
     return cachedBetterSqlite3;
   }
 
   let installError: unknown = null;
   try {
-    await ensureSQLiteRuntimeInstalled(__dirname);
+    if (!loadTargets) await ensureSQLiteRuntimeInstalled(__dirname);
   } catch (error) {
     installError = error;
   }
 
-  const attemptedTargets = resolveBetterSqlite3LoadTargets(__dirname, true);
-  const probe = probeInstalledBetterSqlite3Runtime(__dirname);
+  const attemptedTargets =
+    loadTargets ?? resolveBetterSqlite3LoadTargets(__dirname, true);
+  const probe = loadTargets
+    ? null
+    : probeInstalledBetterSqlite3Runtime(__dirname);
 
   let lastError: unknown = null;
   for (const target of attemptedTargets) {
@@ -415,8 +420,9 @@ class BetterSqlite3DatabaseAdapter implements SQLiteDatabase {
 
 export async function openSQLiteDatabase(
   config: SQLiteRuntimeOpenConfig,
+  loadTargets?: readonly string[],
 ): Promise<SQLiteDatabase> {
-  const Database = await loadBetterSqlite3();
+  const Database = await loadBetterSqlite3(loadTargets);
   const readOnly = config.readOnly === true;
   let database: BetterSqlite3Database;
   try {

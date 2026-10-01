@@ -1,11 +1,15 @@
 import { createClient } from "redis";
-import { REDIS_READ_BUDGET } from "../../shared/safetyContracts";
+import {
+  type OperationCancellationContext,
+  REDIS_READ_BUDGET,
+} from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
 import { pMapWithLimit } from "../utils/concurrency";
 import { logger } from "../utils/logger";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
+import { deleteRowsSequentially, prepareDeleteBatch } from "./deleteOutcomes";
 import {
   applyFilters,
   applySort,
@@ -15,9 +19,16 @@ import {
   stringifyCommandPayload,
   unsupported,
 } from "./nosqlUtils";
+import {
+  DriverTimeoutError,
+  type DriverTimeoutSettingsProvider,
+  getDefaultDriverTimeoutSettings,
+  throwIfTransactionCancelled,
+} from "./timeout";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
+  DatabaseExecutionScope,
   DatabaseInfo,
   DriverDeleteRowsRequest,
   DriverEntityManifest,
@@ -31,14 +42,16 @@ import type {
   IDBDriver,
   IndexMeta,
   PaginationResult,
+  QueryExecutionOptions,
   QueryResult,
   SchemaInfo,
   TableConstraintMeta,
   TableInfo,
+  TransactionContext,
   TransactionOperation,
   TriggerMeta,
 } from "./types";
-import { resolveFilterOperators } from "./types";
+import { NULL_SENTINEL, resolveFilterOperators } from "./types";
 
 const REDIS_ENTITY_MANIFEST: DriverEntityManifest = {
   dbObjectKinds: ["table"],
@@ -169,6 +182,21 @@ interface RedisSampleRow {
 
 type RedisHashEntries = Record<string, string>;
 
+type RedisClient = ReturnType<typeof createClient>;
+
+type RedisInsertPlan = {
+  command: "set";
+  args: [key: string, value: string];
+  options: { NX: true; EX?: number };
+};
+interface RedisClientEntry {
+  client: RedisClient;
+  promise: Promise<RedisClient>;
+  cancelled: boolean;
+  openingSettled: boolean;
+  abort: AbortController;
+}
+
 type RedisSortedSetEntry = {
   score: number;
   value: string;
@@ -298,9 +326,41 @@ function tokenizeRedisCommand(input: string): string[] {
     tokenStarted = false;
   };
 
-  for (const char of input) {
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
     if (escaping) {
-      current += char;
+      // Preview arguments are JSON strings. Decode their escapes only inside
+      // double quotes; single-quoted and unquoted queries keep shell escaping.
+      if (quote === '"' && char === "u") {
+        const hex = input.slice(index + 1, index + 5);
+        if (!/^[\da-fA-F]{4}$/.test(hex)) {
+          throw new Error("Redis query has an invalid Unicode escape.");
+        }
+        current += String.fromCharCode(Number.parseInt(hex, 16));
+        index += 4;
+      } else if (quote === '"') {
+        switch (char) {
+          case "n":
+            current += "\n";
+            break;
+          case "r":
+            current += "\r";
+            break;
+          case "t":
+            current += "\t";
+            break;
+          case "b":
+            current += "\b";
+            break;
+          case "f":
+            current += "\f";
+            break;
+          default:
+            current += char;
+        }
+      } else {
+        current += char;
+      }
       tokenStarted = true;
       escaping = false;
       continue;
@@ -377,17 +437,85 @@ function decideRedisReadOnlyQuery(queryText: string) {
 }
 
 export class RedisDriver implements IDBDriver {
-  private client: ReturnType<typeof createClient> | null = null;
+  private client: RedisClient | null = null;
   private connected = false;
+  private epoch = 0;
+  private connecting?: Promise<void>;
+  private readonly connectionAttempts = new WeakMap<
+    Promise<unknown>,
+    RedisClientEntry
+  >();
+  private readonly databaseClients = new Map<number, RedisClientEntry>();
+  private readonly clients = new Set<RedisClientEntry>();
+  private readonly queries = new Map<number, AbortController>();
 
-  constructor(private readonly config: ConnectionConfig) {}
+  constructor(
+    private readonly config: ConnectionConfig,
+    private readonly timeoutSettingsProvider: DriverTimeoutSettingsProvider = getDefaultDriverTimeoutSettings,
+  ) {}
 
-  async connect(): Promise<void> {
+  connect(): Promise<void> {
     if (this.connected) {
-      return;
+      return Promise.resolve();
     }
+    if (this.connecting) return this.connecting;
+    const epoch = this.epoch;
+    let entry: RedisClientEntry;
+    try {
+      entry = this.openClient(this.resolveDbIndex());
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const attempt = entry.promise
+      .then((client) => {
+        if (epoch !== this.epoch || entry.cancelled) {
+          this.cancelClientEntry(entry);
+          throw new Error("Redis connection attempt was cancelled.");
+        }
+        this.client = client;
+        this.connected = true;
+      })
+      .finally(() => {
+        if (this.connecting === attempt) this.connecting = undefined;
+      });
+    this.connecting = attempt;
+    this.connectionAttempts.set(attempt, entry);
+    return attempt;
+  }
+
+  cancelConnectionAttempt(attempt: Promise<unknown>): void {
+    const entry = this.connectionAttempts.get(attempt);
+    if (!entry) return;
+    this.cancelClientEntry(entry);
+    if (this.connecting === attempt) this.connecting = undefined;
+    if (this.client === entry.client) {
+      this.client = null;
+      this.connected = false;
+    }
+  }
+
+  private createDatabaseClient(
+    database: number,
+    signal: AbortSignal,
+  ): RedisClient {
     const forwardedTransport = getSshTcpForwardTransport(this.config);
     const tlsSettings = resolveConnectionTlsSettings(this.config);
+    // node-redis gives URI fields priority over explicit options. Rewrite both
+    // the DB and forwarded endpoint, retaining URI authentication and TLS.
+    const uri = this.config.connectionUri
+      ? new URL(this.config.connectionUri)
+      : undefined;
+    if (uri) {
+      if (uri.protocol !== "redis:" && uri.protocol !== "rediss:") {
+        throw new Error("Redis connection URI must use redis:// or rediss://.");
+      }
+      uri.pathname = `/${database}`;
+      if (forwardedTransport) {
+        uri.hostname = forwardedTransport.localHost;
+        uri.port = String(forwardedTransport.localPort);
+      }
+      if (tlsSettings) uri.protocol = "rediss:";
+    }
     const socket = tlsSettings
       ? {
           host:
@@ -407,38 +535,140 @@ export class RedisDriver implements IDBDriver {
             (forwardedTransport?.localHost ?? this.config.host) || "127.0.0.1",
           port: forwardedTransport?.localPort ?? this.config.port ?? 6379,
         };
-    const client: ReturnType<typeof createClient> = createClient({
-      url: this.config.connectionUri,
-      socket,
+    // destroy() cannot reach a TCP/TLS socket still inside createSocket().
+    // Node's TLS transport supports signal too (its declaration omits it).
+    // Stop reconnecting on abort, retaining node-redis's default retry backoff.
+    const socketOptions = {
+      ...socket,
+      signal,
+      reconnectStrategy: (retries: number) =>
+        signal.aborted
+          ? false
+          : Math.min(2 ** retries * 50, 2000) + Math.floor(Math.random() * 200),
+    };
+    const client: RedisClient = createClient({
+      url: uri?.toString(),
+      socket: socketOptions,
+      database,
       username: this.config.username,
       password: this.config.password,
     });
     client.on("error", (error: unknown) => {
       logger.error("Redis client error", error);
     });
+    return client;
+  }
+
+  private destroyClient(client: RedisClient): unknown {
     try {
-      await client.connect();
-      const dbIndex = this.resolveDbIndex();
-      if (dbIndex > 0) {
-        await client.select(dbIndex);
-      }
+      if (client.isOpen) client.destroy();
     } catch (error) {
-      if (client.isOpen) {
-        client.destroy();
-      }
-      throw error;
+      logger.error("Redis client cleanup error", error);
+      return error;
     }
-    this.client = client;
-    this.connected = true;
+  }
+
+  private releaseClientEntry(entry: RedisClientEntry): void {
+    if (
+      entry.cancelled &&
+      entry.openingSettled &&
+      !entry.client.isOpen &&
+      !entry.client.isReady
+    ) {
+      this.clients.delete(entry);
+    }
+  }
+
+  private cancelClientEntry(
+    entry: RedisClientEntry,
+    reason: unknown = new Error("Redis connection attempt was cancelled."),
+  ): unknown {
+    entry.cancelled = true;
+    entry.abort.abort(reason);
+    const error = this.destroyClient(entry.client);
+    this.releaseClientEntry(entry);
+    return error;
+  }
+
+  private openClient(database: number): RedisClientEntry {
+    const abort = new AbortController();
+    const client = this.createDatabaseClient(database, abort.signal);
+    const entry: RedisClientEntry = {
+      client,
+      cancelled: false,
+      openingSettled: false,
+      abort,
+      promise: Promise.resolve(client),
+    };
+    this.clients.add(entry);
+    client.on("end", () => this.releaseClientEntry(entry));
+    client.on("error", () => {
+      // node-redis changes isOpen after emitting an error during reconnect.
+      queueMicrotask(() => this.releaseClientEntry(entry));
+    });
+    const epoch = this.epoch;
+    entry.promise = (async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const opening = client
+          .connect()
+          .then(() => {
+            if (entry.cancelled || epoch !== this.epoch) {
+              this.cancelClientEntry(entry);
+              throw new Error("Redis connection attempt was cancelled.");
+            }
+            return client;
+          })
+          .finally(() => {
+            entry.openingSettled = true;
+            this.releaseClientEntry(entry);
+          });
+        const timeoutMs = this.timeoutSettingsProvider().connectionTimeoutMs;
+        if (timeoutMs > 0) {
+          timer = setTimeout(() => {
+            this.cancelClientEntry(
+              entry,
+              new DriverTimeoutError("connection", "connect", timeoutMs),
+            );
+          }, timeoutMs);
+        }
+        await this.waitForResult(opening, entry.abort.signal);
+        if (entry.cancelled || epoch !== this.epoch) {
+          throw new Error("Redis connection attempt was cancelled.");
+        }
+        return client;
+      } catch (error) {
+        this.cancelClientEntry(entry, error);
+        throw error;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    })();
+    return entry;
   }
 
   async disconnect(): Promise<void> {
     const client = this.client;
+    this.epoch += 1;
     this.client = null;
     this.connected = false;
-    if (client?.isOpen) {
-      await client.close();
+    this.connecting = undefined;
+    this.databaseClients.clear();
+    for (const abort of this.queries.values()) abort.abort();
+    this.queries.clear();
+    const entries = [...this.clients];
+    const errors: unknown[] = [];
+    // close() waits for outstanding replies indefinitely. Force physical
+    // transport teardown and keep opening/failed entries tracked until retired.
+    for (const entry of entries) {
+      const error = this.cancelClientEntry(entry);
+      if (error !== undefined) errors.push(error);
     }
+    if (client && !entries.some((entry) => entry.client === client)) {
+      const error = this.destroyClient(client);
+      if (error !== undefined) errors.push(error);
+    }
+    if (errors.length) throw errors[0];
   }
 
   isConnected(): boolean {
@@ -484,8 +714,13 @@ export class RedisDriver implements IDBDriver {
     return [];
   }
 
-  async listObjects(): Promise<TableInfo[]> {
-    const keys = await this.scanKeys("*", REDIS_READ_BUDGET.maxScanKeys);
+  async listObjects(database?: string, _schema?: string): Promise<TableInfo[]> {
+    const client = await this.getDatabaseClient(database);
+    const keys = await this.scanKeys(
+      client,
+      "*",
+      REDIS_READ_BUDGET.maxScanKeys,
+    );
     const names = new Set<string>();
     for (const key of keys) {
       const prefix = key.includes(":") ? key.split(":")[0] : "default";
@@ -502,11 +737,15 @@ export class RedisDriver implements IDBDriver {
   }
 
   async describeTable(
-    _database: string,
+    database: string,
     _schema: string,
     table: string,
   ): Promise<ColumnMeta[]> {
-    const rows = await this.readRows(table, 200);
+    const rows = await this.readRows(
+      await this.getDatabaseClient(database),
+      table,
+      200,
+    );
     return this.inferRedisColumns(rows).map((column) => ({
       name: column.name,
       type: column.nativeType,
@@ -519,11 +758,15 @@ export class RedisDriver implements IDBDriver {
   }
 
   async describeColumns(
-    _database: string,
+    database: string,
     _schema: string,
     table: string,
   ): Promise<ColumnTypeMeta[]> {
-    const rows = await this.readRows(table, 200);
+    const rows = await this.readRows(
+      await this.getDatabaseClient(database),
+      table,
+      200,
+    );
     return this.inferRedisColumns(rows);
   }
 
@@ -573,7 +816,19 @@ export class RedisDriver implements IDBDriver {
     unsupported("Redis routine definition");
   }
 
-  async query(sql: string, _params?: unknown[]): Promise<QueryResult> {
+  query(
+    sql: string,
+    _params?: unknown[],
+    options?: QueryExecutionOptions,
+  ): Promise<QueryResult> {
+    return this.executeQuery(sql, options);
+  }
+
+  private async executeQuery(
+    sql: string,
+    options?: QueryExecutionOptions,
+    signal?: AbortSignal,
+  ): Promise<QueryResult> {
     const trimmed = sql.trim().replace(/;+$/, "");
     if (!trimmed) {
       return {
@@ -587,41 +842,98 @@ export class RedisDriver implements IDBDriver {
     const startedAt = Date.now();
     const statements = splitRedisStatements(trimmed);
     const results: unknown[] = [];
-    for (const statement of statements) {
-      const parts = tokenizeRedisCommand(statement);
-      const [command, ...args] = parts;
-      results.push(
-        await this.requireClient().sendCommand([
-          command.toUpperCase(),
-          ...args,
-        ]),
+    const abort = new AbortController();
+    const querySignal = signal
+      ? AbortSignal.any([signal, abort.signal])
+      : abort.signal;
+    const epoch = this.epoch;
+    if (options?.requestToken !== undefined)
+      this.queries.set(options.requestToken, abort);
+    let entry: RedisClientEntry | undefined;
+    let onAbort: (() => void) | undefined;
+    try {
+      // Explicit query scopes use a disposable session: SELECT in query text must
+      // never change either the editor's base session or cached native DB clients.
+      querySignal.throwIfAborted();
+      this.requireClient();
+      if (options?.database) {
+        entry = this.openClient(this.resolveDbIndex(options.database));
+        const owned = entry;
+        onAbort = () => {
+          this.cancelClientEntry(owned, querySignal.reason);
+        };
+        querySignal.addEventListener("abort", onAbort, { once: true });
+      }
+      const baseClient = entry
+        ? await this.waitForResult(entry.promise, querySignal)
+        : this.requireClient();
+      const client =
+        options?.requestToken !== undefined || signal
+          ? baseClient.withAbortSignal(querySignal)
+          : baseClient;
+      for (const statement of statements) {
+        querySignal.throwIfAborted();
+        if (epoch !== this.epoch)
+          throw new Error("Redis query was cancelled by disconnect.");
+        const parts = tokenizeRedisCommand(statement);
+        const [command, ...args] = parts;
+        // node-redis removes the command's abort listener when it is written.
+        // Race sent commands explicitly; only owned sessions are destroyed.
+        results.push(
+          await this.waitForResult(
+            client.sendCommand([command.toUpperCase(), ...args]),
+            querySignal,
+          ),
+        );
+      }
+      const row = flattenRootRecord(
+        statements.length === 1 ? { result: results[0] } : { results },
       );
+      const columns = Object.keys(row);
+      return {
+        columns,
+        rows: [this.mapRowToQueryRow(row, columns)],
+        rowCount: 1,
+        executionTimeMs: Date.now() - startedAt,
+      };
+    } finally {
+      if (onAbort) querySignal.removeEventListener("abort", onAbort);
+      if (
+        options?.requestToken !== undefined &&
+        this.queries.get(options.requestToken) === abort
+      ) {
+        this.queries.delete(options.requestToken);
+      }
+      if (entry) {
+        this.cancelClientEntry(entry);
+      }
     }
-    const row = flattenRootRecord(
-      statements.length === 1 ? { result: results[0] } : { results },
-    );
-    const columns = Object.keys(row);
-    return {
-      columns,
-      rows: [this.mapRowToQueryRow(row, columns)],
-      rowCount: 1,
-      executionTimeMs: Date.now() - startedAt,
-    };
+  }
+
+  cancelCurrentOperation(context?: OperationCancellationContext): void {
+    if (context?.requestToken !== undefined)
+      this.queries.get(context.requestToken)?.abort();
   }
 
   async readTablePage(
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
     const startTime = performance.now();
+    const client = await this.getDatabaseClient(request.database);
     if (this.canUseKeyOnlyPaging(request)) {
       const pattern = request.table === "default" ? "*" : `${request.table}:*`;
       const offset = Math.max(0, (request.page - 1) * request.pageSize);
       const keys = (
-        await this.scanKeys(pattern, REDIS_READ_BUDGET.maxScanKeys, true)
+        await this.scanKeys(
+          client,
+          pattern,
+          REDIS_READ_BUDGET.maxScanKeys,
+          true,
+        )
       ).sort((left, right) => left.localeCompare(right));
       if (request.sort?.direction === "desc") keys.reverse();
       const pageKeys = keys.slice(offset, offset + request.pageSize);
-      const rows = await this.readRowsForKeys(pageKeys);
+      const rows = await this.readRowsForKeys(client, pageKeys);
       return {
         columns: this.inferRedisColumns(rows),
         rows: rows.map((entry) => entry.row),
@@ -638,21 +950,19 @@ export class RedisDriver implements IDBDriver {
       REDIS_READ_BUDGET.maxValueReads,
       fallbackReadLimit,
     );
-    const rows = await this.readRows(request.table, boundedReadLimit, true);
-    const rowRecords = rows.map((entry) => entry.row);
-    const filtered = applyFilters(rowRecords, request.filters);
-    const sorted = applySort(filtered, request.sort);
-    const paged = pageRows(sorted, request.page, request.pageSize);
-    const redisTypeByKey = new Map(
-      rows.map((entry) => [String(entry.row.key ?? ""), entry.redisType]),
+    const rows = await this.readRows(
+      client,
+      request.table,
+      boundedReadLimit,
+      true,
     );
+    const rowRecords = rows.map((entry) => entry.row);
+    const columns = this.inferRedisColumns(rows);
+    const filtered = applyFilters(rowRecords, request.filters, columns);
+    const sorted = applySort(filtered, request.sort, columns);
+    const paged = pageRows(sorted, request.page, request.pageSize);
     return {
-      columns: this.inferRedisColumns(
-        sorted.map((row) => ({
-          redisType: redisTypeByKey.get(String(row.key ?? "")) ?? "none",
-          row,
-        })),
-      ),
+      columns,
       rows: paged,
       totalCount: request.skipCount ? 0 : sorted.length,
       executionTimeMs: Math.round(performance.now() - startTime),
@@ -676,7 +986,10 @@ export class RedisDriver implements IDBDriver {
     context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
     context?.signal.throwIfAborted();
-    const baseClient = this.requireClient();
+    const baseClient = await this.getDatabaseClient(
+      request.database,
+      context?.signal,
+    );
     const client = context
       ? baseClient.withAbortSignal(context.signal)
       : baseClient;
@@ -771,27 +1084,15 @@ export class RedisDriver implements IDBDriver {
     context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
     context?.signal.throwIfAborted();
-    const key = this.resolveStoredKey(request.values.key);
-    if (!key) {
-      throw new Error("Redis insert requires a 'key' field.");
-    }
-    const hasTtl = Object.hasOwn(request.values, "ttl");
-    const ttlSeconds = hasTtl
-      ? this.parseRedisTtlInput(request.values.ttl, "Redis TTL inserts")
-      : undefined;
-    const value =
-      request.values.value ?? request.values.json ?? request.values.text;
-    const baseClient = this.requireClient();
+    const plan = this.buildRedisInsertPlan(request.values);
+    const baseClient = await this.getDatabaseClient(
+      request.database,
+      context?.signal,
+    );
     const client = context
       ? baseClient.withAbortSignal(context.signal)
       : baseClient;
-    const result = await client.set(
-      key,
-      this.normalizeStoredValue(value),
-      ttlSeconds !== undefined && ttlSeconds !== null
-        ? { NX: true, EX: ttlSeconds }
-        : { NX: true },
-    );
+    const result = await client[plan.command](...plan.args, plan.options);
 
     return { affectedRows: result === "OK" ? 1 : 0 };
   }
@@ -800,22 +1101,24 @@ export class RedisDriver implements IDBDriver {
     request: DriverDeleteRowsRequest,
     context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
-    context?.signal.throwIfAborted();
-    const baseClient = this.requireClient();
+    const baseClient = await prepareDeleteBatch(
+      request.primaryKeyValuesList,
+      context,
+      () => this.getDatabaseClient(request.database, context?.signal),
+    );
     const client = context
       ? baseClient.withAbortSignal(context.signal)
       : baseClient;
-    let affectedRows = 0;
-    for (const entry of request.primaryKeyValuesList) {
-      context?.signal.throwIfAborted();
-      const key = this.resolveStoredKey(entry.key);
-      if (!key) {
-        continue;
-      }
-      const deleted = await client.del(key);
-      affectedRows += deleted;
-    }
-    return { affectedRows };
+    return deleteRowsSequentially(
+      request.primaryKeyValuesList,
+      context,
+      (entry) => {
+        const key = this.resolveStoredKey(entry.key);
+        if (!key) throw new Error("Redis delete requires a non-empty key.");
+        return async () =>
+          (await client.del(key)) > 0 ? "deleted" : "notfound";
+      },
+    );
   }
 
   buildMutationPreviewStatement(
@@ -831,27 +1134,9 @@ export class RedisDriver implements IDBDriver {
     },
   ): string {
     if (operation === "insert") {
-      const key = data.values?.key ?? "<key>";
-      const ttlSeconds = Object.hasOwn(data.values ?? {}, "ttl")
-        ? this.parseRedisTtlInput(data.values?.ttl, "Redis TTL inserts")
-        : undefined;
-      const value =
-        data.values?.value ??
-        data.values?.json ??
-        data.values?.text ??
-        JSON.stringify(data.values ?? {});
-      const setArgs: Array<string | number> = [
-        String(key),
-        this.normalizeStoredValue(value),
-      ];
-      if (ttlSeconds !== undefined && ttlSeconds !== null) {
-        setArgs.push("EX", ttlSeconds);
-      }
-      const setPreview = formatRedisPreviewCommand("SET", setArgs);
-      if (ttlSeconds === null) {
-        return `${setPreview}; ${formatRedisPreviewCommand("PERSIST", [String(key)])}`;
-      }
-      return setPreview;
+      return this.buildRedisInsertPreview(
+        this.buildRedisInsertPlan(data.values),
+      );
     }
     if (operation === "update") {
       const sourceKey = this.resolveStoredKey(data.primaryKeys?.key);
@@ -923,9 +1208,9 @@ export class RedisDriver implements IDBDriver {
 
   async buildMutationPreviewStatements(
     operation: "insert" | "update" | "delete",
-    _database: string,
+    database: string,
     _schema: string,
-    table: string,
+    _table: string,
     data: {
       primaryKeys?: Record<string, unknown>;
       changes?: Record<string, unknown>;
@@ -947,27 +1232,9 @@ export class RedisDriver implements IDBDriver {
     }
 
     if (operation === "insert") {
-      const key = data.values?.key;
-      if (key === undefined) {
-        return ['SET "<key>" ""'];
-      }
-      const ttlSeconds = Object.hasOwn(data.values ?? {}, "ttl")
-        ? this.parseRedisTtlInput(data.values?.ttl, "Redis TTL inserts")
-        : undefined;
-      const value =
-        data.values?.value ?? data.values?.json ?? data.values?.text ?? "";
-      const inferredType = await this.inferInsertRedisType(table);
-      const statements = this.buildRedisPreviewStatementsForType(
-        String(key),
-        inferredType,
-        value,
-      );
-      if (ttlSeconds !== undefined) {
-        statements.push(
-          this.buildRedisTtlPreviewStatement(String(key), ttlSeconds),
-        );
-      }
-      return statements;
+      return [
+        this.buildRedisInsertPreview(this.buildRedisInsertPlan(data.values)),
+      ];
     }
 
     const key = data.primaryKeys?.key;
@@ -1010,7 +1277,9 @@ export class RedisDriver implements IDBDriver {
         ? statements
         : [formatRedisPreviewCommand("GET", [sourceKey])];
     }
-    const redisType = await this.requireClient().type(sourceKey);
+    const redisType = await (await this.getDatabaseClient(database)).type(
+      sourceKey,
+    );
     statements.push(
       ...this.buildRedisPreviewStatementsForType(targetKey, redisType, value),
     );
@@ -1022,9 +1291,24 @@ export class RedisDriver implements IDBDriver {
     return statements;
   }
 
-  async runTransaction(operations: TransactionOperation[]): Promise<void> {
+  async runTransaction(
+    operations: TransactionOperation[],
+    context?: TransactionContext,
+    scope?: DatabaseExecutionScope,
+  ): Promise<void> {
+    // No MULTI/EXEC wrapping here: sequential queries are not atomic.
+    // Fail closed on multi-op instead of risking a partial apply.
+    if (operations.length > 1) {
+      throw new Error(
+        "[RapiDB] Redis driver does not support atomic multi-operation transactions. Apply one row at a time.",
+      );
+    }
     for (const operation of operations) {
-      await this.query(operation.sql, operation.params);
+      throwIfTransactionCancelled(context);
+      if (context)
+        await this.executeQuery(operation.sql, scope, context.signal);
+      else if (scope) await this.query(operation.sql, operation.params, scope);
+      else await this.query(operation.sql, operation.params);
     }
   }
 
@@ -1056,6 +1340,12 @@ export class RedisDriver implements IDBDriver {
   }
 
   coerceInputValue(value: unknown, _column: ColumnTypeMeta): unknown {
+    return value === NULL_SENTINEL ? null : value;
+  }
+
+  coerceOriginalValue(value: unknown, _column: ColumnTypeMeta): unknown {
+    // Persisted bytes may equal the UI NULL marker; keep them for the
+    // atomic edit's original-value comparison.
     return value;
   }
 
@@ -1116,14 +1406,60 @@ export class RedisDriver implements IDBDriver {
     return this.client;
   }
 
-  private resolveDbIndex(): number {
-    if (
-      typeof this.config.database === "string" &&
-      /^\d+$/.test(this.config.database)
-    ) {
-      return Number(this.config.database);
+  private resolveDbIndex(database?: string): number {
+    let selected = database?.trim() || this.config.database?.trim();
+    if (!selected && this.config.connectionUri) {
+      selected = new URL(this.config.connectionUri).pathname.slice(1);
     }
-    return 0;
+    if (!selected) return 0;
+    const match = /^(?:db)?(\d+)$/.exec(selected);
+    const index = match ? Number(match[1]) : NaN;
+    if (!Number.isSafeInteger(index)) {
+      throw new Error(
+        `Invalid Redis logical database '${selected}': expected a numeric index or dbN.`,
+      );
+    }
+    return index;
+  }
+
+  private async getDatabaseClient(
+    database?: string,
+    signal?: AbortSignal,
+  ): Promise<RedisClient> {
+    this.requireClient();
+    signal?.throwIfAborted();
+    const index = this.resolveDbIndex(database);
+    let entry = this.databaseClients.get(index);
+    if (!entry) {
+      entry = this.openClient(index);
+      this.databaseClients.set(index, entry);
+      const pending = entry;
+      void entry.promise.catch(() => {
+        if (this.databaseClients.get(index) === pending)
+          this.databaseClients.delete(index);
+      });
+    }
+    return this.waitForResult(entry.promise, signal);
+  }
+
+  private async waitForResult<T>(
+    promise: Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    if (!signal) return promise;
+    signal.throwIfAborted();
+    let onAbort: () => void = () => undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<never>((_resolve, reject) => {
+          onAbort = () => reject(signal.reason);
+          signal.addEventListener("abort", onAbort, { once: true });
+        }),
+      ]);
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+    }
   }
 
   private normalizeStoredValue(value: unknown): string {
@@ -1141,6 +1477,7 @@ export class RedisDriver implements IDBDriver {
   }
 
   private async readRows(
+    client: RedisClient,
     table: string,
     maxRows: number,
     failOnTruncation = false,
@@ -1148,23 +1485,19 @@ export class RedisDriver implements IDBDriver {
     const pattern = table === "default" ? "*" : `${table}:*`;
     const readLimit = Math.min(maxRows, REDIS_READ_BUDGET.maxValueReads);
     const keys = (
-      await this.scanKeys(pattern, readLimit, failOnTruncation)
+      await this.scanKeys(client, pattern, readLimit, failOnTruncation)
     ).sort((left, right) => left.localeCompare(right));
-    return await this.readRowsForKeys(keys);
+    return await this.readRowsForKeys(client, keys);
   }
 
   private async readRowsForKeys(
+    client: RedisClient,
     keys: readonly string[],
   ): Promise<RedisSampleRow[]> {
     return pMapWithLimit(
       [...keys],
       REDIS_READ_BUDGET.parallelValueReads,
       async (key) => {
-        const client = this.requireClient() as ReturnType<
-          typeof createClient
-        > & {
-          ttl?: (key: string) => Promise<number>;
-        };
         const type = await client.type(key);
         let value: unknown = null;
         switch (type) {
@@ -1184,7 +1517,7 @@ export class RedisDriver implements IDBDriver {
             value = await client.zRangeWithScores(key, 0, -1);
             break;
           case "stream":
-            value = await this.readStreamEntries(key);
+            value = await this.readStreamEntries(client, key);
             break;
           default:
             value = null;
@@ -1211,6 +1544,7 @@ export class RedisDriver implements IDBDriver {
       "key",
       {
         nullableMode: "schemaLess",
+        consistentCategories: true,
       },
     );
     const valueTypeLabel = formatRedisValueTypeLabel(rows);
@@ -1220,6 +1554,11 @@ export class RedisDriver implements IDBDriver {
             ...column,
             type: "string",
             nativeType: "string",
+            category: "text",
+            filterOperators: resolveFilterOperators("text", {
+              filterable: true,
+              nullable: false,
+            }),
           }
         : column.name === "value" && valueTypeLabel
           ? {
@@ -1296,18 +1635,38 @@ export class RedisDriver implements IDBDriver {
       : formatRedisPreviewCommand("EXPIRE", [key, ttlSeconds]);
   }
 
-  private async inferInsertRedisType(table: string): Promise<string> {
-    const pattern = table === "default" ? "*" : `${table}:*`;
-    const keys = (await this.scanKeys(pattern, 25)).slice(0, 25);
-    const valueTypes = [
-      ...new Set(
-        await Promise.all(keys.map((key) => this.requireClient().type(key))),
-      ),
-    ].filter((type) => type !== "none");
-    if (valueTypes.length !== 1) {
-      return "string";
+  private buildRedisInsertPlan(
+    values: Record<string, unknown> = {},
+  ): RedisInsertPlan {
+    const key = this.resolveStoredKey(values.key);
+    if (!key) {
+      throw new Error("Redis insert requires a 'key' field.");
     }
-    return valueTypes[0] ?? "string";
+    const ttlSeconds = Object.hasOwn(values, "ttl")
+      ? this.parseRedisTtlInput(values.ttl, "Redis TTL inserts")
+      : undefined;
+    return {
+      command: "set",
+      args: [
+        key,
+        this.normalizeStoredValue(values.value ?? values.json ?? values.text),
+      ],
+      options:
+        ttlSeconds !== undefined && ttlSeconds !== null
+          ? { NX: true, EX: ttlSeconds }
+          : { NX: true },
+    };
+  }
+
+  private buildRedisInsertPreview(plan: RedisInsertPlan): string {
+    const args: Array<string | number> = [...plan.args];
+    if (plan.options.EX !== undefined) {
+      args.push("EX", plan.options.EX);
+    }
+    if (plan.options.NX) {
+      args.push("NX");
+    }
+    return formatRedisPreviewCommand(plan.command.toUpperCase(), args);
   }
 
   private encodeRedisLuaValue(redisType: string, value: unknown): string {
@@ -1474,11 +1833,10 @@ export class RedisDriver implements IDBDriver {
     return JSON.stringify(value);
   }
 
-  private async readStreamEntries(key: string): Promise<unknown> {
-    const client = this.requireClient() as ReturnType<typeof createClient> & {
-      xRange?: (key: string, start: string, end: string) => Promise<unknown>;
-      sendCommand: (args: string[]) => Promise<unknown>;
-    };
+  private async readStreamEntries(
+    client: RedisClient,
+    key: string,
+  ): Promise<unknown> {
     if (typeof client.xRange === "function") {
       return client.xRange(key, "-", "+");
     }
@@ -1493,11 +1851,11 @@ export class RedisDriver implements IDBDriver {
   }
 
   private async scanKeys(
+    client: RedisClient,
     pattern: string,
     limit = Number.POSITIVE_INFINITY,
     failOnTruncation = false,
   ): Promise<string[]> {
-    const client = this.requireClient();
     const keys: string[] = [];
     let cursor = "0";
     do {

@@ -819,7 +819,7 @@ export class OracleDriver extends BaseDBDriver {
     const connectString = serviceName
       ? `${host}:${port}/${serviceName}`
       : `${host}:${port}`;
-    this.pool = (await oracledb.createPool({
+    const pool = (await oracledb.createPool({
       user: this.config.username ?? "",
       password: this.config.password ?? "",
       connectString,
@@ -832,13 +832,35 @@ export class OracleDriver extends BaseDBDriver {
       poolTimeout: 30,
       poolPingInterval: 60,
     })) as unknown as oracledb.Pool;
-    const conn = await this.pool.getConnection();
     try {
-      conn.callTimeout = this.getDbOperationTimeoutMs();
-      await conn.ping();
-    } finally {
-      await conn.close();
+      const conn = await pool.getConnection();
+      let probeFailed = false;
+      let probeError: unknown;
+      try {
+        conn.callTimeout = this.getDbOperationTimeoutMs();
+        await conn.ping();
+      } catch (error) {
+        probeFailed = true;
+        probeError = error;
+      }
+      try {
+        await conn.close();
+      } catch (closeError) {
+        // Preserve the probe error; otherwise a failed release prevents
+        // publishing a pool with a checked-out connection.
+        if (!probeFailed) throw closeError;
+      }
+      if (probeFailed) throw probeError;
+    } catch (error) {
+      // Probe (getConnection/ping) failed: close the freshly created pool
+      // instead of leaking it. Pool stays local until success so concurrent
+      // readers never observe a half-initialized pool.
+      try {
+        await pool.close(0);
+      } catch {}
+      throw error;
     }
+    this.pool = pool;
   }
   async disconnect(): Promise<void> {
     if (this.pool !== null) {

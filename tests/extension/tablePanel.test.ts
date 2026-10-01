@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
+import { QueryPanelController } from "../../src/extension/panels/queryPanelController";
 import { TablePanel } from "../../src/extension/panels/tablePanel";
+import type { ChunkedExportData } from "../../src/extension/utils/exportService";
 
 type MockColumn = { name: string; isPrimaryKey: boolean };
 
@@ -31,6 +34,13 @@ const createApplyChangesPreviewMock = vi.hoisted(() => vi.fn());
 const createInsertPreviewMock = vi.hoisted(() => vi.fn());
 const createDeleteRowsPreviewMock = vi.hoisted(() => vi.fn());
 const createWebviewShellMock = vi.hoisted(() => vi.fn(() => "<html></html>"));
+const exportTableDataMock = vi.hoisted(() =>
+  vi.fn<
+    (options: {
+      loadChunks: (signal: AbortSignal) => AsyncIterable<ChunkedExportData>;
+    }) => Promise<void>
+  >(),
+);
 
 const vscodeMock = vi.hoisted(() => {
   const configurationListeners = new Set<
@@ -113,6 +123,13 @@ const vscodeMock = vi.hoisted(() => {
 
 vi.mock("vscode", () => vscodeMock.module);
 
+vi.mock("../../src/extension/utils/exportService", () => ({
+  exportTableDataAsCsv: exportTableDataMock,
+  exportTableDataAsJson: exportTableDataMock,
+  exportQueryResultsAsCsv: vi.fn(),
+  exportQueryResultsAsJson: vi.fn(),
+}));
+
 vi.mock("../../src/extension/panels/webviewShell", () => ({
   APP_WEBVIEW_SHELL_LAYOUT: {
     htmlStyles: "height: 100%; overflow: hidden;",
@@ -153,6 +170,14 @@ vi.mock("../../src/extension/panels/tableMutationPreviewController", () => ({
 
 function createdPanel() {
   return vscodeMock.createWebviewPanel.mock.results[0]?.value;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 
 describe("TablePanel", () => {
@@ -197,6 +222,476 @@ describe("TablePanel", () => {
       statementCount: 1,
     });
     createWebviewShellMock.mockClear();
+  });
+
+  async function openSchemaRefreshPath() {
+    let refreshListener: ((connectionId?: string) => void) | undefined;
+    const connectionManager = {
+      getConnection: vi.fn(() => ({ name: "Main", type: "pg" })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(
+        (listener: (connectionId?: string) => void) => {
+          refreshListener = listener;
+          return { dispose: vi.fn() };
+        },
+      ),
+      refreshSchemaCache: vi.fn((connectionId: string) =>
+        refreshListener?.(connectionId),
+      ),
+      getDefaultPageSize: vi.fn(() => 25),
+      getQueryRowLimit: vi.fn(() => 100),
+      isConnected: vi.fn(() => true),
+      getDriver: vi.fn(() => ({
+        query: vi.fn(async () => ({ columns: [], rows: [], rowCount: 0 })),
+      })),
+      addToHistory: vi.fn(async () => undefined),
+      getSkipTableMutationPreview: vi.fn(() => false),
+    };
+    getColumnsMock.mockResolvedValue([
+      { name: "id", isPrimaryKey: true },
+      { name: "name", isPrimaryKey: false },
+    ]);
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      "db1",
+      "public",
+      "users",
+    );
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected table panel");
+    await panel.webview.dispatchMessage({ type: "ready" });
+    const controller = new QueryPanelController(connectionManager as never, {
+      getActiveConnectionId: () => "conn-1",
+      getInitialConnectionId: () => "conn-1",
+      getLastQueryResult: () => null,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    });
+    const refresh = async (
+      columns: MockColumn[] = [
+        { name: "id", isPrimaryKey: true },
+        { name: "renamed", isPrimaryKey: false },
+      ],
+    ) => {
+      getColumnsMock.mockResolvedValue(columns);
+      await controller.handleMessage({
+        type: "executeQuery",
+        payload: {
+          queryText: "ALTER TABLE users RENAME COLUMN name TO renamed",
+        },
+      });
+      await vi.waitFor(() =>
+        expect(panel.webview.postMessage).toHaveBeenCalledWith({
+          type: "tableInit",
+          payload: expect.objectContaining({
+            intent: "metadataRefresh",
+            columns,
+          }),
+        }),
+      );
+    };
+    return { panel, refresh, connectionManager };
+  }
+
+  it("routes query schema changes into explicit metadata refresh and rejects an old preview with its operation ID", async () => {
+    const { panel, refresh, connectionManager } = await openSchemaRefreshPath();
+    prepareApplyChangesPlanMock.mockReturnValue({
+      executable: true,
+      plan: {
+        updates: [{ primaryKeys: { id: 1 }, changes: { name: "Edit" } }],
+        skippedRows: [],
+        previewStatements: ["UPDATE users"],
+      },
+    });
+    await panel.webview.dispatchMessage({
+      type: "applyChanges",
+      payload: {
+        operationId: "op-1",
+        updates: [{ primaryKeys: { id: 1 }, changes: { name: "Edit" } }],
+      },
+    });
+    await refresh();
+    expect(connectionManager.refreshSchemaCache).toHaveBeenCalledWith("conn-1");
+    await panel.webview.dispatchMessage({
+      type: "confirmMutationPreview",
+      payload: { operationId: "op-1", previewToken: "apply-preview-token" },
+    });
+    expect(confirmMutationPreviewMock).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+      type: "applyResult",
+      payload: {
+        operationId: "op-1",
+        success: false,
+        error: expect.stringContaining(
+          "previous mutation preview cannot be applied",
+        ),
+      },
+    });
+  });
+
+  it.each([
+    "exportCSV",
+    "exportJSON",
+  ])("forwards cancellation into the page-only %s read and rejects a late page", async (type) => {
+    const { panel } = await openSchemaRefreshPath();
+    getPageMock.mockClear();
+    const pending = deferred<{ rows: []; totalCount: number; columns: [] }>();
+    getPageMock.mockImplementationOnce(() => pending.promise);
+    exportTableDataMock.mockImplementationOnce(async ({ loadChunks }) => {
+      const controller = new AbortController();
+      const iterator = loadChunks(controller.signal)[Symbol.asyncIterator]();
+      const next = iterator.next();
+      await vi.waitFor(() =>
+        expect(getPageMock).toHaveBeenCalledWith(
+          "conn-1",
+          "db1",
+          "public",
+          "users",
+          3,
+          25,
+          [],
+          null,
+          true,
+          controller.signal,
+        ),
+      );
+      controller.abort();
+      pending.resolve({ rows: [], totalCount: 0, columns: [] });
+      await expect(next).rejects.toMatchObject({ name: "AbortError" });
+    });
+    await panel.webview.dispatchMessage({
+      type,
+      payload: { limitToPage: { page: 3, pageSize: 25 } },
+    });
+    expect(exportTableDataMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an unchanged preview valid across duplicate metadata refresh", async () => {
+    const { panel, refresh } = await openSchemaRefreshPath();
+    prepareDeleteRowsPlanMock.mockResolvedValue({
+      previewStatements: ["DELETE FROM users"],
+    });
+    await panel.webview.dispatchMessage({
+      type: "deleteRows",
+      payload: { operationId: "op-1", primaryKeysList: [{ id: 1 }] },
+    });
+    await refresh([
+      { name: "id", isPrimaryKey: true },
+      { name: "name", isPrimaryKey: false },
+    ]);
+    confirmMutationPreviewMock.mockResolvedValue({
+      type: "deleteResult",
+      payload: { operationId: "op-1", success: true },
+    });
+    await panel.webview.dispatchMessage({
+      type: "confirmMutationPreview",
+      payload: { operationId: "op-1", previewToken: "preview-token" },
+    });
+    expect(confirmMutationPreviewMock).toHaveBeenCalledWith(
+      "preview-token",
+      "op-1",
+    );
+    expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+      type: "deleteResult",
+      payload: { operationId: "op-1", success: true },
+    });
+  });
+
+  it.each([
+    true,
+    false,
+  ])("delivers an in-flight execution's late result (success=%s) after query-triggered metadata refresh", async (success) => {
+    const { panel, refresh } = await openSchemaRefreshPath();
+    prepareDeleteRowsPlanMock.mockResolvedValue({
+      previewStatements: ["DELETE FROM users"],
+    });
+    await panel.webview.dispatchMessage({
+      type: "deleteRows",
+      payload: { operationId: "op-1", primaryKeysList: [{ id: 1 }] },
+    });
+    let resolve!: (value: unknown) => void;
+    confirmMutationPreviewMock.mockImplementationOnce(
+      () =>
+        new Promise((done) => {
+          resolve = done;
+        }),
+    );
+    const execution = panel.webview.dispatchMessage({
+      type: "confirmMutationPreview",
+      payload: { operationId: "op-1", previewToken: "preview-token" },
+    });
+    await vi.waitFor(() =>
+      expect(confirmMutationPreviewMock).toHaveBeenCalledTimes(1),
+    );
+    await refresh();
+    const result = {
+      type: "deleteResult",
+      payload: {
+        operationId: "op-1",
+        success,
+        ...(success ? {} : { error: "Late driver failure" }),
+      },
+    };
+    resolve(result);
+    await execution;
+    expect(panel.webview.postMessage).toHaveBeenLastCalledWith(result);
+  });
+
+  it("does not reuse a pre-refresh read promise for a new schema", async () => {
+    const { panel, refresh } = await openSchemaRefreshPath();
+    let resolve!: (value: {
+      rows: never[];
+      totalCount: number;
+      columns: never[];
+    }) => void;
+    getPageMock.mockImplementationOnce(
+      () =>
+        new Promise((done) => {
+          resolve = done;
+        }),
+    );
+    const first = panel.webview.dispatchMessage({
+      type: "fetchPage",
+      payload: { fetchId: 1, page: 1, pageSize: 25 },
+    });
+    await vi.waitFor(() => expect(getPageMock).toHaveBeenCalledTimes(1));
+    await refresh();
+    await panel.webview.dispatchMessage({
+      type: "fetchPage",
+      payload: { fetchId: 2, page: 1, pageSize: 25 },
+    });
+    expect(getPageMock).toHaveBeenCalledTimes(2);
+    resolve({ rows: [], totalCount: 0, columns: [] });
+    await first;
+  });
+
+  it("rejects a plan whose preparation overlaps metadata refresh", async () => {
+    const { panel, refresh } = await openSchemaRefreshPath();
+    let resolve!: (value: unknown) => void;
+    prepareDeleteRowsPlanMock.mockImplementationOnce(
+      () =>
+        new Promise((done) => {
+          resolve = done;
+        }),
+    );
+    const preparing = panel.webview.dispatchMessage({
+      type: "deleteRows",
+      payload: { operationId: "op-1", primaryKeysList: [{ id: 1 }] },
+    });
+    await vi.waitFor(() =>
+      expect(prepareDeleteRowsPlanMock).toHaveBeenCalledTimes(1),
+    );
+    await refresh();
+    resolve({ previewStatements: ["DELETE FROM users WHERE id=1"] });
+    await preparing;
+    expect(confirmMutationPreviewMock).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+      type: "deleteResult",
+      payload: {
+        operationId: "op-1",
+        success: false,
+        error: expect.stringContaining("Schema metadata changed"),
+      },
+    });
+  });
+
+  it.each([
+    false,
+    true,
+  ])("rejects a refresh starting between schema-wait completion and execution (autoSkip=%s)", async (autoSkip) => {
+    const { panel, connectionManager } = await openSchemaRefreshPath();
+    prepareDeleteRowsPlanMock.mockResolvedValue({
+      previewStatements: ["DELETE FROM users WHERE id=1"],
+    });
+    const metadata = deferred<MockColumn[]>();
+    getColumnsMock.mockImplementationOnce(() => metadata.promise);
+    const startRefresh = () => connectionManager.refreshSchemaCache("conn-1");
+    let execution: Promise<void>;
+    if (autoSkip) {
+      connectionManager.getSkipTableMutationPreview.mockImplementationOnce(
+        () => {
+          // The first microtask precedes the helper's continuation; the nested
+          // one follows its return but precedes the awaiting caller's continuation.
+          queueMicrotask(() => queueMicrotask(startRefresh));
+          return true;
+        },
+      );
+      execution = panel.webview.dispatchMessage({
+        type: "deleteRows",
+        payload: { operationId: "op-1", primaryKeysList: [{ id: 1 }] },
+      });
+    } else {
+      await panel.webview.dispatchMessage({
+        type: "deleteRows",
+        payload: { operationId: "op-1", primaryKeysList: [{ id: 1 }] },
+      });
+      execution = panel.webview.dispatchMessage({
+        type: "confirmMutationPreview",
+        payload: { operationId: "op-1", previewToken: "preview-token" },
+      });
+      queueMicrotask(startRefresh);
+    }
+    await execution;
+    // Metadata is still unresolved and cached columns still match the old plan.
+    expect(getColumnsMock).toHaveBeenCalledTimes(2);
+    expect(confirmMutationPreviewMock).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+      type: "deleteResult",
+      payload: {
+        operationId: "op-1",
+        success: false,
+        error: expect.stringContaining("Schema metadata changed"),
+      },
+    });
+    metadata.resolve([{ name: "new_id", isPrimaryKey: true }]);
+    await vi.waitFor(() =>
+      expect(panel.webview.postMessage).toHaveBeenCalledWith({
+        type: "tableInit",
+        payload: expect.objectContaining({
+          columns: [{ name: "new_id", isPrimaryKey: true }],
+        }),
+      }),
+    );
+    await panel.webview.dispatchMessage({
+      type: "confirmMutationPreview",
+      payload: { operationId: "op-1", previewToken: "preview-token" },
+    });
+    expect(confirmMutationPreviewMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    false,
+    true,
+  ])("never prepares old columns under a new pending generation (autoSkip=%s)", async (autoSkip) => {
+    const { panel, connectionManager } = await openSchemaRefreshPath();
+    connectionManager.getSkipTableMutationPreview.mockReturnValue(autoSkip);
+    const metadata = deferred<MockColumn[]>();
+    const statements = deferred<string[]>();
+    const builder = vi.fn(() => statements.promise);
+    const driver = {
+      ...connectionManager.getDriver(),
+      buildMutationPreviewStatements: builder,
+    };
+    connectionManager.getDriver.mockReturnValue(driver);
+    prepareApplyChangesPlanMock.mockReturnValue({
+      executable: true,
+      plan: {
+        updates: [{ primaryKeys: { id: 1 }, changes: { name: "007" } }],
+        skippedRows: [],
+        previewStatements: [],
+      },
+    });
+    getColumnsMock.mockImplementationOnce(() => metadata.promise);
+    const preparation = panel.webview.dispatchMessage({
+      type: "applyChanges",
+      payload: {
+        operationId: "op-1",
+        updates: [{ primaryKeys: { id: 1 }, changes: { name: "007" } }],
+      },
+    });
+    queueMicrotask(() => connectionManager.refreshSchemaCache("conn-1"));
+    await vi.waitFor(() => expect(getColumnsMock).toHaveBeenCalledTimes(2));
+    // In the old implementation preparation captured the new generation but
+    // used old columns, then paused in this builder until metadata was replaced.
+    metadata.resolve([
+      { name: "id", isPrimaryKey: true },
+      { name: "new_name", isPrimaryKey: false },
+    ]);
+    await vi.waitFor(() =>
+      expect(panel.webview.postMessage).toHaveBeenCalledWith({
+        type: "tableInit",
+        payload: expect.objectContaining({ intent: "metadataRefresh" }),
+      }),
+    );
+    statements.resolve(["UPDATE users SET name='007' WHERE id=1"]);
+    await preparation;
+    expect(prepareApplyChangesPlanMock).not.toHaveBeenCalled();
+    expect(builder).not.toHaveBeenCalled();
+    expect(createApplyChangesPreviewMock).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "applyResult",
+      payload: {
+        operationId: "op-1",
+        success: false,
+        error: expect.stringContaining("Schema metadata changed"),
+      },
+    });
+    await panel.webview.dispatchMessage({
+      type: "confirmMutationPreview",
+      payload: { operationId: "op-1", previewToken: "apply-preview-token" },
+    });
+    expect(confirmMutationPreviewMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    false,
+    true,
+  ])("retains the preparation snapshot when metadata resolves during an async preview builder (autoSkip=%s)", async (autoSkip) => {
+    const { panel, connectionManager } = await openSchemaRefreshPath();
+    connectionManager.getSkipTableMutationPreview.mockReturnValue(autoSkip);
+    const metadata = deferred<MockColumn[]>();
+    const statements = deferred<string[]>();
+    const builder = vi.fn(() => statements.promise);
+    const initialColumns = [
+      { name: "id", isPrimaryKey: true },
+      { name: "name", isPrimaryKey: false },
+    ];
+    const driver = {
+      ...connectionManager.getDriver(),
+      buildMutationPreviewStatements: builder,
+    };
+    connectionManager.getDriver.mockReturnValue(driver);
+    prepareApplyChangesPlanMock.mockReturnValue({
+      executable: true,
+      plan: {
+        updates: [{ primaryKeys: { id: 1 }, changes: { name: "007" } }],
+        skippedRows: [],
+        previewStatements: [],
+      },
+    });
+    const preparation = panel.webview.dispatchMessage({
+      type: "applyChanges",
+      payload: {
+        operationId: "op-1",
+        updates: [{ primaryKeys: { id: 1 }, changes: { name: "007" } }],
+      },
+    });
+    await vi.waitFor(() => expect(builder).toHaveBeenCalledTimes(1));
+    expect(prepareApplyChangesPlanMock.mock.calls[0]?.[6]).toEqual(
+      initialColumns,
+    );
+    getColumnsMock.mockImplementationOnce(() => metadata.promise);
+    connectionManager.refreshSchemaCache("conn-1");
+    metadata.resolve([
+      { name: "id", isPrimaryKey: true },
+      { name: "new_name", isPrimaryKey: false },
+    ]);
+    await vi.waitFor(() =>
+      expect(panel.webview.postMessage).toHaveBeenCalledWith({
+        type: "tableInit",
+        payload: expect.objectContaining({ intent: "metadataRefresh" }),
+      }),
+    );
+    statements.resolve(["UPDATE users SET name='007' WHERE id=1"]);
+    await preparation;
+    expect(createApplyChangesPreviewMock).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+      type: "applyResult",
+      payload: {
+        operationId: "op-1",
+        success: false,
+        error: expect.stringContaining("Schema metadata changed"),
+      },
+    });
+    await panel.webview.dispatchMessage({
+      type: "confirmMutationPreview",
+      payload: { operationId: "op-1", previewToken: "apply-preview-token" },
+    });
+    expect(confirmMutationPreviewMock).not.toHaveBeenCalled();
   });
 
   it("normalizes fetchPage pagination before querying data service", async () => {
@@ -277,14 +772,17 @@ describe("TablePanel", () => {
     );
   });
 
-  it("wires readonly state into the table webview initial state and ready payload", async () => {
+  it.each([
+    "pg",
+    "mongodb",
+  ])("wires readonly and %s identity state into the table webview", async (type) => {
     const columns = [{ name: "id", isPrimaryKey: true }];
     getColumnsMock.mockResolvedValueOnce(columns);
 
     const connectionManager = {
       getConnection: vi.fn(() => ({
         name: "Readonly",
-        type: "pg",
+        type,
         readOnly: true,
       })),
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
@@ -310,6 +808,7 @@ describe("TablePanel", () => {
           table: "users",
           isView: false,
           connectionReadOnly: true,
+          mongoRowIdentity: type === "mongodb",
           defaultPageSize: 50,
         }),
       }),
@@ -332,6 +831,7 @@ describe("TablePanel", () => {
       type: "tableInit",
       payload: {
         columns,
+        intent: "initialize",
         primaryKeyColumns: ["id"],
         isView: false,
         connectionReadOnly: true,
@@ -548,7 +1048,7 @@ describe("TablePanel", () => {
       },
     });
 
-    expect(getPageMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(getPageMock).toHaveBeenCalledTimes(1));
 
     if (!resolveFetch) {
       throw new Error("Expected in-flight fetch resolver");
@@ -797,6 +1297,57 @@ describe("TablePanel", () => {
     });
   });
 
+  it("builds an Elasticsearch update preview with the driver instance", async () => {
+    const driver = new ElasticsearchDriver({ type: "elasticsearch" } as never);
+    const connectionManager = {
+      getConnection: vi.fn(() => ({ name: "Elastic", type: "elasticsearch" })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      getDefaultPageSize: vi.fn(() => 25),
+      getSkipTableMutationPreview: vi.fn(() => false),
+      getDriver: vi.fn(() => driver),
+    };
+    prepareApplyChangesPlanMock.mockReturnValueOnce({
+      executable: true,
+      plan: {
+        updates: [{ primaryKeys: { _id: "doc-1" }, changes: { label: "Ada" } }],
+        skippedRows: [],
+        previewStatements: [],
+      },
+    });
+
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      "db1",
+      "",
+      "users",
+    );
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected table panel instance");
+
+    await panel.webview.dispatchMessage({
+      type: "applyChanges",
+      payload: {
+        operationId: "op-1",
+        updates: [{ primaryKeys: { _id: "doc-1" }, changes: { label: "Ada" } }],
+      },
+    });
+
+    expect(createApplyChangesPreviewMock).toHaveBeenCalledWith(
+      "op-1",
+      expect.objectContaining({
+        apply: expect.objectContaining({
+          previewStatements: [expect.stringContaining("/users/_doc/doc-1")],
+        }),
+      }),
+    );
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "tableMutationPreview",
+      payload: expect.anything(),
+    });
+  });
+
   it("returns immediate success when prepared delete plan is empty", async () => {
     const connectionManager = {
       getConnection: vi.fn(() => ({ name: "Main" })),
@@ -828,7 +1379,14 @@ describe("TablePanel", () => {
     expect(createDeleteRowsPreviewMock).not.toHaveBeenCalled();
     expect(panel.webview.postMessage).toHaveBeenCalledWith({
       type: "deleteResult",
-      payload: { operationId: "op-1", success: true },
+      payload: {
+        operationId: "op-1",
+        success: true,
+        affectedRows: 0,
+        rowOutcomes: [],
+        changesPossible: false,
+        outcomeUnknown: false,
+      },
     });
   });
 
@@ -863,7 +1421,23 @@ describe("TablePanel", () => {
     expect(createDeleteRowsPreviewMock).not.toHaveBeenCalled();
     expect(panel.webview.postMessage).toHaveBeenCalledWith({
       type: "deleteResult",
-      payload: { operationId: "op-1", success: false, error: "Plan failed" },
+      payload: {
+        operationId: "op-1",
+        success: false,
+        error: "Plan failed",
+        affectedRows: 0,
+        changesPossible: false,
+        outcomeUnknown: false,
+        rowOutcomes: [
+          {
+            rowIndex: 0,
+            primaryKeys: { id: 1 },
+            status: "skipped",
+            success: false,
+            message: "Plan failed",
+          },
+        ],
+      },
     });
   });
 

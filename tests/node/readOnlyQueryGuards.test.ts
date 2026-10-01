@@ -207,12 +207,12 @@ describe("readonly query guards", () => {
     ).toEqual({
       allowed: false,
       reason:
-        "[RapiDB] Read-only MongoDB connections allow only find, findOne, countDocuments, and aggregate queries without $out or $merge.",
+        "[RapiDB] Read-only MongoDB connections allow only find, findOne, countDocuments, and aggregate queries without $out or $merge (read-only cursor modifiers only).",
     });
     expect(guard("db.users.deleteMany({ active: false })")).toEqual({
       allowed: false,
       reason:
-        "[RapiDB] Read-only MongoDB connections allow only find, findOne, countDocuments, and aggregate queries without $out or $merge.",
+        "[RapiDB] Read-only MongoDB connections allow only find, findOne, countDocuments, and aggregate queries without $out or $merge (read-only cursor modifiers only).",
     });
   });
 

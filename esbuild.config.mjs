@@ -17,6 +17,7 @@ const baseConfig = {
 
 const webviewBaseConfig = {
   ...baseConfig,
+  tsconfig: "tsconfig.webview.json",
   platform: "browser",
   target: ["chrome120"],
   define: defineNodeEnv,
@@ -53,14 +54,21 @@ export const webviewConfig = {
   },
 };
 
+export const sqliteWorkerConfig = {
+  ...extensionConfig,
+  entryPoints: ["src/extension/dbDrivers/sqliteWorker.ts"],
+  outfile: "dist/sqliteWorker.js",
+};
+
 export async function build() {
   if (isWatch) {
     console.log("⚡ RapiDB — watch mode (extension + webview)");
-    const [extCtx, wvCtx] = await Promise.all([
+    const [extCtx, wvCtx, sqliteCtx] = await Promise.all([
       esbuild.context(extensionConfig),
       esbuild.context(webviewConfig),
+      esbuild.context(sqliteWorkerConfig),
     ]);
-    await Promise.all([extCtx.watch(), wvCtx.watch()]);
+    await Promise.all([extCtx.watch(), wvCtx.watch(), sqliteCtx.watch()]);
     console.log("👀 Watching for changes...");
   } else {
     console.log(
@@ -69,6 +77,7 @@ export async function build() {
     await Promise.all([
       esbuild.build(extensionConfig),
       esbuild.build(webviewConfig),
+      esbuild.build(sqliteWorkerConfig),
     ]);
     console.log("✅ Build complete → dist/");
   }

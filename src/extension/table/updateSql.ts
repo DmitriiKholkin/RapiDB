@@ -33,6 +33,7 @@ export function filterWritableRecord(
 export function assertExactPrimaryKeyShape(
   primaryKeyValues: Record<string, unknown>,
   columns: readonly ColumnTypeMeta[],
+  operation: "update" | "delete" = "update",
 ): void {
   const expected = columns
     .filter((column) => column.isPrimaryKey)
@@ -45,11 +46,41 @@ export function assertExactPrimaryKeyShape(
     provided.some(
       (columnName) =>
         !expectedSet.has(columnName) ||
+        primaryKeyValues[columnName] === null ||
         primaryKeyValues[columnName] === undefined,
     )
   ) {
-    throw new Error("Update requires the full primary key for the target row.");
+    throw new Error(
+      operation === "delete"
+        ? "Delete requires the full primary key for the target row, with no NULL or missing values."
+        : "Update requires the full primary key for the target row, with no NULL or missing values.",
+    );
   }
+}
+
+export function coercePrimaryKeyValues(
+  driver: IDBDriver,
+  values: Record<string, unknown>,
+  columns: readonly ColumnTypeMeta[],
+  operation: "update" | "delete" = "update",
+): Record<string, unknown> {
+  assertExactPrimaryKeyShape(values, columns, operation);
+  const columnMap = new Map(columns.map((column) => [column.name, column]));
+  const coerced = Object.fromEntries(
+    Object.entries(values).map(([name, value]) => {
+      const column = columnMap.get(name);
+      if (!column) throw new Error("Unknown primary key column.");
+      return [
+        name,
+        driver.coercePrimaryKeyValue
+          ? driver.coercePrimaryKeyValue(value, column)
+          : driver.coerceInputValue(value, column),
+      ];
+    }),
+  );
+  // Driver coercion can turn display values (including sentinels) into NULL.
+  assertExactPrimaryKeyShape(coerced, columns, operation);
+  return coerced;
 }
 
 export function buildUpdateRowSql(
@@ -71,8 +102,7 @@ export function buildUpdateRowSql(
     colMap,
   );
   if (Object.keys(coercedChanges).length === 0) return null;
-  assertExactPrimaryKeyShape(pkValues, cols);
-  const coercedPk = coerceRecord(drv, pkValues, colMap);
+  const coercedPk = coercePrimaryKeyValues(drv, pkValues, cols);
   const coercedOriginalValues = coerceRecord(
     drv,
     filterWritableRecord(originalValues, colMap),

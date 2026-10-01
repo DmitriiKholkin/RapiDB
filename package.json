@@ -579,7 +579,7 @@
               "readOnly": {
                 "type": "boolean",
                 "default": false,
-                "description": "Open the connection in read-only mode. Query execution is limited to read operations and table edits are blocked."
+                "description": "Open the connection in read-only mode. Table edits are blocked and query execution is limited to reads; MSSQL query editor execution is blocked entirely. Use a database read-only login with a regular MSSQL connection to run queries."
               },
               "serviceName": {
                 "type": "string",

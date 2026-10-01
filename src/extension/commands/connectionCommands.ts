@@ -173,6 +173,8 @@ export function registerConnectionCommands(
         id,
         `RapiDB: Connecting to "${conn?.name ?? id}"…`,
         false,
+        undefined,
+        "explicit",
       );
       refresh();
     } catch (err: unknown) {

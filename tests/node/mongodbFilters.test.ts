@@ -167,6 +167,7 @@ describe("MongoDBDriver readTablePage filter coverage", () => {
         is_not_null: { expectedIds: [rows[0]._id, rows[1]._id] },
       },
       dateVal: {
+        like: { value: "2026-01", expectedIds: [rows[0]._id] },
         eq: { value: "2026-01-02", expectedIds: [rows[0]._id] },
         neq: { value: "2026-01-02", expectedIds: [rows[1]._id] },
         gt: { value: "2026-01-15", expectedIds: [rows[1]._id] },
@@ -185,6 +186,7 @@ describe("MongoDBDriver readTablePage filter coverage", () => {
         is_not_null: { expectedIds: [rows[0]._id, rows[1]._id] },
       },
       timeVal: {
+        like: { value: "10:20", expectedIds: [rows[0]._id] },
         eq: { value: "10:20:30", expectedIds: [rows[0]._id] },
         neq: { value: "10:20:30", expectedIds: [rows[1]._id] },
         gt: { value: "12:00:00", expectedIds: [rows[1]._id] },
@@ -203,6 +205,7 @@ describe("MongoDBDriver readTablePage filter coverage", () => {
         is_not_null: { expectedIds: [rows[0]._id, rows[1]._id] },
       },
       dateTimeVal: {
+        like: { value: "2026-01", expectedIds: [rows[0]._id] },
         eq: { value: "2026-01-02T10:20:30Z", expectedIds: [rows[0]._id] },
         neq: { value: "2026-01-02T10:20:30Z", expectedIds: [rows[1]._id] },
         gt: { value: "2026-01-15T00:00:00Z", expectedIds: [rows[1]._id] },

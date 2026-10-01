@@ -59,7 +59,11 @@ export interface QueryResult {
   /** The selected result was drained, but rows beyond the collection budget were discarded. */
   truncated?: boolean;
 }
-export interface QueryExecutionOptions {
+export interface DatabaseExecutionScope {
+  /** Omitted/empty means the connection's default database. */
+  database?: string;
+}
+export interface QueryExecutionOptions extends DatabaseExecutionScope {
   requestToken?: number;
   readOnly?: boolean;
   /** Retained-row budget for boundedQueryResults drivers, not a mutation/drain limit. */
@@ -165,14 +169,31 @@ export interface DriverTablePageRequest {
   filters: FilterExpression[];
   sort: DriverSortConfig | null;
   skipCount: boolean;
+  signal?: AbortSignal;
+  /** Absolute deadline supplied by the operation timeout wrapper. */
+  deadline?: number;
 }
 
 export interface DriverTablePageResult {
   columns: ColumnTypeMeta[];
   rows: Record<string, unknown>[];
+  /** BSON _id type for each MongoDB table row, aligned with rows. */
+  mongoIdTypes?: Array<"objectId" | "string" | null>;
   totalCount: number;
   executionTimeMs?: number;
 }
+
+export interface DriverTableExportRequest {
+  database: string;
+  schema: string;
+  table: string;
+  chunkSize: number;
+}
+
+export type DriverTableExportChunk = Pick<
+  DriverTablePageResult,
+  "columns" | "rows"
+>;
 
 export interface DriverUpdateRowsRequest {
   database: string;
@@ -201,10 +222,12 @@ export interface DriverDeleteRowsRequest {
 
 export interface DriverMutationResult {
   affectedRows: number;
+  rowOutcomes?: import("../../shared/webviewContracts").DeleteRowOutcome[];
 }
 export interface DriverOperationContext {
   signal: AbortSignal;
   deadline: number;
+  onDeleteProgress?: (result: DriverMutationResult) => void;
 }
 export interface PaginationResult {
   sql: string;
@@ -223,6 +246,8 @@ export interface IDBDriver {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   isConnected(): boolean;
+  /** A lost stateful session must not be replaced by an implicit reconnect. */
+  getAutomaticReconnectBlockReason?(): string | undefined;
   cancelCurrentOperation?(
     context?: OperationCancellationContext,
   ): Promise<void> | void;
@@ -308,6 +333,11 @@ export interface IDBDriver {
   readTablePage?(
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult>;
+  /** Full unfiltered/default-order export; owns cursor/snapshot cleanup. */
+  exportTableChunks?(
+    request: DriverTableExportRequest,
+    signal?: AbortSignal,
+  ): AsyncIterable<DriverTableExportChunk>;
   updateRows?(
     request: DriverUpdateRowsRequest,
     context?: DriverOperationContext,
@@ -349,6 +379,7 @@ export interface IDBDriver {
   runTransaction(
     operations: TransactionOperation[],
     context?: TransactionContext,
+    scope?: DatabaseExecutionScope,
   ): Promise<void>;
   getMutationAtomicityRisk?(
     database: string,
@@ -364,6 +395,8 @@ export interface IDBDriver {
   ): PaginationResult;
   buildOrderByDefault(cols: ColumnTypeMeta[]): string;
   coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown;
+  /** Validate and decode a table row locator without guessing from sampled types. */
+  coercePrimaryKeyValue?(value: unknown, column: ColumnTypeMeta): unknown;
   coerceOriginalValue?(value: unknown, column: ColumnTypeMeta): unknown;
   buildOriginalValueComparison?(
     column: ColumnTypeMeta,

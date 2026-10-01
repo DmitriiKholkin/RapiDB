@@ -1,4 +1,10 @@
 import type { ConnectionManager } from "../connectionManager";
+import {
+  buildDeleteResult,
+  DeleteExecutionError,
+  getDeleteEvidence,
+  unattemptedDeleteResult,
+} from "../dbDrivers/deleteOutcomes";
 import type { ColumnTypeMeta, TransactionOperation } from "../dbDrivers/types";
 import { pMapWithLimit } from "../utils/concurrency";
 import { assertConnectionWritable } from "../utils/readOnlyGuards";
@@ -9,8 +15,8 @@ import type {
   TableColumnsProvider,
 } from "./tableDataContracts";
 import {
-  assertExactPrimaryKeyShape,
   buildUpdateRowSql,
+  coercePrimaryKeyValues,
   coerceRecord,
   filterWritableRecord,
   writableEntries,
@@ -50,18 +56,18 @@ export class TableMutationService {
       if (Object.keys(writableChanges).length === 0) {
         return;
       }
-      assertExactPrimaryKeyShape(primaryKeyValues, columns);
+      const primaryKeys = coercePrimaryKeyValues(
+        driver,
+        primaryKeyValues,
+        columns,
+      );
       const result = await driver.updateRows({
         database,
         schema,
         table,
         updates: [
           {
-            primaryKeys: coerceRecord(
-              driver,
-              primaryKeyValues,
-              columnMetaByName,
-            ),
+            primaryKeys,
             changes: coerceRecord(driver, writableChanges, columnMetaByName),
           },
         ],
@@ -86,7 +92,9 @@ export class TableMutationService {
     if (!operation) {
       return;
     }
-    const result = await driver.query(operation.sql, operation.params);
+    const result = await driver.query(operation.sql, operation.params, {
+      database,
+    });
     const affectedRows = result.affectedRows ?? result.rowCount;
     if (affectedRows === 0) {
       throw new Error(
@@ -264,6 +272,7 @@ export class TableMutationService {
     const result = await driver.query(
       plan.operation.sql,
       plan.operation.params,
+      { database: plan.database },
     );
     const affectedRows = result.affectedRows ?? result.rowCount;
     if (affectedRows !== undefined && affectedRows === 0) {
@@ -317,8 +326,10 @@ export class TableMutationService {
       columns.map((column) => [column.name, column]),
     );
     if (driver.deleteRows) {
-      const coercedPrimaryKeyValuesList = primaryKeyValuesList.map((criteria) =>
-        coerceRecord(driver, criteria, columnMetaByName),
+      const coercedPrimaryKeyValuesList = primaryKeyValuesList.map(
+        (criteria) => {
+          return coercePrimaryKeyValues(driver, criteria, columns, "delete");
+        },
       );
       const previewStatements = driver.buildMutationPreviewStatements
         ? await driver.buildMutationPreviewStatements(
@@ -354,6 +365,7 @@ export class TableMutationService {
         mode: "driver",
         executionMode: "sequential",
         primaryKeyValuesList: coercedPrimaryKeyValuesList,
+        rowIdentities: primaryKeyValuesList,
         operations: [],
         previewStatements,
         verificationCriteriaList: coercedPrimaryKeyValuesList,
@@ -374,29 +386,15 @@ export class TableMutationService {
     const primaryKeyColumnNames = primaryKeyColumns.map(
       (column) => column.name,
     );
-    const primaryKeyColumnSet = new Set(primaryKeyColumnNames);
     const coercedPrimaryKeys = primaryKeyValuesList.map((row) => {
-      const providedColumnNames = Object.keys(row);
-      const hasExactPrimaryKeyShape =
-        providedColumnNames.length === primaryKeyColumnNames.length &&
-        providedColumnNames.every((columnName) =>
-          primaryKeyColumnSet.has(columnName),
-        ) &&
-        primaryKeyColumnNames.every(
-          (columnName) => row[columnName] !== undefined,
-        );
-      if (!hasExactPrimaryKeyShape) {
-        throw new Error(
-          "Delete requires the full primary key for every selected row.",
-        );
-      }
+      const coerced = coercePrimaryKeyValues(driver, row, columns, "delete");
       const normalizedPrimaryKeys = Object.fromEntries(
         primaryKeyColumnNames.map((columnName) => [
           columnName,
-          row[columnName],
+          coerced[columnName],
         ]),
       );
-      return coerceRecord(driver, normalizedPrimaryKeys, columnMetaByName);
+      return normalizedPrimaryKeys;
     });
     if (coercedPrimaryKeys.length === 0) {
       return null;
@@ -432,6 +430,7 @@ export class TableMutationService {
       schema,
       table,
       executionMode: "transaction",
+      rowIdentities: primaryKeyValuesList,
       operations,
       previewStatements: operations.map((operation) =>
         driver.materializePreviewSql(operation.sql, operation.params),
@@ -440,45 +439,85 @@ export class TableMutationService {
     };
   }
   async executePreparedDeletePlan(plan: PreparedDeletePlan): Promise<void> {
-    assertConnectionWritable(
-      this.connectionManager,
-      plan.connectionId,
-      "delete data",
-    );
-    const { driver } = this.getConnectionDriver(plan.connectionId);
+    const identities = plan.rowIdentities ?? plan.verificationCriteriaList;
+    let driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>;
+    try {
+      assertConnectionWritable(
+        this.connectionManager,
+        plan.connectionId,
+        "delete data",
+      );
+      driver = this.getConnectionDriver(plan.connectionId).driver;
+    } catch (error) {
+      throw new DeleteExecutionError(
+        unattemptedDeleteResult(
+          identities,
+          error instanceof Error ? error.message : String(error),
+        ),
+      );
+    }
     if (plan.mode === "driver") {
       if (!driver.deleteRows) {
-        throw new Error("Delete is not supported by this driver.");
+        throw new DeleteExecutionError(
+          unattemptedDeleteResult(
+            identities,
+            "Delete is not supported by this driver.",
+          ),
+        );
       }
-      const result = await driver.deleteRows({
-        database: plan.database,
-        schema: plan.schema,
-        table: plan.table,
-        primaryKeyValuesList: plan.primaryKeyValuesList ?? [],
-      });
-      if (result.affectedRows < (plan.primaryKeyValuesList?.length ?? 0)) {
-        throw new Error(
-          "Delete failed for one or more selected rows because they no longer exist in the source backend.",
+      try {
+        const result = await driver.deleteRows({
+          database: plan.database,
+          schema: plan.schema,
+          table: plan.table,
+          primaryKeyValuesList: plan.primaryKeyValuesList ?? [],
+        });
+        const outcome = buildDeleteResult(identities, result);
+        if (!outcome.success) throw new DeleteExecutionError(outcome);
+      } catch (error) {
+        if (error instanceof DeleteExecutionError) throw error;
+        throw new DeleteExecutionError(
+          buildDeleteResult(
+            identities,
+            getDeleteEvidence(error) ?? { affectedRows: 0 },
+            error instanceof Error ? error.message : String(error),
+          ),
         );
       }
       return;
     }
 
-    await driver.runTransaction(plan.operations);
-    const columns = await this.columnsProvider.getColumns(
-      plan.connectionId,
-      plan.database,
-      plan.schema,
-      plan.table,
-    );
-    await this.verifyRowsDeleted(
-      driver,
-      plan.database,
-      plan.schema,
-      plan.table,
-      columns,
-      plan.verificationCriteriaList,
-    );
+    let committed = false;
+    try {
+      await driver.runTransaction(plan.operations, undefined, {
+        database: plan.database,
+      });
+      committed = true;
+      const columns = await this.columnsProvider.getColumns(
+        plan.connectionId,
+        plan.database,
+        plan.schema,
+        plan.table,
+      );
+      await this.verifyRowsDeleted(
+        driver,
+        plan.database,
+        plan.schema,
+        plan.table,
+        columns,
+        plan.verificationCriteriaList,
+      );
+    } catch (error) {
+      throw new DeleteExecutionError(
+        buildDeleteResult(
+          plan.rowIdentities ?? plan.verificationCriteriaList,
+          {
+            affectedRows: committed ? plan.verificationCriteriaList.length : 0,
+          },
+          error instanceof Error ? error.message : String(error),
+        ),
+      );
+    }
   }
   private async verifyRowsDeleted(
     driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>,
@@ -539,6 +578,7 @@ export class TableMutationService {
     const result = await driver.query(
       `SELECT 1 FROM ${qualifiedTableName} WHERE ${whereParts.join(" AND ")}`,
       parameters,
+      { database },
     );
     return result.rows.length > 0;
   }
@@ -596,6 +636,9 @@ export class TableMutationService {
   private getConnectionDriver(connectionId: string): {
     driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>;
   } {
+    const reconnectBlock =
+      this.connectionManager.getAutomaticReconnectBlockReason?.(connectionId);
+    if (reconnectBlock) throw new Error(reconnectBlock);
     const connection = this.connectionManager.getConnection(connectionId);
     const driver = this.connectionManager.getDriver(connectionId);
     if (!connection || !driver) {

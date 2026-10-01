@@ -13,6 +13,7 @@ import {
   type FilterDraftMap,
   serializeFilterDrafts,
 } from "../../../shared/tableTypes";
+import type { TableInitPayload } from "../../../shared/webviewContracts";
 import type { Row } from "../../types";
 import {
   calcColWidths,
@@ -31,15 +32,23 @@ interface UseTableDataControllerParams {
   readOnlyTable: boolean;
   columnsRef: MutableRefObject<ColumnMeta[]>;
   rowsRef: MutableRefObject<Row[]>;
+  mongoIdTypesRef: MutableRefObject<Array<"objectId" | "string" | null>>;
   pkColsRef: MutableRefObject<string[]>;
   scrollRef: RefObject<HTMLDivElement | null>;
   fetchPageRef: MutableRefObject<() => void>;
   preserveScrollPositionRef: MutableRefObject<() => void>;
   onTableInit: () => void;
+  getMetadataRefreshState: () => {
+    busy: boolean;
+    hasWork: boolean;
+    reconciliationPending?: boolean;
+  };
   onReadFailed: () => void;
   onRowsCommitted: (
     rows: readonly Row[],
     primaryKeyColumns: readonly string[],
+    previousMongoIdTypes: readonly ("objectId" | "string" | null)[],
+    mongoIdTypes: readonly ("objectId" | "string" | null)[],
   ) => void;
 }
 
@@ -61,6 +70,14 @@ function buildTableInitSignature(
       filterOperators: column.filterOperators,
       valueSemantics: column.valueSemantics,
       identityGeneration: column.identityGeneration ?? null,
+      defaultValue: column.defaultValue,
+      isComputed: column.isComputed,
+      computedExpression: column.computedExpression,
+      generatedKind: column.generatedKind,
+      onUpdateExpression: column.onUpdateExpression,
+      isPersisted: column.isPersisted,
+      bsonSubtype: column.bsonSubtype,
+      primaryKeyOrdinal: column.primaryKeyOrdinal,
     })),
     primaryKeyColumns,
   });
@@ -71,11 +88,13 @@ export function useTableDataController({
   readOnlyTable: initialReadOnlyTable,
   columnsRef,
   rowsRef,
+  mongoIdTypesRef,
   pkColsRef,
   scrollRef,
   fetchPageRef,
   preserveScrollPositionRef,
   onTableInit,
+  getMetadataRefreshState,
   onReadFailed,
   onRowsCommitted,
 }: UseTableDataControllerParams) {
@@ -125,6 +144,129 @@ export function useTableDataController({
   const onReadFailedRef = useRef(onReadFailed);
   const onRowsCommittedRef = useRef(onRowsCommitted);
   const tableInitSignatureRef = useRef<string | null>(null);
+  const metadataStateRef = useRef(getMetadataRefreshState);
+  metadataStateRef.current = getMetadataRefreshState;
+  const queuedMetadataRef = useRef<TableInitPayload | null>(null);
+  const [metadataTick, setMetadataTick] = useState(0);
+  const [schemaWarning, setSchemaWarning] = useState<string | null>(null);
+  const metadataBlockedRef = useRef(false);
+  const committedColumnNamesRef = useRef<ReadonlySet<string>>(new Set());
+  const metadataNeedsReadRef = useRef(false);
+  // A reconciliation read must survive a schema queue (or invalidation of
+  // an already-issued read), even while edits/drafts/history are retained.
+  const deferredReadRef = useRef(false);
+  // Delete reconciliation reads have terminal outcomes: a late response after
+  // failure must not unlock writes or replace the retained work before retry.
+  const reconciliationFetchIdRef = useRef<number | null>(null);
+
+  const retryMetadataRefresh = useCallback(() => {
+    const metadata = queuedMetadataRef.current;
+    const { busy, hasWork } = metadataStateRef.current();
+    if (!metadata) {
+      if (
+        metadataNeedsReadRef.current &&
+        !busy &&
+        !hasWork &&
+        !loadingRef.current
+      ) {
+        metadataNeedsReadRef.current = false;
+        setInitTick((tick) => tick + 1);
+      }
+      return;
+    }
+    const incompatible =
+      JSON.stringify(pkColsRef.current) !==
+        JSON.stringify(metadata.primaryKeyColumns) ||
+      columnsRef.current.some((column) => {
+        const next = metadata.columns.find(
+          (candidate) => candidate.name === column.name,
+        );
+        if (!next) return true;
+        // Filter/header-only metadata can change without invalidating write values.
+        const writeShape = (value: ColumnMeta) =>
+          JSON.stringify([
+            value.type,
+            value.nativeType,
+            value.category,
+            value.valueSemantics,
+            value.nullable,
+            value.identityGeneration,
+            value.primaryKeyRole,
+            value.isComputed,
+            value.computedExpression,
+            value.generatedKind,
+            value.bsonSubtype,
+          ]);
+        return writeShape(column) !== writeShape(next);
+      });
+    if (busy || (hasWork && incompatible)) {
+      metadataBlockedRef.current = true;
+      setSchemaWarning(
+        busy
+          ? "Schema metadata changed during an active operation or editor. Pending work and the displayed schema are retained until it finishes."
+          : "Schema conflict: pending work is retained with the previous schema. Revert All manually to load the new schema before applying changes.",
+      );
+      return;
+    }
+
+    queuedMetadataRef.current = null;
+    metadataBlockedRef.current = false;
+    setSchemaWarning(null);
+    metadataNeedsReadRef.current = hasWork;
+    columnsRef.current = metadata.columns;
+    pkColsRef.current = metadata.primaryKeyColumns;
+    pendingPrimaryKeyColumnsRef.current = metadata.primaryKeyColumns;
+    tableInitSignatureRef.current = buildTableInitSignature(
+      metadata.columns,
+      metadata.primaryKeyColumns,
+    );
+    setColumns(metadata.columns);
+    setPkCols(metadata.primaryKeyColumns);
+    setColSizes((previous) => {
+      const defaults = calcColWidths(metadata.columns, rowsRef.current);
+      return Object.fromEntries(
+        metadata.columns.map((column) => [
+          column.name,
+          previous[column.name] ?? defaults[column.name],
+        ]),
+      );
+    });
+    // Ordinary metadata refresh retains the committed dataset while work exists.
+    // A requested mutation reconciliation instead rebases that work by identity.
+    if (hasWork && deferredReadRef.current) {
+      setInitTick((tick) => tick + 1);
+    }
+    if (!hasWork) {
+      // No local work remains: require an authoritative dataset before exposing
+      // the new schema for editing (especially after PK/type changes or read errors).
+      loadingRef.current = true;
+      setLoading(true);
+      setHasCommittedData(false);
+      setRows([]);
+      mongoIdTypesRef.current = [];
+      setError(null);
+      const nextSort =
+        requestedSortRef.current &&
+        metadata.columns.some(
+          (column) => column.name === requestedSortRef.current?.column,
+        )
+          ? requestedSortRef.current
+          : null;
+      requestedSortRef.current = nextSort;
+      setRequestedSort(nextSort);
+      setSort(nextSort);
+      const nextFilters = buildActiveFilterDrafts(
+        metadata.columns,
+        debouncedFilterDraftsRef.current,
+      );
+      debouncedFilterDraftsRef.current = nextFilters;
+      setFilterDrafts((drafts) =>
+        buildActiveFilterDrafts(metadata.columns, drafts),
+      );
+      setDebouncedFilterDrafts(nextFilters);
+      setInitTick((tick) => tick + 1);
+    }
+  }, [columnsRef, pkColsRef, rowsRef, mongoIdTypesRef]);
 
   const syncRequestedFilterState = useCallback(
     (nextDrafts: FilterDraftMap) => {
@@ -154,8 +296,18 @@ export function useTableDataController({
     if (!initializedRef.current) {
       return;
     }
+    if (queuedMetadataRef.current) {
+      deferredReadRef.current = true;
+      return;
+    }
+
+    deferredReadRef.current = false;
 
     const epoch = ++fetchEpochRef.current;
+    reconciliationFetchIdRef.current = metadataStateRef.current()
+      .reconciliationPending
+      ? epoch
+      : null;
     const snapshot: FetchSnapshot = {
       page: requestedPageRef.current,
       pageSize: requestedPageSizeRef.current,
@@ -203,18 +355,14 @@ export function useTableDataController({
       setFilterError(null);
     };
 
-    const unInit = onMessage<{
-      columns: ColumnMeta[];
-      primaryKeyColumns: string[];
-      isView?: boolean;
-      connectionReadOnly?: boolean;
-    }>(
+    const unInit = onMessage<TableInitPayload>(
       "tableInit",
       ({
         columns: nextColumns,
         primaryKeyColumns,
         isView,
         connectionReadOnly,
+        intent,
       }) => {
         const nextReadOnlyTable =
           isView !== undefined || connectionReadOnly !== undefined
@@ -228,9 +376,29 @@ export function useTableDataController({
           tableInitSignatureRef.current !== null &&
           tableInitSignatureRef.current === nextInitSignature;
 
+        pendingReadOnlyTableRef.current = nextReadOnlyTable;
+
+        if (intent === "metadataRefresh" && initializedRef.current) {
+          setReadOnlyTable(nextReadOnlyTable);
+          if (isDuplicateInit && !queuedMetadataRef.current) return;
+          queuedMetadataRef.current = {
+            columns: nextColumns,
+            primaryKeyColumns,
+          };
+          metadataBlockedRef.current = true;
+          // Invalidate reads issued under the old metadata, without touching mutations.
+          if (fetchSnapshotsRef.current.size > 0)
+            deferredReadRef.current = true;
+          fetchEpochRef.current += 1;
+          fetchSnapshotsRef.current.clear();
+          loadingRef.current = false;
+          setLoading(false);
+          setMetadataTick((tick) => tick + 1);
+          return;
+        }
+
         columnsRef.current = nextColumns;
         pendingPrimaryKeyColumnsRef.current = primaryKeyColumns;
-        pendingReadOnlyTableRef.current = nextReadOnlyTable;
 
         if (isDuplicateInit) {
           setReadOnlyTable(nextReadOnlyTable);
@@ -238,6 +406,12 @@ export function useTableDataController({
         }
 
         tableInitSignatureRef.current = nextInitSignature;
+        queuedMetadataRef.current = null;
+        metadataNeedsReadRef.current = false;
+        deferredReadRef.current = false;
+        reconciliationFetchIdRef.current = null;
+        metadataBlockedRef.current = false;
+        setSchemaWarning(null);
 
         initializedRef.current = true;
         setIsInitialized(true);
@@ -252,6 +426,8 @@ export function useTableDataController({
         setColumns([]);
         setPkCols([]);
         setRows([]);
+        mongoIdTypesRef.current = [];
+        committedColumnNamesRef.current = new Set();
         setTotalCount(0);
         clearErrors();
         setPage(1);
@@ -273,6 +449,7 @@ export function useTableDataController({
     const unData = onMessage<{
       fetchId?: number;
       rows: Row[];
+      mongoIdTypes?: Array<"objectId" | "string" | null>;
       totalCount: number;
       executionTimeMs?: number;
     }>(
@@ -280,10 +457,17 @@ export function useTableDataController({
       ({
         fetchId,
         rows: nextRows,
+        mongoIdTypes,
         totalCount: nextTotalCount,
         executionTimeMs: nextExecutionTimeMs,
       }) => {
-        if (fetchId !== undefined && fetchId !== fetchEpochRef.current) {
+        if (queuedMetadataRef.current) return;
+        if (
+          fetchId !== undefined &&
+          (fetchId !== fetchEpochRef.current ||
+            (fetchId === reconciliationFetchIdRef.current &&
+              !fetchSnapshotsRef.current.has(fetchId)))
+        ) {
           return;
         }
 
@@ -313,9 +497,18 @@ export function useTableDataController({
         }
 
         setColumns(columnsRef.current);
+        metadataNeedsReadRef.current = false;
+        committedColumnNamesRef.current = new Set(
+          columnsRef.current.map((column) => column.name),
+        );
         setPkCols(pendingPrimaryKeyColumnsRef.current);
         setReadOnlyTable(pendingReadOnlyTableRef.current);
+        const previousMongoIdTypes = mongoIdTypesRef.current;
+        const nextMongoIdTypes = Array.isArray(mongoIdTypes)
+          ? mongoIdTypes
+          : [];
         setRows(nextRows);
+        mongoIdTypesRef.current = nextMongoIdTypes;
         setTotalCount(nextTotalCount);
         setExecutionTimeMs(nextExecutionTimeMs);
         setPage(snapshot.page);
@@ -328,6 +521,8 @@ export function useTableDataController({
         onRowsCommittedRef.current(
           nextRows,
           pendingPrimaryKeyColumnsRef.current,
+          previousMongoIdTypes,
+          nextMongoIdTypes,
         );
         fetchSnapshotsRef.current.delete(fetchId ?? fetchEpochRef.current);
 
@@ -348,7 +543,13 @@ export function useTableDataController({
       error: string;
       isFilterError?: boolean;
     }>("tableError", ({ fetchId, error: nextError, isFilterError }) => {
-      if (fetchId !== undefined && fetchId !== fetchEpochRef.current) {
+      if (queuedMetadataRef.current) return;
+      if (
+        fetchId !== undefined &&
+        (fetchId !== fetchEpochRef.current ||
+          (fetchId === reconciliationFetchIdRef.current &&
+            !fetchSnapshotsRef.current.has(fetchId)))
+      ) {
         return;
       }
 
@@ -371,7 +572,7 @@ export function useTableDataController({
       unData();
       unError();
     };
-  }, [columnsRef, scrollRef]);
+  }, [columnsRef, mongoIdTypesRef, scrollRef]);
 
   const fetchTrigger = useMemo(
     () =>
@@ -465,6 +666,11 @@ export function useTableDataController({
   );
 
   return {
+    committedColumnNamesRef,
+    metadataBlockedRef,
+    metadataTick,
+    retryMetadataRefresh,
+    schemaWarning,
     loadingRef,
     fetchEpochRef,
     columns,

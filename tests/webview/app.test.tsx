@@ -39,12 +39,14 @@ vi.mock("../../src/webview/components/TableView", () => ({
     table,
     isView,
     connectionReadOnly,
+    mongoRowIdentity,
   }: {
     table: string;
     isView?: boolean;
     connectionReadOnly?: boolean;
+    mongoRowIdentity?: boolean;
   }) => (
-    <div>
+    <div data-mongo-row-identity={String(mongoRowIdentity)}>
       Table:{table}:{String(isView)}:{String(connectionReadOnly)}
     </div>
   ),
@@ -84,6 +86,7 @@ describe("App", () => {
       table: "users",
       isView: false,
       connectionReadOnly: true,
+      mongoRowIdentity: true,
       defaultPageSize: 25,
     };
 
@@ -96,6 +99,9 @@ describe("App", () => {
     rerender(<App />);
 
     expect(screen.getByText("Table:users:false:true")).toBeTruthy();
+    expect(
+      screen.getByText("Table:users:false:true").dataset.mongoRowIdentity,
+    ).toBe("true");
   });
 
   it("falls back to the default query state when the initial state is invalid", () => {

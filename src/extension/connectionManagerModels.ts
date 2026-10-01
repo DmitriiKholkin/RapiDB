@@ -31,6 +31,8 @@ export interface ConnectAttempt {
   promise: Promise<void>;
   isNew: boolean;
 }
+/** Only a deliberate Connect/reconnect action may replace a lost SQLite session. */
+export type ConnectionConnectIntent = "automatic" | "explicit";
 export interface SchemaObjectEntry {
   database: string;
   schema: string;

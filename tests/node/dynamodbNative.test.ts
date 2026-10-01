@@ -807,7 +807,10 @@ describe("DynamoDBDriver native API", () => {
           { tenant_id: "tenant-2", user_id: "user-2" },
         ],
       }),
-    ).resolves.toEqual({ affectedRows: 1 });
+    ).resolves.toMatchObject({
+      affectedRows: 1,
+      rowOutcomes: [{ status: "deleted" }, { status: "notfound" }],
+    });
 
     const putInputs = commandInputs(clientSend, "PutItemCommand");
     expect(putInputs[0]).toMatchObject({
@@ -1027,7 +1030,10 @@ describe("DynamoDBDriver native API", () => {
           { namespace: "limits", key: "max_login_attempts" },
         ],
       }),
-    ).resolves.toEqual({ affectedRows: 1 });
+    ).resolves.toMatchObject({
+      affectedRows: 1,
+      rowOutcomes: [{ status: "deleted" }],
+    });
 
     const putInputs = commandInputs(clientSend, "PutItemCommand");
     expect(putInputs[0]).toMatchObject({

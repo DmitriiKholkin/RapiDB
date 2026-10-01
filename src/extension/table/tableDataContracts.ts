@@ -9,6 +9,7 @@ export interface SortConfig {
 export interface TablePage {
   columns: ColumnTypeMeta[];
   rows: Record<string, unknown>[];
+  mongoIdTypes?: Array<"objectId" | "string" | null>;
   totalCount: number;
   executionTimeMs?: number;
 }
@@ -41,6 +42,7 @@ export interface PreparedDeletePlan {
   mode?: "sql" | "driver";
   executionMode: "sequential" | "transaction";
   primaryKeyValuesList?: Record<string, unknown>[];
+  rowIdentities?: Record<string, unknown>[];
   operations: TransactionOperation[];
   previewStatements: string[];
   verificationCriteriaList: Record<string, unknown>[];

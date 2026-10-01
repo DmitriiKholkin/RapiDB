@@ -1,5 +1,10 @@
 import type { OperationCancellationContext } from "../../shared/safetyContracts";
-import type { DriverOperationContext, TransactionContext } from "./types";
+import type {
+  DriverMutationResult,
+  DriverOperationContext,
+  DriverTablePageRequest,
+  TransactionContext,
+} from "./types";
 
 export const CONNECTION_TIMEOUT_SECONDS_DEFAULT = 15;
 export const DB_OPERATION_TIMEOUT_SECONDS_DEFAULT = 180;
@@ -22,6 +27,7 @@ export class DriverTimeoutError extends Error {
   readonly timeoutKind: DriverTimeoutKind;
   readonly operationName: string;
   readonly timeoutMs: number;
+  deleteResult?: DriverMutationResult;
 
   constructor(
     timeoutKind: DriverTimeoutKind,
@@ -45,6 +51,8 @@ export class DriverTimeoutError extends Error {
 
 interface TimeoutAwareDriverHooks {
   disconnect?(): void | Promise<void>;
+  /** Drivers with connect epochs can cancel just the timed-out attempt. */
+  cancelConnectionAttempt?(attempt: Promise<unknown>): void | Promise<void>;
   cancelCurrentOperation?(
     context: OperationCancellationContext,
   ): void | Promise<void>;
@@ -174,6 +182,7 @@ async function withDriverTimeout<T>(
     operationName: string;
     timeoutSettingsProvider: DriverTimeoutSettingsProvider;
     onDeadline?: () => void;
+    decorateTimeoutError?: (error: DriverTimeoutError) => void;
     onTimeout?: () => void | Promise<void>;
     onLateSettlementAfterTimeout?: () => void | Promise<void>;
   },
@@ -199,13 +208,13 @@ async function withDriverTimeout<T>(
       timedOut = true;
       clearTimeout(timer);
       options.onDeadline?.();
-      reject(
-        new DriverTimeoutError(
-          options.timeoutKind,
-          options.operationName,
-          timeoutMs,
-        ),
+      const error = new DriverTimeoutError(
+        options.timeoutKind,
+        options.operationName,
+        timeoutMs,
       );
+      options.decorateTimeoutError?.(error);
+      reject(error);
       if (options.onTimeout) {
         runBoundedCleanup(options.onTimeout);
       }
@@ -258,6 +267,10 @@ export function createTimeoutAwareDriver<T extends object>(
   driver: T,
   timeoutSettingsProvider: DriverTimeoutSettingsProvider,
 ): T {
+  // SQLite's process client owns deadlines and waits for native execution to
+  // stop before settling, including a user-facing lost-session outcome.
+  if (Reflect.get(driver, "driverTimeoutsManagedInternally") === true)
+    return driver;
   const wrappedMethods = new Map<string, unknown>();
 
   return new Proxy(driver, {
@@ -278,13 +291,30 @@ export function createTimeoutAwareDriver<T extends object>(
       }
 
       const wrapped = (...args: unknown[]) => {
-        const operationAbort = CANCELLABLE_MUTATION_METHODS.has(property)
-          ? new AbortController()
-          : undefined;
-        if (operationAbort) {
+        let pendingOperation: Promise<unknown> | undefined;
+        let deleteProgress: DriverMutationResult | undefined;
+        const operationAbort =
+          CANCELLABLE_MUTATION_METHODS.has(property) ||
+          property === "readTablePage"
+            ? new AbortController()
+            : undefined;
+        if (operationAbort && property === "readTablePage") {
+          const request = args[0] as DriverTablePageRequest;
+          args[0] = {
+            ...request,
+            signal: request.signal
+              ? AbortSignal.any([request.signal, operationAbort.signal])
+              : operationAbort.signal,
+            deadline: Math.min(
+              request.deadline ?? Infinity,
+              Date.now() + timeoutSettingsProvider().dbOperationTimeoutMs,
+            ),
+          } satisfies DriverTablePageRequest;
+        } else if (operationAbort) {
           const timeoutMs = timeoutSettingsProvider().dbOperationTimeoutMs;
           const supplied = args[1] as DriverOperationContext | undefined;
           args[1] = {
+            ...supplied,
             signal: supplied
               ? AbortSignal.any([supplied.signal, operationAbort.signal])
               : operationAbort.signal,
@@ -292,6 +322,14 @@ export function createTimeoutAwareDriver<T extends object>(
               supplied?.deadline ?? Infinity,
               timeoutMs > 0 ? Date.now() + timeoutMs : Infinity,
             ),
+            ...(property === "deleteRows"
+              ? {
+                  onDeleteProgress: (result: DriverMutationResult) => {
+                    deleteProgress = result;
+                    supplied?.onDeleteProgress?.(result);
+                  },
+                }
+              : {}),
           } satisfies DriverOperationContext;
         }
         if (property === "query") {
@@ -305,16 +343,33 @@ export function createTimeoutAwareDriver<T extends object>(
           args[2] = operationContext;
         }
         return withDriverTimeout(
-          () => Reflect.apply(value, target, args) as Promise<unknown>,
+          () => {
+            pendingOperation = Reflect.apply(
+              value,
+              target,
+              args,
+            ) as Promise<unknown>;
+            return pendingOperation;
+          },
           {
             timeoutKind,
             operationName: property,
             timeoutSettingsProvider,
+            decorateTimeoutError: (error) => {
+              if (property === "deleteRows")
+                error.deleteResult = deleteProgress;
+            },
             onDeadline: () =>
               operationAbort?.abort(
-                new Error(
-                  "Mutation cancelled after timeout; its outcome may be unknown. Refresh before retrying.",
-                ),
+                property === "readTablePage"
+                  ? new DriverTimeoutError(
+                      "dbOperation",
+                      property,
+                      timeoutSettingsProvider().dbOperationTimeoutMs,
+                    )
+                  : new Error(
+                      "Mutation cancelled after timeout; its outcome may be unknown. Refresh before retrying.",
+                    ),
               ),
             onTimeout: () => {
               const timeoutHooks = target as TimeoutAwareDriverHooks;
@@ -337,20 +392,26 @@ export function createTimeoutAwareDriver<T extends object>(
               ) {
                 return timeoutHooks.cancelCurrentOperation(timeoutContext);
               }
-              if (
-                property === "connect" &&
-                typeof timeoutHooks.disconnect === "function"
-              ) {
-                return timeoutHooks.disconnect();
+              if (property === "connect") {
+                if (
+                  pendingOperation &&
+                  typeof timeoutHooks.cancelConnectionAttempt === "function"
+                ) {
+                  return timeoutHooks.cancelConnectionAttempt(pendingOperation);
+                }
+                return timeoutHooks.disconnect?.();
               }
             },
             onLateSettlementAfterTimeout: () => {
               const timeoutHooks = target as TimeoutAwareDriverHooks;
-              if (
-                property === "connect" &&
-                typeof timeoutHooks.disconnect === "function"
-              ) {
-                return timeoutHooks.disconnect();
+              if (property === "connect") {
+                if (
+                  pendingOperation &&
+                  typeof timeoutHooks.cancelConnectionAttempt === "function"
+                ) {
+                  return timeoutHooks.cancelConnectionAttempt(pendingOperation);
+                }
+                return timeoutHooks.disconnect?.();
               }
             },
           },

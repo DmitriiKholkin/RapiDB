@@ -1,9 +1,16 @@
+import net from "node:net";
+import { createClient } from "redis";
 import { describe, expect, it, vi } from "vitest";
 import { DynamoDBDriver } from "../../src/extension/dbDrivers/dynamodb";
 import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
 import { loadDatabaseScope } from "../../src/extension/schema/schemaLoaders";
+
+vi.mock("redis", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("redis")>();
+  return { ...actual, createClient: vi.fn() };
+});
 
 function withClient<T>(driver: T, client: unknown): T {
   Object.assign(driver as object, { client, connected: true });
@@ -84,29 +91,78 @@ describe("driver schema discovery error boundaries", () => {
   it("preserves Redis's no-schema fallback while surfacing SCAN permission errors", async () => {
     const denied = new Error("NOPERM: SCAN");
     const scan = vi.fn().mockRejectedValue(denied);
-    const driver = withClient(
-      new RedisDriver({
-        id: "redis",
-        name: "Redis",
-        type: "redis",
-        host: "localhost",
-      }),
-      { scan },
-    );
-    await expect(driver.listObjects()).rejects.toBe(denied);
-    const failed = await loadDatabaseScope(driver, "db0", "baseline");
-    expect(failed.loadedSchemas).toEqual([]);
-    expect(failed.failedSchemas).toEqual([{ name: "db0", error: denied }]);
-    scan.mockResolvedValue({ cursor: "0", keys: [] });
-    const recovered = await loadDatabaseScope(driver, "db0", "baseline");
-    expect(recovered.failedSchemas).toEqual([]);
-    expect(recovered.loadedSchemas[0]).toMatchObject({
-      name: "db0",
-      objects: [{ name: "default", type: "table" }],
+    const makeClient = (scanMock: typeof scan) => {
+      const client = {
+        isOpen: false,
+        isReady: false,
+        on: vi.fn(),
+        connect: vi.fn<() => Promise<void>>(),
+        destroy: vi.fn<() => void>(),
+        scan: scanMock,
+      };
+      client.connect.mockImplementation(async () => {
+        client.isOpen = true;
+        client.isReady = true;
+      });
+      client.destroy.mockImplementation(() => {
+        client.isOpen = false;
+        client.isReady = false;
+      });
+      return client;
+    };
+    const base = makeClient(vi.fn());
+    const scoped = makeClient(scan);
+    // Exercise production scoping through the SDK boundary, with distinct
+    // editor and native clients even when both select DB 0.
+    vi.mocked(createClient)
+      .mockReturnValueOnce(base as unknown as ReturnType<typeof createClient>)
+      .mockReturnValueOnce(
+        scoped as unknown as ReturnType<typeof createClient>,
+      );
+    const tcp = vi.spyOn(net, "createConnection").mockImplementation(() => {
+      throw new Error("Redis discovery fixture attempted real TCP");
     });
-    vi.spyOn(driver, "listSchemas").mockRejectedValue(denied);
-    await expect(loadDatabaseScope(driver, "db0", "baseline")).rejects.toBe(
-      denied,
-    );
+    const driver = new RedisDriver({
+      id: "redis",
+      name: "Redis",
+      type: "redis",
+      host: "localhost",
+    });
+    try {
+      await driver.connect();
+      await expect(driver.listObjects()).rejects.toBe(denied);
+      const failed = await loadDatabaseScope(driver, "db0", "baseline");
+      expect(failed.loadedSchemas).toEqual([]);
+      expect(failed.failedSchemas).toEqual([{ name: "db0", error: denied }]);
+      scan.mockResolvedValue({ cursor: "0", keys: [] });
+      const recovered = await loadDatabaseScope(driver, "db0", "baseline");
+      expect(recovered.failedSchemas).toEqual([]);
+      expect(recovered.loadedSchemas[0]).toMatchObject({
+        name: "db0",
+        objects: [{ name: "default", type: "table" }],
+      });
+      vi.spyOn(driver, "listSchemas").mockRejectedValue(denied);
+      await expect(loadDatabaseScope(driver, "db0", "baseline")).rejects.toBe(
+        denied,
+      );
+      expect(base.scan).not.toHaveBeenCalled();
+      expect(scoped.connect).toHaveBeenCalledTimes(1);
+      expect(createClient).toHaveBeenCalledTimes(2);
+      for (const [options] of vi.mocked(createClient).mock.calls) {
+        expect(options).toMatchObject({ database: 0 });
+      }
+    } finally {
+      await driver.disconnect();
+      expect(driver.isConnected()).toBe(false);
+      for (const client of [base, scoped]) {
+        expect(client.destroy).toHaveBeenCalledTimes(1);
+        expect(client.isOpen).toBe(false);
+        expect(client.isReady).toBe(false);
+      }
+      expect(
+        (driver as unknown as { clients: Set<unknown> }).clients.size,
+      ).toBe(0);
+      expect(tcp).not.toHaveBeenCalled();
+    }
   });
 });

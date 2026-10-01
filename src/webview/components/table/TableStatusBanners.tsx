@@ -1,4 +1,4 @@
-import React from "react";
+import type React from "react";
 import { Icon } from "../Icon";
 import { type TableApplyStatus, tableButtonStyle } from "./tableViewHelpers";
 
@@ -56,6 +56,7 @@ function BannerDismissButton({ ariaLabel, onClick }: BannerDismissButtonProps) {
 }
 
 interface TableStatusBannersProps {
+  schemaWarning?: string | null;
   filterError: string | null;
   readError: string | null;
   showMissingPrimaryKeyNotice: boolean;
@@ -64,6 +65,7 @@ interface TableStatusBannersProps {
 }
 
 export function TableStatusBanners({
+  schemaWarning,
   filterError,
   readError,
   showMissingPrimaryKeyNotice,
@@ -72,6 +74,14 @@ export function TableStatusBanners({
 }: TableStatusBannersProps) {
   return (
     <>
+      {schemaWarning && (
+        <div
+          role="alert"
+          style={{ ...bannerLayoutStyle, ...warningBannerToneStyle }}
+        >
+          {schemaWarning}
+        </div>
+      )}
       {filterError && (
         <div
           role="status"
@@ -123,6 +133,7 @@ function platformShortcutLabel(): string {
 }
 
 interface TableMutationStatusBarProps {
+  schemaBlocked?: boolean;
   applyStatus: TableApplyStatus | null;
   applying: boolean;
   loading: boolean;
@@ -142,6 +153,7 @@ interface TableMutationStatusBarProps {
 }
 
 export function TableMutationStatusBar({
+  schemaBlocked = false,
   applyStatus,
   applying,
   loading,
@@ -167,7 +179,7 @@ export function TableMutationStatusBar({
 
   return (
     <>
-      {(unsavedRowCount > 0 || applyStatus) && (
+      {(unsavedRowCount > 0 || canUndo || canRedo || applyStatus) && (
         <div
           style={{
             flexShrink: 0,
@@ -187,73 +199,75 @@ export function TableMutationStatusBar({
             }`,
           }}
         >
-          {unsavedRowCount > 0 && applyStatus?.tone !== "error" && (
-            <>
-              <button
-                type="button"
-                aria-label="Undo"
-                title={`Undo (${shortcut}Z)`}
-                disabled={!canUndo || applying || loading}
-                style={{
-                  background: "none",
-                  border: "none",
-                  cursor:
-                    canUndo && !applying && !loading ? "pointer" : "default",
-                  color: canUndo
-                    ? "var(--vscode-editorWarning-foreground, #cca700)"
-                    : "var(--vscode-descriptionForeground, #888)",
-                  opacity: canUndo ? 0.9 : 0.4,
-                  padding: "0 2px",
-                  display: "flex",
-                  alignItems: "center",
-                }}
-                onClick={onUndo}
-              >
-                <Icon name="discard" size={14} />
-              </button>
-              <button
-                type="button"
-                aria-label="Redo"
-                title={`Redo (${shortcut}Shift+Z)`}
-                disabled={!canRedo || applying || loading}
-                style={{
-                  background: "none",
-                  border: "none",
-                  cursor:
-                    canRedo && !applying && !loading ? "pointer" : "default",
-                  color: canRedo
-                    ? "var(--vscode-editorWarning-foreground, #cca700)"
-                    : "var(--vscode-descriptionForeground, #888)",
-                  opacity: canRedo ? 0.9 : 0.4,
-                  padding: "0 2px",
-                  display: "flex",
-                  alignItems: "center",
-                }}
-                onClick={onRedo}
-              >
-                <Icon name="redo" size={14} />
-              </button>
-              <span
-                style={{
-                  width: 1,
-                  height: 14,
-                  background: "rgba(200,150,0,0.3)",
-                  flexShrink: 0,
-                }}
-              />
-              <span
-                style={{
-                  fontSize: 12,
-                  color: "var(--vscode-editorWarning-foreground, #cca700)",
-                  flex: 1,
-                }}
-              >
-                <Icon name="edit" size={12} style={{ marginRight: 4 }} />
-                {unsavedRowCount} row{unsavedRowCount !== 1 ? "s" : ""} with
-                unsaved changes
-              </span>
-            </>
-          )}
+          {(unsavedRowCount > 0 || canUndo || canRedo) &&
+            applyStatus?.tone !== "error" && (
+              <>
+                <button
+                  type="button"
+                  aria-label="Undo"
+                  title={`Undo (${shortcut}Z)`}
+                  disabled={!canUndo || applying || loading}
+                  style={{
+                    background: "none",
+                    border: "none",
+                    cursor:
+                      canUndo && !applying && !loading ? "pointer" : "default",
+                    color: canUndo
+                      ? "var(--vscode-editorWarning-foreground, #cca700)"
+                      : "var(--vscode-descriptionForeground, #888)",
+                    opacity: canUndo ? 0.9 : 0.4,
+                    padding: "0 2px",
+                    display: "flex",
+                    alignItems: "center",
+                  }}
+                  onClick={onUndo}
+                >
+                  <Icon name="discard" size={14} />
+                </button>
+                <button
+                  type="button"
+                  aria-label="Redo"
+                  title={`Redo (${shortcut}Shift+Z)`}
+                  disabled={!canRedo || applying || loading}
+                  style={{
+                    background: "none",
+                    border: "none",
+                    cursor:
+                      canRedo && !applying && !loading ? "pointer" : "default",
+                    color: canRedo
+                      ? "var(--vscode-editorWarning-foreground, #cca700)"
+                      : "var(--vscode-descriptionForeground, #888)",
+                    opacity: canRedo ? 0.9 : 0.4,
+                    padding: "0 2px",
+                    display: "flex",
+                    alignItems: "center",
+                  }}
+                  onClick={onRedo}
+                >
+                  <Icon name="redo" size={14} />
+                </button>
+                <span
+                  style={{
+                    width: 1,
+                    height: 14,
+                    background: "rgba(200,150,0,0.3)",
+                    flexShrink: 0,
+                  }}
+                />
+                <span
+                  style={{
+                    fontSize: 12,
+                    color: "var(--vscode-editorWarning-foreground, #cca700)",
+                    flex: 1,
+                  }}
+                >
+                  <Icon name="edit" size={12} style={{ marginRight: 4 }} />
+                  {unsavedRowCount > 0
+                    ? `${unsavedRowCount} row${unsavedRowCount !== 1 ? "s" : ""} with unsaved changes`
+                    : "Undo/redo history retained"}
+                </span>
+              </>
+            )}
           {applyStatus && (
             <span
               style={{
@@ -270,29 +284,32 @@ export function TableMutationStatusBar({
             </span>
           )}
           {unsavedRowCount > 0 && (
-            <>
-              <button
-                type="button"
-                style={tableButtonStyle("warning", applying || loading)}
-                disabled={applying || loading}
-                title={
-                  newRowExists && insertValueCount === 0
-                    ? "Apply inserts with database defaults, then updates"
-                    : undefined
-                }
-                onClick={onApplyChanges}
-              >
-                {applying ? "Applying…" : "Apply Changes"}
-              </button>
-              <button
-                type="button"
-                style={tableButtonStyle("ghost", applying || loading)}
-                disabled={applying || loading}
-                onClick={onRevertChanges}
-              >
-                Revert All
-              </button>
-            </>
+            <button
+              type="button"
+              style={tableButtonStyle(
+                "warning",
+                applying || loading || schemaBlocked,
+              )}
+              disabled={applying || loading || schemaBlocked}
+              title={
+                newRowExists && insertValueCount === 0
+                  ? "Apply inserts with database defaults, then updates"
+                  : undefined
+              }
+              onClick={onApplyChanges}
+            >
+              {applying ? "Applying…" : "Apply Changes"}
+            </button>
+          )}
+          {(unsavedRowCount > 0 || canUndo || canRedo) && (
+            <button
+              type="button"
+              style={tableButtonStyle("ghost", applying || loading)}
+              disabled={applying || loading}
+              onClick={onRevertChanges}
+            >
+              Revert All
+            </button>
           )}
           {applyStatus && unsavedRowCount === 0 && (
             <button

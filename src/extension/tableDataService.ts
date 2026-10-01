@@ -58,6 +58,7 @@ export class TableDataService {
     filters: FilterExpression[],
     sort: SortConfig | null = null,
     skipCount = false,
+    signal?: AbortSignal,
   ): Promise<TablePage> {
     return this.readService.getPage(
       connectionId,
@@ -69,6 +70,7 @@ export class TableDataService {
       filters,
       sort,
       skipCount,
+      signal,
     );
   }
   updateRow(

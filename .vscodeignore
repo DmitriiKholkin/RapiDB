@@ -2,6 +2,7 @@
 src/
 esbuild.config.mjs
 esbuild.config.d.ts
+esbuild.config.d.mts
 tsconfig*.json
 biome.json
 compose.yaml

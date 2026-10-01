@@ -1,4 +1,4 @@
-import React, { ReactElement } from "react";
+import React, { type ReactElement } from "react";
 import type {
   QueryInitialState,
   WebviewInitialState,
@@ -46,6 +46,7 @@ export function App(): ReactElement {
             table={state.table ?? ""}
             isView={state.isView ?? false}
             connectionReadOnly={state.connectionReadOnly ?? false}
+            mongoRowIdentity={state.mongoRowIdentity ?? false}
             defaultPageSize={state.defaultPageSize}
           />
         </ErrorBoundary>

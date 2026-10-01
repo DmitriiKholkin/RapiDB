@@ -4,6 +4,7 @@
  * All parsers are pure; `null` indicates a parse failure.
  */
 
+import type { ColumnTypeMeta } from "../tableTypes";
 import type { PanelRetentionState, WebviewMessageEnvelope } from "./shared";
 import {
   isRecord,
@@ -88,6 +89,26 @@ export interface TableMutationResultPayload {
   error?: string;
 }
 
+export interface DeleteRowOutcome {
+  rowIndex: number;
+  primaryKeys: Record<string, unknown>;
+  success: boolean;
+  status: "deleted" | "notfound" | "failed" | "unknown" | "skipped";
+  message?: string;
+}
+
+export interface DeleteResultPayload {
+  operationId?: string;
+  success: boolean;
+  affectedRows: number;
+  rowOutcomes: DeleteRowOutcome[];
+  /** A read is needed even if execution failed. */
+  changesPossible: boolean;
+  /** An in-flight write may settle after the first refresh. */
+  outcomeUnknown: boolean;
+  error?: string;
+}
+
 // ─── Initial State ──────────────────────────────────────────────────────────
 
 export interface TableInitialState extends PanelRetentionState {
@@ -98,6 +119,7 @@ export interface TableInitialState extends PanelRetentionState {
   table: string;
   isView?: boolean;
   connectionReadOnly?: boolean;
+  mongoRowIdentity?: boolean;
   defaultPageSize?: number;
 }
 
@@ -126,6 +148,7 @@ export function parseTableInitialState(
     table,
     isView: readOptionalBoolean(input, "isView"),
     connectionReadOnly: readOptionalBoolean(input, "connectionReadOnly"),
+    mongoRowIdentity: readOptionalBoolean(input, "mongoRowIdentity"),
     defaultPageSize: readOptionalNumber(input, "defaultPageSize"),
   };
 }
@@ -398,4 +421,12 @@ export function parseTablePanelMessage(
     default:
       return null;
   }
+}
+export interface TableInitPayload {
+  /** Omitted by older hosts: genuine initialization, with the existing reset semantics. */
+  intent?: "initialize" | "metadataRefresh";
+  columns: ColumnTypeMeta[];
+  primaryKeyColumns: string[];
+  isView?: boolean;
+  connectionReadOnly?: boolean;
 }

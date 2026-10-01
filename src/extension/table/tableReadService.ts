@@ -67,7 +67,9 @@ export class TableReadService {
     filters: FilterExpression[],
     sort: SortConfig | null = null,
     skipCount = false,
+    signal?: AbortSignal,
   ): Promise<TablePage> {
+    signal?.throwIfAborted();
     const { driver } = this.getConnectionDriver(connectionId);
     if (driver.readTablePage) {
       return driver.readTablePage({
@@ -79,6 +81,7 @@ export class TableReadService {
         filters,
         sort,
         skipCount,
+        ...(signal ? { signal } : {}),
       });
     }
 
@@ -130,6 +133,7 @@ export class TableReadService {
     const orderByClause = this.resolveFallbackOrderBy(driver, columns, sort);
     const count = await this.readFallbackTotalCount(
       driver,
+      database,
       qualifiedTableName,
       whereClause,
       whereParams,
@@ -147,6 +151,7 @@ export class TableReadService {
     const dataSql = `SELECT * FROM ${qualifiedTableName} ${whereClause} ${effectiveOrderBy} ${pagination.sql}`;
     const dataResult = await this.readFallbackDataResult(
       driver,
+      database,
       dataSql,
       baseParams,
       columns,
@@ -184,6 +189,13 @@ export class TableReadService {
     rows: Record<string, unknown>[];
   }> {
     const { driver } = this.getConnectionDriver(connectionId);
+    if (driver.exportTableChunks && filters.length === 0 && sort === null) {
+      yield* driver.exportTableChunks(
+        { database, schema, table, chunkSize },
+        signal,
+      );
+      return;
+    }
     if (!driver.readTablePage) {
       const keysetOrder = await this.resolveKeysetExportOrder(
         connectionId,
@@ -224,9 +236,13 @@ export class TableReadService {
         filters,
         sort,
         true,
+        signal,
       );
 
       if (result.rows.length === 0) {
+        if (page === 1) {
+          yield { columns: result.columns, rows: [] };
+        }
         break;
       }
 
@@ -262,6 +278,7 @@ export class TableReadService {
 
   private async readFallbackTotalCount(
     driver: ReturnType<TableReadService["getConnectionDriver"]>["driver"],
+    database: string,
     qualifiedTableName: string,
     whereClause: string,
     whereParams: unknown[],
@@ -273,7 +290,9 @@ export class TableReadService {
 
     try {
       const countSql = `SELECT COUNT(*) AS cnt FROM ${qualifiedTableName} ${whereClause}`;
-      const countResult = await driver.query(countSql, whereParams);
+      const countResult = await driver.query(countSql, whereParams, {
+        database,
+      });
       return {
         totalCount: this.readCountQueryValue(countResult),
         countFailed: false,
@@ -300,12 +319,13 @@ export class TableReadService {
 
   private async readFallbackDataResult(
     driver: ReturnType<TableReadService["getConnectionDriver"]>["driver"],
+    database: string,
     dataSql: string,
     params: unknown[],
     columns: ColumnTypeMeta[],
   ): Promise<QueryResult> {
     try {
-      return await driver.query(dataSql, params);
+      return await driver.query(dataSql, params, { database });
     } catch (error: unknown) {
       this.rethrowComputedColumnOverflow(error, columns);
       throw error;
@@ -423,7 +443,7 @@ export class TableReadService {
         ...(cursorCondition?.params ?? []),
         ...pagination.params,
       ];
-      const dataResult = await driver.query(sql, params);
+      const dataResult = await driver.query(sql, params, { database });
       const rows = dataResult.rows.map((row) => {
         const formattedRow: Record<string, unknown> = {};
         dataResult.columns.forEach((columnName, index) => {
@@ -437,6 +457,9 @@ export class TableReadService {
       });
 
       if (rows.length === 0) {
+        if (cursor === null) {
+          yield { columns, rows: [] };
+        }
         break;
       }
 
@@ -627,6 +650,9 @@ export class TableReadService {
   private getConnectionDriver(connectionId: string): {
     driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>;
   } {
+    const reconnectBlock =
+      this.connectionManager.getAutomaticReconnectBlockReason?.(connectionId);
+    if (reconnectBlock) throw new Error(reconnectBlock);
     const connection = this.connectionManager.getConnection(connectionId);
     const driver = this.connectionManager.getDriver(connectionId);
     if (!connection || !driver) {

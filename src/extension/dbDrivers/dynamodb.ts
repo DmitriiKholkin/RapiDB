@@ -58,6 +58,7 @@ import {
   parseJsonPreservingRawNumbers,
 } from "../utils/jsonCanonical";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
+import { deleteRowsSequentially, prepareDeleteBatch } from "./deleteOutcomes";
 import {
   applyFilters,
   applySort,
@@ -732,8 +733,18 @@ export class DynamoDBDriver implements IDBDriver {
       const formattedRows = materialized.rows.map((row) =>
         this.formatDynamoRowForDisplay(row, describedByName),
       );
-      const filteredRows = applyFilters(formattedRows, request.filters);
-      const sortedRows = applySort(filteredRows, request.sort);
+      const filteredRows = applyFilters(
+        formattedRows,
+        request.filters,
+        describedColumns,
+        this.rowValueCategory,
+      );
+      const sortedRows = applySort(
+        filteredRows,
+        request.sort,
+        describedColumns,
+        this.rowValueCategory,
+      );
       return {
         columns: this.resolveReadTablePageColumns(
           sortedRows.length > 0 ? materialized.rows : [],
@@ -860,32 +871,39 @@ export class DynamoDBDriver implements IDBDriver {
     request: DriverDeleteRowsRequest,
     context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
-    context?.signal.throwIfAborted();
-    const schema = await this.getTableSchema(request.table, context);
+    const schema = await prepareDeleteBatch(
+      request.primaryKeyValuesList,
+      context,
+      () => this.getTableSchema(request.table, context),
+    );
     const keys = schema.keys;
-    let affectedRows = 0;
-
-    for (const criteria of request.primaryKeyValuesList) {
-      context?.signal.throwIfAborted();
-      const input = this.buildDeleteItemInput(request.table, keys, criteria);
-      try {
-        const response = await this.requireClient().send(
-          new DeleteItemCommand(input),
-          context ? { abortSignal: context.signal } : undefined,
-        );
-        if (response.Attributes) {
-          affectedRows += 1;
-        }
-      } catch (error: unknown) {
-        if (this.isConditionalCheckFailure(error)) {
-          continue;
-        }
-        throw error;
-      }
+    try {
+      return await deleteRowsSequentially(
+        request.primaryKeyValuesList,
+        context,
+        (criteria) => {
+          const input = this.buildDeleteItemInput(
+            request.table,
+            keys,
+            criteria,
+          );
+          return async () => {
+            try {
+              const response = await this.requireClient().send(
+                new DeleteItemCommand(input),
+                context ? { abortSignal: context.signal } : undefined,
+              );
+              return response.Attributes ? "deleted" : "notfound";
+            } catch (error) {
+              if (this.isConditionalCheckFailure(error)) return "notfound";
+              throw error;
+            }
+          };
+        },
+      );
+    } finally {
+      this.invalidateCursorCacheForTable(request.table);
     }
-
-    this.invalidateCursorCacheForTable(request.table);
-    return { affectedRows };
   }
 
   buildMutationPreviewStatement(
@@ -930,6 +948,12 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   async runTransaction(operations: TransactionOperation[]): Promise<void> {
+    // No TransactWriteItems batching here; sequential requests are not atomic.
+    if (operations.length > 1) {
+      throw new Error(
+        "[RapiDB] DynamoDB driver does not support atomic multi-operation transactions. Apply one row at a time.",
+      );
+    }
     for (const operation of operations) {
       await this.query(operation.sql, operation.params);
     }
@@ -2080,7 +2104,12 @@ export class DynamoDBDriver implements IDBDriver {
       const formattedRows = rawRows.map((row) =>
         this.formatDynamoRowForDisplay(row, describedByName),
       );
-      const filteredRows = applyFilters(formattedRows, filters);
+      const filteredRows = applyFilters(
+        formattedRows,
+        filters,
+        [...describedByName.values()],
+        this.rowValueCategory,
+      );
       return {
         rawRows: filteredRows.length > 0 ? rawRows.slice(0, 1) : [],
         formattedRows: filteredRows.slice(offset, offset + pageSize),
@@ -2104,7 +2133,14 @@ export class DynamoDBDriver implements IDBDriver {
           rawRow,
           describedByName,
         );
-        if (applyFilters([formattedRow], filters).length === 0) {
+        if (
+          applyFilters(
+            [formattedRow],
+            filters,
+            [...describedByName.values()],
+            this.rowValueCategory,
+          ).length === 0
+        ) {
           continue;
         }
 
@@ -3121,11 +3157,20 @@ export class DynamoDBDriver implements IDBDriver {
     return "string set";
   }
 
+  private readonly tableRowCategories = new WeakMap<
+    Record<string, unknown>,
+    Map<string, TypeCategory>
+  >();
+  private readonly rowValueCategory = (
+    row: Record<string, unknown>,
+    column: string,
+  ): TypeCategory | undefined => this.tableRowCategories.get(row)?.get(column);
+
   private formatDynamoRowForDisplay(
     row: Record<string, unknown>,
     columnsByName?: ReadonlyMap<string, ColumnTypeMeta>,
   ): Record<string, unknown> {
-    return Object.fromEntries(
+    const formatted = Object.fromEntries(
       Object.entries(row).map(([name, value]) => {
         const column = columnsByName?.get(name);
         return [
@@ -3136,6 +3181,16 @@ export class DynamoDBDriver implements IDBDriver {
         ];
       }),
     );
+    this.tableRowCategories.set(
+      formatted,
+      new Map(
+        Object.entries(row).map(([name, value]) => [
+          name,
+          this.describeDynamoValue(value).category,
+        ]),
+      ),
+    );
+    return formatted;
   }
 
   private formatGenericDisplayValue(value: unknown): unknown {

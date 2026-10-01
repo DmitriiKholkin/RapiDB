@@ -442,42 +442,183 @@ async function withInstallLock<T>(
 const PATCHED_PREBUILDS_RELEASE_URL =
   "https://github.com/DmitriiKholkin/RapiDB/releases/download/rapidb-patched-sqlite";
 
-function downloadToFile(url: string, destPath: string): Promise<void> {
+export function downloadToFile(
+  url: string,
+  destPath: string,
+  timeoutMs = 60_000,
+): Promise<void> {
   const { createWriteStream } = require("node:fs") as typeof import("node:fs");
   const https = require("node:https") as typeof import("node:https");
+  const http = require("node:http") as typeof import("node:http");
 
   return new Promise<void>((resolvePromise, rejectPromise) => {
+    let settled = false;
+    let abortActiveRequest: (() => void) | undefined;
+    const resolveOnce = (): void => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(deadline);
+        resolvePromise();
+      }
+    };
+    const rejectOnce = (error: Error): void => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(deadline);
+        try {
+          rmSync(destPath, { force: true });
+        } catch {}
+        rejectPromise(error);
+      }
+    };
+    // Socket timeout is only an inactivity timer. A server can drip bytes
+    // indefinitely, so also bound the entire download across redirects.
+    const deadline = setTimeout(() => {
+      const error = new Error(`Timed out downloading ${url}`);
+      abortActiveRequest?.();
+      rejectOnce(error);
+    }, timeoutMs);
     const follow = (target: string, depth: number): void => {
-      if (depth > 5) {
-        rejectPromise(new Error(`Too many redirects downloading ${url}`));
+      if (settled) {
         return;
       }
-      https
-        .get(target, (response) => {
-          if (
-            (response.statusCode === 301 || response.statusCode === 302) &&
-            response.headers.location
-          ) {
-            follow(response.headers.location, depth + 1);
+      if (depth > 5) {
+        rejectOnce(new Error(`Too many redirects downloading ${url}`));
+        return;
+      }
+      let resolvedTarget: string;
+      try {
+        resolvedTarget = new URL(target).toString();
+      } catch (error) {
+        rejectOnce(
+          error instanceof Error ? error : new Error(`Invalid URL: ${target}`),
+        );
+        return;
+      }
+      // http is only for loopback tests; production URLs are https.
+      // Reject non-loopback http (including https->http downgrade redirects).
+      if (resolvedTarget.startsWith("http://")) {
+        let hostname = "";
+        try {
+          hostname = new URL(resolvedTarget).hostname;
+        } catch {}
+        if (
+          hostname !== "127.0.0.1" &&
+          hostname !== "localhost" &&
+          hostname !== "::1"
+        ) {
+          rejectOnce(new Error(`Refusing non-loopback http URL: ${target}`));
+          return;
+        }
+      }
+      const client = resolvedTarget.startsWith("http://") ? http : https;
+      // biome-ignore lint/suspicious/noExplicitAny: node http/https interop for tests
+      let activeResponse: any | undefined;
+      // biome-ignore lint/suspicious/noExplicitAny: node fs WriteStream interop
+      let activeFile: any | undefined;
+      // biome-ignore lint/suspicious/noExplicitAny: node ClientRequest interop
+      let request: any;
+      abortActiveRequest = () => {
+        activeResponse?.destroy();
+        activeFile?.destroy();
+        request?.destroy();
+      };
+      try {
+        request = client.get(resolvedTarget, (response) => {
+          activeResponse = response;
+          if (settled) {
+            response.resume();
             return;
           }
-          if (response.statusCode !== 200) {
-            rejectPromise(
-              new Error(`HTTP ${response.statusCode} downloading ${target}`),
+          const status = response.statusCode ?? 0;
+          if (
+            (status === 301 ||
+              status === 302 ||
+              status === 303 ||
+              status === 307 ||
+              status === 308) &&
+            response.headers.location
+          ) {
+            // Free the socket before following the redirect.
+            response.resume();
+            let next: string;
+            try {
+              next = new URL(
+                response.headers.location,
+                resolvedTarget,
+              ).toString();
+            } catch (error) {
+              rejectOnce(
+                error instanceof Error
+                  ? error
+                  : new Error(`Invalid redirect: ${response.headers.location}`),
+              );
+              return;
+            }
+            follow(next, depth + 1);
+            return;
+          }
+          if (status !== 200) {
+            response.resume();
+            rejectOnce(
+              new Error(`HTTP ${status} downloading ${resolvedTarget}`),
             );
             return;
           }
           const file = createWriteStream(destPath);
-          response.pipe(file);
-          file.on("finish", () => {
-            file.close(() => resolvePromise());
+          activeFile = file;
+          response.on("error", (err: Error) => {
+            try {
+              file.destroy();
+            } catch {}
+            rejectOnce(err);
           });
           file.on("error", (err: Error) => {
-            rmSync(destPath, { force: true });
-            rejectPromise(err);
+            try {
+              response.destroy();
+            } catch {}
+            rejectOnce(err);
           });
-        })
-        .on("error", rejectPromise);
+          file.on("finish", () => {
+            file.close((closeErr?: Error | null) => {
+              if (closeErr) {
+                rejectOnce(closeErr);
+              } else {
+                resolveOnce();
+              }
+            });
+          });
+          response.pipe(file);
+        });
+      } catch (error) {
+        rejectOnce(
+          error instanceof Error
+            ? error
+            : new Error(`Request failed: ${target}`),
+        );
+        return;
+      }
+      request.on("error", (err: Error) => {
+        try {
+          activeResponse?.destroy();
+        } catch {}
+        try {
+          activeFile?.destroy();
+        } catch {}
+        rejectOnce(err);
+      });
+      request.setTimeout(timeoutMs, () => {
+        const timeoutError = new Error(
+          `Timed out downloading ${resolvedTarget}`,
+        );
+        try {
+          activeResponse?.destroy();
+        } catch {}
+        try {
+          activeFile?.destroy();
+        } catch {}
+        request.destroy(timeoutError);
+      });
     };
     follow(url, 0);
   });

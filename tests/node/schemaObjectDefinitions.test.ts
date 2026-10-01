@@ -7,7 +7,7 @@ import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
 import { OracleDriver } from "../../src/extension/dbDrivers/oracle";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
-import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
+import { SQLiteCoreDriver as SQLiteDriver } from "../../src/extension/dbDrivers/sqliteCore";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
 const mysqlConfig = {

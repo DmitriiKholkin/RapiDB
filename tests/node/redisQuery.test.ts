@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
+import type { createClient } from "redis";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
 import { REDIS_READ_BUDGET } from "../../src/shared/safetyContracts";
 
@@ -82,6 +83,66 @@ describe("RedisDriver — query()", () => {
     expect(sendCommand).toHaveBeenCalledWith(["SET", "key", "hello world"]);
   });
 
+  it("decodes JSON escapes only in double-quoted arguments", async () => {
+    const { driver, sendCommand } = createDriver();
+    await driver.query(
+      String.raw`SET "key\n\r\t\u0000\u96EA" "\b\f\/\uD83D\uDE00\\n\\u0000\""`,
+    );
+    expect(sendCommand).toHaveBeenCalledExactlyOnceWith([
+      "SET",
+      "key\n\r\t\0雪",
+      '\b\f/😀\\n\\u0000"',
+    ]);
+  });
+
+  it.each([
+    String.raw`SET key '\n\r\t\b\f\u0000\u96EA\\path\'quoted\'\ space'`,
+    String.raw`SET key \n\r\t\b\f\u0000\u96EA\\path\'quoted\'\ space`,
+  ])("preserves shell escaping for single-quoted and unquoted input %s", async (query) => {
+    const { driver, sendCommand } = createDriver();
+    await driver.query(query);
+    expect(sendCommand).toHaveBeenCalledExactlyOnceWith([
+      "SET",
+      "key",
+      "nrtbfu0000u96EA\\path'quoted' space",
+    ]);
+  });
+
+  it.each([
+    [
+      String.raw`"\u0047ET" "key\u0022\u003B SET victim value\n\u0000"`,
+      true,
+      ["GET", 'key"; SET victim value\n\0'],
+    ],
+    [String.raw`"\u0053ET" key value`, false, ["SET", "key", "value"]],
+    [
+      String.raw`"G\u0045T" key; "S\u0045T" victim value`,
+      false,
+      ["GET", "key"],
+    ],
+    [String.raw`'G\u0045T' key`, false, ["GU0045T", "key"]],
+  ] as const)("classifies the same decoded commands as execution for %s", async (query, allowed, firstCommand) => {
+    const { driver, sendCommand } = createDriver();
+    expect(driver.getCapabilities().readOnlyQueryGuard?.(query).allowed).toBe(
+      allowed,
+    );
+    await driver.query(query);
+    expect(sendCommand).toHaveBeenNthCalledWith(1, [...firstCommand]);
+    expect(sendCommand).toHaveBeenCalledTimes(query.includes('; "') ? 2 : 1);
+  });
+
+  it.each([
+    String.raw`GET "key\u123"`,
+    String.raw`GET "key\uZZZZ"`,
+  ])("rejects malformed Unicode escapes consistently for %s", async (query) => {
+    const { driver, sendCommand } = createDriver();
+    expect(driver.getCapabilities().readOnlyQueryGuard?.(query).allowed).toBe(
+      false,
+    );
+    await expect(driver.query(query)).rejects.toThrow("invalid Unicode escape");
+    expect(sendCommand).not.toHaveBeenCalled();
+  });
+
   it("rejects unterminated quoted arguments", async () => {
     const { driver } = createDriver();
 
@@ -92,48 +153,48 @@ describe("RedisDriver — query()", () => {
 });
 
 describe("RedisDriver — disconnect()", () => {
-  it("closes the active client and clears connection state", async () => {
+  it("destroys the active client and clears connection state", async () => {
     const driver = new RedisDriver({
       id: "redis-disconnect-test",
       name: "Redis Disconnect Test",
       type: "redis",
       host: "localhost",
     });
-    const close = vi.fn().mockResolvedValue(undefined);
+    const destroy = vi.fn();
     const driverState = driver as unknown as {
-      client: { close: typeof close; isOpen: boolean } | null;
+      client: { destroy: typeof destroy; isOpen: boolean } | null;
       connected: boolean;
     };
 
-    driverState.client = { close, isOpen: true };
+    driverState.client = { destroy, isOpen: true };
     driverState.connected = true;
 
     await driver.disconnect();
 
-    expect(close).toHaveBeenCalledTimes(1);
+    expect(destroy).toHaveBeenCalledTimes(1);
     expect(driverState.client).toBeNull();
     expect(driver.isConnected()).toBe(false);
   });
 
-  it("skips close when the client socket is already closed", async () => {
+  it("skips destroy when the client socket is already closed", async () => {
     const driver = new RedisDriver({
       id: "redis-disconnect-closed-client",
       name: "Redis Disconnect Closed Client",
       type: "redis",
       host: "localhost",
     });
-    const close = vi.fn().mockResolvedValue(undefined);
+    const destroy = vi.fn();
     const driverState = driver as unknown as {
-      client: { close: typeof close; isOpen: boolean } | null;
+      client: { destroy: typeof destroy; isOpen: boolean } | null;
       connected: boolean;
     };
 
-    driverState.client = { close, isOpen: false };
+    driverState.client = { destroy, isOpen: false };
     driverState.connected = true;
 
     await driver.disconnect();
 
-    expect(close).not.toHaveBeenCalled();
+    expect(destroy).not.toHaveBeenCalled();
     expect(driverState.client).toBeNull();
     expect(driver.isConnected()).toBe(false);
   });
@@ -152,6 +213,20 @@ describe("RedisDriver — disconnect()", () => {
 });
 
 describe("RedisDriver — metadata and pages", () => {
+  // These value/paging fixtures inject one already-open client. DB routing and
+  // client lifecycle are exercised through createClient in redisDatabaseScope.
+  beforeEach(() => {
+    vi.spyOn(
+      RedisDriver.prototype as unknown as {
+        getDatabaseClient(
+          database?: string,
+        ): Promise<ReturnType<typeof createClient>>;
+      },
+      "getDatabaseClient",
+    ).mockImplementation(async function (this: unknown) {
+      return (this as { client: ReturnType<typeof createClient> }).client;
+    });
+  });
   it("paginates over the same sorted key set on every page", async () => {
     const driver = new RedisDriver({
       id: "redis-stable-pages",
@@ -197,10 +272,10 @@ describe("RedisDriver — metadata and pages", () => {
     ]);
   });
 
-  it("uses bounded scan COUNT for small finite insert-type discovery limits", async () => {
+  it("builds string insert previews without scanning or inferring group types", async () => {
     const driver = new RedisDriver({
-      id: "redis-insert-infer-scan-limit",
-      name: "Redis Insert Infer Scan Limit",
+      id: "redis-insert-no-inference",
+      name: "Redis Insert No Inference",
       type: "redis",
       host: "localhost",
     });
@@ -220,7 +295,7 @@ describe("RedisDriver — metadata and pages", () => {
     ).client = client;
     (driver as unknown as { connected: boolean }).connected = true;
 
-    await driver.buildMutationPreviewStatements(
+    const preview = await driver.buildMutationPreviewStatements(
       "insert",
       "db0",
       "db0",
@@ -233,10 +308,9 @@ describe("RedisDriver — metadata and pages", () => {
       },
     );
 
-    expect(client.scan).toHaveBeenCalledWith("0", {
-      MATCH: "users:*",
-      COUNT: 25,
-    });
+    expect(preview).toEqual(['SET "users:3" "[\\"a\\",\\"b\\"]" "NX"']);
+    expect(client.scan).not.toHaveBeenCalled();
+    expect(client.type).not.toHaveBeenCalled();
   });
 
   it("lists logical databases and groups keys into table-like prefixes", async () => {
@@ -363,7 +437,7 @@ describe("RedisDriver — metadata and pages", () => {
         }),
         expect.objectContaining({
           name: "value",
-          category: "text",
+          category: "other",
           type: "mixed(string, hash, list, set, zset)",
           nativeType: "mixed(string, hash, list, set, zset)",
         }),

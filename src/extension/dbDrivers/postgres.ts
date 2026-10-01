@@ -28,6 +28,7 @@ import {
 import type {
   ColumnMeta,
   ColumnTypeMeta,
+  DatabaseExecutionScope,
   DatabaseInfo,
   DriverEntityManifest,
   FilterConditionResult,
@@ -502,6 +503,12 @@ export class PostgresDriver extends BaseDBDriver {
   }
 
   private pool: Pool | null = null;
+  private readonly databasePools = new Map<string, Pool>();
+  private readonly pendingPools = new Set<Pool>();
+  private readonly poolClosures = new WeakMap<Pool, Promise<void>>();
+  private connectionEpoch = 0;
+  private connectionAttempt: Promise<void> | null = null;
+  private publishedConnectionAttempt: Promise<void> | null = null;
   private readonly config: ConnectionConfig;
   private _connected = false;
   private connectedDatabaseName = "";
@@ -509,11 +516,28 @@ export class PostgresDriver extends BaseDBDriver {
   private readonly activeTransactionClients = new Set<PoolClient>();
   private readonly activeQueryClients = new Set<PoolClient>();
   private readonly activeQueryOperations = new Set<PostgresQueryOperation>();
-  private requirePool(): Pool {
+  private requirePool(database?: string): Pool {
     if (!this.pool) {
       throw new Error("[RapiDB] PostgreSQL connection is not open");
     }
-    return this.pool;
+    if (
+      !database ||
+      database === this.connectedDatabaseName ||
+      database === this.config.database
+    ) {
+      return this.pool;
+    }
+    let pool = this.databasePools.get(database);
+    if (!pool) {
+      pool = this.createPool(database);
+      pool.on("error", (error) => {
+        logger.error(`PostgreSQL pool error (${database})`, error);
+      });
+      // Publish synchronously: concurrent callers share this database's pool,
+      // never replace the connection/query editor's default pool.
+      this.databasePools.set(database, pool);
+    }
+    return pool;
   }
   private createPool(database: string): Pool {
     const tlsSettings = resolveConnectionTlsSettings(this.config);
@@ -549,22 +573,7 @@ export class PostgresDriver extends BaseDBDriver {
     database: string,
     run: (pool: Pool) => Promise<T>,
   ): Promise<T> {
-    if (
-      !database ||
-      database === this.connectedDatabaseName ||
-      database === this.config.database
-    ) {
-      return run(this.requirePool());
-    }
-
-    const pool = this.createPool(database);
-    try {
-      const client = await pool.connect();
-      client.release();
-      return await run(pool);
-    } finally {
-      await pool.end().catch(() => undefined);
-    }
+    return run(this.requirePool(database));
   }
   constructor(
     config: ConnectionConfig,
@@ -573,35 +582,112 @@ export class PostgresDriver extends BaseDBDriver {
     super(timeoutSettingsProvider);
     this.config = config;
   }
-  async connect(): Promise<void> {
-    if (this.pool !== null) {
-      try {
-        await this.pool.end();
-      } catch {}
-      this.pool = null;
-    }
-    this.pool = this.createPool(this.config.database ?? "");
-    this.pool.on("error", (err) => {
-      logger.error("PostgreSQL pool error", err);
-      this._connected = false;
-    });
-    const client = await this.pool.connect();
-    try {
-      const databaseRes = await client.query<{ name: string }>(
-        `SELECT current_database() AS name`,
-      );
-      this.connectedDatabaseName =
-        databaseRes.rows[0]?.name ?? this.config.database ?? "";
-    } finally {
-      client.release();
-    }
-    this._connected = true;
-  }
-  async disconnect(): Promise<void> {
+  connect(): Promise<void> {
+    if (this.connectionAttempt) return this.connectionAttempt;
+    const epoch = ++this.connectionEpoch;
     this._connected = false;
     this.connectedDatabaseName = "";
-    await this.pool?.end();
+    this.publishedConnectionAttempt = null;
+    const cleanup = this.closeOwnedPools().catch(() => undefined);
+    const attempt: Promise<void> = cleanup
+      .then(() => this.openConnection(epoch, attempt))
+      .finally(() => {
+        if (this.connectionAttempt === attempt) this.connectionAttempt = null;
+      });
+    this.connectionAttempt = attempt;
+    return attempt;
+  }
+
+  private assertConnectionEpoch(epoch: number): void {
+    if (epoch !== this.connectionEpoch) {
+      throw new Error("[RapiDB] PostgreSQL connection attempt cancelled");
+    }
+  }
+
+  private async openConnection(
+    epoch: number,
+    attempt: Promise<void>,
+  ): Promise<void> {
+    this.assertConnectionEpoch(epoch);
+    const pool = this.createPool(this.config.database ?? "");
+    this.pendingPools.add(pool);
+    pool.on("error", (err) => {
+      logger.error("PostgreSQL pool error", err);
+      if (epoch === this.connectionEpoch && this.pool === pool) {
+        this._connected = false;
+      }
+    });
+    try {
+      let databaseName: string;
+      const client = await pool.connect();
+      try {
+        this.assertConnectionEpoch(epoch);
+        const databaseRes = await client.query<{ name: string }>(
+          `SELECT current_database() AS name`,
+        );
+        this.assertConnectionEpoch(epoch);
+        databaseName = databaseRes.rows[0]?.name ?? this.config.database ?? "";
+      } finally {
+        if (epoch !== this.connectionEpoch) client.release(true);
+        else client.release();
+      }
+      this.assertConnectionEpoch(epoch);
+      this.pendingPools.delete(pool);
+      this.pool = pool;
+      this.connectedDatabaseName = databaseName;
+      this.publishedConnectionAttempt = attempt;
+      this._connected = true;
+    } catch (error) {
+      this.pendingPools.delete(pool);
+      // A stale attempt owns only its pool; it cannot reset a newer connection.
+      await this.closePool(pool).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /** Timeout cleanup must not disconnect a later, unrelated connect attempt. */
+  async cancelConnectionAttempt(attempt: Promise<unknown>): Promise<void> {
+    if (
+      attempt === this.connectionAttempt ||
+      attempt === this.publishedConnectionAttempt
+    ) {
+      await this.disconnect();
+    }
+  }
+
+  async disconnect(): Promise<void> {
+    ++this.connectionEpoch;
+    this.connectionAttempt = null;
+    this.publishedConnectionAttempt = null;
+    this._connected = false;
+    this.connectedDatabaseName = "";
+    await this.closeOwnedPools();
+  }
+
+  private closePool(pool: Pool): Promise<void> {
+    let closing = this.poolClosures.get(pool);
+    if (!closing) {
+      closing = Promise.resolve().then(() => pool.end());
+      this.poolClosures.set(pool, closing);
+    }
+    return closing;
+  }
+
+  private async closeOwnedPools(): Promise<void> {
+    const pools = new Set([
+      ...this.databasePools.values(),
+      ...this.pendingPools,
+    ]);
+    if (this.pool) pools.add(this.pool);
     this.pool = null;
+    this.databasePools.clear();
+    this.pendingPools.clear();
+    // Start cleanup for every pool even if one end() fails.
+    const results = await Promise.allSettled(
+      [...pools].map((pool) => this.closePool(pool)),
+    );
+    const failure = results.find((result) => result.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
   }
 
   async cancelCurrentOperation(
@@ -808,7 +894,7 @@ export class PostgresDriver extends BaseDBDriver {
     });
   }
   async describeTable(
-    _database: string,
+    database: string,
     schema: string,
     table: string,
   ): Promise<ColumnMeta[]> {
@@ -823,7 +909,7 @@ export class PostgresDriver extends BaseDBDriver {
       pk_ordinal: number | string | null;
       is_fk: boolean | number | string;
     };
-    const res = await this.requirePool().query<DescribeTableRow>(
+    const res = await this.requirePool(database).query<DescribeTableRow>(
       `SELECT
          a.attname                                AS column_name,
          format_type(a.atttypid, a.atttypmod)    AS data_type,
@@ -908,8 +994,9 @@ export class PostgresDriver extends BaseDBDriver {
     this.activeQueryOperations.add(operation);
     let client: PoolClient | undefined;
     try {
-      await this.waitForQueryConnection(operation);
-      client = await this.requirePool().connect();
+      const pool = this.requirePool(operationContext?.database);
+      await this.waitForQueryConnection(operation, pool);
+      client = await pool.connect();
       operation.client = client;
       if (operation.cancelled) {
         client.release(true);
@@ -1012,12 +1099,18 @@ export class PostgresDriver extends BaseDBDriver {
 
   private async waitForQueryConnection(
     operation: PostgresQueryOperation,
+    pool: Pool,
   ): Promise<void> {
     while (true) {
       if (operation.cancelled) {
         throw new Error("PostgreSQL query cancelled before execution.");
       }
-      const pool = this.requirePool();
+      if (
+        pool !== this.pool &&
+        ![...this.databasePools.values()].includes(pool)
+      ) {
+        throw new Error("[RapiDB] PostgreSQL connection is not open");
+      }
       if (
         pool.waitingCount === 0 &&
         (pool.idleCount > 0 || pool.totalCount < POSTGRES_POOL_MAX)
@@ -1028,7 +1121,7 @@ export class PostgresDriver extends BaseDBDriver {
     }
   }
   async getIndexes(
-    _database: string,
+    database: string,
     schema: string,
     table: string,
   ): Promise<IndexMeta[]> {
@@ -1038,7 +1131,7 @@ export class PostgresDriver extends BaseDBDriver {
       primary: boolean | number | string;
       column: string;
     };
-    const res = await this.requirePool().query<IndexRow>(
+    const res = await this.requirePool(database).query<IndexRow>(
       `SELECT i.relname AS name,
               ix.indisunique AS unique,
               ix.indisprimary AS primary,
@@ -1078,7 +1171,7 @@ export class PostgresDriver extends BaseDBDriver {
     return [...map.values()];
   }
   async getForeignKeys(
-    _database: string,
+    database: string,
     schema: string,
     table: string,
   ): Promise<ForeignKeyMeta[]> {
@@ -1089,7 +1182,7 @@ export class PostgresDriver extends BaseDBDriver {
       ref_table: string;
       ref_column: string;
     };
-    const res = await this.requirePool().query<ForeignKeyRow>(
+    const res = await this.requirePool(database).query<ForeignKeyRow>(
       `SELECT con.conname        AS constraint_name,
               src.attname        AS column_name,
               ref_ns.nspname     AS ref_schema,
@@ -1124,7 +1217,7 @@ export class PostgresDriver extends BaseDBDriver {
     table: string,
   ): Promise<import("./types").TableConstraintMeta[]> {
     const constraints = await super.getConstraints(database, schema, table);
-    const res = await this.requirePool().query<{
+    const res = await this.requirePool(database).query<{
       constraint_name: string;
       check_expression: string;
     }>(
@@ -1151,11 +1244,11 @@ export class PostgresDriver extends BaseDBDriver {
     return constraints;
   }
   async getTriggers(
-    _database: string,
+    database: string,
     schema: string,
     table: string,
   ): Promise<import("./types").TriggerMeta[] | null> {
-    const res = await this.requirePool().query<{
+    const res = await this.requirePool(database).query<{
       trigger_name: string;
       trigger_type: number | string;
       enabled_state: string;
@@ -1209,12 +1302,12 @@ export class PostgresDriver extends BaseDBDriver {
     });
   }
   override async getConstraintDDL(
-    _database: string,
+    database: string,
     schema: string,
     table: string,
     constraintName: string,
   ): Promise<string> {
-    const res = await this.requirePool().query<{ ddl: string }>(
+    const res = await this.requirePool(database).query<{ ddl: string }>(
       `SELECT 'ALTER TABLE ' || quote_ident(ns.nspname) || '.' || quote_ident(tbl.relname) ||
               ' ADD CONSTRAINT ' || quote_ident(con.conname) || ' ' ||
               pg_get_constraintdef(con.oid, true) || ';' AS ddl
@@ -1234,12 +1327,12 @@ export class PostgresDriver extends BaseDBDriver {
     return ddl;
   }
   override async getIndexDDL(
-    _database: string,
+    database: string,
     schema: string,
     table: string,
     indexName: string,
   ): Promise<string> {
-    const res = await this.requirePool().query<{ ddl: string }>(
+    const res = await this.requirePool(database).query<{ ddl: string }>(
       `SELECT pg_get_indexdef(idx.oid, 0, true) || ';' AS ddl
        FROM pg_class tbl
        JOIN pg_index pg_idx ON pg_idx.indrelid = tbl.oid
@@ -1258,12 +1351,12 @@ export class PostgresDriver extends BaseDBDriver {
     return ddl;
   }
   override async getTriggerDDL(
-    _database: string,
+    database: string,
     schema: string,
     table: string,
     triggerName: string,
   ): Promise<string> {
-    const res = await this.requirePool().query<{ ddl: string }>(
+    const res = await this.requirePool(database).query<{ ddl: string }>(
       `SELECT pg_get_triggerdef(trg.oid, true) || ';' AS ddl
        FROM pg_trigger trg
        JOIN pg_class tbl ON tbl.oid = trg.tgrelid
@@ -1282,7 +1375,7 @@ export class PostgresDriver extends BaseDBDriver {
     return ddl;
   }
   async getCreateTableDDL(
-    _database: string,
+    database: string,
     schema: string,
     table: string,
   ): Promise<string> {
@@ -1294,7 +1387,7 @@ export class PostgresDriver extends BaseDBDriver {
       generated_kind: string | null;
       identity_kind: string | null;
     };
-    const pool = this.requirePool();
+    const pool = this.requirePool(database);
     const kindRes = await pool.query<{
       relkind: string;
     }>(
@@ -1405,18 +1498,18 @@ export class PostgresDriver extends BaseDBDriver {
     return `CREATE TABLE ${this.qualifiedTableName("", schema, table)} (\n${cols.join(",\n")}\n);`;
   }
   async getObjectDefinition(
-    _database: string,
+    database: string,
     schema: string,
     name: string,
     kind: DdlOnlyDbObjectKind,
   ): Promise<string | null> {
     if (kind === "sequence") {
-      return this.getSequenceDefinition(schema, name);
+      return this.getSequenceDefinition(database, schema, name);
     }
-    return this.getTypeDefinition(schema, name);
+    return this.getTypeDefinition(database, schema, name);
   }
   async getRoutineDefinition(
-    _database: string,
+    database: string,
     schema: string,
     name: string,
     _kind: "function" | "procedure",
@@ -1424,7 +1517,7 @@ export class PostgresDriver extends BaseDBDriver {
   ): Promise<string> {
     const parsedIdentity = parsePostgresRoutineIdentity(routineIdentity);
     if (parsedIdentity) {
-      const byOidRes = await this.requirePool().query<{
+      const byOidRes = await this.requirePool(database).query<{
         def: string;
       }>(
         `SELECT pg_get_functiondef(p.oid) AS def
@@ -1439,7 +1532,7 @@ export class PostgresDriver extends BaseDBDriver {
       }
     }
 
-    const res = await this.requirePool().query<{
+    const res = await this.requirePool(database).query<{
       def: string;
     }>(
       `SELECT pg_get_functiondef(p.oid) AS def
@@ -1453,10 +1546,11 @@ export class PostgresDriver extends BaseDBDriver {
   }
 
   private async getSequenceDefinition(
+    database: string,
     schema: string,
     name: string,
   ): Promise<string | null> {
-    const res = await this.requirePool().query<{
+    const res = await this.requirePool(database).query<{
       data_type: string;
       start_value: string | number;
       min_value: string | number;
@@ -1499,10 +1593,11 @@ export class PostgresDriver extends BaseDBDriver {
   }
 
   private async getTypeDefinition(
+    database: string,
     schema: string,
     name: string,
   ): Promise<string | null> {
-    const metaRes = await this.requirePool().query<{
+    const metaRes = await this.requirePool(database).query<{
       typtype: string;
       typnotnull: boolean;
       typdefault: string | null;
@@ -1531,7 +1626,7 @@ export class PostgresDriver extends BaseDBDriver {
 
     const qualifiedName = this.qualifiedTableName("", schema, name);
     if (meta.typtype === "e") {
-      const labelsRes = await this.requirePool().query<{
+      const labelsRes = await this.requirePool(database).query<{
         enumlabel: string;
       }>(
         `SELECT e.enumlabel
@@ -1557,7 +1652,7 @@ export class PostgresDriver extends BaseDBDriver {
       return `${clauses.join(" ")};`;
     }
 
-    const attributesRes = await this.requirePool().query<{
+    const attributesRes = await this.requirePool(database).query<{
       column_name: string;
       data_type: string;
     }>(
@@ -1583,9 +1678,10 @@ export class PostgresDriver extends BaseDBDriver {
   async runTransaction(
     operations: import("./types").TransactionOperation[],
     context?: import("./types").TransactionContext,
+    scope?: DatabaseExecutionScope,
   ): Promise<void> {
     throwIfTransactionCancelled(context);
-    const client = await this.requirePool().connect();
+    const client = await this.requirePool(scope?.database).connect();
     this.activeTransactionClients.add(client);
     const cancel = () => {
       if (this.activeTransactionClients.delete(client)) client.release(true);

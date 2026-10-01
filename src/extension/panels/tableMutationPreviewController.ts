@@ -1,9 +1,15 @@
 import { randomUUID } from "node:crypto";
 import type {
   ApplyResultPayload,
+  DeleteResultPayload,
   TableMutationPreviewPayload,
 } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
+import {
+  buildDeleteResult,
+  DeleteExecutionError,
+  getDeleteEvidence,
+} from "../dbDrivers/deleteOutcomes";
 import {
   executeAtomicSqlApplyPlan,
   executePreparedApplyPlan,
@@ -54,12 +60,13 @@ type PendingTableMutationPreview =
     };
 
 type MutationPreviewExecutionResult =
+  | { type: "deleteResult"; payload: DeleteResultPayload }
   | {
       type: "applyResult";
       payload: ApplyResultPayload;
     }
   | {
-      type: "insertResult" | "deleteResult";
+      type: "insertResult";
       payload: {
         operationId: string;
         success: boolean;
@@ -79,6 +86,7 @@ interface TableMutationPreviewControllerOptions {
 }
 
 export class TableMutationPreviewController {
+  private readonly executedOperationIds = new Set<string>();
   private readonly pendingMutationPreviews = new Map<
     string,
     PendingTableMutationPreview
@@ -140,6 +148,10 @@ export class TableMutationPreviewController {
     }
 
     this.pendingMutationPreviews.delete(previewToken);
+    if (preview.kind === "deleteRows") {
+      if (this.executedOperationIds.has(preview.operationId)) return null;
+      this.executedOperationIds.add(preview.operationId);
+    }
 
     if (preview.kind === "applyChanges") {
       const operationCount =
@@ -219,21 +231,49 @@ export class TableMutationPreviewController {
       };
     }
 
-    try {
-      if (preview.kind === "insertRow") {
-        await this.tableDataService.executePreparedInsertPlan(preview.plan);
-      } else {
+    if (preview.kind === "deleteRows") {
+      try {
         await this.tableDataService.executePreparedDeletePlan(preview.plan);
+        const identities =
+          preview.plan.rowIdentities ?? preview.plan.verificationCriteriaList;
+        return {
+          type: "deleteResult",
+          payload: {
+            ...buildDeleteResult(identities, {
+              affectedRows: identities.length,
+            }),
+            operationId: preview.operationId,
+          },
+        };
+      } catch (error) {
+        return {
+          type: "deleteResult",
+          payload: {
+            ...(error instanceof DeleteExecutionError
+              ? error.deleteResult
+              : buildDeleteResult(
+                  preview.plan.rowIdentities ??
+                    preview.plan.verificationCriteriaList,
+                  getDeleteEvidence(error) ?? { affectedRows: 0 },
+                  normalizeUnknownError(error).message,
+                )),
+            operationId: preview.operationId,
+          },
+        };
       }
+    }
+
+    try {
+      await this.tableDataService.executePreparedInsertPlan(preview.plan);
 
       return {
-        type: preview.kind === "insertRow" ? "insertResult" : "deleteResult",
+        type: "insertResult",
         payload: { operationId: preview.operationId, success: true },
       };
     } catch (error: unknown) {
       const normalized = normalizeUnknownError(error);
       return {
-        type: preview.kind === "insertRow" ? "insertResult" : "deleteResult",
+        type: "insertResult",
         payload: {
           operationId: preview.operationId,
           success: false,

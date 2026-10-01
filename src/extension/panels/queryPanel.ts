@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import type { QueryEditorLanguage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import { logErrorWithContext } from "../utils/errorHandling";
+import { logger } from "../utils/logger";
 import {
   attachPanelDisposables,
   attachPanelMessageHandler,
@@ -61,7 +62,28 @@ export class QueryPanel {
         getInitialConnectionId: () => this.initialConnectionId,
         getLastQueryResult: () => this.lastQueryResult,
         postMessage: (message) => {
-          this.panel.webview.postMessage(message);
+          // webview.postMessage returns Thenable<boolean>: false when the
+          // webview is gone, rejection on dispose races. Swallowing it caused
+          // unhandled rejections; log instead so diagnostics stay visible.
+          try {
+            const result = this.panel.webview.postMessage(message);
+            void Promise.resolve(result).then(
+              (delivered) => {
+                if (delivered === false) {
+                  logger.warn("QueryPanel postMessage dropped (webview gone)");
+                }
+              },
+              (error: unknown) => {
+                logger.warn(
+                  `QueryPanel postMessage failed: ${error instanceof Error ? error.message : String(error)}`,
+                );
+              },
+            );
+          } catch (error: unknown) {
+            logger.warn(
+              `QueryPanel postMessage threw: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
         },
         setActiveConnectionId: (nextConnectionId) => {
           this.activeConnectionId = nextConnectionId;
@@ -121,7 +143,11 @@ export class QueryPanel {
       schemaRefreshWatcher,
     );
     this.panel.onDidDispose(() => {
-      void this.controller.dispose();
+      void this.controller.dispose().catch((error: unknown) => {
+        logger.warn(
+          `QueryPanel controller dispose failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
     });
   }
 

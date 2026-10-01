@@ -6,11 +6,11 @@ import type {
   WebviewInitialState,
 } from "../../../src/shared/webviewContracts";
 import { App } from "../../../src/webview/components/App";
-import {
-  type FakeWebviewPanelHandle,
-  type WorkflowMessageEnvelope,
+import type {
+  FakeWebviewPanelHandle,
+  WorkflowMessageEnvelope,
 } from "./fakeWebviewPanel";
-import { type WorkflowVscodeState } from "./workflowVscode";
+import type { WorkflowVscodeState } from "./workflowVscode";
 
 export interface BridgeOptions {
   readonly state: WorkflowVscodeState;
@@ -251,6 +251,7 @@ export function tableInitialStateFor(
     table: options.table,
     isView: options.isView ?? false,
     connectionReadOnly: connection.readOnly ?? false,
+    mongoRowIdentity: connection.type === "mongodb",
     defaultPageSize: options.defaultPageSize ?? 25,
   };
 }

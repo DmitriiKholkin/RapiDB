@@ -3,9 +3,14 @@ import { getDbObjectKindDisplayLabel } from "../../shared/dbObjectKinds";
 import { coerceFilterExpressions } from "../../shared/tableTypes";
 import {
   parseTablePanelMessage,
+  type TableInitPayload,
   type TableMutationPreviewPayload,
 } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
+import {
+  buildDeleteResult,
+  unattemptedDeleteResult,
+} from "../dbDrivers/deleteOutcomes";
 import type { ColumnTypeMeta, FilterExpression } from "../dbDrivers/types";
 import {
   prepareApplyChangesPlan,
@@ -62,6 +67,12 @@ type ExportPayload = {
   columnOrder?: string[];
 };
 
+interface TableSchemaSnapshot {
+  readonly generation: number;
+  readonly columns: ColumnTypeMeta[];
+  readonly signature: string;
+}
+
 export class TablePanel {
   private static readonly viewType = "rapidb.tablePanel";
 
@@ -81,13 +92,28 @@ export class TablePanel {
     string,
     Promise<{
       rows: Record<string, unknown>[];
+      mongoIdTypes?: Array<"objectId" | "string" | null>;
       totalCount: number;
       executionTimeMs?: number;
     }>
   >();
 
-  private cachedColumns: import("../dbDrivers/types").ColumnTypeMeta[] = [];
+  private schemaSnapshot: TableSchemaSnapshot = {
+    generation: 0,
+    columns: [],
+    signature: "[]",
+  };
   private schemaRefreshGeneration = 0;
+  private schemaRefreshPromise: Promise<void> = Promise.resolve();
+  private schemaRefreshError: string | null = null;
+  private readonly previewSchemas = new Map<
+    string,
+    {
+      snapshot: TableSchemaSnapshot;
+      operationId: string;
+      kind: TableMutationPreviewPayload["kind"];
+    }
+  >();
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -127,21 +153,28 @@ export class TablePanel {
           return;
         }
         this.svc.clearForConnection(connectionId);
-        this.cachedColumns = [];
         const generation = ++this.schemaRefreshGeneration;
-        void this.svc
+        this.schemaRefreshPromise = this.svc
           .getColumns(connectionId, database, schema, table)
           .then((columns) => {
             if (generation === this.schemaRefreshGeneration) {
-              this.postTableInit(columns);
+              this.schemaRefreshError = null;
+              this.postTableInit(columns, "metadataRefresh");
             }
           })
-          .catch(() => undefined);
+          .catch((error: unknown) => {
+            if (generation !== this.schemaRefreshGeneration) return;
+            this.schemaRefreshError = normalizeUnknownError(error).message;
+            void this.postMessage("tableError", {
+              error: `Schema metadata refresh failed: ${this.schemaRefreshError}`,
+            });
+          });
       },
     );
     this.panel.onDidDispose(() => {
       schemaRefreshSubscription?.dispose();
       this.previewController.clear();
+      this.previewSchemas.clear();
       TablePanel.panels.delete(key);
 
       this.svc.clearForConnection(connectionId);
@@ -181,21 +214,71 @@ export class TablePanel {
 
   private async presentOrExecuteMutationPreview(
     preview: TableMutationPreviewPayload,
+    snapshot: TableSchemaSnapshot,
   ): Promise<void> {
+    if (!this.isCurrentSchemaSnapshot(snapshot)) {
+      this.previewController.cancel(preview.previewToken, preview.operationId);
+      await this.postSchemaConflict(preview.operationId, preview.kind);
+      return;
+    }
+    if (this.previewSchemas.size >= 50) {
+      const oldest = this.previewSchemas.keys().next().value;
+      if (oldest !== undefined) this.previewSchemas.delete(oldest);
+    }
+    this.previewSchemas.set(preview.previewToken, {
+      snapshot,
+      operationId: preview.operationId,
+      kind: preview.kind,
+    });
     if (!this.shouldSkipTableMutationPreview()) {
       await this.postMessage("tableMutationPreview", preview);
       return;
     }
 
-    const result = await this.previewController.confirm(
-      preview.previewToken,
-      preview.operationId,
-    );
-    if (!result) {
-      return;
-    }
+    await this._handleConfirmMutationPreview(preview);
+  }
 
-    await this.postMessage(result.type, result.payload);
+  private async awaitSchemaRefresh(): Promise<TableSchemaSnapshot> {
+    let current: Promise<void>;
+    do {
+      current = this.schemaRefreshPromise;
+      await current;
+    } while (current !== this.schemaRefreshPromise);
+    if (this.schemaRefreshError)
+      throw new Error(
+        `Schema metadata refresh failed: ${this.schemaRefreshError}`,
+      );
+    return this.schemaSnapshot;
+  }
+
+  private isCurrentSchemaSnapshot(snapshot: TableSchemaSnapshot): boolean {
+    // A refresh advances the requested generation before replacing the committed
+    // snapshot. Check again in the caller after every await, never pairing that
+    // new generation with old columns while its metadata request is pending.
+    return (
+      snapshot === this.schemaSnapshot &&
+      snapshot.generation === this.schemaRefreshGeneration &&
+      this.schemaRefreshError === null
+    );
+  }
+
+  private async postSchemaConflict(
+    operationId: string,
+    kind: TableMutationPreviewPayload["kind"],
+  ): Promise<void> {
+    await this.postMessage(
+      kind === "applyChanges"
+        ? "applyResult"
+        : kind === "deleteRows"
+          ? "deleteResult"
+          : "insertResult",
+      {
+        operationId,
+        success: false,
+        error:
+          "Schema metadata changed. The previous mutation preview cannot be applied; pending work is retained. Review the schema conflict before retrying.",
+      },
+    );
   }
 
   private isConnectionReadOnly(): boolean {
@@ -224,6 +307,7 @@ export class TablePanel {
     sort: SortConfig | null,
   ): string {
     return JSON.stringify({
+      schemaGeneration: this.schemaRefreshGeneration,
       page,
       pageSize,
       sort,
@@ -370,17 +454,27 @@ export class TablePanel {
     }
   }
 
-  private postTableInit(columns: ColumnTypeMeta[]): void {
-    this.cachedColumns = columns;
+  private postTableInit(
+    columns: ColumnTypeMeta[],
+    intent: TableInitPayload["intent"] = "initialize",
+  ): void {
+    const snapshotColumns = structuredClone(columns);
+    this.schemaSnapshot = {
+      generation: this.schemaRefreshGeneration,
+      columns: snapshotColumns,
+      signature: JSON.stringify(snapshotColumns),
+    };
     const primaryKeyColumns = columns
       .filter((column) => column.isPrimaryKey)
       .map((column) => column.name);
-    void this.postMessage("tableInit", {
+    const payload: TableInitPayload = {
+      intent,
       columns,
       primaryKeyColumns,
       isView: this.isView,
       connectionReadOnly: this.isConnectionReadOnly(),
-    });
+    };
+    void this.postMessage("tableInit", payload);
   }
 
   private async _handleFetchPage(
@@ -399,6 +493,7 @@ export class TablePanel {
     const filters = coerceFilterExpressions(raw.filters);
     const sort = raw.sort ?? null;
     try {
+      await this.awaitSchemaRefresh();
       const normalizedFilters = filters as FilterExpression[];
       const normalizedSort = sort as SortConfig | null;
       const requestKey = this.buildPageRequestKey(
@@ -430,6 +525,7 @@ export class TablePanel {
       this.postMessage("tableData", {
         fetchId,
         rows: result.rows,
+        mongoIdTypes: result.mongoIdTypes,
         totalCount: result.totalCount,
         executionTimeMs: result.executionTimeMs,
       });
@@ -454,6 +550,11 @@ export class TablePanel {
   }): Promise<void> {
     const { operationId, updates, insertValues } = payload;
     try {
+      const snapshot = await this.awaitSchemaRefresh();
+      if (!this.isCurrentSchemaSnapshot(snapshot)) {
+        await this.postSchemaConflict(operationId, "applyChanges");
+        return;
+      }
       const prepared = prepareApplyChangesPlan(
         this.connectionManager,
         this.connectionId,
@@ -461,10 +562,11 @@ export class TablePanel {
         this.schema,
         this.table,
         updates ?? [],
-        this.cachedColumns,
+        snapshot.columns,
       );
       const driver = this.connectionManager.getDriver(this.connectionId);
-      const previewBuilder = driver?.buildMutationPreviewStatements;
+      const previewBuilder =
+        driver?.buildMutationPreviewStatements?.bind(driver);
       const applyPlan =
         prepared.executable && previewBuilder
           ? {
@@ -512,6 +614,10 @@ export class TablePanel {
           : [];
 
       const insertCount = insertPlans?.length ?? 0;
+      if (!this.isCurrentSchemaSnapshot(snapshot)) {
+        await this.postSchemaConflict(operationId, "applyChanges");
+        return;
+      }
       const mutationStatementCount =
         insertCount +
         (prepared.executable
@@ -551,6 +657,7 @@ export class TablePanel {
           applyResultWhenEmpty: prepared.executable ? null : prepared.result,
           inserts: insertPlans,
         }),
+        snapshot,
       );
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
@@ -568,6 +675,11 @@ export class TablePanel {
   }): Promise<void> {
     const { operationId, values = {} } = payload;
     try {
+      const snapshot = await this.awaitSchemaRefresh();
+      if (!this.isCurrentSchemaSnapshot(snapshot)) {
+        await this.postSchemaConflict(operationId, "insertRow");
+        return;
+      }
       const plan = await this.svc.prepareInsertRow(
         this.connectionId,
         this.database,
@@ -577,6 +689,7 @@ export class TablePanel {
       );
       await this.presentOrExecuteMutationPreview(
         this.previewController.createInsertPreview(operationId, plan),
+        snapshot,
       );
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
@@ -593,7 +706,13 @@ export class TablePanel {
     primaryKeysList?: Array<Record<string, unknown>>;
   }): Promise<void> {
     const { operationId, primaryKeysList = [] } = payload;
+    let executionPossible = false;
     try {
+      const snapshot = await this.awaitSchemaRefresh();
+      if (!this.isCurrentSchemaSnapshot(snapshot)) {
+        await this.postSchemaConflict(operationId, "deleteRows");
+        return;
+      }
       const plan = await this.svc.prepareDeleteRowsPlan(
         this.connectionId,
         this.database,
@@ -602,20 +721,34 @@ export class TablePanel {
         primaryKeysList,
       );
 
+      if (!this.isCurrentSchemaSnapshot(snapshot)) {
+        await this.postSchemaConflict(operationId, "deleteRows");
+        return;
+      }
       if (!plan) {
-        this.postMessage("deleteResult", { operationId, success: true });
+        this.postMessage("deleteResult", {
+          operationId,
+          ...buildDeleteResult([], { affectedRows: 0 }),
+        });
         return;
       }
 
+      executionPossible = true;
       await this.presentOrExecuteMutationPreview(
         this.previewController.createDeleteRowsPreview(operationId, plan),
+        snapshot,
       );
     } catch (err: unknown) {
       const error = normalizeUnknownError(err);
       this.postMessage("deleteResult", {
         operationId,
-        success: false,
-        error: error.message,
+        ...(executionPossible
+          ? buildDeleteResult(
+              primaryKeysList,
+              { affectedRows: 0 },
+              error.message,
+            )
+          : unattemptedDeleteResult(primaryKeysList, error.message)),
       });
     }
   }
@@ -720,7 +853,7 @@ export class TablePanel {
     columns: ColumnTypeMeta[];
     rows: Record<string, unknown>[];
   }> {
-    if (signal.aborted) return;
+    signal.throwIfAborted();
     const result = await this.svc.getPage(
       this.connectionId,
       this.database,
@@ -731,8 +864,9 @@ export class TablePanel {
       filters,
       sort,
       true,
+      signal,
     );
-    if (signal.aborted) return;
+    signal.throwIfAborted();
     yield { columns: result.columns, rows: result.rows };
   }
 
@@ -740,6 +874,29 @@ export class TablePanel {
     operationId: string;
     previewToken: string;
   }): Promise<void> {
+    const schema = this.previewSchemas.get(payload.previewToken);
+    if (!schema || schema.operationId !== payload.operationId) return;
+    let currentSnapshot: TableSchemaSnapshot;
+    // Refresh errors are reported as a mutation result with the original ID.
+    try {
+      currentSnapshot = await this.awaitSchemaRefresh();
+    } catch {
+      this.previewSchemas.delete(payload.previewToken);
+      this.previewController.cancel(payload.previewToken, payload.operationId);
+      await this.postSchemaConflict(payload.operationId, schema.kind);
+      return;
+    }
+    if (
+      !this.isCurrentSchemaSnapshot(currentSnapshot) ||
+      schema.snapshot.signature !== currentSnapshot.signature
+    ) {
+      this.previewSchemas.delete(payload.previewToken);
+      this.previewController.cancel(payload.previewToken, payload.operationId);
+      await this.postSchemaConflict(payload.operationId, schema.kind);
+      return;
+    }
+    this.previewSchemas.delete(payload.previewToken);
+    // No await between the final current-snapshot check and starting execution.
     const result = await this.previewController.confirm(
       payload.previewToken,
       payload.operationId,
@@ -755,6 +912,11 @@ export class TablePanel {
     operationId: string;
     previewToken: string;
   }): void {
+    if (
+      this.previewSchemas.get(payload.previewToken)?.operationId ===
+      payload.operationId
+    )
+      this.previewSchemas.delete(payload.previewToken);
     this.previewController.cancel(payload.previewToken, payload.operationId);
   }
 
@@ -771,6 +933,9 @@ export class TablePanel {
         table: this.table,
         isView: this.isView,
         connectionReadOnly: this.isConnectionReadOnly(),
+        mongoRowIdentity:
+          this.connectionManager.getConnection(this.connectionId)?.type ===
+          "mongodb",
         defaultPageSize: this.connectionManager.getDefaultPageSize(),
         panelRetentionMode: TABLE_PANEL_RETENTION_MODE,
       },

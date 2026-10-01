@@ -5,6 +5,7 @@ import {
   type FilterDraftMap,
   formatColumnDetailDescription,
   formatPrimaryKeyRoleLabel,
+  NULL_SENTINEL,
 } from "../../../shared/tableTypes";
 import type { ApplyResultPayload } from "../../../shared/webviewContracts";
 import type {
@@ -128,7 +129,10 @@ export function buildInsertValues(
   return Object.fromEntries(
     Object.entries(draft)
       .filter(([, cell]) => cell.value !== INSERT_DEFAULT_SENTINEL)
-      .map(([columnName, cell]) => [columnName, cell.value]),
+      .map(([columnName, cell]) => [
+        columnName,
+        cell.value === NULL_SENTINEL ? null : cell.value,
+      ]),
   );
 }
 
@@ -156,11 +160,52 @@ export function stablePrimaryKeyPart(value: unknown): unknown {
   return value;
 }
 
+export function rowMutationBlockReason(
+  row: Row | undefined,
+  primaryKeyColumns: readonly string[],
+  mongoIdType?: "objectId" | "string" | null,
+  mongoRowIdentity = mongoIdType !== undefined,
+): string | null {
+  if (!row || primaryKeyColumns.length === 0) {
+    return "This row cannot be edited or deleted: a complete primary key is required.";
+  }
+  for (const name of primaryKeyColumns) {
+    if (
+      !Object.hasOwn(row, name) ||
+      row[name] === null ||
+      row[name] === undefined
+    ) {
+      return `This row cannot be edited or deleted: primary key ${name} is NULL or missing, so the row cannot be targeted safely.`;
+    }
+    if (name === "_id" && mongoRowIdentity) {
+      const value = row[name];
+      if (
+        typeof value !== "string" ||
+        (mongoIdType !== "string" &&
+          (mongoIdType !== "objectId" || !/^[0-9a-f]{24}$/i.test(value)))
+      ) {
+        return "This row cannot be edited or deleted: its MongoDB _id type is not supported safely.";
+      }
+    }
+  }
+  return null;
+}
+
 export function rowPrimaryKeySignature(
   row: Row | undefined,
   primaryKeyColumns: readonly string[],
+  mongoIdType?: "objectId" | "string" | null,
+  mongoRowIdentity = mongoIdType !== undefined,
 ): string | null {
-  if (!row || primaryKeyColumns.length === 0) {
+  if (
+    !row ||
+    rowMutationBlockReason(
+      row,
+      primaryKeyColumns,
+      mongoIdType,
+      mongoRowIdentity,
+    )
+  ) {
     return null;
   }
 
@@ -173,6 +218,10 @@ export function rowPrimaryKeySignature(
     keyEntries.push([columnName, stablePrimaryKeyPart(row[columnName])]);
   }
 
+  if (primaryKeyColumns.includes("_id") && mongoIdType !== undefined) {
+    keyEntries.push(["$rapidbMongoIdType", mongoIdType]);
+  }
+
   return JSON.stringify(keyEntries);
 }
 
@@ -180,11 +229,18 @@ export function buildPendingRestoreState(
   pendingEdits: PendingEdits,
   rows: readonly Row[],
   primaryKeyColumns: readonly string[],
+  mongoIdTypes: readonly ("objectId" | "string" | null)[] = [],
+  mongoRowIdentity = false,
 ): PendingRestoreState {
   const restoreState: PendingRestoreState = new Map();
 
   for (const [rowIdx, columnMap] of pendingEdits.entries()) {
-    const signature = rowPrimaryKeySignature(rows[rowIdx], primaryKeyColumns);
+    const signature = rowPrimaryKeySignature(
+      rows[rowIdx],
+      primaryKeyColumns,
+      mongoIdTypes[rowIdx],
+      mongoRowIdentity || mongoIdTypes[rowIdx] !== undefined,
+    );
     if (!signature) {
       continue;
     }
@@ -199,6 +255,8 @@ export function restorePendingEdits(
   restoreState: PendingRestoreState | null,
   rows: readonly Row[],
   primaryKeyColumns: readonly string[],
+  mongoIdTypes: readonly ("objectId" | "string" | null)[] = [],
+  mongoRowIdentity = false,
 ): PendingEdits {
   if (!restoreState || restoreState.size === 0) {
     return new Map();
@@ -207,7 +265,12 @@ export function restorePendingEdits(
   const restored: PendingEdits = new Map();
 
   rows.forEach((row, rowIdx) => {
-    const signature = rowPrimaryKeySignature(row, primaryKeyColumns);
+    const signature = rowPrimaryKeySignature(
+      row,
+      primaryKeyColumns,
+      mongoIdTypes[rowIdx],
+      mongoRowIdentity || mongoIdTypes[rowIdx] !== undefined,
+    );
     if (!signature) {
       return;
     }

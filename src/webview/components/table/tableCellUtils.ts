@@ -4,6 +4,7 @@ import {
   type FilterDraftMap,
   formatColumnDetailDescription,
   formatPrimaryKeyRoleLabel,
+  NULL_SENTINEL,
 } from "../../../shared/tableTypes";
 import type { ApplyResultPayload } from "../../../shared/webviewContracts";
 import type { InsertDraftRow, PendingEdits, Row } from "../../types";
@@ -75,7 +76,10 @@ export function buildInsertValues(
   return Object.fromEntries(
     Object.entries(draft)
       .filter(([, cell]) => cell.value !== INSERT_DEFAULT_SENTINEL)
-      .map(([columnName, cell]) => [columnName, cell.value]),
+      .map(([columnName, cell]) => [
+        columnName,
+        cell.value === NULL_SENTINEL ? null : cell.value,
+      ]),
   );
 }
 

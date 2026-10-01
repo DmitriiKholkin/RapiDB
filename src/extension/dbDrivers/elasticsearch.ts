@@ -13,6 +13,11 @@ import {
   formatDatetimeForDisplay,
   normalizeSqlDatetimeOffsetSpacing,
 } from "./BaseDBDriver";
+import { deleteRowsSequentially } from "./deleteOutcomes";
+import {
+  drainElasticsearchCleanup,
+  ElasticsearchPitSession,
+} from "./elasticsearchPitSession";
 import {
   applyFilters,
   applySort,
@@ -22,6 +27,10 @@ import {
   stringifyCommandPayload,
   unsupported,
 } from "./nosqlUtils";
+import {
+  type DriverTimeoutSettingsProvider,
+  getDefaultDriverTimeoutSettings,
+} from "./timeout";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -31,6 +40,8 @@ import type {
   DriverInsertRowRequest,
   DriverMutationResult,
   DriverOperationContext,
+  DriverTableExportChunk,
+  DriverTableExportRequest,
   DriverTablePageRequest,
   DriverTablePageResult,
   DriverUpdateRowsRequest,
@@ -78,8 +89,12 @@ interface ElasticsearchRestCommand {
 export class ElasticsearchDriver implements IDBDriver {
   private client: Client | null = null;
   private connected = false;
+  private readonly pitReaders = new Set<ElasticsearchPitSession>();
 
-  constructor(private readonly config: ConnectionConfig) {}
+  constructor(
+    private readonly config: ConnectionConfig,
+    private readonly timeoutSettingsProvider: DriverTimeoutSettingsProvider = getDefaultDriverTimeoutSettings,
+  ) {}
 
   async connect(): Promise<void> {
     if (this.connected) {
@@ -147,7 +162,17 @@ export class ElasticsearchDriver implements IDBDriver {
     const client = this.client;
     this.client = null;
     this.connected = false;
-    await client?.close();
+    // Logical cancellation does not depend on a stuck physical request. Drain
+    // cleanup briefly, then close the transport independently of that request.
+    await drainElasticsearchCleanup(
+      Promise.allSettled([...this.pitReaders].map((reader) => reader.close())),
+      100,
+    );
+    if (client)
+      await drainElasticsearchCleanup(
+        Promise.resolve().then(() => client.close()),
+        1000,
+      );
   }
 
   isConnected(): boolean {
@@ -931,6 +956,7 @@ export class ElasticsearchDriver implements IDBDriver {
   async readTablePage(
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
+    request.signal?.throwIfAborted();
     const startTime = performance.now();
     const columns = this.describeIndexColumnsSync();
     const columnMetaByName = new Map(
@@ -942,75 +968,308 @@ export class ElasticsearchDriver implements IDBDriver {
     if (canDelegateToServer) {
       const offset = Math.max(0, (request.page - 1) * request.pageSize);
       const size = this.clampSearchSize(request.pageSize);
-      const response = await this.requireClient().search({
-        index: request.table,
-        query: { match_all: {} },
-        sort: request.sort
-          ? [{ _id: { order: request.sort.direction } }]
-          : ["_doc"],
-        from: offset,
-        size,
-        ...(request.skipCount ? {} : { track_total_hits: true }),
-      } as never);
-      const rows = this.hitsToRows(
-        response.hits.hits as unknown as Array<Record<string, unknown>>,
-      ).map((row) =>
-        Object.fromEntries(
-          Object.entries(row).map(([columnName, value]) => {
-            const column = columnMetaByName.get(columnName);
-            return [
-              columnName,
-              column ? this.formatOutputValue(value, column) : value,
-            ];
-          }),
-        ),
-      );
+      const rows: Record<string, unknown>[] = [];
+      let totalCount = 0;
+      let seen = 0;
+      // A fresh snapshot per page request. Walk to arbitrary offsets using
+      // the same unique PIT order as export, without a result-window limit.
+      for await (const batch of this.readPitBatches(
+        request.table,
+        Math.min(size, 500),
+        !request.skipCount,
+        request.signal,
+        request.deadline ??
+          Date.now() + this.timeoutSettingsProvider().dbOperationTimeoutMs,
+      )) {
+        totalCount = batch.totalCount;
+        const start = Math.max(0, offset - seen);
+        rows.push(...batch.rows.slice(start, start + size - rows.length));
+        seen += batch.rows.length;
+        if (rows.length === size) break;
+      }
       return {
         columns,
         rows,
-        totalCount: request.skipCount
-          ? 0
-          : this.resolveElasticsearchTotalCount(response.hits.total),
+        totalCount,
         executionTimeMs: Math.round(performance.now() - startTime),
       };
     }
 
-    const response = await this.requireClient().search({
-      index: request.table,
-      query: { match_all: {} },
-      sort: ["_doc"],
-      size: ELASTICSEARCH_READ_BUDGET.hardCap,
-      track_total_hits: true,
-    } as never);
-    const rows = this.hitsToRows(
-      response.hits.hits as unknown as Array<Record<string, unknown>>,
+    const client = this.requireClient();
+    // Reuse the bounded read lifetime without opening a PIT: this path must
+    // still materialize the entire index in exactly one capped search.
+    const reader = new ElasticsearchPitSession(
+      client,
+      this.timeoutSettingsProvider().dbOperationTimeoutMs,
+      "readTablePage",
+      request.signal,
+      request.deadline ?? Infinity,
+      () => this.pitReaders.delete(reader),
     );
-    if (
-      this.resolveElasticsearchTotalCount(response.hits.total) > rows.length
-    ) {
-      throw new Error(
-        `Elasticsearch filtering or sorting exceeded the ${ELASTICSEARCH_READ_BUDGET.hardCap}-row safety limit. Narrow the filter before continuing or exporting.`,
-      );
+    this.pitReaders.add(reader);
+    try {
+      return await reader.advance(async () => {
+        const response = await reader.request((options) =>
+          client.search(
+            {
+              index: request.table,
+              query: { match_all: {} },
+              sort: ["_doc"],
+              size: ELASTICSEARCH_READ_BUDGET.hardCap,
+              track_total_hits: true,
+            },
+            { ...options, maxRetries: 0 },
+          ),
+        );
+        const rows = this.hitsToRows(response.hits.hits);
+        if (
+          this.resolveElasticsearchTotalCount(response.hits.total) > rows.length
+        ) {
+          throw new Error(
+            `Elasticsearch filtering or sorting requires reading the entire index and exceeded the ${ELASTICSEARCH_READ_BUDGET.hardCap}-row safety limit. Use an unfiltered, unsorted read or export.`,
+          );
+        }
+        const filtered = applyFilters(rows, request.filters, columns);
+        const sorted = applySort(filtered, request.sort, columns);
+        const paged = pageRows(sorted, request.page, request.pageSize).map(
+          (row) =>
+            Object.fromEntries(
+              Object.entries(row).map(([columnName, value]) => {
+                const column = columnMetaByName.get(columnName);
+                return [
+                  columnName,
+                  column ? this.formatOutputValue(value, column) : value,
+                ];
+              }),
+            ),
+        );
+        reader.check();
+        return {
+          columns,
+          rows: paged,
+          totalCount: request.skipCount ? 0 : sorted.length,
+          executionTimeMs: Math.round(performance.now() - startTime),
+        };
+      });
+    } finally {
+      // Logical cancellation must not wait for an uncooperative transport.
+      // The bounded drain removes the reader even if its search never settles.
+      if (reader.signal.aborted) void reader.close().catch(() => undefined);
+      else await reader.waitForClose();
     }
-    const filtered = applyFilters(rows, request.filters);
-    const sorted = applySort(filtered, request.sort);
-    const paged = pageRows(sorted, request.page, request.pageSize).map((row) =>
-      Object.fromEntries(
-        Object.entries(row).map(([columnName, value]) => {
-          const column = columnMetaByName.get(columnName);
-          return [
-            columnName,
-            column ? this.formatOutputValue(value, column) : value,
-          ];
-        }),
-      ),
+  }
+
+  async *exportTableChunks(
+    request: DriverTableExportRequest,
+    signal?: AbortSignal,
+  ): AsyncGenerator<DriverTableExportChunk> {
+    const columns = this.describeIndexColumnsSync();
+    for await (const batch of this.readPitBatches(
+      request.table,
+      request.chunkSize,
+      false,
+      signal,
+    )) {
+      yield { columns, rows: batch.rows };
+    }
+  }
+
+  private async *readPitBatches(
+    table: string,
+    requestedSize: number,
+    trackCount: boolean,
+    signal?: AbortSignal,
+    pageDeadline = Infinity,
+  ): AsyncGenerator<{ rows: Record<string, unknown>[]; totalCount: number }> {
+    signal?.throwIfAborted();
+    const client = this.requireClient();
+    const reader = new ElasticsearchPitSession(
+      client,
+      this.timeoutSettingsProvider().dbOperationTimeoutMs,
+      pageDeadline === Infinity ? "exportTableChunks" : "readTablePage",
+      signal,
+      pageDeadline,
+      () => this.pitReaders.delete(reader),
     );
-    return {
-      columns,
-      rows: paged,
-      totalCount: request.skipCount ? 0 : sorted.length,
-      executionTimeMs: Math.round(performance.now() - startTime),
-    };
+    this.pitReaders.add(reader);
+    let failed = false;
+    try {
+      let size = this.clampSearchSize(requestedSize);
+      let initialized = false;
+      let unknownWindow = false;
+      let cursor: number | undefined;
+      let totalCount = 0;
+      let first = true;
+      while (true) {
+        const response = await reader.advance(async () => {
+          if (!initialized) {
+            try {
+              const settings = await reader.request((options) =>
+                client.indices.getSettings(
+                  {
+                    index: table,
+                    name: "index.max_result_window",
+                    include_defaults: true,
+                  },
+                  options,
+                ),
+              );
+              for (const entry of Object.values(settings)) {
+                const window = Number(
+                  entry.settings?.index?.max_result_window ??
+                    entry.defaults?.index?.max_result_window ??
+                    ELASTICSEARCH_READ_BUDGET.hardCap,
+                );
+                if (!Number.isSafeInteger(window) || window < 1)
+                  throw new Error(
+                    "Invalid Elasticsearch max_result_window setting.",
+                  );
+                size = Math.min(size, window);
+              }
+            } catch (error) {
+              // PIT/search permission does not imply view_index_metadata.
+              // Only a metadata 403 permits adaptive window discovery.
+              if (this.elasticsearchStatus(error) !== 403) throw error;
+              unknownWindow = true;
+            }
+            await reader.request(
+              (options) =>
+                client.openPointInTime(
+                  {
+                    index: table,
+                    keep_alive: "1m",
+                    allow_partial_search_results: false,
+                  },
+                  options,
+                ),
+              (result) => reader.recordPitId(result.id),
+            );
+            initialized = true;
+          }
+          while (true) {
+            reader.check();
+            const pitId = reader.pitId;
+            if (!pitId)
+              throw new Error("Elasticsearch returned an invalid PIT ID.");
+            try {
+              return await reader.request(
+                (options) =>
+                  client.search(
+                    {
+                      pit: { id: pitId, keep_alive: "1m" },
+                      query: { match_all: {} },
+                      sort: [{ _shard_doc: "asc" }],
+                      size,
+                      search_after: cursor === undefined ? undefined : [cursor],
+                      track_total_hits: trackCount && first,
+                      allow_partial_search_results: false,
+                    },
+                    options,
+                  ),
+                (result) => {
+                  if (result.pit_id) reader.recordPitId(result.pit_id);
+                },
+              );
+            } catch (error) {
+              if (
+                !unknownWindow ||
+                size === 1 ||
+                !this.isResultWindowError(error)
+              )
+                throw error;
+              // Retry the same cursor; rejected window requests emit no rows.
+              size = Math.max(1, Math.floor(size / 2));
+            }
+          }
+        });
+        reader.check();
+        if (response.timed_out || (response._shards?.failed ?? 0) > 0) {
+          throw new Error(
+            "Elasticsearch PIT search returned incomplete results.",
+          );
+        }
+        if (first && trackCount) {
+          totalCount = this.resolveElasticsearchTotalCount(response.hits.total);
+        }
+        const hits = response.hits.hits;
+        // _shard_doc is unique and stable within this PIT. Validate every hit
+        // so malformed/repeated/backwards cursors fail closed, never dedup by _id.
+        for (const hit of hits) {
+          const next = hit.sort?.[0];
+          if (
+            hit.sort?.length !== 1 ||
+            typeof next !== "number" ||
+            !Number.isSafeInteger(next) ||
+            next < 0 ||
+            (cursor !== undefined && next <= cursor)
+          ) {
+            throw new Error(
+              "Elasticsearch PIT cursor is malformed or made no progress.",
+            );
+          }
+          cursor = next;
+        }
+        if (hits.length > size) {
+          throw new Error(
+            "Elasticsearch PIT search exceeded the requested batch size.",
+          );
+        }
+        if (hits.length > 0 || first) {
+          yield {
+            rows: this.hitsToRows(hits),
+            totalCount,
+          };
+          reader.check();
+        }
+        first = false;
+        if (hits.length < size) break;
+      }
+    } catch (error) {
+      failed = true;
+      throw error;
+    } finally {
+      const wasAborted = reader.signal.aborted;
+      // A cancellation/deadline must settle even if physical cleanup is stuck.
+      if (failed && wasAborted) void reader.close().catch(() => undefined);
+      else
+        await reader.waitForClose().catch((error: unknown) => {
+          // Preserve the primary failure; a successful export must surface a
+          // cleanup failure before it can replace the destination file.
+          if (!failed) throw error;
+        });
+    }
+  }
+
+  private elasticsearchStatus(error: unknown): number | undefined {
+    return (error as { meta?: { statusCode?: number } } | null)?.meta
+      ?.statusCode;
+  }
+
+  private isResultWindowError(error: unknown): boolean {
+    const detail = (
+      error as {
+        meta?: {
+          body?: {
+            error?: {
+              reason?: unknown;
+              root_cause?: Array<{ reason?: unknown }>;
+            };
+          };
+        };
+      } | null
+    )?.meta?.body?.error;
+    const reasons = [
+      detail?.reason,
+      ...(detail?.root_cause ?? []).map((cause) => cause.reason),
+    ];
+    return (
+      this.elasticsearchStatus(error) === 400 &&
+      reasons.some(
+        (reason) =>
+          typeof reason === "string" &&
+          /result window is too large/i.test(reason),
+      )
+    );
   }
 
   private resolveElasticsearchTotalCount(totalHits: unknown): number {
@@ -1130,24 +1389,41 @@ export class ElasticsearchDriver implements IDBDriver {
     request: DriverDeleteRowsRequest,
     context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
-    let affectedRows = 0;
-    for (const entry of request.primaryKeyValuesList) {
-      context?.signal.throwIfAborted();
-      const id = entry._id;
-      if (typeof id !== "string" && typeof id !== "number") {
-        continue;
-      }
-      await this.requireClient().delete(
-        {
-          index: request.table,
-          id: String(id),
-          refresh: "wait_for",
-        },
-        context ? { signal: context.signal } : undefined,
-      );
-      affectedRows += 1;
-    }
-    return { affectedRows };
+    return deleteRowsSequentially(
+      request.primaryKeyValuesList,
+      context,
+      (entry) => {
+        const id = entry._id;
+        if (typeof id !== "string" && typeof id !== "number") {
+          throw new Error("Elasticsearch delete requires an _id.");
+        }
+        const client = this.requireClient();
+        return async () => {
+          try {
+            const result = await client.delete(
+              {
+                index: request.table,
+                id: String(id),
+                refresh: "wait_for",
+              },
+              context ? { signal: context.signal } : undefined,
+            );
+            return result.result === "deleted"
+              ? "deleted"
+              : result.result === "not_found"
+                ? "notfound"
+                : "unknown";
+          } catch (error) {
+            // A 404 is only row evidence when ES returned an explicit not_found
+            // document result (an absent index or proxy 404 is not sufficient).
+            const body = (error as { meta?: { body?: { result?: string } } })
+              ?.meta?.body;
+            if (body?.result === "not_found") return "notfound";
+            throw error;
+          }
+        };
+      },
+    );
   }
 
   async buildMutationPreviewStatements(
@@ -1261,6 +1537,12 @@ export class ElasticsearchDriver implements IDBDriver {
   }
 
   async runTransaction(operations: TransactionOperation[]): Promise<void> {
+    // Elasticsearch has no transactions; sequential requests are not atomic.
+    if (operations.length > 1) {
+      throw new Error(
+        "[RapiDB] Elasticsearch driver does not support atomic multi-operation transactions. Apply one row at a time.",
+      );
+    }
     for (const operation of operations) {
       await this.query(operation.sql, operation.params);
     }
@@ -1522,7 +1804,7 @@ export class ElasticsearchDriver implements IDBDriver {
   }
 
   private hitsToRows(
-    hits: Array<Record<string, unknown>>,
+    hits: ReadonlyArray<{ _id?: unknown; _source?: unknown }>,
   ): Record<string, unknown>[] {
     return hits.map((hit) => {
       const source = this.normalizeSourceDocument(hit._source);

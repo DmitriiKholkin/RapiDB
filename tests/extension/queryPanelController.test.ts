@@ -855,6 +855,59 @@ describe("QueryPanelController", () => {
     );
   });
 
+  it("treats MySQL executable comments as schema-changing only for MySQL", async () => {
+    async function runWithConnectionType(type: string) {
+      const query = vi.fn(async () => ({
+        columns: ["id"],
+        rows: [{ id: 1 }],
+        columnMeta: [],
+        rowCount: 1,
+        executionTimeMs: 2,
+      }));
+      const connectionManager = {
+        getConnection: vi.fn(() => ({
+          id: "active",
+          name: "Primary",
+          type,
+        })),
+        isConnected: vi.fn(() => true),
+        connectTo: vi.fn(async () => undefined),
+        addToHistory: vi.fn(async () => undefined),
+        addBookmark: vi.fn(async () => undefined),
+        getDriver: vi.fn(() => ({ query })),
+        getDriverCapabilities: vi.fn(() => ({ boundedQueryResults: true })),
+        getQueryRowLimit: vi.fn(() => 50_000),
+        getSchemaAsync: vi.fn(async () => []),
+        refreshSchemaCache: vi.fn(),
+      };
+      const view = {
+        getActiveConnectionId: vi.fn(() => "active"),
+        getInitialConnectionId: vi.fn(() => "initial"),
+        getLastQueryResult: vi.fn(() => null),
+        postMessage: vi.fn(),
+        setActiveConnectionId: vi.fn(),
+        setLastQueryResult: vi.fn(),
+        syncTitle: vi.fn(),
+      };
+      const { QueryPanelController } = await import(
+        "../../src/extension/panels/queryPanelController"
+      );
+      await new QueryPanelController(
+        connectionManager as never,
+        view,
+      ).handleMessage({
+        type: "executeQuery",
+        // Bounded drivers skip the hard-cap rewrite, so the executable
+        // comment reaches mayChangeDatabaseSchema verbatim.
+        payload: { queryText: "SELECT 1 /*!50000 SELECT 1 */" },
+      });
+      return connectionManager.refreshSchemaCache;
+    }
+
+    expect(await runWithConnectionType("mysql")).toHaveBeenCalledTimes(1);
+    expect(await runWithConnectionType("pg")).not.toHaveBeenCalled();
+  });
+
   it("pushes merged cached schema only for the active or initial connection when schema loads", async () => {
     const getSchema = vi.fn((connectionId: string) => [
       {
@@ -1327,7 +1380,6 @@ describe("QueryPanelController", () => {
 
   it("actively cancels in-flight query execution when superseded", async () => {
     let resolveFirstQuery: ((value: unknown) => void) | undefined;
-    const cancelCurrentOperation = vi.fn(async () => undefined);
     const query = vi
       .fn()
       .mockImplementationOnce(
@@ -1343,6 +1395,14 @@ describe("QueryPanelController", () => {
         rowCount: 1,
         executionTimeMs: 1,
       }));
+    const driver = {
+      query,
+      cancelledTokens: [] as number[],
+      async cancelCurrentOperation(context?: { requestToken?: number }) {
+        this.cancelledTokens.push(context?.requestToken ?? -1);
+      },
+    };
+    const cancelCurrentOperation = vi.spyOn(driver, "cancelCurrentOperation");
 
     const connectionManager = {
       getConnection: vi.fn(() => ({
@@ -1356,7 +1416,7 @@ describe("QueryPanelController", () => {
       connectTo: vi.fn(async () => undefined),
       addToHistory: vi.fn(async () => undefined),
       addBookmark: vi.fn(async () => undefined),
-      getDriver: vi.fn(() => ({ query, cancelCurrentOperation })),
+      getDriver: vi.fn(() => driver),
       getQueryRowLimit: vi.fn(() => 100),
       getSchemaAsync: vi.fn(async () => []),
     };
@@ -1402,6 +1462,7 @@ describe("QueryPanelController", () => {
     await Promise.all([first, second]);
 
     expect(cancelCurrentOperation).toHaveBeenCalledTimes(1);
+    expect(driver.cancelledTokens).toEqual([1]);
     expect(cancelCurrentOperation).toHaveBeenCalledWith(
       expect.objectContaining({
         reason: "superseded",
@@ -1811,13 +1872,20 @@ describe("QueryPanelController", () => {
   it("cancels and invalidates the owned query on connection switch and disposal", async () => {
     let activeConnectionId = "conn-1";
     let resolveQuery: ((value: unknown) => void) | undefined;
-    const cancelCurrentOperation = vi.fn(async () => undefined);
     const query = vi.fn(
       () =>
         new Promise((resolve) => {
           resolveQuery = resolve;
         }),
     );
+    const driver = {
+      query,
+      cancellationReasons: [] as string[],
+      async cancelCurrentOperation(context?: { reason?: string }) {
+        this.cancellationReasons.push(context?.reason ?? "unknown");
+      },
+    };
+    const cancelCurrentOperation = vi.spyOn(driver, "cancelCurrentOperation");
     const connectionManager = {
       getConnection: vi.fn((id: string) => ({
         id,
@@ -1827,7 +1895,7 @@ describe("QueryPanelController", () => {
       })),
       getDriverCapabilities: vi.fn(() => ({})),
       isConnected: vi.fn(() => true),
-      getDriver: vi.fn(() => ({ query, cancelCurrentOperation })),
+      getDriver: vi.fn(() => driver),
       getQueryRowLimit: vi.fn(() => 100),
       addToHistory: vi.fn(async () => undefined),
       getSchemaAsync: vi.fn(async () => []),
@@ -1893,6 +1961,10 @@ describe("QueryPanelController", () => {
         connectionId: "conn-2",
       }),
     );
+    expect(driver.cancellationReasons).toEqual([
+      "superseded",
+      "lifecycle_shutdown",
+    ]);
     resolveQuery?.({ columns: [], rows: [], rowCount: 0, executionTimeMs: 1 });
     await second;
   });

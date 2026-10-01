@@ -5,7 +5,7 @@ import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
 import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
 import { OracleDriver } from "../../src/extension/dbDrivers/oracle";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
-import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
+import { SQLiteCoreDriver as SQLiteDriver } from "../../src/extension/dbDrivers/sqliteCore";
 import { createTimeoutAwareDriver } from "../../src/extension/dbDrivers/timeout";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import { prepareApplyChangesPlan } from "../../src/extension/table/tableMutationExecution";
@@ -258,7 +258,9 @@ describe("review mutation regressions", () => {
       "rows",
       [
         {
-          primaryKeys: { _id: "key" },
+          primaryKeys: {
+            _id: { $rapidbMongoId: { type: "string", value: "key" } },
+          },
           changes: { value: "new" },
           originalValues: { value: original },
         },
@@ -269,6 +271,7 @@ describe("review mutation regressions", () => {
       ],
     );
     if (!prepared.executable) throw new Error("Expected executable plan");
+    expect(prepared.plan.updates[0].primaryKeys).toEqual({ _id: "key" });
     expect(prepared.plan.updates[0].originalValues).toEqual({
       value: original,
     });

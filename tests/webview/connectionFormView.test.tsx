@@ -295,6 +295,22 @@ describe("ConnectionFormView", () => {
     );
   });
 
+  it("explains why read-only SQL Server connections cannot run queries", async () => {
+    const user = userEvent.setup();
+    render(<ConnectionFormView existing={null} />);
+
+    await user.click(screen.getByRole("button", { name: /sql server/i }));
+
+    const toggle = screen.getByRole("switch", {
+      name: /open connection as read-only/i,
+    });
+    const hint = screen.getByText(/blocks table edits and query execution/i);
+    expect(toggle.getAttribute("aria-describedby")).toBe(
+      hint.getAttribute("id"),
+    );
+    expect(hint.textContent).toContain("database read-only login");
+  });
+
   it("posts modern NoSQL root fields in save payloads", async () => {
     const user = userEvent.setup();
 

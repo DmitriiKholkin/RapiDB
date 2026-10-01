@@ -11,6 +11,7 @@ export interface UndoRedoHistory {
   canUndo: boolean;
   canRedo: boolean;
   clear: () => void;
+  remap: (transform: (snapshot: MutationSnapshot) => MutationSnapshot) => void;
 }
 
 export function useUndoRedoHistory(): UndoRedoHistory {
@@ -67,5 +68,13 @@ export function useUndoRedoHistory(): UndoRedoHistory {
     setCanRedo(false);
   }, []);
 
-  return { push, undo, redo, canUndo, canRedo, clear };
+  const remap = useCallback(
+    (transform: (snapshot: MutationSnapshot) => MutationSnapshot) => {
+      pastRef.current = pastRef.current.map(transform);
+      futureRef.current = futureRef.current.map(transform);
+    },
+    [],
+  );
+
+  return { push, undo, redo, canUndo, canRedo, clear, remap };
 }

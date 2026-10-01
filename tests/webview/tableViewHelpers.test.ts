@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
+import { NULL_SENTINEL } from "../../src/shared/tableTypes";
+import { buildInsertValues as buildCellInsertValues } from "../../src/webview/components/table/tableCellUtils";
 import {
   applyUndoRedoSnapshot,
   buildInsertValues,
+  buildPendingRestoreState,
   buildUndoRedoSnapshot,
   INSERT_DEFAULT_SENTINEL,
+  restorePendingEdits,
 } from "../../src/webview/components/table/tableViewHelpers";
 import type {
   EditTarget,
@@ -31,6 +35,34 @@ function row(col: string, value: unknown): InsertDraftRow {
 function rows(...cols: Array<[string, unknown]>): InsertDraftRow[] {
   return cols.map(([c, v]) => row(c, v));
 }
+
+describe("MongoDB pending edit restoration", () => {
+  it("keeps edits on the BSON-typed row when string and ObjectId keys look identical", () => {
+    const id = "507f1f77bcf86cd799439011";
+    const before = [
+      { _id: id, name: "object" },
+      { _id: id, name: "string" },
+    ];
+    const state = buildPendingRestoreState(
+      pendingEditsFrom([[0, { name: "edited" }]]),
+      before,
+      ["_id"],
+      ["objectId", "string"],
+    );
+    const restored = restorePendingEdits(
+      state,
+      [before[1], before[0]],
+      ["_id"],
+      ["string", "objectId"],
+    );
+    expect(
+      [...restored.entries()].map(([index, changes]) => [
+        index,
+        changes.get("name"),
+      ]),
+    ).toEqual([[1, "edited"]]);
+  });
+});
 
 /* ------------------------------------------------------------------ */
 /*  buildUndoRedoSnapshot                                              */
@@ -257,6 +289,37 @@ describe("snapshot round-trip", () => {
 /* ------------------------------------------------------------------ */
 
 describe("buildInsertValues", () => {
+  it.each([
+    buildInsertValues,
+    buildCellInsertValues,
+  ])("serializes explicit NULL without changing draft state or other values", (serialize) => {
+    const structured = { nested: [NULL_SENTINEL, false, 0] };
+    const draft: InsertDraftRow = {
+      omitted: { value: INSERT_DEFAULT_SENTINEL },
+      explicitNull: { value: NULL_SENTINEL },
+      actualNull: { value: null },
+      empty: { value: "" },
+      literal: { value: "NULL" },
+      ttl: { value: "-1" },
+      structured: { value: structured },
+      bool: { value: false },
+      number: { value: 0 },
+    };
+    expect(serialize(draft)).toEqual({
+      explicitNull: null,
+      actualNull: null,
+      empty: "",
+      literal: "NULL",
+      ttl: "-1",
+      structured,
+      bool: false,
+      number: 0,
+    });
+    expect(draft.explicitNull.value).toBe(NULL_SENTINEL);
+    expect(serialize(draft).structured).toBe(structured);
+    expect(serialize({ omitted: draft.omitted })).toEqual({});
+  });
+
   it("builds a values object from a draft row", () => {
     const draft = row("name", "Bob");
     expect(buildInsertValues(draft)).toEqual({ name: "Bob" });

@@ -2,6 +2,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createElasticsearchHttpFixture } from "../support/elasticsearchHttpFixture";
+import {
+  createElasticsearchPitMock,
+  required,
+} from "../support/elasticsearchPitMock";
 
 type VscodeMockShape = {
   showSaveDialog: ReturnType<typeof vi.fn>;
@@ -274,5 +279,273 @@ describe("exportService", () => {
     expect(vscodeMock.showErrorMessage).toHaveBeenCalledWith(
       expect.stringContaining("replace failed"),
     );
+  });
+
+  it.each([
+    "csv",
+    "json",
+  ])("keeps the old %s file on a failed Elasticsearch cursor export", async (format) => {
+    fs.writeFileSync(outputPath, "old export\n");
+    const exporters = await import("../../src/extension/utils/exportService");
+    const { service, client, snapshots } = createElasticsearchPitMock(9, 3);
+    const realSearch = required(client.search.getMockImplementation());
+    client.search
+      .mockImplementationOnce(realSearch)
+      .mockRejectedValueOnce(new Error("cursor fetch failed"));
+    const exporter =
+      format === "csv"
+        ? exporters.exportTableDataAsCsv
+        : exporters.exportTableDataAsJson;
+    await exporter({
+      fileName: "records",
+      loadChunks: (signal) =>
+        service.exportAll(
+          "es-pit",
+          "default",
+          "indices",
+          "records",
+          500,
+          null,
+          [],
+          signal,
+        ),
+    });
+    expect(fs.readFileSync(outputPath, "utf8")).toBe("old export\n");
+    expect(fs.readdirSync(tempDir)).toEqual(["export.out"]);
+    expect(snapshots.size).toBe(0);
+    expect(vscodeMock.showInformationMessage).not.toHaveBeenCalled();
+    expect(vscodeMock.showErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("cursor fetch failed"),
+    );
+  });
+
+  it("keeps the old file if Elasticsearch PIT close fails after all rows were written", async () => {
+    fs.writeFileSync(outputPath, "old export\n");
+    const { exportTableDataAsJson } = await import(
+      "../../src/extension/utils/exportService"
+    );
+    const { service, client } = createElasticsearchPitMock(9, 3);
+    client.closePointInTime.mockRejectedValueOnce(
+      new Error("PIT close failed"),
+    );
+    await exportTableDataAsJson({
+      fileName: "records",
+      loadChunks: (signal) =>
+        service.exportAll(
+          "es-pit",
+          "default",
+          "indices",
+          "records",
+          500,
+          null,
+          [],
+          signal,
+        ),
+    });
+    expect(fs.readFileSync(outputPath, "utf8")).toBe("old export\n");
+    expect(fs.readdirSync(tempDir)).toEqual(["export.out"]);
+    expect(vscodeMock.showInformationMessage).not.toHaveBeenCalled();
+    expect(vscodeMock.showErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("PIT close failed"),
+    );
+  });
+
+  it("cancels Elasticsearch mid-fetch, closes PIT and retains the old file", async () => {
+    fs.writeFileSync(outputPath, "old export\n");
+    let cancel!: () => void;
+    vscodeMock.withProgress.mockImplementation(async (_options, task) =>
+      task(
+        {},
+        {
+          onCancellationRequested: (listener: () => void) => {
+            cancel = listener;
+            return { dispose: vi.fn() };
+          },
+        },
+      ),
+    );
+    const { exportTableDataAsCsv } = await import(
+      "../../src/extension/utils/exportService"
+    );
+    const { service, client, snapshots } = createElasticsearchPitMock(9, 3);
+    const realSearch = required(client.search.getMockImplementation());
+    client.search
+      .mockImplementationOnce(realSearch)
+      .mockImplementationOnce(async (_request, options) => {
+        cancel();
+        options?.signal?.throwIfAborted();
+        throw new Error("Expected cancellation");
+      });
+    await exportTableDataAsCsv({
+      fileName: "records",
+      loadChunks: (signal) =>
+        service.exportAll(
+          "es-pit",
+          "default",
+          "indices",
+          "records",
+          500,
+          null,
+          [],
+          signal,
+        ),
+    });
+    expect(fs.readFileSync(outputPath, "utf8")).toBe("old export\n");
+    expect(fs.readdirSync(tempDir)).toEqual(["export.out"]);
+    expect(snapshots.size).toBe(0);
+    expect(vscodeMock.showInformationMessage).not.toHaveBeenCalled();
+    expect(vscodeMock.showErrorMessage).not.toHaveBeenCalled();
+  });
+
+  it("silently cancels a real SDK HTTP RequestAbortedError and preserves the old export", async () => {
+    fs.writeFileSync(outputPath, "old export\n");
+    let cancel: (() => void) | undefined;
+    vscodeMock.withProgress.mockImplementation(async (_options, task) =>
+      task(
+        {},
+        {
+          onCancellationRequested: (listener: () => void) => {
+            cancel = listener;
+            return { dispose: vi.fn() };
+          },
+        },
+      ),
+    );
+    const { exportTableDataAsCsv } = await import(
+      "../../src/extension/utils/exportService"
+    );
+    const fixture = await createElasticsearchHttpFixture({ stallSearch: true });
+    let sdkErrorName: string | undefined;
+    try {
+      const exporting = exportTableDataAsCsv({
+        fileName: "records",
+        loadChunks: async function* (signal) {
+          yield {
+            columns: [{ name: "_id", category: "text", nativeType: "text" }],
+            rows: [{ _id: "one" }],
+          };
+          try {
+            // Let the actual SDK error reach exportService's signal-based
+            // normalization, rather than replacing it with a mock AbortError.
+            await fixture.client.search(
+              { query: { match_all: {} } },
+              { signal, requestTimeout: 1000 },
+            );
+          } catch (error) {
+            sdkErrorName = error instanceof Error ? error.name : undefined;
+            throw error;
+          }
+        },
+      });
+      await fixture.searchStarted.promise;
+      required(cancel)();
+      await exporting;
+      expect(sdkErrorName).toBe("RequestAbortedError");
+      expect(fs.readFileSync(outputPath, "utf8")).toBe("old export\n");
+      expect(fs.readdirSync(tempDir)).toEqual(["export.out"]);
+      expect(vscodeMock.showInformationMessage).not.toHaveBeenCalled();
+      expect(vscodeMock.showErrorMessage).not.toHaveBeenCalled();
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it.each(
+    (["sorted", "filtered"] as const).flatMap((mode) =>
+      (["page-only", "full"] as const).flatMap((scope) =>
+        (["abort", "deadline"] as const).map((reason) => ({
+          mode,
+          scope,
+          reason,
+        })),
+      ),
+    ),
+  )("retains the old file for a real HTTP $mode $scope export on $reason", async ({
+    mode,
+    scope,
+    reason,
+  }) => {
+    fs.writeFileSync(outputPath, "old export\n");
+    let cancel: (() => void) | undefined;
+    vscodeMock.withProgress.mockImplementation(async (_options, task) =>
+      task(
+        {},
+        {
+          onCancellationRequested: (listener: () => void) => {
+            cancel = listener;
+            return { dispose: vi.fn() };
+          },
+        },
+      ),
+    );
+    const exporters = await import("../../src/extension/utils/exportService");
+    const fixture = await createElasticsearchHttpFixture({
+      stallSearch: true,
+      window: 10000,
+    });
+    const sort =
+      mode === "sorted" ? { column: "_id", direction: "asc" as const } : null;
+    const filters =
+      mode === "filtered"
+        ? [{ column: "_id", operator: "like" as const, value: "%doc%" }]
+        : [];
+    const exporter =
+      mode === "sorted"
+        ? exporters.exportTableDataAsCsv
+        : exporters.exportTableDataAsJson;
+    try {
+      const exporting = exporter({
+        fileName: "records",
+        loadChunks: (signal) =>
+          scope === "full"
+            ? fixture.service.exportAll(
+                "es-http",
+                "default",
+                "indices",
+                "records",
+                500,
+                sort,
+                filters,
+                signal,
+              )
+            : (async function* () {
+                const page = await fixture.service.getPage(
+                  "es-http",
+                  "default",
+                  "indices",
+                  "records",
+                  1,
+                  25,
+                  filters,
+                  sort,
+                  true,
+                  signal,
+                );
+                signal.throwIfAborted();
+                yield { columns: page.columns, rows: page.rows };
+              })(),
+      });
+      await fixture.searchStarted.promise;
+      if (reason === "abort") required(cancel)();
+      await exporting;
+      await vi.waitFor(() => {
+        expect(fixture.pendingSearches.size).toBe(0);
+        expect(fixture.activeReaders).toBe(0);
+      });
+      expect(fs.readFileSync(outputPath, "utf8")).toBe("old export\n");
+      expect(fs.readdirSync(tempDir)).toEqual(["export.out"]);
+      expect(vscodeMock.showInformationMessage).not.toHaveBeenCalled();
+      if (reason === "abort")
+        expect(vscodeMock.showErrorMessage).not.toHaveBeenCalled();
+      else
+        expect(vscodeMock.showErrorMessage).toHaveBeenCalledWith(
+          expect.stringContaining("timed out"),
+        );
+      expect(fixture.searches).toHaveLength(1);
+      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.pits.size).toBe(0);
+    } finally {
+      await fixture.close();
+    }
   });
 });

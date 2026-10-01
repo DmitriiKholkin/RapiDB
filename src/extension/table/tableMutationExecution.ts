@@ -13,8 +13,8 @@ import type {
   VerificationTarget,
 } from "./tableDataContracts";
 import {
-  assertExactPrimaryKeyShape,
   buildUpdateRowSql,
+  coercePrimaryKeyValues,
   coerceRecord,
   filterWritableRecord,
 } from "./updateSql";
@@ -81,13 +81,29 @@ export async function executeAtomicSqlApplyPlan(
     if (!driver) {
       return { success: false, error: "Not connected" };
     }
-    await driver.runTransaction([
-      ...inserts.map((plan) => ({
-        ...plan.operation,
-        checkAffectedRows: true,
-      })),
-      ...(apply?.operations ?? []),
-    ]);
+    const database = apply?.database ?? inserts[0]?.database;
+    if (
+      (apply && apply.connectionId !== connectionId) ||
+      inserts.some(
+        (plan) =>
+          plan.connectionId !== connectionId || plan.database !== database,
+      )
+    ) {
+      throw new Error(
+        "An atomic apply must target one connection and database.",
+      );
+    }
+    await driver.runTransaction(
+      [
+        ...inserts.map((plan) => ({
+          ...plan.operation,
+          checkAffectedRows: true,
+        })),
+        ...(apply?.operations ?? []),
+      ],
+      undefined,
+      { database },
+    );
     return {
       ...(apply
         ? await verifyAppliedPlan(driver, apply)
@@ -126,6 +142,14 @@ export function prepareApplyChangesPlan(
     };
   }
 
+  // Validate the entire batch before generating any mutation preview.
+  const columnMap = new Map(columns.map((column) => [column.name, column]));
+  const primaryKeysByRow = updates.map((update) =>
+    Object.keys(filterWritableRecord(update.changes, columnMap)).length > 0
+      ? coercePrimaryKeyValues(driver, update.primaryKeys, columns)
+      : null,
+  );
+
   if (driver.updateRows) {
     const columnMetaByName = new Map(
       columns.map((column) => [column.name, column]),
@@ -138,11 +162,11 @@ export function prepareApplyChangesPlan(
       );
       if (Object.keys(writableChanges).length === 0) {
         skippedRows.add(rowIndex);
-      } else {
-        assertExactPrimaryKeyShape(update.primaryKeys, columns);
       }
       return {
-        primaryKeys: coerceRecord(driver, update.primaryKeys, columnMetaByName),
+        primaryKeys:
+          primaryKeysByRow[rowIndex] ??
+          coerceRecord(driver, update.primaryKeys, columnMetaByName),
         changes: coerceRecord(driver, writableChanges, columnMetaByName),
         ...(update.originalValues
           ? {
@@ -414,7 +438,9 @@ export async function executePreparedApplyPlan(
   }
 
   try {
-    await driver.runTransaction(plan.operations);
+    await driver.runTransaction(plan.operations, undefined, {
+      database: plan.database,
+    });
     return await verifyAppliedPlan(driver, plan);
   } catch (error: unknown) {
     const message = `Transaction failed; its outcome may be unknown. Refresh and verify the data before retrying. ${error instanceof Error ? error.message : String(error)}`;
@@ -549,7 +575,7 @@ async function verifyExactNumericUpdates(
         .join(
           ", ",
         )} FROM ${qualifiedTableName} WHERE ${whereParts.join(" AND ")}`;
-      const result = await driver.query(sql, parameters);
+      const result = await driver.query(sql, parameters, { database });
       const row = result.rows[0];
       if (!row) {
         failures.push({

@@ -53,7 +53,7 @@ PostgreSQL, MS SQL Server, MySQL, MariaDB, SQLite, Oracle, Redis, MongoDB, Elast
 
 <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-3.png" alt="Connection Form" width="100%" />
 
-> Every connection has a **read-only mode** toggle. When enabled, query execution is limited to read operations and all table edits are blocked - useful for production databases or when you just want to look without breaking anything.
+> Every connection has a **read-only mode** toggle. When enabled, table edits are blocked and query execution is limited to read operations. **SQL Server (MSSQL) exception:** query execution is blocked in read-only mode because client-side classification cannot enforce read-only execution; use a database account with read-only permissions and a regular connection to run queries. Table data remains available in read-only mode.
 
 <br/>
 
@@ -101,7 +101,7 @@ Results land in a **virtualized table** - no jank, no browser tab hanging:
 - Execution time shown right in the toolbar
 - **Export to CSV or JSON** in one click
 
-> If results are truncated, a warning tells you exactly how many rows were cut and how to lift the limit.
+> Truncated results show a warning. `rapidb.queryRowLimit` controls the number of displayed rows, subject to a hard ceiling of 10,000 rows; increasing the setting above 10,000 does not lift that ceiling. This display limit does not limit rows affected by a mutation or cancel query execution.
 
 <br/>
 
@@ -133,7 +133,7 @@ Click any table → the **Table Data Viewer** opens:
 | `rapidb.connections` | `[]` | Saved connections, including folders and other data |
 | `rapidb.connectionTimeoutSeconds` | `15` | Timeout for establishing a database connection |
 | `rapidb.dbOperationTimeoutSeconds` | `180` | Timeout for queries, metadata, DDL, and routine loading |
-| `rapidb.queryRowLimit` | `10000` | Cap on rows returned per query (10–100000) |
+| `rapidb.queryRowLimit` | `10000` | Displayed rows per query: configured range 10–100000, effective ceiling 10000; does not limit affected rows or query execution time |
 | `rapidb.queryHistoryLimit` | `100` | How many past queries to remember (0 = disable history) |
 | `rapidb.defaultPageSize` | `25` | Default rows per page in the Table Data Viewer |
 | `rapidb.skipTableMutationPreview` | `false` | Apply table inserts, edits, and deletes without opening the mutation preview dialog |
@@ -179,7 +179,7 @@ Click any table → the **Table Data Viewer** opens:
 
 PRs and contributions are welcome at [github.com/DmitriiKholkin/RapiDB](https://github.com/DmitriiKholkin/RapiDB).
 
-For maintainer and support documentation, start at [docs/README.md](docs/README.md) or [docs/DEVELOPER_HANDBOOK.md](docs/DEVELOPER_HANDBOOK.md).
+For development and verification commands, see [package.json](package.json); test projects are defined in [vitest.workspace.ts](vitest.workspace.ts). For support, use the [GitHub issue tracker](https://github.com/DmitriiKholkin/RapiDB/issues).
 
 </details>
 

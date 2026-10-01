@@ -14,6 +14,7 @@ import {
 import { describe, expect, it, vi } from "vitest";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
+import { TableMutationService } from "../../src/extension/table/tableMutationService";
 
 function createMockDriver() {
   const driver = new MongoDBDriver({
@@ -46,7 +47,9 @@ function createMockDriver() {
   const mockUpdateMany = vi
     .fn()
     .mockResolvedValue({ matchedCount: 2, modifiedCount: 2 });
-  const mockDeleteOne = vi.fn().mockResolvedValue({ deletedCount: 1 });
+  const mockDeleteOne = vi
+    .fn()
+    .mockResolvedValue({ acknowledged: true, deletedCount: 1 });
   const mockDeleteMany = vi.fn().mockResolvedValue({ deletedCount: 3 });
   const mockCountDocuments = vi.fn().mockResolvedValue(5);
   const mockAggregateToArray = vi.fn().mockResolvedValue([]);
@@ -341,6 +344,138 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
     expect(result.affectedRows).toBe(3);
   });
 
+  it("does not turn user-supplied BSON-marker-shaped filters into undefined", async () => {
+    const { driver, mockDeleteMany } = createMockDriver();
+    const filter = { tag: { __rapidbBsonMarker: "Undefined", args: [] } };
+    const taggedFilter = {
+      tag: { kind: "marker", value: "Undefined", args: [] },
+    };
+
+    await driver.query(
+      'db.users.deleteMany({ tag: { __rapidbBsonMarker: "Undefined", args: [] } })',
+    );
+    await driver.query(
+      'db.users.deleteMany({ tag: { kind: "marker", value: "Undefined", args: [] } })',
+    );
+
+    expect(mockDeleteMany).toHaveBeenNthCalledWith(1, filter);
+    expect(mockDeleteMany).toHaveBeenNthCalledWith(2, taggedFilter);
+  });
+
+  it("preserves bigint values in mongosh arguments", async () => {
+    const { driver, mockInsertOne, mockFind } = createMockDriver();
+
+    await driver.query("db.users.insertOne({ n: 9007199254740993n })");
+    await driver.query("db.users.find({ n: 9007199254740993n })");
+
+    expect(mockInsertOne).toHaveBeenCalledWith({ n: 9007199254740993n });
+    expect(mockFind).toHaveBeenCalledWith(
+      { n: 9007199254740993n },
+      { promoteValues: false, bsonRegExp: false },
+    );
+  });
+
+  it("keeps destructive filters when query code replaces VM serialization built-ins", async () => {
+    const { driver, mockDeleteMany } = createMockDriver();
+
+    await driver.query(`db.users.deleteMany({ active: false });
+      Object.entries = function() { return []; };
+      JSON.stringify = function() { return '{}'; };
+      Array["proto"+"type"].toJSON = function() { return []; }`);
+
+    expect(mockDeleteMany).toHaveBeenCalledWith({ active: false });
+  });
+
+  it("does not let inherited array setters remove fields from a delete filter", async () => {
+    const { driver, mockDeleteMany } = createMockDriver();
+    await driver.query(`db.users.deleteMany({ active: false });
+      Object.defineProperty(Array["proto"+"type"], "0", { set: function() {} })`);
+    expect(mockDeleteMany).toHaveBeenCalledWith({ active: false });
+  });
+
+  it("uses the native RegExp source even if query code changes its getter", async () => {
+    const { driver, mockDeleteMany } = createMockDriver();
+    await driver.query(`db.users.deleteMany({ name: /^Alice$/ });
+      Object.defineProperty(RegExp["proto"+"type"], "source", { get: function() { return ".*"; } })`);
+    expect(mockDeleteMany).toHaveBeenCalledWith({ name: /^Alice$/ });
+  });
+
+  it("uses native RegExp flag getters after query code changes ignoreCase", async () => {
+    const { driver, mockDeleteMany } = createMockDriver();
+    await driver.query(`db.users.deleteMany({ name: /^Alice$/ });
+      Object.defineProperty(nativeRegExp["proto"+"type"], "ignoreCase", { get: function() { return true; } })`);
+    expect(mockDeleteMany).toHaveBeenCalledWith({ name: /^Alice$/ });
+  });
+
+  it("preserves RegExp filters after query code replaces Symbol.hasInstance", async () => {
+    const { driver, mockDeleteMany } = createMockDriver();
+    await driver.query(`db.users.deleteMany({ name: { $nin: [/^Alice$/] } });
+      Object.defineProperty(nativeRegExp, Symbol.hasInstance, { value: function() { return false; } })`);
+    expect(mockDeleteMany).toHaveBeenCalledWith({
+      name: { $nin: [/^Alice$/] },
+    });
+  });
+
+  it("rejects Proxy-wrapped RegExp filters before deleting documents", async () => {
+    const { driver, mockDeleteMany } = createMockDriver();
+    await expect(
+      driver.query("db.users.deleteMany(new Proxy(/^Alice$/, {}))"),
+    ).rejects.toThrow(/Proxy/);
+    await expect(
+      driver.query(
+        "db.users.deleteMany({ name: { $nin: [new Proxy(/^Alice$/, {})] } })",
+      ),
+    ).rejects.toThrow(/Proxy/);
+    await expect(
+      driver.query(`db.users.deleteMany(new Proxy(/^Alice$/, {
+        getPrototypeOf: function() { return Object["proto"+"type"]; }
+      }))`),
+    ).rejects.toThrow(/Proxy/);
+    expect(mockDeleteMany).not.toHaveBeenCalled();
+  });
+
+  it("checks the parsed operation again at execution on read-only connections", async () => {
+    const { driver, mockDeleteMany } = createMockDriver();
+    await expect(
+      driver.query("db.users.deleteMany({})", undefined, { readOnly: true }),
+    ).rejects.toThrow(/Read-only MongoDB/);
+
+    for (let i = 0; i < 20; i++) {
+      try {
+        await driver.query(
+          'db.users[Math.random() < 0.5 ? "find" : "deleteMany"]({})',
+          undefined,
+          { readOnly: true },
+        );
+      } catch (error) {
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toMatch(/Read-only MongoDB/);
+      }
+    }
+    expect(mockDeleteMany).not.toHaveBeenCalled();
+  });
+
+  it("round-trips bigint through a MongoDB mutation preview", async () => {
+    const { driver, mockUpdateOne } = createMockDriver();
+    const preview = driver.buildMutationPreviewStatement(
+      "update",
+      "testdb",
+      "testdb",
+      "users",
+      {
+        primaryKeys: { _id: 9007199254740993n },
+        changes: { value: 9007199254740993n },
+      },
+    );
+
+    expect(preview).toContain("9007199254740993n");
+    await driver.query(preview);
+    expect(mockUpdateOne).toHaveBeenCalledWith(
+      { _id: { $eq: 9007199254740993n } },
+      { $set: { value: 9007199254740993n } },
+    );
+  });
+
   it("executes deleteOne", async () => {
     const { driver, mockDeleteOne } = createMockDriver();
     const result = await driver.query('db.users.deleteOne({ _id: "abc" })');
@@ -429,15 +564,68 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
     );
   });
 
+  it("generates an ObjectId when ObjectId() has no argument", async () => {
+    const { driver, mockInsertOne } = createMockDriver();
+    await driver.query("db.users.insertOne({ _id: ObjectId() })");
+
+    const [document] = mockInsertOne.mock.calls[0] ?? [];
+    expect(document).toMatchObject({ _id: expect.any(ObjectId) });
+  });
+
+  it("preserves numeric milliseconds passed to Date()", async () => {
+    const { driver, mockInsertOne } = createMockDriver();
+    await driver.query("db.users.insertOne({ createdAt: new Date(0) })");
+
+    const [document] = mockInsertOne.mock.calls[0] ?? [];
+    expect(document).toEqual({ createdAt: new Date(0) });
+  });
+
+  it.each([
+    'Date["con"+"structor"]["con"+"structor"]',
+    'this["con"+"structor"]["con"+"structor"]',
+    'db.users.find["con"+"structor"]["con"+"structor"]',
+    'ObjectId("507f1f77bcf86cd799439011")["con"+"structor"]["con"+"structor"]',
+  ])("cannot reach the extension host through %s", async (accessPath) => {
+    const { driver, mockFind } = createMockDriver();
+    await expect(
+      driver.query(
+        `db.users.find({ leak: ${accessPath}("return pro"+"cess.version")() })`,
+      ),
+    ).rejects.toThrow();
+    expect(mockFind).not.toHaveBeenCalled();
+  });
+
+  it("applies the VM timeout to recursively queued Promise microtasks", async () => {
+    const { driver, mockFind } = createMockDriver();
+    const query = `function loop() { Promise.resolve().then(loop); }
+      Promise.resolve().then(loop);
+      db.users.find({})`;
+
+    await expect(driver.query(query)).rejects.toThrow(/timed out/i);
+    expect(mockFind).not.toHaveBeenCalled();
+  }, 10_000);
+
+  it.each([
+    "NaN",
+    "Infinity",
+    "-Infinity",
+  ])("rejects %s before passing a changed filter to MongoDB", async (value) => {
+    const { driver, mockDeleteMany } = createMockDriver();
+    await expect(
+      driver.query(`db.users.deleteMany({ score: ${value} })`),
+    ).rejects.toThrow(/Non-finite numbers/);
+    expect(mockDeleteMany).not.toHaveBeenCalled();
+  });
+
   it("executes generated mutation preview with BSON literals", async () => {
-    const { driver, mockUpdateMany } = createMockDriver();
+    const { driver, mockUpdateOne } = createMockDriver();
     const preview = driver.buildMutationPreviewStatement(
       "update",
       "rapidb_mongo_db",
       "rapidb_mongo_db",
       "bson_types",
       {
-        primaryKeys: { _id: "6a0412be9e2b63ce6b3d8c69" },
+        primaryKeys: { _id: new ObjectId("6a0412be9e2b63ce6b3d8c69") },
         changes: {
           t_binary_uuid: new Binary(
             Buffer.from("ESIzRFVmd4iZqrvM3e6//w==", "base64"),
@@ -465,10 +653,10 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
 
     await driver.query(preview);
 
-    expect(mockUpdateMany).toHaveBeenCalledTimes(1);
-    const [criteria, update] = mockUpdateMany.mock.calls[0] ?? [];
+    expect(mockUpdateOne).toHaveBeenCalledTimes(1);
+    const [criteria, update] = mockUpdateOne.mock.calls[0] ?? [];
     expect(criteria).toEqual({
-      _id: new ObjectId("6a0412be9e2b63ce6b3d8c69"),
+      _id: { $eq: new ObjectId("6a0412be9e2b63ce6b3d8c69") },
     });
 
     const setClause = (update as { $set?: Record<string, unknown> }).$set ?? {};
@@ -582,6 +770,194 @@ describe("MongoDBDriver — readTablePage()", () => {
   });
 });
 
+describe("MongoDB table mutations", () => {
+  const id = "507f1f77bcf86cd799439011";
+
+  it("rejects missing primary keys before preparing a deletion", async () => {
+    const { driver, mockDeleteMany } = createMockDriver();
+    const idColumn: ColumnTypeMeta = {
+      name: "_id",
+      type: "string",
+      nativeType: "string",
+      category: "text",
+      nullable: false,
+      isPrimaryKey: true,
+      isForeignKey: false,
+      filterable: true,
+      filterOperators: ["eq"],
+      valueSemantics: "plain",
+    };
+    const manager = {
+      getConnection: () => ({ id: "test", name: "test", type: "mongodb" }),
+      getDriver: () => driver,
+    };
+    const service = new TableMutationService(manager as never, {
+      getColumns: async () => [idColumn],
+    });
+
+    await expect(
+      service.prepareDeleteRowsPlan("test", "testdb", "", "users", [{}]),
+    ).rejects.toThrow(/full primary key/);
+    await expect(
+      driver.deleteRows({
+        database: "testdb",
+        schema: "",
+        table: "users",
+        primaryKeyValuesList: [{}],
+      }),
+    ).rejects.toThrow(/complete _id/);
+    expect(mockDeleteMany).not.toHaveBeenCalled();
+  });
+
+  it("preserves a hexadecimal string ID when updating and deleting", async () => {
+    const { driver, mockUpdateOne, mockDeleteOne } = createMockDriver();
+    await driver.updateRows({
+      database: "testdb",
+      schema: "",
+      table: "users",
+      updates: [{ primaryKeys: { _id: id }, changes: { name: "Bob" } }],
+    });
+    await driver.deleteRows({
+      database: "testdb",
+      schema: "",
+      table: "users",
+      primaryKeyValuesList: [{ _id: id }],
+    });
+
+    expect(mockUpdateOne).toHaveBeenCalledWith(
+      { _id: { $eq: id } },
+      { $set: { name: "Bob" } },
+    );
+    expect(mockDeleteOne).toHaveBeenCalledWith({ _id: { $eq: id } });
+  });
+
+  it("keeps per-row BSON _id types across table reads, previews, updates and deletes", async () => {
+    const { driver, mockToArray, mockUpdateOne, mockDeleteOne } =
+      createMockDriver();
+    const objectId = new ObjectId(id);
+    mockToArray.mockResolvedValueOnce([
+      { _id: objectId, name: "object row" },
+      { _id: id, name: "string row" },
+    ]);
+    const idColumn: ColumnTypeMeta = {
+      name: "_id",
+      type: "objectId",
+      nativeType: "objectId",
+      category: "text",
+      nullable: false,
+      isPrimaryKey: true,
+      isForeignKey: false,
+      filterable: true,
+      filterOperators: ["eq"],
+      valueSemantics: "plain",
+    };
+    const nameColumn: ColumnTypeMeta = {
+      ...idColumn,
+      name: "name",
+      type: "string",
+      nativeType: "string",
+      isPrimaryKey: false,
+    };
+    Object.assign(driver, {
+      describeSchemaColumns: async () => [idColumn, nameColumn],
+    });
+    const page = await driver.readTablePage({
+      database: "testdb",
+      schema: "",
+      table: "users",
+      page: 1,
+      pageSize: 10,
+      filters: [],
+      sort: null,
+      skipCount: false,
+    });
+    expect(page.rows.map((row) => row._id)).toEqual([id, id]);
+    expect(page.mongoIdTypes).toEqual(["objectId", "string"]);
+
+    const service = new TableMutationService(
+      {
+        getConnection: () => ({ id: "test", type: "mongodb" }),
+        getDriver: () => driver,
+      } as never,
+      { getColumns: async () => [idColumn, nameColumn] },
+    );
+    const taggedStringId = {
+      $rapidbMongoId: { type: "string", value: page.rows[1]._id },
+    };
+    const taggedObjectId = {
+      $rapidbMongoId: { type: "objectId", value: page.rows[0]._id },
+    };
+    const plan = await service.prepareDeleteRowsPlan(
+      "test",
+      "testdb",
+      "",
+      "users",
+      [{ _id: taggedStringId }],
+    );
+    expect(plan?.primaryKeyValuesList).toEqual([{ _id: id }]);
+    expect(plan?.previewStatements[0]).toContain(`"${id}"`);
+    expect(plan?.previewStatements[0]).not.toContain("ObjectId(");
+    if (!plan) throw new Error("Expected delete plan");
+    await service.executePreparedDeletePlan(plan);
+    expect(mockDeleteOne).toHaveBeenCalledWith({ _id: { $eq: id } });
+    await service.updateRow(
+      "test",
+      "testdb",
+      "",
+      "users",
+      { _id: taggedObjectId },
+      { name: "updated" },
+    );
+    expect(mockUpdateOne).toHaveBeenCalledWith(
+      { _id: { $eq: objectId } },
+      { $set: { name: "updated" } },
+    );
+  });
+
+  it("rejects unsupported tagged table ID types instead of targeting another document", async () => {
+    const { driver, mockDeleteMany } = createMockDriver();
+    const idColumn: ColumnTypeMeta = {
+      name: "_id",
+      type: "objectId",
+      nativeType: "objectId",
+      category: "text",
+      nullable: false,
+      isPrimaryKey: true,
+      isForeignKey: false,
+      filterable: true,
+      filterOperators: ["eq"],
+      valueSemantics: "plain",
+    };
+    const service = new TableMutationService(
+      {
+        getConnection: () => ({ id: "test", type: "mongodb" }),
+        getDriver: () => driver,
+      } as never,
+      { getColumns: async () => [idColumn] },
+    );
+    await expect(
+      service.prepareDeleteRowsPlan("test", "testdb", "", "users", [
+        { _id: { $rapidbMongoId: { type: "unsupported", value: "123" } } },
+      ]),
+    ).rejects.toThrow("Invalid MongoDB _id type hint");
+    expect(mockDeleteMany).not.toHaveBeenCalled();
+  });
+
+  it("treats an object-valued ID as a literal, not a delete operator", async () => {
+    const { driver, mockDeleteOne } = createMockDriver();
+    const idWithOperator = { $ne: null };
+    await driver.deleteRows({
+      database: "testdb",
+      schema: "",
+      table: "users",
+      primaryKeyValuesList: [{ _id: idWithOperator }],
+    });
+    expect(mockDeleteOne).toHaveBeenCalledWith({
+      _id: { $eq: idWithOperator },
+    });
+  });
+});
+
 describe("MongoDBDriver — buildMutationPreviewStatement()", () => {
   const driver = new MongoDBDriver({
     id: "preview-test",
@@ -604,36 +980,41 @@ describe("MongoDBDriver — buildMutationPreviewStatement()", () => {
     expect(preview).toContain("Alice");
   });
 
-  it("generates updateMany preview with ObjectId", () => {
+  it("generates updateOne preview with ObjectId", () => {
     const preview = driver.buildMutationPreviewStatement(
       "update",
       "mydb",
       "mydb",
       "users",
       {
-        primaryKeys: { _id: "507f1f77bcf86cd799439011" },
+        primaryKeys: { _id: new ObjectId("507f1f77bcf86cd799439011") },
         changes: { name: "Updated" },
       },
     );
-    expect(preview).toContain("updateMany");
+    expect(preview).toContain("updateOne");
+    expect(preview).not.toContain("updateMany");
     expect(preview).toContain("ObjectId");
     expect(preview).toContain("$set");
     expect(preview).toContain("Updated");
   });
 
-  it("generates deleteMany preview for single key", () => {
+  it("generates deleteOne preview for single key", () => {
     const preview = driver.buildMutationPreviewStatement(
       "delete",
       "mydb",
       "mydb",
       "users",
-      { primaryKeyValuesList: [{ _id: "507f1f77bcf86cd799439011" }] },
+      {
+        primaryKeyValuesList: [
+          { _id: new ObjectId("507f1f77bcf86cd799439011") },
+        ],
+      },
     );
-    expect(preview).toContain("deleteMany");
+    expect(preview).toContain("deleteOne");
     expect(preview).toContain("ObjectId");
   });
 
-  it("generates deleteMany preview with $or for multiple keys", () => {
+  it("generates individual deleteOne previews for multiple keys", () => {
     const preview = driver.buildMutationPreviewStatement(
       "delete",
       "mydb",
@@ -646,8 +1027,20 @@ describe("MongoDBDriver — buildMutationPreviewStatement()", () => {
         ],
       },
     );
-    expect(preview).toContain("deleteMany");
-    expect(preview).toContain("$or");
+    expect(preview.match(/deleteOne/g)).toHaveLength(2);
+    expect(preview).not.toContain("$or");
+  });
+
+  it("keeps hexadecimal string IDs as strings in the preview", () => {
+    const preview = driver.buildMutationPreviewStatement(
+      "delete",
+      "mydb",
+      "mydb",
+      "users",
+      { primaryKeyValuesList: [{ _id: "507f1f77bcf86cd799439011" }] },
+    );
+    expect(preview).toContain('"_id": { "$eq": "507f1f77bcf86cd799439011" }');
+    expect(preview).not.toContain("ObjectId(");
   });
 
   it("serializes coerced BSON values as valid mongosh literals", () => {

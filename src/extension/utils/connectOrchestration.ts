@@ -9,16 +9,24 @@
  *
  * The `withProgress` runner is injected so the function can be unit
  * tested without spinning up the VSCode host.
+ * Intent defaults to automatic; only a deliberate Connect/reconnect action
+ * should pass explicit to allow replacement of a lost SQLite session.
  */
 
 import * as vscode from "vscode";
-import type { ConnectAttempt, ConnectionManager } from "../connectionManager";
+import type {
+  ConnectAttempt,
+  ConnectionConnectIntent,
+} from "../connectionManager";
 
 type ProgressRunner = typeof vscode.window.withProgress;
 
 /** Minimal surface of `ConnectionManager` that this helper depends on. */
 export interface ConnectProgressClient {
-  beginConnect(connectionId: string): ConnectAttempt;
+  beginConnect(
+    connectionId: string,
+    intent?: ConnectionConnectIntent,
+  ): ConnectAttempt;
   isConnected(connectionId: string): boolean;
 }
 
@@ -28,12 +36,13 @@ export async function connectWithProgress(
   title: string,
   waitForExisting: boolean,
   withProgress: ProgressRunner = vscode.window.withProgress,
+  intent: ConnectionConnectIntent = "automatic",
 ): Promise<boolean> {
   if (connectionManager.isConnected(connectionId)) {
     return true;
   }
 
-  const attempt = connectionManager.beginConnect(connectionId);
+  const attempt = connectionManager.beginConnect(connectionId, intent);
   if (!attempt.isNew) {
     if (!waitForExisting) {
       return false;

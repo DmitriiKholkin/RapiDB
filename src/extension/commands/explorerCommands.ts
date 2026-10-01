@@ -72,6 +72,8 @@ async function ensureConnectionReady(
       connectionId,
       "RapiDB: Connecting…",
       true,
+      undefined,
+      "automatic",
     );
     refresh();
     return true;

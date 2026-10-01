@@ -1,10 +1,10 @@
-import React, { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ColumnTypeMeta as ColumnMeta } from "../../shared/tableTypes";
 import type { Row } from "../types";
 import { postMessage } from "../utils/messaging";
 import { GridLoadingOverlay } from "./GridOverlay";
 import { TableDialogs } from "./table/TableDialogs";
-import { type ExportFormat } from "./table/TableExportActions";
+import type { ExportFormat } from "./table/TableExportActions";
 import { TableFooter } from "./table/TableFooter";
 import { TableGrid } from "./table/TableGrid";
 import {
@@ -27,6 +27,7 @@ interface Props {
   table: string;
   isView?: boolean;
   connectionReadOnly?: boolean;
+  mongoRowIdentity?: boolean;
   defaultPageSize?: number;
 }
 
@@ -44,12 +45,14 @@ export function TableView({
   table,
   isView = false,
   connectionReadOnly = false,
+  mongoRowIdentity = false,
   defaultPageSize,
 }: Props) {
   const initialPageSize = getInitialPageSize(defaultPageSize);
   const effectiveReadOnly = isView || connectionReadOnly;
   const columnsRef = useRef<ColumnMeta[]>([]);
   const rowsRef = useRef<Row[]>([]);
+  const mongoIdTypesRef = useRef<Array<"objectId" | "string" | null>>([]);
   const pkColsRef = useRef<string[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const fetchPageRef = useRef<() => void>(() => undefined);
@@ -58,13 +61,21 @@ export function TableView({
     handleRowsCommitted: (
       rows: readonly Row[],
       primaryKeyColumns: readonly string[],
+      previousMongoIdTypes: readonly ("objectId" | "string" | null)[],
+      mongoIdTypes: readonly ("objectId" | "string" | null)[],
     ) => void;
     resetForTableInit: () => void;
     handleReadFailed: () => void;
+    getMetadataRefreshState: () => {
+      busy: boolean;
+      hasWork: boolean;
+      reconciliationPending?: boolean;
+    };
   }>({
     handleRowsCommitted: () => undefined,
     resetForTableInit: () => undefined,
     handleReadFailed: () => undefined,
+    getMetadataRefreshState: () => ({ busy: false, hasWork: false }),
   });
 
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -83,14 +94,22 @@ export function TableView({
     readOnlyTable: effectiveReadOnly,
     columnsRef,
     rowsRef,
+    mongoIdTypesRef,
     pkColsRef,
     scrollRef,
     fetchPageRef,
     preserveScrollPositionRef,
     onTableInit: () => mutationBridgeRef.current.resetForTableInit(),
+    getMetadataRefreshState: () =>
+      mutationBridgeRef.current.getMetadataRefreshState(),
     onReadFailed: () => mutationBridgeRef.current.handleReadFailed(),
-    onRowsCommitted: (rows, primaryKeyColumns) =>
-      mutationBridgeRef.current.handleRowsCommitted(rows, primaryKeyColumns),
+    onRowsCommitted: (rows, primaryKeyColumns, previousTypes, nextTypes) =>
+      mutationBridgeRef.current.handleRowsCommitted(
+        rows,
+        primaryKeyColumns,
+        previousTypes,
+        nextTypes,
+      ),
   });
 
   const hasPrimaryKey = data.pkCols.length > 0;
@@ -98,19 +117,50 @@ export function TableView({
   const canSelectAndDeleteRows = !data.readOnlyTable && hasPrimaryKey;
 
   const mutation = useTableMutationController({
+    mongoRowIdentity,
     canEditRows,
     loadingRef: data.loadingRef,
+    metadataBlockedRef: data.metadataBlockedRef,
+    committedColumnNamesRef: data.committedColumnNamesRef,
     columnsRef,
     fetchPageRef,
     pkColsRef,
     preserveScrollPositionRef,
     rowsRef,
+    mongoIdTypesRef,
     selected,
   });
 
   mutationBridgeRef.current.resetForTableInit = mutation.resetForTableInit;
   mutationBridgeRef.current.handleRowsCommitted = mutation.handleRowsCommitted;
   mutationBridgeRef.current.handleReadFailed = mutation.handleReadFailed;
+  mutationBridgeRef.current.getMetadataRefreshState =
+    mutation.getMetadataRefreshState;
+
+  // Retry deferred metadata only after mutation/editor state has committed.
+  useEffect(() => {
+    void data.metadataTick;
+    void mutation.pendingEdits;
+    void mutation.newRows;
+    void mutation.applying;
+    void mutation.deleting;
+    void mutation.editCell;
+    void mutation.structuredCellDialog;
+    void mutation.canUndo;
+    void mutation.canRedo;
+    data.retryMetadataRefresh();
+  }, [
+    data.metadataTick,
+    data.retryMetadataRefresh,
+    mutation.pendingEdits,
+    mutation.newRows,
+    mutation.applying,
+    mutation.deleting,
+    mutation.editCell,
+    mutation.structuredCellDialog,
+    mutation.canUndo,
+    mutation.canRedo,
+  ]);
 
   useEffect(() => {
     void data.rows;
@@ -202,6 +252,7 @@ export function TableView({
       )}
 
       <TableStatusBanners
+        schemaWarning={data.schemaWarning}
         filterError={data.filterError}
         readError={data.readError}
         showMissingPrimaryKeyNotice={showMissingPrimaryKeyNotice}
@@ -216,6 +267,9 @@ export function TableView({
         deleting={mutation.deleting}
         executionTimeMs={data.executionTimeMs}
         mutationBusy={mutationBusy}
+        schemaBlocked={
+          Boolean(data.schemaWarning) || mutation.deleteReconciliationPending
+        }
         draftRowCount={mutation.newRows.length}
         readOnlyTable={data.readOnlyTable}
         selectedCount={selected.size}
@@ -234,11 +288,17 @@ export function TableView({
             columnOrder: getExportColumnOrder(),
           });
         }}
-        onRefresh={() => guardRowNavigation(data.fetchPage)}
+        onRefresh={() => {
+          if (!mutation.retryDeleteRefresh())
+            guardRowNavigation(data.fetchPage);
+        }}
       />
 
       <TableMutationStatusBar
         applyStatus={mutation.applyStatus}
+        schemaBlocked={
+          Boolean(data.schemaWarning) || mutation.deleteReconciliationPending
+        }
         applying={mutation.applying}
         loading={data.loading}
         insertValueCount={insertValueCount}
@@ -260,8 +320,16 @@ export function TableView({
         key={data.columns.map((column) => column.name).join("|")}
         columnOrderRef={columnOrderRef}
         hiddenColumnIdsRef={hiddenColumnIdsRef}
-        canEditRows={canEditRows && !mutationBusy}
-        canSelectAndDeleteRows={canSelectAndDeleteRows && !mutationBusy}
+        canEditRows={
+          canEditRows && !mutationBusy && !mutation.deleteReconciliationPending
+        }
+        getRowMutationBlockReason={mutation.getRowMutationBlockReason}
+        canSelectAndDeleteRows={
+          canSelectAndDeleteRows &&
+          !mutationBusy &&
+          !data.schemaWarning &&
+          !mutation.deleteReconciliationPending
+        }
         colSizes={data.colSizes}
         columns={data.columns}
         editCell={mutation.editCell}

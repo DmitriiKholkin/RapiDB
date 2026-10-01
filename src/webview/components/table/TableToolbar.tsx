@@ -1,4 +1,3 @@
-import React from "react";
 import {
   type ColumnTypeMeta as ColumnMeta,
   type FilterDraftMap,
@@ -8,7 +7,6 @@ import { Icon } from "../Icon";
 import { type ExportFormat, TableExportActions } from "./TableExportActions";
 import {
   MAX_DRAFT_ROWS,
-  type TableSortState,
   TOOLBAR_H,
   tableButtonStyle,
 } from "./tableViewHelpers";
@@ -20,6 +18,7 @@ interface TableToolbarProps {
   deleting: boolean;
   executionTimeMs?: number;
   mutationBusy: boolean;
+  schemaBlocked?: boolean;
   draftRowCount: number;
   readOnlyTable: boolean;
   selectedCount: number;
@@ -37,6 +36,7 @@ export function TableToolbar({
   deleting,
   executionTimeMs,
   mutationBusy,
+  schemaBlocked = false,
   draftRowCount,
   readOnlyTable,
   selectedCount,
@@ -67,9 +67,11 @@ export function TableToolbar({
             type="button"
             style={tableButtonStyle(
               "primary",
-              mutationBusy || draftRowCount >= MAX_DRAFT_ROWS,
+              mutationBusy || schemaBlocked || draftRowCount >= MAX_DRAFT_ROWS,
             )}
-            disabled={mutationBusy || draftRowCount >= MAX_DRAFT_ROWS}
+            disabled={
+              mutationBusy || schemaBlocked || draftRowCount >= MAX_DRAFT_ROWS
+            }
             onClick={onAddRow}
           >
             <Icon name="add" size={13} style={{ marginRight: 4 }} />
@@ -80,9 +82,9 @@ export function TableToolbar({
               type="button"
               style={tableButtonStyle(
                 "danger",
-                selectedCount === 0 || mutationBusy,
+                selectedCount === 0 || mutationBusy || schemaBlocked,
               )}
-              disabled={selectedCount === 0 || mutationBusy}
+              disabled={selectedCount === 0 || mutationBusy || schemaBlocked}
               onClick={onDeleteSelected}
             >
               <Icon name="trash" size={13} style={{ marginRight: 4 }} />

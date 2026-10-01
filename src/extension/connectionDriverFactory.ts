@@ -48,9 +48,9 @@ export class ConnectionDriverFactory {
         case "mongodb":
           return new MongoDBDriver(config);
         case "redis":
-          return new RedisDriver(config);
+          return new RedisDriver(config, timeoutSettingsProvider);
         case "elasticsearch":
-          return new ElasticsearchDriver(config);
+          return new ElasticsearchDriver(config, timeoutSettingsProvider);
         case "dynamodb":
           return new DynamoDBDriver(config);
         default: {

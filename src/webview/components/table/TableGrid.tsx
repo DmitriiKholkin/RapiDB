@@ -310,6 +310,7 @@ function toDraftEditInitialValue(value: unknown): string {
 }
 
 interface TableGridProps {
+  getRowMutationBlockReason?: (rowIdx: number) => string | null;
   canEditRows: boolean;
   canSelectAndDeleteRows: boolean;
   colSizes: Record<string, number>;
@@ -394,6 +395,7 @@ export function TableGrid(props: UnifiedTableGridProps) {
 }
 
 function TableDataGrid({
+  getRowMutationBlockReason,
   canEditRows,
   canSelectAndDeleteRows,
   colSizes,
@@ -423,6 +425,13 @@ function TableDataGrid({
   columnOrderRef: exportColumnOrderRef,
   hiddenColumnIdsRef,
 }: TableGridProps) {
+  const selectableRowIndexes = useMemo(
+    () =>
+      rows.flatMap((_, index) =>
+        getRowMutationBlockReason?.(index) ? [] : [index],
+      ),
+    [rows, getRowMutationBlockReason],
+  );
   const columnsMap = useMemo(
     () => new Map(columns.map((column) => [column.name, column])),
     [columns],
@@ -616,7 +625,9 @@ function TableDataGrid({
           value: structuredValue,
           currentValue,
           originalValue: isDraft ? currentValue : originalValue,
-          readOnly: !isDraft && !canEditRows,
+          readOnly:
+            !isDraft &&
+            (!canEditRows || Boolean(getRowMutationBlockReason?.(rowIdx))),
         });
       } else {
         (isDraft ? onStartDraftEdit : onStartEdit)(rowIdx, column);
@@ -631,6 +642,7 @@ function TableDataGrid({
       editCell,
       pendingEdits,
       canEditRows,
+      getRowMutationBlockReason,
       onOpenStructuredCell,
       onStartDraftEdit,
       onStartEdit,
@@ -990,17 +1002,22 @@ function TableDataGrid({
                 <input
                   type="checkbox"
                   aria-label="Select all rows"
-                  checked={rows.length > 0 && selected.size === rows.length}
+                  disabled={selectableRowIndexes.length === 0}
+                  checked={
+                    selectableRowIndexes.length > 0 &&
+                    selected.size === selectableRowIndexes.length
+                  }
                   ref={(element) => {
                     if (element) {
                       element.indeterminate =
-                        selected.size > 0 && selected.size < rows.length;
+                        selected.size > 0 &&
+                        selected.size < selectableRowIndexes.length;
                     }
                   }}
                   onChange={(event) =>
                     onSelectionChange(
                       event.target.checked
-                        ? new Set(rows.map((_, index) => index))
+                        ? new Set(selectableRowIndexes)
                         : new Set(),
                     )
                   }
@@ -1015,8 +1032,11 @@ function TableDataGrid({
                 <input
                   type="checkbox"
                   aria-label={`Select row ${row.index + 1}`}
+                  disabled={Boolean(getRowMutationBlockReason?.(row.index))}
+                  title={getRowMutationBlockReason?.(row.index) ?? undefined}
                   checked={selected.has(row.index)}
                   onChange={(event: React.ChangeEvent<HTMLInputElement>) => {
+                    if (getRowMutationBlockReason?.(row.index)) return;
                     const nextSelection = new Set(selected);
                     if (event.target.checked) {
                       nextSelection.add(row.index);
@@ -1086,7 +1106,9 @@ function TableDataGrid({
                   initial={startString}
                   nullable={column.nullable}
                   category={column.category}
-                  readOnly={!canEditRows}
+                  readOnly={
+                    !canEditRows || Boolean(getRowMutationBlockReason?.(rowIdx))
+                  }
                   onCommit={(value) =>
                     onCommitCellEdit(rowIdx, column, value, getValue())
                   }
@@ -1096,12 +1118,14 @@ function TableDataGrid({
             }
 
             return (
-              <CellDisplay
-                value={displayValue}
-                isPending={hasPending}
-                category={column.category}
-                nativeType={column.nativeType}
-              />
+              <div title={getRowMutationBlockReason?.(rowIdx) ?? undefined}>
+                <CellDisplay
+                  value={displayValue}
+                  isPending={hasPending}
+                  category={column.category}
+                  nativeType={column.nativeType}
+                />
+              </div>
             );
           },
         }),
@@ -1110,6 +1134,8 @@ function TableDataGrid({
     [
       canEditRows,
       canSelectAndDeleteRows,
+      getRowMutationBlockReason,
+      selectableRowIndexes,
       colSizes,
       columns,
       editCell,
@@ -1117,7 +1143,6 @@ function TableDataGrid({
       onCommitCellEdit,
       onSelectionChange,
       pendingEdits,
-      rows,
       selected,
     ],
   );

@@ -170,6 +170,11 @@ async function runExport(request: ExportRequest): Promise<void> {
 
         try {
           await request.write(saveUri.fsPath, abortController.signal);
+        } catch (error) {
+          if (abortController.signal.aborted) {
+            throw new DOMException("Export cancelled by user", "AbortError");
+          }
+          throw error;
         } finally {
           cancelSubscription.dispose();
         }

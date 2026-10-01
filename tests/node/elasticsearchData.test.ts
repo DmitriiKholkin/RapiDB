@@ -201,13 +201,20 @@ describe("ElasticsearchDriver — metadata and pages", () => {
       },
     ]);
     expect(search).toHaveBeenCalledTimes(1);
-    expect(search).toHaveBeenCalledWith({
-      index: "users",
-      query: { match_all: {} },
-      sort: ["_doc"],
-      size: ELASTICSEARCH_READ_BUDGET.hardCap,
-      track_total_hits: true,
-    });
+    expect(search).toHaveBeenCalledWith(
+      {
+        index: "users",
+        query: { match_all: {} },
+        sort: ["_doc"],
+        size: ELASTICSEARCH_READ_BUDGET.hardCap,
+        track_total_hits: true,
+      },
+      {
+        signal: expect.any(AbortSignal),
+        requestTimeout: expect.any(Number),
+        maxRetries: 0,
+      },
+    );
     expect(getMapping).not.toHaveBeenCalled();
   });
 

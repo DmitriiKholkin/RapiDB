@@ -30,6 +30,7 @@ import {
 import type {
   ColumnMeta,
   ColumnTypeMeta,
+  DatabaseExecutionScope,
   DatabaseInfo,
   DriverCapabilities,
   FilterConditionResult,
@@ -45,6 +46,7 @@ import type {
   SchemaInfo,
   TableConstraintMeta,
   TableInfo,
+  TransactionContext,
   TransactionOperation,
   TriggerMeta,
   TypeCategory,
@@ -770,7 +772,11 @@ export abstract class BaseDBDriver implements IDBDriver {
     params?: unknown[],
     operationContext?: QueryExecutionOptions,
   ): Promise<QueryResult>;
-  abstract runTransaction(operations: TransactionOperation[]): Promise<void>;
+  abstract runTransaction(
+    operations: TransactionOperation[],
+    context?: TransactionContext,
+    scope?: DatabaseExecutionScope,
+  ): Promise<void>;
 
   protected getTimeoutSettings(): DriverTimeoutSettingsSnapshot {
     return this.timeoutSettingsProvider();

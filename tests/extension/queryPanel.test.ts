@@ -490,4 +490,77 @@ describe("QueryPanel", () => {
     expect(secondPanelId).toMatch(/^qp_/);
     expect(secondPanelId).not.toBe(firstPanelId);
   });
+
+  it("swallows postMessage failures without unhandled rejection", async () => {
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "conn-pm",
+        name: "Primary",
+        type: "pg",
+      })),
+      getQueryEditorPresentation: vi.fn(() => undefined),
+      onDidSchemaLoad: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+    const { QueryPanel } = await import(
+      "../../src/extension/panels/queryPanel"
+    );
+
+    QueryPanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-pm",
+      "select 1",
+      true,
+    );
+    const panel = createdPanel();
+    // Simulate disposed webview: postMessage rejects / resolves false.
+    panel.webview.postMessage.mockRejectedValueOnce(new Error("gone"));
+    await panel.webview.dispatchMessage({ type: "ready" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    panel.webview.postMessage.mockResolvedValueOnce(false);
+    await panel.webview.dispatchMessage({ type: "ready" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    // No throw = no unhandled rejection.
+  });
+
+  it("survives controller dispose rejection on panel dispose", async () => {
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "conn-dispose-err",
+        name: "Primary",
+        type: "pg",
+      })),
+      getQueryEditorPresentation: vi.fn(() => undefined),
+      onDidSchemaLoad: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const disposeSpy = vi
+      .spyOn(QueryPanelController.prototype, "dispose")
+      .mockRejectedValueOnce(new Error("dispose boom"));
+    const { QueryPanel } = await import(
+      "../../src/extension/panels/queryPanel"
+    );
+
+    QueryPanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-dispose-err",
+      "select 1",
+      true,
+    );
+    // Must not throw synchronously; rejection is caught + logged.
+    createdPanel()?.dispose();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(disposeSpy).toHaveBeenCalledOnce();
+    disposeSpy.mockRestore();
+  });
 });

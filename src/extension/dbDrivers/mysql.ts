@@ -1125,7 +1125,7 @@ export class MySQLDriver extends BaseDBDriver {
         tlsSettings.servername;
     }
 
-    this.pool = mysql.createPool({
+    const pool = mysql.createPool({
       host: forwardedTransport?.localHost ?? this.config.host,
       port: forwardedTransport?.localPort ?? this.config.port,
       database: this.config.database,
@@ -1141,12 +1141,26 @@ export class MySQLDriver extends BaseDBDriver {
       supportBigNumbers: true,
       ssl,
     });
-    const conn = await this.pool.getConnection();
-    conn.release();
+    try {
+      const conn = await pool.getConnection();
+      conn.release();
+    } catch (error) {
+      // Probe failed: do not leave an idle pool behind (sockets/timers).
+      // Pool stays local until success so concurrent readers never observe
+      // a half-initialized pool.
+      try {
+        await pool.end();
+      } catch {}
+      throw error;
+    }
+    this.pool = pool;
   }
   async disconnect(): Promise<void> {
-    await this.pool?.end();
-    this.pool = null;
+    try {
+      await this.pool?.end();
+    } finally {
+      this.pool = null;
+    }
   }
 
   async cancelCurrentOperation(

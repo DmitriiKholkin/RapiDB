@@ -8,6 +8,7 @@ import type {
   BookmarkEntry,
   ConnectAttempt,
   ConnectionConfig,
+  ConnectionConnectIntent,
   ConnectionManagerLifecycleApi,
   DriverCapabilitiesApi,
   DriverMetadataApi,
@@ -84,6 +85,7 @@ export type {
   BookmarkEntry,
   ConnectAttempt,
   ConnectionConfig,
+  ConnectionConnectIntent,
   ConnectionManagerLifecycleApi,
   DriverCapabilitiesApi,
   DriverMetadataApi,
@@ -709,6 +711,9 @@ export class ConnectionManager
   private readonly validationService = new ConnectionValidationService();
   private readonly store: ConnectionManagerStore;
   private driverMap = new Map<string, IDBDriver>();
+  // Connection-scoped, not driver-scoped: disposal/replacement cannot discard
+  // the requirement to deliberately reset a lost stateful SQLite session.
+  private readonly automaticReconnectBlocks = new Map<string, string>();
   private readonly sshRuntimeMap = new Map<string, SshRuntime>();
   private readonly createSshRuntimeForConnection: typeof createSshRuntime;
   private readonly _connectingMap = new Map<
@@ -1122,6 +1127,7 @@ export class ConnectionManager
       return false;
     }
     this._connectionsCache = null;
+    this.automaticReconnectBlocks.delete(id);
     this.invalidateDriverStaticMetadata(id);
     await this._purgeHistoryForConnection(id);
     await this._purgeBookmarksForConnection(id);
@@ -1298,9 +1304,9 @@ export class ConnectionManager
         case "mongodb":
           return new MongoDBDriver(config);
         case "redis":
-          return new RedisDriver(config);
+          return new RedisDriver(config, timeoutSettingsProvider);
         case "elasticsearch":
-          return new ElasticsearchDriver(config);
+          return new ElasticsearchDriver(config, timeoutSettingsProvider);
         case "dynamodb":
           return new DynamoDBDriver(config);
         default: {
@@ -1877,8 +1883,19 @@ export class ConnectionManager
     return hadDriver;
   }
 
-  beginConnect(id: string): ConnectAttempt {
+  beginConnect(
+    id: string,
+    intent: ConnectionConnectIntent = "automatic",
+  ): ConnectAttempt {
     this._assertNotDisposed();
+
+    const reconnectBlock = this.getAutomaticReconnectBlockReason(id);
+    if (intent === "automatic" && reconnectBlock) {
+      return {
+        promise: Promise.reject(new Error(reconnectBlock)),
+        isNew: true,
+      };
+    }
 
     const pending = this._connectingMap.get(id);
     if (pending) {
@@ -1935,6 +1952,7 @@ export class ConnectionManager
         }
 
         this.driverMap.set(id, driver);
+        if (intent === "explicit") this.automaticReconnectBlocks.delete(id);
         if (runtime) {
           this.sshRuntimeMap.set(id, runtime);
         }
@@ -1960,8 +1978,11 @@ export class ConnectionManager
     })();
     return { promise: attempt, isNew: true };
   }
-  async connectTo(id: string): Promise<void> {
-    await this.beginConnect(id).promise;
+  async connectTo(
+    id: string,
+    intent: ConnectionConnectIntent = "automatic",
+  ): Promise<void> {
+    await this.beginConnect(id, intent).promise;
   }
   async disconnectFrom(id: string): Promise<void> {
     this._nextConnectionEpoch(id);
@@ -1991,6 +2012,11 @@ export class ConnectionManager
   }
   getDriver(id: string): IDBDriver | undefined {
     return this.driverMap.get(id);
+  }
+  getAutomaticReconnectBlockReason(id: string): string | undefined {
+    const reason = this.driverMap.get(id)?.getAutomaticReconnectBlockReason?.();
+    if (reason) this.automaticReconnectBlocks.set(id, reason);
+    return this.automaticReconnectBlocks.get(id);
   }
 
   private resolveDriverStaticMetadata(
@@ -2512,6 +2538,7 @@ export class ConnectionManager
     preserveConnectingAttempt = false,
   ): Promise<void> {
     await this._disposeSshRuntime(connectionId);
+    this.getAutomaticReconnectBlockReason(connectionId);
     this.driverMap.delete(connectionId);
     if (!preserveConnectingAttempt) {
       this._connectingMap.delete(connectionId);
@@ -3342,6 +3369,7 @@ export class ConnectionManager
 
     await this.disconnectAll();
     this.driverMap.clear();
+    this.automaticReconnectBlocks.clear();
     this.sshRuntimeMap.clear();
     this._connectingMap.clear();
     this._connectionsCache = null;

@@ -13,6 +13,7 @@ import {
   prepareApplyChangesPlan,
 } from "../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
+import { TableReadService } from "../../src/extension/table/tableReadService";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
 const columns: ColumnTypeMeta[] = [
@@ -178,6 +179,120 @@ const fakeDriver: IDBDriver = {
 };
 
 describe("table helpers", () => {
+  it.each([
+    false,
+    true,
+  ])("rejects unsafe original keys before SQL/hooks or previews (hooks: %s)", async (hooks) => {
+    const query = vi.fn(fakeDriver.query);
+    const transaction = vi.fn(fakeDriver.runTransaction);
+    const updateRows = vi.fn(async () => ({ affectedRows: 1 }));
+    const deleteRows = vi.fn(async () => ({ affectedRows: 1 }));
+    const preview = vi.fn(() => "preview");
+    const driver: IDBDriver = {
+      ...fakeDriver,
+      query,
+      runTransaction: transaction,
+      materializePreviewSql: preview,
+      ...(hooks
+        ? { updateRows, deleteRows, buildMutationPreviewStatement: preview }
+        : {}),
+      coerceInputValue: (value) => (value === "null-display" ? null : value),
+    };
+    const manager = {
+      getConnection: () => ({ id: "conn" }),
+      getDriver: () => driver,
+    } as never;
+    const service = new TableMutationService(manager, {
+      getColumns: async () => columns,
+    });
+    for (const primaryKeys of [
+      { id: null },
+      { id: undefined },
+      {},
+      { id: "null-display" },
+    ]) {
+      const updates = [
+        { primaryKeys: { id: 1 }, changes: { display_name: "ok" } },
+        { primaryKeys, changes: { display_name: "unsafe" } },
+      ];
+      expect(() =>
+        prepareApplyChangesPlan(
+          manager,
+          "conn",
+          "db",
+          "public",
+          "users",
+          updates,
+          columns,
+        ),
+      ).toThrow(/full primary key/);
+      await expect(
+        service.updateRow("conn", "db", "public", "users", primaryKeys, {
+          display_name: "unsafe",
+        }),
+      ).rejects.toThrow(/full primary key/);
+      await expect(
+        service.deleteRows("conn", "db", "public", "users", [
+          { id: 1 },
+          primaryKeys,
+        ]),
+      ).rejects.toThrow(/full primary key/);
+    }
+    expect(preview).not.toHaveBeenCalled();
+    expect(query).not.toHaveBeenCalled();
+    expect(transaction).not.toHaveBeenCalled();
+    expect(updateRows).not.toHaveBeenCalled();
+    expect(deleteRows).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "driver page",
+    "keyset",
+    "offset fallback",
+  ])("exports the column schema of an empty table via %s", async (pagination) => {
+    const driver: IDBDriver = {
+      ...fakeDriver,
+      ...(pagination === "driver page"
+        ? {
+            readTablePage: vi.fn(async () => ({
+              columns,
+              rows: [],
+              totalCount: 0,
+              executionTimeMs: 0,
+            })),
+          }
+        : {
+            describeColumns: vi.fn(async () =>
+              pagination === "keyset"
+                ? columns
+                : columns.map((column) => ({
+                    ...column,
+                    isPrimaryKey: false,
+                  })),
+            ),
+          }),
+    };
+    const service = new TableReadService({
+      getConnection: () => ({ id: "conn" }),
+      getDriver: () => driver,
+    } as never);
+    const chunks = [];
+    for await (const chunk of service.exportAll(
+      "conn",
+      "db",
+      "public",
+      "users",
+    )) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]?.columns.map((column) => column.name)).toEqual(
+      columns.map((column) => column.name),
+    );
+    expect(chunks[0]?.rows).toEqual([]);
+  });
+
   it("builds a combined WHERE clause from valid filters", () => {
     const result = buildWhere(
       fakeDriver,
@@ -425,14 +540,18 @@ describe("table helpers", () => {
     );
 
     expect(result.success).toBe(true);
-    expect(runTransaction).toHaveBeenCalledWith([
-      {
-        sql: "INSERT INTO fixture_rows VALUES (?)",
-        params: [2],
-        checkAffectedRows: true,
-      },
-      { sql: "UPDATE fixture_rows SET display_name = ?", params: ["new"] },
-    ]);
+    expect(runTransaction).toHaveBeenCalledWith(
+      [
+        {
+          sql: "INSERT INTO fixture_rows VALUES (?)",
+          params: [2],
+          checkAffectedRows: true,
+        },
+        { sql: "UPDATE fixture_rows SET display_name = ?", params: ["new"] },
+      ],
+      undefined,
+      { database: "main" },
+    );
   });
 
   it("verifies persisted values after an atomic apply and retains row outcomes", async () => {
@@ -720,6 +839,32 @@ describe("table helpers", () => {
         [{ tenant_id: 1, external_id: 2, description: "extra" }],
       ),
     ).rejects.toThrow(/full primary key/i);
+  });
+
+  it("reports delete (not update) when driver-backed delete misses primary key", async () => {
+    const driver: IDBDriver = {
+      ...fakeDriver,
+      deleteRows: async () => ({ affectedRows: 1 }),
+    };
+    const mutationService = new TableMutationService(
+      {
+        getConnection: () => ({ id: "conn-1" }),
+        getDriver: () => driver,
+      } as never,
+      {
+        getColumns: async () => compositePrimaryKeyColumns,
+      },
+    );
+
+    await expect(
+      mutationService.prepareDeleteRowsPlan(
+        "conn-1",
+        "main",
+        "public",
+        "composite_fixture_rows",
+        [{ tenant_id: 1 }],
+      ),
+    ).rejects.toThrow(/Delete requires the full primary key/);
   });
 
   it("fails driver-backed update plans closed on partial matches", async () => {

@@ -60,6 +60,10 @@ describe("normalizeNumericToken", () => {
       ["99.99$", "99.99"],
       ["1,234.56 ₽", "1234.56"],
       ["50.00€", "50.00"],
+      ["99.99\u{1ECB0}\u00a0€\t", "99.99"],
+      ["\u{1ECB0}99.99\u{1ECB0}", "99.99"],
+      ["CHF 1'234.56\u{1ECB0}€", "1234.56"],
+      ["1,234.56\u{1ECB0}€", "1234.56"],
     ])("normalizes %s -> %s", (input, expected) => {
       expect(normalizeNumericToken(input)).toBe(expected);
     });
@@ -70,6 +74,7 @@ describe("normalizeNumericToken", () => {
       ["(99.99)", "-99.99"],
       ["($50.00)", "-50.00"],
       ["(€1,234.56)", "-1234.56"],
+      ["(\u{1ECB0}1,234.56\u00a0€\u{1ECB0})", "-1234.56"],
     ])("normalizes %s -> %s", (input, expected) => {
       expect(normalizeNumericToken(input)).toBe(expected);
     });
@@ -126,6 +131,8 @@ describe("normalizeNumericToken", () => {
       ["1,5"],
       ["0.99 USD"],
       ["$1,234.56 USD"],
+      ["99.99\udf80"],
+      ["99.99\ud83b"],
     ])("rejects %s", (input) => {
       expect(normalizeNumericToken(input)).toBeNull();
     });

@@ -1073,7 +1073,11 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
         <CardHeader icon="shield" label="Access" />
         <Toggle
           label="Open connection as read-only"
-          hint="Blocks data mutations and shows table data in the same read-only mode used for views. Query text stays editable."
+          hint={
+            type === "mssql"
+              ? "Blocks table edits and query execution for SQL Server. To run queries, use a database read-only login with a regular connection."
+              : "Blocks data mutations and shows table data in the same read-only mode used for views. Only read queries can be executed."
+          }
           checked={connectionReadOnly}
           onChange={setConnectionReadOnly}
         />
