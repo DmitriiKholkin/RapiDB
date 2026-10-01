@@ -514,6 +514,7 @@ export function useTableDataController({
         setPage(snapshot.page);
         setPageSize(snapshot.pageSize);
         setSort(snapshot.sort);
+        loadingRef.current = false;
         setLoading(false);
         setHasCommittedData(true);
         clearErrors();
@@ -561,6 +562,7 @@ export function useTableDataController({
         setReadError(nextError);
       }
 
+      loadingRef.current = false;
       setLoading(false);
       onReadFailedRef.current();
       fetchSnapshotsRef.current.delete(fetchId ?? fetchEpochRef.current);

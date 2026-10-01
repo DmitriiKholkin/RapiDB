@@ -22,6 +22,11 @@ import {
 import { queryCollectionLimit } from "./boundedQueryRows";
 import { BoundedPostgresQuery } from "./postgresBoundedQuery";
 import {
+  type IndexedPlaceholderOptions,
+  indexedPlaceholderOffsets,
+  replaceIndexedPlaceholders,
+} from "./sqlPlaceholders";
+import {
   type DriverTimeoutSettingsProvider,
   throwIfTransactionCancelled,
 } from "./timeout";
@@ -1834,6 +1839,10 @@ export class PostgresDriver extends BaseDBDriver {
     }
     return super.buildOriginalValueComparison(column, paramIndex);
   }
+  protected override getQuestionMarkPlaceholderOptions(): IndexedPlaceholderOptions {
+    // BaseDBDriver uses this options hook for indexed preview scanning too.
+    return { dialect: "pg" };
+  }
   materializePreviewColumnSql(
     sql: string,
     params: readonly unknown[] | undefined,
@@ -1842,10 +1851,10 @@ export class PostgresDriver extends BaseDBDriver {
     if (!params || params.length === 0 || columns.length === 0) {
       return this.materializePreviewSql(sql, params);
     }
-    return sql.replace(/\$(\d+)/g, (match, rawIndex: string) => {
-      const index = Number.parseInt(rawIndex, 10) - 1;
+    const offsets = indexedPlaceholderOffsets(sql, "$", { dialect: "pg" });
+    return replaceIndexedPlaceholders(sql, offsets, ({ index, text }) => {
       if (index < 0 || index >= params.length) {
-        return match;
+        return text;
       }
       return this.formatColumnAwarePreviewLiteral(
         params[index],

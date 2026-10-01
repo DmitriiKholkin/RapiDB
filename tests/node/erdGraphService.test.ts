@@ -23,6 +23,78 @@ function createEventSource<T>() {
 }
 
 describe("ErdGraphService", () => {
+  it("preserves quoted case-sensitive and special column names in nodes and foreign keys", async () => {
+    const names = ["Foo", "foo", "FOO", "%", "%25", "列/Имя 🐘"];
+    const connectionManager = {
+      getDriver: vi.fn(() => ({
+        describeColumns: vi.fn(async () =>
+          names.map((name, index) => ({
+            name,
+            nativeType: "text",
+            isPrimaryKey: false,
+            isForeignKey: true,
+            nullable: index === 1,
+          })),
+        ),
+        getForeignKeys: vi.fn(async () =>
+          names.map((name, index) => ({
+            column: name,
+            referencedSchema: "public",
+            referencedTable: "quoted",
+            referencedColumn: names[(index + 1) % names.length],
+            constraintName: `fk-${index}`,
+          })),
+        ),
+        getIndexes: vi.fn(async () => [
+          { name: "unique-Foo", unique: true, columns: ["Foo"] },
+        ]),
+      })),
+      getSchemaSnapshotAsync: vi.fn(async () => ({
+        databases: [
+          {
+            name: "app_db",
+            schemas: [
+              {
+                name: "public",
+                objects: [{ name: "quoted", type: "table", columns: [] }],
+              },
+            ],
+          },
+        ],
+      })),
+      onDidDisconnect: createEventSource<string>().event,
+      onDidRefreshSchemas: createEventSource<void>().event,
+      onDidChangeSchemaState: createEventSource<string>().event,
+    };
+    const service = new ErdGraphService(connectionManager as never);
+    try {
+      const { graph } = await service.getGraph({
+        connectionId: "conn-1",
+        database: "app_db",
+        schema: "public",
+      });
+      expect(graph.nodes[0].id).toBe(
+        JSON.stringify(["app_db", "public", "quoted"]),
+      );
+      expect(graph.nodes[0].columns.map((column) => column.name)).toEqual(
+        names,
+      );
+      expect(graph.edges).toHaveLength(names.length);
+      names.forEach((name, index) => {
+        expect(
+          graph.edges.find((edge) => edge.fromColumn === name),
+        ).toMatchObject({
+          fromColumn: name,
+          toColumn: names[(index + 1) % names.length],
+          sourceNullable: index === 1,
+          cardinality: index === 0 ? "one-to-one" : "many-to-one",
+        });
+      });
+    } finally {
+      service.dispose();
+    }
+  });
+
   it("builds deterministic graph nodes and edges", async () => {
     const disconnect = createEventSource<string>();
     const refresh = createEventSource<void>();

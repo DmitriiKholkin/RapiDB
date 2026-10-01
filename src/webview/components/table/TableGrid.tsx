@@ -329,7 +329,7 @@ interface TableGridProps {
       newVal: string;
       originalVal: unknown;
     }>,
-  ) => void;
+  ) => PasteValidationError[] | undefined;
   onCommitCellEdit: (
     rowIdx: number,
     column: ColumnMeta,
@@ -349,7 +349,7 @@ interface TableGridProps {
       newVal: string;
       originalVal: unknown;
     }>,
-  ) => void;
+  ) => PasteValidationError[] | undefined;
   onFilterDraftChange: (
     columnName: string,
     nextDraft: FilterDraft | undefined,
@@ -546,7 +546,6 @@ function TableDataGrid({
         : range
           ? { ...range }
           : null;
-      if (pasteContextRef.current) pasteContextRef.current.current = null;
       postMessage("readClipboard", {
         requestId,
         recipient: clipboardRecipientRef.current,
@@ -731,8 +730,6 @@ function TableDataGrid({
       const anchorCol = requestedRange.anchorCol;
       const startCol = anchorCol - selColOffset;
 
-      selection.contextMenuCellRef.current = null;
-
       // Block paste into persisted rows when editing is disabled
       // (e.g. no primary key). Paste into draft rows is always allowed.
       if (!canEditRows && startRow >= 0) return;
@@ -788,8 +785,7 @@ function TableDataGrid({
         //           data-row -1 → virtual draftCount-1
         //   persisted: data-row 0 → virtual draftCount,  1 → virtual draftCount+1, …
         const startVirtualIndex = startRow + draftCount;
-        // When persisted rows are read-only (no PK), only target draft rows
-        const totalRows = canEditRows ? rows.length + draftCount : draftCount;
+        const totalRows = rows.length + draftCount;
 
         const errors: PasteValidationError[] = [];
         const normalizedCells: Array<{
@@ -807,7 +803,30 @@ function TableDataGrid({
             const value = row[c];
             const targetCol = startCol + c;
             const column = visiblePasteColumns[c];
-            if (!column) continue;
+            if (!column) {
+              errors.push({
+                rowIndex: targetVirtualIndex,
+                columnIndex: targetCol + selColOffset,
+                columnName: "",
+                value,
+                message: "Paste would exceed the visible column bounds",
+              });
+              continue;
+            }
+
+            if (
+              targetVirtualIndex >= draftCount &&
+              (!canEditRows || column.isPrimaryKey)
+            ) {
+              errors.push({
+                rowIndex: targetVirtualIndex - draftCount,
+                columnIndex: targetCol + selColOffset,
+                columnName: column.name,
+                value,
+                message: `Cannot paste into read-only persisted column "${column.name}"`,
+              });
+              continue;
+            }
 
             const validation = validatePasteValue(value, column);
             if (!validation.valid) {
@@ -822,7 +841,6 @@ function TableDataGrid({
             }
 
             if (targetVirtualIndex >= totalRows) {
-              if (!canEditRows) continue; // silently truncate past draft rows
               errors.push({
                 rowIndex: targetVirtualIndex,
                 columnIndex: targetCol + selColOffset,
@@ -846,8 +864,6 @@ function TableDataGrid({
           setPasteErrors(errors);
           return;
         }
-
-        setPasteErrors([]);
 
         const batchEdits: Array<{
           rowIdx: number;
@@ -890,11 +906,14 @@ function TableDataGrid({
         // Always use onMixedBatchEdit to push a single undo snapshot
         // instead of looping onBatchDraftCellEdit per row, which would
         // push multiple snapshots based on a stale ref (React batch)
-        if (draftEdits.length > 0) {
-          onMixedBatchEdit(draftEdits, batchEdits);
-        } else if (batchEdits.length > 0) {
-          onBatchCellEdit(batchEdits);
-        }
+        const commitErrors =
+          draftEdits.length > 0
+            ? onMixedBatchEdit(draftEdits, batchEdits)
+            : batchEdits.length > 0
+              ? onBatchCellEdit(batchEdits)
+              : undefined;
+        setPasteErrors(commitErrors ?? []);
+        if (!commitErrors?.length) selection.contextMenuCellRef.current = null;
 
         return;
       }
@@ -911,8 +930,6 @@ function TableDataGrid({
         setPasteErrors(validationResult.errors);
         return;
       }
-
-      setPasteErrors([]);
 
       const edits: Array<{
         rowIdx: number;
@@ -941,7 +958,9 @@ function TableDataGrid({
         }
       }
 
-      onBatchCellEdit(edits);
+      const commitErrors = onBatchCellEdit(edits);
+      setPasteErrors(commitErrors ?? []);
+      if (!commitErrors?.length) selection.contextMenuCellRef.current = null;
     };
 
     const unsubscribe = onMessage<ClipboardTextPayload>(
@@ -976,20 +995,26 @@ function TableDataGrid({
   }, [columns, canSelectAndDeleteRows]);
 
   const wasDraggedRef = React.useRef(false);
+  const resizeCleanupRef = useRef<(() => void) | null>(null);
+  const cancelResize = useCallback(() => {
+    resizeCleanupRef.current?.();
+  }, []);
+  useEffect(() => cancelResize, [cancelResize]);
 
-  const { onHeaderMouseDown: handleHeaderMouseDown } = useColumnDragReorder({
-    getColumnOrder: () => columnOrderRef.current,
-    setColumnOrder: (updater) => setColumnOrder(updater),
-    excludedIds: ["__sel"],
-    onDragActivated: () => {
-      wasDraggedRef.current = true;
-    },
-    onDragEnded: (activated) => {
-      if (!activated) {
-        wasDraggedRef.current = false;
-      }
-    },
-  });
+  const { onHeaderMouseDown: handleHeaderMouseDown, cancelDrag } =
+    useColumnDragReorder({
+      getColumnOrder: () => columnOrderRef.current,
+      setColumnOrder: (updater) => setColumnOrder(updater),
+      excludedIds: ["__sel"],
+      onDragActivated: () => {
+        wasDraggedRef.current = true;
+      },
+      onDragEnded: (activated) => {
+        if (!activated) {
+          wasDraggedRef.current = false;
+        }
+      },
+    });
 
   const tanColumns = useMemo<TanColumnDef<Row>[]>(
     () => [
@@ -1254,7 +1279,8 @@ function TableDataGrid({
                         cursor: isSelectionColumn ? "default" : "grab",
                       }}
                       onMouseDown={(event) => {
-                        if (!isSelectionColumn) {
+                        if (!isSelectionColumn && event.button === 0) {
+                          cancelResize();
                           handleHeaderMouseDown(columnId, event);
                         }
                       }}
@@ -1308,8 +1334,11 @@ function TableDataGrid({
                           ariaLabel={`Resize ${columnId} column`}
                           tabIndex={-1}
                           onMouseDown={(event) => {
+                            if (event.button !== 0) return;
                             event.preventDefault();
                             event.stopPropagation();
+                            cancelResize();
+                            cancelDrag();
 
                             const startSize = Math.max(headerSize, 1);
                             const startX = event.clientX;
@@ -1331,10 +1360,15 @@ function TableDataGrid({
 
                             const onUp = (upEvent: MouseEvent) => {
                               applyWidth(upEvent.clientX);
+                              cleanup();
+                            };
+                            const cleanup = () => {
                               document.removeEventListener("mousemove", onMove);
                               document.removeEventListener("mouseup", onUp);
+                              resizeCleanupRef.current = null;
                             };
 
+                            resizeCleanupRef.current = cleanup;
                             document.addEventListener("mousemove", onMove);
                             document.addEventListener("mouseup", onUp);
                           }}

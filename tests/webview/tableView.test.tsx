@@ -1284,6 +1284,452 @@ describe("TableView", () => {
     });
   });
 
+  it.each([
+    "new-column",
+    "rectangle",
+    "draft-to-persisted",
+    "refresh-during-request",
+  ])("reports unread-column paste atomically through TableView: %s", async (scenario) => {
+    const user = await stageMetadataWork();
+    const refresh = () =>
+      dispatchIncomingMessage("tableInit", {
+        intent: "metadataRefresh",
+        columns: [
+          ...columns,
+          { ...columns[0], name: "extra", isPrimaryKey: false },
+        ],
+        primaryKeyColumns: ["id"],
+      });
+    if (scenario !== "refresh-during-request") await act(async () => refresh());
+    const cell = getBodyCell(
+      scenario === "new-column" || scenario === "draft-to-persisted"
+        ? "extra"
+        : "name",
+      scenario === "draft-to-persisted" ? 0 : 1,
+    );
+    fireEvent.mouseDown(cell, { button: 0 });
+    fireEvent.mouseUp(cell);
+    const selectionClass = cell.className;
+    fireEvent.paste(window);
+    const request = getLastPostedMessage();
+    expect(request?.type).toBe("readClipboard");
+    if (scenario === "refresh-during-request") await act(async () => refresh());
+    await act(async () =>
+      dispatchIncomingMessage("clipboardText", {
+        ...(request?.payload as object),
+        text:
+          scenario === "draft-to-persisted"
+            ? "41\n42"
+            : scenario === "new-column"
+              ? "42"
+              : "Overwritten\t42",
+      }),
+    );
+    if (scenario === "refresh-during-request") {
+      // Metadata refresh deliberately invalidates the fetch epoch, even
+      // while pending work keeps the old rows visible. Keep cancellation.
+      expect(screen.queryByText(/Paste failed/)).toBeNull();
+    } else {
+      expect(screen.getByText(/Paste failed/)).toBeTruthy();
+      expect(screen.getByText(/extra.*has not been read/)).toBeTruthy();
+    }
+    expect(getBodyCell("name", 1).textContent).toBe("Edited Alice");
+    expect(getBodyCell("extra", 0).textContent).toContain("DEFAULT");
+    expect(cell.className).toBe(selectionClass);
+    // A rejected rectangle must not introduce an undo snapshot.
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    expect(getBodyCell("name", 0).textContent).toContain("DEFAULT");
+    await user.click(screen.getByRole("button", { name: "Redo" }));
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "applyChanges",
+      payload: {
+        updates: [
+          {
+            changes: { name: "Edited Alice" },
+            originalValues: { name: "Alice" },
+          },
+        ],
+        insertValues: [{ name: "Draft name" }],
+      },
+    });
+  });
+
+  it.each([
+    "Y",
+    "н",
+  ])("redos with the physical KeyY for key %s", async (key) => {
+    const user = await stageMetadataWork();
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    fireEvent.keyDown(document.body, {
+      key,
+      code: "KeyY",
+      ctrlKey: true,
+      metaKey: true,
+    });
+    expect(getBodyCell("name", 0).textContent).toBe("Draft name");
+  });
+
+  it("allows draft-only paste into an unread new column with one undo step", async () => {
+    const user = await stageMetadataWork();
+    await act(async () =>
+      dispatchIncomingMessage("tableInit", {
+        intent: "metadataRefresh",
+        columns: [
+          ...columns,
+          { ...columns[0], name: "extra", isPrimaryKey: false },
+        ],
+        primaryKeyColumns: ["id"],
+      }),
+    );
+    const cell = getBodyCell("extra", 0);
+    fireEvent.mouseDown(cell, { button: 0 });
+    fireEvent.mouseUp(cell);
+    fireEvent.paste(window);
+    const request = getLastPostedMessage();
+    await act(async () =>
+      dispatchIncomingMessage("clipboardText", {
+        ...(request?.payload as object),
+        text: "42",
+      }),
+    );
+    expect(screen.queryByText(/Paste failed/)).toBeNull();
+    expect(getBodyCell("extra", 0).textContent).toBe("42");
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    expect(getBodyCell("extra", 0).textContent).toContain("DEFAULT");
+    expect(getBodyCell("name", 0).textContent).toBe("Draft name");
+    await user.click(screen.getByRole("button", { name: "Redo" }));
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "applyChanges",
+      payload: { insertValues: [{ name: "Draft name", extra: "42" }] },
+    });
+  });
+
+  it("preflights the live baseline before closing an editor or mutating either batch", () => {
+    const extra = { ...columns[0], name: "extra", isPrimaryKey: false };
+    const columnsRef = { current: columns };
+    const committedColumnNamesRef = {
+      current: new Set(columns.map((column) => column.name)),
+    };
+    const { result } = renderHook(() =>
+      useTableMutationController({
+        canEditRows: true,
+        loadingRef: { current: false },
+        committedColumnNamesRef,
+        columnsRef,
+        fetchPageRef: { current: vi.fn() },
+        pkColsRef: { current: ["id"] },
+        preserveScrollPositionRef: { current: vi.fn() },
+        rowsRef: { current: rows },
+        mongoIdTypesRef: { current: [] },
+        selected: new Set(),
+      }),
+    );
+    act(() => result.current.startInsertRow());
+    act(() => result.current.handleStartDraftEdit(0, columns[1]));
+    // The callback must consult current metadata/baseline refs, not the
+    // schema under which it was obtained.
+    const batch = result.current.commitBatchCellEdits;
+    const mixed = result.current.commitMixedBatchEdits;
+    columnsRef.current = [...columns, extra];
+    const persisted = [
+      {
+        rowIdx: 0,
+        column: columns[1],
+        newVal: "Safe prefix",
+        originalVal: "Alice",
+      },
+      { rowIdx: 0, column: extra, newVal: "42", originalVal: undefined },
+      { rowIdx: 1, column: extra, newVal: "43", originalVal: undefined },
+    ];
+    act(() => {
+      expect(batch(persisted)).toHaveLength(2);
+      expect(
+        mixed([{ rowIdx: 0, column: extra, newVal: "41" }], persisted),
+      ).toHaveLength(2);
+    });
+    expect(result.current.pendingEdits.size).toBe(0);
+    expect(result.current.newRows[0]).not.toHaveProperty("extra");
+    expect(result.current.editCell).toEqual({
+      kind: "draft",
+      rowIdx: 0,
+      col: "name",
+    });
+    act(() => result.current.undoAction());
+    expect(result.current.newRows).toHaveLength(0);
+  });
+
+  it.each([
+    "column-overflow",
+    "read-only-row",
+  ])("rejects unavailable draft rectangle targets without applying a prefix: %s", async (scenario) => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData(
+      scenario === "read-only-row"
+        ? {
+            columnDefs: noPkColumns,
+            primaryKeyColumns: [],
+            dataRows: noPkRows,
+          }
+        : undefined,
+    );
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    const cell = getBodyCell("name");
+    fireEvent.mouseDown(cell, { button: 0 });
+    fireEvent.mouseUp(cell);
+    // The keyboard route also permits paste into drafts without a PK.
+    fireEvent.keyDown(cell, {
+      key: "v",
+      code: "KeyV",
+      ctrlKey: true,
+      metaKey: true,
+    });
+    const request = getLastPostedMessage();
+    expect(request?.type).toBe("readClipboard");
+    await act(async () =>
+      dispatchIncomingMessage("clipboardText", {
+        ...(request?.payload as object),
+        text:
+          scenario === "read-only-row" ? "Draft\nPersisted" : "Draft\tExtra",
+      }),
+    );
+    expect(screen.getByText(/Paste failed/)).toBeTruthy();
+    expect(getBodyCell("name").textContent).toContain("DEFAULT");
+    expect(getBodyCell("name", 1).textContent).toBe("Alice");
+  });
+
+  it("allows persisted paste after authoritative added-column rows commit", async () => {
+    const user = await stageMetadataWork();
+    await act(async () =>
+      dispatchIncomingMessage("tableInit", {
+        intent: "metadataRefresh",
+        columns: [
+          ...columns,
+          { ...columns[0], name: "extra", isPrimaryKey: false },
+        ],
+        primaryKeyColumns: ["id"],
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: "Revert All" }));
+    await waitFor(() => expect(getLastPostedMessage()?.type).toBe("fetchPage"));
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: [{ id: 1, name: "Alice", extra: 7 }],
+        totalCount: 1,
+      }),
+    );
+    const cell = getBodyCell("extra");
+    fireEvent.mouseDown(cell, { button: 0 });
+    fireEvent.mouseUp(cell);
+    fireEvent.paste(window);
+    const request = getLastPostedMessage();
+    await act(async () =>
+      dispatchIncomingMessage("clipboardText", {
+        ...(request?.payload as object),
+        text: "42",
+      }),
+    );
+    expect(screen.queryByText(/Paste failed/)).toBeNull();
+    expect(getBodyCell("extra").textContent).toBe("42");
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    expect(getBodyCell("extra").textContent).toBe("7");
+    await user.click(screen.getByRole("button", { name: "Redo" }));
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "applyChanges",
+      payload: {
+        updates: [{ changes: { extra: "42" }, originalValues: { extra: 7 } }],
+      },
+    });
+  });
+
+  it.each([
+    "Win32",
+    "MacIntel",
+  ])("uses the platform redo modifier and preserves Shift+Z on %s", async (platform) => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
+    const user = await stageMetadataWork();
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    const modifier =
+      platform === "MacIntel" ? { metaKey: true } : { ctrlKey: true };
+    const ignoredEvents = [
+      { key: "y", code: "KeyY" },
+      {
+        key: "y",
+        code: "KeyY",
+        ...(platform === "MacIntel" ? { ctrlKey: true } : { metaKey: true }),
+      },
+      { key: "Y", code: "KeyY", ...modifier, shiftKey: true },
+      { key: "y", code: "KeyY", ...modifier, altKey: true },
+      { key: "y", code: "KeyX", ...modifier },
+    ];
+    for (const init of ignoredEvents) {
+      const event = new KeyboardEvent("keydown", {
+        bubbles: true,
+        cancelable: true,
+        ...init,
+      });
+      fireEvent(document.body, event);
+      expect(event.defaultPrevented).toBe(false);
+      expect(getBodyCell("name", 0).textContent).toContain("DEFAULT");
+    }
+    for (const tag of ["input", "textarea", "select"]) {
+      const input = document.createElement(tag);
+      document.body.appendChild(input);
+      const event = new KeyboardEvent("keydown", {
+        bubbles: true,
+        cancelable: true,
+        key: "н",
+        code: "KeyY",
+        ...modifier,
+      });
+      fireEvent(input, event);
+      expect(event.defaultPrevented).toBe(false);
+      expect(getBodyCell("name", 0).textContent).toContain("DEFAULT");
+      input.remove();
+    }
+    fireEvent.keyDown(document.body, { key: "н", code: "KeyY", ...modifier });
+    expect(getBodyCell("name", 0).textContent).toBe("Draft name");
+    fireEvent.keyDown(document.body, { key: "я", code: "KeyZ", ...modifier });
+    expect(getBodyCell("name", 0).textContent).toContain("DEFAULT");
+    fireEvent.keyDown(document.body, {
+      key: "Я",
+      code: "KeyZ",
+      ...modifier,
+      shiftKey: true,
+    });
+    expect(getBodyCell("name", 0).textContent).toBe("Draft name");
+    vi.restoreAllMocks();
+  });
+
+  it("removes active table resize listeners on unmount without a late width commit", async () => {
+    await initializeCommittedTableData();
+    const add = vi.spyOn(document, "addEventListener");
+    const remove = vi.spyOn(document, "removeEventListener");
+    const handle = screen.getByRole("button", { name: "Resize name column" });
+    fireEvent.mouseDown(handle, { button: 0, clientX: 200 });
+    const listeners = add.mock.calls.filter(
+      ([type]) => type === "mousemove" || type === "mouseup",
+    );
+    expect(listeners).toHaveLength(2);
+    fireEvent.mouseMove(document, { clientX: 240 });
+    const header = handle.closest("th") as HTMLElement;
+    const width = header.style.width;
+    // Public route: replacing the table with a new-schema loading view unmounts the grid.
+    await act(async () =>
+      dispatchIncomingMessage("tableInit", {
+        intent: "metadataRefresh",
+        columns: [...columns, { ...columns[1], name: "extra" }],
+        primaryKeyColumns: ["id"],
+      }),
+    );
+    expect(screen.queryByRole("table")).toBeNull();
+    for (const [type, listener] of listeners) {
+      expect(
+        remove.mock.calls.some(
+          ([removedType, removedListener]) =>
+            removedType === type && removedListener === listener,
+        ),
+      ).toBe(true);
+    }
+    fireEvent.mouseMove(document, { clientX: 500 });
+    fireEvent.mouseUp(document, { clientX: 500 });
+    expect(header.style.width).toBe(width);
+    add.mockRestore();
+    remove.mockRestore();
+  });
+
+  it("ends table resize at the mouseup width and replaces gestures without leftover listeners", async () => {
+    await initializeCommittedTableData();
+    const add = vi.spyOn(document, "addEventListener");
+    const remove = vi.spyOn(document, "removeEventListener");
+    const handle = screen.getByRole("button", { name: "Resize name column" });
+    const header = handle.closest("th") as HTMLElement;
+    const startWidth = Number.parseFloat(header.style.width);
+    fireEvent.mouseDown(handle, { button: 2, clientX: 200 });
+    expect(
+      add.mock.calls.filter(
+        ([type]) => type === "mousemove" || type === "mouseup",
+      ),
+    ).toHaveLength(0);
+    fireEvent.mouseDown(handle, { button: 0, clientX: 200 });
+    fireEvent.mouseMove(document, { clientX: 240 });
+    expect(Number.parseFloat(header.style.width)).toBe(startWidth + 40);
+    fireEvent.mouseDown(handle, { button: 0, clientX: 240 });
+    fireEvent.mouseUp(document, { clientX: 270 });
+    expect(Number.parseFloat(header.style.width)).toBe(startWidth + 70);
+    for (const [type, listener] of add.mock.calls.filter(
+      ([t]) => t === "mousemove" || t === "mouseup",
+    )) {
+      expect(
+        remove.mock.calls.some(([t, l]) => t === type && l === listener),
+      ).toBe(true);
+    }
+    fireEvent.mouseMove(document, { clientX: 500 });
+    fireEvent.mouseUp(document, { clientX: 500 });
+    expect(Number.parseFloat(header.style.width)).toBe(startWidth + 70);
+    expect(document.querySelector(".rapidb-column-drag-ghost")).toBeNull();
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    add.mockRestore();
+    remove.mockRestore();
+  });
+
+  it.each([
+    "unmount",
+    "resize",
+  ])("cancels active header drag through the table UI on %s", async (end) => {
+    await initializeCommittedTableData();
+    document.body.style.cursor = "crosshair";
+    document.body.style.userSelect = "text";
+    const add = vi.spyOn(document, "addEventListener");
+    const remove = vi.spyOn(document, "removeEventListener");
+    const header = screen
+      .getByRole("table")
+      .querySelector(
+        'thead tr:first-child th[data-column-id="name"]',
+      ) as HTMLElement;
+    fireEvent.mouseDown(header, { button: 0, clientX: 20 });
+    fireEvent.mouseMove(document, { clientX: 40, clientY: 14 });
+    expect(document.querySelector(".rapidb-column-drag-ghost")).not.toBeNull();
+    const dragListeners = add.mock.calls.filter(
+      ([t]) => t === "mousemove" || t === "mouseup",
+    );
+    if (end === "unmount") {
+      await act(async () =>
+        dispatchIncomingMessage("tableInit", {
+          intent: "metadataRefresh",
+          columns: [...columns, { ...columns[1], name: "extra" }],
+          primaryKeyColumns: ["id"],
+        }),
+      );
+      expect(screen.queryByRole("table")).toBeNull();
+    } else {
+      fireEvent.mouseDown(
+        within(header).getByRole("button", { name: "Resize name column" }),
+        { button: 0, clientX: 40 },
+      );
+    }
+    expect(document.querySelector(".rapidb-column-drag-ghost")).toBeNull();
+    expect(document.body.style.cursor).toBe("crosshair");
+    expect(document.body.style.userSelect).toBe("text");
+    expect(header.hasAttribute("data-column-dragging")).toBe(false);
+    for (const [type, listener] of dragListeners) {
+      expect(
+        remove.mock.calls.some(([t, l]) => t === type && l === listener),
+      ).toBe(true);
+    }
+    clearPostedMessages();
+    fireEvent.mouseMove(document, { clientX: 500, clientY: 14 });
+    fireEvent.mouseUp(document, { clientX: 500, clientY: 14 });
+    expect(getPostedMessages()).toEqual([]);
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+    add.mockRestore();
+    remove.mockRestore();
+  });
+
   it("requires authoritative rows after a PK refresh even when the new-schema read fails", async () => {
     await initializeCommittedTableData();
     clearPostedMessages();

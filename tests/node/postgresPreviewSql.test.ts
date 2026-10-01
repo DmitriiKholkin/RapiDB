@@ -36,6 +36,106 @@ function column(
 }
 
 describe("postgres preview SQL materialization", () => {
+  describe.each([
+    "generic",
+    "column-aware",
+  ] as const)("%s lexical boundaries", (mode) => {
+    function materialize(sql: string, params: readonly unknown[]): string {
+      return mode === "generic"
+        ? driver.materializePreviewSql(sql, params)
+        : driver.materializePreviewColumnSql(sql, params, [
+            column("id", "integer", "integer"),
+          ]);
+    }
+
+    it.each([
+      "\n",
+      " \t\r\n\f ",
+      " -- ignored ' $1\n",
+      "\n -- another comment $1\r\n",
+    ])("preserves E-string escape mode across continuation %j", (separator) => {
+      const literal = `E'foo'${separator}'it\\'s $1'`;
+      expect(materialize(`SELECT ${literal}, $1`, [7])).toBe(
+        `SELECT ${literal}, 7`,
+      );
+    });
+
+    it("preserves escape mode across multiple continued segments", () => {
+      const literal = "E'foo'\n'bar' -- comment\r'it\\'s $1'";
+      expect(materialize(`SELECT ${literal}, $1`, [7])).toBe(
+        `SELECT ${literal}, 7`,
+      );
+    });
+
+    it.each([
+      " ",
+      "\n/* block comment $1 */\n",
+      ",\n",
+    ])("ends escape mode when %j is not a PG quote continuation", (separator) => {
+      const literals = `E'foo'${separator}'plain\\'`;
+      expect(materialize(`SELECT ${literals}, $1`, [7])).toBe(
+        `SELECT ${literals}, 7`,
+      );
+    });
+
+    it("substitutes placeholders in ARRAY expressions", () => {
+      expect(materialize("SELECT ARRAY[$1,$2],$1", [7, 8])).toBe(
+        "SELECT ARRAY[7,8],7",
+      );
+    });
+
+    it("substitutes placeholders in update subscripts", () => {
+      expect(materialize("UPDATE t SET a[$1]=$2 WHERE id=$3", [1, 8, 7])).toBe(
+        "UPDATE t SET a[1]=8 WHERE id=7",
+      );
+    });
+
+    it("protects placeholders inside Unicode dollar quotes", () => {
+      expect(materialize("SELECT $тег$ $1 $тег$, $1", [7])).toBe(
+        "SELECT $тег$ $1 $тег$, 7",
+      );
+    });
+
+    it("protects Unicode dollar tags with exact, case-sensitive closing delimiters", () => {
+      const literal = "$тег_2$ '\\' $1 $Тег_2$ $тег_2$";
+      expect(materialize(`SELECT ${literal}, $1`, [7])).toBe(
+        `SELECT ${literal}, 7`,
+      );
+    });
+
+    it("does not recognize dollar tags embedded in Unicode identifiers", () => {
+      expect(materialize('SELECT имя$тег$, "имя""$тег$", $1', [7])).toBe(
+        'SELECT имя$тег$, "имя""$тег$", 7',
+      );
+    });
+  });
+
+  it("protects quoted identifiers, strings, comments and dollar quotes in column-aware previews", () => {
+    const protectedSql = `SELECT "x$1", "x""$2", "trailing\\", '$1 '' $2', E'it\\'s $1', $$ '$2 $$, $body$ $1 $body$ /* $1 /* $2 */ $1 */ -- $2\n`;
+    expect(
+      driver.materializePreviewColumnSql(
+        `${protectedSql}$2, $1, $2`,
+        [["a$2", null], Buffer.from([0, 255])],
+        [column("x$1", "text[]", "array"), column("x$2", "bytea", "binary")],
+      ),
+    ).toBe(
+      `${protectedSql}'\\x00ff'::bytea, CAST(ARRAY['a$2', NULL] AS text[]), '\\x00ff'::bytea`,
+    );
+  });
+
+  it("keeps indexed marker boundaries, repeats and multi-digit indices", () => {
+    const params = ["9007199254740993.1234567890", ...Array(8).fill(null), 10];
+    expect(
+      driver.materializePreviewColumnSql(
+        "SELECT x$1, $1suffix, $10, $1, $10, $2, $0, $11",
+        params,
+        [column("amount", "numeric(30,10)", "decimal")],
+      ),
+    ).toBe(
+      "SELECT x$1, $1suffix, 10, '9007199254740993.1234567890', 10, NULL, $0, $11",
+    );
+  });
+
   it("prioritizes indexed parameters over the JSON existence operator", () => {
     expect(
       driver.materializePreviewSql(

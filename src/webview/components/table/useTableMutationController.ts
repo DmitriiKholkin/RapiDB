@@ -21,6 +21,7 @@ import type {
   Row,
 } from "../../types";
 import { onMessage, postMessage } from "../../utils/messaging";
+import type { PasteValidationError } from "../../utils/pasteUtils";
 import { valueToEditString } from "./EditInput";
 import type {
   StructuredCellDialogState,
@@ -517,6 +518,32 @@ export function useTableMutationController({
     setApplyStatus(null);
   }, [history, loadingRef]);
 
+  // Validate the entire persisted target set against the live read baseline.
+  // Metadata may have changed while a clipboard request was in flight.
+  const validatePersistedBatch = useCallback(
+    (edits: Array<{ rowIdx: number; column: ColumnMeta; newVal: string }>) => {
+      const errors: PasteValidationError[] = [];
+      for (const { rowIdx, column, newVal } of edits) {
+        if (
+          committedColumnNamesRef &&
+          !committedColumnNamesRef.current.has(column.name)
+        ) {
+          errors.push({
+            rowIndex: rowIdx,
+            columnIndex: columnsRef.current.findIndex(
+              (c) => c.name === column.name,
+            ),
+            columnName: column.name,
+            value: newVal,
+            message: `Column "${column.name}" has not been read for these rows. Apply or revert pending changes, then refresh before pasting.`,
+          });
+        }
+      }
+      return errors;
+    },
+    [committedColumnNamesRef, columnsRef],
+  );
+
   const commitBatchCellEdits = useCallback(
     (
       edits: Array<{
@@ -526,12 +553,13 @@ export function useTableMutationController({
         originalVal: unknown;
       }>,
     ) => {
-      setEditCell(null);
-
       if (isBusy() || !canEditRowsRef.current) {
         return;
       }
+      const errors = validatePersistedBatch(edits);
+      if (errors.length > 0) return errors;
       if (blockUnsafeRows(edits.map((edit) => edit.rowIdx))) return;
+      setEditCell(null);
 
       const currentPending = pendingEditsRef.current;
 
@@ -544,11 +572,6 @@ export function useTableMutationController({
 
       for (const edit of edits) {
         const { rowIdx, column, newVal, originalVal } = edit;
-        if (
-          committedColumnNamesRef &&
-          !committedColumnNamesRef.current.has(column.name)
-        )
-          continue;
         const coerced: unknown = newVal === NULL_SENTINEL ? null : newVal;
         const originalValueString = valueToEditString(originalVal);
 
@@ -600,7 +623,7 @@ export function useTableMutationController({
         return nextPending;
       });
     },
-    [history, isBusy, committedColumnNamesRef, blockUnsafeRows],
+    [history, isBusy, validatePersistedBatch, blockUnsafeRows],
   );
 
   const commitCellEdit = useCallback(
@@ -753,8 +776,10 @@ export function useTableMutationController({
       }>,
     ) => {
       if (isBusy()) return;
-      setEditCell(null);
+      const errors = validatePersistedBatch(persistedEdits);
+      if (errors.length > 0) return errors;
       if (blockUnsafeRows(persistedEdits.map((edit) => edit.rowIdx))) return;
+      setEditCell(null);
 
       const currentRows = newRowsRef.current;
       const currentPending = pendingEditsRef.current;
@@ -779,11 +804,6 @@ export function useTableMutationController({
       const effectivePersistedEdits: typeof persistedEdits = [];
       for (const edit of persistedEdits) {
         const { rowIdx, column, newVal, originalVal } = edit;
-        if (
-          committedColumnNamesRef &&
-          !committedColumnNamesRef.current.has(column.name)
-        )
-          continue;
         const coerced: unknown = newVal === NULL_SENTINEL ? null : newVal;
         const originalValueString = valueToEditString(originalVal);
 
@@ -856,7 +876,7 @@ export function useTableMutationController({
         });
       }
     },
-    [history, isBusy, committedColumnNamesRef, blockUnsafeRows],
+    [history, isBusy, validatePersistedBatch, blockUnsafeRows],
   );
 
   const handleStartEdit = useCallback(
@@ -1120,7 +1140,7 @@ export function useTableMutationController({
 
       const isMac = navigator.platform.toUpperCase().includes("MAC");
       const mod = isMac ? event.metaKey : event.ctrlKey;
-      if (!mod) return;
+      if (!mod || event.altKey) return;
 
       if (event.code === "KeyZ" && !event.shiftKey) {
         event.preventDefault();
@@ -1128,7 +1148,7 @@ export function useTableMutationController({
       } else if (event.code === "KeyZ" && event.shiftKey) {
         event.preventDefault();
         redoAction();
-      } else if (event.key === "y") {
+      } else if (event.code === "KeyY" && !event.shiftKey) {
         event.preventDefault();
         redoAction();
       }

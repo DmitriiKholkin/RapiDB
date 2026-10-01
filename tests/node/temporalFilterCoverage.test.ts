@@ -277,6 +277,199 @@ describe("temporal filter operator coverage", () => {
     });
   });
 
+  describe.each([
+    ["TIME", "time", "12", "12:34", "12:34:00", "TIME"],
+    [
+      "DATETIME",
+      "datetime",
+      "2026",
+      "2026-10-01T12:34:56",
+      "2026-10-01 12:34:56",
+      "DATETIME",
+    ],
+  ] as const)("SQLite %s equality", (nativeType, category, raw, valid, normalized, sqlFunction) => {
+    const driver = new SQLiteDriver({
+      ...baseConfig,
+      type: "sqlite",
+      filePath: ":memory:",
+    } as ConnectionConfig);
+    const temporalColumn = column("event", nativeType, category);
+
+    it.each([
+      "eq",
+      "neq",
+    ] as const)("uses exact parameterized %s for raw values and literal pattern tokens", (operator) => {
+      for (const value of [
+        raw,
+        "raw%_value",
+        "%",
+        "_",
+        "x' OR 1=1 --",
+        "25:99:99",
+      ]) {
+        const normalizedValue = driver.normalizeFilterValue(
+          temporalColumn,
+          operator,
+          value,
+        );
+        expect(normalizedValue).toBe(value);
+        expect(
+          driver.buildFilterCondition(
+            temporalColumn,
+            operator,
+            normalizedValue,
+            1,
+          ),
+        ).toEqual({
+          sql: `"event" ${operator === "eq" ? "=" : "<>"} ?`,
+          params: [value],
+        });
+      }
+    });
+
+    it("keeps valid temporal normalization and SQL null predicates", () => {
+      for (const operator of ["eq", "neq"] as const) {
+        expect(
+          driver.normalizeFilterValue(temporalColumn, operator, valid),
+        ).toBe(normalized);
+        expect(
+          driver.buildFilterCondition(temporalColumn, operator, valid, 1),
+        ).toEqual({
+          sql: `${sqlFunction}("event") ${operator === "eq" ? "=" : "!="} ${sqlFunction}(?)`,
+          params: [normalized],
+        });
+      }
+      expect(
+        driver.buildFilterCondition(temporalColumn, "is_null", undefined, 1),
+      ).toEqual({ sql: '"event" IS NULL', params: [] });
+      expect(
+        driver.buildFilterCondition(
+          temporalColumn,
+          "is_not_null",
+          undefined,
+          1,
+        ),
+      ).toEqual({ sql: '"event" IS NOT NULL', params: [] });
+    });
+
+    it("keeps Contains wildcard semantics", () => {
+      const value = driver.normalizeFilterValue(
+        temporalColumn,
+        "like",
+        "raw%_value",
+      );
+      expect(
+        driver.buildFilterCondition(temporalColumn, "like", value, 1),
+      ).toEqual({ sql: '"event" LIKE ?', params: ["%raw%_value%"] });
+    });
+
+    it("rejects invalid ranges in normalization and direct builders", () => {
+      const inputs: [FilterOperator, string | [string, string]][] = [
+        ["gt", raw],
+        ["gte", raw],
+        ["lt", raw],
+        ["lte", raw],
+        ["between", [valid, raw]],
+        ["between", [raw, valid]],
+      ];
+      for (const [operator, value] of inputs) {
+        expect(() =>
+          driver.normalizeFilterValue(temporalColumn, operator, value),
+        ).toThrow(/expects a valid/);
+        expect(() =>
+          driver.buildFilterCondition(temporalColumn, operator, value, 1),
+        ).toThrow(/expects a valid/);
+      }
+    });
+  });
+
+  describe("SQLite datetime component validation", () => {
+    const driver = new SQLiteDriver({
+      ...baseConfig,
+      type: "sqlite",
+      filePath: ":memory:",
+    } as ConnectionConfig);
+    const datetimeColumn = column("event", "DATETIME", "datetime");
+
+    it.each([
+      "2026-00-01 12:34:56",
+      "2026-13-01 12:34:56",
+      "2026-13-01T12:34:56",
+      "2026-10-00 12:34:56",
+      "2026-10-32 12:34:56",
+      "2026-04-31 12:34:56",
+      "2026-02-29 12:34:56",
+      "2024-02-30 12:34:56",
+      "1900-02-29 12:34:56",
+      "2100-02-29 12:34:56",
+      "2026-10-01 12:34:56+99:99",
+      "2026-10-01T12:34:56 +99:99",
+      "2026-10-01 12:34:56-99:99",
+      "2026-10-01 12:34:56+15:00",
+      "2026-10-01 12:34:56-15:00",
+      "2026-10-01 12:34:56+00:60",
+      "2026-10-01 12:34:56-14:60",
+    ])("uses raw equality and rejects ranges/lists for %s", (value) => {
+      for (const operator of ["eq", "neq"] as const) {
+        expect(
+          driver.normalizeFilterValue(datetimeColumn, operator, value),
+        ).toBe(value);
+        expect(
+          driver.buildFilterCondition(datetimeColumn, operator, value, 1),
+        ).toEqual({
+          sql: `"event" ${operator === "eq" ? "=" : "<>"} ?`,
+          params: [value],
+        });
+      }
+      const valid = "2026-10-01 12:34:56";
+      const inputs: [FilterOperator, string | [string, string]][] = [
+        ["gt", value],
+        ["gte", value],
+        ["lt", value],
+        ["lte", value],
+        ["between", [valid, value]],
+        ["between", [value, valid]],
+        ["in", `${valid}, ${value}`],
+      ];
+      for (const [operator, input] of inputs) {
+        expect(() =>
+          driver.normalizeFilterValue(datetimeColumn, operator, input),
+        ).toThrow(/expects a valid datetime/);
+        expect(() =>
+          driver.buildFilterCondition(datetimeColumn, operator, input, 1),
+        ).toThrow(/expects a valid datetime/);
+      }
+    });
+
+    it.each([
+      ["0000-02-29 00:00", "0000-02-29 00:00"],
+      ["0001-01-01 00:00:00", "0001-01-01 00:00:00"],
+      ["1900-02-28 23:59:59", "1900-02-28 23:59:59"],
+      ["2000-02-29 12:34:56", "2000-02-29 12:34:56"],
+      ["2024-02-29T12:34:56.123Z", "2024-02-29 12:34:56.123Z"],
+      ["2026-04-30 12:34:56", "2026-04-30 12:34:56"],
+      ["9999-12-31 23:59:59", "9999-12-31 23:59:59"],
+      ["2026-10-01T12:34z", "2026-10-01 12:34z"],
+      ["2026-10-01 12:34:56 Z", "2026-10-01 12:34:56 Z"],
+      ["2026-10-01T12:34:56 +02:00", "2026-10-01 12:34:56+02:00"],
+      ["2026-10-01 12:34:56-00:00", "2026-10-01 12:34:56-00:00"],
+      ["2026-10-01 12:34:56+14:59", "2026-10-01 12:34:56+14:59"],
+      ["2026-10-01 12:34:56-14:59", "2026-10-01 12:34:56-14:59"],
+    ])("preserves supported datetime normalization for %s", (value, normalized) => {
+      for (const operator of ["eq", "neq", "gt"] as const) {
+        expect(
+          driver.normalizeFilterValue(datetimeColumn, operator, value),
+        ).toBe(normalized);
+        expect(
+          driver.buildFilterCondition(datetimeColumn, operator, value, 1),
+        ).toEqual({
+          sql: `DATETIME("event") ${operator === "eq" ? "=" : operator === "neq" ? "!=" : ">"} DATETIME(?)`,
+          params: [normalized],
+        });
+      }
+    });
+  });
+
   it("matches MSSQL temporal equality against the millisecond-precision values shown in the table viewer", () => {
     const driver = new MSSQLDriver({
       ...baseConfig,

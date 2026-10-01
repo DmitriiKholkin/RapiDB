@@ -134,11 +134,34 @@ function getTextPlaceholderRatio(
 }
 
 function normalizeHandlePart(columnName: string): string {
-  return encodeURIComponent(columnName.toLowerCase());
+  return encodeURIComponent(columnName);
 }
 
 function handleId(side: "left" | "right", columnName: string): string {
   return `${side}-${normalizeHandlePart(columnName)}`;
+}
+
+// Visibility is a presentation filter, not the source of persisted node IDs.
+// Reconcile against the authoritative graph so hidden nodes survive and removed
+// nodes cannot be resurrected by a later viewport/drag callback.
+function mergeNodePositions(
+  graph: ErdGraph,
+  savedPositions: NonNullable<ErdViewState["nodePositions"]>,
+  visibleNodes: ErdFlowNode[],
+  layoutPositions?: Map<string, { x: number; y: number }>,
+): NonNullable<ErdViewState["nodePositions"]> {
+  const visiblePositions = new Map(
+    visibleNodes.map((node) => [node.id, node.position]),
+  );
+  return Object.fromEntries(
+    graph.nodes.map((node) => [
+      node.id,
+      visiblePositions.get(node.id) ??
+        savedPositions[node.id] ??
+        layoutPositions?.get(node.id) ??
+        node.position,
+    ]),
+  );
 }
 
 function layoutGraph(
@@ -909,7 +932,7 @@ export function ErdView({
   );
 
   const hasRestoredViewportRef = useRef(false);
-  const lastSyncedLoadedAtRef = useRef<string | null>(null);
+  const graphRef = useRef<ErdGraph | null>(null);
   const viewportRef = useRef(initialState.viewport);
   const reactFlowApiRef = useRef<ReactFlowInstance<
     ErdFlowNode,
@@ -925,13 +948,14 @@ export function ErdView({
   const normalizedSearch = search.trim().toLowerCase();
   const shouldHideUnmatched = hideUnmatched && Boolean(normalizedSearch);
 
-  useEffect(() => {
-    flowNodesRef.current = flowNodes;
-  }, [flowNodes]);
-
-  useEffect(() => {
-    manualPositionsRef.current = manualPositions;
-  }, [manualPositions]);
+  const updateManualPositions = useCallback(
+    (positions: NonNullable<ErdViewState["nodePositions"]>) => {
+      // Message/ReactFlow callbacks may run together before React commits.
+      manualPositionsRef.current = positions;
+      setManualPositions(positions);
+    },
+    [],
+  );
 
   useEffect(() => {
     searchRef.current = search;
@@ -951,6 +975,19 @@ export function ErdView({
 
   useEffect(() => {
     const unGraph = onMessage<ErdGraphMessage>("erdGraph", (payload) => {
+      const fullLayout = layoutGraph(payload.graph.nodes, payload.graph.edges);
+      const positions = mergeNodePositions(
+        payload.graph,
+        manualPositionsRef.current,
+        flowNodesRef.current,
+        fullLayout.positions,
+      );
+      graphRef.current = payload.graph;
+      const nodeIds = new Set(payload.graph.nodes.map((node) => node.id));
+      flowNodesRef.current = flowNodesRef.current.filter((node) =>
+        nodeIds.has(node.id),
+      );
+      updateManualPositions(positions);
       setGraph(payload.graph);
       setFromCache(payload.fromCache);
       setLoadedAt(payload.loadedAt);
@@ -976,7 +1013,7 @@ export function ErdView({
       unError();
       unLoading();
     };
-  }, []);
+  }, [updateManualPositions]);
 
   useEffect(() => {
     const nextState: ErdViewState = {
@@ -1065,10 +1102,6 @@ export function ErdView({
     };
   }, [connectedNodeIds, graph, hideIsolated, visibilityFilterNodeIds]);
 
-  const layout = useMemo(() => {
-    return layoutGraph(visibleGraph.nodes, visibleGraph.edges);
-  }, [visibleGraph.edges, visibleGraph.nodes]);
-
   const openData = useCallback((node: ErdGraph["nodes"][number]) => {
     postMessage("openTableData", {
       database: node.database,
@@ -1087,8 +1120,7 @@ export function ErdView({
       return {
         id: node.id,
         type: "tableNode",
-        position:
-          manualPosition ?? layout.positions.get(node.id) ?? node.position,
+        position: manualPosition ?? node.position,
         data: {
           node,
           isDimmed,
@@ -1099,7 +1131,6 @@ export function ErdView({
     });
   }, [
     focusedNodeIds,
-    layout.positions,
     manualPositions,
     normalizedSearch,
     openData,
@@ -1108,7 +1139,18 @@ export function ErdView({
   ]);
 
   useEffect(() => {
-    setFlowNodes(preparedFlowNodes);
+    // Graph/filter/LOD preparation may predate a position callback in the same
+    // React batch. Rebuild presentation using the latest live coordinates;
+    // only new/unhidden nodes fall back to their cached/layout positions.
+    const livePositions = new Map(
+      flowNodesRef.current.map((node) => [node.id, node.position]),
+    );
+    const nodes = preparedFlowNodes.map((node) => ({
+      ...node,
+      position: livePositions.get(node.id) ?? node.position,
+    }));
+    flowNodesRef.current = nodes;
+    setFlowNodes(nodes);
   }, [preparedFlowNodes]);
 
   const flowEdges = useMemo<ErdFlowEdge[]>(() => {
@@ -1159,30 +1201,15 @@ export function ErdView({
     hasRestoredViewportRef.current = true;
   }, [flowNodes.length, loadedAt, loading, reactFlowApi]);
 
-  useEffect(() => {
-    if (!loadedAt || lastSyncedLoadedAtRef.current === loadedAt) {
-      return;
-    }
-
-    lastSyncedLoadedAtRef.current = loadedAt;
-    setManualPositions((previousPositions) => {
-      const nextPositions: Record<string, { x: number; y: number }> = {};
-      for (const node of visibleGraph.nodes) {
-        const existing = previousPositions[node.id];
-        nextPositions[node.id] =
-          existing ?? layout.positions.get(node.id) ?? node.position;
-      }
-      return nextPositions;
-    });
-  }, [layout.positions, loadedAt, visibleGraph.nodes]);
-
   const handleReload = useCallback(() => {
     postMessage("reload");
   }, []);
 
   const handleNodesChange = useCallback(
     (changes: NodeChange<ErdFlowNode>[]) => {
-      setFlowNodes((nodes) => applyNodeChanges(changes, nodes));
+      const nodes = applyNodeChanges(changes, flowNodesRef.current);
+      flowNodesRef.current = nodes;
+      setFlowNodes(nodes);
     },
     [],
   );
@@ -1197,39 +1224,38 @@ export function ErdView({
 
   const handleNodeDragStop = useCallback(
     (_event: React.MouseEvent | MouseEvent, node: ErdFlowNode) => {
-      setManualPositions((prev) => ({
-        ...prev,
+      if (!graphRef.current?.nodes.some((item) => item.id === node.id)) {
+        return;
+      }
+      flowNodesRef.current = flowNodesRef.current.map((item) =>
+        item.id === node.id ? { ...item, position: node.position } : item,
+      );
+      updateManualPositions({
+        ...manualPositionsRef.current,
         [node.id]: {
           x: node.position.x,
           y: node.position.y,
         },
-      }));
+      });
     },
-    [],
+    [updateManualPositions],
   );
 
   const handleMoveEnd = useCallback(() => {
     const instance = reactFlowApiRef.current;
-    if (!instance) {
+    const currentGraph = graphRef.current;
+    if (!instance || !currentGraph) {
       return;
     }
 
     const viewport = instance.getViewport();
     viewportRef.current = viewport;
-    const nodePositions = flowNodesRef.current.reduce<
-      Record<string, { x: number; y: number }>
-    >(
-      (acc, item) => {
-        acc[item.id] = {
-          x: item.position.x,
-          y: item.position.y,
-        };
-        return acc;
-      },
-      {
-        ...manualPositionsRef.current,
-      },
+    const nodePositions = mergeNodePositions(
+      currentGraph,
+      manualPositionsRef.current,
+      flowNodesRef.current,
     );
+    updateManualPositions(nodePositions);
     persistState({
       search: searchRef.current,
       hideUnmatched: hideUnmatchedRef.current,
@@ -1237,7 +1263,7 @@ export function ErdView({
       nodePositions,
       viewport,
     });
-  }, []);
+  }, [updateManualPositions]);
 
   const handleMove = useCallback(
     (

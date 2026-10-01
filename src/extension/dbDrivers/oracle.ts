@@ -7,6 +7,10 @@ import { oracleAlternativeQuoteEnd } from "../utils/sqlStatementScan";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
 import { BoundedQueryRows, queryCollectionLimit } from "./boundedQueryRows";
 import {
+  indexedPlaceholderOffsets,
+  replaceIndexedPlaceholders,
+} from "./sqlPlaceholders";
+import {
   escapeSqlPreviewStringLiteral,
   formatHexSqlPreviewLiteral,
   formatSqlPreviewStringLiteral,
@@ -2409,10 +2413,10 @@ export class OracleDriver extends BaseDBDriver {
     if (!params || params.length === 0) {
       return sql;
     }
-    return sql.replace(/:(\d+)/g, (match, rawIndex: string) => {
-      const index = Number.parseInt(rawIndex, 10) - 1;
+    const offsets = indexedPlaceholderOffsets(sql, ":", { dialect: "oracle" });
+    return replaceIndexedPlaceholders(sql, offsets, ({ index, text }) => {
       if (index < 0 || index >= params.length) {
-        return match;
+        return text;
       }
       return this.formatOracleColumnAwarePreviewLiteral(
         params[index],

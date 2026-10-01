@@ -1795,6 +1795,233 @@ describe("ConnectionManager", () => {
     });
   });
 
+  it.each([
+    {
+      name: "database password",
+      config: {
+        id: "hydrate-pg",
+        name: "Password",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+        password: " db-secret ",
+      } as ConnectionConfig,
+      secrets: { password: " db-secret " },
+      hydrated: { password: " db-secret " },
+    },
+    {
+      name: "SSH password",
+      config: { ...createSshPgConfig("hydrate-ssh"), password: "db-secret" },
+      secrets: { password: "db-secret", sshPassword: "ssh-secret" },
+      hydrated: { password: "db-secret", ssh: { password: "ssh-secret" } },
+    },
+    {
+      name: "API key",
+      config: {
+        id: "hydrate-es",
+        name: "API key",
+        type: "elasticsearch",
+        endpoint: "https://cluster.example.com",
+        apiKey: "api-secret",
+      } as ConnectionConfig,
+      secrets: { apiKey: "api-secret" },
+      hydrated: { apiKey: "api-secret" },
+    },
+    {
+      name: "AWS credentials",
+      config: {
+        id: "hydrate-ddb",
+        name: "AWS",
+        type: "dynamodb",
+        awsRegion: "us-east-1",
+        awsAccessKeyId: "access-key",
+        awsSecretAccessKey: "aws-secret",
+        awsSessionToken: "session-token",
+      } as ConnectionConfig,
+      secrets: {
+        awsAccessKeyId: "access-key",
+        awsSecretAccessKey: "aws-secret",
+        awsSessionToken: "session-token",
+      },
+      hydrated: {
+        awsAccessKeyId: "access-key",
+        awsSecretAccessKey: "aws-secret",
+        awsSessionToken: "session-token",
+      },
+    },
+  ])("aborts final hydration after successful migration and retries with unchanged $name", async ({
+    config,
+    secrets,
+    hydrated,
+  }) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const originalConfig = structuredClone(config);
+    const rawSecret = JSON.stringify(secrets);
+    store.setConnections([config]);
+    store.setSecret(config.id, rawSecret);
+    const readSecret = store.getSecret.bind(store);
+    const reads = vi.spyOn(store, "getSecret");
+    const writes = vi.spyOn(store, "storeSecret");
+    const deletes = vi.spyOn(store, "deleteSecret");
+    const createSshRuntime = vi.fn(async () => ({
+      transport: {
+        kind: "tcpForward" as const,
+        localHost: "127.0.0.1" as const,
+        localPort: 15432,
+        remoteHost: "db.internal",
+        remotePort: 5432,
+      },
+      verifiedFingerprintSha256:
+        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      dispose: vi.fn(async () => undefined),
+    }));
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+      { createSshRuntime },
+    );
+    const state = manager as unknown as {
+      createDriver(config: ConnectionConfig): IDBDriver;
+      _connectAbortControllerMap: Map<string, AbortController>;
+      sshRuntimeMap: Map<string, unknown>;
+    };
+    const factory = vi.spyOn(state, "createDriver");
+    const connected = vi.fn();
+    manager.onDidConnect(connected);
+    const storageError = Object.assign(new Error("Keychain read unavailable"), {
+      code: "EKEYCHAIN",
+    });
+    const hydrate = manager._hydratePassword.bind(manager);
+    // Keep the real migration and hydration. Arm only the read immediately
+    // inside hydration, so background/checked migration reads cannot consume it.
+    const hydration = vi
+      .spyOn(manager, "_hydratePassword")
+      .mockImplementation((liveConfig) => {
+        expect(liveConfig.useSecretStorage).toBe(true);
+        expect(liveConfig.password).toBeUndefined();
+        expect(liveConfig.apiKey).toBeUndefined();
+        expect(liveConfig.awsSecretAccessKey).toBeUndefined();
+        expect(liveConfig.ssh?.password).toBeUndefined();
+        expect(store.getConnections()[0]).toEqual(liveConfig);
+        expect(reads).toHaveBeenCalledWith(config.id);
+        reads.mockRejectedValueOnce(storageError);
+        return hydrate(liveConfig);
+      });
+
+    const first = manager.beginConnect(config.id);
+    const concurrent = manager.connectTo(config.id);
+    expect(first.isNew).toBe(true);
+    expect(manager.isConnecting(config.id)).toBe(true);
+    await Promise.all([
+      expect(first.promise).rejects.toBe(storageError),
+      expect(concurrent).rejects.toBe(storageError),
+    ]);
+
+    expect(hydration).toHaveBeenCalledOnce();
+    expect(factory).not.toHaveBeenCalled();
+    expect(driverInstances).toHaveLength(0);
+    expect(createSshRuntime).not.toHaveBeenCalled();
+    expect(state.sshRuntimeMap.has(config.id)).toBe(false);
+    expect(state._connectAbortControllerMap.has(config.id)).toBe(false);
+    expect(manager.isConnecting(config.id)).toBe(false);
+    expect(manager.isConnected(config.id)).toBe(false);
+    expect(manager.getDriver(config.id)).toBeUndefined();
+    expect(connected).not.toHaveBeenCalled();
+    expect(config).toEqual(originalConfig);
+    await expect(readSecret(config.id)).resolves.toBe(rawSecret);
+    expect(writes).not.toHaveBeenCalled();
+    expect(deletes).not.toHaveBeenCalled();
+
+    hydration.mockRestore();
+    const retry = manager.beginConnect(config.id);
+    expect(retry.isNew).toBe(true);
+    await retry.promise;
+    expect(manager.isConnected(config.id)).toBe(true);
+    expect(manager.isConnecting(config.id)).toBe(false);
+    expect(state._connectAbortControllerMap.has(config.id)).toBe(false);
+    expect(factory).toHaveBeenCalledOnce();
+    expect(driverInstances[0]?.config).toMatchObject(hydrated);
+    expect(connected).toHaveBeenCalledOnce();
+    if (config.ssh) {
+      expect(createSshRuntime).toHaveBeenCalledWith(
+        expect.objectContaining({
+          auth: { kind: "password", password: "ssh-secret" },
+        }),
+        expect.any(Object),
+        { signal: expect.any(AbortSignal) },
+      );
+    }
+    await expect(readSecret(config.id)).resolves.toBe(rawSecret);
+    await manager.dispose();
+  });
+
+  it("propagates permanent storage failures from checked migration on every connect attempt", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const config = createSshPgConfig("permanent-storage-failure");
+    store.setConnections([config]);
+    const storageError = new Error("Keychain permanently unavailable");
+    vi.spyOn(store, "getSecret").mockRejectedValue(storageError);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    const hydration = vi.spyOn(manager, "_hydratePassword");
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await expect(manager.connectTo(config.id)).rejects.toBe(storageError);
+      expect(manager.isConnecting(config.id)).toBe(false);
+      expect(manager.isConnected(config.id)).toBe(false);
+      expect(store.getConnections()).toEqual([config]);
+    }
+    expect(hydration).not.toHaveBeenCalled();
+    expect(driverInstances).toHaveLength(0);
+    await manager.dispose();
+  });
+
+  it.each([
+    undefined,
+    false,
+    true,
+  ])("connects without a password when the secret is absent (useSecretStorage: %s)", async (useSecretStorage) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const config: ConnectionConfig = {
+      id: "no-password",
+      name: "No password",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "postgres",
+      useSecretStorage,
+    };
+    store.setConnections([config]);
+    const reads = vi.spyOn(store, "getSecret");
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await manager.connectTo(config.id);
+
+    expect(manager.isConnected(config.id)).toBe(true);
+    expect((driverInstances[0]?.config as ConnectionConfig).password).toBe(
+      useSecretStorage ? "" : undefined,
+    );
+    if (useSecretStorage) expect(reads).toHaveBeenCalledWith(config.id);
+    else expect(reads).not.toHaveBeenCalled();
+    expect(config.password).toBeUndefined();
+    await manager.dispose();
+  });
+
   it("hydrates stored DynamoDB credentials from Secret Storage before connecting", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"

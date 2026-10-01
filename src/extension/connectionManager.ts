@@ -1220,42 +1220,38 @@ export class ConnectionManager
     if (!config.useSecretStorage) {
       return config;
     }
-    try {
-      const stored = await this.store.getSecret(config.id);
-      const secrets = parseStoredConnectionSecrets(stored);
-      const ssh = config.ssh
-        ? {
-            ...config.ssh,
-            password: secrets.sshPassword ?? config.ssh.password,
-            privateKey: secrets.sshPrivateKey ?? config.ssh.privateKey,
-            passphrase: secrets.sshPassphrase ?? config.ssh.passphrase,
-          }
-        : undefined;
-      return {
-        ...config,
-        password: secrets.password ?? config.password ?? "",
-        apiKey: secrets.apiKey ?? config.apiKey,
-        awsAccessKeyId: secrets.awsAccessKeyId ?? config.awsAccessKeyId,
-        awsSecretAccessKey:
-          secrets.awsSecretAccessKey ?? config.awsSecretAccessKey,
-        awsSessionToken: secrets.awsSessionToken ?? config.awsSessionToken,
-        connectionUri: secrets.connectionUri ?? config.connectionUri,
-        uri: secrets.uri ?? config.uri,
-        endpoint: secrets.endpoint ?? config.endpoint,
-        awsEndpoint: secrets.awsEndpoint ?? config.awsEndpoint,
-        ssh,
-        tls:
-          config.tls !== undefined
-            ? {
-                ...config.tls,
-                keyPassphrase:
-                  secrets.tlsKeyPassphrase ?? config.tls.keyPassphrase,
-              }
-            : config.tls,
-      };
-    } catch {
-      return { ...config, password: "" };
-    }
+    const stored = await this.store.getSecret(config.id);
+    const secrets = parseStoredConnectionSecrets(stored);
+    const ssh = config.ssh
+      ? {
+          ...config.ssh,
+          password: secrets.sshPassword ?? config.ssh.password,
+          privateKey: secrets.sshPrivateKey ?? config.ssh.privateKey,
+          passphrase: secrets.sshPassphrase ?? config.ssh.passphrase,
+        }
+      : undefined;
+    return {
+      ...config,
+      password: secrets.password ?? config.password ?? "",
+      apiKey: secrets.apiKey ?? config.apiKey,
+      awsAccessKeyId: secrets.awsAccessKeyId ?? config.awsAccessKeyId,
+      awsSecretAccessKey:
+        secrets.awsSecretAccessKey ?? config.awsSecretAccessKey,
+      awsSessionToken: secrets.awsSessionToken ?? config.awsSessionToken,
+      connectionUri: secrets.connectionUri ?? config.connectionUri,
+      uri: secrets.uri ?? config.uri,
+      endpoint: secrets.endpoint ?? config.endpoint,
+      awsEndpoint: secrets.awsEndpoint ?? config.awsEndpoint,
+      ssh,
+      tls:
+        config.tls !== undefined
+          ? {
+              ...config.tls,
+              keyPassphrase:
+                secrets.tlsKeyPassphrase ?? config.tls.keyPassphrase,
+            }
+          : config.tls,
+    };
   }
   private async _purgeEntriesForConnection<
     T extends {

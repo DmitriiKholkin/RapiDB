@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
-import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
+import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
+import type {
+  ColumnTypeMeta,
+  FilterOperator,
+} from "../../src/extension/dbDrivers/types";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
 const postgresDriver = new PostgresDriver({
@@ -49,6 +53,119 @@ const moneyColumn: ColumnTypeMeta = {
   ],
   valueSemantics: "plain",
 };
+
+const sqliteDriver = new SQLiteDriver({
+  id: "numeric-filter-normalization-sqlite",
+  name: "Numeric Filter Normalization SQLite",
+  type: "sqlite",
+  filePath: ":memory:",
+});
+const sqliteDecimalColumn: ColumnTypeMeta = {
+  ...moneyColumn,
+  name: "amount",
+  type: "decimal(20,0)",
+  nativeType: "DECIMAL(20,0)",
+};
+
+describe("SQLite decimal filter bindings", () => {
+  it.each([
+    "9007199254740993",
+    "-9007199254740993",
+    "9223372036854775807",
+    "-9223372036854775808",
+    "42",
+    "+42",
+    ".125",
+    "99999999999.12345678",
+    "1.25e+2",
+    "1E-3",
+  ])("binds %s as numeric text without JS rounding", (value) => {
+    for (const [operator, sqlOp] of [
+      ["eq", "="],
+      ["neq", "!="],
+      ["gt", ">"],
+      ["gte", ">="],
+      ["lt", "<"],
+      ["lte", "<="],
+    ] as const) {
+      expect(
+        sqliteDriver.buildFilterCondition(
+          sqliteDecimalColumn,
+          operator,
+          value,
+          1,
+        ),
+      ).toEqual({ sql: `"amount" ${sqlOp} ?`, params: [value] });
+    }
+  });
+
+  it("preserves exact strings in IN and BETWEEN and normalizes formatted values", () => {
+    expect(
+      sqliteDriver.buildFilterCondition(
+        sqliteDecimalColumn,
+        "in",
+        "9007199254740993, -9007199254740993",
+        1,
+      ),
+    ).toEqual({
+      sql: '"amount" IN (?, ?)',
+      params: ["9007199254740993", "-9007199254740993"],
+    });
+    expect(
+      sqliteDriver.buildFilterCondition(
+        sqliteDecimalColumn,
+        "between",
+        ["9007199254740993", "9007199254740994"],
+        1,
+      ),
+    ).toEqual({
+      sql: '"amount" BETWEEN ? AND ?',
+      params: ["9007199254740993", "9007199254740994"],
+    });
+    expect(
+      sqliteDriver.buildFilterCondition(
+        sqliteDecimalColumn,
+        "eq",
+        "$1,234.56",
+        1,
+      ),
+    ).toEqual({ sql: '"amount" = ?', params: ["1234.56"] });
+  });
+
+  it.each([
+    "NaN",
+    "Infinity",
+    "-Infinity",
+    "1e999",
+    "0x10",
+    "1.",
+    "abc123",
+    "1 OR 1=1",
+    "1); DROP TABLE items; --",
+    "",
+  ])("rejects invalid decimal %j in normalization and direct builders", (value) => {
+    const inputs: [FilterOperator, string | [string, string]][] = [
+      ["eq", value],
+      ["neq", value],
+      ["gt", value],
+      ["in", `1, ${value || "NaN"}`],
+      ["between", ["1", value]],
+    ];
+    for (const [operator, input] of inputs) {
+      expect(() =>
+        sqliteDriver.normalizeFilterValue(sqliteDecimalColumn, operator, input),
+      ).toThrow(/RapiDB Filter/);
+      expect(() =>
+        sqliteDriver.buildFilterCondition(
+          sqliteDecimalColumn,
+          operator,
+          input,
+          1,
+        ),
+      ).toThrow(/RapiDB Filter/);
+    }
+  });
+});
 
 describe("numeric filter normalization", () => {
   it("preserves a precise bigint in PostgreSQL filter parameters", () => {

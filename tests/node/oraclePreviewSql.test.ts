@@ -38,6 +38,55 @@ function buildColumn(
 }
 
 describe("Oracle preview SQL literals", () => {
+  it("protects quoted identifiers, strings and comments in column-aware previews", () => {
+    const driver = new OracleDriver(baseConfig as ConnectionConfig);
+    const protectedSql = `SELECT "x:1", "x"":2", "trailing\\", ':1 '' :2' /* :1 */ -- :2\n`;
+    expect(
+      driver.materializePreviewColumnSql(
+        `${protectedSql}:2, :1, :2, :3`,
+        [new Date(Date.UTC(2024, 5, 15, 12, 30)), Buffer.from([0, 255]), null],
+        [
+          buildColumn("x:1", "DATE", "date"),
+          buildColumn("x:2", "RAW(2)", "binary"),
+        ],
+      ),
+    ).toBe(
+      `${protectedSql}HEXTORAW('00ff'), TO_DATE('2024-06-15 12:30:00', 'YYYY-MM-DD HH24:MI:SS'), HEXTORAW('00ff'), NULL`,
+    );
+  });
+
+  it.each([
+    "q'[it's :1]'",
+    "Q'{it's :1}'",
+    "q'(it's :1)'",
+    "q'<it's :1>'",
+    "q'!it's :1!'",
+    "nq'[it's :1]'",
+  ])("protects Oracle alternative-quoted literal %s", (literal) => {
+    const driver = new OracleDriver(baseConfig as ConnectionConfig);
+    expect(
+      driver.materializePreviewColumnSql(
+        `SELECT ${literal}, :1 FROM dual`,
+        [7],
+        [buildColumn("x:1", "NUMBER", "integer")],
+      ),
+    ).toBe(`SELECT ${literal}, 7 FROM dual`);
+  });
+
+  it("keeps indexed marker boundaries, repeats and multi-digit indices", () => {
+    const driver = new OracleDriver(baseConfig as ConnectionConfig);
+    const params = ["9007199254740993.1234567890", ...Array(8).fill(null), 10];
+    expect(
+      driver.materializePreviewColumnSql(
+        "SELECT x:1, :1suffix, ::1, :10, :1, :10, :2, :0, :11 FROM dual",
+        params,
+        [buildColumn("amount", "NUMBER(30,10)", "decimal")],
+      ),
+    ).toBe(
+      "SELECT x:1, :1suffix, ::1, 10, '9007199254740993.1234567890', 10, NULL, :0, :11 FROM dual",
+    );
+  });
+
   it("materializes JS Date values as ANSI TIMESTAMP literals", () => {
     const driver = new OracleDriver(baseConfig as ConnectionConfig);
     const preview = driver.materializePreviewSql(

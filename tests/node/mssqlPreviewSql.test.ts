@@ -78,6 +78,13 @@ describe("MSSQL preview SQL literals", () => {
     );
   });
 
+  it("preserves bracket identifiers and their doubled closing brackets", () => {
+    const driver = new MSSQLDriver(baseConfig as ConnectionConfig);
+    expect(driver.materializePreviewSql("SELECT [x]]?$1:1], ?", [7])).toBe(
+      "SELECT [x]]?$1:1], 7",
+    );
+  });
+
   it("materializes INSERT preview SQL with Unicode string prefixes for Unicode columns", () => {
     const driver = new MSSQLDriver(baseConfig as ConnectionConfig);
     const preview = driver.materializePreviewInsertSql(

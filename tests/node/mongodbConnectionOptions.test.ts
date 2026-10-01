@@ -87,13 +87,18 @@ describe("MongoDBDriver — connect()", () => {
     ]);
   });
 
-  it("uses an explicit connectionUri unchanged while still forwarding authSource options", async () => {
+  it.each([
+    "mongodb://cluster.example:27017/customdb?retryWrites=true",
+    "mongodb://u%40:p%25@[::1]:27018/a%3Fb?retryWrites=true",
+    "mongodb+srv://u%40:p%25@cluster.example/a%3Fb?retryWrites=true",
+  ])("uses explicit connectionUri unchanged: %s", async (connectionUri) => {
     const driver = new MongoDBDriver({
       id: "mongodb-connect-explicit-uri",
       name: "Mongo Connect Explicit URI",
       type: "mongodb",
-      connectionUri:
-        "mongodb://cluster.example:27017/customdb?retryWrites=true",
+      connectionUri,
+      uri: "mongodb://ignored.example/ignored",
+      host: "::1",
       database: "ignored-db",
       authSource: "admin",
     });
@@ -102,7 +107,7 @@ describe("MongoDBDriver — connect()", () => {
 
     expect(mongoClientMocks.constructorCalls).toEqual([
       expect.objectContaining({
-        uri: "mongodb://cluster.example:27017/customdb?retryWrites=true",
+        uri: connectionUri,
         options: expect.objectContaining({
           authSource: "admin",
         }),

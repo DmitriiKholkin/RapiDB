@@ -12,6 +12,7 @@ export interface UseColumnDragReorderOptions {
 export interface UseColumnDragReorderResult {
   onHeaderMouseDown: (columnId: string, event: React.MouseEvent) => void;
   isDragging: () => boolean;
+  cancelDrag: () => void;
 }
 
 interface DragState {
@@ -21,6 +22,7 @@ interface DragState {
   lastSwappedNeighbor: string | null;
   lastSwapDirection: "forward" | "backward" | null;
   draggedTh: HTMLElement;
+  ghost: HTMLElement | null;
 }
 
 interface LiveOrderAccessors {
@@ -68,6 +70,12 @@ export function useColumnDragReorder(
 
   const dragStateRef = useRef<DragState | null>(null);
   const isDraggingRef = useRef(false);
+  const gestureCleanupRef = useRef<(() => void) | null>(null);
+  const cancelDrag = useCallback(() => {
+    gestureCleanupRef.current?.();
+  }, []);
+
+  useEffect(() => cancelDrag, [cancelDrag]);
 
   const isDragging = useCallback(() => isDraggingRef.current, []);
 
@@ -82,6 +90,7 @@ export function useColumnDragReorder(
       const order = getColumnOrderRef.current();
       if (!order.includes(columnId)) return;
 
+      cancelDrag();
       dragStateRef.current = {
         columnId,
         startX: event.clientX,
@@ -89,7 +98,14 @@ export function useColumnDragReorder(
         lastSwappedNeighbor: null,
         lastSwapDirection: null,
         draggedTh,
+        ghost: null,
       };
+      const previousCursor = document.body.style.cursor;
+      const previousUserSelect = document.body.style.userSelect;
+      const previousOpacity = draggedTh.style.opacity;
+      const previousDraggingAttribute = draggedTh.getAttribute(
+        "data-column-dragging",
+      );
 
       const accessors: LiveOrderAccessors = {
         getOrder: () => getColumnOrderRef.current(),
@@ -108,6 +124,7 @@ export function useColumnDragReorder(
           state.activated = true;
           isDraggingRef.current = true;
           onDragActivatedRef.current?.();
+          if (dragStateRef.current !== state) return;
           state.draggedTh.setAttribute("data-column-dragging", "true");
           document.body.style.cursor = "grabbing";
           document.body.style.userSelect = "none";
@@ -119,6 +136,7 @@ export function useColumnDragReorder(
           ghost.style.top = `${rect.top}px`;
           ghost.style.width = `${rect.width}px`;
           document.body.appendChild(ghost);
+          state.ghost = ghost;
           state.draggedTh.style.opacity = "0.3";
         }
 
@@ -126,37 +144,46 @@ export function useColumnDragReorder(
         attemptSwap(state, moveEvent.clientX, moveEvent.clientY, accessors);
       };
 
-      const onMouseUp = () => {
+      const cleanup = () => {
         document.removeEventListener("mousemove", onMouseMove);
         document.removeEventListener("mouseup", onMouseUp);
         const state = dragStateRef.current;
-        const wasActivated = state?.activated ?? false;
-        if (state) {
-          state.draggedTh.style.opacity = "";
-          state.draggedTh.removeAttribute("data-column-dragging");
+        if (state?.activated) {
+          state.draggedTh.style.opacity = previousOpacity;
+          if (previousDraggingAttribute === null) {
+            state.draggedTh.removeAttribute("data-column-dragging");
+          } else {
+            state.draggedTh.setAttribute(
+              "data-column-dragging",
+              previousDraggingAttribute,
+            );
+          }
+          state.ghost?.remove();
+          document.body.style.cursor = previousCursor;
+          document.body.style.userSelect = previousUserSelect;
         }
-        const ghost = document.querySelector(".rapidb-column-drag-ghost");
-        if (ghost) ghost.remove();
-        document.body.style.cursor = "";
-        document.body.style.userSelect = "";
         isDraggingRef.current = false;
         dragStateRef.current = null;
+        gestureCleanupRef.current = null;
+      };
+      const onMouseUp = () => {
+        const wasActivated = dragStateRef.current?.activated ?? false;
+        cleanup();
         onDragEndedRef.current?.(wasActivated);
       };
 
+      gestureCleanupRef.current = cleanup;
       document.addEventListener("mousemove", onMouseMove);
       document.addEventListener("mouseup", onMouseUp);
     },
-    [dragActivationDistance],
+    [dragActivationDistance, cancelDrag],
   );
 
-  return { onHeaderMouseDown, isDragging };
+  return { onHeaderMouseDown, isDragging, cancelDrag };
 }
 
 function updateGhost(state: DragState, clientX: number): void {
-  const ghost = document.querySelector(
-    ".rapidb-column-drag-ghost",
-  ) as HTMLElement | null;
+  const ghost = state.ghost;
   if (!ghost) return;
   const rect = state.draggedTh.getBoundingClientRect();
   ghost.style.left = `${clientX}px`;
@@ -178,6 +205,7 @@ function attemptSwap(
     clientX,
     clientY,
     accessors,
+    state.ghost,
   );
   if (!target) return;
 
@@ -231,11 +259,9 @@ function findNeighborUnderCursor(
   clientX: number,
   clientY: number,
   accessors: LiveOrderAccessors,
+  ghost: HTMLElement | null,
 ): string | null {
   if (typeof document.elementFromPoint === "function") {
-    const ghost = document.querySelector(
-      ".rapidb-column-drag-ghost",
-    ) as HTMLElement | null;
     if (ghost) ghost.style.pointerEvents = "none";
     const elementUnder = document.elementFromPoint(
       clientX,

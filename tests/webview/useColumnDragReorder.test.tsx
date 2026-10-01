@@ -1,4 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useColumnDragReorder } from "../../src/webview/components/table/useColumnDragReorder";
 
@@ -23,6 +24,7 @@ function mountGrid(
   options: {
     excludedIds?: readonly string[];
     widths?: Record<string, number>;
+    strictMode?: boolean;
   } = {},
 ): MountedGrid {
   const widths = options.widths ?? {};
@@ -51,7 +53,9 @@ function mountGrid(
       setOrderCalls={latestSetOrderCallsRef.current}
     />
   );
-  const utils = render(tree);
+  const utils = render(
+    options.strictMode ? <StrictMode>{tree}</StrictMode> : tree,
+  );
 
   const table = screen.getByRole("table");
 
@@ -158,6 +162,9 @@ describe("useColumnDragReorder", () => {
     document.querySelectorAll(".rapidb-column-drag-ghost").forEach((node) => {
       node.remove();
     });
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+    vi.restoreAllMocks();
   });
 
   function installRectMock(widths: Record<string, number>) {
@@ -352,5 +359,98 @@ describe("useColumnDragReorder", () => {
     } finally {
       rig.cleanup();
     }
+  });
+
+  it.each([
+    false,
+    true,
+  ])("cancels an active=%s gesture on unmount with no late callbacks", (active) => {
+    installRectMock({ a: 100, b: 100 });
+    const add = vi.spyOn(document, "addEventListener");
+    const remove = vi.spyOn(document, "removeEventListener");
+    const rig = mountGrid(["a", "b"], { strictMode: true });
+    document.body.style.cursor = "crosshair";
+    document.body.style.userSelect = "text";
+    const header = screen.getByText("a");
+    header.style.opacity = "0.8";
+    rig.pressDown("a", 20);
+    const listeners = add.mock.calls.filter(
+      ([type]) => type === "mousemove" || type === "mouseup",
+    );
+    if (active) rig.moveTo(40);
+    rig.cleanup();
+    expect(document.querySelector(".rapidb-column-drag-ghost")).toBeNull();
+    expect(document.body.style.cursor).toBe("crosshair");
+    expect(document.body.style.userSelect).toBe("text");
+    expect(header.style.opacity).toBe("0.8");
+    expect(header.hasAttribute("data-column-dragging")).toBe(false);
+    for (const [type, listener] of listeners) {
+      expect(
+        remove.mock.calls.some(([t, l]) => t === type && l === listener),
+      ).toBe(true);
+    }
+    rig.moveTo(180);
+    rig.release(180);
+    expect(rig.getSetOrderCallCount()).toBe(0);
+    expect(rig.getEndCount()).toBe(0);
+    expect(rig.getActivationCount()).toBe(active ? 1 : 0);
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+    add.mockRestore();
+    remove.mockRestore();
+  });
+
+  it("replaces an active gesture without leaking its ghost, listeners or end callback", () => {
+    installRectMock({ a: 100, b: 100 });
+    const rig = mountGrid(["a", "b"], { strictMode: true });
+    document.body.style.cursor = "crosshair";
+    document.body.style.userSelect = "text";
+    rig.pressDown("a", 20);
+    rig.moveTo(40);
+    const firstGhost = document.querySelector(".rapidb-column-drag-ghost");
+    rig.pressDown("b", 120);
+    expect(firstGhost?.isConnected).toBe(false);
+    expect(document.body.style.cursor).toBe("crosshair");
+    rig.moveTo(140);
+    expect(document.querySelectorAll(".rapidb-column-drag-ghost")).toHaveLength(
+      1,
+    );
+    expect(rig.getActivationCount()).toBe(2);
+    rig.release(140);
+    expect(rig.getEndCount()).toBe(1);
+    expect(document.querySelector(".rapidb-column-drag-ghost")).toBeNull();
+    expect(document.body.style.cursor).toBe("crosshair");
+    expect(document.body.style.userSelect).toBe("text");
+    rig.moveTo(10);
+    rig.release(10);
+    expect(rig.getEndCount()).toBe(1);
+    expect(rig.getSetOrderCallCount()).toBe(0);
+    rig.cleanup();
+  });
+
+  it("honors activation and pointer boundaries before swapping and restores styles on normal end", () => {
+    installRectMock({ a: 100, b: 100 });
+    const rig = mountGrid(["a", "b"]);
+    const header = screen.getByText("a");
+    header.style.opacity = "0.8";
+    document.body.style.cursor = "crosshair";
+    document.body.style.userSelect = "text";
+    rig.pressDown("a", 20);
+    rig.moveTo(24);
+    expect(rig.getActivationCount()).toBe(0);
+    fireEvent.mouseMove(document, { clientX: 160, clientY: 29 });
+    expect(rig.getActivationCount()).toBe(1);
+    expect(rig.getSetOrderCallCount()).toBe(0);
+    rig.moveTo(149);
+    expect(rig.getSetOrderCallCount()).toBe(0);
+    rig.moveTo(150);
+    expect(rig.getOrder()).toEqual(["b", "a"]);
+    rig.release(150);
+    expect(rig.getEndCount()).toBe(1);
+    expect(header.style.opacity).toBe("0.8");
+    expect(document.body.style.cursor).toBe("crosshair");
+    expect(document.body.style.userSelect).toBe("text");
+    expect(document.querySelector(".rapidb-column-drag-ghost")).toBeNull();
+    rig.cleanup();
   });
 });

@@ -1,3 +1,4 @@
+import { isIPv6 } from "node:net";
 import vm from "node:vm";
 import {
   Binary,
@@ -2350,12 +2351,13 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   private buildUri(): string {
-    const host = this.config.host?.trim() || "localhost";
+    const rawHost = this.config.host?.trim() || "localhost";
+    const host = isIPv6(rawHost) ? `[${rawHost}]` : rawHost;
     const port = this.config.port ?? 27017;
     const auth = this.config.username
       ? `${encodeURIComponent(this.config.username)}:${encodeURIComponent(this.config.password ?? "")}@`
       : "";
-    const database = this.defaultDatabaseName();
+    const database = encodeURIComponent(this.defaultDatabaseName());
     const params = new URLSearchParams();
     if (this.config.authSource) {
       params.set("authSource", this.config.authSource);

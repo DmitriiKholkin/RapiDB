@@ -62,16 +62,54 @@ export function EditInput({
   } | null>(null);
   const ref = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const editorClosedRef = useRef(false);
+  const pasteUnsubscribeRef = useRef<(() => void) | null>(null);
+  const pasteCursorRef = useRef<number | null>(null);
+  const clipboardRecipientRef = useRef(`edit-input:${crypto.randomUUID()}`);
+
+  const invalidatePaste = useCallback(() => {
+    pasteUnsubscribeRef.current?.();
+    pasteUnsubscribeRef.current = null;
+    pasteCursorRef.current = null;
+  }, []);
+
+  const finishEditing = () => {
+    editorClosedRef.current = true;
+    invalidatePaste();
+  };
+
   useLayoutEffect(() => {
+    editorClosedRef.current = false;
     if (ref.current instanceof HTMLInputElement) {
       ref.current.focus({ preventScroll: true });
       ref.current.setSelectionRange(0, ref.current.value.length);
       ref.current.scrollLeft = 0;
     }
     return () => {
-      pasteUnsubscribeRef.current?.();
+      editorClosedRef.current = true;
+      invalidatePaste();
     };
-  }, []);
+  }, [invalidatePaste]);
+
+  useLayoutEffect(() => {
+    if (readOnly) {
+      invalidatePaste();
+      return;
+    }
+    const cursor = pasteCursorRef.current;
+    pasteCursorRef.current = null;
+    const input = ref.current;
+    if (
+      cursor !== null &&
+      input &&
+      !editorClosedRef.current &&
+      document.activeElement === input
+    ) {
+      // Restore after the controlled value update, without a deferred RAF
+      // that could overwrite subsequent typing or selection changes.
+      input.setSelectionRange(cursor, cursor);
+    }
+  });
 
   const handleContextMenu = useCallback((event: MouseEvent) => {
     event.stopImmediatePropagation();
@@ -110,20 +148,14 @@ export function EditInput({
     closeContextMenu();
   }, [closeContextMenu]);
 
-  const pasteUnsubscribeRef = useRef<(() => void) | null>(null);
-  const clipboardRecipientRef = useRef(`edit-input:${crypto.randomUUID()}`);
-
   const handlePaste = useCallback(() => {
     const input = ref.current;
-    if (!input) return;
     closeContextMenu();
+    if (!input || input.readOnly || editorClosedRef.current) return;
 
-    pasteUnsubscribeRef.current?.();
+    invalidatePaste();
 
     const requestId = crypto.randomUUID();
-    const start = input.selectionStart ?? 0;
-    const end = input.selectionEnd ?? 0;
-    const currentVal = val;
     pasteUnsubscribeRef.current = onMessage<ClipboardTextPayload>(
       "clipboardText",
       (payload) => {
@@ -132,22 +164,32 @@ export function EditInput({
           payload.recipient !== clipboardRecipientRef.current
         )
           return;
-        pasteUnsubscribeRef.current?.();
-        pasteUnsubscribeRef.current = null;
+        invalidatePaste();
 
         const { text } = payload;
-        if (!text || !ref.current) return;
-        const newVal =
-          currentVal.slice(0, start) + text + currentVal.slice(end);
+        const input = ref.current;
+        if (!text || !input || input.readOnly || editorClosedRef.current)
+          return;
+        // Clipboard reads are asynchronous: use the displayed value and
+        // selection at response time, including edits made while waiting.
+        const start = input.selectionStart ?? 0;
+        const end = input.selectionEnd ?? start;
+        const currentVal = input.value;
+        const newVal = normalizeEditInitialValue(
+          currentVal.slice(0, start) + text + currentVal.slice(end),
+          category,
+        );
+        const cursor = start + text.length;
+        if (newVal === currentVal) {
+          // An identical replacement may not cause React to render.
+          if (document.activeElement === input) {
+            input.setSelectionRange(cursor, cursor);
+          }
+        } else {
+          pasteCursorRef.current = cursor;
+        }
         setIsNull(false);
         setVal(newVal);
-
-        const cursorPos = start + text.length;
-        requestAnimationFrame(() => {
-          if (ref.current instanceof HTMLInputElement) {
-            ref.current.setSelectionRange(cursorPos, cursorPos);
-          }
-        });
       },
     );
 
@@ -155,7 +197,7 @@ export function EditInput({
       requestId,
       recipient: clipboardRecipientRef.current,
     });
-  }, [closeContextMenu, val]);
+  }, [category, closeContextMenu, invalidatePaste]);
 
   useEffect(() => {
     if (!contextMenu) return;
@@ -179,8 +221,10 @@ export function EditInput({
     };
   }, [contextMenu, closeContextMenu]);
   const normalizedValue = normalizeEditInitialValue(val, category);
-  const commit = () =>
+  const commit = () => {
+    finishEditing();
     onCommit(isNull ? NULL_SENTINEL : normalizeEditInitialValue(val, category));
+  };
   const inputStyle: React.CSSProperties = {
     ...buildTextInputStyle("sm"),
     flex: 1,
@@ -234,6 +278,7 @@ export function EditInput({
           }
           if (e.key === "Escape") {
             e.preventDefault();
+            finishEditing();
             onCancel();
           }
         }}
@@ -255,7 +300,10 @@ export function EditInput({
         <button
           type="button"
           onMouseDown={(e) => e.preventDefault()}
-          onClick={onSetDefault}
+          onClick={() => {
+            finishEditing();
+            onSetDefault();
+          }}
           title="Set field to DEFAULT (omit from insert)"
           style={nullBtnStyle}
         >
@@ -267,7 +315,10 @@ export function EditInput({
           type="button"
           data-null-btn="1"
           onMouseDown={(e) => e.preventDefault()}
-          onClick={() => onCommit(NULL_SENTINEL)}
+          onClick={() => {
+            finishEditing();
+            onCommit(NULL_SENTINEL);
+          }}
           title="Set field to NULL"
           style={nullBtnStyle}
         >
@@ -332,19 +383,22 @@ export function EditInput({
           <button
             type="button"
             role="menuitem"
+            disabled={readOnly}
             onClick={handlePaste}
             style={{
               appearance: "none",
               border: "none",
               background: "transparent",
-              color:
-                cssVar("--vscode-menu-foreground") ||
-                cssVar("--vscode-foreground") ||
-                "#cccccc",
+              color: readOnly
+                ? cssVar("--vscode-disabledForeground") ||
+                  "rgba(255, 255, 255, 0.4)"
+                : cssVar("--vscode-menu-foreground") ||
+                  cssVar("--vscode-foreground") ||
+                  "#cccccc",
               padding: "4px 10px",
               fontSize: 12,
               textAlign: "left",
-              cursor: "pointer",
+              cursor: readOnly ? "default" : "pointer",
               borderRadius: 4,
               width: "100%",
             }}

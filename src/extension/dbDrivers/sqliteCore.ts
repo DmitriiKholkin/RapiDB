@@ -631,14 +631,42 @@ function normalizeSqliteDatetimeLiteral(value: string): string | null {
   if (!SQLITE_DATETIME_LITERAL_RE.test(trimmed)) return null;
   const normalized = trimmed.replace("T", " ");
   const match =
-    /^(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?: ?(?:Z|[+-]\d{2}:\d{2}))?$/i.exec(
+    /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?: ?(?:Z|[+-](\d{2}):(\d{2})))?$/i.exec(
       normalized,
     );
   if (!match) return null;
-  const hours = Number(match[2]);
-  const minutes = Number(match[3]);
-  const seconds = Number(match[4] ?? "00");
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12 || day < 1) return null;
+  // SQLite uses the proleptic Gregorian calendar, including year 0000.
+  // Impossible dates must remain raw equality values even when SQLite itself
+  // would silently roll them into the following month.
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [
+    31,
+    leapYear ? 29 : 28,
+    31,
+    30,
+    31,
+    30,
+    31,
+    31,
+    30,
+    31,
+    30,
+    31,
+  ];
+  if (day > daysInMonth[month - 1]) return null;
+  const hours = Number(match[4]);
+  const minutes = Number(match[5]);
+  const seconds = Number(match[6] ?? "00");
   if (hours > 23 || minutes > 59 || seconds > 59) return null;
+  // SQLite's parseTimezone accepts hours 00..14 and minutes 00..59,
+  // including +/-14:59 (not just the ISO-8601 boundary +/-14:00).
+  const offsetHours = Number(match[7] ?? "00");
+  const offsetMinutes = Number(match[8] ?? "00");
+  if (offsetHours > 14 || offsetMinutes > 59) return null;
   return normalized;
 }
 function parseSqliteBlobDisplayValue(val: string): Uint8Array | null {
@@ -1462,6 +1490,7 @@ export class SQLiteCoreDriver extends BaseDBDriver {
   ): string | [string, string] | undefined {
     if (
       this.isNumericCategory(column.category) &&
+      column.category !== "decimal" &&
       typeof value === "string" &&
       (operator === "eq" || operator === "neq" || operator === "in")
     ) {
@@ -1604,10 +1633,35 @@ export class SQLiteCoreDriver extends BaseDBDriver {
         params: [this.coerceInputValue(val, column)],
       };
     }
-    const fallbackTemporalLike = (rawValue: string, negate = false) => ({
-      sql: `${col} ${negate ? "NOT LIKE" : "LIKE"} ?`,
-      params: [`%${rawValue}%`],
-    });
+    if (
+      column.category === "decimal" &&
+      ["eq", "neq", "gt", "gte", "lt", "lte", "between", "in"].includes(
+        operator,
+      )
+    ) {
+      // Bind numeric text so SQLite's NUMERIC affinity, rather than JS Number,
+      // parses it. Plain int64 literals remain exact; fractions/exponents still
+      // have SQLite's native REAL precision limitations.
+      const normalized = super.normalizeFilterValue(column, operator, val);
+      if (operator === "between" && Array.isArray(normalized)) {
+        return { sql: `${col} BETWEEN ? AND ?`, params: normalized };
+      }
+      if (typeof normalized === "string") {
+        if (operator === "in") {
+          const parts = normalized.split(",").map((part) => part.trim());
+          return {
+            sql: `${col} IN (${parts.map(() => "?").join(", ")})`,
+            params: parts,
+          };
+        }
+        if (["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)) {
+          return {
+            sql: `${col} ${this.sqlOperator(operator)} ?`,
+            params: [normalized],
+          };
+        }
+      }
+    }
     if (
       this.hasBooleanSemantics(column) &&
       (operator === "eq" || operator === "neq")
@@ -1725,8 +1779,12 @@ export class SQLiteCoreDriver extends BaseDBDriver {
           return { sql: `TIME(${col}) ${sqlOp} TIME(?)`, params: [literal] };
         }
         if (operator === "eq" || operator === "neq") {
-          return fallbackTemporalLike(val, operator === "neq");
+          return {
+            sql: `${col} ${operator === "neq" ? "<>" : "="} ?`,
+            params: [val],
+          };
         }
+        throw invalidSqliteTemporalFilterError(column.name, "time");
       }
     }
     if (column.category === "datetime") {
@@ -1745,7 +1803,14 @@ export class SQLiteCoreDriver extends BaseDBDriver {
         const parts = val
           .split(",")
           .map((part) => part.trim())
-          .filter(Boolean);
+          .filter(Boolean)
+          .map((part) => {
+            const literal = normalizeSqliteDatetimeLiteral(part);
+            if (!literal) {
+              throw invalidSqliteTemporalFilterError(column.name, "datetime");
+            }
+            return literal;
+          });
         return {
           sql: `DATETIME(${col}) IN (${parts.map(() => "DATETIME(?)").join(", ")})`,
           params: parts,
@@ -1764,8 +1829,12 @@ export class SQLiteCoreDriver extends BaseDBDriver {
           };
         }
         if (operator === "eq" || operator === "neq") {
-          return fallbackTemporalLike(val, operator === "neq");
+          return {
+            sql: `${col} ${operator === "neq" ? "<>" : "="} ?`,
+            params: [val],
+          };
         }
+        throw invalidSqliteTemporalFilterError(column.name, "datetime");
       }
     }
     if (operator === "between" && Array.isArray(val)) {
