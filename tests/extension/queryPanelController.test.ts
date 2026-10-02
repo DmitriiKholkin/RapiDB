@@ -142,6 +142,65 @@ describe("QueryPanelController", () => {
     });
   });
 
+  it("echoes bookmark request IDs on success and failure and rejects malformed IDs before storage", async () => {
+    const addBookmark = vi.fn(
+      async (_connectionId: string, _queryText: string) => undefined,
+    );
+    const view = {
+      getActiveConnectionId: () => "active",
+      getInitialConnectionId: () => "initial",
+      getLastQueryResult: () => null,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController({ addBookmark } as never, view);
+    await controller.handleMessage({
+      type: "addBookmark",
+      payload: {
+        queryText: "select 1",
+        connectionId: "conn:1",
+        requestId: "bookmark:1",
+      },
+    });
+    expect(addBookmark).toHaveBeenCalledWith("conn:1", "select 1");
+    expect(view.postMessage).toHaveBeenLastCalledWith({
+      type: "bookmarkSaved",
+      payload: { ok: true, requestId: "bookmark:1" },
+    });
+    addBookmark.mockRejectedValueOnce(new Error("Storage failed"));
+    await controller.handleMessage({
+      type: "addBookmark",
+      payload: {
+        queryText: "select 2",
+        requestId: "bookmark:2",
+      },
+    });
+    expect(view.postMessage).toHaveBeenLastCalledWith({
+      type: "bookmarkSaved",
+      payload: { ok: false, error: "Storage failed", requestId: "bookmark:2" },
+    });
+    for (const requestId of [null, 123, "", "   "]) {
+      await controller.handleMessage({
+        type: "addBookmark",
+        payload: { queryText: "select 3", requestId },
+      });
+    }
+    expect(addBookmark).toHaveBeenCalledTimes(2);
+    await controller.handleMessage({
+      type: "addBookmark",
+      payload: { sql: "select 4" },
+    });
+    expect(view.postMessage).toHaveBeenLastCalledWith({
+      type: "bookmarkSaved",
+      payload: { ok: true },
+    });
+  });
+
   it.each([
     "exportResultsCSV",
     "exportResultsJSON",

@@ -235,6 +235,78 @@ afterEach(async () => {
   vi.useRealTimers();
 });
 
+describe("B09 Redis reserved default prefix", () => {
+  it("keeps all-keys and the real prefix distinct in discovery, both page paths, metadata and export", async () => {
+    const store = new Map<string, Value>([
+      ["orphan", { type: "list", value: ["outside"], ttl: -1 }],
+      ["default:a", { type: "string", value: "a", ttl: -1 }],
+      ["default:b", { type: "string", value: "b", ttl: -1 }],
+      ["users:a", { type: "string", value: "outside", ttl: -1 }],
+    ]);
+    harness.databases.set(0, store);
+    const driver = driverWith();
+    await driver.connect();
+    expect(
+      (await driver.listObjects("db0")).map((entry) => entry.name),
+    ).toEqual(["default", "default:", "users"]);
+    expect(
+      (await driver.readTablePage(page("db0", "default"))).totalCount,
+    ).toBe(4);
+    const service = new TableReadService({
+      getConnection: () => config,
+      getDriver: () => driver,
+    } as unknown as ConnectionManager);
+    for (const filters of [
+      [],
+      [{ column: "key", operator: "like" as const, value: "default:%" }],
+    ]) {
+      const result = await service.getPage(
+        config.id,
+        "db0",
+        "",
+        "default:",
+        1,
+        10,
+        filters,
+        { column: "value", direction: "desc" },
+      );
+      expect(result.rows.map((row) => row.key)).toEqual([
+        "default:b",
+        "default:a",
+      ]);
+    }
+    expect(
+      (await driver.readTablePage(page("db0", "default:"))).rows.map(
+        (row) => row.key,
+      ),
+    ).toEqual(["default:a", "default:b"]);
+    expect(
+      (await driver.describeColumns("db0", "", "default:")).find(
+        (column) => column.name === "value",
+      )?.nativeType,
+    ).toBe("string");
+    expect(
+      (await driver.describeColumns("db0", "", "default")).find(
+        (column) => column.name === "value",
+      )?.nativeType,
+    ).toBe("mixed(string, list)");
+    const keys = [];
+    for await (const chunk of service.exportAll(
+      config.id,
+      "db0",
+      "",
+      "default:",
+      1,
+    ))
+      keys.push(...chunk.rows.map((row) => row.key));
+    expect(keys).toEqual(["default:a", "default:b"]);
+    store.delete("orphan");
+    expect(
+      (await driver.listObjects("db0")).map((entry) => entry.name),
+    ).toEqual(["default:", "users"]);
+  });
+});
+
 describe("B02 Redis logical database isolation", () => {
   it("scopes discovery, metadata, both page paths, stream reads and export", async () => {
     const driver = driverWith();

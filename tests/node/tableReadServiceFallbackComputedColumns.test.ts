@@ -336,6 +336,8 @@ describe("TableReadService arithmetic overflow handling", () => {
       query,
       quoteIdentifier: vi.fn((name: string) => name),
       formatOutputValue: vi.fn((value: unknown) => value),
+      coerceInputValue: vi.fn((value: unknown) => value),
+      buildInsertValueExpr: vi.fn(() => "?"),
       buildFilterCondition: vi.fn(
         (column: ColumnTypeMeta, operator: string, value: unknown) => ({
           sql: `${column.name} ${operator === "eq" ? "=" : ">"} ?`,
@@ -360,6 +362,7 @@ describe("TableReadService arithmetic overflow handling", () => {
 
     expect(exportedIds).toEqual([1, 2, 3, 4, 5]);
     expect(new Set(exportedIds).size).toBe(exportedIds.length);
+    expect(driver.buildFilterCondition).not.toHaveBeenCalled();
     expect(buildPagination).toHaveBeenCalled();
     for (const [offset] of buildPagination.mock.calls) {
       expect(offset).toBe(0);

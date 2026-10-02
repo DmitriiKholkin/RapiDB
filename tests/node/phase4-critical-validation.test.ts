@@ -353,6 +353,7 @@ describe("Phase 4 — Critical Validation", () => {
         materializePreviewSql: vi.fn((sql: string) => sql),
         buildInsertValueExpr: vi.fn((_column: unknown, i: number) => `$${i}`),
         coerceInputValue: vi.fn((value: unknown) => value),
+        checkPersistedEdit: vi.fn().mockReturnValue(null),
       }),
     });
 

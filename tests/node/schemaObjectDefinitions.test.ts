@@ -250,6 +250,14 @@ describe("schema object definitions", () => {
       query,
     } as never;
 
+    vi.spyOn(
+      driver as unknown as { createPool(): unknown },
+      "createPool",
+    ).mockReturnValue({
+      on: vi.fn(),
+      connect: async () => ({ query, release: vi.fn() }),
+      end: async () => undefined,
+    } as never);
     await expect(
       driver.getCreateTableDDL("rapidb", "public", "daily_users"),
     ).resolves.toBe(

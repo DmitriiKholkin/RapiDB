@@ -404,10 +404,29 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   async listObjects(database: string): Promise<TableInfo[]> {
-    const result = await this.requireClient().send(new ListTablesCommand({}));
+    const client = this.requireClient();
+    const tableNames = new Set<string>();
+    const seenContinuations = new Set<string>();
+    let continuation: string | undefined;
+    do {
+      const result = await client.send(
+        new ListTablesCommand(
+          continuation ? { ExclusiveStartTableName: continuation } : {},
+        ),
+      );
+      for (const name of result.TableNames ?? []) tableNames.add(name);
+      continuation = result.LastEvaluatedTableName;
+      if (continuation) {
+        if (seenContinuations.has(continuation)) {
+          throw new Error(
+            "DynamoDB catalog pagination made no progress: repeated continuation.",
+          );
+        }
+        seenContinuations.add(continuation);
+      }
+    } while (continuation);
     const schemaName = database || this.databaseName();
-    return (result.TableNames ?? [])
-      .slice()
+    return [...tableNames]
       .sort((left, right) => left.localeCompare(right))
       .map((tableName) => ({
         schema: schemaName,
@@ -731,7 +750,7 @@ export class DynamoDBDriver implements IDBDriver {
       }
 
       const formattedRows = materialized.rows.map((row) =>
-        this.formatDynamoRowForDisplay(row, describedByName),
+        this.formatDynamoRowForDisplay(row),
       );
       const filteredRows = applyFilters(
         formattedRows,
@@ -764,7 +783,7 @@ export class DynamoDBDriver implements IDBDriver {
       request.sort,
     );
     const formattedRows = pageResult.rows.map((row) =>
-      this.formatDynamoRowForDisplay(row, describedByName),
+      this.formatDynamoRowForDisplay(row),
     );
 
     return {
@@ -1049,34 +1068,10 @@ export class DynamoDBDriver implements IDBDriver {
     }
   }
 
-  formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
-    if (value === null || value === undefined) {
-      return null;
-    }
-
-    // DynamoDB attributes can have different types across rows.
-    if (Array.isArray(value) || this.isPlainObject(value)) {
-      return this.formatStructuredDynamoValue(value);
-    }
-
-    const nativeType = column.nativeType.toLowerCase();
-    if (nativeType === "binary") {
-      return this.formatBinaryForDisplay(value);
-    }
-    if (nativeType.endsWith(" set")) {
-      return this.formatSetForDisplay(value);
-    }
-    if (nativeType === "list" || nativeType === "map") {
-      return this.formatStructuredDynamoValue(value);
-    }
-
-    const normalized = this.normalizeValueForDisplay(value);
-    return typeof normalized === "string" ||
-      typeof normalized === "number" ||
-      typeof normalized === "boolean" ||
-      normalized === null
-      ? normalized
-      : JSON.stringify(normalized);
+  formatOutputValue(value: unknown, _column: ColumnTypeMeta): unknown {
+    // Sampled metadata is not a coercion rule: each DynamoDB item carries
+    // its own attribute types, which can differ from the description.
+    return this.formatGenericDisplayValue(value);
   }
 
   checkPersistedEdit(
@@ -2102,7 +2097,7 @@ export class DynamoDBDriver implements IDBDriver {
       );
       const rawRows = response.Item ? [this.unmarshallItem(response.Item)] : [];
       const formattedRows = rawRows.map((row) =>
-        this.formatDynamoRowForDisplay(row, describedByName),
+        this.formatDynamoRowForDisplay(row),
       );
       const filteredRows = applyFilters(
         formattedRows,
@@ -2129,10 +2124,7 @@ export class DynamoDBDriver implements IDBDriver {
         sort,
       );
       for (const rawRow of step.rows) {
-        const formattedRow = this.formatDynamoRowForDisplay(
-          rawRow,
-          describedByName,
-        );
+        const formattedRow = this.formatDynamoRowForDisplay(rawRow);
         if (
           applyFilters(
             [formattedRow],
@@ -2818,7 +2810,9 @@ export class DynamoDBDriver implements IDBDriver {
   ): ColumnTypeMeta[] {
     const sourceColumns =
       rows.length > 0
-        ? this.buildDynamoColumns(rows, schema)
+        ? this.buildDynamoColumns(rows, schema).filter((column) =>
+            rows.some((row) => row[column.name] !== undefined),
+          )
         : describedColumns;
     return this.mergeDescribedColumns(sourceColumns, describedColumns, schema);
   }
@@ -2828,30 +2822,37 @@ export class DynamoDBDriver implements IDBDriver {
     describedColumns: readonly ColumnTypeMeta[],
     schema: DynamoTableSchema,
   ): ColumnTypeMeta[] {
-    const describedByName = new Map(
+    const columnsByName = new Map(
       describedColumns.map((column) => [column.name, column]),
     );
-    return sourceColumns.map((column) => ({
-      ...column,
-      type: describedByName.get(column.name)?.type ?? column.type,
-      nativeType:
-        describedByName.get(column.name)?.nativeType ?? column.nativeType,
-      category: describedByName.get(column.name)?.category ?? column.category,
-      nullable: describedByName.get(column.name)?.nullable ?? column.nullable,
-      filterable:
-        describedByName.get(column.name)?.filterable ?? column.filterable,
-      filterOperators:
-        describedByName.get(column.name)?.filterOperators ??
-        column.filterOperators,
-      valueSemantics:
-        describedByName.get(column.name)?.valueSemantics ??
-        column.valueSemantics,
-      isPrimaryKey: schema.keys.includes(column.name),
-      primaryKeyOrdinal: schema.keys.includes(column.name)
-        ? schema.keys.indexOf(column.name) + 1
-        : undefined,
-      primaryKeyRole: schema.keyRoles.get(column.name),
-    }));
+    for (const column of sourceColumns) {
+      // Retain metadata for sparse/null-only attributes, but do not mask new
+      // type evidence on this page: exporters need to detect schema drift.
+      if (!columnsByName.has(column.name) || column.nativeType !== "null") {
+        columnsByName.set(column.name, column);
+      }
+    }
+    const keyOrder = new Map(schema.keys.map((key, index) => [key, index]));
+    return [...columnsByName.values()]
+      .sort((left, right) => {
+        const leftKey = keyOrder.get(left.name);
+        const rightKey = keyOrder.get(right.name);
+        if (leftKey !== undefined || rightKey !== undefined) {
+          return (
+            (leftKey ?? Number.MAX_SAFE_INTEGER) -
+            (rightKey ?? Number.MAX_SAFE_INTEGER)
+          );
+        }
+        return left.name.localeCompare(right.name);
+      })
+      .map((column) => ({
+        ...column,
+        isPrimaryKey: schema.keys.includes(column.name),
+        primaryKeyOrdinal: schema.keys.includes(column.name)
+          ? schema.keys.indexOf(column.name) + 1
+          : undefined,
+        primaryKeyRole: schema.keyRoles.get(column.name),
+      }));
   }
 
   private splitFilterList(value: string): string[] {
@@ -3168,18 +3169,12 @@ export class DynamoDBDriver implements IDBDriver {
 
   private formatDynamoRowForDisplay(
     row: Record<string, unknown>,
-    columnsByName?: ReadonlyMap<string, ColumnTypeMeta>,
   ): Record<string, unknown> {
     const formatted = Object.fromEntries(
-      Object.entries(row).map(([name, value]) => {
-        const column = columnsByName?.get(name);
-        return [
-          name,
-          column
-            ? this.formatOutputValue(value, column)
-            : this.formatGenericDisplayValue(value),
-        ];
-      }),
+      Object.entries(row).map(([name, value]) => [
+        name,
+        this.formatGenericDisplayValue(value),
+      ]),
     );
     this.tableRowCategories.set(
       formatted,

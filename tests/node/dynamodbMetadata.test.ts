@@ -68,6 +68,166 @@ function createDriver() {
 }
 
 describe("DynamoDBDriver metadata", () => {
+  it("paginates the catalog by API continuation, including an empty intermediate page", async () => {
+    const driver = createDriver();
+    const send = vi.fn(
+      async (command: { input: { ExclusiveStartTableName?: string } }) => {
+        switch (command.input.ExclusiveStartTableName) {
+          case undefined:
+            return {
+              TableNames: ["zeta", "alpha"],
+              LastEvaluatedTableName: "alpha",
+            };
+          case "alpha":
+            return { TableNames: [], LastEvaluatedTableName: "middle" };
+          case "middle":
+            return {
+              TableNames: ["beta", "alpha"],
+              LastEvaluatedTableName: undefined,
+            };
+          default:
+            throw new Error("Unexpected catalog cursor");
+        }
+      },
+    );
+    Object.assign(driver, { client: { send } });
+    await expect(driver.listObjects("audit")).resolves.toEqual(
+      ["alpha", "beta", "zeta"].map((name) => ({
+        name,
+        schema: "audit",
+        type: "table",
+      })),
+    );
+    expect(send.mock.calls.map(([command]) => command.input)).toEqual([
+      {},
+      { ExclusiveStartTableName: "alpha" },
+      { ExclusiveStartTableName: "middle" },
+    ]);
+  });
+
+  it("propagates a later catalog failure instead of returning a partial catalog", async () => {
+    const driver = createDriver();
+    const send = vi.fn(
+      async (command: { input: { ExclusiveStartTableName?: string } }) => {
+        if (command.input.ExclusiveStartTableName === undefined) {
+          return { TableNames: ["first"], LastEvaluatedTableName: "first" };
+        }
+        throw new Error("catalog unavailable");
+      },
+    );
+    Object.assign(driver, { client: { send } });
+    await expect(driver.listObjects("audit")).rejects.toThrow(
+      "catalog unavailable",
+    );
+  });
+
+  it("rejects a cyclic catalog continuation rather than looping forever", async () => {
+    const driver = createDriver();
+    const send = vi.fn(
+      async (command: { input: { ExclusiveStartTableName?: string } }) => ({
+        TableNames: [],
+        LastEvaluatedTableName:
+          command.input.ExclusiveStartTableName === "a" ? "b" : "a",
+      }),
+    );
+    Object.assign(driver, { client: { send } });
+    await expect(driver.listObjects("audit")).rejects.toThrow(
+      /catalog.*(progress|continuation)/i,
+    );
+    expect(send).toHaveBeenCalledTimes(3);
+  });
+
+  it("unions described and current-page columns in key/name order while retaining page type evidence", async () => {
+    const driver = createDriver();
+    const send = vi.fn(async (command: { input: Record<string, unknown> }) => {
+      if (command.constructor.name === "DescribeTableCommand") {
+        return {
+          Table: {
+            KeySchema: [
+              { AttributeName: "pk", KeyType: "HASH" },
+              { AttributeName: "sk", KeyType: "RANGE" },
+            ],
+            AttributeDefinitions: [
+              { AttributeName: "pk", AttributeType: "S" },
+              { AttributeName: "sk", AttributeType: "S" },
+            ],
+          },
+        };
+      }
+      if (command.constructor.name === "ScanCommand") {
+        return {
+          Items: [
+            marshall({
+              pk: "audit",
+              sk: "0000",
+              x: "X",
+              y: "Y",
+              amount: "text",
+            }),
+          ],
+        };
+      }
+      return {
+        Items: [
+          marshall(
+            command.input.ExclusiveStartKey
+              ? {
+                  pk: "audit",
+                  sk: "0002",
+                  y: "Y2",
+                  z: "new",
+                  amount: NumberValueImpl.from("9007199254740993.1250"),
+                }
+              : { pk: "audit", sk: "0001", x: "X1", amount: "text" },
+          ),
+        ],
+        ...(command.input.ExclusiveStartKey
+          ? {}
+          : { LastEvaluatedKey: marshall({ pk: "audit", sk: "0001" }) }),
+      };
+    });
+    Object.assign(driver, { client: { send } });
+    const request = {
+      database: "audit",
+      schema: "audit",
+      table: "sparse",
+      page: 1,
+      pageSize: 1,
+      filters: [{ column: "pk", operator: "eq" as const, value: "audit" }],
+      sort: { column: "sk", direction: "asc" as const },
+      skipCount: true,
+    };
+    const first = await driver.readTablePage(request);
+    const second = await driver.readTablePage({ ...request, page: 2 });
+    expect(first.columns.map((column) => column.name)).toEqual([
+      "pk",
+      "sk",
+      "amount",
+      "x",
+      "y",
+    ]);
+    expect(second.columns.map((column) => column.name)).toEqual([
+      "pk",
+      "sk",
+      "amount",
+      "x",
+      "y",
+      "z",
+    ]);
+    expect(second.columns.find((column) => column.name === "x")).toMatchObject({
+      category: "text",
+      nativeType: "string",
+    });
+    expect(
+      second.columns.find((column) => column.name === "amount"),
+    ).toMatchObject({ category: "decimal", nativeType: "number" });
+    expect(second.columns.slice(0, 2)).toMatchObject([
+      { primaryKeyRole: "partition", primaryKeyOrdinal: 1 },
+      { primaryKeyRole: "sort", primaryKeyOrdinal: 2 },
+    ]);
+    expect(second.rows[0]?.amount).toBe("9007199254740993.1250");
+  });
+
   it("uses a single logical database and collapses the schema name to match it", async () => {
     const driver = createDriver();
 

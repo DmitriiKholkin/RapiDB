@@ -13,6 +13,11 @@ import {
 } from "../dbDrivers/deleteOutcomes";
 import type { ColumnTypeMeta, FilterExpression } from "../dbDrivers/types";
 import {
+  buildPrevalidationFailedResult,
+  PersistedEditValidationError,
+  validatePersistedEditRecord,
+} from "../table/persistedEditValidation";
+import {
   prepareApplyChangesPlan,
   type SortConfig,
   TableDataService,
@@ -555,6 +560,25 @@ export class TablePanel {
         await this.postSchemaConflict(operationId, "applyChanges");
         return;
       }
+      const driver = this.connectionManager.getDriver(this.connectionId);
+      if (driver?.checkPersistedEdit) {
+        const columnMap = new Map(
+          snapshot.columns.map((column) => [column.name, column]),
+        );
+        const updateFailures = (updates ?? []).map((update) =>
+          validatePersistedEditRecord(driver, update.changes, columnMap),
+        );
+        const insertFailures = (insertValues ?? []).map((values) =>
+          validatePersistedEditRecord(driver, values, columnMap),
+        );
+        if ([...updateFailures, ...insertFailures].some(Boolean)) {
+          await this.postMessage("applyResult", {
+            ...buildPrevalidationFailedResult(updateFailures, insertFailures),
+            operationId,
+          });
+          return;
+        }
+      }
       const prepared = prepareApplyChangesPlan(
         this.connectionManager,
         this.connectionId,
@@ -564,7 +588,13 @@ export class TablePanel {
         updates ?? [],
         snapshot.columns,
       );
-      const driver = this.connectionManager.getDriver(this.connectionId);
+      if (!prepared.executable && !prepared.result.success) {
+        await this.postMessage("applyResult", {
+          ...prepared.result,
+          operationId,
+        });
+        return;
+      }
       const previewBuilder =
         driver?.buildMutationPreviewStatements?.bind(driver);
       const applyPlan =
@@ -665,6 +695,17 @@ export class TablePanel {
         operationId,
         success: false,
         error: error.message,
+        ...(err instanceof PersistedEditValidationError
+          ? {
+              rowOutcomes: (updates ?? []).map((_, rowIndex) => ({
+                rowIndex,
+                success: false,
+                status: "skipped" as const,
+                message: "Not applied because an insert failed prevalidation.",
+              })),
+              insertApplied: false,
+            }
+          : {}),
       });
     }
   }
@@ -697,6 +738,12 @@ export class TablePanel {
         operationId,
         success: false,
         error: error.message,
+        ...(err instanceof PersistedEditValidationError
+          ? {
+              status: err.status,
+              columns: err.columns,
+            }
+          : {}),
       });
     }
   }
@@ -811,25 +858,40 @@ export class TablePanel {
     chunks: AsyncIterable<ChunkedExportData>,
     columnOrder?: string[],
   ): AsyncIterable<ChunkedExportData> {
-    if (!columnOrder || columnOrder.length === 0) {
+    if (!columnOrder) {
       yield* chunks;
       return;
     }
 
-    for await (const chunk of chunks) {
-      const colIndex = new Map(chunk.columns.map((col, i) => [col.name, i]));
-      const reorderedColumns: Array<(typeof chunk.columns)[number]> = [];
-      for (const colId of columnOrder) {
-        const idx = colIndex.get(colId);
-        if (idx !== undefined) {
-          reorderedColumns.push(chunk.columns[idx]);
-        }
-      }
+    if (
+      columnOrder.length === 0 ||
+      new Set(columnOrder).size !== columnOrder.length
+    ) {
+      throw new Error(
+        "Export column selection must be non-empty and contain no duplicates.",
+      );
+    }
+    await this.schemaRefreshPromise;
+    if (this.schemaRefreshError) {
+      throw new Error(
+        `Export schema metadata unavailable: ${this.schemaRefreshError}`,
+      );
+    }
+    const knownColumns = new Map<string, ChunkedExportData["columns"][number]>(
+      this.schemaSnapshot.columns.map((column) => [column.name, column]),
+    );
 
-      if (reorderedColumns.length === 0) {
-        yield chunk;
-        continue;
-      }
+    for await (const chunk of chunks) {
+      for (const column of chunk.columns) knownColumns.set(column.name, column);
+      const reorderedColumns = columnOrder.map((name) => {
+        const column = knownColumns.get(name);
+        if (!column) {
+          throw new Error(
+            `Unknown export column "${name}". Refresh table metadata and retry.`,
+          );
+        }
+        return column;
+      });
 
       const reorderedRows = chunk.rows.map((row) => {
         const newRow: Record<string, unknown> = {};

@@ -463,13 +463,34 @@ export class TableReadService {
         break;
       }
 
+      // A cursor must retain database values, not lossy display formatting.
+      const lastRawRow = dataResult.rows[dataResult.rows.length - 1];
+      const nextCursor = this.createCursorFromRow(
+        Object.fromEntries(
+          dataResult.columns.map((name, index) => [
+            name,
+            lastRawRow[`__col_${index}`],
+          ]),
+        ),
+        order,
+      );
+      const previousCursor = cursor;
+      if (
+        previousCursor &&
+        order.every(
+          ({ column }) =>
+            this.toCursorFilterValue(previousCursor[column.name]) ===
+            this.toCursorFilterValue(nextCursor[column.name]),
+        )
+      ) {
+        throw new Error(
+          "Export cursor did not advance; export was stopped to avoid repeating rows.",
+        );
+      }
       yield { columns, rows };
 
-      if (rows.length < chunkSize) {
-        break;
-      }
-
-      cursor = this.createCursorFromRow(rows[rows.length - 1], order);
+      if (rows.length < chunkSize) break;
+      cursor = nextCursor;
     }
   }
 
@@ -564,37 +585,28 @@ export class TableReadService {
       const prefixParts: string[] = [];
       for (let prefix = 0; prefix < index; prefix += 1) {
         const prefixColumn = order[prefix].column;
-        const prefixValue = this.toCursorFilterValue(cursor[prefixColumn.name]);
-        const equality = driver.buildFilterCondition(
-          prefixColumn,
-          "eq",
-          prefixValue,
-          paramIndex + params.length,
+        prefixParts.push(
+          `(${this.buildExactCursorComparison(
+            driver,
+            prefixColumn,
+            "eq",
+            cursor[prefixColumn.name],
+            paramIndex,
+            params,
+          )})`,
         );
-        if (!equality) {
-          continue;
-        }
-        prefixParts.push(`(${equality.sql})`);
-        params.push(...equality.params);
       }
 
       const current = order[index];
-      const currentValue = this.toCursorFilterValue(
-        cursor[current.column.name],
-      );
-      const operator = current.direction === "desc" ? "lt" : "gt";
-      const comparison = driver.buildFilterCondition(
+      const comparison = this.buildExactCursorComparison(
+        driver,
         current.column,
-        operator,
-        currentValue,
-        paramIndex + params.length,
+        current.direction === "desc" ? "lt" : "gt",
+        cursor[current.column.name],
+        paramIndex,
+        params,
       );
-      if (!comparison) {
-        continue;
-      }
-
-      params.push(...comparison.params);
-      const segment = [...prefixParts, `(${comparison.sql})`].join(" AND ");
+      const segment = [...prefixParts, `(${comparison})`].join(" AND ");
       disjunctionParts.push(`(${segment})`);
     }
 
@@ -602,6 +614,32 @@ export class TableReadService {
       clause: disjunctionParts.join(" OR "),
       params,
     };
+  }
+
+  private buildExactCursorComparison(
+    driver: ReturnType<TableReadService["getConnectionDriver"]>["driver"],
+    column: ColumnTypeMeta,
+    operator: "eq" | "gt" | "lt",
+    value: unknown,
+    paramIndex: number,
+    params: unknown[],
+  ): string {
+    if (value === null || value === undefined) {
+      throw new Error(
+        `Export cursor is missing a non-null value for ${column.name}.`,
+      );
+    }
+    // User filters can use approximate equality (floats) or display coercion.
+    // Cursor predicates must use the exact database ordering instead.
+    const index = paramIndex + params.length;
+    const comparison = driver.buildCursorComparison
+      ? driver.buildCursorComparison(column, operator, value, index)
+      : {
+          sql: `${driver.quoteIdentifier(column.name)} ${operator === "eq" ? "=" : operator === "gt" ? ">" : "<"} ${driver.buildInsertValueExpr(column, index)}`,
+          params: [driver.coerceInputValue(value, column)],
+        };
+    params.push(...comparison.params);
+    return comparison.sql;
   }
 
   private toCursorFilterValue(value: unknown): string | undefined {

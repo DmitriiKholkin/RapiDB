@@ -33,6 +33,18 @@ describe("serializeArrayPreservingRawTokens", () => {
     );
   });
 
+  it("quotes numeric-looking text tokens recursively when typed callers disable them", () => {
+    expect(
+      serializeArrayPreservingRawTokens(
+        [
+          ["01", "-01", "-.5", "13000.0"],
+          ["t", "f", null],
+        ],
+        false,
+      ),
+    ).toBe('[["01","-01","-.5","13000.0"],["t","f",null]]');
+  });
+
   it("passes through native numbers and booleans via JSON.stringify", () => {
     expect(serializeArrayPreservingRawTokens([1, true, "1.0"])).toBe(
       "[1,true,1.0]",
@@ -150,10 +162,10 @@ describe("jsonArrayLiteralToPgArrayLiteral", () => {
     ).toBe('{"hello","with \\"quote\\""}');
   });
 
-  it("escapes control characters inside JSON string elements", () => {
+  it("retains real control characters inside PG string elements", () => {
     expect(
       jsonArrayLiteralToPgArrayLiteral('["line1\\nline2","col1\\tcol2"]'),
-    ).toBe('{"line1\\nline2","col1\\tcol2"}');
+    ).toBe('{"line1\nline2","col1\tcol2"}');
   });
 
   it("returns the empty literal for the empty array", () => {

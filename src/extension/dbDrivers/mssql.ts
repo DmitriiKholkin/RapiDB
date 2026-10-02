@@ -767,7 +767,7 @@ patchMssqlTediousExactNumericParsing();
 
 const MSSQL_TIME_RE = /^\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?$/;
 const MSSQL_UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const INTEGER_RE = /^-?\d+$/;
 const DECIMAL_RE = /^-?\d+(?:\.\d+)?$/;
 const MSSQL_LIKE_MAX_NVARCHAR_CHARS = 3900;
@@ -2239,6 +2239,22 @@ export class MSSQLDriver extends BaseDBDriver {
       return `CAST(? AS ${column.nativeType})`;
     }
     return "?";
+  }
+  override buildCursorComparison(
+    column: ColumnTypeMeta,
+    operator: "eq" | "gt" | "lt",
+    rawValue: unknown,
+    paramIndex: number,
+  ): FilterConditionResult {
+    if (baseTypeName(column.nativeType) === "datetime") {
+      // Date binds use datetime2(7). Round back to datetime's 1/300-second
+      // ticks before comparing, including equality of a composite cursor prefix.
+      return {
+        sql: `${this.quoteIdentifier(column.name)} ${this.sqlOperator(operator)} CAST(? AS datetime)`,
+        params: [this.coerceInputValue(rawValue, column)],
+      };
+    }
+    return super.buildCursorComparison(column, operator, rawValue, paramIndex);
   }
   override buildSetExpr(column: ColumnTypeMeta, _paramIndex: number): string {
     const expr = this.buildInsertValueExpr(column, _paramIndex);

@@ -7,12 +7,16 @@ import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
 import { serializeArrayPreservingRawTokens } from "../utils/arraySerialization";
 import {
-  canonicalizeJsonPreservingRawNumbers,
   parseJsonPreservingRawNumbers,
   serializeCanonicalJson,
 } from "../utils/jsonCanonical";
 import { logger } from "../utils/logger";
 import { jsonArrayLiteralToPgArrayLiteral } from "../utils/postgresArrayLiteral";
+import {
+  hasPostgresArrayBounds,
+  parsePostgresArrayLiteral,
+  parsePostgresBooleanArrayElement,
+} from "../utils/postgresArrayParser";
 import {
   BaseDBDriver,
   formatDatetimeForDisplay,
@@ -111,108 +115,14 @@ pgTypes.setTypeParser(PG_OID_TIMESTAMPTZ, (val: string) => val);
 pgTypes.setTypeParser(PG_OID_JSON, (val: string) => val);
 pgTypes.setTypeParser(PG_OID_JSONB, (val: string) => val);
 for (const oid of PG_ARRAY_OIDS) {
-  pgTypes.setTypeParser(oid, parsePostgresArrayLiteral);
+  pgTypes.setTypeParser(oid, (value: string) =>
+    parsePostgresArrayLiteral(
+      value,
+      oid === 1000 ? parsePostgresBooleanArrayElement : undefined,
+    ),
+  );
 }
 
-function parsePostgresArrayLiteral(value: string): unknown[] {
-  if (value === "{}") {
-    return [];
-  }
-  if (!value.startsWith("{") || !value.endsWith("}")) {
-    return [];
-  }
-  const inner = value.slice(1, -1);
-  const result: unknown[] = [];
-  let i = 0;
-  while (i < inner.length) {
-    while (i < inner.length && (inner[i] === " " || inner[i] === "\t")) {
-      i++;
-    }
-    if (i >= inner.length) {
-      break;
-    }
-    if (inner[i] === "{") {
-      let depth = 1;
-      let j = i + 1;
-      while (j < inner.length && depth > 0) {
-        if (inner[j] === "{") {
-          depth++;
-        } else if (inner[j] === "}") {
-          depth--;
-        }
-        if (depth > 0) {
-          j++;
-        }
-      }
-      const nestedText = inner.slice(i, j + 1);
-      result.push(parsePostgresArrayLiteral(nestedText));
-      i = j + 1;
-    } else if (inner[i] === '"') {
-      let j = i + 1;
-      let token = "";
-      while (j < inner.length) {
-        if (inner[j] === "\\" && j + 1 < inner.length) {
-          const next = inner[j + 1];
-          if (
-            next === '"' ||
-            next === "\\" ||
-            next === "n" ||
-            next === "t" ||
-            next === "r" ||
-            next === "b" ||
-            next === "f" ||
-            next === "v"
-          ) {
-            token +=
-              next === "n"
-                ? "\n"
-                : next === "t"
-                  ? "\t"
-                  : next === "r"
-                    ? "\r"
-                    : next === "b"
-                      ? "\b"
-                      : next === "f"
-                        ? "\f"
-                        : next === "v"
-                          ? "\v"
-                          : next;
-            j += 2;
-            continue;
-          }
-        }
-        if (inner[j] === '"') {
-          j++;
-          break;
-        }
-        token += inner[j];
-        j++;
-      }
-      result.push(token);
-      i = j;
-    } else {
-      let j = i;
-      while (j < inner.length && inner[j] !== ",") {
-        j++;
-      }
-      const raw = inner.slice(i, j).trim();
-      if (raw === "NULL") {
-        result.push(null);
-      } else if (raw === "t") {
-        result.push(true);
-      } else if (raw === "f") {
-        result.push(false);
-      } else {
-        result.push(raw);
-      }
-      i = j;
-    }
-    if (i < inner.length && inner[i] === ",") {
-      i++;
-    }
-  }
-  return result;
-}
 const PG_GEOMETRIC_TYPES = new Set([
   "point",
   "line",
@@ -480,15 +390,70 @@ function safeJsonStringify(value: unknown): string {
   }
 }
 
-function normalizePostgresArrayTextForDisplay(value: string): string {
+function postgresArrayElementKind(
+  nativeType: string,
+): "numeric" | "boolean" | "other" {
+  // describeTable uses catalog namespaces to always qualify user-defined array
+  // element types. Built-ins keep format_type's canonical names and typmods.
+  // Also accept pg's internal _type aliases, but never strip an arbitrary schema
+  // or quotes: an enum named audit.numeric must remain a string element type.
+  const type = nativeType.trim().toLowerCase();
+  let elementType: string;
+  if (type.endsWith("[]")) {
+    elementType = type.replace(/(?:\[\])+$/, "");
+  } else if (type.startsWith("_")) {
+    elementType = type.slice(1);
+  } else {
+    return "other";
+  }
+  elementType = elementType
+    .replace(/^pg_catalog\./, "")
+    .replace(/\(\s*\d+(?:\s*,\s*-?\d+)?\s*\)$/, "")
+    .trim();
+  if (["boolean", "bool"].includes(elementType)) return "boolean";
+  if (
+    [
+      "smallint",
+      "integer",
+      "bigint",
+      "int2",
+      "int4",
+      "int8",
+      "numeric",
+      "decimal",
+      "real",
+      "double precision",
+      "float4",
+      "float8",
+      "oid",
+      "xid",
+      "cid",
+    ].includes(elementType)
+  )
+    return "numeric";
+  return "other";
+}
+
+function normalizePostgresArrayTextForDisplay(
+  value: string,
+  nativeType: string,
+): string {
   const trimmed = value.trim();
   if (trimmed === "") {
     return value;
   }
-  if (trimmed.startsWith("{")) {
-    const parsed = parsePostgresArrayLiteral(trimmed);
+  if (trimmed.startsWith("{") || hasPostgresArrayBounds(trimmed)) {
+    const parsed = parsePostgresArrayLiteral(
+      trimmed,
+      postgresArrayElementKind(nativeType) === "boolean"
+        ? parsePostgresBooleanArrayElement
+        : undefined,
+    );
     if (Array.isArray(parsed)) {
-      return serializeArrayPreservingRawTokens(parsed);
+      return serializeArrayPreservingRawTokens(
+        parsed,
+        postgresArrayElementKind(nativeType) === "numeric",
+      );
     }
     return value;
   }
@@ -502,6 +467,59 @@ function normalizePostgresArrayTextForDisplay(value: string): string {
   return value;
 }
 
+function normalizePostgresBooleanInput(value: unknown): unknown {
+  if (value === 1) return true;
+  if (value === 0) return false;
+  if (typeof value !== "string") return value;
+  const token = value.trim().toLowerCase();
+  if (token === "") return value;
+  // boolin accepts case-insensitive unique prefixes. "o" is ambiguous.
+  const truthy = ["true", "yes", "on", "1"].some((word) =>
+    word.startsWith(token),
+  );
+  const falsy = ["false", "no", "off", "0"].some((word) =>
+    word.startsWith(token),
+  );
+  return truthy !== falsy ? truthy : value;
+}
+
+function normalizePostgresBooleanArrayInput(value: unknown): unknown {
+  if (Array.isArray(value))
+    return value.map(normalizePostgresBooleanArrayInput);
+  if (value === null) return null;
+  const normalized = normalizePostgresBooleanInput(value);
+  if (typeof normalized === "boolean") return normalized;
+  throw new Error("Invalid PostgreSQL boolean array input element");
+}
+
+function normalizePostgresUuidInput(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  const token = value.trim().replace(/^\{(.*)\}$/, "$1");
+  // uuid_in allows optional hyphens after each four hex digits and braces.
+  if (!/^[0-9a-f]{4}(?:-?[0-9a-f]{4}){7}$/i.test(token)) return value;
+  const hex = token.replace(/-/g, "").toLowerCase();
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function canonicalizePostgresFloatSpecial(
+  value: unknown,
+): { canonical: string } | null {
+  if (typeof value === "number" && !Number.isFinite(value)) {
+    return { canonical: String(value) };
+  }
+  if (typeof value !== "string") return null;
+  const token = value.trim().toLowerCase();
+  // PostgreSQL's native float input also accepts signed NaN and strtod
+  // payload forms. Payload/sign do not survive the server's NaN value.
+  if (/^[+-]?nan(?:\([a-z0-9_]*\))?$/.test(token)) {
+    return { canonical: "NaN" };
+  }
+  if (/^[+-]?inf(?:inity)?$/.test(token)) {
+    return { canonical: token.startsWith("-") ? "-Infinity" : "Infinity" };
+  }
+  return null;
+}
+
 export class PostgresDriver extends BaseDBDriver {
   protected override getQueryEditorSqlDialect() {
     return "postgresql" as const;
@@ -510,6 +528,10 @@ export class PostgresDriver extends BaseDBDriver {
   private pool: Pool | null = null;
   private readonly databasePools = new Map<string, Pool>();
   private readonly pendingPools = new Set<Pool>();
+  private readonly catalogSessions = new Map<
+    Pool,
+    { client?: PoolClient; cancelled: boolean }
+  >();
   private readonly poolClosures = new WeakMap<Pool, Promise<void>>();
   private connectionEpoch = 0;
   private connectionAttempt: Promise<void> | null = null;
@@ -544,7 +566,11 @@ export class PostgresDriver extends BaseDBDriver {
     }
     return pool;
   }
-  private createPool(database: string): Pool {
+  private createPool(
+    database: string,
+    max = 5,
+    applicationName?: string,
+  ): Pool {
     const tlsSettings = resolveConnectionTlsSettings(this.config);
     const forwardedTransport = getSshTcpForwardTransport(this.config);
     const dbOperationTimeoutMs = this.getDbOperationTimeoutMs();
@@ -554,7 +580,8 @@ export class PostgresDriver extends BaseDBDriver {
       database,
       user: this.config.username,
       password: this.config.password,
-      max: 5,
+      max,
+      ...(applicationName ? { application_name: applicationName } : {}),
       keepAlive: true,
       keepAliveInitialDelayMillis: 60000,
       connectionTimeoutMillis: this.getConnectionTimeoutMs(),
@@ -579,6 +606,59 @@ export class PostgresDriver extends BaseDBDriver {
     run: (pool: Pool) => Promise<T>,
   ): Promise<T> {
     return run(this.requirePool(database));
+  }
+
+  private async withCatalogClient<T>(
+    database: string,
+    run: (client: PoolClient) => Promise<T>,
+  ): Promise<T> {
+    // Only check the editor connection here; never borrow its backend. A pool
+    // checkout may still contain an editor's explicit BEGIN and pending writes.
+    this.requirePool();
+    const epoch = this.connectionEpoch;
+    const pool = this.createPool(
+      database || this.connectedDatabaseName || this.config.database || "",
+      1,
+      "RapiDB catalog DDL",
+    );
+    const session: { client?: PoolClient; cancelled: boolean } = {
+      cancelled: false,
+    };
+    this.catalogSessions.set(pool, session);
+    pool.on("error", (error) =>
+      logger.error("PostgreSQL catalog pool error", error),
+    );
+    let failed = false;
+    try {
+      const client = await pool.connect();
+      if (session.cancelled || epoch !== this.connectionEpoch) {
+        client.release(true);
+        throw new Error("[RapiDB] PostgreSQL catalog session cancelled");
+      }
+      session.client = client;
+      const result = await run(client);
+      this.assertConnectionEpoch(epoch);
+      return result;
+    } catch (error) {
+      failed = true;
+      throw error;
+    } finally {
+      // Destroy even on success: this backend belongs to this DDL request only.
+      // disconnect() may have already destroyed it while a query was pending.
+      const client = session.client;
+      session.client = undefined;
+      try {
+        client?.release(true);
+        const closing = this.closePool(pool);
+        if (failed)
+          await closing.catch((error) =>
+            logger.error("PostgreSQL catalog cleanup error", error),
+          );
+        else await closing;
+      } finally {
+        this.catalogSessions.delete(pool);
+      }
+    }
   }
   constructor(
     config: ConnectionConfig,
@@ -682,7 +762,15 @@ export class PostgresDriver extends BaseDBDriver {
     const pools = new Set([
       ...this.databasePools.values(),
       ...this.pendingPools,
+      ...this.catalogSessions.keys(),
     ]);
+    for (const session of this.catalogSessions.values()) {
+      session.cancelled = true;
+      const client = session.client;
+      session.client = undefined;
+      client?.release(true);
+    }
+    this.catalogSessions.clear();
     if (this.pool) pools.add(this.pool);
     this.pool = null;
     this.databasePools.clear();
@@ -917,7 +1005,14 @@ export class PostgresDriver extends BaseDBDriver {
     const res = await this.requirePool(database).query<DescribeTableRow>(
       `SELECT
          a.attname                                AS column_name,
-         format_type(a.atttypid, a.atttypmod)    AS data_type,
+         CASE
+           WHEN array_type.typcategory = 'A'
+             AND element_ns.oid <> 'pg_catalog'::pg_catalog.regnamespace
+             AND pg_catalog.pg_type_is_visible(element_type.oid)
+           THEN pg_catalog.format('%I.%s[]', element_ns.nspname,
+                  pg_catalog.format_type(element_type.oid, a.atttypmod))
+           ELSE pg_catalog.format_type(a.atttypid, a.atttypmod)
+         END                                      AS data_type,
          NOT a.attnotnull                         AS is_nullable,
          pg_get_expr(d.adbin, d.adrelid)         AS column_default,
          NULLIF(a.attgenerated, '')               AS generated_kind,
@@ -933,6 +1028,9 @@ export class PostgresDriver extends BaseDBDriver {
        FROM pg_attribute a
        JOIN pg_class     c ON c.oid = a.attrelid
        JOIN pg_namespace n ON n.oid = c.relnamespace
+       LEFT JOIN pg_catalog.pg_type array_type ON array_type.oid = a.atttypid
+       LEFT JOIN pg_catalog.pg_type element_type ON element_type.oid = array_type.typelem
+       LEFT JOIN pg_catalog.pg_namespace element_ns ON element_ns.oid = element_type.typnamespace
        LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
        LEFT JOIN LATERAL (
          SELECT pk_key.ordinality::int AS pk_ordinal
@@ -1384,6 +1482,16 @@ export class PostgresDriver extends BaseDBDriver {
     schema: string,
     table: string,
   ): Promise<string> {
+    return this.withCatalogClient(database, (client) =>
+      this.readCreateTableDDL(client, schema, table),
+    );
+  }
+
+  private async readCreateTableDDL(
+    client: PoolClient,
+    schema: string,
+    table: string,
+  ): Promise<string> {
     type DdlColumnRow = {
       column_name: string;
       data_type: string;
@@ -1392,8 +1500,7 @@ export class PostgresDriver extends BaseDBDriver {
       generated_kind: string | null;
       identity_kind: string | null;
     };
-    const pool = this.requirePool(database);
-    const kindRes = await pool.query<{
+    const kindRes = await client.query<{
       relkind: string;
     }>(
       `SELECT c.relkind
@@ -1407,10 +1514,10 @@ export class PostgresDriver extends BaseDBDriver {
     );
     const relkind = kindRes.rows[0]?.relkind;
     if (relkind === "v") {
-      const res = await pool.query<{
+      const res = await client.query<{
         def: string;
       }>(
-        `SELECT 'CREATE OR REPLACE VIEW "' || n.nspname || '"."' || c.relname || '" AS\n' ||
+        `SELECT 'CREATE OR REPLACE VIEW ' || quote_ident(n.nspname) || '.' || quote_ident(c.relname) || ' AS\n' ||
                 pg_get_viewdef(c.oid, true) AS def
          FROM pg_class c
          JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -1424,10 +1531,10 @@ export class PostgresDriver extends BaseDBDriver {
       );
     }
     if (relkind === "m") {
-      const res = await pool.query<{
+      const res = await client.query<{
         def: string;
       }>(
-        `SELECT 'CREATE MATERIALIZED VIEW "' || n.nspname || '"."' || c.relname || '" AS\n' ||
+        `SELECT 'CREATE MATERIALIZED VIEW ' || quote_ident(n.nspname) || '.' || quote_ident(c.relname) || ' AS\n' ||
                 pg_get_viewdef(c.oid, true) || ';' AS def
          FROM pg_class c
          JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -1440,8 +1547,15 @@ export class PostgresDriver extends BaseDBDriver {
         `-- Materialized view definition not available for "${schema}"."${table}"`
       );
     }
-    const colRes = await pool.query<DdlColumnRow>(
-      `SELECT
+    // Deparse with a catalog-only search path on an owned session. This makes
+    // user-schema FK, type, default and CHECK dependencies schema-qualified,
+    // without changing the pool's search path for subsequent operations.
+    let failed = false;
+    try {
+      await client.query("BEGIN READ ONLY");
+      await client.query("SET LOCAL search_path TO pg_catalog");
+      const colRes = await client.query<DdlColumnRow>(
+        `SELECT
          a.attname                                AS column_name,
          format_type(a.atttypid, a.atttypmod)    AS data_type,
          NOT a.attnotnull                         AS is_nullable,
@@ -1457,50 +1571,53 @@ export class PostgresDriver extends BaseDBDriver {
          AND a.attnum > 0
          AND NOT a.attisdropped
        ORDER BY a.attnum`,
-      [schema, table],
-    );
-    const pkRes = await pool.query<{
-      column_name: string;
-      key_ordinal: number;
-    }>(
-      `SELECT a.attname AS column_name,
-              pk_key.ordinality::int AS key_ordinal
-       FROM pg_constraint con
-       JOIN pg_class     c ON c.oid = con.conrelid
-       JOIN pg_namespace n ON n.oid = c.relnamespace
-       JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS pk_key(attnum, ordinality)
-         ON TRUE
-       JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = pk_key.attnum
-       WHERE n.nspname = $1 AND c.relname = $2 AND con.contype = 'p'
-       ORDER BY pk_key.ordinality`,
-      [schema, table],
-    );
-    const pkColumns = pkRes.rows.map((row) => row.column_name);
-    const pkColumnSet = new Set(pkColumns);
-    const hasCompositePrimaryKey = pkColumns.length > 1;
-    const cols = colRes.rows.map((r) => {
-      const columnName = r.column_name as string;
-      const isPk = pkColumnSet.has(columnName);
-      const isComputed = r.generated_kind === "s";
-      const nullable = isPgTrue(r.is_nullable);
-      const notNull = !nullable && !isPk ? " NOT NULL" : "";
-      const identityClause = pgIdentityClause(r.identity_kind);
-      if (isComputed && r.column_default) {
-        return `  ${this.quoteIdentifier(columnName)} ${r.data_type} GENERATED ALWAYS AS (${r.column_default}) STORED${notNull}`;
-      }
-      const defClause =
-        !identityClause && r.column_default
-          ? ` DEFAULT ${r.column_default}`
-          : "";
-      const pk = !hasCompositePrimaryKey && isPk ? " PRIMARY KEY" : "";
-      return `  ${this.quoteIdentifier(columnName)} ${r.data_type}${identityClause}${notNull}${defClause}${pk}`;
-    });
-    if (hasCompositePrimaryKey) {
-      cols.push(
-        `  PRIMARY KEY (${pkColumns.map((columnName) => this.quoteIdentifier(columnName)).join(", ")})`,
+        [schema, table],
       );
+      const constraintRes = await client.query<{
+        constraint_name: string;
+        definition: string;
+      }>(
+        `SELECT con.conname AS constraint_name,
+              pg_get_constraintdef(con.oid, false) AS definition
+        FROM pg_constraint con
+        JOIN pg_class     c ON c.oid = con.conrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relname = $2
+          AND con.contype IN ('p', 'c', 'u', 'f', 'x')
+        ORDER BY CASE con.contype WHEN 'p' THEN 0 WHEN 'c' THEN 1
+                   WHEN 'u' THEN 2 WHEN 'f' THEN 3 ELSE 4 END,
+                 con.conname COLLATE "C", con.oid`,
+        [schema, table],
+      );
+      const cols = colRes.rows.map((r) => {
+        const columnName = r.column_name as string;
+        const isComputed = r.generated_kind === "s";
+        const nullable = isPgTrue(r.is_nullable);
+        const notNull = !nullable ? " NOT NULL" : "";
+        const identityClause = pgIdentityClause(r.identity_kind);
+        if (isComputed && r.column_default) {
+          return `  ${this.quoteIdentifier(columnName)} ${r.data_type} GENERATED ALWAYS AS (${r.column_default}) STORED${notNull}`;
+        }
+        const defClause =
+          !identityClause && r.column_default
+            ? ` DEFAULT ${r.column_default}`
+            : "";
+        return `  ${this.quoteIdentifier(columnName)} ${r.data_type}${identityClause}${notNull}${defClause}`;
+      });
+      for (const constraint of constraintRes.rows) {
+        cols.push(
+          `  CONSTRAINT ${this.quoteIdentifier(constraint.constraint_name)} ${constraint.definition}`,
+        );
+      }
+      return `-- Reconstructed PostgreSQL table DDL (columns and catalog table constraints).\n-- Not a pg_dump schema backup: dependencies must already exist.\n-- Sequences, standalone indexes, triggers, security, storage and partition/inheritance definitions are not included.\nCREATE TABLE ${this.qualifiedTableName("", schema, table)} (\n${cols.join(",\n")}\n);`;
+    } catch (error) {
+      failed = true;
+      throw error;
+    } finally {
+      const rollback = client.query("ROLLBACK");
+      if (failed) await rollback.catch(() => undefined);
+      else await rollback;
     }
-    return `CREATE TABLE ${this.qualifiedTableName("", schema, table)} (\n${cols.join(",\n")}\n);`;
   }
   async getObjectDefinition(
     database: string,
@@ -1973,7 +2090,7 @@ export class PostgresDriver extends BaseDBDriver {
         return value;
       }
       if (column.category === "array") {
-        return normalizePostgresArrayTextForDisplay(value);
+        return normalizePostgresArrayTextForDisplay(value, column.nativeType);
       }
     }
     if (
@@ -1982,7 +2099,10 @@ export class PostgresDriver extends BaseDBDriver {
       !(value instanceof Date)
     ) {
       if (column.category === "array" && Array.isArray(value)) {
-        return serializeArrayPreservingRawTokens(value);
+        return serializeArrayPreservingRawTokens(
+          value,
+          postgresArrayElementKind(column.nativeType) === "numeric",
+        );
       }
       const formattedInterval = formatPostgresIntervalLikeValue(value);
       if (formattedInterval !== null) {
@@ -2023,14 +2143,27 @@ export class PostgresDriver extends BaseDBDriver {
       if (!["numeric", "decimal"].includes(baseType)) {
         return null;
       }
+      const constraint = this.parseExactNumericConstraint(column.nativeType);
+      // numeric(p) has an implicit scale of zero; unconstrained numeric does not.
+      if (constraint.precision !== null && constraint.scale === null) {
+        constraint.scale = 0;
+      }
       return this.checkExactNumericPersistedEdit(
         column,
         expectedValue,
-        this.parseExactNumericConstraint(column.nativeType),
+        constraint,
         options,
       );
     }
     if (column.category === "float") {
+      if (canonicalizePostgresFloatSpecial(expectedValue)) {
+        return this.checkNormalizedPersistedEdit(
+          column,
+          expectedValue,
+          options,
+          canonicalizePostgresFloatSpecial,
+        );
+      }
       const significantDigits =
         baseType === "real" || baseType === "float4" ? 7 : 15;
       return this.checkApproximateNumericPersistedEdit(
@@ -2041,7 +2174,11 @@ export class PostgresDriver extends BaseDBDriver {
       );
     }
     if (column.category === "boolean") {
-      return this.checkBooleanPersistedEdit(column, expectedValue, options);
+      return this.checkBooleanPersistedEdit(
+        column,
+        normalizePostgresBooleanInput(expectedValue),
+        options,
+      );
     }
     if (column.category === "binary") {
       return this.checkBinaryPersistedEdit(column, expectedValue, options);
@@ -2050,10 +2187,57 @@ export class PostgresDriver extends BaseDBDriver {
       return this.checkJsonPersistedEdit(column, expectedValue, options);
     }
     if (column.category === "uuid") {
-      return this.checkUuidPersistedEdit(column, expectedValue, options);
+      return this.checkUuidPersistedEdit(
+        column,
+        normalizePostgresUuidInput(expectedValue),
+        options,
+      );
     }
     if (column.category === "array") {
-      return this.checkJsonArrayPersistedEdit(column, expectedValue, options);
+      let normalizedExpected = expectedValue;
+      if (postgresArrayElementKind(column.nativeType) === "boolean") {
+        try {
+          if (Array.isArray(expectedValue)) {
+            normalizedExpected =
+              normalizePostgresBooleanArrayInput(expectedValue);
+          } else if (
+            typeof expectedValue === "string" &&
+            /^[[{]/.test(expectedValue.trim())
+          ) {
+            // Input uses boolin's lexicon; actual server output keeps the
+            // strict registered B03 parser and formatOutputValue rules.
+            normalizedExpected = parsePostgresArrayLiteral(
+              jsonArrayLiteralToPgArrayLiteral(expectedValue),
+              normalizePostgresBooleanArrayInput,
+            );
+          }
+        } catch {
+          return {
+            ok: false,
+            shouldVerify: false,
+            message: `Column "${column.name}" expects a valid PostgreSQL boolean array.`,
+          };
+        }
+      } else if (typeof expectedValue === "string") {
+        normalizedExpected = this.formatOutputValue(expectedValue, column);
+      }
+      // Arrays with user-defined element OIDs arrive from pg as raw array text.
+      // Use the same catalog-qualified display rules for verification as reads.
+      const normalizedOptions =
+        options && typeof options.persistedValue === "string"
+          ? {
+              ...options,
+              persistedValue: this.formatOutputValue(
+                options.persistedValue,
+                column,
+              ),
+            }
+          : options;
+      return this.checkJsonArrayPersistedEdit(
+        column,
+        normalizedExpected,
+        normalizedOptions,
+      );
     }
     if (
       column.category === "date" ||

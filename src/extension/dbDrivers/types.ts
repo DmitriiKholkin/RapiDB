@@ -419,6 +419,13 @@ export interface IDBDriver {
     value: string | [string, string] | undefined,
     paramIndex: number,
   ): FilterConditionResult | null;
+  /** Exact comparison of a raw query value in database sort order (no filter tolerance). */
+  buildCursorComparison?(
+    column: ColumnTypeMeta,
+    operator: "eq" | "gt" | "lt",
+    rawValue: unknown,
+    paramIndex: number,
+  ): FilterConditionResult;
   buildInsertDefaultValuesSql(
     qualifiedTableName: string,
     columns?: readonly ColumnTypeMeta[],

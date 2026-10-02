@@ -2370,6 +2370,47 @@ export class OracleDriver extends BaseDBDriver {
   ): string {
     return `:${paramIndex}`;
   }
+  override buildCursorComparison(
+    column: ColumnTypeMeta,
+    operator: "eq" | "gt" | "lt",
+    rawValue: unknown,
+    paramIndex: number,
+  ): FilterConditionResult {
+    if (!this.isDatetimeWithTime(column.nativeType)) {
+      return super.buildCursorComparison(
+        column,
+        operator,
+        rawValue,
+        paramIndex,
+      );
+    }
+    const timezoneAware = isTimezoneAwareOracleTemporal(column.nativeType);
+    const dateOnly = oracleTypeName(column.nativeType) === "DATE";
+    const text =
+      dateOnly && typeof rawValue === "string" && isValidDateOnly(rawValue)
+        ? `${rawValue} 00:00:00`
+        : normalizeOracleTemporalValue(rawValue, {
+            preserveExplicitTimezoneText: !timezoneAware,
+          });
+    if (text === null) {
+      throw new Error(`Invalid temporal export cursor for ${column.name}.`);
+    }
+    const name = this.quoteIdentifier(column.name);
+    // Query values for TSTZ/TSLTZ are UTC text. Bind that text, not a Date
+    // (node-oracledb binds Dates as timezone-less TIMESTAMP). Native timestamp
+    // comparison preserves fractions without the user filter's FF6 rendering.
+    // Specify (9): an unqualified TIMESTAMP cast defaults to precision 6.
+    const expression = timezoneAware
+      ? `SYS_EXTRACT_UTC(CAST(${name} AS TIMESTAMP(9) WITH TIME ZONE))`
+      : name;
+    const bind = dateOnly
+      ? `TO_DATE(:${paramIndex}, 'YYYY-MM-DD HH24:MI:SS')`
+      : `TO_TIMESTAMP(:${paramIndex}, 'YYYY-MM-DD HH24:MI:SS.FF')`;
+    return {
+      sql: `${expression} ${this.sqlOperator(operator)} ${bind}`,
+      params: [dateOnly ? text.replace(/\.\d+$/, "") : text],
+    };
+  }
   override buildSetExpr(column: ColumnTypeMeta, paramIndex: number): string {
     return `${this.quoteIdentifier(column.name)} = :${paramIndex}`;
   }

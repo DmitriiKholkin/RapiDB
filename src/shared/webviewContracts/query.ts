@@ -202,6 +202,39 @@ export interface QueryResultExportPayload {
   sort?: { id: string; desc: boolean }[];
 }
 
+export interface QueryBookmarkPayload {
+  queryText: string;
+  sql?: string;
+  connectionId?: string;
+  requestId?: string;
+}
+
+export interface BookmarkSavedPayload {
+  ok: boolean;
+  error?: string;
+  requestId?: string;
+}
+
+export function parseBookmarkSavedPayload(
+  input: unknown,
+): BookmarkSavedPayload | null {
+  if (!isRecord(input) || typeof input.ok !== "boolean") {
+    return null;
+  }
+  const requestId = readOptionalString(input, "requestId");
+  if (input.requestId !== undefined && !requestId?.trim()) {
+    return null;
+  }
+  if (input.error !== undefined && typeof input.error !== "string") {
+    return null;
+  }
+  return {
+    ok: input.ok,
+    ...(requestId !== undefined ? { requestId } : {}),
+    ...(input.error !== undefined ? { error: input.error } : {}),
+  };
+}
+
 function isQueryColumnId(value: unknown): value is string {
   return (
     typeof value === "string" &&
@@ -227,10 +260,7 @@ export type QueryPanelMessage =
   | WebviewMessageEnvelope<"exportResultsJSON", QueryResultExportPayload>
   | WebviewMessageEnvelope<"readClipboard", ClipboardReadPayload>
   | WebviewMessageEnvelope<"writeClipboard", { text: string }>
-  | WebviewMessageEnvelope<
-      "addBookmark",
-      { queryText: string; sql?: string; connectionId?: string }
-    >;
+  | WebviewMessageEnvelope<"addBookmark", QueryBookmarkPayload>;
 
 // ─── Message Parser ─────────────────────────────────────────────────────────
 
@@ -253,8 +283,25 @@ export function parseQueryPanelMessage(
         : null;
     }
 
-    case "executeQuery":
     case "addBookmark": {
+      const payload = parseEnvelopeQueryPayload(envelope);
+      if (!payload || !isRecord(envelope.payload)) {
+        return null;
+      }
+      const requestId = readOptionalString(envelope.payload, "requestId");
+      if (envelope.payload.requestId !== undefined && !requestId?.trim()) {
+        return null;
+      }
+      return {
+        type: envelope.type,
+        payload: {
+          ...payload,
+          ...(requestId !== undefined ? { requestId } : {}),
+        },
+      };
+    }
+
+    case "executeQuery": {
       const payload = parseEnvelopeQueryPayload(envelope);
       return payload
         ? {

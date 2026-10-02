@@ -258,6 +258,92 @@ describe("parseDynamoDbNativeQueryInput", () => {
     );
   });
 
+  it.each(
+    ["map", "list", "binary", "string set", "number", "string"].flatMap(
+      (sampleType) =>
+        [
+          { actual: "string", value: "hello", expected: "hello" },
+          {
+            actual: "JSON-looking string",
+            value: '{"n":9007199254740993}',
+            expected: '{"n":9007199254740993}',
+          },
+          {
+            actual: "set-looking string",
+            value: "<<'literal'>>",
+            expected: "<<'literal'>>",
+          },
+          {
+            actual: "binary-looking string",
+            value: "0xdeadbeef",
+            expected: "0xdeadbeef",
+          },
+          {
+            actual: "exact number",
+            value: NumberValueImpl.from("9007199254740993.1250"),
+            expected: "9007199254740993.1250",
+          },
+          { actual: "boolean", value: true, expected: true },
+          { actual: "null", value: null, expected: null },
+          { actual: "missing", value: undefined, expected: null },
+          {
+            actual: "string set",
+            value: new Set(["a", "b"]),
+            expected: "<<'a', 'b'>>",
+          },
+          {
+            actual: "number set",
+            value: new Set([NumberValueImpl.from("9007199254740993.1250")]),
+            expected: "<<9007199254740993.1250>>",
+          },
+          {
+            actual: "binary set",
+            value: new Set([Uint8Array.from([0xde, 0xad])]),
+            expected: "<<0xdead>>",
+          },
+          {
+            actual: "binary",
+            value: Uint8Array.from([0xde, 0xad]),
+            expected: "0xdead",
+          },
+          {
+            actual: "map",
+            value: { n: NumberValueImpl.from("9007199254740993.1250") },
+            expected: '{"n":9007199254740993.1250}',
+          },
+          {
+            actual: "list",
+            value: ["hello", NumberValueImpl.from("9007199254740993.1250")],
+            expected: '["hello",9007199254740993.1250]',
+          },
+        ].map((testCase) => ({ sampleType, ...testCase })),
+    ),
+  )("formats actual $actual independently of sampled $sampleType metadata", ({
+    sampleType,
+    value,
+    expected,
+  }) => {
+    const { driver } = createDriver();
+    const category =
+      sampleType === "map"
+        ? "json"
+        : sampleType === "list" || sampleType.endsWith(" set")
+          ? "array"
+          : sampleType === "binary"
+            ? "binary"
+            : sampleType === "number"
+              ? "decimal"
+              : "text";
+    expect(
+      driver.formatOutputValue(value, {
+        ...createMapColumn(),
+        type: sampleType,
+        nativeType: sampleType,
+        category,
+      }),
+    ).toEqual(expected);
+  });
+
   it.each([
     new Set(["a"]),
     Buffer.from([1, 2]),

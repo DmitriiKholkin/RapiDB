@@ -429,6 +429,28 @@ async function runFullJourneyForEngine(
       const { openErdViewer } = context;
       const erd = await openErdViewer();
       expect(erd.handle).toBeDefined();
+      // Opening the panel starts asynchronous metadata reads. Complete the
+      // ERD journey before closing its connection: Oracle pool shutdown can
+      // otherwise race queued getConnection requests from graph loading.
+      await waitFor(
+        () => {
+          const messages = erd.session.hostMessages();
+          expect(
+            messages.find((message) => message.type === "erdError"),
+          ).toBeUndefined();
+          const loaded = messages.find(
+            (message) => message.type === "erdGraph",
+          );
+          expect(loaded).toBeDefined();
+          const payload = loaded?.payload as
+            | { graph: { nodes: Array<{ table: string }> } }
+            | undefined;
+          expect(payload?.graph.nodes.map((node) => node.table)).toContain(
+            scenario.tableFixture.table,
+          );
+        },
+        { timeout: 5000 },
+      );
       erd.session.unmount();
       ErdPanel.disposeAll();
     }

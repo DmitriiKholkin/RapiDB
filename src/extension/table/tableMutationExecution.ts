@@ -5,6 +5,10 @@ import type {
 import type { ConnectionManager } from "../connectionManager";
 import type { ColumnTypeMeta } from "../dbDrivers/types";
 import { assertConnectionWritable } from "../utils/readOnlyGuards";
+import {
+  buildPrevalidationFailedResult,
+  validatePersistedEditRecord,
+} from "./persistedEditValidation";
 import type {
   ApplyResult,
   PreparedApplyPlan,
@@ -144,6 +148,15 @@ export function prepareApplyChangesPlan(
 
   // Validate the entire batch before generating any mutation preview.
   const columnMap = new Map(columns.map((column) => [column.name, column]));
+  const failures = updates.map((update) =>
+    validatePersistedEditRecord(driver, update.changes, columnMap),
+  );
+  if (failures.some(Boolean)) {
+    return {
+      executable: false,
+      result: buildPrevalidationFailedResult(failures),
+    };
+  }
   const primaryKeysByRow = updates.map((update) =>
     Object.keys(filterWritableRecord(update.changes, columnMap)).length > 0
       ? coercePrimaryKeyValues(driver, update.primaryKeys, columns)
@@ -254,7 +267,9 @@ export function prepareApplyChangesPlan(
   ] of updates.entries()) {
     const verificationValues: VerificationTarget["values"] = [];
     const verificationPrimaryKeys = { ...primaryKeys };
-    for (const [columnName, nextValue] of Object.entries(changes)) {
+    for (const [columnName, nextValue] of Object.entries(
+      filterWritableRecord(changes, columnMetaByName),
+    )) {
       const column = columnMetaByName.get(columnName);
       if (!column) {
         continue;

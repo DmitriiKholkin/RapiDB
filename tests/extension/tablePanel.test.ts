@@ -41,6 +41,9 @@ const exportTableDataMock = vi.hoisted(() =>
     }) => Promise<void>
   >(),
 );
+const exportAllMock = vi.hoisted(() =>
+  vi.fn<(...args: unknown[]) => AsyncIterable<ChunkedExportData>>(),
+);
 
 const vscodeMock = vi.hoisted(() => {
   const configurationListeners = new Set<
@@ -150,6 +153,7 @@ vi.mock("../../src/extension/tableDataService", () => ({
   TableDataService: class {
     getColumns = getColumnsMock;
     getPage = getPageMock;
+    exportAll = exportAllMock;
     prepareInsertRow = prepareInsertRowMock;
     prepareDeleteRowsPlan = prepareDeleteRowsPlanMock;
     clearForConnection = vi.fn();
@@ -187,6 +191,7 @@ describe("TablePanel", () => {
     getColumnsMock.mockReset();
     getColumnsMock.mockResolvedValue([]);
     getPageMock.mockClear();
+    exportAllMock.mockReset();
     prepareInsertRowMock.mockReset();
     prepareInsertRowMock.mockResolvedValue(null);
     prepareApplyChangesPlanMock.mockReset();
@@ -368,6 +373,149 @@ describe("TablePanel", () => {
       payload: { limitToPage: { page: 3, pageSize: 25 } },
     });
     expect(exportTableDataMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    "exportCSV",
+    "exportJSON",
+  ])("keeps visible-column positions and metadata across sparse chunks for full %s", async (type) => {
+    const { panel } = await openSchemaRefreshPath();
+    const id = { name: "id", category: "integer", nativeType: "int" } as const;
+    const name = {
+      name: "name",
+      category: "text",
+      nativeType: "string",
+    } as const;
+    const hidden = { ...name, name: "hidden" };
+    exportAllMock.mockImplementationOnce(async function* () {
+      yield {
+        columns: [id, name, hidden],
+        rows: [{ id: 1, name: "one", hidden: "secret" }],
+      };
+      yield { columns: [id, hidden], rows: [{ id: 2, hidden: "secret2" }] };
+      yield { columns: [name, id], rows: [{ name: "three", id: 3 }] };
+    });
+    const actual: ChunkedExportData[] = [];
+    exportTableDataMock.mockImplementationOnce(async ({ loadChunks }) => {
+      for await (const chunk of loadChunks(new AbortController().signal))
+        actual.push(chunk);
+    });
+    await panel.webview.dispatchMessage({
+      type,
+      payload: {
+        columnOrder: ["name", "id"],
+        filters: [{ column: "id", operator: "gte", value: "1" }],
+        sort: { column: "id", direction: "asc" },
+      },
+    });
+    expect(actual).toEqual([
+      { columns: [name, id], rows: [{ name: "one", id: 1 }] },
+      { columns: [name, id], rows: [{ name: undefined, id: 2 }] },
+      { columns: [name, id], rows: [{ name: "three", id: 3 }] },
+    ]);
+    expect(exportAllMock).toHaveBeenCalledWith(
+      "conn-1",
+      "db1",
+      "public",
+      "users",
+      500,
+      { column: "id", direction: "asc" },
+      [{ column: "id", operator: "gte", value: "1" }],
+      expect.any(AbortSignal),
+    );
+  });
+
+  it("uses described metadata for a selected column absent even from the first page", async () => {
+    const { panel } = await openSchemaRefreshPath();
+    const name = {
+      name: "name",
+      isPrimaryKey: false,
+      category: "text",
+      nativeType: "string",
+    } as const;
+    getColumnsMock.mockResolvedValue([
+      name,
+      { name: "id", isPrimaryKey: true },
+    ]);
+    await panel.webview.dispatchMessage({ type: "ready" });
+    exportAllMock.mockImplementationOnce(async function* () {
+      yield {
+        columns: [{ name: "id", category: "integer", nativeType: "int" }],
+        rows: [{ id: 1 }],
+      };
+    });
+    const actual: ChunkedExportData[] = [];
+    exportTableDataMock.mockImplementationOnce(async ({ loadChunks }) => {
+      for await (const chunk of loadChunks(new AbortController().signal))
+        actual.push(chunk);
+    });
+    await panel.webview.dispatchMessage({
+      type: "exportCSV",
+      payload: { columnOrder: ["name", "id"] },
+    });
+    expect(actual[0]?.columns.map((column) => column.name)).toEqual([
+      "name",
+      "id",
+    ]);
+    expect(actual[0]?.columns[0]).toEqual(name);
+    expect(actual[0]?.rows).toEqual([{ name: undefined, id: 1 }]);
+  });
+
+  it.each([
+    { selection: ["unknown"] },
+    { selection: ["id", "unknown"] },
+    { selection: [] },
+    { selection: ["id", "id"] },
+  ])("rejects invalid explicit export selection $selection rather than exporting all columns", async ({
+    selection,
+  }) => {
+    const { panel } = await openSchemaRefreshPath();
+    exportAllMock.mockImplementationOnce(async function* () {
+      yield {
+        columns: [{ name: "id", category: "integer", nativeType: "int" }],
+        rows: [{ id: 1, hidden: "secret" }],
+      };
+    });
+    let exportError: unknown;
+    exportTableDataMock.mockImplementationOnce(async ({ loadChunks }) => {
+      const iterator = loadChunks(new AbortController().signal)[
+        Symbol.asyncIterator
+      ]();
+      try {
+        await iterator.next();
+      } catch (error) {
+        exportError = error;
+      }
+    });
+    await panel.webview.dispatchMessage({
+      type: "exportCSV",
+      payload: { columnOrder: selection },
+    });
+    expect(exportTableDataMock).toHaveBeenCalledOnce();
+    expect(exportError).toBeInstanceOf(Error);
+    expect((exportError as Error).message).toMatch(
+      /(Unknown export column|column selection)/,
+    );
+  });
+
+  it("passes the complete schema and rows through when no column selection is supplied", async () => {
+    const { panel } = await openSchemaRefreshPath();
+    const chunk = {
+      columns: [
+        { name: "id", category: "integer", nativeType: "int" },
+      ] as const,
+      rows: [{ id: 1, newField: "must not silently disappear" }],
+    };
+    exportAllMock.mockImplementationOnce(async function* () {
+      yield chunk;
+    });
+    const actual: ChunkedExportData[] = [];
+    exportTableDataMock.mockImplementationOnce(async ({ loadChunks }) => {
+      for await (const result of loadChunks(new AbortController().signal))
+        actual.push(result);
+    });
+    await panel.webview.dispatchMessage({ type: "exportCSV" });
+    expect(actual).toEqual([chunk]);
   });
 
   it("keeps an unchanged preview valid across duplicate metadata refresh", async () => {

@@ -287,6 +287,10 @@ function persistedSampleFor(
     case "uuid":
       return "123e4567-e89b-12d3-a456-426614174000";
     case "array":
+      // Unspecified PG array element types have raw text tokens, not inferred
+      // numeric elements. Typed integer[] cases retain the numeric fixture.
+      if (driverName === "postgres" && lowered === "array")
+        return ["1", "2", "3"];
       return [1, 2, 3];
     case "interval":
       if (driverName === "oracle") {

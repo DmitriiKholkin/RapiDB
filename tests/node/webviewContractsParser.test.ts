@@ -241,6 +241,28 @@ describe.each([
 });
 
 describe("parseTablePanelMessage export payload", () => {
+  it.each([
+    "exportCSV",
+    "exportJSON",
+  ])("preserves an explicit empty selection for %s so the host can fail closed", (type) => {
+    expect(
+      parseTablePanelMessage({ type, payload: { columnOrder: [] } }),
+    ).toMatchObject({ type, payload: { columnOrder: [] } });
+  });
+
+  it.each([
+    { columnOrder: null },
+    { columnOrder: "id" },
+    { columnOrder: [1] },
+    { columnOrder: ["id", null] },
+  ])("rejects a malformed table export selection $columnOrder rather than falling back to all columns", ({
+    columnOrder,
+  }) => {
+    expect(
+      parseTablePanelMessage({ type: "exportCSV", payload: { columnOrder } }),
+    ).toBeNull();
+  });
+
   it("parses numeric limitToPage for exportCSV", () => {
     const parsed = parseTablePanelMessage({
       type: "exportCSV",

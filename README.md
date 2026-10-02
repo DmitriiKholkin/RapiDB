@@ -61,6 +61,10 @@ PostgreSQL, MS SQL Server, MySQL, MariaDB, SQLite, Oracle, Redis, MongoDB, Elast
 
 Saved connections can be grouped into folders, and each connection expands into databases → schemas → tables, views, materialized views, functions, procedures, sequences, and types. Right-click any object to copy its name, inspect columns with PK/FK badges, constraints, indexes, and triggers, open the data viewer where it applies, or pull the DDL / definition - no typing required.
 
+**PostgreSQL table DDL is reconstructed**, not a `pg_dump` schema backup. It includes columns and named PRIMARY KEY, CHECK, UNIQUE, FOREIGN KEY and exclusion constraints from the catalog. Referenced tables, types, functions and sequences must already exist; sequences, standalone indexes, triggers, security, storage settings and partition/inheritance definitions are not included. Dependencies are schema-qualified when deparsed outside the catalog search path. Views and materialized views use the server's native view definition.
+
+**Redis keyspaces:** `default` retains its historical **all-keys** meaning (`*`), including keys without a prefix. A real `default:` prefix has a separate navigation identity, `default:`, which reads only `default:*`. Other keyspaces use `prefix:*`. When there are no unprefixed keys, a real `default:` prefix creates only the `default:` node, not the all-keys node. These names control reads and exports; edits and deletes still address the exact stored primary-key value.
+
 <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-5.png" alt="Database Explorer tree" width="250" />
 
 <br/>
@@ -103,6 +107,8 @@ Results land in a **virtualized table** - no jank, no browser tab hanging:
 
 > Truncated results show a warning. `rapidb.queryRowLimit` controls the number of displayed rows, subject to a hard ceiling of 10,000 rows; increasing the setting above 10,000 does not lift that ceiling. This display limit does not limit rows affected by a mutation or cancel query execution.
 
+Table exports keep a stable column schema across chunks. CSV uses the declared columns (including empty cells for missing values); a later unexpected column fails the export rather than silently dropping data. JSON applies the same unexpected-column check. Failed exports leave an existing destination file intact.
+
 <br/>
 
 ### ✍️ Browse and edit table data
@@ -117,6 +123,8 @@ Click any table → the **Table Data Viewer** opens:
 | New rows | Insert bar at the top |
 | Deletion | Select rows and delete |
 | Safety | Preview-first apply flow with verification; transactional where applicable |
+
+Persisted edits are prevalidated against available column metadata before any write. Known unsupported edits fail before the batch is applied; where representation compatibility depends on the stored value, verification runs in the transaction and a mismatch rolls it back. Preview skipping does not bypass validation or verification. Schemaless sampling is not a complete database schema or a guarantee that every value has the sampled type.
 
 <br/>
 

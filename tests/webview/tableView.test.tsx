@@ -5337,7 +5337,10 @@ describe("TableView", () => {
     });
   });
 
-  it("combines insert draft with pending edits in shared unsaved state", async () => {
+  it.each([
+    "update",
+    "insert",
+  ] as const)("retains mixed pending edits and draft after %s prevalidation failure", async (failedKind) => {
     const user = userEvent.setup();
 
     renderTableView();
@@ -5397,6 +5400,46 @@ describe("TableView", () => {
         ],
       },
     });
+    const request = getLastPostedMessage();
+    const error = 'Column "name" cannot persist the requested value exactly.';
+    await act(async () => {
+      dispatchIncomingMessage("applyResult", {
+        success: false,
+        error,
+        insertApplied: false,
+        rowOutcomes: [
+          {
+            rowIndex: 0,
+            success: false,
+            status:
+              failedKind === "update" ? "prevalidation_failed" : "skipped",
+            columns: failedKind === "update" ? ["name"] : undefined,
+            message: error,
+          },
+        ],
+        insertRowOutcomes: [
+          {
+            rowIndex: 0,
+            success: false,
+            status:
+              failedKind === "insert" ? "prevalidation_failed" : "skipped",
+            message: error,
+          },
+        ],
+      });
+    });
+    expect(
+      screen
+        .getByRole("button", { name: "Apply Changes" })
+        .hasAttribute("disabled"),
+    ).toBe(false);
+    expect(screen.getByText("Alicia")).toBeTruthy();
+    expect(screen.getAllByText(/^DEFAULT$/).length).toBeGreaterThan(0);
+    expect(screen.getByText(error)).toBeTruthy();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()).toEqual(request);
   });
 
   it("clears draft and refreshes when insert is applied but updates fail", async () => {

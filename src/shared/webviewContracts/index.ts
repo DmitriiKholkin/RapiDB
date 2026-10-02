@@ -38,6 +38,8 @@ export type {
 } from "./erd";
 export { parseErdPanelMessage } from "./erd";
 export type {
+  BookmarkSavedPayload,
+  QueryBookmarkPayload,
   QueryEditorLanguage,
   QueryEditorMode,
   QueryEditorPresentation,
@@ -46,7 +48,7 @@ export type {
   QueryPanelMessage,
   QueryResultExportPayload,
 } from "./query";
-export { parseQueryPanelMessage } from "./query";
+export { parseBookmarkSavedPayload, parseQueryPanelMessage } from "./query";
 export type {
   PanelRetentionMode,
   PanelRetentionState,

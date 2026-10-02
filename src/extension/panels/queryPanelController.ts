@@ -6,7 +6,9 @@ import {
   type QueryExecutionCancellationHandle,
 } from "../../shared/safetyContracts";
 import {
+  type BookmarkSavedPayload,
   parseQueryPanelMessage,
+  type QueryBookmarkPayload,
   type QueryEditorSqlDialect,
   type QueryResultExportPayload,
 } from "../../shared/webviewContracts";
@@ -148,10 +150,7 @@ export class QueryPanelController {
         break;
       case "addBookmark":
         if (parsed.payload) {
-          await this.handleAddBookmark(
-            parsed.payload.queryText,
-            parsed.payload.connectionId,
-          );
+          await this.handleAddBookmark(parsed.payload);
         }
         break;
     }
@@ -679,10 +678,11 @@ export class QueryPanelController {
     await writeClipboardText(text);
   }
 
-  private async handleAddBookmark(
-    queryText: string,
-    connectionIdOverride?: string,
-  ): Promise<void> {
+  private async handleAddBookmark({
+    queryText,
+    connectionId: connectionIdOverride,
+    requestId,
+  }: QueryBookmarkPayload): Promise<void> {
     if (!queryText?.trim()) {
       return;
     }
@@ -693,13 +693,20 @@ export class QueryPanelController {
       await this.connectionManager.addBookmark(connectionId, queryText);
       this.view.postMessage({
         type: "bookmarkSaved",
-        payload: { ok: true },
+        payload: {
+          ok: true,
+          ...(requestId !== undefined ? { requestId } : {}),
+        } satisfies BookmarkSavedPayload,
       });
     } catch (error: unknown) {
       const normalized = normalizeUnknownError(error);
       this.view.postMessage({
         type: "bookmarkSaved",
-        payload: { ok: false, error: normalized.message },
+        payload: {
+          ok: false,
+          error: normalized.message,
+          ...(requestId !== undefined ? { requestId } : {}),
+        } satisfies BookmarkSavedPayload,
       });
     }
   }

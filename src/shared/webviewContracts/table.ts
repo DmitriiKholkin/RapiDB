@@ -43,6 +43,7 @@ export interface ApplyResultPayload {
   failedRows?: number[];
   rowOutcomes?: ApplyRowOutcome[];
   insertApplied?: boolean;
+  insertRowOutcomes?: ApplyRowOutcome[];
 }
 
 // ─── Mutation Preview Types ─────────────────────────────────────────────────
@@ -87,6 +88,8 @@ export interface TableMutationResultPayload {
   operationId: string;
   success: boolean;
   error?: string;
+  status?: "prevalidation_failed";
+  columns?: string[];
 }
 
 export interface DeleteRowOutcome {
@@ -248,14 +251,6 @@ function readLimitToPage(
   return { page, pageSize };
 }
 
-function readColumnOrder(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-  const strings = value.filter((v): v is string => typeof v === "string");
-  return strings.length > 0 ? strings : undefined;
-}
-
 function readOperationId(payload: Record<string, unknown>): string | null {
   return readRequiredString(payload, "operationId");
 }
@@ -383,13 +378,21 @@ export function parseTablePanelMessage(
       if (payload.filters !== undefined && !Array.isArray(payload.filters)) {
         return null;
       }
+      const columnOrder = payload.columnOrder;
+      if (
+        columnOrder !== undefined &&
+        (!Array.isArray(columnOrder) ||
+          !columnOrder.every((name) => typeof name === "string"))
+      ) {
+        return null;
+      }
       return {
         type: envelope.type,
         payload: {
           sort: payload.sort,
           filters: payload.filters as unknown[] | undefined,
           limitToPage: readLimitToPage(payload.limitToPage),
-          columnOrder: readColumnOrder(payload.columnOrder),
+          columnOrder: columnOrder as string[] | undefined,
         },
       };
     }

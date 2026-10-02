@@ -221,6 +221,424 @@ describe("ConnectionProvider", () => {
     vi.clearAllMocks();
   });
 
+  it("keeps positional node identity for colons, empty scopes, details and routine keys", async () => {
+    const { RapiDBNode } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+    type Identity = Parameters<typeof makeNode>;
+    function makeNode(
+      ...identity: ConstructorParameters<typeof RapiDBNode> extends [
+        string,
+        infer Kind,
+        number,
+        ...infer Rest,
+      ]
+        ? [Kind, ...Rest]
+        : never
+    ) {
+      const [kind, ...rest] = identity;
+      return new RapiDBNode("label", kind, 0, ...rest);
+    }
+    const identities: Identity[] = [
+      ["table", "conn:1", "db", "a:b", "c"],
+      ["table", "conn:1", "db", "a", "b:c"],
+      ["table", "conn", "", "db", "t"],
+      ["table", "conn", "db", "", "t"],
+      ["table", "conn", undefined, "db", "t"],
+      ["table", "conn:db", "a", "b", "c"],
+      ["table", "conn", "db:a", "b", "c"],
+      ["view", "conn:1", "db", "a:b", "c"],
+      [
+        "table_section_indexes",
+        "conn:1",
+        "db",
+        "s",
+        "t:a",
+        "t:a",
+        "indexes",
+        undefined,
+        undefined,
+        "table",
+      ],
+      [
+        "table_detail_index",
+        "conn:1",
+        "db",
+        "s",
+        "i:a",
+        "t:b",
+        "indexes",
+        "i:a",
+        "supported",
+        "table",
+      ],
+      [
+        "table_detail_index",
+        "conn:1",
+        "db",
+        "s",
+        "i",
+        "a:t:b",
+        "indexes",
+        "i:a",
+        "supported",
+        "table",
+      ],
+      [
+        "table_detail_index",
+        "conn:1",
+        "db",
+        "s",
+        "i:a",
+        "t:b",
+        "indexes",
+        "i:a",
+        "supported",
+        "view",
+      ],
+      ["function", "conn:1", "db", "s", "f", undefined, undefined, "oid:12345"],
+      ["function", "conn:1", "db", "s", "f", undefined, undefined, "oid:12346"],
+      ["folder", "Team:a"],
+      ["connectionNode_connected", "Team:a"],
+    ];
+    const nodes = identities.map((identity) => makeNode(...identity));
+    expect(new Set(nodes.map((node) => node.id)).size).toBe(identities.length);
+    expect(nodes[0].id).toBe(
+      '["table","conn:1","db","a:b","c",null,null,null,null]',
+    );
+    expect(nodes[2].id).toBe(
+      '["table","conn","","db","t",null,null,null,null]',
+    );
+    expect(nodes[4].id).toBe(
+      '["table","conn",null,"db","t",null,null,null,null]',
+    );
+    expect(nodes[9].id).toBe(
+      '["table_detail_index","conn:1","db","s","i:a","t:b","indexes","i:a","table"]',
+    );
+    expect(nodes[12].id).toBe(
+      '["function","conn:1","db","s","f",null,null,"oid:12345",null]',
+    );
+    expect(identities.map((identity) => makeNode(...identity).id)).toEqual(
+      nodes.map((node) => node.id),
+    );
+  });
+
+  it("creates unique stable IDs through getChildren across refresh and cloned snapshots", async () => {
+    const snapshot = {
+      databases: [
+        {
+          name: "db:main",
+          schemas: ["a:b", "a"].map((name, index) => ({
+            name,
+            objects: [
+              { name: index === 0 ? "c" : "b:c", type: "table", columns: [] },
+              {
+                name: "f:run",
+                type: "function",
+                columns: [],
+                routineIdentity: "oid:1",
+              },
+              {
+                name: "f:run",
+                type: "function",
+                columns: [],
+                routineIdentity: "oid:2",
+              },
+            ],
+          })),
+        },
+      ],
+    };
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn:1", name: "Primary", type: "pg", folder: "Team:DB" },
+      ]),
+      isConnected: vi.fn(() => true),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState(structuredClone(snapshot)),
+      ),
+      ensureTableDetailLoading: vi.fn(),
+      getTableDetailState: vi.fn(() => {
+        const state = loadedTableDetailState();
+        state.snapshot.indexes.items[0].name = "idx:lookup";
+        return state;
+      }),
+      isSchemaScopeExpanded: vi.fn(() => false),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+    const { ConnectionProvider, RapiDBNode } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+    const provider = new ConnectionProvider(connectionManager as never);
+    async function collect(
+      parent?: InstanceType<typeof RapiDBNode>,
+    ): Promise<InstanceType<typeof RapiDBNode>[]> {
+      const children = await provider.getChildren(parent);
+      const descendants = await Promise.all(
+        children
+          .filter((node) => node.collapsibleState !== 0)
+          .map((node) => collect(node)),
+      );
+      return [...children, ...descendants.flat()];
+    }
+    const nodes = await collect();
+    expect(new Set(nodes.map((node) => node.id)).size).toBe(nodes.length);
+    expect(
+      nodes.filter((node) => node.kind === "table").map((node) => node.id),
+    ).toEqual([
+      '["table","conn:1","db:main","a:b","c",null,null,null,null]',
+      '["table","conn:1","db:main","a","b:c",null,null,null,null]',
+    ]);
+    expect(nodes.find((node) => node.kind === "folder")?.id).toBe(
+      '["folder","",null,null,"Team:DB",null,null,null,null]',
+    );
+    expect(
+      nodes.find((node) => node.kind === "table_section_indexes")?.id,
+    ).toBe(
+      '["table_section_indexes","conn:1","db:main","a:b","c","c","indexes",null,"table"]',
+    );
+    expect(nodes.find((node) => node.kind === "table_detail_index")?.id).toBe(
+      '["table_detail_index","conn:1","db:main","a:b","idx:lookup","c","indexes","idx:lookup","table"]',
+    );
+    const table = nodes.find((node) => node.kind === "table");
+    expect(table?.contextValue).toBe("table");
+    expect(table?.tooltip).toBe("Table: c\nSchema: a:b\nDatabase: db:main");
+    expect(table?.command?.arguments).toEqual([table]);
+    provider.refresh();
+    expect((await collect()).map((node) => node.id)).toEqual(
+      nodes.map((node) => node.id),
+    );
+  });
+
+  const statusCases = ["loading", "error"] as const;
+
+  it.each(statusCases)("scopes %s status IDs to parents", async (status) => {
+    const snapshot = {
+      databases: ["app_db", "audit:db"].map((name) => ({
+        name,
+        schemas: ["public", "audit:scope"].map((schema) => ({
+          name: schema,
+          objects: [
+            { name: "users", type: "table", columns: [] },
+            { name: "orders", type: "table", columns: [] },
+            { name: "reports:view", type: "view", columns: [] },
+          ],
+        })),
+      })),
+    };
+    let pending = false;
+    let cached = false;
+    let error = "Metadata unavailable";
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn:1", name: "Primary", type: "pg" },
+      ]),
+      isConnected: vi.fn(() => true),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() =>
+        pending
+          ? {
+              snapshot: structuredClone(cached ? snapshot : { databases: [] }),
+              status,
+              isPartial: false,
+              error,
+            }
+          : loadedState(structuredClone(snapshot)),
+      ),
+      ensureTableDetailLoading: vi.fn(),
+      getTableDetailState: vi.fn(() => {
+        const state = loadedTableDetailState();
+        return structuredClone(pending ? { ...state, status, error } : state);
+      }),
+      isSchemaScopeExpanded: vi.fn(() => false),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+    const { ConnectionProvider, RapiDBNode } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+    const provider = new ConnectionProvider(connectionManager as never);
+    async function getParents(
+      parent?: InstanceType<typeof RapiDBNode>,
+    ): Promise<InstanceType<typeof RapiDBNode>[]> {
+      const children = await provider.getChildren(parent);
+      const expandable = children.filter((node) => node.collapsibleState !== 0);
+      const descendants = await Promise.all(expandable.map(getParents));
+      return [...expandable, ...descendants.flat()];
+    }
+    const parents = await getParents();
+    expect(new Set(parents.map((node) => node.kind))).toEqual(
+      new Set([
+        "connectionNode_connected",
+        "database",
+        "schema",
+        "category_tables",
+        "category_views",
+        "table",
+        "view",
+        "table_section_columns",
+        "table_section_constraints",
+        "table_section_indexes",
+        "table_section_triggers",
+      ]),
+    );
+    pending = true;
+    async function getStatuses(nodes: typeof parents) {
+      const branches = await Promise.all(
+        nodes.map((node) => provider.getChildren(node)),
+      );
+      const statuses = branches.map((children) =>
+        children.filter((node) => node.kind === `status_${status}`),
+      );
+      for (const [index, children] of statuses.entries()) {
+        expect(children).toHaveLength(1);
+        expect(children[0]).toMatchObject({
+          kind: `status_${status}`,
+          connectionId: "conn:1",
+          contextValue: status === "loading" ? "_status" : "_error",
+          detailKey: nodes[index].id,
+        });
+        expect(children[0].command).toBeUndefined();
+        expect(children[0].tooltip).toBe(
+          status === "loading" ? children[0].label : `Error: ${error}`,
+        );
+      }
+      return statuses.flat();
+    }
+    const statuses = await getStatuses(parents);
+    expect(new Set(statuses.map((node) => node.id)).size).toBe(parents.length);
+    const usersAndOrders = statuses.filter(
+      (_, index) =>
+        parents[index].kind === "table" &&
+        parents[index].database === "app_db" &&
+        parents[index].schema === "public",
+    );
+    expect(usersAndOrders).toHaveLength(2);
+    expect(new Set(usersAndOrders.map((node) => node.id)).size).toBe(2);
+    if (status === "error") {
+      cached = true;
+      expect((await getStatuses(parents)).map((node) => node.id)).toEqual(
+        statuses.map((node) => node.id),
+      );
+      cached = false;
+    }
+    pending = false;
+    provider.refresh();
+    const refreshedParents = await getParents();
+    expect(refreshedParents.map((node) => node.id)).toEqual(
+      parents.map((node) => node.id),
+    );
+    pending = true;
+    error = "Different error text must not change identity";
+    expect(
+      (await getStatuses(refreshedParents)).map((node) => node.id),
+    ).toEqual(statuses.map((node) => node.id));
+  });
+
+  it.each(statusCases)("scopes %s section-level IDs", async (status) => {
+    let pending = false;
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn:1", name: "Primary", type: "pg" },
+      ]),
+      isConnected: vi.fn(() => true),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "app_db",
+              schemas: [
+                {
+                  name: "public",
+                  objects: [
+                    { name: "users", type: "table", columns: [] },
+                    { name: "orders", type: "table", columns: [] },
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      ensureTableDetailLoading: vi.fn(),
+      getTableDetailState: vi.fn(() => {
+        const state = loadedTableDetailState();
+        return structuredClone(
+          pending
+            ? {
+                ...state,
+                snapshot: {
+                  ...state.snapshot,
+                  columns: { status, items: [], error: "Metadata unavailable" },
+                  indexes: { status, items: [], error: "Metadata unavailable" },
+                },
+              }
+            : state,
+        );
+      }),
+      isSchemaScopeExpanded: vi.fn(() => false),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+    const provider = new ConnectionProvider(connectionManager as never);
+    async function getSections() {
+      const [root] = await provider.getChildren();
+      const [database] = await provider.getChildren(root);
+      const [schema] = await provider.getChildren(database);
+      const categories = await provider.getChildren(schema);
+      const tables = await provider.getChildren(
+        categories.find((node) => node.kind === "category_tables"),
+      );
+      const sections = (
+        await Promise.all(tables.map((node) => provider.getChildren(node)))
+      ).flat();
+      return sections.filter(
+        (node) => node.section === "columns" || node.section === "indexes",
+      );
+    }
+    const sections = await getSections();
+    pending = true;
+    const children = (
+      await Promise.all(sections.map((node) => provider.getChildren(node)))
+    ).flat();
+    expect(children).toHaveLength(4);
+    expect(new Set(children.map((node) => node.id)).size).toBe(4);
+    expect(children.map((node) => node.detailKey)).toEqual(
+      sections.map((node) => node.id),
+    );
+    expect(children.every((node) => node.kind === `status_${status}`)).toBe(
+      true,
+    );
+    provider.refresh();
+    const refreshedSections = await getSections();
+    const refreshedChildren = (
+      await Promise.all(
+        refreshedSections.map((node) => provider.getChildren(node)),
+      )
+    ).flat();
+    expect(refreshedChildren.map((node) => node.id)).toEqual(
+      children.map((node) => node.id),
+    );
+  });
+
   it.each([
     "pg",
     "mysql",
@@ -442,7 +860,7 @@ describe("ConnectionProvider", () => {
     const roots = await provider.getChildren();
     expect(roots.map((node) => node.label)).toEqual(["Team", "Solo"]);
     expect(roots[0]).toMatchObject({
-      id: "folder:Team",
+      id: '["folder","",null,null,"Team",null,null,null,null]',
       contextValue: "folder",
       description: "2 connections",
       tooltip: "Folder: Team (2 connections)",
@@ -1701,7 +2119,7 @@ describe("ConnectionProvider", () => {
     const typeNode = (await provider.getChildren(typeCategory))[0];
 
     expect(tableNode).toMatchObject({
-      id: "table:conn-1:app_db:app_db:users",
+      id: '["table","conn-1","app_db","app_db","users",null,null,null,null]',
       contextValue: "table",
       tooltip: "Table: users\nSchema: app_db\nDatabase: app_db",
     });
@@ -1711,7 +2129,7 @@ describe("ConnectionProvider", () => {
       arguments: [tableNode],
     });
     expect(materializedViewNode).toMatchObject({
-      id: "materializedView:conn-1:app_db:app_db:latest_users",
+      id: '["materializedView","conn-1","app_db","app_db","latest_users",null,null,null,null]',
       contextValue: "materializedView",
       tooltip:
         "Materialized View: latest_users\nSchema: app_db\nDatabase: app_db",
@@ -1722,13 +2140,13 @@ describe("ConnectionProvider", () => {
       arguments: [materializedViewNode],
     });
     expect(functionNode).toMatchObject({
-      id: "function:conn-1:app_db:app_db:users_total",
+      id: '["function","conn-1","app_db","app_db","users_total",null,null,null,null]',
       contextValue: "function",
       tooltip: "Function: users_total\nSchema: app_db\nDatabase: app_db",
     });
     expect(functionNode?.command).toBeUndefined();
     expect(procedureNode).toMatchObject({
-      id: "procedure:conn-1:app_db:app_db:refresh_users",
+      id: '["procedure","conn-1","app_db","app_db","refresh_users",null,null,null,null]',
       contextValue: "procedure",
       tooltip: "Procedure: refresh_users\nSchema: app_db\nDatabase: app_db",
     });
@@ -1770,7 +2188,7 @@ describe("ConnectionProvider", () => {
 
     expect(children).toHaveLength(1);
     expect(children[0]).toMatchObject({
-      id: "status_loading:conn-1",
+      id: '["status_loading","conn-1",null,null,null,null,null,"[\\"connectionNode_connected\\",\\"conn-1\\",null,null,null,null,null,null,null]",null]',
       label: "Loading schema…",
       contextValue: "_status",
       tooltip: "Loading schema…",
@@ -2068,7 +2486,7 @@ describe("ConnectionProvider", () => {
 
     expect(children).toHaveLength(1);
     expect(children[0]).toMatchObject({
-      id: "status_loading:conn-1",
+      id: '["status_loading","conn-1",null,null,null,null,null,"[\\"database\\",\\"conn-1\\",\\"app_db\\",null,null,null,null,null,null]",null]',
       label: "Loading app_db…",
       contextValue: "_status",
       tooltip: "Loading app_db…",
@@ -2153,7 +2571,7 @@ describe("ConnectionProvider", () => {
     expect(schemas.map((node) => node.label)).toEqual(["public", "audit"]);
     expect(children).toHaveLength(1);
     expect(children[0]).toMatchObject({
-      id: "status_loading:conn-1",
+      id: '["status_loading","conn-1",null,null,null,null,null,"[\\"schema\\",\\"conn-1\\",\\"app_db\\",\\"public\\",null,null,null,null,null]",null]',
       label: "Loading public…",
       contextValue: "_status",
       tooltip: "Loading public…",
@@ -2273,7 +2691,7 @@ describe("ConnectionProvider", () => {
 
     expect(children).toHaveLength(1);
     expect(children[0]).toMatchObject({
-      id: "status_error:conn-1",
+      id: '["status_error","conn-1",null,null,null,null,null,"[\\"connectionNode_connected\\",\\"conn-1\\",null,null,null,null,null,null,null]",null]',
       label: "Snapshot failed",
       contextValue: "_error",
       tooltip: "Error: Snapshot failed",
@@ -2558,7 +2976,7 @@ describe("ConnectionProvider", () => {
 
     expect(children).toHaveLength(1);
     expect(children[0]).toMatchObject({
-      id: "status_loading:conn-1",
+      id: '["status_loading","conn-1",null,null,null,null,null,"[\\"table\\",\\"conn-1\\",\\"app_db\\",\\"app_db\\",\\"users\\",null,null,null,null]",null]',
       label: "Loading users…",
       contextValue: "_status",
       tooltip: "Loading users…",
@@ -2665,7 +3083,7 @@ describe("ConnectionProvider", () => {
     expect(viewNode?.collapsibleState).toBe(1);
     expect(sections.map((node) => node.label)).toEqual(["Columns", "Triggers"]);
     expect(columnNodes[0]?.id).toBe(
-      "table_detail_column:conn-1:app_db:app_db:id:active_users:columns:id:view",
+      '["table_detail_column","conn-1","app_db","app_db","id","active_users","columns","id","view"]',
     );
     expect(ensureTableDetailLoading).toHaveBeenCalledWith({
       connectionId: "conn-1",

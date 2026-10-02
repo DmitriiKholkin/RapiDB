@@ -24,6 +24,7 @@ import type {
   DriverTablePageResult,
   QueryResult,
 } from "../../src/extension/dbDrivers/types.ts";
+import { TableReadService } from "../../src/extension/table/tableReadService.ts";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const REDIS_URL = `redis://:redis_pass123@${LOOPBACK_HOST}:6379`;
@@ -389,6 +390,7 @@ async function verifyRedisDriver(transport: LiveTransport): Promise<void> {
   const session = await createRedisDriverSession(transport);
   const driver = session.driver;
   try {
+    await verifyRedisDefaultPrefix(driver);
     assert.equal(driver.isConnected(), true);
     const databases = await driver.listDatabases();
     assert(databases.some((database) => database.name === "db0"));
@@ -401,7 +403,20 @@ async function verifyRedisDriver(transport: LiveTransport): Promise<void> {
 
     const columns = await driver.describeColumns("db0", "db0", "users");
     assert.equal(findColumn(columns, "key").isPrimaryKey, true);
-    assert.equal(findColumn(columns, "value").category, "text");
+    assert.equal(findColumn(columns, "value").category, "other");
+    assert.equal(
+      findColumn(columns, "value").nativeType,
+      "mixed(string, hash, list, set, zset)",
+    );
+    // A separate homogeneous keyspace retains the text/string contract.
+    await driver.query('SET strings:stage6 "plain"');
+    try {
+      const homogeneous = await driver.describeColumns("db0", "db0", "strings");
+      assert.equal(findColumn(homogeneous, "value").category, "text");
+      assert.equal(findColumn(homogeneous, "value").nativeType, "string");
+    } finally {
+      await driver.query("DEL strings:stage6");
+    }
 
     const page = await driver.readTablePage({
       database: "db0",
@@ -469,6 +484,120 @@ async function verifyRedisDriver(transport: LiveTransport): Promise<void> {
   }
 }
 
+async function verifyRedisDefaultPrefix(driver: RedisDriver): Promise<void> {
+  log("Verifying B09 default/all-keys navigation in DB15 (owned keys only)...");
+  const seed = createRedisClient({ url: `${REDIS_URL}/15` });
+  seed.on("error", () => undefined);
+  await seed.connect();
+  const id = `b09_${process.pid}_${Date.now().toString(36)}`;
+  const orphan = `${id}_orphan`;
+  const keys = [orphan, `default:${id}:a`, `default:${id}:b`, `users:${id}`];
+  const manager = {
+    getConnection: () => ({ id: "redis-b09", type: "redis" }),
+    getDriver: () => driver,
+  };
+  const read = new TableReadService(manager as never);
+  try {
+    await seed.set(keys[0], "outside");
+    await seed.set(keys[1], "a");
+    await seed.set(keys[2], "b");
+    await seed.set(keys[3], "outside");
+    const names = (await driver.listObjects("db15")).map((entry) => entry.name);
+    for (const name of ["default", "default:", "users"])
+      assert(names.includes(name));
+    const native = await read.getPage(
+      "redis-b09",
+      "db15",
+      "",
+      "default:",
+      1,
+      100,
+      [],
+      { column: "key", direction: "asc" },
+    );
+    assert(native.rows.every((row) => String(row.key).startsWith("default:")));
+    for (const key of keys.slice(1, 3))
+      assert(native.rows.some((row) => row.key === key));
+    const all = await read.getPage(
+      "redis-b09",
+      "db15",
+      "",
+      "default",
+      1,
+      100,
+      [],
+      null,
+    );
+    for (const key of keys) assert(all.rows.some((row) => row.key === key));
+    const fallback = await read.getPage(
+      "redis-b09",
+      "db15",
+      "",
+      "default:",
+      1,
+      100,
+      [{ column: "key", operator: "like", value: `%${id}%` }],
+      { column: "value", direction: "desc" },
+    );
+    assert.deepEqual(
+      fallback.rows.map((row) => row.key),
+      [keys[2], keys[1]],
+    );
+    const columns = await driver.describeColumns("db15", "", "default:");
+    assert.equal(findColumn(columns, "key").isPrimaryKey, true);
+    assert.equal(findColumn(columns, "value").nativeType, "string");
+    const exported: unknown[] = [];
+    for await (const chunk of read.exportAll(
+      "redis-b09",
+      "db15",
+      "",
+      "default:",
+      100,
+    )) {
+      assert(chunk.rows.every((row) => String(row.key).startsWith("default:")));
+      exported.push(...chunk.rows.map((row) => row.key));
+    }
+    for (const key of keys.slice(1, 3)) assert(exported.includes(key));
+    await driver.updateRows({
+      database: "db15",
+      schema: "",
+      table: "default:",
+      updates: [
+        { primaryKeys: { key: keys[1] }, changes: { value: "updated" } },
+      ],
+    });
+    assert.equal(await seed.get(keys[1]), "updated");
+    assert.equal(await seed.get(keys[3]), "outside");
+    await driver.deleteRows({
+      database: "db15",
+      schema: "",
+      table: "default:",
+      primaryKeyValuesList: [{ key: keys[2] }],
+    });
+    assert.equal(await seed.get(keys[2]), null);
+    assert.equal(await seed.get(keys[0]), "outside");
+    await seed.del(orphan);
+    const remaining = (await driver.listObjects("db15")).map(
+      (entry) => entry.name,
+    );
+    assert(remaining.includes("default:"));
+    // If the DB contains other owners' unprefixed keys, their all-keys node
+    // remains legitimate. Never remove them or flush this logical database.
+    let hasOrphans = false;
+    for await (const batch of seed.scanIterator()) {
+      if (batch.some((key) => !key.includes(":") || key.startsWith(":")))
+        hasOrphans = true;
+    }
+    assert.equal(remaining.includes("default"), hasOrphans);
+  } finally {
+    try {
+      await seed.del(keys);
+    } finally {
+      await seed.close();
+    }
+  }
+}
+
 async function verifyMongoDriver(transport: LiveTransport): Promise<void> {
   log("Seeding MongoDB fixtures...");
   const mongoAlphaId = new ObjectId("507f1f77bcf86cd799439011");
@@ -476,7 +605,6 @@ async function verifyMongoDriver(transport: LiveTransport): Promise<void> {
   const mongoCharlieId = new ObjectId("507f1f77bcf86cd799439013");
   const mongoAlphaHex = mongoAlphaId.toHexString();
   const mongoBravoHex = mongoBravoId.toHexString();
-  const mongoCharlieHex = mongoCharlieId.toHexString();
   const client = new MongoClient(MONGO_URI);
   await client.connect();
   try {
@@ -582,23 +710,27 @@ async function verifyMongoDriver(transport: LiveTransport): Promise<void> {
         profile: { tier: "starter" },
       },
     });
-    await driver.updateRows({
+    const updated = await driver.updateRows({
       database: "rapidb_mongo_db",
       schema: "rapidb_mongo_db",
       table: "users",
       updates: [
         {
-          primaryKeys: { _id: mongoCharlieHex },
+          // Direct native mutations take the actual BSON key, not the
+          // display-only hex string returned by table reads.
+          primaryKeys: { _id: mongoCharlieId },
           changes: { active: false, email: "charlie+updated@example.com" },
         },
       ],
     });
-    await driver.deleteRows({
+    assert.equal(updated.affectedRows, 1);
+    const deleted = await driver.deleteRows({
       database: "rapidb_mongo_db",
       schema: "rapidb_mongo_db",
       table: "users",
-      primaryKeyValuesList: [{ _id: mongoCharlieHex }],
+      primaryKeyValuesList: [{ _id: mongoCharlieId }],
     });
+    assert.equal(deleted.affectedRows, 1);
 
     const verifyClient = new MongoClient(MONGO_URI);
     await verifyClient.connect();

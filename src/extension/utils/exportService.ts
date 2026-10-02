@@ -323,25 +323,46 @@ async function writeChunkedCsv(
   signal: AbortSignal,
 ): Promise<void> {
   await withWriteStream(filePath, async (writeStream) => {
-    let headerWritten = false;
+    let headerColumns: ChunkedExportData["columns"] | undefined;
+    let headerByName: ReturnType<typeof indexExportColumns> | undefined;
 
     for await (const chunk of chunks) {
       throwIfAborted(signal);
-      if (!headerWritten) {
+      const currentByName = indexExportColumns(chunk.columns);
+      if (!headerColumns) {
+        // Copy descriptors so a producer cannot mutate the frozen schema.
+        headerColumns = chunk.columns.map((column) => ({ ...column }));
+        headerByName = indexExportColumns(headerColumns);
         await writeStreamChunk(
           writeStream,
-          chunk.columns.map((column) => csvCell(column.name)).join(",") +
+          headerColumns.map((column) => csvCell(column.name)).join(",") +
             LINE_BREAK,
           signal,
         );
-        headerWritten = true;
+      }
+      for (const column of currentByName.values()) {
+        const header = headerByName?.get(column.name);
+        if (!header) {
+          throw new Error(
+            `CSV schema changed: unexpected column "${column.name}". Select a stable set of columns or export JSON.`,
+          );
+        }
+        if (
+          header.category !== column.category ||
+          header.nativeType !== column.nativeType
+        ) {
+          throw new Error(
+            `CSV schema changed: type of column "${column.name}" changed. Export JSON or narrow the selection.`,
+          );
+        }
       }
 
       for (const row of chunk.rows) {
         throwIfAborted(signal);
+        assertExportRowColumns(row, headerByName ?? currentByName);
         await writeStreamChunk(
           writeStream,
-          chunk.columns
+          headerColumns
             .map((column) =>
               formatCsvExportCell(row[column.name], column.category ?? null),
             )
@@ -351,6 +372,30 @@ async function writeChunkedCsv(
       }
     }
   });
+}
+
+function indexExportColumns(columns: ChunkedExportData["columns"]) {
+  const byName = new Map<string, ChunkedExportData["columns"][number]>();
+  for (const column of columns) {
+    if (byName.has(column.name)) {
+      throw new Error(`Duplicate export column "${column.name}".`);
+    }
+    byName.set(column.name, column);
+  }
+  return byName;
+}
+
+function assertExportRowColumns(
+  row: Record<string, unknown>,
+  columns: ReturnType<typeof indexExportColumns>,
+): void {
+  for (const name of Object.keys(row)) {
+    if (!columns.has(name)) {
+      throw new Error(
+        `Unexpected export row column "${name}" is missing from the schema.`,
+      );
+    }
+  }
 }
 
 async function writeChunkedJson(
@@ -364,8 +409,11 @@ async function writeChunkedJson(
     let firstRow = true;
 
     for await (const chunk of chunks) {
+      throwIfAborted(signal);
+      const columnsByName = indexExportColumns(chunk.columns);
       for (const row of chunk.rows) {
         throwIfAborted(signal);
+        assertExportRowColumns(row, columnsByName);
         await writeStreamChunk(
           writeStream,
           `${firstRow ? "" : ",\n"}${serializeJsonExportRecord(

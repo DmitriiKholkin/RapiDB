@@ -83,6 +83,12 @@ vi.mock("pg", async (importOriginal) => {
           return { rows: [{ relkind: "r" }] };
         if (sql.includes(" AS ddl"))
           return { rows: [{ ddl: `-- ${database} DDL` }] };
+        if (sql.includes("pg_get_constraintdef(con.oid, false)"))
+          return {
+            rows: [
+              { constraint_name: "items_pkey", definition: "PRIMARY KEY (id)" },
+            ],
+          };
         if (sql.includes(" AS def"))
           return { rows: [{ def: `-- ${database} routine` }] };
         if (sql.includes("FROM pg_sequences"))
@@ -249,7 +255,20 @@ describe("B01 PostgreSQL database scope (mock pools)", () => {
       if (database === "b")
         expect(poolFor("a").query).toHaveBeenCalledTimes(before);
     }
-    expect(harness.pools).toHaveLength(2);
+    const catalogPools = harness.pools.filter(
+      (pool) => pool.options.application_name === "RapiDB catalog DDL",
+    );
+    expect(catalogPools.map((pool) => pool.options.database)).toEqual([
+      "a",
+      "b",
+    ]);
+    for (const pool of catalogPools) {
+      expect(pool.options.max).toBe(1);
+      expect(pool.end).toHaveBeenCalledOnce();
+    }
+    expect(
+      harness.pools.filter((pool) => !pool.options.application_name),
+    ).toHaveLength(2);
   });
 
   it("scopes parallel table reads, metadata-dependent previews, all CRUD, verification, exports and ERD", async () => {

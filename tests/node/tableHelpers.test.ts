@@ -441,7 +441,7 @@ describe("table helpers", () => {
     expect(operation.params).toEqual([]);
   });
 
-  it("prepares preview SQL without prevalidation blocking and keeps key edits", () => {
+  it("blocks the whole batch before preview when persisted-edit prevalidation fails", () => {
     const result = prepareApplyChangesPlan(
       {
         getDriver: () => fakeDriver,
@@ -463,17 +463,24 @@ describe("table helpers", () => {
       columns,
     );
 
-    expect(result.executable).toBe(true);
-    if (!result.executable) {
-      throw new Error("Expected executable plan");
-    }
-
-    expect(result.plan.previewStatements).toHaveLength(2);
-    expect(result.plan.previewStatements[0]).toContain(
-      "UPDATE public.fixture_rows",
-    );
-    expect(result.plan.previewStatements[1]).toContain('SET "id" = $1');
-    expect(result.plan.skippedRows).toEqual([]);
+    expect(result).toMatchObject({
+      executable: false,
+      result: {
+        success: false,
+        error: "Invalid amount",
+        failedRows: [0],
+        rowOutcomes: [
+          {
+            rowIndex: 0,
+            success: false,
+            status: "prevalidation_failed",
+            columns: ["amount"],
+            message: "Invalid amount",
+          },
+          { rowIndex: 1, success: false, status: "skipped" },
+        ],
+      },
+    });
   });
 
   it("adds original edited values to SQL update predicates", () => {
@@ -691,8 +698,8 @@ describe("table helpers", () => {
     const strictDriver: IDBDriver = {
       ...fakeDriver,
       describeColumns: async () => temporalColumns,
-      checkPersistedEdit: (column) => {
-        if (column.name === "updated_at") {
+      checkPersistedEdit: (column, _value, options) => {
+        if (column.name === "updated_at" && options !== undefined) {
           throw new Error("updated_at should not be verified strictly");
         }
         return null;

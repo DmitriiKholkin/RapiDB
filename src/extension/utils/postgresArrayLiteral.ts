@@ -1,238 +1,106 @@
-/**
- * Convert a JSON-syntax array literal (e.g. `[13000.0, "x", null]`) into a
- * PostgreSQL array literal (e.g. `{13000.0,"x",NULL}`).
- *
- * The converter uses a small tokenizer that mirrors the JSON grammar but
- * preserves every numeric token verbatim, so trailing zeros in stored
- * `numeric[]` values round-trip through the user-facing JSON dialog and
- * the actual SQL parameter that we send to PostgreSQL.
- */
+import {
+  hasPostgresArrayBounds,
+  parsePostgresArrayLiteral,
+} from "./postgresArrayParser";
+
+// JSON numbers are never converted to JS Number: send their exact tokens to PG.
 const JSON_STRING_RE = /"(?:\\.|[^"\\])*"/y;
-const JSON_NUMBER_RE = /-?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?/y;
-const JSON_KEYWORD_RE = /\b(?:true|false|null)\b/y;
+const JSON_NUMBER_RE = /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
+const JSON_KEYWORD_RE = /(?:true|false|null)/y;
 
-function escapePgString(token: string): string {
-  let out = "";
-  for (const ch of token) {
-    switch (ch) {
-      case "\\":
-        out += "\\\\";
-        break;
-      case '"':
-        out += '\\"';
-        break;
-      case "\n":
-        out += "\\n";
-        break;
-      case "\r":
-        out += "\\r";
-        break;
-      case "\t":
-        out += "\\t";
-        break;
-      case "\b":
-        out += "\\b";
-        break;
-      case "\f":
-        out += "\\f";
-        break;
-      case "\v":
-        out += "\\v";
-        break;
-      default:
-        out += ch;
-        break;
-    }
-  }
-  return `"${out}"`;
+function escapePgString(value: string): string {
+  // PG array escapes quote/backslash, not JSON control sequences. Real controls
+  // inside a quoted element must be sent unchanged (\n would store the letter n).
+  return `"${value.replace(/["\\]/g, (ch) => `\\${ch}`)}"`;
 }
 
-function jsonArrayToPgArrayInner(
-  text: string,
-  position: { pos: number },
-): string {
-  const skipWhitespace = (): void => {
-    while (position.pos < text.length) {
-      const ch = text[position.pos];
-      if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") {
-        position.pos++;
-        continue;
-      }
-      break;
-    }
-  };
+class JsonArrayConverter {
+  private pos = 0;
+  constructor(private readonly text: string) {}
 
-  skipWhitespace();
-  if (text[position.pos] !== "[") {
-    throw new Error("Expected '[' at start of JSON array");
+  private fail(): never {
+    throw new Error(`Invalid JSON array literal at position ${this.pos}`);
   }
-  position.pos++;
-  const parts: string[] = [];
-  skipWhitespace();
-  if (text[position.pos] === "]") {
-    position.pos++;
-    return "{}";
+
+  private skipWhitespace(): void {
+    while (this.pos < this.text.length && /[ \t\n\r]/.test(this.text[this.pos]))
+      this.pos++;
   }
-  while (position.pos < text.length) {
-    skipWhitespace();
-    const ch = text[position.pos];
-    if (ch === "]") {
-      position.pos++;
-      return `{${parts.join(",")}}`;
-    }
-    if (ch === "{") {
-      const inner = jsonObjectToPgValue(text, position);
-      parts.push(inner);
-    } else if (ch === "[") {
-      const inner = jsonArrayToPgArrayInner(text, position);
-      parts.push(inner);
-    } else if (ch === '"') {
-      JSON_STRING_RE.lastIndex = position.pos;
-      const match = JSON_STRING_RE.exec(text);
-      if (!match || match.index !== position.pos) {
-        throw new Error("Invalid JSON string in array");
-      }
-      position.pos += match[0].length;
-      const parsed = JSON.parse(match[0]) as string;
-      parts.push(escapePgString(parsed));
-    } else if (ch === "t" || ch === "f" || ch === "n") {
-      JSON_KEYWORD_RE.lastIndex = position.pos;
-      const match = JSON_KEYWORD_RE.exec(text);
-      if (!match || match.index !== position.pos) {
-        throw new Error("Invalid JSON keyword in array");
-      }
-      position.pos += match[0].length;
-      if (match[0] === "null") {
-        parts.push("NULL");
-      } else if (match[0] === "true") {
-        parts.push("true");
-      } else {
-        parts.push("false");
-      }
-    } else if (ch === "-" || (ch >= "0" && ch <= "9")) {
-      JSON_NUMBER_RE.lastIndex = position.pos;
-      const match = JSON_NUMBER_RE.exec(text);
-      if (!match || match.index !== position.pos) {
-        throw new Error("Invalid JSON number in array");
-      }
-      position.pos += match[0].length;
-      parts.push(match[0]);
-    } else {
-      throw new Error(`Unexpected character '${ch}' in JSON array`);
-    }
-    skipWhitespace();
-    if (text[position.pos] === ",") {
-      position.pos++;
-    }
+
+  private readToken(pattern: RegExp): string {
+    pattern.lastIndex = this.pos;
+    const match = pattern.exec(this.text);
+    if (!match) return this.fail();
+    this.pos += match[0].length;
+    return match[0];
   }
-  throw new Error("Unterminated JSON array");
+
+  private readString(): string {
+    return JSON.parse(this.readToken(JSON_STRING_RE)) as string;
+  }
+
+  private readValue(): string {
+    this.skipWhitespace();
+    const ch = this.text[this.pos];
+    if (ch === "[") return this.readContainer(false);
+    if (ch === "{") return this.readContainer(true);
+    if (ch === '"') return escapePgString(this.readString());
+    if (ch === "-" || (ch >= "0" && ch <= "9"))
+      return this.readToken(JSON_NUMBER_RE);
+    if (ch === "t" || ch === "f" || ch === "n") {
+      const token = this.readToken(JSON_KEYWORD_RE);
+      return token === "null" ? "NULL" : token;
+    }
+    return this.fail();
+  }
+
+  private readContainer(object: boolean): string {
+    const start = this.pos++;
+    const end = object ? "}" : "]";
+    const parts: string[] = [];
+    this.skipWhitespace();
+    if (this.text[this.pos] !== end) {
+      while (this.pos < this.text.length) {
+        this.skipWhitespace();
+        if (object) {
+          if (this.text[this.pos] !== '"') this.fail();
+          this.readString();
+          this.skipWhitespace();
+          if (this.text[this.pos++] !== ":") this.fail();
+        }
+        parts.push(this.readValue());
+        this.skipWhitespace();
+        if (this.text[this.pos] === end) break;
+        if (this.text[this.pos++] !== ",") this.fail();
+        // readValue/readString rejects trailing commas and missing values.
+      }
+    }
+    if (this.text[this.pos++] !== end) this.fail();
+    // Objects are scalar JSON-text elements, including all their nested JSON
+    // arrays/nulls/strings. Escape once for the surrounding PG array grammar.
+    return object
+      ? escapePgString(this.text.slice(start, this.pos))
+      : `{${parts.join(",")}}`;
+  }
+
+  convert(): string {
+    const result = this.readValue();
+    this.skipWhitespace();
+    if (this.pos !== this.text.length) this.fail();
+    return result;
+  }
 }
 
-function jsonObjectToPgValue(text: string, position: { pos: number }): string {
-  const skipWhitespace = (): void => {
-    while (position.pos < text.length) {
-      const ch = text[position.pos];
-      if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") {
-        position.pos++;
-        continue;
-      }
-      break;
-    }
-  };
-
-  if (text[position.pos] !== "{") {
-    throw new Error("Expected '{' at start of JSON object");
-  }
-  position.pos++;
-  const parts: string[] = [];
-  skipWhitespace();
-  if (text[position.pos] === "}") {
-    position.pos++;
-    return '"{}"';
-  }
-  while (position.pos < text.length) {
-    skipWhitespace();
-    if (text[position.pos] === "}") {
-      position.pos++;
-      return escapePgString(`{${parts.join(",")}}`);
-    }
-    if (text[position.pos] === '"') {
-      JSON_STRING_RE.lastIndex = position.pos;
-      const match = JSON_STRING_RE.exec(text);
-      if (!match || match.index !== position.pos) {
-        throw new Error("Invalid JSON string in object");
-      }
-      position.pos += match[0].length;
-      const key = JSON.parse(match[0]) as string;
-      skipWhitespace();
-      if (text[position.pos] !== ":") {
-        throw new Error("Expected ':' after JSON object key");
-      }
-      position.pos++;
-      skipWhitespace();
-      const valueCh = text[position.pos];
-      let valueText = "";
-      if (valueCh === "{") {
-        valueText = jsonObjectToPgValue(text, position);
-      } else if (valueCh === "[") {
-        valueText = jsonArrayToPgArrayInner(text, position);
-      } else if (valueCh === '"') {
-        JSON_STRING_RE.lastIndex = position.pos;
-        const valueMatch = JSON_STRING_RE.exec(text);
-        if (!valueMatch || valueMatch.index !== position.pos) {
-          throw new Error("Invalid JSON string value");
-        }
-        position.pos += valueMatch[0].length;
-        valueText = escapePgString(JSON.parse(valueMatch[0]) as string);
-      } else if (valueCh === "t" || valueCh === "f" || valueCh === "n") {
-        JSON_KEYWORD_RE.lastIndex = position.pos;
-        const valueMatch = JSON_KEYWORD_RE.exec(text);
-        if (!valueMatch || valueMatch.index !== position.pos) {
-          throw new Error("Invalid JSON keyword value");
-        }
-        position.pos += valueMatch[0].length;
-        valueText =
-          valueMatch[0] === "null"
-            ? "NULL"
-            : valueMatch[0] === "true"
-              ? "true"
-              : "false";
-      } else if (valueCh === "-" || (valueCh >= "0" && valueCh <= "9")) {
-        JSON_NUMBER_RE.lastIndex = position.pos;
-        const valueMatch = JSON_NUMBER_RE.exec(text);
-        if (!valueMatch || valueMatch.index !== position.pos) {
-          throw new Error("Invalid JSON number value");
-        }
-        position.pos += valueMatch[0].length;
-        valueText = valueMatch[0];
-      } else {
-        throw new Error(`Unexpected character '${valueCh}' in JSON object`);
-      }
-      parts.push(`${escapePgString(key)}:${valueText}`);
-    } else {
-      throw new Error(
-        `Unexpected character '${text[position.pos]}' in JSON object`,
-      );
-    }
-    skipWhitespace();
-    if (text[position.pos] === ",") {
-      position.pos++;
-    }
-  }
-  throw new Error("Unterminated JSON object");
-}
-
+/** Convert JSON-syntax arrays to PG array text while preserving numeric tokens. */
 export function jsonArrayLiteralToPgArrayLiteral(input: string): string {
   const trimmed = input.trim();
-  if (trimmed === "") {
-    return "{}";
-  }
-  if (trimmed.startsWith("{")) {
+  if (trimmed === "") return "{}";
+  if (trimmed.startsWith("{") || hasPostgresArrayBounds(trimmed)) {
+    parsePostgresArrayLiteral(trimmed);
     return trimmed;
   }
-  if (!trimmed.startsWith("[")) {
-    return trimmed;
-  }
-  const position = { pos: 0 };
-  return jsonArrayToPgArrayInner(trimmed, position);
+  if (!trimmed.startsWith("[")) return trimmed;
+  const result = new JsonArrayConverter(trimmed).convert();
+  parsePostgresArrayLiteral(result);
+  return result;
 }

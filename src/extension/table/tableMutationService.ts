@@ -9,6 +9,10 @@ import type { ColumnTypeMeta, TransactionOperation } from "../dbDrivers/types";
 import { pMapWithLimit } from "../utils/concurrency";
 import { assertConnectionWritable } from "../utils/readOnlyGuards";
 import { buildInsertRowOperation } from "./insertSql";
+import {
+  PersistedEditValidationError,
+  validatePersistedEditRecord,
+} from "./persistedEditValidation";
 import type {
   PreparedDeletePlan,
   PreparedInsertPlan,
@@ -51,6 +55,12 @@ export class TableMutationService {
     const columnMetaByName = new Map(
       columns.map((column) => [column.name, column]),
     );
+    const failure = validatePersistedEditRecord(
+      driver,
+      changes,
+      columnMetaByName,
+    );
+    if (failure) throw new PersistedEditValidationError(failure);
     if (driver.updateRows) {
       const writableChanges = filterWritableRecord(changes, columnMetaByName);
       if (Object.keys(writableChanges).length === 0) {
@@ -140,6 +150,12 @@ export class TableMutationService {
     const columnMetaByName = new Map(
       columns.map((column) => [column.name, column]),
     );
+    const failure = validatePersistedEditRecord(
+      driver,
+      values,
+      columnMetaByName,
+    );
+    if (failure) throw new PersistedEditValidationError(failure);
     if (driver.insertRow) {
       const writableValues = Object.fromEntries(
         writableEntries(values, columnMetaByName),

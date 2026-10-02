@@ -1,4 +1,10 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { QUERY_LIMIT_POLICY } from "../../src/shared/safetyContracts";
@@ -143,6 +149,9 @@ import {
 } from "./testUtils";
 
 describe("QueryView", () => {
+  function receiveBookmark(payload: unknown) {
+    act(() => dispatchIncomingMessage("bookmarkSaved", payload));
+  }
   beforeEach(() => {
     clearPostedMessages();
     formatMock.mockClear();
@@ -178,6 +187,229 @@ describe("QueryView", () => {
 
     await waitFor(() => {
       expect(formatMock).toHaveBeenCalledWith("postgresql");
+    });
+  });
+
+  it("invalidates pending bookmarks on edits and ignores late, duplicate and out-of-order acknowledgements", async () => {
+    const user = userEvent.setup();
+    render(<QueryView connectionId="conn-1" initialQueryText="select 1" />);
+    const button = screen.getByRole("button", {
+      name: "Bookmark",
+    }) as HTMLButtonElement;
+    const editor = screen.getByLabelText("SQL editor");
+    await user.click(button);
+    const first = getLastPostedMessage()?.payload;
+    await user.type(editor, ";");
+    expect(button.disabled).toBe(false);
+    receiveBookmark({ ...(first as object), ok: true });
+    expect(button.disabled).toBe(false);
+    expect(button.title).toBe("Add to Bookmarks");
+    await user.click(button);
+    const second = getLastPostedMessage()?.payload;
+    await user.type(editor, " ");
+    await user.click(button);
+    const third = getLastPostedMessage()?.payload;
+    expect(third).not.toEqual(second);
+    for (const payload of [second, first, second]) {
+      receiveBookmark({ ...(payload as object), ok: true });
+      expect(button.disabled).toBe(true);
+      expect(button.title).toBe("Add to Bookmarks");
+    }
+    receiveBookmark({ ...(third as object), ok: true });
+    expect(button.title).toBe("Already bookmarked");
+    await user.type(editor, "--changed");
+    receiveBookmark({ ...(third as object), ok: true });
+    expect(button.disabled).toBe(false);
+    expect(button.title).toBe("Add to Bookmarks");
+  });
+
+  it("invalidates A on connection switch, preserves editor text and keeps B busy when A replies", async () => {
+    const user = userEvent.setup();
+    render(<QueryView connectionId="conn-1" initialQueryText="select 1" />);
+    dispatchIncomingMessage("connections", [
+      { id: "conn-1", name: "A", type: "pg" },
+      { id: "conn-2", name: "B", type: "pg" },
+    ]);
+    const button = screen.getByRole("button", {
+      name: "Bookmark",
+    }) as HTMLButtonElement;
+    await user.click(button);
+    const first = getLastPostedMessage()?.payload;
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Active connection" }),
+      "conn-2",
+    );
+    expect(button.disabled).toBe(false);
+    expect(
+      (screen.getByLabelText("SQL editor") as HTMLTextAreaElement).value,
+    ).toBe("select 1");
+    await user.click(button);
+    const second = getLastPostedMessage()?.payload;
+    expect(second).toMatchObject({
+      connectionId: "conn-2",
+      queryText: "select 1",
+      requestId: expect.any(String),
+    });
+    receiveBookmark({ ...(first as object), ok: true });
+    expect(button.disabled).toBe(true);
+    expect(button.title).toBe("Add to Bookmarks");
+    receiveBookmark({ ...(second as object), ok: true });
+    expect(button.title).toBe("Already bookmarked");
+  });
+
+  it("accepts only matching acknowledgements and allows retry after failure", async () => {
+    const user = userEvent.setup();
+    render(<QueryView connectionId="conn-1" initialQueryText="  select 1  " />);
+    const button = screen.getByRole("button", {
+      name: "Bookmark",
+    }) as HTMLButtonElement;
+    await user.click(button);
+    const first = getLastPostedMessage()?.payload;
+    expect(first).toMatchObject({
+      queryText: "select 1",
+      requestId: expect.any(String),
+    });
+    for (const payload of [
+      { ok: true },
+      { ok: true, requestId: "other" },
+      { ok: "yes", ...(first as object) },
+    ]) {
+      receiveBookmark(payload);
+      expect(button.disabled).toBe(true);
+      expect(button.title).toBe("Add to Bookmarks");
+    }
+    receiveBookmark({
+      ...(first as object),
+      ok: false,
+      error: "Storage failed",
+    });
+    expect(button.disabled).toBe(false);
+    await user.click(button);
+    const retry = getLastPostedMessage()?.payload;
+    expect(retry).not.toEqual(first);
+    receiveBookmark({ ...(first as object), ok: false });
+    expect(button.disabled).toBe(true);
+    receiveBookmark({ ...(retry as object), ok: true });
+    expect(button.title).toBe("Already bookmarked");
+  });
+
+  it("resets an initially saved bookmark when switching connections", async () => {
+    const user = userEvent.setup();
+    render(
+      <QueryView
+        connectionId="conn-1"
+        initialQueryText="select 1"
+        isBookmarked
+      />,
+    );
+    act(() =>
+      dispatchIncomingMessage("connections", [
+        { id: "conn-1", name: "A", type: "pg" },
+        { id: "conn-2", name: "B", type: "pg" },
+      ]),
+    );
+    const button = screen.getByRole("button", {
+      name: "Bookmark",
+    }) as HTMLButtonElement;
+    expect(button.title).toBe("Already bookmarked");
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Active connection" }),
+      "conn-2",
+    );
+    expect(button.disabled).toBe(false);
+    expect(button.title).toBe("Add to Bookmarks");
+  });
+
+  it("keeps refs and state in sync when a matching ack and an edit occur in one event", async () => {
+    const user = userEvent.setup();
+    render(<QueryView connectionId="conn-1" initialQueryText="select 1" />);
+    const button = screen.getByRole("button", {
+      name: "Bookmark",
+    }) as HTMLButtonElement;
+    const editor = screen.getByLabelText("SQL editor");
+    await user.click(button);
+    const first = getLastPostedMessage()?.payload;
+    act(() => {
+      dispatchIncomingMessage("bookmarkSaved", {
+        ...(first as object),
+        ok: true,
+      });
+      fireEvent.change(editor, { target: { value: "select 2" } });
+    });
+    expect(button.disabled).toBe(false);
+    expect(button.title).toBe("Add to Bookmarks");
+    act(() => {
+      fireEvent.click(button);
+      fireEvent.click(button);
+    });
+    expect(
+      getPostedMessages().filter((message) => message.type === "addBookmark"),
+    ).toHaveLength(2);
+    expect(getLastPostedMessage()?.payload).toEqual({
+      queryText: "select 2",
+      connectionId: "conn-1",
+      requestId: "query:bookmark:2",
+    });
+    await user.click(screen.getByRole("button", { name: "Run" }));
+    expect(getLastPostedMessage()?.payload).toMatchObject({
+      operationId: "query:1",
+    });
+  });
+
+  it("invalidates pending saves when the active connection is removed without replacing editor text", async () => {
+    const user = userEvent.setup();
+    render(<QueryView connectionId="conn-1" initialQueryText="select 1" />);
+    dispatchIncomingMessage("connections", [
+      { id: "conn-1", name: "A", type: "pg" },
+      { id: "conn-2", name: "B", type: "pg" },
+    ]);
+    const button = screen.getByRole("button", {
+      name: "Bookmark",
+    }) as HTMLButtonElement;
+    await user.click(button);
+    const first = getLastPostedMessage()?.payload;
+    act(() =>
+      dispatchIncomingMessage("connections", [
+        { id: "conn-2", name: "B", type: "pg" },
+      ]),
+    );
+    receiveBookmark({ ...(first as object), ok: true });
+    expect(button.disabled).toBe(false);
+    expect(button.title).toBe("Add to Bookmarks");
+    expect(
+      (screen.getByLabelText("SQL editor") as HTMLTextAreaElement).value,
+    ).toBe("select 1");
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Active connection" }),
+      "conn-2",
+    );
+    await user.click(button);
+    expect(getLastPostedMessage()?.payload).toMatchObject({
+      connectionId: "conn-2",
+      queryText: "select 1",
+    });
+  });
+
+  it("invalidates bookmarks on externally changed active connections", async () => {
+    const user = userEvent.setup();
+    render(<QueryView connectionId="conn-1" initialQueryText="select 1" />);
+    const button = screen.getByRole("button", {
+      name: "Bookmark",
+    }) as HTMLButtonElement;
+    await user.click(button);
+    const first = getLastPostedMessage()?.payload;
+    act(() => {
+      useConnectionStore.getState().setActiveConnection("conn-2");
+      dispatchIncomingMessage("bookmarkSaved", {
+        ...(first as object),
+        ok: true,
+      });
+    });
+    expect(button.disabled).toBe(false);
+    expect(button.title).toBe("Add to Bookmarks");
+    await user.click(button);
+    expect(getLastPostedMessage()?.payload).toMatchObject({
+      connectionId: "conn-2",
     });
   });
 
@@ -614,10 +846,17 @@ describe("QueryView", () => {
 
     expect(getLastPostedMessage()).toEqual({
       type: "addBookmark",
-      payload: { queryText: "select 42", connectionId: "conn-1" },
+      payload: {
+        queryText: "select 42",
+        connectionId: "conn-1",
+        requestId: "query:bookmark:1",
+      },
     });
 
-    dispatchIncomingMessage("bookmarkSaved", { ok: true });
+    dispatchIncomingMessage("bookmarkSaved", {
+      ok: true,
+      requestId: "query:bookmark:1",
+    });
 
     await waitFor(() => {
       expect((bookmarkButton as HTMLButtonElement).disabled).toBe(true);

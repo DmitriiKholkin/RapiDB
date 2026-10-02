@@ -87,6 +87,15 @@ describe("view DDL generation", () => {
       query,
     } as never;
 
+    vi.spyOn(
+      driver as unknown as { createPool(): unknown },
+      "createPool",
+    ).mockReturnValue({
+      on: vi.fn(),
+      connect: async () => ({ query, release: vi.fn() }),
+      end: async () => undefined,
+    } as never);
+
     await expect(
       driver.getCreateTableDDL("test_db", "public", "v_employees"),
     ).resolves.toBe('CREATE VIEW "public"."v_employees" AS SELECT 1');

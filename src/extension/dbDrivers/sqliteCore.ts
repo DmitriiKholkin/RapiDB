@@ -1433,10 +1433,13 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     options?: PersistedEditCheckOptions,
   ): PersistedEditCheckResult | null {
     if (column.category === "integer") {
+      // Declared INTEGER has numeric affinity, not a universal scale-zero
+      // constraint. Non-STRICT tables can persist fractions as REAL; STRICT
+      // tables and INTEGER PRIMARY KEY constraints are enforced by SQLite.
       return this.checkExactNumericPersistedEdit(
         column,
         expectedValue,
-        { precision: null, scale: 0 },
+        { precision: null, scale: null },
         options,
       );
     }
@@ -1460,7 +1463,11 @@ export class SQLiteCoreDriver extends BaseDBDriver {
       return this.checkBooleanPersistedEdit(column, expectedValue, options);
     }
     if (column.category === "binary") {
-      return this.checkBinaryPersistedEdit(column, expectedValue, options);
+      const normalized =
+        typeof expectedValue === "string"
+          ? (parseSqliteBlobDisplayValue(expectedValue) ?? expectedValue)
+          : expectedValue;
+      return this.checkBinaryPersistedEdit(column, normalized, options);
     }
     if (column.category === "json") {
       return this.checkJsonPersistedEdit(column, expectedValue, options);

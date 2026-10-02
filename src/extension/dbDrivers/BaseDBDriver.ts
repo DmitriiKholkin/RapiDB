@@ -319,7 +319,7 @@ function splitNumericFilterInList(rawValue: string): string[] {
 }
 const PERSISTED_EDIT_NULL_TOKEN = "\x00__RAPIDB_PERSISTED_EDIT_NULL__\x00";
 const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 interface ExactNumericConstraint {
   precision: number | null;
   scale: number | null;
@@ -333,6 +333,7 @@ type PersistedEditCanonicalizer = (
 interface CanonicalExactNumericValue {
   canonical: string;
   integerDigits: number;
+  leadingFractionZeros: number;
   fractionDigits: number;
   scaleOverflow: boolean;
 }
@@ -410,7 +411,7 @@ function canonicalizeExactNumeric(
       /^0*$/.test(normalizedFraction);
     const integerDigits =
       normalizedInteger.replace(/^0+/, "") === ""
-        ? 1
+        ? 0
         : normalizedInteger.replace(/^0+/, "").length;
     return {
       canonical:
@@ -420,6 +421,7 @@ function canonicalizeExactNumeric(
             : `${sign}${normalizedInteger.replace(/^0+/, "") || "0"}`
           : `${isZero ? "" : sign}${normalizedInteger.replace(/^0+/, "") || "0"}.${normalizedFraction}`,
       integerDigits,
+      leadingFractionZeros: normalizedFraction.match(/^0*/)?.[0].length ?? 0,
       fractionDigits: normalizedFraction.length,
       scaleOverflow,
     };
@@ -431,7 +433,8 @@ function canonicalizeExactNumeric(
     canonical:
       `${isZero ? "" : sign}${normalizedInt}${trimmedFraction ? `.${trimmedFraction}` : ""}` ||
       "0",
-    integerDigits: normalizedInt === "0" ? 1 : normalizedInt.length,
+    integerDigits: normalizedInt === "0" ? 0 : normalizedInt.length,
+    leadingFractionZeros: trimmedFraction.match(/^0*/)?.[0].length ?? 0,
     fractionDigits: trimmedFraction.length,
     scaleOverflow: false,
   };
@@ -467,7 +470,12 @@ function buildValidationMessage(
         constraint.precision - constraint.scale,
         0,
       );
-      if (canonical.integerDigits > allowedIntegerDigits) {
+      if (
+        canonical.integerDigits > allowedIntegerDigits ||
+        (constraint.scale > constraint.precision &&
+          canonical.leadingFractionZeros <
+            constraint.scale - constraint.precision)
+      ) {
         return `Column "${columnName}" exceeds precision ${constraint.precision} with scale ${constraint.scale}.`;
       }
     } else if (
@@ -1108,6 +1116,17 @@ export abstract class BaseDBDriver implements IDBDriver {
   }
   buildInsertValueExpr(_column: ColumnTypeMeta, _paramIndex: number): string {
     return "?";
+  }
+  buildCursorComparison(
+    column: ColumnTypeMeta,
+    operator: "eq" | "gt" | "lt",
+    rawValue: unknown,
+    paramIndex: number,
+  ): FilterConditionResult {
+    return {
+      sql: `${this.quoteIdentifier(column.name)} ${this.sqlOperator(operator)} ${this.buildInsertValueExpr(column, paramIndex)}`,
+      params: [this.coerceInputValue(rawValue, column)],
+    };
   }
   buildSetExpr(column: ColumnTypeMeta, _paramIndex: number): string {
     return `${this.quoteIdentifier(column.name)} = ?`;

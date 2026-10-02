@@ -202,6 +202,13 @@ type RedisSortedSetEntry = {
   value: string;
 };
 
+// Keep the historical all-keys identity for saved queries. A real first
+// prefix cannot contain ':', so 'default:' is an unambiguous navigation ID.
+function keyspacePattern(table: string): string {
+  if (table === "default") return "*";
+  return table === "default:" ? "default:*" : `${table}:*`;
+}
+
 function compareRedisValueTypes(left: string, right: string): number {
   const leftIndex = REDIS_VALUE_TYPE_ORDER.indexOf(
     left as (typeof REDIS_VALUE_TYPE_ORDER)[number],
@@ -723,7 +730,8 @@ export class RedisDriver implements IDBDriver {
     );
     const names = new Set<string>();
     for (const key of keys) {
-      const prefix = key.includes(":") ? key.split(":")[0] : "default";
+      const firstPrefix = key.includes(":") ? key.split(":")[0] : null;
+      const prefix = firstPrefix === "default" ? "default:" : firstPrefix;
       names.add(prefix || "default");
     }
     if (names.size === 0) {
@@ -921,7 +929,7 @@ export class RedisDriver implements IDBDriver {
     const startTime = performance.now();
     const client = await this.getDatabaseClient(request.database);
     if (this.canUseKeyOnlyPaging(request)) {
-      const pattern = request.table === "default" ? "*" : `${request.table}:*`;
+      const pattern = keyspacePattern(request.table);
       const offset = Math.max(0, (request.page - 1) * request.pageSize);
       const keys = (
         await this.scanKeys(
@@ -1482,7 +1490,7 @@ export class RedisDriver implements IDBDriver {
     maxRows: number,
     failOnTruncation = false,
   ): Promise<RedisSampleRow[]> {
-    const pattern = table === "default" ? "*" : `${table}:*`;
+    const pattern = keyspacePattern(table);
     const readLimit = Math.min(maxRows, REDIS_READ_BUDGET.maxValueReads);
     const keys = (
       await this.scanKeys(client, pattern, readLimit, failOnTruncation)

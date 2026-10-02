@@ -256,7 +256,7 @@ export class RapiDBNode extends vscode.TreeItem {
   ) {
     super(label, collapsibleState);
 
-    this.id = [
+    this.id = JSON.stringify([
       kind,
       connectionId,
       database,
@@ -266,9 +266,7 @@ export class RapiDBNode extends vscode.TreeItem {
       section,
       detailKey,
       parentTable || section ? dataObjectKind : undefined,
-    ]
-      .filter(Boolean)
-      .join(":");
+    ]);
 
     this.contextValue = kind;
     if (kind === "connectionNode_connected") {
@@ -718,12 +716,7 @@ export class ConnectionProvider
     if (connectionType === "dynamodb") {
       const databaseName = state.snapshot.databases[0]?.name;
       if (!databaseName) {
-        return this.appendStateNodes(
-          element.connectionId,
-          [],
-          state,
-          "Loading tables…",
-        );
+        return this.appendStateNodes(element, [], state, "Loading tables…");
       }
 
       const databaseState = this.getSchemaState(element.connectionId, {
@@ -742,7 +735,7 @@ export class ConnectionProvider
             )
           : [];
       return this.appendStateNodes(
-        element.connectionId,
+        element,
         categories,
         state.status === "error" ? state : databaseState,
         "Loading tables…",
@@ -761,7 +754,7 @@ export class ConnectionProvider
             )
           : [];
       return this.appendStateNodes(
-        element.connectionId,
+        element,
         categories,
         state,
         "Loading indices…",
@@ -774,19 +767,14 @@ export class ConnectionProvider
       state.snapshot.databases.length <= 1 &&
       (state.snapshot.databases[0]?.schemas.length ?? 0) === 0
     ) {
-      return this.appendStateNodes(
-        element.connectionId,
-        [],
-        state,
-        "Loading indices…",
-      );
+      return this.appendStateNodes(element, [], state, "Loading indices…");
     }
 
     const databaseNodes = state.snapshot.databases.map((database) =>
       this.makeDatabaseNode(element.connectionId, database.name),
     );
     return this.appendStateNodes(
-      element.connectionId,
+      element,
       databaseNodes,
       state,
       "Loading schema…",
@@ -807,11 +795,7 @@ export class ConnectionProvider
     });
     const database = findSnapshotDatabase(state, databaseName);
     if (!database) {
-      return this.pendingStateNodes(
-        element.connectionId,
-        state,
-        `Loading ${databaseName}…`,
-      );
+      return this.pendingStateNodes(element, state, `Loading ${databaseName}…`);
     }
 
     const schemas = database.schemas;
@@ -824,7 +808,7 @@ export class ConnectionProvider
         schema: schemas[0].name,
       });
       return this.appendStateNodes(
-        element.connectionId,
+        element,
         this.categoryNodes(
           element.connectionId,
           databaseName,
@@ -838,7 +822,7 @@ export class ConnectionProvider
     }
 
     return this.appendStateNodes(
-      element.connectionId,
+      element,
       schemas.map((schema) =>
         this.makeSchemaNode(element.connectionId, databaseName, schema.name),
       ),
@@ -861,15 +845,11 @@ export class ConnectionProvider
     });
     const schema = findSnapshotSchema(state, databaseName, schemaName);
     if (!schema) {
-      return this.pendingStateNodes(
-        element.connectionId,
-        state,
-        `Loading ${schemaName}…`,
-      );
+      return this.pendingStateNodes(element, state, `Loading ${schemaName}…`);
     }
 
     return this.appendStateNodes(
-      element.connectionId,
+      element,
       this.categoryNodes(
         element.connectionId,
         databaseName,
@@ -898,11 +878,7 @@ export class ConnectionProvider
     });
     const schema = findSnapshotSchema(state, databaseName, schemaName);
     if (!schema) {
-      return this.pendingStateNodes(
-        element.connectionId,
-        state,
-        `Loading ${schemaName}…`,
-      );
+      return this.pendingStateNodes(element, state, `Loading ${schemaName}…`);
     }
 
     const filteredObjects = schema.objects.filter((object) =>
@@ -914,7 +890,7 @@ export class ConnectionProvider
     const manifest = this.getEntityManifest(element.connectionId);
 
     return this.appendStateNodes(
-      element.connectionId,
+      element,
       filteredObjects.map((object) =>
         this.makeObjectNode(
           object.type,
@@ -977,14 +953,12 @@ export class ConnectionProvider
     const state = this.connectionManager.getTableDetailState(request);
 
     if (state.status === "loading") {
-      return [
-        this.makeLoadingNode(request.connectionId, `Loading ${request.table}…`),
-      ];
+      return [this.makeLoadingNode(element, `Loading ${request.table}…`)];
     }
 
     if (state.status === "error") {
       return this.makeErrorNodes(
-        request.connectionId,
+        element,
         state.error ?? `Failed to load ${request.table}`,
       );
     }
@@ -1018,14 +992,12 @@ export class ConnectionProvider
     const state = this.connectionManager.getTableDetailState(request);
 
     if (state.status === "loading") {
-      return [
-        this.makeLoadingNode(request.connectionId, `Loading ${request.table}…`),
-      ];
+      return [this.makeLoadingNode(element, `Loading ${request.table}…`)];
     }
 
     if (state.status === "error") {
       return this.makeErrorNodes(
-        request.connectionId,
+        element,
         state.error ?? `Failed to load ${request.table}`,
       );
     }
@@ -1035,7 +1007,7 @@ export class ConnectionProvider
     if (sectionState.status === "loading") {
       return [
         this.makeLoadingNode(
-          request.connectionId,
+          element,
           `Loading ${TABLE_SECTION_LABELS[element.section]}…`,
         ),
       ];
@@ -1043,7 +1015,7 @@ export class ConnectionProvider
 
     if (sectionState.status === "error") {
       return this.makeErrorNodes(
-        request.connectionId,
+        element,
         sectionState.error ??
           `Failed to load ${TABLE_SECTION_LABELS[element.section]}`,
       );
@@ -1078,7 +1050,7 @@ export class ConnectionProvider
   }
 
   private appendStateNodes(
-    connectionId: string,
+    parent: RapiDBNode,
     nodes: RapiDBNode[],
     state: SchemaSnapshotState,
     loadingLabel: string,
@@ -1086,27 +1058,27 @@ export class ConnectionProvider
     if (state.status === "loading") {
       return nodes.length > 0
         ? nodes
-        : [this.makeLoadingNode(connectionId, loadingLabel)];
+        : [this.makeLoadingNode(parent, loadingLabel)];
     }
 
     if (state.status === "error") {
-      return [...nodes, ...this.makeErrorNodes(connectionId, state.error)];
+      return [...nodes, ...this.makeErrorNodes(parent, state.error)];
     }
 
     return nodes;
   }
 
   private pendingStateNodes(
-    connectionId: string,
+    parent: RapiDBNode,
     state: SchemaSnapshotState,
     loadingLabel: string,
   ): RapiDBNode[] {
     if (state.status === "error") {
-      return this.makeErrorNodes(connectionId, state.error);
+      return this.makeErrorNodes(parent, state.error);
     }
 
     if (state.status === "loading") {
-      return [this.makeLoadingNode(connectionId, loadingLabel)];
+      return [this.makeLoadingNode(parent, loadingLabel)];
     }
 
     return [];
@@ -1526,18 +1498,24 @@ export class ConnectionProvider
   }
 
   private makeErrorNodes(
-    connectionId: string,
+    parent: RapiDBNode,
     message = "Failed to load schema",
   ): RapiDBNode[] {
-    return [this.makeError(connectionId, message)];
+    return [this.makeError(parent, message)];
   }
 
-  private makeLoadingNode(connectionId: string, label: string): RapiDBNode {
+  private makeLoadingNode(parent: RapiDBNode, label: string): RapiDBNode {
     const node = new RapiDBNode(
       label,
       "status_loading",
       vscode.TreeItemCollapsibleState.None,
-      connectionId,
+      parent.connectionId,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      parent.id,
     );
     node.contextValue = "_status";
     node.tooltip = label;
@@ -1805,12 +1783,18 @@ export class ConnectionProvider
     );
   }
 
-  private makeError(connectionId: string, message: string): RapiDBNode {
+  private makeError(parent: RapiDBNode, message: string): RapiDBNode {
     const node = new RapiDBNode(
       message,
       "status_error",
       vscode.TreeItemCollapsibleState.None,
-      connectionId,
+      parent.connectionId,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      parent.id,
     );
     node.iconPath = new vscode.ThemeIcon(
       "error",

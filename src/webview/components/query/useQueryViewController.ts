@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type {
-  QueryEditorLanguage,
-  QueryEditorPresentation,
+import {
+  parseBookmarkSavedPayload,
+  type QueryBookmarkPayload,
+  type QueryEditorLanguage,
+  type QueryEditorPresentation,
 } from "../../../shared/webviewContracts";
 import {
   type ConnectionEntry,
@@ -56,6 +58,14 @@ export function useQueryViewController({
 
   const schemaFetchedRef = useRef<Set<string>>(new Set());
   const bookmarkedRef = useRef(initialIsBookmarked);
+  const bookmarkTextRef = useRef(initialQueryText.trim());
+  const bookmarkConnectionRef = useRef(connectionId);
+  const bookmarkSequenceRef = useRef(0);
+  const pendingBookmarkRef = useRef<{
+    requestId: string;
+    queryText: string;
+    connectionId: string;
+  } | null>(null);
   const dragStartY = useRef(0);
   const dragStartH = useRef(DEFAULT_EDITOR_H);
   const didAutoFormat = useRef(false);
@@ -71,9 +81,12 @@ export function useQueryViewController({
   const [bookmarked, setBookmarked] = useState(initialIsBookmarked);
   const [bookmarking, setBookmarking] = useState(false);
 
-  useEffect(() => {
-    bookmarkedRef.current = bookmarked;
-  }, [bookmarked]);
+  const invalidateBookmark = useCallback(() => {
+    pendingBookmarkRef.current = null;
+    bookmarkedRef.current = false;
+    setBookmarked(false);
+    setBookmarking(false);
+  }, []);
 
   useEffect(() => {
     const element = containerRef.current;
@@ -90,6 +103,12 @@ export function useQueryViewController({
   }, []);
 
   const resolvedConnectionId = activeConnectionId || connectionId;
+  useEffect(() => {
+    if (bookmarkConnectionRef.current !== resolvedConnectionId) {
+      bookmarkConnectionRef.current = resolvedConnectionId;
+      invalidateBookmark();
+    }
+  }, [invalidateBookmark, resolvedConnectionId]);
   const activeConnection = connections.find(
     (connection) => connection.id === resolvedConnectionId,
   );
@@ -152,6 +171,13 @@ export function useQueryViewController({
     const unsubscribeConnections = onMessage<ConnectionEntry[]>(
       "connections",
       (payload) => {
+        const currentConnectionId =
+          useConnectionStore.getState().activeConnectionId || connectionId;
+        if (
+          !payload.some((connection) => connection.id === currentConnectionId)
+        ) {
+          invalidateBookmark();
+        }
         setConnections(payload);
       },
     );
@@ -163,15 +189,26 @@ export function useQueryViewController({
       setSchema(payload.connectionId, payload.schema);
     });
 
-    const unsubscribeBookmark = onMessage<{ ok: boolean; error?: string }>(
-      "bookmarkSaved",
-      (payload) => {
-        setBookmarking(false);
-        if (payload.ok) {
-          setBookmarked(true);
-        }
-      },
-    );
+    const unsubscribeBookmark = onMessage<unknown>("bookmarkSaved", (input) => {
+      const payload = parseBookmarkSavedPayload(input);
+      const pending = pendingBookmarkRef.current;
+      if (
+        !payload ||
+        !pending ||
+        payload.requestId !== pending.requestId ||
+        pending.queryText !== bookmarkTextRef.current ||
+        pending.connectionId !==
+          (useConnectionStore.getState().activeConnectionId || connectionId)
+      ) {
+        return;
+      }
+      pendingBookmarkRef.current = null;
+      setBookmarking(false);
+      if (payload.ok) {
+        bookmarkedRef.current = true;
+        setBookmarked(true);
+      }
+    });
 
     return () => {
       unsubscribeResult();
@@ -179,10 +216,21 @@ export function useQueryViewController({
       unsubscribeSchema();
       unsubscribeBookmark();
     };
-  }, [setConnections, setError, setResult, setSchema]);
+  }, [
+    connectionId,
+    invalidateBookmark,
+    setConnections,
+    setError,
+    setResult,
+    setSchema,
+  ]);
 
   const handleConnectionChange = useCallback(
     (nextConnectionId: string) => {
+      if (nextConnectionId !== bookmarkConnectionRef.current) {
+        bookmarkConnectionRef.current = nextConnectionId;
+        invalidateBookmark();
+      }
       activeOperationRef.current = null;
       reset();
       setActiveConnection(nextConnectionId);
@@ -196,7 +244,7 @@ export function useQueryViewController({
         schemaFetchedRef.current.delete(nextConnectionId);
       }
     },
-    [reset, setActiveConnection],
+    [invalidateBookmark, reset, setActiveConnection],
   );
 
   useEffect(() => {
@@ -282,27 +330,33 @@ export function useQueryViewController({
   ]);
 
   const handleBookmark = useCallback(() => {
-    if (bookmarked || bookmarking) {
+    if (bookmarkedRef.current || pendingBookmarkRef.current) {
       return;
     }
 
-    const queryText = editorRef.current?.getValue().trim() ?? "";
+    const queryText = bookmarkTextRef.current;
     if (!queryText) {
       return;
     }
 
-    setBookmarking(true);
-    postMessage("addBookmark", {
+    const pending = {
+      requestId: `${panelId}:bookmark:${++bookmarkSequenceRef.current}`,
       queryText,
-      connectionId: resolvedConnectionId,
-    });
-  }, [bookmarked, bookmarking, resolvedConnectionId]);
+      connectionId:
+        useConnectionStore.getState().activeConnectionId || connectionId,
+    };
+    pendingBookmarkRef.current = pending;
+    setBookmarking(true);
+    postMessage("addBookmark", pending satisfies QueryBookmarkPayload);
+  }, [connectionId, panelId]);
 
-  const handleEditorChange = useCallback(() => {
-    if (bookmarkedRef.current) {
-      setBookmarked(false);
-    }
-  }, []);
+  const handleEditorChange = useCallback(
+    (value: string) => {
+      bookmarkTextRef.current = value.trim();
+      invalidateBookmark();
+    },
+    [invalidateBookmark],
+  );
 
   const startResizing = useCallback(
     (event: React.MouseEvent<HTMLButtonElement>) => {

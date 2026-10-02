@@ -109,20 +109,89 @@ describe("PostgreSQL JSON/Array precision", () => {
         '{"hello world","with quote\\"inside",42.5}',
         textArrayColumn,
       );
-      expect(formatted).toBe('["hello world","with quote\\"inside",42.5]');
+      expect(formatted).toBe('["hello world","with quote\\"inside","42.5"]');
     });
 
-    it("decodes PG array backslash escapes (n, t, r, b, f, v)", () => {
+    it.each([
+      "text[]",
+      "varchar(20)[]",
+      "character varying(20)[]",
+      "_text",
+      "audit.numeric[]",
+      '"numeric"[]',
+      '"audit"."int8"[]',
+    ])("keeps numeric-looking text/enum elements as strings for %s", (nativeType) => {
+      const column = { ...textArrayColumn, nativeType };
+      const elements = ["01", "-01", "-.5", "42.5", "13000.0", "t", "f"];
+      const display = JSON.stringify(elements);
+      const literal = driver.coerceInputValue(display, column);
+      expect(driver.formatOutputValue(elements, column)).toBe(display);
+      expect(driver.formatOutputValue(literal, column)).toBe(display);
+      expect(
+        driver.coerceInputValue(
+          driver.formatOutputValue(elements, column),
+          column,
+        ),
+      ).toBe(literal);
+      const nested = [elements, elements];
+      expect(driver.formatOutputValue(nested, column)).toBe(
+        JSON.stringify(nested),
+      );
+    });
+
+    it.each([
+      "numeric(30,10)[]",
+      "decimal[]",
+      "_numeric",
+      "pg_catalog.numeric[]",
+      "bigint[]",
+      "_int8",
+      "pg_catalog.int8[]",
+    ])("preserves exact numeric string tokens for %s", (nativeType) => {
+      const column = { ...numericArrayColumn, nativeType };
+      const elements = ["9223372036854775807", "13000.0", null];
+      const display = "[9223372036854775807,13000.0,null]";
+      expect(driver.formatOutputValue(elements, column)).toBe(display);
+      expect(
+        driver.formatOutputValue("{9223372036854775807,13000.0,NULL}", column),
+      ).toBe(display);
+    });
+
+    it.each([
+      "boolean[]",
+      "bool[]",
+      "_bool",
+      "pg_catalog.bool[]",
+    ])("formats typed boolean elements for %s", (nativeType) => {
+      const column = { ...textArrayColumn, nativeType };
+      expect(driver.formatOutputValue([true, false, null], column)).toBe(
+        "[true,false,null]",
+      );
+      expect(driver.formatOutputValue("{t,f,NULL}", column)).toBe(
+        "[true,false,null]",
+      );
+    });
+
+    it("decodes PG backslash as escaping the next character literally", () => {
       const formatted = driver.formatOutputValue(
         '{"line1\\nline2","col1\\tcol2"}',
         textArrayColumn,
       );
-      expect(formatted).toBe('["line1\\nline2","col1\\tcol2"]');
+      expect(formatted).toBe('["line1nline2","col1tcol2"]');
     });
 
-    it("decodes boolean tokens (t/f) inside PG arrays", () => {
+    it("keeps t/f as strings inside text arrays", () => {
       const formatted = driver.formatOutputValue("{t,f,NULL}", textArrayColumn);
-      expect(formatted).toBe("[true,false,null]");
+      expect(formatted).toBe('["t","f",null]');
+    });
+
+    it("decodes t/f in boolean arrays using column metadata", () => {
+      expect(
+        driver.formatOutputValue("{t,f,NULL}", {
+          ...textArrayColumn,
+          nativeType: "boolean[]",
+        }),
+      ).toBe("[true,false,null]");
     });
   });
 
@@ -160,6 +229,15 @@ describe("PostgreSQL JSON/Array precision", () => {
       const raw = "{13000.0,42.5}";
       expect(driver.coerceInputValue(raw, numericArrayColumn)).toBe(raw);
     });
+  });
+
+  it("verifies raw enum array text using catalog-qualified element metadata", () => {
+    const column = { ...textArrayColumn, nativeType: "audit.int8[]" };
+    expect(
+      driver.checkPersistedEdit(column, '["01","-01","-.5"]', {
+        persistedValue: "{01,-01,-.5}",
+      }),
+    ).toMatchObject({ ok: true, shouldVerify: true });
   });
 
   describe("buildFilterCondition", () => {
