@@ -17,6 +17,7 @@ import {
   normalizeSqlDatetimeOffsetSpacing,
 } from "./BaseDBDriver";
 import { BoundedQueryRows, queryCollectionLimit } from "./boundedQueryRows";
+import { mssqlInsertGuard } from "./mssqlInsertGuard";
 import {
   questionMarkPlaceholderOffsets,
   replaceQuestionMarkPlaceholders,
@@ -29,6 +30,10 @@ import {
   type DriverTimeoutSettingsProvider,
   throwIfTransactionCancelled,
 } from "./timeout";
+import {
+  TransactionIdentityStore,
+  verifyTransaction,
+} from "./transactionVerification";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -111,6 +116,8 @@ interface ObjectRow {
 interface DescribeColumnRow {
   COLUMN_NAME: string;
   DATA_TYPE: string;
+  BASE_TYPE?: string;
+  COLLATION_NAME?: string | null;
   max_length: number;
   precision: number;
   scale: number;
@@ -1493,10 +1500,13 @@ export class MSSQLDriver extends BaseDBDriver {
       .input("table", mssql.NVarChar, table)
       .query<DescribeColumnRow>(`SELECT
            c.name                                                AS COLUMN_NAME,
-           TYPE_NAME(c.user_type_id)                            AS DATA_TYPE,
+           ut.name                                              AS DATA_TYPE,
+           CASE WHEN ut.is_assembly_type = 1 THEN ut.name
+                ELSE bt.name END                                AS BASE_TYPE,
            c.max_length,
            c.precision,
            c.scale,
+           c.collation_name                                    AS COLLATION_NAME,
            c.is_nullable                                        AS IS_NULLABLE,
            c.is_identity,
            c.is_computed,
@@ -1507,6 +1517,8 @@ export class MSSQLDriver extends BaseDBDriver {
            pk.key_ordinal                                       AS PK_ORDINAL,
            CASE WHEN fk.parent_column_id IS NOT NULL THEN 1 ELSE 0 END AS IS_FK
          FROM [${escapeMssqlId(database)}].sys.columns c
+         JOIN [${escapeMssqlId(database)}].sys.types ut ON ut.user_type_id = c.user_type_id
+         LEFT JOIN [${escapeMssqlId(database)}].sys.types bt ON bt.user_type_id = c.system_type_id AND bt.system_type_id = c.system_type_id
          JOIN [${escapeMssqlId(database)}].sys.objects  o ON o.object_id = c.object_id
          JOIN [${escapeMssqlId(database)}].sys.schemas  s ON s.schema_id  = o.schema_id
          LEFT JOIN [${escapeMssqlId(database)}].sys.computed_columns cc
@@ -1539,6 +1551,17 @@ export class MSSQLDriver extends BaseDBDriver {
           row.precision,
           row.scale,
         ),
+        ...(row.BASE_TYPE && row.BASE_TYPE !== row.DATA_TYPE
+          ? {
+              baseType: mssqlFullType(
+                row.BASE_TYPE,
+                row.max_length,
+                row.precision,
+                row.scale,
+              ),
+            }
+          : {}),
+        ...(row.COLLATION_NAME ? { collation: row.COLLATION_NAME } : {}),
         nullable: isSetFlag(row.IS_NULLABLE),
         defaultValue,
         identityGeneration: isSetFlag(row.is_identity) ? "always" : undefined,
@@ -2095,6 +2118,7 @@ export class MSSQLDriver extends BaseDBDriver {
   async runTransaction(
     operations: import("./types").TransactionOperation[],
     context?: import("./types").TransactionContext,
+    scope?: import("./types").TransactionOptions,
   ): Promise<void> {
     throwIfTransactionCancelled(context);
     const tx = new mssql.Transaction(this.requirePool());
@@ -2107,8 +2131,24 @@ export class MSSQLDriver extends BaseDBDriver {
     };
     context?.signal.addEventListener("abort", cancel, { once: true });
     try {
-      for (const op of operations) {
+      const identities = new TransactionIdentityStore();
+      for (const [index, op] of operations.entries()) {
         throwIfTransactionCancelled(context);
+        if (op.captureIdentity?.mssqlSelect) {
+          const guard = mssqlInsertGuard(op.captureIdentity.mssqlInsertTarget);
+          const guardRequest = tx.request();
+          activeRequest = guardRequest;
+          await this.executeTrackedRequest(guardRequest, async (trackedReq) => {
+            // Catalog identifiers are literal Unicode names, never row values:
+            // temporal/UUID inference or trimming can inspect a different object.
+            trackedReq.input("p1", mssql.NVarChar(128), guard.params[0]);
+            trackedReq.input("p2", mssql.NVarChar(128), guard.params[1]);
+            trackedReq.input("p3", mssql.NVarChar(517), guard.params[2]);
+            return trackedReq.query(guard.sql);
+          });
+          activeRequest = undefined;
+          throwIfTransactionCancelled(context);
+        }
         const req = tx.request();
         const checkAffectedRows =
           op.checkAffectedRows || op.expectedAffectedRows !== undefined;
@@ -2127,11 +2167,12 @@ export class MSSQLDriver extends BaseDBDriver {
             );
             // Trigger statements contribute their own TDS row counts. Capture
             // the outer DML's count instead of summing res.rowsAffected.
-            return await trackedReq.query(
-              checkAffectedRows
-                ? `${finalSql}\n;SET @${affectedRowsParameter} = @@ROWCOUNT;`
-                : finalSql,
-            );
+            let sql = checkAffectedRows
+              ? `${finalSql}\n;SET @${affectedRowsParameter} = @@ROWCOUNT;`
+              : finalSql;
+            if (op.captureIdentity?.mssqlSelect)
+              sql += `\n${op.captureIdentity.mssqlSelect}`;
+            return await trackedReq.query(sql);
           },
         );
         activeRequest = undefined;
@@ -2141,7 +2182,62 @@ export class MSSQLDriver extends BaseDBDriver {
             res.output[affectedRowsParameter] ?? 0,
           );
         }
+        await identities.capture(
+          index,
+          op,
+          // A trigger can emit its own recordsets. Only our final SELECT is the
+          // captured identity; never mistake the trigger's first set for it.
+          op.captureIdentity?.mssqlSelect
+            ? Array.isArray(res.recordsets)
+              ? (res.recordsets.at(-1) ?? [])
+              : []
+            : (res.recordset ?? []),
+          async (sql, params) => {
+            const req = tx.request();
+            activeRequest = req;
+            const result = await this.executeTrackedRequest(
+              req,
+              async (trackedReq) =>
+                trackedReq.query(
+                  this.bindPositionalParameters(trackedReq, sql, params),
+                ),
+            );
+            activeRequest = undefined;
+            return result.recordset ?? [];
+          },
+        );
       }
+      await verifyTransaction(
+        this,
+        identities.resolve(scope?.verifications),
+        async (verification) => {
+          const req = tx.request();
+          req.arrayRowMode = true;
+          activeRequest = req;
+          const res = (await this.executeTrackedRequest(
+            req,
+            async (trackedReq) =>
+              trackedReq.query(
+                this.bindPositionalParameters(
+                  trackedReq,
+                  verification.sql,
+                  verification.params,
+                ),
+              ),
+          )) as MssqlArrayResult;
+          activeRequest = undefined;
+          const metadata = res.columns?.[0] ?? [];
+          return ((res.recordset ?? []) as unknown[][]).map((row) =>
+            Object.fromEntries(
+              mssqlArrayRow(row, metadata).map((value, index) => [
+                `__col_${index}`,
+                this.formatQueryValue(value, metadata[index]),
+              ]),
+            ),
+          );
+        },
+        context,
+      );
       throwIfTransactionCancelled(context);
       await tx.commit();
     } catch (e) {
@@ -2175,6 +2271,19 @@ export class MSSQLDriver extends BaseDBDriver {
     if (ct === "hierarchyid" || ct === "sql_variant") return "other";
     if (ct.includes("char") || ct.includes("varchar")) return "text";
     return "other";
+  }
+  protected override enrichColumn(column: ColumnMeta): ColumnTypeMeta {
+    // Coercion, numeric casts, capture and read-back must use the real storage
+    // type, not a user-defined alias name (which is neither SQL text nor a category).
+    const enriched = super.enrichColumn({
+      ...column,
+      type:
+        column.baseType ??
+        (column.type.toLowerCase() === "sysname"
+          ? "nvarchar(128)"
+          : column.type),
+    });
+    return { ...enriched, type: column.type };
   }
   protected getValueSemantics(
     nativeType: string,

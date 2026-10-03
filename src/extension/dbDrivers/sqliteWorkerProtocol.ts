@@ -1,4 +1,5 @@
 import type { ConnectionConfig } from "../connectionManager";
+import type { TransactionVerificationFailure } from "./transactionVerification";
 
 export const SQLITE_WORKER_METHODS = [
   "listDatabases",
@@ -32,5 +33,9 @@ export interface SQLiteWorkerRequest {
 export interface SQLiteWorkerResponse {
   id: number;
   value?: unknown;
-  error?: { message: string; name: string };
+  error?: {
+    message: string;
+    name: string;
+    verificationFailure?: TransactionVerificationFailure;
+  };
 }

@@ -248,6 +248,11 @@ export type PrimaryKeyRole = "partition" | "sort";
 export interface ColumnMeta {
   name: string;
   type: string;
+  /** Catalog-resolved underlying SQL type for aliases, including size/precision.
+   * The declared type remains in `type` for display. */
+  baseType?: string;
+  /** SQL Server character storage collation, needed for lossless OUTPUT INTO. */
+  collation?: string;
   nullable: boolean;
   defaultValue?: string;
   identityGeneration?: IdentityGenerationKind;

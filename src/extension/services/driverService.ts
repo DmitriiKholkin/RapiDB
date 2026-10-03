@@ -254,6 +254,10 @@ export class DriverService {
 
         return {
           ...baseConfig,
+          runtimeOverrides: {
+            ...baseConfig.runtimeOverrides,
+            tlsServername: remoteTarget.host,
+          },
           connectionUri: rewrittenConnectionUri,
           uri: rewrittenLegacyUri,
           directConnection: true,

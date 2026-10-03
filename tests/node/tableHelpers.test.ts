@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
+import { verifyTransaction } from "../../src/extension/dbDrivers/transactionVerification";
 import type {
   ColumnTypeMeta,
   IDBDriver,
@@ -561,14 +562,26 @@ describe("table helpers", () => {
     );
   });
 
-  it("verifies persisted values after an atomic apply and retains row outcomes", async () => {
+  it("passes verification into an atomic transaction and fails the whole apply on mismatch", async () => {
     const query = vi.fn(async () => ({
       columns: ["__col_0"],
       rows: [{ __col_0: "mismatch" }],
       rowCount: 1,
       executionTimeMs: 0,
     }));
-    const driver = { ...fakeDriver, query };
+    const transactionRead = vi.fn(async () => [{ __col_0: "mismatch" }]);
+    const driver: IDBDriver = {
+      ...fakeDriver,
+      query,
+      runTransaction: async (_operations, context, options) => {
+        await verifyTransaction(
+          fakeDriver,
+          options?.verifications,
+          transactionRead,
+          context,
+        );
+      },
+    };
     const manager = { getDriver: () => driver } as never;
     const prepared = prepareApplyChangesPlan(
       manager,
@@ -594,16 +607,17 @@ describe("table helpers", () => {
         verificationCriteria: null,
       },
     ]);
-    expect(query).toHaveBeenCalledOnce();
+    expect(query).not.toHaveBeenCalled();
+    expect(transactionRead).toHaveBeenCalledOnce();
     expect(result).toMatchObject({
-      success: true,
-      insertApplied: true,
+      success: false,
       failedRows: [0],
       rowOutcomes: [
         { rowIndex: 0, status: "verification_failed", columns: ["amount"] },
         { rowIndex: 1, status: "skipped" },
       ],
     });
+    expect(result.insertApplied).not.toBe(true);
   });
 
   it("returns executable preview statements for valid row updates and skips empty changes", () => {

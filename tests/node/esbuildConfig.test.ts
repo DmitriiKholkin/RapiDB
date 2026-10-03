@@ -5,7 +5,7 @@ import { build } from "esbuild";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { webviewConfig } from "../../esbuild.config.mjs";
+import { extensionConfig, webviewConfig } from "../../esbuild.config.mjs";
 
 function readEsbuildConfigSource(): string {
   return readFileSync(
@@ -22,9 +22,12 @@ describe("esbuild config", () => {
     expect(source).toContain('platform: "node"');
     expect(source).toContain('target: "node20"');
     expect(source).toContain('format: "cjs"');
-    expect(source).toContain(
-      'external: ["vscode", "oracledb", "better-sqlite3"]',
-    );
+    expect(extensionConfig.external).toEqual([
+      "vscode",
+      "oracledb",
+      "better-sqlite3",
+      "ssh2",
+    ]);
   });
 
   it("keeps the webview bundle isolated and the build script side-effect free on import", () => {

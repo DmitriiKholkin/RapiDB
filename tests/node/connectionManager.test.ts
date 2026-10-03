@@ -2360,6 +2360,80 @@ describe("ConnectionManager", () => {
   });
 
   it.each([
+    ["host", "db.internal"],
+    ["connectionUri", "db.internal"],
+    ["uri", "db.internal"],
+    ["host", "2001:db8::12"],
+    ["connectionUri", "2001:db8::12"],
+    ["uri", "2001:db8::12"],
+  ] as const)("keeps Mongo TLS identity transient during connectTo: %s %s", async (source, hostname) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const authority = hostname.includes(":") ? `[${hostname}]` : hostname;
+    const config: ConnectionConfig = {
+      ...createSshPgConfig("mongo-ssh-identity"),
+      type: "mongodb",
+      port: 27018,
+      host: source === "host" ? hostname : "ignored.internal",
+      ...(source === "host"
+        ? {}
+        : { [source]: `mongodb://${authority}:27018/app?retryWrites=true` }),
+      tls: {
+        mode: "requireVerifyFull",
+        serverNameOverride: "certificate.internal",
+      },
+    };
+    const dispose = vi.fn(async () => undefined);
+    const createSshRuntime = vi.fn(async () => ({
+      transport: {
+        kind: "tcpForward" as const,
+        localHost: "127.0.0.1" as const,
+        localPort: 15432,
+        remoteHost: hostname,
+        remotePort: 27018,
+      },
+      verifiedFingerprintSha256:
+        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      dispose,
+    }));
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+      { createSshRuntime },
+    );
+    try {
+      await manager.saveConnection(config);
+      const persisted = store.getConnections();
+      await manager.connectTo(config.id);
+      expect(createSshRuntime).toHaveBeenCalledWith(
+        expect.anything(),
+        {
+          kind: "tcpForward",
+          remoteHost: hostname,
+          remotePort: 27018,
+        },
+        { signal: expect.any(AbortSignal) },
+      );
+      expect(driverInstances[0]?.config).toMatchObject({
+        host: "127.0.0.1",
+        port: 15432,
+        directConnection: true,
+        tls: config.tls,
+        runtimeOverrides: { tlsServername: hostname },
+        ...(source === "host"
+          ? {}
+          : { [source]: "mongodb://127.0.0.1:15432/app?retryWrites=true" }),
+      });
+      expect(store.getConnections()).toEqual(persisted);
+    } finally {
+      await manager.dispose();
+      expect(dispose).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it.each([
     undefined,
     22,
     65535,

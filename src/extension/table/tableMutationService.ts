@@ -9,6 +9,7 @@ import type { ColumnTypeMeta, TransactionOperation } from "../dbDrivers/types";
 import { pMapWithLimit } from "../utils/concurrency";
 import { assertConnectionWritable } from "../utils/readOnlyGuards";
 import { buildInsertRowOperation } from "./insertSql";
+import { prepareInsertVerification } from "./insertVerification";
 import {
   PersistedEditValidationError,
   validatePersistedEditRecord,
@@ -250,6 +251,16 @@ export class TableMutationService {
             insertPreviewColumns,
           )
         : driver.materializePreviewSql(operation.sql, operation.params);
+    const verification = prepareInsertVerification(
+      driver,
+      this.connectionManager.getConnection(connectionId)?.type,
+      database,
+      schema,
+      table,
+      writableValues,
+      columns,
+      operation,
+    );
     return {
       connectionId,
       database,
@@ -258,6 +269,7 @@ export class TableMutationService {
       operation,
       previewStatements: [previewSql],
       verificationCriteria,
+      verification,
     };
   }
   async executePreparedInsertPlan(plan: PreparedInsertPlan): Promise<void> {
@@ -285,6 +297,23 @@ export class TableMutationService {
       return;
     }
 
+    if (plan.verification) {
+      const risk = await driver.getMutationAtomicityRisk?.(
+        plan.database,
+        plan.schema,
+        plan.table,
+      );
+      if (risk)
+        throw new Error(
+          `INSERT verification requires rollback support. ${risk}`,
+        );
+      await driver.runTransaction(
+        [{ ...plan.operation, checkAffectedRows: true }],
+        undefined,
+        { database: plan.database, verifications: [plan.verification] },
+      );
+      return;
+    }
     const result = await driver.query(
       plan.operation.sql,
       plan.operation.params,

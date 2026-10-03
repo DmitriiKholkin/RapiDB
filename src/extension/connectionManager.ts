@@ -1384,7 +1384,7 @@ export class ConnectionManager
     if (rawUri) {
       const parsed = new URL(rawUri);
       return {
-        host: parsed.hostname,
+        host: parsed.hostname.replace(/^\[|\]$/g, ""),
         port: parsed.port ? Number.parseInt(parsed.port, 10) : 27017,
       };
     }
@@ -1641,6 +1641,10 @@ export class ConnectionManager
 
         return {
           ...baseConfig,
+          runtimeOverrides: {
+            ...baseConfig.runtimeOverrides,
+            tlsServername: remoteTarget.host,
+          },
           connectionUri: rewrittenConnectionUri,
           uri: rewrittenLegacyUri,
           directConnection: true,

@@ -1,5 +1,9 @@
 import type { ApplyResultPayload } from "../../shared/webviewContracts";
-import type { ColumnTypeMeta, TransactionOperation } from "../dbDrivers/types";
+import type {
+  ColumnTypeMeta,
+  TransactionOperation,
+  TransactionVerification,
+} from "../dbDrivers/types";
 
 export interface SortConfig {
   column: string;
@@ -32,6 +36,7 @@ export interface PreparedInsertPlan {
   operation: TransactionOperation;
   previewStatements: string[];
   verificationCriteria: Record<string, unknown> | null;
+  verification?: TransactionVerification;
 }
 
 export interface PreparedDeletePlan {

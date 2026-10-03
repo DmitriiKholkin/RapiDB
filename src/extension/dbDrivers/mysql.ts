@@ -23,6 +23,10 @@ import {
   type DriverTimeoutSettingsProvider,
   throwIfTransactionCancelled,
 } from "./timeout";
+import {
+  TransactionIdentityStore,
+  verifyTransaction,
+} from "./transactionVerification";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -2151,6 +2155,7 @@ export class MySQLDriver extends BaseDBDriver {
   async runTransaction(
     operations: import("./types").TransactionOperation[],
     context?: import("./types").TransactionContext,
+    scope?: import("./types").TransactionOptions,
   ): Promise<void> {
     throwIfTransactionCancelled(context);
     const conn = await this.requirePool().getConnection();
@@ -2161,14 +2166,135 @@ export class MySQLDriver extends BaseDBDriver {
     context?.signal.addEventListener("abort", cancel, { once: true });
     try {
       throwIfTransactionCancelled(context);
-      await conn.beginTransaction();
-      for (const op of operations) {
+      if (
+        operations.some(
+          (op) =>
+            op.captureIdentity?.mysqlKeyGuard ||
+            op.captureIdentity?.mysqlInsertId?.zero,
+        )
+      ) {
+        // Applies only to the next transaction, not the pooled session. Missing
+        // PK predicates need range locks even when the session uses READ COMMITTED.
+        await conn.query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
         throwIfTransactionCancelled(context);
+      }
+      await conn.beginTransaction();
+      const identities = new TransactionIdentityStore();
+      const generatedZeros = new Set<number>();
+      for (const [index, op] of operations.entries()) {
+        throwIfTransactionCancelled(context);
+        const capture = op.captureIdentity?.mysqlInsertId;
+        let literalZero = false;
+        if (capture?.zero) {
+          const [modes] = await conn.query<RowDataPacket[]>(
+            this.createQueryOptions(
+              "SELECT @@SESSION.sql_mode AS __rapidb_sql_mode",
+            ),
+          );
+          throwIfTransactionCancelled(context);
+          const mode: unknown = modes[0]?.__rapidb_sql_mode;
+          if (modes.length !== 1 || typeof mode !== "string")
+            throw new Error(
+              "INSERT verification cannot determine the transaction session SQL mode; the transaction was not committed.",
+            );
+          literalZero = mode
+            .split(",")
+            .some(
+              (part) => part.trim().toUpperCase() === "NO_AUTO_VALUE_ON_ZERO",
+            );
+          if (!literalZero) generatedZeros.add(index);
+        }
+        const guard =
+          literalZero && capture?.zero
+            ? { sql: capture.zero.guardSql, params: [0] }
+            : op.captureIdentity?.mysqlKeyGuard;
+        if (guard) {
+          const [existing] = await conn.query<RowDataPacket[]>(
+            this.createQueryOptions(
+              guard.sql,
+              guard.params as QueryOptions["values"],
+            ),
+          );
+          throwIfTransactionCancelled(context);
+          if (existing.length)
+            throw new Error(
+              "INSERT verification cannot identify a new row at an already existing primary key; the transaction was not committed.",
+            );
+        }
         const [rows] = await conn.query<ResultSetHeader>(
           this.createQueryOptions(op.sql, op.params as QueryOptions["values"]),
         );
+        throwIfTransactionCancelled(context);
         assertTransactionAffectedRows(op, rows.affectedRows);
+        let returnedKeys: Record<string, unknown>[] = [];
+        if (capture) {
+          // Use this INSERT's OK-packet identity, not session LAST_INSERT_ID();
+          // a BEFORE trigger may explicitly assign the auto-increment field.
+          const id: unknown = rows.insertId;
+          const reliable =
+            (typeof id === "number" &&
+              Number.isSafeInteger(id) &&
+              (id !== 0 || literalZero)) ||
+            (typeof id === "string" &&
+              /^-?\d+$/.test(id) &&
+              (BigInt(id) !== 0n || literalZero));
+          if (reliable) {
+            const [actualKeys] = await conn.query<RowDataPacket[]>(
+              this.createQueryOptions(capture.sql, [id]),
+            );
+            throwIfTransactionCancelled(context);
+            returnedKeys = actualKeys;
+          }
+        }
+        await identities.capture(
+          index,
+          op,
+          returnedKeys,
+          async (sql, params) => {
+            const [identityRows] = await conn.query<RowDataPacket[]>(
+              this.createQueryOptions(sql, params as QueryOptions["values"]),
+            );
+            return identityRows;
+          },
+        );
       }
+      await verifyTransaction(
+        this,
+        identities.resolve(scope?.verifications)?.map((verification) => {
+          const identity = verification.identity;
+          if (!identity || !generatedZeros.has(identity.operationIndex))
+            return verification;
+          const zero =
+            operations[identity.operationIndex].captureIdentity?.mysqlInsertId
+              ?.zero;
+          if (!zero) return verification;
+          // Verify this operation's captured key without mutating its reusable plan.
+          return {
+            ...verification,
+            values: verification.values.map((value) =>
+              value.column.name === zero.columnName
+                ? {
+                    ...value,
+                    expectedValue:
+                      verification.params[
+                        identity.parameterIndexes[zero.keyIndex]
+                      ],
+                  }
+                : value,
+            ),
+          };
+        }),
+        async (verification) => {
+          const [rows] = await conn.query<RowDataPacket[]>(
+            this.createQueryOptions(
+              verification.sql,
+              verification.params as QueryOptions["values"],
+            ),
+          );
+          return rows;
+        },
+        context,
+      );
       throwIfTransactionCancelled(context);
       await conn.commit();
     } catch (e) {

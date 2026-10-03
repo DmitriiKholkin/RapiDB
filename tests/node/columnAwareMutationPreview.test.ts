@@ -115,9 +115,19 @@ describe.each([
       { [key]: 7, [name]: `value ${marker}2`, [escapedName]: null },
     );
     const names = `"id""${marker}1", "x${marker}1", "x""${marker}2"`;
+    const identityClause =
+      dialect === "pg"
+        ? ` RETURNING "id""${marker}1" AS "__col_0"`
+        : ` RETURNING TO_CHAR("id""${marker}1", 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,''') INTO :3`;
     expect(plan.operation).toEqual({
-      sql: `INSERT INTO ${qualified} (${names}) VALUES (${marker}1, ${marker}2, NULL)`,
+      sql: `INSERT INTO ${qualified} (${names}) VALUES (${marker}1, ${marker}2, NULL)${identityClause}`,
       params: [7, `value ${marker}2`],
+      expectedAffectedRows: 1,
+      captureIdentity: dialect === "pg" ? {} : { oracleOutTypes: ["string"] },
+    });
+    expect(plan.verification?.identity).toMatchObject({
+      operationIndex: 0,
+      parameterIndexes: [0],
     });
     const previewSql = `INSERT INTO ${qualified} (${names}) VALUES (7, 'value ${marker}2', NULL)`;
     expect(plan.previewStatements).toEqual([previewSql]);

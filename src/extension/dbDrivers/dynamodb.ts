@@ -124,6 +124,7 @@ const DYNAMODB_CURSOR_FETCH_LIMIT = 200;
 const DYNAMODB_MAX_MATERIALIZED_ROWS = 5000;
 const DYNAMODB_CURSOR_CACHE_MAX_SESSIONS = 100;
 const DYNAMODB_CURSOR_SESSION_MAX_PAGE_STARTS = 100;
+const DYNAMODB_CURSOR_HISTORY_LIMIT = 256;
 const DYNAMODB_UNSUPPORTED_METADATA =
   createNoSqlUnsupportedMetadataHandlers("DynamoDB");
 
@@ -193,8 +194,21 @@ type MaterializedReadResult = {
   truncated: boolean;
 };
 
+type DynamoCursorCycle = {
+  checkpoint?: string;
+  interval: number;
+  distance: number;
+};
+
+type DynamoCursorHistory = {
+  recent: Map<string, true>;
+  cycle: DynamoCursorCycle;
+};
+
 type DynamoCursorSession = {
   pageStarts: Map<number, Record<string, AttributeValue> | undefined>;
+  cursorPages: Map<string, number>;
+  cursorCycle: DynamoCursorCycle & { nextPage: number };
   terminalPage: number | null;
   totalCount?: number;
 };
@@ -203,6 +217,52 @@ type QueryDispatchResult = {
   rows: Record<string, unknown>[];
   affectedRows?: number;
 };
+
+type DynamoReadContext = Pick<DriverTablePageRequest, "signal" | "deadline">;
+
+function throwIfReadCancelled(context: DynamoReadContext): void {
+  context.signal?.throwIfAborted();
+  if (context.deadline !== undefined && Date.now() >= context.deadline) {
+    throw new Error("DynamoDB read deadline exceeded.");
+  }
+}
+
+function createReadCursorHistory(): DynamoCursorHistory {
+  return {
+    recent: new Map(),
+    cycle: { interval: 1, distance: 0 },
+  };
+}
+
+function rememberReadCursor<T>(
+  recent: Map<string, T>,
+  signature: string,
+  value: T,
+): void {
+  recent.set(signature, value);
+  if (recent.size > DYNAMODB_CURSOR_HISTORY_LIMIT) {
+    const oldest = recent.keys().next().value;
+    if (oldest !== undefined) recent.delete(oldest);
+  }
+}
+
+function advanceReadCursorCycle(
+  cycle: DynamoCursorCycle,
+  signature: string,
+): void {
+  if (cycle.checkpoint === signature) {
+    throw new Error(
+      "DynamoDB read cursor repeated; stopped to avoid repeating rows.",
+    );
+  }
+  // Brent-style doubling checkpoints catch cycles beyond the bounded history.
+  cycle.distance += 1;
+  if (cycle.distance >= cycle.interval) {
+    cycle.checkpoint = signature;
+    cycle.interval *= 2;
+    cycle.distance = 0;
+  }
+}
 
 type DynamoNativeCommandCtor = new (input: never) => object;
 
@@ -461,10 +521,11 @@ export class DynamoDBDriver implements IDBDriver {
     _database: string,
     _schema: string,
     table: string,
+    context: DynamoReadContext = {},
   ): Promise<ColumnTypeMeta[]> {
     const [rows, schema] = await Promise.all([
-      this.readRowsForDescription(table, 1000),
-      this.getTableSchema(table),
+      this.readRowsForDescription(table, 1000, context),
+      this.getTableSchema(table, context),
     ]);
     return this.buildDynamoColumns(rows, schema);
   }
@@ -694,12 +755,16 @@ export class DynamoDBDriver implements IDBDriver {
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
     const startTime = performance.now();
-    const schema = await this.getTableSchema(request.table);
+    throwIfReadCancelled(request);
+    const schema = await this.getTableSchema(request.table, request);
+    throwIfReadCancelled(request);
     const describedColumns = await this.describeColumns(
       request.database,
       request.schema,
       request.table,
+      request,
     );
+    throwIfReadCancelled(request);
     const describedByName = new Map(
       describedColumns.map((column) => [column.name, column]),
     );
@@ -724,6 +789,7 @@ export class DynamoDBDriver implements IDBDriver {
           request.sort,
           request.filters,
           describedByName,
+          request,
         );
       return {
         columns: this.resolveReadTablePageColumns(
@@ -741,6 +807,7 @@ export class DynamoDBDriver implements IDBDriver {
       const materialized = await this.materializeReadPlanRows(
         plan,
         DYNAMODB_MAX_MATERIALIZED_ROWS,
+        request,
       );
       if (materialized.truncated) {
         const reason = requiresMaterializedSort ? "sorting" : "filtering";
@@ -781,6 +848,7 @@ export class DynamoDBDriver implements IDBDriver {
       request.page,
       request.pageSize,
       request.sort,
+      request,
     );
     const formattedRows = pageResult.rows.map((row) =>
       this.formatDynamoRowForDisplay(row),
@@ -793,7 +861,9 @@ export class DynamoDBDriver implements IDBDriver {
         describedColumns,
       ),
       rows: formattedRows,
-      totalCount: request.skipCount ? 0 : await this.countReadPlan(plan),
+      totalCount: request.skipCount
+        ? 0
+        : await this.countReadPlan(plan, request),
       executionTimeMs: Math.round(performance.now() - startTime),
     };
   }
@@ -1299,13 +1369,15 @@ export class DynamoDBDriver implements IDBDriver {
 
   private async getTableSchema(
     table: string,
-    context?: DriverOperationContext,
+    context: DynamoReadContext = {},
   ): Promise<DynamoTableSchema> {
+    throwIfReadCancelled(context);
     try {
       const description = await this.requireClient().send(
         new DescribeTableCommand({ TableName: table }),
-        context ? { abortSignal: context.signal } : undefined,
+        context.signal ? { abortSignal: context.signal } : undefined,
       );
+      throwIfReadCancelled(context);
       const keyRoles = new Map<string, PrimaryKeyRole>();
       const keys = (description.Table?.KeySchema ?? []).flatMap((entry) => {
         const name = entry.AttributeName;
@@ -1345,7 +1417,7 @@ export class DynamoDBDriver implements IDBDriver {
         ],
       };
     } catch {
-      context?.signal.throwIfAborted();
+      throwIfReadCancelled(context);
       return {
         keys: [],
         keyRoles: new Map(),
@@ -1853,6 +1925,7 @@ export class DynamoDBDriver implements IDBDriver {
     page: number,
     pageSize: number,
     sort: DriverSortConfig | null,
+    context: DynamoReadContext,
   ): Promise<{ rows: Record<string, unknown>[] }> {
     if (plan.kind === "getItem") {
       const response = await this.requireClient().send(
@@ -1860,13 +1933,17 @@ export class DynamoDBDriver implements IDBDriver {
           TableName: plan.table,
           Key: this.marshallKey(plan.key),
         }),
+        context.signal ? { abortSignal: context.signal } : undefined,
       );
+      throwIfReadCancelled(context);
       return {
         rows: response.Item ? [this.unmarshallItem(response.Item)] : [],
       };
     }
 
-    const cacheKey = `${plan.requestSignature}::${pageSize}`;
+    const order =
+      plan.kind === "query" ? this.resolveScanIndexForward(plan, sort) : "scan";
+    const cacheKey = `${plan.requestSignature}::${pageSize}::${order}`;
     const session = this.getCursorSession(cacheKey);
     if (session.terminalPage !== null && page >= session.terminalPage) {
       return { rows: [] };
@@ -1883,9 +1960,42 @@ export class DynamoDBDriver implements IDBDriver {
       }
     }
 
+    // Preserve cycle detection after history eviction; restart on page jumps.
+    const cycle =
+      session.cursorCycle.nextPage === currentPage
+        ? { ...session.cursorCycle }
+        : {
+            interval: 1,
+            distance: 0,
+            nextPage: currentPage,
+            checkpoint: undefined,
+          };
+
     while (currentPage <= page) {
-      const step = await this.executeReadPlanStep(plan, cursor, pageSize, sort);
+      // A failed/incomplete read must not be treated as a sequential continuation.
+      session.cursorCycle.nextPage = 0;
+      const step = await this.executeReadPlanStep(
+        plan,
+        cursor,
+        pageSize,
+        sort,
+        context,
+        {
+          onCursor: (signature) => {
+            const previousPage = session.cursorPages.get(signature);
+            if (previousPage !== undefined && previousPage !== currentPage) {
+              throw new Error(
+                "DynamoDB read cursor repeated; stopped to avoid repeating rows.",
+              );
+            }
+            advanceReadCursorCycle(cycle, signature);
+            rememberReadCursor(session.cursorPages, signature, currentPage);
+          },
+        },
+      );
       const nextPage = currentPage + 1;
+      cycle.nextPage = nextPage;
+      session.cursorCycle = { ...cycle };
       if (step.nextCursor === undefined) {
         session.terminalPage = step.rows.length === 0 ? currentPage : nextPage;
       } else {
@@ -1915,6 +2025,8 @@ export class DynamoDBDriver implements IDBDriver {
     }
     const session: DynamoCursorSession = {
       pageStarts: new Map([[1, undefined]]),
+      cursorPages: new Map(),
+      cursorCycle: { interval: 1, distance: 0, nextPage: 1 },
       terminalPage: null,
     };
     if (this.cursorCache.size >= DYNAMODB_CURSOR_CACHE_MAX_SESSIONS) {
@@ -1937,7 +2049,12 @@ export class DynamoDBDriver implements IDBDriver {
     const oldestPage = [...session.pageStarts.keys()]
       .filter((candidate) => candidate !== 1)
       .sort((left, right) => left - right)[0];
-    if (oldestPage !== undefined) session.pageStarts.delete(oldestPage);
+    if (oldestPage !== undefined) {
+      session.pageStarts.delete(oldestPage);
+      for (const [signature, cursorPage] of session.cursorPages) {
+        if (cursorPage === oldestPage) session.cursorPages.delete(signature);
+      }
+    }
   }
 
   private async executeReadPlanStep(
@@ -1945,23 +2062,34 @@ export class DynamoDBDriver implements IDBDriver {
     cursor: Record<string, AttributeValue> | undefined,
     pageSize: number,
     sort: DriverSortConfig | null,
+    context: DynamoReadContext,
+    options: {
+      cursorHistory?: DynamoCursorHistory;
+      onCursor?: (signature: string) => void;
+      fillPage?: boolean;
+    } = {},
   ): Promise<ReadStepResult> {
     const rows: Record<string, unknown>[] = [];
+    const cursorHistory = options.cursorHistory ?? createReadCursorHistory();
     let nextCursor = cursor;
+    if (cursor && !options.cursorHistory) {
+      rememberReadCursor(cursorHistory.recent, stableStringify(cursor), true);
+    }
     do {
+      throwIfReadCancelled(context);
       const limit = pageSize - rows.length;
       if (plan.kind === "query") {
         const input: QueryCommandInput = {
           ...plan.baseInput,
+          ScanIndexForward: this.resolveScanIndexForward(plan, sort),
           Limit: limit,
           ...(nextCursor ? { ExclusiveStartKey: nextCursor } : {}),
         };
-        if (sort && plan.sortKeyName === sort.column) {
-          input.ScanIndexForward = sort.direction !== "desc";
-        }
         const response = await this.requireClient().send(
           new QueryCommand(input),
+          context.signal ? { abortSignal: context.signal } : undefined,
         );
+        throwIfReadCancelled(context);
         rows.push(
           ...(response.Items ?? []).map((item) => this.unmarshallItem(item)),
         );
@@ -1974,29 +2102,71 @@ export class DynamoDBDriver implements IDBDriver {
         };
         const response = await this.requireClient().send(
           new ScanCommand(input),
+          context.signal ? { abortSignal: context.signal } : undefined,
         );
+        throwIfReadCancelled(context);
         rows.push(
           ...(response.Items ?? []).map((item) => this.unmarshallItem(item)),
         );
         nextCursor = response.LastEvaluatedKey;
       }
+      nextCursor = this.trackReadCursor(
+        nextCursor,
+        cursorHistory,
+        options.onCursor,
+      );
+      // A short logical page is terminal only when the AWS cursor is exhausted;
+      // DynamoDB may stop at its byte limit even without a FilterExpression.
     } while (
       rows.length < pageSize &&
       nextCursor !== undefined &&
-      plan.baseInput.FilterExpression !== undefined
+      options.fillPage !== false
     );
 
     return { rows, nextCursor };
   }
 
-  private async countReadPlan(plan: DynamoReadPlan): Promise<number> {
+  private trackReadCursor(
+    cursor: Record<string, AttributeValue> | undefined,
+    history: DynamoCursorHistory,
+    onCursor?: (signature: string) => void,
+  ): Record<string, AttributeValue> | undefined {
+    if (!cursor || Object.keys(cursor).length === 0) return undefined;
+    const signature = stableStringify(cursor);
+    if (history.recent.has(signature)) {
+      throw new Error(
+        "DynamoDB read cursor repeated; stopped to avoid repeating rows.",
+      );
+    }
+    advanceReadCursorCycle(history.cycle, signature);
+    onCursor?.(signature);
+    rememberReadCursor(history.recent, signature, true);
+    return cursor;
+  }
+
+  private resolveScanIndexForward(
+    plan: QueryReadPlan,
+    sort: DriverSortConfig | null,
+  ): boolean {
+    return sort && plan.sortKeyName === sort.column
+      ? sort.direction !== "desc"
+      : plan.baseInput.ScanIndexForward !== false;
+  }
+
+  private async countReadPlan(
+    plan: DynamoReadPlan,
+    context: DynamoReadContext,
+  ): Promise<number> {
+    throwIfReadCancelled(context);
     if (plan.kind === "getItem") {
       const response = await this.requireClient().send(
         new GetItemCommand({
           TableName: plan.table,
           Key: this.marshallKey(plan.key),
         }),
+        context.signal ? { abortSignal: context.signal } : undefined,
       );
+      throwIfReadCancelled(context);
       return response.Item ? 1 : 0;
     }
 
@@ -2008,7 +2178,9 @@ export class DynamoDBDriver implements IDBDriver {
 
     let totalCount = 0;
     let cursor: Record<string, AttributeValue> | undefined;
+    const cursorHistory = createReadCursorHistory();
     do {
+      throwIfReadCancelled(context);
       if (plan.kind === "query") {
         const response = await this.requireClient().send(
           new QueryCommand({
@@ -2016,7 +2188,9 @@ export class DynamoDBDriver implements IDBDriver {
             Select: "COUNT",
             ...(cursor ? { ExclusiveStartKey: cursor } : {}),
           }),
+          context.signal ? { abortSignal: context.signal } : undefined,
         );
+        throwIfReadCancelled(context);
         totalCount += response.Count ?? 0;
         cursor = response.LastEvaluatedKey;
       } else {
@@ -2026,10 +2200,13 @@ export class DynamoDBDriver implements IDBDriver {
             Select: "COUNT",
             ...(cursor ? { ExclusiveStartKey: cursor } : {}),
           }),
+          context.signal ? { abortSignal: context.signal } : undefined,
         );
+        throwIfReadCancelled(context);
         totalCount += response.Count ?? 0;
         cursor = response.LastEvaluatedKey;
       }
+      cursor = this.trackReadCursor(cursor, cursorHistory);
     } while (cursor !== undefined);
 
     session.totalCount = totalCount;
@@ -2039,6 +2216,7 @@ export class DynamoDBDriver implements IDBDriver {
   private async materializeReadPlanRows(
     plan: DynamoReadPlan,
     maxRows: number,
+    context: DynamoReadContext = {},
   ): Promise<MaterializedReadResult> {
     if (plan.kind === "getItem") {
       const response = await this.requireClient().send(
@@ -2046,7 +2224,9 @@ export class DynamoDBDriver implements IDBDriver {
           TableName: plan.table,
           Key: this.marshallKey(plan.key),
         }),
+        context.signal ? { abortSignal: context.signal } : undefined,
       );
+      throwIfReadCancelled(context);
       return {
         rows: response.Item ? [this.unmarshallItem(response.Item)] : [],
         truncated: false,
@@ -2056,12 +2236,15 @@ export class DynamoDBDriver implements IDBDriver {
     const rows: Record<string, unknown>[] = [];
     let cursor: Record<string, AttributeValue> | undefined;
     let truncated = false;
+    const cursorHistory = createReadCursorHistory();
     do {
       const step = await this.executeReadPlanStep(
         plan,
         cursor,
         Math.min(maxRows - rows.length, DYNAMODB_CURSOR_FETCH_LIMIT),
         null,
+        context,
+        { cursorHistory },
       );
       rows.push(...step.rows);
       cursor = step.nextCursor;
@@ -2081,6 +2264,7 @@ export class DynamoDBDriver implements IDBDriver {
     sort: DriverSortConfig | null,
     filters: readonly FilterExpression[],
     describedByName: ReadonlyMap<string, ColumnTypeMeta>,
+    context: DynamoReadContext,
   ): Promise<{
     rawRows: Record<string, unknown>[];
     formattedRows: Record<string, unknown>[];
@@ -2094,7 +2278,9 @@ export class DynamoDBDriver implements IDBDriver {
           TableName: plan.table,
           Key: this.marshallKey(plan.key),
         }),
+        context.signal ? { abortSignal: context.signal } : undefined,
       );
+      throwIfReadCancelled(context);
       const rawRows = response.Item ? [this.unmarshallItem(response.Item)] : [];
       const formattedRows = rawRows.map((row) =>
         this.formatDynamoRowForDisplay(row),
@@ -2115,6 +2301,7 @@ export class DynamoDBDriver implements IDBDriver {
     let matchedCount = 0;
     const pageRawRows: Record<string, unknown>[] = [];
     const pageFormattedRows: Record<string, unknown>[] = [];
+    const cursorHistory = createReadCursorHistory();
 
     do {
       const step = await this.executeReadPlanStep(
@@ -2122,6 +2309,10 @@ export class DynamoDBDriver implements IDBDriver {
         cursor,
         DYNAMODB_CURSOR_FETCH_LIMIT,
         sort,
+        context,
+        // This consumer fills the logical page with client-side matches, so it
+        // must evaluate each AWS response before fetching more raw rows.
+        { cursorHistory, fillPage: false },
       );
       for (const rawRow of step.rows) {
         const formattedRow = this.formatDynamoRowForDisplay(rawRow);
@@ -2762,6 +2953,7 @@ export class DynamoDBDriver implements IDBDriver {
   private async readRowsForDescription(
     table: string,
     limit: number,
+    context: DynamoReadContext = {},
   ): Promise<Record<string, unknown>[]> {
     const result = await this.materializeReadPlanRows(
       {
@@ -2777,6 +2969,7 @@ export class DynamoDBDriver implements IDBDriver {
         requestSignature: stableStringify({ kind: "scan", table }),
       },
       limit,
+      context,
     );
     return result.rows;
   }

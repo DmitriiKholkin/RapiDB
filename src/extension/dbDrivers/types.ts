@@ -379,7 +379,7 @@ export interface IDBDriver {
   runTransaction(
     operations: TransactionOperation[],
     context?: TransactionContext,
-    scope?: DatabaseExecutionScope,
+    scope?: TransactionOptions,
   ): Promise<void>;
   getMutationAtomicityRisk?(
     database: string,
@@ -436,11 +436,56 @@ export interface IDBDriver {
 }
 export interface TransactionContext extends DriverOperationContext {}
 
+/** Serializable so verification also runs inside the SQLite execution worker. */
+export interface TransactionVerification {
+  rowIndex: number;
+  mutation?: "insert" | "update";
+  sql: string;
+  params: unknown[];
+  values: Array<{ column: ColumnTypeMeta; expectedValue: unknown }>;
+  /** Replace these positional parameters with the identity captured immediately
+   * after this operation, not the last identity of the whole batch. */
+  identity?: {
+    operationIndex: number;
+    parameterIndexes: number[];
+    /** SQLite composite primary keys may contain NULL; the read must be NULL-safe. */
+    allowNull?: boolean;
+  };
+}
+
+export interface TransactionOptions extends DatabaseExecutionScope {
+  /** Read and validate on the transaction's connection after DML, before COMMIT.
+   * Any read/check failure must abort the entire transaction. */
+  verifications?: TransactionVerification[];
+}
+
 export interface TransactionOperation {
   sql: string;
   params?: unknown[];
   checkAffectedRows?: boolean;
   expectedAffectedRows?: number;
+  /** Capture returned __col_N keys, or execute this identity SELECT on the same
+   * transaction connection immediately after DML. Serializable across SQLite IPC. */
+  captureIdentity?: {
+    sql?: string;
+    params?: unknown[];
+    mysqlInsertId?: {
+      sql: string;
+      /** A writable AUTO_INCREMENT PK input coerced to zero. The executor must
+       * resolve generation using its own session mode for each operation. Literal
+       * zero needs an absence/range-lock guard before trusting packet ID zero. */
+      zero?: { columnName: string; keyIndex: number; guardSql: string };
+    };
+    /** For explicit non-auto MySQL keys: prove absence while holding serializable
+     * key-range locks, so verification cannot accidentally select a preexisting row. */
+    mysqlKeyGuard?: { sql: string; params: unknown[] };
+    oracleOutTypes?: Array<"string" | "buffer">;
+    /** Executed after @@ROWCOUNT is saved, within the same SQL batch/scope. */
+    mssqlSelect?: string;
+    /** OUTPUT fabricates rows for INSTEAD OF INSERT. Inspect this target on the
+     * transaction connection under locks before trusting returned identities. */
+    mssqlInsertTarget?: { database: string; schema: string; table: string };
+  };
 }
 
 export function assertTransactionAffectedRows(

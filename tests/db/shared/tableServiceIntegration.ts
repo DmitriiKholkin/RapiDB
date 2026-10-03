@@ -3,6 +3,7 @@ import type { ConnectionManager } from "../../../src/extension/connectionManager
 import type { IDBDriver } from "../../../src/extension/dbDrivers/types";
 import {
   applyChangesTransactional,
+  executePreparedApplyPlan,
   prepareApplyChangesPlan,
 } from "../../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../../src/extension/table/tableMutationService";
@@ -340,7 +341,7 @@ export function registerTableServiceIntegrationTests(
       expect(rowsFromQuery(compositeResult)).toHaveLength(0);
     });
 
-    it("accepts reported inserts and fails when delete cannot be verified", async () => {
+    it("rejects unverifiable inserts and fails when delete cannot be verified", async () => {
       const probeId = 970_000 + Math.floor(Math.random() * 10_000);
       const tableName = fixtureTableName(engineId, "transactionProbe");
       const columns = await readService.getColumns(
@@ -365,13 +366,24 @@ export function registerTableServiceIntegrationTests(
 
         return harness.driver.query(sql, params);
       };
-      unverifiableDriver.runTransaction = async (operations) => {
+      unverifiableDriver.runTransaction = async (
+        operations,
+        context,
+        scope,
+      ) => {
         if (
           operations.every((operation) => /^\s*delete\b/i.test(operation.sql))
         ) {
           return;
         }
-        await harness.driver.runTransaction(operations);
+        await harness.driver.runTransaction(operations, context, {
+          ...scope,
+          verifications: scope?.verifications?.map((verification) => ({
+            ...verification,
+            sql: `SELECT * FROM ${harness.driver.qualifiedTableName(harness.databaseName, harness.schemaName, tableName)} WHERE 1 = 0`,
+            params: [],
+          })),
+        });
       };
 
       const strictMutationService = new TableMutationService(
@@ -394,7 +406,7 @@ export function registerTableServiceIntegrationTests(
 
       await expect(
         strictMutationService.executePreparedInsertPlan(plan),
-      ).resolves.toBeUndefined();
+      ).rejects.toThrow(/INSERT verification failed/i);
 
       await mutationService.insertRow(
         connectionId,
@@ -428,7 +440,7 @@ export function registerTableServiceIntegrationTests(
       );
     });
 
-    it("prepares previews, rolls back failed transactions, reports skipped rows, and surfaces verification warnings", async () => {
+    it("prepares previews, rolls back failed transactions, reports skipped rows, and rolls back verification failures", async () => {
       const tableName = fixtureTableName(engineId, "transactionProbe");
       const columns = await readService.getColumns(
         connectionId,
@@ -540,29 +552,9 @@ export function registerTableServiceIntegrationTests(
         )} (${harness.driver.quoteIdentifier(idColumn.name)}, ${harness.driver.quoteIdentifier(accountNameColumn.name)}, ${harness.driver.quoteIdentifier(balanceColumn.name)}, ${harness.driver.quoteIdentifier(updatedAtColumn.name)}) VALUES (${warningId}, 'Verification Probe', 10.00, ${engineId === "oracle" ? "TO_TIMESTAMP('2026-04-21 13:00:00.000', 'YYYY-MM-DD HH24:MI:SS.FF3')" : engineId === "mssql" ? "CAST('2026-04-21 13:00:00.000' AS DATETIME2(3))" : engineId === "postgres" ? "TIMESTAMPTZ '2026-04-21T13:00:00.000Z'" : "'2026-04-21 13:00:00.000'"})`,
       );
 
-      const warningDriver = Object.create(harness.driver) as IDBDriver;
-      warningDriver.checkPersistedEdit = (column, expectedValue, options) => {
-        if (column.name.toLowerCase() === balanceColumn.name.toLowerCase()) {
-          if (options?.persistedValue !== undefined) {
-            return {
-              ok: false,
-              shouldVerify: true,
-              message: "Forced verification mismatch",
-            };
-          }
-
-          return { ok: true, shouldVerify: true };
-        }
-
-        return harness.driver.checkPersistedEdit(
-          column,
-          expectedValue,
-          options,
-        );
-      };
-
-      const warningResult = await applyChangesTransactional(
-        createManagerLike(connectionId, warningDriver),
+      const mismatchManager = createManagerLike(connectionId, harness.driver);
+      const mismatchPlan = prepareApplyChangesPlan(
+        mismatchManager,
         connectionId,
         harness.databaseName,
         harness.schemaName,
@@ -575,12 +567,32 @@ export function registerTableServiceIntegrationTests(
         ],
         columns,
       );
-
-      expect(warningResult.success).toBe(true);
-      expect(warningResult.warning).toContain("could not be confirmed");
+      if (!mismatchPlan.executable) throw new Error("Expected an apply plan");
+      // Simulate a persisted representation different from the requested value.
+      // This survives worker IPC, unlike replacing the host driver's checker.
+      const mismatchParams = mismatchPlan.plan.operations[0].params;
+      if (!mismatchParams) throw new Error("Expected bound UPDATE values");
+      mismatchParams[0] = "21.00";
+      const warningResult = await executePreparedApplyPlan(
+        mismatchManager,
+        mismatchPlan.plan,
+      );
+      expect(warningResult.success).toBe(false);
+      expect(warningResult.warning).toBeUndefined();
       expect(warningResult.rowOutcomes?.[0]?.status).toBe(
         "verification_failed",
       );
+      const verificationRollback = await harness.driver.query(
+        `SELECT ${harness.driver.quoteIdentifier(balanceColumn.name)} AS balance FROM ${harness.driver.qualifiedTableName(harness.databaseName, harness.schemaName, tableName)} WHERE ${harness.driver.quoteIdentifier(idColumn.name)} = ${warningId}`,
+      );
+      expect(
+        Number(
+          caseInsensitiveValue(
+            rowsFromQuery(verificationRollback)[0],
+            "balance",
+          ),
+        ),
+      ).toBe(10);
 
       await harness.driver.query(
         `DELETE FROM ${harness.driver.qualifiedTableName(

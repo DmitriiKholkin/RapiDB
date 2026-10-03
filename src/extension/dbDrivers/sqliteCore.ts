@@ -7,6 +7,10 @@ import {
   type DriverTimeoutSettingsProvider,
   throwIfTransactionCancelled,
 } from "./timeout";
+import {
+  TransactionIdentityStore,
+  verifyTransaction,
+} from "./transactionVerification";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -1334,16 +1338,43 @@ export class SQLiteCoreDriver extends BaseDBDriver {
   async runTransaction(
     operations: import("./types").TransactionOperation[],
     context?: import("./types").TransactionContext,
+    scope?: import("./types").TransactionOptions,
   ): Promise<void> {
     throwIfTransactionCancelled(context);
     const db = this.requireDb();
     db.exec("BEGIN TRANSACTION");
     try {
-      for (const op of operations) {
+      const identities = new TransactionIdentityStore();
+      for (const [index, op] of operations.entries()) {
         throwIfTransactionCancelled(context);
-        const info = db.run(op.sql, op.params ?? []);
-        assertTransactionAffectedRows(op, info.changes);
+        const returning =
+          op.captureIdentity && !op.captureIdentity.sql
+            ? this._executeSingle(op.sql, op.params ?? [], Date.now(), 2)
+            : undefined;
+        const affected = returning
+          ? (returning.affectedRows ?? returning.rowCount)
+          : db.run(op.sql, op.params ?? []).changes;
+        assertTransactionAffectedRows(op, affected);
+        await identities.capture(
+          index,
+          op,
+          returning?.rows ?? [],
+          async (sql, params) =>
+            this._executeSingle(sql, params, Date.now(), 2).rows,
+        );
       }
+      await verifyTransaction(
+        this,
+        identities.resolve(scope?.verifications),
+        async (verification) =>
+          this._executeSingle(
+            verification.sql,
+            verification.params,
+            Date.now(),
+            2,
+          ).rows,
+        context,
+      );
       throwIfTransactionCancelled(context);
       db.exec("COMMIT");
     } catch (e) {

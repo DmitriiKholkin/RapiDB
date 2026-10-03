@@ -19,6 +19,10 @@ import {
   type DriverTimeoutSettingsProvider,
   throwIfTransactionCancelled,
 } from "./timeout";
+import {
+  TransactionIdentityStore,
+  verifyTransaction,
+} from "./transactionVerification";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -2193,6 +2197,7 @@ export class OracleDriver extends BaseDBDriver {
   async runTransaction(
     operations: import("./types").TransactionOperation[],
     context?: import("./types").TransactionContext,
+    scope?: import("./types").TransactionOptions,
   ): Promise<void> {
     throwIfTransactionCancelled(context);
     const conn = await this.getConnection();
@@ -2201,7 +2206,8 @@ export class OracleDriver extends BaseDBDriver {
     };
     context?.signal.addEventListener("abort", cancel, { once: true });
     try {
-      for (const op of operations) {
+      const identities = new TransactionIdentityStore();
+      for (const [index, op] of operations.entries()) {
         throwIfTransactionCancelled(context);
         let finalSql = op.sql;
         let binds: Record<string, unknown> | unknown[] = {};
@@ -2209,6 +2215,17 @@ export class OracleDriver extends BaseDBDriver {
           const replaced = replacePositionalParams(op.sql, op.params);
           finalSql = replaced.sql;
           binds = replaced.binds;
+        }
+        const outTypes = op.captureIdentity?.oracleOutTypes;
+        if (outTypes) {
+          binds = [
+            ...(Array.isArray(binds) ? binds : []),
+            ...outTypes.map((type) => ({
+              dir: oracledb.BIND_OUT,
+              type: type === "buffer" ? oracledb.BUFFER : oracledb.STRING,
+              maxSize: 32767,
+            })),
+          ];
         }
         const res = await conn.execute(
           finalSql,
@@ -2219,7 +2236,55 @@ export class OracleDriver extends BaseDBDriver {
           },
         );
         assertTransactionAffectedRows(op, res.rowsAffected ?? 0);
+        if (outTypes) {
+          // DML RETURNING with positional binds yields one array per OUT bind.
+          const outputs = res.outBinds as unknown[][] | undefined;
+          const returnedKeys =
+            outputs?.length === outTypes.length &&
+            outputs.every(
+              (values) => Array.isArray(values) && values.length === 1,
+            )
+              ? [
+                  Object.fromEntries(
+                    outputs.map((values, keyIndex) => [
+                      `__col_${keyIndex}`,
+                      values[0],
+                    ]),
+                  ),
+                ]
+              : [];
+          await identities.capture(index, op, returnedKeys, async () => {
+            throw new Error(
+              "Oracle identity must come from RETURNING OUT binds.",
+            );
+          });
+        }
       }
+      await verifyTransaction(
+        this,
+        identities.resolve(scope?.verifications),
+        async (verification) => {
+          // Reuse normal value decoding on this connection; do not lease or commit.
+          const result = await this._execOne(
+            conn,
+            verification.sql,
+            verification.params,
+            Date.now(),
+            2,
+            {
+              get cancelled() {
+                return (
+                  context?.signal.aborted === true ||
+                  (context?.deadline !== undefined &&
+                    Date.now() >= context.deadline)
+                );
+              },
+            },
+          );
+          return result.rows;
+        },
+        context,
+      );
       throwIfTransactionCancelled(context);
       await conn.commit();
     } catch (e) {

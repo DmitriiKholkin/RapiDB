@@ -27,7 +27,7 @@ export const extensionConfig = {
   ...baseConfig,
   entryPoints: ["src/extension/extension.ts"],
   outfile: "dist/extension.js",
-  external: ["vscode", "oracledb", "better-sqlite3"],
+  external: ["vscode", "oracledb", "better-sqlite3", "ssh2"],
   format: "cjs",
   platform: "node",
   target: "node20",

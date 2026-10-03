@@ -9,6 +9,7 @@ import type {
   SQLiteWorkerResponse,
 } from "./sqliteWorkerProtocol";
 import { DriverTimeoutError } from "./timeout";
+import { TransactionVerificationError } from "./transactionVerification";
 
 interface Pending {
   request: SQLiteWorkerRequest;
@@ -217,9 +218,13 @@ export class SQLiteWorkerClient {
       this.finish(
         current,
         response.error
-          ? Object.assign(new Error(response.error.message), {
-              name: response.error.name,
-            })
+          ? response.error.verificationFailure
+            ? new TransactionVerificationError(
+                response.error.verificationFailure,
+              )
+            : Object.assign(new Error(response.error.message), {
+                name: response.error.name,
+              })
           : undefined,
         response.value,
       );

@@ -34,10 +34,13 @@ import {
   type DriverTimeoutSettingsProvider,
   throwIfTransactionCancelled,
 } from "./timeout";
+import {
+  TransactionIdentityStore,
+  verifyTransaction,
+} from "./transactionVerification";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
-  DatabaseExecutionScope,
   DatabaseInfo,
   DriverEntityManifest,
   FilterConditionResult,
@@ -1800,7 +1803,7 @@ export class PostgresDriver extends BaseDBDriver {
   async runTransaction(
     operations: import("./types").TransactionOperation[],
     context?: import("./types").TransactionContext,
-    scope?: DatabaseExecutionScope,
+    scope?: import("./types").TransactionOptions,
   ): Promise<void> {
     throwIfTransactionCancelled(context);
     const client = await this.requirePool(scope?.database).connect();
@@ -1812,11 +1815,45 @@ export class PostgresDriver extends BaseDBDriver {
     try {
       throwIfTransactionCancelled(context);
       await client.query("BEGIN");
-      for (const op of operations) {
+      const identities = new TransactionIdentityStore();
+      for (const [index, op] of operations.entries()) {
         throwIfTransactionCancelled(context);
         const res = await client.query(op.sql, op.params ?? []);
         assertTransactionAffectedRows(op, res.rowCount ?? 0);
+        await identities.capture(
+          index,
+          op,
+          res.rows,
+          async (sql, params) => (await client.query(sql, params)).rows,
+        );
       }
+      await verifyTransaction(
+        this,
+        identities.resolve(scope?.verifications),
+        async (verification) => {
+          const result = await client.query(
+            verification.sql,
+            verification.params,
+          );
+          return result.rows.map((row) =>
+            Object.fromEntries(
+              verification.values.map((_, index) => {
+                const value = row[`__col_${index}`];
+                return [
+                  `__col_${index}`,
+                  value !== null &&
+                  typeof value === "object" &&
+                  !(value instanceof Date) &&
+                  isPointValue(value)
+                    ? `(${String(value.x)}, ${String(value.y)})`
+                    : value,
+                ];
+              }),
+            ),
+          );
+        },
+        context,
+      );
       throwIfTransactionCancelled(context);
       await client.query("COMMIT");
     } catch (e) {

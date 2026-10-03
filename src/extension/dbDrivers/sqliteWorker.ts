@@ -4,6 +4,7 @@ import {
   type SQLiteWorkerRequest,
   type SQLiteWorkerResponse,
 } from "./sqliteWorkerProtocol";
+import { TransactionVerificationError } from "./transactionVerification";
 
 let driver: SQLiteCoreDriver | undefined;
 // Defense in depth: even a caller bypassing the host queue cannot interleave
@@ -51,6 +52,9 @@ process.on("message", (request: SQLiteWorkerRequest) => {
         response.error = {
           message: error instanceof Error ? error.message : String(error),
           name: error instanceof Error ? error.name : "Error",
+          ...(error instanceof TransactionVerificationError
+            ? { verificationFailure: error.verificationFailure }
+            : {}),
         };
       }
       if (process.connected) process.send?.(response);

@@ -773,7 +773,8 @@
     "jsdom": "29.1.1",
     "tsx": "4.22.3",
     "typescript": "6.0.3",
-    "vitest": "4.1.11"
+    "vitest": "4.1.11",
+    "yaml": "2.9.0"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "3.1057.0",

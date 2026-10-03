@@ -1,4 +1,5 @@
-import { isIPv6 } from "node:net";
+import { isIP, isIPv6 } from "node:net";
+import { checkServerIdentity } from "node:tls";
 import vm from "node:vm";
 import {
   Binary,
@@ -1091,6 +1092,10 @@ export class MongoDBDriver implements IDBDriver {
     }
     const uri = this.config.connectionUri ?? this.config.uri ?? this.buildUri();
     const tlsSettings = resolveConnectionTlsSettings(this.config);
+    const tlsHostname = tlsSettings?.servername?.replace(/^\[|\]$/g, "");
+    // SNI is for DNS names only. For an original IP behind an SSH forward,
+    // verify its IP SAN rather than the local socket address (without IP SNI).
+    const tlsIpIdentity = tlsHostname && isIP(tlsHostname) !== 0;
     this.client = new MongoClient(uri, {
       tls: tlsSettings !== undefined,
       tlsAllowInvalidCertificates:
@@ -1100,7 +1105,12 @@ export class MongoDBDriver implements IDBDriver {
       cert: tlsSettings?.cert,
       key: tlsSettings?.key,
       passphrase: tlsSettings?.passphrase,
-      servername: tlsSettings?.servername,
+      servername: tlsIpIdentity ? undefined : tlsHostname,
+      checkServerIdentity:
+        tlsIpIdentity && !tlsSettings?.skipHostnameVerification
+          ? (_hostname, certificate) =>
+              checkServerIdentity(tlsHostname, certificate)
+          : tlsSettings?.checkServerIdentity,
       authSource: this.config.authSource,
       replicaSet: this.config.replicaSet,
       directConnection: this.config.directConnection,

@@ -9,6 +9,7 @@ import type {
   QueryResult,
   TransactionContext,
   TransactionOperation,
+  TransactionOptions,
 } from "./types";
 
 /** Pure coercion/filter/preview behavior is inherited; all DB work uses IPC. */
@@ -136,10 +137,11 @@ export class SQLiteDriver extends SQLiteCoreDriver {
   override runTransaction(
     operations: TransactionOperation[],
     context?: TransactionContext,
+    scope?: TransactionOptions,
   ): Promise<void> {
     return this.worker.call(
       "runTransaction",
-      [operations],
+      [operations, undefined, scope],
       this.getDbOperationTimeoutMs(),
       undefined,
       context?.signal,

@@ -97,8 +97,6 @@ export interface SshRuntimeDependencies {
   signal?: AbortSignal;
 }
 
-const SSH2_MODULE_NAME = "ssh2";
-
 class SshTransportLifetime {
   private readonly abortController = new AbortController();
   private readonly streams = new Set<Duplex>();
@@ -172,8 +170,11 @@ type TlsClientRequestArgs = http.ClientRequestArgs &
     servername?: string;
   };
 
-function defaultLoadSsh2(): Promise<Ssh2ModuleLike> {
-  return import(SSH2_MODULE_NAME) as Promise<Ssh2ModuleLike>;
+async function defaultLoadSsh2(): Promise<Ssh2ModuleLike> {
+  // Keep lazy CommonJS resolution relative to the installed extension. ssh2
+  // and its JS dependencies are included in the VSIX, not bundled with native
+  // optional modules from the build host.
+  return require("ssh2") as Ssh2ModuleLike;
 }
 
 function normalizeFingerprint(value: string): string {

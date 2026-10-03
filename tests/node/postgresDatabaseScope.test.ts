@@ -113,6 +113,15 @@ vi.mock("pg", async (importOriginal) => {
           return { rows: [{ schema_name: database }] };
         if (sql.includes("information_schema.tables"))
           return { rows: [{ name: database, type: "BASE TABLE" }] };
+        if (typeof input === "string" && /^INSERT .* RETURNING/.test(sql))
+          return { rows: [{ __col_0: params[0] }], rowCount: 1 };
+        if (typeof input === "string" && /^SELECT "id" AS "__col_0"/.test(sql))
+          return {
+            rows: [{ __col_0: params[0], __col_1: "22.5", __col_2: database }],
+            rowCount: 1,
+          };
+        if (typeof input === "string" && /^SELECT .* AS "__col_0"/.test(sql))
+          return { rows: [{ __col_0: "22.5" }], rowCount: 1 };
         if (typeof input === "string") return { rows: [], rowCount: 1 };
         if (/^SELECT COUNT/.test(sql))
           return { fields: [{ name: "cnt" }], rows: [[2]], rowCount: 1 };

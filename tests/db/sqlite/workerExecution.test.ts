@@ -75,6 +75,51 @@ afterEach(async () => {
 });
 
 describe("SQLite off-host execution", () => {
+  it.each([
+    "timeout",
+    "abort",
+  ] as const)("rolls back DML when verification read-back is interrupted by %s", async (mode) => {
+    const driver = await createDriver();
+    await driver.connect();
+    await driver.query(
+      "CREATE TABLE verification (id INTEGER PRIMARY KEY, amount INTEGER); INSERT INTO verification VALUES (1, 0)",
+    );
+    const columns = await driver.describeColumns("", "main", "verification");
+    const amount = columns.find((column) => column.name === "amount");
+    if (!amount) throw new Error("Expected amount column");
+    const controller = new AbortController();
+    const pending = driver.runTransaction(
+      [
+        {
+          sql: "UPDATE verification SET amount = 9 WHERE id = 1",
+          expectedAffectedRows: 1,
+        },
+      ],
+      { signal: controller.signal, deadline: Date.now() + 10000 },
+      {
+        verifications: [
+          {
+            rowIndex: 0,
+            sql: CPU_SUM,
+            params: [],
+            values: [{ column: amount, expectedValue: 9 }],
+          },
+        ],
+      },
+    );
+    const rejected = expect(pending).rejects.toThrow(
+      mode === "timeout" ? /timed out.*rolled back/ : /cancelled.*rolled back/,
+    );
+    if (mode === "abort") {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      controller.abort();
+    }
+    await rejected;
+    expect(driver.isConnected()).toBe(false);
+    await driver.connect();
+    expect(await value(driver, "SELECT amount FROM verification")).toBe(0);
+  });
+
   it("keeps host timers responsive during a real CPU SELECT and enforces its deadline", async () => {
     const driver = await createDriver();
     await driver.connect();
