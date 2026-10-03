@@ -358,7 +358,12 @@ function canonicalizeMssqlTemporalPersistedEditValue(
       baseType === "smalldatetime" ||
       baseType === "datetimeoffset"
     ) {
-      return normalizeDatetimeLiteral(value).replace("T", " ");
+      const normalized = normalizeDatetimeLiteral(value);
+      const wallClock =
+        baseType === "datetimeoffset"
+          ? normalized
+          : normalized.replace(/(?:Z|[+-]\d{2}(?::?\d{2})?)$/i, "");
+      return wallClock.replace("T", " ");
     }
     return value;
   }

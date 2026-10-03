@@ -182,4 +182,19 @@ describe("MSSQL temporal year padding", () => {
 
     expect(check).toEqual({ ok: true, shouldVerify: true });
   });
+
+  it("compares datetime2 values by wall clock when the input includes a timezone", () => {
+    const driver = makeDriver();
+    const datetime2Column = column("col_datetime2", "datetime2(3)", "datetime");
+
+    const check = driver.checkPersistedEdit(
+      datetime2Column,
+      "2026-04-21T12:00:00.000Z",
+      {
+        persistedValue: "2026-04-21 12:00:00.000",
+      },
+    );
+
+    expect(check).toEqual({ ok: true, shouldVerify: true });
+  });
 });

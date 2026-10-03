@@ -8,6 +8,7 @@ import {
   Code,
   DBRef,
   Decimal128,
+  type FindOptions,
   Int32,
   Long,
   MaxKey,
@@ -110,7 +111,7 @@ const DISPLAY_DATETIME_RE =
 const TIMESTAMP_LITERAL_RE = /^Timestamp\((\d+),\s*(\d+)\)$/i;
 
 const MONGODB_READ_ONLY_QUERY_REASON =
-  "[RapiDB] Read-only MongoDB connections allow only find, findOne, countDocuments, and aggregate queries without $out or $merge (read-only cursor modifiers only).";
+  "[RapiDB] Read-only MongoDB connections allow only find, findOne, countDocuments, getCollectionNames, and aggregate queries without $out or $merge (read-only cursor modifiers only).";
 const MONGODB_QUERY_HARD_CAP = QUERY_LIMIT_POLICY.hardCap;
 const MONGOSH_VM_TIMEOUT_MS = 5000;
 const MONGODB_UNSUPPORTED_METADATA =
@@ -315,6 +316,9 @@ const MONGOSH_SANDBOX_SETUP = `
         const operation = { dbName, op: 'runCommand', args: [cmd], chainOps: [] };
         operations.push(operation);
         return createChainProxy(operation);
+      };
+      if (prop === 'getCollectionNames') return (...args) => {
+        operations.push({ dbName, op: 'getCollectionNames', args, chainOps: [] });
       };
       if (prop === 'createCollection' || prop === 'createView') return (...args) => {
         operations.push({ dbName, op: prop, args, chainOps: [] });
@@ -541,6 +545,7 @@ function isReadOnlyMongoOperation(operation: MongoshOperation): boolean {
     case "find":
     case "findOne":
     case "countDocuments":
+    case "getCollectionNames":
       return true;
     case "aggregate":
       return (
@@ -1394,6 +1399,23 @@ export class MongoDBDriver implements IDBDriver {
           : 0;
 
       const dbHandlers: Record<string, () => Promise<QueryResult>> = {
+        getCollectionNames: async () => {
+          if (opArgs.length > 0) {
+            throw new Error(
+              "db.getCollectionNames() does not accept arguments.",
+            );
+          }
+          const collections = await this.requireDb(dbName)
+            .listCollections(
+              {},
+              { authorizedCollections: true, nameOnly: true },
+            )
+            .toArray();
+          return this.buildMongoDocumentRowsQueryResult(
+            collections.map((collection) => ({ name: collection.name })),
+            startedAt,
+          );
+        },
         runCommand: async () => {
           const cmd = this.normalizeFilterCriteria(
             opArgs[0] as Record<string, unknown>,
@@ -1454,15 +1476,39 @@ export class MongoDBDriver implements IDBDriver {
         this.normalizeFilterCriteria(
           (opArgs[index] as Record<string, unknown>) ?? {},
         );
-      const findDocuments = async (limitValue: number) =>
-        mongoCollection
-          .find(normalizeCriteria(), {
-            promoteValues: false,
-            bsonRegExp: false,
-          })
-          .skip(skip)
-          .limit(limitValue)
-          .toArray();
+      const findDocuments = async (limitValue: number) => {
+        const projectionArg = opArgs[1];
+        if (
+          projectionArg !== undefined &&
+          projectionArg !== null &&
+          (typeof projectionArg !== "object" || Array.isArray(projectionArg))
+        ) {
+          throw new Error("MongoDB find projection must be an object.");
+        }
+        const projection = projectionArg
+          ? this.normalizeCriteria(projectionArg as Record<string, unknown>)
+          : undefined;
+        const findOptions: FindOptions = {
+          promoteValues: false,
+          bsonRegExp: false,
+          ...(projection !== undefined ? { projection } : {}),
+        };
+        let cursor = mongoCollection.find(normalizeCriteria(), findOptions);
+        for (const chain of chainOps) {
+          if (chain.op === "sort") {
+            const sort = chain.args[0];
+            if (
+              sort === null ||
+              typeof sort !== "object" ||
+              Array.isArray(sort)
+            ) {
+              throw new Error("MongoDB find().sort() expects an object.");
+            }
+            cursor = cursor.sort(sort as NonNullable<FindOptions["sort"]>);
+          }
+        }
+        return cursor.skip(skip).limit(limitValue).toArray();
+      };
       const runUpdate = async (single: boolean) => {
         const update = opArgs[1] as Record<string, unknown>;
         return single

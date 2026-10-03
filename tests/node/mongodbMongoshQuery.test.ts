@@ -29,8 +29,9 @@ function createMockDriver() {
   const mockToArray = vi
     .fn()
     .mockResolvedValue([{ _id: "abc", name: "Alice" }]);
+  const mockSort = vi.fn().mockReturnThis();
   const mockFind = vi.fn().mockReturnValue({
-    sort: vi.fn().mockReturnThis(),
+    sort: mockSort,
     limit: vi.fn().mockReturnThis(),
     skip: vi.fn().mockReturnThis(),
     toArray: mockToArray,
@@ -59,6 +60,11 @@ function createMockDriver() {
   const mockCommand = vi.fn().mockResolvedValue({ ok: 1 });
   const mockCreateCollection = vi.fn().mockResolvedValue({});
   const mockCreateIndex = vi.fn().mockResolvedValue("users_by_email");
+  const mockListCollections = vi.fn().mockReturnValue({
+    toArray: vi
+      .fn()
+      .mockResolvedValue([{ name: "users" }, { name: "sales_view" }]),
+  });
 
   const mockCollection = {
     find: mockFind,
@@ -77,6 +83,7 @@ function createMockDriver() {
     collection: vi.fn().mockReturnValue(mockCollection),
     command: mockCommand,
     createCollection: mockCreateCollection,
+    listCollections: mockListCollections,
   };
 
   (driver as unknown as { client: unknown; connected: boolean }).client = {
@@ -89,6 +96,7 @@ function createMockDriver() {
     mockDb,
     mockCollection,
     mockFind,
+    mockSort,
     mockToArray,
     mockInsertOne,
     mockInsertMany,
@@ -101,6 +109,7 @@ function createMockDriver() {
     mockCommand,
     mockCreateCollection,
     mockCreateIndex,
+    mockListCollections,
   };
 }
 
@@ -190,6 +199,58 @@ describe("MongoDBDriver — mongosh query()", () => {
       { name: "Alice" },
       { promoteValues: false, bsonRegExp: false },
     );
+  });
+
+  it("applies the find projection and sort cursor modifier", async () => {
+    const { driver, mockFind, mockSort, mockToArray } = createMockDriver();
+    mockToArray.mockResolvedValue([{ name: "Alice" }]);
+
+    const result = await driver.query(
+      "db.users.find({ active: true }, { name: 1, _id: 0 }).sort({ score: -1 })",
+    );
+
+    expect(mockFind).toHaveBeenCalledWith(
+      { active: true },
+      {
+        projection: { name: 1, _id: 0 },
+        promoteValues: false,
+        bsonRegExp: false,
+      },
+    );
+    expect(mockSort).toHaveBeenCalledWith({ score: -1 });
+    expect(result.columns).toEqual(["name"]);
+    expect(result.rows[0]?.__col_0).toBe("Alice");
+  });
+
+  it.each([
+    ["find", "null"],
+    ["find", "undefined"],
+    ["findOne", "null"],
+    ["findOne", "undefined"],
+  ])("treats %s({}, %s) as having no projection", async (method, projection) => {
+    const { driver, mockFind } = createMockDriver();
+
+    const result = await driver.query(`db.users.${method}({}, ${projection})`);
+
+    expect(mockFind).toHaveBeenCalledWith(
+      {},
+      { promoteValues: false, bsonRegExp: false },
+    );
+    expect(result.rowCount).toBe(1);
+  });
+
+  it.each([
+    '"name"',
+    "1",
+    "true",
+    "[]",
+  ])("rejects the invalid find projection %s", async (projection) => {
+    const { driver, mockFind } = createMockDriver();
+
+    await expect(
+      driver.query(`db.users.find({}, ${projection})`),
+    ).rejects.toThrow("MongoDB find projection must be an object.");
+    expect(mockFind).not.toHaveBeenCalled();
   });
 
   it("executes findOne", async () => {
@@ -498,6 +559,25 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
     const result = await driver.query("db.runCommand({ ping: 1 })");
     expect(mockCommand).toHaveBeenCalledWith({ ping: 1 });
     expect(result.rowCount).toBe(1);
+  });
+
+  it("executes db.getCollectionNames", async () => {
+    const { driver, mockDb, mockListCollections } = createMockDriver();
+
+    const result = await driver.query(
+      'db.getSiblingDB("otherdb").getCollectionNames()',
+    );
+
+    expect(mockDb.listCollections).toHaveBeenCalledWith(
+      {},
+      { authorizedCollections: true, nameOnly: true },
+    );
+    expect(mockListCollections).toHaveBeenCalledTimes(1);
+    expect(result.columns).toEqual(["name"]);
+    expect(result.rows.map((row) => row.__col_0)).toEqual([
+      "users",
+      "sales_view",
+    ]);
   });
 
   it("executes createCollection", async () => {

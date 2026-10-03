@@ -200,6 +200,7 @@ describe("readonly query guards", () => {
     expect(guard("db.users.find({ active: true })")).toEqual({
       allowed: true,
     });
+    expect(guard("db.getCollectionNames()")).toEqual({ allowed: true });
     expect(
       guard(
         'db.users.aggregate([{ $match: { active: true } }, { $out: "archive" }])',
@@ -207,12 +208,12 @@ describe("readonly query guards", () => {
     ).toEqual({
       allowed: false,
       reason:
-        "[RapiDB] Read-only MongoDB connections allow only find, findOne, countDocuments, and aggregate queries without $out or $merge (read-only cursor modifiers only).",
+        "[RapiDB] Read-only MongoDB connections allow only find, findOne, countDocuments, getCollectionNames, and aggregate queries without $out or $merge (read-only cursor modifiers only).",
     });
     expect(guard("db.users.deleteMany({ active: false })")).toEqual({
       allowed: false,
       reason:
-        "[RapiDB] Read-only MongoDB connections allow only find, findOne, countDocuments, and aggregate queries without $out or $merge (read-only cursor modifiers only).",
+        "[RapiDB] Read-only MongoDB connections allow only find, findOne, countDocuments, getCollectionNames, and aggregate queries without $out or $merge (read-only cursor modifiers only).",
     });
   });
 
