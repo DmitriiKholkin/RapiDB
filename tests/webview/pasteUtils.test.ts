@@ -197,6 +197,25 @@ describe("TSV clipboard format", () => {
     ]);
   });
 
+  it("keeps empty bytes, empty text, and NULL distinct through clipboard TSV", () => {
+    const payload = serializeTsv([["0x", "", "NULL"]]);
+    expect(payload).toBe('0x\t""\tNULL');
+    const [emptyBytes, emptyText, nullText] = parseTsv(payload).rows[0];
+    const binary = makeColumn({ name: "payload", category: "binary" });
+    expect(validatePasteValue(emptyBytes, binary)).toEqual({
+      valid: true,
+      coercedValue: "0x",
+    });
+    expect(validatePasteValue(emptyText, binary)).toEqual({
+      valid: true,
+      coercedValue: "",
+    });
+    expect(validatePasteValue(nullText, binary)).toEqual({
+      valid: true,
+      coercedValue: null,
+    });
+  });
+
   it("round-trips cells containing all TSV control characters", () => {
     const rows = [
       ["", " ", "plain", "left\tright"],
@@ -406,6 +425,7 @@ describe("validatePasteData — bulk paste with money literals", () => {
       0,
       [MONEY_COLUMN_PG, NUMERIC_COLUMN],
       10,
+      () => true,
     );
 
     expect(result.errors).toEqual([]);
@@ -428,6 +448,7 @@ describe("validatePasteData — bulk paste with money literals", () => {
       0,
       [MONEY_COLUMN_PG, NUMERIC_COLUMN],
       10,
+      () => true,
     );
 
     const numericErrors = result.errors.filter(
@@ -444,6 +465,7 @@ describe("validatePasteData — bulk paste with money literals", () => {
       0,
       [MONEY_COLUMN_PG],
       10,
+      () => true,
     );
 
     expect(result.errors.length).toBeGreaterThan(0);
@@ -461,7 +483,14 @@ describe("validatePasteData — bulk paste with money literals", () => {
       category: "integer",
       isPrimaryKey: true,
     });
-    const result = validatePasteData({ rows: [["42"]] }, 0, 0, [pkColumn], 10);
+    const result = validatePasteData(
+      { rows: [["42"]] },
+      0,
+      0,
+      [pkColumn],
+      10,
+      () => true,
+    );
 
     expect(result.errors).toHaveLength(1);
     expect(result.errors[0]?.message).toContain(

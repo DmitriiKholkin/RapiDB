@@ -659,4 +659,58 @@ describe("ElasticsearchDriver — metadata and pages", () => {
     );
     expect(update).not.toHaveBeenCalled();
   });
+
+  it("reports per-document results for partial Elasticsearch updates", async () => {
+    const { driver, update } = createDriver();
+    update
+      .mockResolvedValueOnce({ result: "updated" })
+      .mockResolvedValueOnce({ result: "noop" });
+
+    await expect(
+      driver.updateRows({
+        database: "default",
+        schema: "indices",
+        table: "users",
+        updates: [
+          { primaryKeys: { _id: "doc-1" }, changes: { active: false } },
+          { primaryKeys: { _id: "doc-2" }, changes: { active: false } },
+        ],
+      }),
+    ).resolves.toEqual({
+      affectedRows: 1,
+      updateRowOutcomes: [
+        { rowIndex: 0, status: "applied" },
+        { rowIndex: 1, status: "not_applied" },
+      ],
+    });
+  });
+
+  it("retains successful Elasticsearch documents when a later update errors", async () => {
+    const { driver, update } = createDriver();
+    update
+      .mockResolvedValueOnce({ result: "updated" })
+      .mockRejectedValueOnce(new Error("Connection lost"));
+
+    await expect(
+      driver.updateRows({
+        database: "default",
+        schema: "indices",
+        table: "users",
+        updates: [
+          { primaryKeys: { _id: "doc-1" }, changes: { active: false } },
+          { primaryKeys: { _id: "doc-2" }, changes: { active: false } },
+          { primaryKeys: { _id: "doc-3" }, changes: { active: false } },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      result: {
+        affectedRows: 1,
+        updateRowOutcomes: [
+          { rowIndex: 0, status: "applied" },
+          { rowIndex: 1, status: "unknown" },
+          { rowIndex: 2, status: "not_applied" },
+        ],
+      },
+    });
+  });
 });

@@ -134,6 +134,7 @@ function platformShortcutLabel(): string {
 
 interface TableMutationStatusBarProps {
   schemaBlocked?: boolean;
+  reconciliationPending?: boolean;
   applyStatus: TableApplyStatus | null;
   applying: boolean;
   loading: boolean;
@@ -142,6 +143,8 @@ interface TableMutationStatusBarProps {
   newRowExists: boolean;
   readOnlyTable: boolean;
   unsavedRowCount: number;
+  unresolvedPendingCount?: number;
+  unresolvedPendingColumns?: readonly string[];
   canUndo?: boolean;
   canRedo?: boolean;
   onApplyChanges: () => void;
@@ -154,6 +157,7 @@ interface TableMutationStatusBarProps {
 
 export function TableMutationStatusBar({
   schemaBlocked = false,
+  reconciliationPending = false,
   applyStatus,
   applying,
   loading,
@@ -162,6 +166,8 @@ export function TableMutationStatusBar({
   newRowExists,
   readOnlyTable,
   unsavedRowCount,
+  unresolvedPendingCount = 0,
+  unresolvedPendingColumns = [],
   canUndo = false,
   canRedo = false,
   onApplyChanges,
@@ -179,6 +185,20 @@ export function TableMutationStatusBar({
 
   return (
     <>
+      {unresolvedPendingCount > 0 && (
+        <div
+          role="alert"
+          style={{ ...bannerLayoutStyle, ...warningBannerToneStyle }}
+        >
+          <Icon name="warning" size={13} style={{ flexShrink: 0 }} />
+          <span>
+            {`Unable to match ${unresolvedPendingCount} row${unresolvedPendingCount === 1 ? "" : "s"} of unverified changes safely after refresh. The edits are preserved but not attached to a displayed row; Apply Changes is blocked. Refresh to check again or use Revert All to discard them.`}
+            {unresolvedPendingColumns.length > 0 && (
+              <> Changed fields: {unresolvedPendingColumns.join(", ")}.</>
+            )}
+          </span>
+        </div>
+      )}
       {(unsavedRowCount > 0 || canUndo || canRedo || applyStatus) && (
         <div
           style={{
@@ -206,12 +226,16 @@ export function TableMutationStatusBar({
                   type="button"
                   aria-label="Undo"
                   title={`Undo (${shortcut}Z)`}
-                  disabled={!canUndo || applying || loading}
+                  disabled={
+                    !canUndo || applying || loading || reconciliationPending
+                  }
                   style={{
                     background: "none",
                     border: "none",
                     cursor:
-                      canUndo && !applying && !loading ? "pointer" : "default",
+                      canUndo && !applying && !loading && !reconciliationPending
+                        ? "pointer"
+                        : "default",
                     color: canUndo
                       ? "var(--vscode-editorWarning-foreground, #cca700)"
                       : "var(--vscode-descriptionForeground, #888)",
@@ -228,12 +252,16 @@ export function TableMutationStatusBar({
                   type="button"
                   aria-label="Redo"
                   title={`Redo (${shortcut}Shift+Z)`}
-                  disabled={!canRedo || applying || loading}
+                  disabled={
+                    !canRedo || applying || loading || reconciliationPending
+                  }
                   style={{
                     background: "none",
                     border: "none",
                     cursor:
-                      canRedo && !applying && !loading ? "pointer" : "default",
+                      canRedo && !applying && !loading && !reconciliationPending
+                        ? "pointer"
+                        : "default",
                     color: canRedo
                       ? "var(--vscode-editorWarning-foreground, #cca700)"
                       : "var(--vscode-descriptionForeground, #888)",

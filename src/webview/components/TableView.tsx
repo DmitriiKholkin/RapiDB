@@ -25,6 +25,7 @@ interface Props {
   database: string;
   schema: string;
   table: string;
+  displayTableName?: string;
   isView?: boolean;
   connectionReadOnly?: boolean;
   mongoRowIdentity?: boolean;
@@ -43,6 +44,7 @@ function resolveTableExportMessageType(format: ExportFormat) {
 
 export function TableView({
   table,
+  displayTableName = table,
   isView = false,
   connectionReadOnly = false,
   mongoRowIdentity = false,
@@ -168,7 +170,15 @@ export function TableView({
   }, [data.rows]);
 
   const totalPages = Math.max(1, Math.ceil(data.totalCount / data.pageSize));
-  const pendingCount = mutation.pendingEdits.size;
+  const unresolvedPendingCount = mutation.unresolvedPendingEdits.length;
+  const unresolvedPendingColumns = [
+    ...new Set(
+      mutation.unresolvedPendingEdits.flatMap((entry) => [
+        ...entry.changes.keys(),
+      ]),
+    ),
+  ];
+  const pendingCount = mutation.pendingEdits.size + unresolvedPendingCount;
   const unsavedRowCount = pendingCount + mutation.newRows.length;
   const insertValueCount = mutation.newRows.reduce(
     (sum, row) =>
@@ -184,7 +194,8 @@ export function TableView({
     data.isInitialized &&
     !hasPrimaryKey;
   const mutationBusy = data.loading || mutation.applying || mutation.deleting;
-  const canLoadDifferentRows = unsavedRowCount === 0 && !mutationBusy;
+  const canLoadDifferentRows =
+    unsavedRowCount === 0 && !mutationBusy && !mutation.reconciliationRequired;
   const guardRowNavigation = (action: () => void) => {
     if (data.loadingRef.current) return;
     if (!canLoadDifferentRows) {
@@ -216,7 +227,7 @@ export function TableView({
   if (!data.hasCommittedData) {
     return (
       <main
-        aria-label={`Table data for ${table}`}
+        aria-label={`Table data for ${displayTableName}`}
         aria-busy="true"
         style={{
           display: "flex",
@@ -233,7 +244,7 @@ export function TableView({
 
   return (
     <main
-      aria-label={`Table data for ${table}`}
+      aria-label={`Table data for ${displayTableName}`}
       aria-busy={showRefetchOverlay}
       style={{
         display: "flex",
@@ -268,7 +279,9 @@ export function TableView({
         executionTimeMs={data.executionTimeMs}
         mutationBusy={mutationBusy}
         schemaBlocked={
-          Boolean(data.schemaWarning) || mutation.deleteReconciliationPending
+          Boolean(data.schemaWarning) ||
+          mutation.reconciliationRequired ||
+          unresolvedPendingCount > 0
         }
         draftRowCount={mutation.newRows.length}
         readOnlyTable={data.readOnlyTable}
@@ -289,16 +302,21 @@ export function TableView({
           });
         }}
         onRefresh={() => {
-          if (!mutation.retryDeleteRefresh())
-            guardRowNavigation(data.fetchPage);
+          if (!mutation.retryReconciliation()) {
+            if (unresolvedPendingCount > 0) data.fetchPage();
+            else guardRowNavigation(data.fetchPage);
+          }
         }}
       />
 
       <TableMutationStatusBar
         applyStatus={mutation.applyStatus}
         schemaBlocked={
-          Boolean(data.schemaWarning) || mutation.deleteReconciliationPending
+          Boolean(data.schemaWarning) ||
+          mutation.reconciliationRequired ||
+          unresolvedPendingCount > 0
         }
+        reconciliationPending={mutation.reconciliationRequired}
         applying={mutation.applying}
         loading={data.loading}
         insertValueCount={insertValueCount}
@@ -306,6 +324,8 @@ export function TableView({
         newRowExists={mutation.newRows.length > 0}
         readOnlyTable={data.readOnlyTable}
         unsavedRowCount={unsavedRowCount}
+        unresolvedPendingCount={unresolvedPendingCount}
+        unresolvedPendingColumns={unresolvedPendingColumns}
         canUndo={mutation.canUndo}
         canRedo={mutation.canRedo}
         onApplyChanges={mutation.applyChanges}
@@ -317,18 +337,22 @@ export function TableView({
       />
 
       <TableGrid
-        key={data.columns.map((column) => column.name).join("|")}
+        key={JSON.stringify(data.columns.map((column) => column.name))}
         columnOrderRef={columnOrderRef}
         hiddenColumnIdsRef={hiddenColumnIdsRef}
         canEditRows={
-          canEditRows && !mutationBusy && !mutation.deleteReconciliationPending
+          canEditRows &&
+          !mutationBusy &&
+          !mutation.reconciliationRequired &&
+          unresolvedPendingCount === 0
         }
         getRowMutationBlockReason={mutation.getRowMutationBlockReason}
         canSelectAndDeleteRows={
           canSelectAndDeleteRows &&
           !mutationBusy &&
           !data.schemaWarning &&
-          !mutation.deleteReconciliationPending
+          !mutation.reconciliationRequired &&
+          unresolvedPendingCount === 0
         }
         colSizes={data.colSizes}
         columns={data.columns}

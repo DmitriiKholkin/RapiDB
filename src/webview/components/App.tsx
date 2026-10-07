@@ -44,6 +44,7 @@ export function App(): ReactElement {
             database={state.database ?? ""}
             schema={state.schema ?? ""}
             table={state.table ?? ""}
+            displayTableName={state.displayTableName}
             isView={state.isView ?? false}
             connectionReadOnly={state.connectionReadOnly ?? false}
             mongoRowIdentity={state.mongoRowIdentity ?? false}

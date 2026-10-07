@@ -5,6 +5,7 @@ import {
   type FilterDraftMap,
   formatColumnDetailDescription,
   formatPrimaryKeyRoleLabel,
+  isServerGeneratedColumn,
   NULL_SENTINEL,
 } from "../../../shared/tableTypes";
 import type { ApplyResultPayload } from "../../../shared/webviewContracts";
@@ -13,11 +14,13 @@ import type {
   InsertDraftRow,
   MutationSnapshot,
   PendingEdits,
+  PendingRestoreEntry,
   Row,
 } from "../../types";
 import { buildButtonStyle } from "../../utils/buttonStyles";
 import { TOOLBAR_H } from "../../utils/layout";
 
+export type { PendingRestoreEntry } from "../../types";
 export { TOOLBAR_H };
 
 export const PAGE_SIZES = [25, 100, 500, 1000] as const;
@@ -56,7 +59,14 @@ export interface FetchSnapshot {
   sort: TableSortState;
 }
 
-type PendingRestoreState = Map<string, Map<string, unknown>>;
+export interface PendingRestoreState {
+  entries: PendingRestoreEntry[];
+}
+
+export interface PendingRestoreResult {
+  pendingEdits: PendingEdits;
+  unresolved: PendingRestoreEntry[];
+}
 
 export function getInitialPageSize(defaultPageSize?: number): number {
   return defaultPageSize !== undefined &&
@@ -73,7 +83,14 @@ export function tableButtonStyle(
 }
 
 export function canEditColumn(column?: ColumnMeta): column is ColumnMeta {
-  return !!column;
+  return !!column && !isServerGeneratedColumn(column);
+}
+
+export function canOpenColumn(
+  column: ColumnMeta | undefined,
+  rowKind: "persisted" | "draft",
+): column is ColumnMeta {
+  return !!column && (rowKind === "persisted" || canEditColumn(column));
 }
 
 export function clonePendingEdits(pendingEdits: PendingEdits): PendingEdits {
@@ -231,38 +248,50 @@ export function buildPendingRestoreState(
   primaryKeyColumns: readonly string[],
   mongoIdTypes: readonly ("objectId" | "string" | null)[] = [],
   mongoRowIdentity = false,
+  preservedEntries: readonly PendingRestoreEntry[] = [],
 ): PendingRestoreState {
-  const restoreState: PendingRestoreState = new Map();
+  const entries: PendingRestoreEntry[] = [];
 
   for (const [rowIdx, columnMap] of pendingEdits.entries()) {
+    const row = rows[rowIdx];
+    const rowHasMongoIdentity =
+      mongoRowIdentity || mongoIdTypes[rowIdx] !== undefined;
     const signature = rowPrimaryKeySignature(
-      rows[rowIdx],
+      row,
       primaryKeyColumns,
       mongoIdTypes[rowIdx],
-      mongoRowIdentity || mongoIdTypes[rowIdx] !== undefined,
+      rowHasMongoIdentity,
     );
     if (!signature) {
       continue;
     }
 
-    restoreState.set(signature, new Map(columnMap));
+    entries.push({
+      originalSignature: signature,
+      changes: new Map(columnMap),
+    });
   }
 
-  return restoreState;
+  return {
+    entries: [...entries, ...preservedEntries].map((entry) => ({
+      ...entry,
+      changes: new Map(entry.changes),
+    })),
+  };
 }
 
-export function restorePendingEdits(
+export function restorePendingEditsSafely(
   restoreState: PendingRestoreState | null,
   rows: readonly Row[],
   primaryKeyColumns: readonly string[],
   mongoIdTypes: readonly ("objectId" | "string" | null)[] = [],
   mongoRowIdentity = false,
-): PendingEdits {
-  if (!restoreState || restoreState.size === 0) {
-    return new Map();
+): PendingRestoreResult {
+  if (!restoreState || restoreState.entries.length === 0) {
+    return { pendingEdits: new Map(), unresolved: [] };
   }
 
-  const restored: PendingEdits = new Map();
+  const rowsBySignature = new Map<string, number[]>();
 
   rows.forEach((row, rowIdx) => {
     const signature = rowPrimaryKeySignature(
@@ -275,13 +304,45 @@ export function restorePendingEdits(
       return;
     }
 
-    const columnMap = restoreState.get(signature);
-    if (columnMap) {
-      restored.set(rowIdx, new Map(columnMap));
-    }
+    const indexes = rowsBySignature.get(signature) ?? [];
+    indexes.push(rowIdx);
+    rowsBySignature.set(signature, indexes);
   });
 
-  return restored;
+  const restored: PendingEdits = new Map();
+  const unresolved: PendingRestoreEntry[] = [];
+  const claimedRows = new Set<number>();
+
+  // A proposed PK is not identity evidence, even after a complete snapshot:
+  // another client may have created that key since the original read.
+  for (const entry of restoreState.entries) {
+    const originalMatches = rowsBySignature.get(entry.originalSignature) ?? [];
+    if (originalMatches.length === 1 && !claimedRows.has(originalMatches[0])) {
+      const rowIdx = originalMatches[0];
+      claimedRows.add(rowIdx);
+      restored.set(rowIdx, new Map(entry.changes));
+    } else {
+      unresolved.push(entry);
+    }
+  }
+
+  return { pendingEdits: restored, unresolved };
+}
+
+export function restorePendingEdits(
+  restoreState: PendingRestoreState | null,
+  rows: readonly Row[],
+  primaryKeyColumns: readonly string[],
+  mongoIdTypes: readonly ("objectId" | "string" | null)[] = [],
+  mongoRowIdentity = false,
+): PendingEdits {
+  return restorePendingEditsSafely(
+    restoreState,
+    rows,
+    primaryKeyColumns,
+    mongoIdTypes,
+    mongoRowIdentity,
+  ).pendingEdits;
 }
 
 export function getRetainedPendingEdits(
@@ -328,9 +389,14 @@ export function buildUndoRedoSnapshot(
   pendingEdits: PendingEdits,
   newRows: InsertDraftRow[],
   editCell: EditTarget | null,
-): MutationSnapshot {
+  unresolvedPendingEdits: readonly PendingRestoreEntry[] = [],
+): MutationSnapshot & { unresolvedPendingEdits: PendingRestoreEntry[] } {
   return {
     pendingEdits: clonePendingEdits(pendingEdits),
+    unresolvedPendingEdits: unresolvedPendingEdits.map((entry) => ({
+      ...entry,
+      changes: new Map(entry.changes),
+    })),
     newRows: newRows.map((row) => ({ ...row })),
     editCell,
   };
@@ -338,12 +404,14 @@ export function buildUndoRedoSnapshot(
 
 export function applyUndoRedoSnapshot(snapshot: MutationSnapshot): {
   pendingEdits: PendingEdits;
+  unresolvedPendingEdits: PendingRestoreEntry[];
   newRows: InsertDraftRow[];
   editCell: EditTarget | null;
 } {
-  return {
-    pendingEdits: clonePendingEdits(snapshot.pendingEdits),
-    newRows: snapshot.newRows.map((row) => ({ ...row })),
-    editCell: snapshot.editCell,
-  };
+  return buildUndoRedoSnapshot(
+    snapshot.pendingEdits,
+    snapshot.newRows,
+    snapshot.editCell,
+    snapshot.unresolvedPendingEdits,
+  );
 }

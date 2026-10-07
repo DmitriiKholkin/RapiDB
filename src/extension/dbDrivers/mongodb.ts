@@ -47,6 +47,7 @@ import type {
   DriverOperationContext,
   DriverTablePageRequest,
   DriverTablePageResult,
+  DriverUpdateRowOutcome,
   DriverUpdateRowsRequest,
   FilterExpression,
   FilterOperator,
@@ -61,6 +62,10 @@ import type {
   TypeCategory,
 } from "./types";
 import { NULL_SENTINEL, resolveFilterOperators } from "./types";
+import {
+  completeDriverUpdateRowsResult,
+  failedDriverUpdateRows,
+} from "./updateRowOutcomes";
 
 const MONGODB_ENTITY_MANIFEST: DriverEntityManifest = {
   dbObjectKinds: ["table", "view"],
@@ -626,6 +631,26 @@ function parseMongoDisplayBinData(
   return bytes !== null ? { subtype, bytes } : null;
 }
 
+function coerceMongoBinaryValue(
+  value: string,
+  column: ColumnTypeMeta,
+  strictHex: boolean,
+): Binary | string {
+  // Output may contain literal strings in a sampled binData column. Explicit
+  // hex input, however, must not fall back to a BSON string when malformed.
+  const recognizedHex = isHexLike(value);
+  if (recognizedHex || /^(?:0x|\\x)/i.test(value)) {
+    if (!strictHex && !recognizedHex) return value;
+    return new Binary(parseHexToBuffer(value), binarySubtypeFromColumn(column));
+  }
+  const binDataParsed = parseMongoDisplayBinData(value);
+  if (binDataParsed) {
+    return new Binary(binDataParsed.bytes, binDataParsed.subtype);
+  }
+  const bytes = parseMongoBase64(value);
+  return bytes ? new Binary(bytes, binarySubtypeFromColumn(column)) : value;
+}
+
 function parseMongoDisplayJavascriptWithScope(value: string): Code | null {
   try {
     const parsed = JSON.parse(value) as {
@@ -1088,6 +1113,8 @@ export class MongoDBDriver implements IDBDriver {
   private client: MongoClient | null = null;
   private connected = false;
   private timeoutRecoveryInFlight: Promise<void> | null = null;
+  private connectionEpoch = 0;
+  private connectionAbortController?: AbortController;
 
   constructor(private readonly config: ConnectionConfig) {}
 
@@ -1095,39 +1122,80 @@ export class MongoDBDriver implements IDBDriver {
     if (this.connected) {
       return;
     }
-    const uri = this.config.connectionUri ?? this.config.uri ?? this.buildUri();
-    const tlsSettings = resolveConnectionTlsSettings(this.config);
-    const tlsHostname = tlsSettings?.servername?.replace(/^\[|\]$/g, "");
-    // SNI is for DNS names only. For an original IP behind an SSH forward,
-    // verify its IP SAN rather than the local socket address (without IP SNI).
-    const tlsIpIdentity = tlsHostname && isIP(tlsHostname) !== 0;
-    this.client = new MongoClient(uri, {
-      tls: tlsSettings !== undefined,
-      tlsAllowInvalidCertificates:
-        tlsSettings !== undefined && !tlsSettings.rejectUnauthorized,
-      tlsAllowInvalidHostnames: tlsSettings?.skipHostnameVerification === true,
-      ca: tlsSettings?.ca,
-      cert: tlsSettings?.cert,
-      key: tlsSettings?.key,
-      passphrase: tlsSettings?.passphrase,
-      servername: tlsIpIdentity ? undefined : tlsHostname,
-      checkServerIdentity:
-        tlsIpIdentity && !tlsSettings?.skipHostnameVerification
-          ? (_hostname, certificate) =>
-              checkServerIdentity(tlsHostname, certificate)
-          : tlsSettings?.checkServerIdentity,
-      authSource: this.config.authSource,
-      replicaSet: this.config.replicaSet,
-      directConnection: this.config.directConnection,
-    });
-    await this.client.connect();
-    this.connected = true;
+    const epoch = ++this.connectionEpoch;
+    this.connectionAbortController?.abort();
+    const abortController = new AbortController();
+    this.connectionAbortController = abortController;
+    let client: MongoClient | undefined;
+    try {
+      const uri =
+        this.config.connectionUri ?? this.config.uri ?? this.buildUri();
+      const tlsSettings = await resolveConnectionTlsSettings(
+        this.config,
+        abortController.signal,
+      );
+      this.assertConnectionEpoch(epoch);
+      const tlsHostname = tlsSettings?.servername?.replace(/^\[|\]$/g, "");
+      // SNI is for DNS names only. For an original IP behind an SSH forward,
+      // verify its IP SAN rather than the local socket address (without IP SNI).
+      const tlsIpIdentity = tlsHostname && isIP(tlsHostname) !== 0;
+      this.assertConnectionEpoch(epoch);
+      client = new MongoClient(uri, {
+        tls: tlsSettings !== undefined,
+        tlsAllowInvalidCertificates:
+          tlsSettings !== undefined && !tlsSettings.rejectUnauthorized,
+        tlsAllowInvalidHostnames:
+          tlsSettings?.skipHostnameVerification === true,
+        ca: tlsSettings?.ca,
+        cert: tlsSettings?.cert,
+        key: tlsSettings?.key,
+        passphrase: tlsSettings?.passphrase,
+        servername: tlsIpIdentity ? undefined : tlsHostname,
+        checkServerIdentity:
+          tlsIpIdentity && !tlsSettings?.skipHostnameVerification
+            ? (_hostname, certificate) =>
+                checkServerIdentity(tlsHostname, certificate)
+            : tlsSettings?.checkServerIdentity,
+        authSource: this.config.authSource,
+        replicaSet: this.config.replicaSet,
+        directConnection: this.config.directConnection,
+      });
+      this.client = client;
+      this.assertConnectionEpoch(epoch);
+      await client.connect();
+      this.assertConnectionEpoch(epoch);
+      this.connected = true;
+    } catch (error) {
+      if (this.client === client) {
+        this.client = null;
+        this.connected = false;
+        await client?.close().catch(() => undefined);
+      }
+      throw error;
+    } finally {
+      if (this.connectionAbortController === abortController) {
+        this.connectionAbortController = undefined;
+      }
+    }
+  }
+
+  private assertConnectionEpoch(epoch: number): void {
+    if (epoch !== this.connectionEpoch) {
+      throw new DOMException(
+        "MongoDB connection attempt cancelled",
+        "AbortError",
+      );
+    }
   }
 
   async disconnect(): Promise<void> {
-    await this.client?.close();
+    this.connectionEpoch += 1;
+    this.connectionAbortController?.abort();
+    this.connectionAbortController = undefined;
+    const client = this.client;
     this.client = null;
     this.connected = false;
+    await client?.close();
   }
 
   async recycleConnectionAfterTimeout(_context?: {
@@ -1943,7 +2011,7 @@ export class MongoDBDriver implements IDBDriver {
 
   private buildContainsRegex(value: string): string {
     const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const normalized = escaped.replace(/%/g, ".*").replace(/_/g, ".").trim();
+    const normalized = escaped.trim();
     return normalized.length > 0 ? normalized : ".*";
   }
 
@@ -1966,30 +2034,55 @@ export class MongoDBDriver implements IDBDriver {
       request.table,
     );
     let affectedRows = 0;
-    for (const update of request.updates) {
-      context?.signal.throwIfAborted();
-      if (
-        Object.hasOwn(update.changes, "_id") &&
-        update.changes._id !== update.primaryKeys._id
-      ) {
-        throw new Error("MongoDB does not support updating the _id field.");
+    const updateRowOutcomes: DriverUpdateRowOutcome[] = [];
+    for (const [rowIndex, update] of request.updates.entries()) {
+      let writeMayHaveApplied = false;
+      try {
+        context?.signal.throwIfAborted();
+        if (
+          Object.hasOwn(update.changes, "_id") &&
+          update.changes._id !== update.primaryKeys._id
+        ) {
+          throw new Error("MongoDB does not support updating the _id field.");
+        }
+        const criteria = this.normalizeCriteria({
+          ...update.primaryKeys,
+          ...(update.originalValues ?? {}),
+        });
+        criteria._id = { $eq: update.primaryKeys._id };
+        const options = this.getMutationTimeoutOptions(context);
+        writeMayHaveApplied = true;
+        const result = options
+          ? await collection.updateOne(
+              criteria,
+              { $set: update.changes },
+              options,
+            )
+          : await collection.updateOne(criteria, { $set: update.changes });
+        writeMayHaveApplied = false;
+        const knownMatchCount =
+          result.acknowledged !== false &&
+          Number.isInteger(result.matchedCount) &&
+          (result.matchedCount === 0 || result.matchedCount === 1);
+        const status = !knownMatchCount
+          ? "unknown"
+          : result.matchedCount === 1
+            ? "applied"
+            : "not_applied";
+        if (status === "applied") affectedRows++;
+        updateRowOutcomes.push({ rowIndex, status });
+      } catch (error: unknown) {
+        throw failedDriverUpdateRows(
+          error,
+          request.updates.length,
+          updateRowOutcomes,
+          rowIndex,
+          affectedRows,
+          writeMayHaveApplied,
+        );
       }
-      const criteria = this.normalizeCriteria({
-        ...update.primaryKeys,
-        ...(update.originalValues ?? {}),
-      });
-      criteria._id = { $eq: update.primaryKeys._id };
-      const options = this.getMutationTimeoutOptions(context);
-      const result = options
-        ? await collection.updateOne(
-            criteria,
-            { $set: update.changes },
-            options,
-          )
-        : await collection.updateOne(criteria, { $set: update.changes });
-      affectedRows += result.matchedCount;
     }
-    return { affectedRows };
+    return completeDriverUpdateRowsResult(affectedRows, updateRowOutcomes);
   }
 
   async insertRow(
@@ -2153,6 +2246,17 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   coerceOriginalValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (
+      typeof value === "string" &&
+      value !== NULL_SENTINEL &&
+      /^binData(?:\(\d+\))?$/i.test(column.nativeType)
+    ) {
+      return coerceMongoBinaryValue(
+        unwrapQuotedMongoDisplay(value),
+        column,
+        false,
+      );
+    }
     return column.nativeType === "string"
       ? value
       : this.coerceInputValue(value, column);
@@ -2312,20 +2416,7 @@ export class MongoDBDriver implements IDBDriver {
     }
 
     if (/^binData(?:\(\d+\))?$/i.test(column.nativeType)) {
-      if (isHexLike(normalized)) {
-        return new Binary(
-          parseHexToBuffer(normalized),
-          binarySubtypeFromColumn(column),
-        );
-      }
-      const binDataParsed = parseMongoDisplayBinData(normalized);
-      if (binDataParsed) {
-        return new Binary(binDataParsed.bytes, binDataParsed.subtype);
-      }
-      const bytes = parseMongoBase64(normalized);
-      return bytes
-        ? new Binary(bytes, binarySubtypeFromColumn(column))
-        : normalized;
+      return coerceMongoBinaryValue(normalized, column, true);
     }
 
     if (column.category === "array" || column.category === "json") {
@@ -2341,7 +2432,15 @@ export class MongoDBDriver implements IDBDriver {
 
   formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (typeof value === "string") {
-      const coerced = this.coerceInputValue(value, column);
+      const coerced =
+        value !== NULL_SENTINEL &&
+        /^binData(?:\(\d+\))?$/i.test(column.nativeType)
+          ? coerceMongoBinaryValue(
+              unwrapQuotedMongoDisplay(value),
+              column,
+              false,
+            )
+          : this.coerceInputValue(value, column);
       if (coerced !== value) {
         return formatMongoDisplayValue(coerced);
       }
@@ -2350,10 +2449,28 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   checkPersistedEdit(
-    _column: ColumnTypeMeta,
-    _expectedValue: unknown,
+    column: ColumnTypeMeta,
+    expectedValue: unknown,
     _options?: { persistedValue: unknown },
   ) {
+    if (
+      typeof expectedValue === "string" &&
+      /^binData(?:\(\d+\))?$/i.test(column.nativeType)
+    ) {
+      try {
+        coerceMongoBinaryValue(
+          unwrapQuotedMongoDisplay(expectedValue),
+          column,
+          true,
+        );
+      } catch (error: unknown) {
+        return {
+          ok: false,
+          shouldVerify: false,
+          message: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
     return null;
   }
 

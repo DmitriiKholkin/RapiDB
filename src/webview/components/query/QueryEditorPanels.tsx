@@ -17,6 +17,7 @@ interface QueryEditorPanelsProps {
   sqlDialect?: QueryEditorSqlDialect;
   status: QueryStatus;
   onEditorChange: (value: string) => void;
+  onEditorSelectionChange: () => void;
   onExecute: () => void;
   onStartResizing: (event: React.MouseEvent<HTMLButtonElement>) => void;
 }
@@ -33,6 +34,7 @@ export function QueryEditorPanels({
   sqlDialect,
   status,
   onEditorChange,
+  onEditorSelectionChange,
   onExecute,
   onStartResizing,
 }: QueryEditorPanelsProps): React.ReactElement {
@@ -48,6 +50,7 @@ export function QueryEditorPanels({
           ariaLabel={editorLabel}
           onExecute={onExecute}
           onChange={onEditorChange}
+          onSelectionChange={onEditorSelectionChange}
           height="100%"
         />
       </div>

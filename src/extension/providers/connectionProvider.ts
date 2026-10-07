@@ -34,6 +34,7 @@ import type {
   TableDetailSectionKind,
   TableDetailState,
 } from "../connectionManagerModels";
+import { redisKeyspaceDisplayName } from "../dbDrivers/redisKeyspace";
 import type {
   ColumnTypeMeta,
   DriverEntityManifest,
@@ -953,13 +954,19 @@ export class ConnectionProvider
     const state = this.connectionManager.getTableDetailState(request);
 
     if (state.status === "loading") {
-      return [this.makeLoadingNode(element, `Loading ${request.table}…`)];
+      return [
+        this.makeLoadingNode(
+          element,
+          `Loading ${this.getObjectDisplayName(request.connectionId, request.table)}…`,
+        ),
+      ];
     }
 
     if (state.status === "error") {
       return this.makeErrorNodes(
         element,
-        state.error ?? `Failed to load ${request.table}`,
+        state.error ??
+          `Failed to load ${this.getObjectDisplayName(request.connectionId, request.table)}`,
       );
     }
 
@@ -992,13 +999,19 @@ export class ConnectionProvider
     const state = this.connectionManager.getTableDetailState(request);
 
     if (state.status === "loading") {
-      return [this.makeLoadingNode(element, `Loading ${request.table}…`)];
+      return [
+        this.makeLoadingNode(
+          element,
+          `Loading ${this.getObjectDisplayName(request.connectionId, request.table)}…`,
+        ),
+      ];
     }
 
     if (state.status === "error") {
       return this.makeErrorNodes(
         element,
-        state.error ?? `Failed to load ${request.table}`,
+        state.error ??
+          `Failed to load ${this.getObjectDisplayName(request.connectionId, request.table)}`,
       );
     }
 
@@ -1185,6 +1198,7 @@ export class ConnectionProvider
     detailKey: string | undefined,
     manifest: DriverEntityManifest,
   ): RapiDBNode {
+    const displayName = this.getObjectDisplayName(connectionId, objectName);
     const dataObjectKind = isDataDbObjectKind(kind) ? kind : undefined;
     const collapsibleState =
       dataObjectKind &&
@@ -1192,7 +1206,7 @@ export class ConnectionProvider
         ? vscode.TreeItemCollapsibleState.Collapsed
         : vscode.TreeItemCollapsibleState.None;
     const node = new RapiDBNode(
-      objectName,
+      displayName,
       kind,
       collapsibleState,
       connectionId,
@@ -1211,10 +1225,10 @@ export class ConnectionProvider
     );
     node.tooltip =
       this.getConnectionType(connectionId) === "elasticsearch"
-        ? `${kindLabel}: ${objectName}`
+        ? `${kindLabel}: ${displayName}`
         : includeSchema
-          ? `${kindLabel}: ${objectName}\nSchema: ${schemaName}\nDatabase: ${databaseName}`
-          : `${kindLabel}: ${objectName}\nDatabase: ${databaseName}`;
+          ? `${kindLabel}: ${displayName}\nSchema: ${schemaName}\nDatabase: ${databaseName}`
+          : `${kindLabel}: ${displayName}\nDatabase: ${databaseName}`;
     node.contextValue = this.composeContextValue(kind, connectionId);
 
     if (isDataDbObjectKind(kind)) {
@@ -1303,8 +1317,8 @@ export class ConnectionProvider
       );
       node.description = this.describeTableSection(sectionState);
       node.tooltip = this.hasSchemaConcept(request.connectionId)
-        ? `${TABLE_SECTION_LABELS[section]} for ${request.schema}.${request.table}`
-        : `${TABLE_SECTION_LABELS[section]} for ${request.table}`;
+        ? `${TABLE_SECTION_LABELS[section]} for ${request.schema}.${this.getObjectDisplayName(request.connectionId, request.table)}`
+        : `${TABLE_SECTION_LABELS[section]} for ${this.getObjectDisplayName(request.connectionId, request.table)}`;
       return node;
     });
   }
@@ -1487,6 +1501,12 @@ export class ConnectionProvider
     return this.connectionManager
       .getConnections()
       .find((connection) => connection.id === connectionId)?.type;
+  }
+
+  private getObjectDisplayName(connectionId: string, name: string): string {
+    return this.getConnectionType(connectionId) === "redis"
+      ? redisKeyspaceDisplayName(name)
+      : name;
   }
 
   private makeDetailTooltip(name: string, description?: string): string {

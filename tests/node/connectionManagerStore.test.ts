@@ -24,7 +24,7 @@ async function createRepairStore() {
   };
   const update = vi.fn(
     async (_key: string, value: StoredConnectionConfig[]) => {
-      state.connections = value;
+      state.connections = JSON.parse(JSON.stringify(value));
     },
   );
   vi.doMock("vscode", () => ({
@@ -52,6 +52,201 @@ async function createRepairStore() {
 }
 
 describe("connection repair transactions", () => {
+  it.each([
+    { omitted: undefined, nested: { omitted: undefined } },
+    { entries: [undefined, Array(1), null, { omitted: undefined }] },
+    { nonfinite: [NaN, Infinity, -Infinity], negativeZero: -0 },
+    { timestamp: new Date("2026-10-05T00:00:00.000Z") },
+  ])("hashes the persisted JSON representation of extra fields %#", async (extra) => {
+    const { store, state } = await createRepairStore();
+    state.connections = [
+      { id: "json-revision", name: "JSON", type: "pg", ...extra },
+    ];
+    const revision = store.getConnectionsRevision();
+    state.connections = JSON.parse(JSON.stringify(state.connections));
+    expect(store.getConnectionsRevision()).toBe(revision);
+    state.connections = [{ ...state.connections[0], name: "External update" }];
+    expect(store.getConnectionsRevision()).not.toBe(revision);
+  });
+
+  it("retains secret mutations after JSON-persisted settings apply before rejecting", async () => {
+    const { store, state, documents, update } = await createRepairStore();
+    state.connections = [state.connections[0]];
+    const rollback = vi.fn(async () => {
+      await store.deleteSecret("duplicate");
+    });
+    update.mockImplementationOnce(async (_key, value) => {
+      state.connections = JSON.parse(JSON.stringify(value));
+      throw new Error("acknowledgement failed");
+    });
+    await expect(
+      store.mutateConnections(async (current) => {
+        await store.storeSecret("duplicate", "new credentials");
+        return {
+          connections: current.map((connection) => ({
+            ...connection,
+            useSecretStorage: true,
+            password: undefined,
+            connectionUri: undefined,
+            ssh: undefined,
+            tls: {
+              mode: "mutualTls" as const,
+              certFilePath: "/cert",
+              keyFilePath: "/key",
+              keyPassphrase: undefined,
+            },
+          })),
+          result: "saved",
+          rollback,
+        };
+      }),
+    ).resolves.toBe("saved");
+    expect(rollback).not.toHaveBeenCalled();
+    expect(documents.get("duplicate")).toBe("new credentials");
+    expect(state.connections[0]).toMatchObject({ useSecretStorage: true });
+    expect(state.connections[0]).not.toHaveProperty("password");
+  });
+
+  it.each([
+    "revision",
+    "target",
+  ])("does not mistake an external %s change after a JSON write for its own commit", async (change) => {
+    const { store, state, documents, update, raw } = await createRepairStore();
+    state.connections = [state.connections[0]];
+    let external!: StoredConnectionConfig[];
+    const rollback = vi.fn(async () => {
+      await store.storeSecret("duplicate", raw);
+    });
+    update.mockImplementationOnce(async (_key, value) => {
+      state.connections = JSON.parse(JSON.stringify(value));
+      if (change === "revision") state.connections[0].name = "External";
+      else state.target = 2;
+      external = state.connections;
+      throw new Error("acknowledgement failed");
+    });
+    await expect(
+      store.mutateConnections(async (current) => {
+        await store.storeSecret("duplicate", "new credentials");
+        return {
+          connections: current.map((c) => ({
+            ...c,
+            name: "Saved",
+            password: undefined,
+          })),
+          result: undefined,
+          rollback,
+        };
+      }),
+    ).rejects.toThrow("acknowledgement failed");
+    expect(rollback).toHaveBeenCalledOnce();
+    expect(documents.get("duplicate")).toBe(raw);
+    expect(state.connections).toBe(external);
+    expect(update).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    "",
+    " \t ",
+  ])("moves exact secret documents off orphan ID %j and preserves the first duplicate owner's key", async (id) => {
+    const { store, state, documents, secrets, raw } = await createRepairStore();
+    state.connections.push(
+      { id, name: "Invalid first", type: "pg" },
+      { id, name: "Invalid second", type: "pg" },
+    );
+    documents.set(id, raw);
+    const repaired = store.getConnections();
+    await store.mutateConnections(() => ({ result: undefined }));
+    expect(state.connections).toEqual(repaired);
+    expect(new Set(repaired.map((c) => c.id)).size).toBe(4);
+    for (const connection of repaired)
+      expect(documents.get(connection.id)).toBe(raw);
+    expect(documents.has(id)).toBe(false);
+    expect(secrets.delete).toHaveBeenCalledExactlyOnceWith(id);
+    expect(secrets.delete).not.toHaveBeenCalledWith("duplicate");
+    // Later removal cannot leave a credential reachable only under the old key.
+    await store.mutateConnections(async (current) => {
+      for (const connection of current.slice(2))
+        await store.deleteSecret(connection.id);
+      return { connections: current.slice(0, 2), result: undefined };
+    });
+    expect(documents.size).toBe(2);
+  });
+
+  it.each([
+    "delete",
+    "settings",
+    "applied-settings",
+  ])("handles orphan cleanup %s failures transactionally", async (failure) => {
+    const { store, state, documents, secrets, update, raw } =
+      await createRepairStore();
+    state.connections = [
+      {
+        id: " ",
+        name: "Invalid",
+        type: "pg",
+        connectionUri: undefined,
+        tls: {
+          mode: "mutualTls",
+          certFilePath: "/cert",
+          keyFilePath: "/key",
+          keyPassphrase: undefined,
+        },
+      },
+    ];
+    documents.clear();
+    documents.set(" ", raw);
+    if (failure === "delete")
+      secrets.delete.mockImplementationOnce(async (id) => {
+        documents.delete(id);
+        throw new Error("cleanup failed");
+      });
+    else
+      update.mockImplementationOnce(async (_key, value) => {
+        if (failure === "applied-settings")
+          state.connections = JSON.parse(JSON.stringify(value));
+        throw new Error("settings failed");
+      });
+    const repaired = store.getConnections();
+    if (failure !== "applied-settings") {
+      await vi.waitFor(() =>
+        expect(secrets.store).toHaveBeenCalledWith(" ", raw),
+      );
+      expect(state.connections[0].id).toBe(" ");
+      expect(documents.get(" ")).toBe(raw);
+      expect(documents.has(repaired[0].id)).toBe(false);
+    }
+    await store.mutateConnections(() => ({ result: undefined }));
+    expect(state.connections).toEqual(repaired);
+    expect(documents.size).toBe(1);
+    expect(documents.get(repaired[0].id)).toBe(raw);
+    expect(documents.has(" ")).toBe(false);
+  });
+
+  it("restores an orphan's old key when settings change after cleanup but before commit", async () => {
+    const { store, state, documents, secrets, update, raw } =
+      await createRepairStore();
+    state.connections = [{ id: "", name: "Invalid", type: "pg" }];
+    documents.clear();
+    documents.set("", raw);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    secrets.delete.mockImplementationOnce(async (id) => {
+      documents.delete(id);
+      await gate;
+    });
+    const repaired = store.getConnections();
+    await vi.waitFor(() => expect(documents.has("")).toBe(false));
+    state.connections = [{ id: "external", name: "External", type: "pg" }];
+    release();
+    await vi.waitFor(() => expect(documents.get("")).toBe(raw));
+    expect(update).not.toHaveBeenCalled();
+    expect(documents.has(repaired[0].id)).toBe(false);
+    await store.mutateConnections(() => ({ result: undefined }));
+    expect(state.connections[0].id).toBe("external");
+  });
+
   it.each([
     { change: "revision", secretOnly: false },
     { change: "target", secretOnly: false },
@@ -143,7 +338,8 @@ describe("connection repair transactions", () => {
     release();
     await expect(pending).resolves.toBe(change === "none");
     expect(update).toHaveBeenCalledTimes(change === "none" ? 2 : 1);
-    expect(state.connections).toBe(change === "none" ? replacement : external);
+    if (change === "none") expect(state.connections).toEqual(replacement);
+    else expect(state.connections).toBe(external);
   });
 
   it("copies the exact duplicate secret before committing IDs and preserves the original", async () => {
@@ -240,8 +436,12 @@ describe("connection repair transactions", () => {
   it("keeps copied secrets when normalization applies before rejecting", async () => {
     const { store, state, documents, update, raw, secrets } =
       await createRepairStore();
+    state.connections = state.connections.map((connection) => ({
+      ...connection,
+      connectionUri: undefined,
+    }));
     update.mockImplementationOnce(async (_key, value) => {
-      state.connections = value;
+      state.connections = JSON.parse(JSON.stringify(value));
       throw new Error("acknowledgement failed");
     });
     const first = store.getConnections();
@@ -249,6 +449,38 @@ describe("connection repair transactions", () => {
     expect(store.getConnections()).toEqual(first);
     expect(documents.get(first[1].id)).toBe(raw);
     expect(secrets.delete).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "revision",
+    "target",
+  ])("rolls back normalization secrets without clobbering an external %s update after JSON persistence", async (change) => {
+    const { store, state, documents, secrets, update, raw } =
+      await createRepairStore();
+    state.connections = [
+      { id: " ", name: "Invalid", type: "pg", connectionUri: undefined },
+    ];
+    documents.clear();
+    documents.set(" ", raw);
+    let external!: StoredConnectionConfig[];
+    let repairedId!: string;
+    update.mockImplementationOnce(async (_key, value) => {
+      state.connections = JSON.parse(JSON.stringify(value));
+      repairedId = state.connections[0].id;
+      if (change === "revision")
+        state.connections = [{ id: "external", name: "External", type: "pg" }];
+      else state.target = 2;
+      external = state.connections;
+      throw new Error("acknowledgement failed");
+    });
+    await expect(
+      store.mutateConnections(() => ({ result: undefined })),
+    ).rejects.toThrow("acknowledgement failed");
+    expect(state.connections).toBe(external);
+    expect(update).toHaveBeenCalledOnce();
+    expect(documents.get(" ")).toBe(raw);
+    expect(documents.has(repairedId)).toBe(false);
+    expect(secrets.delete).toHaveBeenCalledWith(repairedId);
   });
 });
 
@@ -969,7 +1201,7 @@ describe("VSCodeConnectionManagerStore", () => {
       { id: "conn-1", name: "Before", type: "sqlite" as const },
     ];
     const update = vi.fn(async (_key: string, value: typeof connections) => {
-      connections = value;
+      connections = JSON.parse(JSON.stringify(value));
       throw new Error("acknowledgement failed");
     });
     vi.doMock("vscode", () => ({
@@ -997,6 +1229,8 @@ describe("VSCodeConnectionManagerStore", () => {
         connections: current.map((connection) => ({
           ...connection,
           name: "After",
+          connectionUri: undefined,
+          ssh: undefined,
         })),
         result: "saved",
         rollback,

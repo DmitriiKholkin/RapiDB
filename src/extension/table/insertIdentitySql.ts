@@ -79,6 +79,30 @@ export function mssqlInsertIdentityExpression(
   return name;
 }
 
+/**
+ * SQL Server's COLLATE grammar accepts a bare collation name, not a delimited
+ * identifier. Keep the catalog collation on OUTPUT INTO columns to preserve
+ * character encoding and comparison semantics, but only interpolate names
+ * that are a single safe collation-name token.
+ */
+export function mssqlInsertIdentityCollation(
+  collation: string | undefined,
+  identityType: string,
+): string {
+  if (collation === undefined) return "";
+  if (
+    typeof collation !== "string" ||
+    !/^[A-Za-z][A-Za-z0-9_]*$/.test(collation) ||
+    collation.toLowerCase() === "database_default" ||
+    !/^(?:n?varchar|n?char)\(\d+\)$/i.test(identityType)
+  ) {
+    throw new Error(
+      "INSERT verification cannot capture MSSQL primary-key collation metadata; no data was written.",
+    );
+  }
+  return ` COLLATE ${collation}`;
+}
+
 export function mssqlInsertIdentityType(column: ColumnTypeMeta): string {
   const native = column.nativeType.trim();
   const type = /^(?:timestamp|rowversion)$/i.test(native)

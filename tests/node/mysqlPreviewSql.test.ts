@@ -38,6 +38,13 @@ function column(
 }
 
 describe("mysql preview SQL literals", () => {
+  it("retains backslash-escaped quotes around placeholder-looking literal text", () => {
+    const literal = "'it\\'s ? $1 :1'";
+    expect(driver.materializePreviewSql(`SELECT ${literal}, ?`, [7])).toBe(
+      `SELECT ${literal}, 7`,
+    );
+  });
+
   it("ignores question marks in MySQL hash comments", () => {
     expect(
       driver.materializePreviewSql("SELECT ? AS value # ignored ?", [42]),

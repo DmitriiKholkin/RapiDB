@@ -61,9 +61,7 @@ PostgreSQL, MS SQL Server, MySQL, MariaDB, SQLite, Oracle, Redis, MongoDB, Elast
 
 Saved connections can be grouped into folders, and each connection expands into databases → schemas → tables, views, materialized views, functions, procedures, sequences, and types. Right-click any object to copy its name, inspect columns with PK/FK badges, constraints, indexes, and triggers, open the data viewer where it applies, or pull the DDL / definition - no typing required.
 
-**PostgreSQL table DDL is reconstructed**, not a `pg_dump` schema backup. It includes columns and named PRIMARY KEY, CHECK, UNIQUE, FOREIGN KEY and exclusion constraints from the catalog. Referenced tables, types, functions and sequences must already exist; sequences, standalone indexes, triggers, security, storage settings and partition/inheritance definitions are not included. Dependencies are schema-qualified when deparsed outside the catalog search path. Views and materialized views use the server's native view definition.
-
-**Redis keyspaces:** `default` retains its historical **all-keys** meaning (`*`), including keys without a prefix. A real `default:` prefix has a separate navigation identity, `default:`, which reads only `default:*`. Other keyspaces use `prefix:*`. When there are no unprefixed keys, a real `default:` prefix creates only the `default:` node, not the all-keys node. These names control reads and exports; edits and deletes still address the exact stored primary-key value.
+Redis keys are grouped by the prefix before `:`. **All keys** and **Unprefixed keys** are separate views; prefixed groups are shown as patterns such as `default:*` and `users:*`. Edits and deletes still address the exact stored key.
 
 <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-5.png" alt="Database Explorer tree" width="250" />
 

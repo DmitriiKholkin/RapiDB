@@ -33,9 +33,21 @@ class FakeClient {
   destroyed = false;
   readGate?: ReturnType<typeof deferred<void>>;
   errorSql?: RegExp;
+  serverVersionNum = 120000;
+  columnRows?: Array<{
+    column_name: string;
+    data_type: string;
+    is_nullable: boolean;
+    column_default?: string | null;
+    generated_kind?: string | null;
+    identity_kind?: string | null;
+  }>;
   query = vi.fn(async (sql: string) => {
     if (this.destroyed) throw new Error("client destroyed");
     if (this.errorSql?.test(sql)) throw new Error("catalog SQL failure");
+    if (this.serverVersionNum < 120000 && /\ba\.attgenerated\b/.test(sql)) {
+      throw new Error("column a.attgenerated does not exist");
+    }
     if (sql.includes("current_database()"))
       return { rows: [{ name: "resolved" }] };
     if (sql.includes("SELECT c.relkind")) return { rows: [{ relkind: "r" }] };
@@ -43,7 +55,9 @@ class FakeClient {
       await this.readGate?.promise;
       if (this.destroyed) throw new Error("client destroyed");
       return {
-        rows: [{ column_name: "id", data_type: "integer", is_nullable: false }],
+        rows: this.columnRows ?? [
+          { column_name: "id", data_type: "integer", is_nullable: false },
+        ],
       };
     }
     if (sql.includes("pg_get_constraintdef"))
@@ -62,6 +76,27 @@ class FakeClient {
 class FakePool {
   options: Record<string, unknown> = {};
   readonly client = new FakeClient();
+  serverVersionNum = 120000;
+  columnRows?: Array<{
+    column_name: string;
+    data_type: string;
+    is_nullable: boolean;
+    column_default?: string | null;
+    generated_kind?: string | null;
+    identity_kind?: string | null;
+    is_pk?: boolean;
+    is_fk?: boolean;
+    pk_ordinal?: number | null;
+  }>;
+  query = vi.fn(async (sql: string) => {
+    if (this.serverVersionNum < 120000 && /\ba\.attgenerated\b/.test(sql)) {
+      throw new Error("column a.attgenerated does not exist");
+    }
+    if (sql.includes("FROM pg_attribute a")) {
+      return { rows: this.columnRows ?? [] };
+    }
+    return { rows: [] };
+  });
   on = vi.fn();
   connect = vi.fn(async () => this.client);
   end = vi.fn(async (): Promise<void> => undefined);
@@ -114,6 +149,124 @@ afterEach(async () => {
 
 describe("B08 owned PostgreSQL catalog session", () => {
   it.each([
+    {
+      serverVersionNum: 110000,
+      rows: [
+        {
+          column_name: "plain",
+          data_type: "text",
+          is_nullable: true,
+          column_default: "'default'",
+        },
+      ],
+      expectedDdl: ["\"plain\" text DEFAULT 'default'"],
+    },
+    {
+      serverVersionNum: 120000,
+      rows: [
+        {
+          column_name: "name_lower",
+          data_type: "text",
+          is_nullable: true,
+          column_default: "lower(name)",
+          generated_kind: "v",
+        },
+        {
+          column_name: "name_trimmed",
+          data_type: "text",
+          is_nullable: true,
+          column_default: "trim(name)",
+          generated_kind: "s",
+        },
+      ],
+      expectedDdl: [
+        '"name_lower" text GENERATED ALWAYS AS (lower(name)) VIRTUAL',
+        '"name_trimmed" text GENERATED ALWAYS AS (trim(name)) STORED',
+      ],
+    },
+  ])("reconstructs table DDL on server_version_num $serverVersionNum without a pre-12 catalog reference", async ({
+    serverVersionNum,
+    rows,
+    expectedDdl,
+  }) => {
+    const { driver } = await connect();
+    const catalog = pool();
+    catalog.client.serverVersionNum = serverVersionNum;
+    catalog.client.columnRows = rows;
+
+    const ddl = await driver.getCreateTableDDL("", "public", "items");
+    const columnQuery = catalog.client.query.mock.calls.find(([sql]) =>
+      sql.includes("FROM pg_attribute a"),
+    )?.[0];
+
+    for (const expected of expectedDdl) expect(ddl).toContain(expected);
+    expect(columnQuery).toContain("to_jsonb(a)->>'attgenerated'");
+    expect(columnQuery).not.toMatch(/\ba\.attgenerated\b/);
+  });
+
+  it.each([
+    {
+      serverVersionNum: 110000,
+      rows: [
+        {
+          column_name: "plain",
+          data_type: "text",
+          is_nullable: true,
+          generated_kind: null,
+        },
+      ],
+      expected: [
+        { name: "plain", isComputed: false, generatedKind: undefined },
+      ],
+    },
+    {
+      serverVersionNum: 120000,
+      rows: [
+        {
+          column_name: "name_lower",
+          data_type: "text",
+          is_nullable: true,
+          column_default: "lower(name)",
+          generated_kind: "v",
+        },
+        {
+          column_name: "name_trimmed",
+          data_type: "text",
+          is_nullable: true,
+          column_default: "trim(name)",
+          generated_kind: "s",
+        },
+      ],
+      expected: [
+        { name: "name_lower", isComputed: true, generatedKind: "virtual" },
+        { name: "name_trimmed", isComputed: true, generatedKind: "stored" },
+      ],
+    },
+  ])("describes columns at server_version_num $serverVersionNum using a single compatible catalog query", async ({
+    serverVersionNum,
+    rows,
+    expected,
+  }) => {
+    const { driver, editor } = await connect();
+    editor.serverVersionNum = serverVersionNum;
+    editor.columnRows = rows;
+
+    const columns = await driver.describeColumns("", "public", "items");
+    const sql = editor.query.mock.calls[0]?.[0];
+
+    expect(
+      columns.map(({ name, isComputed, generatedKind }) => ({
+        name,
+        isComputed,
+        generatedKind,
+      })),
+    ).toEqual(expected);
+    expect(editor.query).toHaveBeenCalledOnce();
+    expect(sql).toContain("to_jsonb(a)->>'attgenerated'");
+    expect(sql).not.toMatch(/\ba\.attgenerated\b/);
+  });
+
+  it.each([
     "",
     "other",
   ])("isolates DDL in database %j with the same SSH/TLS/timeout settings", async (database) => {
@@ -135,8 +288,9 @@ describe("B08 owned PostgreSQL catalog session", () => {
     expect(ddl).toContain('CONSTRAINT "pk" PRIMARY KEY (id)');
     expect(catalog.options).toMatchObject({
       database: database || "resolved",
-      host: "127.0.0.1",
+      host: "pg.internal",
       port: 15432,
+      stream: expect.any(Function),
       user: "user",
       password: "secret",
       max: 1,
@@ -182,7 +336,6 @@ describe("B08 owned PostgreSQL catalog session", () => {
   it.each([
     "SELECT c.relkind",
     "FROM pg_attribute a",
-    "ROLLBACK",
   ])("closes only the catalog session after failure in %s", async (sql) => {
     const { driver, editor } = await connect();
     const catalog = pool();
@@ -195,6 +348,35 @@ describe("B08 owned PostgreSQL catalog session", () => {
     expect(editor.client.release).toHaveBeenCalledExactlyOnceWith();
     expect(editor.end).not.toHaveBeenCalled();
     expect(driver.isConnected()).toBe(true);
+  });
+
+  it("returns reconstructed DDL when rollback fails after successful catalog reads", async () => {
+    const { driver, editor } = await connect();
+    const catalog = pool();
+    catalog.client.errorSql = /^ROLLBACK$/;
+
+    const ddl = await driver.getCreateTableDDL("", "public", "items");
+
+    expect(ddl).toContain('CREATE TABLE "public"."items"');
+    expect(catalog.client.query).toHaveBeenCalledWith("BEGIN READ ONLY");
+    expect(catalog.client.query).toHaveBeenCalledWith("ROLLBACK");
+    expect(catalog.client.release).toHaveBeenCalledExactlyOnceWith(true);
+    expect(catalog.end).toHaveBeenCalledOnce();
+    expect(editor.end).not.toHaveBeenCalled();
+  });
+
+  it("preserves the catalog error when rollback also fails", async () => {
+    const { driver } = await connect();
+    const catalog = pool();
+    catalog.client.errorSql = /FROM pg_attribute a|ROLLBACK/;
+
+    await expect(
+      driver.getCreateTableDDL("", "public", "items"),
+    ).rejects.toThrow("catalog SQL failure");
+
+    expect(catalog.client.query).toHaveBeenCalledWith("ROLLBACK");
+    expect(catalog.client.release).toHaveBeenCalledExactlyOnceWith(true);
+    expect(catalog.end).toHaveBeenCalledOnce();
   });
 
   it("fences a late acquired backend after disconnect without touching a reconnected editor", async () => {

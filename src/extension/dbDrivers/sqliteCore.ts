@@ -2,6 +2,7 @@ import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { ConnectionConfig } from "../connectionManager";
 import { BaseDBDriver } from "./BaseDBDriver";
 import { queryCollectionLimit } from "./boundedQueryRows";
+import { literalContainsPattern } from "./literalContains";
 import { openSQLiteDatabase, type SQLiteDatabase } from "./sqliteRuntime";
 import {
   type DriverTimeoutSettingsProvider,
@@ -725,6 +726,17 @@ function invalidSqliteTemporalFilterError(
 function quoteSqliteIdentifier(identifier: string): string {
   return `"${identifier.replace(/"/g, '""')}"`;
 }
+
+class SQLiteRollbackFailure extends AggregateError {
+  constructor(operationError: unknown, rollbackError: unknown) {
+    super(
+      [operationError, rollbackError],
+      "SQLite operation and rollback both failed; the connection session is unsafe.",
+    );
+    this.name = "SQLiteRollbackFailure";
+  }
+}
+
 /** Synchronous SQLite implementation: DB methods are only invoked in sqliteWorker. */
 export class SQLiteCoreDriver extends BaseDBDriver {
   protected override getQueryEditorSqlDialect() {
@@ -971,7 +983,9 @@ export class SQLiteCoreDriver extends BaseDBDriver {
         try {
           db.exec("ROLLBACK TO SAVEPOINT rapidb_query_deadline");
           db.exec("RELEASE SAVEPOINT rapidb_query_deadline");
-        } catch {}
+        } catch (rollbackError) {
+          throw new SQLiteRollbackFailure(error, rollbackError);
+        }
       }
       throw error;
     }
@@ -1377,13 +1391,15 @@ export class SQLiteCoreDriver extends BaseDBDriver {
       );
       throwIfTransactionCancelled(context);
       db.exec("COMMIT");
-    } catch (e) {
+    } catch (error) {
       if (db.inTransaction) {
         try {
           db.exec("ROLLBACK");
-        } catch {}
+        } catch (rollbackError) {
+          throw new SQLiteRollbackFailure(error, rollbackError);
+        }
       }
-      throw e;
+      throw error;
     }
   }
   mapTypeCategory(nativeType: string): TypeCategory {
@@ -1658,7 +1674,10 @@ export class SQLiteCoreDriver extends BaseDBDriver {
         return null;
       }
       const arrayValue = typeof val === "string" ? val : val[0];
-      return { sql: `${col} LIKE ?`, params: [`%${arrayValue}%`] };
+      return {
+        sql: `${col} LIKE ? ESCAPE '!'`,
+        params: [literalContainsPattern(arrayValue)],
+      };
     }
     if (
       column.category === "binary" &&
@@ -1747,7 +1766,7 @@ export class SQLiteCoreDriver extends BaseDBDriver {
         };
       }
       const sqlOp = this.sqlOperator(operator);
-      if (column.category === "integer" && /^-?\d+$/.test(val)) {
+      if (column.category === "integer" && /^[+-]?\d+$/.test(val)) {
         const big = BigInt(val);
         if (
           big > SQLITE_JS_SAFE_INTEGER_MAX ||
@@ -1886,6 +1905,12 @@ export class SQLiteCoreDriver extends BaseDBDriver {
       };
     }
     const v = typeof val === "string" ? val : val[0];
+    if (operator === "like" || operator === "ilike") {
+      return {
+        sql: `${col} LIKE ? ESCAPE '!'`,
+        params: [literalContainsPattern(v)],
+      };
+    }
     return { sql: `${col} LIKE ?`, params: [`%${v}%`] };
   }
 }

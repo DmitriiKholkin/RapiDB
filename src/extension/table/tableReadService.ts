@@ -4,7 +4,8 @@ import type {
   FilterExpression,
   QueryResult,
 } from "../dbDrivers/types";
-import { buildWhere } from "./filterSql";
+import { normalizeUnknownError } from "../utils/errorHandling";
+import { buildWhere, validateFilterExpressions } from "./filterSql";
 import type { SortConfig, TablePage } from "./tableDataContracts";
 
 type ExportOrderColumn = {
@@ -70,7 +71,19 @@ export class TableReadService {
     signal?: AbortSignal,
   ): Promise<TablePage> {
     signal?.throwIfAborted();
+    if (!Array.isArray(filters)) {
+      throw new Error("[RapiDB Filter] Filters must be an array.");
+    }
+
     const { driver } = this.getConnectionDriver(connectionId);
+    const columns =
+      filters.length > 0
+        ? await this.getColumns(connectionId, database, schema, table)
+        : undefined;
+    if (columns) {
+      validateFilterExpressions(filters, columns);
+    }
+
     if (driver.readTablePage) {
       return driver.readTablePage({
         database,
@@ -95,6 +108,7 @@ export class TableReadService {
       filters,
       sort,
       skipCount,
+      columns,
     );
   }
 
@@ -108,6 +122,7 @@ export class TableReadService {
     filters: FilterExpression[],
     sort: SortConfig | null,
     skipCount: boolean,
+    knownColumns?: ColumnTypeMeta[],
   ): Promise<TablePage> {
     const startTime = performance.now();
     const { driver } = this.getConnectionDriver(connectionId);
@@ -117,12 +132,9 @@ export class TableReadService {
       schema,
       table,
     );
-    const columns = await this.getColumns(
-      connectionId,
-      database,
-      schema,
-      table,
-    );
+    const columns =
+      knownColumns ??
+      (await this.getColumns(connectionId, database, schema, table));
 
     const { clause: whereClause, params: whereParams } = buildWhere(
       driver,
@@ -300,7 +312,7 @@ export class TableReadService {
     } catch (error: unknown) {
       console.error(
         "[RapiDB] COUNT query failed, falling back to a lower-bound totalCount:",
-        error instanceof Error ? error.message : error,
+        normalizeUnknownError(error).message,
       );
       return { totalCount: 0, countFailed: true };
     }

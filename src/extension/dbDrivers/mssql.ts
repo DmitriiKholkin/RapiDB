@@ -1,4 +1,5 @@
 import * as mssql from "mssql";
+import { normalizeConnectionTlsConfig } from "../../shared/connectionConfig";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { OperationCancellationContext } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
@@ -6,7 +7,6 @@ import {
   getMssqlServerName,
   getSshTcpForwardTransport,
 } from "../driverRuntimeConfig";
-import { resolveConnectionTlsSettings } from "../services/connectionTls";
 import { logger } from "../utils/logger";
 import { scanSqlForCap } from "../utils/sqlStatementScan";
 import {
@@ -17,8 +17,10 @@ import {
   normalizeSqlDatetimeOffsetSpacing,
 } from "./BaseDBDriver";
 import { BoundedQueryRows, queryCollectionLimit } from "./boundedQueryRows";
+import { exactNumericFilterLiteral } from "./exactNumericFilter";
 import { mssqlInsertGuard } from "./mssqlInsertGuard";
 import {
+  type QuestionMarkPlaceholderOptions,
   questionMarkPlaceholderOffsets,
   replaceQuestionMarkPlaceholders,
 } from "./sqlPlaceholders";
@@ -220,6 +222,88 @@ function mssqlArrayRow(
       return values[column.name];
     return columns.length === 1 ? row : undefined;
   });
+}
+
+type MssqlRollbackCallback = (error?: unknown, ...result: unknown[]) => void;
+
+type MssqlRollbackConnection = {
+  rollbackTransaction: (
+    callback: MssqlRollbackCallback,
+    ...args: unknown[]
+  ) => unknown;
+  close?: () => void;
+  hasError?: boolean;
+};
+
+type MssqlRollbackFence = {
+  restore: () => void;
+  closeError: () => unknown;
+};
+
+/**
+ * Tedious' Transaction._rollback releases its connection before reporting a
+ * rollback error to node-mssql. Mark and close that session in Tedious' callback
+ * first, so a waiting pool borrower cannot receive an uncertain transaction.
+ */
+function fenceFailedMssqlRollback(
+  transaction: mssql.Transaction,
+): MssqlRollbackFence | undefined {
+  const connection = (
+    transaction as unknown as {
+      _acquiredConnection?: MssqlRollbackConnection;
+    }
+  )._acquiredConnection;
+  if (!connection || typeof connection.rollbackTransaction !== "function") {
+    return undefined;
+  }
+
+  const rollbackDescriptor = Object.getOwnPropertyDescriptor(
+    connection,
+    "rollbackTransaction",
+  );
+  const rollbackTransaction = connection.rollbackTransaction;
+  let capturedCloseError: unknown;
+  const fencedRollback = function (
+    this: MssqlRollbackConnection,
+    callback: MssqlRollbackCallback,
+    ...args: unknown[]
+  ) {
+    return rollbackTransaction.call(
+      this,
+      (error, ...result) => {
+        if (error) {
+          // The pool validator rejects hasError/closed connections. close()
+          // synchronously sets closed before node-mssql releases this session.
+          this.hasError = true;
+          try {
+            this.close?.();
+          } catch (closeError) {
+            capturedCloseError = closeError;
+          }
+        }
+        callback(error, ...result);
+      },
+      ...args,
+    );
+  };
+  connection.rollbackTransaction = fencedRollback;
+
+  return {
+    restore: () => {
+      if (connection.rollbackTransaction !== fencedRollback) return;
+      if (rollbackDescriptor) {
+        Object.defineProperty(
+          connection,
+          "rollbackTransaction",
+          rollbackDescriptor,
+        );
+      } else {
+        delete (connection as Partial<MssqlRollbackConnection>)
+          .rollbackTransaction;
+      }
+    },
+    closeError: () => capturedCloseError,
+  };
 }
 
 const MSSQL_ENTITY_MANIFEST: DriverEntityManifest = {
@@ -798,13 +882,27 @@ function mssqlNumericFilterParam(
   if (
     column.category === "integer" &&
     baseTypeName(column.nativeType) === "bigint" &&
-    /^-?\d+$/.test(rawValue)
+    /^[+-]?\d+$/.test(rawValue)
   ) {
     return BigInt(rawValue);
   }
+  if (column.category === "integer" && !/^[+-]?\d+$/.test(rawValue)) {
+    return exactNumericFilterLiteral(rawValue, column.name, 38, 38).value;
+  }
   return Number(rawValue);
 }
-function mssqlNumericParamExpr(column: ColumnTypeMeta): string {
+function mssqlNumericParamExpr(
+  column: ColumnTypeMeta,
+  rawValue?: string,
+): string {
+  if (
+    column.category === "integer" &&
+    rawValue !== undefined &&
+    !/^[+-]?\d+$/.test(rawValue)
+  ) {
+    const { scale } = exactNumericFilterLiteral(rawValue, column.name, 38, 38);
+    return `CAST(? AS decimal(38,${scale}))`;
+  }
   return column.category === "decimal"
     ? `CAST(? AS ${column.nativeType})`
     : "?";
@@ -1081,8 +1179,8 @@ export class MSSQLDriver extends BaseDBDriver {
     if (!serverHost) {
       throw new Error("[RapiDB] MSSQL host is required");
     }
-    const tlsSettings = resolveConnectionTlsSettings(this.config);
-    const trustCert = tlsSettings ? !tlsSettings.rejectUnauthorized : false;
+    const tlsConfig = normalizeConnectionTlsConfig(this.config);
+    const trustCert = tlsConfig?.mode === "requireTrustServerCertificate";
     const runtimeServerName = getMssqlServerName(this.config);
     return {
       server: serverHost,
@@ -1093,11 +1191,11 @@ export class MSSQLDriver extends BaseDBDriver {
       connectionTimeout: this.getConnectionTimeoutMs(),
       requestTimeout: this.getDbOperationTimeoutMs(),
       options: {
-        encrypt: tlsSettings !== undefined,
+        encrypt: tlsConfig !== undefined,
         trustServerCertificate: trustCert,
         enableArithAbort: true,
         abortTransactionOnError: true,
-        serverName: tlsSettings
+        serverName: tlsConfig
           ? (runtimeServerName ?? (!trustCert ? this.config.host : undefined))
           : undefined,
         useUTC: false,
@@ -1259,7 +1357,10 @@ export class MSSQLDriver extends BaseDBDriver {
     if (!params || params.length === 0) {
       return sql;
     }
-    const offsets = questionMarkPlaceholderOffsets(sql);
+    const offsets = questionMarkPlaceholderOffsets(
+      sql,
+      this.getQuestionMarkPlaceholderOptions(),
+    );
     if (offsets.length !== params.length) {
       throw new Error(
         `[RapiDB] MSSQL parameter mismatch: SQL has ${offsets.length} placeholder(s) but ${params.length} value(s) were supplied.`,
@@ -2245,11 +2346,22 @@ export class MSSQLDriver extends BaseDBDriver {
       );
       throwIfTransactionCancelled(context);
       await tx.commit();
-    } catch (e) {
+    } catch (error) {
+      const rollbackFence = fenceFailedMssqlRollback(tx);
       try {
         await tx.rollback();
-      } catch {}
-      throw e;
+      } catch (rollbackError) {
+        const errors: unknown[] = [error, rollbackError];
+        const closeError = rollbackFence?.closeError();
+        if (closeError !== undefined) errors.push(closeError);
+        throw new AggregateError(
+          errors,
+          "MSSQL transaction and rollback failed; the failed session was discarded.",
+        );
+      } finally {
+        rollbackFence?.restore();
+      }
+      throw error;
     } finally {
       context?.signal.removeEventListener("abort", cancel);
     }
@@ -2390,6 +2502,9 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     return super.buildOriginalValueComparison(column, paramIndex);
   }
+  protected override getQuestionMarkPlaceholderOptions(): QuestionMarkPlaceholderOptions {
+    return { dialect: "mssql" };
+  }
   materializePreviewInsertSql(
     sql: string,
     params: readonly unknown[] | undefined,
@@ -2405,7 +2520,10 @@ export class MSSQLDriver extends BaseDBDriver {
     if (!params || params.length === 0) {
       return sql;
     }
-    const offsets = questionMarkPlaceholderOffsets(sql);
+    const offsets = questionMarkPlaceholderOffsets(
+      sql,
+      this.getQuestionMarkPlaceholderOptions(),
+    );
     if (offsets.length !== params.length) {
       throw new Error(
         `[RapiDB] Preview parameter mismatch: SQL has ${offsets.length} placeholder(s) but ${params.length} value(s) were supplied.`,
@@ -2686,7 +2804,7 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     if (this.isNumericCategory(column.category) && Array.isArray(val)) {
       return {
-        sql: `${col} BETWEEN ${mssqlNumericParamExpr(column)} AND ${mssqlNumericParamExpr(column)}`,
+        sql: `${col} BETWEEN ${mssqlNumericParamExpr(column, val[0])} AND ${mssqlNumericParamExpr(column, val[1])}`,
         params: [
           mssqlNumericFilterParam(column, val[0]),
           mssqlNumericFilterParam(column, val[1]),
@@ -2695,11 +2813,12 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     if (this.isNumericCategory(column.category) && typeof val === "string") {
       if (operator === "in") {
-        const parts = val
-          .split(",")
-          .map((part) => mssqlNumericFilterParam(column, part.trim()));
+        const tokens = val.split(",").map((part) => part.trim());
+        const parts = tokens.map((part) =>
+          mssqlNumericFilterParam(column, part),
+        );
         return {
-          sql: `${col} IN (${parts.map(() => mssqlNumericParamExpr(column)).join(", ")})`,
+          sql: `${col} IN (${tokens.map((part) => mssqlNumericParamExpr(column, part)).join(", ")})`,
           params: parts,
         };
       }
@@ -2731,7 +2850,7 @@ export class MSSQLDriver extends BaseDBDriver {
         }
         const sqlOp = this.sqlOperator(operator);
         return {
-          sql: `${col} ${sqlOp} ${mssqlNumericParamExpr(column)}`,
+          sql: `${col} ${sqlOp} ${mssqlNumericParamExpr(column, val)}`,
           params: [mssqlNumericFilterParam(column, val)],
         };
       }

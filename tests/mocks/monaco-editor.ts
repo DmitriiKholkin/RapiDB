@@ -5,13 +5,16 @@ interface MockEdit {
 }
 
 let mockSelectionText = "";
+const selectionEmitters = new Set<() => void>();
 
 export function __setMockSelectionText(text: string) {
   mockSelectionText = text;
+  for (const emit of selectionEmitters) emit();
 }
 
 export function __resetMockMonacoState() {
   mockSelectionText = "";
+  selectionEmitters.clear();
 }
 
 function createMockEditor(container: HTMLElement, initialValue: string) {
@@ -24,18 +27,23 @@ function createMockEditor(container: HTMLElement, initialValue: string) {
   container.appendChild(domNode);
 
   const getSelection = () => {
-    if (!mockSelectionText) {
-      return null;
-    }
-
     return {
       startLineNumber: 1,
       startColumn: 1,
       endLineNumber: 1,
       endColumn: mockSelectionText.length + 1,
-      isEmpty: () => false,
+      isEmpty: () => mockSelectionText.length === 0,
     };
   };
+  const selectionListeners = new Set<
+    (event: { selection: ReturnType<typeof getSelection> }) => void
+  >();
+  const emitSelection = () => {
+    for (const listener of selectionListeners) {
+      listener({ selection: getSelection() });
+    }
+  };
+  selectionEmitters.add(emitSelection);
 
   return {
     getValue: () => value,
@@ -61,8 +69,29 @@ function createMockEditor(container: HTMLElement, initialValue: string) {
     }),
     getSelection,
     getPosition: () => ({ lineNumber: 1, column: value.length + 1 }),
-    setPosition: () => {},
-    setSelection: () => {},
+    setPosition: (_position: { lineNumber: number; column: number }) =>
+      __setMockSelectionText(""),
+    setSelection: (selection: Selection) => {
+      const offsetAt = (lineNumber: number, column: number) =>
+        value
+          .split("\n")
+          .slice(0, lineNumber - 1)
+          .join("\n").length +
+        (lineNumber > 1 ? 1 : 0) +
+        column -
+        1;
+      const start = offsetAt(
+        selection.selectionStartLineNumber,
+        selection.selectionStartColumn,
+      );
+      const end = offsetAt(
+        selection.positionLineNumber,
+        selection.positionColumn,
+      );
+      __setMockSelectionText(
+        value.slice(Math.min(start, end), Math.max(start, end)),
+      );
+    },
     revealPosition: () => {},
     focus: () => {},
     layout: () => {},
@@ -97,7 +126,22 @@ function createMockEditor(container: HTMLElement, initialValue: string) {
         },
       };
     },
-    dispose: () => {},
+    onDidChangeCursorSelection: (
+      listener: (event: { selection: ReturnType<typeof getSelection> }) => void,
+    ) => {
+      selectionListeners.add(listener);
+      return {
+        dispose: () => {
+          selectionListeners.delete(listener);
+        },
+      };
+    },
+    dispose: () => {
+      changeListeners.clear();
+      selectionListeners.clear();
+      selectionEmitters.delete(emitSelection);
+      domNode.remove();
+    },
   };
 }
 

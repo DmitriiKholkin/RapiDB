@@ -15,6 +15,7 @@
  * this logger is the lightweight, dependency-free path.
  */
 
+import { redactDiagnosticText } from "./diagnosticRedaction";
 import { normalizeUnknownError } from "./errorHandling";
 
 const PREFIX = "[RapiDB]";
@@ -74,7 +75,11 @@ function emit(
   context: string | undefined,
   message: string,
 ): void {
-  activeSink({ level, message, context });
+  activeSink({
+    level,
+    message: redactDiagnosticText(message),
+    context: context === undefined ? undefined : redactDiagnosticText(context),
+  });
 }
 
 /**
@@ -106,7 +111,12 @@ export const logger = {
     const normalized = normalizeUnknownError(error);
     // Preserve the legacy 2-arg call shape: tests / log scrapers often
     // inspect the second argument (the Error instance) separately.
-    console.error(`${PREFIX} ${context}:`, normalized);
+    const safeContext = redactDiagnosticText(context, error);
+    if (activeSink === consoleSink) {
+      console.error(`${PREFIX} ${safeContext}:`, normalized);
+    } else {
+      emit("error", safeContext, normalized.stack ?? normalized.message);
+    }
     return normalized;
   },
 } as const;

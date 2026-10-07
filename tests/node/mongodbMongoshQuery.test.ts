@@ -911,6 +911,60 @@ describe("MongoDB table mutations", () => {
     expect(mockDeleteOne).toHaveBeenCalledWith({ _id: { $eq: id } });
   });
 
+  it("reports identities for completed updates when a later Mongo update conflicts", async () => {
+    const { driver, mockUpdateOne } = createMockDriver();
+    mockUpdateOne
+      .mockResolvedValueOnce({ acknowledged: true, matchedCount: 1 })
+      .mockResolvedValueOnce({ acknowledged: true, matchedCount: 0 });
+
+    await expect(
+      driver.updateRows({
+        database: "testdb",
+        schema: "",
+        table: "users",
+        updates: [
+          { primaryKeys: { _id: "row-1" }, changes: { name: "One" } },
+          { primaryKeys: { _id: "row-2" }, changes: { name: "Two" } },
+        ],
+      }),
+    ).resolves.toEqual({
+      affectedRows: 1,
+      updateRowOutcomes: [
+        { rowIndex: 0, status: "applied" },
+        { rowIndex: 1, status: "not_applied" },
+      ],
+    });
+  });
+
+  it("retains a confirmed Mongo update when a later sequential update errors", async () => {
+    const { driver, mockUpdateOne } = createMockDriver();
+    mockUpdateOne
+      .mockResolvedValueOnce({ acknowledged: true, matchedCount: 1 })
+      .mockRejectedValueOnce(new Error("Connection lost"));
+
+    await expect(
+      driver.updateRows({
+        database: "testdb",
+        schema: "",
+        table: "users",
+        updates: [
+          { primaryKeys: { _id: "row-1" }, changes: { name: "One" } },
+          { primaryKeys: { _id: "row-2" }, changes: { name: "Two" } },
+          { primaryKeys: { _id: "row-3" }, changes: { name: "Three" } },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      result: {
+        affectedRows: 1,
+        updateRowOutcomes: [
+          { rowIndex: 0, status: "applied" },
+          { rowIndex: 1, status: "unknown" },
+          { rowIndex: 2, status: "not_applied" },
+        ],
+      },
+    });
+  });
+
   it("keeps per-row BSON _id types across table reads, previews, updates and deletes", async () => {
     const { driver, mockToArray, mockUpdateOne, mockDeleteOne } =
       createMockDriver();

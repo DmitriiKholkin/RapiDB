@@ -1,6 +1,7 @@
 import { oracleAlternativeQuoteEnd } from "../utils/sqlStatementScan";
 
 export interface QuestionMarkPlaceholderOptions {
+  dialect?: "pg" | "oracle" | "mssql";
   hashLineComments?: boolean;
   dashCommentRequiresWhitespace?: boolean;
 }
@@ -36,7 +37,8 @@ export function questionMarkPlaceholderOffsets(
       continue;
     }
     if (quote) {
-      if (char === "\\") index += 1;
+      // T-SQL uses doubled quotes; even a trailing backslash is literal text.
+      if (char === "\\" && options.dialect !== "mssql") index += 1;
       else if (char === quote && next === quote) index += 1;
       else if (char === quote) quote = null;
       continue;
@@ -74,10 +76,7 @@ export interface IndexedPlaceholderOffset {
   text: string;
 }
 
-export interface IndexedPlaceholderOptions
-  extends QuestionMarkPlaceholderOptions {
-  dialect?: "pg" | "oracle";
-}
+export type IndexedPlaceholderOptions = QuestionMarkPlaceholderOptions;
 
 // PG quotecontinue accepts ASCII whitespace and -- comments, with at least
 // one LF/CR before the next single quote. Block comments do not qualify.
@@ -178,7 +177,7 @@ export function indexedPlaceholderOffsets(
       quote = char;
       // PG identifiers and ordinary strings use doubled quotes, not backslash
       // escaping. Only E'...' strings have fixed backslash escapes. Oracle
-      // never uses backslashes to escape these quotes.
+      // and T-SQL never use backslashes to escape these quotes.
       backslashEscapes =
         options.dialect === undefined ||
         (options.dialect === "pg" &&
@@ -187,7 +186,7 @@ export function indexedPlaceholderOffsets(
           !/[A-Za-z0-9_$\u0080-\uffff]/.test(sql[index - 2] ?? ""));
     } else if (char === "$") {
       const dollarQuote =
-        options.dialect !== "oracle" &&
+        (options.dialect === undefined || options.dialect === "pg") &&
         !/[A-Za-z0-9_$\u0080-\uffff]/.test(sql[index - 1] ?? "")
           ? /^\$(?:[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/.exec(
               sql.slice(index),

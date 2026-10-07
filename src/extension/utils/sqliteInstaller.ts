@@ -11,6 +11,25 @@ import {
 import { dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { logger } from "./logger";
+import {
+  extractSQLiteArchive,
+  SQLITE_ARCHIVE_LIMITS,
+  SQLITE_SOURCE,
+  verifySQLiteIntegrity,
+} from "./sqliteArchive";
+import {
+  SQLITE_ARTIFACT_POLICY_ID,
+  type SQLiteArtifactPin,
+  type SQLiteHeaderPins,
+  sqliteHeaderPins,
+  sqlitePrebuiltPin,
+} from "./sqliteArtifactPins";
+import {
+  assertSQLiteBuildPath,
+  createSQLiteBuildToolLock,
+  pinSQLiteSourceNodeActions,
+  resolveSQLiteBuildTools,
+} from "./sqliteBuildTools";
 
 const execFileAsync = promisify(execFile);
 
@@ -19,37 +38,6 @@ type BetterSqlite3PackageJson = {
   version?: string;
   repository?: unknown;
 };
-
-type PrebuildInstallDownload = (
-  downloadUrl: string,
-  options: {
-    pkg: BetterSqlite3PackageJson;
-    runtime: "electron" | "node";
-    abi: string;
-    platform: NodeJS.Platform;
-    arch: NodeJS.Architecture;
-    libc?: string;
-    path: string;
-    force: boolean;
-    nolocal: boolean;
-    "tag-prefix": string;
-    log: {
-      http(...args: unknown[]): void;
-      silly(...args: unknown[]): void;
-      debug(...args: unknown[]): void;
-      info(...args: unknown[]): void;
-      warn(...args: unknown[]): void;
-      error(...args: unknown[]): void;
-      critical(...args: unknown[]): void;
-      alert(...args: unknown[]): void;
-      emergency(...args: unknown[]): void;
-      notice(...args: unknown[]): void;
-      verbose(...args: unknown[]): void;
-      fatal(...args: unknown[]): void;
-    };
-  },
-  callback: (error?: Error | null, resolved?: string) => void,
-) => void;
 
 export interface SQLiteInstalledRuntimeProbe {
   runtime: "electron" | "node";
@@ -67,6 +55,7 @@ interface SQLiteInstallerConfiguration {
   storageRoot: string;
   log?: (message: string) => void;
   allowInstall?: () => boolean | Promise<boolean>;
+  workspaceRoots?: () => readonly string[];
 }
 
 interface InstalledRuntimeManifest {
@@ -139,6 +128,8 @@ function currentRuntimeStorageKey(): string {
     process.platform,
     detectLinuxLibc() || null,
     process.arch,
+    // Do not reuse binaries extracted by older, unbounded installers.
+    SQLITE_ARTIFACT_POLICY_ID,
   ]
     .filter(
       (part): part is string => typeof part === "string" && part.length > 0,
@@ -305,41 +296,6 @@ function manifestMatches(baseDir: string): boolean {
   );
 }
 
-function createLogger() {
-  return {
-    http(...args: unknown[]) {
-      installerLog(args.map(String).join(" "));
-    },
-    silly() {},
-    debug() {},
-    info(...args: unknown[]) {
-      installerLog(args.map(String).join(" "));
-    },
-    warn(...args: unknown[]) {
-      installerLog(args.map(String).join(" "));
-    },
-    error(...args: unknown[]) {
-      installerLog(args.map(String).join(" "));
-    },
-    critical(...args: unknown[]) {
-      installerLog(args.map(String).join(" "));
-    },
-    alert(...args: unknown[]) {
-      installerLog(args.map(String).join(" "));
-    },
-    emergency(...args: unknown[]) {
-      installerLog(args.map(String).join(" "));
-    },
-    notice(...args: unknown[]) {
-      installerLog(args.map(String).join(" "));
-    },
-    verbose() {},
-    fatal(...args: unknown[]) {
-      installerLog(args.map(String).join(" "));
-    },
-  };
-}
-
 function copyDirectory(sourceRoot: string, targetRoot: string): void {
   cpSync(sourceRoot, targetRoot, {
     recursive: true,
@@ -431,29 +387,43 @@ async function withInstallLock<T>(
 // --- Electron 42 V8 API compatibility fallback chain --------------------------
 // Better-sqlite3 prebuilt binaries are not yet published for Electron 42
 // (NODE_MODULE_VERSION >= 146). The fallback chain is:
-//   1. Official prebuilt from GitHub releases (prebuild-install)
-//   2. Patched prebuilt from RapiDB GitHub releases (no build tools needed)
+//   1. Official prebuilt from the trusted WiseLibs HTTPS release origin
+//   2. Patched prebuilt with a publisher-reviewed checksum committed here
 //   3. Source build with V8 API patch via node-gyp (requires build toolchain)
 //
 // To publish patched prebuilts, build on each target platform and upload:
 //   gh release create rapidb-patched-sqlite /tmp/rapidb-patched-prebuilts/*.tar.gz
+// Then independently review and commit each asset's checksum below. Uploading
+// assets (or a checksum next to them) alone does not enable this fallback.
 // ------------------------------------------------------------------------------
 
-const PATCHED_PREBUILDS_RELEASE_URL =
-  "https://github.com/DmitriiKholkin/RapiDB/releases/download/rapidb-patched-sqlite";
+const GITHUB_DOWNLOAD_HOSTS = [
+  "github.com",
+  "release-assets.githubusercontent.com",
+  "objects.githubusercontent.com",
+];
+
+interface DownloadLimits {
+  maxBytes?: number;
+  allowedHosts?: readonly string[];
+}
 
 export function downloadToFile(
   url: string,
   destPath: string,
   timeoutMs = 60_000,
+  options: DownloadLimits = {},
 ): Promise<void> {
   const { createWriteStream } = require("node:fs") as typeof import("node:fs");
   const https = require("node:https") as typeof import("node:https");
   const http = require("node:http") as typeof import("node:http");
+  const maxBytes = options.maxBytes ?? SQLITE_ARCHIVE_LIMITS.compressedBytes;
+  const allowLoopbackHttp = url.startsWith("http://") && !options.allowedHosts;
 
   return new Promise<void>((resolvePromise, rejectPromise) => {
     let settled = false;
     let abortActiveRequest: (() => void) | undefined;
+    let downloadFile: import("node:fs").WriteStream | undefined;
     const resolveOnce = (): void => {
       if (!settled) {
         settled = true;
@@ -465,10 +435,18 @@ export function downloadToFile(
       if (!settled) {
         settled = true;
         clearTimeout(deadline);
-        try {
-          rmSync(destPath, { force: true });
-        } catch {}
-        rejectPromise(error);
+        abortActiveRequest?.();
+        const cleanup = (): void => {
+          try {
+            rmSync(destPath, { force: true });
+          } catch {}
+          rejectPromise(error);
+        };
+        // Wait for a pending open/close before removing the partial file (also
+        // required on Windows). Otherwise a late open can recreate it.
+        if (downloadFile && !downloadFile.closed)
+          downloadFile.once("close", cleanup);
+        else cleanup();
       }
     };
     // Socket timeout is only an inactivity timer. A server can drip bytes
@@ -497,15 +475,32 @@ export function downloadToFile(
       }
       // http is only for loopback tests; production URLs are https.
       // Reject non-loopback http (including https->http downgrade redirects).
+      if (
+        options.allowedHosts &&
+        !options.allowedHosts.includes(new URL(resolvedTarget).hostname)
+      ) {
+        rejectOnce(
+          new Error(`Refusing untrusted SQLite download host: ${target}`),
+        );
+        return;
+      }
+      if (
+        !resolvedTarget.startsWith("https://") &&
+        !resolvedTarget.startsWith("http://")
+      ) {
+        rejectOnce(new Error(`Unsupported download protocol: ${target}`));
+        return;
+      }
       if (resolvedTarget.startsWith("http://")) {
         let hostname = "";
         try {
           hostname = new URL(resolvedTarget).hostname;
         } catch {}
         if (
-          hostname !== "127.0.0.1" &&
-          hostname !== "localhost" &&
-          hostname !== "::1"
+          !allowLoopbackHttp ||
+          (hostname !== "127.0.0.1" &&
+            hostname !== "localhost" &&
+            hostname !== "[::1]")
         ) {
           rejectOnce(new Error(`Refusing non-loopback http URL: ${target}`));
           return;
@@ -527,7 +522,7 @@ export function downloadToFile(
         request = client.get(resolvedTarget, (response) => {
           activeResponse = response;
           if (settled) {
-            response.resume();
+            response.destroy();
             return;
           }
           const status = response.statusCode ?? 0;
@@ -540,7 +535,7 @@ export function downloadToFile(
             response.headers.location
           ) {
             // Free the socket before following the redirect.
-            response.resume();
+            response.destroy();
             let next: string;
             try {
               next = new URL(
@@ -565,8 +560,29 @@ export function downloadToFile(
             );
             return;
           }
+          const declaredLength = Number(response.headers["content-length"]);
+          if (declaredLength > maxBytes) {
+            rejectOnce(
+              new Error(
+                `SQLite download exceeds size limit (${maxBytes} bytes).`,
+              ),
+            );
+            return;
+          }
           const file = createWriteStream(destPath);
+          downloadFile = file;
           activeFile = file;
+          let receivedBytes = 0;
+          response.on("data", (chunk: Buffer) => {
+            receivedBytes += chunk.length;
+            if (receivedBytes > maxBytes) {
+              rejectOnce(
+                new Error(
+                  `SQLite download exceeds size limit (${maxBytes} bytes).`,
+                ),
+              );
+            }
+          });
           response.on("error", (err: Error) => {
             try {
               file.destroy();
@@ -622,6 +638,113 @@ export function downloadToFile(
     };
     follow(url, 0);
   });
+}
+
+export async function downloadPinnedSQLiteArtifact(
+  pin: SQLiteArtifactPin,
+  destination: string,
+  allowedHosts: readonly string[],
+): Promise<void> {
+  if (
+    !pin.integrity ||
+    !Number.isSafeInteger(pin.size) ||
+    pin.size <= 0 ||
+    pin.size > SQLITE_ARCHIVE_LIMITS.compressedBytes
+  )
+    throw new Error("Missing/invalid static SQLite artifact pin.");
+  await downloadToFile(pin.url, destination, 60_000, {
+    maxBytes: pin.size,
+    allowedHosts,
+  });
+  try {
+    const bytes = readFileSync(destination);
+    if (bytes.length !== pin.size)
+      throw new Error("SQLite artifact size does not match its reviewed pin.");
+    verifySQLiteIntegrity(bytes, pin.integrity);
+  } catch (error) {
+    rmSync(destination, { force: true });
+    throw error;
+  }
+}
+
+/** node-gyp is never allowed to download or reuse global headers. Both gypi
+ * files and Windows node.lib are verified before it sees this private nodedir.
+ */
+export async function preparePinnedSQLiteHeaders(
+  runtimeRoot: string,
+  pins: SQLiteHeaderPins,
+  platform: NodeJS.Platform,
+  arch: NodeJS.Architecture,
+): Promise<string> {
+  const headerDir = join(runtimeRoot, "electron-headers");
+  const archivePath = join(runtimeRoot, "electron-headers.tgz");
+  const library =
+    platform === "win32" ? pins.windowsLibraries[arch] : undefined;
+  if (platform === "win32" && !library)
+    throw new Error(
+      `Unsupported pinned SQLite Windows import library: ${arch}.`,
+    );
+  try {
+    await downloadPinnedSQLiteArtifact(pins.archive, archivePath, [
+      "artifacts.electronjs.org",
+    ]);
+    await extractSQLiteArchive(
+      archivePath,
+      headerDir,
+      "headers",
+      pins.archive.integrity,
+      SQLITE_ARCHIVE_LIMITS,
+      pins.archiveRoot,
+    );
+    const versionHeader = readFileSync(
+      join(headerDir, "include/node/node_version.h"),
+      "utf8",
+    );
+    if (
+      !new RegExp(`#define NODE_MODULE_VERSION\\s+${pins.abi}(?:\\s|$)`).test(
+        versionHeader,
+      )
+    )
+      throw new Error(
+        "Pinned Electron headers do not match the expected SQLite ABI.",
+      );
+    if (library) {
+      const releaseDir = join(headerDir, "Release");
+      mkdirSync(releaseDir);
+      await downloadPinnedSQLiteArtifact(
+        library,
+        join(releaseDir, "node.lib"),
+        ["artifacts.electronjs.org"],
+      );
+    }
+    return headerDir;
+  } catch (error) {
+    rmSync(headerDir, { recursive: true, force: true });
+    throw error;
+  } finally {
+    rmSync(archivePath, { force: true });
+  }
+}
+
+export function sqliteNodeGypArguments(
+  toolDir: string,
+  headerDir: string,
+  headerVersion: string,
+  platform: NodeJS.Platform,
+  arch: NodeJS.Architecture,
+): string[] {
+  assertSQLiteBuildPath(toolDir, "tools", platform);
+  assertSQLiteBuildPath(headerDir, "headers", platform);
+  return [
+    join(toolDir, "node_modules/node-gyp/bin/node-gyp.js"),
+    "rebuild",
+    `--target=${headerVersion}`,
+    `--arch=${arch}`,
+    `--target_platform=${platform}`,
+    `--nodedir=${headerDir}`,
+    `--devdir=${join(toolDir, "node-gyp-devdir")}`,
+    "--release",
+  ];
 }
 
 /**
@@ -693,16 +816,22 @@ async function downloadPatchedPrebuilt(
   const arch = process.arch;
   const tagPrefix = "v";
   const fileName = `better-sqlite3-${tagPrefix}${pkg.version}-electron-${tagPrefix}${abi}-${platform}-${arch}.tar.gz`;
-  const downloadUrl = `${PATCHED_PREBUILDS_RELEASE_URL}/${fileName}`;
+  const pin = sqlitePrebuiltPin("patched", fileName);
+  const downloadUrl = pin.url;
   const tarballPath = join(runtimeRoot, fileName);
 
   try {
     installerLog(`Trying patched prebuilt from ${downloadUrl}…`);
-    await downloadToFile(downloadUrl, tarballPath);
+    await downloadPinnedSQLiteArtifact(pin, tarballPath, GITHUB_DOWNLOAD_HOSTS);
 
     // Extract into the scaffold (tarball contains build/Release/better_sqlite3.node)
     const scaffoldDir = join(runtimeRoot, "node_modules", "better-sqlite3");
-    await execFileAsync("tar", ["xzf", tarballPath, "-C", scaffoldDir]);
+    await extractSQLiteArchive(
+      tarballPath,
+      scaffoldDir,
+      "prebuilt",
+      pin.integrity,
+    );
 
     const binaryPath = join(
       scaffoldDir,
@@ -726,6 +855,9 @@ async function rebuildFromSourceWithPatch(
   runtimeRoot: string,
   baseDir: string,
 ): Promise<void> {
+  // cwd, headers, devdir and private tool/home paths all derive from this root.
+  // Reject expansion syntax before downloading, patching or executing tools.
+  assertSQLiteBuildPath(runtimeRoot, "runtime");
   const pkg = readBundledBetterSqlite3Package(baseDir);
   if (!pkg.version) {
     throw new Error(
@@ -733,41 +865,96 @@ async function rebuildFromSourceWithPatch(
     );
   }
 
-  // Verify npx is available. The build tool version is pinned below.
-  const npxCommand = process.platform === "win32" ? "npx.cmd" : "npx";
-  try {
-    await execFileAsync(npxCommand, ["--version"]);
-  } catch {
-    throw new Error(
-      "npx is required to build better-sqlite3 from source for Electron 42+. " +
-        "Ensure npm is installed and available on PATH.\n" +
-        "Also ensure Python 3 and a C++ compiler are available " +
-        "(Xcode Command Line Tools on macOS, build-essential on Linux, Visual Studio Build Tools on Windows).",
-    );
-  }
-
   const sourceDir = join(runtimeRoot, "better-sqlite3-build-source");
   const tarballPath = join(runtimeRoot, "better-sqlite3-source.tgz");
+  const toolDir = join(runtimeRoot, "sqlite-build-tools");
+  const headerPins = sqliteHeaderPins(
+    process.versions.electron ?? "",
+    process.versions.modules,
+    process.platform,
+    process.arch,
+  );
 
   try {
     // Download the npm package tarball (includes src/, deps/, binding.gyp)
-    const tarballUrl = `https://registry.npmjs.org/better-sqlite3/-/better-sqlite3-${pkg.version}.tgz`;
+    if (pkg.version !== SQLITE_SOURCE.version) {
+      throw new Error(
+        `No locked SQLite source integrity for better-sqlite3 ${pkg.version}. Update the source pin from package-lock.json.`,
+      );
+    }
+    const tarballUrl = SQLITE_SOURCE.url;
     installerLog(`Downloading better-sqlite3 ${pkg.version} source tarball…`);
-    await downloadToFile(tarballUrl, tarballPath);
+    await downloadToFile(tarballUrl, tarballPath, 60_000, {
+      allowedHosts: ["registry.npmjs.org"],
+    });
 
     // Extract
     mkdirSync(sourceDir, { recursive: true });
-    await execFileAsync("tar", [
-      "xzf",
+    await extractSQLiteArchive(
       tarballPath,
-      "-C",
       sourceDir,
-      "--strip-components=1",
-    ]);
+      "source",
+      SQLITE_SOURCE.integrity,
+    );
+    // Read current roots at discovery time; standalone Node callers have no
+    // workspace. Keep the installer/worker independent of the VS Code module.
+    const buildTools = resolveSQLiteBuildTools(
+      findPackageRoot(baseDir) ?? baseDir,
+      runtimeRoot,
+      process.env,
+      installerConfiguration?.workspaceRoots?.() ?? [],
+    );
+    pinSQLiteSourceNodeActions(sourceDir, buildTools.node);
+    const toolLock = createSQLiteBuildToolLock();
+    for (const directory of [
+      buildTools.env.HOME,
+      buildTools.env.TMPDIR,
+      buildTools.env.APPDATA,
+      buildTools.env.LOCALAPPDATA,
+    ]) {
+      if (directory) mkdirSync(directory, { recursive: true });
+    }
+    mkdirSync(toolDir);
+    writeFileSync(
+      join(toolDir, "package.json"),
+      JSON.stringify(toolLock.manifest),
+    );
+    writeFileSync(
+      join(toolDir, "package-lock.json"),
+      JSON.stringify(toolLock.lock),
+    );
+    const userConfig = join(toolDir, "empty-user.npmrc");
+    const globalConfig = join(toolDir, "empty-global.npmrc");
+    writeFileSync(userConfig, "");
+    writeFileSync(globalConfig, "");
+    installerLog(
+      "Installing lockfile-verified SQLite build tools (no install scripts)…",
+    );
+    await execFileAsync(
+      buildTools.node,
+      [
+        buildTools.npmCli,
+        "ci",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        "--registry=https://registry.npmjs.org",
+        `--cache=${join(toolDir, "cache")}`,
+        `--userconfig=${userConfig}`,
+        `--globalconfig=${globalConfig}`,
+      ],
+      { cwd: toolDir, timeout: 300_000, env: buildTools.env },
+    );
 
     // Apply the Electron 42 V8 API patch
     installerLog("Applying Electron 42 V8 API compatibility patch…");
     applyElectron42V8Patch(sourceDir);
+    const headerDir = await preparePinnedSQLiteHeaders(
+      runtimeRoot,
+      headerPins,
+      process.platform,
+      process.arch,
+    );
 
     // Build native module for the current Electron ABI
     const electronVersion = process.versions.electron;
@@ -775,18 +962,15 @@ async function rebuildFromSourceWithPatch(
       `Building better-sqlite3 from source for Electron ${electronVersion} (ABI ${process.versions.modules}, ${process.platform}-${process.arch})…`,
     );
     await execFileAsync(
-      npxCommand,
-      [
-        "--yes",
-        "node-gyp@12.4.0",
-        "rebuild",
-        `--target=${electronVersion}`,
-        `--arch=${process.arch}`,
-        `--target_platform=${process.platform}`,
-        "--dist-url=https://electronjs.org/headers",
-        "--runtime=electron",
-      ],
-      { cwd: sourceDir, timeout: 300_000 },
+      buildTools.node,
+      sqliteNodeGypArguments(
+        toolDir,
+        headerDir,
+        headerPins.version,
+        process.platform,
+        process.arch,
+      ),
+      { cwd: sourceDir, timeout: 300_000, env: buildTools.env },
     );
 
     // Copy the built binary into the scaffold
@@ -816,6 +1000,12 @@ async function rebuildFromSourceWithPatch(
   } finally {
     rmSync(tarballPath, { force: true });
     rmSync(sourceDir, { recursive: true, force: true });
+    rmSync(toolDir, { recursive: true, force: true });
+    rmSync(join(runtimeRoot, "electron-headers"), {
+      recursive: true,
+      force: true,
+    });
+    rmSync(join(runtimeRoot, "build-home"), { recursive: true, force: true });
   }
 }
 
@@ -823,21 +1013,6 @@ async function downloadPrebuiltBinary(
   runtimeRoot: string,
   baseDir: string,
 ): Promise<void> {
-  const prebuildInstall = require("prebuild-install") as {
-    download: PrebuildInstallDownload;
-  };
-  const prebuildInstallUtil = require("prebuild-install/util") as {
-    getDownloadUrl(options: {
-      pkg: BetterSqlite3PackageJson;
-      runtime: "electron" | "node";
-      abi: string;
-      platform: NodeJS.Platform;
-      arch: NodeJS.Architecture;
-      libc?: string;
-      "tag-prefix": string;
-    }): string;
-  };
-
   const betterSqlite3PackageRoot = join(
     runtimeRoot,
     "node_modules",
@@ -846,35 +1021,28 @@ async function downloadPrebuiltBinary(
   const pkg = JSON.parse(
     readFileSync(join(betterSqlite3PackageRoot, "package.json"), "utf8"),
   ) as BetterSqlite3PackageJson;
-  const options = {
-    pkg,
-    runtime: currentRuntime(),
-    abi: process.versions.modules,
-    platform: process.platform,
-    arch: process.arch,
-    libc: detectLinuxLibc(),
-    path: betterSqlite3PackageRoot,
-    force: true,
-    nolocal: true,
-    "tag-prefix": "v",
-    log: createLogger(),
-  };
-  const downloadUrl = prebuildInstallUtil.getDownloadUrl(options);
+  if (
+    !pkg.version ||
+    !/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(pkg.version)
+  ) {
+    throw new Error("Invalid better-sqlite3 version for runtime installation.");
+  }
+  const fileName = `better-sqlite3-v${pkg.version}-${currentRuntime()}-v${process.versions.modules}-${process.platform}${detectLinuxLibc()}-${process.arch}.tar.gz`;
+  // Do not use prebuild-install's environment-controlled mirrors, npm cache,
+  // arbitrary archive extraction, or require() of a downloaded addon here.
+  const tarballPath = join(runtimeRoot, "official-prebuilt.tar.gz");
 
   try {
-    await new Promise<void>((resolvePromise, rejectPromise) => {
-      prebuildInstall.download(downloadUrl, options, (error) => {
-        if (error) {
-          rejectPromise(
-            new Error(
-              `Could not download the SQLite runtime for ${currentTargetLabel()} (${currentRuntime()}, ABI ${process.versions.modules}) from ${downloadUrl}. ${errorMessage(error)}`,
-            ),
-          );
-          return;
-        }
-        resolvePromise();
-      });
-    });
+    const pin = sqlitePrebuiltPin("official", fileName);
+    const downloadUrl = pin.url;
+    installerLog(`Downloading official SQLite prebuilt from ${downloadUrl}…`);
+    await downloadPinnedSQLiteArtifact(pin, tarballPath, GITHUB_DOWNLOAD_HOSTS);
+    await extractSQLiteArchive(
+      tarballPath,
+      betterSqlite3PackageRoot,
+      "prebuilt",
+      pin.integrity,
+    );
 
     const binaryPath = join(
       betterSqlite3PackageRoot,
@@ -890,7 +1058,10 @@ async function downloadPrebuiltBinary(
   } catch (prebuiltError) {
     // Electron 42+ (NODE_MODULE_VERSION >= 146) has no published prebuilts
     // yet. Try patched prebuilt first (no build tools needed), then source build.
-    if (Number(process.versions.modules) >= 146) {
+    if (
+      currentRuntime() === "electron" &&
+      Number(process.versions.modules) >= 146
+    ) {
       // Step 1: try patched prebuilt from RapiDB GitHub releases
       let patchedPrebuiltInstalled = false;
       try {
@@ -909,12 +1080,16 @@ async function downloadPrebuiltBinary(
           await rebuildFromSourceWithPatch(runtimeRoot, baseDir);
         } catch (sourceError) {
           installerLog(`Source build failed: ${errorMessage(sourceError)}`);
-          throw prebuiltError;
+          throw new Error(
+            `SQLite runtime installation failed. Official prebuilt: ${errorMessage(prebuiltError)}. Verified source build: ${errorMessage(sourceError)}. Patched prebuilts require a published upstream release and reviewed static pins.`,
+          );
         }
       }
     } else {
       throw prebuiltError;
     }
+  } finally {
+    rmSync(tarballPath, { force: true });
   }
 
   writeFileSync(
@@ -971,6 +1146,7 @@ export function configureSQLiteInstaller(
     storageRoot: resolve(configuration.storageRoot),
     log: configuration.log,
     allowInstall: configuration.allowInstall,
+    workspaceRoots: configuration.workspaceRoots,
   };
 }
 

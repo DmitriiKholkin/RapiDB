@@ -662,7 +662,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     sshHostVerificationMode === "trustOnFirstUse"
       ? sshHostFingerprintSha256.trim().length > 0
         ? `The first accepted SSH fingerprint is pinned automatically. Current pinned fingerprint: ${sshHostFingerprintSha256.trim()}`
-        : "The first successful SSH handshake will pin the discovered SHA256 fingerprint automatically and enforce it on future connections."
+        : "The first successful database connection through SSH will pin the discovered SHA256 fingerprint automatically and enforce it on future connections. Test Connection does not save a pin."
       : "Required. Use the OpenSSH SHA256 fingerprint format, for example SHA256:AbCdEf...";
   const sqliteWalHint =
     sqliteWalMode === "off"

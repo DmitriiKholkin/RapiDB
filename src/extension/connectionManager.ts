@@ -39,6 +39,7 @@ import {
 } from "./connectionManagerStore";
 import {
   hasPersistedConnectionConfigChanges,
+  sanitizeConnectionConfigForResponse,
   sanitizePersistedConnectionConfig,
   serializeConnectionSecretsForStoredConfig,
   shouldForceSecretStorage,
@@ -118,6 +119,7 @@ interface InternalScopedSchemaCacheEntry extends ScopedSchemaCacheEntry {
 interface InternalTableDetailCacheEntry extends TableDetailState {
   generation: number;
   loading: Promise<void> | null;
+  waitingForSchema: Promise<void> | null;
 }
 
 interface ConnectionSchemaCacheEntry extends SchemaSnapshotState {
@@ -312,6 +314,7 @@ function createInternalTableDetailCacheEntry(
     ...createEmptyTableDetailState(request),
     generation,
     loading: null,
+    waitingForSchema: null,
   };
 }
 
@@ -1088,7 +1091,7 @@ export class ConnectionManager
       await this.disconnectFrom(canonicalConfig.id);
     }
     this._onDidChangeConnections.fire();
-    return canonicalConfig;
+    return sanitizeConnectionConfigForResponse(persistedConfig);
   }
   async removeConnection(id: string): Promise<boolean> {
     this._assertNotDisposed();
@@ -1739,30 +1742,43 @@ export class ConnectionManager
   }
 
   private async persistTrustedSshFingerprintIfNeeded(
-    connectionId: string,
+    config: ConnectionConfig,
     fingerprintSha256: string,
+    signal: AbortSignal,
   ): Promise<void> {
+    const ssh = config.ssh;
+    if (ssh?.hostVerificationMode !== "trustOnFirstUse") return;
+    const connectionId = config.id;
     const changed = await this.store.mutateConnections((connections) => {
-      let updated = false;
-      const next = connections.map((connection) => {
-        if (
-          connection.id !== connectionId ||
-          !connection.ssh ||
-          connection.ssh.hostVerificationMode !== "trustOnFirstUse" ||
-          connection.ssh.hostFingerprintSha256?.trim() === fingerprintSha256
-        ) {
-          return connection;
-        }
-        updated = true;
-        return {
-          ...connection,
-          ssh: {
-            ...connection.ssh,
-            hostFingerprintSha256: fingerprintSha256,
-          },
-        };
-      });
-      return { connections: updated ? next : undefined, result: updated };
+      // The mutation may have waited behind an edit or another first-use pin.
+      // Never apply a learned key to a different endpoint or replace a pin.
+      signal.throwIfAborted();
+      const index = connections.findIndex((c) => c.id === connectionId);
+      const connection = connections[index];
+      const currentSsh = connection?.ssh;
+      if (
+        currentSsh?.hostVerificationMode !== "trustOnFirstUse" ||
+        currentSsh.host?.trim() !== ssh.host?.trim() ||
+        (currentSsh.port ?? 22) !== (ssh.port ?? 22) ||
+        currentSsh.username?.trim() !== ssh.username?.trim() ||
+        (ssh.hostFingerprintSha256?.trim() &&
+          !currentSsh.hostFingerprintSha256?.trim()) ||
+        (currentSsh.hostFingerprintSha256?.trim() &&
+          currentSsh.hostFingerprintSha256.trim() !== fingerprintSha256)
+      ) {
+        throw new Error(
+          "[RapiDB] SSH trust settings changed during connection setup. Please retry.",
+        );
+      }
+      if (currentSsh.hostFingerprintSha256?.trim() === fingerprintSha256) {
+        return { result: false };
+      }
+      const next = [...connections];
+      next[index] = {
+        ...connection,
+        ssh: { ...currentSsh, hostFingerprintSha256: fingerprintSha256 },
+      };
+      return { connections: next, result: true };
     });
     if (!changed) return;
     this._connectionsCache = null;
@@ -1792,7 +1808,6 @@ export class ConnectionManager
   }
 
   private async connectPreparedDriver(
-    id: string,
     config: ConnectionConfig,
     signal: AbortSignal,
     persistTrustedFingerprint = true,
@@ -1810,12 +1825,6 @@ export class ConnectionManager
     };
 
     try {
-      if (prepared.runtime && persistTrustedFingerprint) {
-        await this.persistTrustedSshFingerprintIfNeeded(
-          id,
-          prepared.runtime.verifiedFingerprintSha256,
-        );
-      }
       driver = this.createDriver(prepared.config);
       signal.addEventListener("abort", onAbort, { once: true });
       if (signal.aborted) {
@@ -1835,10 +1844,19 @@ export class ConnectionManager
         }
       });
       await Promise.race([pendingConnect, abortPromise]);
+      signal.throwIfAborted();
+      if (prepared.runtime && persistTrustedFingerprint) {
+        await this.persistTrustedSshFingerprintIfNeeded(
+          config,
+          prepared.runtime.verifiedFingerprintSha256,
+          signal,
+        );
+      }
+      signal.throwIfAborted();
       return { driver, runtime: prepared.runtime };
     } catch (err) {
       await this.disposeUnboundConnectionResources(driver, prepared.runtime);
-      throw err;
+      throw normalizeUnknownError(err, config);
     } finally {
       signal.removeEventListener("abort", onAbort);
     }
@@ -1940,7 +1958,6 @@ export class ConnectionManager
         }
 
         const { driver, runtime } = await this.connectPreparedDriver(
-          id,
           fullConfig,
           ac.signal,
         );
@@ -1961,8 +1978,9 @@ export class ConnectionManager
         resolveAttempt();
       } catch (err) {
         if (
-          err instanceof DOMException &&
-          err.name === "AbortError" &&
+          // Diagnostics may be sanitized copies with different names/types.
+          // Cancellation is owned by this attempt, not by its error text.
+          ac.signal.aborted &&
           this._isStaleConnectEpoch(id, connectEpoch)
         ) {
           resolveAttempt();
@@ -2224,16 +2242,18 @@ export class ConnectionManager
       indexes: { status: "loading", items: [] },
       triggers: { status: "loading", items: [] },
     };
+    tableDetailEntry.waitingForSchema = schemaEntry.loading;
     this._onDidChangeSchemaState.fire(request.connectionId);
 
     let loadPromise: Promise<void> | null = null;
     loadPromise = (async () => {
       try {
-        if (schemaEntry.loading) {
+        if (tableDetailEntry.waitingForSchema) {
           try {
-            await schemaEntry.loading;
+            await tableDetailEntry.waitingForSchema;
           } catch {}
         }
+        tableDetailEntry.waitingForSchema = null;
 
         if (
           !this._isLiveTableDetailEntry(
@@ -2690,7 +2710,7 @@ export class ConnectionManager
         scopeEntry.scope.database,
         schema,
       );
-      scopeEntry.fragment = { schema };
+      this._replaceSchemaScopeFragment(scopeEntry, schema);
     }
     const error = normalizeUnknownError(err);
     scopeEntry.status = "error";
@@ -3105,9 +3125,11 @@ export class ConnectionManager
         );
         schemaEntry.status = "loaded";
         schemaEntry.isPartial = false;
-        schemaEntry.fragment = {
-          schema: cloneSchemaSnapshotSchemaEntry(schema),
-        };
+        this._replaceSchemaScopeFragment(
+          schemaEntry,
+          schema,
+          schemaLoadPromise,
+        );
         schemaEntry.fullyLoaded = true;
         delete schemaEntry.error;
         this._commitAggregateSchemaState(connectionId, entry, true);
@@ -3149,14 +3171,34 @@ export class ConnectionManager
     schemaEntry.snapshot = createScopeSnapshotForSchema(databaseName, schema);
     schemaEntry.status = "loaded";
     schemaEntry.isPartial = false;
-    schemaEntry.fragment = {
-      schema: cloneSchemaSnapshotSchemaEntry(schema),
-    };
+    this._replaceSchemaScopeFragment(schemaEntry, schema);
     schemaEntry.retainOnCollapse =
       schemaEntry.retainOnCollapse || retainOnCollapse;
     schemaEntry.fullyLoaded = true;
     schemaEntry.loading = null;
     delete schemaEntry.error;
+  }
+
+  private _replaceSchemaScopeFragment(
+    schemaEntry: InternalScopedSchemaCacheEntry,
+    schema: SchemaSnapshotSchemaEntry,
+    completedLoad: Promise<void> | null = null,
+  ): void {
+    // Table details are fetched independently from the schema fragment. A
+    // replacement may change columns or any lazy-loaded section (constraints,
+    // indexes, triggers), so none of those details can remain authoritative.
+    // Clearing this scope's entries also fences in-flight detail loads via
+    // _isLiveTableDetailEntry.
+    for (const [key, detail] of schemaEntry.tableDetails) {
+      // A request waiting for this exact load has not read old metadata yet.
+      // Let it continue against the completed schema; fence every other entry.
+      if (!completedLoad || detail.waitingForSchema !== completedLoad) {
+        schemaEntry.tableDetails.delete(key);
+      }
+    }
+    schemaEntry.fragment = {
+      schema: cloneSchemaSnapshotSchemaEntry(schema),
+    };
   }
 
   private async _loadConnectionRootCatalog(
@@ -3322,7 +3364,6 @@ export class ConnectionManager
     try {
       const testSignal = signal ?? new AbortController().signal;
       const prepared = await this.connectPreparedDriver(
-        TEST_CONNECTION_ID,
         configWithId,
         testSignal,
         false,
@@ -3331,7 +3372,7 @@ export class ConnectionManager
       driver = prepared.driver;
       return { success: true };
     } catch (err: unknown) {
-      const error = normalizeUnknownError(err);
+      const error = normalizeUnknownError(err, configWithId);
       return { success: false, error: error.message };
     } finally {
       await this.disposeUnboundConnectionResources(driver, runtime);

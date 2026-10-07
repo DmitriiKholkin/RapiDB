@@ -24,6 +24,9 @@ import {
   TOOLBAR_H,
 } from "./queryViewHelpers";
 
+const BLANK_QUERY_VALIDATION_MESSAGE =
+  "Select or enter a query before running.";
+
 interface QueryViewControllerParams {
   panelId: string;
   connectionId: string;
@@ -75,6 +78,7 @@ export function useQueryViewController({
     operationId: string;
     connectionId: string;
   } | null>(null);
+  const blankQueryValidationRef = useRef(false);
 
   const [editorHeight, setEditorHeight] = useState(DEFAULT_EDITOR_H);
   const [isResizing, setIsResizing] = useState(false);
@@ -86,6 +90,24 @@ export function useQueryViewController({
     bookmarkedRef.current = false;
     setBookmarked(false);
     setBookmarking(false);
+  }, []);
+
+  const clearBlankQueryValidation = useCallback((queryText: string) => {
+    if (!queryText.trim() || !blankQueryValidationRef.current) {
+      return;
+    }
+
+    const queryState = useQueryStore.getState();
+    if (
+      queryState.status !== "error" ||
+      queryState.result?.error !== BLANK_QUERY_VALIDATION_MESSAGE
+    ) {
+      blankQueryValidationRef.current = false;
+      return;
+    }
+
+    blankQueryValidationRef.current = false;
+    queryState.reset();
   }, []);
 
   useEffect(() => {
@@ -160,10 +182,12 @@ export function useQueryViewController({
           return;
         }
         if (payload.error) {
+          blankQueryValidationRef.current = false;
           setError(payload.error);
           return;
         }
 
+        blankQueryValidationRef.current = false;
         setResult(payload);
       },
     );
@@ -231,6 +255,7 @@ export function useQueryViewController({
         bookmarkConnectionRef.current = nextConnectionId;
         invalidateBookmark();
       }
+      blankQueryValidationRef.current = false;
       activeOperationRef.current = null;
       reset();
       setActiveConnection(nextConnectionId);
@@ -291,11 +316,17 @@ export function useQueryViewController({
   }, [editorState.shouldFormatOnOpen]);
 
   const executeQuery = useCallback(() => {
+    // Monaco shortcuts remain available while Run is disabled. Do not let a
+    // repeated submission (including blank validation) replace an active run.
+    if (useQueryStore.getState().status === "running") return;
     const queryText = editorRef.current?.getSelectionOrValue().trim() ?? "";
     if (!queryText) {
+      blankQueryValidationRef.current = true;
+      setError(BLANK_QUERY_VALIDATION_MESSAGE);
       return;
     }
 
+    blankQueryValidationRef.current = false;
     setRunning();
     const operationId = `${panelId}:${++operationSequenceRef.current}`;
     activeOperationRef.current = {
@@ -307,7 +338,7 @@ export function useQueryViewController({
       connectionId: resolvedConnectionId,
       operationId,
     });
-  }, [panelId, resolvedConnectionId, setRunning]);
+  }, [panelId, resolvedConnectionId, setError, setRunning]);
 
   const clearQuery = useCallback(() => {
     editorRef.current?.setValue("");
@@ -320,6 +351,7 @@ export function useQueryViewController({
 
     const error = editorRef.current?.format(editorState.sqlDialect) ?? null;
     if (error) {
+      blankQueryValidationRef.current = false;
       setError(`${editorState.formatErrorPrefix}: ${error}`);
     }
   }, [
@@ -354,9 +386,16 @@ export function useQueryViewController({
     (value: string) => {
       bookmarkTextRef.current = value.trim();
       invalidateBookmark();
+      clearBlankQueryValidation(
+        editorRef.current?.getSelectionOrValue() ?? value,
+      );
     },
-    [invalidateBookmark],
+    [clearBlankQueryValidation, invalidateBookmark],
   );
+
+  const handleEditorSelectionChange = useCallback(() => {
+    clearBlankQueryValidation(editorRef.current?.getSelectionOrValue() ?? "");
+  }, [clearBlankQueryValidation]);
 
   const startResizing = useCallback(
     (event: React.MouseEvent<HTMLButtonElement>) => {
@@ -411,6 +450,7 @@ export function useQueryViewController({
     handleBookmark,
     handleConnectionChange,
     handleEditorChange,
+    handleEditorSelectionChange,
     isResizing,
     result,
     schema,

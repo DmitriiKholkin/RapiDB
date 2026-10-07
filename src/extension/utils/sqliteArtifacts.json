@@ -1,0 +1,1147 @@
+{
+  "schemaVersion": 2,
+  "betterSqlite3Version": "12.10.0",
+  "officialRelease": {
+    "apiUrl": "https://api.github.com/repos/WiseLibs/better-sqlite3/releases/tags/v12.10.0",
+    "status": 200,
+    "repo": "WiseLibs/better-sqlite3",
+    "tag": "v12.10.0",
+    "id": 321008618
+  },
+  "patchedRelease": {
+    "apiUrl": "https://api.github.com/repos/DmitriiKholkin/RapiDB/releases/tags/rapidb-patched-sqlite",
+    "status": 404,
+    "repo": "DmitriiKholkin/RapiDB",
+    "tag": "rapidb-patched-sqlite"
+  },
+  "prebuilts": {
+    "official/better-sqlite3-v12.10.0-electron-v121-darwin-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v121-darwin-arm64.tar.gz",
+      "integrity": "sha256-691VMfTCz9bX2GfrUhVC0h1OPu6Rg19bvB3YSTDNn5c=",
+      "size": 973345,
+      "releaseId": 321008618,
+      "assetId": 418187747,
+      "apiDigest": "sha256:ebdd5531f4c2cfd6d7d867eb521542d21d4e3eee91835f5bbc1dd84930cd9f97"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v121-darwin-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v121-darwin-x64.tar.gz",
+      "integrity": "sha256-V+eYOu9VT1WXTJJGxuM5+0pnWj47dVswrBveUMsaRZ4=",
+      "size": 1018828,
+      "releaseId": 321008618,
+      "assetId": 418189580,
+      "apiDigest": "sha256:57e7983aef554f55974c9246c6e339fb4a675a3e3b755b30ac1bde50cb1a459e"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v121-linux-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v121-linux-arm64.tar.gz",
+      "integrity": "sha256-3bg9XltRVNwHh0GnjGFomKDsQLIZT/SDm6uhc4FP4t4=",
+      "size": 1063677,
+      "releaseId": 321008618,
+      "assetId": 418258119,
+      "apiDigest": "sha256:ddb83d5e5b5154dc078741a78c616898a0ec40b2194ff4839baba173814fe2de"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v121-linux-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v121-linux-x64.tar.gz",
+      "integrity": "sha256-n0UIRVGiCtwuPOAFKv3Ke1T5emQt0wAfhUU+iJ0Ihio=",
+      "size": 1087234,
+      "releaseId": 321008618,
+      "assetId": 418190192,
+      "apiDigest": "sha256:9f45084551a20adc2e3ce0052afdca7b54f97a642dd3001f85453e889d08862a"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v121-win32-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v121-win32-arm64.tar.gz",
+      "integrity": "sha256-Q16hoOHfycKPA8TU54Rr8ziTaXefhWNV1tYIauSift8=",
+      "size": 905200,
+      "releaseId": 321008618,
+      "assetId": 418196596,
+      "apiDigest": "sha256:435ea1a0e1dfc9c28f03c4d4e7846bf3389369779f856355d6d6086ae4a27edf"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v121-win32-ia32.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v121-win32-ia32.tar.gz",
+      "integrity": "sha256-Do82iAIxMMOtE+YZqvtASpUKZHkMa9pIyydt6VCSiHs=",
+      "size": 861184,
+      "releaseId": 321008618,
+      "assetId": 418193109,
+      "apiDigest": "sha256:0e8f3688023130c3ad13e619aafb404a950a64790c6bda48cb276de95092887b"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v121-win32-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v121-win32-x64.tar.gz",
+      "integrity": "sha256-esfagZ5RPKjfBt11AEininz9EFGH4dJ6Cc8VohjeXOY=",
+      "size": 1035797,
+      "releaseId": 321008618,
+      "assetId": 418189104,
+      "apiDigest": "sha256:7ac7da819e513ca8df06dd750048a78a7cfd105187e1d27a09cf15a218de5ce6"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v123-darwin-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v123-darwin-arm64.tar.gz",
+      "integrity": "sha256-cA/be6BqZp3wwuWqjCMuMweOdT1CJAWyr+8U/4beQXE=",
+      "size": 973345,
+      "releaseId": 321008618,
+      "assetId": 418187743,
+      "apiDigest": "sha256:700fdb7ba06a669df0c2e5aa8c232e33078e753d422405b2afef14ff86de4171"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v123-darwin-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v123-darwin-x64.tar.gz",
+      "integrity": "sha256-nNLNAKbzQMoDzMKvNwgqRqHjVC9Ki2I1zR9VKFypSzc=",
+      "size": 1018831,
+      "releaseId": 321008618,
+      "assetId": 418189579,
+      "apiDigest": "sha256:9cd2cd00a6f340ca03ccc2af37082a46a1e3542f4a8b6235cd1f55285ca94b37"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v123-linux-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v123-linux-arm64.tar.gz",
+      "integrity": "sha256-v3YBMOIQLJG2veaKNEFYW30UL8BRFpuoRzgAINalSWo=",
+      "size": 1063681,
+      "releaseId": 321008618,
+      "assetId": 418258122,
+      "apiDigest": "sha256:bf760130e2102c91b6bde68a3441585b7d142fc051169ba847380020d6a5496a"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v123-linux-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v123-linux-x64.tar.gz",
+      "integrity": "sha256-Prb75Hdl0IgkiqPnLaEfe8mww+29KCtHvvmvJ7wQEyQ=",
+      "size": 1087230,
+      "releaseId": 321008618,
+      "assetId": 418190184,
+      "apiDigest": "sha256:3eb6fbe47765d088248aa3e72da11f7bc9b0c3edbd282b47bef9af27bc101324"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v123-win32-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v123-win32-arm64.tar.gz",
+      "integrity": "sha256-kZAdjIISAMRKxrmYwRI7ydqU/2wOgvWrRlZsjFmb6CM=",
+      "size": 905198,
+      "releaseId": 321008618,
+      "assetId": 418196601,
+      "apiDigest": "sha256:91901d8c821200c44ac6b998c1123bc9da94ff6c0e82f5ab46566c8c599be823"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v123-win32-ia32.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v123-win32-ia32.tar.gz",
+      "integrity": "sha256-YPHG9y+SuJUpKKEulicv9TJ1LY+BiKEUjVGmIYlXACY=",
+      "size": 861183,
+      "releaseId": 321008618,
+      "assetId": 418193110,
+      "apiDigest": "sha256:60f1c6f72f92b8952928a12e96272ff532752d8f8188a1148d51a62189570026"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v123-win32-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v123-win32-x64.tar.gz",
+      "integrity": "sha256-nMiYgjkt7V/QbaY5LRA/+R4Qk7VPgXi5jiR58KE71mY=",
+      "size": 1035799,
+      "releaseId": 321008618,
+      "assetId": 418189102,
+      "apiDigest": "sha256:9cc89882392ded5fd06da6392d103ff91e1093b54f8178b98e2479f0a13bd666"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v125-darwin-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v125-darwin-arm64.tar.gz",
+      "integrity": "sha256-TcxMrG9yKNHwCxDN+Vbgq5/XBWV22m2e20J4mA2MD2A=",
+      "size": 973343,
+      "releaseId": 321008618,
+      "assetId": 418187745,
+      "apiDigest": "sha256:4dcc4cac6f7228d1f00b10cdf956e0ab9fd7056576da6d9edb4278980d8c0f60"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v125-darwin-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v125-darwin-x64.tar.gz",
+      "integrity": "sha256-nySmvYNvn/Q/d1Rn2Dym0NQCDCkFsIrCLbnG2qbpM+U=",
+      "size": 1018831,
+      "releaseId": 321008618,
+      "assetId": 418189574,
+      "apiDigest": "sha256:9f24a6bd836f9ff43f775467d83ca6d0d4020c2905b08ac22db9c6daa6e933e5"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v125-linux-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v125-linux-arm64.tar.gz",
+      "integrity": "sha256-D8MxyC5GkF1lIe0+4VIeIije2+FtSanT4WH2qgOYG6g=",
+      "size": 1063670,
+      "releaseId": 321008618,
+      "assetId": 418258121,
+      "apiDigest": "sha256:0fc331c82e46905d6521ed3ee1521e2228dedbe16d49a9d3e161f6aa03981ba8"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v125-linux-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v125-linux-x64.tar.gz",
+      "integrity": "sha256-JPRaXy7xML81sjPM1A/9CCV0aZuDPcZjVUaapcX0uHw=",
+      "size": 1087237,
+      "releaseId": 321008618,
+      "assetId": 418190190,
+      "apiDigest": "sha256:24f45a5f2ef130bf35b233ccd40ffd082574699b833dc66355469aa5c5f4b87c"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v125-win32-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v125-win32-arm64.tar.gz",
+      "integrity": "sha256-CnB/gDuO1SUUMl7QfAl1Xs+2Yu153pN+n3x6x9jGPK8=",
+      "size": 905194,
+      "releaseId": 321008618,
+      "assetId": 418196604,
+      "apiDigest": "sha256:0a707f803b8ed52514325ed07c09755ecfb662ed79de937e9f7c7ac7d8c63caf"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v125-win32-ia32.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v125-win32-ia32.tar.gz",
+      "integrity": "sha256-VsRBFSYxuuyq1oQVhmMWmnVSLDBmhXY6hNfjL4g8omk=",
+      "size": 861184,
+      "releaseId": 321008618,
+      "assetId": 418193106,
+      "apiDigest": "sha256:56c441152631baecaad684158663169a75522c306685763a84d7e32f883ca269"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v125-win32-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v125-win32-x64.tar.gz",
+      "integrity": "sha256-ICb66Bwflx72ooeiStG+AnvZ9RH2uElr79CPSKrO798=",
+      "size": 1035798,
+      "releaseId": 321008618,
+      "assetId": 418189107,
+      "apiDigest": "sha256:2026fae81c1f971ef6a287a24ad1be027bd9f511f6b8496befd08f48aaceefdf"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v128-darwin-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v128-darwin-arm64.tar.gz",
+      "integrity": "sha256-NLY365oF+eT9MViQ1ygoKoh7Hffzj7bveApQt0yzTwg=",
+      "size": 975875,
+      "releaseId": 321008618,
+      "assetId": 418187740,
+      "apiDigest": "sha256:34b637eb9a05f9e4fd315890d728282a887b1df7f38fb6ef780a50b74cb34f08"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v128-darwin-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v128-darwin-x64.tar.gz",
+      "integrity": "sha256-jes7kY49ysYJaeH7Jam+Wf7cgtIwEZnlIkjZ/jbE/6c=",
+      "size": 1021202,
+      "releaseId": 321008618,
+      "assetId": 418189576,
+      "apiDigest": "sha256:8deb3b918e3dcac60969e1fb25a9be59fedc82d2301199e52248d9fe36c4ffa7"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v128-linux-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v128-linux-arm64.tar.gz",
+      "integrity": "sha256-pSEhQYTC+WEufoHbxLtyac8o3De0R4iSZ4HvhP14z/k=",
+      "size": 1064999,
+      "releaseId": 321008618,
+      "assetId": 418258120,
+      "apiDigest": "sha256:a521214184c2f9612e7e81dbc4bb7269cf28dc37b44788926781ef84fd78cff9"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v128-linux-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v128-linux-x64.tar.gz",
+      "integrity": "sha256-Uf2Dm8yUkrAYVcNUxn0AwjABw8a1lcAj/6JEQCxdOjM=",
+      "size": 1089230,
+      "releaseId": 321008618,
+      "assetId": 418190191,
+      "apiDigest": "sha256:51fd839bcc9492b01855c354c67d00c23001c3c6b595c023ffa244402c5d3a33"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v128-win32-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v128-win32-arm64.tar.gz",
+      "integrity": "sha256-gPK1I/H0OS+H2kvPminM6g7T0sJ4wGLV2g2HmHduvJ0=",
+      "size": 906775,
+      "releaseId": 321008618,
+      "assetId": 418196598,
+      "apiDigest": "sha256:80f2b523f1f4392f87da4bcf9a29ccea0ed3d2c278c062d5da0d8798776ebc9d"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v128-win32-ia32.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v128-win32-ia32.tar.gz",
+      "integrity": "sha256-RhG6CGWdguqJBDtcUXvBVZYOHbEz4XxXJL6kxNal79o=",
+      "size": 862763,
+      "releaseId": 321008618,
+      "assetId": 418193114,
+      "apiDigest": "sha256:4611ba08659d82ea89043b5c517bc155960e1db133e17c5724bea4c4d6a5efda"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v128-win32-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v128-win32-x64.tar.gz",
+      "integrity": "sha256-SigZjyp+zk6ifdqbqZxQ3wQSMGQ2hWNhwRIrzjKBvDw=",
+      "size": 1038190,
+      "releaseId": 321008618,
+      "assetId": 418189109,
+      "apiDigest": "sha256:4a28198f2a7ece4ea27dda9ba99c50df0412306436856361c1122bce3281bc3c"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v130-darwin-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v130-darwin-arm64.tar.gz",
+      "integrity": "sha256-Cry4clM2P6Mpe3Skxn7E0p2/uWvn26fLFDyaDeGflqk=",
+      "size": 975986,
+      "releaseId": 321008618,
+      "assetId": 418187744,
+      "apiDigest": "sha256:0abcb87253363fa3297b74a4c67ec4d29dbfb96be7dba7cb143c9a0de19f96a9"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v130-darwin-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v130-darwin-x64.tar.gz",
+      "integrity": "sha256-mqgtnM9WWO8lA4/sqHg/56rZy7rCTIPm/lFqyFkGcKU=",
+      "size": 1021271,
+      "releaseId": 321008618,
+      "assetId": 418189572,
+      "apiDigest": "sha256:9aa82d9ccf5658ef25038feca8783fe7aad9cbbac24c83e6fe516ac8590670a5"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v130-linux-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v130-linux-arm64.tar.gz",
+      "integrity": "sha256-m5m9Oya03jx1xWQe8WrnU01kS/3cBwdwZDPPiyxsGFs=",
+      "size": 1064994,
+      "releaseId": 321008618,
+      "assetId": 418258125,
+      "apiDigest": "sha256:9b99bd3b26b4de3c75c5641ef16ae7534d644bfddc0707706433cf8b2c6c185b"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v130-linux-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v130-linux-x64.tar.gz",
+      "integrity": "sha256-pzvcvQUPhEqtgSkOPvRGyXHMZM+OXPafLUjWAaYYv3g=",
+      "size": 1089334,
+      "releaseId": 321008618,
+      "assetId": 418190183,
+      "apiDigest": "sha256:a73bdcbd050f844aad81290e3ef446c971cc64cf8e5cf69f2d48d601a618bf78"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v130-win32-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v130-win32-arm64.tar.gz",
+      "integrity": "sha256-BASdn0wTTAchpiwYh7jM0D20NlKFuBGO0bw1nOI/YHs=",
+      "size": 906866,
+      "releaseId": 321008618,
+      "assetId": 418196599,
+      "apiDigest": "sha256:04049d9f4c134c0721a62c1887b8ccd03db4365285b8118ed1bc359ce23f607b"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v130-win32-ia32.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v130-win32-ia32.tar.gz",
+      "integrity": "sha256-O/nxVCfv9sv0H/ZWBskdC/L/AX1dKNnSf3P+GoM6CTI=",
+      "size": 862833,
+      "releaseId": 321008618,
+      "assetId": 418193108,
+      "apiDigest": "sha256:3bf9f15427eff6cbf41ff65606c91d0bf2ff017d5d28d9d27f73fe1a833a0932"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v130-win32-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v130-win32-x64.tar.gz",
+      "integrity": "sha256-C83v/AngxdaGQxPqTPo1ROPD9WxVOzm2H1ayo+oxCUg=",
+      "size": 1038278,
+      "releaseId": 321008618,
+      "assetId": 418189101,
+      "apiDigest": "sha256:0bcdeffc09e0c5d6864313ea4cfa3544e3c3f56c553b39b61f56b2a3ea310948"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v132-darwin-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v132-darwin-arm64.tar.gz",
+      "integrity": "sha256-nW5Y526kibOg/eaNOs+VNMoRKla2lGWSb5xFG5KLwnE=",
+      "size": 975980,
+      "releaseId": 321008618,
+      "assetId": 418187742,
+      "apiDigest": "sha256:9d6e58e76ea489b3a0fde68d3acf9534ca112a56b69465926f9c451b928bc271"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v132-darwin-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v132-darwin-x64.tar.gz",
+      "integrity": "sha256-bHPaqC78/bwcrTyKjhjMD+l1WiytoOkV63EuTKOVa6A=",
+      "size": 1021274,
+      "releaseId": 321008618,
+      "assetId": 418189577,
+      "apiDigest": "sha256:6c73daa82efcfdbc1cad3c8a8e18cc0fe9755a2cada0e915eb712e4ca3956ba0"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v132-linux-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v132-linux-arm64.tar.gz",
+      "integrity": "sha256-3UaVWcsPz56yLnywhCdacB9uxqlsyIZr7tSsLl6hIB8=",
+      "size": 1065057,
+      "releaseId": 321008618,
+      "assetId": 418258118,
+      "apiDigest": "sha256:dd469559cb0fcf9eb22e7cb084275a701f6ec6a96cc8866beed4ac2e5ea1201f"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v132-linux-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v132-linux-x64.tar.gz",
+      "integrity": "sha256-0K2/nPMEbimgslc+eKeXUQYj4Zl5Fuoo9hvwZzwh0qY=",
+      "size": 1089330,
+      "releaseId": 321008618,
+      "assetId": 418190186,
+      "apiDigest": "sha256:d0adbf9cf3046e29a0b2573e78a797510623e1997916ea28f61bf0673c21d2a6"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v132-win32-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v132-win32-arm64.tar.gz",
+      "integrity": "sha256-agnYshMc2OsBYQjXxc/OWxiffURj3FBDQ42LbjpHCxQ=",
+      "size": 906868,
+      "releaseId": 321008618,
+      "assetId": 418196605,
+      "apiDigest": "sha256:6a09d8b2131cd8eb016108d7c5cfce5b189f7d4463dc5043438d8b6e3a470b14"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v132-win32-ia32.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v132-win32-ia32.tar.gz",
+      "integrity": "sha256-rEZPQNDwHhxbVY+ndb5Wu3EGyYrZTkCJS0cqKMrV944=",
+      "size": 862918,
+      "releaseId": 321008618,
+      "assetId": 418193107,
+      "apiDigest": "sha256:ac464f40d0f01e1c5b558fa775be56bb7106c98ad94e40894b472a28cad5f78e"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v132-win32-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v132-win32-x64.tar.gz",
+      "integrity": "sha256-fyGvAqfQNVa7X9pPvhTX2WJpD43dhmNjNdmpq6exMZo=",
+      "size": 1038422,
+      "releaseId": 321008618,
+      "assetId": 418189108,
+      "apiDigest": "sha256:7f21af02a7d03556bb5fda4fbe14d7d962690f8ddd86636335d9a9aba7b1319a"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v133-darwin-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v133-darwin-arm64.tar.gz",
+      "integrity": "sha256-e8+v+1aeQAwWrGiZ97aVPVF9AA1pYdeqMRUpmVlGBV8=",
+      "size": 976246,
+      "releaseId": 321008618,
+      "assetId": 418187746,
+      "apiDigest": "sha256:7bcfaffb569e400c16ac6899f7b6953d517d000d6961d7aa311529995946055f"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v133-darwin-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v133-darwin-x64.tar.gz",
+      "integrity": "sha256-iBB9d8dXUEUp4zRR3QF70DnhLMwvt/3F+2Iwl4qQ2ow=",
+      "size": 1021299,
+      "releaseId": 321008618,
+      "assetId": 418189583,
+      "apiDigest": "sha256:88107d77c757504529e33451dd017bd039e12ccc2fb7fdc5fb6230978a90da8c"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v133-linux-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v133-linux-arm64.tar.gz",
+      "integrity": "sha256-H+94ML6QyU5w15FlrVEdNOo+OaBGZJGDia7dnjYpByI=",
+      "size": 1064694,
+      "releaseId": 321008618,
+      "assetId": 418258129,
+      "apiDigest": "sha256:1fef7830be90c94e70d79165ad511d34ea3e39a04664918389aedd9e36290722"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v133-linux-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v133-linux-x64.tar.gz",
+      "integrity": "sha256-D62jzHF00xajq/qMofIuucCz0gklJaX47VvxfT1XYpc=",
+      "size": 1089415,
+      "releaseId": 321008618,
+      "assetId": 418190185,
+      "apiDigest": "sha256:0fada3cc7174d316a3abfa8ca1f22eb9c0b3d2092525a5f8ed5bf17d3d576297"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v133-win32-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v133-win32-arm64.tar.gz",
+      "integrity": "sha256-veIcQfvSqDJueRWWU93pn/oUL01/5fZ5TK37bmFQEcg=",
+      "size": 906557,
+      "releaseId": 321008618,
+      "assetId": 418196600,
+      "apiDigest": "sha256:bde21c41fbd2a8326e79159653dde99ffa142f4d7fe5f6794cadfb6e615011c8"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v133-win32-ia32.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v133-win32-ia32.tar.gz",
+      "integrity": "sha256-zQXyfmKEKNHgnXyVWHG7PwoNB3MMU71Vu9Z2855/us4=",
+      "size": 862927,
+      "releaseId": 321008618,
+      "assetId": 418193113,
+      "apiDigest": "sha256:cd05f27e628428d1e09d7c955871bb3f0a0d07730c53bd55bbd676f39e7fbace"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v133-win32-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v133-win32-x64.tar.gz",
+      "integrity": "sha256-O5r3GqZYhtFw8RA7fXwMU/O618WEEDMZKmCxidfZgTI=",
+      "size": 1038425,
+      "releaseId": 321008618,
+      "assetId": 418189105,
+      "apiDigest": "sha256:3b9af71aa65886d170f1103b7d7c0c53f3bad7c5841033192a60b189d7d98132"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v135-darwin-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v135-darwin-arm64.tar.gz",
+      "integrity": "sha256-1ACO7wWq3hJFo7AOnI9I6N769CBpMKTuLGqVHbfZ1Dw=",
+      "size": 976250,
+      "releaseId": 321008618,
+      "assetId": 418187748,
+      "apiDigest": "sha256:d4008eef05aade1245a3b00e9c8f48e8defaf4206930a4ee2c6a951db7d9d43c"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v135-darwin-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v135-darwin-x64.tar.gz",
+      "integrity": "sha256-iYc9G3eEAUYOCS2ac7QB/ZA0WrgINylw/i+/wqVJKYk=",
+      "size": 1021293,
+      "releaseId": 321008618,
+      "assetId": 418189575,
+      "apiDigest": "sha256:89873d1b778401460e092d9a73b401fd90345ab808372970fe2fbfc2a5492989"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v135-linux-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v135-linux-arm64.tar.gz",
+      "integrity": "sha256-p63G2NasbjQX+yDuQ3BzVhm+wkqkR27KB0gD8u7UtQw=",
+      "size": 1064692,
+      "releaseId": 321008618,
+      "assetId": 418258132,
+      "apiDigest": "sha256:a7adc6d8d6ac6e3417fb20ee4370735619bec24aa4476eca074803f2eed4b50c"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v135-linux-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v135-linux-x64.tar.gz",
+      "integrity": "sha256-fbfmY88U8UBLwvzM1q1BkhyS5qmyQ7i5O6gQJDwKo5Q=",
+      "size": 1089418,
+      "releaseId": 321008618,
+      "assetId": 418190188,
+      "apiDigest": "sha256:7db7e663cf14f1404bc2fcccd6ad41921c92e6a9b243b8b93ba810243c0aa394"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v135-win32-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v135-win32-arm64.tar.gz",
+      "integrity": "sha256-hkwydeiz/lWR2gek+5YHeCRtKGjyHcwrdmAdxZjjDbk=",
+      "size": 906561,
+      "releaseId": 321008618,
+      "assetId": 418196597,
+      "apiDigest": "sha256:864c3275e8b3fe5591da07a4fb960778246d2868f21dcc2b76601dc598e30db9"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v135-win32-ia32.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v135-win32-ia32.tar.gz",
+      "integrity": "sha256-jl+t+DKmNoohLv1FWu7E9JEEv59mI6PbrNAqe/hqzj4=",
+      "size": 862929,
+      "releaseId": 321008618,
+      "assetId": 418193105,
+      "apiDigest": "sha256:8e5fadf832a6368a212efd455aeec4f49104bf9f6623a3dbacd02a7bf86ace3e"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v135-win32-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v135-win32-x64.tar.gz",
+      "integrity": "sha256-0quI+69husMMs1FOvAEyK3UEKlBXe34d6241k21OSjA=",
+      "size": 1038428,
+      "releaseId": 321008618,
+      "assetId": 418189106,
+      "apiDigest": "sha256:d2ab88fbaf61bac30cb3514ebc01322b75042a50577b7e1deb6e35936d4e4a30"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v136-darwin-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v136-darwin-arm64.tar.gz",
+      "integrity": "sha256-O1YmU7cgMGjCHCRmHZxjAmUGcAds4K+M1koI47KVxVg=",
+      "size": 976020,
+      "releaseId": 321008618,
+      "assetId": 418187749,
+      "apiDigest": "sha256:3b562653b7203068c21c24661d9c6302650670076ce0af8cd64a08e3b295c558"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v136-darwin-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v136-darwin-x64.tar.gz",
+      "integrity": "sha256-p+6rw8ZaZfy1YsS57KbLmZWS5XIL3SGrUQ00cuiyC3E=",
+      "size": 1021301,
+      "releaseId": 321008618,
+      "assetId": 418189573,
+      "apiDigest": "sha256:a7eeabc3c65a65fcb562c4b9eca6cb999592e5720bdd21ab510d3472e8b20b71"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v136-linux-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v136-linux-arm64.tar.gz",
+      "integrity": "sha256-BLeadT1pm46wf1He4ab3hp1yeS8CUCDM9sO693eD8NY=",
+      "size": 1064669,
+      "releaseId": 321008618,
+      "assetId": 418258130,
+      "apiDigest": "sha256:04b79a753d699b8eb07f51dee1a6f7869d72792f025020ccf6c3baf77783f0d6"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v136-linux-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v136-linux-x64.tar.gz",
+      "integrity": "sha256-1a3wyiJo+7euZcgH6qMZaNyAnVWsLJhH6/C0BEs/XFY=",
+      "size": 1089164,
+      "releaseId": 321008618,
+      "assetId": 418190189,
+      "apiDigest": "sha256:d5adf0ca2268fbb7ae65c807eaa31968dc809d55ac2c9847ebf0b4044b3f5c56"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v136-win32-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v136-win32-arm64.tar.gz",
+      "integrity": "sha256-cDJ9TslfcsSXBM/l7EEAOqQvceWsKE/WW2VNnYa8Vuk=",
+      "size": 906782,
+      "releaseId": 321008618,
+      "assetId": 418196603,
+      "apiDigest": "sha256:70327d4ec95f72c49704cfe5ec41003aa42f71e5ac284fd65b654d9d86bc56e9"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v136-win32-ia32.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v136-win32-ia32.tar.gz",
+      "integrity": "sha256-GvRT9n+XrgDeT2qoyU9exjFr+9QXVhpsUYGNfQQZ7a4=",
+      "size": 862809,
+      "releaseId": 321008618,
+      "assetId": 418193111,
+      "apiDigest": "sha256:1af453f67f97ae00de4f6aa8c94f5ec6316bfbd417561a6c51818d7d0419edae"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v136-win32-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v136-win32-x64.tar.gz",
+      "integrity": "sha256-z9MEayXpvrC5NP00w+nGvKEIYtG+AKD+lVBdTf7nrRE=",
+      "size": 1038378,
+      "releaseId": 321008618,
+      "assetId": 418189110,
+      "apiDigest": "sha256:cfd3046b25e9beb0b934fd34c3e9c6bca10862d1be00a0fe95505d4dfee7ad11"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v139-darwin-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v139-darwin-arm64.tar.gz",
+      "integrity": "sha256-OOu6orGgSTzVPv440fnOhz2/sa98tUcZCrZKeYCiwPI=",
+      "size": 977316,
+      "releaseId": 321008618,
+      "assetId": 418187741,
+      "apiDigest": "sha256:38ebbaa2b1a0493cd53efe38d1f9ce873dbfb1af7cb547190ab64a7980a2c0f2"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v139-darwin-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v139-darwin-x64.tar.gz",
+      "integrity": "sha256-yQeZG210xJ9CTMnYQmytB+Dlxs9Gx7eQrTsu44LzVLE=",
+      "size": 1022677,
+      "releaseId": 321008618,
+      "assetId": 418189578,
+      "apiDigest": "sha256:c907991b6d74c49f424cc9d8426cad07e0e5c6cf46c7b790ad3b2ee382f354b1"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v139-linux-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v139-linux-arm64.tar.gz",
+      "integrity": "sha256-qg7eJ3GhooqjsevwHi4a3aQu0VoPHMcCdyw5EtTM7kM=",
+      "size": 1065833,
+      "releaseId": 321008618,
+      "assetId": 418258133,
+      "apiDigest": "sha256:aa0ede2771a1a28aa3b1ebf01e2e1adda42ed15a0f1cc702772c3912d4ccee43"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v139-linux-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v139-linux-x64.tar.gz",
+      "integrity": "sha256-sS3K8BHRBjGIvrKrphHOSmVY7xq1Vts6CzF7bQDhEmw=",
+      "size": 1091027,
+      "releaseId": 321008618,
+      "assetId": 418190187,
+      "apiDigest": "sha256:b12dcaf011d1063188beb2aba611ce4a6558ef1ab556db3a0b317b6d00e1126c"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v139-win32-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v139-win32-arm64.tar.gz",
+      "integrity": "sha256-8+82qtNSQNkmLFJaH21Pzf7g+EM5XEZ0mT16trXOA34=",
+      "size": 907529,
+      "releaseId": 321008618,
+      "assetId": 418196602,
+      "apiDigest": "sha256:f3ef36aad35240d9262c525a1f6d4fcdfee0f843395c4674993d7ab6b5ce037e"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v139-win32-ia32.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v139-win32-ia32.tar.gz",
+      "integrity": "sha256-hEZFLibMYKJWunuuSwsRMy32yrA8XVTI2cVsBlTgldI=",
+      "size": 863457,
+      "releaseId": 321008618,
+      "assetId": 418193112,
+      "apiDigest": "sha256:8446452e26cc60a256ba7bae4b0b11332df6cab03c5d54c8d9c56c0654e095d2"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v139-win32-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v139-win32-x64.tar.gz",
+      "integrity": "sha256-gCkH0jyV1DmGgRWMODLE8zc4DXcI8UYeNPsYSB4xn0A=",
+      "size": 1039028,
+      "releaseId": 321008618,
+      "assetId": 418189100,
+      "apiDigest": "sha256:802907d23c95d4398681158c3832c4f337380d7708f1461e34fb18481e319f40"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v140-darwin-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v140-darwin-arm64.tar.gz",
+      "integrity": "sha256-ZhfLZvTOEOS9+RClNvpGTehYC4h8dTjLjVLaU2UYJrU=",
+      "size": 977884,
+      "releaseId": 321008618,
+      "assetId": 418188168,
+      "apiDigest": "sha256:6617cb66f4ce10e4bdf910a536fa464de8580b887c7538cb8d52da53651826b5"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v140-darwin-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v140-darwin-x64.tar.gz",
+      "integrity": "sha256-E4FytXvc5qdn08HN7/NDOWLIKBnIVJys9FIMizg6Rhg=",
+      "size": 1023039,
+      "releaseId": 321008618,
+      "assetId": 418190336,
+      "apiDigest": "sha256:138172b57bdce6a767d3c1cdeff3433962c82819c8549cacf4520c8b383a4618"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v140-linux-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v140-linux-arm64.tar.gz",
+      "integrity": "sha256-LoQFneDpNrudTZ5ps+ARNF6Q8YwA/C3/YdxpOzoUIPs=",
+      "size": 1073812,
+      "releaseId": 321008618,
+      "assetId": 418207352,
+      "apiDigest": "sha256:2e84059de0e936bb9d4d9e69b3e011345e90f18c00fc2dff61dc693b3a1420fb"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v140-linux-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v140-linux-x64.tar.gz",
+      "integrity": "sha256-mOOABwfvgAXrtJ0eIT4+YYYo2+ZAqzxPrCuZWgdohqQ=",
+      "size": 1114572,
+      "releaseId": 321008618,
+      "assetId": 418186913,
+      "apiDigest": "sha256:98e3800707ef8005ebb49d1e213e3e618628dbe640ab3c4fac2b995a076886a4"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v140-win32-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v140-win32-arm64.tar.gz",
+      "integrity": "sha256-FCCY9JUo+R5bRwyS0+UUZqoVoU/VICQ5gaqj6R0mX64=",
+      "size": 907244,
+      "releaseId": 321008618,
+      "assetId": 418197337,
+      "apiDigest": "sha256:142098f49528f91e5b470c92d3e51466aa15a14fd520243981aaa3e91d265fae"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v140-win32-ia32.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v140-win32-ia32.tar.gz",
+      "integrity": "sha256-M/0R0/2M7K5WGLmNaKDEXi4m6j+td9KjoAhdbUylSRY=",
+      "size": 863595,
+      "releaseId": 321008618,
+      "assetId": 418193762,
+      "apiDigest": "sha256:33fd11d3fd8cecae5618b98d68a0c45e2e26ea3fad77d2a3a0085d6d4ca54916"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v140-win32-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v140-win32-x64.tar.gz",
+      "integrity": "sha256-KWHySApgguXzC/6cN2lpoxV7ygxuhmJUKj9zR8pweDU=",
+      "size": 1039108,
+      "releaseId": 321008618,
+      "assetId": 418189683,
+      "apiDigest": "sha256:2961f2480a6082e5f30bfe9c376969a3157bca0c6e8662542a3f7347ca707835"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v143-darwin-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v143-darwin-arm64.tar.gz",
+      "integrity": "sha256-fr/pxQBovINYL95Dh2Wpl7kadkN4tqu3w9vLo5uJzls=",
+      "size": 977709,
+      "releaseId": 321008618,
+      "assetId": 418188170,
+      "apiDigest": "sha256:7ebfe9c50068bc83582fde438765a997b91a764378b6abb7c3dbcba39b89ce5b"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v143-darwin-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v143-darwin-x64.tar.gz",
+      "integrity": "sha256-VLRvo/5IG/pcQNglcaXyF1jMBtuuQXT35TWFwr0EX6s=",
+      "size": 1022862,
+      "releaseId": 321008618,
+      "assetId": 418190337,
+      "apiDigest": "sha256:54b46fa3fe481bfa5c40d82571a5f21758cc06dbae4174f7e53585c2bd045fab"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v143-linux-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v143-linux-arm64.tar.gz",
+      "integrity": "sha256-7KvIHPSDrJgt6FMkM7OxF4D5kkKGpyHd0Ri+UW1tHY8=",
+      "size": 1074001,
+      "releaseId": 321008618,
+      "assetId": 418207351,
+      "apiDigest": "sha256:ecabc81cf483ac982de8532433b3b11780f9924286a721ddd118be516d6d1d8f"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v143-linux-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v143-linux-x64.tar.gz",
+      "integrity": "sha256-F6EqHljIropJ4TVnSFK+Ic+9mEiNHdBf+tLRd2RDYmw=",
+      "size": 1114498,
+      "releaseId": 321008618,
+      "assetId": 418186914,
+      "apiDigest": "sha256:17a12a1e58c8ae8a49e135674852be21cfbd98488d1dd05ffad2d1776443626c"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v143-win32-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v143-win32-arm64.tar.gz",
+      "integrity": "sha256-xGFVHlkUOxzyGByEpNFh9yv+trTs69gc5qbg4JtCTLI=",
+      "size": 907146,
+      "releaseId": 321008618,
+      "assetId": 418197336,
+      "apiDigest": "sha256:c461551e59143b1cf2181c84a4d161f72bfeb6b4ecebd81ce6a6e0e09b424cb2"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v143-win32-ia32.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v143-win32-ia32.tar.gz",
+      "integrity": "sha256-w8ZN3KPGcMQ3PQ723/9zicGmEOYBMzkqRfGDzwfCMkM=",
+      "size": 863534,
+      "releaseId": 321008618,
+      "assetId": 418193760,
+      "apiDigest": "sha256:c3c64ddca3c670c4373d0ef6dfff7389c1a610e60133392a45f183cf07c23243"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v143-win32-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v143-win32-x64.tar.gz",
+      "integrity": "sha256-uIWGRIX4fcMUM2KjMW5gy/uz5E1lhp3CGblm2MXWX88=",
+      "size": 1039046,
+      "releaseId": 321008618,
+      "assetId": 418189682,
+      "apiDigest": "sha256:b885864485f87dc3143362a3316e60cbfbb3e44d65869dc219b966d8c5d65fcf"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v145-darwin-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v145-darwin-arm64.tar.gz",
+      "integrity": "sha256-MffyCCmJi4eyJReeUeY9xTmlnaldQuz3MEgNdkXLagY=",
+      "size": 977190,
+      "releaseId": 321008618,
+      "assetId": 418188169,
+      "apiDigest": "sha256:31f7f20829898b87b225179e51e63dc539a59da95d42ecf730480d7645cb6a06"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v145-darwin-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v145-darwin-x64.tar.gz",
+      "integrity": "sha256-9jyHosEyXSCxp8xge8guiw/rA6c9JsO558TZ+S0tkYQ=",
+      "size": 1022725,
+      "releaseId": 321008618,
+      "assetId": 418190339,
+      "apiDigest": "sha256:f63c87a2c1325d20b1a7cc607bc82e8b0feb03a73d26c3b9e7c4d9f92d2d9184"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v145-linux-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v145-linux-arm64.tar.gz",
+      "integrity": "sha256-eO7BFmjL3gdIDa7zcvLDVOOVcYki2t+XfTIQcBd7P9Q=",
+      "size": 1073308,
+      "releaseId": 321008618,
+      "assetId": 418207353,
+      "apiDigest": "sha256:78eec11668cbde07480daef372f2c354e395718922dadf977d321070177b3fd4"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v145-linux-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v145-linux-x64.tar.gz",
+      "integrity": "sha256-FO80tF1GcCwiW/w021vG3lIZXfjBmnxjWeMkF/eHXbE=",
+      "size": 1113952,
+      "releaseId": 321008618,
+      "assetId": 418186912,
+      "apiDigest": "sha256:14ef34b45d46702c225bfc34db5bc6de52195df8c19a7c6359e32417f7875db1"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v145-win32-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v145-win32-arm64.tar.gz",
+      "integrity": "sha256-hi+e5c6TvxV5QZVdFBfBSEtt3lvtT9YLBUpIf8TcEn0=",
+      "size": 907059,
+      "releaseId": 321008618,
+      "assetId": 418197338,
+      "apiDigest": "sha256:862f9ee5ce93bf157941955d1417c1484b6dde5bed4fd60b054a487fc4dc127d"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v145-win32-ia32.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v145-win32-ia32.tar.gz",
+      "integrity": "sha256-nGLxUWbWanMkTY7oI3xh8A+fWaGFneSnkUH5Brx2Rrs=",
+      "size": 863294,
+      "releaseId": 321008618,
+      "assetId": 418193761,
+      "apiDigest": "sha256:9c62f15166d66a73244d8ee8237c61f00f9f59a1859de4a79141f906bc7646bb"
+    },
+    "official/better-sqlite3-v12.10.0-electron-v145-win32-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-electron-v145-win32-x64.tar.gz",
+      "integrity": "sha256-K7RdEN6ZEl1QphXzQoTDdozrlzt2yn15JNvB5jlm8m4=",
+      "size": 1039238,
+      "releaseId": 321008618,
+      "assetId": 418189681,
+      "apiDigest": "sha256:2bb45d10de99125d50a615f34284c3768ceb973b76ca7d7924dbc1e63966f26e"
+    },
+    "official/better-sqlite3-v12.10.0-node-v127-darwin-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v127-darwin-arm64.tar.gz",
+      "integrity": "sha256-NVM/mtqCyz8zdgwdwvEo93wrNOwrLt5yKCTLZM1QpGo=",
+      "size": 975786,
+      "releaseId": 321008618,
+      "assetId": 418185899,
+      "apiDigest": "sha256:35533f9ada82cb3f33760c1dc2f128f77c2b34ec2b2ede722824cb64cd50a46a"
+    },
+    "official/better-sqlite3-v12.10.0-node-v127-darwin-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v127-darwin-x64.tar.gz",
+      "integrity": "sha256-jS7w63+ID4iILwp6c2KhXi0hCgd2gfBnLQ38i5Gb2Rs=",
+      "size": 1020748,
+      "releaseId": 321008618,
+      "assetId": 418186306,
+      "apiDigest": "sha256:8d2ef0eb7f880f88882f0a7a7362a15e2d210a077681f0672d0dfc8b919bd91b"
+    },
+    "official/better-sqlite3-v12.10.0-node-v127-linux-arm.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v127-linux-arm.tar.gz",
+      "integrity": "sha256-pHpz4PbuyH/5HI4iacPS0PcKfes9fn+5uyI/DQblCBA=",
+      "size": 942372,
+      "releaseId": 321008618,
+      "assetId": 418196699,
+      "apiDigest": "sha256:a47a73e0f6eec87ff91c8e2269c3d2d0f70a7deb3d7e7fb9bb223f0d06e50810"
+    },
+    "official/better-sqlite3-v12.10.0-node-v127-linux-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v127-linux-arm64.tar.gz",
+      "integrity": "sha256-77Ylh36lF75gA8FNur23SNCsFyq1C8TlrwjCyycrcMY=",
+      "size": 1064660,
+      "releaseId": 321008618,
+      "assetId": 418196358,
+      "apiDigest": "sha256:efb625877ea517be6003c14dbabdb748d0ac172ab50bc4e5af08c2cb272b70c6"
+    },
+    "official/better-sqlite3-v12.10.0-node-v127-linux-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v127-linux-x64.tar.gz",
+      "integrity": "sha256-iZ3Ox9Dk4uw123g6kVW4eK4VdUUSWF3nNSu9M8sdbEg=",
+      "size": 1088879,
+      "releaseId": 321008618,
+      "assetId": 418186228,
+      "apiDigest": "sha256:899dcec7d0e4e2ec35db783a9155b878ae15754512585de7352bbd33cb1d6c48"
+    },
+    "official/better-sqlite3-v12.10.0-node-v127-linuxmusl-arm.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v127-linuxmusl-arm.tar.gz",
+      "integrity": "sha256-t8eC+6jYBFr6abiHtp/jhNjz2GnEWBLEHRzKX8cFsOo=",
+      "size": 1025961,
+      "releaseId": 321008618,
+      "assetId": 418199105,
+      "apiDigest": "sha256:b7c782fba8d8045afa69b887b69fe384d8f3d869c45812c41d1cca5fc705b0ea"
+    },
+    "official/better-sqlite3-v12.10.0-node-v127-linuxmusl-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v127-linuxmusl-arm64.tar.gz",
+      "integrity": "sha256-tekuwmN7tXjMEri5uUh3qCw+9ehizMctQgcGqrl4u5o=",
+      "size": 1222585,
+      "releaseId": 321008618,
+      "assetId": 418201463,
+      "apiDigest": "sha256:b5e92ec2637bb578cc12b8b9b94877a82c3ef5e862ccc72d420706aab978bb9a"
+    },
+    "official/better-sqlite3-v12.10.0-node-v127-linuxmusl-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v127-linuxmusl-x64.tar.gz",
+      "integrity": "sha256-mxRhjz2aqbcNqt6WW8qJLzJLBj4cx1MrAw1xOKj50HA=",
+      "size": 1203424,
+      "releaseId": 321008618,
+      "assetId": 418186647,
+      "apiDigest": "sha256:9b14618f3d9aa9b70daade965bca892f324b063e1cc7532b030d7138a8f9d070"
+    },
+    "official/better-sqlite3-v12.10.0-node-v127-win32-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v127-win32-arm64.tar.gz",
+      "integrity": "sha256-gasjJ+dujMYpCghSjUHxm5E9TFFGv9EsFZlw+llVnUg=",
+      "size": 906340,
+      "releaseId": 321008618,
+      "assetId": 418190453,
+      "apiDigest": "sha256:81ab2327e76e8cc6290a08528d41f19b913d4c5146bfd12c159970fa59559d48"
+    },
+    "official/better-sqlite3-v12.10.0-node-v127-win32-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v127-win32-x64.tar.gz",
+      "integrity": "sha256-hqErpvGezx5NtO/69ZGOcW1NT7YLAxbhjZXVabpi1rw=",
+      "size": 1038445,
+      "releaseId": 321008618,
+      "assetId": 418186462,
+      "apiDigest": "sha256:86a12ba6f19ecf1e4db4effaf5918e716d4d4fb60b0316e18d95d569ba62d6bc"
+    },
+    "official/better-sqlite3-v12.10.0-node-v137-darwin-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v137-darwin-arm64.tar.gz",
+      "integrity": "sha256-sUCYPIvvzvMFMuphWqEGx3Dy+VzSCZTTHKWTwLToVCM=",
+      "size": 975634,
+      "releaseId": 321008618,
+      "assetId": 418185898,
+      "apiDigest": "sha256:b140983c8befcef30532ea615aa106c770f2f95cd20994d31ca593c0b4e85423"
+    },
+    "official/better-sqlite3-v12.10.0-node-v137-darwin-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v137-darwin-x64.tar.gz",
+      "integrity": "sha256-oC+OnCAk8r1DhuWGcVJPz3IsUYe1SfRqlV2OnDsi9zM=",
+      "size": 1020783,
+      "releaseId": 321008618,
+      "assetId": 418186305,
+      "apiDigest": "sha256:a02f8e9c2024f2bd4386e58671524fcf722c5187b549f46a955d8e9c3b22f733"
+    },
+    "official/better-sqlite3-v12.10.0-node-v137-linux-arm.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v137-linux-arm.tar.gz",
+      "integrity": "sha256-Tsx8T9eiO6UF7qVKO0BsTtNU7SyDJ01SSQz2w3SJmUE=",
+      "size": 942362,
+      "releaseId": 321008618,
+      "assetId": 418196698,
+      "apiDigest": "sha256:4ecc7c4fd7a23ba505eea54a3b406c4ed354ed2c83274d52490cf6c374899941"
+    },
+    "official/better-sqlite3-v12.10.0-node-v137-linux-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v137-linux-arm64.tar.gz",
+      "integrity": "sha256-dkjzqClc8DoDbrOStm++91NHZi1lT2q1WPXzPJ5H1po=",
+      "size": 1064573,
+      "releaseId": 321008618,
+      "assetId": 418196357,
+      "apiDigest": "sha256:7648f3a8295cf03a036eb392b66fbef75347662d654f6ab558f5f33c9e47d69a"
+    },
+    "official/better-sqlite3-v12.10.0-node-v137-linux-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v137-linux-x64.tar.gz",
+      "integrity": "sha256-wvdQPmzDorHcn9A+cZSTRDj0Lgck7KxmltoFglhTYvI=",
+      "size": 1088937,
+      "releaseId": 321008618,
+      "assetId": 418186229,
+      "apiDigest": "sha256:c2f7503e6cc3a2b1dc9fd03e7194934438f42e0724ecac6696da0582585362f2"
+    },
+    "official/better-sqlite3-v12.10.0-node-v137-linuxmusl-arm.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v137-linuxmusl-arm.tar.gz",
+      "integrity": "sha256-y9bgV+eQDKbC7sLb67/4F2dlSi2mMFQ7okJAx/ZfGnY=",
+      "size": 1026243,
+      "releaseId": 321008618,
+      "assetId": 418199101,
+      "apiDigest": "sha256:cbd6e057e7900ca6c2eec2dbebbff81767654a2da630543ba24240c7f65f1a76"
+    },
+    "official/better-sqlite3-v12.10.0-node-v137-linuxmusl-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v137-linuxmusl-arm64.tar.gz",
+      "integrity": "sha256-+0jleKSdBUY7RGQuvIl/V2KvnTd5OCG7DJK7F7G4q7Q=",
+      "size": 1222732,
+      "releaseId": 321008618,
+      "assetId": 418201464,
+      "apiDigest": "sha256:fb48e578a49d05463b44642ebc897f5762af9d37793821bb0c92bb17b1b8abb4"
+    },
+    "official/better-sqlite3-v12.10.0-node-v137-linuxmusl-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v137-linuxmusl-x64.tar.gz",
+      "integrity": "sha256-DHsMK1a/mJOPsT92zCJPbHXo/sKleA6P8oAHZt8ktaM=",
+      "size": 1203615,
+      "releaseId": 321008618,
+      "assetId": 418186648,
+      "apiDigest": "sha256:0c7b0c2b56bf98938fb13f76cc224f6c75e8fec2a5780e8ff2800766df24b5a3"
+    },
+    "official/better-sqlite3-v12.10.0-node-v137-win32-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v137-win32-arm64.tar.gz",
+      "integrity": "sha256-QG5FBYGEqPLS9UH6jesGkz4pv03DhPoGnAkw3ebnVoE=",
+      "size": 906410,
+      "releaseId": 321008618,
+      "assetId": 418190450,
+      "apiDigest": "sha256:406e45058184a8f2d2f541fa8deb06933e29bf4dc384fa069c0930dde6e75681"
+    },
+    "official/better-sqlite3-v12.10.0-node-v137-win32-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v137-win32-x64.tar.gz",
+      "integrity": "sha256-D22UjmQ49kyYPQiiBI7xDW9GfzaowI8g0x9YXAGeuDw=",
+      "size": 1038431,
+      "releaseId": 321008618,
+      "assetId": 418186460,
+      "apiDigest": "sha256:0f6d948e6438f64c983d08a2048ef10d6f467f36a8c08f20d31f585c019eb83c"
+    },
+    "official/better-sqlite3-v12.10.0-node-v141-darwin-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v141-darwin-arm64.tar.gz",
+      "integrity": "sha256-9pSO5wPCmwrkRRLj6UI7HM6d0YHF/cI3egGrfr+LTVM=",
+      "size": 977145,
+      "releaseId": 321008618,
+      "assetId": 418186326,
+      "apiDigest": "sha256:f6948ee703c29b0ae44512e3e9423b1cce9dd181c5fdc2377a01ab7ebf8b4d53"
+    },
+    "official/better-sqlite3-v12.10.0-node-v141-darwin-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v141-darwin-x64.tar.gz",
+      "integrity": "sha256-oYS36mj8wKh1N3ZvWfWJ5u9+nvDhr5/0j27cXwXTO4M=",
+      "size": 1022316,
+      "releaseId": 321008618,
+      "assetId": 418186872,
+      "apiDigest": "sha256:a184b7ea68fcc0a87537766f59f589e6ef7e9ef0e1af9ff48f6edc5f05d33b83"
+    },
+    "official/better-sqlite3-v12.10.0-node-v141-linux-arm.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v141-linux-arm.tar.gz",
+      "integrity": "sha256-lcivbqla/ST9fvcAsBlwsrMSHXFyzolcVJzZum/f4oI=",
+      "size": 948025,
+      "releaseId": 321008618,
+      "assetId": 418197707,
+      "apiDigest": "sha256:95c8af6ea95afd24fd7ef700b01970b2b3121d7172ce895c549cd9ba6fdfe282"
+    },
+    "official/better-sqlite3-v12.10.0-node-v141-linux-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v141-linux-arm64.tar.gz",
+      "integrity": "sha256-5X0FgAxvd8DI3PT7NIbW+6mHrwYPLbkIFW4lvkZ6cgU=",
+      "size": 1073483,
+      "releaseId": 321008618,
+      "assetId": 418198297,
+      "apiDigest": "sha256:e57d05800c6f77c0c8dcf4fb3486d6fba987af060f2db908156e25be467a7205"
+    },
+    "official/better-sqlite3-v12.10.0-node-v141-linux-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v141-linux-x64.tar.gz",
+      "integrity": "sha256-t4EpSSZjBdX3rHrx7tYDEOFAIIHMQ8HsKsKyBfbSCYA=",
+      "size": 1113828,
+      "releaseId": 321008618,
+      "assetId": 418186540,
+      "apiDigest": "sha256:b7812949266305d5f7ac7af1eed60310e1402081cc43c1ec2ac2b205f6d20980"
+    },
+    "official/better-sqlite3-v12.10.0-node-v141-linuxmusl-arm.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v141-linuxmusl-arm.tar.gz",
+      "integrity": "sha256-iRe5YCzZrlSrKz2CxwF6L74o1mFBdykGjOEu3KuvFjw=",
+      "size": 1027042,
+      "releaseId": 321008618,
+      "assetId": 418214123,
+      "apiDigest": "sha256:8917b9602cd9ae54ab2b3d82c7017a2fbe28d661417729068ce12edcabaf163c"
+    },
+    "official/better-sqlite3-v12.10.0-node-v141-linuxmusl-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v141-linuxmusl-arm64.tar.gz",
+      "integrity": "sha256-5HU36nsETou/Mzgf0ISBl0CBnT9N/pxSnPK5isie01U=",
+      "size": 1224714,
+      "releaseId": 321008618,
+      "assetId": 418217301,
+      "apiDigest": "sha256:e47537ea7b044e8bbf33381fd084819740819d3f4dfe9c529cf2b98ac89ed355"
+    },
+    "official/better-sqlite3-v12.10.0-node-v141-linuxmusl-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v141-linuxmusl-x64.tar.gz",
+      "integrity": "sha256-uhUIt4DjXFcbUnnRIjpO8pc6JfXpJ6EfDyu1P/FtWqE=",
+      "size": 1204865,
+      "releaseId": 321008618,
+      "assetId": 418187987,
+      "apiDigest": "sha256:ba1508b780e35c571b5279d1223a4ef2973a25f5e927a11f0f2bb53ff16d5aa1"
+    },
+    "official/better-sqlite3-v12.10.0-node-v141-win32-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v141-win32-arm64.tar.gz",
+      "integrity": "sha256-aAFhVjSIRaWoaujbXSejX+8H+u5y6hghu6YPSPgEHi0=",
+      "size": 907001,
+      "releaseId": 321008618,
+      "assetId": 418191227,
+      "apiDigest": "sha256:68016156348845a5a86ae8db5d27a35fef07faee72ea1821bba60f48f8041e2d"
+    },
+    "official/better-sqlite3-v12.10.0-node-v141-win32-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v141-win32-x64.tar.gz",
+      "integrity": "sha256-96DN+47q7IsrUUFLh7LUjmrlyhkKxyjlfEd4u6e1p/w=",
+      "size": 1039202,
+      "releaseId": 321008618,
+      "assetId": 418187197,
+      "apiDigest": "sha256:f7a0cdfb8eeaec8b2b51414b87b2d48e6ae5ca190ac728e57c4778bba7b5a7fc"
+    },
+    "official/better-sqlite3-v12.10.0-node-v147-darwin-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v147-darwin-arm64.tar.gz",
+      "integrity": "sha256-o2xVAMXJRDqlpWsOEFYuBv1YmcaBWkAPYkXDu6v4RxA=",
+      "size": 977136,
+      "releaseId": 321008618,
+      "assetId": 418186325,
+      "apiDigest": "sha256:a36c5500c5c9443aa5a56b0e10562e06fd5899c6815a400f6245c3bbabf84710"
+    },
+    "official/better-sqlite3-v12.10.0-node-v147-darwin-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v147-darwin-x64.tar.gz",
+      "integrity": "sha256-JoCtIH921rRZHh8Zf1ud7rs0QXUDS6eZbRQiWbrSG2M=",
+      "size": 1022141,
+      "releaseId": 321008618,
+      "assetId": 418186871,
+      "apiDigest": "sha256:2680ad207f76d6b4591e1f197f5b9deebb344175034ba7996d142259bad21b63"
+    },
+    "official/better-sqlite3-v12.10.0-node-v147-linux-arm.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v147-linux-arm.tar.gz",
+      "integrity": "sha256-CIn0j+g4K+sbODsHNAo3S2pH+/058kHg5xi8Y0V9HZs=",
+      "size": 947655,
+      "releaseId": 321008618,
+      "assetId": 418197709,
+      "apiDigest": "sha256:0889f48fe8382beb1b383b07340a374b6a47fbfd39f241e0e718bc63457d1d9b"
+    },
+    "official/better-sqlite3-v12.10.0-node-v147-linux-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v147-linux-arm64.tar.gz",
+      "integrity": "sha256-Kna+9VhsIcG6nk8hx6Ct9HJ8rgYaHte4hy9a7J/Rkf8=",
+      "size": 1073040,
+      "releaseId": 321008618,
+      "assetId": 418198298,
+      "apiDigest": "sha256:2a76bef5586c21c1ba9e4f21c7a0adf4727cae061a1ed7b8872f5aec9fd191ff"
+    },
+    "official/better-sqlite3-v12.10.0-node-v147-linux-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v147-linux-x64.tar.gz",
+      "integrity": "sha256-MAWxjKMLEO3ybmsibcBkXuhdCgD17qComWC/FXCr8L8=",
+      "size": 1113355,
+      "releaseId": 321008618,
+      "assetId": 418186541,
+      "apiDigest": "sha256:3005b18ca30b10edf26e6b226dc0645ee85d0a00f5eea0a89960bf1570abf0bf"
+    },
+    "official/better-sqlite3-v12.10.0-node-v147-linuxmusl-arm.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v147-linuxmusl-arm.tar.gz",
+      "integrity": "sha256-eNPsEySxbnC7BBCgOYZkbhOzetH/Lzdwo5x/Cqp2d1c=",
+      "size": 1026529,
+      "releaseId": 321008618,
+      "assetId": 418214122,
+      "apiDigest": "sha256:78d3ec1324b16e70bb0410a03986646e13b37ad1ff2f3770a39c7f0aaa767757"
+    },
+    "official/better-sqlite3-v12.10.0-node-v147-linuxmusl-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v147-linuxmusl-arm64.tar.gz",
+      "integrity": "sha256-uAKZ2c3DSaMNJpl/P5OvlbZUgoWNXD61PDPeA9Rusx4=",
+      "size": 1223759,
+      "releaseId": 321008618,
+      "assetId": 418217302,
+      "apiDigest": "sha256:b80299d9cdc349a30d26997f3f93af95b65482858d5c3eb53c33de03d46eb31e"
+    },
+    "official/better-sqlite3-v12.10.0-node-v147-linuxmusl-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v147-linuxmusl-x64.tar.gz",
+      "integrity": "sha256-5fvtlvYlbmqeAqe/RcQkaIh7TIxOdq9e6MwzTOotIWg=",
+      "size": 1204258,
+      "releaseId": 321008618,
+      "assetId": 418187988,
+      "apiDigest": "sha256:e5fbed96f6256e6a9e02a7bf45c42468887b4c8c4e76af5ee8cc334cea2d2168"
+    },
+    "official/better-sqlite3-v12.10.0-node-v147-win32-arm64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v147-win32-arm64.tar.gz",
+      "integrity": "sha256-fMi2SW7DXsr9CbMNrnpYFHc+8bIk85mxO6QAI5McTGA=",
+      "size": 907092,
+      "releaseId": 321008618,
+      "assetId": 418191225,
+      "apiDigest": "sha256:7cc8b6496ec35ecafd09b30dae7a5814773ef1b224f399b13ba40023931c4c60"
+    },
+    "official/better-sqlite3-v12.10.0-node-v147-win32-x64.tar.gz": {
+      "url": "https://github.com/WiseLibs/better-sqlite3/releases/download/v12.10.0/better-sqlite3-v12.10.0-node-v147-win32-x64.tar.gz",
+      "integrity": "sha256-7f14y6l2GNJbCvn31Vk/ht4v34NCmF9f+l9hJ0r6yQE=",
+      "size": 1039526,
+      "releaseId": 321008618,
+      "assetId": 418187196,
+      "apiDigest": "sha256:edfd78cba97618d25b0af9f7d5593f86de2fdf8342985f5ffa5f61274afac901"
+    }
+  },
+  "headers": {
+    "42-146": {
+      "version": "42.0.0",
+      "abi": "146",
+      "archiveRoot": "node_headers",
+      "releaseId": 318012421,
+      "releaseApiUrl": "https://api.github.com/repos/electron/electron/releases/tags/v42.0.0",
+      "checksumUrl": "https://artifacts.electronjs.org/headers/dist/v42.0.0/SHASUMS256.txt",
+      "checksumIntegrity": "sha256-6CyyFf7JixIPEtYt2SVLQ4cz+zCgDcw5qaLK/lntspY=",
+      "archive": {
+        "url": "https://artifacts.electronjs.org/headers/dist/v42.0.0/node-v42.0.0-headers.tar.gz",
+        "integrity": "sha256-gVK1UPjhWF3vqw4PgQcNTQBXbamMJ1E0IclkXixQdKo=",
+        "size": 344449
+      },
+      "windowsLibraries": {
+        "x64": {
+          "url": "https://artifacts.electronjs.org/headers/dist/v42.0.0/x64/node.lib",
+          "integrity": "sha256-8rqdnGIRtyPJzM5UFE5s1ersAMrP5M+030Akek/trOE=",
+          "size": 1504250
+        },
+        "arm64": {
+          "url": "https://artifacts.electronjs.org/headers/dist/v42.0.0/arm64/node.lib",
+          "integrity": "sha256-VlRJcC16/ZdPrd9tqTh4l8j8eofYkMzUyabGQfpltZo=",
+          "size": 1504250
+        }
+      }
+    },
+    "43-148": {
+      "version": "43.0.0",
+      "abi": "148",
+      "archiveRoot": "node_headers",
+      "releaseId": 346589159,
+      "releaseApiUrl": "https://api.github.com/repos/electron/electron/releases/tags/v43.0.0",
+      "checksumUrl": "https://artifacts.electronjs.org/headers/dist/v43.0.0/SHASUMS256.txt",
+      "checksumIntegrity": "sha256-3DmDv6Qcw5Mr6AFrQUrEDk/uy1jDuYqJdkID8xygC7Y=",
+      "archive": {
+        "url": "https://artifacts.electronjs.org/headers/dist/v43.0.0/node-v43.0.0-headers.tar.gz",
+        "integrity": "sha256-kiu4EaWxoY2SyFX+oorzMIeguO8Lp4oRXm1WD2UFpmI=",
+        "size": 344109
+      },
+      "windowsLibraries": {
+        "x64": {
+          "url": "https://artifacts.electronjs.org/headers/dist/v43.0.0/x64/node.lib",
+          "integrity": "sha256-+Hns6nX77/LuIvCRkVkGAC7z88zv9ExN2D2YKt6v99w=",
+          "size": 1322838
+        },
+        "arm64": {
+          "url": "https://artifacts.electronjs.org/headers/dist/v43.0.0/arm64/node.lib",
+          "integrity": "sha256-q5AzjIn17un4MXTNlC9+FCDzPbQbJWgG0NU5DbQLmEM=",
+          "size": 1322838
+        }
+      }
+    },
+    "44-149": {
+      "version": "44.0.0",
+      "abi": "149",
+      "archiveRoot": "node_headers",
+      "releaseId": 376038527,
+      "releaseApiUrl": "https://api.github.com/repos/electron/electron/releases/tags/v44.0.0",
+      "checksumUrl": "https://artifacts.electronjs.org/headers/dist/v44.0.0/SHASUMS256.txt",
+      "checksumIntegrity": "sha256-B2w80GINNOHBlAZUJRA1UqjiNDu78NxvNSzv62afrTk=",
+      "archive": {
+        "url": "https://artifacts.electronjs.org/headers/dist/v44.0.0/node-v44.0.0-headers.tar.gz",
+        "integrity": "sha256-iL/3TtSr0NR/cO0vHt+5UGJz8YCzrNl1FR68HrprmYA=",
+        "size": 347531
+      },
+      "windowsLibraries": {
+        "x64": {
+          "url": "https://artifacts.electronjs.org/headers/dist/v44.0.0/x64/node.lib",
+          "integrity": "sha256-/Aj/KUwttfDJGEpgulKqdW/a2ltFgQi27aIwij2l5I8=",
+          "size": 1334576
+        },
+        "arm64": {
+          "url": "https://artifacts.electronjs.org/headers/dist/v44.0.0/arm64/node.lib",
+          "integrity": "sha256-Ydxyma0kgb3kMfVppZ9PI5bIo5zxse7ARW/nl7BZBzs=",
+          "size": 1334576
+        }
+      }
+    }
+  }
+}

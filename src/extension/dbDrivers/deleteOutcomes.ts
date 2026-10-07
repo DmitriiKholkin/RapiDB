@@ -34,6 +34,7 @@ export function buildDeleteResult(
   identities: readonly Record<string, unknown>[],
   evidence: DriverMutationResult,
   cause?: string,
+  options: { committed?: boolean } = {},
 ): DeleteResultPayload {
   const rowOutcomes = identities.map(
     (primaryKeys, rowIndex): DeleteRowOutcome => {
@@ -45,15 +46,13 @@ export function buildDeleteResult(
         : {
             rowIndex,
             primaryKeys,
-            success: evidence.affectedRows === identities.length && !cause,
-            status:
-              evidence.affectedRows === identities.length && !cause
-                ? "deleted"
-                : "unknown",
+            success: false,
+            status: "unknown",
           };
     },
   );
-  const outcomeUnknown = rowOutcomes.some((row) => row.status === "unknown");
+  const outcomeUnknown =
+    !options.committed && rowOutcomes.some((row) => row.status === "unknown");
   const success =
     rowOutcomes.every((row) => row.status === "deleted") && !cause;
   const changesPossible =
@@ -68,7 +67,9 @@ export function buildDeleteResult(
     outcomeUnknown,
     ...(!success
       ? {
-          error: `Delete ${evidence.affectedRows > 0 ? "partially changed the data" : outcomeUnknown ? "may have changed the data" : "did not delete all selected rows"}: ${evidence.affectedRows} row(s) confirmed deleted. ${outcomeUnknown ? "An in-flight write may finish after this refresh; refresh again and verify before retrying." : "Refresh and verify before retrying."}${cause ? ` ${cause}` : ""}`,
+          error: options.committed
+            ? `Delete committed, but verification failed: ${evidence.affectedRows} row(s) were affected. Refresh and verify before retrying.${cause ? ` ${cause}` : ""}`
+            : `Delete ${evidence.affectedRows > 0 ? "partially changed the data" : outcomeUnknown ? "may have changed the data" : "did not delete all selected rows"}: ${evidence.affectedRows} row(s) confirmed deleted. ${outcomeUnknown ? "An in-flight write may finish after this refresh; refresh again and verify before retrying." : "Refresh and verify before retrying."}${cause ? ` ${cause}` : ""}`,
         }
       : {}),
   };

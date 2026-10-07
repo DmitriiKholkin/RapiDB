@@ -109,11 +109,12 @@ describe("native driver timeout wiring", () => {
 
     expect(createPool).toHaveBeenCalledWith(
       expect.objectContaining({
-        host: "127.0.0.1",
+        host: "mysql.internal",
         port: 13306,
+        stream: expect.any(Function),
         ssl: expect.objectContaining({
           rejectUnauthorized: true,
-          servername: "mysql.internal",
+          verifyIdentity: true,
         }),
       }),
     );
@@ -171,9 +172,11 @@ describe("native driver timeout wiring", () => {
 
       expect(createPool).toHaveBeenCalledWith(
         expect.objectContaining({
+          host: "mysql.internal",
+          stream: expect.any(Function),
           ssl: expect.objectContaining({
             rejectUnauthorized: true,
-            servername: "mysql.internal",
+            verifyIdentity: true,
             ca: Buffer.from("ca-data"),
             cert: Buffer.from("cert-data"),
             key: Buffer.from("key-data"),
@@ -301,8 +304,9 @@ describe("native driver timeout wiring", () => {
     await driver.connect();
 
     expect(poolConfigs[0]).toMatchObject({
-      host: "127.0.0.1",
+      host: "pg.internal",
       port: 15432,
+      stream: expect.any(Function),
       ssl: expect.objectContaining({
         rejectUnauthorized: true,
         servername: "pg.internal",

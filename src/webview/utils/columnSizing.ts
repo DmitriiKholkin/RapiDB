@@ -1,3 +1,5 @@
+import { getCellPreview } from "./cellPreview";
+
 let _ctx: CanvasRenderingContext2D | null = null;
 
 function getCtx(): CanvasRenderingContext2D | null {
@@ -62,13 +64,15 @@ export function calcColWidth(
 
   const indicatorWidth =
     (isPrimaryKey ? KEY_ICON_W : 0) + (isForeignKey ? KEY_ICON_W : 0);
-  let maxContentW = measureText(colName) + indicatorWidth + SORT_ICON_W;
+  let maxContentW =
+    measureText(getCellPreview(colName).text) + indicatorWidth + SORT_ICON_W;
 
   const rowKey = dataKey ?? colName;
   const limit = Math.min(rows.length, sampleRows);
   for (let i = 0; i < limit; i++) {
     const val = rows[i][rowKey];
-    const s = val === null || val === undefined ? "NULL" : String(val);
+    const s =
+      val === null || val === undefined ? "NULL" : getCellPreview(val).text;
     const w = measureText(s);
     if (w > maxContentW) maxContentW = w;
   }

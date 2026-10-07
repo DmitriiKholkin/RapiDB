@@ -1,9 +1,11 @@
+import { isServerGeneratedColumn } from "../../shared/tableTypes";
 import type {
   ColumnTypeMeta,
   IDBDriver,
   TransactionOperation,
 } from "../dbDrivers/types";
 import {
+  mssqlInsertIdentityCollation,
   mssqlInsertIdentityExpression,
   mssqlInsertIdentityType,
   oracleInsertIdentity,
@@ -100,10 +102,12 @@ function withReturning(
   if (backend === "mssql") {
     operation.captureIdentity.mssqlInsertTarget = target;
     const declarations = columns.map((column, index) => {
-      const collation = column.collation
-        ? ` COLLATE ${driver.quoteIdentifier(column.collation)}`
-        : "";
-      return `${aliases[index]} ${mssqlInsertIdentityType(column)}${collation}`;
+      const identityType = mssqlInsertIdentityType(column);
+      const collation = mssqlInsertIdentityCollation(
+        column.collation,
+        identityType,
+      );
+      return `${aliases[index]} ${identityType}${collation}`;
     });
     const output = columns
       .map((column) => `INSERTED.${driver.quoteIdentifier(column.name)}`)
@@ -141,5 +145,8 @@ function buildDefaultValuesInsertSql(
   qualifiedTable: string,
   columns: readonly ColumnTypeMeta[],
 ): string {
-  return drv.buildInsertDefaultValuesSql(qualifiedTable, columns);
+  return drv.buildInsertDefaultValuesSql(
+    qualifiedTable,
+    columns.filter((column) => !isServerGeneratedColumn(column)),
+  );
 }

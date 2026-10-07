@@ -1,4 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  REDIS_ALL_KEYS_TABLE,
+  REDIS_EMPTY_PREFIX_TABLE,
+  REDIS_UNPREFIXED_KEYS_TABLE,
+} from "../../src/extension/dbDrivers/redisKeyspace";
 import { createExtensionContextStub } from "../support/fakeConnectionManagerStore";
 import { createMockVscodeModule } from "../support/mockVscode";
 
@@ -230,6 +235,55 @@ describe("extension activation", () => {
         dragAndDropController: connectionProviderInstances[0],
         showCollapseAll: true,
       }),
+    );
+  });
+
+  it("copies Redis display names without exposing routing IDs or renaming columns", async () => {
+    const extension = await import("../../src/extension/extension");
+    extension.activate(createExtensionContextStub() as never);
+    vi.mocked(
+      connectionManagerInstance.getConnection as (
+        ...args: unknown[]
+      ) => unknown,
+    ).mockReturnValue({ id: "conn-1", type: "redis" });
+    const command = vscodeState.registerCommand.mock.calls.find(
+      ([id]) => id === "rapidb.copyNodeName",
+    )?.[1];
+    if (!command) throw new Error("Expected copyNodeName command");
+    for (const [objectName, expected] of [
+      [REDIS_ALL_KEYS_TABLE, "All keys"],
+      [REDIS_UNPREFIXED_KEYS_TABLE, "Unprefixed keys"],
+      [REDIS_EMPTY_PREFIX_TABLE, ":*"],
+      ["default:", "default:*"],
+      ["users", "users:*"],
+    ]) {
+      await command({ kind: "table", connectionId: "conn-1", objectName });
+      expect(vscodeState.writeClipboard).toHaveBeenLastCalledWith(expected);
+    }
+    await command({
+      kind: "table_detail_column",
+      connectionId: "conn-1",
+      objectName: "key",
+    });
+    expect(vscodeState.writeClipboard).toHaveBeenLastCalledWith("key");
+    await command({
+      kind: "table_section_columns",
+      connectionId: "conn-1",
+      objectName: REDIS_ALL_KEYS_TABLE,
+    });
+    expect(vscodeState.writeClipboard).toHaveBeenLastCalledWith("All keys");
+    vi.mocked(
+      connectionManagerInstance.getConnection as (
+        ...args: unknown[]
+      ) => unknown,
+    ).mockReturnValue({ id: "conn-1", type: "pg" });
+    await command({
+      kind: "table",
+      connectionId: "conn-1",
+      objectName: REDIS_ALL_KEYS_TABLE,
+    });
+    expect(vscodeState.writeClipboard).toHaveBeenLastCalledWith(
+      REDIS_ALL_KEYS_TABLE,
     );
   });
 

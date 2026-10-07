@@ -5,12 +5,14 @@ import type {
   QueryEditorPresentation,
   QueryEditorSqlDialect,
 } from "../../shared/webviewContracts";
+import { isoToLocalDateStr as isoToSharedLocalDateStr } from "../utils/dateUtils";
 import {
   canonicalizeJsonPreservingRawNumbers,
   parseJsonPreservingRawNumbers,
   serializeCanonicalJson,
 } from "../utils/jsonCanonical";
 import { createSqlReadOnlyQueryGuard } from "../utils/readOnlyGuards";
+import { literalContainsPattern } from "./literalContains";
 import {
   createSqlFilterPreamble,
   type SqlFilterPreambleResult,
@@ -99,12 +101,10 @@ export function formatDatetimeForDisplay(val: unknown): string | null {
   return null;
 }
 export function isoToLocalDateStr(iso: string): string | null {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return null;
-  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+  return isoToSharedLocalDateStr(iso);
 }
 export function hexFromBuffer(val: Buffer): string {
-  return val.length === 0 ? "" : `0x${val.toString("hex")}`;
+  return `0x${val.toString("hex")}`;
 }
 export function normalizeNumericDisplayValue(value: number): number | string {
   return Number.isFinite(value) ? value : String(value);
@@ -211,7 +211,8 @@ export function isHexLike(value: string): boolean {
     value.startsWith("0x") ||
     value.startsWith("0X")
   ) {
-    return /^[0-9a-fA-F]*$/.test(value.slice(2));
+    const digits = value.slice(2);
+    return digits.length % 2 === 0 && /^[0-9a-fA-F]*$/.test(digits);
   }
   return /^[0-9a-fA-F]+$/.test(value) && value.length % 2 === 0;
 }
@@ -1717,7 +1718,10 @@ export abstract class BaseDBDriver implements IDBDriver {
   ): FilterConditionResult {
     const sqlOp = this.sqlOperator(operator);
     if (operator === "like" || operator === "ilike") {
-      return { sql: `CAST(${col} AS CHAR) LIKE ?`, params: [`%${val}%`] };
+      return {
+        sql: `CAST(${col} AS CHAR) LIKE ? ESCAPE '!'`,
+        params: [literalContainsPattern(val)],
+      };
     }
     if (operator === "eq") {
       return { sql: `CAST(${col} AS CHAR) LIKE ?`, params: [`%${val}%`] };
@@ -1739,7 +1743,10 @@ export abstract class BaseDBDriver implements IDBDriver {
     val: string,
     _paramIndex: number,
   ): FilterConditionResult {
-    return { sql: `CAST(${col} AS CHAR) LIKE ?`, params: [`%${val}%`] };
+    return {
+      sql: `CAST(${col} AS CHAR) LIKE ? ESCAPE '!'`,
+      params: [literalContainsPattern(val)],
+    };
   }
   protected createFilterConditionPreamble(
     column: ColumnTypeMeta,

@@ -854,7 +854,7 @@ describe("filter SQL compatibility for complex null-only types", () => {
     );
 
     expect(result).toEqual({
-      sql: 'to_jsonb("probe_col")::text ILIKE $1',
+      sql: `to_jsonb("probe_col")::text ILIKE $1 ESCAPE '!'`,
       params: ["%1%"],
     });
   });
@@ -1097,8 +1097,8 @@ describe("filter SQL compatibility for complex null-only types", () => {
     );
 
     expect(result).toEqual({
-      sql: "CAST(`probe_col` AS CHAR) LIKE ?",
-      params: ['%"alpha"%'],
+      sql: "CAST(`probe_col` AS CHAR) LIKE CAST(UNHEX(?) AS CHAR) ESCAPE '!'",
+      params: [Buffer.from('%"alpha"%').toString("hex")],
     });
   });
 
@@ -1120,7 +1120,7 @@ describe("filter SQL compatibility for complex null-only types", () => {
     );
 
     expect(result).toEqual({
-      sql: '"probe_col" LIKE ?',
+      sql: `"probe_col" LIKE ? ESCAPE '!'`,
       params: ['%"alpha"%'],
     });
   });
@@ -1212,7 +1212,7 @@ describe("filter SQL compatibility for complex null-only types", () => {
     );
 
     expect(result).toEqual({
-      sql: 'UPPER("probe_col") LIKE UPPER(:1)',
+      sql: `UPPER("probe_col") LIKE UPPER(:1) ESCAPE '!'`,
       params: ['%"alpha"%'],
     });
   });

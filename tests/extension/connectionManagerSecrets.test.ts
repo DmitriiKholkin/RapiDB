@@ -6,6 +6,7 @@ import { createExtensionContextStub } from "../support/fakeConnectionManagerStor
 
 const configuration = vi.hoisted(() => ({
   connections: [] as ConnectionConfig[],
+  rejectAfterApply: false,
 }));
 
 vi.mock("vscode", async () => {
@@ -17,13 +18,182 @@ vi.mock("vscode", async () => {
     ),
     inspect: () => ({ globalValue: configuration.connections }),
     update: vi.fn(async (_key: string, value: ConnectionConfig[]) => {
-      configuration.connections = value;
+      configuration.connections = JSON.parse(JSON.stringify(value));
+      if (configuration.rejectAfterApply)
+        throw new Error("acknowledgement failed");
     }),
   }));
   return mock.module;
 });
 
 describe("ConnectionManager with VSCode SecretStorage", () => {
+  it.each([
+    false,
+    true,
+  ])("retains new credentials and connects after a JSON-persisted save applies then rejects (existing=%s)", async (existing) => {
+    const context = createExtensionContextStub();
+    const config: ConnectionConfig = {
+      id: "json-commit",
+      name: "JSON commit",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "user",
+      useSecretStorage: true,
+      password: " new password ",
+      connectionUri: "postgres://user:uri-secret@localhost/app",
+      tls: {
+        mode: "mutualTls",
+        certFilePath: "/cert",
+        keyFilePath: "/key",
+        keyPassphrase: "tls-secret",
+      },
+    };
+    configuration.connections = existing
+      ? [
+          {
+            id: config.id,
+            name: "Before",
+            type: "pg",
+            host: "localhost",
+            database: "app",
+            username: "user",
+            useSecretStorage: true,
+          },
+        ]
+      : [];
+    if (existing)
+      await context.secrets.store(
+        config.id,
+        JSON.stringify({ password: "old password", future: 42 }),
+      );
+    const deletes = vi.spyOn(context.secrets, "delete");
+    const manager = new ConnectionManager(context as never);
+    const state = manager as unknown as {
+      createDriver(config: ConnectionConfig): IDBDriver;
+    };
+    let connected = false;
+    const driver = {
+      connect: vi.fn(async () => {
+        connected = true;
+      }),
+      disconnect: vi.fn(async () => {
+        connected = false;
+      }),
+      isConnected: () => connected,
+    };
+    const factory = vi
+      .spyOn(state, "createDriver")
+      .mockReturnValue(driver as unknown as IDBDriver);
+    configuration.rejectAfterApply = true;
+    try {
+      const saved = await manager.saveConnection(config);
+      expect(saved.password).toBeUndefined();
+      expect(configuration.connections[0]).toMatchObject({
+        useSecretStorage: true,
+        connectionUri: "postgres://localhost/app",
+      });
+      expect(configuration.connections[0]).not.toHaveProperty("ssh");
+      expect(configuration.connections[0].tls).not.toHaveProperty(
+        "keyPassphrase",
+      );
+      const raw = await context.secrets.get(config.id);
+      expect(JSON.parse(raw ?? "{}")).toMatchObject({
+        password: config.password,
+        connectionUri: config.connectionUri,
+        tlsKeyPassphrase: config.tls?.keyPassphrase,
+      });
+      if (existing) expect(JSON.parse(raw ?? "{}").future).toBe(42);
+      expect(deletes).not.toHaveBeenCalled();
+      await manager.connectTo(saved.id);
+      expect(factory).toHaveBeenCalledWith(
+        expect.objectContaining({
+          password: config.password,
+          connectionUri: config.connectionUri,
+          tls: config.tls,
+        }),
+      );
+      expect(manager.isConnected(saved.id)).toBe(true);
+      await expect(context.secrets.get(config.id)).resolves.toBe(raw);
+    } finally {
+      configuration.rejectAfterApply = false;
+      await manager.dispose();
+    }
+  });
+
+  it.each([
+    false,
+    true,
+  ])("returns only sanitized metadata while preserving save/edit/runtime credentials (storage=%s)", async (useSecretStorage) => {
+    const context = createExtensionContextStub();
+    configuration.connections = [];
+    const manager = new ConnectionManager(context as never);
+    const state = manager as unknown as {
+      createDriver(config: ConnectionConfig): IDBDriver;
+    };
+    let connected = false;
+    const driver = {
+      connect: vi.fn(async () => {
+        connected = true;
+      }),
+      disconnect: vi.fn(async () => {
+        connected = false;
+      }),
+      isConnected: () => connected,
+    };
+    const factory = vi
+      .spyOn(state, "createDriver")
+      .mockReturnValue(driver as unknown as IDBDriver);
+    const config: ConnectionConfig = {
+      id: "outward-save",
+      name: "Outward save",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "user",
+      password: " db-secret ",
+      useSecretStorage,
+      connectionUri: "postgres://user:uri-secret@localhost/app",
+    };
+    try {
+      const response = await manager.saveConnection(config);
+      expect(response.password).toBeUndefined();
+      expect(response.connectionUri).toBe("postgres://localhost/app");
+      expect(response.useSecretStorage).toBe(useSecretStorage);
+      expect(config.password).toBe(" db-secret ");
+      expect(configuration.connections[0].password).toBe(
+        useSecretStorage ? undefined : config.password,
+      );
+      await manager.connectTo(response.id);
+      expect(factory).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          password: config.password,
+          connectionUri: config.connectionUri,
+        }),
+      );
+      const savedConfig = manager.getConnection(response.id);
+      if (!savedConfig) throw new Error("Expected the saved connection.");
+      const updated = {
+        ...savedConfig,
+        password: " new-secret ",
+      };
+      const edited = await manager.saveConnection(updated);
+      expect(edited.password).toBeUndefined();
+      expect(edited.useSecretStorage).toBe(useSecretStorage);
+      await manager.connectTo(edited.id);
+      expect(factory).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          password: " new-secret ",
+          connectionUri: config.connectionUri,
+        }),
+      );
+      if (!useSecretStorage)
+        await expect(context.secrets.get(response.id)).resolves.toBeUndefined();
+    } finally {
+      await manager.dispose();
+    }
+  });
+
   it.each([
     1, 2,
   ])("preserves the last-read error and credentials across %s failed attempt(s), then reconnects", async (failures) => {

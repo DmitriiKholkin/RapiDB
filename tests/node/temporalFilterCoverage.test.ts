@@ -352,7 +352,7 @@ describe("temporal filter operator coverage", () => {
       ).toEqual({ sql: '"event" IS NOT NULL', params: [] });
     });
 
-    it("keeps Contains wildcard semantics", () => {
+    it("keeps Contains input literal", () => {
       const value = driver.normalizeFilterValue(
         temporalColumn,
         "like",
@@ -360,7 +360,10 @@ describe("temporal filter operator coverage", () => {
       );
       expect(
         driver.buildFilterCondition(temporalColumn, "like", value, 1),
-      ).toEqual({ sql: '"event" LIKE ?', params: ["%raw%_value%"] });
+      ).toEqual({
+        sql: `"event" LIKE ? ESCAPE '!'`,
+        params: ["%raw!%!_value%"],
+      });
     });
 
     it("rejects invalid ranges in normalization and direct builders", () => {

@@ -480,7 +480,17 @@ describe("Phase 4 — Critical Validation", () => {
     it("allows delete on writable connection", async () => {
       const manager = createMutationManager(false);
       const driver = manager.getDriver();
-      driver.deleteRows = vi.fn().mockResolvedValue({ affectedRows: 1 });
+      driver.deleteRows = vi.fn().mockResolvedValue({
+        affectedRows: 1,
+        rowOutcomes: [
+          {
+            rowIndex: 0,
+            primaryKeys: { id: 1 },
+            success: true,
+            status: "deleted",
+          },
+        ],
+      });
 
       const service = new TableMutationService(
         manager as never,

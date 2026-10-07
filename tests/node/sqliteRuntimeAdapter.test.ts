@@ -233,6 +233,7 @@ describe("SQLite better-sqlite3 runtime adapter", () => {
     });
     await writableDriver.connect();
     await writableDriver.query("CREATE TABLE sample (id INTEGER PRIMARY KEY)");
+    await writableDriver.query("INSERT INTO sample (id) VALUES (7)");
     expect(await readSingleValue(writableDriver, "PRAGMA journal_mode")).toBe(
       "delete",
     );
@@ -251,12 +252,56 @@ describe("SQLite better-sqlite3 runtime adapter", () => {
 
     await readonlyDriver.connect();
 
+    const fileBeforeReadonlyQueries = await readFile(filePath);
+
     expect(await readSingleValue(readonlyDriver, "PRAGMA foreign_keys")).toBe(
       1,
     );
     expect(await readSingleValue(readonlyDriver, "PRAGMA journal_mode")).toBe(
       "delete",
     );
+    await expect(
+      readonlyDriver.query("INSERT INTO sample (id) VALUES (8)"),
+    ).rejects.toThrow();
+
+    const readOnlyGuard = readonlyDriver.getCapabilities().readOnlyQueryGuard;
+    const tempTableScript =
+      "SELECT 1; CREATE TEMP TABLE rapidb_temp (id INTEGER); INSERT INTO rapidb_temp (id) VALUES (1)";
+    expect(readOnlyGuard?.(tempTableScript)).toEqual(
+      expect.objectContaining({ allowed: false }),
+    );
+    // SQLite's readonly open protects the main database file, but its TEMP
+    // database remains writable. The active query controller must therefore
+    // reject this DDL independently of the native file-open barrier.
+    await readonlyDriver.query(tempTableScript);
+    expect(
+      await readSingleValue(readonlyDriver, "SELECT id FROM rapidb_temp"),
+    ).toBe(1);
+    expect(await readFile(filePath)).toEqual(fileBeforeReadonlyQueries);
+  });
+
+  it("rejects PRAGMA optimize as read-only SQL although SQLite can persist its stats", async () => {
+    const { driver } = await createDriver();
+    await driver.connect();
+    await driver.query("CREATE TABLE optimize_sample (value TEXT)");
+    await driver.query(
+      "CREATE INDEX optimize_sample_value ON optimize_sample(value)",
+    );
+    await driver.query(
+      "INSERT INTO optimize_sample VALUES ('alpha'), ('beta'), ('gamma')",
+    );
+
+    await driver.query("PRAGMA optimize=0x10002");
+
+    expect(
+      await readSingleValue(
+        driver,
+        "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'sqlite_stat1'",
+      ),
+    ).toBe(1);
+    expect(
+      driver.getCapabilities().readOnlyQueryGuard?.("PRAGMA optimize"),
+    ).toEqual(expect.objectContaining({ allowed: false }));
   });
 
   it("keeps WAL journal mode intact for readonly opens even when WAL is disabled in config", async () => {

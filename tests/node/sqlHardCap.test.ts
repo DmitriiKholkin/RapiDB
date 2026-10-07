@@ -144,6 +144,8 @@ describe("SQL editor hard cap boundaries (#23)", () => {
   it.each([
     ["pg", "SELECT ';--/*' AS \";select\"; -- done"],
     ["pg", "SELECT $body$'; SELECT * FROM huge; --$body$;"],
+    ["pg", "SELECT $é$'; SELECT * FROM huge; --$é$;"],
+    ["pg", "SELECT $e\u0301٢_$'; SELECT * FROM huge; --$e\u0301٢_$;"],
     ["pg", "/* outer /* nested */ still comment */ SELECT 1;"],
     ["pg", "SELECT E'escaped\\'; SELECT text';"],
     ["mysql", "# SELECT ignored;\nSELECT ';' AS `semi;colon`; # done"],
@@ -161,6 +163,7 @@ describe("SQL editor hard cap boundaries (#23)", () => {
     ["mysql", "SELECT 'a\\' ; SELECT * FROM huge"],
     ["pg", "SELECT 'a\\' ; SELECT * FROM huge"],
     ["pg", "SELECT 'unfinished"],
+    ["pg", "SELECT $é$payload$É$"],
     ["pg", "SELECT 1 /* unfinished"],
     ["oracle", "BEGIN NULL; END;"],
     ["mssql", "INSERT INTO [a;]]b] VALUES (1); SELECT * FROM huge"],

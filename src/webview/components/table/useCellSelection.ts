@@ -1,5 +1,11 @@
 import type { MutableRefObject } from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { isEditableElement } from "../../utils/editableElement";
 import { serializeTsv } from "../../utils/pasteUtils";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
@@ -110,25 +116,28 @@ export function useCellSelection({
   const autoScrollIntervalRef = useRef<number | null>(null);
 
   const rangeRef = useRef(range);
-  rangeRef.current = range;
   const rowCountRef = useRef(rowCount);
-  rowCountRef.current = rowCount;
   const minRowRef = useRef(minRow);
-  minRowRef.current = minRow;
   const minColRef = useRef(minCol);
-  minColRef.current = minCol;
   const colCountRef = useRef(colCount);
-  colCountRef.current = colCount;
   const getCellValueRef = useRef(getCellValue);
-  getCellValueRef.current = getCellValue;
   const onCopyRef = useRef(onCopy);
-  onCopyRef.current = onCopy;
   const onPasteRef = useRef(onPaste);
-  onPasteRef.current = onPaste;
   const isColumnCollapsedRef = useRef(isColumnCollapsed);
-  isColumnCollapsedRef.current = isColumnCollapsed;
   const onCellNavigateRef = useRef(onCellNavigate);
-  onCellNavigateRef.current = onCellNavigate;
+
+  useLayoutEffect(() => {
+    rangeRef.current = range;
+    rowCountRef.current = rowCount;
+    minRowRef.current = minRow;
+    minColRef.current = minCol;
+    colCountRef.current = colCount;
+    getCellValueRef.current = getCellValue;
+    onCopyRef.current = onCopy;
+    onPasteRef.current = onPaste;
+    isColumnCollapsedRef.current = isColumnCollapsed;
+    onCellNavigateRef.current = onCellNavigate;
+  });
 
   const contextMenuCellRef = useRef<{ row: number; col: number } | null>(null);
 

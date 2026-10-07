@@ -1,9 +1,4 @@
-import {
-  Connection,
-  type FieldPacket,
-  type Query,
-  type QueryOptions,
-} from "mysql2";
+import type { FieldPacket, Query, QueryOptions } from "mysql2";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { BoundedQueryRows } from "../../src/extension/dbDrivers/boundedQueryRows";
 import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
@@ -42,23 +37,18 @@ function resultSet(command: WireQuery, count: number, first = 0) {
 
 function harness(run: (command: WireQuery, options: QueryOptions) => void) {
   const commands: WireQuery[] = [];
-  const rawQuery = vi.fn((options: QueryOptions, ...rest: unknown[]) => {
+  const rawQuery = vi.fn((query: Query, ...rest: unknown[]) => {
     expect(rest).toEqual([]);
+    const command = query as WireQuery;
+    const options = Reflect.get(command, "_queryOptions") as QueryOptions;
     expect(options.rowsAsArray).toBe(true);
-    const createQuery = Connection.createQuery as unknown as (
-      options: QueryOptions,
-      values: undefined,
-      callback: undefined,
-      config: object,
-    ) => WireQuery;
-    const command = createQuery(options, undefined, undefined, {});
     commands.push(command);
     expect(command.onResult).toBeUndefined();
     queueMicrotask(() => run(command, options));
     return command;
   });
   const connection = {
-    connection: { query: rawQuery },
+    connection: { query: rawQuery, config: {} },
     query: vi.fn(async () => [[], []]),
     release: vi.fn(),
     destroy: vi.fn(),
@@ -177,7 +167,7 @@ describe("MySQL bounded callback-free queries", () => {
   it("preserves native value formatting and the existing values-query semantics", async () => {
     const values = ["O'Reilly", Buffer.from([1, 2]), null];
     const sql = "SELECT ?, ?, ?";
-    const { driver, rawQuery } = harness((command) => {
+    const { driver, rawQuery, commands } = harness((command) => {
       command.emit("fields", [
         field("b", 1, 1),
         field("bits", 16, 8),
@@ -191,9 +181,12 @@ describe("MySQL bounded callback-free queries", () => {
       command.emit("end");
     });
     const result = await driver.query(sql, values, { hardCap: 1 });
-    expect(rawQuery).toHaveBeenCalledWith(
-      expect.objectContaining({ sql, values, rowsAsArray: true }),
-    );
+    expect(rawQuery).toHaveBeenCalledExactlyOnceWith(commands[0]);
+    expect(Reflect.get(commands[0], "_queryOptions")).toMatchObject({
+      sql,
+      values,
+      rowsAsArray: true,
+    });
     expect(result).toMatchObject({
       rows: [{ __col_0: 1, __col_1: 255, __col_2: null }],
       rowCount: 1,

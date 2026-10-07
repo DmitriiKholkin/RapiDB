@@ -9,8 +9,9 @@ import {
 import type { ConnectionConfig, ConnectionManager } from "../connectionManager";
 import {
   extractCredentialBearingUriSecret,
+  hasConnectionConfigSecrets,
+  sanitizeConnectionConfigForResponse,
   sanitizeCredentialBearingUri,
-  sanitizePersistedConnectionConfig,
   trimOptionalSecretValue,
   trimOptionalUriValue,
 } from "../connectionSecrets";
@@ -123,15 +124,30 @@ function sanitizeExistingForForm(
     uri: sanitizeCredentialBearingUri(uri),
     endpoint: sanitizeCredentialBearingUri(endpoint),
     awsEndpoint: sanitizeCredentialBearingUri(awsEndpoint),
-    hasStoredSecret: storedSecrets.password !== undefined || undefined,
-    hasStoredApiKey: storedSecrets.apiKey !== undefined || undefined,
-    hasStoredSshPassword: storedSecrets.sshPassword !== undefined || undefined,
+    hasStoredSecret:
+      storedSecrets.password !== undefined ||
+      trimOptionalSecretValue(_password) !== undefined ||
+      undefined,
+    hasStoredApiKey:
+      storedSecrets.apiKey !== undefined ||
+      trimOptionalSecretValue(_apiKey) !== undefined ||
+      undefined,
+    hasStoredSshPassword:
+      storedSecrets.sshPassword !== undefined ||
+      trimOptionalSecretValue(_ssh?.password) !== undefined ||
+      undefined,
     hasStoredSshPrivateKey:
-      storedSecrets.sshPrivateKey !== undefined || undefined,
+      storedSecrets.sshPrivateKey !== undefined ||
+      trimOptionalSecretValue(_ssh?.privateKey) !== undefined ||
+      undefined,
     hasStoredSshPassphrase:
-      storedSecrets.sshPassphrase !== undefined || undefined,
+      storedSecrets.sshPassphrase !== undefined ||
+      trimOptionalSecretValue(_ssh?.passphrase) !== undefined ||
+      undefined,
     hasStoredTlsKeyPassphrase:
-      storedSecrets.tlsKeyPassphrase !== undefined || undefined,
+      storedSecrets.tlsKeyPassphrase !== undefined ||
+      trimOptionalSecretValue(existing.tls?.keyPassphrase) !== undefined ||
+      undefined,
   };
 }
 
@@ -143,6 +159,7 @@ export class ConnectionFormPanel {
   private readonly context: vscode.ExtensionContext;
   private readonly connectionManager: ConnectionManager;
   private resolveFn?: (result: ConnectionConfig | undefined) => void;
+  private disposed = false;
   private testAbortController: AbortController | null = null;
 
   private constructor(
@@ -176,6 +193,7 @@ export class ConnectionFormPanel {
       },
     );
     this.panel.onDidDispose(() => {
+      this.disposed = true;
       this.testAbortController?.abort();
       this.testAbortController = null;
       this.resolveFn?.(undefined);
@@ -281,16 +299,17 @@ export class ConnectionFormPanel {
       parseStoredConnectionSecrets(await this.context.secrets.get(payload.id));
     const existing = this.connectionManager.getConnection(payload.id);
     const useSecretStorage =
-      shouldUseSecretStorage(payload) ||
-      resolvedStoredSecrets.connectionUri !== undefined ||
-      resolvedStoredSecrets.uri !== undefined ||
-      resolvedStoredSecrets.endpoint !== undefined ||
-      resolvedStoredSecrets.awsEndpoint !== undefined ||
-      extractCredentialBearingUriSecret(existing?.connectionUri) !==
-        undefined ||
-      extractCredentialBearingUriSecret(existing?.uri) !== undefined ||
-      extractCredentialBearingUriSecret(existing?.endpoint) !== undefined ||
-      extractCredentialBearingUriSecret(existing?.awsEndpoint) !== undefined;
+      payload.useSecretStorage !== false &&
+      (shouldUseSecretStorage(payload) ||
+        resolvedStoredSecrets.connectionUri !== undefined ||
+        resolvedStoredSecrets.uri !== undefined ||
+        resolvedStoredSecrets.endpoint !== undefined ||
+        resolvedStoredSecrets.awsEndpoint !== undefined ||
+        extractCredentialBearingUriSecret(existing?.connectionUri) !==
+          undefined ||
+        extractCredentialBearingUriSecret(existing?.uri) !== undefined ||
+        extractCredentialBearingUriSecret(existing?.endpoint) !== undefined ||
+        extractCredentialBearingUriSecret(existing?.awsEndpoint) !== undefined);
     const password = await this.resolveSubmittedPassword(
       payload,
       resolvedStoredSecrets,
@@ -352,9 +371,7 @@ export class ConnectionFormPanel {
               rest.tls.mode === "mutualTls"
                 ? this.resolveSubmittedSecret(
                     rest.tls.keyPassphrase,
-                    useSecretStorage
-                      ? resolvedStoredSecrets.tlsKeyPassphrase
-                      : undefined,
+                    resolvedStoredSecrets.tlsKeyPassphrase,
                     existing?.tls?.keyPassphrase,
                   )
                 : undefined,
@@ -391,25 +408,21 @@ export class ConnectionFormPanel {
       password,
       apiKey:
         trimOptionalSecretValue(payload.apiKey) ??
-        (useSecretStorage && !prefersElasticsearchBasicAuth
+        (!prefersElasticsearchBasicAuth
           ? resolvedStoredSecrets.apiKey
           : undefined) ??
         existing?.apiKey,
       awsAccessKeyId:
         trimOptionalSecretValue(payload.awsAccessKeyId) ??
-        (useSecretStorage ? resolvedStoredSecrets.awsAccessKeyId : undefined) ??
+        resolvedStoredSecrets.awsAccessKeyId ??
         existing?.awsAccessKeyId,
       awsSecretAccessKey:
         trimOptionalSecretValue(payload.awsSecretAccessKey) ??
-        (useSecretStorage
-          ? resolvedStoredSecrets.awsSecretAccessKey
-          : undefined) ??
+        resolvedStoredSecrets.awsSecretAccessKey ??
         existing?.awsSecretAccessKey,
       awsSessionToken:
         trimOptionalSecretValue(payload.awsSessionToken) ??
-        (useSecretStorage
-          ? resolvedStoredSecrets.awsSessionToken
-          : undefined) ??
+        resolvedStoredSecrets.awsSessionToken ??
         existing?.awsSessionToken,
       ssh,
     };
@@ -479,13 +492,31 @@ export class ConnectionFormPanel {
         }
 
         try {
+          if (
+            raw.useSecretStorage === false &&
+            hasConnectionConfigSecrets(raw)
+          ) {
+            const consent = await vscode.window.showWarningMessage(
+              "Save credentials in plaintext? Passwords, API/AWS keys, SSH secrets, TLS key passphrases and credentials in connection URLs will be saved in settings.json without encryption. They may be exposed by sharing or syncing settings.",
+              { modal: true },
+              "Save in Plaintext",
+            );
+            if (this.disposed) return;
+            if (consent !== "Save in Plaintext") {
+              this.panel.webview.postMessage({
+                type: "saveResult",
+                payload: {
+                  success: false,
+                  error:
+                    "Saving plaintext credentials was cancelled. Connection data was not changed.",
+                },
+              });
+              return;
+            }
+          }
           const saved =
             (await this.connectionManager.saveConnection(raw)) ?? raw;
-          this.resolveFn?.(
-            saved.useSecretStorage
-              ? sanitizePersistedConnectionConfig(saved)
-              : saved,
-          );
+          this.resolveFn?.(sanitizeConnectionConfigForResponse(saved));
         } catch (err: unknown) {
           const error = normalizeUnknownError(err);
           this.panel.webview.postMessage({

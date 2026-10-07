@@ -5,6 +5,10 @@ import {
   getDeleteEvidence,
   unattemptedDeleteResult,
 } from "../dbDrivers/deleteOutcomes";
+import {
+  isMutationNotExecutedError,
+  MutationNotExecutedError,
+} from "../dbDrivers/mutationExecutionState";
 import type { ColumnTypeMeta, TransactionOperation } from "../dbDrivers/types";
 import { pMapWithLimit } from "../utils/concurrency";
 import { assertConnectionWritable } from "../utils/readOnlyGuards";
@@ -12,6 +16,7 @@ import { buildInsertRowOperation } from "./insertSql";
 import { prepareInsertVerification } from "./insertVerification";
 import {
   PersistedEditValidationError,
+  validateInsertColumnNames,
   validatePersistedEditRecord,
 } from "./persistedEditValidation";
 import type {
@@ -72,6 +77,28 @@ export class TableMutationService {
         primaryKeyValues,
         columns,
       );
+      const coercedChanges = coerceRecord(
+        driver,
+        writableChanges,
+        columnMetaByName,
+      );
+      try {
+        assertConnectionWritable(
+          this.connectionManager,
+          connectionId,
+          "update data",
+        );
+        if (this.connectionManager.getDriver(connectionId) !== driver) {
+          throw new Error(
+            "Connection changed during mutation preflight. Prepare the changes again before retrying.",
+          );
+        }
+      } catch (error) {
+        throw new MutationNotExecutedError(
+          error instanceof Error ? error.message : String(error),
+          error,
+        );
+      }
       const result = await driver.updateRows({
         database,
         schema,
@@ -79,13 +106,34 @@ export class TableMutationService {
         updates: [
           {
             primaryKeys,
-            changes: coerceRecord(driver, writableChanges, columnMetaByName),
+            changes: coercedChanges,
           },
         ],
       });
+      const rowOutcome = result.updateRowOutcomes?.find(
+        ({ rowIndex }) => rowIndex === 0,
+      );
+      if (rowOutcome?.status === "applied") {
+        return;
+      }
+      if (rowOutcome?.status === "unknown") {
+        throw new Error(
+          "Update may have been applied. Refresh and verify the row before retrying.",
+        );
+      }
+      if (rowOutcome?.status === "not_applied") {
+        throw new Error(
+          "Row not found — the row may have been modified or deleted by another user",
+        );
+      }
       if (result.affectedRows === 0) {
         throw new Error(
           "Row not found — the row may have been modified or deleted by another user",
+        );
+      }
+      if (result.affectedRows !== 1) {
+        throw new Error(
+          "Update outcome is unknown. Refresh and verify the row before retrying.",
         );
       }
       return;
@@ -102,6 +150,23 @@ export class TableMutationService {
     );
     if (!operation) {
       return;
+    }
+    try {
+      assertConnectionWritable(
+        this.connectionManager,
+        connectionId,
+        "update data",
+      );
+      if (this.connectionManager.getDriver(connectionId) !== driver) {
+        throw new Error(
+          "Connection changed during mutation preflight. Prepare the changes again before retrying.",
+        );
+      }
+    } catch (error) {
+      throw new MutationNotExecutedError(
+        error instanceof Error ? error.message : String(error),
+        error,
+      );
     }
     const result = await driver.query(operation.sql, operation.params, {
       database,
@@ -151,10 +216,19 @@ export class TableMutationService {
     const columnMetaByName = new Map(
       columns.map((column) => [column.name, column]),
     );
+    const unknownColumnFailure = validateInsertColumnNames(
+      driver,
+      values,
+      columnMetaByName,
+    );
+    if (unknownColumnFailure) {
+      throw new PersistedEditValidationError(unknownColumnFailure);
+    }
     const failure = validatePersistedEditRecord(
       driver,
       values,
       columnMetaByName,
+      "Insert",
     );
     if (failure) throw new PersistedEditValidationError(failure);
     if (driver.insertRow) {
@@ -273,15 +347,25 @@ export class TableMutationService {
     };
   }
   async executePreparedInsertPlan(plan: PreparedInsertPlan): Promise<void> {
-    assertConnectionWritable(
-      this.connectionManager,
-      plan.connectionId,
-      "insert data",
-    );
-    const { driver } = this.getConnectionDriver(plan.connectionId);
+    let driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>;
+    try {
+      assertConnectionWritable(
+        this.connectionManager,
+        plan.connectionId,
+        "insert data",
+      );
+      driver = this.getConnectionDriver(plan.connectionId).driver;
+    } catch (error) {
+      throw new MutationNotExecutedError(
+        error instanceof Error ? error.message : String(error),
+        error,
+      );
+    }
     if (plan.mode === "driver") {
       if (!driver.insertRow) {
-        throw new Error("Insert is not supported by this driver.");
+        throw new MutationNotExecutedError(
+          "Insert is not supported by this driver.",
+        );
       }
       const result = await driver.insertRow({
         database: plan.database,
@@ -298,15 +382,40 @@ export class TableMutationService {
     }
 
     if (plan.verification) {
-      const risk = await driver.getMutationAtomicityRisk?.(
-        plan.database,
-        plan.schema,
-        plan.table,
-      );
+      let risk: string | null | undefined;
+      try {
+        risk = await driver.getMutationAtomicityRisk?.(
+          plan.database,
+          plan.schema,
+          plan.table,
+        );
+      } catch (error) {
+        throw new MutationNotExecutedError(
+          `Could not verify INSERT rollback support before execution. ${error instanceof Error ? error.message : String(error)}`,
+          error,
+        );
+      }
       if (risk)
-        throw new Error(
+        throw new MutationNotExecutedError(
           `INSERT verification requires rollback support. ${risk}`,
         );
+      try {
+        assertConnectionWritable(
+          this.connectionManager,
+          plan.connectionId,
+          "insert data",
+        );
+        if (this.connectionManager.getDriver(plan.connectionId) !== driver) {
+          throw new Error(
+            "Connection changed during mutation preflight. Prepare the changes again before retrying.",
+          );
+        }
+      } catch (error) {
+        throw new MutationNotExecutedError(
+          error instanceof Error ? error.message : String(error),
+          error,
+        );
+      }
       await driver.runTransaction(
         [{ ...plan.operation, checkAffectedRows: true }],
         undefined,
@@ -521,6 +630,14 @@ export class TableMutationService {
         if (!outcome.success) throw new DeleteExecutionError(outcome);
       } catch (error) {
         if (error instanceof DeleteExecutionError) throw error;
+        if (isMutationNotExecutedError(error)) {
+          throw new DeleteExecutionError(
+            unattemptedDeleteResult(
+              identities,
+              error instanceof Error ? error.message : String(error),
+            ),
+          );
+        }
         throw new DeleteExecutionError(
           buildDeleteResult(
             identities,
@@ -553,6 +670,14 @@ export class TableMutationService {
         plan.verificationCriteriaList,
       );
     } catch (error) {
+      if (!committed && isMutationNotExecutedError(error)) {
+        throw new DeleteExecutionError(
+          unattemptedDeleteResult(
+            identities,
+            error instanceof Error ? error.message : String(error),
+          ),
+        );
+      }
       throw new DeleteExecutionError(
         buildDeleteResult(
           plan.rowIdentities ?? plan.verificationCriteriaList,
@@ -560,6 +685,7 @@ export class TableMutationService {
             affectedRows: committed ? plan.verificationCriteriaList.length : 0,
           },
           error instanceof Error ? error.message : String(error),
+          committed ? { committed: true } : undefined,
         ),
       );
     }

@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as vscode from "vscode";
-import {
-  type ConnectionTlsConfig,
-  type ConnectionTlsMode,
+import type {
+  ConnectionTlsConfig,
+  ConnectionTlsMode,
 } from "../shared/connectionConfig";
 import { QUERY_LIMIT_POLICY } from "../shared/safetyContracts";
 import type {
@@ -88,9 +88,11 @@ function stableSerialize(value: unknown): string {
 function computeConnectionsRevision(
   connections: StoredConnectionConfig[],
 ): string {
-  return createHash("sha256")
-    .update(stableSerialize(connections))
-    .digest("hex");
+  // Compare the representation VS Code persists, not in-memory optional fields:
+  // JSON omits object undefined, turns array holes/undefined into null, and
+  // applies toJSON/non-finite number rules. Sort keys only after that roundtrip.
+  const persisted = JSON.parse(JSON.stringify(connections));
+  return createHash("sha256").update(stableSerialize(persisted)).digest("hex");
 }
 
 /**
@@ -255,6 +257,10 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
     const normalized = this.getNormalization(snapshot);
     if (!normalized.changed) return;
     const backups: Array<{ id: string; raw: string | undefined }> = [];
+    const retainedIds = new Set(
+      normalized.connections.map((connection) => connection.id),
+    );
+    const orphanedSecrets = new Map<string, string>();
     let writeStarted = false;
     try {
       for (const [index, connection] of normalized.connections.entries()) {
@@ -268,6 +274,14 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
           raw: await this.getSecret(connection.id),
         });
         await this.storeSecret(connection.id, raw);
+        // Duplicate IDs still belong to the first retained record. Only remove
+        // old keys that no normalized record owns (e.g. empty/whitespace IDs).
+        if (!retainedIds.has(originalId)) orphanedSecrets.set(originalId, raw);
+      }
+      this.assertSnapshotCurrent(snapshot);
+      for (const [id, raw] of orphanedSecrets) {
+        backups.push({ id, raw });
+        await this.deleteSecret(id);
       }
       this.assertSnapshotCurrent(snapshot);
       writeStarted = true;

@@ -102,18 +102,24 @@ describe("SSH HTTP driver options", () => {
     await driver.connect();
 
     const options = elasticMocks.constructorCalls[0] as {
-      Connection?: unknown;
+      Connection?: typeof HttpConnection;
       node: string;
       agent?: (input: { url: URL }) => unknown;
     };
-    expect(options.Connection).toBe(HttpConnection);
+    expect(Object.getPrototypeOf(options.Connection?.prototype)).toBe(
+      HttpConnection.prototype,
+    );
     expect(options.node).toBe("https://cluster.example.com");
-    expect(
-      options.agent?.({ url: new URL("https://cluster.example.com") }),
-    ).toBe(httpsAgent);
-    expect(
-      options.agent?.({ url: new URL("http://cluster.example.com") }),
-    ).toBe(httpAgent);
+    const ownedHttpsAgent = options.agent?.({
+      url: new URL("https://cluster.example.com"),
+    });
+    const ownedHttpAgent = options.agent?.({
+      url: new URL("http://cluster.example.com"),
+    });
+    expect(ownedHttpsAgent).not.toBe(httpsAgent);
+    expect(ownedHttpAgent).not.toBe(httpAgent);
+    expect(ownedHttpsAgent).toMatchObject({ protocol: "https:" });
+    expect(ownedHttpAgent).toMatchObject({ protocol: "http:" });
   });
 
   it("injects NodeHttpHandler with SSH agents into DynamoDB without rewriting the endpoint", async () => {

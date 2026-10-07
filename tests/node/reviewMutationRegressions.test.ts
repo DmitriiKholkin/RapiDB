@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import mssql from "mssql";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
@@ -8,7 +9,10 @@ import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { SQLiteCoreDriver as SQLiteDriver } from "../../src/extension/dbDrivers/sqliteCore";
 import { createTimeoutAwareDriver } from "../../src/extension/dbDrivers/timeout";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
-import { prepareApplyChangesPlan } from "../../src/extension/table/tableMutationExecution";
+import {
+  executePreparedApplyPlan,
+  prepareApplyChangesPlan,
+} from "../../src/extension/table/tableMutationExecution";
 
 const config = { id: "regression", name: "Regression", type: "pg" as const };
 const column = (
@@ -33,6 +37,132 @@ afterEach(() => {
 });
 
 describe("review mutation regressions", () => {
+  it("discards a failed MSSQL rollback session before a waiting borrower can use it", async () => {
+    const driver = new MSSQLDriver({ ...config, type: "mssql" });
+    const fakePoolConfig = { options: {} };
+    const operationError = new Error("transaction operation failed");
+    const rollbackError = new Error("rollback refused");
+    let signalRollbackStarted!: () => void;
+    const rollbackStarted = new Promise<void>((resolve) => {
+      signalRollbackStarted = resolve;
+    });
+    let finishRollback!: (error?: Error) => void;
+    class Session extends EventEmitter {
+      closed = false;
+      hasError = false;
+      beginTransaction(callback: (error?: Error) => void) {
+        callback();
+      }
+      rollbackTransaction = vi.fn((callback: (error?: Error) => void) => {
+        finishRollback = callback;
+        signalRollbackStarted();
+      });
+      close = vi.fn(() => {
+        this.closed = true;
+      });
+    }
+    const transactionSession = new Session();
+    const replacementSession = new Session();
+    type AcquireCallback = (
+      error: Error | null,
+      session: Session,
+      config: typeof fakePoolConfig,
+    ) => void;
+    let leasedSession: Session | null = null;
+    const waitingBorrowers: AcquireCallback[] = [];
+    const acquire = vi.fn((_request: unknown, callback: AcquireCallback) => {
+      if (leasedSession) {
+        waitingBorrowers.push(callback);
+        return;
+      }
+      leasedSession = transactionSession;
+      callback(null, transactionSession, fakePoolConfig);
+    });
+    const release = vi.fn((session: Session) => {
+      if (leasedSession !== session) return;
+      const borrower = waitingBorrowers.shift();
+      if (!borrower) {
+        leasedSession = null;
+        return;
+      }
+      const nextSession =
+        session.closed || session.hasError ? replacementSession : session;
+      leasedSession = nextSession;
+      borrower(null, nextSession, fakePoolConfig);
+    });
+    const borrowedSessions: Session[] = [];
+    const pool = {
+      config: fakePoolConfig,
+      connected: true,
+      acquire,
+      release,
+      close: vi.fn(async () => undefined),
+      request: vi.fn(() => ({
+        input: vi.fn().mockReturnThis(),
+        query: vi.fn(
+          async () =>
+            await new Promise((resolve, reject) => {
+              acquire({}, (error, session) => {
+                if (error) {
+                  reject(error);
+                  return;
+                }
+                borrowedSessions.push(session);
+                release(session);
+                resolve({ recordset: [], rowsAffected: [] });
+              });
+            }),
+        ),
+      })),
+    };
+    (driver as unknown as { pool: unknown }).pool = pool;
+    const request = {
+      output: vi.fn(),
+      query: vi.fn(async () => {
+        throw operationError;
+      }),
+    };
+    vi.spyOn(mssql.Transaction.prototype, "request").mockReturnValue(
+      request as never,
+    );
+    const transaction = driver.runTransaction([
+      { sql: "UPDATE [items] SET [value] = 1" },
+    ]);
+    await rollbackStarted;
+
+    let borrowerFinished = false;
+    const borrower = driver.query("SELECT 1").then((result) => {
+      borrowerFinished = true;
+      return result;
+    });
+    await Promise.resolve();
+    expect(borrowerFinished).toBe(false);
+    expect(borrowedSessions).toEqual([]);
+
+    finishRollback(rollbackError);
+    let transactionError: unknown;
+    try {
+      await transaction;
+    } catch (error) {
+      transactionError = error;
+    }
+    expect(transactionError).toBeInstanceOf(AggregateError);
+    if (!(transactionError instanceof AggregateError)) {
+      throw new Error("Expected the transaction and rollback errors");
+    }
+    expect(transactionError.errors[0]).toBe(operationError);
+    expect(transactionError.errors[1]).toMatchObject({
+      message: rollbackError.message,
+    });
+
+    await expect(borrower).resolves.toMatchObject({ rows: [] });
+    expect(transactionSession.close).toHaveBeenCalledOnce();
+    expect(transactionSession.closed).toBe(true);
+    expect(release.mock.calls[0]?.[0]).toBe(transactionSession);
+    expect(borrowedSessions).toEqual([replacementSession]);
+    expect(pool.close).not.toHaveBeenCalled();
+  });
+
   it.each([
     1, 0,
   ] as const)("validates MSSQL DML count %s independently of trigger row counts", async (affectedRows) => {
@@ -223,6 +353,31 @@ describe("review mutation regressions", () => {
     expect(exec.mock.calls).toEqual([["BEGIN TRANSACTION"], ["ROLLBACK"]]);
   });
 
+  it("marks SQLite rollback failure so its worker can discard the unsafe session", async () => {
+    const operationError = new Error("transaction operation failed");
+    const rollbackError = new Error("rollback refused");
+    const exec = vi.fn((sql: string) => {
+      if (sql === "ROLLBACK") throw rollbackError;
+    });
+    const driver = new SQLiteDriver({ ...config, type: "sqlite" });
+    (driver as unknown as { db: unknown }).db = {
+      isOpen: true,
+      inTransaction: true,
+      exec,
+      run: () => {
+        throw operationError;
+      },
+    };
+
+    await expect(
+      driver.runTransaction([{ sql: "UPDATE items SET value = 1" }]),
+    ).rejects.toMatchObject({
+      name: "SQLiteRollbackFailure",
+      errors: [operationError, rollbackError],
+    });
+    expect(exec.mock.calls).toEqual([["BEGIN TRANSACTION"], ["ROLLBACK"]]);
+  });
+
   it("uses type-aware SQL OCC predicates for JSON, LOBs, text and XML", () => {
     const pg = new PostgresDriver(config);
     const oracle = new OracleDriver({ ...config, type: "oracle" });
@@ -274,6 +429,46 @@ describe("review mutation regressions", () => {
     expect(prepared.plan.updates[0].primaryKeys).toEqual({ _id: "key" });
     expect(prepared.plan.updates[0].originalValues).toEqual({
       value: original,
+    });
+  });
+
+  it("reconciles Mongo driver-backed applies after a sequential write partially fails", async () => {
+    const driver = new MongoDBDriver({ ...config, type: "mongodb" });
+    const updateOne = vi
+      .fn()
+      .mockResolvedValueOnce({ matchedCount: 1, modifiedCount: 1 })
+      .mockRejectedValueOnce(new Error("connection lost after first write"));
+    Object.assign(driver, {
+      requireDb: () => ({ collection: () => ({ updateOne }) }),
+    });
+    const mongoColumns = [
+      { ...column("string", "text"), name: "_id", isPrimaryKey: true },
+      column("string", "text"),
+    ];
+    const prepared = prepareApplyChangesPlan(
+      { getDriver: () => driver } as never,
+      config.id,
+      "db",
+      "",
+      "items",
+      ["first", "second"].map((id) => ({
+        primaryKeys: { _id: { $rapidbMongoId: { type: "string", value: id } } },
+        changes: { value: "updated" },
+      })),
+      mongoColumns,
+    );
+    if (!prepared.executable) throw new Error("Expected executable plan");
+
+    const result = await executePreparedApplyPlan(
+      { getDriver: () => driver } as never,
+      prepared.plan,
+    );
+
+    expect(updateOne).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({
+      success: false,
+      changesPossible: true,
+      outcomeUnknown: true,
     });
   });
 });

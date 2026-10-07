@@ -26,7 +26,7 @@ export interface FakeWebviewPanelHandle {
     setOptions?: never;
     readonly cspSource: string;
     readonly asWebviewUri: (uri: FakeWebviewUri) => FakeWebviewUri;
-    postMessage: (message: WorkflowMessageEnvelope) => Thenable<void>;
+    postMessage: (message: WorkflowMessageEnvelope) => Thenable<boolean>;
     onDidReceiveMessage: (
       listener: (message: WorkflowMessageEnvelope) => void,
     ) => { dispose(): void };
@@ -118,6 +118,12 @@ export function createFakeWebviewPanel(
   const hostMessages: WorkflowMessageEnvelope[] = [];
 
   let html = "";
+  let disposed = false;
+  const postMessage = (message: WorkflowMessageEnvelope): Promise<boolean> => {
+    if (disposed) return Promise.resolve(false);
+    hostMessages.push(message);
+    return Promise.resolve(true);
+  };
   let panelOptions: {
     enableScripts: boolean;
     localResourceRoots: FakeWebviewUri[];
@@ -142,7 +148,7 @@ export function createFakeWebviewPanel(
       options: { enableScripts: boolean; localResourceRoots: FakeWebviewUri[] };
       cspSource: string;
       asWebviewUri: (uri: FakeWebviewUri) => FakeWebviewUri;
-      postMessage: (message: WorkflowMessageEnvelope) => Thenable<void>;
+      postMessage: (message: WorkflowMessageEnvelope) => Thenable<boolean>;
       onDidReceiveMessage: (
         listener: (message: WorkflowMessageEnvelope) => void,
       ) => { dispose(): void };
@@ -164,6 +170,8 @@ export function createFakeWebviewPanel(
     },
     reveal: () => undefined,
     dispose: () => {
+      if (disposed) return;
+      disposed = true;
       disposeEmitter.fire();
     },
     onDidDispose: (listener: () => void): EventSubscription => {
@@ -189,10 +197,7 @@ export function createFakeWebviewPanel(
         panelOptions = value;
       },
       asWebviewUri: (uri) => uri,
-      postMessage: (message: WorkflowMessageEnvelope) => {
-        hostMessages.push(message);
-        return Promise.resolve();
-      },
+      postMessage,
       onDidReceiveMessage: (listener) => receiveEmitter.event(listener),
     },
   };
@@ -224,10 +229,7 @@ export function createFakeWebviewPanel(
         panelOptions = value;
       },
       asWebviewUri: (uri) => uri,
-      postMessage: (message: WorkflowMessageEnvelope) => {
-        hostMessages.push(message);
-        return Promise.resolve();
-      },
+      postMessage,
       onDidReceiveMessage: (listener) => receiveEmitter.event(listener),
     },
     setHtml: (value: string) => {

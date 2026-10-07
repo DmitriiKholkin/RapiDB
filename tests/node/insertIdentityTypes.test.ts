@@ -222,8 +222,9 @@ describe("B02 INSERT identity type regressions", () => {
     expect(plan.operation.sql).not.toContain(alias);
     if (base.includes("char")) {
       expect(plan.operation.sql).toContain(
-        "COLLATE [Latin1_General_100_BIN2_UTF8]",
+        "COLLATE Latin1_General_100_BIN2_UTF8",
       );
+      expect(plan.operation.sql).not.toContain("COLLATE [");
     }
     expect(metadataQuery.mock.calls[0]).toBeDefined();
     const catalogSql = vi.mocked(request.query).mock.calls[0][0];
@@ -436,7 +437,7 @@ describe("B02 INSERT identity type regressions", () => {
     ).toThrow(/cannot capture/);
   });
 
-  it("MSSQL quotes catalog collation identifiers instead of interpolating type SQL", () => {
+  it("MSSQL emits a bare validated catalog collation in the identity batch", () => {
     const driver = new MSSQLDriver({
       id: "types",
       name: "types",
@@ -446,7 +447,7 @@ describe("B02 INSERT identity type regressions", () => {
       ...key,
       type: "varchar(20)",
       nativeType: "varchar(20)",
-      collation: "name]; DROP TABLE t;--",
+      collation: "Latin1_General_100_BIN2_UTF8",
     };
     const operation = buildInsertRowOperation(
       driver,
@@ -457,6 +458,71 @@ describe("B02 INSERT identity type regressions", () => {
       [column, amount],
       { backend: "mssql", columns: [column] },
     );
-    expect(operation.sql).toContain("COLLATE [name]]; DROP TABLE t;--]");
+    expect(operation.sql).toContain(
+      "DECLARE @__rapidb_identity TABLE ([__col_0] varchar(20) COLLATE Latin1_General_100_BIN2_UTF8);",
+    );
+    expect(operation.sql).toContain(
+      "OUTPUT INSERTED.[id] INTO @__rapidb_identity ([__col_0])",
+    );
+    expect(operation.sql).not.toContain("COLLATE [");
+  });
+
+  it.each([
+    "name]; DROP TABLE t;--",
+    "Latin1_General_CI_AS; DROP TABLE t;--",
+    "[Latin1_General_CI_AS]",
+    '"Latin1_General_CI_AS"',
+    "Latin1 General CI AS",
+    "database_default",
+    "",
+  ])("MSSQL rejects malformed catalog collation metadata %s", (collation) => {
+    const driver = new MSSQLDriver({
+      id: "types",
+      name: "types",
+      type: "mssql",
+    });
+    const column = {
+      ...key,
+      type: "varchar(20)",
+      nativeType: "varchar(20)",
+      category: "text" as const,
+      collation,
+    };
+    expect(() =>
+      buildInsertRowOperation(
+        driver,
+        "db",
+        "dbo",
+        "t",
+        { amount: "1.25" },
+        [column, amount],
+        { backend: "mssql", columns: [column] },
+      ),
+    ).toThrow(/collation metadata; no data was written/);
+  });
+
+  it("MSSQL rejects collation metadata on a non-character identity column", () => {
+    const driver = new MSSQLDriver({
+      id: "types",
+      name: "types",
+      type: "mssql",
+    });
+    const column = {
+      ...key,
+      type: "int",
+      nativeType: "int",
+      collation: "Latin1_General_100_CS_AS",
+    };
+    expect(() =>
+      buildInsertRowOperation(
+        driver,
+        "db",
+        "dbo",
+        "t",
+        { amount: "1.25" },
+        [column, amount],
+        { backend: "mssql", columns: [column] },
+      ),
+    ).toThrow(/collation metadata; no data was written/);
   });
 });

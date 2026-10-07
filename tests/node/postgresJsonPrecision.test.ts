@@ -275,8 +275,8 @@ describe("PostgreSQL JSON/Array precision", () => {
         1,
       );
       expect(condition).toEqual({
-        sql: 'CAST("data" AS TEXT) ILIKE $1',
-        params: ['%"amt_estimated_loan": 13000.0%'],
+        sql: `CAST("data" AS TEXT) ILIKE $1 ESCAPE '!'`,
+        params: ['%"amt!_estimated!_loan": 13000.0%'],
       });
     });
   });

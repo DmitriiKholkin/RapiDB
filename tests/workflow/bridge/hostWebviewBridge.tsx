@@ -128,14 +128,16 @@ export async function startBridge(
   // which has its own webview. We need to override that one.
   const innerPanel = (panel.panel ?? panel) as {
     webview: {
-      postMessage: (message: WorkflowMessageEnvelope) => Thenable<void>;
+      postMessage: (message: WorkflowMessageEnvelope) => Thenable<boolean>;
     };
   };
   const panelWebview = innerPanel.webview;
   const originalPostMessage = panelWebview.postMessage;
-  panelWebview.postMessage = (message: WorkflowMessageEnvelope) => {
+  panelWebview.postMessage = async (message: WorkflowMessageEnvelope) => {
+    const delivered = await originalPostMessage(message);
+    if (!delivered) return false;
     hostWindow.dispatchEvent(new MessageEvent("message", { data: message }));
-    return originalPostMessage(message);
+    return true;
   };
 
   const user = userEvent.setup({

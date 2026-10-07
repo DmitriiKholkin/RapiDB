@@ -2,6 +2,11 @@ import type { createClient } from "redis";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionManager } from "../../src/extension/connectionManager";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
+import {
+  REDIS_ALL_KEYS_TABLE,
+  REDIS_EMPTY_PREFIX_TABLE,
+  REDIS_UNPREFIXED_KEYS_TABLE,
+} from "../../src/extension/dbDrivers/redisKeyspace";
 import { createTimeoutAwareDriver } from "../../src/extension/dbDrivers/timeout";
 import type { DriverTablePageRequest } from "../../src/extension/dbDrivers/types";
 import type { DriverConnectionConfig } from "../../src/extension/driverRuntimeConfig";
@@ -236,6 +241,78 @@ afterEach(async () => {
 });
 
 describe("B09 Redis reserved default prefix", () => {
+  it("rejects truncated unprefixed filter reads instead of returning false zero matches", async () => {
+    const store = new Map<string, Value>();
+    for (let index = 0; index < 101; index++) {
+      store.set(`key${String(index).padStart(4, "0")}`, {
+        type: "string",
+        value: String(index),
+        ttl: -1,
+      });
+    }
+    harness.databases.set(0, store);
+    const driver = driverWith();
+    await driver.connect();
+    await expect(
+      driver.readTablePage({
+        ...page("db0", REDIS_UNPREFIXED_KEYS_TABLE),
+        filters: [{ column: "key", operator: "eq", value: "key0100" }],
+      }),
+    ).rejects.toThrow("100-key safety limit");
+  });
+
+  it("rejects incomplete unprefixed sorted exports but keeps full key-only paging", async () => {
+    const store = new Map<string, Value>();
+    for (let index = 0; index < 2001; index++) {
+      store.set(`key${String(index).padStart(4, "0")}`, {
+        type: "string",
+        value: String(index),
+        ttl: -1,
+      });
+    }
+    harness.databases.set(0, store);
+    const driver = driverWith();
+    await driver.connect();
+    const service = new TableReadService({
+      getConnection: () => config,
+      getDriver: () => driver,
+    } as unknown as ConnectionManager);
+    const chunks = service.exportAll(
+      config.id,
+      "db0",
+      "",
+      REDIS_UNPREFIXED_KEYS_TABLE,
+      500,
+      { column: "value", direction: "asc" },
+    );
+    await expect(chunks.next()).rejects.toThrow("2000-key safety limit");
+    expect(
+      (await driver.readTablePage(page("db0", REDIS_UNPREFIXED_KEYS_TABLE)))
+        .totalCount,
+    ).toBe(2001);
+  });
+
+  it("counts only unprefixed matches against the fallback value-read limit", async () => {
+    const store = new Map<string, Value>();
+    for (let index = 0; index < 200; index++) {
+      store.set(`users:${index}`, {
+        type: "string",
+        value: "outside",
+        ttl: -1,
+      });
+    }
+    store.set("orphan", { type: "string", value: "inside", ttl: -1 });
+    harness.databases.set(0, store);
+    const driver = driverWith();
+    await driver.connect();
+    const result = await driver.readTablePage({
+      ...page("db0", REDIS_UNPREFIXED_KEYS_TABLE),
+      filters: [{ column: "key", operator: "eq", value: "orphan" }],
+    });
+    expect(result.rows.map((row) => row.key)).toEqual(["orphan"]);
+    expect(result.totalCount).toBe(1);
+  });
+
   it("keeps all-keys and the real prefix distinct in discovery, both page paths, metadata and export", async () => {
     const store = new Map<string, Value>([
       ["orphan", { type: "list", value: ["outside"], ttl: -1 }],
@@ -248,7 +325,23 @@ describe("B09 Redis reserved default prefix", () => {
     await driver.connect();
     expect(
       (await driver.listObjects("db0")).map((entry) => entry.name),
-    ).toEqual(["default", "default:", "users"]);
+    ).toEqual([
+      REDIS_ALL_KEYS_TABLE,
+      REDIS_UNPREFIXED_KEYS_TABLE,
+      "default:",
+      "users",
+    ]);
+    expect(
+      (await driver.readTablePage(page("db0", REDIS_ALL_KEYS_TABLE))).rows.map(
+        (row) => row.key,
+      ),
+    ).toEqual(["default:a", "default:b", "orphan", "users:a"]);
+    expect(
+      (
+        await driver.readTablePage(page("db0", REDIS_UNPREFIXED_KEYS_TABLE))
+      ).rows.map((row) => row.key),
+    ).toEqual(["orphan"]);
+    // Old saved views that used `default` continue to mean all keys.
     expect(
       (await driver.readTablePage(page("db0", "default"))).totalCount,
     ).toBe(4);
@@ -258,7 +351,7 @@ describe("B09 Redis reserved default prefix", () => {
     } as unknown as ConnectionManager);
     for (const filters of [
       [],
-      [{ column: "key", operator: "like" as const, value: "default:%" }],
+      [{ column: "key", operator: "like" as const, value: "default:" }],
     ]) {
       const result = await service.getPage(
         config.id,
@@ -300,10 +393,57 @@ describe("B09 Redis reserved default prefix", () => {
     ))
       keys.push(...chunk.rows.map((row) => row.key));
     expect(keys).toEqual(["default:a", "default:b"]);
+    const unprefixedKeys: string[] = [];
+    for await (const chunk of service.exportAll(
+      config.id,
+      "db0",
+      "",
+      REDIS_UNPREFIXED_KEYS_TABLE,
+      1,
+    ))
+      unprefixedKeys.push(...chunk.rows.map((row) => String(row.key)));
+    expect(unprefixedKeys).toEqual(["orphan"]);
     store.delete("orphan");
     expect(
       (await driver.listObjects("db0")).map((entry) => entry.name),
-    ).toEqual(["default:", "users"]);
+    ).toEqual([REDIS_ALL_KEYS_TABLE, "default:", "users"]);
+  });
+
+  it("keeps an all-keys view when the database has only prefixed keys", async () => {
+    harness.databases.set(
+      0,
+      new Map([["users:a", { type: "string", value: "a", ttl: -1 }]]),
+    );
+    const driver = driverWith();
+    await driver.connect();
+
+    expect(
+      (await driver.listObjects("db0")).map((entry) => entry.name),
+    ).toEqual([REDIS_ALL_KEYS_TABLE, "users"]);
+    expect(
+      (await driver.readTablePage(page("db0", REDIS_ALL_KEYS_TABLE))).rows.map(
+        (row) => row.key,
+      ),
+    ).toEqual(["users:a"]);
+    expect(
+      (await driver.listObjects("db0")).map((entry) => entry.name),
+    ).not.toContain(REDIS_UNPREFIXED_KEYS_TABLE);
+  });
+
+  it("keeps keys beginning with a colon in their own prefix view", async () => {
+    harness.databases.set(
+      0,
+      new Map([[":root", { type: "string", value: "root", ttl: -1 }]]),
+    );
+    const driver = driverWith();
+    await driver.connect();
+
+    expect(
+      (await driver.listObjects("db0")).map((entry) => entry.name),
+    ).toEqual([REDIS_ALL_KEYS_TABLE, REDIS_EMPTY_PREFIX_TABLE]);
+    expect(
+      (await driver.readTablePage(page("db0", REDIS_EMPTY_PREFIX_TABLE))).rows,
+    ).toEqual([{ key: ":root", value: "root", ttl: null }]);
   });
 });
 
@@ -662,6 +802,10 @@ describe("B02 Redis logical database isolation", () => {
     const pending = driver.connect();
     expect(driver.connect()).toBe(pending);
     const rejected = expect(pending).rejects.toThrow("cancelled");
+    await vi.waitFor(() => {
+      expect(harness.clients).toHaveLength(1);
+      expect(harness.clients[0].connect).toHaveBeenCalledTimes(1);
+    });
     const late = harness.clients[0];
     driver.cancelConnectionAttempt(pending);
     await rejected;

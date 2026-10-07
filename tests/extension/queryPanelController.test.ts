@@ -1,4 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createSqlReadOnlyQueryGuard } from "../../src/extension/utils/readOnlyGuards";
+import {
+  MONGO_ERROR_URI,
+  MONGO_NUMERIC_PASSWORD_ERROR_URIS,
+  MONGO_QUERY_ERROR_URIS,
+  mongoCredentialError,
+} from "../support/mongoCredentialError";
 
 describe("QueryPanelController", () => {
   let showWarningMessage: ReturnType<typeof vi.fn>;
@@ -47,6 +54,78 @@ describe("QueryPanelController", () => {
     vi.doMock("../../src/extension/utils/queryResultFormatting", () => ({
       formatQueryResult,
     }));
+  });
+
+  it.each(
+    ["query", "connect"].flatMap((route) =>
+      [
+        MONGO_ERROR_URI,
+        ...MONGO_QUERY_ERROR_URIS,
+        ...MONGO_NUMERIC_PASSWORD_ERROR_URIS,
+      ].map((uri) => ({
+        route,
+        uri,
+      })),
+    ),
+  )("redacts upstream Mongo URI errors in the $route response: $uri", async ({
+    route,
+    uri,
+  }) => {
+    const upstream = mongoCredentialError(uri);
+    const query = vi.fn(async (_queryText: string) => {
+      throw upstream;
+    });
+    const connection = {
+      id: "mongo",
+      name: "Mongo",
+      type: "mongodb",
+      connectionUri: uri,
+    };
+    const connectionManager = {
+      getConnection: () => connection,
+      isConnected: () => route === "query",
+      connectTo: vi.fn(async () => {
+        throw upstream;
+      }),
+      getQueryRowLimit: () => 100,
+      getDriver: () => ({ query }),
+      addToHistory: vi.fn(async () => undefined),
+    };
+    const view = {
+      getActiveConnectionId: () => "mongo",
+      getInitialConnectionId: () => "mongo",
+      getLastQueryResult: () => null,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+    const queryText = `db.runCommand({ comment: ${JSON.stringify(uri)} })`;
+    await controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText, connectionId: "mongo" },
+    });
+    expect(view.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "queryResult",
+        payload: expect.objectContaining({
+          error: expect.stringContaining("Protocol and host list are required"),
+        }),
+      }),
+    );
+    expect(JSON.stringify(view.postMessage.mock.calls)).not.toMatch(
+      /H10_MONGO_SENTINEL|H10_QUERY_SECRET|H10_SECRET|h10-user|user:123/,
+    );
+    if (route === "query") expect(query.mock.calls[0]?.[0]).toBe(queryText);
+    expect(upstream.message).toContain(uri);
+    expect(connection.connectionUri).toBe(uri);
   });
 
   it("keeps explicit, active, then initial connection precedence", async () => {
@@ -1185,6 +1264,112 @@ describe("QueryPanelController", () => {
           "[RapiDB] Read-only SQL connections allow only read-only queries.",
       },
     });
+  });
+
+  it.each([
+    {
+      type: "mysql",
+      dialect: "mysql" as const,
+      queryText:
+        "SELECT 1 AS $tag$; CREATE TEMPORARY TABLE rapidb_temp (id INT);",
+    },
+    {
+      type: "sqlite",
+      dialect: "sqlite" as const,
+      queryText: "PRAGMA optimize",
+    },
+    {
+      type: "pg",
+      dialect: "postgresql" as const,
+      queryText: "SELECT 1; $body$; DELETE FROM users",
+    },
+    {
+      type: "oracle",
+      dialect: "plsql" as const,
+      queryText: "SELECT 1 FROM dual; SELECT q'[unterminated",
+    },
+    {
+      type: "oracle",
+      dialect: "plsql" as const,
+      queryText:
+        'SELECT app /* owner */ . "orders seq" /* sequence */ . NEXTVAL FROM dual',
+    },
+    {
+      type: "mssql",
+      dialect: "transactsql" as const,
+      queryText: "SELECT 1; SELECT [unterminated",
+    },
+    {
+      type: "mssql",
+      dialect: "transactsql" as const,
+      queryText: "SELECT NEXT VALUE FOR dbo.orders_seq",
+    },
+    {
+      type: "mysql",
+      dialect: "mysql" as const,
+      queryText: "SELECT GET_LOCK #x\n('rapidb',0)",
+    },
+  ])("blocks unsafe $type read-only SQL in the query controller before connection/history", async ({
+    type,
+    dialect,
+    queryText,
+  }) => {
+    const query = vi.fn(async () => ({
+      columns: [],
+      rows: [],
+      rowCount: 0,
+      executionTimeMs: 0,
+    }));
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "active",
+        name: "Readonly",
+        type,
+        readOnly: true,
+      })),
+      getDriverCapabilities: vi.fn(() => ({
+        readOnlyQueryGuard: createSqlReadOnlyQueryGuard(dialect),
+      })),
+      isConnected: vi.fn(() => false),
+      connectTo: vi.fn(async () => undefined),
+      addToHistory: vi.fn(async () => undefined),
+      getDriver: vi.fn(() => ({ query })),
+      getQueryRowLimit: vi.fn(() => 100),
+    };
+    const view = {
+      getActiveConnectionId: vi.fn(() => "active"),
+      getInitialConnectionId: vi.fn(() => "active"),
+      getLastQueryResult: vi.fn(() => null),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+
+    await controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText },
+    });
+
+    expect(connectionManager.connectTo).not.toHaveBeenCalled();
+    expect(connectionManager.addToHistory).not.toHaveBeenCalled();
+    expect(query).not.toHaveBeenCalled();
+    expect(view.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "queryResult",
+        payload: expect.objectContaining({
+          error:
+            "[RapiDB] Read-only SQL connections allow only read-only queries.",
+        }),
+      }),
+    );
   });
 
   it("rejects readonly MSSQL queries without database-enforced permissions", async () => {

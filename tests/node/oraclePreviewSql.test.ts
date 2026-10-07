@@ -280,7 +280,7 @@ describe("Oracle preview SQL literals", () => {
 
     expect(condition).toBeTruthy();
     expect(condition).toMatchObject({
-      sql: `UPPER(REGEXP_REPLACE(XMLSERIALIZE(CONTENT "COL_XMLTYPE" AS CLOB), '>\\s+<', '><')) LIKE UPPER(:1)`,
+      sql: `UPPER(REGEXP_REPLACE(XMLSERIALIZE(CONTENT "COL_XMLTYPE" AS CLOB), '>\\s+<', '><')) LIKE UPPER(:1) ESCAPE '!'`,
       params: ['%<root><child id="1">Text</child></root>%'],
     });
   });

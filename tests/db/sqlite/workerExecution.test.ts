@@ -155,9 +155,13 @@ describe("SQLite off-host execution", () => {
         },
       ]),
     ).rejects.toThrow(/timed out.*rolled back/);
-    await expect(driver.query("UPDATE data SET value=99")).rejects.toThrow(
-      /connection is closed/,
-    );
+    await expect(
+      driver.query("UPDATE data SET value=99"),
+    ).rejects.toMatchObject({
+      code: "NOT_EXECUTED",
+      executionState: "not-executed",
+      message: expect.stringMatching(/connection is closed/),
+    });
     await driver.connect();
     expect(await value(driver, "SELECT value FROM data")).toBe(7);
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -268,7 +272,11 @@ describe("SQLite off-host execution", () => {
     await query;
     await expect(
       driver.runTransaction([{ sql: "INSERT INTO data VALUES(1)" }]),
-    ).rejects.toThrow(/connection is closed/);
+    ).rejects.toMatchObject({
+      code: "NOT_EXECUTED",
+      executionState: "not-executed",
+      message: expect.stringMatching(/connection is closed/),
+    });
     await expect(driver.connect()).rejects.toThrow(
       /Create a new connection explicitly/,
     );

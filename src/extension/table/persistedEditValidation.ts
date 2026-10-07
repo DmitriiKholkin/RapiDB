@@ -1,9 +1,10 @@
+import { isServerGeneratedColumn } from "../../shared/tableTypes";
 import type {
   ApplyResultPayload,
   ApplyRowOutcome,
 } from "../../shared/webviewContracts";
 import type { ColumnTypeMeta, IDBDriver } from "../dbDrivers/types";
-import { writableEntries } from "./updateSql";
+import { unknownSqlMutationColumns, writableEntries } from "./updateSql";
 
 export interface PersistedEditFailure {
   columns: string[];
@@ -15,9 +16,29 @@ export function validatePersistedEditRecord(
   driver: IDBDriver,
   values: Record<string, unknown>,
   columnMap: Map<string, ColumnTypeMeta>,
+  operation: "Insert" | "Update" = "Update",
 ): PersistedEditFailure | null {
+  const unknownColumns = unknownSqlMutationColumns(driver, values, columnMap);
+  if (unknownColumns.length > 0) {
+    return {
+      columns: unknownColumns,
+      message: `${operation} contains unknown column${unknownColumns.length === 1 ? "" : "s"} ${unknownColumns.map((name) => `"${name}"`).join(", ")}. Refresh the table schema and try again.`,
+    };
+  }
   const columns: string[] = [];
   const messages: string[] = [];
+  const generatedColumns = Object.entries(values)
+    .filter(
+      ([name, value]) =>
+        value !== undefined && isServerGeneratedColumn(columnMap.get(name)),
+    )
+    .map(([name]) => name);
+  if (generatedColumns.length > 0) {
+    columns.push(...generatedColumns);
+    messages.push(
+      `Generated column${generatedColumns.length === 1 ? "" : "s"} ${generatedColumns.map((name) => `"${name}"`).join(", ")} ${generatedColumns.length === 1 ? "is" : "are"} read-only and cannot be written.`,
+    );
+  }
   for (const [name, value] of writableEntries(values, columnMap)) {
     const column = columnMap.get(name);
     if (!column) continue;
@@ -31,6 +52,21 @@ export function validatePersistedEditRecord(
     }
   }
   return columns.length ? { columns, message: messages.join(" ") } : null;
+}
+
+export function validateInsertColumnNames(
+  driver: IDBDriver,
+  values: Record<string, unknown>,
+  columnMap: Map<string, ColumnTypeMeta>,
+): PersistedEditFailure | null {
+  // SQL tables have a closed set of columns. Document stores may allow new
+  // fields that are not represented by the current sample metadata.
+  const unknownColumns = unknownSqlMutationColumns(driver, values, columnMap);
+  if (unknownColumns.length === 0) return null;
+  return {
+    columns: unknownColumns,
+    message: `Insert contains unknown column${unknownColumns.length === 1 ? "" : "s"} ${unknownColumns.map((name) => `"${name}"`).join(", ")}. Refresh the table schema and try again.`,
+  };
 }
 
 export class PersistedEditValidationError extends Error {

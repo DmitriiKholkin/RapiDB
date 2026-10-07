@@ -1,4 +1,5 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import type { ServerResponse } from "node:http";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -169,6 +170,46 @@ describe("downloadToFile (stage 4)", () => {
     await expect(downloadToFile(`${base}/drip`, dest, 120)).rejects.toThrow(
       "Timed out downloading",
     );
+    expect(existsSync(dest)).toBe(false);
+  });
+
+  it("rejects oversized Content-Length before creating a file", async () => {
+    const base = await start((_req, res) => {
+      const response = res as ServerResponse;
+      response.writeHead(200, { "Content-Length": "1024" });
+      response.end("body");
+    });
+    const dest = tempFile();
+    await expect(
+      downloadToFile(`${base}/large`, dest, 1000, { maxBytes: 8 }),
+    ).rejects.toThrow("size limit");
+    expect(existsSync(dest)).toBe(false);
+  });
+
+  it("bounds chunked bodies, aborts the stream and removes partial files", async () => {
+    const base = await start((_req, res) => {
+      const response = res as ServerResponse;
+      response.write("1234");
+      const interval = setInterval(() => response.write("1234"), 5);
+      response.on("close", () => clearInterval(interval));
+    });
+    const dest = tempFile();
+    await expect(
+      downloadToFile(`${base}/chunked`, dest, 1000, { maxBytes: 8 }),
+    ).rejects.toThrow("size limit");
+    expect(existsSync(dest)).toBe(false);
+  });
+
+  it("refuses non-HTTP protocols and untrusted production hosts", async () => {
+    const dest = tempFile();
+    await expect(downloadToFile("file:///etc/passwd", dest)).rejects.toThrow(
+      "protocol",
+    );
+    await expect(
+      downloadToFile("https://evil.invalid/archive", dest, 1000, {
+        allowedHosts: ["github.com"],
+      }),
+    ).rejects.toThrow("untrusted");
     expect(existsSync(dest)).toBe(false);
   });
 });

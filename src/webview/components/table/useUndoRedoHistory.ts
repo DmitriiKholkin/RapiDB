@@ -11,6 +11,7 @@ export interface UndoRedoHistory {
   canUndo: boolean;
   canRedo: boolean;
   clear: () => void;
+  hasUnresolvedEdits: () => boolean;
   remap: (transform: (snapshot: MutationSnapshot) => MutationSnapshot) => void;
 }
 
@@ -76,5 +77,22 @@ export function useUndoRedoHistory(): UndoRedoHistory {
     [],
   );
 
-  return { push, undo, redo, canUndo, canRedo, clear, remap };
+  const hasUnresolvedEdits = useCallback(
+    () =>
+      [...pastRef.current, ...futureRef.current].some(
+        (snapshot) => (snapshot.unresolvedPendingEdits?.length ?? 0) > 0,
+      ),
+    [],
+  );
+
+  return {
+    push,
+    undo,
+    redo,
+    canUndo,
+    canRedo,
+    clear,
+    remap,
+    hasUnresolvedEdits,
+  };
 }

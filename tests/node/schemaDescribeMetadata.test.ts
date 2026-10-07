@@ -50,6 +50,17 @@ describe("describeTable schema metadata", () => {
     const driver = new MySQLDriver(mysqlConfig as ConnectionConfig);
     const rows = [
       {
+        COLUMN_NAME: "id",
+        COLUMN_TYPE: "int",
+        IS_NULLABLE: "NO",
+        COLUMN_DEFAULT: null,
+        GENERATION_EXPRESSION: null,
+        EXTRA: "auto_increment",
+        IS_PRIMARY_KEY: 1,
+        PRIMARY_KEY_ORDINAL: 1,
+        IS_FOREIGN_KEY: 0,
+      },
+      {
         COLUMN_NAME: "created_at",
         COLUMN_TYPE: "timestamp(6)",
         IS_NULLABLE: "NO",
@@ -104,6 +115,11 @@ describe("describeTable schema metadata", () => {
     expect(columns).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
+          name: "id",
+          identityGeneration: "auto_increment",
+          isComputed: false,
+        }),
+        expect.objectContaining({
           name: "created_at",
           defaultValue: "CURRENT_TIMESTAMP(6)",
           onUpdateExpression: "CURRENT_TIMESTAMP(6)",
@@ -132,10 +148,21 @@ describe("describeTable schema metadata", () => {
     );
   });
 
-  it("surfaces Postgres stored generated columns without reusing defaultValue", async () => {
+  it("surfaces Postgres stored and virtual generated columns without reusing defaultValue", async () => {
     const driver = new PostgresDriver(postgresConfig as ConnectionConfig);
     const query = vi.fn(async () => ({
       rows: [
+        {
+          column_name: "id",
+          data_type: "integer",
+          is_nullable: false,
+          column_default: null,
+          generated_kind: null,
+          identity_kind: "d",
+          is_pk: true,
+          pk_ordinal: 1,
+          is_fk: false,
+        },
         {
           column_name: "created_at",
           data_type: "timestamp with time zone",
@@ -158,6 +185,17 @@ describe("describeTable schema metadata", () => {
           pk_ordinal: null,
           is_fk: false,
         },
+        {
+          column_name: "slug_virtual",
+          data_type: "text",
+          is_nullable: true,
+          column_default: "upper(display_name)",
+          generated_kind: "v",
+          identity_kind: null,
+          is_pk: false,
+          pk_ordinal: null,
+          is_fk: false,
+        },
       ],
     }));
     (driver as unknown as { pool: { query: typeof query } }).pool = {
@@ -168,6 +206,14 @@ describe("describeTable schema metadata", () => {
 
     expect(columns).toEqual(
       expect.arrayContaining([
+        expect.objectContaining({
+          name: "id",
+          type: "integer",
+          identityGeneration: "by_default",
+          isComputed: false,
+          generatedKind: undefined,
+          computedExpression: undefined,
+        }),
         expect.objectContaining({
           name: "created_at",
           defaultValue: "CURRENT_TIMESTAMP",
@@ -180,6 +226,15 @@ describe("describeTable schema metadata", () => {
           computedExpression: "lower(display_name)",
           generatedKind: "stored",
           isPersisted: true,
+        }),
+        expect.objectContaining({
+          name: "slug_virtual",
+          type: "text",
+          defaultValue: undefined,
+          isComputed: true,
+          computedExpression: "upper(display_name)",
+          generatedKind: "virtual",
+          isPersisted: false,
         }),
       ]),
     );

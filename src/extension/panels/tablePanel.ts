@@ -11,6 +11,10 @@ import {
   buildDeleteResult,
   unattemptedDeleteResult,
 } from "../dbDrivers/deleteOutcomes";
+import {
+  redisKeyspaceDisplayName,
+  redisKeyspaceFileName,
+} from "../dbDrivers/redisKeyspace";
 import type { ColumnTypeMeta, FilterExpression } from "../dbDrivers/types";
 import {
   buildPrevalidationFailedResult,
@@ -65,6 +69,20 @@ function shouldShowSchemaPrefix(connectionType: string | undefined): boolean {
   );
 }
 
+function tableDisplayName(
+  connectionType: string | undefined,
+  table: string,
+): string {
+  return connectionType === "redis" ? redisKeyspaceDisplayName(table) : table;
+}
+
+function tableFileName(
+  connectionType: string | undefined,
+  table: string,
+): string {
+  return connectionType === "redis" ? redisKeyspaceFileName(table) : table;
+}
+
 type ExportPayload = {
   sort?: unknown;
   filters?: unknown[];
@@ -93,6 +111,8 @@ export class TablePanel {
   private readonly table: string;
   private readonly isView: boolean;
   private readonly previewController: TableMutationPreviewController;
+  private disposed = false;
+  private messageEpoch = 0;
   private readonly inFlightPageRequests = new Map<
     string,
     Promise<{
@@ -141,7 +161,7 @@ export class TablePanel {
     this.isView = isView;
     this.previewController = new TableMutationPreviewController({
       connectionId,
-      tableName: table,
+      tableName: this.getDisplayTableName(),
       connectionManager,
       tableDataService: this.svc,
       notifyWarning: (message) => {
@@ -177,6 +197,8 @@ export class TablePanel {
       },
     );
     this.panel.onDidDispose(() => {
+      this.disposed = true;
+      this.messageEpoch++;
       schemaRefreshSubscription?.dispose();
       this.previewController.clear();
       this.previewSchemas.clear();
@@ -209,8 +231,127 @@ export class TablePanel {
     return JSON.stringify([connectionId, database, schema, table]);
   }
 
-  private postMessage(type: string, payload: unknown): Thenable<boolean> {
-    return this.panel.webview.postMessage({ type, payload });
+  private async postMessage(type: string, payload: unknown): Promise<boolean> {
+    const epoch = this.messageEpoch;
+    if (this.disposed) return false;
+
+    let delivered = false;
+    let deliveryError: unknown;
+    try {
+      delivered = await this.panel.webview.postMessage({ type, payload });
+    } catch (error: unknown) {
+      deliveryError = error;
+    }
+
+    if (delivered || !this.isCurrentMessageEpoch(epoch)) return delivered;
+
+    const fallback = this.createUndeliveredMutationFallback(type, payload);
+    if (!fallback) {
+      if (deliveryError !== undefined) {
+        logErrorWithContext(
+          "TablePanel webview message delivery failed",
+          deliveryError,
+        );
+      }
+      return false;
+    }
+
+    if (type === "tableMutationPreview") {
+      this.discardUndeliveredPreview(payload);
+    }
+
+    try {
+      const fallbackDelivered = await this.panel.webview.postMessage(fallback);
+      if (!fallbackDelivered && this.isCurrentMessageEpoch(epoch)) {
+        this.reportUndeliveredMutationFallback();
+      }
+    } catch (error: unknown) {
+      if (this.isCurrentMessageEpoch(epoch)) {
+        this.reportUndeliveredMutationFallback(error);
+      }
+    }
+    return false;
+  }
+
+  private isCurrentMessageEpoch(epoch: number): boolean {
+    return !this.disposed && epoch === this.messageEpoch;
+  }
+
+  private createUndeliveredMutationFallback(
+    type: string,
+    payload: unknown,
+  ): { type: string; payload: unknown } | null {
+    if (payload === null || typeof payload !== "object") return null;
+    const message = payload as Record<string, unknown>;
+    if (typeof message.operationId !== "string") return null;
+
+    if (type === "tableMutationPreview") {
+      const resultType =
+        message.kind === "applyChanges"
+          ? "applyResult"
+          : message.kind === "deleteRows"
+            ? "deleteResult"
+            : message.kind === "insertRow"
+              ? "insertResult"
+              : null;
+      if (!resultType) return null;
+      const error =
+        "The mutation preview could not be delivered. No changes were applied; retry when the table panel is responsive.";
+      return {
+        type: resultType,
+        payload:
+          resultType === "deleteResult"
+            ? {
+                operationId: message.operationId,
+                success: false,
+                error,
+                affectedRows: 0,
+                rowOutcomes: [],
+                changesPossible: false,
+                outcomeUnknown: false,
+              }
+            : { operationId: message.operationId, success: false, error },
+      };
+    }
+
+    if (
+      type !== "applyResult" &&
+      type !== "deleteResult" &&
+      type !== "insertResult"
+    ) {
+      return null;
+    }
+
+    // Delivery failure is not execution uncertainty. Retry the exact evidence,
+    // including validation diagnostics and confirmed writes. Keep operationId:
+    // postMessage acknowledgement does not prove receipt, so the consumer must
+    // ignore a duplicate result after settling that correlated operation.
+    return { type, payload };
+  }
+
+  private discardUndeliveredPreview(payload: unknown): void {
+    if (payload === null || typeof payload !== "object") return;
+    const preview = payload as Partial<TableMutationPreviewPayload>;
+    if (!preview.previewToken || !preview.operationId) return;
+    if (
+      this.previewSchemas.get(preview.previewToken)?.operationId !==
+      preview.operationId
+    ) {
+      return;
+    }
+    this.previewSchemas.delete(preview.previewToken);
+    this.previewController.cancel(preview.previewToken, preview.operationId);
+  }
+
+  private reportUndeliveredMutationFallback(error?: unknown): void {
+    if (this.disposed) return;
+    const warning =
+      "The table mutation response could not be delivered to the panel. Refresh the table and verify before retrying.";
+    logErrorWithContext(
+      "TablePanel mutation fallback delivery failed",
+      error ?? new Error(warning),
+    );
+    void vscode.window.showWarningMessage(`[RapiDB] ${warning}`);
   }
 
   private shouldSkipTableMutationPreview(): boolean {
@@ -350,9 +491,10 @@ export class TablePanel {
       const connectionType = connection?.type;
       const effectiveObjectKind = objectKind ?? (isView ? "view" : "table");
       const objType = titleObjectKindLabel(connectionType, effectiveObjectKind);
+      const displayTable = tableDisplayName(connectionType, table);
       const schemaPrefix =
         schema && shouldShowSchemaPrefix(connectionType) ? `${schema}.` : "";
-      return `${schemaPrefix}${table} (${objType}) [${connName}]`;
+      return `${schemaPrefix}${displayTable} (${objType}) [${connName}]`;
     };
     const panel = vscode.window.createWebviewPanel(
       TablePanel.viewType,
@@ -569,7 +711,7 @@ export class TablePanel {
           validatePersistedEditRecord(driver, update.changes, columnMap),
         );
         const insertFailures = (insertValues ?? []).map((values) =>
-          validatePersistedEditRecord(driver, values, columnMap),
+          validatePersistedEditRecord(driver, values, columnMap, "Insert"),
         );
         if ([...updateFailures, ...insertFailures].some(Boolean)) {
           await this.postMessage("applyResult", {
@@ -813,7 +955,13 @@ export class TablePanel {
     const normalizedLimitToPage = limitToPage
       ? this.normalizePageRequest(limitToPage.page, limitToPage.pageSize)
       : undefined;
-    const fileName = this.schema ? `${this.schema}_${this.table}` : this.table;
+    const connectionType = this.connectionManager.getConnection(
+      this.connectionId,
+    )?.type;
+    const displayTable = tableFileName(connectionType, this.table);
+    const fileName = this.schema
+      ? `${this.schema}_${displayTable}`
+      : displayTable;
     const filterExpressions = coerceFilterExpressions(filters);
     const loadChunks = (signal: AbortSignal) =>
       this.reorderChunks(
@@ -986,13 +1134,14 @@ export class TablePanel {
     return createWebviewShell({
       context,
       webview: this.panel.webview,
-      title: `${this.isView ? "View" : "Table"} - ${this.table}`,
+      title: `${this.isView ? "View" : "Table"} - ${this.getDisplayTableName()}`,
       initialState: {
         view: "table",
         connectionId: this.connectionId,
         database: this.database,
         schema: this.schema,
         table: this.table,
+        displayTableName: this.getDisplayTableName(),
         isView: this.isView,
         connectionReadOnly: this.isConnectionReadOnly(),
         mongoRowIdentity:
@@ -1001,6 +1150,8 @@ export class TablePanel {
         defaultPageSize: this.connectionManager.getDefaultPageSize(),
         panelRetentionMode: TABLE_PANEL_RETENTION_MODE,
       },
+      // LargeMonacoDialog uses a Blob-backed Monaco worker in table dialogs.
+      extraCspDirectives: ["worker-src blob:"],
       ...APP_WEBVIEW_SHELL_LAYOUT,
       extraStyles: `
         ${WEBVIEW_SCROLLBAR_STYLES}
@@ -1011,5 +1162,12 @@ export class TablePanel {
         }
       `,
     });
+  }
+
+  private getDisplayTableName(): string {
+    return tableDisplayName(
+      this.connectionManager.getConnection(this.connectionId)?.type,
+      this.table,
+    );
   }
 }

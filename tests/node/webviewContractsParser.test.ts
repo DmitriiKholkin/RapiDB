@@ -429,6 +429,17 @@ describe("parseQueryPanelMessage", () => {
     expect(parsed).toBeNull();
   });
 
+  it.each([
+    "",
+    " \t\n",
+  ])("rejects blank query text for execution and bookmarks (%j)", (queryText) => {
+    for (const type of ["executeQuery", "addBookmark"] as const) {
+      expect(
+        parseQueryPanelMessage({ type, payload: { queryText } }),
+      ).toBeNull();
+    }
+  });
+
   it("parses writeClipboard payload", () => {
     const parsed = parseQueryPanelMessage({
       type: "writeClipboard",
@@ -1063,6 +1074,22 @@ describe("parseWebviewInitialState", () => {
       isView: undefined,
       connectionReadOnly: undefined,
       defaultPageSize: 100,
+    });
+  });
+
+  it("keeps table display names separate from routing identities", () => {
+    expect(
+      parseWebviewInitialState({
+        view: "table",
+        connectionId: "redis",
+        database: "db0",
+        schema: "",
+        table: "__rapidb:all-keys",
+        displayTableName: "All keys",
+      }),
+    ).toMatchObject({
+      table: "__rapidb:all-keys",
+      displayTableName: "All keys",
     });
   });
 

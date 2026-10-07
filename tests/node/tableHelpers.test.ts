@@ -384,7 +384,7 @@ describe("table helpers", () => {
     expect(operation.params).toEqual([]);
   });
 
-  it("includes computed columns in insert operations", () => {
+  it("omits computed columns from insert operations", () => {
     const operation = buildInsertRowOperation(
       fakeDriver,
       "main",
@@ -399,9 +399,9 @@ describe("table helpers", () => {
     );
 
     expect(operation.sql).toBe(
-      'INSERT INTO public.fixture_rows ("display_name", "amount", "amount_x2") VALUES ($1, $2, $3)',
+      'INSERT INTO public.fixture_rows ("display_name", "amount") VALUES ($1, $2)',
     );
-    expect(operation.params).toEqual(["Gamma", "10.25", "20.50"]);
+    expect(operation.params).toEqual(["Gamma", "10.25"]);
   });
 
   it("builds Oracle-safe default-only insert SQL using explicit DEFAULT expressions", () => {
@@ -437,7 +437,7 @@ describe("table helpers", () => {
     );
 
     expect(operation.sql).toBe(
-      'INSERT INTO "PUBLIC"."fixture_rows" ("id", "display_name", "amount", "amount_x2") VALUES (DEFAULT, DEFAULT, DEFAULT, DEFAULT)',
+      'INSERT INTO "PUBLIC"."fixture_rows" ("id", "display_name", "amount") VALUES (DEFAULT, DEFAULT, DEFAULT)',
     );
     expect(operation.params).toEqual([]);
   });
@@ -948,10 +948,57 @@ describe("table helpers", () => {
     expect(result).toEqual(
       expect.objectContaining({
         success: false,
+        changesPossible: true,
+        outcomeUnknown: true,
         error:
-          "One or more rows changed after they were loaded. Refresh the table and retry.",
+          "One or more row outcomes are unknown. Refresh the table and verify before retrying.",
+        rowOutcomes: expect.arrayContaining([
+          expect.objectContaining({
+            rowIndex: 0,
+            success: false,
+            status: "unknown",
+          }),
+          expect.objectContaining({
+            rowIndex: 1,
+            success: false,
+            status: "unknown",
+          }),
+        ]),
       }),
     );
+  });
+
+  it("preserves no-change flags when a driver proves an update was not executed", async () => {
+    const notExecuted = Object.assign(new Error("operation remained queued"), {
+      code: "NOT_EXECUTED",
+    });
+    const driver: IDBDriver = {
+      ...fakeDriver,
+      updateRows: async () => {
+        throw notExecuted;
+      },
+    };
+    const prepared = prepareApplyChangesPlan(
+      { getDriver: () => driver } as never,
+      "conn-1",
+      "main",
+      "public",
+      "fixture_rows",
+      [{ primaryKeys: { id: 1 }, changes: { display_name: "Updated" } }],
+      columns,
+    );
+    if (!prepared.executable) throw new Error("Expected executable plan");
+
+    const result = await executePreparedApplyPlan(
+      { getDriver: () => driver } as never,
+      prepared.plan,
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      changesPossible: false,
+      outcomeUnknown: false,
+    });
   });
 
   it("skips driver-backed updates whose writable change set becomes empty", async () => {
@@ -1027,7 +1074,23 @@ describe("table helpers", () => {
   it("uses driver mutation hooks for update, insert, and delete flows", async () => {
     const updateRows = async () => ({ affectedRows: 1 });
     const insertRow = async () => ({ affectedRows: 1 });
-    const deleteRows = async () => ({ affectedRows: 2 });
+    const deleteRows: NonNullable<IDBDriver["deleteRows"]> = async () => ({
+      affectedRows: 2,
+      rowOutcomes: [
+        {
+          rowIndex: 0,
+          primaryKeys: { id: 1 },
+          success: true,
+          status: "deleted",
+        },
+        {
+          rowIndex: 1,
+          primaryKeys: { id: 2 },
+          success: true,
+          status: "deleted",
+        },
+      ],
+    });
     const driver: IDBDriver = {
       ...fakeDriver,
       coerceInputValue: (value, column) => {
@@ -1157,6 +1220,31 @@ describe("table helpers", () => {
         { display_name: "Missing" },
       ),
     ).rejects.toThrow(/row not found/i);
+  });
+
+  it("does not treat a driver update with no affectedRows count as success", async () => {
+    const driver: IDBDriver = {
+      ...fakeDriver,
+      updateRows: async () => ({ affectedRows: undefined }) as never,
+    };
+    const mutationService = new TableMutationService(
+      {
+        getConnection: () => ({ id: "conn-1" }),
+        getDriver: () => driver,
+      } as never,
+      { getColumns: async () => columns },
+    );
+
+    await expect(
+      mutationService.updateRow(
+        "conn-1",
+        "main",
+        "public",
+        "fixture_rows",
+        { id: 1 },
+        { display_name: "Uncertain" },
+      ),
+    ).rejects.toThrow(/outcome is unknown/i);
   });
 
   it("does not call driver-backed update hooks when no writable changes remain", async () => {

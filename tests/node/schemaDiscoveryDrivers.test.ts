@@ -5,6 +5,7 @@ import { DynamoDBDriver } from "../../src/extension/dbDrivers/dynamodb";
 import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
+import { REDIS_ALL_KEYS_TABLE } from "../../src/extension/dbDrivers/redisKeyspace";
 import { loadDatabaseScope } from "../../src/extension/schema/schemaLoaders";
 
 vi.mock("redis", async (importOriginal) => {
@@ -139,7 +140,7 @@ describe("driver schema discovery error boundaries", () => {
       expect(recovered.failedSchemas).toEqual([]);
       expect(recovered.loadedSchemas[0]).toMatchObject({
         name: "db0",
-        objects: [{ name: "default", type: "table" }],
+        objects: [{ name: REDIS_ALL_KEYS_TABLE, type: "table" }],
       });
       vi.spyOn(driver, "listSchemas").mockRejectedValue(denied);
       await expect(loadDatabaseScope(driver, "db0", "baseline")).rejects.toBe(

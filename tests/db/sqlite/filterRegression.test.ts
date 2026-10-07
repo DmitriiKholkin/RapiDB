@@ -57,6 +57,26 @@ describe.each([
   "native",
   "worker",
 ] as const)("real %s SQLite filter regressions", (mode) => {
+  it("preserves leading-plus int64 filter values through the active rows/count route", async () => {
+    const { ids } = await setup(
+      mode,
+      `CREATE TABLE items (id INTEGER PRIMARY KEY, whole BIGINT);
+      INSERT INTO items VALUES (1, 9007199254740992), (2, 9007199254740993),
+        (3, 9007199254740994), (4, -9007199254740993);`,
+    );
+    const value = "+9007199254740993";
+    expect(await ids("whole", "eq", value)).toEqual([2]);
+    expect(await ids("whole", "neq", value)).toEqual([1, 3, 4]);
+    expect(await ids("whole", "gt", value)).toEqual([3]);
+    expect(await ids("whole", "lt", value)).toEqual([1, 4]);
+    expect(await ids("whole", "in", `${value}, -9007199254740993`)).toEqual([
+      2, 4,
+    ]);
+    expect(await ids("whole", "between", [value, "9007199254740994"])).toEqual([
+      2, 3,
+    ]);
+  });
+
   it("distinguishes exact int64 values stored under declared DECIMAL in scalar, IN and range filters", async () => {
     const { driver, read, ids } = await setup(
       mode,
@@ -404,7 +424,7 @@ describe.each([
           contains.params,
         )
       ).rows.map((row) => row.__col_0),
-    ).toEqual([5, 6]);
+    ).toEqual([5]);
     expect(await ids("event", "eq", "raw%_value")).toEqual([5]);
   });
 });

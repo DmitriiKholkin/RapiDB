@@ -7,6 +7,7 @@ import {
 import { DynamoDBDriver } from "../../src/extension/dbDrivers/dynamodb";
 import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
+import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
 import { createTimeoutAwareDriver } from "../../src/extension/dbDrivers/timeout";
 import type {
@@ -253,6 +254,74 @@ describe("B12 service and preview results", () => {
     });
   });
 
+  it("does not infer per-row success from an exact aggregate count", async () => {
+    const identities = [{ id: 1 }, { id: 2 }, { id: 3 }];
+    const error = await service({
+      deleteRows: async () => ({ affectedRows: identities.length }),
+      runTransaction: vi.fn(),
+    })
+      .executePreparedDeletePlan(plan(identities))
+      .catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      deleteResult: {
+        success: false,
+        affectedRows: identities.length,
+        changesPossible: true,
+        outcomeUnknown: true,
+        rowOutcomes: identities.map(() => ({ status: "unknown" })),
+      },
+    });
+  });
+
+  it("keeps duplicate IDs unknown when an aggregate delete races with reinsertion", async () => {
+    const identities = [{ id: 1 }, { id: 1 }];
+    let rows = ["selected row"];
+    let signalFirstDelete!: () => void;
+    let releaseSecondDelete!: () => void;
+    const firstDelete = new Promise<void>((resolve) => {
+      signalFirstDelete = resolve;
+    });
+    const reinsertionReady = new Promise<void>((resolve) => {
+      releaseSecondDelete = resolve;
+    });
+    const deleteRows = vi.fn(async () => {
+      let affectedRows = 0;
+      if (rows.length > 0) {
+        rows.shift();
+        affectedRows++;
+      }
+      signalFirstDelete();
+      await reinsertionReady;
+      if (rows.length > 0) {
+        rows.shift();
+        affectedRows++;
+      }
+      return { affectedRows };
+    });
+    const pending = service({ deleteRows, runTransaction: vi.fn() })
+      .executePreparedDeletePlan(plan(identities))
+      .catch((caught: unknown) => caught);
+    const concurrentReinsert = (async () => {
+      await firstDelete;
+      rows.push("concurrent reinsertion");
+      releaseSecondDelete();
+    })();
+    await concurrentReinsert;
+    const error = await pending;
+
+    expect(deleteRows).toHaveBeenCalledOnce();
+    expect(rows).toEqual([]);
+    expect(error).toMatchObject({
+      deleteResult: {
+        success: false,
+        affectedRows: identities.length,
+        outcomeUnknown: true,
+        rowOutcomes: [{ status: "unknown" }, { status: "unknown" }],
+      },
+    });
+  });
+
   it("keeps the confirmed delete count through the service after a wrapper timeout", async () => {
     vi.useFakeTimers();
     let finish!: () => void;
@@ -407,6 +476,66 @@ describe("B12 service and preview results", () => {
     expect(execute).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps SQL-verified preview deletes successful with explicit row outcomes", async () => {
+    const identities = [{ id: 1 }, { id: 2 }];
+    const driver = new PostgresDriver({
+      id: config.id,
+      name: config.name,
+      type: "pg",
+    });
+    const runTransaction = vi
+      .spyOn(driver, "runTransaction")
+      .mockResolvedValue();
+    const query = vi.spyOn(driver, "query").mockResolvedValue({
+      columns: [],
+      rows: [],
+      rowCount: 0,
+      executionTimeMs: 0,
+    });
+    const manager = {
+      getDriver: () => driver,
+      getConnection: () => ({ ...config, type: "pg" }),
+      getQueryEditorPresentation: () => undefined,
+    };
+    const tableMutationService = new TableMutationService(manager as never, {
+      getColumns: async () => [],
+    });
+    const controller = new TableMutationPreviewController({
+      connectionId: config.id,
+      tableName: "items",
+      connectionManager: manager as never,
+      tableDataService: {
+        executePreparedDeletePlan:
+          tableMutationService.executePreparedDeletePlan.bind(
+            tableMutationService,
+          ),
+        executePreparedInsertPlan: vi.fn(),
+      },
+      notifyWarning: vi.fn(),
+    });
+    const preview = controller.createDeleteRowsPreview(
+      "confirmed-delete",
+      plan(identities, "sql"),
+    );
+
+    expect(
+      await controller.confirm(preview.previewToken, "confirmed-delete"),
+    ).toMatchObject({
+      type: "deleteResult",
+      payload: {
+        success: true,
+        affectedRows: identities.length,
+        outcomeUnknown: false,
+        rowOutcomes: [
+          { rowIndex: 0, primaryKeys: identities[0], status: "deleted" },
+          { rowIndex: 1, primaryKeys: identities[1], status: "deleted" },
+        ],
+      },
+    });
+    expect(runTransaction).toHaveBeenCalledOnce();
+    expect(query).toHaveBeenCalledTimes(identities.length);
+  });
+
   it("preserves SQL expected-count guards and treats a transaction error as unknown", async () => {
     const runTransaction = vi.fn(async () => {
       throw new Error("commit response lost");
@@ -431,5 +560,80 @@ describe("B12 service and preview results", () => {
       { database: "db" },
     );
     expect(prepared.operations[0].expectedAffectedRows).toBe(2);
+  });
+
+  it.each([
+    "metadata",
+    "verification",
+  ] as const)("does not mark a committed delete as unknown when %s reads fail", async (failedRead) => {
+    const driver = new PostgresDriver({
+      id: config.id,
+      name: config.name,
+      type: "pg",
+    });
+    const events: string[] = [];
+    const runTransaction = vi
+      .spyOn(driver, "runTransaction")
+      .mockImplementation(async () => {
+        events.push("committed");
+      });
+    const queuedRead = Object.assign(
+      new Error("verification read was queued"),
+      {
+        code: "NOT_EXECUTED",
+      },
+    );
+    const query = vi.spyOn(driver, "query").mockImplementation(async () => {
+      events.push("verification");
+      throw queuedRead;
+    });
+    const getColumns = vi.fn(async () => {
+      events.push("metadata");
+      if (failedRead === "metadata") {
+        throw new Error("metadata read failed after commit");
+      }
+      return [];
+    });
+    const manager = {
+      getDriver: () => driver,
+      getConnection: () => ({ ...config, type: "pg" }),
+    };
+    const tableMutationService = new TableMutationService(manager as never, {
+      getColumns,
+    });
+    const prepared = plan([{ id: 1 }, { id: 2 }], "sql");
+    const error = await tableMutationService
+      .executePreparedDeletePlan(prepared)
+      .catch((caught: unknown) => caught);
+
+    expect(runTransaction).toHaveBeenCalledOnce();
+    expect(getColumns).toHaveBeenCalledOnce();
+    expect(query).toHaveBeenCalledTimes(failedRead === "verification" ? 2 : 0);
+    expect(events).toEqual(
+      failedRead === "verification"
+        ? ["committed", "metadata", "verification", "verification"]
+        : ["committed", "metadata"],
+    );
+    expect(error).toBeInstanceOf(DeleteExecutionError);
+    expect(error).toMatchObject({
+      deleteResult: {
+        success: false,
+        affectedRows: 2,
+        changesPossible: true,
+        outcomeUnknown: false,
+        rowOutcomes: [{ status: "unknown" }, { status: "unknown" }],
+      },
+    });
+    expect((error as DeleteExecutionError).deleteResult.error).toMatch(
+      /Delete committed, but verification failed/,
+    );
+    expect((error as DeleteExecutionError).deleteResult.error).not.toMatch(
+      /late write|in-flight write/i,
+    );
+    expect(
+      (error as DeleteExecutionError).deleteResult.rowOutcomes.map(
+        (row) => row.status,
+      ),
+    ).not.toContain("skipped");
   });
 });

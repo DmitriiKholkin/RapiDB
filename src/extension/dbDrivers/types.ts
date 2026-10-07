@@ -223,6 +223,12 @@ export interface DriverDeleteRowsRequest {
 export interface DriverMutationResult {
   affectedRows: number;
   rowOutcomes?: import("../../shared/webviewContracts").DeleteRowOutcome[];
+  updateRowOutcomes?: DriverUpdateRowOutcome[];
+}
+export interface DriverUpdateRowOutcome {
+  /** Zero-based index in DriverUpdateRowsRequest.updates. */
+  rowIndex: number;
+  status: "applied" | "not_applied" | "unknown";
 }
 export interface DriverOperationContext {
   signal: AbortSignal;

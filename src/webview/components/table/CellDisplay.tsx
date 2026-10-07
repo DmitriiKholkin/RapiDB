@@ -1,10 +1,7 @@
 import React from "react";
 import type { TypeCategory } from "../../../shared/tableTypes";
 import { getCategoryPresentation } from "../../types";
-import {
-  formatBinaryValueForViewer,
-  formatScalarValueForDisplay,
-} from "../../utils/valueFormatting";
+import { CELL_PREVIEW_NOTICE, getCellPreview } from "../../utils/cellPreview";
 
 const PENDING_COLOR = "var(--vscode-editorWarning-foreground, #cca700)";
 export function CellDisplay({
@@ -25,18 +22,20 @@ export function CellDisplay({
     ? getCategoryPresentation(category).foreground
     : undefined;
   const resolvedColor = isPending ? PENDING_COLOR : categoryColor;
-  const str = formatScalarValueForDisplay(value);
+  const preview = getCellPreview(value, category);
+  const str = preview.text;
+  const title = preview.truncated ? CELL_PREVIEW_NOTICE : undefined;
 
   if (category === "binary") {
-    const binaryStr = formatBinaryValueForViewer(value);
     return (
       <span
+        title={title}
         style={{
           color: resolvedColor,
           opacity: 0.85,
         }}
       >
-        {binaryStr}
+        {str}
       </span>
     );
   }
@@ -44,6 +43,7 @@ export function CellDisplay({
   if (category === "uuid") {
     return (
       <span
+        title={title}
         style={{
           color: resolvedColor,
           opacity: 0.85,
@@ -60,6 +60,7 @@ export function CellDisplay({
   ) {
     return (
       <span
+        title={title}
         style={{
           color: resolvedColor,
         }}
@@ -71,6 +72,7 @@ export function CellDisplay({
   const singleLineStr = str.replace(/\r\n|\r|\n/g, "↵");
   return (
     <span
+      title={title}
       style={{
         color: resolvedColor,
         whiteSpace: "pre",

@@ -23,6 +23,8 @@ import {
 
 export type ApplyRowStatus =
   | "applied"
+  | "not_applied"
+  | "unknown"
   | "skipped"
   | "prevalidation_failed"
   | "verification_failed";
@@ -39,9 +41,14 @@ export interface ApplyResultPayload {
   operationId?: string;
   success: boolean;
   error?: string;
+  /** Whether a failed apply may have persisted any write. */
+  changesPossible?: boolean;
+  /** Whether write execution/settlement is uncertain (not a post-commit read failure). */
+  outcomeUnknown?: boolean;
   warning?: string;
   failedRows?: number[];
   rowOutcomes?: ApplyRowOutcome[];
+  /** Whether at least one insert is known to have completed, not merely possibly applied. */
   insertApplied?: boolean;
   insertRowOutcomes?: ApplyRowOutcome[];
 }
@@ -105,9 +112,9 @@ export interface DeleteResultPayload {
   success: boolean;
   affectedRows: number;
   rowOutcomes: DeleteRowOutcome[];
-  /** A read is needed even if execution failed. */
+  /** A read is needed to reconcile a committed or possibly applied delete. */
   changesPossible: boolean;
-  /** An in-flight write may settle after the first refresh. */
+  /** A delete write may still settle after the first refresh; excludes post-commit verification failures. */
   outcomeUnknown: boolean;
   error?: string;
 }
@@ -120,6 +127,7 @@ export interface TableInitialState extends PanelRetentionState {
   database: string;
   schema: string;
   table: string;
+  displayTableName?: string;
   isView?: boolean;
   connectionReadOnly?: boolean;
   mongoRowIdentity?: boolean;
@@ -149,6 +157,7 @@ export function parseTableInitialState(
     database,
     schema,
     table,
+    displayTableName: readOptionalString(input, "displayTableName"),
     isView: readOptionalBoolean(input, "isView"),
     connectionReadOnly: readOptionalBoolean(input, "connectionReadOnly"),
     mongoRowIdentity: readOptionalBoolean(input, "mongoRowIdentity"),

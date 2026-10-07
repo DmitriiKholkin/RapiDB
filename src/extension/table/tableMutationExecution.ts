@@ -3,12 +3,16 @@ import type {
   ApplyRowOutcome,
 } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
+import { isMutationNotExecutedError } from "../dbDrivers/mutationExecutionState";
 import { TransactionVerificationError } from "../dbDrivers/transactionVerification";
 import type {
   ColumnTypeMeta,
+  DriverMutationResult,
+  DriverUpdateRowOutcome,
   TransactionOptions,
   TransactionVerification,
 } from "../dbDrivers/types";
+import { DriverUpdateRowsError } from "../dbDrivers/updateRowOutcomes";
 import { assertConnectionWritable } from "../utils/readOnlyGuards";
 import {
   buildPrevalidationFailedResult,
@@ -79,6 +83,7 @@ export async function executeAtomicSqlApplyPlan(
         "This backend cannot guarantee an atomic multi-operation apply. Apply one row at a time.",
     };
   }
+  let executionStarted = false;
   try {
     assertConnectionWritable(connectionManager, connectionId, "apply changes");
     const driver = connectionManager.getDriver(connectionId);
@@ -98,20 +103,8 @@ export async function executeAtomicSqlApplyPlan(
       );
     }
     const options = apply
-      ? await buildTransactionOptions(driver, apply)
+      ? buildTransactionOptions(driver, apply)
       : { database };
-    for (const insert of inserts) {
-      if (!insert.verification) continue;
-      const risk = await driver.getMutationAtomicityRisk?.(
-        insert.database,
-        insert.schema,
-        insert.table,
-      );
-      if (risk)
-        throw new Error(
-          `INSERT verification requires rollback support. ${risk}`,
-        );
-    }
     const insertVerifications = inserts.flatMap((plan, index) =>
       plan.verification
         ? [
@@ -135,17 +128,48 @@ export async function executeAtomicSqlApplyPlan(
       ...insertVerifications,
       ...(options.verifications ?? []),
     ];
-    await driver.runTransaction(
+    const operations = [
+      ...inserts.map((plan) => ({
+        ...plan.operation,
+        checkAffectedRows: true,
+      })),
+      ...(apply?.operations ?? []),
+    ];
+    await assertMutationRollbackSupport(
+      driver,
       [
+        ...(apply && apply.operations.length > 0
+          ? [
+              {
+                database: apply.database,
+                schema: apply.schema,
+                table: apply.table,
+                ...(options.verifications?.length
+                  ? { verification: "UPDATE" as const }
+                  : {}),
+              },
+            ]
+          : []),
         ...inserts.map((plan) => ({
-          ...plan.operation,
-          checkAffectedRows: true,
+          database: plan.database,
+          schema: plan.schema,
+          table: plan.table,
+          ...(plan.verification ? { verification: "INSERT" as const } : {}),
         })),
-        ...(apply?.operations ?? []),
       ],
-      undefined,
-      { ...options, ...(verifications.length ? { verifications } : {}) },
+      operations.length,
     );
+    assertConnectionWritable(connectionManager, connectionId, "apply changes");
+    if (connectionManager.getDriver(connectionId) !== driver) {
+      throw new Error(
+        "Connection changed during mutation preflight. Prepare the changes again before retrying.",
+      );
+    }
+    executionStarted = true;
+    await driver.runTransaction(operations, undefined, {
+      ...options,
+      ...(verifications.length ? { verifications } : {}),
+    });
     return {
       ...(apply
         ? appliedPlanResult(apply)
@@ -159,10 +183,18 @@ export async function executeAtomicSqlApplyPlan(
     if (error instanceof TransactionVerificationError) {
       return { success: false, error: error.message, rowOutcomes: [] };
     }
-    const message = `Transaction failed; its outcome may be unknown. Refresh and verify the data before retrying. ${error instanceof Error ? error.message : String(error)}`;
+    const notExecuted = isMutationNotExecutedError(error);
+    const detail = error instanceof Error ? error.message : String(error);
+    const message = !executionStarted
+      ? detail
+      : notExecuted
+        ? `Transaction was not executed; no changes were made. ${detail}`
+        : `Transaction failed; its outcome may be unknown. Refresh and verify the data before retrying. ${detail}`;
     return {
       success: false,
       error: message,
+      changesPossible: executionStarted && !notExecuted,
+      outcomeUnknown: executionStarted && !notExecuted,
       rowOutcomes: (apply?.updates ?? []).map((_, rowIndex) =>
         buildSkippedOutcome(rowIndex, message, false),
       ),
@@ -318,6 +350,9 @@ export function prepareApplyChangesPlan(
       if (!column) {
         continue;
       }
+      if (column.isPrimaryKey) {
+        verificationPrimaryKeys[columnName] = nextValue;
+      }
       if (shouldSkipTemporalOnUpdateVerification(column)) {
         continue;
       }
@@ -327,9 +362,6 @@ export function prepareApplyChangesPlan(
           column,
           expectedValue: nextValue,
         });
-      }
-      if (column.isPrimaryKey) {
-        verificationPrimaryKeys[columnName] = nextValue;
       }
     }
     const operation = buildUpdateRowSql(
@@ -452,6 +484,9 @@ export async function executePreparedApplyPlan(
     const executableUpdates = plan.updates.filter(
       (_update, rowIndex) => !skippedRows.has(rowIndex),
     );
+    const executableRowIndexes = plan.updates.flatMap((_, rowIndex) =>
+      skippedRows.has(rowIndex) ? [] : [rowIndex],
+    );
     try {
       const result = await driver.updateRows({
         database: plan.database,
@@ -465,49 +500,84 @@ export async function executePreparedApplyPlan(
             : {}),
         })),
       });
-      const rowOutcomes = plan.updates.map((_, rowIndex) =>
-        skippedRows.has(rowIndex)
-          ? buildSkippedOutcome(rowIndex, "No changes to apply.")
-          : {
-              rowIndex,
-              success: true,
-              status: "applied",
-            },
-      ) satisfies ApplyRowOutcome[];
-      if (result.affectedRows < executableUpdates.length) {
-        throw new Error(
-          "One or more rows changed after they were loaded. Refresh the table and retry.",
-        );
-      }
-      return { success: true, rowOutcomes };
+      return buildDriverApplyResult(
+        plan,
+        skippedRows,
+        executableRowIndexes,
+        result,
+      );
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
+      if (error instanceof DriverUpdateRowsError) {
+        return buildDriverApplyResult(
+          plan,
+          skippedRows,
+          executableRowIndexes,
+          error.result,
+          message,
+        );
+      }
+      const notExecuted = isMutationNotExecutedError(error);
       return {
         success: false,
         error: message,
+        changesPossible: !notExecuted,
+        outcomeUnknown: !notExecuted,
         rowOutcomes: plan.updates.map((_, rowIndex) =>
-          buildSkippedOutcome(
-            rowIndex,
-            `The update operation failed: ${message}`,
-            false,
-          ),
+          skippedRows.has(rowIndex)
+            ? buildSkippedOutcome(rowIndex, "No changes to apply.")
+            : buildDriverFailureOutcome(rowIndex, notExecuted, message),
         ),
       };
     }
   }
 
+  let executionStarted = false;
   try {
-    const options = await buildTransactionOptions(driver, plan);
+    const options = buildTransactionOptions(driver, plan);
+    await assertMutationRollbackSupport(
+      driver,
+      [
+        {
+          database: plan.database,
+          schema: plan.schema,
+          table: plan.table,
+          ...(options.verifications?.length
+            ? { verification: "UPDATE" as const }
+            : {}),
+        },
+      ],
+      plan.operations.length,
+    );
+    assertConnectionWritable(
+      connectionManager,
+      plan.connectionId,
+      "apply changes",
+    );
+    if (connectionManager.getDriver(plan.connectionId) !== driver) {
+      throw new Error(
+        "Connection changed during mutation preflight. Prepare the changes again before retrying.",
+      );
+    }
+    executionStarted = true;
     await driver.runTransaction(plan.operations, undefined, options);
     return appliedPlanResult(plan);
   } catch (error: unknown) {
     if (error instanceof TransactionVerificationError) {
       return verificationFailedResult(plan, error);
     }
-    const message = `Transaction failed; its outcome may be unknown. Refresh and verify the data before retrying. ${error instanceof Error ? error.message : String(error)}`;
+    const notExecuted = isMutationNotExecutedError(error);
+    const detail = error instanceof Error ? error.message : String(error);
+    const message = !executionStarted
+      ? detail
+      : notExecuted
+        ? `Transaction was not executed; no changes were made. ${detail}`
+        : `Transaction failed; its outcome may be unknown. Refresh and verify the data before retrying. ${detail}`;
     return {
       success: false,
       error: message,
+      changesPossible: executionStarted && !notExecuted,
+      outcomeUnknown: executionStarted && !notExecuted,
       rowOutcomes: plan.updates.map((_, rowIndex) =>
         skippedRows.has(rowIndex)
           ? buildSkippedOutcome(rowIndex, "No changes to apply.")
@@ -515,6 +585,145 @@ export async function executePreparedApplyPlan(
       ),
     };
   }
+}
+
+function buildDriverApplyResult(
+  plan: PreparedApplyPlan,
+  skippedRows: ReadonlySet<number>,
+  executableRowIndexes: readonly number[],
+  result: DriverMutationResult,
+  error?: string,
+): ApplyResultPayload {
+  const resolvedOutcomes = resolveDriverUpdateOutcomes(
+    executableRowIndexes.length,
+    result,
+  );
+  const requestIndexByRow = new Map(
+    executableRowIndexes.map((rowIndex, requestIndex) => [
+      rowIndex,
+      requestIndex,
+    ]),
+  );
+  const rowOutcomes = plan.updates.map((_, rowIndex) => {
+    if (skippedRows.has(rowIndex)) {
+      return buildSkippedOutcome(rowIndex, "No changes to apply.");
+    }
+    const requestIndex = requestIndexByRow.get(rowIndex);
+    const status =
+      requestIndex === undefined
+        ? "unknown"
+        : (resolvedOutcomes[requestIndex] ?? "unknown");
+    if (status === "applied") {
+      return { rowIndex, success: true, status } satisfies ApplyRowOutcome;
+    }
+    return {
+      rowIndex,
+      success: false,
+      status,
+      message:
+        status === "unknown"
+          ? "This row may have been updated; refresh and verify before retrying."
+          : "This row was not updated; it may have changed or been deleted since it was loaded.",
+    } satisfies ApplyRowOutcome;
+  });
+  const failedRows = rowOutcomes.flatMap((outcome) =>
+    outcome.status === "not_applied" || outcome.status === "unknown"
+      ? [outcome.rowIndex]
+      : [],
+  );
+  const appliedCount = resolvedOutcomes.filter(
+    (status) => status === "applied",
+  ).length;
+  const unknownCount = resolvedOutcomes.filter(
+    (status) => status === "unknown",
+  ).length;
+  if (failedRows.length === 0) {
+    return { success: true, rowOutcomes };
+  }
+
+  const message =
+    error ??
+    (unknownCount > 0
+      ? "One or more row outcomes are unknown. Refresh the table and verify before retrying."
+      : appliedCount > 0
+        ? `The update partially succeeded (${appliedCount} of ${executableRowIndexes.length} row(s)). Refresh the table and verify before retrying.`
+        : "One or more rows changed after they were loaded. Refresh the table and retry.");
+  return {
+    success: false,
+    error: message,
+    failedRows,
+    changesPossible: appliedCount > 0 || unknownCount > 0,
+    outcomeUnknown: unknownCount > 0,
+    rowOutcomes,
+  };
+}
+
+function resolveDriverUpdateOutcomes(
+  updateCount: number,
+  result: DriverMutationResult,
+): DriverUpdateRowOutcome["status"][] {
+  const supplied = result.updateRowOutcomes;
+  if (Array.isArray(supplied) && supplied.length > 0) {
+    const byIndex = new Map<number, DriverUpdateRowOutcome["status"]>();
+    let malformed = false;
+    for (const outcome of supplied) {
+      if (
+        !Number.isInteger(outcome.rowIndex) ||
+        outcome.rowIndex < 0 ||
+        outcome.rowIndex >= updateCount ||
+        byIndex.has(outcome.rowIndex) ||
+        !["applied", "not_applied", "unknown"].includes(outcome.status)
+      ) {
+        malformed = true;
+        break;
+      }
+      byIndex.set(outcome.rowIndex, outcome.status);
+    }
+    if (!malformed) {
+      const outcomes: DriverUpdateRowOutcome["status"][] = Array.from(
+        { length: updateCount },
+        (_, index) => byIndex.get(index) ?? "unknown",
+      );
+      if (result.affectedRows !== undefined) {
+        const appliedCount = outcomes.filter(
+          (status) => status === "applied",
+        ).length;
+        if (
+          !Number.isInteger(result.affectedRows) ||
+          result.affectedRows !== appliedCount
+        ) {
+          return Array.from({ length: updateCount }, () => "unknown");
+        }
+      }
+      return outcomes;
+    }
+    return Array.from({ length: updateCount }, () => "unknown");
+  }
+
+  if (Number.isInteger(result.affectedRows)) {
+    if (result.affectedRows === updateCount) {
+      return Array.from({ length: updateCount }, () => "applied");
+    }
+    if (result.affectedRows === 0) {
+      return Array.from({ length: updateCount }, () => "not_applied");
+    }
+  }
+  // A partial aggregate cannot identify which updates committed. Never assign
+  // successes by position; keep every row eligible for identity-based refresh.
+  return Array.from({ length: updateCount }, () => "unknown");
+}
+
+function buildDriverFailureOutcome(
+  rowIndex: number,
+  notExecuted: boolean,
+  message: string,
+): ApplyRowOutcome {
+  return {
+    rowIndex,
+    success: false,
+    status: notExecuted ? "not_applied" : "unknown",
+    message: `The update operation ${notExecuted ? "was not executed" : "may have been applied"}: ${message}`,
+  };
 }
 
 function appliedPlanResult(plan: PreparedApplyPlan): ApplyResultPayload {
@@ -574,10 +783,10 @@ function buildSkippedOutcome(
     message,
   };
 }
-async function buildTransactionOptions(
+function buildTransactionOptions(
   driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>,
   plan: PreparedApplyPlan,
-): Promise<TransactionOptions> {
+): TransactionOptions {
   const {
     database,
     schema,
@@ -622,17 +831,53 @@ async function buildTransactionOptions(
       values: target.values,
     });
   }
-  if (verifications.length) {
-    // Verified UPDATE needs rollback even when applied alone; check before DML.
-    const risk = await driver.getMutationAtomicityRisk?.(
-      database,
-      schema,
-      table,
-    );
-    if (risk)
-      throw new Error(`UPDATE verification requires rollback support. ${risk}`);
-  }
   return { database, ...(verifications.length ? { verifications } : {}) };
+}
+
+async function assertMutationRollbackSupport(
+  driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>,
+  targets: Array<{
+    database: string;
+    schema: string;
+    table: string;
+    verification?: "INSERT" | "UPDATE";
+  }>,
+  operationCount: number,
+): Promise<void> {
+  const uniqueTargets = new Map<
+    string,
+    {
+      database: string;
+      schema: string;
+      table: string;
+      verification?: "INSERT" | "UPDATE";
+    }
+  >();
+  for (const target of targets) {
+    const key = `${target.database}\u0000${target.schema}\u0000${target.table}`;
+    const previous = uniqueTargets.get(key);
+    if (previous) {
+      previous.verification ??= target.verification;
+    } else {
+      uniqueTargets.set(key, { ...target });
+    }
+  }
+
+  for (const target of uniqueTargets.values()) {
+    if (operationCount < 2 && !target.verification) continue;
+    const risk = await driver.getMutationAtomicityRisk?.(
+      target.database,
+      target.schema,
+      target.table,
+    );
+    if (risk) {
+      throw new Error(
+        target.verification
+          ? `${target.verification} verification requires rollback support. ${risk}`
+          : risk,
+      );
+    }
+  }
 }
 
 function shouldSkipTemporalOnUpdateVerification(

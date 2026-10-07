@@ -11,6 +11,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import React, {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -30,6 +31,7 @@ import type {
   PendingEdits,
   Row,
 } from "../../types";
+import { getCellPreviewTitle } from "../../utils/cellPreview";
 import { isEditableElement } from "../../utils/editableElement";
 import { onMessage, postMessage } from "../../utils/messaging";
 import {
@@ -52,6 +54,7 @@ import {
 import {
   buildColumnHeaderTitle,
   canEditColumn,
+  canOpenColumn,
   FILTER_H,
   HEADER_H,
   INSERT_DEFAULT_SENTINEL,
@@ -438,16 +441,19 @@ function TableDataGrid({
   );
 
   const columnsMapRef = useRef(columnsMap);
-  columnsMapRef.current = columnsMap;
 
   const [columnSizing, setColumnSizing] = useState<Record<string, number>>({});
   const [columnOrder, setColumnOrder] = useState<string[]>([]);
   const columnOrderRef = useRef(columnOrder);
-  columnOrderRef.current = columnOrder;
   const columnSizingRef = useRef(columnSizing);
-  columnSizingRef.current = columnSizing;
   const colSizesRef = useRef(colSizes);
-  colSizesRef.current = colSizes;
+
+  useLayoutEffect(() => {
+    columnsMapRef.current = columnsMap;
+    columnOrderRef.current = columnOrder;
+    columnSizingRef.current = columnSizing;
+    colSizesRef.current = colSizes;
+  }, [columnOrder, columnSizing, colSizes, columnsMap]);
 
   useEffect(() => {
     if (exportColumnOrderRef) {
@@ -470,8 +476,11 @@ function TableDataGrid({
   const containerRef = React.useRef<HTMLDivElement>(null);
   const [pasteErrors, setPasteErrors] = useState<PasteValidationError[]>([]);
   const newRowsRef = useRef(newRows);
-  newRowsRef.current = newRows;
   const scrollToCellRef = useRef<(row: number, col: number) => void>(() => {});
+
+  useLayoutEffect(() => {
+    newRowsRef.current = newRows;
+  }, [newRows]);
 
   const dataColCount = columns.length;
   const selColOffset = canSelectAndDeleteRows ? 1 : 0;
@@ -578,7 +587,12 @@ function TableDataGrid({
     onCellNavigate,
   });
 
-  selectionRangeRef.current = selection.range;
+  useLayoutEffect(() => {
+    selectionRangeRef.current = selection.range;
+  }, [selection.range]);
+
+  // useCellSelection returns this stable ref object; its identity is unchanged
+  // across renders, so publishing it here does not expose work-in-progress data.
   pasteContextRef.current = selection.contextMenuCellRef;
 
   const openCell = useCallback(
@@ -588,8 +602,7 @@ function TableDataGrid({
       const rowIdx = isDraft ? row + newRows.length : row;
       const rowKind = isDraft ? "draft" : "persisted";
       if (
-        !column ||
-        (!isDraft && !canEditColumn(column)) ||
+        !canOpenColumn(column, rowKind) ||
         isCollapsedWidth(columnSizing[columnId] ?? colSizes[columnId] ?? 160) ||
         (editCell?.kind === rowKind &&
           editCell.rowIdx === rowIdx &&
@@ -626,7 +639,9 @@ function TableDataGrid({
           originalValue: isDraft ? currentValue : originalValue,
           readOnly:
             !isDraft &&
-            (!canEditRows || Boolean(getRowMutationBlockReason?.(rowIdx))),
+            (!canEditRows ||
+              !canEditColumn(column) ||
+              Boolean(getRowMutationBlockReason?.(rowIdx))),
         });
       } else {
         (isDraft ? onStartDraftEdit : onStartEdit)(rowIdx, column);
@@ -814,16 +829,19 @@ function TableDataGrid({
               continue;
             }
 
+            const isPersistedRow = targetVirtualIndex >= draftCount;
             if (
-              targetVirtualIndex >= draftCount &&
-              (!canEditRows || column.isPrimaryKey)
+              !canEditColumn(column) ||
+              (isPersistedRow && (!canEditRows || column.isPrimaryKey))
             ) {
               errors.push({
-                rowIndex: targetVirtualIndex - draftCount,
+                rowIndex: isPersistedRow
+                  ? targetVirtualIndex - draftCount
+                  : targetVirtualIndex,
                 columnIndex: targetCol + selColOffset,
                 columnName: column.name,
                 value,
-                message: `Cannot paste into read-only persisted column "${column.name}"`,
+                message: `Cannot paste into read-only column "${column.name}"`,
               });
               continue;
             }
@@ -924,6 +942,7 @@ function TableDataGrid({
         0,
         visiblePasteColumns,
         rows.length,
+        canEditColumn,
       );
 
       if (validationResult.errors.length > 0) {
@@ -1132,7 +1151,9 @@ function TableDataGrid({
                   nullable={column.nullable}
                   category={column.category}
                   readOnly={
-                    !canEditRows || Boolean(getRowMutationBlockReason?.(rowIdx))
+                    !canEditRows ||
+                    !canEditColumn(column) ||
+                    Boolean(getRowMutationBlockReason?.(rowIdx))
                   }
                   onCommit={(value) =>
                     onCommitCellEdit(rowIdx, column, value, getValue())
@@ -1195,21 +1216,28 @@ function TableDataGrid({
   const virtualItems = virtualizer.getVirtualItems();
   const totalVirtualHeight = virtualizer.getTotalSize();
 
-  scrollToCellRef.current = (row: number, col: number) => {
-    const virtualIndex = row + draftRowCount;
-    virtualizer.scrollToIndex(virtualIndex, { align: "auto" });
-    requestAnimationFrame(() => {
+  const scrollToCell = useCallback(
+    (row: number, col: number) => {
+      const virtualIndex = row + draftRowCount;
+      virtualizer.scrollToIndex(virtualIndex, { align: "auto" });
       requestAnimationFrame(() => {
-        if (col === selColOffset) {
-          scrollRef.current?.scrollTo({ left: 0 });
-        }
-        const cell = scrollRef.current?.querySelector(
-          `td[data-row="${row}"][data-col="${col}"]`,
-        ) as HTMLElement | null;
-        cell?.scrollIntoView({ block: "nearest", inline: "nearest" });
+        requestAnimationFrame(() => {
+          if (col === selColOffset) {
+            scrollRef.current?.scrollTo({ left: 0 });
+          }
+          const cell = scrollRef.current?.querySelector(
+            `td[data-row="${row}"][data-col="${col}"]`,
+          ) as HTMLElement | null;
+          cell?.scrollIntoView({ block: "nearest", inline: "nearest" });
+        });
       });
-    });
-  };
+    },
+    [draftRowCount, scrollRef, selColOffset, virtualizer],
+  );
+
+  useLayoutEffect(() => {
+    scrollToCellRef.current = scrollToCell;
+  }, [scrollToCell]);
 
   return (
     <div
@@ -1666,7 +1694,7 @@ function TableRow({
         const isCellPending = pendingCols?.has(columnId) ?? false;
         const isEditing = columnId === editingCol;
         const canOpenCellEditor =
-          !isSelectionColumn && canEditColumn(columnDef);
+          !isSelectionColumn && canOpenColumn(columnDef, "persisted");
 
         const isDataCol = !isSelectionColumn;
 
@@ -1720,7 +1748,7 @@ function TableRow({
             }}
             title={
               !isCollapsed && isPrimaryKey
-                ? `${primaryKeyLabel}: ${String(cell.getValue())}`
+                ? `${primaryKeyLabel}: ${getCellPreviewTitle(cell.getValue())}`
                 : undefined
             }
             onMouseDown={(event) => {
@@ -1825,6 +1853,7 @@ function DraftTableRow({
         }
 
         const draftCell = draft[columnId] ?? { value: INSERT_DEFAULT_SENTINEL };
+        const canOpenCellEditor = canOpenColumn(columnDef, "draft");
         const isEditing = editingCol === columnId;
         const isDefault = draftCell.value === INSERT_DEFAULT_SENTINEL;
         const displayValue =
@@ -1876,7 +1905,7 @@ function DraftTableRow({
               textOverflow: "ellipsis",
               boxSizing: "border-box",
               verticalAlign: "middle",
-              cursor: isCollapsed ? "default" : "pointer",
+              cursor: canOpenCellEditor && !isCollapsed ? "pointer" : "default",
               userSelect: "none",
               background: "rgba(200, 150, 0, 0.23)",
             }}
@@ -1891,7 +1920,7 @@ function DraftTableRow({
               }
             }}
             onDoubleClick={() => {
-              if (!isCollapsed) {
+              if (canOpenCellEditor && !isCollapsed) {
                 onOpenCell(selRow, columnId);
               }
             }}

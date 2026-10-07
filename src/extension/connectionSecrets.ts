@@ -229,6 +229,23 @@ function hasCredentialBearingUriSecret(config: ConnectionConfig): boolean {
   );
 }
 
+export function hasConnectionConfigSecrets(config: ConnectionConfig): boolean {
+  return (
+    [
+      config.password,
+      config.apiKey,
+      config.awsAccessKeyId,
+      config.awsSecretAccessKey,
+      config.awsSessionToken,
+      config.ssh?.password,
+      config.ssh?.privateKey,
+      config.ssh?.passphrase,
+      config.tls?.keyPassphrase,
+    ].some((value) => trimOptionalSecretValue(value) !== undefined) ||
+    hasCredentialBearingUriSecret(config)
+  );
+}
+
 export function shouldForceSecretStorage(config: ConnectionConfig): boolean {
   for (const field of CREDENTIAL_BEARING_URI_FIELDS) {
     if (hasAmbiguousUriCredentials(config[field])) {
@@ -261,6 +278,16 @@ export function sanitizePersistedConnectionConfig(
     return { ...config };
   }
 
+  return sanitizeConnectionConfigForResponse({
+    ...config,
+    useSecretStorage: true,
+  });
+}
+
+/** Outward-facing metadata is secret-free even when persistence opts out. */
+export function sanitizeConnectionConfigForResponse(
+  config: ConnectionConfig,
+): ConnectionConfig {
   const {
     password: _password,
     apiKey: _apiKey,
@@ -302,7 +329,6 @@ export function sanitizePersistedConnectionConfig(
     uri: sanitizeCredentialBearingUri(rawUri),
     endpoint: sanitizeCredentialBearingUri(rawEndpoint),
     awsEndpoint: sanitizeCredentialBearingUri(rawAwsEndpoint),
-    useSecretStorage: true,
   };
 }
 

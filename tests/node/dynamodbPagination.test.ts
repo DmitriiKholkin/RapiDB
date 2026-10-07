@@ -14,6 +14,7 @@ import type {
 import { TableReadService } from "../../src/extension/table/tableReadService";
 
 type Response = {
+  Item?: Record<string, AttributeValue>;
   Items?: Record<string, AttributeValue>[];
   LastEvaluatedKey?: Record<string, AttributeValue>;
   Count?: number;
@@ -35,7 +36,7 @@ const columns: ColumnTypeMeta[] = ["tenant_id", "user_id", "email"].map(
       : {}),
     isForeignKey: false,
     filterable: true,
-    filterOperators: ["eq", "ilike"],
+    filterOperators: index === 2 ? ["eq", "like", "ilike"] : ["eq", "ilike"],
     valueSemantics: "plain",
   }),
 );
@@ -282,6 +283,62 @@ describe("B03 DynamoDB logical pages and service export", () => {
       Limit: 499,
       ExclusiveStartKey: key("first"),
     });
+  });
+
+  it.each([
+    true,
+    false,
+  ])("applies residual filters to full-key pages and exports (match=%s)", async (matches) => {
+    const item = marshall({
+      tenant_id: "tenant",
+      user_id: "target",
+      email: "person@example.com",
+    });
+    const { driver, service, send, reads } = createHarness((input) => {
+      if (!("KeyConditionExpression" in input)) {
+        // GetItem cannot apply the residual email condition.
+        return { Item: item };
+      }
+      if (input.Select === "COUNT") {
+        return { Count: matches ? 1 : 0 };
+      }
+      return { Items: matches ? [item] : [] };
+    });
+    const req = {
+      ...request("Query", 10),
+      skipCount: false,
+      filters: [
+        { column: "tenant_id", operator: "eq", value: "tenant" },
+        { column: "user_id", operator: "eq", value: "target" },
+        { column: "email", operator: "like", value: "example.com" },
+      ] satisfies DriverTablePageRequest["filters"],
+    };
+
+    const page = await driver.readTablePage(req);
+    expect(page.rows.map((row) => row.email)).toEqual(
+      matches ? ["person@example.com"] : [],
+    );
+    expect(page.totalCount).toBe(matches ? 1 : 0);
+
+    const chunks = await exportChunks(service, { ...req, pageSize: 11 });
+    expect(
+      chunks.flatMap((chunk) => chunk.rows.map((row) => row.email)),
+    ).toEqual(matches ? ["person@example.com"] : []);
+
+    expect(
+      send.mock.calls.filter(
+        ([command]) => command.constructor.name === "GetItemCommand",
+      ),
+    ).toHaveLength(0);
+    expect(reads()).toHaveLength(3);
+    expect(
+      reads().every(([command]) => command.constructor.name === "QueryCommand"),
+    ).toBe(true);
+    expect(
+      reads().every(([command]) =>
+        command.input.FilterExpression?.toString().includes("contains"),
+      ),
+    ).toBe(true);
   });
 
   it.each(modes)("fills native %s pages", async (mode) => {

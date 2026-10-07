@@ -231,7 +231,7 @@ function evaluateScalarOperator(
     case "like":
     case "ilike": {
       const haystack = String(rawValue ?? "");
-      const needle = inputValue.replace(/%/g, "");
+      const needle = inputValue;
       return operator === "ilike"
         ? haystack.toLowerCase().includes(needle.toLowerCase())
         : haystack.includes(needle);

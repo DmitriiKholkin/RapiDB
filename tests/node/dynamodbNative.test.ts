@@ -1,4 +1,4 @@
-import { marshall, NumberValueImpl } from "@aws-sdk/util-dynamodb";
+import { marshall, NumberValueImpl, unmarshall } from "@aws-sdk/util-dynamodb";
 import { describe, expect, it, vi } from "vitest";
 import { DynamoDBDriver } from "../../src/extension/dbDrivers/dynamodb";
 import type {
@@ -11,6 +11,9 @@ import {
   parseDynamoDbNativeQueryInput,
   parseDynamoDbNativeQueryInputs,
 } from "../../src/shared/dynamodbNative";
+import { NULL_SENTINEL } from "../../src/shared/tableTypes";
+
+const emptyBinaryCellMarker = "0x (empty binary)";
 
 const config: ConnectionConfig = {
   id: "conn-ddb",
@@ -211,6 +214,851 @@ function commandInputs(
     .map((command) => command.input as Record<string, unknown>);
 }
 
+describe("DynamoDB lossless marker filter inputs (R9)", () => {
+  const literal = emptyBinaryCellMarker;
+  const escapedLiteral = `\\${literal}`;
+  const nextLiteral = `\\${literal}`;
+  const escapedNextLiteral = `\\\\${literal}`;
+  const request = {
+    database: "us-east-1",
+    schema: "us-east-1",
+    table: "users",
+    page: 1,
+    pageSize: 25,
+    sort: null,
+    skipCount: true,
+  };
+
+  function createMarkerDriver(
+    extraItems: Array<{
+      tenant_id: string;
+      user_id: string;
+      email: unknown;
+    }> = [],
+  ) {
+    const fixture = createDriver();
+    const items = [
+      { tenant_id: "tenant", user_id: literal, email: literal },
+      { tenant_id: "tenant", user_id: nextLiteral, email: nextLiteral },
+      { tenant_id: "tenant", user_id: "binary", email: Buffer.alloc(0) },
+      { tenant_id: "tenant", user_id: "partial", email: `prefix\\0x suffix` },
+      { tenant_id: "tenant", user_id: "slashes", email: "path\\\\leaf" },
+      ...extraItems,
+    ];
+    const originalSend = fixture.clientSend.getMockImplementation();
+    fixture.clientSend.mockImplementation(async (command) => {
+      const input = command.input as Record<string, unknown>;
+      if (command.constructor.name === "GetItemCommand") {
+        const key = unmarshall(input.Key as Parameters<typeof unmarshall>[0]);
+        const item = items.find(
+          (candidate) =>
+            candidate.tenant_id === key.tenant_id &&
+            candidate.user_id === key.user_id,
+        );
+        return item ? { Item: marshall(item) } : {};
+      }
+      if (
+        command.constructor.name === "ScanCommand" ||
+        command.constructor.name === "QueryCommand"
+      ) {
+        const expression = String(input.FilterExpression ?? "");
+        const contains = /^contains\((#n\d+), (:v\d+)\)$/.exec(expression);
+        const between = /^(#n\d+) BETWEEN (:v\d+) AND (:v\d+)$/.exec(
+          expression,
+        );
+        const range = /^(#n\d+) (>=|>|<=|<) (:v\d+)$/.exec(expression);
+        const names = (input.ExpressionAttributeNames ?? {}) as Record<
+          string,
+          string
+        >;
+        const values = unmarshall(
+          (input.ExpressionAttributeValues ?? {}) as Parameters<
+            typeof unmarshall
+          >[0],
+        );
+        const matches = items.filter((item) => {
+          if (contains) {
+            const haystack = item[names[contains[1]] as keyof typeof item];
+            const needle = values[contains[2]];
+            if (typeof haystack === "string")
+              return haystack.includes(String(needle));
+            if (haystack instanceof Set || Array.isArray(haystack)) {
+              return [...haystack].some(
+                (member) => typeof member === "string" && member === needle,
+              );
+            }
+            return false;
+          }
+          if (between || range) {
+            const condition = between ?? range;
+            if (!condition) return false;
+            const actual = item[names[condition[1]] as keyof typeof item];
+            if (typeof actual !== "string") return false;
+            const compare = (bound: unknown) =>
+              Buffer.compare(
+                Buffer.from(actual, "utf8"),
+                Buffer.from(String(bound), "utf8"),
+              );
+            if (between)
+              return (
+                compare(values[between[2]]) >= 0 &&
+                compare(values[between[3]]) <= 0
+              );
+            const cmp = compare(values[condition[3]]);
+            return condition[2] === ">"
+              ? cmp > 0
+              : condition[2] === ">="
+                ? cmp >= 0
+                : condition[2] === "<"
+                  ? cmp < 0
+                  : cmp <= 0;
+          }
+          return true;
+        });
+        return { Items: matches.map((item) => marshall(item)) };
+      }
+      return originalSend?.(command) ?? {};
+    });
+    return fixture;
+  }
+
+  it.each([
+    "native",
+    "streaming",
+    "materialized",
+  ] as const)("gets each adjacent escaped S key from the actual request (%s)", async (mode) => {
+    const { driver, clientSend } = createMarkerDriver();
+    for (const [raw, display] of [
+      [literal, escapedLiteral],
+      [nextLiteral, escapedNextLiteral],
+    ]) {
+      const page = await driver.readTablePage({
+        ...request,
+        sort:
+          mode === "materialized"
+            ? { column: "email", direction: "asc" }
+            : null,
+        filters: [
+          { column: "tenant_id", operator: "eq", value: "tenant" },
+          { column: "user_id", operator: "eq", value: display },
+          ...(mode === "streaming"
+            ? [
+                {
+                  column: "email",
+                  operator: "ilike",
+                  value: display,
+                } satisfies FilterExpression,
+              ]
+            : []),
+        ],
+      });
+      expect(page.rows).toEqual([
+        expect.objectContaining({ user_id: display, email: display }),
+      ]);
+      expect(commandInputs(clientSend, "GetItemCommand").at(-1)?.Key).toEqual(
+        marshall({ tenant_id: "tenant", user_id: raw }),
+      );
+      expect(driver.coerceInputValue(display, createColumns()[1])).toBe(raw);
+    }
+  });
+
+  it.each([
+    [escapedLiteral, [escapedLiteral, escapedNextLiteral]],
+    [escapedNextLiteral, [escapedNextLiteral]],
+    [literal, [escapedLiteral, escapedNextLiteral]],
+    ["empty binary", [escapedLiteral, escapedNextLiteral]],
+    ["0x", [escapedLiteral, escapedNextLiteral, "partial"]],
+    ["\\0x", [escapedNextLiteral, "partial"]],
+    ["\\\\0x", []],
+    ["path\\\\", ["slashes"]],
+  ] as const)("keeps native Contains / streaming / materialized parity for %s", async (needle, expectedKeys) => {
+    const results: string[][] = [];
+    for (const mode of [
+      "native",
+      "streaming",
+      "materialized",
+      "materialized-like",
+    ] as const) {
+      const { driver, clientSend } = createMarkerDriver();
+      const operator =
+        mode === "native" || mode === "materialized-like" ? "like" : "ilike";
+      const page = await driver.readTablePage({
+        ...request,
+        skipCount: mode !== "materialized" && mode !== "materialized-like",
+        sort:
+          mode === "materialized-like"
+            ? { column: "email", direction: "asc" }
+            : null,
+        filters: [{ column: "email", operator, value: needle }],
+      });
+      results.push(page.rows.map((row) => String(row.user_id)).sort());
+      if (mode === "native") {
+        const input = commandInputs(clientSend, "ScanCommand")[0];
+        const expectedNeedle =
+          needle === escapedLiteral
+            ? literal
+            : needle === escapedNextLiteral
+              ? nextLiteral
+              : needle;
+        expect(input.ExpressionAttributeValues).toEqual({
+          ":v0": { S: expectedNeedle },
+        });
+        expect(
+          driver.buildFilterCondition(createColumns()[2], "like", needle, 1)
+            ?.params,
+        ).toEqual([expectedNeedle]);
+      }
+    }
+    expect(results).toEqual(
+      Array.from({ length: 4 }, () => [...expectedKeys].sort()),
+    );
+  });
+
+  it.each([
+    { operator: "eq", value: escapedLiteral, expected: [escapedLiteral] },
+    {
+      operator: "eq",
+      value: escapedNextLiteral,
+      expected: [escapedNextLiteral],
+    },
+    { operator: "eq", value: literal, expected: [escapedLiteral] },
+    {
+      operator: "neq",
+      value: escapedLiteral,
+      expected: [escapedNextLiteral, "binary", "partial", "slashes"],
+    },
+    {
+      operator: "in",
+      value: `${escapedLiteral},${escapedNextLiteral}`,
+      expected: [escapedLiteral, escapedNextLiteral],
+    },
+    {
+      operator: "between",
+      value: [escapedNextLiteral, escapedNextLiteral],
+      expected: [escapedNextLiteral],
+    },
+    {
+      operator: "gte",
+      value: escapedNextLiteral,
+      expected: [escapedNextLiteral, "partial", "slashes"],
+    },
+  ] satisfies Array<{
+    operator: FilterExpression["operator"];
+    value: string | [string, string];
+    expected: string[];
+  }>)("uses logical inputs in client $operator without S/B collisions", async ({
+    operator,
+    value,
+    expected,
+  }) => {
+    for (const skipCount of [false, true]) {
+      const { driver } = createMarkerDriver();
+      const page = await driver.readTablePage({
+        ...request,
+        skipCount,
+        filters: [
+          { column: "email", operator, value } as FilterExpression,
+          { column: "user_id", operator: "ilike", value: "" },
+        ],
+      });
+      expect(page.rows.map((row) => row.user_id).sort()).toEqual(
+        [...expected].sort(),
+      );
+    }
+  });
+
+  it("decodes native range/list parameters, with binary decoding only in native binary context", async () => {
+    const { driver, clientSend, queueResponses } = createDriver();
+    queueResponses({ Items: [] }, { Items: [] });
+    await driver.readTablePage({
+      ...request,
+      filters: [
+        { column: "tenant_id", operator: "eq", value: "tenant" },
+        {
+          column: "user_id",
+          operator: "between",
+          value: [escapedLiteral, escapedNextLiteral],
+        },
+        {
+          column: "email",
+          operator: "in",
+          value: `${escapedLiteral},${escapedNextLiteral}`,
+        },
+      ],
+    });
+    expect(
+      commandInputs(clientSend, "QueryCommand")[0].ExpressionAttributeValues,
+    ).toEqual({
+      ":v0": { S: "tenant" },
+      ":v1": { S: literal },
+      ":v2": { S: nextLiteral },
+      ":v3": { S: literal },
+      ":v4": { S: nextLiteral },
+    });
+    const textColumn = createColumns()[2];
+    const binaryColumn = {
+      ...textColumn,
+      nativeType: "binary",
+      category: "binary" as const,
+    };
+    for (const column of [textColumn, binaryColumn]) {
+      expect(
+        driver.buildFilterCondition(column, "eq", escapedLiteral, 1)?.params,
+      ).toEqual([literal]);
+      expect(
+        driver.buildFilterCondition(
+          column,
+          "between",
+          [escapedLiteral, escapedNextLiteral],
+          1,
+        )?.params,
+      ).toEqual([literal, nextLiteral]);
+      expect(
+        driver.buildFilterCondition(
+          column,
+          "in",
+          `${escapedLiteral},${escapedNextLiteral}`,
+          1,
+        )?.params,
+      ).toEqual([literal, nextLiteral]);
+    }
+    expect(
+      driver.buildFilterCondition(textColumn, "eq", literal, 1)?.params,
+    ).toEqual([literal]);
+    expect(
+      driver.buildFilterCondition(binaryColumn, "eq", literal, 1)?.params,
+    ).toEqual([Buffer.alloc(0)]);
+    const state = driver as unknown as {
+      coerceFilterParameter: (
+        column: ColumnTypeMeta | undefined,
+        value: string,
+      ) => unknown;
+    };
+    expect(state.coerceFilterParameter(undefined, literal)).toBe(literal);
+    expect(state.coerceFilterParameter(undefined, escapedLiteral)).toBe(
+      literal,
+    );
+  });
+
+  it.each([
+    {
+      operator: "between",
+      value: [escapedLiteral, escapedNextLiteral],
+      expected: [escapedLiteral, escapedNextLiteral],
+    },
+    {
+      operator: "gt",
+      value: escapedLiteral,
+      expected: [escapedNextLiteral, "partial", "slashes"],
+    },
+    {
+      operator: "gte",
+      value: escapedNextLiteral,
+      expected: [escapedNextLiteral, "partial", "slashes"],
+    },
+    { operator: "lt", value: escapedNextLiteral, expected: [escapedLiteral] },
+    { operator: "lte", value: escapedLiteral, expected: [escapedLiteral] },
+    {
+      operator: "between",
+      value: ["\ue000", "😀"],
+      expected: ["bmp", "astral"],
+    },
+  ] satisfies Array<{
+    operator: FilterExpression["operator"];
+    value: string | [string, string];
+    expected: string[];
+  }>)("matches native UTF-8 string $operator results, not locale order", async ({
+    operator,
+    value,
+    expected,
+  }) => {
+    for (const mode of [
+      "native",
+      "materialized",
+      "streaming-client",
+      "materialized-client",
+    ] as const) {
+      const { driver } = createMarkerDriver(
+        value[0] === "\ue000"
+          ? [
+              { tenant_id: "tenant", user_id: "bmp", email: "\ue000" },
+              { tenant_id: "tenant", user_id: "astral", email: "😀" },
+            ]
+          : [],
+      );
+      if (mode.endsWith("client")) {
+        // A binary first sample makes the predicate client-only; escaped
+        // bounds still identify S and must compare the unfiltered raw S rows.
+        vi.spyOn(driver, "describeColumns").mockResolvedValue(
+          createColumns().map((column) =>
+            column.name === "email"
+              ? { ...column, nativeType: "binary", category: "binary" }
+              : column,
+          ),
+        );
+      }
+      const page = await driver.readTablePage({
+        ...request,
+        skipCount: mode !== "materialized-client",
+        sort:
+          mode === "materialized"
+            ? { column: "email", direction: "asc" }
+            : null,
+        filters: [{ column: "email", operator, value } as FilterExpression],
+      });
+      expect(page.rows.map((row) => row.user_id).sort()).toEqual(
+        [...expected].sort(),
+      );
+    }
+  });
+
+  it.each([
+    [
+      escapedLiteral,
+      [
+        escapedLiteral,
+        escapedNextLiteral,
+        "ss-marker",
+        "list-marker",
+        "list-mixed",
+      ],
+    ],
+    [escapedNextLiteral, [escapedNextLiteral, "ss-next", "list-next"]],
+    ["member", ["ss-member", "list-member", "string-member"]],
+    ["0x", [escapedLiteral, escapedNextLiteral, "partial"]],
+  ] as const)("retains native SS/L string-member Contains matches with S sampling for %s", async (needle, expected) => {
+    for (const mode of [
+      "native",
+      "materialized-like",
+      "streaming-ilike",
+      "materialized-ilike",
+    ] as const) {
+      const { driver } = createMarkerDriver([
+        {
+          tenant_id: "tenant",
+          user_id: "ss-marker",
+          email: new Set([literal]),
+        },
+        {
+          tenant_id: "tenant",
+          user_id: "ss-next",
+          email: new Set([nextLiteral]),
+        },
+        { tenant_id: "tenant", user_id: "list-marker", email: [literal] },
+        { tenant_id: "tenant", user_id: "list-next", email: [nextLiteral] },
+        {
+          tenant_id: "tenant",
+          user_id: "list-mixed",
+          email: [Buffer.alloc(0), literal],
+        },
+        {
+          tenant_id: "tenant",
+          user_id: "list-binary",
+          email: [Buffer.from(literal)],
+        },
+        {
+          tenant_id: "tenant",
+          user_id: "ss-member",
+          email: new Set(["member"]),
+        },
+        { tenant_id: "tenant", user_id: "list-member", email: ["member", 1] },
+        {
+          tenant_id: "tenant",
+          user_id: "string-member",
+          email: "prefix member suffix",
+        },
+        {
+          tenant_id: "tenant",
+          user_id: "list-substring",
+          email: ["prefix member suffix"],
+        },
+        { tenant_id: "tenant", user_id: "number-set", email: new Set([1]) },
+      ]);
+      const page = await driver.readTablePage({
+        ...request,
+        skipCount: mode !== "materialized-ilike",
+        sort:
+          mode === "materialized-like"
+            ? { column: "user_id", direction: "asc" }
+            : null,
+        filters: [
+          {
+            column: "email",
+            operator: mode.endsWith("ilike") ? "ilike" : "like",
+            value: needle,
+          },
+        ],
+      });
+      expect(page.rows.map((row) => row.user_id).sort()).toEqual(
+        [...expected].sort(),
+      );
+    }
+  });
+
+  it.each([
+    "string",
+    "string set",
+    "list",
+  ] as const)("uses raw SS/L Contains membership independently of %s sampled metadata", async (nativeType) => {
+    for (const [needle, expected] of [
+      [
+        literal,
+        [
+          escapedLiteral,
+          escapedNextLiteral,
+          "ss-marker",
+          "list-marker",
+          "list-mixed",
+        ],
+      ],
+      [
+        escapedLiteral,
+        [
+          escapedLiteral,
+          escapedNextLiteral,
+          "ss-marker",
+          "list-marker",
+          "list-mixed",
+        ],
+      ],
+      [escapedNextLiteral, [escapedNextLiteral, "ss-next", "list-next"]],
+      ["0x", [escapedLiteral, escapedNextLiteral, "partial"]],
+      ["empty binary", [escapedLiteral, escapedNextLiteral]],
+    ] as const) {
+      for (const operator of ["like", "ilike"] as const) {
+        for (const materialized of [false, true]) {
+          const { driver, clientSend } = createMarkerDriver([
+            {
+              tenant_id: "tenant",
+              user_id: "ss-marker",
+              email: new Set([literal]),
+            },
+            {
+              tenant_id: "tenant",
+              user_id: "ss-next",
+              email: new Set([nextLiteral]),
+            },
+            { tenant_id: "tenant", user_id: "list-marker", email: [literal] },
+            { tenant_id: "tenant", user_id: "list-next", email: [nextLiteral] },
+            {
+              tenant_id: "tenant",
+              user_id: "list-mixed",
+              email: [Buffer.alloc(0), literal, 1],
+            },
+            {
+              tenant_id: "tenant",
+              user_id: "list-binary",
+              email: [Buffer.alloc(0), Buffer.from(literal)],
+            },
+            {
+              tenant_id: "tenant",
+              user_id: "binary-set",
+              email: new Set([Buffer.from(literal)]),
+            },
+            { tenant_id: "tenant", user_id: "number-set", email: new Set([1]) },
+          ]);
+          vi.spyOn(driver, "describeColumns").mockResolvedValue(
+            createColumns().map((column) =>
+              column.name === "email"
+                ? {
+                    ...column,
+                    type: nativeType,
+                    nativeType,
+                    category: nativeType === "string" ? "text" : "array",
+                  }
+                : column,
+            ),
+          );
+          const page = await driver.readTablePage({
+            ...request,
+            skipCount: !materialized,
+            sort: materialized ? { column: "user_id", direction: "asc" } : null,
+            filters: [{ column: "email", operator, value: needle }],
+          });
+          expect(page.rows.map((row) => row.user_id).sort()).toEqual(
+            [...expected].sort(),
+          );
+          if (nativeType !== "string") {
+            // Exercise client filtering of all raw rows, not just a native
+            // pre-filtered subset which could hide membership rejections.
+            expect(
+              commandInputs(clientSend, "ScanCommand")[0].FilterExpression,
+            ).toBeUndefined();
+          }
+        }
+      }
+    }
+  });
+
+  it.each([
+    false,
+    true,
+  ])("keeps empty B separate from escaped S with binary metadata (skipCount=%s)", async (skipCount) => {
+    const binaryColumn = {
+      ...createColumns()[2],
+      nativeType: "binary",
+      category: "binary" as const,
+    };
+    for (const [input, expected] of [
+      [literal, "binary"],
+      [escapedLiteral, escapedLiteral],
+      [escapedNextLiteral, escapedNextLiteral],
+    ]) {
+      const { driver, queueResponses } = createDriver({
+        columns: [...createColumns().slice(0, 2), binaryColumn],
+      });
+      queueResponses({
+        Items: [
+          marshall({ user_id: literal, email: literal }),
+          marshall({ user_id: nextLiteral, email: nextLiteral }),
+          marshall({ user_id: "binary", email: Buffer.alloc(0) }),
+        ],
+      });
+      const page = await driver.readTablePage({
+        ...request,
+        skipCount,
+        filters: [{ column: "email", operator: "eq", value: input }],
+      });
+      expect(page.rows.map((row) => row.user_id)).toEqual([expected]);
+    }
+    const { driver, queueResponses } = createDriver({
+      columns: [...createColumns().slice(0, 2), binaryColumn],
+    });
+    queueResponses({
+      Items: [
+        marshall({ user_id: literal, email: literal }),
+        marshall({ user_id: nextLiteral, email: nextLiteral }),
+        marshall({ user_id: "binary", email: Buffer.alloc(0) }),
+      ],
+    });
+    const page = await driver.readTablePage({
+      ...request,
+      skipCount,
+      filters: [
+        {
+          column: "email",
+          operator: "in",
+          value: `${literal},${escapedLiteral}`,
+        },
+      ],
+    });
+    expect(page.rows.map((row) => row.user_id).sort()).toEqual(
+      ["binary", escapedLiteral].sort(),
+    );
+  });
+
+  it.each([
+    "string",
+    "string set",
+    "list",
+    "binary",
+    "map",
+  ] as const)("uses only actual S substrings and SS/L string members with %s metadata", async (nativeType) => {
+    const items = [
+      { tenant_id: "tenant", user_id: "s-hex", email: "0xdead" },
+      {
+        tenant_id: "tenant",
+        user_id: "b-hex",
+        email: Buffer.from("dead", "hex"),
+      },
+      {
+        tenant_id: "tenant",
+        user_id: "map",
+        email: { payload: "0xdead", text: "needle", count: 123, flag: true },
+      },
+      { tenant_id: "tenant", user_id: "number", email: 123 },
+      { tenant_id: "tenant", user_id: "boolean", email: true },
+      { tenant_id: "tenant", user_id: "null", email: null },
+      { tenant_id: "tenant", user_id: "s-number", email: "123" },
+      { tenant_id: "tenant", user_id: "s-boolean", email: "true" },
+      { tenant_id: "tenant", user_id: "s-null", email: "null" },
+      { tenant_id: "tenant", user_id: "s-needle", email: "has needle" },
+      {
+        tenant_id: "tenant",
+        user_id: "ss-needle",
+        email: new Set(["0x", "0xdead", "needle", "1", "true", "null"]),
+      },
+      {
+        tenant_id: "tenant",
+        user_id: "l-needle",
+        email: ["0x", "0xdead", "needle", "1", "true", "null"],
+      },
+      {
+        tenant_id: "tenant",
+        user_id: "l-mixed",
+        email: [Buffer.from("dead", "hex"), 123, true, null, "0x", "needle"],
+      },
+      {
+        tenant_id: "tenant",
+        user_id: "binary-set",
+        email: new Set([Buffer.from("dead", "hex")]),
+      },
+      { tenant_id: "tenant", user_id: "number-set", email: new Set([123]) },
+      {
+        tenant_id: "tenant",
+        user_id: "l-non-strings",
+        email: [
+          Buffer.from("dead", "hex"),
+          123,
+          true,
+          null,
+          { text: "needle" },
+        ],
+      },
+    ];
+    for (const [needle, expected] of [
+      [
+        "0x",
+        [
+          escapedLiteral,
+          escapedNextLiteral,
+          "partial",
+          "s-hex",
+          "ss-needle",
+          "l-needle",
+          "l-mixed",
+        ],
+      ],
+      ["0xdead", ["s-hex", "ss-needle", "l-needle"]],
+      ["dead", ["s-hex"]],
+      ["needle", ["s-needle", "ss-needle", "l-needle", "l-mixed"]],
+      ["1", ["s-number", "ss-needle", "l-needle"]],
+      ["true", ["s-boolean", "ss-needle", "l-needle"]],
+      ["null", ["s-null", "ss-needle", "l-needle"]],
+    ] as const) {
+      // Independent native evaluator consumes the actual S request needle.
+      const native = createMarkerDriver(items);
+      const nativePage = await native.driver.readTablePage({
+        ...request,
+        filters: [{ column: "email", operator: "like", value: needle }],
+      });
+      expect(commandInputs(native.clientSend, "ScanCommand")[0]).toMatchObject({
+        FilterExpression: "contains(#n0, :v0)",
+        ExpressionAttributeNames: { "#n0": "email" },
+        ExpressionAttributeValues: { ":v0": { S: needle } },
+      });
+      const expectedKeys = [...expected].sort();
+      expect(nativePage.rows.map((row) => row.user_id).sort()).toEqual(
+        expectedKeys,
+      );
+      for (const operator of ["like", "ilike"] as const) {
+        for (const materialized of [false, true]) {
+          const { driver } = createMarkerDriver(items);
+          vi.spyOn(driver, "describeColumns").mockResolvedValue(
+            createColumns().map((column) =>
+              column.name === "email"
+                ? {
+                    ...column,
+                    type: nativeType,
+                    nativeType,
+                    category:
+                      nativeType === "string"
+                        ? "text"
+                        : nativeType === "binary"
+                          ? "binary"
+                          : nativeType === "map"
+                            ? "json"
+                            : "array",
+                  }
+                : column,
+            ),
+          );
+          const page = await driver.readTablePage({
+            ...request,
+            skipCount: !materialized,
+            filters: [
+              { column: "email", operator, value: needle },
+              { column: "user_id", operator: "ilike", value: "" },
+            ],
+          });
+          expect(page.rows.map((row) => row.user_id).sort()).toEqual(
+            expectedKeys,
+          );
+        }
+      }
+    }
+  });
+
+  it("uses known raw S when categories are absent, never an untyped display string", () => {
+    const { driver } = createMarkerDriver();
+    const state = driver as unknown as {
+      formatDynamoRowForDisplay: (
+        row: Record<string, unknown>,
+      ) => Record<string, unknown>;
+      tableRowCategories: WeakMap<
+        Record<string, unknown>,
+        Map<string, unknown>
+      >;
+      applyDynamoFilters: (
+        rows: Record<string, unknown>[],
+        filters: FilterExpression[],
+        columns: ColumnTypeMeta[],
+      ) => Record<string, unknown>[];
+    };
+    const rows = [
+      "0xdead",
+      Buffer.from("dead", "hex"),
+      { text: "0xdead" },
+      123,
+      true,
+      null,
+      literal,
+      new Set([literal]),
+      [Buffer.alloc(0), literal],
+    ].map((email) => state.formatDynamoRowForDisplay({ email }));
+    for (const row of rows) state.tableRowCategories.delete(row);
+    expect(
+      state.applyDynamoFilters(
+        rows,
+        [{ column: "email", operator: "like", value: "0x" }],
+        createColumns(),
+      ),
+    ).toEqual([rows[0], rows[6]]);
+    expect(
+      state.applyDynamoFilters(
+        rows,
+        [{ column: "email", operator: "like", value: escapedLiteral }],
+        createColumns(),
+      ),
+    ).toEqual(rows.slice(6));
+    expect(
+      state.applyDynamoFilters(
+        [{ email: "0xdead" }],
+        [{ column: "email", operator: "like", value: "0x" }],
+        createColumns(),
+      ),
+    ).toEqual([]);
+  });
+
+  it.each([
+    false,
+    true,
+  ])("never searches the empty B display token as a Contains haystack (skipCount=%s)", async (skipCount) => {
+    const binaryColumn = {
+      ...createColumns()[2],
+      nativeType: "binary",
+      category: "binary" as const,
+    };
+    for (const needle of ["0x", "empty binary", literal, escapedLiteral]) {
+      const { driver, queueResponses } = createDriver({
+        columns: [...createColumns().slice(0, 2), binaryColumn],
+      });
+      queueResponses({
+        Items: [
+          marshall({ user_id: "string", email: literal }),
+          marshall({ user_id: "binary", email: Buffer.alloc(0) }),
+        ],
+      });
+      const page = await driver.readTablePage({
+        ...request,
+        skipCount,
+        filters: [{ column: "email", operator: "like", value: needle }],
+      });
+      expect(page.rows.map((row) => row.user_id)).toEqual(["string"]);
+    }
+  });
+});
+
 describe("parseDynamoDbNativeQueryInput", () => {
   it("renders native query numbers as exact scalars with numeric metadata", async () => {
     const { driver, queueResponses } = createDriver();
@@ -256,6 +1104,45 @@ describe("parseDynamoDbNativeQueryInput", () => {
     expect(() => driver.coerceInputValue(displayed, column)).toThrow(
       "read-only",
     );
+  });
+
+  it("parses the empty-binary marker independently of sampled metadata", () => {
+    const { driver } = createDriver();
+    const binaryColumn: ColumnTypeMeta = {
+      ...createMapColumn(),
+      name: "payload",
+      type: "binary",
+      nativeType: "binary",
+      category: "binary",
+    };
+    const textColumn: ColumnTypeMeta = {
+      ...binaryColumn,
+      name: "note",
+      type: "string",
+      nativeType: "string",
+      category: "text",
+    };
+
+    expect(driver.coerceInputValue("0x", binaryColumn)).toEqual(
+      Buffer.alloc(0),
+    );
+    expect(driver.coerceInputValue(emptyBinaryCellMarker, textColumn)).toEqual(
+      Buffer.alloc(0),
+    );
+    expect(driver.coerceInputValue("", binaryColumn)).toBe("");
+    expect(driver.coerceInputValue("0xA", binaryColumn)).toBe("0xA");
+    expect(driver.coerceInputValue("0x", textColumn)).toBe("0x");
+
+    const escapedMarker = `\\${emptyBinaryCellMarker}`;
+    expect(driver.formatOutputValue(emptyBinaryCellMarker, textColumn)).toBe(
+      escapedMarker,
+    );
+    expect(driver.coerceInputValue(escapedMarker, binaryColumn)).toBe(
+      emptyBinaryCellMarker,
+    );
+    expect(
+      driver.coerceInputValue(`\\\\${emptyBinaryCellMarker}`, textColumn),
+    ).toBe(escapedMarker);
   });
 
   it.each(
@@ -847,6 +1734,163 @@ describe("DynamoDBDriver native API", () => {
     );
   });
 
+  it("edits, marshals, and reloads empty binary without changing text or NULL", async () => {
+    const payloadColumn: ColumnTypeMeta = {
+      ...createMapColumn(),
+      name: "payload",
+      type: "binary",
+      nativeType: "binary",
+      category: "binary",
+      filterable: false,
+      filterOperators: ["is_null", "is_not_null"],
+    };
+    const columns = [...createColumns(), payloadColumn];
+    const { driver, clientSend, queueResponses } = createDriver({ columns });
+    queueResponses(
+      { Attributes: marshall({ payload: Buffer.alloc(0) }) },
+      { Attributes: marshall({ payload: "" }) },
+      { Attributes: marshall({ email: "0x" }) },
+      { Attributes: marshall({ email: emptyBinaryCellMarker }) },
+      { Attributes: marshall({ email: null }) },
+    );
+    const mutationService = new TableMutationService(
+      {
+        getConnection: () => ({ id: "conn-ddb" }),
+        getDriver: () => driver,
+      } as never,
+      { getColumns: async () => columns },
+    );
+    const keys = { tenant_id: "tenant-1", user_id: "user-1" };
+    const emptyBinaryDisplay = driver.formatOutputValue(
+      Buffer.alloc(0),
+      payloadColumn,
+    );
+    expect(emptyBinaryDisplay).toBe(emptyBinaryCellMarker);
+
+    await mutationService.updateRow(
+      "conn-ddb",
+      "us-east-1",
+      "us-east-1",
+      "users",
+      keys,
+      { payload: String(emptyBinaryDisplay) },
+    );
+    await mutationService.updateRow(
+      "conn-ddb",
+      "us-east-1",
+      "us-east-1",
+      "users",
+      keys,
+      { payload: "" },
+    );
+    await mutationService.updateRow(
+      "conn-ddb",
+      "us-east-1",
+      "us-east-1",
+      "users",
+      keys,
+      { email: "0x" },
+    );
+    const literalMarkerDisplay = driver.formatOutputValue(
+      emptyBinaryCellMarker,
+      columns.find((column) => column.name === "email") as ColumnTypeMeta,
+    );
+    expect(literalMarkerDisplay).toBe(`\\${emptyBinaryCellMarker}`);
+    await mutationService.updateRow(
+      "conn-ddb",
+      "us-east-1",
+      "us-east-1",
+      "users",
+      keys,
+      { email: String(literalMarkerDisplay) },
+    );
+    await mutationService.updateRow(
+      "conn-ddb",
+      "us-east-1",
+      "us-east-1",
+      "users",
+      keys,
+      { email: NULL_SENTINEL },
+    );
+
+    const updates = commandInputs(clientSend, "UpdateItemCommand");
+    expect(updates).toHaveLength(5);
+    const updateValues = updates.map(
+      (update) => update.ExpressionAttributeValues as Record<string, unknown>,
+    );
+    const binaryAttribute = updateValues[0][":u0"] as never;
+    expect(binaryAttribute).toEqual({ B: Buffer.alloc(0) });
+    const reloadedBinary = unmarshall({ payload: binaryAttribute }).payload;
+    expect(driver.formatOutputValue(reloadedBinary, payloadColumn)).toBe(
+      emptyBinaryCellMarker,
+    );
+    expect(updateValues[1][":u0"]).toEqual({ S: "" });
+    expect(updateValues[2][":u0"]).toEqual({ S: "0x" });
+    expect(updateValues[3][":u0"]).toEqual({ S: emptyBinaryCellMarker });
+    expect(updateValues[4][":u0"]).toEqual({ NULL: true });
+  });
+
+  it("saves an empty binary cell when the first sampled row is string-typed", async () => {
+    const { driver, clientSend, queueResponses } = createDriver();
+    const request = {
+      database: "us-east-1",
+      schema: "us-east-1",
+      table: "users",
+      page: 1,
+      pageSize: 25,
+      filters: [],
+      sort: null,
+      skipCount: true,
+    };
+    const firstRow = {
+      tenant_id: "tenant-1",
+      user_id: "user-1",
+      payload: "ordinary text",
+    };
+    const binaryRow = {
+      tenant_id: "tenant-1",
+      user_id: "user-2",
+      payload: Buffer.alloc(0),
+    };
+    queueResponses(
+      { Items: [marshall(firstRow), marshall(binaryRow)] },
+      { Attributes: marshall(binaryRow) },
+      { Items: [marshall(firstRow), marshall(binaryRow)] },
+    );
+
+    const page = await driver.readTablePage(request);
+    const payloadColumn = page.columns.find(
+      (column) => column.name === "payload",
+    );
+    expect(payloadColumn?.nativeType).toBe("string");
+    expect(page.rows[1]?.payload).toBe(emptyBinaryCellMarker);
+
+    const mutationService = new TableMutationService(
+      {
+        getConnection: () => ({ id: "conn-ddb" }),
+        getDriver: () => driver,
+      } as never,
+      { getColumns: async () => page.columns },
+    );
+    await mutationService.updateRow(
+      "conn-ddb",
+      "us-east-1",
+      "us-east-1",
+      "users",
+      { tenant_id: binaryRow.tenant_id, user_id: binaryRow.user_id },
+      { payload: String(page.rows[1]?.payload) },
+    );
+
+    const update = commandInputs(clientSend, "UpdateItemCommand")[0];
+    const updateValues = update?.ExpressionAttributeValues as
+      | Record<string, unknown>
+      | undefined;
+    expect(updateValues?.[":u0"]).toEqual({ B: Buffer.alloc(0) });
+
+    const reloadedPage = await driver.readTablePage(request);
+    expect(reloadedPage.rows[1]?.payload).toBe(emptyBinaryCellMarker);
+  });
+
   it("executes native item operations for insert, update, and delete", async () => {
     const { driver, clientSend, queueResponses } = createDriver();
     queueResponses(
@@ -994,6 +2038,165 @@ describe("DynamoDBDriver native API", () => {
         ]),
       }),
     );
+  });
+
+  it("reports an atomic DynamoDB conditional failure for every transaction row", async () => {
+    const { driver, clientSend } = createDriver();
+    clientSend.mockImplementation(async (command) => {
+      if (command.constructor.name === "DescribeTableCommand") {
+        return {
+          Table: {
+            KeySchema: [
+              { AttributeName: "tenant_id", KeyType: "HASH" },
+              { AttributeName: "user_id", KeyType: "RANGE" },
+            ],
+            AttributeDefinitions: [
+              { AttributeName: "tenant_id", AttributeType: "S" },
+              { AttributeName: "user_id", AttributeType: "S" },
+            ],
+          },
+        };
+      }
+      throw Object.assign(new Error("Conditional check failed"), {
+        name: "TransactionCanceledException",
+        CancellationReasons: [
+          { Code: "ConditionalCheckFailed" },
+          { Code: "None" },
+        ],
+      });
+    });
+
+    await expect(
+      driver.updateRows({
+        database: "us-east-1",
+        schema: "us-east-1",
+        table: "users",
+        updates: [
+          {
+            primaryKeys: { tenant_id: "tenant-1", user_id: "user-1" },
+            changes: { email: "one@example.com" },
+          },
+          {
+            primaryKeys: { tenant_id: "tenant-1", user_id: "user-2" },
+            changes: { email: "two@example.com" },
+          },
+        ],
+      }),
+    ).resolves.toEqual({
+      affectedRows: 0,
+      updateRowOutcomes: [
+        { rowIndex: 0, status: "not_applied" },
+        { rowIndex: 1, status: "not_applied" },
+      ],
+    });
+    expect(commandInputs(clientSend, "TransactWriteItemsCommand")).toHaveLength(
+      1,
+    );
+  });
+
+  it.each([
+    "ValidationError",
+    "ProvisionedThroughputExceeded",
+    "TransactionConflict",
+    "MixedConditionalValidation",
+    "MissingReasons",
+  ])("preserves %s cancellation diagnostics without claiming any write committed", async (reason) => {
+    const { driver, clientSend } = createDriver();
+    const error = Object.assign(new Error(`Transaction cancelled: ${reason}`), {
+      name: "TransactionCanceledException",
+      ...(reason === "MissingReasons"
+        ? {}
+        : {
+            CancellationReasons:
+              reason === "MixedConditionalValidation"
+                ? [
+                    { Code: "ConditionalCheckFailed" },
+                    { Code: "ValidationError" },
+                  ]
+                : [{ Code: reason }, { Code: "None" }],
+          }),
+    });
+    const originalSend = clientSend.getMockImplementation();
+    if (!originalSend)
+      throw new Error("Expected DynamoDB fixture implementation");
+    clientSend.mockImplementation(async (command) => {
+      if (command.constructor.name === "TransactWriteItemsCommand") throw error;
+      return originalSend(command);
+    });
+    await expect(
+      driver.updateRows({
+        database: "us-east-1",
+        schema: "",
+        table: "users",
+        updates: [
+          {
+            primaryKeys: { tenant_id: "tenant-1", user_id: "user-1" },
+            changes: { email: "one@example.com" },
+          },
+          {
+            primaryKeys: { tenant_id: "tenant-1", user_id: "user-2" },
+            changes: { email: "two@example.com" },
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      message: error.message,
+      cause: error,
+      result: {
+        affectedRows: 0,
+        updateRowOutcomes: [
+          { rowIndex: 0, status: "not_applied" },
+          { rowIndex: 1, status: "not_applied" },
+        ],
+      },
+    });
+  });
+
+  it("does not invent partial successes for an uncertain DynamoDB transaction", async () => {
+    const { driver, clientSend } = createDriver();
+    clientSend.mockImplementation(async (command) => {
+      if (command.constructor.name === "DescribeTableCommand") {
+        return {
+          Table: {
+            KeySchema: [
+              { AttributeName: "tenant_id", KeyType: "HASH" },
+              { AttributeName: "user_id", KeyType: "RANGE" },
+            ],
+            AttributeDefinitions: [
+              { AttributeName: "tenant_id", AttributeType: "S" },
+              { AttributeName: "user_id", AttributeType: "S" },
+            ],
+          },
+        };
+      }
+      throw new Error("Connection lost");
+    });
+
+    await expect(
+      driver.updateRows({
+        database: "us-east-1",
+        schema: "us-east-1",
+        table: "users",
+        updates: [
+          {
+            primaryKeys: { tenant_id: "tenant-1", user_id: "user-1" },
+            changes: { email: "one@example.com" },
+          },
+          {
+            primaryKeys: { tenant_id: "tenant-1", user_id: "user-2" },
+            changes: { email: "two@example.com" },
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      result: {
+        affectedRows: 0,
+        updateRowOutcomes: [
+          { rowIndex: 0, status: "unknown" },
+          { rowIndex: 1, status: "unknown" },
+        ],
+      },
+    });
   });
 
   it("aliases reserved key names in mutation conditions", async () => {
@@ -1404,7 +2607,7 @@ describe("DynamoDBDriver native API", () => {
       pageSize: 1,
       filters: [
         { column: "tenant_id", operator: "eq", value: "tenant-1" },
-        { column: "email", operator: "ilike", value: "%example.com%" },
+        { column: "email", operator: "ilike", value: "example.com" },
       ],
       sort: { column: "user_id", direction: "asc" },
       skipCount: true,
@@ -1432,7 +2635,7 @@ describe("DynamoDBDriver native API", () => {
     ]);
   });
 
-  it("falls back to Scan planning for non-key JSON filters", async () => {
+  it("uses Scan for non-key map Contains without searching display serialization", async () => {
     const { driver, clientSend, queueResponses } = createDriver();
     const driverState = driver as unknown as {
       describeColumns: ReturnType<typeof vi.fn>;
@@ -1491,10 +2694,6 @@ describe("DynamoDBDriver native API", () => {
     expect(scanInputs[0]).toMatchObject({
       TableName: "users",
     });
-    expect(page.rows).toEqual([
-      expect.objectContaining({
-        address: '{"country":"RU","lon":37.6173,"city":"Moscow","lat":55.7558}',
-      }),
-    ]);
+    expect(page.rows).toEqual([]);
   });
 });

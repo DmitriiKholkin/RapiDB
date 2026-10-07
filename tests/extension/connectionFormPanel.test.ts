@@ -47,6 +47,7 @@ const vscodeMock = vi.hoisted(() => {
       ViewColumn: { One: 1 },
       window: {
         createWebviewPanel,
+        showWarningMessage: vi.fn(async () => "Save in Plaintext"),
       },
     },
   };
@@ -80,6 +81,298 @@ type ConnectionFormPanelPrototype = {
 describe("ConnectionFormPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vscodeMock.module.window.showWarningMessage.mockResolvedValue(
+      "Save in Plaintext",
+    );
+  });
+
+  it.each([
+    "pg",
+    "sqlite",
+  ])("saves nonsecret %s opt-outs without a plaintext consent prompt", async (type) => {
+    const context = {
+      secrets: { get: vi.fn(), store: vi.fn(), delete: vi.fn() },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn(),
+      getConnection: vi.fn(),
+      testConnection: vi.fn(),
+    };
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+    );
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected a webview panel to be created.");
+    await panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        id: "nonsecret",
+        name: "Nonsecret",
+        type,
+        host: "localhost",
+        database: "app",
+        username: "user",
+        filePath: "/app.db",
+        password: "",
+        useSecretStorage: false,
+      },
+    });
+    expect((await promise)?.useSecretStorage).toBe(false);
+    expect(vscodeMock.module.window.showWarningMessage).not.toHaveBeenCalled();
+    expect(connectionManager.saveConnection).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    "password",
+    "connectionUri",
+    "tls",
+  ])("requires explicit consent for plaintext %s and leaves persistence untouched on dismissal", async (field) => {
+    const context = {
+      secrets: { get: vi.fn(), store: vi.fn(), delete: vi.fn() },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn(),
+      getConnection: vi.fn(),
+      testConnection: vi.fn(async () => ({ success: true })),
+    };
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+    );
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected a webview panel to be created.");
+    const payload = {
+      id: "consent",
+      name: "Consent",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "user",
+      useSecretStorage: false,
+      ...(field === "password"
+        ? { password: " secret " }
+        : field === "connectionUri"
+          ? { connectionUri: "postgres://user:uri-secret@localhost/app" }
+          : {
+              tls: {
+                mode: "mutualTls",
+                certFilePath: "/cert",
+                keyFilePath: "/key",
+                keyPassphrase: "tls-secret",
+              },
+            }),
+    };
+    const warning = vscodeMock.module.window.showWarningMessage;
+    warning.mockResolvedValueOnce(undefined as never);
+    await panel.webview.dispatchMessage({ type: "saveConnection", payload });
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringContaining("settings.json"),
+      { modal: true },
+      "Save in Plaintext",
+    );
+    expect(JSON.stringify(warning.mock.calls)).not.toContain("uri-secret");
+    expect(connectionManager.saveConnection).not.toHaveBeenCalled();
+    expect(context.secrets.store).not.toHaveBeenCalled();
+    expect(context.secrets.delete).not.toHaveBeenCalled();
+    // Connection tests don't persist anything and must not prompt for consent.
+    await panel.webview.dispatchMessage({ type: "testConnection", payload });
+    expect(connectionManager.testConnection).toHaveBeenCalledWith(
+      expect.objectContaining(payload),
+      expect.any(AbortSignal),
+    );
+    expect(warning).toHaveBeenCalledOnce();
+    await panel.webview.dispatchMessage({ type: "saveConnection", payload });
+    const response = await promise;
+    expect(JSON.stringify(response)).not.toContain("secret");
+    expect(response?.useSecretStorage).toBe(false);
+    expect(connectionManager.saveConnection).toHaveBeenCalledWith(
+      expect.objectContaining(payload),
+    );
+  });
+
+  it("does not save if the form closes while plaintext consent is pending", async () => {
+    const context = {
+      secrets: { get: vi.fn(), store: vi.fn(), delete: vi.fn() },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn(),
+      getConnection: vi.fn(),
+      testConnection: vi.fn(),
+    };
+    let accept!: (value: string) => void;
+    vscodeMock.module.window.showWarningMessage.mockImplementationOnce(
+      () =>
+        new Promise<string>((resolve) => {
+          accept = resolve;
+        }),
+    );
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+    );
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected a webview panel to be created.");
+    const save = panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        id: "closed-consent",
+        name: "Closed consent",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "user",
+        password: "secret",
+        useSecretStorage: false,
+      },
+    });
+    await vi.waitFor(() =>
+      expect(
+        vscodeMock.module.window.showWarningMessage,
+      ).toHaveBeenCalledOnce(),
+    );
+    panel.dispose();
+    accept("Save in Plaintext");
+    await save;
+    await expect(promise).resolves.toBeUndefined();
+    expect(connectionManager.saveConnection).not.toHaveBeenCalled();
+    expect(context.secrets.store).not.toHaveBeenCalled();
+    expect(context.secrets.delete).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "apiKey",
+    "aws",
+    "tls",
+    "connectionUri",
+  ])("preserves stored %s credentials when explicitly disabling storage", async (field) => {
+    const secrets = {
+      apiKey: "api-secret",
+      awsAccessKeyId: "access-secret",
+      awsSecretAccessKey: "aws-secret",
+      awsSessionToken: "token-secret",
+      tlsKeyPassphrase: "tls-secret",
+      connectionUri: "mongodb://user:uri-secret@localhost/app",
+    };
+    const context = {
+      secrets: {
+        get: vi.fn(async () => JSON.stringify(secrets)),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const existing = {
+      id: "switch",
+      name: "Switch",
+      type:
+        field === "apiKey"
+          ? "elasticsearch"
+          : field === "aws"
+            ? "dynamodb"
+            : field === "connectionUri"
+              ? "mongodb"
+              : "pg",
+      host: "localhost",
+      database: "app",
+      username: "user",
+      useSecretStorage: true,
+    };
+    const connectionManager = {
+      saveConnection: vi.fn(),
+      getConnection: vi.fn(() => existing),
+      testConnection: vi.fn(),
+    };
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+    );
+    const payload = {
+      ...existing,
+      useSecretStorage: false,
+      ...(field === "apiKey"
+        ? { endpoint: "https://localhost", apiKey: "" }
+        : field === "aws"
+          ? { awsRegion: "us-east-1" }
+          : field === "tls"
+            ? {
+                tls: {
+                  mode: "mutualTls",
+                  certFilePath: "/cert",
+                  keyFilePath: "/key",
+                  keyPassphrase: "",
+                },
+              }
+            : { connectionUri: "mongodb://localhost/app" }),
+    };
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected a webview panel to be created.");
+    await panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload,
+    });
+    const response = await promise;
+    const saved = connectionManager.saveConnection.mock.calls[0]?.[0];
+    expect(saved?.useSecretStorage).toBe(false);
+    if (field === "apiKey") expect(saved?.apiKey).toBe(secrets.apiKey);
+    if (field === "aws")
+      expect(saved).toMatchObject({
+        awsAccessKeyId: secrets.awsAccessKeyId,
+        awsSecretAccessKey: secrets.awsSecretAccessKey,
+        awsSessionToken: secrets.awsSessionToken,
+      });
+    if (field === "tls")
+      expect(saved?.tls?.keyPassphrase).toBe(secrets.tlsKeyPassphrase);
+    if (field === "connectionUri")
+      expect(saved?.connectionUri).toBe(secrets.connectionUri);
+    expect(JSON.stringify(response)).not.toContain("secret");
+    expect(response?.useSecretStorage).toBe(false);
+    expect(vscodeMock.module.window.showWarningMessage).toHaveBeenCalledOnce();
+  });
+
+  it("keeps plaintext edit metadata secret-free and blank submissions retain the user's password", async () => {
+    const existing = {
+      id: "plain-edit",
+      name: "Plain edit",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "user",
+      password: " original-secret ",
+      useSecretStorage: false,
+    };
+    const context = {
+      secrets: { get: vi.fn(), store: vi.fn(), delete: vi.fn() },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn(),
+      getConnection: vi.fn(() => existing),
+      testConnection: vi.fn(),
+    };
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+      existing as never,
+    );
+    await Promise.resolve();
+    const initial =
+      vi.mocked(createWebviewShell).mock.calls[0]?.[0].initialState;
+    expect(JSON.stringify(initial)).not.toContain("original-secret");
+    expect(initial).toMatchObject({
+      existing: { hasStoredSecret: true, useSecretStorage: false },
+    });
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected a webview panel to be created.");
+    await panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: { ...existing, password: "", hasStoredSecret: true },
+    });
+    expect(connectionManager.saveConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        password: existing.password,
+        useSecretStorage: false,
+      }),
+    );
+    expect((await promise)?.password).toBeUndefined();
   });
 
   it.each([
@@ -957,7 +1250,7 @@ describe("ConnectionFormPanel", () => {
       expect.objectContaining({
         id: "conn-es",
         type: "elasticsearch",
-        endpoint: "https://elastic-user:elastic-pass@cluster.example.com",
+        endpoint: "https://cluster.example.com",
         cloudId: "deployment:ZXM=",
         useSecretStorage: false,
       }),
@@ -1067,15 +1360,14 @@ describe("ConnectionFormPanel", () => {
         id: "conn-ssh",
         ssh: expect.objectContaining({
           host: "bastion.example.com",
-          privateKey:
-            "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
-          passphrase: "new-passphrase",
         }),
         useSecretStorage: false,
       }),
     );
     expect(context.secrets.store).not.toHaveBeenCalled();
     expect(context.secrets.delete).not.toHaveBeenCalled();
+    expect((await promise)?.ssh?.privateKey).toBeUndefined();
+    expect((await promise)?.ssh?.passphrase).toBeUndefined();
     expect(connectionManager.saveConnection).toHaveBeenCalledWith(
       expect.objectContaining({
         id: "conn-ssh",

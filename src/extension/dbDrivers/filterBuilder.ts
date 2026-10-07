@@ -1,5 +1,6 @@
 import { normalizeNumericToken } from "../../shared/numericNormalization";
 import { normalizeDateFilterValue } from "../utils/dateUtils";
+import { literalContainsPattern } from "./literalContains";
 import {
   createSqlFilterPreamble,
   type SqlFilterPreambleResult,
@@ -280,7 +281,10 @@ export class FilterBuilder {
   ): FilterConditionResult {
     const sqlOp = this.sqlOperator(operator);
     if (operator === "like" || operator === "ilike") {
-      return { sql: `CAST(${col} AS CHAR) LIKE ?`, params: [`%${val}%`] };
+      return {
+        sql: `CAST(${col} AS CHAR) LIKE ? ESCAPE '!'`,
+        params: [literalContainsPattern(val)],
+      };
     }
     if (operator === "eq") {
       return { sql: `CAST(${col} AS CHAR) LIKE ?`, params: [`%${val}%`] };
@@ -305,7 +309,10 @@ export class FilterBuilder {
     col: string,
     val: string,
   ): FilterConditionResult {
-    return { sql: `CAST(${col} AS CHAR) LIKE ?`, params: [`%${val}%`] };
+    return {
+      sql: `CAST(${col} AS CHAR) LIKE ? ESCAPE '!'`,
+      params: [literalContainsPattern(val)],
+    };
   }
 
   /**

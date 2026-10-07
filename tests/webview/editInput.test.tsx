@@ -31,6 +31,29 @@ afterEach(() => {
 });
 
 describe("EditInput", () => {
+  it.each([
+    ["0x", "0x"],
+    ["0xab", ""],
+  ])("keeps binary input %j distinct from clearing to empty text", (initial, value) => {
+    const onCommit = vi.fn();
+    render(
+      <EditInput
+        initial={initial}
+        nullable
+        category="binary"
+        onCommit={onCommit}
+        onCancel={vi.fn()}
+      />,
+    );
+    const input = screen.getByLabelText("Cell value") as HTMLInputElement;
+    expect(input.value).toBe(initial);
+    if (value !== initial) {
+      fireEvent.change(input, { target: { value } });
+    }
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onCommit).toHaveBeenCalledExactlyOnceWith(value);
+  });
+
   it("preserves typing while a context-menu clipboard read is pending", async () => {
     const user = userEvent.setup();
     const onCommit = vi.fn();

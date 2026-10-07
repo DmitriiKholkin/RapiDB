@@ -140,7 +140,7 @@ export function parseEnvelopeQueryPayload(
   const queryText =
     readRequiredString(payload, "queryText") ??
     readRequiredString(payload, "sql");
-  if (!queryText) {
+  if (!queryText?.trim()) {
     return null;
   }
   return {

@@ -47,6 +47,7 @@ function harness(
   options: {
     triggerId?: number;
     mismatch?: boolean;
+    rollbackFailure?: Error;
     metadata?: ColumnTypeMeta[];
     packet?: unknown;
     modeResult?: unknown;
@@ -168,6 +169,7 @@ function harness(
     }),
     rollback: vi.fn(async () => {
       events.push("ROLLBACK");
+      if (options.rollbackFailure) throw options.rollbackFailure;
       stored.clear();
       for (const [key, value] of snapshot) stored.set(key, value);
     }),
@@ -370,6 +372,28 @@ describe("F02: MySQL AUTO_INCREMENT zero verification", () => {
     }
   });
 
+  it("discards the pooled connection when a failed mutation cannot be rolled back", async () => {
+    const rollbackFailure = new Error("rollback refused");
+    const h = harness("", { mismatch: true, rollbackFailure });
+    const plan = await h.prepare({ id: 0, amount: 7 });
+
+    await expect(
+      h.service.executePreparedInsertPlan(plan),
+    ).rejects.toMatchObject({
+      name: "AggregateError",
+      message: expect.stringContaining("rollback failed"),
+      errors: [
+        expect.objectContaining({
+          message: expect.stringContaining("verification failed"),
+        }),
+        rollbackFailure,
+      ],
+    });
+
+    expect(h.conn.destroy).toHaveBeenCalledOnce();
+    expect(h.conn.release).not.toHaveBeenCalled();
+  });
+
   it("NOAUTO rejects a trigger-redirected zero even with compatible other values", async () => {
     const h = harness(noAuto, { triggerId: 900 });
     await expect(
@@ -525,14 +549,13 @@ describe("F02: MySQL AUTO_INCREMENT zero verification", () => {
     expect(h.events).toContain("GUARD");
   });
 
-  it("filters unknown inputs before zero generation planning", async () => {
+  it("rejects unknown insert columns before zero generation planning", async () => {
     const h = harness();
-    const plan = await h.prepare({ unknown: 0, amount: 7 });
-    expect(plan.operation.params).toEqual([7]);
-    expect(plan.operation.captureIdentity?.mysqlInsertId?.zero).toBeUndefined();
-    expect(plan.verification?.values.map((value) => value.column.name)).toEqual(
-      ["amount"],
+    await expect(h.prepare({ unknown: 0, amount: 7 })).rejects.toThrow(
+      /Insert contains unknown column "unknown"/,
     );
+    expect(h.lease).not.toHaveBeenCalled();
+    expect(h.events).toEqual([]);
   });
 
   it("only AUTO_INCREMENT primary keys receive zero generation indicators", async () => {
@@ -642,10 +665,10 @@ describe("F02: MySQL AUTO_INCREMENT zero verification", () => {
     expect(h.events.at(-1)).toBe("ROLLBACK");
   });
 
-  it("unknown primary-key metadata still fails closed before leasing/writing", async () => {
+  it("rejects an unknown insert key before missing-primary-key inference", async () => {
     const h = harness("", { metadata: [columns[1]] });
     await expect(h.prepare({ id: 0, amount: 7 })).rejects.toThrow(
-      /requires a reliable primary key/,
+      /Insert contains unknown column "id"/,
     );
     expect(h.lease).not.toHaveBeenCalled();
     expect(h.events).toEqual([]);

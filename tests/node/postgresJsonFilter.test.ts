@@ -37,8 +37,8 @@ describe("postgres json filter", () => {
     );
 
     expect(condition).toEqual({
-      sql: 'CAST("payload" AS TEXT) ILIKE $1',
-      params: ['%{"key":"value","num":42,"bool":true,"null_val":null}%'],
+      sql: `CAST("payload" AS TEXT) ILIKE $1 ESCAPE '!'`,
+      params: ['%{"key":"value","num":42,"bool":true,"null!_val":null}%'],
     });
   });
 
@@ -51,7 +51,7 @@ describe("postgres json filter", () => {
     );
 
     expect(condition).toEqual({
-      sql: 'CAST("payload" AS TEXT) ILIKE $1',
+      sql: `CAST("payload" AS TEXT) ILIKE $1 ESCAPE '!'`,
       params: ['%"key":"value"%'],
     });
   });

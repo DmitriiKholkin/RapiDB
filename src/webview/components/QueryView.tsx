@@ -70,6 +70,7 @@ export function QueryView({
         sqlDialect={view.editorState.sqlDialect}
         status={view.status}
         onEditorChange={view.handleEditorChange}
+        onEditorSelectionChange={view.handleEditorSelectionChange}
         onExecute={view.executeQuery}
         onStartResizing={view.startResizing}
       />

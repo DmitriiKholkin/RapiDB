@@ -2,11 +2,16 @@ import { describe, expect, it } from "vitest";
 import {
   formatDatetimeForDisplay,
   hasExplicitTimezone,
+  isoToLocalDateStr,
   normalizeSqlDatetimeOffsetSpacing,
 } from "../../src/extension/dbDrivers/BaseDBDriver";
+import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
+import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
+import { OracleDriver } from "../../src/extension/dbDrivers/oracle";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
+import { isoToLocalDateStr as isoToSharedDateStr } from "../../src/extension/utils/dateUtils";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
 const sqliteDriver = new SQLiteDriver({
@@ -25,6 +30,21 @@ const postgresDriver = new PostgresDriver({
   database: "postgres",
   username: "postgres",
   password: "postgres",
+} as ConnectionConfig);
+const mysqlDriver = new MySQLDriver({
+  id: "date-filter-timezone-test-mysql",
+  name: "Date Filter Timezone Test MySQL",
+  type: "mysql",
+} as ConnectionConfig);
+const mssqlDriver = new MSSQLDriver({
+  id: "date-filter-timezone-test-mssql",
+  name: "Date Filter Timezone Test MSSQL",
+  type: "mssql",
+} as ConnectionConfig);
+const oracleDriver = new OracleDriver({
+  id: "date-filter-timezone-test-oracle",
+  name: "Date Filter Timezone Test Oracle",
+  type: "oracle",
 } as ConnectionConfig);
 
 const dateColumn: ColumnTypeMeta = {
@@ -54,6 +74,14 @@ const datetimeColumn: ColumnTypeMeta = {
 };
 
 describe("date filter timezone normalization", () => {
+  const sqlDrivers = [
+    ["SQLite", sqliteDriver],
+    ["PostgreSQL", postgresDriver],
+    ["MySQL", mysqlDriver],
+    ["MSSQL", mssqlDriver],
+    ["Oracle", oracleDriver],
+  ] as const;
+
   it("treats +HH and +HHMM as explicit timezone", () => {
     expect(hasExplicitTimezone("2019-07-24 22:24:19.395+00")).toBe(true);
     expect(hasExplicitTimezone("2019-07-24 22:24:19.395+0000")).toBe(true);
@@ -122,6 +150,58 @@ describe("date filter timezone normalization", () => {
     expect(normalized).toBe("2019-07-24");
   });
 
+  it.each([
+    ["+HH", "2024-03-10T00:30:00+14", "2024-03-09"],
+    ["+HHMM", "2024-03-10T00:30:00+1400", "2024-03-09"],
+    ["+HH:MM", "2024-03-10T00:30:00+14:00", "2024-03-09"],
+    ["DST boundary", "2024-03-10T23:30:00-04:00", "2024-03-11"],
+  ])("normalizes %s offsets consistently for each SQL driver's DATE filter", (_label, value, expected) => {
+    expect(isoToLocalDateStr(value)).toBe(expected);
+    expect(isoToSharedDateStr(value)).toBe(expected);
+    for (const [dialect, driver] of sqlDrivers) {
+      expect(
+        driver.normalizeFilterValue(dateColumn, "eq", value),
+        dialect,
+      ).toBe(expected);
+    }
+  });
+
+  it("keeps timezone-free wall dates stable across host TZ and DST", () => {
+    const originalTz = process.env.TZ;
+    try {
+      for (const timezone of [
+        "UTC",
+        "Pacific/Kiritimati",
+        "America/Los_Angeles",
+        "America/New_York",
+      ]) {
+        process.env.TZ = timezone;
+        const wallDatetime = "2024-03-10T02:30:00";
+        expect(isoToLocalDateStr(wallDatetime), timezone).toBe("2024-03-10");
+        expect(isoToSharedDateStr(wallDatetime), timezone).toBe("2024-03-10");
+        for (const [dialect, driver] of sqlDrivers) {
+          expect(
+            driver.normalizeFilterValue(dateColumn, "eq", wallDatetime),
+            `${dialect} in ${timezone}`,
+          ).toBe("2024-03-10");
+        }
+        expect(
+          postgresDriver.coerceInputValue(wallDatetime, dateColumn),
+          timezone,
+        ).toBe("2024-03-10");
+        expect(isoToLocalDateStr("2024-03-10T23:30:00-04:00"), timezone).toBe(
+          "2024-03-11",
+        );
+      }
+    } finally {
+      if (originalTz === undefined) {
+        delete process.env.TZ;
+      } else {
+        process.env.TZ = originalTz;
+      }
+    }
+  });
+
   it("builds PostgreSQL LIKE filter for date from copied datetime+timezone", () => {
     const condition = postgresDriver.buildFilterCondition(
       dateColumn,
@@ -131,7 +211,7 @@ describe("date filter timezone normalization", () => {
     );
 
     expect(condition).toEqual({
-      sql: 'CAST("created_at" AS TEXT) ILIKE $1',
+      sql: `CAST("created_at" AS TEXT) ILIKE $1 ESCAPE '!'`,
       params: ["%2019-07-24%"],
     });
   });
@@ -145,7 +225,7 @@ describe("date filter timezone normalization", () => {
     );
 
     expect(condition).toEqual({
-      sql: 'CAST("created_at" AS TEXT) ILIKE $1',
+      sql: `CAST("created_at" AS TEXT) ILIKE $1 ESCAPE '!'`,
       params: ["%2016-12-21%16:50:38.528%"],
     });
   });

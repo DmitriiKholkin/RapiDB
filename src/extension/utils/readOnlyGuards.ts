@@ -5,6 +5,11 @@ import type {
   ReadOnlyQueryDecision,
   ReadOnlyQueryGuard,
 } from "../dbDrivers/types";
+import {
+  hasPostgresDollarQuoteTag,
+  oracleAlternativeQuoteEnd,
+  readPostgresDollarQuoteTag,
+} from "./sqlStatementScan";
 
 const ALLOWED_READ_ONLY_QUERY: ReadOnlyQueryDecision = { allowed: true };
 
@@ -18,7 +23,7 @@ const SQL_READ_ONLY_QUERY_REASON =
 // SELECT __rapidb_executable_comment__ must stay allowed.
 const EXECUTABLE_MYSQL_COMMENT_SENTINEL =
   "\u0000__rapidb-executable-comment__\u0000";
-const AMBIGUOUS_SQL_QUOTE_SENTINEL = "\u0000__rapidb-ambiguous-quote__\u0000";
+const AMBIGUOUS_SQL_SYNTAX_SENTINEL = "\u0000__rapidb-ambiguous-syntax__\u0000";
 
 const SQLITE_READ_ONLY_PRAGMAS = new Set([
   "application_id",
@@ -49,7 +54,6 @@ const SQLITE_READ_ONLY_PRAGMAS = new Set([
   "locking_mode",
   "max_page_count",
   "module_list",
-  "optimize",
   "page_count",
   "page_size",
   "pragma_list",
@@ -183,6 +187,11 @@ const SQL_MUTATING_FUNCTIONS = new Set([
 // Prefix families that are all mutating when called: dblink_* can execute
 // remote DML, pg_advisory_* changes session lock state.
 const SQL_MUTATING_FUNCTION_PREFIXES = ["dblink_", "pg_advisory_"];
+const MYSQL_SESSION_MUTATING_FUNCTIONS = new Set([
+  "get_lock",
+  "release_lock",
+  "release_all_locks",
+]);
 
 function isMutatingFunctionCall(
   keyword: string,
@@ -196,6 +205,21 @@ function isMutatingFunctionCall(
   }
   return SQL_MUTATING_FUNCTION_PREFIXES.some((prefix) =>
     keyword.startsWith(prefix),
+  );
+}
+
+function isKnownMutatingFunctionName(
+  keyword: string,
+  dialect: QueryEditorSqlDialect,
+): boolean {
+  return (
+    SQL_MUTATING_FUNCTIONS.has(keyword) ||
+    SQL_MUTATING_FUNCTION_PREFIXES.some((prefix) =>
+      keyword.startsWith(prefix),
+    ) ||
+    (dialect === "mysql" &&
+      (MYSQL_SESSION_MUTATING_FUNCTIONS.has(keyword) ||
+        keyword === "last_insert_id"))
   );
 }
 
@@ -256,7 +280,7 @@ export function sqlReadOnlyQueryGuard(
   const sanitized = sanitizeSqlForReadOnlyClassification(queryText, dialect);
   if (
     sanitized.includes(EXECUTABLE_MYSQL_COMMENT_SENTINEL) ||
-    sanitized.includes(AMBIGUOUS_SQL_QUOTE_SENTINEL)
+    sanitized.includes(AMBIGUOUS_SQL_SYNTAX_SENTINEL)
   ) {
     return denyReadOnlyQuery(SQL_READ_ONLY_QUERY_REASON);
   }
@@ -306,6 +330,9 @@ function isSqlLineComment(
   index: number,
   dialect: QueryEditorSqlDialect,
 ): boolean {
+  if (dialect === "mysql" && queryText[index] === "#") {
+    return true;
+  }
   if (queryText[index] !== "-" || queryText[index + 1] !== "-") {
     return false;
   }
@@ -326,7 +353,7 @@ function skipSqlTrivia(
     const char = queryText[pos];
     const next = queryText[pos + 1];
     if (isSqlLineComment(queryText, pos, dialect)) {
-      pos += 2;
+      pos += char === "#" ? 1 : 2;
       while (
         pos < queryText.length &&
         queryText[pos] !== "\n" &&
@@ -366,9 +393,22 @@ function sanitizeSqlForReadOnlyClassification(
     const char = queryText[index];
     const next = queryText[index + 1];
 
+    if (dialect === "plsql") {
+      try {
+        const alternativeQuoteEnd = oracleAlternativeQuoteEnd(queryText, index);
+        if (alternativeQuoteEnd !== undefined) {
+          sanitized += " ";
+          index = alternativeQuoteEnd;
+          continue;
+        }
+      } catch {
+        return AMBIGUOUS_SQL_SYNTAX_SENTINEL;
+      }
+    }
+
     if (isSqlLineComment(queryText, index, dialect)) {
       sanitized += " ";
-      index += 2;
+      index += char === "#" ? 1 : 2;
       while (
         index < queryText.length &&
         queryText[index] !== "\n" &&
@@ -396,30 +436,42 @@ function sanitizeSqlForReadOnlyClassification(
         sanitized += " ";
       }
       index += 2;
+      let closed = false;
       while (index < queryText.length) {
         if (queryText[index] === "/" && queryText[index + 1] === "*") {
           // PostgreSQL nests block comments, while MySQL closes at the first
           // terminator. Do not guess where executable SQL resumes.
-          return AMBIGUOUS_SQL_QUOTE_SENTINEL;
+          return AMBIGUOUS_SQL_SYNTAX_SENTINEL;
         }
         if (queryText[index] === "*" && queryText[index + 1] === "/") {
           index += 2;
+          closed = true;
           break;
         }
         index += 1;
+      }
+      if (!closed) {
+        return AMBIGUOUS_SQL_SYNTAX_SENTINEL;
       }
       continue;
     }
 
     if (char === "'") {
-      sanitized += " ";
+      // Hide literal contents, not argument presence: LAST_INSERT_ID('123')
+      // mutates MySQL session state just like LAST_INSERT_ID(123).
+      sanitized += dialect === "mysql" ? " __rapidb_quoted_value__ " : " ";
       index += 1;
+      let closed = false;
       while (index < queryText.length) {
-        if (queryText[index] === "\\" && queryText[index + 1] === "'") {
+        if (
+          supportsBackslashEscapedQuotes(dialect) &&
+          queryText[index] === "\\" &&
+          queryText[index + 1] === "'"
+        ) {
           // PostgreSQL E'...' and MySQL (depending on sql_mode) treat \' as
           // an escaped quote. Without the server's string mode, the rest of
           // the statement cannot safely be classified as read-only.
-          return AMBIGUOUS_SQL_QUOTE_SENTINEL;
+          return AMBIGUOUS_SQL_SYNTAX_SENTINEL;
         }
         if (queryText[index] === "'") {
           if (queryText[index + 1] === "'") {
@@ -427,9 +479,13 @@ function sanitizeSqlForReadOnlyClassification(
             continue;
           }
           index += 1;
+          closed = true;
           break;
         }
         index += 1;
+      }
+      if (!closed) {
+        return AMBIGUOUS_SQL_SYNTAX_SENTINEL;
       }
       continue;
     }
@@ -444,17 +500,21 @@ function sanitizeSqlForReadOnlyClassification(
         queryText[index - 1] === "&" &&
         /[uU]/.test(queryText[index - 2])
       ) {
-        return AMBIGUOUS_SQL_QUOTE_SENTINEL;
+        return AMBIGUOUS_SQL_SYNTAX_SENTINEL;
       }
       const quote = char;
       index += 1;
       let inner = "";
       let closed = false;
       while (index < queryText.length) {
-        if (queryText[index] === "\\" && queryText[index + 1] === quote) {
+        if (
+          dialect === "mysql" &&
+          queryText[index] === "\\" &&
+          queryText[index + 1] === quote
+        ) {
           // Backticks and (depending on SQL mode) double quotes can also use
           // backslash escapes. Do not mistake the escaped quote for the end.
-          return AMBIGUOUS_SQL_QUOTE_SENTINEL;
+          return AMBIGUOUS_SQL_SYNTAX_SENTINEL;
         }
         if (queryText[index] === quote) {
           if (queryText[index + 1] === quote) {
@@ -470,22 +530,25 @@ function sanitizeSqlForReadOnlyClassification(
         index += 1;
       }
       if (!closed) {
-        sanitized += " ";
-        continue;
+        return AMBIGUOUS_SQL_SYNTAX_SENTINEL;
       }
       // Quoted identifiers are normally opaque (SELECT "comment" stays allowed),
       // but `"nextval"(...)` is still a function call in PG. Preserve the name
-      // when it looks like a mutating-function call, otherwise blank it.
+      // when it looks like a mutating-function call, otherwise keep it opaque.
       const lowered = inner.toLowerCase();
       const lookahead = skipSqlTrivia(queryText, index, dialect);
       if (
-        (SQL_MUTATING_FUNCTIONS.has(lowered) ||
-          SQL_MUTATING_FUNCTION_PREFIXES.some((prefix) =>
-            lowered.startsWith(prefix),
-          )) &&
+        isKnownMutatingFunctionName(lowered, dialect) &&
         queryText[lookahead] === "("
       ) {
         sanitized += ` ${lowered} (`;
+      } else if (dialect === "plsql") {
+        sanitized +=
+          inner === "NEXTVAL" ? " NEXTVAL " : " __rapidb_quoted_identifier__ ";
+      } else if (dialect === "mysql") {
+        // Double quotes may be strings or identifiers (ANSI_QUOTES); either
+        // spelling, including backticks, remains a nonempty call argument.
+        sanitized += " __rapidb_quoted_value__ ";
       } else {
         sanitized += " ";
       }
@@ -514,16 +577,12 @@ function sanitizeSqlForReadOnlyClassification(
         index += 1;
       }
       if (!closed) {
-        sanitized += " ";
-        continue;
+        return AMBIGUOUS_SQL_SYNTAX_SENTINEL;
       }
       const lowered = inner.toLowerCase();
       const lookahead = skipSqlTrivia(queryText, index, dialect);
       if (
-        (SQL_MUTATING_FUNCTIONS.has(lowered) ||
-          SQL_MUTATING_FUNCTION_PREFIXES.some((prefix) =>
-            lowered.startsWith(prefix),
-          )) &&
+        isKnownMutatingFunctionName(lowered, dialect) &&
         queryText[lookahead] === "("
       ) {
         sanitized += ` ${lowered} (`;
@@ -533,13 +592,19 @@ function sanitizeSqlForReadOnlyClassification(
       continue;
     }
 
-    const dollarQuoteTag = readDollarQuoteTag(queryText, index);
+    // Dollar-quoted strings are PostgreSQL syntax, not a generic SQL quote.
+    // In MySQL, for example, `$tag$` is an identifier spelling and semicolons
+    // after it are real statement boundaries (including temporary-table DDL).
+    const dollarQuoteTag =
+      dialect === "postgresql"
+        ? readPostgresDollarQuoteTag(queryText, index)
+        : null;
     if (dollarQuoteTag) {
       sanitized += " ";
       index += dollarQuoteTag.length;
       const closingIndex = queryText.indexOf(dollarQuoteTag, index);
       if (closingIndex === -1) {
-        break;
+        return AMBIGUOUS_SQL_SYNTAX_SENTINEL;
       }
       index = closingIndex + dollarQuoteTag.length;
       continue;
@@ -550,6 +615,14 @@ function sanitizeSqlForReadOnlyClassification(
   }
 
   return sanitized;
+}
+
+function supportsBackslashEscapedQuotes(
+  dialect: QueryEditorSqlDialect,
+): boolean {
+  // MySQL string behavior depends on sql_mode; PostgreSQL E-strings always
+  // support escapes and ordinary strings can depend on server configuration.
+  return dialect === "mysql" || dialect === "postgresql";
 }
 
 export function mayChangeDatabaseSchema(
@@ -565,7 +638,7 @@ export function mayChangeDatabaseSchema(
   );
   if (
     sanitizedQuery.includes(EXECUTABLE_MYSQL_COMMENT_SENTINEL) ||
-    sanitizedQuery.includes(AMBIGUOUS_SQL_QUOTE_SENTINEL)
+    sanitizedQuery.includes(AMBIGUOUS_SQL_SYNTAX_SENTINEL)
   ) {
     return true;
   }
@@ -578,24 +651,16 @@ export function mayChangeDatabaseSchema(
   }
 
   return (
-    /^\s*DO\b/i.test(sanitizedQuery) &&
-    /\$(?:[A-Za-z_][A-Za-z0-9_]*\$|\$)/.test(queryText)
+    /^\s*DO\b/i.test(sanitizedQuery) && hasPostgresDollarQuoteTag(queryText)
   );
-}
-
-function readDollarQuoteTag(queryText: string, index: number): string | null {
-  if (queryText[index] !== "$") {
-    return null;
-  }
-
-  const match = /^(\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$)/.exec(
-    queryText.slice(index),
-  );
-  return match?.[0] ?? null;
 }
 
 function tokenizeSql(statement: string): string[] {
-  return statement.match(/[A-Za-z_][A-Za-z0-9_$]*|[(),.]/g) ?? [];
+  // Keep non-ASCII identifiers intact; dropping a sequence name can conceal
+  // Oracle's identifier.NEXTVAL behind a comma or opening parenthesis.
+  return (
+    statement.match(/[\p{L}\p{Nl}_][\p{L}\p{Nl}\p{N}\p{M}_$#]*|[(),.]/gu) ?? []
+  );
 }
 
 function isReadOnlySqlStatement(
@@ -606,12 +671,92 @@ function isReadOnlySqlStatement(
   if (tokens.length === 0) {
     return false;
   }
+  if (dialect === "mysql" && hasMysqlSessionSideEffect(statement, tokens)) {
+    return false;
+  }
+  if (dialect === "transactsql" && hasTsqlSequenceAdvance(tokens)) {
+    return false;
+  }
+  if (dialect === "plsql" && hasOracleSequenceAdvance(tokens)) {
+    return false;
+  }
 
   if (isReadOnlySqlTokens(tokens)) {
     return true;
   }
 
   return isDialectReadOnlySqlStatement(statement, tokens, dialect);
+}
+
+function hasTsqlSequenceAdvance(tokens: string[]): boolean {
+  for (let index = 0; index + 2 < tokens.length; index += 1) {
+    if (
+      tokens[index]?.toLowerCase() === "next" &&
+      tokens[index + 1]?.toLowerCase() === "value" &&
+      tokens[index + 2]?.toLowerCase() === "for"
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasOracleSequenceAdvance(tokens: string[]): boolean {
+  // Oracle sequence increments survive transaction rollback, so NEXTVAL is
+  // unsafe even when the editor wraps the read in a READ ONLY transaction.
+  for (let index = 2; index < tokens.length; index += 1) {
+    if (
+      tokens[index]?.toUpperCase() === "NEXTVAL" &&
+      tokens[index - 1] === "." &&
+      isOracleIdentifierToken(tokens[index - 2] ?? "")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isOracleIdentifierToken(token: string): boolean {
+  return (
+    token === "__rapidb_quoted_identifier__" ||
+    /^[\p{L}\p{Nl}_][\p{L}\p{Nl}\p{N}\p{M}_$#]*$/u.test(token)
+  );
+}
+
+function hasMysqlSessionSideEffect(
+  statement: string,
+  tokens: string[],
+): boolean {
+  // User-variable assignment and named locks are session state, not protected
+  // by START TRANSACTION READ ONLY; both can outlive rollback on a pooled
+  // connection. LAST_INSERT_ID(expr) also mutates per-connection state.
+  if (statement.includes(":=")) {
+    return true;
+  }
+  const lastInsertIdCall = /\blast_insert_id\s*\(/gi;
+  while (true) {
+    const lastInsertIdMatch = lastInsertIdCall.exec(statement);
+    if (lastInsertIdMatch === null) {
+      break;
+    }
+    let argumentStart = lastInsertIdMatch.index + lastInsertIdMatch[0].length;
+    while (/\s/.test(statement[argumentStart] ?? "")) {
+      argumentStart += 1;
+    }
+    if (statement[argumentStart] !== ")") {
+      return true;
+    }
+  }
+  for (let index = 0; index < tokens.length; index += 1) {
+    const keyword = tokens[index]?.toLowerCase();
+    if (
+      MYSQL_SESSION_MUTATING_FUNCTIONS.has(keyword ?? "") &&
+      tokens[index + 1] === "("
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** Structural SELECT/CTE check; callers must establish lexical boundaries first. */

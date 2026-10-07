@@ -276,6 +276,13 @@ export interface ColumnTypeMeta extends ColumnMeta {
   valueSemantics: ValueSemantics;
 }
 
+/** True for columns whose values are computed by the database, not identities/defaults. */
+export function isServerGeneratedColumn(
+  column: Pick<ColumnMeta, "isComputed" | "generatedKind"> | null | undefined,
+): boolean {
+  return Boolean(column && (column.isComputed || column.generatedKind));
+}
+
 export type IndexDdlSupport = "supported" | "unsupported";
 
 export interface IndexMeta {

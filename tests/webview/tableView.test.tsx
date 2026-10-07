@@ -102,6 +102,7 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
 import { TableView } from "../../src/webview/components/TableView";
 import { DEBOUNCE } from "../../src/webview/components/table/tableViewHelpers";
 import { useTableMutationController } from "../../src/webview/components/table/useTableMutationController";
+import { CELL_PREVIEW_LIMIT } from "../../src/webview/utils/cellPreview";
 import {
   clearPostedMessages as clearRawPostedMessages,
   dispatchIncomingMessage as dispatchRawIncomingMessage,
@@ -121,7 +122,7 @@ function captureTableMutationOperationId(): void {
     "operationId" in payload &&
     typeof payload.operationId === "string"
   ) {
-    expect(payload.operationId).toMatch(/^table-mutation:\d+$/);
+    expect(payload.operationId).toMatch(/^table-mutation:[^:]+:\d+$/);
     activeTableMutationOperationId = payload.operationId;
   }
 }
@@ -439,6 +440,34 @@ const operatorVisibilityColumns: ColumnTypeMeta[] = [
   },
 ];
 
+const redisKeyColumns: ColumnTypeMeta[] = [
+  {
+    name: "key",
+    type: "TEXT",
+    nativeType: "TEXT",
+    nullable: false,
+    isPrimaryKey: true,
+    primaryKeyOrdinal: 1,
+    isForeignKey: false,
+    category: "text",
+    filterable: true,
+    filterOperators: ["eq", "like"],
+    valueSemantics: "plain",
+  },
+  {
+    name: "value",
+    type: "TEXT",
+    nativeType: "TEXT",
+    nullable: true,
+    isPrimaryKey: false,
+    isForeignKey: false,
+    category: "text",
+    filterable: true,
+    filterOperators: ["eq", "like"],
+    valueSemantics: "plain",
+  },
+];
+
 function lastFetchPayload(): {
   fetchId?: number;
   page?: number;
@@ -470,6 +499,7 @@ function renderTableView(overrides?: {
   defaultPageSize?: number;
   isView?: boolean;
   table?: string;
+  displayTableName?: string;
 }) {
   return render(
     <TableView
@@ -481,6 +511,7 @@ function renderTableView(overrides?: {
       defaultPageSize={overrides?.defaultPageSize}
       isView={overrides?.isView}
       table={overrides?.table ?? "users"}
+      displayTableName={overrides?.displayTableName}
     />,
   );
 }
@@ -577,6 +608,39 @@ afterEach(() => {
 });
 
 describe("TableView", () => {
+  it("uses the display name throughout loading and committed accessible labels", async () => {
+    renderTableView({
+      table: "__rapidb:all-keys",
+      displayTableName: "All keys",
+    });
+    expect(
+      screen.getByRole("main", { name: "Table data for All keys" }),
+    ).toBeTruthy();
+    act(() =>
+      dispatchIncomingMessage("tableInit", {
+        columns,
+        primaryKeyColumns: ["id"],
+      }),
+    );
+    await waitFor(() =>
+      expect(postedMessagesOfType("fetchPage")).toHaveLength(1),
+    );
+    const fetch = lastFetchPayload();
+    act(() =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: fetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      }),
+    );
+    expect(
+      screen.getByRole("main", { name: "Table data for All keys" }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("main", { name: "Table data for __rapidb:all-keys" }),
+    ).toBeNull();
+  });
+
   it.each([
     ["absent", undefined],
     ["empty", []],
@@ -999,6 +1063,73 @@ describe("TableView", () => {
   }
 
   it.each([
+    ["delimiter collision", ["a", "a|a"], ["a|a", "a"]],
+    ["ordinary reorder", ["a", "b"], ["b", "a"]],
+  ] as const)("resets grid selection and preserves pending edits on %s metadata reorder", async (_label, initialNames, reorderedNames) => {
+    const user = userEvent.setup();
+    const beforeNames: string[] = [...initialNames];
+    const afterNames: string[] = [...reorderedNames];
+    const editColumn = beforeNames[1];
+    const pendingValue = `Pending ${editColumn}`;
+    const columnForName = (name: string): ColumnTypeMeta => ({
+      ...(name === "a" ? columns[0] : columns[1]),
+      name,
+    });
+
+    await initializeCommittedTableData({
+      columnDefs: beforeNames.map(columnForName),
+      primaryKeyColumns: ["a"],
+      dataRows: [{ a: 1, [editColumn]: "Original" }],
+    });
+
+    await user.dblClick(getBodyCell(editColumn));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: pendingValue },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+
+    const selectedCell = getBodyCell(editColumn);
+    fireEvent.mouseDown(selectedCell, { button: 0 });
+    fireEvent.mouseUp(selectedCell);
+    expect(selectedCell.className).toContain("rdb-tcell-anchor");
+    expect(getBodyCell(editColumn).textContent).toContain(pendingValue);
+
+    await act(async () =>
+      dispatchIncomingMessage("tableInit", {
+        intent: "metadataRefresh",
+        columns: afterNames.map(columnForName),
+        primaryKeyColumns: ["a"],
+      }),
+    );
+
+    const visibleColumnNames = Array.from(
+      screen
+        .getByRole("table")
+        .querySelectorAll("thead tr:first-child th[data-column-id]"),
+    )
+      .map((header) => header.getAttribute("data-column-id"))
+      .filter((name): name is string => name !== null && name !== "__sel");
+    expect(visibleColumnNames).toEqual(afterNames);
+    expect(
+      screen.getByRole("table").querySelectorAll(".rdb-tcell-anchor"),
+    ).toHaveLength(0);
+    expect(getBodyCell(editColumn).textContent).toContain(pendingValue);
+    expect(screen.getByRole("button", { name: "Apply Changes" })).toBeTruthy();
+
+    clearPostedMessages();
+    fireEvent.paste(window);
+    expect(postedMessagesOfType("readClipboard")).toHaveLength(0);
+
+    const reorderedEditCell = getBodyCell(editColumn);
+    fireEvent.mouseDown(reorderedEditCell, { button: 0 });
+    fireEvent.mouseUp(reorderedEditCell);
+    expect(reorderedEditCell.className).toContain("rdb-tcell-anchor");
+    expect(reorderedEditCell.getAttribute("data-col")).toBe(
+      String(afterNames.indexOf(editColumn) + 1),
+    );
+  });
+
+  it.each([
     "duplicate",
     "add",
     "header",
@@ -1222,6 +1353,785 @@ describe("TableView", () => {
         expect(getBodyCell("name").textContent).toContain("Draft name");
       }
     }
+  });
+
+  it.each([
+    false,
+    true,
+  ])("reconciles a failed apply only when changes are possible (unknown=%s)", async (outcomeUnknown) => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData();
+    await user.dblClick(getBodyCell("name"));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Pending Alice" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()?.type).toBe("applyChanges");
+
+    await act(async () =>
+      dispatchIncomingMessage("applyResult", {
+        success: false,
+        error: outcomeUnknown
+          ? "Transaction outcome is unknown. Refresh and verify before retrying."
+          : "UPDATE verification requires rollback support on this table.",
+        changesPossible: outcomeUnknown,
+        outcomeUnknown,
+        rowOutcomes: [
+          {
+            rowIndex: 0,
+            success: false,
+            status: "skipped",
+            message: outcomeUnknown ? "Outcome unknown" : "Not executed",
+          },
+        ],
+      }),
+    );
+
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(
+      outcomeUnknown ? 1 : 0,
+    );
+    expect(getBodyCell("name").textContent).toContain("Pending Alice");
+    expect(
+      screen.getByText(
+        outcomeUnknown
+          ? /outcome is unknown/
+          : /verification requires rollback support/,
+      ),
+    ).toBeTruthy();
+  });
+
+  it("reconciles applied and uncertain UPDATE rows independently", async () => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData();
+
+    await user.dblClick(getBodyCell("name", 0));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Pending Alice" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await user.dblClick(getBodyCell("name", 1));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Pending Bob" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    const operationId = (
+      getRawLastPostedMessage()?.payload as { operationId: string }
+    ).operationId;
+    const result = {
+      operationId,
+      success: false,
+      error:
+        "The update partially succeeded. Refresh and verify before retrying.",
+      changesPossible: true,
+      outcomeUnknown: true,
+      rowOutcomes: [
+        { rowIndex: 0, success: true, status: "applied" },
+        { rowIndex: 1, success: false, status: "unknown" },
+      ],
+    };
+    await act(async () => {
+      // A transport retry can duplicate a result already received by the view.
+      dispatchRawIncomingMessage("applyResult", result);
+      dispatchRawIncomingMessage("applyResult", result);
+    });
+
+    await waitFor(() =>
+      expect(postedMessagesOfType("fetchPage")).toHaveLength(1),
+    );
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: [
+          { id: 1, name: "Authoritative Alice" },
+          { id: 2, name: "Bob" },
+        ],
+        totalCount: 2,
+      }),
+    );
+
+    expect(getBodyCell("name", 0).textContent).toContain("Authoritative Alice");
+    expect(getBodyCell("name", 0).textContent).not.toContain("Pending Alice");
+    expect(getBodyCell("name", 1).textContent).toContain("Pending Bob");
+    expect(screen.getByRole("button", { name: "Apply Changes" })).toBeTruthy();
+    expect(screen.getByText(/partially succeeded/)).toBeTruthy();
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    const retry = getRawLastPostedMessage()?.payload as {
+      operationId: string;
+      updates: unknown[];
+    };
+    expect(retry.operationId).not.toBe(operationId);
+    expect(retry.updates).toEqual([
+      {
+        primaryKeys: { id: 2 },
+        changes: { name: "Pending Bob" },
+        originalValues: { name: "Bob" },
+      },
+    ]);
+    await act(async () => dispatchRawIncomingMessage("applyResult", result));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+    expect(screen.getByRole("button", { name: "Applying…" })).toBeTruthy();
+  });
+
+  it("keeps an unknown Redis rename unresolved when another client creates the proposed key after a full snapshot", async () => {
+    const user = userEvent.setup();
+    const stageCell = async (
+      column: string,
+      rowIndex: number,
+      value: string,
+    ) => {
+      await user.dblClick(getBodyCell(column, rowIndex));
+      fireEvent.change(screen.getByLabelText("Cell data"), {
+        target: { value },
+      });
+      await user.click(screen.getByRole("button", { name: "Apply" }));
+    };
+    await initializeCommittedTableData({
+      columnDefs: redisKeyColumns,
+      primaryKeyColumns: ["key"],
+      dataRows: [
+        { key: "users:1", value: "old value" },
+        { key: "users:3", value: "old other" },
+      ],
+    });
+
+    await stageCell("key", 0, "users:2");
+    await stageCell("value", 0, "pending value");
+    await stageCell("value", 1, "pending other");
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()).toMatchObject({ type: "applyChanges" });
+
+    await act(async () =>
+      dispatchIncomingMessage("applyResult", {
+        success: false,
+        error: "Redis update acknowledgement was lost.",
+        changesPossible: true,
+        outcomeUnknown: true,
+        rowOutcomes: [
+          { rowIndex: 0, success: false, status: "unknown" },
+          { rowIndex: 1, success: true, status: "applied" },
+        ],
+      }),
+    );
+
+    await waitFor(() =>
+      expect(postedMessagesOfType("fetchPage")).toHaveLength(1),
+    );
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: [
+          { key: "users:2", value: "concurrent client value" },
+          { key: "users:3", value: "confirmed other" },
+        ],
+        totalCount: 2,
+      }),
+    );
+
+    expect(getBodyCell("key", 0).textContent).toContain("users:2");
+    expect(getBodyCell("value", 0).textContent).toContain(
+      "concurrent client value",
+    );
+    expect(getBodyCell("value", 0).textContent).not.toContain("pending value");
+    expect(getBodyCell("value", 1).textContent).toContain("confirmed other");
+    expect(getBodyCell("value", 1).textContent).not.toContain("pending other");
+    expect(screen.getByRole("alert").textContent).toMatch(/not attached/i);
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply Changes",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: [
+          { key: "users:2", value: "concurrent client value" },
+          { key: "users:3", value: "confirmed other" },
+        ],
+        totalCount: 2,
+      }),
+    );
+    expect(screen.getByRole("alert").textContent).toMatch(/not attached/i);
+    expect(getBodyCell("value", 0).textContent).not.toContain("pending value");
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+  });
+
+  it("keeps unknown apply reconciliation locked after a failed read and restores edits by original identity", async () => {
+    const user = userEvent.setup();
+    const stageCell = async (
+      column: string,
+      rowIndex: number,
+      value: string,
+    ) => {
+      await user.dblClick(getBodyCell(column, rowIndex));
+      fireEvent.change(screen.getByLabelText("Cell data"), {
+        target: { value },
+      });
+      await user.click(screen.getByRole("button", { name: "Apply" }));
+    };
+    await initializeCommittedTableData({
+      columnDefs: redisKeyColumns,
+      primaryKeyColumns: ["key"],
+      dataRows: [
+        { key: "users:1", value: "old value" },
+        { key: "users:3", value: "old other" },
+      ],
+    });
+
+    await stageCell("key", 0, "users:2");
+    await stageCell("value", 0, "pending value");
+    await stageCell("value", 1, "pending other");
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(1);
+
+    await act(async () =>
+      dispatchIncomingMessage("applyResult", {
+        success: false,
+        error: "Redis update acknowledgement was lost.",
+        changesPossible: true,
+        outcomeUnknown: true,
+        rowOutcomes: [
+          { rowIndex: 0, success: false, status: "unknown" },
+          { rowIndex: 1, success: true, status: "applied" },
+        ],
+      }),
+    );
+    await waitFor(() =>
+      expect(postedMessagesOfType("fetchPage")).toHaveLength(1),
+    );
+    const failedFetchId = lastFetchPayload().fetchId;
+    await act(async () =>
+      dispatchIncomingMessage("tableError", {
+        fetchId: failedFetchId,
+        error: "Temporary verification read failure",
+      }),
+    );
+
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply Changes",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    expect(
+      (screen.getByRole("button", { name: "Refresh" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: [
+          { key: "users:1", value: "old value" },
+          { key: "users:3", value: "confirmed other" },
+        ],
+        totalCount: 2,
+      }),
+    );
+
+    expect(getBodyCell("key", 0).textContent).toContain("users:2");
+    expect(getBodyCell("value", 0).textContent).toContain("pending value");
+    expect(getBodyCell("value", 1).textContent).toContain("confirmed other");
+    expect(getBodyCell("value", 1).textContent).not.toContain("pending other");
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply Changes",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "applyChanges",
+      payload: {
+        updates: [
+          {
+            primaryKeys: { key: "users:1" },
+            changes: { key: "users:2", value: "pending value" },
+            originalValues: { key: "users:1", value: "old value" },
+          },
+        ],
+      },
+    });
+  });
+
+  it("does not let Revert All unlock mutations before unknown apply verification", async () => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData();
+    await user.dblClick(getBodyCell("name"));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Pending Alice" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await user.click(screen.getByLabelText("Select row 1"));
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+
+    await act(async () =>
+      dispatchIncomingMessage("applyResult", {
+        success: false,
+        error: "Write outcome is unknown.",
+        changesPossible: true,
+        outcomeUnknown: true,
+        rowOutcomes: [{ rowIndex: 0, success: false, status: "unknown" }],
+      }),
+    );
+    await waitFor(() =>
+      expect(postedMessagesOfType("fetchPage")).toHaveLength(1),
+    );
+    expect(
+      screen
+        .getByRole("button", { name: "Revert All" })
+        .hasAttribute("disabled"),
+    ).toBe(true);
+    await user.click(screen.getByRole("button", { name: "Revert All" }));
+    expect(getBodyCell("name").textContent).toContain("Pending Alice");
+    await act(async () =>
+      dispatchIncomingMessage("tableError", {
+        fetchId: lastFetchPayload().fetchId,
+        error: "Verification read failed",
+      }),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Revert All" }));
+    expect(screen.queryByRole("button", { name: "Apply Changes" })).toBeNull();
+    expect(
+      (screen.getByRole("button", { name: "Add Row" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(
+      screen
+        .getByRole("button", { name: "Delete (1)" })
+        .hasAttribute("disabled"),
+    ).toBe(true);
+    expect(
+      screen.getByText(/first refresh may precede a late write/),
+    ).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    await user.click(screen.getByRole("button", { name: "Delete (1)" }));
+    fireEvent.doubleClick(getBodyCell("name"));
+    expect(screen.queryByLabelText("Cell data")).toBeNull();
+    expect(screen.queryByText(/^DEFAULT$/)).toBeNull();
+    expect(postedMessagesOfType("deleteRows")).toHaveLength(0);
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(1);
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows,
+        totalCount: rows.length,
+      }),
+    );
+    expect(
+      (screen.getByRole("button", { name: "Add Row" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+  });
+
+  it.each([
+    "apply",
+    "delete",
+  ] as const)("ends verified unknown %s recovery on Revert All and guards unrelated edits without losing undo", async (kind) => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData();
+    await user.dblClick(getBodyCell("name"));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Abandoned edit" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    clearPostedMessages();
+    if (kind === "apply") {
+      await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    } else {
+      await user.click(screen.getByLabelText("Select row 2"));
+      await user.click(screen.getByRole("button", { name: "Delete (1)" }));
+    }
+    await act(async () =>
+      dispatchIncomingMessage(
+        kind === "apply" ? "applyResult" : "deleteResult",
+        {
+          success: false,
+          error: "Write acknowledgement lost.",
+          changesPossible: true,
+          outcomeUnknown: true,
+        },
+      ),
+    );
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows,
+        totalCount: rows.length,
+      }),
+    );
+    expect(
+      screen.getByText(/first refresh may precede a late write/),
+    ).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Revert All" }));
+    expect(
+      screen.queryByText(/first refresh may precede a late write/),
+    ).toBeNull();
+    expect(screen.queryByText(/acknowledgement lost/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Apply Changes" })).toBeNull();
+
+    await user.dblClick(getBodyCell("name", 1));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Unrelated edit" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+    expect(postedMessagesOfType("deleteRows")).toHaveLength(0);
+    expect(
+      screen.getByText(/Apply or revert pending changes before loading/),
+    ).toBeTruthy();
+    expect(getBodyCell("name", 1).textContent).toContain("Unrelated edit");
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    expect(getBodyCell("name", 1).textContent).toContain("Bob");
+    expect(screen.queryByText("Unrelated edit")).toBeNull();
+    // Status dismissal works normally after recovery has been abandoned.
+    await user.click(screen.getByTitle("Dismiss"));
+    expect(
+      screen.queryByText(/Apply or revert pending changes before loading/),
+    ).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Redo" }));
+    expect(getBodyCell("name", 1).textContent).toContain("Unrelated edit");
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+  });
+
+  it("preserves unknown DELETE warning through Add Row, dismiss, editors and repeated verification until verified revert", async () => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData();
+    await user.click(screen.getByLabelText("Select row 1"));
+    await user.click(screen.getByRole("button", { name: "Delete (1)" }));
+    await act(async () =>
+      dispatchIncomingMessage("deleteResult", {
+        success: false,
+        error: "Delete acknowledgement lost.",
+        changesPossible: true,
+        outcomeUnknown: true,
+      }),
+    );
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows,
+        totalCount: rows.length,
+      }),
+    );
+    const expectLateWriteWarning = () =>
+      expect(
+        screen.getByText(/first refresh may precede a late write/),
+      ).toBeTruthy();
+    expectLateWriteWarning();
+    await user.click(
+      screen.getByRole("button", { name: "Dismiss mutation error" }),
+    );
+    expectLateWriteWarning();
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    expectLateWriteWarning();
+    fireEvent.doubleClick(getBodyCell("name"));
+    expectLateWriteWarning();
+    fireEvent.change(screen.getByLabelText("Cell value"), {
+      target: { value: "Preserved draft" },
+    });
+    fireEvent.blur(screen.getByLabelText("Cell value"));
+    await user.dblClick(getBodyCell("name", 2));
+    expectLateWriteWarning();
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Pending Bob" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    clearPostedMessages();
+    fireEvent.click(screen.getByText("id", { exact: true }));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+    expectLateWriteWarning();
+    await user.click(
+      screen.getByRole("button", { name: "Dismiss mutation error" }),
+    );
+    expectLateWriteWarning();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    expectLateWriteWarning();
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: [rows[1]],
+        totalCount: 1,
+      }),
+    );
+    expect(getBodyCell("name", 0).textContent).toContain("Preserved draft");
+    expect(getBodyCell("name", 1).textContent).toContain("Pending Bob");
+    expectLateWriteWarning();
+    await user.click(
+      screen.getByRole("button", { name: "Dismiss mutation error" }),
+    );
+    expectLateWriteWarning();
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+    expect(postedMessagesOfType("deleteRows")).toHaveLength(0);
+
+    await user.click(screen.getByRole("button", { name: "Revert All" }));
+    expect(
+      screen.queryByText(/first refresh may precede a late write/),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Dismiss mutation error" }),
+    ).toBeNull();
+    await user.dblClick(getBodyCell("name"));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Unrelated Bob edit" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+    expect(
+      screen.getByText(/Apply or revert pending changes before loading/),
+    ).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    expect(getBodyCell("name").textContent).toContain("Bob");
+    expect(screen.queryByText("Unrelated Bob edit")).toBeNull();
+  });
+
+  it("keeps unknown DELETE warning and write fence when second verification fails and work is reverted", async () => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData();
+    await user.click(screen.getByLabelText("Select row 1"));
+    await user.click(screen.getByRole("button", { name: "Delete (1)" }));
+    await act(async () =>
+      dispatchIncomingMessage("deleteResult", {
+        success: false,
+        error: "Delete acknowledgement lost.",
+        changesPossible: true,
+        outcomeUnknown: true,
+      }),
+    );
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows,
+        totalCount: rows.length,
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await act(async () =>
+      dispatchIncomingMessage("tableError", {
+        fetchId: lastFetchPayload().fetchId,
+        error: "Second verification failed",
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: "Revert All" }));
+    await user.click(
+      screen.getByRole("button", { name: "Dismiss mutation error" }),
+    );
+    expect(
+      screen.getByText(/first refresh may precede a late write/),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Add Row" }).hasAttribute("disabled"),
+    ).toBe(true);
+    expect(screen.queryByText(/^DEFAULT$/)).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(2);
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+    expect(postedMessagesOfType("deleteRows")).toHaveLength(0);
+  });
+
+  it.each([
+    "Add Row",
+    "Dismiss mutation error",
+  ])("clears a known DELETE error normally through %s", async (action) => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData();
+    await user.click(screen.getByLabelText("Select row 1"));
+    await user.click(screen.getByRole("button", { name: "Delete (1)" }));
+    await act(async () =>
+      dispatchIncomingMessage("deleteResult", {
+        success: false,
+        error: "Known delete failure",
+        changesPossible: true,
+        outcomeUnknown: false,
+      }),
+    );
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows,
+        totalCount: rows.length,
+      }),
+    );
+    expect(screen.getByText("Known delete failure")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: action }));
+    expect(screen.queryByText("Known delete failure")).toBeNull();
+    expect(
+      screen.queryByText(/first refresh may precede a late write/),
+    ).toBeNull();
+  });
+
+  it("keeps a colliding unknown key rename explicitly unresolved instead of attaching to the other row", async () => {
+    const user = userEvent.setup();
+    const stageCell = async (
+      column: string,
+      rowIndex: number,
+      value: string,
+    ) => {
+      await user.dblClick(getBodyCell(column, rowIndex));
+      fireEvent.change(screen.getByLabelText("Cell data"), {
+        target: { value },
+      });
+      await user.click(screen.getByRole("button", { name: "Apply" }));
+    };
+    await initializeCommittedTableData({
+      columnDefs: redisKeyColumns,
+      primaryKeyColumns: ["key"],
+      dataRows: [
+        { key: "users:1", value: "source value" },
+        { key: "users:2", value: "existing target value" },
+      ],
+    });
+
+    await stageCell("key", 0, "users:2");
+    await stageCell("value", 0, "must not attach");
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    await act(async () =>
+      dispatchIncomingMessage("applyResult", {
+        success: false,
+        error: "Redis update acknowledgement was lost.",
+        changesPossible: true,
+        outcomeUnknown: true,
+        rowOutcomes: [{ rowIndex: 0, success: false, status: "unknown" }],
+      }),
+    );
+    await waitFor(() =>
+      expect(postedMessagesOfType("fetchPage")).toHaveLength(1),
+    );
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: [{ key: "users:2", value: "existing target value" }],
+        totalCount: 1,
+      }),
+    );
+
+    expect(getBodyCell("value").textContent).toContain("existing target value");
+    expect(getBodyCell("value").textContent).not.toContain("must not attach");
+    expect(screen.getByRole("alert").textContent).toMatch(/not attached/i);
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply Changes",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: [{ key: "users:2", value: "existing target value" }],
+        totalCount: 1,
+      }),
+    );
+    expect(screen.getByRole("alert").textContent).toMatch(/not attached/i);
+
+    await user.click(screen.getByRole("button", { name: "Revert All" }));
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Apply Changes" })).toBeNull();
+  });
+
+  it.each([
+    [
+      "unsafe-target preflight",
+      "INSERT verification requires rollback support.",
+    ],
+    [
+      "verification rollback",
+      "INSERT verification failed; the transaction was not committed.",
+    ],
+  ])("preserves a single insert draft and undo without reconciliation after $0", async (_kind, error) => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData();
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    fireEvent.doubleClick(getBodyCell("name"));
+    fireEvent.change(screen.getByLabelText("Cell value"), {
+      target: { value: "Pending insert" },
+    });
+    fireEvent.blur(screen.getByLabelText("Cell value"));
+    clearPostedMessages();
+
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "applyChanges",
+      payload: {
+        updates: [],
+        insertValues: [{ name: "Pending insert" }],
+      },
+    });
+    await act(async () =>
+      dispatchIncomingMessage("applyResult", {
+        success: false,
+        error,
+        changesPossible: false,
+        outcomeUnknown: false,
+      }),
+    );
+
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+    expect(getBodyCell("name").textContent).toContain("Pending insert");
+    fireEvent.keyDown(document.body, {
+      key: "z",
+      code: "KeyZ",
+      ctrlKey: true,
+      metaKey: true,
+    });
+    expect(getBodyCell("name").textContent).toContain("DEFAULT");
+    fireEvent.keyDown(document.body, {
+      key: "z",
+      code: "KeyZ",
+      ctrlKey: true,
+      metaKey: true,
+      shiftKey: true,
+    });
+    expect(getBodyCell("name").textContent).toContain("Pending insert");
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
   });
 
   it("retains editor-only work while metadata is deferred, then preserves the committed draft", async () => {
@@ -1999,6 +2909,43 @@ describe("TableView", () => {
     });
   }
 
+  it("refreshes after a committed delete whose verification read was not executed", async () => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData();
+    await user.click(screen.getByLabelText("Select row 1"));
+    await user.click(screen.getByRole("button", { name: "Delete (1)" }));
+    const operationId = (
+      getRawLastPostedMessage()?.payload as { operationId: string }
+    ).operationId;
+    clearPostedMessages();
+
+    await act(async () =>
+      dispatchRawIncomingMessage("deleteResult", {
+        operationId,
+        success: false,
+        affectedRows: 1,
+        changesPossible: true,
+        outcomeUnknown: false,
+        error:
+          "Delete committed, but verification failed: 1 row was affected. Refresh and verify before retrying. Verification read was not executed.",
+        rowOutcomes: [
+          {
+            rowIndex: 0,
+            primaryKeys: { id: 1 },
+            status: "unknown",
+            success: false,
+          },
+        ],
+      }),
+    );
+
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    expect(
+      screen.getByText(/Delete committed, but verification failed/),
+    ).toBeTruthy();
+    expect(screen.queryByText(/late write/)).toBeNull();
+  });
+
   it.each([
     "add",
     "header",
@@ -2335,6 +3282,623 @@ describe("TableView", () => {
         }) as HTMLButtonElement
       ).disabled,
     ).toBe(false);
+  });
+
+  async function stageDirtyDeleteWork(dataRows = rows) {
+    const user = userEvent.setup();
+    await initializeCommittedTableData({ dataRows });
+    for (let index = 0; index < dataRows.length; index++) {
+      await user.dblClick(getBodyCell("name", index));
+      fireEvent.change(screen.getByLabelText("Cell data"), {
+        target: { value: `Pending ${dataRows[index].name}` },
+      });
+      await user.click(screen.getByRole("button", { name: "Apply" }));
+    }
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    fireEvent.doubleClick(getBodyCell("name"));
+    fireEvent.change(screen.getByLabelText("Cell value"), {
+      target: { value: "Delete survivor draft" },
+    });
+    fireEvent.blur(screen.getByLabelText("Cell value"));
+    return user;
+  }
+
+  it.each([
+    false,
+    true,
+  ])("removes confirmed dirty delete work from both history stacks, keeps B and drafts (stale read=%s)", async (staleRead) => {
+    const user = await stageDirtyDeleteWork();
+    // The redo stack also contains A's edit and must be pruned, not cleared.
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    await user.click(screen.getByLabelText("Select row 1"));
+    await user.click(screen.getByRole("button", { name: "Delete (1)" }));
+    const operationId = (
+      getRawLastPostedMessage()?.payload as { operationId: string }
+    ).operationId;
+    clearPostedMessages();
+    const result = {
+      operationId,
+      success: true,
+      affectedRows: 1,
+      changesPossible: true,
+      outcomeUnknown: false,
+      rowOutcomes: [
+        {
+          rowIndex: 0,
+          primaryKeys: { id: 1 },
+          status: "deleted",
+          success: true,
+        },
+      ],
+    };
+    await act(async () => dispatchRawIncomingMessage("deleteResult", result));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    await act(async () => {
+      dispatchRawIncomingMessage("deleteResult", result); // Delivery retry is stale.
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: staleRead ? [rows[1], rows[0]] : [rows[1]],
+        totalCount: staleRead ? 2 : 1,
+      });
+    });
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    expect(screen.queryByText(/Unable to match/)).toBeNull();
+    expect(getBodyCell("name", 1).textContent).toContain("Pending Bob");
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply Changes",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
+    // Traverse all preserved past/future snapshots. A must never reappear as
+    // an edit, even if the verification read still shows its old identity.
+    for (let index = 0; index < 4; index++) {
+      const undo = screen.queryByRole("button", {
+        name: "Undo",
+      }) as HTMLButtonElement | null;
+      if (!undo || undo.disabled) break;
+      await user.click(undo);
+      expect(screen.queryByText("Pending Alice")).toBeNull();
+    }
+    for (let index = 0; index < 4; index++) {
+      const redo = screen.queryByRole("button", {
+        name: "Redo",
+      }) as HTMLButtonElement | null;
+      if (!redo || redo.disabled) break;
+      await user.click(redo);
+      expect(screen.queryByText("Pending Alice")).toBeNull();
+    }
+    expect(getBodyCell("name").textContent).toContain("Delete survivor draft");
+    expect(getBodyCell("name", 1).textContent).toContain("Pending Bob");
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getRawLastPostedMessage()).toMatchObject({
+      type: "applyChanges",
+      payload: {
+        updates: [
+          {
+            primaryKeys: { id: 2 },
+            changes: { name: "Pending Bob" },
+            originalValues: { name: "Bob" },
+          },
+        ],
+        insertValues: [{ name: "Delete survivor draft" }],
+      },
+    });
+  });
+
+  it.each([
+    { stack: "past", outcomeUnknown: true },
+    { stack: "future", outcomeUnknown: true },
+    { stack: "past", outcomeUnknown: false },
+  ] as const)("preserves $stack delete history through missing and duplicate original identities until reordered recovery (unknown=$outcomeUnknown)", async ({
+    stack,
+    outcomeUnknown,
+  }) => {
+    const user = userEvent.setup();
+    const carol = { id: 3, name: "Carol" };
+    await initializeCommittedTableData({ dataRows: [...rows, carol] });
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    fireEvent.doubleClick(getBodyCell("name"));
+    fireEvent.change(screen.getByLabelText("Cell value"), {
+      target: { value: "History survivor draft" },
+    });
+    fireEvent.blur(screen.getByLabelText("Cell value"));
+    const edit = async (column: string, index: number, value: string) => {
+      await user.dblClick(getBodyCell(column, index));
+      const modal = screen.queryByLabelText("Cell data");
+      const input = modal ?? screen.getByLabelText("Cell value");
+      fireEvent.change(input, {
+        target: { value },
+      });
+      if (modal) {
+        await user.click(screen.getByRole("button", { name: "Apply" }));
+      } else {
+        fireEvent.blur(input);
+      }
+    };
+    await edit("name", 1, "Deleted Alice edit");
+    // Proposed PK collides with Carol, but only original id=2 identifies B.
+    await edit("id", 2, "3");
+    await edit("name", 2, "First Bob edit");
+    await edit("name", 2, "Second Bob edit");
+    if (stack === "future") {
+      await user.click(screen.getByRole("button", { name: "Undo" }));
+    }
+    const currentEdit = stack === "past" ? "Second Bob edit" : "First Bob edit";
+    await user.click(screen.getByLabelText("Select row 1"));
+    await user.click(screen.getByLabelText("Select row 2"));
+    await user.click(screen.getByRole("button", { name: "Delete (2)" }));
+    const operationId = (
+      getRawLastPostedMessage()?.payload as { operationId: string }
+    ).operationId;
+    clearPostedMessages();
+    const result = {
+      operationId,
+      success: false,
+      affectedRows: 1,
+      changesPossible: true,
+      outcomeUnknown,
+      rowOutcomes: [
+        {
+          rowIndex: 0,
+          primaryKeys: { id: 1 },
+          status: "deleted",
+          success: true,
+        },
+        {
+          rowIndex: 1,
+          primaryKeys: { id: 2 },
+          status: "unknown",
+          success: false,
+        },
+      ],
+    };
+    await act(async () => dispatchRawIncomingMessage("deleteResult", result));
+    const read = async (dataRows: typeof rows) => {
+      await act(async () =>
+        dispatchIncomingMessage("tableData", {
+          fetchId: lastFetchPayload().fetchId,
+          rows: dataRows,
+          totalCount: dataRows.length,
+        }),
+      );
+    };
+    await read([carol, rows[0]]); // Missing B, stale A, and occupied proposed PK.
+    expect(screen.getByText(/Unable to match 1 row/)).toBeTruthy();
+    expect(getBodyCell("name", 1).textContent).toBe("Carol");
+    expect(getBodyCell("name", 2).textContent).toBe("Alice");
+    expect(getBodyCell("name").textContent).toContain("History survivor draft");
+    if (outcomeUnknown) {
+      expect(
+        screen.getByText(/first refresh may precede a late write/),
+      ).toBeTruthy();
+    }
+    // Neither buttons nor keyboard may consume either stack while unresolved.
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    await user.click(screen.getByRole("button", { name: "Redo" }));
+    fireEvent.keyDown(document.body, {
+      code: "KeyZ",
+      key: "z",
+      ctrlKey: true,
+      metaKey: true,
+    });
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await read([
+      rows[1],
+      carol,
+      { ...rows[1], name: "Duplicate Bob" },
+      rows[0],
+    ]);
+    expect(screen.getByText(/Unable to match 1 row/)).toBeTruthy();
+    expect(screen.queryByText(currentEdit)).toBeNull();
+    expect(screen.queryByText("Deleted Alice edit")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await read([carol, rows[0], rows[1]]); // B returns uniquely at a different index.
+    expect(screen.queryByText(/Unable to match/)).toBeNull();
+    expect(getBodyCell("name", 3).textContent).toBe(currentEdit);
+    const assertSurvivors = () => {
+      expect(getBodyCell("name", 1).textContent).toBe("Carol");
+      expect(getBodyCell("name", 2).textContent).toBe("Alice");
+      expect(getBodyCell("name").textContent).toContain(
+        "History survivor draft",
+      );
+      expect(screen.queryByText("Deleted Alice edit")).toBeNull();
+    };
+    assertSurvivors();
+    if (stack === "past") {
+      await user.click(screen.getByRole("button", { name: "Undo" }));
+      expect(getBodyCell("name", 3).textContent).toBe("First Bob edit");
+      assertSurvivors();
+      await user.click(screen.getByRole("button", { name: "Redo" }));
+    } else {
+      await user.click(screen.getByRole("button", { name: "Redo" }));
+      expect(getBodyCell("name", 3).textContent).toBe("Second Bob edit");
+      assertSurvivors();
+      await user.click(screen.getByRole("button", { name: "Undo" }));
+    }
+    expect(getBodyCell("name", 3).textContent).toBe(currentEdit);
+    assertSurvivors();
+    if (outcomeUnknown) {
+      expect(
+        screen.getByText(/first refresh may precede a late write/),
+      ).toBeTruthy();
+    }
+    const fetchCount = postedMessagesOfType("fetchPage").length;
+    await act(async () => dispatchRawIncomingMessage("deleteResult", result));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(fetchCount);
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getRawLastPostedMessage()).toMatchObject({
+      type: "applyChanges",
+      payload: {
+        updates: [
+          {
+            primaryKeys: { id: 2 },
+            changes: { id: "3", name: currentEdit },
+            originalValues: { id: 2, name: "Bob" },
+          },
+        ],
+        insertValues: [{ name: "History survivor draft" }],
+      },
+    });
+  });
+
+  it.each([
+    false,
+    true,
+  ])("clears unresolved DELETE history during partial APPLY recovery without resurrecting confirmed inserts (unknown=%s)", async (outcomeUnknown) => {
+    const user = userEvent.setup();
+    const carol = { id: 3, name: "Carol" };
+    await initializeCommittedTableData({ dataRows: [...rows, carol] });
+    const editName = async (index: number, value: string) => {
+      await user.dblClick(getBodyCell("name", index));
+      fireEvent.change(screen.getByLabelText("Cell data"), {
+        target: { value },
+      });
+      await user.click(screen.getByRole("button", { name: "Apply" }));
+    };
+    await editName(1, "Historical Bob edit");
+    await editName(1, "Bob"); // Only history now contains a B edit.
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    fireEvent.doubleClick(getBodyCell("name"));
+    fireEvent.change(screen.getByLabelText("Cell value"), {
+      target: { value: "Confirmed draft" },
+    });
+    fireEvent.blur(screen.getByLabelText("Cell value"));
+    await editName(3, "Pending Carol");
+    await user.click(screen.getByLabelText("Select row 1"));
+    await user.click(screen.getByRole("button", { name: "Delete (1)" }));
+    await act(async () =>
+      dispatchIncomingMessage("deleteResult", {
+        success: true,
+        affectedRows: 1,
+        changesPossible: true,
+        outcomeUnknown: false,
+        rowOutcomes: [
+          {
+            rowIndex: 0,
+            primaryKeys: { id: 1 },
+            status: "deleted",
+            success: true,
+          },
+        ],
+      }),
+    );
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: [carol], // Current C resolves; historical B does not.
+        totalCount: 1,
+      }),
+    );
+    expect(screen.queryByText(/Unable to match/)).toBeNull();
+    expect(getBodyCell("name").textContent).toContain("Confirmed draft");
+    expect(getBodyCell("name", 1).textContent).toContain("Pending Carol");
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "applyChanges",
+      payload: {
+        updates: [
+          { primaryKeys: { id: 3 }, changes: { name: "Pending Carol" } },
+        ],
+        insertValues: [{ name: "Confirmed draft" }],
+      },
+    });
+    const operationId = (
+      getRawLastPostedMessage()?.payload as { operationId: string }
+    ).operationId;
+    const result = {
+      operationId,
+      success: false,
+      error: "C update was not applied",
+      insertApplied: true,
+      changesPossible: true,
+      outcomeUnknown,
+      rowOutcomes: [{ rowIndex: 0, status: "not_applied", success: false }],
+    };
+    await act(async () => dispatchRawIncomingMessage("applyResult", result));
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: [rows[1], carol, { id: 4, name: "Confirmed draft" }],
+        totalCount: 3,
+      }),
+    );
+    const fetchCount = postedMessagesOfType("fetchPage").length;
+    await act(async () => dispatchRawIncomingMessage("applyResult", result));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(fetchCount);
+    fireEvent.keyDown(document.body, {
+      code: "KeyZ",
+      key: "z",
+      ctrlKey: true,
+      metaKey: true,
+    });
+    expect(getBodyCell("name").dataset.row).toBe("0");
+    expect(getBodyCell("name", 1).textContent).toBe("Pending Carol");
+    expect(screen.getAllByText("Confirmed draft")).toHaveLength(1);
+    fireEvent.keyDown(document.body, {
+      code: "KeyZ",
+      key: "z",
+      ctrlKey: true,
+      metaKey: true,
+      shiftKey: true,
+    });
+    expect(getBodyCell("name").dataset.row).toBe("0"); // No draft resurrection.
+    expect(getBodyCell("name").textContent).toBe("Bob");
+    expect(getBodyCell("name", 1).textContent).toBe("Pending Carol");
+    expect(screen.getAllByText("Confirmed draft")).toHaveLength(1);
+    if (outcomeUnknown) {
+      expect(
+        screen.getByText(/first refresh may precede a late write/),
+      ).toBeTruthy();
+    }
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    const retry = getRawLastPostedMessage();
+    expect(retry).toMatchObject({
+      type: "applyChanges",
+      payload: {
+        updates: [
+          {
+            primaryKeys: { id: 3 },
+            changes: { name: "Pending Carol" },
+            originalValues: { name: "Carol" },
+          },
+        ],
+      },
+    });
+    expect(retry?.payload).not.toHaveProperty("insertValues");
+  });
+
+  it.each([
+    "unknown",
+    "missing",
+    "notfound",
+    "failed",
+    "skipped",
+  ] as const)("retains %s delete work and drafts while dropping only confirmed identities", async (status) => {
+    const dataRows = [...rows, { id: 3, name: "Carol" }];
+    const user = await stageDirtyDeleteWork(dataRows);
+    // Request order differs from page order: rowIndex 1 is Alice, not Bob.
+    await user.click(screen.getByLabelText("Select row 2"));
+    await user.click(screen.getByLabelText("Select row 1"));
+    await user.click(screen.getByLabelText("Select row 3"));
+    await user.click(screen.getByRole("button", { name: "Delete (3)" }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "deleteRows",
+      payload: { primaryKeysList: [{ id: 2 }, { id: 1 }, { id: 3 }] },
+    });
+    await act(async () =>
+      dispatchIncomingMessage("deleteResult", {
+        success: false,
+        affectedRows: 1,
+        changesPossible: true,
+        outcomeUnknown: true,
+        rowOutcomes: [
+          {
+            rowIndex: 1,
+            primaryKeys: { id: 1 },
+            status: "deleted",
+            success: true,
+          },
+          ...(status === "missing"
+            ? []
+            : [
+                { rowIndex: 0, primaryKeys: { id: 2 }, status, success: false },
+              ]),
+          // Carol has no outcome and must also survive.
+        ],
+      }),
+    );
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: [dataRows[2]], // Bob remains unresolved, not discarded.
+        totalCount: 1,
+      }),
+    );
+    expect(getBodyCell("name").textContent).toContain("Delete survivor draft");
+    expect(getBodyCell("name", 1).textContent).toContain("Pending Carol");
+    expect(
+      screen.getByText(/Unable to match 1 row of unverified changes/),
+    ).toBeTruthy();
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply Changes",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: [dataRows[2], dataRows[1]],
+        totalCount: 2,
+      }),
+    );
+    expect(getBodyCell("name", 2).textContent).toContain("Pending Bob");
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getRawLastPostedMessage()).toMatchObject({
+      type: "applyChanges",
+      payload: {
+        updates: [
+          { primaryKeys: { id: 3 }, changes: { name: "Pending Carol" } },
+          { primaryKeys: { id: 2 }, changes: { name: "Pending Bob" } },
+        ],
+        insertValues: [{ name: "Delete survivor draft" }],
+      },
+    });
+  });
+
+  it.each([
+    false,
+    true,
+  ])("uses the delete request identity snapshot after live rows and selection change (target missing=%s)", (targetMissing) => {
+    const rowsRef = { current: [...rows] };
+    const fetchPage = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ selected }) =>
+        useTableMutationController({
+          canEditRows: true,
+          loadingRef: { current: false },
+          columnsRef: { current: columns },
+          fetchPageRef: { current: fetchPage },
+          pkColsRef: { current: ["id"] },
+          preserveScrollPositionRef: { current: vi.fn() },
+          rowsRef,
+          mongoIdTypesRef: { current: [] },
+          selected,
+        }),
+      { initialProps: { selected: new Set([0]) } },
+    );
+    act(() =>
+      result.current.commitCellEdit(0, columns[1], "Pending Alice", "Alice"),
+    );
+    act(() =>
+      result.current.commitCellEdit(1, columns[1], "Pending Bob", "Bob"),
+    );
+    // A proposed/colliding PK must not make Bob the confirmed delete target.
+    act(() => result.current.commitCellEdit(0, columns[0], "2", 1));
+    act(() => result.current.deleteSelected());
+    const operationId = (
+      getRawLastPostedMessage()?.payload as { operationId: string }
+    ).operationId;
+    act(() => {
+      const nextRows = targetMissing ? [rows[1]] : [rows[1], rows[0]];
+      result.current.handleRowsCommitted(nextRows, ["id"], [], []);
+      rowsRef.current = nextRows;
+    });
+    rerender({ selected: new Set([0]) }); // Both index 0 and selection now mean Bob.
+    expect(result.current.unresolvedPendingEdits).toHaveLength(
+      targetMissing ? 1 : 0,
+    );
+    act(() =>
+      dispatchRawIncomingMessage("deleteResult", {
+        operationId,
+        success: true,
+        affectedRows: 1,
+        changesPossible: true,
+        outcomeUnknown: false,
+        rowOutcomes: [
+          {
+            rowIndex: 0,
+            primaryKeys: { id: 1 },
+            status: "deleted",
+            success: true,
+          },
+        ],
+      }),
+    );
+    expect(result.current.pendingEdits).toEqual(
+      new Map([[0, new Map([["name", "Pending Bob"]])]]),
+    );
+    expect(fetchPage).toHaveBeenCalledTimes(1);
+    act(() => result.current.handleRowsCommitted([rows[1]], ["id"], [], []));
+    expect(result.current.unresolvedPendingEdits).toEqual([]);
+    expect(result.current.pendingEdits.get(0)?.get("name")).toBe("Pending Bob");
+  });
+
+  it("prunes only the confirmed Mongo identity when ObjectId and string display values coincide", () => {
+    const id = "507f1f77bcf86cd799439011";
+    const rowsRef = {
+      current: [
+        { _id: id, name: "ObjectId row" },
+        { _id: id, name: "String row" },
+      ],
+    };
+    const mongoIdTypesRef = {
+      current: ["objectId", "string"] as Array<"objectId" | "string" | null>,
+    };
+    const { result } = renderHook(() =>
+      useTableMutationController({
+        mongoRowIdentity: true,
+        canEditRows: true,
+        loadingRef: { current: false },
+        columnsRef: { current: columns },
+        fetchPageRef: { current: vi.fn() },
+        pkColsRef: { current: ["_id"] },
+        preserveScrollPositionRef: { current: vi.fn() },
+        rowsRef,
+        mongoIdTypesRef,
+        selected: new Set([0]),
+      }),
+    );
+    act(() =>
+      result.current.commitCellEdit(
+        0,
+        columns[1],
+        "Deleted edit",
+        "ObjectId row",
+      ),
+    );
+    act(() =>
+      result.current.commitCellEdit(1, columns[1], "Kept edit", "String row"),
+    );
+    act(() => result.current.deleteSelected());
+    act(() =>
+      dispatchIncomingMessage("deleteResult", {
+        success: true,
+        affectedRows: 1,
+        changesPossible: true,
+        outcomeUnknown: false,
+        rowOutcomes: [
+          {
+            rowIndex: 0,
+            primaryKeys: {
+              _id: { $rapidbMongoId: { type: "objectId", value: id } },
+            },
+            status: "deleted",
+            success: true,
+          },
+        ],
+      }),
+    );
+    expect(result.current.pendingEdits).toEqual(
+      new Map([[1, new Map([["name", "Kept edit"]])]]),
+    );
+    act(() => {
+      result.current.handleRowsCommitted(
+        [rowsRef.current[1]],
+        ["_id"],
+        mongoIdTypesRef.current,
+        ["string"],
+      );
+      rowsRef.current = [rowsRef.current[1]];
+      mongoIdTypesRef.current = ["string"];
+    });
+    expect(result.current.unresolvedPendingEdits).toEqual([]);
+    act(() => result.current.undoAction());
+    expect(result.current.pendingEdits.size).toBe(0);
+    act(() => result.current.redoAction());
+    expect(result.current.pendingEdits).toEqual(
+      new Map([[0, new Map([["name", "Kept edit"]])]]),
+    );
   });
 
   it.each([
@@ -4137,6 +5701,412 @@ describe("TableView", () => {
     expect((editInput as HTMLInputElement).readOnly).toBe(true);
   });
 
+  it("keeps generated columns read-only in persisted rows and insert drafts", async () => {
+    const user = userEvent.setup();
+    renderTableView();
+    const generatedColumns: ColumnTypeMeta[] = [
+      ...noPkColumns,
+      {
+        name: "name_lower",
+        type: "TEXT",
+        nativeType: "TEXT",
+        nullable: true,
+        isPrimaryKey: false,
+        isForeignKey: false,
+        isComputed: true,
+        generatedKind: "stored",
+        computedExpression: "lower(name)",
+        category: "text",
+        filterable: true,
+        filterOperators: ["eq", "like"],
+        valueSemantics: "plain",
+      },
+    ];
+    dispatchIncomingMessage("tableInit", {
+      columns: generatedColumns,
+      primaryKeyColumns: [],
+    });
+
+    await waitFor(() => {
+      expect(getLastPostedMessage()).toEqual({
+        type: "fetchPage",
+        payload: expect.objectContaining({ page: 1, pageSize: 25 }),
+      });
+    });
+    const initialFetch = lastFetchPayload();
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: initialFetch.fetchId,
+        rows: [{ code: "A-1", name: "Alice", name_lower: "alice" }],
+        totalCount: 1,
+      }),
+    );
+
+    fireEvent.doubleClick(getBodyCell("name_lower"));
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).readOnly,
+    ).toBe(true);
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).value,
+    ).toBe("alice");
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    expect(getBodyCell("name_lower", 0).textContent).toContain("DEFAULT");
+    fireEvent.doubleClick(getBodyCell("name_lower", 0));
+    expect(screen.queryByLabelText("Cell data")).toBeNull();
+  });
+
+  describe("R8 generated full-value inspection", () => {
+    const longText = `${"Résumé 😀\ncomputed text\t".repeat(160)}END of generated text`;
+    const rawJson = `{"counter":9007199254740993,"text":${JSON.stringify(longText)}}`;
+    const formattedJson = `{\n  "counter": 9007199254740993,\n  "text": ${JSON.stringify(longText)}\n}`;
+    const generatedColumns: ColumnTypeMeta[] = [
+      ...columns,
+      {
+        ...structuredColumns[1],
+        name: "computed_json",
+        isComputed: true,
+        computedExpression: "json_object('text', name)",
+      },
+      {
+        ...columns[1],
+        name: "generated_text",
+        nullable: true,
+        generatedKind: "stored",
+      },
+    ];
+    const dataRows = [
+      {
+        id: 1,
+        name: "Alice",
+        computed_json: rawJson,
+        generated_text: longText,
+      },
+    ];
+    const cases = [
+      { column: "computed_json", language: "json", value: formattedJson },
+      { column: "generated_text", language: "plaintext", value: longText },
+    ];
+
+    for (const mode of [
+      "writable",
+      "readonly-view",
+      "readonly-connection",
+      "no-pk",
+    ]) {
+      for (const gesture of ["doubleClick", "F2"]) {
+        it.each(
+          cases,
+        )(`opens full $column read-only via ${gesture} in ${mode}`, async ({
+          column,
+          language,
+          value,
+        }) => {
+          const user = userEvent.setup();
+          await initializeCommittedTableData({
+            columnDefs: generatedColumns,
+            primaryKeyColumns: mode === "no-pk" ? [] : ["id"],
+            dataRows,
+            renderOverrides: {
+              isView: mode === "readonly-view",
+              connectionReadOnly: mode === "readonly-connection",
+            },
+          });
+          const cell = getBodyCell(column);
+          expect(cell.textContent?.length).toBeLessThanOrEqual(
+            CELL_PREVIEW_LIMIT,
+          );
+          expect(cell.textContent).not.toContain("END of generated text");
+          clearPostedMessages();
+          if (gesture === "F2") {
+            await user.click(cell);
+            await user.keyboard("{F2}");
+          } else {
+            await user.dblClick(cell);
+          }
+
+          const dialog = screen.getByRole("dialog", {
+            name: `Cell data: ${column}`,
+          });
+          const editor = within(dialog).getByLabelText(
+            "Cell data",
+          ) as HTMLTextAreaElement;
+          expect(editor.readOnly).toBe(true);
+          expect(editor.value).toBe(value);
+          expect(
+            within(dialog).getByTestId("monaco-language").textContent,
+          ).toBe(language);
+          expect(
+            within(dialog).queryByRole("button", { name: "NULL" }),
+          ).toBeNull();
+          expect(
+            within(dialog).queryByRole("button", { name: "DEF" }),
+          ).toBeNull();
+          expect(screen.queryByLabelText("Cell value")).toBeNull();
+          // Even an unexpected editor callback cannot stage a generated edit.
+          fireEvent.change(editor, { target: { value: "forbidden mutation" } });
+          await user.click(
+            within(dialog).getByRole("button", { name: "Apply" }),
+          );
+          expect(screen.queryByRole("dialog")).toBeNull();
+          expect(
+            screen.queryByRole("button", { name: "Apply Changes" }),
+          ).toBeNull();
+          expect(screen.queryByText(/unsaved changes/)).toBeNull();
+          expect(getPostedMessages()).toEqual([]);
+
+          await user.dblClick(getBodyCell(column));
+          expect(
+            (screen.getByLabelText("Cell data") as HTMLTextAreaElement).value,
+          ).toBe(value);
+          await user.click(
+            screen.getByRole("button", { name: "Close cell data" }),
+          );
+          expect(getPostedMessages()).toEqual([]);
+
+          await user.click(getBodyCell(column));
+          fireEvent.paste(window);
+          if (mode === "writable") {
+            const request = getLastPostedMessage();
+            expect(request?.type).toBe("readClipboard");
+            await act(async () =>
+              dispatchIncomingMessage("clipboardText", {
+                ...(request?.payload as object),
+                text: "forbidden mutation",
+              }),
+            );
+            expect(screen.getByText(/Paste failed/)).toBeTruthy();
+          } else {
+            expect(getPostedMessages()).toEqual([]);
+          }
+          expect(
+            screen.queryByRole("button", { name: "Apply Changes" }),
+          ).toBeNull();
+          expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+          expect(postedMessagesOfType("insertRow")).toHaveLength(0);
+          expect(postedMessagesOfType("deleteRows")).toHaveLength(0);
+        });
+      }
+    }
+
+    it.each(
+      cases,
+    )("blocks $column draft opening and paste, while inspection never enters the insert payload", async ({
+      column,
+    }) => {
+      const user = userEvent.setup();
+      await initializeCommittedTableData({
+        columnDefs: generatedColumns,
+        dataRows,
+      });
+      await user.dblClick(getBodyCell(column));
+      await user.click(screen.getByRole("button", { name: "Apply" }));
+      await user.click(screen.getByRole("button", { name: "Add Row" }));
+      const cell = getBodyCell(column);
+      expect(Number(cell.dataset.row)).toBeLessThan(0);
+      expect(cell.textContent).toBe("DEFAULT");
+      await user.dblClick(cell);
+      await user.click(cell);
+      await user.keyboard("{F2}");
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(screen.queryByLabelText("Cell value")).toBeNull();
+
+      clearPostedMessages();
+      fireEvent.paste(window);
+      const request = getLastPostedMessage();
+      expect(request?.type).toBe("readClipboard");
+      await act(async () =>
+        dispatchIncomingMessage("clipboardText", {
+          ...(request?.payload as object),
+          text: "forbidden mutation",
+        }),
+      );
+      expect(screen.getByText(/Paste failed/)).toBeTruthy();
+      expect(getBodyCell(column).textContent).toBe("DEFAULT");
+      expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+      await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+      expect(getLastPostedMessage()).toMatchObject({
+        type: "applyChanges",
+        payload: { updates: [], insertValues: [{}] },
+      });
+    });
+
+    it.each([
+      false,
+      true,
+    ])("keeps scalar generated inspection read-only (readonly connection: %s)", async (connectionReadOnly) => {
+      const user = userEvent.setup();
+      await initializeCommittedTableData({
+        columnDefs: [
+          ...columns,
+          {
+            ...columns[0],
+            name: "computed_number",
+            isPrimaryKey: false,
+            isComputed: true,
+            nullable: true,
+          },
+        ],
+        dataRows: [{ id: 1, name: "Alice", computed_number: 1234 }],
+        renderOverrides: { connectionReadOnly },
+      });
+      clearPostedMessages();
+      await user.dblClick(getBodyCell("computed_number"));
+      const editor = screen.getByLabelText("Cell value") as HTMLInputElement;
+      expect(editor.readOnly).toBe(true);
+      expect(editor.value).toBe("1234");
+      expect(screen.queryByRole("button", { name: "NULL" })).toBeNull();
+      fireEvent.change(editor, { target: { value: "9999" } });
+      await user.keyboard("{Enter}");
+      expect(getBodyCell("computed_number").textContent).toBe("1234");
+      expect(
+        screen.queryByRole("button", { name: "Apply Changes" }),
+      ).toBeNull();
+      expect(getPostedMessages()).toEqual([]);
+    });
+  });
+
+  it("keeps explicitly supplied identity values pasteable into insert drafts", async () => {
+    const user = userEvent.setup();
+    const identityColumns = columns.map((column) =>
+      column.name === "id"
+        ? { ...column, identityGeneration: "by_default" as const }
+        : column,
+    );
+    await initializeCommittedTableData({ columnDefs: identityColumns });
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+
+    const cell = getBodyCell("id");
+    fireEvent.mouseDown(cell, { button: 0 });
+    fireEvent.mouseUp(cell);
+    clearPostedMessages();
+    fireEvent.paste(window);
+    const request = getLastPostedMessage();
+    await act(async () =>
+      dispatchIncomingMessage("clipboardText", {
+        ...(request?.payload as object),
+        text: "17",
+      }),
+    );
+
+    expect(screen.queryByText(/Paste failed/)).toBeNull();
+    expect(getBodyCell("id").textContent).toContain("17");
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "applyChanges",
+      payload: { insertValues: [{ id: "17" }] },
+    });
+  });
+
+  it.each([
+    "persisted",
+    "draft",
+  ] as const)("rejects paste into a virtual generated column in %s rows without staging it", async (rowKind) => {
+    const user = userEvent.setup();
+    const generatedColumn: ColumnTypeMeta = {
+      name: "name_lower",
+      type: "TEXT",
+      nativeType: "TEXT",
+      nullable: true,
+      isPrimaryKey: false,
+      isForeignKey: false,
+      isComputed: true,
+      computedExpression: "lower(name)",
+      generatedKind: "virtual",
+      isPersisted: false,
+      category: "text",
+      filterable: true,
+      filterOperators: ["eq", "like"],
+      valueSemantics: "plain",
+    };
+    await initializeCommittedTableData({
+      columnDefs: [...columns, generatedColumn],
+      dataRows: [{ id: 1, name: "Alice", name_lower: "alice" }],
+    });
+    if (rowKind === "draft") {
+      await user.click(screen.getByRole("button", { name: "Add Row" }));
+    }
+
+    const cell = getBodyCell("name_lower");
+    fireEvent.mouseDown(cell, { button: 0 });
+    fireEvent.mouseUp(cell);
+    clearPostedMessages();
+    fireEvent.paste(window);
+    const request = getLastPostedMessage();
+    expect(request?.type).toBe("readClipboard");
+
+    await act(async () =>
+      dispatchIncomingMessage("clipboardText", {
+        ...(request?.payload as object),
+        text: "overwritten",
+      }),
+    );
+
+    expect(screen.getByText(/Paste failed/)).toBeTruthy();
+    expect(getBodyCell("name_lower").textContent).toContain(
+      rowKind === "draft" ? "DEFAULT" : "alice",
+    );
+    if (rowKind === "persisted") {
+      expect(
+        screen.queryByRole("button", { name: "Apply Changes" }),
+      ).toBeNull();
+    } else {
+      await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+      expect(getLastPostedMessage()).toMatchObject({
+        type: "applyChanges",
+        payload: { insertValues: [{}] },
+      });
+    }
+  });
+
+  it("continues to stage ordinary editable paste alongside generated columns", async () => {
+    const user = userEvent.setup();
+    const generatedColumn: ColumnTypeMeta = {
+      name: "name_lower",
+      type: "TEXT",
+      nativeType: "TEXT",
+      nullable: true,
+      isPrimaryKey: false,
+      isForeignKey: false,
+      isComputed: true,
+      computedExpression: "lower(name)",
+      generatedKind: "virtual",
+      isPersisted: false,
+      category: "text",
+      filterable: true,
+      filterOperators: ["eq", "like"],
+      valueSemantics: "plain",
+    };
+    await initializeCommittedTableData({
+      columnDefs: [...columns, generatedColumn],
+      dataRows: [{ id: 1, name: "Alice", name_lower: "alice" }],
+    });
+
+    const cell = getBodyCell("name");
+    fireEvent.mouseDown(cell, { button: 0 });
+    fireEvent.mouseUp(cell);
+    clearPostedMessages();
+    fireEvent.paste(window);
+    const request = getLastPostedMessage();
+    await act(async () =>
+      dispatchIncomingMessage("clipboardText", {
+        ...(request?.payload as object),
+        text: "Pasted",
+      }),
+    );
+
+    expect(screen.queryByText(/Paste failed/)).toBeNull();
+    expect(getBodyCell("name").textContent).toContain("Pasted");
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "applyChanges",
+      payload: {
+        updates: [{ primaryKeys: { id: 1 }, changes: { name: "Pasted" } }],
+      },
+    });
+  });
+
   it("uses view-style readonly behavior for readonly connections", async () => {
     renderTableView({ connectionReadOnly: true });
 
@@ -5402,32 +7372,38 @@ describe("TableView", () => {
     });
     const request = getLastPostedMessage();
     const error = 'Column "name" cannot persist the requested value exactly.';
+    const operationId = (
+      getRawLastPostedMessage()?.payload as { operationId: string }
+    ).operationId;
+    const result = {
+      operationId,
+      success: false,
+      error,
+      insertApplied: false,
+      rowOutcomes: [
+        {
+          rowIndex: 0,
+          success: false,
+          status: failedKind === "update" ? "prevalidation_failed" : "skipped",
+          columns: failedKind === "update" ? ["name"] : undefined,
+          message: error,
+        },
+      ],
+      insertRowOutcomes: [
+        {
+          rowIndex: 0,
+          success: false,
+          status: failedKind === "insert" ? "prevalidation_failed" : "skipped",
+          message: error,
+        },
+      ],
+    };
     await act(async () => {
-      dispatchIncomingMessage("applyResult", {
-        success: false,
-        error,
-        insertApplied: false,
-        rowOutcomes: [
-          {
-            rowIndex: 0,
-            success: false,
-            status:
-              failedKind === "update" ? "prevalidation_failed" : "skipped",
-            columns: failedKind === "update" ? ["name"] : undefined,
-            message: error,
-          },
-        ],
-        insertRowOutcomes: [
-          {
-            rowIndex: 0,
-            success: false,
-            status:
-              failedKind === "insert" ? "prevalidation_failed" : "skipped",
-            message: error,
-          },
-        ],
-      });
+      dispatchRawIncomingMessage("applyResult", result);
+      dispatchRawIncomingMessage("applyResult", result);
     });
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+    expect(screen.queryByText(/write outcome is unknown/i)).toBeNull();
     expect(
       screen
         .getByRole("button", { name: "Apply Changes" })
@@ -5442,7 +7418,7 @@ describe("TableView", () => {
     expect(getLastPostedMessage()).toEqual(request);
   });
 
-  it("clears draft and refreshes when insert is applied but updates fail", async () => {
+  it("clears a committed draft once on duplicate correlated results and retries only failed updates", async () => {
     const user = userEvent.setup();
 
     renderTableView();
@@ -5499,12 +7475,22 @@ describe("TableView", () => {
       },
     });
 
+    const operationId = (
+      getRawLastPostedMessage()?.payload as { operationId: string }
+    ).operationId;
+    const result = {
+      operationId,
+      success: false,
+      error: "Update failed",
+      insertApplied: true,
+      changesPossible: true,
+      outcomeUnknown: false,
+      rowOutcomes: [{ rowIndex: 0, success: false, status: "not_applied" }],
+      insertRowOutcomes: [{ rowIndex: 0, success: true, status: "applied" }],
+    };
     await act(async () => {
-      dispatchIncomingMessage("applyResult", {
-        success: false,
-        error: "Update failed",
-        insertApplied: true,
-      });
+      dispatchRawIncomingMessage("applyResult", result);
+      dispatchRawIncomingMessage("applyResult", result);
     });
 
     await waitFor(() => {
@@ -5520,6 +7506,324 @@ describe("TableView", () => {
     ).toBeTruthy();
     expect(screen.getByRole("button", { name: "Apply Changes" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Revert All" })).toBeTruthy();
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    expect(screen.queryByText(/write outcome is unknown/i)).toBeNull();
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: [...rows, { id: 3, name: "Inserted default" }],
+        totalCount: 3,
+      }),
+    );
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()).toEqual({
+      type: "applyChanges",
+      payload: {
+        updates: [
+          {
+            primaryKeys: { id: 1 },
+            changes: { name: "Alicia" },
+            originalValues: { name: "Alice" },
+          },
+        ],
+      },
+    });
+    const retryOperationId = (
+      getRawLastPostedMessage()?.payload as { operationId: string }
+    ).operationId;
+    expect(retryOperationId).not.toBe(operationId);
+    await act(async () => dispatchRawIncomingMessage("applyResult", result));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+    expect(screen.getByRole("button", { name: "Applying…" })).toBeTruthy();
+  });
+
+  it("reconciles a possibly applied draft insert without claiming it succeeded", async () => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData();
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()?.type).toBe("applyChanges");
+
+    await act(async () =>
+      dispatchIncomingMessage("applyResult", {
+        success: false,
+        error: "Driver lost the acknowledgement after the insert.",
+        changesPossible: true,
+        outcomeUnknown: true,
+      }),
+    );
+
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    expect(screen.getAllByText(/^DEFAULT$/).length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "Apply Changes" })).toBeTruthy();
+    expect(screen.getByText(/write outcome is unknown/i)).toBeTruthy();
+    expect(screen.queryByText(/Insert was applied/)).toBeNull();
+  });
+
+  it.each([
+    false,
+    true,
+  ])("keeps unknown DEFAULT insert recovery after the first read, preserving live edits/drafts through a late write (second read fails=%s)", async (secondReadFails) => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData({
+      columnDefs: columns.map((column) =>
+        column.name === "id"
+          ? { ...column, identityGeneration: "auto_increment" }
+          : column,
+      ),
+    });
+    await user.dblClick(getBodyCell("name", 0));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Pending Alice" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "applyChanges",
+      payload: { insertValues: [{}] },
+    });
+    const operationId = (
+      getRawLastPostedMessage()?.payload as { operationId: string }
+    ).operationId;
+    const result = {
+      operationId,
+      success: false,
+      error: "Insert acknowledgement lost.",
+      changesPossible: true,
+      outcomeUnknown: true,
+      rowOutcomes: [{ rowIndex: 0, success: false, status: "unknown" }],
+    };
+    await act(async () => dispatchRawIncomingMessage("applyResult", result));
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows,
+        totalCount: rows.length,
+      }),
+    );
+    expect(
+      screen.getByText(/first refresh may precede a late write/),
+    ).toBeTruthy();
+    expect(screen.getAllByText(/^DEFAULT$/)).toHaveLength(2);
+    expect(getBodyCell("name", 1).textContent).toContain("Pending Alice");
+    expect(
+      screen
+        .getByRole("button", { name: "Apply Changes" })
+        .hasAttribute("disabled"),
+    ).toBe(false);
+
+    // Edits made after the first verification must also survive later reads.
+    await user.dblClick(getBodyCell("name", 2));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Pending Bob" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await user.click(screen.getByLabelText("Select row 2"));
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+    expect(
+      screen.queryByText(/Apply or revert pending changes before loading/),
+    ).toBeNull();
+    expect(
+      screen.getByText(/first refresh may precede a late write/),
+    ).toBeTruthy();
+
+    if (secondReadFails) {
+      await act(async () =>
+        dispatchIncomingMessage("tableError", {
+          fetchId: lastFetchPayload().fetchId,
+          error: "Second verification failed",
+        }),
+      );
+      expect(
+        screen.queryByRole("status", { name: "Loading data..." }),
+      ).toBeNull();
+      expect(screen.getByText(/verification refresh failed/)).toBeTruthy();
+      for (const name of ["Apply Changes", "Add Row", "Delete (1)"]) {
+        expect(
+          screen.getByRole("button", { name }).hasAttribute("disabled"),
+        ).toBe(true);
+        await user.click(screen.getByRole("button", { name }));
+      }
+      fireEvent.doubleClick(getBodyCell("name", 1));
+      expect(screen.queryByLabelText("Cell data")).toBeNull();
+      fireEvent.keyDown(document.body, {
+        key: "z",
+        code: "KeyZ",
+        ctrlKey: true,
+        metaKey: true,
+      });
+      expect(getBodyCell("name", 2).textContent).toContain("Pending Bob");
+      expect(screen.getAllByText(/^DEFAULT$/)).toHaveLength(2);
+      expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+      expect(postedMessagesOfType("deleteRows")).toHaveLength(0);
+      await user.click(screen.getByRole("button", { name: "Refresh" }));
+      expect(postedMessagesOfType("fetchPage")).toHaveLength(2);
+    }
+
+    const lateRows = [{ id: 3, name: "Late default insert" }, rows[1], rows[0]];
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: lateRows,
+        totalCount: lateRows.length,
+      }),
+    );
+    expect(getBodyCell("name", 1).textContent).toContain("Late default insert");
+    expect(getBodyCell("name", 2).textContent).toContain("Pending Bob");
+    expect(getBodyCell("name", 3).textContent).toContain("Pending Alice");
+    expect(screen.getAllByText(/^DEFAULT$/)).toHaveLength(2);
+    expect(
+      screen.getByText(/first refresh may precede a late write/),
+    ).toBeTruthy();
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+    const fetchCount = postedMessagesOfType("fetchPage").length;
+    await act(async () => dispatchRawIncomingMessage("applyResult", result));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(fetchCount);
+
+    // Verification never infers that a generated/default draft was applied,
+    // and never retries it automatically. Retry remains an explicit user choice.
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(1);
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "applyChanges",
+      payload: {
+        insertValues: [{}],
+        updates: [
+          {
+            primaryKeys: { id: 1 },
+            changes: { name: "Pending Alice" },
+            originalValues: { name: "Alice" },
+          },
+          {
+            primaryKeys: { id: 2 },
+            changes: { name: "Pending Bob" },
+            originalValues: { name: "Bob" },
+          },
+        ],
+      },
+    });
+    expect(
+      (getRawLastPostedMessage()?.payload as { operationId: string })
+        .operationId,
+    ).not.toBe(operationId);
+  });
+
+  it("keeps unknown APPLY original identity unresolved on a second read with a late proposed-key collision", async () => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData({
+      columnDefs: redisKeyColumns,
+      primaryKeyColumns: ["key"],
+      dataRows: [{ key: "old", value: "original" }],
+    });
+    await user.dblClick(getBodyCell("key"));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "new" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    await act(async () =>
+      dispatchIncomingMessage("applyResult", {
+        success: false,
+        error: "Acknowledgement lost",
+        changesPossible: true,
+        outcomeUnknown: true,
+      }),
+    );
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: [{ key: "old", value: "original" }],
+        totalCount: 1,
+      }),
+    );
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: [{ key: "new", value: "Other client's row" }],
+        totalCount: 1,
+      }),
+    );
+    expect(screen.getByRole("alert").textContent).toMatch(/not attached/);
+    expect(getBodyCell("value", 1).textContent).toContain("Other client's row");
+    expect(screen.getAllByText(/^DEFAULT$/)).toHaveLength(2);
+    expect(
+      screen.getByText(/first refresh may precede a late write/),
+    ).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+  });
+
+  it("preserves confirmed insert/update evidence during repeated unknown APPLY verification", async () => {
+    const user = await stageDirtyDeleteWork();
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    await act(async () =>
+      dispatchIncomingMessage("applyResult", {
+        success: false,
+        error: "Update acknowledgement lost.",
+        insertApplied: true,
+        changesPossible: true,
+        outcomeUnknown: true,
+        rowOutcomes: [
+          { rowIndex: 0, success: true, status: "applied" },
+          { rowIndex: 1, success: false, status: "unknown" },
+        ],
+      }),
+    );
+    const confirmedRows = [
+      { id: 1, name: "Pending Alice" },
+      rows[1],
+      { id: 3, name: "Delete survivor draft" },
+    ];
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: confirmedRows,
+        totalCount: 3,
+      }),
+    );
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: confirmedRows,
+        totalCount: 3,
+      }),
+    );
+    expect(screen.queryByText(/^DEFAULT$/)).toBeNull();
+    expect(screen.getByText(/Insert was applied/)).toBeTruthy();
+    expect(
+      screen.getByText(/first refresh may precede a late write/),
+    ).toBeTruthy();
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()).toEqual({
+      type: "applyChanges",
+      payload: {
+        updates: [
+          {
+            primaryKeys: { id: 2 },
+            changes: { name: "Pending Bob" },
+            originalValues: { name: "Bob" },
+          },
+        ],
+      },
+    });
   });
 
   it("renders filter operator menus according to column filter policy payload", async () => {

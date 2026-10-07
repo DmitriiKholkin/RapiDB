@@ -10,6 +10,8 @@ import {
   DeleteExecutionError,
   getDeleteEvidence,
 } from "../dbDrivers/deleteOutcomes";
+import { isMutationNotExecutedError } from "../dbDrivers/mutationExecutionState";
+import { TransactionVerificationError } from "../dbDrivers/transactionVerification";
 import {
   executeAtomicSqlApplyPlan,
   executePreparedApplyPlan,
@@ -170,6 +172,8 @@ export class TableMutationPreviewController {
         };
       }
       let insertApplied = false;
+      let changesPossible = false;
+      let outcomeUnknown = false;
       let succeededCount = 0;
       const errors: string[] = [];
 
@@ -180,6 +184,11 @@ export class TableMutationPreviewController {
           insertApplied = true;
         } catch (error: unknown) {
           const normalized = normalizeUnknownError(error);
+          const definitelyNoChanges =
+            isMutationNotExecutedError(error) ||
+            error instanceof TransactionVerificationError;
+          changesPossible ||= !definitelyNoChanges;
+          outcomeUnknown ||= !definitelyNoChanges;
           errors.push(normalized.message);
         }
       }
@@ -191,6 +200,8 @@ export class TableMutationPreviewController {
             operationId: preview.operationId,
             success: false,
             error: `All inserts failed: ${errors.join("; ")}`,
+            changesPossible,
+            outcomeUnknown,
           },
         };
       }
@@ -202,6 +213,8 @@ export class TableMutationPreviewController {
             operationId: preview.operationId,
             success: false,
             insertApplied: true,
+            changesPossible: true,
+            outcomeUnknown,
             error: `${succeededCount} row(s) inserted, ${errors.length} failed: ${errors.join("; ")}`,
           },
         };
@@ -241,6 +254,12 @@ export class TableMutationPreviewController {
           payload: {
             ...buildDeleteResult(identities, {
               affectedRows: identities.length,
+              rowOutcomes: identities.map((primaryKeys, rowIndex) => ({
+                rowIndex,
+                primaryKeys,
+                success: true,
+                status: "deleted",
+              })),
             }),
             operationId: preview.operationId,
           },

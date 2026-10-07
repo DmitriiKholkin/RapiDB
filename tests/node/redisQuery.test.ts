@@ -1,6 +1,10 @@
 import type { createClient } from "redis";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
+import {
+  REDIS_ALL_KEYS_TABLE,
+  REDIS_UNPREFIXED_KEYS_TABLE,
+} from "../../src/extension/dbDrivers/redisKeyspace";
 import { REDIS_READ_BUDGET } from "../../src/shared/safetyContracts";
 
 function createDriver() {
@@ -345,7 +349,8 @@ describe("RedisDriver — metadata and pages", () => {
       { name: "db4", schemas: [] },
     ]);
     await expect(driver.listObjects()).resolves.toEqual([
-      { schema: "", name: "default", type: "table" },
+      { schema: "", name: REDIS_ALL_KEYS_TABLE, type: "table" },
+      { schema: "", name: REDIS_UNPREFIXED_KEYS_TABLE, type: "table" },
       { schema: "", name: "orders", type: "table" },
       { schema: "", name: "users", type: "table" },
     ]);
@@ -970,5 +975,84 @@ describe("RedisDriver — metadata and pages", () => {
       REDIS_READ_BUDGET.maxScanKeys / keyBatch.length,
     );
     expect(client.scan).toHaveBeenCalledTimes(expectedCalls);
+  });
+
+  it("reports Redis update identities when a later row does not match", async () => {
+    const driver = new RedisDriver({
+      id: "redis-partial-update-test",
+      name: "Redis Partial Update Test",
+      type: "redis",
+      host: "localhost",
+    });
+    const client = {
+      type: vi.fn().mockResolvedValue("string"),
+      sendCommand: vi.fn().mockResolvedValueOnce(1).mockResolvedValueOnce(0),
+    };
+    (driver as unknown as { client: typeof client | null }).client = client;
+    (driver as unknown as { connected: boolean }).connected = true;
+    (
+      driver as unknown as { getDatabaseClient: () => Promise<typeof client> }
+    ).getDatabaseClient = async () => client;
+
+    await expect(
+      driver.updateRows({
+        database: "db0",
+        schema: "db0",
+        table: "users",
+        updates: [
+          { primaryKeys: { key: "users:1" }, changes: { value: "One" } },
+          { primaryKeys: { key: "users:2" }, changes: { value: "Two" } },
+        ],
+      }),
+    ).resolves.toEqual({
+      affectedRows: 1,
+      updateRowOutcomes: [
+        { rowIndex: 0, status: "applied" },
+        { rowIndex: 1, status: "not_applied" },
+      ],
+    });
+  });
+
+  it("retains confirmed Redis updates when a later row errors", async () => {
+    const driver = new RedisDriver({
+      id: "redis-partial-error-test",
+      name: "Redis Partial Error Test",
+      type: "redis",
+      host: "localhost",
+    });
+    const client = {
+      type: vi.fn().mockResolvedValue("string"),
+      sendCommand: vi
+        .fn()
+        .mockResolvedValueOnce(1)
+        .mockRejectedValueOnce(new Error("Connection lost")),
+    };
+    (driver as unknown as { client: typeof client | null }).client = client;
+    (driver as unknown as { connected: boolean }).connected = true;
+    (
+      driver as unknown as { getDatabaseClient: () => Promise<typeof client> }
+    ).getDatabaseClient = async () => client;
+
+    await expect(
+      driver.updateRows({
+        database: "db0",
+        schema: "db0",
+        table: "users",
+        updates: [
+          { primaryKeys: { key: "users:1" }, changes: { value: "One" } },
+          { primaryKeys: { key: "users:2" }, changes: { value: "Two" } },
+          { primaryKeys: { key: "users:3" }, changes: { value: "Three" } },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      result: {
+        affectedRows: 1,
+        updateRowOutcomes: [
+          { rowIndex: 0, status: "applied" },
+          { rowIndex: 1, status: "unknown" },
+          { rowIndex: 2, status: "not_applied" },
+        ],
+      },
+    });
   });
 });

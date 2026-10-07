@@ -55,9 +55,17 @@ describe("MongoDB row identity guards", () => {
     const update = vi
       .spyOn(driver, "updateRows")
       .mockResolvedValue({ affectedRows: 1 });
-    const remove = vi
-      .spyOn(driver, "deleteRows")
-      .mockResolvedValue({ affectedRows: 1 });
+    const remove = vi.spyOn(driver, "deleteRows").mockResolvedValue({
+      affectedRows: 1,
+      rowOutcomes: [
+        {
+          rowIndex: 0,
+          primaryKeys: { _id: "507f1f77bcf86cd799439011" },
+          success: true,
+          status: "deleted",
+        },
+      ],
+    });
     const hex = "507f1f77bcf86cd799439011";
     const valid = { _id: { $rapidbMongoId: { type: "string", value: hex } } };
     for (const id of [

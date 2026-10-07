@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import {
@@ -6,7 +7,10 @@ import {
   type FilterExpression,
   resolveFilterOperators,
 } from "../../src/extension/dbDrivers/types";
-import { buildWhere } from "../../src/extension/table/filterSql";
+import {
+  buildWhere,
+  validateFilterExpressions,
+} from "../../src/extension/table/filterSql";
 import { TableReadService } from "../../src/extension/table/tableReadService";
 import { serializeFilterDrafts } from "../../src/shared/tableTypes";
 
@@ -68,7 +72,11 @@ describe.each([
     for (const operator of ["like", "ilike"] as const) {
       const result = driver.buildFilterCondition(meta, operator, "needle", 3);
       expect(result?.sql).toMatch(/I?LIKE/);
-      expect(result?.params).toEqual(["%needle%"]);
+      expect(result?.params).toEqual([
+        _name === "MySQL"
+          ? Buffer.from("%needle%").toString("hex")
+          : "%needle%",
+      ]);
     }
     for (const operator of ["is_null", "is_not_null"] as const) {
       // Null checks are allowed even when scalar filtering is unavailable.
@@ -224,5 +232,141 @@ describe.each([
         [column()],
       ),
     ).toThrow("[RapiDB Filter] Column value could not build like filter.");
+  });
+});
+
+describe("native page filter validation", () => {
+  function createMongoDriver() {
+    return new MongoDBDriver({
+      id: "mongo-filters",
+      name: "mongo-filters",
+      type: "mongodb",
+      host: "localhost",
+      port: 27017,
+      database: "db",
+    });
+  }
+
+  function createReadService(driver: MongoDBDriver) {
+    return new TableReadService({
+      getConnection: () => ({ id: "mongo-filters" }),
+      getDriver: () => driver,
+    } as never);
+  }
+
+  it.each([
+    { operator: "in" as const, value: "alpha,beta" },
+    { operator: "eq" as const, value: "alpha" },
+  ])("rejects forged text $operator before MongoDB's native page reader is called", async ({
+    operator,
+    value,
+  }) => {
+    const driver = createMongoDriver();
+    const textColumn = { ...column(), name: "text" };
+    const describeColumns = vi
+      .spyOn(driver, "describeColumns")
+      .mockResolvedValue([textColumn]);
+    const readTablePage = vi.spyOn(driver, "readTablePage").mockResolvedValue({
+      columns: [textColumn],
+      rows: [],
+      totalCount: 0,
+    });
+    const query = vi.spyOn(driver, "query");
+    const service = createReadService(driver);
+
+    await expect(
+      service.getPage("mongo-filters", "db", "public", "items", 1, 25, [
+        { column: "text", operator, value },
+      ]),
+    ).rejects.toThrow(
+      `[RapiDB Filter] Column text does not support ${operator} filters.`,
+    );
+
+    expect(describeColumns).toHaveBeenCalledTimes(1);
+    expect(readTablePage).not.toHaveBeenCalled();
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it("preserves allowed UUID and enum IN filters for native page readers", async () => {
+    const driver = createMongoDriver();
+    const columns = [
+      { ...column("uuid", "uuid"), name: "id" },
+      { ...column("enum", "enum"), name: "status" },
+    ];
+    vi.spyOn(driver, "describeColumns").mockResolvedValue(columns);
+    const readTablePage = vi.spyOn(driver, "readTablePage").mockResolvedValue({
+      columns,
+      rows: [],
+      totalCount: 0,
+    });
+    const service = createReadService(driver);
+    const filters: FilterExpression[] = [
+      {
+        column: "id",
+        operator: "in",
+        value: "00000000-0000-0000-0000-000000000001",
+      },
+      { column: "status", operator: "in", value: "active,pending" },
+    ];
+
+    await service.getPage(
+      "mongo-filters",
+      "db",
+      "public",
+      "items",
+      1,
+      25,
+      filters,
+    );
+
+    expect(readTablePage).toHaveBeenCalledWith(
+      expect.objectContaining({ filters }),
+    );
+  });
+
+  it.each([
+    "is_null",
+    "is_not_null",
+  ] as const)("accepts an own undefined value for %s filters", (operator) => {
+    const filter = {
+      column: "value",
+      operator,
+      value: undefined,
+    } as unknown as FilterExpression;
+
+    expect(() =>
+      validateFilterExpressions([filter], [column("integer", "int")]),
+    ).not.toThrow();
+  });
+
+  it.each([
+    [
+      "missing scalar value",
+      { column: "value", operator: "eq" },
+      "Column value requires a value for eq filters.",
+    ],
+    [
+      "non-scalar value",
+      { column: "value", operator: "eq", value: ["a", "b"] },
+      "Column value expects a string value for eq filters.",
+    ],
+    [
+      "malformed range",
+      { column: "value", operator: "between", value: ["a"] },
+      "Column value expects two string values for between filters.",
+    ],
+    [
+      "null check with a value",
+      { column: "value", operator: "is_null", value: "null" },
+      "Column value does not accept a value for is_null filters.",
+    ],
+  ] as const)("rejects malformed %s expressions", (_case, filter, message) => {
+    const meta = column("integer", "int");
+    expect(() =>
+      validateFilterExpressions(
+        [filter as unknown as FilterExpression],
+        [meta],
+      ),
+    ).toThrow(`[RapiDB Filter] ${message}`);
   });
 });

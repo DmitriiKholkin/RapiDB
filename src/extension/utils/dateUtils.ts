@@ -70,11 +70,22 @@ export function formatDatetimeForDisplay(val: unknown): string | null {
 }
 
 /**
- * Convert an ISO datetime string to a local date string (YYYY-MM-DD).
- * Returns null if the input is not a valid ISO datetime.
+ * Convert an ISO datetime string to a date string (YYYY-MM-DD).
+ * Timezone-free datetimes retain their written calendar date; explicit
+ * offsets are interpreted as instants and converted to their UTC date.
  */
 export function isoToLocalDateStr(iso: string): string | null {
-  const d = new Date(iso);
+  const normalized = normalizeSqlDatetimeOffsetSpacing(iso.trim()).replace(
+    / ([zZ])$/,
+    "$1",
+  );
+  if (ISO_DATETIME_RE.test(normalized)) {
+    if (!hasValidDateTimeParts(normalized)) return null;
+    const dateOnly = normalized.slice(0, 10);
+    if (!isValidDateOnly(dateOnly)) return null;
+    if (!hasExplicitTimezone(normalized)) return dateOnly;
+  }
+  const d = new Date(normalized.replace(" ", "T"));
   if (Number.isNaN(d.getTime())) return null;
   return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
 }

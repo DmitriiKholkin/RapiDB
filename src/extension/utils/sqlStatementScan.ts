@@ -1,5 +1,50 @@
 import type { ConnectionType } from "../../shared/connectionTypes";
 
+const POSTGRES_IDENTIFIER_CONTINUATION = /[\p{L}\p{M}\p{N}_$]/u;
+const POSTGRES_DOLLAR_QUOTE_TAG = /^(\$\$|\$[\p{L}_][\p{L}\p{M}\p{N}_]*\$)/u;
+
+/**
+ * PostgreSQL dollar-quote tags follow unquoted identifier rules, except that
+ * `$` itself is not allowed inside a tag. The delimiter remains case-sensitive.
+ */
+export function readPostgresDollarQuoteTag(
+  sql: string,
+  start: number,
+): string | null {
+  if (sql[start] !== "$") return null;
+
+  if (start > 0) {
+    let previousStart = start - 1;
+    const previousCodeUnit = sql.charCodeAt(previousStart);
+    if (
+      previousCodeUnit >= 0xdc00 &&
+      previousCodeUnit <= 0xdfff &&
+      previousStart > 0
+    ) {
+      const highSurrogate = sql.charCodeAt(previousStart - 1);
+      if (highSurrogate >= 0xd800 && highSurrogate <= 0xdbff) {
+        previousStart -= 1;
+      }
+    }
+    if (
+      POSTGRES_IDENTIFIER_CONTINUATION.test(sql.slice(previousStart, start))
+    ) {
+      return null;
+    }
+  }
+
+  return POSTGRES_DOLLAR_QUOTE_TAG.exec(sql.slice(start))?.[0] ?? null;
+}
+
+export function hasPostgresDollarQuoteTag(sql: string): boolean {
+  for (let index = 0; index < sql.length; index += 1) {
+    if (sql[index] === "$" && readPostgresDollarQuoteTag(sql, index)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export interface SqlCapToken {
   text: string;
   start: number;
@@ -106,9 +151,7 @@ export function scanSqlForCap(
     const alternativeEnd =
       dialect === "oracle" ? oracleAlternativeQuoteEnd(sql, index) : undefined;
     const dollarTag =
-      dialect === "pg"
-        ? /^(\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$)/.exec(sql.slice(index))?.[0]
-        : undefined;
+      dialect === "pg" ? readPostgresDollarQuoteTag(sql, index) : null;
     if (dollarTag) {
       const end = sql.indexOf(dollarTag, index + dollarTag.length);
       if (end < 0) {

@@ -154,6 +154,79 @@ describe("driver-owned result budgets", () => {
     expect(result.affectedRows).toBeUndefined();
   });
 
+  it.each([
+    1, 3, 4,
+  ])("PG reports truncation only for the final %i-row result, not discarded earlier sets", async (finalCount) => {
+    const { driver } = postgresHarness((query) => {
+      for (const [name, count] of [
+        ["earlier", 20],
+        ["final", finalCount],
+      ] as const) {
+        query.handleRowDescription({ fields: [field(name)] });
+        for (let row = 0; row < count; row++) {
+          query.handleDataRow({ fields: [String(row)] });
+          expect(query._result.rows).toHaveLength(0);
+          expect(query.retained.rows.length).toBeLessThanOrEqual(3);
+          expect(Array.isArray(query._results)).toBe(false);
+        }
+        query.handleCommandComplete({ text: `SELECT ${count}` }, {});
+      }
+      query.handleReadyForQuery({});
+    });
+    const result = await driver.query(
+      "SELECT earlier; SELECT final",
+      undefined,
+      {
+        hardCap: 3,
+      },
+    );
+    expect(result).toMatchObject({
+      columns: ["final"],
+      rowCount: finalCount,
+      truncated: finalCount > 3,
+    });
+    expect(result.rows).toEqual(
+      Array.from({ length: Math.min(finalCount, 3) }, (_, index) => ({
+        __col_0: index,
+      })),
+    );
+  });
+
+  it("PG keeps draining a bounded writable query until real pg ReadyForQuery completion", async () => {
+    let finish!: () => void;
+    let started!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const { driver, client } = postgresHarness((query) => {
+      query.handleRowDescription({ fields: [field()] });
+      for (let row = 0; row < 20; row++)
+        query.handleDataRow({ fields: [String(row)] });
+      query.handleCommandComplete({ text: "UPDATE 20" }, {});
+      finish = () => query.handleReadyForQuery({});
+      started();
+    });
+    let settled = false;
+    const pending = driver
+      .query("UPDATE items SET active = true RETURNING id", undefined, {
+        hardCap: 2,
+      })
+      .then((result) => {
+        settled = true;
+        return result;
+      });
+    await ready;
+    expect(settled).toBe(false);
+    expect(client.release).not.toHaveBeenCalled();
+    finish();
+    expect(await pending).toMatchObject({
+      rowCount: 20,
+      affectedRows: 20,
+      truncated: true,
+    });
+    expect(client.release).toHaveBeenCalledExactlyOnceWith();
+  });
+
   it("PG propagates a late server error and destroys the incomplete connection exactly once", async () => {
     const { driver, client } = postgresHarness((query) => {
       query.handleRowDescription({ fields: [field()] });

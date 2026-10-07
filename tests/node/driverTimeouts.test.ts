@@ -81,15 +81,16 @@ describe("driver timeout helpers", () => {
       .spyOn(postgres, "recycleConnectionAfterTimeout")
       .mockResolvedValue(undefined);
     const pgClient = { release: vi.fn() };
-    (
-      postgres as unknown as {
-        activeQueryOperations: Set<{
-          cancelled: boolean;
-          requestToken?: number;
-          client?: typeof pgClient;
-        }>;
-      }
-    ).activeQueryOperations.add({
+    const pgQueryState = postgres as unknown as {
+      activeQueryOperations: Set<{
+        cancelled: boolean;
+        requestToken?: number;
+        client?: typeof pgClient;
+      }>;
+      activeQueryClients: Set<typeof pgClient>;
+    };
+    pgQueryState.activeQueryClients.add(pgClient);
+    pgQueryState.activeQueryOperations.add({
       cancelled: false,
       requestToken: 41,
       client: pgClient,
@@ -132,6 +133,26 @@ describe("driver timeout helpers", () => {
     await mysql.cancelCurrentOperation(context);
 
     expect(pgClient.release).toHaveBeenCalledWith(true);
+    expect(pgClient.release).toHaveBeenCalledOnce();
+    expect(pgQueryState.activeQueryClients.size).toBe(0);
+    expect([...pgQueryState.activeQueryOperations]).toEqual([
+      { cancelled: true, requestToken: 41, client: undefined },
+    ]);
+    expect(mysqlConnection.destroy).toHaveBeenCalledOnce();
+    expect(
+      (
+        mysql as unknown as {
+          activeQueryConnections: Set<typeof mysqlConnection>;
+        }
+      ).activeQueryConnections.size,
+    ).toBe(0);
+
+    // The real query finally removes the operation entry. Even while it is
+    // still registered, cancellation must not release the owned client twice.
+    await postgres.cancelCurrentOperation(context);
+    await mysql.cancelCurrentOperation(context);
+    expect(pgClient.release).toHaveBeenCalledOnce();
+    expect(pgQueryState.activeQueryClients.size).toBe(0);
     expect(mysqlConnection.destroy).toHaveBeenCalledOnce();
     expect(pgRecycle).not.toHaveBeenCalled();
     expect(mysqlRecycle).not.toHaveBeenCalled();

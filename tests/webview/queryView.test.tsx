@@ -25,11 +25,13 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
   interface MockMonacoEditorProps {
     initialValue?: string;
     onChange?: (value: string) => void;
+    onSelectionChange?: () => void;
     readOnly?: boolean;
     ariaLabel?: string;
     schema?: Array<unknown>;
     dialect?: string;
     language?: string;
+    onExecute?: (value: string) => void;
   }
 
   const MonacoEditor = React.forwardRef<
@@ -37,14 +39,27 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
     MockMonacoEditorProps
   >(function MockMonacoEditor(props, ref) {
     const [value, setValue] = React.useState(props.initialValue ?? "");
+    const currentValueRef = React.useRef(props.initialValue ?? "");
+    const textareaRef = React.useRef<HTMLTextAreaElement>(null);
+    const updateValue = React.useCallback((nextValue: string) => {
+      currentValueRef.current = nextValue;
+      setValue(nextValue);
+    }, []);
 
     React.useImperativeHandle(
       ref,
       () => ({
-        getSelectionOrValue: () => value,
-        getValue: () => value,
+        getSelectionOrValue: () => {
+          const textarea = textareaRef.current;
+          const start = textarea?.selectionStart ?? 0;
+          const end = textarea?.selectionEnd ?? 0;
+          return start !== end
+            ? currentValueRef.current.slice(start, end)
+            : currentValueRef.current;
+        },
+        getValue: () => currentValueRef.current,
         setValue: (nextValue: string) => {
-          setValue(nextValue);
+          updateValue(nextValue);
           props.onChange?.(nextValue);
         },
         format: (dialect?: string) => {
@@ -53,13 +68,13 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
           if (props.language === "json") {
             try {
               const nextValue = JSON.stringify(
-                JSON.parse(value) as unknown,
+                JSON.parse(currentValueRef.current) as unknown,
                 null,
                 2,
               );
 
-              if (nextValue !== value) {
-                setValue(nextValue);
+              if (nextValue !== currentValueRef.current) {
+                updateValue(nextValue);
                 props.onChange?.(nextValue);
               }
 
@@ -73,7 +88,7 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
         },
         placeCursor: () => undefined,
       }),
-      [props, value],
+      [props, updateValue],
     );
 
     return (
@@ -84,12 +99,22 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
         <div data-testid="monaco-language">{props.language ?? "sql"}</div>
         <div data-testid="monaco-dialect">{props.dialect ?? "none"}</div>
         <textarea
+          ref={textareaRef}
           aria-label={props.ariaLabel ?? "SQL editor"}
           readOnly={props.readOnly}
           value={value}
           onChange={(event) => {
-            setValue(event.target.value);
+            updateValue(event.target.value);
             props.onChange?.(event.target.value);
+          }}
+          onSelect={() => props.onSelectionChange?.()}
+          onKeyDown={(event) => {
+            if (
+              event.key === "F5" ||
+              (event.key === "Enter" && (event.ctrlKey || event.metaKey))
+            ) {
+              props.onExecute?.(value);
+            }
           }}
         />
       </div>
@@ -867,6 +892,131 @@ describe("QueryView", () => {
     await waitFor(() => {
       expect((bookmarkButton as HTMLButtonElement).disabled).toBe(false);
     });
+    expect(screen.getByTestId("results-panel").textContent).toBe(
+      "query:error:Bad SQL",
+    );
+  });
+
+  it.each([
+    { queryText: "", trigger: "button" },
+    { queryText: " \t\n", trigger: "keyboard" },
+  ])("shows validation feedback for a blank query submitted by $trigger", async ({
+    queryText,
+    trigger,
+  }) => {
+    const user = userEvent.setup();
+    render(<QueryView connectionId="conn-1" initialQueryText={queryText} />);
+
+    if (trigger === "button") {
+      await user.click(screen.getByRole("button", { name: "Run" }));
+    } else {
+      fireEvent.keyDown(screen.getByLabelText("SQL editor"), {
+        key: "Enter",
+        ctrlKey: true,
+      });
+    }
+
+    expect(
+      getPostedMessages().filter((message) => message.type === "executeQuery"),
+    ).toHaveLength(0);
+    expect(useQueryStore.getState().status).toBe("error");
+    expect(screen.getByTestId("results-panel").textContent).toContain(
+      "Select or enter a query before running.",
+    );
+    expect(
+      (screen.getByRole("button", { name: "Run" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+  });
+
+  it.each([
+    { key: "Enter", blank: "editor" },
+    { key: "F5", blank: "editor" },
+    { key: "Enter", blank: "selection" },
+    { key: "F5", blank: "selection" },
+  ])("keeps the pending operation running after blank $blank submission by $key", async ({
+    key,
+    blank,
+  }) => {
+    const user = userEvent.setup();
+    render(<QueryView connectionId="conn-1" initialQueryText="  select 1  " />);
+    await user.click(screen.getByRole("button", { name: "Run" }));
+    const operation = getLastPostedMessage()?.payload as {
+      operationId: string;
+      connectionId: string;
+    };
+    const editor = screen.getByLabelText("SQL editor") as HTMLTextAreaElement;
+    if (blank === "editor") {
+      fireEvent.change(editor, { target: { value: " \t\n" } });
+    } else {
+      editor.setSelectionRange(0, 2);
+      fireEvent.select(editor);
+    }
+    fireEvent.keyDown(editor, { key, ctrlKey: key === "Enter" });
+    expect(useQueryStore.getState().status).toBe("running");
+    expect(screen.getByTestId("results-panel").textContent).toBe(
+      "query:running:none",
+    );
+    expect(
+      (screen.getByRole("button", { name: "Run" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(
+      getPostedMessages().filter((message) => message.type === "executeQuery"),
+    ).toHaveLength(1);
+    act(() =>
+      dispatchIncomingMessage("queryResult", {
+        ...operation,
+        columns: [],
+        rows: [],
+        rowCount: 1,
+        executionTimeMs: 1,
+      }),
+    );
+    expect(useQueryStore.getState().status).toBe("success");
+    expect(screen.getByTestId("results-panel").textContent).toBe(
+      "query:success:1",
+    );
+  });
+
+  it("clears blank-query validation as soon as a nonblank query is typed", async () => {
+    const user = userEvent.setup();
+    render(<QueryView connectionId="conn-1" initialQueryText="" />);
+
+    await user.click(screen.getByRole("button", { name: "Run" }));
+    expect(screen.getByTestId("results-panel").textContent).toContain(
+      "Select or enter a query before running.",
+    );
+
+    await user.type(screen.getByLabelText("SQL editor"), "select 1");
+
+    expect(useQueryStore.getState().status).toBe("idle");
+    expect(screen.getByTestId("results-panel").textContent).toBe(
+      "query:idle:none",
+    );
+    expect(
+      getPostedMessages().filter((message) => message.type === "executeQuery"),
+    ).toHaveLength(0);
+  });
+
+  it("clears blank-query validation when a nonblank selection becomes effective", () => {
+    render(<QueryView connectionId="conn-1" initialQueryText="  select 1  " />);
+    const editor = screen.getByLabelText("SQL editor") as HTMLTextAreaElement;
+    editor.setSelectionRange(0, 2);
+    fireEvent.select(editor);
+    fireEvent.keyDown(editor, { key: "Enter", ctrlKey: true });
+
+    expect(screen.getByTestId("results-panel").textContent).toContain(
+      "Select or enter a query before running.",
+    );
+
+    editor.setSelectionRange(2, 10);
+    fireEvent.select(editor);
+
+    expect(useQueryStore.getState().status).toBe("idle");
+    expect(screen.getByTestId("results-panel").textContent).toBe(
+      "query:idle:none",
+    );
   });
 
   it("caps oversized query results in webview state as a defensive fallback", async () => {

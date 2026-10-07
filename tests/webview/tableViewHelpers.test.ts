@@ -8,6 +8,7 @@ import {
   buildUndoRedoSnapshot,
   INSERT_DEFAULT_SENTINEL,
   restorePendingEdits,
+  restorePendingEditsSafely,
 } from "../../src/webview/components/table/tableViewHelpers";
 import type {
   EditTarget,
@@ -61,6 +62,122 @@ describe("MongoDB pending edit restoration", () => {
         changes.get("name"),
       ]),
     ).toEqual([[1, "edited"]]);
+  });
+});
+
+describe("unknown primary-key edit restoration", () => {
+  it.each([
+    "baseline",
+    "concurrent client value",
+  ])("does not attach an unknown rename to a new key with value %s", (value) => {
+    const before = [{ key: "users:1", value: "baseline" }];
+    const state = buildPendingRestoreState(
+      pendingEditsFrom([[0, { key: "users:2", value: "pending" }]]),
+      before,
+      ["key"],
+    );
+
+    const restored = restorePendingEditsSafely(
+      state,
+      [{ key: "users:2", value }],
+      ["key"],
+    );
+
+    expect(restored.pendingEdits.size).toBe(0);
+    expect(restored.unresolved).toHaveLength(1);
+    expect(restored.unresolved[0].originalSignature).toBe(
+      state.entries[0].originalSignature,
+    );
+    expect(restored.unresolved[0].changes).toEqual(
+      new Map([
+        ["key", "users:2"],
+        ["value", "pending"],
+      ]),
+    );
+  });
+
+  it("keeps a proposed identity unresolved when it was already occupied", () => {
+    const before = [
+      { key: "users:1", value: "source" },
+      { key: "users:2", value: "existing target" },
+    ];
+    const state = buildPendingRestoreState(
+      pendingEditsFrom([[0, { key: "users:2", value: "pending" }]]),
+      before,
+      ["key"],
+    );
+
+    const restored = restorePendingEditsSafely(
+      state,
+      [{ key: "users:2", value: "existing target" }],
+      ["key"],
+    );
+
+    expect(restored.pendingEdits.size).toBe(0);
+    expect(restored.unresolved).toHaveLength(1);
+    expect(restored.unresolved[0].changes.get("value")).toBe("pending");
+  });
+
+  it("keeps duplicate original identities unresolved", () => {
+    const state = buildPendingRestoreState(
+      pendingEditsFrom([[0, { key: "users:2", value: "pending" }]]),
+      [{ key: "users:1", value: "baseline" }],
+      ["key"],
+    );
+
+    const restored = restorePendingEditsSafely(
+      state,
+      [
+        { key: "users:1", value: "one" },
+        { key: "users:1", value: "two" },
+      ],
+      ["key"],
+    );
+
+    expect(restored.pendingEdits.size).toBe(0);
+    expect(restored.unresolved).toHaveLength(1);
+  });
+
+  it("preserves unresolved entries across refreshes and restores only the original identity", () => {
+    const changes = pendingEditsFrom([
+      [0, { key: "users:2", value: "pending" }],
+    ]);
+    const state = buildPendingRestoreState(
+      changes,
+      [{ key: "users:1", value: "baseline" }],
+      ["key"],
+    );
+    const foreignRows = [{ key: "users:2", value: "concurrent client value" }];
+    const restored = restorePendingEditsSafely(state, foreignRows, ["key"]);
+
+    expect(restored.pendingEdits.size).toBe(0);
+    expect(restored.unresolved).toHaveLength(1);
+
+    const preserved = buildPendingRestoreState(
+      restored.pendingEdits,
+      foreignRows,
+      ["key"],
+      [],
+      false,
+      restored.unresolved,
+    );
+    expect(preserved.entries[0].changes).not.toBe(
+      restored.unresolved[0].changes,
+    );
+    const stillUnresolved = restorePendingEditsSafely(preserved, foreignRows, [
+      "key",
+    ]);
+    expect(stillUnresolved.pendingEdits.size).toBe(0);
+    expect(stillUnresolved.unresolved).toEqual(restored.unresolved);
+
+    const originalReturned = restorePendingEditsSafely(
+      preserved,
+      [...foreignRows, { key: "users:1", value: "baseline" }],
+      ["key"],
+    );
+    expect(originalReturned.pendingEdits.get(1)).toEqual(changes.get(0));
+    expect(originalReturned.pendingEdits.has(0)).toBe(false);
+    expect(originalReturned.unresolved).toEqual([]);
   });
 });
 
@@ -237,6 +354,40 @@ describe("applyUndoRedoSnapshot", () => {
 /* ------------------------------------------------------------------ */
 
 describe("snapshot round-trip", () => {
+  it("clones unresolved historical edits independently on capture and restore", () => {
+    const unresolved = buildPendingRestoreState(
+      pendingEditsFrom([[0, { name: "First edit" }]]),
+      [{ id: 2, name: "Bob" }],
+      ["id"],
+    ).entries;
+    const snapshot = buildUndoRedoSnapshot(new Map(), [], null, unresolved);
+    unresolved[0].changes.set("name", "Mutated source");
+    const restored = applyUndoRedoSnapshot(snapshot);
+    expect(restored.unresolvedPendingEdits[0].changes.get("name")).toBe(
+      "First edit",
+    );
+    restored.unresolvedPendingEdits[0].changes.set("name", "Mutated restore");
+    expect(snapshot.unresolvedPendingEdits[0].changes.get("name")).toBe(
+      "First edit",
+    );
+    const recovered = restorePendingEditsSafely(
+      buildPendingRestoreState(
+        new Map(),
+        [],
+        ["id"],
+        [],
+        false,
+        snapshot.unresolvedPendingEdits,
+      ),
+      [{ id: 3 }, { id: 2 }],
+      ["id"],
+    );
+    expect(recovered.pendingEdits).toEqual(
+      pendingEditsFrom([[1, { name: "First edit" }]]),
+    );
+    expect(recovered.unresolved).toEqual([]);
+  });
+
   it("building and applying a snapshot produces equivalent data", () => {
     const pending = pendingEditsFrom([
       [0, { name: "Alice", age: 30 }],

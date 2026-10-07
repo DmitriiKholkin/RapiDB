@@ -59,9 +59,11 @@ describe("mysql filter normalization", () => {
     );
 
     expect(condition).toEqual({
-      sql: "CAST(`payload` AS CHAR) LIKE ?",
+      sql: "CAST(`payload` AS CHAR) LIKE CAST(UNHEX(?) AS CHAR) ESCAPE '!'",
       params: [
-        '%{"arr":[1,2,3],"key":"value","num":42,"bool":true,"nested":{"a":1}}%',
+        Buffer.from(
+          '%{"arr":[1,2,3],"key":"value","num":42,"bool":true,"nested":{"a":1}}%',
+        ).toString("hex"),
       ],
     });
   });
@@ -398,9 +400,15 @@ describe("mysql filter normalization", () => {
     expect(page.rows).toHaveLength(5);
     expect(page.totalCount).toBe(11);
     const dataCall = sqlCalls.find((call) => /SELECT `id`/i.test(call.sql));
-    expect(dataCall?.sql).toContain("WHERE CAST(`title` AS CHAR) LIKE ?");
+    expect(dataCall?.sql).toContain(
+      "WHERE CAST(`title` AS CHAR) LIKE CAST(UNHEX(?) AS CHAR) ESCAPE '!'",
+    );
     expect(dataCall?.sql).toContain("ORDER BY `title` DESC");
-    expect(dataCall?.params).toEqual(["%row%", 6, 5]);
+    expect(dataCall?.params).toEqual([
+      Buffer.from("%row%").toString("hex"),
+      6,
+      5,
+    ]);
   });
 
   it("does not invent a next row when count fails at the end", async () => {

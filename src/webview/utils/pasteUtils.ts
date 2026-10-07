@@ -235,6 +235,7 @@ export function validatePasteData(
   startCol: number,
   columns: ColumnTypeMeta[],
   totalRows: number,
+  canEditColumn: (column: ColumnTypeMeta) => boolean,
 ): PasteValidationResult {
   const errors: PasteValidationError[] = [];
   const rows: PasteValidationResult["rows"] = [];
@@ -273,6 +274,17 @@ export function validatePasteData(
 
       const column = columns[targetCol];
       if (!column) continue;
+
+      if (!canEditColumn(column)) {
+        errors.push({
+          rowIndex: targetRow,
+          columnIndex: targetCol,
+          columnName: column.name,
+          value,
+          message: `Cannot paste into read-only column "${column.name}"`,
+        });
+        continue;
+      }
 
       if (column.isPrimaryKey) {
         errors.push({

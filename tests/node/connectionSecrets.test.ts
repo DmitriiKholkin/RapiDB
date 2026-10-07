@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   extractCredentialBearingUriSecret,
+  hasConnectionConfigSecrets,
+  sanitizeConnectionConfigForResponse,
   sanitizeCredentialBearingUri,
   sanitizePersistedConnectionConfig,
   serializeConnectionSecretsForStoredConfig,
@@ -171,6 +173,61 @@ describe("connection URI secret handling", () => {
 });
 
 describe("connection secret persistence", () => {
+  it.each([
+    undefined,
+    false,
+    true,
+  ])("sanitizes outward metadata independently of storage mode %s without changing the input", (useSecretStorage) => {
+    const config: ConnectionConfig = {
+      id: "outward",
+      name: "Outward",
+      type: "dynamodb",
+      useSecretStorage,
+      password: " db-secret ",
+      apiKey: "api-secret",
+      awsAccessKeyId: "access-secret",
+      awsSecretAccessKey: "aws-secret",
+      awsSessionToken: "token-secret",
+      connectionUri: "mongodb://user:uri-secret@host/db",
+      uri: "redis://user:alias-secret@host/0",
+      endpoint: "https://host/?api_key=endpoint-secret&region=us",
+      awsEndpoint: "https://host/#token=fragment-secret",
+      ssh: {
+        host: "bastion",
+        port: 22,
+        username: "user",
+        authMethod: "privateKey",
+        password: "ssh-secret",
+        privateKey: "private-secret",
+        passphrase: "passphrase-secret",
+      },
+      tls: {
+        mode: "mutualTls",
+        certFilePath: "/cert",
+        keyFilePath: "/key",
+        keyPassphrase: "tls-secret",
+      },
+    };
+    const original = structuredClone(config);
+    expect(hasConnectionConfigSecrets(config)).toBe(true);
+    const response = sanitizeConnectionConfigForResponse(config);
+    expect(hasConnectionConfigSecrets(response)).toBe(false);
+    expect(JSON.stringify(response)).not.toContain("secret");
+    expect(response).toMatchObject({
+      id: "outward",
+      useSecretStorage,
+      connectionUri: "mongodb://host/db",
+      uri: "redis://host/0",
+      endpoint: "https://host/?region=us",
+      awsEndpoint: "https://host/",
+      ssh: { host: "bastion", authMethod: "privateKey" },
+      tls: { keyFilePath: "/key" },
+    });
+    expect(config).toEqual(original);
+    if (useSecretStorage === false)
+      expect(sanitizePersistedConnectionConfig(config)).toEqual(original);
+  });
+
   it("preserves whitespace-significant secret values byte-for-byte", () => {
     expect(trimOptionalSecretValue("  password  ")).toBe("  password  ");
     expect(trimOptionalSecretValue("\nprivate-key\n")).toBe("\nprivate-key\n");

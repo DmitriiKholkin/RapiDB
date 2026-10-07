@@ -262,6 +262,7 @@ interface Props {
   dialect?: string;
   language?: string;
   onChange?: (value: string) => void;
+  onSelectionChange?: () => void;
   onExecute?: (value: string) => void;
   height?: string | number;
   readOnly?: boolean;
@@ -283,6 +284,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       dialect = "sql",
       language = "sql",
       onChange,
+      onSelectionChange,
       onExecute,
       height = "100%",
       readOnly = false,
@@ -295,6 +297,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
     const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
     const initialValueRef = useRef(initialValue);
     const onChangeRef = useRef(onChange);
+    const onSelectionChangeRef = useRef(onSelectionChange);
     const onExecuteRef = useRef(onExecute);
     const readOnlyRef = useRef(readOnly);
     const ariaLabelRef = useRef(ariaLabel);
@@ -330,6 +333,10 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
     useEffect(() => {
       onChangeRef.current = onChange;
     }, [onChange]);
+
+    useEffect(() => {
+      onSelectionChangeRef.current = onSelectionChange;
+    }, [onSelectionChange]);
 
     useEffect(() => {
       onExecuteRef.current = onExecute;
@@ -780,6 +787,9 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
 
         onChangeRef.current?.(editor.getValue());
       });
+      const selectionDisposable = editor.onDidChangeCursorSelection(() => {
+        onSelectionChangeRef.current?.();
+      });
 
       const observer = new MutationObserver(() => {
         applyVSCodeTheme();
@@ -792,6 +802,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       return () => {
         observer.disconnect();
         changeDisposable.dispose();
+        selectionDisposable.dispose();
         unsubClipboard();
         domNode?.removeEventListener("copy", nativeCopy, true);
         domNode?.removeEventListener("cut", nativeCut, true);

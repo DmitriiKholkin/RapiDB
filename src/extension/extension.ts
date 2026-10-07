@@ -120,6 +120,9 @@ function activateOnce(context: vscode.ExtensionContext): void {
   if (typeof context.globalStorageUri?.fsPath === "string") {
     configureSQLiteInstaller({
       storageRoot: context.globalStorageUri.fsPath,
+      workspaceRoots: () =>
+        vscode.workspace.workspaceFolders?.map((folder) => folder.uri.fsPath) ??
+        [],
       log: (message) => logger.info(message),
       allowInstall: async () => {
         if (!vscode.workspace.isTrusted) return false;

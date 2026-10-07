@@ -1,10 +1,15 @@
+import { isIP } from "node:net";
 import type { PoolClient } from "pg";
 import { Pool, types as pgTypes } from "pg";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { OperationCancellationContext } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
-import { resolveConnectionTlsSettings } from "../services/connectionTls";
+import {
+  type ResolvedConnectionTlsSettings,
+  resolveConnectionTlsSettings,
+} from "../services/connectionTls";
+import { SqlTlsSocket } from "../services/sqlTlsSocket";
 import { serializeArrayPreservingRawTokens } from "../utils/arraySerialization";
 import {
   parseJsonPreservingRawNumbers,
@@ -24,6 +29,7 @@ import {
   normalizeSqlDatetimeOffsetSpacing,
 } from "./BaseDBDriver";
 import { queryCollectionLimit } from "./boundedQueryRows";
+import { literalContainsPattern } from "./literalContains";
 import { BoundedPostgresQuery } from "./postgresBoundedQuery";
 import {
   type IndexedPlaceholderOptions,
@@ -92,9 +98,17 @@ const POSTGRES_ENTITY_MANIFEST: DriverEntityManifest = {
   },
 };
 const POSTGRES_POOL_MAX = 5;
+// `pg_attribute.attgenerated` was added in PostgreSQL 12. Reading the row as
+// JSON keeps this projection parseable on PostgreSQL 10/11, where the key is
+// simply absent.
+const PG_GENERATED_KIND_EXPRESSION = "NULLIF(to_jsonb(a)->>'attgenerated', '')";
 
-interface PostgresQueryOperation {
+interface PostgresPoolWaitOperation {
   cancelled: boolean;
+  wakePoolWait?: () => void;
+}
+
+interface PostgresQueryOperation extends PostgresPoolWaitOperation {
   requestToken?: number;
   client?: PoolClient;
 }
@@ -281,14 +295,15 @@ function normalizeTemporalSearchValue(value: string): string {
     trimmed.replace("T", " "),
   );
   if (ISO_DATETIME_RE.test(trimmed) || DATETIME_SQL_RE.test(normalizedSql)) {
-    return normalizedSql
-      .replace(/(\.\d*?[1-9])0+(?=[Zz+-]|$)/, "$1")
-      .replace(/\.0+(?=[Zz+-]|$)/, "")
-      .replace(" ", "%")
-      .replace(/[zZ]$/, "")
-      .replace(/[+-]\d{2}(?::?\d{2})?$/, "");
+    return literalContainsPattern(
+      normalizedSql
+        .replace(/(\.\d*?[1-9])0+(?=[Zz+-]|$)/, "$1")
+        .replace(/\.0+(?=[Zz+-]|$)/, "")
+        .replace(/[zZ]$/, "")
+        .replace(/[+-]\d{2}(?::?\d{2})?$/, ""),
+    ).replace(" ", "%");
   }
-  return trimmed;
+  return literalContainsPattern(trimmed);
 }
 function normalizePostgresTemporalValue(value: string): string {
   const trimmed = value.trim().replace(/^(["'])(.*)\1$/s, "$2");
@@ -538,8 +553,10 @@ export class PostgresDriver extends BaseDBDriver {
   private readonly poolClosures = new WeakMap<Pool, Promise<void>>();
   private connectionEpoch = 0;
   private connectionAttempt: Promise<void> | null = null;
+  private connectionAbortController?: AbortController;
   private publishedConnectionAttempt: Promise<void> | null = null;
   private readonly config: ConnectionConfig;
+  private tlsSettings: ResolvedConnectionTlsSettings | undefined;
   private _connected = false;
   private connectedDatabaseName = "";
   private timeoutRecoveryInFlight: Promise<void> | null = null;
@@ -574,12 +591,25 @@ export class PostgresDriver extends BaseDBDriver {
     max = 5,
     applicationName?: string,
   ): Pool {
-    const tlsSettings = resolveConnectionTlsSettings(this.config);
+    const tlsSettings = this.tlsSettings;
     const forwardedTransport = getSshTcpForwardTransport(this.config);
     const dbOperationTimeoutMs = this.getDbOperationTimeoutMs();
+    const endpointHost = forwardedTransport?.localHost ?? this.config.host;
+    const endpointPort = forwardedTransport?.localPort ?? this.config.port;
+    const tlsIdentity = tlsSettings?.servername?.replace(/^\[|\]$/g, "");
     return new Pool({
-      host: forwardedTransport?.localHost ?? this.config.host,
-      port: forwardedTransport?.localPort ?? this.config.port,
+      // pg overwrites ssl.servername with a DNS config.host. Route the socket
+      // separately so both SNI and verification use the intended identity.
+      host: tlsIdentity ?? endpointHost,
+      port: endpointPort,
+      stream: tlsIdentity
+        ? () =>
+            new SqlTlsSocket(
+              endpointHost || "localhost",
+              endpointPort ?? 5432,
+              tlsIdentity,
+            )
+        : undefined,
       database,
       user: this.config.username,
       password: this.config.password,
@@ -594,7 +624,10 @@ export class PostgresDriver extends BaseDBDriver {
       ssl: tlsSettings
         ? {
             rejectUnauthorized: tlsSettings.rejectUnauthorized,
-            servername: tlsSettings.servername,
+            servername:
+              tlsIdentity && isIP(tlsIdentity)
+                ? undefined
+                : tlsSettings.servername,
             ca: tlsSettings.ca,
             cert: tlsSettings.cert,
             key: tlsSettings.key,
@@ -673,14 +706,19 @@ export class PostgresDriver extends BaseDBDriver {
   connect(): Promise<void> {
     if (this.connectionAttempt) return this.connectionAttempt;
     const epoch = ++this.connectionEpoch;
+    const abortController = new AbortController();
+    this.connectionAbortController = abortController;
     this._connected = false;
     this.connectedDatabaseName = "";
     this.publishedConnectionAttempt = null;
     const cleanup = this.closeOwnedPools().catch(() => undefined);
     const attempt: Promise<void> = cleanup
-      .then(() => this.openConnection(epoch, attempt))
+      .then(() => this.openConnection(epoch, attempt, abortController.signal))
       .finally(() => {
         if (this.connectionAttempt === attempt) this.connectionAttempt = null;
+        if (this.connectionAbortController === abortController) {
+          this.connectionAbortController = undefined;
+        }
       });
     this.connectionAttempt = attempt;
     return attempt;
@@ -688,15 +726,22 @@ export class PostgresDriver extends BaseDBDriver {
 
   private assertConnectionEpoch(epoch: number): void {
     if (epoch !== this.connectionEpoch) {
-      throw new Error("[RapiDB] PostgreSQL connection attempt cancelled");
+      throw new DOMException(
+        "[RapiDB] PostgreSQL connection attempt cancelled",
+        "AbortError",
+      );
     }
   }
 
   private async openConnection(
     epoch: number,
     attempt: Promise<void>,
+    signal: AbortSignal,
   ): Promise<void> {
     this.assertConnectionEpoch(epoch);
+    const tlsSettings = await resolveConnectionTlsSettings(this.config, signal);
+    this.assertConnectionEpoch(epoch);
+    this.tlsSettings = tlsSettings;
     const pool = this.createPool(this.config.database ?? "");
     this.pendingPools.add(pool);
     pool.on("error", (err) => {
@@ -745,10 +790,13 @@ export class PostgresDriver extends BaseDBDriver {
 
   async disconnect(): Promise<void> {
     ++this.connectionEpoch;
+    this.connectionAbortController?.abort();
+    this.connectionAbortController = undefined;
     this.connectionAttempt = null;
     this.publishedConnectionAttempt = null;
     this._connected = false;
     this.connectedDatabaseName = "";
+    this.tlsSettings = undefined;
     await this.closeOwnedPools();
   }
 
@@ -798,9 +846,11 @@ export class PostgresDriver extends BaseDBDriver {
           continue;
         }
         operation.cancelled = true;
+        operation.wakePoolWait?.();
         if (operation.client) {
-          this.activeQueryClients.delete(operation.client);
-          operation.client.release(true);
+          const client = operation.client;
+          operation.client = undefined;
+          if (this.activeQueryClients.delete(client)) client.release(true);
         }
       }
       return;
@@ -1018,7 +1068,7 @@ export class PostgresDriver extends BaseDBDriver {
          END                                      AS data_type,
          NOT a.attnotnull                         AS is_nullable,
          pg_get_expr(d.adbin, d.adrelid)         AS column_default,
-         NULLIF(a.attgenerated, '')               AS generated_kind,
+          ${PG_GENERATED_KIND_EXPRESSION}           AS generated_kind,
          NULLIF(a.attidentity, '')                AS identity_kind,
          pk.pk_ordinal IS NOT NULL                AS is_pk,
          pk.pk_ordinal                            AS pk_ordinal,
@@ -1057,7 +1107,13 @@ export class PostgresDriver extends BaseDBDriver {
       const identityGeneration = pgIdentityGenerationKind(
         r.identity_kind as string | null | undefined,
       );
-      const isComputed = generatedKind === "s";
+      const mappedGeneratedKind =
+        generatedKind === "s"
+          ? "stored"
+          : generatedKind === "v"
+            ? "virtual"
+            : undefined;
+      const isComputed = mappedGeneratedKind !== undefined;
       const computedExpression =
         isComputed && typeof rawDefault === "string" ? rawDefault : undefined;
       const defaultValue = !isComputed ? (rawDefault ?? undefined) : undefined;
@@ -1069,8 +1125,11 @@ export class PostgresDriver extends BaseDBDriver {
         identityGeneration,
         isComputed,
         computedExpression,
-        generatedKind: isComputed ? "stored" : undefined,
-        isPersisted: isComputed ? true : undefined,
+        generatedKind: mappedGeneratedKind,
+        isPersisted:
+          mappedGeneratedKind === undefined
+            ? undefined
+            : mappedGeneratedKind === "stored",
         isPrimaryKey: isPgTrue(r.is_pk),
         primaryKeyOrdinal: toOptionalNumber(r.pk_ordinal),
         isForeignKey: isPgTrue(r.is_fk),
@@ -1099,12 +1158,21 @@ export class PostgresDriver extends BaseDBDriver {
     };
     this.activeQueryOperations.add(operation);
     let client: PoolClient | undefined;
+    let output: QueryResult | undefined;
+    let queryError: unknown;
+    let queryFailed = false;
+    let rollbackError: unknown;
+    let rollbackFailed = false;
     try {
       const pool = this.requirePool(operationContext?.database);
-      await this.waitForQueryConnection(operation, pool);
-      client = await pool.connect();
+      client = await this.acquirePoolClient(operation, pool, () => {
+        if (operation.cancelled) {
+          throw new Error("PostgreSQL query cancelled before execution.");
+        }
+      });
       operation.client = client;
       if (operation.cancelled) {
+        operation.client = undefined;
         client.release(true);
         throw new Error("PostgreSQL query cancelled before execution.");
       }
@@ -1174,8 +1242,10 @@ export class PostgresDriver extends BaseDBDriver {
           ? { affectedRows: result.rowCount ?? 0 }
           : {}),
       };
-      return queryResult;
+      output = queryResult;
     } catch (error) {
+      queryFailed = true;
+      queryError = error;
       // A read timeout can fire before ReadyForQuery. Never return that socket
       // to the pool while the server is still emitting the timed-out result.
       if (
@@ -1184,33 +1254,53 @@ export class PostgresDriver extends BaseDBDriver {
         this.activeQueryClients.delete(client)
       )
         client.release(true);
-      throw error;
     } finally {
-      if (
-        client &&
-        this.activeQueryClients.has(client) &&
-        operationContext?.readOnly
-      ) {
-        await client.query("ROLLBACK").catch(() => undefined);
-      }
-      this.activeQueryOperations.delete(operation);
-      if (client && this.activeQueryClients.delete(client)) {
-        client.release();
+      try {
+        if (
+          client &&
+          this.activeQueryClients.has(client) &&
+          operationContext?.readOnly
+        ) {
+          try {
+            await client.query("ROLLBACK");
+          } catch (error) {
+            // Cancellation may already have discarded this client while rollback
+            // was pending. Only the owner that removes it may release it.
+            rollbackFailed = true;
+            rollbackError = error;
+            operation.client = undefined;
+            if (this.activeQueryClients.delete(client)) client.release(true);
+          }
+        }
+        if (client && this.activeQueryClients.delete(client)) {
+          operation.client = undefined;
+          client.release();
+        }
+      } finally {
+        operation.client = undefined;
+        this.activeQueryOperations.delete(operation);
       }
     }
+    if (rollbackFailed) {
+      throw new AggregateError(
+        queryFailed ? [queryError, rollbackError] : [rollbackError],
+        "PostgreSQL read-only query rollback failed; the connection was discarded.",
+      );
+    }
+    if (queryFailed) throw queryError;
+    return output as QueryResult;
   }
   override getCapabilities() {
     return { ...super.getCapabilities(), boundedQueryResults: true };
   }
 
-  private async waitForQueryConnection(
-    operation: PostgresQueryOperation,
+  private async acquirePoolClient(
+    operation: PostgresPoolWaitOperation,
     pool: Pool,
-  ): Promise<void> {
+    assertActive: () => void,
+  ): Promise<PoolClient> {
     while (true) {
-      if (operation.cancelled) {
-        throw new Error("PostgreSQL query cancelled before execution.");
-      }
+      assertActive();
       if (
         pool !== this.pool &&
         ![...this.databasePools.values()].includes(pool)
@@ -1218,12 +1308,41 @@ export class PostgresDriver extends BaseDBDriver {
         throw new Error("[RapiDB] PostgreSQL connection is not open");
       }
       if (
-        pool.waitingCount === 0 &&
-        (pool.idleCount > 0 || pool.totalCount < POSTGRES_POOL_MAX)
+        (pool.waitingCount ?? 0) === 0 &&
+        ((pool.idleCount ?? 0) > 0 ||
+          (pool.totalCount ?? 0) < POSTGRES_POOL_MAX)
       ) {
-        return;
+        // Begin checkout in the same turn as the capacity check. Awaiting a
+        // separate readiness promise here leaves a race where another pool
+        // user can take the slot and strand this request in pg-pool's
+        // non-cancellable checkout queue.
+        const client = await pool.connect();
+        try {
+          assertActive();
+          if (
+            pool !== this.pool &&
+            ![...this.databasePools.values()].includes(pool)
+          ) {
+            throw new Error("[RapiDB] PostgreSQL connection is not open");
+          }
+        } catch (error) {
+          client.release(true);
+          throw error;
+        }
+        return client;
       }
-      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      await new Promise<void>((resolve) => {
+        let timer: ReturnType<typeof setTimeout>;
+        const wake = () => {
+          clearTimeout(timer);
+          if (operation.wakePoolWait === wake) {
+            operation.wakePoolWait = undefined;
+          }
+          resolve();
+        };
+        timer = setTimeout(wake, 25);
+        operation.wakePoolWait = wake;
+      });
     }
   }
   async getIndexes(
@@ -1553,7 +1672,6 @@ export class PostgresDriver extends BaseDBDriver {
     // Deparse with a catalog-only search path on an owned session. This makes
     // user-schema FK, type, default and CHECK dependencies schema-qualified,
     // without changing the pool's search path for subsequent operations.
-    let failed = false;
     try {
       await client.query("BEGIN READ ONLY");
       await client.query("SET LOCAL search_path TO pg_catalog");
@@ -1563,7 +1681,7 @@ export class PostgresDriver extends BaseDBDriver {
          format_type(a.atttypid, a.atttypmod)    AS data_type,
          NOT a.attnotnull                         AS is_nullable,
          pg_get_expr(d.adbin, d.adrelid)         AS column_default,
-         NULLIF(a.attgenerated, '')               AS generated_kind,
+          ${PG_GENERATED_KIND_EXPRESSION}           AS generated_kind,
          NULLIF(a.attidentity, '')                AS identity_kind
        FROM pg_attribute a
        JOIN pg_class     c ON c.oid = a.attrelid
@@ -1594,12 +1712,14 @@ export class PostgresDriver extends BaseDBDriver {
       );
       const cols = colRes.rows.map((r) => {
         const columnName = r.column_name as string;
-        const isComputed = r.generated_kind === "s";
+        const isComputed = r.generated_kind === "s" || r.generated_kind === "v";
         const nullable = isPgTrue(r.is_nullable);
         const notNull = !nullable ? " NOT NULL" : "";
         const identityClause = pgIdentityClause(r.identity_kind);
         if (isComputed && r.column_default) {
-          return `  ${this.quoteIdentifier(columnName)} ${r.data_type} GENERATED ALWAYS AS (${r.column_default}) STORED${notNull}`;
+          const generatedStorage =
+            r.generated_kind === "v" ? "VIRTUAL" : "STORED";
+          return `  ${this.quoteIdentifier(columnName)} ${r.data_type} GENERATED ALWAYS AS (${r.column_default}) ${generatedStorage}${notNull}`;
         }
         const defClause =
           !identityClause && r.column_default
@@ -1613,13 +1733,15 @@ export class PostgresDriver extends BaseDBDriver {
         );
       }
       return `-- Reconstructed PostgreSQL table DDL (columns and catalog table constraints).\n-- Not a pg_dump schema backup: dependencies must already exist.\n-- Sequences, standalone indexes, triggers, security, storage and partition/inheritance definitions are not included.\nCREATE TABLE ${this.qualifiedTableName("", schema, table)} (\n${cols.join(",\n")}\n);`;
-    } catch (error) {
-      failed = true;
-      throw error;
     } finally {
-      const rollback = client.query("ROLLBACK");
-      if (failed) await rollback.catch(() => undefined);
-      else await rollback;
+      // This client is request-scoped and is destroyed by withCatalogClient.
+      // A failed cleanup must not replace either a completed DDL result or the
+      // catalog query error that caused cleanup.
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        // The client is discarded by withCatalogClient in all cases.
+      }
     }
   }
   async getObjectDefinition(
@@ -1806,32 +1928,61 @@ export class PostgresDriver extends BaseDBDriver {
     scope?: import("./types").TransactionOptions,
   ): Promise<void> {
     throwIfTransactionCancelled(context);
-    const client = await this.requirePool(scope?.database).connect();
-    this.activeTransactionClients.add(client);
+    const waitOperation: PostgresPoolWaitOperation = { cancelled: false };
+    let client: PoolClient | undefined;
+    let transactionStarted = false;
+    let discardTransactionClient = false;
     const cancel = () => {
-      if (this.activeTransactionClients.delete(client)) client.release(true);
+      waitOperation.cancelled = true;
+      waitOperation.wakePoolWait?.();
+      if (client && this.activeTransactionClients.delete(client)) {
+        client.release(true);
+      }
     };
     context?.signal.addEventListener("abort", cancel, { once: true });
     try {
       throwIfTransactionCancelled(context);
-      await client.query("BEGIN");
+      const acquired = await this.acquirePoolClient(
+        waitOperation,
+        this.requirePool(scope?.database),
+        () => {
+          if (waitOperation.cancelled) {
+            throw new Error(
+              "PostgreSQL transaction cancelled before execution.",
+            );
+          }
+          throwIfTransactionCancelled(context);
+        },
+      );
+      if (waitOperation.cancelled) {
+        acquired.release(true);
+        throwIfTransactionCancelled(context);
+        throw new Error("PostgreSQL transaction cancelled before execution.");
+      }
+      client = acquired;
+      this.activeTransactionClients.add(client);
+      const transactionClient = client;
+      throwIfTransactionCancelled(context);
+      transactionStarted = true;
+      await transactionClient.query("BEGIN");
       const identities = new TransactionIdentityStore();
       for (const [index, op] of operations.entries()) {
         throwIfTransactionCancelled(context);
-        const res = await client.query(op.sql, op.params ?? []);
+        const res = await transactionClient.query(op.sql, op.params ?? []);
         assertTransactionAffectedRows(op, res.rowCount ?? 0);
         await identities.capture(
           index,
           op,
           res.rows,
-          async (sql, params) => (await client.query(sql, params)).rows,
+          async (sql, params) =>
+            (await transactionClient.query(sql, params)).rows,
         );
       }
       await verifyTransaction(
         this,
         identities.resolve(scope?.verifications),
         async (verification) => {
-          const result = await client.query(
+          const result = await transactionClient.query(
             verification.sql,
             verification.params,
           );
@@ -1855,14 +2006,25 @@ export class PostgresDriver extends BaseDBDriver {
         context,
       );
       throwIfTransactionCancelled(context);
-      await client.query("COMMIT");
-    } catch (e) {
-      await client.query("ROLLBACK").catch(() => undefined);
-      throw e;
+      await transactionClient.query("COMMIT");
+    } catch (error) {
+      if (client && transactionStarted) {
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackError) {
+          discardTransactionClient = true;
+          throw new AggregateError(
+            [error, rollbackError],
+            "PostgreSQL transaction and rollback failed; the connection was discarded.",
+          );
+        }
+      }
+      throw error;
     } finally {
       context?.signal.removeEventListener("abort", cancel);
-      if (this.activeTransactionClients.delete(client)) {
-        client.release();
+      if (client && this.activeTransactionClients.delete(client)) {
+        if (discardTransactionClient) client.release(true);
+        else client.release();
       }
     }
   }
@@ -2319,8 +2481,8 @@ export class PostgresDriver extends BaseDBDriver {
       }
       const arrayValue = typeof val === "string" ? val : val[0];
       return {
-        sql: `to_jsonb(${col})::text ILIKE $${paramIndex}`,
-        params: [`%${arrayValue}%`],
+        sql: `to_jsonb(${col})::text ILIKE $${paramIndex} ESCAPE '!'`,
+        params: [literalContainsPattern(arrayValue)],
       };
     }
     if (
@@ -2387,8 +2549,8 @@ export class PostgresDriver extends BaseDBDriver {
           return null;
         }
         return {
-          sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex}`,
-          params: [`%${searchValue}%`],
+          sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex} ESCAPE '!'`,
+          params: [literalContainsPattern(searchValue)],
         };
       }
     }
@@ -2400,8 +2562,8 @@ export class PostgresDriver extends BaseDBDriver {
             ? normalized.trim()
             : val;
         return {
-          sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex}`,
-          params: [`%${searchValue}%`],
+          sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex} ESCAPE '!'`,
+          params: [literalContainsPattern(searchValue)],
         };
       }
       if (operator === "between" && Array.isArray(val)) {
@@ -2431,8 +2593,8 @@ export class PostgresDriver extends BaseDBDriver {
         const v = typeof val === "string" ? val : val[0];
         const searchValue = normalizeTemporalSearchValue(v);
         return {
-          sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex}`,
-          params: [`%${searchValue}%`],
+          sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex} ESCAPE '!'`,
+          params: [searchValue],
         };
       }
       const castType = postgresTemporalCastType(column);
@@ -2507,20 +2669,33 @@ export class PostgresDriver extends BaseDBDriver {
           params: [numericValue, tolerance, numericValue, tolerance],
         };
       }
-      if (ct === "bigint" && /^-?\d+$/.test(val)) {
+      if (ct === "bigint" && /^[+-]?\d+$/.test(val)) {
         return { sql: `${col} ${sqlOp} $${paramIndex}`, params: [BigInt(val)] };
+      }
+      if (column.category === "integer" && !/^[+-]?\d+$/.test(val)) {
+        // Fractional/scientific input must be interpreted by NUMERIC, not
+        // rounded through JS Number (or coerced to the column's integer type).
+        return {
+          sql: `${col} ${sqlOp} $${paramIndex}::numeric`,
+          params: [val],
+        };
       }
       return { sql: `${col} ${sqlOp} $${paramIndex}`, params: [Number(val)] };
     }
     if (operator === "between" && Array.isArray(val)) {
       return {
-        sql: `${col} BETWEEN $${paramIndex} AND $${paramIndex + 1}`,
+        sql: `${col} BETWEEN $${paramIndex}${column.category === "integer" && !/^[+-]?\d+$/.test(val[0]) ? "::numeric" : ""} AND $${paramIndex + 1}${column.category === "integer" && !/^[+-]?\d+$/.test(val[1]) ? "::numeric" : ""}`,
         params: [val[0], val[1]],
       };
     }
     if (operator === "in" && typeof val === "string") {
       const parts = val.split(",").map((s) => s.trim());
-      const placeholders = parts.map((_, i) => `$${paramIndex + i}`).join(", ");
+      const placeholders = parts
+        .map(
+          (part, i) =>
+            `$${paramIndex + i}${column.category === "integer" && !/^[+-]?\d+$/.test(part) ? "::numeric" : ""}`,
+        )
+        .join(", ");
       return { sql: `${col} IN (${placeholders})`, params: parts };
     }
     if (operator !== "like" && operator !== "ilike") {
@@ -2529,10 +2704,9 @@ export class PostgresDriver extends BaseDBDriver {
       );
     }
     const v = typeof val === "string" ? val : val[0];
-    const finalVal = normalizeTemporalSearchValue(v);
     return {
-      sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex}`,
-      params: [`%${finalVal}%`],
+      sql: `CAST(${col} AS TEXT) ILIKE $${paramIndex} ESCAPE '!'`,
+      params: [literalContainsPattern(v)],
     };
   }
 }

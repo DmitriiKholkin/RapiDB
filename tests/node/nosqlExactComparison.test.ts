@@ -443,18 +443,23 @@ function dynamo(items: Record<string, unknown>[]) {
     type: "dynamodb",
     awsRegion: "us-east-1",
   });
-  const send = vi.fn(async (command: { constructor: { name: string } }) => {
-    if (command.constructor.name === "DescribeTableCommand")
-      return {
-        Table: {
-          KeySchema: [{ AttributeName: "id", KeyType: "HASH" }],
-          AttributeDefinitions: [{ AttributeName: "id", AttributeType: "S" }],
-        },
-      };
-    if (command.constructor.name === "GetItemCommand")
-      return { Item: items[0] };
-    return { Items: items };
-  });
+  const send = vi.fn(
+    async (command: {
+      constructor: { name: string };
+      input?: Record<string, unknown>;
+    }) => {
+      if (command.constructor.name === "DescribeTableCommand")
+        return {
+          Table: {
+            KeySchema: [{ AttributeName: "id", KeyType: "HASH" }],
+            AttributeDefinitions: [{ AttributeName: "id", AttributeType: "S" }],
+          },
+        };
+      if (command.constructor.name === "GetItemCommand")
+        return { Item: items[0] };
+      return { Items: items };
+    },
+  );
   Object.assign(driver, { connected: true, client: { send } });
   return { driver, send };
 }
@@ -617,17 +622,17 @@ describe("B08 actual driver fallback paths with SDK-boundary fixtures", () => {
       {
         id: { S: "high" },
         value: { N: "0.10000000000000000002" },
-        payload: { M: { match: { S: "yes" } } },
+        payload: { L: [{ S: "yes" }] },
       },
       {
         id: { S: "low" },
         value: { N: "0.10000000000000000001" },
-        payload: { M: { match: { S: "yes" } } },
+        payload: { L: [{ S: "yes" }] },
       },
       {
         id: { S: "text" },
         value: { S: "0.10000000000000000003" },
-        payload: { M: { match: { S: "yes" } } },
+        payload: { L: [{ S: "yes" }] },
       },
     ]);
     const page = await driver.readTablePage({
@@ -640,9 +645,22 @@ describe("B08 actual driver fallback paths with SDK-boundary fixtures", () => {
       ],
     });
     expect(page.rows.map((row) => row.id)).toEqual(["high"]);
-    expect(
-      send.mock.calls.map(([command]) => command.constructor.name),
-    ).toContain("ScanCommand");
+    // The L member predicate remains client-only; numeric comparison must
+    // still reject the low N and the numerically larger textual S impostor.
+    const scans = send.mock.calls
+      .map(([command]) => command)
+      .filter((command) => command.constructor.name === "ScanCommand");
+    const filteredScans = scans.filter(
+      (command) => command.input?.FilterExpression !== undefined,
+    );
+    expect(filteredScans).toHaveLength(1);
+    expect(filteredScans[0].input).toMatchObject({
+      TableName: request.table,
+      FilterExpression: "#n0 > :v0",
+    });
+    expect(filteredScans[0].input?.ExpressionAttributeNames).toEqual({
+      "#n0": "value",
+    });
   });
 
   it.each([
@@ -653,7 +671,7 @@ describe("B08 actual driver fallback paths with SDK-boundary fixtures", () => {
       {
         id: { S: "key" },
         value: { N: value },
-        payload: { M: { match: { S: "yes" } } },
+        payload: { L: [{ S: "yes" }] },
       },
     ]);
     const page = await driver.readTablePage({
@@ -667,9 +685,17 @@ describe("B08 actual driver fallback paths with SDK-boundary fixtures", () => {
       ],
     });
     expect(page.rows).toHaveLength(matches);
-    expect(
-      send.mock.calls.map(([command]) => command.constructor.name),
-    ).toContain("GetItemCommand");
+    const getItems = send.mock.calls
+      .map(([command]) => command)
+      .filter((command) => command.constructor.name === "GetItemCommand");
+    expect(getItems).toHaveLength(1);
+    expect(getItems[0].input).toEqual({
+      TableName: request.table,
+      Key: { id: { S: "key" } },
+    });
+    // GetItem cannot apply residual predicates; L membership and exact int64
+    // range comparison therefore remain client-side for both adjacent Ns.
+    expect(getItems[0].input?.FilterExpression).toBeUndefined();
   });
 
   it("Elasticsearch fallback keeps IDs textual, including numeric/date-shaped IDs", async () => {

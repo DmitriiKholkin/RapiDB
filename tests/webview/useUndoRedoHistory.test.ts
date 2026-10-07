@@ -45,6 +45,35 @@ function pendingEditsFrom(
 /* ------------------------------------------------------------------ */
 
 describe("useUndoRedoHistory", () => {
+  it("tracks unresolved identities in both stacks until remapped or cleared", () => {
+    const { result } = renderHook(() => useUndoRedoHistory());
+    const snapshot = makeSnapshot({
+      unresolvedPendingEdits: [
+        {
+          originalSignature: "original B",
+          changes: new Map([["name", "first"]]),
+        },
+      ],
+    });
+    expect(result.current.hasUnresolvedEdits()).toBe(false);
+    act(() => result.current.push(snapshot));
+    expect(result.current.hasUnresolvedEdits()).toBe(true);
+    act(() => result.current.undo(snapshot));
+    expect(result.current.canUndo).toBe(false);
+    expect(result.current.canRedo).toBe(true);
+    expect(result.current.hasUnresolvedEdits()).toBe(true);
+    act(() =>
+      result.current.remap((entry) => ({
+        ...entry,
+        unresolvedPendingEdits: [],
+      })),
+    );
+    expect(result.current.hasUnresolvedEdits()).toBe(false);
+    act(() => result.current.push(snapshot));
+    act(() => result.current.clear());
+    expect(result.current.hasUnresolvedEdits()).toBe(false);
+  });
+
   /* ---------- initial state ---------- */
 
   it("starts with canUndo=false and canRedo=false", () => {

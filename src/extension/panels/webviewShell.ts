@@ -115,6 +115,8 @@ export function createWebviewShell({
     "default-src 'none'",
     ...extraCspDirectives,
     `script-src 'nonce-${nonce}' ${webview.cspSource}`,
+    // Monaco, ReactFlow, and UI helpers inject runtime <style> elements without a nonce.
+    // Keep this allowance style-only; script-src above remains nonce-gated.
     `style-src ${webview.cspSource} 'unsafe-inline'`,
     `font-src ${webview.cspSource} data:`,
     `img-src ${webview.cspSource} https: data:`,

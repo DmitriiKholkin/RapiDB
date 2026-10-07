@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionManager } from "../../src/extension/connectionManager";
 import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
+import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
+import { SQLiteCoreDriver } from "../../src/extension/dbDrivers/sqliteCore";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import type {
   PreparedApplyPlan,
@@ -172,6 +174,8 @@ describe("verified UPDATE rollback preflight", () => {
           events: [],
           result: {
             success: false,
+            changesPossible: false,
+            outcomeUnknown: false,
             error: expect.stringContaining(
               "UPDATE verification requires rollback support",
             ),
@@ -185,6 +189,7 @@ describe("verified UPDATE rollback preflight", () => {
       );
       expect(h.transaction).not.toHaveBeenCalled();
       expect(h.lease).not.toHaveBeenCalled();
+      expect(result.error).not.toMatch(/outcome may be unknown/i);
       expect(result.rowOutcomes).toEqual(
         plan.updates.map((_, rowIndex) =>
           expect.objectContaining({
@@ -322,6 +327,40 @@ describe("verified UPDATE rollback preflight", () => {
       expect(h.events).toEqual(["BEGIN", "UPDATE", "COMMIT"]);
     });
 
+    it(`${path}: blocks multi-statement temporal-only UPDATEs on MyISAM before DML`, async () => {
+      const h = harness();
+      const temporalColumns: ColumnTypeMeta[] = [
+        columns[0],
+        { ...columns[1], nativeType: "TIMESTAMP", category: "datetime" },
+      ];
+      const plan = h.prepare(
+        [1, 2].map((id) => ({
+          primaryKeys: { id },
+          changes: { amount: "2026-10-02 12:00:00" },
+        })),
+        temporalColumns,
+      );
+      expect(plan.verificationTargets.map((target) => target.values)).toEqual([
+        [],
+        [],
+      ]);
+
+      const result = await execute(path, h.manager, plan);
+
+      expect(result).toMatchObject({
+        success: false,
+        error: expect.stringContaining(riskMessage),
+      });
+      expect(h.riskCheck).toHaveBeenCalledExactlyOnceWith(
+        "target",
+        "ignored_schema",
+        "unsafe_rows",
+      );
+      expect(h.transaction).not.toHaveBeenCalled();
+      expect(h.events).toEqual([]);
+      expect([...h.stored]).toEqual([]);
+    });
+
     it(`${path}: preserves skipped rows while blocking remaining verified UPDATEs`, async () => {
       const h = harness();
       const plan = h.prepare([
@@ -340,6 +379,113 @@ describe("verified UPDATE rollback preflight", () => {
       expect(h.transaction).not.toHaveBeenCalled();
     });
   }
+
+  it.each([
+    "pg",
+    "sqlite",
+  ] as const)("allows multi-statement temporal-only SQL updates on transactional %s", async (dialect) => {
+    const driver =
+      dialect === "pg"
+        ? new PostgresDriver({
+            id: `safe-${dialect}`,
+            name: `safe-${dialect}`,
+            type: "pg",
+            host: "localhost",
+            database: "target",
+            username: "user",
+            password: "pass",
+          })
+        : new SQLiteCoreDriver({
+            id: `safe-${dialect}`,
+            name: `safe-${dialect}`,
+            type: "sqlite",
+            filePath: ":memory:",
+          });
+    const manager = {
+      getConnection: () => ({ id: `safe-${dialect}`, readOnly: false }),
+      getDriver: () => driver,
+    } as unknown as ConnectionManager;
+    const temporalColumns: ColumnTypeMeta[] = [
+      columns[0],
+      { ...columns[1], nativeType: "TIMESTAMP", category: "datetime" },
+    ];
+    const prepared = prepareApplyChangesPlan(
+      manager,
+      `safe-${dialect}`,
+      "target",
+      "schema",
+      "temporal_rows",
+      [1, 2].map((id) => ({
+        primaryKeys: { id },
+        changes: { amount: "2026-10-02 12:00:00" },
+      })),
+      temporalColumns,
+    );
+    if (!prepared.executable) {
+      throw new Error("Expected an executable UPDATE plan");
+    }
+    const riskCheck = vi.spyOn(driver, "getMutationAtomicityRisk");
+    const transaction = vi
+      .spyOn(driver, "runTransaction")
+      .mockResolvedValue(undefined);
+
+    const result = await executePreparedApplyPlan(manager, prepared.plan);
+
+    expect(result.success).toBe(true);
+    expect(riskCheck).toHaveBeenCalledExactlyOnceWith(
+      "target",
+      "schema",
+      "temporal_rows",
+    );
+    expect(transaction).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["DATE", "date", "2026-10-01", "2026-10-02"],
+    ["TIME", "time", "10:00:00", "11:00:00"],
+    ["DATETIME", "datetime", "2026-10-01 10:00:00", "2026-10-01 11:00:00"],
+  ] as const)("uses the changed temporal %s primary key for UPDATE verification readback", async (nativeType, category, previousValue, nextValue) => {
+    const h = harness(null, false);
+    h.transaction.mockResolvedValue(undefined);
+    const integerPrimaryKey: ColumnTypeMeta = {
+      ...columns[0],
+      primaryKeyOrdinal: 1,
+    };
+    const temporalPrimaryKey: ColumnTypeMeta = {
+      ...columns[0],
+      name: "event_time",
+      type: nativeType,
+      nativeType,
+      category,
+      primaryKeyOrdinal: 2,
+    };
+    const plan = h.prepare(
+      [
+        {
+          // Input PK order differs from metadata/ordinal order.
+          primaryKeys: { id: 7, event_time: previousValue },
+          changes: { event_time: nextValue, amount: "12.34" },
+        },
+      ],
+      [temporalPrimaryKey, integerPrimaryKey, columns[1]],
+    );
+
+    const result = await executePreparedApplyPlan(h.manager, plan);
+
+    expect(result.success).toBe(true);
+    const options = h.transaction.mock.calls[0]?.[2];
+    expect(options?.verifications?.[0]).toMatchObject({
+      sql: expect.stringContaining("WHERE `id` = ? AND `event_time` = ?"),
+      params: [7, nextValue],
+      values: [
+        {
+          column: expect.objectContaining({ name: "amount" }),
+          expectedValue: "12.34",
+        },
+      ],
+    });
+    expect(h.riskCheck).toHaveBeenCalledOnce();
+  });
 
   it("atomic: rejects an unsafe verified UPDATE before even an unverified INSERT on another table", async () => {
     const h = harness();
@@ -365,6 +511,141 @@ describe("verified UPDATE rollback preflight", () => {
     );
     expect(h.transaction).not.toHaveBeenCalled();
     expect(result.insertApplied).not.toBe(true);
+  });
+
+  it("atomic: rechecks every table before a mixed temporal UPDATE and unverified temporal INSERT", async () => {
+    const h = harness(null, false);
+    const temporalColumns: ColumnTypeMeta[] = [
+      columns[0],
+      { ...columns[1], nativeType: "TIMESTAMP", category: "datetime" },
+    ];
+    const apply = h.prepare(
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { amount: "2026-10-02 12:00:00" },
+        },
+      ],
+      temporalColumns,
+    );
+    const temporalInsert: PreparedInsertPlan = {
+      ...insert,
+      operation: {
+        sql: "INSERT INTO other_rows (event_at) VALUES (?)",
+        params: ["2026-10-02 12:00:00"],
+      },
+    };
+    expect(apply.verificationTargets[0].values).toEqual([]);
+    expect(temporalInsert.verification).toBeUndefined();
+
+    // Both preview-time checks see transactional engines; the INSERT table's
+    // engine changes before confirmation.
+    await h.riskCheck("target", "ignored_schema", "unsafe_rows");
+    await h.riskCheck("target", "ignored_schema", "other_rows");
+    h.riskCheck.mockImplementation(async (_database, _schema, table) =>
+      table === "other_rows" ? riskMessage : null,
+    );
+
+    const result = await executeAtomicSqlApplyPlan(h.manager, apply, [
+      temporalInsert,
+    ]);
+
+    expect(result).toMatchObject({
+      success: false,
+      error: expect.stringContaining(riskMessage),
+    });
+    expect(h.riskCheck.mock.calls.map(([, , table]) => table)).toEqual([
+      "unsafe_rows",
+      "other_rows",
+      "unsafe_rows",
+      "other_rows",
+    ]);
+    expect(h.transaction).not.toHaveBeenCalled();
+    expect(h.events).toEqual([]);
+    expect([...h.stored]).toEqual([]);
+  });
+
+  it("atomic: rechecks a mixed temporal mutation after a same-table preview", async () => {
+    const h = harness(null, false);
+    const temporalColumns: ColumnTypeMeta[] = [
+      columns[0],
+      { ...columns[1], nativeType: "TIMESTAMP", category: "datetime" },
+    ];
+    const apply = h.prepare(
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { amount: "2026-10-02 12:00:00" },
+        },
+      ],
+      temporalColumns,
+    );
+    const temporalInsert: PreparedInsertPlan = {
+      ...insert,
+      table: "unsafe_rows",
+      operation: {
+        sql: "INSERT INTO unsafe_rows (event_at) VALUES (?)",
+        params: ["2026-10-02 12:00:00"],
+      },
+    };
+    expect(apply.verificationTargets[0].values).toEqual([]);
+    expect(temporalInsert.verification).toBeUndefined();
+
+    // Preview sees InnoDB; the engine changes before the user confirms.
+    await h.riskCheck("target", "ignored_schema", "unsafe_rows");
+    h.riskCheck.mockResolvedValue(riskMessage);
+
+    const result = await executeAtomicSqlApplyPlan(h.manager, apply, [
+      temporalInsert,
+    ]);
+
+    expect(result).toMatchObject({
+      success: false,
+      error: expect.stringContaining(riskMessage),
+    });
+    expect(h.riskCheck.mock.calls.map(([, , table]) => table)).toEqual([
+      "unsafe_rows",
+      "unsafe_rows",
+    ]);
+    expect(h.transaction).not.toHaveBeenCalled();
+    expect(h.events).toEqual([]);
+    expect([...h.stored]).toEqual([]);
+  });
+
+  it("atomic: allows mixed temporal mutations when every table supports rollback", async () => {
+    const h = harness(null, false);
+    const temporalColumns: ColumnTypeMeta[] = [
+      columns[0],
+      { ...columns[1], nativeType: "TIMESTAMP", category: "datetime" },
+    ];
+    const apply = h.prepare(
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { amount: "2026-10-02 12:00:00" },
+        },
+      ],
+      temporalColumns,
+    );
+    const temporalInsert: PreparedInsertPlan = {
+      ...insert,
+      operation: {
+        sql: "INSERT INTO other_rows (event_at) VALUES (?)",
+        params: ["2026-10-02 12:00:00"],
+      },
+    };
+
+    const result = await executeAtomicSqlApplyPlan(h.manager, apply, [
+      temporalInsert,
+    ]);
+
+    expect(result).toMatchObject({ success: true, insertApplied: true });
+    expect(h.riskCheck.mock.calls.map(([, , table]) => table)).toEqual([
+      "unsafe_rows",
+      "other_rows",
+    ]);
+    expect(h.transaction).toHaveBeenCalledOnce();
+    expect(h.events).toEqual(["BEGIN", "INSERT", "UPDATE", "COMMIT"]);
   });
 
   it("does not inspect rollback metadata for an entirely skipped UPDATE plan", async () => {

@@ -12,11 +12,13 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import React, {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
 import type { QueryResult } from "../../../store";
+import { getCellPreviewTitle } from "../../../utils/cellPreview";
 import {
   buildCellSelectionClassName,
   classifyCellSelection,
@@ -247,7 +249,6 @@ export function QueryResultsGrid({
 
   const wasDraggedRef = React.useRef(false);
   const columnOrderRef = React.useRef(columnOrder);
-  columnOrderRef.current = columnOrder;
 
   const { onHeaderMouseDown: handleHeaderMouseDown } = useColumnDragReorder({
     getColumnOrder: () => columnOrderRef.current,
@@ -276,7 +277,6 @@ export function QueryResultsGrid({
   });
 
   const tableRows = table.getRowModel().rows;
-  sortedRowsRef.current = tableRows;
   const virtualizer = useVirtualizer({
     count: tableRows.length,
     getScrollElement: () => scrollRef.current,
@@ -286,20 +286,29 @@ export function QueryResultsGrid({
   const virtualItems = virtualizer.getVirtualItems();
   const totalVirtualHeight = virtualizer.getTotalSize();
 
-  scrollToCellRef.current = (row: number, col: number) => {
-    virtualizer.scrollToIndex(row, { align: "auto" });
-    requestAnimationFrame(() => {
+  const scrollToCell = useCallback(
+    (row: number, col: number) => {
+      virtualizer.scrollToIndex(row, { align: "auto" });
       requestAnimationFrame(() => {
-        if (col === 0) {
-          scrollRef.current?.scrollTo({ left: 0 });
-        }
-        const cell = scrollRef.current?.querySelector(
-          `td[data-row="${row}"][data-col="${col}"]`,
-        ) as HTMLElement | null;
-        cell?.scrollIntoView({ block: "nearest", inline: "nearest" });
+        requestAnimationFrame(() => {
+          if (col === 0) {
+            scrollRef.current?.scrollTo({ left: 0 });
+          }
+          const cell = scrollRef.current?.querySelector(
+            `td[data-row="${row}"][data-col="${col}"]`,
+          ) as HTMLElement | null;
+          cell?.scrollIntoView({ block: "nearest", inline: "nearest" });
+        });
       });
-    });
-  };
+    },
+    [virtualizer],
+  );
+
+  useLayoutEffect(() => {
+    columnOrderRef.current = columnOrder;
+    sortedRowsRef.current = tableRows;
+    scrollToCellRef.current = scrollToCell;
+  }, [columnOrder, scrollToCell, tableRows]);
 
   return (
     <div
@@ -568,7 +577,7 @@ export const QueryTableRow = React.memo(function QueryTableRow({
               cursor: isCollapsed ? "default" : "pointer",
               userSelect: "none",
             }}
-            title={isNull ? "" : formatScalarValueForDisplay(raw)}
+            title={isCollapsed || isNull ? "" : getCellPreviewTitle(raw)}
             onMouseDown={(event) => {
               if (!isCollapsed) {
                 selection.handleCellMouseDown(index, visualPos, event);

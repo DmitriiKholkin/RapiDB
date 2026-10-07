@@ -5,6 +5,7 @@ import {
   prepareApplyChangesPlan,
 } from "../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
+import { buildUpdateRowSql } from "../../src/extension/table/updateSql";
 import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
 
 const columns: ColumnTypeMeta[] = [
@@ -161,7 +162,134 @@ describe("B01 raw persisted-edit prevalidation", () => {
     ])
       expect(spy).not.toHaveBeenCalled();
   });
-  it("ignores undefined and unknown changes and omitted identity/default values", async () => {
+  it.each([
+    false,
+    true,
+  ])("rejects unknown SQL UPDATE keys before coercion, preview or writes (hooks %s)", async (hooks) => {
+    const s = setup(hooks);
+    const result = prepareApplyChangesPlan(
+      s.manager as never,
+      "prevalidation",
+      "db",
+      "public",
+      "items",
+      [
+        { primaryKeys: {}, changes: { amuont: "2.34" } },
+        { primaryKeys: { id: 2 }, changes: { amount: "2.34", amuont: "3" } },
+      ],
+      columns,
+    );
+
+    expect(result).toMatchObject({
+      executable: false,
+      result: {
+        success: false,
+        failedRows: [0, 1],
+        rowOutcomes: [
+          {
+            rowIndex: 0,
+            status: "prevalidation_failed",
+            columns: ["amuont"],
+            message: expect.stringContaining('unknown column "amuont"'),
+          },
+          {
+            rowIndex: 1,
+            status: "prevalidation_failed",
+            columns: ["amuont"],
+            message: expect.stringContaining('unknown column "amuont"'),
+          },
+        ],
+      },
+    });
+    await expect(
+      s.service.updateRow(
+        "prevalidation",
+        "db",
+        "public",
+        "items",
+        { id: 1 },
+        { amuont: "2.34" },
+      ),
+    ).rejects.toMatchObject({
+      status: "prevalidation_failed",
+      columns: ["amuont"],
+      message: expect.stringContaining('unknown column "amuont"'),
+    });
+    for (const spy of [
+      s.preview,
+      s.query,
+      s.transaction,
+      s.coerce,
+      s.hookUpdate,
+    ])
+      expect(spy).not.toHaveBeenCalled();
+
+    expect(() =>
+      buildUpdateRowSql(
+        s.driver,
+        "db",
+        "public",
+        "items",
+        { id: 1 },
+        { amuont: "2.34" },
+        columns,
+      ),
+    ).toThrow('unknown column "amuont"');
+  });
+
+  it("still prepares and executes a normal SQL UPDATE", async () => {
+    const s = setup();
+    const prepared = prepareApplyChangesPlan(
+      s.manager as never,
+      "prevalidation",
+      "db",
+      "public",
+      "items",
+      [{ primaryKeys: { id: 2 }, changes: { amount: "2.34" } }],
+      columns,
+    );
+    expect(prepared).toMatchObject({
+      executable: true,
+      plan: { operations: [{ sql: expect.stringContaining('"amount" =') }] },
+    });
+    await s.service.updateRow(
+      "prevalidation",
+      "db",
+      "public",
+      "items",
+      { id: 2 },
+      { amount: "2.34" },
+    );
+    expect(s.query).toHaveBeenCalledOnce();
+  });
+
+  it("keeps unknown NoSQL identity and pseudo keys outside SQL validation", () => {
+    const s = setup();
+    vi.spyOn(s.driver, "getCapabilities").mockReturnValue({
+      ...s.driver.getCapabilities(),
+      tabularRead: "nosql",
+    });
+    const prepared = prepareApplyChangesPlan(
+      s.manager as never,
+      "prevalidation",
+      "db",
+      "public",
+      "items",
+      [
+        {
+          primaryKeys: { _id: "mongo-id" },
+          changes: { _id: "mongo-id", $rapidbMongoId: { type: "objectId" } },
+        },
+      ],
+      columns,
+    );
+    expect(prepared).toMatchObject({
+      executable: false,
+      result: { success: true, rowOutcomes: [{ status: "skipped" }] },
+    });
+  });
+
+  it("ignores undefined changes and omitted identity/default values", async () => {
     const s = setup();
     const check = vi.spyOn(s.driver, "checkPersistedEdit");
     const prepared = prepareApplyChangesPlan(
@@ -170,7 +298,7 @@ describe("B01 raw persisted-edit prevalidation", () => {
       "db",
       "public",
       "items",
-      [{ primaryKeys: {}, changes: { amount: undefined, unknown: "1.239" } }],
+      [{ primaryKeys: {}, changes: { amount: undefined } }],
       columns,
     );
     expect(prepared).toMatchObject({

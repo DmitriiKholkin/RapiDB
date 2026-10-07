@@ -1,3 +1,4 @@
+import { isServerGeneratedColumn } from "../../shared/tableTypes";
 import type { ColumnTypeMeta, IDBDriver } from "../dbDrivers/types";
 
 export function coerceRecord(
@@ -21,6 +22,17 @@ export function writableEntries(
     if (value === undefined) return false;
     return isWritableColumn(colMap.get(columnName));
   });
+}
+
+export function unknownSqlMutationColumns(
+  driver: IDBDriver,
+  values: Record<string, unknown>,
+  colMap: Map<string, ColumnTypeMeta>,
+): string[] {
+  if (driver.getCapabilities?.().tabularRead !== "sql") return [];
+  return Object.entries(values)
+    .filter(([name, value]) => value !== undefined && !colMap.has(name))
+    .map(([name]) => name);
 }
 
 export function filterWritableRecord(
@@ -95,6 +107,12 @@ export function buildUpdateRowSql(
 ): { sql: string; params: unknown[] } | null {
   const qt = drv.qualifiedTableName(database, schema, table);
   const colMap = new Map(cols.map((c) => [c.name, c]));
+  const unknownColumns = unknownSqlMutationColumns(drv, changes, colMap);
+  if (unknownColumns.length > 0) {
+    throw new Error(
+      `Update contains unknown column${unknownColumns.length === 1 ? "" : "s"} ${unknownColumns.map((name) => `"${name}"`).join(", ")}. Refresh the table schema and try again.`,
+    );
+  }
 
   const coercedChanges = coerceRecord(
     drv,
@@ -154,5 +172,5 @@ export function buildUpdateRowSql(
 function isWritableColumn(
   column: ColumnTypeMeta | undefined,
 ): column is ColumnTypeMeta {
-  return !!column;
+  return !!column && !isServerGeneratedColumn(column);
 }

@@ -422,8 +422,60 @@ describe("sshRuntime", () => {
     expect(runtime.verifiedFingerprintSha256).toBe(
       buildSshFingerprintSha256(Buffer.from("ssh-host-key")),
     );
+    const verifier = createdClients[0]?.connectOptions?.hostVerifier;
+    expect(verifier?.(Buffer.from("ssh-host-key"))).toBe(true);
+    expect(verifier?.(Buffer.from("changed-host-key"))).toBe(false);
 
     await runtime.dispose();
+  });
+
+  it.each([
+    "manual",
+    "trustOnFirstUse",
+  ] as const)("rejects a mismatched saved pin in %s mode", async (hostVerificationMode) => {
+    await expect(
+      createRuntime({
+        ...sshSettings,
+        hostVerificationMode,
+        fingerprintSha256: "SHA256:wrong",
+      }),
+    ).rejects.toThrow("Host verification failed");
+    expect(createdClients[0]?.ended).toBe(true);
+    expect(createdClients[0]?.forwardOutCalls).toEqual([]);
+  });
+
+  it.each([
+    undefined,
+    "",
+    "   ",
+  ])("rejects manual verification without a fingerprint (%s)", async (fingerprintSha256) => {
+    await expect(
+      createRuntime({ ...sshSettings, fingerprintSha256 }),
+    ).rejects.toThrow("Host verification failed");
+    expect(createdClients[0]?.ended).toBe(true);
+  });
+
+  it("enforces a learned TOFU pin on a subsequent connection", async () => {
+    const first = await createRuntime({
+      ...sshSettings,
+      hostVerificationMode: "trustOnFirstUse",
+      fingerprintSha256: undefined,
+    });
+    const fingerprintSha256 = first.verifiedFingerprintSha256;
+    await first.dispose();
+    const second = await createRuntime({
+      ...sshSettings,
+      hostVerificationMode: "trustOnFirstUse",
+      fingerprintSha256,
+    });
+    try {
+      expect(second.verifiedFingerprintSha256).toBe(fingerprintSha256);
+      const verifier = createdClients[1]?.connectOptions?.hostVerifier;
+      expect(verifier?.(Buffer.from("ssh-host-key"))).toBe(true);
+      expect(verifier?.(Buffer.from("changed-host-key"))).toBe(false);
+    } finally {
+      await second.dispose();
+    }
   });
 
   it("creates HTTP-agent runtimes for private-key SSH auth and disposes the client", async () => {

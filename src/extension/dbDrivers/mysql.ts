@@ -1,4 +1,4 @@
-import type { Connection as NativeMysqlConnection } from "mysql2";
+import type { Connection as NativeMysqlConnection, Query } from "mysql2";
 import type {
   FieldPacket,
   Pool,
@@ -14,10 +14,16 @@ import type { OperationCancellationContext } from "../../shared/safetyContracts"
 import type { ConnectionConfig } from "../connectionManager";
 import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
+import { SqlTlsSocket } from "../services/sqlTlsSocket";
 import { buildWhere } from "../table/filterSql";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
 import { BoundedQueryRows, queryCollectionLimit } from "./boundedQueryRows";
-import { discardMysqlResultHistory } from "./mysqlBoundedQuery";
+import { exactNumericFilterLiteral } from "./exactNumericFilter";
+import { literalContainsPattern } from "./literalContains";
+import {
+  createMysqlStreamingQuery,
+  discardMysqlResultHistory,
+} from "./mysqlBoundedQuery";
 import {
   DriverTimeoutError,
   type DriverTimeoutSettingsProvider,
@@ -495,7 +501,7 @@ function parseMysqlBitWidth(nativeType: string): number | null {
   return Number.isInteger(width) && width > 0 ? width : null;
 }
 function toMysqlIntegerFilterParam(val: string): number | string {
-  if (/^-?\d+$/.test(val)) {
+  if (/^[+-]?\d+$/.test(val)) {
     const big = BigInt(val);
     const safe = BigInt(Number.MAX_SAFE_INTEGER);
     if (big > safe || big < -safe) {
@@ -1080,6 +1086,8 @@ export class MySQLDriver extends BaseDBDriver {
   private readonly activeQueryConnections = new Set<PoolConnection>();
   private readonly activeQueryOperations = new Set<MysqlQueryOperation>();
   private activeQueryConnectionSlots = 0;
+  private connectionEpoch = 0;
+  private connectionAbortController?: AbortController;
   constructor(
     config: ConnectionConfig,
     timeoutSettingsProvider?: DriverTimeoutSettingsProvider,
@@ -1100,66 +1108,97 @@ export class MySQLDriver extends BaseDBDriver {
   }
 
   async connect(): Promise<void> {
+    const epoch = ++this.connectionEpoch;
+    this.connectionAbortController?.abort();
+    const abortController = new AbortController();
+    this.connectionAbortController = abortController;
     if (this.pool !== null) {
-      try {
-        await this.pool.end();
-      } catch {}
+      const previousPool = this.pool;
       this.pool = null;
+      try {
+        await previousPool.end();
+      } catch {}
     }
-    const tlsSettings = resolveConnectionTlsSettings(this.config);
-    const forwardedTransport = getSshTcpForwardTransport(this.config);
-    const ssl: MysqlSslOptions | undefined = tlsSettings
-      ? {
-          rejectUnauthorized: tlsSettings.rejectUnauthorized,
-          ca: tlsSettings.ca,
-          cert: tlsSettings.cert,
-          key: tlsSettings.key,
-          passphrase: tlsSettings.passphrase,
-        }
-      : undefined;
-
-    if (ssl && tlsSettings?.checkServerIdentity) {
-      (
-        ssl as MysqlSslOptions & { checkServerIdentity?: unknown }
-      ).checkServerIdentity = tlsSettings.checkServerIdentity;
-    }
-
-    if (ssl && tlsSettings?.servername) {
-      (ssl as MysqlSslOptions & { servername?: string }).servername =
-        tlsSettings.servername;
-    }
-
-    const pool = mysql.createPool({
-      host: forwardedTransport?.localHost ?? this.config.host,
-      port: forwardedTransport?.localPort ?? this.config.port,
-      database: this.config.database,
-      user: this.config.username,
-      password: this.config.password,
-      waitForConnections: true,
-      connectionLimit: 5,
-      connectTimeout: this.getConnectionTimeoutMs(),
-      idleTimeout: 30000,
-      dateStrings: true,
-      decimalNumbers: false,
-      bigNumberStrings: true,
-      supportBigNumbers: true,
-      ssl,
-    });
+    let pool: Pool | undefined;
     try {
+      this.assertConnectionEpoch(epoch);
+      const tlsSettings = await resolveConnectionTlsSettings(
+        this.config,
+        abortController.signal,
+      );
+      this.assertConnectionEpoch(epoch);
+      const forwardedTransport = getSshTcpForwardTransport(this.config);
+      const ssl: MysqlSslOptions | undefined = tlsSettings
+        ? {
+            rejectUnauthorized: tlsSettings.rejectUnauthorized,
+            verifyIdentity: !tlsSettings.skipHostnameVerification,
+            ca: tlsSettings.ca,
+            cert: tlsSettings.cert,
+            key: tlsSettings.key,
+            passphrase: tlsSettings.passphrase,
+          }
+        : undefined;
+
+      const endpointHost = forwardedTransport?.localHost ?? this.config.host;
+      const endpointPort = forwardedTransport?.localPort ?? this.config.port;
+      // mysql2 uses config.host for both SNI and verification, ignoring
+      // ssl.servername/checkServerIdentity. Its supported verifyIdentity option
+      // controls name checks; a stream keeps overrides away from TCP routing.
+      const tlsIdentity = tlsSettings?.servername?.replace(/^\[|\]$/g, "");
+      this.assertConnectionEpoch(epoch);
+      pool = mysql.createPool({
+        host: tlsIdentity ?? endpointHost,
+        port: endpointPort,
+        stream: tlsIdentity
+          ? () =>
+              new SqlTlsSocket(
+                endpointHost || "localhost",
+                endpointPort ?? 3306,
+                tlsIdentity,
+              ).connect(endpointPort ?? 3306)
+          : undefined,
+        database: this.config.database,
+        user: this.config.username,
+        password: this.config.password,
+        waitForConnections: true,
+        connectionLimit: 5,
+        connectTimeout: this.getConnectionTimeoutMs(),
+        idleTimeout: 30000,
+        dateStrings: true,
+        decimalNumbers: false,
+        bigNumberStrings: true,
+        supportBigNumbers: true,
+        ssl,
+      });
       const conn = await pool.getConnection();
       conn.release();
+      this.assertConnectionEpoch(epoch);
+      this.pool = pool;
+      pool = undefined;
     } catch (error) {
-      // Probe failed: do not leave an idle pool behind (sockets/timers).
-      // Pool stays local until success so concurrent readers never observe
-      // a half-initialized pool.
-      try {
-        await pool.end();
-      } catch {}
+      // Probe failed or the attempt was cancelled: do not leave an idle pool
+      // behind (sockets/timers). It stays local until success.
+      await pool?.end().catch(() => undefined);
       throw error;
+    } finally {
+      if (this.connectionAbortController === abortController) {
+        this.connectionAbortController = undefined;
+      }
     }
-    this.pool = pool;
+  }
+
+  private assertConnectionEpoch(epoch: number): void {
+    if (epoch !== this.connectionEpoch) {
+      throw new DOMException(
+        "MySQL connection attempt cancelled",
+        "AbortError",
+      );
+    }
   }
   async disconnect(): Promise<void> {
+    this.connectionEpoch += 1;
+    this.connectionAbortController?.abort();
+    this.connectionAbortController = undefined;
     try {
       await this.pool?.end();
     } finally {
@@ -1438,19 +1477,23 @@ export class MySQLDriver extends BaseDBDriver {
           truncated: false,
         };
       }
-      return this.withTrackedQueryConnection(
-        (connection) =>
-          this.withReadOnlyTransaction(connection, operationContext, () =>
-            this.executeBoundedScript(
-              connection,
-              statements,
-              params,
-              hardCap,
-              start,
-            ),
+      return this.withTrackedQueryConnection((connection) => {
+        // Preflight before even opening a read-only transaction. The detached
+        // command exercises the same factory used for every submitted command.
+        createMysqlStreamingQuery(
+          connection.connection as unknown as NativeMysqlConnection,
+          { sql: "", rowsAsArray: true },
+        );
+        return this.withReadOnlyTransaction(connection, operationContext, () =>
+          this.executeBoundedScript(
+            connection,
+            statements,
+            params,
+            hardCap,
+            start,
           ),
-        operationContext,
-      );
+        );
+      }, operationContext);
     }
     if (params && params.length > 0) {
       return this.withTrackedQueryConnection(
@@ -1532,7 +1575,7 @@ export class MySQLDriver extends BaseDBDriver {
         // connection, but its runtime value is the native Connection.
         const native =
           connection.connection as unknown as NativeMysqlConnection;
-        const command = native.query({
+        const command = createMysqlStreamingQuery(native, {
           sql,
           values: params as QueryOptions["values"],
           rowsAsArray: true,
@@ -1588,6 +1631,14 @@ export class MySQLDriver extends BaseDBDriver {
         command.on("result", onResult);
         command.on("error", fail);
         command.on("end", onEnd);
+        try {
+          // The installed native query accepts an existing Query, preserving its
+          // normal parameter formatting without constructing a callback command.
+          const submit = native.query as unknown as (command: Query) => Query;
+          submit.call(native, command);
+        } catch (error) {
+          fail(error instanceof Error ? error : new Error(String(error)));
+        }
       });
     }
     const result = this._parseQueryResult(
@@ -1610,11 +1661,28 @@ export class MySQLDriver extends BaseDBDriver {
       return operation();
     }
     await connection.query("START TRANSACTION READ ONLY");
+    let result: T | undefined;
+    let operationError: unknown;
+    let operationFailed = false;
     try {
-      return await operation();
-    } finally {
-      await connection.query("ROLLBACK").catch(() => undefined);
+      result = await operation();
+    } catch (error) {
+      operationFailed = true;
+      operationError = error;
     }
+    try {
+      await connection.query("ROLLBACK");
+    } catch (rollbackError) {
+      // Never return a connection with an unknown transaction state to mysql2.
+      this.activeQueryConnections.delete(connection);
+      connection.destroy();
+      throw new AggregateError(
+        operationFailed ? [operationError, rollbackError] : [rollbackError],
+        "MySQL read-only query rollback failed; the connection was discarded.",
+      );
+    }
+    if (operationFailed) throw operationError;
+    return result as T;
   }
 
   private async withTrackedQueryConnection<T>(
@@ -2160,6 +2228,7 @@ export class MySQLDriver extends BaseDBDriver {
     throwIfTransactionCancelled(context);
     const conn = await this.requirePool().getConnection();
     this.activeTransactionConnections.add(conn);
+    let discardTransactionConnection = false;
     const cancel = () => {
       if (this.activeTransactionConnections.delete(conn)) conn.destroy();
     };
@@ -2297,13 +2366,22 @@ export class MySQLDriver extends BaseDBDriver {
       );
       throwIfTransactionCancelled(context);
       await conn.commit();
-    } catch (e) {
-      await conn.rollback().catch(() => undefined);
-      throw e;
+    } catch (error) {
+      try {
+        await conn.rollback();
+      } catch (rollbackError) {
+        discardTransactionConnection = true;
+        throw new AggregateError(
+          [error, rollbackError],
+          "MySQL transaction and rollback failed; the connection was discarded.",
+        );
+      }
+      throw error;
     } finally {
       context?.signal.removeEventListener("abort", cancel);
       if (this.activeTransactionConnections.delete(conn)) {
-        conn.release();
+        if (discardTransactionConnection) conn.destroy();
+        else conn.release();
       }
     }
   }
@@ -2714,10 +2792,7 @@ export class MySQLDriver extends BaseDBDriver {
         return null;
       }
       const arrayValue = typeof val === "string" ? val : val[0];
-      return {
-        sql: `CAST(${col} AS CHAR) LIKE ?`,
-        params: [`%${arrayValue}%`],
-      };
+      return this.buildContainsFilter(col, literalContainsPattern(arrayValue));
     }
     if (
       column.category === "binary" &&
@@ -2925,6 +3000,15 @@ export class MySQLDriver extends BaseDBDriver {
       val !== ""
     ) {
       const sqlOp = this.sqlOperator(operator);
+      if (column.category === "integer" && !/^[+-]?\d+$/.test(val)) {
+        // Text transport alone is insufficient: MySQL can compare bigint
+        // against fractional strings using DOUBLE. Force an exact operand.
+        const operand = this.integerFilterOperand(column, val);
+        return {
+          sql: `${col} ${sqlOp} ${operand.sql}`,
+          params: [operand.value],
+        };
+      }
       const param =
         column.category === "integer"
           ? toMysqlIntegerFilterParam(val)
@@ -2934,10 +3018,28 @@ export class MySQLDriver extends BaseDBDriver {
       return { sql: `${col} ${sqlOp} ?`, params: [param] };
     }
     if (operator === "between" && Array.isArray(val)) {
+      if (column.category === "integer") {
+        const operands = val.map((part) =>
+          this.integerFilterOperand(column, part),
+        );
+        return {
+          sql: `${col} BETWEEN ${operands[0].sql} AND ${operands[1].sql}`,
+          params: operands.map((part) => part.value),
+        };
+      }
       return { sql: `${col} BETWEEN ? AND ?`, params: [val[0], val[1]] };
     }
     if (operator === "in" && typeof val === "string") {
       const parts = val.split(",").map((s) => s.trim());
+      if (column.category === "integer") {
+        const operands = parts.map((part) =>
+          this.integerFilterOperand(column, part),
+        );
+        return {
+          sql: `${col} IN (${operands.map((part) => part.sql).join(", ")})`,
+          params: operands.map((part) => part.value),
+        };
+      }
       return {
         sql: `${col} IN (${parts.map(() => "?").join(", ")})`,
         params: parts,
@@ -2949,6 +3051,9 @@ export class MySQLDriver extends BaseDBDriver {
       );
     }
     const v = typeof val === "string" ? val : val[0];
+    if (!["date", "time", "datetime"].includes(column.category)) {
+      return this.buildContainsFilter(col, literalContainsPattern(v));
+    }
     let finalVal = v;
     if (ISO_DATETIME_RE.test(v)) {
       finalVal = v
@@ -2960,8 +3065,34 @@ export class MySQLDriver extends BaseDBDriver {
     }
     const mysqlVal = DATETIME_SQL_RE.test(finalVal)
       ? `${finalVal}%`
-      : `%${finalVal}%`;
-    return { sql: `CAST(${col} AS CHAR) LIKE ?`, params: [mysqlVal] };
+      : ISO_DATETIME_RE.test(v)
+        ? `%${finalVal}%`
+        : literalContainsPattern(finalVal);
+    return this.buildContainsFilter(col, mysqlVal);
+  }
+  private integerFilterOperand(
+    column: ColumnTypeMeta,
+    value: string,
+  ): { sql: string; value: string } {
+    if (/^[+-]?\d+$/.test(value)) return { sql: "?", value };
+    const literal = exactNumericFilterLiteral(value, column.name, 65, 30);
+    return {
+      sql: `CAST(? AS DECIMAL(65,${literal.scale}))`,
+      value: literal.value,
+    };
+  }
+  private buildContainsFilter(
+    col: string,
+    pattern: string,
+  ): FilterConditionResult {
+    // mysql2.query() interpolates string parameters with backslash escapes.
+    // Transport only ASCII hex, then decode on the server: quotes/backslashes
+    // stay data even with NO_BACKSLASH_ESCAPES. CAST uses the same connection
+    // character set/collation as the left-hand CAST, keeping LIKE nonbinary.
+    return {
+      sql: `CAST(${col} AS CHAR) LIKE CAST(UNHEX(?) AS CHAR) ESCAPE '!'`,
+      params: [Buffer.from(pattern, "utf8").toString("hex")],
+    };
   }
   private isApproximateNumericType(nativeType: string): boolean {
     const base = mysqlTypeName(nativeType);

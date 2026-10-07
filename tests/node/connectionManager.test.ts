@@ -22,6 +22,13 @@ import {
   FakeConnectionManagerStore,
 } from "../support/fakeConnectionManagerStore";
 import { MockEventEmitter } from "../support/mockVscode";
+import {
+  MONGO_ERROR_SECRET,
+  MONGO_ERROR_URI,
+  MONGO_NUMERIC_PASSWORD_ERROR_URIS,
+  MONGO_QUERY_ERROR_URIS,
+  mongoCredentialError,
+} from "../support/mongoCredentialError";
 
 interface DriverBehavior {
   constructorError?: Error;
@@ -472,6 +479,130 @@ beforeEach(() => {
 });
 
 describe("ConnectionManager", () => {
+  it.each(
+    MONGO_QUERY_ERROR_URIS,
+  )("redacts malformed query-secret errors through the real Mongo testConnection route: %s", async (uri) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const { MongoDBDriver } = await vi.importActual<
+      typeof import("../../src/extension/dbDrivers/mongodb")
+    >("../../src/extension/dbDrivers/mongodb");
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      new FakeConnectionManagerStore(),
+    );
+    const createDriver = vi
+      .spyOn(
+        manager as unknown as {
+          createDriver(config: ConnectionConfig): IDBDriver;
+        },
+        "createDriver",
+      )
+      .mockImplementation((config) => new MongoDBDriver(config));
+    const result = await manager.testConnection({
+      name: "Real Mongo query-secret parse error",
+      type: "mongodb",
+      connectionUri: uri,
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("Protocol and host list are required");
+    expect(result.error).toContain("authMechanismProperties=[REDACTED]");
+    expect(result.error).not.toContain("H10_QUERY_SECRET");
+    if (uri.includes("retryWrites"))
+      expect(result.error).toContain("retryWrites=true");
+    expect(createDriver.mock.calls[0]?.[0].connectionUri).toBe(uri);
+    await manager.dispose();
+  });
+
+  it.each([
+    MONGO_ERROR_URI,
+    ...MONGO_NUMERIC_PASSWORD_ERROR_URIS,
+  ])("redacts the real MongoDB driver's parse error through the complete testConnection route: %s", async (uri) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const { MongoDBDriver } = await vi.importActual<
+      typeof import("../../src/extension/dbDrivers/mongodb")
+    >("../../src/extension/dbDrivers/mongodb");
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      new FakeConnectionManagerStore(),
+    );
+    const createDriver = vi
+      .spyOn(
+        manager as unknown as {
+          createDriver(config: ConnectionConfig): IDBDriver;
+        },
+        "createDriver",
+      )
+      .mockImplementation((config) => new MongoDBDriver(config));
+    const result = await manager.testConnection({
+      name: "Real Mongo parse error",
+      type: "mongodb",
+      connectionUri: uri,
+    });
+    expect(result).toEqual({
+      success: false,
+      error:
+        'Protocol and host list are required in "mongodb://[REDACTED]@/db"',
+    });
+    expect(createDriver.mock.calls[0]?.[0].connectionUri).toBe(uri);
+    await manager.dispose();
+  });
+
+  it("redacts actual upstream credential URI errors returned by testConnection", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const upstream = mongoCredentialError();
+    driverBehaviors.set("__test__", { connectError: upstream });
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      new FakeConnectionManagerStore(),
+    );
+    const result = await manager.testConnection({
+      name: "Mongo parser failure",
+      type: "mongodb",
+      connectionUri: MONGO_ERROR_URI,
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("Protocol and host list are required");
+    expect(result.error).toContain("mongodb://[REDACTED]@/db");
+    expect(result.error).not.toContain(MONGO_ERROR_SECRET);
+    expect((driverInstances[0]?.config as ConnectionConfig).connectionUri).toBe(
+      MONGO_ERROR_URI,
+    );
+    expect(upstream.message).toContain(MONGO_ERROR_SECRET);
+    await manager.dispose();
+  });
+
+  it("redacts raw known config secrets in test-connection errors", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    driverBehaviors.set("__test__", {
+      connectError: new Error("auth failed RAW_H10_PASSWORD: ECONNREFUSED"),
+    });
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      new FakeConnectionManagerStore(),
+    );
+    const result = await manager.testConnection({
+      name: "Raw password",
+      type: "mysql",
+      host: "localhost",
+      username: "root",
+      database: "app",
+      password: "RAW_H10_PASSWORD",
+    });
+    expect(result.error).toBe("auth failed [REDACTED]: ECONNREFUSED");
+    expect((driverInstances[0]?.config as ConnectionConfig).password).toBe(
+      "RAW_H10_PASSWORD",
+    );
+    await manager.dispose();
+  });
+
   it("connects successfully across all supported driver types with minimal valid configs", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
@@ -1157,6 +1288,45 @@ describe("ConnectionManager", () => {
     expect(disconnect).toHaveBeenCalledWith("conn-connecting");
   });
 
+  it.each([
+    "AbortError",
+    "Aborted",
+  ])("cancels a pending connection normally when its password is %s", async (password) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const id = "redacted-cancellation";
+    store.setConnections([
+      {
+        id,
+        name: "Cancellation",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+        password,
+      },
+    ]);
+    const pending = createDeferred<void>();
+    driverBehaviors.set(id, { connectImpl: () => pending.promise });
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    const attempt = manager.beginConnect(id).promise;
+    const settled = expect(attempt).resolves.toBeUndefined();
+    await vi.waitFor(() => expect(driverInstances[0]?.connectCalls).toBe(1));
+    await manager.disconnectFrom(id);
+    await settled;
+    expect(manager.isConnected(id)).toBe(false);
+    pending.resolve();
+    await vi.waitFor(() =>
+      expect(driverInstances[0]?.isConnected()).toBe(false),
+    );
+    await manager.dispose();
+  });
+
   it("renames a connection folder without disconnecting matching connections", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
@@ -1616,6 +1786,8 @@ describe("ConnectionManager", () => {
     });
 
     expect(saved.id).not.toBe("");
+    expect(saved.password).toBeUndefined();
+    expect(saved.useSecretStorage).toBe(true);
     expect(store.getConnections()[0]?.id).toBe(saved.id);
     await expect(store.getSecret(saved.id)).resolves.toContain("secret");
     await expect(store.getSecret("")).resolves.toBeUndefined();
@@ -2581,7 +2753,9 @@ describe("ConnectionManager", () => {
       await expect(manager.connectTo(config.id)).rejects.toBe(failure);
       expect(createSshRuntime).toHaveBeenCalledOnce();
       expect(dispose).toHaveBeenCalledOnce();
-      expect(driverInstances).toHaveLength(0);
+      expect(driverInstances).toHaveLength(1);
+      expect(driverInstances[0]?.connectCalls).toBe(1);
+      expect(driverInstances[0]?.disconnectCalls).toBeGreaterThanOrEqual(1);
       expect(manager.isConnected(config.id)).toBe(false);
       expect(manager.isConnecting(config.id)).toBe(false);
       expect(
@@ -2727,7 +2901,7 @@ describe("ConnectionManager", () => {
     expect(dispose).toHaveBeenCalledTimes(1);
   });
 
-  it("pins the learned SSH fingerprint after the first trust-on-first-use handshake", async () => {
+  it("pins the learned SSH fingerprint after the first successful trust-on-first-use connection", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
     );
@@ -2791,6 +2965,451 @@ describe("ConnectionManager", () => {
         .find((connection) => connection.id === "conn-ssh-tofu")?.ssh
         ?.hostFingerprintSha256,
     ).toBe("SHA256:LearnedTrustOnFirstUseFingerprint1234567890+/=");
+  });
+
+  describe("SSH TOFU pin lifecycle", () => {
+    function setup() {
+      const config = createSshPgConfig("ssh-tofu-lifecycle");
+      config.ssh = {
+        ...config.ssh,
+        hostVerificationMode: "trustOnFirstUse",
+        hostFingerprintSha256: undefined,
+      };
+      const store = new FakeConnectionManagerStore();
+      store.setConnections([config]);
+      const fingerprint =
+        "SHA256:LearnedTrustOnFirstUseFingerprint1234567890+/=";
+      const dispose = vi.fn(async () => undefined);
+      const createSshRuntime = vi.fn(async () => ({
+        transport: {
+          kind: "tcpForward" as const,
+          localHost: "127.0.0.1" as const,
+          localPort: 15436,
+          remoteHost: "db.internal",
+          remotePort: 5432,
+        },
+        verifiedFingerprintSha256: fingerprint,
+        dispose,
+      }));
+      return { config, store, fingerprint, dispose, createSshRuntime };
+    }
+
+    it.each([
+      "constructor",
+      "connect",
+    ] as const)("does not pin when the database %s fails", async (stage) => {
+      const { ConnectionManager } = await import(
+        "../../src/extension/connectionManager"
+      );
+      const { config, store, dispose, createSshRuntime } = setup();
+      const failure = new Error("database connection failed");
+      driverBehaviors.set(
+        config.id,
+        stage === "constructor"
+          ? { constructorError: failure }
+          : { connectError: failure },
+      );
+      const manager = new ConnectionManager(
+        createExtensionContextStub() as never,
+        store,
+        { createSshRuntime },
+      );
+      try {
+        await expect(manager.connectTo(config.id)).rejects.toBe(failure);
+        expect(
+          store.getConnections()[0].ssh?.hostFingerprintSha256,
+        ).toBeUndefined();
+        expect(dispose).toHaveBeenCalledOnce();
+        expect(manager.isConnected(config.id)).toBe(false);
+      } finally {
+        await manager.dispose();
+      }
+    });
+
+    it("does not pin test connections or mutate the submitted config", async () => {
+      const { ConnectionManager } = await import(
+        "../../src/extension/connectionManager"
+      );
+      const { config, store, dispose, createSshRuntime } = setup();
+      const manager = new ConnectionManager(
+        createExtensionContextStub() as never,
+        store,
+        { createSshRuntime },
+      );
+      const mutate = vi.spyOn(store, "mutateConnections");
+      try {
+        await expect(manager.testConnection(config)).resolves.toEqual({
+          success: true,
+        });
+        expect(mutate).not.toHaveBeenCalled();
+        expect(
+          store.getConnections()[0].ssh?.hostFingerprintSha256,
+        ).toBeUndefined();
+        expect(config.ssh?.hostFingerprintSha256).toBeUndefined();
+        expect(dispose).toHaveBeenCalledOnce();
+      } finally {
+        await manager.dispose();
+      }
+    });
+
+    it("does not pin a canceled database connection, including late success", async () => {
+      const { ConnectionManager } = await import(
+        "../../src/extension/connectionManager"
+      );
+      const { config, store, createSshRuntime } = setup();
+      const started = createDeferred<void>();
+      const finish = createDeferred<void>();
+      driverBehaviors.set(config.id, {
+        connectImpl: async () => {
+          started.resolve();
+          await finish.promise;
+        },
+      });
+      const manager = new ConnectionManager(
+        createExtensionContextStub() as never,
+        store,
+        { createSshRuntime },
+      );
+      try {
+        const attempt = manager.beginConnect(config.id);
+        await started.promise;
+        expect(
+          store.getConnections()[0].ssh?.hostFingerprintSha256,
+        ).toBeUndefined();
+        await manager.disconnectFrom(config.id);
+        finish.resolve();
+        await attempt.promise;
+        expect(
+          store.getConnections()[0].ssh?.hostFingerprintSha256,
+        ).toBeUndefined();
+        expect(manager.isConnected(config.id)).toBe(false);
+      } finally {
+        finish.resolve();
+        await manager.dispose();
+      }
+    });
+
+    it.each([
+      "pin",
+      "host",
+      "port",
+      "username",
+      "mode",
+      "removed",
+    ] as const)("rejects a concurrent SSH %s change without overwriting it", async (change) => {
+      const { ConnectionManager } = await import(
+        "../../src/extension/connectionManager"
+      );
+      const { config, store, dispose, createSshRuntime } = setup();
+      const started = createDeferred<void>();
+      const finish = createDeferred<void>();
+      driverBehaviors.set(config.id, {
+        connectImpl: async () => {
+          started.resolve();
+          await finish.promise;
+        },
+      });
+      const manager = new ConnectionManager(
+        createExtensionContextStub() as never,
+        store,
+        { createSshRuntime },
+      );
+      try {
+        const attempt = manager.beginConnect(config.id);
+        await started.promise;
+        const current = store.getConnections()[0];
+        const ssh = { ...current.ssh };
+        if (change === "pin")
+          ssh.hostFingerprintSha256 =
+            "SHA256:OtherPinnedFingerprint1234567890+/=";
+        if (change === "host") ssh.host = "other-bastion.internal";
+        if (change === "port") ssh.port = 2222;
+        if (change === "username") ssh.username = "other-user";
+        if (change === "mode") ssh.hostVerificationMode = "manual";
+        store.setConnections(change === "removed" ? [] : [{ ...current, ssh }]);
+        const expected = store.getConnections();
+        finish.resolve();
+        await expect(attempt.promise).rejects.toThrow(/SSH.*changed/);
+        expect(store.getConnections()).toEqual(expected);
+        expect(dispose).toHaveBeenCalledOnce();
+        expect(driverInstances[0]?.disconnectCalls).toBeGreaterThanOrEqual(1);
+        expect(manager.isConnected(config.id)).toBe(false);
+      } finally {
+        finish.resolve();
+        await manager.dispose();
+      }
+    });
+
+    it("checks cancellation again when a queued pin mutation starts", async () => {
+      const { ConnectionManager } = await import(
+        "../../src/extension/connectionManager"
+      );
+      const { config, store, createSshRuntime } = setup();
+      const started = createDeferred<void>();
+      const finish = createDeferred<void>();
+      driverBehaviors.set(config.id, {
+        connectImpl: async () => {
+          started.resolve();
+          await finish.promise;
+        },
+      });
+      const manager = new ConnectionManager(
+        createExtensionContextStub() as never,
+        store,
+        { createSshRuntime },
+      );
+      const releaseQueue = createDeferred<void>();
+      try {
+        const attempt = manager.beginConnect(config.id);
+        await started.promise;
+        const blocker = store.mutateConnections(async () => {
+          await releaseQueue.promise;
+          return { result: undefined };
+        });
+        const mutate = vi.spyOn(store, "mutateConnections");
+        finish.resolve();
+        await vi.waitFor(() => expect(mutate).toHaveBeenCalledOnce());
+        await manager.disconnectFrom(config.id);
+        releaseQueue.resolve();
+        await blocker;
+        await attempt.promise;
+        expect(
+          store.getConnections()[0].ssh?.hostFingerprintSha256,
+        ).toBeUndefined();
+        expect(manager.isConnected(config.id)).toBe(false);
+      } finally {
+        finish.resolve();
+        releaseQueue.resolve();
+        await manager.dispose();
+      }
+    });
+
+    it.each([
+      false,
+      true,
+    ])("preserves the first concurrent pin (same key: %s)", async (sameKey) => {
+      const { ConnectionManager } = await import(
+        "../../src/extension/connectionManager"
+      );
+      const { config, store, fingerprint, createSshRuntime } = setup();
+      const first = new ConnectionManager(
+        createExtensionContextStub() as never,
+        store,
+        { createSshRuntime },
+      );
+      const secondDispose = vi.fn(async () => undefined);
+      const secondCreateRuntime = vi.fn(async () => ({
+        ...(await createSshRuntime()),
+        verifiedFingerprintSha256: sameKey
+          ? fingerprint
+          : "SHA256:OtherPinnedFingerprint1234567890+/=",
+        dispose: secondDispose,
+      }));
+      const second = new ConnectionManager(
+        createExtensionContextStub() as never,
+        store,
+        { createSshRuntime: secondCreateRuntime },
+      );
+      const bothStarted = createDeferred<void>();
+      const releaseFirst = createDeferred<void>();
+      const releaseSecond = createDeferred<void>();
+      let calls = 0;
+      driverBehaviors.set(config.id, {
+        connectImpl: async () => {
+          const ordinal = ++calls;
+          if (calls === 2) bothStarted.resolve();
+          await (ordinal === 1 ? releaseFirst.promise : releaseSecond.promise);
+        },
+      });
+      try {
+        const firstAttempt = first.beginConnect(config.id);
+        await vi.waitFor(() => expect(calls).toBe(1));
+        const secondAttempt = second.beginConnect(config.id);
+        await bothStarted.promise;
+        expect(
+          store.getConnections()[0].ssh?.hostFingerprintSha256,
+        ).toBeUndefined();
+        releaseFirst.resolve();
+        await firstAttempt.promise;
+        releaseSecond.resolve();
+        if (sameKey) {
+          await secondAttempt.promise;
+          expect(second.isConnected(config.id)).toBe(true);
+          await second.disconnectFrom(config.id);
+          await second.connectTo(config.id);
+          expect(secondCreateRuntime).toHaveBeenLastCalledWith(
+            expect.objectContaining({ fingerprintSha256: fingerprint }),
+            expect.anything(),
+            { signal: expect.any(AbortSignal) },
+          );
+        } else {
+          await expect(secondAttempt.promise).rejects.toThrow(/SSH.*changed/);
+          expect(second.isConnected(config.id)).toBe(false);
+          expect(secondDispose).toHaveBeenCalledOnce();
+        }
+        expect(store.getConnections()[0].ssh?.hostFingerprintSha256).toBe(
+          fingerprint,
+        );
+      } finally {
+        releaseFirst.resolve();
+        releaseSecond.resolve();
+        await Promise.all([first.dispose(), second.dispose()]);
+      }
+    });
+
+    it("does not restore a pin cleared during a pinned TOFU connection", async () => {
+      const { ConnectionManager } = await import(
+        "../../src/extension/connectionManager"
+      );
+      const { config, store, fingerprint, createSshRuntime } = setup();
+      config.ssh = { ...config.ssh, hostFingerprintSha256: fingerprint };
+      store.setConnections([config]);
+      driverBehaviors.set(config.id, {
+        connectImpl: async () => {
+          const current = store.getConnections()[0];
+          store.setConnections([
+            {
+              ...current,
+              ssh: { ...current.ssh, hostFingerprintSha256: undefined },
+            },
+          ]);
+        },
+      });
+      const manager = new ConnectionManager(
+        createExtensionContextStub() as never,
+        store,
+        { createSshRuntime },
+      );
+      try {
+        await expect(manager.connectTo(config.id)).rejects.toThrow(
+          /SSH.*changed/,
+        );
+        expect(
+          store.getConnections()[0].ssh?.hostFingerprintSha256,
+        ).toBeUndefined();
+      } finally {
+        await manager.dispose();
+      }
+    });
+
+    it.each([
+      "pg",
+      "mysql",
+      "mssql",
+      "oracle",
+      "mongodb",
+      "redis",
+      "elasticsearch",
+      "dynamodb",
+    ] as const)("pins only successful connects, not tests, for %s", async (type) => {
+      const { ConnectionManager } = await import(
+        "../../src/extension/connectionManager"
+      );
+      const { config, store, fingerprint, createSshRuntime } = setup();
+      config.type = type;
+      if (type === "oracle") config.serviceName = "app";
+      if (type === "dynamodb") config.awsRegion = "us-east-1";
+      if (type === "elasticsearch") config.endpoint = "http://db.internal:9200";
+      store.setConnections([config]);
+      const manager = new ConnectionManager(
+        createExtensionContextStub() as never,
+        store,
+        { createSshRuntime },
+      );
+      try {
+        await expect(manager.testConnection(config)).resolves.toEqual({
+          success: true,
+        });
+        expect(
+          store.getConnections()[0].ssh?.hostFingerprintSha256,
+        ).toBeUndefined();
+        await manager.connectTo(config.id);
+        expect(store.getConnections()[0].ssh?.hostFingerprintSha256).toBe(
+          fingerprint,
+        );
+        await manager.disconnectFrom(config.id);
+        await manager.connectTo(config.id);
+        expect(createSshRuntime).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            hostVerificationMode: "trustOnFirstUse",
+            fingerprintSha256: fingerprint,
+          }),
+          expect.anything(),
+          { signal: expect.any(AbortSignal) },
+        );
+      } finally {
+        await manager.dispose();
+      }
+    });
+
+    it("uses the same pin lifecycle for Elasticsearch Cloud HTTP agents", async () => {
+      const { ConnectionManager } = await import(
+        "../../src/extension/connectionManager"
+      );
+      const { config, store, fingerprint } = setup();
+      config.type = "elasticsearch";
+      config.cloudId = "deployment:ZXM=";
+      store.setConnections([config]);
+      const httpAgent = new http.Agent();
+      const httpsAgent = new https.Agent();
+      const dispose = vi.fn(async () => {
+        httpAgent.destroy();
+        httpsAgent.destroy();
+      });
+      const createSshRuntime = vi.fn(async () => ({
+        transport: { kind: "httpAgent" as const, httpAgent, httpsAgent },
+        verifiedFingerprintSha256: fingerprint,
+        dispose,
+      }));
+      const manager = new ConnectionManager(
+        createExtensionContextStub() as never,
+        store,
+        { createSshRuntime },
+      );
+      try {
+        await expect(manager.testConnection(config)).resolves.toEqual({
+          success: true,
+        });
+        expect(
+          store.getConnections()[0].ssh?.hostFingerprintSha256,
+        ).toBeUndefined();
+        await manager.connectTo(config.id);
+        expect(store.getConnections()[0].ssh?.hostFingerprintSha256).toBe(
+          fingerprint,
+        );
+        expect(createSshRuntime).toHaveBeenLastCalledWith(
+          expect.objectContaining({ hostVerificationMode: "trustOnFirstUse" }),
+          { kind: "httpAgent" },
+          { signal: expect.any(AbortSignal) },
+        );
+      } finally {
+        await manager.dispose();
+      }
+      expect(dispose).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not pin when the SSH handshake fails", async () => {
+      const { ConnectionManager } = await import(
+        "../../src/extension/connectionManager"
+      );
+      const { config, store, createSshRuntime } = setup();
+      const failure = new Error("SSH authentication failed");
+      createSshRuntime.mockRejectedValueOnce(failure);
+      const manager = new ConnectionManager(
+        createExtensionContextStub() as never,
+        store,
+        { createSshRuntime },
+      );
+      try {
+        await expect(manager.connectTo(config.id)).rejects.toBe(failure);
+        expect(
+          store.getConnections()[0].ssh?.hostFingerprintSha256,
+        ).toBeUndefined();
+        expect(driverInstances).toHaveLength(0);
+      } finally {
+        await manager.dispose();
+      }
+    });
   });
 
   it("disposes SSH runtime when a connect attempt becomes stale", async () => {
@@ -5037,6 +5656,417 @@ describe("ConnectionManager", () => {
       "app_db.public.users",
       "app_db.public.users",
     ]);
+  });
+
+  it("completes first table-detail requests waiting for the schema they started", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const schemaObjects = createDeferred<TableInfo[]>();
+    const schemaStarted = createDeferred<void>();
+    driverBehaviors.set("first-details", {
+      listDatabases: [
+        { name: "app_db", schemas: [] },
+        { name: "archive", schemas: [] },
+      ],
+      listSchemasByDatabase: { app_db: [{ name: "public" }] },
+      listObjectsImpl: (database) => {
+        if (database === "archive") {
+          schemaStarted.resolve();
+          return schemaObjects.promise;
+        }
+        return [];
+      },
+      describeTableImpl: () => [
+        {
+          name: "id",
+          type: "int",
+          nullable: false,
+          isPrimaryKey: true,
+          isForeignKey: false,
+        },
+      ],
+    });
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "first-details",
+        name: "Details",
+        type: "pg",
+        database: "app_db",
+        host: "localhost",
+        username: "postgres",
+      },
+    ]);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    const request = {
+      connectionId: "first-details",
+      database: "archive",
+      schema: "audit",
+      table: "users",
+      objectKind: "table",
+    } as const;
+    try {
+      await manager.connectTo(request.connectionId);
+      await manager.getSchemaSnapshotAsync(request.connectionId);
+      manager.ensureTableDetailLoading(request);
+      manager.ensureTableDetailLoading({ ...request, table: "events" });
+      await schemaStarted.promise;
+      expect(manager.getTableDetailState(request).status).toBe("loading");
+      schemaObjects.resolve([
+        { schema: "audit", name: "users", type: "table" },
+        { schema: "audit", name: "events", type: "table" },
+      ]);
+      await vi.waitFor(() => {
+        expect(manager.getTableDetailState(request).status).toBe("loaded");
+        expect(
+          manager.getTableDetailState({ ...request, table: "events" }).status,
+        ).toBe("loaded");
+      });
+      expect(
+        manager.getTableDetailState(request).snapshot.columns.items[0]?.name,
+      ).toBe("id");
+      // One description for discovery and one for details; no second demand.
+      expect(
+        driverInstances[0]?.describeTableCalls.filter(
+          (name) => name === "archive.audit.users",
+        ),
+      ).toHaveLength(2);
+    } finally {
+      schemaObjects.resolve([]);
+      await manager.dispose();
+    }
+  });
+
+  it("invalidates loaded and in-flight table details when a same-generation database load replaces a schema fragment", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const databaseSchemas = createDeferred<SchemaInfo[]>();
+    const databaseLoadStarted = createDeferred<void>();
+    const oldAuditIndexes = createDeferred<IndexMeta[]>();
+    const oldAuditDetailStarted = createDeferred<void>();
+    let metadataVersion = 1;
+
+    driverBehaviors.set("conn-1", {
+      listDatabases: [{ name: "app_db", schemas: [] }],
+      listSchemasImpl: () => {
+        databaseLoadStarted.resolve();
+        return databaseSchemas.promise;
+      },
+      listObjectsByScope: {
+        "app_db.public": [
+          { schema: "public", name: "users", type: "table" },
+          { schema: "public", name: "audit_log", type: "table" },
+        ],
+      },
+      describeTableImpl: () => [
+        {
+          name: `id_v${metadataVersion}`,
+          type: "int",
+          nullable: false,
+          isPrimaryKey: true,
+          primaryKeyOrdinal: 1,
+          isForeignKey: false,
+        },
+      ],
+      getConstraintsImpl: (_database, _schema, table) => [
+        {
+          name: `pk_${table}_v${metadataVersion}`,
+          kind: "primary_key",
+          columns: [`id_v${metadataVersion}`],
+          source: "catalog",
+        },
+      ],
+      getIndexesImpl: (_database, _schema, table) => {
+        if (table === "audit_log" && metadataVersion === 1) {
+          oldAuditDetailStarted.resolve();
+          return oldAuditIndexes.promise;
+        }
+        return [
+          {
+            name: `${table}_idx_v${metadataVersion}`,
+            columns: [`id_v${metadataVersion}`],
+            unique: false,
+            primary: false,
+          },
+        ];
+      },
+      getTriggersImpl: (_database, _schema, table) => [
+        {
+          name: `${table}_trigger_v${metadataVersion}`,
+          timing: "after",
+          events: ["insert"],
+          orientation: "row",
+        },
+      ],
+    });
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        database: "app_db",
+        host: "localhost",
+        username: "postgres",
+      },
+    ]);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    const usersRequest = {
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+      table: "users",
+      objectKind: "table",
+    } as const;
+    const auditRequest = {
+      ...usersRequest,
+      table: "audit_log",
+    } as const;
+
+    try {
+      await manager.connectTo("conn-1");
+      manager.ensureSchemaSnapshotLoading("conn-1");
+      await databaseLoadStarted.promise;
+
+      // The database load is held before it starts loading schema fragments.
+      // Load the same schema directly, then load table details in this generation.
+      manager.ensureSchemaScopeLoading("conn-1", {
+        kind: "schema",
+        database: "app_db",
+        schema: "public",
+      });
+      await waitForSchemaCondition(
+        manager,
+        "conn-1",
+        () =>
+          manager.getSchemaSnapshotState("conn-1", {
+            kind: "schema",
+            database: "app_db",
+            schema: "public",
+          }).status === "loaded",
+      );
+
+      manager.ensureTableDetailLoading(usersRequest);
+      await waitForTableDetailCondition(
+        manager,
+        "conn-1",
+        () => manager.getTableDetailState(usersRequest).status === "loaded",
+      );
+      manager.ensureTableDetailLoading(auditRequest);
+      await oldAuditDetailStarted.promise;
+
+      metadataVersion = 2;
+      databaseSchemas.resolve([{ name: "public" }]);
+      await manager.getSchemaSnapshotAsync("conn-1");
+
+      // The database-scope upsert replaces this schema fragment without
+      // advancing the connection generation. It must evict both cached and
+      // in-flight per-table metadata for just this schema.
+      expect(manager.getTableDetailState(usersRequest).status).toBe("idle");
+      expect(manager.getTableDetailState(auditRequest).status).toBe("idle");
+
+      manager.ensureTableDetailLoading(usersRequest);
+      manager.ensureTableDetailLoading(auditRequest);
+      await waitForTableDetailCondition(
+        manager,
+        "conn-1",
+        () =>
+          manager.getTableDetailState(usersRequest).status === "loaded" &&
+          manager.getTableDetailState(auditRequest).status === "loaded",
+      );
+
+      expect(
+        manager.getTableDetailState(usersRequest).snapshot.columns.items[0]
+          ?.name,
+      ).toBe("id_v2");
+      expect(
+        manager.getTableDetailState(usersRequest).snapshot.constraints.items[0]
+          ?.name,
+      ).toBe("pk_users_v2");
+      expect(
+        manager.getTableDetailState(usersRequest).snapshot.indexes.items[0]
+          ?.name,
+      ).toBe("users_idx_v2");
+      expect(
+        manager.getTableDetailState(usersRequest).snapshot.triggers.items[0]
+          ?.name,
+      ).toBe("users_trigger_v2");
+
+      const oldAuditDetailFinished = createDeferred<void>();
+      const subscription = manager.onDidChangeSchemaState((connectionId) => {
+        if (connectionId === "conn-1") oldAuditDetailFinished.resolve();
+      });
+      oldAuditIndexes.resolve([
+        {
+          name: "audit_log_idx_v1",
+          columns: ["id_v1"],
+          unique: false,
+          primary: false,
+        },
+      ]);
+      await oldAuditDetailFinished.promise;
+      subscription.dispose();
+
+      expect(
+        manager.getTableDetailState(auditRequest).snapshot.columns.items[0]
+          ?.name,
+      ).toBe("id_v2");
+      expect(
+        manager.getTableDetailState(auditRequest).snapshot.indexes.items[0]
+          ?.name,
+      ).toBe("audit_log_idx_v2");
+    } finally {
+      databaseSchemas.resolve([{ name: "public" }]);
+      oldAuditIndexes.resolve([]);
+      await manager.dispose();
+    }
+  });
+
+  it("does not let a table detail load from a previous schema generation overwrite refreshed details", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const oldIndexes = createDeferred<IndexMeta[]>();
+    const oldDetailStarted = createDeferred<void>();
+    let metadataVersion = 1;
+
+    driverBehaviors.set("conn-1", {
+      listDatabases: [{ name: "app_db", schemas: [] }],
+      listSchemasByDatabase: {
+        app_db: [{ name: "public" }],
+      },
+      listObjectsByScope: {
+        "app_db.public": [{ schema: "public", name: "users", type: "table" }],
+      },
+      describeTableImpl: () => [
+        {
+          name: `id_v${metadataVersion}`,
+          type: "int",
+          nullable: false,
+          isPrimaryKey: true,
+          primaryKeyOrdinal: 1,
+          isForeignKey: false,
+        },
+      ],
+      getConstraintsImpl: () => [
+        {
+          name: `pk_users_v${metadataVersion}`,
+          kind: "primary_key",
+          columns: [`id_v${metadataVersion}`],
+          source: "catalog",
+        },
+      ],
+      getIndexesImpl: () => {
+        if (metadataVersion === 1) {
+          oldDetailStarted.resolve();
+          return oldIndexes.promise;
+        }
+        return [
+          {
+            name: "users_idx_v2",
+            columns: ["id_v2"],
+            unique: false,
+            primary: false,
+          },
+        ];
+      },
+      getTriggersImpl: () => [
+        {
+          name: `users_trigger_v${metadataVersion}`,
+          timing: "after",
+          events: ["update"],
+          orientation: "row",
+        },
+      ],
+    });
+
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        database: "app_db",
+        host: "localhost",
+        username: "postgres",
+      },
+    ]);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    const request = {
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+      table: "users",
+      objectKind: "table",
+    } as const;
+
+    try {
+      await manager.connectTo("conn-1");
+      await manager.getSchemaSnapshotAsync("conn-1");
+      manager.ensureTableDetailLoading(request);
+      await oldDetailStarted.promise;
+
+      metadataVersion = 2;
+      manager.refreshSchemaCache({
+        connectionId: "conn-1",
+        reason: "manual",
+      });
+      await manager.getSchemaSnapshotAsync("conn-1");
+      manager.ensureTableDetailLoading(request);
+      await waitForTableDetailCondition(
+        manager,
+        "conn-1",
+        () => manager.getTableDetailState(request).status === "loaded",
+      );
+      expect(
+        manager.getTableDetailState(request).snapshot.indexes.items[0]?.name,
+      ).toBe("users_idx_v2");
+
+      const oldDetailFinished = createDeferred<void>();
+      const subscription = manager.onDidChangeSchemaState((connectionId) => {
+        if (connectionId === "conn-1") oldDetailFinished.resolve();
+      });
+      oldIndexes.resolve([
+        {
+          name: "users_idx_v1",
+          columns: ["id_v1"],
+          unique: false,
+          primary: false,
+        },
+      ]);
+      await oldDetailFinished.promise;
+      subscription.dispose();
+
+      expect(manager.getTableDetailState(request).status).toBe("loaded");
+      expect(
+        manager.getTableDetailState(request).snapshot.columns.items[0]?.name,
+      ).toBe("id_v2");
+      expect(
+        manager.getTableDetailState(request).snapshot.constraints.items[0]
+          ?.name,
+      ).toBe("pk_users_v2");
+      expect(
+        manager.getTableDetailState(request).snapshot.indexes.items[0]?.name,
+      ).toBe("users_idx_v2");
+      expect(
+        manager.getTableDetailState(request).snapshot.triggers.items[0]?.name,
+      ).toBe("users_trigger_v2");
+    } finally {
+      oldIndexes.resolve([]);
+      await manager.dispose();
+    }
   });
 
   it("skips non-applicable table detail loaders per manifest", async () => {

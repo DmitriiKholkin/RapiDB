@@ -5,7 +5,10 @@ import {
 } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
-import { resolveConnectionTlsSettings } from "../services/connectionTls";
+import {
+  type ResolvedConnectionTlsSettings,
+  resolveConnectionTlsSettings,
+} from "../services/connectionTls";
 import { pMapWithLimit } from "../utils/concurrency";
 import { logger } from "../utils/logger";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
@@ -19,6 +22,13 @@ import {
   stringifyCommandPayload,
   unsupported,
 } from "./nosqlUtils";
+import {
+  isRedisUnprefixedKeysTable,
+  REDIS_ALL_KEYS_TABLE,
+  REDIS_EMPTY_PREFIX_TABLE,
+  REDIS_UNPREFIXED_KEYS_TABLE,
+  redisKeyspacePattern,
+} from "./redisKeyspace";
 import {
   DriverTimeoutError,
   type DriverTimeoutSettingsProvider,
@@ -37,6 +47,7 @@ import type {
   DriverOperationContext,
   DriverTablePageRequest,
   DriverTablePageResult,
+  DriverUpdateRowOutcome,
   DriverUpdateRowsRequest,
   ForeignKeyMeta,
   IDBDriver,
@@ -52,6 +63,10 @@ import type {
   TriggerMeta,
 } from "./types";
 import { NULL_SENTINEL, resolveFilterOperators } from "./types";
+import {
+  completeDriverUpdateRowsResult,
+  failedDriverUpdateRows,
+} from "./updateRowOutcomes";
 
 const REDIS_ENTITY_MANIFEST: DriverEntityManifest = {
   dbObjectKinds: ["table"],
@@ -197,17 +212,15 @@ interface RedisClientEntry {
   abort: AbortController;
 }
 
+interface RedisConnectionAttempt {
+  abort: AbortController;
+  entry?: RedisClientEntry;
+}
+
 type RedisSortedSetEntry = {
   score: number;
   value: string;
 };
-
-// Keep the historical all-keys identity for saved queries. A real first
-// prefix cannot contain ':', so 'default:' is an unambiguous navigation ID.
-function keyspacePattern(table: string): string {
-  if (table === "default") return "*";
-  return table === "default:" ? "default:*" : `${table}:*`;
-}
 
 function compareRedisValueTypes(left: string, right: string): number {
   const leftIndex = REDIS_VALUE_TYPE_ORDER.indexOf(
@@ -446,11 +459,13 @@ function decideRedisReadOnlyQuery(queryText: string) {
 export class RedisDriver implements IDBDriver {
   private client: RedisClient | null = null;
   private connected = false;
+  private tlsSettings: ResolvedConnectionTlsSettings | undefined;
   private epoch = 0;
   private connecting?: Promise<void>;
+  private connectionAbortController?: AbortController;
   private readonly connectionAttempts = new WeakMap<
     Promise<unknown>,
-    RedisClientEntry
+    RedisConnectionAttempt
   >();
   private readonly databaseClients = new Map<number, RedisClientEntry>();
   private readonly clients = new Set<RedisClientEntry>();
@@ -467,14 +482,25 @@ export class RedisDriver implements IDBDriver {
     }
     if (this.connecting) return this.connecting;
     const epoch = this.epoch;
-    let entry: RedisClientEntry;
-    try {
-      entry = this.openClient(this.resolveDbIndex());
-    } catch (error) {
-      return Promise.reject(error);
-    }
-    const attempt = entry.promise
-      .then((client) => {
+    const state: RedisConnectionAttempt = { abort: new AbortController() };
+    this.connectionAbortController = state.abort;
+    let attempt: Promise<void>;
+    attempt = Promise.resolve()
+      .then(async () => {
+        const tlsSettings = await resolveConnectionTlsSettings(
+          this.config,
+          state.abort.signal,
+        );
+        if (epoch !== this.epoch) {
+          throw new DOMException(
+            "Redis connection attempt was cancelled.",
+            "AbortError",
+          );
+        }
+        this.tlsSettings = tlsSettings;
+        const entry = this.openClient(this.resolveDbIndex());
+        state.entry = entry;
+        const client = await entry.promise;
         if (epoch !== this.epoch || entry.cancelled) {
           this.cancelClientEntry(entry);
           throw new Error("Redis connection attempt was cancelled.");
@@ -484,18 +510,30 @@ export class RedisDriver implements IDBDriver {
       })
       .finally(() => {
         if (this.connecting === attempt) this.connecting = undefined;
+        if (this.connectionAbortController === state.abort) {
+          this.connectionAbortController = undefined;
+        }
       });
+    // Register before asynchronous TLS resolution, not only after client creation.
+    this.connectionAttempts.set(attempt, state);
     this.connecting = attempt;
-    this.connectionAttempts.set(attempt, entry);
     return attempt;
   }
 
   cancelConnectionAttempt(attempt: Promise<unknown>): void {
-    const entry = this.connectionAttempts.get(attempt);
-    if (!entry) return;
-    this.cancelClientEntry(entry);
-    if (this.connecting === attempt) this.connecting = undefined;
-    if (this.client === entry.client) {
+    const state = this.connectionAttempts.get(attempt);
+    if (!state) return;
+    state.abort.abort();
+    if (state.entry) this.cancelClientEntry(state.entry);
+    if (this.connecting === attempt) {
+      this.epoch += 1;
+      this.connecting = undefined;
+      this.tlsSettings = undefined;
+    }
+    if (this.connectionAbortController === state.abort) {
+      this.connectionAbortController = undefined;
+    }
+    if (state.entry && this.client === state.entry.client) {
       this.client = null;
       this.connected = false;
     }
@@ -506,7 +544,7 @@ export class RedisDriver implements IDBDriver {
     signal: AbortSignal,
   ): RedisClient {
     const forwardedTransport = getSshTcpForwardTransport(this.config);
-    const tlsSettings = resolveConnectionTlsSettings(this.config);
+    const tlsSettings = this.tlsSettings;
     // node-redis gives URI fields priority over explicit options. Rewrite both
     // the DB and forwarded endpoint, retaining URI authentication and TLS.
     const uri = this.config.connectionUri
@@ -657,9 +695,12 @@ export class RedisDriver implements IDBDriver {
   async disconnect(): Promise<void> {
     const client = this.client;
     this.epoch += 1;
+    this.connectionAbortController?.abort();
+    this.connectionAbortController = undefined;
     this.client = null;
     this.connected = false;
     this.connecting = undefined;
+    this.tlsSettings = undefined;
     this.databaseClients.clear();
     for (const abort of this.queries.values()) abort.abort();
     this.queries.clear();
@@ -728,16 +769,25 @@ export class RedisDriver implements IDBDriver {
       "*",
       REDIS_READ_BUDGET.maxScanKeys,
     );
-    const names = new Set<string>();
+    const prefixedNames = new Set<string>();
+    let hasUnprefixedKeys = false;
     for (const key of keys) {
-      const firstPrefix = key.includes(":") ? key.split(":")[0] : null;
-      const prefix = firstPrefix === "default" ? "default:" : firstPrefix;
-      names.add(prefix || "default");
+      const separator = key.indexOf(":");
+      if (separator < 0) {
+        hasUnprefixedKeys = true;
+      } else if (separator === 0) {
+        prefixedNames.add(REDIS_EMPTY_PREFIX_TABLE);
+      } else {
+        const prefix = key.slice(0, separator);
+        prefixedNames.add(prefix === "default" ? "default:" : prefix);
+      }
     }
-    if (names.size === 0) {
-      names.add("default");
-    }
-    return [...names].sort().map((name) => ({
+    const names = [
+      REDIS_ALL_KEYS_TABLE,
+      ...(hasUnprefixedKeys ? [REDIS_UNPREFIXED_KEYS_TABLE] : []),
+      ...[...prefixedNames].sort((left, right) => left.localeCompare(right)),
+    ];
+    return names.map((name) => ({
       schema: "",
       name,
       type: "table",
@@ -929,12 +979,11 @@ export class RedisDriver implements IDBDriver {
     const startTime = performance.now();
     const client = await this.getDatabaseClient(request.database);
     if (this.canUseKeyOnlyPaging(request)) {
-      const pattern = keyspacePattern(request.table);
       const offset = Math.max(0, (request.page - 1) * request.pageSize);
       const keys = (
-        await this.scanKeys(
+        await this.scanTableKeys(
           client,
-          pattern,
+          request.table,
           REDIS_READ_BUDGET.maxScanKeys,
           true,
         )
@@ -1002,89 +1051,120 @@ export class RedisDriver implements IDBDriver {
       ? baseClient.withAbortSignal(context.signal)
       : baseClient;
     let affectedRows = 0;
-    for (const update of request.updates) {
-      context?.signal.throwIfAborted();
-      const sourceKey = this.resolveStoredKey(update.primaryKeys.key);
-      if (!sourceKey) {
-        continue;
-      }
+    const updateRowOutcomes: DriverUpdateRowOutcome[] = [];
+    for (const [rowIndex, update] of request.updates.entries()) {
+      let writeMayHaveApplied = false;
+      try {
+        context?.signal.throwIfAborted();
+        const sourceKey = this.resolveStoredKey(update.primaryKeys.key);
+        if (!sourceKey) {
+          updateRowOutcomes.push({ rowIndex, status: "not_applied" });
+          continue;
+        }
 
-      const hasKeyChange = Object.hasOwn(update.changes, "key");
-      const targetKey = hasKeyChange
-        ? this.resolveStoredKey(update.changes.key)
-        : sourceKey;
-      if (!targetKey) {
-        throw new Error("Redis key updates require a non-empty 'key' value.");
-      }
+        const hasKeyChange = Object.hasOwn(update.changes, "key");
+        const targetKey = hasKeyChange
+          ? this.resolveStoredKey(update.changes.key)
+          : sourceKey;
+        if (!targetKey) {
+          throw new Error("Redis key updates require a non-empty 'key' value.");
+        }
 
-      const keyChanged = sourceKey !== targetKey;
+        const keyChanged = sourceKey !== targetKey;
 
-      const hasValueChange =
-        Object.hasOwn(update.changes, "value") ||
-        Object.hasOwn(update.changes, "json") ||
-        Object.hasOwn(update.changes, "text");
-      const hasTtlChange = Object.hasOwn(update.changes, "ttl");
-      if (!keyChanged && !hasValueChange && !hasTtlChange) {
-        continue;
-      }
+        const hasValueChange =
+          Object.hasOwn(update.changes, "value") ||
+          Object.hasOwn(update.changes, "json") ||
+          Object.hasOwn(update.changes, "text");
+        const hasTtlChange = Object.hasOwn(update.changes, "ttl");
+        if (!keyChanged && !hasValueChange && !hasTtlChange) {
+          updateRowOutcomes.push({ rowIndex, status: "not_applied" });
+          continue;
+        }
 
-      const currentType = await client.type(sourceKey);
-      if (currentType === "stream" && hasValueChange) {
-        throw new Error(
-          "Redis stream values are read-only in the table viewer.",
+        const currentType = await client.type(sourceKey);
+        if (currentType === "stream" && hasValueChange) {
+          throw new Error(
+            "Redis stream values are read-only in the table viewer.",
+          );
+        }
+        const value =
+          update.changes.value ?? update.changes.json ?? update.changes.text;
+        const encodedValue = hasValueChange
+          ? this.encodeRedisLuaValue(currentType, value)
+          : "null";
+        const ttlSeconds = hasTtlChange
+          ? this.parseRedisTtlInput(update.changes.ttl, "Redis TTL updates")
+          : undefined;
+        const hasOriginalValue = Object.hasOwn(
+          update.originalValues ?? {},
+          "value",
+        );
+        const originalValue = hasOriginalValue
+          ? currentType === "string"
+            ? this.normalizeStoredValue(update.originalValues?.value)
+            : this.encodeRedisLuaValue(
+                currentType,
+                update.originalValues?.value,
+              )
+          : "";
+        writeMayHaveApplied = true;
+        const result = Number(
+          await client.sendCommand([
+            "EVAL",
+            REDIS_ATOMIC_EDIT_SCRIPT,
+            "2",
+            sourceKey,
+            targetKey,
+            currentType,
+            originalValue,
+            hasValueChange ? "1" : "0",
+            encodedValue,
+            ttlSeconds === undefined
+              ? "keep"
+              : ttlSeconds === null
+                ? "persist"
+                : "set",
+            ttlSeconds === undefined || ttlSeconds === null
+              ? "0"
+              : String(ttlSeconds),
+            hasOriginalValue ? "1" : "0",
+          ]),
+        );
+        if (result === -1) {
+          writeMayHaveApplied = false;
+          throw new Error(`Redis key '${targetKey}' already exists.`);
+        }
+        if (result === -2) {
+          writeMayHaveApplied = false;
+          throw new Error("Redis key type changed after the row was loaded.");
+        }
+        if (result === -3) {
+          writeMayHaveApplied = false;
+          throw new Error("Redis value changed after the row was loaded.");
+        }
+        if (result === 1) {
+          writeMayHaveApplied = false;
+          affectedRows++;
+          updateRowOutcomes.push({ rowIndex, status: "applied" });
+        } else if (result === 0) {
+          writeMayHaveApplied = false;
+          updateRowOutcomes.push({ rowIndex, status: "not_applied" });
+        } else {
+          updateRowOutcomes.push({ rowIndex, status: "unknown" });
+        }
+      } catch (error: unknown) {
+        throw failedDriverUpdateRows(
+          error,
+          request.updates.length,
+          updateRowOutcomes,
+          rowIndex,
+          affectedRows,
+          writeMayHaveApplied,
         );
       }
-      const value =
-        update.changes.value ?? update.changes.json ?? update.changes.text;
-      const encodedValue = hasValueChange
-        ? this.encodeRedisLuaValue(currentType, value)
-        : "null";
-      const ttlSeconds = hasTtlChange
-        ? this.parseRedisTtlInput(update.changes.ttl, "Redis TTL updates")
-        : undefined;
-      const hasOriginalValue = Object.hasOwn(
-        update.originalValues ?? {},
-        "value",
-      );
-      const originalValue = hasOriginalValue
-        ? currentType === "string"
-          ? this.normalizeStoredValue(update.originalValues?.value)
-          : this.encodeRedisLuaValue(currentType, update.originalValues?.value)
-        : "";
-      const result = Number(
-        await client.sendCommand([
-          "EVAL",
-          REDIS_ATOMIC_EDIT_SCRIPT,
-          "2",
-          sourceKey,
-          targetKey,
-          currentType,
-          originalValue,
-          hasValueChange ? "1" : "0",
-          encodedValue,
-          ttlSeconds === undefined
-            ? "keep"
-            : ttlSeconds === null
-              ? "persist"
-              : "set",
-          ttlSeconds === undefined || ttlSeconds === null
-            ? "0"
-            : String(ttlSeconds),
-          hasOriginalValue ? "1" : "0",
-        ]),
-      );
-      if (result === -1) {
-        throw new Error(`Redis key '${targetKey}' already exists.`);
-      }
-      if (result === -2) {
-        throw new Error("Redis key type changed after the row was loaded.");
-      }
-      if (result === -3) {
-        throw new Error("Redis value changed after the row was loaded.");
-      }
-      affectedRows += result === 1 ? 1 : 0;
     }
-    return { affectedRows };
+    return completeDriverUpdateRowsResult(affectedRows, updateRowOutcomes);
   }
 
   async insertRow(
@@ -1490,12 +1570,35 @@ export class RedisDriver implements IDBDriver {
     maxRows: number,
     failOnTruncation = false,
   ): Promise<RedisSampleRow[]> {
-    const pattern = keyspacePattern(table);
     const readLimit = Math.min(maxRows, REDIS_READ_BUDGET.maxValueReads);
     const keys = (
-      await this.scanKeys(client, pattern, readLimit, failOnTruncation)
+      await this.scanTableKeys(client, table, readLimit, failOnTruncation)
     ).sort((left, right) => left.localeCompare(right));
     return await this.readRowsForKeys(client, keys);
+  }
+
+  private async scanTableKeys(
+    client: RedisClient,
+    table: string,
+    limit: number,
+    failOnTruncation = false,
+  ): Promise<string[]> {
+    const unprefixed = isRedisUnprefixedKeysTable(table);
+    const keys = await this.scanKeys(
+      client,
+      redisKeyspacePattern(table),
+      unprefixed ? REDIS_READ_BUDGET.maxScanKeys : limit,
+      failOnTruncation,
+    );
+    const scopedKeys = unprefixed
+      ? keys.filter((key) => !key.includes(":"))
+      : keys;
+    if (failOnTruncation && scopedKeys.length > limit) {
+      throw new Error(
+        `Redis data exceeds the ${limit}-key safety limit. Narrow the filter before continuing or exporting.`,
+      );
+    }
+    return scopedKeys.slice(0, limit);
   }
 
   private async readRowsForKeys(

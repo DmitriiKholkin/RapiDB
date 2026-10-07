@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
+import { REDIS_ALL_KEYS_TABLE } from "../../src/extension/dbDrivers/redisKeyspace";
 import { QueryPanelController } from "../../src/extension/panels/queryPanelController";
 import { TablePanel } from "../../src/extension/panels/tablePanel";
 import type { ChunkedExportData } from "../../src/extension/utils/exportService";
@@ -28,7 +29,12 @@ const prepareInsertRowMock = vi.hoisted(() =>
 );
 const prepareApplyChangesPlanMock = vi.hoisted(() => vi.fn());
 const confirmMutationPreviewMock = vi.hoisted(() =>
-  vi.fn<() => Promise<unknown | null>>(async () => null),
+  vi.fn<
+    (previewToken: string, operationId?: string) => Promise<unknown | null>
+  >(async () => null),
+);
+const pendingPreviewControllerState = vi.hoisted(
+  () => new Map<string, string>(),
 );
 const createApplyChangesPreviewMock = vi.hoisted(() => vi.fn());
 const createInsertPreviewMock = vi.hoisted(() => vi.fn());
@@ -58,7 +64,7 @@ const vscodeMock = vi.hoisted(() => {
       title: "",
       webview: {
         html: "",
-        postMessage: vi.fn(),
+        postMessage: vi.fn(async (_message: unknown) => true),
         onDidReceiveMessage(
           listener: (message: unknown) => void | Promise<void>,
         ) {
@@ -163,12 +169,54 @@ vi.mock("../../src/extension/tableDataService", () => ({
 
 vi.mock("../../src/extension/panels/tableMutationPreviewController", () => ({
   TableMutationPreviewController: class {
-    clear = vi.fn();
-    confirm = confirmMutationPreviewMock;
-    cancel = vi.fn();
-    createApplyChangesPreview = createApplyChangesPreviewMock;
-    createInsertPreview = createInsertPreviewMock;
-    createDeleteRowsPreview = createDeleteRowsPreviewMock;
+    clear = vi.fn(() => pendingPreviewControllerState.clear());
+    confirm = vi.fn((previewToken: string, operationId?: string) => {
+      const pendingOperationId =
+        pendingPreviewControllerState.get(previewToken);
+      if (
+        pendingOperationId === undefined ||
+        (operationId && pendingOperationId !== operationId)
+      ) {
+        return Promise.resolve(null);
+      }
+      pendingPreviewControllerState.delete(previewToken);
+      return confirmMutationPreviewMock(previewToken, operationId);
+    });
+    cancel = vi.fn((previewToken: string, operationId?: string) => {
+      const pendingOperationId =
+        pendingPreviewControllerState.get(previewToken);
+      if (
+        pendingOperationId !== undefined &&
+        (!operationId || pendingOperationId === operationId)
+      ) {
+        pendingPreviewControllerState.delete(previewToken);
+      }
+    });
+    createApplyChangesPreview = (...args: unknown[]) =>
+      this.rememberPreview(createApplyChangesPreviewMock(...args));
+    createInsertPreview = (...args: unknown[]) =>
+      this.rememberPreview(createInsertPreviewMock(...args));
+    createDeleteRowsPreview = (...args: unknown[]) =>
+      this.rememberPreview(createDeleteRowsPreviewMock(...args));
+
+    private rememberPreview<T>(preview: T): T {
+      if (preview !== null && typeof preview === "object") {
+        const payload = preview as {
+          previewToken?: unknown;
+          operationId?: unknown;
+        };
+        if (
+          typeof payload.previewToken === "string" &&
+          typeof payload.operationId === "string"
+        ) {
+          pendingPreviewControllerState.set(
+            payload.previewToken,
+            payload.operationId,
+          );
+        }
+      }
+      return preview;
+    }
   },
 }));
 
@@ -188,6 +236,7 @@ describe("TablePanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     TablePanel.disposeAll();
+    pendingPreviewControllerState.clear();
     getColumnsMock.mockReset();
     getColumnsMock.mockResolvedValue([]);
     getPageMock.mockClear();
@@ -336,6 +385,428 @@ describe("TablePanel", () => {
         ),
       },
     });
+  });
+
+  it.each([
+    "resolves false",
+    "rejects",
+  ] as const)("retries the correlated delete evidence when result delivery %s", async (delivery) => {
+    const { panel } = await openSchemaRefreshPath();
+    prepareDeleteRowsPlanMock.mockResolvedValue({
+      previewStatements: ["DELETE FROM users WHERE id=1"],
+    });
+    await panel.webview.dispatchMessage({
+      type: "deleteRows",
+      payload: { operationId: "op-1", primaryKeysList: [{ id: 1 }] },
+    });
+
+    const execution = deferred<unknown>();
+    confirmMutationPreviewMock.mockImplementationOnce(() => execution.promise);
+    if (delivery === "resolves false") {
+      panel.webview.postMessage.mockResolvedValueOnce(false);
+    } else {
+      panel.webview.postMessage.mockRejectedValueOnce(
+        new Error("Delivery failed"),
+      );
+    }
+    const confirming = panel.webview.dispatchMessage({
+      type: "confirmMutationPreview",
+      payload: { operationId: "op-1", previewToken: "preview-token" },
+    });
+    await vi.waitFor(() =>
+      expect(confirmMutationPreviewMock).toHaveBeenCalledOnce(),
+    );
+
+    const result = {
+      type: "deleteResult",
+      payload: {
+        operationId: "op-1",
+        success: true,
+        affectedRows: 1,
+        rowOutcomes: [
+          {
+            rowIndex: 0,
+            primaryKeys: { id: 1 },
+            status: "deleted",
+            success: true,
+          },
+        ],
+        changesPossible: true,
+        outcomeUnknown: false,
+      },
+    };
+    execution.resolve(result);
+    await confirming;
+
+    expect(panel.webview.postMessage).toHaveBeenCalledTimes(4);
+    expect(panel.webview.postMessage).toHaveBeenNthCalledWith(3, result);
+    expect(panel.webview.postMessage).toHaveBeenNthCalledWith(4, result);
+    // A duplicated confirm cannot rerun the mutation while its result is retried.
+    await panel.webview.dispatchMessage({
+      type: "confirmMutationPreview",
+      payload: { operationId: "op-1", previewToken: "preview-token" },
+    });
+    expect(confirmMutationPreviewMock).toHaveBeenCalledOnce();
+    expect(panel.webview.postMessage).toHaveBeenCalledTimes(4);
+    expect(vscodeMock.module.window.showWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("preserves apply prevalidation diagnostics on false-to-true delivery without executing writes", async () => {
+    const { panel, connectionManager } = await openSchemaRefreshPath();
+    const error = 'Column "name" cannot persist the requested value exactly.';
+    connectionManager.getDriver.mockReturnValueOnce({
+      checkPersistedEdit: vi.fn(() => ({ ok: false, message: error })),
+    } as never);
+    const postCount = panel.webview.postMessage.mock.calls.length;
+    panel.webview.postMessage.mockResolvedValueOnce(false);
+
+    await panel.webview.dispatchMessage({
+      type: "applyChanges",
+      payload: {
+        operationId: "op-validation",
+        updates: [{ primaryKeys: { id: 1 }, changes: { name: "Invalid" } }],
+        insertValues: [{ name: "Invalid insert" }],
+      },
+    });
+
+    const result = {
+      type: "applyResult",
+      payload: {
+        operationId: "op-validation",
+        success: false,
+        error: `${error} ${error}`,
+        failedRows: [0],
+        insertApplied: false,
+        rowOutcomes: [
+          {
+            rowIndex: 0,
+            success: false,
+            status: "prevalidation_failed",
+            columns: ["name"],
+            message: error,
+          },
+        ],
+        insertRowOutcomes: [
+          {
+            rowIndex: 0,
+            success: false,
+            status: "prevalidation_failed",
+            columns: ["name"],
+            message: error,
+          },
+        ],
+      },
+    };
+    expect(panel.webview.postMessage).toHaveBeenCalledTimes(postCount + 2);
+    expect(panel.webview.postMessage).toHaveBeenNthCalledWith(
+      postCount + 1,
+      result,
+    );
+    expect(panel.webview.postMessage).toHaveBeenNthCalledWith(
+      postCount + 2,
+      result,
+    );
+    expect(prepareApplyChangesPlanMock).not.toHaveBeenCalled();
+    expect(prepareInsertRowMock).not.toHaveBeenCalled();
+    expect(confirmMutationPreviewMock).not.toHaveBeenCalled();
+    expect(vscodeMock.module.window.showWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      name: "committed staged INSERT success",
+      type: "applyResult",
+      payload: {
+        success: true,
+        insertApplied: true,
+        changesPossible: true,
+        outcomeUnknown: false,
+        rowOutcomes: [],
+        insertRowOutcomes: [{ rowIndex: 0, success: true, status: "applied" }],
+      },
+    },
+    {
+      name: "committed staged INSERT with rejected UPDATE",
+      type: "applyResult",
+      payload: {
+        success: false,
+        error: "Update rejected",
+        insertApplied: true,
+        changesPossible: true,
+        outcomeUnknown: false,
+        failedRows: [0],
+        rowOutcomes: [
+          {
+            rowIndex: 0,
+            success: false,
+            status: "not_applied",
+            message: "Update rejected",
+          },
+        ],
+        insertRowOutcomes: [{ rowIndex: 0, success: true, status: "applied" }],
+      },
+    },
+    {
+      name: "partial UPDATE with known row outcomes",
+      type: "applyResult",
+      payload: {
+        success: false,
+        error: "Second update rejected",
+        insertApplied: false,
+        changesPossible: true,
+        outcomeUnknown: false,
+        failedRows: [1],
+        rowOutcomes: [
+          { rowIndex: 0, success: true, status: "applied" },
+          {
+            rowIndex: 1,
+            success: false,
+            status: "not_applied",
+            message: "Second update rejected",
+          },
+        ],
+      },
+    },
+    {
+      name: "backend unknown UPDATE (not a delivery error)",
+      type: "applyResult",
+      payload: {
+        success: false,
+        error: "Backend acknowledgement lost",
+        insertApplied: false,
+        changesPossible: true,
+        outcomeUnknown: true,
+        rowOutcomes: [{ rowIndex: 0, success: false, status: "unknown" }],
+      },
+    },
+    {
+      name: "committed standalone INSERT",
+      type: "insertResult",
+      payload: { success: true },
+    },
+    {
+      name: "standalone INSERT validation diagnostics",
+      type: "insertResult",
+      payload: {
+        success: false,
+        error: "Invalid name",
+        status: "prevalidation_failed",
+        columns: ["name"],
+      },
+    },
+    {
+      name: "backend unknown DELETE with confirmed row evidence",
+      type: "deleteResult",
+      payload: {
+        success: false,
+        error: "Backend delete acknowledgement lost",
+        affectedRows: 1,
+        changesPossible: true,
+        outcomeUnknown: true,
+        rowOutcomes: [
+          {
+            rowIndex: 0,
+            primaryKeys: { id: 1 },
+            success: true,
+            status: "deleted",
+          },
+          {
+            rowIndex: 1,
+            primaryKeys: { id: 2 },
+            success: false,
+            status: "unknown",
+          },
+        ],
+      },
+    },
+  ])("preserves $name on false-to-true result delivery", async ({
+    type,
+    payload,
+  }) => {
+    const { panel } = await openSchemaRefreshPath();
+    prepareApplyChangesPlanMock.mockReturnValue({
+      executable: true,
+      plan: {
+        updates: [{ primaryKeys: { id: 1 }, changes: { name: "Edit" } }],
+        skippedRows: [],
+        previewStatements: ["UPDATE users"],
+      },
+    });
+    prepareInsertRowMock.mockResolvedValue({
+      previewStatements: ["INSERT INTO users DEFAULT VALUES"],
+    });
+    prepareDeleteRowsPlanMock.mockResolvedValue({
+      previewStatements: ["DELETE FROM users"],
+    });
+    const request =
+      type === "applyResult"
+        ? {
+            type: "applyChanges",
+            payload: {
+              operationId: "op-1",
+              updates: [{ primaryKeys: { id: 1 }, changes: { name: "Edit" } }],
+              insertValues: [{}],
+            },
+          }
+        : type === "insertResult"
+          ? { type: "insertRow", payload: { operationId: "op-1", values: {} } }
+          : {
+              type: "deleteRows",
+              payload: {
+                operationId: "op-1",
+                primaryKeysList: [{ id: 1 }, { id: 2 }],
+              },
+            };
+    await panel.webview.dispatchMessage(request);
+    const result = { type, payload: { operationId: "op-1", ...payload } };
+    confirmMutationPreviewMock.mockResolvedValueOnce(result);
+    const delivered: unknown[] = [];
+    panel.webview.postMessage.mockImplementationOnce(async () => false);
+    panel.webview.postMessage.mockImplementationOnce(
+      async (message: unknown) => {
+        delivered.push(message);
+        return true;
+      },
+    );
+    const postCount = panel.webview.postMessage.mock.calls.length;
+    await panel.webview.dispatchMessage({
+      type: "confirmMutationPreview",
+      payload: {
+        operationId: "op-1",
+        previewToken:
+          type === "applyResult"
+            ? "apply-preview-token"
+            : type === "insertResult"
+              ? "insert-preview-token"
+              : "preview-token",
+      },
+    });
+    expect(panel.webview.postMessage).toHaveBeenCalledTimes(postCount + 2);
+    expect(panel.webview.postMessage).toHaveBeenNthCalledWith(
+      postCount + 1,
+      result,
+    );
+    expect(panel.webview.postMessage).toHaveBeenNthCalledWith(
+      postCount + 2,
+      result,
+    );
+    expect(delivered).toEqual([result]);
+    expect((delivered[0] as typeof result).payload).toBe(result.payload);
+    expect(confirmMutationPreviewMock).toHaveBeenCalledOnce();
+    expect(vscodeMock.module.window.showWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "resolves false",
+    "rejects",
+  ] as const)("cancels an undelivered mutation preview when postMessage %s", async (delivery) => {
+    const { panel } = await openSchemaRefreshPath();
+    prepareApplyChangesPlanMock.mockReturnValue({
+      executable: true,
+      plan: {
+        updates: [{ primaryKeys: { id: 1 }, changes: { name: "Edit" } }],
+        skippedRows: [],
+        previewStatements: ["UPDATE users SET name = 'Edit' WHERE id = 1"],
+      },
+    });
+    const postCountBeforeMutation = panel.webview.postMessage.mock.calls.length;
+    if (delivery === "resolves false") {
+      panel.webview.postMessage.mockImplementationOnce(async () => false);
+    } else {
+      panel.webview.postMessage.mockRejectedValueOnce(
+        new Error("webview delivery failed"),
+      );
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "applyChanges",
+      payload: {
+        operationId: "op-1",
+        updates: [{ primaryKeys: { id: 1 }, changes: { name: "Edit" } }],
+      },
+    });
+
+    expect(panel.webview.postMessage).toHaveBeenCalledTimes(
+      postCountBeforeMutation + 2,
+    );
+    expect(panel.webview.postMessage).toHaveBeenNthCalledWith(
+      postCountBeforeMutation + 1,
+      {
+        type: "tableMutationPreview",
+        payload: expect.objectContaining({
+          operationId: "op-1",
+          previewToken: "apply-preview-token",
+        }),
+      },
+    );
+    expect(panel.webview.postMessage).toHaveBeenNthCalledWith(
+      postCountBeforeMutation + 2,
+      {
+        type: "applyResult",
+        payload: {
+          operationId: "op-1",
+          success: false,
+          error: expect.stringContaining("preview could not be delivered"),
+        },
+      },
+    );
+    expect(pendingPreviewControllerState.has("apply-preview-token")).toBe(
+      false,
+    );
+
+    await panel.webview.dispatchMessage({
+      type: "confirmMutationPreview",
+      payload: {
+        operationId: "op-1",
+        previewToken: "apply-preview-token",
+      },
+    });
+
+    expect(confirmMutationPreviewMock).not.toHaveBeenCalled();
+    expect(pendingPreviewControllerState.has("apply-preview-token")).toBe(
+      false,
+    );
+    expect(panel.webview.postMessage).toHaveBeenCalledTimes(
+      postCountBeforeMutation + 2,
+    );
+  });
+
+  it("does not warn or retry a mutation reply that resolves false after the panel is disposed", async () => {
+    const { panel } = await openSchemaRefreshPath();
+    prepareDeleteRowsPlanMock.mockResolvedValue({
+      previewStatements: ["DELETE FROM users WHERE id=1"],
+    });
+    await panel.webview.dispatchMessage({
+      type: "deleteRows",
+      payload: { operationId: "op-1", primaryKeysList: [{ id: 1 }] },
+    });
+    confirmMutationPreviewMock.mockResolvedValueOnce({
+      type: "deleteResult",
+      payload: {
+        operationId: "op-1",
+        success: true,
+        affectedRows: 1,
+        rowOutcomes: [],
+        changesPossible: true,
+        outcomeUnknown: false,
+      },
+    });
+
+    const delivery = deferred<boolean>();
+    panel.webview.postMessage.mockImplementationOnce(() => delivery.promise);
+    const confirming = panel.webview.dispatchMessage({
+      type: "confirmMutationPreview",
+      payload: { operationId: "op-1", previewToken: "preview-token" },
+    });
+    await vi.waitFor(() =>
+      expect(panel.webview.postMessage).toHaveBeenCalledTimes(3),
+    );
+    panel.dispose();
+    delivery.resolve(false);
+    await confirming;
+
+    expect(panel.webview.postMessage).toHaveBeenCalledTimes(3);
+    expect(vscodeMock.module.window.showWarningMessage).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -948,6 +1419,7 @@ describe("TablePanel", () => {
 
     expect(createWebviewShellMock).toHaveBeenCalledWith(
       expect.objectContaining({
+        extraCspDirectives: ["worker-src blob:"],
         initialState: expect.objectContaining({
           view: "table",
           connectionId: "conn-1",
@@ -1607,9 +2079,34 @@ describe("TablePanel", () => {
 
     expect(vscodeMock.createWebviewPanel).toHaveBeenLastCalledWith(
       "rapidb.tablePanel",
-      "activity (keyspace) [Cache]",
+      "activity:* (keyspace) [Cache]",
       expect.anything(),
       expect.anything(),
+    );
+
+    TablePanel.disposeAll();
+
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      redisManager as never,
+      "conn-redis",
+      "db0",
+      "db0",
+      REDIS_ALL_KEYS_TABLE,
+    );
+    expect(vscodeMock.createWebviewPanel).toHaveBeenLastCalledWith(
+      "rapidb.tablePanel",
+      "All keys (keyspace) [Cache]",
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(createWebviewShellMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        initialState: expect.objectContaining({
+          table: REDIS_ALL_KEYS_TABLE,
+          displayTableName: "All keys",
+        }),
+      }),
     );
 
     TablePanel.disposeAll();

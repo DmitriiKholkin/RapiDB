@@ -274,7 +274,7 @@ export class QueryPanelController {
       try {
         await this.connectionManager.connectTo(connectionId, "automatic");
       } catch (error: unknown) {
-        const normalized = normalizeUnknownError(error);
+        const normalized = normalizeUnknownError(error, connection);
         this.postQueryError(
           `Cannot connect: ${normalized.message}`,
           requestToken,
@@ -315,7 +315,7 @@ export class QueryPanelController {
     void this.connectionManager
       .addToHistory(connectionId, queryText)
       .catch((error) => {
-        console.error("[RapiDB] Failed to save query history:", error);
+        logger.error("Failed to save query history", error);
       });
 
     try {
@@ -348,7 +348,7 @@ export class QueryPanelController {
         payload: { ...formattedResult, ...resultIdentity },
       });
     } catch (error: unknown) {
-      const normalized = normalizeUnknownError(error);
+      const normalized = normalizeUnknownError(error, connection);
       this.postQueryError(normalized.message, requestToken, resultIdentity);
     } finally {
       const active = this.activeQueryExecutions.get(connectionId);
@@ -534,7 +534,7 @@ export class QueryPanelController {
       if (!this.isCurrentSchemaRequest(requestToken)) {
         return;
       }
-      console.error("[RapiDB] Failed to load schema:", error);
+      logger.error("Failed to load schema", error);
       this.view.postMessage({
         type: "schema",
         payload: { connectionId, schema: [] },

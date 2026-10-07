@@ -9,7 +9,7 @@
  *  - `normalizeUnknownError(value)` always returns an `Error` whose
  *    `.message` is a non-empty string.
  *  - If `value` is already an `Error` with a usable message, the same
- *    instance is returned (no wrapper, no stack mutation).
+ *    instance is returned unless diagnostic credential redaction is needed.
  *  - If `value` is a plain object, the helper walks a small set of
  *    well-known fields (`message`, `sqlMessage`, `detail`, `reason`,
  *    `cause`, `originalError`, `error`) and returns the first
@@ -17,6 +17,11 @@
  *  - For everything else (numbers, booleans, primitives), the value is
  *    `String()`-ified.
  */
+
+import {
+  redactDiagnosticText,
+  redactDiagnosticValue,
+} from "./diagnosticRedaction";
 
 function isMeaningfulString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
@@ -88,13 +93,17 @@ function formatUnknownErrorMessage(error: unknown): string {
  *
  * Behavior:
  *  - If `error` is already an `Error` whose message is meaningful, it is
- *    returned unchanged. This preserves the original `stack` and
- *    identity (callers can `instanceof`-check).
+ *    returned unchanged unless credentials require a sanitized copy.
+ *    The original error and its stack are never mutated.
  *  - If `error` is an `Error` with an empty `message`, a new `Error` is
  *    built with the inferred text and the original name/stack copied.
  *  - Otherwise, a fresh `Error` is built from the inferred message.
  */
-export function normalizeUnknownError(error: unknown): Error {
+export function normalizeUnknownError(
+  error: unknown,
+  secretContext?: unknown,
+): Error {
+  error = redactDiagnosticValue(error, secretContext);
   if (error instanceof Error) {
     const message = formatUnknownErrorMessage(error);
     if (message === error.message && message.trim().length > 0) {
@@ -117,6 +126,9 @@ export function normalizeUnknownError(error: unknown): Error {
  */
 export function logErrorWithContext(context: string, error: unknown): Error {
   const normalized = normalizeUnknownError(error);
-  console.error(`[RapiDB] ${context}:`, normalized.stack ?? normalized.message);
+  console.error(
+    `[RapiDB] ${redactDiagnosticText(context, error)}:`,
+    normalized.stack ?? normalized.message,
+  );
   return normalized;
 }

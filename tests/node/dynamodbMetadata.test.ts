@@ -340,6 +340,15 @@ describe("DynamoDBDriver metadata", () => {
       "tenant_id",
       "user_id",
     ]);
+    expect(
+      described.find((column) => column.name === "tenant_id")?.filterOperators,
+    ).toEqual(["like", "eq"]);
+    expect(
+      described.find((column) => column.name === "user_id")?.filterOperators,
+    ).toEqual(["like", "eq", "gt", "gte", "lt", "lte", "between"]);
+    expect(
+      described.find((column) => column.name === "email")?.filterOperators,
+    ).toEqual(["like", "is_null", "is_not_null"]);
 
     const page = await driver.readTablePage({
       database: "us-east-1",

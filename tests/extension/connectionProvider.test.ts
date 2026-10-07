@@ -1,4 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  REDIS_ALL_KEYS_TABLE,
+  REDIS_UNPREFIXED_KEYS_TABLE,
+} from "../../src/extension/dbDrivers/redisKeyspace";
 
 vi.mock("vscode", () => {
   class EventEmitter<T> {
@@ -1495,6 +1499,104 @@ describe("ConnectionProvider", () => {
     expect(byConnectionId.get("conn-redis")).toBe("database");
   });
 
+  it("renders Redis virtual keyspaces separately from real prefixes", async () => {
+    const connection = { id: "conn-redis", name: "Redis", type: "redis" };
+    let detailsLoading = true;
+    const connectionManager = {
+      getConnections: vi.fn(() => [connection]),
+      getConnection: vi.fn(() => connection),
+      isConnected: vi.fn(() => true),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      ensureTableDetailLoading: vi.fn(),
+      getTableDetailState: vi.fn(() => ({
+        status: detailsLoading ? "loading" : "loaded",
+        snapshot: {
+          columns: { status: "loaded", items: [{ name: "key", type: "text" }] },
+          constraints: { status: "loaded", items: [] },
+          indexes: { status: "loaded", items: [] },
+          triggers: { status: "loaded", items: [] },
+        },
+      })),
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "db0",
+              schemas: [
+                {
+                  name: "db0",
+                  objects: [
+                    { name: REDIS_ALL_KEYS_TABLE, type: "table", columns: [] },
+                    {
+                      name: REDIS_UNPREFIXED_KEYS_TABLE,
+                      type: "table",
+                      columns: [],
+                    },
+                    { name: "default:", type: "table", columns: [] },
+                    { name: "users", type: "table", columns: [] },
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+    const provider = new ConnectionProvider(connectionManager as never);
+    const roots = await provider.getChildren();
+    const databases = await provider.getChildren(roots[0]);
+    const categories = await provider.getChildren(databases[0]);
+    const tables = categories.find((node) => node.label === "Keyspaces");
+    if (!tables) throw new Error("Expected Redis Keyspaces category");
+
+    const nodes = await provider.getChildren(tables);
+    expect(nodes.map((node) => node.label)).toEqual([
+      "All keys",
+      "Unprefixed keys",
+      "default:*",
+      "users:*",
+    ]);
+    expect(nodes.map((node) => node.objectName)).toEqual([
+      REDIS_ALL_KEYS_TABLE,
+      REDIS_UNPREFIXED_KEYS_TABLE,
+      "default:",
+      "users",
+    ]);
+    for (const node of nodes) {
+      const loading = await provider.getChildren(node);
+      expect(loading[0]?.label).toBe(`Loading ${node.label}…`);
+    }
+    detailsLoading = false;
+    for (const node of nodes) {
+      const sections = await provider.getChildren(node);
+      const columns = sections.find((section) => section.label === "Columns");
+      expect(columns?.tooltip).toBe(`Columns for ${node.label}`);
+      if (!columns) throw new Error("Expected Redis columns section");
+      detailsLoading = true;
+      expect((await provider.getChildren(columns))[0]?.label).toBe(
+        `Loading ${node.label}…`,
+      );
+      detailsLoading = false;
+    }
+    expect(connectionManager.ensureTableDetailLoading).toHaveBeenCalledWith(
+      expect.objectContaining({ table: REDIS_ALL_KEYS_TABLE }),
+    );
+  });
+
   it("renders multi-schema databases from the shared schema snapshot", async () => {
     const connectionManager = {
       getConnections: vi.fn(() => [
@@ -1759,8 +1861,8 @@ describe("ConnectionProvider", () => {
     expect(redisCategories[0]?.tooltip).toContain("Keyspaces in db0");
 
     const redisObjects = await redisProvider.getChildren(redisCategories[0]);
-    expect(redisObjects.map((node) => node.label)).toEqual(["activity"]);
-    expect(redisObjects[0]?.tooltip).toContain("Keyspace: activity");
+    expect(redisObjects.map((node) => node.label)).toEqual(["activity:*"]);
+    expect(redisObjects[0]?.tooltip).toContain("Keyspace: activity:*");
     expect(redisObjects[0]?.tooltip).toContain("Database: db0");
     expect(redisObjects[0]?.tooltip).not.toContain("Schema:");
 

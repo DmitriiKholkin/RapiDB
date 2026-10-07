@@ -6,6 +6,7 @@ import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
 import { oracleAlternativeQuoteEnd } from "../utils/sqlStatementScan";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
 import { BoundedQueryRows, queryCollectionLimit } from "./boundedQueryRows";
+import { literalContainsPattern } from "./literalContains";
 import {
   indexedPlaceholderOffsets,
   replaceIndexedPlaceholders,
@@ -2848,6 +2849,12 @@ export class OracleDriver extends BaseDBDriver {
           : val[0];
       const xmlExpr = oracleXmlFilterExpr(column);
       const sqlOp = operator === "neq" ? "NOT LIKE" : "LIKE";
+      if (operator === "like" || operator === "ilike") {
+        return {
+          sql: `UPPER(${xmlExpr}) LIKE UPPER(:${paramIndex}) ESCAPE '!'`,
+          params: [literalContainsPattern(xmlValue)],
+        };
+      }
       return {
         sql: `UPPER(${xmlExpr}) ${sqlOp} UPPER(:${paramIndex})`,
         params: [`%${xmlValue}%`],
@@ -2859,8 +2866,8 @@ export class OracleDriver extends BaseDBDriver {
       }
       const arrayValue = typeof val === "string" ? val : val[0];
       return {
-        sql: `UPPER(${col}) LIKE UPPER(:${paramIndex})`,
-        params: [`%${arrayValue}%`],
+        sql: `UPPER(${col}) LIKE UPPER(:${paramIndex}) ESCAPE '!'`,
+        params: [literalContainsPattern(arrayValue)],
       };
     }
     if (
@@ -2966,8 +2973,12 @@ export class OracleDriver extends BaseDBDriver {
         };
       }
       return {
-        sql: `${temporalExpr} LIKE :${paramIndex}`,
-        params: [`%${comparable}%`],
+        sql: `${temporalExpr} LIKE :${paramIndex}${operator === "like" || operator === "ilike" ? " ESCAPE '!'" : ""}`,
+        params: [
+          operator === "like" || operator === "ilike"
+            ? literalContainsPattern(comparable)
+            : `%${comparable}%`,
+        ],
       };
     }
     if (operator === "between" && Array.isArray(val)) {
@@ -2984,6 +2995,12 @@ export class OracleDriver extends BaseDBDriver {
       };
     }
     const v = typeof val === "string" ? val : val[0];
+    if (operator === "like" || operator === "ilike") {
+      return {
+        sql: `UPPER(${col}) LIKE UPPER(:${paramIndex}) ESCAPE '!'`,
+        params: [literalContainsPattern(v)],
+      };
+    }
     return {
       sql: `UPPER(${col}) LIKE UPPER(:${paramIndex})`,
       params: [`%${v}%`],

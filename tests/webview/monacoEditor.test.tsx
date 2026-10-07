@@ -9,6 +9,8 @@ import {
 import {
   __resetMockMonacoState,
   __setMockSelectionText,
+  editor as mockEditor,
+  Selection,
 } from "../mocks/monaco-editor";
 
 afterEach(() => {
@@ -16,6 +18,69 @@ afterEach(() => {
 });
 
 describe("MonacoEditor", () => {
+  it("notifies the current selection callback and disposes the subscription on unmount", () => {
+    const create = mockEditor.create;
+    const disposeSelection = vi.fn();
+    const disposeEditor = vi.fn();
+    vi.spyOn(mockEditor, "create").mockImplementation((...args) => {
+      const instance = create(...args);
+      const subscribe = instance.onDidChangeCursorSelection;
+      vi.spyOn(instance, "onDidChangeCursorSelection").mockImplementation(
+        (listener) => {
+          const subscription = subscribe(listener);
+          return {
+            dispose: () => {
+              disposeSelection();
+              return subscription.dispose();
+            },
+          };
+        },
+      );
+      const dispose = instance.dispose;
+      vi.spyOn(instance, "dispose").mockImplementation(() => {
+        disposeEditor();
+        dispose();
+      });
+      return instance;
+    });
+    const firstCallback = vi.fn();
+    const nextCallback = vi.fn();
+    const ref = createRef<MonacoEditorHandle>();
+    const { rerender, unmount } = render(
+      <MonacoEditor
+        ref={ref}
+        initialValue="select 1"
+        onSelectionChange={firstCallback}
+      />,
+    );
+    const instance = vi.mocked(mockEditor.create).mock.results[0].value;
+    expect(instance.onDidChangeCursorSelection).toHaveBeenCalledTimes(1);
+    instance.setSelection(new Selection(1, 1, 1, 7));
+    expect(firstCallback).toHaveBeenCalledTimes(1);
+    expect(ref.current?.getSelectionOrValue()).toBe("select");
+
+    rerender(
+      <MonacoEditor
+        ref={ref}
+        initialValue="select 1"
+        onSelectionChange={nextCallback}
+      />,
+    );
+    __setMockSelectionText("1");
+    expect(nextCallback).toHaveBeenCalledTimes(1);
+    expect(ref.current?.getSelectionOrValue()).toBe("1");
+    instance.setPosition({ lineNumber: 1, column: 9 });
+    expect(nextCallback).toHaveBeenCalledTimes(2);
+    expect(ref.current?.getSelectionOrValue()).toBe("select 1");
+    expect(firstCallback).toHaveBeenCalledTimes(1);
+
+    unmount();
+    expect(disposeSelection).toHaveBeenCalledTimes(1);
+    expect(disposeEditor).toHaveBeenCalledTimes(1);
+    __setMockSelectionText("select");
+    expect(nextCallback).toHaveBeenCalledTimes(2);
+  });
+
   it("does not emit onChange when syncing a new initialValue", async () => {
     const handleChange = vi.fn();
 

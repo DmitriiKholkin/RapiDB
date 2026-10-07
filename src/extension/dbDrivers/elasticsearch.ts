@@ -1,3 +1,4 @@
+import type { ConnectionOptions as TlsConnectionOptions } from "node:tls";
 import { Client } from "@elastic/elasticsearch";
 import { HttpConnection } from "@elastic/transport";
 import {
@@ -8,6 +9,7 @@ import { ELASTICSEARCH_READ_BUDGET } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { getSshHttpAgentTransport } from "../driverRuntimeConfig";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
+import { createOwnedSshConnectionAgentFactory } from "../services/sshConnectionAgent";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import {
   formatDatetimeForDisplay,
@@ -44,6 +46,7 @@ import type {
   DriverTableExportRequest,
   DriverTablePageRequest,
   DriverTablePageResult,
+  DriverUpdateRowOutcome,
   DriverUpdateRowsRequest,
   ForeignKeyMeta,
   IDBDriver,
@@ -58,6 +61,10 @@ import type {
   TypeCategory,
 } from "./types";
 import { resolveFilterOperators } from "./types";
+import {
+  completeDriverUpdateRowsResult,
+  failedDriverUpdateRows,
+} from "./updateRowOutcomes";
 
 const ELASTICSEARCH_ENTITY_MANIFEST: DriverEntityManifest = {
   dbObjectKinds: ["table"],
@@ -70,6 +77,20 @@ const ELASTICSEARCH_ENTITY_MANIFEST: DriverEntityManifest = {
 };
 
 type ElasticsearchRestMethod = "GET" | "POST" | "PUT" | "DELETE";
+
+class SshTlsHttpConnection extends HttpConnection {
+  override buildRequestObject(
+    ...args: Parameters<HttpConnection["buildRequestObject"]>
+  ): ReturnType<HttpConnection["buildRequestObject"]> {
+    const request = super.buildRequestObject(...args);
+    // HttpConnection normally puts TLS settings on its own HTTPS agent. With
+    // the SSH agent factory it does neither that nor per-request TLS options.
+    // Keep settings request-local and use a connection-owned socket pool.
+    return this.url.protocol === "https:"
+      ? { ...request, ...this.tls }
+      : request;
+  }
+}
 
 const ELASTICSEARCH_READ_ONLY_QUERY_REASON =
   "[RapiDB] Read-only Elasticsearch connections allow only GET requests and POST _search requests.";
@@ -90,6 +111,8 @@ export class ElasticsearchDriver implements IDBDriver {
   private client: Client | null = null;
   private connected = false;
   private readonly pitReaders = new Set<ElasticsearchPitSession>();
+  private connectionEpoch = 0;
+  private connectionAbortController?: AbortController;
 
   constructor(
     private readonly config: ConnectionConfig,
@@ -100,65 +123,105 @@ export class ElasticsearchDriver implements IDBDriver {
     if (this.connected) {
       return;
     }
-    const protocol = isConnectionTlsEnabled(
-      resolveConnectionTlsMode(this.config),
-    )
-      ? "https"
-      : "http";
-    const node =
-      this.config.connectionUri ??
-      this.config.endpoint ??
-      `${protocol}://${this.config.host || "localhost"}:${this.config.port ?? 9200}`;
-    const sshAgentTransport = getSshHttpAgentTransport(this.config);
-    const tlsSettings = resolveConnectionTlsSettings(this.config);
-    const client = new Client({
-      ...(sshAgentTransport ? { Connection: HttpConnection } : {}),
-      node: this.config.cloudId ? undefined : node,
-      headers: ELASTICSEARCH_COMPATIBILITY_HEADERS,
-      cloud: this.config.cloudId
-        ? {
-            id: this.config.cloudId,
-          }
-        : undefined,
-      agent: sshAgentTransport
-        ? (options: { url: URL }) =>
-            options.url.protocol === "https:"
-              ? sshAgentTransport.httpsAgent
-              : sshAgentTransport.httpAgent
-        : undefined,
-      auth: this.config.username
-        ? {
-            username: this.config.username,
-            password: this.config.password ?? "",
-          }
-        : this.config.apiKey
+    const epoch = ++this.connectionEpoch;
+    this.connectionAbortController?.abort();
+    const abortController = new AbortController();
+    this.connectionAbortController = abortController;
+    let client: Client | undefined;
+    try {
+      const protocol = isConnectionTlsEnabled(
+        resolveConnectionTlsMode(this.config),
+      )
+        ? "https"
+        : "http";
+      const node =
+        this.config.connectionUri ??
+        this.config.endpoint ??
+        `${protocol}://${this.config.host || "localhost"}:${this.config.port ?? 9200}`;
+      const sshAgentTransport = getSshHttpAgentTransport(this.config);
+      const tlsSettings = await resolveConnectionTlsSettings(
+        this.config,
+        abortController.signal,
+      );
+      this.assertConnectionEpoch(epoch);
+      const createOwnedAgent = sshAgentTransport
+        ? await createOwnedSshConnectionAgentFactory()
+        : undefined;
+      this.assertConnectionEpoch(epoch);
+      client = new Client({
+        ...(sshAgentTransport ? { Connection: SshTlsHttpConnection } : {}),
+        node: this.config.cloudId ? undefined : node,
+        headers: ELASTICSEARCH_COMPATIBILITY_HEADERS,
+        cloud: this.config.cloudId
           ? {
-              apiKey: this.config.apiKey,
+              id: this.config.cloudId,
             }
           : undefined,
-      tls: tlsSettings
-        ? {
-            rejectUnauthorized: tlsSettings.rejectUnauthorized,
-            ca: tlsSettings.ca,
-            cert: tlsSettings.cert,
-            key: tlsSettings.key,
-            passphrase: tlsSettings.passphrase,
-            servername: tlsSettings.servername,
-            checkServerIdentity: tlsSettings.checkServerIdentity,
-          }
-        : undefined,
-    });
-    try {
+        agent:
+          sshAgentTransport && createOwnedAgent
+            ? (options: { url: URL; tls?: TlsConnectionOptions | null }) =>
+                createOwnedAgent(
+                  options.url.protocol === "https:"
+                    ? sshAgentTransport.httpsAgent
+                    : sshAgentTransport.httpAgent,
+                  options.url.protocol === "https:",
+                  options.tls,
+                )
+            : undefined,
+        auth: this.config.username
+          ? {
+              username: this.config.username,
+              password: this.config.password ?? "",
+            }
+          : this.config.apiKey
+            ? {
+                apiKey: this.config.apiKey,
+              }
+            : undefined,
+        tls: tlsSettings
+          ? {
+              rejectUnauthorized: tlsSettings.rejectUnauthorized,
+              ca: tlsSettings.ca,
+              cert: tlsSettings.cert,
+              key: tlsSettings.key,
+              passphrase: tlsSettings.passphrase,
+              servername: tlsSettings.servername,
+              checkServerIdentity: tlsSettings.checkServerIdentity,
+            }
+          : undefined,
+      });
+      this.client = client;
+      this.assertConnectionEpoch(epoch);
       await client.ping();
+      this.assertConnectionEpoch(epoch);
+      this.connected = true;
     } catch (error) {
-      await client.close().catch(() => undefined);
+      if (this.client === client && client) {
+        this.client = null;
+        this.connected = false;
+        await client.close().catch(() => undefined);
+      }
       throw error;
+    } finally {
+      if (this.connectionAbortController === abortController) {
+        this.connectionAbortController = undefined;
+      }
     }
-    this.client = client;
-    this.connected = true;
+  }
+
+  private assertConnectionEpoch(epoch: number): void {
+    if (epoch !== this.connectionEpoch) {
+      throw new DOMException(
+        "Elasticsearch connection attempt cancelled",
+        "AbortError",
+      );
+    }
   }
 
   async disconnect(): Promise<void> {
+    this.connectionEpoch += 1;
+    this.connectionAbortController?.abort();
+    this.connectionAbortController = undefined;
     const client = this.client;
     this.client = null;
     this.connected = false;
@@ -1293,70 +1356,96 @@ export class ElasticsearchDriver implements IDBDriver {
     context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
     let affectedRows = 0;
-    for (const update of request.updates) {
-      context?.signal.throwIfAborted();
-      if (
-        Object.hasOwn(update.changes, "_id") &&
-        update.changes._id !== update.primaryKeys._id
-      ) {
-        throw new Error(
-          "Elasticsearch does not support updating the _id field.",
+    const updateRowOutcomes: DriverUpdateRowOutcome[] = [];
+    for (const [rowIndex, update] of request.updates.entries()) {
+      let writeMayHaveApplied = false;
+      try {
+        context?.signal.throwIfAborted();
+        if (
+          Object.hasOwn(update.changes, "_id") &&
+          update.changes._id !== update.primaryKeys._id
+        ) {
+          throw new Error(
+            "Elasticsearch does not support updating the _id field.",
+          );
+        }
+        const id = update.primaryKeys._id;
+        if (typeof id !== "string" && typeof id !== "number") {
+          updateRowOutcomes.push({ rowIndex, status: "not_applied" });
+          continue;
+        }
+        const document = this.resolveDocumentForMutation(
+          {
+            ...update.primaryKeys,
+            ...update.changes,
+          },
+          update.changes,
         );
-      }
-      const id = update.primaryKeys._id;
-      if (typeof id !== "string" && typeof id !== "number") {
-        continue;
-      }
-      const document = this.resolveDocumentForMutation(
-        {
-          ...update.primaryKeys,
-          ...update.changes,
-        },
-        update.changes,
-      );
-      const client = this.requireClient();
-      const response = Object.hasOwn(update.originalValues ?? {}, "_source")
-        ? await client.update(
-            {
-              index: request.table,
-              id: String(id),
-              script: {
-                lang: "painless",
-                source:
-                  "if (ctx._source != params.original) { ctx.op = 'none' } else { ctx._source = params.next }",
-                params: {
-                  original: this.resolveDocumentForMutation({
-                    _source: update.originalValues?._source,
-                  }),
-                  next: document,
-                },
-              },
-              refresh: "wait_for",
-            },
-            context ? { signal: context.signal } : undefined,
-          )
-        : Object.hasOwn(update.changes, "_source")
-          ? await client.index(
+        const client = this.requireClient();
+        writeMayHaveApplied = true;
+        const response = Object.hasOwn(update.originalValues ?? {}, "_source")
+          ? await client.update(
               {
                 index: request.table,
                 id: String(id),
-                document,
+                script: {
+                  lang: "painless",
+                  source:
+                    "if (ctx._source != params.original) { ctx.op = 'none' } else { ctx._source = params.next }",
+                  params: {
+                    original: this.resolveDocumentForMutation({
+                      _source: update.originalValues?._source,
+                    }),
+                    next: document,
+                  },
+                },
                 refresh: "wait_for",
               },
               context ? { signal: context.signal } : undefined,
             )
-          : await client.update(
-              {
-                index: request.table,
-                id: String(id),
-                doc: document,
-                refresh: "wait_for",
-              },
-              context ? { signal: context.signal } : undefined,
-            );
-      affectedRows += response.result === "noop" ? 0 : 1;
+          : Object.hasOwn(update.changes, "_source")
+            ? await client.index(
+                {
+                  index: request.table,
+                  id: String(id),
+                  document,
+                  refresh: "wait_for",
+                },
+                context ? { signal: context.signal } : undefined,
+              )
+            : await client.update(
+                {
+                  index: request.table,
+                  id: String(id),
+                  doc: document,
+                  refresh: "wait_for",
+                },
+                context ? { signal: context.signal } : undefined,
+              );
+        writeMayHaveApplied = false;
+        if (response.result === "noop") {
+          updateRowOutcomes.push({ rowIndex, status: "not_applied" });
+        } else if (
+          response.result === "updated" ||
+          response.result === "created"
+        ) {
+          affectedRows++;
+          updateRowOutcomes.push({ rowIndex, status: "applied" });
+        } else {
+          updateRowOutcomes.push({ rowIndex, status: "unknown" });
+        }
+      } catch (error: unknown) {
+        throw failedDriverUpdateRows(
+          error,
+          request.updates.length,
+          updateRowOutcomes,
+          rowIndex,
+          affectedRows,
+          writeMayHaveApplied,
+        );
+      }
     }
-    return { affectedRows };
+    return completeDriverUpdateRowsResult(affectedRows, updateRowOutcomes);
   }
 
   async insertRow(

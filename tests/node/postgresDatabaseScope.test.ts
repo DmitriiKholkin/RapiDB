@@ -176,6 +176,14 @@ vi.mock("pg", async (importOriginal) => {
   return { ...actual, Pool: MockPool };
 });
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((yes) => {
+    resolve = yes;
+  });
+  return { promise, resolve };
+}
+
 const config = {
   id: "scope",
   name: "scope",
@@ -217,6 +225,152 @@ afterEach(async () => {
 });
 
 describe("B01 PostgreSQL database scope (mock pools)", () => {
+  it("releases once when cancellation rejects a pending read-only rollback", async () => {
+    const pool = poolFor("a");
+    const query = pool.query as (...args: unknown[]) => Promise<unknown>;
+    const rollbackStarted = deferred<void>();
+    let rejectRollback!: (error: Error) => void;
+    const rollback = new Promise<never>((_, reject) => {
+      rejectRollback = reject;
+    });
+    const rollbackError = new Error("rollback cancelled");
+    let released = false;
+    const client = {
+      query: vi.fn((input: string | { text: string }, params?: unknown[]) => {
+        if (input === "ROLLBACK") {
+          rollbackStarted.resolve();
+          return rollback;
+        }
+        return query(input, params);
+      }),
+      release: vi.fn((destroy?: boolean) => {
+        if (released) throw new Error("Release called on client twice");
+        released = true;
+        if (destroy) rejectRollback(rollbackError);
+      }),
+    };
+    pool.connect.mockResolvedValueOnce(client);
+    const registry = driver as unknown as {
+      activeQueryOperations: Set<unknown>;
+      activeQueryClients: Set<unknown>;
+    };
+    const pending = driver.query("SELECT * FROM items", [], {
+      readOnly: true,
+      requestToken: 44,
+    });
+    const rejected = expect(pending).rejects.toMatchObject({
+      name: "AggregateError",
+      message: expect.stringContaining("rollback failed"),
+      errors: [rollbackError],
+    });
+    await rollbackStarted.promise;
+    expect(registry.activeQueryOperations.size).toBe(1);
+    expect(registry.activeQueryClients.has(client)).toBe(true);
+
+    await driver.cancelCurrentOperation({
+      reason: "manual",
+      operationName: "query",
+      requestToken: 44,
+    });
+    await rejected;
+
+    expect(client.release).toHaveBeenCalledExactlyOnceWith(true);
+    expect(registry.activeQueryOperations.size).toBe(0);
+    expect(registry.activeQueryClients.size).toBe(0);
+  });
+
+  it.each([
+    false,
+    true,
+  ])("cleans the query registry when release throws (rollback failure: %s)", async (rollbackFails) => {
+    const pool = poolFor("a");
+    const connect = pool.connect as () => Promise<
+      (typeof pool.clients)[number]
+    >;
+    const query = pool.query as (...args: unknown[]) => Promise<unknown>;
+    const client = await connect();
+    pool.connect.mockResolvedValueOnce(client);
+    if (rollbackFails) {
+      client.query.mockImplementation(
+        async (input: string | { text: string }) => {
+          if (input === "ROLLBACK") throw new Error("rollback refused");
+          return query(input);
+        },
+      );
+    }
+    const releaseError = new Error("release failed");
+    client.release.mockImplementation(() => {
+      throw releaseError;
+    });
+
+    await expect(
+      driver.query("SELECT * FROM items", [], { readOnly: true }),
+    ).rejects.toBe(releaseError);
+
+    const registry = driver as unknown as {
+      activeQueryOperations: Set<unknown>;
+      activeQueryClients: Set<unknown>;
+    };
+    expect(registry.activeQueryOperations.size).toBe(0);
+    expect(registry.activeQueryClients.size).toBe(0);
+    if (rollbackFails)
+      expect(client.release).toHaveBeenCalledExactlyOnceWith(true);
+    else expect(client.release).toHaveBeenCalledExactlyOnceWith();
+  });
+
+  it("discards a read-only query client when rollback fails", async () => {
+    const pool = poolFor("a");
+    pool.query.mockImplementation(async (input) => {
+      const sql = typeof input === "string" ? input : input.text;
+      if (sql === "ROLLBACK") throw new Error("rollback refused");
+      if (sql === "SELECT * FROM items") {
+        return {
+          fields: [{ name: "id" }],
+          rows: [[1]],
+          rowCount: 1,
+        };
+      }
+      return { rows: [], rowCount: 1 };
+    });
+
+    await expect(
+      driver.query("SELECT * FROM items", [], { readOnly: true }),
+    ).rejects.toMatchObject({
+      name: "AggregateError",
+      message: expect.stringContaining("rollback failed"),
+    });
+
+    const client = pool.clients.at(-1);
+    if (!client) throw new Error("Expected a checked-out PostgreSQL client");
+    expect(client.release).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
+  it("discards a transaction client when rollback fails", async () => {
+    const pool = poolFor("a");
+    pool.query.mockImplementation(async (input) => {
+      const sql = typeof input === "string" ? input : input.text;
+      if (sql === "SELECT transaction_failure")
+        throw new Error("transaction operation failed");
+      if (sql === "ROLLBACK") throw new Error("rollback refused");
+      return { rows: [], rowCount: 1 };
+    });
+
+    await expect(
+      driver.runTransaction([{ sql: "SELECT transaction_failure" }]),
+    ).rejects.toMatchObject({
+      name: "AggregateError",
+      message: expect.stringContaining("rollback failed"),
+      errors: [
+        expect.objectContaining({ message: "transaction operation failed" }),
+        expect.objectContaining({ message: "rollback refused" }),
+      ],
+    });
+
+    const client = pool.clients.at(-1);
+    if (!client) throw new Error("Expected a checked-out PostgreSQL client");
+    expect(client.release).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
   it("routes every metadata/DDL path by database, including inherited columns/constraints and routine OIDs", async () => {
     for (const database of ["a", "b"]) {
       const before = poolFor("a").query.mock.calls.length;
@@ -517,9 +671,119 @@ describe("B01 PostgreSQL database scope (mock pools)", () => {
       operationName: "query",
       requestToken: 42,
     });
-    await vi.advanceTimersByTimeAsync(25);
     await rejected;
     expect(poolFor("b").connect).not.toHaveBeenCalled();
+  });
+
+  it("starts checkout in the same turn as the pool-capacity check", async () => {
+    const pool = poolFor("a");
+    const before = pool.connect.mock.calls.length;
+    const pending = driver.query("SELECT * FROM items");
+
+    // A peer pool consumer invoked before this microtask must not be able to
+    // take the checked slot and strand this query in pg-pool's wait queue.
+    expect(pool.connect).toHaveBeenCalledTimes(before + 1);
+    expect((await pending).rows[0].__col_2).toBe("a");
+  });
+
+  it("cancels a saturated timed-out query wait and reacquires without stale SQL", async () => {
+    const pool = poolFor("a");
+    const connectCalls = pool.connect.mock.calls.length;
+    Object.assign(pool, { totalCount: 5, idleCount: 0, waitingCount: 0 });
+    vi.useFakeTimers();
+    const wrapped = createTimeoutAwareDriver(driver, () => ({
+      connectionTimeoutSeconds: 1,
+      dbOperationTimeoutSeconds: 1,
+      connectionTimeoutMs: 1000,
+      dbOperationTimeoutMs: 10,
+    }));
+
+    const pending = wrapped.query("SELECT timed_out_before_checkout");
+    const rejected = expect(pending).rejects.toThrow("timed out");
+    await vi.advanceTimersByTimeAsync(10);
+    await rejected;
+
+    expect(pool.connect).toHaveBeenCalledTimes(connectCalls);
+    expect(pool.waitingCount).toBe(0);
+
+    pool.idleCount = 1;
+    const reacquired = await driver.query("SELECT * FROM items");
+    expect(reacquired.rows[0].__col_2).toBe("a");
+    expect(pool.connect).toHaveBeenCalledTimes(connectCalls + 1);
+    expect(
+      pool.clients.flatMap((client) =>
+        client.query.mock.calls.map(([input]) =>
+          typeof input === "string" ? input : input.text,
+        ),
+      ),
+    ).not.toContain("SELECT timed_out_before_checkout");
+  });
+
+  it.each([
+    "abort",
+    "timeout",
+  ] as const)("cancels a saturated transaction %s without leaving a checkout or late SQL", async (cancellation) => {
+    const pool = poolFor("a");
+    const originalConnect = pool.connect as unknown as () => Promise<
+      (typeof pool.clients)[number]
+    >;
+    const pendingCheckout = deferred<(typeof pool.clients)[number]>();
+    Object.assign(pool, { totalCount: 5, idleCount: 0, waitingCount: 0 });
+    pool.connect = vi.fn(() => {
+      if (pool.totalCount >= 5 && pool.idleCount === 0) {
+        pool.waitingCount += 1;
+        return pendingCheckout.promise;
+      }
+      return originalConnect();
+    });
+    const connectCalls = pool.connect.mock.calls.length;
+
+    let rejected: Promise<void>;
+    if (cancellation === "timeout") {
+      vi.useFakeTimers();
+      const wrapped = createTimeoutAwareDriver(driver, () => ({
+        connectionTimeoutSeconds: 1,
+        dbOperationTimeoutSeconds: 1,
+        connectionTimeoutMs: 1000,
+        dbOperationTimeoutMs: 10,
+      }));
+      const pending = wrapped.runTransaction([
+        { sql: "SELECT timed_out_transaction" },
+      ]);
+      rejected = expect(pending).rejects.toThrow("timed out");
+      await vi.advanceTimersByTimeAsync(10);
+    } else {
+      const controller = new AbortController();
+      const pending = driver.runTransaction(
+        [{ sql: "SELECT aborted_transaction" }],
+        { signal: controller.signal, deadline: Infinity },
+      );
+      rejected = expect(pending).rejects.toThrow(/abort|cancel/i);
+      controller.abort();
+    }
+    await rejected;
+
+    expect(pool.connect).toHaveBeenCalledTimes(connectCalls);
+    expect(pool.waitingCount).toBe(0);
+    const priorSql = pool.clients.flatMap((client) =>
+      client.query.mock.calls.map(([input]) =>
+        typeof input === "string" ? input : input.text,
+      ),
+    );
+    expect(priorSql).not.toContain("SELECT timed_out_transaction");
+    expect(priorSql).not.toContain("SELECT aborted_transaction");
+    expect(priorSql).not.toContain("ROLLBACK");
+
+    pool.idleCount = 1;
+    await driver.runTransaction([{ sql: "SELECT reacquired_transaction" }]);
+    expect(pool.waitingCount).toBe(0);
+    const acquiredSql = pool.clients.flatMap((client) =>
+      client.query.mock.calls.map(([input]) =>
+        typeof input === "string" ? input : input.text,
+      ),
+    );
+    expect(acquiredSql).toContain("SELECT reacquired_transaction");
+    expect(pool.connect).toHaveBeenCalledTimes(connectCalls + 1);
   });
 
   it("preserves query and transaction timeout fences in a scoped pool", async () => {

@@ -18,6 +18,10 @@ export {
 import type { TypeCategory } from "../shared/tableTypes";
 export type Row = Record<string, unknown>;
 export type PendingEdits = Map<number, Map<string, unknown>>;
+export interface PendingRestoreEntry {
+  originalSignature: string;
+  changes: Map<string, unknown>;
+}
 export interface InsertDraftCell {
   value: unknown;
 }
@@ -35,6 +39,8 @@ export type EditTarget =
     };
 export interface MutationSnapshot {
   pendingEdits: PendingEdits;
+  /** Historical edits whose original identity is absent or ambiguous. */
+  unresolvedPendingEdits?: PendingRestoreEntry[];
   newRows: InsertDraftRow[];
   editCell: EditTarget | null;
 }

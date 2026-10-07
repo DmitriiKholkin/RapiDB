@@ -622,6 +622,53 @@ export function registerTableServiceIntegrationTests(
     });
 
     it.runIf(engineId === "mssql")(
+      "captures and verifies a string primary key with a nondefault collation",
+      async () => {
+        const probeTableName = `collation_identity_probe_${Date.now()}_${Math.floor(Math.random() * 10_000)}`;
+        const qualifiedProbeTableName = harness.driver.qualifiedTableName(
+          harness.databaseName,
+          harness.schemaName,
+          probeTableName,
+        );
+        const collation = "Latin1_General_100_CS_AS";
+
+        await harness.driver.query(
+          `CREATE TABLE ${qualifiedProbeTableName} ([id] VARCHAR(64) COLLATE ${collation} NOT NULL PRIMARY KEY, [verification_value] VARCHAR(64) NOT NULL)`,
+        );
+
+        try {
+          const columns = await readService.getColumns(
+            connectionId,
+            harness.databaseName,
+            harness.schemaName,
+            probeTableName,
+          );
+          const idColumn = findColumnName(columns, "id");
+          const verificationColumn = findColumnName(
+            columns,
+            "verification_value",
+          );
+          const plan = await mutationService.prepareInsertRow(
+            connectionId,
+            harness.databaseName,
+            harness.schemaName,
+            probeTableName,
+            {
+              [idColumn]: "CaseSensitive-Å",
+              [verificationColumn]: "verified",
+            },
+          );
+
+          expect(plan.operation.sql).toContain(`COLLATE ${collation}`);
+          expect(plan.operation.sql).not.toContain(`COLLATE [${collation}]`);
+          await mutationService.executePreparedInsertPlan(plan);
+        } finally {
+          await harness.driver.query(`DROP TABLE ${qualifiedProbeTableName}`);
+        }
+      },
+    );
+
+    it.runIf(engineId === "mssql")(
       "filters exact numeric and temporal MSSQL values through table service",
       async () => {
         const probeTableName = `filter_probe_${Date.now()}_${Math.floor(Math.random() * 10_000)}`;

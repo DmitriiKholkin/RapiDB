@@ -1,12 +1,14 @@
 import * as vscode from "vscode";
 import { RAPIDB_COMMANDS as CMD } from "../../shared/commandIds";
 import {
+  isDataDbObjectKind,
   isDbObjectKind,
   isDdlOnlyDbObjectKind,
   isRoutineDbObjectKind,
 } from "../../shared/dbObjectKinds";
 import type { QueryEditorLanguage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
+import { redisKeyspaceDisplayName } from "../dbDrivers/redisKeyspace";
 import { DEFAULT_DRIVER_ENTITY_MANIFEST } from "../dbDrivers/types";
 import { ErdPanel } from "../panels/erdPanel";
 import { QueryPanel } from "../panels/queryPanel";
@@ -357,7 +359,13 @@ export function registerExplorerCommands(
 
   // ─── Copy Node Name ────────────────────────────────────────────────
   registerCommand(CMD.copyNodeName, async (node?: RapiDBNode) => {
-    const name = node?.objectName ?? node?.label?.toString();
+    const name =
+      node?.objectName &&
+      ((isDbObjectKind(node.kind) && isDataDbObjectKind(node.kind)) ||
+        node.kind.startsWith("table_section_")) &&
+      connectionManager.getConnection(node.connectionId)?.type === "redis"
+        ? redisKeyspaceDisplayName(node.objectName)
+        : (node?.objectName ?? node?.label?.toString());
     if (name) {
       await vscode.env.clipboard.writeText(name);
     }

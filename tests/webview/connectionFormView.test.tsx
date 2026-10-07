@@ -228,6 +228,10 @@ describe("ConnectionFormView", () => {
     expect(screen.getByLabelText("SSH username")).toBeTruthy();
     expect(screen.getByLabelText("SSH auth method")).toBeTruthy();
     expect(screen.getByLabelText("SSH host verification mode")).toBeTruthy();
+    expect(
+      (screen.getByLabelText("SSH host verification mode") as HTMLSelectElement)
+        .value,
+    ).toBe("manual");
     expect(screen.getByLabelText("SSH private key")).toBeTruthy();
     expect(screen.getByLabelText("SSH passphrase")).toBeTruthy();
     expect(screen.getByLabelText("SSH host fingerprint SHA256")).toBeTruthy();
@@ -240,7 +244,7 @@ describe("ConnectionFormView", () => {
     expect(screen.queryByLabelText("SSH host fingerprint SHA256")).toBeNull();
     expect(
       screen.getByText(
-        /first successful ssh handshake will pin the discovered sha256 fingerprint automatically/i,
+        /first successful database connection through ssh will pin the discovered sha256 fingerprint automatically.*test connection does not save a pin/i,
       ),
     ).toBeTruthy();
 

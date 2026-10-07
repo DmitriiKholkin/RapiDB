@@ -3,14 +3,15 @@
  * Extracted from BaseDBDriver for single-responsibility adherence.
  */
 
-/** Convert a Buffer to a 0x-prefixed hex string. Empty buffers produce "". */
+/** Convert a Buffer to a 0x-prefixed hex string, including empty buffers. */
 export function hexFromBuffer(val: Buffer): string {
-  return val.length === 0 ? "" : `0x${val.toString("hex")}`;
+  return `0x${val.toString("hex")}`;
 }
 
 /**
  * Returns true when `value` looks like a hex-encoded binary string.
- * Accepts 0x, \\x prefixes or a bare even-length hex string.
+ * Requires complete byte pairs, with optional 0x or \\x prefixes.
+ * A prefix alone is accepted as an empty buffer.
  */
 export function isHexLike(value: string): boolean {
   if (
@@ -19,7 +20,8 @@ export function isHexLike(value: string): boolean {
     value.startsWith("0x") ||
     value.startsWith("0X")
   ) {
-    return /^[0-9a-fA-F]*$/.test(value.slice(2));
+    const digits = value.slice(2);
+    return digits.length % 2 === 0 && /^[0-9a-fA-F]*$/.test(digits);
   }
   return /^[0-9a-fA-F]+$/.test(value) && value.length % 2 === 0;
 }
