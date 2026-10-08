@@ -16,8 +16,10 @@ import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
 import { SqlTlsSocket } from "../services/sqlTlsSocket";
 import { buildWhere } from "../table/filterSql";
+import { logger } from "../utils/logger";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
 import { BoundedQueryRows, queryCollectionLimit } from "./boundedQueryRows";
+import { closeDriverResource } from "./driverCleanup";
 import { exactNumericFilterLiteral } from "./exactNumericFilter";
 import { literalContainsPattern } from "./literalContains";
 import {
@@ -1080,6 +1082,10 @@ export class MySQLDriver extends BaseDBDriver {
   }
 
   private pool: Pool | null = null;
+  private readonly poolConnections = new Map<
+    Pool,
+    Set<NativeMysqlConnection>
+  >();
   private readonly config: ConnectionConfig;
   private timeoutRecoveryInFlight: Promise<void> | null = null;
   private readonly activeTransactionConnections = new Set<PoolConnection>();
@@ -1116,7 +1122,7 @@ export class MySQLDriver extends BaseDBDriver {
       const previousPool = this.pool;
       this.pool = null;
       try {
-        await previousPool.end();
+        await this.closePool(previousPool);
       } catch {}
     }
     let pool: Pool | undefined;
@@ -1170,6 +1176,16 @@ export class MySQLDriver extends BaseDBDriver {
         supportBigNumbers: true,
         ssl,
       });
+      const connections = new Set<NativeMysqlConnection>();
+      this.poolConnections.set(pool, connections);
+      pool.on?.("connection", (connection) => {
+        // PromisePool forwards the core pool's native connection event.
+        const native = connection as unknown as NativeMysqlConnection;
+        connections.add(native);
+        const forget = () => connections.delete(native);
+        native.once("end", forget);
+        native.once("error", forget);
+      });
       const conn = await pool.getConnection();
       conn.release();
       this.assertConnectionEpoch(epoch);
@@ -1178,7 +1194,7 @@ export class MySQLDriver extends BaseDBDriver {
     } catch (error) {
       // Probe failed or the attempt was cancelled: do not leave an idle pool
       // behind (sockets/timers). It stays local until success.
-      await pool?.end().catch(() => undefined);
+      if (pool) await this.closePool(pool).catch(() => undefined);
       throw error;
     } finally {
       if (this.connectionAbortController === abortController) {
@@ -1199,10 +1215,44 @@ export class MySQLDriver extends BaseDBDriver {
     this.connectionEpoch += 1;
     this.connectionAbortController?.abort();
     this.connectionAbortController = undefined;
+    const pool = this.pool;
+    this.pool = null;
+    if (pool) await this.closePool(pool);
+  }
+
+  private async closePool(pool: Pool): Promise<void> {
+    const connections = this.poolConnections.get(pool);
+    this.poolConnections.delete(pool);
+    const discard = () => {
+      for (const connection of connections ?? []) {
+        connections?.delete(connection);
+        try {
+          // mysql2.destroy() only ends the stream. Also destroy the socket
+          // so a blackholed command cannot keep shutdown or its writes alive.
+          try {
+            connection.destroy();
+          } finally {
+            const stream = (
+              connection as unknown as {
+                stream?: { destroy(error?: Error): void };
+              }
+            ).stream;
+            stream?.destroy(
+              new Error("MySQL connection closed during pool shutdown."),
+            );
+          }
+        } catch (error) {
+          logger.error("MySQL transport cleanup failed", error);
+        }
+      }
+    };
     try {
-      await this.pool?.end();
+      await closeDriverResource(() => pool.end(), discard);
     } finally {
-      this.pool = null;
+      // Quit resolves before COM_QUIT is written, not after the socket closes.
+      // Drop any remaining transports even when pool.end() reports success.
+      discard();
+      connections?.clear();
     }
   }
 

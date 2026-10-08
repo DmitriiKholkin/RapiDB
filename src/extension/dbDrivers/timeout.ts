@@ -3,6 +3,7 @@ import type {
   DriverMutationResult,
   DriverOperationContext,
   DriverTablePageRequest,
+  QueryExecutionOptions,
   TransactionContext,
 } from "./types";
 
@@ -40,7 +41,7 @@ export class DriverTimeoutError extends Error {
         ? "Database connection"
         : "Database operation";
     super(
-      `${operationLabel} timed out after ${timeoutSeconds} second(s) while running ${operationName}.${["updateRows", "insertRow", "deleteRows", "runTransaction"].includes(operationName) ? " Mutation outcome may be unknown. Refresh and verify the data before retrying." : ""}`,
+      `${operationLabel} timed out after ${timeoutSeconds} second(s) while running ${operationName}.${["query", "updateRows", "insertRow", "deleteRows", "runTransaction"].includes(operationName) ? " Mutation outcome may be unknown. Refresh and verify the data before retrying." : ""}`,
     );
     this.name = "DriverTimeoutError";
     this.timeoutKind = timeoutKind;
@@ -60,6 +61,24 @@ interface TimeoutAwareDriverHooks {
 
 const TIMEOUT_CLEANUP_BUDGET_MS = 1_000;
 let nextInternalQueryRequestToken = 0;
+
+export function throwIfQueryCancelled(context?: QueryExecutionOptions): void {
+  context?.signal?.throwIfAborted();
+  if (context?.deadline !== undefined && Date.now() >= context.deadline) {
+    throw new Error(
+      "Query deadline exceeded. Mutation outcome may be unknown. Refresh and verify the data before retrying.",
+    );
+  }
+}
+
+export function getQueryRemainingTimeoutMs(
+  context?: QueryExecutionOptions,
+): number | undefined {
+  throwIfQueryCancelled(context);
+  return context?.deadline !== undefined && Number.isFinite(context.deadline)
+    ? Math.max(1, Math.ceil(context.deadline - Date.now()))
+    : undefined;
+}
 
 export function throwIfTransactionCancelled(
   context?: TransactionContext,
@@ -181,16 +200,32 @@ async function withDriverTimeout<T>(
     timeoutKind: DriverTimeoutKind;
     operationName: string;
     timeoutSettingsProvider: DriverTimeoutSettingsProvider;
-    onDeadline?: () => void;
+    deadline?: number;
+    onDeadline?: (error: DriverTimeoutError) => void;
     decorateTimeoutError?: (error: DriverTimeoutError) => void;
     onTimeout?: () => void | Promise<void>;
     onLateSettlementAfterTimeout?: () => void | Promise<void>;
   },
 ): Promise<T> {
-  const timeoutMs = timeoutMsForKind(
-    options.timeoutSettingsProvider,
-    options.timeoutKind,
-  );
+  const timeoutMs =
+    options.deadline !== undefined && Number.isFinite(options.deadline)
+      ? Math.max(0, options.deadline - Date.now())
+      : timeoutMsForKind(options.timeoutSettingsProvider, options.timeoutKind);
+
+  const makeTimeoutError = () => {
+    const error = new DriverTimeoutError(
+      options.timeoutKind,
+      options.operationName,
+      timeoutMs,
+    );
+    options.decorateTimeoutError?.(error);
+    return error;
+  };
+  if (options.deadline !== undefined && Date.now() >= options.deadline) {
+    const error = makeTimeoutError();
+    options.onDeadline?.(error);
+    throw error;
+  }
 
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     return promiseFactory();
@@ -199,7 +234,7 @@ async function withDriverTimeout<T>(
   return await new Promise<T>((resolve, reject) => {
     let settled = false;
     let timedOut = false;
-    const timer = setTimeout(() => {
+    const expire = () => {
       if (settled) {
         return;
       }
@@ -207,18 +242,14 @@ async function withDriverTimeout<T>(
       settled = true;
       timedOut = true;
       clearTimeout(timer);
-      options.onDeadline?.();
-      const error = new DriverTimeoutError(
-        options.timeoutKind,
-        options.operationName,
-        timeoutMs,
-      );
-      options.decorateTimeoutError?.(error);
+      const error = makeTimeoutError();
+      options.onDeadline?.(error);
       reject(error);
       if (options.onTimeout) {
         runBoundedCleanup(options.onTimeout);
       }
-    }, timeoutMs);
+    };
+    const timer = setTimeout(expire, timeoutMs);
 
     let pendingPromise: Promise<T>;
     try {
@@ -232,6 +263,11 @@ async function withDriverTimeout<T>(
 
     void pendingPromise.then(
       (value) => {
+        // Promise microtasks can run before an overdue timer after expensive
+        // synchronous result formatting. Never turn that race into success.
+        if (options.deadline !== undefined && Date.now() >= options.deadline) {
+          expire();
+        }
         if (settled) {
           if (timedOut) {
             void Promise.resolve(
@@ -246,6 +282,11 @@ async function withDriverTimeout<T>(
         resolve(value);
       },
       (error) => {
+        // SDK deadlines can reject just before our timer callback. Preserve
+        // the same timeout/unknown-mutation outcome in either ordering.
+        if (options.deadline !== undefined && Date.now() >= options.deadline) {
+          expire();
+        }
         if (settled) {
           if (timedOut) {
             void Promise.resolve(
@@ -295,10 +336,28 @@ export function createTimeoutAwareDriver<T extends object>(
         let deleteProgress: DriverMutationResult | undefined;
         const operationAbort =
           CANCELLABLE_MUTATION_METHODS.has(property) ||
-          property === "readTablePage"
+          property === "readTablePage" ||
+          property === "query"
             ? new AbortController()
             : undefined;
-        if (operationAbort && property === "readTablePage") {
+        if (operationAbort && property === "query") {
+          const supplied = args[2] as QueryExecutionOptions | undefined;
+          const timeoutMs = timeoutSettingsProvider().dbOperationTimeoutMs;
+          args[2] = {
+            ...supplied,
+            requestToken:
+              supplied?.requestToken ?? --nextInternalQueryRequestToken,
+            signal: supplied?.signal
+              ? AbortSignal.any([supplied.signal, operationAbort.signal])
+              : operationAbort.signal,
+            deadline: Math.min(
+              supplied?.deadline ?? Infinity,
+              Number.isFinite(timeoutMs) && timeoutMs > 0
+                ? Date.now() + timeoutMs
+                : Infinity,
+            ),
+          } satisfies QueryExecutionOptions;
+        } else if (operationAbort && property === "readTablePage") {
           const request = args[0] as DriverTablePageRequest;
           args[0] = {
             ...request,
@@ -332,16 +391,6 @@ export function createTimeoutAwareDriver<T extends object>(
               : {}),
           } satisfies DriverOperationContext;
         }
-        if (property === "query") {
-          const operationContext =
-            typeof args[2] === "object" && args[2] !== null
-              ? (args[2] as { requestToken?: number })
-              : {};
-          if (operationContext.requestToken === undefined) {
-            operationContext.requestToken = --nextInternalQueryRequestToken;
-          }
-          args[2] = operationContext;
-        }
         return withDriverTimeout(
           () => {
             pendingOperation = Reflect.apply(
@@ -355,22 +404,15 @@ export function createTimeoutAwareDriver<T extends object>(
             timeoutKind,
             operationName: property,
             timeoutSettingsProvider,
+            deadline:
+              property === "query"
+                ? (args[2] as QueryExecutionOptions).deadline
+                : undefined,
             decorateTimeoutError: (error) => {
               if (property === "deleteRows")
                 error.deleteResult = deleteProgress;
             },
-            onDeadline: () =>
-              operationAbort?.abort(
-                property === "readTablePage"
-                  ? new DriverTimeoutError(
-                      "dbOperation",
-                      property,
-                      timeoutSettingsProvider().dbOperationTimeoutMs,
-                    )
-                  : new Error(
-                      "Mutation cancelled after timeout; its outcome may be unknown. Refresh before retrying.",
-                    ),
-              ),
+            onDeadline: (error) => operationAbort?.abort(error),
             onTimeout: () => {
               const timeoutHooks = target as TimeoutAwareDriverHooks;
               const operationContext =

@@ -67,6 +67,7 @@ import {
   pageRows,
   unsupported,
 } from "./nosqlUtils";
+import { throwIfQueryCancelled } from "./timeout";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -88,6 +89,7 @@ import type {
   IDBDriver,
   IndexMeta,
   PaginationResult,
+  QueryExecutionOptions,
   QueryResult,
   SchemaInfo,
   TableConstraintMeta,
@@ -724,7 +726,12 @@ export class DynamoDBDriver implements IDBDriver {
 
   getRoutineDefinition = DYNAMODB_UNSUPPORTED_METADATA.getRoutineDefinition;
 
-  async query(queryText: string, _params?: unknown[]): Promise<QueryResult> {
+  async query(
+    queryText: string,
+    _params?: unknown[],
+    options?: QueryExecutionOptions,
+  ): Promise<QueryResult> {
+    throwIfQueryCancelled(options);
     const inputs = parseDynamoDbNativeQueryInputs(queryText);
     const operation = this.resolveNativeOperation(inputs);
     const startedAt = Date.now();
@@ -733,7 +740,13 @@ export class DynamoDBDriver implements IDBDriver {
     let sawMutation = false;
 
     for (const input of inputs) {
-      const result = await this.dispatchNativeCommand(operation, input);
+      throwIfQueryCancelled(options);
+      const result = await this.dispatchNativeCommand(
+        operation,
+        input,
+        options,
+      );
+      throwIfQueryCancelled(options);
       rawRows.push(...result.rows);
       if (result.affectedRows !== undefined) {
         sawMutation = true;
@@ -2653,11 +2666,13 @@ export class DynamoDBDriver implements IDBDriver {
   private async dispatchNativeCommand(
     operation: DynamoDbNativeOperationName,
     rawInput: Record<string, unknown>,
+    options?: QueryExecutionOptions,
   ): Promise<QueryDispatchResult> {
     const input = this.requireInputRecord(rawInput);
     const spec = DYNAMO_NATIVE_DISPATCH_MAP[operation];
     const output = await this.requireClient().send(
       new spec.ctor(input as never) as never,
+      ...(options?.signal ? ([{ abortSignal: options.signal }] as const) : []),
     );
 
     this.applyNativeDispatchInvalidation(spec.invalidation, input);

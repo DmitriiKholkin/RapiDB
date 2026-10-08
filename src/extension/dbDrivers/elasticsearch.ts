@@ -2,6 +2,7 @@ import type { ConnectionOptions as TlsConnectionOptions } from "node:tls";
 import { Client } from "@elastic/elasticsearch";
 import { HttpConnection } from "@elastic/transport";
 import {
+  getElasticsearchTlsEndpointError,
   isConnectionTlsEnabled,
   resolveConnectionTlsMode,
 } from "../../shared/connectionConfig";
@@ -32,6 +33,8 @@ import {
 import {
   type DriverTimeoutSettingsProvider,
   getDefaultDriverTimeoutSettings,
+  getQueryRemainingTimeoutMs,
+  throwIfQueryCancelled,
 } from "./timeout";
 import type {
   ColumnMeta,
@@ -52,6 +55,7 @@ import type {
   IDBDriver,
   IndexMeta,
   PaginationResult,
+  QueryExecutionOptions,
   QueryResult,
   SchemaInfo,
   TableConstraintMeta,
@@ -123,6 +127,8 @@ export class ElasticsearchDriver implements IDBDriver {
     if (this.connected) {
       return;
     }
+    const endpointError = getElasticsearchTlsEndpointError(this.config);
+    if (endpointError) throw new Error(endpointError);
     const epoch = ++this.connectionEpoch;
     this.connectionAbortController?.abort();
     const abortController = new AbortController();
@@ -450,7 +456,12 @@ export class ElasticsearchDriver implements IDBDriver {
     unsupported("Elasticsearch routine definition");
   }
 
-  async query(sql: string, _params?: unknown[]): Promise<QueryResult> {
+  async query(
+    sql: string,
+    _params?: unknown[],
+    options?: QueryExecutionOptions,
+  ): Promise<QueryResult> {
+    throwIfQueryCancelled(options);
     const trimmed = sql.trim().replace(/;+$/, "");
     if (!trimmed) {
       return {
@@ -471,7 +482,7 @@ export class ElasticsearchDriver implements IDBDriver {
       };
     }
 
-    return this.executeRestCommands(commands, startedAt);
+    return this.executeRestCommands(commands, startedAt, options);
   }
 
   private parseRestCommands(input: string): ElasticsearchRestCommand[] {
@@ -487,16 +498,20 @@ export class ElasticsearchDriver implements IDBDriver {
   private async executeRestCommands(
     commands: readonly ElasticsearchRestCommand[],
     startedAt: number,
+    options?: QueryExecutionOptions,
   ): Promise<QueryResult> {
     if (commands.length === 1) {
       const [command] = commands;
-      return this.executeRestCommand(command, startedAt);
+      const result = await this.executeRestCommand(command, startedAt, options);
+      throwIfQueryCancelled(options);
+      return result;
     }
 
     const results: Array<Record<string, unknown>> = [];
     let affectedRows = 0;
     for (const command of commands) {
-      const result = await this.executeRestCommand(command, startedAt);
+      const result = await this.executeRestCommand(command, startedAt, options);
+      throwIfQueryCancelled(options);
       affectedRows += result.affectedRows ?? 0;
       results.push({
         statement: this.formatParsedRestCommand(command),
@@ -684,17 +699,31 @@ export class ElasticsearchDriver implements IDBDriver {
   private async executeRestCommand(
     command: ElasticsearchRestCommand,
     startedAt: number,
+    options?: QueryExecutionOptions,
   ): Promise<QueryResult> {
+    throwIfQueryCancelled(options);
+    const requestTimeout = getQueryRemainingTimeoutMs(options);
+    const transportOptions = {
+      ...(options?.signal ? { signal: options.signal } : {}),
+      ...(requestTimeout !== undefined ? { requestTimeout } : {}),
+    };
+    const transportArgs =
+      Object.keys(transportOptions).length > 0
+        ? ([transportOptions] as const)
+        : ([] as const);
     const client = this.requireClient();
     const queryParams = this.queryParamsToObject(command.queryParams);
     const [firstSegment, secondSegment, thirdSegment] = command.pathSegments;
 
     if (command.method === "PUT" && command.pathSegments.length === 1) {
-      const response = await client.indices.create({
-        index: firstSegment,
-        ...queryParams,
-        ...this.readObjectBody(command, `PUT ${command.path}`),
-      });
+      const response = await client.indices.create(
+        {
+          index: firstSegment,
+          ...queryParams,
+          ...this.readObjectBody(command, `PUT ${command.path}`),
+        },
+        ...transportArgs,
+      );
       return this.buildSingleRowQueryResult(
         {
           acknowledged: response.acknowledged,
@@ -707,10 +736,13 @@ export class ElasticsearchDriver implements IDBDriver {
     }
 
     if (command.method === "DELETE" && command.pathSegments.length === 1) {
-      const response = await client.indices.delete({
-        index: firstSegment,
-        ...queryParams,
-      });
+      const response = await client.indices.delete(
+        {
+          index: firstSegment,
+          ...queryParams,
+        },
+        ...transportArgs,
+      );
       return this.buildSingleRowQueryResult(
         {
           acknowledged: response.acknowledged,
@@ -731,11 +763,14 @@ export class ElasticsearchDriver implements IDBDriver {
           allowEmpty: true,
         }),
       );
-      const response = await client.search({
-        index: firstSegment,
-        ...this.enforceSearchQueryParamsHardCap(queryParams),
-        ...body,
-      } as never);
+      const response = await client.search(
+        {
+          index: firstSegment,
+          ...this.enforceSearchQueryParamsHardCap(queryParams),
+          ...body,
+        } as never,
+        ...transportArgs,
+      );
       const rows = this.hitsToRows(
         response.hits.hits as unknown as Array<Record<string, unknown>>,
       );
@@ -752,10 +787,13 @@ export class ElasticsearchDriver implements IDBDriver {
           allowEmpty: true,
         }),
       );
-      const response = await client.search({
-        ...this.enforceSearchQueryParamsHardCap(queryParams),
-        ...body,
-      } as never);
+      const response = await client.search(
+        {
+          ...this.enforceSearchQueryParamsHardCap(queryParams),
+          ...body,
+        } as never,
+        ...transportArgs,
+      );
       const rows = this.hitsToRows(
         response.hits.hits as unknown as Array<Record<string, unknown>>,
       );
@@ -767,11 +805,14 @@ export class ElasticsearchDriver implements IDBDriver {
       command.pathSegments.length === 3 &&
       secondSegment === "_doc"
     ) {
-      const response = await client.get({
-        index: firstSegment,
-        id: thirdSegment,
-        ...queryParams,
-      });
+      const response = await client.get(
+        {
+          index: firstSegment,
+          id: thirdSegment,
+          ...queryParams,
+        },
+        ...transportArgs,
+      );
       const row = flattenRootRecord({
         _id: response._id,
         ...(((response as { _source?: Record<string, unknown> })._source ??
@@ -785,14 +826,17 @@ export class ElasticsearchDriver implements IDBDriver {
       secondSegment === "_doc" &&
       (command.pathSegments.length === 2 || command.pathSegments.length === 3)
     ) {
-      const response = await client.index({
-        index: firstSegment,
-        ...(thirdSegment ? { id: thirdSegment } : {}),
-        document: this.stripDocumentId(
-          this.readObjectBody(command, `${command.method} ${command.path}`),
-        ),
-        ...queryParams,
-      });
+      const response = await client.index(
+        {
+          index: firstSegment,
+          ...(thirdSegment ? { id: thirdSegment } : {}),
+          document: this.stripDocumentId(
+            this.readObjectBody(command, `${command.method} ${command.path}`),
+          ),
+          ...queryParams,
+        },
+        ...transportArgs,
+      );
       return this.buildSingleRowQueryResult(
         {
           result: response.result,
@@ -810,12 +854,15 @@ export class ElasticsearchDriver implements IDBDriver {
       secondSegment === "_update"
     ) {
       const body = this.readObjectBody(command, `POST ${command.path}`);
-      const response = await client.update({
-        index: firstSegment,
-        id: thirdSegment,
-        ...queryParams,
-        ...body,
-      } as never);
+      const response = await client.update(
+        {
+          index: firstSegment,
+          id: thirdSegment,
+          ...queryParams,
+          ...body,
+        } as never,
+        ...transportArgs,
+      );
       return this.buildSingleRowQueryResult(
         {
           result: response.result,
@@ -832,11 +879,14 @@ export class ElasticsearchDriver implements IDBDriver {
       command.pathSegments.length === 3 &&
       secondSegment === "_doc"
     ) {
-      const response = await client.delete({
-        index: firstSegment,
-        id: thirdSegment,
-        ...queryParams,
-      });
+      const response = await client.delete(
+        {
+          index: firstSegment,
+          id: thirdSegment,
+          ...queryParams,
+        },
+        ...transportArgs,
+      );
       return this.buildSingleRowQueryResult(
         {
           result: response.result,
@@ -853,11 +903,14 @@ export class ElasticsearchDriver implements IDBDriver {
       command.pathSegments.length === 2 &&
       secondSegment === "_mapping"
     ) {
-      const response = await client.indices.putMapping({
-        index: firstSegment,
-        ...queryParams,
-        ...this.readObjectBody(command, `PUT ${command.path}`),
-      });
+      const response = await client.indices.putMapping(
+        {
+          index: firstSegment,
+          ...queryParams,
+          ...this.readObjectBody(command, `PUT ${command.path}`),
+        },
+        ...transportArgs,
+      );
       return this.buildSingleRowQueryResult(
         {
           acknowledged: response.acknowledged,
@@ -873,11 +926,14 @@ export class ElasticsearchDriver implements IDBDriver {
       command.pathSegments.length === 2 &&
       secondSegment === "_settings"
     ) {
-      const response = await client.indices.putSettings({
-        index: firstSegment,
-        ...queryParams,
-        ...this.readObjectBody(command, `PUT ${command.path}`),
-      });
+      const response = await client.indices.putSettings(
+        {
+          index: firstSegment,
+          ...queryParams,
+          ...this.readObjectBody(command, `PUT ${command.path}`),
+        },
+        ...transportArgs,
+      );
       return this.buildSingleRowQueryResult(
         {
           acknowledged: response.acknowledged,
@@ -893,10 +949,13 @@ export class ElasticsearchDriver implements IDBDriver {
       command.pathSegments.length === 1 &&
       firstSegment === "_aliases"
     ) {
-      const response = await client.indices.updateAliases({
-        ...queryParams,
-        ...this.readObjectBody(command, `POST ${command.path}`),
-      });
+      const response = await client.indices.updateAliases(
+        {
+          ...queryParams,
+          ...this.readObjectBody(command, `POST ${command.path}`),
+        },
+        ...transportArgs,
+      );
       return this.buildSingleRowQueryResult(
         {
           acknowledged: response.acknowledged,

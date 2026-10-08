@@ -17,6 +17,7 @@ import {
   normalizeSqlDatetimeOffsetSpacing,
 } from "./BaseDBDriver";
 import { BoundedQueryRows, queryCollectionLimit } from "./boundedQueryRows";
+import { closeDriverResource } from "./driverCleanup";
 import { exactNumericFilterLiteral } from "./exactNumericFilter";
 import { mssqlInsertGuard } from "./mssqlInsertGuard";
 import {
@@ -233,7 +234,32 @@ type MssqlRollbackConnection = {
   ) => unknown;
   close?: () => void;
   hasError?: boolean;
+  removeListener?: (event: string, listener: () => void) => unknown;
 };
+
+/** node-mssql retains its borrowed session when native BEGIN fails. */
+function discardFailedMssqlBegin(transaction: mssql.Transaction): void {
+  const state = transaction as unknown as {
+    _acquiredConnection?: MssqlRollbackConnection | null;
+    _acquiredConfig?: unknown;
+    _abort?: () => void;
+    parent: { release(connection: MssqlRollbackConnection): unknown };
+  };
+  const connection = state._acquiredConnection;
+  if (!connection) return;
+  if (state._abort) {
+    connection.removeListener?.("rollbackTransaction", state._abort);
+  }
+  state._acquiredConnection = null;
+  state._acquiredConfig = null;
+  // Fence before release: another borrower must never inherit uncertain state.
+  connection.hasError = true;
+  try {
+    connection.close?.();
+  } finally {
+    state.parent.release(connection);
+  }
+}
 
 type MssqlRollbackFence = {
   restore: () => void;
@@ -1153,12 +1179,17 @@ export class MSSQLDriver extends BaseDBDriver {
   }
 
   private pool: mssql.ConnectionPool | null = null;
+  private readonly poolConnections = new Map<
+    mssql.ConnectionPool,
+    Set<mssql.Connection>
+  >();
   private readonly config: ConnectionConfig;
   private readonly activeRequests = new Map<
     mssql.Request,
     number | undefined
   >();
   private timeoutRecoveryInFlight: Promise<void> | null = null;
+  private connectionEpoch = 0;
   constructor(
     config: ConnectionConfig,
     timeoutSettingsProvider?: DriverTimeoutSettingsProvider,
@@ -1413,23 +1444,70 @@ export class MSSQLDriver extends BaseDBDriver {
     return value;
   }
   async connect(): Promise<void> {
+    const epoch = ++this.connectionEpoch;
     if (this.pool !== null) {
-      try {
-        await this.pool.close();
-      } catch {}
+      const previousPool = this.pool;
       this.pool = null;
+      try {
+        await this.closePool(previousPool);
+      } catch {}
     }
-    const pool = new mssql.ConnectionPool(this.poolConfig());
+    this.assertConnectionEpoch(epoch);
+    const connections = new Set<mssql.Connection>();
+    const pool = new mssql.ConnectionPool({
+      ...this.poolConfig(),
+      beforeConnect: (connection) => {
+        connections.add(connection);
+        connection.once("end", () => connections.delete(connection));
+      },
+    });
+    this.poolConnections.set(pool, connections);
     pool.on("error", (err: unknown) => {
       logger.error("MSSQL pool error", err);
     });
-    this.pool = await pool.connect();
-  }
-  async disconnect(): Promise<void> {
     try {
-      await this.pool?.close();
+      await pool.connect();
+      this.assertConnectionEpoch(epoch);
+      this.pool = pool;
+    } catch (error) {
+      await this.closePool(pool).catch(() => undefined);
+      throw error;
+    }
+  }
+  private assertConnectionEpoch(epoch: number): void {
+    if (epoch !== this.connectionEpoch) {
+      throw new DOMException(
+        "MSSQL connection attempt cancelled",
+        "AbortError",
+      );
+    }
+  }
+
+  async disconnect(): Promise<void> {
+    this.connectionEpoch += 1;
+    const pool = this.pool;
+    this.pool = null;
+    if (pool) await this.closePool(pool);
+  }
+
+  private async closePool(pool: mssql.ConnectionPool): Promise<void> {
+    const connections = this.poolConnections.get(pool);
+    this.poolConnections.delete(pool);
+    try {
+      await closeDriverResource(
+        () => pool.close(),
+        () => {
+          for (const connection of connections ?? []) {
+            try {
+              connection.close();
+            } catch (error) {
+              logger.error("MSSQL transport cleanup failed", error);
+            }
+          }
+        },
+      );
     } finally {
-      this.pool = null;
+      connections?.clear();
     }
   }
 
@@ -2041,8 +2119,13 @@ export class MSSQLDriver extends BaseDBDriver {
     if (objectTypeRes.recordset[0]?.TABLE_TYPE === "VIEW") {
       const viewDef = await this.requirePool()
         .request()
+        .input(
+          "objectName",
+          mssql.NVarChar,
+          this.qualifiedTableName(database, schema, table),
+        )
         .query<RoutineDefinitionRow>(
-          `SELECT OBJECT_DEFINITION(OBJECT_ID('[${escapeMssqlId(database)}].[${escapeMssqlId(schema)}].[${escapeMssqlId(table)}]')) AS def`,
+          "SELECT OBJECT_DEFINITION(OBJECT_ID(@objectName)) AS def",
         );
       return (
         viewDef.recordset[0]?.def ??
@@ -2130,8 +2213,13 @@ export class MSSQLDriver extends BaseDBDriver {
   ): Promise<string> {
     const res = await this.requirePool()
       .request()
+      .input(
+        "objectName",
+        mssql.NVarChar,
+        this.qualifiedTableName(database, schema, name),
+      )
       .query<RoutineDefinitionRow>(
-        `SELECT OBJECT_DEFINITION(OBJECT_ID('[${escapeMssqlId(database)}].[${escapeMssqlId(schema)}].[${escapeMssqlId(name)}]')) AS def`,
+        "SELECT OBJECT_DEFINITION(OBJECT_ID(@objectName)) AS def",
       );
     const def = res.recordset[0]?.def ?? null;
     return def ?? `-- Definition not available for [${schema}].[${name}]`;
@@ -2228,7 +2316,19 @@ export class MSSQLDriver extends BaseDBDriver {
   ): Promise<void> {
     throwIfTransactionCancelled(context);
     const tx = new mssql.Transaction(this.requirePool());
-    await tx.begin();
+    try {
+      await tx.begin();
+    } catch (error) {
+      try {
+        discardFailedMssqlBegin(tx);
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "MSSQL transaction begin and session cleanup failed.",
+        );
+      }
+      throw error;
+    }
     let activeRequest: mssql.Request | undefined;
     const cancel = () => {
       try {

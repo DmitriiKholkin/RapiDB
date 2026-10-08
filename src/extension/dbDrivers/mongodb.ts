@@ -36,6 +36,7 @@ import {
   inferColumnsFromRows,
   pageRows,
 } from "./nosqlUtils";
+import { getQueryRemainingTimeoutMs, throwIfQueryCancelled } from "./timeout";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -1431,6 +1432,7 @@ export class MongoDBDriver implements IDBDriver {
     _params?: unknown[],
     options?: QueryExecutionOptions,
   ): Promise<QueryResult> {
+    throwIfQueryCancelled(options);
     const trimmed = normalizeMongoshQueryText(sql);
 
     if (trimmed.length === 0) {
@@ -1449,6 +1451,16 @@ export class MongoDBDriver implements IDBDriver {
     const executeOperation = async (
       operation: MongoshOperation,
     ): Promise<QueryResult> => {
+      throwIfQueryCancelled(options);
+      const timeoutMS = getQueryRemainingTimeoutMs(options);
+      const sdkOptions = {
+        ...(options?.signal ? { signal: options.signal } : {}),
+        ...(timeoutMS !== undefined ? { timeoutMS } : {}),
+      };
+      const sdkArgs =
+        Object.keys(sdkOptions).length > 0
+          ? ([sdkOptions] as const)
+          : ([] as const);
       const { dbName, collName, op, args: opArgs, chainOps } = operation;
 
       const limitOp = chainOps.find((c) => c.op === "limit");
@@ -1476,7 +1488,7 @@ export class MongoDBDriver implements IDBDriver {
           const collections = await this.requireDb(dbName)
             .listCollections(
               {},
-              { authorizedCollections: true, nameOnly: true },
+              { authorizedCollections: true, nameOnly: true, ...sdkOptions },
             )
             .toArray();
           return this.buildMongoDocumentRowsQueryResult(
@@ -1488,7 +1500,7 @@ export class MongoDBDriver implements IDBDriver {
           const cmd = this.normalizeFilterCriteria(
             opArgs[0] as Record<string, unknown>,
           );
-          const result = await this.requireDb(dbName).command(cmd);
+          const result = await this.requireDb(dbName).command(cmd, ...sdkArgs);
           return this.buildMongoSingleRowQueryResult(
             this.toRow(result as Record<string, unknown>),
             startedAt,
@@ -1501,9 +1513,12 @@ export class MongoDBDriver implements IDBDriver {
               ? (opArgs[1] as Record<string, unknown>)
               : undefined;
           if (options) {
-            await this.requireDb(dbName).createCollection(name, options);
+            await this.requireDb(dbName).createCollection(name, {
+              ...options,
+              ...sdkOptions,
+            });
           } else {
-            await this.requireDb(dbName).createCollection(name);
+            await this.requireDb(dbName).createCollection(name, ...sdkArgs);
           }
           return this.buildMongoSingleRowQueryResult(
             { ok: 1, name, type: "collection" },
@@ -1522,6 +1537,7 @@ export class MongoDBDriver implements IDBDriver {
             viewOn,
             pipeline,
             ...(options ?? {}),
+            ...sdkOptions,
           });
           return this.buildMongoSingleRowQueryResult(
             { ok: 1, name, type: "view", viewOn },
@@ -1560,6 +1576,7 @@ export class MongoDBDriver implements IDBDriver {
           promoteValues: false,
           bsonRegExp: false,
           ...(projection !== undefined ? { projection } : {}),
+          ...sdkOptions,
         };
         let cursor = mongoCollection.find(normalizeCriteria(), findOptions);
         for (const chain of chainOps) {
@@ -1580,13 +1597,13 @@ export class MongoDBDriver implements IDBDriver {
       const runUpdate = async (single: boolean) => {
         const update = opArgs[1] as Record<string, unknown>;
         return single
-          ? mongoCollection.updateOne(normalizeCriteria(), update)
-          : mongoCollection.updateMany(normalizeCriteria(), update);
+          ? mongoCollection.updateOne(normalizeCriteria(), update, ...sdkArgs)
+          : mongoCollection.updateMany(normalizeCriteria(), update, ...sdkArgs);
       };
       const runDelete = async (single: boolean) =>
         single
-          ? mongoCollection.deleteOne(normalizeCriteria())
-          : mongoCollection.deleteMany(normalizeCriteria());
+          ? mongoCollection.deleteOne(normalizeCriteria(), ...sdkArgs)
+          : mongoCollection.deleteMany(normalizeCriteria(), ...sdkArgs);
 
       const collectionHandlers: Record<string, () => Promise<QueryResult>> = {
         find: async () =>
@@ -1602,12 +1619,13 @@ export class MongoDBDriver implements IDBDriver {
         countDocuments: async () => {
           const count = await mongoCollection.countDocuments(
             normalizeCriteria(),
+            ...sdkArgs,
           );
           return this.buildMongoSingleRowQueryResult({ count }, startedAt);
         },
         insertOne: async () => {
           const doc = opArgs[0] as Record<string, unknown>;
-          const result = await mongoCollection.insertOne(doc);
+          const result = await mongoCollection.insertOne(doc, ...sdkArgs);
           return this.buildMongoSingleRowQueryResult(
             {
               acknowledged: result.acknowledged,
@@ -1619,7 +1637,7 @@ export class MongoDBDriver implements IDBDriver {
         },
         insertMany: async () => {
           const docs = opArgs[0] as Record<string, unknown>[];
-          const result = await mongoCollection.insertMany(docs);
+          const result = await mongoCollection.insertMany(docs, ...sdkArgs);
           return this.buildMongoSingleRowQueryResult(
             {
               acknowledged: result.acknowledged,
@@ -1683,6 +1701,7 @@ export class MongoDBDriver implements IDBDriver {
             .aggregate(boundedPipeline, {
               promoteValues: false,
               bsonRegExp: false,
+              ...sdkOptions,
             })
             .toArray();
           return this.buildMongoDocumentRowsQueryResult(docs, startedAt);
@@ -1702,7 +1721,9 @@ export class MongoDBDriver implements IDBDriver {
               : undefined;
           const name = await mongoCollection.createIndex(
             key as Parameters<typeof mongoCollection.createIndex>[0],
-            options as Parameters<typeof mongoCollection.createIndex>[1],
+            (sdkArgs.length > 0
+              ? { ...options, ...sdkOptions }
+              : options) as Parameters<typeof mongoCollection.createIndex>[1],
           );
           return this.buildMongoSingleRowQueryResult(
             { ok: 1, name },
@@ -1722,7 +1743,9 @@ export class MongoDBDriver implements IDBDriver {
     };
 
     if (operations.length === 1) {
-      return executeOperation(operations[0]);
+      const result = await executeOperation(operations[0]);
+      throwIfQueryCancelled(options);
+      return result;
     }
 
     const rawRows: Record<string, unknown>[] = [];
@@ -1732,6 +1755,7 @@ export class MongoDBDriver implements IDBDriver {
 
     for (const operation of operations) {
       const result = await executeOperation(operation);
+      throwIfQueryCancelled(options);
       const mappedRows = this.mapQueryResultRowsToObjects(result);
       totalRowCount += mappedRows.length;
       const availableSlots = MONGODB_QUERY_HARD_CAP - rawRows.length;

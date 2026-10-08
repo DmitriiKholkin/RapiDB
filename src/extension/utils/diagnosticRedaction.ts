@@ -1,7 +1,7 @@
 /** Redact diagnostics only; never use these copies as connection/query inputs. */
 const REDACTED = "[REDACTED]";
 const SECRET_KEY =
-  /^(?:password|passwd|pwd|passphrase|privateKey|keyPassphrase|tlsKeyPassphrase|sshPassword|sshPrivateKey|sshPassphrase|api[_-]?key|access[_-]?token|auth[_-]?token|authorization|token|secret|client[_-]?secret|(?:aws)?AccessKeyId|(?:aws)?SecretAccessKey|(?:aws)?SessionToken|proxyPassword)$/i;
+  /^(?:password|passwd|pwd|passphrase|tlsCertificateKeyFilePassword|privateKey|keyPassphrase|tlsKeyPassphrase|sshPassword|sshPrivateKey|sshPassphrase|api[_-]?key|access[_-]?token|auth[_-]?token|authorization|token|secret|client[_-]?secret|(?:aws)?AccessKeyId|(?:aws)?SecretAccessKey|(?:aws)?SessionToken|proxyPassword)$/i;
 const URI_SECRET_KEY =
   /^(?:auth|key|sig|proxyUsername|username|user|authMechanismProperties|aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key|session[_-]?token))$/i;
 const URI_KEY = /^(?:connectionUri|uri|endpoint|awsEndpoint)$/i;

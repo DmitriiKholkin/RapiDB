@@ -31,7 +31,7 @@ const CREDENTIAL_BEARING_URI_FIELDS = [
   "awsEndpoint",
 ] as const satisfies readonly (keyof ConnectionSecretSnapshot)[];
 const CREDENTIAL_QUERY_PARAMETER =
-  /^(?:password|passwd|pwd|auth|key|sig|api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|client[_-]?secret|aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key|session[_-]?token))$/i;
+  /^(?:password|passwd|pwd|proxyPassword|passphrase|tlsCertificateKeyFilePassword|auth|key|sig|api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|client[_-]?secret|aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key|session[_-]?token))$/i;
 
 export function trimOptionalSecretValue(
   value: string | undefined,

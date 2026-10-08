@@ -35,6 +35,38 @@ afterEach(() => {
 });
 
 describe("driver timeout helpers", () => {
+  it("adds per-query cancellation without mutating or losing caller options", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const options = Object.freeze({
+      requestToken: 123,
+      readOnly: true,
+      database: "selected",
+      hardCap: 100,
+      signal: controller.signal,
+      deadline: Date.now() + 10,
+    });
+    const query = vi.fn(
+      async (_sql: string, _params?: unknown[], context?: typeof options) =>
+        context,
+    );
+    const wrapped = createTimeoutAwareDriver({ query }, () => ({
+      connectionTimeoutSeconds: 15,
+      dbOperationTimeoutSeconds: 1,
+      connectionTimeoutMs: 15000,
+      dbOperationTimeoutMs: 25,
+    }));
+    const captured = await wrapped.query("select 1", undefined, options);
+    expect(captured).toMatchObject({
+      ...options,
+      signal: expect.any(AbortSignal),
+    });
+    expect(captured).not.toBe(options);
+    expect(captured?.signal).not.toBe(options.signal);
+    controller.abort();
+    expect(captured?.signal.aborted).toBe(true);
+  });
+
   it("cancels transaction connections without recursively recycling pools", async () => {
     const postgres = new PostgresDriver({
       id: "pg-timeout",

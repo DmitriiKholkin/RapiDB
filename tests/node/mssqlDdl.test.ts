@@ -1,3 +1,4 @@
+import * as mssql from "mssql";
 import { describe, expect, it, vi } from "vitest";
 import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
@@ -32,10 +33,40 @@ function attachPool(
     on: vi.fn(),
   };
   (driver as unknown as { pool: typeof pool }).pool = pool;
-  return { pool, request, query };
+  return { pool, request, query, input };
 }
 
 describe("MSSQL DDL generation", () => {
+  it.each([
+    "view",
+    "function",
+    "procedure",
+  ] as const)("binds apostrophes and bracket delimiters when loading %s DDL", async (kind) => {
+    const driver = makeDriver();
+    const { query, input } = attachPool(driver, (sql) => ({
+      recordset: sql.includes("INFORMATION_SCHEMA.TABLES")
+        ? [{ TABLE_TYPE: "VIEW" }]
+        : [{ def: "definition" }],
+    }));
+    const database = "db's]name";
+    const schema = "schema's]name";
+    const name = "O'Brien]";
+    const result =
+      kind === "view"
+        ? await driver.getCreateTableDDL(database, schema, name)
+        : await driver.getRoutineDefinition(database, schema, name, kind);
+    expect(result).toBe("definition");
+    expect(query).toHaveBeenLastCalledWith(
+      "SELECT OBJECT_DEFINITION(OBJECT_ID(@objectName)) AS def",
+    );
+    expect(input).toHaveBeenCalledWith(
+      "objectName",
+      mssql.NVarChar,
+      "[db's]]name].[schema's]]name].[O'Brien]]]",
+    );
+    expect(query.mock.calls.at(-1)?.[0]).not.toContain(name);
+  });
+
   it("returns view definition instead of table DDL for views", async () => {
     const driver = makeDriver();
     const queries: string[] = [];

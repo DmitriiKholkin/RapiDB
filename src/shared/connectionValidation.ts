@@ -1,6 +1,7 @@
 import {
   type ConnectionConfig,
   getConnectionTlsSupport,
+  getElasticsearchTlsEndpointError,
   isConnectionTlsEnabled,
 } from "./connectionConfig";
 import type { ConnectionType } from "./connectionTypes";
@@ -445,6 +446,17 @@ function buildTlsValidationIssues(
   const pushInvalidIssue = (fields: string[], message: string) => {
     issues.push(createValidationIssue("invalid", fields, message));
   };
+
+  const endpointError = getElasticsearchTlsEndpointError(config);
+  if (endpointError) {
+    pushInvalidIssue(
+      [
+        "tls.mode",
+        config.connectionUri !== undefined ? "connectionUri" : "endpoint",
+      ],
+      endpointError,
+    );
+  }
 
   if (!support.modes.includes(tlsConfig.mode)) {
     pushInvalidIssue(

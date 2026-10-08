@@ -18,6 +18,20 @@ import {
 } from "../support/mongoCredentialError";
 
 describe("diagnostic credential redaction", () => {
+  it.each([
+    "proxyPassword",
+    "tlsCertificateKeyFilePassword",
+    "passphrase",
+  ])("redacts MongoDB URI %s from diagnostics", (key) => {
+    const uri = `mongodb://db.internal/app?${key}=mongo-secret&replicaSet=rs`;
+    const text = redactDiagnosticText(`Connection failed: ${uri}`);
+    expect(text).not.toContain("mongo-secret");
+    expect(text).toContain("replicaSet=rs");
+    expect(redactDiagnosticValue({ [key]: "mongo-secret" })).toEqual({
+      [key]: "[REDACTED]",
+    });
+  });
+
   it("preserves and redacts inherited DOMException messages without mutating the original", () => {
     const upstream = new DOMException(
       "Credential inherited-secret rejected",

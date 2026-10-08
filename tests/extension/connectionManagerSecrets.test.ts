@@ -27,6 +27,123 @@ vi.mock("vscode", async () => {
 });
 
 describe("ConnectionManager with VSCode SecretStorage", () => {
+  it("rejects an Elasticsearch HTTP endpoint before persisting required TLS credentials", async () => {
+    configuration.connections = [];
+    const context = createExtensionContextStub();
+    const manager = new ConnectionManager(context as never);
+    try {
+      await expect(
+        manager.saveConnection({
+          id: "elastic-http",
+          name: "Elasticsearch",
+          type: "elasticsearch",
+          connectionUri: "http://db.internal:9200",
+          password: "elastic-secret",
+          tls: { mode: "requireVerifyFull" },
+        }),
+      ).rejects.toThrow("requires an HTTPS");
+      expect(configuration.connections).toEqual([]);
+      await expect(
+        context.secrets.get("elastic-http"),
+      ).resolves.toBeUndefined();
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  it.each([
+    "proxyPassword",
+    "tlsCertificateKeyFilePassword",
+    "passphrase",
+  ])("migrates an existing plaintext MongoDB URI %s before connecting", async (key) => {
+    const connectionUri = `mongodb://db.internal/app?${key}=mongo-secret&replicaSet=rs`;
+    const config: ConnectionConfig = {
+      id: "mongo-uri-migration",
+      name: "MongoDB",
+      type: "mongodb",
+      connectionUri,
+      useSecretStorage: true,
+    };
+    configuration.connections = [config];
+    const context = createExtensionContextStub();
+    const manager = new ConnectionManager(context as never);
+    const state = manager as unknown as {
+      createDriver(config: ConnectionConfig): IDBDriver;
+    };
+    let connected = false;
+    const factory = vi.spyOn(state, "createDriver").mockReturnValue({
+      connect: vi.fn(async () => {
+        connected = true;
+      }),
+      disconnect: vi.fn(async () => {
+        connected = false;
+      }),
+      isConnected: () => connected,
+    } as unknown as IDBDriver);
+    try {
+      await manager.connectTo(config.id);
+      expect(configuration.connections[0].connectionUri).toBe(
+        "mongodb://db.internal/app?replicaSet=rs",
+      );
+      expect(
+        JSON.parse((await context.secrets.get(config.id)) ?? "{}"),
+      ).toMatchObject({ connectionUri });
+      expect(factory).toHaveBeenLastCalledWith(
+        expect.objectContaining({ connectionUri }),
+      );
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  it.each([
+    "proxyPassword",
+    "tlsCertificateKeyFilePassword",
+    "passphrase",
+  ])("keeps MongoDB URI %s in SecretStorage through JSON save, edit and runtime hydration", async (key) => {
+    configuration.connections = [];
+    const context = createExtensionContextStub();
+    const manager = new ConnectionManager(context as never);
+    const state = manager as unknown as {
+      createDriver(config: ConnectionConfig): IDBDriver;
+    };
+    let connected = false;
+    const factory = vi.spyOn(state, "createDriver").mockReturnValue({
+      connect: vi.fn(async () => {
+        connected = true;
+      }),
+      disconnect: vi.fn(async () => {
+        connected = false;
+      }),
+      isConnected: () => connected,
+    } as unknown as IDBDriver);
+    const connectionUri = `mongodb://db.internal/app?${key}=mongo-secret&replicaSet=rs`;
+    const config: ConnectionConfig = {
+      id: "mongo-uri-secret",
+      name: "MongoDB",
+      type: "mongodb",
+      connectionUri,
+      useSecretStorage: true,
+    };
+    try {
+      const saved = await manager.saveConnection(config);
+      const redacted = "mongodb://db.internal/app?replicaSet=rs";
+      expect(saved.connectionUri).toBe(redacted);
+      expect(configuration.connections[0].connectionUri).toBe(redacted);
+      expect(
+        JSON.parse((await context.secrets.get(config.id)) ?? "{}"),
+      ).toMatchObject({ connectionUri });
+      await manager.saveConnection({ ...saved, name: "Renamed" });
+      await manager.connectTo(saved.id);
+      expect(factory).toHaveBeenLastCalledWith(
+        expect.objectContaining({ connectionUri }),
+      );
+      expect(configuration.connections[0].connectionUri).toBe(redacted);
+    } finally {
+      await manager.dispose();
+    }
+  });
+
   it.each([
     false,
     true,

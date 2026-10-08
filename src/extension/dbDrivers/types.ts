@@ -66,6 +66,10 @@ export interface DatabaseExecutionScope {
 export interface QueryExecutionOptions extends DatabaseExecutionScope {
   requestToken?: number;
   readOnly?: boolean;
+  /** Per-query cancellation; must not cancel a later request on the connection. */
+  signal?: AbortSignal;
+  /** Absolute deadline shared by every command in a query batch. */
+  deadline?: number;
   /** Retained-row budget for boundedQueryResults drivers, not a mutation/drain limit. */
   hardCap?: number;
 }

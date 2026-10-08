@@ -160,6 +160,41 @@ describe("connection URI secret handling", () => {
     );
   });
 
+  it.each([
+    "proxyPassword",
+    "tlsCertificateKeyFilePassword",
+    "passphrase",
+    "PROXYPASSWORD",
+    "tlsCertificateKeyFile%50assword",
+  ])("redacts supported MongoDB URI credential %s and preserves it across resaves", (key) => {
+    const uri = `mongodb://db.internal/app?replicaSet=rs&${key}=uri-secret&tls=true`;
+    const redacted = "mongodb://db.internal/app?replicaSet=rs&tls=true";
+    const config: ConnectionConfig = {
+      id: "mongo-uri-credential",
+      name: "MongoDB",
+      type: "mongodb",
+      connectionUri: uri,
+      useSecretStorage: true,
+    };
+    const persisted = sanitizePersistedConnectionConfig(config);
+    expect(persisted.connectionUri).toBe(redacted);
+    expect(hasConnectionConfigSecrets(config)).toBe(true);
+    const secret = serializeConnectionSecretsForStoredConfig(config, undefined);
+    expect(JSON.parse(secret ?? "{}")).toEqual({ connectionUri: uri });
+    expect(serializeConnectionSecretsForStoredConfig(persisted, secret)).toBe(
+      secret,
+    );
+    expect(
+      sanitizeConnectionConfigForResponse({
+        ...config,
+        useSecretStorage: false,
+      }).connectionUri,
+    ).toBe(redacted);
+    expect(
+      sanitizeCredentialBearingUri(`mongodb://host/app#${key}=uri-secret`),
+    ).toBe("mongodb://host/app");
+  });
+
   it("preserves the explicit plaintext opt-out for unambiguous credentials", () => {
     const config: ConnectionConfig = {
       id: "plaintext",
