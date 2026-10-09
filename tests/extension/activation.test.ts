@@ -44,8 +44,10 @@ describe("extension activation", () => {
   let connectWithProgress: ReturnType<typeof vi.fn>;
   let queryPanelCreateOrShow: ReturnType<typeof vi.fn>;
   let queryPanelDisposeAll: ReturnType<typeof vi.fn>;
+  let queryPanelRegisterSerializer: ReturnType<typeof vi.fn>;
   let tablePanelCreateOrShow: ReturnType<typeof vi.fn>;
   let tablePanelDisposeAll: ReturnType<typeof vi.fn>;
+  let tablePanelRegisterSerializer: ReturnType<typeof vi.fn>;
   let erdPanelCreateOrShow: ReturnType<typeof vi.fn>;
   let erdPanelDisposeAll: ReturnType<typeof vi.fn>;
 
@@ -56,8 +58,10 @@ describe("extension activation", () => {
     connectWithProgress = vi.fn();
     queryPanelCreateOrShow = vi.fn();
     queryPanelDisposeAll = vi.fn();
+    queryPanelRegisterSerializer = vi.fn(() => ({ dispose: vi.fn() }));
     tablePanelCreateOrShow = vi.fn();
     tablePanelDisposeAll = vi.fn();
+    tablePanelRegisterSerializer = vi.fn(() => ({ dispose: vi.fn() }));
     erdPanelCreateOrShow = vi.fn();
     erdPanelDisposeAll = vi.fn();
 
@@ -174,12 +178,14 @@ describe("extension activation", () => {
       QueryPanel: {
         createOrShow: queryPanelCreateOrShow,
         disposeAll: queryPanelDisposeAll,
+        registerSerializer: queryPanelRegisterSerializer,
       },
     }));
     vi.doMock("../../src/extension/panels/tablePanel", () => ({
       TablePanel: {
         createOrShow: tablePanelCreateOrShow,
         disposeAll: tablePanelDisposeAll,
+        registerSerializer: tablePanelRegisterSerializer,
       },
     }));
     vi.doMock("../../src/extension/panels/erdPanel", () => ({
@@ -228,6 +234,8 @@ describe("extension activation", () => {
       vscodeState.registerCommand.mock.calls.map(([command]) => command),
     ).toEqual(expectedCommands);
     expect(connectionProviderInstances).toHaveLength(1);
+    expect(queryPanelRegisterSerializer).toHaveBeenCalledOnce();
+    expect(tablePanelRegisterSerializer).toHaveBeenCalledOnce();
     expect(vscodeState.createTreeView).toHaveBeenCalledWith(
       "rapidb-explorer",
       expect.objectContaining({

@@ -89,6 +89,15 @@ export class ErdGraphService {
         }
       }),
     ];
+    const metadataInvalidation =
+      this.connectionManager.onDidInvalidateConnectionMetadata?.(
+        (connectionId) => {
+          this.bumpConnectionGeneration(connectionId);
+          this.bumpConnectionLifecycleGeneration(connectionId);
+          this.invalidateConnection(connectionId);
+        },
+      );
+    if (metadataInvalidation) this.subscriptions.push(metadataInvalidation);
   }
 
   dispose(): void {
@@ -109,6 +118,12 @@ export class ErdGraphService {
   ): Promise<ErdGraphResult> {
     const normalized = this.normalizeRequest(request);
     const cacheKey = this.makeCacheKey(normalized);
+    if (
+      this.connectionManager.isConnecting?.(normalized.connectionId) ||
+      this.connectionManager.isConnected?.(normalized.connectionId) === false
+    ) {
+      throw new Error("Not connected");
+    }
 
     if (!forceReload) {
       const cached = this.cache.get(cacheKey);

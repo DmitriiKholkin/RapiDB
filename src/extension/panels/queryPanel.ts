@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import type { QueryEditorLanguage } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
@@ -22,10 +23,46 @@ import {
 
 const QUERY_PANEL_RETENTION_MODE = "retain" as const;
 
+interface QueryPanelSerializedState {
+  panelId: string;
+  connectionId: string;
+  activeConnectionId?: string;
+  initialQueryText?: string;
+  formatOnOpen?: boolean;
+  isBookmarked?: boolean;
+  editorLanguage?: QueryEditorLanguage;
+}
+
+function isQueryPanelSerialization(
+  value: unknown,
+): value is QueryPanelSerializedState {
+  if (!value || typeof value !== "object") return false;
+  const state = value as Record<string, unknown>;
+  return (
+    typeof state.panelId === "string" &&
+    /^qp_(?:\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.test(
+      state.panelId,
+    ) &&
+    typeof state.connectionId === "string" &&
+    (state.activeConnectionId === undefined ||
+      typeof state.activeConnectionId === "string") &&
+    (state.initialQueryText === undefined ||
+      typeof state.initialQueryText === "string") &&
+    (state.formatOnOpen === undefined ||
+      typeof state.formatOnOpen === "boolean") &&
+    (state.isBookmarked === undefined ||
+      typeof state.isBookmarked === "boolean") &&
+    (state.editorLanguage === undefined ||
+      state.editorLanguage === "sql" ||
+      state.editorLanguage === "javascript" ||
+      state.editorLanguage === "plaintext" ||
+      state.editorLanguage === "json")
+  );
+}
+
 export class QueryPanel {
   private static readonly viewType = "rapidb.queryPanel";
   private static panels = new Map<string, QueryPanel>();
-  private static sequence = 0;
 
   private readonly panel: vscode.WebviewPanel;
   private readonly connectionManager: ConnectionManager;
@@ -36,6 +73,7 @@ export class QueryPanel {
   private editorLanguage: QueryEditorLanguage | undefined;
   private lastQueryResult: QueryPanelCachedResult | null = null;
   private activeConnectionId: string;
+  private readonly initialQueryText: string | undefined;
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -50,6 +88,7 @@ export class QueryPanel {
   ) {
     this.panel = panel;
     this.connectionManager = connectionManager;
+    this.initialQueryText = initialQueryText;
     this.initialConnectionId = connectionId;
     this.activeConnectionId = connectionId;
     this.formatOnOpen = formatOnOpen;
@@ -158,6 +197,82 @@ export class QueryPanel {
     QueryPanel.panels.clear();
   }
 
+  private static trackPanel(panelId: string, instance: QueryPanel): void {
+    QueryPanel.panels.set(panelId, instance);
+    instance.panel.onDidDispose(() => {
+      if (QueryPanel.panels.get(panelId) === instance) {
+        QueryPanel.panels.delete(panelId);
+      }
+    });
+  }
+
+  static registerSerializer(
+    context: vscode.ExtensionContext,
+    connectionManager: ConnectionManager,
+  ): vscode.Disposable {
+    if (typeof vscode.window.registerWebviewPanelSerializer !== "function") {
+      return { dispose: () => undefined };
+    }
+    return vscode.window.registerWebviewPanelSerializer(QueryPanel.viewType, {
+      async deserializeWebviewPanel(panel, state) {
+        const saved =
+          state !== null && typeof state === "object"
+            ? (state as { initialState?: unknown }).initialState
+            : undefined;
+        if (!saved || typeof saved !== "object") {
+          panel.dispose();
+          return;
+        }
+        const initialState = saved as Record<string, unknown>;
+        const persistedDraft =
+          state !== null && typeof state === "object"
+            ? (state as { queryDraft?: unknown }).queryDraft
+            : undefined;
+        const activeConnectionId =
+          persistedDraft !== null && typeof persistedDraft === "object"
+            ? (
+                persistedDraft as {
+                  panelId?: unknown;
+                  activeConnectionId?: unknown;
+                }
+              ).panelId === initialState.panelId &&
+              typeof (persistedDraft as { activeConnectionId?: unknown })
+                .activeConnectionId === "string"
+              ? (persistedDraft as { activeConnectionId: string })
+                  .activeConnectionId
+              : undefined
+            : undefined;
+        const restored = {
+          panelId: initialState.panelId,
+          connectionId: initialState.connectionId,
+          activeConnectionId,
+          initialQueryText: initialState.queryText ?? initialState.initialSql,
+          formatOnOpen: initialState.formatOnOpen,
+          isBookmarked: initialState.isBookmarked,
+          editorLanguage: initialState.editorLanguage,
+        };
+        if (!isQueryPanelSerialization(restored)) {
+          panel.dispose();
+          return;
+        }
+        const instance = new QueryPanel(
+          panel,
+          context,
+          connectionManager,
+          restored.connectionId,
+          restored.initialQueryText,
+          restored.formatOnOpen,
+          restored.isBookmarked,
+          restored.editorLanguage,
+          restored.panelId,
+        );
+        instance.activeConnectionId =
+          restored.activeConnectionId ?? restored.connectionId;
+        QueryPanel.trackPanel(restored.panelId, instance);
+      },
+    });
+  }
+
   static createOrShow(
     context: vscode.ExtensionContext,
     connectionManager: ConnectionManager,
@@ -180,7 +295,9 @@ export class QueryPanel {
       }
     }
 
-    const panelId = `qp_${++QueryPanel.sequence}`;
+    // Hidden saved panels are restored lazily. A local counter cannot reserve
+    // their IDs before deserialization runs, including after an extension restart.
+    const panelId = `qp_${randomUUID()}`;
     const webviewPanel = vscode.window.createWebviewPanel(
       QueryPanel.viewType,
       title,
@@ -199,8 +316,7 @@ export class QueryPanel {
       editorLanguage,
       panelId,
     );
-    QueryPanel.panels.set(panelId, instance);
-    webviewPanel.onDidDispose(() => QueryPanel.panels.delete(panelId));
+    QueryPanel.trackPanel(panelId, instance);
     return instance;
   }
 

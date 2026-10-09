@@ -106,6 +106,7 @@ const PG_GENERATED_KIND_EXPRESSION = "NULLIF(to_jsonb(a)->>'attgenerated', '')";
 interface PostgresPoolWaitOperation {
   cancelled: boolean;
   wakePoolWait?: () => void;
+  cancelPoolCheckout?: () => void;
 }
 
 interface PostgresQueryOperation extends PostgresPoolWaitOperation {
@@ -797,6 +798,24 @@ export class PostgresDriver extends BaseDBDriver {
     this._connected = false;
     this.connectedDatabaseName = "";
     this.tlsSettings = undefined;
+    for (const operation of this.activeQueryOperations) {
+      operation.cancelled = true;
+      operation.wakePoolWait?.();
+      operation.cancelPoolCheckout?.();
+      const client = operation.client;
+      operation.client = undefined;
+      if (client && this.activeQueryClients.delete(client)) {
+        client.release(true);
+      }
+    }
+    for (const client of this.activeQueryClients) {
+      client.release(true);
+    }
+    this.activeQueryClients.clear();
+    for (const client of this.activeTransactionClients) {
+      this.activeTransactionClients.delete(client);
+      client.release(true);
+    }
     await this.closeOwnedPools();
   }
 
@@ -847,6 +866,7 @@ export class PostgresDriver extends BaseDBDriver {
         }
         operation.cancelled = true;
         operation.wakePoolWait?.();
+        operation.cancelPoolCheckout?.();
         if (operation.client) {
           const client = operation.client;
           operation.client = undefined;
@@ -1316,7 +1336,7 @@ export class PostgresDriver extends BaseDBDriver {
         // separate readiness promise here leaves a race where another pool
         // user can take the slot and strand this request in pg-pool's
         // non-cancellable checkout queue.
-        const client = await pool.connect();
+        const client = await this.awaitPoolCheckout(operation, pool);
         try {
           assertActive();
           if (
@@ -1343,6 +1363,43 @@ export class PostgresDriver extends BaseDBDriver {
         timer = setTimeout(wake, 25);
         operation.wakePoolWait = wake;
       });
+    }
+  }
+
+  private async awaitPoolCheckout(
+    operation: PostgresPoolWaitOperation,
+    pool: Pool,
+  ): Promise<PoolClient> {
+    let cancelCheckout: (() => void) | undefined;
+    try {
+      return await new Promise<PoolClient>((resolve, reject) => {
+        let cancelled = false;
+        cancelCheckout = () => {
+          cancelled = true;
+          reject(
+            new Error("PostgreSQL operation cancelled during pool checkout."),
+          );
+        };
+        operation.cancelPoolCheckout = cancelCheckout;
+        // One settlement promise also observes reentrant cancellation if
+        // connect() throws synchronously; there is no orphaned race loser.
+        // Start connect in this turn to retain the pool capacity reservation.
+        void Promise.resolve(pool.connect()).then((client) => {
+          if (!cancelled) {
+            resolve(client);
+            return;
+          }
+          try {
+            client.release(true);
+          } catch (error) {
+            logger.error("PostgreSQL cancelled checkout cleanup error", error);
+          }
+        }, reject);
+      });
+    } finally {
+      if (operation.cancelPoolCheckout === cancelCheckout) {
+        operation.cancelPoolCheckout = undefined;
+      }
     }
   }
   async getIndexes(
@@ -1935,6 +1992,7 @@ export class PostgresDriver extends BaseDBDriver {
     const cancel = () => {
       waitOperation.cancelled = true;
       waitOperation.wakePoolWait?.();
+      waitOperation.cancelPoolCheckout?.();
       if (client && this.activeTransactionClients.delete(client)) {
         client.release(true);
       }
@@ -1962,27 +2020,44 @@ export class PostgresDriver extends BaseDBDriver {
       client = acquired;
       this.activeTransactionClients.add(client);
       const transactionClient = client;
-      throwIfTransactionCancelled(context);
+      const assertActive = () => {
+        throwIfTransactionCancelled(context);
+        if (
+          waitOperation.cancelled ||
+          !this.activeTransactionClients.has(transactionClient)
+        ) {
+          throw new Error("PostgreSQL transaction cancelled before execution.");
+        }
+      };
+      const queryTransaction = async (sql: string, params?: unknown[]) => {
+        assertActive();
+        const result =
+          params === undefined
+            ? await transactionClient.query(sql)
+            : await transactionClient.query(sql, params);
+        // disconnect/cancelCurrentOperation may discard the socket without a
+        // TransactionContext. A late successful reply must not send more SQL.
+        assertActive();
+        return result;
+      };
       transactionStarted = true;
-      await transactionClient.query("BEGIN");
+      await queryTransaction("BEGIN");
       const identities = new TransactionIdentityStore();
       for (const [index, op] of operations.entries()) {
-        throwIfTransactionCancelled(context);
-        const res = await transactionClient.query(op.sql, op.params ?? []);
+        const res = await queryTransaction(op.sql, op.params ?? []);
         assertTransactionAffectedRows(op, res.rowCount ?? 0);
         await identities.capture(
           index,
           op,
           res.rows,
-          async (sql, params) =>
-            (await transactionClient.query(sql, params)).rows,
+          async (sql, params) => (await queryTransaction(sql, params)).rows,
         );
       }
       await verifyTransaction(
         this,
         identities.resolve(scope?.verifications),
         async (verification) => {
-          const result = await transactionClient.query(
+          const result = await queryTransaction(
             verification.sql,
             verification.params,
           );
@@ -2005,10 +2080,13 @@ export class PostgresDriver extends BaseDBDriver {
         },
         context,
       );
-      throwIfTransactionCancelled(context);
-      await transactionClient.query("COMMIT");
+      await queryTransaction("COMMIT");
     } catch (error) {
-      if (client && transactionStarted) {
+      if (
+        client &&
+        transactionStarted &&
+        this.activeTransactionClients.has(client)
+      ) {
         try {
           await client.query("ROLLBACK");
         } catch (rollbackError) {

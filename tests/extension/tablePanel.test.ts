@@ -1,9 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
 import { REDIS_ALL_KEYS_TABLE } from "../../src/extension/dbDrivers/redisKeyspace";
+import type { IDBDriver } from "../../src/extension/dbDrivers/types";
 import { QueryPanelController } from "../../src/extension/panels/queryPanelController";
 import { TablePanel } from "../../src/extension/panels/tablePanel";
+import { TableReadService } from "../../src/extension/table/tableReadService";
 import type { ChunkedExportData } from "../../src/extension/utils/exportService";
+import type { TableMutationPreviewPayload } from "../../src/shared/webviewContracts";
+import {
+  createExtensionContextStub,
+  FakeConnectionManagerStore,
+} from "../support/fakeConnectionManagerStore";
 
 type MockColumn = { name: string; isPrimaryKey: boolean };
 
@@ -13,6 +20,7 @@ const getColumnsMock = vi.hoisted(() =>
 const getPageMock = vi.hoisted(() =>
   vi.fn(async () => ({ rows: [], totalCount: 0, columns: [] })),
 );
+const clearForConnectionMock = vi.hoisted(() => vi.fn<(id: string) => void>());
 const prepareDeleteRowsPlanMock = vi.hoisted(() =>
   vi.fn<
     (
@@ -36,6 +44,14 @@ const confirmMutationPreviewMock = vi.hoisted(() =>
 const pendingPreviewControllerState = vi.hoisted(
   () => new Map<string, string>(),
 );
+const realPreviewControllerMode = vi.hoisted(() => ({ enabled: false }));
+const executePreparedDeletePlanMock = vi.hoisted(() =>
+  vi.fn<
+    (
+      plan: import("../../src/extension/tableDataService").PreparedDeletePlan,
+    ) => Promise<void>
+  >(),
+);
 const createApplyChangesPreviewMock = vi.hoisted(() => vi.fn());
 const createInsertPreviewMock = vi.hoisted(() => vi.fn());
 const createDeleteRowsPreviewMock = vi.hoisted(() => vi.fn());
@@ -52,6 +68,7 @@ const exportAllMock = vi.hoisted(() =>
 );
 
 const vscodeMock = vi.hoisted(() => {
+  const serializers = new Map<string, unknown>();
   const configurationListeners = new Set<
     (event: { affectsConfiguration: (section: string) => boolean }) => void
   >();
@@ -98,9 +115,17 @@ const vscodeMock = vi.hoisted(() => {
     };
     return panel;
   });
+  const registerWebviewPanelSerializer = vi.fn(
+    (viewType: string, serializer: unknown) => {
+      serializers.set(viewType, serializer);
+      return { dispose: vi.fn() };
+    },
+  );
 
   return {
     createWebviewPanel,
+    registerWebviewPanelSerializer,
+    serializers,
     dispatchConfigurationChange(section: string) {
       const event = {
         affectsConfiguration: (candidate: string) => candidate === section,
@@ -113,6 +138,7 @@ const vscodeMock = vi.hoisted(() => {
       ViewColumn: { One: 1 },
       window: {
         createWebviewPanel,
+        registerWebviewPanelSerializer,
         showWarningMessage: vi.fn(),
         showErrorMessage: vi.fn(),
       },
@@ -130,7 +156,10 @@ const vscodeMock = vi.hoisted(() => {
   };
 });
 
-vi.mock("vscode", () => vscodeMock.module);
+vi.mock("vscode", async () => {
+  const { MockEventEmitter } = await import("../support/mockVscode");
+  return { ...vscodeMock.module, EventEmitter: MockEventEmitter };
+});
 
 vi.mock("../../src/extension/utils/exportService", () => ({
   exportTableDataAsCsv: exportTableDataMock,
@@ -162,63 +191,83 @@ vi.mock("../../src/extension/tableDataService", () => ({
     exportAll = exportAllMock;
     prepareInsertRow = prepareInsertRowMock;
     prepareDeleteRowsPlan = prepareDeleteRowsPlanMock;
-    clearForConnection = vi.fn();
+    executePreparedDeletePlan = executePreparedDeletePlanMock;
+    clearForConnection = clearForConnectionMock;
   },
   prepareApplyChangesPlan: prepareApplyChangesPlanMock,
 }));
 
-vi.mock("../../src/extension/panels/tableMutationPreviewController", () => ({
-  TableMutationPreviewController: class {
-    clear = vi.fn(() => pendingPreviewControllerState.clear());
-    confirm = vi.fn((previewToken: string, operationId?: string) => {
-      const pendingOperationId =
-        pendingPreviewControllerState.get(previewToken);
-      if (
-        pendingOperationId === undefined ||
-        (operationId && pendingOperationId !== operationId)
-      ) {
-        return Promise.resolve(null);
-      }
-      pendingPreviewControllerState.delete(previewToken);
-      return confirmMutationPreviewMock(previewToken, operationId);
-    });
-    cancel = vi.fn((previewToken: string, operationId?: string) => {
-      const pendingOperationId =
-        pendingPreviewControllerState.get(previewToken);
-      if (
-        pendingOperationId !== undefined &&
-        (!operationId || pendingOperationId === operationId)
-      ) {
-        pendingPreviewControllerState.delete(previewToken);
-      }
-    });
-    createApplyChangesPreview = (...args: unknown[]) =>
-      this.rememberPreview(createApplyChangesPreviewMock(...args));
-    createInsertPreview = (...args: unknown[]) =>
-      this.rememberPreview(createInsertPreviewMock(...args));
-    createDeleteRowsPreview = (...args: unknown[]) =>
-      this.rememberPreview(createDeleteRowsPreviewMock(...args));
-
-    private rememberPreview<T>(preview: T): T {
-      if (preview !== null && typeof preview === "object") {
-        const payload = preview as {
-          previewToken?: unknown;
-          operationId?: unknown;
-        };
+vi.mock(
+  "../../src/extension/panels/tableMutationPreviewController",
+  async (importOriginal) => {
+    const actual =
+      await importOriginal<
+        typeof import("../../src/extension/panels/tableMutationPreviewController")
+      >();
+    class MockTableMutationPreviewController {
+      clear = vi.fn(() => pendingPreviewControllerState.clear());
+      confirm = vi.fn((previewToken: string, operationId?: string) => {
+        const pendingOperationId =
+          pendingPreviewControllerState.get(previewToken);
         if (
-          typeof payload.previewToken === "string" &&
-          typeof payload.operationId === "string"
+          pendingOperationId === undefined ||
+          (operationId && pendingOperationId !== operationId)
         ) {
-          pendingPreviewControllerState.set(
-            payload.previewToken,
-            payload.operationId,
-          );
+          return Promise.resolve(null);
         }
+        pendingPreviewControllerState.delete(previewToken);
+        return confirmMutationPreviewMock(previewToken, operationId);
+      });
+      cancel = vi.fn((previewToken: string, operationId?: string) => {
+        const pendingOperationId =
+          pendingPreviewControllerState.get(previewToken);
+        if (
+          pendingOperationId !== undefined &&
+          (!operationId || pendingOperationId === operationId)
+        ) {
+          pendingPreviewControllerState.delete(previewToken);
+        }
+      });
+      createApplyChangesPreview = (...args: unknown[]) =>
+        this.rememberPreview(createApplyChangesPreviewMock(...args));
+      createInsertPreview = (...args: unknown[]) =>
+        this.rememberPreview(createInsertPreviewMock(...args));
+      createDeleteRowsPreview = (...args: unknown[]) =>
+        this.rememberPreview(createDeleteRowsPreviewMock(...args));
+
+      private rememberPreview<T>(preview: T): T {
+        if (preview !== null && typeof preview === "object") {
+          const payload = preview as {
+            previewToken?: unknown;
+            operationId?: unknown;
+          };
+          if (
+            typeof payload.previewToken === "string" &&
+            typeof payload.operationId === "string"
+          ) {
+            pendingPreviewControllerState.set(
+              payload.previewToken,
+              payload.operationId,
+            );
+          }
+        }
+        return preview;
       }
-      return preview;
     }
+    return {
+      // biome-ignore lint/complexity/useArrowFunction: Vitest needs a constructible function because TablePanel calls this mock with new.
+      TableMutationPreviewController: vi.fn(function (
+        options: ConstructorParameters<
+          typeof actual.TableMutationPreviewController
+        >[0],
+      ) {
+        return realPreviewControllerMode.enabled
+          ? new actual.TableMutationPreviewController(options)
+          : new MockTableMutationPreviewController();
+      }),
+    };
   },
-}));
+);
 
 function createdPanel() {
   return vscodeMock.createWebviewPanel.mock.results[0]?.value;
@@ -226,19 +275,60 @@ function createdPanel() {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => {
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
     resolve = done;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
+}
+
+function lastMutationPreview(
+  panel: ReturnType<typeof vscodeMock.createWebviewPanel>,
+  operationId: string,
+): TableMutationPreviewPayload {
+  const message = panel.webview.postMessage.mock.calls
+    .map(
+      ([value]) =>
+        value as { type: string; payload: TableMutationPreviewPayload },
+    )
+    .filter(
+      (value) =>
+        value.type === "tableMutationPreview" &&
+        value.payload.operationId === operationId,
+    )
+    .at(-1);
+  if (!message) throw new Error(`Expected preview for ${operationId}`);
+  return message.payload;
+}
+
+function deletePreviewPlan(): import("../../src/extension/tableDataService").PreparedDeletePlan {
+  return {
+    connectionId: "conn-1",
+    database: "db1",
+    schema: "public",
+    table: "restored_items",
+    executionMode: "transaction",
+    operations: [
+      { sql: "DELETE FROM restored_items WHERE id = $1", params: [1] },
+    ],
+    previewStatements: ["DELETE FROM restored_items WHERE id = 1"],
+    rowIdentities: [{ id: 1 }],
+    verificationCriteriaList: [{ id: 1 }],
+  };
 }
 
 describe("TablePanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     TablePanel.disposeAll();
+    vscodeMock.serializers.clear();
     pendingPreviewControllerState.clear();
+    realPreviewControllerMode.enabled = false;
+    executePreparedDeletePlanMock.mockReset();
     getColumnsMock.mockReset();
     getColumnsMock.mockResolvedValue([]);
+    clearForConnectionMock.mockReset();
     getPageMock.mockClear();
     exportAllMock.mockReset();
     prepareInsertRowMock.mockReset();
@@ -350,6 +440,1014 @@ describe("TablePanel", () => {
     };
     return { panel, refresh, connectionManager };
   }
+
+  it("restores serialized table panels from their persisted initial state", async () => {
+    const { connectionManager } = await openSchemaRefreshPath();
+    TablePanel.registerSerializer(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+    );
+    const serializer = vscodeMock.serializers.get("rapidb.tablePanel") as {
+      deserializeWebviewPanel(panel: unknown, state: unknown): Promise<void>;
+    };
+    const panel = vscodeMock.createWebviewPanel();
+
+    await serializer.deserializeWebviewPanel(panel, {
+      initialState: {
+        view: "table",
+        connectionId: "conn-2",
+        database: "db2",
+        schema: "public",
+        table: "restored_items",
+        isView: false,
+        objectKind: "table",
+      },
+    });
+
+    expect(panel.webview.html).toBe("<html></html>");
+    expect(panel.title).toContain("restored_items");
+    TablePanel.disposeAll();
+  });
+
+  function lazyRestoreRegistryFixture() {
+    const refreshListeners = new Set<(id?: string) => void>();
+    const invalidationListeners = new Set<(id: string) => void>();
+    const disconnectListeners = new Set<(id: string) => void>();
+    const context = { extensionUri: {} };
+    const connectionManager = {
+      getConnection: vi.fn(() => ({ name: "Main", type: "pg" })),
+      getDefaultPageSize: vi.fn(() => 25),
+      isConnected: vi.fn(() => true),
+      onDidRefreshSchemas: (listener: (id?: string) => void) => {
+        refreshListeners.add(listener);
+        return { dispose: () => refreshListeners.delete(listener) };
+      },
+      onDidInvalidateConnectionMetadata: (listener: (id: string) => void) => {
+        invalidationListeners.add(listener);
+        return { dispose: () => invalidationListeners.delete(listener) };
+      },
+      onDidDisconnect: (listener: (id: string) => void) => {
+        disconnectListeners.add(listener);
+        return { dispose: () => disconnectListeners.delete(listener) };
+      },
+    };
+    const initialState = {
+      view: "table",
+      connectionId: "conn-1",
+      database: "db1",
+      schema: "public",
+      table: "users",
+      isView: false,
+      objectKind: "table",
+    };
+    TablePanel.registerSerializer(context as never, connectionManager as never);
+    const serializer = vscodeMock.serializers.get("rapidb.tablePanel") as {
+      deserializeWebviewPanel(panel: unknown, state: unknown): Promise<void>;
+    };
+    const open = () => {
+      TablePanel.createOrShow(
+        context as never,
+        connectionManager as never,
+        "conn-1",
+        "db1",
+        "public",
+        "users",
+      );
+    };
+    const restore = async (name: string) => {
+      // This is the opaque webview-owned state VS Code passes to the actual
+      // serializer. Distinct saved drafts must not be merged or discarded.
+      const state = {
+        initialState: { ...initialState },
+        tableDraft: {
+          tableKey: JSON.stringify(["conn-1", "db1", "public", "users"]),
+          restoreState: { entries: [] },
+          newRows: [{ name: { value: name } }],
+        },
+        tableReadEpoch: 17,
+      };
+      const snapshot = structuredClone(state);
+      const panel = vscodeMock.createWebviewPanel();
+      const onDispose = vi.fn();
+      panel.onDidDispose(onDispose);
+      await serializer.deserializeWebviewPanel(panel, state);
+      return { panel, state, snapshot, onDispose };
+    };
+    return {
+      open,
+      restore,
+      refresh: () => {
+        for (const listener of refreshListeners) listener("conn-1");
+      },
+      invalidate: () => {
+        for (const listener of invalidationListeners) listener("conn-1");
+      },
+      disconnect: () => {
+        for (const listener of disconnectListeners) listener("conn-1");
+      },
+      refreshListeners,
+      invalidationListeners,
+      disconnectListeners,
+    };
+  }
+
+  it("preserves distinct late-restored drafts without replacing Explorer's reuse owner", async () => {
+    const fixture = lazyRestoreRegistryFixture();
+    fixture.open();
+    const fresh = createdPanel();
+    const onFreshDispose = vi.fn();
+    fresh.onDidDispose(onFreshDispose);
+    await fresh.webview.dispatchMessage({ type: "ready" });
+    const first = await fixture.restore("saved draft A");
+    const second = await fixture.restore("saved draft B");
+
+    // Deserialization neither performs reads nor sends a reset to a hidden tab.
+    expect(getColumnsMock).toHaveBeenCalledOnce();
+    for (const restored of [first, second]) {
+      expect(restored.panel.webview.html).toBe("<html></html>");
+      expect(restored.panel.title).toContain("public.users");
+      expect(restored.panel.webview.postMessage).not.toHaveBeenCalled();
+      expect(restored.onDispose).not.toHaveBeenCalled();
+      expect(restored.state).toEqual(restored.snapshot);
+      await restored.panel.webview.dispatchMessage({ type: "ready" });
+      expect(
+        restored.panel.webview.postMessage,
+      ).toHaveBeenCalledExactlyOnceWith({
+        type: "tableInit",
+        payload: expect.objectContaining({ intent: "initialize" }),
+      });
+    }
+    fixture.open();
+    expect(vscodeMock.createWebviewPanel).toHaveBeenCalledTimes(3);
+    expect(fresh.reveal).toHaveBeenCalledExactlyOnceWith(1);
+    expect(first.panel.reveal).not.toHaveBeenCalled();
+    expect(second.panel.reveal).not.toHaveBeenCalled();
+    expect(onFreshDispose).not.toHaveBeenCalled();
+
+    // Metadata and session events must still reach every registered instance,
+    // including those not selected by the single-table reuse index.
+    fixture.refresh();
+    await vi.waitFor(() => {
+      for (const panel of [fresh, first.panel, second.panel]) {
+        expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+          type: "tableInit",
+          payload: expect.objectContaining({ intent: "metadataRefresh" }),
+        });
+      }
+    });
+    fixture.invalidate();
+    for (const panel of [fresh, first.panel, second.panel]) {
+      expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+        type: "tableConnectionInvalidated",
+        payload: {},
+      });
+    }
+    expect(first.state).toEqual(first.snapshot);
+    expect(second.state).toEqual(second.snapshot);
+    expect(first.state.tableDraft).not.toEqual(second.state.tableDraft);
+
+    // Promotion is FIFO, not whichever saved panel deserialized most recently.
+    fresh.dispose();
+    fixture.open();
+    expect(first.panel.reveal).toHaveBeenCalledExactlyOnceWith(1);
+    expect(second.panel.reveal).not.toHaveBeenCalled();
+    first.panel.dispose();
+    fixture.open();
+    expect(second.panel.reveal).toHaveBeenCalledExactlyOnceWith(1);
+    expect(vscodeMock.createWebviewPanel).toHaveBeenCalledTimes(3);
+    TablePanel.disposeAll();
+    expect(second.onDispose).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    "fresh",
+    "restored",
+  ] as const)("reuses the surviving same-table panel when closing %s first", async (closeFirst) => {
+    const fixture = lazyRestoreRegistryFixture();
+    fixture.open();
+    const fresh = createdPanel();
+    const restored = await fixture.restore("late draft");
+    const closing = closeFirst === "fresh" ? fresh : restored.panel;
+    const surviving = closeFirst === "fresh" ? restored.panel : fresh;
+    const onSurvivorDispose = vi.fn();
+    surviving.onDidDispose(onSurvivorDispose);
+    closing.dispose();
+    fixture.open();
+    fixture.open();
+    expect(vscodeMock.createWebviewPanel).toHaveBeenCalledTimes(2);
+    expect(surviving.reveal).toHaveBeenCalledTimes(2);
+    expect(closing.reveal).not.toHaveBeenCalled();
+    expect(onSurvivorDispose).not.toHaveBeenCalled();
+
+    surviving.dispose();
+    fixture.open();
+    expect(vscodeMock.createWebviewPanel).toHaveBeenCalledTimes(3);
+    TablePanel.disposeAll();
+    expect(onSurvivorDispose).toHaveBeenCalledOnce();
+    expect(fixture.refreshListeners.size).toBe(0);
+    expect(fixture.invalidationListeners.size).toBe(0);
+    expect(fixture.disconnectListeners.size).toBe(0);
+  });
+
+  it.each([
+    "create-first",
+    "restore-first",
+  ] as const)("disposeAll closes every same-table instance after %s registration", async (order) => {
+    const fixture = lazyRestoreRegistryFixture();
+    let first: ReturnType<typeof vscodeMock.createWebviewPanel>;
+    if (order === "create-first") {
+      fixture.open();
+      first = createdPanel();
+    } else {
+      first = (await fixture.restore("first saved draft")).panel;
+    }
+    const onFirstDispose = vi.fn();
+    first.onDidDispose(onFirstDispose);
+    const second = await fixture.restore("second saved draft");
+    const third = await fixture.restore("third saved draft");
+    fixture.open();
+    expect(first.reveal).toHaveBeenCalledExactlyOnceWith(1);
+    expect(vscodeMock.createWebviewPanel).toHaveBeenCalledTimes(3);
+    TablePanel.disposeAll();
+    TablePanel.disposeAll();
+    expect(onFirstDispose).toHaveBeenCalledOnce();
+    expect(second.onDispose).toHaveBeenCalledOnce();
+    expect(third.onDispose).toHaveBeenCalledOnce();
+    expect(fixture.refreshListeners.size).toBe(0);
+    expect(fixture.invalidationListeners.size).toBe(0);
+    expect(fixture.disconnectListeners.size).toBe(0);
+    fixture.open();
+    expect(vscodeMock.createWebviewPanel).toHaveBeenCalledTimes(4);
+    TablePanel.disposeAll();
+  });
+
+  it("disconnect closes indexed and late-restored same-table panels", async () => {
+    const fixture = lazyRestoreRegistryFixture();
+    fixture.open();
+    const fresh = createdPanel();
+    const onFreshDispose = vi.fn();
+    fresh.onDidDispose(onFreshDispose);
+    const restored = await fixture.restore("saved draft");
+    fixture.disconnect();
+    TablePanel.disposeAll();
+    expect(onFreshDispose).toHaveBeenCalledOnce();
+    expect(restored.onDispose).toHaveBeenCalledOnce();
+    fixture.open();
+    expect(vscodeMock.createWebviewPanel).toHaveBeenCalledTimes(3);
+    TablePanel.disposeAll();
+  });
+
+  async function restoreDisconnectedPanel() {
+    const connected = new Set<string>();
+    const connectListeners = new Set<() => void>();
+    const disconnectListeners = new Set<(id: string) => void>();
+    let reconnectBlock: string | undefined;
+    let readOnly = true;
+    const columns = [{ name: "id", isPrimaryKey: true }];
+    const driver = { describeColumns: vi.fn(async () => columns) };
+    const connectionManager = {
+      getConnection: vi.fn(() => ({ name: "Restored", type: "pg", readOnly })),
+      getDefaultPageSize: vi.fn(() => 25),
+      isConnected: vi.fn((id: string) => connected.has(id)),
+      getDriver: vi.fn((id: string) =>
+        connected.has(id) ? driver : undefined,
+      ),
+      getAutomaticReconnectBlockReason: vi.fn(() => reconnectBlock),
+      connectTo: vi.fn(async (id: string, intent: string = "automatic") => {
+        if (intent === "automatic" && reconnectBlock) {
+          throw new Error(reconnectBlock);
+        }
+        if (intent === "explicit" && id === "conn-1")
+          reconnectBlock = undefined;
+        connected.add(id);
+        for (const listener of connectListeners) listener();
+      }),
+      onDidConnect: vi.fn((listener: () => void) => {
+        connectListeners.add(listener);
+        return { dispose: vi.fn(() => connectListeners.delete(listener)) };
+      }),
+      onDidDisconnect: vi.fn((listener: (id: string) => void) => {
+        disconnectListeners.add(listener);
+        return { dispose: vi.fn(() => disconnectListeners.delete(listener)) };
+      }),
+    };
+    // Exercise the real disconnected-driver guard, not a columns mock that
+    // succeeds without a connection (which hid the serializer regression).
+    const reads = new TableReadService(connectionManager as never);
+    clearForConnectionMock.mockImplementation((id) =>
+      reads.clearForConnection(id),
+    );
+    getColumnsMock.mockImplementation(async () => {
+      await reads.getColumns("conn-1", "db1", "public", "restored_items");
+      return columns;
+    });
+    TablePanel.registerSerializer(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+    );
+    const serializer = vscodeMock.serializers.get("rapidb.tablePanel") as {
+      deserializeWebviewPanel(panel: unknown, state: unknown): Promise<void>;
+    };
+    const panel = vscodeMock.createWebviewPanel();
+    await serializer.deserializeWebviewPanel(panel, {
+      initialState: {
+        connectionId: "conn-1",
+        database: "db1",
+        schema: "public",
+        table: "restored_items",
+      },
+    });
+    return {
+      panel,
+      connectionManager,
+      driver,
+      columns,
+      connected,
+      connectListeners,
+      setReconnectBlock: (reason: string) => {
+        reconnectBlock = reason;
+      },
+      setReadOnly: (value: boolean) => {
+        readOnly = value;
+      },
+      disconnect: () => {
+        connected.delete("conn-1");
+        for (const listener of disconnectListeners) listener("conn-1");
+      },
+    };
+  }
+
+  it("connects a restored disconnected panel on actual ready before reading metadata", async () => {
+    const { panel, connectionManager, driver, columns } =
+      await restoreDisconnectedPanel();
+    expect(connectionManager.connectTo).not.toHaveBeenCalled();
+    expect(getColumnsMock).not.toHaveBeenCalled();
+
+    await panel.webview.dispatchMessage({ type: "ready" });
+
+    expect(connectionManager.connectTo).toHaveBeenCalledExactlyOnceWith(
+      "conn-1",
+      "automatic",
+    );
+    expect(driver.describeColumns).toHaveBeenCalledExactlyOnceWith(
+      "db1",
+      "public",
+      "restored_items",
+    );
+    expect(panel.webview.postMessage).toHaveBeenCalledExactlyOnceWith({
+      type: "tableInit",
+      payload: {
+        intent: "initialize",
+        columns,
+        primaryKeyColumns: ["id"],
+        isView: false,
+        connectionReadOnly: true,
+      },
+    });
+    // Our own connect event must not cause a second initialization.
+    await connectionManager.connectTo("conn-2", "explicit");
+    expect(getColumnsMock).toHaveBeenCalledOnce();
+  });
+
+  it("preserves the automatic reconnect block and retries initialization after explicit Connect", async () => {
+    const { panel, connectionManager, setReconnectBlock, setReadOnly } =
+      await restoreDisconnectedPanel();
+    const reason = "Automatic reconnect blocked. Use Connect explicitly.";
+    setReconnectBlock(reason);
+    await panel.webview.dispatchMessage({ type: "ready" });
+    expect(connectionManager.connectTo).not.toHaveBeenCalled();
+    expect(getColumnsMock).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+      type: "tableError",
+      payload: { error: reason },
+    });
+
+    // onDidConnect is global: a different connection must not retry this one.
+    await connectionManager.connectTo("conn-2", "explicit");
+    expect(getColumnsMock).not.toHaveBeenCalled();
+    setReadOnly(false);
+    await connectionManager.connectTo("conn-1", "explicit");
+    await vi.waitFor(() =>
+      expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+        type: "tableInit",
+        payload: expect.objectContaining({
+          intent: "initialize",
+          connectionReadOnly: false,
+        }),
+      }),
+    );
+    expect(getColumnsMock).toHaveBeenCalledOnce();
+    expect(connectionManager.connectTo.mock.calls).toEqual([
+      ["conn-2", "explicit"],
+      ["conn-1", "explicit"],
+    ]);
+  });
+
+  it("retries a restored panel after its automatic connection attempt failed", async () => {
+    const { panel, connectionManager } = await restoreDisconnectedPanel();
+    connectionManager.connectTo.mockRejectedValueOnce(
+      new Error("Connection refused"),
+    );
+    await panel.webview.dispatchMessage({ type: "ready" });
+    expect(getColumnsMock).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+      type: "tableError",
+      payload: { error: "Connection refused" },
+    });
+    await connectionManager.connectTo("conn-1", "explicit");
+    await vi.waitFor(() =>
+      expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+        type: "tableInit",
+        payload: expect.objectContaining({ intent: "initialize" }),
+      }),
+    );
+    expect(getColumnsMock).toHaveBeenCalledOnce();
+  });
+
+  it("does not initialize a restored panel on Connect until its webview sends ready", async () => {
+    const { panel, connectionManager } = await restoreDisconnectedPanel();
+    await connectionManager.connectTo("conn-1", "explicit");
+    expect(getColumnsMock).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+    await panel.webview.dispatchMessage({ type: "ready" });
+    expect(getColumnsMock).toHaveBeenCalledOnce();
+    expect(connectionManager.connectTo).toHaveBeenCalledOnce();
+  });
+
+  it("does not reload an initialized table when a later Connect event fires", async () => {
+    const { panel, connectionManager } = await restoreDisconnectedPanel();
+    await panel.webview.dispatchMessage({ type: "ready" });
+    await connectionManager.connectTo("conn-1", "explicit");
+    expect(getColumnsMock).toHaveBeenCalledOnce();
+    expect(panel.webview.postMessage).toHaveBeenCalledOnce();
+  });
+
+  it("deduplicates ready and Connect initialization while connecting", async () => {
+    const { panel, connectionManager, connected, connectListeners } =
+      await restoreDisconnectedPanel();
+    const pending = deferred<void>();
+    connectionManager.connectTo.mockImplementationOnce(() => pending.promise);
+    const first = panel.webview.dispatchMessage({ type: "ready" });
+    const second = panel.webview.dispatchMessage({ type: "ready" });
+    expect(connectionManager.connectTo).toHaveBeenCalledOnce();
+    connected.add("conn-1");
+    for (const listener of connectListeners) listener();
+    pending.resolve();
+    await Promise.all([first, second]);
+    expect(getColumnsMock).toHaveBeenCalledOnce();
+    expect(panel.webview.postMessage).toHaveBeenCalledOnce();
+  });
+
+  it("does not lose Connect while the initial error is still being delivered", async () => {
+    const { panel, connectionManager, setReconnectBlock } =
+      await restoreDisconnectedPanel();
+    setReconnectBlock("Use explicit Connect");
+    const delivery = deferred<boolean>();
+    panel.webview.postMessage.mockImplementationOnce(() => delivery.promise);
+    const ready = panel.webview.dispatchMessage({ type: "ready" });
+    await connectionManager.connectTo("conn-1", "explicit");
+    expect(getColumnsMock).not.toHaveBeenCalled();
+    delivery.resolve(true);
+    await ready;
+    await vi.waitFor(() =>
+      expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+        type: "tableInit",
+        payload: expect.objectContaining({ intent: "initialize" }),
+      }),
+    );
+    expect(getColumnsMock).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a cancelled connect that resolves without establishing a driver", async () => {
+    const { panel, connectionManager } = await restoreDisconnectedPanel();
+    connectionManager.connectTo.mockResolvedValueOnce();
+    await panel.webview.dispatchMessage({ type: "ready" });
+    expect(getColumnsMock).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).toHaveBeenCalledExactlyOnceWith({
+      type: "tableError",
+      payload: { error: "[RapiDB] Not connected: conn-1" },
+    });
+  });
+
+  it("does not read metadata or revive the panel after manual disconnect during connect", async () => {
+    const { panel, connectionManager, disconnect, connectListeners } =
+      await restoreDisconnectedPanel();
+    const pending = deferred<void>();
+    connectionManager.connectTo.mockImplementationOnce(() => pending.promise);
+    const ready = panel.webview.dispatchMessage({ type: "ready" });
+    disconnect();
+    expect(connectListeners.size).toBe(0);
+    // Manager cancellation may resolve successfully without a live driver.
+    pending.resolve();
+    await ready;
+    await connectionManager.connectTo("conn-1", "explicit");
+    expect(getColumnsMock).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not publish late initialization metadata after dispose", async () => {
+    const { panel, connectionManager } = await restoreDisconnectedPanel();
+    const pending = deferred<MockColumn[]>();
+    getColumnsMock.mockImplementationOnce(() => pending.promise);
+    const ready = panel.webview.dispatchMessage({ type: "ready" });
+    await vi.waitFor(() => expect(getColumnsMock).toHaveBeenCalledOnce());
+    panel.dispose();
+    pending.resolve([{ name: "late_id", isPrimaryKey: true }]);
+    await ready;
+    await connectionManager.connectTo("conn-1", "explicit");
+    expect(getColumnsMock).toHaveBeenCalledOnce();
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+  });
+
+  async function restoreWithRealConnectionManager({
+    realPreviews = false,
+    host = "localhost",
+  } = {}) {
+    realPreviewControllerMode.enabled = realPreviews;
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Restored",
+        type: "pg",
+        host,
+        database: "db1",
+        username: "postgres",
+        readOnly: !realPreviews,
+      },
+    ]);
+    const context = { ...createExtensionContextStub(), extensionUri: {} };
+    const manager = new ConnectionManager(context as never, store);
+    let disconnectDelay: Promise<void> | undefined;
+    let connectDelay: Promise<void> | undefined;
+    let columns = [{ name: "id", isPrimaryKey: true }];
+    const driverFactory = vi.fn(() => {
+      let connected = false;
+      const driverColumns = columns;
+      const query = vi.fn(
+        async (
+          _sql: string,
+          _params?: unknown[],
+          _options?: { database?: string },
+        ) => ({ columns: [], rows: [], rowCount: 1 }),
+      );
+      return {
+        targetHost: manager.getConnection("conn-1")?.host,
+        connect: vi.fn(async () => {
+          await connectDelay;
+          connected = true;
+        }),
+        disconnect: vi.fn(async () => {
+          connected = false;
+          await disconnectDelay;
+        }),
+        isConnected: vi.fn(() => connected),
+        describeColumns: vi.fn(async () => driverColumns),
+        query,
+        qualifiedTableName: vi.fn(() => "restored_items"),
+        quoteIdentifier: vi.fn((name: string) => `"${name}"`),
+        buildInsertValueExpr: vi.fn(
+          (_column: unknown, index: number) => `$${index}`,
+        ),
+        runTransaction: vi.fn(
+          async (operations: Array<{ sql: string; params?: unknown[] }>) => {
+            for (const operation of operations)
+              await query(operation.sql, operation.params);
+          },
+        ),
+      };
+    });
+    // Only the actual database transport is fake. Epochs, cancellation, driver
+    // replacement, bounded cleanup and all manager events use production code.
+    vi.spyOn(
+      manager as unknown as { createDriver(): IDBDriver },
+      "createDriver",
+    ).mockImplementation(() => driverFactory() as unknown as IDBDriver);
+    await manager.connectTo("conn-1", "explicit");
+    const driver = driverFactory.mock.results[0].value;
+    const reads = new TableReadService(manager);
+    if (realPreviews) {
+      const { TableMutationService } = await import(
+        "../../src/extension/table/tableMutationService"
+      );
+      const mutations = new TableMutationService(manager, reads);
+      executePreparedDeletePlanMock.mockImplementation((plan) =>
+        mutations.executePreparedDeletePlan(plan),
+      );
+    }
+    clearForConnectionMock.mockImplementation((id) =>
+      reads.clearForConnection(id),
+    );
+    getColumnsMock.mockImplementation(async () => {
+      const described = await reads.getColumns(
+        "conn-1",
+        "db1",
+        "public",
+        "restored_items",
+      );
+      return described.map((column) => ({
+        name: column.name,
+        isPrimaryKey: column.isPrimaryKey === true,
+      }));
+    });
+    TablePanel.registerSerializer(context as never, manager);
+    const serializer = vscodeMock.serializers.get("rapidb.tablePanel") as {
+      deserializeWebviewPanel(panel: unknown, state: unknown): Promise<void>;
+    };
+    const panel = vscodeMock.createWebviewPanel();
+    await serializer.deserializeWebviewPanel(panel, {
+      initialState: {
+        connectionId: "conn-1",
+        database: "db1",
+        schema: "public",
+        table: "restored_items",
+      },
+    });
+    const onDispose = vi.fn();
+    panel.onDidDispose(onDispose);
+    return {
+      manager,
+      panel,
+      driver,
+      driverFactory,
+      onDispose,
+      setNextColumns: (next: MockColumn[]) => {
+        columns = next;
+      },
+      setDisconnectDelay: (delay?: Promise<void>) => {
+        disconnectDelay = delay;
+      },
+      setConnectDelay: (delay?: Promise<void>) => {
+        connectDelay = delay;
+      },
+    };
+  }
+
+  it("does not let restored ready reconnect over a manual Disconnect already in progress", async () => {
+    const {
+      manager,
+      panel,
+      driver,
+      driverFactory,
+      onDispose,
+      setDisconnectDelay,
+    } = await restoreWithRealConnectionManager();
+    const cleanup = deferred<void>();
+    setDisconnectDelay(cleanup.promise);
+    const onConnect = vi.fn();
+    const onDisconnect = vi.fn();
+    manager.onDidConnect(onConnect);
+    manager.onDidDisconnect(onDisconnect);
+    const disconnect = manager.disconnectFrom("conn-1");
+    try {
+      await vi.waitFor(() => expect(driver.disconnect).toHaveBeenCalledOnce());
+      expect(manager.isConnected("conn-1")).toBe(false);
+      expect(onDisconnect).not.toHaveBeenCalled();
+      expect(onDispose).not.toHaveBeenCalled();
+      // This is the inverse of ready -> Disconnect: async driver cleanup has
+      // already begun, but its final panel-disposal event has not happened yet.
+      await panel.webview.dispatchMessage({ type: "ready" });
+      expect(driverFactory).toHaveBeenCalledOnce();
+      expect(getColumnsMock).not.toHaveBeenCalled();
+      expect(manager.isConnecting("conn-1")).toBe(false);
+      expect(panel.webview.postMessage).toHaveBeenCalledExactlyOnceWith({
+        type: "tableError",
+        payload: { error: expect.stringContaining("Disconnect in progress") },
+      });
+      cleanup.resolve();
+      await disconnect;
+      expect(onDispose).toHaveBeenCalledOnce();
+      expect(onDisconnect).toHaveBeenCalledExactlyOnceWith("conn-1");
+      expect(onConnect).not.toHaveBeenCalled();
+      expect(manager.getDriver("conn-1")).toBeUndefined();
+      expect(driverFactory).toHaveBeenCalledOnce();
+    } finally {
+      cleanup.resolve();
+      setDisconnectDelay();
+      await disconnect;
+      await manager.dispose();
+    }
+  });
+
+  it("keeps the restored panel alive when automatic Connect replaces a retained disconnected driver", async () => {
+    const {
+      manager,
+      panel,
+      driver,
+      driverFactory,
+      onDispose,
+      setDisconnectDelay,
+    } = await restoreWithRealConnectionManager();
+    // Simulate transport loss: the registered driver remains in driverMap.
+    await driver.disconnect();
+    expect(manager.isConnected("conn-1")).toBe(false);
+    expect(manager.getDriver("conn-1")).toBe(driver);
+    const cleanup = deferred<void>();
+    setDisconnectDelay(cleanup.promise);
+    const onDisconnect = vi.fn();
+    manager.onDidDisconnect(onDisconnect);
+    const ready = panel.webview.dispatchMessage({ type: "ready" });
+    try {
+      await vi.waitFor(() =>
+        expect(driver.disconnect).toHaveBeenCalledTimes(2),
+      );
+      expect(onDispose).not.toHaveBeenCalled();
+      cleanup.resolve();
+      await ready;
+      expect(manager.isConnected("conn-1")).toBe(true);
+      expect(driverFactory).toHaveBeenCalledTimes(2);
+      expect(onDisconnect).not.toHaveBeenCalled();
+      expect(onDispose).not.toHaveBeenCalled();
+      expect(getColumnsMock).toHaveBeenCalledOnce();
+      expect(panel.webview.postMessage).toHaveBeenCalledExactlyOnceWith({
+        type: "tableInit",
+        payload: expect.objectContaining({
+          intent: "initialize",
+          connectionReadOnly: true,
+        }),
+      });
+      // Suppressing internal replacement must not suppress real Disconnect.
+      setDisconnectDelay();
+      await manager.disconnectFrom("conn-1");
+      expect(onDisconnect).toHaveBeenCalledExactlyOnceWith("conn-1");
+      expect(onDispose).toHaveBeenCalledOnce();
+    } finally {
+      cleanup.resolve();
+      setDisconnectDelay();
+      await ready;
+      await manager.dispose();
+    }
+  });
+
+  it("still closes the restored panel for manual Disconnect during stale-driver replacement", async () => {
+    const {
+      manager,
+      panel,
+      driver,
+      driverFactory,
+      onDispose,
+      setDisconnectDelay,
+    } = await restoreWithRealConnectionManager();
+    await driver.disconnect();
+    const cleanup = deferred<void>();
+    setDisconnectDelay(cleanup.promise);
+    const onDisconnect = vi.fn();
+    const onConnect = vi.fn();
+    manager.onDidDisconnect(onDisconnect);
+    manager.onDidConnect(onConnect);
+    const ready = panel.webview.dispatchMessage({ type: "ready" });
+    let disconnect: Promise<void> | undefined;
+    try {
+      await vi.waitFor(() =>
+        expect(driver.disconnect).toHaveBeenCalledTimes(2),
+      );
+      disconnect = manager.disconnectFrom("conn-1");
+      cleanup.resolve();
+      await Promise.all([ready, disconnect]);
+      expect(onDisconnect).toHaveBeenCalledExactlyOnceWith("conn-1");
+      expect(onDispose).toHaveBeenCalledOnce();
+      expect(onConnect).not.toHaveBeenCalled();
+      expect(manager.getDriver("conn-1")).toBeUndefined();
+      expect(driverFactory).toHaveBeenCalledOnce();
+      expect(getColumnsMock).not.toHaveBeenCalled();
+      expect(panel.webview.postMessage).not.toHaveBeenCalledWith({
+        type: "tableInit",
+        payload: expect.anything(),
+      });
+    } finally {
+      cleanup.resolve();
+      setDisconnectDelay();
+      await Promise.all([ready, disconnect]);
+      await manager.dispose();
+    }
+  });
+
+  it.each([
+    "cached",
+    "in-flight refresh",
+  ] as const)("reloads an initialized TablePanel's %s metadata after retained-driver replacement", async (mode) => {
+    const { manager, panel, driver, onDispose, setNextColumns } =
+      await restoreWithRealConnectionManager();
+    const oldRefresh = deferred<MockColumn[]>();
+    let oldMetadataRequest: Promise<MockColumn[]> | undefined;
+    const newColumns = [{ name: "new_id", isPrimaryKey: true }];
+    await panel.webview.dispatchMessage({ type: "ready" });
+    try {
+      if (mode === "in-flight refresh") {
+        driver.describeColumns.mockImplementationOnce(() => oldRefresh.promise);
+        manager.refreshSchemaCache("conn-1");
+        await vi.waitFor(() =>
+          expect(driver.describeColumns).toHaveBeenCalledTimes(2),
+        );
+        oldMetadataRequest = getColumnsMock.mock.results.at(-1)?.value;
+      }
+      await driver.disconnect();
+      setNextColumns(newColumns);
+      await manager.connectTo("conn-1");
+      await vi.waitFor(() =>
+        expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+          type: "tableInit",
+          payload: expect.objectContaining({
+            intent: "connectionRefresh",
+            columns: newColumns,
+          }),
+        }),
+      );
+      expect(onDispose).not.toHaveBeenCalled();
+      // Old metadata settles AFTER the new session's metadata was published.
+      oldRefresh.resolve([{ name: "obsolete_id", isPrimaryKey: true }]);
+      await oldMetadataRequest;
+      await Promise.resolve();
+      expect(panel.webview.postMessage).toHaveBeenCalledTimes(4);
+      expect(panel.webview.postMessage).toHaveBeenNthCalledWith(2, {
+        type: "tableConnectionInvalidated",
+        payload: {},
+      });
+      expect(panel.webview.postMessage).toHaveBeenNthCalledWith(3, {
+        type: "tableConnectionInvalidated",
+        payload: {},
+      });
+      expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+        type: "tableInit",
+        payload: expect.objectContaining({
+          intent: "connectionRefresh",
+          columns: newColumns,
+        }),
+      });
+    } finally {
+      oldRefresh.resolve([]);
+      await manager.dispose();
+    }
+  });
+
+  it.each([
+    "success",
+    "error",
+  ] as const)("initializes the new session before a lost initialization settles with %s", async (outcome) => {
+    const { manager, panel, driver, setNextColumns } =
+      await restoreWithRealConnectionManager();
+    const lostMetadata = deferred<MockColumn[]>();
+    const laterMetadata = deferred<MockColumn[]>();
+    driver.describeColumns.mockImplementationOnce(() => lostMetadata.promise);
+    const oldReady = panel.webview.dispatchMessage({ type: "ready" });
+    const currentColumns = [{ name: "current_id", isPrimaryKey: true }];
+    try {
+      await vi.waitFor(() =>
+        expect(driver.describeColumns).toHaveBeenCalledOnce(),
+      );
+      await driver.disconnect();
+      setNextColumns(currentColumns);
+      await manager.connectTo("conn-1");
+      // The old describeColumns is STILL unresolved. Connect alone must start
+      // the new initialization, without needing another ready message.
+      await vi.waitFor(() =>
+        expect(panel.webview.postMessage).toHaveBeenCalledExactlyOnceWith({
+          type: "tableInit",
+          payload: expect.objectContaining({
+            intent: "initialize",
+            columns: currentColumns,
+          }),
+        }),
+      );
+      expect(getColumnsMock).toHaveBeenCalledTimes(2);
+
+      getColumnsMock.mockImplementationOnce(() => laterMetadata.promise);
+      const currentReady = panel.webview.dispatchMessage({ type: "ready" });
+      await vi.waitFor(() => expect(getColumnsMock).toHaveBeenCalledTimes(3));
+      if (outcome === "success")
+        lostMetadata.resolve([{ name: "lost_id", isPrimaryKey: true }]);
+      else lostMetadata.reject(new Error("Lost session error"));
+      await oldReady;
+      // The late old finally must not clear the new, still-pending promise.
+      const duplicateReady = panel.webview.dispatchMessage({ type: "ready" });
+      expect(getColumnsMock).toHaveBeenCalledTimes(3);
+      expect(panel.webview.postMessage).toHaveBeenCalledOnce();
+      laterMetadata.resolve(currentColumns);
+      await Promise.all([currentReady, duplicateReady]);
+      expect(panel.webview.postMessage).toHaveBeenCalledTimes(2);
+      expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+        type: "tableInit",
+        payload: expect.objectContaining({ columns: currentColumns }),
+      });
+    } finally {
+      lostMetadata.resolve([]);
+      laterMetadata.resolve(currentColumns);
+      await oldReady;
+      await manager.dispose();
+    }
+  });
+
+  it.each([
+    "data",
+    "error",
+  ] as const)("suppresses old-session page %s after a same-columns reconnect and publishes the current read", async (outcome) => {
+    const { manager, panel, driver } = await restoreWithRealConnectionManager();
+    await panel.webview.dispatchMessage({ type: "ready" });
+    const oldPage = deferred<{
+      rows: never[];
+      totalCount: number;
+      columns: never[];
+    }>();
+    getPageMock.mockImplementationOnce(() => oldPage.promise);
+    const fetching = panel.webview.dispatchMessage({
+      type: "fetchPage",
+      payload: { fetchId: 11, page: 1 },
+    });
+    try {
+      await vi.waitFor(() => expect(getPageMock).toHaveBeenCalledOnce());
+      await driver.disconnect();
+      await manager.connectTo("conn-1");
+      await vi.waitFor(() =>
+        expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+          type: "tableInit",
+          payload: expect.objectContaining({
+            intent: "connectionRefresh",
+            columns: [{ name: "id", isPrimaryKey: true }],
+          }),
+        }),
+      );
+      getPageMock.mockResolvedValueOnce({
+        rows: [{ id: 2 }] as never,
+        totalCount: 1,
+        columns: [],
+      });
+      await panel.webview.dispatchMessage({
+        type: "fetchPage",
+        payload: { fetchId: 12, page: 1 },
+      });
+      expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+        type: "tableData",
+        payload: expect.objectContaining({ fetchId: 12, rows: [{ id: 2 }] }),
+      });
+      const postCount = panel.webview.postMessage.mock.calls.length;
+      if (outcome === "data")
+        oldPage.resolve({
+          rows: [{ id: 91 }] as never,
+          totalCount: 1,
+          columns: [],
+        });
+      else oldPage.reject(new Error("Old connection read failed"));
+      await fetching;
+      expect(panel.webview.postMessage).toHaveBeenCalledTimes(postCount);
+      expect(getPageMock).toHaveBeenCalledTimes(2);
+    } finally {
+      oldPage.resolve({ rows: [], totalCount: 0, columns: [] });
+      await fetching;
+      await manager.dispose();
+    }
+  });
+
+  it("does not let old page cleanup delete the new session's same-key pending read", async () => {
+    const { manager, panel, driver } = await restoreWithRealConnectionManager();
+    await panel.webview.dispatchMessage({ type: "ready" });
+    const oldPage = deferred<Awaited<ReturnType<typeof getPageMock>>>();
+    const newPage = deferred<Awaited<ReturnType<typeof getPageMock>>>();
+    getPageMock.mockImplementationOnce(() => oldPage.promise);
+    const oldRead = panel.webview.dispatchMessage({
+      type: "fetchPage",
+      payload: { fetchId: 11, page: 1 },
+    });
+    try {
+      await vi.waitFor(() => expect(getPageMock).toHaveBeenCalledOnce());
+      await driver.disconnect();
+      await manager.connectTo("conn-1");
+      await vi.waitFor(() =>
+        expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+          type: "tableInit",
+          payload: expect.objectContaining({ intent: "connectionRefresh" }),
+        }),
+      );
+      getPageMock.mockImplementationOnce(() => newPage.promise);
+      const newRead = panel.webview.dispatchMessage({
+        type: "fetchPage",
+        payload: { fetchId: 12, page: 1 },
+      });
+      await vi.waitFor(() => expect(getPageMock).toHaveBeenCalledTimes(2));
+      oldPage.resolve({ rows: [], totalCount: 91, columns: [] });
+      await oldRead;
+      const duplicateRead = panel.webview.dispatchMessage({
+        type: "fetchPage",
+        payload: { fetchId: 13, page: 1 },
+      });
+      await Promise.resolve();
+      expect(getPageMock).toHaveBeenCalledTimes(2);
+      newPage.resolve({ rows: [], totalCount: 2, columns: [] });
+      await Promise.all([newRead, duplicateRead]);
+      expect(getPageMock).toHaveBeenCalledTimes(2);
+      expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+        type: "tableData",
+        payload: expect.objectContaining({ fetchId: 13, totalCount: 2 }),
+      });
+    } finally {
+      oldPage.resolve({ rows: [], totalCount: 0, columns: [] });
+      newPage.resolve({ rows: [], totalCount: 0, columns: [] });
+      await oldRead;
+      await manager.dispose();
+    }
+  });
 
   it("routes query schema changes into explicit metadata refresh and rejects an old preview with its operation ID", async () => {
     const { panel, refresh, connectionManager } = await openSchemaRefreshPath();
@@ -987,6 +2085,246 @@ describe("TablePanel", () => {
     });
     await panel.webview.dispatchMessage({ type: "exportCSV" });
     expect(actual).toEqual([chunk]);
+  });
+
+  it.each([
+    false,
+    true,
+  ])("rejects a server-A preview with its operation ID after reconnect to same-columns server B (install pending=%s)", async (pendingInstall) => {
+    const {
+      manager,
+      panel,
+      driver,
+      driverFactory,
+      onDispose,
+      setConnectDelay,
+    } = await restoreWithRealConnectionManager({
+      realPreviews: true,
+      host: "server-a",
+    });
+    const connecting = deferred<void>();
+    let reconnect: Promise<void> | undefined;
+    try {
+      await panel.webview.dispatchMessage({ type: "ready" });
+      prepareDeleteRowsPlanMock.mockResolvedValue(deletePreviewPlan());
+      await panel.webview.dispatchMessage({
+        type: "deleteRows",
+        payload: { operationId: "delete-a", primaryKeysList: [{ id: 1 }] },
+      });
+      const previewA = lastMutationPreview(panel, "delete-a");
+      expect(driver.targetHost).toBe("server-a");
+      expect(driver.query).not.toHaveBeenCalled();
+      await driver.disconnect(); // Transport loss, NOT panel-closing Disconnect.
+      const config = manager.getConnection("conn-1");
+      if (!config) throw new Error("Expected connection config");
+      await manager.saveConnection({ ...config, host: "server-b" });
+      expect(onDispose).not.toHaveBeenCalled();
+      if (pendingInstall) setConnectDelay(connecting.promise);
+      reconnect = manager.connectTo("conn-1", "explicit");
+      await vi.waitFor(() => expect(driverFactory).toHaveBeenCalledTimes(2));
+      const driverB = driverFactory.mock.results[1].value;
+      expect(driverB.targetHost).toBe("server-b");
+      if (!pendingInstall) {
+        await reconnect;
+        await vi.waitFor(() =>
+          expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+            type: "tableInit",
+            payload: expect.objectContaining({
+              intent: "connectionRefresh",
+              columns: [{ name: "id", isPrimaryKey: true }],
+            }),
+          }),
+        );
+      } else {
+        expect(manager.isConnecting("conn-1")).toBe(true);
+        expect(manager.isConnected("conn-1")).toBe(false);
+      }
+      await panel.webview.dispatchMessage({
+        type: "confirmMutationPreview",
+        payload: {
+          operationId: "delete-a",
+          previewToken: previewA.previewToken,
+        },
+      });
+      expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+        type: "deleteResult",
+        payload: {
+          operationId: "delete-a",
+          success: false,
+          error: expect.stringContaining("Connection session changed"),
+          changesPossible: false,
+          outcomeUnknown: false,
+          affectedRows: 0,
+          rowOutcomes: [],
+        },
+      });
+      expect(executePreparedDeletePlanMock).not.toHaveBeenCalled();
+      expect(driverB.runTransaction).not.toHaveBeenCalled();
+      expect(driverB.query).not.toHaveBeenCalled();
+      expect(driver.query).not.toHaveBeenCalled();
+
+      connecting.resolve();
+      await reconnect;
+      await vi.waitFor(() =>
+        expect(panel.webview.postMessage).toHaveBeenCalledWith({
+          type: "tableInit",
+          payload: expect.objectContaining({ intent: "connectionRefresh" }),
+        }),
+      );
+      await panel.webview.dispatchMessage({
+        type: "deleteRows",
+        payload: { operationId: "delete-b", primaryKeysList: [{ id: 1 }] },
+      });
+      const previewB = lastMutationPreview(panel, "delete-b");
+      expect(previewB.previewToken).not.toBe(previewA.previewToken);
+      await panel.webview.dispatchMessage({
+        type: "confirmMutationPreview",
+        payload: {
+          operationId: "delete-b",
+          previewToken: previewB.previewToken,
+        },
+      });
+      expect(executePreparedDeletePlanMock).toHaveBeenCalledOnce();
+      expect(driverB.query).toHaveBeenCalledTimes(2);
+      expect(driverB.query).toHaveBeenNthCalledWith(
+        1,
+        "DELETE FROM restored_items WHERE id = $1",
+        [1],
+      );
+      expect(driverB.query).toHaveBeenNthCalledWith(
+        2,
+        'SELECT 1 FROM restored_items WHERE "id" = $1',
+        [1],
+        { database: "db1" },
+      );
+      expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+        type: "deleteResult",
+        payload: expect.objectContaining({
+          operationId: "delete-b",
+          success: true,
+        }),
+      });
+      expect(onDispose).not.toHaveBeenCalled();
+      expect(driver.query).not.toHaveBeenCalled();
+    } finally {
+      connecting.resolve();
+      setConnectDelay();
+      await reconnect;
+      await manager.dispose();
+    }
+  });
+
+  it.each([
+    "plan",
+    "metadata",
+  ] as const)("rejects a late server-A preview preparation waiting on %s after server B's metadata is installed", async (waitingOn) => {
+    const { manager, panel, driver, driverFactory } =
+      await restoreWithRealConnectionManager({
+        realPreviews: true,
+        host: "server-a",
+      });
+    const plan = deferred<ReturnType<typeof deletePreviewPlan>>();
+    const metadata = deferred<MockColumn[]>();
+    let preparing: Promise<void> | undefined;
+    try {
+      await panel.webview.dispatchMessage({ type: "ready" });
+      if (waitingOn === "metadata") {
+        getColumnsMock.mockImplementationOnce(() => metadata.promise);
+        manager.refreshSchemaCache("conn-1");
+        await vi.waitFor(() => expect(getColumnsMock).toHaveBeenCalledTimes(2));
+      } else
+        prepareDeleteRowsPlanMock.mockImplementationOnce(() => plan.promise);
+      preparing = panel.webview.dispatchMessage({
+        type: "deleteRows",
+        payload: { operationId: "late-delete-a", primaryKeysList: [{ id: 1 }] },
+      });
+      if (waitingOn === "plan")
+        await vi.waitFor(() =>
+          expect(prepareDeleteRowsPlanMock).toHaveBeenCalledOnce(),
+        );
+      await driver.disconnect();
+      const config = manager.getConnection("conn-1");
+      if (!config) throw new Error("Expected connection config");
+      await manager.saveConnection({ ...config, host: "server-b" });
+      await manager.connectTo("conn-1", "explicit");
+      await vi.waitFor(() =>
+        expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+          type: "tableInit",
+          payload: expect.objectContaining({ intent: "connectionRefresh" }),
+        }),
+      );
+      // The old build/metadata completes only AFTER the new same-columns session.
+      plan.resolve(deletePreviewPlan());
+      metadata.resolve([{ name: "id", isPrimaryKey: true }]);
+      await preparing;
+      expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+        type: "deleteResult",
+        payload: expect.objectContaining({
+          operationId: "late-delete-a",
+          success: false,
+          error: expect.stringContaining("Connection session changed"),
+        }),
+      });
+      expect(panel.webview.postMessage).not.toHaveBeenCalledWith({
+        type: "tableMutationPreview",
+        payload: expect.anything(),
+      });
+      if (waitingOn === "metadata")
+        expect(prepareDeleteRowsPlanMock).not.toHaveBeenCalled();
+      expect(executePreparedDeletePlanMock).not.toHaveBeenCalled();
+      expect(driverFactory.mock.results[1].value.query).not.toHaveBeenCalled();
+      expect(driver.query).not.toHaveBeenCalled();
+    } finally {
+      plan.resolve(deletePreviewPlan());
+      metadata.resolve([]);
+      await preparing;
+      await manager.dispose();
+    }
+  });
+
+  it.each([
+    ["deleteRows", "deleteResult"],
+    ["insertRow", "insertResult"],
+    ["applyChanges", "applyResult"],
+  ] as const)("rejects %s during the panel's pending initial Connect with a correlated %s", async (kind, resultType) => {
+    const { panel, connectionManager, setReadOnly } =
+      await restoreDisconnectedPanel();
+    setReadOnly(false);
+    const connecting = deferred<void>();
+    const connect = connectionManager.connectTo.getMockImplementation();
+    if (!connect) throw new Error("Expected connect implementation");
+    connectionManager.connectTo.mockImplementationOnce(async (...args) => {
+      await connecting.promise;
+      await connect(...args);
+    });
+    const ready = panel.webview.dispatchMessage({ type: "ready" });
+    try {
+      await vi.waitFor(() =>
+        expect(connectionManager.connectTo).toHaveBeenCalledOnce(),
+      );
+      await panel.webview.dispatchMessage({
+        type: kind,
+        payload: {
+          operationId: "pending-connect-mutation",
+        },
+      });
+      expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+        type: resultType,
+        payload: expect.objectContaining({
+          operationId: "pending-connect-mutation",
+          success: false,
+          error: expect.stringContaining("not connected"),
+        }),
+      });
+      expect(prepareDeleteRowsPlanMock).not.toHaveBeenCalled();
+      expect(prepareInsertRowMock).not.toHaveBeenCalled();
+      expect(prepareApplyChangesPlanMock).not.toHaveBeenCalled();
+      expect(createDeleteRowsPreviewMock).not.toHaveBeenCalled();
+      expect(confirmMutationPreviewMock).not.toHaveBeenCalled();
+    } finally {
+      connecting.resolve();
+      await ready;
+    }
   });
 
   it("keeps an unchanged preview valid across duplicate metadata refresh", async () => {

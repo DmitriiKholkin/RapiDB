@@ -19,6 +19,7 @@ interface QueryToolbarProps {
   selectedConnectionId: string;
   status: QueryStatus;
   onBookmark: () => void;
+  onCancel: () => void;
   onClear: () => void;
   onConnectionChange: (connectionId: string) => void;
   onFormat: () => void;
@@ -36,21 +37,27 @@ export function QueryToolbar({
   selectedConnectionId,
   status,
   onBookmark,
+  onCancel,
   onClear,
   onConnectionChange,
   onFormat,
   onRun,
 }: QueryToolbarProps): React.ReactElement {
+  const runDisabled = status === "running" || !selectedConnectionId;
+  const bookmarkDisabled = bookmarked || bookmarking || !selectedConnectionId;
   return (
     <div style={queryToolbarStyle}>
       <select
         aria-label="Active connection"
         style={querySelectStyle}
         value={selectedConnectionId}
+        disabled={!selectedConnectionId}
         onChange={(event) => onConnectionChange(event.target.value)}
       >
         {connections.length === 0 ? (
-          <option value={connectionId}>{connectionId}</option>
+          <option value={selectedConnectionId}>
+            {selectedConnectionId ? connectionId : "No connections available"}
+          </option>
         ) : (
           connections.map((connection) => (
             <option key={connection.id} value={connection.id}>
@@ -60,7 +67,7 @@ export function QueryToolbar({
         )}
       </select>
 
-      {connections.length === 0 && (
+      {connections.length === 0 && selectedConnectionId && (
         <Icon
           name="sync"
           size={11}
@@ -72,14 +79,26 @@ export function QueryToolbar({
 
       <button
         type="button"
-        style={buildQueryPrimaryButtonStyle(status === "running")}
-        disabled={status === "running"}
+        style={buildQueryPrimaryButtonStyle(runDisabled)}
+        disabled={runDisabled}
         onClick={onRun}
         title="Run query (Ctrl+Enter / F5)"
       >
         <Icon name="run" size={13} style={{ marginRight: 4 }} />
         Run
       </button>
+
+      {status === "running" && (
+        <button
+          type="button"
+          style={buildQueryGhostButtonStyle(false)}
+          onClick={onCancel}
+          title="Cancel running query"
+        >
+          <Icon name="debug-stop" size={13} style={{ marginRight: 4 }} />
+          Stop
+        </button>
+      )}
 
       <button
         type="button"
@@ -105,7 +124,7 @@ export function QueryToolbar({
       <button
         type="button"
         style={{
-          ...buildQueryGhostButtonStyle(bookmarked || bookmarking),
+          ...buildQueryGhostButtonStyle(bookmarkDisabled),
           ...(bookmarked
             ? {
                 color: "var(--vscode-charts-yellow, #e5c07b)",
@@ -113,7 +132,7 @@ export function QueryToolbar({
               }
             : {}),
         }}
-        disabled={bookmarked || bookmarking}
+        disabled={bookmarkDisabled}
         onClick={onBookmark}
         title={bookmarked ? "Already bookmarked" : "Add to Bookmarks"}
       >

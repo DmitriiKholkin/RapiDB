@@ -146,6 +146,8 @@ function activateOnce(context: vscode.ExtensionContext): void {
   });
 
   const disposables: vscode.Disposable[] = [
+    QueryPanel.registerSerializer(context, connectionManager),
+    TablePanel.registerSerializer(context, connectionManager),
     ...trackExplorerTreeView(explorerView, {
       context,
       connectionManager,

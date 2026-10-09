@@ -39,7 +39,7 @@ export function formatQueryResult(
     columnMeta,
     rows: normalizeQueryRows(sampledRows, result.columns, columnMeta),
     truncated,
-    truncatedAt: rowLimit,
+    truncatedAt: sampledRows.length,
   };
 }
 

@@ -81,6 +81,7 @@ import {
   type SshRuntimeRequest,
 } from "./services/sshRuntime";
 import { normalizeUnknownError } from "./utils/errorHandling";
+import { logger } from "./utils/logger";
 
 export type {
   BookmarkEntry,
@@ -698,6 +699,35 @@ function flattenSchemaSnapshot(snapshot: SchemaSnapshot): SchemaObjectEntry[] {
 }
 
 const TEST_CONNECTION_ID = "__test__";
+const CONNECTION_CLEANUP_BUDGET_MS = 1_500;
+
+async function awaitBoundedCleanup(
+  label: string,
+  cleanup: () => void | Promise<void>,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const completed = await Promise.race([
+    Promise.resolve()
+      .then(cleanup)
+      .then(
+        () => true,
+        (error: unknown) => {
+          logger.error(`${label} failed during cleanup`, error);
+          return true;
+        },
+      ),
+    new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), CONNECTION_CLEANUP_BUDGET_MS);
+      timer.unref?.();
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+  if (!completed) {
+    logger.warn(
+      `${label} did not finish within ${CONNECTION_CLEANUP_BUDGET_MS}ms; continuing shutdown.`,
+    );
+  }
+}
 
 interface ConnectionManagerDependencies {
   createSshRuntime?: typeof createSshRuntime;
@@ -718,6 +748,7 @@ export class ConnectionManager
   // the requirement to deliberately reset a lost stateful SQLite session.
   private readonly automaticReconnectBlocks = new Map<string, string>();
   private readonly sshRuntimeMap = new Map<string, SshRuntime>();
+  private readonly disposedSshRuntimes = new WeakSet<SshRuntime>();
   private readonly createSshRuntimeForConnection: typeof createSshRuntime;
   private readonly _connectingMap = new Map<
     string,
@@ -726,6 +757,7 @@ export class ConnectionManager
       epoch: number;
     }
   >();
+  private readonly _disconnectingMap = new Map<string, Promise<void>>();
   private readonly _connectAbortControllerMap = new Map<
     string,
     AbortController
@@ -740,6 +772,9 @@ export class ConnectionManager
   private readonly _onDidDisconnect = new vscode.EventEmitter<string>();
   readonly onDidConnect: vscode.Event<void>;
   private readonly _onDidConnect = new vscode.EventEmitter<void>();
+  readonly onDidInvalidateConnectionMetadata: vscode.Event<string>;
+  private readonly _onDidInvalidateConnectionMetadata =
+    new vscode.EventEmitter<string>();
   readonly onDidSchemaLoad: vscode.Event<string>;
   private readonly _onDidSchemaLoad = new vscode.EventEmitter<string>();
   readonly onDidChangeSchemaState: vscode.Event<string>;
@@ -779,6 +814,8 @@ export class ConnectionManager
     this.onDidChangeHistory = this._onDidChangeHistory.event;
     this.onDidChangeBookmarks = this._onDidChangeBookmarks.event;
     this.onDidConnect = this._onDidConnect.event;
+    this.onDidInvalidateConnectionMetadata =
+      this._onDidInvalidateConnectionMetadata.event;
     this.onDidDisconnect = this._onDidDisconnect.event;
     this.onDidSchemaLoad = this._onDidSchemaLoad.event;
     this.onDidChangeSchemaState = this._onDidChangeSchemaState.event;
@@ -1867,14 +1904,23 @@ export class ConnectionManager
     runtime?: SshRuntime,
   ): Promise<void> {
     if (driver) {
-      try {
-        await driver.disconnect();
-      } catch {}
+      await awaitBoundedCleanup("Unbound database driver disconnect", () =>
+        driver.disconnect(),
+      );
     }
 
     if (runtime) {
-      await runtime.dispose().catch(() => undefined);
+      await this.disposeSshRuntime(runtime, "Unbound SSH runtime disposal");
     }
+  }
+
+  private async disposeSshRuntime(
+    runtime: SshRuntime,
+    label: string,
+  ): Promise<void> {
+    if (this.disposedSshRuntimes.has(runtime)) return;
+    this.disposedSshRuntimes.add(runtime);
+    await awaitBoundedCleanup(label, () => runtime.dispose());
   }
 
   private finalizeConnectAttempt(id: string, connectEpoch: number): void {
@@ -1891,13 +1937,22 @@ export class ConnectionManager
   ): Promise<boolean> {
     const hadDriver = this.driverMap.has(id);
     const driver = this.driverMap.get(id);
+    const owner = {
+      epoch: this._connectionEpochMap.get(id),
+      driver,
+      runtime: this.sshRuntimeMap.get(id),
+    };
     if (driver) {
-      try {
-        await driver.disconnect();
-      } catch {}
+      await awaitBoundedCleanup(`Driver disconnect for ${id}`, () =>
+        driver.disconnect(),
+      );
     }
 
-    await this._cleanupConnectionRuntimeState(id, preserveConnectingAttempt);
+    await this._cleanupConnectionRuntimeState(
+      id,
+      preserveConnectingAttempt,
+      owner,
+    );
     return hadDriver;
   }
 
@@ -1907,6 +1962,19 @@ export class ConnectionManager
   ): ConnectAttempt {
     this._assertNotDisposed();
 
+    // Disconnect fences attempts synchronously, but driver/runtime cleanup can
+    // await. No caller (including a restored webview's ready) may create a new
+    // epoch while that cleanup still owns this connection's resources.
+    if (this._disconnectingMap.has(id)) {
+      return {
+        promise: Promise.reject(
+          new Error(
+            `[RapiDB] Disconnect in progress: ${id}. Retry Connect after it finishes.`,
+          ),
+        ),
+        isNew: true,
+      };
+    }
     const reconnectBlock = this.getAutomaticReconnectBlockReason(id);
     if (intent === "automatic" && reconnectBlock) {
       return {
@@ -1935,12 +2003,20 @@ export class ConnectionManager
       promise: attempt,
       epoch: connectEpoch,
     });
+    // Fence cached/in-flight metadata without emitting a panel-closing event.
+    this._onDidInvalidateConnectionMetadata.fire(id);
     this._onDidChangeConnections.fire();
     void (async () => {
       try {
         if (this.driverMap.has(id)) {
-          const hadDriver = await this.disconnectRegisteredDriver(id, true);
-          if (hadDriver) this._onDidDisconnect.fire(id);
+          // Replacing an already disconnected driver is internal cleanup, not
+          // a final disconnect. Closing connection-scoped panels here would
+          // dispose the restored panel that requested this reconnect.
+          await this.disconnectRegisteredDriver(id, true);
+        }
+        if (this._isStaleConnectEpoch(id, connectEpoch)) {
+          resolveAttempt();
+          return;
         }
         const config = this.getConnection(id);
         if (!config) {
@@ -1974,6 +2050,9 @@ export class ConnectionManager
           this.sshRuntimeMap.set(id, runtime);
         }
         this._invalidateSchemaState(id);
+        // Also fence reads started during teardown, before the new driver was
+        // installed. Consumers can now reload against the new session.
+        this._onDidInvalidateConnectionMetadata.fire(id);
         this._onDidConnect.fire();
         resolveAttempt();
       } catch (err) {
@@ -2002,21 +2081,39 @@ export class ConnectionManager
   ): Promise<void> {
     await this.beginConnect(id, intent).promise;
   }
-  async disconnectFrom(id: string): Promise<void> {
-    this._nextConnectionEpoch(id);
-    const hadPendingConnect = this._connectingMap.has(id);
-    this._connectingMap.delete(id);
+  disconnectFrom(id: string): Promise<void> {
+    const pending = this._disconnectingMap.get(id);
+    if (pending) return pending;
+    let resolveDisconnect!: () => void;
+    let rejectDisconnect!: (error: unknown) => void;
+    const disconnect = new Promise<void>((resolve, reject) => {
+      resolveDisconnect = resolve;
+      rejectDisconnect = reject;
+    });
+    // Install before cancellation: abort listeners can synchronously request a
+    // new connection. Concurrent Disconnect calls share this cleanup as well.
+    this._disconnectingMap.set(id, disconnect);
+    void (async () => {
+      try {
+        this._nextConnectionEpoch(id);
+        const hadPendingConnect = this._connectingMap.has(id);
+        this._connectingMap.delete(id);
 
-    const ac = this._connectAbortControllerMap.get(id);
-    if (ac) {
-      ac.abort();
-    }
+        const ac = this._connectAbortControllerMap.get(id);
+        if (ac) ac.abort();
 
-    const hadDriver = await this.disconnectRegisteredDriver(id);
-
-    if (hadDriver || hadPendingConnect) {
-      this._onDidDisconnect.fire(id);
-    }
+        const hadDriver = await this.disconnectRegisteredDriver(id);
+        if (hadDriver || hadPendingConnect) {
+          this._onDidDisconnect.fire(id);
+        }
+        resolveDisconnect();
+      } catch (error: unknown) {
+        rejectDisconnect(error);
+      } finally {
+        this._disconnectingMap.delete(id);
+      }
+    })();
+    return disconnect;
   }
   isConnected(id: string): boolean {
     return this.driverMap.get(id)?.isConnected() ?? false;
@@ -2541,35 +2638,42 @@ export class ConnectionManager
     this._onDidChangeSchemaState.fire(connectionId);
   }
 
-  private async _disposeSshRuntime(connectionId: string): Promise<void> {
-    const runtime = this.sshRuntimeMap.get(connectionId);
-    this.sshRuntimeMap.delete(connectionId);
-    if (!runtime) {
-      return;
-    }
-
-    try {
-      await runtime.dispose();
-    } catch {}
-  }
-
   private async _cleanupConnectionRuntimeState(
     connectionId: string,
-    preserveConnectingAttempt = false,
+    preserveConnectingAttempt: boolean,
+    owner: {
+      epoch: number | undefined;
+      driver: IDBDriver | undefined;
+      runtime: SshRuntime | undefined;
+    },
   ): Promise<void> {
-    await this._disposeSshRuntime(connectionId);
-    this.getAutomaticReconnectBlockReason(connectionId);
-    this.driverMap.delete(connectionId);
-    if (!preserveConnectingAttempt) {
-      this._connectingMap.delete(connectionId);
+    // A second Disconnect may finish before this teardown, allowing a new
+    // session to be installed. Never resolve shared resources by ID after an
+    // await: this cleanup owns only its captured epoch, driver and runtime.
+    if (
+      this._connectionEpochMap.get(connectionId) === owner.epoch &&
+      this.driverMap.get(connectionId) === owner.driver &&
+      this.sshRuntimeMap.get(connectionId) === owner.runtime
+    ) {
+      this.getAutomaticReconnectBlockReason(connectionId);
+      this.driverMap.delete(connectionId);
+      this.sshRuntimeMap.delete(connectionId);
+      if (!preserveConnectingAttempt) {
+        this._connectingMap.delete(connectionId);
+      }
+      this.invalidateDriverStaticMetadata(connectionId);
+      this._schemaCacheMap.delete(connectionId);
+      this._schemaGenerationMap.delete(connectionId);
+      this._schemaExpandedScopeKeyMap.delete(connectionId);
+      // All shared-state changes precede the next await.
+      this._onDidChangeSchemaState.fire(connectionId);
     }
-    this.invalidateDriverStaticMetadata(connectionId);
-    this._schemaCacheMap.delete(connectionId);
-    this._schemaGenerationMap.delete(connectionId);
-    this._schemaExpandedScopeKeyMap.delete(connectionId);
-    // Keep epoch fences to ensure stale in-flight connect attempts remain stale
-    // even if a fresh connect starts immediately after disconnect.
-    this._onDidChangeSchemaState.fire(connectionId);
+    if (owner.runtime) {
+      await this.disposeSshRuntime(
+        owner.runtime,
+        `SSH runtime disposal for ${connectionId}`,
+      );
+    }
   }
 
   private _restoreExpandedSchemaLoads(connectionId: string): void {
@@ -3382,6 +3486,7 @@ export class ConnectionManager
     const ids = new Set([
       ...this.driverMap.keys(),
       ...this._connectAbortControllerMap.keys(),
+      ...this._disconnectingMap.keys(),
     ]);
     await Promise.allSettled([...ids].map((id) => this.disconnectFrom(id)));
   }
@@ -3424,6 +3529,7 @@ export class ConnectionManager
     this._onDidChangeBookmarks.dispose();
     this._onDidDisconnect.dispose();
     this._onDidConnect.dispose();
+    this._onDidInvalidateConnectionMetadata.dispose();
     this._onDidSchemaLoad.dispose();
     this._onDidChangeSchemaState.dispose();
     this._onDidRefreshSchemas.dispose();

@@ -129,6 +129,7 @@ export interface TableInitialState extends PanelRetentionState {
   table: string;
   displayTableName?: string;
   isView?: boolean;
+  objectKind?: "table" | "view" | "materializedView";
   connectionReadOnly?: boolean;
   mongoRowIdentity?: boolean;
   defaultPageSize?: number;
@@ -143,11 +144,20 @@ export function parseTableInitialState(
   const database = readOptionalString(input, "database");
   const schema = readOptionalString(input, "schema");
   const table = readRequiredString(input, "table");
+  const objectKind = input.objectKind;
   if (
     !connectionId ||
     database === undefined ||
     schema === undefined ||
     !table
+  ) {
+    return null;
+  }
+  if (
+    objectKind !== undefined &&
+    objectKind !== "table" &&
+    objectKind !== "view" &&
+    objectKind !== "materializedView"
   ) {
     return null;
   }
@@ -159,6 +169,7 @@ export function parseTableInitialState(
     table,
     displayTableName: readOptionalString(input, "displayTableName"),
     isView: readOptionalBoolean(input, "isView"),
+    objectKind,
     connectionReadOnly: readOptionalBoolean(input, "connectionReadOnly"),
     mongoRowIdentity: readOptionalBoolean(input, "mongoRowIdentity"),
     defaultPageSize: readOptionalNumber(input, "defaultPageSize"),
@@ -435,8 +446,8 @@ export function parseTablePanelMessage(
   }
 }
 export interface TableInitPayload {
-  /** Omitted by older hosts: genuine initialization, with the existing reset semantics. */
-  intent?: "initialize" | "metadataRefresh";
+  /** connectionRefresh fences reads even when columns match; it is not a user verification Refresh. Omitted by older hosts: genuine initialization. */
+  intent?: "initialize" | "metadataRefresh" | "connectionRefresh";
   columns: ColumnTypeMeta[];
   primaryKeyColumns: string[];
   isView?: boolean;

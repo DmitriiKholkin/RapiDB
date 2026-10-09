@@ -254,6 +254,7 @@ export type QueryPanelMessage =
         operationId?: string;
       }
     >
+  | WebviewMessageEnvelope<"cancelQuery", { operationId: string }>
   | WebviewMessageEnvelope<"getConnections">
   | WebviewMessageEnvelope<"getSchema", { connectionId?: string }>
   | WebviewMessageEnvelope<"exportResultsCSV", QueryResultExportPayload>
@@ -318,6 +319,14 @@ export function parseQueryPanelMessage(
                 : {}),
             },
           }
+        : null;
+    }
+
+    case "cancelQuery": {
+      if (!isRecord(envelope.payload)) return null;
+      const operationId = readRequiredString(envelope.payload, "operationId");
+      return operationId
+        ? { type: envelope.type, payload: { operationId } }
         : null;
     }
 

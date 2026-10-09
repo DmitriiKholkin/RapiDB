@@ -8,6 +8,15 @@ export function writeWebviewState<T>(state: T): void {
   window.__vscode?.setState<T>(state);
 }
 
+export function updateWebviewState(
+  update: (state: Record<string, unknown>) => Record<string, unknown>,
+): void {
+  const vscode = window.__vscode;
+  if (!vscode) return;
+  const current = vscode.getState<Record<string, unknown>>() ?? {};
+  vscode.setState(update(current));
+}
+
 export function syncInitialWebviewState(
   vscode: VSCodeAPI,
   initialState: WebviewInitialState | undefined,

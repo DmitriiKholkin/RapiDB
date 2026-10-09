@@ -2422,7 +2422,9 @@ export class OracleDriver extends BaseDBDriver {
     columns?: readonly ColumnTypeMeta[],
   ): string {
     if (!columns || columns.length === 0) {
-      return `INSERT INTO ${qualifiedTableName} DEFAULT VALUES`;
+      throw new Error(
+        "Oracle insert failed: the table has no insertable columns to provide default values for.",
+      );
     }
     const columnNames = columns.map((column) =>
       this.quoteIdentifier(column.name),

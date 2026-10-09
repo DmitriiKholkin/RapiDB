@@ -14,6 +14,7 @@ import {
   useSchemaStore,
 } from "../../store";
 import { onMessage, postMessage } from "../../utils/messaging";
+import { readWebviewState, updateWebviewState } from "../../utils/vscodeState";
 import type { MonacoEditorHandle } from "../MonacoEditor";
 import {
   DEFAULT_EDITOR_H,
@@ -37,6 +38,33 @@ interface QueryViewControllerParams {
   initialQueryText: string;
 }
 
+function readQueryDraft(
+  panelId: string,
+  initialQueryText: string,
+): {
+  text: string;
+  restored: boolean;
+  activeConnectionId?: string;
+} {
+  const state = readWebviewState<Record<string, unknown>>({});
+  const draft = state.queryDraft;
+  if (
+    draft !== null &&
+    typeof draft === "object" &&
+    (draft as { panelId?: unknown }).panelId === panelId &&
+    typeof (draft as { text?: unknown }).text === "string"
+  ) {
+    const activeConnectionId = (draft as { activeConnectionId?: unknown })
+      .activeConnectionId;
+    return {
+      text: (draft as { text: string }).text,
+      restored: true,
+      ...(typeof activeConnectionId === "string" ? { activeConnectionId } : {}),
+    };
+  }
+  return { text: initialQueryText, restored: false };
+}
+
 export function useQueryViewController({
   panelId,
   connectionId,
@@ -46,6 +74,14 @@ export function useQueryViewController({
   initialIsBookmarked,
   initialQueryText,
 }: QueryViewControllerParams) {
+  const [queryDraft] = useState(() =>
+    readQueryDraft(panelId, initialQueryText),
+  );
+  const editorInitialValue = queryDraft.text;
+  const draftInitiallyBookmarked =
+    initialIsBookmarked &&
+    editorInitialValue.trim() === initialQueryText.trim() &&
+    (queryDraft.activeConnectionId ?? connectionId) === connectionId;
   const editorRef = useRef<MonacoEditorHandle>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -60,8 +96,8 @@ export function useQueryViewController({
   const { schemaByConnection, setSchema } = useSchemaStore();
 
   const schemaFetchedRef = useRef<Set<string>>(new Set());
-  const bookmarkedRef = useRef(initialIsBookmarked);
-  const bookmarkTextRef = useRef(initialQueryText.trim());
+  const bookmarkedRef = useRef(draftInitiallyBookmarked);
+  const bookmarkTextRef = useRef(editorInitialValue.trim());
   const bookmarkConnectionRef = useRef(connectionId);
   const bookmarkSequenceRef = useRef(0);
   const pendingBookmarkRef = useRef<{
@@ -71,7 +107,7 @@ export function useQueryViewController({
   } | null>(null);
   const dragStartY = useRef(0);
   const dragStartH = useRef(DEFAULT_EDITOR_H);
-  const didAutoFormat = useRef(false);
+  const didAutoFormat = useRef(queryDraft.restored);
   const didPlaceCursor = useRef(false);
   const operationSequenceRef = useRef(0);
   const activeOperationRef = useRef<{
@@ -82,7 +118,8 @@ export function useQueryViewController({
 
   const [editorHeight, setEditorHeight] = useState(DEFAULT_EDITOR_H);
   const [isResizing, setIsResizing] = useState(false);
-  const [bookmarked, setBookmarked] = useState(initialIsBookmarked);
+  const [connectionsLoaded, setConnectionsLoaded] = useState(false);
+  const [bookmarked, setBookmarked] = useState(draftInitiallyBookmarked);
   const [bookmarking, setBookmarking] = useState(false);
 
   const invalidateBookmark = useCallback(() => {
@@ -124,7 +161,9 @@ export function useQueryViewController({
     }
   }, []);
 
-  const resolvedConnectionId = activeConnectionId || connectionId;
+  const resolvedConnectionId =
+    activeConnectionId ||
+    (connectionsLoaded ? "" : (queryDraft.activeConnectionId ?? connectionId));
   useEffect(() => {
     if (bookmarkConnectionRef.current !== resolvedConnectionId) {
       bookmarkConnectionRef.current = resolvedConnectionId;
@@ -145,9 +184,9 @@ export function useQueryViewController({
   });
 
   useEffect(() => {
-    setActiveConnection(connectionId);
+    setActiveConnection(queryDraft.activeConnectionId ?? connectionId);
     postMessage("getConnections");
-  }, [connectionId, setActiveConnection]);
+  }, [connectionId, queryDraft.activeConnectionId, setActiveConnection]);
 
   useEffect(() => {
     if (!resolvedConnectionId) {
@@ -168,6 +207,44 @@ export function useQueryViewController({
     schemaFetchedRef.current.add(resolvedConnectionId);
     postMessage("getSchema", { connectionId: resolvedConnectionId });
   }, [resolvedConnectionId]);
+
+  const handleConnectionChange = useCallback(
+    (nextConnectionId: string) => {
+      updateWebviewState((state) => ({
+        ...state,
+        queryDraft: {
+          panelId,
+          text: editorRef.current?.getValue() ?? editorInitialValue,
+          activeConnectionId: nextConnectionId,
+        },
+      }));
+      if (nextConnectionId !== bookmarkConnectionRef.current) {
+        bookmarkConnectionRef.current = nextConnectionId;
+        invalidateBookmark();
+      }
+      blankQueryValidationRef.current = false;
+      activeOperationRef.current = null;
+      reset();
+      setActiveConnection(nextConnectionId);
+      if (!nextConnectionId) return;
+      postMessage("activeConnectionChanged", {
+        connectionId: nextConnectionId,
+      });
+
+      const cachedSchema =
+        useSchemaStore.getState().schemaByConnection[nextConnectionId];
+      if (cachedSchema === undefined) {
+        schemaFetchedRef.current.delete(nextConnectionId);
+      }
+    },
+    [
+      editorInitialValue,
+      invalidateBookmark,
+      panelId,
+      reset,
+      setActiveConnection,
+    ],
+  );
 
   useEffect(() => {
     const unsubscribeResult = onMessage<QueryResult>(
@@ -196,12 +273,14 @@ export function useQueryViewController({
       "connections",
       (payload) => {
         const currentConnectionId =
-          useConnectionStore.getState().activeConnectionId || connectionId;
+          useConnectionStore.getState().activeConnectionId;
         if (
           !payload.some((connection) => connection.id === currentConnectionId)
         ) {
           invalidateBookmark();
+          handleConnectionChange(payload[0]?.id ?? "");
         }
+        setConnectionsLoaded(true);
         setConnections(payload);
       },
     );
@@ -222,7 +301,7 @@ export function useQueryViewController({
         payload.requestId !== pending.requestId ||
         pending.queryText !== bookmarkTextRef.current ||
         pending.connectionId !==
-          (useConnectionStore.getState().activeConnectionId || connectionId)
+          useConnectionStore.getState().activeConnectionId
       ) {
         return;
       }
@@ -241,7 +320,7 @@ export function useQueryViewController({
       unsubscribeBookmark();
     };
   }, [
-    connectionId,
+    handleConnectionChange,
     invalidateBookmark,
     setConnections,
     setError,
@@ -249,33 +328,10 @@ export function useQueryViewController({
     setSchema,
   ]);
 
-  const handleConnectionChange = useCallback(
-    (nextConnectionId: string) => {
-      if (nextConnectionId !== bookmarkConnectionRef.current) {
-        bookmarkConnectionRef.current = nextConnectionId;
-        invalidateBookmark();
-      }
-      blankQueryValidationRef.current = false;
-      activeOperationRef.current = null;
-      reset();
-      setActiveConnection(nextConnectionId);
-      postMessage("activeConnectionChanged", {
-        connectionId: nextConnectionId,
-      });
-
-      const cachedSchema =
-        useSchemaStore.getState().schemaByConnection[nextConnectionId];
-      if (cachedSchema === undefined) {
-        schemaFetchedRef.current.delete(nextConnectionId);
-      }
-    },
-    [invalidateBookmark, reset, setActiveConnection],
-  );
-
   useEffect(() => {
     if (
       !editorState.shouldFormatOnOpen ||
-      !initialQueryText ||
+      !editorInitialValue ||
       didAutoFormat.current ||
       !editorState.canFormat ||
       (editorState.monacoLanguage === "sql" && !editorState.sqlDialect)
@@ -301,7 +357,7 @@ export function useQueryViewController({
     editorState.monacoLanguage,
     editorState.shouldFormatOnOpen,
     editorState.sqlDialect,
-    initialQueryText,
+    editorInitialValue,
   ]);
 
   useEffect(() => {
@@ -319,6 +375,10 @@ export function useQueryViewController({
     // Monaco shortcuts remain available while Run is disabled. Do not let a
     // repeated submission (including blank validation) replace an active run.
     if (useQueryStore.getState().status === "running") return;
+    // Read live state so a shortcut in the same event as connection removal
+    // cannot use the previous render's connection or the initial fallback.
+    const queryConnectionId = useConnectionStore.getState().activeConnectionId;
+    if (!queryConnectionId) return;
     const queryText = editorRef.current?.getSelectionOrValue().trim() ?? "";
     if (!queryText) {
       blankQueryValidationRef.current = true;
@@ -331,17 +391,27 @@ export function useQueryViewController({
     const operationId = `${panelId}:${++operationSequenceRef.current}`;
     activeOperationRef.current = {
       operationId,
-      connectionId: resolvedConnectionId,
+      connectionId: queryConnectionId,
     };
     postMessage("executeQuery", {
       queryText,
-      connectionId: resolvedConnectionId,
+      connectionId: queryConnectionId,
       operationId,
     });
-  }, [panelId, resolvedConnectionId, setError, setRunning]);
+  }, [panelId, setError, setRunning]);
+
+  const cancelQuery = useCallback(() => {
+    const activeOperation = activeOperationRef.current;
+    if (!activeOperation || useQueryStore.getState().status !== "running") {
+      return;
+    }
+    postMessage("cancelQuery", {
+      operationId: activeOperation.operationId,
+    });
+  }, []);
 
   const clearQuery = useCallback(() => {
-    editorRef.current?.setValue("");
+    editorRef.current?.clearValue();
   }, []);
 
   const formatQuery = useCallback(() => {
@@ -367,30 +437,44 @@ export function useQueryViewController({
     }
 
     const queryText = bookmarkTextRef.current;
-    if (!queryText) {
+    const bookmarkConnectionId =
+      useConnectionStore.getState().activeConnectionId;
+    if (!queryText || !bookmarkConnectionId) {
       return;
     }
 
     const pending = {
       requestId: `${panelId}:bookmark:${++bookmarkSequenceRef.current}`,
       queryText,
-      connectionId:
-        useConnectionStore.getState().activeConnectionId || connectionId,
+      connectionId: bookmarkConnectionId,
     };
     pendingBookmarkRef.current = pending;
     setBookmarking(true);
     postMessage("addBookmark", pending satisfies QueryBookmarkPayload);
-  }, [connectionId, panelId]);
+  }, [panelId]);
 
   const handleEditorChange = useCallback(
     (value: string) => {
+      updateWebviewState((state) => ({
+        ...state,
+        queryDraft: {
+          panelId,
+          text: value,
+          activeConnectionId: resolvedConnectionId,
+        },
+      }));
       bookmarkTextRef.current = value.trim();
       invalidateBookmark();
       clearBlankQueryValidation(
         editorRef.current?.getSelectionOrValue() ?? value,
       );
     },
-    [clearBlankQueryValidation, invalidateBookmark],
+    [
+      clearBlankQueryValidation,
+      invalidateBookmark,
+      panelId,
+      resolvedConnectionId,
+    ],
   );
 
   const handleEditorSelectionChange = useCallback(() => {
@@ -460,5 +544,7 @@ export function useQueryViewController({
     startResizing,
     status,
     clearQuery,
+    cancelQuery,
+    editorInitialValue,
   };
 }

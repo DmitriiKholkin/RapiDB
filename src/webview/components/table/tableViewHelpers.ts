@@ -3,6 +3,7 @@ import {
   type ColumnTypeMeta as ColumnMeta,
   deriveApplicableFilterDrafts,
   type FilterDraftMap,
+  type FilterOperator,
   formatColumnDetailDescription,
   formatPrimaryKeyRoleLabel,
   isServerGeneratedColumn,
@@ -10,17 +11,20 @@ import {
 } from "../../../shared/tableTypes";
 import type { ApplyResultPayload } from "../../../shared/webviewContracts";
 import type {
+  PendingRestoreEntry as BasePendingRestoreEntry,
   EditTarget,
   InsertDraftRow,
   MutationSnapshot,
   PendingEdits,
-  PendingRestoreEntry,
   Row,
 } from "../../types";
 import { buildButtonStyle } from "../../utils/buttonStyles";
 import { TOOLBAR_H } from "../../utils/layout";
 
-export type { PendingRestoreEntry } from "../../types";
+export type PendingRestoreEntry = BasePendingRestoreEntry & {
+  originalValues?: Map<string, unknown>;
+  baselineMissing?: boolean;
+};
 export { TOOLBAR_H };
 
 export const PAGE_SIZES = [25, 100, 500, 1000] as const;
@@ -63,9 +67,276 @@ export interface PendingRestoreState {
   entries: PendingRestoreEntry[];
 }
 
+export interface PersistedTableDraft {
+  tableKey: string;
+  restoreState: PendingRestoreState;
+  newRows: InsertDraftRow[];
+  mutation?: PersistedTableMutation;
+}
+
+export interface PersistedTableMutation {
+  kind: "apply" | "delete";
+  unknown: boolean;
+  operationId?: string;
+}
+
+export interface PersistedTableViewState {
+  tableKey: string;
+  page: number;
+  pageSize: number;
+  sort: TableSortState;
+  filters: FilterDraftMap;
+}
+
+interface SerializedTableDraft {
+  tableKey: string;
+  restoreState: {
+    entries: Array<{
+      originalSignature: string;
+      changes: Array<[string, unknown]>;
+      originalValues?: Array<[string, unknown] | [string]>;
+    }>;
+  };
+  newRows: Array<Record<string, { value: unknown } | { valueUndefined: true }>>;
+  mutation?: PersistedTableMutation;
+}
+
 export interface PendingRestoreResult {
   pendingEdits: PendingEdits;
   unresolved: PendingRestoreEntry[];
+}
+
+export function serializeTableDraft(
+  tableKey: string,
+  restoreState: PendingRestoreState,
+  newRows: readonly InsertDraftRow[],
+  mutation?: PersistedTableMutation,
+): SerializedTableDraft {
+  return {
+    tableKey,
+    restoreState: {
+      entries: restoreState.entries.map((entry) => ({
+        originalSignature: entry.originalSignature,
+        changes: [...entry.changes.entries()],
+        ...(entry.originalValues
+          ? {
+              // A one-element tuple preserves undefined through JSON; encoding
+              // it as [name, undefined] would silently turn the baseline NULL.
+              originalValues: [...entry.originalValues].map(
+                ([name, value]): [string, unknown] | [string] =>
+                  value === undefined ? [name] : [name, value],
+              ),
+            }
+          : {}),
+      })),
+    },
+    newRows: newRows.map((row) =>
+      Object.fromEntries(
+        Object.entries(row).map(([name, cell]) => [
+          name,
+          // Keep undefined distinct from a malformed cell with no value.
+          cell.value === undefined ? { valueUndefined: true } : { ...cell },
+        ]),
+      ),
+    ),
+    ...(mutation ? { mutation: { ...mutation } } : {}),
+  };
+}
+
+export function parsePersistedTableDraft(
+  value: unknown,
+  expectedTableKey: string,
+): PersistedTableDraft | null {
+  if (!isRecord(value) || value.tableKey !== expectedTableKey) return null;
+  const state = value.restoreState;
+  const newRows = value.newRows;
+  if (
+    !isRecord(state) ||
+    !Array.isArray(state.entries) ||
+    !Array.isArray(newRows) ||
+    newRows.length > MAX_DRAFT_ROWS
+  ) {
+    return null;
+  }
+
+  const entries: PendingRestoreEntry[] = [];
+  for (const entry of state.entries) {
+    if (
+      !isRecord(entry) ||
+      typeof entry.originalSignature !== "string" ||
+      !Array.isArray(entry.changes)
+    ) {
+      return null;
+    }
+    const changes = new Map<string, unknown>();
+    for (const change of entry.changes) {
+      if (
+        !Array.isArray(change) ||
+        change.length !== 2 ||
+        typeof change[0] !== "string"
+      ) {
+        return null;
+      }
+      changes.set(change[0], change[1]);
+    }
+    let originalValues: Map<string, unknown> | undefined;
+    if (entry.originalValues !== undefined) {
+      if (!Array.isArray(entry.originalValues)) return null;
+      originalValues = new Map();
+      for (const original of entry.originalValues) {
+        if (
+          !Array.isArray(original) ||
+          (original.length !== 1 && original.length !== 2) ||
+          typeof original[0] !== "string"
+        )
+          return null;
+        originalValues.set(original[0], original[1]);
+      }
+    }
+    entries.push({
+      originalSignature: entry.originalSignature,
+      changes,
+      originalValues,
+      // Older drafts have no concurrency baseline. Retain them, but never
+      // silently adopt the first post-restart read as their original values.
+      baselineMissing: originalValues === undefined,
+    });
+  }
+
+  const parsedRows: InsertDraftRow[] = [];
+  for (const row of newRows) {
+    if (!isRecord(row)) return null;
+    const cells: Array<[string, InsertDraftRow[string]]> = [];
+    for (const [name, cell] of Object.entries(row)) {
+      if (!isRecord(cell)) return null;
+      if (Object.hasOwn(cell, "value")) {
+        cells.push([name, { value: cell.value }]);
+      } else if (
+        Object.hasOwn(cell, "valueUndefined") &&
+        cell.valueUndefined === true
+      ) {
+        cells.push([name, { value: undefined }]);
+      } else {
+        return null;
+      }
+    }
+    // Assignment on {} would invoke the inherited __proto__ setter instead
+    // of creating an own property for a legal database column of that name.
+    parsedRows.push(Object.fromEntries(cells));
+  }
+
+  let mutation: PersistedTableMutation | undefined;
+  if (value.mutation !== undefined) {
+    const marker = value.mutation;
+    if (
+      !isRecord(marker) ||
+      (marker.kind !== "apply" && marker.kind !== "delete") ||
+      typeof marker.unknown !== "boolean" ||
+      (marker.operationId !== undefined &&
+        typeof marker.operationId !== "string")
+    )
+      return null;
+    mutation = {
+      kind: marker.kind,
+      unknown: marker.unknown,
+      ...(typeof marker.operationId === "string"
+        ? { operationId: marker.operationId }
+        : {}),
+    };
+  }
+
+  return {
+    tableKey: expectedTableKey,
+    restoreState: { entries },
+    newRows: parsedRows,
+    ...(mutation ? { mutation } : {}),
+  };
+}
+
+export function parsePersistedTableViewState(
+  value: unknown,
+  expectedTableKey: string,
+): PersistedTableViewState | null {
+  if (!isRecord(value) || value.tableKey !== expectedTableKey) return null;
+  const { page, pageSize, sort, filters } = value;
+  if (
+    typeof page !== "number" ||
+    !Number.isSafeInteger(page) ||
+    page < 1 ||
+    typeof pageSize !== "number" ||
+    !(PAGE_SIZES as readonly number[]).includes(pageSize) ||
+    !isRecord(filters)
+  ) {
+    return null;
+  }
+
+  let parsedSort: TableSortState = null;
+  if (sort !== null) {
+    if (
+      !isRecord(sort) ||
+      typeof sort.column !== "string" ||
+      (sort.direction !== "asc" && sort.direction !== "desc")
+    ) {
+      return null;
+    }
+    parsedSort = { column: sort.column, direction: sort.direction };
+  }
+
+  const operators = new Set<FilterOperator>([
+    "eq",
+    "neq",
+    "gt",
+    "gte",
+    "lt",
+    "lte",
+    "between",
+    "like",
+    "ilike",
+    "in",
+    "is_null",
+    "is_not_null",
+  ]);
+  const parsedFilters: Array<[string, FilterDraftMap[string]]> = [];
+  for (const [column, rawDraft] of Object.entries(filters)) {
+    if (!isRecord(rawDraft) || typeof rawDraft.operator !== "string") {
+      return null;
+    }
+    const operator = rawDraft.operator as FilterOperator;
+    if (!operators.has(operator)) return null;
+    if (operator === "is_null" || operator === "is_not_null") {
+      parsedFilters.push([column, { operator }]);
+    } else if (operator === "between") {
+      if (
+        !Array.isArray(rawDraft.value) ||
+        rawDraft.value.length !== 2 ||
+        !rawDraft.value.every((entry) => typeof entry === "string")
+      ) {
+        return null;
+      }
+      parsedFilters.push([
+        column,
+        {
+          operator,
+          value: [rawDraft.value[0], rawDraft.value[1]],
+        },
+      ]);
+    } else {
+      if (typeof rawDraft.value !== "string") return null;
+      parsedFilters.push([column, { operator, value: rawDraft.value }]);
+    }
+  }
+
+  return {
+    tableKey: expectedTableKey,
+    page,
+    pageSize,
+    sort: parsedSort,
+    filters: Object.fromEntries(parsedFilters),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 export function getInitialPageSize(defaultPageSize?: number): number {
@@ -269,6 +540,9 @@ export function buildPendingRestoreState(
     entries.push({
       originalSignature: signature,
       changes: new Map(columnMap),
+      originalValues: new Map(
+        [...columnMap.keys()].map((name) => [name, row[name]]),
+      ),
     });
   }
 
@@ -276,6 +550,9 @@ export function buildPendingRestoreState(
     entries: [...entries, ...preservedEntries].map((entry) => ({
       ...entry,
       changes: new Map(entry.changes),
+      ...(entry.originalValues
+        ? { originalValues: new Map(entry.originalValues) }
+        : {}),
     })),
   };
 }
@@ -319,6 +596,21 @@ export function restorePendingEditsSafely(
     const originalMatches = rowsBySignature.get(entry.originalSignature) ?? [];
     if (originalMatches.length === 1 && !claimedRows.has(originalMatches[0])) {
       const rowIdx = originalMatches[0];
+      if (
+        entry.baselineMissing ||
+        (entry.originalValues &&
+          [...entry.changes.keys()].some(
+            (name) =>
+              !entry.originalValues?.has(name) ||
+              !Object.hasOwn(rows[rowIdx], name) ||
+              JSON.stringify(
+                stablePrimaryKeyPart(entry.originalValues.get(name)),
+              ) !== JSON.stringify(stablePrimaryKeyPart(rows[rowIdx][name])),
+          ))
+      ) {
+        unresolved.push(entry);
+        continue;
+      }
       claimedRows.add(rowIdx);
       restored.set(rowIdx, new Map(entry.changes));
     } else {
@@ -396,6 +688,9 @@ export function buildUndoRedoSnapshot(
     unresolvedPendingEdits: unresolvedPendingEdits.map((entry) => ({
       ...entry,
       changes: new Map(entry.changes),
+      ...(entry.originalValues
+        ? { originalValues: new Map(entry.originalValues) }
+        : {}),
     })),
     newRows: newRows.map((row) => ({ ...row })),
     editCell,

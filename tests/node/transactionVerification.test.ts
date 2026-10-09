@@ -61,7 +61,13 @@ function harness(
     events.push("ROLLBACK");
   });
   const cancel = vi.fn(async () => undefined);
-  const release = vi.fn();
+  let released = false;
+  const release = vi.fn(() => {
+    if (engine === "pg") {
+      expect(released).toBe(false);
+      released = true;
+    }
+  });
   const metadata = [{ name: "__col_0", dbType: oracledb.DB_TYPE_NUMBER }];
   const execute = vi.fn(
     async (
@@ -69,6 +75,8 @@ function harness(
       _params?: unknown,
       executeOptions?: oracledb.ExecuteOptions,
     ) => {
+      if (engine === "pg" && released)
+        throw new Error("SQL on a released PostgreSQL client");
       const sql = typeof input === "string" ? input : input.sql;
       if (sql.startsWith("ALTER SESSION")) return {};
       if (sql === "BEGIN") {
@@ -181,7 +189,7 @@ function harness(
   const outsideQuery = vi
     .spyOn(driver, "query")
     .mockRejectedValue(new Error("Outside transaction read forbidden"));
-  return { driver, events, lease, execute, outsideQuery, cancel };
+  return { driver, events, lease, execute, outsideQuery, cancel, release };
 }
 
 afterEach(() => {
@@ -228,7 +236,7 @@ describe("transaction-scoped UPDATE verification", () => {
           ? [[9], [9]]
           : [[10]];
     };
-    const { driver, events, outsideQuery } = harness(
+    const { driver, events, outsideQuery, release } = harness(
       engine,
       read,
       failure === "affected zero" ? 0 : 1,
@@ -262,6 +270,7 @@ describe("transaction-scoped UPDATE verification", () => {
     expect(events).not.toContain("COMMIT");
     expect(events.includes("READ")).toBe(failure !== "affected zero");
     expect(outsideQuery).not.toHaveBeenCalled();
+    if (engine === "pg") expect(release).toHaveBeenCalledExactlyOnceWith();
   });
 
   it.each([
@@ -279,6 +288,8 @@ describe("transaction-scoped UPDATE verification", () => {
       driver: raw,
       events,
       cancel,
+      execute,
+      release,
     } = harness(engine, async () => {
       await wait;
       return [[9]];
@@ -298,11 +309,20 @@ describe("transaction-scoped UPDATE verification", () => {
     await vi.advanceTimersByTimeAsync(25);
     await rejected;
     expect(events).toContain("READ");
+    const sqlCountAtTimeout = execute.mock.calls.length;
+    if (engine === "pg") expect(release).toHaveBeenCalledExactlyOnceWith(true);
     finish();
     await vi.runAllTimersAsync();
     expect(events).not.toContain("COMMIT");
-    expect(events).toContain("ROLLBACK");
-    if (engine !== "pg") expect(cancel).toHaveBeenCalled();
+    if (engine === "pg") {
+      // Socket destruction rolls back server-side; SQL on it is unsafe.
+      expect(events).not.toContain("ROLLBACK");
+      expect(execute).toHaveBeenCalledTimes(sqlCountAtTimeout);
+      expect(release).toHaveBeenCalledExactlyOnceWith(true);
+    } else {
+      expect(events).toContain("ROLLBACK");
+      expect(cancel).toHaveBeenCalled();
+    }
   });
 
   it("SQLite core checks a wall-clock deadline after native read-back and rolls back", async () => {
@@ -328,11 +348,31 @@ describe("transaction-scoped UPDATE verification", () => {
     expect(events).toEqual(["BEGIN", "DML", "READ", "ROLLBACK"]);
   });
 
+  it("pg rolls back a still-live client when verification crosses the deadline without abort", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1000);
+    const { driver, events, release } = harness("pg", async () => {
+      vi.setSystemTime(1026);
+      return [[9]];
+    });
+    const controller = new AbortController();
+    await expect(
+      driver.runTransaction(
+        [{ sql: "UPDATE edits SET amount = 9" }],
+        { signal: controller.signal, deadline: 1025 },
+        options,
+      ),
+    ).rejects.toThrow("deadline exceeded");
+    expect(controller.signal.aborted).toBe(false);
+    expect(events).toEqual(["BEGIN", "DML", "READ", "ROLLBACK"]);
+    expect(release).toHaveBeenCalledExactlyOnceWith();
+  });
+
   it.each(
     engines,
   )("%s honors cancellation between read-back and commit", async (engine) => {
     const controller = new AbortController();
-    const { driver, events } = harness(engine, async () => {
+    const { driver, events, execute, release } = harness(engine, async () => {
       controller.abort(new Error("cancelled during verification"));
       return [[9]];
     });
@@ -354,7 +394,11 @@ describe("transaction-scoped UPDATE verification", () => {
         options,
       ),
     ).rejects.toThrow("cancelled");
-    expect(events).toContain("ROLLBACK");
+    if (engine === "pg") {
+      expect(release).toHaveBeenCalledExactlyOnceWith(true);
+      expect(events).toEqual(["BEGIN", "DML", "READ"]);
+      expect(execute).toHaveBeenCalledTimes(3);
+    } else expect(events).toContain("ROLLBACK");
     expect(events).not.toContain("COMMIT");
   });
 });

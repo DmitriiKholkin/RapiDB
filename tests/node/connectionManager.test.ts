@@ -17,6 +17,7 @@ import type {
   TriggerMeta,
 } from "../../src/extension/dbDrivers/types";
 import { DEFAULT_DRIVER_ENTITY_MANIFEST } from "../../src/extension/dbDrivers/types";
+import { ErdGraphService } from "../../src/extension/services/erdGraphService";
 import {
   createExtensionContextStub,
   FakeConnectionManagerStore,
@@ -71,6 +72,7 @@ interface DriverBehavior {
   getCapabilitiesImpl?: (driver: FakeDriver) => DriverCapabilities;
   entityManifest?: DriverEntityManifest;
   getEntityManifestImpl?: (driver: FakeDriver) => DriverEntityManifest;
+  disconnectImpl?: () => Promise<void>;
 }
 
 const driverBehaviors = new Map<string, DriverBehavior>();
@@ -203,6 +205,8 @@ class FakeDriver implements IDBDriver {
 
   async disconnect(): Promise<void> {
     this.disconnectCalls += 1;
+    const disconnectImpl = driverBehaviors.get(this.config.id)?.disconnectImpl;
+    if (disconnectImpl) await disconnectImpl();
     this.connected = false;
   }
 
@@ -871,6 +875,8 @@ describe("ConnectionManager", () => {
       createExtensionContextStub() as never,
       store,
     );
+    const onDisconnect = vi.fn();
+    manager.onDidDisconnect(onDisconnect);
     await manager.connectTo("conn-1");
     await driverInstances[0]?.disconnect();
 
@@ -889,6 +895,80 @@ describe("ConnectionManager", () => {
 
     reconnectDeferred.resolve();
     await Promise.all([first.promise, second.promise]);
+    expect(manager.isConnected("conn-1")).toBe(true);
+    expect(onDisconnect).not.toHaveBeenCalled();
+    // Internal stale-driver replacement must not masquerade as this final
+    // event: connection-scoped panels should close only for the latter.
+    await manager.disconnectFrom("conn-1");
+    expect(onDisconnect).toHaveBeenCalledExactlyOnceWith("conn-1");
+  });
+
+  it.each([
+    "automatic",
+    "explicit",
+  ] as const)("rejects %s Connect while manual Disconnect is still cleaning up", async (intent) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+      },
+    ]);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo("conn-1");
+    const driver = driverInstances[0];
+    const cleanup = createDeferred<void>();
+    driverBehaviors.set("conn-1", {
+      disconnectImpl: () => {
+        // Real drivers can become disconnected before async pool/worker cleanup
+        // finishes, while the manager has not emitted onDidDisconnect yet.
+        vi.spyOn(driver, "isConnected").mockReturnValue(false);
+        return cleanup.promise;
+      },
+    });
+    const onConnect = vi.fn();
+    const onDisconnect = vi.fn();
+    manager.onDidConnect(onConnect);
+    manager.onDidDisconnect(onDisconnect);
+    const disconnect = manager.disconnectFrom("conn-1");
+    expect(manager.disconnectFrom("conn-1")).toBe(disconnect);
+    await vi.waitFor(() => expect(driver.disconnectCalls).toBe(1));
+    expect(manager.isConnected("conn-1")).toBe(false);
+    expect(onDisconnect).not.toHaveBeenCalled();
+    const epochs = (
+      manager as unknown as {
+        _connectionEpochMap: Map<string, number>;
+      }
+    )._connectionEpochMap;
+    const disconnectEpoch = epochs.get("conn-1");
+
+    await expect(manager.connectTo("conn-1", intent)).rejects.toThrow(
+      "Disconnect in progress",
+    );
+    expect(epochs.get("conn-1")).toBe(disconnectEpoch);
+    expect(manager.isConnecting("conn-1")).toBe(false);
+    expect(driverInstances).toHaveLength(1);
+    cleanup.resolve();
+    await disconnect;
+    expect(onConnect).not.toHaveBeenCalled();
+    expect(onDisconnect).toHaveBeenCalledExactlyOnceWith("conn-1");
+    expect(manager.getDriver("conn-1")).toBeUndefined();
+
+    // The guard covers cleanup only; a deliberate subsequent Connect is valid.
+    driverBehaviors.delete("conn-1");
+    await manager.connectTo("conn-1", "explicit");
+    expect(manager.isConnected("conn-1")).toBe(true);
+    expect(driverInstances).toHaveLength(2);
   });
 
   it("fences stale in-flight connect completion after disconnect", async () => {
@@ -928,6 +1008,114 @@ describe("ConnectionManager", () => {
     expect(manager.isConnected("conn-1")).toBe(false);
     expect(driverInstances).toHaveLength(1);
     expect(driverInstances[0]?.disconnectCalls).toBeGreaterThanOrEqual(1);
+  });
+
+  it.each([
+    { ending: "settles", connecting: false },
+    { ending: "times out", connecting: false },
+    { ending: "settles", connecting: true },
+    { ending: "times out", connecting: true },
+  ])("old replacement cleanup $ending cannot remove a new session (connecting=$connecting)", async ({
+    ending,
+    connecting,
+  }) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const id = "conn-cleanup-owner";
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([createSshPgConfig(id)]);
+    const createSshRuntime = vi.fn(async () => ({
+      transport: {
+        kind: "tcpForward" as const,
+        localHost: "127.0.0.1" as const,
+        localPort: 15433,
+        remoteHost: "db.internal",
+        remotePort: 5432,
+      },
+      verifiedFingerprintSha256:
+        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      dispose: vi.fn(async () => undefined),
+    }));
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+      { createSshRuntime },
+    );
+    await manager.connectTo(id);
+    const oldDriver = driverInstances[0];
+    vi.spyOn(oldDriver, "isConnected").mockReturnValue(false);
+    const firstCleanup = createDeferred<void>();
+    const newConnect = createDeferred<void>();
+    // The first transport teardown waits. The second has already detached its
+    // pool/client and returns immediately, just like Mongo/MSSQL disconnect.
+    const cleanup = vi
+      .fn()
+      .mockImplementationOnce(() => firstCleanup.promise)
+      .mockResolvedValue(undefined);
+    vi.spyOn(oldDriver, "disconnect").mockImplementation(cleanup);
+    const oldAttempt = manager.connectTo(id);
+    await vi.waitFor(() => expect(cleanup).toHaveBeenCalledOnce());
+    await manager.disconnectFrom(id);
+    expect(cleanup).toHaveBeenCalledTimes(2);
+    expect(createSshRuntime.mock.results[0].value).toBeDefined();
+    const oldRuntime = await createSshRuntime.mock.results[0].value;
+    expect(oldRuntime.dispose).toHaveBeenCalledOnce();
+
+    if (connecting)
+      driverBehaviors.set(id, { connectImpl: () => newConnect.promise });
+    const freshAttempt = manager.connectTo(id, "explicit");
+    await vi.waitFor(() => expect(driverInstances).toHaveLength(2));
+    if (!connecting) await freshAttempt;
+    const installedDriver = manager.getDriver(id);
+    const newRuntime = await createSshRuntime.mock.results[1].value;
+    const state = manager as unknown as {
+      sshRuntimeMap: Map<string, unknown>;
+      _connectingMap: Map<string, unknown>;
+      _connectAbortControllerMap: Map<string, unknown>;
+      _schemaCacheMap: Map<string, unknown>;
+      _schemaGenerationMap: Map<string, number>;
+      _schemaExpandedScopeKeyMap: Map<string, Set<string>>;
+      _driverStaticMetadataCache: Map<string, unknown>;
+    };
+    const cache = { newSession: true };
+    const scopes = new Set(["new-session-scope"]);
+    state._schemaCacheMap.set(id, cache);
+    state._schemaGenerationMap.set(id, 77);
+    state._schemaExpandedScopeKeyMap.set(id, scopes);
+    state._driverStaticMetadataCache.set(id, cache);
+    const pending = state._connectingMap.get(id);
+    const controller = state._connectAbortControllerMap.get(id);
+    try {
+      // Crucially, do NOT release both cleanups together. A fresh session (or
+      // its attempt) exists before the first cleanup returns or hits its budget.
+      if (ending === "settles") firstCleanup.resolve();
+      await oldAttempt;
+      expect(state._schemaCacheMap.get(id)).toBe(cache);
+      expect(state._schemaGenerationMap.get(id)).toBe(77);
+      expect(state._schemaExpandedScopeKeyMap.get(id)).toBe(scopes);
+      expect(state._driverStaticMetadataCache.get(id)).toBe(cache);
+      expect(state._connectingMap.get(id)).toBe(pending);
+      expect(state._connectAbortControllerMap.get(id)).toBe(controller);
+      expect(newRuntime.dispose).not.toHaveBeenCalled();
+      if (connecting) {
+        expect(manager.isConnecting(id)).toBe(true);
+        newConnect.resolve();
+        await freshAttempt;
+      }
+      expect(manager.getDriver(id)).toBeDefined();
+      if (!connecting) expect(manager.getDriver(id)).toBe(installedDriver);
+      expect(driverInstances[1].isConnected()).toBe(true);
+      expect(state.sshRuntimeMap.get(id)).toBe(newRuntime);
+      expect(manager.isConnected(id)).toBe(true);
+    } finally {
+      firstCleanup.resolve();
+      newConnect.resolve();
+      await Promise.all([oldAttempt, freshAttempt]);
+      await manager.dispose();
+    }
+    expect(oldRuntime.dispose).toHaveBeenCalledOnce();
+    expect(newRuntime.dispose).toHaveBeenCalledOnce();
   });
 
   it("cleans per-connection runtime maps on disconnect", async () => {
@@ -977,6 +1165,178 @@ describe("ConnectionManager", () => {
     expect(managerState._schemaGenerationMap.has("conn-1")).toBe(false);
     expect(managerState._schemaExpandedScopeKeyMap.has("conn-1")).toBe(false);
     expect(managerState._connectionEpochMap.get("conn-1")).toBe(6);
+  });
+
+  it.each([
+    "cached",
+    "in-flight columns",
+    "in-flight snapshot",
+    "in-flight during teardown",
+  ] as const)("invalidates ERD %s on retained-driver replacement without closing panels", async (mode) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const id = "conn-erd-replacement";
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id,
+        name: "ERD",
+        type: "pg",
+        host: "localhost",
+        database: "main",
+        username: "postgres",
+      },
+    ]);
+    const behavior: DriverBehavior = {
+      listObjectsByScope: {
+        "main.public": [{ name: "users", schema: "public", type: "table" }],
+      },
+      describeTableByScope: {
+        "main.public.users": [
+          {
+            name: "old_column",
+            type: "text",
+            nullable: false,
+            isPrimaryKey: false,
+            isForeignKey: false,
+          },
+        ],
+      },
+    };
+    driverBehaviors.set(id, behavior);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo(id);
+    const oldDriver = driverInstances[0];
+    const snapshot = await manager.getSchemaSnapshotAsync(id);
+    const oldColumns = await oldDriver.describeColumns(
+      "main",
+      "public",
+      "users",
+    );
+    const service = new ErdGraphService(manager);
+    const request = { connectionId: id, database: "main", schema: "public" };
+    const columns = createDeferred<ColumnTypeMeta[]>();
+    const pendingSnapshot = createDeferred<typeof snapshot>();
+    const teardown = createDeferred<void>();
+    let staleAssertion: Promise<unknown> | undefined;
+    let reconnect: Promise<void> | undefined;
+    try {
+      if (mode === "cached") {
+        expect(
+          (await service.getGraph(request)).graph.nodes[0].columns[0].name,
+        ).toBe("old_column");
+        expect((await service.getGraph(request)).fromCache).toBe(true);
+      } else {
+        if (mode !== "in-flight snapshot") {
+          vi.spyOn(oldDriver, "describeColumns").mockImplementationOnce(
+            () => columns.promise,
+          );
+        } else {
+          vi.spyOn(manager, "getSchemaSnapshotAsync").mockImplementationOnce(
+            () => pendingSnapshot.promise,
+          );
+        }
+        staleAssertion = expect(service.getGraph(request)).rejects.toThrow(
+          "Connection changed while the ERD was loading",
+        );
+        if (mode !== "in-flight snapshot") {
+          await vi.waitFor(() =>
+            expect(oldDriver.describeColumns).toHaveBeenCalledOnce(),
+          );
+        }
+      }
+      const onDisconnect = vi.fn();
+      const onInvalidation = vi.fn();
+      manager.onDidDisconnect(onDisconnect);
+      manager.onDidInvalidateConnectionMetadata(onInvalidation);
+      vi.spyOn(oldDriver, "isConnected").mockReturnValue(false);
+      if (mode === "in-flight during teardown") {
+        vi.spyOn(oldDriver, "disconnect").mockImplementationOnce(
+          () => teardown.promise,
+        );
+      }
+      behavior.describeTableByScope = {
+        "main.public.users": [
+          {
+            name: "new_column",
+            type: "text",
+            nullable: false,
+            isPrimaryKey: false,
+            isForeignKey: false,
+          },
+        ],
+      };
+      reconnect = manager.connectTo(id);
+      if (mode === "in-flight during teardown") {
+        await vi.waitFor(() =>
+          expect(oldDriver.disconnect).toHaveBeenCalledOnce(),
+        );
+        columns.resolve(oldColumns);
+        await staleAssertion;
+        expect(onInvalidation.mock.calls).toEqual([[id]]);
+        expect(driverInstances).toHaveLength(1);
+        teardown.resolve();
+      }
+      await reconnect;
+      expect(onDisconnect).not.toHaveBeenCalled();
+      expect(onInvalidation.mock.calls).toEqual([[id], [id]]);
+      // No newer ERD request exists yet. Only the lifecycle invalidation (not
+      // request supersession) can fence these old columns/snapshot results.
+      columns.resolve(oldColumns);
+      pendingSnapshot.resolve(snapshot);
+      await staleAssertion;
+      const fresh = await service.getGraph(request);
+      expect(fresh.fromCache).toBe(false);
+      expect(fresh.graph.nodes[0].columns[0].name).toBe("new_column");
+      const cached = await service.getGraph(request);
+      expect(cached.fromCache).toBe(true);
+      expect(cached.graph.nodes[0].columns[0].name).toBe("new_column");
+    } finally {
+      columns.resolve(oldColumns);
+      pendingSnapshot.resolve(snapshot);
+      teardown.resolve();
+      await staleAssertion;
+      await reconnect;
+      service.dispose();
+      await manager.dispose();
+    }
+  });
+
+  it("bounds a hung driver disconnect and still removes the connection", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    driverBehaviors.set("conn-1", {
+      disconnectImpl: () => new Promise<void>(() => undefined),
+    });
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+      },
+    ]);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo("conn-1");
+
+    await expect(manager.disconnectFrom("conn-1")).resolves.toBeUndefined();
+    expect(manager.isConnected("conn-1")).toBe(false);
+    expect(
+      (manager as unknown as { driverMap: Map<string, unknown> }).driverMap.has(
+        "conn-1",
+      ),
+    ).toBe(false);
   });
 
   it("allows a fresh connect attempt after disconnect fences a stale in-flight attempt", async () => {

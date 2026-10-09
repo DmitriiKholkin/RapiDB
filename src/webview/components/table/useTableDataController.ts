@@ -24,11 +24,13 @@ import {
   buildActiveFilterDrafts,
   DEBOUNCE,
   type FetchSnapshot,
+  type PersistedTableViewState,
   type TableSortState,
 } from "./tableViewHelpers";
 
 interface UseTableDataControllerParams {
   initialPageSize: number;
+  initialView?: PersistedTableViewState | null;
   readOnlyTable: boolean;
   columnsRef: MutableRefObject<ColumnMeta[]>;
   rowsRef: MutableRefObject<Row[]>;
@@ -83,8 +85,34 @@ function buildTableInitSignature(
   });
 }
 
+function reserveTableReadEpoch(previousEpoch: number): number {
+  const vscode = window.__vscode;
+  if (!vscode) throw new Error("Table read identity could not be saved.");
+  const state = vscode.getState<Record<string, unknown>>() ?? {};
+  const savedEpoch =
+    state.tableReadEpoch === undefined ? 0 : state.tableReadEpoch;
+  if (
+    typeof savedEpoch !== "number" ||
+    !Number.isSafeInteger(savedEpoch) ||
+    savedEpoch < 0 ||
+    Math.max(previousEpoch, savedEpoch) >= Number.MAX_SAFE_INTEGER
+  ) {
+    // Never wrap/reset IDs: a delayed host response may still carry an old ID.
+    throw new Error(
+      "Table read identity is invalid or exhausted. Reopen this table in a new panel.",
+    );
+  }
+  const epoch = Math.max(previousEpoch, savedEpoch) + 1;
+  // Reserve synchronously, before a read can reach the host or this mount can
+  // disappear. Keep the high-water mark outside tableDraft/tableView, whose
+  // contents may be cleared or replaced independently.
+  vscode.setState({ ...state, tableReadEpoch: epoch });
+  return epoch;
+}
+
 export function useTableDataController({
   initialPageSize,
+  initialView,
   readOnlyTable: initialReadOnlyTable,
   columnsRef,
   rowsRef,
@@ -108,15 +136,27 @@ export function useTableDataController({
   const [error, setError] = useState<string | null>(null);
   const [readError, setReadError] = useState<string | null>(null);
   const [filterError, setFilterError] = useState<string | null>(null);
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(initialPageSize);
-  const [requestedPage, setRequestedPage] = useState(1);
-  const [requestedPageSize, setRequestedPageSize] = useState(initialPageSize);
-  const [filterDrafts, setFilterDrafts] = useState<FilterDraftMap>({});
+  const [page, setPage] = useState(initialView?.page ?? 1);
+  const [pageSize, setPageSize] = useState(
+    initialView?.pageSize ?? initialPageSize,
+  );
+  const [requestedPage, setRequestedPage] = useState(initialView?.page ?? 1);
+  // Draft edits intend page 1 even before debounce requests that page. Keep
+  // persistence independent of both the displayed page and the live request.
+  const [filterDraftPending, setFilterDraftPending] = useState(false);
+  const intendedPage = filterDraftPending ? 1 : requestedPage;
+  const [requestedPageSize, setRequestedPageSize] = useState(
+    initialView?.pageSize ?? initialPageSize,
+  );
+  const [filterDrafts, setFilterDrafts] = useState<FilterDraftMap>(
+    initialView?.filters ?? {},
+  );
   const [debouncedFilterDrafts, setDebouncedFilterDrafts] =
-    useState<FilterDraftMap>({});
-  const [sort, setSort] = useState<TableSortState>(null);
-  const [requestedSort, setRequestedSort] = useState<TableSortState>(null);
+    useState<FilterDraftMap>(initialView?.filters ?? {});
+  const [sort, setSort] = useState<TableSortState>(initialView?.sort ?? null);
+  const [requestedSort, setRequestedSort] = useState<TableSortState>(
+    initialView?.sort ?? null,
+  );
   const [readOnlyTable, setReadOnlyTable] = useState(initialReadOnlyTable);
   const [colSizes, setColSizes] = useState<Record<string, number>>({});
   const [isInitialized, setIsInitialized] = useState(false);
@@ -136,10 +176,14 @@ export function useTableDataController({
   const debouncedFilterDraftsRef = useRef(debouncedFilterDrafts);
   const initializedRef = useRef(false);
   const fetchEpochRef = useRef(0);
-  const filtersMountedRef = useRef(false);
+  const readIdentityFailedRef = useRef(false);
+  const previousFilterDraftsRef = useRef(filterDrafts);
   const [initTick, setInitTick] = useState(0);
   const readOnlyTableRef = useRef(initialReadOnlyTable);
   const initialPageSizeRef = useRef(initialPageSize);
+  const preserveRestoredViewRef = useRef(
+    initialView !== null && initialView !== undefined,
+  );
   const onTableInitRef = useRef(onTableInit);
   const onReadFailedRef = useRef(onReadFailed);
   const onRowsCommittedRef = useRef(onRowsCommitted);
@@ -152,6 +196,7 @@ export function useTableDataController({
   const metadataBlockedRef = useRef(false);
   const committedColumnNamesRef = useRef<ReadonlySet<string>>(new Set());
   const metadataNeedsReadRef = useRef(false);
+  const connectionInvalidatedRef = useRef(false);
   // A reconciliation read must survive a schema queue (or invalidation of
   // an already-issued read), even while edits/drafts/history are retained.
   const deferredReadRef = useRef(false);
@@ -159,7 +204,30 @@ export function useTableDataController({
   // failure must not unlock writes or replace the retained work before retry.
   const reconciliationFetchIdRef = useRef<number | null>(null);
 
+  const advanceFetchEpoch = useCallback(() => {
+    try {
+      const epoch = reserveTableReadEpoch(fetchEpochRef.current);
+      fetchEpochRef.current = epoch;
+      readIdentityFailedRef.current = false;
+      return epoch;
+    } catch (cause) {
+      readIdentityFailedRef.current = true;
+      fetchSnapshotsRef.current.clear();
+      loadingRef.current = false;
+      setLoading(false);
+      const message =
+        cause instanceof Error
+          ? cause.message
+          : "Table read identity could not be saved.";
+      if (hasCommittedDataRef.current) setReadError(message);
+      else setError(message);
+      onReadFailedRef.current();
+      return null;
+    }
+  }, []);
+
   const retryMetadataRefresh = useCallback(() => {
+    if (connectionInvalidatedRef.current) return;
     const metadata = queuedMetadataRef.current;
     const { busy, hasWork } = metadataStateRef.current();
     if (!metadata) {
@@ -175,8 +243,11 @@ export function useTableDataController({
       return;
     }
     const incompatible =
-      JSON.stringify(pkColsRef.current) !==
-        JSON.stringify(metadata.primaryKeyColumns) ||
+      JSON.stringify(
+        hasCommittedDataRef.current
+          ? pkColsRef.current
+          : pendingPrimaryKeyColumnsRef.current,
+      ) !== JSON.stringify(metadata.primaryKeyColumns) ||
       columnsRef.current.some((column) => {
         const next = metadata.columns.find(
           (candidate) => candidate.name === column.name,
@@ -271,6 +342,7 @@ export function useTableDataController({
   const syncRequestedFilterState = useCallback(
     (nextDrafts: FilterDraftMap) => {
       setFilterError(null);
+      setFilterDraftPending(false);
       setRequestedPage(1);
       setDebouncedFilterDrafts(
         buildActiveFilterDrafts(columnsRef.current, nextDrafts),
@@ -296,14 +368,15 @@ export function useTableDataController({
     if (!initializedRef.current) {
       return;
     }
-    if (queuedMetadataRef.current) {
+    if (queuedMetadataRef.current || connectionInvalidatedRef.current) {
       deferredReadRef.current = true;
       return;
     }
 
     deferredReadRef.current = false;
 
-    const epoch = ++fetchEpochRef.current;
+    const epoch = advanceFetchEpoch();
+    if (epoch === null) return;
     reconciliationFetchIdRef.current = metadataStateRef.current()
       .reconciliationPending
       ? epoch
@@ -332,7 +405,7 @@ export function useTableDataController({
       filters: activeFilters,
       sort: snapshot.sort,
     });
-  }, [columnsRef]);
+  }, [advanceFetchEpoch, columnsRef]);
 
   fetchPageRef.current = fetchPage;
   // Keep callbacks blocked until the committed rows and restored edits render.
@@ -378,18 +451,28 @@ export function useTableDataController({
 
         pendingReadOnlyTableRef.current = nextReadOnlyTable;
 
-        if (intent === "metadataRefresh" && initializedRef.current) {
+        const connectionRefresh = intent === "connectionRefresh";
+        if (connectionRefresh) connectionInvalidatedRef.current = false;
+        if (
+          (intent === "metadataRefresh" || connectionRefresh) &&
+          initializedRef.current
+        ) {
           setReadOnlyTable(nextReadOnlyTable);
-          if (isDuplicateInit && !queuedMetadataRef.current) return;
+          if (
+            !connectionRefresh &&
+            isDuplicateInit &&
+            !queuedMetadataRef.current
+          )
+            return;
           queuedMetadataRef.current = {
             columns: nextColumns,
             primaryKeyColumns,
           };
           metadataBlockedRef.current = true;
           // Invalidate reads issued under the old metadata, without touching mutations.
-          if (fetchSnapshotsRef.current.size > 0)
+          if (connectionRefresh || fetchSnapshotsRef.current.size > 0)
             deferredReadRef.current = true;
-          fetchEpochRef.current += 1;
+          if (advanceFetchEpoch() === null) return;
           fetchSnapshotsRef.current.clear();
           loadingRef.current = false;
           setLoading(false);
@@ -398,6 +481,7 @@ export function useTableDataController({
         }
 
         columnsRef.current = nextColumns;
+        connectionInvalidatedRef.current = false;
         pendingPrimaryKeyColumnsRef.current = primaryKeyColumns;
 
         if (isDuplicateInit) {
@@ -415,7 +499,7 @@ export function useTableDataController({
 
         initializedRef.current = true;
         setIsInitialized(true);
-        fetchEpochRef.current += 1;
+        if (advanceFetchEpoch() === null) return;
         fetchSnapshotsRef.current.clear();
         scrollPreserveRef.current = null;
         colSizesInitedRef.current = false;
@@ -430,19 +514,81 @@ export function useTableDataController({
         committedColumnNamesRef.current = new Set();
         setTotalCount(0);
         clearErrors();
-        setPage(1);
-        setPageSize(initialPageSizeRef.current);
-        setRequestedPage(1);
-        setRequestedPageSize(initialPageSizeRef.current);
+        const restoredView = preserveRestoredViewRef.current
+          ? initialView
+          : null;
+        preserveRestoredViewRef.current = false;
+        const nextPage = restoredView?.page ?? 1;
+        const nextPageSize =
+          restoredView?.pageSize ?? initialPageSizeRef.current;
+        // Persisted names refer to the actual column name, not its position or
+        // a case-folded label. Duplicate names use the same name-based state.
+        const nextSort =
+          restoredView?.sort &&
+          nextColumns.some(
+            (column) => column.name === restoredView.sort?.column,
+          )
+            ? restoredView.sort
+            : null;
+        const nextFilters = Object.fromEntries(
+          Object.entries(restoredView?.filters ?? {}).filter(
+            ([name, draft]) =>
+              draft &&
+              nextColumns.some(
+                (column) =>
+                  column.name === name &&
+                  column.filterOperators.includes(draft.operator) &&
+                  (column.filterable ||
+                    draft.operator === "is_null" ||
+                    draft.operator === "is_not_null"),
+              ),
+          ),
+        );
+        // Keep incomplete/blank user drafts, but do not send them as filters.
+        const nextActiveFilters = buildActiveFilterDrafts(
+          nextColumns,
+          nextFilters,
+        );
+        requestedPageRef.current = nextPage;
+        requestedPageSizeRef.current = nextPageSize;
+        requestedSortRef.current = nextSort;
+        debouncedFilterDraftsRef.current = nextActiveFilters;
+        // Restoration is not a user filter edit: it must not debounce another
+        // read or reset the restored page after the initial fetch.
+        previousFilterDraftsRef.current = nextFilters;
+        setPage(nextPage);
+        setPageSize(nextPageSize);
+        setRequestedPage(nextPage);
+        setRequestedPageSize(nextPageSize);
         setReadOnlyTable(nextReadOnlyTable);
-        setSort(null);
-        setRequestedSort(null);
-        setFilterDrafts({});
-        setDebouncedFilterDrafts({});
+        setSort(nextSort);
+        setRequestedSort(nextSort);
+        setFilterDrafts(nextFilters);
+        setFilterDraftPending(false);
+        setDebouncedFilterDrafts(nextActiveFilters);
         setColSizes({});
 
         onTableInitRef.current();
         setInitTick((tick) => tick + 1);
+      },
+    );
+
+    const unConnectionInvalidated = onMessage(
+      "tableConnectionInvalidated",
+      () => {
+        connectionInvalidatedRef.current = true;
+        queuedMetadataRef.current = null;
+        metadataNeedsReadRef.current = false;
+        metadataBlockedRef.current = true;
+        deferredReadRef.current = true;
+        if (advanceFetchEpoch() === null) return;
+        fetchSnapshotsRef.current.clear();
+        reconciliationFetchIdRef.current = null;
+        loadingRef.current = false;
+        setLoading(false);
+        setSchemaWarning(
+          "Connection changed. Waiting for metadata from the new session.",
+        );
       },
     );
 
@@ -461,12 +607,20 @@ export function useTableDataController({
         totalCount: nextTotalCount,
         executionTimeMs: nextExecutionTimeMs,
       }) => {
-        if (queuedMetadataRef.current) return;
         if (
-          fetchId !== undefined &&
-          (fetchId !== fetchEpochRef.current ||
-            (fetchId === reconciliationFetchIdRef.current &&
-              !fetchSnapshotsRef.current.has(fetchId)))
+          connectionInvalidatedRef.current ||
+          queuedMetadataRef.current ||
+          readIdentityFailedRef.current
+        )
+          return;
+        // Legacy untagged replies cannot prove a reconciliation read. Keep its
+        // terminal response guard separate from ordinary read lifecycle rules.
+        if (
+          fetchId === undefined
+            ? reconciliationFetchIdRef.current !== null
+            : fetchId !== fetchEpochRef.current ||
+              (fetchId === reconciliationFetchIdRef.current &&
+                !fetchSnapshotsRef.current.has(fetchId))
         ) {
           return;
         }
@@ -544,12 +698,13 @@ export function useTableDataController({
       error: string;
       isFilterError?: boolean;
     }>("tableError", ({ fetchId, error: nextError, isFilterError }) => {
-      if (queuedMetadataRef.current) return;
+      if (queuedMetadataRef.current || readIdentityFailedRef.current) return;
       if (
-        fetchId !== undefined &&
-        (fetchId !== fetchEpochRef.current ||
-          (fetchId === reconciliationFetchIdRef.current &&
-            !fetchSnapshotsRef.current.has(fetchId)))
+        fetchId === undefined
+          ? reconciliationFetchIdRef.current !== null
+          : fetchId !== fetchEpochRef.current ||
+            (fetchId === reconciliationFetchIdRef.current &&
+              !fetchSnapshotsRef.current.has(fetchId))
       ) {
         return;
       }
@@ -571,10 +726,11 @@ export function useTableDataController({
     postMessage("ready");
     return () => {
       unInit();
+      unConnectionInvalidated();
       unData();
       unError();
     };
-  }, [columnsRef, mongoIdTypesRef, scrollRef]);
+  }, [advanceFetchEpoch, columnsRef, initialView, mongoIdTypesRef, scrollRef]);
 
   const fetchTrigger = useMemo(
     () =>
@@ -605,13 +761,14 @@ export function useTableDataController({
   }, [fetchPage, fetchTrigger]);
 
   useEffect(() => {
-    if (!filtersMountedRef.current) {
-      filtersMountedRef.current = true;
+    if (previousFilterDraftsRef.current === filterDrafts) {
       return;
     }
+    previousFilterDraftsRef.current = filterDrafts;
 
     const timeoutId = setTimeout(() => {
       setFilterError(null);
+      setFilterDraftPending(false);
       setRequestedPage(1);
       setDebouncedFilterDrafts(
         buildActiveFilterDrafts(columnsRef.current, filterDrafts),
@@ -657,6 +814,7 @@ export function useTableDataController({
           };
         }
 
+        setFilterDraftPending(true);
         if (options?.applyImmediately) {
           syncRequestedFilterState(nextDrafts);
         }
@@ -685,6 +843,7 @@ export function useTableDataController({
     filterError,
     hasCommittedData,
     isInitialized,
+    intendedPage,
     loading,
     page,
     pageSize,
@@ -693,6 +852,7 @@ export function useTableDataController({
     readOnlyTable,
     requestedPage,
     requestedPageSize,
+    requestedSort,
     rows,
     sort,
     totalCount,

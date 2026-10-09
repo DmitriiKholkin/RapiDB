@@ -2,6 +2,25 @@ import { describe, expect, it } from "vitest";
 import { formatQueryResult } from "../../src/extension/utils/queryResultFormatting";
 
 describe("formatQueryResult", () => {
+  it("reports the actual displayed row count when a driver already truncated below the UI limit", () => {
+    const formatted = formatQueryResult(
+      {
+        columns: ["id"],
+        rows: [{ __col_0: 1 }, { __col_0: 2 }],
+        rowCount: 120,
+        executionTimeMs: 12,
+        truncated: true,
+      },
+      100,
+    );
+
+    expect(formatted).toMatchObject({
+      truncated: true,
+      truncatedAt: 2,
+      rows: [{ __col_0: 1 }, { __col_0: 2 }],
+    });
+  });
+
   it("normalizes binary query values to the 0x display prefix", () => {
     const formatted = formatQueryResult(
       {

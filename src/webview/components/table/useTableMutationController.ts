@@ -22,6 +22,7 @@ import type {
 } from "../../types";
 import { onMessage, postMessage } from "../../utils/messaging";
 import type { PasteValidationError } from "../../utils/pasteUtils";
+import { updateWebviewState } from "../../utils/vscodeState";
 import { valueToEditString } from "./EditInput";
 import type {
   StructuredCellDialogState,
@@ -42,14 +43,19 @@ import {
   MAX_DRAFT_ROWS,
   type PendingRestoreEntry,
   type PendingRestoreState,
+  type PersistedTableDraft,
+  type PersistedTableMutation,
   restorePendingEditsSafely,
   rowMutationBlockReason,
   rowPrimaryKeySignature,
+  serializeTableDraft,
   type TableApplyStatus,
 } from "./tableViewHelpers";
 import { useUndoRedoHistory } from "./useUndoRedoHistory";
 
 interface UseTableMutationControllerParams {
+  initialDraft?: PersistedTableDraft | null;
+  tableDraftKey?: string;
   mongoRowIdentity?: boolean;
   canEditRows: boolean;
   loadingRef: MutableRefObject<boolean>;
@@ -68,9 +74,15 @@ interface ReconciliationState {
   kind: "apply" | "delete";
   unknown: boolean;
   verified: boolean;
+  requiresExplicitRead?: boolean;
 }
 
+const RESTORED_MUTATION_WARNING =
+  "A previous table write may have been applied. Refresh and verify before retrying. The initial read may precede a late write; use Refresh again before retrying or reverting.";
+
 export function useTableMutationController({
+  initialDraft,
+  tableDraftKey,
   mongoRowIdentity = false,
   canEditRows,
   loadingRef,
@@ -90,12 +102,34 @@ export function useTableMutationController({
   >([]);
   const [editCell, setEditCell] = useState<EditTarget | null>(null);
   const [applying, setApplying] = useState(false);
-  const [applyStatus, setApplyStatus] = useState<TableApplyStatus | null>(null);
-  const [newRows, setNewRows] = useState<InsertDraftRow[]>([]);
-  const [mutErr, setMutErr] = useState<string | null>(null);
+  const [applyStatus, setApplyStatus] = useState<TableApplyStatus | null>(
+    initialDraft?.mutation?.kind === "apply"
+      ? { tone: "error", message: RESTORED_MUTATION_WARNING }
+      : null,
+  );
+  const [newRows, setNewRows] = useState<InsertDraftRow[]>(
+    initialDraft?.newRows ?? [],
+  );
+  const [mutErr, setMutErr] = useState<string | null>(
+    initialDraft?.mutation?.kind === "delete"
+      ? RESTORED_MUTATION_WARNING
+      : null,
+  );
   const [deleting, setDeleting] = useState(false);
   const [reconciliation, setReconciliationState] =
-    useState<ReconciliationState | null>(null);
+    useState<ReconciliationState | null>(
+      initialDraft?.mutation
+        ? {
+            kind: initialDraft.mutation.kind,
+            unknown: initialDraft.mutation.unknown,
+            verified: false,
+            requiresExplicitRead: true,
+          }
+        : null,
+    );
+  const [persistedMutation, setPersistedMutation] = useState(
+    initialDraft?.mutation,
+  );
   const [mutationPreview, setMutationPreview] =
     useState<TableMutationPreviewPayload | null>(null);
   const [structuredCellDialog, setStructuredCellDialog] =
@@ -104,7 +138,13 @@ export function useTableMutationController({
   const applyPendingSnapshotRef = useRef<PendingEdits>(new Map());
   const applyRowIndexesRef = useRef<number[]>([]);
   const deleteRequestSignaturesRef = useRef<Array<string | null>>([]);
-  const pendingRestoreRef = useRef<PendingRestoreState | null>(null);
+  const pendingRestoreRef = useRef<PendingRestoreState | null>(
+    initialDraft?.restoreState ?? null,
+  );
+  const initialDraftPendingRef = useRef(
+    initialDraft !== null && initialDraft !== undefined,
+  );
+  const didHydrateDraftRef = useRef(false);
   const unresolvedPendingEditsRef = useRef<PendingRestoreEntry[]>([]);
   const selectedRef = useRef(selected);
   const canEditRowsRef = useRef(canEditRows);
@@ -114,10 +154,16 @@ export function useTableMutationController({
     `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
   );
   const activeOperationIdRef = useRef<string | null>(null);
-  const reconciliationRef = useRef<ReconciliationState | null>(null);
+  // Do not resurrect a saved operation ID as an active request: its preview,
+  // sent row indexes and result snapshots belonged to the previous mount.
+  // Late replies cannot release the restored fence; only explicit reads can.
+  const reconciliationRef = useRef<ReconciliationState | null>(reconciliation);
   const setReconciliation = useCallback((state: ReconciliationState | null) => {
     reconciliationRef.current = state;
     setReconciliationState(state);
+    setPersistedMutation(
+      state ? { kind: state.kind, unknown: state.unknown } : undefined,
+    );
   }, []);
   const dismissApplyStatus = useCallback(() => {
     const recovery = reconciliationRef.current;
@@ -159,6 +205,60 @@ export function useTableMutationController({
   selectedRef.current = selected;
   canEditRowsRef.current = canEditRows;
   mutationPreviewRef.current = mutationPreview;
+
+  const persistDraft = useCallback(
+    (
+      mutation?: PersistedTableMutation,
+      edits = pendingEditsRef.current,
+      inserts = newRowsRef.current,
+      unresolved = unresolvedPendingEditsRef.current,
+    ) => {
+      if (!tableDraftKey) return;
+      const restoreState = buildPendingRestoreState(
+        edits,
+        rowsRef.current,
+        pkColsRef.current,
+        mongoIdTypesRef.current,
+        mongoRowIdentity,
+        unresolved,
+      );
+      const hasDraft =
+        restoreState.entries.length > 0 ||
+        inserts.length > 0 ||
+        mutation !== undefined;
+      updateWebviewState((state) => {
+        const next = { ...state };
+        if (hasDraft) {
+          next.tableDraft = serializeTableDraft(
+            tableDraftKey,
+            restoreState,
+            inserts,
+            mutation,
+          );
+        } else {
+          delete next.tableDraft;
+        }
+        return next;
+      });
+    },
+    [mongoRowIdentity, rowsRef, pkColsRef, mongoIdTypesRef, tableDraftKey],
+  );
+
+  useEffect(() => {
+    if (!didHydrateDraftRef.current) return;
+    persistDraft(
+      persistedMutation,
+      pendingEdits,
+      newRows,
+      unresolvedPendingEdits,
+    );
+  }, [
+    persistDraft,
+    persistedMutation,
+    pendingEdits,
+    newRows,
+    unresolvedPendingEdits,
+  ]);
 
   const getRowMutationBlockReason = useCallback(
     (rowIdx: number) =>
@@ -261,7 +361,7 @@ export function useTableMutationController({
         history.clear();
       }
       const recovery = reconciliationRef.current;
-      if (recovery) {
+      if (recovery && !recovery.requiresExplicitRead) {
         // A read does not prove an unknown write has finished. Keep recovery
         // available for another read, but allow only an explicit user retry.
         setReconciliation(
@@ -287,6 +387,7 @@ export function useTableMutationController({
       );
 
       pendingRestoreRef.current = null;
+      didHydrateDraftRef.current = true;
       unresolvedPendingEditsRef.current = restoreResult.unresolved;
       setPending(restoreResult.pendingEdits);
       setUnresolvedPendingEdits(restoreResult.unresolved);
@@ -296,9 +397,11 @@ export function useTableMutationController({
   );
 
   const resetForTableInit = useCallback(() => {
+    const preserveInitialDraft = initialDraftPendingRef.current;
+    initialDraftPendingRef.current = false;
     clearApplyRequestState();
     history.clear();
-    pendingRestoreRef.current = null;
+    if (!preserveInitialDraft) pendingRestoreRef.current = null;
     setPending(new Map());
     unresolvedPendingEditsRef.current = [];
     setUnresolvedPendingEdits([]);
@@ -307,12 +410,14 @@ export function useTableMutationController({
     setDeleting(false);
     setMutationPreview(null);
     setStructuredCellDialog(null);
-    setNewRows([]);
-    setMutErr(null);
-    setApplyStatus(null);
+    if (!preserveInitialDraft) setNewRows([]);
+    if (!preserveInitialDraft) {
+      setMutErr(null);
+      setApplyStatus(null);
+    }
     activeOperationIdRef.current = null;
     deleteRequestSignaturesRef.current = [];
-    setReconciliation(null);
+    if (!preserveInitialDraft) setReconciliation(null);
   }, [clearApplyRequestState, history, setReconciliation]);
 
   useEffect(() => {
@@ -335,6 +440,7 @@ export function useTableMutationController({
         setApplying(false);
 
         if (success) {
+          setReconciliation(null);
           history.clear();
           setNewRows([]);
           const nextPending = getRetainedPendingEdits(
@@ -412,6 +518,7 @@ export function useTableMutationController({
             fetchPageRef.current();
           } else {
             pendingRestoreRef.current = null;
+            setReconciliation(null);
           }
 
           const failureMessage = error ?? "Apply failed";
@@ -532,6 +639,8 @@ export function useTableMutationController({
           );
           preserveScrollPositionRef.current();
           fetchPageRef.current();
+        } else {
+          setReconciliation(null);
         }
       },
     );
@@ -581,7 +690,8 @@ export function useTableMutationController({
       previewToken,
     });
     activeOperationIdRef.current = null;
-  }, [clearApplyRequestState]);
+    setReconciliation(null);
+  }, [clearApplyRequestState, setReconciliation]);
 
   const confirmMutationPreview = useCallback(() => {
     const preview = mutationPreviewRef.current;
@@ -666,6 +776,15 @@ export function useTableMutationController({
     const updates = buildPendingUpdatesPayload(pendingEdits);
     // An empty values object inserts a row using database defaults.
     const insertValues = newRows.map(buildInsertValues);
+    const marker: PersistedTableMutation = {
+      kind: "apply",
+      unknown: true,
+      operationId,
+    };
+    setPersistedMutation(marker);
+    // Write-ahead marker: persist before crossing the webview/host boundary,
+    // including when preview is skipped. A remount cannot replay this request.
+    persistDraft(marker);
     postMessage("applyChanges", {
       operationId,
       updates,
@@ -680,6 +799,7 @@ export function useTableMutationController({
     metadataBlockedRef,
     blockUnsafeRows,
     setReconciliation,
+    persistDraft,
   ]);
 
   const revertChanges = useCallback(() => {
@@ -1314,6 +1434,13 @@ export function useTableMutationController({
     setReconciliation(null);
     const operationId = `table-mutation:${operationEpochRef.current}:${++operationSequenceRef.current}`;
     activeOperationIdRef.current = operationId;
+    const marker: PersistedTableMutation = {
+      kind: "delete",
+      unknown: true,
+      operationId,
+    };
+    setPersistedMutation(marker);
+    persistDraft(marker);
     postMessage("deleteRows", { operationId, primaryKeysList: toDelete });
   }, [
     applying,
@@ -1326,6 +1453,7 @@ export function useTableMutationController({
     metadataBlockedRef,
     blockUnsafeRows,
     setReconciliation,
+    persistDraft,
   ]);
 
   const undoAction = useCallback(() => {
@@ -1452,7 +1580,11 @@ export function useTableMutationController({
           unresolvedPendingEditsRef.current,
         );
       }
-      setReconciliation({ ...recovery, verified: false });
+      setReconciliation({
+        ...recovery,
+        verified: false,
+        requiresExplicitRead: false,
+      });
       preserveScrollPositionRef.current();
       fetchPageRef.current();
       return true;
@@ -1461,7 +1593,9 @@ export function useTableMutationController({
       const recovery = reconciliationRef.current;
       if (!recovery || recovery.verified) {
         // Non-reconciliation reads will retry from the current committed rows.
-        pendingRestoreRef.current = null;
+        // Before the first successful read there are no committed rows: the
+        // saved restore source is the only copy of UPDATE edits and baselines.
+        if (didHydrateDraftRef.current) pendingRestoreRef.current = null;
         return;
       }
       const failedReadMessage =

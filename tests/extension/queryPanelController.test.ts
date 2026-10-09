@@ -445,6 +445,553 @@ describe("QueryPanelController", () => {
     expect(exportQueryResultsAsJson).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { queryText: "UPDATE items SET id = id + 1", affectedRows: 3, refresh: 0 },
+    {
+      queryText: "CREATE TABLE items (id NUMBER)",
+      affectedRows: 0,
+      refresh: 1,
+    },
+  ])("preserves completed Oracle SQL during post-commit cleanup after a no-op Stop: $queryText", async ({
+    queryText,
+    affectedRows,
+    refresh,
+  }) => {
+    const actual = await vi.importActual<
+      typeof import("../../src/extension/utils/queryResultFormatting")
+    >("../../src/extension/utils/queryResultFormatting");
+    formatQueryResult.mockImplementation(actual.formatQueryResult);
+    const result = {
+      columns: [],
+      rows: [],
+      rowCount: affectedRows,
+      affectedRows,
+      executionTimeMs: 7,
+    };
+    let finishRelease!: () => void;
+    const pendingRelease = new Promise<void>((resolve) => {
+      finishRelease = resolve;
+    });
+    let operationActive = true;
+    const committed = vi.fn();
+    const breakOperation = vi.fn();
+    const cancelCurrentOperation = vi.fn(async () => {
+      if (operationActive) breakOperation();
+    });
+    const driver = {
+      query: vi.fn(async () => {
+        committed();
+        try {
+          return result;
+        } finally {
+          // Production Oracle removes the operation before awaiting release.
+          operationActive = false;
+          await pendingRelease;
+        }
+      }),
+      cancelCurrentOperation,
+    };
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "active",
+        name: "Primary",
+        type: "oracle",
+      })),
+      getDriverCapabilities: vi.fn(() => ({ boundedQueryResults: true })),
+      isConnected: vi.fn(() => true),
+      addToHistory: vi.fn(async () => undefined),
+      getDriver: vi.fn(() => driver),
+      getQueryRowLimit: vi.fn(() => 100),
+      refreshSchemaCache: vi.fn(),
+    };
+    const view = {
+      getActiveConnectionId: vi.fn(() => "active"),
+      getInitialConnectionId: vi.fn(() => "active"),
+      getLastQueryResult: vi.fn(() => null),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+    const running = controller.handleMessage({
+      type: "executeQuery",
+      payload: {
+        queryText,
+        operationId: "panel:run:1",
+      },
+    });
+    await vi.waitFor(() => expect(driver.query).toHaveBeenCalledOnce());
+    expect(committed).toHaveBeenCalledOnce();
+    expect(operationActive).toBe(false);
+
+    await controller.handleMessage({
+      type: "cancelQuery",
+      payload: { operationId: "panel:run:1" },
+    });
+
+    expect(cancelCurrentOperation).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: "manual", operationName: "query" }),
+    );
+    expect(breakOperation).not.toHaveBeenCalled();
+    expect(view.postMessage).not.toHaveBeenCalled();
+    finishRelease();
+    await running;
+    expect(view.postMessage).toHaveBeenCalledExactlyOnceWith({
+      type: "queryResult",
+      payload: {
+        ...result,
+        columnMeta: [],
+        truncated: false,
+        truncatedAt: 0,
+        connectionId: "active",
+        operationId: "panel:run:1",
+        requestToken: expect.any(Number),
+      },
+    });
+    expect(view.setLastQueryResult).toHaveBeenCalledExactlyOnceWith({
+      columns: [],
+      columnMeta: [],
+      rows: [],
+      truncated: false,
+      truncatedAt: 0,
+    });
+    expect(connectionManager.refreshSchemaCache).toHaveBeenCalledTimes(refresh);
+    if (refresh) {
+      expect(connectionManager.refreshSchemaCache).toHaveBeenCalledWith(
+        "active",
+      );
+    }
+  });
+
+  it.each([
+    { cancellation: "succeeds", outcome: "error" },
+    { cancellation: "succeeds", outcome: "success" },
+    { cancellation: "fails", outcome: "error" },
+    { cancellation: "fails", outcome: "success" },
+    { cancellation: "times out", outcome: "error" },
+    { cancellation: "times out", outcome: "success" },
+    { cancellation: "unavailable", outcome: "error" },
+    { cancellation: "unavailable", outcome: "success" },
+  ])("preserves the correct $outcome outcome when manual cancellation $cancellation", async ({
+    cancellation,
+    outcome,
+  }) => {
+    const result = {
+      columns: ["id"],
+      rows: [{ __col_0: 1 }],
+      rowCount: 1,
+      executionTimeMs: 1,
+    };
+    let resolveQuery!: (value: typeof result) => void;
+    let rejectQuery!: (error: Error) => void;
+    const pendingQuery = new Promise<typeof result>((resolve, reject) => {
+      resolveQuery = resolve;
+      rejectQuery = reject;
+    });
+    const finishQuery = () => {
+      if (outcome === "error") rejectQuery(new Error("Driver query error"));
+      else resolveQuery(result);
+    };
+    let finishLateCancellation!: () => void;
+    const cancelCurrentOperation = vi.fn(async () => {
+      // Reproduce the driver settling query() before cancel() returns.
+      finishQuery();
+      if (cancellation === "fails") throw new Error("Cancel failed");
+      if (cancellation === "times out") {
+        await new Promise<void>((resolve) => {
+          finishLateCancellation = resolve;
+        });
+      }
+    });
+    const driver = {
+      query: vi.fn(() => pendingQuery),
+      ...(cancellation === "unavailable" ? {} : { cancelCurrentOperation }),
+    };
+    const connectionManager = {
+      getConnection: () => ({ id: "active", name: "Primary", type: "pg" }),
+      isConnected: () => true,
+      addToHistory: vi.fn(async () => undefined),
+      getDriver: () => driver,
+      getQueryRowLimit: () => 100,
+    };
+    const view = {
+      getActiveConnectionId: () => "active",
+      getInitialConnectionId: () => "active",
+      getLastQueryResult: () => null,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+    const running = controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText: "select 1", operationId: "manual:1" },
+    });
+    await vi.waitFor(() => expect(driver.query).toHaveBeenCalledOnce());
+    vi.useFakeTimers();
+    try {
+      const cancelling = controller.handleMessage({
+        type: "cancelQuery",
+        payload: { operationId: "manual:1" },
+      });
+      if (cancellation === "unavailable") finishQuery();
+      if (cancellation === "times out") {
+        await vi.advanceTimersByTimeAsync(1500);
+      }
+      await cancelling;
+      await running;
+      expect(view.postMessage).toHaveBeenCalledOnce();
+      expect(view.postMessage).toHaveBeenCalledWith({
+        type: "queryResult",
+        payload: expect.objectContaining({
+          operationId: "manual:1",
+          connectionId: "active",
+          ...(outcome === "error"
+            ? {
+                error:
+                  cancellation === "succeeds"
+                    ? "[RapiDB] Query failed after a cancellation request. Driver query error The operation outcome may be unknown; cancellation does not confirm rollback."
+                    : "Driver query error",
+              }
+            : result),
+        }),
+      });
+      expect(showWarningMessage).toHaveBeenCalledTimes(
+        cancellation === "succeeds" ? 0 : 1,
+      );
+      if (cancellation === "times out") {
+        // A late acknowledgement must not cancel or overwrite the next run.
+        let finishNextQuery!: (value: typeof result) => void;
+        driver.query.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finishNextQuery = resolve;
+            }),
+        );
+        const nextRun = controller.handleMessage({
+          type: "executeQuery",
+          payload: { queryText: "select 2", operationId: "manual:2" },
+        });
+        await vi.waitFor(() => expect(driver.query).toHaveBeenCalledTimes(2));
+        finishLateCancellation();
+        await Promise.resolve();
+        await controller.handleMessage({
+          type: "cancelQuery",
+          payload: { operationId: "manual:1" },
+        });
+        expect(cancelCurrentOperation).toHaveBeenCalledOnce();
+        expect(view.postMessage).toHaveBeenCalledOnce();
+        finishNextQuery(result);
+        await nextRun;
+        expect(view.postMessage).toHaveBeenCalledTimes(2);
+        expect(view.postMessage).toHaveBeenLastCalledWith({
+          type: "queryResult",
+          payload: expect.objectContaining({
+            ...result,
+            operationId: "manual:2",
+          }),
+        });
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    "during cancellation",
+    "after acknowledgement",
+  ])("preserves SQLite unknown-outcome and session-loss diagnostics %s", async (timing) => {
+    const driverError = new Error(
+      "[RapiDB] SQLite operation cancelled (manual) The active SQLite request outcome is unknown (OUTCOME_UNKNOWN); if it contained a write, it may have partially or fully persisted. Refresh and verify before retrying. SQLite execution process was stopped and the connection is closed. Uncommitted transactions are rolled back. ATTACH, temporary tables and session state are lost; in-memory databases are lost. Use Connect to reconnect explicitly before continuing (:memory: starts a new empty database). Completed statements may have persisted; refresh file data before retrying.",
+    );
+    Object.assign(driverError, {
+      code: "OUTCOME_UNKNOWN",
+      executionState: "unknown",
+    });
+    const originalMessage = driverError.message;
+    let rejectQuery!: (error: Error) => void;
+    const pendingQuery = new Promise<never>((_resolve, reject) => {
+      rejectQuery = reject;
+    });
+    let acknowledgeCancellation!: () => void;
+    const pendingCancellation = new Promise<void>((resolve) => {
+      acknowledgeCancellation = resolve;
+    });
+    const driver = {
+      query: vi.fn(() => pendingQuery),
+      cancelCurrentOperation: vi.fn(async () => {
+        if (timing === "during cancellation") rejectQuery(driverError);
+        await pendingCancellation;
+      }),
+    };
+    const connectionManager = {
+      getConnection: () => ({ id: "sqlite", name: "SQLite", type: "sqlite" }),
+      getDriverCapabilities: () => ({ boundedQueryResults: true }),
+      isConnected: () => true,
+      addToHistory: vi.fn(async () => undefined),
+      getDriver: () => driver,
+      getQueryRowLimit: () => 100,
+    };
+    const view = {
+      getActiveConnectionId: () => "sqlite",
+      getInitialConnectionId: () => "sqlite",
+      getLastQueryResult: () => null,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+    const running = controller.handleMessage({
+      type: "executeQuery",
+      payload: {
+        queryText: "UPDATE items SET id = id + 1",
+        operationId: "sqlite:write",
+      },
+    });
+    await vi.waitFor(() => expect(driver.query).toHaveBeenCalledOnce());
+    const cancelling = controller.handleMessage({
+      type: "cancelQuery",
+      payload: { operationId: "sqlite:write" },
+    });
+    await vi.waitFor(() =>
+      expect(driver.cancelCurrentOperation).toHaveBeenCalledOnce(),
+    );
+    expect(view.postMessage).not.toHaveBeenCalled();
+    acknowledgeCancellation();
+    await cancelling;
+    if (timing === "after acknowledgement") rejectQuery(driverError);
+    await running;
+    expect(view.postMessage).toHaveBeenCalledExactlyOnceWith({
+      type: "queryResult",
+      payload: expect.objectContaining({
+        connectionId: "sqlite",
+        operationId: "sqlite:write",
+        error: `[RapiDB] Query failed after a cancellation request. ${originalMessage} The operation outcome may be unknown; cancellation does not confirm rollback.`,
+      }),
+    });
+    expect(view.setLastQueryResult).not.toHaveBeenCalled();
+    expect(driverError.message).toBe(originalMessage);
+    expect(showWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("keeps a superseding operation live when the old query and manual cancellation settle late", async () => {
+    const result = {
+      columns: ["id"],
+      rows: [{ __col_0: 2 }],
+      rowCount: 1,
+      executionTimeMs: 1,
+    };
+    let rejectOldQuery!: (error: Error) => void;
+    const oldQuery = new Promise<typeof result>((_resolve, reject) => {
+      rejectOldQuery = reject;
+    });
+    let resolveNewQuery!: (value: typeof result) => void;
+    const newQuery = new Promise<typeof result>((resolve) => {
+      resolveNewQuery = resolve;
+    });
+    let acknowledgeOldCancellation!: () => void;
+    const oldCancellation = new Promise<void>((resolve) => {
+      acknowledgeOldCancellation = resolve;
+    });
+    const driver = {
+      query: vi
+        .fn()
+        .mockReturnValueOnce(oldQuery)
+        .mockReturnValueOnce(newQuery),
+      cancelCurrentOperation: vi
+        .fn(async (): Promise<void> => undefined)
+        .mockImplementationOnce(() => oldCancellation),
+    };
+    const connectionManager = {
+      getConnection: () => ({ id: "active", name: "Primary", type: "pg" }),
+      isConnected: () => true,
+      addToHistory: vi.fn(async () => undefined),
+      getDriver: () => driver,
+      getQueryRowLimit: () => 100,
+    };
+    const view = {
+      getActiveConnectionId: () => "active",
+      getInitialConnectionId: () => "active",
+      getLastQueryResult: () => null,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+    const oldRun = controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText: "select 1", operationId: "old" },
+    });
+    await vi.waitFor(() => expect(driver.query).toHaveBeenCalledOnce());
+    const cancellingOld = controller.handleMessage({
+      type: "cancelQuery",
+      payload: { operationId: "old" },
+    });
+    const newRun = controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText: "select 2", operationId: "new" },
+    });
+    await vi.waitFor(() => expect(driver.query).toHaveBeenCalledTimes(2));
+    rejectOldQuery(new Error("Old driver failure (OUTCOME_UNKNOWN)"));
+    acknowledgeOldCancellation();
+    await cancellingOld;
+    await oldRun;
+    expect(view.postMessage).not.toHaveBeenCalled();
+    await controller.handleMessage({
+      type: "cancelQuery",
+      payload: { operationId: "old" },
+    });
+    expect(driver.cancelCurrentOperation).toHaveBeenCalledTimes(2);
+    // The old query's finally must not remove the new cancellation handle.
+    await controller.handleMessage({
+      type: "cancelQuery",
+      payload: { operationId: "new" },
+    });
+    expect(driver.cancelCurrentOperation).toHaveBeenCalledTimes(3);
+    expect(driver.cancelCurrentOperation).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        reason: "manual",
+        requestToken: driver.query.mock.calls[1][2].requestToken,
+      }),
+    );
+    resolveNewQuery(result);
+    await newRun;
+    expect(view.postMessage).toHaveBeenCalledExactlyOnceWith({
+      type: "queryResult",
+      payload: expect.objectContaining({ ...result, operationId: "new" }),
+    });
+  });
+
+  it("cancels a query request that is still waiting for its connection", async () => {
+    let finishConnect!: () => void;
+    const pendingConnect = new Promise<void>((resolve) => {
+      finishConnect = resolve;
+    });
+    const query = vi.fn(async () => ({
+      columns: [],
+      rows: [],
+      rowCount: 0,
+      executionTimeMs: 1,
+    }));
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "active",
+        name: "Primary",
+        type: "pg",
+      })),
+      getDriverCapabilities: vi.fn(() => undefined),
+      isConnected: vi.fn(() => false),
+      connectTo: vi.fn(() => pendingConnect),
+      addToHistory: vi.fn(async () => undefined),
+      getDriver: vi.fn(() => ({ query })),
+      getQueryRowLimit: vi.fn(() => 100),
+    };
+    const view = {
+      getActiveConnectionId: vi.fn(() => "active"),
+      getInitialConnectionId: vi.fn(() => "active"),
+      getLastQueryResult: vi.fn(() => null),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+    const running = controller.handleMessage({
+      type: "executeQuery",
+      payload: {
+        queryText: "select 1",
+        operationId: "panel:connect:1",
+      },
+    });
+    await vi.waitFor(() =>
+      expect(connectionManager.connectTo).toHaveBeenCalledOnce(),
+    );
+
+    await controller.handleMessage({
+      type: "cancelQuery",
+      payload: { operationId: "panel:connect:1" },
+    });
+
+    expect(view.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "queryResult",
+        payload: expect.objectContaining({
+          operationId: "panel:connect:1",
+          error: "[RapiDB] Query cancelled.",
+        }),
+      }),
+    );
+    finishConnect();
+    await running;
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it("requires explicit confirmation before exporting a truncated query result", async () => {
+    showWarningMessage.mockResolvedValue("Export displayed rows");
+    const cached = {
+      columns: ["id"],
+      rows: [{ __col_0: 1 }],
+      truncated: true,
+      truncatedAt: 100,
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController({} as never, {
+      getActiveConnectionId: () => "active",
+      getInitialConnectionId: () => "active",
+      getLastQueryResult: () => cached,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    });
+
+    await controller.handleMessage({ type: "exportResultsCSV" });
+
+    expect(showWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining("only the first 1 displayed row"),
+      { modal: true },
+      "Export displayed rows",
+    );
+    expect(exportQueryResultsAsCsv).toHaveBeenCalledOnce();
+  });
+
   it("applies SQL hard cap before driver.query when configured row limit exceeds safety policy", async () => {
     const query = vi.fn(async () => ({
       columns: ["id"],
@@ -634,7 +1181,7 @@ describe("QueryPanelController", () => {
           rowCount: 100,
           affectedRows: 100,
           truncated: true,
-          truncatedAt: 10,
+          truncatedAt: 1,
         }),
       }),
     );

@@ -53,6 +53,8 @@ export interface QueryPanelCachedResult {
   columns: string[];
   columnMeta?: QueryColumnMeta[];
   rows: Record<string, unknown>[];
+  truncated?: boolean;
+  truncatedAt?: number;
 }
 
 interface QueryPanelView {
@@ -65,6 +67,13 @@ interface QueryPanelView {
   syncTitle(): void;
 }
 
+interface ActiveQueryExecution extends QueryExecutionCancellationHandle {
+  operationId?: string;
+  cancelRequested?: boolean;
+  cancellationPending?: Promise<void>;
+  queryStarted: boolean;
+}
+
 export class QueryPanelController {
   private schemaRequestToken = 0;
 
@@ -72,7 +81,7 @@ export class QueryPanelController {
 
   private readonly activeQueryExecutions = new Map<
     string,
-    QueryExecutionCancellationHandle
+    ActiveQueryExecution
   >();
 
   constructor(
@@ -118,6 +127,11 @@ export class QueryPanelController {
             parsed.payload.connectionId,
             parsed.payload.operationId,
           );
+        }
+        break;
+      case "cancelQuery":
+        if (parsed.payload) {
+          await this.handleCancelQuery(parsed.payload.operationId);
         }
         break;
       case "getConnections":
@@ -270,10 +284,26 @@ export class QueryPanelController {
     }
     const cappedQueryText = rewrite.queryText;
 
+    const pendingExecution: ActiveQueryExecution = {
+      requestToken,
+      connectionId,
+      operationName: "query",
+      operationId,
+      supportsCancellation: false,
+      queryStarted: false,
+      cancel: async () => undefined,
+    };
+    this.activeQueryExecutions.set(connectionId, pendingExecution);
+
     if (!this.connectionManager.isConnected(connectionId)) {
       try {
         await this.connectionManager.connectTo(connectionId, "automatic");
       } catch (error: unknown) {
+        const active = this.activeQueryExecutions.get(connectionId);
+        if (active?.requestToken === requestToken) {
+          this.activeQueryExecutions.delete(connectionId);
+        }
+        if (!this.isCurrentQueryRequest(requestToken)) return;
         const normalized = normalizeUnknownError(error, connection);
         this.postQueryError(
           `Cannot connect: ${normalized.message}`,
@@ -285,11 +315,19 @@ export class QueryPanelController {
     }
 
     if (!this.isCurrentQueryRequest(requestToken)) {
+      const active = this.activeQueryExecutions.get(connectionId);
+      if (active?.requestToken === requestToken) {
+        this.activeQueryExecutions.delete(connectionId);
+      }
       return;
     }
 
     const driver = this.connectionManager.getDriver(connectionId);
     if (!driver) {
+      const active = this.activeQueryExecutions.get(connectionId);
+      if (active?.requestToken === requestToken) {
+        this.activeQueryExecutions.delete(connectionId);
+      }
       this.postQueryError(
         `[RapiDB] Cannot execute query: driver is unavailable for ${connectionId}.`,
         requestToken,
@@ -300,7 +338,12 @@ export class QueryPanelController {
 
     this.activeQueryExecutions.set(
       connectionId,
-      this.createQueryExecutionHandle(connectionId, requestToken, driver),
+      this.createQueryExecutionHandle(
+        connectionId,
+        requestToken,
+        driver,
+        operationId,
+      ),
     );
 
     if (!this.isCurrentQueryRequest(requestToken)) {
@@ -324,9 +367,16 @@ export class QueryPanelController {
         ...(driverBounded ? { hardCap: hardCapProbeLimit } : {}),
         ...(connection?.readOnly === true ? { readOnly: true } : {}),
       });
+      const activeExecution = this.activeQueryExecutions.get(connectionId);
+      if (activeExecution?.requestToken === requestToken) {
+        await activeExecution.cancellationPending;
+      }
       if (!this.isCurrentQueryRequest(requestToken)) {
         return;
       }
+      // A cancellation acknowledgement may be a no-op after SQL completed
+      // (for example, while Oracle releases its session). Trust query()'s
+      // successful outcome, including schema invalidation, rather than Stop.
       const formattedResult = formatQueryResult(result, effectiveRowLimit);
       const schemaDialect: QueryEditorSqlDialect =
         this.connectionManager.getDriverCapabilities?.(connectionId)
@@ -342,13 +392,30 @@ export class QueryPanelController {
         columns: formattedResult.columns,
         columnMeta: formattedResult.columnMeta,
         rows: formattedResult.rows,
+        truncated: formattedResult.truncated,
+        truncatedAt: formattedResult.truncatedAt,
       });
       this.view.postMessage({
         type: "queryResult",
         payload: { ...formattedResult, ...resultIdentity },
       });
     } catch (error: unknown) {
+      const activeExecution = this.activeQueryExecutions.get(connectionId);
+      if (activeExecution?.requestToken === requestToken) {
+        await activeExecution.cancellationPending;
+      }
       const normalized = normalizeUnknownError(error, connection);
+      if (
+        activeExecution?.requestToken === requestToken &&
+        activeExecution.cancelRequested
+      ) {
+        this.postQueryError(
+          `[RapiDB] Query failed after a cancellation request. ${normalized.message} The operation outcome may be unknown; cancellation does not confirm rollback.`,
+          requestToken,
+          resultIdentity,
+        );
+        return;
+      }
       this.postQueryError(normalized.message, requestToken, resultIdentity);
     } finally {
       const active = this.activeQueryExecutions.get(connectionId);
@@ -367,7 +434,8 @@ export class QueryPanelController {
         context?: OperationCancellationContext,
       ) => void | Promise<void>;
     },
-  ): QueryExecutionCancellationHandle {
+    operationId?: string,
+  ): ActiveQueryExecution {
     const supportsCancellation =
       typeof driver.cancelCurrentOperation === "function";
 
@@ -375,6 +443,8 @@ export class QueryPanelController {
       requestToken,
       connectionId,
       operationName: "query",
+      operationId,
+      queryStarted: true,
       supportsCancellation,
       cancel: async (context: OperationCancellationContext) => {
         if (!supportsCancellation) {
@@ -391,12 +461,92 @@ export class QueryPanelController {
     };
   }
 
+  private async handleCancelQuery(operationId: string): Promise<void> {
+    const execution = [...this.activeQueryExecutions.values()].find(
+      (candidate) => candidate.operationId === operationId,
+    );
+    if (!execution) return;
+    if (!execution.queryStarted) {
+      execution.cancelRequested = true;
+      this.postQueryError("[RapiDB] Query cancelled.", execution.requestToken, {
+        connectionId: execution.connectionId,
+        operationId: execution.operationId,
+        requestToken: execution.requestToken,
+      });
+      if (this.queryRequestToken === execution.requestToken) {
+        this.queryRequestToken = ++nextQueryRequestToken;
+      }
+      const current = this.activeQueryExecutions.get(execution.connectionId);
+      if (current?.requestToken === execution.requestToken) {
+        this.activeQueryExecutions.delete(execution.connectionId);
+      }
+      return;
+    }
+    if (!execution.supportsCancellation) {
+      void vscode.window.showWarningMessage(
+        "[RapiDB] This database driver does not support cancelling the running query. It may continue until completion or timeout.",
+      );
+      return;
+    }
+
+    if (execution.cancelRequested) return;
+    // Drivers may reject query() from inside cancel(). Record intent first,
+    // but defer publishing its outcome until cancellation succeeds or fails.
+    execution.cancelRequested = true;
+    let finishCancellation!: () => void;
+    execution.cancellationPending = new Promise<void>((resolve) => {
+      finishCancellation = resolve;
+    });
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        execution
+          .cancel({
+            reason: "manual",
+            operationName: execution.operationName,
+            connectionId: execution.connectionId,
+            requestToken: execution.requestToken,
+          })
+          .then(() => "cancelled" as const),
+        new Promise<"timed-out">((resolve) => {
+          timeoutHandle = setTimeout(
+            () => resolve("timed-out"),
+            SUPERSEDED_QUERY_CANCEL_TIMEOUT_MS,
+          );
+        }),
+      ]);
+      if (result !== "cancelled") {
+        execution.cancelRequested = false;
+        void vscode.window.showWarningMessage(
+          "[RapiDB] Query cancellation did not complete in time; the query may still be running.",
+        );
+        return;
+      }
+    } catch (error: unknown) {
+      execution.cancelRequested = false;
+      logger.error("Failed to cancel query execution", error);
+      void vscode.window.showWarningMessage(
+        "[RapiDB] Query cancellation failed; the query may still be running.",
+      );
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      execution.cancellationPending = undefined;
+      finishCancellation();
+    }
+  }
+
   private async cancelSupersededQueryExecution(
     connectionId: string,
     supersededByRequestToken: number,
   ): Promise<boolean> {
     const previous = this.activeQueryExecutions.get(connectionId);
     if (!previous) {
+      return true;
+    }
+
+    if (!previous.queryStarted) {
+      previous.cancelRequested = true;
+      this.activeQueryExecutions.delete(connectionId);
       return true;
     }
 
@@ -587,6 +737,17 @@ export class QueryPanelController {
     const cached = this.getCachedResultForExport();
     if (!cached) {
       return;
+    }
+
+    if (cached.truncated) {
+      const exportSample = "Export displayed rows";
+      const displayedRowCount = cached.rows.length;
+      const confirmation = await vscode.window.showWarningMessage(
+        `[RapiDB] This query result was truncated. The export will contain only the first ${displayedRowCount.toLocaleString()} displayed ${displayedRowCount === 1 ? "row" : "rows"}, not the full result.`,
+        { modal: true },
+        exportSample,
+      );
+      if (confirmation !== exportSample) return;
     }
 
     const columnIds = new Set(cached.columns.map((_, i) => colKey(i)));

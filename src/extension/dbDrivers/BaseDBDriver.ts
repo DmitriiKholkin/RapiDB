@@ -1724,10 +1724,16 @@ export abstract class BaseDBDriver implements IDBDriver {
       };
     }
     if (operator === "eq") {
-      return { sql: `CAST(${col} AS CHAR) LIKE ?`, params: [`%${val}%`] };
+      return {
+        sql: `CAST(${col} AS CHAR) LIKE ? ESCAPE '!'`,
+        params: [literalContainsPattern(val)],
+      };
     }
     if (operator === "neq") {
-      return { sql: `CAST(${col} AS CHAR) NOT LIKE ?`, params: [`%${val}%`] };
+      return {
+        sql: `CAST(${col} AS CHAR) NOT LIKE ? ESCAPE '!'`,
+        params: [literalContainsPattern(val)],
+      };
     }
     if (operator === "in") {
       const parts = val.split(",").map((s) => s.trim());

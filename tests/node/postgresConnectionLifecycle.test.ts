@@ -167,6 +167,224 @@ describe("B01 PostgreSQL pending connection lifecycle", () => {
     expect(pool.end).toHaveBeenCalledOnce();
   });
 
+  it("cancels and discards an active query client before closing the pool", async () => {
+    const { pool, client } = createPool();
+    const pendingQuery = deferred<never>();
+    const driver = createDriver();
+    await driver.connect();
+    client.query.mockReturnValue(pendingQuery.promise);
+    const query = driver.query("SELECT pg_sleep(60)");
+    const rejected = expect(query).rejects.toThrow();
+    await flushMicrotasks();
+
+    await driver.disconnect();
+
+    expect(client.release).toHaveBeenCalledWith(true);
+    expect(pool.end).toHaveBeenCalledOnce();
+    pendingQuery.reject(new Error("socket closed"));
+    await rejected;
+  });
+
+  it("stops waiting for a pending pool checkout when cancelling a query and discards a late client", async () => {
+    const { pool, client } = createPool();
+    const driver = createDriver();
+    await driver.connect();
+    const lateClient = {
+      query: vi.fn(async () => ({ rows: [{ name: "late" }] })),
+      release: vi.fn(),
+    };
+    const acquisition = deferred<typeof lateClient>();
+    pool.connect.mockReturnValueOnce(acquisition.promise);
+    const query = driver.query("SELECT 1", undefined, { requestToken: 84 });
+    const rejected = expect(query).rejects.toThrow(/cancelled/i);
+    await vi.waitFor(() => expect(pool.connect).toHaveBeenCalledTimes(2));
+
+    await driver.cancelCurrentOperation({
+      reason: "manual",
+      operationName: "query",
+      requestToken: 84,
+    });
+    await rejected;
+    expect(client.query).toHaveBeenCalledTimes(1);
+    expect(lateClient.query).not.toHaveBeenCalled();
+    expect(lateClient.release).not.toHaveBeenCalled();
+
+    acquisition.resolve(lateClient);
+    await flushMicrotasks();
+    expect(lateClient.release).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
+  it("discards an active transaction client on disconnect without trying to roll back a dead socket", async () => {
+    const { pool, client } = createPool();
+    const driver = createDriver();
+    await driver.connect();
+    const pendingStatement = deferred<never>();
+    client.query
+      .mockReset()
+      .mockResolvedValueOnce({ rows: [] })
+      .mockReturnValueOnce(pendingStatement.promise);
+    const transaction = driver.runTransaction([
+      { sql: "SELECT pg_sleep(60)", params: [] },
+    ] as never);
+    const rejected = expect(transaction).rejects.toThrow();
+    await flushMicrotasks();
+
+    await driver.disconnect();
+
+    expect(client.release).toHaveBeenCalledWith(true);
+    expect(pool.end).toHaveBeenCalledOnce();
+    pendingStatement.reject(new Error("socket closed"));
+    await rejected;
+    expect(client.query).not.toHaveBeenCalledWith("ROLLBACK");
+  });
+
+  it.each(
+    ["disconnect", "cancel"].flatMap((action) =>
+      ["begin", "mutation", "identity", "verification"].map((stage) => ({
+        action,
+        stage,
+      })),
+    ),
+  )("$action fences late successful $stage without a transaction context", async ({
+    action,
+    stage,
+  }) => {
+    const { client } = createPool();
+    const driver = createDriver();
+    await driver.connect();
+    client.release.mockClear();
+    const result = { rows: [{ __col_0: 9 }], rowCount: 1 };
+    const pendingStatement = deferred<typeof result>();
+    const pauseSql = {
+      begin: "BEGIN",
+      mutation: "UPDATE edits SET amount = 9",
+      identity: "SELECT identity",
+      verification: "SELECT amount",
+    }[stage];
+    client.query
+      .mockReset()
+      .mockImplementation(((sql: string) =>
+        sql === pauseSql
+          ? pendingStatement.promise
+          : Promise.resolve(result)) as never);
+    const transaction = driver.runTransaction(
+      [
+        {
+          sql: "UPDATE edits SET amount = 9",
+          captureIdentity: { sql: "SELECT identity" },
+        },
+        { sql: "UPDATE another SET amount = 9" },
+      ],
+      undefined,
+      {
+        verifications: [
+          {
+            rowIndex: 0,
+            sql: "SELECT amount",
+            params: [],
+            values: [],
+          },
+          { rowIndex: 1, sql: "SELECT another", params: [], values: [] },
+        ],
+      },
+    );
+    const rejected = expect(transaction).rejects.toThrow(/cancelled/i);
+    await flushMicrotasks();
+    expect(client.query).toHaveBeenCalledWith(
+      pauseSql,
+      ...(stage === "begin" ? [] : [[]]),
+    );
+    if (action === "disconnect") await driver.disconnect();
+    else
+      await driver.cancelCurrentOperation({
+        reason: "manual",
+        operationName: "runTransaction",
+      });
+    const sqlCountAtCancellation = client.query.mock.calls.length;
+    expect(client.release).toHaveBeenCalledExactlyOnceWith(true);
+    pendingStatement.resolve(result);
+    await rejected;
+    expect(client.query).toHaveBeenCalledTimes(sqlCountAtCancellation);
+    expect(client.query).not.toHaveBeenCalledWith("COMMIT");
+    expect(client.query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(client.release).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
+  it.each(
+    ["query", "transaction"].flatMap((kind) =>
+      [
+        "late success",
+        "late failure",
+        "resolve then cancel",
+        "cancel then resolve",
+      ].map((settlement) => ({ kind, settlement })),
+    ),
+  )("$kind checkout handles $settlement with exactly one discard and no SQL", async ({
+    kind,
+    settlement,
+  }) => {
+    const { pool } = createPool();
+    const driver = createDriver();
+    await driver.connect();
+    const lateClient = { query: vi.fn(), release: vi.fn() };
+    const acquisition = deferred<typeof lateClient>();
+    pool.connect.mockReturnValueOnce(acquisition.promise);
+    const controller = new AbortController();
+    const pending =
+      kind === "query"
+        ? driver.query("SELECT 1", undefined, { requestToken: 85 })
+        : driver.runTransaction([{ sql: "UPDATE edits SET amount = 9" }], {
+            signal: controller.signal,
+            deadline: Date.now() + 10000,
+          });
+    const rejected = expect(pending).rejects.toThrow(/cancelled/i);
+    await flushMicrotasks();
+    expect(pool.connect).toHaveBeenCalledTimes(2);
+    if (settlement === "resolve then cancel") acquisition.resolve(lateClient);
+    const cancel = () =>
+      kind === "query"
+        ? driver.cancelCurrentOperation({
+            reason: "manual",
+            operationName: "query",
+            requestToken: 85,
+          })
+        : controller.abort(new Error("transaction cancelled"));
+    const cancellation = cancel();
+    if (settlement === "cancel then resolve") acquisition.resolve(lateClient);
+    await cancellation;
+    await rejected;
+    if (settlement.startsWith("late")) {
+      expect(lateClient.release).not.toHaveBeenCalled();
+      if (settlement === "late failure")
+        acquisition.reject(new Error("checkout failed"));
+      else acquisition.resolve(lateClient);
+    }
+    await flushMicrotasks();
+    expect(lateClient.query).not.toHaveBeenCalled();
+    if (settlement === "late failure")
+      expect(lateClient.release).not.toHaveBeenCalled();
+    else expect(lateClient.release).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
+  it("handles cancellation during a synchronously throwing pool checkout without an unhandled rejection", async () => {
+    const { pool } = createPool();
+    const driver = createDriver();
+    await driver.connect();
+    pool.connect.mockImplementationOnce(() => {
+      void driver.cancelCurrentOperation({
+        reason: "manual",
+        operationName: "query",
+        requestToken: 86,
+      });
+      throw new Error("synchronous checkout failure");
+    });
+    await expect(
+      driver.query("SELECT 1", undefined, { requestToken: 86 }),
+    ).rejects.toThrow(/checkout/);
+    // Vitest reports orphaned cancellation promises as unhandled errors.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  });
+
   it.each([
     "success",
     "failure",

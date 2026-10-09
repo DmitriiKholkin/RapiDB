@@ -63,6 +63,7 @@ export interface MockVscodeState {
   withProgress: ReturnType<typeof vi.fn>;
   writeClipboard: ReturnType<typeof vi.fn>;
   createWebviewPanel: ReturnType<typeof vi.fn>;
+  registerWebviewPanelSerializer: ReturnType<typeof vi.fn>;
   panels: MockWebviewPanel[];
   treeViews: MockTreeView[];
 }
@@ -190,6 +191,7 @@ export function createMockVscodeModule(): {
       panels.push(panel);
       return panel;
     }),
+    registerWebviewPanelSerializer: vi.fn(() => ({ dispose: vi.fn() })),
     panels,
     treeViews,
   };
@@ -203,6 +205,7 @@ export function createMockVscodeModule(): {
       window: {
         createTreeView: state.createTreeView,
         createWebviewPanel: state.createWebviewPanel,
+        registerWebviewPanelSerializer: state.registerWebviewPanelSerializer,
         showInputBox: state.showInputBox,
         showInformationMessage: state.showInformationMessage,
         showWarningMessage: state.showWarningMessage,

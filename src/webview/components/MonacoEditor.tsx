@@ -158,6 +158,7 @@ export interface MonacoEditorHandle {
   getValue(): string;
   getSelectionOrValue(): string;
   setValue(v: string): void;
+  clearValue(): void;
 
   format(dialect?: string): string | null;
   focus(): void;
@@ -409,6 +410,16 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         return editor.getValue() ?? "";
       },
       setValue: (v) => editorRef.current?.setValue(v),
+      clearValue: () => {
+        const editor = editorRef.current;
+        const model = editor?.getModel();
+        if (!editor || !model || model.getValueLength() === 0) return;
+        editor.pushUndoStop();
+        editor.executeEdits("rapidb-clear-query", [
+          { range: model.getFullModelRange(), text: "" },
+        ]);
+        editor.pushUndoStop();
+      },
       format: (requestedDialect?: string) => {
         const editor = editorRef.current;
         if (!editor || editor.getOption(monaco.editor.EditorOption.readOnly)) {

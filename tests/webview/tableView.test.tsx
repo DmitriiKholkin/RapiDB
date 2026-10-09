@@ -100,7 +100,12 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
 });
 
 import { TableView } from "../../src/webview/components/TableView";
-import { DEBOUNCE } from "../../src/webview/components/table/tableViewHelpers";
+import {
+  DEBOUNCE,
+  parsePersistedTableDraft,
+  parsePersistedTableViewState,
+  serializeTableDraft,
+} from "../../src/webview/components/table/tableViewHelpers";
 import { useTableMutationController } from "../../src/webview/components/table/useTableMutationController";
 import { CELL_PREVIEW_LIMIT } from "../../src/webview/utils/cellPreview";
 import {
@@ -113,6 +118,73 @@ import {
 } from "./testUtils";
 
 let activeTableMutationOperationId: string | undefined;
+
+describe("table draft persistence", () => {
+  const tableKey = JSON.stringify(["conn", "db", "schema", "items"]);
+
+  it("round-trips pending edits and inserted rows as serializable state", () => {
+    const source = {
+      entries: [
+        {
+          originalSignature: JSON.stringify([["id", 7]]),
+          changes: new Map<string, unknown>([["name", "updated"]]),
+        },
+      ],
+    };
+    const serialized = serializeTableDraft(tableKey, source, [
+      {
+        name: { value: "new item" },
+        id: { value: "__RAPIDB_INSERT_DEFAULT__" },
+      },
+    ]);
+    const jsonSafe = JSON.parse(JSON.stringify(serialized)) as unknown;
+    const restored = parsePersistedTableDraft(jsonSafe, tableKey);
+
+    expect(restored?.restoreState.entries[0]?.changes).toEqual(
+      new Map([["name", "updated"]]),
+    );
+    expect(restored?.newRows).toEqual([
+      {
+        name: { value: "new item" },
+        id: { value: "__RAPIDB_INSERT_DEFAULT__" },
+      },
+    ]);
+    expect(parsePersistedTableDraft(jsonSafe, "another-table")).toBeNull();
+  });
+
+  it("restores bounded page, sorting, and valid filter state", () => {
+    expect(
+      parsePersistedTableViewState(
+        {
+          tableKey,
+          page: 3,
+          pageSize: 100,
+          sort: { column: "id", direction: "desc" },
+          filters: { name: { operator: "like", value: "%literal%" } },
+        },
+        tableKey,
+      ),
+    ).toEqual({
+      tableKey,
+      page: 3,
+      pageSize: 100,
+      sort: { column: "id", direction: "desc" },
+      filters: { name: { operator: "like", value: "%literal%" } },
+    });
+    expect(
+      parsePersistedTableViewState(
+        {
+          tableKey,
+          page: 0,
+          pageSize: 10_000,
+          sort: null,
+          filters: {},
+        },
+        tableKey,
+      ),
+    ).toBeNull();
+  });
+});
 
 function captureTableMutationOperationId(): void {
   const payload = getRawLastPostedMessage()?.payload;

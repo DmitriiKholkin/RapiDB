@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const vscodeMock = vi.hoisted(() => {
+  const serializers = new Map<string, unknown>();
   const createWebviewPanel = vi.fn(() => {
     const disposeListeners = new Set<() => void>();
     const messageListeners = new Set<
@@ -44,13 +45,22 @@ const vscodeMock = vi.hoisted(() => {
     };
     return panel;
   });
+  const registerWebviewPanelSerializer = vi.fn(
+    (viewType: string, serializer: unknown) => {
+      serializers.set(viewType, serializer);
+      return { dispose: vi.fn() };
+    },
+  );
 
   return {
     createWebviewPanel,
+    registerWebviewPanelSerializer,
+    serializers,
     module: {
       ViewColumn: { One: 1 },
       window: {
         createWebviewPanel,
+        registerWebviewPanelSerializer,
       },
       workspace: {
         onDidChangeConfiguration: vi.fn(() => ({ dispose: vi.fn() })),
@@ -103,6 +113,7 @@ function createEventSource<T>() {
 describe("QueryPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vscodeMock.serializers.clear();
   });
 
   it("preserves driver-owned formatOnOpen defaults when no explicit override is provided", async () => {
@@ -164,6 +175,151 @@ describe("QueryPanel", () => {
       },
     });
     expect(initialState.formatOnOpen).toBeUndefined();
+  });
+
+  it.each([
+    "qp_42",
+    "qp_701acb27-3ee6-4ff9-8424-477d65022fb2",
+  ])("restores serialized query panel %s using retained webview state", async (panelId) => {
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+      })),
+      getQueryEditorPresentation: vi.fn(() => undefined),
+      onDidSchemaLoad: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+      getConnections: vi.fn(() => []),
+    };
+    const { QueryPanel } = await import(
+      "../../src/extension/panels/queryPanel"
+    );
+    QueryPanel.disposeAll();
+    QueryPanel.registerSerializer(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+    );
+    const serializer = vscodeMock.serializers.get("rapidb.queryPanel") as {
+      deserializeWebviewPanel(panel: unknown, state: unknown): Promise<void>;
+    };
+    const panel = vscodeMock.createWebviewPanel();
+
+    await serializer.deserializeWebviewPanel(panel, {
+      initialState: {
+        view: "query",
+        panelId,
+        connectionId: "conn-1",
+        queryText: "select 1",
+        initialSql: "select 1",
+      },
+      queryDraft: {
+        panelId,
+        text: "select 2",
+        activeConnectionId: "conn-1",
+      },
+    });
+
+    expect(panel.webview.html).toBe("<html></html>");
+    expect(connectionManager.getConnection).toHaveBeenCalledWith("conn-1");
+    panel.dispose();
+    QueryPanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+    );
+    expect(vscodeMock.createWebviewPanel).toHaveBeenCalledTimes(2);
+    QueryPanel.disposeAll();
+  });
+
+  it.each([
+    "new",
+    "restored",
+  ])("keeps both panels registered when a legacy panel restores lazily and %s closes first", async (closedFirst) => {
+    // Simulate a restarted host: no serializer has reserved legacy qp_1 yet.
+    vi.resetModules();
+    const context = { extensionUri: {} } as never;
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "conn-lazy",
+        name: "Primary",
+        type: "pg",
+      })),
+      getQueryEditorPresentation: vi.fn(() => undefined),
+      onDidSchemaLoad: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+    const { createWebviewShell } = await import(
+      "../../src/extension/panels/webviewShell"
+    );
+    const { QueryPanel } = await import(
+      "../../src/extension/panels/queryPanel"
+    );
+    QueryPanel.registerSerializer(context, connectionManager as never);
+    const newInstance = QueryPanel.createOrShow(
+      context,
+      connectionManager as never,
+      "conn-lazy",
+    );
+    const newPanel = createdPanel();
+    const newPanelId = (
+      createWebviewShell as ReturnType<typeof vi.fn>
+    ).mock.calls.at(-1)?.[0]?.initialState?.panelId;
+    expect(newPanelId).toMatch(/^qp_[0-9a-f]{8}-[0-9a-f-]{27}$/);
+    const serializer = vscodeMock.serializers.get("rapidb.queryPanel") as {
+      deserializeWebviewPanel(panel: unknown, state: unknown): Promise<void>;
+    };
+    const restoredPanel = vscodeMock.createWebviewPanel();
+    await serializer.deserializeWebviewPanel(restoredPanel, {
+      initialState: {
+        panelId: "qp_1",
+        connectionId: "conn-lazy",
+        queryText: "select 1",
+      },
+      queryDraft: {
+        panelId: "qp_1",
+        text: "select 2",
+        activeConnectionId: "conn-lazy",
+      },
+    });
+    expect(createWebviewShell).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        initialState: expect.objectContaining({
+          panelId: "qp_1",
+          queryText: "select 1",
+        }),
+      }),
+    );
+    expect(
+      QueryPanel.createOrShow(context, connectionManager as never, "conn-lazy"),
+    ).toBe(newInstance);
+    expect(newPanel.reveal).toHaveBeenCalledOnce();
+    expect(vscodeMock.createWebviewPanel).toHaveBeenCalledTimes(2);
+
+    const firstPanel = closedFirst === "new" ? newPanel : restoredPanel;
+    const remainingPanel = closedFirst === "new" ? restoredPanel : newPanel;
+    const remainingDispose = vi.spyOn(remainingPanel, "dispose");
+    firstPanel.dispose();
+    const remainingInstance = QueryPanel.createOrShow(
+      context,
+      connectionManager as never,
+      "conn-lazy",
+    );
+    expect(remainingPanel.reveal).toHaveBeenCalledWith(1);
+    expect(vscodeMock.createWebviewPanel).toHaveBeenCalledTimes(2);
+    if (closedFirst === "new") expect(remainingInstance).not.toBe(newInstance);
+    else expect(remainingInstance).toBe(newInstance);
+    QueryPanel.disposeAll();
+    expect(remainingDispose).toHaveBeenCalledOnce();
+    expect(
+      QueryPanel.createOrShow(context, connectionManager as never, "conn-lazy"),
+    ).not.toBe(remainingInstance);
+    expect(vscodeMock.createWebviewPanel).toHaveBeenCalledTimes(3);
+    QueryPanel.disposeAll();
   });
 
   it("passes editor language overrides through the webview initial state", async () => {

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ColumnTypeMeta as ColumnMeta } from "../../shared/tableTypes";
 import type { Row } from "../types";
 import { postMessage } from "../utils/messaging";
+import { readWebviewState, updateWebviewState } from "../utils/vscodeState";
 import { GridLoadingOverlay } from "./GridOverlay";
 import { TableDialogs } from "./table/TableDialogs";
 import type { ExportFormat } from "./table/TableExportActions";
@@ -15,6 +16,8 @@ import { TableToolbar } from "./table/TableToolbar";
 import {
   getInitialPageSize,
   INSERT_DEFAULT_SENTINEL,
+  parsePersistedTableDraft,
+  parsePersistedTableViewState,
   type TableSortState,
 } from "./table/tableViewHelpers";
 import { useTableDataController } from "./table/useTableDataController";
@@ -43,6 +46,9 @@ function resolveTableExportMessageType(format: ExportFormat) {
 }
 
 export function TableView({
+  connectionId,
+  database,
+  schema,
   table,
   displayTableName = table,
   isView = false,
@@ -51,6 +57,14 @@ export function TableView({
   defaultPageSize,
 }: Props) {
   const initialPageSize = getInitialPageSize(defaultPageSize);
+  const tableDraftKey = JSON.stringify([connectionId, database, schema, table]);
+  const [restoredState] = useState(() => {
+    const persisted = readWebviewState<Record<string, unknown>>({});
+    return {
+      draft: parsePersistedTableDraft(persisted.tableDraft, tableDraftKey),
+      view: parsePersistedTableViewState(persisted.tableView, tableDraftKey),
+    };
+  });
   const effectiveReadOnly = isView || connectionReadOnly;
   const columnsRef = useRef<ColumnMeta[]>([]);
   const rowsRef = useRef<Row[]>([]);
@@ -93,6 +107,7 @@ export function TableView({
 
   const data = useTableDataController({
     initialPageSize,
+    initialView: restoredState.view,
     readOnlyTable: effectiveReadOnly,
     columnsRef,
     rowsRef,
@@ -119,6 +134,8 @@ export function TableView({
   const canSelectAndDeleteRows = !data.readOnlyTable && hasPrimaryKey;
 
   const mutation = useTableMutationController({
+    initialDraft: restoredState.draft,
+    tableDraftKey,
     mongoRowIdentity,
     canEditRows,
     loadingRef: data.loadingRef,
@@ -138,6 +155,27 @@ export function TableView({
   mutationBridgeRef.current.handleReadFailed = mutation.handleReadFailed;
   mutationBridgeRef.current.getMetadataRefreshState =
     mutation.getMetadataRefreshState;
+
+  useEffect(() => {
+    if (!data.hasCommittedData) return;
+    updateWebviewState((state) => ({
+      ...state,
+      tableView: {
+        tableKey: tableDraftKey,
+        page: data.intendedPage,
+        pageSize: data.requestedPageSize,
+        sort: data.requestedSort,
+        filters: data.filterDrafts,
+      },
+    }));
+  }, [
+    data.filterDrafts,
+    data.hasCommittedData,
+    data.intendedPage,
+    data.requestedPageSize,
+    data.requestedSort,
+    tableDraftKey,
+  ]);
 
   // Retry deferred metadata only after mutation/editor state has committed.
   useEffect(() => {

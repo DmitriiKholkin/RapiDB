@@ -70,7 +70,13 @@ function harness(
   const rollback = vi.fn(async () => {
     events.push("ROLLBACK");
   });
-  const release = vi.fn();
+  let released = false;
+  const release = vi.fn(() => {
+    if (engine === "pg") {
+      expect(released).toBe(false);
+      released = true;
+    }
+  });
   const cancel = vi.fn(async () => undefined);
   const stored = new Map<number, unknown>();
   const execute = vi.fn(
@@ -79,6 +85,8 @@ function harness(
       params: unknown[] = [],
       executeOptions?: oracledb.ExecuteOptions,
     ) => {
+      if (engine === "pg" && released)
+        throw new Error("SQL on a released PostgreSQL client");
       const sql = typeof input === "string" ? input : input.sql;
       if (typeof input !== "string") params = input.values ?? [];
       statements.push(sql);
@@ -295,6 +303,7 @@ function harness(
     outsideQuery,
     cancel,
     execute,
+    release,
     stored,
   };
 }
@@ -526,6 +535,24 @@ describe("INSERT verification contracts (B02)", () => {
     expect(plan.verification).toBeUndefined();
     expect(plan.operation.sql).toMatch(/DEFAULT/);
     expect(service).toBeDefined();
+  });
+
+  it("rejects Oracle inserts when there are no insertable columns instead of emitting unsupported DEFAULT VALUES", () => {
+    const { driver } = harness("oracle");
+    const computedOnlyColumns = columns.map((column) => ({
+      ...column,
+      generatedKind: "virtual" as const,
+    }));
+    expect(() =>
+      buildInsertRowOperation(
+        driver,
+        "target",
+        "public",
+        "edits",
+        {},
+        computedOnlyColumns,
+      ),
+    ).toThrow(/Oracle insert failed: the table has no insertable columns/);
   });
 
   it("rejects MySQL generated identities without an AUTO_INCREMENT primary key before mutation", async () => {
@@ -764,7 +791,13 @@ describe("INSERT verification contracts (B02)", () => {
     const wait = new Promise<void>((resolve) => {
       finish = resolve;
     });
-    const { driver: raw, prepare, events } = harness(engine, false, () => wait);
+    const {
+      driver: raw,
+      prepare,
+      events,
+      execute,
+      release,
+    } = harness(engine, false, () => wait);
     const plan = await prepare({ id: 3, amount: "1.25" });
     if (!plan.verification) throw new Error("Expected INSERT verification");
     const driver = createTimeoutAwareDriver(raw, () => ({
@@ -780,9 +813,16 @@ describe("INSERT verification contracts (B02)", () => {
     const rejection = expect(pending).rejects.toThrow(/outcome may be unknown/);
     await vi.advanceTimersByTimeAsync(25);
     await rejection;
+    expect(events).toContain("VERIFY");
+    const sqlCountAtTimeout = execute.mock.calls.length;
+    if (engine === "pg") expect(release).toHaveBeenCalledExactlyOnceWith(true);
     finish();
     await vi.runAllTimersAsync();
     expect(events).not.toContain("COMMIT");
-    expect(events).toContain("ROLLBACK");
+    if (engine === "pg") {
+      expect(events).not.toContain("ROLLBACK");
+      expect(execute).toHaveBeenCalledTimes(sqlCountAtTimeout);
+      expect(release).toHaveBeenCalledExactlyOnceWith(true);
+    } else expect(events).toContain("ROLLBACK");
   });
 });

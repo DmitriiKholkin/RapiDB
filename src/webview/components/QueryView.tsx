@@ -52,6 +52,7 @@ export function QueryView({
         selectedConnectionId={view.activeConnectionId}
         status={view.status}
         onBookmark={view.handleBookmark}
+        onCancel={view.cancelQuery}
         onClear={view.clearQuery}
         onConnectionChange={view.handleConnectionChange}
         onFormat={view.formatQuery}
@@ -62,7 +63,7 @@ export function QueryView({
         editorHeight={view.editorHeight}
         editorLabel={view.editorState.editorLabel}
         editorRef={view.editorRef}
-        initialQueryText={initialQueryText}
+        initialQueryText={view.editorInitialValue}
         isResizing={view.isResizing}
         language={view.editorState.monacoLanguage}
         result={view.result}

@@ -163,6 +163,26 @@ describe("H1 shared builders and dialect edge cases", () => {
     ).toEqual(expected);
   });
 
+  it.each([
+    "eq",
+    "neq",
+  ] as const)("treats percent, underscore, and the escape character literally for BaseDBDriver %s filters", (operator) => {
+    const driver = new MySQLDriver({ ...config, type: "mysql" });
+    const value = "!%_";
+    expect(
+      BaseDBDriver.prototype.buildFilterCondition.call(
+        driver,
+        column(),
+        operator,
+        value,
+        1,
+      ),
+    ).toEqual({
+      sql: `CAST(${driver.quoteIdentifier("value")} AS CHAR) ${operator === "eq" ? "LIKE" : "NOT LIKE"} ? ESCAPE '!'`,
+      params: [literalContainsPattern(value)],
+    });
+  });
+
   it("keeps text IN values unchanged, including %, _, and backslashes", () => {
     for (const [, createDriver] of drivers) {
       const meta = column();

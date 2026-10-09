@@ -7,8 +7,11 @@ import {
   buildPendingRestoreState,
   buildUndoRedoSnapshot,
   INSERT_DEFAULT_SENTINEL,
+  parsePersistedTableDraft,
+  parsePersistedTableViewState,
   restorePendingEdits,
   restorePendingEditsSafely,
+  serializeTableDraft,
 } from "../../src/webview/components/table/tableViewHelpers";
 import type {
   EditTarget,
@@ -36,6 +39,71 @@ function row(col: string, value: unknown): InsertDraftRow {
 function rows(...cols: Array<[string, unknown]>): InsertDraftRow[] {
   return cols.map(([c, v]) => row(c, v));
 }
+
+describe("prototype-named persisted columns", () => {
+  it.each([
+    {},
+    { valueUndefined: false },
+    { valueUndefined: "true" },
+  ])("rejects a cell without a value or explicit undefined marker (%j)", (cell) => {
+    expect(
+      parsePersistedTableDraft(
+        {
+          tableKey: "table",
+          restoreState: { entries: [] },
+          newRows: [{ ["__proto__"]: cell }],
+        },
+        "table",
+      ),
+    ).toBeNull();
+  });
+
+  it("retains own __proto__ edit changes and concurrency baselines", () => {
+    const original = { nested: "original" };
+    const state = buildPendingRestoreState(
+      pendingEditsFrom([[0, { ["__proto__"]: "Pending" }]]),
+      [{ id: 1, ["__proto__"]: original }],
+      ["id"],
+    );
+    const parsed = parsePersistedTableDraft(
+      JSON.parse(JSON.stringify(serializeTableDraft("table", state, []))),
+      "table",
+    );
+    expect(parsed?.restoreState.entries[0].changes.get("__proto__")).toBe(
+      "Pending",
+    );
+    expect(
+      parsed?.restoreState.entries[0].originalValues?.get("__proto__"),
+    ).toEqual(original);
+    const conflicted = restorePendingEditsSafely(
+      parsed?.restoreState ?? null,
+      [{ id: 1, ["__proto__"]: { nested: "concurrent" } }],
+      ["id"],
+    );
+    expect(conflicted.pendingEdits.size).toBe(0);
+    expect(conflicted.unresolved).toHaveLength(1);
+  });
+
+  it.each([
+    { operator: "eq", value: "scalar" },
+    { operator: "between", value: ["a", "b"] },
+    { operator: "is_null" },
+  ])("retains __proto__ as an own persisted filter (%j)", (filter) => {
+    const parsed = parsePersistedTableViewState(
+      {
+        tableKey: "table",
+        page: 1,
+        pageSize: 25,
+        sort: null,
+        filters: { ["__proto__"]: filter },
+      },
+      "table",
+    );
+    expect(Object.hasOwn(parsed?.filters ?? {}, "__proto__")).toBe(true);
+    expect(parsed?.filters.__proto__).toEqual(filter);
+    expect(Object.getPrototypeOf(parsed?.filters)).toBe(Object.prototype);
+  });
+});
 
 describe("MongoDB pending edit restoration", () => {
   it("keeps edits on the BSON-typed row when string and ObjectId keys look identical", () => {
@@ -362,11 +430,19 @@ describe("snapshot round-trip", () => {
     ).entries;
     const snapshot = buildUndoRedoSnapshot(new Map(), [], null, unresolved);
     unresolved[0].changes.set("name", "Mutated source");
+    unresolved[0].originalValues?.set("name", "Mutated baseline");
     const restored = applyUndoRedoSnapshot(snapshot);
     expect(restored.unresolvedPendingEdits[0].changes.get("name")).toBe(
       "First edit",
     );
+    expect(restored.unresolvedPendingEdits[0].originalValues?.get("name")).toBe(
+      "Bob",
+    );
     restored.unresolvedPendingEdits[0].changes.set("name", "Mutated restore");
+    restored.unresolvedPendingEdits[0].originalValues?.set(
+      "name",
+      "Mutated restored baseline",
+    );
     expect(snapshot.unresolvedPendingEdits[0].changes.get("name")).toBe(
       "First edit",
     );
@@ -382,10 +458,20 @@ describe("snapshot round-trip", () => {
       [{ id: 3 }, { id: 2 }],
       ["id"],
     );
-    expect(recovered.pendingEdits).toEqual(
+    // PK identity alone is insufficient: a missing edited column cannot
+    // replace the historical concurrency baseline with undefined.
+    expect(recovered.pendingEdits.size).toBe(0);
+    expect(recovered.unresolved).toHaveLength(1);
+    expect(recovered.unresolved[0].originalValues?.get("name")).toBe("Bob");
+    const matchingBaseline = restorePendingEditsSafely(
+      { entries: recovered.unresolved },
+      [{ id: 3 }, { id: 2, name: "Bob" }],
+      ["id"],
+    );
+    expect(matchingBaseline.pendingEdits).toEqual(
       pendingEditsFrom([[1, { name: "First edit" }]]),
     );
-    expect(recovered.unresolved).toEqual([]);
+    expect(matchingBaseline.unresolved).toEqual([]);
   });
 
   it("building and applying a snapshot produces equivalent data", () => {
