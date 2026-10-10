@@ -225,7 +225,80 @@ afterEach(async () => {
 });
 
 describe("B01 PostgreSQL database scope (mock pools)", () => {
-  it("releases once when cancellation rejects a pending read-only rollback", async () => {
+  it.each([
+    "T",
+    "E",
+  ])("rolls back writable query status %s before releasing the client", async (status) => {
+    const pool = poolFor("a");
+    const client = {
+      query: vi.fn(async (input: string | { text: string }) =>
+        (pool.query as (input: unknown) => Promise<unknown>)(input),
+      ),
+      release: vi.fn(),
+      getTransactionStatus: vi.fn(() => status),
+    };
+    pool.connect.mockResolvedValueOnce(client);
+    await expect(
+      driver.query("BEGIN; UPDATE items SET amount = 99"),
+    ).rejects.toThrow(/unfinished transaction.*rolled back/);
+    expect(
+      client.query.mock.calls.map(([input]) =>
+        typeof input === "string" ? input : input.text,
+      ),
+    ).toEqual(["BEGIN; UPDATE items SET amount = 99", "ROLLBACK"]);
+    expect(client.release).toHaveBeenCalledExactlyOnceWith();
+    expect(client.query.mock.invocationCallOrder.at(-1)).toBeLessThan(
+      client.release.mock.invocationCallOrder[0],
+    );
+  });
+
+  it.each([
+    "I",
+    null,
+    undefined,
+  ])("safely releases writable query status %s", async (status) => {
+    const pool = poolFor("a");
+    const client = {
+      query: vi.fn(async (input: string | { text: string }) =>
+        (pool.query as (input: unknown) => Promise<unknown>)(input),
+      ),
+      release: vi.fn(),
+      ...(status === undefined ? {} : { getTransactionStatus: () => status }),
+    };
+    pool.connect.mockResolvedValueOnce(client);
+    await driver.query("SELECT 1");
+    expect(
+      client.query.mock.calls.some(([input]) => input === "ROLLBACK"),
+    ).toBe(status !== "I");
+    expect(client.release).toHaveBeenCalledExactlyOnceWith();
+  });
+
+  it.each([
+    "I",
+    "T",
+    "E",
+    null,
+  ])("preserves query errors and discards even a stale status %s", async (status) => {
+    const pool = poolFor("a");
+    const queryError = new Error("original SQL failure");
+    const client = {
+      query: vi.fn().mockRejectedValue(queryError),
+      release: vi.fn(),
+      getTransactionStatus: vi.fn(() => status),
+    };
+    pool.connect.mockResolvedValueOnce(client);
+    await expect(driver.query("BEGIN; SELECT invalid")).rejects.toBe(
+      queryError,
+    );
+    expect(client.release).toHaveBeenCalledExactlyOnceWith(true);
+    expect(client.query).toHaveBeenCalledOnce();
+    expect(client.getTransactionStatus).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    true,
+    false,
+  ])("releases once when cancellation rejects a pending query rollback (readOnly: %s)", async (readOnly) => {
     const pool = poolFor("a");
     const query = pool.query as (...args: unknown[]) => Promise<unknown>;
     const rollbackStarted = deferred<void>();
@@ -255,7 +328,7 @@ describe("B01 PostgreSQL database scope (mock pools)", () => {
       activeQueryClients: Set<unknown>;
     };
     const pending = driver.query("SELECT * FROM items", [], {
-      readOnly: true,
+      readOnly,
       requestToken: 44,
     });
     const rejected = expect(pending).rejects.toMatchObject({

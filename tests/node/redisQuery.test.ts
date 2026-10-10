@@ -690,7 +690,7 @@ describe("RedisDriver — metadata and pages", () => {
       expect.arrayContaining([
         "EVAL",
         expect.stringContaining("local ttl = redis.call('PTTL', source)"),
-        "2",
+        "3",
         "list:activity:recent",
         "list:activity:recent",
         "list",

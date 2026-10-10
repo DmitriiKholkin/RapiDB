@@ -129,9 +129,9 @@ class FakeRedis {
       const value = store.get(source);
       if (!value) return 0;
       if (source !== target && store.has(target)) return -1;
-      if (args[7] === "1") value.value = JSON.parse(args[8]);
-      if (args[9] === "set") value.ttl = Number(args[10]);
-      if (args[9] === "persist") value.ttl = -1;
+      if (args[8] === "1") value.value = JSON.parse(args[9]);
+      if (args[10] === "set") value.ttl = Number(args[11]);
+      if (args[10] === "persist") value.ttl = -1;
       store.delete(source);
       store.set(target, value);
       return 1;

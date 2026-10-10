@@ -1183,6 +1183,7 @@ export class PostgresDriver extends BaseDBDriver {
     let queryFailed = false;
     let rollbackError: unknown;
     let rollbackFailed = false;
+    let unfinishedTransaction = false;
     try {
       const pool = this.requirePool(operationContext?.database);
       client = await this.acquirePoolClient(operation, pool, () => {
@@ -1266,23 +1267,28 @@ export class PostgresDriver extends BaseDBDriver {
     } catch (error) {
       queryFailed = true;
       queryError = error;
-      // A read timeout can fire before ReadyForQuery. Never return that socket
-      // to the pool while the server is still emitting the timed-out result.
-      if (
-        hardCap !== undefined &&
-        client &&
-        this.activeQueryClients.delete(client)
-      )
+      // Both ErrorResponse and client-side timeouts can reject before
+      // ReadyForQuery updates the transaction status. Discard every failed
+      // query's socket rather than pooling a client with a stale idle status.
+      if (client && this.activeQueryClients.delete(client))
         client.release(true);
     } finally {
       try {
-        if (
-          client &&
-          this.activeQueryClients.has(client) &&
-          operationContext?.readOnly
-        ) {
+        if (client && this.activeQueryClients.has(client)) {
+          // pg 8.21 exposes the server's ReadyForQuery status; @types/pg has
+          // not caught up yet. Never infer transaction state from SQL text.
+          const status = (
+            client as PoolClient & {
+              getTransactionStatus?: () => string | null;
+            }
+          ).getTransactionStatus?.();
+          unfinishedTransaction =
+            !operationContext?.readOnly && (status === "T" || status === "E");
           try {
-            await client.query("ROLLBACK");
+            // Unknown state (including older clients) must also be cleaned up.
+            if (operationContext?.readOnly || status !== "I") {
+              await client.query("ROLLBACK");
+            }
           } catch (error) {
             // Cancellation may already have discarded this client while rollback
             // was pending. Only the owner that removes it may release it.
@@ -1304,10 +1310,15 @@ export class PostgresDriver extends BaseDBDriver {
     if (rollbackFailed) {
       throw new AggregateError(
         queryFailed ? [queryError, rollbackError] : [rollbackError],
-        "PostgreSQL read-only query rollback failed; the connection was discarded.",
+        "PostgreSQL query rollback failed; the connection was discarded.",
       );
     }
     if (queryFailed) throw queryError;
+    if (unfinishedTransaction) {
+      throw new Error(
+        "PostgreSQL query left an unfinished transaction; it was rolled back. Execute BEGIN and COMMIT in the same query script.",
+      );
+    }
     return output as QueryResult;
   }
   override getCapabilities() {

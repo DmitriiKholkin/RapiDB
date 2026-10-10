@@ -581,6 +581,33 @@ function decideMongoReadOnlyQuery(queryText: string) {
   }
 }
 
+function isMongoIntegerType(nativeType: string): boolean {
+  return ["int", "int32", "long", "int64"].includes(nativeType);
+}
+
+function coerceMongoIntegerValue(
+  value: string,
+  column: ColumnTypeMeta,
+  strict: boolean,
+): unknown {
+  if (!/^[+-]?\d+$/.test(value)) return value;
+  const integer = BigInt(value);
+  const int32 = column.nativeType === "int" || column.nativeType === "int32";
+  const min = int32 ? -2147483648n : -9223372036854775808n;
+  const max = int32 ? 2147483647n : 9223372036854775807n;
+  if (integer < min || integer > max) {
+    // Existing mixed-type strings must remain readable and usable in original
+    // value predicates. Only new edits are required to fit the sampled type.
+    if (!strict) return value;
+    throw new Error(
+      `MongoDB ${column.nativeType} value is out of range (${min} to ${max}).`,
+    );
+  }
+  return int32
+    ? new Int32(Number(integer))
+    : Long.fromString(integer.toString());
+}
+
 function unwrapQuotedMongoDisplay(value: string): string {
   const trimmed = value.trim();
   if (trimmed.length >= 2) {
@@ -2281,6 +2308,17 @@ export class MongoDBDriver implements IDBDriver {
         false,
       );
     }
+    if (
+      typeof value === "string" &&
+      value !== NULL_SENTINEL &&
+      isMongoIntegerType(column.nativeType)
+    ) {
+      return coerceMongoIntegerValue(
+        unwrapQuotedMongoDisplay(value),
+        column,
+        false,
+      );
+    }
     return column.nativeType === "string"
       ? value
       : this.coerceInputValue(value, column);
@@ -2387,16 +2425,8 @@ export class MongoDBDriver implements IDBDriver {
       }
     }
 
-    if (column.nativeType === "int" || column.nativeType === "int32") {
-      return /^[+-]?\d+$/.test(normalized)
-        ? new Int32(Number.parseInt(normalized, 10))
-        : normalized;
-    }
-
-    if (column.nativeType === "long" || column.nativeType === "int64") {
-      return /^[+-]?\d+$/.test(normalized)
-        ? Long.fromString(normalized)
-        : normalized;
+    if (isMongoIntegerType(column.nativeType)) {
+      return coerceMongoIntegerValue(normalized, column, true);
     }
 
     if (column.nativeType === "double" || column.nativeType === "number") {
@@ -2464,7 +2494,13 @@ export class MongoDBDriver implements IDBDriver {
               column,
               false,
             )
-          : this.coerceInputValue(value, column);
+          : value !== NULL_SENTINEL && isMongoIntegerType(column.nativeType)
+            ? coerceMongoIntegerValue(
+                unwrapQuotedMongoDisplay(value),
+                column,
+                false,
+              )
+            : this.coerceInputValue(value, column);
       if (coerced !== value) {
         return formatMongoDisplayValue(coerced);
       }
@@ -2479,14 +2515,16 @@ export class MongoDBDriver implements IDBDriver {
   ) {
     if (
       typeof expectedValue === "string" &&
-      /^binData(?:\(\d+\))?$/i.test(column.nativeType)
+      (/^binData(?:\(\d+\))?$/i.test(column.nativeType) ||
+        isMongoIntegerType(column.nativeType))
     ) {
       try {
-        coerceMongoBinaryValue(
-          unwrapQuotedMongoDisplay(expectedValue),
-          column,
-          true,
-        );
+        const normalized = unwrapQuotedMongoDisplay(expectedValue);
+        if (isMongoIntegerType(column.nativeType)) {
+          coerceMongoIntegerValue(normalized, column, true);
+        } else {
+          coerceMongoBinaryValue(normalized, column, true);
+        }
       } catch (error: unknown) {
         return {
           ok: false,

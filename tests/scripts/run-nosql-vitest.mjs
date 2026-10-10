@@ -12,6 +12,7 @@ const child = spawn(
     "--project",
     "unit-node",
     "tests/node/nosqlLive.test.ts",
+    "tests/node/mutationDataSafetyLive.test.ts",
   ],
   {
     stdio: "inherit",

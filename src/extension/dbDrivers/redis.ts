@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { createClient } from "redis";
 import {
   type OperationCancellationContext,
@@ -93,6 +94,7 @@ const REDIS_READ_ONLY_QUERY_REASON =
 const REDIS_ATOMIC_EDIT_SCRIPT = `
 local source = KEYS[1]
 local target = KEYS[2]
+local staging = KEYS[3]
 if redis.call('EXISTS', source) == 0 then return 0 end
 if source ~= target and redis.call('EXISTS', target) ~= 0 then return -1 end
 local kind = redis.call('TYPE', source)['ok']
@@ -131,14 +133,47 @@ if ARGV[7] == '1' then
 end
 local ttl = redis.call('PTTL', source)
 if ARGV[3] == '1' then
-  redis.call('DEL', source)
+  -- Lua errors do not roll back writes. Decode and build the entire replacement
+  -- away from the source, including its TTL, before committing it.
   local value = cjson.decode(ARGV[4])
-  if kind == 'string' then redis.call('SET', source, value)
-  elseif kind == 'hash' then for field, entry in pairs(value) do redis.call('HSET', source, field, entry) end
-  elseif kind == 'list' then for _, entry in ipairs(value) do redis.call('RPUSH', source, entry) end
-  elseif kind == 'set' then for _, entry in ipairs(value) do redis.call('SADD', source, entry) end
-  elseif kind == 'zset' then for _, entry in ipairs(value) do redis.call('ZADD', source, entry.score, entry.value) end
-  else return -2 end
+  if kind ~= 'string' and kind ~= 'hash' and kind ~= 'list' and kind ~= 'set' and kind ~= 'zset' then return -2 end
+  if staging == source or staging == target or redis.call('EXISTS', staging) ~= 0 then
+    return redis.error_reply('Redis edit staging key already exists.')
+  end
+  -- Redis 7 ACL selectors can allow EVAL but deny a command on a particular
+  -- key. Check final commit permissions before creating any replacement.
+  if redis.acl_check_cmd then
+    if not redis.acl_check_cmd('DEL', source) or not redis.acl_check_cmd('DEL', staging) or not redis.acl_check_cmd('RENAME', staging, target) then
+      return redis.error_reply('Redis edit requires DEL and RENAME permissions on its keys.')
+    end
+  end
+  -- On older Redis versions command ACLs are global to the allowed keys.
+  -- This harmless no-op also ensures cleanup is permitted if building fails.
+  redis.call('DEL', staging)
+  local replacementExists = false
+  local ok, err = pcall(function()
+    if kind == 'string' then redis.call('SET', staging, value)
+    elseif kind == 'hash' then for field, entry in pairs(value) do redis.call('HSET', staging, field, entry) end
+    elseif kind == 'list' then for _, entry in ipairs(value) do redis.call('RPUSH', staging, entry) end
+    elseif kind == 'set' then for _, entry in ipairs(value) do redis.call('SADD', staging, entry) end
+    elseif kind == 'zset' then for _, entry in ipairs(value) do redis.call('ZADD', staging, entry.score, entry.value) end
+    end
+    if redis.call('EXISTS', staging) ~= 0 then
+      replacementExists = true
+      if ARGV[5] == 'set' then redis.call('PEXPIRE', staging, tonumber(ARGV[6]) * 1000)
+      elseif ARGV[5] == 'keep' and ttl >= 0 then redis.call('PEXPIRE', staging, ttl) end
+      redis.call('RENAME', staging, target)
+    end
+  end)
+  if not ok then
+    redis.call('DEL', staging)
+    return redis.error_reply(tostring(err))
+  end
+  -- Empty collections intentionally remove the key (Redis cannot store them).
+  if source ~= target or not replacementExists then
+    redis.call('DEL', source)
+  end
+  return 1
 end
 if source ~= target and redis.call('EXISTS', source) ~= 0 then redis.call('RENAME', source, target) end
 local finalKey = target
@@ -1113,9 +1148,10 @@ export class RedisDriver implements IDBDriver {
           await client.sendCommand([
             "EVAL",
             REDIS_ATOMIC_EDIT_SCRIPT,
-            "2",
+            "3",
             sourceKey,
             targetKey,
+            `${sourceKey}:rapidb-edit:${randomUUID()}`,
             currentType,
             originalValue,
             hasValueChange ? "1" : "0",
