@@ -3,6 +3,22 @@ import { splitMySQLScript } from "../../src/extension/dbDrivers/mysql";
 import { applyHardCapToSqlQuery } from "../../src/extension/utils/sqlHardCap";
 
 describe("splitMySQLScript", () => {
+  it.each([
+    "DELETE FROM accounts /*!50000 WHERE id = 1 */",
+    "DELETE FROM accounts /*! WHERE id = 1 */",
+    "DELETE FROM accounts /*M!100000 WHERE id = 1 */",
+    "SELECT /*+ MAX_EXECUTION_TIME(1000) */ * FROM accounts",
+    "/*!40101 SET @OLD_SQL_MODE=@@SQL_MODE */",
+    "SELECT '/*! not a comment */'",
+    "SELECT /*!80000 'a;b' */ 1",
+  ])("preserves server-interpreted comments: %s", (sql) => {
+    expect(splitMySQLScript(`${sql}; SELECT 2;`)).toEqual([sql, "SELECT 2"]);
+  });
+
+  it.each(["SELECT 1 /* unfinished", "DELETE FROM accounts /*! WHERE id = 1"])(
+    "rejects unterminated comments before submitting any script: %s",
+    (sql) => expect(() => splitMySQLScript(sql)).toThrow(/Unterminated/),
+  );
   it("retains a cap after CR comments and separates tokens around block comments", () => {
     const capped = applyHardCapToSqlQuery(
       "SELECT * FROM items -- comment\r ORDER BY id",

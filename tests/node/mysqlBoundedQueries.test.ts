@@ -49,7 +49,7 @@ function harness(run: (command: WireQuery, options: QueryOptions) => void) {
   });
   const connection = {
     connection: { query: rawQuery, config: {} },
-    query: vi.fn(async () => [[], []]),
+    query: vi.fn(async () => [{ serverStatus: 2 }, []]),
     release: vi.fn(),
     destroy: vi.fn(),
   };
@@ -123,8 +123,8 @@ describe("MySQL bounded callback-free queries", () => {
       rowCount: 2000,
       truncated: true,
     });
-    expect(connection.release).toHaveBeenCalledOnce();
-    expect(connection.destroy).not.toHaveBeenCalled();
+    expect(connection.release).not.toHaveBeenCalled();
+    expect(connection.destroy).toHaveBeenCalledOnce();
     expect(tracked.activeQueryOperations.size).toBe(0);
     expect(tracked.activeQueryConnectionSlots).toBe(0);
   });
@@ -214,7 +214,8 @@ describe("MySQL bounded callback-free queries", () => {
     expect(
       (await driver.query("SELECT 1", undefined, { hardCap: 2 })).rowCount,
     ).toBe(10000);
-    expect(connection.release).toHaveBeenCalledOnce();
+    expect(connection.release).not.toHaveBeenCalled();
+    expect(connection.destroy).toHaveBeenCalledTimes(2);
   });
 
   it.each([

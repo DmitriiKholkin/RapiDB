@@ -11,6 +11,10 @@ import type { ConnectionConfig } from "../connectionManager";
 import { getSshHttpAgentTransport } from "../driverRuntimeConfig";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
 import { createOwnedSshConnectionAgentFactory } from "../services/sshConnectionAgent";
+import {
+  JsonNumericPrecisionError,
+  parseJsonForWrite,
+} from "../utils/jsonWriteSafety";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import {
   formatDatetimeForDisplay,
@@ -692,7 +696,7 @@ export class ElasticsearchDriver implements IDBDriver {
       path: parsedUrl.pathname,
       pathSegments,
       queryParams: parsedUrl.searchParams,
-      body: bodyText.length > 0 ? JSON.parse(bodyText) : undefined,
+      body: bodyText.length > 0 ? parseJsonForWrite(bodyText) : undefined,
     };
   }
 
@@ -1723,6 +1727,22 @@ export class ElasticsearchDriver implements IDBDriver {
     return "ORDER BY _id";
   }
 
+  coerceOriginalValue(value: unknown, column: ColumnTypeMeta): unknown {
+    try {
+      return this.coerceInputValue(value, column);
+    } catch (error) {
+      // Originals describe existing data, not new writes. Preserve the old
+      // Number round-trip contract so safe replacements remain possible.
+      if (
+        error instanceof JsonNumericPrecisionError &&
+        typeof value === "string"
+      ) {
+        return JSON.parse(value.trim()) as unknown;
+      }
+      throw error;
+    }
+  }
+
   coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (column.name === "_source") {
       if (typeof value === "string") {
@@ -1731,12 +1751,13 @@ export class ElasticsearchDriver implements IDBDriver {
           return {};
         }
         try {
-          const parsed = JSON.parse(trimmed) as unknown;
+          const parsed = parseJsonForWrite(trimmed);
           if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
             throw new Error();
           }
           return parsed;
-        } catch {
+        } catch (error) {
+          if (error instanceof JsonNumericPrecisionError) throw error;
           throw new Error(
             'Elasticsearch field "_source" must be a valid JSON object.',
           );
@@ -1777,10 +1798,21 @@ export class ElasticsearchDriver implements IDBDriver {
   }
 
   checkPersistedEdit(
-    _column: ColumnTypeMeta,
-    _expectedValue: unknown,
+    column: ColumnTypeMeta,
+    expectedValue: unknown,
     _options?: { persistedValue: unknown },
   ) {
+    if (column.name === "_source") {
+      try {
+        this.coerceInputValue(expectedValue, column);
+      } catch (error) {
+        return {
+          ok: false,
+          shouldVerify: false,
+          message: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
     return null;
   }
 
@@ -2008,7 +2040,7 @@ export class ElasticsearchDriver implements IDBDriver {
       if (!trimmed) {
         return {};
       }
-      const parsed = JSON.parse(trimmed) as unknown;
+      const parsed = parseJsonForWrite(trimmed);
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
         throw new Error(
           'Elasticsearch field "_source" must be a valid JSON object.',

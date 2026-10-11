@@ -8,6 +8,14 @@ describe("database-native read-only query execution", () => {
   it("wraps MySQL editor reads in a READ ONLY transaction", async () => {
     const lifecycle: string[] = [];
     const query = vi.fn(async (input: unknown) => {
+      if (
+        typeof input === "object" &&
+        input &&
+        Reflect.get(input, "sql") === "DO 0"
+      ) {
+        lifecycle.push("DO 0");
+        return [{ serverStatus: 2 }, []];
+      }
       if (typeof input === "string") {
         lifecycle.push(input);
         return [[], []];
@@ -20,7 +28,7 @@ describe("database-native read-only query execution", () => {
       release: vi.fn(() => {
         lifecycle.push("release");
       }),
-      destroy: vi.fn(),
+      destroy: vi.fn(() => lifecycle.push("destroy")),
     };
     const driver = new MySQLDriver({
       id: "mysql-readonly-native",
@@ -39,13 +47,14 @@ describe("database-native read-only query execution", () => {
     });
 
     expect(query.mock.calls[0]?.[0]).toBe("START TRANSACTION READ ONLY");
-    expect(query.mock.calls.at(-1)?.[0]).toBe("ROLLBACK");
+    expect(query.mock.calls.at(-1)?.[0]).toMatchObject({ sql: "DO 0" });
     expect(lifecycle).toEqual([
       "START TRANSACTION READ ONLY",
       "query",
       "query",
       "ROLLBACK",
-      "release",
+      "DO 0",
+      "destroy",
     ]);
   });
 

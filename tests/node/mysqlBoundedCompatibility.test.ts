@@ -79,7 +79,7 @@ function harness(
   const rawQuery = vi.spyOn(native, "query");
   const connection = {
     connection: native,
-    query: vi.fn(async (_input: unknown) => [[], []]),
+    query: vi.fn(async (_input: unknown) => [{ serverStatus: 2 }, []]),
     release: vi.fn(),
     destroy: vi.fn(),
   };
@@ -121,9 +121,8 @@ async function expectNoSql(
   expect(rawQuery).not.toHaveBeenCalled();
   expect(Reflect.get(native, "writePacket")).not.toHaveBeenCalled();
   expect(connection.query).not.toHaveBeenCalled();
-  // Preflight failed without starting a command; the untouched socket is reusable.
-  expect(connection.release).toHaveBeenCalledOnce();
-  expect(connection.destroy).not.toHaveBeenCalled();
+  expect(connection.release).not.toHaveBeenCalled();
+  expect(connection.destroy).toHaveBeenCalledOnce();
   expect(tracked.activeQueryOperations.size).toBe(0);
   expect(tracked.activeQueryConnections.size).toBe(0);
   expect(tracked.activeQueryConnectionSlots).toBe(0);
@@ -189,7 +188,8 @@ describe("MySQL bounded adapter compatibility", () => {
     ).rejects.toThrow("unexpected callback-free Query shape");
     expect(rawQuery).not.toHaveBeenCalled();
     expect(Reflect.get(native, "writePacket")).not.toHaveBeenCalled();
-    expect(connection.release).toHaveBeenCalledOnce();
+    expect(connection.release).not.toHaveBeenCalled();
+    expect(connection.destroy).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -326,8 +326,8 @@ describe("MySQL bounded adapter compatibility", () => {
       "CALL report('O\\'Reilly; \\\\ quoted')",
     );
     expect(Reflect.get(native, "writePacket")).toHaveBeenCalledOnce();
-    expect(connection.release).toHaveBeenCalledOnce();
-    expect(connection.destroy).not.toHaveBeenCalled();
+    expect(connection.release).not.toHaveBeenCalled();
+    expect(connection.destroy).toHaveBeenCalledOnce();
   });
 
   it("preserves installed OK affectedRows across rebased mutation-only results", async () => {

@@ -21,6 +21,10 @@ import {
 import { QUERY_LIMIT_POLICY } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
+import {
+  JsonNumericPrecisionError,
+  parseJsonForWrite,
+} from "../utils/jsonWriteSafety";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import {
   formatDatetimeForDisplay,
@@ -2319,9 +2323,20 @@ export class MongoDBDriver implements IDBDriver {
         false,
       );
     }
-    return column.nativeType === "string"
-      ? value
-      : this.coerceInputValue(value, column);
+    if (column.nativeType === "string") return value;
+    try {
+      return this.coerceInputValue(value, column);
+    } catch (error) {
+      // Optimistic predicates must reconstruct the existing BSON double, not
+      // reject its display text as though it were a new numeric write.
+      if (
+        error instanceof JsonNumericPrecisionError &&
+        typeof value === "string"
+      ) {
+        return JSON.parse(unwrapQuotedMongoDisplay(value)) as unknown;
+      }
+      throw error;
+    }
   }
 
   coercePrimaryKeyValue(value: unknown, column: ColumnTypeMeta): unknown {
@@ -2475,8 +2490,9 @@ export class MongoDBDriver implements IDBDriver {
 
     if (column.category === "array" || column.category === "json") {
       try {
-        return JSON.parse(normalized) as unknown;
-      } catch {
+        return parseJsonForWrite(normalized);
+      } catch (error) {
+        if (error instanceof JsonNumericPrecisionError) throw error;
         return normalized;
       }
     }
@@ -2485,6 +2501,19 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
+    // Display is not a write: retain original JSON text if Number-based
+    // coercion cannot represent it. Do not break reads of existing documents.
+    if (
+      typeof value === "string" &&
+      (column.category === "json" || column.category === "array")
+    ) {
+      try {
+        return formatMongoDisplayValue(this.coerceInputValue(value, column));
+      } catch (error) {
+        if (error instanceof JsonNumericPrecisionError) return value;
+        throw error;
+      }
+    }
     if (typeof value === "string") {
       const coerced =
         value !== NULL_SENTINEL &&
@@ -2513,6 +2542,20 @@ export class MongoDBDriver implements IDBDriver {
     expectedValue: unknown,
     _options?: { persistedValue: unknown },
   ) {
+    if (
+      typeof expectedValue === "string" &&
+      (column.category === "json" || column.category === "array")
+    ) {
+      try {
+        this.coerceInputValue(expectedValue, column);
+      } catch (error) {
+        return {
+          ok: false,
+          shouldVerify: false,
+          message: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
     if (
       typeof expectedValue === "string" &&
       (/^binData(?:\(\d+\))?$/i.test(column.nativeType) ||

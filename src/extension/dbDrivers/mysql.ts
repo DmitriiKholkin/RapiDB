@@ -124,15 +124,29 @@ export function splitMySQLScript(sql: string): string[] {
       continue;
     }
     if (sql[i] === "/" && sql[i + 1] === "*") {
+      const start = i;
+      const executable =
+        sql[i + 2] === "!" ||
+        sql[i + 2] === "+" ||
+        (sql[i + 2] === "M" && sql[i + 3] === "!");
       i += 2;
+      let closed = false;
       while (i < n) {
         if (sql[i] === "*" && sql[i + 1] === "/") {
           i += 2;
+          closed = true;
           break;
         }
         i++;
       }
-      buf += " ";
+      if (!closed) {
+        throw new Error(
+          "Unterminated MySQL block comment; script was not submitted.",
+        );
+      }
+      // Let the server interpret version gates, MariaDB comments and hints.
+      // Removing one can remove a WHERE clause or change execution semantics.
+      buf += executable ? sql.slice(start, i) : " ";
       continue;
     }
     if (sql[i] === "'" || sql[i] === '"' || sql[i] === "`") {
@@ -1757,11 +1771,56 @@ export class MySQLDriver extends BaseDBDriver {
         throw new Error("MySQL query cancelled before execution.");
       }
       this.activeQueryConnections.add(connection);
-      return await operation(connection);
+      const result = await operation(connection);
+      if (queryOperation.cancelled) throw new Error("MySQL query cancelled.");
+      const cleanupQuery = (sql: string): Promise<ResultSetHeader> => {
+        let timer: ReturnType<typeof setTimeout>;
+        return new Promise<ResultSetHeader>((resolve, reject) => {
+          const timeoutMs = this.getDbOperationTimeoutMs();
+          timer = setTimeout(
+            () =>
+              reject(new DriverTimeoutError("dbOperation", "query", timeoutMs)),
+            timeoutMs,
+          );
+          queryOperation.reject = reject;
+          connection!
+            .query<ResultSetHeader>(this.createQueryOptions(sql))
+            .then(([header]) => resolve(header), reject);
+          // Clear tracking on settlement, including cancellation even if the
+          // native command never emits anything after socket destruction.
+        }).finally(() => {
+          clearTimeout(timer);
+          queryOperation.reject = undefined;
+        });
+      };
+      // DO neither starts a transaction nor implicitly commits one. Its OK
+      // packet exposes the public protocol status even after streaming SELECTs.
+      const status = await cleanupQuery("DO 0");
+      if (
+        !status ||
+        Array.isArray(status) ||
+        !Number.isInteger(status.serverStatus) ||
+        status.serverStatus < 0 ||
+        status.serverStatus > 0xffff
+      ) {
+        throw new Error(
+          "Cannot verify MySQL transaction state; connection was discarded.",
+        );
+      }
+      if ((status.serverStatus & 1) !== 0) {
+        await cleanupQuery("ROLLBACK");
+        throw new Error(
+          "Unfinished MySQL transaction was rolled back. Execute BEGIN and COMMIT/ROLLBACK in the same script. Earlier commits and nontransactional changes are not undone.",
+        );
+      }
+      if (queryOperation.cancelled) throw new Error("MySQL query cancelled.");
+      return result;
     } finally {
       this.activeQueryOperations.delete(queryOperation);
       if (connection && this.activeQueryConnections.delete(connection)) {
-        connection.release();
+        // Arbitrary SQL can change database, autocommit, sql_mode, variables,
+        // locks and temporary tables. Never lend this session to another task.
+        connection.destroy();
       }
       if (slotAcquired) {
         this.activeQueryConnectionSlots -= 1;
