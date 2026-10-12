@@ -201,4 +201,63 @@ describe("stage 4 review PostgreSQL native persisted-edit compatibility", () => 
       ).toBe(false);
     }
   });
+
+  it.each(
+    ["f", "r"].flatMap((name) =>
+      ["NaN", "Infinity", "-Infinity"].map((special) => [name, special]),
+    ),
+  )("keeps %s=%s distinct from NULL across webview transport and atomic CAS", async (name, special) => {
+    const rowId = ++id;
+    await driver.query(`INSERT INTO ${table}(id,${name}) VALUES ($1,$2)`, [
+      rowId,
+      special,
+    ]);
+    const page = await service.getPage(
+      config.id,
+      database(),
+      schema,
+      "edits",
+      1,
+      10,
+      [{ column: "id", operator: "eq", value: String(rowId) }],
+    );
+    const baseline = JSON.parse(JSON.stringify(page)).rows[0][name];
+    expect(baseline).toBe(special);
+    const columns = await service.getColumns(
+      config.id,
+      database(),
+      schema,
+      "edits",
+    );
+    const update = () =>
+      applyChangesTransactional(
+        manager as never,
+        config.id,
+        database(),
+        schema,
+        "edits",
+        [
+          {
+            primaryKeys: { id: rowId },
+            changes: { [name]: "5" },
+            originalValues: { [name]: baseline },
+          },
+        ],
+        columns,
+      );
+    // Model another client's committed transition to NULL after the original read.
+    await driver.query(`UPDATE ${table} SET ${name}=NULL WHERE id=$1`, [rowId]);
+    expect(await update()).toMatchObject({ success: false });
+    expect(
+      rowsFromQuery(
+        await driver.query(`SELECT ${name} FROM ${table} WHERE id=$1`, [rowId]),
+      )[0][name],
+    ).toBeNull();
+    // An unchanged special value must match the string baseline on the server.
+    await driver.query(`UPDATE ${table} SET ${name}=$2 WHERE id=$1`, [
+      rowId,
+      special,
+    ]);
+    expect(await update()).toMatchObject({ success: true });
+  });
 });

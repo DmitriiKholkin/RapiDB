@@ -27,6 +27,92 @@ vi.mock("vscode", async () => {
 });
 
 describe("ConnectionManager with VSCode SecretStorage", () => {
+  it.each([
+    ["user:uri-secret@host/db", "host/db"],
+    ["//user:uri-secret@host/db", "//host/db"],
+  ])("protects nonstandard URI credentials through save and edit: %s", async (connectionUri, redacted) => {
+    for (const useSecretStorage of [undefined, true]) {
+      configuration.connections = [];
+      const context = createExtensionContextStub();
+      const manager = new ConnectionManager(context as never);
+      const config: ConnectionConfig = {
+        id: "nonstandard-uri-save",
+        name: "Nonstandard URI",
+        type: "mongodb",
+        connectionUri,
+        useSecretStorage,
+      };
+      try {
+        const saved = await manager.saveConnection(config);
+        expect(saved.connectionUri).toBe(redacted);
+        expect(configuration.connections[0].connectionUri).toBe(redacted);
+        expect(configuration.connections[0].useSecretStorage).toBe(true);
+        expect(
+          JSON.parse((await context.secrets.get(config.id)) ?? "{}"),
+        ).toEqual({
+          connectionUri,
+        });
+        const edited = await manager.saveConnection({
+          ...saved,
+          name: "Renamed",
+        });
+        expect(edited.connectionUri).toBe(redacted);
+        expect(configuration.connections[0].connectionUri).toBe(redacted);
+        expect(
+          JSON.parse((await context.secrets.get(config.id)) ?? "{}"),
+        ).toEqual({
+          connectionUri,
+        });
+      } finally {
+        await manager.dispose();
+      }
+    }
+  });
+
+  it.each([
+    "jdbc:postgresql://user:uri-secret@host/db",
+    "alice:supersecret://tail@host/db",
+  ])("rejects credential-bearing nested schemes on save and legacy connect: %s", async (connectionUri) => {
+    for (const useSecretStorage of [undefined, false, true]) {
+      const config: ConnectionConfig = {
+        id: "ambiguous-nested-scheme",
+        name: "Ambiguous nested scheme",
+        type: "mongodb",
+        connectionUri,
+        useSecretStorage,
+      };
+      configuration.connections = [];
+      const context = createExtensionContextStub();
+      const manager = new ConnectionManager(context as never);
+      try {
+        await expect(manager.saveConnection(config)).rejects.toThrow(
+          "Ambiguous URI credentials",
+        );
+        expect(configuration.connections).toEqual([]);
+        await expect(context.secrets.get(config.id)).resolves.toBeUndefined();
+      } finally {
+        await manager.dispose();
+      }
+      // Fail closed for old settings as well, without changing the user's data.
+      configuration.connections = [config];
+      const legacyManager = new ConnectionManager(context as never);
+      const state = legacyManager as unknown as {
+        createDriver(config: ConnectionConfig): IDBDriver;
+      };
+      const factory = vi.spyOn(state, "createDriver");
+      try {
+        await expect(legacyManager.connectTo(config.id)).rejects.toThrow(
+          "Ambiguous URI credentials",
+        );
+        expect(factory).not.toHaveBeenCalled();
+        expect(configuration.connections).toEqual([config]);
+        await expect(context.secrets.get(config.id)).resolves.toBeUndefined();
+      } finally {
+        await legacyManager.dispose();
+      }
+    }
+  });
+
   it("rejects an Elasticsearch HTTP endpoint before persisting required TLS credentials", async () => {
     configuration.connections = [];
     const context = createExtensionContextStub();

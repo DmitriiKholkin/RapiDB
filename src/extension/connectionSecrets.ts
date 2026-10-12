@@ -1,6 +1,7 @@
 import {
   AMBIGUOUS_URI_CREDENTIALS_MESSAGE,
   hasAmbiguousUriCredentials,
+  splitUriAuthorityPrefix,
 } from "../shared/connectionUriSecurity";
 import type { ConnectionConfig } from "./connectionManagerModels";
 import {
@@ -57,10 +58,8 @@ function redactCredentialBearingUri(uri: string): string {
   if (hasAmbiguousUriCredentials(uri)) {
     throw new Error(AMBIGUOUS_URI_CREDENTIALS_MESSAGE);
   }
-  const authorityRedacted = uri.replace(
-    /^([a-z][a-z\d+.-]*:\/\/)([^/?#\s\\]*)@/i,
-    "$1",
-  );
+  const { prefix, remainder } = splitUriAuthorityPrefix(uri);
+  const authorityRedacted = prefix + remainder.replace(/^[^/?#\s\\]*@/, "");
   const hashIndex = authorityRedacted.indexOf("#");
   const fragment = hashIndex >= 0 ? authorityRedacted.slice(hashIndex + 1) : "";
   const withoutFragment =

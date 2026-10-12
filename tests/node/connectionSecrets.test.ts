@@ -14,6 +14,8 @@ import { validateConnectionConfig } from "../../src/shared/connectionValidation"
 describe("connection URI secret handling", () => {
   it.each([
     ["redis://user:p@ss@host:6379/0", "redis://host:6379/0"],
+    ["user:uri-secret@host/db", "host/db"],
+    ["//user:uri-secret@host/db", "//host/db"],
     [
       "mongodb://user:p%40%2F%3F%23%20ss@host1:27017,host2:27017/db?replicaSet=rs",
       "mongodb://host1:27017,host2:27017/db?replicaSet=rs",
@@ -30,22 +32,19 @@ describe("connection URI secret handling", () => {
     expect(validateConnectionConfig(persisted).valid).toBe(true);
     expect(extractCredentialBearingUriSecret(uri)).toBe(uri);
     const secret = serializeConnectionSecretsForStoredConfig(config, undefined);
-    expect(JSON.parse(secret!)).toEqual({ connectionUri: uri });
+    expect(JSON.parse(secret ?? "{}")).toEqual({ connectionUri: uri });
     expect(serializeConnectionSecretsForStoredConfig(persisted, secret)).toBe(
       secret,
     );
   });
 
-  it.each([
-    "/",
-    "?",
-    "#",
-    " ",
-    "\t",
-    "\n",
-    "\\",
-  ])("rejects ambiguous userinfo containing %j without echoing secrets", (delimiter) => {
-    const uri = `mongodb://user:pa${delimiter}ss@host/db`;
+  it.each(
+    ["/", "?", "#", " ", "\t", "\n", "\\"].flatMap((delimiter) =>
+      ["mongodb://", "jdbc:postgresql://", "", "//"].map(
+        (prefix) => `${prefix}user:pa${delimiter}ss@host/db`,
+      ),
+    ),
+  )("rejects ambiguous userinfo %j without echoing secrets", (uri) => {
     expect(() => sanitizeCredentialBearingUri(uri)).toThrow(
       "Ambiguous URI credentials",
     );
@@ -78,7 +77,45 @@ describe("connection URI secret handling", () => {
   });
 
   it.each([
+    "jdbc:postgresql://user:uri-secret@host/db",
+    "alice:supersecret://tail@host/db",
+    "outer:middle:inner://user:uri-secret@host/db",
+  ])("rejects credential-bearing nested schemes without retaining a possible password: %s", (uri) => {
+    for (const useSecretStorage of [undefined, false, true]) {
+      for (const field of [
+        "connectionUri",
+        "uri",
+        "endpoint",
+        "awsEndpoint",
+      ] as const) {
+        const config: ConnectionConfig = {
+          id: "nested-scheme",
+          name: "Nested scheme",
+          type: "mongodb",
+          [field]: uri,
+          useSecretStorage,
+        };
+        const validation = validateConnectionConfig(config);
+        expect(validation.valid).toBe(false);
+        expect(validation.message).not.toContain(uri);
+        expect(() => sanitizePersistedConnectionConfig(config)).toThrow(
+          "Ambiguous URI credentials",
+        );
+        expect(() => sanitizeConnectionConfigForResponse(config)).toThrow(
+          "Ambiguous URI credentials",
+        );
+        expect(() =>
+          serializeConnectionSecretsForStoredConfig(config, undefined),
+        ).toThrow("Ambiguous URI credentials");
+      }
+    }
+  });
+
+  it.each([
     "redis://user:123/ss@host/0",
+    "jdbc:postgresql://user:uri/secret@host/db",
+    "user:uri/secret@host/db",
+    "//user:uri/secret@host/db",
     "redis://user:p@ss/word@host/0",
     "https://host:443/path@name",
     "redis://user name@host/0",
@@ -93,6 +130,9 @@ describe("connection URI secret handling", () => {
 
   it.each([
     "https://host/path@name?mode=read&column=name&label=example#section",
+    "jdbc:postgresql://host:5432/db",
+    "host:5432/db",
+    "//host:5432/db",
     "mongodb://host1:27017,host2:27017/db?replicaSet=rs",
     "redis://host:6379/0",
     "https://host/path%40name?label=user%40example.com",
@@ -204,6 +244,43 @@ describe("connection URI secret handling", () => {
       useSecretStorage: false,
     };
     expect(sanitizePersistedConnectionConfig(config)).toEqual(config);
+  });
+
+  it.each([
+    ["user:uri-secret@host/db", "host/db"],
+    ["//user:uri-secret@host/db", "//host/db"],
+  ])("protects nonstandard userinfo in every URI field: %s", (uri, redacted) => {
+    for (const field of [
+      "connectionUri",
+      "uri",
+      "endpoint",
+      "awsEndpoint",
+    ] as const) {
+      for (const useSecretStorage of [undefined, false, true]) {
+        const config: ConnectionConfig = {
+          id: "nonstandard-uri",
+          name: "Nonstandard URI",
+          type: "mongodb",
+          [field]: uri,
+          useSecretStorage,
+        };
+        expect(hasConnectionConfigSecrets(config)).toBe(true);
+        expect(sanitizeConnectionConfigForResponse(config)[field]).toBe(
+          redacted,
+        );
+        expect(sanitizePersistedConnectionConfig(config)[field]).toBe(
+          useSecretStorage === false ? uri : redacted,
+        );
+        expect(
+          JSON.parse(
+            serializeConnectionSecretsForStoredConfig(config, undefined) ??
+              "{}",
+          ),
+        ).toEqual({
+          [field]: uri,
+        });
+      }
+    }
   });
 });
 

@@ -2373,6 +2373,11 @@ export class PostgresDriver extends BaseDBDriver {
     if (value === null || value === undefined) return value;
     if (Buffer.isBuffer(value)) return super.formatOutputValue(value, column);
     if (typeof value === "bigint") return value.toString();
+    // JSON webview transport maps nonfinite numbers to NULL, corrupting CAS baselines.
+    // PostgreSQL accepts these canonical strings as float input and comparison values.
+    if (typeof value === "number" && !Number.isFinite(value)) {
+      return String(value);
+    }
     if (typeof value === "string") {
       if (column.category === "json") {
         return value;
