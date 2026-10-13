@@ -23,6 +23,10 @@ import { closeDriverResource } from "./driverCleanup";
 import { exactNumericFilterLiteral } from "./exactNumericFilter";
 import { literalContainsPattern } from "./literalContains";
 import {
+  getMetadataContext,
+  withMetadataResource,
+} from "./metadataCancellation";
+import {
   createMysqlStreamingQuery,
   discardMysqlResultHistory,
 } from "./mysqlBoundedQuery";
@@ -1105,6 +1109,7 @@ export class MySQLDriver extends BaseDBDriver {
   private readonly activeTransactionConnections = new Set<PoolConnection>();
   private readonly activeQueryConnections = new Set<PoolConnection>();
   private readonly activeQueryOperations = new Set<MysqlQueryOperation>();
+  private readonly discardedMetadataConnections = new WeakSet<object>();
   private activeQueryConnectionSlots = 0;
   private connectionEpoch = 0;
   private connectionAbortController?: AbortController;
@@ -1351,10 +1356,149 @@ export class MySQLDriver extends BaseDBDriver {
     }
     return this.pool;
   }
+  private destroyMetadataConnection(
+    connection: PoolConnection | NativeMysqlConnection,
+  ): void {
+    const native = ("connection" in connection
+      ? connection.connection
+      : connection) as unknown as {
+      stream?: { destroy(error?: Error): void };
+    };
+    const resource = native ?? connection;
+    if (this.discardedMetadataConnections.has(resource)) return;
+    this.discardedMetadataConnections.add(resource);
+    try {
+      connection.destroy();
+    } finally {
+      // PromisePoolConnection wraps the native connection. mysql2.destroy()
+      // only half-closes its stream; force the owned physical socket closed.
+      native?.stream?.destroy(new Error("MySQL metadata operation cancelled."));
+    }
+  }
+
+  private async acquireMetadataConnection(
+    pool: Pool,
+    signal: AbortSignal,
+  ): Promise<PoolConnection> {
+    // mysql2's checkout queue has no public cancellation API. Check capacity
+    // and reserve in the same turn, never enqueue a timed metadata request.
+    const core = pool.pool as unknown as {
+      _freeConnections: { length: number };
+      _allConnections: {
+        length: number;
+        get?(index: number): NativeMysqlConnection;
+      };
+      _connectionQueue: { length: number };
+      config: { connectionLimit: number };
+    };
+    if (
+      !core?._freeConnections ||
+      !core._allConnections ||
+      !core._connectionQueue
+    )
+      throw new Error("MySQL metadata checkout capacity is unavailable.");
+    while (true) {
+      signal.throwIfAborted();
+      if (pool !== this.pool)
+        throw new Error("MySQL metadata connection closed.");
+      if (
+        core._connectionQueue.length === 0 &&
+        (core._freeConnections.length > 0 ||
+          core.config.connectionLimit === 0 ||
+          core._allConnections.length < core.config.connectionLimit)
+      ) {
+        let onAbort: () => void = () => undefined;
+        try {
+          return await new Promise<PoolConnection>((resolve, reject) => {
+            let cancelled = false;
+            let openingConnection: NativeMysqlConnection | undefined;
+            onAbort = () => {
+              cancelled = true;
+              try {
+                if (openingConnection)
+                  this.destroyMetadataConnection(openingConnection);
+              } catch (error) {
+                logger.error(
+                  "MySQL metadata handshake cancellation failed",
+                  error,
+                );
+              } finally {
+                reject(signal.reason);
+              }
+            };
+            signal.addEventListener("abort", onAbort, { once: true });
+            // getConnection reserves synchronously; late handshakes are still
+            // observed and discarded without ever executing their SQL.
+            const beforeCheckout = core._allConnections.length;
+            const checkout = pool.getConnection();
+            if (core._allConnections.length > beforeCheckout)
+              openingConnection = core._allConnections.get?.(beforeCheckout);
+            if (signal.aborted) onAbort();
+            void checkout.then((connection) => {
+              openingConnection = undefined;
+              if (!cancelled && pool === this.pool) resolve(connection);
+              else {
+                try {
+                  this.destroyMetadataConnection(connection);
+                } catch (error) {
+                  logger.error(
+                    "MySQL cancelled metadata checkout cleanup failed",
+                    error,
+                  );
+                }
+                reject(new Error("MySQL metadata checkout cancelled."));
+              }
+            }, reject);
+          });
+        } finally {
+          signal.removeEventListener("abort", onAbort);
+        }
+      }
+      await new Promise<void>((resolve, reject) => {
+        const finish = () => {
+          clearTimeout(timer);
+          signal.removeEventListener("abort", abort);
+        };
+        const abort = () => {
+          finish();
+          reject(signal.reason);
+        };
+        const timer = setTimeout(() => {
+          finish();
+          resolve();
+        }, 25);
+        signal.addEventListener("abort", abort, { once: true });
+      });
+    }
+  }
+
   private async queryObjectRows<TRow extends RowDataPacket = RowDataPacket>(
     sql: string,
     params?: QueryOptions["values"],
   ): Promise<TRow[]> {
+    const metadata = getMetadataContext();
+    if (metadata) {
+      const connection = await this.acquireMetadataConnection(
+        this.requirePool(),
+        metadata.signal,
+      );
+      let destroyed = false;
+      const destroy = () => {
+        if (destroyed) return;
+        destroyed = true;
+        this.destroyMetadataConnection(connection);
+      };
+      try {
+        metadata.signal.throwIfAborted();
+        const [rows] = await withMetadataResource(destroy, () =>
+          connection.query<TRow[]>(this.createQueryOptions(sql, params)),
+        );
+        return rows;
+      } finally {
+        if (metadata.signal.aborted) destroy();
+        else if (!destroyed) connection.release();
+      }
+    }
     const [rows] = await this.requirePool().query<TRow[]>(
       this.createQueryOptions(sql, params),
     );

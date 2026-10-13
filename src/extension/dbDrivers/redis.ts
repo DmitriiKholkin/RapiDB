@@ -14,6 +14,7 @@ import { pMapWithLimit } from "../utils/concurrency";
 import { logger } from "../utils/logger";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import { deleteRowsSequentially, prepareDeleteBatch } from "./deleteOutcomes";
+import { getMetadataContext } from "./metadataCancellation";
 import {
   applyFilters,
   applySort,
@@ -778,7 +779,10 @@ export class RedisDriver implements IDBDriver {
 
   async listDatabases(): Promise<DatabaseInfo[]> {
     try {
-      const info = await this.requireClient().info("keyspace");
+      const client = getMetadataContext()
+        ? await this.getDatabaseClient()
+        : this.requireClient();
+      const info = await client.info("keyspace");
       const names = info
         .split("\n")
         .map((line) => line.trim())
@@ -1546,11 +1550,37 @@ export class RedisDriver implements IDBDriver {
     return index;
   }
 
+  private readonly metadataClients = new WeakMap<
+    object,
+    Map<number, RedisClientEntry>
+  >();
+
   private async getDatabaseClient(
     database?: string,
     signal?: AbortSignal,
   ): Promise<RedisClient> {
     this.requireClient();
+    const metadata = getMetadataContext();
+    if (metadata) {
+      const index = this.resolveDbIndex(database);
+      let clients = this.metadataClients.get(metadata);
+      if (!clients) {
+        clients = new Map();
+        this.metadataClients.set(metadata, clients);
+      }
+      let entry = clients.get(index);
+      if (!entry) {
+        entry = this.openClient(index);
+        clients.set(index, entry);
+        const owned = entry;
+        metadata.cleanups.add(() => {
+          this.cancelClientEntry(owned);
+        });
+      }
+      const client = await this.waitForResult(entry.promise, metadata.signal);
+      metadata.signal.throwIfAborted();
+      return client;
+    }
     signal?.throwIfAborted();
     const index = this.resolveDbIndex(database);
     let entry = this.databaseClients.get(index);

@@ -25,6 +25,7 @@ import {
   drainElasticsearchCleanup,
   ElasticsearchPitSession,
 } from "./elasticsearchPitSession";
+import { getMetadataContext } from "./metadataCancellation";
 import {
   applyFilters,
   applySort,
@@ -308,6 +309,11 @@ export class ElasticsearchDriver implements IDBDriver {
     );
   }
 
+  private metadataTransportOptions(): [] | [{ signal: AbortSignal }] {
+    const metadata = getMetadataContext();
+    return metadata ? [{ signal: metadata.signal }] : [];
+  }
+
   async listDatabases(): Promise<DatabaseInfo[]> {
     return [{ name: "default", schemas: [] }];
   }
@@ -317,12 +323,15 @@ export class ElasticsearchDriver implements IDBDriver {
   }
 
   async listObjects(): Promise<TableInfo[]> {
-    const response = await this.requireClient().indices.resolveIndex({
-      name: "*",
-      expand_wildcards: ["open", "closed", "hidden"],
-      allow_no_indices: true,
-      ignore_unavailable: true,
-    });
+    const response = await this.requireClient().indices.resolveIndex(
+      {
+        name: "*",
+        expand_wildcards: ["open", "closed", "hidden"],
+        allow_no_indices: true,
+        ignore_unavailable: true,
+      },
+      ...this.metadataTransportOptions(),
+    );
     const backingIndexNames = new Set(
       response.data_streams.flatMap((stream) => stream.backing_indices),
     );
@@ -378,7 +387,10 @@ export class ElasticsearchDriver implements IDBDriver {
     table: string,
   ): Promise<IndexMeta[]> {
     try {
-      await this.requireClient().indices.get({ index: table });
+      await this.requireClient().indices.get(
+        { index: table },
+        ...this.metadataTransportOptions(),
+      );
       return [
         {
           name: `${table}_id_idx`,
@@ -421,7 +433,10 @@ export class ElasticsearchDriver implements IDBDriver {
     _schema: string,
     table: string,
   ): Promise<string> {
-    const response = await this.requireClient().indices.get({ index: table });
+    const response = await this.requireClient().indices.get(
+      { index: table },
+      ...this.metadataTransportOptions(),
+    );
     const definition = this.extractIndexDefinition(response, table);
     if (!definition) {
       throw new Error(`Index "${table}" not found`);

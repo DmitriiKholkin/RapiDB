@@ -19,6 +19,10 @@ import {
 import { BoundedQueryRows, queryCollectionLimit } from "./boundedQueryRows";
 import { closeDriverResource } from "./driverCleanup";
 import { exactNumericFilterLiteral } from "./exactNumericFilter";
+import {
+  getMetadataContext,
+  withMetadataResource,
+} from "./metadataCancellation";
 import { mssqlInsertGuard } from "./mssqlInsertGuard";
 import {
   type QuestionMarkPlaceholderOptions,
@@ -1198,7 +1202,27 @@ export class MSSQLDriver extends BaseDBDriver {
     this.config = config;
   }
   private requirePool(): mssql.ConnectionPool {
+    const metadata = getMetadataContext();
     if (this.pool) {
+      if (metadata)
+        return new Proxy(this.pool, {
+          get(target, property) {
+            if (property === "request")
+              return () => {
+                metadata.signal.throwIfAborted();
+                const request = target.request();
+                const query = request.query;
+                request.query = ((...args: unknown[]) =>
+                  withMetadataResource(
+                    () => request.cancel(),
+                    () => Reflect.apply(query, request, args),
+                  )) as typeof query;
+                return request;
+              };
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
       return this.pool;
     }
     throw new Error("[RapiDB] MSSQL connection is not open");

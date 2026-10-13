@@ -8,6 +8,10 @@ import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
 import { BoundedQueryRows, queryCollectionLimit } from "./boundedQueryRows";
 import { literalContainsPattern } from "./literalContains";
 import {
+  getMetadataContext,
+  withMetadataResource,
+} from "./metadataCancellation";
+import {
   indexedPlaceholderOffsets,
   replaceIndexedPlaceholders,
 } from "./sqlPlaceholders";
@@ -910,10 +914,29 @@ export class OracleDriver extends BaseDBDriver {
   }
 
   private async getConnection(): Promise<oracledb.Connection> {
+    const metadata = getMetadataContext();
     if (!this.pool) {
       throw new Error("[RapiDB] Oracle connection pool is not initialized.");
     }
-    const connection = await this.pool.getConnection();
+    let connection = await this.pool.getConnection();
+    if (metadata) {
+      if (metadata.signal.aborted) {
+        await connection.close().catch(() => undefined);
+        metadata.signal.throwIfAborted();
+      }
+      connection = new Proxy(connection, {
+        get(target, property) {
+          if (property === "execute")
+            return (...args: unknown[]) =>
+              withMetadataResource(
+                () => target.break(),
+                () => Reflect.apply(target.execute, target, args),
+              );
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    }
     connection.callTimeout = this.getDbOperationTimeoutMs();
     try {
       await connection.execute(

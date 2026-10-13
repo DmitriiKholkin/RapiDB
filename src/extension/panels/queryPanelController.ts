@@ -72,6 +72,8 @@ interface ActiveQueryExecution extends QueryExecutionCancellationHandle {
   cancelRequested?: boolean;
   cancellationPending?: Promise<void>;
   queryStarted: boolean;
+  completion?: Promise<void>;
+  finish?: () => void;
 }
 
 export class QueryPanelController {
@@ -420,6 +422,7 @@ export class QueryPanelController {
     } finally {
       const active = this.activeQueryExecutions.get(connectionId);
       if (active?.requestToken === requestToken) {
+        active.finish?.();
         this.activeQueryExecutions.delete(connectionId);
       }
     }
@@ -438,6 +441,10 @@ export class QueryPanelController {
   ): ActiveQueryExecution {
     const supportsCancellation =
       typeof driver.cancelCurrentOperation === "function";
+    let finish!: () => void;
+    const completion = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
 
     return {
       requestToken,
@@ -445,6 +452,8 @@ export class QueryPanelController {
       operationName: "query",
       operationId,
       queryStarted: true,
+      completion,
+      finish,
       supportsCancellation,
       cancel: async (context: OperationCancellationContext) => {
         if (!supportsCancellation) {
@@ -568,7 +577,11 @@ export class QueryPanelController {
             requestToken: previous.requestToken,
             supersededByRequestToken,
           })
-          .then(() => "cancelled" as const),
+          .then(async () => {
+            // An acknowledgement alone does not prove query() has stopped.
+            await previous.completion;
+            return "cancelled" as const;
+          }),
         new Promise<"timed-out">((resolve) => {
           timeoutHandle = setTimeout(() => {
             resolve("timed-out");
@@ -604,9 +617,18 @@ export class QueryPanelController {
     reason: OperationCancellationContext["reason"],
   ): Promise<void> {
     const executions = [...this.activeQueryExecutions.values()];
-    this.activeQueryExecutions.clear();
     await Promise.all(
       executions.map(async (execution) => {
+        if (!execution.queryStarted) {
+          execution.cancelRequested = true;
+          if (
+            this.activeQueryExecutions.get(execution.connectionId) === execution
+          )
+            this.activeQueryExecutions.delete(execution.connectionId);
+          return;
+        }
+        // Keep the per-connection fence until query() actually settles, even
+        // when cancellation is unavailable, fails, times out, or is a no-op.
         if (!execution.supportsCancellation) {
           return;
         }

@@ -33,6 +33,7 @@ import {
   parseHexToBuffer,
 } from "./BaseDBDriver";
 import { deleteRowsSequentially, prepareDeleteBatch } from "./deleteOutcomes";
+import { getMetadataSdkOptions } from "./metadataCancellation";
 import {
   applyFilters,
   applySort,
@@ -1283,7 +1284,7 @@ export class MongoDBDriver implements IDBDriver {
   async listDatabases(): Promise<DatabaseInfo[]> {
     try {
       const admin = this.requireClient().db().admin();
-      const dbs = await admin.listDatabases();
+      const dbs = await admin.listDatabases(getMetadataSdkOptions());
       return dbs.databases.map((database) => ({
         name: database.name,
         schemas: [],
@@ -1300,7 +1301,7 @@ export class MongoDBDriver implements IDBDriver {
   async listObjects(database: string): Promise<TableInfo[]> {
     const db = this.requireDb(database);
     const collections = await db
-      .listCollections({}, { nameOnly: false })
+      .listCollections({}, { nameOnly: false, ...getMetadataSdkOptions() })
       .toArray();
     return collections
       .filter((collection) => !this.isSystemNamespace(collection.name))
@@ -1354,7 +1355,7 @@ export class MongoDBDriver implements IDBDriver {
     try {
       const indexes = await this.requireDb(database)
         .collection(table)
-        .indexes();
+        .indexes(getMetadataSdkOptions());
       return indexes.map((index) => ({
         name: index.name ?? "index",
         columns: Object.keys(index.key),
@@ -1381,7 +1382,9 @@ export class MongoDBDriver implements IDBDriver {
     indexName: string,
   ): Promise<string> {
     const index = (
-      await this.requireDb(database).collection(table).indexes()
+      await this.requireDb(database)
+        .collection(table)
+        .indexes(getMetadataSdkOptions())
     ).find((entry) => entry.name === indexName);
     if (!index) {
       throw new Error(`Index "${indexName}" not found`);
@@ -2684,7 +2687,10 @@ export class MongoDBDriver implements IDBDriver {
   }> {
     const collection = (
       await this.requireDb(database)
-        .listCollections({ name: table }, { nameOnly: false })
+        .listCollections(
+          { name: table },
+          { nameOnly: false, ...getMetadataSdkOptions() },
+        )
         .toArray()
     ).find((entry) => entry.name === table);
 
@@ -2795,6 +2801,7 @@ export class MongoDBDriver implements IDBDriver {
         {
           promoteValues: false,
           bsonRegExp: false,
+          ...getMetadataSdkOptions(),
         },
       )
       .limit(limit)

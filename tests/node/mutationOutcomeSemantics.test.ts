@@ -52,6 +52,8 @@ async function confirmSingleDriverInsert(error: Error) {
   });
 
   return {
+    controller,
+    insert,
     insertRow,
     insertedRows,
     result: await controller.confirm(preview.previewToken, "insert-one"),
@@ -115,6 +117,76 @@ async function confirmSingleVerifiedInsert(options: {
 }
 
 describe("mutation outcome semantics", () => {
+  it("does not replay an unknown INSERT with a fresh preview token or after clear", async () => {
+    const { controller, insert, insertRow, result } =
+      await confirmSingleDriverInsert(new Error("Acknowledgement lost"));
+    expect(result?.payload).toMatchObject({ outcomeUnknown: true });
+    controller.clear();
+    const retry = controller.createApplyChangesPreview("insert-one", {
+      apply: null,
+      applyResultWhenEmpty: null,
+      inserts: [insert],
+    });
+    expect(
+      await controller.confirm(retry.previewToken, "insert-one"),
+    ).toBeNull();
+    const standalone = controller.createInsertPreview("insert-one", insert);
+    expect(
+      await controller.confirm(standalone.previewToken, "insert-one"),
+    ).toBeNull();
+    expect(insertRow).toHaveBeenCalledOnce();
+  });
+
+  it("consumes standalone insert operation IDs before execution and reports uncertainty", async () => {
+    let rejectInsert!: (error: Error) => void;
+    const executePreparedInsertPlan = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectInsert = reject;
+        }),
+    );
+    const controller = new TableMutationPreviewController({
+      connectionId: config.id,
+      tableName: "items",
+      connectionManager: {
+        getQueryEditorPresentation: () => undefined,
+      } as never,
+      tableDataService: {
+        executePreparedInsertPlan,
+        executePreparedDeletePlan: vi.fn(),
+      },
+      notifyWarning: vi.fn(),
+    });
+    const insert: PreparedInsertPlan = {
+      connectionId: config.id,
+      database: "db",
+      schema: "",
+      table: "items",
+      mode: "driver",
+      values: {},
+      operation: { sql: "INSERT", params: [] },
+      previewStatements: ["INSERT"],
+      verificationCriteria: null,
+    };
+    const first = controller.createInsertPreview("standalone", insert);
+    const second = controller.createInsertPreview("standalone", insert);
+    const running = controller.confirm(first.previewToken, "standalone");
+    expect(
+      await controller.confirm(second.previewToken, "standalone"),
+    ).toBeNull();
+    rejectInsert(new Error("Lost acknowledgement"));
+    expect(await running).toMatchObject({
+      type: "insertResult",
+      payload: {
+        success: false,
+        changesPossible: true,
+        outcomeUnknown: true,
+        error: expect.stringContaining("do not repeat"),
+      },
+    });
+    expect(executePreparedInsertPlan).toHaveBeenCalledOnce();
+  });
+
   it.each([
     "driver",
     "sql",

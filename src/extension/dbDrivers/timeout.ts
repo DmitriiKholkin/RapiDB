@@ -1,4 +1,5 @@
 import type { OperationCancellationContext } from "../../shared/safetyContracts";
+import { runWithMetadataCancellation } from "./metadataCancellation";
 import type {
   DriverMutationResult,
   DriverOperationContext,
@@ -131,6 +132,11 @@ const CANCELLABLE_MUTATION_METHODS = new Set([
   "insertRow",
   "deleteRows",
   "runTransaction",
+]);
+const NON_METADATA_METHODS = new Set([
+  "query",
+  "readTablePage",
+  ...CANCELLABLE_MUTATION_METHODS,
 ]);
 
 function normalizeTimeoutSeconds(
@@ -334,7 +340,19 @@ export function createTimeoutAwareDriver<T extends object>(
       const wrapped = (...args: unknown[]) => {
         let pendingOperation: Promise<unknown> | undefined;
         let deleteProgress: DriverMutationResult | undefined;
+        const isMetadata =
+          timeoutKind === "dbOperation" && !NON_METADATA_METHODS.has(property);
+        const metadataTimeoutMs = isMetadata
+          ? timeoutSettingsProvider().dbOperationTimeoutMs
+          : undefined;
+        const metadataDeadline =
+          metadataTimeoutMs !== undefined
+            ? Number.isFinite(metadataTimeoutMs) && metadataTimeoutMs > 0
+              ? Date.now() + metadataTimeoutMs
+              : Infinity
+            : undefined;
         const operationAbort =
+          isMetadata ||
           CANCELLABLE_MUTATION_METHODS.has(property) ||
           property === "readTablePage" ||
           property === "query"
@@ -369,7 +387,7 @@ export function createTimeoutAwareDriver<T extends object>(
               Date.now() + timeoutSettingsProvider().dbOperationTimeoutMs,
             ),
           } satisfies DriverTablePageRequest;
-        } else if (operationAbort) {
+        } else if (operationAbort && !isMetadata) {
           const timeoutMs = timeoutSettingsProvider().dbOperationTimeoutMs;
           const supplied = args[1] as DriverOperationContext | undefined;
           args[1] = {
@@ -393,11 +411,16 @@ export function createTimeoutAwareDriver<T extends object>(
         }
         return withDriverTimeout(
           () => {
-            pendingOperation = Reflect.apply(
-              value,
-              target,
-              args,
-            ) as Promise<unknown>;
+            const invoke = () =>
+              Reflect.apply(value, target, args) as Promise<unknown>;
+            pendingOperation =
+              isMetadata && operationAbort && metadataDeadline !== undefined
+                ? runWithMetadataCancellation(
+                    operationAbort.signal,
+                    metadataDeadline,
+                    invoke,
+                  )
+                : invoke();
             return pendingOperation;
           },
           {
@@ -407,7 +430,7 @@ export function createTimeoutAwareDriver<T extends object>(
             deadline:
               property === "query"
                 ? (args[2] as QueryExecutionOptions).deadline
-                : undefined,
+                : metadataDeadline,
             decorateTimeoutError: (error) => {
               if (property === "deleteRows")
                 error.deleteResult = deleteProgress;

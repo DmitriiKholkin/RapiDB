@@ -860,11 +860,11 @@ describe("QueryPanelController", () => {
       type: "executeQuery",
       payload: { queryText: "select 2", operationId: "new" },
     });
-    await vi.waitFor(() => expect(driver.query).toHaveBeenCalledTimes(2));
     rejectOldQuery(new Error("Old driver failure (OUTCOME_UNKNOWN)"));
     acknowledgeOldCancellation();
     await cancellingOld;
     await oldRun;
+    await vi.waitFor(() => expect(driver.query).toHaveBeenCalledTimes(2));
     expect(view.postMessage).not.toHaveBeenCalled();
     await controller.handleMessage({
       type: "cancelQuery",
@@ -2658,6 +2658,98 @@ describe("QueryPanelController", () => {
     expect(controller.activeQueryExecutions.size).toBe(0);
 
     currentCheck.mockRestore();
+  });
+
+  it.each([
+    "unavailable",
+    "fails",
+    "hangs",
+    "acknowledges",
+  ])("retains the connection fence across switches when cancellation %s", async (cancellation) => {
+    const result = { columns: [], rows: [], rowCount: 0, executionTimeMs: 1 };
+    let finishQuery!: (value: typeof result) => void;
+    const query = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishQuery = resolve;
+          }),
+      )
+      .mockResolvedValue(result);
+    const cancelCurrentOperation = vi.fn(async () => {
+      if (cancellation === "fails") throw new Error("Cancel failed");
+      if (cancellation === "hangs") await new Promise<void>(() => undefined);
+    });
+    const driver = {
+      query,
+      ...(cancellation === "unavailable" ? {} : { cancelCurrentOperation }),
+    };
+    let activeConnectionId = "conn-1";
+    const manager = {
+      getConnection: (id: string) => ({ id, name: id, type: "pg" }),
+      isConnected: () => true,
+      getDriver: () => driver,
+      getQueryRowLimit: () => 100,
+      addToHistory: vi.fn(async () => undefined),
+      getSchemaAsync: async () => [],
+    };
+    const view = {
+      getActiveConnectionId: () => activeConnectionId,
+      getInitialConnectionId: () => "conn-1",
+      getLastQueryResult: () => null,
+      postMessage: vi.fn(),
+      setActiveConnectionId: (id: string) => {
+        activeConnectionId = id;
+      },
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(manager as never, view);
+    const running = controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText: "select 1" },
+    });
+    await vi.waitFor(() => expect(query).toHaveBeenCalledOnce());
+    vi.useFakeTimers();
+    try {
+      for (const connectionId of ["conn-2", "conn-1"]) {
+        const switching = controller.handleMessage({
+          type: "activeConnectionChanged",
+          payload: { connectionId },
+        });
+        await vi.advanceTimersByTimeAsync(1500);
+        await switching;
+      }
+      const retry = controller.handleMessage({
+        type: "executeQuery",
+        payload: { queryText: "select 2" },
+      });
+      await vi.advanceTimersByTimeAsync(1500);
+      await retry;
+      expect(query).toHaveBeenCalledOnce();
+      expect(view.postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "queryResult",
+          payload: expect.objectContaining({
+            error: expect.stringContaining("previous query is still running"),
+          }),
+        }),
+      );
+      finishQuery(result);
+      await running;
+      await controller.handleMessage({
+        type: "executeQuery",
+        payload: { queryText: "select 3" },
+      });
+      expect(query).toHaveBeenCalledTimes(2);
+      expect(view.setLastQueryResult).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("cancels and invalidates the owned query on connection switch and disposal", async () => {

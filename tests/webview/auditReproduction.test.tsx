@@ -134,7 +134,7 @@ it("M16 clears apply-busy state while retaining drafts for a correlated backend-
   expect(result.current.applyStatus?.tone).toBe("error");
   expect(result.current.applyStatus?.message).toContain(backendError);
   expect(result.current.applyStatus?.message).toContain(
-    "The first refresh may precede a late write; refresh again and verify before retrying.",
+    "These insert drafts cannot be reapplied.",
   );
   expect(result.current.newRows).toEqual(drafts);
   expect(result.current.reconciliationRequired).toBe(true);

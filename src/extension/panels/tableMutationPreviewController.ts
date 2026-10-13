@@ -73,6 +73,8 @@ type MutationPreviewExecutionResult =
         operationId: string;
         success: boolean;
         error?: string;
+        changesPossible?: boolean;
+        outcomeUnknown?: boolean;
       };
     };
 
@@ -150,10 +152,10 @@ export class TableMutationPreviewController {
     }
 
     this.pendingMutationPreviews.delete(previewToken);
-    if (preview.kind === "deleteRows") {
-      if (this.executedOperationIds.has(preview.operationId)) return null;
-      this.executedOperationIds.add(preview.operationId);
-    }
+    // A fresh preview token must not replay an operation whose acknowledgement
+    // was lost. Consume the operation ID before crossing any await boundary.
+    if (this.executedOperationIds.has(preview.operationId)) return null;
+    this.executedOperationIds.add(preview.operationId);
 
     if (preview.kind === "applyChanges") {
       const operationCount =
@@ -199,7 +201,9 @@ export class TableMutationPreviewController {
           payload: {
             operationId: preview.operationId,
             success: false,
-            error: `All inserts failed: ${errors.join("; ")}`,
+            error: outcomeUnknown
+              ? `Insert outcome is unknown: ${errors.join("; ")}. Refresh and verify the data before creating a new insert; do not repeat these insert drafts.`
+              : `All inserts failed: ${errors.join("; ")}`,
             changesPossible,
             outcomeUnknown,
           },
@@ -291,12 +295,19 @@ export class TableMutationPreviewController {
       };
     } catch (error: unknown) {
       const normalized = normalizeUnknownError(error);
+      const outcomeUnknown =
+        !isMutationNotExecutedError(error) &&
+        !(error instanceof TransactionVerificationError);
       return {
         type: "insertResult",
         payload: {
           operationId: preview.operationId,
           success: false,
-          error: normalized.message,
+          error: outcomeUnknown
+            ? `${normalized.message} Insert outcome is unknown. Refresh and verify before creating a new insert; do not repeat this insert draft.`
+            : normalized.message,
+          changesPossible: outcomeUnknown,
+          outcomeUnknown,
         },
       };
     }

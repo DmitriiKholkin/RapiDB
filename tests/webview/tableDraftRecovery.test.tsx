@@ -152,6 +152,42 @@ function mountController(
 }
 
 describe("table draft recovery across remounts", () => {
+  it.each([
+    false,
+    true,
+  ])("allows INSERT retry only for a proven non-execution (unknown=%s)", (outcomeUnknown) => {
+    const hook = mountController();
+    act(() => hook.result.current.startInsertRow());
+    act(() => hook.result.current.applyChanges());
+    const operationId = lastPayload("applyChanges").operationId;
+    act(() =>
+      dispatchIncomingMessage("applyResult", {
+        operationId,
+        success: false,
+        error: "Lost reply",
+        changesPossible: outcomeUnknown,
+        outcomeUnknown,
+      }),
+    );
+    hook.commit([{ id: 1, name: "Alice" }]);
+    const drafts = hook.result.current.newRows;
+    act(() => hook.result.current.applyChanges());
+    expect(messages("applyChanges")).toHaveLength(outcomeUnknown ? 1 : 2);
+    if (!outcomeUnknown) return;
+    expect(hook.result.current.newRows).toEqual(drafts);
+    expect(hook.result.current.reconciliationRequired).toBe(true);
+    act(() => hook.result.current.retryReconciliation());
+    hook.commit([
+      { id: 2, name: "Late inserted row" },
+      { id: 1, name: "Alice" },
+    ]);
+    act(() => hook.result.current.applyChanges());
+    expect(messages("applyChanges")).toHaveLength(1);
+    act(() => hook.result.current.revertChanges());
+    expect(hook.result.current.newRows).toHaveLength(0);
+    expect(hook.result.current.reconciliationRequired).toBe(false);
+  });
+
   it("preserves an unhydrated UPDATE after first read failure and metadataRefresh retry", () => {
     const first = mountController();
     act(() =>
@@ -327,7 +363,7 @@ describe("table draft recovery across remounts", () => {
           name: "Apply Changes",
         }) as HTMLButtonElement
       ).disabled,
-    ).toBe(false);
+    ).toBe(true);
     expect(messages("applyChanges")).toHaveLength(0);
     // The user verifies the inserted row and abandons the uncertain local draft.
     fireEvent.click(screen.getByRole("button", { name: "Revert All" }));

@@ -79,6 +79,15 @@ interface ReconciliationState {
 
 const RESTORED_MUTATION_WARNING =
   "A previous table write may have been applied. Refresh and verify before retrying. The initial read may precede a late write; use Refresh again before retrying or reverting.";
+const UNKNOWN_INSERT_WARNING =
+  "Insert outcome is unknown. These insert drafts cannot be reapplied. Refresh and verify the data, then use Revert All to discard the drafts. Create new drafts only for rows confirmed missing. The first refresh may precede a late write; refresh again and verify before creating new drafts.";
+
+function hasUnknownInsertDrafts(
+  recovery: ReconciliationState | null,
+  drafts: readonly InsertDraftRow[],
+): boolean {
+  return recovery?.kind === "apply" && recovery.unknown && drafts.length > 0;
+}
 
 export function useTableMutationController({
   initialDraft,
@@ -104,7 +113,13 @@ export function useTableMutationController({
   const [applying, setApplying] = useState(false);
   const [applyStatus, setApplyStatus] = useState<TableApplyStatus | null>(
     initialDraft?.mutation?.kind === "apply"
-      ? { tone: "error", message: RESTORED_MUTATION_WARNING }
+      ? {
+          tone: "error",
+          message:
+            initialDraft.mutation.unknown && initialDraft.newRows.length > 0
+              ? `${RESTORED_MUTATION_WARNING} ${UNKNOWN_INSERT_WARNING}`
+              : RESTORED_MUTATION_WARNING,
+        }
       : null,
   );
   const [newRows, setNewRows] = useState<InsertDraftRow[]>(
@@ -187,7 +202,8 @@ export function useTableMutationController({
       loadingRef.current ||
       activeOperationIdRef.current !== null ||
       (reconciliationRef.current !== null &&
-        !reconciliationRef.current.verified),
+        !reconciliationRef.current.verified) ||
+      hasUnknownInsertDrafts(reconciliationRef.current, newRowsRef.current),
     [loadingRef],
   );
 
@@ -363,7 +379,8 @@ export function useTableMutationController({
       const recovery = reconciliationRef.current;
       if (recovery && !recovery.requiresExplicitRead) {
         // A read does not prove an unknown write has finished. Keep recovery
-        // available for another read, but allow only an explicit user retry.
+        // available for another read. Unknown INSERT drafts remain fenced even
+        // after this read; presence/absence on one page is not execution proof.
         setReconciliation(
           recovery.unknown ? { ...recovery, verified: true } : null,
         );
@@ -534,9 +551,12 @@ export function useTableMutationController({
               : failureMessage;
           setApplyStatus({
             tone: "error",
-            message: outcomeUnknown
-              ? `${message} The first refresh may precede a late write; refresh again and verify before retrying.`
-              : message,
+            message:
+              outcomeUnknown && newRowsRef.current.length > 0 && !insertApplied
+                ? `${message} ${UNKNOWN_INSERT_WARNING}`
+                : outcomeUnknown
+                  ? `${message} The first refresh may precede a late write; refresh again and verify before retrying.`
+                  : message,
           });
         }
 
@@ -1558,7 +1578,9 @@ export function useTableMutationController({
     deleting,
     reconciliationPending:
       reconciliation !== null && !reconciliation.verified && loadingRef.current,
-    reconciliationRequired: reconciliation !== null && !reconciliation.verified,
+    reconciliationRequired:
+      (reconciliation !== null && !reconciliation.verified) ||
+      hasUnknownInsertDrafts(reconciliation, newRows),
     dismissApplyStatus,
     dismissMutationError: () => setLocalMutationError(null),
     editCell,

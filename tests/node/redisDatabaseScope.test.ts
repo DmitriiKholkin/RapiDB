@@ -174,6 +174,37 @@ const config: DriverConnectionConfig = {
   host: "localhost",
 };
 const drivers: RedisDriver[] = [];
+
+it("destroys only the owned metadata session on timeout", async () => {
+  const driver = driverWith();
+  await driver.connect();
+  const editor = harness.clients[0];
+  vi.useFakeTimers();
+  try {
+    const wrapped = createTimeoutAwareDriver(driver, () => ({
+      connectionTimeoutMs: 1000,
+      connectionTimeoutSeconds: 1,
+      dbOperationTimeoutMs: 25,
+      dbOperationTimeoutSeconds: 1,
+    }));
+    const operation = wrapped.listObjects("db1");
+    const owned = harness.clients.at(-1);
+    if (!owned || owned === editor)
+      throw new Error("Expected an isolated metadata client");
+    owned.scanGate = new Promise<void>(() => undefined);
+    const assertion = expect(operation).rejects.toMatchObject({
+      name: "DriverTimeoutError",
+    });
+    await vi.advanceTimersByTimeAsync(25);
+    await assertion;
+    expect(owned.destroy).toHaveBeenCalledOnce();
+    expect(editor.destroy).not.toHaveBeenCalled();
+    expect(editor.isOpen).toBe(true);
+    expect(driver.isConnected()).toBe(true);
+  } finally {
+    vi.useRealTimers();
+  }
+});
 function driverWith(overrides: Partial<DriverConnectionConfig> = {}) {
   const driver = new RedisDriver({ ...config, ...overrides }, () => ({
     connectionTimeoutMs: 1000,

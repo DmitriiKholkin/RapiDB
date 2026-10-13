@@ -59,6 +59,7 @@ import {
 } from "../utils/jsonCanonical";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import { deleteRowsSequentially, prepareDeleteBatch } from "./deleteOutcomes";
+import { getMetadataContext } from "./metadataCancellation";
 import {
   applyFilters,
   applySort,
@@ -1347,10 +1348,33 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   private requireClient(): DynamoDBClient {
+    const metadata = getMetadataContext();
     if (!this.client || !this.connected) {
       throw new Error("DynamoDB is not connected.");
     }
-    return this.client;
+    if (!metadata) return this.client;
+    return new Proxy(this.client, {
+      get(target, property) {
+        if (property === "send")
+          return (
+            command: unknown,
+            options?: { abortSignal?: AbortSignal },
+          ) => {
+            metadata.signal.throwIfAborted();
+            return Reflect.apply(target.send, target, [
+              command,
+              {
+                ...options,
+                abortSignal: options?.abortSignal
+                  ? AbortSignal.any([options.abortSignal, metadata.signal])
+                  : metadata.signal,
+              },
+            ]);
+          };
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
   }
 
   private invalidateCursorCacheForTable(table: string): void {

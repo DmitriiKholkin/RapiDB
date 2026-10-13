@@ -7638,7 +7638,7 @@ describe("TableView", () => {
   it.each([
     false,
     true,
-  ])("keeps unknown DEFAULT insert recovery after the first read, preserving live edits/drafts through a late write (second read fails=%s)", async (secondReadFails) => {
+  ])("fences unknown DEFAULT insert drafts through repeated reads and a late write (second read fails=%s)", async (secondReadFails) => {
     const user = userEvent.setup();
     await initializeCommittedTableData({
       columnDefs: columns.map((column) =>
@@ -7687,15 +7687,10 @@ describe("TableView", () => {
       screen
         .getByRole("button", { name: "Apply Changes" })
         .hasAttribute("disabled"),
-    ).toBe(false);
-
-    // Edits made after the first verification must also survive later reads.
-    await user.dblClick(getBodyCell("name", 2));
-    fireEvent.change(screen.getByLabelText("Cell data"), {
-      target: { value: "Pending Bob" },
-    });
-    await user.click(screen.getByRole("button", { name: "Apply" }));
-    await user.click(screen.getByLabelText("Select row 2"));
+    ).toBe(true);
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(1);
+    // A refresh cannot turn a possibly committed INSERT into a retryable draft.
     clearPostedMessages();
     await user.click(screen.getByRole("button", { name: "Refresh" }));
     expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
@@ -7718,7 +7713,7 @@ describe("TableView", () => {
         screen.queryByRole("status", { name: "Loading data..." }),
       ).toBeNull();
       expect(screen.getByText(/verification refresh failed/)).toBeTruthy();
-      for (const name of ["Apply Changes", "Add Row", "Delete (1)"]) {
+      for (const name of ["Apply Changes", "Add Row", "Delete (0)"]) {
         expect(
           screen.getByRole("button", { name }).hasAttribute("disabled"),
         ).toBe(true);
@@ -7732,7 +7727,7 @@ describe("TableView", () => {
         ctrlKey: true,
         metaKey: true,
       });
-      expect(getBodyCell("name", 2).textContent).toContain("Pending Bob");
+      expect(getBodyCell("name", 2).textContent).toContain("Bob");
       expect(screen.getAllByText(/^DEFAULT$/)).toHaveLength(2);
       expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
       expect(postedMessagesOfType("deleteRows")).toHaveLength(0);
@@ -7749,7 +7744,7 @@ describe("TableView", () => {
       }),
     );
     expect(getBodyCell("name", 1).textContent).toContain("Late default insert");
-    expect(getBodyCell("name", 2).textContent).toContain("Pending Bob");
+    expect(getBodyCell("name", 2).textContent).toContain("Bob");
     expect(getBodyCell("name", 3).textContent).toContain("Pending Alice");
     expect(screen.getAllByText(/^DEFAULT$/)).toHaveLength(2);
     expect(
@@ -7760,26 +7755,19 @@ describe("TableView", () => {
     await act(async () => dispatchRawIncomingMessage("applyResult", result));
     expect(postedMessagesOfType("fetchPage")).toHaveLength(fetchCount);
 
-    // Verification never infers that a generated/default draft was applied,
-    // and never retries it automatically. Retry remains an explicit user choice.
+    // Neither a successful read nor duplicate results allow replaying INSERT.
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+    await user.click(screen.getByRole("button", { name: "Revert All" }));
+    expect(screen.queryByRole("button", { name: "Apply Changes" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
     await user.click(screen.getByRole("button", { name: "Apply Changes" }));
     expect(postedMessagesOfType("applyChanges")).toHaveLength(1);
     expect(getLastPostedMessage()).toMatchObject({
       type: "applyChanges",
       payload: {
         insertValues: [{}],
-        updates: [
-          {
-            primaryKeys: { id: 1 },
-            changes: { name: "Pending Alice" },
-            originalValues: { name: "Alice" },
-          },
-          {
-            primaryKeys: { id: 2 },
-            changes: { name: "Pending Bob" },
-            originalValues: { name: "Bob" },
-          },
-        ],
+        updates: [],
       },
     });
     expect(

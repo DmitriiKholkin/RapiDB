@@ -30,6 +30,10 @@ import {
 } from "./BaseDBDriver";
 import { queryCollectionLimit } from "./boundedQueryRows";
 import { literalContainsPattern } from "./literalContains";
+import {
+  getMetadataContext,
+  withMetadataResource,
+} from "./metadataCancellation";
 import { BoundedPostgresQuery } from "./postgresBoundedQuery";
 import {
   type IndexedPlaceholderOptions,
@@ -573,7 +577,7 @@ export class PostgresDriver extends BaseDBDriver {
       database === this.connectedDatabaseName ||
       database === this.config.database
     ) {
-      return this.pool;
+      return this.metadataPool(this.pool);
     }
     let pool = this.databasePools.get(database);
     if (!pool) {
@@ -585,7 +589,42 @@ export class PostgresDriver extends BaseDBDriver {
       // never replace the connection/query editor's default pool.
       this.databasePools.set(database, pool);
     }
-    return pool;
+    return this.metadataPool(pool);
+  }
+  private metadataPool(pool: Pool): Pool {
+    const metadata = getMetadataContext();
+    if (!metadata) return pool;
+    return new Proxy(pool, {
+      get: (target, property) => {
+        if (property === "query")
+          return async (...args: unknown[]) => {
+            const operation: PostgresPoolWaitOperation = { cancelled: false };
+            let client: PoolClient | undefined;
+            const cancel = () => {
+              operation.wakePoolWait?.();
+              operation.cancelPoolCheckout?.();
+              const owned = client;
+              client = undefined;
+              owned?.release(true);
+            };
+            return withMetadataResource(cancel, async () => {
+              try {
+                client = await this.acquirePoolClient(operation, pool, () =>
+                  metadata.signal.throwIfAborted(),
+                );
+                metadata.signal.throwIfAborted();
+                return await Reflect.apply(client.query, client, args);
+              } finally {
+                const owned = client;
+                client = undefined;
+                owned?.release(metadata.signal.aborted);
+              }
+            });
+          };
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
   }
   private createPool(
     database: string,
@@ -662,6 +701,15 @@ export class PostgresDriver extends BaseDBDriver {
       cancelled: false,
     };
     this.catalogSessions.set(pool, session);
+    const metadata = getMetadataContext();
+    const cancelCatalog = () => {
+      session.cancelled = true;
+      const owned = session.client;
+      session.client = undefined;
+      owned?.release(true);
+      void this.closePool(pool).catch(() => undefined);
+    };
+    metadata?.cleanups.add(cancelCatalog);
     pool.on("error", (error) =>
       logger.error("PostgreSQL catalog pool error", error),
     );
@@ -673,7 +721,14 @@ export class PostgresDriver extends BaseDBDriver {
         throw new Error("[RapiDB] PostgreSQL catalog session cancelled");
       }
       session.client = client;
-      const result = await run(client);
+      const result = await withMetadataResource(
+        () => {
+          const owned = session.client;
+          session.client = undefined;
+          owned?.release(true);
+        },
+        () => run(client),
+      );
       this.assertConnectionEpoch(epoch);
       return result;
     } catch (error) {
@@ -693,6 +748,7 @@ export class PostgresDriver extends BaseDBDriver {
           );
         else await closing;
       } finally {
+        metadata?.cleanups.delete(cancelCatalog);
         this.catalogSessions.delete(pool);
       }
     }

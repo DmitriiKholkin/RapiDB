@@ -473,7 +473,9 @@ describe("TableView persisted state recovery", () => {
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     expect(fetches()).toHaveLength(3);
     commit(lastFetch().fetchId);
-    expect(isButtonDisabled("Apply Changes")).toBe(false);
+    expect(isButtonDisabled("Apply Changes")).toBe(true);
+    expect(isButtonDisabled("Add Row")).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Revert All" }));
     expect(isButtonDisabled("Add Row")).toBe(false);
   });
 
@@ -580,9 +582,7 @@ describe("TableView persisted state recovery", () => {
     expect(
       screen.queryByRole("status", { name: "Loading data..." }),
     ).toBeNull();
-    expect(isButtonDisabled("Apply Changes")).toBe(
-      currentType === "tableError",
-    );
+    expect(isButtonDisabled("Apply Changes")).toBe(true);
     act(deliverOld);
     expect(screen.queryByText("OLD VERIFICATION")).toBeNull();
     expect(screen.queryByText("OLD READ ERROR")).toBeNull();
@@ -613,7 +613,13 @@ describe("TableView persisted state recovery", () => {
     } else {
       expect(screen.getByText("CURRENT VERIFICATION")).toBeTruthy();
     }
-    expect(isButtonDisabled("Apply Changes")).toBe(false);
+    expect(isButtonDisabled("Apply Changes")).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(
+      getPostedMessages().filter((message) => message.type === "applyChanges"),
+    ).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: "Revert All" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add Row" }));
     fireEvent.click(screen.getByRole("button", { name: "Apply Changes" }));
     expect(
       getPostedMessages().filter((message) => message.type === "applyChanges"),
