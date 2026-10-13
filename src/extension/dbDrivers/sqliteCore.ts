@@ -3,6 +3,7 @@ import type { ConnectionConfig } from "../connectionManager";
 import { BaseDBDriver } from "./BaseDBDriver";
 import { queryCollectionLimit } from "./boundedQueryRows";
 import { literalContainsPattern } from "./literalContains";
+import { MutationNotExecutedError } from "./mutationExecutionState";
 import { openSQLiteDatabase, type SQLiteDatabase } from "./sqliteRuntime";
 import {
   type DriverTimeoutSettingsProvider,
@@ -10,6 +11,7 @@ import {
 } from "./timeout";
 import {
   TransactionIdentityStore,
+  TransactionVerificationError,
   verifyTransaction,
 } from "./transactionVerification";
 import type {
@@ -986,6 +988,11 @@ export class SQLiteCoreDriver extends BaseDBDriver {
         } catch (rollbackError) {
           throw new SQLiteRollbackFailure(error, rollbackError);
         }
+        if (error instanceof TransactionVerificationError) throw error;
+        throw new MutationNotExecutedError(
+          error instanceof Error ? error.message : String(error),
+          error,
+        );
       }
       throw error;
     }
@@ -1398,6 +1405,11 @@ export class SQLiteCoreDriver extends BaseDBDriver {
         } catch (rollbackError) {
           throw new SQLiteRollbackFailure(error, rollbackError);
         }
+        if (error instanceof TransactionVerificationError) throw error;
+        throw new MutationNotExecutedError(
+          error instanceof Error ? error.message : String(error),
+          error,
+        );
       }
       throw error;
     }

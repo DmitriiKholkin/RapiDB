@@ -13,17 +13,26 @@ function harness(status: unknown = { serverStatus: 2 }) {
         return command;
       }),
     },
-    query: vi.fn(async (options: { sql: string } | string): Promise<[unknown, unknown[]]> => {
-      const text = typeof options === "string" ? options : options.sql;
-      sql.push(text);
-      return [text === "DO 0" ? status : [], []];
-    }),
+    query: vi.fn(
+      async (
+        options: { sql: string } | string,
+      ): Promise<[unknown, unknown[]]> => {
+        const text = typeof options === "string" ? options : options.sql;
+        sql.push(text);
+        return [text === "DO 0" ? status : [], []];
+      },
+    ),
     destroy: vi.fn(),
     release: vi.fn(),
   };
   const driver = new MySQLDriver(
     { id: "isolation", name: "MySQL", type: "mysql", host: "localhost" },
-    () => ({ connectionTimeoutMs: 1000, connectionTimeoutSeconds: 1, dbOperationTimeoutMs: 1000, dbOperationTimeoutSeconds: 1 }),
+    () => ({
+      connectionTimeoutMs: 1000,
+      connectionTimeoutSeconds: 1,
+      dbOperationTimeoutMs: 1000,
+      dbOperationTimeoutSeconds: 1,
+    }),
   );
   const tracked = driver as unknown as {
     pool: unknown;
@@ -45,7 +54,11 @@ describe("MySQL arbitrary-query transaction and session isolation", () => {
     [1, [1]],
   ])("rejects unfinished transactions in all query paths (cap=%s, params=%s)", async (hardCap, params) => {
     const { driver, connection, sql, tracked } = harness({ serverStatus: 3 });
-    await expect(driver.query("START TRANSACTION; UPDATE accounts SET balance=0", params, { hardCap })).rejects.toThrow(/Unfinished.*rolled back/);
+    await expect(
+      driver.query("START TRANSACTION; UPDATE accounts SET balance=0", params, {
+        hardCap,
+      }),
+    ).rejects.toThrow(/Unfinished.*rolled back/);
     expect(sql.slice(-2)).toEqual(["DO 0", "ROLLBACK"]);
     expect(connection.destroy).toHaveBeenCalledOnce();
     expect(connection.release).not.toHaveBeenCalled();
@@ -66,13 +79,23 @@ describe("MySQL arbitrary-query transaction and session isolation", () => {
     expect(connection.destroy).toHaveBeenCalledOnce();
   });
 
-  it.each([{}, [], { serverStatus: -1 }, { serverStatus: 1.5 }, { serverStatus: 65536 }])("fails closed on invalid status %j", async (status) => {
+  it.each([
+    {},
+    [],
+    { serverStatus: -1 },
+    { serverStatus: 1.5 },
+    { serverStatus: 65536 },
+  ])("fails closed on invalid status %j", async (status) => {
     const { driver, connection } = harness(status);
     await expect(driver.query("SELECT 1")).rejects.toThrow(/Cannot verify/);
     expect(connection.destroy).toHaveBeenCalledOnce();
   });
 
-  it.each(["SELECT 1", "DO 0", "ROLLBACK"])("preserves failures and discards connection when %s fails", async (failAt) => {
+  it.each([
+    "SELECT 1",
+    "DO 0",
+    "ROLLBACK",
+  ])("preserves failures and discards connection when %s fails", async (failAt) => {
     const { driver, connection } = harness({ serverStatus: 3 });
     connection.query.mockImplementation(async (options) => {
       const sql = typeof options === "string" ? options : options.sql;
@@ -84,7 +107,10 @@ describe("MySQL arbitrary-query transaction and session isolation", () => {
     expect(connection.release).not.toHaveBeenCalled();
   });
 
-  it.each(["DO 0", "ROLLBACK"])("settles cancellation/timeout while %s is hung", async (hangAt) => {
+  it.each([
+    "DO 0",
+    "ROLLBACK",
+  ])("settles cancellation/timeout while %s is hung", async (hangAt) => {
     for (const cancel of [true, false]) {
       vi.useFakeTimers();
       const { driver, connection, tracked } = harness({ serverStatus: 3 });
@@ -93,9 +119,16 @@ describe("MySQL arbitrary-query transaction and session isolation", () => {
         if (sql === hangAt) return new Promise(() => {});
         return [{ serverStatus: 3 }, []];
       });
-      const outcome = driver.query("SELECT 1", undefined, { requestToken: 9 }).catch((error: unknown) => error);
+      const outcome = driver
+        .query("SELECT 1", undefined, { requestToken: 9 })
+        .catch((error: unknown) => error);
       await vi.advanceTimersByTimeAsync(0);
-      if (cancel) await driver.cancelCurrentOperation({ operationName: "query", requestToken: 9, reason: "manual" });
+      if (cancel)
+        await driver.cancelCurrentOperation({
+          operationName: "query",
+          requestToken: 9,
+          reason: "manual",
+        });
       else await vi.advanceTimersByTimeAsync(1000);
       expect(String(await outcome)).toMatch(cancel ? /cancelled/ : /timed out/);
       expect(connection.destroy).toHaveBeenCalledOnce();

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createClient } from "redis";
+import { createClient, ErrorReply } from "redis";
 import {
   type OperationCancellationContext,
   REDIS_READ_BUDGET,
@@ -15,6 +15,7 @@ import { logger } from "../utils/logger";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import { deleteRowsSequentially, prepareDeleteBatch } from "./deleteOutcomes";
 import { getMetadataContext } from "./metadataCancellation";
+import { MutationNotExecutedError } from "./mutationExecutionState";
 import {
   applyFilters,
   applySort,
@@ -1220,7 +1221,17 @@ export class RedisDriver implements IDBDriver {
     const client = context
       ? baseClient.withAbortSignal(context.signal)
       : baseClient;
-    const result = await client[plan.command](...plan.args, plan.options);
+    let result: string | null;
+    try {
+      result = await client[plan.command](...plan.args, plan.options);
+    } catch (error) {
+      // A Redis ErrorReply means the server rejected the atomic SET command;
+      // transport failures remain unknown because the write may have arrived.
+      if (error instanceof ErrorReply) {
+        throw new MutationNotExecutedError(error.message, error);
+      }
+      throw error;
+    }
 
     return { affectedRows: result === "OK" ? 1 : 0 };
   }

@@ -19,6 +19,7 @@ import { DynamoDBDriver } from "../../src/extension/dbDrivers/dynamodb.ts";
 import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch.ts";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb.ts";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis.ts";
+import { REDIS_ALL_KEYS_TABLE } from "../../src/extension/dbDrivers/redisKeyspace.ts";
 import type {
   ColumnTypeMeta,
   DriverTablePageResult,
@@ -398,7 +399,7 @@ async function verifyRedisDriver(transport: LiveTransport): Promise<void> {
     const objects = await driver.listObjects();
     assert.deepEqual(
       objects.map((entry) => entry.name),
-      ["users"],
+      [REDIS_ALL_KEYS_TABLE, "users"],
     );
 
     const columns = await driver.describeColumns("db0", "db0", "users");
@@ -503,7 +504,7 @@ async function verifyRedisDefaultPrefix(driver: RedisDriver): Promise<void> {
     await seed.set(keys[2], "b");
     await seed.set(keys[3], "outside");
     const names = (await driver.listObjects("db15")).map((entry) => entry.name);
-    for (const name of ["default", "default:", "users"])
+    for (const name of [REDIS_ALL_KEYS_TABLE, "default:", "users"])
       assert(names.includes(name));
     const native = await read.getPage(
       "redis-b09",
@@ -536,7 +537,7 @@ async function verifyRedisDefaultPrefix(driver: RedisDriver): Promise<void> {
       "default:",
       1,
       100,
-      [{ column: "key", operator: "like", value: `%${id}%` }],
+      [{ column: "key", operator: "like", value: id }],
       { column: "value", direction: "desc" },
     );
     assert.deepEqual(

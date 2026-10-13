@@ -49,11 +49,20 @@ process.on("message", (request: SQLiteWorkerRequest) => {
           );
         }
       } catch (error) {
+        const executionState =
+          error && typeof error === "object"
+            ? (error as { executionState?: unknown }).executionState
+            : undefined;
         response.error = {
           message: error instanceof Error ? error.message : String(error),
           name: error instanceof Error ? error.name : "Error",
           ...(error instanceof TransactionVerificationError
             ? { verificationFailure: error.verificationFailure }
+            : {}),
+          ...(executionState === "not-executed" || executionState === "unknown"
+            ? {
+                executionState,
+              }
             : {}),
         };
       }

@@ -144,6 +144,9 @@ describe("B08 PostgreSQL reconstructed DDL (live)", () => {
     const editor = new PostgresDriver(config);
     const verifier = new PostgresDriver(config);
     await editor.connect();
+    const editorPool = (editor as unknown as { pool: Pool | null }).pool;
+    if (!editorPool) throw new Error("Missing editor PostgreSQL pool");
+    const editorClient = await editorPool.connect();
     const catalogPids: unknown[] = [];
     const internals = editor as unknown as {
       createPool(
@@ -188,18 +191,18 @@ describe("B08 PostgreSQL reconstructed DDL (live)", () => {
         return pool;
       });
     try {
-      await editor.query("BEGIN");
-      await editor.query("SET LOCAL search_path TO public, pg_catalog");
-      await editor.query(`INSERT INTO ${qualified(name)} VALUES (2, 20)`);
-      await editor.query(
+      await editorClient.query("BEGIN");
+      await editorClient.query("SET LOCAL search_path TO public, pg_catalog");
+      await editorClient.query(`INSERT INTO ${qualified(name)} VALUES (2, 20)`);
+      await editorClient.query(
         `UPDATE ${qualified(name)} SET value = 11 WHERE id = 1`,
       );
       const state = async () =>
-        rowsFromQuery(
-          await editor.query(
+        (
+          await editorClient.query(
             `SELECT pg_backend_pid() AS pid, current_setting('search_path') AS path, id, value FROM ${qualified(name)} ORDER BY id`,
-          ),
-        );
+          )
+        ).rows;
       const before = await state();
       expect(before.map(({ id, value }) => ({ id, value }))).toEqual([
         { id: 1, value: 11 },
@@ -226,7 +229,7 @@ describe("B08 PostgreSQL reconstructed DDL (live)", () => {
           ),
         )
         .toEqual([]);
-      await editor.query("COMMIT");
+      await editorClient.query("COMMIT");
       await verifier.connect();
       expect(
         rowsFromQuery(
@@ -240,7 +243,8 @@ describe("B08 PostgreSQL reconstructed DDL (live)", () => {
       ]);
     } finally {
       poolSpy.mockRestore();
-      await editor.query("ROLLBACK").catch(() => undefined);
+      await editorClient.query("ROLLBACK").catch(() => undefined);
+      editorClient.release();
       await Promise.all([editor.disconnect(), verifier.disconnect()]);
     }
   });

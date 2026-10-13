@@ -108,17 +108,19 @@ class InsertRespServer {
       case "EVAL": {
         // Model the string-key compare-and-write using the actual RESP
         // arguments emitted by node-redis, including embedded NUL bytes.
+        const keyCount = Number(args[2]);
         const source = args[3];
         const target = args[4];
+        const arg = (index: number) => args[2 + keyCount + index];
         const stored = this.rows.get(source);
         if (!stored) return ":0\r\n";
         if (source !== target && this.rows.has(target)) return ":-1\r\n";
-        if (Array.isArray(stored.value) || args[5] !== "string")
+        if (Array.isArray(stored.value) || arg(1) !== "string")
           return ":-2\r\n";
-        if (args[11] === "1" && stored.value !== args[6]) return ":-3\r\n";
-        if (args[7] === "1") stored.value = JSON.parse(args[8]);
-        if (args[9] === "persist") stored.ttl = -1;
-        if (args[9] === "set") stored.ttl = Number(args[10]);
+        if (arg(7) === "1" && stored.value !== arg(2)) return ":-3\r\n";
+        if (arg(3) === "1") stored.value = JSON.parse(arg(4));
+        if (arg(5) === "persist") stored.ttl = -1;
+        if (arg(5) === "set") stored.ttl = Number(arg(6));
         this.rows.delete(source);
         this.rows.set(target, stored);
         return ":1\r\n";
@@ -462,9 +464,10 @@ describe("B07 Redis draft NULL UI → host → real node-redis RESP wire", () =>
       expect(evals).toHaveLength(1);
       expect(evals[0][1]).toContain("redis.call('GET', source) ~= ARGV[2]");
       expect(evals[0].slice(2)).toEqual([
-        "2",
+        "3",
         key,
         key,
+        expect.stringMatching(/^drafts:seed:rapidb-edit:/),
         "string",
         NULL_SENTINEL,
         change === "value" ? "1" : "0",

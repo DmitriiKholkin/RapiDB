@@ -15,10 +15,11 @@ describe("splitMySQLScript", () => {
     expect(splitMySQLScript(`${sql}; SELECT 2;`)).toEqual([sql, "SELECT 2"]);
   });
 
-  it.each(["SELECT 1 /* unfinished", "DELETE FROM accounts /*! WHERE id = 1"])(
-    "rejects unterminated comments before submitting any script: %s",
-    (sql) => expect(() => splitMySQLScript(sql)).toThrow(/Unterminated/),
-  );
+  it.each([
+    "SELECT 1 /* unfinished",
+    "DELETE FROM accounts /*! WHERE id = 1",
+  ])("rejects unterminated comments before submitting any script: %s", (sql) =>
+    expect(() => splitMySQLScript(sql)).toThrow(/Unterminated/));
   it("retains a cap after CR comments and separates tokens around block comments", () => {
     const capped = applyHardCapToSqlQuery(
       "SELECT * FROM items -- comment\r ORDER BY id",

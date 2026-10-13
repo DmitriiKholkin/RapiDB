@@ -276,6 +276,9 @@ export class SQLiteWorkerClient {
               )
             : Object.assign(new Error(response.error.message), {
                 name: response.error.name,
+                ...(response.error.executionState
+                  ? { executionState: response.error.executionState }
+                  : {}),
               })
           : undefined,
         response.value,
