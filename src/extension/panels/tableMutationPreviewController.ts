@@ -10,7 +10,10 @@ import {
   DeleteExecutionError,
   getDeleteEvidence,
 } from "../dbDrivers/deleteOutcomes";
-import { isMutationNotExecutedError } from "../dbDrivers/mutationExecutionState";
+import {
+  isMutationNotExecutedError,
+  isPostgresStatementRejection,
+} from "../dbDrivers/mutationExecutionState";
 import { TransactionVerificationError } from "../dbDrivers/transactionVerification";
 import {
   executeAtomicSqlApplyPlan,
@@ -188,7 +191,10 @@ export class TableMutationPreviewController {
           const normalized = normalizeUnknownError(error);
           const definitelyNoChanges =
             isMutationNotExecutedError(error) ||
-            error instanceof TransactionVerificationError;
+            error instanceof TransactionVerificationError ||
+            (this.connectionManager.getConnection?.(this.connectionId)?.type ===
+              "pg" &&
+              isPostgresStatementRejection(error));
           changesPossible ||= !definitelyNoChanges;
           outcomeUnknown ||= !definitelyNoChanges;
           errors.push(normalized.message);
@@ -297,7 +303,11 @@ export class TableMutationPreviewController {
       const normalized = normalizeUnknownError(error);
       const outcomeUnknown =
         !isMutationNotExecutedError(error) &&
-        !(error instanceof TransactionVerificationError);
+        !(error instanceof TransactionVerificationError) &&
+        !(
+          this.connectionManager.getConnection?.(this.connectionId)?.type ===
+            "pg" && isPostgresStatementRejection(error)
+        );
       return {
         type: "insertResult",
         payload: {

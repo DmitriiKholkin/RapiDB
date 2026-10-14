@@ -1,5 +1,5 @@
+import { DatabaseError } from "pg";
 import { describe, expect, it, vi } from "vitest";
-import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import { TransactionVerificationError } from "../../src/extension/dbDrivers/transactionVerification";
 import { TableMutationPreviewController } from "../../src/extension/panels/tableMutationPreviewController";
 import type { PreparedInsertPlan } from "../../src/extension/table/tableDataContracts";
@@ -7,19 +7,24 @@ import { TableMutationService } from "../../src/extension/table/tableMutationSer
 
 const config = { id: "insert-outcome", name: "insert-outcome" };
 
-async function confirmSingleDriverInsert(error: Error) {
-  const driver = new MongoDBDriver({ ...config, type: "mongodb" });
+async function confirmSingleDriverInsert(
+  error: Error,
+  type: "mongodb" | "pg" = "mongodb",
+) {
   const insertedRows: Record<string, unknown>[] = [];
-  const insertRow = vi
-    .spyOn(driver, "insertRow")
-    .mockImplementation(async () => {
-      if ((error as Error & { code?: string }).code !== "NOT_EXECUTED") {
-        insertedRows.push({ name: "new row" });
-      }
-      throw error;
-    });
+  const insertRow = vi.fn(async () => {
+    const code = (error as Error & { code?: string }).code;
+    if (
+      code !== "NOT_EXECUTED" &&
+      !(type === "pg" && error instanceof DatabaseError && code === "23502")
+    ) {
+      insertedRows.push({ name: "new row" });
+    }
+    throw error;
+  });
+  const driver = { insertRow };
   const connectionManager = {
-    getConnection: () => ({ ...config, type: "mongodb", readOnly: false }),
+    getConnection: () => ({ ...config, type, readOnly: false }),
     getDriver: () => driver,
     getQueryEditorPresentation: () => undefined,
   };
@@ -135,6 +140,102 @@ describe("mutation outcome semantics", () => {
       await controller.confirm(standalone.previewToken, "insert-one"),
     ).toBeNull();
     expect(insertRow).toHaveBeenCalledOnce();
+  });
+
+  it("reports PostgreSQL SQLSTATE rejections as definite insert failures", async () => {
+    const error = new DatabaseError(
+      'null value in column "id" violates not-null constraint',
+      0,
+      "error",
+    );
+    error.code = "23502";
+    const { result, insertedRows } = await confirmSingleDriverInsert(
+      error,
+      "pg",
+    );
+
+    expect(result?.payload).toMatchObject({
+      success: false,
+      changesPossible: false,
+      outcomeUnknown: false,
+    });
+    expect(result?.payload.error).toContain("violates not-null constraint");
+    expect(result?.payload.error).not.toContain("outcome is unknown");
+    expect(insertedRows).toEqual([]);
+  });
+
+  it("reports standalone PostgreSQL SQLSTATE rejections as definite insert failures", async () => {
+    const error = new DatabaseError(
+      'null value in column "id" violates not-null constraint',
+      0,
+      "error",
+    );
+    error.code = "23502";
+    const controller = new TableMutationPreviewController({
+      connectionId: config.id,
+      tableName: "items",
+      connectionManager: {
+        getConnection: () => ({ ...config, type: "pg", readOnly: false }),
+        getQueryEditorPresentation: () => undefined,
+      } as never,
+      tableDataService: {
+        executePreparedInsertPlan: vi.fn().mockRejectedValue(error),
+        executePreparedDeletePlan: vi.fn(),
+      },
+      notifyWarning: vi.fn(),
+    });
+    const insert: PreparedInsertPlan = {
+      connectionId: config.id,
+      database: "db",
+      schema: "public",
+      table: "items",
+      mode: "sql",
+      values: { id: null },
+      operation: { sql: "INSERT INTO items (id) VALUES (NULL)", params: [] },
+      previewStatements: ["INSERT INTO items (id) VALUES (NULL)"],
+      verificationCriteria: null,
+    };
+    const preview = controller.createInsertPreview("standalone-pg", insert);
+    const result = await controller.confirm(
+      preview.previewToken,
+      "standalone-pg",
+    );
+
+    expect(result?.payload).toMatchObject({
+      success: false,
+      changesPossible: false,
+      outcomeUnknown: false,
+    });
+    expect(result?.payload.error).not.toContain("outcome is unknown");
+  });
+
+  it("keeps PostgreSQL connection failures outcome-unknown", async () => {
+    const error = new DatabaseError("connection lost", 0, "error");
+    error.code = "08006";
+    const { result } = await confirmSingleDriverInsert(error, "pg");
+
+    expect(result?.payload).toMatchObject({
+      success: false,
+      changesPossible: true,
+      outcomeUnknown: true,
+    });
+  });
+
+  it("keeps PostgreSQL socket EPIPE errors outcome-unknown", async () => {
+    const error = Object.assign(new Error("socket write failed"), {
+      code: "EPIPE",
+    });
+    const { result, insertedRows } = await confirmSingleDriverInsert(
+      error,
+      "pg",
+    );
+
+    expect(result?.payload).toMatchObject({
+      success: false,
+      changesPossible: true,
+      outcomeUnknown: true,
+    });
+    expect(insertedRows).toEqual([{ name: "new row" }]);
   });
 
   it("consumes standalone insert operation IDs before execution and reports uncertainty", async () => {
