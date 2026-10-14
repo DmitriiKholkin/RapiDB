@@ -223,8 +223,12 @@ export class SQLiteWorkerClient {
     // receives resolved package paths and never installs or downloads anything.
     try {
       await ensureSQLiteRuntimeInstalled(__dirname);
-    } catch {
-      /* Runtime loader reports fallback/load errors. */
+    } catch (error) {
+      // better-sqlite3 loads its native addon only when its constructor runs.
+      // Falling back to the bundled package after a failed managed install can
+      // therefore hide the useful installer error until the child reports a
+      // misleading NODE_MODULE_VERSION mismatch from that stale binary.
+      throw error instanceof Error ? error : new Error(String(error));
     }
     if (this.active !== pending) return; // connect timeout/disconnect during installation
     pending.request.runtimeTargets = resolveBetterSqlite3LoadTargets(

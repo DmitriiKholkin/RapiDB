@@ -597,6 +597,15 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
     });
   });
 
+  it("does not forward query AbortSignal as a createCollection command field", async () => {
+    const { driver, mockCreateCollection } = createMockDriver();
+    const signal = new AbortController().signal;
+
+    await driver.query('db.createCollection("newcoll")', [], { signal });
+
+    expect(mockCreateCollection).toHaveBeenCalledWith("newcoll");
+  });
+
   it("executes createView from generated DDL", async () => {
     const { driver, mockCreateCollection } = createMockDriver();
     const result = await driver.query(
@@ -607,6 +616,22 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
       pipeline: [{ $match: { active: true } }],
     });
     expect(result.columns).toContain("viewOn");
+  });
+
+  it("does not forward query AbortSignal as a createView command field", async () => {
+    const { driver, mockCreateCollection } = createMockDriver();
+    const signal = new AbortController().signal;
+
+    await driver.query(
+      'db.getSiblingDB("otherdb").createView("active_users", "users", [{ $match: { active: true } }])',
+      [],
+      { signal },
+    );
+
+    expect(mockCreateCollection).toHaveBeenCalledWith("active_users", {
+      viewOn: "users",
+      pipeline: [{ $match: { active: true } }],
+    });
   });
 
   it("executes createIndex via getCollection from generated DDL", async () => {
@@ -620,6 +645,22 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
       { name: "users_by_email", unique: true },
     );
     expect(result.rows[0]?.__col_1).toBe("users_by_email");
+  });
+
+  it("forwards query AbortSignal to createIndex for cancellation", async () => {
+    const { driver, mockCreateIndex } = createMockDriver();
+    const signal = new AbortController().signal;
+
+    await driver.query(
+      'db.users.createIndex({ email: 1 }, { name: "users_by_email", unique: true })',
+      [],
+      { signal },
+    );
+
+    expect(mockCreateIndex).toHaveBeenCalledWith(
+      { email: 1 },
+      { name: "users_by_email", unique: true, signal },
+    );
   });
 
   it("supports getSiblingDB for cross-database queries", async () => {

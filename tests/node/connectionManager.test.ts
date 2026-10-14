@@ -3355,6 +3355,70 @@ describe("ConnectionManager", () => {
     }
 
     it.each([
+      false,
+      true,
+    ])("reconnects with a legacy padded pin and rejects a changed key during setup (changed: %s)", async (changedKey) => {
+      const { ConnectionManager } = await import(
+        "../../src/extension/connectionManager"
+      );
+      const { config, store, fingerprint, dispose, createSshRuntime } = setup();
+      config.ssh = { ...config.ssh, hostFingerprintSha256: fingerprint };
+      store.setConnections([config]);
+      createSshRuntime.mockImplementation(async () => ({
+        transport: {
+          kind: "tcpForward" as const,
+          localHost: "127.0.0.1" as const,
+          localPort: 15436,
+          remoteHost: "db.internal",
+          remotePort: 5432,
+        },
+        verifiedFingerprintSha256: fingerprint.replace(/=+$/, ""),
+        dispose,
+      }));
+      if (changedKey) {
+        driverBehaviors.set(config.id, {
+          connectImpl: async () => {
+            const current = store.getConnections()[0];
+            store.setConnections([
+              {
+                ...current,
+                ssh: {
+                  ...current.ssh,
+                  hostFingerprintSha256: "SHA256:DifferentHostKey=",
+                },
+              },
+            ]);
+          },
+        });
+      }
+      const manager = new ConnectionManager(
+        createExtensionContextStub() as never,
+        store,
+        { createSshRuntime },
+      );
+      try {
+        if (changedKey) {
+          await expect(manager.connectTo(config.id)).rejects.toThrow(
+            /SSH.*changed/,
+          );
+          expect(manager.isConnected(config.id)).toBe(false);
+          expect(dispose).toHaveBeenCalledOnce();
+        } else {
+          await manager.connectTo(config.id);
+          expect(manager.isConnected(config.id)).toBe(true);
+          await manager.disconnectFrom(config.id);
+          await manager.connectTo(config.id);
+          expect(manager.isConnected(config.id)).toBe(true);
+          expect(store.getConnections()[0].ssh?.hostFingerprintSha256).toBe(
+            fingerprint,
+          );
+        }
+      } finally {
+        await manager.dispose();
+      }
+    });
+
+    it.each([
       "constructor",
       "connect",
     ] as const)("does not pin when the database %s fails", async (stage) => {

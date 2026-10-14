@@ -1,13 +1,16 @@
 import { execFile } from "node:child_process";
 import {
+  chmodSync,
   cpSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { logger } from "./logger";
@@ -855,8 +858,10 @@ async function rebuildFromSourceWithPatch(
   runtimeRoot: string,
   baseDir: string,
 ): Promise<void> {
-  // cwd, headers, devdir and private tool/home paths all derive from this root.
-  // Reject expansion syntax before downloading, patching or executing tools.
+  // Keep the final managed runtime in extension global storage, but compile in
+  // a private temporary path without spaces. macOS commonly puts globalStorage
+  // under "Application Support"; make/node-gyp split generated include paths
+  // there and clang then cannot find the pinned headers.
   assertSQLiteBuildPath(runtimeRoot, "runtime");
   const pkg = readBundledBetterSqlite3Package(baseDir);
   if (!pkg.version) {
@@ -865,15 +870,16 @@ async function rebuildFromSourceWithPatch(
     );
   }
 
-  const sourceDir = join(runtimeRoot, "better-sqlite3-build-source");
-  const tarballPath = join(runtimeRoot, "better-sqlite3-source.tgz");
-  const toolDir = join(runtimeRoot, "sqlite-build-tools");
   const headerPins = sqliteHeaderPins(
     process.versions.electron ?? "",
     process.versions.modules,
     process.platform,
     process.arch,
   );
+  const buildRoot = createSQLiteBuildRoot();
+  const sourceDir = join(buildRoot, "better-sqlite3-build-source");
+  const tarballPath = join(buildRoot, "better-sqlite3-source.tgz");
+  const toolDir = join(buildRoot, "sqlite-build-tools");
 
   try {
     // Download the npm package tarball (includes src/, deps/, binding.gyp)
@@ -900,7 +906,7 @@ async function rebuildFromSourceWithPatch(
     // workspace. Keep the installer/worker independent of the VS Code module.
     const buildTools = resolveSQLiteBuildTools(
       findPackageRoot(baseDir) ?? baseDir,
-      runtimeRoot,
+      buildRoot,
       process.env,
       installerConfiguration?.workspaceRoots?.() ?? [],
     );
@@ -950,7 +956,7 @@ async function rebuildFromSourceWithPatch(
     installerLog("Applying Electron 42 V8 API compatibility patch…");
     applyElectron42V8Patch(sourceDir);
     const headerDir = await preparePinnedSQLiteHeaders(
-      runtimeRoot,
+      buildRoot,
       headerPins,
       process.platform,
       process.arch,
@@ -998,15 +1004,41 @@ async function rebuildFromSourceWithPatch(
       "Successfully built better-sqlite3 from source with Electron 42 V8 patch.",
     );
   } finally {
-    rmSync(tarballPath, { force: true });
-    rmSync(sourceDir, { recursive: true, force: true });
-    rmSync(toolDir, { recursive: true, force: true });
-    rmSync(join(runtimeRoot, "electron-headers"), {
-      recursive: true,
-      force: true,
-    });
-    rmSync(join(runtimeRoot, "build-home"), { recursive: true, force: true });
+    rmSync(buildRoot, { recursive: true, force: true });
   }
+}
+
+function createSQLiteBuildRoot(): string {
+  const candidates = [tmpdir()];
+  if (process.platform === "win32") {
+    const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
+    if (systemRoot) candidates.push(join(systemRoot, "Temp"));
+  } else {
+    candidates.push("/tmp");
+  }
+
+  let lastError: unknown;
+  for (const directory of [...new Set(candidates)]) {
+    const prefix = join(directory, "rapidb-sqlite-build-");
+    let created: string | undefined;
+    try {
+      if (/\s/.test(prefix)) {
+        throw new Error("SQLite temporary build root contains whitespace.");
+      }
+      assertSQLiteBuildPath(prefix, "temporary build root");
+      created = mkdtempSync(prefix);
+      if (process.platform !== "win32") chmodSync(created, 0o700);
+      assertSQLiteBuildPath(created, "temporary build root");
+      return created;
+    } catch (error) {
+      if (created) rmSync(created, { recursive: true, force: true });
+      lastError = error;
+    }
+  }
+
+  throw new Error(
+    `Could not create a private SQLite build directory without spaces. ${errorMessage(lastError ?? "No temporary directory is available.")}`,
+  );
 }
 
 async function downloadPrebuiltBinary(

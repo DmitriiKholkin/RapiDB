@@ -1491,6 +1491,11 @@ export class MongoDBDriver implements IDBDriver {
         ...(options?.signal ? { signal: options.signal } : {}),
         ...(timeoutMS !== undefined ? { timeoutMS } : {}),
       };
+      // Db.createCollection() forwards signal as a MongoDB command field
+      // (create.signal), which the server rejects. Keep these options limited
+      // to createCollection/createView; createIndex consumes AbortSignal and
+      // filters it out of the index description.
+      const commandSdkOptions = timeoutMS !== undefined ? { timeoutMS } : {};
       const sdkArgs =
         Object.keys(sdkOptions).length > 0
           ? ([sdkOptions] as const)
@@ -1542,17 +1547,18 @@ export class MongoDBDriver implements IDBDriver {
         },
         createCollection: async () => {
           const name = String(opArgs[0]);
-          const options =
+          const collectionOptions =
             opArgs[1] !== null && typeof opArgs[1] === "object"
               ? (opArgs[1] as Record<string, unknown>)
               : undefined;
-          if (options) {
-            await this.requireDb(dbName).createCollection(name, {
-              ...options,
-              ...sdkOptions,
-            });
+          const createOptions = {
+            ...collectionOptions,
+            ...commandSdkOptions,
+          };
+          if (Object.keys(createOptions).length > 0) {
+            await this.requireDb(dbName).createCollection(name, createOptions);
           } else {
-            await this.requireDb(dbName).createCollection(name, ...sdkArgs);
+            await this.requireDb(dbName).createCollection(name);
           }
           return this.buildMongoSingleRowQueryResult(
             { ok: 1, name, type: "collection" },
@@ -1571,7 +1577,7 @@ export class MongoDBDriver implements IDBDriver {
             viewOn,
             pipeline,
             ...(options ?? {}),
-            ...sdkOptions,
+            ...commandSdkOptions,
           });
           return this.buildMongoSingleRowQueryResult(
             { ok: 1, name, type: "view", viewOn },

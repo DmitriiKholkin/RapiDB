@@ -77,6 +77,7 @@ import { ConnectionValidationService } from "./services/connectionValidationServ
 import {
   type ConnectionSshSettings,
   createSshRuntime,
+  normalizeSshFingerprintSha256,
   type SshRuntime,
   type SshRuntimeRequest,
 } from "./services/sshRuntime";
@@ -1785,6 +1786,8 @@ export class ConnectionManager
   ): Promise<void> {
     const ssh = config.ssh;
     if (ssh?.hostVerificationMode !== "trustOnFirstUse") return;
+    const verifiedFingerprint =
+      normalizeSshFingerprintSha256(fingerprintSha256);
     const connectionId = config.id;
     const changed = await this.store.mutateConnections((connections) => {
       // The mutation may have waited behind an edit or another first-use pin.
@@ -1793,6 +1796,9 @@ export class ConnectionManager
       const index = connections.findIndex((c) => c.id === connectionId);
       const connection = connections[index];
       const currentSsh = connection?.ssh;
+      const currentFingerprint = currentSsh?.hostFingerprintSha256
+        ? normalizeSshFingerprintSha256(currentSsh.hostFingerprintSha256)
+        : undefined;
       if (
         currentSsh?.hostVerificationMode !== "trustOnFirstUse" ||
         currentSsh.host?.trim() !== ssh.host?.trim() ||
@@ -1801,13 +1807,13 @@ export class ConnectionManager
         (ssh.hostFingerprintSha256?.trim() &&
           !currentSsh.hostFingerprintSha256?.trim()) ||
         (currentSsh.hostFingerprintSha256?.trim() &&
-          currentSsh.hostFingerprintSha256.trim() !== fingerprintSha256)
+          currentFingerprint !== verifiedFingerprint)
       ) {
         throw new Error(
           "[RapiDB] SSH trust settings changed during connection setup. Please retry.",
         );
       }
-      if (currentSsh.hostFingerprintSha256?.trim() === fingerprintSha256) {
+      if (currentFingerprint === verifiedFingerprint) {
         return { result: false };
       }
       const next = [...connections];

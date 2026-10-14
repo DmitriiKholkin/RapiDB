@@ -933,6 +933,21 @@ async function waitForDynamoTableActive(
   );
 }
 
+async function deleteDynamoTable(tableName: string): Promise<void> {
+  const client = createDynamoAdminClient();
+  try {
+    try {
+      await client.send(new DeleteTableCommand({ TableName: tableName }));
+    } catch (error) {
+      if (isDynamoResourceNotFound(error)) return;
+      throw error;
+    }
+    await waitForDynamoTableRemoved(client, tableName);
+  } finally {
+    client.destroy();
+  }
+}
+
 async function verifyDynamoDriver(transport: LiveTransport): Promise<void> {
   log("Seeding DynamoDB Local fixtures...");
   const adminClient = createDynamoAdminClient();
@@ -940,6 +955,7 @@ async function verifyDynamoDriver(transport: LiveTransport): Promise<void> {
     marshallOptions: { removeUndefinedValues: true },
   });
   const tableName = `users-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  let tableCreated = false;
   try {
     try {
       await adminClient.send(new DeleteTableCommand({ TableName: tableName }));
@@ -982,6 +998,7 @@ async function verifyDynamoDriver(transport: LiveTransport): Promise<void> {
         ],
       }),
     );
+    tableCreated = true;
     await waitForDynamoTableActive(adminClient, tableName);
 
     await documentClient.send(
@@ -1016,6 +1033,9 @@ async function verifyDynamoDriver(transport: LiveTransport): Promise<void> {
         },
       }),
     );
+  } catch (error) {
+    if (tableCreated) await deleteDynamoTable(tableName);
+    throw error;
   } finally {
     adminClient.destroy();
   }
@@ -1136,7 +1156,11 @@ async function verifyDynamoDriver(transport: LiveTransport): Promise<void> {
       verifyClient.destroy();
     }
   } finally {
-    await session.dispose();
+    try {
+      await session.dispose();
+    } finally {
+      await deleteDynamoTable(tableName);
+    }
   }
 }
 

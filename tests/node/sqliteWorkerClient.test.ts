@@ -2,6 +2,10 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SQLiteWorkerClient } from "../../src/extension/dbDrivers/sqliteWorkerClient";
+import {
+  configureSQLiteInstaller,
+  resetSQLiteInstallerForTests,
+} from "../../src/extension/utils/sqliteInstaller";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 import { createProjectTempDir } from "../runtime/tempDirectories";
 
@@ -10,6 +14,7 @@ const clients = new Set<SQLiteWorkerClient>();
 afterEach(async () => {
   await Promise.all(Array.from(clients, (client) => client.close()));
   clients.clear();
+  resetSQLiteInstallerForTests();
   vi.unstubAllEnvs();
 });
 
@@ -93,6 +98,31 @@ function diagnostic(error: Error) {
 }
 
 describe("SQLite worker request queue failures", () => {
+  it("surfaces managed runtime installation failures before spawning a worker", async () => {
+    const directory = await createProjectTempDir(
+      "sqlite-worker-install-denied",
+    );
+    configureSQLiteInstaller({
+      storageRoot: join(directory, ".global-storage"),
+      allowInstall: () => false,
+    });
+
+    const client = new SQLiteWorkerClient();
+    clients.add(client);
+    const config: ConnectionConfig = {
+      id: "sqlite-worker-install-denied",
+      name: "SQLite worker install denied",
+      type: "sqlite",
+      filePath: join(directory, "db.sqlite"),
+    };
+
+    const error = await rejection(client.open(config, 2_000));
+    expect(error.message).toContain(
+      "SQLite runtime installation was not authorized",
+    );
+    expect(client.connected).toBe(false);
+  });
+
   it("marks a call before opening a connection as NOT_EXECUTED", async () => {
     const client = new SQLiteWorkerClient();
     clients.add(client);

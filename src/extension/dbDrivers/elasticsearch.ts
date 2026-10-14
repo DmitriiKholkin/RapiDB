@@ -1279,7 +1279,6 @@ export class ElasticsearchDriver implements IDBDriver {
                   {
                     index: table,
                     keep_alive: "1m",
-                    allow_partial_search_results: false,
                   },
                   options,
                 ),

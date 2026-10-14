@@ -623,9 +623,14 @@ describe("SQLite installer security across callers and fallback paths", () => {
     }
   });
 
-  it.skipIf(process.platform === "win32").each([true, false])(
-    "passes only verified private headers and a controlled environment through the complete source fallback (workspace getter: %s)",
-    async (withWorkspaceGetter) => {
+  it.skipIf(process.platform === "win32").each([
+    [true, false],
+    [false, false],
+    [true, true],
+    [false, true],
+  ])(
+    "passes only verified private headers and a controlled environment through the complete source fallback (workspace getter: %s, spaced TMPDIR: %s)",
+    async (withWorkspaceGetter, spacedTmpdir) => {
       Object.defineProperty(process.versions, "modules", {
         value: "146",
         configurable: true,
@@ -679,6 +684,11 @@ describe("SQLite installer security across callers and fallback paths", () => {
         },
       ]);
       const headers = headerFixture();
+      if (spacedTmpdir) {
+        const temporaryDirectory = join(f.root, "temporary directory");
+        mkdirSync(temporaryDirectory, { recursive: true });
+        vi.stubEnv("TMPDIR", temporaryDirectory);
+      }
       let currentWorkspaceRoots: readonly string[] = [];
       const workspaceRootsGetter = vi.fn(() => currentWorkspaceRoots);
       const urls = mockDownloads((url) => {
@@ -751,7 +761,7 @@ describe("SQLite installer security across callers and fallback paths", () => {
       const fresh = await import("../../src/extension/utils/sqliteInstaller");
       try {
         fresh.configureSQLiteInstaller({
-          storageRoot: join(f.root, "fresh-storage"),
+          storageRoot: join(f.root, "fresh storage"),
           allowInstall: () => true,
           log: () => {},
           ...(withWorkspaceGetter
@@ -763,6 +773,7 @@ describe("SQLite installer security across callers and fallback paths", () => {
           join(f.root, "dist"),
         );
         expect(installed).toBeTruthy();
+        expect(installed).toContain("fresh storage");
         expect(workspaceRootsGetter).toHaveBeenCalledTimes(
           withWorkspaceGetter ? 1 : 0,
         );
@@ -783,10 +794,12 @@ describe("SQLite installer security across callers and fallback paths", () => {
         expect(nodedir).toContain("electron-headers");
         expect(build.args.some((arg) => arg.includes("dist-url"))).toBe(false);
         expect(build.cwd).toContain("better-sqlite3-build-source");
+        expect(build.cwd).not.toMatch(/\s/);
         expect(build.env.npm_config_nodedir).toBeUndefined();
         expect(build.env.npm_package_config_node_gyp_directory).toBeUndefined();
         expect(build.env.PYTHONPATH).toBeUndefined();
         expect(build.env.HOME).toContain("build-home");
+        expect(build.env.HOME).not.toMatch(/\s/);
         expect(existsSync(nodedir as string)).toBe(false);
       } finally {
         fresh.resetSQLiteInstallerForTests();

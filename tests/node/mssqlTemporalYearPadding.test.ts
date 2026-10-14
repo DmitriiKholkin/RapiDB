@@ -197,4 +197,19 @@ describe("MSSQL temporal year padding", () => {
 
     expect(check).toEqual({ ok: true, shouldVerify: true });
   });
+
+  it("treats omitted and zero-only datetime2 fractions as equivalent", () => {
+    const driver = makeDriver();
+    const datetime2Column = column("created_at", "datetime2(3)", "datetime");
+
+    const check = driver.checkPersistedEdit(
+      datetime2Column,
+      "2026-10-14T12:00:00",
+      {
+        persistedValue: "2026-10-14 12:00:00.000",
+      },
+    );
+
+    expect(check).toEqual({ ok: true, shouldVerify: true });
+  });
 });

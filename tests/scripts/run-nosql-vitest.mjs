@@ -11,6 +11,7 @@ const child = spawn(
     "run",
     "--project",
     "unit-node",
+    "--no-file-parallelism",
     "tests/node/nosqlLive.test.ts",
     "tests/node/mutationDataSafetyLive.test.ts",
   ],

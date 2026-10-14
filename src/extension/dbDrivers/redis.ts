@@ -628,11 +628,12 @@ export class RedisDriver implements IDBDriver {
           ? false
           : Math.min(2 ** retries * 50, 2000) + Math.floor(Math.random() * 200),
     };
+    const username = this.config.username?.trim();
     const client: RedisClient = createClient({
       url: uri?.toString(),
       socket: socketOptions,
       database,
-      username: this.config.username,
+      username: username || undefined,
       password: this.config.password,
     });
     client.on("error", (error: unknown) => {

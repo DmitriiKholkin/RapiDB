@@ -477,7 +477,7 @@ function canonicalizeMssqlTemporalPersistedEditValue(
         baseType === "datetimeoffset"
           ? normalized
           : normalized.replace(/(?:Z|[+-]\d{2}(?::?\d{2})?)$/i, "");
-      return wallClock.replace("T", " ");
+      return normalizeMssqlTemporalFraction(wallClock.replace("T", " "));
     }
     return value;
   }
@@ -536,6 +536,16 @@ function canonicalizeMssqlTemporalPersistedEditValue(
     );
   }
   return null;
+}
+
+function normalizeMssqlTemporalFraction(value: string): string {
+  return value.replace(
+    /\.(\d+)(?=(?:Z|[+-]\d{2}(?::?\d{2})?)?$)/i,
+    (_match, fraction: string) => {
+      const significantFraction = fraction.replace(/0+$/, "");
+      return significantFraction ? `.${significantFraction}` : "";
+    },
+  );
 }
 
 function readTediousDateTimeOffsetValue(

@@ -594,7 +594,25 @@ describe("sshRuntime", () => {
 
   it("builds OpenSSH-compatible SHA256 fingerprints", () => {
     expect(buildSshFingerprintSha256(Buffer.from("ssh-host-key"))).toBe(
-      `SHA256:${createHash("sha256").update("ssh-host-key").digest("base64")}`,
+      `SHA256:${createHash("sha256")
+        .update("ssh-host-key")
+        .digest("base64")
+        .replace(/=+$/, "")}`,
     );
+  });
+
+  it("accepts OpenSSH fingerprints and legacy padded pins", async () => {
+    const fingerprintSha256 = buildSshFingerprintSha256(
+      Buffer.from("ssh-host-key"),
+    );
+    const runtime = await createRuntime({
+      ...sshSettings,
+      fingerprintSha256: `${fingerprintSha256}=`,
+    });
+    const verifier = createdClients[0]?.connectOptions?.hostVerifier;
+
+    expect(verifier?.(Buffer.from("ssh-host-key"))).toBe(true);
+
+    await runtime.dispose();
   });
 });

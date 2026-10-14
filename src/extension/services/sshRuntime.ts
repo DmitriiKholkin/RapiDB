@@ -177,12 +177,16 @@ async function defaultLoadSsh2(): Promise<Ssh2ModuleLike> {
   return require("ssh2") as Ssh2ModuleLike;
 }
 
-function normalizeFingerprint(value: string): string {
-  return value.trim();
+export function normalizeSshFingerprintSha256(value: string): string {
+  return value.trim().replace(/=+$/, "");
 }
 
 export function buildSshFingerprintSha256(hostKey: Buffer): string {
-  return `SHA256:${createHash("sha256").update(hostKey).digest("base64")}`;
+  const digest = createHash("sha256")
+    .update(hostKey)
+    .digest("base64")
+    .replace(/=+$/, "");
+  return `SHA256:${digest}`;
 }
 
 function resolvePresentedFingerprint(hostKey: Buffer | string): string {
@@ -190,7 +194,7 @@ function resolvePresentedFingerprint(hostKey: Buffer | string): string {
     return buildSshFingerprintSha256(hostKey);
   }
 
-  const normalized = normalizeFingerprint(hostKey);
+  const normalized = normalizeSshFingerprintSha256(hostKey);
   return normalized.startsWith("SHA256:") ? normalized : `SHA256:${normalized}`;
 }
 
@@ -199,7 +203,7 @@ function createHostVerifier(ssh: ConnectionSshSettings): {
   getVerifiedFingerprintSha256(): string | undefined;
 } {
   const expectedFingerprint = ssh.fingerprintSha256
-    ? normalizeFingerprint(ssh.fingerprintSha256)
+    ? normalizeSshFingerprintSha256(ssh.fingerprintSha256)
     : undefined;
   let verifiedFingerprintSha256 = expectedFingerprint;
 

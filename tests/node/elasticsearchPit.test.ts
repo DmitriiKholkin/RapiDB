@@ -61,10 +61,7 @@ describe("Elasticsearch PIT paging and full export (B11)", () => {
         expect.objectContaining({
           method: "POST",
           path: "/records/_pit",
-          querystring: {
-            keep_alive: "1m",
-            allow_partial_search_results: false,
-          },
+          querystring: { keep_alive: "1m" },
         }),
         { signal: expect.any(AbortSignal), requestTimeout: expect.any(Number) },
       ]);
@@ -110,7 +107,6 @@ describe("Elasticsearch PIT paging and full export (B11)", () => {
       {
         index: "records",
         keep_alive: "1m",
-        allow_partial_search_results: false,
       },
       { signal: expect.any(AbortSignal), requestTimeout: expect.any(Number) },
     );
