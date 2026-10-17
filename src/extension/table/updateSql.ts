@@ -1,4 +1,4 @@
-import { isServerGeneratedColumn } from "../../shared/tableTypes";
+import { isColumnReadOnly } from "../../shared/tableTypes";
 import type { ColumnTypeMeta, IDBDriver } from "../dbDrivers/types";
 
 export function coerceRecord(
@@ -104,6 +104,7 @@ export function buildUpdateRowSql(
   changes: Record<string, unknown>,
   cols: ColumnTypeMeta[],
   originalValues: Record<string, unknown> = {},
+  onPreviewColumns?: (columns: Array<ColumnTypeMeta | undefined>) => void,
 ): { sql: string; params: unknown[] } | null {
   const qt = drv.qualifiedTableName(database, schema, table);
   const colMap = new Map(cols.map((c) => [c.name, c]));
@@ -121,20 +122,53 @@ export function buildUpdateRowSql(
   );
   if (Object.keys(coercedChanges).length === 0) return null;
   const coercedPk = coercePrimaryKeyValues(drv, pkValues, cols);
-  const coercedOriginalValues = coerceRecord(
-    drv,
-    filterWritableRecord(originalValues, colMap),
-    colMap,
+  const canUseSqlOriginalCoercion =
+    drv.getCapabilities?.().tabularRead === "sql";
+  const coercedOriginalValues = Object.fromEntries(
+    writableEntries(originalValues, colMap).map(([columnName, value]) => {
+      const column = colMap.get(columnName);
+      return [
+        columnName,
+        column && canUseSqlOriginalCoercion && drv.coerceOriginalValue
+          ? drv.coerceOriginalValue(value, column)
+          : column
+            ? drv.coerceInputValue(value, column)
+            : value,
+      ];
+    }),
   );
 
   const setCols = Object.keys(coercedChanges);
   const pkCols = Object.keys(coercedPk);
 
   const params: unknown[] = [];
+  const previewColumns: Array<ColumnTypeMeta | undefined> = [];
+  const tableAlias = drv.getUpdateTableAlias?.() ?? undefined;
+  const updateTarget = tableAlias
+    ? `${qt} ${drv.quoteIdentifier(tableAlias)}`
+    : qt;
 
   const setParts = setCols.map((c) => {
-    params.push(coercedChanges[c]);
     const meta = colMap.get(c);
+    if (meta && drv.buildMutationValueExpr) {
+      const mutationValue = drv.buildMutationValueExpr(
+        meta,
+        coercedChanges[c],
+        "update",
+        coercedOriginalValues[c],
+        params.length + 1,
+      );
+      if (mutationValue) {
+        params.push(...mutationValue.params);
+        previewColumns.push(
+          ...(mutationValue.previewColumns ??
+            mutationValue.params.map(() => meta)),
+        );
+        return `${drv.quoteIdentifier(c)} = ${mutationValue.sql}`;
+      }
+    }
+    params.push(coercedChanges[c]);
+    previewColumns.push(meta);
     return meta
       ? drv.buildSetExpr(meta, params.length)
       : `${drv.quoteIdentifier(c)} = ?`;
@@ -143,6 +177,7 @@ export function buildUpdateRowSql(
   const whereParts = pkCols.map((c) => {
     params.push(coercedPk[c]);
     const meta = colMap.get(c);
+    previewColumns.push(meta);
     const placeholder = meta
       ? drv.buildInsertValueExpr(meta, params.length)
       : "?";
@@ -154,8 +189,27 @@ export function buildUpdateRowSql(
       whereParts.push(`${identifier} IS NULL`);
       continue;
     }
-    params.push(value);
     const meta = colMap.get(columnName);
+    const expandedComparison =
+      meta && drv.buildOriginalValueComparisonWithParams
+        ? drv.buildOriginalValueComparisonWithParams(
+            meta,
+            value,
+            params.length + 1,
+            tableAlias,
+          )
+        : null;
+    if (expandedComparison) {
+      params.push(...expandedComparison.params);
+      previewColumns.push(
+        ...(expandedComparison.previewColumns ??
+          expandedComparison.params.map(() => meta)),
+      );
+      whereParts.push(expandedComparison.sql);
+      continue;
+    }
+    params.push(value);
+    previewColumns.push(meta);
     whereParts.push(
       meta && drv.buildOriginalValueComparison
         ? drv.buildOriginalValueComparison(meta, params.length)
@@ -163,8 +217,9 @@ export function buildUpdateRowSql(
     );
   }
 
+  onPreviewColumns?.(previewColumns);
   return {
-    sql: `UPDATE ${qt} SET ${setParts.join(", ")} WHERE ${whereParts.join(" AND ")}`,
+    sql: `UPDATE ${updateTarget} SET ${setParts.join(", ")} WHERE ${whereParts.join(" AND ")}`,
     params,
   };
 }
@@ -172,5 +227,5 @@ export function buildUpdateRowSql(
 function isWritableColumn(
   column: ColumnTypeMeta | undefined,
 ): column is ColumnTypeMeta {
-  return !!column && !isServerGeneratedColumn(column);
+  return !!column && !isColumnReadOnly(column);
 }

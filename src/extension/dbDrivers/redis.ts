@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { createClient, ErrorReply } from "redis";
+import { createClient, ErrorReply, RESP_TYPES } from "redis";
+import { isRedisBinaryValueSnapshot } from "../../shared/redisValueSnapshot";
 import {
   type OperationCancellationContext,
   REDIS_READ_BUDGET,
@@ -258,6 +259,63 @@ type RedisSortedSetEntry = {
   score: number;
   value: string;
 };
+
+function isDisplayableRedisText(bytes: Buffer): boolean {
+  const text = bytes.toString("utf8");
+  if (!Buffer.from(text, "utf8").equals(bytes)) return false;
+  for (const character of text) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (
+      codePoint <= 0x08 ||
+      codePoint === 0x0b ||
+      codePoint === 0x0c ||
+      (codePoint >= 0x0e && codePoint <= 0x1f) ||
+      codePoint === 0x7f
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function formatRedisBlobString(bytes: Buffer): string {
+  if (isDisplayableRedisText(bytes)) return bytes.toString("utf8");
+  return `RedisBinary(0x${bytes.toString("hex")})`;
+}
+
+function redisComparisonRow(
+  row: Record<string, unknown>,
+): Record<string, unknown> {
+  return isRedisBinaryValueSnapshot(row.value)
+    ? { ...row, value: row.value.displayValue }
+    : row;
+}
+
+function formatRedisReplyValue(value: unknown): unknown {
+  if (Buffer.isBuffer(value)) return formatRedisBlobString(value);
+  if (Array.isArray(value)) return value.map(formatRedisReplyValue);
+  if (value instanceof Map) {
+    return Object.fromEntries(
+      [...value].map(([key, entry]) => [
+        Buffer.isBuffer(key) ? formatRedisBlobString(key) : String(key),
+        formatRedisReplyValue(entry),
+      ]),
+    );
+  }
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    Object.getPrototypeOf(value) === Object.prototype
+  ) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [
+        key,
+        formatRedisReplyValue(entry),
+      ]),
+    );
+  }
+  return value;
+}
 
 function compareRedisValueTypes(left: string, right: string): number {
   const leftIndex = REDIS_VALUE_TYPE_ORDER.indexOf(
@@ -978,12 +1036,16 @@ export class RedisDriver implements IDBDriver {
         const [command, ...args] = parts;
         // node-redis removes the command's abort listener when it is written.
         // Race sent commands explicitly; only owned sessions are destroyed.
-        results.push(
-          await this.waitForResult(
-            client.sendCommand([command.toUpperCase(), ...args]),
-            querySignal,
-          ),
+        const result = await this.waitForResult(
+          client.sendCommand([command.toUpperCase(), ...args], {
+            typeMapping: {
+              [RESP_TYPES.BLOB_STRING]: Buffer,
+              [RESP_TYPES.DOUBLE]: String,
+            },
+          }),
+          querySignal,
         );
+        results.push(formatRedisReplyValue(result));
       }
       const row = flattenRootRecord(
         statements.length === 1 ? { result: results[0] } : { results },
@@ -1054,14 +1116,17 @@ export class RedisDriver implements IDBDriver {
       boundedReadLimit,
       true,
     );
-    const rowRecords = rows.map((entry) => entry.row);
+    const displayToOriginal = new Map(
+      rows.map((entry) => [redisComparisonRow(entry.row), entry.row]),
+    );
+    const rowRecords = [...displayToOriginal.keys()];
     const columns = this.inferRedisColumns(rows);
     const filtered = applyFilters(rowRecords, request.filters, columns);
     const sorted = applySort(filtered, request.sort, columns);
     const paged = pageRows(sorted, request.page, request.pageSize);
     return {
       columns,
-      rows: paged,
+      rows: paged.map((row) => displayToOriginal.get(row) ?? row),
       totalCount: request.skipCount ? 0 : sorted.length,
       executionTimeMs: Math.round(performance.now() - startTime),
     };
@@ -1129,6 +1194,19 @@ export class RedisDriver implements IDBDriver {
             "Redis stream values are read-only in the table viewer.",
           );
         }
+        if (currentType === "string" && hasValueChange) {
+          const currentBytes = await client
+            .withTypeMapping({ [RESP_TYPES.BLOB_STRING]: Buffer })
+            .get(sourceKey);
+          if (
+            Buffer.isBuffer(currentBytes) &&
+            !isDisplayableRedisText(currentBytes)
+          ) {
+            throw new Error(
+              "Binary-backed Redis string values are read-only in the table viewer.",
+            );
+          }
+        }
         const value =
           update.changes.value ?? update.changes.json ?? update.changes.text;
         const encodedValue = hasValueChange
@@ -1143,7 +1221,9 @@ export class RedisDriver implements IDBDriver {
         );
         const originalValue = hasOriginalValue
           ? currentType === "string"
-            ? this.normalizeStoredValue(update.originalValues?.value)
+            ? isRedisBinaryValueSnapshot(update.originalValues?.value)
+              ? Buffer.from(update.originalValues.value.binaryHex, "hex")
+              : this.normalizeStoredValue(update.originalValues?.value)
             : this.encodeRedisLuaValue(
                 currentType,
                 update.originalValues?.value,
@@ -1689,9 +1769,24 @@ export class RedisDriver implements IDBDriver {
       async (key) => {
         const type = await client.type(key);
         let value: unknown = null;
+        let binarySnapshot: unknown;
         switch (type) {
           case "string":
-            value = await client.get(key);
+            {
+              const bytes = await client
+                .withTypeMapping({ [RESP_TYPES.BLOB_STRING]: Buffer })
+                .get(key);
+              value = Buffer.isBuffer(bytes)
+                ? formatRedisBlobString(bytes)
+                : null;
+              if (Buffer.isBuffer(bytes) && !isDisplayableRedisText(bytes)) {
+                binarySnapshot = {
+                  __rapidbRedisBinary: 1,
+                  displayValue: value,
+                  binaryHex: bytes.toString("hex"),
+                };
+              }
+            }
             break;
           case "hash":
             value = await client.hGetAll(key);
@@ -1703,7 +1798,17 @@ export class RedisDriver implements IDBDriver {
             value = await client.sMembers(key);
             break;
           case "zset":
-            value = await client.zRangeWithScores(key, 0, -1);
+            value = (
+              await client
+                .withTypeMapping({ [RESP_TYPES.DOUBLE]: String })
+                .zRangeWithScores(key, 0, -1)
+            ).map((entry) => ({
+              ...entry,
+              // node-redis 6's RESP3 double decoder accumulates decimal digits
+              // with precomputed multipliers; e.g. 7.125 becomes 7.124999999999999.
+              // Decode the raw score string with the JS number parser instead.
+              score: Number(entry.score),
+            }));
             break;
           case "stream":
             value = await this.readStreamEntries(client, key);
@@ -1717,11 +1822,14 @@ export class RedisDriver implements IDBDriver {
 
         return {
           redisType: type,
-          row: flattenRootRecord({
-            key,
-            value,
-            ttl: ttl >= 0 ? ttl : null,
-          }),
+          row: {
+            ...flattenRootRecord({
+              key,
+              value,
+              ttl: ttl >= 0 ? ttl : null,
+            }),
+            ...(binarySnapshot ? { value: binarySnapshot } : {}),
+          },
         };
       },
     );
@@ -1729,7 +1837,7 @@ export class RedisDriver implements IDBDriver {
 
   private inferRedisColumns(rows: readonly RedisSampleRow[]): ColumnTypeMeta[] {
     const columns = inferColumnsFromRows(
-      rows.map((entry) => entry.row),
+      rows.map((entry) => redisComparisonRow(entry.row)),
       "key",
       {
         nullableMode: "schemaLess",

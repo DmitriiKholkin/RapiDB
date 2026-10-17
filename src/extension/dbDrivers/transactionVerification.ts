@@ -114,18 +114,21 @@ export async function verifyTransaction(
     }
     const columns: string[] = [];
     const messages: string[] = [];
-    verification.values.forEach(({ column, expectedValue }, index) => {
-      const check = driver.checkPersistedEdit(column, expectedValue, {
-        persistedValue: rows[0][`__col_${index}`],
-      });
-      if (!check?.ok) {
-        columns.push(column.name);
-        messages.push(
-          check?.message ??
-            `${column.name} could not be confirmed against the persisted value.`,
-        );
-      }
-    });
+    verification.values.forEach(
+      ({ column, expectedValue, originalValue }, index) => {
+        const check = driver.checkPersistedEdit(column, expectedValue, {
+          persistedValue: rows[0][`__col_${index}`],
+          ...(originalValue !== undefined ? { originalValue } : {}),
+        });
+        if (!check?.ok) {
+          columns.push(column.name);
+          messages.push(
+            check?.message ??
+              `${column.name} could not be confirmed against the persisted value.`,
+          );
+        }
+      },
+    );
     if (columns.length) {
       throw new TransactionVerificationError({
         rowIndex: verification.rowIndex,

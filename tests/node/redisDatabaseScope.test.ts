@@ -92,6 +92,16 @@ class FakeRedis {
   });
   type = vi.fn(async (key: string) => this.store().get(key)?.type ?? "none");
   get = vi.fn(async (key: string) => this.store().get(key)?.value ?? null);
+  withTypeMapping = vi.fn(() => ({
+    get: async (key: string) => {
+      const value = await this.get(key);
+      return value == null
+        ? null
+        : Buffer.isBuffer(value)
+          ? value
+          : Buffer.from(String(value));
+    },
+  }));
   ttl = vi.fn(async (key: string) => this.store().get(key)?.ttl ?? -2);
   lRange = vi.fn(async (key: string) => this.store().get(key)?.value ?? []);
   xRange = vi.fn(async (key: string) => this.store().get(key)?.value ?? []);
@@ -156,6 +166,9 @@ class FakeRedis {
     };
     return {
       sendCommand: (args: string[]) => run(() => this.sendCommand(args)),
+      withTypeMapping: () => ({
+        get: (key: string) => run(() => this.withTypeMapping().get(key)),
+      }),
       type: (key: string) => run(() => this.type(key)),
       set: (
         key: string,

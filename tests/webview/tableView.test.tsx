@@ -6039,6 +6039,39 @@ describe("TableView", () => {
     });
   });
 
+  it.each([
+    ["string", "text"],
+    ["mixed(string, list)", "other"],
+  ] as const)("shows a Redis binary snapshot in %s as readonly display text without exposing metadata", async (nativeType, category) => {
+    const user = userEvent.setup();
+    const value = {
+      __rapidbRedisBinary: 1,
+      displayValue: "RedisBinary(0xff)",
+      binaryHex: "ff",
+    };
+    await initializeCommittedTableData({
+      columnDefs: [
+        columns[0],
+        {
+          ...columns[1],
+          name: "value",
+          nativeType,
+          type: "string",
+          category,
+        },
+      ],
+      dataRows: [{ id: 1, value }],
+    });
+    expect(getBodyCell("value").textContent).toBe("RedisBinary(0xff)");
+    await user.dblClick(getBodyCell("value"));
+    const editor = screen.getByLabelText("Cell data") as HTMLTextAreaElement;
+    expect(editor.readOnly).toBe(true);
+    expect(editor.value).toBe("RedisBinary(0xff)");
+    expect(screen.queryByRole("button", { name: "NULL" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Close cell data" }));
+    expect(screen.queryByRole("button", { name: "Apply Changes" })).toBeNull();
+  });
+
   it("keeps explicitly supplied identity values pasteable into insert drafts", async () => {
     const user = userEvent.setup();
     const identityColumns = columns.map((column) =>

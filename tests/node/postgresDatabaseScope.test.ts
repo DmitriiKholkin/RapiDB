@@ -105,7 +105,7 @@ vi.mock("pg", async (importOriginal) => {
               },
             ],
           };
-        if (sql.includes("SELECT t.typtype"))
+        if (sql.includes("AS type_oid") && sql.includes("t.typtype"))
           return { rows: [{ typtype: "e" }] };
         if (sql.includes("SELECT e.enumlabel"))
           return { rows: [{ enumlabel: database }] };

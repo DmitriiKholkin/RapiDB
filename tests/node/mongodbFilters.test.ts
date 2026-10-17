@@ -504,10 +504,23 @@ describe("MongoDBDriver schema type inference", () => {
         t_binary: new Binary(Buffer.from([1, 2, 3]), 0),
       },
     ]);
-    const readRowsMock = vi.fn().mockResolvedValue([
-      { _id: "64a1b2c3d4e5f67890abcdef", t_binary: "0x010203" },
-      { _id: "64a1b2c3d4e5f67890abcdee", t_binary: "0x040506" },
-    ]);
+    const toRow = (
+      driver as unknown as {
+        toRow: (doc: Record<string, unknown>) => Record<string, unknown>;
+      }
+    ).toRow.bind(driver);
+    const readRowsMock = vi.fn().mockResolvedValue(
+      [
+        {
+          _id: "64a1b2c3d4e5f67890abcdef",
+          t_binary: new Binary(Buffer.from([1, 2, 3]), 0),
+        },
+        {
+          _id: "64a1b2c3d4e5f67890abcdee",
+          t_binary: new Binary(Buffer.from([4, 5, 6]), 0),
+        },
+      ].map(toRow),
+    );
 
     (
       driver as unknown as {
@@ -667,13 +680,7 @@ describe("MongoDBDriver schema type inference", () => {
   });
 
   it("normalizes datetime filters against Mongo display values", async () => {
-    const driver = createDriverWithRows([
-      {
-        _id: "507f1f77bcf86cd799439011",
-        t_date: "2024-07-04 12:00:00",
-        t_timestamp: "2024-07-04 12:00:00",
-      },
-    ]);
+    const driver = createDriverWithRows([]);
 
     const readSchemaDocumentsMock = vi.fn().mockResolvedValue([
       {
@@ -687,6 +694,13 @@ describe("MongoDBDriver schema type inference", () => {
         readSchemaDocuments: typeof readSchemaDocumentsMock;
       }
     ).readSchemaDocuments = readSchemaDocumentsMock;
+    const nativeRows = await readSchemaDocumentsMock();
+    const state = driver as unknown as {
+      toRow: (doc: Record<string, unknown>) => Record<string, unknown>;
+      readRows: () => Promise<Record<string, unknown>[]>;
+    };
+    state.readRows = async () =>
+      nativeRows.map((doc: Record<string, unknown>) => state.toRow(doc));
 
     const dateMatches = await applyFilter(driver, {
       column: "t_date",

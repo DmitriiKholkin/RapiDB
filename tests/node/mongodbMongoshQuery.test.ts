@@ -323,7 +323,7 @@ describe("MongoDBDriver — mongosh query()", () => {
       t_array: '[1,"two",3,true,null,{"k":"v"},[7,8,9]]',
       t_nested_array: "[[1,2],[3,4],[5,null,7]]",
       t_regex: "/quick\\s+fox/gi",
-      t_timestamp: "2024-07-04 12:00:00",
+      t_timestamp: "Timestamp(1720094400, 1)",
     });
   });
 
@@ -1370,7 +1370,7 @@ describe("MongoDBDriver — buildMutationPreviewStatement()", () => {
         driver.coerceInputValue("Timestamp(1720094400, 1)", timestampColumn),
         timestampColumn,
       ),
-    ).toBe("2024-07-04 12:00:00");
+    ).toBe("Timestamp(1720094400, 1)");
     expect(
       driver.formatOutputValue(
         driver.coerceInputValue("/quick\\s+fox/gi", regexColumn),

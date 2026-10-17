@@ -1,4 +1,4 @@
-import React from "react";
+import { redisBinarySnapshotDisplay } from "../../../shared/redisValueSnapshot";
 import type { TypeCategory } from "../../../shared/tableTypes";
 import { getCategoryPresentation } from "../../types";
 import { CELL_PREVIEW_NOTICE, getCellPreview } from "../../utils/cellPreview";
@@ -7,14 +7,27 @@ const PENDING_COLOR = "var(--vscode-editorWarning-foreground, #cca700)";
 export function CellDisplay({
   value,
   isPending,
+  isMissing = false,
   category,
-  nativeType: _nativeType,
+  nativeType,
 }: {
   value: unknown;
   isPending: boolean;
+  isMissing?: boolean;
   category?: TypeCategory;
   nativeType?: string;
 }) {
+  if (isMissing) {
+    return (
+      <span
+        title="This item does not contain the attribute."
+        style={{ fontStyle: "italic", opacity: 0.7 }}
+      >
+        MISSING
+      </span>
+    );
+  }
+
   if (value === null || value === undefined) {
     return <span style={{ fontStyle: "italic", opacity: 0.45 }}>NULL</span>;
   }
@@ -22,7 +35,10 @@ export function CellDisplay({
     ? getCategoryPresentation(category).foreground
     : undefined;
   const resolvedColor = isPending ? PENDING_COLOR : categoryColor;
-  const preview = getCellPreview(value, category);
+  const preview = getCellPreview(
+    redisBinarySnapshotDisplay(value, nativeType) ?? value,
+    category,
+  );
   const str = preview.text;
   const title = preview.truncated ? CELL_PREVIEW_NOTICE : undefined;
 

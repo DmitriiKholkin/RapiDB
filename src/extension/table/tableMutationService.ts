@@ -299,6 +299,7 @@ export class TableMutationService {
           ]),
         )
       : null;
+    let insertPreviewColumns: ColumnTypeMeta[] = [];
     const operation = buildInsertRowOperation(
       driver,
       database,
@@ -306,10 +307,11 @@ export class TableMutationService {
       table,
       values,
       columns,
+      undefined,
+      (columns) => {
+        insertPreviewColumns = columns;
+      },
     );
-    const insertPreviewColumns = writableEntries(values, columnMetaByName)
-      .map(([columnName]) => columnMetaByName.get(columnName))
-      .filter((column): column is ColumnTypeMeta => column !== undefined);
     const oracleLikeDriver = driver as {
       materializePreviewInsertSql?: (
         sql: string,

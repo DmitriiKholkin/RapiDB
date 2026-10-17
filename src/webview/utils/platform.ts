@@ -19,3 +19,8 @@ export function isMac(): boolean {
 export function platformShortcutLabel(): string {
   return isMac() ? "\u2318" : "Ctrl+";
 }
+
+/** Returns the Query Editor execution shortcut using the host platform's key labels. */
+export function queryRunShortcutLabel(): string {
+  return isMac() ? "\u2318+Return" : "Ctrl+Enter";
+}

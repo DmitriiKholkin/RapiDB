@@ -243,7 +243,7 @@ describe("describeTable schema metadata", () => {
   it("surfaces Oracle virtual columns separately from default expressions", async () => {
     const driver = new OracleDriver(oracleConfig as ConnectionConfig);
     const execute = vi.fn(async (sql: string) => {
-      if (sql.includes("FROM all_tab_columns")) {
+      if (sql.includes("FROM all_tab_cols")) {
         return {
           rows: [
             {
@@ -267,6 +267,17 @@ describe("describeTable schema metadata", () => {
               DATA_DEFAULT: 'LOWER("NAME")',
               VIRTUAL_COLUMN: "YES",
               COLUMN_ID: 2,
+            },
+            {
+              COLUMN_NAME: "XML_DOC",
+              DATA_TYPE: "XMLTYPE",
+              DATA_PRECISION: null,
+              DATA_SCALE: null,
+              DATA_LENGTH: 2000,
+              NULLABLE: "Y",
+              DATA_DEFAULT: null,
+              VIRTUAL_COLUMN: "YES",
+              COLUMN_ID: 3,
             },
           ],
         };
@@ -311,7 +322,27 @@ describe("describeTable schema metadata", () => {
           generatedKind: "virtual",
           isPersisted: false,
         }),
+        expect.objectContaining({
+          name: "XML_DOC",
+          isComputed: false,
+          computedExpression: undefined,
+          generatedKind: undefined,
+        }),
       ]),
+    );
+    const ddl = await (
+      driver as unknown as {
+        _fallbackDDL: (
+          conn: unknown,
+          schema: string,
+          table: string,
+        ) => Promise<string>;
+      }
+    )._fallbackDDL({ execute }, "app", "users");
+    expect(ddl).toContain('"XML_DOC" XMLTYPE');
+    expect(ddl).not.toContain('"XML_DOC" XMLTYPE GENERATED');
+    expect(ddl).toContain(
+      '"SLUG" VARCHAR2(128) GENERATED ALWAYS AS (LOWER("NAME")) VIRTUAL',
     );
   });
 

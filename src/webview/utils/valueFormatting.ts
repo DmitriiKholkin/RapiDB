@@ -20,6 +20,18 @@ export function formatScalarValueForDisplay(value: unknown): string {
   }
 
   if (typeof value === "object") {
+    const driverSnapshot = value as {
+      __rapidbSqlVariant?: unknown;
+      __rapidbSpatial?: unknown;
+      displayValue?: unknown;
+    };
+    if (
+      (driverSnapshot.__rapidbSqlVariant === 1 ||
+        driverSnapshot.__rapidbSpatial === 1) &&
+      typeof driverSnapshot.displayValue === "string"
+    ) {
+      return driverSnapshot.displayValue;
+    }
     try {
       return JSON.stringify(value);
     } catch {

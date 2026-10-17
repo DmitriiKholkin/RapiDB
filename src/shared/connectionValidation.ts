@@ -110,7 +110,7 @@ function createAnyOfIssue(group: readonly string[]): ConnectionValidationIssue {
 function buildValidationMessage(
   missingRequired: readonly string[],
   missingAnyOf: readonly string[][],
-  invalidIssues: readonly ConnectionValidationIssue[],
+  issues: readonly ConnectionValidationIssue[],
 ): string {
   const parts: string[] = [];
 
@@ -130,6 +130,24 @@ function buildValidationMessage(
     );
   }
 
+  const extraConditionalIssues = issues.filter((issue) => {
+    if (issue.code === "required") {
+      return !(
+        issue.fields.length === 1 && missingRequired.includes(issue.fields[0])
+      );
+    }
+    if (issue.code === "anyOf") {
+      return !missingAnyOf.some(
+        (group) =>
+          group.length === issue.fields.length &&
+          group.every((field) => issue.fields.includes(field)),
+      );
+    }
+    return false;
+  });
+  appendMessages(extraConditionalIssues.map((issue) => issue.message));
+
+  const invalidIssues = issues.filter((issue) => issue.code === "invalid");
   if (invalidIssues.length > 0) {
     appendMessages(invalidIssues.map((issue) => issue.message));
   }
@@ -590,11 +608,7 @@ export function validateConnectionConfig(
 
   return {
     valid: false,
-    message: buildValidationMessage(
-      missingRequired,
-      missingAnyOf,
-      issues.filter((issue) => issue.code === "invalid"),
-    ),
+    message: buildValidationMessage(missingRequired, missingAnyOf, issues),
     missingRequired,
     missingAnyOf,
     issues,

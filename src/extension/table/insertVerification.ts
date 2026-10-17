@@ -28,6 +28,15 @@ export function prepareInsertVerification(
   const writable = writableEntries(requested, columnMap);
   const values = writable.flatMap(([name, expectedValue]) => {
     const column = columnMap.get(name);
+    // Oracle RETURNING captures temporal keys verbatim, and the canonical
+    // identity predicate below already verifies that exact persisted key.
+    // A trigger may assign it; do not compare it with the pre-trigger draft.
+    if (
+      backend === "oracle" &&
+      column?.isPrimaryKey &&
+      /^(?:DATE$|TIMESTAMP(?:\(|\s|$))/i.test(column.nativeType.trim())
+    )
+      return [];
     // NULL is a request to generate a key for SQLite's INTEGER rowid alias and
     // MySQL AUTO_INCREMENT, not a request to persist a NULL primary key.
     if (
@@ -137,7 +146,7 @@ export function prepareInsertVerification(
   return {
     rowIndex: 0,
     mutation: "insert",
-    sql: `SELECT ${values.map(({ column }, index) => `${driver.quoteIdentifier(column.name)} AS ${driver.quoteIdentifier(`__col_${index}`)}`).join(", ")} FROM ${qualified} WHERE ${keys
+    sql: `SELECT ${values.map(({ column }, index) => `${driver.buildVerificationValueExpr?.(column) ?? driver.quoteIdentifier(column.name)} AS ${driver.quoteIdentifier(`__col_${index}`)}`).join(", ")} FROM ${qualified} WHERE ${keys
       .map((column, index) => {
         const name = driver.quoteIdentifier(column.name);
         const expression =
@@ -147,8 +156,10 @@ export function prepareInsertVerification(
               ? mssqlInsertIdentityExpression(column, name)
               : name;
         const bind =
-          captureKeys && backend === "mssql"
-            ? "?"
+          captureKeys && (backend === "mssql" || backend === "oracle")
+            ? backend === "oracle"
+              ? `:${index + 1}`
+              : "?"
             : driver.buildInsertValueExpr(column, index + 1);
         return `${expression} ${backend === "sqlite" ? "IS" : "="} ${bind}`;
       })

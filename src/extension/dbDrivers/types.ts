@@ -11,10 +11,9 @@ import type {
   FilterExpression,
   FilterOperator,
   ForeignKeyMeta,
-  GeneratedKind,
-  IdentityGenerationKind,
   IndexMeta,
   QueryColumnMeta,
+  QueryMissingCell,
   TableConstraintMeta,
   TriggerMeta,
   TypeCategory,
@@ -32,6 +31,7 @@ export {
   type IndexMeta,
   NULL_SENTINEL,
   type QueryColumnMeta,
+  type QueryMissingCell,
   type ScalarFilterOperator,
   type TableConstraintMeta,
   type TriggerMeta,
@@ -53,6 +53,8 @@ export interface QueryResult {
   columns: string[];
   columnMeta?: QueryColumnMeta[];
   rows: Record<string, unknown>[];
+  responseMetadata?: Record<string, unknown>[];
+  missingCells?: QueryMissingCell[];
   rowCount: number;
   executionTimeMs: number;
   affectedRows?: number;
@@ -86,6 +88,12 @@ export interface SchemaInfo {
 export interface FilterConditionResult {
   sql: string;
   params: unknown[];
+}
+export interface MutationSqlExpression {
+  sql: string;
+  params: unknown[];
+  /** Actual bind metadata when native constructors differ from the column. */
+  previewColumns?: ColumnTypeMeta[];
 }
 
 export type ReadOnlyQueryDecision =
@@ -245,6 +253,7 @@ export interface PaginationResult {
 }
 export interface PersistedEditCheckOptions {
   persistedValue: unknown;
+  originalValue?: unknown;
 }
 export interface PersistedEditCheckResult {
   ok: boolean;
@@ -398,12 +407,31 @@ export interface IDBDriver {
   ): Promise<string | null>;
   quoteIdentifier(name: string): string;
   qualifiedTableName(database: string, schema: string, table: string): string;
+  /** Optional typed projection for paged Table Viewer reads. */
+  buildTableDataProjection?(columns: readonly ColumnTypeMeta[]): string;
+  /** Read a value exactly on the active transaction before committing a mutation. */
+  buildVerificationValueExpr?(column: ColumnTypeMeta): string;
+  /** Format a projected table value using any driver-specific companion values. */
+  formatTableDataValue?(
+    value: unknown,
+    column: ColumnTypeMeta,
+    projectionValues: Record<string, unknown>,
+    columnIndex: number,
+    columns?: readonly ColumnTypeMeta[],
+  ): unknown;
+  /** Whether a projection-specific server limitation can use a raw-column fallback. */
+  shouldFallbackTableDataProjection?(error: unknown): boolean;
   buildPagination(
     offset: number,
     limit: number,
     paramIndex: number,
   ): PaginationResult;
-  buildOrderByDefault(cols: ColumnTypeMeta[]): string;
+  buildOrderByDefault(cols: ColumnTypeMeta[], tableReference?: string): string;
+  /** Use source columns when display projections reuse their result names. */
+  buildTableDataOrderExpression?(
+    columnName: string,
+    tableReference: string,
+  ): string;
   coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown;
   /** Validate and decode a table row locator without guessing from sampled types. */
   coercePrimaryKeyValue?(value: unknown, column: ColumnTypeMeta): unknown;
@@ -412,6 +440,15 @@ export interface IDBDriver {
     column: ColumnTypeMeta,
     paramIndex: number,
   ): string;
+  /** Optional comparison that expands one logical original value into multiple positional binds. */
+  buildOriginalValueComparisonWithParams?(
+    column: ColumnTypeMeta,
+    value: unknown,
+    paramIndex: number,
+    tableAlias?: string,
+  ): MutationSqlExpression | null;
+  /** Optional alias applied to UPDATE targets for driver-specific predicates. */
+  getUpdateTableAlias?(): string | null;
   formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown;
   checkPersistedEdit(
     column: ColumnTypeMeta,
@@ -442,6 +479,14 @@ export interface IDBDriver {
   ): string;
   buildInsertValueExpr(column: ColumnTypeMeta, paramIndex: number): string;
   buildSetExpr(column: ColumnTypeMeta, paramIndex: number): string;
+  /** Optional native expression for values that need database-specific construction. */
+  buildMutationValueExpr?(
+    column: ColumnTypeMeta,
+    value: unknown,
+    operation: "insert" | "update",
+    originalValue?: unknown,
+    paramIndex?: number,
+  ): MutationSqlExpression | null;
   materializePreviewSql(sql: string, params?: readonly unknown[]): string;
 }
 export interface TransactionContext extends DriverOperationContext {}
@@ -452,7 +497,11 @@ export interface TransactionVerification {
   mutation?: "insert" | "update";
   sql: string;
   params: unknown[];
-  values: Array<{ column: ColumnTypeMeta; expectedValue: unknown }>;
+  values: Array<{
+    column: ColumnTypeMeta;
+    expectedValue: unknown;
+    originalValue?: unknown;
+  }>;
   /** Replace these positional parameters with the identity captured immediately
    * after this operation, not the last identity of the whole batch. */
   identity?: {

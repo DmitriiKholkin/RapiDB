@@ -10,10 +10,8 @@ import {
   DeleteExecutionError,
   getDeleteEvidence,
 } from "../dbDrivers/deleteOutcomes";
-import {
-  isMutationNotExecutedError,
-  isPostgresStatementRejection,
-} from "../dbDrivers/mutationExecutionState";
+import { isMutationNotExecutedError } from "../dbDrivers/mutationExecutionState";
+import { isPostgresStatementRejection } from "../dbDrivers/postgresStatementRejection";
 import { TransactionVerificationError } from "../dbDrivers/transactionVerification";
 import {
   executeAtomicSqlApplyPlan,

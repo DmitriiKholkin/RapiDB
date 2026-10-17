@@ -124,9 +124,17 @@ describe.each(drivers)("H1 %s active SQL table read", (name, createDriver) => {
         name === "MySQL"
           ? Buffer.from(String(param), "hex").toString("utf8")
           : param,
-      ).toBe(name === "MSSQL" ? value : literalContainsPattern(value));
+      ).toBe(
+        name === "MSSQL" || (name === "Oracle" && category === "json")
+          ? value
+          : literalContainsPattern(value),
+      );
       if (name === "PostgreSQL") expect(result?.sql).toContain("$7 ESCAPE '!'");
-      if (name === "Oracle") expect(result?.sql).toContain(":7) ESCAPE '!'");
+      if (name === "Oracle") {
+        expect(result?.sql).toContain(
+          category === "json" ? "UPPER(:7)) > 0" : ":7) ESCAPE '!'",
+        );
+      }
     }
   });
 });

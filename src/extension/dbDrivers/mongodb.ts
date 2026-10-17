@@ -18,6 +18,7 @@ import {
   Timestamp,
   UUID,
 } from "mongodb";
+import { compareNumericTokens } from "../../shared/numericNormalization";
 import { QUERY_LIMIT_POLICY } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
@@ -40,6 +41,7 @@ import {
   createNoSqlUnsupportedMetadataHandlers,
   inferColumnsFromRows,
   pageRows,
+  splitInFilterValues,
 } from "./nosqlUtils";
 import { getQueryRemainingTimeoutMs, throwIfQueryCancelled } from "./timeout";
 import type {
@@ -755,17 +757,31 @@ function parseMongoDisplayDate(value: string): Date | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
-function formatMongoTimestampDisplay(seconds: number): string {
-  return formatDatetimeForDisplay(new Date(seconds * 1000)) ?? String(seconds);
+function formatMongoTimestampDisplay(
+  seconds: number,
+  increment: number,
+): string {
+  // MongoDB Timestamp equality includes both components. A date-only display
+  // loses the increment and cannot be used to reconstruct an optimistic edit
+  // predicate after the first update.
+  return `Timestamp(${seconds}, ${increment})`;
 }
 
 function parseMongoTimestampInput(value: string): Timestamp | null {
   const trimmed = unwrapQuotedMongoDisplay(value);
   const literalMatch = TIMESTAMP_LITERAL_RE.exec(trimmed);
   if (literalMatch) {
+    const t = Number(literalMatch[1]);
+    const i = Number(literalMatch[2]);
+    if (
+      ![t, i].every(
+        (part) => Number.isInteger(part) && part >= 0 && part <= 0xffffffff,
+      )
+    )
+      return null;
     return new Timestamp({
-      t: Number.parseInt(literalMatch[1], 10),
-      i: Number.parseInt(literalMatch[2], 10),
+      t,
+      i,
     });
   }
 
@@ -950,7 +966,7 @@ function formatMongoScalarValue(
       const increment = (value as { low?: unknown }).low;
       const seconds = (value as { high?: unknown }).high;
       return typeof seconds === "number" && typeof increment === "number"
-        ? formatMongoTimestampDisplay(seconds)
+        ? formatMongoTimestampDisplay(seconds >>> 0, increment >>> 0)
         : String(value);
     }
     case "BSONRegExp": {
@@ -1129,15 +1145,15 @@ function selectMongoSchemaSample(
 }
 
 export class MongoDBDriver implements IDBDriver {
-  private readonly tableRowCategories = new WeakMap<
+  private readonly tableRowSchemas = new WeakMap<
     Record<string, unknown>,
-    Map<string, TypeCategory>
+    Map<string, ReturnType<typeof inferMongoSchemaType>>
   >();
   private readonly rowValueCategory = (
     row: Record<string, unknown>,
     column: string,
   ): TypeCategory =>
-    this.tableRowCategories.get(row)?.get(column) ??
+    this.tableRowSchemas.get(row)?.get(column)?.category ??
     inferMongoSchemaType(row[column]).category;
   private readonly tableRowIdTypes = new WeakMap<
     Record<string, unknown>,
@@ -1196,6 +1212,21 @@ export class MongoDBDriver implements IDBDriver {
       this.client = client;
       this.assertConnectionEpoch(epoch);
       await client.connect();
+      this.assertConnectionEpoch(epoch);
+      // A successful handshake/ping does not prove authentication or catalog
+      // access: MongoDB permits those commands without credentials. Exercise
+      // the same database catalog used by Explorer before reporting success.
+      const catalog = client
+        .db(this.defaultDatabaseName())
+        .listCollections(
+          {},
+          { nameOnly: true, batchSize: 1, signal: abortController.signal },
+        );
+      try {
+        await catalog.hasNext();
+      } finally {
+        await catalog.close();
+      }
       this.assertConnectionEpoch(epoch);
       this.connected = true;
     } catch (error) {
@@ -1948,6 +1979,15 @@ export class MongoDBDriver implements IDBDriver {
       normalizedFilters,
       comparisonColumns,
       this.rowValueCategory,
+      (value, name) => {
+        const column = schemaColumns.find(
+          (candidate) => candidate.name === name,
+        );
+        return splitInFilterValues(value).map((entry) =>
+          column ? this.normalizeInlineFilterScalar(column, entry) : entry,
+        );
+      },
+      this.buildClientScalarEquality(normalizedFilters, schemaColumns),
     );
     const sorted = applySort(
       filtered,
@@ -2031,11 +2071,9 @@ export class MongoDBDriver implements IDBDriver {
           break;
         }
         case "in": {
-          const entries = filter.value
-            .split(",")
-            .map((entry) => entry.trim())
-            .filter((entry) => entry.length > 0)
-            .map((entry) => this.coerceFilterInput(entry, column));
+          const entries = splitInFilterValues(filter.value).map((entry) =>
+            this.coerceFilterInput(entry, column),
+          );
           if (entries.length > 0) {
             andClauses.push({ [filter.column]: { $in: entries } });
           }
@@ -2070,7 +2108,100 @@ export class MongoDBDriver implements IDBDriver {
     if (!column) {
       return value;
     }
-    return this.coerceInputValue(value, column);
+    const normalized = unwrapQuotedMongoDisplay(value);
+    let coerced: unknown;
+    try {
+      coerced = this.coerceInputValue(value, column);
+    } catch (error) {
+      // Filter bounds describe a schema-less numeric field, not a mutation
+      // restricted to the first sampled Int32/Long subtype.
+      if (
+        isMongoIntegerType(column.nativeType) &&
+        /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(normalized)
+      )
+        return Decimal128.fromString(normalized);
+      throw error;
+    }
+    if (
+      (column.nativeType === "double" || column.nativeType === "number") &&
+      /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(normalized) &&
+      (typeof coerced === "string" ||
+        (typeof coerced === "number" &&
+          (!Number.isFinite(coerced) ||
+            compareNumericTokens(normalized, String(coerced)) !== 0)))
+    )
+      return Decimal128.fromString(normalized);
+    if (
+      typeof coerced === "string" &&
+      isMongoIntegerType(column.nativeType) &&
+      !/^[+-]?\d+$/.test(normalized) &&
+      /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(normalized)
+    ) {
+      // A schema-less MongoDB field may contain a Double even when the first
+      // non-null sample is Int32/Long. Keep fractional numeric filters numeric
+      // instead of passing the uncoercible text to the BSON query unchanged.
+      return Decimal128.fromString(normalized);
+    }
+    return coerced;
+  }
+
+  private buildClientScalarEquality(
+    filters: readonly FilterExpression[],
+    columns: readonly ColumnTypeMeta[],
+  ) {
+    const predicates = new Map<
+      FilterExpression,
+      (row: Record<string, unknown>) => boolean | undefined
+    >();
+    const numeric = (category: TypeCategory) =>
+      category === "integer" || category === "decimal" || category === "float";
+    for (const filter of filters) {
+      if (
+        !["eq", "neq", "in"].includes(filter.operator) ||
+        !("value" in filter) ||
+        typeof filter.value !== "string"
+      )
+        continue;
+      const column = columns.find((column) => column.name === filter.column);
+      if (!column || ["json", "array", "other"].includes(column.category))
+        continue;
+      const candidates = (
+        filter.operator === "in"
+          ? splitInFilterValues(filter.value)
+          : [filter.value]
+      ).map((input) => {
+        const value = this.coerceFilterInput(input, column);
+        return {
+          value,
+          schema: inferMongoSchemaType(value),
+          display: formatMongoDisplayValue(value),
+        };
+      });
+      predicates.set(filter, (row) => {
+        const schema = this.tableRowSchemas.get(row);
+        if (!schema) return undefined;
+        const actual = schema.get(filter.column);
+        const value = row[filter.column];
+        const match = candidates.some((candidate) => {
+          if (candidate.value == null) return value == null;
+          if (!actual || value == null) return false;
+          if (numeric(actual.category) && numeric(candidate.schema.category))
+            return (
+              compareNumericTokens(String(value), String(candidate.display)) ===
+              0
+            );
+          if (
+            actual.nativeType !== candidate.schema.nativeType ||
+            actual.bsonSubtype !== candidate.schema.bsonSubtype
+          )
+            return false;
+          return String(value) === String(candidate.display);
+        });
+        return filter.operator === "neq" ? !match : match;
+      });
+    }
+    return (row: Record<string, unknown>, filter: FilterExpression) =>
+      predicates.get(filter)?.(row);
   }
 
   private buildContainsRegex(value: string): string {
@@ -2590,11 +2721,18 @@ export class MongoDBDriver implements IDBDriver {
 
   normalizeFilterValue(
     column: ColumnTypeMeta,
-    _operator: FilterOperator,
+    operator: FilterOperator,
     value: string | [string, string] | undefined,
   ) {
     if (value === undefined) {
       return undefined;
+    }
+    if (operator === "in" && typeof value === "string") {
+      return column.nativeType === "timestamp"
+        ? splitInFilterValues(value)
+            .map((entry) => this.normalizeInlineFilterScalar(column, entry))
+            .join(", ")
+        : value;
     }
     if (Array.isArray(value)) {
       return value.map((entry) =>
@@ -2725,12 +2863,12 @@ export class MongoDBDriver implements IDBDriver {
         formatMongoDisplayValue(value),
       ]),
     );
-    this.tableRowCategories.set(
+    this.tableRowSchemas.set(
       row,
       new Map(
         Object.entries(document).map(([key, value]) => [
           key,
-          inferMongoSchemaType(value).category,
+          inferMongoSchemaType(value),
         ]),
       ),
     );
@@ -2927,7 +3065,7 @@ export class MongoDBDriver implements IDBDriver {
       return `new NumberInt(${JSON.stringify(value.toString())})`;
     }
     if (value instanceof Timestamp) {
-      return `new Timestamp(${value.high}, ${value.low})`;
+      return `new Timestamp(${value.high >>> 0}, ${value.low >>> 0})`;
     }
     if (value instanceof Long) {
       return `new NumberLong(${JSON.stringify(value.toString())})`;

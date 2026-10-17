@@ -177,6 +177,11 @@ function compareValues(
     return compareNumericTokens(String(left), String(right));
   }
   if (isTemporalCategory(category)) {
+    const aBson = bsonTimestampParts(left);
+    const bBson = bsonTimestampParts(right);
+    if (aBson || bBson) {
+      return aBson && bBson ? aBson[0] - bBson[0] || aBson[1] - bBson[1] : null;
+    }
     const timestamp = (value: unknown) => {
       if (value instanceof Date) return value.getTime();
       return Date.parse(
@@ -192,11 +197,47 @@ function compareValues(
   return String(left).localeCompare(String(right));
 }
 
-function splitInValues(value: string): string[] {
-  return value
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
+function bsonTimestampParts(value: unknown): [number, number] | null {
+  if (typeof value !== "string") return null;
+  const match = /^Timestamp\((\d+),\s*(\d+)\)$/i.exec(value);
+  if (!match) return null;
+  const seconds = Number(match[1]);
+  const increment = Number(match[2]);
+  return [seconds, increment].every(
+    (part) => Number.isInteger(part) && part >= 0 && part <= 0xffffffff,
+  )
+    ? [seconds, increment]
+    : null;
+}
+
+/** Commas inside typed values or quoted strings do not delimit IN entries. */
+export function splitInFilterValues(value: string): string[] {
+  const entries: string[] = [];
+  let start = 0;
+  let depth = 0;
+  let quote = "";
+  for (let index = 0; index < value.length; index++) {
+    const char = value[index];
+    if (quote) {
+      if (char === "\\") index++;
+      else if (char === quote) quote = "";
+    } else if (
+      (char === '"' || char === "'") &&
+      (value.slice(start, index).trim() === "" ||
+        (depth > 0 && /[([{,:]\s*$/.test(value.slice(start, index))))
+    )
+      quote = char;
+    else if (char === "(" || char === "[" || char === "{") depth++;
+    else if (char === ")" || char === "]" || char === "}") depth--;
+    else if (char === "," && depth === 0) {
+      const entry = value.slice(start, index).trim();
+      if (entry) entries.push(entry);
+      start = index + 1;
+    }
+  }
+  const last = value.slice(start).trim();
+  if (last) entries.push(last);
+  return entries;
 }
 
 function evaluateScalarOperator(
@@ -204,6 +245,8 @@ function evaluateScalarOperator(
   rawValue: unknown,
   inputValue: string,
   category?: TypeCategory,
+  inCandidates?: readonly string[],
+  numericEquality = false,
 ): boolean {
   if (rawValue === null || rawValue === undefined) {
     return false;
@@ -211,8 +254,14 @@ function evaluateScalarOperator(
 
   switch (operator) {
     case "eq":
-      return String(rawValue) === inputValue;
+      return numericEquality
+        ? compareValues(rawValue, inputValue, category) === 0
+        : String(rawValue) === inputValue;
     case "neq":
+      if (numericEquality) {
+        const comparison = compareValues(rawValue, inputValue, category);
+        return comparison !== null && comparison !== 0;
+      }
       return String(rawValue) !== inputValue;
     case "gt":
     case "gte":
@@ -237,8 +286,17 @@ function evaluateScalarOperator(
         : haystack.includes(needle);
     }
     case "in": {
-      const candidates = splitInValues(inputValue);
-      return candidates.includes(String(rawValue));
+      const candidates =
+        inCandidates ??
+        inputValue
+          .split(",")
+          .map((entry) => entry.trim())
+          .filter(Boolean);
+      return numericEquality
+        ? candidates.some(
+            (candidate) => compareValues(rawValue, candidate, category) === 0,
+          )
+        : candidates.includes(String(rawValue));
     }
   }
 }
@@ -248,6 +306,11 @@ function evaluateFilter(
   row: Record<string, unknown>,
   category?: TypeCategory,
   valueCategory?: ValueCategory,
+  parseInValues?: (value: string, column: string) => readonly string[],
+  scalarEquality?: (
+    row: Record<string, unknown>,
+    filter: FilterExpression,
+  ) => boolean | undefined,
 ): boolean {
   const rawValue = row[filter.column];
   if (filter.operator === "is_null") {
@@ -256,6 +319,8 @@ function evaluateFilter(
   if (filter.operator === "is_not_null") {
     return rawValue !== null && rawValue !== undefined;
   }
+  const equality = scalarEquality?.(row, filter);
+  if (equality !== undefined) return equality;
   if (rawValue == null) return false;
   const isRange = ["gt", "gte", "lt", "lte", "between"].includes(
     filter.operator,
@@ -281,6 +346,14 @@ function evaluateFilter(
     rawValue,
     filter.value,
     category,
+    filter.operator === "in"
+      ? parseInValues?.(filter.value, filter.column)
+      : undefined,
+    Boolean(
+      valueCategory &&
+        isNumericCategory(category) &&
+        compatibleCategory(category, valueCategory(row, filter.column)),
+    ),
   );
 }
 
@@ -289,6 +362,11 @@ export function applyFilters(
   filters: readonly FilterExpression[],
   columns: readonly ComparisonColumn[] = [],
   valueCategory?: ValueCategory,
+  parseInValues?: (value: string, column: string) => readonly string[],
+  scalarEquality?: (
+    row: Record<string, unknown>,
+    filter: FilterExpression,
+  ) => boolean | undefined,
 ): Record<string, unknown>[] {
   if (filters.length === 0) {
     return [...rows];
@@ -298,7 +376,14 @@ export function applyFilters(
   );
   return rows.filter((row) =>
     filters.every((filter) =>
-      evaluateFilter(filter, row, categories.get(filter.column), valueCategory),
+      evaluateFilter(
+        filter,
+        row,
+        categories.get(filter.column),
+        valueCategory,
+        parseInValues,
+        scalarEquality,
+      ),
     ),
   );
 }
@@ -316,21 +401,35 @@ export function applySort(
   const declaredCategory = columns.find(
     (column) => column.name === sort.column,
   )?.category;
+  const mixedTemporalKinds =
+    isTemporalCategory(declaredCategory) &&
+    new Set(
+      rows
+        .filter((row) => row[sort.column] != null)
+        .map((row) =>
+          bsonTimestampParts(row[sort.column]) ? "timestamp" : "date",
+        ),
+    ).size > 1;
   // A heterogeneous column must use one ordering for the entire sort. Switching
   // between numeric and text comparison per pair would break transitivity.
-  const category = rows.some(
-    (row) =>
-      row[sort.column] != null &&
-      ((valueCategory &&
-        !compatibleCategory(
-          declaredCategory,
-          valueCategory(row, sort.column),
-        )) ||
-        compareValues(row[sort.column], row[sort.column], declaredCategory) ===
-          null),
-  )
-    ? undefined
-    : declaredCategory;
+  const category =
+    mixedTemporalKinds ||
+    rows.some(
+      (row) =>
+        row[sort.column] != null &&
+        ((valueCategory &&
+          !compatibleCategory(
+            declaredCategory,
+            valueCategory(row, sort.column),
+          )) ||
+          compareValues(
+            row[sort.column],
+            row[sort.column],
+            declaredCategory,
+          ) === null),
+    )
+      ? undefined
+      : declaredCategory;
   sorted.sort((left, right) => {
     const cmp =
       compareValues(left[sort.column], right[sort.column], category) ??

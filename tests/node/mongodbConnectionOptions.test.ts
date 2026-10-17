@@ -36,7 +36,12 @@ describe("MongoDBDriver — connect()", () => {
     mongoClientMocks.constructorCalls.length = 0;
     mongoClientMocks.connect.mockClear().mockResolvedValue(undefined);
     mongoClientMocks.close.mockClear().mockResolvedValue(undefined);
-    mongoClientMocks.db.mockClear();
+    mongoClientMocks.db.mockClear().mockReturnValue({
+      listCollections: vi.fn(() => ({
+        hasNext: vi.fn().mockResolvedValue(false),
+        close: vi.fn().mockResolvedValue(undefined),
+      })),
+    });
   });
 
   it("builds a URI with the selected database and authSource", async () => {

@@ -142,7 +142,12 @@ export class TableReadService {
       columns,
     );
     const offset = (page - 1) * pageSize;
-    const orderByClause = this.resolveFallbackOrderBy(driver, columns, sort);
+    const orderByClause = this.resolveFallbackOrderBy(
+      driver,
+      columns,
+      sort,
+      qualifiedTableName,
+    );
     const count = await this.readFallbackTotalCount(
       driver,
       database,
@@ -158,15 +163,25 @@ export class TableReadService {
       whereParams.length + 1,
     );
     const effectiveOrderBy =
-      orderByClause || driver.buildOrderByDefault(columns);
+      orderByClause ||
+      driver.buildOrderByDefault(
+        columns,
+        driver.buildTableDataOrderExpression ? qualifiedTableName : undefined,
+      );
     const baseParams = [...whereParams, ...pagination.params];
-    const dataSql = `SELECT * FROM ${qualifiedTableName} ${whereClause} ${effectiveOrderBy} ${pagination.sql}`;
+    const projection = driver.buildTableDataProjection?.(columns) ?? "*";
+    const dataSql = `SELECT ${projection} FROM ${qualifiedTableName} ${whereClause} ${effectiveOrderBy} ${pagination.sql}`;
+    const fallbackSql =
+      projection === "*"
+        ? undefined
+        : `SELECT * FROM ${qualifiedTableName} ${whereClause} ${effectiveOrderBy} ${pagination.sql}`;
     const dataResult = await this.readFallbackDataResult(
       driver,
       database,
       dataSql,
       baseParams,
       columns,
+      fallbackSql,
     );
     const fetchedRows = this.formatQueryRows(driver, columns, dataResult);
     const hasMoreRows = count.countFailed && fetchedRows.length > pageSize;
@@ -272,10 +287,19 @@ export class TableReadService {
     driver: ReturnType<TableReadService["getConnectionDriver"]>["driver"],
     columns: ColumnTypeMeta[],
     sort: SortConfig | null,
+    tableReference?: string,
   ): string {
-    if (!sort) return driver.buildOrderByDefault(columns);
+    if (!sort)
+      return driver.buildOrderByDefault(
+        columns,
+        driver.buildTableDataOrderExpression ? tableReference : undefined,
+      );
+    const name = (columnName: string) =>
+      tableReference && driver.buildTableDataOrderExpression
+        ? driver.buildTableDataOrderExpression(columnName, tableReference)
+        : driver.quoteIdentifier(columnName);
     const clauses = [
-      `${driver.quoteIdentifier(sort.column)} ${sort.direction === "desc" ? "DESC" : "ASC"}`,
+      `${name(sort.column)} ${sort.direction === "desc" ? "DESC" : "ASC"}`,
       ...columns
         .filter((column) => column.isPrimaryKey && column.name !== sort.column)
         .sort(
@@ -283,7 +307,7 @@ export class TableReadService {
             (left.primaryKeyOrdinal ?? Number.MAX_SAFE_INTEGER) -
             (right.primaryKeyOrdinal ?? Number.MAX_SAFE_INTEGER),
         )
-        .map((column) => `${driver.quoteIdentifier(column.name)} ASC`),
+        .map((column) => `${name(column.name)} ASC`),
     ];
     return `ORDER BY ${clauses.join(", ")}`;
   }
@@ -335,11 +359,25 @@ export class TableReadService {
     dataSql: string,
     params: unknown[],
     columns: ColumnTypeMeta[],
+    projectionFallbackSql?: string,
   ): Promise<QueryResult> {
     try {
       return await driver.query(dataSql, params, { database });
     } catch (error: unknown) {
       this.rethrowComputedColumnOverflow(error, columns);
+      if (
+        projectionFallbackSql &&
+        driver.shouldFallbackTableDataProjection?.(error)
+      ) {
+        try {
+          return await driver.query(projectionFallbackSql, params, {
+            database,
+          });
+        } catch (fallbackError: unknown) {
+          this.rethrowComputedColumnOverflow(fallbackError, columns);
+          throw fallbackError;
+        }
+      }
       throw error;
     }
   }
@@ -374,18 +412,23 @@ export class TableReadService {
     columns: ColumnTypeMeta[],
     result: QueryResult,
   ): Record<string, unknown>[] {
-    const columnMetaByName = new Map(
-      columns.map((column) => [column.name, column]),
-    );
-
     return result.rows.map((row) => {
-      const formattedRow: Record<string, unknown> = {};
+      const projectionValues: Record<string, unknown> = {};
       result.columns.forEach((columnName, index) => {
-        const value = row[`__col_${index}`];
-        const column = columnMetaByName.get(columnName);
-        formattedRow[columnName] = column
-          ? driver.formatOutputValue(value, column)
-          : value;
+        projectionValues[columnName] = row[`__col_${index}`];
+      });
+      const formattedRow: Record<string, unknown> = {};
+      columns.forEach((column, columnIndex) => {
+        const value = projectionValues[column.name];
+        formattedRow[column.name] = driver.formatTableDataValue
+          ? driver.formatTableDataValue(
+              value,
+              column,
+              projectionValues,
+              columnIndex,
+              columns,
+            )
+          : driver.formatOutputValue(value, column);
       });
       return formattedRow;
     });
@@ -416,10 +459,11 @@ export class TableReadService {
       schema,
       table,
     );
-    const columnMetaByName = new Map(
-      columns.map((column) => [column.name, column]),
+    const orderByClause = this.buildOrderByClause(
+      driver,
+      order,
+      qualifiedTableName,
     );
-    const orderByClause = this.buildOrderByClause(driver, order);
     let cursor: ExportCursor | null = null;
 
     while (true) {
@@ -449,24 +493,26 @@ export class TableReadService {
         chunkSize,
         baseWhereParams.length + (cursorCondition?.params.length ?? 0) + 1,
       );
-      const sql = `SELECT * FROM ${qualifiedTableName} ${whereClause} ${orderByClause} ${pagination.sql}`;
+      const projection = driver.buildTableDataProjection?.(columns) ?? "*";
+      const sql = `SELECT ${projection} FROM ${qualifiedTableName} ${whereClause} ${orderByClause} ${pagination.sql}`;
+      const fallbackSql =
+        projection === "*"
+          ? undefined
+          : `SELECT * FROM ${qualifiedTableName} ${whereClause} ${orderByClause} ${pagination.sql}`;
       const params = [
         ...baseWhereParams,
         ...(cursorCondition?.params ?? []),
         ...pagination.params,
       ];
-      const dataResult = await driver.query(sql, params, { database });
-      const rows = dataResult.rows.map((row) => {
-        const formattedRow: Record<string, unknown> = {};
-        dataResult.columns.forEach((columnName, index) => {
-          const value = row[`__col_${index}`];
-          const column = columnMetaByName.get(columnName);
-          formattedRow[columnName] = column
-            ? driver.formatOutputValue(value, column)
-            : value;
-        });
-        return formattedRow;
-      });
+      const dataResult = await this.readFallbackDataResult(
+        driver,
+        database,
+        sql,
+        params,
+        columns,
+        fallbackSql,
+      );
+      const rows = this.formatQueryRows(driver, columns, dataResult);
 
       if (rows.length === 0) {
         if (cursor === null) {
@@ -567,10 +613,11 @@ export class TableReadService {
   private buildOrderByClause(
     driver: ReturnType<TableReadService["getConnectionDriver"]>["driver"],
     order: readonly ExportOrderColumn[],
+    tableReference?: string,
   ): string {
     const clauses = order.map(
       (entry) =>
-        `${driver.quoteIdentifier(entry.column.name)} ${entry.direction === "desc" ? "DESC" : "ASC"}`,
+        `${tableReference && driver.buildTableDataOrderExpression ? driver.buildTableDataOrderExpression(entry.column.name, tableReference) : driver.quoteIdentifier(entry.column.name)} ${entry.direction === "desc" ? "DESC" : "ASC"}`,
     );
     return `ORDER BY ${clauses.join(", ")}`;
   }

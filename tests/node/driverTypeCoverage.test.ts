@@ -1212,8 +1212,8 @@ describe("filter SQL compatibility for complex null-only types", () => {
     );
 
     expect(result).toEqual({
-      sql: `UPPER("probe_col") LIKE UPPER(:1) ESCAPE '!'`,
-      params: ['%"alpha"%'],
+      sql: `DBMS_LOB.INSTR(UPPER(JSON_SERIALIZE("probe_col" RETURNING CLOB)), UPPER(:1)) > 0`,
+      params: ['"alpha"'],
     });
   });
 

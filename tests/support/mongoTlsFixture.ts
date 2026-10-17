@@ -111,6 +111,12 @@ export async function startMongoTlsFixture(options: tls.TlsOptions) {
           maxBsonObjectSize: 16777216,
           maxMessageSizeBytes: 48000000,
           maxWriteBatchSize: 100000,
+          // Catalog access now verifies authentication after the handshake.
+          cursor: {
+            id: BSON.Long.ZERO,
+            ns: "app.$cmd.listCollections",
+            firstBatch: [],
+          },
         });
         const prefix = Buffer.alloc(opcode === 2004 ? 36 : 21);
         prefix.writeInt32LE(prefix.length + document.length, 0);

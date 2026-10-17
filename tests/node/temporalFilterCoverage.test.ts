@@ -198,11 +198,11 @@ describe("temporal filter operator coverage", () => {
     );
 
     expect(gtCondition).toEqual({
-      sql: "CAST(`event_time` AS TIME) > CAST(? AS TIME)",
+      sql: "`event_time` > CAST(? AS TIME(6))",
       params: ["12:34:56"],
     });
     expect(inCondition).toEqual({
-      sql: "CAST(`event_at` AS DATETIME) IN (CAST(? AS DATETIME), CAST(? AS DATETIME))",
+      sql: "`event_at` IN (CAST(? AS DATETIME(6)), CAST(? AS DATETIME(6)))",
       params: ["2026-04-23 12:34:56", "2026-04-24 08:00:00"],
     });
   });
@@ -545,11 +545,11 @@ describe("temporal filter operator coverage", () => {
     );
 
     expect(gtCondition).toEqual({
-      sql: `RTRIM(RTRIM(TO_CHAR(SYS_EXTRACT_UTC(CAST("event_at" AS TIMESTAMP WITH TIME ZONE)), 'YYYY-MM-DD HH24:MI:SS.FF6'), '0'), '.') > :1`,
+      sql: `RTRIM(RTRIM(TO_CHAR(SYS_EXTRACT_UTC(CAST("event_at" AS TIMESTAMP(9) WITH TIME ZONE)), 'YYYY-MM-DD HH24:MI:SS.FF9'), '0'), '.') > :1`,
       params: ["2026-04-23 12:34:56"],
     });
     expect(inCondition).toEqual({
-      sql: `RTRIM(RTRIM(TO_CHAR(SYS_EXTRACT_UTC(CAST("event_at" AS TIMESTAMP WITH TIME ZONE)), 'YYYY-MM-DD HH24:MI:SS.FF6'), '0'), '.') IN (:1, :2)`,
+      sql: `RTRIM(RTRIM(TO_CHAR(SYS_EXTRACT_UTC(CAST("event_at" AS TIMESTAMP(9) WITH TIME ZONE)), 'YYYY-MM-DD HH24:MI:SS.FF9'), '0'), '.') IN (:1, :2)`,
       params: ["2026-04-23 12:34:56", "2026-04-24 08:00:00"],
     });
   });

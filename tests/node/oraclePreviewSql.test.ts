@@ -303,18 +303,18 @@ describe("Oracle preview SQL literals", () => {
     );
   });
 
-  it("formats Oracle DATE values without the time portion", () => {
+  it("preserves the wall-clock time portion of Oracle DATE", () => {
     const driver = new OracleDriver(baseConfig as ConnectionConfig);
     const column = buildColumn("COL_DATE", "DATE", "date");
 
     expect(
       driver.formatOutputValue(
-        new Date(Date.UTC(2016, 9, 23, 0, 0, 0, 0)),
+        new Date(2016, 9, 23, 12, 34, 56),
         column,
       ),
-    ).toBe("2016-10-23");
+    ).toBe("2016-10-23 12:34:56");
     expect(driver.formatOutputValue("2016-10-23 00:00:00", column)).toBe(
-      "2016-10-23",
+      "2016-10-23 00:00:00",
     );
   });
 

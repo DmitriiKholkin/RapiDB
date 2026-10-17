@@ -1,5 +1,6 @@
 import React from "react";
 import type { ConnectionEntry, QueryStatus } from "../../store";
+import { queryRunShortcutLabel } from "../../utils/platform";
 import { Icon } from "../Icon";
 import {
   buildQueryGhostButtonStyle,
@@ -82,7 +83,7 @@ export function QueryToolbar({
         style={buildQueryPrimaryButtonStyle(runDisabled)}
         disabled={runDisabled}
         onClick={onRun}
-        title="Run query (Ctrl+Enter / F5)"
+        title={`Run query (${queryRunShortcutLabel()} / F5)`}
       >
         <Icon name="run" size={13} style={{ marginRight: 4 }} />
         Run
@@ -158,7 +159,9 @@ export function QueryToolbar({
         </span>
       )}
 
-      <span style={{ fontSize: 11, opacity: 0.35 }}>Ctrl+Enter</span>
+      <span style={{ fontSize: 11, opacity: 0.35 }}>
+        {queryRunShortcutLabel()}
+      </span>
     </div>
   );
 }

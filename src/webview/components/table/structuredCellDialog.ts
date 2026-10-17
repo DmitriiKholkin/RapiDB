@@ -1,3 +1,4 @@
+import { redisBinarySnapshotDisplay } from "../../../shared/redisValueSnapshot";
 import type { ColumnTypeMeta as ColumnMeta } from "../../../shared/tableTypes";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
 
@@ -320,6 +321,13 @@ export function getStructuredCellDialogValue(
   value: unknown,
   column: Pick<ColumnMeta, "category" | "nativeType">,
 ): StructuredCellDialogValue | null {
+  const binaryDisplay = redisBinarySnapshotDisplay(value, column.nativeType);
+  if (binaryDisplay !== undefined)
+    return {
+      kind: "text",
+      language: "plaintext",
+      formattedText: binaryDisplay,
+    };
   const structuredKind = resolveStructuredCellKind(column);
   if (!structuredKind) {
     if (

@@ -139,6 +139,71 @@ const DYNAMODB_CURSOR_HISTORY_LIMIT = 256;
 const DYNAMODB_EMPTY_BINARY_CELL_MARKER = "0x (empty binary)";
 const DYNAMODB_EMPTY_BINARY_TEXT_PATTERN = /^\\*0x \(empty binary\)$/;
 const DYNAMODB_ESCAPED_EMPTY_BINARY_TEXT_PATTERN = /^\\+0x \(empty binary\)$/;
+const DYNAMODB_NUMBER_RE = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+const DYNAMODB_TABLE_FILTER_ERROR_PREFIX = "Invalid DynamoDB table filter:";
+
+function canonicalDynamoNumber(value: unknown): string | null {
+  const text =
+    value instanceof NumberValueImpl
+      ? value.value
+      : typeof value === "number" && Number.isFinite(value)
+        ? String(value)
+        : typeof value === "bigint"
+          ? value.toString()
+          : typeof value === "string"
+            ? value.trim()
+            : null;
+  if (!text || !DYNAMODB_NUMBER_RE.test(text)) return null;
+
+  const match = text.match(
+    /^([+-]?)(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/,
+  );
+  if (!match) return null;
+  const sign = match[1] === "-" ? "-" : "";
+  const integerDigits = match[2] ?? "0";
+  const fractionDigits = match[3] ?? match[4] ?? "";
+  const exponent = Number(match[5] ?? "0");
+  if (!Number.isSafeInteger(exponent)) return null;
+
+  let digits = `${integerDigits}${fractionDigits}`.replace(/^0+/, "");
+  if (!digits) return "0";
+  let power = exponent - fractionDigits.length;
+  while (digits.endsWith("0")) {
+    digits = digits.slice(0, -1);
+    power += 1;
+  }
+  return `${sign}${digits}e${power}`;
+}
+
+function parseDynamoContainsNeedle(
+  value: string,
+  nativeType?: string,
+):
+  | { kind: "string"; value: string }
+  | { kind: "number"; value: string }
+  | { kind: "binary"; value: string } {
+  const trimmed = value.trim();
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (typeof parsed === "string") return { kind: "string", value: parsed };
+  } catch {
+    // Unquoted input remains the convenient string form used by existing filters.
+  }
+  // Preserve the native S-needle contract, including strings such as "123"
+  // and "0xdead". Homogeneous typed sets are unambiguous. Mixed lists use
+  // explicit N(...) / B(...) to select numeric or binary membership.
+  const binary = /^B\((0x[0-9a-f]*)\)$/i.exec(trimmed);
+  if (binary) return { kind: "binary", value: binary[1] };
+  const numeric = /^N\((.*)\)$/i.exec(trimmed);
+  if (numeric && DYNAMODB_NUMBER_RE.test(numeric[1]))
+    return { kind: "number", value: numeric[1] };
+  if (nativeType === "binary set" && /^0x[0-9a-f]*$/i.test(trimmed))
+    return { kind: "binary", value: trimmed };
+  if (nativeType === "number set" && DYNAMODB_NUMBER_RE.test(trimmed))
+    return { kind: "number", value: trimmed };
+  return { kind: "string", value };
+}
+
 // Decode only a complete escaped cell token, never partial Contains needles or
 // arbitrary backslashes. Filters need native binary context to interpret B;
 // edits already have the value-tagged cell context.
@@ -240,6 +305,7 @@ type DynamoCursorSession = {
 
 type QueryDispatchResult = {
   rows: Record<string, unknown>[];
+  responseMetadata?: Record<string, unknown>;
   affectedRows?: number;
 };
 
@@ -460,6 +526,8 @@ export class DynamoDBDriver implements IDBDriver {
       tabularRead: "nosql" as const,
       queryMode: "text" as const,
       supportsMutations: true,
+      isTableFilterError: (message: string) =>
+        message.startsWith(DYNAMODB_TABLE_FILTER_ERROR_PREFIX),
       readOnlyQueryGuard: (queryText: string) =>
         this.decideReadOnlyQuery(queryText),
       editorPresentation: {
@@ -737,6 +805,7 @@ export class DynamoDBDriver implements IDBDriver {
     const operation = this.resolveNativeOperation(inputs);
     const startedAt = Date.now();
     const rawRows: Record<string, unknown>[] = [];
+    const responseMetadata: Record<string, unknown>[] = [];
     let affectedRows = 0;
     let sawMutation = false;
 
@@ -749,6 +818,9 @@ export class DynamoDBDriver implements IDBDriver {
       );
       throwIfQueryCancelled(options);
       rawRows.push(...result.rows);
+      if (result.responseMetadata) {
+        responseMetadata.push(result.responseMetadata);
+      }
       if (result.affectedRows !== undefined) {
         sawMutation = true;
         affectedRows += result.affectedRows;
@@ -757,6 +829,11 @@ export class DynamoDBDriver implements IDBDriver {
 
     const columns = inferColumnsFromRows(rawRows, "id").map(
       (column) => column.name,
+    );
+    const missingCells = rawRows.flatMap((row, rowIndex) =>
+      columns.flatMap((columnName, columnIndex) =>
+        Object.hasOwn(row, columnName) ? [] : [{ rowIndex, columnIndex }],
+      ),
     );
 
     return {
@@ -767,6 +844,8 @@ export class DynamoDBDriver implements IDBDriver {
             ?.category ?? null,
       })),
       rows: rawRows.map((row) => this.mapRowToQueryRow(row, columns)),
+      ...(responseMetadata.length > 0 ? { responseMetadata } : {}),
+      ...(missingCells.length > 0 ? { missingCells } : {}),
       rowCount: rawRows.length,
       affectedRows: sawMutation ? affectedRows : undefined,
       executionTimeMs: Date.now() - startedAt,
@@ -801,6 +880,7 @@ export class DynamoDBDriver implements IDBDriver {
       request,
     );
     throwIfReadCancelled(request);
+    this.validateNumericTableFilters(request.filters, describedColumns);
     const describedByName = new Map(
       describedColumns.map((column) => [column.name, column]),
     );
@@ -1089,6 +1169,7 @@ export class DynamoDBDriver implements IDBDriver {
     data: {
       primaryKeys?: Record<string, unknown>;
       changes?: Record<string, unknown>;
+      originalValues?: Record<string, unknown>;
       values?: Record<string, unknown>;
       primaryKeyValuesList?: Array<Record<string, unknown>>;
     },
@@ -2880,6 +2961,31 @@ export class DynamoDBDriver implements IDBDriver {
     }
   }
 
+  private dynamoPageMetadata(
+    output: Pick<
+      QueryCommandOutput | ScanCommandOutput,
+      "Count" | "ScannedCount" | "LastEvaluatedKey"
+    >,
+  ): Record<string, unknown> {
+    const lastEvaluatedKey = output.LastEvaluatedKey;
+    const hasMoreResults =
+      lastEvaluatedKey !== undefined &&
+      Object.keys(lastEvaluatedKey).length > 0;
+    return {
+      ...(output.Count !== undefined ? { Count: output.Count } : {}),
+      ...(output.ScannedCount !== undefined
+        ? { ScannedCount: output.ScannedCount }
+        : {}),
+      hasMoreResults,
+      ...(hasMoreResults
+        ? {
+            LastEvaluatedKey:
+              this.serializeNativePreviewValue(lastEvaluatedKey),
+          }
+        : {}),
+    };
+  }
+
   private toQueryDispatchResult(
     operation: DynamoDbNativeOperationName,
     output:
@@ -2907,6 +3013,7 @@ export class DynamoDBDriver implements IDBDriver {
           rows: (typedOutput.Items ?? []).map(
             (item: Record<string, AttributeValue>) => this.unmarshallItem(item),
           ),
+          responseMetadata: this.dynamoPageMetadata(typedOutput),
         };
       }
       case "Scan": {
@@ -2915,6 +3022,7 @@ export class DynamoDBDriver implements IDBDriver {
           rows: (typedOutput.Items ?? []).map(
             (item: Record<string, AttributeValue>) => this.unmarshallItem(item),
           ),
+          responseMetadata: this.dynamoPageMetadata(typedOutput),
         };
       }
       case "BatchGetItem": {
@@ -2994,6 +3102,7 @@ export class DynamoDBDriver implements IDBDriver {
     data: {
       primaryKeys?: Record<string, unknown>;
       changes?: Record<string, unknown>;
+      originalValues?: Record<string, unknown>;
       values?: Record<string, unknown>;
       primaryKeyValuesList?: Array<Record<string, unknown>>;
     },
@@ -3016,6 +3125,9 @@ export class DynamoDBDriver implements IDBDriver {
         {
           primaryKeys: data.primaryKeys ?? {},
           changes: data.changes ?? {},
+          ...(data.originalValues
+            ? { originalValues: data.originalValues }
+            : {}),
         },
       );
       return input ? [input as unknown as Record<string, unknown>] : [];
@@ -3202,6 +3314,51 @@ export class DynamoDBDriver implements IDBDriver {
       .filter((entry) => entry.length > 0);
   }
 
+  private validateNumericTableFilters(
+    filters: readonly FilterExpression[],
+    columns: readonly ColumnTypeMeta[],
+  ): void {
+    const numericColumns = new Set(
+      columns
+        .filter(
+          (column) =>
+            column.category === "integer" ||
+            column.category === "float" ||
+            column.category === "decimal",
+        )
+        .map((column) => column.name),
+    );
+
+    for (const filter of filters) {
+      if (
+        !numericColumns.has(filter.column) ||
+        filter.operator === "is_null" ||
+        filter.operator === "is_not_null" ||
+        filter.operator === "like" ||
+        filter.operator === "ilike"
+      ) {
+        continue;
+      }
+
+      const values =
+        filter.operator === "between"
+          ? [...filter.value]
+          : filter.operator === "in"
+            ? this.splitFilterList(filter.value)
+            : "value" in filter
+              ? [filter.value]
+              : [];
+      const invalidValue = values.find(
+        (value) => !DYNAMODB_NUMBER_RE.test(value.trim()),
+      );
+      if (invalidValue !== undefined) {
+        throw new Error(
+          `${DYNAMODB_TABLE_FILTER_ERROR_PREFIX} column ${JSON.stringify(filter.column)} requires a numeric value; received ${JSON.stringify(invalidValue.trim())}.`,
+        );
+      }
+    }
+  }
+
   private coerceFilterValueForColumn(
     column: ColumnTypeMeta | undefined,
     rawValue: string | [string, string] | undefined,
@@ -3235,8 +3392,12 @@ export class DynamoDBDriver implements IDBDriver {
       column.category === "float" ||
       column.category === "decimal"
     ) {
-      const numeric = Number(value);
-      return Number.isFinite(numeric) ? numeric : value;
+      // DynamoDB numbers are decimal strings (up to 38 significant digits).
+      // Keep the token intact when marshalling native filter/key expressions;
+      // passing through Number rounds large integers and precise decimals.
+      return DYNAMODB_NUMBER_RE.test(value)
+        ? NumberValueImpl.from(value)
+        : value;
     }
     if (column.category === "boolean" || column.valueSemantics === "boolean") {
       if (/^(true|1)$/i.test(value)) {
@@ -3287,23 +3448,37 @@ export class DynamoDBDriver implements IDBDriver {
         return left.localeCompare(right);
       })
       .map((name) => {
+        const samples = rows.map((row) => row[name]);
         const descriptor = this.resolveDynamoColumnDescriptor(
-          rows.map((row) => row[name]),
+          samples,
           schema.attrTypes.get(name),
         );
         const isPrimaryKey = schema.keys.includes(name);
         const primaryKeyRole = schema.keyRoles.get(name);
         const nullable = !isPrimaryKey;
         const filterable = descriptor.category !== "spatial";
-        const filterOperators = resolveFilterOperators(descriptor.category, {
+        let filterOperators = resolveFilterOperators(descriptor.category, {
           filterable,
           nullable,
         });
-        if (
-          filterable &&
-          (descriptor.category === "json" || descriptor.category === "array")
-        ) {
-          filterOperators.push("ilike");
+        const nativeType = descriptor.nativeType.toLowerCase();
+        if (nativeType === "map") {
+          filterOperators = filterOperators.filter(
+            (operator) => operator === "is_null" || operator === "is_not_null",
+          );
+        } else if (nativeType === "list" || nativeType.endsWith(" set")) {
+          filterOperators = filterOperators.filter(
+            (operator) =>
+              operator === "like" ||
+              operator === "is_null" ||
+              operator === "is_not_null",
+          );
+          if (
+            nativeType === "string set" ||
+            (nativeType === "list" && this.hasStringContainsMember(samples))
+          ) {
+            filterOperators.push("ilike");
+          }
         }
         const keyOperators: FilterOperator[] =
           primaryKeyRole === "partition"
@@ -3524,6 +3699,14 @@ export class DynamoDBDriver implements IDBDriver {
     return "string set";
   }
 
+  private hasStringContainsMember(samples: readonly unknown[]): boolean {
+    return samples.some((value) => {
+      const members =
+        value instanceof Set ? [...value] : Array.isArray(value) ? value : [];
+      return members.some((member) => typeof member === "string");
+    });
+  }
+
   private readonly tableRowCategories = new WeakMap<
     Record<string, unknown>,
     Map<string, TypeCategory>
@@ -3574,19 +3757,46 @@ export class DynamoDBDriver implements IDBDriver {
             ? this.splitFilterList(filter.value)
             : [filter.value];
         if (contains) {
-          // Native contains accepts S substrings and exact string members of
-          // SS/L regardless of sampled metadata. Do not search
-          // the collection's display serialization (or a binary cell token).
+          // Native contains accepts S substrings and exact S/N/B members of
+          // SS/NS/BS/L. Do not search collection serialization: retain the
+          // member type and compare numeric/binary values without lossy casts.
           const rawValue = this.tableRawRows.get(row)?.[filter.column];
           const needle = String(decodeDynamoCellInput(values[0]));
           if (rawValue instanceof Set || Array.isArray(rawValue)) {
-            return [...rawValue].some(
-              (member) =>
-                typeof member === "string" &&
-                (filter.operator === "ilike"
-                  ? member.toLowerCase() === needle.toLowerCase()
-                  : member === needle),
+            const parsedNeedle = parseDynamoContainsNeedle(
+              needle,
+              column?.nativeType.toLowerCase(),
             );
+            const typedNeedle = parsedNeedle;
+            return [...rawValue].some((member) => {
+              if (typeof member === "string") {
+                return (
+                  typedNeedle.kind === "string" &&
+                  (filter.operator === "ilike"
+                    ? member.toLowerCase() === typedNeedle.value.toLowerCase()
+                    : member === typedNeedle.value)
+                );
+              }
+              if (filter.operator !== "like" || typedNeedle.kind !== "number") {
+                if (
+                  filter.operator === "like" &&
+                  typedNeedle.kind === "binary" &&
+                  this.isBinaryValue(member)
+                ) {
+                  const actual = this.toBinaryBuffer(member);
+                  const expected = this.parseBinaryInput(typedNeedle.value);
+                  return (
+                    actual !== null &&
+                    expected !== null &&
+                    actual.equals(expected)
+                  );
+                }
+                return false;
+              }
+              const actualNumber = canonicalDynamoNumber(member);
+              const expectedNumber = canonicalDynamoNumber(typedNeedle.value);
+              return actualNumber !== null && actualNumber === expectedNumber;
+            });
           }
           // Raw typeof is authoritative even if category metadata is absent;
           // without raw evidence, only a known S display value may be searched.
@@ -3855,6 +4065,22 @@ export class DynamoDBDriver implements IDBDriver {
         ? new Set(tokens.map((entry) => NumberValueImpl.from(entry)))
         : null;
     }
+    const trimmed = value.trim();
+    if (
+      subtype === "binary" &&
+      trimmed.startsWith("<<") &&
+      trimmed.endsWith(">>")
+    ) {
+      const tokens = trimmed
+        .slice(2, -2)
+        .split(",")
+        .map((entry) => entry.trim());
+      const buffers = tokens.map((entry) => this.parseBinaryInput(entry));
+      return tokens.length > 0 &&
+        buffers.every((entry): entry is Buffer => entry !== null)
+        ? new Set(buffers)
+        : null;
+    }
     const parsedJson = this.parseJsonValue(value);
     if (Array.isArray(parsedJson)) {
       return new Set(
@@ -3862,7 +4088,6 @@ export class DynamoDBDriver implements IDBDriver {
       );
     }
 
-    const trimmed = value.trim();
     const normalized =
       trimmed.startsWith("<<") && trimmed.endsWith(">>")
         ? `[${trimmed.slice(2, -2).replace(/'/g, '"')}]`

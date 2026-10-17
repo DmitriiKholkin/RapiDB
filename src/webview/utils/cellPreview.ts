@@ -57,6 +57,13 @@ export function getCellPreview(
       quoted(current);
     } else if (current instanceof Date) {
       append(JSON.stringify(current));
+    } else if (
+      typeof current === "object" &&
+      ((current as { __rapidbSqlVariant?: unknown }).__rapidbSqlVariant === 1 ||
+        (current as { __rapidbSpatial?: unknown }).__rapidbSpatial === 1) &&
+      typeof (current as { displayValue?: unknown }).displayValue === "string"
+    ) {
+      append((current as { displayValue: string }).displayValue);
     } else if (typeof current !== "object") {
       append(JSON.stringify(current) ?? "null");
     } else {

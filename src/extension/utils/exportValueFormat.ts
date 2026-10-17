@@ -12,6 +12,10 @@
  */
 
 import type { QueryColumnMeta, TypeCategory } from "../dbDrivers/types";
+import {
+  isRawNumberToken,
+  parseJsonPreservingRawNumbers,
+} from "./jsonCanonical";
 
 export interface ExportColumnDescriptor {
   key: string;
@@ -32,8 +36,9 @@ export type JsonExportValue =
   | JsonExportValue[]
   | { [key: string]: JsonExportValue };
 
+const RAW_EXPORT_LITERAL = Symbol("raw export JSON literal");
 export type RawJsonLiteral = {
-  readonly __rapidbRawJsonLiteral: unique symbol;
+  readonly [RAW_EXPORT_LITERAL]: true;
   readonly literal: string;
 };
 
@@ -119,11 +124,14 @@ export function buildQueryExportColumns(
 export function formatTableCsvExportValue(
   value: unknown,
   category: TypeCategory | null,
+  nativeType?: string,
 ): string {
+  const displayValue = getDriverDisplaySnapshotValue(value, nativeType);
+  if (displayValue !== undefined) return displayValue;
   if (typeof value === "string") {
     const parsed = tryParseStructuredExportValue(value, category);
     if (parsed !== undefined) {
-      return formatExportCellValue(parsed);
+      return stringifyJsonExportValue(normalizeNestedJsonExportValue(parsed));
     }
   }
 
@@ -139,14 +147,20 @@ export function serializeJsonExportRecord(
   entries: ReadonlyArray<
     ExportColumnDescriptor & {
       value: unknown;
+      omit?: boolean;
     }
   >,
 ): string {
   return `{${entries
+    .filter((entry) => !entry.omit)
     .map(
       (entry) =>
         `${JSON.stringify(entry.key)}:${stringifyJsonExportValue(
-          normalizeJsonExportValue(entry.value, entry.category ?? null),
+          normalizeJsonExportValue(
+            entry.value,
+            entry.category ?? null,
+            entry.nativeType,
+          ),
         )}`,
     )
     .join(",")}}`;
@@ -160,7 +174,10 @@ export function serializeJsonExportRecord(
 export function normalizeJsonExportValue(
   value: unknown,
   category: TypeCategory | null,
+  nativeType?: string,
 ): JsonExportValue {
+  const displayValue = getDriverDisplaySnapshotValue(value, nativeType);
+  if (displayValue !== undefined) return displayValue;
   if (value == null) {
     return null;
   }
@@ -211,6 +228,8 @@ function normalizeNestedJsonExportValue(value: unknown): JsonExportValue {
     return null;
   }
 
+  if (isRawNumberToken(value)) return rawJsonLiteral(value.raw);
+
   if (value instanceof Date) {
     return Number.isNaN(value.getTime()) ? null : formatExportCellValue(value);
   }
@@ -245,6 +264,34 @@ function normalizeNestedJsonExportValue(value: unknown): JsonExportValue {
   }
 
   return String(value);
+}
+
+function getDriverDisplaySnapshotValue(
+  value: unknown,
+  nativeType?: string,
+): string | undefined {
+  const redisDisplay = redisBinarySnapshotDisplay(value, nativeType);
+  if (redisDisplay !== undefined) return redisDisplay;
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  const snapshot = value as {
+    __rapidbSqlVariant?: unknown;
+    __rapidbSpatial?: unknown;
+    displayValue?: unknown;
+  };
+  if (
+    ((nativeType?.toLowerCase() === "sql_variant" &&
+      snapshot.__rapidbSqlVariant === 1) ||
+      (["geometry", "geography"].includes(nativeType?.toLowerCase() ?? "") &&
+        snapshot.__rapidbSpatial === 1)) &&
+    typeof snapshot.displayValue === "string"
+  ) {
+    return snapshot.displayValue;
+  }
+
+  return undefined;
 }
 
 function stringifyJsonExportValue(value: JsonExportValue): string {
@@ -294,7 +341,9 @@ function tryParseStructuredExportValue(
   }
 
   try {
-    return JSON.parse(trimmed) as unknown;
+    // Validate JSON grammar, then retain every numeric token verbatim.
+    JSON.parse(trimmed);
+    return parseJsonPreservingRawNumbers(trimmed);
   } catch {
     return undefined;
   }
@@ -318,13 +367,15 @@ function toJsonNumericLiteral(value: string): string | null {
 
 function rawJsonLiteral(literal: string): RawJsonLiteral {
   return {
-    __rapidbRawJsonLiteral: Symbol(
-      "rapidb-raw-json",
-    ) as RawJsonLiteral["__rapidbRawJsonLiteral"],
+    [RAW_EXPORT_LITERAL]: true,
     literal,
   };
 }
 
 function isRawJsonLiteral(value: JsonExportValue): value is RawJsonLiteral {
-  return typeof value === "object" && value !== null && "literal" in value;
+  return (
+    typeof value === "object" && value !== null && RAW_EXPORT_LITERAL in value
+  );
 }
+
+import { redisBinarySnapshotDisplay } from "../../shared/redisValueSnapshot";

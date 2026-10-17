@@ -25,6 +25,7 @@ export function buildInsertRowOperation(
   values: Record<string, unknown>,
   cols: ColumnTypeMeta[],
   returning?: InsertReturning,
+  onPreviewColumns?: (columns: ColumnTypeMeta[]) => void,
 ): TransactionOperation {
   const qt = drv.qualifiedTableName(database, schema, table);
   const colMap = new Map(cols.map((column) => [column.name, column]));
@@ -46,6 +47,7 @@ export function buildInsertRowOperation(
   const columnNames: string[] = [];
   const valueExpressions: string[] = [];
   const params: unknown[] = [];
+  const previewColumns: ColumnTypeMeta[] = [];
 
   for (const [columnName, rawValue] of entries) {
     const column = colMap.get(columnName);
@@ -62,8 +64,27 @@ export function buildInsertRowOperation(
       continue;
     }
 
-    valueExpressions.push(drv.buildInsertValueExpr(column, params.length + 1));
-    params.push(value);
+    const mutationValue = drv.buildMutationValueExpr?.(
+      column,
+      value,
+      "insert",
+      undefined,
+      params.length + 1,
+    );
+    if (mutationValue) {
+      valueExpressions.push(mutationValue.sql);
+      params.push(...mutationValue.params);
+      previewColumns.push(
+        ...(mutationValue.previewColumns ??
+          mutationValue.params.map(() => column)),
+      );
+    } else {
+      valueExpressions.push(
+        drv.buildInsertValueExpr(column, params.length + 1),
+      );
+      params.push(value);
+      previewColumns.push(column);
+    }
   }
 
   if (columnNames.length === 0) {
@@ -72,6 +93,7 @@ export function buildInsertRowOperation(
     );
   }
 
+  onPreviewColumns?.(previewColumns);
   return withReturning(
     drv,
     {

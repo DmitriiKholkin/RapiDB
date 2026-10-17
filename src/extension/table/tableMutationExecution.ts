@@ -361,9 +361,13 @@ export function prepareApplyChangesPlan(
         verificationValues.push({
           column,
           expectedValue: nextValue,
+          ...(originalValues && Object.hasOwn(originalValues, columnName)
+            ? { originalValue: originalValues[columnName] }
+            : {}),
         });
       }
     }
+    let previewColumns: Array<ColumnTypeMeta | undefined> = [];
     const operation = buildUpdateRowSql(
       driver,
       database,
@@ -373,6 +377,9 @@ export function prepareApplyChangesPlan(
       changes,
       columns,
       originalValues,
+      (columns) => {
+        previewColumns = columns;
+      },
     );
     if (!operation) {
       skippedRows.add(rowIndex);
@@ -383,12 +390,6 @@ export function prepareApplyChangesPlan(
       params: operation.params,
       checkAffectedRows: true,
     });
-    const previewColumns = buildUpdatePreviewColumns(
-      changes,
-      primaryKeys,
-      columnMetaByName,
-      originalValues,
-    );
     previewStatements.push(
       typeof previewDriver.materializePreviewColumnSql === "function"
         ? previewDriver.materializePreviewColumnSql(
@@ -432,29 +433,6 @@ export function prepareApplyChangesPlan(
   };
 }
 
-function buildUpdatePreviewColumns(
-  changes: Record<string, unknown>,
-  primaryKeys: Record<string, unknown>,
-  columnMetaByName: ReadonlyMap<string, ColumnTypeMeta>,
-  originalValues: Record<string, unknown> = {},
-): Array<ColumnTypeMeta | undefined> {
-  const setColumns = Object.entries(changes)
-    .filter(
-      ([columnName, value]) =>
-        value !== undefined && columnMetaByName.has(columnName),
-    )
-    .map(([columnName]) => columnMetaByName.get(columnName));
-  const whereColumns = Object.keys(primaryKeys).map((columnName) =>
-    columnMetaByName.get(columnName),
-  );
-  const originalColumns = Object.entries(originalValues)
-    .filter(
-      ([name, value]) =>
-        value !== undefined && value !== null && columnMetaByName.has(name),
-    )
-    .map(([name]) => columnMetaByName.get(name));
-  return [...setColumns, ...whereColumns, ...originalColumns];
-}
 export async function executePreparedApplyPlan(
   connectionManager: ConnectionManager,
   plan: PreparedApplyPlan,
@@ -819,7 +797,7 @@ function buildTransactionOptions(
     const sql = `SELECT ${target.values
       .map(
         ({ column }, index) =>
-          `${driver.quoteIdentifier(column.name)} AS ${driver.quoteIdentifier(`__col_${index}`)}`,
+          `${driver.buildVerificationValueExpr?.(column) ?? driver.quoteIdentifier(column.name)} AS ${driver.quoteIdentifier(`__col_${index}`)}`,
       )
       .join(
         ", ",

@@ -1,7 +1,10 @@
 import { create } from "zustand";
 import type { DbObjectKind } from "../../shared/dbObjectKinds";
 import { QUERY_LIMIT_POLICY } from "../../shared/safetyContracts";
-import type { QueryColumnMeta } from "../../shared/tableTypes";
+import type {
+  QueryColumnMeta,
+  QueryMissingCell,
+} from "../../shared/tableTypes";
 import type { QueryEditorPresentation } from "../../shared/webviewContracts";
 
 export interface QueryResult {
@@ -11,6 +14,8 @@ export interface QueryResult {
   columns: string[];
   columnMeta: QueryColumnMeta[];
   rows: Record<string, unknown>[];
+  responseMetadata?: Record<string, unknown>[];
+  missingCells?: QueryMissingCell[];
   rowCount: number;
   executionTimeMs: number;
   error?: string;

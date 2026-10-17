@@ -164,8 +164,8 @@ describe("MSSQL datetimeoffset filter", () => {
     );
 
     expect(condition).toEqual({
-      sql: "REPLACE(REPLACE(REPLACE(CONVERT(VARCHAR(40), [created_at], 127), 'Z', '+00:00'), ' +', '+'), ' -', '-') LIKE ?",
-      params: ["%2024-07-04T08:34:56.123%+02:00%"],
+      sql: "[created_at] = CAST(? AS datetimeoffset(7))",
+      params: ["2024-07-04 08:34:56.1230000+02:00"],
     });
   });
 

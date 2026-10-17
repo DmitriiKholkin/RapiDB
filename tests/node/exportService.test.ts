@@ -220,7 +220,9 @@ describe("exportService", () => {
       { column: "pk", operator: "eq", value: "B" },
     ];
     if (readPath === "client-filter")
-      filters.push({ column: "value", operator: "ilike", value: "hello" });
+      // Maps advertise only NULL operators. This still forces the client path
+      // and exercises values whose native type differs from the sample.
+      filters.push({ column: "value", operator: "is_not_null" });
     const sort = {
       column: readPath === "materialized" ? "value" : "sk",
       direction: "asc" as const,

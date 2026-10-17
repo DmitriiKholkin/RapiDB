@@ -6,7 +6,7 @@ import {
   type FilterOperator,
   formatColumnDetailDescription,
   formatPrimaryKeyRoleLabel,
-  isServerGeneratedColumn,
+  isColumnReadOnly,
   NULL_SENTINEL,
 } from "../../../shared/tableTypes";
 import type { ApplyResultPayload } from "../../../shared/webviewContracts";
@@ -354,7 +354,7 @@ export function tableButtonStyle(
 }
 
 export function canEditColumn(column?: ColumnMeta): column is ColumnMeta {
-  return !!column && !isServerGeneratedColumn(column);
+  return !!column && !isColumnReadOnly(column);
 }
 
 export function canOpenColumn(

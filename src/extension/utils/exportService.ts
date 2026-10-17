@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
+import type { QueryMissingCell } from "../../shared/tableTypes";
 import type { ColumnTypeMeta, QueryColumnMeta } from "../dbDrivers/types";
 import { csvCell } from "./csvUtils";
 import { normalizeUnknownError } from "./errorHandling";
@@ -28,8 +29,9 @@ type ExportFormat = typeof CSV_EXTENSION | typeof JSON_EXTENSION;
 function formatCsvExportCell(
   value: unknown,
   category: ColumnTypeMeta["category"] | QueryColumnMeta["category"] | null,
+  nativeType?: string,
 ): string {
-  const formatted = formatTableCsvExportValue(value, category);
+  const formatted = formatTableCsvExportValue(value, category, nativeType);
   const trustedNumeric =
     (category === "integer" ||
       category === "float" ||
@@ -42,6 +44,7 @@ export interface QueryResultExport {
   columns: readonly string[];
   columnMeta?: readonly QueryColumnMeta[];
   rows: readonly Record<string, unknown>[];
+  missingCells?: readonly QueryMissingCell[];
 }
 
 export interface ChunkedExportData {
@@ -305,14 +308,21 @@ async function writeQueryResultsCsv(
         signal,
       );
 
-      for (const row of result.rows) {
+      const missingCells = new Set(
+        result.missingCells?.map(
+          ({ rowIndex, columnIndex }) => `${rowIndex}:${columnIndex}`,
+        ),
+      );
+      for (const [rowIndex, row] of result.rows.entries()) {
         throwIfAborted(signal);
         await writeStreamChunk(
           writeStream,
           exportColumns
-            .map((column) =>
+            .map((column, columnIndex) =>
               formatCsvExportCell(
-                row[column.sourceKey],
+                missingCells.has(`${rowIndex}:${columnIndex}`)
+                  ? "MISSING"
+                  : row[column.sourceKey],
                 column.category ?? null,
               ),
             )
@@ -342,6 +352,11 @@ async function writeQueryResultsJson(
     async (writeStream) => {
       throwIfAborted(signal);
       await writeStreamChunk(writeStream, "[\n", signal);
+      const missingCells = new Set(
+        result.missingCells?.map(
+          ({ rowIndex, columnIndex }) => `${rowIndex}:${columnIndex}`,
+        ),
+      );
 
       for (let index = 0; index < result.rows.length; index++) {
         throwIfAborted(signal);
@@ -349,9 +364,10 @@ async function writeQueryResultsJson(
         await writeStreamChunk(
           writeStream,
           `${index === 0 ? "" : ",\n"}${serializeJsonExportRecord(
-            exportColumns.map((column) => ({
+            exportColumns.map((column, columnIndex) => ({
               ...column,
               value: row[column.sourceKey],
+              omit: missingCells.has(`${index}:${columnIndex}`),
             })),
           )}`,
           signal,
@@ -415,7 +431,11 @@ async function writeChunkedCsv(
             writeStream,
             headerColumns
               .map((column) =>
-                formatCsvExportCell(row[column.name], column.category ?? null),
+                formatCsvExportCell(
+                  row[column.name],
+                  column.category ?? null,
+                  column.nativeType,
+                ),
               )
               .join(",") + LINE_BREAK,
             signal,

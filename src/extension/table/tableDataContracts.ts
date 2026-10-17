@@ -59,6 +59,7 @@ export interface VerificationTarget {
   values: Array<{
     column: ColumnTypeMeta;
     expectedValue: unknown;
+    originalValue?: unknown;
   }>;
 }
 

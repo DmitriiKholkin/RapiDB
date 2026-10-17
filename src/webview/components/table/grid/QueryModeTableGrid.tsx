@@ -3,6 +3,7 @@ import React, { useEffect, useState } from "react";
 import type { QueryResultExportPayload } from "../../../../shared/webviewContracts";
 import type { QueryResult, QueryStatus } from "../../../store";
 import { postMessage } from "../../../utils/messaging";
+import { queryRunShortcutLabel } from "../../../utils/platform";
 import { Icon } from "../../Icon";
 import { TableExportActions } from "../TableExportActions";
 import { tableButtonStyle } from "../tableConstants";
@@ -38,7 +39,7 @@ export function QueryModeTableGrid({
       <QueryEmptyState
         icon="run"
         primary="Run a query to see results"
-        secondary="Ctrl+Enter or F5"
+        secondary={`${queryRunShortcutLabel()} or F5`}
       />
     );
   }
@@ -84,7 +85,8 @@ export function QueryModeTableGrid({
     );
   }
 
-  if (!result || result.columns.length === 0) {
+  const hasResponseMetadata = (result?.responseMetadata?.length ?? 0) > 0;
+  if (!result || (result.columns.length === 0 && !hasResponseMetadata)) {
     return (
       <QueryEmptyState
         icon="pass"
@@ -198,15 +200,55 @@ export function QueryModeTableGrid({
         </div>
       )}
 
-      <QueryResultsGrid
-        result={result}
-        columnOrder={columnOrder}
-        onColumnOrderChange={setColumnOrder}
-        sorting={sorting}
-        onSortingChange={setSorting}
-        columnSizing={columnSizing}
-        onColumnSizingChange={setColumnSizing}
-      />
+      {result.responseMetadata && result.responseMetadata.length > 0 && (
+        <section
+          aria-label="DynamoDB response metadata"
+          style={{
+            flexShrink: 0,
+            maxHeight: 180,
+            overflow: "auto",
+            padding: "6px 12px",
+            borderBottom: "1px solid var(--vscode-panel-border)",
+            background: "var(--vscode-editor-background)",
+          }}
+        >
+          <div style={{ fontSize: 11, fontWeight: 600, opacity: 0.8 }}>
+            DynamoDB response metadata
+          </div>
+          <pre
+            style={{
+              margin: "4px 0 0",
+              fontFamily: "var(--vscode-editor-font-family, monospace)",
+              fontSize: 11,
+              whiteSpace: "pre-wrap",
+              userSelect: "text",
+            }}
+          >
+            {JSON.stringify(result.responseMetadata, null, 2)}
+          </pre>
+          <div style={{ fontSize: 10, opacity: 0.65 }}>
+            Use LastEvaluatedKey as ExclusiveStartKey to continue a page.
+          </div>
+        </section>
+      )}
+
+      {result.columns.length === 0 ? (
+        <QueryEmptyState
+          icon="pass"
+          primary="No rows in this response"
+          secondary={`${rowCount} rows · ${executionTimeMs} ms`}
+        />
+      ) : (
+        <QueryResultsGrid
+          result={result}
+          columnOrder={columnOrder}
+          onColumnOrderChange={setColumnOrder}
+          sorting={sorting}
+          onSortingChange={setSorting}
+          columnSizing={columnSizing}
+          onColumnSizingChange={setColumnSizing}
+        />
+      )}
     </div>
   );
 }

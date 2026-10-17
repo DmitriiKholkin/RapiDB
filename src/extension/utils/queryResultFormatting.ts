@@ -36,6 +36,13 @@ export function formatQueryResult(
 
   return {
     ...result,
+    ...(result.missingCells
+      ? {
+          missingCells: result.missingCells.filter(
+            ({ rowIndex }) => rowIndex < sampledRows.length,
+          ),
+        }
+      : {}),
     columnMeta,
     rows: normalizeQueryRows(sampledRows, result.columns, columnMeta),
     truncated,

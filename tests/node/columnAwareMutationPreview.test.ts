@@ -83,8 +83,9 @@ describe.each([
     );
     if (!prepared.executable)
       throw new Error("Expected executable update plan");
-    const executionSql = `UPDATE ${qualified} SET "x${marker}1" = ${marker}1, "x""${marker}2" = ${marker}2 WHERE "id""${marker}1" = ${marker}3 AND "x${marker}1" = ${marker}4 AND "x""${marker}2" IS NULL`;
-    const previewSql = `UPDATE ${qualified} SET "x${marker}1" = 'new ${marker}2', "x""${marker}2" = NULL WHERE "id""${marker}1" = 7 AND "x${marker}1" = 'old ${marker}1' AND "x""${marker}2" IS NULL`;
+    const updateTarget = `${qualified}${dialect === "oracle" ? ' "RAPIDB_UPDATE_ROW"' : ""}`;
+    const executionSql = `UPDATE ${updateTarget} SET "x${marker}1" = ${marker}1, "x""${marker}2" = ${marker}2 WHERE "id""${marker}1" = ${marker}3 AND "x${marker}1" = ${marker}4 AND "x""${marker}2" IS NULL`;
+    const previewSql = `UPDATE ${updateTarget} SET "x${marker}1" = 'new ${marker}2', "x""${marker}2" = NULL WHERE "id""${marker}1" = 7 AND "x${marker}1" = 'old ${marker}1' AND "x""${marker}2" IS NULL`;
     expect(prepared.plan.operations).toEqual([
       {
         sql: executionSql,

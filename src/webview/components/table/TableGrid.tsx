@@ -16,6 +16,7 @@ import React, {
   useRef,
   useState,
 } from "react";
+import { redisBinarySnapshotDisplay } from "../../../shared/redisValueSnapshot";
 import {
   type ColumnTypeMeta as ColumnMeta,
   type FilterDraft,
@@ -505,7 +506,12 @@ function TableDataGrid({
       }
       const row = rows[rowIndex];
       if (!row) return undefined;
-      return row[colId];
+      return (
+        redisBinarySnapshotDisplay(
+          row[colId],
+          columnsMapRef.current.get(colId)?.nativeType,
+        ) ?? row[colId]
+      );
     },
     [rows],
   );
@@ -641,6 +647,8 @@ function TableDataGrid({
             !isDraft &&
             (!canEditRows ||
               !canEditColumn(column) ||
+              redisBinarySnapshotDisplay(currentValue, column.nativeType) !==
+                undefined ||
               Boolean(getRowMutationBlockReason?.(rowIdx))),
         });
       } else {

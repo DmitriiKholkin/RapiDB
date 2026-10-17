@@ -188,6 +188,7 @@ export type TablePanelMessage =
         pageSize?: number | string;
         filters?: unknown;
         sort?: unknown;
+        refreshMetadata?: boolean;
       }
     >
   | WebviewMessageEnvelope<
@@ -310,6 +311,7 @@ export function parseTablePanelMessage(
           pageSize: payload.pageSize as number | string | undefined,
           filters: payload.filters,
           sort: payload.sort,
+          refreshMetadata: payload.refreshMetadata === true,
         },
       };
     }

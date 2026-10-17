@@ -1,4 +1,13 @@
-import type { createClient } from "redis";
+import { type createClient, RESP_TYPES } from "redis";
+import { withRedisReplyMapping } from "../support/redisReplyMapping";
+
+const queryReplyOptions = {
+  typeMapping: {
+    [RESP_TYPES.BLOB_STRING]: Buffer,
+    [RESP_TYPES.DOUBLE]: String,
+  },
+};
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
 import {
@@ -33,7 +42,10 @@ describe("RedisDriver — query()", () => {
 
     const result = await driver.query('SET key "hello world"');
 
-    expect(sendCommand).toHaveBeenCalledWith(["SET", "key", "hello world"]);
+    expect(sendCommand).toHaveBeenCalledWith(
+      ["SET", "key", "hello world"],
+      queryReplyOptions,
+    );
     expect(result.rowCount).toBe(1);
     expect(result.columns).toEqual(["result"]);
     expect(result.rows[0]?.__col_0).toBe("OK");
@@ -64,16 +76,21 @@ describe("RedisDriver — query()", () => {
       'DEL "list:activity:recent"\n\nRPUSH "list:activity:recent" "{\\"id\\":\\"high-1\\",\\"type\\":\\"payment\\",\\"amount\\":999.99}" "{\\"id\\":\\"high-2\\",\\"type\\":\\"alert\\",\\"message\\":\\"System critical\\"}"',
     );
 
-    expect(sendCommand).toHaveBeenNthCalledWith(1, [
-      "DEL",
-      "list:activity:recent",
-    ]);
-    expect(sendCommand).toHaveBeenNthCalledWith(2, [
-      "RPUSH",
-      "list:activity:recent",
-      '{"id":"high-1","type":"payment","amount":999.99}',
-      '{"id":"high-2","type":"alert","message":"System critical"}',
-    ]);
+    expect(sendCommand).toHaveBeenNthCalledWith(
+      1,
+      ["DEL", "list:activity:recent"],
+      queryReplyOptions,
+    );
+    expect(sendCommand).toHaveBeenNthCalledWith(
+      2,
+      [
+        "RPUSH",
+        "list:activity:recent",
+        '{"id":"high-1","type":"payment","amount":999.99}',
+        '{"id":"high-2","type":"alert","message":"System critical"}',
+      ],
+      queryReplyOptions,
+    );
     expect(result.rowCount).toBe(1);
     expect(result.columns).toEqual(["results"]);
     expect(result.rows[0]?.__col_0).toBe("[1,2]");
@@ -84,7 +101,10 @@ describe("RedisDriver — query()", () => {
 
     await driver.query("SET key hello\\ world");
 
-    expect(sendCommand).toHaveBeenCalledWith(["SET", "key", "hello world"]);
+    expect(sendCommand).toHaveBeenCalledWith(
+      ["SET", "key", "hello world"],
+      queryReplyOptions,
+    );
   });
 
   it("decodes JSON escapes only in double-quoted arguments", async () => {
@@ -92,11 +112,10 @@ describe("RedisDriver — query()", () => {
     await driver.query(
       String.raw`SET "key\n\r\t\u0000\u96EA" "\b\f\/\uD83D\uDE00\\n\\u0000\""`,
     );
-    expect(sendCommand).toHaveBeenCalledExactlyOnceWith([
-      "SET",
-      "key\n\r\t\0雪",
-      '\b\f/😀\\n\\u0000"',
-    ]);
+    expect(sendCommand).toHaveBeenCalledExactlyOnceWith(
+      ["SET", "key\n\r\t\0雪", '\b\f/😀\\n\\u0000"'],
+      queryReplyOptions,
+    );
   });
 
   it.each([
@@ -105,11 +124,10 @@ describe("RedisDriver — query()", () => {
   ])("preserves shell escaping for single-quoted and unquoted input %s", async (query) => {
     const { driver, sendCommand } = createDriver();
     await driver.query(query);
-    expect(sendCommand).toHaveBeenCalledExactlyOnceWith([
-      "SET",
-      "key",
-      "nrtbfu0000u96EA\\path'quoted' space",
-    ]);
+    expect(sendCommand).toHaveBeenCalledExactlyOnceWith(
+      ["SET", "key", "nrtbfu0000u96EA\\path'quoted' space"],
+      queryReplyOptions,
+    );
   });
 
   it.each([
@@ -131,7 +149,11 @@ describe("RedisDriver — query()", () => {
       allowed,
     );
     await driver.query(query);
-    expect(sendCommand).toHaveBeenNthCalledWith(1, [...firstCommand]);
+    expect(sendCommand).toHaveBeenNthCalledWith(
+      1,
+      [...firstCommand],
+      queryReplyOptions,
+    );
     expect(sendCommand).toHaveBeenCalledTimes(query.includes('; "') ? 2 : 1);
   });
 
@@ -251,7 +273,7 @@ describe("RedisDriver — metadata and pages", () => {
         client: typeof client | null;
         connected: boolean;
       }
-    ).client = client;
+    ).client = withRedisReplyMapping(client);
     (driver as unknown as { connected: boolean }).connected = true;
 
     const request = {
@@ -296,7 +318,7 @@ describe("RedisDriver — metadata and pages", () => {
         client: typeof client | null;
         connected: boolean;
       }
-    ).client = client;
+    ).client = withRedisReplyMapping(client);
     (driver as unknown as { connected: boolean }).connected = true;
 
     const preview = await driver.buildMutationPreviewStatements(
@@ -341,7 +363,7 @@ describe("RedisDriver — metadata and pages", () => {
         client: typeof client | null;
         connected: boolean;
       }
-    ).client = client;
+    ).client = withRedisReplyMapping(client);
     (driver as unknown as { connected: boolean }).connected = true;
 
     await expect(driver.listDatabases()).resolves.toEqual([
@@ -415,7 +437,7 @@ describe("RedisDriver — metadata and pages", () => {
         client: typeof client | null;
         connected: boolean;
       }
-    ).client = client;
+    ).client = withRedisReplyMapping(client);
     (driver as unknown as { connected: boolean }).connected = true;
 
     const described = await driver.describeColumns("db0", "db0", "users");
@@ -501,7 +523,7 @@ describe("RedisDriver — metadata and pages", () => {
         client: typeof client | null;
         connected: boolean;
       }
-    ).client = client;
+    ).client = withRedisReplyMapping(client);
     (driver as unknown as { connected: boolean }).connected = true;
 
     const page = await driver.readTablePage({
@@ -547,7 +569,7 @@ describe("RedisDriver — metadata and pages", () => {
         client: typeof client | null;
         connected: boolean;
       }
-    ).client = client;
+    ).client = withRedisReplyMapping(client);
     (driver as unknown as { connected: boolean }).connected = true;
 
     const described = await driver.describeColumns("db0", "db0", "events");
@@ -612,7 +634,7 @@ describe("RedisDriver — metadata and pages", () => {
         client: typeof client | null;
         connected: boolean;
       }
-    ).client = client;
+    ).client = withRedisReplyMapping(client);
     (driver as unknown as { connected: boolean }).connected = true;
 
     const page = await driver.readTablePage({
@@ -656,7 +678,7 @@ describe("RedisDriver — metadata and pages", () => {
         client: typeof client | null;
         connected: boolean;
       }
-    ).client = client;
+    ).client = withRedisReplyMapping(client);
     (driver as unknown as { connected: boolean }).connected = true;
 
     const listJson =
@@ -722,7 +744,7 @@ describe("RedisDriver — metadata and pages", () => {
         client: typeof client | null;
         connected: boolean;
       }
-    ).client = client;
+    ).client = withRedisReplyMapping(client);
     (driver as unknown as { connected: boolean }).connected = true;
 
     await expect(
@@ -763,7 +785,7 @@ describe("RedisDriver — metadata and pages", () => {
         client: typeof client | null;
         connected: boolean;
       }
-    ).client = client;
+    ).client = withRedisReplyMapping(client);
     (driver as unknown as { connected: boolean }).connected = true;
 
     await driver.updateRows({
@@ -799,7 +821,7 @@ describe("RedisDriver — metadata and pages", () => {
         client: typeof client | null;
         connected: boolean;
       }
-    ).client = client;
+    ).client = withRedisReplyMapping(client);
     (driver as unknown as { connected: boolean }).connected = true;
 
     await driver.updateRows({
@@ -844,7 +866,7 @@ describe("RedisDriver — metadata and pages", () => {
         client: typeof client | null;
         connected: boolean;
       }
-    ).client = client;
+    ).client = withRedisReplyMapping(client);
     (driver as unknown as { connected: boolean }).connected = true;
 
     await expect(
@@ -902,7 +924,7 @@ describe("RedisDriver — metadata and pages", () => {
         client: typeof client | null;
         connected: boolean;
       }
-    ).client = client;
+    ).client = withRedisReplyMapping(client);
     (driver as unknown as { connected: boolean }).connected = true;
 
     await expect(
@@ -966,7 +988,7 @@ describe("RedisDriver — metadata and pages", () => {
         client: typeof client | null;
         connected: boolean;
       }
-    ).client = client;
+    ).client = withRedisReplyMapping(client);
     (driver as unknown as { connected: boolean }).connected = true;
 
     await driver.listObjects();
@@ -988,7 +1010,8 @@ describe("RedisDriver — metadata and pages", () => {
       type: vi.fn().mockResolvedValue("string"),
       sendCommand: vi.fn().mockResolvedValueOnce(1).mockResolvedValueOnce(0),
     };
-    (driver as unknown as { client: typeof client | null }).client = client;
+    (driver as unknown as { client: typeof client | null }).client =
+      withRedisReplyMapping(client);
     (driver as unknown as { connected: boolean }).connected = true;
     (
       driver as unknown as { getDatabaseClient: () => Promise<typeof client> }
@@ -1027,7 +1050,8 @@ describe("RedisDriver — metadata and pages", () => {
         .mockResolvedValueOnce(1)
         .mockRejectedValueOnce(new Error("Connection lost")),
     };
-    (driver as unknown as { client: typeof client | null }).client = client;
+    (driver as unknown as { client: typeof client | null }).client =
+      withRedisReplyMapping(client);
     (driver as unknown as { connected: boolean }).connected = true;
     (
       driver as unknown as { getDatabaseClient: () => Promise<typeof client> }

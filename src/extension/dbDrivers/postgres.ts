@@ -60,6 +60,7 @@ import type {
   PaginationResult,
   PersistedEditCheckOptions,
   PersistedEditCheckResult,
+  QueryColumnMeta,
   QueryExecutionOptions,
   QueryResult,
   SchemaInfo,
@@ -1098,7 +1099,7 @@ export class PostgresDriver extends BaseDBDriver {
            LEFT JOIN pg_class c ON c.oid = t.typrelid
            WHERE n.nspname = $1
              AND (
-               t.typtype IN ('e', 'd')
+               t.typtype IN ('e', 'd', 'r', 'm')
                OR (t.typtype = 'c' AND c.relkind = 'c')
              )
            ORDER BY t.typname`,
@@ -1220,6 +1221,7 @@ export class PostgresDriver extends BaseDBDriver {
     const hardCap = queryCollectionLimit(operationContext?.hardCap);
     type PgArrayField = {
       name: string;
+      dataTypeID?: number;
     };
     type PgArrayQueryResult = {
       fields?: PgArrayField[];
@@ -1293,6 +1295,15 @@ export class PostgresDriver extends BaseDBDriver {
         Array.isArray(res) ? res[res.length - 1] : res
       ) as PgArrayQueryResult;
       const columns = result.fields?.map((field) => field.name) ?? [];
+      const columnMeta: QueryColumnMeta[] | undefined = result.fields?.map(
+        (field) => ({
+          category:
+            field.dataTypeID === PG_OID_JSON ||
+            field.dataTypeID === PG_OID_JSONB
+              ? "json"
+              : null,
+        }),
+      );
       const rawRows: unknown[][] = result.rows ?? [];
       const rows = rawRows.map((row) =>
         Object.fromEntries(
@@ -1310,6 +1321,7 @@ export class PostgresDriver extends BaseDBDriver {
       );
       const queryResult = {
         columns,
+        ...(columnMeta ? { columnMeta } : {}),
         rows,
         rowCount: result.rowCount ?? rawRows.length,
         executionTimeMs,
@@ -1969,12 +1981,14 @@ export class PostgresDriver extends BaseDBDriver {
     name: string,
   ): Promise<string | null> {
     const metaRes = await this.requirePool(database).query<{
+      type_oid: string;
       typtype: string;
       typnotnull: boolean;
       typdefault: string | null;
       base_type: string | null;
     }>(
-      `SELECT t.typtype,
+      `SELECT t.oid::text AS type_oid,
+              t.typtype,
               t.typnotnull,
               t.typdefault,
               format_type(t.typbasetype, t.typtypmod) AS base_type
@@ -1984,7 +1998,7 @@ export class PostgresDriver extends BaseDBDriver {
        WHERE n.nspname = $1
          AND t.typname = $2
          AND (
-           t.typtype IN ('e', 'd')
+           t.typtype IN ('e', 'd', 'r', 'm')
            OR (t.typtype = 'c' AND c.relkind = 'c')
          )
        LIMIT 1`,
@@ -2021,6 +2035,80 @@ export class PostgresDriver extends BaseDBDriver {
         meta.typnotnull ? "NOT NULL" : undefined,
       ].filter((value): value is string => Boolean(value));
       return `${clauses.join(" ")};`;
+    }
+
+    if (meta.typtype === "r" || meta.typtype === "m") {
+      const rangeRes = await this.requirePool(database).query<{
+        range_schema: string;
+        range_name: string;
+        multirange_name: string | null;
+        subtype: string;
+        subtype_opclass: string | null;
+        collation: string | null;
+        canonical: string | null;
+        subtype_diff: string | null;
+      }>(
+        `SELECT range_ns.nspname AS range_schema,
+                range_type.typname AS range_name,
+                multirange_type.typname AS multirange_name,
+                format_type(r.rngsubtype, NULL) AS subtype,
+                CASE WHEN r.rngsubopc <> 0
+                     THEN format('%I.%I', opclass_ns.nspname, opc.opcname)
+                END AS subtype_opclass,
+                CASE WHEN r.rngcollation <> 0
+                     THEN format('%I.%I', coll_ns.nspname, coll.collname)
+                END AS collation,
+                CASE WHEN r.rngcanonical <> 0
+                     THEN format('%I.%I', canonical_ns.nspname, canonical_proc.proname)
+                END AS canonical,
+                CASE WHEN r.rngsubdiff <> 0
+                     THEN format('%I.%I', subtype_diff_ns.nspname, subtype_diff_proc.proname)
+                END AS subtype_diff
+         FROM pg_range r
+         JOIN pg_type range_type ON range_type.oid = r.rngtypid
+         JOIN pg_namespace range_ns ON range_ns.oid = range_type.typnamespace
+         LEFT JOIN pg_type multirange_type ON multirange_type.oid = r.rngmultitypid
+         LEFT JOIN pg_opclass opc ON opc.oid = r.rngsubopc
+         LEFT JOIN pg_namespace opclass_ns ON opclass_ns.oid = opc.opcnamespace
+         LEFT JOIN pg_collation coll ON coll.oid = r.rngcollation
+         LEFT JOIN pg_namespace coll_ns ON coll_ns.oid = coll.collnamespace
+         LEFT JOIN pg_proc canonical_proc ON canonical_proc.oid = r.rngcanonical
+         LEFT JOIN pg_namespace canonical_ns ON canonical_ns.oid = canonical_proc.pronamespace
+         LEFT JOIN pg_proc subtype_diff_proc ON subtype_diff_proc.oid = r.rngsubdiff
+         LEFT JOIN pg_namespace subtype_diff_ns ON subtype_diff_ns.oid = subtype_diff_proc.pronamespace
+         WHERE r.${meta.typtype === "m" ? "rngmultitypid" : "rngtypid"} = $1::oid
+         LIMIT 1`,
+        [meta.type_oid],
+      );
+      const range = rangeRes.rows[0];
+      if (!range) {
+        return null;
+      }
+
+      const rangeName = this.qualifiedTableName(
+        "",
+        range.range_schema,
+        range.range_name,
+      );
+      const clauses = [
+        `SUBTYPE = ${range.subtype}`,
+        range.multirange_name
+          ? `MULTIRANGE_TYPE_NAME = ${this.quoteIdentifier(range.multirange_name)}`
+          : undefined,
+        range.subtype_opclass
+          ? `SUBTYPE_OPCLASS = ${range.subtype_opclass}`
+          : undefined,
+        range.collation ? `COLLATION = ${range.collation}` : undefined,
+        range.canonical ? `CANONICAL = ${range.canonical}` : undefined,
+        range.subtype_diff ? `SUBTYPE_DIFF = ${range.subtype_diff}` : undefined,
+      ].filter((value): value is string => Boolean(value));
+      const generatedForMultirange =
+        meta.typtype === "m"
+          ? `-- ${qualifiedName} is the multirange companion generated for ${rangeName}.\n`
+          : "";
+      return `${generatedForMultirange}CREATE TYPE ${rangeName} AS RANGE (\n${clauses
+        .map((clause) => `  ${clause}`)
+        .join(",\n")}\n);`;
     }
 
     const attributesRes = await this.requirePool(database).query<{
@@ -2274,13 +2362,19 @@ export class PostgresDriver extends BaseDBDriver {
     };
   }
   override buildInsertValueExpr(
-    _column: ColumnTypeMeta,
+    column: ColumnTypeMeta,
     paramIndex: number,
   ): string {
-    return `$${paramIndex}`;
+    const parameter = `$${paramIndex}`;
+    if (column.category === "other") {
+      // PostgreSQL needs a concrete type for values such as named composites;
+      // an untyped protocol parameter is otherwise treated as anonymous record.
+      return `${parameter}::${column.nativeType}`;
+    }
+    return parameter;
   }
   override buildSetExpr(column: ColumnTypeMeta, paramIndex: number): string {
-    return `${this.quoteIdentifier(column.name)} = $${paramIndex}`;
+    return `${this.quoteIdentifier(column.name)} = ${this.buildInsertValueExpr(column, paramIndex)}`;
   }
   override buildOriginalValueComparison(
     column: ColumnTypeMeta,
@@ -2570,18 +2664,22 @@ export class PostgresDriver extends BaseDBDriver {
       } else if (typeof expectedValue === "string") {
         normalizedExpected = this.formatOutputValue(expectedValue, column);
       }
-      // Arrays with user-defined element OIDs arrive from pg as raw array text.
-      // Use the same catalog-qualified display rules for verification as reads.
-      const normalizedOptions =
-        options && typeof options.persistedValue === "string"
-          ? {
-              ...options,
-              persistedValue: this.formatOutputValue(
-                options.persistedValue,
-                column,
-              ),
-            }
-          : options;
+      // Built-in PostgreSQL array OIDs can be parsed by `pg` into JS arrays
+      // before verification, while user-defined array OIDs arrive as raw text.
+      // Normalize both forms through the same display serializer so numeric
+      // tokens remain unquoted and match the editor's JSON array draft.
+      normalizedExpected = this.formatOutputValue(normalizedExpected, column);
+      // Normalize built-in and user-defined arrays with the same display rules
+      // used for reads before comparing the persisted value.
+      const normalizedOptions = options
+        ? {
+            ...options,
+            persistedValue: this.formatOutputValue(
+              options.persistedValue,
+              column,
+            ),
+          }
+        : options;
       return this.checkJsonArrayPersistedEdit(
         column,
         normalizedExpected,
@@ -2670,9 +2768,13 @@ export class PostgresDriver extends BaseDBDriver {
         spatialType === "point"
           ? `REPLACE(CAST(${col} AS TEXT), ',', ', ')`
           : `CAST(${col} AS TEXT)`;
+      const normalizedSearchValue =
+        spatialType === "point"
+          ? searchValue.replace(/\s*,\s*/g, ", ")
+          : searchValue;
       return {
         sql: `${spatialExpr} ${operator === "neq" ? "<>" : "="} $${paramIndex}`,
-        params: [searchValue],
+        params: [normalizedSearchValue],
       };
     }
     if (column.category === "json" && typeof val === "string") {

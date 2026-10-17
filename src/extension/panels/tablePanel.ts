@@ -960,6 +960,7 @@ export class TablePanel {
     const filters = coerceFilterExpressions(raw.filters);
     const sort = raw.sort ?? null;
     try {
+      if (raw.refreshMetadata) this.refreshMetadata();
       await this.awaitSchemaRefresh();
       if (!isCurrentSession()) return;
       const normalizedFilters = filters as FilterExpression[];
@@ -970,9 +971,11 @@ export class TablePanel {
         normalizedFilters,
         normalizedSort,
       );
-      let inFlightRequest = this.inFlightPageRequests.get(requestKey);
+      let inFlightRequest = raw.refreshMetadata
+        ? undefined
+        : this.inFlightPageRequests.get(requestKey);
       if (!inFlightRequest) {
-        inFlightRequest = this.svc
+        const pageRequest = this.svc
           .getPage(
             this.connectionId,
             this.database,
@@ -984,11 +987,14 @@ export class TablePanel {
             normalizedSort,
           )
           .finally(() => {
-            if (this.inFlightPageRequests.get(requestKey) === inFlightRequest) {
+            if (this.inFlightPageRequests.get(requestKey) === pageRequest) {
               this.inFlightPageRequests.delete(requestKey);
             }
           });
-        this.inFlightPageRequests.set(requestKey, inFlightRequest);
+        if (!raw.refreshMetadata) {
+          this.inFlightPageRequests.set(requestKey, pageRequest);
+        }
+        inFlightRequest = pageRequest;
       }
 
       const result = await inFlightRequest;

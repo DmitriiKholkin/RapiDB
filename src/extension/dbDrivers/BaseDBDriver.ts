@@ -1098,7 +1098,7 @@ export abstract class BaseDBDriver implements IDBDriver {
       params: [limit, offset],
     };
   }
-  buildOrderByDefault(cols: ColumnTypeMeta[]): string {
+  buildOrderByDefault(cols: ColumnTypeMeta[], tableReference?: string): string {
     const pkCols = cols
       .filter((c) => c.isPrimaryKey)
       .sort((left, right) => {
@@ -1107,7 +1107,7 @@ export abstract class BaseDBDriver implements IDBDriver {
         return leftOrdinal - rightOrdinal;
       });
     if (pkCols.length === 0) return "";
-    return `ORDER BY ${pkCols.map((c) => this.quoteIdentifier(c.name)).join(", ")}`;
+    return `ORDER BY ${pkCols.map((c) => `${tableReference ? `${tableReference}.` : ""}${this.quoteIdentifier(c.name)}`).join(", ")}`;
   }
   buildInsertDefaultValuesSql(
     qualifiedTableName: string,

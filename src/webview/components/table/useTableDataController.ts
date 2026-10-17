@@ -37,7 +37,9 @@ interface UseTableDataControllerParams {
   mongoIdTypesRef: MutableRefObject<Array<"objectId" | "string" | null>>;
   pkColsRef: MutableRefObject<string[]>;
   scrollRef: RefObject<HTMLDivElement | null>;
-  fetchPageRef: MutableRefObject<() => void>;
+  fetchPageRef: MutableRefObject<
+    (options?: { refreshMetadata?: boolean }) => void
+  >;
   preserveScrollPositionRef: MutableRefObject<() => void>;
   onTableInit: () => void;
   getMetadataRefreshState: () => {
@@ -72,6 +74,7 @@ function buildTableInitSignature(
       filterOperators: column.filterOperators,
       valueSemantics: column.valueSemantics,
       identityGeneration: column.identityGeneration ?? null,
+      isReadOnly: column.isReadOnly ?? false,
       defaultValue: column.defaultValue,
       isComputed: column.isComputed,
       computedExpression: column.computedExpression,
@@ -262,6 +265,7 @@ export function useTableDataController({
             value.valueSemantics,
             value.nullable,
             value.identityGeneration,
+            value.isReadOnly,
             value.primaryKeyRole,
             value.isComputed,
             value.computedExpression,
@@ -364,48 +368,52 @@ export function useTableDataController({
   rowsRef.current = rows;
   pkColsRef.current = pkCols;
 
-  const fetchPage = useCallback(() => {
-    if (!initializedRef.current) {
-      return;
-    }
-    if (queuedMetadataRef.current || connectionInvalidatedRef.current) {
-      deferredReadRef.current = true;
-      return;
-    }
+  const fetchPage = useCallback(
+    (options?: { refreshMetadata?: boolean }) => {
+      if (!initializedRef.current) {
+        return;
+      }
+      if (queuedMetadataRef.current || connectionInvalidatedRef.current) {
+        deferredReadRef.current = true;
+        return;
+      }
 
-    deferredReadRef.current = false;
+      deferredReadRef.current = false;
 
-    const epoch = advanceFetchEpoch();
-    if (epoch === null) return;
-    reconciliationFetchIdRef.current = metadataStateRef.current()
-      .reconciliationPending
-      ? epoch
-      : null;
-    const snapshot: FetchSnapshot = {
-      page: requestedPageRef.current,
-      pageSize: requestedPageSizeRef.current,
-      sort: requestedSortRef.current,
-    };
+      const epoch = advanceFetchEpoch();
+      if (epoch === null) return;
+      reconciliationFetchIdRef.current = metadataStateRef.current()
+        .reconciliationPending
+        ? epoch
+        : null;
+      const snapshot: FetchSnapshot = {
+        page: requestedPageRef.current,
+        pageSize: requestedPageSizeRef.current,
+        sort: requestedSortRef.current,
+      };
 
-    fetchSnapshotsRef.current.clear();
-    fetchSnapshotsRef.current.set(epoch, snapshot);
-    loadingRef.current = true;
-    setLoading(true);
-    setReadError(null);
+      fetchSnapshotsRef.current.clear();
+      fetchSnapshotsRef.current.set(epoch, snapshot);
+      loadingRef.current = true;
+      setLoading(true);
+      setReadError(null);
 
-    const activeFilters = serializeFilterDrafts(
-      columnsRef.current,
-      debouncedFilterDraftsRef.current,
-    );
+      const activeFilters = serializeFilterDrafts(
+        columnsRef.current,
+        debouncedFilterDraftsRef.current,
+      );
 
-    postMessage("fetchPage", {
-      fetchId: epoch,
-      page: snapshot.page,
-      pageSize: snapshot.pageSize,
-      filters: activeFilters,
-      sort: snapshot.sort,
-    });
-  }, [advanceFetchEpoch, columnsRef]);
+      postMessage("fetchPage", {
+        fetchId: epoch,
+        page: snapshot.page,
+        pageSize: snapshot.pageSize,
+        filters: activeFilters,
+        sort: snapshot.sort,
+        ...(options?.refreshMetadata ? { refreshMetadata: true } : {}),
+      });
+    },
+    [advanceFetchEpoch, columnsRef],
+  );
 
   fetchPageRef.current = fetchPage;
   // Keep callbacks blocked until the committed rows and restored edits render.

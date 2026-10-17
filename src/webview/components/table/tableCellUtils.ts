@@ -4,7 +4,7 @@ import {
   type FilterDraftMap,
   formatColumnDetailDescription,
   formatPrimaryKeyRoleLabel,
-  isServerGeneratedColumn,
+  isColumnReadOnly,
   NULL_SENTINEL,
 } from "../../../shared/tableTypes";
 import type { ApplyResultPayload } from "../../../shared/webviewContracts";
@@ -21,7 +21,7 @@ export function getInitialPageSize(defaultPageSize?: number): number {
 }
 
 export function canEditColumn(column?: ColumnMeta): column is ColumnMeta {
-  return !!column && !isServerGeneratedColumn(column);
+  return !!column && !isColumnReadOnly(column);
 }
 
 export function clonePendingEdits(pendingEdits: PendingEdits): PendingEdits {

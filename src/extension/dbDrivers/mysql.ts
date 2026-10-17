@@ -31,6 +31,10 @@ import {
   discardMysqlResultHistory,
 } from "./mysqlBoundedQuery";
 import {
+  canonicalizeExactNumeric,
+  numberToDecimalString,
+} from "./numericUtils";
+import {
   DriverTimeoutError,
   type DriverTimeoutSettingsProvider,
   throwIfTransactionCancelled,
@@ -1069,6 +1073,18 @@ function canonicalizeMysqlBitPersistedEditValue(
   if (value === NULL_SENTINEL || value === null) {
     return { canonical: "__rapidb_null__" };
   }
+  if (Buffer.isBuffer(value)) {
+    const type = nativeType ?? "bit";
+    const bitValue = decodeMysqlBitBuffer(
+      value,
+      parseMysqlBitWidth(type) ?? value.length * 8,
+    );
+    const parsed = parseMysqlBitValue(bitValue, type);
+    if (!parsed) {
+      return null;
+    }
+    return { canonical: parsed.canonical };
+  }
   const parsed = parseMysqlBitValue(value, nativeType ?? "bit");
   if (!parsed) {
     return null;
@@ -1190,6 +1206,10 @@ export class MySQLDriver extends BaseDBDriver {
         connectTimeout: this.getConnectionTimeoutMs(),
         idleTimeout: 30000,
         dateStrings: true,
+        // Preserve JSON tokens, including integers beyond JS safe precision.
+        // Original values also need JSON text for CAST(? AS JSON), not an
+        // object that mysql2.query() expands as SQL assignment fragments.
+        jsonStrings: true,
         decimalNumbers: false,
         bigNumberStrings: true,
         supportBigNumbers: true,
@@ -1997,6 +2017,16 @@ export class MySQLDriver extends BaseDBDriver {
       request.schema,
       request.table,
     );
+    if (columns.length === 0) {
+      const tableName = this.qualifiedTableName(
+        request.database,
+        request.schema,
+        request.table,
+      );
+      throw new Error(
+        `Table ${tableName} no longer exists or has no visible columns. Refresh the database explorer and reopen the table.`,
+      );
+    }
     const { clause: whereClause, params: whereParams } = buildWhere(
       this,
       request.filters,
@@ -2797,6 +2827,12 @@ export class MySQLDriver extends BaseDBDriver {
       return `ST_AsBinary(${name}) = ST_AsBinary(ST_GeomFromText(?))`;
     if (column.category === "text")
       return `CAST(${name} AS BINARY) = CAST(? AS BINARY)`;
+    if (
+      column.category === "float" &&
+      mysqlTypeName(column.nativeType) === "float"
+    ) {
+      return `${name} = CAST(? AS FLOAT)`;
+    }
     return super.buildOriginalValueComparison(column, paramIndex);
   }
   protected override coerceBooleanTrue(): unknown {
@@ -2808,6 +2844,9 @@ export class MySQLDriver extends BaseDBDriver {
   override coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (value === null || value === undefined || value === "") return value;
     if (value === NULL_SENTINEL) return null;
+    if (column.category === "json" && typeof value === "object") {
+      return JSON.stringify(value);
+    }
     if (typeof value !== "string") return value;
     if (this.hasBooleanSemantics(column)) {
       const normalized = this.parseBooleanInput(value);
@@ -2955,6 +2994,9 @@ export class MySQLDriver extends BaseDBDriver {
     expectedValue: unknown,
     options?: PersistedEditCheckOptions,
   ): PersistedEditCheckResult | null {
+    if (column.category === "json") {
+      return this.checkJsonPersistedEdit(column, expectedValue, options);
+    }
     if (
       column.category === "date" ||
       column.category === "time" ||
@@ -2999,7 +3041,30 @@ export class MySQLDriver extends BaseDBDriver {
       column.category === "float" &&
       this.isApproximateNumericType(column.nativeType)
     ) {
-      const significantDigits = baseType === "float" ? 7 : 15;
+      const significantDigits =
+        baseType === "float" ? 7 : baseType === "double" ? 17 : 15;
+      if (baseType === "double" && options === undefined) {
+        const requested = canonicalizeExactNumeric(expectedValue, null);
+        if (requested) {
+          const parsed = Number(expectedValue);
+          if (Number.isFinite(parsed)) {
+            const roundTrip = canonicalizeExactNumeric(
+              numberToDecimalString(parsed),
+              null,
+            );
+            if (roundTrip && requested.canonical !== roundTrip.canonical) {
+              return {
+                ok: false,
+                shouldVerify: false,
+                message:
+                  `Column "${column.name}" exceeds the reliable precision of DOUBLE ` +
+                  `and would round to ${roundTrip.canonical}.`,
+              };
+            }
+            return { ok: true, shouldVerify: true };
+          }
+        }
+      }
       return this.checkApproximateNumericPersistedEdit(
         column,
         expectedValue,
@@ -3167,7 +3232,7 @@ export class MySQLDriver extends BaseDBDriver {
     if (column.category === "time") {
       if (operator === "between" && Array.isArray(val)) {
         return {
-          sql: `CAST(${col} AS TIME) BETWEEN CAST(? AS TIME) AND CAST(? AS TIME)`,
+          sql: `${col} BETWEEN CAST(? AS TIME(6)) AND CAST(? AS TIME(6))`,
           params: [val[0], val[1]],
         };
       }
@@ -3177,7 +3242,7 @@ export class MySQLDriver extends BaseDBDriver {
           .map((part) => part.trim())
           .filter(Boolean);
         return {
-          sql: `CAST(${col} AS TIME) IN (${parts.map(() => "CAST(? AS TIME)").join(", ")})`,
+          sql: `${col} IN (${parts.map(() => "CAST(? AS TIME(6))").join(", ")})`,
           params: parts,
         };
       }
@@ -3187,7 +3252,7 @@ export class MySQLDriver extends BaseDBDriver {
       ) {
         const sqlOp = operator === "neq" ? "!=" : this.sqlOperator(operator);
         return {
-          sql: `CAST(${col} AS TIME) ${sqlOp} CAST(? AS TIME)`,
+          sql: `${col} ${sqlOp} CAST(? AS TIME(6))`,
           params: [val],
         };
       }
@@ -3195,7 +3260,7 @@ export class MySQLDriver extends BaseDBDriver {
     if (column.category === "datetime") {
       if (operator === "between" && Array.isArray(val)) {
         return {
-          sql: `CAST(${col} AS DATETIME) BETWEEN CAST(? AS DATETIME) AND CAST(? AS DATETIME)`,
+          sql: `${col} BETWEEN CAST(? AS DATETIME(6)) AND CAST(? AS DATETIME(6))`,
           params: [
             normalizeMysqlDatetimeInput(val[0]) ?? val[0],
             normalizeMysqlDatetimeInput(val[1]) ?? val[1],
@@ -3209,7 +3274,7 @@ export class MySQLDriver extends BaseDBDriver {
           .filter(Boolean)
           .map((part) => normalizeMysqlDatetimeInput(part) ?? part);
         return {
-          sql: `CAST(${col} AS DATETIME) IN (${parts.map(() => "CAST(? AS DATETIME)").join(", ")})`,
+          sql: `${col} IN (${parts.map(() => "CAST(? AS DATETIME(6))").join(", ")})`,
           params: parts,
         };
       }
@@ -3219,7 +3284,7 @@ export class MySQLDriver extends BaseDBDriver {
       ) {
         const sqlOp = operator === "neq" ? "!=" : this.sqlOperator(operator);
         return {
-          sql: `CAST(${col} AS DATETIME) ${sqlOp} CAST(? AS DATETIME)`,
+          sql: `${col} ${sqlOp} CAST(? AS DATETIME(6))`,
           params: [normalizeMysqlDatetimeInput(val) ?? val],
         };
       }
@@ -3305,7 +3370,11 @@ export class MySQLDriver extends BaseDBDriver {
     }
     const v = typeof val === "string" ? val : val[0];
     if (!["date", "time", "datetime"].includes(column.category)) {
-      return this.buildContainsFilter(col, literalContainsPattern(v));
+      return this.buildContainsFilter(
+        col,
+        literalContainsPattern(v),
+        column.category === "text" || column.category === "enum",
+      );
     }
     let finalVal = v;
     if (ISO_DATETIME_RE.test(v)) {
@@ -3337,13 +3406,19 @@ export class MySQLDriver extends BaseDBDriver {
   private buildContainsFilter(
     col: string,
     pattern: string,
+    preserveColumnCollation = false,
   ): FilterConditionResult {
     // mysql2.query() interpolates string parameters with backslash escapes.
     // Transport only ASCII hex, then decode on the server: quotes/backslashes
     // stay data even with NO_BACKSLASH_ESCAPES. CAST uses the same connection
-    // character set/collation as the left-hand CAST, keeping LIKE nonbinary.
+    // character set/collation as the left-hand CAST for non-text values. Text
+    // columns retain their native collation so binary and language-specific
+    // comparisons keep the semantics declared by the column.
+    const leftExpression = preserveColumnCollation
+      ? col
+      : `CAST(${col} AS CHAR)`;
     return {
-      sql: `CAST(${col} AS CHAR) LIKE CAST(UNHEX(?) AS CHAR) ESCAPE '!'`,
+      sql: `${leftExpression} LIKE CAST(UNHEX(?) AS CHAR) ESCAPE '!'`,
       params: [Buffer.from(pattern, "utf8").toString("hex")],
     };
   }

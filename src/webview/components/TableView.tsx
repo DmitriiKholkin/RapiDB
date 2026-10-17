@@ -71,7 +71,9 @@ export function TableView({
   const mongoIdTypesRef = useRef<Array<"objectId" | "string" | null>>([]);
   const pkColsRef = useRef<string[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const fetchPageRef = useRef<() => void>(() => undefined);
+  const fetchPageRef = useRef<
+    (options?: { refreshMetadata?: boolean }) => void
+  >(() => undefined);
   const preserveScrollPositionRef = useRef<() => void>(() => undefined);
   const mutationBridgeRef = useRef<{
     handleRowsCommitted: (
@@ -342,7 +344,10 @@ export function TableView({
         onRefresh={() => {
           if (!mutation.retryReconciliation()) {
             if (unresolvedPendingCount > 0) data.fetchPage();
-            else guardRowNavigation(data.fetchPage);
+            else
+              guardRowNavigation(() =>
+                data.fetchPage({ refreshMetadata: true }),
+              );
           }
         }}
       />

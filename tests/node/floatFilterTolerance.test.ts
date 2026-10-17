@@ -66,7 +66,7 @@ describe("float filter tolerance", () => {
     ]);
   });
 
-  it("uses tolerant equality for MSSQL real filters", () => {
+  it("compares MSSQL real filters after rounding the operand to real", () => {
     const driver = new MSSQLDriver({
       id: "float-filter-mssql",
       name: "Float Filter MSSQL",
@@ -85,19 +85,16 @@ describe("float filter tolerance", () => {
       1,
     );
 
-    expect(condition?.sql).toContain("ABS(CAST([col_real] AS float) - ?)");
-    expect(condition?.sql).toContain(
-      "CASE WHEN ABS(?) * ? > ? THEN ABS(?) * ? ELSE ? END",
-    );
-    expect(condition?.params).toEqual([
-      floatFilterNumber,
-      floatFilterNumber,
-      1e-7,
-      1e-7,
-      floatFilterNumber,
-      1e-7,
-      1e-7,
-    ]);
+    expect(condition).toEqual({
+      sql: "[col_real] = CAST(? AS real)",
+      params: [floatFilterNumber],
+    });
+    expect(
+      driver.buildFilterCondition(floatColumn, "neq", floatFilterValue, 1),
+    ).toEqual({
+      sql: "[col_real] <> CAST(? AS real)",
+      params: [floatFilterNumber],
+    });
   });
 
   it("uses tolerant equality for SQLite REAL filters", () => {

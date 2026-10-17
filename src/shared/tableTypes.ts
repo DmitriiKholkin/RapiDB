@@ -42,6 +42,12 @@ export interface QueryColumnMeta {
   category: TypeCategory | null;
 }
 
+/** A query result cell whose attribute is absent rather than explicitly NULL. */
+export interface QueryMissingCell {
+  rowIndex: number;
+  columnIndex: number;
+}
+
 const UUID_VALUE_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const INTEGER_VALUE_RE = /^[+-]?\d+$/;
@@ -248,6 +254,15 @@ export type PrimaryKeyRole = "partition" | "sort";
 export interface ColumnMeta {
   name: string;
   type: string;
+  /** Oracle collection catalog details used by typed filters and mutations. */
+  collectionKind?: "varray" | "nestedTable";
+  collectionElementType?: string;
+  collectionTypeOwner?: string;
+  collectionTypeName?: string;
+  /** Oracle named object type details used by typed mutations and verification. */
+  objectTypeOwner?: string;
+  objectTypeName?: string;
+  objectAttributes?: Array<{ name: string; nativeType: string }>;
   /** Catalog-resolved underlying SQL type for aliases, including size/precision.
    * The declared type remains in `type` for display. */
   baseType?: string;
@@ -256,6 +271,8 @@ export interface ColumnMeta {
   nullable: boolean;
   defaultValue?: string;
   identityGeneration?: IdentityGenerationKind;
+  /** The backend accepts reads but rejects explicit writes to this column. */
+  isReadOnly?: boolean;
   onUpdateExpression?: string;
   isComputed?: boolean;
   computedExpression?: string;
@@ -281,6 +298,18 @@ export function isServerGeneratedColumn(
   column: Pick<ColumnMeta, "isComputed" | "generatedKind"> | null | undefined,
 ): boolean {
   return Boolean(column && (column.isComputed || column.generatedKind));
+}
+
+/** True when a table viewer must not let a user write this column. */
+export function isColumnReadOnly(
+  column:
+    | Pick<ColumnMeta, "isComputed" | "generatedKind" | "isReadOnly">
+    | null
+    | undefined,
+): boolean {
+  return Boolean(
+    column && (column.isReadOnly || isServerGeneratedColumn(column)),
+  );
 }
 
 export type IndexDdlSupport = "supported" | "unsupported";
@@ -411,6 +440,7 @@ export function formatColumnDetailDescription(
     | "nullable"
     | "defaultValue"
     | "identityGeneration"
+    | "isReadOnly"
     | "isComputed"
     | "generatedKind"
     | "computedExpression"
@@ -426,6 +456,7 @@ export function formatColumnDetailDescription(
       : column.defaultValue
         ? `default: ${column.defaultValue}`
         : undefined,
+    column.isReadOnly ? "read-only" : undefined,
     generated,
   ].filter((value): value is string => Boolean(value));
 
@@ -440,6 +471,7 @@ export function formatColumnDetailTooltip(
     | "nullable"
     | "defaultValue"
     | "identityGeneration"
+    | "isReadOnly"
     | "isComputed"
     | "generatedKind"
     | "computedExpression"

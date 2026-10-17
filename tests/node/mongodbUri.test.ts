@@ -1,5 +1,5 @@
-import { MongoClient } from "mongodb";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { Db, MongoClient } from "mongodb";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
@@ -165,6 +165,12 @@ describe("MongoDBDriver — host-based URI parsing", () => {
 });
 
 describe("MongoDBDriver — real MongoClient constructor through connect()", () => {
+  beforeEach(() => {
+    vi.spyOn(Db.prototype, "listCollections").mockReturnValue({
+      hasNext: vi.fn().mockResolvedValue(false),
+      close: vi.fn().mockResolvedValue(undefined),
+    } as never);
+  });
   afterEach(() => vi.restoreAllMocks());
 
   it.each([

@@ -5,6 +5,7 @@ import {
   QUERY_LIMIT_POLICY,
   type QueryExecutionCancellationHandle,
 } from "../../shared/safetyContracts";
+import type { QueryMissingCell } from "../../shared/tableTypes";
 import {
   type BookmarkSavedPayload,
   parseQueryPanelMessage,
@@ -53,6 +54,7 @@ export interface QueryPanelCachedResult {
   columns: string[];
   columnMeta?: QueryColumnMeta[];
   rows: Record<string, unknown>[];
+  missingCells?: QueryMissingCell[];
   truncated?: boolean;
   truncatedAt?: number;
 }
@@ -394,6 +396,7 @@ export class QueryPanelController {
         columns: formattedResult.columns,
         columnMeta: formattedResult.columnMeta,
         rows: formattedResult.rows,
+        missingCells: formattedResult.missingCells,
         truncated: formattedResult.truncated,
         truncatedAt: formattedResult.truncatedAt,
       });
@@ -804,6 +807,7 @@ export class QueryPanelController {
   ): QueryPanelCachedResult {
     if (columnOrder.length === 0) return result;
     const indices = columnOrder.map((id) => Number(id.slice(6)));
+    const columnMeta = result.columnMeta;
 
     const reorderedRows = result.rows.map((row) => {
       const newRow: Record<string, unknown> = {};
@@ -812,14 +816,21 @@ export class QueryPanelController {
       }
       return newRow;
     });
+    const reorderedMissingCells = result.missingCells?.flatMap(
+      ({ rowIndex, columnIndex }) => {
+        const nextColumnIndex = indices.indexOf(columnIndex);
+        return nextColumnIndex < 0
+          ? []
+          : [{ rowIndex, columnIndex: nextColumnIndex }];
+      },
+    );
 
     return {
       ...result,
       columns: indices.map((i) => result.columns[i]),
-      ...(result.columnMeta
-        ? { columnMeta: indices.map((i) => result.columnMeta![i]) }
-        : {}),
+      ...(columnMeta ? { columnMeta: indices.map((i) => columnMeta[i]) } : {}),
       rows: reorderedRows,
+      ...(reorderedMissingCells ? { missingCells: reorderedMissingCells } : {}),
     };
   }
 
@@ -827,10 +838,11 @@ export class QueryPanelController {
     result: QueryPanelCachedResult,
     sort: NonNullable<QueryResultExportPayload["sort"]>,
   ): QueryPanelCachedResult {
-    const sortedRows = [...result.rows].sort((a, b) => {
+    const indexedRows = result.rows.map((row, rowIndex) => ({ row, rowIndex }));
+    const sortedRows = [...indexedRows].sort((a, b) => {
       for (const { id, desc } of sort) {
-        const aVal = a[id];
-        const bVal = b[id];
+        const aVal = a.row[id];
+        const bVal = b.row[id];
         let cmp = 0;
         if (aVal == null && bVal == null) cmp = 0;
         else if (aVal == null) cmp = -1;
@@ -844,7 +856,22 @@ export class QueryPanelController {
       }
       return 0;
     });
-    return { ...result, rows: sortedRows };
+    const nextRowIndexByPrevious = new Map(
+      sortedRows.map(({ rowIndex }, nextRowIndex) => [rowIndex, nextRowIndex]),
+    );
+    const missingCells = result.missingCells?.flatMap(
+      ({ rowIndex, columnIndex }) => {
+        const nextRowIndex = nextRowIndexByPrevious.get(rowIndex);
+        return nextRowIndex === undefined
+          ? []
+          : [{ rowIndex: nextRowIndex, columnIndex }];
+      },
+    );
+    return {
+      ...result,
+      rows: sortedRows.map(({ row }) => row),
+      ...(missingCells ? { missingCells } : {}),
+    };
   }
 
   private async handleReadClipboard(

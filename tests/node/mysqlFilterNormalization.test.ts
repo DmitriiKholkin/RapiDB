@@ -401,7 +401,7 @@ describe("mysql filter normalization", () => {
     expect(page.totalCount).toBe(11);
     const dataCall = sqlCalls.find((call) => /SELECT `id`/i.test(call.sql));
     expect(dataCall?.sql).toContain(
-      "WHERE CAST(`title` AS CHAR) LIKE CAST(UNHEX(?) AS CHAR) ESCAPE '!'",
+      "WHERE `title` LIKE CAST(UNHEX(?) AS CHAR) ESCAPE '!'",
     );
     expect(dataCall?.sql).toContain("ORDER BY `title` DESC");
     expect(dataCall?.params).toEqual([

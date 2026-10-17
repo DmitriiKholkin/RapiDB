@@ -82,6 +82,15 @@ export function QueryResultsGrid({
   const containerRef = React.useRef<HTMLDivElement>(null);
 
   const colCount = colNames.length;
+  const missingCellKeys = useMemo(
+    () =>
+      new Set(
+        result.missingCells?.map(
+          ({ rowIndex, columnIndex }) => `${rowIndex}:${columnIndex}`,
+        ),
+      ),
+    [result.missingCells],
+  );
   const sortedRowsRef = useRef<readonly TanStackRow<Record<string, unknown>>[]>(
     [],
   );
@@ -93,15 +102,20 @@ export function QueryResultsGrid({
 
   const openCell = useCallback(
     (rowIndex: number, columnId: string) => {
-      const raw = sortedRowsRef.current[rowIndex]?.original[columnId];
-      const displayValue = formatScalarValueForDisplay(raw);
+      const row = sortedRowsRef.current[rowIndex];
+      const raw = row?.original[columnId];
       const columnIndex = Number.parseInt(columnId.replace("__col_", ""), 10);
+      const isMissing =
+        row !== undefined && missingCellKeys.has(`${row.index}:${columnIndex}`);
+      const displayValue = isMissing
+        ? "MISSING"
+        : formatScalarValueForDisplay(raw);
       const category = columnMeta[columnIndex]?.category;
       const isPlainText =
         category === "text" ||
         category === "lob" ||
         (category === undefined && typeof raw === "string");
-      if (isPlainText || /[\r\n]/.test(displayValue)) {
+      if (isMissing || isPlainText || /[\r\n]/.test(displayValue)) {
         setActiveCell(null);
         setCellPreview({
           columnName: colNames[columnIndex] ?? columnId,
@@ -112,7 +126,7 @@ export function QueryResultsGrid({
 
       setActiveCell({ rowIndex, columnId });
     },
-    [colNames, columnMeta],
+    [colNames, columnMeta, missingCellKeys],
   );
 
   const getCellValue = useCallback(
@@ -121,9 +135,13 @@ export function QueryResultsGrid({
       if (!sortedRow) return undefined;
       const colId = columnOrderRef.current[visualColIndex];
       if (!colId) return undefined;
+      const columnIndex = Number.parseInt(colId.replace("__col_", ""), 10);
+      if (missingCellKeys.has(`${sortedRow.index}:${columnIndex}`)) {
+        return "MISSING";
+      }
       return sortedRow.original[colId];
     },
-    [],
+    [missingCellKeys],
   );
 
   const getCellFromPoint = useCallback((x: number, y: number) => {
@@ -231,12 +249,13 @@ export function QueryResultsGrid({
             <CellDisplay
               value={info.getValue()}
               isPending={false}
+              isMissing={missingCellKeys.has(`${info.row.index}:${index}`)}
               category={category ?? undefined}
             />
           ),
         };
       }),
-    [colNames, colSizes, columnMeta],
+    [colNames, colSizes, columnMeta, missingCellKeys],
   );
 
   const handleSortingChange = React.useCallback<OnChangeFn<SortingState>>(
@@ -446,6 +465,7 @@ export function QueryResultsGrid({
                   index={virtualRow.index}
                   columnMeta={columnMeta}
                   activeCell={activeCell}
+                  missingCellKeys={missingCellKeys}
                   onOpenCell={openCell}
                   onDeactivateCell={() => setActiveCell(null)}
                   selection={selection}
@@ -488,6 +508,7 @@ export const QueryTableRow = React.memo(function QueryTableRow({
   index,
   columnMeta,
   activeCell,
+  missingCellKeys,
   onOpenCell,
   onDeactivateCell,
   selection,
@@ -496,6 +517,7 @@ export const QueryTableRow = React.memo(function QueryTableRow({
   index: number;
   columnMeta: QueryResult["columnMeta"];
   activeCell: { rowIndex: number; columnId: string } | null;
+  missingCellKeys: ReadonlySet<string>;
   onOpenCell: (rowIndex: number, columnId: string) => void;
   onDeactivateCell: () => void;
   selection: {
@@ -529,7 +551,6 @@ export const QueryTableRow = React.memo(function QueryTableRow({
     >
       {row.getVisibleCells().map((cell, visualPos) => {
         const raw = cell.getValue();
-        const isNull = raw === null || raw === undefined;
         const isEditing =
           activeCell?.rowIndex === index &&
           activeCell.columnId === cell.column.id;
@@ -543,6 +564,8 @@ export const QueryTableRow = React.memo(function QueryTableRow({
         const category = Number.isNaN(columnIndex)
           ? undefined
           : (columnMeta[columnIndex]?.category ?? undefined);
+        const isMissing = missingCellKeys.has(`${row.index}:${columnIndex}`);
+        const isNull = !isMissing && (raw === null || raw === undefined);
 
         const cellSelectionState = classifyCellSelection(
           range,
@@ -577,7 +600,15 @@ export const QueryTableRow = React.memo(function QueryTableRow({
               cursor: isCollapsed ? "default" : "pointer",
               userSelect: "none",
             }}
-            title={isCollapsed || isNull ? "" : getCellPreviewTitle(raw)}
+            title={
+              isCollapsed
+                ? ""
+                : isMissing
+                  ? "This item does not contain the attribute."
+                  : isNull
+                    ? ""
+                    : getCellPreviewTitle(raw)
+            }
             onMouseDown={(event) => {
               if (!isCollapsed) {
                 selection.handleCellMouseDown(index, visualPos, event);

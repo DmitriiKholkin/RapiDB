@@ -7,6 +7,7 @@ import {
   getMssqlServerName,
   getSshTcpForwardTransport,
 } from "../driverRuntimeConfig";
+import { normalizeUnknownError } from "../utils/errorHandling";
 import { logger } from "../utils/logger";
 import { scanSqlForCap } from "../utils/sqlStatementScan";
 import {
@@ -70,7 +71,12 @@ const MSSQL_TEDIOUS_EXACT_NUMERIC_PATCH_KEY = Symbol.for(
   "rapidb.mssqlTediousExactNumericPatch",
 );
 
-export function splitMssqlBatches(sql: string): string[] {
+interface MssqlBatch {
+  sql: string;
+  repeatCount: number;
+}
+
+function parseMssqlBatches(sql: string): MssqlBatch[] {
   const separators = new Set(
     scanSqlForCap(sql, "mssql")
       .filter(
@@ -78,15 +84,27 @@ export function splitMssqlBatches(sql: string): string[] {
       )
       .map((token) => token.start),
   );
-  const batches: string[] = [];
+  const batches: MssqlBatch[] = [];
   let start = 0;
-  for (const match of sql.matchAll(/^[\t ]*GO(?:[\t ]+\d+)?[\t \r]*$/gim)) {
+  for (const match of sql.matchAll(/^[\t ]*GO(?:[\t ]+(-?\d+))?[\t \r]*$/gim)) {
     if (!separators.has(match.index + match[0].search(/\S/))) continue;
-    batches.push(sql.slice(start, match.index).trim());
+    const repeatCount = match[1] === undefined ? 1 : Number(match[1]);
+    if (!Number.isSafeInteger(repeatCount) || repeatCount < 1) {
+      throw new Error(
+        "[RapiDB] SQL Server GO repeat count must be a positive integer.",
+      );
+    }
+    const batch = sql.slice(start, match.index).trim();
+    if (batch) batches.push({ sql: batch, repeatCount });
     start = match.index + match[0].length;
   }
-  batches.push(sql.slice(start).trim());
-  return batches.filter(Boolean);
+  const finalBatch = sql.slice(start).trim();
+  if (finalBatch) batches.push({ sql: finalBatch, repeatCount: 1 });
+  return batches;
+}
+
+export function splitMssqlBatches(sql: string): string[] {
+  return parseMssqlBatches(sql).map((batch) => batch.sql);
 }
 
 type TediousReadValueResult = {
@@ -113,6 +131,225 @@ type TediousHelpersModule = {
 };
 
 type MssqlSqlType = Parameters<mssql.Request["input"]>[1];
+type MssqlSqlVariantSnapshot = {
+  __rapidbSqlVariant: 1;
+  displayValue: string;
+  baseType: string;
+  precision: number | null;
+  scale: number | null;
+  maxLength: number | null;
+  collation: string | null;
+  binaryHex: string;
+};
+type MssqlSpatialSnapshot = {
+  __rapidbSpatial: 1;
+  displayValue: string;
+  srid: number;
+  binaryHex: string;
+};
+
+function isMssqlSqlVariantSnapshot(
+  value: unknown,
+): value is MssqlSqlVariantSnapshot {
+  if (!value || typeof value !== "object") return false;
+  const snapshot = value as Partial<MssqlSqlVariantSnapshot>;
+  return (
+    snapshot.__rapidbSqlVariant === 1 &&
+    typeof snapshot.displayValue === "string" &&
+    typeof snapshot.baseType === "string" &&
+    typeof snapshot.binaryHex === "string" &&
+    /^(?:[0-9a-f]{2})*$/i.test(snapshot.binaryHex)
+  );
+}
+
+function isMssqlSpatialSnapshot(value: unknown): value is MssqlSpatialSnapshot {
+  if (!value || typeof value !== "object") return false;
+  const snapshot = value as Partial<MssqlSpatialSnapshot>;
+  return (
+    snapshot.__rapidbSpatial === 1 &&
+    typeof snapshot.displayValue === "string" &&
+    typeof snapshot.srid === "number" &&
+    Number.isSafeInteger(snapshot.srid) &&
+    snapshot.srid >= -2_147_483_648 &&
+    snapshot.srid <= 2_147_483_647 &&
+    typeof snapshot.binaryHex === "string" &&
+    /^(?:[0-9a-f]{2})*$/i.test(snapshot.binaryHex)
+  );
+}
+
+function mssqlSqlVariantProjectionAlias(
+  columnIndex: number,
+  property:
+    | "base_type"
+    | "precision"
+    | "scale"
+    | "max_length"
+    | "collation"
+    | "binary_hex",
+  columns: readonly ColumnTypeMeta[] = [],
+): string {
+  return mssqlCompanionProjectionAlias(
+    `__rapidb_sql_variant_${columnIndex}_${property}`,
+    columns,
+  );
+}
+
+function mssqlSpatialProjectionAlias(
+  columnIndex: number,
+  columns: readonly ColumnTypeMeta[] = [],
+): string {
+  return mssqlCompanionProjectionAlias(
+    `__rapidb_spatial_${columnIndex}_binary_hex`,
+    columns,
+  );
+}
+
+function mssqlCompanionProjectionAlias(
+  base: string,
+  columns: readonly ColumnTypeMeta[],
+): string {
+  const names = new Set(columns.map((column) => column.name.toLowerCase()));
+  let alias = base;
+  for (let suffix = 1; names.has(alias.toLowerCase()); suffix++)
+    alias = `${base}_${suffix}`;
+  return alias;
+}
+
+function mssqlSqlVariantNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isSafeInteger(value)) return value;
+  if (typeof value === "string" && /^-?\d+$/.test(value)) {
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function mssqlSqlVariantNativeType(snapshot: MssqlSqlVariantSnapshot): string {
+  const baseType = snapshot.baseType.toLowerCase();
+  const precision = snapshot.precision;
+  const scale = snapshot.scale;
+  const maxLength = snapshot.maxLength;
+  let type: string;
+
+  if (baseType === "decimal" || baseType === "numeric") {
+    if (
+      precision === null ||
+      precision < 1 ||
+      precision > 38 ||
+      scale === null ||
+      scale < 0 ||
+      scale > precision
+    ) {
+      throw new TypeError(
+        "SQL Server did not return valid precision metadata for this sql_variant value. Refresh the table and try again.",
+      );
+    }
+    type = `decimal(${precision},${scale})`;
+  } else if (baseType === "float") {
+    if (precision !== 24 && precision !== 53) {
+      throw new TypeError(
+        "SQL Server returned unsupported float precision metadata for this sql_variant value.",
+      );
+    }
+    type = `float(${precision})`;
+  } else if (baseType === "binary" || baseType === "varbinary") {
+    if (maxLength === null || maxLength < 1 || maxLength > 8000) {
+      throw new TypeError(
+        "SQL Server returned unsupported binary length metadata for this sql_variant value.",
+      );
+    }
+    type = `${baseType}(${maxLength})`;
+  } else if (["char", "varchar", "nchar", "nvarchar"].includes(baseType)) {
+    if (maxLength === null || maxLength < 1 || maxLength > 8000) {
+      throw new TypeError(
+        "SQL Server returned unsupported character length metadata for this sql_variant value.",
+      );
+    }
+    const length = baseType.startsWith("n") ? maxLength / 2 : maxLength;
+    if (!Number.isInteger(length) || length < 1) {
+      throw new TypeError(
+        "SQL Server returned invalid character length metadata for this sql_variant value.",
+      );
+    }
+    type = `${baseType}(${length})`;
+  } else if (
+    baseType === "time" ||
+    baseType === "datetime2" ||
+    baseType === "datetimeoffset"
+  ) {
+    if (scale === null || scale < 0 || scale > 7) {
+      throw new TypeError(
+        "SQL Server returned invalid temporal scale metadata for this sql_variant value.",
+      );
+    }
+    type = `${baseType}(${scale})`;
+  } else if (
+    [
+      "bigint",
+      "bit",
+      "date",
+      "datetime",
+      "int",
+      "money",
+      "real",
+      "smalldatetime",
+      "smallint",
+      "smallmoney",
+      "tinyint",
+      "uniqueidentifier",
+    ].includes(baseType)
+  ) {
+    type = baseType;
+  } else {
+    throw new TypeError(
+      `Editing SQL Server sql_variant values with base type "${snapshot.baseType}" is not supported safely.`,
+    );
+  }
+
+  return type;
+}
+
+function mssqlSqlVariantInputExpression(
+  snapshot: MssqlSqlVariantSnapshot,
+): string {
+  const type = mssqlSqlVariantNativeType(snapshot);
+  const baseType = snapshot.baseType.toLowerCase();
+  const converted = ["binary", "varbinary"].includes(baseType)
+    ? `CONVERT(${type}, ?, 1)`
+    : `CAST(? AS ${type})`;
+  if (!["char", "varchar", "nchar", "nvarchar"].includes(baseType))
+    return converted;
+  if (!snapshot.collation) {
+    throw new TypeError(
+      "SQL Server did not return collation metadata for this sql_variant character value.",
+    );
+  }
+  if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(snapshot.collation)) {
+    throw new TypeError(
+      "SQL Server returned invalid collation metadata for this sql_variant value.",
+    );
+  }
+  return `CAST(? COLLATE ${snapshot.collation} AS ${type})`;
+}
+
+/** sql_variant's normal TDS value may already have lost decimal/date precision. */
+function mssqlSqlVariantDisplayExpression(name: string): string {
+  return `CASE CONVERT(nvarchar(128), SQL_VARIANT_PROPERTY(${name}, 'BaseType'))
+    WHEN 'binary' THEN CONVERT(nvarchar(max), CONVERT(varbinary(8000), ${name}), 1)
+    WHEN 'varbinary' THEN CONVERT(nvarchar(max), CONVERT(varbinary(8000), ${name}), 1)
+    WHEN 'float' THEN CONVERT(nvarchar(max), CONVERT(float, ${name}), 3)
+    WHEN 'real' THEN CONVERT(nvarchar(max), CONVERT(real, ${name}), 3)
+    WHEN 'money' THEN CONVERT(nvarchar(max), CONVERT(decimal(19,4), ${name}))
+    WHEN 'smallmoney' THEN CONVERT(nvarchar(max), CONVERT(decimal(10,4), ${name}))
+    WHEN 'datetimeoffset' THEN CONVERT(nvarchar(max), CONVERT(datetimeoffset(7), ${name}), 127)
+    WHEN 'datetime2' THEN CONVERT(nvarchar(max), CONVERT(datetime2(7), ${name}), 126)
+    WHEN 'datetime' THEN CONVERT(nvarchar(max), CONVERT(datetime, ${name}), 121)
+    WHEN 'smalldatetime' THEN CONVERT(nvarchar(max), CONVERT(smalldatetime, ${name}), 120)
+    WHEN 'date' THEN CONVERT(nvarchar(max), CONVERT(date, ${name}), 23)
+    WHEN 'time' THEN CONVERT(nvarchar(max), CONVERT(time(7), ${name}))
+    ELSE CONVERT(nvarchar(max), ${name}) END`;
+}
+
 interface NamedRow {
   name: string;
 }
@@ -973,6 +1210,17 @@ function mssqlFloatSignificantDigits(nativeType: string): number {
   }
   return Number.parseInt(match[1], 10) <= 24 ? 7 : 15;
 }
+function mssqlSinglePrecisionFilterType(nativeType: string): string | null {
+  const normalized = nativeType.toLowerCase().trim();
+  if (baseTypeName(normalized) === "real") return "real";
+  if (
+    normalized.startsWith("float") &&
+    mssqlFloatSignificantDigits(normalized) === 7
+  ) {
+    return "float(24)";
+  }
+  return null;
+}
 type MssqlTemporalDate = Date & {
   nanosecondDelta?: number;
 };
@@ -1014,8 +1262,36 @@ const escapeMssqlId = (s: string) => s.replace(/]/g, "]]");
 function baseTypeName(typeName: string): string {
   return typeName.toLowerCase().split("(")[0].trim();
 }
+type MssqlSpatialInput = { wkt: string; srid: number | null };
+function parseMssqlSpatialInput(
+  value: string,
+  spatialType?: "geometry" | "geography",
+): MssqlSpatialInput {
+  const match = /^(?:SRID\s*=\s*(-?\d+)\s*;\s*)?([\s\S]+)$/i.exec(value.trim());
+  const wkt = match?.[2]?.trim();
+  const sridText = match?.[1];
+  const srid = sridText === undefined ? null : Number(sridText);
+  if (
+    !wkt ||
+    !/^(?:fullglobe\b$|(?:point|linestring|polygon|multipoint|multilinestring|multipolygon|geometrycollection|circularstring|compoundcurve|curvepolygon)\s*(?:\(|empty\b))/i.test(
+      wkt,
+    ) ||
+    (srid !== null &&
+      (!Number.isSafeInteger(srid) ||
+        srid < -2_147_483_648 ||
+        srid > 2_147_483_647)) ||
+    (spatialType === "geometry" && /^fullglobe\b/i.test(wkt))
+  ) {
+    throw new TypeError(
+      "Enter SQL Server spatial data as WKT, optionally prefixed with SRID=...;.",
+    );
+  }
+  return { wkt, srid };
+}
 function isUnicodeMssqlLiteralType(nativeType: string): boolean {
-  return ["nchar", "nvarchar", "ntext", "xml"].includes(
+  // sql_variant strings travel as NVarChar, including insert/NULL updates.
+  // Preserve Unicode before the explicit subtype CAST and COLLATE conversion.
+  return ["nchar", "nvarchar", "ntext", "xml", "sql_variant"].includes(
     baseTypeName(nativeType),
   );
 }
@@ -1455,6 +1731,23 @@ export class MSSQLDriver extends BaseDBDriver {
       return Number.isFinite(value) ? value : null;
     }
     if (value instanceof Date && !Number.isNaN(value.getTime())) {
+      if (typeName === "DateTime" || typeName === "SmallDateTime") {
+        return formatMssqlDateTimeParts(
+          {
+            year: value.getFullYear(),
+            month: value.getMonth() + 1,
+            day: value.getDate(),
+          },
+          {
+            hours: value.getHours(),
+            minutes: value.getMinutes(),
+            seconds: value.getSeconds(),
+            fraction: formatMssqlFractionFromMilliseconds(
+              value.getMilliseconds(),
+            ),
+          },
+        );
+      }
       if (typeName === "Date") {
         return `${formatMssqlYear(value.getFullYear())}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`;
       }
@@ -1755,6 +2048,12 @@ export class MSSQLDriver extends BaseDBDriver {
          WHERE s.name = @schema AND o.name = @table
          ORDER BY c.column_id`);
     return res.recordset.map((row) => {
+      const isIdentity = isSetFlag(row.is_identity);
+      const isRowVersion = [row.DATA_TYPE, row.BASE_TYPE].some(
+        (typeName) =>
+          typeName != null &&
+          ["rowversion", "timestamp"].includes(baseTypeName(typeName)),
+      );
       const isComputed = isSetFlag(row.is_computed);
       const isPersisted = isComputed ? isSetFlag(row.is_persisted) : undefined;
       const defaultValue =
@@ -1782,7 +2081,8 @@ export class MSSQLDriver extends BaseDBDriver {
         ...(row.COLLATION_NAME ? { collation: row.COLLATION_NAME } : {}),
         nullable: isSetFlag(row.IS_NULLABLE),
         defaultValue,
-        identityGeneration: isSetFlag(row.is_identity) ? "always" : undefined,
+        identityGeneration: isIdentity ? "always" : undefined,
+        isReadOnly: isIdentity || isRowVersion,
         isComputed,
         computedExpression: row.COMPUTED_DEFINITION ?? undefined,
         generatedKind: isComputed
@@ -1804,7 +2104,7 @@ export class MSSQLDriver extends BaseDBDriver {
   ): Promise<QueryResult> {
     const hardCap = queryCollectionLimit(operationContext?.hardCap);
     const start = Date.now();
-    const batches = splitMssqlBatches(sql);
+    const batches = parseMssqlBatches(sql);
     if (batches.length === 0) {
       return {
         columns: [],
@@ -1825,18 +2125,20 @@ export class MSSQLDriver extends BaseDBDriver {
       rowCount: 0,
       executionTimeMs: 0,
     };
-    for (const batch of batches) {
+    for (const { sql: batch, repeatCount } of batches) {
       const currentParams = batches.length === 1 ? params : undefined;
-      // Only the final GO batch is returned; release the preceding collection
-      // before starting another request, rather than retaining two budgets.
-      if (hardCap !== undefined) lastResult.rows = [];
-      lastResult = await this._executeBatch(
-        batch,
-        currentParams,
-        start,
-        operationContext?.requestToken,
-        hardCap,
-      );
+      for (let repetition = 0; repetition < repeatCount; repetition++) {
+        // Only the final GO batch is returned; release the preceding collection
+        // before starting another request, rather than retaining two budgets.
+        if (hardCap !== undefined) lastResult.rows = [];
+        lastResult = await this._executeBatch(
+          batch,
+          currentParams,
+          start,
+          operationContext?.requestToken,
+          hardCap,
+        );
+      }
     }
     lastResult.executionTimeMs = Date.now() - start;
     return lastResult;
@@ -2488,9 +2790,18 @@ export class MSSQLDriver extends BaseDBDriver {
         const errors: unknown[] = [error, rollbackError];
         const closeError = rollbackFence?.closeError();
         if (closeError !== undefined) errors.push(closeError);
+        const diagnostics = [
+          `original transaction error: ${normalizeUnknownError(error).message}`,
+          `rollback error: ${normalizeUnknownError(rollbackError).message}`,
+          ...(closeError === undefined
+            ? []
+            : [
+                `session close error: ${normalizeUnknownError(closeError).message}`,
+              ]),
+        ].join("; ");
         throw new AggregateError(
           errors,
-          "MSSQL transaction and rollback failed; the failed session was discarded.",
+          `MSSQL transaction and rollback failed (${diagnostics}); the failed session was discarded.`,
         );
       } finally {
         rollbackFence?.restore();
@@ -2600,6 +2911,294 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     return "?";
   }
+  buildMutationValueExpr(
+    column: ColumnTypeMeta,
+    value: unknown,
+    operation: "insert" | "update",
+    originalValue?: unknown,
+  ): { sql: string; params: unknown[] } | null {
+    const type = baseTypeName(column.nativeType);
+    if (type === "sql_variant") {
+      if (operation !== "update" || originalValue == null) return null;
+      if (!isMssqlSqlVariantSnapshot(originalValue)) {
+        throw new TypeError(
+          `Refresh the Table Viewer before editing SQL Server sql_variant column "${column.name}" so its original base type can be preserved.`,
+        );
+      }
+      const nativeType = mssqlSqlVariantNativeType(originalValue);
+      const effectiveColumn = {
+        ...column,
+        nativeType,
+        category: this.mapTypeCategory(nativeType),
+      };
+      const check = this.checkPersistedEdit(effectiveColumn, value);
+      if (check?.ok === false)
+        throw new TypeError(
+          check.message ?? `Invalid value for ${column.name}.`,
+        );
+      if (
+        typeof value === "string" &&
+        value !== NULL_SENTINEL &&
+        ["nvarchar", "nchar"].includes(originalValue.baseType.toLowerCase()) &&
+        Buffer.byteLength(value, "utf16le") > (originalValue.maxLength ?? 0)
+      ) {
+        throw new TypeError(
+          `Column "${column.name}" exceeds the original sql_variant ${nativeType} length.`,
+        );
+      }
+      return {
+        sql: mssqlSqlVariantInputExpression(originalValue),
+        params: [value],
+      };
+    }
+    if (type !== "geometry" && type !== "geography") return null;
+    if (value === null || value === NULL_SENTINEL) {
+      return { sql: "NULL", params: [] };
+    }
+    if (typeof value !== "string") {
+      throw new TypeError(
+        `Column "${column.name}" expects spatial WKT text for editing.`,
+      );
+    }
+    const spatial = parseMssqlSpatialInput(
+      value,
+      type as "geometry" | "geography",
+    );
+    if (
+      type === "geography" &&
+      spatial.srid === null &&
+      (operation === "insert" ||
+        originalValue === null ||
+        originalValue === undefined)
+    ) {
+      throw new TypeError(
+        `Specify an SRID prefix such as SRID=4326; for a new geography value in column "${column.name}".`,
+      );
+    }
+    const quotedColumn = this.quoteIdentifier(column.name);
+    const defaultSrid = type === "geography" ? 4326 : 0;
+    const sridExpression =
+      spatial.srid !== null
+        ? String(spatial.srid)
+        : operation === "update"
+          ? `COALESCE(${quotedColumn}.STSrid, ${defaultSrid})`
+          : String(defaultSrid);
+    return {
+      sql: `${type}::STGeomFromText(?, ${sridExpression})`,
+      params: [spatial.wkt],
+    };
+  }
+  buildTableDataOrderExpression(
+    columnName: string,
+    tableReference: string,
+  ): string {
+    return `${tableReference}.${this.quoteIdentifier(columnName)}`;
+  }
+  buildTableDataProjection(columns: readonly ColumnTypeMeta[]): string {
+    if (columns.length === 0) return "*";
+    const projection: string[] = [];
+    columns.forEach((column, columnIndex) => {
+      const quoted = this.quoteIdentifier(column.name);
+      if (column.category === "spatial") {
+        projection.push(
+          `CASE WHEN ${quoted} IS NULL THEN CAST(NULL AS nvarchar(max)) ELSE N'SRID=' + CONVERT(nvarchar(11), ${quoted}.STSrid) + N';' + ${quoted}.ToString() END AS ${quoted}`,
+        );
+        projection.push(
+          `CASE WHEN ${quoted} IS NULL THEN CAST(NULL AS varchar(max)) ELSE CONVERT(varchar(max), ${quoted}.AsBinaryZM(), 2) END AS ${this.quoteIdentifier(mssqlSpatialProjectionAlias(columnIndex, columns))}`,
+        );
+      } else if (
+        baseTypeName(column.nativeType) === "sql_variant" &&
+        !column.isPrimaryKey
+      ) {
+        projection.push(
+          `${mssqlSqlVariantDisplayExpression(quoted)} AS ${quoted}`,
+        );
+      } else {
+        projection.push(`${quoted} AS ${quoted}`);
+      }
+      if (
+        baseTypeName(column.nativeType) === "sql_variant" &&
+        !column.isPrimaryKey
+      ) {
+        const properties = [
+          ["base_type", "BaseType"],
+          ["precision", "Precision"],
+          ["scale", "Scale"],
+          ["max_length", "MaxLength"],
+          ["collation", "Collation"],
+        ] as const;
+        for (const [aliasName, property] of properties) {
+          const alias = this.quoteIdentifier(
+            mssqlSqlVariantProjectionAlias(columnIndex, aliasName, columns),
+          );
+          projection.push(
+            `SQL_VARIANT_PROPERTY(${quoted}, '${property}') AS ${alias}`,
+          );
+        }
+        const binaryAlias = this.quoteIdentifier(
+          mssqlSqlVariantProjectionAlias(columnIndex, "binary_hex", columns),
+        );
+        projection.push(
+          `CONVERT(varchar(max), CONVERT(varbinary(8000), ${quoted}), 2) AS ${binaryAlias}`,
+        );
+      }
+    });
+    return projection.join(", ");
+  }
+  buildVerificationValueExpr(column: ColumnTypeMeta): string {
+    const name = this.quoteIdentifier(column.name);
+    if (baseTypeName(column.nativeType) !== "sql_variant") return name;
+    const properties = [
+      "BaseType",
+      "Precision",
+      "Scale",
+      "MaxLength",
+      "Collation",
+    ];
+    const fields = ["baseType", "precision", "scale", "maxLength", "collation"];
+    const expressions = properties.map(
+      (property, index) =>
+        `${index === 0 || index === 4 ? "CONVERT(nvarchar(128)," : "CONVERT(int,"} SQL_VARIANT_PROPERTY(${name}, '${property}')) AS ${fields[index]}`,
+    );
+    return `CASE WHEN ${name} IS NULL THEN NULL ELSE (SELECT 1 AS __rapidbSqlVariant, ${mssqlSqlVariantDisplayExpression(name)} AS displayValue, ${expressions.join(", ")}, CONVERT(varchar(max), CONVERT(varbinary(8000), ${name}), 2) AS binaryHex FOR JSON PATH, INCLUDE_NULL_VALUES, WITHOUT_ARRAY_WRAPPER) END`;
+  }
+  formatTableDataValue(
+    value: unknown,
+    column: ColumnTypeMeta,
+    projectionValues: Record<string, unknown>,
+    columnIndex: number,
+    columns: readonly ColumnTypeMeta[] = [],
+  ): unknown {
+    if (column.category === "spatial") {
+      if (value === null || value === undefined) {
+        return this.formatOutputValue(value, column);
+      }
+      const displayValue = this.formatOutputValue(value, column);
+      const binaryHex =
+        projectionValues[mssqlSpatialProjectionAlias(columnIndex, columns)];
+      if (
+        typeof displayValue !== "string" ||
+        typeof binaryHex !== "string" ||
+        !/^(?:[0-9a-f]{2})*$/i.test(binaryHex)
+      ) {
+        return displayValue;
+      }
+      const { srid } = parseMssqlSpatialInput(
+        displayValue,
+        baseTypeName(column.nativeType) as "geometry" | "geography",
+      );
+      if (srid === null) return displayValue;
+      return {
+        __rapidbSpatial: 1,
+        displayValue,
+        srid,
+        binaryHex,
+      } satisfies MssqlSpatialSnapshot;
+    }
+    if (
+      baseTypeName(column.nativeType) !== "sql_variant" ||
+      column.isPrimaryKey ||
+      value === null ||
+      value === undefined
+    ) {
+      return this.formatOutputValue(value, column);
+    }
+
+    const readProjection = (
+      property: Parameters<typeof mssqlSqlVariantProjectionAlias>[1],
+    ) =>
+      projectionValues[
+        mssqlSqlVariantProjectionAlias(columnIndex, property, columns)
+      ];
+    const baseType = readProjection("base_type");
+    const binaryHex = readProjection("binary_hex");
+    if (typeof baseType !== "string" || typeof binaryHex !== "string") {
+      return this.formatOutputValue(value, column);
+    }
+    const displayValue = this.formatOutputValue(value, column);
+    const collation = readProjection("collation");
+    return {
+      __rapidbSqlVariant: 1,
+      displayValue:
+        typeof displayValue === "string" ? displayValue : String(displayValue),
+      baseType,
+      precision: mssqlSqlVariantNumber(readProjection("precision")),
+      scale: mssqlSqlVariantNumber(readProjection("scale")),
+      maxLength: mssqlSqlVariantNumber(readProjection("max_length")),
+      collation: typeof collation === "string" ? collation : null,
+      binaryHex,
+    } satisfies MssqlSqlVariantSnapshot;
+  }
+  shouldFallbackTableDataProjection(error: unknown): boolean {
+    return /common language runtime\s*\(clr\)\s*is not enabled/i.test(
+      error instanceof Error ? error.message : String(error ?? ""),
+    );
+  }
+  coerceOriginalValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (column.category === "spatial") {
+      if (value === null || value === undefined) return value;
+      if (isMssqlSpatialSnapshot(value)) return value;
+      throw new TypeError(
+        `Refresh the Table Viewer before editing SQL Server spatial column "${column.name}" so its original SRID and Z/M coordinates can be checked safely.`,
+      );
+    }
+    if (
+      baseTypeName(column.nativeType) === "sql_variant" &&
+      isMssqlSqlVariantSnapshot(value)
+    ) {
+      return value;
+    }
+    return this.coerceInputValue(value, column);
+  }
+  buildOriginalValueComparisonWithParams(
+    column: ColumnTypeMeta,
+    value: unknown,
+    _paramIndex: number,
+    tableAlias?: string,
+  ): { sql: string; params: unknown[] } | null {
+    if (column.category === "spatial") {
+      if (!isMssqlSpatialSnapshot(value)) {
+        throw new TypeError(
+          `Refresh the Table Viewer before editing SQL Server spatial column "${column.name}" so its original SRID and Z/M coordinates can be checked safely.`,
+        );
+      }
+      const name = tableAlias
+        ? `${this.quoteIdentifier(tableAlias)}.${this.quoteIdentifier(column.name)}`
+        : this.quoteIdentifier(column.name);
+      return {
+        sql: `${name}.STSrid = ? AND ${name}.AsBinaryZM() = ?`,
+        params: [value.srid, Buffer.from(value.binaryHex, "hex")],
+      };
+    }
+    if (baseTypeName(column.nativeType) !== "sql_variant") return null;
+    if (!isMssqlSqlVariantSnapshot(value)) {
+      throw new TypeError(
+        `Refresh the Table Viewer before editing SQL Server sql_variant column "${column.name}" so the original value can be checked safely.`,
+      );
+    }
+
+    const name = tableAlias
+      ? `${this.quoteIdentifier(tableAlias)}.${this.quoteIdentifier(column.name)}`
+      : this.quoteIdentifier(column.name);
+    return {
+      sql: [
+        `CONVERT(nvarchar(128), SQL_VARIANT_PROPERTY(${name}, 'BaseType')) = ?`,
+        `COALESCE(CONVERT(int, SQL_VARIANT_PROPERTY(${name}, 'Precision')), -1) = ?`,
+        `COALESCE(CONVERT(int, SQL_VARIANT_PROPERTY(${name}, 'Scale')), -1) = ?`,
+        `COALESCE(CONVERT(int, SQL_VARIANT_PROPERTY(${name}, 'MaxLength')), -1) = ?`,
+        `COALESCE(CONVERT(nvarchar(128), SQL_VARIANT_PROPERTY(${name}, 'Collation')), N'') = ?`,
+        `CONVERT(varbinary(8000), ${name}) = ?`,
+      ].join(" AND "),
+      params: [
+        value.baseType,
+        value.precision ?? -1,
+        value.scale ?? -1,
+        value.maxLength ?? -1,
+        value.collation ?? "",
+        Buffer.from(value.binaryHex, "hex"),
+      ],
+    };
+  }
   override buildCursorComparison(
     column: ColumnTypeMeta,
     operator: "eq" | "gt" | "lt",
@@ -2695,7 +3294,10 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     return super.formatPreviewSqlLiteral(value);
   }
-  override buildOrderByDefault(columns: ColumnTypeMeta[]): string {
+  override buildOrderByDefault(
+    columns: ColumnTypeMeta[],
+    tableReference?: string,
+  ): string {
     const pkCols = columns
       .filter((column) => column.isPrimaryKey)
       .sort(
@@ -2704,10 +3306,10 @@ export class MSSQLDriver extends BaseDBDriver {
           (right.primaryKeyOrdinal ?? Number.MAX_SAFE_INTEGER),
       );
     if (pkCols.length > 0) {
-      return `ORDER BY ${pkCols.map((column) => this.quoteIdentifier(column.name)).join(", ")}`;
+      return `ORDER BY ${pkCols.map((column) => `${tableReference ? `${tableReference}.` : ""}${this.quoteIdentifier(column.name)}`).join(", ")}`;
     }
     if (columns.length > 0) {
-      return `ORDER BY ${this.quoteIdentifier(columns[0].name)}`;
+      return `ORDER BY ${tableReference ? `${tableReference}.` : ""}${this.quoteIdentifier(columns[0].name)}`;
     }
     return "ORDER BY (SELECT NULL)";
   }
@@ -2763,6 +3365,57 @@ export class MSSQLDriver extends BaseDBDriver {
     expectedValue: unknown,
     options?: PersistedEditCheckOptions,
   ): PersistedEditCheckResult | null {
+    if (baseTypeName(column.nativeType) === "sql_variant") {
+      if (options === undefined) return { ok: true, shouldVerify: true };
+      if (expectedValue === null || expectedValue === NULL_SENTINEL) {
+        return {
+          ok: options.persistedValue === null,
+          shouldVerify: true,
+          message: `Column "${column.name}" did not preserve the requested SQL NULL.`,
+        };
+      }
+      let persisted: unknown = options.persistedValue;
+      if (typeof persisted === "string") {
+        try {
+          persisted = JSON.parse(persisted);
+        } catch {
+          persisted = null;
+        }
+      }
+      if (!isMssqlSqlVariantSnapshot(persisted)) {
+        return {
+          ok: false,
+          shouldVerify: true,
+          message: `Column "${column.name}" could not be read back with its sql_variant type metadata.`,
+        };
+      }
+      const original = options.originalValue;
+      if (
+        isMssqlSqlVariantSnapshot(original) &&
+        (original.baseType.toLowerCase() !== persisted.baseType.toLowerCase() ||
+          mssqlSqlVariantNativeType(original) !==
+            mssqlSqlVariantNativeType(persisted) ||
+          original.collation !== persisted.collation)
+      ) {
+        return {
+          ok: false,
+          shouldVerify: true,
+          message: `Column "${column.name}" did not preserve the original sql_variant subtype or collation.`,
+        };
+      }
+      const nativeType = mssqlSqlVariantNativeType(persisted);
+      return (
+        this.checkPersistedEdit(
+          { ...column, nativeType, category: this.mapTypeCategory(nativeType) },
+          expectedValue,
+          { persistedValue: persisted.displayValue },
+        ) ?? {
+          ok: false,
+          shouldVerify: true,
+          message: `The persisted sql_variant base type ${nativeType} cannot be verified safely.`,
+        }
+      );
+    }
     if (this.hasBitSemantics(column)) {
       return this.checkNormalizedPersistedEdit(
         column,
@@ -2926,14 +3579,21 @@ export class MSSQLDriver extends BaseDBDriver {
       if (operator !== "eq" && operator !== "neq") {
         return null;
       }
-      const searchValue = val.trim();
-      if (!searchValue) {
-        return null;
-      }
+      const { wkt, srid } = parseMssqlSpatialInput(
+        val,
+        baseTypeName(column.nativeType) as "geometry" | "geography",
+      );
       const sqlOp = operator === "neq" ? "<>" : "=";
+      const wktComparison = `${col}.ToString() ${sqlOp} ?`;
+      const spatialComparison =
+        srid === null
+          ? wktComparison
+          : operator === "neq"
+            ? `(${col}.STSrid <> ${srid} OR ${wktComparison})`
+            : `${col}.STSrid = ${srid} AND ${wktComparison}`;
       return {
-        sql: `${col}.ToString() ${sqlOp} ?`,
-        params: [searchValue],
+        sql: spatialComparison,
+        params: [wkt],
       };
     }
     if (this.isNumericCategory(column.category) && Array.isArray(val)) {
@@ -2961,6 +3621,16 @@ export class MSSQLDriver extends BaseDBDriver {
           column.category === "float" &&
           (operator === "eq" || operator === "neq")
         ) {
+          const singlePrecisionType = mssqlSinglePrecisionFilterType(
+            column.nativeType,
+          );
+          if (singlePrecisionType) {
+            const sqlOp = operator === "neq" ? "<>" : "=";
+            return {
+              sql: `${col} ${sqlOp} CAST(? AS ${singlePrecisionType})`,
+              params: [mssqlNumericFilterParam(column, val)],
+            };
+          }
           const numericValue = Number(val);
           const tolerance = approximateNumericFilterTolerance(val);
           const toleranceExpr =
@@ -3076,15 +3746,20 @@ export class MSSQLDriver extends BaseDBDriver {
       if (["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)) {
         if (operator === "eq" || operator === "neq") {
           const normalizedValue = normalizeDatetimeLiteral(v);
+          const baseType = baseTypeName(column.nativeType);
+          if (baseType === "datetime" || baseType === "smalldatetime") {
+            const comparisonExpr = `${col} ${operator === "neq" ? "<>" : "="} CAST(? AS ${baseType})`;
+            return {
+              sql: comparisonExpr,
+              params: [normalizedValue],
+            };
+          }
           const diffUpperBound = mssqlDisplayedTemporalDiffUpperBound(v);
           if (isDateTimeOffset && diffUpperBound === null) {
-            const normalizedExpr = `REPLACE(REPLACE(REPLACE(CONVERT(VARCHAR(40), ${col}, 127), 'Z', '+00:00'), ' +', '+'), ' -', '-')`;
+            const comparisonExpr = `${col} ${operator === "neq" ? "<>" : "="} CAST(? AS datetimeoffset(7))`;
             return {
-              sql:
-                operator === "neq"
-                  ? `NOT (${normalizedExpr} LIKE ?)`
-                  : `${normalizedExpr} LIKE ?`,
-              params: [`%${datetimeOffsetSearchLiteral(v)}%`],
+              sql: comparisonExpr,
+              params: [normalizedValue],
             };
           }
           if (diffUpperBound !== null) {

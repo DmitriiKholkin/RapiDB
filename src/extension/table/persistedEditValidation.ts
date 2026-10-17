@@ -1,4 +1,7 @@
-import { isServerGeneratedColumn } from "../../shared/tableTypes";
+import {
+  isColumnReadOnly,
+  isServerGeneratedColumn,
+} from "../../shared/tableTypes";
 import type {
   ApplyResultPayload,
   ApplyRowOutcome,
@@ -37,6 +40,20 @@ export function validatePersistedEditRecord(
     columns.push(...generatedColumns);
     messages.push(
       `Generated column${generatedColumns.length === 1 ? "" : "s"} ${generatedColumns.map((name) => `"${name}"`).join(", ")} ${generatedColumns.length === 1 ? "is" : "are"} read-only and cannot be written.`,
+    );
+  }
+  const readOnlyColumns = Object.entries(values)
+    .filter(
+      ([name, value]) =>
+        value !== undefined &&
+        isColumnReadOnly(columnMap.get(name)) &&
+        !isServerGeneratedColumn(columnMap.get(name)),
+    )
+    .map(([name]) => name);
+  if (readOnlyColumns.length > 0) {
+    columns.push(...readOnlyColumns);
+    messages.push(
+      `Read-only column${readOnlyColumns.length === 1 ? "" : "s"} ${readOnlyColumns.map((name) => `"${name}"`).join(", ")} ${readOnlyColumns.length === 1 ? "is" : "are"} not writable.`,
     );
   }
   for (const [name, value] of writableEntries(values, columnMap)) {
