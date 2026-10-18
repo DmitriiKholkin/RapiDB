@@ -39,7 +39,19 @@ export function createMysqlStreamingQuery(
     callback: undefined,
     config: NativeMysqlConnection["config"],
   ) => Query;
-  const command = createQuery(options, undefined, undefined, native.config);
+  const command = createQuery(
+    {
+      ...options,
+      // mysql2's typeCast field exposes a string type name, not the numeric
+      // protocol code. Preserve raw WKB here too because bounded Query Editor
+      // reads use this callback-free streaming path.
+      typeCast: (field, next) =>
+        field.type === "GEOMETRY" ? field.buffer() : next(),
+    },
+    undefined,
+    undefined,
+    native.config,
+  );
   if (!command || typeof command !== "object")
     incompatible("unexpected callback-free Query shape");
   for (const method of [

@@ -4,6 +4,7 @@ import type { OperationCancellationContext } from "../../shared/safetyContracts"
 import type { ConnectionConfig } from "../connectionManager";
 import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
 import {
+  canonicalizeJsonNumericValues,
   isRawNumberToken,
   parseJsonPreservingRawNumbers,
 } from "../utils/jsonCanonical";
@@ -3106,6 +3107,13 @@ END;`,
     if (oracleTypeName(column.nativeType) === "XMLTYPE") {
       return `XMLSERIALIZE(CONTENT ${identifier} AS CLOB NO INDENT)`;
     }
+    if (oracleTypeName(column.nativeType) === "JSON") {
+      // Oracle's native JSON fetch path materializes JSON numbers as JS
+      // numbers. That silently rounds integers above Number.MAX_SAFE_INTEGER
+      // before the table viewer can display or edit them. Keep the server's
+      // serialized tokens by fetching JSON as text instead.
+      return `JSON_SERIALIZE(${identifier} RETURNING CLOB)`;
+    }
     if (column.category === "other" && column.objectAttributes?.length) {
       return `CASE WHEN ${identifier} IS NULL THEN NULL ELSE JSON_OBJECT(${identifier} RETURNING CLOB) END`;
     }
@@ -3303,6 +3311,9 @@ END;`,
         .join(" AND ");
     }
     const type = oracleTypeName(column.nativeType);
+    if (type === "JSON") {
+      return `JSON_EQUAL(${name}, :${paramIndex} ERROR ON ERROR)`;
+    }
     if (this.isDatetimeWithTime(column.nativeType)) {
       return `${name} = ${this.buildInsertValueExpr(column, paramIndex)}`;
     }
@@ -3328,6 +3339,15 @@ END;`,
     paramIndex: number,
     tableAlias?: string,
   ): MutationSqlExpression | null {
+    if (oracleTypeName(column.nativeType) === "JSON") {
+      const jsonColumn = tableAlias
+        ? `${this.quoteIdentifier(tableAlias)}.${this.quoteIdentifier(column.name)}`
+        : this.quoteIdentifier(column.name);
+      return {
+        sql: `JSON_EQUAL(${jsonColumn}, :${paramIndex} ERROR ON ERROR)`,
+        params: [value],
+      };
+    }
     if (oracleTypeName(column.nativeType) === "XMLTYPE") {
       return {
         sql: this.buildOriginalValueComparison(column, paramIndex),
@@ -3604,6 +3624,52 @@ END;`,
         ok: false,
         shouldVerify: true,
         message: `Oracle VARRAY column "${column.name}" did not match the requested value after it was read back.`,
+      };
+    }
+    if (oracleTypeName(column.nativeType) === "JSON") {
+      const isNull = expectedValue === null || expectedValue === NULL_SENTINEL;
+      if (isNull) {
+        return options === undefined || options.persistedValue === null
+          ? { ok: true, shouldVerify: true }
+          : {
+              ok: false,
+              shouldVerify: true,
+              message: `Oracle JSON column "${column.name}" did not preserve SQL NULL.`,
+            };
+      }
+      const canonicalize = (value: unknown): string | null => {
+        try {
+          const jsonText =
+            typeof value === "string"
+              ? value
+              : value !== null && typeof value === "object"
+                ? JSON.stringify(value)
+                : null;
+          return jsonText === undefined || jsonText === null
+            ? null
+            : canonicalizeJsonNumericValues(jsonText, {
+                requireUniqueKeys: true,
+              });
+        } catch {
+          return null;
+        }
+      };
+      const expected = canonicalize(expectedValue);
+      if (expected === null) {
+        return {
+          ok: false,
+          shouldVerify: false,
+          message: `Column "${column.name}" expects a valid Oracle JSON value.`,
+        };
+      }
+      if (options === undefined) return { ok: true, shouldVerify: true };
+      if (canonicalize(options.persistedValue) === expected) {
+        return { ok: true, shouldVerify: true };
+      }
+      return {
+        ok: false,
+        shouldVerify: true,
+        message: `Oracle JSON column "${column.name}" did not match the requested value after it was read back.`,
       };
     }
     const isNamedObject =

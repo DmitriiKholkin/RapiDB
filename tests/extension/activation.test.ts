@@ -38,6 +38,8 @@ describe("extension activation", () => {
   let connectionManagerInstance: Record<string, unknown>;
   let connectionProviderInstances: Array<{
     refresh: ReturnType<typeof vi.fn>;
+    markExplorerNodeExpanded: ReturnType<typeof vi.fn>;
+    markExplorerNodeCollapsed: ReturnType<typeof vi.fn>;
     disposable: { dispose(): void };
   }>;
   let connectionFormShow: ReturnType<typeof vi.fn>;
@@ -144,6 +146,8 @@ describe("extension activation", () => {
       const instance = {
         refresh: vi.fn(),
         refreshConnectionTree: vi.fn(),
+        markExplorerNodeExpanded: vi.fn(),
+        markExplorerNodeCollapsed: vi.fn(),
         markConnectionRootExpanded: vi.fn(),
         collapseAllConnectionRoots: vi.fn(),
         disposable: { dispose: vi.fn() },
@@ -388,6 +392,9 @@ describe("extension activation", () => {
       database: "app_db",
       schema: "public",
     });
+    expect(
+      connectionProviderInstances[0].markExplorerNodeExpanded,
+    ).toHaveBeenCalledTimes(4);
 
     explorerView.fireDidCollapseElement({
       kind: "database",

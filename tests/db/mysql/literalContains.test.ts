@@ -1,5 +1,13 @@
 import type { Pool, PoolConnection, RowDataPacket } from "mysql2/promise";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import { MySQLDriver } from "../../../src/extension/dbDrivers/mysql";
 import { TableReadService } from "../../../src/extension/table/tableReadService";
 import { resolveConnectionSeed } from "../../runtime/testRuntimeConfig";
@@ -12,11 +20,13 @@ describe.runIf(process.env.RAPIDB_LIVE_MYSQL_CONTAINS === "1")(
     let driver: MySQLDriver | undefined;
     let pool: Pool | undefined;
     let connection: PoolConnection | undefined;
+    let checkout: (() => Promise<PoolConnection>) | undefined;
     let service: TableReadService;
     let database: string;
     let configuredConnectionId: string;
     let originalMode: string | undefined;
-    let connectionId: number;
+    let modeForReads: string | undefined;
+    let observedModes: string[] = [];
     let tableCreated = false;
     const table = `rapidb_h1_contains_${process.pid}_${Date.now()}`;
     const samples: Array<string | null> = [
@@ -79,24 +89,14 @@ describe.runIf(process.env.RAPIDB_LIVE_MYSQL_CONTAINS === "1")(
         throw new Error("MySQL did not return the original SESSION sql_mode");
       }
       originalMode = session[0].mode;
-      connectionId = Number(session[0]?.id);
-      expect(Number.isFinite(connectionId)).toBe(true);
-
-      // Only pin routing, not SQL/results: metadata uses pool.query(), whereas
-      // COUNT/data use pool.getConnection() and the native mysql2 text protocol.
-      // Keep this real lease until cleanup so every path sees the same session.
-      vi.spyOn(connection, "release").mockImplementation(() => {});
-      vi.spyOn(pool, "getConnection").mockResolvedValue(connection);
-      vi.spyOn(pool, "query").mockImplementation(
-        connection.query.bind(connection),
-      );
+      checkout = pool.getConnection.bind(pool);
       const liveDriver = driver;
       service = new TableReadService({
         getConnection: () => config,
         getDriver: () => liveDriver,
       } as never);
 
-      await driver.query(
+      await connection.query(
         `CREATE TABLE \`${table}\` (\`id\` INT PRIMARY KEY, \`value\` VARCHAR(512) CHARACTER SET utf8mb4 NULL)`,
       );
       tableCreated = true;
@@ -108,6 +108,29 @@ describe.runIf(process.env.RAPIDB_LIVE_MYSQL_CONTAINS === "1")(
           [index + 1, value],
         );
       }
+    });
+
+    beforeEach(() => {
+      if (!pool || !checkout) throw new Error("MySQL pool was not initialized");
+      // Production deliberately discards arbitrary-query sessions. Initialize
+      // each real checkout instead of returning one already-destroyed lease.
+      const realCheckout = checkout;
+      vi.spyOn(pool, "getConnection").mockImplementation(async () => {
+        const lease = await realCheckout();
+        try {
+          if (modeForReads !== undefined) {
+            await lease.query("SET SESSION sql_mode = ?", [modeForReads]);
+            const [session] = await lease.query<RowDataPacket[]>(
+              "SELECT @@SESSION.sql_mode AS mode",
+            );
+            observedModes.push(String(session[0]?.mode));
+          }
+          return lease;
+        } catch (error) {
+          lease.destroy();
+          throw error;
+        }
+      });
     });
 
     afterAll(async () => {
@@ -134,14 +157,8 @@ describe.runIf(process.env.RAPIDB_LIVE_MYSQL_CONTAINS === "1")(
       }
       const query = vi.spyOn(driver, "query"); // Call through to the live server.
       try {
-        await connection.query("SET SESSION sql_mode = ?", [mode]);
-        const [session] = await connection.query<RowDataPacket[]>(
-          "SELECT @@SESSION.sql_mode AS mode, CONNECTION_ID() AS id",
-        );
-        expect(String(session[0]?.mode).split(",").sort()).toEqual(
-          mode.split(",").sort(),
-        );
-        expect(Number(session[0]?.id)).toBe(connectionId);
+        modeForReads = mode;
+        observedModes = [];
 
         for (const needle of needles) {
           query.mockClear();
@@ -176,20 +193,85 @@ describe.runIf(process.env.RAPIDB_LIVE_MYSQL_CONTAINS === "1")(
             ),
           ).toBe(true);
         }
-        const [sessionAfterReads] = await connection.query<RowDataPacket[]>(
-          "SELECT @@SESSION.sql_mode AS mode, CONNECTION_ID() AS id",
-        );
-        expect(String(sessionAfterReads[0]?.mode).split(",").sort()).toEqual(
-          mode.split(",").sort(),
-        );
-        expect(Number(sessionAfterReads[0]?.id)).toBe(connectionId);
+        expect(observedModes.length).toBeGreaterThanOrEqual(needles.length * 2);
+        for (const observed of observedModes)
+          expect(observed.split(",").sort()).toEqual(mode.split(",").sort());
       } finally {
+        modeForReads = undefined;
         query.mockRestore();
         await connection.query("SET SESSION sql_mode = ?", [originalMode]);
         const [restored] = await connection.query<RowDataPacket[]>(
           "SELECT @@SESSION.sql_mode AS mode",
         );
         expect(String(restored[0]?.mode)).toBe(originalMode);
+      }
+    });
+
+    it.each(
+      modes,
+    )("never matches replacement characters in legacy charsets under %s", async (mode) => {
+      if (!connection || originalMode === undefined) {
+        throw new Error("Live MySQL session was not initialized");
+      }
+      const legacyTable = `${table}_legacy`;
+      try {
+        modeForReads = mode;
+        observedModes = [];
+        await connection.query("SET SESSION sql_mode = ?", [mode]);
+        for (const charset of ["latin1", "utf8mb3"] as const) {
+          await connection.query(
+            `CREATE TABLE \`${legacyTable}\` (id INT PRIMARY KEY, value VARCHAR(80) CHARACTER SET ${charset} COLLATE ${charset}_general_ci)`,
+          );
+          try {
+            for (const [index, value] of [
+              "?",
+              "café",
+              "CAFÉ",
+              "100% done",
+              "snow?",
+            ].entries()) {
+              await connection.execute(
+                `INSERT INTO \`${legacyTable}\` (id, value) VALUES (?, ?)`,
+                [index + 1, value],
+              );
+            }
+            for (const [needle, expectedIds] of [
+              ["😀", []],
+              ["snow😀", []],
+              ["?", [1, 5]],
+              ["café", [2, 3]],
+              ["%", [4]],
+              ["_", []],
+            ] as const) {
+              const page = await service.getPage(
+                configuredConnectionId,
+                database,
+                database,
+                legacyTable,
+                1,
+                100,
+                [{ column: "value", operator: "like", value: needle }],
+                { column: "id", direction: "asc" },
+                false,
+              );
+              expect(
+                page.rows.map((row) => row.id),
+                `${charset}: ${needle}`,
+              ).toEqual(expectedIds);
+              expect(page.totalCount, `${charset}: ${needle}`).toBe(
+                expectedIds.length,
+              );
+            }
+          } finally {
+            await connection.query(`DROP TABLE \`${legacyTable}\``);
+          }
+        }
+        expect(observedModes.length).toBeGreaterThanOrEqual(24);
+        for (const observed of observedModes)
+          expect(observed.split(",").sort()).toEqual(mode.split(",").sort());
+      } finally {
+        modeForReads = undefined;
+        await connection.query("SET SESSION sql_mode = ?", [originalMode]);
       }
     });
   },

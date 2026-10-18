@@ -269,6 +269,21 @@ describe.runIf(live)("MongoDB integer mutation data safety (live BSON)", () => {
       },
       { ...base, nativeType },
     ];
+    const page = await driver.readTablePage({
+      database,
+      schema: "",
+      table,
+      page: 1,
+      pageSize: 25,
+      sort: { column: "_id", direction: "asc" },
+      filters: [],
+      skipCount: false,
+    });
+    expect(page.rows.map((row) => row._id)).toEqual(["one", "two"]);
+    expect(page.mongoValueTypes).toMatchObject([
+      { amount: { nativeType, category: "integer" } },
+      { amount: { nativeType, category: "integer" } },
+    ]);
     const updates = (values: string[]) =>
       values.map((amount, index) => ({
         primaryKeys: {
@@ -277,9 +292,10 @@ describe.runIf(live)("MongoDB integer mutation data safety (live BSON)", () => {
           },
         },
         changes: { amount },
+        originalTypes: page.mongoValueTypes?.[index],
       }));
-    expect(
-      await applyChangesTransactional(
+    await expect(
+      applyChangesTransactional(
         manager as never,
         config.id,
         database,
@@ -288,12 +304,12 @@ describe.runIf(live)("MongoDB integer mutation data safety (live BSON)", () => {
         updates([min, max]),
         columns,
       ),
-    ).toMatchObject({ success: true });
+    ).resolves.toMatchObject({ success: true });
     const saved = await collection.find().sort({ _id: 1 }).toArray();
     expect(saved.map((row) => row.amount.toString())).toEqual([min, max]);
     for (const row of saved) expect(row.amount).toBeInstanceOf(bsonType);
-    expect(
-      await applyChangesTransactional(
+    await expect(
+      applyChangesTransactional(
         manager as never,
         config.id,
         database,
@@ -302,7 +318,7 @@ describe.runIf(live)("MongoDB integer mutation data safety (live BSON)", () => {
         updates(["123", overflow]),
         columns,
       ),
-    ).toMatchObject({ success: false, failedRows: [1] });
+    ).rejects.toThrow(/out of range/);
     expect(
       (await collection.find().sort({ _id: 1 }).toArray()).map((row) =>
         row.amount.toString(),

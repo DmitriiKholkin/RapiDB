@@ -182,11 +182,11 @@ describe("QueryPanel", () => {
     "qp_701acb27-3ee6-4ff9-8424-477d65022fb2",
   ])("restores serialized query panel %s using retained webview state", async (panelId) => {
     const connectionManager = {
-      getConnection: vi.fn(() => ({
-        id: "conn-1",
-        name: "Primary",
-        type: "pg",
-      })),
+      getConnection: vi.fn((connectionId: string) =>
+        connectionId === "conn-2"
+          ? { id: "conn-2", name: "Secondary", type: "pg" }
+          : { id: "conn-1", name: "Primary", type: "pg" },
+      ),
       getQueryEditorPresentation: vi.fn(() => undefined),
       onDidSchemaLoad: vi.fn(() => ({ dispose: vi.fn() })),
       onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
@@ -218,12 +218,13 @@ describe("QueryPanel", () => {
       queryDraft: {
         panelId,
         text: "select 2",
-        activeConnectionId: "conn-1",
+        activeConnectionId: "conn-2",
       },
     });
 
     expect(panel.webview.html).toBe("<html></html>");
     expect(connectionManager.getConnection).toHaveBeenCalledWith("conn-1");
+    expect(panel.title).toBe("Query — Secondary");
     panel.dispose();
     QueryPanel.createOrShow(
       { extensionUri: {} } as never,
@@ -231,6 +232,52 @@ describe("QueryPanel", () => {
       "conn-1",
     );
     expect(vscodeMock.createWebviewPanel).toHaveBeenCalledTimes(2);
+    QueryPanel.disposeAll();
+  });
+
+  it("opens a new query when a restored panel has switched away from the requested connection", async () => {
+    const connectionManager = {
+      getConnection: vi.fn((connectionId: string) =>
+        connectionId === "conn-2"
+          ? { id: "conn-2", name: "Secondary", type: "pg" }
+          : { id: "conn-1", name: "Primary", type: "pg" },
+      ),
+      getQueryEditorPresentation: vi.fn(() => undefined),
+      onDidSchemaLoad: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+      getConnections: vi.fn(() => []),
+    };
+    const context = { extensionUri: {} } as never;
+    const { QueryPanel } = await import(
+      "../../src/extension/panels/queryPanel"
+    );
+    QueryPanel.disposeAll();
+    QueryPanel.registerSerializer(context, connectionManager as never);
+    const serializer = vscodeMock.serializers.get("rapidb.queryPanel") as {
+      deserializeWebviewPanel(panel: unknown, state: unknown): Promise<void>;
+    };
+    const restoredPanel = vscodeMock.createWebviewPanel();
+    await serializer.deserializeWebviewPanel(restoredPanel, {
+      initialState: {
+        view: "query",
+        panelId: "qp_101",
+        connectionId: "conn-1",
+        queryText: "select 1",
+      },
+      queryDraft: {
+        panelId: "qp_101",
+        text: "select 2",
+        activeConnectionId: "conn-2",
+      },
+    });
+
+    QueryPanel.createOrShow(context, connectionManager as never, "conn-1");
+
+    expect(restoredPanel.reveal).not.toHaveBeenCalled();
+    expect(vscodeMock.createWebviewPanel).toHaveBeenCalledTimes(2);
+    expect(restoredPanel.title).toBe("Query — Secondary");
     QueryPanel.disposeAll();
   });
 
@@ -472,6 +519,11 @@ describe("QueryPanel", () => {
       type: "schema",
       payload: { connectionId: "conn-1", schema: [] },
     });
+    // Removing the saved profile cannot relabel the draft as another database.
+    connectionManager.getConnection.mockReturnValue(undefined as never);
+    connectionManager.getConnections.mockReturnValue([]);
+    disconnectListener?.();
+    expect(panel.title).toBe("Query — Select a connection");
   });
 
   it("pushes incremental shared-cache schema updates and refresh reloads into the webview", async () => {

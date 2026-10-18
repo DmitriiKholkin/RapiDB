@@ -1,4 +1,4 @@
-import React from "react";
+import type React from "react";
 import type { ConnectionEntry, QueryStatus } from "../../store";
 import { queryRunShortcutLabel } from "../../utils/platform";
 import { Icon } from "../Icon";
@@ -44,6 +44,7 @@ export function QueryToolbar({
   onFormat,
   onRun,
 }: QueryToolbarProps): React.ReactElement {
+  const noConnection = !selectedConnectionId;
   const runDisabled = status === "running" || !selectedConnectionId;
   const bookmarkDisabled = bookmarked || bookmarking || !selectedConnectionId;
   return (
@@ -52,19 +53,26 @@ export function QueryToolbar({
         aria-label="Active connection"
         style={querySelectStyle}
         value={selectedConnectionId}
-        disabled={!selectedConnectionId}
+        disabled={connections.length === 0 && !selectedConnectionId}
         onChange={(event) => onConnectionChange(event.target.value)}
       >
         {connections.length === 0 ? (
           <option value={selectedConnectionId}>
-            {selectedConnectionId ? connectionId : "No connections available"}
+            {selectedConnectionId ? connectionId : "—"}
           </option>
         ) : (
-          connections.map((connection) => (
-            <option key={connection.id} value={connection.id}>
-              {connection.name} ({connection.type})
-            </option>
-          ))
+          <>
+            {!selectedConnectionId && (
+              <option value="" disabled>
+                —
+              </option>
+            )}
+            {connections.map((connection) => (
+              <option key={connection.id} value={connection.id}>
+                {connection.name} ({connection.type})
+              </option>
+            ))}
+          </>
         )}
       </select>
 
@@ -103,7 +111,8 @@ export function QueryToolbar({
 
       <button
         type="button"
-        style={buildQueryGhostButtonStyle(false)}
+        style={buildQueryGhostButtonStyle(noConnection)}
+        disabled={noConnection}
         onClick={onClear}
         title="Clear query"
       >
@@ -113,8 +122,8 @@ export function QueryToolbar({
 
       <button
         type="button"
-        style={buildQueryGhostButtonStyle(!canFormat)}
-        disabled={!canFormat}
+        style={buildQueryGhostButtonStyle(noConnection || !canFormat)}
+        disabled={noConnection || !canFormat}
         onClick={onFormat}
         title={formatButtonTitle}
       >

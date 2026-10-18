@@ -365,7 +365,20 @@ export class QueryPanelController {
         logger.error("Failed to save query history", error);
       });
 
+    const driverCapabilities =
+      this.connectionManager.getDriverCapabilities?.(connectionId);
+    const schemaDialect: QueryEditorSqlDialect =
+      driverCapabilities?.editorPresentation?.sqlDialect ??
+      (connectionType
+        ? CONNECTION_TYPE_TO_SCHEMA_DIALECT[connectionType]
+        : "sql");
+    const changesDiscoverableSchema =
+      driverCapabilities?.schemaMutationGuard?.(cappedQueryText) ??
+      mayChangeDatabaseSchema(cappedQueryText, schemaDialect);
+    let queryStarted = false;
+
     try {
+      queryStarted = true;
       const result = await driver.query(cappedQueryText, undefined, {
         requestToken,
         ...(driverBounded ? { hardCap: hardCapProbeLimit } : {}),
@@ -382,15 +395,6 @@ export class QueryPanelController {
       // (for example, while Oracle releases its session). Trust query()'s
       // successful outcome, including schema invalidation, rather than Stop.
       const formattedResult = formatQueryResult(result, effectiveRowLimit);
-      const schemaDialect: QueryEditorSqlDialect =
-        this.connectionManager.getDriverCapabilities?.(connectionId)
-          ?.editorPresentation?.sqlDialect ??
-        (connectionType
-          ? CONNECTION_TYPE_TO_SCHEMA_DIALECT[connectionType]
-          : "sql");
-      if (mayChangeDatabaseSchema(cappedQueryText, schemaDialect)) {
-        this.connectionManager.refreshSchemaCache(connectionId);
-      }
 
       this.view.setLastQueryResult({
         columns: formattedResult.columns,
@@ -423,6 +427,12 @@ export class QueryPanelController {
       }
       this.postQueryError(normalized.message, requestToken, resultIdentity);
     } finally {
+      // Native scripts can apply earlier statements before a later statement
+      // fails, so refresh after every attempted schema-changing query even if
+      // its final outcome is an error or cancellation.
+      if (queryStarted && changesDiscoverableSchema) {
+        this.connectionManager.refreshSchemaCache(connectionId);
+      }
       const active = this.activeQueryExecutions.get(connectionId);
       if (active?.requestToken === requestToken) {
         active.finish?.();

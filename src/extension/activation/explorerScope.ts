@@ -19,6 +19,7 @@ export function getExplorerSchemaScopeForNode(
 
   if (
     node.kind === "connectionNode_connected" ||
+    node.kind === "connectionNode_connecting" ||
     node.kind === "connectionNode_disconnected"
   ) {
     return { kind: "connectionRoot" };
@@ -42,10 +43,11 @@ export function getExplorerSchemaScopeForNode(
   return undefined;
 }
 
-/** True when a node represents a connection root (connected or not). */
+/** True when a node represents a connection root, including while connecting. */
 export function isConnectionRootNode(node: RapiDBNode | undefined): boolean {
   return (
     node?.kind === "connectionNode_connected" ||
+    node?.kind === "connectionNode_connecting" ||
     node?.kind === "connectionNode_disconnected"
   );
 }

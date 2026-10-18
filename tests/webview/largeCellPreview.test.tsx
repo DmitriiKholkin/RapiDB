@@ -59,6 +59,25 @@ function expectBoundedMeasurements() {
 }
 
 describe("large cell rendering", () => {
+  it("renders absent table attributes separately from explicit NULL", () => {
+    const { rerender } = render(
+      <CellDisplay
+        value={undefined}
+        isMissing
+        category="other"
+        isPending={false}
+      />,
+    );
+
+    expect(screen.getByText("MISSING")).toBeDefined();
+    expect(screen.queryByText("NULL")).toBeNull();
+
+    rerender(<CellDisplay value={null} category="other" isPending={false} />);
+
+    expect(screen.getByText("NULL")).toBeDefined();
+    expect(screen.queryByText("MISSING")).toBeNull();
+  });
+
   it.each([
     "lob",
     "text",

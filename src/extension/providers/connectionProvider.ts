@@ -365,6 +365,10 @@ export class ConnectionProvider
   private readonly _subscriptions: vscode.Disposable[] = [];
   private readonly _connectionNodes = new Map<string, RapiDBNode>();
   private readonly _expandedConnectionRoots = new Set<string>();
+  private readonly _expandedDescendantNodes = new Map<
+    string,
+    Map<string, RapiDBNode>
+  >();
   private readonly _pendingConnectionRefreshIds = new Set<string>();
   private _refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private _refreshAllPending = false;
@@ -454,16 +458,64 @@ export class ConnectionProvider
 
   refreshConnectionTree(connectionId?: string): void {
     if (!connectionId) {
-      // Refresh each connection subtree individually so VS Code preserves
-      // the expanded state of deeper nodes (databases, schemas, tables,
-      // table sections, columns) that still exist after refresh.
-      for (const node of this._connectionNodes.values()) {
-        this.refresh(node);
+      // VS Code refreshes the children of the changed element, not every
+      // expanded descendant below it. Refresh each tracked expanded node too
+      // so DDL changes become visible without requiring users to collapse and
+      // reopen every database/schema/table in the tree.
+      const connectionIds = new Set([
+        ...this._connectionNodes.keys(),
+        ...this._expandedDescendantNodes.keys(),
+      ]);
+      if (connectionIds.size === 0) {
+        this.refresh();
+        return;
+      }
+      for (const expandedConnectionId of connectionIds) {
+        this.refreshConnectionSubtree(expandedConnectionId);
       }
       return;
     }
 
-    this.refresh(this._connectionNodes.get(connectionId));
+    this.refreshConnectionSubtree(connectionId);
+  }
+
+  markExplorerNodeExpanded(node: RapiDBNode): void {
+    if (
+      node.kind === "folder" ||
+      node.kind === "connectionNode_connected" ||
+      node.kind === "connectionNode_connecting" ||
+      node.kind === "connectionNode_disconnected" ||
+      !node.id
+    ) {
+      return;
+    }
+
+    let expandedNodes = this._expandedDescendantNodes.get(node.connectionId);
+    if (!expandedNodes) {
+      expandedNodes = new Map<string, RapiDBNode>();
+      this._expandedDescendantNodes.set(node.connectionId, expandedNodes);
+    }
+    expandedNodes.set(node.id, node);
+  }
+
+  markExplorerNodeCollapsed(node: RapiDBNode): void {
+    if (
+      node.kind === "folder" ||
+      node.kind === "connectionNode_connected" ||
+      node.kind === "connectionNode_connecting" ||
+      node.kind === "connectionNode_disconnected"
+    ) {
+      return;
+    }
+
+    const expandedNodes = this._expandedDescendantNodes.get(node.connectionId);
+    if (!expandedNodes || !node.id) {
+      return;
+    }
+    expandedNodes.delete(node.id);
+    if (expandedNodes.size === 0) {
+      this._expandedDescendantNodes.delete(node.connectionId);
+    }
   }
 
   markConnectionRootExpanded(connectionId: string, expanded: boolean): void {
@@ -473,6 +525,16 @@ export class ConnectionProvider
     }
 
     this._expandedConnectionRoots.delete(connectionId);
+    this._expandedDescendantNodes.delete(connectionId);
+  }
+
+  private refreshConnectionSubtree(connectionId: string): void {
+    this.refresh(this._connectionNodes.get(connectionId));
+    for (const node of this._expandedDescendantNodes
+      .get(connectionId)
+      ?.values() ?? []) {
+      this.refresh(node);
+    }
   }
 
   collapseAllConnectionRoots(): void {
@@ -1125,6 +1187,16 @@ export class ConnectionProvider
     for (const connectionId of this._connectionNodes.keys()) {
       if (!liveConnectionIds.has(connectionId)) {
         this._connectionNodes.delete(connectionId);
+      }
+    }
+    for (const connectionId of this._expandedConnectionRoots) {
+      if (!liveConnectionIds.has(connectionId)) {
+        this._expandedConnectionRoots.delete(connectionId);
+      }
+    }
+    for (const connectionId of this._expandedDescendantNodes.keys()) {
+      if (!liveConnectionIds.has(connectionId)) {
+        this._expandedDescendantNodes.delete(connectionId);
       }
     }
   }

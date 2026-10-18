@@ -7,6 +7,7 @@ import {
 } from "react";
 import {
   type ColumnTypeMeta as ColumnMeta,
+  type MongoValueTypeHint,
   NULL_SENTINEL,
 } from "../../../shared/tableTypes";
 import type {
@@ -67,6 +68,9 @@ interface UseTableMutationControllerParams {
   preserveScrollPositionRef: MutableRefObject<() => void>;
   rowsRef: MutableRefObject<Row[]>;
   mongoIdTypesRef: MutableRefObject<Array<"objectId" | "string" | null>>;
+  mongoValueTypesRef: MutableRefObject<
+    Array<Record<string, MongoValueTypeHint>>
+  >;
   selected: ReadonlySet<number>;
 }
 
@@ -103,6 +107,7 @@ export function useTableMutationController({
   preserveScrollPositionRef,
   rowsRef,
   mongoIdTypesRef,
+  mongoValueTypesRef,
   selected,
 }: UseTableMutationControllerParams) {
   const [pendingEdits, setPending] = useState<PendingEdits>(new Map());
@@ -323,9 +328,22 @@ export function useTableMutationController({
             rowsRef.current[rowIdx][columnName],
           ]),
         ),
+        ...(mongoRowIdentity
+          ? {
+              originalTypes: Object.fromEntries(
+                [...columnMap.keys()].map((columnName) => [
+                  columnName,
+                  mongoValueTypesRef.current[rowIdx]?.[columnName] ?? {
+                    category: "other",
+                    nativeType: "missing",
+                  },
+                ]),
+              ),
+            }
+          : {}),
       }));
     },
-    [pkColsRef, rowsRef, mongoIdTypesRef, mongoRowIdentity],
+    [pkColsRef, rowsRef, mongoIdTypesRef, mongoValueTypesRef, mongoRowIdentity],
   );
 
   const clearApplyRequestState = useCallback(() => {

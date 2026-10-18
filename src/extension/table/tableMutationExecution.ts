@@ -245,9 +245,27 @@ export function prepareApplyChangesPlan(
     );
     const skippedRows = new Set<number>();
     const coercedUpdates = updates.map((update, rowIndex) => {
+      const rowColumnMetaByName = new Map(columnMetaByName);
+      // MongoDB's inferred column metadata is collection-wide. Use the
+      // committed row's BSON type for both the edit and its optimistic guard.
+      if (driver.getCapabilities?.().tabularRead === "nosql") {
+        for (const [name, hint] of Object.entries(update.originalTypes ?? {})) {
+          // Null and undefined have no scalar BSON type to preserve for a new
+          // value. Keep the collection's inferred column type for that edit.
+          if (
+            hint.nativeType === "null" ||
+            hint.nativeType === "undefined" ||
+            hint.nativeType === "missing"
+          ) {
+            continue;
+          }
+          const column = rowColumnMetaByName.get(name);
+          if (column) rowColumnMetaByName.set(name, { ...column, ...hint });
+        }
+      }
       const writableChanges = filterWritableRecord(
         update.changes,
-        columnMetaByName,
+        rowColumnMetaByName,
       );
       if (Object.keys(writableChanges).length === 0) {
         skippedRows.add(rowIndex);
@@ -256,12 +274,32 @@ export function prepareApplyChangesPlan(
         primaryKeys:
           primaryKeysByRow[rowIndex] ??
           coerceRecord(driver, update.primaryKeys, columnMetaByName),
-        changes: coerceRecord(driver, writableChanges, columnMetaByName),
+        changes: Object.fromEntries(
+          Object.entries(writableChanges).map(([name, value]) => {
+            const column = rowColumnMetaByName.get(name);
+            const rowTypeHint = update.originalTypes?.[name];
+            const hasRowTypeHint =
+              rowTypeHint !== undefined &&
+              rowTypeHint.nativeType !== "null" &&
+              rowTypeHint.nativeType !== "undefined" &&
+              rowTypeHint.nativeType !== "missing";
+            return [
+              name,
+              column
+                ? driver.coerceTableEditValue
+                  ? driver.coerceTableEditValue(value, column, {
+                      preserveNativeType: hasRowTypeHint,
+                    })
+                  : driver.coerceInputValue(value, column)
+                : value,
+            ];
+          }),
+        ),
         ...(update.originalValues
           ? {
               originalValues: Object.fromEntries(
                 Object.entries(update.originalValues).map(([name, value]) => {
-                  const column = columnMetaByName.get(name);
+                  const column = rowColumnMetaByName.get(name);
                   return [
                     name,
                     column
@@ -273,6 +311,9 @@ export function prepareApplyChangesPlan(
                 }),
               ),
             }
+          : {}),
+        ...(update.originalTypes
+          ? { originalTypes: update.originalTypes }
           : {}),
       };
     });
@@ -302,7 +343,7 @@ export function prepareApplyChangesPlan(
         updates: coercedUpdates,
         operations: [],
         previewStatements: executableUpdates.map(
-          ({ primaryKeys, changes, originalValues }) =>
+          ({ primaryKeys, changes, originalValues, originalTypes }) =>
             driver.buildMutationPreviewStatement
               ? driver.buildMutationPreviewStatement(
                   "update",
@@ -313,6 +354,7 @@ export function prepareApplyChangesPlan(
                     primaryKeys,
                     changes,
                     originalValues,
+                    originalTypes,
                   },
                 )
               : `UPDATE ${driver.qualifiedTableName(database, schema, table)} ${JSON.stringify({ primaryKeys, changes, originalValues })}`,
@@ -475,6 +517,9 @@ export async function executePreparedApplyPlan(
           changes: update.changes,
           ...(update.originalValues
             ? { originalValues: update.originalValues }
+            : {}),
+          ...(update.originalTypes
+            ? { originalTypes: update.originalTypes }
             : {}),
         })),
       });

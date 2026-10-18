@@ -16,6 +16,33 @@ import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
 
+describe("MongoDB discoverable schema changes", () => {
+  it.each([
+    ['db.items.find({label:"create"}).sort({_id:1})', true],
+    ['db.items.aggregate([{$match:{label:"drop"}}])', true],
+    ["db.items.countDocuments({})", true],
+    ["db.getCollectionNames()", true],
+    ['db.createCollection("new_items")', true],
+    ['db.items.insertOne({_id:"new"})', true],
+    ['db.items.insertMany([{_id:"new"}])', true],
+    ['db.items.updateOne({_id:"new"},{$set:{flag:true}},{upsert:true})', true],
+    ["db.items.createIndex({flag:1})", true],
+    ['db.items.aggregate([{$out:"new_items"}])', true],
+    ['db.runCommand({drop:"items"})', true],
+    ['db.items.insertOne({_id:"new"});db.items.unsupported()', true],
+    ['db.items.insertOne({_id:"new"});{', true],
+    ['db.items[Math.random()<0.5?"find":"insertOne"]({label:"demo"})', true],
+    ["while(true){}", true],
+  ])("classifies %s without executing any database operation", (text, expected) => {
+    const driver = new MongoDBDriver({
+      id: "schema",
+      name: "QA",
+      type: "mongodb",
+    });
+    expect(driver.getCapabilities().schemaMutationGuard(text)).toBe(expected);
+  });
+});
+
 function createMockDriver() {
   const driver = new MongoDBDriver({
     id: "test",

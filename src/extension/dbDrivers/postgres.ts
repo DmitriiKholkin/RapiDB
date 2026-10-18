@@ -1124,6 +1124,7 @@ export class PostgresDriver extends BaseDBDriver {
     type DescribeTableRow = {
       column_name: string;
       data_type: string;
+      range_subtype: string | null;
       is_nullable: boolean | number | string;
       column_default: string | null;
       generated_kind: string | null;
@@ -1143,6 +1144,10 @@ export class PostgresDriver extends BaseDBDriver {
                   pg_catalog.format_type(element_type.oid, a.atttypmod))
            ELSE pg_catalog.format_type(a.atttypid, a.atttypmod)
          END                                      AS data_type,
+         CASE
+           WHEN range_subtype_type.oid IS NOT NULL
+           THEN pg_catalog.format('%I.%I', range_subtype_ns.nspname, range_subtype_type.typname)
+         END                                      AS range_subtype,
          NOT a.attnotnull                         AS is_nullable,
          pg_get_expr(d.adbin, d.adrelid)         AS column_default,
           ${PG_GENERATED_KIND_EXPRESSION}           AS generated_kind,
@@ -1161,6 +1166,11 @@ export class PostgresDriver extends BaseDBDriver {
        LEFT JOIN pg_catalog.pg_type array_type ON array_type.oid = a.atttypid
        LEFT JOIN pg_catalog.pg_type element_type ON element_type.oid = array_type.typelem
        LEFT JOIN pg_catalog.pg_namespace element_ns ON element_ns.oid = element_type.typnamespace
+       LEFT JOIN pg_catalog.pg_range range_meta
+         ON range_meta.rngtypid = a.atttypid
+         OR (pg_catalog.to_jsonb(range_meta)->>'rngmultitypid') = a.atttypid::text
+       LEFT JOIN pg_catalog.pg_type range_subtype_type ON range_subtype_type.oid = range_meta.rngsubtype
+       LEFT JOIN pg_catalog.pg_namespace range_subtype_ns ON range_subtype_ns.oid = range_subtype_type.typnamespace
        LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
        LEFT JOIN LATERAL (
          SELECT pk_key.ordinality::int AS pk_ordinal
@@ -1197,6 +1207,10 @@ export class PostgresDriver extends BaseDBDriver {
       return {
         name: r.column_name as string,
         type: r.data_type as string,
+        rangeSubtype:
+          typeof r.range_subtype === "string" && r.range_subtype.trim() !== ""
+            ? r.range_subtype
+            : undefined,
         nullable: isPgTrue(r.is_nullable),
         defaultValue,
         identityGeneration,
@@ -2723,6 +2737,20 @@ export class PostgresDriver extends BaseDBDriver {
     if (preamble.kind === "resolved") return preamble.condition;
     const col = preamble.columnSql;
     const val = preamble.value;
+    if (
+      column.rangeSubtype &&
+      (operator === "like" || operator === "ilike") &&
+      typeof val === "string"
+    ) {
+      const subtypeValue = val.trim();
+      if (!subtypeValue) {
+        return null;
+      }
+      return {
+        sql: `${col} @> $${paramIndex}::${column.rangeSubtype}`,
+        params: [subtypeValue],
+      };
+    }
     if (column.category === "array") {
       if (operator !== "like" && operator !== "ilike") {
         return null;

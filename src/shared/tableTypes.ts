@@ -254,6 +254,8 @@ export type PrimaryKeyRole = "partition" | "sort";
 export interface ColumnMeta {
   name: string;
   type: string;
+  /** PostgreSQL range or multirange subtype used for native containment filters. */
+  rangeSubtype?: string;
   /** Oracle collection catalog details used by typed filters and mutations. */
   collectionKind?: "varray" | "nestedTable";
   collectionElementType?: string;
@@ -266,7 +268,8 @@ export interface ColumnMeta {
   /** Catalog-resolved underlying SQL type for aliases, including size/precision.
    * The declared type remains in `type` for display. */
   baseType?: string;
-  /** SQL Server character storage collation, needed for lossless OUTPUT INTO. */
+  /** Catalog character encoding and collation used when a driver must preserve them. */
+  characterSet?: string;
   collation?: string;
   nullable: boolean;
   defaultValue?: string;
@@ -291,6 +294,13 @@ export interface ColumnTypeMeta extends ColumnMeta {
   filterable: boolean;
   filterOperators: FilterOperator[];
   valueSemantics: ValueSemantics;
+}
+
+/** Per-row BSON type for schema-less collections whose fields can vary by row. */
+export interface MongoValueTypeHint {
+  category: TypeCategory;
+  nativeType: string;
+  bsonSubtype?: number;
 }
 
 /** True for columns whose values are computed by the database, not identities/defaults. */

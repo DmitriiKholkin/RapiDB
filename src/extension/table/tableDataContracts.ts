@@ -1,6 +1,7 @@
 import type { ApplyResultPayload } from "../../shared/webviewContracts";
 import type {
   ColumnTypeMeta,
+  MongoValueTypeHint,
   TransactionOperation,
   TransactionVerification,
 } from "../dbDrivers/types";
@@ -14,6 +15,7 @@ export interface TablePage {
   columns: ColumnTypeMeta[];
   rows: Record<string, unknown>[];
   mongoIdTypes?: Array<"objectId" | "string" | null>;
+  mongoValueTypes?: Array<Record<string, MongoValueTypeHint>>;
   totalCount: number;
   executionTimeMs?: number;
 }
@@ -22,6 +24,7 @@ export interface RowUpdate {
   primaryKeys: Record<string, unknown>;
   changes: Record<string, unknown>;
   originalValues?: Record<string, unknown>;
+  originalTypes?: Record<string, MongoValueTypeHint>;
 }
 
 export type ApplyResult = ApplyResultPayload;

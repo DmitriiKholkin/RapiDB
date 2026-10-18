@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { serializeArrayPreservingRawTokens } from "../../src/extension/utils/arraySerialization";
 import {
+  canonicalizeJsonNumericValues,
   canonicalizeJsonPreservingRawNumbers,
   isRawNumberToken,
   parseJsonPreservingRawNumbers,
@@ -138,6 +139,31 @@ describe("canonicalizeJsonPreservingRawNumbers", () => {
       '{"arr":[13000.0,42.5]}',
     );
     expect(canonical).toBe('{"arr":[13000.0,42.5]}');
+  });
+});
+
+describe("canonicalizeJsonNumericValues", () => {
+  it("ignores equivalent decimal spellings without rounding large numbers", () => {
+    expect(
+      canonicalizeJsonNumericValues(
+        '{"a":1,"b":1.0,"c":1e0,"d":-0,"e":1.2300,"big":9007199254740993}',
+      ),
+    ).toBe(
+      '{"a":1e0,"b":1e0,"big":9007199254740993e0,"c":1e0,"d":0,"e":123e-2}',
+    );
+    expect(
+      canonicalizeJsonNumericValues('{"n":9007199254740993}') ===
+        canonicalizeJsonNumericValues('{"n":9007199254740992}'),
+    ).toBe(false);
+  });
+
+  it("can reject duplicate object keys when the target JSON type requires unique keys", () => {
+    expect(canonicalizeJsonNumericValues('{"x":1,"x":2}')).toBe('{"x":2e0}');
+    expect(
+      canonicalizeJsonNumericValues('{"x":1,"x":2}', {
+        requireUniqueKeys: true,
+      }),
+    ).toBeNull();
   });
 });
 

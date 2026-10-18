@@ -1175,6 +1175,9 @@ function TableDataGrid({
               <div title={getRowMutationBlockReason?.(rowIdx) ?? undefined}>
                 <CellDisplay
                   value={displayValue}
+                  isMissing={
+                    !hasPending && !Object.hasOwn(row.original, column.name)
+                  }
                   isPending={hasPending}
                   category={column.category}
                   nativeType={column.nativeType}

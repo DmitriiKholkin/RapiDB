@@ -61,6 +61,7 @@ import type {
   FilterOperator,
   IDBDriver,
   IndexMeta,
+  MongoValueTypeHint,
   PaginationResult,
   QueryExecutionOptions,
   QueryResult,
@@ -69,7 +70,11 @@ import type {
   TransactionOperation,
   TypeCategory,
 } from "./types";
-import { NULL_SENTINEL, resolveFilterOperators } from "./types";
+import {
+  filterOperatorsForCategory,
+  NULL_SENTINEL,
+  resolveFilterOperators,
+} from "./types";
 import {
   completeDriverUpdateRowsResult,
   failedDriverUpdateRows,
@@ -110,6 +115,8 @@ type MongoshOperation = {
 };
 
 const MONGO_SCALAR_MISS = Symbol("mongo-scalar-miss");
+const MONGO_NUMERIC_LITERAL_RE =
+  /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i;
 const MONGO_CLIENT_SIDE_LIKE_NATIVE_TYPES = new Set([
   "objectId",
   "javascript",
@@ -615,16 +622,150 @@ function coerceMongoIntegerValue(
     : Long.fromString(integer.toString());
 }
 
-function unwrapQuotedMongoDisplay(value: string): string {
-  const trimmed = value.trim();
-  if (trimmed.length >= 2) {
-    const first = trimmed[0];
-    const last = trimmed[trimmed.length - 1];
-    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
-      return trimmed.slice(1, -1);
+function coerceMongoNumericInput(
+  value: string,
+  column: ColumnTypeMeta,
+): unknown {
+  if (!MONGO_NUMERIC_LITERAL_RE.test(value)) {
+    return value;
+  }
+
+  if (isMongoIntegerType(column.nativeType)) {
+    if (!/^[+-]?\d+$/.test(value)) {
+      return Decimal128.fromString(value);
+    }
+    try {
+      return coerceMongoIntegerValue(value, column, true);
+    } catch {
+      // A schema-less field may contain a Decimal128 beyond the sampled
+      // Int32/Long range. Keep the edit numeric when the full value fits BSON.
+      return Decimal128.fromString(value);
     }
   }
+
+  if (column.nativeType === "double" || column.nativeType === "number") {
+    const numeric = Number(value);
+    if (
+      Number.isFinite(numeric) &&
+      compareNumericTokens(value, String(numeric)) === 0
+    ) {
+      return numeric;
+    }
+    // JavaScript numbers cannot represent every BSON numeric value. Use
+    // Decimal128 when the input overflows Double or loses decimal precision.
+    return Decimal128.fromString(value);
+  }
+
+  return value;
+}
+
+function unwrapQuotedMongoDisplay(value: string): string {
+  const trimmed = value.trim();
+  if (isQuotedMongoString(trimmed)) {
+    return trimmed.slice(1, -1);
+  }
   return trimmed;
+}
+
+function isQuotedMongoString(value: string): boolean {
+  const trimmed = value.trim();
+  if (trimmed.length < 2) return false;
+  const first = trimmed[0];
+  const last = trimmed[trimmed.length - 1];
+  return (first === '"' && last === '"') || (first === "'" && last === "'");
+}
+
+function parseExplicitMongoFilterString(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!isQuotedMongoString(trimmed)) return undefined;
+
+  const quote = trimmed[0];
+  if (quote === '"') {
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (typeof parsed === "string") return parsed;
+    } catch {
+      // Report malformed string syntax consistently with the single-quoted
+      // parser below.
+    }
+    throw new Error("Invalid quoted MongoDB filter string.");
+  }
+
+  let result = "";
+  for (let index = 1; index < trimmed.length - 1; index++) {
+    const char = trimmed[index];
+    if (char === quote) {
+      throw new Error("Invalid quoted MongoDB filter string.");
+    }
+    if (char !== "\\") {
+      result += char;
+      continue;
+    }
+
+    index++;
+    if (index >= trimmed.length - 1) {
+      throw new Error("Invalid quoted MongoDB filter string.");
+    }
+    const escaped = trimmed[index];
+    if (escaped === "\n") continue;
+    if (escaped === "\r") {
+      if (trimmed[index + 1] === "\n") index++;
+      continue;
+    }
+    if (escaped === "\u2028" || escaped === "\u2029") continue;
+    const simpleEscapes: Record<string, string> = {
+      "\\": "\\",
+      "'": "'",
+      '"': '"',
+      "/": "/",
+      b: "\b",
+      f: "\f",
+      n: "\n",
+      r: "\r",
+      t: "\t",
+      v: "\v",
+    };
+    if (Object.hasOwn(simpleEscapes, escaped)) {
+      result += simpleEscapes[escaped];
+      continue;
+    }
+    if (escaped === "0") {
+      if (/\d/.test(trimmed[index + 1] ?? "")) {
+        throw new Error("Invalid quoted MongoDB filter string.");
+      }
+      result += "\0";
+      continue;
+    }
+    if (escaped === "u" && trimmed[index + 1] === "{") {
+      const end = trimmed.indexOf("}", index + 2);
+      const hex = end < 0 ? "" : trimmed.slice(index + 2, end);
+      const codePoint = Number.parseInt(hex, 16);
+      if (
+        end < 0 ||
+        end >= trimmed.length - 1 ||
+        !/^[0-9a-fA-F]+$/.test(hex) ||
+        !Number.isSafeInteger(codePoint) ||
+        codePoint > 0x10ffff
+      ) {
+        throw new Error("Invalid quoted MongoDB filter string.");
+      }
+      result += String.fromCodePoint(codePoint);
+      index = end;
+      continue;
+    }
+    const hexLength = escaped === "u" ? 4 : escaped === "x" ? 2 : 0;
+    if (hexLength > 0) {
+      const hex = trimmed.slice(index + 1, index + 1 + hexLength);
+      if (!new RegExp(`^[0-9a-fA-F]{${hexLength}}$`).test(hex)) {
+        throw new Error("Invalid quoted MongoDB filter string.");
+      }
+      result += String.fromCharCode(Number.parseInt(hex, 16));
+      index += hexLength;
+      continue;
+    }
+    throw new Error("Invalid quoted MongoDB filter string.");
+  }
+  return result;
 }
 
 function binarySubtypeFromNativeType(nativeType: string): number {
@@ -871,6 +1012,19 @@ function bsonBinarySubtype(value: unknown): number | undefined {
   }
   const subtype = (value as { sub_type?: unknown }).sub_type;
   return typeof subtype === "number" ? subtype : undefined;
+}
+
+function setOwnMongoRecordField(
+  record: Record<string, unknown>,
+  field: string,
+  value: unknown,
+): void {
+  Object.defineProperty(record, field, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
 }
 
 function bsonBinaryBytes(value: unknown): Buffer | null {
@@ -1305,6 +1459,9 @@ export class MongoDBDriver implements IDBDriver {
       queryMode: "text" as const,
       supportsMutations: true,
       readOnlyQueryGuard: decideMongoReadOnlyQuery,
+      // Mongosh can choose operations dynamically. Re-evaluating the source to
+      // classify it can disagree with execution, so refresh after every attempt.
+      schemaMutationGuard: (_queryText: string) => true,
       editorPresentation: {
         formatOnOpen: false,
         editorLanguage: "javascript" as const,
@@ -1914,6 +2071,7 @@ export class MongoDBDriver implements IDBDriver {
           mongoIdTypes: rows.map(
             (row) => this.tableRowIdTypes.get(row) ?? null,
           ),
+          mongoValueTypes: rows.map((row) => this.getTableRowValueTypes(row)),
           totalCount,
           executionTimeMs: Math.round(performance.now() - startTime),
         };
@@ -2000,6 +2158,7 @@ export class MongoDBDriver implements IDBDriver {
       columns: comparisonColumns,
       rows: paged,
       mongoIdTypes: paged.map((row) => this.tableRowIdTypes.get(row) ?? null),
+      mongoValueTypes: paged.map((row) => this.getTableRowValueTypes(row)),
       totalCount: request.skipCount ? 0 : sorted.length,
       executionTimeMs: Math.round(performance.now() - startTime),
     };
@@ -2037,16 +2196,30 @@ export class MongoDBDriver implements IDBDriver {
           break;
         }
         case "eq": {
-          andClauses.push({
-            [filter.column]: this.coerceFilterInput(filter.value, column),
-          });
+          const candidates = this.getFilterInputCandidates(
+            filter.value,
+            column,
+          );
+          if (candidates.length === 1) {
+            andClauses.push({ [filter.column]: candidates[0] });
+          } else {
+            andClauses.push({
+              $or: candidates.map((candidate) => ({
+                [filter.column]: { $eq: candidate },
+              })),
+            });
+          }
           break;
         }
         case "neq": {
+          const candidates = this.getFilterInputCandidates(
+            filter.value,
+            column,
+          );
           andClauses.push({
-            [filter.column]: {
-              $ne: this.coerceFilterInput(filter.value, column),
-            },
+            $and: candidates.map((candidate) => ({
+              [filter.column]: { $ne: candidate },
+            })),
           });
           break;
         }
@@ -2071,8 +2244,8 @@ export class MongoDBDriver implements IDBDriver {
           break;
         }
         case "in": {
-          const entries = splitInFilterValues(filter.value).map((entry) =>
-            this.coerceFilterInput(entry, column),
+          const entries = splitInFilterValues(filter.value).flatMap((entry) =>
+            this.getFilterInputCandidates(entry, column),
           );
           if (entries.length > 0) {
             andClauses.push({ [filter.column]: { $in: entries } });
@@ -2145,6 +2318,43 @@ export class MongoDBDriver implements IDBDriver {
     return coerced;
   }
 
+  private getFilterInputCandidates(
+    value: string,
+    column: ColumnTypeMeta | undefined,
+  ): unknown[] {
+    const normalized = unwrapQuotedMongoDisplay(value);
+    const explicitString = parseExplicitMongoFilterString(value);
+    if (explicitString !== undefined) {
+      return [explicitString];
+    }
+    if (
+      !MONGO_NUMERIC_LITERAL_RE.test(normalized) ||
+      (column &&
+        column.nativeType !== "string" &&
+        !["integer", "decimal", "float"].includes(column.category))
+    ) {
+      return [this.coerceFilterInput(value, column)];
+    }
+
+    // Mongo collections have no declared column type. The inferred type comes
+    // from a sample, so numeric-looking filters use numeric BSON candidates
+    // regardless of which numeric subtype appeared in the first document.
+    if (column && ["integer", "decimal", "float"].includes(column.category)) {
+      if (
+        column.nativeType === "decimal" ||
+        column.nativeType === "decimal128"
+      ) {
+        // coerceInputValue intentionally leaves invalid edit input as text so
+        // the caller can display it. A numeric filter must instead reject a
+        // Decimal128 overflow instead of matching a BSON String value.
+        return [Decimal128.fromString(normalized)];
+      }
+      return [this.coerceFilterInput(value, column)];
+    }
+
+    return [Decimal128.fromString(normalized)];
+  }
+
   private buildClientScalarEquality(
     filters: readonly FilterExpression[],
     columns: readonly ColumnTypeMeta[],
@@ -2169,14 +2379,13 @@ export class MongoDBDriver implements IDBDriver {
         filter.operator === "in"
           ? splitInFilterValues(filter.value)
           : [filter.value]
-      ).map((input) => {
-        const value = this.coerceFilterInput(input, column);
-        return {
+      ).flatMap((input) =>
+        this.getFilterInputCandidates(input, column).map((value) => ({
           value,
           schema: inferMongoSchemaType(value),
           display: formatMongoDisplayValue(value),
-        };
-      });
+        })),
+      );
       predicates.set(filter, (row) => {
         const schema = this.tableRowSchemas.get(row);
         if (!schema) return undefined;
@@ -2244,6 +2453,17 @@ export class MongoDBDriver implements IDBDriver {
           ...update.primaryKeys,
           ...(update.originalValues ?? {}),
         });
+        for (const [field, hint] of Object.entries(
+          update.originalTypes ?? {},
+        )) {
+          if (hint.nativeType === "null") {
+            setOwnMongoRecordField(criteria, field, { $eq: null, $type: 10 });
+          } else if (hint.nativeType === "undefined") {
+            setOwnMongoRecordField(criteria, field, { $type: 6 });
+          } else if (hint.nativeType === "missing") {
+            setOwnMongoRecordField(criteria, field, { $exists: false });
+          }
+        }
         criteria._id = { $eq: update.primaryKeys._id };
         const options = this.getMutationTimeoutOptions(context);
         writeMayHaveApplied = true;
@@ -2359,6 +2579,8 @@ export class MongoDBDriver implements IDBDriver {
     data: {
       primaryKeys?: Record<string, unknown>;
       changes?: Record<string, unknown>;
+      originalValues?: Record<string, unknown>;
+      originalTypes?: Record<string, MongoValueTypeHint>;
       values?: Record<string, unknown>;
       primaryKeyValuesList?: Array<Record<string, unknown>>;
     },
@@ -2373,13 +2595,32 @@ export class MongoDBDriver implements IDBDriver {
       return `${collectionRef}.insertOne(${doc})`;
     }
     if (operation === "update") {
-      const filter = this.serializeMongosh({
+      const filter: Record<string, unknown> = {
         _id: { $eq: data.primaryKeys?._id },
-      });
+      };
+      const guardedFields = new Set<string>();
+      for (const [field, hint] of Object.entries(data.originalTypes ?? {})) {
+        guardedFields.add(field);
+        if (hint.nativeType === "null") {
+          setOwnMongoRecordField(filter, field, { $eq: null, $type: 10 });
+        } else if (hint.nativeType === "undefined") {
+          setOwnMongoRecordField(filter, field, { $type: 6 });
+        } else if (hint.nativeType === "missing") {
+          setOwnMongoRecordField(filter, field, { $exists: false });
+        } else if (Object.hasOwn(data.originalValues ?? {}, field)) {
+          setOwnMongoRecordField(filter, field, data.originalValues?.[field]);
+        }
+      }
+      for (const [field, value] of Object.entries(data.originalValues ?? {})) {
+        if (!guardedFields.has(field))
+          setOwnMongoRecordField(filter, field, value);
+      }
+      const serializedFilter = this.serializeMongosh(filter);
       const update = this.serializeMongosh({ $set: data.changes ?? {} });
       // Execution applies updateOne per row (see updateRows); the preview must
-      // match so copy-paste does not escalate to a multi-row write.
-      return `${collectionRef}.updateOne(\n  ${filter},\n  ${update}\n)`;
+      // match its identity and optimistic guard so copy-paste has the same
+      // protection and cannot escalate to a multi-row write.
+      return `${collectionRef}.updateOne(\n  ${serializedFilter},\n  ${update}\n)`;
     }
     return (data.primaryKeyValuesList ?? [data.primaryKeys ?? {}])
       .map(
@@ -2457,11 +2698,7 @@ export class MongoDBDriver implements IDBDriver {
       value !== NULL_SENTINEL &&
       isMongoIntegerType(column.nativeType)
     ) {
-      return coerceMongoIntegerValue(
-        unwrapQuotedMongoDisplay(value),
-        column,
-        false,
-      );
+      return coerceMongoNumericInput(unwrapQuotedMongoDisplay(value), column);
     }
     if (column.nativeType === "string") return value;
     try {
@@ -2493,6 +2730,32 @@ export class MongoDBDriver implements IDBDriver {
       throw new Error(
         "MongoDB row identity requires an explicit supported _id type hint.",
       );
+    }
+    return this.coerceInputValue(value, column);
+  }
+
+  coerceTableEditValue(
+    value: unknown,
+    column: ColumnTypeMeta,
+    options?: { preserveNativeType?: boolean },
+  ): unknown {
+    if (options?.preserveNativeType && isMongoIntegerType(column.nativeType)) {
+      if (value === null || value === undefined || value === NULL_SENTINEL) {
+        return this.coerceInputValue(value, column);
+      }
+      const normalized =
+        typeof value === "string"
+          ? unwrapQuotedMongoDisplay(value)
+          : typeof value === "number" || typeof value === "bigint"
+            ? String(value)
+            : null;
+      if (normalized === null) return this.coerceInputValue(value, column);
+      if (!/^[+-]?\d+$/.test(normalized)) {
+        throw new Error(
+          `MongoDB ${column.nativeType} value must be an integer.`,
+        );
+      }
+      return coerceMongoIntegerValue(normalized, column, true);
     }
     return this.coerceInputValue(value, column);
   }
@@ -2542,6 +2805,12 @@ export class MongoDBDriver implements IDBDriver {
       return value;
     }
 
+    const rawValue = value.trim();
+    if (!isQuotedMongoString(rawValue)) {
+      if (/^MinKey\(\)$/i.test(rawValue)) return new MinKey();
+      if (/^MaxKey\(\)$/i.test(rawValue)) return new MaxKey();
+    }
+
     const normalized = unwrapQuotedMongoDisplay(value);
 
     if (column.nativeType === "objectId") {
@@ -2581,12 +2850,11 @@ export class MongoDBDriver implements IDBDriver {
     }
 
     if (isMongoIntegerType(column.nativeType)) {
-      return coerceMongoIntegerValue(normalized, column, true);
+      return coerceMongoNumericInput(normalized, column);
     }
 
     if (column.nativeType === "double" || column.nativeType === "number") {
-      const numeric = Number(normalized);
-      return Number.isFinite(numeric) ? numeric : normalized;
+      return coerceMongoNumericInput(normalized, column);
     }
 
     if (column.nativeType === "bool") {
@@ -2614,14 +2882,6 @@ export class MongoDBDriver implements IDBDriver {
 
     if (column.nativeType === "regex") {
       return parseMongoRegexInput(normalized) ?? normalized;
-    }
-
-    if (column.nativeType === "minKey") {
-      return /^MinKey\(\)$/i.test(normalized) ? new MinKey() : normalized;
-    }
-
-    if (column.nativeType === "maxKey") {
-      return /^MaxKey\(\)$/i.test(normalized) ? new MaxKey() : normalized;
     }
 
     if (/^binData(?:\(\d+\))?$/i.test(column.nativeType)) {
@@ -2704,7 +2964,7 @@ export class MongoDBDriver implements IDBDriver {
       try {
         const normalized = unwrapQuotedMongoDisplay(expectedValue);
         if (isMongoIntegerType(column.nativeType)) {
-          coerceMongoIntegerValue(normalized, column, true);
+          coerceMongoNumericInput(normalized, column);
         } else {
           coerceMongoBinaryValue(normalized, column, true);
         }
@@ -2733,6 +2993,13 @@ export class MongoDBDriver implements IDBDriver {
             .map((entry) => this.normalizeInlineFilterScalar(column, entry))
             .join(", ")
         : value;
+    }
+    if (
+      typeof value === "string" &&
+      (operator === "eq" || operator === "neq") &&
+      isQuotedMongoString(value)
+    ) {
+      return value.trim();
     }
     if (Array.isArray(value)) {
       return value.map((entry) =>
@@ -2883,6 +3150,19 @@ export class MongoDBDriver implements IDBDriver {
     return row;
   }
 
+  private getTableRowValueTypes(
+    row: Record<string, unknown>,
+  ): Record<
+    string,
+    { category: TypeCategory; nativeType: string; bsonSubtype?: number }
+  > {
+    const schemas = this.tableRowSchemas.get(row);
+    if (!schemas) return {};
+    return Object.fromEntries(
+      [...schemas].map(([name, schema]) => [name, { ...schema }]),
+    );
+  }
+
   private async describeSchemaColumns(
     database: string,
     table: string,
@@ -2902,6 +3182,59 @@ export class MongoDBDriver implements IDBDriver {
         inferMongoSchemaType(sample);
       const filterable = category !== "spatial";
       const nullable = !isPrimaryKey;
+      const observedTypes = documents
+        .filter(
+          (document) =>
+            Object.hasOwn(document, name) &&
+            document[name] !== null &&
+            document[name] !== undefined,
+        )
+        .map((document) => inferMongoSchemaType(document[name]));
+      const observedCategories = new Set(
+        observedTypes.map((observedType) => observedType.category),
+      );
+      const observedTextNativeTypes = new Set(
+        observedTypes
+          .filter((observedType) => observedType.category === "text")
+          .map((observedType) => observedType.nativeType),
+      );
+      const filterOperators = new Set<FilterOperator>();
+      if (filterable) {
+        const categories =
+          observedCategories.size > 0 ? [...observedCategories] : [category];
+        const isNumericCategory = (candidate: TypeCategory) =>
+          candidate === "integer" ||
+          candidate === "decimal" ||
+          candidate === "float";
+        const allNumeric = categories.every(isNumericCategory);
+        const mixedTextAndNumeric =
+          categories.includes("text") &&
+          categories.some(isNumericCategory) &&
+          observedTextNativeTypes.size === 1 &&
+          observedTextNativeTypes.has("string") &&
+          categories.every(
+            (candidate) => candidate === "text" || isNumericCategory(candidate),
+          );
+        const operators =
+          categories.length === 1
+            ? filterOperatorsForCategory(categories[0])
+            : allNumeric
+              ? filterOperatorsForCategory("decimal")
+              : mixedTextAndNumeric
+                ? (["like", "eq", "neq", "in"] as FilterOperator[])
+                : [];
+        for (const operator of operators) {
+          filterOperators.add(operator);
+        }
+      }
+      if (nullable) {
+        for (const operator of resolveFilterOperators(category, {
+          filterable: false,
+          nullable: true,
+        })) {
+          filterOperators.add(operator);
+        }
+      }
 
       return {
         name,
@@ -2915,10 +3248,7 @@ export class MongoDBDriver implements IDBDriver {
         primaryKeyOrdinal,
         isForeignKey: false,
         filterable,
-        filterOperators: resolveFilterOperators(category, {
-          filterable,
-          nullable,
-        }),
+        filterOperators: [...filterOperators],
         valueSemantics: "plain",
       } satisfies ColumnTypeMeta;
     });
@@ -3090,7 +3420,11 @@ export class MongoDBDriver implements IDBDriver {
     }
     if (typeof value === "object") {
       const entries = Object.entries(value as Record<string, unknown>).map(
-        ([k, v]) => `${JSON.stringify(k)}: ${this.serializeMongosh(v)}`,
+        ([k, v]) => {
+          const serializedKey =
+            k === "__proto__" ? `[${JSON.stringify(k)}]` : JSON.stringify(k);
+          return `${serializedKey}: ${this.serializeMongosh(v)}`;
+        },
       );
       if (entries.length === 0) return "{}";
       return `{ ${entries.join(", ")} }`;

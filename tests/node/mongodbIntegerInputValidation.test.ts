@@ -1,4 +1,4 @@
-import { Int32, Long } from "mongodb";
+import { Decimal128, Int32, Long } from "mongodb";
 import { describe, expect, it, vi } from "vitest";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
@@ -95,11 +95,70 @@ describe.each([
   it.each([
     (min - 1n).toString(),
     (max + 1n).toString(),
-    "9".repeat(500),
-  ])("rejects overflow %j before any preview or batch writes", async (input) => {
+    "1.5",
+  ])("rejects changes outside the committed row's BSON integer type (%j)", async (input) => {
     const s = setup(nativeType);
+    expect(() =>
+      s.driver.coerceTableEditValue(input, meta, { preserveNativeType: true }),
+    ).toThrow(/out of range|must be an integer/);
+    const preview = vi.spyOn(s.driver, "buildMutationPreviewStatement");
+    const originalTypes = {
+      amount: { nativeType, category: "integer" as const },
+    };
+    await expect(
+      applyChangesTransactional(
+        s.manager as never,
+        "mongo-integer",
+        "db",
+        "",
+        "items",
+        [
+          { primaryKeys, changes: { amount: "1" }, originalTypes },
+          { primaryKeys, changes: { amount: input }, originalTypes },
+        ],
+        s.columns,
+      ),
+    ).rejects.toThrow(/out of range|must be an integer|inexact rounding/);
+    for (const spy of [preview, s.updateOne, s.insertOne])
+      expect(spy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    (min - 1n).toString(),
+    (max + 1n).toString(),
+    "1.5",
+  ])("keeps schema-less numeric input %j exact when no row type is committed", async (input) => {
+    const s = setup(nativeType);
+    const value = s.driver.coerceInputValue(input, meta);
+    expect(value).toBeInstanceOf(Decimal128);
+    expect(String(value)).toBe(input);
+    expect(s.driver.checkPersistedEdit(meta, input)).toBeNull();
+    const result = await applyChangesTransactional(
+      s.manager as never,
+      "mongo-integer",
+      "db",
+      "",
+      "items",
+      [{ primaryKeys, changes: { amount: input } }],
+      s.columns,
+    );
+    expect(result.success).toBe(true);
+    expect(s.updateOne.mock.calls[0][1].$set.amount).toEqual(value);
+    await s.service.insertRow("mongo-integer", "db", "", "items", {
+      amount: input,
+    });
+    expect(s.insertOne.mock.calls[0][0].amount).toEqual(value);
+    expect(s.driver.coerceOriginalValue(input, meta)).toEqual(value);
+  });
+
+  it("rejects unrepresentable Decimal128 input before any preview or batch writes", async () => {
+    const input = "9".repeat(500);
+    const s = setup(nativeType);
+    expect(() =>
+      s.driver.coerceTableEditValue(input, meta, { preserveNativeType: true }),
+    ).toThrow(/out of range/);
     expect(() => s.driver.coerceInputValue(input, meta)).toThrow(
-      /out of range/,
+      /inexact rounding/,
     );
     expect(s.driver.checkPersistedEdit(meta, input)).toMatchObject({
       ok: false,
@@ -127,7 +186,7 @@ describe.each([
         {
           status: "prevalidation_failed",
           columns: ["amount"],
-          message: expect.stringMatching(/out of range/),
+          message: expect.stringMatching(/inexact rounding/),
         },
       ],
     });
@@ -151,13 +210,19 @@ describe.each([
       });
     for (const spy of [preview, coerce, s.updateOne, s.insertOne])
       expect(spy).not.toHaveBeenCalled();
-    expect(s.driver.coerceOriginalValue(input, meta)).toBe(input);
+    expect(
+      s.driver.coerceOriginalValue(input, {
+        ...meta,
+        nativeType: "string",
+        category: "text",
+      }),
+    ).toBe(input);
     expect(s.driver.formatOutputValue(input, meta)).toBe(input);
   });
 
   it("preserves non-integer strings, null and original mixed-type values", () => {
     const s = setup(nativeType);
-    for (const input of ["plain text", "1.5", "", null])
+    for (const input of ["plain text", "", null])
       expect(s.driver.coerceInputValue(input, meta)).toBe(input);
     expect(s.driver.coerceInputValue(NULL_SENTINEL, meta)).toBeNull();
     expect(s.driver.coerceOriginalValue(NULL_SENTINEL, meta)).toBeNull();

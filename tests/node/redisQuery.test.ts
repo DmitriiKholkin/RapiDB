@@ -143,6 +143,7 @@ describe("RedisDriver — query()", () => {
       ["GET", "key"],
     ],
     [String.raw`'G\u0045T' key`, false, ["GU0045T", "key"]],
+    ["PING", true, ["PING"]],
   ] as const)("classifies the same decoded commands as execution for %s", async (query, allowed, firstCommand) => {
     const { driver, sendCommand } = createDriver();
     expect(driver.getCapabilities().readOnlyQueryGuard?.(query).allowed).toBe(

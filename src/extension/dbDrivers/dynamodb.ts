@@ -139,6 +139,10 @@ const DYNAMODB_CURSOR_HISTORY_LIMIT = 256;
 const DYNAMODB_EMPTY_BINARY_CELL_MARKER = "0x (empty binary)";
 const DYNAMODB_EMPTY_BINARY_TEXT_PATTERN = /^\\*0x \(empty binary\)$/;
 const DYNAMODB_ESCAPED_EMPTY_BINARY_TEXT_PATTERN = /^\\+0x \(empty binary\)$/;
+const DYNAMODB_NATIVE_CELL_TEXT_PATTERN =
+  /^\\*DynamoDB native value \(nested sets\/binary\): /;
+const DYNAMODB_ESCAPED_NATIVE_CELL_TEXT_PATTERN =
+  /^\\+DynamoDB native value \(nested sets\/binary\): /;
 const DYNAMODB_NUMBER_RE = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/;
 const DYNAMODB_TABLE_FILTER_ERROR_PREFIX = "Invalid DynamoDB table filter:";
 
@@ -208,7 +212,10 @@ function parseDynamoContainsNeedle(
 // arbitrary backslashes. Filters need native binary context to interpret B;
 // edits already have the value-tagged cell context.
 function decodeDynamoCellInput(value: string, binaryContext = false) {
-  if (DYNAMODB_ESCAPED_EMPTY_BINARY_TEXT_PATTERN.test(value)) {
+  if (
+    DYNAMODB_ESCAPED_EMPTY_BINARY_TEXT_PATTERN.test(value) ||
+    DYNAMODB_ESCAPED_NATIVE_CELL_TEXT_PATTERN.test(value)
+  ) {
     return value.slice(1);
   }
   return binaryContext && value === DYNAMODB_EMPTY_BINARY_CELL_MARKER
@@ -446,8 +453,8 @@ function stableStringify(value: unknown): string {
   return JSON.stringify(value);
 }
 
-const READ_ONLY_DYNAMO_VALUE_PREFIX =
-  "Read-only DynamoDB value (nested sets/binary): ";
+const DYNAMODB_NATIVE_CELL_VALUE_PREFIX =
+  "DynamoDB native value (nested sets/binary): ";
 
 export class DynamoDBDriver implements IDBDriver {
   readonly supportsAtomicUpdateRows = true;
@@ -1262,9 +1269,9 @@ export class DynamoDBDriver implements IDBDriver {
 
     const trimmed = value.trim();
     const nativeType = column.nativeType.toLowerCase();
-    if (trimmed.startsWith(READ_ONLY_DYNAMO_VALUE_PREFIX)) {
-      throw new Error(
-        "DynamoDB maps/lists containing nested sets or binary values are read-only in the table editor. Use the native DynamoDB editor to preserve their types.",
+    if (value.startsWith(DYNAMODB_NATIVE_CELL_VALUE_PREFIX)) {
+      return this.parseNativeCellAttributeValue(
+        trimmed.slice(DYNAMODB_NATIVE_CELL_VALUE_PREFIX.length),
       );
     }
 
@@ -1468,6 +1475,10 @@ export class DynamoDBDriver implements IDBDriver {
         this.cursorCache.delete(key);
       }
     }
+  }
+
+  clearTableReadCache(): void {
+    this.cursorCache.clear();
   }
 
   private async describeTableDefinition(
@@ -3906,7 +3917,8 @@ export class DynamoDBDriver implements IDBDriver {
     if (typeof value === "string") {
       // A literal marker (including one already starting with backslashes) is
       // escaped by one extra leading backslash. Coercion removes exactly one.
-      return DYNAMODB_EMPTY_BINARY_TEXT_PATTERN.test(value)
+      return DYNAMODB_EMPTY_BINARY_TEXT_PATTERN.test(value) ||
+        DYNAMODB_NATIVE_CELL_TEXT_PATTERN.test(value)
         ? `\\${value}`
         : value;
     }
@@ -4152,6 +4164,101 @@ export class DynamoDBDriver implements IDBDriver {
     return value;
   }
 
+  private parseNativeCellAttributeValue(text: string): unknown {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text) as unknown;
+    } catch {
+      throw new Error(
+        "DynamoDB native cell value must contain a valid AttributeValue JSON envelope.",
+      );
+    }
+
+    if (!isRecord(parsed) || Object.keys(parsed).length !== 1) {
+      throw new Error(
+        "DynamoDB native cell value must contain one AttributeValue type tag.",
+      );
+    }
+
+    const [type] = Object.keys(parsed);
+    const value = parsed[type];
+    switch (type) {
+      case "S":
+        if (typeof value !== "string") break;
+        return value;
+      case "N":
+        if (typeof value !== "string" || !DYNAMODB_NUMBER_RE.test(value)) break;
+        return NumberValueImpl.from(value);
+      case "B":
+        if (typeof value !== "string") break;
+        {
+          const binary = this.parseCanonicalBase64(value);
+          if (!binary) break;
+          return binary;
+        }
+      case "BOOL":
+        if (typeof value !== "boolean") break;
+        return value;
+      case "NULL":
+        if (value !== true) break;
+        return null;
+      case "SS":
+        if (
+          !Array.isArray(value) ||
+          !value.every((entry) => typeof entry === "string")
+        )
+          break;
+        return new Set(value);
+      case "NS":
+        if (
+          !Array.isArray(value) ||
+          !value.every(
+            (entry) =>
+              typeof entry === "string" && DYNAMODB_NUMBER_RE.test(entry),
+          )
+        )
+          break;
+        return new Set(value.map((entry) => NumberValueImpl.from(entry)));
+      case "BS":
+        if (
+          !Array.isArray(value) ||
+          value.length === 0 ||
+          !value.every((entry) => typeof entry === "string")
+        )
+          break;
+        {
+          const binaries = value.map((entry) =>
+            this.parseCanonicalBase64(entry),
+          );
+          if (binaries.some((entry) => entry === null)) break;
+          // Base64 is canonicalized above, so equal encoded entries represent
+          // equal bytes. Buffer instances compare by identity in a Set, which
+          // would otherwise preserve duplicate binary values.
+          if (new Set(value).size !== value.length) break;
+          return new Set(binaries as Buffer[]);
+        }
+      case "L":
+        if (!Array.isArray(value)) break;
+        return value.map((entry) =>
+          this.parseNativeCellAttributeValue(JSON.stringify(entry)),
+        );
+      case "M":
+        if (!isRecord(value)) break;
+        return Object.fromEntries(
+          Object.entries(value).map(([key, entry]) => [
+            key,
+            this.parseNativeCellAttributeValue(JSON.stringify(entry)),
+          ]),
+        );
+      default:
+        break;
+    }
+
+    throw new Error(
+      `DynamoDB native cell value has an invalid ${JSON.stringify(type)} AttributeValue.`,
+    );
+  }
+
   private formatStructuredDynamoValue(value: unknown): string {
     const hasSpecialValue = (entry: unknown): boolean => {
       if (entry instanceof Set || this.isBinaryValue(entry)) return true;
@@ -4162,13 +4269,27 @@ export class DynamoDBDriver implements IDBDriver {
     };
     if (hasSpecialValue(value)) {
       return (
-        READ_ONLY_DYNAMO_VALUE_PREFIX +
+        DYNAMODB_NATIVE_CELL_VALUE_PREFIX +
         JSON.stringify(
           this.serializeNativePreviewValue(this.toAttributeValue(value)),
         )
       );
     }
     return this.stringifyExactDynamoValue(value);
+  }
+
+  private parseCanonicalBase64(value: string): Buffer | null {
+    if (value === "") return Buffer.alloc(0);
+    if (
+      value.length % 4 !== 0 ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+        value,
+      )
+    ) {
+      return null;
+    }
+    const decoded = Buffer.from(value, "base64");
+    return decoded.toString("base64") === value ? decoded : null;
   }
 
   private stringifyExactDynamoValue(value: unknown): string {

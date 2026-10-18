@@ -4,6 +4,8 @@ import {
   Double,
   Int32,
   Long,
+  MaxKey,
+  MinKey,
   ObjectId,
   Timestamp,
 } from "mongodb";
@@ -133,6 +135,87 @@ describe("manual review: exact exports and user documents", () => {
 });
 
 describe("manual review: Oracle exact objects and temporal writes", () => {
+  it("reads native JSON through text to preserve exact numeric tokens", () => {
+    const jsonColumn = column("JSON_DOC", "JSON", "json");
+    expect(oracle.buildVerificationValueExpr(jsonColumn)).toBe(
+      'JSON_SERIALIZE("JSON_DOC" RETURNING CLOB)',
+    );
+  });
+  it("uses Oracle JSON_EQUAL for exact optimistic edit guards", () => {
+    const jsonColumn = column("JSON_DOC", "JSON", "json");
+    const previous = '{"ok":true,"n":9007199254740993}';
+    const next = '{"ok":false,"n":9007199254740994}';
+    const update = buildUpdateRowSql(
+      oracle,
+      "",
+      "QA",
+      "T",
+      { ID: 1 },
+      { JSON_DOC: next },
+      [id, jsonColumn],
+      { JSON_DOC: previous },
+    );
+
+    expect(update?.sql).toContain(
+      'JSON_EQUAL("RAPIDB_UPDATE_ROW"."JSON_DOC", :3 ERROR ON ERROR)',
+    );
+    expect(update?.params).toEqual([next, 1, previous]);
+  });
+  it("verifies native JSON edits without rounding numbers and distinguishes SQL NULL", () => {
+    const jsonColumn = column("JSON_DOC", "JSON", "json");
+    const requested = '{"ok":false,"n":9007199254740994}';
+
+    expect(
+      oracle.checkPersistedEdit(jsonColumn, requested, {
+        persistedValue: '{ "n": 9007199254740994, "ok": false }',
+      })?.ok,
+    ).toBe(true);
+    expect(
+      oracle.checkPersistedEdit(jsonColumn, requested, {
+        persistedValue: '{"ok":false,"n":9007199254740992}',
+      })?.ok,
+    ).toBe(false);
+    expect(
+      oracle.checkPersistedEdit(jsonColumn, null, { persistedValue: null })?.ok,
+    ).toBe(true);
+    expect(
+      oracle.checkPersistedEdit(jsonColumn, "null", { persistedValue: null })
+        ?.ok,
+    ).toBe(false);
+    expect(
+      oracle.checkPersistedEdit(jsonColumn, "null", {
+        persistedValue: "null",
+      })?.ok,
+    ).toBe(true);
+    expect(
+      oracle.checkPersistedEdit(jsonColumn, '{"n":1.0}', {
+        persistedValue: '{"n":1}',
+      })?.ok,
+    ).toBe(true);
+    expect(
+      oracle.checkPersistedEdit(jsonColumn, '{"n":1e0}', {
+        persistedValue: '{"n":1.0}',
+      })?.ok,
+    ).toBe(true);
+    expect(
+      oracle.checkPersistedEdit(jsonColumn, '{"x":1,"x":2}')?.shouldVerify,
+    ).toBe(false);
+    expect(
+      buildUpdateRowSql(
+        oracle,
+        "",
+        "QA",
+        "T",
+        { ID: 1 },
+        { JSON_DOC: requested },
+        [id, jsonColumn],
+        { JSON_DOC: "null" },
+      )?.sql,
+    ).toContain(
+      'JSON_EQUAL("RAPIDB_UPDATE_ROW"."JSON_DOC", :3 ERROR ON ERROR)',
+    );
+  });
+
   it("aligns preview metadata with every expanded object bind and skips inline NULLs", () => {
     const xml = column("XML_DOC", "XMLTYPE", "lob");
     const next = '{"N":1,"TXT":"new"}';
@@ -1007,6 +1090,32 @@ describe("manual review: Oracle exact temporal filters and export cursors", () =
   });
 });
 
+describe("manual review: MongoDB explicit sentinel edits", () => {
+  it("parses unquoted sentinel literals independently of field type and preserves quoted strings", () => {
+    const driver = new MongoDBDriver({
+      id: "sentinel-edit",
+      name: "Review",
+      type: "mongodb",
+    });
+
+    expect(
+      driver.coerceInputValue("MaxKey()", column("min", "minKey", "text")),
+    ).toBeInstanceOf(MaxKey);
+    expect(
+      driver.coerceInputValue("MinKey()", column("max", "maxKey", "text")),
+    ).toBeInstanceOf(MinKey);
+    expect(
+      driver.coerceInputValue('"MaxKey()"', column("min", "minKey", "text")),
+    ).toBe("MaxKey()");
+    expect(
+      driver.coerceInputValue('"MinKey()"', column("min", "minKey", "text")),
+    ).toBe("MinKey()");
+    expect(
+      driver.coerceInputValue('"MaxKey()"', column("max", "maxKey", "text")),
+    ).toBe("MaxKey()");
+  });
+});
+
 describe("manual review: IN value boundaries", () => {
   it.each([
     [
@@ -1018,6 +1127,15 @@ describe("manual review: IN value boundaries", () => {
     ],
     ["binData", "binary", new Binary(Buffer.from([255]), 0), "0xff", "0xff"],
     ["bool", "boolean", true, "TRUE", "true"],
+    ["bool", "boolean", true, "1", "1"],
+    ["bool", "boolean", false, "0", "0"],
+    [
+      "objectId",
+      "text",
+      new ObjectId("123456789012345678901234"),
+      "123456789012345678901234",
+      "123456789012345678901234",
+    ],
     [
       "date",
       "datetime",
@@ -1038,12 +1156,24 @@ describe("manual review: IN value boundaries", () => {
     ];
     const state = driver as unknown as {
       toRow: (doc: Record<string, unknown>) => Record<string, unknown>;
+      buildMongoFilterCriteria: (
+        filters: FilterExpression[],
+        columns: ColumnTypeMeta[],
+      ) => Record<string, unknown>;
     };
     Object.assign(driver, {
       describeSchemaColumns: async () => [col, column("obj", "object", "json")],
       readRows: async () => docs.map((doc) => state.toRow(doc)),
     });
     for (const operator of ["eq", "in", "neq"] as const) {
+      const filter = { column: "v", operator, value: input };
+      expect(state.buildMongoFilterCriteria([filter], [col])).toEqual(
+        operator === "eq"
+          ? { v: bson }
+          : operator === "in"
+            ? { v: { $in: [bson] } }
+            : { $and: [{ v: { $ne: bson } }] },
+      );
       const page = await driver.readTablePage({
         database: "qa",
         schema: "",
@@ -1052,10 +1182,7 @@ describe("manual review: IN value boundaries", () => {
         pageSize: 100,
         skipCount: false,
         sort: null,
-        filters: [
-          { column: "v", operator, value: input },
-          { column: "obj", operator: "like", value: "needle" },
-        ],
+        filters: [filter, { column: "obj", operator: "like", value: "needle" }],
       });
       expect(page.rows.map((row) => row._id)).toEqual([
         operator === "neq" ? "literal" : "bson",

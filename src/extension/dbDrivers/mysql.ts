@@ -255,6 +255,7 @@ const MYSQL_SPATIAL_TYPES = new Set([
   "multipoint",
   "multilinestring",
   "multipolygon",
+  "geomcollection",
   "geometrycollection",
   "geometry",
 ]);
@@ -534,6 +535,15 @@ function toMysqlIntegerFilterParam(val: string): number | string {
   }
   return Number(val);
 }
+function mysqlFilterCollation(
+  characterSet: string,
+  collation: string,
+): { characterSet: string; collation: string } | null {
+  if (!/^[a-z0-9_]+$/i.test(characterSet) || !/^[a-z0-9_]+$/i.test(collation)) {
+    return null;
+  }
+  return { characterSet, collation };
+}
 function mysqlBitMaxValue(nativeType: string): bigint | null {
   const width = parseMysqlBitWidth(nativeType);
   return width === null ? null : (1n << BigInt(width)) - 1n;
@@ -765,6 +775,8 @@ function parseMysqlSpatialSridPrefix(value: string): {
 }
 
 type MysqlGeometryParseResult = {
+  geometryType: number;
+  body: string;
   wkt: string;
   nextOffset: number;
 };
@@ -827,8 +839,11 @@ function parseMysqlWkbGeometry(
     cursor += 8;
     const y = readMysqlGeometryDouble(view, cursor, littleEndian);
     cursor += 8;
+    const body = `${mysqlGeometryNumber(x)} ${mysqlGeometryNumber(y)}`;
     return {
-      wkt: `POINT(${mysqlGeometryNumber(x)} ${mysqlGeometryNumber(y)})`,
+      geometryType,
+      body,
+      wkt: `POINT(${body})`,
       nextOffset: cursor,
     };
   }
@@ -844,8 +859,11 @@ function parseMysqlWkbGeometry(
       cursor += 8;
       points.push(`${mysqlGeometryNumber(x)} ${mysqlGeometryNumber(y)}`);
     }
+    const body = points.join(", ");
     return {
-      wkt: `LINESTRING(${points.join(", ")})`,
+      geometryType,
+      body,
+      wkt: `LINESTRING(${body})`,
       nextOffset: cursor,
     };
   }
@@ -867,8 +885,11 @@ function parseMysqlWkbGeometry(
       }
       rings.push(`(${points.join(", ")})`);
     }
+    const body = rings.join(", ");
     return {
-      wkt: `POLYGON(${rings.join(", ")})`,
+      geometryType,
+      body,
+      wkt: `POLYGON(${body})`,
       nextOffset: cursor,
     };
   }
@@ -876,24 +897,49 @@ function parseMysqlWkbGeometry(
   if (geometryType >= 4 && geometryType <= 7) {
     const geometryCount = readMysqlGeometryUInt32(view, cursor, littleEndian);
     cursor += 4;
-    const children: string[] = [];
+    const children: MysqlGeometryParseResult[] = [];
     for (let index = 0; index < geometryCount; index += 1) {
       const parsedChild = parseMysqlWkbGeometry(view, cursor);
       cursor = parsedChild.nextOffset;
-      children.push(parsedChild.wkt);
+      children.push(parsedChild);
     }
 
-    const label =
-      geometryType === 4
-        ? "MULTIPOINT"
-        : geometryType === 5
-          ? "MULTILINESTRING"
-          : geometryType === 6
-            ? "MULTIPOLYGON"
-            : "GEOMETRYCOLLECTION";
+    let wkt: string;
+    if (geometryType === 4) {
+      if (children.some((child) => child.geometryType !== 1)) {
+        throw new Error(
+          "Invalid WKB: MULTIPOINT contains a non-POINT geometry",
+        );
+      }
+      wkt = `MULTIPOINT(${children
+        .map((child) => `(${child.body})`)
+        .join(", ")})`;
+    } else if (geometryType === 5) {
+      if (children.some((child) => child.geometryType !== 2)) {
+        throw new Error(
+          "Invalid WKB: MULTILINESTRING contains a non-LINESTRING geometry",
+        );
+      }
+      wkt = `MULTILINESTRING(${children
+        .map((child) => `(${child.body})`)
+        .join(", ")})`;
+    } else if (geometryType === 6) {
+      if (children.some((child) => child.geometryType !== 3)) {
+        throw new Error(
+          "Invalid WKB: MULTIPOLYGON contains a non-POLYGON geometry",
+        );
+      }
+      wkt = `MULTIPOLYGON(${children
+        .map((child) => `(${child.body})`)
+        .join(", ")})`;
+    } else {
+      wkt = `GEOMETRYCOLLECTION(${children.map((child) => child.wkt).join(", ")})`;
+    }
 
     return {
-      wkt: `${label}(${children.join(", ")})`,
+      geometryType,
+      body: "",
+      wkt,
       nextOffset: cursor,
     };
   }
@@ -910,7 +956,7 @@ function decodeMysqlGeometryBuffer(value: Buffer): string | null {
     const srid = value.readUInt32LE(0);
     const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
     const parsed = parseMysqlWkbGeometry(view, 4);
-    if (parsed.nextOffset > view.byteLength) {
+    if (parsed.nextOffset !== view.byteLength) {
       return null;
     }
     return srid > 0 ? `SRID=${srid};${parsed.wkt}` : parsed.wkt;
@@ -1532,6 +1578,12 @@ export class MySQLDriver extends BaseDBDriver {
       ...options,
       timeout: this.getDbOperationTimeoutMs(),
       rowsAsArray: true,
+      // mysql2's built-in GEOMETRY parser turns WKB into untyped coordinate
+      // arrays, making MULTIPOINT and MULTILINESTRING indistinguishable from
+      // simpler geometry types. Keep the native WKB so _parseQueryResult can
+      // decode the declared WKB geometry type without guessing.
+      typeCast: (field, next) =>
+        field.type === "GEOMETRY" ? field.buffer() : next(),
     });
     return [rows as MysqlQueryRows, fields as FieldPacket[]];
   }
@@ -1600,6 +1652,8 @@ export class MySQLDriver extends BaseDBDriver {
       RowDataPacket & {
         COLUMN_NAME: string;
         COLUMN_TYPE: string;
+        CHARACTER_SET_NAME: string | null;
+        COLLATION_NAME: string | null;
         IS_NULLABLE: string;
         COLUMN_DEFAULT: unknown;
         GENERATION_EXPRESSION: string | null;
@@ -1611,6 +1665,8 @@ export class MySQLDriver extends BaseDBDriver {
     >(
       `SELECT c.COLUMN_NAME,
               c.COLUMN_TYPE,
+              c.CHARACTER_SET_NAME,
+              c.COLLATION_NAME,
               c.IS_NULLABLE,
               c.COLUMN_DEFAULT,
               c.GENERATION_EXPRESSION,
@@ -1667,6 +1723,12 @@ export class MySQLDriver extends BaseDBDriver {
       return {
         name: r.COLUMN_NAME as string,
         type: r.COLUMN_TYPE as string,
+        characterSet:
+          typeof r.CHARACTER_SET_NAME === "string"
+            ? r.CHARACTER_SET_NAME
+            : undefined,
+        collation:
+          typeof r.COLLATION_NAME === "string" ? r.COLLATION_NAME : undefined,
         nullable: r.IS_NULLABLE === "YES",
         defaultValue,
         identityGeneration: extraMetadata.identityGeneration,
@@ -3374,6 +3436,7 @@ export class MySQLDriver extends BaseDBDriver {
         col,
         literalContainsPattern(v),
         column.category === "text" || column.category === "enum",
+        column,
       );
     }
     let finalVal = v;
@@ -3407,19 +3470,42 @@ export class MySQLDriver extends BaseDBDriver {
     col: string,
     pattern: string,
     preserveColumnCollation = false,
+    column?: ColumnTypeMeta,
   ): FilterConditionResult {
     // mysql2.query() interpolates string parameters with backslash escapes.
     // Transport only ASCII hex, then decode on the server: quotes/backslashes
-    // stay data even with NO_BACKSLASH_ESCAPES. CAST uses the same connection
-    // character set/collation as the left-hand CAST for non-text values. Text
-    // columns retain their native collation so binary and language-specific
-    // comparisons keep the semantics declared by the column.
-    const leftExpression = preserveColumnCollation
-      ? col
-      : `CAST(${col} AS CHAR)`;
+    // stay data even with NO_BACKSLASH_ESCAPES. Text columns use their catalog
+    // collation for both operands because the pool connection may use a
+    // different collation from the schema default.
+    const leftExpression =
+      column?.category === "spatial"
+        ? `ST_AsText(${col})`
+        : preserveColumnCollation
+          ? col
+          : `CAST(${col} AS CHAR)`;
+    const collation =
+      preserveColumnCollation && column?.characterSet && column.collation
+        ? mysqlFilterCollation(column.characterSet, column.collation)
+        : null;
+    const convertedPattern = collation
+      ? `CONVERT(CONVERT(UNHEX(?) USING utf8mb4) USING ${collation.characterSet})`
+      : null;
+    const rightExpression = collation
+      ? `${convertedPattern} COLLATE ${collation.collation}`
+      : "CAST(UNHEX(?) AS CHAR)";
+    const predicate = `${leftExpression} LIKE ${rightExpression} ESCAPE '!'`;
+    const encodedPattern = Buffer.from(pattern, "utf8").toString("hex");
+    if (collation && collation.characterSet !== "utf8mb4") {
+      // Legacy charsets can replace an unsupported character with '?'. Require
+      // an exact UTF-8 round trip before using the transcoded LIKE pattern.
+      return {
+        sql: `(${predicate} AND CAST(CONVERT(${convertedPattern} USING utf8mb4) AS BINARY) = UNHEX(?))`,
+        params: [encodedPattern, encodedPattern, encodedPattern],
+      };
+    }
     return {
-      sql: `${leftExpression} LIKE CAST(UNHEX(?) AS CHAR) ESCAPE '!'`,
-      params: [Buffer.from(pattern, "utf8").toString("hex")],
+      sql: predicate,
+      params: [encodedPattern],
     };
   }
   private isApproximateNumericType(nativeType: string): boolean {

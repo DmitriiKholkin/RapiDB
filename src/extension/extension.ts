@@ -71,6 +71,7 @@ function trackExplorerTreeView(
 
   return [
     treeView.onDidExpandElement(({ element }) => {
+      connectionProvider.markExplorerNodeExpanded(element);
       const scope: ExplorerSchemaScope | undefined =
         getExplorerSchemaScopeForNode(element);
       if (!scope) {
@@ -81,6 +82,7 @@ function trackExplorerTreeView(
       connectionManager.ensureSchemaScopeLoading(element.connectionId, scope);
     }),
     treeView.onDidCollapseElement(({ element }) => {
+      connectionProvider.markExplorerNodeCollapsed(element);
       const scope = getExplorerSchemaScopeForNode(element);
       if (!scope) {
         return;

@@ -100,7 +100,10 @@ function tokenize(input: string): string[] | null {
 
 class JsonTokenParser {
   private pos = 0;
-  constructor(private readonly tokens: string[]) {}
+  constructor(
+    private readonly tokens: string[],
+    private readonly requireUniqueKeys = false,
+  ) {}
 
   get position(): number {
     return this.pos;
@@ -166,6 +169,9 @@ class JsonTokenParser {
       } catch {
         return undefined;
       }
+      if (this.requireUniqueKeys && Object.hasOwn(obj, key)) {
+        return undefined;
+      }
       if (this.tokens[this.pos] !== ":") {
         return undefined;
       }
@@ -220,12 +226,13 @@ class JsonTokenParser {
 
 export function parseJsonPreservingRawNumbers(
   text: string,
+  options: { requireUniqueKeys?: boolean } = {},
 ): CanonicalJsonValue | undefined {
   const tokens = tokenize(text);
   if (tokens === null) {
     return undefined;
   }
-  const parser = new JsonTokenParser(tokens);
+  const parser = new JsonTokenParser(tokens, options.requireUniqueKeys);
   const value = parser.parseValue();
   if (value === undefined || parser.position !== tokens.length) {
     return undefined;
@@ -266,4 +273,48 @@ export function canonicalizeJsonPreservingRawNumbers(
     return null;
   }
   return serializeCanonicalJson(parsed);
+}
+
+function canonicalJsonNumberToken(token: string): string | null {
+  const match = /^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(token);
+  if (!match) return null;
+  let digits = `${match[2]}${match[3] ?? ""}`.replace(/^0+/, "");
+  if (digits.length === 0) return "0";
+  let exponent = BigInt(match[4] ?? "0") - BigInt((match[3] ?? "").length);
+  const trailingZeros = /0+$/.exec(digits)?.[0].length ?? 0;
+  if (trailingZeros > 0) {
+    digits = digits.slice(0, -trailingZeros);
+    exponent += BigInt(trailingZeros);
+  }
+  return `${match[1]}${digits}e${exponent.toString()}`;
+}
+
+/**
+ * Canonicalizes JSON for value comparison: object key order and insignificant
+ * number spelling differences are ignored, while numeric precision is kept
+ * exact. Oracle native JSON uses OSON and JSON_SERIALIZE can normalize 1.0,
+ * 1e0, and -0 to 1, 1, and 0 respectively.
+ */
+export function canonicalizeJsonNumericValues(
+  text: string,
+  options: { requireUniqueKeys?: boolean } = {},
+): string | null {
+  const parsed = parseJsonPreservingRawNumbers(text, options);
+  if (parsed === undefined) return null;
+  const normalize = (value: CanonicalJsonValue): CanonicalJsonValue => {
+    if (isRawNumberToken(value)) {
+      const raw = canonicalJsonNumberToken(value.raw);
+      return raw === null ? value : { [RAW_NUMBER_TAG]: true, raw };
+    }
+    if (Array.isArray(value)) return value.map(normalize);
+    if (value !== null && typeof value === "object") {
+      const result: Record<string, CanonicalJsonValue> = Object.create(null);
+      for (const key of Object.keys(value)) {
+        result[key] = normalize(value[key]);
+      }
+      return result;
+    }
+    return value;
+  };
+  return serializeCanonicalJson(normalize(parsed));
 }

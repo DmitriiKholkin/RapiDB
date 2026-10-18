@@ -90,6 +90,7 @@ describe("QueryPanelController", () => {
       getQueryRowLimit: () => 100,
       getDriver: () => ({ query }),
       addToHistory: vi.fn(async () => undefined),
+      refreshSchemaCache: vi.fn(),
     };
     const view = {
       getActiveConnectionId: () => "mongo",
@@ -1537,6 +1538,73 @@ describe("QueryPanelController", () => {
     expect(formatQueryResult).toHaveBeenCalledWith(
       expect.objectContaining({ rows: [{ database_name: "postgres" }] }),
       10000,
+    );
+  });
+
+  it.each([
+    {
+      queryText: 'db.items.find({label:"create"})',
+      fails: false,
+      refresh: true,
+    },
+    {
+      queryText: 'db.items.insertMany([{_id:"new"}])',
+      fails: false,
+      refresh: true,
+    },
+    {
+      queryText: 'db.items.insertOne({_id:"new"});db.runCommand({invalid:1})',
+      fails: true,
+      refresh: true,
+    },
+  ])("refreshes MongoDB discovery after attempted native writes ($fails)", async ({
+    queryText,
+    fails,
+    refresh,
+  }) => {
+    const { MongoDBDriver } = await import(
+      "../../src/extension/dbDrivers/mongodb"
+    );
+    const connection = { id: "mongo", name: "QA", type: "mongodb" as const };
+    const nativeDriver = new MongoDBDriver(connection);
+    const query = vi.fn(async () => {
+      if (fails) throw new Error("Later native command failed");
+      return { columns: [], rows: [], rowCount: 0, executionTimeMs: 0 };
+    });
+    const manager = {
+      getConnection: () => connection,
+      isConnected: () => true,
+      getDriver: () => ({ query }),
+      getDriverCapabilities: () => nativeDriver.getCapabilities(),
+      getQueryRowLimit: () => 100,
+      addToHistory: vi.fn(async () => undefined),
+      refreshSchemaCache: vi.fn(),
+    };
+    const view = {
+      getActiveConnectionId: () => "mongo",
+      getInitialConnectionId: () => "mongo",
+      getLastQueryResult: () => null,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    await new QueryPanelController(manager as never, view).handleMessage({
+      type: "executeQuery",
+      payload: { connectionId: "mongo", queryText },
+    });
+    expect(query).toHaveBeenCalledOnce();
+    expect(manager.refreshSchemaCache).toHaveBeenCalledTimes(refresh ? 1 : 0);
+    expect(view.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "queryResult",
+        payload: expect.objectContaining(
+          fails ? { error: "Later native command failed" } : { rows: [] },
+        ),
+      }),
     );
   });
 

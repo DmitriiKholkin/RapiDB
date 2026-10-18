@@ -444,11 +444,10 @@ describe("B02 real node-redis 6 transport lifecycle", () => {
     expect((await driver.query("GET shared")).rows[0]?.__col_0).toBe("db-0");
   });
 
-  it("cancels a sent base GET without destroying the base or native DB session", async () => {
+  it("cancels a sent query without destroying the base or native DB session", async () => {
     const driver = makeDriver();
     await driver.connect();
     await driver.readTablePage(page("db1"));
-    const entry = [...state(driver).clients][0];
     const pending = driver.query("GET hang; SET shared wrong", [], {
       requestToken: 101,
     });
@@ -458,25 +457,66 @@ describe("B02 real node-redis 6 transport lifecycle", () => {
         true,
       ),
     );
+    const [baseEntry, nativeEntry, queryEntry] = [...state(driver).clients];
+    const querySocket = sockets[2];
+    expect(queryEntry.client.isReady).toBe(true);
     driver.cancelCurrentOperation({
       reason: "manual",
       operationName: "query",
       requestToken: 101,
     });
     await bounded(rejected);
+    await vi.waitFor(() => expect(querySocket.readyState).toBe("closed"));
     expect(state(driver).queries.size).toBe(0);
     expect(state(driver).clients.size).toBe(2);
-    expect(entry.client.isOpen).toBe(true);
-    expect(entry.client.isReady).toBe(true);
+    expect(baseEntry.client.isOpen).toBe(true);
+    expect(baseEntry.client.isReady).toBe(true);
+    expect(nativeEntry.client.isOpen).toBe(true);
+    expect(nativeEntry.client.isReady).toBe(true);
+    expect(querySocket.destroyed).toBe(true);
+    expect(queryEntry.client.isOpen).toBe(false);
+    expect(queryEntry.client.isReady).toBe(false);
     expect(sockets[0].destroyed).toBe(false);
+    expect(sockets[1].destroyed).toBe(false);
     expect((await driver.readTablePage(page("db1"))).rows[0]?.value).toBe(
       "db-1",
     );
-    // A late response is still drained by node-redis without corrupting the
-    // next command's reply, but cannot resume the cancelled query's SET.
-    const stalled = server.commands.find(({ args }) => args.includes("hang"));
-    stalled?.socket.write("$4\r\nlate\r\n");
     expect((await driver.query("GET shared")).rows[0]?.__col_0).toBe("db-0");
+    expect(server.commands.some(({ args }) => args[0] === "SET")).toBe(false);
+  });
+
+  it("cancels a query-editor BLPOP without blocking the shared Redis session", async () => {
+    const driver = makeDriver();
+    await driver.connect();
+    const baseEntry = [...state(driver).clients][0];
+    const pending = driver.query("BLPOP blocked 0; SET shared wrong", [], {
+      requestToken: 102,
+    });
+    const rejected = expect(pending).rejects.toThrow();
+    await vi.waitFor(() =>
+      expect(server.commands.some(({ args }) => args[0] === "BLPOP")).toBe(
+        true,
+      ),
+    );
+    const queryEntry = [...state(driver).clients][1];
+    const querySocket = sockets[1];
+    expect(queryEntry.client.isReady).toBe(true);
+    driver.cancelCurrentOperation({
+      reason: "manual",
+      operationName: "query",
+      requestToken: 102,
+    });
+    await bounded(rejected);
+    await vi.waitFor(() => expect(querySocket.readyState).toBe("closed"));
+
+    expect(state(driver).clients.size).toBe(1);
+    await vi.waitFor(() => expect(server.sockets.size).toBe(1));
+    expect(querySocket.destroyed).toBe(true);
+    expect(queryEntry.client.isOpen).toBe(false);
+    expect(queryEntry.client.isReady).toBe(false);
+    expect(baseEntry.client.isOpen).toBe(true);
+    expect(baseEntry.client.isReady).toBe(true);
+    await bounded(driver.query("GET shared"));
     expect(server.commands.some(({ args }) => args[0] === "SET")).toBe(false);
   });
 
@@ -547,7 +587,7 @@ describe("B02 real node-redis 6 transport lifecycle", () => {
       ).toBe(3),
     );
     const entries = [...state(driver).clients];
-    expect(entries).toHaveLength(3);
+    expect(entries).toHaveLength(4);
     await bounded(driver.disconnect());
     expect(
       (await bounded(settled)).every((result) => result.status === "rejected"),

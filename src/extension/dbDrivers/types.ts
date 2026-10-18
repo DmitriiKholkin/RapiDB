@@ -12,6 +12,7 @@ import type {
   FilterOperator,
   ForeignKeyMeta,
   IndexMeta,
+  MongoValueTypeHint,
   QueryColumnMeta,
   QueryMissingCell,
   TableConstraintMeta,
@@ -29,6 +30,7 @@ export {
   type GeneratedKind,
   type IdentityGenerationKind,
   type IndexMeta,
+  type MongoValueTypeHint,
   NULL_SENTINEL,
   type QueryColumnMeta,
   type QueryMissingCell,
@@ -113,6 +115,8 @@ export interface DriverCapabilities {
   editorPresentation?: QueryEditorPresentation;
   isTableFilterError?: (message: string) => boolean;
   readOnlyQueryGuard?: ReadOnlyQueryGuard;
+  /** Returns whether a native query may change discoverable schema objects. */
+  schemaMutationGuard?: (queryText: string) => boolean;
 }
 
 export interface DriverStaticMetadata {
@@ -191,6 +195,8 @@ export interface DriverTablePageResult {
   rows: Record<string, unknown>[];
   /** BSON _id type for each MongoDB table row, aligned with rows. */
   mongoIdTypes?: Array<"objectId" | "string" | null>;
+  /** Per-row BSON field types, aligned with rows, for schema-less edits. */
+  mongoValueTypes?: Array<Record<string, MongoValueTypeHint>>;
   totalCount: number;
   executionTimeMs?: number;
 }
@@ -215,6 +221,8 @@ export interface DriverUpdateRowsRequest {
     primaryKeys: Record<string, unknown>;
     changes: Record<string, unknown>;
     originalValues?: Record<string, unknown>;
+    /** Original MongoDB field types, including null, undefined and missing. */
+    originalTypes?: Record<string, MongoValueTypeHint>;
   }>;
 }
 
@@ -352,6 +360,8 @@ export interface IDBDriver {
   readTablePage?(
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult>;
+  /** Drop any driver-owned read/page cursor state after an explicit refresh. */
+  clearTableReadCache?(): void;
   /** Full unfiltered/default-order export; owns cursor/snapshot cleanup. */
   exportTableChunks?(
     request: DriverTableExportRequest,
@@ -378,6 +388,7 @@ export interface IDBDriver {
       primaryKeys?: Record<string, unknown>;
       changes?: Record<string, unknown>;
       originalValues?: Record<string, unknown>;
+      originalTypes?: Record<string, MongoValueTypeHint>;
       values?: Record<string, unknown>;
       primaryKeyValuesList?: Array<Record<string, unknown>>;
     },
@@ -391,6 +402,7 @@ export interface IDBDriver {
       primaryKeys?: Record<string, unknown>;
       changes?: Record<string, unknown>;
       originalValues?: Record<string, unknown>;
+      originalTypes?: Record<string, MongoValueTypeHint>;
       values?: Record<string, unknown>;
       primaryKeyValuesList?: Array<Record<string, unknown>>;
     },
@@ -433,6 +445,12 @@ export interface IDBDriver {
     tableReference: string,
   ): string;
   coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown;
+  /** Coerce a Table Viewer edit while optionally preserving a row's native type. */
+  coerceTableEditValue?(
+    value: unknown,
+    column: ColumnTypeMeta,
+    options?: { preserveNativeType?: boolean },
+  ): unknown;
   /** Validate and decode a table row locator without guessing from sampled types. */
   coercePrimaryKeyValue?(value: unknown, column: ColumnTypeMeta): unknown;
   coerceOriginalValue?(value: unknown, column: ColumnTypeMeta): unknown;

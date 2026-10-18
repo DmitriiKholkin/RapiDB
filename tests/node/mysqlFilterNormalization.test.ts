@@ -50,6 +50,66 @@ describe("mysql filter normalization", () => {
     });
   });
 
+  it("matches text operands using the column charset and collation", () => {
+    const varcharColumn = {
+      ...buildColumn("label", "varchar(80)", "text"),
+      characterSet: "utf8mb4",
+      collation: "utf8mb4_0900_ai_ci",
+    };
+
+    expect(
+      driver.buildFilterCondition(varcharColumn, "like", "Привет", 1),
+    ).toEqual({
+      sql: "`label` LIKE CONVERT(CONVERT(UNHEX(?) USING utf8mb4) USING utf8mb4) COLLATE utf8mb4_0900_ai_ci ESCAPE '!'",
+      params: [Buffer.from("%Привет%", "utf8").toString("hex")],
+    });
+  });
+
+  it("transcodes UTF-8 filter values to the column charset", () => {
+    const latin1Column = {
+      ...buildColumn("label", "varchar(80)", "text"),
+      characterSet: "latin1",
+      collation: "latin1_swedish_ci",
+    };
+
+    expect(
+      driver.buildFilterCondition(latin1Column, "like", "café", 1),
+    ).toEqual({
+      sql: "(`label` LIKE CONVERT(CONVERT(UNHEX(?) USING utf8mb4) USING latin1) COLLATE latin1_swedish_ci ESCAPE '!' AND CAST(CONVERT(CONVERT(CONVERT(UNHEX(?) USING utf8mb4) USING latin1) USING utf8mb4) AS BINARY) = UNHEX(?))",
+      params: Array(3).fill(Buffer.from("%café%", "utf8").toString("hex")),
+    });
+  });
+
+  it("uses catalog charset for collations without a charset prefix", () => {
+    const mariaDbColumn = {
+      ...buildColumn("label", "varchar(80)", "text"),
+      characterSet: "utf8mb4",
+      collation: "uca1400_ai_ci",
+    };
+
+    expect(
+      driver.buildFilterCondition(mariaDbColumn, "like", "needle", 1),
+    ).toEqual({
+      sql: "`label` LIKE CONVERT(CONVERT(UNHEX(?) USING utf8mb4) USING utf8mb4) COLLATE uca1400_ai_ci ESCAPE '!'",
+      params: [Buffer.from("%needle%", "utf8").toString("hex")],
+    });
+  });
+
+  it("does not interpolate unsupported MySQL collation tokens", () => {
+    const varcharColumn = {
+      ...buildColumn("label", "varchar(80)", "text"),
+      characterSet: "utf8mb4",
+      collation: "utf8mb4_0900_ai_ci` OR 1=1 --",
+    };
+
+    expect(
+      driver.buildFilterCondition(varcharColumn, "like", "needle", 1),
+    ).toEqual({
+      sql: "`label` LIKE CAST(UNHEX(?) AS CHAR) ESCAPE '!'",
+      params: [Buffer.from("%needle%", "utf8").toString("hex")],
+    });
+  });
+
   it("uses text contains matching for valid JSON filter input", () => {
     const condition = driver.buildFilterCondition(
       buildColumn("payload", "json", "json"),

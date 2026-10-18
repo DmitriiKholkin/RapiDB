@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import type { ColumnTypeMeta as ColumnMeta } from "../../shared/tableTypes";
+import type {
+  ColumnTypeMeta as ColumnMeta,
+  MongoValueTypeHint,
+} from "../../shared/tableTypes";
 import type { Row } from "../types";
 import { postMessage } from "../utils/messaging";
 import { readWebviewState, updateWebviewState } from "../utils/vscodeState";
@@ -69,6 +72,9 @@ export function TableView({
   const columnsRef = useRef<ColumnMeta[]>([]);
   const rowsRef = useRef<Row[]>([]);
   const mongoIdTypesRef = useRef<Array<"objectId" | "string" | null>>([]);
+  const mongoValueTypesRef = useRef<Array<Record<string, MongoValueTypeHint>>>(
+    [],
+  );
   const pkColsRef = useRef<string[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const fetchPageRef = useRef<
@@ -114,6 +120,7 @@ export function TableView({
     columnsRef,
     rowsRef,
     mongoIdTypesRef,
+    mongoValueTypesRef,
     pkColsRef,
     scrollRef,
     fetchPageRef,
@@ -149,6 +156,7 @@ export function TableView({
     preserveScrollPositionRef,
     rowsRef,
     mongoIdTypesRef,
+    mongoValueTypesRef,
     selected,
   });
 

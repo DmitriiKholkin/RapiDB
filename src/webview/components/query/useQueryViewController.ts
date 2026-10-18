@@ -275,10 +275,13 @@ export function useQueryViewController({
         const currentConnectionId =
           useConnectionStore.getState().activeConnectionId;
         if (
+          currentConnectionId &&
           !payload.some((connection) => connection.id === currentConnectionId)
         ) {
           invalidateBookmark();
-          handleConnectionChange(payload[0]?.id ?? "");
+          // A draft may contain writes for the removed database. Require an
+          // explicit choice before it can run against any other connection.
+          handleConnectionChange("");
         }
         setConnectionsLoaded(true);
         setConnections(payload);
@@ -539,6 +542,7 @@ export function useQueryViewController({
     result,
     schema,
     schemaLoading:
+      !!resolvedConnectionId &&
       connections.length > 0 &&
       schemaByConnection[resolvedConnectionId] === undefined,
     startResizing,

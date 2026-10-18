@@ -4,7 +4,7 @@
  * All parsers are pure; `null` indicates a parse failure.
  */
 
-import type { ColumnTypeMeta } from "../tableTypes";
+import type { ColumnTypeMeta, MongoValueTypeHint } from "../tableTypes";
 import type { PanelRetentionState, WebviewMessageEnvelope } from "./shared";
 import {
   isRecord,
@@ -59,6 +59,7 @@ export interface RowUpdateMessagePayload {
   primaryKeys: Record<string, unknown>;
   changes: Record<string, unknown>;
   originalValues?: Record<string, unknown>;
+  originalTypes?: Record<string, MongoValueTypeHint>;
 }
 
 export type TableMutationPreviewKind =
@@ -248,7 +249,43 @@ function isRowUpdateMessagePayload(
     isRecord(value) &&
     isRecord(value.primaryKeys) &&
     isRecord(value.changes) &&
-    (value.originalValues === undefined || isRecord(value.originalValues))
+    (value.originalValues === undefined || isRecord(value.originalValues)) &&
+    (value.originalTypes === undefined ||
+      (isRecord(value.originalTypes) &&
+        Object.values(value.originalTypes).every(isMongoValueTypeHint)))
+  );
+}
+
+function isMongoValueTypeHint(value: unknown): value is MongoValueTypeHint {
+  if (!isRecord(value)) return false;
+  const categories = new Set([
+    "text",
+    "integer",
+    "float",
+    "decimal",
+    "boolean",
+    "date",
+    "time",
+    "datetime",
+    "binary",
+    "json",
+    "uuid",
+    "spatial",
+    "interval",
+    "array",
+    "enum",
+    "lob",
+    "other",
+  ]);
+  return (
+    typeof value.category === "string" &&
+    categories.has(value.category) &&
+    typeof value.nativeType === "string" &&
+    (value.bsonSubtype === undefined ||
+      (typeof value.bsonSubtype === "number" &&
+        Number.isInteger(value.bsonSubtype) &&
+        value.bsonSubtype >= 0 &&
+        value.bsonSubtype <= 255))
   );
 }
 

@@ -206,6 +206,7 @@ const READ_ONLY_REDIS_COMMANDS = new Set([
   "LLEN",
   "LRANGE",
   "MGET",
+  "PING",
   "PTTL",
   "SCAN",
   "SCARD",
@@ -978,7 +979,7 @@ export class RedisDriver implements IDBDriver {
     _params?: unknown[],
     options?: QueryExecutionOptions,
   ): Promise<QueryResult> {
-    return this.executeQuery(sql, options);
+    return this.executeQuery(sql, options, options?.signal);
   }
 
   private async executeQuery(
@@ -1000,8 +1001,9 @@ export class RedisDriver implements IDBDriver {
     const statements = splitRedisStatements(trimmed);
     const results: unknown[] = [];
     const abort = new AbortController();
-    const querySignal = signal
-      ? AbortSignal.any([signal, abort.signal])
+    const externalSignal = signal ?? options?.signal;
+    const querySignal = externalSignal
+      ? AbortSignal.any([externalSignal, abort.signal])
       : abort.signal;
     const epoch = this.epoch;
     if (options?.requestToken !== undefined)
@@ -1009,12 +1011,19 @@ export class RedisDriver implements IDBDriver {
     let entry: RedisClientEntry | undefined;
     let onAbort: (() => void) | undefined;
     try {
-      // Explicit query scopes use a disposable session: SELECT in query text must
-      // never change either the editor's base session or cached native DB clients.
+      // Query editor runs are cancellable after commands reach Redis. Give every
+      // cancellable query its own session so abort can close a blocked command
+      // without leaving later work queued behind it on the shared base client.
+      // Explicit database scopes also stay isolated so SELECT cannot change the
+      // editor's base session or cached native DB clients.
       querySignal.throwIfAborted();
       this.requireClient();
-      if (options?.database) {
-        entry = this.openClient(this.resolveDbIndex(options.database));
+      if (
+        options?.database ||
+        options?.requestToken !== undefined ||
+        externalSignal !== undefined
+      ) {
+        entry = this.openClient(this.resolveDbIndex(options?.database));
         const owned = entry;
         onAbort = () => {
           this.cancelClientEntry(owned, querySignal.reason);
@@ -1025,7 +1034,7 @@ export class RedisDriver implements IDBDriver {
         ? await this.waitForResult(entry.promise, querySignal)
         : this.requireClient();
       const client =
-        options?.requestToken !== undefined || signal
+        options?.requestToken !== undefined || externalSignal
           ? baseClient.withAbortSignal(querySignal)
           : baseClient;
       for (const statement of statements) {

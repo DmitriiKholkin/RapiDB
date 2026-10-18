@@ -404,7 +404,7 @@ describe("QueryView", () => {
       ]),
     );
     receiveBookmark({ ...(first as object), ok: true });
-    expect(button.disabled).toBe(false);
+    expect(button.disabled).toBe(true);
     expect(button.title).toBe("Add to Bookmarks");
     expect(
       (screen.getByLabelText("SQL editor") as HTMLTextAreaElement).value,
@@ -481,7 +481,7 @@ describe("QueryView", () => {
     ).toBe("select 2");
   });
 
-  it("falls back to an available connection when the persisted active connection was removed", () => {
+  it("requires an explicit choice when the persisted active connection was removed", () => {
     const api = window.__vscode as NonNullable<Window["__vscode"]> & {
       getState: ReturnType<typeof vi.fn>;
     };
@@ -509,11 +509,27 @@ describe("QueryView", () => {
 
     expect(
       (screen.getByLabelText("Active connection") as HTMLSelectElement).value,
-    ).toBe("conn-2");
-    expect(getPostedMessages()).toContainEqual({
-      type: "activeConnectionChanged",
-      payload: { connectionId: "conn-2" },
-    });
+    ).toBe("");
+    expect(
+      (screen.getByRole("button", { name: "Run" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(
+      (screen.getByLabelText("Active connection") as HTMLSelectElement)
+        .disabled,
+    ).toBe(false);
+    expect(screen.getByRole("option", { name: "—" })).toBeTruthy();
+    expect(screen.queryByText("Indexing schema…")).toBeNull();
+    for (const name of ["Run", "Clear", "Format", "Bookmark"]) {
+      expect(
+        (screen.getByRole("button", { name }) as HTMLButtonElement).disabled,
+      ).toBe(true);
+    }
+    expect(
+      getPostedMessages().some(
+        (message) => message.type === "activeConnectionChanged",
+      ),
+    ).toBe(false);
   });
 
   it.each([
@@ -661,7 +677,7 @@ describe("QueryView", () => {
     expect(useQueryStore.getState().status).toBe("running");
   });
 
-  it("resets a running query on removed-connection fallback and ignores its stale responses", async () => {
+  it("clears a removed connection without selecting another and ignores stale responses", async () => {
     const user = userEvent.setup();
     render(<QueryView connectionId="conn-1" initialQueryText="select 1" />);
     act(() =>
@@ -687,14 +703,18 @@ describe("QueryView", () => {
     expect(
       (screen.getByRole("button", { name: "Run" }) as HTMLButtonElement)
         .disabled,
-    ).toBe(false);
+    ).toBe(true);
     expect(
       (screen.getByLabelText("SQL editor") as HTMLTextAreaElement).value,
     ).toBe("select 1");
-    expect(getPostedMessages()).toContainEqual({
-      type: "activeConnectionChanged",
-      payload: { connectionId: "conn-2" },
+    expect(useConnectionStore.getState().activeConnectionId).toBe("");
+    clearPostedMessages();
+    fireEvent.keyDown(screen.getByLabelText("SQL editor"), { key: "F5" });
+    fireEvent.keyDown(screen.getByLabelText("SQL editor"), {
+      key: "Enter",
+      ctrlKey: true,
     });
+    expect(getPostedMessages()).toEqual([]);
     const staleResult = {
       ...oldRequest,
       columns: [],
@@ -705,6 +725,10 @@ describe("QueryView", () => {
     };
     act(() => dispatchIncomingMessage("queryResult", staleResult));
     expect(useQueryStore.getState().status).toBe("idle");
+    await user.selectOptions(
+      screen.getByLabelText("Active connection"),
+      "conn-2",
+    );
     await user.click(screen.getByRole("button", { name: "Run" }));
     const newRequest = getLastPostedMessage()?.payload as {
       operationId: string;
@@ -786,9 +810,7 @@ describe("QueryView", () => {
     expect(
       (screen.getByLabelText("Active connection") as HTMLSelectElement).value,
     ).toBe("");
-    expect(
-      screen.getByRole("option", { name: "No connections available" }),
-    ).toBeTruthy();
+    expect(screen.getByRole("option", { name: "—" })).toBeTruthy();
     expect(screen.queryByTitle("Loading connections…")).toBeNull();
     expect(
       (screen.getByLabelText("SQL editor") as HTMLTextAreaElement).value,
@@ -809,11 +831,20 @@ describe("QueryView", () => {
       },
     });
 
-    // Returning connections restores a usable selection without reviving the old run.
+    // Returning connections still requires an explicit choice before running the draft.
     act(() =>
       dispatchIncomingMessage("connections", [
         { id: "conn-2", name: "New connection", type: "pg" },
       ]),
+    );
+    expect(useConnectionStore.getState().activeConnectionId).toBe("");
+    expect(
+      (screen.getByRole("button", { name: "Run" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    await user.selectOptions(
+      screen.getByLabelText("Active connection"),
+      "conn-2",
     );
     await user.click(screen.getByRole("button", { name: "Run" }));
     const newRequest = getLastPostedMessage()?.payload as {
@@ -848,7 +879,17 @@ describe("QueryView", () => {
         initialQueryText="select 0"
       />,
     );
-    act(() => dispatchIncomingMessage("connections", []));
+    act(() =>
+      dispatchIncomingMessage("connections", [
+        { id: "conn-2", name: "Other database", type: "pg" },
+      ]),
+    );
+    for (const name of ["Run", "Clear", "Format", "Bookmark"]) {
+      expect(
+        (screen.getByRole("button", { name }) as HTMLButtonElement).disabled,
+      ).toBe(true);
+    }
+    expect(screen.getByRole("option", { name: "—" })).toBeTruthy();
     fireEvent.keyDown(screen.getByLabelText("SQL editor"), { key: "F5" });
     expect(useConnectionStore.getState().activeConnectionId).toBe("");
     expect(getPostedMessages()).toEqual([{ type: "getConnections" }]);

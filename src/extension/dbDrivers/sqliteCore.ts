@@ -1486,6 +1486,24 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     }
     return super.formatOutputValue(value, column);
   }
+  formatTableDataValue(
+    value: unknown,
+    column: ColumnTypeMeta,
+    _projectionValues: Record<string, unknown>,
+    _columnIndex: number,
+    _columns: readonly ColumnTypeMeta[] = [],
+  ): unknown {
+    // SQLite keeps DATETIME/TIMESTAMP values as text. Keep their original
+    // spelling in Table Viewer rows because those values are reused by the
+    // optimistic UPDATE predicate; Query Results can keep normalizing dates.
+    if (
+      this.isDatetimeWithTime(column.nativeType) &&
+      typeof value === "string"
+    ) {
+      return value;
+    }
+    return this.formatOutputValue(value, column);
+  }
   override checkPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,

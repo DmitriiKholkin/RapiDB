@@ -1089,7 +1089,7 @@ describe("parseDynamoDbNativeQueryInput", () => {
     expect(driver.formatOutputValue(value, createMapColumn())).toBe(text);
   });
 
-  it("guards nested special values even when another row supplied string metadata", () => {
+  it("round-trips nested sets even when another row supplied string metadata", () => {
     const { driver } = createDriver();
     const column = {
       ...createMapColumn(),
@@ -1100,10 +1100,10 @@ describe("parseDynamoDbNativeQueryInput", () => {
       { nested: new Set(["a"]) },
       column,
     );
-    expect(displayed).toMatch(/^Read-only DynamoDB value/);
-    expect(() => driver.coerceInputValue(displayed, column)).toThrow(
-      "read-only",
-    );
+    expect(displayed).toMatch(/^DynamoDB native value/);
+    expect(driver.coerceInputValue(displayed, column)).toEqual({
+      nested: new Set(["a"]),
+    });
   });
 
   it("parses the empty-binary marker independently of sampled metadata", () => {
@@ -1235,14 +1235,18 @@ describe("parseDynamoDbNativeQueryInput", () => {
     new Set(["a"]),
     Buffer.from([1, 2]),
     new Set([NumberValueImpl.from("9007199254740993")]),
-  ])("blocks lossy nested set/binary table edits (%s)", (special) => {
+    new Set([Buffer.from([0]), Buffer.from([255])]),
+  ])("preserves nested set/binary AttributeValue types through editing (%s)", (special) => {
     const { driver } = createDriver();
     const column = createMapColumn();
-    const displayed = driver.formatOutputValue({ nested: [special] }, column);
-    expect(displayed).toMatch(/^Read-only DynamoDB value/);
-    expect(() => driver.coerceInputValue(displayed, column)).toThrow(
-      "read-only",
+    const original = { nested: [special] };
+    const displayed = driver.formatOutputValue(original, column);
+    expect(displayed).toMatch(/^DynamoDB native value/);
+    const edited = driver.coerceInputValue(displayed, column);
+    expect(toJsonSafeValue(marshall({ value: edited }))).toEqual(
+      toJsonSafeValue(marshall({ value: original })),
     );
+    expect(driver.formatOutputValue(edited, column)).toBe(displayed);
   });
 
   it("parses a single raw AWS request body", () => {

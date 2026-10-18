@@ -429,7 +429,12 @@ describe("B07 Redis draft NULL UI → host → real node-redis RESP wire", () =>
         skipCount: false,
       });
       const original = page?.rows.find((row) => row.key === key);
-      expect(original?.value).toBe(NULL_SENTINEL);
+      const snapshot = {
+        __rapidbRedisBinary: 1,
+        binaryHex: Buffer.from(NULL_SENTINEL).toString("hex"),
+        displayValue: `RedisBinary(0x${Buffer.from(NULL_SENTINEL).toString("hex")})`,
+      };
+      expect(original?.value).toEqual(snapshot);
       const columns = await driver.describeColumns("db0", "", "drafts");
       const prepared = prepareApplyChangesPlan(
         context.connectionManager,
@@ -451,7 +456,7 @@ describe("B07 Redis draft NULL UI → host → real node-redis RESP wire", () =>
         {
           primaryKeys: { key },
           changes: { [change]: null },
-          originalValues: { value: NULL_SENTINEL },
+          originalValues: { value: snapshot },
         },
       ]);
       // Change the actual store after preparation, before the atomic edit.
@@ -461,6 +466,15 @@ describe("B07 Redis draft NULL UI → host → real node-redis RESP wire", () =>
         prepared.plan,
       );
       const evals = server.commands.filter((args) => args[0] === "EVAL");
+      if (change === "value" && !concurrent) {
+        expect(result.success).toBe(false);
+        expect(result.error).toMatch(
+          /Binary-backed Redis string values are read-only/,
+        );
+        expect(evals).toHaveLength(0);
+        expect(server.rows.get(key)).toEqual({ value: NULL_SENTINEL, ttl: 60 });
+        return;
+      }
       expect(evals).toHaveLength(1);
       expect(evals[0][1]).toContain("redis.call('GET', source) ~= ARGV[2]");
       expect(evals[0].slice(2)).toEqual([
@@ -485,8 +499,8 @@ describe("B07 Redis draft NULL UI → host → real node-redis RESP wire", () =>
       } else {
         expect(result.success).toBe(true);
         expect(server.rows.get(key)).toEqual({
-          value: change === "value" ? "" : NULL_SENTINEL,
-          ttl: change === "ttl" ? -1 : 60,
+          value: NULL_SENTINEL,
+          ttl: -1,
         });
       }
     });

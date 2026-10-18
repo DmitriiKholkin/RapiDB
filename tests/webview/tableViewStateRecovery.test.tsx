@@ -832,6 +832,54 @@ describe("TableView persisted state recovery", () => {
     });
   });
 
+  it("recovers from a restored invalid filter without showing stale rows or retrying it", () => {
+    vi.useFakeTimers();
+    const view = {
+      page: 3,
+      pageSize: 100,
+      sort: { column: "id", direction: "desc" as const },
+      filters: { name: { operator: "like" as const, value: "Alice" } },
+    };
+    const persisted = persistView(view);
+    renderTable();
+    const failed = initialize([idColumn, nameColumn]);
+
+    expect(failed).toMatchObject({
+      page: 3,
+      filters: [{ column: "name", operator: "like", value: "Alice" }],
+    });
+
+    act(() => {
+      dispatchIncomingMessage("tableError", {
+        fetchId: failed.fetchId,
+        error: "Invalid numeric filter",
+        isFilterError: true,
+      });
+    });
+
+    expect(screen.getByRole("table")).toBeTruthy();
+    expect(screen.getByText(/Invalid numeric filter/)).toBeTruthy();
+    expect(screen.getByText("0 rows total")).toBeTruthy();
+    expect(screen.getByText("Page 1 of 1")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Add Row" })).toBeNull();
+    expect(fetches()).toHaveLength(1);
+    expect(persisted()).toMatchObject({ tableView: { page: 1 } });
+
+    fireEvent.change(screen.getByLabelText("name filter value"), {
+      target: { value: "Bob" },
+    });
+    act(() => vi.advanceTimersByTime(DEBOUNCE + 1));
+
+    const recovered = lastFetch();
+    expect(recovered).toMatchObject({
+      page: 1,
+      filters: [{ column: "name", operator: "like", value: "Bob" }],
+    });
+    commit(recovered.fetchId);
+    expect(screen.queryByText("Invalid numeric filter")).toBeNull();
+    expect(isButtonDisabled("Add Row")).toBe(false);
+  });
+
   it("removes unsupported and non-filterable value filters but retains supported null checks", () => {
     vi.useFakeTimers();
     const view = {

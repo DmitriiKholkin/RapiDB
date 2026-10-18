@@ -264,11 +264,60 @@ export class ElasticsearchDriver implements IDBDriver {
       supportsMutations: true,
       readOnlyQueryGuard: (queryText: string) =>
         this.decideReadOnlyQuery(queryText),
+      schemaMutationGuard: (queryText: string) =>
+        this.mayChangeDiscoverableIndices(queryText),
       editorPresentation: {
         formatOnOpen: false,
         editorLanguage: "plaintext" as const,
       },
     };
+  }
+
+  private mayChangeDiscoverableIndices(queryText: string): boolean {
+    try {
+      return this.parseRestCommands(queryText).some((command) => {
+        const [index, endpoint] = command.pathSegments;
+        if (
+          command.pathSegments.length === 1 &&
+          (command.method === "PUT" || command.method === "DELETE")
+        ) {
+          return true;
+        }
+
+        if (command.method === "POST" && index === "_aliases") {
+          return true;
+        }
+
+        if (
+          index &&
+          (command.method === "PUT" || command.method === "POST") &&
+          endpoint === "_doc" &&
+          (command.pathSegments.length === 2 ||
+            command.pathSegments.length === 3)
+        ) {
+          // Indexing a document may implicitly create its index.
+          return true;
+        }
+
+        if (
+          index &&
+          command.method === "POST" &&
+          endpoint === "_update" &&
+          command.pathSegments.length === 3
+        ) {
+          // Update with upsert may create an index or add dynamically mapped fields.
+          return true;
+        }
+
+        return (
+          command.method === "PUT" &&
+          command.pathSegments.length === 2 &&
+          (endpoint === "_mapping" || endpoint === "_settings")
+        );
+      });
+    } catch {
+      return false;
+    }
   }
 
   private decideReadOnlyQuery(queryText: string) {

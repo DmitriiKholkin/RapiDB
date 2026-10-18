@@ -788,6 +788,7 @@ describe("TableView", () => {
           current: [{ _id: "507f1f77bcf86cd799439011", name: "Ambiguous" }],
         },
         mongoIdTypesRef: { current: [] },
+        mongoValueTypesRef: { current: [] },
         selected: new Set([0]),
       }),
     );
@@ -1089,6 +1090,7 @@ describe("TableView", () => {
           ],
         },
         mongoIdTypesRef: { current: [] },
+        mongoValueTypesRef: { current: [] },
         selected: new Set([0, 1]),
       }),
     );
@@ -2405,6 +2407,7 @@ describe("TableView", () => {
         preserveScrollPositionRef: { current: vi.fn() },
         rowsRef: { current: rows },
         mongoIdTypesRef: { current: [] },
+        mongoValueTypesRef: { current: [] },
         selected: new Set(),
       }),
     );
@@ -3845,6 +3848,7 @@ describe("TableView", () => {
           preserveScrollPositionRef: { current: vi.fn() },
           rowsRef,
           mongoIdTypesRef: { current: [] },
+          mongoValueTypesRef: { current: [] },
           selected,
         }),
       { initialProps: { selected: new Set([0]) } },
@@ -3918,6 +3922,7 @@ describe("TableView", () => {
         preserveScrollPositionRef: { current: vi.fn() },
         rowsRef,
         mongoIdTypesRef,
+        mongoValueTypesRef: { current: [] },
         selected: new Set([0]),
       }),
     );
@@ -4694,9 +4699,10 @@ describe("TableView", () => {
     });
 
     expect(screen.getByText(/Bad filter expression/)).toBeTruthy();
-    expect(screen.getByText("51 rows total")).toBeTruthy();
-    expect(screen.getByText("Page 2 of 3")).toBeTruthy();
-    expect(screen.getByText("Alice")).toBeTruthy();
+    expect(screen.getByText("0 rows total")).toBeTruthy();
+    expect(screen.getByText("Page 1 of 1")).toBeTruthy();
+    expect(screen.queryByText("Alice")).toBeNull();
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
     expect(
       screen.queryByRole("status", { name: "Loading data..." }),
     ).toBeNull();

@@ -11,6 +11,7 @@ import {
   type ColumnTypeMeta as ColumnMeta,
   type FilterDraft,
   type FilterDraftMap,
+  type MongoValueTypeHint,
   serializeFilterDrafts,
 } from "../../../shared/tableTypes";
 import type { TableInitPayload } from "../../../shared/webviewContracts";
@@ -35,6 +36,9 @@ interface UseTableDataControllerParams {
   columnsRef: MutableRefObject<ColumnMeta[]>;
   rowsRef: MutableRefObject<Row[]>;
   mongoIdTypesRef: MutableRefObject<Array<"objectId" | "string" | null>>;
+  mongoValueTypesRef: MutableRefObject<
+    Array<Record<string, MongoValueTypeHint>>
+  >;
   pkColsRef: MutableRefObject<string[]>;
   scrollRef: RefObject<HTMLDivElement | null>;
   fetchPageRef: MutableRefObject<
@@ -120,6 +124,7 @@ export function useTableDataController({
   columnsRef,
   rowsRef,
   mongoIdTypesRef,
+  mongoValueTypesRef,
   pkColsRef,
   scrollRef,
   fetchPageRef,
@@ -176,6 +181,7 @@ export function useTableDataController({
   const hasCommittedDataRef = useRef(hasCommittedData);
   const requestedPageRef = useRef(requestedPage);
   const requestedPageSizeRef = useRef(requestedPageSize);
+  const skipNextFetchRef = useRef(false);
   const debouncedFilterDraftsRef = useRef(debouncedFilterDrafts);
   const initializedRef = useRef(false);
   const fetchEpochRef = useRef(0);
@@ -319,6 +325,7 @@ export function useTableDataController({
       setHasCommittedData(false);
       setRows([]);
       mongoIdTypesRef.current = [];
+      mongoValueTypesRef.current = [];
       setError(null);
       const nextSort =
         requestedSortRef.current &&
@@ -341,7 +348,7 @@ export function useTableDataController({
       setDebouncedFilterDrafts(nextFilters);
       setInitTick((tick) => tick + 1);
     }
-  }, [columnsRef, pkColsRef, rowsRef, mongoIdTypesRef]);
+  }, [columnsRef, pkColsRef, rowsRef, mongoIdTypesRef, mongoValueTypesRef]);
 
   const syncRequestedFilterState = useCallback(
     (nextDrafts: FilterDraftMap) => {
@@ -519,6 +526,7 @@ export function useTableDataController({
         setPkCols([]);
         setRows([]);
         mongoIdTypesRef.current = [];
+        mongoValueTypesRef.current = [];
         committedColumnNamesRef.current = new Set();
         setTotalCount(0);
         clearErrors();
@@ -604,6 +612,7 @@ export function useTableDataController({
       fetchId?: number;
       rows: Row[];
       mongoIdTypes?: Array<"objectId" | "string" | null>;
+      mongoValueTypes?: Array<Record<string, MongoValueTypeHint>>;
       totalCount: number;
       executionTimeMs?: number;
     }>(
@@ -612,6 +621,7 @@ export function useTableDataController({
         fetchId,
         rows: nextRows,
         mongoIdTypes,
+        mongoValueTypes,
         totalCount: nextTotalCount,
         executionTimeMs: nextExecutionTimeMs,
       }) => {
@@ -671,6 +681,9 @@ export function useTableDataController({
           : [];
         setRows(nextRows);
         mongoIdTypesRef.current = nextMongoIdTypes;
+        mongoValueTypesRef.current = Array.isArray(mongoValueTypes)
+          ? mongoValueTypes
+          : [];
         setTotalCount(nextTotalCount);
         setExecutionTimeMs(nextExecutionTimeMs);
         setPage(snapshot.page);
@@ -717,10 +730,32 @@ export function useTableDataController({
         return;
       }
 
-      if (!hasCommittedDataRef.current) {
-        setError(nextError);
-      } else if (isFilterError) {
+      if (isFilterError) {
+        setError(null);
         setFilterError(nextError);
+        // Rows on screen belong to the previous filter state. Do not keep
+        // presenting them as the result of a filter that failed validation.
+        if (!hasCommittedDataRef.current) {
+          // A restored invalid filter can fail before the first page arrives.
+          // Show the schema and filter controls so the user can correct it;
+          // keep mutations disabled until a successful read commits data.
+          setColumns(columnsRef.current);
+          setPkCols(pendingPrimaryKeyColumnsRef.current);
+          setReadOnlyTable(true);
+          setHasCommittedData(true);
+        }
+        setRows([]);
+        setTotalCount(0);
+        setExecutionTimeMs(undefined);
+        if (requestedPageRef.current !== 1) {
+          // Persist page 1 without immediately retrying the same invalid filter.
+          skipNextFetchRef.current = true;
+          requestedPageRef.current = 1;
+          setRequestedPage(1);
+        }
+        setPage(1);
+      } else if (!hasCommittedDataRef.current) {
+        setError(nextError);
       } else {
         setReadError(nextError);
       }
@@ -738,7 +773,14 @@ export function useTableDataController({
       unData();
       unError();
     };
-  }, [advanceFetchEpoch, columnsRef, initialView, mongoIdTypesRef, scrollRef]);
+  }, [
+    advanceFetchEpoch,
+    columnsRef,
+    initialView,
+    mongoIdTypesRef,
+    mongoValueTypesRef,
+    scrollRef,
+  ]);
 
   const fetchTrigger = useMemo(
     () =>
@@ -762,6 +804,11 @@ export function useTableDataController({
   // biome-ignore lint/correctness/useExhaustiveDependencies: fetchTrigger is a synthetic trigger that encodes page/sort/filter state; fetchPage reads those values from stable refs at call time.
   useEffect(() => {
     if (!initializedRef.current) {
+      return;
+    }
+
+    if (skipNextFetchRef.current) {
+      skipNextFetchRef.current = false;
       return;
     }
 

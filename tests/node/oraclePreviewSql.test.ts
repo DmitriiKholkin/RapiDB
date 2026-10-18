@@ -308,10 +308,7 @@ describe("Oracle preview SQL literals", () => {
     const column = buildColumn("COL_DATE", "DATE", "date");
 
     expect(
-      driver.formatOutputValue(
-        new Date(2016, 9, 23, 12, 34, 56),
-        column,
-      ),
+      driver.formatOutputValue(new Date(2016, 9, 23, 12, 34, 56), column),
     ).toBe("2016-10-23 12:34:56");
     expect(driver.formatOutputValue("2016-10-23 00:00:00", column)).toBe(
       "2016-10-23 00:00:00",

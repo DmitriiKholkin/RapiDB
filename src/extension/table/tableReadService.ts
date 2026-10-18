@@ -30,6 +30,7 @@ export class TableReadService {
       connectionId,
       (this.columnCacheGenerations.get(connectionId) ?? 0) + 1,
     );
+    this.connectionManager.getDriver(connectionId)?.clearTableReadCache?.();
     for (const key of this.columnCache.keys()) {
       if (key.startsWith(`${this.encodeKeyPart(connectionId)}|`)) {
         this.columnCache.delete(key);

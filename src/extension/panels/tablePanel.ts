@@ -1,6 +1,9 @@
 import * as vscode from "vscode";
 import { getDbObjectKindDisplayLabel } from "../../shared/dbObjectKinds";
-import { coerceFilterExpressions } from "../../shared/tableTypes";
+import {
+  coerceFilterExpressions,
+  type MongoValueTypeHint,
+} from "../../shared/tableTypes";
 import {
   parseTablePanelMessage,
   type TableInitPayload,
@@ -159,6 +162,7 @@ export class TablePanel {
     Promise<{
       rows: Record<string, unknown>[];
       mongoIdTypes?: Array<"objectId" | "string" | null>;
+      mongoValueTypes?: Array<Record<string, MongoValueTypeHint>>;
       totalCount: number;
       executionTimeMs?: number;
     }>
@@ -1003,6 +1007,7 @@ export class TablePanel {
         fetchId,
         rows: result.rows,
         mongoIdTypes: result.mongoIdTypes,
+        mongoValueTypes: result.mongoValueTypes,
         totalCount: result.totalCount,
         executionTimeMs: result.executionTimeMs,
       });
@@ -1084,18 +1089,25 @@ export class TablePanel {
                       (_update, rowIndex) =>
                         !prepared.plan.skippedRows.includes(rowIndex),
                     )
-                    .map(({ primaryKeys, changes, originalValues }) =>
-                      previewBuilder(
-                        "update",
-                        this.database,
-                        this.schema,
-                        this.table,
-                        {
-                          primaryKeys,
-                          changes,
-                          originalValues,
-                        },
-                      ),
+                    .map(
+                      ({
+                        primaryKeys,
+                        changes,
+                        originalValues,
+                        originalTypes,
+                      }) =>
+                        previewBuilder(
+                          "update",
+                          this.database,
+                          this.schema,
+                          this.table,
+                          {
+                            primaryKeys,
+                            changes,
+                            originalValues,
+                            originalTypes,
+                          },
+                        ),
                     ),
                 )
               ).flat(),

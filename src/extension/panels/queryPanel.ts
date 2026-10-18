@@ -268,6 +268,7 @@ export class QueryPanel {
         );
         instance.activeConnectionId =
           restored.activeConnectionId ?? restored.connectionId;
+        instance.syncTitle();
         QueryPanel.trackPanel(restored.panelId, instance);
       },
     });
@@ -288,7 +289,7 @@ export class QueryPanel {
 
     if (!initialQueryText && !forceNew) {
       for (const panel of QueryPanel.panels.values()) {
-        if (panel.initialConnectionId === connectionId) {
+        if (panel.activeConnectionId === connectionId) {
           panel.panel.reveal(vscode.ViewColumn.One);
           return panel;
         }
@@ -324,7 +325,7 @@ export class QueryPanel {
     const connection = this.connectionManager.getConnection(
       this.activeConnectionId,
     );
-    this.panel.title = `Query — ${connection?.name ?? this.activeConnectionId}`;
+    this.panel.title = `Query — ${connection?.name ?? "Select a connection"}`;
   }
 
   private buildHtml(
