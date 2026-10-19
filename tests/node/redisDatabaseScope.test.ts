@@ -45,6 +45,9 @@ function deferred() {
 
 class FakeRedis {
   isOpen = false;
+  get isReady() {
+    return this.isOpen;
+  }
   database: number;
   scanGate?: Promise<void>;
   commandGate?: Promise<void>;

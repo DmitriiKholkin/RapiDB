@@ -1172,6 +1172,11 @@ export class OracleDriver extends BaseDBDriver {
   }
 
   private pool: oracledb.Pool | null = null;
+  private connectionEpoch = 0;
+  private connectionAttempt: Promise<void> | null = null;
+  private publishedConnectionAttempt: Promise<void> | null = null;
+  private readonly pendingPools = new Set<oracledb.Pool>();
+  private readonly closingPools = new WeakMap<oracledb.Pool, Promise<void>>();
   private readonly config: ConnectionConfig;
   private readonly activeQueryOperations = new Set<OracleQueryOperation>();
   constructor(
@@ -1181,13 +1186,34 @@ export class OracleDriver extends BaseDBDriver {
     super(timeoutSettingsProvider);
     this.config = config;
   }
-  async connect(): Promise<void> {
-    if (this.pool !== null) {
-      try {
-        await this.pool.close(0);
-      } catch {}
-      this.pool = null;
+  connect(): Promise<void> {
+    if (this.connectionAttempt) return this.connectionAttempt;
+    const epoch = ++this.connectionEpoch;
+    this.publishedConnectionAttempt = null;
+    const cleanup = this.closeOwnedPools();
+    const attempt: Promise<void> = cleanup
+      .then(() => this.openConnection(epoch, attempt))
+      .finally(() => {
+        if (this.connectionAttempt === attempt) this.connectionAttempt = null;
+      });
+    this.connectionAttempt = attempt;
+    return attempt;
+  }
+
+  private assertConnectionEpoch(epoch: number): void {
+    if (epoch !== this.connectionEpoch) {
+      throw new DOMException(
+        "Oracle connection attempt was cancelled.",
+        "AbortError",
+      );
     }
+  }
+
+  private async openConnection(
+    epoch: number,
+    attempt: Promise<void>,
+  ): Promise<void> {
+    this.assertConnectionEpoch(epoch);
     const serviceName = this.config.serviceName || this.config.database;
     const forwardedTransport = getSshTcpForwardTransport(this.config);
     const host =
@@ -1209,11 +1235,14 @@ export class OracleDriver extends BaseDBDriver {
       poolTimeout: 30,
       poolPingInterval: 60,
     })) as unknown as oracledb.Pool;
+    this.pendingPools.add(pool);
     try {
+      this.assertConnectionEpoch(epoch);
       const conn = await pool.getConnection();
       let probeFailed = false;
       let probeError: unknown;
       try {
+        this.assertConnectionEpoch(epoch);
         conn.callTimeout = this.getDbOperationTimeoutMs();
         await conn.ping();
       } catch (error) {
@@ -1228,24 +1257,55 @@ export class OracleDriver extends BaseDBDriver {
         if (!probeFailed) throw closeError;
       }
       if (probeFailed) throw probeError;
+      this.assertConnectionEpoch(epoch);
     } catch (error) {
       // Probe (getConnection/ping) failed: close the freshly created pool
       // instead of leaking it. Pool stays local until success so concurrent
       // readers never observe a half-initialized pool.
-      try {
-        await pool.close(0);
-      } catch {}
+      await this.closePool(pool);
       throw error;
+    } finally {
+      this.pendingPools.delete(pool);
     }
     this.pool = pool;
+    this.publishedConnectionAttempt = attempt;
   }
-  async disconnect(): Promise<void> {
-    if (this.pool !== null) {
-      try {
-        await this.pool.close(0);
-      } catch {}
-      this.pool = null;
+
+  private closePool(pool: oracledb.Pool): Promise<void> {
+    let closing = this.closingPools.get(pool);
+    if (!closing) {
+      closing = Promise.resolve()
+        .then(() => pool.close(0))
+        .catch(() => undefined);
+      this.closingPools.set(pool, closing);
     }
+    return closing;
+  }
+
+  private async closeOwnedPools(): Promise<void> {
+    const pools = new Set(this.pendingPools);
+    if (this.pool) pools.add(this.pool);
+    // Detach before awaiting: a late close must not null a newly published pool.
+    this.pool = null;
+    this.pendingPools.clear();
+    await Promise.all([...pools].map((pool) => this.closePool(pool)));
+  }
+
+  /** Timeout cleanup belongs only to the captured attempt, including late settlement. */
+  async cancelConnectionAttempt(attempt: Promise<unknown>): Promise<void> {
+    if (
+      attempt === this.connectionAttempt ||
+      attempt === this.publishedConnectionAttempt
+    ) {
+      await this.disconnect();
+    }
+  }
+
+  async disconnect(): Promise<void> {
+    ++this.connectionEpoch;
+    this.connectionAttempt = null;
+    this.publishedConnectionAttempt = null;
+    await this.closeOwnedPools();
   }
   async cancelCurrentOperation(
     context?: OperationCancellationContext,

@@ -554,6 +554,7 @@ function decideRedisReadOnlyQuery(queryText: string) {
 
 export class RedisDriver implements IDBDriver {
   private client: RedisClient | null = null;
+  // Session ownership survives transient reconnects; transport readiness does not.
   private connected = false;
   private tlsSettings: ResolvedConnectionTlsSettings | undefined;
   private epoch = 0;
@@ -743,7 +744,13 @@ export class RedisDriver implements IDBDriver {
       promise: Promise.resolve(client),
     };
     this.clients.add(entry);
-    client.on("end", () => this.releaseClientEntry(entry));
+    client.on("end", () => {
+      if (this.client === client) {
+        this.client = null;
+        this.connected = false;
+      }
+      this.releaseClientEntry(entry);
+    });
     client.on("error", () => {
       // node-redis changes isOpen after emitting an error during reconnect.
       queueMicrotask(() => this.releaseClientEntry(entry));
@@ -817,7 +824,10 @@ export class RedisDriver implements IDBDriver {
   }
 
   isConnected(): boolean {
-    return this.connected;
+    // isOpen also stays true throughout node-redis's reconnect loop. Report the
+    // base session's actual readiness, not auxiliary client opens/cleanup or an
+    // error event alone (some errors do not invalidate the transport).
+    return this.connected && this.client?.isReady === true;
   }
 
   getEntityManifest(): DriverEntityManifest {

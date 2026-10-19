@@ -153,10 +153,15 @@ function isMssqlSqlVariantSnapshot(
 ): value is MssqlSqlVariantSnapshot {
   if (!value || typeof value !== "object") return false;
   const snapshot = value as Partial<MssqlSqlVariantSnapshot>;
+  // Snapshots return from the webview: numeric metadata must not be coerced.
   return (
     snapshot.__rapidbSqlVariant === 1 &&
     typeof snapshot.displayValue === "string" &&
     typeof snapshot.baseType === "string" &&
+    (snapshot.precision === null || Number.isSafeInteger(snapshot.precision)) &&
+    (snapshot.scale === null || Number.isSafeInteger(snapshot.scale)) &&
+    (snapshot.maxLength === null || Number.isSafeInteger(snapshot.maxLength)) &&
+    (snapshot.collation === null || typeof snapshot.collation === "string") &&
     typeof snapshot.binaryHex === "string" &&
     /^(?:[0-9a-f]{2})*$/i.test(snapshot.binaryHex)
   );
@@ -231,12 +236,15 @@ function mssqlSqlVariantNativeType(snapshot: MssqlSqlVariantSnapshot): string {
   const maxLength = snapshot.maxLength;
   let type: string;
 
+  // Independently validate every numeric SQL fragment, even after shape checks.
   if (baseType === "decimal" || baseType === "numeric") {
     if (
       precision === null ||
+      !Number.isInteger(precision) ||
       precision < 1 ||
       precision > 38 ||
       scale === null ||
+      !Number.isInteger(scale) ||
       scale < 0 ||
       scale > precision
     ) {
@@ -253,14 +261,24 @@ function mssqlSqlVariantNativeType(snapshot: MssqlSqlVariantSnapshot): string {
     }
     type = `float(${precision})`;
   } else if (baseType === "binary" || baseType === "varbinary") {
-    if (maxLength === null || maxLength < 1 || maxLength > 8000) {
+    if (
+      maxLength === null ||
+      !Number.isInteger(maxLength) ||
+      maxLength < 1 ||
+      maxLength > 8000
+    ) {
       throw new TypeError(
         "SQL Server returned unsupported binary length metadata for this sql_variant value.",
       );
     }
     type = `${baseType}(${maxLength})`;
   } else if (["char", "varchar", "nchar", "nvarchar"].includes(baseType)) {
-    if (maxLength === null || maxLength < 1 || maxLength > 8000) {
+    if (
+      maxLength === null ||
+      !Number.isInteger(maxLength) ||
+      maxLength < 1 ||
+      maxLength > 8000
+    ) {
       throw new TypeError(
         "SQL Server returned unsupported character length metadata for this sql_variant value.",
       );
@@ -277,7 +295,7 @@ function mssqlSqlVariantNativeType(snapshot: MssqlSqlVariantSnapshot): string {
     baseType === "datetime2" ||
     baseType === "datetimeoffset"
   ) {
-    if (scale === null || scale < 0 || scale > 7) {
+    if (scale === null || !Number.isInteger(scale) || scale < 0 || scale > 7) {
       throw new TypeError(
         "SQL Server returned invalid temporal scale metadata for this sql_variant value.",
       );
@@ -319,7 +337,7 @@ function mssqlSqlVariantInputExpression(
     : `CAST(? AS ${type})`;
   if (!["char", "varchar", "nchar", "nvarchar"].includes(baseType))
     return converted;
-  if (!snapshot.collation) {
+  if (typeof snapshot.collation !== "string" || !snapshot.collation) {
     throw new TypeError(
       "SQL Server did not return collation metadata for this sql_variant character value.",
     );

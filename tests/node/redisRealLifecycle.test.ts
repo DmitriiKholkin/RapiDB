@@ -92,9 +92,9 @@ class RespServer {
     return { args, consumed: offset };
   }
 
-  async listen() {
+  async listen(port = 0) {
     await new Promise<void>((resolve) =>
-      this.server.listen(0, "127.0.0.1", resolve),
+      this.server.listen(port, "127.0.0.1", resolve),
     );
     return (this.server.address() as net.AddressInfo).port;
   }
@@ -349,6 +349,149 @@ describe("B06 insert previews match real node-redis wire commands", () => {
 });
 
 describe("B02 real node-redis 6 transport lifecycle", () => {
+  it("reports a server outage and recovery without retiring reconnecting DB sessions", async () => {
+    const driver = makeDriver();
+    expect(driver.isConnected()).toBe(false);
+    await driver.connect();
+    await driver.readTablePage(page("db0"));
+    await driver.readTablePage(page("db1"));
+    const entries = [...state(driver).clients];
+    expect(driver.isConnected()).toBe(true);
+
+    await server.close();
+    await vi.waitFor(() => {
+      expect(entries.every(({ client }) => !client.isReady)).toBe(true);
+      expect(driver.isConnected()).toBe(false);
+    });
+    // Observe real failed reconnects, not just the instant the socket closes.
+    await vi.waitFor(() =>
+      expect(logger.error).toHaveBeenCalledWith(
+        "Redis client error",
+        expect.objectContaining({ code: "ECONNREFUSED" }),
+      ),
+    );
+    expect(driver.isConnected()).toBe(false);
+    expect(entries.every(({ client }) => client.isOpen)).toBe(true);
+    expect([...state(driver).clients]).toEqual(entries);
+    // Re-entering connect must not open a second base session during retry.
+    await driver.connect();
+    expect([...state(driver).clients]).toEqual(entries);
+    expect(driver.isConnected()).toBe(false);
+
+    await server.listen(port);
+    await vi.waitFor(
+      () => {
+        expect(entries.every(({ client }) => client.isReady)).toBe(true);
+        expect(driver.isConnected()).toBe(true);
+      },
+      { timeout: 3000 },
+    );
+    expect([...state(driver).clients]).toEqual(entries);
+    expect((await driver.query("GET shared")).rows[0]?.__col_0).toBe("db-0");
+    expect((await driver.readTablePage(page("db0"))).rows[0]?.value).toBe(
+      "db-0",
+    );
+    expect((await driver.readTablePage(page("db1"))).rows[0]?.value).toBe(
+      "db-1",
+    );
+  });
+
+  it("keeps base status independent of a native DB reconnect or a non-transport error", async () => {
+    const driver = makeDriver();
+    await driver.connect();
+    await driver.readTablePage(page("db0"));
+    await driver.readTablePage(page("db1"));
+    const entries = [...state(driver).clients];
+    const native = entries[2];
+    const nativeSocket = server.commands.find(
+      ({ database, args }) => database === 1 && args[0] === "GET",
+    )?.socket;
+    expect(nativeSocket).toBeDefined();
+    delayNext = true;
+    nativeSocket?.destroy();
+    await vi.waitFor(() => expect(releaseLookups).toHaveLength(1));
+    expect(native.client.isReady).toBe(false);
+    expect(entries[0].client.isReady).toBe(true);
+    expect(driver.isConnected()).toBe(true);
+    entries[0].client.emit("error", new Error("non-transport notification"));
+    expect(driver.isConnected()).toBe(true);
+    expect((await driver.readTablePage(page("db0"))).rows[0]?.value).toBe(
+      "db-0",
+    );
+
+    for (const release of releaseLookups.splice(0)) release();
+    await vi.waitFor(() => expect(native.client.isReady).toBe(true));
+    expect([...state(driver).clients]).toEqual(entries);
+    expect((await driver.readTablePage(page("db1"))).rows[0]?.value).toBe(
+      "db-1",
+    );
+  });
+
+  it("disconnect during outage stops retries and cannot be resurrected by recovery", async () => {
+    const driver = makeDriver();
+    await driver.connect();
+    await driver.readTablePage(page("db0"));
+    await driver.readTablePage(page("db1"));
+    const entries = [...state(driver).clients];
+    await server.close();
+    await vi.waitFor(() => expect(entries[0].client.isReady).toBe(false));
+    await driver.disconnect();
+    expect(driver.isConnected()).toBe(false);
+    expect(state(driver).clients.size).toBe(0);
+    expect(state(driver).databaseClients.size).toBe(0);
+    expect(entries.every(({ abort }) => abort.signal.aborted)).toBe(true);
+    await server.listen(port);
+    await delay(350);
+    expect(server.sockets.size).toBe(0);
+    expect(driver.isConnected()).toBe(false);
+
+    await driver.connect();
+    // Stale client notifications cannot change the replacement base status.
+    entries[0].client.emit("end");
+    entries[0].client.emit("ready");
+    expect(driver.isConnected()).toBe(true);
+    expect(state(driver).clients.size).toBe(1);
+    expect((await driver.query("GET shared")).rows[0]?.__col_0).toBe("db-0");
+  });
+
+  it("keeps failed initial connection status false and allows a fresh start after recovery", async () => {
+    await server.close();
+    const driver = makeDriver(150);
+    const opening = driver.connect();
+    const rejected = expect(opening).rejects.toThrow("timed out");
+    await vi.waitFor(() => expect(logger.error).toHaveBeenCalled());
+    expect(driver.isConnected()).toBe(false);
+    await bounded(rejected);
+    await vi.waitFor(() => expect(state(driver).clients.size).toBe(0));
+    expect(driver.isConnected()).toBe(false);
+
+    await server.listen(port);
+    await driver.connect();
+    expect(driver.isConnected()).toBe(true);
+    expect(state(driver).clients.size).toBe(1);
+  });
+
+  it("clears a terminal base session without letting healthy native clients mask its end", async () => {
+    const driver = makeDriver();
+    await driver.connect();
+    await driver.readTablePage(page("db1"));
+    const [base, native] = [...state(driver).clients];
+    base.client.destroy();
+    expect(driver.isConnected()).toBe(false);
+    expect(native.client.isReady).toBe(true);
+    await expect(driver.query("GET shared")).rejects.toThrow("not connected");
+    await driver.connect();
+    expect(driver.isConnected()).toBe(true);
+    base.client.emit("end");
+    expect(driver.isConnected()).toBe(true);
+    expect((await driver.readTablePage(page("db1"))).rows[0]?.value).toBe(
+      "db-1",
+    );
+    await driver.disconnect();
+    expect(state(driver).clients.size).toBe(0);
+    expect(driver.isConnected()).toBe(false);
+  });
+
   it("cancels TCP creation before physical connect and prevents a late ready socket", async () => {
     const driver = makeDriver();
     delayNext = true;
@@ -358,6 +501,7 @@ describe("B02 real node-redis 6 transport lifecycle", () => {
     const entry = [...state(driver).clients][0];
     const socket = sockets[0];
     expect(socket.connecting).toBe(true);
+    expect(driver.isConnected()).toBe(false);
     driver.cancelConnectionAttempt(pending);
     await bounded(rejected);
     for (const release of releaseLookups.splice(0)) release();
@@ -478,6 +622,7 @@ describe("B02 real node-redis 6 transport lifecycle", () => {
     expect(queryEntry.client.isReady).toBe(false);
     expect(sockets[0].destroyed).toBe(false);
     expect(sockets[1].destroyed).toBe(false);
+    expect(driver.isConnected()).toBe(true);
     expect((await driver.readTablePage(page("db1"))).rows[0]?.value).toBe(
       "db-1",
     );

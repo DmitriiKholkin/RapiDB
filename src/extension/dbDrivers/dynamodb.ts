@@ -460,14 +460,51 @@ export class DynamoDBDriver implements IDBDriver {
   readonly supportsAtomicUpdateRows = true;
   private client: DynamoDBClient | null = null;
   private connected = false;
+  private connectionEpoch = 0;
+  private connectionAttempt: Promise<void> | null = null;
+  private publishedConnectionAttempt: Promise<void> | null = null;
+  private connectionAbortController?: AbortController;
+  private pendingClient: DynamoDBClient | null = null;
+  private readonly destroyedClients = new WeakSet<DynamoDBClient>();
   private readonly cursorCache = new Map<string, DynamoCursorSession>();
 
   constructor(private readonly config: ConnectionConfig) {}
 
-  async connect(): Promise<void> {
+  connect(): Promise<void> {
     if (this.connected) {
-      return;
+      return Promise.resolve();
     }
+    if (this.connectionAttempt) return this.connectionAttempt;
+    const epoch = ++this.connectionEpoch;
+    const abortController = new AbortController();
+    this.connectionAbortController = abortController;
+    const attempt: Promise<void> = Promise.resolve()
+      .then(() => this.openConnection(epoch, attempt, abortController.signal))
+      .finally(() => {
+        if (this.connectionAttempt === attempt) this.connectionAttempt = null;
+        if (this.connectionAbortController === abortController) {
+          this.connectionAbortController = undefined;
+        }
+      });
+    this.connectionAttempt = attempt;
+    return attempt;
+  }
+
+  private assertConnectionEpoch(epoch: number): void {
+    if (epoch !== this.connectionEpoch) {
+      throw new DOMException(
+        "DynamoDB connection attempt was cancelled.",
+        "AbortError",
+      );
+    }
+  }
+
+  private async openConnection(
+    epoch: number,
+    attempt: Promise<void>,
+    signal: AbortSignal,
+  ): Promise<void> {
+    this.assertConnectionEpoch(epoch);
 
     const sshAgentTransport = getSshHttpAgentTransport(this.config);
     const tlsServername = getTlsServername(this.config);
@@ -500,24 +537,55 @@ export class DynamoDBDriver implements IDBDriver {
             : undefined,
     });
 
+    this.pendingClient = client;
     try {
-      await client.send(new ListTablesCommand({ Limit: 1 }));
+      await client.send(new ListTablesCommand({ Limit: 1 }), {
+        abortSignal: signal,
+      });
+      this.assertConnectionEpoch(epoch);
     } catch (error) {
-      client.destroy();
+      this.destroyClient(client);
       throw error;
+    } finally {
+      if (this.pendingClient === client) this.pendingClient = null;
     }
 
     this.client = client;
+    this.publishedConnectionAttempt = attempt;
     this.connected = true;
     this.cursorCache.clear();
   }
 
+  private destroyClient(client: DynamoDBClient): void {
+    if (this.destroyedClients.has(client)) return;
+    this.destroyedClients.add(client);
+    client.destroy();
+  }
+
+  /** The wrapper repeats cleanup on late settlement; never cancel a newer attempt. */
+  async cancelConnectionAttempt(attempt: Promise<unknown>): Promise<void> {
+    if (
+      attempt === this.connectionAttempt ||
+      attempt === this.publishedConnectionAttempt
+    ) {
+      await this.disconnect();
+    }
+  }
+
   async disconnect(): Promise<void> {
+    ++this.connectionEpoch;
+    this.connectionAbortController?.abort();
+    this.connectionAbortController = undefined;
+    this.connectionAttempt = null;
+    this.publishedConnectionAttempt = null;
     const client = this.client;
+    const pendingClient = this.pendingClient;
     this.client = null;
+    this.pendingClient = null;
     this.connected = false;
     this.cursorCache.clear();
-    client?.destroy();
+    if (client) this.destroyClient(client);
+    if (pendingClient) this.destroyClient(pendingClient);
   }
 
   isConnected(): boolean {

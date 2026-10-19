@@ -10,6 +10,8 @@ import { createProjectTempDir } from "../runtime/tempDirectories";
 interface WorkflowStep {
   name: string;
   id?: string;
+  if?: string;
+  "continue-on-error"?: boolean | string;
   env?: Record<string, string>;
   run?: string;
   uses?: string;
@@ -105,6 +107,30 @@ const adversarialVersions = [
   "1.2.3$HOME",
   "1.2.3\\",
 ];
+
+describe("release workflow quality gates", () => {
+  it("requires checks and core tests before any release steps", () => {
+    const steps = workflow.jobs.release.steps;
+    const installIndex = steps.findIndex((step) => step.run === "npm ci");
+    const checkIndex = steps.findIndex((step) => step.run === "npm run check");
+    const testIndex = steps.findIndex(
+      (step) => step.run === "npm run test:core",
+    );
+    const versionIndex = steps.findIndex((step) => step.id === "version");
+
+    expect(installIndex).toBeGreaterThanOrEqual(0);
+    expect(checkIndex).toBe(installIndex + 1);
+    expect(testIndex).toBe(checkIndex + 1);
+    expect(versionIndex).toBe(testIndex + 1);
+
+    // Default Actions success gating must stop before bump/build/commit/tag/release
+    // when either check fails; no conditional skips or error suppression.
+    for (const step of steps.slice(checkIndex)) {
+      expect(step.if).toBeUndefined();
+      expect(step["continue-on-error"]).toBeUndefined();
+    }
+  });
+});
 
 describe("release workflow version input boundary", () => {
   it("binds both inputs as env data, never inline shell source", () => {
