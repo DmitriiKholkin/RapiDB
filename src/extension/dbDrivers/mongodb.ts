@@ -1298,6 +1298,35 @@ function selectMongoSchemaSample(
   return fallbackSample;
 }
 
+function isUnsupportedMongoTableField(name: string): boolean {
+  return name.includes(".") || name.startsWith("$");
+}
+
+function unsupportedMongoTableFieldMessage(name: string): string {
+  return `MongoDB Table Viewer cannot safely edit literal field ${JSON.stringify(name)}: names containing a dot or starting with "$" are read-only. Use the Query Editor with explicit literal-field operations instead.`;
+}
+
+function assertSupportedMongoTableUpdate(update: {
+  changes?: Record<string, unknown>;
+  originalValues?: Record<string, unknown>;
+  originalTypes?: Record<string, MongoValueTypeHint>;
+}): void {
+  // Viewer column names are literal top-level keys, whereas update operators
+  // and optimistic predicates interpret these names as paths/operators. Check
+  // every input record, including fields absent from sampled metadata.
+  for (const record of [
+    update.changes,
+    update.originalValues,
+    update.originalTypes,
+  ]) {
+    for (const name of Object.keys(record ?? {})) {
+      if (isUnsupportedMongoTableField(name)) {
+        throw new Error(unsupportedMongoTableFieldMessage(name));
+      }
+    }
+  }
+}
+
 export class MongoDBDriver implements IDBDriver {
   private readonly tableRowSchemas = new WeakMap<
     Record<string, unknown>,
@@ -2066,7 +2095,12 @@ export class MongoDBDriver implements IDBDriver {
               ? schemaColumns
               : inferColumnsFromRows(rows, "_id", {
                   nullableMode: "schemaLess",
-                }),
+                }).map((column) => ({
+                  ...column,
+                  ...(isUnsupportedMongoTableField(column.name)
+                    ? { isReadOnly: true }
+                    : {}),
+                })),
           rows,
           mongoIdTypes: rows.map(
             (row) => this.tableRowIdTypes.get(row) ?? null,
@@ -2125,6 +2159,9 @@ export class MongoDBDriver implements IDBDriver {
                 category,
                 type: category,
                 nativeType: category,
+                ...(isUnsupportedMongoTableField(column.name)
+                  ? { isReadOnly: true }
+                  : {}),
                 filterOperators: resolveFilterOperators(category, {
                   filterable: column.filterable,
                   nullable: column.nullable,
@@ -2419,10 +2456,24 @@ export class MongoDBDriver implements IDBDriver {
     return normalized.length > 0 ? normalized : ".*";
   }
 
+  validateTableUpdates(
+    updates: readonly Pick<
+      DriverUpdateRowsRequest["updates"][number],
+      "changes" | "originalValues" | "originalTypes"
+    >[],
+  ): void {
+    for (const update of updates) {
+      assertSupportedMongoTableUpdate(update);
+    }
+  }
+
   async updateRows(
     request: DriverUpdateRowsRequest,
     context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
+    // Validate the complete batch before obtaining a collection or writing a
+    // safe prefix. This also protects direct callers that bypass UI metadata.
+    this.validateTableUpdates(request.updates);
     if (
       request.updates.some(
         ({ primaryKeys }) =>
@@ -2595,6 +2646,7 @@ export class MongoDBDriver implements IDBDriver {
       return `${collectionRef}.insertOne(${doc})`;
     }
     if (operation === "update") {
+      assertSupportedMongoTableUpdate(data);
       const filter: Record<string, unknown> = {
         _id: { $eq: data.primaryKeys?._id },
       };
@@ -2942,6 +2994,13 @@ export class MongoDBDriver implements IDBDriver {
     expectedValue: unknown,
     _options?: { persistedValue: unknown },
   ) {
+    if (isUnsupportedMongoTableField(column.name)) {
+      return {
+        ok: false,
+        shouldVerify: false,
+        message: unsupportedMongoTableFieldMessage(column.name),
+      };
+    }
     if (
       typeof expectedValue === "string" &&
       (column.category === "json" || column.category === "array")
@@ -3250,6 +3309,7 @@ export class MongoDBDriver implements IDBDriver {
         filterable,
         filterOperators: [...filterOperators],
         valueSemantics: "plain",
+        ...(isUnsupportedMongoTableField(name) ? { isReadOnly: true } : {}),
       } satisfies ColumnTypeMeta;
     });
   }

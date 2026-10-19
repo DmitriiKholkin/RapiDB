@@ -94,6 +94,10 @@ const REDIS_VALUE_TYPE_ORDER = [
 const REDIS_READ_ONLY_QUERY_REASON =
   "[RapiDB] Read-only Redis connections allow only read commands.";
 
+// Keep seconds-to-milliseconds conversion exact in both JavaScript and Lua,
+// comfortably below Redis's signed 64-bit expiration timestamp limit.
+const REDIS_MAX_TTL_SECONDS = Math.floor(Number.MAX_SAFE_INTEGER / 1000);
+
 const REDIS_ATOMIC_EDIT_SCRIPT = `
 local source = KEYS[1]
 local target = KEYS[2]
@@ -135,6 +139,23 @@ if ARGV[7] == '1' then
   end
 end
 local ttl = redis.call('PTTL', source)
+local expiry = nil
+if ARGV[5] == 'set' then
+  local seconds = tonumber(ARGV[6])
+  if not string.match(ARGV[6], '^%d+$') or not seconds or seconds < 1 or seconds > ${REDIS_MAX_TTL_SECONDS} or seconds ~= math.floor(seconds) then
+    return redis.error_reply('Redis edit TTL is outside the supported integer range.')
+  end
+  -- Passing a Lua number can produce scientific notation, which PEXPIRE
+  -- rejects as a non-integer. Always pass an exact decimal string instead.
+  expiry = string.format('%.0f', seconds * 1000)
+elseif ARGV[5] ~= 'keep' and ARGV[5] ~= 'persist' then
+  return redis.error_reply('Redis edit TTL mode is invalid.')
+end
+local function requirePermission(command, ...)
+  if not redis.acl_check_cmd(command, ...) then
+    error('Redis edit requires ' .. command .. ' permission on its keys.')
+  end
+end
 if ARGV[3] == '1' then
   -- Lua errors do not roll back writes. Decode and build the entire replacement
   -- away from the source, including its TTL, before committing it.
@@ -143,48 +164,68 @@ if ARGV[3] == '1' then
   if staging == source or staging == target or redis.call('EXISTS', staging) ~= 0 then
     return redis.error_reply('Redis edit staging key already exists.')
   end
-  -- Redis 7 ACL selectors can allow EVAL but deny a command on a particular
-  -- key. Check final commit permissions before creating any replacement.
-  if redis.acl_check_cmd then
-    if not redis.acl_check_cmd('DEL', source) or not redis.acl_check_cmd('DEL', staging) or not redis.acl_check_cmd('RENAME', staging, target) then
-      return redis.error_reply('Redis edit requires DEL and RENAME permissions on its keys.')
+  -- Empty collections only need one DEL, with no partial-commit risk.
+  if kind ~= 'string' and next(value) == nil then
+    redis.call('DEL', source)
+    return 1
+  end
+  -- Redis 6 cannot inspect command ACLs without executing commands. Fail
+  -- closed for staged replacements rather than discovering a denied final
+  -- command after writes. Single-command rename/TTL edits still work below.
+  if not redis.acl_check_cmd then
+    return redis.error_reply('Redis value replacements require Redis 7 or newer for ACL-safe edits.')
+  end
+  if ARGV[5] == 'keep' and ttl >= 0 then
+    if ttl > 9007199254740991 then
+      return redis.error_reply('Redis edit TTL is too large to preserve safely.')
+    end
+    expiry = string.format('%.0f', ttl)
+  end
+  local function buildReplacement(call)
+    if kind == 'string' then call('SET', staging, value)
+    elseif kind == 'hash' then for field, entry in pairs(value) do call('HSET', staging, field, entry) end
+    elseif kind == 'list' then for _, entry in ipairs(value) do call('RPUSH', staging, entry) end
+    elseif kind == 'set' then for _, entry in ipairs(value) do call('SADD', staging, entry) end
+    elseif kind == 'zset' then for _, entry in ipairs(value) do call('ZADD', staging, entry.score, entry.value) end
     end
   end
-  -- On older Redis versions command ACLs are global to the allowed keys.
-  -- This harmless no-op also ensures cleanup is permitted if building fails.
-  redis.call('DEL', staging)
-  local replacementExists = false
+  -- Redis 7 ACL selectors can allow EVAL but deny a command on a particular
+  -- key. Preflight every write, including cleanup, before creating staging.
+  requirePermission('DEL', staging)
+  if source ~= target then requirePermission('DEL', source) end
+  requirePermission('RENAME', staging, target)
+  buildReplacement(requirePermission)
+  if expiry then requirePermission('PEXPIRE', staging, expiry) end
   local ok, err = pcall(function()
-    if kind == 'string' then redis.call('SET', staging, value)
-    elseif kind == 'hash' then for field, entry in pairs(value) do redis.call('HSET', staging, field, entry) end
-    elseif kind == 'list' then for _, entry in ipairs(value) do redis.call('RPUSH', staging, entry) end
-    elseif kind == 'set' then for _, entry in ipairs(value) do redis.call('SADD', staging, entry) end
-    elseif kind == 'zset' then for _, entry in ipairs(value) do redis.call('ZADD', staging, entry.score, entry.value) end
-    end
-    if redis.call('EXISTS', staging) ~= 0 then
-      replacementExists = true
-      if ARGV[5] == 'set' then redis.call('PEXPIRE', staging, tonumber(ARGV[6]) * 1000)
-      elseif ARGV[5] == 'keep' and ttl >= 0 then redis.call('PEXPIRE', staging, ttl) end
-      redis.call('RENAME', staging, target)
-    end
+    buildReplacement(redis.call)
+    if expiry then redis.call('PEXPIRE', staging, expiry) end
+    redis.call('RENAME', staging, target)
   end)
   if not ok then
     redis.call('DEL', staging)
     return redis.error_reply(tostring(err))
   end
-  -- Empty collections intentionally remove the key (Redis cannot store them).
-  if source ~= target or not replacementExists then
-    redis.call('DEL', source)
-  end
+  if source ~= target then redis.call('DEL', source) end
   return 1
 end
-if source ~= target and redis.call('EXISTS', source) ~= 0 then redis.call('RENAME', source, target) end
-local finalKey = target
+if source ~= target and ARGV[5] ~= 'keep' and not redis.acl_check_cmd then
+  return redis.error_reply('Combined Redis rename and TTL edits require Redis 7 or newer for ACL-safe edits.')
+end
+if redis.acl_check_cmd then
+  if source ~= target then requirePermission('RENAME', source, target) end
+  if expiry then requirePermission('PEXPIRE', target, expiry)
+  elseif ARGV[5] == 'persist' then requirePermission('PERSIST', target) end
+end
+-- RENAME preserves expiration inherently. In keep mode it is the only write;
+-- re-expiring would add a needless command that could fail after the rename.
+-- ACL/argument preflight prevents those known failures, not arbitrary server
+-- failures: Lua errors never roll back earlier writes.
+if source ~= target then redis.call('RENAME', source, target) end
 if ARGV[5] == 'set' then
-  if redis.call('EXISTS', finalKey) ~= 0 then redis.call('PEXPIRE', finalKey, tonumber(ARGV[6]) * 1000) end
+  redis.call('PEXPIRE', target, expiry)
 elseif ARGV[5] == 'persist' then
-  if redis.call('EXISTS', finalKey) ~= 0 then redis.call('PERSIST', finalKey) end
-elseif ttl >= 0 and redis.call('EXISTS', finalKey) ~= 0 then redis.call('PEXPIRE', finalKey, ttl) end
+  redis.call('PERSIST', target)
+end
 return 1
 `;
 
@@ -1910,10 +1951,18 @@ export class RedisDriver implements IDBDriver {
       if (!Number.isInteger(value)) {
         throw new Error(`${source} require an integer TTL in seconds.`);
       }
+      if (!Number.isSafeInteger(value)) {
+        throw new Error(`${source} require a safe integer TTL value.`);
+      }
       if (value === -1) {
         return null;
       }
       if (value >= 1) {
+        if (value > REDIS_MAX_TTL_SECONDS) {
+          throw new Error(
+            `${source} require a TTL no greater than ${REDIS_MAX_TTL_SECONDS} seconds.`,
+          );
+        }
         return value;
       }
       throw new Error(`${source} require a positive TTL or -1 to persist.`);
@@ -1934,6 +1983,11 @@ export class RedisDriver implements IDBDriver {
         return null;
       }
       if (parsed >= 1) {
+        if (parsed > REDIS_MAX_TTL_SECONDS) {
+          throw new Error(
+            `${source} require a TTL no greater than ${REDIS_MAX_TTL_SECONDS} seconds.`,
+          );
+        }
         return parsed;
       }
       throw new Error(`${source} require a positive TTL or -1 to persist.`);

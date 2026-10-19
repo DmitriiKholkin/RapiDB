@@ -233,6 +233,7 @@ export function prepareApplyChangesPlan(
       result: buildPrevalidationFailedResult(failures),
     };
   }
+  driver.validateTableUpdates?.(updates);
   const primaryKeysByRow = updates.map((update) =>
     Object.keys(filterWritableRecord(update.changes, columnMap)).length > 0
       ? coercePrimaryKeyValues(driver, update.primaryKeys, columns)

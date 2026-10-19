@@ -841,6 +841,63 @@ describe("TableView", () => {
     });
   });
 
+  it.each([
+    "update",
+    "delete",
+  ] as const)("retains an opaque read-only key component for a selected duplicate ID (%s)", async (operation) => {
+    const user = userEvent.setup();
+    const identityColumn: ColumnTypeMeta = {
+      ...columns[0],
+      name: "_identity",
+      type: "text",
+      nativeType: "text",
+      category: "text",
+      isReadOnly: true,
+    };
+    await initializeCommittedTableData({
+      columnDefs: [
+        { ...identityColumn, name: "_id" },
+        identityColumn,
+        columns[1],
+      ],
+      primaryKeyColumns: ["_id", "_identity"],
+      dataRows: [
+        { _id: "same", _identity: "opaque-key-a", name: "First" },
+        { _id: "same", _identity: "opaque-key-b", name: "Second" },
+      ],
+    });
+    clearPostedMessages();
+    if (operation === "delete") {
+      await user.click(screen.getByRole("checkbox", { name: "Select row 2" }));
+      await user.click(screen.getByRole("button", { name: /Delete/ }));
+      expect(getLastPostedMessage()).toMatchObject({
+        type: "deleteRows",
+        payload: {
+          primaryKeysList: [{ _id: "same", _identity: "opaque-key-b" }],
+        },
+      });
+    } else {
+      await user.dblClick(getBodyCell("name", 1));
+      fireEvent.change(screen.getByLabelText("Cell data"), {
+        target: { value: "Edited second" },
+      });
+      await user.click(screen.getByRole("button", { name: "Apply" }));
+      await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+      expect(getLastPostedMessage()).toMatchObject({
+        type: "applyChanges",
+        payload: {
+          updates: [
+            {
+              primaryKeys: { _id: "same", _identity: "opaque-key-b" },
+              changes: { name: "Edited second" },
+              originalValues: { name: "Second" },
+            },
+          ],
+        },
+      });
+    }
+  });
+
   it("blocks a NULL component of a composite row key", async () => {
     const user = userEvent.setup();
     await initializeCommittedTableData({

@@ -367,6 +367,13 @@ export interface IDBDriver {
     request: DriverTableExportRequest,
     signal?: AbortSignal,
   ): AsyncIterable<DriverTableExportChunk>;
+  /** Validate raw Viewer edits before sampled metadata can filter/coerce fields. */
+  validateTableUpdates?(
+    updates: readonly Pick<
+      DriverUpdateRowsRequest["updates"][number],
+      "changes" | "originalValues" | "originalTypes"
+    >[],
+  ): void;
   updateRows?(
     request: DriverUpdateRowsRequest,
     context?: DriverOperationContext,

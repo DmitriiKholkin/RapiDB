@@ -7,6 +7,7 @@ import { TablePanel } from "../../src/extension/panels/tablePanel";
 import { TableReadService } from "../../src/extension/table/tableReadService";
 import type { ChunkedExportData } from "../../src/extension/utils/exportService";
 import type { TableMutationPreviewPayload } from "../../src/shared/webviewContracts";
+import { elasticsearchKeys } from "../support/elasticsearchIdentity";
 import {
   createExtensionContextStub,
   FakeConnectionManagerStore,
@@ -3257,6 +3258,7 @@ describe("TablePanel", () => {
 
   it("builds an Elasticsearch update preview with the driver instance", async () => {
     const driver = new ElasticsearchDriver({ type: "elasticsearch" } as never);
+    const primaryKeys = elasticsearchKeys(driver, "doc-1");
     const connectionManager = {
       getConnection: vi.fn(() => ({ name: "Elastic", type: "elasticsearch" })),
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
@@ -3267,7 +3269,7 @@ describe("TablePanel", () => {
     prepareApplyChangesPlanMock.mockReturnValueOnce({
       executable: true,
       plan: {
-        updates: [{ primaryKeys: { _id: "doc-1" }, changes: { label: "Ada" } }],
+        updates: [{ primaryKeys, changes: { label: "Ada" } }],
         skippedRows: [],
         previewStatements: [],
       },
@@ -3288,7 +3290,7 @@ describe("TablePanel", () => {
       type: "applyChanges",
       payload: {
         operationId: "op-1",
-        updates: [{ primaryKeys: { _id: "doc-1" }, changes: { label: "Ada" } }],
+        updates: [{ primaryKeys, changes: { label: "Ada" } }],
       },
     });
 
@@ -3296,7 +3298,11 @@ describe("TablePanel", () => {
       "op-1",
       expect.objectContaining({
         apply: expect.objectContaining({
-          previewStatements: [expect.stringContaining("/users/_doc/doc-1")],
+          previewStatements: [
+            expect.stringContaining(
+              "/users/_update/doc-1?if_seq_no=3&if_primary_term=1",
+            ),
+          ],
         }),
       }),
     );

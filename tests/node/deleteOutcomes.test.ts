@@ -17,6 +17,7 @@ import type {
 import { TableMutationPreviewController } from "../../src/extension/panels/tableMutationPreviewController";
 import type { PreparedDeletePlan } from "../../src/extension/table/tableDataContracts";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
+import { elasticsearchKeys } from "../support/elasticsearchIdentity";
 
 const engines = ["redis", "dynamodb", "elasticsearch", "mongodb"] as const;
 type Engine = (typeof engines)[number];
@@ -73,7 +74,9 @@ function harness(engine: Engine, write: (index: number) => Promise<boolean>) {
       ? { key: id }
       : engine === "dynamodb"
         ? { id }
-        : { _id: id },
+        : driver instanceof ElasticsearchDriver
+          ? elasticsearchKeys(driver, id, "items")
+          : { _id: id },
   );
   const request: DriverDeleteRowsRequest = {
     database: "db0",

@@ -11,6 +11,7 @@ import {
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
 import { parseJsonForWrite } from "../../src/extension/utils/jsonWriteSafety";
 import { NUMERIC_COMPARISON_LIMITS } from "../../src/shared/numericNormalization";
+import { elasticsearchKeys } from "../support/elasticsearchIdentity";
 
 const unsafe = [
   "9007199254740993",
@@ -162,8 +163,13 @@ describe("JSON numeric write safety", () => {
     );
   });
 
-  it("allows safe Elasticsearch repairs with existing imprecise display originals", () => {
-    const es = drivers[0];
+  it("allows safe Elasticsearch repairs with existing imprecise display originals", async () => {
+    const es = new ElasticsearchDriver({
+      id: "es",
+      name: "es",
+      type: "elasticsearch",
+    });
+    const columns = await es.describeColumns("db", "", "items");
     const manager = {
       getConnection: () => ({ readOnly: false }),
       getDriver: () => es,
@@ -177,12 +183,12 @@ describe("JSON numeric write safety", () => {
         "items",
         [
           {
-            primaryKeys: { _id: "actual" },
+            primaryKeys: elasticsearchKeys(es, "actual", "items"),
             changes: { _source: '{"amount":42}' },
             originalValues: { _source: '{"amount":9007199254740993}' },
           },
         ],
-        [column, idColumn],
+        columns,
       ).executable,
     ).toBe(true);
   });

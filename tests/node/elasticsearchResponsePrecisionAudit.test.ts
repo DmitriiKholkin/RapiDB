@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
 import { ElasticsearchSerializer } from "../../src/extension/dbDrivers/elasticsearchSerializer";
 import { canonicalizeJsonNumericValues } from "../../src/extension/utils/jsonCanonical";
+import { elasticsearchKeys } from "../support/elasticsearchIdentity";
 
 const exportRequest = {
   database: "default",
@@ -190,7 +191,10 @@ describe("Elasticsearch response numeric precision audit (real SDK + HTTP)", () 
         f.driver.updateRows({
           ...exportRequest,
           updates: [
-            { primaryKeys: { _id: "doc-1" }, changes: { _source: source } },
+            {
+              primaryKeys: elasticsearchKeys(f.driver, "doc-1", "records"),
+              changes: { _source: source },
+            },
           ],
         }),
       ).rejects.toThrow(/numeric precision/i);

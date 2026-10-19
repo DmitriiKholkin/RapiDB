@@ -1,3 +1,4 @@
+import { createHmac, randomBytes } from "node:crypto";
 import type { ConnectionOptions as TlsConnectionOptions } from "node:tls";
 import { Client } from "@elastic/elasticsearch";
 import { HttpConnection } from "@elastic/transport";
@@ -117,12 +118,21 @@ interface ElasticsearchRestCommand {
   body?: unknown;
 }
 
+interface ElasticsearchMutationIdentity {
+  index: string;
+  id: string;
+  routing?: string;
+  if_seq_no: number;
+  if_primary_term: number;
+}
+
 export class ElasticsearchDriver implements IDBDriver {
   private client: Client | null = null;
   private connected = false;
   private readonly pitReaders = new Set<ElasticsearchPitSession>();
   private connectionEpoch = 0;
   private connectionAbortController?: AbortController;
+  private readonly identitySecret = randomBytes(32);
 
   constructor(
     private readonly config: ConnectionConfig,
@@ -445,7 +455,7 @@ export class ElasticsearchDriver implements IDBDriver {
       return [
         {
           name: `${table}_id_idx`,
-          columns: ["_id"],
+          columns: ["_id", "_identity"],
           unique: true,
           primary: true,
         },
@@ -1087,7 +1097,9 @@ export class ElasticsearchDriver implements IDBDriver {
     for (const key of new Set(queryParams.keys())) {
       const values = queryParams
         .getAll(key)
-        .map((value) => this.coerceRestQueryParamValue(value));
+        .map((value) =>
+          key === "routing" ? value : this.coerceRestQueryParamValue(value),
+        );
       if (values.length === 1) {
         result[key] = values[0];
       } else if (values.length > 1) {
@@ -1209,11 +1221,12 @@ export class ElasticsearchDriver implements IDBDriver {
               sort: ["_doc"],
               size: ELASTICSEARCH_READ_BUDGET.hardCap,
               track_total_hits: true,
+              seq_no_primary_term: true,
             },
             { ...options, maxRetries: 0 },
           ),
         );
-        const rows = this.hitsToRows(response.hits.hits);
+        const rows = this.hitsToRows(response.hits.hits, request.table);
         if (
           this.resolveElasticsearchTotalCount(response.hits.total) > rows.length
         ) {
@@ -1354,6 +1367,7 @@ export class ElasticsearchDriver implements IDBDriver {
                       search_after: cursor === undefined ? undefined : [cursor],
                       track_total_hits: trackCount && first,
                       allow_partial_search_results: false,
+                      seq_no_primary_term: true,
                     },
                     options,
                   ),
@@ -1407,7 +1421,7 @@ export class ElasticsearchDriver implements IDBDriver {
         }
         if (hits.length > 0 || first) {
           yield {
-            rows: this.hitsToRows(hits),
+            rows: this.hitsToRows(hits, table),
             totalCount,
           };
           reader.check();
@@ -1497,10 +1511,14 @@ export class ElasticsearchDriver implements IDBDriver {
             "Elasticsearch does not support updating the _id field.",
           );
         }
-        const id = update.primaryKeys._id;
-        if (typeof id !== "string" && typeof id !== "number") {
-          updateRowOutcomes.push({ rowIndex, status: "not_applied" });
-          continue;
+        const identity = this.resolveMutationIdentity(
+          request.table,
+          update.primaryKeys,
+        );
+        if (Object.hasOwn(update.changes, "_identity")) {
+          throw new Error(
+            "Elasticsearch does not support updating the _identity field.",
+          );
         }
         const document = this.resolveDocumentForMutation(
           {
@@ -1514,19 +1532,11 @@ export class ElasticsearchDriver implements IDBDriver {
         const response = Object.hasOwn(update.originalValues ?? {}, "_source")
           ? await client.update(
               {
-                index: request.table,
-                id: String(id),
-                script: {
-                  lang: "painless",
-                  source:
-                    "if (ctx._source != params.original) { ctx.op = 'none' } else { ctx._source = params.next }",
-                  params: {
-                    original: this.resolveDocumentForMutation({
-                      _source: update.originalValues?._source,
-                    }),
-                    next: document,
-                  },
-                },
+                ...identity,
+                script: this.originalSourceScript(
+                  update.originalValues,
+                  document,
+                ),
                 refresh: "wait_for",
               },
               context ? { signal: context.signal } : undefined,
@@ -1534,8 +1544,7 @@ export class ElasticsearchDriver implements IDBDriver {
           : Object.hasOwn(update.changes, "_source")
             ? await client.index(
                 {
-                  index: request.table,
-                  id: String(id),
+                  ...identity,
                   document,
                   refresh: "wait_for",
                 },
@@ -1543,8 +1552,7 @@ export class ElasticsearchDriver implements IDBDriver {
               )
             : await client.update(
                 {
-                  index: request.table,
-                  id: String(id),
+                  ...identity,
                   doc: document,
                   refresh: "wait_for",
                 },
@@ -1610,17 +1618,13 @@ export class ElasticsearchDriver implements IDBDriver {
       request.primaryKeyValuesList,
       context,
       (entry) => {
-        const id = entry._id;
-        if (typeof id !== "string" && typeof id !== "number") {
-          throw new Error("Elasticsearch delete requires an _id.");
-        }
+        const identity = this.resolveMutationIdentity(request.table, entry);
         const client = this.requireClient();
         return async () => {
           try {
             const result = await client.delete(
               {
-                index: request.table,
-                id: String(id),
+                ...identity,
                 refresh: "wait_for",
               },
               context ? { signal: context.signal } : undefined,
@@ -1651,6 +1655,7 @@ export class ElasticsearchDriver implements IDBDriver {
     data: {
       primaryKeys?: Record<string, unknown>;
       changes?: Record<string, unknown>;
+      originalValues?: Record<string, unknown>;
       values?: Record<string, unknown>;
       primaryKeyValuesList?: Array<Record<string, unknown>>;
     },
@@ -1682,6 +1687,7 @@ export class ElasticsearchDriver implements IDBDriver {
     data: {
       primaryKeys?: Record<string, unknown>;
       changes?: Record<string, unknown>;
+      originalValues?: Record<string, unknown>;
       values?: Record<string, unknown>;
       primaryKeyValuesList?: Array<Record<string, unknown>>;
     },
@@ -1694,6 +1700,7 @@ export class ElasticsearchDriver implements IDBDriver {
         table,
         data.primaryKeys ?? {},
         data.changes ?? {},
+        data.originalValues,
       );
     }
     return this.buildDeleteMutationPreviewStatement(
@@ -1723,33 +1730,57 @@ export class ElasticsearchDriver implements IDBDriver {
     table: string,
     primaryKeys: Record<string, unknown>,
     changes: Record<string, unknown>,
+    originalValues?: Record<string, unknown>,
   ): string {
-    const id = primaryKeys._id;
-    return this.formatRestCommand(
-      "PUT",
-      `/${encodeURIComponent(table)}/_doc/${encodeURIComponent(
-        id !== undefined ? String(id) : "<id>",
-      )}?refresh=wait_for`,
-      this.resolveDocumentForMutation(
-        {
-          ...primaryKeys,
-          ...changes,
-        },
-        changes,
-      ),
+    const identity = this.resolveMutationIdentity(table, primaryKeys);
+    if (
+      Object.hasOwn(changes, "_identity") ||
+      (Object.hasOwn(changes, "_id") && changes._id !== primaryKeys._id)
+    ) {
+      throw new Error("Elasticsearch document identity is read-only.");
+    }
+    const document = this.resolveDocumentForMutation(
+      { ...primaryKeys, ...changes },
+      changes,
     );
+    const conditional = Object.hasOwn(originalValues ?? {}, "_source");
+    const replace = Object.hasOwn(changes, "_source") && !conditional;
+    return this.formatRestCommand(
+      replace ? "PUT" : "POST",
+      this.mutationIdentityPath(identity, replace ? "_doc" : "_update"),
+      conditional
+        ? { script: this.originalSourceScript(originalValues, document) }
+        : replace
+          ? document
+          : { doc: document },
+    );
+  }
+
+  private originalSourceScript(
+    originalValues: Record<string, unknown> | undefined,
+    next: Record<string, unknown>,
+  ) {
+    return {
+      lang: "painless",
+      source:
+        "if (ctx._source != params.original) { ctx.op = 'none' } else { ctx._source = params.next }",
+      params: {
+        original: this.resolveDocumentForMutation({
+          _source: originalValues?._source,
+        }),
+        next,
+      },
+    };
   }
 
   private buildDeleteMutationPreviewStatement(
     table: string,
     primaryKeys: Record<string, unknown>,
   ): string {
-    const id = primaryKeys._id;
+    const identity = this.resolveMutationIdentity(table, primaryKeys);
     return this.formatRestCommand(
       "DELETE",
-      `/${encodeURIComponent(table)}/_doc/${encodeURIComponent(
-        id !== undefined ? String(id) : "<id>",
-      )}?refresh=wait_for`,
+      this.mutationIdentityPath(identity, "_doc"),
     );
   }
 
@@ -2029,6 +2060,20 @@ export class ElasticsearchDriver implements IDBDriver {
         valueSemantics: "plain",
       },
       {
+        name: "_identity",
+        type: "text",
+        nativeType: "text",
+        category: "text",
+        nullable: false,
+        isReadOnly: true,
+        isPrimaryKey: true,
+        primaryKeyOrdinal: 2,
+        isForeignKey: false,
+        filterable: false,
+        filterOperators: [],
+        valueSemantics: "plain",
+      },
+      {
         name: "_source",
         type: "json",
         nativeType: "json",
@@ -2049,15 +2094,142 @@ export class ElasticsearchDriver implements IDBDriver {
   }
 
   private hitsToRows(
-    hits: ReadonlyArray<{ _id?: unknown; _source?: unknown }>,
+    hits: ReadonlyArray<{
+      _id?: unknown;
+      _source?: unknown;
+      _index?: unknown;
+      _routing?: unknown;
+      _seq_no?: unknown;
+      _primary_term?: unknown;
+    }>,
+    table?: string,
   ): Record<string, unknown>[] {
     return hits.map((hit) => {
       const source = this.normalizeSourceDocument(hit._source);
       return {
         _id: hit._id,
+        ...(table === undefined
+          ? {}
+          : {
+              _identity: this.encodeRowIdentity(table, hit),
+            }),
         _source: JSON.stringify(source),
       };
     });
+  }
+
+  // A non-null opaque key avoids nullable routing in the shared compound-PK
+  // pipeline. Sign the entire read identity so omitted/edited routing cannot
+  // silently become default routing. Tokens are scoped to this connection and
+  // table (including aliases); writes always use the hit's concrete index.
+  private encodeRowIdentity(
+    table: string,
+    hit: {
+      _index?: unknown;
+      _id?: unknown;
+      _routing?: unknown;
+      _seq_no?: unknown;
+      _primary_term?: unknown;
+    },
+  ): string | null {
+    if (
+      typeof hit._index !== "string" ||
+      !hit._index ||
+      typeof hit._id !== "string" ||
+      !hit._id ||
+      (hit._routing !== undefined && typeof hit._routing !== "string") ||
+      !Number.isSafeInteger(hit._seq_no) ||
+      Number(hit._seq_no) < 0 ||
+      !Number.isSafeInteger(hit._primary_term) ||
+      Number(hit._primary_term) < 1
+    )
+      return null; // Incomplete reads remain viewable, but cannot be mutated.
+    const payload = Buffer.from(
+      JSON.stringify([
+        1,
+        this.connectionEpoch,
+        table,
+        hit._index,
+        hit._id,
+        hit._routing ?? null,
+        hit._seq_no,
+        hit._primary_term,
+      ]),
+    ).toString("base64url");
+    return `${payload}.${this.signRowIdentity(payload)}`;
+  }
+
+  private signRowIdentity(payload: string): string {
+    return createHmac("sha256", this.identitySecret)
+      .update(payload)
+      .digest("base64url");
+  }
+
+  private resolveMutationIdentity(
+    table: string,
+    primaryKeys: Record<string, unknown>,
+  ): ElasticsearchMutationIdentity {
+    const invalid = () =>
+      new Error(
+        "Elasticsearch mutation requires a complete, unchanged _id/_identity from the current table read. Refresh the table and retry.",
+      );
+    const token = primaryKeys._identity;
+    if (typeof token !== "string") throw invalid();
+    const [payload, signature, extra] = token.split(".");
+    if (
+      !payload ||
+      !signature ||
+      extra !== undefined ||
+      signature !== this.signRowIdentity(payload)
+    )
+      throw invalid();
+    let identity: unknown;
+    try {
+      identity = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    } catch {
+      throw invalid();
+    }
+    if (!Array.isArray(identity) || identity.length !== 8) throw invalid();
+    const [version, epoch, readTable, index, id, routing, seqNo, primaryTerm] =
+      identity as unknown[];
+    if (
+      version !== 1 ||
+      epoch !== this.connectionEpoch ||
+      readTable !== table ||
+      typeof index !== "string" ||
+      !index ||
+      typeof id !== "string" ||
+      !id ||
+      primaryKeys._id !== id ||
+      (routing !== null && typeof routing !== "string") ||
+      typeof seqNo !== "number" ||
+      !Number.isSafeInteger(seqNo) ||
+      seqNo < 0 ||
+      typeof primaryTerm !== "number" ||
+      !Number.isSafeInteger(primaryTerm) ||
+      primaryTerm < 1
+    )
+      throw invalid();
+    return {
+      index,
+      id,
+      ...(routing === null ? {} : { routing }),
+      if_seq_no: seqNo,
+      if_primary_term: primaryTerm,
+    };
+  }
+
+  private mutationIdentityPath(
+    identity: ElasticsearchMutationIdentity,
+    endpoint: "_doc" | "_update",
+  ): string {
+    const params = new URLSearchParams({
+      ...(identity.routing === undefined ? {} : { routing: identity.routing }),
+      if_seq_no: String(identity.if_seq_no),
+      if_primary_term: String(identity.if_primary_term),
+      refresh: "wait_for",
+    });
+    return `/${encodeURIComponent(identity.index)}/${endpoint}/${encodeURIComponent(identity.id)}?${params}`;
   }
 
   private mapRowToQueryRow(
@@ -2096,7 +2268,10 @@ export class ElasticsearchDriver implements IDBDriver {
       return this.normalizeSourceDocument(record._source);
     }
 
-    return this.stripDocumentId(record);
+    // Only the Viewer envelope owns a service _identity. A raw REST body or
+    // _source may legitimately contain an application field with this name.
+    const { _identity: _ignoredIdentity, ...document } = record;
+    return this.stripDocumentId(document);
   }
 
   private normalizeSourceDocument(source: unknown): Record<string, unknown> {

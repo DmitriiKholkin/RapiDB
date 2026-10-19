@@ -68,6 +68,7 @@ export class TableMutationService {
     );
     if (failure) throw new PersistedEditValidationError(failure);
     if (driver.updateRows) {
+      driver.validateTableUpdates?.([{ changes }]);
       const writableChanges = filterWritableRecord(changes, columnMetaByName);
       if (Object.keys(writableChanges).length === 0) {
         return;

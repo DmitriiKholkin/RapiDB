@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import { ELASTICSEARCH_READ_BUDGET } from "../../src/shared/safetyContracts";
+import { elasticsearchKeys } from "../support/elasticsearchIdentity";
 
 const elasticDatetimeColumn: ColumnTypeMeta = {
   name: "created_at",
@@ -121,7 +122,7 @@ describe("ElasticsearchDriver — metadata and pages", () => {
     });
   });
 
-  it("returns fixed _id/_source columns and JSON row payloads for page reads", async () => {
+  it("returns fixed identity/source columns and JSON row payloads for page reads", async () => {
     const { driver, search, getMapping } = createDriver();
     search.mockResolvedValue({
       hits: {
@@ -183,6 +184,11 @@ describe("ElasticsearchDriver — metadata and pages", () => {
         primaryKeyOrdinal: 1,
       }),
       expect.objectContaining({
+        name: "_identity",
+        isPrimaryKey: true,
+        isReadOnly: true,
+      }),
+      expect.objectContaining({
         name: "_source",
         category: "json",
       }),
@@ -191,11 +197,13 @@ describe("ElasticsearchDriver — metadata and pages", () => {
     expect(page.rows).toEqual([
       {
         _id: "doc-1",
+        _identity: null,
         _source:
           '{"created_at":"2026-04-01T09:00:00Z","email":"alpha@example.com","profile":{"tier":"free"},"active":true,"status":null,"dynamic_seen":"no"}',
       },
       {
         _id: "doc-2",
+        _identity: null,
         _source:
           '{"created_at":"2026-04-02T10:30:00Z","email":"bravo@example.com","profile":{"tier":"pro"},"active":false,"dynamic_seen":"yes"}',
       },
@@ -208,6 +216,7 @@ describe("ElasticsearchDriver — metadata and pages", () => {
         sort: ["_doc"],
         size: ELASTICSEARCH_READ_BUDGET.hardCap,
         track_total_hits: true,
+        seq_no_primary_term: true,
       },
       {
         signal: expect.any(AbortSignal),
@@ -285,6 +294,11 @@ describe("ElasticsearchDriver — metadata and pages", () => {
 
     expect(described).toEqual([
       expect.objectContaining({ name: "_id", isPrimaryKey: true }),
+      expect.objectContaining({
+        name: "_identity",
+        isPrimaryKey: true,
+        isReadOnly: true,
+      }),
       expect.objectContaining({ name: "_source", category: "json" }),
     ]);
   });
@@ -497,6 +511,11 @@ describe("ElasticsearchDriver — metadata and pages", () => {
     expect(page.totalCount).toBe(0);
     expect(page.columns).toEqual([
       expect.objectContaining({ name: "_id", isPrimaryKey: true }),
+      expect.objectContaining({
+        name: "_identity",
+        isPrimaryKey: true,
+        isReadOnly: true,
+      }),
       expect.objectContaining({ name: "_source", category: "json" }),
     ]);
   });
@@ -554,11 +573,13 @@ describe("ElasticsearchDriver — metadata and pages", () => {
         "indices",
         "users",
         {
-          primaryKeys: { _id: "doc-3" },
+          primaryKeys: elasticsearchKeys(driver, "doc-3"),
           changes: { active: false },
         },
       ),
-    ).toBe('PUT /users/_doc/doc-3?refresh=wait_for\n{\n  "active": false\n}');
+    ).toBe(
+      'POST /users/_update/doc-3?if_seq_no=3&if_primary_term=1&refresh=wait_for\n{\n  "doc": {\n    "active": false\n  }\n}',
+    );
     expect(
       driver.buildMutationPreviewStatement(
         "delete",
@@ -566,10 +587,12 @@ describe("ElasticsearchDriver — metadata and pages", () => {
         "indices",
         "users",
         {
-          primaryKeys: { _id: "doc-3" },
+          primaryKeys: elasticsearchKeys(driver, "doc-3"),
         },
       ),
-    ).toBe("DELETE /users/_doc/doc-3?refresh=wait_for");
+    ).toBe(
+      "DELETE /users/_doc/doc-3?if_seq_no=3&if_primary_term=1&refresh=wait_for",
+    );
   });
 
   it("normalizes viewer-formatted datetime edits back to REST payload syntax", () => {
@@ -588,12 +611,12 @@ describe("ElasticsearchDriver — metadata and pages", () => {
         "indices",
         "users",
         {
-          primaryKeys: { _id: "doc-3" },
+          primaryKeys: elasticsearchKeys(driver, "doc-3"),
           changes: { created_at: coerced },
         },
       ),
     ).toBe(
-      'PUT /users/_doc/doc-3?refresh=wait_for\n{\n  "created_at": "2026-04-01T09:00:00.123+00:00"\n}',
+      'POST /users/_update/doc-3?if_seq_no=3&if_primary_term=1&refresh=wait_for\n{\n  "doc": {\n    "created_at": "2026-04-01T09:00:00.123+00:00"\n  }\n}',
     );
   });
 
@@ -607,7 +630,7 @@ describe("ElasticsearchDriver — metadata and pages", () => {
         table: "users",
         updates: [
           {
-            primaryKeys: { _id: "doc-3" },
+            primaryKeys: elasticsearchKeys(driver, "doc-3"),
             changes: { _source: '{"active":false}' },
             originalValues: { _source: '{"active":true}' },
           },
@@ -629,7 +652,7 @@ describe("ElasticsearchDriver — metadata and pages", () => {
     );
   });
 
-  it("supports updates without an original snapshot for legacy callers", async () => {
+  it("supports updates without an original snapshot when a read identity is supplied", async () => {
     const { driver, update, index } = createDriver();
 
     await expect(
@@ -639,7 +662,7 @@ describe("ElasticsearchDriver — metadata and pages", () => {
         table: "users",
         updates: [
           {
-            primaryKeys: { _id: "doc-3" },
+            primaryKeys: elasticsearchKeys(driver, "doc-3"),
             changes: {
               _source: '{"active":false}',
             },
@@ -652,6 +675,8 @@ describe("ElasticsearchDriver — metadata and pages", () => {
       {
         index: "users",
         id: "doc-3",
+        if_seq_no: 3,
+        if_primary_term: 1,
         document: { active: false },
         refresh: "wait_for",
       },
@@ -672,8 +697,14 @@ describe("ElasticsearchDriver — metadata and pages", () => {
         schema: "indices",
         table: "users",
         updates: [
-          { primaryKeys: { _id: "doc-1" }, changes: { active: false } },
-          { primaryKeys: { _id: "doc-2" }, changes: { active: false } },
+          {
+            primaryKeys: elasticsearchKeys(driver, "doc-1"),
+            changes: { active: false },
+          },
+          {
+            primaryKeys: elasticsearchKeys(driver, "doc-2"),
+            changes: { active: false },
+          },
         ],
       }),
     ).resolves.toEqual({
@@ -697,9 +728,18 @@ describe("ElasticsearchDriver — metadata and pages", () => {
         schema: "indices",
         table: "users",
         updates: [
-          { primaryKeys: { _id: "doc-1" }, changes: { active: false } },
-          { primaryKeys: { _id: "doc-2" }, changes: { active: false } },
-          { primaryKeys: { _id: "doc-3" }, changes: { active: false } },
+          {
+            primaryKeys: elasticsearchKeys(driver, "doc-1"),
+            changes: { active: false },
+          },
+          {
+            primaryKeys: elasticsearchKeys(driver, "doc-2"),
+            changes: { active: false },
+          },
+          {
+            primaryKeys: elasticsearchKeys(driver, "doc-3"),
+            changes: { active: false },
+          },
         ],
       }),
     ).rejects.toMatchObject({

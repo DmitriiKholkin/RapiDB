@@ -47,7 +47,7 @@ describe("Elasticsearch PIT paging and full export (B11)", () => {
     Object.assign(driver, { client, connected: true });
     try {
       expect(await collect(driver.exportTableChunks(request))).toEqual([
-        { _id: "one", _source: "{}" },
+        { _id: "one", _identity: null, _source: "{}" },
       ]);
       expect(transport.mock.calls[0]).toEqual([
         expect.objectContaining({
@@ -202,6 +202,7 @@ describe("Elasticsearch PIT paging and full export (B11)", () => {
     expect(rows).toEqual(
       expected.map((hit) => ({
         _id: hit._id,
+        _identity: null,
         _source: JSON.stringify(hit._source),
       })),
     );
@@ -215,7 +216,7 @@ describe("Elasticsearch PIT paging and full export (B11)", () => {
     const chunks = driver.exportTableChunks(request);
     const first = await chunks.next();
     expect(first.value).toMatchObject({
-      columns: [{ name: "_id" }, { name: "_source" }],
+      columns: [{ name: "_id" }, { name: "_identity" }, { name: "_source" }],
       rows: [],
     });
     expect((await chunks.next()).done).toBe(true);
@@ -358,7 +359,10 @@ describe("Elasticsearch PIT paging and full export (B11)", () => {
       pit_id: rotatedId,
       timed_out: false,
       _shards: { total: 2, successful: 2, failed: 0 },
-      hits: { total: { value: 9, relation: "eq" }, hits: snapshot.slice(3, 6) },
+      hits: {
+        total: { value: 9, relation: "eq" },
+        hits: snapshot.slice(3, 6),
+      },
     });
     await rejection;
     expect(client.closePointInTime).toHaveBeenCalledWith(
