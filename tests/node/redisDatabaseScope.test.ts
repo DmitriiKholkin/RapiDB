@@ -886,7 +886,6 @@ describe("B02 Redis logical database isolation", () => {
     const driver = driverWith();
     await driver.connect();
     const gate = deferred();
-    harness.clients[0].commandGate = gate.promise;
     const wrapped = createTimeoutAwareDriver(driver, () => ({
       connectionTimeoutMs: 1000,
       connectionTimeoutSeconds: 1,
@@ -898,6 +897,11 @@ describe("B02 Redis logical database isolation", () => {
       [],
       { requestToken: 42 },
     );
+    const queryClient = harness.clients.at(-1);
+    if (!queryClient || queryClient === harness.clients[0]) {
+      throw new Error("Expected an isolated editor-query client");
+    }
+    queryClient.commandGate = gate.promise;
     const rejected = expect(pending).rejects.toThrow("timed out");
     await vi.advanceTimersByTimeAsync(101);
     await rejected;
