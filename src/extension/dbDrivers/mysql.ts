@@ -2738,30 +2738,36 @@ export class MySQLDriver extends BaseDBDriver {
     const rows = await this.queryObjectRows<
       RowDataPacket & {
         ENGINE: string | null;
+        TRANSACTIONS: string | null;
       }
     >(
-      `SELECT ENGINE
-       FROM information_schema.TABLES
-       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+      `SELECT t.ENGINE, e.TRANSACTIONS
+       FROM information_schema.TABLES t
+       LEFT JOIN information_schema.ENGINES e ON e.ENGINE = t.ENGINE
+       WHERE t.TABLE_SCHEMA = ? AND t.TABLE_NAME = ?
        LIMIT 1`,
       [database, table],
     );
-    const engine = (rows[0]?.ENGINE ?? "").toUpperCase();
-    if (!engine) {
+    const engine =
+      typeof rows[0]?.ENGINE === "string"
+        ? rows[0].ENGINE.trim().toUpperCase()
+        : "";
+    const transactions =
+      typeof rows[0]?.TRANSACTIONS === "string"
+        ? rows[0].TRANSACTIONS.trim().toUpperCase()
+        : "";
+    // Use the server's capability rather than a blacklist: MariaDB Aria and
+    // third-party engines may accept BEGIN/ROLLBACK without undoing writes.
+    // Missing tables, views (NULL ENGINE), or unavailable engine metadata must
+    // not be treated as proof that rollback is safe.
+    if (engine && transactions === "YES") {
       return null;
     }
-    const nonTransactionalEngines = new Set([
-      "MYISAM",
-      "MEMORY",
-      "CSV",
-      "ARCHIVE",
-      "MRG_MYISAM",
-      "ISAM",
-    ]);
-    if (!nonTransactionalEngines.has(engine)) {
-      return null;
-    }
-    return `Table \`${database}\`.\`${table}\` uses the non-transactional MySQL engine ${engine}. Multi-statement table mutations are blocked to avoid partial writes. Convert the table to InnoDB or apply rows one by one.`;
+    const reason =
+      engine && transactions === "NO"
+        ? `Table \`${database}\`.\`${table}\` uses the non-transactional MySQL engine ${engine}.`
+        : `Cannot confirm rollback support for table \`${database}\`.\`${table}\`${engine ? ` (engine ${engine})` : ""}: storage engine transaction metadata is unavailable or inconclusive.`;
+    return `${reason} Multi-statement table mutations and mutations requiring verification are blocked to avoid partial writes. Use a transactional engine such as InnoDB and ensure its engine metadata is visible.`;
   }
   mapTypeCategory(nativeType: string): TypeCategory {
     const ct = nativeType.toLowerCase();

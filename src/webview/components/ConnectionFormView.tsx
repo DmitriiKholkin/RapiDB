@@ -670,6 +670,13 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       : connectionReadOnly
         ? "Advanced. WAL is enabled automatically for writable SQLite connections; this read-only session leaves the file untouched."
         : "Advanced. WAL is enabled automatically for writable SQLite connections unless you disable it here.";
+  const readOnlyHint =
+    (type === "oracle"
+      ? "Blocks table edits and query editor execution for Oracle. Table data and schema browsing remain available. Autonomous transactions can commit writes despite SET TRANSACTION READ ONLY and caller rollback. To run queries, use database-enforced read-only permissions, including restrictions on executable routines, with a regular connection."
+      : type === "mssql"
+        ? "Blocks table edits and query editor execution for SQL Server. Table data and schema browsing remain available. To run queries, use database-enforced read-only permissions, including restrictions on executable routines, with a regular connection."
+        : "Blocks table edits and limits query editor execution to read operations. Table data and schema browsing remain available.") +
+    " This application safeguard does not replace database permissions; database-defined views, policies, and routines may have side effects even during reads.";
   const tlsModeHint =
     tlsMode === "disabled"
       ? "Connection encryption is disabled."
@@ -1073,11 +1080,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
         <CardHeader icon="shield" label="Access" />
         <Toggle
           label="Open connection as read-only"
-          hint={
-            type === "mssql"
-              ? "Blocks table edits and query execution for SQL Server. To run queries, use a database read-only login with a regular connection."
-              : "Blocks data mutations and shows table data in the same read-only mode used for views. Only read queries can be executed."
-          }
+          hint={readOnlyHint}
           checked={connectionReadOnly}
           onChange={setConnectionReadOnly}
         />

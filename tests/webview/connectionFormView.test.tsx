@@ -291,28 +291,95 @@ describe("ConnectionFormView", () => {
     const toggle = screen.getByRole("switch", {
       name: /open connection as read-only/i,
     });
-    const hint = screen.getByText(/Blocks data mutations/i);
+    const hint = screen.getByText(/Blocks table edits/i);
 
     expect(toggle.getAttribute("aria-describedby")).toBeTruthy();
     expect(toggle.getAttribute("aria-describedby")).toBe(
       hint.getAttribute("id"),
     );
+    expect(hint.textContent).toContain(
+      "limits query editor execution to read operations",
+    );
+    expect(hint.textContent).toContain("does not replace database permissions");
+    expect(hint.textContent).not.toContain("Only read queries can be executed");
   });
 
-  it("explains why read-only SQL Server connections cannot run queries", async () => {
+  it.each([
+    "SQL Server",
+    "Oracle",
+  ])("explains the read-only %s editor exception without disabling browsing", async (databaseType) => {
     const user = userEvent.setup();
     render(<ConnectionFormView existing={null} />);
 
-    await user.click(screen.getByRole("button", { name: /sql server/i }));
+    await user.click(
+      screen.getByRole("button", { name: new RegExp(databaseType, "i") }),
+    );
 
     const toggle = screen.getByRole("switch", {
       name: /open connection as read-only/i,
     });
-    const hint = screen.getByText(/blocks table edits and query execution/i);
+    const hint = screen.getByText(
+      /blocks table edits and query editor execution/i,
+    );
     expect(toggle.getAttribute("aria-describedby")).toBe(
       hint.getAttribute("id"),
     );
-    expect(hint.textContent).toContain("database read-only login");
+    expect(hint.textContent).toContain(
+      `query editor execution for ${databaseType}`,
+    );
+    expect(hint.textContent).toContain(
+      "Table data and schema browsing remain available",
+    );
+    expect(hint.textContent).toContain(
+      "database-enforced read-only permissions",
+    );
+    expect(hint.textContent).toContain("restrictions on executable routines");
+    expect(hint.textContent).toContain("with a regular connection");
+    expect(hint.textContent).toContain("does not replace database permissions");
+    expect(hint.textContent).toContain(
+      "may have side effects even during reads",
+    );
+    expect(hint.textContent).not.toContain("Only read queries can be executed");
+    if (databaseType === "Oracle") {
+      expect(hint.textContent).toContain(
+        "Autonomous transactions can commit writes despite SET TRANSACTION READ ONLY and caller rollback",
+      );
+    }
+
+    await user.click(toggle);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    await user.type(
+      screen.getByLabelText("Connection name"),
+      "Readonly browsing",
+    );
+    await submitCreateConnection(user);
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "saveConnection",
+      payload: {
+        type: databaseType === "Oracle" ? "oracle" : "mssql",
+        readOnly: true,
+      },
+    });
+  });
+
+  it("updates the read-only hint when switching away from Oracle", async () => {
+    const user = userEvent.setup();
+    render(<ConnectionFormView existing={null} />);
+    await user.click(screen.getByRole("button", { name: /oracle/i }));
+    expect(
+      screen.getByText(/Autonomous transactions can commit writes/i),
+    ).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: /postgresql/i }));
+    expect(
+      screen.queryByText(/Autonomous transactions can commit writes/i),
+    ).toBeNull();
+    expect(
+      screen.queryByText(/blocks table edits and query editor execution/i),
+    ).toBeNull();
+    expect(
+      screen.getByText(/limits query editor execution to read operations/i),
+    ).toBeTruthy();
   });
 
   it("posts modern NoSQL root fields in save payloads", async () => {
@@ -736,12 +803,15 @@ describe("ConnectionFormView", () => {
     expect(getLastPostedMessage()).toEqual({ type: "cancel" });
   });
 
-  it("tracks the read-only toggle through edit state, test, and save payloads", async () => {
+  it.each([
+    "pg",
+    "oracle",
+  ] as const)("tracks the %s read-only toggle through edit state, test, and save payloads", async (type) => {
     const user = userEvent.setup();
     const existing = {
       id: "conn-1",
       name: "Warehouse",
-      type: "pg" as const,
+      type,
       host: "db.local",
       port: 5432,
       database: "app_db",

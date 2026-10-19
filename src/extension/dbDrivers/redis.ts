@@ -2178,12 +2178,26 @@ export class RedisDriver implements IDBDriver {
       const count = Number.isFinite(limit)
         ? Math.min(500, Math.max(1, limit - keys.length))
         : 500;
-      const response = await client.scan(cursor, {
-        MATCH: pattern,
-        COUNT: count,
-      });
-      cursor = response.cursor;
-      keys.push(...response.keys);
+      // The table viewer uses strings as key identities. Decoding SCAN with
+      // replacement characters can alias a binary key to a different UTF-8 key,
+      // including for subsequent updates/deletes. Validate the original bytes
+      // before returning any identity or issuing any value reads.
+      const response = await client
+        .withTypeMapping({ [RESP_TYPES.BLOB_STRING]: Buffer })
+        .scan(cursor, {
+          MATCH: pattern,
+          COUNT: count,
+        });
+      cursor = response.cursor.toString();
+      for (const bytes of response.keys) {
+        const key = bytes.toString("utf8");
+        if (!Buffer.from(key, "utf8").equals(bytes)) {
+          throw new Error(
+            "Redis keyspace contains a non-UTF-8 key. The table viewer cannot safely display or edit binary keys. Use a binary-safe Redis client or narrow the keyspace.",
+          );
+        }
+        keys.push(key);
+      }
     } while (cursor !== "0" && keys.length < limit);
     if (failOnTruncation && (cursor !== "0" || keys.length > limit)) {
       throw new Error(

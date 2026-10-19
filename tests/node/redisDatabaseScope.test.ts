@@ -96,6 +96,13 @@ class FakeRedis {
   type = vi.fn(async (key: string) => this.store().get(key)?.type ?? "none");
   get = vi.fn(async (key: string) => this.store().get(key)?.value ?? null);
   withTypeMapping = vi.fn(() => ({
+    scan: async (cursor: string, options: { MATCH: string }) => {
+      const response = await this.scan(cursor, options);
+      return {
+        cursor: Buffer.from(response.cursor),
+        keys: response.keys.map((key) => Buffer.from(key)),
+      };
+    },
     get: async (key: string) => {
       const value = await this.get(key);
       return value == null
@@ -170,6 +177,8 @@ class FakeRedis {
     return {
       sendCommand: (args: string[]) => run(() => this.sendCommand(args)),
       withTypeMapping: () => ({
+        scan: (cursor: string, options: { MATCH: string }) =>
+          run(() => this.withTypeMapping().scan(cursor, options)),
         get: (key: string) => run(() => this.withTypeMapping().get(key)),
       }),
       type: (key: string) => run(() => this.type(key)),

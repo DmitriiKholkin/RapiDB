@@ -579,7 +579,7 @@
               "readOnly": {
                 "type": "boolean",
                 "default": false,
-                "description": "Open the connection in read-only mode. Table edits are blocked and query execution is limited to reads; MSSQL query editor execution is blocked entirely. Use a database read-only login with a regular MSSQL connection to run queries."
+                "description": "Open the connection in read-only mode. Table edits are blocked and query execution is limited to reads; MSSQL and Oracle query editor execution is blocked entirely, while table data and schema browsing remain available. Use database-enforced read-only permissions, including restrictions on executable routines, with a regular connection to run queries. This application safeguard does not replace database permissions."
               },
               "serviceName": {
                 "type": "string",

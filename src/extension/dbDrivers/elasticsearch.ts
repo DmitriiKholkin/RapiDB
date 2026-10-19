@@ -25,6 +25,7 @@ import {
   drainElasticsearchCleanup,
   ElasticsearchPitSession,
 } from "./elasticsearchPitSession";
+import { ElasticsearchSerializer } from "./elasticsearchSerializer";
 import { getMetadataContext } from "./metadataCancellation";
 import {
   applyFilters,
@@ -160,6 +161,7 @@ export class ElasticsearchDriver implements IDBDriver {
         : undefined;
       this.assertConnectionEpoch(epoch);
       client = new Client({
+        Serializer: ElasticsearchSerializer,
         ...(sshAgentTransport ? { Connection: SshTlsHttpConnection } : {}),
         node: this.config.cloudId ? undefined : node,
         headers: ELASTICSEARCH_COMPATIBILITY_HEADERS,

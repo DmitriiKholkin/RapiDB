@@ -96,19 +96,30 @@ export function formatExportCellValue(value: unknown): string {
 /**
  * Build the column descriptor list for a query-result export, deduplicating
  * column names that collide (e.g. two `id` columns become `id`, `id_2`).
+ * Reserve literal names before allocating suffixes so a generated label cannot
+ * steal another column's name, even when that column appears later.
  */
 export function buildQueryExportColumns(
   columns: readonly string[],
   columnMeta?: readonly QueryColumnMeta[],
 ): ExportColumnDescriptor[] {
-  const seenColumnNames = new Map<string, number>();
+  const reservedNames = new Set(columns);
+  const usedNames = new Set<string>();
+  const nextSuffixes = new Map<string, number>();
 
   return columns.map((columnName, index) => {
-    const seenCount = seenColumnNames.get(columnName) ?? 0;
-    seenColumnNames.set(columnName, seenCount + 1);
+    let key = columnName;
+    if (usedNames.has(key)) {
+      let suffix = nextSuffixes.get(columnName) ?? 2;
+      do {
+        key = `${columnName}_${suffix++}`;
+      } while (reservedNames.has(key) || usedNames.has(key));
+      nextSuffixes.set(columnName, suffix);
+    }
+    usedNames.add(key);
 
     return {
-      key: seenCount === 0 ? columnName : `${columnName}_${seenCount + 1}`,
+      key,
       sourceKey: queryColumnKey(index),
       category: columnMeta?.[index]?.category ?? null,
     } satisfies ExportColumnDescriptor;

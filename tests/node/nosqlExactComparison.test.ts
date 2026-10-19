@@ -400,6 +400,10 @@ function redis(valuesByKey: Record<string, string>) {
       .mockResolvedValue({ cursor: "0", keys: Object.keys(valuesByKey) }),
     type: vi.fn().mockResolvedValue("string"),
     withTypeMapping: vi.fn(() => ({
+      scan: vi.fn().mockResolvedValue({
+        cursor: Buffer.from("0"),
+        keys: Object.keys(valuesByKey).map((key) => Buffer.from(key)),
+      }),
       get: vi.fn(async (key: string) =>
         valuesByKey[key] === undefined ? null : Buffer.from(valuesByKey[key]),
       ),

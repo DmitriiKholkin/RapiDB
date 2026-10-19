@@ -406,8 +406,8 @@ describe("readOnly bypass regressions (stage 1)", () => {
     "SELECT '序列.NEXTVAL' AS example FROM dual",
     "SELECT 1 /* 序列.NEXTVAL */ FROM dual",
     'SELECT "序列.NEXTVAL" FROM items',
-  ])("preserves harmless Oracle Unicode identifiers and literals: %s", (sql) => {
-    expect(sqlReadOnlyQueryGuard(sql, "plsql")).toEqual({ allowed: true });
+  ])("fails closed even for apparently harmless Oracle SQL: %s", (sql) => {
+    expect(sqlReadOnlyQueryGuard(sql, "plsql").allowed).toBe(false);
   });
 
   it("denies encoded PostgreSQL mutating function names", () => {

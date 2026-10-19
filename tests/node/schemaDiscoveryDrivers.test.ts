@@ -7,6 +7,7 @@ import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
 import { REDIS_ALL_KEYS_TABLE } from "../../src/extension/dbDrivers/redisKeyspace";
 import { loadDatabaseScope } from "../../src/extension/schema/schemaLoaders";
+import { withRedisReplyMapping } from "../support/redisReplyMapping";
 
 vi.mock("redis", async (importOriginal) => {
   const actual = await importOriginal<typeof import("redis")>();
@@ -109,7 +110,7 @@ describe("driver schema discovery error boundaries", () => {
         client.isOpen = false;
         client.isReady = false;
       });
-      return client;
+      return withRedisReplyMapping(client);
     };
     const base = makeClient(vi.fn());
     const scoped = makeClient(scan);

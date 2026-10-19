@@ -1981,10 +1981,96 @@ describe("QueryPanelController", () => {
         type: "queryResult",
         payload: expect.objectContaining({
           error:
-            "[RapiDB] Read-only SQL connections allow only read-only queries.",
+            type === "oracle"
+              ? expect.stringContaining(
+                  "Read-only Oracle query editor execution is blocked",
+                )
+              : "[RapiDB] Read-only SQL connections allow only read-only queries.",
         }),
       }),
     );
+  });
+
+  it.each([
+    { readOnly: true, capabilitiesAvailable: false },
+    { readOnly: true, capabilitiesAvailable: true },
+    { readOnly: false, capabilitiesAvailable: false },
+    { readOnly: false, capabilitiesAvailable: true },
+  ])("enforces the Oracle editor boundary from saved settings: %j", async ({
+    readOnly,
+    capabilitiesAvailable,
+  }) => {
+    const query = vi.fn(async () => ({
+      columns: ["N"],
+      rows: [{ __col_0: 1 }],
+      rowCount: 1,
+      executionTimeMs: 1,
+    }));
+    const connectionManager = {
+      getConnection: vi.fn(() => ({
+        id: "oracle",
+        name: "Oracle",
+        type: "oracle",
+        readOnly,
+      })),
+      getDriverCapabilities: vi.fn(() =>
+        capabilitiesAvailable
+          ? {
+              // A permissive classifier must not override the Oracle boundary.
+              readOnlyQueryGuard: () => ({ allowed: true as const }),
+            }
+          : undefined,
+      ),
+      isConnected: vi.fn(() => false),
+      connectTo: vi.fn(async () => undefined),
+      addToHistory: vi.fn(async () => undefined),
+      getDriver: vi.fn(() => ({ query })),
+      getQueryRowLimit: vi.fn(() => 100),
+      refreshSchemaCache: vi.fn(),
+    };
+    const view = {
+      getActiveConnectionId: () => "oracle",
+      getInitialConnectionId: () => "oracle",
+      getLastQueryResult: () => null,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+    await controller.handleMessage({
+      type: "executeQuery",
+      payload: {
+        queryText: "SELECT audit_touch() FROM dual",
+        operationId: "oracle-audit",
+      },
+    });
+    if (readOnly) {
+      expect(connectionManager.connectTo).not.toHaveBeenCalled();
+      expect(connectionManager.addToHistory).not.toHaveBeenCalled();
+      expect(query).not.toHaveBeenCalled();
+      expect(view.postMessage).toHaveBeenCalledWith({
+        type: "queryResult",
+        payload: expect.objectContaining({
+          error: expect.stringContaining(
+            "Read-only Oracle query editor execution is blocked",
+          ),
+          connectionId: "oracle",
+          operationId: "oracle-audit",
+        }),
+      });
+    } else {
+      expect(connectionManager.connectTo).toHaveBeenCalledOnce();
+      expect(connectionManager.addToHistory).toHaveBeenCalledOnce();
+      expect(query).toHaveBeenCalledOnce();
+      expect(view.setLastQueryResult).toHaveBeenCalledOnce();
+    }
   });
 
   it("rejects readonly MSSQL queries without database-enforced permissions", async () => {

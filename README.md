@@ -53,7 +53,7 @@ PostgreSQL, MS SQL Server, MySQL, MariaDB, SQLite, Oracle, Redis, MongoDB, Elast
 
 <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-3.png" alt="Connection Form" width="100%" />
 
-> Every connection has a **read-only mode** toggle. When enabled, table edits are blocked and query execution is limited to read operations. **SQL Server (MSSQL) exception:** query execution is blocked in read-only mode because client-side classification cannot enforce read-only execution; use a database account with read-only permissions and a regular connection to run queries. Table data remains available in read-only mode.
+> Every connection has a **read-only mode** toggle. When enabled, table edits are blocked and query execution is limited to read operations. **SQL Server (MSSQL) and Oracle exceptions:** query editor execution is blocked in read-only mode because client-side classification cannot enforce read-only execution. Oracle autonomous transactions can commit writes even inside `SET TRANSACTION READ ONLY`, and caller rollback cannot undo them. Use a database account with enforced read-only permissions (including restrictions on executable routines) and a regular connection to run queries. Table data and schema browsing remain available. This toggle is an application safeguard, not a replacement for database permissions; database-defined views, policies, and routines may have side effects even during reads.
 
 <br/>
 

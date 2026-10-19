@@ -8,6 +8,7 @@ import {
   isRawNumberToken,
   parseJsonPreservingRawNumbers,
 } from "../utils/jsonCanonical";
+import { ORACLE_READ_ONLY_ENFORCEMENT_MESSAGE } from "../utils/readOnlyGuards";
 import { oracleAlternativeQuoteEnd } from "../utils/sqlStatementScan";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
 import { BoundedQueryRows, queryCollectionLimit } from "./boundedQueryRows";
@@ -2567,6 +2568,12 @@ export class OracleDriver extends BaseDBDriver {
       hardCap?: number;
     },
   ): Promise<QueryResult> {
+    // This option is the arbitrary-editor execution boundary, not the saved
+    // connection flag: generated table reads also use query() without it.
+    // Autonomous transactions can commit despite READ ONLY + caller rollback.
+    if (operationContext?.readOnly) {
+      throw new Error(ORACLE_READ_ONLY_ENFORCEMENT_MESSAGE);
+    }
     const limit = queryCollectionLimit(operationContext?.hardCap);
     const start = Date.now();
     const operation: OracleQueryOperation = {
@@ -2579,9 +2586,6 @@ export class OracleDriver extends BaseDBDriver {
     try {
       conn = await this.getConnection();
       operation.connection = conn;
-      if (operationContext?.readOnly) {
-        await conn.execute("SET TRANSACTION READ ONLY");
-      }
       const statements =
         params && params.length > 0 ? [sql] : splitOracleStatements(sql.trim());
       let selectResult: QueryResult | null = null;
@@ -2606,11 +2610,7 @@ export class OracleDriver extends BaseDBDriver {
       if (operation.cancelled) {
         throw new Error("Oracle query cancelled before commit.");
       }
-      if (operationContext?.readOnly) {
-        await conn.rollback();
-      } else {
-        await conn.commit();
-      }
+      await conn.commit();
       if (selectResult) {
         return { ...selectResult, executionTimeMs: Date.now() - start };
       }

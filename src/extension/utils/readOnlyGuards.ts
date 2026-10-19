@@ -16,6 +16,9 @@ const ALLOWED_READ_ONLY_QUERY: ReadOnlyQueryDecision = { allowed: true };
 const SQL_READ_ONLY_QUERY_REASON =
   "[RapiDB] Read-only SQL connections allow only read-only queries.";
 
+export const ORACLE_READ_ONLY_ENFORCEMENT_MESSAGE =
+  "[RapiDB] Read-only Oracle query editor execution is blocked: autonomous transactions can commit writes even inside SET TRANSACTION READ ONLY. Use database-enforced read-only permissions with a regular connection to run queries.";
+
 // Sentinel injected when a MySQL executable comment is stripped. It forces
 // fail-closed classification: sqlReadOnlyQueryGuard denies, and
 // mayChangeDatabaseSchema treats the query as potentially mutating.
@@ -270,6 +273,12 @@ export function decideReadOnlyQueryExecution(
     return allowReadOnlyQuery();
   }
 
+  // Capabilities may be unavailable before automatic connection, or provide a
+  // permissive SQL classifier. Neither can establish this Oracle boundary.
+  if (connectionManager.getConnection?.(connectionId)?.type === "oracle") {
+    return denyReadOnlyQuery(ORACLE_READ_ONLY_ENFORCEMENT_MESSAGE);
+  }
+
   return resolveReadOnlyQueryGuard(connectionManager, connectionId)(queryText);
 }
 
@@ -277,6 +286,12 @@ export function sqlReadOnlyQueryGuard(
   queryText: string,
   dialect: QueryEditorSqlDialect = "sql",
 ): ReadOnlyQueryDecision {
+  // A SELECT can invoke an existing autonomous routine, including indirectly
+  // through a view or policy. READ ONLY and rollback only protect the caller's
+  // transaction. No lexical function blacklist can make arbitrary SQL safe.
+  if (dialect === "plsql") {
+    return denyReadOnlyQuery(ORACLE_READ_ONLY_ENFORCEMENT_MESSAGE);
+  }
   const sanitized = sanitizeSqlForReadOnlyClassification(queryText, dialect);
   if (
     sanitized.includes(EXECUTABLE_MYSQL_COMMENT_SENTINEL) ||
@@ -677,9 +692,6 @@ function isReadOnlySqlStatement(
   if (dialect === "transactsql" && hasTsqlSequenceAdvance(tokens)) {
     return false;
   }
-  if (dialect === "plsql" && hasOracleSequenceAdvance(tokens)) {
-    return false;
-  }
 
   if (isReadOnlySqlTokens(tokens)) {
     return true;
@@ -699,28 +711,6 @@ function hasTsqlSequenceAdvance(tokens: string[]): boolean {
     }
   }
   return false;
-}
-
-function hasOracleSequenceAdvance(tokens: string[]): boolean {
-  // Oracle sequence increments survive transaction rollback, so NEXTVAL is
-  // unsafe even when the editor wraps the read in a READ ONLY transaction.
-  for (let index = 2; index < tokens.length; index += 1) {
-    if (
-      tokens[index]?.toUpperCase() === "NEXTVAL" &&
-      tokens[index - 1] === "." &&
-      isOracleIdentifierToken(tokens[index - 2] ?? "")
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function isOracleIdentifierToken(token: string): boolean {
-  return (
-    token === "__rapidb_quoted_identifier__" ||
-    /^[\p{L}\p{Nl}_][\p{L}\p{Nl}\p{N}\p{M}_$#]*$/u.test(token)
-  );
 }
 
 function hasMysqlSessionSideEffect(

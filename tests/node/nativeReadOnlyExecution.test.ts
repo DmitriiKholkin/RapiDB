@@ -93,17 +93,8 @@ describe("database-native read-only query execution", () => {
     expect(query.mock.calls.at(-1)?.[0]).toBe("ROLLBACK");
   });
 
-  it("uses an Oracle READ ONLY transaction and never commits it", async () => {
-    const execute = vi
-      .fn()
-      .mockResolvedValueOnce({})
-      .mockResolvedValueOnce({})
-      .mockResolvedValueOnce({})
-      .mockResolvedValueOnce({})
-      .mockResolvedValueOnce({
-        metaData: [{ name: "VALUE" }],
-        rows: [[1]],
-      });
+  it("rejects Oracle editor reads before leasing a session instead of relying on rollback", async () => {
+    const execute = vi.fn();
     const connection = {
       callTimeout: 0,
       execute,
@@ -118,21 +109,24 @@ describe("database-native read-only query execution", () => {
       host: "localhost",
       serviceName: "xe",
     } as ConnectionConfig);
+    const getConnection = vi.fn(async () => connection);
     (driver as unknown as { pool: unknown }).pool = {
-      getConnection: vi.fn(async () => connection),
+      getConnection,
       connectionsInUse: 0,
       connectionsOpen: 1,
     };
 
-    await driver.query("select 1 from dual; select 2 from dual", undefined, {
-      requestToken: 3,
-      readOnly: true,
-    });
+    await expect(
+      driver.query("select 1 from dual; select 2 from dual", undefined, {
+        requestToken: 3,
+        readOnly: true,
+      }),
+    ).rejects.toThrow("Read-only Oracle query editor execution is blocked");
 
-    expect(execute.mock.calls[2]?.[0]).toBe("SET TRANSACTION READ ONLY");
-    expect(execute.mock.calls[3]?.[0]).toBe("select 1 from dual");
-    expect(execute.mock.calls[4]?.[0]).toBe("select 2 from dual");
-    expect(connection.rollback).toHaveBeenCalledOnce();
+    expect(getConnection).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(connection.rollback).not.toHaveBeenCalled();
     expect(connection.commit).not.toHaveBeenCalled();
+    expect(connection.close).not.toHaveBeenCalled();
   });
 });

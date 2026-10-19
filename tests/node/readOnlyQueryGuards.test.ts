@@ -143,7 +143,7 @@ describe("readonly query guards", () => {
     });
   });
 
-  it("keeps readonly SQL coverage for MSSQL and Oracle dialects", () => {
+  it("classifies MSSQL SQL and fails closed for arbitrary Oracle SQL", () => {
     const mssqlDriver = new MSSQLDriver({
       id: "mssql-readonly-guard",
       name: "mssql-readonly-guard",
@@ -180,43 +180,31 @@ describe("readonly query guards", () => {
       oracleDriver.getCapabilities().readOnlyQueryGuard,
     );
 
-    expect(oracleGuard("select 1 from dual")).toEqual({ allowed: true });
     for (const sql of [
+      "select 1 from dual",
+      "select audit_touch() from dual",
       "select orders_seq.NEXTVAL from dual",
       "select app.orders_seq.nextval from dual",
       'select "app" . "orders seq" /* gap */ . "NEXTVAL" from dual',
       "select app /* owner */ . orders_seq . /* sequence */ NEXTVAL from dual",
-    ]) {
-      expect(oracleGuard(sql), sql).toEqual({
-        allowed: false,
-        reason:
-          "[RapiDB] Read-only SQL connections allow only read-only queries.",
-      });
-    }
-    for (const sql of [
       "select nextval, orders_seq_nextval, orders_seq.nextvalue from dual",
       "select 'orders_seq.NEXTVAL' from dual",
       "select q'[orders_seq.NEXTVAL]' from dual",
       "select 1 from dual /* orders_seq.NEXTVAL */",
       'select "NEXTVAL" from dual',
       'select "orders_seq"."nextval" from dual',
+      "select q'[an apostrophe's; DELETE FROM t]' as example from dual",
+      "select q'[unterminated",
+      "with src as (select 1 from dual) select * from src",
+      "explain plan for select 1 from dual",
     ]) {
-      expect(oracleGuard(sql), sql).toEqual({ allowed: true });
+      expect(oracleGuard(sql), sql).toEqual({
+        allowed: false,
+        reason: expect.stringContaining(
+          "Read-only Oracle query editor execution is blocked",
+        ),
+      });
     }
-    expect(
-      oracleGuard(
-        "select q'[an apostrophe's; DELETE FROM t]' as example from dual",
-      ),
-    ).toEqual({ allowed: true });
-    expect(oracleGuard("select q'[unterminated").allowed).toBe(false);
-    expect(
-      oracleGuard("with src as (select 1 from dual) select * from src"),
-    ).toEqual({ allowed: true });
-    expect(oracleGuard("explain plan for select 1 from dual")).toEqual({
-      allowed: false,
-      reason:
-        "[RapiDB] Read-only SQL connections allow only read-only queries.",
-    });
   });
 
   it("uses mongosh operation parsing to block MongoDB mutations", () => {
