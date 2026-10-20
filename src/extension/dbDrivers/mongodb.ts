@@ -18,6 +18,7 @@ import {
   Timestamp,
   UUID,
 } from "mongodb";
+import { resolveMongoDatabaseName } from "../../shared/mongoDatabase";
 import { compareNumericTokens } from "../../shared/numericNormalization";
 import { QUERY_LIMIT_POLICY } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
@@ -1704,6 +1705,7 @@ export class MongoDBDriver implements IDBDriver {
 
     const executeOperation = async (
       operation: MongoshOperation,
+      rowBudget = MONGODB_QUERY_HARD_CAP,
     ): Promise<QueryResult> => {
       throwIfQueryCancelled(options);
       const timeoutMS = getQueryRemainingTimeoutMs(options);
@@ -1718,14 +1720,42 @@ export class MongoDBDriver implements IDBDriver {
           : ([] as const);
       const { dbName, collName, op, args: opArgs, chainOps } = operation;
 
-      const limitOp = chainOps.find((c) => c.op === "limit");
-      const normalizedRequestedLimit =
-        typeof limitOp?.args[0] === "number" && Number.isFinite(limitOp.args[0])
-          ? Math.floor(limitOp.args[0])
-          : 100;
-      const limit = Math.max(
-        0,
-        Math.min(MONGODB_QUERY_HARD_CAP, normalizedRequestedLimit),
+      const limitOp = chainOps.filter((chain) => chain.op === "limit").at(-1);
+      const requestedLimit = limitOp?.args[0];
+      if (
+        limitOp &&
+        (limitOp.args.length !== 1 ||
+          typeof requestedLimit !== "number" ||
+          !Number.isSafeInteger(requestedLimit) ||
+          requestedLimit < 0)
+      ) {
+        throw new Error(
+          "[RapiDB] MongoDB limit() requires a non-negative safe integer. Negative and fractional limits are not supported.",
+        );
+      }
+      if (op === "aggregate" && requestedLimit === 0) {
+        throw new Error(
+          "[RapiDB] MongoDB aggregate().limit() requires a positive safe integer.",
+        );
+      }
+      const explicitLimit = requestedLimit as number | undefined;
+      const resultLimit = Math.min(
+        rowBudget,
+        op === "findOne"
+          ? 1
+          : explicitLimit === 0
+            ? MONGODB_QUERY_HARD_CAP
+            : (explicitLimit ?? 100),
+      );
+      // Default/safety caps need a probe, but an explicit user limit must not
+      // read beyond its requested result set. Never pass zero to cursor.limit().
+      const fetchLimit = Math.min(
+        resultLimit + 1,
+        op === "findOne"
+          ? 1
+          : explicitLimit === undefined || explicitLimit === 0
+            ? Infinity
+            : explicitLimit,
       );
       const skipOp = chainOps.find((c) => c.op === "skip");
       const skip =
@@ -1864,13 +1894,15 @@ export class MongoDBDriver implements IDBDriver {
       const collectionHandlers: Record<string, () => Promise<QueryResult>> = {
         find: async () =>
           this.buildMongoDocumentRowsQueryResult(
-            await findDocuments(limit),
+            await findDocuments(fetchLimit),
             startedAt,
+            resultLimit,
           ),
         findOne: async () =>
           this.buildMongoDocumentRowsQueryResult(
             await findDocuments(1),
             startedAt,
+            resultLimit,
           ),
         countDocuments: async () => {
           const count = await mongoCollection.countDocuments(
@@ -1952,7 +1984,7 @@ export class MongoDBDriver implements IDBDriver {
           if (skip > 0) {
             boundedPipeline.push({ $skip: skip });
           }
-          boundedPipeline.push({ $limit: limit });
+          boundedPipeline.push({ $limit: fetchLimit });
           const docs = await mongoCollection
             .aggregate(boundedPipeline, {
               promoteValues: false,
@@ -1960,7 +1992,11 @@ export class MongoDBDriver implements IDBDriver {
               ...sdkOptions,
             })
             .toArray();
-          return this.buildMongoDocumentRowsQueryResult(docs, startedAt);
+          return this.buildMongoDocumentRowsQueryResult(
+            docs,
+            startedAt,
+            resultLimit,
+          );
         },
         createIndex: async () => {
           const key =
@@ -2008,13 +2044,18 @@ export class MongoDBDriver implements IDBDriver {
     let affectedRows = 0;
     let sawAffectedRows = false;
     let totalRowCount = 0;
+    let truncated = false;
 
     for (const operation of operations) {
-      const result = await executeOperation(operation);
+      const availableSlots = MONGODB_QUERY_HARD_CAP - rawRows.length;
+      // Keep executing every statement (including mutations) after the union
+      // fills. Find/aggregate reads then fetch one probe, never limit(0).
+      const result = await executeOperation(operation, availableSlots);
       throwIfQueryCancelled(options);
       const mappedRows = this.mapQueryResultRowsToObjects(result);
       totalRowCount += mappedRows.length;
-      const availableSlots = MONGODB_QUERY_HARD_CAP - rawRows.length;
+      truncated ||=
+        result.truncated === true || mappedRows.length > availableSlots;
       if (availableSlots > 0) {
         rawRows.push(...mappedRows.slice(0, availableSlots));
       }
@@ -2031,6 +2072,7 @@ export class MongoDBDriver implements IDBDriver {
       rowCount: totalRowCount,
       affectedRows: sawAffectedRows ? affectedRows : undefined,
       executionTimeMs: Date.now() - startedAt,
+      ...(truncated ? { truncated: true } : {}),
     };
   }
 
@@ -3063,7 +3105,7 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   private defaultDatabaseName(): string {
-    return this.config.database || "admin";
+    return resolveMongoDatabaseName(this.config);
   }
 
   private requireDb(database?: string) {
@@ -3493,8 +3535,13 @@ export class MongoDBDriver implements IDBDriver {
   private buildMongoDocumentRowsQueryResult(
     docs: readonly Record<string, unknown>[],
     startedAt: number,
+    rowLimit = MONGODB_QUERY_HARD_CAP,
   ): QueryResult {
-    const rows = docs.map((doc) => this.toRow(doc));
+    const truncated = docs.length > rowLimit;
+    // Remove the probe before display conversion and schema inference, so its
+    // fields and values cannot leak into the displayed/exported result.
+    const retainedDocs = truncated ? docs.slice(0, rowLimit) : docs;
+    const rows = retainedDocs.map((doc) => this.toRow(doc));
     const columns = inferColumnsFromRows(rows, "_id").map(
       (column) => column.name,
     );
@@ -3503,6 +3550,7 @@ export class MongoDBDriver implements IDBDriver {
       rows: rows.map((row) => this.mapRowToQueryRow(row, columns)),
       rowCount: rows.length,
       executionTimeMs: Date.now() - startedAt,
+      ...(truncated ? { truncated: true } : {}),
     };
   }
 

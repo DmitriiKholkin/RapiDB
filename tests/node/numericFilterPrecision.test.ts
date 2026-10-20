@@ -12,6 +12,7 @@ import {
   resolveFilterOperators,
 } from "../../src/extension/dbDrivers/types";
 import { buildWhere } from "../../src/extension/table/filterSql";
+import { mockMssqlSessionPool } from "../helpers/mssqlQuerySessionHarness";
 
 const factories = [
   [
@@ -164,7 +165,10 @@ describe("bounded exact DECIMAL filter transport", () => {
       input: vi.fn().mockReturnThis(),
       query: vi.fn().mockResolvedValue({ rowsAffected: [0], columns: [[]] }),
     });
-    (driver as unknown as { pool: unknown }).pool = { request: () => request };
+    Object.assign(request, { overrides: {} });
+    (driver as unknown as { pool: unknown }).pool = mockMssqlSessionPool(
+      () => request,
+    );
     for (const [value, expected, expectedType] of [
       ["+9007199254740993", 9007199254740993n, mssql.BigInt],
       ["9.007199254740993e15", "9007199254740993", mssql.NVarChar(16)],

@@ -25,6 +25,7 @@ import {
   withMetadataResource,
 } from "./metadataCancellation";
 import { mssqlInsertGuard } from "./mssqlInsertGuard";
+import { MssqlQuerySession } from "./mssqlQuerySession";
 import {
   type QuestionMarkPlaceholderOptions,
   questionMarkPlaceholderOffsets,
@@ -36,6 +37,7 @@ import {
 } from "./sqlPreviewLiterals";
 import {
   type DriverTimeoutSettingsProvider,
+  throwIfQueryCancelled,
   throwIfTransactionCancelled,
 } from "./timeout";
 import {
@@ -705,7 +707,9 @@ function canonicalizeMssqlTemporalPersistedEditValue(
       return normalizeDateLiteral(value);
     }
     if (baseType === "time") {
-      return value.trim();
+      return normalizeMssqlTemporalFraction(
+        normalizeMssqlTemporalClock(value.trim()),
+      );
     }
     if (
       baseType === "datetime" ||
@@ -713,10 +717,17 @@ function canonicalizeMssqlTemporalPersistedEditValue(
       baseType === "smalldatetime" ||
       baseType === "datetimeoffset"
     ) {
-      const normalized = normalizeDatetimeLiteral(value);
+      const literal = normalizeMssqlYearPrefix(
+        normalizeMssqlTemporalClock(value.trim()),
+      );
+      const normalized = DATE_ONLY_RE.test(literal)
+        ? `${literal} 00:00:00`
+        : normalizeDatetimeLiteral(literal);
       const wallClock =
         baseType === "datetimeoffset"
-          ? normalized
+          ? hasExplicitTimezone(normalized)
+            ? normalized.replace(/(?:Z|-00:00)$/i, "+00:00")
+            : `${normalized}+00:00`
           : normalized.replace(/(?:Z|[+-]\d{2}(?::?\d{2})?)$/i, "");
       return normalizeMssqlTemporalFraction(wallClock.replace("T", " "));
     }
@@ -777,6 +788,21 @@ function canonicalizeMssqlTemporalPersistedEditValue(
     );
   }
   return null;
+}
+
+function normalizeMssqlTemporalClock(value: string): string {
+  return value.replace(
+    /(^|[ T])(\d{1,2}):(\d{2})(?::(\d{2})(\.\d+)?)?(?=(?:\s?(?:Z|[+-]\d{2}(?::?\d{2})?))?$)/i,
+    (
+      _match,
+      prefix: string,
+      hours: string,
+      minutes: string,
+      seconds: string | undefined,
+      fraction: string | undefined,
+    ) =>
+      `${prefix}${hours.padStart(2, "0")}:${minutes}:${seconds ?? "00"}${fraction ?? ""}`,
+  );
 }
 
 function normalizeMssqlTemporalFraction(value: string): string {
@@ -1480,6 +1506,7 @@ export class MSSQLDriver extends BaseDBDriver {
     mssql.Request,
     number | undefined
   >();
+  private readonly querySessions = new Set<MssqlQuerySession>();
   private timeoutRecoveryInFlight: Promise<void> | null = null;
   private connectionEpoch = 0;
   constructor(
@@ -1774,6 +1801,7 @@ export class MSSQLDriver extends BaseDBDriver {
   }
   async connect(): Promise<void> {
     const epoch = ++this.connectionEpoch;
+    for (const session of this.querySessions) session.cancel();
     if (this.pool !== null) {
       const previousPool = this.pool;
       this.pool = null;
@@ -1814,6 +1842,7 @@ export class MSSQLDriver extends BaseDBDriver {
 
   async disconnect(): Promise<void> {
     this.connectionEpoch += 1;
+    for (const session of this.querySessions) session.cancel();
     const pool = this.pool;
     this.pool = null;
     if (pool) await this.closePool(pool);
@@ -1848,6 +1877,9 @@ export class MSSQLDriver extends BaseDBDriver {
       context.requestToken === undefined
     ) {
       return;
+    }
+    for (const session of this.querySessions) {
+      if (session.requestToken === context.requestToken) session.cancel();
     }
     for (const [request, requestToken] of this.activeRequests) {
       if (requestToken !== context.requestToken) {
@@ -2104,6 +2136,7 @@ export class MSSQLDriver extends BaseDBDriver {
     params?: unknown[],
     operationContext?: QueryExecutionOptions,
   ): Promise<QueryResult> {
+    throwIfQueryCancelled(operationContext);
     const hardCap = queryCollectionLimit(operationContext?.hardCap);
     const start = Date.now();
     const batches = parseMssqlBatches(sql);
@@ -2121,111 +2154,125 @@ export class MSSQLDriver extends BaseDBDriver {
           "Use parameters only in single queries without the GO separator.",
       );
     }
-    let lastResult: QueryResult = {
-      columns: [],
-      rows: [],
-      rowCount: 0,
-      executionTimeMs: 0,
-    };
-    for (const { sql: batch, repeatCount } of batches) {
-      const currentParams = batches.length === 1 ? params : undefined;
-      for (let repetition = 0; repetition < repeatCount; repetition++) {
-        if (hardCap !== undefined) lastResult.rows = [];
-        lastResult = await this._executeBatch(
-          batch,
-          currentParams,
-          start,
-          operationContext?.requestToken,
-          hardCap,
-        );
-      }
+    const epoch = this.connectionEpoch;
+    const session = new MssqlQuerySession(
+      this.requirePool(),
+      operationContext,
+      () => this.assertConnectionEpoch(epoch),
+    );
+    this.querySessions.add(session);
+    try {
+      return await session.run(async () => {
+        let lastResult: QueryResult = {
+          columns: [],
+          rows: [],
+          rowCount: 0,
+          executionTimeMs: 0,
+        };
+        for (const { sql: batch, repeatCount } of batches) {
+          const currentParams = batches.length === 1 ? params : undefined;
+          for (let repetition = 0; repetition < repeatCount; repetition++) {
+            if (hardCap !== undefined) lastResult.rows = [];
+            lastResult = await this._executeBatch(
+              session,
+              batch,
+              currentParams,
+              start,
+              hardCap,
+            );
+          }
+        }
+        lastResult.executionTimeMs = Date.now() - start;
+        return lastResult;
+      });
+    } finally {
+      this.querySessions.delete(session);
     }
-    lastResult.executionTimeMs = Date.now() - start;
-    return lastResult;
   }
   private async _executeBatch(
+    session: MssqlQuerySession,
     sql: string,
     params?: unknown[],
     start = Date.now(),
-    requestToken?: number,
     hardCap?: number,
   ): Promise<QueryResult> {
-    const req = this.requirePool().request();
+    const req = session.request();
     req.arrayRowMode = true;
     if (hardCap !== undefined) {
-      return this.executeTrackedRequest(
-        req,
-        async (trackedReq) => {
-          const finalSql = this.bindPositionalParameters(
-            trackedReq,
-            sql,
-            params,
-          );
-          const retained = new BoundedQueryRows<unknown[]>(hardCap);
-          let columnsMeta: MssqlArrayColumnMeta[] = [];
-          let recordsetIndex = -1;
-          let affectedRows = 0;
-          let streamError: Error | undefined;
-          const onRecordset = (columns: MssqlArrayColumnMeta[]) => {
-            recordsetIndex++;
-            if (recordsetIndex === 0) columnsMeta = columns;
-          };
-          const onRow = (row: unknown) => {
-            if (recordsetIndex === 0)
-              retained.add(mssqlArrayRow(row, columnsMeta));
-          };
-          const onAffected = (count: number) => {
-            affectedRows = count;
-          };
-          const onError = (error: Error) => {
-            streamError ??= error;
-          };
-          trackedReq.stream = true;
-          trackedReq.on("recordset", onRecordset);
-          trackedReq.on("row", onRow);
-          trackedReq.on("rowsaffected", onAffected);
-          trackedReq.on("error", onError);
-          try {
-            const result = await trackedReq.query(finalSql);
-            if (streamError) throw streamError;
-            affectedRows = result.rowsAffected?.at(-1) ?? affectedRows;
-            return {
-              columns: columnsMeta.map((column) =>
-                column.name === "" ? " " : column.name,
-              ),
-              rows: retained.rows.map((row) =>
-                Object.fromEntries(
-                  row.map((value, index) => [
-                    `__col_${index}`,
-                    this.formatQueryValue(value, columnsMeta[index]),
-                  ]),
-                ),
-              ),
-              rowCount: columnsMeta.length ? retained.rowCount : affectedRows,
-              affectedRows,
-              truncated: retained.truncated,
-              executionTimeMs: Date.now() - start,
-            };
-          } finally {
-            trackedReq.off("recordset", onRecordset);
-            trackedReq.off("row", onRow);
-            trackedReq.off("rowsaffected", onAffected);
-            trackedReq.off("error", onError);
-          }
-        },
-        requestToken,
-      );
-    }
-    const res = (await this.executeTrackedRequest(
-      req,
-      async (trackedReq) => {
+      return session.execute(req, async (trackedReq) => {
         const finalSql = this.bindPositionalParameters(trackedReq, sql, params);
-        return await trackedReq.query(finalSql);
-      },
-      requestToken,
-    )) as MssqlArrayResult;
+        const retained = new BoundedQueryRows<unknown[]>(hardCap);
+        let columnsMeta: MssqlArrayColumnMeta[] = [];
+        let recordsetIndex = -1;
+        let affectedRows = 0;
+        let streamError: Error | undefined;
+        const onRecordset = (columns: MssqlArrayColumnMeta[]) => {
+          recordsetIndex++;
+          if (recordsetIndex === 0) columnsMeta = columns;
+        };
+        const onRow = (row: unknown) => {
+          if (recordsetIndex === 0)
+            retained.add(mssqlArrayRow(row, columnsMeta));
+        };
+        const onAffected = (count: number) => {
+          affectedRows = count;
+        };
+        const onError = (error: Error) => {
+          streamError ??= error;
+        };
+        trackedReq.stream = true;
+        trackedReq.on("recordset", onRecordset);
+        trackedReq.on("row", onRow);
+        trackedReq.on("rowsaffected", onAffected);
+        trackedReq.on("error", onError);
+        try {
+          const result = params?.length
+            ? await trackedReq.query(finalSql)
+            : await trackedReq.batch(finalSql);
+          if (streamError) throw streamError;
+          affectedRows = result.rowsAffected?.at(-1) ?? affectedRows;
+          return {
+            columns: columnsMeta.map((column) =>
+              column.name === "" ? " " : column.name,
+            ),
+            rows: retained.rows.map((row) =>
+              Object.fromEntries(
+                row.map((value, index) => [
+                  `__col_${index}`,
+                  this.formatQueryValue(value, columnsMeta[index]),
+                ]),
+              ),
+            ),
+            rowCount: columnsMeta.length ? retained.rowCount : affectedRows,
+            affectedRows,
+            truncated: retained.truncated,
+            executionTimeMs: Date.now() - start,
+          };
+        } finally {
+          trackedReq.off("recordset", onRecordset);
+          trackedReq.off("row", onRow);
+          trackedReq.off("rowsaffected", onAffected);
+          trackedReq.off("error", onError);
+        }
+      });
+    }
+    const res = (await session.execute(req, async (trackedReq) => {
+      const finalSql = this.bindPositionalParameters(trackedReq, sql, params);
+      return params?.length
+        ? await trackedReq.query(finalSql)
+        : await trackedReq.batch(finalSql);
+    })) as MssqlArrayResult;
     const executionTimeMs = Date.now() - start;
-    const columnsMeta = res.columns?.[0] ?? [];
+    // node-mssql batch() omits top-level columns in arrayRowMode, but retains
+    // them on each recordset (including an empty SELECT).
+    const columnsMeta =
+      res.columns?.[0] ??
+      (
+        res.recordset as unknown as
+          | { columns?: MssqlArrayColumnMeta[] }
+          | undefined
+      )?.columns ??
+      [];
     const affectedRows = res.rowsAffected.at(-1) ?? 0;
     if (columnsMeta.length === 0) {
       return {
@@ -3470,6 +3517,27 @@ export class MSSQLDriver extends BaseDBDriver {
       column.category === "datetime"
     ) {
       const baseType = baseTypeName(column.nativeType);
+      // These types have a decimal second scale. Legacy datetime and
+      // smalldatetime use different rounding rules and are checked on readback.
+      const precision =
+        /^(?:time|datetime2|datetimeoffset)(?:\(\s*(\d+)\s*\))?$/i.exec(
+          column.nativeType.trim(),
+        );
+      if (options === undefined && precision) {
+        const canonical = canonicalizeMssqlTemporalPersistedEditValue(
+          expectedValue,
+          baseType,
+        );
+        const fraction = canonical?.match(/:\d{2}\.(\d+)/)?.[1] ?? "";
+        const scale = Number(precision[1] ?? 7);
+        if (fraction.length > scale) {
+          return {
+            ok: false,
+            shouldVerify: false,
+            message: `Column "${column.name}" supports at most ${scale} fractional second digits.`,
+          };
+        }
+      }
       return this.checkNormalizedPersistedEdit(
         column,
         expectedValue,

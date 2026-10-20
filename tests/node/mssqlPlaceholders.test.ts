@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import mssql from "mssql";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
+import { mockMssqlSessionPool } from "../helpers/mssqlQuerySessionHarness";
 
 function harness() {
   const driver = new MSSQLDriver({
@@ -11,12 +12,14 @@ function harness() {
     database: "db",
   });
   const request = Object.assign(new EventEmitter(), {
+    overrides: {},
     input: vi.fn().mockReturnThis(),
     query: vi.fn().mockResolvedValue({ rowsAffected: [0], columns: [[]] }),
+    batch: vi.fn().mockResolvedValue({ rowsAffected: [0], columns: [[]] }),
   });
-  (driver as unknown as { pool: unknown }).pool = {
-    request: () => request,
-  };
+  (driver as unknown as { pool: unknown }).pool = mockMssqlSessionPool(
+    () => request,
+  );
   return { driver, request };
 }
 
@@ -117,7 +120,7 @@ describe("MSSQL T-SQL placeholder boundaries", () => {
     const { driver, request } = harness();
     const sql = "SELECT N'C:\\', '?' AS [literal], '$1 :1' AS [markers]";
     await driver.query(sql, params);
-    expect(request.query).toHaveBeenCalledWith(sql);
+    expect(request.batch).toHaveBeenCalledWith(sql);
     expect(request.input).not.toHaveBeenCalled();
     expect(driver.materializePreviewSql(sql, params)).toBe(sql);
     expect(driver.materializePreviewColumnSql(sql, params, [])).toBe(sql);

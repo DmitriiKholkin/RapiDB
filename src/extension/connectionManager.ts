@@ -4,6 +4,7 @@ import {
   isConnectionTlsEnabled,
   resolveConnectionTlsMode,
 } from "../shared/connectionConfig";
+import { resolveMongoDatabaseName } from "../shared/mongoDatabase";
 import type {
   BookmarkEntry,
   ConnectAttempt,
@@ -468,6 +469,10 @@ function cloneSchemaSnapshotState(
 }
 
 function getConfiguredDefaultDatabaseName(config: ConnectionConfig): string {
+  if (config.type === "mongodb") {
+    return resolveMongoDatabaseName(config);
+  }
+
   if (config.type === "elasticsearch") {
     return "default";
   }

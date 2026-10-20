@@ -679,7 +679,10 @@ describe("table helpers", () => {
     ).toThrow("Update requires the full primary key");
   });
 
-  it("skips strict verification for temporal on-update columns across drivers", async () => {
+  it.each([
+    true,
+    false,
+  ])("respects the driver's temporal verification decision (%s), not on-update metadata", async (shouldVerify) => {
     const temporalColumns: ColumnTypeMeta[] = [
       {
         name: "id",
@@ -709,22 +712,23 @@ describe("table helpers", () => {
       },
     ];
 
+    const check = vi.fn(
+      (_column: ColumnTypeMeta, _value: unknown, _options?: unknown) => ({
+        ok: true,
+        shouldVerify,
+      }),
+    );
     const strictDriver: IDBDriver = {
       ...fakeDriver,
       describeColumns: async () => temporalColumns,
-      checkPersistedEdit: (column, _value, options) => {
-        if (column.name === "updated_at" && options !== undefined) {
-          throw new Error("updated_at should not be verified strictly");
-        }
-        return null;
+      checkPersistedEdit: check,
+      runTransaction: async (_operations, _context, options) => {
+        await verifyTransaction(
+          strictDriver,
+          options?.verifications,
+          async () => [{ __col_0: "2026-05-29 13:45:36.917354" }],
+        );
       },
-      runTransaction: async () => undefined,
-      query: async () => ({
-        columns: ["updated_at"],
-        rows: [{ __col_0: "2026-05-29 14:57:54.510808" }],
-        rowCount: 1,
-        executionTimeMs: 0,
-      }),
     };
 
     const prepared = prepareApplyChangesPlan(
@@ -749,7 +753,16 @@ describe("table helpers", () => {
       throw new Error("Expected executable plan");
     }
 
-    expect(prepared.plan.verificationTargets[0]?.values).toEqual([]);
+    expect(prepared.plan.verificationTargets[0]?.values).toEqual(
+      shouldVerify
+        ? [
+            {
+              column: temporalColumns[1],
+              expectedValue: "2026-05-29 13:45:36.917354",
+            },
+          ]
+        : [],
+    );
 
     const result = await executePreparedApplyPlan(
       {
@@ -760,6 +773,9 @@ describe("table helpers", () => {
 
     expect(result.success).toBe(true);
     expect(result.warning).toBeUndefined();
+    expect(check.mock.calls.some((call) => call[2] !== undefined)).toBe(
+      shouldVerify,
+    );
   });
 
   it("uses column-aware PostgreSQL preview materialization for typed array updates", () => {

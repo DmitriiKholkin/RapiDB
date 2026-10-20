@@ -39,7 +39,7 @@ afterEach(() => {
 describe("review mutation regressions", () => {
   it("discards a failed MSSQL rollback session before a waiting borrower can use it", async () => {
     const driver = new MSSQLDriver({ ...config, type: "mssql" });
-    const fakePoolConfig = { options: {} };
+    const fakePoolConfig = { options: {}, requestTimeout: 5000 };
     const operationError = new Error("transaction operation failed");
     const rollbackError = new Error("rollback refused");
     let signalRollbackStarted!: () => void;
@@ -48,8 +48,13 @@ describe("review mutation regressions", () => {
     });
     let finishRollback!: (error?: Error) => void;
     class Session extends EventEmitter {
+      inTransaction = false;
       closed = false;
       hasError = false;
+      reset = vi.fn((callback: (error?: Error) => void) => {
+        this.inTransaction = false;
+        callback();
+      });
       beginTransaction(callback: (error?: Error) => void) {
         callback();
       }
@@ -97,23 +102,30 @@ describe("review mutation regressions", () => {
       acquire,
       release,
       close: vi.fn(async () => undefined),
-      request: vi.fn(() => ({
-        input: vi.fn().mockReturnThis(),
-        query: vi.fn(
-          async () =>
-            await new Promise((resolve, reject) => {
-              acquire({}, (error, session) => {
-                if (error) {
-                  reject(error);
-                  return;
-                }
-                borrowedSessions.push(session);
-                release(session);
-                resolve({ recordset: [], rowsAffected: [] });
-              });
-            }),
-        ),
-      })),
+      request: vi.fn(() => {
+        const request = Object.assign(new EventEmitter(), {
+          overrides: {},
+          parent: {
+            acquire,
+            release,
+          },
+          input: vi.fn().mockReturnThis(),
+          batch: vi.fn(
+            async () =>
+              await new Promise((resolve, reject) => {
+                // Like node-mssql: acquire/release through the Request's parent,
+                // which the query-session lease replaces before dispatch.
+                request.parent.acquire({}, (error, session) => {
+                  if (error) return reject(error);
+                  borrowedSessions.push(session);
+                  request.parent.release(session);
+                  resolve({ recordset: [], rowsAffected: [] });
+                });
+              }),
+          ),
+        });
+        return request;
+      }),
     };
     (driver as unknown as { pool: unknown }).pool = pool;
     const request = {

@@ -390,9 +390,6 @@ export function prepareApplyChangesPlan(
       if (column.isPrimaryKey) {
         verificationPrimaryKeys[columnName] = nextValue;
       }
-      if (shouldSkipTemporalOnUpdateVerification(column)) {
-        continue;
-      }
       const check = driver.checkPersistedEdit(column, nextValue);
       if (check?.shouldVerify) {
         verificationValues.push({
@@ -894,14 +891,4 @@ async function assertMutationRollbackSupport(
       );
     }
   }
-}
-
-function shouldSkipTemporalOnUpdateVerification(
-  column: Pick<ColumnTypeMeta, "category">,
-): boolean {
-  return (
-    column.category === "date" ||
-    column.category === "time" ||
-    column.category === "datetime"
-  );
 }

@@ -5,6 +5,7 @@ import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import type { BoundedPostgresQuery } from "../../src/extension/dbDrivers/postgresBoundedQuery";
 import { formatQueryResult } from "../../src/extension/utils/queryResultFormatting";
+import { mockMssqlSessionPool } from "../helpers/mssqlQuerySessionHarness";
 
 type WireQuery = BoundedPostgresQuery & {
   handleDataRow(message: { fields: string[] }): void;
@@ -274,6 +275,7 @@ describe("driver-owned result budgets", () => {
     readOnly: true,
   });
   class Request extends EventEmitter {
+    overrides = {};
     stream = false;
     arrayRowMode = false;
     cancel = vi.fn();
@@ -281,19 +283,17 @@ describe("driver-owned result budgets", () => {
       rowsAffected: [1000],
       recordsets: [],
     }));
+    batch = vi.fn((sql: string) => this.query(sql));
   }
   function mssqlHarness(requests: Request[]) {
-    let next = 0;
     const driver = new MSSQLDriver({
       id: "ms-budget",
       name: "MSSQL",
       type: "mssql",
       host: "localhost",
     });
-    (driver as unknown as { pool: unknown }).pool = {
-      connected: true,
-      request: () => requests[next++],
-    };
+    (driver as unknown as { pool: unknown }).pool =
+      mockMssqlSessionPool(requests);
     return driver;
   }
 
@@ -327,8 +327,7 @@ describe("driver-owned result budgets", () => {
         settled = true;
         return result;
       });
-    await Promise.resolve();
-    expect(request.stream).toBe(true);
+    await vi.waitFor(() => expect(request.stream).toBe(true));
     expect(request.arrayRowMode).toBe(true);
     expect(drained).toBe(60000);
     expect(settled).toBe(false);
@@ -442,6 +441,7 @@ describe("driver-owned result budgets", () => {
       requestToken: 10,
     });
     const rejected = expect(pending).rejects.toThrow("cancelled");
+    await vi.waitFor(() => expect(request.query).toHaveBeenCalledOnce());
     expect(request.cancel).not.toHaveBeenCalled();
     await driver.cancelCurrentOperation({
       operationName: "query",

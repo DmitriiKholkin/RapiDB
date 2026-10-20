@@ -298,7 +298,7 @@ describe("verified UPDATE rollback preflight", () => {
       expect([...h.stored]).toEqual([]);
     });
 
-    it(`${path}: does not consult rollback risk when UPDATE has no verification`, async () => {
+    it(`${path}: respects MySQL's temporal verification opt-out for a single UPDATE`, async () => {
       const h = harness();
       const temporalColumns: ColumnTypeMeta[] = [
         columns[0],
@@ -325,7 +325,7 @@ describe("verified UPDATE rollback preflight", () => {
       expect(h.events).toEqual(["BEGIN", "UPDATE", "COMMIT"]);
     });
 
-    it(`${path}: blocks multi-statement temporal-only UPDATEs on MyISAM before DML`, async () => {
+    it(`${path}: blocks multiple MySQL temporal UPDATEs on MyISAM despite the driver's verification opt-out`, async () => {
       const h = harness();
       const temporalColumns: ColumnTypeMeta[] = [
         columns[0],
@@ -659,6 +659,29 @@ describe("verified UPDATE rollback preflight", () => {
     });
     expect(h.riskCheck).not.toHaveBeenCalled();
     expect(h.transaction).not.toHaveBeenCalled();
+  });
+
+  it("allows MySQL's unchanged ON UPDATE/default column while verifying an explicit numeric edit", async () => {
+    const h = harness(null, false);
+    const serverManaged: ColumnTypeMeta = {
+      ...columns[1],
+      name: "updated_at",
+      type: "TIMESTAMP(6)",
+      nativeType: "TIMESTAMP(6)",
+      category: "datetime",
+      defaultValue: "CURRENT_TIMESTAMP(6)",
+      onUpdateExpression: "CURRENT_TIMESTAMP(6)",
+    };
+    const plan = h.prepare([update(1)], [...columns, serverManaged]);
+    expect(plan.operations[0].sql).not.toContain("updated_at");
+    const result = await executePreparedApplyPlan(h.manager, plan);
+    expect(result.success).toBe(true);
+    const verification = h.transaction.mock.calls[0][2]?.verifications?.[0];
+    expect(verification?.values.map(({ column }) => column.name)).toEqual([
+      "amount",
+    ]);
+    expect(verification?.sql).not.toContain("updated_at");
+    expect(h.events).toEqual(["BEGIN", "UPDATE", "VERIFY", "COMMIT"]);
   });
 
   it("atomic: preserves verified INSERT risk checks on the INSERT table after a safe UPDATE preflight", async () => {

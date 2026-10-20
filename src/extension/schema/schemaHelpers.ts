@@ -1,4 +1,5 @@
 import { isDataDbObjectKind } from "../../shared/dbObjectKinds";
+import { resolveMongoDatabaseName } from "../../shared/mongoDatabase";
 import type {
   ConnectionConfig,
   ExplorerSchemaScope,
@@ -352,6 +353,10 @@ export function mergeSchemaIntoDatabase(
 export function getConfiguredDefaultDatabaseName(
   config: ConnectionConfig,
 ): string {
+  if (config.type === "mongodb") {
+    return resolveMongoDatabaseName(config);
+  }
+
   if (config.type === "elasticsearch") {
     return "default";
   }

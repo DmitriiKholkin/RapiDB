@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
+import { NULL_SENTINEL } from "../../src/shared/tableTypes";
 
 const driver = new PostgresDriver({
   id: "persisted-edit-diagnostics",
@@ -29,6 +30,159 @@ const column = (
   filterable: true,
   filterOperators: [],
   valueSemantics: "plain",
+});
+
+describe("MSSQL exact temporal persistence", () => {
+  const sqlServer = new MSSQLDriver({
+    id: "temporal",
+    name: "temporal",
+    type: "mssql",
+  });
+  for (const type of ["time", "datetime2", "datetimeoffset"] as const) {
+    const literal = (time: string) =>
+      type === "time"
+        ? time
+        : `2026-10-20 ${time}${type === "datetimeoffset" ? "+02:00" : ""}`;
+    it.each([
+      [0, "12:00:00", true],
+      [0, "12:00:00.0000000", true],
+      [0, "12:00:00.1234567", false],
+      [3, "12:00:00.1230000", true],
+      [3, "12:00:00.1230001", false],
+      [7, "12:00:00.1234567", true],
+      [7, "12:00:00.12345678", false],
+    ] as const)(`${type}(%i) prevalidates significant fractional digits in %s (%s)`, (scale, time, ok) => {
+      const meta = column(
+        `${type}(${scale})`,
+        type === "time" ? "time" : "datetime",
+      );
+      expect(sqlServer.checkPersistedEdit(meta, literal(time))).toMatchObject({
+        ok,
+        shouldVerify: ok,
+        ...(!ok
+          ? {
+              message: expect.stringContaining(
+                `${scale} fractional second digits`,
+              ),
+            }
+          : {}),
+      });
+    });
+    it(`${type} defaults to precision 7 without discarding significant digits`, () => {
+      const meta = column(type, type === "time" ? "time" : "datetime");
+      expect(
+        sqlServer.checkPersistedEdit(meta, literal("12:00:00.1234567"))?.ok,
+      ).toBe(true);
+      expect(
+        sqlServer.checkPersistedEdit(meta, literal("12:00:00.12345678"))?.ok,
+      ).toBe(false);
+    });
+    it.each([
+      null,
+      NULL_SENTINEL,
+    ])(`${type} verifies SQL NULL (%s)`, (value) => {
+      const meta = column(`${type}(0)`, type === "time" ? "time" : "datetime");
+      expect(sqlServer.checkPersistedEdit(meta, value)).toEqual({
+        ok: true,
+        shouldVerify: true,
+      });
+      expect(
+        sqlServer.checkPersistedEdit(meta, value, { persistedValue: null })?.ok,
+      ).toBe(true);
+      expect(
+        sqlServer.checkPersistedEdit(meta, value, {
+          persistedValue: literal("12:00:00"),
+        })?.ok,
+      ).toBe(false);
+      expect(
+        sqlServer.checkPersistedEdit(meta, literal("12:00:00"), {
+          persistedValue: null,
+        })?.ok,
+      ).toBe(false);
+    });
+    it(`${type} normalizes zero padding without hiding fractional changes`, () => {
+      const meta = column(`${type}(7)`, type === "time" ? "time" : "datetime");
+      for (const [expected, persisted] of [
+        ["12:00:00", "12:00:00.0000000"],
+        ["12:00:00.123", "12:00:00.1230000"],
+      ]) {
+        expect(
+          sqlServer.checkPersistedEdit(meta, literal(expected), {
+            persistedValue: literal(persisted),
+          }),
+        ).toEqual({ ok: true, shouldVerify: true });
+      }
+      expect(
+        sqlServer.checkPersistedEdit(meta, literal("12:00:00.1234567"), {
+          persistedValue: literal("12:00:00.1234566"),
+        })?.ok,
+      ).toBe(false);
+    });
+  }
+
+  it.each([
+    ["time(7)", "12:00", "12:00:00.0000000"],
+    ["time(7)", "1:02", "01:02:00.0000000"],
+    ["time(7)", "1:02:03.123", "01:02:03.1230000"],
+    ["datetime2(7)", "2026-10-20T12:00", "2026-10-20 12:00:00.0000000"],
+    [
+      "datetimeoffset(7)",
+      "2026-10-20T12:00+02:00",
+      "2026-10-20 12:00:00.0000000+02:00",
+    ],
+    ["datetime2(3)", "2026-10-20T12:00:00.123Z", "2026-10-20 12:00:00.1230000"],
+    ["datetime2(0)", "2026-10-20", "2026-10-20 00:00:00"],
+    [
+      "datetimeoffset(3)",
+      "2026-10-20T12:00:00.123Z",
+      "2026-10-20 12:00:00.1230000+00:00",
+    ],
+    [
+      "datetimeoffset(3)",
+      "2026-10-20 12:00:00.123 +02",
+      "2026-10-20 12:00:00.1230000+02:00",
+    ],
+    ["datetimeoffset(0)", "2026-10-20", "2026-10-20 00:00:00+00:00"],
+    [
+      "datetimeoffset(3)",
+      "2026-10-20T12:00:00.123-00:00",
+      "2026-10-20 12:00:00.1230000+00:00",
+    ],
+  ])("verifies equivalent %s formatting", (type, expected, persistedValue) => {
+    expect(
+      sqlServer.checkPersistedEdit(column(type, "datetime"), expected, {
+        persistedValue,
+      }),
+    ).toEqual({ ok: true, shouldVerify: true });
+  });
+
+  it("prevalidates Date milliseconds without rounding to the declared scale", () => {
+    const date = new Date(2026, 9, 20, 12, 0, 0, 123);
+    expect(
+      sqlServer.checkPersistedEdit(column("datetime2(0)", "datetime"), date)
+        ?.ok,
+    ).toBe(false);
+    expect(
+      sqlServer.checkPersistedEdit(column("time(3)", "time"), date)?.ok,
+    ).toBe(true);
+  });
+
+  it.each([
+    "datetime",
+    "smalldatetime",
+  ])("leaves %s rounding to exact readback", (type) => {
+    const meta = column(type, "datetime");
+    const expected = "2026-10-20 12:00:00.123";
+    expect(sqlServer.checkPersistedEdit(meta, expected)).toEqual({
+      ok: true,
+      shouldVerify: true,
+    });
+    expect(
+      sqlServer.checkPersistedEdit(meta, expected, {
+        persistedValue: "2026-10-20 12:00:00",
+      })?.ok,
+    ).toBe(false);
+  });
 });
 
 describe("C01 UUID syntax and parameter inference", () => {
@@ -200,7 +354,7 @@ describe("persisted edit diagnostics", () => {
     expect(check?.ok).toBe(true);
   });
 
-  it("skips verification for likely auto-updated temporal columns", () => {
+  it("preserves PostgreSQL's driver-specific temporal opt-out without inferring on-update metadata", () => {
     const column: ColumnTypeMeta = {
       name: "updated_at",
       type: "timestamp with time zone",

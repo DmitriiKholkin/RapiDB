@@ -1,3 +1,4 @@
+import { resolveMongoDatabaseName } from "../shared/mongoDatabase";
 import type {
   ConnectionConfig,
   ExplorerSchemaScope,
@@ -404,6 +405,10 @@ export function createConnectionSchemaCacheEntry(
 export function getConfiguredDefaultDatabaseName(
   config: ConnectionConfig,
 ): string {
+  if (config.type === "mongodb") {
+    return resolveMongoDatabaseName(config);
+  }
+
   if (config.type === "elasticsearch") {
     return "default";
   }

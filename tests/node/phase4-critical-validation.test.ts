@@ -49,7 +49,7 @@ describe("Phase 4 — Critical Validation", () => {
       };
       (driver as unknown as { connected: boolean }).connected = true;
 
-      return { driver, mockFind, mockLimit, mockSkip };
+      return { driver, mockFind, mockLimit, mockSkip, mockToArray };
     }
 
     it("rejects prototype pollution attempts", async () => {
@@ -158,13 +158,23 @@ describe("Phase 4 — Critical Validation", () => {
       expect(result).toHaveProperty("rowCount");
     });
 
-    it("caps mongosh find limit to the safety hard cap", async () => {
-      const { driver, mockLimit, mockSkip } = createMongoDriver();
+    it("caps mongosh find output and reads one truncation probe", async () => {
+      const { driver, mockLimit, mockSkip, mockToArray } = createMongoDriver();
+      mockToArray.mockResolvedValue(
+        Array.from({ length: QUERY_LIMIT_POLICY.hardCap + 1 }, (_, _id) => ({
+          _id,
+        })),
+      );
 
-      await driver.query("db.users.find({}).skip(7).limit(999999)");
+      const result = await driver.query(
+        "db.users.find({}).skip(7).limit(999999)",
+      );
 
       expect(mockSkip).toHaveBeenCalledWith(7);
-      expect(mockLimit).toHaveBeenCalledWith(QUERY_LIMIT_POLICY.hardCap);
+      expect(mockLimit).toHaveBeenCalledWith(QUERY_LIMIT_POLICY.hardCap + 1);
+      expect(result.rows).toHaveLength(QUERY_LIMIT_POLICY.hardCap);
+      expect(result.rowCount).toBe(QUERY_LIMIT_POLICY.hardCap);
+      expect(result.truncated).toBe(true);
     });
 
     it("allows safe aggregation without $out", async () => {

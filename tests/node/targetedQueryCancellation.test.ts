@@ -2,23 +2,27 @@ import { describe, expect, it, vi } from "vitest";
 import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
 import { OracleDriver } from "../../src/extension/dbDrivers/oracle";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
+import {
+  MockMssqlRequest,
+  mockMssqlSessionPool,
+} from "../helpers/mssqlQuerySessionHarness";
 
 describe("targeted query cancellation", () => {
   it("cancels only the MSSQL request with the matching token", async () => {
     const requests = [1, 2].map(() => {
       let rejectQuery: ((error: Error) => void) | undefined;
-      return {
-        arrayRowMode: false,
-        query: vi.fn(
-          () =>
-            new Promise((_, reject) => {
-              rejectQuery = reject;
-            }),
-        ),
-        cancel: vi.fn(() => rejectQuery?.(new Error("cancelled"))),
-      };
+      const request = new MockMssqlRequest();
+      request.execute.mockImplementation(
+        () =>
+          new Promise((_, reject) => {
+            rejectQuery = reject;
+          }),
+      );
+      request.cancel.mockImplementation(() =>
+        rejectQuery?.(new Error("cancelled")),
+      );
+      return request;
     });
-    let requestIndex = 0;
     const driver = new MSSQLDriver({
       id: "mssql-targeted",
       name: "MSSQL",
@@ -26,14 +30,14 @@ describe("targeted query cancellation", () => {
       host: "localhost",
       database: "master",
     } as ConnectionConfig);
-    (driver as unknown as { pool: unknown }).pool = {
-      connected: true,
-      request: () => requests[requestIndex++],
-    };
+    (driver as unknown as { pool: unknown }).pool =
+      mockMssqlSessionPool(requests);
 
     const first = driver.query("select 1", undefined, { requestToken: 11 });
     const second = driver.query("select 2", undefined, { requestToken: 22 });
-    await Promise.resolve();
+    const firstRejected = expect(first).rejects.toThrow("cancelled");
+    const secondRejected = expect(second).rejects.toThrow("cancelled");
+    await vi.waitFor(() => expect(requests[0].execute).toHaveBeenCalledOnce());
     await driver.cancelCurrentOperation({
       reason: "manual",
       operationName: "query",
@@ -42,9 +46,14 @@ describe("targeted query cancellation", () => {
 
     expect(requests[0].cancel).toHaveBeenCalledOnce();
     expect(requests[1].cancel).not.toHaveBeenCalled();
-    await expect(first).rejects.toThrow("cancelled");
-    requests[1].cancel();
-    await expect(second).rejects.toThrow("cancelled");
+    await firstRejected;
+    await vi.waitFor(() => expect(requests[1].execute).toHaveBeenCalledOnce());
+    await driver.cancelCurrentOperation({
+      reason: "manual",
+      operationName: "query",
+      requestToken: 22,
+    });
+    await secondRejected;
   });
 
   it("breaks and rolls back timed-out Oracle DML without a late commit", async () => {

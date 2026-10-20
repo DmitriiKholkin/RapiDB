@@ -51,6 +51,8 @@ Your database lives in the sidebar - same window, same shortcuts, same theme.
 
 PostgreSQL, MS SQL Server, MySQL, MariaDB, SQLite, Oracle, Redis, MongoDB, Elasticsearch, DynamoDB - all supported out of the box. SSL, self-signed certs, SSH tunneling, connection folders to keep things organized.
 
+For MongoDB, a non-empty **Database** field overrides the database in the connection URI. Otherwise the URI database is used; if neither specifies a database, RapiDB uses `admin`. `authSource` selects the authentication database, not the database queried by the editor. An explicit `db.getSiblingDB(...)` selects the database for that operation.
+
 <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-3.png" alt="Connection Form" width="100%" />
 
 > Every connection has a **read-only mode** toggle. When enabled, table edits are blocked and query execution is limited to read operations. **SQL Server (MSSQL) and Oracle exceptions:** query editor execution is blocked in read-only mode because client-side classification cannot enforce read-only execution. Oracle autonomous transactions can commit writes even inside `SET TRANSACTION READ ONLY`, and caller rollback cannot undo them. Use a database account with enforced read-only permissions (including restrictions on executable routines) and a regular connection to run queries. Table data and schema browsing remain available. This toggle is an application safeguard, not a replacement for database permissions; database-defined views, policies, and routines may have side effects even during reads.
@@ -90,6 +92,8 @@ The query editor runs on **Monaco** - the same engine as VS Code itself. You get
 - ⌨️ `Ctrl+Enter` / `F5` to run · Select a fragment to run just that part
 - ↕️ Drag the divider to resize editor vs results
 
+For PostgreSQL, MySQL, and SQL Server, finish explicit transactions with `COMMIT` or `ROLLBACK` in the same executed script. Unfinished transactions are not kept for a later Execute. SQL Server keeps one session across the script's `GO` batches and cleans it before another query can borrow it; cancelling or timing out a query is not proof that earlier commits were undone.
+
 <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-2.png" alt="SQL Editor with results" width="100%" />
 
 <br/>
@@ -104,6 +108,8 @@ Results land in a **virtualized table** - no jank, no browser tab hanging:
 - **Export to CSV or JSON** in one click
 
 > Truncated results show a warning. `rapidb.queryRowLimit` controls the number of displayed rows, subject to a hard ceiling of 10,000 rows; increasing the setting above 10,000 does not lift that ceiling. This display limit does not limit rows affected by a mutation or cancel query execution.
+
+MongoDB `find` and `aggregate` results also have a safety budget. The default sample is 100 documents; requesting more cannot bypass the 10,000-document ceiling, including with `find().limit(0)`. Negative and fractional chain limits are rejected; `aggregate().limit()` requires a positive integer. A probe document detects actual truncation without becoming part of the displayed schema. Exporting a truncated query result requires confirmation and exports only the displayed rows.
 
 Table exports keep a stable column schema across chunks. CSV uses the declared columns (including empty cells for missing values); a later unexpected column fails the export rather than silently dropping data. JSON applies the same unexpected-column check. Failed exports leave an existing destination file intact.
 
@@ -123,6 +129,8 @@ Click any table → the **Table Data Viewer** opens:
 | Safety | Preview-first apply flow with verification; transactional where applicable |
 
 Persisted edits are prevalidated against available column metadata before any write. Known unsupported edits fail before the batch is applied; where representation compatibility depends on the stored value, verification runs in the transaction and a mismatch rolls it back. Preview skipping does not bypass validation or verification. Schemaless sampling is not a complete database schema or a guarantee that every value has the sampled type.
+
+Temporal-value verification is driver-specific: SQL Server and Oracle verify explicitly edited dates/times, while PostgreSQL, MySQL, and SQLite retain their existing temporal verification exceptions. Exact temporal persistence is not guaranteed by this safeguard for those three drivers.
 
 <br/>
 
