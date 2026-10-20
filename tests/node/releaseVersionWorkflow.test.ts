@@ -27,8 +27,6 @@ const versionStep = workflow.jobs.release.steps.find(
   (step) => step.id === "version",
 );
 
-// Model Actions' substitution before Bash runs, including run as well as env:
-// moving an input back into run must make the behavioral tests fail.
 function interpolateInputs(
   source: string,
   inputs: Record<string, string>,
@@ -63,7 +61,6 @@ async function determineVersion(bump: string, customVersion = "") {
     "inputs.version_bump": bump,
     "inputs.custom_version": customVersion,
   };
-  // No inherited tokens, credentials, BASH_ENV or release/publishing steps.
   const env: Record<string, string> = {
     PATH: process.env.PATH ?? "",
     LC_ALL: "C",
@@ -123,8 +120,6 @@ describe("release workflow quality gates", () => {
     expect(testIndex).toBe(checkIndex + 1);
     expect(versionIndex).toBe(testIndex + 1);
 
-    // Default Actions success gating must stop before bump/build/commit/tag/release
-    // when either check fails; no conditional skips or error suppression.
     for (const step of steps.slice(checkIndex)) {
       expect(step.if).toBeUndefined();
       expect(step["continue-on-error"]).toBeUndefined();
@@ -136,9 +131,7 @@ describe("release workflow version input boundary", () => {
   it("binds both inputs as env data, never inline shell source", () => {
     expect(versionStep?.name).toBe("Determine version");
     expect(versionStep?.env).toEqual({
-      // biome-ignore lint/suspicious/noTemplateCurlyInString: Literal GitHub Actions expression.
       BUMP: "${{ inputs.version_bump }}",
-      // biome-ignore lint/suspicious/noTemplateCurlyInString: Literal GitHub Actions expression.
       CUSTOM_VERSION: "${{ inputs.custom_version }}",
     });
     expect(versionStep?.run).not.toContain("${{");
@@ -175,8 +168,6 @@ describe("release workflow version input boundary", () => {
     const result = await determineVersion("custom", version);
     expect(result.status).toBe(1);
     expect(result.stdout).toContain("::error::");
-    // The harmless payload writes only to stderr if it actually executes.
-    // The error may echo the literal payload on stdout; that is not execution.
     expect(result.stderr).toBe("");
     expect(result.output).toBe("");
   });

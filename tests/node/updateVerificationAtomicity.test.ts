@@ -81,7 +81,6 @@ function harness(risk: string | null = riskMessage, mismatch = true) {
       events.push("COMMIT");
     },
     rollback: async () => {
-      // Deliberately ineffective for known risk: model MyISAM's partial writes.
       events.push("ROLLBACK");
       if (risk === null) stored.clear();
     },
@@ -167,7 +166,6 @@ describe("verified UPDATE rollback preflight", () => {
         plan.verificationTargets.every((target) => target.values.length > 0),
       ).toBe(true);
       const result = await execute(path, h.manager, plan);
-      // Include the result in BEFORE failure evidence: rollback cannot undo writes.
       expect({ stored: [...h.stored], events: h.events, result }).toMatchObject(
         {
           stored: [],
@@ -462,7 +460,6 @@ describe("verified UPDATE rollback preflight", () => {
     const plan = h.prepare(
       [
         {
-          // Input PK order differs from metadata/ordinal order.
           primaryKeys: { id: 7, event_time: previousValue },
           changes: { event_time: nextValue, amount: "12.34" },
         },
@@ -538,8 +535,6 @@ describe("verified UPDATE rollback preflight", () => {
     expect(apply.verificationTargets[0].values).toEqual([]);
     expect(temporalInsert.verification).toBeUndefined();
 
-    // Both preview-time checks see transactional engines; the INSERT table's
-    // engine changes before confirmation.
     await h.riskCheck("target", "ignored_schema", "unsafe_rows");
     await h.riskCheck("target", "ignored_schema", "other_rows");
     h.riskCheck.mockImplementation(async (_database, _schema, table) =>
@@ -591,7 +586,6 @@ describe("verified UPDATE rollback preflight", () => {
     expect(apply.verificationTargets[0].values).toEqual([]);
     expect(temporalInsert.verification).toBeUndefined();
 
-    // Preview sees InnoDB; the engine changes before the user confirms.
     await h.riskCheck("target", "ignored_schema", "unsafe_rows");
     h.riskCheck.mockResolvedValue(riskMessage);
 

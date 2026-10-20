@@ -1,23 +1,3 @@
-/**
- * Type guards and helpers that turn arbitrary thrown values into
- * `Error` instances with usable `.message` and `.stack`.
- *
- * The point of this module is to keep error normalization in one place
- * so log output stays consistent and tests can rely on a stable
- * contract:
- *
- *  - `normalizeUnknownError(value)` always returns an `Error` whose
- *    `.message` is a non-empty string.
- *  - If `value` is already an `Error` with a usable message, the same
- *    instance is returned unless diagnostic credential redaction is needed.
- *  - If `value` is a plain object, the helper walks a small set of
- *    well-known fields (`message`, `sqlMessage`, `detail`, `reason`,
- *    `cause`, `originalError`, `error`) and returns the first
- *    meaningful string. Cycle protection is built in.
- *  - For everything else (numbers, booleans, primitives), the value is
- *    `String()`-ified.
- */
-
 import {
   redactDiagnosticText,
   redactDiagnosticValue,
@@ -27,7 +7,6 @@ function isMeaningfulString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
-/** Walk an unknown value, returning the deepest meaningful string. */
 function extractErrorMessage(
   error: unknown,
   seen: Set<unknown> = new Set<unknown>(),
@@ -88,17 +67,6 @@ function formatUnknownErrorMessage(error: unknown): string {
   return extractErrorMessage(error) ?? "Unknown error";
 }
 
-/**
- * Coerce an arbitrary value into a usable `Error`.
- *
- * Behavior:
- *  - If `error` is already an `Error` whose message is meaningful, it is
- *    returned unchanged unless credentials require a sanitized copy.
- *    The original error and its stack are never mutated.
- *  - If `error` is an `Error` with an empty `message`, a new `Error` is
- *    built with the inferred text and the original name/stack copied.
- *  - Otherwise, a fresh `Error` is built from the inferred message.
- */
 export function normalizeUnknownError(
   error: unknown,
   secretContext?: unknown,
@@ -119,11 +87,6 @@ export function normalizeUnknownError(
   return new Error(formatUnknownErrorMessage(error));
 }
 
-/**
- * Normalize an error and write a `[RapiDB] <context>: <stack-or-message>`
- * line to `console.error`. Returns the normalized error so callers can
- * re-throw or inspect it.
- */
 export function logErrorWithContext(context: string, error: unknown): Error {
   const normalized = normalizeUnknownError(error);
   console.error(

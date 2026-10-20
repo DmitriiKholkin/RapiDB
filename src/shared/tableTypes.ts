@@ -42,7 +42,6 @@ export interface QueryColumnMeta {
   category: TypeCategory | null;
 }
 
-/** A query result cell whose attribute is absent rather than explicitly NULL. */
 export interface QueryMissingCell {
   rowIndex: number;
   columnIndex: number;
@@ -254,27 +253,20 @@ export type PrimaryKeyRole = "partition" | "sort";
 export interface ColumnMeta {
   name: string;
   type: string;
-  /** PostgreSQL range or multirange subtype used for native containment filters. */
   rangeSubtype?: string;
-  /** Oracle collection catalog details used by typed filters and mutations. */
   collectionKind?: "varray" | "nestedTable";
   collectionElementType?: string;
   collectionTypeOwner?: string;
   collectionTypeName?: string;
-  /** Oracle named object type details used by typed mutations and verification. */
   objectTypeOwner?: string;
   objectTypeName?: string;
   objectAttributes?: Array<{ name: string; nativeType: string }>;
-  /** Catalog-resolved underlying SQL type for aliases, including size/precision.
-   * The declared type remains in `type` for display. */
   baseType?: string;
-  /** Catalog character encoding and collation used when a driver must preserve them. */
   characterSet?: string;
   collation?: string;
   nullable: boolean;
   defaultValue?: string;
   identityGeneration?: IdentityGenerationKind;
-  /** The backend accepts reads but rejects explicit writes to this column. */
   isReadOnly?: boolean;
   onUpdateExpression?: string;
   isComputed?: boolean;
@@ -296,21 +288,18 @@ export interface ColumnTypeMeta extends ColumnMeta {
   valueSemantics: ValueSemantics;
 }
 
-/** Per-row BSON type for schema-less collections whose fields can vary by row. */
 export interface MongoValueTypeHint {
   category: TypeCategory;
   nativeType: string;
   bsonSubtype?: number;
 }
 
-/** True for columns whose values are computed by the database, not identities/defaults. */
 export function isServerGeneratedColumn(
   column: Pick<ColumnMeta, "isComputed" | "generatedKind"> | null | undefined,
 ): boolean {
   return Boolean(column && (column.isComputed || column.generatedKind));
 }
 
-/** True when a table viewer must not let a user write this column. */
 export function isColumnReadOnly(
   column:
     | Pick<ColumnMeta, "isComputed" | "generatedKind" | "isReadOnly">

@@ -597,8 +597,6 @@ function TableDataGrid({
     selectionRangeRef.current = selection.range;
   }, [selection.range]);
 
-  // useCellSelection returns this stable ref object; its identity is unchanged
-  // across renders, so publishing it here does not expose work-in-progress data.
   pasteContextRef.current = selection.contextMenuCellRef;
 
   const openCell = useCallback(
@@ -736,8 +734,6 @@ function TableDataGrid({
       clipboardRequestRef.current = null;
       const requestedRange = pendingPasteRangeRef.current;
       pendingPasteRangeRef.current = null;
-      // A reply belongs to the dataset from which the paste was requested,
-      // even if its refetch has already finished (or failed).
       if (
         loadingRef.current ||
         clipboardEpochRef.current !== fetchEpochRef.current
@@ -753,12 +749,8 @@ function TableDataGrid({
       const anchorCol = requestedRange.anchorCol;
       const startCol = anchorCol - selColOffset;
 
-      // Block paste into persisted rows when editing is disabled
-      // (e.g. no primary key). Paste into draft rows is always allowed.
       if (!canEditRows && startRow >= 0) return;
 
-      // Build the list of visible data columns starting from the anchor position,
-      // skipping collapsed (hidden) columns and the selection column.
       const visiblePasteColumns: ColumnMeta[] = [];
       for (let i = anchorCol; i < columnOrderRef.current.length; i++) {
         const colId = columnOrderRef.current[i];
@@ -802,11 +794,6 @@ function TableDataGrid({
         const draftCount = newRowsRef.current.length;
         if (draftCount === 0) return;
 
-        // Convert startRow (a data-row value) to a virtual index that
-        // treats the visible row order as a contiguous sequence:
-        //   drafts: data-row -draftCount → virtual 0,  -(draftCount-1) → virtual 1, …
-        //           data-row -1 → virtual draftCount-1
-        //   persisted: data-row 0 → virtual draftCount,  1 → virtual draftCount+1, …
         const startVirtualIndex = startRow + draftCount;
         const totalRows = rows.length + draftCount;
 
@@ -929,9 +916,6 @@ function TableDataGrid({
           }
         }
 
-        // Always use onMixedBatchEdit to push a single undo snapshot
-        // instead of looping onBatchDraftCellEdit per row, which would
-        // push multiple snapshots based on a stale ref (React batch)
         const commitErrors =
           draftEdits.length > 0
             ? onMixedBatchEdit(draftEdits, batchEdits)
@@ -1263,7 +1247,6 @@ function TableDataGrid({
           overflow: "auto",
           outline: "none",
         }}
-        // biome-ignore lint/a11y/noNoninteractiveTabindex: needed for webview keyboard focus
         tabIndex={0}
       >
         <table style={getBaseTableStyle(tanTable.getTotalSize())}>

@@ -97,7 +97,6 @@ describe.each([
     expect(firstSignal?.aborted).toBe(true);
     expect(firstSignal?.reason).toBeInstanceOf(DriverTimeoutError);
 
-    // The old HTTP request is still pending. A retry owns a separate signal.
     await wrapped.query(single);
     const retryOptions = send.mock.calls[1][1] as typeof firstOptions;
     expect((retryOptions.signal ?? retryOptions.abortSignal)?.aborted).toBe(
@@ -108,7 +107,7 @@ describe.each([
     );
     finish(reply);
     await vi.advanceTimersByTimeAsync(0);
-    expect(send).toHaveBeenCalledTimes(2); // first old command + retry, no old second command
+    expect(send).toHaveBeenCalledTimes(2);
   });
 
   it("executes a successful batch with one shared deadline and a decreasing SDK budget", async () => {
@@ -210,8 +209,6 @@ describe.each([
     let calls = 0;
     vi.spyOn(mapping, "mapRowToQueryRow").mockImplementation((row, columns) => {
       calls++;
-      // Mongo/Elastic format two individual replies before assembling the
-      // batch result. Dynamo formats its rows only after the final guard.
       if (calls === (kind === "dynamodb" ? 1 : 3)) {
         vi.setSystemTime(Date.now() + 30);
       }

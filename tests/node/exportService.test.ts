@@ -220,8 +220,6 @@ describe("exportService", () => {
       { column: "pk", operator: "eq", value: "B" },
     ];
     if (readPath === "client-filter")
-      // Maps advertise only NULL operators. This still forces the client path
-      // and exercises values whose native type differs from the sample.
       filters.push({ column: "value", operator: "is_not_null" });
     const sort = {
       column: readPath === "materialized" ? "value" : "sk",
@@ -1533,8 +1531,6 @@ describe("exportService", () => {
             rows: [{ _id: "one" }],
           };
           try {
-            // Let the actual SDK error reach exportService's signal-based
-            // normalization, rather than replacing it with a mock AbortError.
             await fixture.client.search(
               { query: { match_all: {} } },
               { signal, requestTimeout: 1000 },

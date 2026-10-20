@@ -30,6 +30,7 @@ import {
   createMysqlStreamingQuery,
   discardMysqlResultHistory,
 } from "./mysqlBoundedQuery";
+import { formatMysqlQuery, formatMysqlStringLiteral } from "./mysqlQueryFormat";
 import {
   canonicalizeExactNumeric,
   numberToDecimalString,
@@ -152,8 +153,6 @@ export function splitMySQLScript(sql: string): string[] {
           "Unterminated MySQL block comment; script was not submitted.",
         );
       }
-      // Let the server interpret version gates, MariaDB comments and hints.
-      // Removing one can remove a WHERE clause or change execution semantics.
       buf += executable ? sql.slice(start, i) : " ";
       continue;
     }
@@ -1228,9 +1227,6 @@ export class MySQLDriver extends BaseDBDriver {
 
       const endpointHost = forwardedTransport?.localHost ?? this.config.host;
       const endpointPort = forwardedTransport?.localPort ?? this.config.port;
-      // mysql2 uses config.host for both SNI and verification, ignoring
-      // ssl.servername/checkServerIdentity. Its supported verifyIdentity option
-      // controls name checks; a stream keeps overrides away from TCP routing.
       const tlsIdentity = tlsSettings?.servername?.replace(/^\[|\]$/g, "");
       this.assertConnectionEpoch(epoch);
       pool = mysql.createPool({
@@ -1252,19 +1248,16 @@ export class MySQLDriver extends BaseDBDriver {
         connectTimeout: this.getConnectionTimeoutMs(),
         idleTimeout: 30000,
         dateStrings: true,
-        // Preserve JSON tokens, including integers beyond JS safe precision.
-        // Original values also need JSON text for CAST(? AS JSON), not an
-        // object that mysql2.query() expands as SQL assignment fragments.
         jsonStrings: true,
         decimalNumbers: false,
         bigNumberStrings: true,
         supportBigNumbers: true,
+        queryFormat: formatMysqlQuery,
         ssl,
       });
       const connections = new Set<NativeMysqlConnection>();
       this.poolConnections.set(pool, connections);
       pool.on?.("connection", (connection) => {
-        // PromisePool forwards the core pool's native connection event.
         const native = connection as unknown as NativeMysqlConnection;
         connections.add(native);
         const forget = () => connections.delete(native);
@@ -1277,8 +1270,6 @@ export class MySQLDriver extends BaseDBDriver {
       this.pool = pool;
       pool = undefined;
     } catch (error) {
-      // Probe failed or the attempt was cancelled: do not leave an idle pool
-      // behind (sockets/timers). It stays local until success.
       if (pool) await this.closePool(pool).catch(() => undefined);
       throw error;
     } finally {
@@ -1312,8 +1303,6 @@ export class MySQLDriver extends BaseDBDriver {
       for (const connection of connections ?? []) {
         connections?.delete(connection);
         try {
-          // mysql2.destroy() only ends the stream. Also destroy the socket
-          // so a blackholed command cannot keep shutdown or its writes alive.
           try {
             connection.destroy();
           } finally {
@@ -1334,8 +1323,6 @@ export class MySQLDriver extends BaseDBDriver {
     try {
       await closeDriverResource(() => pool.end(), discard);
     } finally {
-      // Quit resolves before COM_QUIT is written, not after the socket closes.
-      // Drop any remaining transports even when pool.end() reports success.
       discard();
       connections?.clear();
     }
@@ -1436,8 +1423,6 @@ export class MySQLDriver extends BaseDBDriver {
     try {
       connection.destroy();
     } finally {
-      // PromisePoolConnection wraps the native connection. mysql2.destroy()
-      // only half-closes its stream; force the owned physical socket closed.
       native?.stream?.destroy(new Error("MySQL metadata operation cancelled."));
     }
   }
@@ -1446,8 +1431,6 @@ export class MySQLDriver extends BaseDBDriver {
     pool: Pool,
     signal: AbortSignal,
   ): Promise<PoolConnection> {
-    // mysql2's checkout queue has no public cancellation API. Check capacity
-    // and reserve in the same turn, never enqueue a timed metadata request.
     const core = pool.pool as unknown as {
       _freeConnections: { length: number };
       _allConnections: {
@@ -1493,8 +1476,6 @@ export class MySQLDriver extends BaseDBDriver {
               }
             };
             signal.addEventListener("abort", onAbort, { once: true });
-            // getConnection reserves synchronously; late handshakes are still
-            // observed and discarded without ever executing their SQL.
             const beforeCheckout = core._allConnections.length;
             const checkout = pool.getConnection();
             if (core._allConnections.length > beforeCheckout)
@@ -1578,10 +1559,6 @@ export class MySQLDriver extends BaseDBDriver {
       ...options,
       timeout: this.getDbOperationTimeoutMs(),
       rowsAsArray: true,
-      // mysql2's built-in GEOMETRY parser turns WKB into untyped coordinate
-      // arrays, making MULTIPOINT and MULTILINESTRING indistinguishable from
-      // simpler geometry types. Keep the native WKB so _parseQueryResult can
-      // decode the declared WKB geometry type without guessing.
       typeCast: (field, next) =>
         field.type === "GEOMETRY" ? field.buffer() : next(),
     });
@@ -1768,8 +1745,6 @@ export class MySQLDriver extends BaseDBDriver {
         };
       }
       return this.withTrackedQueryConnection((connection) => {
-        // Preflight before even opening a read-only transaction. The detached
-        // command exercises the same factory used for every submitted command.
         createMysqlStreamingQuery(
           connection.connection as unknown as NativeMysqlConnection,
           { sql: "", rowsAsArray: true },
@@ -1859,10 +1834,6 @@ export class MySQLDriver extends BaseDBDriver {
     for (const sql of statements) {
       if (operation?.cancelled) throw new Error("MySQL query cancelled.");
       await new Promise<void>((resolve, reject) => {
-        // The promise wrapper supplies a callback, causing mysql2 to accumulate
-        // every row internally. Use the underlying callback-free command instead.
-        // mysql2's promise declaration types this property as another promise
-        // connection, but its runtime value is the native Connection.
         const native =
           connection.connection as unknown as NativeMysqlConnection;
         const command = createMysqlStreamingQuery(native, {
@@ -1871,8 +1842,6 @@ export class MySQLDriver extends BaseDBDriver {
           rowsAsArray: true,
         });
         let settled = false;
-        // Own the timer: mysql2's inactivity timer survives destroy() on an
-        // explicitly cancelled command, retaining its listeners until it fires.
         const timeoutMs = this.getDbOperationTimeoutMs();
         const timer = setTimeout(
           () => fail(new DriverTimeoutError("dbOperation", "query", timeoutMs)),
@@ -1884,7 +1853,6 @@ export class MySQLDriver extends BaseDBDriver {
           command.off("result", onResult);
           command.off("end", onEnd);
           command.off("error", fail);
-          // Destroying a socket may still deliver a queued transport error.
           command.on("error", () => undefined);
           if (operation) operation.reject = undefined;
         };
@@ -1892,8 +1860,6 @@ export class MySQLDriver extends BaseDBDriver {
           if (settled) return;
           settled = true;
           cleanup();
-          // A timeout is not a protocol end. Never return an undrained socket
-          // to the pool; destruction also covers cancellation and transport errors.
           this.activeQueryConnections.delete(connection);
           connection.destroy();
           reject(error);
@@ -1922,8 +1888,6 @@ export class MySQLDriver extends BaseDBDriver {
         command.on("error", fail);
         command.on("end", onEnd);
         try {
-          // The installed native query accepts an existing Query, preserving its
-          // normal parameter formatting without constructing a callback command.
           const submit = native.query as unknown as (command: Query) => Query;
           submit.call(native, command);
         } catch (error) {
@@ -1963,7 +1927,6 @@ export class MySQLDriver extends BaseDBDriver {
     try {
       await connection.query("ROLLBACK");
     } catch (rollbackError) {
-      // Never return a connection with an unknown transaction state to mysql2.
       this.activeQueryConnections.delete(connection);
       connection.destroy();
       throw new AggregateError(
@@ -2012,15 +1975,11 @@ export class MySQLDriver extends BaseDBDriver {
           connection!
             .query<ResultSetHeader>(this.createQueryOptions(sql))
             .then(([header]) => resolve(header), reject);
-          // Clear tracking on settlement, including cancellation even if the
-          // native command never emits anything after socket destruction.
         }).finally(() => {
           clearTimeout(timer);
           queryOperation.reject = undefined;
         });
       };
-      // DO neither starts a transaction nor implicitly commits one. Its OK
-      // packet exposes the public protocol status even after streaming SELECTs.
       const status = await cleanupQuery("DO 0");
       if (
         !status ||
@@ -2044,8 +2003,6 @@ export class MySQLDriver extends BaseDBDriver {
     } finally {
       this.activeQueryOperations.delete(queryOperation);
       if (connection && this.activeQueryConnections.delete(connection)) {
-        // Arbitrary SQL can change database, autocommit, sql_mode, variables,
-        // locks and temporary tables. Never lend this session to another task.
         connection.destroy();
       }
       if (slotAcquired) {
@@ -2587,8 +2544,6 @@ export class MySQLDriver extends BaseDBDriver {
             op.captureIdentity?.mysqlInsertId?.zero,
         )
       ) {
-        // Applies only to the next transaction, not the pooled session. Missing
-        // PK predicates need range locks even when the session uses READ COMMITTED.
         await conn.query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
         throwIfTransactionCancelled(context);
       }
@@ -2642,8 +2597,6 @@ export class MySQLDriver extends BaseDBDriver {
         assertTransactionAffectedRows(op, rows.affectedRows);
         let returnedKeys: Record<string, unknown>[] = [];
         if (capture) {
-          // Use this INSERT's OK-packet identity, not session LAST_INSERT_ID();
-          // a BEFORE trigger may explicitly assign the auto-increment field.
           const id: unknown = rows.insertId;
           const reliable =
             (typeof id === "number" &&
@@ -2682,7 +2635,6 @@ export class MySQLDriver extends BaseDBDriver {
             operations[identity.operationIndex].captureIdentity?.mysqlInsertId
               ?.zero;
           if (!zero) return verification;
-          // Verify this operation's captured key without mutating its reusable plan.
           return {
             ...verification,
             values: verification.values.map((value) =>
@@ -2756,10 +2708,6 @@ export class MySQLDriver extends BaseDBDriver {
       typeof rows[0]?.TRANSACTIONS === "string"
         ? rows[0].TRANSACTIONS.trim().toUpperCase()
         : "";
-    // Use the server's capability rather than a blacklist: MariaDB Aria and
-    // third-party engines may accept BEGIN/ROLLBACK without undoing writes.
-    // Missing tables, views (NULL ENGINE), or unavailable engine metadata must
-    // not be treated as proof that rollback is safe.
     if (engine && transactions === "YES") {
       return null;
     }
@@ -2818,6 +2766,12 @@ export class MySQLDriver extends BaseDBDriver {
     )
       return "text";
     return "other";
+  }
+  protected override formatPreviewSqlLiteral(value: unknown): string {
+    if (typeof value === "string" && /[\\\p{Cc}]/u.test(value)) {
+      return formatMysqlStringLiteral(value);
+    }
+    return super.formatPreviewSqlLiteral(value);
   }
   protected getValueSemantics(
     nativeType: string,
@@ -3387,8 +3341,6 @@ export class MySQLDriver extends BaseDBDriver {
     ) {
       const sqlOp = this.sqlOperator(operator);
       if (column.category === "integer" && !/^[+-]?\d+$/.test(val)) {
-        // Text transport alone is insufficient: MySQL can compare bigint
-        // against fractional strings using DOUBLE. Force an exact operand.
         const operand = this.integerFilterOperand(column, val);
         return {
           sql: `${col} ${sqlOp} ${operand.sql}`,
@@ -3478,11 +3430,6 @@ export class MySQLDriver extends BaseDBDriver {
     preserveColumnCollation = false,
     column?: ColumnTypeMeta,
   ): FilterConditionResult {
-    // mysql2.query() interpolates string parameters with backslash escapes.
-    // Transport only ASCII hex, then decode on the server: quotes/backslashes
-    // stay data even with NO_BACKSLASH_ESCAPES. Text columns use their catalog
-    // collation for both operands because the pool connection may use a
-    // different collation from the schema default.
     const leftExpression =
       column?.category === "spatial"
         ? `ST_AsText(${col})`
@@ -3502,8 +3449,6 @@ export class MySQLDriver extends BaseDBDriver {
     const predicate = `${leftExpression} LIKE ${rightExpression} ESCAPE '!'`;
     const encodedPattern = Buffer.from(pattern, "utf8").toString("hex");
     if (collation && collation.characterSet !== "utf8mb4") {
-      // Legacy charsets can replace an unsupported character with '?'. Require
-      // an exact UTF-8 round trip before using the transcoded LIKE pattern.
       return {
         sql: `(${predicate} AND CAST(CONVERT(${convertedPattern} USING utf8mb4) AS BINARY) = UNHEX(?))`,
         params: [encodedPattern, encodedPattern, encodedPattern],

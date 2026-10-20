@@ -172,7 +172,6 @@ export function formatSQLiteRuntimeLoadErrorMessage(
 ): string {
   const errorMsg = errorMessage(error);
 
-  // Detect MODULE_VERSION mismatch (common error pattern)
   const isModuleVersionError =
     errorMsg.includes("NODE_MODULE_VERSION") ||
     errorMsg.includes("MODULE_VERSION") ||
@@ -347,9 +346,6 @@ class BetterSqlite3DatabaseAdapter implements SQLiteDatabase {
     params: readonly unknown[] = [],
   ): { columns: string[]; rows: unknown[][] } {
     const statement = this.database.prepare(sql);
-    // Preserve all()'s non-reader error contract: the driver uses it to fall
-    // back to run() for assignment PRAGMAs; raw() rejects non-readers with a
-    // different error message before all() can establish that contract.
     if (!statement.reader)
       throw new TypeError(
         "This statement does not return data. Use run() instead.",
@@ -385,8 +381,6 @@ class BetterSqlite3DatabaseAdapter implements SQLiteDatabase {
     const iterator = params.length ? exact.iterate(params) : exact.iterate();
     const rows: unknown[][] = [];
     let rowCount = 0;
-    // Drain even INSERT/UPDATE/DELETE RETURNING completely. Breaking iteration
-    // at the display limit is not a safe substitute for mutation completion.
     for (const row of iterator) {
       rowCount++;
       if (rows.length < limit)

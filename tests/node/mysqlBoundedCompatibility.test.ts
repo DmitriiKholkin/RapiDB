@@ -13,8 +13,6 @@ import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
 const drift = vi.hoisted(() => ({ mysqlPackage: { version: "3.24.4" } }));
 vi.mock("mysql2/package.json", () => ({ default: drift.mysqlPackage }));
 
-// Use the installed packet reader, command state machine, column decoder and
-// row parser. No database/socket or fake result/fields emitter is involved.
 const require = createRequire(import.meta.url);
 const mysqlRoot = dirname(require.resolve("mysql2"));
 type Packet = { buffer: Buffer; offset: number; end: number };
@@ -45,7 +43,6 @@ function column(name: string): Packet {
     const text = Buffer.from(value);
     return Buffer.concat([Buffer.from([text.length]), text]);
   });
-  // fixed metadata: UTF8MB4 charset, INT length/type, no flags/decimals.
   return packet(
     Buffer.concat([
       ...strings,
@@ -269,7 +266,6 @@ describe("MySQL bounded adapter compatibility", () => {
               warningStatus: 2,
             });
         });
-        // Interleave OK packets between SELECT sets, not just one trailing OK.
         for (let set = 0; set < 40; set++) {
           expect(advance(ok(7, true))).toBe(false);
           expect(advance(packet([2]))).toBe(false);

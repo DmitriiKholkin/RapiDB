@@ -48,8 +48,6 @@ const bulk = (value: string) => `$${Buffer.byteLength(value)}\r\n${value}\r\n`;
 const array = (values: string[]) =>
   `*${values.length}\r\n${values.map(bulk).join("")}`;
 
-// A small RESP endpoint: node-redis itself is never mocked. Record decoded
-// wire arguments, serve reads for the real host refresh, and inject SET errors.
 class InsertRespServer {
   readonly commands: string[][] = [];
   readonly sockets = new Set<net.Socket>();
@@ -106,8 +104,6 @@ class InsertRespServer {
       case "TTL":
         return `:${row?.ttl ?? -2}\r\n`;
       case "EVAL": {
-        // Model the string-key compare-and-write using the actual RESP
-        // arguments emitted by node-redis, including embedded NUL bytes.
         const keyCount = Number(args[2]);
         const source = args[3];
         const target = args[4];
@@ -324,8 +320,6 @@ describe("B07 Redis draft NULL UI → host → real node-redis RESP wire", () =>
       await waitFor(() =>
         expect(document.querySelector('td[data-row="-1"]')).toBeNull(),
       );
-      // Replay the host's actual B06 preview through the query parser and
-      // compare wire args, including the empty value and optional EX/NX.
       const preview = session
         .hostMessages()
         .find((message) => message.type === "tableMutationPreview");
@@ -459,7 +453,6 @@ describe("B07 Redis draft NULL UI → host → real node-redis RESP wire", () =>
           originalValues: { value: snapshot },
         },
       ]);
-      // Change the actual store after preparation, before the atomic edit.
       if (concurrent) server.rows.set(key, { value: "", ttl: 60 });
       const result = await executePreparedApplyPlan(
         context.connectionManager,

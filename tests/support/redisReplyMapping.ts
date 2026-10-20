@@ -1,6 +1,5 @@
 import { vi } from "vitest";
 
-/** Model the Buffer/String reply mapping used by the actual node-redis client. */
 export function withRedisReplyMapping<T extends object>(client: T) {
   const commands = client as {
     scan?: (...args: unknown[]) => Promise<{

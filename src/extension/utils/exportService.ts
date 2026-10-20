@@ -397,7 +397,6 @@ async function writeChunkedCsv(
         throwIfAborted(signal);
         const currentByName = indexExportColumns(chunk.columns);
         if (!headerColumns) {
-          // Copy descriptors so a producer cannot mutate the frozen schema.
           headerColumns = chunk.columns.map((column) => ({ ...column }));
           headerByName = indexExportColumns(headerColumns);
           await writeStreamChunk(
@@ -529,9 +528,6 @@ function isSignalCancellationError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   if (error.name === "AbortError") return true;
 
-  // Elastic transport 9 uses these messages for signal-triggered aborts, but
-  // also uses RequestAbortedError for response-size-limit failures. Match only
-  // its explicit abort messages so a racing size-limit error is still reported.
   return (
     error.name === "RequestAbortedError" &&
     (error.message === "Request aborted" ||
@@ -582,10 +578,7 @@ async function withWriteStream(
   const temporaryPath = `${filePath}.rapidb-${randomUUID()}.tmp`;
   const writeStream = fs.createWriteStream(temporaryPath, {
     encoding: "utf8",
-    // Exclusive creation rejects collisions instead of following symlinks.
     flags: "wx",
-    // POSIX enforces owner-only access. Windows inherits the parent-directory
-    // ACL; replacing an existing file does not preserve that file's ACL.
     mode: 0o600,
   });
   let temporaryFileCreated = false;
@@ -676,8 +669,6 @@ function restoreExportBackup(backupPath: string, filePath: string): void {
     );
   }
 
-  // The check and rename cannot be made atomic with Node's portable fs API.
-  // Refuse an already-present destination rather than overwriting a competitor.
   fs.renameSync(backupPath, filePath);
 }
 
@@ -711,7 +702,5 @@ function closeWriteStream(writeStream: fs.WriteStream): Promise<void> {
   });
 }
 
-// Re-export value-formatting types and helpers for downstream consumers
-// that need the column descriptor type.
 export type { ExportColumnDescriptor, JsonExportValue };
 export { formatExportCellValue, queryColumnKey };

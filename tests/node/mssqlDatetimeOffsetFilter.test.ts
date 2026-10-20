@@ -220,20 +220,8 @@ describe("MSSQL datetimeoffset filter", () => {
   });
 
   it("parses tedious DateTimeOffset values into wall-clock time with the original offset", () => {
-    // Encoded payload stores UTC time 04:34:56.1230000 with +02:00 offset.
-    // The display value must preserve wall-clock form: 06:34:56.1230000+02:00.
     const encoded = Buffer.from([
-      0x0a, // payload length
-      0xb0,
-      0x9c,
-      0x74,
-      0x68,
-      0x26, // time
-      0xfe,
-      0x46,
-      0x0b, // date
-      0x78,
-      0x00, // offset minutes (+120)
+      0x0a, 0xb0, 0x9c, 0x74, 0x68, 0x26, 0xfe, 0x46, 0x0b, 0x78, 0x00,
     ]);
 
     const tediousValueParser = require("tedious/lib/value-parser") as {

@@ -20,10 +20,6 @@ import type {
   PendingEdits,
 } from "../../src/webview/types";
 
-/* ------------------------------------------------------------------ */
-/*  Helpers                                                           */
-/* ------------------------------------------------------------------ */
-
 function pendingEditsFrom(
   entries: Array<[number, Record<string, unknown>]>,
 ): PendingEdits {
@@ -249,10 +245,6 @@ describe("unknown primary-key edit restoration", () => {
   });
 });
 
-/* ------------------------------------------------------------------ */
-/*  buildUndoRedoSnapshot                                              */
-/* ------------------------------------------------------------------ */
-
 describe("buildUndoRedoSnapshot", () => {
   it("captures pendingEdits, newRows, and editCell", () => {
     const pending = pendingEditsFrom([[0, { name: "Alice" }]]);
@@ -305,11 +297,9 @@ describe("buildUndoRedoSnapshot", () => {
     const r = rows(["name", "original"]);
     const snapshot = buildUndoRedoSnapshot(new Map(), r, null);
 
-    // Adding a key to the original does NOT appear in the snapshot
     r[0].email = { value: "e@x.com" };
     expect(snapshot.newRows[0].email).toBeUndefined();
 
-    // But mutating an inner cell object IS shared (shallow clone)
     r[0].name.value = "mutated";
     expect(snapshot.newRows[0].name.value).toBe("mutated");
   });
@@ -327,10 +317,6 @@ describe("buildUndoRedoSnapshot", () => {
     expect(snapshot.pendingEdits.get(1)?.get("b")).toBe(2);
   });
 });
-
-/* ------------------------------------------------------------------ */
-/*  applyUndoRedoSnapshot                                              */
-/* ------------------------------------------------------------------ */
 
 describe("applyUndoRedoSnapshot", () => {
   it("returns the same values that were captured in the snapshot", () => {
@@ -399,7 +385,6 @@ describe("applyUndoRedoSnapshot", () => {
     restoredRow.email = { value: "e@x.com" };
     expect(snapshot.newRows[0].email).toBeUndefined();
 
-    // But inner cell objects are shared references (shallow clone)
     result.newRows[0].name.value = "mutated";
     expect(snapshot.newRows[0].name.value).toBe("mutated");
   });
@@ -416,10 +401,6 @@ describe("applyUndoRedoSnapshot", () => {
     expect(result.editCell).toBe(editCell);
   });
 });
-
-/* ------------------------------------------------------------------ */
-/*  Round-trip: build -> apply preserves data                         */
-/* ------------------------------------------------------------------ */
 
 describe("snapshot round-trip", () => {
   it("clones unresolved historical edits independently on capture and restore", () => {
@@ -458,8 +439,6 @@ describe("snapshot round-trip", () => {
       [{ id: 3 }, { id: 2 }],
       ["id"],
     );
-    // PK identity alone is insufficient: a missing edited column cannot
-    // replace the historical concurrency baseline with undefined.
     expect(recovered.pendingEdits.size).toBe(0);
     expect(recovered.unresolved).toHaveLength(1);
     expect(recovered.unresolved[0].originalValues?.get("name")).toBe("Bob");
@@ -520,10 +499,6 @@ describe("snapshot round-trip", () => {
     expect(result.editCell).toEqual({ kind: "draft", rowIdx: 1, col: "name" });
   });
 });
-
-/* ------------------------------------------------------------------ */
-/*  buildInsertValues                                                  */
-/* ------------------------------------------------------------------ */
 
 describe("buildInsertValues", () => {
   it.each([

@@ -120,8 +120,6 @@ export function serializeTableDraft(
         changes: [...entry.changes.entries()],
         ...(entry.originalValues
           ? {
-              // A one-element tuple preserves undefined through JSON; encoding
-              // it as [name, undefined] would silently turn the baseline NULL.
               originalValues: [...entry.originalValues].map(
                 ([name, value]): [string, unknown] | [string] =>
                   value === undefined ? [name] : [name, value],
@@ -134,7 +132,6 @@ export function serializeTableDraft(
       Object.fromEntries(
         Object.entries(row).map(([name, cell]) => [
           name,
-          // Keep undefined distinct from a malformed cell with no value.
           cell.value === undefined ? { valueUndefined: true } : { ...cell },
         ]),
       ),
@@ -197,8 +194,6 @@ export function parsePersistedTableDraft(
       originalSignature: entry.originalSignature,
       changes,
       originalValues,
-      // Older drafts have no concurrency baseline. Retain them, but never
-      // silently adopt the first post-restart read as their original values.
       baselineMissing: originalValues === undefined,
     });
   }
@@ -220,8 +215,6 @@ export function parsePersistedTableDraft(
         return null;
       }
     }
-    // Assignment on {} would invoke the inherited __proto__ setter instead
-    // of creating an own property for a legal database column of that name.
     parsedRows.push(Object.fromEntries(cells));
   }
 
@@ -590,8 +583,6 @@ export function restorePendingEditsSafely(
   const unresolved: PendingRestoreEntry[] = [];
   const claimedRows = new Set<number>();
 
-  // A proposed PK is not identity evidence, even after a complete snapshot:
-  // another client may have created that key since the original read.
   for (const entry of restoreState.entries) {
     const originalMatches = rowsBySignature.get(entry.originalSignature) ?? [];
     if (originalMatches.length === 1 && !claimedRows.has(originalMatches[0])) {

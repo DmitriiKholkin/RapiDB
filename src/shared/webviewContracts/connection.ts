@@ -1,8 +1,3 @@
-/**
- * Connection form panel types, initial state, and message parser.
- *
- * All parsers are pure; `null` indicates a parse failure.
- */
 import {
   CONNECTION_TLS_MODES,
   type ConnectionConfig,
@@ -22,8 +17,6 @@ import {
   readRequiredString,
 } from "./shared";
 
-// ─── Sanitized Config Types ─────────────────────────────────────────────────
-
 export type SanitizedSshConfig = Omit<
   ConnectionSshConfig,
   "password" | "privateKey" | "passphrase"
@@ -35,8 +28,6 @@ export type SanitizedConnectionConfig = Omit<
 > & {
   ssh?: SanitizedSshConfig;
 };
-
-// ─── Connection Form Types ──────────────────────────────────────────────────
 
 export interface ConnectionFormExistingState extends SanitizedConnectionConfig {
   hasStoredSecret?: boolean;
@@ -68,8 +59,6 @@ export interface ConnectionFormInitialState extends PanelRetentionState {
   view: "connection";
   existing: ConnectionFormExistingState | null;
 }
-
-// ─── Parser Helpers ─────────────────────────────────────────────────────────
 
 const CONNECTION_FORM_BROWSE_TARGETS: ReadonlySet<ConnectionFormBrowseTarget> =
   new Set(["filePath", "tlsCaFile", "tlsCertFile", "tlsKeyFile"]);
@@ -190,8 +179,6 @@ function parseConnectionSshConfig(
   };
 }
 
-// ─── Connection Base Parser ─────────────────────────────────────────────────
-
 function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
   if (!isRecord(input)) {
     return null;
@@ -209,8 +196,6 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
     return null;
   }
 
-  // readOptionalNumber returns undefined for malformed values as well as absent
-  // ones. Reject malformed ports instead of silently replacing them with defaults.
   for (const source of [input, ...(isRecord(input.ssh) ? [input.ssh] : [])]) {
     if (
       source.port !== undefined &&
@@ -285,8 +270,6 @@ function readStoredSecretFlags(input: Record<string, unknown>) {
   };
 }
 
-// ─── Connection Form Parsers ────────────────────────────────────────────────
-
 export function parseConnectionFormExistingState(
   input: unknown,
 ): ConnectionFormExistingState | null {
@@ -312,8 +295,6 @@ export function parseConnectionFormSubmission(
   };
 }
 
-// ─── Initial State Parser ───────────────────────────────────────────────────
-
 export function parseConnectionFormInitialState(
   input: Record<string, unknown>,
 ): ConnectionFormInitialState | null {
@@ -328,8 +309,6 @@ export function parseConnectionFormInitialState(
   return { view: "connection", existing: null };
 }
 
-// ─── Messages ───────────────────────────────────────────────────────────────
-
 export type ConnectionFormPanelMessage =
   | WebviewMessageEnvelope<"saveConnection", ConnectionFormSubmission>
   | WebviewMessageEnvelope<"testConnection", ConnectionFormSubmission>
@@ -339,8 +318,6 @@ export type ConnectionFormPanelMessage =
       "browseFile",
       { target: ConnectionFormBrowseTarget }
     >;
-
-// ─── Message Parser ─────────────────────────────────────────────────────────
 
 export function parseConnectionFormPanelMessage(
   input: unknown,

@@ -94,8 +94,6 @@ const REDIS_VALUE_TYPE_ORDER = [
 const REDIS_READ_ONLY_QUERY_REASON =
   "[RapiDB] Read-only Redis connections allow only read commands.";
 
-// Keep seconds-to-milliseconds conversion exact in both JavaScript and Lua,
-// comfortably below Redis's signed 64-bit expiration timestamp limit.
 const REDIS_MAX_TTL_SECONDS = Math.floor(Number.MAX_SAFE_INTEGER / 1000);
 
 const REDIS_ATOMIC_EDIT_SCRIPT = `
@@ -486,8 +484,6 @@ function tokenizeRedisCommand(input: string): string[] {
   for (let index = 0; index < input.length; index += 1) {
     const char = input[index];
     if (escaping) {
-      // Preview arguments are JSON strings. Decode their escapes only inside
-      // double quotes; single-quoted and unquoted queries keep shell escaping.
       if (quote === '"' && char === "u") {
         const hex = input.slice(index + 1, index + 5);
         if (!/^[\da-fA-F]{4}$/.test(hex)) {
@@ -595,7 +591,6 @@ function decideRedisReadOnlyQuery(queryText: string) {
 
 export class RedisDriver implements IDBDriver {
   private client: RedisClient | null = null;
-  // Session ownership survives transient reconnects; transport readiness does not.
   private connected = false;
   private tlsSettings: ResolvedConnectionTlsSettings | undefined;
   private epoch = 0;
@@ -652,7 +647,6 @@ export class RedisDriver implements IDBDriver {
           this.connectionAbortController = undefined;
         }
       });
-    // Register before asynchronous TLS resolution, not only after client creation.
     this.connectionAttempts.set(attempt, state);
     this.connecting = attempt;
     return attempt;
@@ -683,8 +677,6 @@ export class RedisDriver implements IDBDriver {
   ): RedisClient {
     const forwardedTransport = getSshTcpForwardTransport(this.config);
     const tlsSettings = this.tlsSettings;
-    // node-redis gives URI fields priority over explicit options. Rewrite both
-    // the DB and forwarded endpoint, retaining URI authentication and TLS.
     const uri = this.config.connectionUri
       ? new URL(this.config.connectionUri)
       : undefined;
@@ -718,9 +710,6 @@ export class RedisDriver implements IDBDriver {
             (forwardedTransport?.localHost ?? this.config.host) || "127.0.0.1",
           port: forwardedTransport?.localPort ?? this.config.port ?? 6379,
         };
-    // destroy() cannot reach a TCP/TLS socket still inside createSocket().
-    // Node's TLS transport supports signal too (its declaration omits it).
-    // Stop reconnecting on abort, retaining node-redis's default retry backoff.
     const socketOptions = {
       ...socket,
       signal,
@@ -793,7 +782,6 @@ export class RedisDriver implements IDBDriver {
       this.releaseClientEntry(entry);
     });
     client.on("error", () => {
-      // node-redis changes isOpen after emitting an error during reconnect.
       queueMicrotask(() => this.releaseClientEntry(entry));
     });
     const epoch = this.epoch;
@@ -851,8 +839,6 @@ export class RedisDriver implements IDBDriver {
     this.queries.clear();
     const entries = [...this.clients];
     const errors: unknown[] = [];
-    // close() waits for outstanding replies indefinitely. Force physical
-    // transport teardown and keep opening/failed entries tracked until retired.
     for (const entry of entries) {
       const error = this.cancelClientEntry(entry);
       if (error !== undefined) errors.push(error);
@@ -865,9 +851,6 @@ export class RedisDriver implements IDBDriver {
   }
 
   isConnected(): boolean {
-    // isOpen also stays true throughout node-redis's reconnect loop. Report the
-    // base session's actual readiness, not auxiliary client opens/cleanup or an
-    // error event alone (some errors do not invalidate the transport).
     return this.connected && this.client?.isReady === true;
   }
 
@@ -1062,11 +1045,6 @@ export class RedisDriver implements IDBDriver {
     let entry: RedisClientEntry | undefined;
     let onAbort: (() => void) | undefined;
     try {
-      // Query editor runs are cancellable after commands reach Redis. Give every
-      // cancellable query its own session so abort can close a blocked command
-      // without leaving later work queued behind it on the shared base client.
-      // Explicit database scopes also stay isolated so SELECT cannot change the
-      // editor's base session or cached native DB clients.
       querySignal.throwIfAborted();
       this.requireClient();
       if (
@@ -1094,8 +1072,6 @@ export class RedisDriver implements IDBDriver {
           throw new Error("Redis query was cancelled by disconnect.");
         const parts = tokenizeRedisCommand(statement);
         const [command, ...args] = parts;
-        // node-redis removes the command's abort listener when it is written.
-        // Race sent commands explicitly; only owned sessions are destroyed.
         const result = await this.waitForResult(
           client.sendCommand([command.toUpperCase(), ...args], {
             typeMapping: {
@@ -1366,8 +1342,6 @@ export class RedisDriver implements IDBDriver {
     try {
       result = await client[plan.command](...plan.args, plan.options);
     } catch (error) {
-      // A Redis ErrorReply means the server rejected the atomic SET command;
-      // transport failures remain unknown because the write may have arrived.
       if (error instanceof ErrorReply) {
         throw new MutationNotExecutedError(error.message, error);
       }
@@ -1474,7 +1448,6 @@ export class RedisDriver implements IDBDriver {
         ? commands.join("; ")
         : formatRedisPreviewCommand("GET", [sourceKey]);
     }
-    // delete
     const keys = (
       data.primaryKeyValuesList ?? (data.primaryKeys ? [data.primaryKeys] : [])
     )
@@ -1576,8 +1549,6 @@ export class RedisDriver implements IDBDriver {
     context?: TransactionContext,
     scope?: DatabaseExecutionScope,
   ): Promise<void> {
-    // No MULTI/EXEC wrapping here: sequential queries are not atomic.
-    // Fail closed on multi-op instead of risking a partial apply.
     if (operations.length > 1) {
       throw new Error(
         "[RapiDB] Redis driver does not support atomic multi-operation transactions. Apply one row at a time.",
@@ -1624,8 +1595,6 @@ export class RedisDriver implements IDBDriver {
   }
 
   coerceOriginalValue(value: unknown, _column: ColumnTypeMeta): unknown {
-    // Persisted bytes may equal the UI NULL marker; keep them for the
-    // atomic edit's original-value comparison.
     return value;
   }
 
@@ -1864,9 +1833,6 @@ export class RedisDriver implements IDBDriver {
                 .zRangeWithScores(key, 0, -1)
             ).map((entry) => ({
               ...entry,
-              // node-redis 6's RESP3 double decoder accumulates decimal digits
-              // with precomputed multipliers; e.g. 7.125 becomes 7.124999999999999.
-              // Decode the raw score string with the JS number parser instead.
               score: Number(entry.score),
             }));
             break;
@@ -2232,10 +2198,6 @@ export class RedisDriver implements IDBDriver {
       const count = Number.isFinite(limit)
         ? Math.min(500, Math.max(1, limit - keys.length))
         : 500;
-      // The table viewer uses strings as key identities. Decoding SCAN with
-      // replacement characters can alias a binary key to a different UTF-8 key,
-      // including for subsequent updates/deletes. Validate the original bytes
-      // before returning any identity or issuing any value reads.
       const response = await client
         .withTypeMapping({ [RESP_TYPES.BLOB_STRING]: Buffer })
         .scan(cursor, {

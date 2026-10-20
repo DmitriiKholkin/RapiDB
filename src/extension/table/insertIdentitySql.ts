@@ -1,7 +1,5 @@
 import type { ColumnTypeMeta } from "../dbDrivers/types";
 
-/** The same representation is used by RETURNING and the final identity predicate.
- * Never round a key through a JS Date/number or an implicit NLS conversion. */
 export function oracleInsertIdentity(
   column: ColumnTypeMeta,
   name: string,
@@ -26,7 +24,6 @@ export function oracleInsertIdentity(
   } else if (native === "DATE") {
     expression = `TO_CHAR(${name}, 'SYYYY-MM-DD HH24:MI:SS', 'NLS_DATE_LANGUAGE=American')`;
   } else if (native.startsWith("TIMESTAMP")) {
-    // Preserve timezone-independent instants at full 9-digit precision.
     const timestamp = native.includes("TIME ZONE")
       ? `SYS_EXTRACT_UTC(CAST(${name} AS TIMESTAMP(9) WITH TIME ZONE))`
       : name;
@@ -56,8 +53,6 @@ export function mssqlInsertIdentityExpression(
   const native = column.nativeType.toLowerCase().trim();
   if (native === "hierarchyid") return `${name}.ToString()`;
   if (native === "sql_variant") {
-    // Include type properties as well as value bytes: equal-looking values of
-    // different variant types must not redirect verification to a different row.
     const properties = [
       "BaseType",
       "Precision",
@@ -79,12 +74,6 @@ export function mssqlInsertIdentityExpression(
   return name;
 }
 
-/**
- * SQL Server's COLLATE grammar accepts a bare collation name, not a delimited
- * identifier. Keep the catalog collation on OUTPUT INTO columns to preserve
- * character encoding and comparison semantics, but only interpolate names
- * that are a single safe collation-name token.
- */
 export function mssqlInsertIdentityCollation(
   collation: string | undefined,
   identityType: string,
@@ -110,9 +99,6 @@ export function mssqlInsertIdentityType(column: ColumnTypeMeta): string {
     : /^sysname$/i.test(native)
       ? "nvarchar(128)"
       : native;
-  // Aliases have already been resolved through sys.types. This grammar covers
-  // SQL Server's indexable scalar built-ins, not arbitrary catalog text as SQL.
-  // LOB/XML/spatial/MAX types cannot be PKs. Comparable hierarchyid/sql_variant can.
   if (
     !/^(?:bigint|int|integer|smallint|tinyint|bit|float(?:\(\d+\))?|real|money|smallmoney|uniqueidentifier|hierarchyid|sql_variant|date|datetime|smalldatetime|(?:datetime2|datetimeoffset|time)(?:\(\d+\))?|(?:decimal|numeric)(?:\(\d+(?:\s*,\s*\d+)?\))?|(?:n?varchar|n?char|varbinary|binary)(?:\(\d+\))?)$/i.test(
       type,

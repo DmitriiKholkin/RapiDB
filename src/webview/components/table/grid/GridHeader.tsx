@@ -53,7 +53,6 @@ export function GridHeader({
   void columnSizing;
   return (
     <thead>
-      {/* Header row */}
       <tr>
         {headers.map((header) => {
           const isSelectionColumn = header.column.id === "__sel";
@@ -192,7 +191,6 @@ export function GridHeader({
         })}
       </tr>
 
-      {/* Filter row */}
       <tr>
         {headers.map((header) => {
           const isSelectionColumn = header.column.id === "__sel";

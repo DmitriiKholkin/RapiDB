@@ -1,15 +1,3 @@
-/**
- * Monaco editor worker bootstrap.
- *
- * Monaco looks for a `MonacoEnvironment.getWorker()` factory on the
- * `self` global. Inside the VS Code webview we never need real workers
- * (the editor is single-threaded and language services run in-process),
- * so we hand Monaco a no-op `Worker` backed by a Blob URL.
- *
- * Setting `MonacoEnvironment` is idempotent — the guard flag on the
- * `window` object keeps multiple `MonacoEditor` mounts from clobbering
- * each other's environment.
- */
 type MonacoHostWindow = Window & {
   __rapidbMonacoEnvSet?: boolean;
 };
@@ -24,10 +12,6 @@ const ENV_FLAG = "__rapidbMonacoEnvSet" as const;
 
 const NOOP_WORKER_SOURCE = "self.onmessage=function(){}";
 
-/**
- * Install the no-op worker factory exactly once per window. Safe to call
- * repeatedly — the second call is a no-op.
- */
 export function ensureMonacoEnvironment(): void {
   const w = window as MonacoHostWindow;
   if (w[ENV_FLAG]) {

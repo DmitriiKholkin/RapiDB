@@ -1,6 +1,3 @@
-/** Internal table identities cannot collide with a Redis prefix (prefixes end
- * before the first colon). The old `default` identity remains an alias for
- * all keys so previously opened views continue to work. */
 export const REDIS_ALL_KEYS_TABLE = "__rapidb:all-keys";
 export const REDIS_UNPREFIXED_KEYS_TABLE = "__rapidb:unprefixed-keys";
 export const REDIS_EMPTY_PREFIX_TABLE = "__rapidb:empty-prefix";

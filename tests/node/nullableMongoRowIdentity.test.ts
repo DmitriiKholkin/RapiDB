@@ -195,7 +195,6 @@ describe("MongoDB row identity guards", () => {
       name: "Mongo",
       type: "mongodb",
     });
-    // These guards must run even before a collection is acquired.
     for (const _id of [null, undefined]) {
       await expect(
         driver.updateRows({

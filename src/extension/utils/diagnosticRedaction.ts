@@ -1,4 +1,3 @@
-/** Redact diagnostics only; never use these copies as connection/query inputs. */
 const REDACTED = "[REDACTED]";
 const SECRET_KEY =
   /^(?:password|passwd|pwd|passphrase|tlsCertificateKeyFilePassword|privateKey|keyPassphrase|tlsKeyPassphrase|sshPassword|sshPrivateKey|sshPassphrase|api[_-]?key|access[_-]?token|auth[_-]?token|authorization|token|secret|client[_-]?secret|(?:aws)?AccessKeyId|(?:aws)?SecretAccessKey|(?:aws)?SessionToken|proxyPassword)$/i;
@@ -17,9 +16,7 @@ interface Secrets {
 function isSecretKey(key: string, uri = false): boolean {
   try {
     key = decodeURIComponent(key.replace(/\+/g, " "));
-  } catch {
-    // Malformed escaping must not disable recognition of ordinary keys.
-  }
+  } catch {}
   return SECRET_KEY.test(key) || (uri && URI_SECRET_KEY.test(key));
 }
 
@@ -43,9 +40,6 @@ function collectSecrets(
     } else if (URI_KEY.test(key) && typeof item === "string") {
       const safe = redactUri(item);
       if (safe !== item) secrets.uris.set(item, safe);
-      // URI-only configurations have no separate password field. Collect
-      // userinfo passwords too, including Mongo's comma-separated hosts.
-      // Stop at authority delimiters so a query email is not userinfo.
       const authority = /^[a-z][a-z\d+.-]*:\/\/([^/?#]*)/i.exec(item)?.[1];
       if (authority !== undefined) {
         const at = authority.lastIndexOf("@");
@@ -61,7 +55,6 @@ function collectSecrets(
           }
         }
       }
-      // Also hide a known URI's query secret when upstream reports it alone.
       for (const match of item.matchAll(/[?&#;]([^=&#;\s]+)=([^&#;]*)/g)) {
         if (!isSecretKey(match[1], true) || !match[2]) continue;
         secrets.values.add(match[2]);
@@ -94,10 +87,7 @@ function collectSecrets(
     )) {
       if ("value" in descriptor) collectField(key, descriptor.value);
     }
-  } catch {
-    // Driver metadata can contain revoked proxies or hostile ownKeys traps.
-    // Secret collection is best-effort; visit() replaces unreadable objects.
-  }
+  } catch {}
 }
 
 function redactUri(uri: string): string {
@@ -107,23 +97,15 @@ function redactUri(uri: string): string {
   const boundary = rest.search(/[/?#\s"'<>`]/);
   const authorityEnd = boundary < 0 ? rest.length : boundary;
   let at = rest.lastIndexOf("@", authorityEnd);
-  // Malformed userinfo can contain slashes, quotes or spaces. Only extend
-  // beyond the authority for a credential-shaped prefix, never host:port
-  // followed by unrelated diagnostic prose containing an email address.
   const colon = rest.indexOf(":");
   if (at < 0 && colon >= 0 && colon < authorityEnd && !rest.startsWith("[")) {
     const passwordPrefix = rest.slice(colon + 1, authorityEnd);
-    // A numeric prefix followed by a quote and a contiguous userinfo suffix
-    // ending in @ is a malformed password, not a host port. Do not look past
-    // whitespace or a path/query delimiter into unrelated error prose/email.
     const quotedUserinfo = /^["'][^\s/?#<>`]*@/.test(rest.slice(authorityEnd));
     if (!/^\d+$/.test(passwordPrefix) || quotedUserinfo) {
       at = rest.indexOf("@");
     }
   }
   if (at >= 0) uri = `${scheme[0]}${REDACTED}@${rest.slice(at + 1)}`;
-  // Whitespace and quotes are not reliable value terminators in a malformed
-  // URI. The enclosing URI span, rather than a token regex, bounds the value.
   return uri.replace(
     /([?&#;])([^=&#;\s]+)=([^&#;]*)/g,
     (part, separator: string, key: string) =>
@@ -151,8 +133,6 @@ function redactUriSpans(text: string): string {
         : tokenBoundary < 0
           ? lineEnd
           : start + tokenBoundary;
-    // In unquoted diagnostic text, a quote inside a clearly bounded userinfo
-    // segment is not the URI's terminator. Include its @ and following host.
     const quotedPassword =
       /^[a-z][a-z\d+.-]*:\/\/[^\s/?#"'<>`]*:[^\s/?#"'<>`]*["'][^\s/?#<>`]*@/i.exec(
         text.slice(start, lineEnd),
@@ -162,9 +142,6 @@ function redactUriSpans(text: string): string {
       const hostBoundary = text.slice(hostStart, lineEnd).search(/[\s"'<>`]/);
       end = hostBoundary < 0 ? lineEnd : hostStart + hostBoundary;
     }
-    // With no enclosing quote, a credential query value containing malformed
-    // whitespace/quotes has no unambiguous end. Hide its remaining line rather
-    // than disclosing a suffix. Non-credential URIs retain their token boundary.
     if (
       closingQuote <= start &&
       /[?&#;]([^=&#;\s]+)=/.test(text.slice(start, end))
@@ -190,8 +167,6 @@ function redactText(text: string, secrets: Secrets): string {
       .join(JSON.stringify(safe).slice(1, -1));
   }
   text = redactUriSpans(text);
-  // Serialized metadata is common in driver messages. Limit this to named
-  // credential fields, not arbitrary SQL literals or user data.
   text = text.replace(
     /("([^"\\]+)"\s*:\s*)"(?:\\.|[^"\\])*"/g,
     (part, prefix: string, key: string) =>
@@ -203,9 +178,7 @@ function redactText(text: string, secrets: Secrets): string {
     let encoded = secret;
     try {
       encoded = encodeURIComponent(secret);
-    } catch {
-      // A lone surrogate in a known password must not break error reporting.
-    }
+    } catch {}
     for (const spelling of new Set([
       secret,
       encoded,
@@ -217,7 +190,6 @@ function redactText(text: string, secrets: Secrets): string {
   return text;
 }
 
-/** Known raw secret values are scoped to this call, never retained by a logger. */
 export function redactDiagnosticText(
   text: string,
   secretContext?: unknown,
@@ -227,7 +199,6 @@ export function redactDiagnosticText(
   return redactText(text, secrets);
 }
 
-/** Copy only when redaction is needed, including non-enumerable Error fields. */
 export function redactDiagnosticValue(
   value: unknown,
   secretContext?: unknown,
@@ -291,8 +262,6 @@ export function redactDiagnosticValue(
       } else if (copy instanceof Error) {
         try {
           copy.name = String(visit((item as Error).name, depth + 1));
-          // DOMException exposes its message on the prototype, not as an own
-          // data property. Preserve and redact it before copying descriptors.
           copy.message = String(visit((item as Error).message, depth + 1));
         } catch {
           copy.name = "Error";

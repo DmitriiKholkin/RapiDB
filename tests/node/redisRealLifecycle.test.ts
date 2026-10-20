@@ -17,8 +17,6 @@ function state(driver: RedisDriver) {
   };
 }
 
-// Only TCP DNS timing is intercepted. Redis clients, transport, handshake,
-// command queue, AbortSignal handling and destroy/close are the real library.
 class RespServer {
   readonly sockets = new Set<net.Socket>();
   readonly commands: Array<{
@@ -206,7 +204,6 @@ afterEach(async () => {
   for (const driver of drivers) {
     await bounded(driver.disconnect()).catch(() => undefined);
   }
-  // Test teardown also cleans sockets when a regression assertion fails.
   for (const socket of sockets) socket.destroy();
   for (const release of releaseLookups.splice(0)) release();
   await server.close();
@@ -313,8 +310,6 @@ describe("B06 insert previews match real node-redis wire commands", () => {
       table: "group",
       values,
     });
-    // JSON permits Unicode escapes for every character, including surrogate
-    // pairs. Exercise that spelling in both preview entry points too.
     const escapeUnicode = (preview: string) =>
       preview
         .replaceAll("雪", String.raw`\u96EA`)
@@ -363,7 +358,6 @@ describe("B02 real node-redis 6 transport lifecycle", () => {
       expect(entries.every(({ client }) => !client.isReady)).toBe(true);
       expect(driver.isConnected()).toBe(false);
     });
-    // Observe real failed reconnects, not just the instant the socket closes.
     await vi.waitFor(() =>
       expect(logger.error).toHaveBeenCalledWith(
         "Redis client error",
@@ -373,7 +367,6 @@ describe("B02 real node-redis 6 transport lifecycle", () => {
     expect(driver.isConnected()).toBe(false);
     expect(entries.every(({ client }) => client.isOpen)).toBe(true);
     expect([...state(driver).clients]).toEqual(entries);
-    // Re-entering connect must not open a second base session during retry.
     await driver.connect();
     expect([...state(driver).clients]).toEqual(entries);
     expect(driver.isConnected()).toBe(false);
@@ -446,7 +439,6 @@ describe("B02 real node-redis 6 transport lifecycle", () => {
     expect(driver.isConnected()).toBe(false);
 
     await driver.connect();
-    // Stale client notifications cannot change the replacement base status.
     entries[0].client.emit("end");
     entries[0].client.emit("ready");
     expect(driver.isConnected()).toBe(true);
@@ -541,7 +533,6 @@ describe("B02 real node-redis 6 transport lifecycle", () => {
   });
 
   it("cancels a physical TLS socket waiting for secureConnect", async () => {
-    // This TCP endpoint intentionally never completes the TLS handshake.
     const driver = makeDriver(2000, true);
     const pending = driver.connect();
     const rejected = expect(pending).rejects.toThrow("cancelled");

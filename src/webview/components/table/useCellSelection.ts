@@ -348,7 +348,6 @@ export function useCellSelection({
     [],
   );
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: all values accessed via refs, empty deps intentional
   const handleKeyDown = useCallback((event: KeyboardEvent) => {
     const currentRange = rangeRef.current;
     const currentRowCount = rowCountRef.current;

@@ -94,9 +94,6 @@ class SshTlsHttpConnection extends HttpConnection {
     ...args: Parameters<HttpConnection["buildRequestObject"]>
   ): ReturnType<HttpConnection["buildRequestObject"]> {
     const request = super.buildRequestObject(...args);
-    // HttpConnection normally puts TLS settings on its own HTTPS agent. With
-    // the SSH agent factory it does neither that nor per-request TLS options.
-    // Keep settings request-local and use a connection-owned socket pool.
     return this.url.protocol === "https:"
       ? { ...request, ...this.tls }
       : request;
@@ -248,8 +245,6 @@ export class ElasticsearchDriver implements IDBDriver {
     const client = this.client;
     this.client = null;
     this.connected = false;
-    // Logical cancellation does not depend on a stuck physical request. Drain
-    // cleanup briefly, then close the transport independently of that request.
     await drainElasticsearchCleanup(
       Promise.allSettled([...this.pitReaders].map((reader) => reader.close())),
       100,
@@ -307,7 +302,6 @@ export class ElasticsearchDriver implements IDBDriver {
           (command.pathSegments.length === 2 ||
             command.pathSegments.length === 3)
         ) {
-          // Indexing a document may implicitly create its index.
           return true;
         }
 
@@ -317,7 +311,6 @@ export class ElasticsearchDriver implements IDBDriver {
           endpoint === "_update" &&
           command.pathSegments.length === 3
         ) {
-          // Update with upsert may create an index or add dynamically mapped fields.
           return true;
         }
 
@@ -1175,8 +1168,6 @@ export class ElasticsearchDriver implements IDBDriver {
       const rows: Record<string, unknown>[] = [];
       let totalCount = 0;
       let seen = 0;
-      // A fresh snapshot per page request. Walk to arbitrary offsets using
-      // the same unique PIT order as export, without a result-window limit.
       for await (const batch of this.readPitBatches(
         request.table,
         Math.min(size, 500),
@@ -1200,8 +1191,6 @@ export class ElasticsearchDriver implements IDBDriver {
     }
 
     const client = this.requireClient();
-    // Reuse the bounded read lifetime without opening a PIT: this path must
-    // still materialize the entire index in exactly one capped search.
     const reader = new ElasticsearchPitSession(
       client,
       this.timeoutSettingsProvider().dbOperationTimeoutMs,
@@ -1257,8 +1246,6 @@ export class ElasticsearchDriver implements IDBDriver {
         };
       });
     } finally {
-      // Logical cancellation must not wait for an uncooperative transport.
-      // The bounded drain removes the reader even if its search never settles.
       if (reader.signal.aborted) void reader.close().catch(() => undefined);
       else await reader.waitForClose();
     }
@@ -1332,8 +1319,6 @@ export class ElasticsearchDriver implements IDBDriver {
                 size = Math.min(size, window);
               }
             } catch (error) {
-              // PIT/search permission does not imply view_index_metadata.
-              // Only a metadata 403 permits adaptive window discovery.
               if (this.elasticsearchStatus(error) !== 403) throw error;
               unknownWindow = true;
             }
@@ -1382,7 +1367,6 @@ export class ElasticsearchDriver implements IDBDriver {
                 !this.isResultWindowError(error)
               )
                 throw error;
-              // Retry the same cursor; rejected window requests emit no rows.
               size = Math.max(1, Math.floor(size / 2));
             }
           }
@@ -1397,8 +1381,6 @@ export class ElasticsearchDriver implements IDBDriver {
           totalCount = this.resolveElasticsearchTotalCount(response.hits.total);
         }
         const hits = response.hits.hits;
-        // _shard_doc is unique and stable within this PIT. Validate every hit
-        // so malformed/repeated/backwards cursors fail closed, never dedup by _id.
         for (const hit of hits) {
           const next = hit.sort?.[0];
           if (
@@ -1434,12 +1416,9 @@ export class ElasticsearchDriver implements IDBDriver {
       throw error;
     } finally {
       const wasAborted = reader.signal.aborted;
-      // A cancellation/deadline must settle even if physical cleanup is stuck.
       if (failed && wasAborted) void reader.close().catch(() => undefined);
       else
         await reader.waitForClose().catch((error: unknown) => {
-          // Preserve the primary failure; a successful export must surface a
-          // cleanup failure before it can replace the destination file.
           if (!failed) throw error;
         });
     }
@@ -1635,8 +1614,6 @@ export class ElasticsearchDriver implements IDBDriver {
                 ? "notfound"
                 : "unknown";
           } catch (error) {
-            // A 404 is only row evidence when ES returned an explicit not_found
-            // document result (an absent index or proxy 404 is not sufficient).
             const body = (error as { meta?: { body?: { result?: string } } })
               ?.meta?.body;
             if (body?.result === "not_found") return "notfound";
@@ -1785,7 +1762,6 @@ export class ElasticsearchDriver implements IDBDriver {
   }
 
   async runTransaction(operations: TransactionOperation[]): Promise<void> {
-    // Elasticsearch has no transactions; sequential requests are not atomic.
     if (operations.length > 1) {
       throw new Error(
         "[RapiDB] Elasticsearch driver does not support atomic multi-operation transactions. Apply one row at a time.",
@@ -1827,8 +1803,6 @@ export class ElasticsearchDriver implements IDBDriver {
     try {
       return this.coerceInputValue(value, column);
     } catch (error) {
-      // Originals describe existing data, not new writes. Preserve the old
-      // Number round-trip contract so safe replacements remain possible.
       if (
         error instanceof JsonNumericPrecisionError &&
         typeof value === "string"
@@ -2118,10 +2092,6 @@ export class ElasticsearchDriver implements IDBDriver {
     });
   }
 
-  // A non-null opaque key avoids nullable routing in the shared compound-PK
-  // pipeline. Sign the entire read identity so omitted/edited routing cannot
-  // silently become default routing. Tokens are scoped to this connection and
-  // table (including aliases); writes always use the hit's concrete index.
   private encodeRowIdentity(
     table: string,
     hit: {
@@ -2143,7 +2113,7 @@ export class ElasticsearchDriver implements IDBDriver {
       !Number.isSafeInteger(hit._primary_term) ||
       Number(hit._primary_term) < 1
     )
-      return null; // Incomplete reads remain viewable, but cannot be mutated.
+      return null;
     const payload = Buffer.from(
       JSON.stringify([
         1,
@@ -2268,8 +2238,6 @@ export class ElasticsearchDriver implements IDBDriver {
       return this.normalizeSourceDocument(record._source);
     }
 
-    // Only the Viewer envelope owns a service _identity. A raw REST body or
-    // _source may legitimately contain an application field with this name.
     const { _identity: _ignoredIdentity, ...document } = record;
     return this.stripDocumentId(document);
   }

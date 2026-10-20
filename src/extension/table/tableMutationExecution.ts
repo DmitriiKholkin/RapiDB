@@ -110,7 +110,6 @@ export async function executeAtomicSqlApplyPlan(
         ? [
             {
               ...plan.verification,
-              // Keep INSERT failures separate from UPDATE row indexes in mixed results.
               rowIndex: -1 - index,
               ...(plan.verification.identity
                 ? {
@@ -222,7 +221,6 @@ export function prepareApplyChangesPlan(
     };
   }
 
-  // Validate the entire batch before generating any mutation preview.
   const columnMap = new Map(columns.map((column) => [column.name, column]));
   const failures = updates.map((update) =>
     validatePersistedEditRecord(driver, update.changes, columnMap),
@@ -247,12 +245,8 @@ export function prepareApplyChangesPlan(
     const skippedRows = new Set<number>();
     const coercedUpdates = updates.map((update, rowIndex) => {
       const rowColumnMetaByName = new Map(columnMetaByName);
-      // MongoDB's inferred column metadata is collection-wide. Use the
-      // committed row's BSON type for both the edit and its optimistic guard.
       if (driver.getCapabilities?.().tabularRead === "nosql") {
         for (const [name, hint] of Object.entries(update.originalTypes ?? {})) {
-          // Null and undefined have no scalar BSON type to preserve for a new
-          // value. Keep the collection's inferred column type for that edit.
           if (
             hint.nativeType === "null" ||
             hint.nativeType === "undefined" ||
@@ -732,8 +726,6 @@ function resolveDriverUpdateOutcomes(
       return Array.from({ length: updateCount }, () => "not_applied");
     }
   }
-  // A partial aggregate cannot identify which updates committed. Never assign
-  // successes by position; keep every row eligible for identity-based refresh.
   return Array.from({ length: updateCount }, () => "unknown");
 }
 

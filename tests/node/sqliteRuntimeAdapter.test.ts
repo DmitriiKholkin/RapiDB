@@ -270,9 +270,6 @@ describe("SQLite better-sqlite3 runtime adapter", () => {
     expect(readOnlyGuard?.(tempTableScript)).toEqual(
       expect.objectContaining({ allowed: false }),
     );
-    // SQLite's readonly open protects the main database file, but its TEMP
-    // database remains writable. The active query controller must therefore
-    // reject this DDL independently of the native file-open barrier.
     await readonlyDriver.query(tempTableScript);
     expect(
       await readSingleValue(readonlyDriver, "SELECT id FROM rapidb_temp"),

@@ -133,8 +133,6 @@ describe("B08 exact typed client comparisons", () => {
     const replace = vi
       .spyOn(String.prototype, "replace")
       .mockImplementation(function (this: string, ...args) {
-        // Deterministically fail the old quadratic algorithm, without wall-clock
-        // assertions or waiting for regexp backtracking on adversarial digits.
         if (
           args[0] instanceof RegExp &&
           !args[0].source.startsWith("^") &&
@@ -653,8 +651,6 @@ describe("B08 actual driver fallback paths with SDK-boundary fixtures", () => {
       ],
     });
     expect(page.rows.map((row) => row.id)).toEqual(["high"]);
-    // The L member predicate remains client-only; numeric comparison must
-    // still reject the low N and the numerically larger textual S impostor.
     const scans = send.mock.calls
       .map(([command]) => command)
       .filter((command) => command.constructor.name === "ScanCommand");
@@ -701,8 +697,6 @@ describe("B08 actual driver fallback paths with SDK-boundary fixtures", () => {
       TableName: request.table,
       Key: { id: { S: "key" } },
     });
-    // GetItem cannot apply residual predicates; L membership and exact int64
-    // range comparison therefore remain client-side for both adjacent Ns.
     expect(getItems[0].input?.FilterExpression).toBeUndefined();
   });
 

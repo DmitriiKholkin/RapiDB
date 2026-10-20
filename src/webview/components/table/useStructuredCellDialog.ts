@@ -1,9 +1,3 @@
-/**
- * Manages the structured cell dialog (JSON/XML/array editor).
- *
- * Encapsulates open/close/update/confirm/setNull logic and delegates
- * the actual cell commit to the parent's commit callbacks.
- */
 import { useCallback, useState } from "react";
 import type { ColumnTypeMeta as ColumnMeta } from "../../../shared/tableTypes";
 import { NULL_SENTINEL } from "../../../shared/tableTypes";
@@ -25,9 +19,7 @@ interface UseStructuredCellDialogOptions {
     column: ColumnMeta,
     newVal: string,
   ) => void;
-  /** Clear the active edit target (e.g. close inline editor). */
   clearEditCell: () => void;
-  /** Clear apply status banner. */
   clearApplyStatus: () => void;
 }
 

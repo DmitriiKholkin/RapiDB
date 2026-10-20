@@ -1,13 +1,3 @@
-/**
- * Transform a raw `QueryResult` (driver output) into a
- * `FormattedQueryResult` (webview-ready) by:
- *  - applying a row-limit (and reporting whether truncation happened);
- *  - resolving column metadata (one entry per column, defaulting to
- *    `category: null`);
- *  - normalizing each cell to a value the table renderer can display
- *    (numbers, bigints, buffers, dates, points, intervals, etc.).
- */
-
 import type { QueryColumnMeta } from "../../shared/tableTypes";
 import {
   formatDatetimeForDisplay,
@@ -50,16 +40,12 @@ export function formatQueryResult(
   };
 }
 
-// ── Cell value type guards ──────────────────────────────────────────────────
-
-/** `value` has exactly `{ x, y }` — a 2D point shape. */
 export function isPointLike(
   value: object,
 ): value is { x: unknown; y: unknown } {
   return "x" in value && "y" in value && Object.keys(value).length === 2;
 }
 
-/** `value` has exactly `{ x, y, radius }` — a circle shape. */
 export function isCircleLike(value: object): value is {
   x: unknown;
   y: unknown;
@@ -94,8 +80,6 @@ function safeStringify(value: unknown): string {
     return String(value);
   }
 }
-
-// ── Interval formatting (ISO 8601 duration) ────────────────────────────────
 
 const INTERVAL_FIELDS = [
   "years",
@@ -166,10 +150,6 @@ function buildIntervalIso(fields: IntervalFieldValues): string {
   return iso === "P" ? "P0D" : iso;
 }
 
-/**
- * Try to format an object as an ISO 8601 duration (`PnYnMnDTnHnMnS`).
- * Returns `null` if the object has unknown keys or non-numeric values.
- */
 function formatIntervalLikeObject(value: object): string | null {
   const record = value as Record<string, unknown>;
   if (!isRecognizedIntervalRecord(record)) {
@@ -177,8 +157,6 @@ function formatIntervalLikeObject(value: object): string | null {
   }
   return buildIntervalIso(readIntervalFields(record));
 }
-
-// ── Row normalization ──────────────────────────────────────────────────────
 
 function normalizeQueryRows(
   rows: readonly Record<string, unknown>[],

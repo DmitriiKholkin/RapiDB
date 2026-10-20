@@ -568,8 +568,6 @@ export function registerTableServiceIntegrationTests(
         columns,
       );
       if (!mismatchPlan.executable) throw new Error("Expected an apply plan");
-      // Simulate a persisted representation different from the requested value.
-      // This survives worker IPC, unlike replacing the host driver's checker.
       const mismatchParams = mismatchPlan.plan.operations[0].params;
       if (!mismatchParams) throw new Error("Expected bound UPDATE values");
       mismatchParams[0] = "21.00";

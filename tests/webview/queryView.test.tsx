@@ -593,7 +593,6 @@ describe("QueryView", () => {
     await user.click(button);
     if (expectedBookmarked) {
       expect(getPostedMessages()).toEqual([]);
-      // A bookmark belongs to its connection, not just its SQL text.
       await user.selectOptions(
         screen.getByLabelText("Active connection"),
         "conn-2",
@@ -788,7 +787,6 @@ describe("QueryView", () => {
     clearPostedMessages();
     act(() => {
       dispatchIncomingMessage("connections", []);
-      // The old render's shortcut callback must also be safe before rerender.
       fireEvent.keyDown(screen.getByLabelText("SQL editor"), { key: "F5" });
       fireEvent.click(screen.getByRole("button", { name: "Bookmark" }));
       dispatchIncomingMessage("queryResult", staleResult);
@@ -831,7 +829,6 @@ describe("QueryView", () => {
       },
     });
 
-    // Returning connections still requires an explicit choice before running the draft.
     act(() =>
       dispatchIncomingMessage("connections", [
         { id: "conn-2", name: "New connection", type: "pg" },

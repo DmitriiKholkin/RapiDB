@@ -6,15 +6,7 @@ import {
   replaceQuestionMarkPlaceholders,
 } from "./sqlPlaceholders";
 
-/**
- * Materializes SQL preview strings by replacing parameter placeholders
- * with actual values for display purposes.
- */
 export class SqlPreviewMaterializer {
-  /**
-   * Materializes a SQL preview string by replacing parameter placeholders
-   * with actual values.
-   */
   materializePreviewSql(
     sql: string,
     params?: readonly unknown[],
@@ -35,9 +27,6 @@ export class SqlPreviewMaterializer {
     return materializeSequentialPreviewSql(sql, params, formatter);
   }
 
-  /**
-   * Formats a value as a SQL literal for preview purposes.
-   */
   formatGenericPreviewSqlLiteral(value: unknown): string {
     if (value === null || value === undefined) {
       return "NULL";
@@ -75,16 +64,10 @@ export class SqlPreviewMaterializer {
   }
 }
 
-/**
- * Escapes a string for use in SQL preview literals.
- */
 function escapePreviewSqlString(value: string): string {
   return value.replace(/'/g, "''");
 }
 
-/**
- * Materializes sequential placeholder SQL preview.
- */
 function materializeSequentialPreviewSql(
   sql: string,
   params: readonly unknown[],
@@ -101,9 +84,6 @@ function materializeSequentialPreviewSql(
   );
 }
 
-/**
- * Materializes indexed placeholder SQL preview.
- */
 function materializeIndexedPreviewSql(
   sql: string,
   params: readonly unknown[],

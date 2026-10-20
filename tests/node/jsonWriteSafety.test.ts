@@ -153,7 +153,10 @@ describe("JSON numeric write safety", () => {
     expect(result.success).toBe(true);
     expect(updateOne.mock.calls[0][0]).toEqual({
       _id: { $eq: "actual" },
-      payload: JSON.parse(oldText),
+      payload: { $eq: JSON.parse(oldText) },
+      $expr: {
+        $and: [{ $eq: ["$payload", { $literal: JSON.parse(oldText) }] }],
+      },
     });
     expect(updateOne.mock.calls[0][1]).toEqual({
       $set: { payload: JSON.parse(newText) },

@@ -646,9 +646,6 @@ function normalizeSqliteDatetimeLiteral(value: string): string | null {
   const month = Number(match[2]);
   const day = Number(match[3]);
   if (month < 1 || month > 12 || day < 1) return null;
-  // SQLite uses the proleptic Gregorian calendar, including year 0000.
-  // Impossible dates must remain raw equality values even when SQLite itself
-  // would silently roll them into the following month.
   const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
   const daysInMonth = [
     31,
@@ -669,8 +666,6 @@ function normalizeSqliteDatetimeLiteral(value: string): string | null {
   const minutes = Number(match[5]);
   const seconds = Number(match[6] ?? "00");
   if (hours > 23 || minutes > 59 || seconds > 59) return null;
-  // SQLite's parseTimezone accepts hours 00..14 and minutes 00..59,
-  // including +/-14:59 (not just the ISO-8601 boundary +/-14:00).
   const offsetHours = Number(match[7] ?? "00");
   const offsetMinutes = Number(match[8] ?? "00");
   if (offsetHours > 14 || offsetMinutes > 59) return null;
@@ -739,7 +734,6 @@ class SQLiteRollbackFailure extends AggregateError {
   }
 }
 
-/** Synchronous SQLite implementation: DB methods are only invoked in sqliteWorker. */
 export class SQLiteCoreDriver extends BaseDBDriver {
   protected override getQueryEditorSqlDialect() {
     return "sqlite" as const;
@@ -962,10 +956,6 @@ export class SQLiteCoreDriver extends BaseDBDriver {
       }
     };
     checkDeadline();
-    // A synchronous mutation must not autocommit after its wall-clock deadline.
-    // Savepoints also preserve an existing user BEGIN/session transaction.
-    // Session/transaction-control PRAGMAs, ATTACH and VACUUM keep their native
-    // semantics; interrupted scripts may have already completed statements.
     const statements = splitSQLiteScript(sql);
     const transactional =
       statements.length > 0 &&
@@ -1493,9 +1483,6 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     _columnIndex: number,
     _columns: readonly ColumnTypeMeta[] = [],
   ): unknown {
-    // SQLite keeps DATETIME/TIMESTAMP values as text. Keep their original
-    // spelling in Table Viewer rows because those values are reused by the
-    // optimistic UPDATE predicate; Query Results can keep normalizing dates.
     if (
       this.isDatetimeWithTime(column.nativeType) &&
       typeof value === "string"
@@ -1510,9 +1497,6 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     options?: PersistedEditCheckOptions,
   ): PersistedEditCheckResult | null {
     if (column.category === "integer") {
-      // Declared INTEGER has numeric affinity, not a universal scale-zero
-      // constraint. Non-STRICT tables can persist fractions as REAL; STRICT
-      // tables and INTEGER PRIMARY KEY constraints are enforced by SQLite.
       return this.checkExactNumericPersistedEdit(
         column,
         expectedValue,
@@ -1726,9 +1710,6 @@ export class SQLiteCoreDriver extends BaseDBDriver {
         operator,
       )
     ) {
-      // Bind numeric text so SQLite's NUMERIC affinity, rather than JS Number,
-      // parses it. Plain int64 literals remain exact; fractions/exponents still
-      // have SQLite's native REAL precision limitations.
       const normalized = super.normalizeFilterValue(column, operator, val);
       if (operator === "between" && Array.isArray(normalized)) {
         return { sql: `${col} BETWEEN ? AND ?`, params: normalized };

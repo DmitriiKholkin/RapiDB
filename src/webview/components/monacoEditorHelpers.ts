@@ -1,26 +1,15 @@
-/**
- * Monaco editor helper functions and constants.
- *
- * Extracted from MonacoEditor.tsx to reduce its size and improve testability.
- */
 import * as monaco from "monaco-editor";
 import { format as sqlFormatterFormat } from "sql-formatter";
 import type { QueryEditorSqlDialect } from "../../shared/webviewContracts";
 import { cssVar } from "../utils/cssVar";
 import type { SqlCompletionSuggestionKind } from "../utils/sqlCompletionSuggestions";
 
-// ─── Types ──────────────────────────────────────────────────────────────────
-
 type SqlFormatterOptions = NonNullable<
   Parameters<typeof sqlFormatterFormat>[1]
 >;
 type SqlFormatterLanguage = NonNullable<SqlFormatterOptions["language"]>;
 
-// ─── Constants ──────────────────────────────────────────────────────────────
-
 export const RAPIDB_THEME = "rapidb-vscode";
-
-// ─── Theme Helpers ──────────────────────────────────────────────────────────
 
 export function themeBase(): "vs-dark" | "vs" | "hc-black" | "hc-light" {
   const k = document.body.dataset.vscodeThemeKind ?? "";
@@ -59,8 +48,6 @@ export function applyVSCodeTheme(): void {
   monaco.editor.setTheme(RAPIDB_THEME);
 }
 
-// ─── Completion Helpers ─────────────────────────────────────────────────────
-
 export function monacoCompletionKindFor(
   kind: SqlCompletionSuggestionKind,
 ): monaco.languages.CompletionItemKind {
@@ -79,8 +66,6 @@ export function monacoCompletionKindFor(
       return monaco.languages.CompletionItemKind.Value;
   }
 }
-
-// ─── Formatting Helpers ─────────────────────────────────────────────────────
 
 export function formatSQLSafe(sql: string, dialect = "sql"): string {
   if (!sql.trim()) {
@@ -154,8 +139,6 @@ export function formatEditorValueOrError(options: {
   return null;
 }
 
-// ─── Connection Type to Dialect ─────────────────────────────────────────────
-
 export function connTypeToDialect(connType: string): QueryEditorSqlDialect {
   switch (connType) {
     case "mysql":
@@ -173,17 +156,6 @@ export function connTypeToDialect(connType: string): QueryEditorSqlDialect {
   }
 }
 
-// ─── Editor Format Application ──────────────────────────────────────────────
-
-/**
- * Format the editor content and apply the result as an edit.
- *
- * Returns `null` on success (or when no formatting was needed),
- * or an error message string on failure.
- *
- * Centralises the format logic used by both the imperative `format()` handle
- * and the Shift+Alt+F keyboard shortcut.
- */
 export function applyFormatToEditor(
   editor: monaco.editor.IStandaloneCodeEditor,
   options: { language: string; dialect?: string },

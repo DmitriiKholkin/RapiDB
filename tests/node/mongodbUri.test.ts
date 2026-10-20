@@ -16,8 +16,6 @@ function buildUri(config: Partial<ConnectionConfig> = {}) {
   return (createDriver(config) as unknown as { buildUri(): string }).buildUri();
 }
 
-// These are URI parser tests, not server-side database-name validation.
-// Constructing the installed MongoClient does not open sockets or resolve DNS.
 describe("MongoDBDriver — host-based URI parsing", () => {
   it.each([
     ["::1", "::1"],

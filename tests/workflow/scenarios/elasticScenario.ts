@@ -1,9 +1,6 @@
 import type { EngineScenario } from "./types";
 
 const elastic = (): EngineScenario => {
-  // Unique index name per factory call so parallel/consecutive test runs
-  // never collide. Both createEntities and cleanup share the same closure,
-  // so the name is consistent within a single test.
   const indexName = `workflow_todos_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
   return {
     engineId: "elasticsearch",

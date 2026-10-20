@@ -120,7 +120,6 @@ describe.each(
         );
     }
     if (_name === "SQLite") {
-      // SQLite deliberately supports text stored in INTEGER-affinity columns.
       expect(
         buildWhere(
           driver,

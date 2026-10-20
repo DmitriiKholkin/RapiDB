@@ -117,7 +117,6 @@ class SshTransportLifetime {
     externalSignal?: AbortSignal,
   ) {
     this.externalSignal = externalSignal;
-    // Keep this listener even after close: ssh2 can report late transport errors.
     client.on("error", (error) => this.stop(error));
     client.on("close", () =>
       this.stop(new Error("[RapiDB] SSH connection closed")),
@@ -136,7 +135,6 @@ class SshTransportLifetime {
   }
 
   track<T extends Duplex>(stream: T): T {
-    // A channel may emit an error before its consumer has attached listeners.
     stream.on("error", () => stream.destroy());
     if (this.signal.aborted) {
       stream.destroy(this.signal.reason);
@@ -150,7 +148,6 @@ class SshTransportLifetime {
   stop(error = new Error("[RapiDB] SSH runtime disposed")): void {
     this.externalSignal?.removeEventListener("abort", this.onExternalAbort);
     if (this.signal.aborted) return;
-    // Destroy accepted sockets before the abort listener waits for server.close.
     for (const stream of this.streams) stream.destroy(error);
     this.streams.clear();
     this.abortController.abort(error);
@@ -171,9 +168,6 @@ type TlsClientRequestArgs = http.ClientRequestArgs &
   };
 
 async function defaultLoadSsh2(): Promise<Ssh2ModuleLike> {
-  // Keep lazy CommonJS resolution relative to the installed extension. ssh2
-  // and its JS dependencies are included in the VSIX, not bundled with native
-  // optional modules from the build host.
   return require("ssh2") as Ssh2ModuleLike;
 }
 

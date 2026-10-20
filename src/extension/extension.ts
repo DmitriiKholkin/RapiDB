@@ -1,21 +1,3 @@
-/**
- * RapiDB extension entry point.
- *
- * This module is intentionally thin: it wires together focused
- * collaborators (activation submodules, panels, providers) and
- * delegates every non-trivial concern to a dedicated module. The
- * lifecycle is split into:
- *
- *   - `activateOnce` — guarded against duplicate calls (the test runner
- *      re-imports this module between cases).
- *   - `deactivate`   — disposes everything that was created during
- *      activation.
- *
- * Keep this file boring: if you need to add a feature, create or extend
- * a module under `activation/`, `commands/`, `panels/`, or
- * `providers/` and wire it in here.
- */
-
 import * as vscode from "vscode";
 import {
   type ActivationServices,
@@ -198,7 +180,6 @@ function activateOnce(context: vscode.ExtensionContext): void {
     );
   }
 
-  // Persist disposables so deactivate can clean them up.
   for (const d of disposables) {
     context.subscriptions.push(d);
   }

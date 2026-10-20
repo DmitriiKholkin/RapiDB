@@ -105,8 +105,6 @@ export function EditInput({
       !editorClosedRef.current &&
       document.activeElement === input
     ) {
-      // Restore after the controlled value update, without a deferred RAF
-      // that could overwrite subsequent typing or selection changes.
       input.setSelectionRange(cursor, cursor);
     }
   });
@@ -170,8 +168,6 @@ export function EditInput({
         const input = ref.current;
         if (!text || !input || input.readOnly || editorClosedRef.current)
           return;
-        // Clipboard reads are asynchronous: use the displayed value and
-        // selection at response time, including edits made while waiting.
         const start = input.selectionStart ?? 0;
         const end = input.selectionEnd ?? start;
         const currentVal = input.value;
@@ -181,7 +177,6 @@ export function EditInput({
         );
         const cursor = start + text.length;
         if (newVal === currentVal) {
-          // An identical replacement may not cause React to render.
           if (document.activeElement === input) {
             input.setSelectionRange(cursor, cursor);
           }

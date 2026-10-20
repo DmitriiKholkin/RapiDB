@@ -22,7 +22,6 @@ export class TransactionVerificationError extends Error {
   }
 }
 
-/** Capture per-operation identities for verification on the active transaction. */
 export class TransactionIdentityStore {
   private readonly rows = new Map<number, Record<string, unknown>[]>();
 
@@ -79,7 +78,6 @@ export class TransactionIdentityStore {
   }
 }
 
-/** Verify on the existing transaction connection; rows use positional __col_N keys. */
 export async function verifyTransaction(
   driver: Pick<IDBDriver, "checkPersistedEdit">,
   verifications: readonly TransactionVerification[] | undefined,

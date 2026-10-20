@@ -26,5 +26,93 @@
       "trailingCommas": "all",
       "semicolons": "always"
     }
-  }
+  },
+  "overrides": [
+    {
+      "includes": [
+        "src/webview/components/connectionForm/useConnectionFormState.ts",
+        "src/webview/components/table/useCellSelection.ts",
+        "src/webview/components/table/useTableDataController.ts"
+      ],
+      "linter": {
+        "rules": {
+          "correctness": {
+            "useExhaustiveDependencies": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "src/webview/components/table/TableGrid.tsx",
+        "src/webview/components/table/grid/QueryResultsGrid.tsx",
+        "tests/webview/tableIntegration.test.tsx"
+      ],
+      "linter": {
+        "rules": {
+          "a11y": {
+            "noNoninteractiveTabindex": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "tests/node/dynamodbConnectionLifecycle.test.ts",
+        "tests/node/poolConnectLeak.test.ts",
+        "tests/node/postgresCatalogSession.test.ts",
+        "tests/node/postgresConnectionLifecycle.test.ts"
+      ],
+      "linter": {
+        "rules": {
+          "correctness": {
+            "noConstructorReturn": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["tests/webview/tableIntegration.test.tsx"],
+      "linter": {
+        "rules": {
+          "a11y": {
+            "noAutofocus": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["src/extension/utils/sqliteInstaller.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noExplicitAny": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "tests/node/releaseVersionWorkflow.test.ts",
+        "tests/node/sqliteGypPathSecurity.test.ts"
+      ],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noTemplateCurlyInString": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["tests/extension/tablePanel.test.ts"],
+      "linter": {
+        "rules": {
+          "complexity": {
+            "useArrowFunction": "off"
+          }
+        }
+      }
+    }
+  ]
 }

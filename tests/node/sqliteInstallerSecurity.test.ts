@@ -69,8 +69,6 @@ type Entry = {
   size?: number;
 };
 
-// Build raw USTAR headers, so malformed names/types are not normalized by the
-// fixture builder before they reach the production parser.
 function tar(entries: Entry[]): Buffer {
   const chunks: Buffer[] = [];
   for (const entry of entries) {
@@ -692,7 +690,6 @@ describe("SQLite installer security across callers and fallback paths", () => {
       let currentWorkspaceRoots: readonly string[] = [];
       const workspaceRootsGetter = vi.fn(() => currentWorkspaceRoots);
       const urls = mockDownloads((url) => {
-        // Folders change after configuration and before tool discovery.
         if (url === SQLITE_SOURCE.url) currentWorkspaceRoots = workspaceRoots;
         return { data: url === SQLITE_SOURCE.url ? source : headers.data };
       });
@@ -859,7 +856,6 @@ describe("SQLite source build tool discovery", () => {
       );
       chmodSync(malicious, 0o700);
       symlinkSync(malicious, join(rejected, "node"));
-      // Use the real interpreter, not an executable fixture launcher.
       const selectedNode = join(installation, "selected Node's executable");
       symlinkSync(process.execPath, selectedNode);
       symlinkSync(selectedNode, join(bin, "node"));
@@ -908,10 +904,7 @@ describe("SQLite source build tool discovery", () => {
         ),
       ].map((match) => JSON.parse(match[1]) as string);
       expect(interpreters).toEqual([tools.node, tools.node]);
-      // Deliberately reintroduce the rejected directory ahead of the selected
-      // one. Unlike a PATH-only fix, the patched actions must still be safe.
       const env = { ...tools.env, PATH: [rejected, bin].join(delimiter) };
-      // Never run the malicious fixture, even to demonstrate bare-node failure.
       expect(existsSync(marker)).toBe(false);
       for (const [index, interpreter] of interpreters.entries()) {
         const destination = join(root, `actual output ${index}`);

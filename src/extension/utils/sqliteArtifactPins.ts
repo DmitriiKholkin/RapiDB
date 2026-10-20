@@ -32,7 +32,6 @@ export interface SQLiteArtifactManifest {
   headers: Record<string, SQLiteHeaderPins>;
 }
 
-// esbuild embeds this reviewed snapshot. Never fetch a replacement at runtime.
 export const SQLITE_ARTIFACTS =
   require("./sqliteArtifacts.json") as SQLiteArtifactManifest;
 export const SQLITE_ARTIFACT_POLICY_ID = `pins-v4-${createHash("sha256").update(JSON.stringify(SQLITE_ARTIFACTS)).digest("hex").slice(0, 16)}`;

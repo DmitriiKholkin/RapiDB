@@ -174,9 +174,6 @@ export function useTableMutationController({
     `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
   );
   const activeOperationIdRef = useRef<string | null>(null);
-  // Do not resurrect a saved operation ID as an active request: its preview,
-  // sent row indexes and result snapshots belonged to the previous mount.
-  // Late replies cannot release the restored fence; only explicit reads can.
   const reconciliationRef = useRef<ReconciliationState | null>(reconciliation);
   const setReconciliation = useCallback((state: ReconciliationState | null) => {
     reconciliationRef.current = state;
@@ -193,8 +190,6 @@ export function useTableMutationController({
   const setLocalMutationError = useCallback((message: string | null) => {
     const recovery = reconciliationRef.current;
     if (recovery?.kind === "delete" && recovery.unknown) {
-      // Local actions cannot dismiss the late-write warning. Keep it alongside
-      // any new diagnostic until explicit retry or verified abandonment.
       if (message !== null) {
         setMutErr((current) => `${current ?? ""} ${message}`.trim());
       }
@@ -212,7 +207,6 @@ export function useTableMutationController({
     [loadingRef],
   );
 
-  // Refs for snapshot access inside callbacks that avoid re-creation
   const pendingEditsRef = useRef(pendingEdits);
   pendingEditsRef.current = pendingEdits;
   unresolvedPendingEditsRef.current = unresolvedPendingEdits;
@@ -359,11 +353,6 @@ export function useTableMutationController({
       previousMongoIdTypes: readonly ("objectId" | "string" | null)[],
       nextMongoIdTypes: readonly ("objectId" | "string" | null)[],
     ) => {
-      // Delete reconciliation moves surviving rows. Remap both history stacks
-      // by identity so undo cannot target a different row at the old index.
-      // Missing historical identities must survive later reads even after a
-      // known delete's reconciliation has ended, but never across APPLY:
-      // old snapshots may contain inserts/updates that APPLY already committed.
       if (
         reconciliationRef.current?.kind !== "apply" &&
         (reconciliationRef.current?.kind === "delete" ||
@@ -396,9 +385,6 @@ export function useTableMutationController({
       }
       const recovery = reconciliationRef.current;
       if (recovery && !recovery.requiresExplicitRead) {
-        // A read does not prove an unknown write has finished. Keep recovery
-        // available for another read. Unknown INSERT drafts remain fenced even
-        // after this read; presence/absence on one page is not execution proof.
         setReconciliation(
           recovery.unknown ? { ...recovery, verified: true } : null,
         );
@@ -598,8 +584,6 @@ export function useTableMutationController({
           return;
         activeOperationIdRef.current = null;
         setDeleting(false);
-        // rowIndex belongs to the sent request, not the live selection/page.
-        // Aggregate success/count and missing outcomes are not identity evidence.
         const deletedSignatures = new Set<string>();
         for (const outcome of rowOutcomes ?? []) {
           const signature =
@@ -639,8 +623,6 @@ export function useTableMutationController({
               entries: retainEntries(pendingRestoreRef.current.entries),
             };
           }
-          // Prune both stacks before refreshing, even if a stale read still
-          // contains the deleted row. Keep surviving edits and draft history.
           history.remap((snapshot) => ({
             ...snapshot,
             pendingEdits: retainPending(snapshot.pendingEdits),
@@ -812,7 +794,6 @@ export function useTableMutationController({
     activeOperationIdRef.current = operationId;
 
     const updates = buildPendingUpdatesPayload(pendingEdits);
-    // An empty values object inserts a row using database defaults.
     const insertValues = newRows.map(buildInsertValues);
     const marker: PersistedTableMutation = {
       kind: "apply",
@@ -820,8 +801,6 @@ export function useTableMutationController({
       operationId,
     };
     setPersistedMutation(marker);
-    // Write-ahead marker: persist before crossing the webview/host boundary,
-    // including when preview is skipped. A remount cannot replay this request.
     persistDraft(marker);
     postMessage("applyChanges", {
       operationId,
@@ -850,8 +829,6 @@ export function useTableMutationController({
     setNewRows([]);
     setEditCell(null);
     setStructuredCellDialog(null);
-    // Discarding verified work ends recovery. Incomplete verification must
-    // still fence mutations, even when the local edits/drafts are discarded.
     if (reconciliationRef.current?.verified) setReconciliation(null);
     setLocalMutationError(null);
     dismissApplyStatus();
@@ -863,8 +840,6 @@ export function useTableMutationController({
     setReconciliation,
   ]);
 
-  // Validate the entire persisted target set against the live read baseline.
-  // Metadata may have changed while a clipboard request was in flight.
   const validatePersistedBatch = useCallback(
     (edits: Array<{ rowIdx: number; column: ColumnMeta; newVal: string }>) => {
       const errors: PasteValidationError[] = [];
@@ -1569,7 +1544,6 @@ export function useTableMutationController({
   return {
     getRowMutationBlockReason,
     getMetadataRefreshState: () => ({
-      // Metadata must resume verification even after a failed/deferred read.
       reconciliationPending:
         reconciliationRef.current !== null &&
         !reconciliationRef.current.verified,
@@ -1607,7 +1581,6 @@ export function useTableMutationController({
     retryReconciliation: () => {
       const recovery = reconciliationRef.current;
       if (!recovery || (recovery.verified && !recovery.unknown)) return false;
-      // Reconciliation itself blocks writes, but must not block its read retry.
       if (loadingRef.current || activeOperationIdRef.current !== null)
         return true;
       if (recovery.verified) {
@@ -1632,9 +1605,6 @@ export function useTableMutationController({
     handleReadFailed: () => {
       const recovery = reconciliationRef.current;
       if (!recovery || recovery.verified) {
-        // Non-reconciliation reads will retry from the current committed rows.
-        // Before the first successful read there are no committed rows: the
-        // saved restore source is the only copy of UPDATE edits and baselines.
         if (didHydrateDraftRef.current) pendingRestoreRef.current = null;
         return;
       }

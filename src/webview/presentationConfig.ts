@@ -1,12 +1,4 @@
-/**
- * Presentation configuration for type categories and structural badges.
- *
- * The category→key map and the badge factory live in small private helpers
- * so adding a new category is a one-line change.
- */
 import type { TypeCategory } from "../shared/tableTypes";
-
-// ─── Public Types ────────────────────────────────────────────────────────────
 
 export interface BadgePresentation {
   foreground: string;
@@ -30,8 +22,6 @@ export interface StructuralBadgePresentation extends BadgePresentation {
   label: string;
 }
 
-// ─── Internal Types ──────────────────────────────────────────────────────────
-
 type CategoryKey =
   | "numeric"
   | "boolean"
@@ -53,25 +43,10 @@ interface BadgeSpec {
   background: string;
 }
 
-// ─── Badge Factory ───────────────────────────────────────────────────────────
-
-/**
- * The shape shared by every labelled badge presentation. Both
- * `CategoryPresentation` and `StructuralBadgePresentation` extend this
- * interface and add nothing else, so a single factory can produce either
- * without per-kind wrappers.
- */
 interface LabeledBadgePresentation extends BadgePresentation {
   label: string;
 }
 
-/**
- * Build a labelled badge presentation from a tiny spec object. The return
- * type is constrained to the shared `LabeledBadgePresentation` shape; the
- * catalogue tables annotate each entry with the concrete presentation kind
- * (`CategoryPresentation` / `StructuralBadgePresentation`) and TypeScript
- * verifies structural assignability at the catalogue site — no casts needed.
- */
 function makeBadge({
   label,
   foreground,
@@ -84,8 +59,6 @@ function makeBadge({
     badgeBorder: "none",
   };
 }
-
-// ─── Category Catalogue ──────────────────────────────────────────────────────
 
 const CATEGORY_PRESENTATIONS: Record<CategoryKey, CategoryPresentation> = {
   numeric: makeBadge({
@@ -155,8 +128,6 @@ const CATEGORY_PRESENTATIONS: Record<CategoryKey, CategoryPresentation> = {
   }),
 };
 
-// ─── Structural Badge Catalogue ──────────────────────────────────────────────
-
 const STRUCTURAL_BADGE_PRESENTATIONS: Record<
   StructuralBadgeKind,
   StructuralBadgePresentation
@@ -192,8 +163,6 @@ const STRUCTURAL_BADGE_PRESENTATIONS: Record<
     background: "rgba(107, 114, 128, 0.12)",
   }),
 };
-
-// ─── Public API ──────────────────────────────────────────────────────────────
 
 export function placeholderForCategory(cat: TypeCategory): string {
   switch (cat) {
@@ -232,13 +201,6 @@ export function getStructuralBadgePresentation(
   return STRUCTURAL_BADGE_PRESENTATIONS[kind];
 }
 
-// ─── Category Key Map ────────────────────────────────────────────────────────
-
-/**
- * Map a `TypeCategory` (the rich, user-facing enum) to a `CategoryKey`
- * (the smaller bucket used by the presentation catalogue). Each branch is a
- * single, declarative entry — adding a new variant is a one-line change.
- */
 function getCategoryKey(cat: TypeCategory): CategoryKey {
   switch (cat) {
     case "integer":

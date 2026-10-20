@@ -9,15 +9,8 @@ export class JsonNumericPrecisionError extends Error {
   }
 }
 
-/** Parse JSON for Number-based SDKs, refusing silent numeric changes.
- * Ordinary decimals follow decimal JSON round-trip semantics (0.1 is allowed).
- * Integers are compared with the actual IEEE-754 integer, also safe for BSON.
- */
 export function parseJsonForWrite(text: string): unknown {
   const parsed: unknown = JSON.parse(text);
-  // Syntax has already been validated. Match strings atomically so quoted
-  // numbers/escaped keys are never mistaken for numeric tokens. Check every
-  // token, including duplicate object keys, before returning the parsed value.
   const tokens = /"(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
   for (const match of text.matchAll(tokens)) {
     const token = match[0];

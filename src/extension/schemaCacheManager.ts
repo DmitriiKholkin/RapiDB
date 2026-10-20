@@ -42,15 +42,6 @@ import type {
   InternalTableDetailCacheEntry,
 } from "./schemaCacheUtils";
 import {
-  logErrorWithContext,
-  normalizeUnknownError,
-} from "./utils/errorHandling";
-
-// ─── Internal Types ───────────────────────────────────────────────────────────
-// Types moved to schemaCacheUtils.ts
-
-// ─── Re-exported from schemaCacheUtils ───────────────────────────────────────
-import {
   buildAggregateSchemaSnapshot,
   CONNECTION_ROOT_SCOPE,
   cloneExplorerSchemaScope,
@@ -81,6 +72,10 @@ import {
   mergeSchemaIntoDatabase,
   parseExplorerSchemaScopeKey,
 } from "./schemaCacheUtils";
+import {
+  logErrorWithContext,
+  normalizeUnknownError,
+} from "./utils/errorHandling";
 
 export {
   buildAggregateSchemaSnapshot,
@@ -115,8 +110,6 @@ export {
   resolveDriverCapabilities,
   resolveDriverEntityManifest,
 };
-
-// ─── SchemaCacheManager ───────────────────────────────────────────────────────
 
 export interface SchemaCacheManagerDependencies {
   getDriver: (connectionId: string) => IDBDriver | undefined;
@@ -602,8 +595,6 @@ export class SchemaCacheManager {
     };
   }
 
-  // ─── Public API ───────────────────────────────────────────────────────────
-
   getSchemaSnapshot(connectionId: string): SchemaSnapshot {
     return this.getSchemaSnapshotState(connectionId).snapshot;
   }
@@ -952,11 +943,7 @@ export class SchemaCacheManager {
     return this.getSchemaSnapshot(connectionId);
   }
 
-  invalidateDriverStaticMetadata(_connectionId: string): void {
-    // This is handled by ConnectionManager
-  }
-
-  // ─── Private Load Methods ────────────────────────────────────────────────
+  invalidateDriverStaticMetadata(_connectionId: string): void {}
 
   private startScopeLoadForScope(
     connectionId: string,
@@ -1348,8 +1335,6 @@ export class SchemaCacheManager {
 
     schemaEntry.loading = schemaLoadPromise;
   }
-
-  // ─── Lifecycle ─────────────────────────────────────────────────────────
 
   markConnectionEpoch(connectionId: string): number {
     return this.nextConnectionEpoch(connectionId);

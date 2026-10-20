@@ -93,7 +93,6 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
       } finally {
         await manager.dispose();
       }
-      // Fail closed for old settings as well, without changing the user's data.
       configuration.connections = [config];
       const legacyManager = new ConnectionManager(context as never);
       const state = legacyManager as unknown as {
@@ -419,8 +418,6 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
     const writes = vi.spyOn(context.secrets, "store");
     const deletes = vi.spyOn(context.secrets, "delete");
     const createSshRuntime = vi.fn();
-    // Exercise the default VSCodeConnectionManagerStore, including its checked
-    // migration transaction; replace only the external driver/SSH boundaries.
     const manager = new ConnectionManager(context as never, undefined, {
       createSshRuntime,
     });
@@ -452,7 +449,6 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
         expect(configuration.connections[0].useSecretStorage).toBe(true);
         expect(configuration.connections[0].password).toBeUndefined();
         expect(liveConfig.password).toBeUndefined();
-        // The actual context SecretStorage read fails only after migration.
         reads.mockRejectedValueOnce(originalError);
         return hydrate(liveConfig);
       });

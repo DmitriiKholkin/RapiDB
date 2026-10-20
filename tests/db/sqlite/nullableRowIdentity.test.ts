@@ -103,7 +103,6 @@ describe("SQLite nullable primary-key row identity", () => {
     expect(
       (await driver.query("SELECT * FROM items ORDER BY rowid")).rows,
     ).toEqual(before);
-    // The safe row in the same ordinary table remains mutable.
     await service.updateRow("identity", "", "main", "items", valid, {
       value: "changed",
     });

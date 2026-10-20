@@ -315,7 +315,6 @@ describe("transaction-scoped UPDATE verification", () => {
     await vi.runAllTimersAsync();
     expect(events).not.toContain("COMMIT");
     if (engine === "pg") {
-      // Socket destruction rolls back server-side; SQL on it is unsafe.
       expect(events).not.toContain("ROLLBACK");
       expect(execute).toHaveBeenCalledTimes(sqlCountAtTimeout);
       expect(release).toHaveBeenCalledExactlyOnceWith(true);

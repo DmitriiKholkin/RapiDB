@@ -20,11 +20,8 @@ function harness() {
   return { driver, request };
 }
 
-// T-SQL escapes quotes by doubling them; a backslash is an ordinary character
-// in both '...' / N'...' strings and double-quoted identifiers.
 const cases = [
   { sql: "SELECT 'C:\\', ?", expected: "SELECT 'C:\\', VALUE" },
-  // Before the fix this silently binds the '?' literal instead of the value.
   {
     sql: "SELECT 'C:\\', ? AS [value], '?' AS [literal]",
     expected: "SELECT 'C:\\', VALUE AS [value], '?' AS [literal]",

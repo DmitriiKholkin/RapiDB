@@ -3,8 +3,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { BoundedQueryRows } from "../../src/extension/dbDrivers/boundedQueryRows";
 import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
 
-// Exercise the pinned mysql2 command's real row handler. A promise/callback
-// query would collect into _currentRows even if the collector itself was bounded.
 type WireQuery = Query & {
   onResult?: unknown;
   _currentRows: unknown[][];
@@ -246,7 +244,6 @@ describe("MySQL bounded callback-free queries", () => {
         requestToken: 42,
         reason: "manual" as const,
       };
-      // Both cancellations run before the rejected query's finally microtask.
       await Promise.all([
         driver.cancelCurrentOperation(cancellation),
         driver.cancelCurrentOperation(cancellation),

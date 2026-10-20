@@ -7,17 +7,10 @@ import type {
 } from "./sshRuntime";
 import { createSshRuntime } from "./sshRuntime";
 
-/**
- * Dependencies for the SSH service.
- */
 export interface SshServiceDependencies {
   createSshRuntime?: typeof createSshRuntime;
 }
 
-/**
- * Service for managing SSH connections and runtime.
- * Handles SSH settings validation, runtime creation, and cleanup.
- */
 export class SshService {
   private readonly sshRuntimeMap = new Map<string, SshRuntime>();
   private readonly createSshRuntimeFn: typeof createSshRuntime;
@@ -26,10 +19,6 @@ export class SshService {
     this.createSshRuntimeFn = dependencies.createSshRuntime ?? createSshRuntime;
   }
 
-  /**
-   * Builds SSH settings from a connection config.
-   * Throws if required settings are missing.
-   */
   buildConnectionSshSettings(
     config: ConnectionConfig,
   ): ConnectionSshSettings | undefined {
@@ -92,9 +81,6 @@ export class SshService {
     };
   }
 
-  /**
-   * Resolves the SSH runtime request based on connection type.
-   */
   resolveSshRuntimeRequest(config: ConnectionConfig): SshRuntimeRequest {
     switch (config.type) {
       case "pg":
@@ -137,9 +123,6 @@ export class SshService {
     }
   }
 
-  /**
-   * Resolves the TCP remote target for a connection.
-   */
   resolveTcpRemoteTarget(config: ConnectionConfig): {
     host: string;
     port: number;
@@ -190,9 +173,6 @@ export class SshService {
     }
   }
 
-  /**
-   * Creates an SSH runtime for a connection.
-   */
   async createSshRuntime(
     sshSettings: ConnectionSshSettings,
     request: SshRuntimeRequest,
@@ -200,23 +180,14 @@ export class SshService {
     return this.createSshRuntimeFn(sshSettings, request);
   }
 
-  /**
-   * Gets the SSH runtime for a connection.
-   */
   getSshRuntime(connectionId: string): SshRuntime | undefined {
     return this.sshRuntimeMap.get(connectionId);
   }
 
-  /**
-   * Stores an SSH runtime for a connection.
-   */
   setSshRuntime(connectionId: string, runtime: SshRuntime): void {
     this.sshRuntimeMap.set(connectionId, runtime);
   }
 
-  /**
-   * Disposes and removes the SSH runtime for a connection.
-   */
   async disposeSshRuntime(connectionId: string): Promise<void> {
     const runtime = this.sshRuntimeMap.get(connectionId);
     this.sshRuntimeMap.delete(connectionId);
@@ -227,14 +198,10 @@ export class SshService {
     try {
       await runtime.dispose();
     } catch (e) {
-      // Cleanup is best-effort — log the failure and continue.
       logErrorWithContext("Failed to dispose SSH runtime", e);
     }
   }
 
-  /**
-   * Disposes all SSH runtimes.
-   */
   async disposeAll(): Promise<void> {
     const runtimeIds = [...this.sshRuntimeMap.keys()];
     await Promise.allSettled(
@@ -242,9 +209,6 @@ export class SshService {
     );
   }
 
-  /**
-   * Rewrites a URL's host and port.
-   */
   rewriteUriHostPort(
     value: string | undefined,
     host: string,
@@ -260,9 +224,6 @@ export class SshService {
     return url.toString();
   }
 
-  /**
-   * Resolves MongoDB remote target.
-   */
   private resolveMongoRemoteTarget(config: ConnectionConfig): {
     host: string;
     port: number;
@@ -275,9 +236,7 @@ export class SshService {
           host: parsed.hostname || "localhost",
           port: parsed.port ? Number.parseInt(parsed.port, 10) : 27017,
         };
-      } catch {
-        // Fall through to default
-      }
+      } catch {}
     }
 
     return {
@@ -286,9 +245,6 @@ export class SshService {
     };
   }
 
-  /**
-   * Resolves Redis remote target.
-   */
   private resolveRedisRemoteTarget(config: ConnectionConfig): {
     host: string;
     port: number;
@@ -301,9 +257,7 @@ export class SshService {
           host: parsed.hostname || "localhost",
           port: parsed.port ? Number.parseInt(parsed.port, 10) : 6379,
         };
-      } catch {
-        // Fall through to default
-      }
+      } catch {}
     }
 
     return {
@@ -312,9 +266,6 @@ export class SshService {
     };
   }
 
-  /**
-   * Resolves Elasticsearch remote target.
-   */
   private resolveElasticsearchRemoteTarget(config: ConnectionConfig):
     | {
         host: string;
@@ -329,9 +280,7 @@ export class SshService {
           host: parsed.hostname || "localhost",
           port: parsed.port ? Number.parseInt(parsed.port, 10) : 9200,
         };
-      } catch {
-        // Fall through to default
-      }
+      } catch {}
     }
 
     if (config.host) {
@@ -344,9 +293,6 @@ export class SshService {
     return undefined;
   }
 
-  /**
-   * Resolves DynamoDB remote target.
-   */
   private resolveDynamoRemoteTarget(config: ConnectionConfig): {
     host: string;
     port: number;
@@ -359,9 +305,7 @@ export class SshService {
           host: parsed.hostname || "localhost",
           port: parsed.port ? Number.parseInt(parsed.port, 10) : 443,
         };
-      } catch {
-        // Fall through to default
-      }
+      } catch {}
     }
 
     const region = config.awsRegion?.trim() || "us-east-1";

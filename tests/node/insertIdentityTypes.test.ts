@@ -72,8 +72,6 @@ describe("B02 INSERT identity type regressions", () => {
       expect(plan.operation.sql).toContain("FF9");
     if (nativeType.includes("TIME ZONE"))
       expect(plan.operation.sql).toContain("TIMESTAMP(9) WITH TIME ZONE");
-    // A trigger may assign a more precise/different key than the input Date bind.
-    // The final read must use RETURNING text verbatim, never re-coerce it to Date.
     const captured =
       nativeType === "DATE"
         ? "+2026-10-03 12:34:56"
@@ -228,7 +226,6 @@ describe("B02 INSERT identity type regressions", () => {
     }
     expect(metadataQuery.mock.calls[0]).toBeDefined();
     const catalogSql = vi.mocked(request.query).mock.calls[0][0];
-    // Both alias and base lookups are scoped to the selected database.
     expect(catalogSql).toContain("[db]]name].sys.types ut");
     expect(catalogSql).toContain("[db]]name].sys.types bt");
     expect(catalogSql).not.toContain("TYPE_NAME(");

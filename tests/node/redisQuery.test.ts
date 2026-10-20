@@ -240,8 +240,6 @@ describe("RedisDriver — disconnect()", () => {
 });
 
 describe("RedisDriver — metadata and pages", () => {
-  // These value/paging fixtures inject one already-open client. DB routing and
-  // client lifecycle are exercised through createClient in redisDatabaseScope.
   beforeEach(() => {
     vi.spyOn(
       RedisDriver.prototype as unknown as {

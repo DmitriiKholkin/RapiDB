@@ -296,7 +296,6 @@ describe("B03 DynamoDB logical pages and service export", () => {
     });
     const { driver, service, send, reads } = createHarness((input) => {
       if (!("KeyConditionExpression" in input)) {
-        // GetItem cannot apply the residual email condition.
         return { Item: item };
       }
       if (input.Select === "COUNT") {
@@ -558,7 +557,6 @@ describe("B03 DynamoDB logical pages and service export", () => {
         | Record<string, AttributeValue>
         | undefined;
       const previous = Number(cursor?.user_id.S ?? -1);
-      // A non-cyclic prefix followed by a cycle longer than the page cache.
       return response(String(previous === 250 ? 1 : previous + 1));
     });
     await expect(exportChunks(service, request(mode, 1))).rejects.toThrow(

@@ -8,7 +8,6 @@ interface MetadataContext {
 
 const metadataContext = new AsyncLocalStorage<MetadataContext>();
 
-/** Internal scope: metadata signatures stay unchanged, including nested calls. */
 export async function runWithMetadataCancellation<T>(
   signal: AbortSignal,
   deadline: number,
@@ -19,9 +18,7 @@ export async function runWithMetadataCancellation<T>(
     for (const close of context.cleanups) {
       try {
         close();
-      } catch {
-        /* Cleanup must not replace the operation error. */
-      }
+      } catch {}
     }
     context.cleanups.clear();
   };
@@ -55,7 +52,6 @@ export function getMetadataSdkOptions(): {
     : {};
 }
 
-/** Cancel only the native resource owned by this metadata request. */
 export async function withMetadataResource<T>(
   cancel: () => void | Promise<void>,
   run: () => Promise<T>,

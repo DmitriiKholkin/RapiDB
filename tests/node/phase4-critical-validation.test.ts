@@ -20,20 +20,7 @@ import {
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 import { QUERY_LIMIT_POLICY } from "../../src/shared/safetyContracts";
 
-/**
- * PHASE 4 CRITICAL VALIDATION TEST SUITE
- *
- * Tests critical security and behavioral guarantees:
- * F1: MongoDB mongosh execution safety (vm.runInNewContext with pre-validation)
- * F2: Read-only connection enforcement across all database types
- * F3: Mutation operation safetyand primary key verification
- */
-
 describe("Phase 4 — Critical Validation", () => {
-  // ============================================================================
-  // F1: MONGODB MONGOSH EXECUTION SAFETY
-  // ============================================================================
-
   describe("F1: MongoDB mongosh execution safety", () => {
     function createMongoDriver() {
       const driver = new MongoDBDriver({
@@ -202,16 +189,10 @@ describe("Phase 4 — Critical Validation", () => {
     it("times out long-running code execution", async () => {
       const { driver } = createMongoDriver();
 
-      // The sandbox has a 5-second timeout; we can't easily test this
-      // but we verify the timeout is documented in the code
       const driverCode = driver.constructor.toString();
       expect(driverCode).toContain("timeout");
     });
   });
-
-  // ============================================================================
-  // F2: READ-ONLY CONNECTION ENFORCEMENT
-  // ============================================================================
 
   describe("F2: Read-only connection enforcement", () => {
     const createTestManager = (readOnly: boolean) => ({
@@ -333,10 +314,6 @@ describe("Phase 4 — Critical Validation", () => {
     });
   });
 
-  // ============================================================================
-  // F3: MUTATION OPERATION SAFETY
-  // ============================================================================
-
   describe("F3: Mutation operation safety", () => {
     const createMutationManager = (readOnly: boolean) => ({
       getConnection: vi.fn().mockReturnValue({
@@ -445,7 +422,6 @@ describe("Phase 4 — Critical Validation", () => {
         mockColumnsProvider,
       );
 
-      // Should not throw
       await service.updateRow(
         "test-conn",
         "testdb",
@@ -468,7 +444,6 @@ describe("Phase 4 — Critical Validation", () => {
         mockColumnsProvider,
       );
 
-      // Should not throw
       await service.insertRow("test-conn", "testdb", "public", "users", {
         id: 2,
         name: "Bob",
@@ -497,7 +472,6 @@ describe("Phase 4 — Critical Validation", () => {
         mockColumnsProvider,
       );
 
-      // Should not throw
       await service.deleteRows("test-conn", "testdb", "public", "users", [
         { id: 1 },
       ]);
@@ -539,10 +513,6 @@ describe("Phase 4 — Critical Validation", () => {
     });
   });
 
-  // ============================================================================
-  // CROSS-DATABASE READ-ONLY CONSISTENCY
-  // ============================================================================
-
   describe("Cross-database read-only consistency", () => {
     const databases: Array<{
       name: string;
@@ -582,7 +552,6 @@ describe("Phase 4 — Critical Validation", () => {
         const driver = new Driver(config);
         const capabilities = driver.getCapabilities?.();
 
-        // All drivers should have a readOnlyQueryGuard
         if (capabilities) {
           expect(capabilities.readOnlyQueryGuard).toBeDefined();
         }

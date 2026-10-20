@@ -285,7 +285,6 @@ describe("QueryPanel", () => {
     "new",
     "restored",
   ])("keeps both panels registered when a legacy panel restores lazily and %s closes first", async (closedFirst) => {
-    // Simulate a restarted host: no serializer has reserved legacy qp_1 yet.
     vi.resetModules();
     const context = { extensionUri: {} } as never;
     const connectionManager = {
@@ -519,7 +518,6 @@ describe("QueryPanel", () => {
       type: "schema",
       payload: { connectionId: "conn-1", schema: [] },
     });
-    // Removing the saved profile cannot relabel the draft as another database.
     connectionManager.getConnection.mockReturnValue(undefined as never);
     connectionManager.getConnections.mockReturnValue([]);
     disconnectListener?.();
@@ -724,7 +722,6 @@ describe("QueryPanel", () => {
       true,
     );
     const panel = createdPanel();
-    // Simulate disposed webview: postMessage rejects / resolves false.
     panel.webview.postMessage.mockRejectedValueOnce(new Error("gone"));
     await panel.webview.dispatchMessage({ type: "ready" });
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -732,7 +729,6 @@ describe("QueryPanel", () => {
     panel.webview.postMessage.mockResolvedValueOnce(false);
     await panel.webview.dispatchMessage({ type: "ready" });
     await new Promise((resolve) => setTimeout(resolve, 10));
-    // No throw = no unhandled rejection.
   });
 
   it("survives controller dispose rejection on panel dispose", async () => {
@@ -765,7 +761,6 @@ describe("QueryPanel", () => {
       "select 1",
       true,
     );
-    // Must not throw synchronously; rejection is caught + logged.
     createdPanel()?.dispose();
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(disposeSpy).toHaveBeenCalledOnce();

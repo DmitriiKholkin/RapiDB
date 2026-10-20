@@ -147,8 +147,6 @@ describe("QueryPanelController", () => {
     let activeConnectionId = "active";
 
     const connectionManager = {
-      // No `type` field so the SQL hard-cap path stays inactive — this
-      // test focuses on connection-id precedence, not the rewrite logic.
       getConnection: vi.fn((connectionId: string) => ({
         id: connectionId,
         name: "Primary",
@@ -485,7 +483,6 @@ describe("QueryPanelController", () => {
         try {
           return result;
         } finally {
-          // Production Oracle removes the operation before awaiting release.
           operationActive = false;
           await pendingRelease;
         }
@@ -603,7 +600,6 @@ describe("QueryPanelController", () => {
     };
     let finishLateCancellation!: () => void;
     const cancelCurrentOperation = vi.fn(async () => {
-      // Reproduce the driver settling query() before cancel() returns.
       finishQuery();
       if (cancellation === "fails") throw new Error("Cancel failed");
       if (cancellation === "times out") {
@@ -676,7 +672,6 @@ describe("QueryPanelController", () => {
         cancellation === "succeeds" ? 0 : 1,
       );
       if (cancellation === "times out") {
-        // A late acknowledgement must not cancel or overwrite the next run.
         let finishNextQuery!: (value: typeof result) => void;
         driver.query.mockImplementationOnce(
           () =>
@@ -872,7 +867,6 @@ describe("QueryPanelController", () => {
       payload: { operationId: "old" },
     });
     expect(driver.cancelCurrentOperation).toHaveBeenCalledTimes(2);
-    // The old query's finally must not remove the new cancellation handle.
     await controller.handleMessage({
       type: "cancelQuery",
       payload: { operationId: "new" },
@@ -1650,8 +1644,6 @@ describe("QueryPanelController", () => {
         view,
       ).handleMessage({
         type: "executeQuery",
-        // Bounded drivers skip the hard-cap rewrite, so the executable
-        // comment reaches mayChangeDatabaseSchema verbatim.
         payload: { queryText: "SELECT 1 /*!50000 SELECT 1 */" },
       });
       return connectionManager.refreshSchemaCache;
@@ -2016,7 +2008,6 @@ describe("QueryPanelController", () => {
       getDriverCapabilities: vi.fn(() =>
         capabilitiesAvailable
           ? {
-              // A permissive classifier must not override the Oracle boundary.
               readOnlyQueryGuard: () => ({ allowed: true as const }),
             }
           : undefined,

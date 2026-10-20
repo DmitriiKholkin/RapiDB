@@ -98,7 +98,6 @@ describe("stage 4 C01/C02/B01 PostgreSQL persisted edits (live)", () => {
           ?.ok,
       ).toBe(true);
     } else if (name === "equal_scale" && value === "0.001") {
-      // Native SQL rounds; the table-edit policy intentionally rejects loss.
       expect(
         rowsFromQuery(
           await driver.query(`SELECT $1::${meta.nativeType} AS value`, [value]),

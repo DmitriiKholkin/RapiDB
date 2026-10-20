@@ -1,15 +1,7 @@
-/**
- * ERD view state management hook.
- *
- * Encapsulates all state variables, viewport persistence, and the
- * message handlers for the ERD panel.
- */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ErdGraph } from "../../../shared/webviewContracts";
 import { onMessage, postMessage } from "../../utils/messaging";
 import { readWebviewState, writeWebviewState } from "../../utils/vscodeState";
-
-// ─── Persisted State ────────────────────────────────────────────────────────
 
 export interface ErdViewState {
   search?: string;
@@ -19,8 +11,6 @@ export interface ErdViewState {
   nodePositions?: Record<string, { x: number; y: number }>;
 }
 
-// ─── LOD Level ──────────────────────────────────────────────────────────────
-
 export type LODLevel = "full" | "placeholder";
 
 const LOD_ZOOM_THRESHOLD_FULL = 0.3;
@@ -29,18 +19,13 @@ export function getLODLevel(zoom: number): LODLevel {
   return zoom >= LOD_ZOOM_THRESHOLD_FULL ? "full" : "placeholder";
 }
 
-// ─── Message Types ──────────────────────────────────────────────────────────
-
 interface ErdGraphMessage {
   graph: ErdGraph;
   fromCache: boolean;
   loadedAt: string;
 }
 
-// ─── Hook ───────────────────────────────────────────────────────────────────
-
 export interface UseErdViewStateResult {
-  // Graph data
   graph: ErdGraph | null;
   loading: boolean;
   hasCommittedGraph: boolean;
@@ -48,7 +33,6 @@ export interface UseErdViewStateResult {
   fromCache: boolean;
   loadedAt: string | null;
 
-  // Search & filter
   search: string;
   setSearch: (v: string) => void;
   hideUnmatched: boolean;
@@ -56,7 +40,6 @@ export interface UseErdViewStateResult {
   hideIsolated: boolean;
   setHideIsolated: (v: boolean) => void;
 
-  // Layout
   lodLevel: LODLevel;
   setLodLevel: (level: LODLevel) => void;
   manualPositions: Record<string, { x: number; y: number }>;
@@ -68,14 +51,12 @@ export interface UseErdViewStateResult {
     React.SetStateAction<import("@xyflow/react").Node[]>
   >;
 
-  // Viewport
   viewportRef: React.MutableRefObject<
     { x: number; y: number; zoom: number } | undefined
   >;
   hasRestoredViewportRef: React.MutableRefObject<boolean>;
   lastSyncedLoadedAtRef: React.MutableRefObject<string | null>;
 
-  // Actions
   handleReload: () => void;
 }
 
@@ -109,7 +90,6 @@ export function useErdViewState(): UseErdViewStateResult {
   const hasRestoredViewportRef = useRef(false);
   const lastSyncedLoadedAtRef = useRef<string | null>(null);
 
-  // Subscribe to ERD messages
   useEffect(() => {
     const unGraph = onMessage<ErdGraphMessage>("erdGraph", (payload) => {
       setGraph(payload.graph);
@@ -139,7 +119,6 @@ export function useErdViewState(): UseErdViewStateResult {
     };
   }, []);
 
-  // Persist state on changes
   useEffect(() => {
     const nextState: ErdViewState = {
       search,

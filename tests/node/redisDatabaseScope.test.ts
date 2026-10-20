@@ -25,8 +25,6 @@ vi.mock("redis", async (importOriginal) => {
   return {
     ...actual,
     createClient: vi.fn((options: Parameters<typeof createClient>[0]) => {
-      // Exercise the installed library's actual URI/option precedence without
-      // opening a socket. In-memory command replies are deliberately DB-aware.
       const effective = actual.createClient(options).options;
       const client = new FakeRedis(effective);
       harness.clients.push(client);
@@ -60,7 +58,6 @@ class FakeRedis {
   connect = vi.fn(async () => {
     this.isOpen = true;
     await this.opening?.();
-    // Deliberately model an uncancellable late socket open.
     this.isOpen = true;
     return this;
   });
@@ -397,7 +394,6 @@ describe("B09 Redis reserved default prefix", () => {
         await driver.readTablePage(page("db0", REDIS_UNPREFIXED_KEYS_TABLE))
       ).rows.map((row) => row.key),
     ).toEqual(["orphan"]);
-    // Old saved views that used `default` continue to mean all keys.
     expect(
       (await driver.readTablePage(page("db0", "default"))).totalCount,
     ).toBe(4);
@@ -558,7 +554,7 @@ describe("B02 Redis logical database isolation", () => {
     expect(chunks).toEqual([
       { key: "users:shared", value: "value-1", ttl: 11 },
     ]);
-    expect(harness.clients).toHaveLength(3); // editor base + two native clients
+    expect(harness.clients).toHaveLength(3);
     for (const client of harness.clients)
       expect(client.select).not.toHaveBeenCalled();
   });
@@ -774,7 +770,6 @@ describe("B02 Redis logical database isolation", () => {
       "Redis client cleanup error",
       expect.any(Error),
     );
-    // The failed cleanup remains tracked for a later disconnect retry.
     expect(harness.clients[1].isOpen).toBe(true);
     expect((driver as unknown as { clients: Set<unknown> }).clients.size).toBe(
       2,
@@ -1075,7 +1070,6 @@ describe("B06 Redis insert preview/execution parity", () => {
       expect(client.del).not.toHaveBeenCalled();
     }
 
-    // Replaying either preview must produce the same type, value and TTL.
     for (const preview of [sync, asyncPreview.join("\n")]) {
       store.delete(values.key);
       await driver.query(preview, [], { database: "db1" });

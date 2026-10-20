@@ -279,8 +279,6 @@ export function useQueryViewController({
           !payload.some((connection) => connection.id === currentConnectionId)
         ) {
           invalidateBookmark();
-          // A draft may contain writes for the removed database. Require an
-          // explicit choice before it can run against any other connection.
           handleConnectionChange("");
         }
         setConnectionsLoaded(true);
@@ -375,11 +373,7 @@ export function useQueryViewController({
   }, [editorState.shouldFormatOnOpen]);
 
   const executeQuery = useCallback(() => {
-    // Monaco shortcuts remain available while Run is disabled. Do not let a
-    // repeated submission (including blank validation) replace an active run.
     if (useQueryStore.getState().status === "running") return;
-    // Read live state so a shortcut in the same event as connection removal
-    // cannot use the previous render's connection or the initial fallback.
     const queryConnectionId = useConnectionStore.getState().activeConnectionId;
     if (!queryConnectionId) return;
     const queryText = editorRef.current?.getSelectionOrValue().trim() ?? "";

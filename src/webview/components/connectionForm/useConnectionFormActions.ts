@@ -1,6 +1,3 @@
-/**
- * Connection form action handlers — validation, test, save.
- */
 import { useCallback } from "react";
 import type { ConnectionFormExistingState } from "../../../shared/webviewContracts";
 import { postMessage } from "../../utils/messaging";
@@ -10,16 +7,12 @@ import type {
 } from "./useConnectionFormState";
 import { buildConnectionPayload } from "./useConnectionFormState";
 
-// ─── Validation ─────────────────────────────────────────────────────────────
-
 function validateRedisDatabase(database: string): string | null {
   if (database.trim().length > 0 && !/^\d+$/.test(database.trim())) {
     return "Redis database must be a non-negative integer.";
   }
   return null;
 }
-
-// ─── Actions Hook ───────────────────────────────────────────────────────────
 
 export interface ConnectionFormActions {
   handleTest: () => void;

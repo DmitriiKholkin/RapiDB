@@ -1,9 +1,3 @@
-/**
- * Test harness for the workflow tests. This file is imported by every
- * workflow test as the first import; it installs the vscode mock,
- * the Monaco editor mock, the react-virtual mock, and exposes a shared
- * state object that tests can use to capture panels and mock state.
- */
 import { vi } from "vitest";
 
 const { workflowState, vscodeMockFactory } = vi.hoisted(() => {

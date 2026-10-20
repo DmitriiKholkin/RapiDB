@@ -3568,7 +3568,6 @@ describe("ConnectionProvider", () => {
 
     const provider = new ConnectionProvider(connectionManager as never);
 
-    // Before toggle: folders + ungrouped
     const allRoots = await provider.getChildren();
     expect(allRoots.map((node) => node.label)).toEqual([
       "Team",
@@ -3576,10 +3575,8 @@ describe("ConnectionProvider", () => {
       "Gamma",
     ]);
 
-    // Activate connected-only mode
     provider.toggleConnectedOnly();
 
-    // After toggle: only connected, flat (no folders)
     const filteredRoots = await provider.getChildren();
     expect(filteredRoots.map((node) => node.label)).toEqual(["Alpha", "Gamma"]);
     expect(
@@ -3614,7 +3611,6 @@ describe("ConnectionProvider", () => {
 
     const provider = new ConnectionProvider(connectionManager as never);
 
-    // Activate then deactivate
     provider.toggleConnectedOnly();
     provider.toggleConnectedOnly();
 
@@ -3658,7 +3654,6 @@ describe("ConnectionProvider", () => {
     const initialRoots = await provider.getChildren();
     expect(initialRoots.map((node) => node.label)).toEqual(["Alpha"]);
 
-    // Simulate second connection becoming active
     connectedIds = new Set(["conn-a", "conn-b"]);
     connectEvents.fire();
     await vi.advanceTimersByTimeAsync(60);

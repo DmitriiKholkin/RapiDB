@@ -1,9 +1,5 @@
 import type { TransactionOperation } from "./types";
 
-/** Catalog visibility must be proven: an empty sys.triggers result without VIEW
- * DEFINITION is not evidence that the target has no triggers. USE is local to
- * this request's batch, so both permission checks and catalogs use the target DB.
- */
 export function mssqlInsertGuard(
   target: NonNullable<
     TransactionOperation["captureIdentity"]

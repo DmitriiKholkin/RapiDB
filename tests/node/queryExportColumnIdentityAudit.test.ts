@@ -81,7 +81,6 @@ describe("query export column identity", () => {
       expect(Object.keys(parsed)).toHaveLength(names.length);
       for (const [index, column] of columns.entries()) {
         expect(parsed[column.key]).toBe(index + 1);
-        // Generated labels must not steal the first occurrence of a literal name.
         if (names.indexOf(names[index]) === index) {
           expect(column.key).toBe(names[index]);
         }

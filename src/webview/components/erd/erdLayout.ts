@@ -1,42 +1,26 @@
-/**
- * ERD graph layout algorithm.
- *
- * Uses dagre for hierarchical layout within connected components,
- * then packs components into a grid to minimize canvas usage.
- */
 import dagre from "@dagrejs/dagre";
 import type { ErdGraph } from "../../../shared/webviewContracts";
 
-// ─── Constants ──────────────────────────────────────────────────────────────
-
 export const CARD_WIDTH = 320;
 
-/** Height of the table-card header (title bar). */
 const HEADER_HEIGHT = 60;
 
-/** Per-column row height inside a table card. */
 const COLUMN_ROW_HEIGHT = 20;
 
-/** Padding inside a card above/below the column list. */
-const CARD_VERTICAL_PADDING = 30; // 16 (top) + 14 (bottom)
+const CARD_VERTICAL_PADDING = 30;
 
-/** dagre intra-component spacing. */
 const DAGRE_NODESEP = 36;
 const DAGRE_RANKSEP = 52;
 const DAGRE_MARGIN = 24;
 
-/** Fallback node height when a height is missing from the map. */
 const FALLBACK_NODE_HEIGHT = 220;
 
-/** Component grid packing parameters. */
 const MIN_TARGET_ROW_WIDTH = 900;
 const ROW_WIDTH_GROWTH_FACTOR = 1.2;
 const COMPONENT_GAP_X = 56;
 const COMPONENT_GAP_Y = 56;
 const PACK_ORIGIN_X = 36;
 const PACK_ORIGIN_Y = 36;
-
-// ─── Node Height Calculation ────────────────────────────────────────────────
 
 export function computeNodeHeight(node: ErdGraph["nodes"][number]): number {
   return (
@@ -45,8 +29,6 @@ export function computeNodeHeight(node: ErdGraph["nodes"][number]): number {
     node.columns.length * COLUMN_ROW_HEIGHT
   );
 }
-
-// ─── Connected Components ───────────────────────────────────────────────────
 
 function findConnectedComponents(
   nodes: ErdGraph["nodes"],
@@ -89,8 +71,6 @@ function findConnectedComponents(
 
   return components;
 }
-
-// ─── Single Component Layout ────────────────────────────────────────────────
 
 interface PackedComponent {
   positions: Map<string, { x: number; y: number }>;
@@ -164,7 +144,6 @@ function layoutSingleComponent(
     maxY = Math.max(maxY, y + height);
   }
 
-  // Normalize to (0,0) origin
   const width = Math.max(1, maxX - minX);
   const height = Math.max(1, maxY - minY);
   const normalized = new Map<string, { x: number; y: number }>();
@@ -174,8 +153,6 @@ function layoutSingleComponent(
 
   return { positions: normalized, width, height, area: width * height };
 }
-
-// ─── Component Packing ──────────────────────────────────────────────────────
 
 function packComponents(
   packedComponents: PackedComponent[],
@@ -210,8 +187,6 @@ function packComponents(
 
   return positions;
 }
-
-// ─── Main Layout Function ───────────────────────────────────────────────────
 
 export function layoutGraph(
   nodes: ErdGraph["nodes"],

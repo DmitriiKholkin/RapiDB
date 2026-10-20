@@ -9,7 +9,6 @@ import {
 import { TableReadService } from "../../src/extension/table/tableReadService";
 import { deferred } from "./elasticsearchPitMock";
 
-/** Real SDK/HTTP requests, without a live Elasticsearch installation. */
 export async function createElasticsearchHttpFixture(options?: {
   denySettings?: boolean;
   stallSearch?: boolean;

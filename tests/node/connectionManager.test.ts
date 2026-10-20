@@ -897,8 +897,6 @@ describe("ConnectionManager", () => {
     await Promise.all([first.promise, second.promise]);
     expect(manager.isConnected("conn-1")).toBe(true);
     expect(onDisconnect).not.toHaveBeenCalled();
-    // Internal stale-driver replacement must not masquerade as this final
-    // event: connection-scoped panels should close only for the latter.
     await manager.disconnectFrom("conn-1");
     expect(onDisconnect).toHaveBeenCalledExactlyOnceWith("conn-1");
   });
@@ -930,8 +928,6 @@ describe("ConnectionManager", () => {
     const cleanup = createDeferred<void>();
     driverBehaviors.set("conn-1", {
       disconnectImpl: () => {
-        // Real drivers can become disconnected before async pool/worker cleanup
-        // finishes, while the manager has not emitted onDidDisconnect yet.
         vi.spyOn(driver, "isConnected").mockReturnValue(false);
         return cleanup.promise;
       },
@@ -964,7 +960,6 @@ describe("ConnectionManager", () => {
     expect(onDisconnect).toHaveBeenCalledExactlyOnceWith("conn-1");
     expect(manager.getDriver("conn-1")).toBeUndefined();
 
-    // The guard covers cleanup only; a deliberate subsequent Connect is valid.
     driverBehaviors.delete("conn-1");
     await manager.connectTo("conn-1", "explicit");
     expect(manager.isConnected("conn-1")).toBe(true);
@@ -1047,8 +1042,6 @@ describe("ConnectionManager", () => {
     vi.spyOn(oldDriver, "isConnected").mockReturnValue(false);
     const firstCleanup = createDeferred<void>();
     const newConnect = createDeferred<void>();
-    // The first transport teardown waits. The second has already detached its
-    // pool/client and returns immediately, just like Mongo/MSSQL disconnect.
     const cleanup = vi
       .fn()
       .mockImplementationOnce(() => firstCleanup.promise)
@@ -1087,8 +1080,6 @@ describe("ConnectionManager", () => {
     const pending = state._connectingMap.get(id);
     const controller = state._connectAbortControllerMap.get(id);
     try {
-      // Crucially, do NOT release both cleanups together. A fresh session (or
-      // its attempt) exists before the first cleanup returns or hits its budget.
       if (ending === "settles") firstCleanup.resolve();
       await oldAttempt;
       expect(state._schemaCacheMap.get(id)).toBe(cache);
@@ -1284,8 +1275,6 @@ describe("ConnectionManager", () => {
       await reconnect;
       expect(onDisconnect).not.toHaveBeenCalled();
       expect(onInvalidation.mock.calls).toEqual([[id], [id]]);
-      // No newer ERD request exists yet. Only the lifecycle invalidation (not
-      // request supersession) can fence these old columns/snapshot results.
       columns.resolve(oldColumns);
       pendingSnapshot.resolve(snapshot);
       await staleAssertion;
@@ -2428,8 +2417,6 @@ describe("ConnectionManager", () => {
       code: "EKEYCHAIN",
     });
     const hydrate = manager._hydratePassword.bind(manager);
-    // Keep the real migration and hydration. Arm only the read immediately
-    // inside hydration, so background/checked migration reads cannot consume it.
     const hydration = vi
       .spyOn(manager, "_hydratePassword")
       .mockImplementation((liveConfig) => {
@@ -6153,7 +6140,6 @@ describe("ConnectionManager", () => {
       expect(
         manager.getTableDetailState(request).snapshot.columns.items[0]?.name,
       ).toBe("id");
-      // One description for discovery and one for details; no second demand.
       expect(
         driverInstances[0]?.describeTableCalls.filter(
           (name) => name === "archive.audit.users",
@@ -6261,8 +6247,6 @@ describe("ConnectionManager", () => {
       manager.ensureSchemaSnapshotLoading("conn-1");
       await databaseLoadStarted.promise;
 
-      // The database load is held before it starts loading schema fragments.
-      // Load the same schema directly, then load table details in this generation.
       manager.ensureSchemaScopeLoading("conn-1", {
         kind: "schema",
         database: "app_db",
@@ -6292,9 +6276,6 @@ describe("ConnectionManager", () => {
       databaseSchemas.resolve([{ name: "public" }]);
       await manager.getSchemaSnapshotAsync("conn-1");
 
-      // The database-scope upsert replaces this schema fragment without
-      // advancing the connection generation. It must evict both cached and
-      // in-flight per-table metadata for just this schema.
       expect(manager.getTableDetailState(usersRequest).status).toBe("idle");
       expect(manager.getTableDetailState(auditRequest).status).toBe("idle");
 

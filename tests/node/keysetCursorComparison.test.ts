@@ -270,7 +270,6 @@ describe("TableReadService cursor integration", () => {
       null,
       [{ column: "bucket", operator: "eq", value: "1" }],
     )) {
-      /* exhaust */
     }
     expect(hook.mock.calls).toEqual([
       [meta[1], "gt", amount, 2],

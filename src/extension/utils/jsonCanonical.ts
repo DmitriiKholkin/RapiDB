@@ -1,17 +1,3 @@
-/**
- * Token-preserving JSON helpers.
- *
- * JavaScript's built-in `JSON.parse` collapses every JSON number to a
- * JS `Number`, which silently drops trailing zeros (e.g. `13000.0`
- * becomes `13000`). To round-trip a JSON document without losing that
- * information, we need to keep the original numeric token text.
- *
- * The two helpers below are intentionally narrow: they accept arbitrary
- * JSON text, produce a structural value where every numeric token is
- * kept verbatim, and serialize the structure back to JSON text in a stable
- * key order. A private symbol distinguishes numeric tokens from user objects.
- */
-
 const RAW_NUMERIC_TOKEN_RE = /^-?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/;
 
 const JSON_STRING_RE = /"(?:\\.|[^"\\])*"/y;
@@ -289,12 +275,6 @@ function canonicalJsonNumberToken(token: string): string | null {
   return `${match[1]}${digits}e${exponent.toString()}`;
 }
 
-/**
- * Canonicalizes JSON for value comparison: object key order and insignificant
- * number spelling differences are ignored, while numeric precision is kept
- * exact. Oracle native JSON uses OSON and JSON_SERIALIZE can normalize 1.0,
- * 1e0, and -0 to 1, 1, and 0 respectively.
- */
 export function canonicalizeJsonNumericValues(
   text: string,
   options: { requireUniqueKeys?: boolean } = {},

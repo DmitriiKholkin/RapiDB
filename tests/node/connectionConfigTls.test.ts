@@ -79,10 +79,6 @@ describe("normalizeConnectionTlsConfig", () => {
 
 describe("ConnectionConfig type constraints", () => {
   it("ConnectionConfig should not have ssl or rejectUnauthorized fields", () => {
-    // This test ensures the type was cleaned up.
-    // If someone adds `ssl` or `rejectUnauthorized` back to ConnectionConfig,
-    // this test will still pass at runtime but the TypeScript compiler will
-    // catch it at build time (the field won't exist on the type).
     const config: ConnectionConfig = {
       id: "test",
       name: "Test",

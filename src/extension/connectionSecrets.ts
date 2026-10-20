@@ -283,7 +283,6 @@ export function sanitizePersistedConnectionConfig(
   });
 }
 
-/** Outward-facing metadata is secret-free even when persistence opts out. */
 export function sanitizeConnectionConfigForResponse(
   config: ConnectionConfig,
 ): ConnectionConfig {

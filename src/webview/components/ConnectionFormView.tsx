@@ -1753,7 +1753,6 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
         </Card>
       )}
 
-      {/* Oracle advanced options */}
       {isOracle && (
         <Card>
           <CardHeader icon="settings-gear" label="Oracle Options" />

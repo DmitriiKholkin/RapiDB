@@ -1,8 +1,5 @@
 services:
 
-  # ─────────────────────────────────────────────
-  # SSH Bastion
-  # ─────────────────────────────────────────────
 
   ssh-bastion:
     build:
@@ -11,9 +8,6 @@ services:
     ports:
       - "2222:22"
 
-  # ─────────────────────────────────────────────
-  # PostgreSQL 15
-  # ─────────────────────────────────────────────
 
   postgres:
     image: postgres:15-alpine
@@ -821,9 +815,6 @@ services:
         SELECT 'PostgreSQL seed complete: '||count(*)||' rows in pg_master' FROM pg_master;
         EOSQL
 
-  # ─────────────────────────────────────────────
-  # MySQL 8.0
-  # ─────────────────────────────────────────────
 
   mysql:
     image: mysql:8.0
@@ -1269,9 +1260,6 @@ services:
         SELECT CONCAT('MySQL seed complete: ',COUNT(*),' rows in mysql_master') FROM mysql_master;
         EOSQL
 
-  # ─────────────────────────────────────────────
-  # MSSQL (Azure SQL Edge)
-  # ─────────────────────────────────────────────
 
   mssql:
     image: mcr.microsoft.com/azure-sql-edge:latest
@@ -1812,9 +1800,6 @@ services:
         GO
         EOSQL
 
-  # ─────────────────────────────────────────────
-  # Oracle Free
-  # ─────────────────────────────────────────────
 
   oracle:
     image: gvenzl/oracle-free:latest
@@ -2076,9 +2061,6 @@ services:
         EXIT
         EOSQL
 
-  # ─────────────────────────────────────────────
-  # MongoDB 7
-  # ─────────────────────────────────────────────
 
   mongo:
     image: mongo:7
@@ -2106,14 +2088,12 @@ services:
     command:
       - --eval
       - |
-        // ── Create user ───────────────────────────────────────────
         db.getSiblingDB("rapidb_mongo_db").createUser({
           user: "mongo_user", pwd: "mongo_pass123",
           roles: [{ role: "readWrite", db: "rapidb_mongo_db" }]
         });
         const mdb = db.getSiblingDB("rapidb_mongo_db");
 
-        // ── users collection — rich nested docs ───────────────────
         const users = [];
         const cities = ["Berlin","Amsterdam","Paris","London","Moscow","Tokyo","New York","Sydney","Dubai","Singapore"];
         const countries = ["DE","NL","FR","GB","RU","JP","US","AU","AE","SG"];
@@ -2161,7 +2141,6 @@ services:
               ipAddress: "192.168." + (i%256) + "." + ((i*7)%256),
               userAgent: ["Chrome/120","Firefox/121","Safari/17","Edge/120"][i%4]
             },
-            // BSON type variety
             profilePic: new BinData(0, "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="),
             rating: new NumberDecimal((3.0+Math.random()*2).toFixed(2)),
             luckyNumber: new NumberLong(i * 1000000),
@@ -2180,7 +2159,6 @@ services:
         mdb.users.createIndex({ name: "text", "address.city": "text" });
         mdb.users.createIndex({ plan: 1, "stats.loginCount": -1 });
 
-        // ── products collection — e-commerce catalog ───────────────
         const categories = ["Electronics","Clothing","Books","Home","Sports","Toys","Food","Beauty","Garden","Tools"];
         const products = [];
         for (let i = 1; i <= 100; i++) {
@@ -2230,7 +2208,6 @@ services:
         mdb.products.createIndex({ name: "text", "seo.description": "text" });
         mdb.products.createIndex({ rating: -1, reviewCount: -1 });
 
-        // ── orders collection — transactions with all BSON types ───
         const orders = [];
         for (let i = 1; i <= 150; i++) {
           const uid = "user-" + String((i%200)+1).padStart(4,"0");
@@ -2286,7 +2263,6 @@ services:
         mdb.orders.createIndex({ status: 1, paymentStatus: 1 });
         mdb.orders.createIndex({ total: -1 });
 
-        // ── events collection — time-series / analytics ────────────
         const events = [];
         const eventTypes = ["page_view","click","purchase","signup","logout","search","add_to_cart","remove_from_cart","checkout","refund"];
         for (let i = 1; i <= 500; i++) {
@@ -2312,7 +2288,6 @@ services:
         mdb.events.createIndex({ sessionId: 1 });
         mdb.events.createIndex({ timestamp: -1 }, { expireAfterSeconds: 7776000 });
 
-        // ── bson_types collection — every BSON type ────────────────
         mdb.bson_types.insertOne({
           _id: new ObjectId(),
           label: "All BSON types showcase",
@@ -2343,7 +2318,6 @@ services:
           t_unicode_keys: { "ключ1":"значение1", "键":"值", "مفتاح":"قيمة" }
         });
 
-        // ── logs collection — mixed schema (schemaless) ────────────
         const logLevels = ["DEBUG","INFO","WARN","ERROR","FATAL"];
         const services = ["auth","api","payment","notification","search","cache","db","cdn"];
         const logDocs = [];
@@ -2378,7 +2352,6 @@ services:
         mdb.logs.createIndex({ traceId: 1 });
         mdb.logs.createIndex({ timestamp: -1 }, { expireAfterSeconds: 2592000 });
 
-        // ── inventory collection — geospatial + arrays ─────────────
         const warehouses = [];
         const whCities = [["New York",-74.006,40.7128],["Berlin",13.405,52.52],["Tokyo",139.6917,35.6895],["London",-0.1276,51.5074],["Sydney",151.2093,-33.8688]];
         for (let i = 0; i < 5; i++) {
@@ -2401,7 +2374,6 @@ services:
         mdb.inventory.createIndex({ location: "2dsphere" });
         mdb.inventory.createIndex({ warehouseId: 1 }, { unique: true });
 
-        // ── MongoDB views — read-only projections of seeded data ───
         try { mdb.runCommand({ drop: "view_active_users" }); } catch (e) {}
         try { mdb.runCommand({ drop: "view_top_products" }); } catch (e) {}
 
@@ -2425,9 +2397,6 @@ services:
 
         print("MongoDB seed complete. Collections: users="+mdb.users.countDocuments()+", products="+mdb.products.countDocuments()+", orders="+mdb.orders.countDocuments()+", events="+mdb.events.countDocuments()+", bson_types="+mdb.bson_types.countDocuments()+", logs="+mdb.logs.countDocuments()+", inventory="+mdb.inventory.countDocuments()+", views="+[mdb.view_active_users.countDocuments(), mdb.view_top_products.countDocuments()].join(", ")); 
 
-  # ─────────────────────────────────────────────
-  # Redis 7
-  # ─────────────────────────────────────────────
 
   redis:
     image: redis:7-alpine
@@ -2457,7 +2426,6 @@ services:
         C="redis-cli -h redis -a redis_pass123 --no-auth-warning"
         LONG_A="$$(printf '%01000d' 0 | tr '0' 'A')"
 
-        # ── STRING — all value types ──────────────────────────────
         $$C SET "str:plain"            "Hello, World!"
         $$C SET "str:integer"          "42"
         $$C SET "str:float"            "3.14159265"
@@ -2478,7 +2446,6 @@ services:
         $$C INCRBYFLOAT "str:float_counter" 1.5
         $$C INCRBYFLOAT "str:float_counter" 1.5
 
-        # String with TTL
         $$C SET  "str:session:abc123" '{"userId":"user-0001","role":"admin","loginAt":"2024-07-04T12:00:00Z"}'
         $$C EXPIRE "str:session:abc123" 3600
         $$C SET  "str:session:def456" '{"userId":"user-0002","role":"editor","loginAt":"2024-07-04T11:00:00Z"}'
@@ -2486,7 +2453,6 @@ services:
         $$C SET  "str:cache:product:SKU-00001" '{"sku":"SKU-00001","name":"Electronics Item 1","price":15.49,"stock":10}'
         $$C EXPIRE "str:cache:product:SKU-00001" 300
 
-        # ── HASH — user profiles ──────────────────────────────────
         for i in 1 2 3 4 5 6 7 8 9 10; do
           name=$$(echo "Alice Bob Carol Dave Eve Frank Grace Hank Ivy Jack" | cut -d' ' -f$$i)
           balance_cents=$$((i*123456))
@@ -2510,7 +2476,6 @@ services:
             is_verified "$$([ $$((i%3)) -ne 0 ] && echo true || echo false)"
         done
 
-        # Product hashes
         for i in 1 2 3 4 5; do
           price_cents=$$((i*999))
           price="$$(printf '%d.%02d' $$((price_cents/100)) $$((price_cents%100)))"
@@ -2525,7 +2490,6 @@ services:
             reviews   "$$((i*25))"
         done
 
-        # Config hash
         $$C HSET "hash:config:app" \
           theme        dark \
           language     en \
@@ -2538,51 +2502,37 @@ services:
           log_level    INFO \
           api_url      "https://api.example.com/v2"
 
-        # ── LIST — queues and logs ────────────────────────────────
-        # Task queue
         for i in 1 2 3 4 5 6 7 8 9 10; do
           $$C RPUSH "list:queue:tasks" "{\"id\":\"task-$$i\",\"type\":\"$$(echo 'email sms push webhook batch report export import notify audit' | cut -d' ' -f$$i)\",\"priority\":$$((11-i)),\"payload\":{\"userId\":\"user-$$(printf '%04d' $$i)\"},\"createdAt\":\"2024-07-04T$$(printf '%02d' $$i):00:00Z\"}"
         done
 
-        # Priority queue (simulate with separate lists)
         $$C RPUSH "list:queue:high"   '{"id":"high-1","type":"payment","amount":999.99}' '{"id":"high-2","type":"alert","message":"System critical"}'
         $$C RPUSH "list:queue:medium" '{"id":"med-1","type":"email","to":"user@example.com"}' '{"id":"med-2","type":"sms","to":"+1555000001"}'
         $$C RPUSH "list:queue:low"    '{"id":"low-1","type":"report","name":"weekly"}' '{"id":"low-2","type":"export","format":"csv"}'
 
-        # Recent activity log (capped with LTRIM)
         for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
           $$C LPUSH "list:activity:recent" "{\"id\":\"act-$$i\",\"user\":\"user-$$(printf '%04d' $$i)\",\"action\":\"$$(echo 'login logout view_product add_to_cart purchase search update_profile delete_account download upload' | cut -d' ' -f$$((i%10+1)))\",\"ts\":\"2024-07-04T$$(printf '%02d' $$((i%24))):00:00Z\"}"
         done
-        $$C LTRIM "list:activity:recent" 0 9   # keep only last 10
+        $$C LTRIM "list:activity:recent" 0 9
 
-        # Browser history style list
         $$C RPUSH "list:history:user-0001" "/home" "/products" "/products/SKU-00001" "/cart" "/checkout" "/order/ORD-2024-000001"
 
-        # ── SET — unique collections ──────────────────────────────
-        # Online users
         $$C SADD "set:online_users" "user-0001" "user-0003" "user-0007" "user-0012" "user-0025" "user-0050" "user-0099" "user-0150" "user-0178" "user-0200"
-        # Blocked IPs
         $$C SADD "set:blocked_ips" "192.168.1.100" "10.0.0.50" "172.16.0.1" "1.2.3.4" "255.255.255.0"
-        # Feature flags (enabled features)
         $$C SADD "set:features:enabled"  "dark_mode" "notifications" "beta_editor" "api_v2" "new_checkout"
         $$C SADD "set:features:disabled" "ai_assistant" "crypto_payment" "video_call"
-        # Tags
         $$C SADD "set:tags:popular"  "electronics" "sale" "new" "trending" "premium"
         $$C SADD "set:tags:category" "electronics" "clothing" "books" "home" "sports" "toys" "food" "beauty" "garden" "tools"
-        # Set operations demo
         $$C SADD "set:group:admin"   "user-0001" "user-0006"
         $$C SADD "set:group:premium" "user-0001" "user-0003" "user-0006" "user-0012"
         $$C SADD "set:group:verified" "user-0001" "user-0002" "user-0003" "user-0006" "user-0007" "user-0012"
 
-        # ── SORTED SET — leaderboards & priorities ────────────────
-        # Game leaderboard
         $$C ZADD "zset:leaderboard:global" \
           15000 "user-0001" 12500 "user-0006" 11000 "user-0003" \
           9500  "user-0012" 8750  "user-0025" 7200  "user-0050" \
           6100  "user-0099" 5400  "user-0150" 4300  "user-0178" \
           3100  "user-0200"
 
-        # Time-based sorted set (Unix timestamp as score)
         $$C ZADD "zset:events:timeline" \
           1720000000 "evt:login:user-0001" \
           1720003600 "evt:purchase:user-0003" \
@@ -2592,22 +2542,18 @@ services:
           1720018000 "evt:search:user-0025" \
           1720021600 "evt:cart:user-0099"
 
-        # Rate limiting (requests per minute)
         $$C ZADD "zset:ratelimit:api:user-0001" \
           1720000001 "req-001" 1720000005 "req-002" 1720000010 "req-003" \
           1720000015 "req-004" 1720000020 "req-005"
 
-        # Priority queue (score = priority)
         $$C ZADD "zset:queue:priority" \
           100 "task:critical:001" 90 "task:high:002" 80 "task:high:003" \
           50  "task:medium:004" 50 "task:medium:005" 10 "task:low:006"
 
-        # Geographic distance sorted set (score = distance from origin in km)
         $$C ZADD "zset:stores:nearby" \
           0.5 "store:001:downtown" 1.2 "store:002:midtown" 2.8 "store:003:uptown" \
           5.1 "store:004:suburb" 12.4 "store:005:outskirts"
 
-        # ── STREAM — event streaming ──────────────────────────────
         for i in 1 2 3 4 5 6 7 8 9 10; do
           etype=$$(echo "user.login user.logout product.view order.created order.paid order.shipped order.delivered cart.add cart.remove search.query" | cut -d' ' -f$$i)
           $$C XADD "stream:events" "*" \
@@ -2618,11 +2564,9 @@ services:
             version "1" \
             source  "$$(echo 'web mobile api' | cut -d' ' -f$$((i%3+1)))"
         done
-        # Create consumer group
         $$C XGROUP CREATE "stream:events" "processors" "$$" MKSTREAM 2>/dev/null || true
         $$C XGROUP CREATE "stream:events" "analytics"  "0" 2>/dev/null || true
 
-        # Order events stream
         for i in 1 2 3 4 5; do
           $$C XADD "stream:orders" "*" \
             orderId "ORD-2024-$$(printf '%06d' $$i)" \
@@ -2631,8 +2575,6 @@ services:
             userId  "user-$$(printf '%04d' $$i)"
         done
 
-        # ── BITMAP ───────────────────────────────────────────────
-        # User activity bitmap: bit position = userId, 1 = active today
         $$C SETBIT "bitmap:active:2024-07-04" 1  1
         $$C SETBIT "bitmap:active:2024-07-04" 3  1
         $$C SETBIT "bitmap:active:2024-07-04" 7  1
@@ -2640,7 +2582,6 @@ services:
         $$C SETBIT "bitmap:active:2024-07-04" 25 1
         $$C SETBIT "bitmap:active:2024-07-04" 50 1
         $$C SETBIT "bitmap:active:2024-07-04" 99 1
-        # Feature flags bitmap
         $$C SETBIT "bitmap:feature:dark_mode"    1 1
         $$C SETBIT "bitmap:feature:dark_mode"    3 1
         $$C SETBIT "bitmap:feature:dark_mode"    7 1
@@ -2648,12 +2589,10 @@ services:
         $$C SETBIT "bitmap:feature:notifications" 3 1
         $$C SETBIT "bitmap:feature:notifications" 12 1
 
-        # ── HYPERLOGLOG — cardinality estimation ──────────────────
         $$C PFADD "hll:unique_visitors:2024-07-04" "user-0001" "user-0002" "user-0003" "user-0004" "user-0005" "anon-abc" "anon-def" "anon-xyz" "bot-001" "crawler-goog"
         $$C PFADD "hll:unique_ips:2024-07-04"      "192.168.1.1" "10.0.0.1" "172.16.0.1" "8.8.8.8" "1.1.1.1"
         $$C PFADD "hll:unique_visitors:2024-07-03" "user-0001" "user-0010" "user-0020" "anon-111" "anon-222"
 
-        # ── GEO — geospatial ──────────────────────────────────────
         $$C GEOADD "geo:stores" \
           -73.9857  40.7484  "store:NYC" \
           13.4050   52.5200  "store:BER" \
@@ -2672,14 +2611,10 @@ services:
           -0.128   51.507  "wh:LN" \
           151.209 -33.869  "wh:SY"
 
-        # ── Summary info ─────────────────────────────────────────
         echo "Redis seed complete."
         $$C INFO keyspace
         echo "Redis key count: $$($$C DBSIZE)"
 
-  # ─────────────────────────────────────────────
-  # Elasticsearch 8.13
-  # ─────────────────────────────────────────────
 
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
@@ -2690,10 +2625,6 @@ services:
       - xpack.security.http.ssl.enabled=false
       - xpack.security.transport.ssl.enabled=false
       - ES_JAVA_OPTS=-Xms512m -Xmx512m
-      # Raised watermarks for ephemeral test containers — the Docker VM
-      # often has limited free disk, and the default 85%/90% thresholds
-      # cause shard allocation to fail (cluster stays RED).
-      # DO NOT copy these values to production Elasticsearch configurations.
       - cluster.routing.allocation.disk.watermark.low=95%
       - cluster.routing.allocation.disk.watermark.high=97%
       - cluster.routing.allocation.disk.watermark.flood_stage=99%
@@ -2719,7 +2650,6 @@ services:
         B="http://elasticsearch:9200"
         H="-H Content-Type:application/json"
 
-        # ── users index — full mapping with all field types ────────
         curl -sf -X PUT "$$B/users" $$H -d '{
           "settings": { "number_of_shards":1,"number_of_replicas":0,"analysis":{"analyzer":{"email_analyzer":{"type":"custom","tokenizer":"uax_url_email","filter":["lowercase"]},"autocomplete":{"type":"custom","tokenizer":"standard","filter":["lowercase","autocomplete_filter"]}}},"analysis":{"filter":{"autocomplete_filter":{"type":"edge_ngram","min_gram":2,"max_gram":20}}} },
           "mappings": { "properties": {
@@ -2744,7 +2674,6 @@ services:
           }}
         }' && echo "users index created"
 
-        # Bulk index users
         curl -sf -X POST "$$B/users/_bulk" $$H -d '
         {"index":{"_id":"user-0001"}}
         {"userId":"user-0001","name":"Alice Smith","email":"alice@example.com","age":30,"birthDate":"1994-03-15","score":9500,"balance":15234.56,"role":"admin","status":"active","plan":"enterprise","tags":["admin","beta","premium"],"isVerified":true,"address":{"city":"Berlin","country":"DE","zip":"10115","street":"1 Main St","location":{"lat":52.52,"lon":13.405}},"preferences":{"language":"en","timezone":"Europe/Berlin","theme":"dark"},"stats":{"loginCount":450,"lastLogin":"2024-07-04T10:00:00Z","sessionDuration":3600,"pageViews":22500,"purchases":50},"bio":"Senior administrator managing platform operations and user experience.","joinedAt":"2020-01-15T00:00:00Z","updatedAt":"2024-07-04T00:00:00Z"}
@@ -2758,7 +2687,6 @@ services:
         {"userId":"user-0005","name":"Eve Wilson","email":"eve@example.com","age":28,"birthDate":"1996-02-14","score":5500,"balance":6300.75,"role":"moderator","status":"active","plan":"pro","tags":["moderator","premium","verified"],"isVerified":true,"address":{"city":"Moscow","country":"RU","zip":"101000","street":"5 Maple Blvd","location":{"lat":55.7558,"lon":37.6173}},"preferences":{"language":"ru","timezone":"Europe/Moscow","theme":"dark"},"stats":{"loginCount":190,"lastLogin":"2024-07-04T12:00:00Z","sessionDuration":5400,"pageViews":9500,"purchases":18},"bio":"Сообщество-менеджер и модератор контента на платформе.","joinedAt":"2021-11-15T00:00:00Z","updatedAt":"2024-07-04T00:00:00Z"}
         ' && echo "users bulk indexed"
 
-        # ── products index — e-commerce ────────────────────────────
         curl -sf -X PUT "$$B/products" $$H -d '{
           "settings":{"number_of_shards":1,"number_of_replicas":0},
           "mappings":{"properties":{
@@ -2797,7 +2725,6 @@ services:
         {"sku":"SKU-00005","name":"Yoga Mat Premium","description":"6mm thick non-slip yoga mat with alignment lines. Eco-friendly TPE material. Comes with carry strap.","category":"Sports","brand":"BrandE","price":39.99,"compareAtPrice":54.99,"stock":300,"active":true,"featured":false,"rating":4.5,"reviewCount":620,"tags":["sports","yoga","fitness","eco","new"],"attributes":{"color":"purple","size":"183x61cm","weight":1.0,"material":"tpe"},"location":{"lat":48.8566,"lon":2.3522},"priceRange":{"gte":30,"lte":60},"saleWindow":{"gte":"2024-07-15","lte":"2024-08-15"},"metadata":{"createdAt":"2024-05-01T00:00:00Z","updatedAt":"2024-07-04T00:00:00Z","views":28000,"sales":1800},"embedding":[0.6,0.4,0.5,0.9]}
         ' && echo "products bulk indexed"
 
-        # ── logs index — all ES field types ───────────────────────
         curl -sf -X PUT "$$B/app_logs" $$H -d '{
           "settings":{"number_of_shards":1,"number_of_replicas":0},
           "mappings":{"properties":{
@@ -2837,7 +2764,6 @@ services:
         {"timestamp":"2024-07-04T12:05:00Z","level":"INFO","service":"notification","message":"Email batch sent: 500 emails delivered in 12.3s","traceId":"trace-006","spanId":"span-006","duration_ms":12300,"status_code":200,"request_size":102400,"response_size":1024,"success":true,"tags":["notification","email","batch"],"host":"server-5.example.com","ip":"192.168.2.1","geo":{"lat":55.7558,"lon":37.6173}}
         ' && echo "app_logs bulk indexed"
 
-        # ── metrics index — numeric/time-series all types ──────────
         curl -sf -X PUT "$$B/metrics" $$H -d '{
           "settings":{"number_of_shards":1,"number_of_replicas":0},
           "mappings":{"properties":{
@@ -2871,7 +2797,6 @@ services:
         {"timestamp":"2024-07-04T12:00:00Z","service":"cache","host":"server-3","metric":"hit_rate","value_int":95,"value_long":9500,"value_float":0.9512,"value_double":0.951234567890,"value_half":0.95,"value_byte":95,"value_short":951,"value_unsigned":9512,"value_scaled":0.95,"tags":["cache","redis","performance"]}
         ' && echo "metrics bulk indexed"
 
-        # ── geo_index — all geo types ──────────────────────────────
         curl -sf -X PUT "$$B/geo_locations" $$H -d '{
           "settings":{"number_of_shards":1,"number_of_replicas":0},
           "mappings":{"properties":{
@@ -2895,14 +2820,10 @@ services:
         {"name":"Route 66 segment","type":"road","point":{"lat":35.4676,"lon":-97.5164},"shape":{"type":"LineString","coordinates":[[-87.63,41.85],[-93.09,44.97],[-104.98,39.74],[-112.07,33.45]]},"distance_km":3940,"tags":["road","landmark","historic","us"]}
         ' && echo "geo_locations bulk indexed"
 
-        # ── Flush and verify ───────────────────────────────────────
         curl -sf -X POST "$$B/_all/_refresh" > /dev/null
         echo "Elasticsearch seed complete:"
         curl -sf "$$B/_cat/indices?v"
 
-  # ─────────────────────────────────────────────
-  # DynamoDB Local
-  # ─────────────────────────────────────────────
 
   dynamodb:
     image: amazon/dynamodb-local:2.5.4
@@ -2976,7 +2897,6 @@ services:
           delete_table_if_exists "$$table"
         done
 
-        # ── Users table — hash key + GSI on email ─────────────────
         ddb create-table \
           --table-name Users \
           --attribute-definitions \
@@ -2992,7 +2912,6 @@ services:
           --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5
         wait_for_table Users
 
-        # ── Products table — hash + sort key + LSI + GSI ──────────
         ddb create-table \
           --table-name Products \
           --attribute-definitions \
@@ -3013,7 +2932,6 @@ services:
           --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5
         wait_for_table Products
 
-        # ── Orders table — hash + sort key (composite) ─────────────
         ddb create-table \
           --table-name Orders \
           --attribute-definitions \
@@ -3030,7 +2948,6 @@ services:
           --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5
         wait_for_table Orders
 
-        # ── Sessions table — with TTL ──────────────────────────────
         ddb create-table \
           --table-name Sessions \
           --attribute-definitions AttributeName=sessionId,AttributeType=S \
@@ -3041,7 +2958,6 @@ services:
           --table-name Sessions \
           --time-to-live-specification Enabled=true,AttributeName=expiresAt
 
-        # ── ConfigStore table — key/value store pattern ────────────
         ddb create-table \
           --table-name ConfigStore \
           --attribute-definitions \
@@ -3053,7 +2969,6 @@ services:
           --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5
         wait_for_table ConfigStore
 
-        # ── Seed Users — all DynamoDB attribute types ──────────────
         ddb put-item --table-name Users --item \
           '{"userId":{"S":"user-0001"},"email":{"S":"alice@example.com"},"name":{"S":"Alice Smith"},"age":{"N":"30"},"score":{"N":"9500"},"balance":{"N":"15234.56"},"role":{"S":"admin"},"status":{"S":"active"},"plan":{"S":"enterprise"},"isVerified":{"BOOL":true},"tags":{"L":[{"S":"admin"},{"S":"beta"},{"S":"premium"}]},"address":{"M":{"city":{"S":"Berlin"},"country":{"S":"DE"},"zip":{"S":"10115"},"lat":{"N":"52.52"},"lon":{"N":"13.405"}}},"preferences":{"M":{"language":{"S":"en"},"theme":{"S":"dark"},"timezone":{"S":"Europe/Berlin"}}},"stats":{"M":{"loginCount":{"N":"450"},"pageViews":{"N":"22500"},"purchases":{"N":"50"}}},"rawData":{"B":"AQIDBAUGB/8="},"nullField":{"NULL":true},"joinedAt":{"S":"2020-01-15T00:00:00Z"},"updatedAt":{"S":"2024-07-04T00:00:00Z"}}'
 
@@ -3069,11 +2984,9 @@ services:
         ddb put-item --table-name Users --item \
           '{"userId":{"S":"user-0005"},"email":{"S":"eve@example.com"},"name":{"S":"Eve Wilson"},"age":{"N":"28"},"score":{"N":"5500"},"balance":{"N":"6300.75"},"role":{"S":"moderator"},"status":{"S":"active"},"plan":{"S":"pro"},"isVerified":{"BOOL":true},"tags":{"L":[{"S":"moderator"},{"S":"premium"}]},"address":{"M":{"city":{"S":"Moscow"},"country":{"S":"RU"},"lat":{"N":"55.7558"},"lon":{"N":"37.6173"}}},"nestedDeep":{"M":{"level1":{"M":{"level2":{"M":{"level3":{"S":"deep value"},"num":{"N":"42"}}}}}}},"joinedAt":{"S":"2021-11-15T00:00:00Z"}}'
 
-        # Number set, String set, Binary set items
         ddb put-item --table-name Users --item \
           '{"userId":{"S":"user-0006"},"email":{"S":"frank@example.com"},"name":{"S":"Frank Davis"},"age":{"N":"38"},"score":{"N":"4400"},"role":{"S":"admin"},"status":{"S":"active"},"plan":{"S":"enterprise"},"isVerified":{"BOOL":true},"numberSet":{"NS":["1","2","3","4","5"]},"stringSet":{"SS":["tag1","tag2","tag3","premium","featured"]},"binarySet":{"BS":["AQID","BAUG"]}}'
 
-        # ── Seed Products ─────────────────────────────────────────
         for i in 1 2 3 4 5; do
           cat=$$(echo "Electronics Clothing Books Home Sports" | cut -d' ' -f$$i)
           price_cents=$$((i*999 + 999))
@@ -3086,11 +2999,9 @@ services:
             "{\"category\":{\"S\":\"$$cat\"},\"sku\":{\"S\":\"SKU-$$(printf '%05d' $$i)\"},\"name\":{\"S\":\"$$cat Item $$i\"},\"price\":{\"N\":\"$$price\"},\"stock\":{\"N\":\"$$(($$i*50))\"},\"active\":{\"BOOL\":true},\"rating\":{\"N\":\"$$rating\"},\"reviewCount\":{\"N\":\"$$((i*25))\"},\"tags\":{\"L\":[{\"S\":\"$$(printf '%s' "$$cat" | tr '[:upper:]' '[:lower:]')\"},{\"S\":\"item\"}]},\"attributes\":{\"M\":{\"weight\":{\"N\":\"$$weight\"},\"color\":{\"S\":\"$$(echo 'red blue green black white' | cut -d' ' -f$$i)\"}}}}"
         done
 
-        # Out-of-stock product (BOOL false)
         ddb put-item --table-name Products --item \
           '{"category":{"S":"Electronics"},"sku":{"S":"SKU-00099"},"name":{"S":"Out of Stock Widget"},"price":{"N":"199.99"},"stock":{"N":"0"},"active":{"BOOL":false},"rating":{"N":"2.5"},"reviewCount":{"N":"12"},"tags":{"SS":["electronics","unavailable"]}}'
 
-        # ── Seed Orders ───────────────────────────────────────────
         for i in 1 2 3 4 5 6 7 8; do
           uid="user-$$(printf '%04d' $$((i%5+1)))"
           status=$$(echo "pending processing shipped delivered cancelled refunded pending processing" | cut -d' ' -f$$i)
@@ -3107,7 +3018,6 @@ services:
             "{\"customerId\":{\"S\":\"$$uid\"},\"orderId\":{\"S\":\"ORD-2024-$$(printf '%06d' $$i)\"},\"status\":{\"S\":\"$$status\"},\"createdAt\":{\"S\":\"2024-07-0$$((i%9+1))T12:00:00Z\"},\"total\":{\"N\":\"$$total\"},\"currency\":{\"S\":\"USD\"},\"itemCount\":{\"N\":\"$$i\"},\"items\":{\"L\":[{\"M\":{\"sku\":{\"S\":\"SKU-$$(printf '%05d' $$i)\"},\"qty\":{\"N\":\"$$i\"},\"price\":{\"N\":\"$$item_price\"}}}]},\"shippingAddress\":{\"M\":{\"city\":{\"S\":\"Berlin\"},\"country\":{\"S\":\"DE\"}}},\"notes\":$$notes_attr}"
         done
 
-        # ── Seed Sessions ─────────────────────────────────────────
         FUTURE_TS=$$(($$(date +%s) + 3600))
         FUTURE_SHORT=$$(($$(date +%s) + 900))
         ddb put-item --table-name Sessions --item \
@@ -3115,7 +3025,6 @@ services:
         ddb put-item --table-name Sessions --item \
           "{\"sessionId\":{\"S\":\"sess-def456\"},\"userId\":{\"S\":\"user-0003\"},\"role\":{\"S\":\"editor\"},\"createdAt\":{\"S\":\"2024-07-04T11:00:00Z\"},\"expiresAt\":{\"N\":\"$$FUTURE_SHORT\"},\"data\":{\"M\":{\"lastPage\":{\"S\":\"/products\"}}}}"
 
-        # ── Seed ConfigStore ──────────────────────────────────────
         configs='
         app theme dark
         app language en

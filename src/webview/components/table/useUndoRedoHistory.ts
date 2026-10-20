@@ -2,11 +2,8 @@ import { useCallback, useRef, useState } from "react";
 import type { MutationSnapshot } from "../../types";
 
 export interface UndoRedoHistory {
-  /** Push the current state BEFORE an action, so undo restores to this state */
   push: (snapshot: MutationSnapshot) => void;
-  /** Undo: returns the snapshot to restore, or null if nothing to undo */
   undo: (currentState: MutationSnapshot) => MutationSnapshot | null;
-  /** Redo: returns the snapshot to restore, or null if nothing to redo */
   redo: (currentState: MutationSnapshot) => MutationSnapshot | null;
   canUndo: boolean;
   canRedo: boolean;

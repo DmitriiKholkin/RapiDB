@@ -1,18 +1,11 @@
 import React from "react";
 
 interface ErrorPanelProps {
-  /** Error message to display */
   message: string;
-  /** Optional title prefix (default: "Error") */
   title?: string;
-  /** Additional style overrides */
   style?: React.CSSProperties;
 }
 
-/**
- * Shared error display panel used across views.
- * Extracts duplicated error styling from TableView, ErdView, and ErrorBoundary.
- */
 export function ErrorPanel({
   message,
   title = "Error",

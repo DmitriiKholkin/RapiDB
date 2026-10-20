@@ -55,8 +55,6 @@ describe("PostgreSQL pooled query transaction cleanup (live)", () => {
         (await observer.query(`SELECT value FROM ${table} WHERE id=1`)).rows[0]
           .value,
       ).toBe("original");
-      // pg-pool uses its newest idle client first: ensure cleanup retains it,
-      // then exercise precisely the old cross-operation COMMIT reproduction.
       const pool = (
         driver as unknown as {
           pool: {
@@ -150,7 +148,6 @@ describe("PostgreSQL pooled query transaction cleanup (live)", () => {
       const pending = driver.query(
         `BEGIN; UPDATE ${table} SET value='pending' WHERE id=1${status === "E" ? "; SELECT 1/0" : ""}`,
       );
-      // Attach before waiting for the proxy: ErrorResponse can reject first.
       const rejected = expect(pending).rejects.toThrow(
         status === "E" ? /division by zero/ : /read timeout/i,
       );
@@ -162,8 +159,6 @@ describe("PostgreSQL pooled query transaction cleanup (live)", () => {
         ).getTransactionStatus(),
       ).toBe("I");
       expect(pool.idleCount).toBe(0);
-      // An unrelated transaction must use a fresh socket even while the old
-      // transaction's ReadyForQuery reply remains withheld.
       await driver.runTransaction([
         { sql: `UPDATE ${table} SET value='other' WHERE id=2` },
       ]);

@@ -65,7 +65,6 @@ describe("esbuild config", () => {
       module: bundledModule,
       exports: bundledModule.exports,
       require: createRequire(import.meta.url),
-      // Messaging registers a listener on import; SSR does not run effects.
       window: new EventTarget(),
       self: {},
     });

@@ -16,8 +16,6 @@ import { RedisDriver } from "../../src/extension/dbDrivers/redis";
 import { logger } from "../../src/extension/utils/logger";
 
 const exec = promisify(execFile);
-// Opt in explicitly: each suite owns a disposable container, a random loopback
-// port and no mounts. It never touches the compose services or existing data.
 const live = process.env.RAPIDB_REDIS_ACL_LIVE === "1";
 
 describe.runIf(live).each(["redis:7", "redis:6-alpine"])(
@@ -64,7 +62,6 @@ describe.runIf(live).each(["redis:7", "redis:6-alpine"])(
     }, 30000);
 
     afterEach(async () => {
-      // The common setup restores spies before suite teardown hooks run.
       vi.spyOn(logger, "error").mockReturnValue(new Error("logged"));
       for (const driver of drivers.splice(0)) await driver.disconnect();
       await delay(0);

@@ -114,8 +114,6 @@ describe("driver schema discovery error boundaries", () => {
     };
     const base = makeClient(vi.fn());
     const scoped = makeClient(scan);
-    // Exercise production scoping through the SDK boundary, with distinct
-    // editor and native clients even when both select DB 0.
     vi.mocked(createClient)
       .mockReturnValueOnce(base as unknown as ReturnType<typeof createClient>)
       .mockReturnValueOnce(

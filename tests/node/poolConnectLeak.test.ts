@@ -19,7 +19,6 @@ describe("pool leak on failed connect (stage 3)", () => {
       const actual = (await importOriginal()) as Record<string, unknown>;
       class MockPool {
         constructor() {
-          // biome-ignore lint/correctness/noConstructorReturn: mock must stay a class for `new Pool()`
           return failingPool as never;
         }
       }
@@ -66,7 +65,6 @@ describe("pool leak on failed connect (stage 3)", () => {
       const actual = (await importOriginal()) as Record<string, unknown>;
       class MockPool {
         constructor() {
-          // biome-ignore lint/correctness/noConstructorReturn: mock must stay a class for `new Pool()`
           return queryFailingPool as never;
         }
       }
@@ -109,7 +107,6 @@ describe("pool leak on failed connect (stage 3)", () => {
       const actual = (await importOriginal()) as Record<string, unknown>;
       class MockPool {
         constructor() {
-          // biome-ignore lint/correctness/noConstructorReturn: mock must stay a class for `new Pool()`
           return failingPool as never;
         }
       }

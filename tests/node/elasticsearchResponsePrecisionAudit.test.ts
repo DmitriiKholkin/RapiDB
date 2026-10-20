@@ -13,7 +13,6 @@ const exportRequest = {
   chunkSize: 10,
 };
 
-/** Send literal JSON, never JSON.stringify a JS number in this fixture. */
 async function fixture(source: string, mutationResponse?: string) {
   const requests: Array<{ method?: string; path: string; body: string }> = [];
   const closedIds: string[] = [];
@@ -119,8 +118,6 @@ describe("Elasticsearch response numeric precision audit (real SDK + HTTP)", () 
         name: "DeserializationError",
         message: expect.stringMatching(/numeric precision/i),
       });
-      // In particular, an SDK retry must not turn a rejected response into
-      // another request (which could replay a mutation for other endpoints).
       expect(f.requests.filter((r) => r.method !== "HEAD")).toHaveLength(1);
     } finally {
       await f.close();
@@ -231,11 +228,7 @@ describe("ElasticsearchSerializer portable numeric boundary", () => {
     "9007199254740993",
     "-9007199254740993",
     "9223372036854775807",
-    // JSON.stringify(Number(token)) appears unchanged here, but the actual
-    // IEEE-754 integer is 1000000000000000128. Checking stringify is not enough.
     "1000000000000000100",
-    // Conversely, this actual integer is representable, but JSON.stringify
-    // renders it as 1000000000000000100. Read/export must reject this too.
     "1000000000000000128",
     "1.0000000000000001",
     "0.123456789012345678901",

@@ -104,15 +104,11 @@ function reserveTableReadEpoch(previousEpoch: number): number {
     savedEpoch < 0 ||
     Math.max(previousEpoch, savedEpoch) >= Number.MAX_SAFE_INTEGER
   ) {
-    // Never wrap/reset IDs: a delayed host response may still carry an old ID.
     throw new Error(
       "Table read identity is invalid or exhausted. Reopen this table in a new panel.",
     );
   }
   const epoch = Math.max(previousEpoch, savedEpoch) + 1;
-  // Reserve synchronously, before a read can reach the host or this mount can
-  // disappear. Keep the high-water mark outside tableDraft/tableView, whose
-  // contents may be cleared or replaced independently.
   vscode.setState({ ...state, tableReadEpoch: epoch });
   return epoch;
 }
@@ -149,8 +145,6 @@ export function useTableDataController({
     initialView?.pageSize ?? initialPageSize,
   );
   const [requestedPage, setRequestedPage] = useState(initialView?.page ?? 1);
-  // Draft edits intend page 1 even before debounce requests that page. Keep
-  // persistence independent of both the displayed page and the live request.
   const [filterDraftPending, setFilterDraftPending] = useState(false);
   const intendedPage = filterDraftPending ? 1 : requestedPage;
   const [requestedPageSize, setRequestedPageSize] = useState(
@@ -206,11 +200,7 @@ export function useTableDataController({
   const committedColumnNamesRef = useRef<ReadonlySet<string>>(new Set());
   const metadataNeedsReadRef = useRef(false);
   const connectionInvalidatedRef = useRef(false);
-  // A reconciliation read must survive a schema queue (or invalidation of
-  // an already-issued read), even while edits/drafts/history are retained.
   const deferredReadRef = useRef(false);
-  // Delete reconciliation reads have terminal outcomes: a late response after
-  // failure must not unlock writes or replace the retained work before retry.
   const reconciliationFetchIdRef = useRef<number | null>(null);
 
   const advanceFetchEpoch = useCallback(() => {
@@ -262,7 +252,6 @@ export function useTableDataController({
           (candidate) => candidate.name === column.name,
         );
         if (!next) return true;
-        // Filter/header-only metadata can change without invalidating write values.
         const writeShape = (value: ColumnMeta) =>
           JSON.stringify([
             value.type,
@@ -312,14 +301,10 @@ export function useTableDataController({
         ]),
       );
     });
-    // Ordinary metadata refresh retains the committed dataset while work exists.
-    // A requested mutation reconciliation instead rebases that work by identity.
     if (hasWork && deferredReadRef.current) {
       setInitTick((tick) => tick + 1);
     }
     if (!hasWork) {
-      // No local work remains: require an authoritative dataset before exposing
-      // the new schema for editing (especially after PK/type changes or read errors).
       loadingRef.current = true;
       setLoading(true);
       setHasCommittedData(false);
@@ -423,7 +408,6 @@ export function useTableDataController({
   );
 
   fetchPageRef.current = fetchPage;
-  // Keep callbacks blocked until the committed rows and restored edits render.
   useEffect(() => {
     loadingRef.current = loading;
   });
@@ -484,7 +468,6 @@ export function useTableDataController({
             primaryKeyColumns,
           };
           metadataBlockedRef.current = true;
-          // Invalidate reads issued under the old metadata, without touching mutations.
           if (connectionRefresh || fetchSnapshotsRef.current.size > 0)
             deferredReadRef.current = true;
           if (advanceFetchEpoch() === null) return;
@@ -537,8 +520,6 @@ export function useTableDataController({
         const nextPage = restoredView?.page ?? 1;
         const nextPageSize =
           restoredView?.pageSize ?? initialPageSizeRef.current;
-        // Persisted names refer to the actual column name, not its position or
-        // a case-folded label. Duplicate names use the same name-based state.
         const nextSort =
           restoredView?.sort &&
           nextColumns.some(
@@ -560,7 +541,6 @@ export function useTableDataController({
               ),
           ),
         );
-        // Keep incomplete/blank user drafts, but do not send them as filters.
         const nextActiveFilters = buildActiveFilterDrafts(
           nextColumns,
           nextFilters,
@@ -569,8 +549,6 @@ export function useTableDataController({
         requestedPageSizeRef.current = nextPageSize;
         requestedSortRef.current = nextSort;
         debouncedFilterDraftsRef.current = nextActiveFilters;
-        // Restoration is not a user filter edit: it must not debounce another
-        // read or reset the restored page after the initial fetch.
         previousFilterDraftsRef.current = nextFilters;
         setPage(nextPage);
         setPageSize(nextPageSize);
@@ -631,8 +609,6 @@ export function useTableDataController({
           readIdentityFailedRef.current
         )
           return;
-        // Legacy untagged replies cannot prove a reconciliation read. Keep its
-        // terminal response guard separate from ordinary read lifecycle rules.
         if (
           fetchId === undefined
             ? reconciliationFetchIdRef.current !== null
@@ -733,12 +709,7 @@ export function useTableDataController({
       if (isFilterError) {
         setError(null);
         setFilterError(nextError);
-        // Rows on screen belong to the previous filter state. Do not keep
-        // presenting them as the result of a filter that failed validation.
         if (!hasCommittedDataRef.current) {
-          // A restored invalid filter can fail before the first page arrives.
-          // Show the schema and filter controls so the user can correct it;
-          // keep mutations disabled until a successful read commits data.
           setColumns(columnsRef.current);
           setPkCols(pendingPrimaryKeyColumnsRef.current);
           setReadOnlyTable(true);
@@ -748,7 +719,6 @@ export function useTableDataController({
         setTotalCount(0);
         setExecutionTimeMs(undefined);
         if (requestedPageRef.current !== 1) {
-          // Persist page 1 without immediately retrying the same invalid filter.
           skipNextFetchRef.current = true;
           requestedPageRef.current = 1;
           setRequestedPage(1);
@@ -801,7 +771,6 @@ export function useTableDataController({
     ],
   );
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: fetchTrigger is a synthetic trigger that encodes page/sort/filter state; fetchPage reads those values from stable refs at call time.
   useEffect(() => {
     if (!initializedRef.current) {
       return;

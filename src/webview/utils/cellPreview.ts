@@ -1,7 +1,6 @@
 import type { TypeCategory } from "../../shared/tableTypes";
 import { formatBinaryValueForViewer } from "./valueFormatting";
 
-// Grid-only presentation budget. Never use these previews for data operations.
 export const CELL_PREVIEW_LIMIT = 1024;
 export const CELL_PREVIEW_NOTICE =
   "Preview only; open the cell for the full value.";
@@ -39,7 +38,6 @@ export function getCellPreview(
   }
 
   function quoted(part: string): void {
-    // Bound the input before JSON escaping, not just the resulting text.
     const bounded = prefix(part, CELL_PREVIEW_LIMIT - text.length);
     append(JSON.stringify(bounded));
     if (bounded.length < part.length) truncated = true;
@@ -82,7 +80,6 @@ export function getCellPreview(
         ArrayBuffer.isView(current) &&
         !(current instanceof DataView)
       ) {
-        // Do not call Buffer.toJSON(): it copies the entire byte array.
         const bytes = current as unknown as ArrayLike<number>;
         const isBuffer = current.constructor.name === "Buffer";
         append(isBuffer ? '{"type":"Buffer","data":[' : "{");
@@ -101,8 +98,6 @@ export function getCellPreview(
             truncated = true;
             break;
           }
-          // Stable ordinary objects enumerate own keys before prototype keys.
-          // JSON ignores inherited keys, so stop rather than scanning them all.
           if (!Object.hasOwn(current, key)) break;
           const item = (current as Record<string, unknown>)[key];
           if (
@@ -131,8 +126,6 @@ export function getCellPreview(
     }
     if (current === null || current === undefined) return;
     if (Array.isArray(current)) {
-      // Match ordinary Array#toString, including its empty circular entries,
-      // without joining or coercing the entire array first.
       if (ancestors.has(current)) return;
       ancestors.add(current);
       for (let i = 0; i < current.length && !truncated; i++) {
@@ -143,7 +136,6 @@ export function getCellPreview(
     } else if (current instanceof Date) {
       append(Date.prototype.toString.call(current));
     } else if (typeof current === "object") {
-      // Default object coercion is constant; never invoke custom toString.
       append("[object Object]");
     } else {
       append(String(current));
@@ -168,7 +160,6 @@ export function getCellPreview(
           ancestors.clear();
           writeFallback(value, 0);
         } else {
-          // Unexpected objects are presentation-only; avoid unbounded coercion.
           text = "[Object]";
           truncated = true;
         }

@@ -458,10 +458,6 @@ export class ConnectionProvider
 
   refreshConnectionTree(connectionId?: string): void {
     if (!connectionId) {
-      // VS Code refreshes the children of the changed element, not every
-      // expanded descendant below it. Refresh each tracked expanded node too
-      // so DDL changes become visible without requiring users to collapse and
-      // reopen every database/schema/table in the tree.
       const connectionIds = new Set([
         ...this._connectionNodes.keys(),
         ...this._expandedDescendantNodes.keys(),

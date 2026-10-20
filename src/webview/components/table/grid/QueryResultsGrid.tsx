@@ -342,7 +342,6 @@ export function QueryResultsGrid({
           overflow: "auto",
           outline: "none",
         }}
-        // biome-ignore lint/a11y/noNoninteractiveTabindex: needed for webview keyboard focus
         tabIndex={0}
       >
         <table style={getBaseTableStyle(table.getTotalSize())}>

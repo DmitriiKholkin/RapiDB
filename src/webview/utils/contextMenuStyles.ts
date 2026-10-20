@@ -1,8 +1,3 @@
-/**
- * Shared styles for context menu items.
- *
- * Used by MonacoEditor and EditInput to keep the visual appearance consistent.
- */
 import React from "react";
 import { cssVar } from "./cssVar";
 

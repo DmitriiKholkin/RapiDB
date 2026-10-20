@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import "../../src/extension/dbDrivers/postgres";
 import { jsonArrayLiteralToPgArrayLiteral } from "../../src/extension/utils/postgresArrayLiteral";
 
-// pg's TypeId enum lists scalar OIDs only; dynamic numeric OIDs are supported.
 const parser = (oid: number): ((text: string) => unknown[]) =>
   pgTypes.getTypeParser(oid);
 

@@ -1,6 +1,5 @@
 const DRIVER_CLOSE_BUDGET_MS = 1_000;
 
-/** Give graceful shutdown a bounded chance, then close the owned transports. */
 export async function closeDriverResource(
   close: () => Promise<void>,
   discard: () => void,
@@ -18,7 +17,6 @@ export async function closeDriverResource(
     ]);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
-    // Promise.race also observes any late rejection from graceful shutdown.
     if (!closed) discard();
   }
 }

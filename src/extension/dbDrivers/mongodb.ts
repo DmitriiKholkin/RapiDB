@@ -189,8 +189,6 @@ function ensureMongoshQueryIsSafe(queryText: string): void {
   }
 }
 
-// No host objects or functions may be reachable by query code: a host
-// function's constructor provides an escape from vm's disabled code generation.
 const MONGOSH_SANDBOX_SETUP = `
   const operations = [];
   const nativeRegExp = globalThis.RegExp;
@@ -450,8 +448,6 @@ function parseMongoshOperations(queryText: string): MongoshOperation[] {
       codeGeneration: { strings: false, wasm: false },
       microtaskMode: "afterEvaluate",
     });
-    // Bootstrap and serialization both run under the VM deadline. Never read
-    // query-created properties or call query-created getters in the host realm.
     vm.runInContext(MONGOSH_SANDBOX_SETUP, context, {
       timeout: MONGOSH_VM_TIMEOUT_MS,
     });
@@ -536,8 +532,6 @@ const MONGODB_READ_ONLY_CHAIN_OPS = new Set([
   "hint",
   "collation",
   "explain",
-  // Display / cursor helpers that have no write effect (execution ignores
-  // unknown chain ops anyway; allowlist is fail-closed for the guard).
   "pretty",
   "comment",
   "count",
@@ -551,9 +545,6 @@ const MONGODB_READ_ONLY_CHAIN_OPS = new Set([
 ]);
 
 function isReadOnlyMongoOperation(operation: MongoshOperation): boolean {
-  // Cursor modifiers must also be read-only: db.users.find({}).deleteMany()
-  // parses as op=find + chainOp=deleteMany and must not pass the guard even
-  // though execution currently ignores unknown chain ops.
   if (
     operation.chainOps.some(
       (chain) => !MONGODB_READ_ONLY_CHAIN_OPS.has(chain.op),
@@ -610,8 +601,6 @@ function coerceMongoIntegerValue(
   const min = int32 ? -2147483648n : -9223372036854775808n;
   const max = int32 ? 2147483647n : 9223372036854775807n;
   if (integer < min || integer > max) {
-    // Existing mixed-type strings must remain readable and usable in original
-    // value predicates. Only new edits are required to fit the sampled type.
     if (!strict) return value;
     throw new Error(
       `MongoDB ${column.nativeType} value is out of range (${min} to ${max}).`,
@@ -637,8 +626,6 @@ function coerceMongoNumericInput(
     try {
       return coerceMongoIntegerValue(value, column, true);
     } catch {
-      // A schema-less field may contain a Decimal128 beyond the sampled
-      // Int32/Long range. Keep the edit numeric when the full value fits BSON.
       return Decimal128.fromString(value);
     }
   }
@@ -651,8 +638,6 @@ function coerceMongoNumericInput(
     ) {
       return numeric;
     }
-    // JavaScript numbers cannot represent every BSON numeric value. Use
-    // Decimal128 when the input overflows Double or loses decimal precision.
     return Decimal128.fromString(value);
   }
 
@@ -684,10 +669,7 @@ function parseExplicitMongoFilterString(value: string): string | undefined {
     try {
       const parsed: unknown = JSON.parse(trimmed);
       if (typeof parsed === "string") return parsed;
-    } catch {
-      // Report malformed string syntax consistently with the single-quoted
-      // parser below.
-    }
+    } catch {}
     throw new Error("Invalid quoted MongoDB filter string.");
   }
 
@@ -812,8 +794,6 @@ function coerceMongoBinaryValue(
   column: ColumnTypeMeta,
   strictHex: boolean,
 ): Binary | string {
-  // Output may contain literal strings in a sampled binData column. Explicit
-  // hex input, however, must not fall back to a BSON string when malformed.
   const recognizedHex = isHexLike(value);
   if (recognizedHex || /^(?:0x|\\x)/i.test(value)) {
     if (!strictHex && !recognizedHex) return value;
@@ -902,9 +882,6 @@ function formatMongoTimestampDisplay(
   seconds: number,
   increment: number,
 ): string {
-  // MongoDB Timestamp equality includes both components. A date-only display
-  // loses the increment and cannot be used to reconstruct an optimistic edit
-  // predicate after the first update.
   return `Timestamp(${seconds}, ${increment})`;
 }
 
@@ -1299,11 +1276,11 @@ function selectMongoSchemaSample(
 }
 
 function isUnsupportedMongoTableField(name: string): boolean {
-  return name.includes(".") || name.startsWith("$");
+  return name.length === 0 || name.includes(".") || name.startsWith("$");
 }
 
 function unsupportedMongoTableFieldMessage(name: string): string {
-  return `MongoDB Table Viewer cannot safely edit literal field ${JSON.stringify(name)}: names containing a dot or starting with "$" are read-only. Use the Query Editor with explicit literal-field operations instead.`;
+  return `MongoDB Table Viewer cannot safely edit literal field ${JSON.stringify(name)}: empty names, names containing a dot or starting with "$" are read-only. Use the Query Editor with explicit literal-field operations instead.`;
 }
 
 function assertSupportedMongoTableUpdate(update: {
@@ -1311,9 +1288,6 @@ function assertSupportedMongoTableUpdate(update: {
   originalValues?: Record<string, unknown>;
   originalTypes?: Record<string, MongoValueTypeHint>;
 }): void {
-  // Viewer column names are literal top-level keys, whereas update operators
-  // and optimistic predicates interpret these names as paths/operators. Check
-  // every input record, including fields absent from sampled metadata.
   for (const record of [
     update.changes,
     update.originalValues,
@@ -1325,6 +1299,42 @@ function assertSupportedMongoTableUpdate(update: {
       }
     }
   }
+}
+
+function buildMongoTableUpdateCriteria(update: {
+  primaryKeys?: Record<string, unknown>;
+  originalValues?: Record<string, unknown>;
+  originalTypes?: Record<string, MongoValueTypeHint>;
+}): Record<string, unknown> {
+  const criteria: Record<string, unknown> = {};
+  const exactChecks = new Map<string, unknown>();
+  for (const [field, value] of Object.entries(update.originalValues ?? {})) {
+    setOwnMongoRecordField(
+      criteria,
+      field,
+      value !== null && typeof value === "object" ? { $eq: value } : value,
+    );
+    exactChecks.set(field, { $eq: [`$${field}`, { $literal: value }] });
+  }
+  for (const [field, hint] of Object.entries(update.originalTypes ?? {})) {
+    if (hint.nativeType === "null") {
+      setOwnMongoRecordField(criteria, field, { $eq: null, $type: 10 });
+    } else if (hint.nativeType === "undefined") {
+      setOwnMongoRecordField(criteria, field, { $type: 6 });
+    } else if (hint.nativeType === "missing") {
+      setOwnMongoRecordField(criteria, field, { $exists: false });
+    }
+    if (["null", "undefined", "missing"].includes(hint.nativeType)) {
+      exactChecks.set(field, {
+        $eq: [{ $type: `$${field}` }, { $literal: hint.nativeType }],
+      });
+    }
+  }
+  criteria._id = { $eq: update.primaryKeys?._id };
+  if (exactChecks.size > 0) {
+    criteria.$expr = { $and: [...exactChecks.values()] };
+  }
+  return criteria;
 }
 
 export class MongoDBDriver implements IDBDriver {
@@ -1368,8 +1378,6 @@ export class MongoDBDriver implements IDBDriver {
       );
       this.assertConnectionEpoch(epoch);
       const tlsHostname = tlsSettings?.servername?.replace(/^\[|\]$/g, "");
-      // SNI is for DNS names only. For an original IP behind an SSH forward,
-      // verify its IP SAN rather than the local socket address (without IP SNI).
       const tlsIpIdentity = tlsHostname && isIP(tlsHostname) !== 0;
       this.assertConnectionEpoch(epoch);
       client = new MongoClient(uri, {
@@ -1396,9 +1404,6 @@ export class MongoDBDriver implements IDBDriver {
       this.assertConnectionEpoch(epoch);
       await client.connect();
       this.assertConnectionEpoch(epoch);
-      // A successful handshake/ping does not prove authentication or catalog
-      // access: MongoDB permits those commands without credentials. Exercise
-      // the same database catalog used by Explorer before reporting success.
       const catalog = client
         .db(this.defaultDatabaseName())
         .listCollections(
@@ -1488,8 +1493,6 @@ export class MongoDBDriver implements IDBDriver {
       queryMode: "text" as const,
       supportsMutations: true,
       readOnlyQueryGuard: decideMongoReadOnlyQuery,
-      // Mongosh can choose operations dynamically. Re-evaluating the source to
-      // classify it can disagree with execution, so refresh after every attempt.
       schemaMutationGuard: (_queryText: string) => true,
       editorPresentation: {
         formatOnOpen: false,
@@ -1708,10 +1711,6 @@ export class MongoDBDriver implements IDBDriver {
         ...(options?.signal ? { signal: options.signal } : {}),
         ...(timeoutMS !== undefined ? { timeoutMS } : {}),
       };
-      // Db.createCollection() forwards signal as a MongoDB command field
-      // (create.signal), which the server rejects. Keep these options limited
-      // to createCollection/createView; createIndex consumes AbortSignal and
-      // filters it out of the index description.
       const commandSdkOptions = timeoutMS !== undefined ? { timeoutMS } : {};
       const sdkArgs =
         Object.keys(sdkOptions).length > 0
@@ -2109,9 +2108,7 @@ export class MongoDBDriver implements IDBDriver {
           totalCount,
           executionTimeMs: Math.round(performance.now() - startTime),
         };
-      } catch {
-        // Fall through to display-value filtering when server-side BSON coercion is unavailable.
-      }
+      } catch {}
     }
 
     const fallbackReadLimit = Math.max(
@@ -2323,8 +2320,6 @@ export class MongoDBDriver implements IDBDriver {
     try {
       coerced = this.coerceInputValue(value, column);
     } catch (error) {
-      // Filter bounds describe a schema-less numeric field, not a mutation
-      // restricted to the first sampled Int32/Long subtype.
       if (
         isMongoIntegerType(column.nativeType) &&
         /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(normalized)
@@ -2347,9 +2342,6 @@ export class MongoDBDriver implements IDBDriver {
       !/^[+-]?\d+$/.test(normalized) &&
       /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(normalized)
     ) {
-      // A schema-less MongoDB field may contain a Double even when the first
-      // non-null sample is Int32/Long. Keep fractional numeric filters numeric
-      // instead of passing the uncoercible text to the BSON query unchanged.
       return Decimal128.fromString(normalized);
     }
     return coerced;
@@ -2373,17 +2365,11 @@ export class MongoDBDriver implements IDBDriver {
       return [this.coerceFilterInput(value, column)];
     }
 
-    // Mongo collections have no declared column type. The inferred type comes
-    // from a sample, so numeric-looking filters use numeric BSON candidates
-    // regardless of which numeric subtype appeared in the first document.
     if (column && ["integer", "decimal", "float"].includes(column.category)) {
       if (
         column.nativeType === "decimal" ||
         column.nativeType === "decimal128"
       ) {
-        // coerceInputValue intentionally leaves invalid edit input as text so
-        // the caller can display it. A numeric filter must instead reject a
-        // Decimal128 overflow instead of matching a BSON String value.
         return [Decimal128.fromString(normalized)];
       }
       return [this.coerceFilterInput(value, column)];
@@ -2471,8 +2457,6 @@ export class MongoDBDriver implements IDBDriver {
     request: DriverUpdateRowsRequest,
     context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
-    // Validate the complete batch before obtaining a collection or writing a
-    // safe prefix. This also protects direct callers that bypass UI metadata.
     this.validateTableUpdates(request.updates);
     if (
       request.updates.some(
@@ -2500,22 +2484,7 @@ export class MongoDBDriver implements IDBDriver {
         ) {
           throw new Error("MongoDB does not support updating the _id field.");
         }
-        const criteria = this.normalizeCriteria({
-          ...update.primaryKeys,
-          ...(update.originalValues ?? {}),
-        });
-        for (const [field, hint] of Object.entries(
-          update.originalTypes ?? {},
-        )) {
-          if (hint.nativeType === "null") {
-            setOwnMongoRecordField(criteria, field, { $eq: null, $type: 10 });
-          } else if (hint.nativeType === "undefined") {
-            setOwnMongoRecordField(criteria, field, { $type: 6 });
-          } else if (hint.nativeType === "missing") {
-            setOwnMongoRecordField(criteria, field, { $exists: false });
-          }
-        }
-        criteria._id = { $eq: update.primaryKeys._id };
+        const criteria = buildMongoTableUpdateCriteria(update);
         const options = this.getMutationTimeoutOptions(context);
         writeMayHaveApplied = true;
         const result = options
@@ -2594,7 +2563,6 @@ export class MongoDBDriver implements IDBDriver {
       request.primaryKeyValuesList,
       context,
       (entry) => {
-        // Keep the actual BSON identity: no ObjectId/string guessing.
         const filter = { _id: { $eq: entry._id } } as Parameters<
           typeof collection.deleteOne
         >[0];
@@ -2647,31 +2615,9 @@ export class MongoDBDriver implements IDBDriver {
     }
     if (operation === "update") {
       assertSupportedMongoTableUpdate(data);
-      const filter: Record<string, unknown> = {
-        _id: { $eq: data.primaryKeys?._id },
-      };
-      const guardedFields = new Set<string>();
-      for (const [field, hint] of Object.entries(data.originalTypes ?? {})) {
-        guardedFields.add(field);
-        if (hint.nativeType === "null") {
-          setOwnMongoRecordField(filter, field, { $eq: null, $type: 10 });
-        } else if (hint.nativeType === "undefined") {
-          setOwnMongoRecordField(filter, field, { $type: 6 });
-        } else if (hint.nativeType === "missing") {
-          setOwnMongoRecordField(filter, field, { $exists: false });
-        } else if (Object.hasOwn(data.originalValues ?? {}, field)) {
-          setOwnMongoRecordField(filter, field, data.originalValues?.[field]);
-        }
-      }
-      for (const [field, value] of Object.entries(data.originalValues ?? {})) {
-        if (!guardedFields.has(field))
-          setOwnMongoRecordField(filter, field, value);
-      }
+      const filter = buildMongoTableUpdateCriteria(data);
       const serializedFilter = this.serializeMongosh(filter);
       const update = this.serializeMongosh({ $set: data.changes ?? {} });
-      // Execution applies updateOne per row (see updateRows); the preview must
-      // match its identity and optimistic guard so copy-paste has the same
-      // protection and cannot escalate to a multi-row write.
       return `${collectionRef}.updateOne(\n  ${serializedFilter},\n  ${update}\n)`;
     }
     return (data.primaryKeyValuesList ?? [data.primaryKeys ?? {}])
@@ -2683,20 +2629,12 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   async runTransaction(operations: TransactionOperation[]): Promise<void> {
-    // MongoDB multi-document transactions require sessions/replica sets and
-    // per-op retry semantics this text-protocol driver does not implement.
-    // Fail closed instead of silently applying a non-atomic prefix on error.
-    // Table mutations already avoid this path for multi-row driver applies
-    // (see executeAtomicSqlApplyPlan); single-op callers are unaffected.
     if (operations.length > 1) {
       throw new Error(
         "[RapiDB] MongoDB driver does not support atomic multi-operation transactions. Apply one row at a time.",
       );
     }
     for (const operation of operations) {
-      // One text item can contain several statements; query() executes all of
-      // them in order. Reject before the first write rather than applying a
-      // non-atomic prefix and reporting an error on the second statement.
       if (
         parseMongoshOperations(normalizeMongoshQueryText(operation.sql))
           .length !== 1
@@ -2756,8 +2694,6 @@ export class MongoDBDriver implements IDBDriver {
     try {
       return this.coerceInputValue(value, column);
     } catch (error) {
-      // Optimistic predicates must reconstruct the existing BSON double, not
-      // reject its display text as though it were a new numeric write.
       if (
         error instanceof JsonNumericPrecisionError &&
         typeof value === "string"
@@ -2769,8 +2705,6 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   coercePrimaryKeyValue(value: unknown, column: ColumnTypeMeta): unknown {
-    // Table rows serialize _id for display. Never reinterpret an untyped string
-    // using the sampled column type: it may identify a different document.
     if (
       column.name !== "_id" ||
       value === null ||
@@ -2953,8 +2887,6 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
-    // Display is not a write: retain original JSON text if Number-based
-    // coercion cannot represent it. Do not break reads of existing documents.
     if (
       typeof value === "string" &&
       (column.category === "json" || column.category === "array")

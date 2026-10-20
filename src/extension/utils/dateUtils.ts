@@ -1,22 +1,8 @@
-/**
- * Pure date/datetime formatting and parsing utilities.
- *
- * Extracted from BaseDBDriver to enable reuse across drivers and services
- * without requiring a class inheritance hierarchy. All functions in this
- * module are pure (same input → same output, no side effects).
- */
-
 const pad2 = (n: number): string => String(n).padStart(2, "0");
 
-/** Datetime prefix used as a carrier when normalizing a bare offset. */
 const DATETIME_CARRIER_PREFIX = "2000-01-01 00:00:00";
 const DATETIME_CARRIER_PREFIX_LENGTH = DATETIME_CARRIER_PREFIX.length;
 
-/**
- * Normalize a bare timezone offset (`+05`, `+0500`, `+05:00`, `Z`) by
- * routing it through `normalizeSqlDatetimeOffsetSpacing`. The carrier
- * date is purely structural — it is sliced off before returning.
- */
 function normalizeTimezoneOffset(offset: string): string {
   if (offset === "Z") {
     return "Z";
@@ -34,15 +20,6 @@ function trimTrailingZerosFromFraction(rawFrac: string | undefined): string {
   return digits.length > 0 ? `.${digits}` : "";
 }
 
-// ── Display formatting ──────────────────────────────────────────────────────
-
-/**
- * Format a Date or ISO-like string for human-readable display.
- *
- * Returns null if the input cannot be interpreted as a valid datetime.
- * For Date objects, uses UTC fields. For strings, normalizes fractional
- * seconds and timezone offset spacing.
- */
 export function formatDatetimeForDisplay(val: unknown): string | null {
   if (val instanceof Date) {
     if (Number.isNaN(val.getTime())) return null;
@@ -69,11 +46,6 @@ export function formatDatetimeForDisplay(val: unknown): string | null {
   return null;
 }
 
-/**
- * Convert an ISO datetime string to a date string (YYYY-MM-DD).
- * Timezone-free datetimes retain their written calendar date; explicit
- * offsets are interpreted as instants and converted to their UTC date.
- */
 export function isoToLocalDateStr(iso: string): string | null {
   const normalized = normalizeSqlDatetimeOffsetSpacing(iso.trim()).replace(
     / ([zZ])$/,
@@ -90,22 +62,10 @@ export function isoToLocalDateStr(iso: string): string | null {
   return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
 }
 
-// ── Timezone handling ───────────────────────────────────────────────────────
-
-/**
- * Check whether a datetime string contains an explicit timezone indicator
- * (Z, +HH, +HH:MM, -HH, -HH:MM).
- */
 export function hasExplicitTimezone(value: string): boolean {
   return /[zZ]|[+-]\d{2}(?::?\d{2})?$/.test(value);
 }
 
-/**
- * Normalize the spacing of SQL datetime offset strings.
- *
- * Converts variants like "2024-01-15 12:00:00+05", "+0500", "+05" into
- * the canonical "+05:00" form.
- */
 export function normalizeSqlDatetimeOffsetSpacing(value: string): string {
   const compact = value.replace(/ ([+-]\d{2}(?::?\d{2})?)$/, "$1");
   if (/[+-]\d{2}:\d{2}$/.test(compact)) {
@@ -120,21 +80,13 @@ export function normalizeSqlDatetimeOffsetSpacing(value: string): string {
   return compact;
 }
 
-// ── Validation ──────────────────────────────────────────────────────────────
-
-/** Regex for date-only strings (YYYY-MM-DD). */
 export const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-/** Regex for ISO-like datetime strings. */
 export const ISO_DATETIME_RE = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}/;
 
-/** Regex for SQL-style datetime strings (YYYY-MM-DD HH:MM:SS). */
 export const DATETIME_SQL_RE =
   /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?: ?(?:Z|[+-]\d{2}(?::?\d{2})?))?$/i;
 
-/**
- * Validate that a date-only string (YYYY-MM-DD) represents a real calendar date.
- */
 export function isValidDateOnly(value: string): boolean {
   if (!DATE_ONLY_RE.test(value)) return false;
   const parsed = new Date(`${value}T00:00:00Z`);
@@ -147,9 +99,6 @@ export function isValidDateOnly(value: string): boolean {
   );
 }
 
-/**
- * Validate that the individual date/time parts of a datetime string are valid.
- */
 export function hasValidDateTimeParts(value: string): boolean {
   const match =
     /^(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?: ?(?:Z|[+-]\d{2}(?::?\d{2})?))?$/i.exec(
@@ -163,12 +112,6 @@ export function hasValidDateTimeParts(value: string): boolean {
   return isValidDateOnly(date) && hours < 24 && minutes < 60 && seconds < 60;
 }
 
-/**
- * Normalize a user-provided date filter value into a canonical date string.
- *
- * Handles ISO datetimes, SQL datetimes, and date-only strings.
- * Returns null if the input is not a recognizable date value.
- */
 export function normalizeDateFilterValue(value: string): string | null {
   const normalized = value.trim();
   const normalizedSql = normalizeSqlDatetimeOffsetSpacing(normalized);
@@ -198,10 +141,6 @@ export function normalizeDateFilterValue(value: string): string | null {
   return null;
 }
 
-/**
- * Quick heuristic check: does the value look like a date input?
- * Used to decide whether to show a "not a valid date" error.
- */
 export function looksLikeDateInput(value: string): boolean {
   return /^\d{4}-\d{2}-\d{2}(?:[ T].*)?$/.test(value.trim());
 }

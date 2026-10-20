@@ -1,11 +1,3 @@
-/**
- * Safe clipboard access for the RapiDB extension.
- *
- * Reads return an empty string on failure (with a warning log) so that
- * the calling feature can degrade gracefully; writes surface errors
- * normally so the caller can decide what to do.
- */
-
 import * as vscode from "vscode";
 import { logger } from "./logger";
 

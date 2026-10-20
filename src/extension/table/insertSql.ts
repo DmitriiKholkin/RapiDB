@@ -59,7 +59,6 @@ export function buildInsertRowOperation(
 
     columnNames.push(drv.quoteIdentifier(columnName));
     if (value === null) {
-      // Inline NULL to avoid backend-specific NULL parameter typing issues.
       valueExpressions.push("NULL");
       continue;
     }
@@ -107,7 +106,6 @@ export function buildInsertRowOperation(
   );
 }
 
-/** Render identity clauses structurally; never search inside quoted identifiers. */
 function withReturning(
   driver: IDBDriver,
   operation: TransactionOperation,

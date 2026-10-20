@@ -35,8 +35,6 @@ describe("SQLite packaged execution process", () => {
     const bundle = await readFile(workerFile, "utf8");
     expect(bundle).not.toMatch(/require\(["'](?:tsx|typescript|vscode)["']\)/);
 
-    // Reproduce VSIX runtime contents: JS scaffold + helper packages, and a
-    // host-compatible native binary standing in for the managed cache download.
     const runtime = join(root, ".rapidb-runtime", "node_modules");
     const sqlitePackage = join(runtime, "better-sqlite3");
     await mkdir(runtime, { recursive: true });

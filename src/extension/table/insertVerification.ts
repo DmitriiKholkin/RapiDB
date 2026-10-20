@@ -12,7 +12,6 @@ import {
 import { buildInsertRowOperation } from "./insertSql";
 import { writableEntries } from "./updateSql";
 
-/** Keep requested values, not bind/coerced values, as the verification baseline. */
 export function prepareInsertVerification(
   driver: IDBDriver,
   backend: string | undefined,
@@ -28,17 +27,12 @@ export function prepareInsertVerification(
   const writable = writableEntries(requested, columnMap);
   const values = writable.flatMap(([name, expectedValue]) => {
     const column = columnMap.get(name);
-    // Oracle RETURNING captures temporal keys verbatim, and the canonical
-    // identity predicate below already verifies that exact persisted key.
-    // A trigger may assign it; do not compare it with the pre-trigger draft.
     if (
       backend === "oracle" &&
       column?.isPrimaryKey &&
       /^(?:DATE$|TIMESTAMP(?:\(|\s|$))/i.test(column.nativeType.trim())
     )
       return [];
-    // NULL is a request to generate a key for SQLite's INTEGER rowid alias and
-    // MySQL AUTO_INCREMENT, not a request to persist a NULL primary key.
     if (
       column?.isPrimaryKey &&
       driver.coerceInputValue(expectedValue, column) === null &&
@@ -105,10 +99,8 @@ export function prepareInsertVerification(
         );
       }
       operation.captureIdentity = {
-        // Resolve all key components from this packet's auto key; reject ambiguity.
         mysqlInsertId: {
           sql: `SELECT ${keys.map((column, index) => `${driver.quoteIdentifier(column.name)} AS ${driver.quoteIdentifier(`__col_${index}`)}`).join(", ")} FROM ${qualified} WHERE ${driver.quoteIdentifier(mysqlAutoKey.name)} = ${driver.buildInsertValueExpr(mysqlAutoKey, 1)} LIMIT 2`,
-          // Resolve zero from this operation's session SQL mode, not planning metadata.
           ...(writable.some(
             ([name, value]) =>
               name === mysqlAutoKey.name &&

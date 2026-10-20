@@ -1,8 +1,3 @@
-/**
- * ERD panel types, initial state, and message parser.
- *
- * All parsers are pure; `null` indicates a parse failure.
- */
 import type { PrimaryKeyRole } from "../tableTypes";
 import type { PanelRetentionState, WebviewMessageEnvelope } from "./shared";
 import {
@@ -13,8 +8,6 @@ import {
   readOptionalString,
   readRequiredString,
 } from "./shared";
-
-// ─── ERD Graph Types ────────────────────────────────────────────────────────
 
 export interface ErdNodeColumn {
   name: string;
@@ -62,16 +55,12 @@ export interface ErdGraph {
   scope: ErdGraphScope;
 }
 
-// ─── Initial State ──────────────────────────────────────────────────────────
-
 export interface ErdInitialState extends PanelRetentionState {
   view: "erd";
   connectionId: string;
   database?: string;
   schema?: string;
 }
-
-// ─── Initial State Parser ───────────────────────────────────────────────────
 
 export function parseErdInitialState(
   input: Record<string, unknown>,
@@ -88,8 +77,6 @@ export function parseErdInitialState(
   };
 }
 
-// ─── Messages ───────────────────────────────────────────────────────────────
-
 export type ErdPanelMessage =
   | WebviewMessageEnvelope<"ready">
   | WebviewMessageEnvelope<"reload">
@@ -97,8 +84,6 @@ export type ErdPanelMessage =
       "openTableData",
       { table: string; schema?: string; database?: string; isView?: boolean }
     >;
-
-// ─── Message Parser ─────────────────────────────────────────────────────────
 
 export function parseErdPanelMessage(input: unknown): ErdPanelMessage | null {
   const envelope = parseEnvelope(input);

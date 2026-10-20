@@ -527,8 +527,6 @@ export function registerLiveDriverConformanceTests(
         const result = await harness.driver.query(empty.queryText);
         expect(result.columns).toEqual(["same", "same"]);
         expect(result.rows).toEqual([]);
-        // A bare CR does not end a native SQLite -- comment. Check the native
-        // prepared path as well as the rewritten script path.
         const native = await harness.driver.query(
           "SELECT ? AS n -- comment\r UNION ALL SELECT 2",
           [1],
@@ -542,8 +540,6 @@ export function registerLiveDriverConformanceTests(
         expect((await harness.driver.query(capped.queryText)).rows).toEqual(
           native.rows,
         );
-        // Raw result metadata must not break the driver's existing fallback
-        // from non-reader PRAGMAs to run().
         await expect(
           harness.driver.query("PRAGMA user_version = 41"),
         ).resolves.toMatchObject({ columns: [], rows: [] });

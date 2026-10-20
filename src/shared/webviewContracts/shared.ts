@@ -1,10 +1,3 @@
-/**
- * Core types and parser utilities shared across all panel parsers.
- *
- * All public functions are pure: same input -> same output, no I/O,
- * no mutation of arguments. Parser failure is communicated by a
- * `null` return value.
- */
 import type { ConnectionType } from "../connectionTypes";
 import { CONNECTION_TYPES } from "../connectionTypes";
 
@@ -24,7 +17,6 @@ export interface PanelRetentionState {
 
 type UnknownRecord = Record<string, unknown>;
 
-/** True for plain objects (no `null`, no arrays). */
 export function isRecord(value: unknown): value is UnknownRecord {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -53,7 +45,6 @@ export function readOptionalBoolean(
   return typeof value === "boolean" ? value : undefined;
 }
 
-/** Reads a finite number; accepts numeric and non-empty numeric strings. */
 export function readOptionalNumber(
   record: UnknownRecord,
   key: string,
@@ -69,7 +60,6 @@ export function readOptionalNumber(
   return undefined;
 }
 
-/** Reads a positive integer; accepts numeric and non-empty numeric strings. */
 export function readPositiveInteger(value: unknown): number | undefined {
   if (typeof value === "number") {
     return Number.isInteger(value) && value > 0 ? value : undefined;

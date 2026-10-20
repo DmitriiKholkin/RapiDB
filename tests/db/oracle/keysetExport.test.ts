@@ -67,8 +67,6 @@ describe("Oracle timezone-aware keyset export", () => {
             )) {
               ids.push(...chunk.rows.map((row) => row.ID));
               if (++batches > 6) throw new Error("Export did not terminate");
-              // Change timezone while the generator is suspended: the next
-              // cursor must still denote the same instant as the previous row.
               const nextTimezone =
                 batches % 2 === 0 ? sessionTimezone : "+09:00";
               await driver.query(

@@ -136,7 +136,6 @@ function harness(path: Path) {
     if (path === "prepared-update")
       return executePreparedApplyPlan(manager, apply);
     if (path === "prepared-insert") {
-      // The single-insert consumer must retain the service's no-execution evidence.
       const preview = controller.createApplyChangesPreview("insert-one", {
         apply: null,
         applyResultWhenEmpty: null,

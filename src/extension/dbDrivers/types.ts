@@ -60,21 +60,16 @@ export interface QueryResult {
   rowCount: number;
   executionTimeMs: number;
   affectedRows?: number;
-  /** The selected result was drained, but rows beyond the collection budget were discarded. */
   truncated?: boolean;
 }
 export interface DatabaseExecutionScope {
-  /** Omitted/empty means the connection's default database. */
   database?: string;
 }
 export interface QueryExecutionOptions extends DatabaseExecutionScope {
   requestToken?: number;
   readOnly?: boolean;
-  /** Per-query cancellation; must not cancel a later request on the connection. */
   signal?: AbortSignal;
-  /** Absolute deadline shared by every command in a query batch. */
   deadline?: number;
-  /** Retained-row budget for boundedQueryResults drivers, not a mutation/drain limit. */
   hardCap?: number;
 }
 export function colKey(index: number): string {
@@ -94,7 +89,6 @@ export interface FilterConditionResult {
 export interface MutationSqlExpression {
   sql: string;
   params: unknown[];
-  /** Actual bind metadata when native constructors differ from the column. */
   previewColumns?: ColumnTypeMeta[];
 }
 
@@ -106,16 +100,13 @@ export type ReadOnlyQueryGuard = (queryText: string) => ReadOnlyQueryDecision;
 
 export interface DriverCapabilities {
   tabularRead: "sql" | "nosql";
-  /** No schema namespace: discover objects in a synthetic database-named scope. */
   schemaNamespaces?: "none";
   queryMode?: "sql" | "text";
   supportsMutations?: boolean;
-  /** query(..., { hardCap }) bounds collection across every emitted result set. */
   boundedQueryResults?: boolean;
   editorPresentation?: QueryEditorPresentation;
   isTableFilterError?: (message: string) => boolean;
   readOnlyQueryGuard?: ReadOnlyQueryGuard;
-  /** Returns whether a native query may change discoverable schema objects. */
   schemaMutationGuard?: (queryText: string) => boolean;
 }
 
@@ -186,16 +177,13 @@ export interface DriverTablePageRequest {
   sort: DriverSortConfig | null;
   skipCount: boolean;
   signal?: AbortSignal;
-  /** Absolute deadline supplied by the operation timeout wrapper. */
   deadline?: number;
 }
 
 export interface DriverTablePageResult {
   columns: ColumnTypeMeta[];
   rows: Record<string, unknown>[];
-  /** BSON _id type for each MongoDB table row, aligned with rows. */
   mongoIdTypes?: Array<"objectId" | "string" | null>;
-  /** Per-row BSON field types, aligned with rows, for schema-less edits. */
   mongoValueTypes?: Array<Record<string, MongoValueTypeHint>>;
   totalCount: number;
   executionTimeMs?: number;
@@ -221,7 +209,6 @@ export interface DriverUpdateRowsRequest {
     primaryKeys: Record<string, unknown>;
     changes: Record<string, unknown>;
     originalValues?: Record<string, unknown>;
-    /** Original MongoDB field types, including null, undefined and missing. */
     originalTypes?: Record<string, MongoValueTypeHint>;
   }>;
 }
@@ -246,7 +233,6 @@ export interface DriverMutationResult {
   updateRowOutcomes?: DriverUpdateRowOutcome[];
 }
 export interface DriverUpdateRowOutcome {
-  /** Zero-based index in DriverUpdateRowsRequest.updates. */
   rowIndex: number;
   status: "applied" | "not_applied" | "unknown";
 }
@@ -273,7 +259,6 @@ export interface IDBDriver {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   isConnected(): boolean;
-  /** A lost stateful session must not be replaced by an implicit reconnect. */
   getAutomaticReconnectBlockReason?(): string | undefined;
   cancelCurrentOperation?(
     context?: OperationCancellationContext,
@@ -360,14 +345,11 @@ export interface IDBDriver {
   readTablePage?(
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult>;
-  /** Drop any driver-owned read/page cursor state after an explicit refresh. */
   clearTableReadCache?(): void;
-  /** Full unfiltered/default-order export; owns cursor/snapshot cleanup. */
   exportTableChunks?(
     request: DriverTableExportRequest,
     signal?: AbortSignal,
   ): AsyncIterable<DriverTableExportChunk>;
-  /** Validate raw Viewer edits before sampled metadata can filter/coerce fields. */
   validateTableUpdates?(
     updates: readonly Pick<
       DriverUpdateRowsRequest["updates"][number],
@@ -426,11 +408,8 @@ export interface IDBDriver {
   ): Promise<string | null>;
   quoteIdentifier(name: string): string;
   qualifiedTableName(database: string, schema: string, table: string): string;
-  /** Optional typed projection for paged Table Viewer reads. */
   buildTableDataProjection?(columns: readonly ColumnTypeMeta[]): string;
-  /** Read a value exactly on the active transaction before committing a mutation. */
   buildVerificationValueExpr?(column: ColumnTypeMeta): string;
-  /** Format a projected table value using any driver-specific companion values. */
   formatTableDataValue?(
     value: unknown,
     column: ColumnTypeMeta,
@@ -438,7 +417,6 @@ export interface IDBDriver {
     columnIndex: number,
     columns?: readonly ColumnTypeMeta[],
   ): unknown;
-  /** Whether a projection-specific server limitation can use a raw-column fallback. */
   shouldFallbackTableDataProjection?(error: unknown): boolean;
   buildPagination(
     offset: number,
@@ -446,33 +424,28 @@ export interface IDBDriver {
     paramIndex: number,
   ): PaginationResult;
   buildOrderByDefault(cols: ColumnTypeMeta[], tableReference?: string): string;
-  /** Use source columns when display projections reuse their result names. */
   buildTableDataOrderExpression?(
     columnName: string,
     tableReference: string,
   ): string;
   coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown;
-  /** Coerce a Table Viewer edit while optionally preserving a row's native type. */
   coerceTableEditValue?(
     value: unknown,
     column: ColumnTypeMeta,
     options?: { preserveNativeType?: boolean },
   ): unknown;
-  /** Validate and decode a table row locator without guessing from sampled types. */
   coercePrimaryKeyValue?(value: unknown, column: ColumnTypeMeta): unknown;
   coerceOriginalValue?(value: unknown, column: ColumnTypeMeta): unknown;
   buildOriginalValueComparison?(
     column: ColumnTypeMeta,
     paramIndex: number,
   ): string;
-  /** Optional comparison that expands one logical original value into multiple positional binds. */
   buildOriginalValueComparisonWithParams?(
     column: ColumnTypeMeta,
     value: unknown,
     paramIndex: number,
     tableAlias?: string,
   ): MutationSqlExpression | null;
-  /** Optional alias applied to UPDATE targets for driver-specific predicates. */
   getUpdateTableAlias?(): string | null;
   formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown;
   checkPersistedEdit(
@@ -491,7 +464,6 @@ export interface IDBDriver {
     value: string | [string, string] | undefined,
     paramIndex: number,
   ): FilterConditionResult | null;
-  /** Exact comparison of a raw query value in database sort order (no filter tolerance). */
   buildCursorComparison?(
     column: ColumnTypeMeta,
     operator: "eq" | "gt" | "lt",
@@ -504,7 +476,6 @@ export interface IDBDriver {
   ): string;
   buildInsertValueExpr(column: ColumnTypeMeta, paramIndex: number): string;
   buildSetExpr(column: ColumnTypeMeta, paramIndex: number): string;
-  /** Optional native expression for values that need database-specific construction. */
   buildMutationValueExpr?(
     column: ColumnTypeMeta,
     value: unknown,
@@ -516,7 +487,6 @@ export interface IDBDriver {
 }
 export interface TransactionContext extends DriverOperationContext {}
 
-/** Serializable so verification also runs inside the SQLite execution worker. */
 export interface TransactionVerification {
   rowIndex: number;
   mutation?: "insert" | "update";
@@ -527,19 +497,14 @@ export interface TransactionVerification {
     expectedValue: unknown;
     originalValue?: unknown;
   }>;
-  /** Replace these positional parameters with the identity captured immediately
-   * after this operation, not the last identity of the whole batch. */
   identity?: {
     operationIndex: number;
     parameterIndexes: number[];
-    /** SQLite composite primary keys may contain NULL; the read must be NULL-safe. */
     allowNull?: boolean;
   };
 }
 
 export interface TransactionOptions extends DatabaseExecutionScope {
-  /** Read and validate on the transaction's connection after DML, before COMMIT.
-   * Any read/check failure must abort the entire transaction. */
   verifications?: TransactionVerification[];
 }
 
@@ -548,26 +513,16 @@ export interface TransactionOperation {
   params?: unknown[];
   checkAffectedRows?: boolean;
   expectedAffectedRows?: number;
-  /** Capture returned __col_N keys, or execute this identity SELECT on the same
-   * transaction connection immediately after DML. Serializable across SQLite IPC. */
   captureIdentity?: {
     sql?: string;
     params?: unknown[];
     mysqlInsertId?: {
       sql: string;
-      /** A writable AUTO_INCREMENT PK input coerced to zero. The executor must
-       * resolve generation using its own session mode for each operation. Literal
-       * zero needs an absence/range-lock guard before trusting packet ID zero. */
       zero?: { columnName: string; keyIndex: number; guardSql: string };
     };
-    /** For explicit non-auto MySQL keys: prove absence while holding serializable
-     * key-range locks, so verification cannot accidentally select a preexisting row. */
     mysqlKeyGuard?: { sql: string; params: unknown[] };
     oracleOutTypes?: Array<"string" | "buffer">;
-    /** Executed after @@ROWCOUNT is saved, within the same SQL batch/scope. */
     mssqlSelect?: string;
-    /** OUTPUT fabricates rows for INSTEAD OF INSERT. Inspect this target on the
-     * transaction connection under locks before trusting returned identities. */
     mssqlInsertTarget?: { database: string; schema: string; table: string };
   };
 }

@@ -1,6 +1,5 @@
 import type { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
 
-/** Produce a read identity for isolated mutation tests with mocked clients. */
 export function elasticsearchKeys(
   driver: ElasticsearchDriver,
   id: string,

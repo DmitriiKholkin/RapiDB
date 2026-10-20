@@ -128,7 +128,6 @@ export function isConnectionTlsEnabled(mode: ConnectionTlsMode): boolean {
   return mode !== "disabled";
 }
 
-/** An explicit HTTP node cannot satisfy an Elasticsearch TLS policy. */
 export function getElasticsearchTlsEndpointError(
   config: Partial<ConnectionConfig>,
 ): string | undefined {
@@ -143,9 +142,7 @@ export function getElasticsearchTlsEndpointError(
   if (endpoint === undefined) return undefined;
   try {
     if (new URL(endpoint).protocol === "https:") return undefined;
-  } catch {
-    // Do not echo an endpoint: its URI may contain credentials.
-  }
+  } catch {}
   return "Elasticsearch TLS requires an HTTPS connection URI or endpoint.";
 }
 

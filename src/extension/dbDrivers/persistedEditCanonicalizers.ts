@@ -1,10 +1,3 @@
-/**
- * Persisted-edit value canonicalizers and diagnostic helpers.
- * Extracted from BaseDBDriver for single-responsibility adherence.
- *
- * Each canonicalizer converts a user-supplied value into a normalized
- * string representation used for edit-verification comparison.
- */
 import { NULL_SENTINEL } from "../../shared/tableTypes";
 import { formatDatetimeForDisplay } from "../utils/dateUtils";
 import {
@@ -19,20 +12,11 @@ import {
   parseDecimalString,
 } from "./numericUtils";
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/** Sentinel token used to represent SQL NULL in persisted-edit canonicalization. */
 export const PERSISTED_EDIT_NULL_TOKEN =
   "\x00__RAPIDB_PERSISTED_EDIT_NULL__\x00";
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 export interface CanonicalPersistedEditValue {
   canonical: string;
@@ -42,10 +26,6 @@ export type PersistedEditCanonicalizer = (
   value: unknown,
 ) => CanonicalPersistedEditValue | null;
 
-// ---------------------------------------------------------------------------
-// Null handling (shared by every canonicalizer)
-// ---------------------------------------------------------------------------
-
 export function canonicalizeNullishPersistedEditValue(
   value: unknown,
 ): CanonicalPersistedEditValue | null {
@@ -54,10 +34,6 @@ export function canonicalizeNullishPersistedEditValue(
   }
   return null;
 }
-
-// ---------------------------------------------------------------------------
-// Type-specific canonicalizers
-// ---------------------------------------------------------------------------
 
 export function canonicalizeTextPersistedEditValue(
   value: unknown,
@@ -122,11 +98,6 @@ export function canonicalizeUuidPersistedEditValue(
   return { canonical: normalized };
 }
 
-// ---------------------------------------------------------------------------
-// JSON canonicalization (stable key ordering)
-// ---------------------------------------------------------------------------
-
-/** Recursively sort object keys for stable JSON serialization. */
 export function stableJsonValue(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map((item) => stableJsonValue(item));
@@ -213,10 +184,6 @@ export function canonicalizeJsonArrayPersistedEditValue(
   return null;
 }
 
-// ---------------------------------------------------------------------------
-// Binary / hex canonicalization
-// ---------------------------------------------------------------------------
-
 function toPersistedEditBuffer(value: unknown): Buffer | null {
   if (Buffer.isBuffer(value)) {
     return value;
@@ -255,10 +222,6 @@ export function canonicalizeBinaryPersistedEditValue(
   };
 }
 
-// ---------------------------------------------------------------------------
-// Numeric canonicalization
-// ---------------------------------------------------------------------------
-
 export function canonicalizeApproximateNumericPersistedEditValue(
   value: unknown,
   significantDigits: number,
@@ -282,10 +245,6 @@ export function canonicalizeApproximateNumericPersistedEditValue(
   };
 }
 
-/**
- * Detect when an approximate-numeric value would suffer precision loss
- * at the given significant-digits limit. Returns the rounded value or null.
- */
 export function findApproximateNumericPrecisionLoss(
   value: unknown,
   significantDigits: number,
@@ -322,11 +281,6 @@ export function findApproximateNumericPrecisionLoss(
   };
 }
 
-// ---------------------------------------------------------------------------
-// Diagnostic helpers
-// ---------------------------------------------------------------------------
-
-/** Format a value for human-readable diagnostic messages. */
 export function formatDiagnosticValue(value: unknown): string {
   if (value === null) return "NULL";
   if (value === undefined) return "<missing>";
@@ -350,10 +304,6 @@ export interface ExactNumericConstraint {
   scale: number | null;
 }
 
-/**
- * Build a human-readable validation message when an exact-numeric value
- * violates its column precision/scale constraint.
- */
 export function buildValidationMessage(
   columnName: string,
   constraint: ExactNumericConstraint,

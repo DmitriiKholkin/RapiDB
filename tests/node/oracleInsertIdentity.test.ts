@@ -95,7 +95,7 @@ function fixture(
             ? 'RETURNING "id" INTO'
             : "RETURNING TO_CHAR(\"id\", 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,''')",
         );
-        expect(sql.split(" RETURNING ")[0]).not.toContain('"id"'); // GENERATED ALWAYS: no PK input.
+        expect(sql.split(" RETURNING ")[0]).not.toContain('"id"');
         expect(binds.slice(-outputCount)).toEqual([
           { dir: oracledb.BIND_OUT, type: oracledb.STRING, maxSize: 32767 },
           ...(options.composite

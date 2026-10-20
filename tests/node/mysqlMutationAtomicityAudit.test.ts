@@ -233,7 +233,6 @@ describe("MySQL mutation atomicity metadata audit", () => {
   });
 });
 
-// Opt-in isolated MariaDB only; no compose services or production credentials.
 const livePort = Number(process.env.RAPIDB_MYSQL_ATOMICITY_AUDIT_PORT);
 describe.runIf(Boolean(livePort))("MySQL atomicity (live MariaDB)", () => {
   async function live(

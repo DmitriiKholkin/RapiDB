@@ -233,8 +233,6 @@ describe("H1 shared builders and dialect edge cases", () => {
     );
     expect(result.clause).toContain("LIKE CAST(UNHEX(?) AS CHAR) ESCAPE '!'");
     expect(String(result.params[0])).toMatch(/^[0-9a-f]+$/);
-    // Exercise mysql2's real text-protocol formatter: no backslash escapes or
-    // user-controlled SQL quotes can reach either SQL-mode parser.
     const formatted = mysql.format(result.clause, result.params.map(String));
     expect(formatted).not.toContain("\\");
     expect(formatted).not.toContain("OR 1=1");

@@ -35,8 +35,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  // Replace the state so each test starts fresh. The mock factory closes
-  // over the same state object via getSharedWorkflowState().
   workflowState = resetSharedWorkflowState();
 });
 

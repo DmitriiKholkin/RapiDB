@@ -18,7 +18,6 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-// Observe, but never alter, the real IPC client's active request and FIFO.
 function workerRequests(driver: SQLiteDriver) {
   return (
     driver as unknown as {
@@ -88,7 +87,6 @@ describe("UPDATE verification transaction rollback", () => {
     const transaction = vi
       .spyOn(driver, "runTransaction")
       .mockImplementation((...args) => {
-        // Observe the real transaction enqueue, not its completion.
         const pending = original(...args);
         enqueued.resolve();
         return pending;
@@ -104,7 +102,6 @@ describe("UPDATE verification transaction rollback", () => {
     if (riskCheck) {
       expect(riskCheck).toHaveBeenCalledExactlyOnceWith("", "main", "edits");
       expect(transaction).not.toHaveBeenCalled();
-      // Before metadata resolves, apply is not queued and a read may see old data.
       expect((await driver.query("SELECT id, amount FROM edits")).rows).toEqual(
         [{ __col_0: 1, __col_1: 0 }],
       );
@@ -114,14 +111,12 @@ describe("UPDATE verification transaction rollback", () => {
     }
     await enqueued.promise;
     const queuedRead = driver.query("SELECT id, amount FROM edits");
-    // Inspect the IPC FIFO before a reply can complete the transaction.
     const worker = workerRequests(driver);
     const queueAtRead = {
       applySettled,
       active: worker.active?.request,
       queuedMethods: worker.queue.map(({ request }) => request.method),
     };
-    // Drain both promises before assertions to avoid an unhandled read rejection.
     const [result, selected] = await Promise.all([pending, queuedRead]);
     expect(queueAtRead.applySettled).toBe(false);
     expect(queueAtRead.active?.method).toBe("runTransaction");

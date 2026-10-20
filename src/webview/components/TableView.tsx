@@ -187,7 +187,6 @@ export function TableView({
     tableDraftKey,
   ]);
 
-  // Retry deferred metadata only after mutation/editor state has committed.
   useEffect(() => {
     void data.metadataTick;
     void mutation.pendingEdits;

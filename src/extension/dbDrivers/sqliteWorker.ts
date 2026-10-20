@@ -7,8 +7,6 @@ import {
 import { TransactionVerificationError } from "./transactionVerification";
 
 let driver: SQLiteCoreDriver | undefined;
-// Defense in depth: even a caller bypassing the host queue cannot interleave
-// transactions or async metadata methods on the same database handle.
 let queue = Promise.resolve();
 process.on("message", (request: SQLiteWorkerRequest) => {
   queue = queue
@@ -70,5 +68,4 @@ process.on("message", (request: SQLiteWorkerRequest) => {
     })
     .catch(() => process.exit(1));
 });
-// Release the idle DB handle after the host's IPC channel closes.
 process.on("disconnect", () => process.exit(0));

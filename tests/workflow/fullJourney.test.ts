@@ -31,13 +31,10 @@ async function seedEntities(
   connection: ReturnType<typeof scenario.buildConnection>,
   connectionManager?: ConnectionManager,
 ): Promise<void> {
-  // DynamoDB requires CreateTable via the admin client; handle separately.
   if (scenario.engineId === "dynamodb") {
     await seedDynamoDbTable(connection, scenario);
     return;
   }
-  // Prefer the already-connected driver from ConnectionManager (has timeout
-  // wrapper) over creating a raw driver (which has no timeout protection).
   const connectedDriver = connectionManager?.getDriver(connection.id);
   if (connectedDriver) {
     for (const statement of scenario.createEntities.statements) {
@@ -62,7 +59,6 @@ async function cleanupEntities(
       await cleanupDynamoDbTable(connection, scenario);
       return;
     }
-    // Prefer the already-connected driver from ConnectionManager.
     const connectedDriver = connectionManager?.getDriver(connection.id);
     if (connectedDriver) {
       for (const statement of scenario.cleanup.statements) {
@@ -75,9 +71,7 @@ async function cleanupEntities(
         await driver.query(statement);
       }
     });
-  } catch {
-    // Ignore cleanup errors.
-  }
+  } catch {}
 }
 
 async function createDynamoDbClient() {
@@ -103,9 +97,7 @@ async function seedDynamoDbTable(
   const client = await createDynamoDbClient();
   try {
     await client.send(new DeleteTableCommand({ TableName: tableName }));
-  } catch {
-    // ignore if table does not exist
-  }
+  } catch {}
   try {
     await client.send(
       new CreateTableCommand({
@@ -135,7 +127,6 @@ async function cleanupDynamoDbTable(
   try {
     await client.send(new DeleteTableCommand({ TableName: tableName }));
   } catch {
-    // ignore
   } finally {
     client.destroy();
   }
@@ -147,8 +138,6 @@ async function countRows(
   table: string,
   schema: string | undefined,
 ): Promise<number> {
-  // For DynamoDB, the native Scan path paginates. Use the AWS SDK directly
-  // to get an accurate count.
   if (scenario.engineId === "dynamodb") {
     return countDynamoDbRows(table);
   }
@@ -165,7 +154,6 @@ async function countDynamoDbRows(table: string): Promise<number> {
   const { ScanCommand } = await import("@aws-sdk/client-dynamodb");
   const client = await createDynamoDbClient();
   try {
-    // Single-page scan is sufficient for the small test fixtures (3 items).
     const result = await client.send(new ScanCommand({ TableName: table }));
     return (result.Items ?? []).length;
   } finally {
@@ -253,9 +241,6 @@ async function waitForTablePanel(
 async function runFullJourneyForEngine(
   engineId: WorkflowEngineId,
 ): Promise<void> {
-  // Clone the scenario so mutations (buildConnection override) don't leak
-  // across describe blocks. getScenario() returns a fresh factory call, but
-  // we clone explicitly to make the intent clear.
   const scenario = { ...getScenario(engineId) };
   let connection = scenario.buildConnection();
 
@@ -264,7 +249,6 @@ async function runFullJourneyForEngine(
     connection = scenario.buildConnection(filePath);
     scenario.buildConnection = () => connection;
   } else {
-    // For live engines, replace the connection's password via env if present.
     const envKey = `${engineId.toUpperCase()}_PASSWORD`;
     const envPassword = process.env[envKey];
     if (envPassword) {
@@ -284,16 +268,12 @@ async function runFullJourneyForEngine(
   });
 
   try {
-    // 1. Connection is already in the store, but the UI flow normally
-    //    would add it via the form. We exercise the form path symbolically.
     const form = await context.openConnectionForm();
     form.session.unmount();
     form.handle.dispose();
 
-    // 2. Connect.
     await context.connect();
 
-    // 2b. Preflight: verify the connection is alive before seeding.
     const connectedDriver = context.connectionManager.getDriver(connection.id);
     if (connectedDriver) {
       for (const stmt of scenario.preflight) {
@@ -301,20 +281,15 @@ async function runFullJourneyForEngine(
       }
     }
 
-    // 3. Open query editor and run DDL.
     const { openQueryEditor } = context;
     const query = await openQueryEditor();
     query.session.unmount();
     query.handle.dispose();
 
-    // Seed directly through the driver (the query editor executeQuery path
-    // is covered by other unit tests; this is the bridge validation).
     await seedEntities(scenario, connection, context.connectionManager);
 
-    // 4. Refresh the schema cache so the explorer sees the new table.
     await context.connectionManager.refreshSchemaCache(connection.id);
 
-    // 5. Open table viewer (skipped for engines without a relational table).
     let opened: OpenTableResult | undefined;
     if (
       scenario.engineId !== "redis" &&
@@ -325,7 +300,6 @@ async function runFullJourneyForEngine(
       expect(opened.handle).toBeDefined();
       await waitForTablePanel(scenario, scenario.tableFixture.table);
 
-      // Wait for the columns to be rendered in the DOM.
       await waitFor(
         () => {
           const tables = Array.from(
@@ -339,7 +313,6 @@ async function runFullJourneyForEngine(
           const headerTexts = Array.from(headerElements).map((th) =>
             th.getAttribute("data-column-id"),
           );
-          // The table fixture columns must be present.
           for (const col of scenario.tableFixture.columns) {
             expect(headerTexts).toContain(col.name);
           }
@@ -348,7 +321,6 @@ async function runFullJourneyForEngine(
       );
     }
 
-    // 6. Verify table is rendered.
     if (
       scenario.engineId !== "redis" &&
       scenario.engineId !== "elasticsearch"
@@ -357,18 +329,15 @@ async function runFullJourneyForEngine(
       await waitForRowCount(scenario.tableFixture.rowCount);
     }
 
-    // 7-9. UI actions on the table (skipped for engines without a table).
     if (
       scenario.engineId !== "redis" &&
       scenario.engineId !== "elasticsearch"
     ) {
-      // 7. Resize a column.
       const resizeCol = scenario.tableFixture.columns[1]?.name ?? "title";
       if (findResizeHandle(resizeCol)) {
         resizeColumn(resizeCol, 40);
       }
 
-      // 8. Drag-reorder two columns.
       if (
         scenario.capabilities.structuredCell &&
         scenario.tableFixture.columns.length >= 2
@@ -386,26 +355,18 @@ async function runFullJourneyForEngine(
         }
       }
 
-      // 9. Hide another column.
       if (scenario.tableFixture.columns[2]) {
         hideColumn(scenario.tableFixture.columns[2].name);
       }
 
-      // Unmount table viewer session now that UI checks are done.
       opened?.session.unmount();
     }
 
-    // 10. Verify the export pipeline is reachable.
     if (scenario.capabilities.csvExport) {
       const exportButton = screen.queryByRole("button", { name: /csv/i });
       expect(exportButton).toBeDefined();
     }
 
-    // 11. Add a new row directly through the driver (we are testing the
-    //     bridge, not the mutation UI which is exercised in the unit
-    //     tests for the table mutation controller).
-    // Skip the countRows check for engines where the count query isn't
-    // easily translatable (elasticsearch, dynamodb).
     if (
       scenario.engineId !== "elasticsearch" &&
       scenario.engineId !== "dynamodb"
@@ -419,7 +380,6 @@ async function runFullJourneyForEngine(
       expect(beforeCount).toBe(scenario.tableFixture.rowCount);
     }
 
-    // 12. Open ERD viewer (skipped for engines without relational schema).
     if (
       scenario.engineId !== "redis" &&
       scenario.engineId !== "elasticsearch" &&
@@ -429,9 +389,6 @@ async function runFullJourneyForEngine(
       const { openErdViewer } = context;
       const erd = await openErdViewer();
       expect(erd.handle).toBeDefined();
-      // Opening the panel starts asynchronous metadata reads. Complete the
-      // ERD journey before closing its connection: Oracle pool shutdown can
-      // otherwise race queued getConnection requests from graph loading.
       await waitFor(
         () => {
           const messages = erd.session.hostMessages();
@@ -455,10 +412,8 @@ async function runFullJourneyForEngine(
       ErdPanel.disposeAll();
     }
 
-    // 13. Cleanup through the query editor.
     await cleanupEntities(scenario, connection, context.connectionManager);
 
-    // 14. Delete connection.
     await context.connectionManager.removeConnection(connection.id);
   } finally {
     TablePanel.disposeAll();
@@ -477,8 +432,6 @@ const liveEnginesAvailable =
   Boolean(process.env.RAPIDB_WORKFLOW_ENGINES) || isDockerAvailable();
 
 function isDockerAvailable(): boolean {
-  // Heuristic: if we can reach the postgres port, assume docker is up.
-  // Cross-platform: use `nc` (available on macOS/Linux) or `powershell` (Windows).
   const isWin = process.platform === "win32";
   const cmd = isWin
     ? 'powershell -Command "Test-NetConnection -ComputerName 127.0.0.1 -Port 5432 -InformationLevel Quiet"'
@@ -494,9 +447,7 @@ function isDockerAvailable(): boolean {
 for (const engineId of enabledEngines) {
   describe(`workflow full journey — ${engineId}`, () => {
     afterEach(() => {
-      // Unmount any remaining React trees to prevent DOM leakage.
       cleanup();
-      // Ensure panels are cleared between tests.
       while ((workflowState.panels as unknown[]).length > 0) {
         (workflowState.panels as unknown[]).pop();
       }

@@ -107,7 +107,6 @@ describe("readOnly bypass regressions (stage 1)", () => {
     expect(guard("VALUES (pg_terminate_backend(1))").allowed).toBe(false);
     expect(guard("SELECT pg_catalog.nextval('s')").allowed).toBe(false);
     expect(guard("SELECT NEXTVAL('s')").allowed).toBe(false);
-    // Bare name without call is a column, not a mutation.
     expect(guard("SELECT nextval FROM t")).toEqual({ allowed: true });
   });
 
@@ -118,7 +117,6 @@ describe("readOnly bypass regressions (stage 1)", () => {
     expect(guard("SELECT `nextval`('s')").allowed).toBe(false);
     expect(guard("SELECT [nextval](1)").allowed).toBe(false);
     expect(guard("SELECT pg_catalog.\"nextval\"('s')").allowed).toBe(false);
-    // Quoted non-call stays allowed.
     expect(guard('SELECT "nextval" FROM t')).toEqual({ allowed: true });
   });
 
@@ -445,12 +443,10 @@ describe("readOnly bypass regressions (stage 1)", () => {
     expect(guard("SELECT 1 /*!50000 DELETE FROM t */").allowed).toBe(false);
     expect(guard("SELECT 1 /*M!50000 DELETE FROM t */").allowed).toBe(false);
     expect(guard("SELECT 1").allowed).toBe(true);
-    // Executable-looking text inside a string literal must not trigger.
     expect(guard("SELECT '/*!50000 DELETE */'").allowed).toBe(true);
   });
 
   it("treats executable comments as plain comments on other dialects", () => {
-    // PostgreSQL does not execute /*! ... */, so classification stays read-only.
     expect(
       sqlReadOnlyQueryGuard("SELECT 1 /*!50000 DELETE FROM t */", "postgresql"),
     ).toEqual({ allowed: true });
@@ -458,11 +454,8 @@ describe("readOnly bypass regressions (stage 1)", () => {
 
   it("ignores spaced comments and handles unterminated executable comments", () => {
     const guard = mysqlGuard();
-    // `/* !` with a space is a plain comment, not executable.
     expect(guard("SELECT 1 /* !50000 DELETE FROM t */").allowed).toBe(true);
-    // Lowercase m is a plain comment; only uppercase M! executes on MariaDB.
     expect(guard("SELECT 1 /*m!50000 DELETE FROM t */").allowed).toBe(true);
-    // Unterminated executable comment fails closed.
     expect(guard("SELECT 1 /*!50000 DELETE FROM t").allowed).toBe(false);
   });
 
@@ -515,7 +508,6 @@ describe("readOnly bypass regressions (stage 1)", () => {
     expect(mayChangeDatabaseSchema("SELECT 1 /*!50000 DELETE FROM t */")).toBe(
       true,
     );
-    // Explicit non-MySQL dialect avoids the conservative refresh.
     expect(
       mayChangeDatabaseSchema("SELECT 1 /*!50000 SELECT 1 */", "postgresql"),
     ).toBe(false);

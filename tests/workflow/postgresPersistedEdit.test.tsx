@@ -144,7 +144,6 @@ describe.runIf(enabled)(
           ).rows.map((row) => row.__col_0),
         ).toEqual(["0.00", "0.00"]);
 
-        // Correct the bad value and prove valid p=s and UUIDv7 survive preview/save/verification.
         edit("amount", bad === "insert" ? 0 : 1, "4.56");
         edit("fraction", 1, "0.12");
         edit("u", 1, "01890f47-6a42-7cc3-98c4-dc0c0c07398f");

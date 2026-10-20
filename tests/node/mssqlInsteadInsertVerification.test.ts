@@ -43,12 +43,6 @@ type CatalogObject = {
   trigger?: Trigger;
 };
 
-/** Only the node-mssql transaction/request boundary is mocked. SQL Server's
- * OUTPUT documentation, "Triggers": with INSTEAD OF, OUTPUT is generated as if
- * DML occurred, even when the trigger makes no modifications. The preexisting
- * row therefore passes ordinary read-back despite this INSERT doing no DML.
- * https://learn.microsoft.com/en-us/sql/t-sql/queries/output-clause-transact-sql#triggers
- */
 function harness(
   options: {
     trigger?: Trigger;
@@ -133,7 +127,6 @@ function harness(
           stage("GUARD");
           guardInputs.push(inputs);
           const actualTable = String(params[1]);
-          // Validate executed SQL, not a mocked guard function or planning read.
           expect(sql).toContain(`USE ${driver.quoteIdentifier(database)};`);
           expect(sql).toContain("sys.triggers");
           expect(sql).toContain("is_instead_of_trigger = 1");
@@ -172,8 +165,6 @@ function harness(
           expect(params[2]).toBe(
             `${driver.quoteIdentifier(schema)}.${driver.quoteIdentifier(options.catalog ? table : actualTable)}`,
           );
-          // Evaluate object lookup using the actual bound schema/table, independently
-          // of the bracket-quoted lock target and permission object's original name.
           const found = options.catalog?.find(
             (object) =>
               object.schema === params[0] && object.table === params[1],
@@ -229,7 +220,6 @@ function harness(
           }
           outputs.push([id]);
           return {
-            // Audit trigger resultset/count must never be treated as identity.
             recordset: [{ __col_0: 999 }],
             recordsets: [[{ __col_0: 999 }], [{ __col_0: id }]],
             rowsAffected: [1, 7],

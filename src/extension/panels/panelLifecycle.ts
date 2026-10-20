@@ -3,9 +3,7 @@ import * as vscode from "vscode";
 function safelyDispose(action: () => void): void {
   try {
     action();
-  } catch {
-    // Ignore dispose errors during panel shutdown and forced cleanup.
-  }
+  } catch {}
 }
 
 export function attachPanelDisposables(

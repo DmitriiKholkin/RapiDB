@@ -1,6 +1,5 @@
 import * as tls from "node:tls";
 
-// RESP2 command acknowledgments only; node-redis performs the real handshake.
 export async function startRedisTlsFixture(options: tls.TlsOptions) {
   const sockets = new Set<tls.TLSSocket>();
   const servernames: Array<string | false> = [];

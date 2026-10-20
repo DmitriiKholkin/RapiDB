@@ -11,7 +11,6 @@ export const MONGO_QUERY_ERROR_URIS = [
   "mongodb:///db?authMechanismProperties=AWS_SESSION_TOKEN:p H10_QUERY_SECRET&retryWrites=true",
 ] as const;
 
-/** Actual installed upstream parser error; no connection/network is attempted. */
 export function mongoCredentialError(uri = MONGO_ERROR_URI): Error {
   try {
     new MongoClient(uri);

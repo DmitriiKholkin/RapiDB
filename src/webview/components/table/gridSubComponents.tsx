@@ -1,17 +1,7 @@
-/**
- * Shared sub-components for TableGrid and QueryResultsGrid.
- *
- * These small, presentational components were extracted from TableGrid.tsx
- * to reduce its size and improve reusability.
- */
 import React from "react";
-
-// ─── Constants ──────────────────────────────────────────────────────────────
 
 export const RESIZE_HANDLE_WIDTH = 12;
 export const RESIZE_HANDLE_OVERHANG = 6;
-
-// ─── Helper Functions ───────────────────────────────────────────────────────
 
 export function isCollapsedWidth(width: number): boolean {
   return width <= 1;
@@ -30,8 +20,6 @@ export function getBaseTableStyle(width: number): React.CSSProperties {
     fontFamily: "var(--vscode-editor-font-family, monospace)",
   };
 }
-
-// ─── Components ─────────────────────────────────────────────────────────────
 
 export function HeaderContent({
   isCollapsed,

@@ -24,8 +24,6 @@ import React, {
   useRef,
   useState,
 } from "react";
-// biome-ignore lint/suspicious/noTsIgnore: TypeScript does not resolve this bundler-only stylesheet import reliably here.
-// @ts-ignore Bundler resolves this stylesheet import for the webview bundle.
 import "../xyflow.css";
 import { formatPrimaryKeyBadgeLabel } from "../../shared/tableTypes";
 import type { ErdGraph } from "../../shared/webviewContracts";
@@ -141,9 +139,6 @@ function handleId(side: "left" | "right", columnName: string): string {
   return `${side}-${normalizeHandlePart(columnName)}`;
 }
 
-// Visibility is a presentation filter, not the source of persisted node IDs.
-// Reconcile against the authoritative graph so hidden nodes survive and removed
-// nodes cannot be resurrected by a later viewport/drag callback.
 function mergeNodePositions(
   graph: ErdGraph,
   savedPositions: NonNullable<ErdViewState["nodePositions"]>,
@@ -950,7 +945,6 @@ export function ErdView({
 
   const updateManualPositions = useCallback(
     (positions: NonNullable<ErdViewState["nodePositions"]>) => {
-      // Message/ReactFlow callbacks may run together before React commits.
       manualPositionsRef.current = positions;
       setManualPositions(positions);
     },
@@ -1139,9 +1133,6 @@ export function ErdView({
   ]);
 
   useEffect(() => {
-    // Graph/filter/LOD preparation may predate a position callback in the same
-    // React batch. Rebuild presentation using the latest live coordinates;
-    // only new/unhidden nodes fall back to their cached/layout positions.
     const livePositions = new Map(
       flowNodesRef.current.map((node) => [node.id, node.position]),
     );

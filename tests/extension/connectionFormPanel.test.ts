@@ -175,7 +175,6 @@ describe("ConnectionFormPanel", () => {
     expect(connectionManager.saveConnection).not.toHaveBeenCalled();
     expect(context.secrets.store).not.toHaveBeenCalled();
     expect(context.secrets.delete).not.toHaveBeenCalled();
-    // Connection tests don't persist anything and must not prompt for consent.
     await panel.webview.dispatchMessage({ type: "testConnection", payload });
     expect(connectionManager.testConnection).toHaveBeenCalledWith(
       expect.objectContaining(payload),
@@ -422,7 +421,6 @@ describe("ConnectionFormPanel", () => {
     expect(context.secrets.get).not.toHaveBeenCalled();
     expect(context.secrets.store).not.toHaveBeenCalled();
 
-    // A valid retry must retain TLS all the way to the manager.
     const tls = { mode: "requireVerifyFull", caFilePath: "/certs/ca.pem" };
     await panel.webview.dispatchMessage({ type, payload: { ...payload, tls } });
     const action =

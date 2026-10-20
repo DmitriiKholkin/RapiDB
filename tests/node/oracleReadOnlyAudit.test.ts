@@ -88,7 +88,6 @@ describe("Oracle read-only autonomous transaction boundary", () => {
   });
 });
 
-// Opt-in only: point this at a disposable Oracle schema, never a production DB.
 const livePort = process.env.RAPIDB_ORACLE_READONLY_AUDIT_PORT;
 describe.skipIf(!livePort)(
   "live Oracle read-only autonomous transaction audit",

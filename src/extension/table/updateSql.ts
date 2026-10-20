@@ -90,7 +90,6 @@ export function coercePrimaryKeyValues(
       ];
     }),
   );
-  // Driver coercion can turn display values (including sentinels) into NULL.
   assertExactPrimaryKeyShape(coerced, columns, operation);
   return coerced;
 }

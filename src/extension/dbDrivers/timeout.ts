@@ -53,7 +53,6 @@ export class DriverTimeoutError extends Error {
 
 interface TimeoutAwareDriverHooks {
   disconnect?(): void | Promise<void>;
-  /** Drivers with connect epochs can cancel just the timed-out attempt. */
   cancelConnectionAttempt?(attempt: Promise<unknown>): void | Promise<void>;
   cancelCurrentOperation?(
     context: OperationCancellationContext,
@@ -269,8 +268,6 @@ async function withDriverTimeout<T>(
 
     void pendingPromise.then(
       (value) => {
-        // Promise microtasks can run before an overdue timer after expensive
-        // synchronous result formatting. Never turn that race into success.
         if (options.deadline !== undefined && Date.now() >= options.deadline) {
           expire();
         }
@@ -288,8 +285,6 @@ async function withDriverTimeout<T>(
         resolve(value);
       },
       (error) => {
-        // SDK deadlines can reject just before our timer callback. Preserve
-        // the same timeout/unknown-mutation outcome in either ordering.
         if (options.deadline !== undefined && Date.now() >= options.deadline) {
           expire();
         }
@@ -314,8 +309,6 @@ export function createTimeoutAwareDriver<T extends object>(
   driver: T,
   timeoutSettingsProvider: DriverTimeoutSettingsProvider,
 ): T {
-  // SQLite's process client owns deadlines and waits for native execution to
-  // stop before settling, including a user-facing lost-session outcome.
   if (Reflect.get(driver, "driverTimeoutsManagedInternally") === true)
     return driver;
   const wrappedMethods = new Map<string, unknown>();

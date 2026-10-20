@@ -11,7 +11,6 @@ import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import { applyChangesTransactional } from "../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
 
-// Opt-in isolated services only: never reuse production credentials or tables.
 const mysqlPort = Number(process.env.RAPIDB_FIX_MYSQL_PORT);
 const esPort = Number(process.env.RAPIDB_FIX_ES_PORT);
 const mongoPort = Number(process.env.RAPIDB_FIX_MONGO_PORT);

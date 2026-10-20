@@ -260,8 +260,6 @@ function hasMongoMultiHostUri(value: string | undefined): boolean {
     return false;
   }
 
-  // Delimit before stripping userinfo; query/path/fragment commas and @ signs
-  // are not part of the seed list. Keep percent-encoded credentials encoded.
   const authority = normalized.slice(schemeIndex + 3).split(/[/?#]/, 1)[0];
   const hosts = authority.includes("@")
     ? authority.slice(authority.lastIndexOf("@") + 1)

@@ -7,11 +7,9 @@ export function queryCollectionLimit(
   if (!Number.isSafeInteger(hardCap) || hardCap < 1) {
     throw new Error("[RapiDB] Query hardCap must be a positive integer.");
   }
-  // One extra row is allowed for the editor's truncation probe.
   return Math.min(hardCap, QUERY_LIMIT_POLICY.hardCap + 1);
 }
 
-/** Retain one selected result at a time; exhausting the budget never stops execution. */
 export class BoundedQueryRows<T> {
   rows: T[] = [];
   rowCount = 0;

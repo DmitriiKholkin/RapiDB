@@ -133,8 +133,6 @@ export function registerNumericFilterPrecisionTests(
           },
           [2, 3],
         );
-        // A one-row page must still receive the full count, not a fallback
-        // derived from the number of fetched rows.
         const first = await service.getPage(
           config.id,
           config.database ?? "",

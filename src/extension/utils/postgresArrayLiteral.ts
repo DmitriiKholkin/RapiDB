@@ -3,14 +3,11 @@ import {
   parsePostgresArrayLiteral,
 } from "./postgresArrayParser";
 
-// JSON numbers are never converted to JS Number: send their exact tokens to PG.
 const JSON_STRING_RE = /"(?:\\.|[^"\\])*"/y;
 const JSON_NUMBER_RE = /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
 const JSON_KEYWORD_RE = /(?:true|false|null)/y;
 
 function escapePgString(value: string): string {
-  // PG array escapes quote/backslash, not JSON control sequences. Real controls
-  // inside a quoted element must be sent unchanged (\n would store the letter n).
   return `"${value.replace(/["\\]/g, (ch) => `\\${ch}`)}"`;
 }
 
@@ -72,12 +69,9 @@ class JsonArrayConverter {
         this.skipWhitespace();
         if (this.text[this.pos] === end) break;
         if (this.text[this.pos++] !== ",") this.fail();
-        // readValue/readString rejects trailing commas and missing values.
       }
     }
     if (this.text[this.pos++] !== end) this.fail();
-    // Objects are scalar JSON-text elements, including all their nested JSON
-    // arrays/nulls/strings. Escape once for the surrounding PG array grammar.
     return object
       ? escapePgString(this.text.slice(start, this.pos))
       : `{${parts.join(",")}}`;
@@ -91,7 +85,6 @@ class JsonArrayConverter {
   }
 }
 
-/** Convert JSON-syntax arrays to PG array text while preserving numeric tokens. */
 export function jsonArrayLiteralToPgArrayLiteral(input: string): string {
   const trimmed = input.trim();
   if (trimmed === "") return "{}";

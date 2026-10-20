@@ -164,8 +164,6 @@ export function validatePasteValue(
         value,
         column.category === "float",
       );
-      // Integer drivers use decimal integer literals (including BigInt), not
-      // rounded JS numbers. Leave native ranges and decimal scale to the driver.
       if (
         normalized !== null &&
         (column.category !== "integer" || /^[+-]?\d+$/.test(normalized))

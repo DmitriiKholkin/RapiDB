@@ -7,7 +7,6 @@ function cancellation(signal: AbortSignal): Error {
     : new DOMException("Elasticsearch read cancelled", "AbortError");
 }
 
-/** Observe physical settlement, but never require it for logical cancellation. */
 function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const onAbort = () => reject(cancellation(signal));
@@ -36,7 +35,6 @@ export async function drainElasticsearchCleanup(
   }
 }
 
-/** One PIT lifetime, with deadlines only while advancing (never at a yield). */
 export class ElasticsearchPitSession {
   private readonly controller = new AbortController();
   readonly signal: AbortSignal = this.controller.signal;
@@ -94,8 +92,6 @@ export class ElasticsearchPitSession {
     try {
       return await untilAborted(Promise.resolve().then(work), this.signal);
     } catch (error) {
-      // SDK 9 rejects aborted HTTP requests with RequestAbortedError.
-      // The operation signal distinguishes user cancellation from DB failures.
       if (error instanceof errors.TimeoutError) this.expire();
       this.check();
       throw error;
@@ -117,8 +113,6 @@ export class ElasticsearchPitSession {
       signal: this.signal,
       requestTimeout: Math.max(1, this.activeDeadline - Date.now()),
     }).then((value) => {
-      // This observer stays attached after a logical abort/deadline, even if
-      // the SDK/transport ignores the signal and creates/rotates the PIT late.
       observe?.(value);
       return value;
     });
@@ -168,8 +162,6 @@ export class ElasticsearchPitSession {
       this.controller.abort();
       this.externalSignal?.removeEventListener("abort", this.onAbort);
       this.closing = (async () => {
-        // A short drain catches promptly rotating IDs without hanging on an
-        // uncooperative physical request. Late observers handle later IDs.
         if (this.pending) await drainElasticsearchCleanup(this.pending, 50);
         if (this.pitId) await this.closePit(this.pitId);
       })().finally(this.onClosed);

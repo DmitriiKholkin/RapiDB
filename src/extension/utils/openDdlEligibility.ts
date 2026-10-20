@@ -1,19 +1,3 @@
-/**
- * Decide whether a given tree-view node kind supports a "show DDL" action.
- *
- * Two layers of gating:
- *  1. **Driver manifest** — the per-driver entity manifest declares which
- *     object kinds it can produce DDL for.
- *  2. **Per-connection overrides** — some drivers (DynamoDB, Redis,
- *     Elasticsearch) report support for a kind in their manifest but
- *     cannot actually emit meaningful DDL for it; the override table
- *     forces a no-DDL state.
- *
- * The function `composeOpenDdlAwareContextValue` is used to build the
- * `contextValue` string VSCode sees — adding a `_noDdl` suffix that
- * the `package.json` menus key on to hide the command.
- */
-
 import type { ConnectionType } from "../../shared/connectionTypes";
 import type { DbObjectKind } from "../../shared/dbObjectKinds";
 import type { IndexDdlSupport } from "../../shared/tableTypes";
@@ -31,7 +15,6 @@ export interface OpenDdlSupportHints {
 
 const OPEN_DDL_CONTEXT_VALUE_UNSUPPORTED_SUFFIX = "_noDdl";
 
-/** Per-connection overrides that demote otherwise-supported kinds. */
 const OPEN_DDL_UNSUPPORTED_BY_CONNECTION_TYPE: Readonly<
   Partial<Record<ConnectionType, readonly OpenDdlNodeKind[]>>
 > = {

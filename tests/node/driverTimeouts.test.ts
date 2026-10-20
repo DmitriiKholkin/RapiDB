@@ -179,8 +179,6 @@ describe("driver timeout helpers", () => {
       ).activeQueryConnections.size,
     ).toBe(0);
 
-    // The real query finally removes the operation entry. Even while it is
-    // still registered, cancellation must not release the owned client twice.
     await postgres.cancelCurrentOperation(context);
     await mysql.cancelCurrentOperation(context);
     expect(pgClient.release).toHaveBeenCalledOnce();

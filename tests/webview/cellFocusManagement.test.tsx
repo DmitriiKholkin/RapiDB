@@ -8,11 +8,6 @@ import {
   useCellSelection,
 } from "../../src/webview/components/table/useCellSelection";
 
-/**
- * Test harness component that renders the useCellSelection hook alongside
- * the required DOM elements. Exposes the hook return value via a callback
- * on every render so tests always have the latest API reference.
- */
 function TestHarness({
   onReady,
 }: {
@@ -30,8 +25,6 @@ function TestHarness({
 
   const api = useCellSelection(options);
 
-  // Always sync the latest api to the parent — safe because onReady is a
-  // stable vi.fn() reference and this doesn't trigger setState.
   onReady(api);
 
   return (
@@ -50,9 +43,6 @@ function TestHarness({
   );
 }
 
-/**
- * Creates a mock React.MouseEvent with the specified target and properties.
- */
 function createMouseEvent(
   target: HTMLElement,
   options: {
@@ -78,9 +68,6 @@ function createMouseEvent(
   } as unknown as React.MouseEvent;
 }
 
-/**
- * Parses the range-display span text into a CellRange or null.
- */
 function getDisplayedRange(): CellRange | null {
   const text = screen.getByTestId("range-display").textContent;
   if (text === "null") {
@@ -122,82 +109,65 @@ describe("useCellSelection — focus management on cell click", () => {
 
   describe("filter input loses focus when data cell is clicked", () => {
     it("blurs filter input and focuses scroll container on left-click of data cell", () => {
-      // Arrange — focus the filter input
       act(() => {
         filterInput.focus();
       });
       expect(document.activeElement).toBe(filterInput);
 
-      // Act — left-click on data cell (non-input target)
       const event = createMouseEvent(dataCell);
       act(() => {
         hookApi.handleCellMouseDown(2, 3, event);
       });
 
-      // Assert — filter input should lose focus
       expect(document.activeElement).not.toBe(filterInput);
-      // Scroll container should receive focus
       expect(document.activeElement).toBe(scrollContainer);
     });
   });
 
   describe("mousedown default is prevented on data cell click", () => {
     it("calls preventDefault when left-clicking a non-input data cell", () => {
-      // Arrange
       const event = createMouseEvent(dataCell);
 
-      // Act
       act(() => {
         hookApi.handleCellMouseDown(2, 3, event);
       });
 
-      // Assert
       expect(event.defaultPrevented).toBe(true);
     });
 
     it("calls preventDefault for right-click on non-input data cell", () => {
-      // Arrange
       const event = createMouseEvent(dataCell, { button: 2 });
 
-      // Act
       act(() => {
         hookApi.handleCellMouseDown(2, 3, event);
       });
 
-      // Assert
       expect(event.defaultPrevented).toBe(true);
     });
   });
 
   describe("EditInput retains focus when clicked directly", () => {
     it("does NOT prevent default when mousedown target is an <input>", () => {
-      // Arrange
       const event = createMouseEvent(editInput);
 
-      // Act
       act(() => {
         hookApi.handleCellMouseDown(2, 3, event);
       });
 
-      // Assert — default should NOT be prevented for input targets
       expect(event.defaultPrevented).toBe(false);
     });
 
     it("does NOT prevent default when mousedown target is a <textarea>", () => {
-      // Arrange
       const event = createMouseEvent(editTextarea);
 
-      // Act
       act(() => {
         hookApi.handleCellMouseDown(2, 3, event);
       });
 
-      // Assert
       expect(event.defaultPrevented).toBe(false);
     });
 
     it("does NOT blur the active input when clicking directly on it", () => {
-      // Arrange — focus the edit input
       act(() => {
         editInput.focus();
       });
@@ -207,30 +177,24 @@ describe("useCellSelection — focus management on cell click", () => {
 
       const event = createMouseEvent(editInput);
 
-      // Act
       act(() => {
         hookApi.handleCellMouseDown(2, 3, event);
       });
 
-      // Assert — blur should NOT have been called on the edit input
       expect(blurSpy).not.toHaveBeenCalled();
-      // The edit input should still be focused
       expect(document.activeElement).toBe(editInput);
     });
   });
 
   describe("cell selection still updates after preventDefault", () => {
     it("sets selection range on left-click of data cell", () => {
-      // Arrange
       const event = createMouseEvent(dataCell);
       expect(getDisplayedRange()).toBeNull();
 
-      // Act
       act(() => {
         hookApi.handleCellMouseDown(3, 2, event);
       });
 
-      // Assert — selection range should be updated
       expect(getDisplayedRange()).toEqual({
         anchorRow: 3,
         anchorCol: 2,
@@ -240,15 +204,12 @@ describe("useCellSelection — focus management on cell click", () => {
     });
 
     it("sets selection range on right-click of data cell", () => {
-      // Arrange
       const event = createMouseEvent(dataCell, { button: 2 });
 
-      // Act
       act(() => {
         hookApi.handleCellMouseDown(5, 1, event);
       });
 
-      // Assert
       expect(getDisplayedRange()).toEqual({
         anchorRow: 5,
         anchorCol: 1,
@@ -258,15 +219,12 @@ describe("useCellSelection — focus management on cell click", () => {
     });
 
     it("sets selection range even when clicking on an input target", () => {
-      // Arrange
       const event = createMouseEvent(editInput);
 
-      // Act
       act(() => {
         hookApi.handleCellMouseDown(4, 0, event);
       });
 
-      // Assert — selection should still update even for input targets
       expect(getDisplayedRange()).toEqual({
         anchorRow: 4,
         anchorCol: 0,
@@ -278,7 +236,6 @@ describe("useCellSelection — focus management on cell click", () => {
 
   describe("drag selection still works after preventDefault", () => {
     it("extends range with shift-click after initial selection", () => {
-      // Arrange — initial click to set anchor
       const firstClick = createMouseEvent(dataCell);
       act(() => {
         hookApi.handleCellMouseDown(1, 1, firstClick);
@@ -291,13 +248,11 @@ describe("useCellSelection — focus management on cell click", () => {
         activeCol: 1,
       });
 
-      // Act — shift-click to extend range
       const shiftClick = createMouseEvent(dataCell, { shiftKey: true });
       act(() => {
         hookApi.handleCellMouseDown(4, 3, shiftClick);
       });
 
-      // Assert — range should extend from anchor to new cell
       expect(getDisplayedRange()).toEqual({
         anchorRow: 1,
         anchorCol: 1,
@@ -307,11 +262,9 @@ describe("useCellSelection — focus management on cell click", () => {
     });
 
     it("calls preventDefault for each non-input click in a drag sequence", () => {
-      // Arrange
       const firstEvent = createMouseEvent(dataCell);
       const shiftEvent = createMouseEvent(dataCell, { shiftKey: true });
 
-      // Act
       act(() => {
         hookApi.handleCellMouseDown(0, 0, firstEvent);
       });
@@ -319,7 +272,6 @@ describe("useCellSelection — focus management on cell click", () => {
         hookApi.handleCellMouseDown(2, 2, shiftEvent);
       });
 
-      // Assert — both should have preventDefault called
       expect(firstEvent.defaultPrevented).toBe(true);
       expect(shiftEvent.defaultPrevented).toBe(true);
     });

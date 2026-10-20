@@ -107,7 +107,6 @@ describe("date filter timezone normalization", () => {
   });
 
   it("preserves microsecond precision in timestamp display", () => {
-    // PostgreSQL returns 6 digits of fractional seconds (microseconds)
     expect(formatDatetimeForDisplay("2026-05-28T13:08:29.999999+00:00")).toBe(
       "2026-05-28 13:08:29.999999+00:00",
     );
@@ -117,15 +116,12 @@ describe("date filter timezone normalization", () => {
   });
 
   it("handles mixed precision fractional seconds", () => {
-    // 3 digits (milliseconds)
     expect(formatDatetimeForDisplay("2026-05-28 13:08:29.123+00:00")).toBe(
       "2026-05-28 13:08:29.123+00:00",
     );
-    // 4 digits
     expect(formatDatetimeForDisplay("2026-05-28 13:08:29.1234+00:00")).toBe(
       "2026-05-28 13:08:29.1234+00:00",
     );
-    // 5 digits
     expect(formatDatetimeForDisplay("2026-05-28 13:08:29.12345+00:00")).toBe(
       "2026-05-28 13:08:29.12345+00:00",
     );

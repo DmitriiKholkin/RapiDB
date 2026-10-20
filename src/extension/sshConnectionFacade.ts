@@ -1,11 +1,3 @@
-/**
- * SSH Connection Facade — инкапсулирует логику настройки SSH-туннелей.
- *
- * Извлечен из ConnectionManager для соблюдения SRP.
- * Содержит разрешение удалённых целей, построение SSH-настроек
- * и подготовку конфигурации драйвера с SSH-туннелем.
- */
-
 import type { ConnectionDriverFactory } from "./connectionDriverFactory";
 import type { ConnectionConfig } from "./connectionManagerModels";
 import type { DriverConnectionConfig } from "./driverRuntimeConfig";
@@ -35,8 +27,6 @@ export class SshConnectionFacade {
     private readonly driverFactory: ConnectionDriverFactory,
     private readonly dependencies: SshConnectionFacadeDependencies,
   ) {}
-
-  // ─── Remote Target Resolution ────────────────────────────────────────────
 
   resolveMongoRemoteTarget(config: ConnectionConfig): RemoteTarget {
     return this.driverFactory.resolveMongoRemoteTarget(config);
@@ -95,8 +85,6 @@ export class SshConnectionFacade {
     );
   }
 
-  // ─── SSH Settings ────────────────────────────────────────────────────────
-
   buildSshSettings(
     config: ConnectionConfig,
   ): ConnectionSshSettings | undefined {
@@ -111,8 +99,6 @@ export class SshConnectionFacade {
     );
   }
 
-  // ─── Config Transformation ──────────────────────────────────────────────
-
   applySshRuntimeToConfig(
     config: ConnectionConfig,
     runtime: SshRuntime,
@@ -121,8 +107,6 @@ export class SshConnectionFacade {
       this.resolveTcpRemoteTarget(c),
     );
   }
-
-  // ─── High-Level Orchestration ───────────────────────────────────────────
 
   async prepareDriverConfig(config: ConnectionConfig): Promise<{
     config: DriverConnectionConfig;

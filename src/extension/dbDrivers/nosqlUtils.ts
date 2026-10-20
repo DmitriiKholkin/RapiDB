@@ -210,7 +210,6 @@ function bsonTimestampParts(value: unknown): [number, number] | null {
     : null;
 }
 
-/** Commas inside typed values or quoted strings do not delimit IN entries. */
 export function splitInFilterValues(value: string): string[] {
   const entries: string[] = [];
   let start = 0;
@@ -410,8 +409,6 @@ export function applySort(
           bsonTimestampParts(row[sort.column]) ? "timestamp" : "date",
         ),
     ).size > 1;
-  // A heterogeneous column must use one ordering for the entire sort. Switching
-  // between numeric and text comparison per pair would break transitivity.
   const category =
     mixedTemporalKinds ||
     rows.some(

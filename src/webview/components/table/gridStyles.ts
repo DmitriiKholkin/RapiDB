@@ -1,11 +1,3 @@
-/**
- * Grid style injection — ensures table and query result styles are loaded.
- *
- * These styles were previously inlined at the top of TableGrid.tsx as
- * side-effectful module-level code. Extracting them here improves
- * readability and makes the dependency explicit.
- */
-
 function injectStyles(id: string, css: string): void {
   if (typeof document === "undefined" || document.getElementById(id)) {
     return;
@@ -15,8 +7,6 @@ function injectStyles(id: string, css: string): void {
   el.textContent = css;
   document.head.appendChild(el);
 }
-
-// ─── Table Data Grid Styles ────────────────────────────────────────────────
 
 injectStyles(
   "rapidb-table-row-style",
@@ -38,8 +28,6 @@ injectStyles(
   ].join("\n"),
 );
 
-// ─── Query Results Grid Styles ─────────────────────────────────────────────
-
 injectStyles(
   "rapidb-results-row-style",
   [
@@ -59,8 +47,6 @@ injectStyles(
     ".rdb-rcell-border-bottom.rdb-rcell-border-right { box-shadow: inset -2px -2px 0 var(--vscode-focusBorder, #007fd4); }",
   ].join("\n"),
 );
-
-// ─── Column Drag Styles ────────────────────────────────────────────────────
 
 injectStyles(
   "rapidb-column-drag-style",

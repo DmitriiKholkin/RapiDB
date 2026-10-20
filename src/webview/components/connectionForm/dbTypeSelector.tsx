@@ -1,13 +1,5 @@
-/**
- * Database type selector and TLS mode constants for ConnectionFormView.
- *
- * Extracted from ConnectionFormView.tsx to reduce its size and improve
- * reusability.
- */
 import React from "react";
 import type { ConnectionType } from "../../../shared/connectionTypes";
-
-// ─── Database Types ─────────────────────────────────────────────────────────
 
 export interface DBTypeEntry {
   type: ConnectionType;
@@ -32,8 +24,6 @@ export const DB_TYPES: DBTypeEntry[] = [
   },
   { type: "dynamodb", label: "DynamoDB", short: "DY", color: "#4053d6" },
 ];
-
-// ─── DB Type Selector Component ─────────────────────────────────────────────
 
 interface DBTypeSelectorProps {
   value: ConnectionType;
@@ -123,8 +113,6 @@ export function DBTypeSelector({
     </div>
   );
 }
-
-// ─── TLS Mode Constants ─────────────────────────────────────────────────────
 
 export const TLS_MODE_LABELS: Record<string, string> = {
   disabled: "Disabled",

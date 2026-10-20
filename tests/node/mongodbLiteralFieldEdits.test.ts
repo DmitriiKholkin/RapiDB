@@ -7,7 +7,7 @@ import type {
 import { applyChangesTransactional } from "../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
 
-const unsupportedNames = ["a.b", ".a", "a.", "$literal", "$where"];
+const unsupportedNames = ["", "a.b", ".a", "a.", "$literal", "$where"];
 const primaryKeys = {
   _id: { $rapidbMongoId: { type: "string", value: "test" } },
 };
@@ -332,7 +332,11 @@ describe("MongoDB Table Viewer literal field edit safety", () => {
     ]);
     expect(result.success).toBe(true);
     expect(s.updateOne).toHaveBeenCalledExactlyOnceWith(
-      { _id: { $eq: "test" }, [name]: "old" },
+      {
+        _id: { $eq: "test" },
+        [name]: "old",
+        $expr: { $and: [{ $eq: [`$${name}`, { $literal: "old" }] }] },
+      },
       { $set: { [name]: "NEW" } },
     );
     expect(preview.mock.results[0].value).toContain(".updateOne(");

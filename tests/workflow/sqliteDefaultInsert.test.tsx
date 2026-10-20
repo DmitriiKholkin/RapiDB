@@ -12,7 +12,6 @@ import { getScenario } from "./scenarios";
 import { getBodyCell } from "./tableUi";
 import type { WorkflowContext } from "./workflowContext";
 
-// Exercise the actual draft cells/editors, not the workflow harness's display stub.
 vi.doUnmock("../../src/webview/components/table/TableGrid");
 vi.doMock("../../src/webview/components/MonacoEditor", () => ({
   MonacoEditor: ({
@@ -64,7 +63,6 @@ async function withTable(
       title ${titleDefinition},
       title_upper TEXT GENERATED ALWAYS AS (upper(title)) STORED
     ); INSERT INTO default_rows (title) VALUES ('seed')`);
-    // Cover the real preview/confirmation route as well as host execution.
     context.store.setSkipTableMutationPreview(false);
     session = (await context.openTableViewer()).session;
     await waitFor(() => expect(getBodyCell("title").textContent).toBe("seed"));
@@ -271,7 +269,6 @@ describe("B05 sqlite UI/host/default insert journey", () => {
           screen.getByRole("button", { name: "Add Row" }),
         );
       }
-      // The DEFAULT insert comes first, so a later failure must undo it.
       if (explicit) editTitle(1, "");
       if (update) editTitle(count, "");
       const draftTitles = Array.from(
@@ -304,7 +301,6 @@ describe("B05 sqlite UI/host/default insert journey", () => {
           update ? "" : "seed",
         );
       });
-      // Fix the offending values in the retained drafts/edits and retry via UI.
       if (update) editTitle(count, "recovered");
       else editTitle(count - 1, "recovered");
       await session.user.click(

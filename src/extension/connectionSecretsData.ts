@@ -1,13 +1,3 @@
-/**
- * Shared type and parsing utilities for connection secret storage.
- *
- * Extracted to eliminate duplication between ConnectionManager and
- * ConnectionFormPanel. Both modules previously contained identical
- * StoredConnectionSecrets type definitions and parseStoredConnectionSecrets
- * implementations.
- */
-
-/** Shape of secrets persisted in VS Code SecretStorage per connection. */
 export type StoredConnectionSecrets = {
   password?: string;
   apiKey?: string;
@@ -41,10 +31,6 @@ export const CONNECTION_SECRET_KEYS: readonly (keyof StoredConnectionSecrets)[] 
     "tlsKeyPassphrase",
   ];
 
-/**
- * Safely extract a string field from a parsed JSON record.
- * Returns the original string if it is non-empty, otherwise undefined.
- */
 function extractStringField(
   record: Record<string, unknown>,
   key: string,
@@ -56,15 +42,6 @@ function extractStringField(
   return value.length > 0 ? value : undefined;
 }
 
-/**
- * Parse a JSON-serialized secret blob into a structured object.
- *
- * Falls back to treating the entire value as a legacy plaintext password
- * if the value is not valid JSON or does not match the expected shape.
- *
- * @param value - Raw string from SecretStorage (may be undefined)
- * @returns Parsed secrets, or `{}` if input is empty/undefined
- */
 export function parseStoredConnectionSecrets(
   value: string | undefined,
 ): StoredConnectionSecrets {
@@ -84,9 +61,7 @@ export function parseStoredConnectionSecrets(
       }
       return secrets;
     }
-  } catch {
-    // JSON parse failed — treat as legacy plaintext password
-  }
+  } catch {}
 
   return { password: value };
 }
@@ -113,9 +88,7 @@ export function parseStoredConnectionSecretDocument(
         isLegacy: false,
       };
     }
-  } catch {
-    // Legacy values are intentionally retained byte-for-byte as passwords.
-  }
+  } catch {}
 
   return {
     known: { password: value },
@@ -124,10 +97,6 @@ export function parseStoredConnectionSecretDocument(
   };
 }
 
-/**
- * Serialize a secrets object for storage.
- * Filters out undefined fields and returns undefined if the object is empty.
- */
 export function serializeStoredConnectionSecrets(
   secrets: StoredConnectionSecrets,
 ): string | undefined {

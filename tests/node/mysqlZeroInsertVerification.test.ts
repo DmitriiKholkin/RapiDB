@@ -37,11 +37,6 @@ const columns: ColumnTypeMeta[] = [
 const noAuto = "STRICT_TRANS_TABLES,NO_AUTO_VALUE_ON_ZERO";
 type Stage = "MODE" | "GUARD" | "INSERT" | "IDENTITY" | "VERIFY";
 
-/** Mock only mysql2's leased connection, not planning, executor or value checks.
- * MySQL 8.4 sql-mode.html: NULL always generates; zero only without NOAUTO.
- * sql/sql_insert.cc: OK ID is this statement's generated ID or actual auto field,
- * including literal zero/BEFORE-trigger assignment, not session LAST_INSERT_ID.
- */
 function harness(
   mode = "STRICT_TRANS_TABLES",
   options: {
@@ -607,9 +602,9 @@ describe("F02: MySQL AUTO_INCREMENT zero verification", () => {
     expect(plan.operation.captureIdentity?.mysqlInsertId?.zero?.keyIndex).toBe(
       1,
     );
-    h.conn.query.mockResolvedValueOnce([[]]); // SERIALIZABLE
+    h.conn.query.mockResolvedValueOnce([[]]);
     h.conn.query.mockResolvedValueOnce([[{ __rapidb_sql_mode: mode }]]);
-    if (mode === noAuto) h.conn.query.mockResolvedValueOnce([[]]); // guard
+    if (mode === noAuto) h.conn.query.mockResolvedValueOnce([[]]);
     const actualId = mode === noAuto ? 0 : 101;
     h.conn.query.mockResolvedValueOnce([
       { affectedRows: 1, insertId: actualId },

@@ -1,9 +1,3 @@
-/**
- * Table panel types, initial state, and message parser.
- *
- * All parsers are pure; `null` indicates a parse failure.
- */
-
 import type { ColumnTypeMeta, MongoValueTypeHint } from "../tableTypes";
 import type { PanelRetentionState, WebviewMessageEnvelope } from "./shared";
 import {
@@ -18,8 +12,6 @@ import {
   readPositiveInteger,
   readRequiredString,
 } from "./shared";
-
-// ─── Apply Result Types ─────────────────────────────────────────────────────
 
 export type ApplyRowStatus =
   | "applied"
@@ -41,19 +33,14 @@ export interface ApplyResultPayload {
   operationId?: string;
   success: boolean;
   error?: string;
-  /** Whether a failed apply may have persisted any write. */
   changesPossible?: boolean;
-  /** Whether write execution/settlement is uncertain (not a post-commit read failure). */
   outcomeUnknown?: boolean;
   warning?: string;
   failedRows?: number[];
   rowOutcomes?: ApplyRowOutcome[];
-  /** Whether at least one insert is known to have completed, not merely possibly applied. */
   insertApplied?: boolean;
   insertRowOutcomes?: ApplyRowOutcome[];
 }
-
-// ─── Mutation Preview Types ─────────────────────────────────────────────────
 
 export interface RowUpdateMessagePayload {
   primaryKeys: Record<string, unknown>;
@@ -113,14 +100,10 @@ export interface DeleteResultPayload {
   success: boolean;
   affectedRows: number;
   rowOutcomes: DeleteRowOutcome[];
-  /** A read is needed to reconcile a committed or possibly applied delete. */
   changesPossible: boolean;
-  /** A delete write may still settle after the first refresh; excludes post-commit verification failures. */
   outcomeUnknown: boolean;
   error?: string;
 }
-
-// ─── Initial State ──────────────────────────────────────────────────────────
 
 export interface TableInitialState extends PanelRetentionState {
   view: "table";
@@ -135,8 +118,6 @@ export interface TableInitialState extends PanelRetentionState {
   mongoRowIdentity?: boolean;
   defaultPageSize?: number;
 }
-
-// ─── Initial State Parser ───────────────────────────────────────────────────
 
 export function parseTableInitialState(
   input: Record<string, unknown>,
@@ -176,8 +157,6 @@ export function parseTableInitialState(
     defaultPageSize: readOptionalNumber(input, "defaultPageSize"),
   };
 }
-
-// ─── Messages ───────────────────────────────────────────────────────────────
 
 export type TablePanelMessage =
   | WebviewMessageEnvelope<"ready">
@@ -239,8 +218,6 @@ export type TablePanelMessage =
     >
   | WebviewMessageEnvelope<"readClipboard", ClipboardReadPayload>
   | WebviewMessageEnvelope<"writeClipboard", { text: string }>;
-
-// ─── Parser Helpers ─────────────────────────────────────────────────────────
 
 function isRowUpdateMessagePayload(
   value: unknown,
@@ -320,8 +297,6 @@ function readClipboardRequest(
   const recipient = readRequiredString(payload, "recipient");
   return requestId && recipient ? { requestId, recipient } : null;
 }
-
-// ─── Message Parser ─────────────────────────────────────────────────────────
 
 export function parseTablePanelMessage(
   input: unknown,
@@ -485,7 +460,6 @@ export function parseTablePanelMessage(
   }
 }
 export interface TableInitPayload {
-  /** connectionRefresh fences reads even when columns match; it is not a user verification Refresh. Omitted by older hosts: genuine initialization. */
   intent?: "initialize" | "metadataRefresh" | "connectionRefresh";
   columns: ColumnTypeMeta[];
   primaryKeyColumns: string[];

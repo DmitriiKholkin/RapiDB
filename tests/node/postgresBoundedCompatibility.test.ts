@@ -11,8 +11,6 @@ const drift = vi.hoisted(() => ({
 vi.mock("pg/package.json", () => ({ default: drift.pgPackage }));
 vi.mock("pg", async () => {
   const actual = await vi.importActual<typeof import("pg")>("pg");
-  // All protocol behavior remains the installed pg implementation. Only its
-  // initial shape is changed to simulate dependency/native implementation drift.
   class Query extends actual.Query {
     constructor(config: QueryArrayConfig, callback: () => void) {
       super(config, callback);

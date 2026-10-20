@@ -522,7 +522,6 @@ export class TableReadService {
         break;
       }
 
-      // A cursor must retain database values, not lossy display formatting.
       const lastRawRow = dataResult.rows[dataResult.rows.length - 1];
       const nextCursor = this.createCursorFromRow(
         Object.fromEntries(
@@ -689,8 +688,6 @@ export class TableReadService {
         `Export cursor is missing a non-null value for ${column.name}.`,
       );
     }
-    // User filters can use approximate equality (floats) or display coercion.
-    // Cursor predicates must use the exact database ordering instead.
     const index = paramIndex + params.length;
     const comparison = driver.buildCursorComparison
       ? driver.buildCursorComparison(column, operator, value, index)

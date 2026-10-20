@@ -12,7 +12,6 @@ import type {
   TransactionOptions,
 } from "./types";
 
-/** Pure coercion/filter/preview behavior is inherited; all DB work uses IPC. */
 export class SQLiteDriver extends SQLiteCoreDriver {
   readonly driverTimeoutsManagedInternally = true;
   private readonly worker = new SQLiteWorkerClient();

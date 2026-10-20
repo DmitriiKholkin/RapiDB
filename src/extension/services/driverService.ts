@@ -15,10 +15,6 @@ import {
 import type { SshRuntime } from "../services/sshRuntime";
 import { logErrorWithContext } from "../utils/errorHandling";
 
-/**
- * Service for managing database drivers.
- * Handles driver creation, caching, and configuration.
- */
 export class DriverService {
   private readonly driverMap = new Map<string, IDBDriver>();
   private readonly driverStaticMetadataCache = new Map<
@@ -35,44 +31,26 @@ export class DriverService {
     this.driverFactory = new ConnectionDriverFactory(getTimeoutSettings);
   }
 
-  /**
-   * Creates a driver for a connection config.
-   */
   createDriver(config: ConnectionConfig): IDBDriver {
     return this.driverFactory.createDriver(config);
   }
 
-  /**
-   * Gets a driver by connection ID.
-   */
   getDriver(connectionId: string): IDBDriver | undefined {
     return this.driverMap.get(connectionId);
   }
 
-  /**
-   * Stores a driver for a connection.
-   */
   setDriver(connectionId: string, driver: IDBDriver): void {
     this.driverMap.set(connectionId, driver);
   }
 
-  /**
-   * Removes a driver for a connection.
-   */
   removeDriver(connectionId: string): boolean {
     return this.driverMap.delete(connectionId);
   }
 
-  /**
-   * Checks if a driver exists for a connection.
-   */
   hasDriver(connectionId: string): boolean {
     return this.driverMap.has(connectionId);
   }
 
-  /**
-   * Disconnects and removes a driver.
-   */
   async disconnectDriver(connectionId: string): Promise<boolean> {
     const hadDriver = this.driverMap.has(connectionId);
     const driver = this.driverMap.get(connectionId);
@@ -89,9 +67,6 @@ export class DriverService {
     return hadDriver;
   }
 
-  /**
-   * Disconnects all drivers.
-   */
   async disconnectAllDrivers(): Promise<void> {
     const connectionIds = [...this.driverMap.keys()];
     await Promise.allSettled(
@@ -99,25 +74,15 @@ export class DriverService {
     );
   }
 
-  /**
-   * Checks if a connection is connected.
-   */
   isConnected(connectionId: string): boolean {
     return this.driverMap.get(connectionId)?.isConnected() ?? false;
   }
 
-  /**
-   * Gets the count of connected drivers.
-   */
   getConnectedCount(): number {
     return [...this.driverMap.values()].filter((driver) => driver.isConnected())
       .length;
   }
 
-  /**
-   * Resolves static metadata for a driver.
-   * Caches the result for future calls.
-   */
   resolveDriverStaticMetadata(
     connectionId: string,
     getConnection: (id: string) => ConnectionConfig | undefined,
@@ -154,16 +119,10 @@ export class DriverService {
     return metadata;
   }
 
-  /**
-   * Invalidates the static metadata cache for a connection.
-   */
   invalidateDriverStaticMetadata(connectionId: string): void {
     this.driverStaticMetadataCache.delete(connectionId);
   }
 
-  /**
-   * Gets driver capabilities for a connection.
-   */
   getDriverCapabilities(
     connectionId: string,
     getConnection: (id: string) => ConnectionConfig | undefined,
@@ -172,9 +131,6 @@ export class DriverService {
       ?.capabilities;
   }
 
-  /**
-   * Gets the query editor presentation for a connection.
-   */
   getQueryEditorPresentation(
     connectionId: string,
     getConnection: (id: string) => ConnectionConfig | undefined,
@@ -183,9 +139,6 @@ export class DriverService {
       ?.editorPresentation;
   }
 
-  /**
-   * Gets the driver entity manifest for a connection.
-   */
   getDriverEntityManifest(
     connectionId: string,
     getConnection: (id: string) => ConnectionConfig | undefined,
@@ -196,9 +149,6 @@ export class DriverService {
     );
   }
 
-  /**
-   * Applies SSH runtime to a connection config.
-   */
   applySshRuntimeToConfig(
     config: ConnectionConfig,
     runtime: SshRuntime,
@@ -319,9 +269,6 @@ export class DriverService {
     return baseConfig;
   }
 
-  /**
-   * Resolves MongoDB remote target.
-   */
   resolveMongoRemoteTarget(config: ConnectionConfig): {
     host: string;
     port: number;
@@ -329,9 +276,6 @@ export class DriverService {
     return this.driverFactory.resolveMongoRemoteTarget(config);
   }
 
-  /**
-   * Resolves Redis remote target.
-   */
   resolveRedisRemoteTarget(config: ConnectionConfig): {
     host: string;
     port: number;
@@ -339,9 +283,6 @@ export class DriverService {
     return this.driverFactory.resolveRedisRemoteTarget(config);
   }
 
-  /**
-   * Resolves URL remote target.
-   */
   resolveUrlRemoteTarget(
     value: string | undefined,
     defaultPort: number,
@@ -349,18 +290,12 @@ export class DriverService {
     return this.driverFactory.resolveUrlRemoteTarget(value, defaultPort);
   }
 
-  /**
-   * Resolves Elasticsearch remote target.
-   */
   resolveElasticsearchRemoteTarget(
     config: ConnectionConfig,
   ): { host: string; port: number } | undefined {
     return this.driverFactory.resolveElasticsearchRemoteTarget(config);
   }
 
-  /**
-   * Resolves DynamoDB endpoint.
-   */
   resolveDynamoEndpoint(config: ConnectionConfig): string {
     if (config.endpoint) {
       return config.endpoint;
@@ -374,9 +309,6 @@ export class DriverService {
     return `https://dynamodb.${region}.amazonaws.com`;
   }
 
-  /**
-   * Resolves DynamoDB remote target.
-   */
   resolveDynamoRemoteTarget(config: ConnectionConfig): {
     host: string;
     port: number;
@@ -392,9 +324,6 @@ export class DriverService {
     );
   }
 
-  /**
-   * Resolves TCP remote target for a connection.
-   */
   private resolveTcpRemoteTarget(config: ConnectionConfig): {
     host: string;
     port: number;
@@ -445,9 +374,6 @@ export class DriverService {
     }
   }
 
-  /**
-   * Rewrites a URL's host and port.
-   */
   private rewriteUriHostPort(
     value: string | undefined,
     host: string,

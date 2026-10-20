@@ -6,52 +6,31 @@ import {
 } from "../utils/jsonCanonical";
 import type { ColumnTypeMeta, ValueSemantics } from "./types";
 
-/**
- * Options for persisted edit checks.
- */
 export interface PersistedEditCheckOptions {
   persistedValue: unknown;
 }
 
-/**
- * Result of a persisted edit check.
- */
 export interface PersistedEditCheckResult {
   ok: boolean;
   shouldVerify: boolean;
   message?: string;
 }
 
-/**
- * Canonicalizer function for persisted edit values.
- */
 export type PersistedEditCanonicalizer = (
   value: unknown,
 ) => { canonical: string } | null;
 
-// Sentinel for null values in persisted edits
 const PERSISTED_EDIT_NULL_TOKEN = "\x00__RAPIDB_PERSISTED_EDIT_NULL__\x00";
 
-// UUID regex pattern
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-/**
- * Interface for exact numeric constraints.
- */
 interface ExactNumericConstraint {
   precision: number | null;
   scale: number | null;
 }
 
-/**
- * Checks and validates persisted edit values against expected values.
- * Encapsulates all logic for verifying that database edits were persisted correctly.
- */
 export class PersistedEditChecker {
-  /**
-   * Checks if a value is nullish in the context of persisted edits.
-   */
   canonicalizeNullishPersistedEditValue(
     value: unknown,
   ): { canonical: string } | null {
@@ -64,9 +43,6 @@ export class PersistedEditChecker {
     return null;
   }
 
-  /**
-   * Canonicalizes an exact numeric value for comparison.
-   */
   canonicalizeExactNumeric(
     value: unknown,
     scale: number | null,
@@ -94,9 +70,6 @@ export class PersistedEditChecker {
     return null;
   }
 
-  /**
-   * Canonicalizes a text value for comparison.
-   */
   canonicalizeTextPersistedEditValue(
     value: unknown,
   ): { canonical: string } | null {
@@ -117,9 +90,6 @@ export class PersistedEditChecker {
     return null;
   }
 
-  /**
-   * Canonicalizes a boolean value for comparison.
-   */
   canonicalizeBooleanPersistedEditValue(
     value: unknown,
   ): { canonical: string } | null {
@@ -142,9 +112,6 @@ export class PersistedEditChecker {
     return null;
   }
 
-  /**
-   * Canonicalizes a UUID value for comparison.
-   */
   canonicalizeUuidPersistedEditValue(
     value: unknown,
   ): { canonical: string } | null {
@@ -161,9 +128,6 @@ export class PersistedEditChecker {
     return null;
   }
 
-  /**
-   * Canonicalizes a JSON value for comparison.
-   */
   canonicalizeJsonPersistedEditValue(
     value: unknown,
   ): { canonical: string } | null {
@@ -199,9 +163,6 @@ export class PersistedEditChecker {
     return null;
   }
 
-  /**
-   * Canonicalizes a JSON array value for comparison.
-   */
   canonicalizeJsonArrayPersistedEditValue(
     value: unknown,
   ): { canonical: string } | null {
@@ -233,9 +194,6 @@ export class PersistedEditChecker {
     return null;
   }
 
-  /**
-   * Canonicalizes a binary value for comparison.
-   */
   canonicalizeBinaryPersistedEditValue(
     value: unknown,
   ): { canonical: string } | null {
@@ -260,9 +218,6 @@ export class PersistedEditChecker {
     return null;
   }
 
-  /**
-   * Canonicalizes an approximate numeric value for comparison.
-   */
   canonicalizeApproximateNumericPersistedEditValue(
     value: unknown,
     significantDigits: number,
@@ -286,9 +241,6 @@ export class PersistedEditChecker {
     return null;
   }
 
-  /**
-   * Finds precision loss in approximate numeric values.
-   */
   findApproximateNumericPrecisionLoss(
     value: unknown,
     significantDigits: number,
@@ -313,9 +265,6 @@ export class PersistedEditChecker {
     return null;
   }
 
-  /**
-   * Parses exact numeric constraint from native type string.
-   */
   parseExactNumericConstraint(nativeType: string): ExactNumericConstraint {
     const match = /decimal\((\d+)(?:,\s*(\d+))?\)/i.exec(nativeType);
     if (!match) {
@@ -327,9 +276,6 @@ export class PersistedEditChecker {
     };
   }
 
-  /**
-   * Formats a value for diagnostic messages.
-   */
   formatDiagnosticValue(value: unknown): string {
     if (value === null) return "NULL";
     if (value === undefined) return "<missing>";
@@ -344,9 +290,6 @@ export class PersistedEditChecker {
     return String(value);
   }
 
-  /**
-   * Builds a validation message for exact numeric constraints.
-   */
   buildValidationMessage(
     columnName: string,
     constraint: ExactNumericConstraint,
@@ -361,9 +304,6 @@ export class PersistedEditChecker {
     return null;
   }
 
-  /**
-   * Checks if a column has boolean semantics.
-   */
   hasBooleanSemantics(column: ColumnTypeMeta): boolean {
     return (
       column.valueSemantics === ("boolean" as ValueSemantics) ||
@@ -371,9 +311,6 @@ export class PersistedEditChecker {
     );
   }
 
-  /**
-   * Checks if a column is a datetime type with time component.
-   */
   isDatetimeWithTime(nativeType: string): boolean {
     const lower = nativeType.toLowerCase();
     return (
@@ -383,16 +320,10 @@ export class PersistedEditChecker {
     );
   }
 
-  /**
-   * Checks if a value looks like a date input.
-   */
   looksLikeDateInput(value: string): boolean {
     return /^\d{4}-\d{2}-\d{2}(?:[ T].*)?$/.test(value.trim());
   }
 
-  /**
-   * Generic check for normalized persisted edit values.
-   */
   checkNormalizedPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -430,9 +361,6 @@ export class PersistedEditChecker {
     };
   }
 
-  /**
-   * Checks text persisted edit values.
-   */
   checkTextPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -463,9 +391,6 @@ export class PersistedEditChecker {
     );
   }
 
-  /**
-   * Checks fixed-width char persisted edit values.
-   */
   checkFixedWidthCharPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -496,9 +421,6 @@ export class PersistedEditChecker {
     );
   }
 
-  /**
-   * Checks boolean persisted edit values.
-   */
   checkBooleanPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -513,9 +435,6 @@ export class PersistedEditChecker {
     );
   }
 
-  /**
-   * Checks UUID persisted edit values.
-   */
   checkUuidPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -530,9 +449,6 @@ export class PersistedEditChecker {
     );
   }
 
-  /**
-   * Checks JSON persisted edit values.
-   */
   checkJsonPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -547,9 +463,6 @@ export class PersistedEditChecker {
     );
   }
 
-  /**
-   * Checks JSON array persisted edit values.
-   */
   checkJsonArrayPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -564,9 +477,6 @@ export class PersistedEditChecker {
     );
   }
 
-  /**
-   * Checks binary persisted edit values.
-   */
   checkBinaryPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -581,9 +491,6 @@ export class PersistedEditChecker {
     );
   }
 
-  /**
-   * Checks approximate numeric persisted edit values.
-   */
   checkApproximateNumericPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,
@@ -618,9 +525,6 @@ export class PersistedEditChecker {
     );
   }
 
-  /**
-   * Checks exact numeric persisted edit values.
-   */
   checkExactNumericPersistedEdit(
     column: ColumnTypeMeta,
     expectedValue: unknown,

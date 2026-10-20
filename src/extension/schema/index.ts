@@ -1,4 +1,3 @@
-// Schema helpers
 export {
   buildAggregateSchemaSnapshot,
   CONNECTION_ROOT_SCOPE,
@@ -35,7 +34,6 @@ export type {
   DatabaseLoadMode,
   DatabaseScopeLoadResult,
 } from "./schemaLoaders";
-// Schema loaders
 export {
   loadConnectionRootCatalog,
   loadDatabaseScope,

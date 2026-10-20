@@ -1382,7 +1382,6 @@ describe("TableView", () => {
       expect(getBodyCell("renamed").textContent).toContain("Renamed Alice");
     if (change === "drop")
       expect(screen.queryByRole("columnheader", { name: /^name/ })).toBeNull();
-    // Old undo snapshots must not be replayed into the new schema/data.
     fireEvent.keyDown(document.body, {
       key: "z",
       code: "KeyZ",
@@ -1411,7 +1410,6 @@ describe("TableView", () => {
         primaryKeyColumns: ["id"],
       }),
     );
-    // A preview prepared before refresh may arrive late and must still be cancellable/confirmable.
     await act(async () =>
       dispatchRawIncomingMessage("tableMutationPreview", {
         operationId,
@@ -1565,7 +1563,6 @@ describe("TableView", () => {
       ],
     };
     await act(async () => {
-      // A transport retry can duplicate a result already received by the view.
       dispatchRawIncomingMessage("applyResult", result);
       dispatchRawIncomingMessage("applyResult", result);
     });
@@ -1952,7 +1949,6 @@ describe("TableView", () => {
     await user.click(screen.getByRole("button", { name: "Undo" }));
     expect(getBodyCell("name", 1).textContent).toContain("Bob");
     expect(screen.queryByText("Unrelated edit")).toBeNull();
-    // Status dismissal works normally after recovery has been abandoned.
     await user.click(screen.getByTitle("Dismiss"));
     expect(
       screen.queryByText(/Apply or revert pending changes before loading/),
@@ -2367,8 +2363,6 @@ describe("TableView", () => {
       }),
     );
     if (scenario === "refresh-during-request") {
-      // Metadata refresh deliberately invalidates the fetch epoch, even
-      // while pending work keeps the old rows visible. Keep cancellation.
       expect(screen.queryByText(/Paste failed/)).toBeNull();
     } else {
       expect(screen.getByText(/Paste failed/)).toBeTruthy();
@@ -2377,7 +2371,6 @@ describe("TableView", () => {
     expect(getBodyCell("name", 1).textContent).toBe("Edited Alice");
     expect(getBodyCell("extra", 0).textContent).toContain("DEFAULT");
     expect(cell.className).toBe(selectionClass);
-    // A rejected rectangle must not introduce an undo snapshot.
     await user.click(screen.getByRole("button", { name: "Undo" }));
     expect(getBodyCell("name", 0).textContent).toContain("DEFAULT");
     await user.click(screen.getByRole("button", { name: "Redo" }));
@@ -2470,8 +2463,6 @@ describe("TableView", () => {
     );
     act(() => result.current.startInsertRow());
     act(() => result.current.handleStartDraftEdit(0, columns[1]));
-    // The callback must consult current metadata/baseline refs, not the
-    // schema under which it was obtained.
     const batch = result.current.commitBatchCellEdits;
     const mixed = result.current.commitMixedBatchEdits;
     columnsRef.current = [...columns, extra];
@@ -2520,7 +2511,6 @@ describe("TableView", () => {
     const cell = getBodyCell("name");
     fireEvent.mouseDown(cell, { button: 0 });
     fireEvent.mouseUp(cell);
-    // The keyboard route also permits paste into drafts without a PK.
     fireEvent.keyDown(cell, {
       key: "v",
       code: "KeyV",
@@ -2659,7 +2649,6 @@ describe("TableView", () => {
     fireEvent.mouseMove(document, { clientX: 240 });
     const header = handle.closest("th") as HTMLElement;
     const width = header.style.width;
-    // Public route: replacing the table with a new-schema loading view unmounts the grid.
     await act(async () =>
       dispatchIncomingMessage("tableInit", {
         intent: "metadataRefresh",
@@ -3127,7 +3116,6 @@ describe("TableView", () => {
         fetchId: oldFetchId,
         error: "Stale error",
       });
-      // A second compatible refresh invalidates the first reconciliation read.
       dispatchRawIncomingMessage("tableInit", {
         intent: "metadataRefresh",
         columns: [...nextColumns, { ...columns[1], name: "extra2" }],
@@ -3389,7 +3377,7 @@ describe("TableView", () => {
           name: "Cancel",
         }),
       );
-      await act(async () => partialDeleteResult(operationId)); // Cancelled operation's late result is stale.
+      await act(async () => partialDeleteResult(operationId));
     } else {
       await act(async () =>
         dispatchRawIncomingMessage("deleteResult", {
@@ -3440,7 +3428,6 @@ describe("TableView", () => {
     true,
   ])("removes confirmed dirty delete work from both history stacks, keeps B and drafts (stale read=%s)", async (staleRead) => {
     const user = await stageDirtyDeleteWork();
-    // The redo stack also contains A's edit and must be pruned, not cleared.
     await user.click(screen.getByRole("button", { name: "Undo" }));
     await user.click(screen.getByLabelText("Select row 1"));
     await user.click(screen.getByRole("button", { name: "Delete (1)" }));
@@ -3466,7 +3453,7 @@ describe("TableView", () => {
     await act(async () => dispatchRawIncomingMessage("deleteResult", result));
     expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
     await act(async () => {
-      dispatchRawIncomingMessage("deleteResult", result); // Delivery retry is stale.
+      dispatchRawIncomingMessage("deleteResult", result);
       dispatchIncomingMessage("tableData", {
         fetchId: lastFetchPayload().fetchId,
         rows: staleRead ? [rows[1], rows[0]] : [rows[1]],
@@ -3483,8 +3470,6 @@ describe("TableView", () => {
         }) as HTMLButtonElement
       ).disabled,
     ).toBe(false);
-    // Traverse all preserved past/future snapshots. A must never reappear as
-    // an edit, even if the verification read still shows its old identity.
     for (let index = 0; index < 4; index++) {
       const undo = screen.queryByRole("button", {
         name: "Undo",
@@ -3550,7 +3535,6 @@ describe("TableView", () => {
       }
     };
     await edit("name", 1, "Deleted Alice edit");
-    // Proposed PK collides with Carol, but only original id=2 identifies B.
     await edit("id", 2, "3");
     await edit("name", 2, "First Bob edit");
     await edit("name", 2, "Second Bob edit");
@@ -3596,7 +3580,7 @@ describe("TableView", () => {
         }),
       );
     };
-    await read([carol, rows[0]]); // Missing B, stale A, and occupied proposed PK.
+    await read([carol, rows[0]]);
     expect(screen.getByText(/Unable to match 1 row/)).toBeTruthy();
     expect(getBodyCell("name", 1).textContent).toBe("Carol");
     expect(getBodyCell("name", 2).textContent).toBe("Alice");
@@ -3606,7 +3590,6 @@ describe("TableView", () => {
         screen.getByText(/first refresh may precede a late write/),
       ).toBeTruthy();
     }
-    // Neither buttons nor keyboard may consume either stack while unresolved.
     await user.click(screen.getByRole("button", { name: "Undo" }));
     await user.click(screen.getByRole("button", { name: "Redo" }));
     fireEvent.keyDown(document.body, {
@@ -3630,7 +3613,7 @@ describe("TableView", () => {
     await user.click(screen.getByRole("button", { name: "Apply Changes" }));
     expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
     await user.click(screen.getByRole("button", { name: "Refresh" }));
-    await read([carol, rows[0], rows[1]]); // B returns uniquely at a different index.
+    await read([carol, rows[0], rows[1]]);
     expect(screen.queryByText(/Unable to match/)).toBeNull();
     expect(getBodyCell("name", 3).textContent).toBe(currentEdit);
     const assertSurvivors = () => {
@@ -3694,7 +3677,7 @@ describe("TableView", () => {
       await user.click(screen.getByRole("button", { name: "Apply" }));
     };
     await editName(1, "Historical Bob edit");
-    await editName(1, "Bob"); // Only history now contains a B edit.
+    await editName(1, "Bob");
     await user.click(screen.getByRole("button", { name: "Add Row" }));
     fireEvent.doubleClick(getBodyCell("name"));
     fireEvent.change(screen.getByLabelText("Cell value"), {
@@ -3723,7 +3706,7 @@ describe("TableView", () => {
     await act(async () =>
       dispatchIncomingMessage("tableData", {
         fetchId: lastFetchPayload().fetchId,
-        rows: [carol], // Current C resolves; historical B does not.
+        rows: [carol],
         totalCount: 1,
       }),
     );
@@ -3780,7 +3763,7 @@ describe("TableView", () => {
       metaKey: true,
       shiftKey: true,
     });
-    expect(getBodyCell("name").dataset.row).toBe("0"); // No draft resurrection.
+    expect(getBodyCell("name").dataset.row).toBe("0");
     expect(getBodyCell("name").textContent).toBe("Bob");
     expect(getBodyCell("name", 1).textContent).toBe("Pending Carol");
     expect(screen.getAllByText("Confirmed draft")).toHaveLength(1);
@@ -3816,7 +3799,6 @@ describe("TableView", () => {
   ] as const)("retains %s delete work and drafts while dropping only confirmed identities", async (status) => {
     const dataRows = [...rows, { id: 3, name: "Carol" }];
     const user = await stageDirtyDeleteWork(dataRows);
-    // Request order differs from page order: rowIndex 1 is Alice, not Bob.
     await user.click(screen.getByLabelText("Select row 2"));
     await user.click(screen.getByLabelText("Select row 1"));
     await user.click(screen.getByLabelText("Select row 3"));
@@ -3843,14 +3825,13 @@ describe("TableView", () => {
             : [
                 { rowIndex: 0, primaryKeys: { id: 2 }, status, success: false },
               ]),
-          // Carol has no outcome and must also survive.
         ],
       }),
     );
     await act(async () =>
       dispatchIncomingMessage("tableData", {
         fetchId: lastFetchPayload().fetchId,
-        rows: [dataRows[2]], // Bob remains unresolved, not discarded.
+        rows: [dataRows[2]],
         totalCount: 1,
       }),
     );
@@ -3916,7 +3897,6 @@ describe("TableView", () => {
     act(() =>
       result.current.commitCellEdit(1, columns[1], "Pending Bob", "Bob"),
     );
-    // A proposed/colliding PK must not make Bob the confirmed delete target.
     act(() => result.current.commitCellEdit(0, columns[0], "2", 1));
     act(() => result.current.deleteSelected());
     const operationId = (
@@ -3927,7 +3907,7 @@ describe("TableView", () => {
       result.current.handleRowsCommitted(nextRows, ["id"], [], []);
       rowsRef.current = nextRows;
     });
-    rerender({ selected: new Set([0]) }); // Both index 0 and selection now mean Bob.
+    rerender({ selected: new Set([0]) });
     expect(result.current.unresolvedPendingEdits).toHaveLength(
       targetMissing ? 1 : 0,
     );
@@ -4077,7 +4057,6 @@ describe("TableView", () => {
       expect(
         screen.getByText(/first refresh may precede a late write/),
       ).toBeTruthy();
-    // Mutations and undo are fenced while the authoritative page is pending.
     fireEvent.keyDown(document.body, {
       key: "z",
       code: "KeyZ",
@@ -4110,7 +4089,6 @@ describe("TableView", () => {
     expect(getBodyCell("name").textContent).not.toContain("Pending Bob");
     await user.click(screen.getByRole("button", { name: "Redo" }));
     expect(getBodyCell("name").textContent).toContain("Pending Bob");
-    // A deliberate retry gets a fresh ID and targets the newly committed identity.
     await user.click(screen.getByLabelText("Select row 1"));
     await user.click(screen.getByRole("button", { name: "Delete (1)" }));
     const retry = getRawLastPostedMessage()?.payload as {
@@ -4564,7 +4542,6 @@ describe("TableView", () => {
         rows: [{ id: 26, name: "Carol" }],
         totalCount: 51,
       });
-      // Exercise the keyboard handler before the commit's React rerender too.
       fireEvent.keyDown(document.body, {
         key: "z",
         code: "KeyZ",
@@ -5979,7 +5956,6 @@ describe("TableView", () => {
             within(dialog).queryByRole("button", { name: "DEF" }),
           ).toBeNull();
           expect(screen.queryByLabelText("Cell value")).toBeNull();
-          // Even an unexpected editor callback cannot stage a generated edit.
           fireEvent.change(editor, { target: { value: "forbidden mutation" } });
           await user.click(
             within(dialog).getByRole("button", { name: "Apply" }),
@@ -6581,7 +6557,6 @@ describe("TableView", () => {
     expect(Number(draftCell.dataset.row)).toBeLessThan(0);
     await user.click(draftCell);
     await user.keyboard("{F2}");
-    // DEFAULT text stays inline until it has a value, just like double click.
     expect(screen.queryByRole("dialog")).toBeNull();
     fireEvent.change(screen.getByLabelText("Cell value"), {
       target: { value: "draft text" },
@@ -7786,7 +7761,6 @@ describe("TableView", () => {
     ).toBe(true);
     await user.click(screen.getByRole("button", { name: "Apply Changes" }));
     expect(postedMessagesOfType("applyChanges")).toHaveLength(1);
-    // A refresh cannot turn a possibly committed INSERT into a retryable draft.
     clearPostedMessages();
     await user.click(screen.getByRole("button", { name: "Refresh" }));
     expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
@@ -7851,7 +7825,6 @@ describe("TableView", () => {
     await act(async () => dispatchRawIncomingMessage("applyResult", result));
     expect(postedMessagesOfType("fetchPage")).toHaveLength(fetchCount);
 
-    // Neither a successful read nor duplicate results allow replaying INSERT.
     await user.click(screen.getByRole("button", { name: "Apply Changes" }));
     expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
     await user.click(screen.getByRole("button", { name: "Revert All" }));

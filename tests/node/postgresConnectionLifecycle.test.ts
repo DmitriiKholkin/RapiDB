@@ -16,7 +16,6 @@ vi.mock("pg", async (importOriginal) => {
     constructor() {
       const pool = harness.pools.shift();
       if (!pool) throw new Error("Unexpected PostgreSQL pool creation");
-      // biome-ignore lint/correctness/noConstructorReturn: a pg Pool test double
       return pool as never;
     }
   }
@@ -381,7 +380,6 @@ describe("B01 PostgreSQL pending connection lifecycle", () => {
     await expect(
       driver.query("SELECT 1", undefined, { requestToken: 86 }),
     ).rejects.toThrow(/checkout/);
-    // Vitest reports orphaned cancellation promises as unhandled errors.
     await new Promise<void>((resolve) => setImmediate(resolve));
   });
 
@@ -408,7 +406,6 @@ describe("B01 PostgreSQL pending connection lifecycle", () => {
     await rejected;
     expect(driver.isConnected()).toBe(true);
     expect(fresh.pool.end).not.toHaveBeenCalled();
-    // Old pool error callbacks also must not mutate the new connection state.
     old.pool.on.mock.calls[0][1](new Error("old idle socket error"));
     expect(driver.isConnected()).toBe(true);
     await driver.disconnect();

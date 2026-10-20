@@ -37,7 +37,6 @@ export function questionMarkPlaceholderOffsets(
       continue;
     }
     if (quote) {
-      // T-SQL uses doubled quotes; even a trailing backslash is literal text.
       if (char === "\\" && options.dialect !== "mssql") index += 1;
       else if (char === quote && next === quote) index += 1;
       else if (char === quote) quote = null;
@@ -78,8 +77,6 @@ export interface IndexedPlaceholderOffset {
 
 export type IndexedPlaceholderOptions = QuestionMarkPlaceholderOptions;
 
-// PG quotecontinue accepts ASCII whitespace and -- comments, with at least
-// one LF/CR before the next single quote. Block comments do not qualify.
 function postgresStringContinuationQuote(sql: string, start: number): number {
   let index = start;
   let newline = false;
@@ -143,7 +140,6 @@ export function indexedPlaceholderOffsets(
           options.dialect === "pg" && quote === "'"
             ? postgresStringContinuationQuote(sql, index + 1)
             : -1;
-        // Continued segments remain in the original quote/escape mode.
         if (continuation >= 0) index = continuation;
         else quote = null;
       }
@@ -175,9 +171,6 @@ export function indexedPlaceholderOffsets(
       bracketIdentifier = true;
     } else if (char === "'" || char === '"' || char === "`") {
       quote = char;
-      // PG identifiers and ordinary strings use doubled quotes, not backslash
-      // escaping. Only E'...' strings have fixed backslash escapes. Oracle
-      // and T-SQL never use backslashes to escape these quotes.
       backslashEscapes =
         options.dialect === undefined ||
         (options.dialect === "pg" &&
@@ -194,7 +187,6 @@ export function indexedPlaceholderOffsets(
           : undefined;
       if (dollarQuote) {
         const closing = sql.indexOf(dollarQuote, index + dollarQuote.length);
-        // An unfinished literal still protects its contents from substitution.
         index = closing >= 0 ? closing + dollarQuote.length - 1 : sql.length;
         continue;
       }

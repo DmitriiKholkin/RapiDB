@@ -107,7 +107,6 @@ describe("stage 4 review PostgreSQL native persisted-edit compatibility", () => 
     );
     const meta = columns.find((column) => column.name === name);
     if (!meta) throw new Error("Missing actual metadata");
-    // Read-only server cast is the independent acceptance/value control.
     const controlSql =
       name === "a" && typeof input === "string" && input.startsWith('["')
         ? "SELECT ARRAY(SELECT value::boolean FROM jsonb_array_elements_text($1::jsonb) AS e(value)) AS value"
@@ -245,7 +244,6 @@ describe("stage 4 review PostgreSQL native persisted-edit compatibility", () => 
         ],
         columns,
       );
-    // Model another client's committed transition to NULL after the original read.
     await driver.query(`UPDATE ${table} SET ${name}=NULL WHERE id=$1`, [rowId]);
     expect(await update()).toMatchObject({ success: false });
     expect(
@@ -253,7 +251,6 @@ describe("stage 4 review PostgreSQL native persisted-edit compatibility", () => 
         await driver.query(`SELECT ${name} FROM ${table} WHERE id=$1`, [rowId]),
       )[0][name],
     ).toBeNull();
-    // An unchanged special value must match the string baseline on the server.
     await driver.query(`UPDATE ${table} SET ${name}=$2 WHERE id=$1`, [
       rowId,
       special,

@@ -1,12 +1,6 @@
-/**
- * ERD cardinality rendering — SVG glyphs for relationship endpoints.
- */
-
 import { Position } from "@xyflow/react";
 import React from "react";
 import type { ErdGraph } from "../../../shared/webviewContracts";
-
-// ─── Types ──────────────────────────────────────────────────────────────────
 
 export type CardinalityEnd =
   | "one"
@@ -15,8 +9,6 @@ export type CardinalityEnd =
   | "zeroOrOne"
   | "oneOrMany"
   | "zeroOrMany";
-
-// ─── Cardinality Mapping ────────────────────────────────────────────────────
 
 export function mapCardinalityEnds(
   cardinality: ErdGraph["edges"][number]["cardinality"] | undefined,
@@ -37,8 +29,6 @@ export function mapCardinalityEnds(
   return { start: "many", end: "one" };
 }
 
-// ─── Vector Helpers ─────────────────────────────────────────────────────────
-
 export function outwardVector(position: Position): {
   x: number;
   y: number;
@@ -50,8 +40,6 @@ export function outwardVector(position: Position): {
   return { x: 0, y: 0, angle: 0 };
 }
 
-// ─── Cardinality Glyph Component ────────────────────────────────────────────
-
 interface CardinalityGlyphProps {
   x: number;
   y: number;
@@ -61,10 +49,6 @@ interface CardinalityGlyphProps {
   strokeWidth: number;
 }
 
-/**
- * Renders the cardinality symbol (one, many, optional, etc.) at an edge endpoint.
- * Each kind maps to a specific SVG path pattern.
- */
 export function CardinalityGlyph({
   x,
   y,
@@ -82,8 +66,6 @@ export function CardinalityGlyph({
     </g>
   );
 }
-
-// ─── Glyph Renderers ────────────────────────────────────────────────────────
 
 function renderGlyph(
   kind: CardinalityEnd,
@@ -133,8 +115,6 @@ function renderGlyph(
       return null;
   }
 }
-
-// ─── Primitive Glyph Shapes ─────────────────────────────────────────────────
 
 function OneLine({
   color,

@@ -6,25 +6,12 @@ import type {
   RapiDBNode,
 } from "../providers/connectionProvider";
 
-/**
- * Context required for utility commands.
- */
 export interface UtilityCommandContext {
   readonly connectionManager: ConnectionManager;
   readonly connectionProvider: ConnectionProvider;
   readonly refresh: () => void;
 }
 
-/**
- * Registers all utility commands.
- *
- * Commands:
- * - rapidb.refreshAll: Refresh all connections (toolbar)
- * - rapidb.refresh: Refresh a single connection (context menu)
- * - rapidb.showConnectedOnly: Toggle connected-only view
- * - rapidb.showAllConnections: Show all connections
- * - rapidb.disconnectAll: Disconnect from all connections
- */
 export function registerUtilityCommands(
   ctx: UtilityCommandContext,
   registerCommand: <TArgs extends unknown[]>(
@@ -34,13 +21,11 @@ export function registerUtilityCommands(
 ): void {
   const { connectionManager, connectionProvider, refresh } = ctx;
 
-  // ─── Refresh All (toolbar) ─────────────────────────────────────────
   registerCommand(CMD.refreshAll, () => {
     connectionManager.refreshSchemaCache({ reason: "manual" });
     connectionProvider.refreshConnectionTree();
   });
 
-  // ─── Refresh (context menu) ────────────────────────────────────────
   registerCommand(CMD.refresh, (node?: RapiDBNode) => {
     const connectionId = node?.connectionId;
     connectionManager.refreshSchemaCache({
@@ -50,17 +35,14 @@ export function registerUtilityCommands(
     connectionProvider.refreshConnectionTree(connectionId);
   });
 
-  // ─── Show Connected Only ───────────────────────────────────────────
   registerCommand(CMD.showConnectedOnly, async () => {
     await connectionProvider.setConnectedOnly(true);
   });
 
-  // ─── Show All Connections ──────────────────────────────────────────
   registerCommand(CMD.showAllConnections, async () => {
     await connectionProvider.setConnectedOnly(false);
   });
 
-  // ─── Disconnect All ────────────────────────────────────────────────
   registerCommand(CMD.disconnectAll, async () => {
     connectionProvider.collapseAllConnectionRoots();
     await connectionManager.disconnectAll();

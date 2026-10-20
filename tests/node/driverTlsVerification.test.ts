@@ -250,7 +250,6 @@ describe.each([
       id: "tls",
       name: "TLS",
       type: engine,
-      // A DNS physical host catches pg's ssl.servername overwrite.
       host: "localhost",
       port: fixture.port,
       username: "test",
@@ -626,8 +625,6 @@ describe("Elasticsearch Cloud ID / real SSH HTTPS agent TLS", () => {
     if (!address || typeof address === "string") throw new Error("No TLS port");
     const destinations: string[] = [];
     const key = Buffer.from("test-host-key");
-    // Only SSH transport negotiation is fake; its forwarding agents and the
-    // Elasticsearch package's HttpConnection/request path are unmodified.
     const runtime = await createSshRuntime(
       {
         host: "bastion.internal",
@@ -748,7 +745,6 @@ describe("Elasticsearch Cloud ID / real SSH HTTPS agent TLS", () => {
       );
       const weakSocket = Object.values(caAgent?.freeSockets ?? {}).flat()[0];
       expect(weakSocket?.destroyed).toBe(false);
-      // A remains connected with a free socket and identical endpoint/CA/SNI.
       await expect(wrongFull.connect()).rejects.toThrow(
         /not.*cert|does not match/i,
       );
@@ -779,7 +775,6 @@ describe("Elasticsearch Cloud ID / real SSH HTTPS agent TLS", () => {
       expect(destroyRuntimeAgent).not.toHaveBeenCalled();
       await vi.waitFor(() => expect(weakSocket?.destroyed).toBe(true));
       await nativeClient(validFull).ping();
-      // Runtime disposal still terminates the independently pooled sockets.
       await f.runtime.dispose();
       await expect(
         nativeClient(validFull).ping({}, { maxRetries: 0 }),

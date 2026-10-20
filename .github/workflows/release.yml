@@ -99,11 +99,8 @@ jobs:
         run: |
           NEW_TAG="${{ steps.version.outputs.tag }}"
 
-          # Use last existing tag from history (not the version from package.json,
-          # which is the *pre-bump* value and may not match a real release tag)
           CURRENT_TAG=$(git describe --tags --abbrev=0 HEAD 2>/dev/null || echo "")
 
-          # Get commits since last tag (or all commits if no tags exist)
           if [ -n "$CURRENT_TAG" ] && git rev-parse "$CURRENT_TAG" >/dev/null 2>&1; then
             LOG=$(git log "$CURRENT_TAG"..HEAD --pretty=format:"- %s (%h)" --no-merges)
             COMPARE_URL="https://github.com/${{ github.repository }}/compare/$CURRENT_TAG...$NEW_TAG"
@@ -112,7 +109,6 @@ jobs:
             COMPARE_URL=""
           fi
 
-          # Write changelog to file (multiline output)
           echo "## What's Changed" > "$GITHUB_WORKSPACE/.changelog.md"
           echo "" >> "$GITHUB_WORKSPACE/.changelog.md"
           echo "$LOG" >> "$GITHUB_WORKSPACE/.changelog.md"
@@ -131,11 +127,9 @@ jobs:
           NEW_VERSION="${{ steps.version.outputs.new }}"
           npx @vscode/vsce package --allow-missing-repository
           VSIX_FILE="rapidb-${NEW_VERSION}.vsix"
-          # vsce names the file based on package.json version
           if [ -f "$VSIX_FILE" ]; then
             echo "VSIX created: $VSIX_FILE"
           else
-            # Find the generated .vsix file
             VSIX_FILE=$(ls *.vsix | head -1)
             echo "VSIX created: $VSIX_FILE"
           fi

@@ -4,8 +4,6 @@ import type { ErdGraph } from "../../src/shared/webviewContracts";
 import { ErdView } from "../../src/webview/components/ErdView";
 import { dispatchIncomingMessage } from "./testUtils";
 
-// Supply the browser measurements JSDOM lacks; ReactFlow, TableNode, Handle and
-// RelationshipEdge are real. Different row bounds expose incorrect anchoring.
 function installFlowMeasurements() {
   vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(
     function (this: HTMLElement) {

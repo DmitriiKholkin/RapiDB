@@ -142,9 +142,6 @@ async function readOptionalTlsFile(
   };
   signal?.addEventListener("abort", onAbort, { once: true });
   try {
-    // stat() follows regular symlinks, which are commonly used by certificate
-    // managers. Reject known special files before opening, and use nonblocking
-    // open flags so a path replaced with a FIFO cannot stall the extension host.
     const pathStats = await awaitWithAbort(stat(normalized), signal);
     if (!pathStats.isFile()) {
       failTlsFileRead(
@@ -196,7 +193,6 @@ async function readOptionalTlsFile(
     const chunks: Buffer[] = [];
     let totalBytes = 0;
     while (true) {
-      // Read one byte past the cap to detect files that grew after stat().
       const chunk = Buffer.allocUnsafe(
         Math.min(
           TLS_FILE_READ_CHUNK_SIZE,
@@ -251,12 +247,8 @@ async function readOptionalTlsFile(
   } finally {
     signal?.removeEventListener("abort", onAbort);
     if (signal?.aborted) {
-      // FileHandle.close() waits for in-flight I/O. Start it promptly but do
-      // not make cancellation wait behind the operation being cancelled.
       void closeHandle();
     } else {
-      // Abort may arrive after close has started. Keep its handled cleanup in
-      // the background instead of making cancellation wait for file I/O.
       await awaitWithAbort(closeHandle(), signal);
     }
   }

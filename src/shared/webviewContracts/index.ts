@@ -1,17 +1,3 @@
-/**
- * Webview Contracts — Barrel Re-export
- *
- * All types and parsers are defined in domain-specific modules:
- *   - shared.ts    — Core types, envelope parsers, utilities
- *   - query.ts     — Query panel types and message parser
- *   - table.ts     — Table panel types and message parser
- *   - erd.ts       — ERD panel types and message parser
- *   - connection.ts — Connection form types and message parser
- *
- * Existing imports from `"../../shared/webviewContracts"` continue
- * to work via this re-export.
- */
-
 export type {
   ConnectionFormBrowseTarget,
   ConnectionFormExistingState,
@@ -86,8 +72,6 @@ export type {
 } from "./table";
 export { parseTablePanelMessage } from "./table";
 
-// ─── Composite Types & Parsers (defined here to avoid circular deps) ───────
-
 import type { ConnectionFormInitialState } from "./connection";
 import { parseConnectionFormInitialState } from "./connection";
 import type { ErdInitialState } from "./erd";
@@ -104,12 +88,6 @@ export type WebviewInitialState =
   | ErdInitialState
   | ConnectionFormInitialState;
 
-/**
- * Parses the raw initial state injected by the extension host into
- * a strongly-typed discriminated union based on the `view` field.
- * Returns `null` when the input is not a record or has an unknown
- * `view` value.
- */
 export function parseWebviewInitialState(
   input: unknown,
 ): WebviewInitialState | null {

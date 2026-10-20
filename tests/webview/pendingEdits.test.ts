@@ -1,12 +1,3 @@
-/**
- * Smoke tests for the refactored `pendingEdits` utilities.
- *
- * The original co-located suite at `src/webview/utils/pendingEdits.test.ts`
- * is not picked up by the vitest workspace (which scans `tests/**`).
- * The full behavioural coverage is re-asserted here from the perspective
- * of the actual workspace, ensuring the refactor remains a true
- * drop-in replacement.
- */
 import { describe, expect, it } from "vitest";
 import {
   type ColumnTypeMeta as ColumnMeta,
@@ -25,8 +16,6 @@ import {
   type PendingCellEdit,
   type PendingDraftEdit,
 } from "../../src/webview/utils/pendingEdits";
-
-// ─── Fixtures ────────────────────────────────────────────────────────────────
 
 const makeColumn = (name: string, nullable = false): ColumnMeta =>
   ({
@@ -53,8 +42,6 @@ const pendingWith = (
   }
   return map;
 };
-
-// ─── createPendingEdit ───────────────────────────────────────────────────────
 
 describe("createPendingEdit (refactored)", () => {
   it("adds a new edit", () => {
@@ -92,8 +79,6 @@ describe("createPendingEdit (refactored)", () => {
   });
 });
 
-// ─── applyCellEditsToPending ────────────────────────────────────────────────
-
 describe("applyCellEditsToPending (refactored)", () => {
   it("returns same map for empty edits", () => {
     const pending = emptyPending();
@@ -124,8 +109,6 @@ describe("applyCellEditsToPending (refactored)", () => {
   });
 });
 
-// ─── getPendingEditsForCell ──────────────────────────────────────────────────
-
 describe("getPendingEditsForCell", () => {
   it("returns the pending value", () => {
     const pending = pendingWith([[0, [["name", "Alice"]]]]);
@@ -136,8 +119,6 @@ describe("getPendingEditsForCell", () => {
     expect(getPendingEditsForCell(emptyPending(), 0, "name")).toBeUndefined();
   });
 });
-
-// ─── clearPendingEdits / clearAllPendingEdits ───────────────────────────────
 
 describe("clearPendingEdits", () => {
   it("removes a single cell entry but keeps siblings", () => {
@@ -175,8 +156,6 @@ describe("clearAllPendingEdits", () => {
   });
 });
 
-// ─── mergePendingEdits ──────────────────────────────────────────────────────
-
 describe("mergePendingEdits", () => {
   it("merges two empty maps", () => {
     expect(mergePendingEdits(emptyPending(), emptyPending()).size).toBe(0);
@@ -198,8 +177,6 @@ describe("mergePendingEdits", () => {
     );
   });
 });
-
-// ─── applyDraftEditsToInsertRow ─────────────────────────────────────────────
 
 describe("applyDraftEditsToInsertRow", () => {
   it("returns same draft for empty edits", () => {
@@ -225,8 +202,6 @@ describe("applyDraftEditsToInsertRow", () => {
     expect(result.name.value).toBe(NULL_SENTINEL);
   });
 });
-
-// ─── filterEffectiveEdits ───────────────────────────────────────────────────
 
 describe("filterEffectiveEdits", () => {
   it("returns empty when all edits already match pending state", () => {

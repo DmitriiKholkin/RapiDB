@@ -1,10 +1,5 @@
-/** Selection editing helpers for Monaco. */
 import type * as monaco from "monaco-editor";
 
-/**
- * Compute the range of the current selection, or the caret position
- * when nothing is selected. Used as the insertion target for paste.
- */
 function selectionRangeOrCaret(
   editor: monaco.editor.IStandaloneCodeEditor,
 ): monaco.IRange {
@@ -27,10 +22,6 @@ function selectionRangeOrCaret(
   };
 }
 
-/**
- * Insert text at the current selection, replacing any active selection.
- * No-op when the editor is read-only.
- */
 export function insertTextAtSelection(
   editor: monaco.editor.IStandaloneCodeEditor,
   text: string,
@@ -58,10 +49,6 @@ export function insertTextAtSelection(
   editor.revealPosition(newPos);
 }
 
-/**
- * Delete the currently selected text (no clipboard interaction). Used
- * by the cut handler. No-op for empty selections or read-only editors.
- */
 export function deleteSelectedText(
   editor: monaco.editor.IStandaloneCodeEditor,
   isReadOnly: () => boolean,

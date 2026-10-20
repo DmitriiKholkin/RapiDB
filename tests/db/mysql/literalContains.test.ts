@@ -12,8 +12,6 @@ import { MySQLDriver } from "../../../src/extension/dbDrivers/mysql";
 import { TableReadService } from "../../../src/extension/table/tableReadService";
 import { resolveConnectionSeed } from "../../runtime/testRuntimeConfig";
 
-// Opt in against the existing MySQL test seed (no fixture reset required):
-// RAPIDB_LIVE_MYSQL_CONTAINS=1 npx vitest run --project db-mysql tests/db/mysql/literalContains.test.ts
 describe.runIf(process.env.RAPIDB_LIVE_MYSQL_CONTAINS === "1")(
   "H1 live MySQL literal Contains across SESSION sql_mode",
   () => {
@@ -100,8 +98,6 @@ describe.runIf(process.env.RAPIDB_LIVE_MYSQL_CONTAINS === "1")(
         `CREATE TABLE \`${table}\` (\`id\` INT PRIMARY KEY, \`value\` VARCHAR(512) CHARACTER SET utf8mb4 NULL)`,
       );
       tableCreated = true;
-      // Seed through real prepared statements so quotes/backslashes in fixture
-      // data are independent of the server's initial string-literal mode.
       for (const [index, value] of samples.entries()) {
         await connection.execute(
           `INSERT INTO \`${table}\` (\`id\`, \`value\`) VALUES (?, ?)`,
@@ -112,8 +108,6 @@ describe.runIf(process.env.RAPIDB_LIVE_MYSQL_CONTAINS === "1")(
 
     beforeEach(() => {
       if (!pool || !checkout) throw new Error("MySQL pool was not initialized");
-      // Production deliberately discards arbitrary-query sessions. Initialize
-      // each real checkout instead of returning one already-destroyed lease.
       const realCheckout = checkout;
       vi.spyOn(pool, "getConnection").mockImplementation(async () => {
         const lease = await realCheckout();
@@ -155,7 +149,7 @@ describe.runIf(process.env.RAPIDB_LIVE_MYSQL_CONTAINS === "1")(
       if (!driver || !connection || originalMode === undefined) {
         throw new Error("Live MySQL session was not initialized");
       }
-      const query = vi.spyOn(driver, "query"); // Call through to the live server.
+      const query = vi.spyOn(driver, "query");
       try {
         modeForReads = mode;
         observedModes = [];
@@ -182,8 +176,6 @@ describe.runIf(process.env.RAPIDB_LIVE_MYSQL_CONTAINS === "1")(
             page.rows.some((row) => row.value === null),
             needle,
           ).toBe(false);
-          // A failed COUNT falls back to a lower bound. Verify the COUNT really
-          // succeeded, including zero matches, rather than accepting fallback.
           expect(query).toHaveBeenCalledTimes(2);
           expect(query.mock.calls[0]?.[0]).toMatch(/^SELECT COUNT\(\*\)/);
           expect(query.mock.calls[1]?.[0]).toMatch(/^SELECT `id`, `value`/);

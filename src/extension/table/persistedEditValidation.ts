@@ -14,7 +14,6 @@ export interface PersistedEditFailure {
   message: string;
 }
 
-/** Check raw, executable values before coercion can erase a lossy edit. */
 export function validatePersistedEditRecord(
   driver: IDBDriver,
   values: Record<string, unknown>,
@@ -76,8 +75,6 @@ export function validateInsertColumnNames(
   values: Record<string, unknown>,
   columnMap: Map<string, ColumnTypeMeta>,
 ): PersistedEditFailure | null {
-  // SQL tables have a closed set of columns. Document stores may allow new
-  // fields that are not represented by the current sample metadata.
   const unknownColumns = unknownSqlMutationColumns(driver, values, columnMap);
   if (unknownColumns.length === 0) return null;
   return {

@@ -73,8 +73,6 @@ describe("Float column precision preservation", () => {
       port: 3306,
       database: "test",
     } as ConnectionConfig);
-    // For whole numbers, `13000.0` and `13000` are the same JS Number;
-    // the test asserts the value is passed through without truncation.
     expect(driver.formatOutputValue(13000.0, floatColumn)).toBe(13000);
     expect(driver.formatOutputValue(0.123456789, floatColumn)).toBe(
       0.123456789,

@@ -12,7 +12,6 @@ import { calcColWidths } from "../../src/webview/utils/columnSizing";
 import { formatScalarValueForDisplay } from "../../src/webview/utils/valueFormatting";
 import { getPostedMessages } from "./testUtils";
 
-// Use the real virtualizer with a deterministic JSDOM viewport.
 vi.mock("@tanstack/react-virtual", async (importOriginal) => {
   const actual =
     await importOriginal<typeof import("@tanstack/react-virtual")>();
@@ -132,7 +131,6 @@ describe("large cell rendering", () => {
     const copied = getPostedMessages().find(
       (message) => message.type === "writeClipboard",
     );
-    // TSV quotes multiline cells but preserves all original characters.
     expect(
       (copied?.payload as { text?: string } | undefined)?.text === `"${huge}"`,
     ).toBe(true);

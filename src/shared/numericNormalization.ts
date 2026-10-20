@@ -1,4 +1,3 @@
-// Supported currency codes; never interpret arbitrary three-letter text as money.
 const CURRENCY_CODES = new Set([
   "USD",
   "EUR",
@@ -35,8 +34,6 @@ function stripCurrencyAffixes(rawValue: string): string {
   let value = rawValue.trim();
   value = value.replace(/^[\p{Sc}\s]+/gu, "");
   let end = value.length;
-  // Scan suffix code points once. An unanchored greedy suffix regexp retries
-  // every position in long interior whitespace/currency runs before a digit.
   while (end > 0) {
     let start = end - 1;
     const last = value.charCodeAt(start);
@@ -55,7 +52,6 @@ function stripCurrencyAffixes(rawValue: string): string {
     value = value.slice(3).trim();
   }
   if (
-    // Fixed-width suffix: no variable-length run can be retried quadratically.
     /(?:\d|\.)[A-Za-z]{3}$/.test(value) &&
     CURRENCY_CODES.has(value.slice(-3).toUpperCase())
   ) {
@@ -115,12 +111,9 @@ export function normalizeNumericToken(
     return null;
   }
 
-  // Exact DB numerics can exceed the JS Number range without being infinite.
   return !requireFiniteNumber || Number.isFinite(Number(value)) ? value : null;
 }
 
-// Comparison-only work limits; normalization's existing exact/money contracts
-// remain unchanged. Oversized comparison inputs are invalid, never rounded.
 export const NUMERIC_COMPARISON_LIMITS = {
   maxTokenLength: 65_536,
   maxExponentDigits: 8_192,
@@ -131,12 +124,10 @@ function skipLeadingZeros(digits: string, start = 0): number {
   return start;
 }
 
-/** Compare bounded decimal tokens without rounding or expanding exponents. */
 export function compareNumericTokens(
   left: string,
   right: string,
 ): number | null {
-  // Check both operands before trimming, normalization, allocation or BigInt.
   if (
     left.length > NUMERIC_COMPARISON_LIMITS.maxTokenLength ||
     right.length > NUMERIC_COMPARISON_LIMITS.maxTokenLength
@@ -145,8 +136,6 @@ export function compareNumericTokens(
   const parse = (raw: string) => {
     let token = normalizeNumericToken(raw, false);
     if (token === null) {
-      // Only the complete plain trailing-dot grammar gets this extension.
-      // Never repair a malformed decimal or alter money/grouping normalization.
       const plain = raw.trim();
       if (!/^[+-]?\d+\.(?:[eE][+-]?\d+)?$/.test(plain)) return null;
       const dot = plain.indexOf(".");
@@ -170,8 +159,6 @@ export function compareNumericTokens(
     const start = skipLeadingZeros(digits);
     if (start === digits.length) return { sign: 0, digits: "", magnitude: 0n };
     let end = digits.length;
-    // One backwards pass. An unanchored /0+$/ retries long internal zero runs
-    // at every position and becomes quadratic on e.g. 1 + zeros + 1.
     while (end > start && digits.charCodeAt(end - 1) === 48) end -= 1;
     return {
       sign: match[1] === "-" ? -1 : 1,
@@ -190,7 +177,6 @@ export function compareNumericTokens(
   if (a.magnitude !== b.magnitude) {
     return (a.magnitude < b.magnitude ? -1 : 1) * a.sign;
   }
-  // Virtual right-padding is bounded by the input significands, never exponents.
   for (let i = 0; i < Math.max(a.digits.length, b.digits.length); i += 1) {
     const x = a.digits[i] ?? "0";
     const y = b.digits[i] ?? "0";

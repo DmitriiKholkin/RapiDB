@@ -1,12 +1,4 @@
-/**
- * ERD (Entity Relationship Diagram) style constants.
- *
- * Extracted from ErdView.tsx to reduce component size and improve maintainability.
- * All styles are React.CSSProperties objects used by the ERD view components.
- */
 import type React from "react";
-
-// ─── Button Styles ───────────────────────────────────────────────────────────
 
 export const miniButtonStyle: React.CSSProperties = {
   cursor: "pointer",
@@ -18,8 +10,6 @@ export const miniButtonStyle: React.CSSProperties = {
   color: "var(--vscode-button-secondaryForeground)",
   background: "var(--vscode-button-secondaryBackground)",
 };
-
-// ─── Node Header Styles ──────────────────────────────────────────────────────
 
 export const nodeHeaderLabelStyle: React.CSSProperties = {
   flex: 1,
@@ -39,8 +29,6 @@ export const tableTitleStyle: React.CSSProperties = {
   textOverflow: "ellipsis",
 };
 
-// ─── Toggle Label Styles ─────────────────────────────────────────────────────
-
 export const toggleLabelStyle: React.CSSProperties = {
   display: "flex",
   alignItems: "center",
@@ -48,8 +36,6 @@ export const toggleLabelStyle: React.CSSProperties = {
   fontSize: 11,
   opacity: 0.85,
 };
-
-// ─── Column Badge Styles ─────────────────────────────────────────────────────
 
 export const columnBadgeStyle: React.CSSProperties = {
   fontSize: 9,
@@ -74,8 +60,6 @@ export function primaryKeyBadgeStyle(
       : "rgba(143, 91, 0, 0.16)",
   };
 }
-
-// ─── Column Layout Styles ────────────────────────────────────────────────────
 
 export const columnNameAndBadgesStyle: React.CSSProperties = {
   display: "flex",
@@ -102,8 +86,6 @@ export const columnTypeTextStyle: React.CSSProperties = {
   textOverflow: "ellipsis",
 };
 
-// ─── Row Handle Styles ───────────────────────────────────────────────────────
-
 export const rowHandleStyle: React.CSSProperties = {
   width: 8,
   height: 8,
@@ -123,8 +105,6 @@ export const rowRightHandleStyle: React.CSSProperties = {
   ...rowHandleStyle,
   right: -11,
 };
-
-// ─── ReactFlow Controls Theme ────────────────────────────────────────────────
 
 export const reactFlowControlsThemeCss = `
 .react-flow__controls { border: 1px solid var(--vscode-panel-border); border-radius: 4px; overflow: hidden; box-shadow: none; }

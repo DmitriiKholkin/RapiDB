@@ -50,7 +50,6 @@ describe("mongo readonly bypass regressions (stage 2)", () => {
         'db.users.aggregate([{ $project: { x: { $mergeObjects: ["$a", "$b"] } } }])',
       ),
     ).toEqual({ allowed: true });
-    // Stage names are case-sensitive; $OUT is unknown to the server.
     expect(g('db.users.aggregate([{ $OUT: "x" }])')).toEqual({ allowed: true });
     expect(
       g(

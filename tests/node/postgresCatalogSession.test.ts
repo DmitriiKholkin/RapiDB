@@ -12,7 +12,6 @@ vi.mock("pg", async (importOriginal) => {
       const pool = harness.pools.shift();
       if (!pool) throw new Error("Unexpected pool creation");
       pool.options = options;
-      // biome-ignore lint/correctness/noConstructorReturn: pg Pool test double
       return pool as never;
     }
   }
@@ -425,7 +424,6 @@ describe("B08 owned PostgreSQL catalog session", () => {
     const catalog = pool();
     const acquisition = deferred<FakeClient>();
     catalog.connect.mockImplementation(() => {
-      // Model pg's configured connectionTimeoutMillis, not a caller abort.
       setTimeout(
         () =>
           acquisition.reject(
@@ -466,7 +464,6 @@ describe("B08 owned PostgreSQL catalog session", () => {
     await vi.advanceTimersByTimeAsync(11);
     await rejected;
     expect(editor.end).not.toHaveBeenCalled();
-    // Model native query_timeout settling after the external wrapper's limit.
     catalog.client.readGate.reject(new Error("Query read timeout"));
     await flush();
     expect(catalog.end).toHaveBeenCalledOnce();

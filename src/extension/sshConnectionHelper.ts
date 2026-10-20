@@ -1,11 +1,3 @@
-/**
- * SSH Connection Helper — утилиты для настройки SSH-туннелей.
- *
- * Извлечены из ConnectionManager для соблюдения SRP.
- * Содержат логику построения SSH-настроек, разрешения удалённых целей
- * и применения SSH runtime к конфигурации драйвера.
- */
-
 import type { ConnectionConfig } from "./connectionManagerModels";
 import type { DriverConnectionConfig } from "./driverRuntimeConfig";
 import type {
@@ -14,12 +6,6 @@ import type {
   SshRuntimeRequest,
 } from "./services/sshRuntime";
 
-// ─── SSH Settings Builder ──────────────────────────────────────────────────
-
-/**
- * Строит SSH-настройки из конфигурации соединения.
- * @throws Если SSH-настройки неполные
- */
 export function buildConnectionSshSettings(
   config: ConnectionConfig,
 ): ConnectionSshSettings | undefined {
@@ -79,18 +65,11 @@ export function buildConnectionSshSettings(
   };
 }
 
-// ─── Remote Target Resolution ──────────────────────────────────────────────
-
-/** Результат разрешения удалённой цели (host:port). */
 export interface RemoteTarget {
   host: string;
   port: number;
 }
 
-/**
- * Разрешает удалённую цель для TCP-соединения по типу драйвера.
- * @throws Если тип драйвера не поддерживает SSH
- */
 export function resolveTcpRemoteTarget(
   config: ConnectionConfig,
   resolveMongoRemoteTarget: (config: ConnectionConfig) => RemoteTarget,
@@ -149,10 +128,6 @@ export function resolveTcpRemoteTarget(
   }
 }
 
-/**
- * Разрешает SSH runtime request на основе типа драйвера.
- * @throws Если SSH не поддерживается для данного типа
- */
 export function resolveSshRuntimeRequest(
   config: ConnectionConfig,
   resolveTcpRemoteTargetFn: (config: ConnectionConfig) => RemoteTarget,
@@ -200,11 +175,6 @@ export function resolveSshRuntimeRequest(
   }
 }
 
-// ─── URI Rewriting ─────────────────────────────────────────────────────────
-
-/**
- * Перезаписывает host и port в URI.
- */
 export function rewriteUriHostPort(
   value: string | undefined,
   host: string,
@@ -220,12 +190,6 @@ export function rewriteUriHostPort(
   return url.toString();
 }
 
-// ─── Config Transformation ─────────────────────────────────────────────────
-
-/**
- * Применяет SSH runtime к конфигурации драйвера.
- * Перезаписывает host/port на локальные значения SSH-туннеля.
- */
 export function applySshRuntimeToConfig(
   config: ConnectionConfig,
   runtime: SshRuntime,

@@ -71,8 +71,6 @@ describe("MSSQL sql_variant snapshot boundary", () => {
   it("rejects raw temporal metadata before preview or parameter binding", () => {
     const injected =
       "7)) WHERE 1=0; SELECT 424242 AS [variant_injection]; UPDATE [db].[dbo].[t] SET [V] = CAST(NULL AS datetime2(7";
-    // Pre-fix this passes effective-column checkPersistedEdit, preview
-    // materialization and the binder's placeholder-count check unchanged.
     expect(() =>
       prepare(
         snapshot({ baseType: "datetime2", scale: injected }),
@@ -155,8 +153,6 @@ describe("MSSQL sql_variant snapshot boundary", () => {
     { baseType: "varbinary", maxLength: null },
     { baseType: "time", scale: null },
   ])("rejects out-of-range or missing required subtype metadata: %j", (metadata) => {
-    // These pass the integer-or-null snapshot shape check; type construction
-    // must still fail closed before trying to validate the edited value.
     expect(() =>
       driver.buildMutationValueExpr(variant, "1", "update", snapshot(metadata)),
     ).toThrow(TypeError);

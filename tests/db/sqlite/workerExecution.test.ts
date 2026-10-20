@@ -166,7 +166,6 @@ describe("SQLite off-host execution", () => {
     expect(await value(driver, "SELECT value FROM data")).toBe(7);
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(await value(driver, "SELECT value FROM data")).toBe(7);
-    // Query editor mutations, including RETURNING, have the same isolation.
     await expect(
       driver.query(`UPDATE data SET value=(${CPU_SUM}) RETURNING value`, [], {
         hardCap: 1,

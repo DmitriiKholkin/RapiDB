@@ -1,6 +1,3 @@
-/** Expand validated numeric filter text within the backend's DECIMAL limits.
- * Only digit counts/exponents use Number; the significand is never rounded.
- */
 export function exactNumericFilterLiteral(
   raw: string,
   columnName: string,
@@ -22,7 +19,6 @@ export function exactNumericFilterLiteral(
   const exponent = Number(match[4] ?? "0");
   const decimalIndex = match[2].length + exponent - leading;
   const scale = Math.max(0, digits.length - decimalIndex);
-  // Check before expanding: even underflowing exponents can be arbitrarily big.
   if (
     !Number.isSafeInteger(decimalIndex) ||
     scale > maxScale ||

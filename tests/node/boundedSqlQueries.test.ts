@@ -60,9 +60,6 @@ describe("driver-owned result budgets", () => {
     let peakBuilders = 0;
     let mutationCompleted = false;
     const { driver, client } = postgresHarness((query) => {
-      // Exercise pg's real parsing and command handling, not a fake row emitter.
-      // A callback is installed (as with query_timeout); native pg would buffer
-      // rows despite a row listener without the bounded adapter override.
       for (let set = 0; set < 80; set++) {
         query.handleRowDescription({ fields: [field("same"), field("same")] });
         for (let row = 0; row < 120; row++) {

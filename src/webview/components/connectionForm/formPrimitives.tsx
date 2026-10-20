@@ -1,9 +1,3 @@
-/**
- * Reusable form primitives for the connection form.
- *
- * These are controlled input components that integrate with VS Code
- * theming and provide consistent focus styling.
- */
 import React, {
   type CSSProperties,
   type InputHTMLAttributes,
@@ -18,8 +12,6 @@ import {
   buildTextInputStyle,
 } from "../../utils/controlStyles";
 import { Icon } from "../Icon";
-
-// ─── Focus-Aware Inputs ─────────────────────────────────────────────────────
 
 export function FocusInput(props: InputHTMLAttributes<HTMLInputElement>) {
   const [focused, setFocused] = useState(false);
@@ -96,8 +88,6 @@ export function FocusTextArea(
     />
   );
 }
-
-// ─── Layout Primitives ──────────────────────────────────────────────────────
 
 export function FieldLabel({ children }: { children: ReactNode }) {
   return (
@@ -203,8 +193,6 @@ export function CardHeader({ icon, label }: { icon: string; label: string }) {
     </div>
   );
 }
-
-// ─── Toggle ─────────────────────────────────────────────────────────────────
 
 function ToggleSwitch({
   checked,

@@ -12,7 +12,6 @@ export const TEST_PROJECT_IDS = [
   "db-workflow",
 ] as const;
 
-/** Index of the extension-host project in TEST_PROJECT_IDS. */
 export const EXTENSION_HOST_PROJECT_INDEX =
   TEST_PROJECT_IDS.indexOf("extension-host");
 

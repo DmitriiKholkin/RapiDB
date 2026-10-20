@@ -1,6 +1,5 @@
 import net from "node:net";
 
-/** A real PostgreSQL TCP relay that can withhold one transaction-state reply. */
 export class PgReadyForQueryProxy {
   private readonly sockets = new Set<net.Socket>();
   private pauseStatus?: "T" | "E";
@@ -33,7 +32,7 @@ export class PgReadyForQueryProxy {
           const frame = pending.subarray(0, length);
           pending = pending.subarray(length);
           if (
-            frame[0] === 90 && // ReadyForQuery ('Z')
+            frame[0] === 90 &&
             this.pauseStatus &&
             frame.toString("ascii", 5) === this.pauseStatus
           ) {

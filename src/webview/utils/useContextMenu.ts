@@ -1,15 +1,3 @@
-/**
- * Reusable context menu hook.
- *
- * Manages open/close state, position, and dismiss-on-outside-click/Escape.
- * Menu items and actions stay in the consuming component — this hook only
- * handles the menu shell.
- *
- * Listeners are tied to the lifetime of the menu via an `AbortController`
- * so we never leak global `window` handlers when the menu unmounts.
- *
- * @typeParam TMeta - Arbitrary metadata attached to the menu (e.g. hasSelection).
- */
 import { useCallback, useEffect, useRef, useState } from "react";
 
 export interface ContextMenuState<TMeta = Record<string, unknown>> {
@@ -19,14 +7,8 @@ export interface ContextMenuState<TMeta = Record<string, unknown>> {
 }
 
 interface UseContextMenuOptions<TMeta> {
-  /** Return current metadata when the menu opens. */
   buildMeta: () => TMeta;
-  /**
-   * Compute the menu position from the native event.
-   * Defaults to fixed positioning (clientX / clientY).
-   */
   getPosition?: (event: MouseEvent) => { x: number; y: number };
-  /** Close on window blur (default: true). */
   closeOnBlur?: boolean;
 }
 
@@ -34,7 +16,6 @@ interface UseContextMenuReturn<TMeta> {
   menu: ContextMenuState<TMeta> | null;
   open: (event: MouseEvent) => void;
   close: () => void;
-  /** Ref to attach to the menu DOM node for outside-click detection. */
   menuRef: React.RefObject<HTMLDivElement | null>;
 }
 
@@ -53,11 +34,8 @@ export function useContextMenu<TMeta = Record<string, unknown>>({
   const [menu, setMenu] = useState<ContextMenuState<TMeta> | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
 
-  // `close` is stable; no need for a ref dance.
   const close = useCallback(() => setMenu(null), []);
 
-  // Stash mutable options in refs so the effect can stay focused on the
-  // menu-open transition without re-subscribing on every render.
   const buildMetaRef = useRef(buildMeta);
   const getPositionRef = useRef(getPosition);
   const closeOnBlurRef = useRef(closeOnBlur);
@@ -73,7 +51,6 @@ export function useContextMenu<TMeta = Record<string, unknown>>({
     setMenu({ x: pos.x, y: pos.y, meta: buildMetaRef.current() });
   }, []);
 
-  // Subscribe to global dismissal events only while the menu is open.
   useEffect(() => {
     if (!menu) {
       return;

@@ -79,7 +79,6 @@ describe.each([
       ]);
     }
     for (const operator of ["is_null", "is_not_null"] as const) {
-      // Null checks are allowed even when scalar filtering is unavailable.
       const result = buildWhere(
         driver,
         [{ column: "value", operator }],

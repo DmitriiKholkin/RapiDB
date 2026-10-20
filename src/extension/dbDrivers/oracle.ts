@@ -522,7 +522,6 @@ function parseOracleNumberScale(nativeType: string): number | null {
   return Number(match[1]);
 }
 function oracleTypeName(nativeType: string): string {
-  // Catalog annotations describe constraints, not the physical SQL type.
   return nativeType
     .toUpperCase()
     .replace(/\s+IS\s+(?:JSON|XML)\s*$/, "")
@@ -901,8 +900,6 @@ function normalizeOracleTemporalValue(
       return `${normalizedText.text}${timezone}`;
     }
     if (normalizedText?.hasExplicitTimezone) {
-      // Shift whole seconds to UTC and carry the fraction verbatim: Date
-      // truncates the FF9 digits used by filters and keyset export cursors.
       const [date, time] = normalizedText.text.split(" ");
       const [seconds, fraction] = time.split(".");
       const instant = parseOracleTemporalInput(
@@ -975,7 +972,6 @@ function oracleTemporalFilterExpr(column: ColumnTypeMeta): string {
   return `RTRIM(RTRIM(TO_CHAR(${col}, 'YYYY-MM-DD HH24:MI:SS.FF9'), '0'), '.')`;
 }
 
-/** Bind temporal text without passing through millisecond-only JS Dates. */
 function oracleTemporalBindText(
   value: unknown,
   column: ColumnTypeMeta,
@@ -1034,8 +1030,6 @@ function formatOracleQueryValue(
     return value;
   }
   if (meta.dbType === oracledb.DB_TYPE_DATE) {
-    // Oracle DATE includes time through seconds. node-oracledb maps it to a
-    // local-time Date, so UTC getters can move midnight into the previous day.
     return formatOracleWallClockDate(value) ?? value;
   }
   if (meta.dbType === oracledb.DB_TYPE_TIMESTAMP) {
@@ -1253,16 +1247,11 @@ export class OracleDriver extends BaseDBDriver {
       try {
         await conn.close();
       } catch (closeError) {
-        // Preserve the probe error; otherwise a failed release prevents
-        // publishing a pool with a checked-out connection.
         if (!probeFailed) throw closeError;
       }
       if (probeFailed) throw probeError;
       this.assertConnectionEpoch(epoch);
     } catch (error) {
-      // Probe (getConnection/ping) failed: close the freshly created pool
-      // instead of leaking it. Pool stays local until success so concurrent
-      // readers never observe a half-initialized pool.
       await this.closePool(pool);
       throw error;
     } finally {
@@ -1286,13 +1275,11 @@ export class OracleDriver extends BaseDBDriver {
   private async closeOwnedPools(): Promise<void> {
     const pools = new Set(this.pendingPools);
     if (this.pool) pools.add(this.pool);
-    // Detach before awaiting: a late close must not null a newly published pool.
     this.pool = null;
     this.pendingPools.clear();
     await Promise.all([...pools].map((pool) => this.closePool(pool)));
   }
 
-  /** Timeout cleanup belongs only to the captured attempt, including late settlement. */
   async cancelConnectionAttempt(attempt: Promise<unknown>): Promise<void> {
     if (
       attempt === this.connectionAttempt ||
@@ -1370,9 +1357,7 @@ export class OracleDriver extends BaseDBDriver {
       await connection.execute(
         "ALTER SESSION SET NLS_TIMESTAMP_TZ_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM'",
       );
-    } catch {
-      // Best effort: continue with default NLS settings when session alter is not allowed.
-    }
+    } catch {}
     return connection;
   }
 
@@ -1413,9 +1398,7 @@ export class OracleDriver extends BaseDBDriver {
         }
         result.set(row.COLUMN_NAME, kind);
       }
-    } catch {
-      // Ignore metadata lookup errors and keep base type information.
-    }
+    } catch {}
     return result;
   }
   async listDatabases(): Promise<DatabaseInfo[]> {
@@ -1584,9 +1567,7 @@ export class OracleDriver extends BaseDBDriver {
             name: row.TYPE_NAME,
           });
         }
-      } catch {
-        // Collection annotations are optional; retain ordinary column metadata.
-      }
+      } catch {}
       const objectByColumn = new Map<
         string,
         {
@@ -1634,9 +1615,7 @@ export class OracleDriver extends BaseDBDriver {
             nativeType: row.ATTR_TYPE_NAME.trim().toUpperCase(),
           });
         }
-      } catch {
-        // Object annotations are optional; retain ordinary column metadata.
-      }
+      } catch {}
       const pkRes = await conn.execute<{
         COLUMN_NAME: string;
         POSITION: number;
@@ -2457,8 +2436,6 @@ export class OracleDriver extends BaseDBDriver {
       );
       return (res.rows ?? []).map((row) => ({
         ...row,
-        // Binary XML storage exposes the writable XMLType column as virtual
-        // with no expression. It is not a generated SQL expression column.
         VIRTUAL_COLUMN:
           row.DATA_TYPE?.toUpperCase() === "XMLTYPE" &&
           !row.DATA_DEFAULT?.trim()
@@ -2568,9 +2545,6 @@ export class OracleDriver extends BaseDBDriver {
       hardCap?: number;
     },
   ): Promise<QueryResult> {
-    // This option is the arbitrary-editor execution boundary, not the saved
-    // connection flag: generated table reads also use query() without it.
-    // Autonomous transactions can commit despite READ ONLY + caller rollback.
     if (operationContext?.readOnly) {
       throw new Error(ORACLE_READ_ONLY_ENFORCEMENT_MESSAGE);
     }
@@ -2628,7 +2602,6 @@ export class OracleDriver extends BaseDBDriver {
     } finally {
       this.activeQueryOperations.delete(operation);
       await conn?.close().catch((error: unknown) => {
-        // A broken connection can also fail release; preserve the query error.
         if (!failed) throw error;
       });
     }
@@ -2669,9 +2642,6 @@ export class OracleDriver extends BaseDBDriver {
       try {
         statementInfo = await conn.getStatementInfo(sql);
       } catch (error) {
-        // node-oracledb Thin's parse-only metadata path currently calls a
-        // public-connection method on its internal connection for DbObjects.
-        // Describe those SELECTs on the server without executing/fetching them.
         if (
           !(error instanceof TypeError) ||
           !error.message.includes("_getDbObjectClass")
@@ -2742,8 +2712,6 @@ END;`,
         return undefined;
       }
 
-      // Oracle does not let an inline view address duplicate output labels by
-      // position. Leave those uncommon result shapes on the original path.
       if (
         new Set(columns.map((column) => column.name)).size !== columns.length
       ) {
@@ -2774,8 +2742,6 @@ END;`,
         `FROM (${sql}\n) ${innerAlias}) ${outerAlias} ` +
         `ORDER BY ${outerAlias}.${rowOrderAlias}`;
 
-      // Parse-check the rewrite. If Oracle rejects a legal SELECT shape when
-      // nested (for example a locking query), execute the user's SQL unchanged.
       const projectedInfo = await conn.getStatementInfo(projectedSql);
       const projectedColumns = projectedInfo.metaData ?? [];
       if (
@@ -2789,8 +2755,6 @@ END;`,
       }
       return { sql: projectedSql, columnNames: outputNames };
     } catch {
-      // The normal execute path remains responsible for reporting the query's
-      // Oracle error with its original SQL and driver diagnostics.
       return undefined;
     }
   }
@@ -2813,14 +2777,9 @@ END;`,
       conn,
       finalSql,
     );
-    // node-oracledb uniquifies metadata names even in array mode. Capture
-    // original labels in the public fetch handler before that transformation.
     const columnNames = new WeakMap<object, string>();
     const options: oracledb.ExecuteOptions = {
       outFormat: oracledb.OUT_FORMAT_ARRAY,
-      // Named Oracle objects otherwise arrive as DbObject instances whose
-      // attributes are exposed through accessors and are not enumerable. The
-      // table mutation verifier canonicalizes plain attribute records.
       dbObjectAsPojo: true,
       fetchArraySize: 100,
       prefetchRows: 0,
@@ -2839,8 +2798,6 @@ END;`,
       binds,
       options,
     );
-    // Register every returned cursor before fetching any: a late fetch failure
-    // must also close cursors we have not visited yet.
     const cursors = new Set<oracledb.ResultSet<unknown[]>>();
     const register = (value: unknown): void => {
       if (
@@ -2874,7 +2831,6 @@ END;`,
             throw new Error("Oracle query cancelled during fetch.");
           if (batch.length === 0) break;
           for (const row of batch) {
-            // Avoid converting discarded rows while still counting all rows.
             if (collected.rows.length < collected.limit) {
               collected.add(
                 Object.fromEntries(
@@ -2969,7 +2925,6 @@ END;`,
         );
         assertTransactionAffectedRows(op, res.rowsAffected ?? 0);
         if (outTypes) {
-          // DML RETURNING with positional binds yields one array per OUT bind.
           const outputs = res.outBinds as unknown[][] | undefined;
           const returnedKeys =
             outputs?.length === outTypes.length &&
@@ -2996,7 +2951,6 @@ END;`,
         this,
         identities.resolve(scope?.verifications),
         async (verification) => {
-          // Reuse normal value decoding on this connection; do not lease or commit.
           const result = await this._execOne(
             conn,
             verification.sql,
@@ -3168,10 +3122,6 @@ END;`,
       return `XMLSERIALIZE(CONTENT ${identifier} AS CLOB NO INDENT)`;
     }
     if (oracleTypeName(column.nativeType) === "JSON") {
-      // Oracle's native JSON fetch path materializes JSON numbers as JS
-      // numbers. That silently rounds integers above Number.MAX_SAFE_INTEGER
-      // before the table viewer can display or edit them. Keep the server's
-      // serialized tokens by fetching JSON as text instead.
       return `JSON_SERIALIZE(${identifier} RETURNING CLOB)`;
     }
     if (column.category === "other" && column.objectAttributes?.length) {
@@ -3308,8 +3258,6 @@ END;`,
       .join(", ");
     return {
       sql: `${typeName}(${argumentsSql})`,
-      // Oracle positional binds count each placeholder occurrence, even when
-      // the same JSON document feeds multiple JSON_VALUE expressions.
       params: column.objectAttributes.map(() => JSON.stringify(normalized)),
     };
   }
@@ -3339,10 +3287,6 @@ END;`,
       throw new Error(`Invalid temporal export cursor for ${column.name}.`);
     }
     const name = this.quoteIdentifier(column.name);
-    // Query values for TSTZ/TSLTZ are UTC text. Bind that text, not a Date
-    // (node-oracledb binds Dates as timezone-less TIMESTAMP). Native timestamp
-    // comparison preserves fractions without the user filter's FF6 rendering.
-    // Specify (9): an unqualified TIMESTAMP cast defaults to precision 6.
     const expression = timezoneAware
       ? `SYS_EXTRACT_UTC(CAST(${name} AS TIMESTAMP(9) WITH TIME ZONE))`
       : name;
@@ -3605,8 +3549,6 @@ END;`,
           return match[2] ? `${match[1]} ${match[2]}` : match[1];
         }
       }
-      // Oracle DATE is a timezone-free wall-clock value that includes time
-      // through seconds. Preserve it instead of interpreting it as UTC.
       const formatted = formatOracleWallClockDate(value);
       if (formatted !== null) return formatted;
     }

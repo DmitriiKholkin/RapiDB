@@ -63,9 +63,6 @@ vi.mock("monaco-editor", async (importOriginal) => {
             endColumn: (value.split("\n").at(-1)?.length ?? 0) + 1,
           }),
         };
-        // Model only the documented edit-stack contract: executeEdits emits
-        // content changes and joins the open group; pushUndoStop separates
-        // groups; setValue resets history. This is not the real Monaco engine.
         const editor = {
           ...base,
           getValue: () => value,
@@ -161,7 +158,6 @@ describe("Clear with the actual MonacoEditor component", () => {
     );
     const editor = monacoState.current;
     if (!editor) throw new Error("Monaco editor was not created");
-    // Leave the previous edit group open: Clear must close it before editing.
     act(() =>
       editor.executeEdits("typing", [
         { range: editor.getModel().getFullModelRange(), text: edited },
@@ -182,7 +178,6 @@ describe("Clear with the actual MonacoEditor component", () => {
         text: "",
       },
     ]);
-    // Clearing an already empty model is a no-op, including its undo stack.
     fireEvent.click(screen.getByRole("button", { name: "Clear" }));
     expect(editor.pushUndoStop).toHaveBeenCalledTimes(2);
     expect(editor.executeEdits).toHaveBeenCalledTimes(2);
@@ -201,7 +196,6 @@ describe("Clear with the actual MonacoEditor component", () => {
         queryDraft: { panelId: "undo-clear", text: expected },
       });
     }
-    // The stop after Clear must prevent subsequent typing merging into it.
     act(() =>
       editor.executeEdits("typing", [
         { range: editor.getModel().getFullModelRange(), text: "select 5" },

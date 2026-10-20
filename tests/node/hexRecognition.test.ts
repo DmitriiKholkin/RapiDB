@@ -103,7 +103,6 @@ describe("binary result formatting", () => {
     ...oddHexValues,
     ...nonHexValues,
   ])("preserves SQLite binary-column text %j in a whole table page", async (value) => {
-    // Non-STRICT SQLite can legitimately return TEXT from a BLOB column.
     const driver = new SQLiteDriver({
       id: "hex-table",
       name: "Hex Table",

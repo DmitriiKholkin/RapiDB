@@ -153,7 +153,6 @@ describe("B03 PostgreSQL array literals (live)", () => {
       expect(row?.a).toEqual(values);
       expect(JSON.parse(String(row?.control))).toEqual(values);
     }
-    // The same optimistic check must still detect a genuine concurrent edit.
     const page = await read.getPage(config.id, database, schema, table, 1, 10, [
       { column: "id", operator: "eq", value: String(id) },
     ]);
@@ -236,7 +235,6 @@ describe("B03 PostgreSQL array literals (live)", () => {
     [" \t[0:1] \n= \t{x,y} \n", true],
     ["[+0:+1]={x,y}", true],
   ])("bounds grammar agrees with PostgreSQL: %s (valid=%s)", async (literal, valid) => {
-    // Only scalar text results: server validation is independent of our parser.
     const query = driver.query(
       "SELECT array_dims($1::text[]) AS dims, array_to_json($1::text[])::text AS elements",
       [literal],
@@ -273,8 +271,6 @@ describe("B03 PostgreSQL array literals (live)", () => {
         10,
         [{ column: "id", operator: "eq", value: String(id) }],
       );
-      // Exercise the strict converter on actual page originals, before asserting
-      // their display, so the regression reproduces the reported apply failure.
       const result = await applyChangesTransactional(
         manager as never,
         config.id,
@@ -381,9 +377,6 @@ describe("B03 PostgreSQL array literals (live)", () => {
     await scopedDriver.connect();
     try {
       const pool = (scopedDriver as unknown as { pool: Pool }).pool;
-      // Initialize every physical connection (production pool max=5), so catalog,
-      // page reads, UPDATE transaction and verification all use this search_path.
-      // A dedicated driver is disconnected below; no session settings leak out.
       const clients = await Promise.all(
         Array.from({ length: 5 }, () => pool.connect()),
       );
@@ -398,7 +391,6 @@ describe("B03 PostgreSQL array literals (live)", () => {
       } finally {
         for (const client of clients) client.release();
       }
-      // Show that format_type alone really loses the user type's namespace.
       const [catalog] = rowsFromQuery(
         await scopedDriver.query(
           "SELECT pg_catalog.format_type(a.atttypid,a.atttypmod) AS formatted FROM pg_catalog.pg_attribute a WHERE a.attrelid=$1::regclass AND a.attname='a'",
@@ -438,8 +430,6 @@ describe("B03 PostgreSQL array literals (live)", () => {
         );
       for (const elements of [["fixed"], initial]) {
         const page = await getPage();
-        // Use actual originals before checking their display to reproduce the
-        // strict-JSON regression, rather than failing only on metadata text.
         const result = await apply(page.rows[0].a, elements);
         expect(result).toMatchObject({
           success: true,

@@ -21,7 +21,6 @@ export function createElasticsearchPitMock(
     _index: "records",
     _id: `doc-${ordinal}`,
     _source: { ordinal },
-    // Real PIT shard-doc values include the shard ordinal in the high bits.
     sort: [Math.floor(ordinal / 2) + (ordinal % 2) * 2 ** 32],
   })).sort((a, b) => a.sort[0] - b.sort[0]);
   const snapshots = new Map<string, Hit[]>();

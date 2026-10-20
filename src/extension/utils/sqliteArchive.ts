@@ -14,8 +14,6 @@ import type { Readable, Writable } from "node:stream";
 import { promisify } from "node:util";
 import { gunzip } from "node:zlib";
 
-// Copied from package-lock.json, not fetched alongside the archive. A regression
-// test requires these pins to be updated together with the locked dependency.
 export const SQLITE_SOURCE = {
   version: "12.10.0",
   url: "https://registry.npmjs.org/better-sqlite3/-/better-sqlite3-12.10.0.tgz",
@@ -88,10 +86,6 @@ type Extract = Writable & {
   ): Extract;
 };
 
-/** Parse and validate the entire bounded archive before making any filesystem writes.
- * tar-stream only parses headers/data: unlike tar-fs or a PATH tar executable it
- * cannot create links, devices, or files behind our validation's back.
- */
 export async function extractSQLiteArchive(
   archivePath: string,
   destination: string,
@@ -224,8 +218,6 @@ export async function extractSQLiteArchive(
       "SQLite header archive is missing required pinned build inputs.",
     );
   }
-  // Validate file/directory conflicts before writing, including case-insensitive
-  // filesystems. Native binary archives may not overwrite any scaffold JS.
   const foldedPaths = new Set<string>();
   for (const path of paths) {
     const folded = path.toLowerCase();
@@ -243,7 +235,6 @@ export async function extractSQLiteArchive(
         throw new Error("Conflicting SQLite archive paths.");
     }
   }
-  // Never follow a preexisting link, even if the archive itself has no links.
   const ensureDirectory = (path: string): void => {
     try {
       if (!lstatSync(path).isDirectory())

@@ -1,10 +1,3 @@
-/**
- * Schema Cache Utilities — pure helper functions for schema caching.
- *
- * Извлечены из SchemaCacheManager для соблюдения SRP и улучшения тестируемости.
- * Содержат клонирование, создание и трансформацию схемных данных.
- */
-
 import type {
   ConnectionConfig,
   ExplorerSchemaScope,
@@ -27,8 +20,6 @@ import {
   type DriverEntityManifest,
   type IDBDriver,
 } from "./dbDrivers/types";
-
-// ─── Internal Types ───────────────────────────────────────────────────────────
 
 export interface InternalScopedSchemaCacheEntry {
   snapshot: SchemaSnapshot;
@@ -58,13 +49,9 @@ export interface ConnectionSchemaCacheEntry extends SchemaSnapshotState {
   expandedScopeKeys: Set<SchemaScopeKey>;
 }
 
-// ─── Constants ─────────────────────────────────────────────────────────────
-
 export const CONNECTION_ROOT_SCOPE: ExplorerSchemaScope = {
   kind: "connectionRoot",
 };
-
-// ─── Scope Utilities ──────────────────────────────────────────────────────
 
 export function createConnectionRootSchemaScope(): ExplorerSchemaScope {
   return { kind: "connectionRoot" };
@@ -148,8 +135,6 @@ export function isDescendantScope(
   }
 }
 
-// ─── Driver Utilities ─────────────────────────────────────────────────────
-
 export function resolveDriverEntityManifest(
   driver: IDBDriver | undefined,
 ): DriverEntityManifest {
@@ -161,8 +146,6 @@ export function resolveDriverCapabilities(
 ): DriverCapabilities | undefined {
   return driver?.getCapabilities?.();
 }
-
-// ─── Snapshot Creation ────────────────────────────────────────────────────
 
 export function createEmptySchemaSnapshot(): SchemaSnapshot {
   return { databases: [] };
@@ -247,8 +230,6 @@ export function createScopeSnapshotForSchema(
     ],
   };
 }
-
-// ─── Cloning Utilities ────────────────────────────────────────────────────
 
 export function cloneSchemaSnapshotObjectEntry(
   object: SchemaSnapshotObjectEntry,
@@ -352,8 +333,6 @@ export function cloneTableDetailState(
   };
 }
 
-// ─── Cache Entry Creation ─────────────────────────────────────────────────
-
 export function createInternalTableDetailCacheEntry(
   request: TableDetailRequest,
   generation: number,
@@ -422,8 +401,6 @@ export function createConnectionSchemaCacheEntry(
   };
 }
 
-// ─── Config Utilities ─────────────────────────────────────────────────────
-
 export function getConfiguredDefaultDatabaseName(
   config: ConnectionConfig,
 ): string {
@@ -443,8 +420,6 @@ export function getConfiguredDefaultDatabaseName(
     config.database || config.serviceName || (config.filePath ? "main" : "")
   );
 }
-
-// ─── Schema Merging ───────────────────────────────────────────────────────
 
 export function mergeSchemaIntoDatabase(
   database: SchemaSnapshotDatabaseEntry,
@@ -467,8 +442,6 @@ export function mergeSchemaIntoDatabase(
   );
   return nextDatabase;
 }
-
-// ─── Aggregate Snapshot Building ──────────────────────────────────────────
 
 export function buildAggregateSchemaSnapshot(
   entry: ConnectionSchemaCacheEntry,
@@ -611,8 +584,6 @@ export function deriveAggregateSchemaState(
       }
     : { status: "loaded", isPartial: false };
 }
-
-// ─── Flattening ───────────────────────────────────────────────────────────
 
 export function flattenSchemaSnapshot(
   snapshot: SchemaSnapshot,

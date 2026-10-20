@@ -50,8 +50,6 @@ const classificationTokens = (tokens: SqlCapToken[]): string[] =>
     return token.text;
   });
 
-// A derived table rejects duplicate output names in MySQL and renames them in
-// SQLite. Preserve the original projection when LIMIT has a literal row count.
 function integerAt(
   tokens: SqlCapToken[],
   index: number,
@@ -88,7 +86,6 @@ function applyLiteralLimit(
   hardCap: number,
 ): string | undefined {
   const top = tokens.filter((token) => token.depth === tokens[0].depth);
-  // SQLite forbids LIMIT when the rightmost compound operand is VALUES.
   if (top.some((token) => word(token) === "values")) return undefined;
   const limit = top.findIndex((token) => word(token) === "limit");
   if (limit < 0) return `${sql} LIMIT ${hardCap}`;
@@ -131,9 +128,6 @@ function isSubquerySelect(tokens: SqlCapToken[], index: number): boolean {
   if (token.depth <= tokens[0].depth) return false;
   for (let i = index - 1; i >= 0; i--) {
     if (tokens[i].text === "(" && tokens[i].depth === token.depth - 1) {
-      // These positions require an expression/table operand; a parenthesized
-      // standalone T-SQL statement cannot start there. Do not infer from depth
-      // alone: `SELECT 1 (SELECT ... )` can be a second statement.
       return (
         [
           "exists",
@@ -157,8 +151,6 @@ function isSubquerySelect(tokens: SqlCapToken[], index: number): boolean {
 }
 
 function sqlitePragmaSelect(tokens: SqlCapToken[]): string | undefined {
-  // SQLite exposes these read-only metadata PRAGMAs as table-valued functions.
-  // This does not turn assignment PRAGMAs (journal_mode etc.) into reads.
   const withArgument = new Set([
     "table_info",
     "table_xinfo",
@@ -214,7 +206,6 @@ export interface SqlHardCapRewrite {
   error?: string;
 }
 
-/** Only rewrites a documented subset; the server remains the syntax validator. */
 export function applyHardCapToSqlQuery(
   queryText: string,
   connectionType: ConnectionType | undefined,
@@ -240,15 +231,12 @@ export function applyHardCapToSqlQuery(
   } catch (error) {
     return reject((error as Error).message);
   }
-  // Empty separators (including SQL Server's ;WITH convention) are harmless.
   while (tokens[0]?.text === ";") tokens.shift();
   while (tokens.at(-1)?.text === ";") tokens.pop();
   if (tokens.some((token) => token.kind === "symbol" && token.text === ";")) {
     if (connectionType !== "mssql") {
       const statements: SqlHardCapRewrite[] = [];
       let start = 0;
-      // Preflight the complete script before the controller can execute any
-      // statement. Each result is bounded; transaction semantics stay native.
       for (const token of tokens) {
         if (token.kind !== "symbol" || token.text !== ";") continue;
         if (token.depth !== 0)
@@ -286,12 +274,10 @@ export function applyHardCapToSqlQuery(
   if (!tokens.length) return reject("Enter one SQL statement.");
   let sqlStart = 0;
   let sql = queryText.slice(sqlStart, tokens[tokens.length - 1].end);
-  // Drop leading empty separators without losing comments on ordinary queries.
   if (queryText.slice(0, tokens[0].start).includes(";")) {
     sqlStart = tokens[0].start;
     sql = queryText.slice(sqlStart, tokens[tokens.length - 1].end);
   }
-  // Remove only parentheses enclosing the entire query (not set operands).
   while (
     tokens[0]?.text === "(" &&
     tokens.at(-1)?.text === ")" &&
@@ -308,9 +294,6 @@ export function applyHardCapToSqlQuery(
     first === "set" &&
     word(tokens[1]) === "statement"
   ) {
-    // MariaDB SET STATEMENT scopes settings to an arbitrary statement; unlike
-    // ordinary SET it can return an unbounded result. Bound that statement,
-    // retaining the settings and native mutation semantics.
     const forIndex = tokens.findIndex(
       (token) => token.depth === tokens[0].depth && word(token) === "for",
     );
@@ -351,10 +334,6 @@ export function applyHardCapToSqlQuery(
   }
   let ctePrefix = "";
   if (first === "with") {
-    // Reuse the read-only guard's CTE structure check, using the dialect-aware
-    // lexer above instead of erasing quotes/comments and splitting on ';'.
-    // PostgreSQL permits data-modifying CTEs at statement scope; retaining that
-    // prefix lets the mutation finish while bounding only the final SELECT.
     if (
       connectionType !== "pg" &&
       (!isReadOnlySqlTokens(
@@ -434,8 +413,6 @@ export function applyHardCapToSqlQuery(
           token.depth === tokens[0].depth && word(token) === "returning",
       )
     ) {
-      // PostgreSQL executes data-modifying CTEs to completion even when the
-      // consumer stops early. Never put a limit on the mutation itself.
       let name = "rapidb_returning_cap";
       while (tokens.some((token) => token.text.toLowerCase().includes(name)))
         name += "_";
@@ -457,8 +434,6 @@ export function applyHardCapToSqlQuery(
         "This result-producing command is unsupported. Run a separate SELECT for results; omit RETURNING/OUTPUT from mutations.",
       );
     }
-    // T-SQL permits batches without semicolons. Do not pass through a hidden
-    // SELECT/CTE or procedural batch after a nominal DML/DDL statement.
     if (
       connectionType === "mssql" &&
       tokens.some(
@@ -506,9 +481,6 @@ export function applyHardCapToSqlQuery(
     );
   }
   if (connectionType === "mssql") {
-    // T-SQL does not require statement separators. Without a full T-SQL parser
-    // a nested SELECT might instead be an appended parenthesized statement.
-    // CTE bodies are outside this final SELECT and remain supported.
     if (
       tokens.some(
         (token, index) =>

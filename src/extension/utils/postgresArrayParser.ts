@@ -1,4 +1,3 @@
-/** PostgreSQL array text grammar. Numeric elements deliberately remain strings. */
 export function parsePostgresArrayLiteral(
   input: string,
   parseElement: (token: string) => unknown = (token) => token,
@@ -35,8 +34,6 @@ export function parsePostgresArrayLiteral(
     const upper = readBound();
     expect("]");
     const dimension = upper - lower + 1;
-    // PostgreSQL ArrayCheckBounds checks lower + dimension, i.e. the exclusive
-    // upper bound. Even a single element at INT32_MAX would overflow int32.
     if (
       dimension <= 0 ||
       dimension > 2147483647 ||
@@ -66,7 +63,6 @@ export function parsePostgresArrayLiteral(
       }
       return fail();
     }
-    // Unescaped trailing whitespace is insignificant; escaped whitespace is data.
     let whitespace = "";
     while (pos < input.length && input[pos] !== "," && input[pos] !== "}") {
       const ch = input[pos++];

@@ -307,7 +307,6 @@ describe("table draft recovery across remounts", () => {
     view.unmount();
     clearPostedMessages();
 
-    // The initial fresh read happens before the server's delayed INSERT.
     const restored = mountTable([{ id: 1, name: "Alice" }]);
     expect(
       (
@@ -326,7 +325,6 @@ describe("table draft recovery across remounts", () => {
     expect(messages("applyChanges")).toHaveLength(0);
     expect(draft()?.mutation).toBeDefined();
 
-    // A failed explicit verification must not unlock writes, even on another remount.
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     act(() =>
       dispatchIncomingMessage("tableError", {
@@ -366,7 +364,6 @@ describe("table draft recovery across remounts", () => {
       ).disabled,
     ).toBe(true);
     expect(messages("applyChanges")).toHaveLength(0);
-    // The user verifies the inserted row and abandons the uncertain local draft.
     fireEvent.click(screen.getByRole("button", { name: "Revert All" }));
     expect(state.tableDraft).toBeUndefined();
     expect(state.unrelated).toBe("preserved");
@@ -522,7 +519,6 @@ describe("table draft recovery across remounts", () => {
     expect(draft()?.restoreState.entries[0].changes.get("name")).toBe(
       "Pending",
     );
-    // Only the original baseline, not an arbitrary fresh row, can restore it.
     again.commit([{ id: 1, name: "Alice" }]);
     expect(again.result.current.unresolvedPendingEdits).toHaveLength(0);
     act(() => again.result.current.applyChanges());

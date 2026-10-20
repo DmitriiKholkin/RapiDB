@@ -16,20 +16,11 @@ import type { DriverTimeoutSettingsProvider } from "./dbDrivers/timeout";
 import { createTimeoutAwareDriver } from "./dbDrivers/timeout";
 import type { IDBDriver } from "./dbDrivers/types";
 
-/**
- * Factory for creating database drivers based on connection configuration.
- * Encapsulates the driver creation logic and all driver class dependencies.
- */
 export class ConnectionDriverFactory {
   constructor(
     private readonly getTimeoutSettings: DriverTimeoutSettingsProvider,
   ) {}
 
-  /**
-   * Creates the appropriate database driver for the given connection configuration.
-   * @param config The connection configuration specifying the database type
-   * @returns The instantiated and timeout-wrapped driver
-   */
   createDriver(config: ConnectionConfig): IDBDriver {
     const timeoutSettingsProvider = this.getTimeoutSettings;
 
@@ -63,9 +54,6 @@ export class ConnectionDriverFactory {
     return createTimeoutAwareDriver(driver, timeoutSettingsProvider);
   }
 
-  /**
-   * Resolves the remote target (host/port) for MongoDB connections.
-   */
   resolveMongoRemoteTarget(config: ConnectionConfig): {
     host: string;
     port: number;
@@ -85,9 +73,6 @@ export class ConnectionDriverFactory {
     };
   }
 
-  /**
-   * Resolves the remote target (host/port) for Redis connections.
-   */
   resolveRedisRemoteTarget(config: ConnectionConfig): {
     host: string;
     port: number;
@@ -106,9 +91,6 @@ export class ConnectionDriverFactory {
     };
   }
 
-  /**
-   * Resolves the remote target (host/port) from a URL string.
-   */
   resolveUrlRemoteTarget(
     value: string | undefined,
     defaultPort: number,
@@ -129,9 +111,6 @@ export class ConnectionDriverFactory {
     };
   }
 
-  /**
-   * Resolves the remote target (host/port) for Elasticsearch connections.
-   */
   resolveElasticsearchRemoteTarget(
     config: ConnectionConfig,
   ): { host: string; port: number } | undefined {

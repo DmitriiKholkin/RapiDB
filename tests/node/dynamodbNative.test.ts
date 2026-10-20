@@ -587,8 +587,6 @@ describe("DynamoDB lossless marker filter inputs (R9)", () => {
           : [],
       );
       if (mode.endsWith("client")) {
-        // A binary first sample makes the predicate client-only; escaped
-        // bounds still identify S and must compare the unfiltered raw S rows.
         vi.spyOn(driver, "describeColumns").mockResolvedValue(
           createColumns().map((column) =>
             column.name === "email"
@@ -779,8 +777,6 @@ describe("DynamoDB lossless marker filter inputs (R9)", () => {
             [...expected].sort(),
           );
           if (nativeType !== "string") {
-            // Exercise client filtering of all raw rows, not just a native
-            // pre-filtered subset which could hide membership rejections.
             expect(
               commandInputs(clientSend, "ScanCommand")[0].FilterExpression,
             ).toBeUndefined();
@@ -926,7 +922,6 @@ describe("DynamoDB lossless marker filter inputs (R9)", () => {
       ["true", ["s-boolean", "ss-needle", "l-needle"]],
       ["null", ["s-null", "ss-needle", "l-needle"]],
     ] as const) {
-      // Independent native evaluator consumes the actual S request needle.
       const native = createMarkerDriver(items);
       const nativePage = await native.driver.readTablePage({
         ...request,

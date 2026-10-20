@@ -153,7 +153,6 @@ function isMssqlSqlVariantSnapshot(
 ): value is MssqlSqlVariantSnapshot {
   if (!value || typeof value !== "object") return false;
   const snapshot = value as Partial<MssqlSqlVariantSnapshot>;
-  // Snapshots return from the webview: numeric metadata must not be coerced.
   return (
     snapshot.__rapidbSqlVariant === 1 &&
     typeof snapshot.displayValue === "string" &&
@@ -236,7 +235,6 @@ function mssqlSqlVariantNativeType(snapshot: MssqlSqlVariantSnapshot): string {
   const maxLength = snapshot.maxLength;
   let type: string;
 
-  // Independently validate every numeric SQL fragment, even after shape checks.
   if (baseType === "decimal" || baseType === "numeric") {
     if (
       precision === null ||
@@ -350,7 +348,6 @@ function mssqlSqlVariantInputExpression(
   return `CAST(? COLLATE ${snapshot.collation} AS ${type})`;
 }
 
-/** sql_variant's normal TDS value may already have lost decimal/date precision. */
 function mssqlSqlVariantDisplayExpression(name: string): string {
   return `CASE CONVERT(nvarchar(128), SQL_VARIANT_PROPERTY(${name}, 'BaseType'))
     WHEN 'binary' THEN CONVERT(nvarchar(max), CONVERT(varbinary(8000), ${name}), 1)
@@ -470,8 +467,6 @@ function mssqlArrayRow(
   columns: MssqlArrayColumnMeta[],
 ): unknown[] {
   if (Array.isArray(row)) return row;
-  // node-mssql emits chunked FOR XML/JSON values as an object even with
-  // arrayRowMode enabled. In that mode its single key is usually "0".
   const values =
     row !== null && typeof row === "object"
       ? (row as Record<string, unknown>)
@@ -496,7 +491,6 @@ type MssqlRollbackConnection = {
   removeListener?: (event: string, listener: () => void) => unknown;
 };
 
-/** node-mssql retains its borrowed session when native BEGIN fails. */
 function discardFailedMssqlBegin(transaction: mssql.Transaction): void {
   const state = transaction as unknown as {
     _acquiredConnection?: MssqlRollbackConnection | null;
@@ -511,7 +505,6 @@ function discardFailedMssqlBegin(transaction: mssql.Transaction): void {
   }
   state._acquiredConnection = null;
   state._acquiredConfig = null;
-  // Fence before release: another borrower must never inherit uncertain state.
   connection.hasError = true;
   try {
     connection.close?.();
@@ -525,11 +518,6 @@ type MssqlRollbackFence = {
   closeError: () => unknown;
 };
 
-/**
- * Tedious' Transaction._rollback releases its connection before reporting a
- * rollback error to node-mssql. Mark and close that session in Tedious' callback
- * first, so a waiting pool borrower cannot receive an uncertain transaction.
- */
 function fenceFailedMssqlRollback(
   transaction: mssql.Transaction,
 ): MssqlRollbackFence | undefined {
@@ -557,8 +545,6 @@ function fenceFailedMssqlRollback(
       this,
       (error, ...result) => {
         if (error) {
-          // The pool validator rejects hasError/closed connections. close()
-          // synchronously sets closed before node-mssql releases this session.
           this.hasError = true;
           try {
             this.close?.();
@@ -1307,8 +1293,6 @@ function parseMssqlSpatialInput(
   return { wkt, srid };
 }
 function isUnicodeMssqlLiteralType(nativeType: string): boolean {
-  // sql_variant strings travel as NVarChar, including insert/NULL updates.
-  // Preserve Unicode before the explicit subtype CAST and COLLATE conversion.
   return ["nchar", "nvarchar", "ntext", "xml", "sql_variant"].includes(
     baseTypeName(nativeType),
   );
@@ -2146,8 +2130,6 @@ export class MSSQLDriver extends BaseDBDriver {
     for (const { sql: batch, repeatCount } of batches) {
       const currentParams = batches.length === 1 ? params : undefined;
       for (let repetition = 0; repetition < repeatCount; repetition++) {
-        // Only the final GO batch is returned; release the preceding collection
-        // before starting another request, rather than retaining two budgets.
         if (hardCap !== undefined) lastResult.rows = [];
         lastResult = await this._executeBatch(
           batch,
@@ -2186,7 +2168,6 @@ export class MSSQLDriver extends BaseDBDriver {
           let streamError: Error | undefined;
           const onRecordset = (columns: MssqlArrayColumnMeta[]) => {
             recordsetIndex++;
-            // Preserve the existing first-recordset selection within a batch.
             if (recordsetIndex === 0) columnsMeta = columns;
           };
           const onRow = (row: unknown) => {
@@ -2205,9 +2186,6 @@ export class MSSQLDriver extends BaseDBDriver {
           trackedReq.on("rowsaffected", onAffected);
           trackedReq.on("error", onError);
           try {
-            // In mssql stream mode the promise may resolve after emitting errors.
-            // Wait for completion/release, then propagate the first error. Never
-            // cancel on a full display budget: triggers and mutations must drain.
             const result = await trackedReq.query(finalSql);
             if (streamError) throw streamError;
             affectedRows = result.rowsAffected?.at(-1) ?? affectedRows;
@@ -2699,8 +2677,6 @@ export class MSSQLDriver extends BaseDBDriver {
           const guardRequest = tx.request();
           activeRequest = guardRequest;
           await this.executeTrackedRequest(guardRequest, async (trackedReq) => {
-            // Catalog identifiers are literal Unicode names, never row values:
-            // temporal/UUID inference or trimming can inspect a different object.
             trackedReq.input("p1", mssql.NVarChar(128), guard.params[0]);
             trackedReq.input("p2", mssql.NVarChar(128), guard.params[1]);
             trackedReq.input("p3", mssql.NVarChar(517), guard.params[2]);
@@ -2725,8 +2701,6 @@ export class MSSQLDriver extends BaseDBDriver {
               op.sql,
               op.params,
             );
-            // Trigger statements contribute their own TDS row counts. Capture
-            // the outer DML's count instead of summing res.rowsAffected.
             let sql = checkAffectedRows
               ? `${finalSql}\n;SET @${affectedRowsParameter} = @@ROWCOUNT;`
               : finalSql;
@@ -2745,8 +2719,6 @@ export class MSSQLDriver extends BaseDBDriver {
         await identities.capture(
           index,
           op,
-          // A trigger can emit its own recordsets. Only our final SELECT is the
-          // captured identity; never mistake the trigger's first set for it.
           op.captureIdentity?.mssqlSelect
             ? Array.isArray(res.recordsets)
               ? (res.recordsets.at(-1) ?? [])
@@ -2853,8 +2825,6 @@ export class MSSQLDriver extends BaseDBDriver {
     return "other";
   }
   protected override enrichColumn(column: ColumnMeta): ColumnTypeMeta {
-    // Coercion, numeric casts, capture and read-back must use the real storage
-    // type, not a user-defined alias name (which is neither SQL text nor a category).
     const enriched = super.enrichColumn({
       ...column,
       type:
@@ -3224,8 +3194,6 @@ export class MSSQLDriver extends BaseDBDriver {
     paramIndex: number,
   ): FilterConditionResult {
     if (baseTypeName(column.nativeType) === "datetime") {
-      // Date binds use datetime2(7). Round back to datetime's 1/300-second
-      // ticks before comparing, including equality of a composite cursor prefix.
       return {
         sql: `${this.quoteIdentifier(column.name)} ${this.sqlOperator(operator)} CAST(? AS datetime)`,
         params: [this.coerceInputValue(rawValue, column)],

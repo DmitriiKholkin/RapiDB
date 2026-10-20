@@ -72,10 +72,6 @@ export function ensureTempSqlitePath(): Promise<string> {
 
 export interface BootstrapOptions {
   scenario: EngineScenario;
-  /**
-   * State object shared with the vscode mock installed via vi.hoisted.
-   * When omitted, the singleton shared state is used.
-   */
   state?: { panels: unknown[]; [key: string]: unknown };
 }
 
@@ -91,18 +87,15 @@ export async function bootstrapWorkflowContext(
         [key: string]: unknown;
       };
 
-  // For a simple object from vi.hoisted, wrap it to match WorkflowVscodeState.
   const workflowState: WorkflowVscodeState =
     "createWebviewPanel" in state
       ? (state as unknown as WorkflowVscodeState)
       : createWorkflowVscodeState();
   if (!("createWebviewPanel" in state)) {
-    // Copy the test's panels into the workflow state.
     workflowState.panels.length = 0;
     for (const panel of state.panels as never[]) {
       workflowState.panels.push(panel as never);
     }
-    // Override createWebviewPanel to push to the test's panels array.
     (
       workflowState as unknown as { createWebviewPanel: unknown }
     ).createWebviewPanel = (...args: unknown[]) => {
@@ -124,8 +117,6 @@ export async function bootstrapWorkflowContext(
     store,
   );
 
-  // Override the vscode mock's createWebviewPanel for the duration of
-  // this context so that panels get a real FakeWebviewPanelHandle.
   const realCreateWebviewPanel =
     workflowState.createWebviewPanel as unknown as (
       viewType: string,
@@ -251,7 +242,6 @@ export async function bootstrapWorkflowContext(
       await connectionManager.connectTo(scenario.buildConnection().id);
     },
     async dispose() {
-      // Restore the original createWebviewPanel.
       stateMut.createWebviewPanel = realCreateWebviewPanel;
       await connectionManager.disconnectAll();
       await connectionManager.dispose();

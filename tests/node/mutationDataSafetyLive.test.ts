@@ -8,7 +8,6 @@ import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import { applyChangesTransactional } from "../../src/extension/table/tableMutationExecution";
 import { logger } from "../../src/extension/utils/logger";
 
-// Also run by test:db:nosql. Overrides allow reproductions on isolated services.
 const live = process.env.RAPIDB_LIVE_NOSQL === "1";
 const redisUri =
   process.env.RAPIDB_DATA_SAFETY_REDIS_URI ??
@@ -33,7 +32,6 @@ describe.runIf(live)("Redis edit failure data safety (live Lua)", () => {
     await admin.connect();
   });
   afterEach(async () => {
-    // The driver logs expected socket AbortErrors while disconnecting.
     vi.spyOn(logger, "error").mockReturnValue(new Error("teardown"));
     await Promise.allSettled(drivers.map((driver) => driver.disconnect()));
     if (admin?.isOpen) {
@@ -237,6 +235,135 @@ describe.runIf(live)("MongoDB integer mutation data safety (live BSON)", () => {
       await admin.db(database).collection(table).drop();
       await admin.close();
     }
+  });
+  it.each([
+    [{ $ne: "never" }, "concurrent value"],
+    [{ $exists: true }, "concurrent value"],
+    [{ $gt: 0 }, 42],
+    ["before", ["before", "concurrent value"]],
+    [{ nested: true }, [{ nested: true }, { concurrent: true }]],
+    [null, [null, "concurrent value"]],
+    [["before"], [["before"], "concurrent value"]],
+    [/before/i, "BEFORE"],
+  ])("does not overwrite a concurrent edit when the original document is %j", async (original, concurrent) => {
+    const collection = admin.db(database).collection(table);
+    await collection.insertOne({ _id: "one", payload: original } as never);
+    const update = {
+      primaryKeys: { _id: "one" },
+      changes: { payload: { replacement: true } },
+      originalValues: { payload: original },
+    };
+    await collection.updateOne({ _id: "one" } as never, {
+      $set: { payload: concurrent },
+    });
+    const result = await driver.updateRows({
+      database,
+      schema: "",
+      table,
+      updates: [update],
+    });
+    expect(result.affectedRows).toBe(0);
+    expect(
+      (
+        await collection.findOne({ _id: "one" } as never, {
+          promoteValues: true,
+        })
+      )?.payload,
+    ).toEqual(concurrent);
+
+    await collection.updateOne({ _id: "one" } as never, {
+      $set: { payload: original },
+    });
+    expect(
+      (
+        await driver.updateRows({
+          database,
+          schema: "",
+          table,
+          updates: [update],
+        })
+      ).affectedRows,
+    ).toBe(1);
+    expect(
+      (await collection.findOne({ _id: "one" } as never))?.payload,
+    ).toEqual({ replacement: true });
+  });
+  it.each([
+    "__proto__",
+    "price$usd",
+  ])("guards the complete value of literal field %j", async (field) => {
+    const collection = admin.db(database).collection(table);
+    await collection.insertOne({
+      _id: "one",
+      [field]: ["before", "concurrent"],
+    } as never);
+    const update = {
+      primaryKeys: { _id: "one" },
+      changes: { [field]: "replacement" },
+      originalValues: { [field]: "before" },
+    };
+    expect(
+      (
+        await driver.updateRows({
+          database,
+          schema: "",
+          table,
+          updates: [update],
+        })
+      ).affectedRows,
+    ).toBe(0);
+    await collection.updateOne({ _id: "one" } as never, {
+      $set: { [field]: "before" },
+    });
+    expect(
+      (
+        await driver.updateRows({
+          database,
+          schema: "",
+          table,
+          updates: [update],
+        })
+      ).affectedRows,
+    ).toBe(1);
+  });
+  it.each([
+    "null",
+    "missing",
+  ] as const)("keeps an exact %s type guard rather than matching array elements", async (nativeType) => {
+    const collection = admin.db(database).collection(table);
+    await collection.insertOne({ _id: "one", payload: [null] } as never);
+    const update = {
+      primaryKeys: { _id: "one" },
+      changes: { payload: "replacement" },
+      originalValues: { payload: nativeType === "null" ? null : undefined },
+      originalTypes: { payload: { category: "other" as const, nativeType } },
+    };
+    expect(
+      (
+        await driver.updateRows({
+          database,
+          schema: "",
+          table,
+          updates: [update],
+        })
+      ).affectedRows,
+    ).toBe(0);
+    await collection.updateOne(
+      { _id: "one" } as never,
+      nativeType === "null"
+        ? { $set: { payload: null } }
+        : { $unset: { payload: "" } },
+    );
+    expect(
+      (
+        await driver.updateRows({
+          database,
+          schema: "",
+          table,
+          updates: [update],
+        })
+      ).affectedRows,
+    ).toBe(1);
   });
   it.each([
     ["int", "-2147483648", "2147483647", "2147483648", Int32],

@@ -73,8 +73,6 @@ async function fixture() {
   );
   for (const file of ["sqlite3.c", "sqlite3.h", "sqlite3ext.h"])
     writeFileSync(join(deps, "sqlite3", file), `actual ${file}`);
-  // Complete GYP input, not a regex/JSON-only parser fixture. Both actions use
-  // the pinned source's real copy.js with the builtin and custom argument forms.
   const gyp = `{
     'targets': [{
       'target_name': 'copy_fixture', 'type': 'none',
@@ -104,9 +102,6 @@ with open(${JSON.stringify(started)}, 'w') as marker:
     marker.write('real GYP parser/generator entered')
 sys.exit(gyp.main(['--depth=.', '-f', 'make', '-Gstandalone', 'sqlite3.gyp']))
 `;
-  // Admission is the same production boundary used before npm/node-gyp. The
-  // execFile below is real and uses an absolute trusted Python with isolated
-  // startup (-I), no inherited interpreter injection, and explicitly bundled GYP.
   async function admitAndGenerate(
     node: string,
     platform: NodeJS.Platform = process.platform,
@@ -190,7 +185,6 @@ describe.skipIf(process.platform === "win32")(
       "/opt/trusted/<(node_root_dir)/node",
       "/opt/trusted/>(node_root_dir)/node",
       "/opt/trusted/$(echo C1_MAKE_INTERPOLATED)/node",
-      // biome-ignore lint/suspicious/noTemplateCurlyInString: Deliberate literal generator/shell expansion token, not JavaScript interpolation.
       "/opt/trusted/${HOME}/node",
       "/opt/trusted/`echo C1_SHELL_INTERPOLATED`/node",
       "/opt/trusted/;echo C1_SHELL_INTERPOLATED/node",
@@ -223,8 +217,6 @@ describe.skipIf(process.platform === "win32")(
         /unsupported GYP\/build expansion or shell characters|absolute selected Node/,
       );
       expect(readFileSync(f.gypPath, "utf8")).toBe(f.gyp);
-      // No Python/GYP start, no generated file, and no input containing an
-      // injected command ever reaches a parser or shell.
       expect(existsSync(f.started)).toBe(false);
       expect(existsSync(join(f.deps, "Makefile"))).toBe(false);
       expect(existsSync(join(f.deps, "out"))).toBe(false);
@@ -235,8 +227,6 @@ describe.skipIf(process.platform === "win32")(
       const installation = join(f.root, "trusted Node's installation (local)");
       mkdirSync(installation);
       const node = join(installation, "selected Node's executable");
-      // Invoke the real interpreter via a path with the tested punctuation,
-      // without a fake launcher or relocating its shared-library installation.
       symlinkSync(f.tools.node, node);
       await f.admitAndGenerate(node);
       expect(existsSync(f.started)).toBe(true);

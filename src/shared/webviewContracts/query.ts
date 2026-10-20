@@ -1,9 +1,3 @@
-/**
- * Query panel types, initial state, and message parser.
- *
- * All parsers are pure; `null` indicates a parse failure (caller
- * should surface UX error).
- */
 import type { ConnectionType } from "../connectionTypes";
 import type { PanelRetentionState, WebviewMessageEnvelope } from "./shared";
 import {
@@ -19,8 +13,6 @@ import {
   readRequiredString,
 } from "./shared";
 import type { ClipboardReadPayload } from "./table";
-
-// ─── Editor Types ───────────────────────────────────────────────────────────
 
 export type QueryEditorLanguage = "sql" | "javascript" | "plaintext" | "json";
 
@@ -42,8 +34,6 @@ export interface QueryEditorPresentation {
   allowFormatting?: boolean;
 }
 
-// ─── Initial State ──────────────────────────────────────────────────────────
-
 export interface QueryInitialState extends PanelRetentionState {
   view: "query";
   panelId?: string;
@@ -56,8 +46,6 @@ export interface QueryInitialState extends PanelRetentionState {
   editorLanguage?: QueryEditorLanguage;
   editorPresentation?: QueryEditorPresentation;
 }
-
-// ─── Parser Helpers ─────────────────────────────────────────────────────────
 
 const QUERY_EDITOR_LANGUAGES: ReadonlySet<QueryEditorLanguage> = new Set([
   "sql",
@@ -105,7 +93,6 @@ function readQueryEditorSqlDialect(
     : undefined;
 }
 
-/** True if every presentation field is absent (lets the caller drop the wrapper). */
 function isEmptyPresentation(presentation: QueryEditorPresentation): boolean {
   return (
     presentation.queryMode === undefined &&
@@ -132,8 +119,6 @@ function readQueryEditorPresentation(
   return isEmptyPresentation(presentation) ? undefined : presentation;
 }
 
-// ─── Initial State Parser ───────────────────────────────────────────────────
-
 export function parseQueryInitialState(
   input: Record<string, unknown>,
 ): QueryInitialState | null {
@@ -143,8 +128,6 @@ export function parseQueryInitialState(
     return null;
   }
 
-  // Editor presentation may be embedded in `editorPresentation` or in
-  // top-level fields. Prefer the embedded form when present.
   const editorPresentation = readQueryEditorPresentation(
     input.editorPresentation,
   );
@@ -168,7 +151,6 @@ export function parseQueryInitialState(
     readOptionalString(input, "queryText") ??
     readOptionalString(input, "initialSql");
 
-  // Only keep `editorPresentation` when at least one field is set.
   const finalPresentation: QueryEditorPresentation | undefined = (() => {
     const candidate: QueryEditorPresentation = {
       queryMode,
@@ -194,10 +176,7 @@ export function parseQueryInitialState(
   };
 }
 
-// ─── Messages ───────────────────────────────────────────────────────────────
-
 export interface QueryResultExportPayload {
-  // IDs refer to original result positions (__col_0, __col_1), not display names.
   columnOrder?: string[];
   sort?: { id: string; desc: boolean }[];
 }
@@ -262,8 +241,6 @@ export type QueryPanelMessage =
   | WebviewMessageEnvelope<"readClipboard", ClipboardReadPayload>
   | WebviewMessageEnvelope<"writeClipboard", { text: string }>
   | WebviewMessageEnvelope<"addBookmark", QueryBookmarkPayload>;
-
-// ─── Message Parser ─────────────────────────────────────────────────────────
 
 export function parseQueryPanelMessage(
   input: unknown,

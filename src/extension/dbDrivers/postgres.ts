@@ -103,9 +103,6 @@ const POSTGRES_ENTITY_MANIFEST: DriverEntityManifest = {
   },
 };
 const POSTGRES_POOL_MAX = 5;
-// `pg_attribute.attgenerated` was added in PostgreSQL 12. Reading the row as
-// JSON keeps this projection parseable on PostgreSQL 10/11, where the key is
-// simply absent.
 const PG_GENERATED_KIND_EXPRESSION = "NULLIF(to_jsonb(a)->>'attgenerated', '')";
 
 interface PostgresPoolWaitOperation {
@@ -417,10 +414,6 @@ function safeJsonStringify(value: unknown): string {
 function postgresArrayElementKind(
   nativeType: string,
 ): "numeric" | "boolean" | "other" {
-  // describeTable uses catalog namespaces to always qualify user-defined array
-  // element types. Built-ins keep format_type's canonical names and typmods.
-  // Also accept pg's internal _type aliases, but never strip an arbitrary schema
-  // or quotes: an enum named audit.numeric must remain a string element type.
   const type = nativeType.trim().toLowerCase();
   let elementType: string;
   if (type.endsWith("[]")) {
@@ -497,7 +490,6 @@ function normalizePostgresBooleanInput(value: unknown): unknown {
   if (typeof value !== "string") return value;
   const token = value.trim().toLowerCase();
   if (token === "") return value;
-  // boolin accepts case-insensitive unique prefixes. "o" is ambiguous.
   const truthy = ["true", "yes", "on", "1"].some((word) =>
     word.startsWith(token),
   );
@@ -519,7 +511,6 @@ function normalizePostgresBooleanArrayInput(value: unknown): unknown {
 function normalizePostgresUuidInput(value: unknown): unknown {
   if (typeof value !== "string") return value;
   const token = value.trim().replace(/^\{(.*)\}$/, "$1");
-  // uuid_in allows optional hyphens after each four hex digits and braces.
   if (!/^[0-9a-f]{4}(?:-?[0-9a-f]{4}){7}$/i.test(token)) return value;
   const hex = token.replace(/-/g, "").toLowerCase();
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
@@ -533,8 +524,6 @@ function canonicalizePostgresFloatSpecial(
   }
   if (typeof value !== "string") return null;
   const token = value.trim().toLowerCase();
-  // PostgreSQL's native float input also accepts signed NaN and strtod
-  // payload forms. Payload/sign do not survive the server's NaN value.
   if (/^[+-]?nan(?:\([a-z0-9_]*\))?$/.test(token)) {
     return { canonical: "NaN" };
   }
@@ -586,8 +575,6 @@ export class PostgresDriver extends BaseDBDriver {
       pool.on("error", (error) => {
         logger.error(`PostgreSQL pool error (${database})`, error);
       });
-      // Publish synchronously: concurrent callers share this database's pool,
-      // never replace the connection/query editor's default pool.
       this.databasePools.set(database, pool);
     }
     return this.metadataPool(pool);
@@ -639,8 +626,6 @@ export class PostgresDriver extends BaseDBDriver {
     const endpointPort = forwardedTransport?.localPort ?? this.config.port;
     const tlsIdentity = tlsSettings?.servername?.replace(/^\[|\]$/g, "");
     return new Pool({
-      // pg overwrites ssl.servername with a DNS config.host. Route the socket
-      // separately so both SNI and verification use the intended identity.
       host: tlsIdentity ?? endpointHost,
       port: endpointPort,
       stream: tlsIdentity
@@ -689,8 +674,6 @@ export class PostgresDriver extends BaseDBDriver {
     database: string,
     run: (client: PoolClient) => Promise<T>,
   ): Promise<T> {
-    // Only check the editor connection here; never borrow its backend. A pool
-    // checkout may still contain an editor's explicit BEGIN and pending writes.
     this.requirePool();
     const epoch = this.connectionEpoch;
     const pool = this.createPool(
@@ -736,8 +719,6 @@ export class PostgresDriver extends BaseDBDriver {
       failed = true;
       throw error;
     } finally {
-      // Destroy even on success: this backend belongs to this DDL request only.
-      // disconnect() may have already destroyed it while a query was pending.
       const client = session.client;
       session.client = undefined;
       try {
@@ -830,13 +811,11 @@ export class PostgresDriver extends BaseDBDriver {
       this._connected = true;
     } catch (error) {
       this.pendingPools.delete(pool);
-      // A stale attempt owns only its pool; it cannot reset a newer connection.
       await this.closePool(pool).catch(() => undefined);
       throw error;
     }
   }
 
-  /** Timeout cleanup must not disconnect a later, unrelated connect attempt. */
   async cancelConnectionAttempt(attempt: Promise<unknown>): Promise<void> {
     if (
       attempt === this.connectionAttempt ||
@@ -902,7 +881,6 @@ export class PostgresDriver extends BaseDBDriver {
     this.pool = null;
     this.databasePools.clear();
     this.pendingPools.clear();
-    // Start cleanup for every pool even if one end() fails.
     const results = await Promise.allSettled(
       [...pools].map((pool) => this.closePool(pool)),
     );
@@ -1296,8 +1274,6 @@ export class PostgresDriver extends BaseDBDriver {
                   resolve({
                     ...result,
                     rows: query.retained.rows,
-                    // SHOW/EXPLAIN command tags omit a row count. The stream
-                    // still observes the complete result, not just its sample.
                     rowCount: result?.rowCount ?? query.retained.rowCount,
                   });
                 },
@@ -1349,16 +1325,11 @@ export class PostgresDriver extends BaseDBDriver {
     } catch (error) {
       queryFailed = true;
       queryError = error;
-      // Both ErrorResponse and client-side timeouts can reject before
-      // ReadyForQuery updates the transaction status. Discard every failed
-      // query's socket rather than pooling a client with a stale idle status.
       if (client && this.activeQueryClients.delete(client))
         client.release(true);
     } finally {
       try {
         if (client && this.activeQueryClients.has(client)) {
-          // pg 8.21 exposes the server's ReadyForQuery status; @types/pg has
-          // not caught up yet. Never infer transaction state from SQL text.
           const status = (
             client as PoolClient & {
               getTransactionStatus?: () => string | null;
@@ -1367,13 +1338,10 @@ export class PostgresDriver extends BaseDBDriver {
           unfinishedTransaction =
             !operationContext?.readOnly && (status === "T" || status === "E");
           try {
-            // Unknown state (including older clients) must also be cleaned up.
             if (operationContext?.readOnly || status !== "I") {
               await client.query("ROLLBACK");
             }
           } catch (error) {
-            // Cancellation may already have discarded this client while rollback
-            // was pending. Only the owner that removes it may release it.
             rollbackFailed = true;
             rollbackError = error;
             operation.client = undefined;
@@ -1425,10 +1393,6 @@ export class PostgresDriver extends BaseDBDriver {
         ((pool.idleCount ?? 0) > 0 ||
           (pool.totalCount ?? 0) < POSTGRES_POOL_MAX)
       ) {
-        // Begin checkout in the same turn as the capacity check. Awaiting a
-        // separate readiness promise here leaves a race where another pool
-        // user can take the slot and strand this request in pg-pool's
-        // non-cancellable checkout queue.
         const client = await this.awaitPoolCheckout(operation, pool);
         try {
           assertActive();
@@ -1474,9 +1438,6 @@ export class PostgresDriver extends BaseDBDriver {
           );
         };
         operation.cancelPoolCheckout = cancelCheckout;
-        // One settlement promise also observes reentrant cancellation if
-        // connect() throws synchronously; there is no orphaned race loser.
-        // Start connect in this turn to retain the pool capacity reservation.
         void Promise.resolve(pool.connect()).then((client) => {
           if (!cancelled) {
             resolve(client);
@@ -1819,9 +1780,6 @@ export class PostgresDriver extends BaseDBDriver {
         `-- Materialized view definition not available for "${schema}"."${table}"`
       );
     }
-    // Deparse with a catalog-only search path on an owned session. This makes
-    // user-schema FK, type, default and CHECK dependencies schema-qualified,
-    // without changing the pool's search path for subsequent operations.
     try {
       await client.query("BEGIN READ ONLY");
       await client.query("SET LOCAL search_path TO pg_catalog");
@@ -1884,14 +1842,9 @@ export class PostgresDriver extends BaseDBDriver {
       }
       return `-- Reconstructed PostgreSQL table DDL (columns and catalog table constraints).\n-- Not a pg_dump schema backup: dependencies must already exist.\n-- Sequences, standalone indexes, triggers, security, storage and partition/inheritance definitions are not included.\nCREATE TABLE ${this.qualifiedTableName("", schema, table)} (\n${cols.join(",\n")}\n);`;
     } finally {
-      // This client is request-scoped and is destroyed by withCatalogClient.
-      // A failed cleanup must not replace either a completed DDL result or the
-      // catalog query error that caused cleanup.
       try {
         await client.query("ROLLBACK");
-      } catch {
-        // The client is discarded by withCatalogClient in all cases.
-      }
+      } catch {}
     }
   }
   async getObjectDefinition(
@@ -2204,8 +2157,6 @@ export class PostgresDriver extends BaseDBDriver {
           params === undefined
             ? await transactionClient.query(sql)
             : await transactionClient.query(sql, params);
-        // disconnect/cancelCurrentOperation may discard the socket without a
-        // TransactionContext. A late successful reply must not send more SQL.
         assertActive();
         return result;
       };
@@ -2381,8 +2332,6 @@ export class PostgresDriver extends BaseDBDriver {
   ): string {
     const parameter = `$${paramIndex}`;
     if (column.category === "other") {
-      // PostgreSQL needs a concrete type for values such as named composites;
-      // an untyped protocol parameter is otherwise treated as anonymous record.
       return `${parameter}::${column.nativeType}`;
     }
     return parameter;
@@ -2409,7 +2358,6 @@ export class PostgresDriver extends BaseDBDriver {
     return super.buildOriginalValueComparison(column, paramIndex);
   }
   protected override getQuestionMarkPlaceholderOptions(): IndexedPlaceholderOptions {
-    // BaseDBDriver uses this options hook for indexed preview scanning too.
     return { dialect: "pg" };
   }
   materializePreviewColumnSql(
@@ -2537,8 +2485,6 @@ export class PostgresDriver extends BaseDBDriver {
     if (value === null || value === undefined) return value;
     if (Buffer.isBuffer(value)) return super.formatOutputValue(value, column);
     if (typeof value === "bigint") return value.toString();
-    // JSON webview transport maps nonfinite numbers to NULL, corrupting CAS baselines.
-    // PostgreSQL accepts these canonical strings as float input and comparison values.
     if (typeof value === "number" && !Number.isFinite(value)) {
       return String(value);
     }
@@ -2601,7 +2547,6 @@ export class PostgresDriver extends BaseDBDriver {
         return null;
       }
       const constraint = this.parseExactNumericConstraint(column.nativeType);
-      // numeric(p) has an implicit scale of zero; unconstrained numeric does not.
       if (constraint.precision !== null && constraint.scale === null) {
         constraint.scale = 0;
       }
@@ -2661,8 +2606,6 @@ export class PostgresDriver extends BaseDBDriver {
             typeof expectedValue === "string" &&
             /^[[{]/.test(expectedValue.trim())
           ) {
-            // Input uses boolin's lexicon; actual server output keeps the
-            // strict registered B03 parser and formatOutputValue rules.
             normalizedExpected = parsePostgresArrayLiteral(
               jsonArrayLiteralToPgArrayLiteral(expectedValue),
               normalizePostgresBooleanArrayInput,
@@ -2678,13 +2621,7 @@ export class PostgresDriver extends BaseDBDriver {
       } else if (typeof expectedValue === "string") {
         normalizedExpected = this.formatOutputValue(expectedValue, column);
       }
-      // Built-in PostgreSQL array OIDs can be parsed by `pg` into JS arrays
-      // before verification, while user-defined array OIDs arrive as raw text.
-      // Normalize both forms through the same display serializer so numeric
-      // tokens remain unquoted and match the editor's JSON array draft.
       normalizedExpected = this.formatOutputValue(normalizedExpected, column);
-      // Normalize built-in and user-defined arrays with the same display rules
-      // used for reads before comparing the persisted value.
       const normalizedOptions = options
         ? {
             ...options,
@@ -2953,8 +2890,6 @@ export class PostgresDriver extends BaseDBDriver {
         return { sql: `${col} ${sqlOp} $${paramIndex}`, params: [BigInt(val)] };
       }
       if (column.category === "integer" && !/^[+-]?\d+$/.test(val)) {
-        // Fractional/scientific input must be interpreted by NUMERIC, not
-        // rounded through JS Number (or coerced to the column's integer type).
         return {
           sql: `${col} ${sqlOp} $${paramIndex}::numeric`,
           params: [val],

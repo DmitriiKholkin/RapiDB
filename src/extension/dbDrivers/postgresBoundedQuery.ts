@@ -5,11 +5,6 @@ import { BoundedQueryRows } from "./boundedQueryRows";
 type Result = QueryArrayResult<unknown[]>;
 type Completion = (error: Error | null, result?: Result) => void;
 
-// pg's public Query event API avoids row buffering only without a callback.
-// Client.query_timeout installs a callback even for event consumers. This small
-// adapter targets the pinned pg version: force event-only row handling and keep
-// only the last command's metadata, rather than an ever-growing _results array.
-// Protocol-level regression tests exercise the real pg Query implementation.
 const StreamingQueryBase = Query as unknown as new (
   config: QueryArrayConfig,
   callback: Completion,
@@ -32,8 +27,6 @@ function assertStreamingCompatibility(
       `[RapiDB] Cannot safely bound PostgreSQL query results: incompatible pg ${pgPackage.version} (${detail}). Expected the JavaScript Query implementation from pg ${SUPPORTED_PG_VERSION}; query was not submitted. No fully buffered fallback is allowed.`,
     );
   };
-  // Private hooks are not a pg compatibility promise. A dependency upgrade must
-  // be reviewed against the protocol tests before extending this allowlist.
   if (pgPackage.version !== SUPPORTED_PG_VERSION)
     incompatible("unvalidated version");
   for (const method of [
@@ -69,9 +62,6 @@ function assertStreamingCompatibility(
     if (typeof Reflect.get(result, method) !== "function")
       incompatible(`missing Result.${method}`);
   }
-  // _accumulateRows does not exist until RowDescription in the pinned version.
-  // Probe that switch on a disposable Query, without a connection or SQL, so a
-  // renamed/ignored switch (including pg-native) cannot silently buffer rows.
   try {
     const probe = new StreamingQueryBase(
       { text: "", rowMode: "array" },

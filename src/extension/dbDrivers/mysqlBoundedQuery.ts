@@ -9,7 +9,6 @@ import mysqlPackage from "mysql2/package.json";
 
 const SUPPORTED_MYSQL_VERSION = "3.24.4";
 
-/** Construct and validate a detached command: native.query() can send SQL immediately. */
 export function createMysqlStreamingQuery(
   native: NativeMysqlConnection,
   options: QueryOptions,
@@ -19,8 +18,6 @@ export function createMysqlStreamingQuery(
       `[RapiDB] Cannot safely bound MySQL query results: incompatible mysql2 ${mysqlPackage.version} (${detail}). Expected mysql2 ${SUPPORTED_MYSQL_VERSION}; query was not submitted. No fully buffered fallback is allowed.`,
     );
   };
-  // Private protocol state is not a compatibility promise. Review upgrades
-  // against the installed-protocol tests before extending this allowlist.
   if (mysqlPackage.version !== SUPPORTED_MYSQL_VERSION)
     incompatible("unvalidated version");
   if (
@@ -32,7 +29,6 @@ export function createMysqlStreamingQuery(
     incompatible("missing native connection query/config");
   if (typeof Connection.createQuery !== "function")
     incompatible("missing Connection.createQuery");
-  // mysql2's declarations omit the options/config overload of this public factory.
   const createQuery = Connection.createQuery as unknown as (
     options: QueryOptions,
     values: undefined,
@@ -42,9 +38,6 @@ export function createMysqlStreamingQuery(
   const command = createQuery(
     {
       ...options,
-      // mysql2's typeCast field exposes a string type name, not the numeric
-      // protocol code. Preserve raw WKB here too because bounded Query Editor
-      // reads use this callback-free streaming path.
       typeCast: (field, next) =>
         field.type === "GEOMETRY" ? field.buffer() : next(),
     },
@@ -86,16 +79,6 @@ export function createMysqlStreamingQuery(
   return command;
 }
 
-/**
- * mysql2's callback-free command emits rows without retaining them, but still
- * appends an empty row array / OK packet and field metadata for every result.
- * At the fields event readField holds the current fields in a local variable;
- * doneInsert likewise holds its OK packet locally before emitting result.
- * Retain only the field slot and rebase the next result's index.
- * This adapter is specific to the pinned mysql2 Query protocol implementation;
- * it must only be used on a validated command without a callback or other
- * result consumers.
- */
 export function discardMysqlResultHistory(
   command: Query,
   fields: FieldPacket[] | undefined,

@@ -8,17 +8,11 @@ import type {
 import { confirmBookmarkRemoval } from "../connectionManagerPrompts";
 import { QueryPanel } from "../panels/queryPanel";
 
-/**
- * Context required for saved entry commands.
- */
 export interface SavedEntryCommandContext {
   readonly context: vscode.ExtensionContext;
   readonly connectionManager: ConnectionManager;
 }
 
-/**
- * Shows a saved query in a query panel.
- */
 function showSavedQuery(
   context: vscode.ExtensionContext,
   connectionManager: ConnectionManager,
@@ -44,9 +38,6 @@ function showSavedQuery(
   );
 }
 
-/**
- * Clears saved entries (history or bookmarks) after user confirmation.
- */
 async function clearSavedEntries(
   prompt: string,
   successMessage: string,
@@ -63,16 +54,6 @@ async function clearSavedEntries(
   }
 }
 
-/**
- * Registers all saved entry commands (history and bookmarks).
- *
- * Commands:
- * - rapidb.openHistoryEntry: Open a history entry
- * - rapidb.openBookmarkEntry: Open a bookmark entry
- * - rapidb.deleteBookmark: Delete a bookmark
- * - rapidb.clearBookmarks: Clear all bookmarks
- * - rapidb.clearHistory: Clear all history
- */
 export function registerSavedEntryCommands(
   ctx: SavedEntryCommandContext,
   registerCommand: <TArgs extends unknown[]>(
@@ -82,12 +63,10 @@ export function registerSavedEntryCommands(
 ): void {
   const { context, connectionManager } = ctx;
 
-  // ─── Open History Entry ────────────────────────────────────────────
   registerCommand(CMD.openHistoryEntry, (entry: HistoryEntry) => {
     showSavedQuery(context, connectionManager, entry);
   });
 
-  // ─── Open Bookmark Entry ───────────────────────────────────────────
   registerCommand(CMD.openBookmarkEntry, (entry: BookmarkEntry) => {
     showSavedQuery(context, connectionManager, entry, {
       forceNew: true,
@@ -96,7 +75,6 @@ export function registerSavedEntryCommands(
     });
   });
 
-  // ─── Delete Bookmark ───────────────────────────────────────────────
   registerCommand(
     CMD.deleteBookmark,
     async (node?: {
@@ -114,7 +92,6 @@ export function registerSavedEntryCommands(
     },
   );
 
-  // ─── Clear Bookmarks ──────────────────────────────────────────────
   registerCommand(CMD.clearBookmarks, async () => {
     await clearSavedEntries(
       "[RapiDB] Clear all bookmarks?",
@@ -123,7 +100,6 @@ export function registerSavedEntryCommands(
     );
   });
 
-  // ─── Clear History ─────────────────────────────────────────────────
   registerCommand(CMD.clearHistory, async () => {
     await clearSavedEntries(
       "[RapiDB] Clear all query history?",

@@ -25,8 +25,6 @@ function inside(path: string, root: string): boolean {
     (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel))
   )
     return true;
-  // realpath's JS implementation can preserve case aliases on macOS. Compare
-  // ancestor identities as well, without folding names on case-sensitive disks.
   let rootStat: Stats;
   try {
     rootStat = statSync(root);
@@ -44,12 +42,6 @@ function inside(path: string, root: string): boolean {
   }
 }
 
-/** PATH is used only to discover a normal Node/npm installation, never to
- * execute tar/npx (or a workspace's .bin shim). Compilers/Python remain an
- * explicitly required, locally trusted build toolchain.
- * The caller supplies every actual workspace root; process cwd is unrelated
- * to this boundary (it may be HOME or the extension host's installation).
- */
 export function resolveSQLiteBuildTools(
   packageRoot: string,
   runtimeRoot: string,
@@ -104,9 +96,6 @@ export function resolveSQLiteBuildTools(
       );
       const env = sqliteBuildEnvironment(
         environment,
-        // A directory may itself be external while its node executable points
-        // back into the workspace. Do not retain that rejected interpreter in
-        // child PATH, and put the selected installation first as defense in depth.
         [
           directory,
           ...directories.filter((candidateDirectory) => {
@@ -135,16 +124,6 @@ export function resolveSQLiteBuildTools(
   );
 }
 
-/** The pinned 12.10.0 source has two copy.js actions which otherwise launch
- * bare `node` from make/MSBuild. Bind both to the canonical interpreter chosen
- * above: merely selecting an absolute node-gyp interpreter does not protect
- * nested source actions. JSON string literals are also valid GYP/Python string
- * literals, preserving spaces, apostrophes and Windows backslashes. That alone
- * does NOT escape GYP expansion or make/MSBuild syntax: admit only letters,
- * numbers and a small set of ordinary path punctuation before writing the GYP
- * literal. In particular < > $ % and shell metacharacters are not admitted.
- * GYP's generator performs the final argv-to-command escaping for safe paths.
- */
 export function pinSQLiteSourceNodeActions(
   sourceDir: string,
   node: string,
@@ -174,8 +153,6 @@ export function pinSQLiteSourceNodeActions(
   writeFileSync(path, patched, "utf8");
 }
 
-/** Every path entering GYP (not just action executables) can be recursively
- * expanded. Validate lexical and existing canonical paths before any build. */
 export function assertSQLiteBuildPath(
   path: string,
   label: string,
@@ -197,7 +174,6 @@ export function assertSQLiteBuildPath(
     throw error;
   }
   if (canonical !== path) {
-    // A harmless alias must not hide an expansion-bearing filesystem path.
     if (!/^[\p{L}\p{N} /\\._:'()+-]+$/u.test(canonical)) {
       throw new Error(
         `SQLite source ${label} canonical path contains unsupported GYP/build expansion or shell characters.`,
@@ -206,11 +182,6 @@ export function assertSQLiteBuildPath(
   }
 }
 
-/** Build processes do not inherit npm/node-gyp config, interpreter/loader
- * injection, compiler flags or shell startup hooks. Only OS discovery/locale
- * and hash-verified download proxy settings cross this boundary. Home, temp,
- * npm cache and node-gyp devdir are private to this installation.
- */
 export function sqliteBuildEnvironment(
   environment: NodeJS.ProcessEnv,
   path: string,
@@ -271,10 +242,6 @@ interface LockedPackage {
   devOptional?: boolean;
 }
 
-/** Bundle the committed lockfile, not registry metadata. Only the node-gyp
- * dependency closure is materialized for npm ci; all tarballs retain their
- * existing lockfile integrity. No installation scripts or npx cache are used.
- */
 export function createSQLiteBuildToolLock() {
   const repositoryLock = require("../../../package-lock.json") as {
     packages: Record<string, LockedPackage>;

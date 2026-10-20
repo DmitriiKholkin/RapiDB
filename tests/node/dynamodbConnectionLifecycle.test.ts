@@ -19,7 +19,6 @@ vi.mock("@aws-sdk/client-dynamodb", async (importOriginal) => {
     constructor() {
       const client = harness.clients.shift();
       if (!client) throw new Error("Unexpected DynamoDB client creation");
-      // biome-ignore lint/correctness/noConstructorReturn: SDK client test double
       return client as never;
     }
   }

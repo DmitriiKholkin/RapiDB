@@ -252,7 +252,6 @@ describe.each([
 
     await driver.disconnect();
 
-    // Cancellation must settle the driver connection without waiting for open().
     await expect(connecting).rejects.toMatchObject({ name: "AbortError" });
     handle.close.mockRejectedValueOnce(new Error("late close failure"));
     await expectNoUnhandledRejections(() => pendingOpen.resolve(handle));
@@ -445,8 +444,6 @@ describe.each([
       await raw.cancelConnectionAttempt(oldAttempt);
     }
 
-    // The underlying raw attempt, not just its timeout wrapper, must reject
-    // while oldClosing is still pending. No native client may have been created.
     await vi.waitFor(
       () => expect(oldError).toMatchObject({ name: "AbortError" }),
       { timeout: 100 },
@@ -566,7 +563,6 @@ describe.each([
     const oldOpening = deferred<typeof oldFixture.client>();
     const oldClosing = deferred<void>();
     oldFixture.connect.mockReturnValue(oldOpening.promise);
-    // pg.end() may wait for a checkout; late catch/finally must own only that pool.
     if (engine === "postgres")
       oldFixture.cleanup.mockReturnValue(oldClosing.promise);
     const newFixture = nativeFixture();

@@ -1,11 +1,5 @@
-/**
- * Numeric utility functions for display normalization, decimal parsing,
- * and exact-numeric constraint validation.
- * Extracted from BaseDBDriver for single-responsibility adherence.
- */
 import { NULL_SENTINEL } from "../../shared/tableTypes";
 
-/** Normalize a number for display — non-finite values become their string representation. */
 export function normalizeNumericDisplayValue(value: number): number | string {
   return Number.isFinite(value) ? value : String(value);
 }
@@ -22,7 +16,6 @@ export interface CanonicalExactNumericValue {
   scaleOverflow: boolean;
 }
 
-/** Parse precision/scale from a native type string like DECIMAL(10,2). */
 export function parseTypePrecisionScale(
   nativeType: string,
 ): ExactNumericConstraint {
@@ -36,7 +29,6 @@ export function parseTypePrecisionScale(
   };
 }
 
-/** Convert a number to a decimal string, expanding scientific notation if needed. */
 export function numberToDecimalString(value: number): string {
   const raw = value.toString();
   if (!/[eE]/.test(raw)) {
@@ -58,7 +50,6 @@ export function numberToDecimalString(value: number): string {
   return `${sign}${digits.slice(0, decimalIndex)}.${digits.slice(decimalIndex)}`;
 }
 
-/** Parse a value into a normalized decimal string, or null for NULL/empty/invalid. */
 export function parseDecimalString(value: unknown): string | null {
   if (value === null || value === undefined || value === NULL_SENTINEL) {
     return null;
@@ -76,10 +67,6 @@ export function parseDecimalString(value: unknown): string | null {
   return trimmed === "" ? null : trimmed;
 }
 
-/**
- * Canonicalize a numeric value against an optional scale constraint.
- * Returns the canonical string, digit counts, and whether scale was exceeded.
- */
 export function canonicalizeExactNumeric(
   value: unknown,
   scale: number | null,

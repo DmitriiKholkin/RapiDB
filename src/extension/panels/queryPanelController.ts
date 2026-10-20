@@ -358,7 +358,6 @@ export class QueryPanelController {
       return;
     }
 
-    // History persistence must not block query execution.
     void this.connectionManager
       .addToHistory(connectionId, queryText)
       .catch((error) => {
@@ -391,9 +390,6 @@ export class QueryPanelController {
       if (!this.isCurrentQueryRequest(requestToken)) {
         return;
       }
-      // A cancellation acknowledgement may be a no-op after SQL completed
-      // (for example, while Oracle releases its session). Trust query()'s
-      // successful outcome, including schema invalidation, rather than Stop.
       const formattedResult = formatQueryResult(result, effectiveRowLimit);
 
       this.view.setLastQueryResult({
@@ -427,9 +423,6 @@ export class QueryPanelController {
       }
       this.postQueryError(normalized.message, requestToken, resultIdentity);
     } finally {
-      // Native scripts can apply earlier statements before a later statement
-      // fails, so refresh after every attempted schema-changing query even if
-      // its final outcome is an error or cancellation.
       if (queryStarted && changesDiscoverableSchema) {
         this.connectionManager.refreshSchemaCache(connectionId);
       }
@@ -512,8 +505,6 @@ export class QueryPanelController {
     }
 
     if (execution.cancelRequested) return;
-    // Drivers may reject query() from inside cancel(). Record intent first,
-    // but defer publishing its outcome until cancellation succeeds or fails.
     execution.cancelRequested = true;
     let finishCancellation!: () => void;
     execution.cancellationPending = new Promise<void>((resolve) => {
@@ -591,7 +582,6 @@ export class QueryPanelController {
             supersededByRequestToken,
           })
           .then(async () => {
-            // An acknowledgement alone does not prove query() has stopped.
             await previous.completion;
             return "cancelled" as const;
           }),
@@ -603,8 +593,6 @@ export class QueryPanelController {
       ]);
 
       if (cancellationResult !== "cancelled") {
-        // 1-arg console.error preserves the original log shape that
-        // downstream log scrapers and tests key on.
         console.error(
           `[RapiDB] Superseded query cancellation timed out for connection ${previous.connectionId}.`,
         );
@@ -640,8 +628,6 @@ export class QueryPanelController {
             this.activeQueryExecutions.delete(execution.connectionId);
           return;
         }
-        // Keep the per-connection fence until query() actually settles, even
-        // when cancellation is unavailable, fails, times out, or is a no-op.
         if (!execution.supportsCancellation) {
           return;
         }

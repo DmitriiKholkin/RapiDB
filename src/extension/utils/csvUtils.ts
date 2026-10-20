@@ -1,15 +1,3 @@
-/**
- * CSV cell formatting.
- *
- * Quotes a value when it contains characters that would otherwise be
- * ambiguous in a CSV stream: `,`, `"`, `\n`, `\r`, or `\t`. Embedded quotes
- * are escaped by doubling. Untrusted strings that start with a spreadsheet
- * formula marker after whitespace/control/format characters get an apostrophe
- * before their original contents. Leading tab/CR cells retain their existing
- * neutralization. `null`/`undefined` and empty strings are returned as an empty
- * cell.
- */
-
 const NEEDS_QUOTING = /[",\r\n\t]/;
 const FORMULA_AFTER_IGNORABLE_PREFIX =
   /^(?:[\p{White_Space}\p{Cc}\p{Cf}]|\u034F)*[=+\-@]/u;

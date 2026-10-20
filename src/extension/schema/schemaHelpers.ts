@@ -24,24 +24,14 @@ import {
   resolveDriverTableSectionAvailability,
 } from "../dbDrivers/types";
 
-// ─── Constants ──────────────────────────────────────────────────────────────
-
 export const CONNECTION_ROOT_SCOPE: ExplorerSchemaScope = {
   kind: "connectionRoot",
 };
 
-// ─── Scope Functions ────────────────────────────────────────────────────────
-
-/**
- * Creates a connection root schema scope.
- */
 export function createConnectionRootSchemaScope(): ExplorerSchemaScope {
   return { kind: "connectionRoot" };
 }
 
-/**
- * Gets the scope key for an explorer schema scope.
- */
 export function getExplorerSchemaScopeKey(
   scope: ExplorerSchemaScope,
 ): SchemaScopeKey {
@@ -55,9 +45,6 @@ export function getExplorerSchemaScopeKey(
   }
 }
 
-/**
- * Parses a scope key back into an explorer schema scope.
- */
 export function parseExplorerSchemaScopeKey(
   key: SchemaScopeKey,
 ): ExplorerSchemaScope | undefined {
@@ -88,16 +75,10 @@ export function parseExplorerSchemaScopeKey(
   return undefined;
 }
 
-/**
- * Checks if a scope is the connection root scope.
- */
 export function isConnectionRootScope(scope?: ExplorerSchemaScope): boolean {
   return !scope || scope.kind === "connectionRoot";
 }
 
-/**
- * Checks if a scope is a descendant of an ancestor scope.
- */
 export function isDescendantScope(
   scope: ExplorerSchemaScope,
   ancestor: ExplorerSchemaScope,
@@ -112,38 +93,22 @@ export function isDescendantScope(
   }
 }
 
-// ─── Driver Functions ───────────────────────────────────────────────────────
-
-/**
- * Resolves the driver entity manifest.
- */
 export function resolveDriverEntityManifest(
   driver: IDBDriver | undefined,
 ): DriverEntityManifest {
   return driver?.getEntityManifest?.() ?? DEFAULT_DRIVER_ENTITY_MANIFEST;
 }
 
-/**
- * Resolves driver capabilities.
- */
 export function resolveDriverCapabilities(
   driver: IDBDriver | undefined,
 ): DriverCapabilities | undefined {
   return driver?.getCapabilities?.();
 }
 
-// ─── Snapshot Functions ─────────────────────────────────────────────────────
-
-/**
- * Creates an empty schema snapshot.
- */
 export function createEmptySchemaSnapshot(): SchemaSnapshot {
   return { databases: [] };
 }
 
-/**
- * Creates a schema snapshot state.
- */
 export function createSchemaSnapshotState(
   snapshot: SchemaSnapshot,
   status: SchemaLoadStatus,
@@ -166,16 +131,10 @@ export function createSchemaSnapshotState(
   };
 }
 
-/**
- * Creates an empty schema snapshot state.
- */
 export function createEmptySchemaSnapshotState(): SchemaSnapshotState {
   return createSchemaSnapshotState(createEmptySchemaSnapshot(), "idle", false);
 }
 
-/**
- * Creates an empty table structure snapshot.
- */
 export function createEmptyTableStructureSnapshot(): TableStructureSnapshot {
   return {
     columns: {
@@ -197,9 +156,6 @@ export function createEmptyTableStructureSnapshot(): TableStructureSnapshot {
   };
 }
 
-/**
- * Creates an empty table detail state.
- */
 export function createEmptyTableDetailState(
   request: TableDetailRequest,
 ): TableDetailState {
@@ -211,11 +167,6 @@ export function createEmptyTableDetailState(
   };
 }
 
-// ─── Clone Functions ────────────────────────────────────────────────────────
-
-/**
- * Clones a table structure snapshot.
- */
 export function cloneTableStructureSnapshot(
   snapshot: TableStructureSnapshot,
 ): TableStructureSnapshot {
@@ -255,9 +206,6 @@ export function cloneTableStructureSnapshot(
   };
 }
 
-/**
- * Clones a table detail state.
- */
 export function cloneTableDetailState(
   state: TableDetailState,
 ): TableDetailState {
@@ -270,9 +218,6 @@ export function cloneTableDetailState(
   };
 }
 
-/**
- * Clones a schema snapshot object entry.
- */
 export function cloneSchemaSnapshotObjectEntry(
   object: SchemaSnapshotObjectEntry,
 ): SchemaSnapshotObjectEntry {
@@ -289,9 +234,6 @@ export function cloneSchemaSnapshotObjectEntry(
   };
 }
 
-/**
- * Clones a schema snapshot schema entry.
- */
 export function cloneSchemaSnapshotSchemaEntry(
   schema: SchemaSnapshotSchemaEntry,
 ): SchemaSnapshotSchemaEntry {
@@ -301,9 +243,6 @@ export function cloneSchemaSnapshotSchemaEntry(
   };
 }
 
-/**
- * Clones a schema snapshot database entry.
- */
 export function cloneSchemaSnapshotDatabaseEntry(
   database: SchemaSnapshotDatabaseEntry,
 ): SchemaSnapshotDatabaseEntry {
@@ -313,18 +252,12 @@ export function cloneSchemaSnapshotDatabaseEntry(
   };
 }
 
-/**
- * Clones a schema snapshot.
- */
 export function cloneSchemaSnapshot(snapshot: SchemaSnapshot): SchemaSnapshot {
   return {
     databases: snapshot.databases.map(cloneSchemaSnapshotDatabaseEntry),
   };
 }
 
-/**
- * Clones an explorer schema scope.
- */
 export function cloneExplorerSchemaScope(
   scope: ExplorerSchemaScope,
 ): ExplorerSchemaScope {
@@ -342,9 +275,6 @@ export function cloneExplorerSchemaScope(
   }
 }
 
-/**
- * Clones a schema snapshot state.
- */
 export function cloneSchemaSnapshotState(
   state: SchemaSnapshotState,
 ): SchemaSnapshotState {
@@ -356,11 +286,6 @@ export function cloneSchemaSnapshotState(
   );
 }
 
-// ─── Scope Snapshot Functions ───────────────────────────────────────────────
-
-/**
- * Creates a scope snapshot for a database.
- */
 export function createScopeSnapshotForDatabase(
   database: SchemaSnapshotDatabaseEntry,
 ): SchemaSnapshot {
@@ -369,9 +294,6 @@ export function createScopeSnapshotForDatabase(
   };
 }
 
-/**
- * Creates a scope snapshot for a schema.
- */
 export function createScopeSnapshotForSchema(
   databaseName: string,
   schema: SchemaSnapshotSchemaEntry,
@@ -386,11 +308,6 @@ export function createScopeSnapshotForSchema(
   };
 }
 
-// ─── Cache Entry Functions ──────────────────────────────────────────────────
-
-/**
- * Creates an internal table detail cache entry.
- */
 export function createInternalTableDetailCacheEntry(
   request: TableDetailRequest,
   generation: number,
@@ -402,9 +319,6 @@ export function createInternalTableDetailCacheEntry(
   };
 }
 
-/**
- * Gets the cache key for a table detail request.
- */
 export function getTableDetailCacheKey(
   request: Omit<TableDetailRequest, "connectionId">,
 ): string {
@@ -413,11 +327,6 @@ export function getTableDetailCacheKey(
     .join(":");
 }
 
-// ─── Schema Merge Functions ─────────────────────────────────────────────────
-
-/**
- * Merges a schema into a database entry.
- */
 export function mergeSchemaIntoDatabase(
   database: SchemaSnapshotDatabaseEntry,
   schema: SchemaSnapshotSchemaEntry,
@@ -440,11 +349,6 @@ export function mergeSchemaIntoDatabase(
   return nextDatabase;
 }
 
-// ─── Config Functions ───────────────────────────────────────────────────────
-
-/**
- * Gets the configured default database name for a connection.
- */
 export function getConfiguredDefaultDatabaseName(
   config: ConnectionConfig,
 ): string {
@@ -465,11 +369,6 @@ export function getConfiguredDefaultDatabaseName(
   );
 }
 
-// ─── Aggregate Functions ────────────────────────────────────────────────────
-
-/**
- * Builds an aggregate schema snapshot from a connection schema cache entry.
- */
 export function buildAggregateSchemaSnapshot(
   entry: import("../schemaCacheUtils").ConnectionSchemaCacheEntry,
 ): SchemaSnapshot {
@@ -536,9 +435,6 @@ export function buildAggregateSchemaSnapshot(
   };
 }
 
-/**
- * Derives the aggregate schema state from a connection schema cache entry.
- */
 export function deriveAggregateSchemaState(
   entry: import("../schemaCacheUtils").ConnectionSchemaCacheEntry,
   snapshot: SchemaSnapshot,
@@ -617,9 +513,6 @@ export function deriveAggregateSchemaState(
     : { status: "loaded", isPartial: false };
 }
 
-/**
- * Flattens a schema snapshot into a flat array of schema object entries.
- */
 export function flattenSchemaSnapshot(
   snapshot: SchemaSnapshot,
 ): SchemaObjectEntry[] {

@@ -84,8 +84,6 @@ describe("MySQL native shutdown", () => {
       | undefined;
     mysqlMocks.createPool.mockImplementation((options: PoolOptions) => {
       const pool = mysql.createPool({ ...options, stream: () => stream });
-      // Replace only the wire handshake. All query, timeout, pool and Quit
-      // behavior below uses the pinned mysql2 implementation.
       queueMicrotask(() => {
         const core = Reflect.get(pool, "pool") as unknown as {
           _allConnections: {
@@ -286,7 +284,6 @@ describe("MSSQL native transaction cleanup", () => {
       await closing;
       expect(session.closed).toBe(true);
     } finally {
-      // Release the intentionally stuck test borrower so Tarn itself can drain.
       pool.release(session);
       const finalClose = pool.close();
       await vi.advanceTimersByTimeAsync(0);

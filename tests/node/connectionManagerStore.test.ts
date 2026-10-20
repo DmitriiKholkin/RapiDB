@@ -163,7 +163,6 @@ describe("connection repair transactions", () => {
     expect(documents.has(id)).toBe(false);
     expect(secrets.delete).toHaveBeenCalledExactlyOnceWith(id);
     expect(secrets.delete).not.toHaveBeenCalledWith("duplicate");
-    // Later removal cannot leave a credential reachable only under the old key.
     await store.mutateConnections(async (current) => {
       for (const connection of current.slice(2))
         await store.deleteSecret(connection.id);
@@ -1069,7 +1068,6 @@ describe("VSCodeConnectionManagerStore", () => {
         tls: { mode: "requireVerifyCa", caFilePath: "/tmp/ca.pem" },
       },
     ]);
-    // No update should be triggered
     expect(update).not.toHaveBeenCalled();
   });
 

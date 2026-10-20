@@ -11,27 +11,12 @@ import { connectWithProgress } from "../utils/connectOrchestration";
 import { logErrorWithContext } from "../utils/errorHandling";
 import { resolveConnectionId } from "../utils/resolveConnectionId";
 
-/**
- * Context required for connection commands.
- */
 export interface ConnectionCommandContext {
   readonly context: vscode.ExtensionContext;
   readonly connectionManager: ConnectionManager;
   readonly refresh: () => void;
 }
 
-/**
- * Registers all connection-related commands.
- *
- * Commands:
- * - rapidb.addConnection: Add a new connection
- * - rapidb.editConnection: Edit an existing connection
- * - rapidb.deleteConnection: Delete a connection
- * - rapidb.renameConnectionFolder: Rename a connection folder
- * - rapidb.deleteConnectionFolder: Delete a connection folder
- * - rapidb.connect: Connect to a database
- * - rapidb.disconnect: Disconnect from a database
- */
 export function registerConnectionCommands(
   ctx: ConnectionCommandContext,
   registerCommand: <TArgs extends unknown[]>(
@@ -41,7 +26,6 @@ export function registerConnectionCommands(
 ): void {
   const { context, connectionManager, refresh } = ctx;
 
-  // ─── Add Connection ────────────────────────────────────────────────
   registerCommand(CMD.addConnection, async () => {
     const result = await ConnectionFormPanel.show(context, connectionManager);
     if (result) {
@@ -52,7 +36,6 @@ export function registerConnectionCommands(
     }
   });
 
-  // ─── Edit Connection ───────────────────────────────────────────────
   registerCommand(CMD.editConnection, async (node?: RapiDBNode) => {
     const id = await resolveConnectionId(node, connectionManager);
     if (!id) {
@@ -74,7 +57,6 @@ export function registerConnectionCommands(
     }
   });
 
-  // ─── Delete Connection ─────────────────────────────────────────────
   registerCommand(CMD.deleteConnection, async (node?: RapiDBNode) => {
     const id = await resolveConnectionId(node, connectionManager);
     if (!id) {
@@ -87,7 +69,6 @@ export function registerConnectionCommands(
     }
   });
 
-  // ─── Rename Connection Folder ──────────────────────────────────────
   registerCommand(CMD.renameConnectionFolder, async (node?: RapiDBNode) => {
     const currentFolderName =
       node?.kind === "folder" ? node.objectName?.trim() : "";
@@ -130,7 +111,6 @@ export function registerConnectionCommands(
     refresh();
   });
 
-  // ─── Delete Connection Folder ──────────────────────────────────────
   registerCommand(CMD.deleteConnectionFolder, async (node?: RapiDBNode) => {
     const folderName = node?.kind === "folder" ? node.objectName?.trim() : "";
     if (!folderName) {
@@ -151,7 +131,6 @@ export function registerConnectionCommands(
     refresh();
   });
 
-  // ─── Connect ───────────────────────────────────────────────────────
   registerCommand(CMD.connect, async (node?: RapiDBNode) => {
     const id = await resolveConnectionId(node, connectionManager);
     if (!id) {
@@ -196,7 +175,6 @@ export function registerConnectionCommands(
     }
   });
 
-  // ─── Disconnect ────────────────────────────────────────────────────
   registerCommand(CMD.disconnect, async (node?: RapiDBNode) => {
     const id = await resolveConnectionId(node, connectionManager);
     if (!id) {

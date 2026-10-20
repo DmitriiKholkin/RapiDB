@@ -1,16 +1,3 @@
-/**
- * Pure value-formatting helpers for the export pipeline.
- *
- * Extracted from `exportService.ts` to:
- * 1. keep the I/O orchestration file focused on streaming and UI flow,
- * 2. make the value → string / value → JSON-value transformations
- *    individually unit-testable in isolation,
- * 3. keep the file under the 200-line "component" guideline from the
- *    project code-quality standards.
- *
- * All functions here are pure (no I/O, no global state).
- */
-
 import type { QueryColumnMeta, TypeCategory } from "../dbDrivers/types";
 import {
   isRawNumberToken,
@@ -46,22 +33,10 @@ const JSON_NUMBER_LITERAL_RE = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
 
 const pad2 = (n: number): string => String(n).padStart(2, "0");
 
-/**
- * Generate the synthetic column key used in query-result export rows
- * (e.g. `__col_0`). Centralised so format conversions stay in sync.
- */
 export function queryColumnKey(index: number): string {
   return `__col_${index}`;
 }
 
-/**
- * Format any value as a plain string suitable for a CSV cell.
- *
- * - `null` / `undefined` → empty string
- * - `bigint` → decimal string
- * - `Date` → canonical `YYYY-MM-DD HH:MM:SS` UTC
- * - objects / arrays → JSON string (with fallback to `String(value)`)
- */
 export function formatExportCellValue(value: unknown): string {
   if (value == null) {
     return "";
@@ -93,12 +68,6 @@ export function formatExportCellValue(value: unknown): string {
   return String(value);
 }
 
-/**
- * Build the column descriptor list for a query-result export, deduplicating
- * column names that collide (e.g. two `id` columns become `id`, `id_2`).
- * Reserve literal names before allocating suffixes so a generated label cannot
- * steal another column's name, even when that column appears later.
- */
 export function buildQueryExportColumns(
   columns: readonly string[],
   columnMeta?: readonly QueryColumnMeta[],
@@ -126,12 +95,6 @@ export function buildQueryExportColumns(
   });
 }
 
-/**
- * Format a single cell for the table-data CSV export. Mirrors
- * {@link formatExportCellValue} but additionally tries to parse
- * string-encoded JSON values for `json` / `array` columns so the
- * CSV cell contains a properly-typed representation.
- */
 export function formatTableCsvExportValue(
   value: unknown,
   category: TypeCategory | null,
@@ -149,11 +112,6 @@ export function formatTableCsvExportValue(
   return formatExportCellValue(value);
 }
 
-/**
- * Serialize one row of a JSON export, including the column-name → JSON
- * value mapping. Keeps the row's shape stable for both query and
- * table-data exports.
- */
 export function serializeJsonExportRecord(
   entries: ReadonlyArray<
     ExportColumnDescriptor & {
@@ -177,11 +135,6 @@ export function serializeJsonExportRecord(
     .join(",")}}`;
 }
 
-/**
- * Normalize a query/table value into a JSON-friendly shape, honouring
- * per-column category hints (e.g. parse JSON strings, coerce booleans
- * and numerics, wrap `bigint` as a raw literal).
- */
 export function normalizeJsonExportValue(
   value: unknown,
   category: TypeCategory | null,
@@ -352,7 +305,6 @@ function tryParseStructuredExportValue(
   }
 
   try {
-    // Validate JSON grammar, then retain every numeric token verbatim.
     JSON.parse(trimmed);
     return parseJsonPreservingRawNumbers(trimmed);
   } catch {

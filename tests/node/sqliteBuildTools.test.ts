@@ -11,7 +11,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveSQLiteBuildTools } from "../../src/extension/utils/sqliteBuildTools";
 import { createProjectTempDir } from "../runtime/tempDirectories";
 
-// Discovery-only fixtures: no fixture node/npm/shim is ever executed.
 function installation(root: string) {
   const bin = join(root, "bin");
   const npmCli = join(root, "lib/node_modules/npm/bin/npm-cli.js");
@@ -87,7 +86,7 @@ describe.skipIf(process.platform === "win32")(
       const f = await fixture();
       installation(join(f.workspaceRoots[0], "tools"));
       const alias = join(f.root, "WORKSPACE-ONE", "tools", "bin");
-      if (!existsSync(alias)) return skip(); // Case-sensitive filesystem.
+      if (!existsSync(alias)) return skip();
       expect(() => f.resolve([alias])).toThrow("trusted Node.js/npm");
       const trusted = installation(join(f.root, "external"));
       const tools = f.resolve([alias, trusted.bin]);
@@ -100,7 +99,7 @@ describe.skipIf(process.platform === "win32")(
     }) => {
       const f = await fixture();
       const sibling = join(f.root, "WORKSPACE-ONE");
-      if (existsSync(sibling)) return skip(); // Case-insensitive filesystem.
+      if (existsSync(sibling)) return skip();
       const trusted = installation(join(sibling, "tools"));
       expect(f.resolve([trusted.bin]).node).toBe(realpathSync(trusted.node));
     });
@@ -152,7 +151,6 @@ describe.skipIf(process.platform === "win32")(
       expect(() => f.resolve([external])).toThrow("trusted Node.js/npm");
       const tools = f.resolve([external, trusted.bin]);
       expect(tools.node).toBe(realpathSync(trusted.node));
-      // A rejected workspace interpreter must not survive in nested-action PATH.
       if (name === "node") expect(tools.env.PATH).toBe(trusted.bin);
     });
 

@@ -176,8 +176,6 @@ describe("B08 PostgreSQL reconstructed DDL (live)", () => {
               sql: unknown,
               ...params: unknown[]
             ) => {
-              // Inject a real server-side catalog SQL error, inside the owned
-              // read transaction; don't just reject a mock promise.
               if (
                 typeof sql === "string" &&
                 sql.includes("FROM pg_attribute a")
@@ -217,8 +215,6 @@ describe("B08 PostgreSQL reconstructed DDL (live)", () => {
         ).rejects.toThrow("division by zero");
       expect(catalogPids).toHaveLength(1);
       expect(catalogPids[0]).not.toBe(before[0].pid);
-      // A fresh editor pool has exactly one physical backend. Check its PID
-      // as well as pending data, rather than trusting pool transaction affinity.
       expect(await state()).toEqual(before);
       await expect
         .poll(async () =>

@@ -256,7 +256,6 @@ vi.mock(
       }
     }
     return {
-      // biome-ignore lint/complexity/useArrowFunction: Vitest needs a constructible function because TablePanel calls this mock with new.
       TableMutationPreviewController: vi.fn(function (
         options: ConstructorParameters<
           typeof actual.TableMutationPreviewController
@@ -516,8 +515,6 @@ describe("TablePanel", () => {
       );
     };
     const restore = async (name: string) => {
-      // This is the opaque webview-owned state VS Code passes to the actual
-      // serializer. Distinct saved drafts must not be merged or discarded.
       const state = {
         initialState: { ...initialState },
         tableDraft: {
@@ -562,7 +559,6 @@ describe("TablePanel", () => {
     const first = await fixture.restore("saved draft A");
     const second = await fixture.restore("saved draft B");
 
-    // Deserialization neither performs reads nor sends a reset to a hidden tab.
     expect(getColumnsMock).toHaveBeenCalledOnce();
     for (const restored of [first, second]) {
       expect(restored.panel.webview.html).toBe("<html></html>");
@@ -585,8 +581,6 @@ describe("TablePanel", () => {
     expect(second.panel.reveal).not.toHaveBeenCalled();
     expect(onFreshDispose).not.toHaveBeenCalled();
 
-    // Metadata and session events must still reach every registered instance,
-    // including those not selected by the single-table reuse index.
     fixture.refresh();
     await vi.waitFor(() => {
       for (const panel of [fresh, first.panel, second.panel]) {
@@ -607,7 +601,6 @@ describe("TablePanel", () => {
     expect(second.state).toEqual(second.snapshot);
     expect(first.state.tableDraft).not.toEqual(second.state.tableDraft);
 
-    // Promotion is FIFO, not whichever saved panel deserialized most recently.
     fresh.dispose();
     fixture.open();
     expect(first.panel.reveal).toHaveBeenCalledExactlyOnceWith(1);
@@ -732,8 +725,6 @@ describe("TablePanel", () => {
         return { dispose: vi.fn(() => disconnectListeners.delete(listener)) };
       }),
     };
-    // Exercise the real disconnected-driver guard, not a columns mock that
-    // succeeds without a connection (which hid the serializer regression).
     const reads = new TableReadService(connectionManager as never);
     clearForConnectionMock.mockImplementation((id) =>
       reads.clearForConnection(id),
@@ -805,7 +796,6 @@ describe("TablePanel", () => {
         connectionReadOnly: true,
       },
     });
-    // Our own connect event must not cause a second initialization.
     await connectionManager.connectTo("conn-2", "explicit");
     expect(getColumnsMock).toHaveBeenCalledOnce();
   });
@@ -823,7 +813,6 @@ describe("TablePanel", () => {
       payload: { error: reason },
     });
 
-    // onDidConnect is global: a different connection must not retry this one.
     await connectionManager.connectTo("conn-2", "explicit");
     expect(getColumnsMock).not.toHaveBeenCalled();
     setReadOnly(false);
@@ -938,7 +927,6 @@ describe("TablePanel", () => {
     const ready = panel.webview.dispatchMessage({ type: "ready" });
     disconnect();
     expect(connectListeners.size).toBe(0);
-    // Manager cancellation may resolve successfully without a live driver.
     pending.resolve();
     await ready;
     await connectionManager.connectTo("conn-1", "explicit");
@@ -1021,8 +1009,6 @@ describe("TablePanel", () => {
         ),
       };
     });
-    // Only the actual database transport is fake. Epochs, cancellation, driver
-    // replacement, bounded cleanup and all manager events use production code.
     vi.spyOn(
       manager as unknown as { createDriver(): IDBDriver },
       "createDriver",
@@ -1108,8 +1094,6 @@ describe("TablePanel", () => {
       expect(manager.isConnected("conn-1")).toBe(false);
       expect(onDisconnect).not.toHaveBeenCalled();
       expect(onDispose).not.toHaveBeenCalled();
-      // This is the inverse of ready -> Disconnect: async driver cleanup has
-      // already begun, but its final panel-disposal event has not happened yet.
       await panel.webview.dispatchMessage({ type: "ready" });
       expect(driverFactory).toHaveBeenCalledOnce();
       expect(getColumnsMock).not.toHaveBeenCalled();
@@ -1142,7 +1126,6 @@ describe("TablePanel", () => {
       onDispose,
       setDisconnectDelay,
     } = await restoreWithRealConnectionManager();
-    // Simulate transport loss: the registered driver remains in driverMap.
     await driver.disconnect();
     expect(manager.isConnected("conn-1")).toBe(false);
     expect(manager.getDriver("conn-1")).toBe(driver);
@@ -1170,7 +1153,6 @@ describe("TablePanel", () => {
           connectionReadOnly: true,
         }),
       });
-      // Suppressing internal replacement must not suppress real Disconnect.
       setDisconnectDelay();
       await manager.disconnectFrom("conn-1");
       expect(onDisconnect).toHaveBeenCalledExactlyOnceWith("conn-1");
@@ -1258,7 +1240,6 @@ describe("TablePanel", () => {
         }),
       );
       expect(onDispose).not.toHaveBeenCalled();
-      // Old metadata settles AFTER the new session's metadata was published.
       oldRefresh.resolve([{ name: "obsolete_id", isPrimaryKey: true }]);
       await oldMetadataRequest;
       await Promise.resolve();
@@ -1302,8 +1283,6 @@ describe("TablePanel", () => {
       await driver.disconnect();
       setNextColumns(currentColumns);
       await manager.connectTo("conn-1");
-      // The old describeColumns is STILL unresolved. Connect alone must start
-      // the new initialization, without needing another ready message.
       await vi.waitFor(() =>
         expect(panel.webview.postMessage).toHaveBeenCalledExactlyOnceWith({
           type: "tableInit",
@@ -1322,7 +1301,6 @@ describe("TablePanel", () => {
         lostMetadata.resolve([{ name: "lost_id", isPrimaryKey: true }]);
       else lostMetadata.reject(new Error("Lost session error"));
       await oldReady;
-      // The late old finally must not clear the new, still-pending promise.
       const duplicateReady = panel.webview.dispatchMessage({ type: "ready" });
       expect(getColumnsMock).toHaveBeenCalledTimes(3);
       expect(panel.webview.postMessage).toHaveBeenCalledOnce();
@@ -1540,7 +1518,6 @@ describe("TablePanel", () => {
     expect(panel.webview.postMessage).toHaveBeenCalledTimes(4);
     expect(panel.webview.postMessage).toHaveBeenNthCalledWith(3, result);
     expect(panel.webview.postMessage).toHaveBeenNthCalledWith(4, result);
-    // A duplicated confirm cannot rerun the mutation while its result is retried.
     await panel.webview.dispatchMessage({
       type: "confirmMutationPreview",
       payload: { operationId: "op-1", previewToken: "preview-token" },
@@ -2115,7 +2092,7 @@ describe("TablePanel", () => {
       const previewA = lastMutationPreview(panel, "delete-a");
       expect(driver.targetHost).toBe("server-a");
       expect(driver.query).not.toHaveBeenCalled();
-      await driver.disconnect(); // Transport loss, NOT panel-closing Disconnect.
+      await driver.disconnect();
       const config = manager.getConnection("conn-1");
       if (!config) throw new Error("Expected connection config");
       await manager.saveConnection({ ...config, host: "server-b" });
@@ -2254,7 +2231,6 @@ describe("TablePanel", () => {
           payload: expect.objectContaining({ intent: "connectionRefresh" }),
         }),
       );
-      // The old build/metadata completes only AFTER the new same-columns session.
       plan.resolve(deletePreviewPlan());
       metadata.resolve([{ name: "id", isPrimaryKey: true }]);
       await preparing;
@@ -2472,8 +2448,6 @@ describe("TablePanel", () => {
     if (autoSkip) {
       connectionManager.getSkipTableMutationPreview.mockImplementationOnce(
         () => {
-          // The first microtask precedes the helper's continuation; the nested
-          // one follows its return but precedes the awaiting caller's continuation.
           queueMicrotask(() => queueMicrotask(startRefresh));
           return true;
         },
@@ -2494,7 +2468,6 @@ describe("TablePanel", () => {
       queueMicrotask(startRefresh);
     }
     await execution;
-    // Metadata is still unresolved and cached columns still match the old plan.
     expect(getColumnsMock).toHaveBeenCalledTimes(2);
     expect(confirmMutationPreviewMock).not.toHaveBeenCalled();
     expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
@@ -2553,8 +2526,6 @@ describe("TablePanel", () => {
     });
     queueMicrotask(() => connectionManager.refreshSchemaCache("conn-1"));
     await vi.waitFor(() => expect(getColumnsMock).toHaveBeenCalledTimes(2));
-    // In the old implementation preparation captured the new generation but
-    // used old columns, then paused in this builder until metadata was replaced.
     metadata.resolve([
       { name: "id", isPrimaryKey: true },
       { name: "new_name", isPrimaryKey: false },

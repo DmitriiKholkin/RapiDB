@@ -37,10 +37,6 @@ export function buildWhere(
   return { clause: `WHERE ${conditions.join(" AND ")}`, params };
 }
 
-/**
- * Validate filters against discovered metadata without producing SQL. Native
- * NoSQL table-page readers use this same policy before dispatching a read.
- */
 export function validateFilterExpressions(
   filters: FilterExpression[],
   cols: ColumnTypeMeta[],

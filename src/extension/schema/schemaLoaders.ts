@@ -17,9 +17,6 @@ import {
   resolveDriverEntityManifest,
 } from "./schemaHelpers";
 
-/**
- * Result of loading a database scope.
- */
 export interface DatabaseScopeLoadResult {
   database: {
     name: string;
@@ -29,7 +26,6 @@ export interface DatabaseScopeLoadResult {
   failedSchemas?: Array<{ name: string; error: unknown }>;
 }
 
-/** A discovered object catalog remains usable even when column discovery fails. */
 export class PartialSchemaLoadError extends Error {
   constructor(
     readonly schema: SchemaSnapshotSchemaEntry,
@@ -57,18 +53,8 @@ export class PartialSchemaLoadError extends Error {
   }
 }
 
-/**
- * Load mode for database scopes.
- */
 export type DatabaseLoadMode = "baseline" | "expanded";
 
-/**
- * Loads the connection root catalog (list of databases).
- *
- * @param driver - The database driver
- * @param config - The connection configuration
- * @returns The catalog snapshot and default database name
- */
 export async function loadConnectionRootCatalog(
   driver: IDBDriver,
   config: ConnectionConfig,
@@ -97,21 +83,11 @@ export async function loadConnectionRootCatalog(
   };
 }
 
-/**
- * Loads a database scope (schemas within a database).
- *
- * @param driver - The database driver
- * @param databaseName - The database name
- * @param loadMode - The load mode (baseline or expanded)
- * @returns The database scope load result
- */
 export async function loadDatabaseScope(
   driver: IDBDriver,
   databaseName: string,
   loadMode: DatabaseLoadMode,
 ): Promise<DatabaseScopeLoadResult> {
-  // Only drivers explicitly lacking namespaces (Redis) need a synthetic scope.
-  // A rejected request or a genuinely empty catalog must not trigger fallback.
   const schemas = await driver.listSchemas(databaseName);
   const scopes =
     schemas.length === 0 &&
@@ -174,14 +150,6 @@ export async function loadDatabaseScope(
   };
 }
 
-/**
- * Loads a schema scope (objects within a schema).
- *
- * @param driver - The database driver
- * @param databaseName - The database name
- * @param schemaName - The schema name
- * @returns The schema snapshot entry
- */
 export async function loadSchemaScope(
   driver: IDBDriver,
   databaseName: string,
@@ -248,13 +216,6 @@ export async function loadSchemaScope(
   return schema;
 }
 
-/**
- * Loads table detail information (columns, constraints, indexes, triggers).
- *
- * @param driver - The database driver
- * @param request - The table detail request
- * @returns The table detail state
- */
 export async function loadTableDetail(
   driver: IDBDriver,
   request: TableDetailRequest,

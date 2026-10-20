@@ -409,7 +409,6 @@ async function verifyRedisDriver(transport: LiveTransport): Promise<void> {
       findColumn(columns, "value").nativeType,
       "mixed(string, hash, list, set, zset)",
     );
-    // A separate homogeneous keyspace retains the text/string contract.
     await driver.query('SET strings:stage6 "plain"');
     try {
       const homogeneous = await driver.describeColumns("db0", "db0", "strings");
@@ -582,8 +581,6 @@ async function verifyRedisDefaultPrefix(driver: RedisDriver): Promise<void> {
       (entry) => entry.name,
     );
     assert(remaining.includes("default:"));
-    // If the DB contains other owners' unprefixed keys, their all-keys node
-    // remains legitimate. Never remove them or flush this logical database.
     let hasOrphans = false;
     for await (const batch of seed.scanIterator()) {
       if (batch.some((key) => !key.includes(":") || key.startsWith(":")))
@@ -717,8 +714,6 @@ async function verifyMongoDriver(transport: LiveTransport): Promise<void> {
       table: "users",
       updates: [
         {
-          // Direct native mutations take the actual BSON key, not the
-          // display-only hex string returned by table reads.
           primaryKeys: { _id: mongoCharlieId },
           changes: { active: false, email: "charlie+updated@example.com" },
         },

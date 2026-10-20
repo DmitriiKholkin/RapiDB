@@ -210,7 +210,6 @@ describe("R10 Mongo binary input versus tolerant output", () => {
     expect(saved.sub_type).toBe(subtype);
     expect(Buffer.from(saved.buffer)).toEqual(Buffer.from(hex, "hex"));
     const displayed = s.driver.formatOutputValue(saved, column);
-    // Hex display carries its subtype in column metadata, not in the text.
     const roundtrip = s.driver.coerceInputValue(displayed, {
       ...column,
       bsonSubtype: subtype,

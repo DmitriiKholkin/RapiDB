@@ -12,36 +12,21 @@ import type {
   ValueSemantics,
 } from "./types";
 
-// Re-export date utilities for backward compatibility.
 export { normalizeDateFilterValue } from "../utils/dateUtils";
 
 const SQL_FILTER_ERROR_RE =
   /^\[RapiDB Filter\]|invalid input syntax|invalid cidr|malformed array|not a valid (binary|hex|uuid)|syntax error in input|invalid value for type|invalid number|operator does not exist|conversion failed|arithmetic overflow|ORA-0(1841|1843|1858|1861|6502)|ORA-01722|incorrect (date|datetime|time)|Incorrect integer value|Truncated incorrect|data truncat/i;
 
-/**
- * Result of building a filter condition.
- */
 export interface FilterConditionResult {
   sql: string;
   params: unknown[];
 }
 
-/**
- * Builds SQL filter conditions for database queries.
- * Encapsulates all filter-related logic including value normalization
- * and SQL generation for different column types and operators.
- */
 export class FilterBuilder {
-  /**
-   * Checks if a value looks like a filter input error based on known patterns.
-   */
   static isSqlFilterError(value: unknown): boolean {
     return typeof value === "string" && SQL_FILTER_ERROR_RE.test(value);
   }
 
-  /**
-   * Normalizes a filter value based on column type and operator.
-   */
   normalizeFilterValue(
     column: ColumnTypeMeta,
     operator: FilterOperator,
@@ -68,9 +53,6 @@ export class FilterBuilder {
     return this.normalizeScalarFilterValue(column, value, operator);
   }
 
-  /**
-   * Normalizes a scalar filter value based on column type.
-   */
   protected normalizeScalarFilterValue(
     column: ColumnTypeMeta,
     rawValue: string,
@@ -137,9 +119,6 @@ export class FilterBuilder {
     return value;
   }
 
-  /**
-   * Builds a filter condition for a column.
-   */
   buildFilterCondition(
     column: ColumnTypeMeta,
     operator: FilterOperator,
@@ -203,9 +182,6 @@ export class FilterBuilder {
     );
   }
 
-  /**
-   * Checks if a column has boolean semantics.
-   */
   hasBooleanSemantics(column: ColumnTypeMeta): boolean {
     return (
       column.valueSemantics === ("boolean" as ValueSemantics) ||
@@ -213,9 +189,6 @@ export class FilterBuilder {
     );
   }
 
-  /**
-   * Coerces an input value based on column type.
-   */
   coerceInputValue(value: string, _column: ColumnTypeMeta): unknown {
     if (value.startsWith("0x") || value.startsWith("0X")) {
       const hex = value.slice(2);
@@ -226,16 +199,10 @@ export class FilterBuilder {
     return value;
   }
 
-  /**
-   * Checks if a type category is numeric.
-   */
   isNumericCategory(cat: TypeCategory): boolean {
     return cat === "integer" || cat === "float" || cat === "decimal";
   }
 
-  /**
-   * Builds a boolean filter condition.
-   */
   protected buildBooleanFilter(
     col: string,
     operator: FilterOperator,
@@ -245,9 +212,6 @@ export class FilterBuilder {
     return { sql: `${col} ${op} ?`, params: [isTrue ? 1 : 0] };
   }
 
-  /**
-   * Builds a numeric filter condition.
-   */
   protected buildNumericFilter(
     col: string,
     _column: ColumnTypeMeta,
@@ -259,9 +223,6 @@ export class FilterBuilder {
     return { sql: `${col} ${sqlOp} ?`, params: [num] };
   }
 
-  /**
-   * Builds a BETWEEN filter condition.
-   */
   protected buildBetweenFilter(
     col: string,
     _column: ColumnTypeMeta,
@@ -270,9 +231,6 @@ export class FilterBuilder {
     return { sql: `${col} BETWEEN ? AND ?`, params: [val[0], val[1]] };
   }
 
-  /**
-   * Builds a text filter condition.
-   */
   protected buildTextFilter(
     col: string,
     _column: ColumnTypeMeta,
@@ -302,9 +260,6 @@ export class FilterBuilder {
     return { sql: `${col} ${sqlOp} ?`, params: [val] };
   }
 
-  /**
-   * Builds an array LIKE filter condition.
-   */
   protected buildArrayLikeFilter(
     col: string,
     val: string,
@@ -315,9 +270,6 @@ export class FilterBuilder {
     };
   }
 
-  /**
-   * Returns the SQL operator for a filter operator.
-   */
   sqlOperator(op: FilterOperator): string {
     switch (op) {
       case "eq":
@@ -337,8 +289,6 @@ export class FilterBuilder {
     }
   }
 }
-
-// Helper functions (moved from BaseDBDriver)
 
 function normalizeBooleanFilterValue(value: string): "true" | "false" | null {
   const normalized = value.trim().toLowerCase();

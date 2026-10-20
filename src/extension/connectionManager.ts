@@ -745,8 +745,6 @@ export class ConnectionManager
   private readonly validationService = new ConnectionValidationService();
   private readonly store: ConnectionManagerStore;
   private driverMap = new Map<string, IDBDriver>();
-  // Connection-scoped, not driver-scoped: disposal/replacement cannot discard
-  // the requirement to deliberately reset a lost stateful SQLite session.
   private readonly automaticReconnectBlocks = new Map<string, string>();
   private readonly sshRuntimeMap = new Map<string, SshRuntime>();
   private readonly disposedSshRuntimes = new WeakSet<SshRuntime>();
@@ -1790,8 +1788,6 @@ export class ConnectionManager
       normalizeSshFingerprintSha256(fingerprintSha256);
     const connectionId = config.id;
     const changed = await this.store.mutateConnections((connections) => {
-      // The mutation may have waited behind an edit or another first-use pin.
-      // Never apply a learned key to a different endpoint or replace a pin.
       signal.throwIfAborted();
       const index = connections.findIndex((c) => c.id === connectionId);
       const connection = connections[index];
@@ -1877,8 +1873,6 @@ export class ConnectionManager
         rejectAbort = reject;
       });
       const pendingConnect = driver.connect().finally(async () => {
-        // Some drivers create their pool asynchronously, after the initial
-        // abort cleanup has already run. Dispose those late resources too.
         if (signal.aborted) {
           await this.disposeUnboundConnectionResources(
             driver,
@@ -1968,9 +1962,6 @@ export class ConnectionManager
   ): ConnectAttempt {
     this._assertNotDisposed();
 
-    // Disconnect fences attempts synchronously, but driver/runtime cleanup can
-    // await. No caller (including a restored webview's ready) may create a new
-    // epoch while that cleanup still owns this connection's resources.
     if (this._disconnectingMap.has(id)) {
       return {
         promise: Promise.reject(
@@ -2009,15 +2000,11 @@ export class ConnectionManager
       promise: attempt,
       epoch: connectEpoch,
     });
-    // Fence cached/in-flight metadata without emitting a panel-closing event.
     this._onDidInvalidateConnectionMetadata.fire(id);
     this._onDidChangeConnections.fire();
     void (async () => {
       try {
         if (this.driverMap.has(id)) {
-          // Replacing an already disconnected driver is internal cleanup, not
-          // a final disconnect. Closing connection-scoped panels here would
-          // dispose the restored panel that requested this reconnect.
           await this.disconnectRegisteredDriver(id, true);
         }
         if (this._isStaleConnectEpoch(id, connectEpoch)) {
@@ -2056,18 +2043,11 @@ export class ConnectionManager
           this.sshRuntimeMap.set(id, runtime);
         }
         this._invalidateSchemaState(id);
-        // Also fence reads started during teardown, before the new driver was
-        // installed. Consumers can now reload against the new session.
         this._onDidInvalidateConnectionMetadata.fire(id);
         this._onDidConnect.fire();
         resolveAttempt();
       } catch (err) {
-        if (
-          // Diagnostics may be sanitized copies with different names/types.
-          // Cancellation is owned by this attempt, not by its error text.
-          ac.signal.aborted &&
-          this._isStaleConnectEpoch(id, connectEpoch)
-        ) {
+        if (ac.signal.aborted && this._isStaleConnectEpoch(id, connectEpoch)) {
           resolveAttempt();
         } else {
           rejectAttempt(err);
@@ -2096,8 +2076,6 @@ export class ConnectionManager
       resolveDisconnect = resolve;
       rejectDisconnect = reject;
     });
-    // Install before cancellation: abort listeners can synchronously request a
-    // new connection. Concurrent Disconnect calls share this cleanup as well.
     this._disconnectingMap.set(id, disconnect);
     void (async () => {
       try {
@@ -2653,9 +2631,6 @@ export class ConnectionManager
       runtime: SshRuntime | undefined;
     },
   ): Promise<void> {
-    // A second Disconnect may finish before this teardown, allowing a new
-    // session to be installed. Never resolve shared resources by ID after an
-    // await: this cleanup owns only its captured epoch, driver and runtime.
     if (
       this._connectionEpochMap.get(connectionId) === owner.epoch &&
       this.driverMap.get(connectionId) === owner.driver &&
@@ -2671,7 +2646,6 @@ export class ConnectionManager
       this._schemaCacheMap.delete(connectionId);
       this._schemaGenerationMap.delete(connectionId);
       this._schemaExpandedScopeKeyMap.delete(connectionId);
-      // All shared-state changes precede the next await.
       this._onDidChangeSchemaState.fire(connectionId);
     }
     if (owner.runtime) {
@@ -3144,7 +3118,6 @@ export class ConnectionManager
           );
         }
         if (result.failedSchemas?.length) {
-          // Child fragments include retained columns/catalogs from earlier loads.
           const database = buildAggregateSchemaSnapshot(entry).databases.find(
             (database) => database.name === databaseName,
           );
@@ -3294,14 +3267,7 @@ export class ConnectionManager
     schema: SchemaSnapshotSchemaEntry,
     completedLoad: Promise<void> | null = null,
   ): void {
-    // Table details are fetched independently from the schema fragment. A
-    // replacement may change columns or any lazy-loaded section (constraints,
-    // indexes, triggers), so none of those details can remain authoritative.
-    // Clearing this scope's entries also fences in-flight detail loads via
-    // _isLiveTableDetailEntry.
     for (const [key, detail] of schemaEntry.tableDetails) {
-      // A request waiting for this exact load has not read old metadata yet.
-      // Let it continue against the completed schema; fence every other entry.
       if (!completedLoad || detail.waitingForSchema !== completedLoad) {
         schemaEntry.tableDetails.delete(key);
       }

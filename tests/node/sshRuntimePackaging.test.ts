@@ -116,7 +116,6 @@ describe("SSH installed extension packaging", () => {
     }
     expect(visited.size).toBe(5);
 
-    // npm reports canonical paths (not macOS's /var symlink spelling).
     const root = await realpath(await createProjectTempDir("ssh-ignore"));
     await cp(join(projectRoot, ".vscodeignore"), join(root, ".vscodeignore"));
     await writeFile(
@@ -168,8 +167,6 @@ describe("SSH installed extension packaging", () => {
     cipher,
   }) => {
     const root = await createProjectTempDir("ssh-package");
-    // Use vsce's actual npm dependency collection and the checkout's ignore
-    // rules, then copy ONLY files that would be installed from the VSIX.
     const files = await listFiles({
       cwd: projectRoot,
       packageManager: PackageManager.Npm,
@@ -188,8 +185,6 @@ describe("SSH installed extension packaging", () => {
       sourcemap: false,
       logLevel: "silent",
       metafile: true,
-      // Expose the real internal function, without replacing its loader or
-      // changing the production entry point/dependency graph.
       plugins: [
         {
           name: "ssh-package-probe",

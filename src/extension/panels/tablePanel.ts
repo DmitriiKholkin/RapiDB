@@ -133,8 +133,6 @@ export class TablePanel {
   private static readonly viewType = "rapidb.tablePanel";
 
   private static panels = new Map<string, TablePanel>();
-  // Lazy restore can produce multiple live webviews for the same table. The
-  // reuse index above must never be the source of truth for their lifetime.
   private static readonly instances = new Set<TablePanel>();
 
   private readonly panel: vscode.WebviewPanel;
@@ -221,20 +219,14 @@ export class TablePanel {
     this.panel.webview.html = this.buildHtml(context);
 
     const connectSubscription = connectionManager.onDidConnect?.(() => {
-      // The event is global and also fires during our own automatic connect.
-      // Wait for that initialization before deciding whether a retry is needed.
       void this.retryInitializationAfterConnect();
     });
     const metadataInvalidationSubscription =
       connectionManager.onDidInvalidateConnectionMetadata?.((id) => {
         if (this.disposed || id !== connectionId) return;
         ++this.connectionGeneration;
-        // Drop executable plans, but keep their correlated descriptors so an
-        // already displayed preview receives a terminal refusal on Confirm.
         this.previewController.clear();
         this.inFlightPageRequests.clear();
-        // Keep an attempt waiting on our own connect, but detach metadata work
-        // from the lost session. Its promise may never settle.
         if (!this.initializationAttempt?.waitingForConnect) {
           this.initializationAttempt = undefined;
           this.initializationPromise = undefined;
@@ -270,7 +262,6 @@ export class TablePanel {
       TablePanel.instances.delete(this);
       if (TablePanel.panels.get(this.key) === this) {
         TablePanel.panels.delete(this.key);
-        // Keep reuse deterministic: promote the earliest remaining instance.
         for (const instance of TablePanel.instances) {
           if (!instance.disposed && instance.key === this.key) {
             TablePanel.panels.set(this.key, instance);
@@ -389,8 +380,6 @@ export class TablePanel {
       objectKind,
     );
     TablePanel.instances.add(instance);
-    // A late restored panel may carry a different draft. Preserve both panels
-    // without changing the one Explorer already reuses.
     if (!TablePanel.panels.has(instance.key)) {
       TablePanel.panels.set(instance.key, instance);
     }
@@ -503,10 +492,6 @@ export class TablePanel {
       return null;
     }
 
-    // Delivery failure is not execution uncertainty. Retry the exact evidence,
-    // including validation diagnostics and confirmed writes. Keep operationId:
-    // postMessage acknowledgement does not prove receipt, so the consumer must
-    // ignore a duplicate result after settling that correlated operation.
     return { type, payload };
   }
 
@@ -584,9 +569,6 @@ export class TablePanel {
   }
 
   private isCurrentSchemaSnapshot(snapshot: TableSchemaSnapshot): boolean {
-    // A refresh advances the requested generation before replacing the committed
-    // snapshot. Check again in the caller after every await, never pairing that
-    // new generation with old columns while its metadata request is pending.
     return (
       snapshot === this.schemaSnapshot &&
       snapshot.connectionGeneration === this.connectionGeneration &&
@@ -800,7 +782,6 @@ export class TablePanel {
     const attempt = { waitingForConnect: false };
     this.initializationAttempt = attempt;
     this.initializationPromise = this.initializeTable(attempt).finally(() => {
-      // A detached old attempt must not clear a newer in-flight initialization.
       if (this.initializationAttempt === attempt) {
         this.initializationAttempt = undefined;
         this.initializationPromise = undefined;
@@ -810,8 +791,6 @@ export class TablePanel {
   }
 
   private async retryInitializationAfterConnect(): Promise<void> {
-    // Defer even if the manager fires synchronously from connectTo, so the
-    // in-flight promise is installed before this callback observes it.
     await Promise.resolve();
     await this.initializationPromise;
     if (
@@ -871,8 +850,6 @@ export class TablePanel {
         );
       if (reconnectBlock) throw new Error(reconnectBlock);
       if (this.connectionManager.isConnected?.(this.connectionId) === false) {
-        // Restored panels have no driver after extension restart. Never treat
-        // webview readiness as an explicit Connect that can clear a safety block.
         attempt.waitingForConnect = true;
         try {
           await this.connectionManager.connectTo(
@@ -1448,7 +1425,6 @@ export class TablePanel {
       return;
     }
     let currentSnapshot: TableSchemaSnapshot;
-    // Refresh errors are reported as a mutation result with the original ID.
     try {
       currentSnapshot = await this.awaitSchemaRefresh();
     } catch {
@@ -1473,7 +1449,6 @@ export class TablePanel {
       return;
     }
     this.previewSchemas.delete(payload.previewToken);
-    // No await between the final current-snapshot check and starting execution.
     const result = await this.previewController.confirm(
       payload.previewToken,
       payload.operationId,
@@ -1518,7 +1493,6 @@ export class TablePanel {
         defaultPageSize: this.connectionManager.getDefaultPageSize(),
         panelRetentionMode: TABLE_PANEL_RETENTION_MODE,
       },
-      // LargeMonacoDialog uses a Blob-backed Monaco worker in table dialogs.
       extraCspDirectives: ["worker-src blob:"],
       ...APP_WEBVIEW_SHELL_LAYOUT,
       extraStyles: `

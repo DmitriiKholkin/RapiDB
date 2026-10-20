@@ -67,7 +67,6 @@ async function connectThroughManager(
   fields: Partial<ConnectionConfig> = {},
 ) {
   const dispose = vi.fn(async () => undefined);
-  // Only the SSH transport is injected. MongoDBDriver and MongoClient are real.
   const createSshRuntime = vi.fn(
     async (_settings: ConnectionSshSettings, request: SshRuntimeRequest) => {
       if (request.kind !== "tcpForward")

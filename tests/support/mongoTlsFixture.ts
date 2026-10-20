@@ -5,7 +5,6 @@ import * as tls from "node:tls";
 import { BSON } from "mongodb";
 import { createProjectTempDir } from "../runtime/tempDirectories";
 
-// Fresh, test-only certificates avoid expiration-sensitive checked-in keys.
 export async function createMongoTlsCertificates() {
   const directory = await createProjectTempDir("unit-node", "mongo-tls-");
   const path = (name: string) => join(directory, name);
@@ -78,8 +77,6 @@ export async function createMongoTlsCertificates() {
   };
 }
 
-// Only hello and command acknowledgments, not a database. Real MongoClient
-// performs TLS, certificate checks, server selection and wire negotiation.
 export async function startMongoTlsFixture(options: tls.TlsOptions) {
   const sockets = new Set<tls.TLSSocket>();
   const handshakes: Array<{ servername: string | false; authorized: boolean }> =
@@ -111,7 +108,6 @@ export async function startMongoTlsFixture(options: tls.TlsOptions) {
           maxBsonObjectSize: 16777216,
           maxMessageSizeBytes: 48000000,
           maxWriteBatchSize: 100000,
-          // Catalog access now verifies authentication after the handshake.
           cursor: {
             id: BSON.Long.ZERO,
             ns: "app.$cmd.listCollections",

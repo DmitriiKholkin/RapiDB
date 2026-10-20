@@ -3,10 +3,6 @@ import type { ConnectionType } from "../../shared/connectionTypes";
 const POSTGRES_IDENTIFIER_CONTINUATION = /[\p{L}\p{M}\p{N}_$]/u;
 const POSTGRES_DOLLAR_QUOTE_TAG = /^(\$\$|\$[\p{L}_][\p{L}\p{M}\p{N}_]*\$)/u;
 
-/**
- * PostgreSQL dollar-quote tags follow unquoted identifier rules, except that
- * `$` itself is not allowed inside a tag. The delimiter remains case-sensitive.
- */
 export function readPostgresDollarQuoteTag(
   sql: string,
   start: number,
@@ -53,7 +49,6 @@ export interface SqlCapToken {
   depth: number;
 }
 
-/** Shared with the Oracle script splitter so literal semicolons stay opaque. */
 export function oracleAlternativeQuoteEnd(
   sql: string,
   start: number,
@@ -83,11 +78,6 @@ export function oracleAlternativeQuoteEnd(
   return end + 2;
 }
 
-/**
- * Lexical boundaries for the editor's conservative cap rewrites, not a SQL
- * parser. Unlike the driver script splitters this retains source positions and
- * fails closed on ambiguous/session-dependent quoting and executable comments.
- */
 export function scanSqlForCap(
   sql: string,
   dialect: ConnectionType,
@@ -111,9 +101,6 @@ export function scanSqlForCap(
       next === "-" &&
       (dialect !== "mysql" || !sql[index + 2] || /\s/.test(sql[index + 2]));
     if (dashComment || (dialect === "mysql" && char === "#")) {
-      // SQLite/MySQL and their driver splitters terminate these comments at
-      // LF, not bare CR. Treating CR as a boundary can append a LIMIT that the
-      // driver/server then consumes as part of the comment.
       while (
         index < sql.length &&
         sql[index] !== "\n" &&
@@ -170,8 +157,6 @@ export function scanSqlForCap(
     ) {
       const closer = char === "[" ? "]" : char;
       kind = char === "'" ? "literal" : "quoted";
-      // PostgreSQL E strings have a fixed escape convention. Ordinary PG and
-      // MySQL strings depend on session settings; don't guess those settings.
       const previous = tokens.at(-1);
       const escapeString =
         dialect === "pg" &&

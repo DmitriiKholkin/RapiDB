@@ -153,8 +153,6 @@ export class TableMutationPreviewController {
     }
 
     this.pendingMutationPreviews.delete(previewToken);
-    // A fresh preview token must not replay an operation whose acknowledgement
-    // was lost. Consume the operation ID before crossing any await boundary.
     if (this.executedOperationIds.has(preview.operationId)) return null;
     this.executedOperationIds.add(preview.operationId);
 

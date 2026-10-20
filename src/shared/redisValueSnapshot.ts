@@ -1,4 +1,3 @@
-/** Table-only byte identity; a literal Redis string is never decoded as a marker. */
 export interface RedisBinaryValueSnapshot {
   __rapidbRedisBinary: 1;
   displayValue: string;

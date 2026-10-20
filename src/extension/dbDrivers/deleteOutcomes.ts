@@ -98,7 +98,6 @@ export function unattemptedDeleteResult(
   };
 }
 
-/** Setup/metadata failures cannot have written any row in this batch. */
 export async function prepareDeleteBatch<T>(
   identities: readonly Record<string, unknown>[],
   context: DriverOperationContext | undefined,
@@ -122,7 +121,6 @@ export async function prepareDeleteBatch<T>(
   }
 }
 
-/** Each backend write is atomic for one identity, but the batch is not. */
 export async function deleteRowsSequentially(
   identities: readonly Record<string, unknown>[],
   context: DriverOperationContext | undefined,
@@ -148,8 +146,6 @@ export async function deleteRowsSequentially(
   for (const row of rowOutcomes) {
     try {
       throwIfTransactionCancelled(context);
-      // Local validation errors are known failures; sent requests are unknown
-      // until the backend acknowledges them. Never infer no-op from a network error.
       row.status = "failed";
       const execute = prepare(row.primaryKeys);
       row.status = "unknown";

@@ -136,8 +136,6 @@ describe("SQLite lost session recovery through controller/manager/worker", () =>
         ),
       );
       await new Promise((resolve) => setTimeout(resolve, 50));
-      // Execute supersedes the CPU query through the controller's own targeted
-      // cancellation handle. The successor must not reopen/write an empty DB.
       await test.execute(
         "CREATE TABLE kept(value INTEGER); INSERT INTO kept VALUES(99)",
       );
@@ -161,7 +159,6 @@ describe("SQLite lost session recovery through controller/manager/worker", () =>
     expect(test.manager.getDriver(test.connection.id)).toBe(original);
     expect(test.manager.isConnected(test.connection.id)).toBe(false);
 
-    // Loss survives disposal of the old instance, not just its private flag.
     await test.manager.disconnectFrom(test.connection.id);
     expect(test.manager.getDriver(test.connection.id)).toBeUndefined();
     await test.execute(

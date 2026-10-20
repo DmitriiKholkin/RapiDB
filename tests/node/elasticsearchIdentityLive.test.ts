@@ -3,7 +3,6 @@ import { Client } from "@elastic/elasticsearch";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
 
-// Opt-in: point only at a disposable ES 8 server. Each test owns its indices.
 const endpoint = process.env.RAPIDB_ES_IDENTITY_TEST_URL;
 describe.skipIf(!endpoint)(
   "Elasticsearch document identity — live ES 8",

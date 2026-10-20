@@ -134,8 +134,6 @@ const DYNAMODB_MAX_MATERIALIZED_ROWS = 5000;
 const DYNAMODB_CURSOR_CACHE_MAX_SESSIONS = 100;
 const DYNAMODB_CURSOR_SESSION_MAX_PAGE_STARTS = 100;
 const DYNAMODB_CURSOR_HISTORY_LIMIT = 256;
-// Editable-cell token: literal text matching the token (plus any leading
-// backslashes) displays with one extra leading backslash; coercion removes one.
 const DYNAMODB_EMPTY_BINARY_CELL_MARKER = "0x (empty binary)";
 const DYNAMODB_EMPTY_BINARY_TEXT_PATTERN = /^\\*0x \(empty binary\)$/;
 const DYNAMODB_ESCAPED_EMPTY_BINARY_TEXT_PATTERN = /^\\+0x \(empty binary\)$/;
@@ -190,12 +188,7 @@ function parseDynamoContainsNeedle(
   try {
     const parsed = JSON.parse(trimmed) as unknown;
     if (typeof parsed === "string") return { kind: "string", value: parsed };
-  } catch {
-    // Unquoted input remains the convenient string form used by existing filters.
-  }
-  // Preserve the native S-needle contract, including strings such as "123"
-  // and "0xdead". Homogeneous typed sets are unambiguous. Mixed lists use
-  // explicit N(...) / B(...) to select numeric or binary membership.
+  } catch {}
   const binary = /^B\((0x[0-9a-f]*)\)$/i.exec(trimmed);
   if (binary) return { kind: "binary", value: binary[1] };
   const numeric = /^N\((.*)\)$/i.exec(trimmed);
@@ -208,9 +201,6 @@ function parseDynamoContainsNeedle(
   return { kind: "string", value };
 }
 
-// Decode only a complete escaped cell token, never partial Contains needles or
-// arbitrary backslashes. Filters need native binary context to interpret B;
-// edits already have the value-tagged cell context.
 function decodeDynamoCellInput(value: string, binaryContext = false) {
   if (
     DYNAMODB_ESCAPED_EMPTY_BINARY_TEXT_PATTERN.test(value) ||
@@ -353,7 +343,6 @@ function advanceReadCursorCycle(
       "DynamoDB read cursor repeated; stopped to avoid repeating rows.",
     );
   }
-  // Brent-style doubling checkpoints catch cycles beyond the bounded history.
   cycle.distance += 1;
   if (cycle.distance >= cycle.interval) {
     cycle.checkpoint = signature;
@@ -562,7 +551,6 @@ export class DynamoDBDriver implements IDBDriver {
     client.destroy();
   }
 
-  /** The wrapper repeats cleanup on late settlement; never cancel a newer attempt. */
   async cancelConnectionAttempt(attempt: Promise<unknown>): Promise<void> {
     if (
       attempt === this.connectionAttempt ||
@@ -1279,7 +1267,6 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   async runTransaction(operations: TransactionOperation[]): Promise<void> {
-    // No TransactWriteItems batching here; sequential requests are not atomic.
     if (operations.length > 1) {
       throw new Error(
         "[RapiDB] DynamoDB driver does not support atomic multi-operation transactions. Apply one row at a time.",
@@ -1328,8 +1315,6 @@ export class DynamoDBDriver implements IDBDriver {
       return value;
     }
 
-    // Cell markers are value-tagged, so sampled column metadata cannot change
-    // a zero-byte binary into text (or an escaped literal into binary).
     const decoded = decodeDynamoCellInput(value, true);
     if (decoded !== value) {
       return decoded;
@@ -1388,8 +1373,6 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   formatOutputValue(value: unknown, _column: ColumnTypeMeta): unknown {
-    // Sampled metadata is not a coercion rule: each DynamoDB item carries
-    // its own attribute types, which can differ from the description.
     return this.formatDynamoCellValue(value);
   }
 
@@ -1748,10 +1731,6 @@ export class DynamoDBDriver implements IDBDriver {
     );
     const onlyFullPrimaryKeyEqualities =
       fullPrimaryKey !== null && indexedFilters.length === schema.keys.length;
-    // A key-bounded GetItem is also safe for residual predicates when the
-    // caller is guaranteed to run the fetched row through client filtering or
-    // materialization (client-only filters and sorts). Otherwise use Query so
-    // DynamoDB's FilterExpression can enforce every residual predicate.
     if (
       fullPrimaryKey &&
       (onlyFullPrimaryKeyEqualities ||
@@ -2251,7 +2230,6 @@ export class DynamoDBDriver implements IDBDriver {
       }
     }
 
-    // Preserve cycle detection after history eviction; restart on page jumps.
     const cycle =
       session.cursorCycle.nextPage === currentPage
         ? { ...session.cursorCycle }
@@ -2263,7 +2241,6 @@ export class DynamoDBDriver implements IDBDriver {
           };
 
     while (currentPage <= page) {
-      // A failed/incomplete read must not be treated as a sequential continuation.
       session.cursorCycle.nextPage = 0;
       const step = await this.executeReadPlanStep(
         plan,
@@ -2406,8 +2383,6 @@ export class DynamoDBDriver implements IDBDriver {
         cursorHistory,
         options.onCursor,
       );
-      // A short logical page is terminal only when the AWS cursor is exhausted;
-      // DynamoDB may stop at its byte limit even without a FilterExpression.
     } while (
       rows.length < pageSize &&
       nextCursor !== undefined &&
@@ -2598,8 +2573,6 @@ export class DynamoDBDriver implements IDBDriver {
         DYNAMODB_CURSOR_FETCH_LIMIT,
         sort,
         context,
-        // This consumer fills the logical page with client-side matches, so it
-        // must evaluate each AWS response before fetching more raw rows.
         { cursorHistory, fillPage: false },
       );
       for (const rawRow of step.rows) {
@@ -3312,9 +3285,6 @@ export class DynamoDBDriver implements IDBDriver {
     if (!this.isTransactionCanceled(error)) return false;
     const reasons = (error as { CancellationReasons?: { Code?: string }[] })
       .CancellationReasons;
-    // A cancelled transaction is atomic, but cancellation can also mean
-    // validation, throttling or transaction conflict. Only a known conditional
-    // rejection may be presented as a stale row without the backend diagnostic.
     return (
       Array.isArray(reasons) &&
       reasons.some((reason) => reason?.Code === "ConditionalCheckFailed") &&
@@ -3357,8 +3327,6 @@ export class DynamoDBDriver implements IDBDriver {
       describedColumns.map((column) => [column.name, column]),
     );
     for (const column of sourceColumns) {
-      // Retain metadata for sparse/null-only attributes, but do not mask new
-      // type evidence on this page: exporters need to detect schema drift.
       if (!columnsByName.has(column.name) || column.nativeType !== "null") {
         columnsByName.set(column.name, column);
       }
@@ -3471,9 +3439,6 @@ export class DynamoDBDriver implements IDBDriver {
       column.category === "float" ||
       column.category === "decimal"
     ) {
-      // DynamoDB numbers are decimal strings (up to 38 significant digits).
-      // Keep the token intact when marshalling native filter/key expressions;
-      // passing through Number rounds large integers and precise decimals.
       return DYNAMODB_NUMBER_RE.test(value)
         ? NumberValueImpl.from(value)
         : value;
@@ -3809,8 +3774,6 @@ export class DynamoDBDriver implements IDBDriver {
       columns.map((column) => [column.name, column]),
     );
     return rows.filter((row) => {
-      // Display rows retain native categories in the WeakMap. Decode S only:
-      // an empty B displays as the same *unescaped* token as the logical S.
       const logicalRow = Object.fromEntries(
         Object.entries(row).map(([name, value]) => [
           name,
@@ -3836,9 +3799,6 @@ export class DynamoDBDriver implements IDBDriver {
             ? this.splitFilterList(filter.value)
             : [filter.value];
         if (contains) {
-          // Native contains accepts S substrings and exact S/N/B members of
-          // SS/NS/BS/L. Do not search collection serialization: retain the
-          // member type and compare numeric/binary values without lossy casts.
           const rawValue = this.tableRawRows.get(row)?.[filter.column];
           const needle = String(decodeDynamoCellInput(values[0]));
           if (rawValue instanceof Set || Array.isArray(rawValue)) {
@@ -3877,8 +3837,6 @@ export class DynamoDBDriver implements IDBDriver {
               return actualNumber !== null && actualNumber === expectedNumber;
             });
           }
-          // Raw typeof is authoritative even if category metadata is absent;
-          // without raw evidence, only a known S display value may be searched.
           const text =
             typeof rawValue === "string"
               ? rawValue
@@ -3898,8 +3856,6 @@ export class DynamoDBDriver implements IDBDriver {
             column?.nativeType.toLowerCase() === "binary";
           return actualCategory === (expectsBinary ? "binary" : "text");
         };
-        // IN candidates keep their individual S/B identity; decoding the whole
-        // comma-separated input would miss escaped candidates.
         const eligible = values.filter(matches);
         if (eligible.length !== values.length && filter.operator !== "in") {
           return filter.operator === "neq" && logicalRow[filter.column] != null;
@@ -3924,7 +3880,6 @@ export class DynamoDBDriver implements IDBDriver {
               typeof this.coerceFilterParameter(column, value) === "string",
           )
         ) {
-          // DynamoDB orders S by UTF-8 bytes, not the shared locale comparator.
           const compare = (bound: string) =>
             Buffer.compare(
               Buffer.from(String(logicalRow[filter.column]), "utf8"),
@@ -3983,8 +3938,6 @@ export class DynamoDBDriver implements IDBDriver {
 
   private formatDynamoCellValue(value: unknown): unknown {
     if (typeof value === "string") {
-      // A literal marker (including one already starting with backslashes) is
-      // escaped by one extra leading backslash. Coercion removes exactly one.
       return DYNAMODB_EMPTY_BINARY_TEXT_PATTERN.test(value) ||
         DYNAMODB_NATIVE_CELL_TEXT_PATTERN.test(value)
         ? `\\${value}`
@@ -4299,9 +4252,6 @@ export class DynamoDBDriver implements IDBDriver {
             this.parseCanonicalBase64(entry),
           );
           if (binaries.some((entry) => entry === null)) break;
-          // Base64 is canonicalized above, so equal encoded entries represent
-          // equal bytes. Buffer instances compare by identity in a Set, which
-          // would otherwise preserve duplicate binary values.
           if (new Set(value).size !== value.length) break;
           return new Set(binaries as Buffer[]);
         }

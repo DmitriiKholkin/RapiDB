@@ -1,18 +1,3 @@
-/**
- * Wraps the `connectionManager.beginConnect` / `isConnected` pair with
- * the VSCode `withProgress` notification. Three small concerns:
- *
- *  - if the connection is already established, return immediately;
- *  - if another caller already started a connect attempt, optionally
- *    wait for it;
- *  - otherwise, show progress and await the attempt.
- *
- * The `withProgress` runner is injected so the function can be unit
- * tested without spinning up the VSCode host.
- * Intent defaults to automatic; only a deliberate Connect/reconnect action
- * should pass explicit to allow replacement of a lost SQLite session.
- */
-
 import * as vscode from "vscode";
 import type {
   ConnectAttempt,
@@ -21,7 +6,6 @@ import type {
 
 type ProgressRunner = typeof vscode.window.withProgress;
 
-/** Minimal surface of `ConnectionManager` that this helper depends on. */
 export interface ConnectProgressClient {
   beginConnect(
     connectionId: string,

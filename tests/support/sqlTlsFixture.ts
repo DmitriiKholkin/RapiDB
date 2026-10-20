@@ -29,8 +29,6 @@ function mysqlHello() {
   );
 }
 
-// Minimal native wire negotiation, not a database server. All TLS operations
-// and certificate decisions use the real client packages and Node TLS server.
 export async function startSqlTlsFixture(
   engine: "mysql" | "pg",
   options: tls.TlsOptions,
@@ -38,8 +36,6 @@ export async function startSqlTlsFixture(
   const sockets = new Set<net.Socket>();
   const servernames: Array<string | false> = [];
   let authentications = 0;
-  // tls.Server performs client-certificate authorization before this callback;
-  // a raw server TLSSocket alone does not enforce rejectUnauthorized.
   const secureServer = tls.createServer(options, (secure) => {
     sockets.add(secure);
     secure.on("error", () => undefined);
@@ -52,7 +48,6 @@ export async function startSqlTlsFixture(
       if (engine === "mysql") {
         secure.write(mysqlPacket(Buffer.from([0, 0, 0, 2, 0, 0, 0]), 3));
       } else {
-        // AuthenticationOk and ReadyForQuery suffice for pg Pool.connect().
         secure.write(Buffer.from("5200000008000000005a0000000549", "hex"));
         secure.on("data", (query: Buffer) => {
           if (query[0] === 0x51) {
@@ -79,8 +74,6 @@ export async function startSqlTlsFixture(
       socket.pause();
       if (pending.length > length) socket.unshift(pending.subarray(length));
       if (engine === "pg") socket.write("S");
-      // The SSLRequest and TLS ClientHello can share a TCP chunk. A generic
-      // duplex makes TLS consume the socket's unshifted readable bytes too.
       const channel = new Duplex({
         read() {
           socket.resume();
@@ -102,8 +95,6 @@ export async function startSqlTlsFixture(
       socket.on("end", () => channel.push(null));
       socket.on("close", () => channel.destroy());
       channel.on("error", () => undefined);
-      // Feed the already-negotiated duplex through tls.Server's normal
-      // connection listener, retaining its authorization gate and buffering.
       secureServer.emit("connection", channel);
     };
     socket.on("data", negotiate);

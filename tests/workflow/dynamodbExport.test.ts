@@ -102,8 +102,6 @@ describe.runIf(enabled)("dynamodb B04 public TablePanel CSV export", () => {
         })),
       );
       await putRows(rows);
-      // Scan order is unspecified. Assign sampled/queried roles using the
-      // actual SDK scan order, while keeping both partitions' keys unchanged.
       const scan = await admin.send(
         new ScanCommand({ TableName: table, Limit: 1, ConsistentRead: true }),
       );
@@ -347,7 +345,6 @@ describe.runIf(enabled)("dynamodb B04 public TablePanel CSV export", () => {
         expect(request.filters).toEqual(payload.filters);
       }
 
-      // An explicit visible-column selection intentionally excludes y.
       state.showInformationMessage.mockClear();
       await opened.handle.dispatchMessage({
         type: "exportCSV",

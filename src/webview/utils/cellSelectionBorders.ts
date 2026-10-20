@@ -1,12 +1,3 @@
-/**
- * Cell selection border utilities.
- *
- * The border logic (which side(s) of a cell need to show a thicker border
- * to outline the active range) was previously duplicated in
- * `TableRow`, `DraftTableRow`, and `QueryResultsGrid`. This module
- * centralises the computation so the three call sites cannot drift.
- */
-
 export interface CellRange {
   anchorRow: number;
   anchorCol: number;
@@ -26,10 +17,6 @@ export interface CellSelectionState extends CellBorders {
   anchor: boolean;
 }
 
-/**
- * Compute the min/max rectangle of a range. Returns `null` if the
- * range itself is `null`, allowing the caller to short-circuit.
- */
 function normalizeBounds(range: CellRange | null): {
   minRow: number;
   maxRow: number;
@@ -47,15 +34,6 @@ function normalizeBounds(range: CellRange | null): {
   };
 }
 
-/**
- * Pure: classify a single cell relative to a selection range.
- *
- * @param range      Active range or `null` if nothing is selected.
- * @param rowIndex   Visible row index (use `-1` for the draft row).
- * @param colIndex   Visible column index (0-based, excluding selection).
- * @param isSelected Whether this cell is part of the active range.
- * @param isAnchor   Whether this cell is the anchor corner of the range.
- */
 export function classifyCellSelection(
   range: CellRange | null,
   rowIndex: number,
@@ -84,7 +62,6 @@ export function classifyCellSelection(
   };
 }
 
-/** Class names emitted by the grid CSS for selected cell borders. */
 const TABLE_SELECTED_CLASS = "rdb-tcell-selected";
 const TABLE_ANCHOR_CLASS = "rdb-tcell-anchor";
 const TABLE_TOP_BORDER_CLASS = "rdb-tcell-border-top";
@@ -92,7 +69,6 @@ const TABLE_BOTTOM_BORDER_CLASS = "rdb-tcell-border-bottom";
 const TABLE_LEFT_BORDER_CLASS = "rdb-tcell-border-left";
 const TABLE_RIGHT_BORDER_CLASS = "rdb-tcell-border-right";
 
-/** Alternate class names used by the read-only `QueryResultsGrid`. */
 const RESULTS_SELECTED_CLASS = "rdb-rcell-selected";
 const RESULTS_ANCHOR_CLASS = "rdb-rcell-anchor";
 const RESULTS_TOP_BORDER_CLASS = "rdb-rcell-border-top";
@@ -100,13 +76,8 @@ const RESULTS_BOTTOM_BORDER_CLASS = "rdb-rcell-border-bottom";
 const RESULTS_LEFT_BORDER_CLASS = "rdb-rcell-border-left";
 const RESULTS_RIGHT_BORDER_CLASS = "rdb-rcell-border-right";
 
-/** Selects which CSS class family to emit. */
 export type CellSelectionClassSet = "table" | "results";
 
-/**
- * Build a className list for a cell based on its selection state.
- * Returns a single space-separated string; pass through to `className`.
- */
 export function buildCellSelectionClassName(
   state: CellSelectionState,
   options:

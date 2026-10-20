@@ -34,7 +34,6 @@ export type SQLiteWorkerNotExecutedReason =
   | "cancelled"
   | "disconnected";
 
-/** A request that was never sent to the SQLite process. */
 export class SQLiteWorkerNotExecutedError extends Error {
   readonly code = "NOT_EXECUTED";
   readonly executionState = "not-executed";
@@ -55,7 +54,6 @@ export class SQLiteWorkerNotExecutedError extends Error {
   }
 }
 
-/** One persistent process/handle, one active request, no automatic reopen/retry. */
 export class SQLiteWorkerClient {
   private child?: ChildProcess;
   private active?: Pending;
@@ -107,8 +105,6 @@ export class SQLiteWorkerClient {
     deadline?: number,
   ): Promise<T> {
     if (!this.connected) {
-      // The previous request may have an unknown outcome, but this one has
-      // not even entered the queue. Never reuse the previous error's message.
       const error = new SQLiteWorkerNotExecutedError(method, "disconnected");
       error.message +=
         " The SQLite connection is closed. Use Connect to reconnect explicitly before continuing.";
@@ -219,18 +215,12 @@ export class SQLiteWorkerClient {
   }
 
   private async start(pending: Pending): Promise<void> {
-    // Installation policy/configuration lives in the extension host. The child
-    // receives resolved package paths and never installs or downloads anything.
     try {
       await ensureSQLiteRuntimeInstalled(__dirname);
     } catch (error) {
-      // better-sqlite3 loads its native addon only when its constructor runs.
-      // Falling back to the bundled package after a failed managed install can
-      // therefore hide the useful installer error until the child reports a
-      // misleading NODE_MODULE_VERSION mismatch from that stale binary.
       throw error instanceof Error ? error : new Error(String(error));
     }
-    if (this.active !== pending) return; // connect timeout/disconnect during installation
+    if (this.active !== pending) return;
     pending.request.runtimeTargets = resolveBetterSqlite3LoadTargets(
       __dirname,
     ).map((target) => {
@@ -257,8 +247,6 @@ export class SQLiteWorkerClient {
         return;
       const current = this.active;
       if (response.error?.name === "SQLiteRollbackFailure") {
-        // The worker's SQLite handle may still contain uncommitted writes.
-        // Stop it rather than allowing a later request onto that session.
         void this.stop(new Error(response.error.message));
         return;
       }
@@ -403,8 +391,6 @@ export class SQLiteWorkerClient {
     this.connected = false;
     this.active = undefined;
     this.queue = [];
-    // Clear deadlines immediately, but settle only after process exit: native
-    // SQLite cannot continue writing after cancellation has completed.
     for (const entry of [active, ...queued]) if (entry) this.cleanup(entry);
     const exit =
       child?.pid && child.exitCode === null && child.signalCode === null
@@ -427,7 +413,6 @@ export class SQLiteWorkerClient {
 
   async close(invalidateAttempt = true): Promise<void> {
     if (invalidateAttempt) this.epoch++;
-    // Idle close is graceful so SQLite can checkpoint/release resources.
     if (this.connected && !this.active && this.queue.length === 0) {
       try {
         await this.call("disconnect", [], 1000);

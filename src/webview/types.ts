@@ -39,7 +39,6 @@ export type EditTarget =
     };
 export interface MutationSnapshot {
   pendingEdits: PendingEdits;
-  /** Historical edits whose original identity is absent or ambiguous. */
   unresolvedPendingEdits?: PendingRestoreEntry[];
   newRows: InsertDraftRow[];
   editCell: EditTarget | null;

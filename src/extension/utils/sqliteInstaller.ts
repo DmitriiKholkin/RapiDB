@@ -131,7 +131,6 @@ function currentRuntimeStorageKey(): string {
     process.platform,
     detectLinuxLibc() || null,
     process.arch,
-    // Do not reuse binaries extracted by older, unbounded installers.
     SQLITE_ARTIFACT_POLICY_ID,
   ]
     .filter(
@@ -387,19 +386,6 @@ async function withInstallLock<T>(
   }
 }
 
-// --- Electron 42 V8 API compatibility fallback chain --------------------------
-// Better-sqlite3 prebuilt binaries are not yet published for Electron 42
-// (NODE_MODULE_VERSION >= 146). The fallback chain is:
-//   1. Official prebuilt from the trusted WiseLibs HTTPS release origin
-//   2. Patched prebuilt with a publisher-reviewed checksum committed here
-//   3. Source build with V8 API patch via node-gyp (requires build toolchain)
-//
-// To publish patched prebuilts, build on each target platform and upload:
-//   gh release create rapidb-patched-sqlite /tmp/rapidb-patched-prebuilts/*.tar.gz
-// Then independently review and commit each asset's checksum below. Uploading
-// assets (or a checksum next to them) alone does not enable this fallback.
-// ------------------------------------------------------------------------------
-
 const GITHUB_DOWNLOAD_HOSTS = [
   "github.com",
   "release-assets.githubusercontent.com",
@@ -445,15 +431,11 @@ export function downloadToFile(
           } catch {}
           rejectPromise(error);
         };
-        // Wait for a pending open/close before removing the partial file (also
-        // required on Windows). Otherwise a late open can recreate it.
         if (downloadFile && !downloadFile.closed)
           downloadFile.once("close", cleanup);
         else cleanup();
       }
     };
-    // Socket timeout is only an inactivity timer. A server can drip bytes
-    // indefinitely, so also bound the entire download across redirects.
     const deadline = setTimeout(() => {
       const error = new Error(`Timed out downloading ${url}`);
       abortActiveRequest?.();
@@ -476,8 +458,6 @@ export function downloadToFile(
         );
         return;
       }
-      // http is only for loopback tests; production URLs are https.
-      // Reject non-loopback http (including https->http downgrade redirects).
       if (
         options.allowedHosts &&
         !options.allowedHosts.includes(new URL(resolvedTarget).hostname)
@@ -510,11 +490,8 @@ export function downloadToFile(
         }
       }
       const client = resolvedTarget.startsWith("http://") ? http : https;
-      // biome-ignore lint/suspicious/noExplicitAny: node http/https interop for tests
       let activeResponse: any | undefined;
-      // biome-ignore lint/suspicious/noExplicitAny: node fs WriteStream interop
       let activeFile: any | undefined;
-      // biome-ignore lint/suspicious/noExplicitAny: node ClientRequest interop
       let request: any;
       abortActiveRequest = () => {
         activeResponse?.destroy();
@@ -537,7 +514,6 @@ export function downloadToFile(
               status === 308) &&
             response.headers.location
           ) {
-            // Free the socket before following the redirect.
             response.destroy();
             let next: string;
             try {
@@ -670,9 +646,6 @@ export async function downloadPinnedSQLiteArtifact(
   }
 }
 
-/** node-gyp is never allowed to download or reuse global headers. Both gypi
- * files and Windows node.lib are verified before it sees this private nodedir.
- */
 export async function preparePinnedSQLiteHeaders(
   runtimeRoot: string,
   pins: SQLiteHeaderPins,
@@ -750,16 +723,7 @@ export function sqliteNodeGypArguments(
   ];
 }
 
-/**
- * Applies the V8 External API compatibility patch from
- * https://github.com/WiseLibs/better-sqlite3/pull/1475
- *
- * The patch adds version-guarded macros for tagged v8::External
- * creation/access (required by V8 14+ / NODE_MODULE_VERSION >= 146)
- * and fixes a SetNativeDataProperty overload ambiguity.
- */
 function applyElectron42V8Patch(sourceDir: string): void {
-  // 1. src/util/macros.cpp — add EXTERNAL_NEW / EXTERNAL_VALUE macros
   const macrosPath = join(sourceDir, "src", "util", "macros.cpp");
   let macros = readFileSync(macrosPath, "utf8");
   macros = macros.replace(
@@ -777,14 +741,12 @@ function applyElectron42V8Patch(sourceDir: string): void {
   );
   writeFileSync(macrosPath, macros, "utf8");
 
-  // 2. src/better_sqlite3.cpp — use EXTERNAL_NEW macro + MSVC compat for Electron 42 headers
   const mainPath = join(sourceDir, "src", "better_sqlite3.cpp");
   let mainCpp = readFileSync(mainPath, "utf8");
   mainCpp = mainCpp.replace(
     "v8::Local<v8::External> data = v8::External::New(isolate, addon);",
     "v8::Local<v8::External> data = EXTERNAL_NEW(isolate, addon);",
   );
-  // Electron 42 V8 headers use __builtin_frame_address (GCC/Clang only)
   if (!mainCpp.includes("__builtin_frame_address")) {
     mainCpp =
       "#ifdef _MSC_VER\n" +
@@ -794,8 +756,6 @@ function applyElectron42V8Patch(sourceDir: string): void {
   }
   writeFileSync(mainPath, mainCpp, "utf8");
 
-  // 3. src/util/helpers.cpp — pass nullptr instead of 0 for missing setter
-  //    (better-sqlite3 source uses tabs for indentation)
   const helpersPath = join(sourceDir, "src", "util", "helpers.cpp");
   let helpers = readFileSync(helpersPath, "utf8");
   helpers = helpers.replace(
@@ -827,7 +787,6 @@ async function downloadPatchedPrebuilt(
     installerLog(`Trying patched prebuilt from ${downloadUrl}…`);
     await downloadPinnedSQLiteArtifact(pin, tarballPath, GITHUB_DOWNLOAD_HOSTS);
 
-    // Extract into the scaffold (tarball contains build/Release/better_sqlite3.node)
     const scaffoldDir = join(runtimeRoot, "node_modules", "better-sqlite3");
     await extractSQLiteArchive(
       tarballPath,
@@ -858,10 +817,6 @@ async function rebuildFromSourceWithPatch(
   runtimeRoot: string,
   baseDir: string,
 ): Promise<void> {
-  // Keep the final managed runtime in extension global storage, but compile in
-  // a private temporary path without spaces. macOS commonly puts globalStorage
-  // under "Application Support"; make/node-gyp split generated include paths
-  // there and clang then cannot find the pinned headers.
   assertSQLiteBuildPath(runtimeRoot, "runtime");
   const pkg = readBundledBetterSqlite3Package(baseDir);
   if (!pkg.version) {
@@ -882,7 +837,6 @@ async function rebuildFromSourceWithPatch(
   const toolDir = join(buildRoot, "sqlite-build-tools");
 
   try {
-    // Download the npm package tarball (includes src/, deps/, binding.gyp)
     if (pkg.version !== SQLITE_SOURCE.version) {
       throw new Error(
         `No locked SQLite source integrity for better-sqlite3 ${pkg.version}. Update the source pin from package-lock.json.`,
@@ -894,7 +848,6 @@ async function rebuildFromSourceWithPatch(
       allowedHosts: ["registry.npmjs.org"],
     });
 
-    // Extract
     mkdirSync(sourceDir, { recursive: true });
     await extractSQLiteArchive(
       tarballPath,
@@ -902,8 +855,6 @@ async function rebuildFromSourceWithPatch(
       "source",
       SQLITE_SOURCE.integrity,
     );
-    // Read current roots at discovery time; standalone Node callers have no
-    // workspace. Keep the installer/worker independent of the VS Code module.
     const buildTools = resolveSQLiteBuildTools(
       findPackageRoot(baseDir) ?? baseDir,
       buildRoot,
@@ -952,7 +903,6 @@ async function rebuildFromSourceWithPatch(
       { cwd: toolDir, timeout: 300_000, env: buildTools.env },
     );
 
-    // Apply the Electron 42 V8 API patch
     installerLog("Applying Electron 42 V8 API compatibility patch…");
     applyElectron42V8Patch(sourceDir);
     const headerDir = await preparePinnedSQLiteHeaders(
@@ -962,7 +912,6 @@ async function rebuildFromSourceWithPatch(
       process.arch,
     );
 
-    // Build native module for the current Electron ABI
     const electronVersion = process.versions.electron;
     installerLog(
       `Building better-sqlite3 from source for Electron ${electronVersion} (ABI ${process.versions.modules}, ${process.platform}-${process.arch})…`,
@@ -979,7 +928,6 @@ async function rebuildFromSourceWithPatch(
       { cwd: sourceDir, timeout: 300_000, env: buildTools.env },
     );
 
-    // Copy the built binary into the scaffold
     const builtBinary = join(
       sourceDir,
       "build",
@@ -1060,8 +1008,6 @@ async function downloadPrebuiltBinary(
     throw new Error("Invalid better-sqlite3 version for runtime installation.");
   }
   const fileName = `better-sqlite3-v${pkg.version}-${currentRuntime()}-v${process.versions.modules}-${process.platform}${detectLinuxLibc()}-${process.arch}.tar.gz`;
-  // Do not use prebuild-install's environment-controlled mirrors, npm cache,
-  // arbitrary archive extraction, or require() of a downloaded addon here.
   const tarballPath = join(runtimeRoot, "official-prebuilt.tar.gz");
 
   try {
@@ -1088,13 +1034,10 @@ async function downloadPrebuiltBinary(
       );
     }
   } catch (prebuiltError) {
-    // Electron 42+ (NODE_MODULE_VERSION >= 146) has no published prebuilts
-    // yet. Try patched prebuilt first (no build tools needed), then source build.
     if (
       currentRuntime() === "electron" &&
       Number(process.versions.modules) >= 146
     ) {
-      // Step 1: try patched prebuilt from RapiDB GitHub releases
       let patchedPrebuiltInstalled = false;
       try {
         await downloadPatchedPrebuilt(runtimeRoot, baseDir);
@@ -1105,7 +1048,6 @@ async function downloadPrebuiltBinary(
         );
       }
 
-      // Step 2: try building from source with the V8 API compat patch
       if (!patchedPrebuiltInstalled) {
         installerLog("Attempting source build with Electron 42 V8 patch…");
         try {

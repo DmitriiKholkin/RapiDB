@@ -753,8 +753,6 @@ describe("B01 PostgreSQL database scope (mock pools)", () => {
     const before = pool.connect.mock.calls.length;
     const pending = driver.query("SELECT * FROM items");
 
-    // A peer pool consumer invoked before this microtask must not be able to
-    // take the checked slot and strand this query in pg-pool's wait queue.
     expect(pool.connect).toHaveBeenCalledTimes(before + 1);
     expect((await pending).rows[0].__col_2).toBe("a");
   });

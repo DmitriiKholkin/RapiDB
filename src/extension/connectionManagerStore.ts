@@ -88,18 +88,10 @@ function stableSerialize(value: unknown): string {
 function computeConnectionsRevision(
   connections: StoredConnectionConfig[],
 ): string {
-  // Compare the representation VS Code persists, not in-memory optional fields:
-  // JSON omits object undefined, turns array holes/undefined into null, and
-  // applies toJSON/non-finite number rules. Sort keys only after that roundtrip.
   const persisted = JSON.parse(JSON.stringify(connections));
   return createHash("sha256").update(stableSerialize(persisted)).digest("hex");
 }
 
-/**
- * Migrate legacy `ssl` / `rejectUnauthorized` boolean flags into the
- * structured `tls` config. Returns a new array; originals are not mutated.
- * Connections that already use `tls` are left untouched.
- */
 function migrateLegacyTlsFlags(
   connections: StoredConnectionConfig[],
 ): StoredConnectionConfig[] {
@@ -111,7 +103,6 @@ function migrateLegacyTlsFlags(
     const hasTls = conn.tls != null;
 
     if ((!hasLegacySsl && !hasLegacyReject) || hasTls) {
-      // No legacy flags, or already has tls — strip legacy keys if present
       if (hasLegacySsl || hasLegacyReject) {
         changed = true;
         const { ssl: _ssl, rejectUnauthorized: _ru, ...rest } = raw;
@@ -128,8 +119,6 @@ function migrateLegacyTlsFlags(
         ? "requireVerifyFull"
         : "requireTrustServerCertificate"
       : "disabled";
-    // `ssl` / `rejectUnauthorized` are intentionally discarded here so
-    // they don't leak into the sanitized record stored on disk.
     const { ssl: _ssl, rejectUnauthorized: _ru, ...rest } = raw;
     return {
       ...rest,
@@ -274,8 +263,6 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
           raw: await this.getSecret(connection.id),
         });
         await this.storeSecret(connection.id, raw);
-        // Duplicate IDs still belong to the first retained record. Only remove
-        // old keys that no normalized record owns (e.g. empty/whitespace IDs).
         if (!retainedIds.has(originalId)) orphanedSecrets.set(originalId, raw);
       }
       this.assertSnapshotCurrent(snapshot);
@@ -338,9 +325,7 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
         this.assertSnapshotCurrent(snapshot);
         await this.persistNormalization(snapshot);
       })
-        .catch(() => {
-          // Keep the same repaired IDs and retry on the next read or mutation.
-        })
+        .catch(() => {})
         .finally(() => {
           normalized.scheduled = false;
         });

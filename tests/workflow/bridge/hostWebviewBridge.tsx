@@ -61,9 +61,6 @@ export function buildBridgeGlobals(): BridgeGlobals {
   };
 }
 
-// NOTE: startBridge mutates window.__vscode and window.__RAPIDB_INITIAL_STATE__.
-// This is safe because the db-workflow vitest project has fileParallelism: false.
-// If that changes, this function must be made reentrant (e.g. per-session globals).
 export async function startBridge(
   options: BridgeOptions,
 ): Promise<BridgeSession> {
@@ -122,10 +119,6 @@ export async function startBridge(
 
   hostWindow.__vscode = vscodeBridge as unknown as typeof window.__vscode;
 
-  // Override the panel's INNER webview.postMessage to dispatch a MessageEvent
-  // to the window, so the webview's message handler (from messaging.ts) receives it.
-  // The panel returned by the fake's createWebviewPanel is `handle.panel`,
-  // which has its own webview. We need to override that one.
   const innerPanel = (panel.panel ?? panel) as {
     webview: {
       postMessage: (message: WorkflowMessageEnvelope) => Thenable<boolean>;
@@ -153,8 +146,6 @@ export async function startBridge(
     throw new Error("[workflow bridge] Failed to render App");
   }
 
-  // Wait for the webview's effects to register their message handlers
-  // before letting the host respond.
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
   });

@@ -101,9 +101,6 @@ export class QueryPanel {
         getInitialConnectionId: () => this.initialConnectionId,
         getLastQueryResult: () => this.lastQueryResult,
         postMessage: (message) => {
-          // webview.postMessage returns Thenable<boolean>: false when the
-          // webview is gone, rejection on dispose races. Swallowing it caused
-          // unhandled rejections; log instead so diagnostics stay visible.
           try {
             const result = this.panel.webview.postMessage(message);
             void Promise.resolve(result).then(
@@ -296,8 +293,6 @@ export class QueryPanel {
       }
     }
 
-    // Hidden saved panels are restored lazily. A local counter cannot reserve
-    // their IDs before deserialization runs, including after an extension restart.
     const panelId = `qp_${randomUUID()}`;
     const webviewPanel = vscode.window.createWebviewPanel(
       QueryPanel.viewType,

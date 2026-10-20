@@ -29,8 +29,6 @@ function bulk(bytes: Buffer | string): Buffer {
   ]);
 }
 
-// Real node-redis parser, RESP3 handshake, socket, reply mappings and wire
-// arguments. The tiny server deliberately preserves key bytes (never strings).
 class BinaryKeyServer {
   readonly sockets = new Set<net.Socket>();
   readonly commands: Buffer[][] = [];
@@ -88,7 +86,6 @@ class BinaryKeyServer {
             socket.write(":-1\r\n");
             break;
           case "EVAL":
-            // TTL-only edit: the live regression below also executes real Lua.
             socket.write(":1\r\n");
             break;
           case "DEL":
@@ -358,8 +355,6 @@ describe("Redis binary key identity: SCAN validation unit cases", () => {
   });
 });
 
-// Opt-in live verification. Only uniquely named keys are created/deleted; this
-// never flushes a database or uses the project's shared Docker services.
 it.skipIf(!process.env.RAPIDB_REDIS_BINARY_KEY_AUDIT_URL)(
   "rejects binary aliases on live Redis and keeps both values untouched",
   async () => {
@@ -387,7 +382,6 @@ it.skipIf(!process.env.RAPIDB_REDIS_BINARY_KEY_AUDIT_URL)(
       ).rejects.toThrow(binaryKeyError);
       expect(await client.get(binary)).toBe("BINARY");
       expect(await client.get(valid)).toBe("VALID");
-      // A valid U+FFFD key remains editable when addressed explicitly.
       await liveDriver.updateRows({
         database: "db0",
         schema: "",

@@ -181,7 +181,6 @@ it("M16 accepts a resent known backend result without unknown-write recovery", (
   const operationId = (request?.payload as { operationId: string }).operationId;
   expect(result.current.applying).toBe(true);
 
-  // R5 resends the original execution evidence, not a transport-derived unknown.
   const knownResult: ApplyResultPayload = {
     operationId,
     success: true,

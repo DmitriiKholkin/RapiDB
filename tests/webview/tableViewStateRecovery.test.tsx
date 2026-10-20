@@ -77,7 +77,6 @@ function persistState(initialState: Record<string, unknown>) {
   });
   api.postMessage.mockImplementation((message) => {
     if (message.type === "fetchPage") {
-      // Check ordering at the host boundary, not after React effects flush.
       expect(state.tableReadEpoch).toBe(message.payload.fetchId);
     }
   });
@@ -184,7 +183,6 @@ describe("TableView persisted state recovery", () => {
       fireEvent.change(screen.getByLabelText("name filter value"), {
         target: { value },
       });
-      // Persisting page 1 must not cause an early live read with old filters.
       expect(fetches()).toHaveLength(0);
     }
     const draft = nullFilter
@@ -209,7 +207,6 @@ describe("TableView persisted state recovery", () => {
       expect(fetches()).toHaveLength(1);
       expect(oldRead).toMatchObject({ page: 1, filters: expectedFilters });
     }
-    // Displayed rows/page still belong to the old read, not the saved intent.
     expect(screen.getByText("Page 3 of 4")).toBeTruthy();
     first.unmount();
     clearPostedMessages();
@@ -383,8 +380,6 @@ describe("TableView persisted state recovery", () => {
     act(() => dispatchIncomingMessage("tableConnectionInvalidated", {}));
     const invalidationEpoch = persisted().tableReadEpoch as number;
     expect(invalidationEpoch).toBeGreaterThan(old.fetchId);
-    // A committed dataset is no longer covered by the abandoned read's overlay.
-    // Before the first dataset, the fullscreen placeholder waits for new metadata.
     if (committed)
       expect(
         screen.queryByRole("status", { name: "Loading data..." }),
@@ -469,7 +464,6 @@ describe("TableView persisted state recovery", () => {
         mutation: { kind: "apply", unknown: true },
       },
     });
-    // Only an explicit user Refresh may verify this restored fence.
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     expect(fetches()).toHaveLength(3);
     commit(lastFetch().fetchId);
@@ -514,7 +508,6 @@ describe("TableView persisted state recovery", () => {
     });
     first.unmount();
 
-    // Fresh API and JSON state model a webview reload as well as a React remount.
     window.__vscode = {
       postMessage: vi.fn(),
       getState: vi.fn(),
@@ -552,7 +545,6 @@ describe("TableView persisted state recovery", () => {
     ).toBeTruthy();
     expect(isButtonDisabled("Apply Changes")).toBe(true);
 
-    // An uncorrelated legacy response must not verify a mutation either.
     act(() => {
       dispatchIncomingMessage("tableData", {
         rows: [{ id: 92, name: "UNCORRELATED READ" }],
@@ -596,7 +588,6 @@ describe("TableView persisted state recovery", () => {
     });
     if (currentType === "tableError") {
       expect(screen.getByText("CURRENT READ ERROR")).toBeTruthy();
-      // A failed current response is terminal; its late success cannot verify.
       act(() => {
         dispatchIncomingMessage("tableData", {
           fetchId: current.fetchId,

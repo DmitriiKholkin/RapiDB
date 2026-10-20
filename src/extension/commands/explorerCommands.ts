@@ -19,18 +19,12 @@ import { logErrorWithContext } from "../utils/errorHandling";
 import { isOpenDdlSupportedForNode } from "../utils/openDdlEligibility";
 import { resolveConnectionId } from "../utils/resolveConnectionId";
 
-/**
- * Context required for explorer commands.
- */
 export interface ExplorerCommandContext {
   readonly context: vscode.ExtensionContext;
   readonly connectionManager: ConnectionManager;
   readonly refresh: () => void;
 }
 
-/**
- * Reads database and schema from a node, defaulting to empty strings.
- */
 function readNodeLocation(node: RapiDBNode): {
   database: string;
   schema: string;
@@ -41,9 +35,6 @@ function readNodeLocation(node: RapiDBNode): {
   };
 }
 
-/**
- * Returns the default DDL presentation options.
- */
 function getOpenDdlPresentation(): {
   formatOnOpen: boolean;
   editorLanguage?: QueryEditorLanguage;
@@ -53,11 +44,6 @@ function getOpenDdlPresentation(): {
   };
 }
 
-/**
- * Ensures a connection is ready, connecting if necessary.
- *
- * @returns true if connected, false if connection failed
- */
 async function ensureConnectionReady(
   connectionManager: ConnectionManager,
   connectionId: string,
@@ -86,9 +72,6 @@ async function ensureConnectionReady(
   }
 }
 
-/**
- * Opens DDL in a query panel with the specified presentation options.
- */
 function openDdlInQueryPanel(
   context: vscode.ExtensionContext,
   connectionManager: ConnectionManager,
@@ -123,17 +106,6 @@ function openDdlInQueryPanel(
   );
 }
 
-/**
- * Registers all explorer-related commands.
- *
- * Commands:
- * - rapidb.newQuery: Open a new query editor
- * - rapidb.openTableData: Open table data viewer
- * - rapidb.showDDL: Show DDL for an object
- * - rapidb.copyNodeName: Copy node name to clipboard
- * - rapidb.openErd: Open ERD viewer
- * - rapidb.openRoutine: Open routine definition
- */
 export function registerExplorerCommands(
   ctx: ExplorerCommandContext,
   registerCommand: <TArgs extends unknown[]>(
@@ -143,7 +115,6 @@ export function registerExplorerCommands(
 ): void {
   const { context, connectionManager, refresh } = ctx;
 
-  // ─── New Query ─────────────────────────────────────────────────────
   registerCommand(CMD.newQuery, async (node?: RapiDBNode) => {
     const connectionId = await resolveConnectionId(node, connectionManager);
     if (!connectionId) {
@@ -170,7 +141,6 @@ export function registerExplorerCommands(
     );
   });
 
-  // ─── Open Table Data ───────────────────────────────────────────────
   registerCommand(CMD.openTableData, (node?: RapiDBNode) => {
     if (!node?.connectionId || !node.objectName) {
       return;
@@ -194,7 +164,6 @@ export function registerExplorerCommands(
     );
   });
 
-  // ─── Show DDL ──────────────────────────────────────────────────────
   registerCommand(CMD.showDDL, async (node?: RapiDBNode) => {
     if (!node?.connectionId) {
       vscode.window.showWarningMessage(
@@ -357,7 +326,6 @@ export function registerExplorerCommands(
     }
   });
 
-  // ─── Copy Node Name ────────────────────────────────────────────────
   registerCommand(CMD.copyNodeName, async (node?: RapiDBNode) => {
     const name =
       node?.objectName &&
@@ -371,7 +339,6 @@ export function registerExplorerCommands(
     }
   });
 
-  // ─── Open ERD ──────────────────────────────────────────────────────
   registerCommand(CMD.openErd, async (node?: RapiDBNode) => {
     const connectionId = await resolveConnectionId(node, connectionManager);
     if (!connectionId) {
@@ -402,7 +369,6 @@ export function registerExplorerCommands(
     });
   });
 
-  // ─── Open Routine ──────────────────────────────────────────────────
   registerCommand(CMD.openRoutine, async (node?: RapiDBNode) => {
     if (!node?.connectionId || !node.objectName) {
       return;

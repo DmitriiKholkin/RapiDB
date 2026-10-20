@@ -1,10 +1,3 @@
-/**
- * Connection form state management hook.
- *
- * Encapsulates all useState calls, derived state computation, and
- * the `buildPayload` function. This keeps the view component thin
- * and the business logic independently testable.
- */
 import { useCallback, useMemo, useState } from "react";
 import type {
   ConnectionSshAuthMethod,
@@ -26,10 +19,7 @@ import type {
   ConnectionFormSubmission,
 } from "../../../shared/webviewContracts";
 
-// ─── Form State Shape ───────────────────────────────────────────────────────
-
 export interface ConnectionFormState {
-  // Identity
   name: string;
   setName: (v: string) => void;
   nameError: string;
@@ -37,7 +27,6 @@ export interface ConnectionFormState {
   color: string;
   setColor: (v: string) => void;
 
-  // Type & connection
   type: ConnectionType;
   handleTypeChange: (nextType: ConnectionType) => void;
   host: string;
@@ -59,15 +48,12 @@ export interface ConnectionFormState {
   connectionReadOnly: boolean;
   setConnectionReadOnly: (v: boolean) => void;
 
-  // Oracle
   oracleServiceName: string;
   setOracleServiceName: (v: string) => void;
 
-  // MongoDB
   mongoConnectionUri: string;
   setMongoConnectionUri: (v: string) => void;
 
-  // Elasticsearch
   elasticsearchEndpoint: string;
   setElasticsearchEndpoint: (v: string) => void;
   elasticsearchApiKey: string;
@@ -75,7 +61,6 @@ export interface ConnectionFormState {
   elasticsearchCloudId: string;
   setElasticsearchCloudId: (v: string) => void;
 
-  // AWS / DynamoDB
   awsRegion: string;
   setAwsRegion: (v: string) => void;
   awsAccessKeyId: string;
@@ -89,7 +74,6 @@ export interface ConnectionFormState {
   dynamoEndpoint: string;
   setDynamoEndpoint: (v: string) => void;
 
-  // SSH
   sshEnabled: boolean;
   setSshEnabled: (v: boolean) => void;
   sshHost: string;
@@ -111,7 +95,6 @@ export interface ConnectionFormState {
   sshHostFingerprintSha256: string;
   setSshHostFingerprintSha256: (v: string) => void;
 
-  // TLS
   tlsMode: ConnectionTlsMode;
   setTlsMode: (v: ConnectionTlsMode) => void;
   tlsCaFilePath: string;
@@ -125,11 +108,9 @@ export interface ConnectionFormState {
   tlsServerNameOverride: string;
   setTlsServerNameOverride: (v: string) => void;
 
-  // Secret storage
   useSecretStorage: boolean;
   setUseSecretStorage: (v: boolean) => void;
 
-  // Test state
   testState: "idle" | "testing" | "ok" | "fail";
   setTestState: (v: "idle" | "testing" | "ok" | "fail") => void;
   testError: string;
@@ -137,8 +118,6 @@ export interface ConnectionFormState {
   saving: boolean;
   setSaving: (v: boolean) => void;
 }
-
-// ─── Derived State ──────────────────────────────────────────────────────────
 
 export interface ConnectionFormDerived {
   isEdit: boolean;
@@ -324,9 +303,6 @@ export function computeDerivedState(
   };
 }
 
-// ─── Payload Builder ────────────────────────────────────────────────────────
-
-/** Parse a port string, returning the default if empty/invalid, clamping to 1-65535. */
 function parsePort(raw: string, defaultPort: number): number {
   const trimmed = raw.trim();
   if (!trimmed) return defaultPort;
@@ -452,8 +428,6 @@ export function buildConnectionPayload(
   };
 }
 
-// ─── Hook ───────────────────────────────────────────────────────────────────
-
 function getDefaultColor(): string {
   if (
     typeof document !== "undefined" &&
@@ -463,8 +437,6 @@ function getDefaultColor(): string {
   }
   return "#ffffff";
 }
-
-// ─── Grouped State Shapes ────────────────────────────────────────────────────
 
 interface IdentityState {
   name: string;
@@ -527,8 +499,6 @@ interface UiState {
   nameError: string;
   saving: boolean;
 }
-
-// ─── Hook ───────────────────────────────────────────────────────────────────
 
 export function useConnectionFormState(
   existing: ConnectionFormExistingState | null,
@@ -599,8 +569,6 @@ export function useConnectionFormState(
     nameError: "",
     saving: false,
   });
-
-  // ─── Adapter Setters (preserve external API) ─────────────────────────────
 
   const setName = useCallback(
     (v: string) => setIdentity((s) => ({ ...s, name: v })),
@@ -802,8 +770,6 @@ export function useConnectionFormState(
     });
   }, []);
 
-  // ─── Assemble Flat State Object (same shape as ConnectionFormState) ────────
-
   const state: ConnectionFormState = {
     name: identity.name,
     setName,
@@ -897,14 +863,11 @@ export function useConnectionFormState(
 
   const derived = useMemo(
     () => computeDerivedState(state, existing),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    // biome-ignore lint/correctness/useExhaustiveDependencies: state changes every render intentionally
     [existing, state],
   );
 
   const buildPayload = useCallback(
     () => buildConnectionPayload(state, derived, existing),
-    // biome-ignore lint/correctness/useExhaustiveDependencies: state changes every render intentionally
     [state, derived, existing],
   );
 

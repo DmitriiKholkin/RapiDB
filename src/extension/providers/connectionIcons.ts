@@ -1,10 +1,3 @@
-/**
- * Connection Icons — SVG-иконки для отображения состояния соединений.
- *
- * Извлечены из ConnectionProvider для соблюдения SRP и уменьшения размера файла.
- * Иконки кешируются по цвету и состоянию для оптимальной производительности.
- */
-
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -12,10 +5,6 @@ import * as vscode from "vscode";
 
 const coloredIconCache = new Map<string, vscode.Uri>();
 
-/**
- * Создаёт SVG-иконку сервера с указанным цветом и состоянием.
- * Результат кешируется для повторного использования.
- */
 export function getColoredServerIconUri(
   hexColor: string,
   isConnected: boolean,

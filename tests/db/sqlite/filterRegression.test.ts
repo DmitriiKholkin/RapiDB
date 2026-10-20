@@ -161,7 +161,6 @@ describe.each([
     ] as const) {
       expect(await ids("amount", "eq", value)).toEqual(expected);
     }
-    // DECIMAL/NUMERIC affinity is not arbitrary-precision decimal storage.
     expect(
       (
         await driver.query(
@@ -250,8 +249,6 @@ describe.each([
       );
     }
     expect(await ids("event", "eq", validInput)).toEqual([2, 10]);
-    // Nonnumeric raw text yields NULL in temporal functions, but numeric raw
-    // values (row 1) are stored as integers and interpreted as Julian days.
     expect(await ids("event", "neq", validInput)).toEqual([1, 11]);
     expect(await ids("event", "is_null")).toEqual([9]);
     expect(await ids("event", "is_not_null")).toEqual([
@@ -298,8 +295,6 @@ describe.each([
     const values = [
       ...invalidValues,
       valid,
-      // SQLite rolls impossible calendar dates into these valid dates.
-      // Raw equality must not match their normalized counterparts.
       "2026-05-01 12:34:56",
       "2026-03-01 12:34:56",
       "2024-03-01 12:34:56",
@@ -354,7 +349,6 @@ describe.each([
     ];
     for (const [index, [value, canonical]] of cases.entries()) {
       await driver.query("DELETE FROM items");
-      // DATETIME intentionally compares at SQLite's whole-second precision.
       await driver.query("INSERT INTO items VALUES (?, ?)", [
         index + 1,
         canonical,
@@ -408,8 +402,6 @@ describe.each([
       await driver.describeColumns("", "main", "items")
     ).find((column) => column.name === "event");
     if (!eventColumn) throw new Error("Expected event column");
-    // Contains is not exposed in temporal metadata; exercise its existing
-    // builder/execution path directly without changing the UI operator list.
     const contains = driver.buildFilterCondition(
       eventColumn,
       "like",

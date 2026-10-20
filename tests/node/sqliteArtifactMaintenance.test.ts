@@ -23,8 +23,6 @@ async function bootstrapFixture(
     size: options.size ?? bytes.length,
     browser_download_url: options.url ?? assetUrl,
   };
-  // Run the real maintenance logic with a fake fetch transport. No real network
-  // or manifest writes are possible in these bootstrap-boundary regressions.
   const program = `
     const urls = [];
     const bytes = Buffer.from(${JSON.stringify(bytes.toString("base64"))}, "base64");
