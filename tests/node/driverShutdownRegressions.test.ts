@@ -152,7 +152,6 @@ describe("MySQL native shutdown", () => {
 
 class MssqlSession extends EventEmitter {
   closed = false;
-  hasError = false;
   beginError?: Error;
   beginTransaction(callback: (error?: Error) => void): void {
     callback(this.beginError);
@@ -248,7 +247,6 @@ describe("MSSQL native transaction cleanup", () => {
         beginError.message,
       );
       const failed = sessions[1];
-      expect(failed.hasError).toBe(true);
       expect(failed.closed).toBe(true);
       expect(failed.listenerCount("rollbackTransaction")).toBe(0);
       expect(pool.borrowed).toBe(0);

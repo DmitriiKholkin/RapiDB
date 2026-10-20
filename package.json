@@ -792,7 +792,7 @@
     "better-sqlite3": "12.10.0",
     "monaco-editor": "0.53.0",
     "mongodb": "7.2.0",
-    "mssql": "12.5.5",
+    "mssql": "12.7.10",
     "mysql2": "3.24.4",
     "oracledb": "6.10.0",
     "pg": "8.21.0",
