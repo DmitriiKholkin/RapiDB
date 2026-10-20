@@ -17,6 +17,18 @@ describe("connection URI secret handling", () => {
     ["user:uri-secret@host/db", "host/db"],
     ["//user:uri-secret@host/db", "//host/db"],
     [
+      "mongodb://host/db?authMechanism=MONGODB-AWS&authMechanismProperties=AWS_SESSION_TOKEN%3ASESSION_SECRET&retryWrites=true",
+      "mongodb://host/db?authMechanism=MONGODB-AWS&retryWrites=true",
+    ],
+    [
+      "mongodb://host/db?auth%4dechanismProperties=AWS_SESSION_TOKEN%3ASESSION_SECRET",
+      "mongodb://host/db",
+    ],
+    [
+      "mongodb://host/db?AUTHMECHANISMPROPERTIES=AWS_SESSION_TOKEN%3ASESSION_SECRET",
+      "mongodb://host/db",
+    ],
+    [
       "mongodb://user:p%40%2F%3F%23%20ss@host1:27017,host2:27017/db?replicaSet=rs",
       "mongodb://host1:27017,host2:27017/db?replicaSet=rs",
     ],
@@ -206,6 +218,7 @@ describe("connection URI secret handling", () => {
     "passphrase",
     "PROXYPASSWORD",
     "tlsCertificateKeyFile%50assword",
+    "authMechanismProperties",
   ])("redacts supported MongoDB URI credential %s and preserves it across resaves", (key) => {
     const uri = `mongodb://db.internal/app?replicaSet=rs&${key}=uri-secret&tls=true`;
     const redacted = "mongodb://db.internal/app?replicaSet=rs&tls=true";

@@ -2,6 +2,7 @@ import * as http from "node:http";
 import * as https from "node:https";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionConfig } from "../../src/extension/connectionManagerModels";
+import type { ConnectionStoreMutation } from "../../src/extension/connectionManagerStore";
 import type { DriverTimeoutSettingsProvider } from "../../src/extension/dbDrivers/timeout";
 import type {
   ColumnMeta,
@@ -482,7 +483,222 @@ beforeEach(() => {
   vi.resetModules();
 });
 
+class NotifyingConnectionManagerStore extends FakeConnectionManagerStore {
+  beforeNotify?: () => void;
+  override async mutateConnections<T>(
+    mutate: (
+      connections: ConnectionConfig[],
+    ) => ConnectionStoreMutation<T> | Promise<ConnectionStoreMutation<T>>,
+  ): Promise<T> {
+    const result = await super.mutateConnections(mutate);
+    this.beforeNotify?.();
+    this.fireConfigurationChange("rapidb.connections");
+    return result;
+  }
+}
+
 describe("ConnectionManager", () => {
+  it("does not disconnect for presentation-only, reordered or unrelated settings changes", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const config: ConnectionConfig = {
+      id: "external-metadata",
+      name: "Primary",
+      type: "pg",
+      host: "db.internal",
+      database: "app",
+      username: "admin",
+    };
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([config]);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo(config.id);
+    const driver = manager.getDriver(config.id);
+    // An unrelated event used to discard the only cached settings snapshot.
+    store.fireConfigurationChange("rapidb.queryRowLimit");
+    store.setConnections([
+      {
+        color: "blue",
+        folder: "Production",
+        ...Object.fromEntries(Object.entries(config).reverse()),
+        name: "Renamed",
+      } as ConnectionConfig,
+      { id: "other", name: "Other", type: "mysql", host: "other.internal" },
+    ]);
+    store.fireConfigurationChange("rapidb.connections");
+    expect(manager.getDriver(config.id)).toBe(driver);
+    expect(manager.isConnected(config.id)).toBe(true);
+    store.setConnections([{ ...config, host: "changed.internal" }]);
+    store.fireConfigurationChange("rapidb.connections");
+    expect(manager.getDriver(config.id)).toBeUndefined();
+    await manager.dispose();
+  });
+
+  it("fences an externally changed pending connection even if its old driver succeeds late", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const config: ConnectionConfig = {
+      id: "external-pending",
+      name: "Primary",
+      type: "pg",
+      host: "old.internal",
+      database: "app",
+      username: "admin",
+    };
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([config]);
+    const entered = createDeferred<void>();
+    const finish = createDeferred<void>();
+    driverBehaviors.set(config.id, {
+      connectImpl: () => {
+        entered.resolve();
+        return finish.promise;
+      },
+    });
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    const pending = manager.connectTo(config.id);
+    await entered.promise;
+    store.setConnections([{ ...config, host: "new.internal" }]);
+    store.fireConfigurationChange("rapidb.connections");
+    finish.resolve();
+    await pending;
+    await manager.disconnectFrom(config.id);
+    expect(manager.getDriver(config.id)).toBeUndefined();
+    expect(manager.isConnecting(config.id)).toBe(false);
+    await manager.connectTo(config.id, "explicit");
+    expect((driverInstances.at(-1)?.config as ConnectionConfig).host).toBe(
+      "new.internal",
+    );
+    await manager.dispose();
+  });
+
+  it.each([
+    false,
+    true,
+  ])("handles owned credential migration and TOFU pin events without hiding a coalesced target edit (%s)", async (editTarget) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const config = createSshPgConfig("notifying-migration");
+    config.password = "db-password";
+    config.ssh = {
+      ...config.ssh,
+      hostVerificationMode: "trustOnFirstUse",
+      hostFingerprintSha256: undefined,
+    };
+    const store = new NotifyingConnectionManagerStore();
+    store.setConnections([config]);
+    const fingerprint = "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/";
+    if (editTarget) {
+      store.beforeNotify = () => {
+        const current = store.getConnections()[0];
+        if (current.ssh?.hostFingerprintSha256) {
+          store.setConnections([{ ...current, host: "different-db.internal" }]);
+        }
+      };
+    }
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+      {
+        createSshRuntime: async () => ({
+          transport: {
+            kind: "tcpForward",
+            localHost: "127.0.0.1",
+            localPort: 15432,
+            remoteHost: "db.internal",
+            remotePort: 5432,
+          },
+          verifiedFingerprintSha256: fingerprint,
+          dispose: vi.fn(async () => undefined),
+        }),
+      },
+    );
+    await manager.connectTo(config.id);
+    if (editTarget) {
+      expect(manager.getDriver(config.id)).toBeUndefined();
+      expect(manager.isConnected(config.id)).toBe(false);
+      await manager.dispose();
+      return;
+    }
+    expect(manager.isConnected(config.id)).toBe(true);
+    expect(store.getConnections()[0].password).toBeUndefined();
+    expect(store.getConnections()[0].ssh?.hostFingerprintSha256).toBe(
+      fingerprint,
+    );
+    // A subsequent unowned pin edit must still invalidate the established session.
+    store.setConnections([
+      {
+        ...store.getConnections()[0],
+        ssh: {
+          ...store.getConnections()[0].ssh,
+          hostFingerprintSha256: "SHA256:Changed",
+        },
+      },
+    ]);
+    store.fireConfigurationChange("rapidb.connections");
+    expect(manager.getDriver(config.id)).toBeUndefined();
+    await manager.dispose();
+  });
+
+  it.each([
+    "host",
+    "database",
+    "tls",
+    "readOnly",
+    "removed",
+  ] as const)("invalidates an active session immediately after an external %s change", async (field) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const config: ConnectionConfig = {
+      id: "external-change",
+      name: "Production",
+      type: "pg",
+      host: "production.internal",
+      database: "app",
+      username: "admin",
+    };
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([config]);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo(config.id);
+    const oldDriver = manager.getDriver(config.id);
+    const invalidated = vi.fn();
+    manager.onDidInvalidateConnectionMetadata(invalidated);
+    const cleanup = createDeferred<void>();
+    driverBehaviors.set(config.id, { disconnectImpl: () => cleanup.promise });
+    const next = { ...config };
+    if (field === "host") next.host = "staging.internal";
+    if (field === "database") next.database = "other";
+    if (field === "tls") next.tls = { mode: "requireVerifyFull" };
+    if (field === "readOnly") next.readOnly = true;
+    store.setConnections(field === "removed" ? [] : [next]);
+    store.fireConfigurationChange("rapidb.connections");
+    // A slow disconnect must not leave the old target available to new work.
+    expect(manager.getDriver(config.id)).toBeUndefined();
+    expect(manager.isConnected(config.id)).toBe(false);
+    expect(invalidated).toHaveBeenCalledWith(config.id);
+    cleanup.resolve();
+    await manager.disconnectFrom(config.id);
+    if (field !== "removed") {
+      await manager.connectTo(config.id, "explicit");
+      expect(manager.getDriver(config.id)).not.toBe(oldDriver);
+    }
+    await manager.dispose();
+  });
+
   it.each(
     MONGO_QUERY_ERROR_URIS,
   )("redacts malformed query-secret errors through the real Mongo testConnection route: %s", async (uri) => {
@@ -3871,7 +4087,22 @@ describe("ConnectionManager", () => {
     expect(dispose).toHaveBeenCalledTimes(1);
   });
 
-  it("migrates plaintext credential-bearing connection URI to Secret Storage on connect", async () => {
+  it.each([
+    {
+      type: "redis" as const,
+      uri: "redis://user:pass@localhost:6379",
+      safe: "redis://localhost:6379",
+    },
+    {
+      type: "mongodb" as const,
+      uri: "mongodb://host/app?authMechanism=MONGODB-AWS&authMechanismProperties=AWS_SESSION_TOKEN%3ASESSION_SECRET",
+      safe: "mongodb://host/app?authMechanism=MONGODB-AWS",
+    },
+  ])("migrates plaintext credential-bearing $type URI to Secret Storage on connect", async ({
+    type,
+    uri,
+    safe,
+  }) => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
     );
@@ -3880,9 +4111,9 @@ describe("ConnectionManager", () => {
     store.setConnections([
       {
         id: "conn-redis-legacy",
-        name: "Legacy Redis",
-        type: "redis",
-        connectionUri: "redis://user:pass@localhost:6379",
+        name: "Legacy URI",
+        type,
+        connectionUri: uri,
       },
     ]);
 
@@ -3899,16 +4130,17 @@ describe("ConnectionManager", () => {
     expect(persisted).toMatchObject({
       id: "conn-redis-legacy",
       useSecretStorage: true,
-      connectionUri: "redis://localhost:6379",
+      connectionUri: safe,
     });
 
     const secret = await store.getSecret("conn-redis-legacy");
-    expect(secret).toContain("redis://user:pass@localhost:6379");
+    expect(secret).toContain(uri);
 
     expect(driverInstances[0]?.config).toMatchObject({
       id: "conn-redis-legacy",
-      connectionUri: "redis://user:pass@localhost:6379",
+      connectionUri: uri,
     });
+    await manager.dispose();
   });
 
   it("does not overwrite a newer saveConnection while background secret migration is in-flight", async () => {

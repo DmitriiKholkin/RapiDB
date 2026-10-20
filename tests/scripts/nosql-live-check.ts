@@ -850,13 +850,34 @@ async function verifyElasticsearchDriver(
         },
       },
     });
-    await driver.updateRows({
+    const readInsertedRow = async () => {
+      const current = await driver.readTablePage({
+        database: "default",
+        schema: "indices",
+        table: "users",
+        page: 1,
+        pageSize: 10,
+        filters: [],
+        sort: { column: "_id", direction: "asc" },
+        skipCount: false,
+      });
+      const row = findRow(current, (entry) => entry._id === "user-3");
+      const primaryKeys = Object.fromEntries(
+        current.columns
+          .filter((column) => column.isPrimaryKey)
+          .map((column) => [column.name, row[column.name]]),
+      );
+      assert.equal(typeof primaryKeys._identity, "string");
+      return { row, primaryKeys };
+    };
+    const inserted = await readInsertedRow();
+    const update = await driver.updateRows({
       database: "default",
       schema: "indices",
       table: "users",
       updates: [
         {
-          primaryKeys: { _id: "user-3" },
+          primaryKeys: inserted.primaryKeys,
           changes: {
             _source: {
               email: "charlie+updated@example.com",
@@ -867,12 +888,21 @@ async function verifyElasticsearchDriver(
         },
       ],
     });
-    await driver.deleteRows({
+    assert.equal(update.affectedRows, 1);
+    // UPDATE advances Elasticsearch's sequence number: DELETE needs a fresh
+    // signed identity, just as it does after the viewer refreshes its data.
+    const updated = await readInsertedRow();
+    assert.equal(
+      JSON.parse(String(updated.row._source)).email,
+      "charlie+updated@example.com",
+    );
+    const deletion = await driver.deleteRows({
       database: "default",
       schema: "indices",
       table: "users",
-      primaryKeyValuesList: [{ _id: "user-3" }],
+      primaryKeyValuesList: [updated.primaryKeys],
     });
+    assert.equal(deletion.affectedRows, 1);
 
     const verifyClient = createElasticsearchAdminClient();
     try {

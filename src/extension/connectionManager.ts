@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import * as vscode from "vscode";
 import {
   isConnectionTlsEnabled,
@@ -134,6 +135,48 @@ interface ConnectionSchemaCacheEntry extends SchemaSnapshotState {
 }
 
 const CONNECTION_ROOT_SCOPE: ExplorerSchemaScope = { kind: "connectionRoot" };
+
+function connectionSessionSettings(config: StoredConnectionConfig) {
+  const {
+    name: _name,
+    folder: _folder,
+    color: _color,
+    useSecretStorage: _storage,
+    ...settings
+  } = canonicalizeOracleServiceName({
+    ...config,
+    username: config.username ?? config.user,
+  });
+  return JSON.parse(JSON.stringify(settings));
+}
+
+function connectionSessionChanged(
+  previous: ConnectionConfig,
+  next: ConnectionConfig,
+): boolean {
+  const before = connectionSessionSettings(previous);
+  const after = connectionSessionSettings(next);
+  if (isDeepStrictEqual(before, after)) return false;
+  // Moving existing credentials into Secret Storage does not change the session.
+  if (next.useSecretStorage !== true) return true;
+  try {
+    const sanitizedAfter = connectionSessionSettings(
+      sanitizeConnectionConfigForResponse(next),
+    );
+    return !(
+      isDeepStrictEqual(after, sanitizedAfter) &&
+      isDeepStrictEqual(
+        connectionSessionSettings(
+          sanitizeConnectionConfigForResponse(previous),
+        ),
+        sanitizedAfter,
+      )
+    );
+  } catch {
+    // Invalid edited credentials must invalidate the old session as well.
+    return true;
+  }
+}
 
 export function createConnectionRootSchemaScope(): ExplorerSchemaScope {
   return { kind: "connectionRoot" };
@@ -806,6 +849,11 @@ export class ConnectionManager
   private _bookmarkMutationTail: Promise<void> = Promise.resolve();
   private _pendingSecretMigration: Promise<void> | null = null;
   private _disposed = false;
+  private lastKnownConnections: ConnectionConfig[] = [];
+  private readonly pendingTrustedFingerprintWrites = new Map<
+    string,
+    ConnectionConfig
+  >();
   constructor(
     context: vscode.ExtensionContext,
     store: ConnectionManagerStore = new VSCodeConnectionManagerStore(context),
@@ -825,8 +873,41 @@ export class ConnectionManager
     this.onDidChangeSchemaState = this._onDidChangeSchemaState.event;
     this.onDidRefreshSchemas = this._onDidRefreshSchemas.event;
     this.store.onDidChangeConfiguration(async (e) => {
+      if (this._disposed) return;
+      const previous = this.lastKnownConnections;
       this._connectionsCache = null;
       if (e.affectsConfiguration("rapidb.connections")) {
+        const current = new Map(
+          this.getConnections().map((config) => [config.id, config]),
+        );
+        for (const before of previous) {
+          const next = current.get(before.id);
+          const expected = this.pendingTrustedFingerprintWrites.get(before.id);
+          // Only the verified pin is owned by the handshake. A coalesced edit
+          // to the database target or other SSH settings must still fence it.
+          if (
+            next &&
+            expected &&
+            !connectionSessionChanged(
+              {
+                ...before,
+                ssh: {
+                  ...before.ssh,
+                  hostFingerprintSha256: expected.ssh?.hostFingerprintSha256,
+                },
+              },
+              next,
+            )
+          )
+            continue;
+          if (next && !connectionSessionChanged(before, next)) continue;
+          this.invalidateDriverStaticMetadata(before.id);
+          if (this.driverMap.has(before.id) || this.isConnecting(before.id)) {
+            void this.disconnectFrom(before.id).catch((error) => {
+              logger.error("Failed to disconnect changed connection", error);
+            });
+          }
+        }
         this._onDidChangeConnections.fire();
       }
       if (e.affectsConfiguration("rapidb.queryHistoryLimit")) {
@@ -1078,6 +1159,7 @@ export class ConnectionManager
         username: c.username ?? c.user,
       }),
     }));
+    this.lastKnownConnections = structuredClone(this._connectionsCache);
     return this._connectionsCache;
   }
   private invalidateDriverStaticMetadata(connectionId: string): void {
@@ -1792,40 +1874,53 @@ export class ConnectionManager
     const verifiedFingerprint =
       normalizeSshFingerprintSha256(fingerprintSha256);
     const connectionId = config.id;
-    const changed = await this.store.mutateConnections((connections) => {
-      signal.throwIfAborted();
-      const index = connections.findIndex((c) => c.id === connectionId);
-      const connection = connections[index];
-      const currentSsh = connection?.ssh;
-      const currentFingerprint = currentSsh?.hostFingerprintSha256
-        ? normalizeSshFingerprintSha256(currentSsh.hostFingerprintSha256)
-        : undefined;
+    let expectedWrite: ConnectionConfig | undefined;
+    let changed: boolean;
+    try {
+      changed = await this.store.mutateConnections((connections) => {
+        signal.throwIfAborted();
+        const index = connections.findIndex((c) => c.id === connectionId);
+        const connection = connections[index];
+        const currentSsh = connection?.ssh;
+        const currentFingerprint = currentSsh?.hostFingerprintSha256
+          ? normalizeSshFingerprintSha256(currentSsh.hostFingerprintSha256)
+          : undefined;
+        if (
+          currentSsh?.hostVerificationMode !== "trustOnFirstUse" ||
+          currentSsh.host?.trim() !== ssh.host?.trim() ||
+          (currentSsh.port ?? 22) !== (ssh.port ?? 22) ||
+          currentSsh.username?.trim() !== ssh.username?.trim() ||
+          (ssh.hostFingerprintSha256?.trim() &&
+            !currentSsh.hostFingerprintSha256?.trim()) ||
+          (currentSsh.hostFingerprintSha256?.trim() &&
+            currentFingerprint !== verifiedFingerprint)
+        ) {
+          throw new Error(
+            "[RapiDB] SSH trust settings changed during connection setup. Please retry.",
+          );
+        }
+        if (currentFingerprint === verifiedFingerprint) {
+          return { result: false };
+        }
+        const next = [...connections];
+        next[index] = {
+          ...connection,
+          ssh: { ...currentSsh, hostFingerprintSha256: fingerprintSha256 },
+        };
+        expectedWrite = next[index];
+        this.pendingTrustedFingerprintWrites.set(connectionId, expectedWrite);
+        return { connections: next, result: true };
+      });
+    } finally {
       if (
-        currentSsh?.hostVerificationMode !== "trustOnFirstUse" ||
-        currentSsh.host?.trim() !== ssh.host?.trim() ||
-        (currentSsh.port ?? 22) !== (ssh.port ?? 22) ||
-        currentSsh.username?.trim() !== ssh.username?.trim() ||
-        (ssh.hostFingerprintSha256?.trim() &&
-          !currentSsh.hostFingerprintSha256?.trim()) ||
-        (currentSsh.hostFingerprintSha256?.trim() &&
-          currentFingerprint !== verifiedFingerprint)
+        this.pendingTrustedFingerprintWrites.get(connectionId) === expectedWrite
       ) {
-        throw new Error(
-          "[RapiDB] SSH trust settings changed during connection setup. Please retry.",
-        );
+        this.pendingTrustedFingerprintWrites.delete(connectionId);
       }
-      if (currentFingerprint === verifiedFingerprint) {
-        return { result: false };
-      }
-      const next = [...connections];
-      next[index] = {
-        ...connection,
-        ssh: { ...currentSsh, hostFingerprintSha256: fingerprintSha256 },
-      };
-      return { connections: next, result: true };
-    });
+    }
     if (!changed) return;
     this._connectionsCache = null;
+    this.getConnections();
     this.invalidateDriverStaticMetadata(connectionId);
     this._onDidChangeConnections.fire();
   }
@@ -2082,6 +2177,7 @@ export class ConnectionManager
       rejectDisconnect = reject;
     });
     this._disconnectingMap.set(id, disconnect);
+    this._onDidInvalidateConnectionMetadata.fire(id);
     void (async () => {
       try {
         this._nextConnectionEpoch(id);
@@ -2105,17 +2201,17 @@ export class ConnectionManager
     return disconnect;
   }
   isConnected(id: string): boolean {
-    return this.driverMap.get(id)?.isConnected() ?? false;
+    return this.getDriver(id)?.isConnected() ?? false;
   }
   getConnectedCount(): number {
-    return [...this.driverMap.values()].filter((driver) => driver.isConnected())
+    return [...this.driverMap.keys()].filter((id) => this.isConnected(id))
       .length;
   }
   isConnecting(id: string): boolean {
     return this._connectingMap.has(id);
   }
   getDriver(id: string): IDBDriver | undefined {
-    return this.driverMap.get(id);
+    return this._disconnectingMap.has(id) ? undefined : this.driverMap.get(id);
   }
   getAutomaticReconnectBlockReason(id: string): string | undefined {
     const reason = this.driverMap.get(id)?.getAutomaticReconnectBlockReason?.();
@@ -3496,6 +3592,8 @@ export class ConnectionManager
     this.sshRuntimeMap.clear();
     this._connectingMap.clear();
     this._connectionsCache = null;
+    this.lastKnownConnections = [];
+    this.pendingTrustedFingerprintWrites.clear();
     this._driverStaticMetadataCache.clear();
     this._schemaCacheMap.clear();
     this._schemaGenerationMap.clear();

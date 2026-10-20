@@ -30,6 +30,10 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
   it.each([
     ["user:uri-secret@host/db", "host/db"],
     ["//user:uri-secret@host/db", "//host/db"],
+    [
+      "mongodb://host/db?authMechanism=MONGODB-AWS&authMechanismProperties=AWS_SESSION_TOKEN%3ASESSION_SECRET&retryWrites=true",
+      "mongodb://host/db?authMechanism=MONGODB-AWS&retryWrites=true",
+    ],
   ])("protects nonstandard URI credentials through save and edit: %s", async (connectionUri, redacted) => {
     for (const useSecretStorage of [undefined, true]) {
       configuration.connections = [];

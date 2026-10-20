@@ -340,6 +340,36 @@ export class QueryPanelController {
       return;
     }
 
+    // Connecting may prompt for credentials or wait on a concurrent attempt.
+    // Never carry pre-connect permissions into the newly available session.
+    const executionConnection =
+      this.connectionManager.getConnection(connectionId);
+    const executionDecision = decideReadOnlyQueryExecution(
+      this.connectionManager,
+      connectionId,
+      queryText,
+    );
+    const executionBlock =
+      executionConnection?.type !== connectionType
+        ? "[RapiDB] Connection type changed while preparing the query. Execute it again."
+        : (this.connectionManager.getAutomaticReconnectBlockReason?.(
+            connectionId,
+          ) ??
+          (!executionDecision.allowed
+            ? executionDecision.reason
+            : executionConnection?.readOnly === true &&
+                executionConnection.type === "mssql"
+              ? MSSQL_READ_ONLY_ENFORCEMENT_MESSAGE
+              : undefined));
+    if (executionBlock) {
+      const active = this.activeQueryExecutions.get(connectionId);
+      if (active?.requestToken === requestToken) {
+        this.activeQueryExecutions.delete(connectionId);
+      }
+      this.postQueryError(executionBlock, requestToken, resultIdentity);
+      return;
+    }
+
     this.activeQueryExecutions.set(
       connectionId,
       this.createQueryExecutionHandle(
@@ -381,7 +411,7 @@ export class QueryPanelController {
       const result = await driver.query(cappedQueryText, undefined, {
         requestToken,
         ...(driverBounded ? { hardCap: hardCapProbeLimit } : {}),
-        ...(connection?.readOnly === true ? { readOnly: true } : {}),
+        ...(executionConnection?.readOnly === true ? { readOnly: true } : {}),
       });
       const activeExecution = this.activeQueryExecutions.get(connectionId);
       if (activeExecution?.requestToken === requestToken) {

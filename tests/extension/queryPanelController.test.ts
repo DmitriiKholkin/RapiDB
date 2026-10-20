@@ -1799,6 +1799,68 @@ describe("QueryPanelController", () => {
     });
   });
 
+  it.each([
+    { type: "pg", queryText: "DELETE FROM accounts", blocked: true },
+    { type: "pg", queryText: "SELECT 1", blocked: false },
+    { type: "mysql", queryText: "SELECT 1", blocked: false },
+    { type: "mssql", queryText: "SELECT 1", blocked: true },
+    { type: "oracle", queryText: "SELECT 1 FROM dual", blocked: true },
+  ])("rechecks $type read-only policy after connecting ($queryText)", async ({
+    type,
+    queryText,
+    blocked,
+  }) => {
+    let connection = { id: "active", name: "Primary", type, readOnly: false };
+    const query = vi.fn(async () => ({ columns: [], rows: [], rowCount: 0 }));
+    const manager = {
+      getConnection: () => connection,
+      isConnected: () => false,
+      connectTo: vi.fn(async () => {
+        connection = { ...connection, readOnly: true };
+      }),
+      getDriver: () => ({ query }),
+      getDriverCapabilities: () => ({
+        boundedQueryResults: true,
+        readOnlyQueryGuard: createSqlReadOnlyQueryGuard(),
+      }),
+      getQueryRowLimit: () => 100,
+      addToHistory: vi.fn(async () => undefined),
+      refreshSchemaCache: vi.fn(),
+    };
+    const view = {
+      getActiveConnectionId: () => "active",
+      getInitialConnectionId: () => "active",
+      getLastQueryResult: () => null,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    await new QueryPanelController(manager as never, view).handleMessage({
+      type: "executeQuery",
+      payload: { queryText },
+    });
+    if (blocked) {
+      expect(query).not.toHaveBeenCalled();
+      expect(manager.addToHistory).not.toHaveBeenCalled();
+      expect(view.postMessage).toHaveBeenCalledWith({
+        type: "queryResult",
+        payload: expect.objectContaining({
+          error: expect.stringMatching(/read.only/i),
+        }),
+      });
+    } else {
+      expect(query).toHaveBeenCalledWith(queryText, undefined, {
+        requestToken: 1,
+        hardCap: 101,
+        readOnly: true,
+      });
+    }
+  });
+
   it("blocks non-read queries on readonly connections before connect and history", async () => {
     const query = vi.fn(async () => ({
       columns: ["id"],
