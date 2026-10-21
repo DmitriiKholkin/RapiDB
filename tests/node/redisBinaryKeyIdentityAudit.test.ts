@@ -1,9 +1,11 @@
 import net from "node:net";
 import { createClient, RESP_TYPES } from "redis";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ConnectionManager } from "../../src/extension/connectionManager";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
 import type { DriverTablePageRequest } from "../../src/extension/dbDrivers/types";
 import { loadDatabaseScope } from "../../src/extension/schema/schemaLoaders";
+import { TableReadService } from "../../src/extension/table/tableReadService";
 import { logger } from "../../src/extension/utils/logger";
 
 const binaryKey = Buffer.concat([Buffer.from("audit:"), Buffer.from([0xff])]);
@@ -37,6 +39,7 @@ class BinaryKeyServer {
     { key: validKey, value: Buffer.from("VALID") },
   ];
   scanPages?: Buffer[][];
+  onScan?: () => Promise<void>;
   readonly server = net.createServer((socket) => {
     this.sockets.add(socket);
     socket.on("close", () => this.sockets.delete(socket));
@@ -66,14 +69,19 @@ class BinaryKeyServer {
               this.scanPages && index + 1 < this.scanPages.length
                 ? String(index + 1)
                 : "0";
-            socket.write(
-              Buffer.concat([
-                Buffer.from("*2\r\n"),
-                bulk(cursor),
-                Buffer.from(`*${keys.length}\r\n`),
-                ...keys.map(bulk),
-              ]),
-            );
+            const reply = Buffer.concat([
+              Buffer.from("*2\r\n"),
+              bulk(cursor),
+              Buffer.from(`*${keys.length}\r\n`),
+              ...keys.map(bulk),
+            ]);
+            if (this.onScan) {
+              void this.onScan().then(() => {
+                if (!socket.destroyed) socket.write(reply);
+              });
+            } else {
+              socket.write(reply);
+            }
             break;
           }
           case "TYPE":
@@ -156,6 +164,139 @@ afterEach(async () => {
 });
 
 describe("Redis binary key identity: real node-redis transport", () => {
+  it("aborts an in-flight SCAN through node-redis without reading late values or poisoning a retry", async () => {
+    server.entries = [{ key: validKey, value: Buffer.from("VALID") }];
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const scanning = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    server.onScan = () => {
+      entered();
+      return gate;
+    };
+    const abort = new AbortController();
+    const pending = driver.readTablePage({
+      ...pageRequest,
+      signal: abort.signal,
+    });
+    const rejected = expect(pending).rejects.toThrow(/cancel/i);
+    await scanning;
+    abort.abort(new Error("Read cancelled"));
+    try {
+      await rejected;
+      expect(
+        server.commands.some((args) => args[0].toString() === "TYPE"),
+      ).toBe(false);
+    } finally {
+      release();
+      server.onScan = undefined;
+    }
+    const retry = await driver.readTablePage(pageRequest);
+    expect(retry.rows).toEqual([{ key: "audit:�", value: "VALID", ttl: null }]);
+    expect(
+      server.commands.filter((args) => args[0].toString() === "TYPE"),
+    ).toHaveLength(1);
+  });
+
+  it.each([
+    null,
+    { column: "value", direction: "asc" as const },
+  ])("does not expose duplicate SCAN identities (sort=%j)", async (sort) => {
+    const keys = ["audit:a", "audit:b", "audit:c"].map((key) =>
+      Buffer.from(key),
+    );
+    server.entries = keys.map((key, index) => ({
+      key,
+      value: Buffer.from(String(index)),
+    }));
+    server.scanPages = [
+      [keys[0], keys[0]],
+      [keys[0], keys[1], keys[1]],
+      [keys[2]],
+    ];
+    const page = await driver.readTablePage({ ...pageRequest, sort });
+    expect(page.totalCount).toBe(3);
+    expect(page.rows.map((row) => row.key)).toEqual([
+      "audit:a",
+      "audit:b",
+      "audit:c",
+    ]);
+    const reads = server.commands.filter(
+      (args) => args[0].toString() === "GET",
+    );
+    expect(reads).toHaveLength(3);
+  });
+
+  it("counts the SCAN safety budget in unique keys, not duplicate replies", async () => {
+    server.entries = [{ key: validKey, value: Buffer.from("VALID") }];
+    server.scanPages = [
+      Array.from({ length: 5000 }, () => validKey),
+      [validKey],
+    ];
+    const page = await driver.readTablePage(pageRequest);
+    expect(page.totalCount).toBe(1);
+    expect(page.rows).toHaveLength(1);
+  });
+
+  it("exports each identity once when SCAN repeats keys within and across batches", async () => {
+    const keys = ["audit:a", "audit:b", "audit:c"].map((key) =>
+      Buffer.from(key),
+    );
+    server.entries = keys.map((key) => ({ key, value: key }));
+    server.scanPages = [[keys[0], keys[0]], [keys[0], keys[1]], [keys[2]]];
+    const service = new TableReadService({
+      getConnection: () => ({ id: "audit", type: "redis" }),
+      getDriver: () => driver,
+    } as unknown as ConnectionManager);
+    const exported: unknown[] = [];
+    for await (const chunk of service.exportAll(
+      "audit",
+      "db0",
+      "",
+      "audit",
+      2,
+    )) {
+      exported.push(...chunk.rows.map((row) => row.key));
+    }
+    expect(exported).toEqual(["audit:a", "audit:b", "audit:c"]);
+  });
+
+  it.each([
+    null,
+    { column: "value", direction: "asc" as const },
+  ])("keeps distinct Unicode keys in a stable export order when SCAN changes order (sort=%j)", async (sort) => {
+    const composed = "audit:é";
+    const decomposed = "audit:e\u0301";
+    expect(composed.localeCompare(decomposed)).toBe(0);
+    const keys = [Buffer.from(composed), Buffer.from(decomposed)];
+    server.entries = keys.map((key) => ({ key, value: Buffer.from("same") }));
+    server.scanPages = [keys];
+    let iteration = 0;
+    server.onScan = async () => {
+      server.scanPages = [++iteration % 2 ? [...keys].reverse() : keys];
+    };
+    const service = new TableReadService({
+      getConnection: () => ({ id: "audit", type: "redis" }),
+      getDriver: () => driver,
+    } as unknown as ConnectionManager);
+    const exported: unknown[] = [];
+    for await (const chunk of service.exportAll(
+      "audit",
+      "db0",
+      "",
+      "audit",
+      1,
+      sort,
+    )) {
+      exported.push(...chunk.rows.map((row) => row.key));
+    }
+    expect(exported).toEqual([decomposed, composed]);
+  });
+
   it("independently demonstrates why ordinary SCAN decoding is unsafe", async () => {
     const client = createClient({ url });
     try {

@@ -971,14 +971,18 @@ describe("RedisDriver — metadata and pages", () => {
       host: "localhost",
     });
 
-    const keyBatch = Array.from(
-      { length: 250 },
-      (_value, index) => `ns:${index}`,
-    );
+    const batchSize = 250;
+    let iteration = 0;
     const client = {
-      scan: vi.fn().mockResolvedValue({
-        cursor: "1",
-        keys: keyBatch,
+      scan: vi.fn().mockImplementation(async () => {
+        const start = iteration++ * batchSize;
+        return {
+          cursor: String(iteration),
+          keys: Array.from(
+            { length: batchSize },
+            (_, index) => `ns:${start + index}`,
+          ),
+        };
       }),
     };
 
@@ -992,9 +996,7 @@ describe("RedisDriver — metadata and pages", () => {
 
     await driver.listObjects();
 
-    const expectedCalls = Math.ceil(
-      REDIS_READ_BUDGET.maxScanKeys / keyBatch.length,
-    );
+    const expectedCalls = Math.ceil(REDIS_READ_BUDGET.maxScanKeys / batchSize);
     expect(client.scan).toHaveBeenCalledTimes(expectedCalls);
   });
 

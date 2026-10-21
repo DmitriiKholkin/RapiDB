@@ -37,6 +37,7 @@ import {
   DriverTimeoutError,
   type DriverTimeoutSettingsProvider,
   getDefaultDriverTimeoutSettings,
+  throwIfQueryCancelled,
   throwIfTransactionCancelled,
 } from "./timeout";
 import type {
@@ -374,6 +375,14 @@ function compareRedisValueTypes(left: string, right: string): number {
     return -1;
   }
   return leftIndex - rightIndex;
+}
+
+function compareRedisKeys(left: string, right: string): number {
+  // Locale collation can equate distinct UTF-8 identities (e.g. NFC/NFD).
+  // A total order is required because each exported page starts a fresh SCAN.
+  return (
+    left.localeCompare(right) || (left < right ? -1 : left > right ? 1 : 0)
+  );
 }
 
 function formatRedisValueTypeLabel(
@@ -1116,7 +1125,15 @@ export class RedisDriver implements IDBDriver {
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
     const startTime = performance.now();
-    const client = await this.getDatabaseClient(request.database);
+    throwIfQueryCancelled(request);
+    const baseClient = await this.getDatabaseClient(
+      request.database,
+      request.signal,
+    );
+    throwIfQueryCancelled(request);
+    const client = request.signal
+      ? baseClient.withAbortSignal(request.signal)
+      : baseClient;
     if (this.canUseKeyOnlyPaging(request)) {
       const offset = Math.max(0, (request.page - 1) * request.pageSize);
       const keys = (
@@ -1125,11 +1142,13 @@ export class RedisDriver implements IDBDriver {
           request.table,
           REDIS_READ_BUDGET.maxScanKeys,
           true,
+          request,
         )
-      ).sort((left, right) => left.localeCompare(right));
+      ).sort(compareRedisKeys);
       if (request.sort?.direction === "desc") keys.reverse();
       const pageKeys = keys.slice(offset, offset + request.pageSize);
-      const rows = await this.readRowsForKeys(client, pageKeys);
+      const rows = await this.readRowsForKeys(client, pageKeys, request);
+      throwIfQueryCancelled(request);
       return {
         columns: this.inferRedisColumns(rows),
         rows: rows.map((entry) => entry.row),
@@ -1151,6 +1170,7 @@ export class RedisDriver implements IDBDriver {
       request.table,
       boundedReadLimit,
       true,
+      request,
     );
     const displayToOriginal = new Map(
       rows.map((entry) => [redisComparisonRow(entry.row), entry.row]),
@@ -1756,12 +1776,19 @@ export class RedisDriver implements IDBDriver {
     table: string,
     maxRows: number,
     failOnTruncation = false,
+    context?: QueryExecutionOptions,
   ): Promise<RedisSampleRow[]> {
     const readLimit = Math.min(maxRows, REDIS_READ_BUDGET.maxValueReads);
     const keys = (
-      await this.scanTableKeys(client, table, readLimit, failOnTruncation)
-    ).sort((left, right) => left.localeCompare(right));
-    return await this.readRowsForKeys(client, keys);
+      await this.scanTableKeys(
+        client,
+        table,
+        readLimit,
+        failOnTruncation,
+        context,
+      )
+    ).sort(compareRedisKeys);
+    return await this.readRowsForKeys(client, keys, context);
   }
 
   private async scanTableKeys(
@@ -1769,6 +1796,7 @@ export class RedisDriver implements IDBDriver {
     table: string,
     limit: number,
     failOnTruncation = false,
+    context?: QueryExecutionOptions,
   ): Promise<string[]> {
     const unprefixed = isRedisUnprefixedKeysTable(table);
     const keys = await this.scanKeys(
@@ -1776,6 +1804,7 @@ export class RedisDriver implements IDBDriver {
       redisKeyspacePattern(table),
       unprefixed ? REDIS_READ_BUDGET.maxScanKeys : limit,
       failOnTruncation,
+      context,
     );
     const scopedKeys = unprefixed
       ? keys.filter((key) => !key.includes(":"))
@@ -1791,20 +1820,31 @@ export class RedisDriver implements IDBDriver {
   private async readRowsForKeys(
     client: RedisClient,
     keys: readonly string[],
+    context?: QueryExecutionOptions,
   ): Promise<RedisSampleRow[]> {
+    // Check both sides of each await: cancellation must also fence late SDK
+    // replies, rather than merely rejecting the caller's timeout wrapper.
+    const read = async <T>(operation: () => Promise<T>): Promise<T> => {
+      throwIfQueryCancelled(context);
+      const result = await this.waitForResult(operation(), context?.signal);
+      throwIfQueryCancelled(context);
+      return result;
+    };
     return pMapWithLimit(
       [...keys],
       REDIS_READ_BUDGET.parallelValueReads,
       async (key) => {
-        const type = await client.type(key);
+        const type = await read(() => client.type(key));
         let value: unknown = null;
         let binarySnapshot: unknown;
         switch (type) {
           case "string":
             {
-              const bytes = await client
-                .withTypeMapping({ [RESP_TYPES.BLOB_STRING]: Buffer })
-                .get(key);
+              const bytes = await read(() =>
+                client
+                  .withTypeMapping({ [RESP_TYPES.BLOB_STRING]: Buffer })
+                  .get(key),
+              );
               value = Buffer.isBuffer(bytes)
                 ? formatRedisBlobString(bytes)
                 : null;
@@ -1818,33 +1858,37 @@ export class RedisDriver implements IDBDriver {
             }
             break;
           case "hash":
-            value = await client.hGetAll(key);
+            value = await read(() => client.hGetAll(key));
             break;
           case "list":
-            value = await client.lRange(key, 0, -1);
+            value = await read(() => client.lRange(key, 0, -1));
             break;
           case "set":
-            value = await client.sMembers(key);
+            value = await read(() => client.sMembers(key));
             break;
           case "zset":
             value = (
-              await client
-                .withTypeMapping({ [RESP_TYPES.DOUBLE]: String })
-                .zRangeWithScores(key, 0, -1)
+              await read(() =>
+                client
+                  .withTypeMapping({ [RESP_TYPES.DOUBLE]: String })
+                  .zRangeWithScores(key, 0, -1),
+              )
             ).map((entry) => ({
               ...entry,
               score: Number(entry.score),
             }));
             break;
           case "stream":
-            value = await this.readStreamEntries(client, key);
+            value = await read(() => this.readStreamEntries(client, key));
             break;
           default:
             value = null;
         }
 
         const ttl =
-          typeof client.ttl === "function" ? await client.ttl(key) : -1;
+          typeof client.ttl === "function"
+            ? await read(() => client.ttl(key))
+            : -1;
 
         return {
           redisType: type,
@@ -1858,6 +1902,7 @@ export class RedisDriver implements IDBDriver {
           },
         };
       },
+      context?.signal,
     );
   }
 
@@ -2191,19 +2236,37 @@ export class RedisDriver implements IDBDriver {
     pattern: string,
     limit = Number.POSITIVE_INFINITY,
     failOnTruncation = false,
+    context?: QueryExecutionOptions,
   ): Promise<string[]> {
-    const keys: string[] = [];
+    // SCAN may repeat keys even within a complete iteration. Repeated replies
+    // must not become duplicate row identities or consume the unique-key budget.
+    const keys = new Set<string>();
+    const seenCursors = new Set<string>();
     let cursor = "0";
     do {
+      throwIfQueryCancelled(context);
+      if (
+        seenCursors.has(cursor) ||
+        seenCursors.size >= REDIS_READ_BUDGET.maxScanIterations
+      ) {
+        throw new Error(
+          "Redis SCAN did not complete within its safety budget. The keyspace may be changing; narrow the keyspace and retry.",
+        );
+      }
+      seenCursors.add(cursor);
       const count = Number.isFinite(limit)
-        ? Math.min(500, Math.max(1, limit - keys.length))
+        ? Math.min(500, Math.max(1, limit - keys.size))
         : 500;
-      const response = await client
-        .withTypeMapping({ [RESP_TYPES.BLOB_STRING]: Buffer })
-        .scan(cursor, {
-          MATCH: pattern,
-          COUNT: count,
-        });
+      const response = await this.waitForResult(
+        client
+          .withTypeMapping({ [RESP_TYPES.BLOB_STRING]: Buffer })
+          .scan(cursor, {
+            MATCH: pattern,
+            COUNT: count,
+          }),
+        context?.signal,
+      );
+      throwIfQueryCancelled(context);
       cursor = response.cursor.toString();
       for (const bytes of response.keys) {
         const key = bytes.toString("utf8");
@@ -2212,15 +2275,15 @@ export class RedisDriver implements IDBDriver {
             "Redis keyspace contains a non-UTF-8 key. The table viewer cannot safely display or edit binary keys. Use a binary-safe Redis client or narrow the keyspace.",
           );
         }
-        keys.push(key);
+        keys.add(key);
       }
-    } while (cursor !== "0" && keys.length < limit);
-    if (failOnTruncation && (cursor !== "0" || keys.length > limit)) {
+    } while (cursor !== "0" && keys.size < limit);
+    if (failOnTruncation && (cursor !== "0" || keys.size > limit)) {
       throw new Error(
         `Redis data exceeds the ${limit}-key safety limit. Narrow the filter before continuing or exporting.`,
       );
     }
-    return Number.isFinite(limit) ? keys.slice(0, limit) : keys;
+    return Number.isFinite(limit) ? [...keys].slice(0, limit) : [...keys];
   }
 
   private mapRowToQueryRow(

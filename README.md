@@ -65,6 +65,8 @@ Saved connections can be grouped into folders, and each connection expands into 
 
 Redis keys are grouped by the prefix before `:`. **All keys** and **Unprefixed keys** are separate views; prefixed groups are shown as patterns such as `default:*` and `users:*`. Edits and deletes still address the exact stored key.
 
+Redis table reads and exports deduplicate `SCAN` replies and use exact-key tie-breaks when Unicode keys have equal locale collation. A repeated cursor or more than 5,000 scan requests fails explicitly rather than presenting an incomplete result. Cancellation stops waiting and prevents further reads; commands already sent may still complete. Exports are not transactional snapshots of a concurrently changing keyspace.
+
 <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-5.png" alt="Database Explorer tree" width="250" />
 
 <br/>

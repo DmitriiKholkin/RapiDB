@@ -51,12 +51,14 @@ export interface SqlHardCapRewriteDecision {
 
 export interface RedisReadBudget {
   maxScanKeys: number;
+  maxScanIterations: number;
   maxValueReads: number;
   parallelValueReads: number;
 }
 
 export const REDIS_READ_BUDGET: RedisReadBudget = Object.freeze({
   maxScanKeys: 5000,
+  maxScanIterations: 5000,
   maxValueReads: 2000,
   parallelValueReads: 24,
 });
