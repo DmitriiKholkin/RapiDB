@@ -169,6 +169,9 @@ export class ElasticsearchDriver implements IDBDriver {
       this.assertConnectionEpoch(epoch);
       client = new Client({
         Serializer: ElasticsearchSerializer,
+        // A lost response is not proof that a write failed. Replaying an
+        // auto-ID insert or update script can apply the mutation twice.
+        maxRetries: 0,
         ...(sshAgentTransport ? { Connection: SshTlsHttpConnection } : {}),
         node: this.config.cloudId ? undefined : node,
         headers: ELASTICSEARCH_COMPATIBILITY_HEADERS,

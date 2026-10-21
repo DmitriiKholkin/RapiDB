@@ -541,6 +541,12 @@ async function writeStreamChunk(
   signal: AbortSignal,
 ): Promise<void> {
   throwIfAborted(signal);
+  // I/O can fail while the chunk producer is awaiting the database. In that
+  // case the error event has already fired and no future drain will arrive.
+  if (stream.errored) throw stream.errored;
+  if (stream.destroyed) {
+    throw new Error("Export staging stream closed before completion.");
+  }
   if (stream.write(chunk)) return;
 
   await new Promise<void>((resolve, reject) => {

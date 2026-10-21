@@ -499,6 +499,9 @@ export class DynamoDBDriver implements IDBDriver {
     const tlsServername = getTlsServername(this.config);
 
     const client = new DynamoDBClient({
+      // Native requests can contain non-idempotent ADD/list_append updates.
+      // Never replay an ambiguous write, including via AWS_MAX_ATTEMPTS.
+      maxAttempts: 1,
       region: this.config.awsRegion || "us-east-1",
       endpoint: this.config.endpoint ?? this.config.awsEndpoint,
       requestHandler: sshAgentTransport

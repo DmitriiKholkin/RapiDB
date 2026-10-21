@@ -96,6 +96,8 @@ The query editor runs on **Monaco** - the same engine as VS Code itself. You get
 
 For PostgreSQL, MySQL, SQL Server, and SQLite, finish explicit transactions with `COMMIT` or `ROLLBACK` in the same executed script (or `RELEASE` for an outermost SQLite `SAVEPOINT`). Unfinished transactions are not kept for a later Execute. SQL Server keeps one session across the script's `GO` batches and cleans it before another query can borrow it; cancelling or timing out a query is not proof that earlier commits were undone.
 
+Elasticsearch and DynamoDB use a single SDK request attempt, including for reads: automatic retries are disabled because a lost response or server error can follow a committed write. This also overrides `AWS_MAX_ATTEMPTS` for DynamoDB. After a failed mutation, refresh and verify the data before retrying; the first request may already have applied.
+
 <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-2.png" alt="SQL Editor with results" width="100%" />
 
 <br/>

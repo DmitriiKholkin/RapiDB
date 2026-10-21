@@ -1030,6 +1030,82 @@ describe("exportService", () => {
     expect(errorMessage).toContain("backup restore failed");
   });
 
+  it.each([
+    "csv",
+    "json",
+  ] as const)("reports a staging I/O error between %s chunks without hanging or replacing the destination", async (format) => {
+    fs.writeFileSync(outputPath, "previous export\n");
+    let stream: fs.WriteStream | undefined;
+    let cancel: (() => void) | undefined;
+    vscodeMock.withProgress.mockImplementation(async (_options, task) =>
+      task(
+        {},
+        {
+          onCancellationRequested: (listener: () => void) => {
+            cancel = listener;
+            return { dispose: vi.fn() };
+          },
+        },
+      ),
+    );
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        createWriteStream: (
+          ...args: Parameters<typeof fs.createWriteStream>
+        ) => {
+          stream = actual.createWriteStream(...args);
+          return stream;
+        },
+      };
+    });
+    let exporting: Promise<void> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const exporters = await import("../../src/extension/utils/exportService");
+      const exporter =
+        format === "csv"
+          ? exporters.exportTableDataAsCsv
+          : exporters.exportTableDataAsJson;
+      exporting = exporter({
+        fileName: "disk_failure",
+        loadChunks: async function* () {
+          const chunk: ChunkedExportData = {
+            columns: [{ name: "id", category: "integer", nativeType: "int" }],
+            rows: [{ id: 1 }],
+          };
+          yield chunk;
+          const staging = required(stream);
+          // Fail while the exporter awaits the next database chunk, not drain.
+          await new Promise<void>((resolve) => {
+            staging.once("close", resolve);
+            staging.destroy(new Error("ENOSPC: simulated disk full"));
+          });
+          yield chunk;
+        },
+      });
+      const settled = await Promise.race([
+        exporting.then(() => true),
+        new Promise<false>((resolve) => {
+          timer = setTimeout(() => resolve(false), 500);
+        }),
+      ]);
+      expect(settled).toBe(true);
+      expect(vscodeMock.showErrorMessage).toHaveBeenCalledWith(
+        expect.stringContaining("ENOSPC"),
+      );
+      expect(vscodeMock.showInformationMessage).not.toHaveBeenCalled();
+      expect(fs.readFileSync(outputPath, "utf8")).toBe("previous export\n");
+      expect(fs.readdirSync(tempDir)).toEqual(["export.out"]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      cancel?.();
+      await exporting;
+      vi.doUnmock("node:fs");
+    }
+  });
+
   it("cancels while the staging stream closes without replacing the old export", async () => {
     const previousOutput = "previous export\n";
     fs.writeFileSync(outputPath, previousOutput);
