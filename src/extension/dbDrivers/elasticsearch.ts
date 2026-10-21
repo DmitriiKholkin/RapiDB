@@ -785,6 +785,8 @@ export class ElasticsearchDriver implements IDBDriver {
         ? ([transportOptions] as const)
         : ([] as const);
     const client = this.requireClient();
+    // REST query/body fields are not SDK arguments: spreading them here lets
+    // fields such as index/id silently replace the resource named in the path.
     const queryParams = this.queryParamsToObject(command.queryParams);
     const [firstSegment, secondSegment, thirdSegment] = command.pathSegments;
 
@@ -792,8 +794,8 @@ export class ElasticsearchDriver implements IDBDriver {
       const response = await client.indices.create(
         {
           index: firstSegment,
-          ...queryParams,
-          ...this.readObjectBody(command, `PUT ${command.path}`),
+          querystring: queryParams,
+          body: this.readObjectBody(command, `PUT ${command.path}`),
         },
         ...transportArgs,
       );
@@ -812,7 +814,7 @@ export class ElasticsearchDriver implements IDBDriver {
       const response = await client.indices.delete(
         {
           index: firstSegment,
-          ...queryParams,
+          querystring: queryParams,
         },
         ...transportArgs,
       );
@@ -839,8 +841,8 @@ export class ElasticsearchDriver implements IDBDriver {
       const response = await client.search(
         {
           index: firstSegment,
-          ...this.enforceSearchQueryParamsHardCap(queryParams),
-          ...body,
+          querystring: this.enforceSearchQueryParamsHardCap(queryParams),
+          body,
         } as never,
         ...transportArgs,
       );
@@ -863,8 +865,8 @@ export class ElasticsearchDriver implements IDBDriver {
       );
       const response = await client.search(
         {
-          ...this.enforceSearchQueryParamsHardCap(queryParams),
-          ...body,
+          querystring: this.enforceSearchQueryParamsHardCap(queryParams),
+          body,
         } as never,
         ...transportArgs,
       );
@@ -884,7 +886,7 @@ export class ElasticsearchDriver implements IDBDriver {
         {
           index: firstSegment,
           id: thirdSegment,
-          ...queryParams,
+          querystring: queryParams,
         },
         ...transportArgs,
       );
@@ -908,7 +910,7 @@ export class ElasticsearchDriver implements IDBDriver {
           document: this.stripDocumentId(
             this.readObjectBody(command, `${command.method} ${command.path}`),
           ),
-          ...queryParams,
+          querystring: queryParams,
         },
         ...transportArgs,
       );
@@ -933,8 +935,8 @@ export class ElasticsearchDriver implements IDBDriver {
         {
           index: firstSegment,
           id: thirdSegment,
-          ...queryParams,
-          ...body,
+          querystring: queryParams,
+          body,
         } as never,
         ...transportArgs,
       );
@@ -958,7 +960,7 @@ export class ElasticsearchDriver implements IDBDriver {
         {
           index: firstSegment,
           id: thirdSegment,
-          ...queryParams,
+          querystring: queryParams,
         },
         ...transportArgs,
       );
@@ -981,8 +983,8 @@ export class ElasticsearchDriver implements IDBDriver {
       const response = await client.indices.putMapping(
         {
           index: firstSegment,
-          ...queryParams,
-          ...this.readObjectBody(command, `PUT ${command.path}`),
+          querystring: queryParams,
+          body: this.readObjectBody(command, `PUT ${command.path}`),
         },
         ...transportArgs,
       );
@@ -1004,8 +1006,8 @@ export class ElasticsearchDriver implements IDBDriver {
       const response = await client.indices.putSettings(
         {
           index: firstSegment,
-          ...queryParams,
-          ...this.readObjectBody(command, `PUT ${command.path}`),
+          querystring: queryParams,
+          body: this.readObjectBody(command, `PUT ${command.path}`),
         },
         ...transportArgs,
       );
@@ -1026,8 +1028,8 @@ export class ElasticsearchDriver implements IDBDriver {
     ) {
       const response = await client.indices.updateAliases(
         {
-          ...queryParams,
-          ...this.readObjectBody(command, `POST ${command.path}`),
+          querystring: queryParams,
+          body: this.readObjectBody(command, `POST ${command.path}`),
         },
         ...transportArgs,
       );
@@ -1088,13 +1090,11 @@ export class ElasticsearchDriver implements IDBDriver {
   private queryParamsToObject(
     queryParams: URLSearchParams,
   ): Record<string, unknown> {
-    const result: Record<string, unknown> = {};
+    const result: Record<string, unknown> = Object.create(null);
     for (const key of new Set(queryParams.keys())) {
-      const values = queryParams
-        .getAll(key)
-        .map((value) =>
-          key === "routing" ? value : this.coerceRestQueryParamValue(value),
-        );
+      // HTTP query values are strings. Numeric-looking names (pipeline,
+      // preference, etc.) and 64-bit concurrency tokens must remain exact.
+      const values = queryParams.getAll(key);
       if (values.length === 1) {
         result[key] = values[0];
       } else if (values.length > 1) {
@@ -1102,22 +1102,6 @@ export class ElasticsearchDriver implements IDBDriver {
       }
     }
     return result;
-  }
-
-  private coerceRestQueryParamValue(value: string): boolean | number | string {
-    if (value === "true") {
-      return true;
-    }
-    if (value === "false") {
-      return false;
-    }
-    if (/^-?\d+(?:\.\d+)?$/.test(value)) {
-      const numeric = Number(value);
-      if (!Number.isNaN(numeric)) {
-        return numeric;
-      }
-    }
-    return value;
   }
 
   private buildRowsQueryResult(
@@ -2306,13 +2290,18 @@ export class ElasticsearchDriver implements IDBDriver {
   private enforceSearchQueryParamsHardCap(
     queryParams: Record<string, unknown>,
   ): Record<string, unknown> {
+    if (Object.hasOwn(queryParams, "source")) {
+      throw new Error(
+        "Elasticsearch REST search does not support the source query parameter. Put the JSON search body after the request path so its size limit can be checked.",
+      );
+    }
     if (!Object.hasOwn(queryParams, "size")) {
       return queryParams;
     }
 
     return {
       ...queryParams,
-      size: this.clampSearchSize(queryParams.size),
+      size: this.clampSearchSize(Number(queryParams.size)),
     };
   }
 

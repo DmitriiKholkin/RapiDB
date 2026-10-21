@@ -354,12 +354,12 @@ const MONGOSH_SANDBOX_SETUP = `
   const ISODate = Date;
   const RegExp = function mongoRegExp(pattern, flags) { return marker('RegExp', [pattern, flags]); };
   const ObjectId = function mongoObjectId(hex) { return marker('ObjectId', [hex]); };
-  const BinData = function mongoBinData(subtype, base64) { return marker('BinData', [subtype, base64]); };
+  const BinData = function mongoBinData(...args) { return marker('BinData', args); };
   const DBRef = function mongoDBRef(collection, oid, database) { return marker('DBRef', [collection, oid, database]); };
   const BSONSymbol = function mongoBSONSymbol(value) { return marker('BSONSymbol', [value]); };
   const NumberLong = function mongoNumberLong(...args) { return marker('NumberLong', args); };
   const NumberInt = function mongoNumberInt(...args) { return marker('NumberInt', args); };
-  const NumberDecimal = function mongoNumberDecimal(value) { return marker('NumberDecimal', [value]); };
+  const NumberDecimal = function mongoNumberDecimal(...args) { return marker('NumberDecimal', args); };
   const Timestamp = function mongoTimestamp(seconds, increment) { return marker('Timestamp', [seconds, increment]); };
   const Code = function mongoCode(source, scope) { return marker('Code', [source, scope]); };
   const MinKey = function mongoMinKey() { return marker('MinKey', []); };
@@ -432,11 +432,29 @@ function reviveMongoshValue(value: unknown): unknown {
         return args[0] === undefined
           ? new ObjectId()
           : new ObjectId(String(args[0]));
-      case "BinData":
-        return new Binary(
-          Buffer.from(String(args[1]), "base64"),
-          Number(args[0]),
-        );
+      case "BinData": {
+        const [subtype, base64] = args;
+        if (
+          args.length !== 2 ||
+          typeof subtype !== "number" ||
+          !Number.isInteger(subtype) ||
+          subtype < 0 ||
+          subtype > 255 ||
+          typeof base64 !== "string" ||
+          !BASE64_VALUE_RE.test(base64)
+        ) {
+          throw new Error(
+            "BinData requires an integer subtype from 0 to 255 and a canonical base64 string.",
+          );
+        }
+        const bytes = Buffer.from(base64, "base64");
+        // Buffer.from silently discards invalid characters, padding and pad
+        // bits. Never let a mistyped binary key target different stored bytes.
+        if (bytes.toString("base64") !== base64) {
+          throw new Error("BinData requires a canonical base64 string.");
+        }
+        return new Binary(bytes, subtype);
+      }
       case "DBRef":
         return new DBRef(
           String(args[0]),
@@ -449,7 +467,14 @@ function reviveMongoshValue(value: unknown): unknown {
       case "NumberInt":
         return reviveMongoshInteger(record.value, args);
       case "NumberDecimal":
-        return Decimal128.fromString(String(args[0]));
+        // Numeric arguments have already crossed the VM's IEEE-754 boundary;
+        // converting them to a string cannot recover the requested decimal.
+        if (args.length !== 1 || typeof args[0] !== "string") {
+          throw new Error(
+            'NumberDecimal requires one string argument, for example NumberDecimal("0.123456789012345678901").',
+          );
+        }
+        return Decimal128.fromString(args[0]);
       case "Timestamp": {
         const spec = args[0];
         return spec && typeof spec === "object"

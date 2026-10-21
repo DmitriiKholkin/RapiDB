@@ -298,7 +298,16 @@ describe("Elasticsearch read-to-mutation identity", () => {
       { primaryKeys: keys },
     );
     await driver.query(preview);
-    expect(client.delete).toHaveBeenLastCalledWith(expected);
+    expect(client.delete).toHaveBeenLastCalledWith({
+      index: expected.index,
+      id: expected.id,
+      querystring: {
+        routing: expected.routing,
+        if_seq_no: String(expected.if_seq_no),
+        if_primary_term: String(expected.if_primary_term),
+        refresh: expected.refresh,
+      },
+    });
   });
 
   it("preserves identity in exported rows, including no-routing rows", async () => {
@@ -363,7 +372,19 @@ describe("Elasticsearch read-to-mutation identity", () => {
       { primaryKeys: keys, changes, originalValues },
     );
     await driver.query(preview);
-    expect(method.mock.calls[1][0]).toEqual(actual);
+    const { index, id, routing, if_seq_no, if_primary_term, refresh, ...body } =
+      actual;
+    expect(method.mock.calls[1][0]).toEqual({
+      index,
+      id,
+      querystring: {
+        routing,
+        if_seq_no: String(if_seq_no),
+        if_primary_term: String(if_primary_term),
+        refresh,
+      },
+      ...(mode === "replace" ? body : { body }),
+    });
   });
 
   it.each([
@@ -388,7 +409,9 @@ describe("Elasticsearch read-to-mutation identity", () => {
       { primaryKeys: keys },
     );
     await driver.query(preview);
-    expect(client.delete.mock.calls[0][0]).toMatchObject({ routing });
+    expect(client.delete.mock.calls[0][0]).toMatchObject({
+      querystring: { routing },
+    });
   });
 
   const invalidCases = [

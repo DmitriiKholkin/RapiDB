@@ -326,8 +326,8 @@ describe("ElasticsearchDriver — metadata and pages", () => {
 
     expect(search).toHaveBeenCalledWith({
       index: "notes",
-      size: 1,
-      query: { match: { title: "Release" } },
+      querystring: {},
+      body: { size: 1, query: { match: { title: "Release" } } },
     });
     expect(result.columns).toEqual(["_id", "_source"]);
     expect(result.rowCount).toBe(1);
@@ -350,7 +350,9 @@ describe("ElasticsearchDriver — metadata and pages", () => {
     expect(search).toHaveBeenCalledWith(
       expect.objectContaining({
         index: "notes",
-        size: ELASTICSEARCH_READ_BUDGET.hardCap,
+        body: expect.objectContaining({
+          size: ELASTICSEARCH_READ_BUDGET.hardCap,
+        }),
       }),
     );
   });
@@ -365,7 +367,7 @@ describe("ElasticsearchDriver — metadata and pages", () => {
 
     expect(search).toHaveBeenCalledWith(
       expect.objectContaining({
-        size: ELASTICSEARCH_READ_BUDGET.hardCap,
+        querystring: { size: ELASTICSEARCH_READ_BUDGET.hardCap },
       }),
     );
   });
@@ -387,9 +389,9 @@ describe("ElasticsearchDriver — metadata and pages", () => {
     expect(update).toHaveBeenCalledWith({
       index: "users",
       id: "doc-3",
-      refresh: "wait_for",
-      doc: {
-        email: "charlie+updated@example.com",
+      querystring: { refresh: "wait_for" },
+      body: {
+        doc: { email: "charlie+updated@example.com" },
       },
     });
 
@@ -405,7 +407,7 @@ describe("ElasticsearchDriver — metadata and pages", () => {
     expect(remove).toHaveBeenCalledWith({
       index: "users",
       id: "doc-3",
-      refresh: "wait_for",
+      querystring: { refresh: "wait_for" },
     });
   });
 
@@ -419,18 +421,20 @@ describe("ElasticsearchDriver — metadata and pages", () => {
     expect(update).toHaveBeenNthCalledWith(1, {
       index: "app_logs",
       id: "acQgPZ4BXTUBdY62RrjQ",
-      refresh: "wait_for",
-      doc: {
-        host: "server-11.example.com",
+      querystring: { refresh: "wait_for" },
+      body: {
+        doc: { host: "server-11.example.com" },
       },
     });
     expect(update).toHaveBeenNthCalledWith(2, {
       index: "app_logs",
       id: "asQgPZ4BXTUBdY62RrjQ",
-      refresh: "wait_for",
-      doc: {
-        message:
-          "Database connection pool exhausted - all 111 connections in use",
+      querystring: { refresh: "wait_for" },
+      body: {
+        doc: {
+          message:
+            "Database connection pool exhausted - all 111 connections in use",
+        },
       },
     });
     expect(result.columns).toEqual(["results"]);
@@ -456,14 +460,17 @@ describe("ElasticsearchDriver — metadata and pages", () => {
 
     expect(createIndex).toHaveBeenCalledWith({
       index: "app_logs_clone",
-      settings: {
-        number_of_shards: "1",
-        number_of_replicas: "0",
-      },
-      mappings: {
-        properties: {
-          message: { type: "text" },
-          level: { type: "keyword" },
+      querystring: {},
+      body: {
+        settings: {
+          number_of_shards: "1",
+          number_of_replicas: "0",
+        },
+        mappings: {
+          properties: {
+            message: { type: "text" },
+            level: { type: "keyword" },
+          },
         },
       },
     });

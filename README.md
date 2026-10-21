@@ -115,6 +115,10 @@ MongoDB `find` and `aggregate` results also have a safety budget. The default sa
 
 MongoDB `NumberInt(...)` and `NumberLong(...)` literals require one integer argument within the signed BSON int32/int64 range. Fractional, malformed, overflowing, and unsafe JavaScript number arguments are rejected before any operation in the script is sent. For exact large integers, use strings such as `NumberLong("9223372036854775807")` or bigint arguments rather than unquoted JavaScript numbers.
 
+MongoDB `NumberDecimal(...)` requires exactly one string argument, such as `NumberDecimal("0.123456789012345678901")`. Numeric arguments are rejected before any operation in the script is sent because JavaScript can round them before Decimal128 conversion.
+
+MongoDB `BinData(subtype, base64)` requires an integer subtype from 0 to 255 and a canonical base64 string (including padding when needed). Invalid literals are rejected before any operation in the script is sent, rather than silently decoding to different bytes.
+
 Table exports keep a stable column schema across chunks. CSV uses the declared columns (including empty cells for missing values); a later unexpected column fails the export rather than silently dropping data. JSON applies the same unexpected-column check. Failed exports leave an existing destination file intact.
 
 <br/>
