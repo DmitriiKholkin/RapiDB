@@ -271,7 +271,7 @@ describe("mysql filter normalization", () => {
     }
   });
 
-  it("uses ST_AsText in table page reads for spatial columns", async () => {
+  it("uses SRID-preserving WKT in table page reads for spatial columns", async () => {
     const pageDriver = new MySQLDriver({
       id: "mysql-filter-normalization-read-page",
       name: "MySQL Filter Normalization Read Page",
@@ -331,7 +331,9 @@ describe("mysql filter normalization", () => {
 
     expect(
       sqlCalls.some((sql) =>
-        /ST_AsText\(`geometry_column`\) AS `__rapidb_col_\d+`/.test(sql),
+        /CASE WHEN ST_SRID\(`geometry_column`\) = 0 THEN ST_AsText\(`geometry_column`\) ELSE CONCAT\('SRID=', ST_SRID\(`geometry_column`\), ';', ST_AsText\(`geometry_column`\)\) END AS `__rapidb_col_\d+`/.test(
+          sql,
+        ),
       ),
     ).toBe(true);
     expect(page.rows[0]?.geometry_column).toBe("MULTIPOINT((0 0),(1 1),(2 2))");

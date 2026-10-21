@@ -3168,6 +3168,77 @@ describe("ConnectionManager", () => {
     }
   });
 
+  it.each(
+    (["elasticsearch", "dynamodb"] as const).flatMap((type) =>
+      (
+        [
+          ["http://db.internal", 80],
+          ["http://db.internal:80", 80],
+          ["http://db.internal:8080", 8080],
+          ["https://db.internal", 443],
+          ["https://db.internal:443", 443],
+          ["https://db.internal:8443", 8443],
+        ] as const
+      ).map(([endpoint, remotePort]) => ({ type, endpoint, remotePort })),
+    ),
+  )("routes $type SSH to the URL port for $endpoint", async ({
+    type,
+    endpoint,
+    remotePort,
+  }) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const dispose = vi.fn(async () => undefined);
+    const createSshRuntime = vi.fn(async () => ({
+      transport: {
+        kind: "tcpForward" as const,
+        localHost: "127.0.0.1" as const,
+        localPort: 15432,
+        remoteHost: "db.internal",
+        remotePort: Number(remotePort),
+      },
+      verifiedFingerprintSha256:
+        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      dispose,
+    }));
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      new FakeConnectionManagerStore(),
+      { createSshRuntime },
+    );
+    try {
+      const result = await manager.testConnection({
+        ...createSshPgConfig("ssh-http-routing"),
+        type,
+        endpoint,
+        awsRegion: "us-east-1",
+        tls: {
+          mode:
+            type === "elasticsearch" && endpoint.startsWith("https:")
+              ? "requireVerifyFull"
+              : "disabled",
+        },
+      });
+      expect(result).toEqual({ success: true });
+      expect(createSshRuntime).toHaveBeenCalledWith(
+        expect.anything(),
+        {
+          kind: "tcpForward",
+          remoteHost: "db.internal",
+          remotePort,
+        },
+        { signal: expect.any(AbortSignal) },
+      );
+      expect(driverInstances[0]?.config).toMatchObject({
+        endpoint: `${endpoint.startsWith("https:") ? "https" : "http"}://127.0.0.1:15432/`,
+      });
+      expect(dispose).toHaveBeenCalledOnce();
+    } finally {
+      await manager.dispose();
+    }
+  });
+
   it.each([
     undefined,
     22,

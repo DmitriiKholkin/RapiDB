@@ -767,8 +767,14 @@ function parseMysqlSpatialSridPrefix(value: string): {
   if (!sridMatch) {
     return { wkt: trimmed, srid: null };
   }
+  const srid = Number(sridMatch[1]);
+  if (!Number.isInteger(srid) || srid < 0 || srid > 0xffffffff) {
+    throw new TypeError(
+      "MySQL spatial SRID must be an unsigned 32-bit integer.",
+    );
+  }
   return {
-    srid: Number.parseInt(sridMatch[1], 10),
+    srid,
     wkt: sridMatch[2].trim(),
   };
 }
@@ -2060,7 +2066,9 @@ export class MySQLDriver extends BaseDBDriver {
       .map((column, index) => {
         const quoted = this.quoteIdentifier(column.name);
         const expression =
-          column.category === "spatial" ? `ST_AsText(${quoted})` : quoted;
+          column.category === "spatial"
+            ? `CASE WHEN ST_SRID(${quoted}) = 0 THEN ST_AsText(${quoted}) ELSE CONCAT('SRID=', ST_SRID(${quoted}), ';', ST_AsText(${quoted})) END`
+            : quoted;
         return `${expression} AS ${this.quoteIdentifier(`__rapidb_col_${index}`)}`;
       })
       .join(", ");
@@ -2846,6 +2854,47 @@ export class MySQLDriver extends BaseDBDriver {
   }
   override buildSetExpr(column: ColumnTypeMeta, _paramIndex: number): string {
     return `${this.quoteIdentifier(column.name)} = ${this.buildInsertValueExpr(column, _paramIndex)}`;
+  }
+  buildMutationValueExpr(
+    column: ColumnTypeMeta,
+    value: unknown,
+    operation: "insert" | "update",
+  ): { sql: string; params: unknown[] } | null {
+    if (column.category !== "spatial") return null;
+    if (value === null) return { sql: "NULL", params: [] };
+    if (typeof value !== "string") {
+      throw new TypeError(`Column "${column.name}" expects spatial WKT text.`);
+    }
+    const { wkt, srid } = parseMysqlSpatialSridPrefix(value);
+    if (srid !== null) {
+      return { sql: "ST_GeomFromText(?, ?)", params: [wkt, srid] };
+    }
+    // Plain WKT edits change coordinates, not their reference system. A new
+    // value (INSERT or a NULL cell) retains the existing SRID-zero default.
+    return {
+      sql:
+        operation === "update"
+          ? `ST_GeomFromText(?, COALESCE(ST_SRID(${this.quoteIdentifier(column.name)}), 0))`
+          : "ST_GeomFromText(?)",
+      params: [wkt],
+    };
+  }
+  buildOriginalValueComparisonWithParams(
+    column: ColumnTypeMeta,
+    value: unknown,
+  ): { sql: string; params: unknown[] } | null {
+    if (column.category !== "spatial") return null;
+    if (typeof value !== "string") {
+      throw new TypeError(
+        `Refresh spatial column "${column.name}" before editing.`,
+      );
+    }
+    const { wkt, srid } = parseMysqlSpatialSridPrefix(value);
+    const name = this.quoteIdentifier(column.name);
+    return {
+      sql: `ST_SRID(${name}) = ? AND ST_AsBinary(${name}) = ST_AsBinary(ST_GeomFromText(?, ?))`,
+      params: [srid ?? 0, wkt, srid ?? 0],
+    };
   }
   override buildOriginalValueComparison(
     column: ColumnTypeMeta,

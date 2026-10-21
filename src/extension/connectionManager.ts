@@ -1555,7 +1555,9 @@ export class ConnectionManager
           ? Number.parseInt(url.port, 10)
           : url.protocol === "https:"
             ? 443
-            : defaultPort,
+            : url.protocol === "http:"
+              ? 80
+              : defaultPort,
     };
   }
 

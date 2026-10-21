@@ -144,6 +144,8 @@ Temporal-value verification is driver-specific: SQL Server and Oracle verify exp
 
 MySQL `TINYINT(1)` is not restricted to boolean storage. Values outside `0`/`1` are preserved in query results, table reads, row keys, and exports rather than converted to booleans.
 
+MySQL spatial table reads and exports retain nonzero reference systems as `SRID=4326;POINT(1 2)`. Editing with plain WKT preserves the existing SRID; use an explicit `SRID=...;` prefix to change it. New plain-WKT values default to SRID 0. Optimistic update checks compare both the SRID and coordinates.
+
 <br/>
 
 <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-1.png" alt="Table Data Viewer" width="100%" />
