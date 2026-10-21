@@ -254,9 +254,14 @@ describe("SQLite off-host execution", () => {
     expect(
       Buffer.isBuffer(await value(driver, "SELECT value FROM temporary")),
     ).toBe(true);
-    await driver.query("BEGIN; UPDATE attached.data SET value=8");
-    expect(await value(driver, "SELECT value FROM attached.data")).toBe(8);
-    await driver.query("ROLLBACK");
+    await expect(
+      driver.query("BEGIN; UPDATE attached.data SET value=8"),
+    ).rejects.toThrow(/unfinished SQLite transaction.*rolled back/i);
+    expect(await value(driver, "SELECT value FROM attached.data")).toBe(2);
+    const explicit = await driver.query(
+      "BEGIN; UPDATE attached.data SET value=8; SELECT value FROM attached.data; ROLLBACK",
+    );
+    expect(explicit.rows[0].__col_0).toBe(8);
     expect(await value(driver, "SELECT value FROM attached.data")).toBe(2);
   });
 

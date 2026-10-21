@@ -216,6 +216,7 @@ describe("ElasticsearchDriver — metadata and pages", () => {
         sort: ["_doc"],
         size: ELASTICSEARCH_READ_BUDGET.hardCap,
         track_total_hits: true,
+        allow_partial_search_results: false,
         seq_no_primary_term: true,
       },
       {

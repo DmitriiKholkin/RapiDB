@@ -357,14 +357,48 @@ const MONGOSH_SANDBOX_SETUP = `
   const BinData = function mongoBinData(subtype, base64) { return marker('BinData', [subtype, base64]); };
   const DBRef = function mongoDBRef(collection, oid, database) { return marker('DBRef', [collection, oid, database]); };
   const BSONSymbol = function mongoBSONSymbol(value) { return marker('BSONSymbol', [value]); };
-  const NumberLong = function mongoNumberLong(value) { return marker('NumberLong', [value]); };
-  const NumberInt = function mongoNumberInt(value) { return marker('NumberInt', [value]); };
+  const NumberLong = function mongoNumberLong(...args) { return marker('NumberLong', args); };
+  const NumberInt = function mongoNumberInt(...args) { return marker('NumberInt', args); };
   const NumberDecimal = function mongoNumberDecimal(value) { return marker('NumberDecimal', [value]); };
   const Timestamp = function mongoTimestamp(seconds, increment) { return marker('Timestamp', [seconds, increment]); };
   const Code = function mongoCode(source, scope) { return marker('Code', [source, scope]); };
   const MinKey = function mongoMinKey() { return marker('MinKey', []); };
   const MaxKey = function mongoMaxKey() { return marker('MaxKey', []); };
 `;
+
+function reviveMongoshInteger(
+  kind: "NumberInt" | "NumberLong",
+  args: unknown[],
+): Int32 | Long {
+  const value = args[0];
+  if (
+    args.length !== 1 ||
+    !["string", "number", "bigint"].includes(typeof value)
+  ) {
+    throw new Error(`${kind} requires one integer argument.`);
+  }
+  // A numeric JS literal may already have been rounded in the VM. Exact BSON
+  // int64 values outside the safe range must arrive as strings or bigints.
+  if (typeof value === "number" && !Number.isSafeInteger(value)) {
+    throw new Error(
+      `${kind} requires a safe integer number; use a string or bigint for exact large integers.`,
+    );
+  }
+  const text = String(value).trim();
+  if (!/^[+-]?\d+$/.test(text)) {
+    throw new Error(`${kind} requires an integer without fractional digits.`);
+  }
+  const integer = BigInt(text);
+  const int32 = kind === "NumberInt";
+  const min = int32 ? -2147483648n : -9223372036854775808n;
+  const max = int32 ? 2147483647n : 9223372036854775807n;
+  if (integer < min || integer > max) {
+    throw new Error(`${kind} integer is out of range (${min} to ${max}).`);
+  }
+  return int32
+    ? new Int32(Number(integer))
+    : Long.fromString(integer.toString());
+}
 
 function reviveMongoshValue(value: unknown): unknown {
   if (value === null || typeof value !== "object") return value;
@@ -412,9 +446,8 @@ function reviveMongoshValue(value: unknown): unknown {
       case "BSONSymbol":
         return new BSONSymbol(String(args[0]));
       case "NumberLong":
-        return Long.fromString(String(args[0]));
       case "NumberInt":
-        return new Int32(Number.parseInt(String(args[0]), 10));
+        return reviveMongoshInteger(record.value, args);
       case "NumberDecimal":
         return Decimal128.fromString(String(args[0]));
       case "Timestamp": {

@@ -97,6 +97,88 @@ export function registerTableServiceIntegrationTests(
       await disposeLiveDriverHarness(harness);
     });
 
+    it("preserves prototype-named columns in pages and multi-chunk exports", async () => {
+      const table = `RAPIDB_PROTO_${Date.now().toString(36).toUpperCase()}`;
+      const target = harness.driver.qualifiedTableName(
+        harness.databaseName,
+        harness.schemaName,
+        table,
+      );
+      const quote = (name: string) => harness.driver.quoteIdentifier(name);
+      await harness.driver.query(
+        `CREATE TABLE ${target} (${quote("id")} INT PRIMARY KEY, ${quote("__proto__")} VARCHAR(30), ${quote("constructor")} VARCHAR(30), ${quote("__rapidb_col_0")} INT)`,
+      );
+      try {
+        for (const [id, value] of [
+          [1, "first"],
+          [2, "second"],
+          [3, null],
+        ] as const) {
+          await harness.driver.query(
+            `INSERT INTO ${target} (${quote("id")}, ${quote("__proto__")}, ${quote("constructor")}, ${quote("__rapidb_col_0")}) VALUES (${id}, ${value === null ? "NULL" : `'${value}'`}, 'ctor', ${4 - id})`,
+          );
+        }
+        const page = await readService.getPage(
+          connectionId,
+          harness.databaseName,
+          harness.schemaName,
+          table,
+          1,
+          10,
+          [],
+        );
+        const expected = [
+          {
+            id: 1,
+            ["__proto__"]: "first",
+            constructor: "ctor",
+            __rapidb_col_0: 3,
+          },
+          {
+            id: 2,
+            ["__proto__"]: "second",
+            constructor: "ctor",
+            __rapidb_col_0: 2,
+          },
+          {
+            id: 3,
+            ["__proto__"]: null,
+            constructor: "ctor",
+            __rapidb_col_0: 1,
+          },
+        ];
+        expect(page.rows).toEqual(expected);
+        for (const row of page.rows) {
+          expect(Object.hasOwn(row, "__proto__")).toBe(true);
+          expect(Object.getPrototypeOf(row)).toBe(Object.prototype);
+        }
+        const rows: Record<string, unknown>[] = [];
+        for await (const chunk of readService.exportAll(
+          connectionId,
+          harness.databaseName,
+          harness.schemaName,
+          table,
+          2,
+        )) {
+          rows.push(...chunk.rows);
+        }
+        expect(JSON.stringify(rows)).toBe(JSON.stringify(expected));
+        const sorted = await readService.getPage(
+          connectionId,
+          harness.databaseName,
+          harness.schemaName,
+          table,
+          1,
+          10,
+          [],
+          { column: "__rapidb_col_0", direction: "asc" },
+        );
+        expect(sorted.rows.map((row) => row.id)).toEqual([3, 2, 1]);
+      } finally {
+        await harness.driver.query(`DROP TABLE ${target}`);
+      }
+    });
+
     it("reads filtered and sorted pages and falls back cleanly when count queries fail", async () => {
       const columns = await readService.getColumns(
         connectionId,

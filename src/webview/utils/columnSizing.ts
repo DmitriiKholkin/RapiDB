@@ -96,7 +96,7 @@ export function calcColWidths(
   opts?: ColSizeOpts,
 ): Record<string, number> {
   syncCtxFont();
-  const result: Record<string, number> = {};
+  const result: Record<string, number> = Object.create(null);
   for (const column of columns) {
     result[column.dataKey ?? column.name] = calcColWidth(
       column.name,

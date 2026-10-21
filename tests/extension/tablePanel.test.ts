@@ -329,7 +329,8 @@ describe("TablePanel", () => {
     getColumnsMock.mockReset();
     getColumnsMock.mockResolvedValue([]);
     clearForConnectionMock.mockReset();
-    getPageMock.mockClear();
+    getPageMock.mockReset();
+    getPageMock.mockResolvedValue({ rows: [], totalCount: 0, columns: [] });
     exportAllMock.mockReset();
     prepareInsertRowMock.mockReset();
     prepareInsertRowMock.mockResolvedValue(null);
@@ -1972,6 +1973,42 @@ describe("TablePanel", () => {
     );
   });
 
+  it.each([
+    "exportCSV",
+    "exportJSON",
+  ])("preserves prototype-named selected columns in %s", async (type) => {
+    const { panel } = await openSchemaRefreshPath();
+    const columns = ["__proto__", "constructor", "toString"].map((name) => ({
+      name,
+      category: "text" as const,
+      nativeType: "text",
+    }));
+    const row = Object.fromEntries([
+      ["__proto__", "stored text"],
+      ["constructor", null],
+      ["toString", "own value"],
+    ]);
+    exportAllMock.mockImplementationOnce(async function* () {
+      yield { columns, rows: [row] };
+      yield { columns, rows: [{}] };
+    });
+    const actual: ChunkedExportData[] = [];
+    exportTableDataMock.mockImplementationOnce(async ({ loadChunks }) => {
+      for await (const chunk of loadChunks(new AbortController().signal))
+        actual.push(chunk);
+    });
+    await panel.webview.dispatchMessage({
+      type,
+      payload: { columnOrder: columns.map((column) => column.name) },
+    });
+    expect(actual[0]?.rows[0]).toEqual(row);
+    expect(Object.hasOwn(actual[0].rows[0], "__proto__")).toBe(true);
+    expect(Object.getPrototypeOf(actual[0].rows[0])).toBe(Object.prototype);
+    expect(Object.entries(actual[1].rows[0])).toEqual(
+      columns.map((column) => [column.name, undefined]),
+    );
+  });
+
   it("uses described metadata for a selected column absent even from the first page", async () => {
     const { panel } = await openSchemaRefreshPath();
     const name = {
@@ -2063,6 +2100,96 @@ describe("TablePanel", () => {
     });
     await panel.webview.dispatchMessage({ type: "exportCSV" });
     expect(actual).toEqual([chunk]);
+  });
+
+  it.each(
+    (["exportCSV", "exportJSON"] as const).flatMap((type) =>
+      [false, true].flatMap((pageOnly) =>
+        ["save-dialog", "pending-read", "between-chunks"].map((stage) => ({
+          type,
+          pageOnly,
+          stage,
+        })),
+      ),
+    ),
+  )("rejects $type after a same-schema reconnect ($stage, pageOnly=$pageOnly)", async ({
+    type,
+    pageOnly,
+    stage,
+  }) => {
+    const { manager, panel, driver, onDispose } =
+      await restoreWithRealConnectionManager({
+        host: "server-a",
+      });
+    try {
+      await panel.webview.dispatchMessage({ type: "ready" });
+      getPageMock.mockReset();
+      const pending = deferred<void>();
+      const readStarted = deferred<void>();
+      const chunk = {
+        columns: [
+          { name: "id", category: "integer" as const, nativeType: "int" },
+        ],
+        rows: [{ id: 1 }],
+      };
+      const closed = vi.fn();
+      exportAllMock.mockImplementationOnce(async function* () {
+        try {
+          readStarted.resolve();
+          if (stage === "pending-read") await pending.promise;
+          yield chunk;
+        } finally {
+          closed();
+        }
+      });
+      getPageMock.mockImplementationOnce(async () => {
+        readStarted.resolve();
+        if (stage === "pending-read") await pending.promise;
+        return { ...chunk, totalCount: 1 } as never;
+      });
+      const reconnect = async () => {
+        await driver.disconnect();
+        const config = manager.getConnection("conn-1");
+        if (!config) throw new Error("Expected connection config");
+        await manager.saveConnection({ ...config, host: "server-b" });
+        await manager.connectTo("conn-1", "explicit");
+      };
+      exportTableDataMock.mockImplementationOnce(async ({ loadChunks }) => {
+        if (stage === "save-dialog") await reconnect();
+        const iterator = loadChunks(new AbortController().signal)[
+          Symbol.asyncIterator
+        ]();
+        const next = iterator.next();
+        if (stage === "pending-read") {
+          await readStarted.promise;
+          await reconnect();
+          pending.resolve();
+        }
+        if (stage === "between-chunks") {
+          expect((await next).value?.rows).toEqual(chunk.rows);
+          await reconnect();
+          await expect(iterator.next()).rejects.toThrow(
+            /export connection changed/i,
+          );
+        } else {
+          await expect(next).rejects.toThrow(/export connection changed/i);
+        }
+      });
+      await panel.webview.dispatchMessage({
+        type,
+        payload: pageOnly ? { limitToPage: { page: 1, pageSize: 25 } } : {},
+      });
+      expect(exportTableDataMock).toHaveBeenCalledOnce();
+      expect(onDispose).not.toHaveBeenCalled();
+      if (stage === "save-dialog") {
+        expect(closed).not.toHaveBeenCalled();
+        expect(getPageMock).not.toHaveBeenCalled();
+      } else if (!pageOnly) {
+        expect(closed).toHaveBeenCalledOnce();
+      }
+    } finally {
+      await manager.dispose();
+    }
   });
 
   it.each([

@@ -125,6 +125,113 @@ describe("exportService", () => {
   });
 
   it.each(
+    (["timeout", "shards"] as const).flatMap((failure) =>
+      (["csv", "json"] as const).flatMap((format) =>
+        (["sorted", "filtered"] as const).map((mode) => ({
+          failure,
+          format,
+          mode,
+        })),
+      ),
+    ),
+  )("preserves the destination for partial Elasticsearch HTTP results ($failure $format $mode)", async ({
+    failure,
+    format,
+    mode,
+  }) => {
+    const fixture = await createElasticsearchHttpFixture({
+      window: 10000,
+      partialSearch: failure,
+    });
+    try {
+      const exporters = await import("../../src/extension/utils/exportService");
+      fs.writeFileSync(outputPath, "original file");
+      const exporter =
+        format === "csv"
+          ? exporters.exportTableDataAsCsv
+          : exporters.exportTableDataAsJson;
+      await exporter({
+        fileName: "records",
+        loadChunks: (signal) =>
+          fixture.service.exportAll(
+            "es-http",
+            "default",
+            "indices",
+            "records",
+            500,
+            mode === "sorted" ? { column: "_id", direction: "asc" } : null,
+            mode === "filtered"
+              ? [{ column: "_id", operator: "like", value: "doc" }]
+              : [],
+            signal,
+          ),
+      });
+      expect(fs.readFileSync(outputPath, "utf8")).toBe("original file");
+      expect(fs.readdirSync(tempDir)).toEqual(["export.out"]);
+      expect(vscodeMock.showInformationMessage).not.toHaveBeenCalled();
+      expect(vscodeMock.showErrorMessage).toHaveBeenCalledWith(
+        expect.stringMatching(/incomplete results/i),
+      );
+      expect(fixture.activeReaders).toBe(0);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it.each([
+    "csv",
+    "json",
+  ] as const)("preserves the destination when the export connection changes (%s)", async (format) => {
+    const { TableReadService } = await import(
+      "../../src/extension/table/tableReadService"
+    );
+    const exporters = await import("../../src/extension/utils/exportService");
+    const columns = [
+      { name: "id", category: "text" as const, nativeType: "text" },
+    ];
+    const readTablePage = vi.fn(async () => ({
+      columns,
+      rows: [{ id: "server-a" }],
+      totalCount: 2,
+    }));
+    let driver = { readTablePage };
+    const service = new TableReadService({
+      getConnection: () => ({ id: "c1" }),
+      getDriver: () => driver,
+    } as never);
+    fs.writeFileSync(outputPath, "original file");
+    const exporter =
+      format === "csv"
+        ? exporters.exportTableDataAsCsv
+        : exporters.exportTableDataAsJson;
+    await exporter({
+      fileName: "records",
+      loadChunks: async function* (signal) {
+        for await (const chunk of service.exportAll(
+          "c1",
+          "db",
+          "public",
+          "records",
+          1,
+          null,
+          [],
+          signal,
+        )) {
+          yield chunk;
+          driver = { readTablePage: vi.fn() };
+        }
+      },
+    });
+    expect(fs.readFileSync(outputPath, "utf8")).toBe("original file");
+    expect(fs.readdirSync(tempDir)).toEqual(["export.out"]);
+    expect(vscodeMock.showInformationMessage).not.toHaveBeenCalled();
+    expect(vscodeMock.showErrorMessage).toHaveBeenCalledWith(
+      expect.stringMatching(/connection changed/i),
+    );
+    expect(driver.readTablePage).not.toHaveBeenCalled();
+  });
+
+  it.each(
     (["map", "list"] as const).flatMap((sampleType) =>
       (["cursor", "materialized", "client-filter"] as const).flatMap(
         (readPath) =>

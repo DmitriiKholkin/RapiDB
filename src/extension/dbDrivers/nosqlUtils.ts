@@ -32,11 +32,9 @@ function stringifyNested(value: unknown): unknown {
 export function flattenRootRecord(
   record: Record<string, unknown>,
 ): Record<string, unknown> {
-  const flattened: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(record)) {
-    flattened[key] = stringifyNested(value);
-  }
-  return flattened;
+  return Object.fromEntries(
+    Object.entries(record).map(([key, value]) => [key, stringifyNested(value)]),
+  );
 }
 
 export function inferColumnsFromRows(

@@ -443,7 +443,18 @@ function TableDataGrid({
 
   const columnsMapRef = useRef(columnsMap);
 
-  const [columnSizing, setColumnSizing] = useState<Record<string, number>>({});
+  const selectionColumnId = useMemo(() => {
+    let id = "__sel";
+    while (columnsMap.has(id)) id += "_";
+    return id;
+  }, [columnsMap]);
+  const [columnSizingState, setColumnSizing] = useState<Record<string, number>>(
+    {},
+  );
+  const columnSizing = useMemo<Record<string, number>>(
+    () => Object.assign(Object.create(null), columnSizingState),
+    [columnSizingState],
+  );
   const [columnOrder, setColumnOrder] = useState<string[]>([]);
   const columnOrderRef = useRef(columnOrder);
   const columnSizingRef = useRef(columnSizing);
@@ -494,7 +505,7 @@ function TableDataGrid({
   const getCellValue = useCallback(
     (rowIndex: number, colIndex: number) => {
       const colId = columnOrderRef.current[colIndex];
-      if (!colId || colId === "__sel") return undefined;
+      if (!colId || colId === selectionColumnId) return undefined;
       if (rowIndex < 0) {
         const draftIdx = rowIndex + newRowsRef.current.length;
         const draft = newRowsRef.current[draftIdx];
@@ -513,7 +524,7 @@ function TableDataGrid({
         ) ?? row[colId]
       );
     },
-    [rows],
+    [rows, selectionColumnId],
   );
 
   const getCellFromPoint = useCallback((x: number, y: number) => {
@@ -572,11 +583,11 @@ function TableDataGrid({
   const isColumnCollapsed = useCallback(
     (visualColIndex: number) => {
       const colId = columnOrderRef.current[visualColIndex];
-      if (!colId || colId === "__sel") return false;
+      if (!colId || colId === selectionColumnId) return false;
       const size = columnSizing[colId] ?? colSizes[colId] ?? 160;
       return isCollapsedWidth(size);
     },
-    [columnSizing, colSizes],
+    [columnSizing, colSizes, selectionColumnId],
   );
 
   const selection = useCellSelection({
@@ -754,7 +765,7 @@ function TableDataGrid({
       const visiblePasteColumns: ColumnMeta[] = [];
       for (let i = anchorCol; i < columnOrderRef.current.length; i++) {
         const colId = columnOrderRef.current[i];
-        if (colId === "__sel") continue;
+        if (colId === selectionColumnId) continue;
         const size =
           columnSizingRef.current[colId] ?? colSizesRef.current[colId] ?? 160;
         if (isCollapsedWidth(size)) continue;
@@ -983,6 +994,7 @@ function TableDataGrid({
   }, [
     canEditRows,
     rows,
+    selectionColumnId,
     selColOffset,
     onBatchCellEdit,
     onMixedBatchEdit,
@@ -1000,10 +1012,10 @@ function TableDataGrid({
 
   useEffect(() => {
     setColumnOrder([
-      ...(canSelectAndDeleteRows ? ["__sel"] : []),
+      ...(canSelectAndDeleteRows ? [selectionColumnId] : []),
       ...columns.map((column) => column.name),
     ]);
-  }, [columns, canSelectAndDeleteRows]);
+  }, [columns, canSelectAndDeleteRows, selectionColumnId]);
 
   const wasDraggedRef = React.useRef(false);
   const resizeCleanupRef = useRef<(() => void) | null>(null);
@@ -1016,7 +1028,7 @@ function TableDataGrid({
     useColumnDragReorder({
       getColumnOrder: () => columnOrderRef.current,
       setColumnOrder: (updater) => setColumnOrder(updater),
-      excludedIds: ["__sel"],
+      excludedIds: [selectionColumnId],
       onDragActivated: () => {
         wasDraggedRef.current = true;
       },
@@ -1032,7 +1044,7 @@ function TableDataGrid({
       ...(canSelectAndDeleteRows
         ? [
             {
-              id: "__sel",
+              id: selectionColumnId,
               size: 36,
               header: () => (
                 <input
@@ -1094,7 +1106,8 @@ function TableDataGrid({
       ...columns.map(
         (column): TanColumnDef<Row> => ({
           id: column.name,
-          accessorKey: column.name,
+          accessorFn: (row) =>
+            Object.hasOwn(row, column.name) ? row[column.name] : undefined,
           meta: column,
           size: colSizes[column.name] ?? colSizes[`${column.name}key`] ?? 160,
           minSize: 1,
@@ -1123,7 +1136,12 @@ function TableDataGrid({
               )}
             </span>
           ),
-          cell: ({ row, getValue }) => {
+          cell: ({ row }) => {
+            // Read literal names directly: TanStack's object-backed value cache
+            // cannot safely store __proto__, and accessorKey treats dots as paths.
+            const originalValue = Object.hasOwn(row.original, column.name)
+              ? row.original[column.name]
+              : undefined;
             const rowIdx = row.index;
             const isEditing =
               editCell?.kind === "persisted" &&
@@ -1132,10 +1150,10 @@ function TableDataGrid({
             const pendingRow = pendingEdits.get(rowIdx);
             const hasPending = pendingRow?.has(column.name) ?? false;
             const pendingValue = pendingRow?.get(column.name);
-            const displayValue = hasPending ? pendingValue : getValue();
+            const displayValue = hasPending ? pendingValue : originalValue;
 
             if (isEditing) {
-              const startValue = hasPending ? pendingValue : getValue();
+              const startValue = hasPending ? pendingValue : originalValue;
               const startString = valueToEditString(startValue);
               return (
                 <EditInput
@@ -1148,7 +1166,7 @@ function TableDataGrid({
                     Boolean(getRowMutationBlockReason?.(rowIdx))
                   }
                   onCommit={(value) =>
-                    onCommitCellEdit(rowIdx, column, value, getValue())
+                    onCommitCellEdit(rowIdx, column, value, originalValue)
                   }
                   onCancel={onCancelEdit}
                 />
@@ -1174,6 +1192,7 @@ function TableDataGrid({
     ],
     [
       canEditRows,
+      selectionColumnId,
       canSelectAndDeleteRows,
       getRowMutationBlockReason,
       selectableRowIndexes,
@@ -1254,7 +1273,8 @@ function TableDataGrid({
             {tanTable.getHeaderGroups().map((headerGroup) => (
               <tr key={headerGroup.id}>
                 {headerGroup.headers.map((header) => {
-                  const isSelectionColumn = header.column.id === "__sel";
+                  const isSelectionColumn =
+                    header.column.id === selectionColumnId;
                   const columnId = header.column.id;
                   const headerSize = header.getSize();
                   const isCollapsed = isCollapsedWidth(headerSize);
@@ -1405,7 +1425,8 @@ function TableDataGrid({
             ))}
             <tr>
               {tanTable.getHeaderGroups()[0]?.headers.map((header) => {
-                const isSelectionColumn = header.column.id === "__sel";
+                const isSelectionColumn =
+                  header.column.id === selectionColumnId;
                 const column = columnsMap.get(header.column.id);
                 const headerSize = header.getSize();
                 const isCollapsed = isCollapsedWidth(headerSize);
@@ -1684,7 +1705,7 @@ function TableRow({
               ? "Partition key"
               : "Primary key"
           : undefined;
-        const isSelectionColumn = columnId === "__sel";
+        const isSelectionColumn = !columnDef;
         const isCellPending = pendingCols?.has(columnId) ?? false;
         const isEditing = columnId === editingCol;
         const canOpenCellEditor =
@@ -1742,7 +1763,7 @@ function TableRow({
             }}
             title={
               !isCollapsed && isPrimaryKey
-                ? `${primaryKeyLabel}: ${getCellPreviewTitle(cell.getValue())}`
+                ? `${primaryKeyLabel}: ${getCellPreviewTitle(Object.hasOwn(row.original, columnId) ? row.original[columnId] : undefined)}`
                 : undefined
             }
             onMouseDown={(event) => {
@@ -1827,7 +1848,7 @@ function DraftTableRow({
       {visibleColumns.map((column) => {
         const columnId = column.id;
         const columnDef = columnsMap.get(columnId);
-        const isSelectionColumn = columnId === "__sel";
+        const isSelectionColumn = !columnDef;
 
         if (isSelectionColumn || !columnDef) {
           return (

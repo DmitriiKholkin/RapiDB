@@ -110,7 +110,9 @@ export function TableView({
   const hiddenColumnIdsRef = useRef<Set<string>>(new Set());
   const getExportColumnOrder = () =>
     columnOrderRef.current.filter(
-      (id) => id !== "__sel" && !hiddenColumnIdsRef.current.has(id),
+      (id) =>
+        columnsRef.current.some((column) => column.name === id) &&
+        !hiddenColumnIdsRef.current.has(id),
     );
 
   const data = useTableDataController({

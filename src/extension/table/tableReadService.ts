@@ -217,6 +217,59 @@ export class TableReadService {
     rows: Record<string, unknown>[];
   }> {
     const { driver } = this.getConnectionDriver(connectionId);
+    let invalidated = false;
+    const subscription =
+      this.connectionManager.onDidInvalidateConnectionMetadata?.((id) => {
+        if (id === connectionId) invalidated = true;
+      });
+    const assertSession = () => {
+      signal?.throwIfAborted();
+      if (
+        invalidated ||
+        this.connectionManager.getDriver(connectionId) !== driver
+      ) {
+        throw new Error(
+          "Export connection changed. The export was stopped; retry using the current connection.",
+        );
+      }
+    };
+    try {
+      assertSession();
+      for await (const chunk of this.exportAllChunks(
+        connectionId,
+        database,
+        schema,
+        table,
+        chunkSize,
+        sort,
+        filters,
+        signal,
+      )) {
+        assertSession();
+        yield chunk;
+        // The destination can apply backpressure between chunks.
+        assertSession();
+      }
+      assertSession();
+    } finally {
+      subscription?.dispose();
+    }
+  }
+
+  private async *exportAllChunks(
+    connectionId: string,
+    database: string,
+    schema: string,
+    table: string,
+    chunkSize: number,
+    sort: SortConfig | null,
+    filters: FilterExpression[],
+    signal?: AbortSignal,
+  ): AsyncGenerator<{
+    columns: ColumnTypeMeta[];
+    rows: Record<string, unknown>[];
+  }> {
+    const { driver } = this.getConnectionDriver(connectionId);
     if (driver.exportTableChunks && filters.length === 0 && sort === null) {
       yield* driver.exportTableChunks(
         { database, schema, table, chunkSize },
@@ -414,24 +467,27 @@ export class TableReadService {
     result: QueryResult,
   ): Record<string, unknown>[] {
     return result.rows.map((row) => {
-      const projectionValues: Record<string, unknown> = {};
-      result.columns.forEach((columnName, index) => {
-        projectionValues[columnName] = row[`__col_${index}`];
-      });
-      const formattedRow: Record<string, unknown> = {};
-      columns.forEach((column, columnIndex) => {
-        const value = projectionValues[column.name];
-        formattedRow[column.name] = driver.formatTableDataValue
-          ? driver.formatTableDataValue(
-              value,
-              column,
-              projectionValues,
-              columnIndex,
-              columns,
-            )
-          : driver.formatOutputValue(value, column);
-      });
-      return formattedRow;
+      const projectionValues = Object.fromEntries(
+        result.columns.map((columnName, index) => [
+          columnName,
+          row[`__col_${index}`],
+        ]),
+      );
+      return Object.fromEntries(
+        columns.map((column, columnIndex) => {
+          const value = projectionValues[column.name];
+          const formatted = driver.formatTableDataValue
+            ? driver.formatTableDataValue(
+                value,
+                column,
+                projectionValues,
+                columnIndex,
+                columns,
+              )
+            : driver.formatOutputValue(value, column);
+          return [column.name, formatted];
+        }),
+      );
     });
   }
 

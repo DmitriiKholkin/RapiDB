@@ -13,6 +13,7 @@ export async function createElasticsearchHttpFixture(options?: {
   denySettings?: boolean;
   stallSearch?: boolean;
   window?: number;
+  partialSearch?: "timeout" | "shards";
 }) {
   const window = options?.window ?? 3;
   const searchStarted = deferred<void>();
@@ -107,7 +108,8 @@ export async function createElasticsearchHttpFixture(options?: {
           sort: [ordinal],
         }))
           .filter((hit) => hit.sort[0] > cursor)
-          .slice(0, body.size ?? 1);
+          .slice(0, body.size ?? 1)
+          .slice(0, options?.partialSearch ? 2 : undefined);
         let pit_id: string | undefined;
         if (body.pit) {
           pits.delete(body.pit.id);
@@ -116,9 +118,19 @@ export async function createElasticsearchHttpFixture(options?: {
         }
         send({
           pit_id,
-          timed_out: false,
-          _shards: { total: 1, successful: 1, failed: 0 },
-          hits: { total: { value: 17, relation: "eq" }, hits },
+          timed_out: options?.partialSearch === "timeout",
+          _shards: {
+            total: 1,
+            successful: options?.partialSearch === "shards" ? 0 : 1,
+            failed: options?.partialSearch === "shards" ? 1 : 0,
+          },
+          hits: {
+            total: {
+              value: options?.partialSearch ? hits.length : 17,
+              relation: "eq",
+            },
+            hits,
+          },
         });
       };
       if (options?.stallSearch) heldSearches.push(finishSearch);

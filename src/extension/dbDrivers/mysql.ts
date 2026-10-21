@@ -2057,18 +2057,26 @@ export class MySQLDriver extends BaseDBDriver {
       request.table,
     );
     const selectList = columns
-      .map((column) => {
+      .map((column, index) => {
         const quoted = this.quoteIdentifier(column.name);
-        if (column.category === "spatial") {
-          return `ST_AsText(${quoted}) AS ${quoted}`;
-        }
-        return quoted;
+        const expression =
+          column.category === "spatial" ? `ST_AsText(${quoted})` : quoted;
+        return `${expression} AS ${this.quoteIdentifier(`__rapidb_col_${index}`)}`;
       })
       .join(", ");
     const offset = (request.page - 1) * request.pageSize;
+    const sortExpression = request.sort
+      ? `${qualifiedTableName}.${this.quoteIdentifier(request.sort.column)}`
+      : "";
+    const sortValue = columns.some(
+      (column) =>
+        column.name === request.sort?.column && column.category === "spatial",
+    )
+      ? `ST_AsText(${sortExpression})`
+      : sortExpression;
     const orderByClause = request.sort
       ? `ORDER BY ${[
-          `${this.quoteIdentifier(request.sort.column)} ${request.sort.direction === "desc" ? "DESC" : "ASC"}`,
+          `${sortValue} ${request.sort.direction === "desc" ? "DESC" : "ASC"}`,
           ...columns
             .filter(
               (column) =>
@@ -2079,9 +2087,12 @@ export class MySQLDriver extends BaseDBDriver {
                 (left.primaryKeyOrdinal ?? Number.MAX_SAFE_INTEGER) -
                 (right.primaryKeyOrdinal ?? Number.MAX_SAFE_INTEGER),
             )
-            .map((column) => `${this.quoteIdentifier(column.name)} ASC`),
+            .map(
+              (column) =>
+                `${qualifiedTableName}.${this.quoteIdentifier(column.name)} ASC`,
+            ),
         ].join(", ")}`
-      : this.buildOrderByDefault(columns);
+      : this.buildOrderByDefault(columns, qualifiedTableName);
 
     let totalCount = 0;
     let countFailed = false;
@@ -2117,16 +2128,14 @@ export class MySQLDriver extends BaseDBDriver {
       [...whereParams, ...pagination.params],
     );
 
-    const fetchedRows = dataResult.rows.map((row) => {
-      const formattedRow: Record<string, unknown> = {};
-      columns.forEach((column, index) => {
-        formattedRow[column.name] = this.formatOutputValue(
-          row[`__col_${index}`],
-          column,
-        );
-      });
-      return formattedRow;
-    });
+    const fetchedRows = dataResult.rows.map((row) =>
+      Object.fromEntries(
+        columns.map((column, index) => [
+          column.name,
+          this.formatOutputValue(row[`__col_${index}`], column),
+        ]),
+      ),
+    );
 
     const hasMoreRows = countFailed && fetchedRows.length > request.pageSize;
     const rows = hasMoreRows
@@ -2172,12 +2181,11 @@ export class MySQLDriver extends BaseDBDriver {
         Object.fromEntries(
           row.map((val, i) => {
             let v = val;
-            if (boolCols.has(i) && v !== null && v !== undefined) {
-              if (Buffer.isBuffer(v)) {
-                v = v[0] === 1 ? 1 : 0;
-              } else {
-                v = v === true || v === 1 || v === "1" ? 1 : 0;
-              }
+            // TINYINT(1) is only a display-width convention: MySQL still
+            // stores its full integer range. Never collapse a stored key to
+            // 0/1; the table viewer uses these values for UPDATE and DELETE.
+            if (boolCols.has(i) && typeof v === "boolean") {
+              v = v ? 1 : 0;
             }
             if (bitIntCols.has(i) && v !== null && v !== undefined) {
               if (Buffer.isBuffer(v)) {
@@ -2931,7 +2939,7 @@ export class MySQLDriver extends BaseDBDriver {
         }
       }
       if (typeof value === "number") {
-        return value === 0 ? 0 : 1;
+        return value;
       }
     }
     if (column.category === "spatial") {

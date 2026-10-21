@@ -1278,6 +1278,7 @@ export class TablePanel {
     format: "csv" | "json",
     payload: ExportPayload | undefined,
   ): Promise<void> {
+    const connectionGeneration = this.connectionGeneration;
     const {
       sort = null,
       filters = [],
@@ -1296,26 +1297,29 @@ export class TablePanel {
       : displayTable;
     const filterExpressions = coerceFilterExpressions(filters);
     const loadChunks = (signal: AbortSignal) =>
-      this.reorderChunks(
-        normalizedLimitToPage
-          ? this._pageAsChunks(
-              normalizedLimitToPage.page,
-              normalizedLimitToPage.pageSize,
-              sort as SortConfig | null,
-              filterExpressions,
-              signal,
-            )
-          : this.svc.exportAll(
-              this.connectionId,
-              this.database,
-              this.schema,
-              this.table,
-              EXPORT_CHUNK_SIZE,
-              sort as SortConfig | null,
-              filterExpressions,
-              signal,
-            ),
-        columnOrder,
+      this.guardExportSession(
+        this.reorderChunks(
+          normalizedLimitToPage
+            ? this._pageAsChunks(
+                normalizedLimitToPage.page,
+                normalizedLimitToPage.pageSize,
+                sort as SortConfig | null,
+                filterExpressions,
+                signal,
+              )
+            : this.svc.exportAll(
+                this.connectionId,
+                this.database,
+                this.schema,
+                this.table,
+                EXPORT_CHUNK_SIZE,
+                sort as SortConfig | null,
+                filterExpressions,
+                signal,
+              ),
+          columnOrder,
+        ),
+        connectionGeneration,
       );
 
     if (format === "csv") {
@@ -1332,6 +1336,27 @@ export class TablePanel {
       loadChunks,
       context: this.context,
     });
+  }
+
+  private async *guardExportSession(
+    chunks: AsyncIterable<ChunkedExportData>,
+    connectionGeneration: number,
+  ): AsyncIterable<ChunkedExportData> {
+    const assertSession = () => {
+      if (!this.isCurrentMutationSession(connectionGeneration)) {
+        throw new Error(
+          "Export connection changed or the table panel was closed. Retry the export from the current connection.",
+        );
+      }
+    };
+    // Also covers session changes while the Save dialog is open.
+    assertSession();
+    for await (const chunk of chunks) {
+      assertSession();
+      yield chunk;
+      assertSession();
+    }
+    assertSession();
   }
 
   private async *reorderChunks(
@@ -1373,13 +1398,14 @@ export class TablePanel {
         return column;
       });
 
-      const reorderedRows = chunk.rows.map((row) => {
-        const newRow: Record<string, unknown> = {};
-        for (const col of reorderedColumns) {
-          newRow[col.name] = row[col.name];
-        }
-        return newRow;
-      });
+      const reorderedRows = chunk.rows.map((row) =>
+        Object.fromEntries(
+          reorderedColumns.map((column) => [
+            column.name,
+            Object.hasOwn(row, column.name) ? row[column.name] : undefined,
+          ]),
+        ),
+      );
 
       yield { columns: reorderedColumns, rows: reorderedRows };
     }

@@ -331,7 +331,7 @@ describe("mysql filter normalization", () => {
 
     expect(
       sqlCalls.some((sql) =>
-        sql.includes("ST_AsText(`geometry_column`) AS `geometry_column`"),
+        /ST_AsText\(`geometry_column`\) AS `__rapidb_col_\d+`/.test(sql),
       ),
     ).toBe(true);
     expect(page.rows[0]?.geometry_column).toBe("MULTIPOINT((0 0),(1 1),(2 2))");
@@ -463,7 +463,7 @@ describe("mysql filter normalization", () => {
     expect(dataCall?.sql).toContain(
       "WHERE `title` LIKE CAST(UNHEX(?) AS CHAR) ESCAPE '!'",
     );
-    expect(dataCall?.sql).toContain("ORDER BY `title` DESC");
+    expect(dataCall?.sql).toContain("ORDER BY `test`.`users`.`title` DESC");
     expect(dataCall?.params).toEqual([
       Buffer.from("%row%").toString("hex"),
       6,

@@ -237,6 +237,47 @@ describe.runIf(live)("MongoDB integer mutation data safety (live BSON)", () => {
     }
   });
   it.each([
+    'NumberLong("9223372036854775808")',
+    'NumberLong("18446744073709551616")',
+    'NumberInt("1.5")',
+    'NumberLong("12junk")',
+  ])("rejects unsafe mongosh literal %s without deleting another document or submitting earlier writes", async (literal) => {
+    const collection = admin.db(database).collection(table);
+    await collection.insertMany([
+      { _id: Long.fromString("-9223372036854775808") },
+      { _id: new Int32(0) },
+      { _id: new Int32(1) },
+      { _id: new Int32(12) },
+    ] as never);
+    const target = `db.getSiblingDB("${database}").getCollection("${table}")`;
+    await expect(
+      driver.query(
+        `${target}.insertOne({_id:"unexpected"}); ${target}.deleteOne({_id:${literal}})`,
+      ),
+    ).rejects.toThrow(/integer|range/i);
+    expect(Number(await collection.countDocuments())).toBe(4);
+    expect(await collection.findOne({ _id: "unexpected" } as never)).toBeNull();
+  });
+  it("persists exact BSON types and int32/int64 boundaries from mongosh literals", async () => {
+    const target = `db.getSiblingDB("${database}").getCollection("${table}")`;
+    await driver.query(
+      `${target}.insertOne({_id:"bounds", minInt:NumberInt("-2147483648"), maxInt:NumberInt("2147483647"), minLong:NumberLong("-9223372036854775808"), maxLong:NumberLong("9223372036854775807")})`,
+    );
+    const saved = await admin
+      .db(database)
+      .collection(table)
+      .findOne({ _id: "bounds" } as never);
+    for (const [name, expected, type] of [
+      ["minInt", "-2147483648", Int32],
+      ["maxInt", "2147483647", Int32],
+      ["minLong", "-9223372036854775808", Long],
+      ["maxLong", "9223372036854775807", Long],
+    ] as const) {
+      expect(saved?.[name]).toBeInstanceOf(type);
+      expect(saved?.[name].toString()).toBe(expected);
+    }
+  });
+  it.each([
     [{ $ne: "never" }, "concurrent value"],
     [{ $exists: true }, "concurrent value"],
     [{ $gt: 0 }, 42],

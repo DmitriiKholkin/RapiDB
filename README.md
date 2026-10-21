@@ -92,7 +92,7 @@ The query editor runs on **Monaco** - the same engine as VS Code itself. You get
 - ⌨️ `Ctrl+Enter` / `F5` to run · Select a fragment to run just that part
 - ↕️ Drag the divider to resize editor vs results
 
-For PostgreSQL, MySQL, and SQL Server, finish explicit transactions with `COMMIT` or `ROLLBACK` in the same executed script. Unfinished transactions are not kept for a later Execute. SQL Server keeps one session across the script's `GO` batches and cleans it before another query can borrow it; cancelling or timing out a query is not proof that earlier commits were undone.
+For PostgreSQL, MySQL, SQL Server, and SQLite, finish explicit transactions with `COMMIT` or `ROLLBACK` in the same executed script (or `RELEASE` for an outermost SQLite `SAVEPOINT`). Unfinished transactions are not kept for a later Execute. SQL Server keeps one session across the script's `GO` batches and cleans it before another query can borrow it; cancelling or timing out a query is not proof that earlier commits were undone.
 
 <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-2.png" alt="SQL Editor with results" width="100%" />
 
@@ -110,6 +110,8 @@ Results land in a **virtualized table** - no jank, no browser tab hanging:
 > Truncated results show a warning. `rapidb.queryRowLimit` controls the number of displayed rows, subject to a hard ceiling of 10,000 rows; increasing the setting above 10,000 does not lift that ceiling. This display limit does not limit rows affected by a mutation or cancel query execution.
 
 MongoDB `find` and `aggregate` results also have a safety budget. The default sample is 100 documents; requesting more cannot bypass the 10,000-document ceiling, including with `find().limit(0)`. Negative and fractional chain limits are rejected; `aggregate().limit()` requires a positive integer. A probe document detects actual truncation without becoming part of the displayed schema. Exporting a truncated query result requires confirmation and exports only the displayed rows.
+
+MongoDB `NumberInt(...)` and `NumberLong(...)` literals require one integer argument within the signed BSON int32/int64 range. Fractional, malformed, overflowing, and unsafe JavaScript number arguments are rejected before any operation in the script is sent. For exact large integers, use strings such as `NumberLong("9223372036854775807")` or bigint arguments rather than unquoted JavaScript numbers.
 
 Table exports keep a stable column schema across chunks. CSV uses the declared columns (including empty cells for missing values); a later unexpected column fails the export rather than silently dropping data. JSON applies the same unexpected-column check. Failed exports leave an existing destination file intact.
 
@@ -131,6 +133,8 @@ Click any table → the **Table Data Viewer** opens:
 Persisted edits are prevalidated against available column metadata before any write. Known unsupported edits fail before the batch is applied; where representation compatibility depends on the stored value, verification runs in the transaction and a mismatch rolls it back. Preview skipping does not bypass validation or verification. Schemaless sampling is not a complete database schema or a guarantee that every value has the sampled type.
 
 Temporal-value verification is driver-specific: SQL Server and Oracle verify explicitly edited dates/times, while PostgreSQL, MySQL, and SQLite retain their existing temporal verification exceptions. Exact temporal persistence is not guaranteed by this safeguard for those three drivers.
+
+MySQL `TINYINT(1)` is not restricted to boolean storage. Values outside `0`/`1` are preserved in query results, table reads, row keys, and exports rather than converted to booleans.
 
 <br/>
 

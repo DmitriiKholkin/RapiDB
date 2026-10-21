@@ -844,6 +844,7 @@ export class ElasticsearchDriver implements IDBDriver {
         } as never,
         ...transportArgs,
       );
+      this.assertCompleteSearch(response);
       const rows = this.hitsToRows(
         response.hits.hits as unknown as Array<Record<string, unknown>>,
       );
@@ -867,6 +868,7 @@ export class ElasticsearchDriver implements IDBDriver {
         } as never,
         ...transportArgs,
       );
+      this.assertCompleteSearch(response);
       const rows = this.hitsToRows(
         response.hits.hits as unknown as Array<Record<string, unknown>>,
       );
@@ -1210,11 +1212,13 @@ export class ElasticsearchDriver implements IDBDriver {
               sort: ["_doc"],
               size: ELASTICSEARCH_READ_BUDGET.hardCap,
               track_total_hits: true,
+              allow_partial_search_results: false,
               seq_no_primary_term: true,
             },
             { ...options, maxRetries: 0 },
           ),
         );
+        this.assertCompleteSearch(response);
         const rows = this.hitsToRows(response.hits.hits, request.table);
         if (
           this.resolveElasticsearchTotalCount(response.hits.total) > rows.length
@@ -1372,11 +1376,7 @@ export class ElasticsearchDriver implements IDBDriver {
           }
         });
         reader.check();
-        if (response.timed_out || (response._shards?.failed ?? 0) > 0) {
-          throw new Error(
-            "Elasticsearch PIT search returned incomplete results.",
-          );
-        }
+        this.assertCompleteSearch(response);
         if (first && trackCount) {
           totalCount = this.resolveElasticsearchTotalCount(response.hits.total);
         }
@@ -1421,6 +1421,17 @@ export class ElasticsearchDriver implements IDBDriver {
         await reader.waitForClose().catch((error: unknown) => {
           if (!failed) throw error;
         });
+    }
+  }
+
+  private assertCompleteSearch(response: {
+    timed_out?: boolean;
+    _shards?: { failed?: number };
+  }): void {
+    if (response.timed_out || (response._shards?.failed ?? 0) > 0) {
+      throw new Error(
+        "Elasticsearch search returned incomplete results (server timeout or shard failure). Retry after resolving the cluster error.",
+      );
     }
   }
 

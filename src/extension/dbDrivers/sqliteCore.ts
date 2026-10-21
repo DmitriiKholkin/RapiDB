@@ -969,20 +969,33 @@ export class SQLiteCoreDriver extends BaseDBDriver {
       const result = await this.executeQuery(sql, params, operationContext);
       checkDeadline();
       if (transactional) db.exec("RELEASE SAVEPOINT rapidb_query_deadline");
+      if (db.inTransaction) {
+        throw new Error(
+          "Unfinished SQLite transaction was rolled back. Execute BEGIN/SAVEPOINT and COMMIT/ROLLBACK/RELEASE in the same script. Earlier commits are not undone.",
+        );
+      }
       return result;
     } catch (error) {
-      if (transactional && db.inTransaction) {
+      // The worker session is shared by editors and table mutations. Explicit
+      // transactions (including failed scripts) must not leak to the next call.
+      if (db.inTransaction) {
         try {
-          db.exec("ROLLBACK TO SAVEPOINT rapidb_query_deadline");
-          db.exec("RELEASE SAVEPOINT rapidb_query_deadline");
+          if (transactional) {
+            db.exec("ROLLBACK TO SAVEPOINT rapidb_query_deadline");
+            db.exec("RELEASE SAVEPOINT rapidb_query_deadline");
+          } else {
+            db.exec("ROLLBACK");
+          }
         } catch (rollbackError) {
           throw new SQLiteRollbackFailure(error, rollbackError);
         }
-        if (error instanceof TransactionVerificationError) throw error;
-        throw new MutationNotExecutedError(
-          error instanceof Error ? error.message : String(error),
-          error,
-        );
+        if (transactional) {
+          if (error instanceof TransactionVerificationError) throw error;
+          throw new MutationNotExecutedError(
+            error instanceof Error ? error.message : String(error),
+            error,
+          );
+        }
       }
       throw error;
     }
