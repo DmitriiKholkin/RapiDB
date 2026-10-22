@@ -1,3 +1,4 @@
+import { resolveMongoRemoteTarget as resolveMongoTarget } from "../../shared/mongoConnection";
 import type { ConnectionConfig } from "../connectionManagerModels";
 import { logErrorWithContext } from "../utils/errorHandling";
 import type {
@@ -228,21 +229,7 @@ export class SshService {
     host: string;
     port: number;
   } {
-    const url = config.connectionUri || config.uri;
-    if (url) {
-      try {
-        const parsed = new URL(url);
-        return {
-          host: parsed.hostname || "localhost",
-          port: parsed.port ? Number.parseInt(parsed.port, 10) : 27017,
-        };
-      } catch {}
-    }
-
-    return {
-      host: config.host?.trim() || "localhost",
-      port: config.port ?? 27017,
-    };
+    return resolveMongoTarget(config);
   }
 
   private resolveRedisRemoteTarget(config: ConnectionConfig): {
@@ -254,7 +241,7 @@ export class SshService {
       try {
         const parsed = new URL(url);
         return {
-          host: parsed.hostname || "localhost",
+          host: parsed.hostname.replace(/^\[|\]$/g, "") || "localhost",
           port: parsed.port ? Number.parseInt(parsed.port, 10) : 6379,
         };
       } catch {}

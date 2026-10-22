@@ -6,7 +6,10 @@ import {
   REDIS_READ_BUDGET,
 } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
-import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
+import {
+  getSshTcpForwardTransport,
+  getTlsServername,
+} from "../driverRuntimeConfig";
 import {
   type ResolvedConnectionTlsSettings,
   resolveConnectionTlsSettings,
@@ -686,6 +689,9 @@ export class RedisDriver implements IDBDriver {
   ): RedisClient {
     const forwardedTransport = getSshTcpForwardTransport(this.config);
     const tlsSettings = this.tlsSettings;
+    const tlsServername =
+      tlsSettings?.servername ??
+      (forwardedTransport ? getTlsServername(this.config) : undefined);
     const uri = this.config.connectionUri
       ? new URL(this.config.connectionUri)
       : undefined;
@@ -718,6 +724,9 @@ export class RedisDriver implements IDBDriver {
           host:
             (forwardedTransport?.localHost ?? this.config.host) || "127.0.0.1",
           port: forwardedTransport?.localPort ?? this.config.port ?? 6379,
+          ...(uri?.protocol === "rediss:" && forwardedTransport && tlsServername
+            ? { servername: tlsServername }
+            : {}),
         };
     const socketOptions = {
       ...socket,

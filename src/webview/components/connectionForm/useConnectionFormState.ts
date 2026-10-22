@@ -14,6 +14,10 @@ import {
   type ConnectionType,
   DEFAULT_PORT_BY_CONNECTION_TYPE,
 } from "../../../shared/connectionTypes";
+import {
+  getMongoConnectionUri,
+  getMongoFormHost,
+} from "../../../shared/mongoConnection";
 import type {
   ConnectionFormExistingState,
   ConnectionFormSubmission,
@@ -513,7 +517,10 @@ export function useConnectionFormState(
 
   const [conn, setConn] = useState<ConnectionState>({
     type: existing?.type ?? "pg",
-    host: existing?.host ?? "localhost",
+    host:
+      (existing?.type === "mongodb"
+        ? getMongoFormHost(existing)
+        : existing?.host) ?? "localhost",
     port: String(
       existing?.port ?? DEFAULT_PORT_BY_CONNECTION_TYPE[existing?.type ?? "pg"],
     ),
@@ -528,7 +535,8 @@ export function useConnectionFormState(
 
   const [typeSpecific, setTypeSpecific] = useState<TypeSpecificState>({
     oracleServiceName: existing?.serviceName ?? existing?.database ?? "",
-    mongoConnectionUri: existing?.connectionUri ?? existing?.uri ?? "",
+    mongoConnectionUri:
+      getMongoConnectionUri(existing?.type === "mongodb" ? existing : {}) ?? "",
     elasticsearchEndpoint: existing?.endpoint ?? existing?.connectionUri ?? "",
     elasticsearchApiKey: "",
     elasticsearchCloudId: existing?.cloudId ?? "",

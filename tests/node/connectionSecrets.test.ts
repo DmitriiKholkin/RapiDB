@@ -36,12 +36,14 @@ describe("connection URI secret handling", () => {
     const config: ConnectionConfig = {
       id: "uri",
       name: "URI",
-      type: "mongodb",
+      type: uri.startsWith("redis://") ? "redis" : "mongodb",
       connectionUri: uri,
     };
     const persisted = sanitizePersistedConnectionConfig(config);
     expect(persisted.connectionUri).toBe(redacted);
-    expect(validateConnectionConfig(persisted).valid).toBe(true);
+    expect(validateConnectionConfig(persisted).valid).toBe(
+      /^(?:mongodb|redis):\/\//.test(uri),
+    );
     expect(extractCredentialBearingUriSecret(uri)).toBe(uri);
     const secret = serializeConnectionSecretsForStoredConfig(config, undefined);
     expect(JSON.parse(secret ?? "{}")).toEqual({ connectionUri: uri });

@@ -1,6 +1,7 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
+import type { ConnectionFormSubmission } from "../../src/shared/webviewContracts/connection";
 import { ConnectionFormView } from "../../src/webview/components/ConnectionFormView";
 import {
   clearPostedMessages,
@@ -15,6 +16,13 @@ async function submitCreateConnection(
   await user.click(screen.getByRole("button", { name: "Create Connection" }));
 }
 
+async function fillRequiredPostgresFields(
+  user: ReturnType<typeof userEvent.setup>,
+) {
+  await user.type(screen.getByLabelText("Database"), "app");
+  await user.type(screen.getByLabelText("Username"), "reader");
+}
+
 describe("ConnectionFormView", () => {
   it.each([
     "Port",
@@ -23,9 +31,21 @@ describe("ConnectionFormView", () => {
     const user = userEvent.setup();
     render(<ConnectionFormView existing={null} />);
     await user.type(screen.getByLabelText("Connection name"), "Ports");
+    await fillRequiredPostgresFields(user);
     if (label === "SSH port") {
       await user.click(
         screen.getByRole("switch", { name: /connect through ssh bastion/i }),
+      );
+      await user.type(screen.getByLabelText("SSH host"), "bastion.local");
+      await user.type(screen.getByLabelText("SSH username"), "tunnel");
+      await user.selectOptions(
+        screen.getByLabelText("SSH auth method"),
+        "password",
+      );
+      await user.type(screen.getByLabelText("SSH password"), "ssh-secret");
+      await user.selectOptions(
+        screen.getByLabelText("SSH host verification mode"),
+        "trustOnFirstUse",
       );
     }
     const input = screen.getByLabelText(label);
@@ -73,8 +93,20 @@ describe("ConnectionFormView", () => {
     const user = userEvent.setup();
     render(<ConnectionFormView existing={null} />);
     await user.type(screen.getByLabelText("Connection name"), "Ports");
+    await fillRequiredPostgresFields(user);
     await user.click(
       screen.getByRole("switch", { name: /connect through ssh bastion/i }),
+    );
+    await user.type(screen.getByLabelText("SSH host"), "bastion.local");
+    await user.type(screen.getByLabelText("SSH username"), "tunnel");
+    await user.selectOptions(
+      screen.getByLabelText("SSH auth method"),
+      "password",
+    );
+    await user.type(screen.getByLabelText("SSH password"), "ssh-secret");
+    await user.selectOptions(
+      screen.getByLabelText("SSH host verification mode"),
+      "trustOnFirstUse",
     );
     for (const label of ["Port", "SSH port"]) {
       await user.clear(screen.getByLabelText(label));
@@ -97,6 +129,10 @@ describe("ConnectionFormView", () => {
     await user.click(screen.getByRole("button", { name: /mongodb/i }));
     await user.clear(screen.getByLabelText("Port"));
     await user.type(screen.getByLabelText("Port"), "invalid");
+    await user.selectOptions(
+      screen.getByLabelText("MongoDB connection method"),
+      "uri",
+    );
     await user.type(
       screen.getByLabelText("MongoDB connection URI"),
       "mongodb://host",
@@ -180,7 +216,8 @@ describe("ConnectionFormView", () => {
 
     await user.click(screen.getByRole("button", { name: /mongodb/i }));
 
-    expect(screen.getByLabelText("MongoDB connection URI")).toBeTruthy();
+    expect(screen.getByLabelText("MongoDB connection method")).toBeTruthy();
+    expect(screen.getByLabelText("MongoDB URI preview")).toBeTruthy();
     expect(screen.getByLabelText("Database")).toBeTruthy();
 
     await user.click(screen.getByRole("button", { name: /redis/i }));
@@ -206,6 +243,87 @@ describe("ConnectionFormView", () => {
     expect(screen.getByLabelText("AWS region")).toBeTruthy();
     expect(screen.getByLabelText("AWS profile")).toBeTruthy();
     expect(screen.getByLabelText("DynamoDB endpoint")).toBeTruthy();
+  });
+
+  it.each([
+    ["pg", /postgresql/i, 5432],
+    ["mysql", /mysql \/ mariadb/i, 3306],
+    ["mssql", /sql server/i, 1433],
+  ] as const)("submits the network fields and default port for %s", async (type, label, defaultPort) => {
+    const user = userEvent.setup();
+    render(<ConnectionFormView existing={null} />);
+    await user.click(screen.getByRole("button", { name: label }));
+    await user.type(screen.getByLabelText("Connection name"), `${type} QA`);
+    await user.clear(screen.getByLabelText("Host"));
+    await user.type(screen.getByLabelText("Host"), `${type}.db.local`);
+    await user.type(screen.getByLabelText("Database"), "app_db");
+    await user.type(screen.getByLabelText("Username"), "app_user");
+    await user.type(screen.getByLabelText("Password"), "secret");
+
+    await submitCreateConnection(user);
+
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "saveConnection",
+      payload: {
+        type,
+        host: `${type}.db.local`,
+        port: defaultPort,
+        database: "app_db",
+        username: "app_user",
+        password: "secret",
+      },
+    });
+  });
+
+  it("submits Oracle service name as its database target", async () => {
+    const user = userEvent.setup();
+    render(<ConnectionFormView existing={null} />);
+    await user.click(screen.getByRole("button", { name: /oracle/i }));
+    await user.type(screen.getByLabelText("Connection name"), "Oracle QA");
+    await user.clear(screen.getByLabelText("Host"));
+    await user.type(screen.getByLabelText("Host"), "oracle.db.local");
+    await user.type(screen.getByLabelText("Oracle service name"), "FREEPDB1");
+
+    await submitCreateConnection(user);
+
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "saveConnection",
+      payload: {
+        type: "oracle",
+        host: "oracle.db.local",
+        port: 1521,
+        serviceName: "FREEPDB1",
+      },
+    });
+    expect(getLastPostedMessage()?.payload).toHaveProperty("database", "");
+  });
+
+  it("routes SQLite Browse results back into the path field and save payload", async () => {
+    const user = userEvent.setup();
+    render(<ConnectionFormView existing={null} />);
+    await user.click(screen.getByRole("button", { name: /sqlite/i }));
+    await user.type(screen.getByLabelText("Connection name"), "SQLite QA");
+    await user.click(screen.getByRole("button", { name: /browse/i }));
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "browseFile",
+      payload: { target: "filePath" },
+    });
+
+    dispatchIncomingMessage("browseFileResult", {
+      target: "filePath",
+      filePath: "/tmp/rapidb-form-check.sqlite",
+    });
+    await submitCreateConnection(user);
+
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "saveConnection",
+      payload: {
+        type: "sqlite",
+        filePath: "/tmp/rapidb-form-check.sqlite",
+        sqliteWalMode: "auto",
+      },
+    });
   });
 
   it("renders SSH controls conditionally, forces Secret Storage, and hides SSH for SQLite", async () => {
@@ -352,6 +470,11 @@ describe("ConnectionFormView", () => {
       screen.getByLabelText("Connection name"),
       "Readonly browsing",
     );
+    if (databaseType === "Oracle") {
+      await user.type(screen.getByLabelText("Oracle service name"), "XEPDB1");
+    } else {
+      await user.type(screen.getByLabelText("Database"), "app");
+    }
     await submitCreateConnection(user);
     expect(getLastPostedMessage()).toMatchObject({
       type: "saveConnection",
@@ -390,27 +513,32 @@ describe("ConnectionFormView", () => {
     await user.clear(screen.getByLabelText("Connection name"));
     await user.type(screen.getByLabelText("Connection name"), "Mongo Local");
     await user.click(screen.getByRole("button", { name: /mongodb/i }));
+    await user.selectOptions(
+      screen.getByLabelText("MongoDB connection method"),
+      "uri",
+    );
     await user.type(
       screen.getByLabelText("MongoDB connection URI"),
       "mongodb://localhost:27017/app",
     );
-    await user.clear(screen.getByLabelText("Database"));
-    await user.type(screen.getByLabelText("Database"), "admin");
+    expect(screen.queryByLabelText("Database")).toBeNull();
 
     clearPostedMessages();
     await submitCreateConnection(user);
 
-    const mongoMessage = getLastPostedMessage();
+    const mongoMessage = getLastPostedMessage() as
+      | { type: string; payload: ConnectionFormSubmission }
+      | undefined;
     expect(mongoMessage).toEqual({
       type: "saveConnection",
       payload: expect.objectContaining({
         type: "mongodb",
         connectionUri: "mongodb://localhost:27017/app",
-        database: "admin",
+        database: undefined,
       }),
     });
-    expect(mongoMessage?.payload).not.toHaveProperty("uri");
-    expect(mongoMessage?.payload).not.toHaveProperty("authSource");
+    expect(mongoMessage?.payload?.uri).toBeUndefined();
+    expect(mongoMessage?.payload?.authSource).toBeUndefined();
 
     mongoView.unmount();
 
@@ -472,6 +600,12 @@ describe("ConnectionFormView", () => {
     await user.click(screen.getByRole("button", { name: /dynamodb/i }));
     await user.type(screen.getByLabelText("AWS region"), "us-east-1");
     await user.type(screen.getByLabelText("AWS profile"), "default");
+    await user.type(screen.getByLabelText("AWS access key id"), "AKIAQA");
+    await user.type(
+      screen.getByLabelText("AWS secret access key"),
+      "aws-secret",
+    );
+    await user.type(screen.getByLabelText("AWS session token"), "session");
     await user.type(
       screen.getByLabelText("DynamoDB endpoint"),
       "http://localhost:8000",
@@ -487,6 +621,9 @@ describe("ConnectionFormView", () => {
         type: "dynamodb",
         awsRegion: "us-east-1",
         awsProfile: "default",
+        awsAccessKeyId: "AKIAQA",
+        awsSecretAccessKey: "aws-secret",
+        awsSessionToken: "session",
         endpoint: "http://localhost:8000",
       }),
     });
@@ -500,6 +637,7 @@ describe("ConnectionFormView", () => {
 
     await user.clear(screen.getByLabelText("Connection name"));
     await user.type(screen.getByLabelText("Connection name"), "Postgres TLS");
+    await fillRequiredPostgresFields(user);
     await user.selectOptions(screen.getByLabelText("TLS mode"), ["mutualTls"]);
     await user.type(
       screen.getByLabelText("TLS CA certificate file"),
@@ -548,6 +686,7 @@ describe("ConnectionFormView", () => {
 
     await user.clear(screen.getByLabelText("Connection name"));
     await user.type(screen.getByLabelText("Connection name"), "PG SSH");
+    await fillRequiredPostgresFields(user);
     await user.click(
       screen.getByRole("switch", { name: /connect through ssh bastion/i }),
     );
@@ -599,6 +738,7 @@ describe("ConnectionFormView", () => {
 
     await user.clear(screen.getByLabelText("Connection name"));
     await user.type(screen.getByLabelText("Connection name"), "PG SSH TOFU");
+    await fillRequiredPostgresFields(user);
     await user.click(
       screen.getByRole("switch", { name: /connect through ssh bastion/i }),
     );
@@ -713,7 +853,9 @@ describe("ConnectionFormView", () => {
     expect(getLastPostedMessage()).toBeUndefined();
     await waitFor(() => {
       expect(
-        screen.getByText(/Redis database must be a non-negative integer\./i),
+        screen.getByText(
+          /Redis database must be a non-negative safe integer or dbN\./i,
+        ),
       ).toBeTruthy();
     });
   });
@@ -950,5 +1092,416 @@ describe("ConnectionFormView", () => {
     expect(
       (screen.getByLabelText("AWS session token") as HTMLInputElement).value,
     ).toBe("");
+  });
+});
+
+describe("MongoDB connection editor", () => {
+  it("submits the same authSource and credentials for Test and Save, while keeping editor drafts", async () => {
+    const user = userEvent.setup();
+    render(<ConnectionFormView existing={null} />);
+    await user.type(screen.getByLabelText("Connection name"), "Mongo fields");
+    await user.click(screen.getByRole("button", { name: /mongodb/i }));
+    await user.selectOptions(
+      screen.getByLabelText("MongoDB authentication"),
+      "password",
+    );
+    await user.type(screen.getByLabelText("Database"), "app");
+    await user.type(screen.getByLabelText("Username"), "root");
+    await user.type(screen.getByLabelText("Password"), "p@ss");
+    await user.type(
+      screen.getByLabelText("MongoDB authentication database"),
+      "admin",
+    );
+    expect(
+      (screen.getByLabelText("MongoDB URI preview") as HTMLInputElement).value,
+    ).not.toContain("p%40ss");
+    await user.selectOptions(
+      screen.getByLabelText("MongoDB connection method"),
+      "uri",
+    );
+    await user.type(
+      screen.getByLabelText("MongoDB connection URI"),
+      "mongodb://other/uri-db?authSource=admin&retryWrites=false",
+    );
+    expect(screen.queryByLabelText("Host")).toBeNull();
+    expect(screen.queryByLabelText("Password")).toBeNull();
+    await user.selectOptions(
+      screen.getByLabelText("MongoDB connection method"),
+      "fields",
+    );
+    expect(
+      (
+        screen.getByLabelText(
+          "MongoDB authentication database",
+        ) as HTMLInputElement
+      ).value,
+    ).toBe("admin");
+    await user.click(screen.getByRole("button", { name: /test connection/i }));
+    const tested = getLastPostedMessage()?.payload as ConnectionFormSubmission;
+    expect(tested).toMatchObject({
+      mongoConnectionMode: "fields",
+      database: "app",
+      authSource: "admin",
+      username: "root",
+      password: "p@ss",
+    });
+    expect(tested?.connectionUri).toBeUndefined();
+    dispatchIncomingMessage("testResult", { success: true });
+    await waitFor(() =>
+      expect(
+        screen
+          .getByRole("button", { name: /create connection/i })
+          .hasAttribute("disabled"),
+      ).toBe(false),
+    );
+    await submitCreateConnection(user);
+    expect(getLastPostedMessage()?.payload).toMatchObject({
+      ...tested,
+      id: expect.any(String),
+    });
+  });
+
+  it("materializes legacy MongoDB seed ports before saving in fields mode", async () => {
+    const user = userEvent.setup();
+    render(
+      <ConnectionFormView
+        existing={{
+          id: "legacy-seeds",
+          name: "Legacy seeds",
+          type: "mongodb",
+          host: "mongo-a,mongo-b",
+          port: 27018,
+          database: "app",
+        }}
+      />,
+    );
+    expect((screen.getByLabelText("Host") as HTMLInputElement).value).toBe(
+      "mongo-a:27017,mongo-b:27018",
+    );
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "saveConnection",
+      payload: {
+        mongoConnectionMode: "fields",
+        host: "mongo-a:27017,mongo-b:27018",
+        port: 27018,
+      },
+    });
+  });
+
+  it("preserves a legacy MongoDB working database separately from the URI", async () => {
+    const user = userEvent.setup();
+    render(
+      <ConnectionFormView
+        existing={{
+          id: "mongo-db-override",
+          name: "Mongo legacy",
+          type: "mongodb",
+          connectionUri: "mongodb+srv://cluster.example/users",
+          database: "app",
+          hasStoredMongoUriCredentials: true,
+        }}
+      />,
+    );
+    expect(
+      (screen.getByLabelText("MongoDB connection URI") as HTMLInputElement)
+        .value,
+    ).toBe("mongodb+srv://cluster.example/users");
+    expect(
+      (
+        screen.getByLabelText(
+          "MongoDB working database override",
+        ) as HTMLInputElement
+      ).value,
+    ).toBe("app");
+    await user.click(screen.getByRole("button", { name: /test connection/i }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "testConnection",
+      payload: {
+        database: "app",
+        connectionUri: "mongodb+srv://cluster.example/users",
+      },
+    });
+    dispatchIncomingMessage("testResult", { success: true });
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "saveConnection",
+      payload: {
+        database: "app",
+        connectionUri: "mongodb+srv://cluster.example/users",
+      },
+    });
+  });
+
+  it("opens a stored URI with TLS inheritance and explicit credential retention", async () => {
+    const user = userEvent.setup();
+    render(
+      <ConnectionFormView
+        existing={{
+          id: "saved",
+          type: "mongodb",
+          name: "Saved",
+          mongoConnectionMode: "uri",
+          connectionUri: "mongodb+srv://cluster.example/app",
+          hasStoredMongoUriCredentials: true,
+        }}
+      />,
+    );
+    expect(screen.queryByLabelText("Host")).toBeNull();
+    expect(screen.queryByLabelText("TLS mode")).toBeNull();
+    expect(
+      screen
+        .getByRole("switch", { name: /keep saved uri credentials/i })
+        .getAttribute("aria-checked"),
+    ).toBe("true");
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+    expect(getLastPostedMessage()?.payload).toMatchObject({
+      mongoConnectionMode: "uri",
+      keepMongoUriCredentials: true,
+    });
+    expect(
+      (getLastPostedMessage()?.payload as ConnectionFormSubmission)?.tls,
+    ).toBeUndefined();
+  });
+});
+
+describe("Redis URI connection editor", () => {
+  it("rejects a non-Redis URI before sending Test or Save", async () => {
+    const user = userEvent.setup();
+    render(<ConnectionFormView existing={null} />);
+    await user.type(screen.getByLabelText("Connection name"), "Invalid Redis");
+    await user.click(screen.getByRole("button", { name: /redis/i }));
+    await user.selectOptions(
+      screen.getByLabelText("Redis connection method"),
+      "uri",
+    );
+    await user.type(
+      screen.getByLabelText("Redis connection URI"),
+      "http://redis.local:6379/0",
+    );
+    clearPostedMessages();
+
+    await user.click(screen.getByRole("button", { name: /test connection/i }));
+
+    expect(getLastPostedMessage()).toBeUndefined();
+    expect(
+      screen.getByText(/valid redis uri starting with redis:\/\//i),
+    ).toBeTruthy();
+  });
+
+  it("edits and tests URI connections while keeping stored credentials opt-in", async () => {
+    const user = userEvent.setup();
+    render(
+      <ConnectionFormView
+        existing={{
+          id: "redis-uri",
+          name: "Redis URI",
+          type: "redis",
+          connectionUri: "redis://cache.local:6380/4",
+          useSecretStorage: true,
+          hasStoredConnectionUriCredentials: true,
+        }}
+      />,
+    );
+
+    expect(
+      (screen.getByLabelText("Redis connection method") as HTMLSelectElement)
+        .value,
+    ).toBe("uri");
+    expect(screen.queryByLabelText("Host")).toBeNull();
+    expect(screen.queryByLabelText("Password")).toBeNull();
+    expect(
+      (
+        screen.getByRole("switch", { name: "Keep saved URI credentials" }) as
+          | HTMLInputElement
+          | HTMLElement
+      ).getAttribute("aria-checked"),
+    ).toBe("true");
+
+    await user.clear(screen.getByLabelText("Redis connection URI"));
+    await user.type(
+      screen.getByLabelText("Redis connection URI"),
+      "redis://cache.local:6380/5",
+    );
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: /test connection/i }));
+
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "testConnection",
+      payload: {
+        type: "redis",
+        connectionUri: "redis://cache.local:6380/5",
+        keepConnectionUriCredentials: true,
+        host: undefined,
+        port: undefined,
+        database: undefined,
+      },
+    });
+  });
+
+  it("switches from a saved URI to parameters without resending the URI", async () => {
+    const user = userEvent.setup();
+    render(
+      <ConnectionFormView
+        existing={{
+          id: "redis-uri",
+          name: "Redis URI",
+          type: "redis",
+          connectionUri: "redis://cache.local:6380/4",
+        }}
+      />,
+    );
+    await user.selectOptions(
+      screen.getByLabelText("Redis connection method"),
+      "fields",
+    );
+    await user.clear(screen.getByLabelText("Host"));
+    await user.type(screen.getByLabelText("Host"), "redis-new.local");
+    await user.clear(screen.getByLabelText("Database"));
+    await user.type(screen.getByLabelText("Database"), "2");
+    await user.type(screen.getByLabelText("Connection name"), " edited");
+
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "saveConnection",
+      payload: {
+        type: "redis",
+        host: "redis-new.local",
+        port: 6379,
+        database: "2",
+        connectionUri: undefined,
+      },
+    });
+  });
+});
+
+describe("Elasticsearch endpoint editor", () => {
+  it("offers explicit retention for credentials saved in a URI alias", async () => {
+    const user = userEvent.setup();
+    render(
+      <ConnectionFormView
+        existing={{
+          id: "elastic-uri",
+          name: "Elastic URI",
+          type: "elasticsearch",
+          connectionUri: "https://elastic.local/base",
+          useSecretStorage: true,
+          hasStoredConnectionUriCredentials: true,
+        }}
+      />,
+    );
+    expect(
+      (screen.getByLabelText("Elasticsearch endpoint") as HTMLInputElement)
+        .value,
+    ).toBe("https://elastic.local/base");
+    expect(
+      screen
+        .getByRole("switch", {
+          name: "Keep saved endpoint credentials",
+        })
+        .getAttribute("aria-checked"),
+    ).toBe("true");
+
+    await user.clear(screen.getByLabelText("Elasticsearch endpoint"));
+    await user.type(
+      screen.getByLabelText("Elasticsearch endpoint"),
+      "https://elastic.local/edited",
+    );
+    await user.type(screen.getByLabelText("Connection name"), " edited");
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "saveConnection",
+      payload: {
+        type: "elasticsearch",
+        endpoint: "https://elastic.local/edited",
+        keepConnectionUriCredentials: true,
+      },
+    });
+    expect(getLastPostedMessage()?.payload).not.toHaveProperty("connectionUri");
+  });
+});
+
+describe("saved credential removal controls", () => {
+  it.each([
+    {
+      label: "Remove saved password",
+      existing: {
+        id: "pg-password",
+        name: "Postgres",
+        type: "pg" as const,
+        host: "localhost",
+        database: "app",
+        username: "user",
+        hasStoredSecret: true,
+        useSecretStorage: true,
+      },
+      payloadFlag: "clearPassword",
+    },
+    {
+      label: "Remove saved API key",
+      existing: {
+        id: "elastic-api-key",
+        name: "Elasticsearch",
+        type: "elasticsearch" as const,
+        endpoint: "https://elastic.local",
+        hasStoredApiKey: true,
+        useSecretStorage: true,
+      },
+      payloadFlag: "clearApiKey",
+    },
+    {
+      label: "Remove saved AWS credentials",
+      existing: {
+        id: "dynamo-keys",
+        name: "DynamoDB",
+        type: "dynamodb" as const,
+        awsRegion: "us-east-1",
+        hasStoredAwsCredentials: true,
+        useSecretStorage: true,
+      },
+      payloadFlag: "clearAwsCredentials",
+    },
+  ])("sends $payloadFlag when the user removes a saved secret", async ({
+    label,
+    existing,
+    payloadFlag,
+  }) => {
+    const user = userEvent.setup();
+    render(<ConnectionFormView existing={existing} />);
+    await user.click(screen.getByRole("switch", { name: label }));
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+    expect(getLastPostedMessage()?.payload).toMatchObject({
+      [payloadFlag]: true,
+    });
+  });
+
+  it("uses a DynamoDB profile instead of saved static credentials", async () => {
+    const user = userEvent.setup();
+    render(
+      <ConnectionFormView
+        existing={{
+          id: "dynamo-profile",
+          name: "DynamoDB",
+          type: "dynamodb",
+          awsRegion: "us-east-1",
+          awsProfile: "team",
+          hasStoredAwsCredentials: true,
+          useSecretStorage: true,
+        }}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+    const payload = getLastPostedMessage()?.payload as
+      | Record<string, unknown>
+      | undefined;
+    expect(payload).toMatchObject({
+      awsProfile: "team",
+      clearAwsCredentials: true,
+    });
+    expect(payload?.awsAccessKeyId).toBeUndefined();
+    expect(payload?.awsSecretAccessKey).toBeUndefined();
+    expect(payload?.awsSessionToken).toBeUndefined();
   });
 });

@@ -548,7 +548,7 @@
               },
               "database": {
                 "type": "string",
-                "description": "Database name. For Oracle used as service name when oracleSettings.serviceName is not set."
+                "description": "Database name. For MongoDB URI connections, overrides the working database without changing the URI authentication database. For Oracle used as service name when serviceName is not set."
               },
               "username": {
                 "type": "string",
@@ -620,6 +620,54 @@
               "awsProfile": {
                 "type": "string",
                 "description": "Shared AWS profile name to use for DynamoDB credentials."
+              },
+              "mongoConnectionMode": {
+                "type": "string",
+                "enum": [
+                  "uri",
+                  "fields"
+                ],
+                "description": "MongoDB connection editor: URI or separate parameters."
+              },
+              "mongoScheme": {
+                "type": "string",
+                "enum": [
+                  "mongodb",
+                  "mongodb+srv"
+                ],
+                "description": "MongoDB fields mode connection scheme."
+              },
+              "mongoAuthMethod": {
+                "type": "string",
+                "enum": [
+                  "none",
+                  "password"
+                ],
+                "description": "MongoDB fields mode authentication method."
+              },
+              "authSource": {
+                "type": "string",
+                "description": "MongoDB database where the user was created; independent of the working database."
+              },
+              "authMechanism": {
+                "type": "string",
+                "enum": [
+                  "SCRAM-SHA-1",
+                  "SCRAM-SHA-256"
+                ],
+                "description": "MongoDB password authentication mechanism. Omit for automatic selection."
+              },
+              "replicaSet": {
+                "type": "string",
+                "description": "MongoDB replica set name."
+              },
+              "directConnection": {
+                "type": "boolean",
+                "description": "MongoDB: connect directly to a single host instead of discovering the topology."
+              },
+              "mongoUriHasCredentials": {
+                "type": "boolean",
+                "description": "Whether the MongoDB URI has credentials stored separately in Secret Storage."
               }
             }
           },
@@ -792,6 +840,7 @@
     "better-sqlite3": "12.10.0",
     "monaco-editor": "0.53.0",
     "mongodb": "7.2.0",
+    "mongodb-connection-string-url": "7.0.1",
     "mssql": "12.7.10",
     "mysql2": "3.24.4",
     "oracledb": "6.10.0",

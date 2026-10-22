@@ -18,10 +18,21 @@ import {
   Timestamp,
   UUID,
 } from "mongodb";
+import {
+  buildMongoFieldsUri,
+  getMongoConnectionUri,
+  normalizeMongoConnectionConfig,
+  resolveMongoConnectionMode,
+  stripMongoUriTlsOptions,
+} from "../../shared/mongoConnection";
 import { resolveMongoDatabaseName } from "../../shared/mongoDatabase";
 import { compareNumericTokens } from "../../shared/numericNormalization";
 import { QUERY_LIMIT_POLICY } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
+import {
+  getSshTcpForwardTransport,
+  getTlsServername,
+} from "../driverRuntimeConfig";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
 import {
   JsonNumericPrecisionError,
@@ -1417,7 +1428,14 @@ export class MongoDBDriver implements IDBDriver {
   private connectionEpoch = 0;
   private connectionAbortController?: AbortController;
 
-  constructor(private readonly config: ConnectionConfig) {}
+  private readonly config: ConnectionConfig;
+
+  constructor(config: ConnectionConfig) {
+    const normalized = normalizeMongoConnectionConfig(config);
+    this.config = getSshTcpForwardTransport(config)
+      ? { ...normalized, directConnection: config.directConnection }
+      : normalized;
+  }
 
   async connect(): Promise<void> {
     if (this.connected) {
@@ -1429,22 +1447,38 @@ export class MongoDBDriver implements IDBDriver {
     this.connectionAbortController = abortController;
     let client: MongoClient | undefined;
     try {
+      const configuredUri =
+        resolveMongoConnectionMode(this.config) === "uri"
+          ? (getMongoConnectionUri(this.config) ?? "")
+          : this.buildUri();
       const uri =
-        this.config.connectionUri ?? this.config.uri ?? this.buildUri();
+        this.config.tls !== undefined
+          ? stripMongoUriTlsOptions(
+              configuredUri,
+              this.config.tls.mode !== "disabled",
+            )
+          : configuredUri;
       const tlsSettings = await resolveConnectionTlsSettings(
         this.config,
         abortController.signal,
       );
       this.assertConnectionEpoch(epoch);
-      const tlsHostname = tlsSettings?.servername?.replace(/^\[|\]$/g, "");
+      const tlsHostname = (
+        tlsSettings?.servername ?? getTlsServername(this.config)
+      )?.replace(/^\[|\]$/g, "");
       const tlsIpIdentity = tlsHostname && isIP(tlsHostname) !== 0;
       this.assertConnectionEpoch(epoch);
       client = new MongoClient(uri, {
-        tls: tlsSettings !== undefined,
-        tlsAllowInvalidCertificates:
-          tlsSettings !== undefined && !tlsSettings.rejectUnauthorized,
-        tlsAllowInvalidHostnames:
-          tlsSettings?.skipHostnameVerification === true,
+        ...(this.config.tls !== undefined
+          ? { tls: tlsSettings !== undefined }
+          : {}),
+        ...(tlsSettings
+          ? {
+              tlsAllowInvalidCertificates: !tlsSettings.rejectUnauthorized,
+              tlsAllowInvalidHostnames:
+                tlsSettings.skipHostnameVerification === true,
+            }
+          : {}),
         ca: tlsSettings?.ca,
         cert: tlsSettings?.cert,
         key: tlsSettings?.key,
@@ -1455,6 +1489,7 @@ export class MongoDBDriver implements IDBDriver {
             ? (_hostname, certificate) =>
                 checkServerIdentity(tlsHostname, certificate)
             : tlsSettings?.checkServerIdentity,
+        authMechanism: this.config.authMechanism,
         authSource: this.config.authSource,
         replicaSet: this.config.replicaSet,
         directConnection: this.config.directConnection,
@@ -1481,6 +1516,18 @@ export class MongoDBDriver implements IDBDriver {
         this.client = null;
         this.connected = false;
         await client?.close().catch(() => undefined);
+      }
+      if (error && typeof error === "object" && "code" in error) {
+        if (error.code === 18)
+          throw new Error(
+            "MongoDB authentication failed. Check username, password and Authentication database (authSource).",
+            { cause: error },
+          );
+        if (error.code === 13)
+          throw new Error(
+            "MongoDB server reached, but access to the selected database was denied. Check authentication and database permissions.",
+            { cause: error },
+          );
       }
       throw error;
     } finally {
@@ -3134,6 +3181,9 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   private buildUri(): string {
+    if (this.config.mongoConnectionMode === "fields")
+      return buildMongoFieldsUri(this.config);
+    // Preserve released seed-list/port semantics until the legacy profile is edited.
     const rawHost = this.config.host?.trim() || "localhost";
     const host = isIPv6(rawHost) ? `[${rawHost}]` : rawHost;
     const port = this.config.port ?? 27017;
@@ -3142,17 +3192,15 @@ export class MongoDBDriver implements IDBDriver {
       : "";
     const database = encodeURIComponent(this.defaultDatabaseName());
     const params = new URLSearchParams();
-    if (this.config.authSource) {
+    if (this.config.authMechanism)
+      params.set("authMechanism", this.config.authMechanism);
+    if (this.config.authSource)
       params.set("authSource", this.config.authSource);
-    }
-    if (this.config.replicaSet) {
+    if (this.config.replicaSet)
       params.set("replicaSet", this.config.replicaSet);
-    }
-    if (this.config.directConnection !== undefined) {
+    if (this.config.directConnection !== undefined)
       params.set("directConnection", String(this.config.directConnection));
-    }
-    const suffix = params.size > 0 ? `?${params.toString()}` : "";
-    return `mongodb://${auth}${host}:${port}/${database}${suffix}`;
+    return `mongodb://${auth}${host}:${port}/${database}${params.size ? `?${params}` : ""}`;
   }
 
   private requireClient(): MongoClient {

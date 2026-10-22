@@ -189,6 +189,28 @@ describe("ConnectionValidationService", () => {
     }
   });
 
+  it.each([
+    "http://redis.example.com:6379/0",
+    "redis://",
+    "rediss:///0",
+    "redis://redis.example.com/not-a-database",
+    "redis://redis.example.com//1",
+  ])("rejects Redis URIs without a supported scheme and host: %s", (uri) => {
+    const result = service.validate({
+      id: "redis-invalid-uri",
+      name: "Redis invalid URI",
+      type: "redis",
+      connectionUri: uri,
+    });
+    expect(result.valid).toBe(false);
+    expect(result.issues).toContainEqual(
+      expect.objectContaining({
+        code: "invalid",
+        fields: ["connectionUri"],
+      }),
+    );
+  });
+
   it("returns missing field details for invalid configs", () => {
     const scenarios: Array<{
       config: Partial<ConnectionConfig>;
@@ -389,7 +411,6 @@ describe("ConnectionValidationService", () => {
     };
     const scenarios = [
       ["mongodb://host:27017?readPreferenceTags=dc:ny,rack:1", true],
-      ["mongodb://host:27017#one,two", true],
       ["mongodb://host:27017/db,other?tags=a,b", true],
       ["mongodb://u%2Cser:p%40%2F%3F%23@[::1]:27017?tags=a,b", true],
       ["mongodb://user,name:password@[2001:db8::1]:27017", true],
@@ -407,6 +428,23 @@ describe("ConnectionValidationService", () => {
       expect(result.valid, uri).toBe(valid);
       if (!valid) expect(result.message).toContain("single-host");
     }
+  });
+
+  it.each([
+    "connectionUri",
+    "uri",
+  ] as const)("rejects a MongoDB URI fragment via %s", (field) => {
+    const result = service.validate({
+      name: "Mongo fragment",
+      type: "mongodb",
+      [field]: "mongodb://host:27017#one,two",
+    });
+    expect(result.valid).toBe(false);
+    expect(result.issues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: "invalid", fields: ["connectionUri"] }),
+      ]),
+    );
   });
 
   it("rejects unsupported MongoDB SSH topologies", () => {

@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  type ConnectionSecretClearOptions,
+  serializeConnectionSecretsForStoredConfig,
+} from "../../src/extension/connectionSecrets";
 import { ConnectionFormPanel } from "../../src/extension/panels/connectionFormPanel";
 import { createWebviewShell } from "../../src/extension/panels/webviewShell";
+import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
 const vscodeMock = vi.hoisted(() => {
   const createWebviewPanel = vi.fn(() => {
@@ -73,6 +78,13 @@ vi.mock("../../src/extension/panels/webviewShell", () => ({
 function createdPanel() {
   return vscodeMock.createWebviewPanel.mock.results[0]?.value;
 }
+
+const noSecretClears: ConnectionSecretClearOptions = {
+  password: false,
+  apiKey: false,
+  credentialBearingUris: false,
+  awsCredentials: false,
+};
 
 type ConnectionFormPanelPrototype = {
   handleMessage(message: unknown): Promise<void>;
@@ -187,6 +199,7 @@ describe("ConnectionFormPanel", () => {
     expect(response?.useSecretStorage).toBe(false);
     expect(connectionManager.saveConnection).toHaveBeenCalledWith(
       expect.objectContaining(payload),
+      noSecretClears,
     );
   });
 
@@ -370,6 +383,7 @@ describe("ConnectionFormPanel", () => {
         password: existing.password,
         useSecretStorage: false,
       }),
+      noSecretClears,
     );
     expect((await promise)?.password).toBeUndefined();
   });
@@ -390,7 +404,8 @@ describe("ConnectionFormPanel", () => {
       context as never,
       connectionManager as never,
     );
-    const panel = createdPanel()!;
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected the connection form panel to open.");
     const payload = {
       id: "tls-regression",
       name: "TLS",
@@ -435,6 +450,7 @@ describe("ConnectionFormPanel", () => {
     } else {
       expect(action).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({ tls }),
+        noSecretClears,
       );
     }
     panel.dispose();
@@ -525,6 +541,7 @@ describe("ConnectionFormPanel", () => {
           keyPassphrase: "stored-tls-passphrase",
         }),
       }),
+      noSecretClears,
     );
   });
 
@@ -604,6 +621,7 @@ describe("ConnectionFormPanel", () => {
         password: "stored-secret",
         useSecretStorage: true,
       }),
+      noSecretClears,
     );
     expect(context.secrets.store).not.toHaveBeenCalled();
   });
@@ -673,6 +691,7 @@ describe("ConnectionFormPanel", () => {
         password: "basic-secret",
         apiKey: undefined,
       }),
+      noSecretClears,
     );
   });
 
@@ -730,6 +749,7 @@ describe("ConnectionFormPanel", () => {
         serviceName: "XEPDB1",
         database: undefined,
       }),
+      noSecretClears,
     );
   });
 
@@ -839,7 +859,8 @@ describe("ConnectionFormPanel", () => {
       context as never,
       connectionManager as never,
     );
-    const panel = createdPanel()!;
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected the connection form panel to open.");
     const connectionUri = `redis://user:pa${delimiter}ss@host:6379/0`;
     await panel.webview.dispatchMessage({
       type: "saveConnection",
@@ -1027,6 +1048,7 @@ describe("ConnectionFormPanel", () => {
         awsSecretAccessKey: expect.anything(),
         awsSessionToken: expect.anything(),
       }),
+      { ...noSecretClears, awsCredentials: true },
     );
   });
 
@@ -1150,6 +1172,7 @@ describe("ConnectionFormPanel", () => {
         id: "conn-sqlite",
         sqliteWalMode: "off",
       }),
+      noSecretClears,
     );
   });
 
@@ -1261,6 +1284,7 @@ describe("ConnectionFormPanel", () => {
         apiKey: "base64-api-key",
         useSecretStorage: false,
       }),
+      noSecretClears,
     );
   });
 
@@ -1376,6 +1400,7 @@ describe("ConnectionFormPanel", () => {
         }),
         useSecretStorage: false,
       }),
+      noSecretClears,
     );
   });
 
@@ -1631,5 +1656,595 @@ describe("ConnectionFormPanel", () => {
       handleMessageSpy.mockRestore();
       consoleErrorSpy.mockRestore();
     }
+  });
+});
+
+describe("MongoDB form credential lifecycle", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it.each([
+    {
+      method: "uri",
+      keep: true,
+      expected: "mongodb://u:p%40ss@localhost/edited?authSource=admin",
+    },
+    {
+      method: "uri",
+      keep: false,
+      expected: "mongodb://localhost/edited?authSource=admin",
+    },
+    { method: "fields", keep: false, expected: undefined },
+  ])("uses the same resolved settings for Test and Save: $method / keep=$keep", async ({
+    method,
+    keep,
+    expected,
+  }) => {
+    const existing = {
+      id: "mongo-lifecycle",
+      name: "Mongo lifecycle",
+      type: "mongodb",
+      mongoConnectionMode: "uri",
+      connectionUri: "mongodb://localhost/app?authSource=admin",
+      useSecretStorage: true,
+    };
+    const context = {
+      secrets: {
+        get: vi.fn(async () =>
+          JSON.stringify({
+            connectionUri: "mongodb://u:p%40ss@localhost/app?authSource=admin",
+            password: "stored-fields-password",
+          }),
+        ),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const manager = {
+      getConnection: vi.fn(() => existing),
+      testConnection: vi.fn(async (_config: Record<string, unknown>) => ({
+        success: true,
+      })),
+      saveConnection: vi.fn(
+        async (_config: Record<string, unknown>) => undefined,
+      ),
+    };
+    const pending = ConnectionFormPanel.show(
+      context as never,
+      manager as never,
+    );
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected connection form");
+    const payload = {
+      ...existing,
+      mongoConnectionMode: method,
+      connectionUri: "mongodb://localhost/edited?authSource=admin",
+      keepMongoUriCredentials: keep,
+      host: "localhost",
+      database: "app",
+      username: "field-user",
+      password: "",
+      mongoAuthMethod: "password",
+      authSource: "admin",
+    };
+    await panel.webview.dispatchMessage({ type: "testConnection", payload });
+    const tested = manager.testConnection.mock.calls[0]?.[0];
+    expect(tested?.connectionUri).toBe(expected);
+    if (method === "fields")
+      expect(tested?.password).toBe("stored-fields-password");
+    else {
+      expect(tested?.database).toBe("app");
+      expect(tested?.authSource).toBeUndefined();
+      expect(tested?.password).toBeUndefined();
+      expect(tested?.mongoUriHasCredentials).toBe(keep);
+    }
+    await panel.webview.dispatchMessage({ type: "saveConnection", payload });
+    expect(manager.saveConnection.mock.calls[0]?.[0]).toEqual(tested);
+    await pending;
+  });
+});
+
+describe("MongoDB legacy URI migration", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("moves legacy overrides into the URI and retains its credentials on save", async () => {
+    const existing = {
+      id: "mongo-legacy",
+      name: "Legacy",
+      type: "mongodb",
+      connectionUri: "mongodb://localhost/original?retryWrites=false",
+      database: "app",
+      authSource: "admin",
+      useSecretStorage: true,
+    };
+    const context = {
+      secrets: {
+        get: vi.fn(async () =>
+          JSON.stringify({
+            connectionUri:
+              "mongodb://u:secret@localhost/original?retryWrites=false",
+          }),
+        ),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const manager = {
+      getConnection: vi.fn(() => existing),
+      saveConnection: vi.fn(
+        async (_config: Record<string, unknown>) => undefined,
+      ),
+    };
+    const pending = ConnectionFormPanel.show(
+      context as never,
+      manager as never,
+      existing as never,
+    );
+    await vi.waitFor(() => expect(createdPanel()).toBeDefined());
+    const state = vi.mocked(createWebviewShell).mock.calls[0]?.[0].initialState;
+    if (state?.view !== "connection" || !state.existing)
+      throw new Error("Expected MongoDB edit state");
+    expect(state.existing.connectionUri).toBe(
+      "mongodb://localhost/original?retryWrites=false&authSource=admin",
+    );
+    expect(state.existing.hasStoredMongoUriCredentials).toBe(true);
+    await createdPanel().webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        ...state.existing,
+        mongoConnectionMode: "uri",
+        keepMongoUriCredentials: true,
+      },
+    });
+    expect(manager.saveConnection.mock.calls[0]?.[0]).toMatchObject({
+      connectionUri:
+        "mongodb://u:secret@localhost/original?retryWrites=false&authSource=admin",
+      mongoUriHasCredentials: true,
+    });
+    await pending;
+  });
+});
+
+describe("Redis and Elasticsearch URI credential editing", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vscodeMock.module.window.showWarningMessage.mockResolvedValue(
+      "Save in Plaintext",
+    );
+  });
+
+  it.each([
+    {
+      database: "4",
+      connectionUri: "redis://cache.local:6380/1",
+      port: undefined,
+      expectedUri: "redis://cache.local:6380/4",
+    },
+    {
+      database: "db4",
+      connectionUri: "redis://cache.local:6380/1",
+      port: undefined,
+      expectedUri: "redis://cache.local:6380/4",
+    },
+    {
+      database: "0",
+      connectionUri: "redis://cache.local",
+      port: 6380,
+      expectedUri: "redis://cache.local:6380/0",
+    },
+    {
+      database: "4",
+      connectionUri: "redis://cache.local:6379/1",
+      port: 6380,
+      expectedUri: "redis://cache.local:6379/4",
+    },
+  ])("migrates legacy Redis database and fallback port into the URI ($connectionUri, $port, $database)", async ({
+    database,
+    connectionUri,
+    port,
+    expectedUri,
+  }) => {
+    const existing: ConnectionConfig = {
+      id: "redis-working-db",
+      name: "Redis override",
+      type: "redis",
+      connectionUri,
+      port,
+      database,
+    };
+    const context = {
+      secrets: { get: vi.fn(), store: vi.fn(), delete: vi.fn() },
+    };
+    const manager = {
+      getConnection: vi.fn(() => existing),
+      testConnection: vi.fn(async (_config: ConnectionConfig) => ({
+        success: true,
+      })),
+      saveConnection: vi.fn(async (_config: ConnectionConfig) => undefined),
+    };
+    const pending = ConnectionFormPanel.show(
+      context as never,
+      manager as never,
+      existing,
+    );
+    await Promise.resolve();
+    const state = vi.mocked(createWebviewShell).mock.calls[0]?.[0].initialState;
+    if (state?.view !== "connection" || !state.existing)
+      throw new Error("Expected edit form");
+    expect(state.existing.connectionUri).toBe(expectedUri);
+    const payload = { ...state.existing, database: undefined, port: undefined };
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected connection form");
+    await panel.webview.dispatchMessage({ type: "testConnection", payload });
+    const tested = manager.testConnection.mock.calls[0]?.[0];
+    expect(tested?.connectionUri).toBe(expectedUri);
+    expect(tested?.database).toBeUndefined();
+    await panel.webview.dispatchMessage({ type: "saveConnection", payload });
+    expect(manager.saveConnection.mock.calls[0]?.[0]).toEqual(tested);
+    await pending;
+  });
+
+  it.each(
+    [
+      { username: "cache user", password: " pass:@/雪% ", storage: true },
+      { username: undefined, password: "default-password", storage: true },
+      { username: "inline-user", password: "inline-password", storage: false },
+    ].flatMap((scenario) =>
+      [true, false].map((keep) => ({ ...scenario, keep })),
+    ),
+  )("retains or removes legacy Redis URI authentication through Test and Save ($storage, $username, keep=$keep)", async ({
+    username,
+    password,
+    storage,
+    keep,
+  }) => {
+    const existing: ConnectionConfig = {
+      id: "redis-legacy-auth",
+      name: "Legacy Redis",
+      type: "redis",
+      connectionUri: "redis://cache.local:6380/4?socket_timeout=2",
+      username,
+      password: storage ? undefined : password,
+      useSecretStorage: storage,
+    };
+    const serialized = storage ? JSON.stringify({ password }) : undefined;
+    const context = {
+      secrets: {
+        get: vi.fn(async () => serialized),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const manager = {
+      getConnection: vi.fn(() => existing),
+      testConnection: vi.fn(async (_config: ConnectionConfig) => ({
+        success: true,
+      })),
+      saveConnection: vi.fn(
+        async (
+          _config: ConnectionConfig,
+          _options: ConnectionSecretClearOptions,
+        ) => undefined,
+      ),
+    };
+    const pending = ConnectionFormPanel.show(
+      context as never,
+      manager as never,
+      existing,
+    );
+    await Promise.resolve();
+    const initial =
+      vi.mocked(createWebviewShell).mock.calls[0]?.[0].initialState;
+    expect(initial).toMatchObject({
+      existing: {
+        connectionUri: existing.connectionUri,
+        hasStoredConnectionUriCredentials: true,
+      },
+    });
+    expect(JSON.stringify(initial)).not.toContain(password);
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected connection form");
+    const payload = {
+      id: existing.id,
+      name: "Renamed Redis",
+      type: "redis",
+      connectionUri: existing.connectionUri,
+      useSecretStorage: storage,
+      hasStoredSecret: true,
+      keepConnectionUriCredentials: keep,
+    };
+    await panel.webview.dispatchMessage({ type: "testConnection", payload });
+    const tested = manager.testConnection.mock.calls[0]?.[0];
+    if (!tested?.connectionUri) throw new Error("Expected resolved Redis URI");
+    const uri = new URL(tested.connectionUri);
+    expect(decodeURIComponent(uri.username)).toBe(keep ? (username ?? "") : "");
+    expect(decodeURIComponent(uri.password)).toBe(keep ? password : "");
+    expect(uri.search).toBe("?socket_timeout=2");
+    expect(tested.password).toBeUndefined();
+    await panel.webview.dispatchMessage({ type: "saveConnection", payload });
+    const save = manager.saveConnection.mock.calls[0];
+    if (!save) throw new Error("Expected saved Redis connection");
+    expect(save[0]).toEqual(tested);
+    const persisted = serializeConnectionSecretsForStoredConfig(
+      save[0],
+      serialized,
+      save[1],
+    );
+    expect(JSON.parse(persisted ?? "{}")).toEqual(
+      keep ? { connectionUri: tested.connectionUri } : {},
+    );
+    expect((await pending)?.connectionUri).toBe(existing.connectionUri);
+  });
+
+  it.each([
+    {
+      type: "redis",
+      existing: {
+        id: "redis-uri-edit",
+        name: "Redis URI",
+        type: "redis",
+        connectionUri: "redis://cache.local:6380/4",
+        useSecretStorage: true,
+      },
+      secrets: {
+        connectionUri: "redis://user:pass@cache.local:6380/4?token=old-secret",
+      },
+      payload: {
+        connectionUri: "redis://cache.local:6380/5?socket_timeout=2",
+      },
+      expectedField: "connectionUri",
+      retained:
+        "redis://user:pass@cache.local:6380/5?socket_timeout=2&token=old-secret",
+      safe: "redis://cache.local:6380/5?socket_timeout=2",
+    },
+    {
+      type: "elasticsearch",
+      existing: {
+        id: "elastic-uri-edit",
+        name: "Elastic URI",
+        type: "elasticsearch",
+        connectionUri: "https://elastic.local/base",
+        useSecretStorage: true,
+      },
+      secrets: {
+        connectionUri:
+          "https://elastic-user:pass@elastic.local/base?api_key=old-secret",
+      },
+      payload: { endpoint: "https://elastic.local/edited" },
+      expectedField: "endpoint",
+      retained:
+        "https://elastic-user:pass@elastic.local/edited?api_key=old-secret",
+      safe: "https://elastic.local/edited",
+    },
+  ] as const)("uses the same credential-aware config for Test and Save for $type (keep=$keep)", async ({
+    type,
+    existing,
+    secrets,
+    payload: uriPayload,
+    expectedField,
+    retained,
+    safe,
+  }) => {
+    for (const keep of [true, false]) {
+      vi.clearAllMocks();
+      const context = {
+        secrets: {
+          get: vi.fn(async () => JSON.stringify(secrets)),
+          store: vi.fn(),
+          delete: vi.fn(),
+        },
+      };
+      const manager = {
+        getConnection: vi.fn(() => existing),
+        testConnection: vi.fn(async (_config: Record<string, unknown>) => ({
+          success: true,
+        })),
+        saveConnection: vi.fn(
+          async (_config: Record<string, unknown>) => undefined,
+        ),
+      };
+      const pending = ConnectionFormPanel.show(
+        context as never,
+        manager as never,
+      );
+      const panel = createdPanel();
+      if (!panel) throw new Error("Expected connection form");
+      const payload = {
+        ...existing,
+        connectionUri:
+          expectedField === "connectionUri"
+            ? uriPayload.connectionUri
+            : undefined,
+        endpoint:
+          expectedField === "endpoint" ? uriPayload.endpoint : undefined,
+        keepConnectionUriCredentials: keep,
+      };
+
+      await panel.webview.dispatchMessage({ type: "testConnection", payload });
+      const tested = manager.testConnection.mock.calls[0]?.[0];
+      expect(tested?.[expectedField]).toBe(keep ? retained : safe);
+      if (type === "elasticsearch")
+        expect(tested?.connectionUri).toBeUndefined();
+
+      await panel.webview.dispatchMessage({ type: "saveConnection", payload });
+      expect(manager.saveConnection.mock.calls[0]?.[0]).toEqual(tested);
+      await pending;
+    }
+  });
+});
+
+describe("explicit saved credential removal", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it.each([
+    "pg",
+    "mysql",
+    "mssql",
+    "oracle",
+    "redis",
+  ] as const)("removes a plaintext %s password with the same config for Test and Save", async (type) => {
+    const existing: ConnectionConfig = {
+      id: "plaintext-clear",
+      name: "Plaintext password",
+      type,
+      host: "localhost",
+      database: type === "redis" ? "0" : "app",
+      username: "user",
+      password: "old-password",
+      useSecretStorage: false,
+    };
+    const context = {
+      secrets: { get: vi.fn(), store: vi.fn(), delete: vi.fn() },
+    };
+    const manager = {
+      getConnection: vi.fn(() => existing),
+      testConnection: vi.fn(async (_config: ConnectionConfig) => ({
+        success: true,
+      })),
+      saveConnection: vi.fn(
+        async (
+          _config: ConnectionConfig,
+          _options: ConnectionSecretClearOptions,
+        ) => undefined,
+      ),
+    };
+    const pending = ConnectionFormPanel.show(
+      context as never,
+      manager as never,
+      existing,
+    );
+    await Promise.resolve();
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected connection form");
+    const payload = {
+      ...existing,
+      password: "",
+      hasStoredSecret: true,
+      clearPassword: true,
+    };
+    await panel.webview.dispatchMessage({ type: "testConnection", payload });
+    const tested = manager.testConnection.mock.calls[0]?.[0];
+    expect(tested?.password).toBe("");
+    await panel.webview.dispatchMessage({ type: "saveConnection", payload });
+    expect(manager.saveConnection).toHaveBeenCalledWith(tested, {
+      password: true,
+      apiKey: false,
+      credentialBearingUris: false,
+      awsCredentials: false,
+    });
+    expect(vscodeMock.module.window.showWarningMessage).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "saveResult" }),
+    );
+    await pending;
+  });
+
+  it.each([
+    {
+      type: "pg",
+      existing: {
+        id: "pg-clear-password",
+        name: "Postgres",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "user",
+        useSecretStorage: true,
+      },
+      secrets: { password: "old-password" },
+      payload: { clearPassword: true },
+      expected: { password: "" },
+    },
+    {
+      type: "elasticsearch",
+      existing: {
+        id: "elastic-clear-api-key",
+        name: "Elasticsearch",
+        type: "elasticsearch",
+        endpoint: "https://elastic.local",
+        useSecretStorage: true,
+      },
+      secrets: { apiKey: "old-api-key" },
+      payload: { clearApiKey: true },
+      expected: { apiKey: undefined },
+    },
+    {
+      type: "dynamodb",
+      existing: {
+        id: "dynamo-clear-keys",
+        name: "DynamoDB",
+        type: "dynamodb",
+        awsRegion: "us-east-1",
+        useSecretStorage: true,
+      },
+      secrets: {
+        awsAccessKeyId: "old-access-key",
+        awsSecretAccessKey: "old-secret-key",
+        awsSessionToken: "old-session-token",
+      },
+      payload: { clearAwsCredentials: true },
+      expected: {
+        awsAccessKeyId: undefined,
+        awsSecretAccessKey: undefined,
+        awsSessionToken: undefined,
+      },
+    },
+    {
+      type: "dynamodb",
+      existing: {
+        id: "dynamo-profile",
+        name: "DynamoDB",
+        type: "dynamodb",
+        awsRegion: "us-east-1",
+        useSecretStorage: true,
+      },
+      secrets: {
+        awsAccessKeyId: "old-access-key",
+        awsSecretAccessKey: "old-secret-key",
+        awsSessionToken: "old-session-token",
+      },
+      payload: { awsProfile: "team" },
+      expected: {
+        awsProfile: "team",
+        awsAccessKeyId: undefined,
+        awsSecretAccessKey: undefined,
+        awsSessionToken: undefined,
+      },
+    },
+  ] as const)("clears saved $type credentials for both Test and Save", async ({
+    existing,
+    secrets,
+    payload: clearFlags,
+    expected,
+  }) => {
+    const context = {
+      secrets: {
+        get: vi.fn(async () => JSON.stringify(secrets)),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const manager = {
+      getConnection: vi.fn(() => existing),
+      testConnection: vi.fn(async (_config: Record<string, unknown>) => ({
+        success: true,
+      })),
+      saveConnection: vi.fn(
+        async (_config: Record<string, unknown>) => undefined,
+      ),
+    };
+    const pending = ConnectionFormPanel.show(
+      context as never,
+      manager as never,
+    );
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected connection form");
+    const payload = { ...existing, ...clearFlags };
+
+    await panel.webview.dispatchMessage({ type: "testConnection", payload });
+    const tested = manager.testConnection.mock.calls[0]?.[0];
+    expect(tested).toMatchObject(expected);
+    await panel.webview.dispatchMessage({ type: "saveConnection", payload });
+    expect(manager.saveConnection.mock.calls[0]?.[0]).toEqual(tested);
+    await pending;
   });
 });

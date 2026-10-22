@@ -25,6 +25,13 @@ export interface ConnectionSecretSnapshot {
   tlsKeyPassphrase?: string;
 }
 
+export interface ConnectionSecretClearOptions {
+  password?: boolean;
+  apiKey?: boolean;
+  awsCredentials?: boolean;
+  credentialBearingUris?: boolean;
+}
+
 const CREDENTIAL_BEARING_URI_FIELDS = [
   "connectionUri",
   "uri",
@@ -179,7 +186,14 @@ function extractConnectionSecrets(
 
   return {
     password:
-      trimOptionalSecretValue(config.password) ?? previousSecrets?.password,
+      config.type === "mongodb" &&
+      config.mongoConnectionMode &&
+      (config.mongoConnectionMode === "uri" ||
+        config.mongoAuthMethod === "none" ||
+        config.password === "")
+        ? undefined
+        : (trimOptionalSecretValue(config.password) ??
+          previousSecrets?.password),
     apiKey:
       config.type === "elasticsearch"
         ? (trimOptionalSecretValue(config.apiKey) ?? previousSecrets?.apiKey)
@@ -201,7 +215,9 @@ function extractConnectionSecrets(
         : undefined,
     connectionUri: resolvePersistedCredentialBearingUriSecret(
       config.connectionUri,
-      previousSecrets?.connectionUri,
+      config.type === "mongodb" && config.mongoUriHasCredentials === false
+        ? undefined
+        : previousSecrets?.connectionUri,
     ),
     uri: resolvePersistedCredentialBearingUriSecret(
       config.uri,
@@ -365,9 +381,34 @@ export function serializeConnectionSecretsForConfig(
 export function serializeConnectionSecretsForStoredConfig(
   config: ConnectionConfig,
   previousSerialized: string | undefined,
+  clearOptions: ConnectionSecretClearOptions = {},
 ): string | undefined {
   const previous = parseStoredConnectionSecretDocument(previousSerialized);
   const nextSecrets = extractConnectionSecrets(config, previous.known);
+  if (clearOptions.password && !trimOptionalSecretValue(config.password)) {
+    nextSecrets.password = undefined;
+  }
+  if (clearOptions.apiKey && !trimOptionalSecretValue(config.apiKey)) {
+    nextSecrets.apiKey = undefined;
+  }
+  if (clearOptions.awsCredentials) {
+    for (const key of [
+      "awsAccessKeyId",
+      "awsSecretAccessKey",
+      "awsSessionToken",
+    ] as const) {
+      if (!trimOptionalSecretValue(config[key])) {
+        nextSecrets[key] = undefined;
+      }
+    }
+  }
+  if (clearOptions.credentialBearingUris) {
+    for (const key of CREDENTIAL_BEARING_URI_FIELDS) {
+      if (extractCredentialBearingUriSecret(config[key]) === undefined) {
+        nextSecrets[key] = undefined;
+      }
+    }
+  }
   const knownUnchanged = CONNECTION_SECRET_KEYS.every(
     (key) => nextSecrets[key] === previous.known[key],
   );
@@ -388,4 +429,71 @@ export function serializeConnectionSecretsForStoredConfig(
   return Object.keys(nextRecord).length > 0
     ? JSON.stringify(nextRecord)
     : undefined;
+}
+
+/** Retain URI credentials only when an editor explicitly requests it. */
+export function restoreCredentialBearingUri(
+  value: string | undefined,
+  previous: string | undefined,
+  keep: boolean,
+): string | undefined {
+  const submitted = trimOptionalUriValue(value);
+  if (!submitted || !previous || !keep) return submitted;
+  const pattern = /^([a-z][a-z\d+.-]*:\/\/)([^/?#]+)(.*)$/i;
+  const oldParts = pattern.exec(previous);
+  const parts = pattern.exec(submitted);
+  if (!oldParts || !parts) return submitted;
+
+  const splitSuffix = (suffix: string) => {
+    const hashIndex = suffix.indexOf("#");
+    const beforeFragment = hashIndex < 0 ? suffix : suffix.slice(0, hashIndex);
+    const fragment = hashIndex < 0 ? "" : suffix.slice(hashIndex);
+    const queryIndex = beforeFragment.indexOf("?");
+    return {
+      path:
+        queryIndex < 0 ? beforeFragment : beforeFragment.slice(0, queryIndex),
+      query: new URLSearchParams(
+        queryIndex < 0 ? "" : beforeFragment.slice(queryIndex + 1),
+      ),
+      fragment,
+    };
+  };
+
+  const at = oldParts[2].lastIndexOf("@");
+  const replacesCredentials = parts[2].includes("@");
+  const credentials =
+    at >= 0 && !replacesCredentials ? oldParts[2].slice(0, at + 1) : "";
+  const oldSuffix = splitSuffix(oldParts[3]);
+  const safeParts = pattern.exec(sanitizeCredentialBearingUri(previous) ?? "");
+  const safeQuery = splitSuffix(safeParts?.[3] ?? "").query;
+  const nextSuffix = splitSuffix(parts[3]);
+  const query = nextSuffix.query;
+  let added = false;
+  for (const [key, secret] of oldSuffix.query) {
+    const hasEquivalentKey = (params: URLSearchParams) =>
+      [...params.keys()].some(
+        (candidate) => candidate.toLowerCase() === key.toLowerCase(),
+      );
+    if (
+      !replacesCredentials &&
+      !hasEquivalentKey(safeQuery) &&
+      !hasEquivalentKey(query)
+    ) {
+      query.append(key, secret);
+      added = true;
+    }
+  }
+  const suffix = added
+    ? `${nextSuffix.path}${query.size ? `?${query}` : ""}${nextSuffix.fragment}`
+    : parts[3];
+  return `${parts[1]}${credentials}${parts[2]}${suffix}`;
+}
+
+/** Retain credentials only when the MongoDB URI editor explicitly requests it. */
+export function restoreMongoUriCredentials(
+  value: string | undefined,
+  previous: string | undefined,
+  keep: boolean,
+): string | undefined {
+  return restoreCredentialBearingUri(value, previous, keep);
 }

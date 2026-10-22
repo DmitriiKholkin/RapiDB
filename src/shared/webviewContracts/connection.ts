@@ -4,7 +4,6 @@ import {
   type ConnectionSshConfig,
   type ConnectionTlsMode,
 } from "../connectionConfig";
-import type { ConnectionType } from "../connectionTypes";
 import type { PanelRetentionState, WebviewMessageEnvelope } from "./shared";
 import {
   isRecord,
@@ -31,7 +30,14 @@ export type SanitizedConnectionConfig = Omit<
 
 export interface ConnectionFormExistingState extends SanitizedConnectionConfig {
   hasStoredSecret?: boolean;
+  hasStoredMongoUriCredentials?: boolean;
+  hasStoredConnectionUriCredentials?: boolean;
+  keepConnectionUriCredentials?: boolean;
+  keepMongoUriCredentials?: boolean;
+  clearPassword?: boolean;
   hasStoredApiKey?: boolean;
+  hasStoredAwsCredentials?: boolean;
+  hasStoredAwsKeyPair?: boolean;
   hasStoredSshPassword?: boolean;
   hasStoredSshPrivateKey?: boolean;
   hasStoredSshPassphrase?: boolean;
@@ -40,7 +46,15 @@ export interface ConnectionFormExistingState extends SanitizedConnectionConfig {
 
 export interface ConnectionFormSubmission extends SanitizedConnectionConfig {
   password?: string;
+  hasStoredMongoUriCredentials?: boolean;
+  hasStoredConnectionUriCredentials?: boolean;
+  keepConnectionUriCredentials?: boolean;
+  keepMongoUriCredentials?: boolean;
+  clearPassword?: boolean;
+  clearApiKey?: boolean;
+  clearAwsCredentials?: boolean;
   hasStoredApiKey?: boolean;
+  hasStoredAwsCredentials?: boolean;
   ssh?: ConnectionSshConfig;
   hasStoredSecret?: boolean;
   hasStoredSshPassword?: boolean;
@@ -238,6 +252,30 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
     apiKey: readOptionalString(input, "apiKey"),
     cloudId: readOptionalString(input, "cloudId"),
     uri: readOptionalString(input, "uri"),
+    mongoUriHasCredentials: readOptionalBoolean(
+      input,
+      "mongoUriHasCredentials",
+    ),
+    mongoScheme:
+      input.mongoScheme === "mongodb+srv"
+        ? "mongodb+srv"
+        : input.mongoScheme === "mongodb"
+          ? "mongodb"
+          : undefined,
+    mongoConnectionMode:
+      input.mongoConnectionMode === "uri" ||
+      input.mongoConnectionMode === "fields"
+        ? input.mongoConnectionMode
+        : undefined,
+    mongoAuthMethod:
+      input.mongoAuthMethod === "none" || input.mongoAuthMethod === "password"
+        ? input.mongoAuthMethod
+        : undefined,
+    authMechanism:
+      input.authMechanism === "SCRAM-SHA-1" ||
+      input.authMechanism === "SCRAM-SHA-256"
+        ? input.authMechanism
+        : undefined,
     authSource: readOptionalString(input, "authSource"),
     awsRegion: readOptionalString(input, "awsRegion"),
     awsAccessKeyId: readOptionalString(input, "awsAccessKeyId"),
@@ -253,7 +291,30 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
 function readStoredSecretFlags(input: Record<string, unknown>) {
   return {
     hasStoredSecret: readOptionalBoolean(input, "hasStoredSecret"),
+    hasStoredConnectionUriCredentials: readOptionalBoolean(
+      input,
+      "hasStoredConnectionUriCredentials",
+    ),
+    keepConnectionUriCredentials: readOptionalBoolean(
+      input,
+      "keepConnectionUriCredentials",
+    ),
+    hasStoredMongoUriCredentials: readOptionalBoolean(
+      input,
+      "hasStoredMongoUriCredentials",
+    ),
+    keepMongoUriCredentials: readOptionalBoolean(
+      input,
+      "keepMongoUriCredentials",
+    ),
+    clearPassword: readOptionalBoolean(input, "clearPassword"),
+    clearApiKey: readOptionalBoolean(input, "clearApiKey"),
+    clearAwsCredentials: readOptionalBoolean(input, "clearAwsCredentials"),
     hasStoredApiKey: readOptionalBoolean(input, "hasStoredApiKey"),
+    hasStoredAwsCredentials: readOptionalBoolean(
+      input,
+      "hasStoredAwsCredentials",
+    ),
     hasStoredSshPassword: readOptionalBoolean(input, "hasStoredSshPassword"),
     hasStoredSshPrivateKey: readOptionalBoolean(
       input,
@@ -277,7 +338,11 @@ export function parseConnectionFormExistingState(
   if (!base || !isRecord(input)) {
     return null;
   }
-  return { ...base, ...readStoredSecretFlags(input) };
+  return {
+    ...base,
+    ...readStoredSecretFlags(input),
+    hasStoredAwsKeyPair: readOptionalBoolean(input, "hasStoredAwsKeyPair"),
+  };
 }
 
 export function parseConnectionFormSubmission(

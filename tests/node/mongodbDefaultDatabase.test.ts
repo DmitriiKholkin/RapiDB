@@ -80,7 +80,7 @@ describe("MongoDB database resolution", () => {
     expect(getCacheDefaultDatabaseName(config(fields))).toBe("admin");
   });
 
-  it("preserves explicit database precedence and connectionUri ?? uri selection", () => {
+  it("preserves explicit database precedence and prefers a nonblank canonical URI", () => {
     const fields = {
       database: "explicit",
       connectionUri: "mongodb://host/app",
@@ -104,7 +104,7 @@ describe("MongoDB database resolution", () => {
     ).toBe("admin");
     expect(
       resolveMongoDatabaseName({ ...fields, database: "", connectionUri: "" }),
-    ).toBe("admin");
+    ).toBe("legacy");
   });
 
   it.each([

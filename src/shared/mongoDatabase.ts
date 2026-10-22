@@ -1,12 +1,20 @@
 import type { ConnectionConfig } from "./connectionConfig";
+import {
+  getMongoConnectionUri,
+  normalizeMongoConnectionConfig,
+} from "./mongoConnection";
 
 /** Resolve the operation database, independently of the authentication source. */
 export function resolveMongoDatabaseName(
-  config: Pick<ConnectionConfig, "database" | "connectionUri" | "uri">,
+  input: Pick<
+    ConnectionConfig,
+    "database" | "connectionUri" | "uri" | "mongoConnectionMode"
+  >,
 ): string {
+  const config = normalizeMongoConnectionConfig({ ...input, type: "mongodb" });
   if (config.database?.trim()) return config.database;
 
-  const uri = config.connectionUri ?? config.uri;
+  const uri = getMongoConnectionUri(config);
   if (!uri) return "admin";
 
   // Only parse the path/query, never MongoDB's authority: WHATWG URL does not

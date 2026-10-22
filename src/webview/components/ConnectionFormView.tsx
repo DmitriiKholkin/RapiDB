@@ -1,4 +1,4 @@
-import React, {
+import {
   type CSSProperties,
   type InputHTMLAttributes,
   type ReactElement,
@@ -27,9 +27,16 @@ import {
   DEFAULT_PORT_BY_CONNECTION_TYPE,
 } from "../../shared/connectionTypes";
 import {
-  buildConnectionPortValidationIssues,
   isConnectionPortRelevant,
+  validateConnectionConfig,
 } from "../../shared/connectionValidation";
+import {
+  buildMongoFieldsUri,
+  getMongoFormHost,
+  getMongoFormUri,
+  normalizeMongoConnectionConfig,
+  resolveMongoConnectionMode,
+} from "../../shared/mongoConnection";
 import type {
   ConnectionFormBrowseTarget,
   ConnectionFormExistingState,
@@ -490,6 +497,7 @@ function getDefaultColor(): string {
 
 export function ConnectionFormView({ existing }: Props): ReactElement {
   const isEdit = !!existing;
+  const existingMongo = existing?.type === "mongodb" ? existing : undefined;
   const hasStoredSecret = existing?.hasStoredSecret ?? false;
   const hasStoredApiKey = existing?.hasStoredApiKey ?? false;
   const hasStoredSshPassword = existing?.hasStoredSshPassword ?? false;
@@ -502,7 +510,10 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const [name, setName] = useState(existing?.name ?? "");
   const [color, setColor] = useState(existing?.color ?? getDefaultColor());
   const [type, setType] = useState<ConnectionType>(existing?.type ?? "pg");
-  const [host, setHost] = useState(existing?.host ?? "localhost");
+  const [host, setHost] = useState(
+    (existingMongo ? getMongoFormHost(existingMongo) : existing?.host) ??
+      "localhost",
+  );
   const [port, setPort] = useState(
     String(
       existing?.port ?? DEFAULT_PORT_BY_CONNECTION_TYPE[existing?.type ?? "pg"],
@@ -524,10 +535,56 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     existing?.serviceName ?? existing?.database ?? "",
   );
   const [mongoConnectionUri, setMongoConnectionUri] = useState(
-    existing?.connectionUri ?? existing?.uri ?? "",
+    getMongoFormUri(existingMongo ?? {}) ?? "",
   );
+  const [mongoConnectionMode, setMongoConnectionMode] = useState<
+    "uri" | "fields"
+  >(resolveMongoConnectionMode(existingMongo ?? {}));
+  const [mongoUriDatabase, setMongoUriDatabase] = useState(
+    resolveMongoConnectionMode(existingMongo ?? {}) === "uri"
+      ? (existingMongo?.database ?? "")
+      : "",
+  );
+  const [redisConnectionMode, setRedisConnectionMode] = useState<
+    "uri" | "fields"
+  >(existing?.type === "redis" && existing.connectionUri ? "uri" : "fields");
+  const [redisConnectionUri, setRedisConnectionUri] = useState(
+    existing?.type === "redis" ? (existing.connectionUri ?? "") : "",
+  );
+  const [mongoScheme, setMongoScheme] = useState<"mongodb" | "mongodb+srv">(
+    existingMongo?.mongoScheme ?? "mongodb",
+  );
+  const [mongoAuthMethod, setMongoAuthMethod] = useState<"none" | "password">(
+    existingMongo?.mongoAuthMethod ??
+      (existingMongo?.username ? "password" : "none"),
+  );
+  const [mongoAuthSource, setMongoAuthSource] = useState(
+    existingMongo?.authSource ?? "",
+  );
+  const [mongoAuthMechanism, setMongoAuthMechanism] = useState(
+    existingMongo?.authMechanism ?? "",
+  );
+  const [mongoReplicaSet, setMongoReplicaSet] = useState(
+    existingMongo?.replicaSet ?? "",
+  );
+  const [mongoDirectConnection, setMongoDirectConnection] = useState(
+    existingMongo?.directConnection === undefined
+      ? "auto"
+      : String(existingMongo.directConnection),
+  );
+  const [mongoTlsInherit, setMongoTlsInherit] = useState(
+    existingMongo?.tls === undefined,
+  );
+  const [keepMongoUriCredentials, setKeepMongoUriCredentials] = useState(
+    existingMongo?.hasStoredMongoUriCredentials ?? false,
+  );
+  const [clearPassword, setClearPassword] = useState(false);
+  const [clearApiKey, setClearApiKey] = useState(false);
+  const [clearAwsCredentials, setClearAwsCredentials] = useState(false);
+  const [keepConnectionUriCredentials, setKeepConnectionUriCredentials] =
+    useState(existing?.hasStoredConnectionUriCredentials ?? false);
   const [elasticsearchEndpoint, setElasticsearchEndpoint] = useState(
-    existing?.endpoint ?? existing?.connectionUri ?? "",
+    existing?.connectionUri ?? existing?.endpoint ?? "",
   );
   const [elasticsearchApiKey, setElasticsearchApiKey] = useState("");
   const [elasticsearchCloudId, setElasticsearchCloudId] = useState(
@@ -590,9 +647,25 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const isSQLite = type === "sqlite";
   const isOracle = type === "oracle";
   const isMongo = type === "mongodb";
+  const mongoUriMode = isMongo && mongoConnectionMode === "uri";
   const isRedis = type === "redis";
+  const redisUriMode = isRedis && redisConnectionMode === "uri";
+  const redisUriUsesTls =
+    redisUriMode && /^rediss:\/\//i.test(redisConnectionUri.trim());
   const isElasticsearch = type === "elasticsearch";
   const isDynamo = type === "dynamodb";
+  const hasAnyAwsCredentialInput =
+    awsAccessKeyId.trim().length > 0 ||
+    awsSecretAccessKey.trim().length > 0 ||
+    awsSessionToken.trim().length > 0;
+  const hasStoredAwsKeyPair = existing?.hasStoredAwsKeyPair ?? false;
+  const hasChangedAwsProfile =
+    awsProfile.trim() !== (existing?.awsProfile?.trim() ?? "");
+  const awsProfileSelected =
+    isDynamo &&
+    awsProfile.trim().length > 0 &&
+    !hasAnyAwsCredentialInput &&
+    (clearAwsCredentials || !hasStoredAwsKeyPair || hasChangedAwsProfile);
   const tlsSupport = getConnectionTlsSupport(type);
   const supportsTls = tlsSupport !== undefined;
   const tlsEnabled = supportsTls && isConnectionTlsEnabled(tlsMode);
@@ -634,7 +707,9 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
           : "Password will be saved in plaintext in settings.json. Enable to store securely.";
   const elasticsearchApiKeyHint =
     hasStoredApiKey && elasticsearchApiKey.length === 0
-      ? "Leave blank to keep the stored API key unchanged."
+      ? clearApiKey
+        ? "The saved API key will be removed unless you enter a replacement."
+        : "Leave blank to keep the stored API key unchanged."
       : "Will be stored securely in VS Code Secret Storage (OS keychain)";
   const sshPasswordHint =
     hasStoredSshPassword && sshPassword.length === 0
@@ -677,7 +752,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
         ? "Blocks table edits and query editor execution for SQL Server. Table data and schema browsing remain available. To run queries, use database-enforced read-only permissions, including restrictions on executable routines, with a regular connection."
         : "Blocks table edits and limits query editor execution to read operations. Table data and schema browsing remain available.") +
     " This application safeguard does not replace database permissions; database-defined views, policies, and routines may have side effects even during reads.";
-  const tlsModeHint =
+  const standardTlsModeHint =
     tlsMode === "disabled"
       ? "Connection encryption is disabled."
       : tlsMode === "requireVerifyFull"
@@ -687,6 +762,12 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
           : tlsMode === "requireTrustServerCertificate"
             ? "Encrypt the connection but accept self-signed or otherwise untrusted server certificates."
             : "Encrypt the connection and present a client certificate and private key to the server.";
+  const tlsModeHint =
+    isRedis && redisUriUsesTls
+      ? tlsMode === "disabled"
+        ? "The rediss:// URI enables TLS. This mode leaves certificate handling to Redis client defaults; choose a TLS mode to configure verification or client certificates."
+        : `${standardTlsModeHint} The rediss:// URI already enables TLS; this mode applies its certificate settings.`
+      : standardTlsModeHint;
 
   useEffect(
     () =>
@@ -753,7 +834,12 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     const parsedSshPort = sshPort.trim() === "" ? 22 : Number(sshPort);
     const usesDatabasePort = isConnectionPortRelevant({
       type,
-      connectionUri: isMongo ? mongoConnectionUri : undefined,
+      mongoScheme: isMongo && !mongoUriMode ? mongoScheme : undefined,
+      connectionUri: mongoUriMode
+        ? mongoConnectionUri
+        : redisUriMode
+          ? redisConnectionUri
+          : undefined,
       endpoint: isElasticsearch ? elasticsearchEndpoint : undefined,
       cloudId: isElasticsearch ? elasticsearchCloudId : undefined,
     });
@@ -783,7 +869,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
         }
       : undefined;
 
-    return {
+    return normalizeMongoConnectionConfig({
       id: existing?.id ?? crypto.randomUUID(),
       name: name.trim(),
       type,
@@ -793,6 +879,10 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       useSecretStorage: effectiveUseSecretStorage,
       hasStoredSecret: hasStoredSecret || undefined,
       hasStoredApiKey: hasStoredApiKey || undefined,
+      clearPassword: hasStoredSecret ? clearPassword : undefined,
+      clearApiKey: isElasticsearch && clearApiKey,
+      clearAwsCredentials:
+        isDynamo && (clearAwsCredentials || awsProfileSelected),
       ssh: effectiveSshEnabled
         ? {
             host: sshHost.trim() || undefined,
@@ -820,26 +910,67 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
         : isDynamo
           ? {
               awsRegion: awsRegion.trim() || undefined,
-              awsAccessKeyId: awsAccessKeyId.trim() || undefined,
-              awsSecretAccessKey: awsSecretAccessKey.trim() || undefined,
-              awsSessionToken: awsSessionToken.trim() || undefined,
+              awsAccessKeyId: awsProfileSelected
+                ? undefined
+                : awsAccessKeyId.trim() || undefined,
+              awsSecretAccessKey: awsProfileSelected
+                ? undefined
+                : awsSecretAccessKey.trim() || undefined,
+              awsSessionToken: awsProfileSelected
+                ? undefined
+                : awsSessionToken.trim() || undefined,
               awsProfile: awsProfile.trim() || undefined,
               endpoint: dynamoEndpoint.trim() || undefined,
             }
           : {
-              host: host.trim(),
+              host: redisUriMode ? undefined : host.trim(),
               port: usesDatabasePort
                 ? port.trim() === ""
                   ? DEFAULT_PORT_BY_CONNECTION_TYPE[type]
                   : Number(port)
                 : undefined,
-              database: database.trim(),
-              username: username.trim(),
-              password,
-              tls: tlsConfig,
+              database: redisUriMode ? undefined : database.trim(),
+              username: redisUriMode ? undefined : username.trim(),
+              password: redisUriMode ? undefined : password,
+              tls: isMongo && mongoTlsInherit ? undefined : tlsConfig,
+              ...(isRedis
+                ? {
+                    connectionUri: redisUriMode
+                      ? redisConnectionUri.trim() || undefined
+                      : undefined,
+                    keepConnectionUriCredentials:
+                      redisUriMode && keepConnectionUriCredentials,
+                  }
+                : {}),
               ...(isMongo
                 ? {
-                    connectionUri: mongoConnectionUri.trim() || undefined,
+                    connectionUri: mongoUriMode
+                      ? mongoConnectionUri.trim() || undefined
+                      : undefined,
+                    mongoConnectionMode,
+                    database: mongoUriMode
+                      ? mongoUriDatabase.trim() || undefined
+                      : database.trim(),
+                    mongoScheme: mongoUriMode ? undefined : mongoScheme,
+                    mongoAuthMethod,
+                    authSource:
+                      mongoAuthMethod === "password"
+                        ? mongoAuthSource.trim() || undefined
+                        : undefined,
+                    authMechanism:
+                      mongoAuthMethod === "password"
+                        ? (mongoAuthMechanism as
+                            | "SCRAM-SHA-1"
+                            | "SCRAM-SHA-256") || undefined
+                        : undefined,
+                    replicaSet: mongoReplicaSet.trim() || undefined,
+                    directConnection:
+                      mongoDirectConnection === "auto"
+                        ? undefined
+                        : mongoDirectConnection === "true",
+                    keepMongoUriCredentials:
+                      mongoUriMode && keepMongoUriCredentials,
+                    keepConnectionUriCredentials: false,
                   }
                 : {}),
               ...(isElasticsearch
@@ -847,6 +978,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                     endpoint: elasticsearchEndpoint.trim() || undefined,
                     apiKey: elasticsearchApiKey.trim() || undefined,
                     cloudId: elasticsearchCloudId.trim() || undefined,
+                    keepConnectionUriCredentials,
                   }
                 : {}),
               ...(isOracle
@@ -855,7 +987,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                   }
                 : {}),
             }),
-    };
+    });
   }, [
     existing,
     name,
@@ -908,6 +1040,25 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     isOracle,
     oracleServiceName,
     mongoConnectionUri,
+    mongoUriDatabase,
+    mongoUriMode,
+    mongoConnectionMode,
+    isRedis,
+    redisUriMode,
+    redisConnectionUri,
+    mongoScheme,
+    mongoAuthMethod,
+    mongoAuthSource,
+    mongoAuthMechanism,
+    mongoReplicaSet,
+    mongoDirectConnection,
+    mongoTlsInherit,
+    keepMongoUriCredentials,
+    keepConnectionUriCredentials,
+    clearPassword,
+    clearApiKey,
+    clearAwsCredentials,
+    awsProfileSelected,
     elasticsearchEndpoint,
     elasticsearchApiKey,
     elasticsearchCloudId,
@@ -916,20 +1067,32 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     isDynamo,
   ]);
 
-  const validateSubmission = () => {
-    const portIssues = buildConnectionPortValidationIssues(buildPayload());
-    if (portIssues.length > 0) {
-      setTestState("fail");
-      setTestError(portIssues.map((issue) => issue.message).join(" "));
-      return false;
+  const payloadKey = JSON.stringify(buildPayload(), (key, value) =>
+    key === "id" ? undefined : value,
+  );
+  const previousPayloadKey = useRef(payloadKey);
+  useEffect(() => {
+    if (previousPayloadKey.current !== payloadKey) {
+      previousPayloadKey.current = payloadKey;
+      setTestState("idle");
+      setTestError("");
     }
-    if (
-      type === "redis" &&
-      database.trim().length > 0 &&
-      !/^\d+$/.test(database.trim())
-    ) {
+  }, [payloadKey]);
+
+  const validateSubmission = () => {
+    const config = buildPayload();
+    const validation = validateConnectionConfig(config, {
+      hasStoredAwsKeyPair:
+        existing?.hasStoredAwsKeyPair === true && !clearAwsCredentials,
+      hasStoredSshPassword:
+        sshAuthMethod === "password" && existing?.hasStoredSshPassword === true,
+      hasStoredSshPrivateKey:
+        sshAuthMethod === "privateKey" &&
+        existing?.hasStoredSshPrivateKey === true,
+    });
+    if (!validation.valid) {
       setTestState("fail");
-      setTestError("Redis database must be a non-negative integer.");
+      setTestError(validation.message ?? "Connection settings are invalid.");
       return false;
     }
     return true;
@@ -1135,7 +1298,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
             </Field>
             <Field
               label="AWS Profile"
-              hint="Optional shared credentials profile to use instead of explicit keys."
+              hint="Explicit static keys take priority. Selecting a different profile clears saved static keys."
             >
               <FocusInput
                 aria-label="AWS profile"
@@ -1180,67 +1343,267 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                 placeholder="IQoJ..."
               />
             </Field>
+            {existing?.hasStoredAwsCredentials && (
+              <Toggle
+                label="Remove saved AWS credentials"
+                hint={
+                  clearAwsCredentials || awsProfileSelected
+                    ? "Saved static credentials are removed; AWS Profile (when set) or the default credential chain will be used."
+                    : "Saved AWS credentials are kept; a complete static key pair takes priority over AWS Profile. New values replace them."
+                }
+                checked={clearAwsCredentials || awsProfileSelected}
+                disabled={awsProfileSelected}
+                onChange={setClearAwsCredentials}
+              />
+            )}
           </>
         ) : (
           <>
-            <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
-              <div style={{ flex: 1 }}>
-                <FieldLabel>Host</FieldLabel>
-                <FocusInput
-                  aria-label="Host"
-                  value={host}
-                  onChange={(e) => setHost(e.target.value)}
-                  placeholder="localhost"
-                />
-              </div>
-              <div style={{ width: 90 }}>
-                <FieldLabel>Port</FieldLabel>
-                <FocusInput
-                  aria-label="Port"
-                  value={port}
-                  onChange={(e) => setPort(e.target.value)}
-                  type="text"
-                  inputMode="numeric"
-                  pattern="[0-9]*"
-                  style={
-                    {
-                      fontFamily: "var(--vscode-editor-font-family, monospace)",
-                      MozAppearance: "textfield",
-                    } as CSSProperties
+            {isMongo && (
+              <Field
+                label="Connection method"
+                hint="Each method keeps its draft while this form is open. Only the selected method is saved."
+              >
+                <FocusSelect
+                  aria-label="MongoDB connection method"
+                  value={mongoConnectionMode}
+                  onChange={(e) =>
+                    setMongoConnectionMode(e.target.value as "uri" | "fields")
                   }
-                />
-              </div>
-            </div>
-            {!isElasticsearch && !isOracle && (
-              <Field label="Database">
+                >
+                  <option value="fields">Parameters</option>
+                  <option value="uri">Connection string (URI)</option>
+                </FocusSelect>
+              </Field>
+            )}
+            {isRedis && (
+              <Field
+                label="Connection method"
+                hint="Only the selected method is saved. URI mode uses credentials from the URI and clears separate username and password values. Saved URI credentials remain hidden while editing."
+              >
+                <FocusSelect
+                  aria-label="Redis connection method"
+                  value={redisConnectionMode}
+                  onChange={(e) =>
+                    setRedisConnectionMode(e.target.value as "uri" | "fields")
+                  }
+                >
+                  <option value="fields">Parameters</option>
+                  <option value="uri">Connection string (URI)</option>
+                </FocusSelect>
+              </Field>
+            )}
+            {!mongoUriMode && !redisUriMode && (
+              <>
+                {isMongo && (
+                  <Field label="Connection scheme">
+                    <FocusSelect
+                      aria-label="MongoDB scheme"
+                      value={mongoScheme}
+                      onChange={(e) =>
+                        setMongoScheme(
+                          e.target.value as "mongodb" | "mongodb+srv",
+                        )
+                      }
+                    >
+                      <option value="mongodb">Standard (mongodb://)</option>
+                      <option value="mongodb+srv">
+                        DNS seed list (mongodb+srv://)
+                      </option>
+                    </FocusSelect>
+                  </Field>
+                )}
+                <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+                  <div style={{ flex: 1 }}>
+                    <FieldLabel>Host</FieldLabel>
+                    <FocusInput
+                      aria-label="Host"
+                      value={host}
+                      onChange={(e) => setHost(e.target.value)}
+                      placeholder="localhost"
+                    />
+                  </div>
+                  {!(isMongo && mongoScheme === "mongodb+srv") && (
+                    <div style={{ width: 90 }}>
+                      <FieldLabel>Port</FieldLabel>
+                      <FocusInput
+                        aria-label="Port"
+                        value={port}
+                        onChange={(e) => setPort(e.target.value)}
+                        type="text"
+                        inputMode="numeric"
+                        pattern="[0-9]*"
+                        style={
+                          {
+                            fontFamily:
+                              "var(--vscode-editor-font-family, monospace)",
+                            MozAppearance: "textfield",
+                          } as CSSProperties
+                        }
+                      />
+                    </div>
+                  )}
+                </div>
+                {!isElasticsearch && !isOracle && (
+                  <Field label="Database">
+                    <FocusInput
+                      aria-label="Database"
+                      value={database}
+                      onChange={(e) => setDatabase(e.target.value)}
+                      placeholder={isRedis ? "0" : "mydb"}
+                    />
+                  </Field>
+                )}
+                {isMongo && (
+                  <Field label="Authentication">
+                    <FocusSelect
+                      aria-label="MongoDB authentication"
+                      value={mongoAuthMethod}
+                      onChange={(e) =>
+                        setMongoAuthMethod(
+                          e.target.value as "none" | "password",
+                        )
+                      }
+                    >
+                      <option value="none">No authentication</option>
+                      <option value="password">Username / Password</option>
+                    </FocusSelect>
+                  </Field>
+                )}
+                {(!isMongo || mongoAuthMethod === "password") && (
+                  <Field label="Username">
+                    <FocusInput
+                      aria-label="Username"
+                      value={username}
+                      onChange={(e) => setUsername(e.target.value)}
+                      placeholder="admin"
+                    />
+                  </Field>
+                )}
+                {isMongo && (
+                  <>
+                    {mongoAuthMethod === "password" && (
+                      <>
+                        <Field
+                          label="Authentication database"
+                          hint={`Where the user was created. Automatic uses ${database.trim() || "admin"}. Set this to admin if the user was created in admin.`}
+                        >
+                          <FocusInput
+                            aria-label="MongoDB authentication database"
+                            value={mongoAuthSource}
+                            onChange={(e) => setMongoAuthSource(e.target.value)}
+                            placeholder="Automatic"
+                          />
+                        </Field>
+                        <Field label="Authentication mechanism">
+                          <FocusSelect
+                            aria-label="MongoDB authentication mechanism"
+                            value={mongoAuthMechanism}
+                            onChange={(e) =>
+                              setMongoAuthMechanism(e.target.value)
+                            }
+                          >
+                            <option value="">Automatic</option>
+                            <option value="SCRAM-SHA-256">SCRAM-SHA-256</option>
+                            <option value="SCRAM-SHA-1">SCRAM-SHA-1</option>
+                          </FocusSelect>
+                        </Field>
+                      </>
+                    )}
+                    <Field label="Replica set">
+                      <FocusInput
+                        aria-label="MongoDB replica set"
+                        value={mongoReplicaSet}
+                        onChange={(e) => setMongoReplicaSet(e.target.value)}
+                        placeholder="Optional"
+                      />
+                    </Field>
+                    <Field label="Direct connection">
+                      <FocusSelect
+                        aria-label="MongoDB direct connection"
+                        value={mongoDirectConnection}
+                        onChange={(e) =>
+                          setMongoDirectConnection(e.target.value)
+                        }
+                      >
+                        <option value="auto">Automatic</option>
+                        <option value="true">Enabled — single host</option>
+                        <option value="false">
+                          Disabled — discover topology
+                        </option>
+                      </FocusSelect>
+                    </Field>
+                    <Field
+                      label="Connection string preview"
+                      hint="Password is hidden."
+                    >
+                      <FocusInput
+                        aria-label="MongoDB URI preview"
+                        readOnly
+                        value={buildMongoFieldsUri({
+                          ...buildPayload(),
+                          password: "********",
+                        })}
+                      />
+                    </Field>
+                  </>
+                )}
+              </>
+            )}
+            {mongoUriMode && (
+              <>
+                <Field
+                  label="Connection URI"
+                  hint="The URI defines MongoDB hosts, credentials, authentication database and options. Supports mongodb:// and mongodb+srv://. Saved credentials are hidden when editing."
+                >
+                  <FocusInput
+                    aria-label="MongoDB connection URI"
+                    value={mongoConnectionUri}
+                    onChange={(e) => setMongoConnectionUri(e.target.value)}
+                    placeholder="mongodb://user:pass@localhost:27017/mydb"
+                  />
+                </Field>
+                <Field
+                  label="Working database override"
+                  hint="Optional database for browsing and queries. Leaves the URI authentication database unchanged. Leave empty to use the URI database, or admin if none is specified."
+                >
+                  <FocusInput
+                    aria-label="MongoDB working database override"
+                    value={mongoUriDatabase}
+                    onChange={(e) => setMongoUriDatabase(e.target.value)}
+                    placeholder="Use URI database"
+                  />
+                </Field>
+              </>
+            )}
+            {redisUriMode && (
+              <Field
+                label="Connection URI"
+                hint="redis:// uses plain TCP unless a TLS mode is selected; rediss:// always enables TLS. TLS modes configure certificate handling. Saved credentials are hidden when editing."
+              >
                 <FocusInput
-                  aria-label="Database"
-                  value={database}
-                  onChange={(e) => setDatabase(e.target.value)}
-                  placeholder={isRedis ? "0" : "mydb"}
+                  aria-label="Redis connection URI"
+                  value={redisConnectionUri}
+                  onChange={(e) => setRedisConnectionUri(e.target.value)}
+                  placeholder="redis://user:pass@localhost:6379/0"
                 />
               </Field>
             )}
-            <Field label="Username">
-              <FocusInput
-                aria-label="Username"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="admin"
+            {redisUriMode && existing?.hasStoredConnectionUriCredentials && (
+              <Toggle
+                label="Keep saved URI credentials"
+                hint="Reuse saved URI credentials when editing. Turn off to remove them, or enter a complete URI to replace them."
+                checked={keepConnectionUriCredentials}
+                onChange={setKeepConnectionUriCredentials}
               />
-            </Field>
-            {isMongo && (
-              <Field
-                label="Connection URI"
-                hint="Optional. When set, this URI is used instead of host/port/user fields."
-              >
-                <FocusInput
-                  aria-label="MongoDB connection URI"
-                  value={mongoConnectionUri}
-                  onChange={(e) => setMongoConnectionUri(e.target.value)}
-                  placeholder="mongodb://user:pass@localhost:27017/mydb"
-                />
-              </Field>
+            )}
+            {mongoUriMode && existing?.hasStoredMongoUriCredentials && (
+              <Toggle
+                label="Keep saved URI credentials"
+                hint="Reuse the saved credentials when editing this URI. Turn off to remove them, or paste a complete URI to replace them."
+                checked={keepMongoUriCredentials}
+                onChange={setKeepMongoUriCredentials}
+              />
             )}
             {isElasticsearch && (
               <>
@@ -1255,6 +1618,14 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                     placeholder="http://localhost:9200"
                   />
                 </Field>
+                {existing?.hasStoredConnectionUriCredentials && (
+                  <Toggle
+                    label="Keep saved endpoint credentials"
+                    hint="Reuse credentials stored in this endpoint or connection URI. Turn off to remove them, or enter a complete endpoint to replace them."
+                    checked={keepConnectionUriCredentials}
+                    onChange={setKeepConnectionUriCredentials}
+                  />
+                )}
                 <Field
                   label="API Key"
                   hint={`Optional API key for Elasticsearch authentication. ${elasticsearchApiKeyHint}`}
@@ -1266,6 +1637,14 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                     placeholder="base64ApiKey"
                   />
                 </Field>
+                {hasStoredApiKey && (
+                  <Toggle
+                    label="Remove saved API key"
+                    hint="The saved API key is removed unless you enter a replacement."
+                    checked={clearApiKey}
+                    onChange={setClearApiKey}
+                  />
+                )}
                 <Field
                   label="Cloud ID"
                   hint="Optional Elastic Cloud deployment identifier."
@@ -1458,54 +1837,79 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
             disabled={secretStorageRequired}
           />
 
-          <Field
-            label="Password"
-            hint={
-              effectiveUseSecretStorage &&
-              hasStoredSecret &&
-              password.length === 0
-                ? "Leave blank to keep the stored password unchanged."
-                : effectiveUseSecretStorage
-                  ? "Will be stored securely in VS Code Secret Storage (OS keychain)"
-                  : "Will be stored in plaintext in settings.json"
-            }
-          >
-            <div style={{ position: "relative" }}>
-              <FocusInput
-                aria-label="Password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                type="password"
-                placeholder="••••••••"
-                style={{
-                  fontFamily: "var(--vscode-editor-font-family, monospace)",
-                  paddingRight: 34,
-                  borderColor: effectiveUseSecretStorage
-                    ? "var(--vscode-testing-iconPassed, #4ec94e)"
-                    : "var(--vscode-inputValidation-warningBorder, #b89500)",
-                }}
-              />
-              <span
-                title={
-                  effectiveUseSecretStorage
-                    ? "Stored in OS keychain"
-                    : "Stored in plaintext"
-                }
-                style={{
-                  position: "absolute",
-                  right: 8,
-                  top: "50%",
-                  transform: "translateY(-50%)",
-                  fontSize: 14,
-                  pointerEvents: "none",
-                  opacity: 0.75,
-                }}
-              >
-                {effectiveUseSecretStorage ? "🔒" : "⚠️"}
-              </span>
-            </div>
-          </Field>
+          {(!isMongo || (!mongoUriMode && mongoAuthMethod === "password")) &&
+            !redisUriMode && (
+              <>
+                <Field
+                  label="Password"
+                  hint={
+                    hasStoredSecret && password.length === 0
+                      ? clearPassword
+                        ? "The saved password will be removed unless you enter a replacement."
+                        : "Leave blank to keep the stored password unchanged."
+                      : effectiveUseSecretStorage
+                        ? "Will be stored securely in VS Code Secret Storage (OS keychain)"
+                        : "Will be stored in plaintext in settings.json"
+                  }
+                >
+                  <div style={{ position: "relative" }}>
+                    <FocusInput
+                      aria-label="Password"
+                      value={password}
+                      onChange={(e) => {
+                        setPassword(e.target.value);
+                        if (e.target.value) setClearPassword(false);
+                      }}
+                      type="password"
+                      placeholder="••••••••"
+                      style={{
+                        fontFamily:
+                          "var(--vscode-editor-font-family, monospace)",
+                        paddingRight: 34,
+                        borderColor: effectiveUseSecretStorage
+                          ? "var(--vscode-testing-iconPassed, #4ec94e)"
+                          : "var(--vscode-inputValidation-warningBorder, #b89500)",
+                      }}
+                    />
+                    <span
+                      title={
+                        effectiveUseSecretStorage
+                          ? "Stored in OS keychain"
+                          : "Stored in plaintext"
+                      }
+                      style={{
+                        position: "absolute",
+                        right: 8,
+                        top: "50%",
+                        transform: "translateY(-50%)",
+                        fontSize: 14,
+                        pointerEvents: "none",
+                        opacity: 0.75,
+                      }}
+                    >
+                      {effectiveUseSecretStorage ? "🔒" : "⚠️"}
+                    </span>
+                  </div>
+                </Field>
+                {hasStoredSecret && (
+                  <Toggle
+                    label="Remove saved password"
+                    hint="Leave the password field blank to remove it; a new password replaces it."
+                    checked={clearPassword}
+                    onChange={setClearPassword}
+                  />
+                )}
+              </>
+            )}
 
+          {isMongo && (
+            <Toggle
+              label="Use MongoDB TLS defaults / URI settings"
+              hint="Preserves tls/ssl URI options and the secure default of mongodb+srv. Turn off to set TLS mode and verification below. URI certificate files remain fallbacks while TLS is enabled."
+              checked={mongoTlsInherit}
+              onChange={setMongoTlsInherit}
+            />
+          )}
           <div
             style={{
               borderTop: "1px solid var(--vscode-panel-border)",
@@ -1513,7 +1917,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
               marginTop: 4,
             }}
           >
-            {supportsTls && tlsSupport ? (
+            {supportsTls && tlsSupport && !(isMongo && mongoTlsInherit) ? (
               <>
                 <div
                   style={{
@@ -1552,7 +1956,9 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                     >
                       {tlsSupport.modes.map((mode) => (
                         <option key={mode} value={mode}>
-                          {TLS_MODE_LABELS[mode]}
+                          {mode === "disabled" && redisUriUsesTls
+                            ? "URI defaults (TLS enabled)"
+                            : TLS_MODE_LABELS[mode]}
                         </option>
                       ))}
                     </FocusSelect>

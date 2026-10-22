@@ -101,6 +101,11 @@ export interface ConnectionConfig {
   apiKey?: string;
   cloudId?: string;
   uri?: string;
+  mongoUriHasCredentials?: boolean;
+  mongoScheme?: "mongodb" | "mongodb+srv";
+  mongoConnectionMode?: "uri" | "fields";
+  mongoAuthMethod?: "none" | "password";
+  authMechanism?: "SCRAM-SHA-1" | "SCRAM-SHA-256";
   authSource?: string;
   awsRegion?: string;
   awsAccessKeyId?: string;

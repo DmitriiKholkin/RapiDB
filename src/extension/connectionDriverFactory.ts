@@ -2,6 +2,7 @@ import {
   isConnectionTlsEnabled,
   resolveConnectionTlsMode,
 } from "../shared/connectionConfig";
+import { resolveMongoRemoteTarget } from "../shared/mongoConnection";
 import type { ConnectionConfig } from "./connectionManagerModels";
 import { DynamoDBDriver } from "./dbDrivers/dynamodb";
 import { ElasticsearchDriver } from "./dbDrivers/elasticsearch";
@@ -58,19 +59,7 @@ export class ConnectionDriverFactory {
     host: string;
     port: number;
   } {
-    const rawUri = config.connectionUri ?? config.uri;
-    if (rawUri) {
-      const parsed = new URL(rawUri);
-      return {
-        host: parsed.hostname,
-        port: parsed.port ? Number.parseInt(parsed.port, 10) : 27017,
-      };
-    }
-
-    return {
-      host: config.host?.trim() || "localhost",
-      port: config.port ?? 27017,
-    };
+    return resolveMongoRemoteTarget(config);
   }
 
   resolveRedisRemoteTarget(config: ConnectionConfig): {
@@ -80,7 +69,7 @@ export class ConnectionDriverFactory {
     if (config.connectionUri) {
       const parsed = new URL(config.connectionUri);
       return {
-        host: parsed.hostname,
+        host: parsed.hostname.replace(/^\[|\]$/g, ""),
         port: parsed.port ? Number.parseInt(parsed.port, 10) : 6379,
       };
     }

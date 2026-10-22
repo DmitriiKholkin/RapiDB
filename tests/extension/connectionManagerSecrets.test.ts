@@ -27,6 +27,48 @@ vi.mock("vscode", async () => {
 });
 
 describe("ConnectionManager with VSCode SecretStorage", () => {
+  it("moves Elasticsearch URI credentials into the canonical endpoint secret on edit", async () => {
+    configuration.connections = [];
+    const context = createExtensionContextStub();
+    const existing: ConnectionConfig = {
+      id: "elastic-uri-migration",
+      name: "Elastic URI",
+      type: "elasticsearch",
+      connectionUri: "https://elastic.local/base",
+      useSecretStorage: true,
+    };
+    const fullEndpoint =
+      "https://elastic-user:elastic-pass@elastic.local/edited?api_key=key-secret";
+    configuration.connections = [existing];
+    await context.secrets.store(
+      existing.id,
+      JSON.stringify({
+        connectionUri:
+          "https://elastic-user:elastic-pass@elastic.local/base?api_key=key-secret",
+      }),
+    );
+    const manager = new ConnectionManager(context as never);
+    try {
+      const saved = await manager.saveConnection({
+        ...existing,
+        connectionUri: undefined,
+        endpoint: fullEndpoint,
+      });
+
+      expect(saved.connectionUri).toBeUndefined();
+      expect(saved.endpoint).toBe("https://elastic.local/edited");
+      expect(configuration.connections[0].endpoint).toBe(
+        "https://elastic.local/edited",
+      );
+      expect(configuration.connections[0].connectionUri).toBeUndefined();
+      expect(
+        JSON.parse((await context.secrets.get(existing.id)) ?? "{}"),
+      ).toEqual({ endpoint: fullEndpoint });
+    } finally {
+      await manager.dispose();
+    }
+  });
+
   it.each([
     ["user:uri-secret@host/db", "host/db"],
     ["//user:uri-secret@host/db", "//host/db"],
@@ -34,7 +76,7 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
       "mongodb://host/db?authMechanism=MONGODB-AWS&authMechanismProperties=AWS_SESSION_TOKEN%3ASESSION_SECRET&retryWrites=true",
       "mongodb://host/db?authMechanism=MONGODB-AWS&retryWrites=true",
     ],
-  ])("protects nonstandard URI credentials through save and edit: %s", async (connectionUri, redacted) => {
+  ])("handles legacy URI credentials safely through save and edit: %s", async (connectionUri, redacted) => {
     for (const useSecretStorage of [undefined, true]) {
       configuration.connections = [];
       const context = createExtensionContextStub();
@@ -47,6 +89,14 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
         useSecretStorage,
       };
       try {
+        if (!connectionUri.startsWith("mongodb://")) {
+          await expect(manager.saveConnection(config)).rejects.toThrow(
+            "Enter a valid MongoDB URI",
+          );
+          expect(configuration.connections).toEqual([]);
+          expect(await context.secrets.get(config.id)).toBeUndefined();
+          continue;
+        }
         const saved = await manager.saveConnection(config);
         expect(saved.connectionUri).toBe(redacted);
         expect(configuration.connections[0].connectionUri).toBe(redacted);

@@ -5,6 +5,7 @@ import {
   isConnectionTlsEnabled,
   resolveConnectionTlsMode,
 } from "../shared/connectionConfig";
+import { resolveMongoRemoteTarget } from "../shared/mongoConnection";
 import { resolveMongoDatabaseName } from "../shared/mongoDatabase";
 import type {
   BookmarkEntry,
@@ -40,6 +41,7 @@ import {
   VSCodeConnectionManagerStore,
 } from "./connectionManagerStore";
 import {
+  type ConnectionSecretClearOptions,
   hasPersistedConnectionConfigChanges,
   sanitizeConnectionConfigForResponse,
   sanitizePersistedConnectionConfig,
@@ -1003,12 +1005,14 @@ export class ConnectionManager
 
   private async _persistConnectionSecretsIfNeeded(
     config: ConnectionConfig,
+    clearOptions: ConnectionSecretClearOptions = {},
   ): Promise<(() => Promise<void>) | undefined> {
     const previousSecretSnapshot = await this.store.getSecret(config.id);
     const nextSecretSnapshot = shouldForceSecretStorage(config)
       ? serializeConnectionSecretsForStoredConfig(
           config,
           previousSecretSnapshot,
+          clearOptions,
         )
       : undefined;
     if (nextSecretSnapshot === previousSecretSnapshot) {
@@ -1168,7 +1172,10 @@ export class ConnectionManager
   getConnection(id: string): ConnectionConfig | undefined {
     return this.getConnections().find((c) => c.id === id);
   }
-  async saveConnection(config: ConnectionConfig): Promise<ConnectionConfig> {
+  async saveConnection(
+    config: ConnectionConfig,
+    clearOptions: ConnectionSecretClearOptions = {},
+  ): Promise<ConnectionConfig> {
     this._assertNotDisposed();
 
     const canonicalConfig = canonicalizeOracleServiceName({
@@ -1190,7 +1197,10 @@ export class ConnectionManager
       const rollback =
         connections[idx]?.useSecretStorage === true ||
         shouldForceSecretStorage(canonicalConfig)
-          ? await this._persistConnectionSecretsIfNeeded(canonicalConfig)
+          ? await this._persistConnectionSecretsIfNeeded(
+              canonicalConfig,
+              clearOptions,
+            )
           : undefined;
       const next = [...connections];
       if (idx >= 0) {
@@ -1506,19 +1516,7 @@ export class ConnectionManager
     host: string;
     port: number;
   } {
-    const rawUri = config.connectionUri ?? config.uri;
-    if (rawUri) {
-      const parsed = new URL(rawUri);
-      return {
-        host: parsed.hostname.replace(/^\[|\]$/g, ""),
-        port: parsed.port ? Number.parseInt(parsed.port, 10) : 27017,
-      };
-    }
-
-    return {
-      host: config.host?.trim() || "localhost",
-      port: config.port ?? 27017,
-    };
+    return resolveMongoRemoteTarget(config);
   }
 
   private resolveRedisRemoteTarget(config: ConnectionConfig): {
@@ -1528,7 +1526,7 @@ export class ConnectionManager
     if (config.connectionUri) {
       const parsed = new URL(config.connectionUri);
       return {
-        host: parsed.hostname,
+        host: parsed.hostname.replace(/^\[|\]$/g, ""),
         port: parsed.port ? Number.parseInt(parsed.port, 10) : 6379,
       };
     }

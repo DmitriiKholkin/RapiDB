@@ -701,7 +701,7 @@ describe("ConnectionManager", () => {
 
   it.each(
     MONGO_QUERY_ERROR_URIS,
-  )("redacts malformed query-secret errors through the real Mongo testConnection route: %s", async (uri) => {
+  )("rejects malformed query-secret URIs before creating a Mongo driver: %s", async (uri) => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
     );
@@ -726,19 +726,16 @@ describe("ConnectionManager", () => {
       connectionUri: uri,
     });
     expect(result.success).toBe(false);
-    expect(result.error).toContain("Protocol and host list are required");
-    expect(result.error).toContain("authMechanismProperties=[REDACTED]");
+    expect(result.error).toContain("Enter a valid MongoDB URI");
     expect(result.error).not.toContain("H10_QUERY_SECRET");
-    if (uri.includes("retryWrites"))
-      expect(result.error).toContain("retryWrites=true");
-    expect(createDriver.mock.calls[0]?.[0].connectionUri).toBe(uri);
+    expect(createDriver).not.toHaveBeenCalled();
     await manager.dispose();
   });
 
   it.each([
     MONGO_ERROR_URI,
     ...MONGO_NUMERIC_PASSWORD_ERROR_URIS,
-  ])("redacts the real MongoDB driver's parse error through the complete testConnection route: %s", async (uri) => {
+  ])("rejects malformed credential URIs without echoing them in testConnection: %s", async (uri) => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
     );
@@ -762,12 +759,14 @@ describe("ConnectionManager", () => {
       type: "mongodb",
       connectionUri: uri,
     });
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       success: false,
-      error:
-        'Protocol and host list are required in "mongodb://[REDACTED]@/db"',
+      error: expect.stringContaining("Enter a valid MongoDB URI"),
+      validation: { valid: false },
     });
-    expect(createDriver.mock.calls[0]?.[0].connectionUri).toBe(uri);
+    expect(result.error).not.toContain(uri);
+    expect(result.error).not.toContain("H10_");
+    expect(createDriver).not.toHaveBeenCalled();
     await manager.dispose();
   });
 
@@ -776,6 +775,7 @@ describe("ConnectionManager", () => {
       "../../src/extension/connectionManager"
     );
     const upstream = mongoCredentialError();
+    const connectionUri = MONGO_ERROR_URI.replace("@/db", "@mongo.example/db");
     driverBehaviors.set("__test__", { connectError: upstream });
     const manager = new ConnectionManager(
       createExtensionContextStub() as never,
@@ -784,14 +784,14 @@ describe("ConnectionManager", () => {
     const result = await manager.testConnection({
       name: "Mongo parser failure",
       type: "mongodb",
-      connectionUri: MONGO_ERROR_URI,
+      connectionUri,
     });
     expect(result.success).toBe(false);
     expect(result.error).toContain("Protocol and host list are required");
     expect(result.error).toContain("mongodb://[REDACTED]@/db");
     expect(result.error).not.toContain(MONGO_ERROR_SECRET);
     expect((driverInstances[0]?.config as ConnectionConfig).connectionUri).toBe(
-      MONGO_ERROR_URI,
+      connectionUri,
     );
     expect(upstream.message).toContain(MONGO_ERROR_SECRET);
     await manager.dispose();
@@ -4006,6 +4006,7 @@ describe("ConnectionManager", () => {
       const { config, store, fingerprint, createSshRuntime } = setup();
       config.type = type;
       if (type === "oracle") config.serviceName = "app";
+      if (type === "redis") config.database = "0";
       if (type === "dynamodb") config.awsRegion = "us-east-1";
       if (type === "elasticsearch") config.endpoint = "http://db.internal:9200";
       store.setConnections([config]);
@@ -6819,7 +6820,7 @@ describe("ConnectionManager", () => {
         id: "conn-sections",
         name: "Sectioned",
         type: "redis",
-        database: "app_db",
+        database: "0",
         host: "localhost",
       },
     ]);

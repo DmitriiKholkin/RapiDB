@@ -1,6 +1,11 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import {
+  getMongoConnectionUri,
+  getMongoFormUri,
+  normalizeMongoConnectionConfig,
+} from "../../shared/mongoConnection";
+import {
   type ConnectionFormBrowseTarget,
   type ConnectionFormExistingState,
   type ConnectionFormSubmission,
@@ -8,8 +13,11 @@ import {
 } from "../../shared/webviewContracts";
 import type { ConnectionConfig, ConnectionManager } from "../connectionManager";
 import {
+  type ConnectionSecretClearOptions,
   extractCredentialBearingUriSecret,
   hasConnectionConfigSecrets,
+  restoreCredentialBearingUri,
+  restoreMongoUriCredentials,
   sanitizeConnectionConfigForResponse,
   sanitizeCredentialBearingUri,
   trimOptionalSecretValue,
@@ -80,6 +88,69 @@ function shouldUseSecretStorage(payload: ConnectionFormSubmission): boolean {
   );
 }
 
+function getExistingMongoUri(
+  existing: ConnectionConfig,
+  secrets: StoredConnectionSecrets,
+): string | undefined {
+  const value = getMongoConnectionUri(existing);
+  const usesCanonicalUri = Boolean(existing.connectionUri?.trim());
+  const secret = usesCanonicalUri ? secrets.connectionUri : secrets.uri;
+  return secret &&
+    sanitizeCredentialBearingUri(secret) === sanitizeCredentialBearingUri(value)
+    ? secret
+    : value;
+}
+
+function getExistingUriValue(
+  value: string | undefined,
+  secret: string | undefined,
+): string | undefined {
+  return secret &&
+    sanitizeCredentialBearingUri(secret) === sanitizeCredentialBearingUri(value)
+    ? secret
+    : value;
+}
+
+/** Preserve legacy Redis URI authentication when moving to the URI editor. */
+function getExistingRedisUri(
+  existing: ConnectionConfig,
+  secrets: StoredConnectionSecrets,
+): string | undefined {
+  const value = getExistingUriValue(
+    existing.connectionUri,
+    secrets.connectionUri,
+  );
+  if (!value) return value;
+  try {
+    const parsed = new URL(value);
+    if (!["redis:", "rediss:"].includes(parsed.protocol)) return value;
+    if (!parsed.port && existing.port !== undefined) {
+      parsed.port = String(existing.port);
+    }
+    const database = existing.database?.trim();
+    if (database) parsed.pathname = `/${database.replace(/^db/, "")}`;
+    // Redis URI credentials take priority over separate authentication fields.
+    if (parsed.username || parsed.password) return parsed.toString();
+    const username = existing.username?.trim();
+    const password = secrets.password ?? existing.password;
+    if (!username && !password) return parsed.toString();
+    parsed.username = encodeURIComponent(username ?? "");
+    parsed.password = encodeURIComponent(password ?? "");
+    return parsed.toString();
+  } catch {
+    return value;
+  }
+}
+
+function getExistingElasticEndpoint(
+  existing: ConnectionConfig,
+  secrets: StoredConnectionSecrets,
+): string | undefined {
+  return existing.connectionUri !== undefined
+    ? getExistingUriValue(existing.connectionUri, secrets.connectionUri)
+    : getExistingUriValue(existing.endpoint, secrets.endpoint);
+}
+
 function sanitizeExistingForForm(
   existing: ConnectionConfig,
   storedSecrets: StoredConnectionSecrets,
@@ -97,6 +168,20 @@ function sanitizeExistingForForm(
     awsEndpoint,
     ...rest
   } = existing;
+  const existingRedisUri =
+    existing.type === "redis"
+      ? getExistingRedisUri(existing, storedSecrets)
+      : undefined;
+  const existingElasticEndpoint =
+    existing.type === "elasticsearch"
+      ? getExistingElasticEndpoint(existing, storedSecrets)
+      : endpoint;
+  const hasStoredAwsKeyPair =
+    trimOptionalSecretValue(storedSecrets.awsAccessKeyId ?? _awsAccessKeyId) !==
+      undefined &&
+    trimOptionalSecretValue(
+      storedSecrets.awsSecretAccessKey ?? _awsSecretAccessKey,
+    ) !== undefined;
   const tls =
     rest.tls !== undefined
       ? {
@@ -120,9 +205,31 @@ function sanitizeExistingForForm(
     ...rest,
     ssh: sanitizedSsh,
     tls,
-    connectionUri: sanitizeCredentialBearingUri(connectionUri),
+    connectionUri: sanitizeCredentialBearingUri(
+      existing.type === "mongodb"
+        ? getMongoFormUri(
+            existing,
+            getExistingMongoUri(existing, storedSecrets),
+          )
+        : existing.type === "redis"
+          ? existingRedisUri
+          : connectionUri,
+    ),
+    hasStoredConnectionUriCredentials:
+      (existing.type === "redis" &&
+        extractCredentialBearingUriSecret(existingRedisUri) !== undefined) ||
+      (existing.type === "elasticsearch" &&
+        extractCredentialBearingUriSecret(existingElasticEndpoint) !==
+          undefined),
+    hasStoredMongoUriCredentials:
+      existing.type === "mongodb" &&
+      extractCredentialBearingUriSecret(
+        getExistingMongoUri(existing, storedSecrets),
+      ) !== undefined,
     uri: sanitizeCredentialBearingUri(uri),
-    endpoint: sanitizeCredentialBearingUri(endpoint),
+    endpoint: sanitizeCredentialBearingUri(
+      existing.type === "elasticsearch" ? existingElasticEndpoint : endpoint,
+    ),
     awsEndpoint: sanitizeCredentialBearingUri(awsEndpoint),
     hasStoredSecret:
       storedSecrets.password !== undefined ||
@@ -132,6 +239,15 @@ function sanitizeExistingForForm(
       storedSecrets.apiKey !== undefined ||
       trimOptionalSecretValue(_apiKey) !== undefined ||
       undefined,
+    hasStoredAwsCredentials:
+      storedSecrets.awsAccessKeyId !== undefined ||
+      storedSecrets.awsSecretAccessKey !== undefined ||
+      storedSecrets.awsSessionToken !== undefined ||
+      trimOptionalSecretValue(_awsAccessKeyId) !== undefined ||
+      trimOptionalSecretValue(_awsSecretAccessKey) !== undefined ||
+      trimOptionalSecretValue(_awsSessionToken) !== undefined ||
+      undefined,
+    hasStoredAwsKeyPair: hasStoredAwsKeyPair || undefined,
     hasStoredSshPassword:
       storedSecrets.sshPassword !== undefined ||
       trimOptionalSecretValue(_ssh?.password) !== undefined ||
@@ -248,6 +364,7 @@ export class ConnectionFormPanel {
     if (payload.password !== undefined && payload.password !== "") {
       return payload.password;
     }
+    if (payload.clearPassword) return "";
 
     if (useSecretStorage && storedSecrets.password !== undefined) {
       return storedSecrets.password;
@@ -310,13 +427,26 @@ export class ConnectionFormPanel {
         extractCredentialBearingUriSecret(existing?.uri) !== undefined ||
         extractCredentialBearingUriSecret(existing?.endpoint) !== undefined ||
         extractCredentialBearingUriSecret(existing?.awsEndpoint) !== undefined);
-    const password = await this.resolveSubmittedPassword(
-      payload,
-      resolvedStoredSecrets,
-      useSecretStorage,
-    );
+    const isRedisUriSubmission =
+      payload.type === "redis" &&
+      trimOptionalUriValue(payload.connectionUri) !== undefined;
+    const password = isRedisUriSubmission
+      ? undefined
+      : await this.resolveSubmittedPassword(
+          payload,
+          resolvedStoredSecrets,
+          useSecretStorage,
+        );
     const {
       hasStoredSecret: _hasStoredSecret,
+      hasStoredMongoUriCredentials: _hasStoredMongoUriCredentials,
+      hasStoredConnectionUriCredentials: _hasStoredConnectionUriCredentials,
+      hasStoredAwsCredentials: _hasStoredAwsCredentials,
+      keepConnectionUriCredentials: _keepConnectionUriCredentials,
+      keepMongoUriCredentials: _keepMongoUriCredentials,
+      clearPassword: _clearPassword,
+      clearApiKey: _clearApiKey,
+      clearAwsCredentials: _clearAwsCredentials,
       hasStoredApiKey: _hasStoredApiKey,
       hasStoredSshPassword: _hasStoredSshPassword,
       hasStoredSshPrivateKey: _hasStoredSshPrivateKey,
@@ -381,25 +511,100 @@ export class ConnectionFormPanel {
       payload.type === "elasticsearch" &&
       Boolean(payload.username?.trim()) &&
       trimOptionalSecretValue(payload.password) !== undefined;
-    return {
+    const hasAwsProfile =
+      payload.type === "dynamodb" && Boolean(payload.awsProfile?.trim());
+    const hasSubmittedAwsKeyMaterial =
+      payload.type === "dynamodb" &&
+      (trimOptionalSecretValue(payload.awsAccessKeyId) !== undefined ||
+        trimOptionalSecretValue(payload.awsSecretAccessKey) !== undefined);
+    const hasSubmittedAwsCredentialMaterial =
+      hasSubmittedAwsKeyMaterial ||
+      (payload.type === "dynamodb" &&
+        trimOptionalSecretValue(payload.awsSessionToken) !== undefined);
+    const useAwsProfile = hasAwsProfile && !hasSubmittedAwsCredentialMaterial;
+    const hasExistingAwsKeyPair =
+      trimOptionalSecretValue(
+        resolvedStoredSecrets.awsAccessKeyId ?? existing?.awsAccessKeyId,
+      ) !== undefined &&
+      trimOptionalSecretValue(
+        resolvedStoredSecrets.awsSecretAccessKey ??
+          existing?.awsSecretAccessKey,
+      ) !== undefined;
+    const hasChangedAwsProfile =
+      (payload.awsProfile?.trim() ?? "") !==
+      (existing?.awsProfile?.trim() ?? "");
+    const effectiveAwsProfile =
+      useAwsProfile &&
+      (payload.clearAwsCredentials === true ||
+        !hasExistingAwsKeyPair ||
+        hasChangedAwsProfile);
+    const existingRedisUri =
+      existing?.type === "redis"
+        ? getExistingRedisUri(existing, resolvedStoredSecrets)
+        : undefined;
+    const resolvedConnectionUri =
+      payload.type === "mongodb" && payload.mongoConnectionMode === "uri"
+        ? restoreMongoUriCredentials(
+            submittedConnectionUri,
+            getMongoFormUri(
+              existing ?? {},
+              existing
+                ? getExistingMongoUri(existing, resolvedStoredSecrets)
+                : undefined,
+            ),
+            payload.keepMongoUriCredentials === true,
+          )
+        : payload.type === "redis"
+          ? restoreCredentialBearingUri(
+              submittedConnectionUri,
+              existingRedisUri,
+              payload.keepConnectionUriCredentials ??
+                (Boolean(submittedConnectionUri) &&
+                  sanitizeCredentialBearingUri(submittedConnectionUri) ===
+                    sanitizeCredentialBearingUri(existingRedisUri)),
+            )
+          : restoreSubmittedUriValue(
+              submittedConnectionUri,
+              resolvedStoredSecrets.connectionUri,
+              existing?.connectionUri,
+            );
+    const existingElasticEndpoint =
+      existing?.type === "elasticsearch"
+        ? getExistingElasticEndpoint(existing, resolvedStoredSecrets)
+        : undefined;
+    const resolvedEndpoint =
+      payload.type === "elasticsearch"
+        ? restoreCredentialBearingUri(
+            submittedEndpoint,
+            existingElasticEndpoint,
+            payload.keepConnectionUriCredentials ??
+              (Boolean(submittedEndpoint) &&
+                sanitizeCredentialBearingUri(submittedEndpoint) ===
+                  sanitizeCredentialBearingUri(existingElasticEndpoint)),
+          )
+        : restoreSubmittedUriValue(
+            submittedEndpoint,
+            resolvedStoredSecrets.endpoint,
+            existing?.endpoint,
+          );
+    return normalizeMongoConnectionConfig({
       ...rest,
       tls,
       useSecretStorage,
-      connectionUri: restoreSubmittedUriValue(
-        submittedConnectionUri,
-        resolvedStoredSecrets.connectionUri,
-        existing?.connectionUri,
-      ),
+      connectionUri: resolvedConnectionUri,
+      ...(payload.type === "mongodb" && payload.mongoConnectionMode === "uri"
+        ? {
+            mongoUriHasCredentials:
+              extractCredentialBearingUriSecret(resolvedConnectionUri) !==
+              undefined,
+          }
+        : {}),
       uri: restoreSubmittedUriValue(
         submittedUri,
         resolvedStoredSecrets.uri,
         existing?.uri,
       ),
-      endpoint: restoreSubmittedUriValue(
-        submittedEndpoint,
-        resolvedStoredSecrets.endpoint,
-        existing?.endpoint,
-      ),
+      endpoint: resolvedEndpoint,
       awsEndpoint: restoreSubmittedUriValue(
         submittedAwsEndpoint,
         resolvedStoredSecrets.awsEndpoint,
@@ -408,24 +613,34 @@ export class ConnectionFormPanel {
       password,
       apiKey:
         trimOptionalSecretValue(payload.apiKey) ??
-        (!prefersElasticsearchBasicAuth
+        (!payload.clearApiKey && !prefersElasticsearchBasicAuth
           ? resolvedStoredSecrets.apiKey
           : undefined) ??
-        existing?.apiKey,
-      awsAccessKeyId:
-        trimOptionalSecretValue(payload.awsAccessKeyId) ??
-        resolvedStoredSecrets.awsAccessKeyId ??
-        existing?.awsAccessKeyId,
-      awsSecretAccessKey:
-        trimOptionalSecretValue(payload.awsSecretAccessKey) ??
-        resolvedStoredSecrets.awsSecretAccessKey ??
-        existing?.awsSecretAccessKey,
-      awsSessionToken:
-        trimOptionalSecretValue(payload.awsSessionToken) ??
-        resolvedStoredSecrets.awsSessionToken ??
-        existing?.awsSessionToken,
+        (!payload.clearApiKey && !prefersElasticsearchBasicAuth
+          ? existing?.apiKey
+          : undefined),
+      awsAccessKeyId: effectiveAwsProfile
+        ? undefined
+        : (trimOptionalSecretValue(payload.awsAccessKeyId) ??
+          (!payload.clearAwsCredentials && !hasSubmittedAwsKeyMaterial
+            ? (resolvedStoredSecrets.awsAccessKeyId ?? existing?.awsAccessKeyId)
+            : undefined)),
+      awsSecretAccessKey: effectiveAwsProfile
+        ? undefined
+        : (trimOptionalSecretValue(payload.awsSecretAccessKey) ??
+          (!payload.clearAwsCredentials && !hasSubmittedAwsKeyMaterial
+            ? (resolvedStoredSecrets.awsSecretAccessKey ??
+              existing?.awsSecretAccessKey)
+            : undefined)),
+      awsSessionToken: effectiveAwsProfile
+        ? undefined
+        : (trimOptionalSecretValue(payload.awsSessionToken) ??
+          (!payload.clearAwsCredentials && !hasSubmittedAwsKeyMaterial
+            ? (resolvedStoredSecrets.awsSessionToken ??
+              existing?.awsSessionToken)
+            : undefined)),
       ssh,
-    };
+    });
   }
 
   private async handleMessage(msg: unknown): Promise<void> {
@@ -472,8 +687,17 @@ export class ConnectionFormPanel {
         }
 
         const inlinePassword = trimOptionalSecretValue(raw.password);
+        const usesSeparatePassword = !(
+          (raw.type === "redis" && trimOptionalUriValue(raw.connectionUri)) ||
+          (raw.type === "mongodb" &&
+            (raw.mongoConnectionMode === "uri" ||
+              raw.mongoAuthMethod === "none"))
+        );
         const requiresStoredPasswordRecovery =
-          !raw.useSecretStorage && payload.hasStoredSecret === true;
+          usesSeparatePassword &&
+          !raw.useSecretStorage &&
+          payload.hasStoredSecret === true &&
+          payload.clearPassword !== true;
         if (
           requiresStoredPasswordRecovery &&
           inlinePassword === undefined &&
@@ -514,8 +738,35 @@ export class ConnectionFormPanel {
               return;
             }
           }
+          const hasSubmittedAwsKeyMaterial =
+            raw.type === "dynamodb" &&
+            (trimOptionalSecretValue(payload.awsAccessKeyId) !== undefined ||
+              trimOptionalSecretValue(payload.awsSecretAccessKey) !==
+                undefined);
+          const clearStoredSecrets: ConnectionSecretClearOptions = {
+            password:
+              payload.clearPassword === true ||
+              (raw.type === "redis" &&
+                trimOptionalUriValue(payload.connectionUri) !== undefined),
+            apiKey: payload.clearApiKey === true,
+            credentialBearingUris:
+              (payload.type === "redis" || payload.type === "elasticsearch") &&
+              payload.keepConnectionUriCredentials === false,
+            awsCredentials:
+              payload.clearAwsCredentials === true ||
+              (raw.type === "dynamodb" &&
+                (hasSubmittedAwsKeyMaterial ||
+                  (Boolean(raw.awsProfile?.trim()) &&
+                    !(
+                      trimOptionalSecretValue(raw.awsAccessKeyId) &&
+                      trimOptionalSecretValue(raw.awsSecretAccessKey)
+                    )))),
+          };
           const saved =
-            (await this.connectionManager.saveConnection(raw)) ?? raw;
+            (await this.connectionManager.saveConnection(
+              raw,
+              clearStoredSecrets,
+            )) ?? raw;
           this.resolveFn?.(sanitizeConnectionConfigForResponse(saved));
         } catch (err: unknown) {
           const error = normalizeUnknownError(err);
