@@ -150,6 +150,14 @@ const TIMESTAMP_LITERAL_RE = /^Timestamp\((\d+),\s*(\d+)\)$/i;
 const MONGODB_READ_ONLY_QUERY_REASON =
   "[RapiDB] Read-only MongoDB connections allow only find, findOne, countDocuments, getCollectionNames, and aggregate queries without $out or $merge (read-only cursor modifiers only).";
 const MONGODB_QUERY_HARD_CAP = QUERY_LIMIT_POLICY.hardCap;
+const MONGODB_MUTATION_ARGUMENT_COUNTS = new Map([
+  ["insertOne", 1],
+  ["insertMany", 1],
+  ["updateOne", 2],
+  ["updateMany", 2],
+  ["deleteOne", 1],
+  ["deleteMany", 1],
+]);
 const MONGOSH_VM_TIMEOUT_MS = 5000;
 const MONGODB_UNSUPPORTED_METADATA =
   createNoSqlUnsupportedMetadataHandlers("MongoDB");
@@ -422,6 +430,31 @@ function reviveMongoshInteger(
     : Long.fromString(integer.toString());
 }
 
+function reviveMongoshDate(args: unknown[]): Date {
+  if (
+    args.length > 7 ||
+    args.some(
+      (value) =>
+        !(
+          args.length === 1 &&
+          (typeof value === "string" || value instanceof Date)
+        ) && !(typeof value === "number" && Number.isSafeInteger(value)),
+    )
+  ) {
+    throw new Error(
+      "Date requires no arguments, one date string or Date, or one to seven safe integer arguments.",
+    );
+  }
+  // Preserve every constructor component. Passing just the year as the first
+  // argument instead silently turns a calendar date into milliseconds in 1970.
+  const date = Reflect.construct(Date, args) as Date;
+  if (!Number.isFinite(date.getTime())) {
+    // BSON serializes an Invalid Date as epoch zero rather than rejecting it.
+    throw new Error("Date requires a valid date within the supported range.");
+  }
+  return date;
+}
+
 function reviveMongoshValue(value: unknown): unknown {
   if (value === null || typeof value !== "object") return value;
   const record = value as { kind: string; value?: unknown; args?: unknown[] };
@@ -442,9 +475,7 @@ function reviveMongoshValue(value: unknown): unknown {
     const args = (record.args ?? []).map(reviveMongoshValue);
     switch (record.value) {
       case "Date":
-        return args.length === 0
-          ? new Date()
-          : new Date(args[0] as string | number);
+        return reviveMongoshDate(args);
       case "RegExp":
         return new RegExp(
           String(args[0]),
@@ -1874,6 +1905,15 @@ export class MongoDBDriver implements IDBDriver {
     // mutation can turn a malformed query into a collection-wide write. Check
     // every mutation before submitting even the first statement in the script.
     for (const { op, args, chainOps } of operations) {
+      const argumentCount = MONGODB_MUTATION_ARGUMENT_COUNTS.get(op);
+      if (argumentCount !== undefined && args.length > argumentCount) {
+        // These helpers do not forward mongosh options to the SDK. Ignoring
+        // collation can broaden a delete under a collection's default collation;
+        // ignoring upsert/ordered also changes the requested write semantics.
+        throw new Error(
+          `[RapiDB] MongoDB ${op} options are not supported by this helper. Use db.runCommand with explicit command options instead. No operations were submitted.`,
+        );
+      }
       if (
         chainOps.length > 0 &&
         !["find", "findOne", "aggregate"].includes(op)

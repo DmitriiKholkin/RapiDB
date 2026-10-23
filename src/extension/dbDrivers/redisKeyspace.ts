@@ -7,7 +7,9 @@ export function redisKeyspacePattern(table: string): string {
   if (table === REDIS_UNPREFIXED_KEYS_TABLE) return "*";
   if (table === REDIS_EMPTY_PREFIX_TABLE) return ":*";
   if (table === "default:") return "default:*";
-  return `${table}:*`;
+  // Explorer groups come from literal key prefixes, not user-supplied globs.
+  // Unescaped metacharacters can include another prefix or hide this one.
+  return `${table.replace(/[\\*?[\]]/g, "\\$&")}:*`;
 }
 
 export function isRedisUnprefixedKeysTable(table: string): boolean {
@@ -19,7 +21,7 @@ export function redisKeyspaceDisplayName(table: string): string {
   if (table === REDIS_UNPREFIXED_KEYS_TABLE) return "Unprefixed keys";
   if (table === REDIS_EMPTY_PREFIX_TABLE) return ":*";
   if (table === "default:") return "default:*";
-  return `${table}:*`;
+  return redisKeyspacePattern(table);
 }
 
 export function redisKeyspaceFileName(table: string): string {

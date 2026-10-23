@@ -177,6 +177,37 @@ describe("RedisDriver — query()", () => {
       /unterminated quoted argument/i,
     );
   });
+
+  it.each([
+    String.raw`DEL "key\uD800"`,
+    String.raw`DEL "key\uDC00"`,
+    `DEL "key${String.fromCharCode(0xd800)}"`,
+    `DEL key${String.fromCharCode(0xdc00)}`,
+  ])("rejects keys that UTF-8 would silently replace: %s", async (query) => {
+    const { driver, sendCommand } = createDriver();
+    await expect(driver.query(query)).rejects.toThrow(/Unicode|UTF-8/);
+    expect(sendCommand).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    String.raw`SET target "value\uZZZZ"`,
+    String.raw`SET target "value\uD800"`,
+  ])("validates all commands before sending the first mutation: %s", async (tail) => {
+    const { driver, sendCommand } = createDriver();
+    await expect(driver.query(`DEL target; ${tail}`)).rejects.toThrow(
+      /Unicode|UTF-8/,
+    );
+    expect(sendCommand).not.toHaveBeenCalled();
+  });
+
+  it("preserves valid surrogate pairs and literal replacement-character keys", async () => {
+    const { driver, sendCommand } = createDriver();
+    await driver.query(String.raw`DEL "key\uD83D\uDE00" "key�"`);
+    expect(sendCommand).toHaveBeenCalledExactlyOnceWith(
+      ["DEL", "key😀", "key�"],
+      queryReplyOptions,
+    );
+  });
 });
 
 describe("RedisDriver — disconnect()", () => {

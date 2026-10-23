@@ -65,6 +65,8 @@ Saved connections can be grouped into folders, and each connection expands into 
 
 Redis keys are grouped by the prefix before `:`. **All keys** and **Unprefixed keys** are separate views; prefixed groups are shown as patterns such as `default:*` and `users:*`. Edits and deletes still address the exact stored key.
 
+Prefix groups are literal: `*`, `?`, `[`, `]`, and `\` inside a stored prefix are escaped in the Redis scan pattern, so selecting one group cannot include a different prefix through wildcard expansion.
+
 Redis table reads and exports deduplicate `SCAN` replies and use exact-key tie-breaks when Unicode keys have equal locale collation. A repeated cursor or more than 5,000 scan requests fails explicitly rather than presenting an incomplete result. Cancellation stops waiting and prevents further reads; commands already sent may still complete. Exports are not transactional snapshots of a concurrently changing keyspace.
 
 <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-5.png" alt="Database Explorer tree" width="250" />
@@ -121,7 +123,13 @@ MongoDB `NumberDecimal(...)` requires exactly one string argument, such as `Numb
 
 MongoDB `BinData(subtype, base64)` requires an integer subtype from 0 to 255 and a canonical base64 string (including padding when needed). Invalid literals are rejected before any operation in the script is sent, rather than silently decoding to different bytes.
 
+MongoDB `Date` / `ISODate` literals reject invalid dates before any operation in the script is sent. They accept no arguments (current time), one date string or Date value, or one to seven safe integer arguments. Calendar-component arguments follow JavaScript's local-time `Date` constructor; use an ISO string with an explicit time zone for an unambiguous instant. Arguments are never silently discarded, and invalid dates cannot become Unix epoch during BSON serialization.
+
 MongoDB updates and deletes require an explicit document filter; use `{}` explicitly to target all documents. Cursor modifiers on non-cursor operations, such as `deleteMany({}).limit(1)`, are rejected rather than silently ignored. Explicit database/collection names must be non-empty strings. BSON `Timestamp(t, i)` and `Timestamp({t, i})` components must be unsigned 32-bit integers, without coercion or rounding (`Timestamp(t)` defaults the increment to zero). Invalid filters, namespaces, modifiers, and timestamps are rejected before any operation in the script is sent.
+
+MongoDB `insertOne`, `insertMany`, `updateOne`, `updateMany`, `deleteOne`, and `deleteMany` helpers do not support an additional options argument. Such calls are rejected before any operation in the script is sent: options such as `collation`, `upsert`, or `ordered` must never be silently ignored. Use `db.runCommand(...)` with explicit native command options when needed.
+
+Redis query scripts are fully tokenized before the first command is sent. Invalid Unicode escapes and unpaired UTF-16 surrogates are rejected rather than addressing a replacement-character key or partially executing a script with a later parsing error. This validation does not make Redis scripts transactional; server-side errors can still follow successful commands.
 
 Table exports keep a stable column schema across chunks. CSV uses the declared columns (including empty cells for missing values); a later unexpected column fails the export rather than silently dropping data. JSON applies the same unexpected-column check. Failed exports leave an existing destination file intact.
 

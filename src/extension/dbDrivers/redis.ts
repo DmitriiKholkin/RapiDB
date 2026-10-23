@@ -487,6 +487,14 @@ function tokenizeRedisCommand(input: string): string[] {
 
   const pushCurrent = () => {
     if (tokenStarted) {
+      // node-redis encodes string arguments as UTF-8, replacing lone UTF-16
+      // surrogates with U+FFFD. A malformed key must never address a different
+      // stored key (and values must not be silently corrupted either).
+      if (Buffer.from(current, "utf8").toString("utf8") !== current) {
+        throw new Error(
+          "Redis query has invalid Unicode that cannot be encoded as UTF-8 without data loss.",
+        );
+      }
       tokens.push(current);
     }
     current = "";
@@ -1057,6 +1065,9 @@ export class RedisDriver implements IDBDriver {
 
     const startedAt = Date.now();
     const statements = splitRedisStatements(trimmed);
+    // Finish syntax/encoding validation before a preceding DEL or other write
+    // can run. Parsing a later SET only after DEL succeeds can destroy data.
+    const commands = statements.map(tokenizeRedisCommand);
     const results: unknown[] = [];
     const abort = new AbortController();
     const externalSignal = signal ?? options?.signal;
@@ -1090,11 +1101,10 @@ export class RedisDriver implements IDBDriver {
         options?.requestToken !== undefined || externalSignal
           ? baseClient.withAbortSignal(querySignal)
           : baseClient;
-      for (const statement of statements) {
+      for (const parts of commands) {
         querySignal.throwIfAborted();
         if (epoch !== this.epoch)
           throw new Error("Redis query was cancelled by disconnect.");
-        const parts = tokenizeRedisCommand(statement);
         const [command, ...args] = parts;
         const result = await this.waitForResult(
           client.sendCommand([command.toUpperCase(), ...args], {

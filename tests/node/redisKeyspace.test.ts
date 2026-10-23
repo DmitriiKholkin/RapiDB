@@ -31,4 +31,16 @@ describe("Redis keyspace identities", () => {
     expect(redisKeyspacePattern(REDIS_EMPTY_PREFIX_TABLE)).toBe(":*");
     expect(redisKeyspaceDisplayName(REDIS_EMPTY_PREFIX_TABLE)).toBe(":*");
   });
+
+  it.each([
+    ["tenant*", "tenant\\*:*"],
+    ["tenant?", "tenant\\?:*"],
+    ["tenant[ab]", "tenant\\[ab\\]:*"],
+    ["tenant[^a]", "tenant\\[^a\\]:*"],
+    ["tenant\\x", "tenant\\\\x:*"],
+    ["tenant\\*?[]", "tenant\\\\\\*\\?\\[\\]:*"],
+  ])("treats the stored prefix %s literally, not as a Redis glob", (prefix, pattern) => {
+    expect(redisKeyspacePattern(prefix)).toBe(pattern);
+    expect(redisKeyspaceDisplayName(prefix)).toBe(pattern);
+  });
 });
