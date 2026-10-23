@@ -1381,7 +1381,7 @@ export class OracleDriver extends BaseDBDriver {
            AND cons.table_name = :2
            AND cons.constraint_type = 'C'
            AND cons.search_condition_vc IS NOT NULL`,
-        [schema.toUpperCase(), table.toUpperCase()],
+        [schema, table],
         { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
 
@@ -1475,7 +1475,7 @@ export class OracleDriver extends BaseDBDriver {
            AND object_type IN ('TABLE','VIEW','MATERIALIZED VIEW','FUNCTION','PROCEDURE','PACKAGE','SEQUENCE','TYPE')
            AND status = 'VALID'
          ORDER BY object_type, object_name`,
-        [schema.toUpperCase()],
+        [schema],
         { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
       for (const r of tableRes.rows ?? []) {
@@ -1554,7 +1554,7 @@ export class OracleDriver extends BaseDBDriver {
              ON coll.owner = tab.data_type_owner
             AND coll.type_name = tab.data_type
            WHERE tab.owner = :1 AND tab.table_name = :2`,
-          [schema.toUpperCase(), table.toUpperCase()],
+          [schema, table],
           { outFormat: oracledb.OUT_FORMAT_OBJECT },
         );
         for (const row of collectionRes.rows ?? []) {
@@ -1597,7 +1597,7 @@ export class OracleDriver extends BaseDBDriver {
             AND attr.type_name = tab.data_type
            WHERE tab.owner = :1 AND tab.table_name = :2
            ORDER BY tab.column_id, attr.attr_no`,
-          [schema.toUpperCase(), table.toUpperCase()],
+          [schema, table],
           { outFormat: oracledb.OUT_FORMAT_OBJECT },
         );
         for (const row of objectRes.rows ?? []) {
@@ -1629,7 +1629,7 @@ export class OracleDriver extends BaseDBDriver {
            AND cons.owner = :1
            AND cons.table_name = :2
          ORDER BY cols.position`,
-        [schema.toUpperCase(), table.toUpperCase()],
+        [schema, table],
         { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
       const pkOrdinalByColumn = new Map(
@@ -1646,7 +1646,7 @@ export class OracleDriver extends BaseDBDriver {
          WHERE cons.constraint_type = 'R'
            AND cons.owner = :1
            AND cons.table_name = :2`,
-        [schema.toUpperCase(), table.toUpperCase()],
+        [schema, table],
         { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
       const fkCols = new Set((fkRes.rows ?? []).map((r) => r.COLUMN_NAME));
@@ -1664,7 +1664,7 @@ export class OracleDriver extends BaseDBDriver {
           `SELECT column_name, generation_type
            FROM all_tab_identity_cols
            WHERE owner = :1 AND table_name = :2`,
-          [schema.toUpperCase(), table.toUpperCase()],
+          [schema, table],
           { outFormat: oracledb.OUT_FORMAT_OBJECT },
         );
         for (const r of idRes.rows ?? []) {
@@ -1765,7 +1765,7 @@ export class OracleDriver extends BaseDBDriver {
            ON c.index_name = i.index_name AND c.index_owner = i.owner
          WHERE i.owner = :1 AND i.table_name = :2
          ORDER BY i.index_name, c.column_position`,
-        [schema.toUpperCase(), table.toUpperCase()],
+        [schema, table],
         { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
       const map = new Map<string, IndexMeta>();
@@ -1818,7 +1818,7 @@ export class OracleDriver extends BaseDBDriver {
          WHERE fk.constraint_type = 'R'
            AND fk.owner = :1 AND fk.table_name = :2
          ORDER BY fk.constraint_name, fkcol.position`,
-        [schema.toUpperCase(), table.toUpperCase()],
+        [schema, table],
         { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
       return (res.rows ?? []).map((r) => ({
@@ -1853,7 +1853,7 @@ export class OracleDriver extends BaseDBDriver {
            AND cons.table_name = :2
            AND cons.constraint_type IN ('P', 'U')
          ORDER BY cons.constraint_name, cols.position`,
-        [schema.toUpperCase(), table.toUpperCase()],
+        [schema, table],
         { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
       const constraints = new Map<
@@ -1908,7 +1908,7 @@ export class OracleDriver extends BaseDBDriver {
            AND table_name = :2
            AND constraint_type = 'C'
          ORDER BY constraint_name`,
-        [schema.toUpperCase(), table.toUpperCase()],
+        [schema, table],
         { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
       const checkConstraints = (res.rows ?? []).map((row) => ({
@@ -1942,7 +1942,7 @@ export class OracleDriver extends BaseDBDriver {
          WHERE table_owner = :1
            AND table_name = :2
          ORDER BY trigger_name`,
-        [schema.toUpperCase(), table.toUpperCase()],
+        [schema, table],
         { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
       return (res.rows ?? []).map((row) => {
@@ -1999,7 +1999,7 @@ export class OracleDriver extends BaseDBDriver {
          WHERE table_owner = :1
            AND table_name = :2
            AND trigger_name = :3`,
-        [schema.toUpperCase(), table.toUpperCase(), triggerName.toUpperCase()],
+        [schema, table, triggerName],
         { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
       const row = res.rows?.[0];
@@ -2014,9 +2014,9 @@ export class OracleDriver extends BaseDBDriver {
         : "";
       const body = row.TRIGGER_BODY?.trim() || "BEGIN\n  NULL;\nEND;";
       return [
-        `CREATE OR REPLACE TRIGGER ${this.quoteIdentifier(schema.toUpperCase())}.${this.quoteIdentifier(triggerName.toUpperCase())}`,
+        `CREATE OR REPLACE TRIGGER ${this.quoteIdentifier(schema)}.${this.quoteIdentifier(triggerName)}`,
         `${timingClause} ${row.TRIGGERING_EVENT.toUpperCase()}`,
-        `ON ${this.qualifiedTableName("", schema.toUpperCase(), table.toUpperCase())}${forEachRowClause}`,
+        `ON ${this.qualifiedTableName("", schema, table)}${forEachRowClause}`,
         body,
       ].join("\n");
     } finally {
@@ -2101,8 +2101,8 @@ export class OracleDriver extends BaseDBDriver {
     schema: string,
     objectName: string,
   ): Promise<"TABLE" | "VIEW" | "MATERIALIZED VIEW" | null> {
-    const owner = schema.toUpperCase();
-    const name = objectName.toUpperCase();
+    const owner = schema;
+    const name = objectName;
     const obj = oracledb.OUT_FORMAT_OBJECT;
     try {
       const objRes = await conn.execute<{
@@ -2160,7 +2160,7 @@ export class OracleDriver extends BaseDBDriver {
       TEXT: unknown;
     }>(
       `SELECT text FROM all_views WHERE owner = :1 AND view_name = :2`,
-      [schema.toUpperCase(), view.toUpperCase()],
+      [schema, view],
       { outFormat: oracledb.OUT_FORMAT_OBJECT },
     );
     const row = res.rows?.[0];
@@ -2170,7 +2170,7 @@ export class OracleDriver extends BaseDBDriver {
     const text = await this._consumeLob(row.TEXT);
     const cleanText = toOracleDdlText(text);
     return cleanText
-      ? `CREATE OR REPLACE VIEW "${schema}"."${view}" AS\n${cleanText}`
+      ? `CREATE OR REPLACE VIEW ${this.qualifiedTableName("", schema, view)} AS\n${cleanText}`
       : `-- View source not available for "${schema}"."${view}"`;
   }
   private async _getMetadataDDL(
@@ -2193,7 +2193,7 @@ export class OracleDriver extends BaseDBDriver {
         DDL: unknown;
       }>(
         `SELECT DBMS_METADATA.GET_DDL('${objectType}', :2, :1) AS ddl FROM dual`,
-        [schema.toUpperCase(), objectName.toUpperCase()],
+        [schema, objectName],
         { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
       const ddl = await this._consumeLob(res.rows?.[0]?.DDL);
@@ -2227,7 +2227,7 @@ export class OracleDriver extends BaseDBDriver {
          FROM all_sequences
          WHERE sequence_owner = :1
            AND sequence_name = :2`,
-        [schema.toUpperCase(), sequenceName.toUpperCase()],
+        [schema, sequenceName],
         { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
 
@@ -2256,7 +2256,7 @@ export class OracleDriver extends BaseDBDriver {
           : undefined;
 
       const parts = [
-        `CREATE SEQUENCE ${this.quoteIdentifier(schema.toUpperCase())}.${this.quoteIdentifier(sequenceName.toUpperCase())}`,
+        `CREATE SEQUENCE ${this.quoteIdentifier(schema)}.${this.quoteIdentifier(sequenceName)}`,
         `INCREMENT BY ${String(row.INCREMENT_BY)}`,
         minValue,
         maxValue,
@@ -2313,7 +2313,7 @@ export class OracleDriver extends BaseDBDriver {
         `SELECT column_name, generation_type
          FROM all_tab_identity_cols
          WHERE owner = :1 AND table_name = :2`,
-        [schema.toUpperCase(), table.toUpperCase()],
+        [schema, table],
         { outFormat: OBJ },
       );
       for (const r of idRes.rows ?? []) {
@@ -2341,7 +2341,7 @@ export class OracleDriver extends BaseDBDriver {
          WHERE cons.constraint_type = 'P'
            AND cons.owner = :1 AND cons.table_name = :2
          ORDER BY cols.position`,
-        [schema.toUpperCase(), table.toUpperCase()],
+        [schema, table],
         { outFormat: OBJ },
       );
       for (const r of pkRes.rows ?? []) {
@@ -2361,7 +2361,7 @@ export class OracleDriver extends BaseDBDriver {
       const nullable = r.NULLABLE === "Y" ? "" : " NOT NULL";
       if (r.VIRTUAL_COLUMN === "YES") {
         const expression = r.DATA_DEFAULT?.trim() ?? "";
-        return `  "${r.COLUMN_NAME}" ${typ} GENERATED ALWAYS AS (${expression}) VIRTUAL${nullable}`;
+        return `  ${this.quoteIdentifier(r.COLUMN_NAME)} ${typ} GENERATED ALWAYS AS (${expression}) VIRTUAL${nullable}`;
       }
       const genType = identityMap.get(r.COLUMN_NAME);
       if (genType !== undefined) {
@@ -2371,7 +2371,7 @@ export class OracleDriver extends BaseDBDriver {
             : genType === "BY DEFAULT ON NULL"
               ? "GENERATED BY DEFAULT ON NULL AS IDENTITY"
               : "GENERATED BY DEFAULT AS IDENTITY";
-        return `  "${r.COLUMN_NAME}" ${typ} ${genClause}${nullable}`;
+        return `  ${this.quoteIdentifier(r.COLUMN_NAME)} ${typ} ${genClause}${nullable}`;
       }
       let defClause = "";
       if (r.DATA_DEFAULT) {
@@ -2380,16 +2380,16 @@ export class OracleDriver extends BaseDBDriver {
           defClause = ` DEFAULT ${raw}`;
         }
       }
-      return `  "${r.COLUMN_NAME}" ${typ}${nullable}${defClause}`;
+      return `  ${this.quoteIdentifier(r.COLUMN_NAME)} ${typ}${nullable}${defClause}`;
     });
     if (pkCols.length > 0) {
-      const pkColList = pkCols.map((c) => `"${c}"`).join(", ");
+      const pkColList = pkCols.map((c) => this.quoteIdentifier(c)).join(", ");
       const constraintClause = pkConstraintName
-        ? `CONSTRAINT "${pkConstraintName}" PRIMARY KEY (${pkColList})`
+        ? `CONSTRAINT ${this.quoteIdentifier(pkConstraintName)} PRIMARY KEY (${pkColList})`
         : `PRIMARY KEY (${pkColList})`;
       colLines.push(`  ${constraintClause}`);
     }
-    return `CREATE TABLE "${schema}"."${table}" (\n${colLines.join(",\n")}\n);`;
+    return `CREATE TABLE ${this.qualifiedTableName("", schema, table)} (\n${colLines.join(",\n")}\n);`;
   }
   private async _readTableColumnsWithVirtualFallback(
     conn: oracledb.Connection,
@@ -2410,8 +2410,10 @@ export class OracleDriver extends BaseDBDriver {
       COLUMN_ID: number;
     }>
   > {
-    const owner = schema.toUpperCase();
-    const tableName = table.toUpperCase();
+    // Explorer names are already catalog identifiers, not unquoted SQL text.
+    // Folding them can select a different object's types and primary key.
+    const owner = schema;
+    const tableName = table;
     try {
       const res = await conn.execute<{
         COLUMN_NAME: string;
@@ -2500,7 +2502,7 @@ export class OracleDriver extends BaseDBDriver {
            WHERE owner = :1 AND name = :2
              AND type = 'PACKAGE'
            ORDER BY line`,
-          [schema.toUpperCase(), name.toUpperCase()],
+          [schema, name],
           { outFormat: oracledb.OUT_FORMAT_OBJECT },
         );
         const packageLines = (packageSource.rows ?? []).map((r) => r.TEXT);
@@ -2524,7 +2526,7 @@ export class OracleDriver extends BaseDBDriver {
          WHERE owner = :1 AND name = :2
            AND type = :3
          ORDER BY line`,
-        [schema.toUpperCase(), name.toUpperCase(), sourceType],
+        [schema, name, sourceType],
         { outFormat: oracledb.OUT_FORMAT_OBJECT },
       );
       const lines = (res.rows ?? []).map((r) => r.TEXT);
