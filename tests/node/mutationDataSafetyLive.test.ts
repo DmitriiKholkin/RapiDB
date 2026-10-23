@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { Int32, Long, MongoClient } from "mongodb";
+import { Int32, Long, MongoClient, Timestamp } from "mongodb";
 import { createClient } from "redis";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
@@ -226,6 +226,7 @@ describe.runIf(live)("MongoDB integer mutation data safety (live BSON)", () => {
       name: "Mongo safety",
       type: "mongodb",
       connectionUri: mongoUri,
+      database,
     });
     await driver.connect();
   });
@@ -234,6 +235,73 @@ describe.runIf(live)("MongoDB integer mutation data safety (live BSON)", () => {
     if (admin) {
       await admin.db(database).collection(table).drop();
       await admin.close();
+    }
+  });
+  it("rejects malformed mutation filters and ignored limits without changing the collection", async () => {
+    const collection = admin.db(database).collection(table);
+    await collection.insertMany([
+      { _id: "one", active: true },
+      { _id: "two", active: true },
+    ] as never);
+    const target = `db.getSiblingDB("${database}").getCollection("${table}")`;
+    for (const mutation of [
+      "deleteMany()",
+      "deleteMany(null)",
+      "deleteMany(42)",
+      "deleteMany([])",
+      "deleteMany({}).limit(1)",
+      "updateMany(null, {$set: {active: false}})",
+      "updateMany({}, {$set: {active: false}}).limit(1)",
+    ]) {
+      await expect(
+        driver.query(
+          `${target}.insertOne({_id: "unexpected"}); ${target}.${mutation}`,
+        ),
+      ).rejects.toThrow(/filter|cursor modifier/i);
+      expect(
+        await collection
+          .find({}, { promoteValues: true })
+          .sort({ _id: 1 })
+          .toArray(),
+      ).toEqual([
+        { _id: "one", active: true },
+        { _id: "two", active: true },
+      ]);
+    }
+    await driver.query(`${target}.deleteMany({_id: "one"})`);
+    expect(Number(await collection.countDocuments())).toBe(1);
+    await driver.query(`${target}.deleteMany({})`);
+    expect(Number(await collection.countDocuments())).toBe(0);
+  });
+  it("does not round a BSON Timestamp filter into another document's identity", async () => {
+    const collection = admin.db(database).collection(table);
+    await collection.insertOne({ _id: new Timestamp({ t: 1, i: 0 }) } as never);
+    const target = `db.getSiblingDB("${database}").getCollection("${table}")`;
+    for (const literal of [
+      "Timestamp(1.5, 0)",
+      "Timestamp(1, 0.5)",
+      "Timestamp({t: 1.5, i: 0})",
+    ]) {
+      await expect(
+        driver.query(
+          `${target}.insertOne({_id: "unexpected"}); ${target}.deleteOne({_id: ${literal}})`,
+        ),
+      ).rejects.toThrow(/Timestamp.*integer/i);
+      expect(Number(await collection.countDocuments())).toBe(1);
+    }
+    await driver.query(`${target}.deleteOne({_id: Timestamp(1, 0)})`);
+    expect(Number(await collection.countDocuments())).toBe(0);
+  });
+  it("does not redirect an invalid explicit database name to the default database", async () => {
+    const collection = admin.db(database).collection(table);
+    await collection.insertOne({ _id: "keep" } as never);
+    for (const name of ['""', "null", "undefined", "0"]) {
+      await expect(
+        driver.query(
+          `db.getCollection("${table}").insertOne({_id: "unexpected"}); db.getSiblingDB(${name}).getCollection("${table}").deleteMany({})`,
+        ),
+      ).rejects.toThrow(/name.*non-empty string/i);
+      expect(Number(await collection.countDocuments())).toBe(1);
     }
   });
   it.each([

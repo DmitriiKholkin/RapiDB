@@ -121,6 +121,8 @@ MongoDB `NumberDecimal(...)` requires exactly one string argument, such as `Numb
 
 MongoDB `BinData(subtype, base64)` requires an integer subtype from 0 to 255 and a canonical base64 string (including padding when needed). Invalid literals are rejected before any operation in the script is sent, rather than silently decoding to different bytes.
 
+MongoDB updates and deletes require an explicit document filter; use `{}` explicitly to target all documents. Cursor modifiers on non-cursor operations, such as `deleteMany({}).limit(1)`, are rejected rather than silently ignored. Explicit database/collection names must be non-empty strings. BSON `Timestamp(t, i)` and `Timestamp({t, i})` components must be unsigned 32-bit integers, without coercion or rounding (`Timestamp(t)` defaults the increment to zero). Invalid filters, namespaces, modifiers, and timestamps are rejected before any operation in the script is sent.
+
 Table exports keep a stable column schema across chunks. CSV uses the declared columns (including empty cells for missing values); a later unexpected column fails the export rather than silently dropping data. JSON applies the same unexpected-column check. Failed exports leave an existing destination file intact.
 
 <br/>

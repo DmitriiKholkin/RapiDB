@@ -323,6 +323,12 @@ const MONGOSH_SANDBOX_SETUP = `
   })();
   const db = (() => {
   const InternalProxy = Proxy;
+  const requireNamespaceName = (name) => {
+    if (typeof name !== 'string' || name.length === 0) {
+      throw new Error('MongoDB database/collection name must be a non-empty string.');
+    }
+    return name;
+  };
   const createChainProxy = (operation) => new InternalProxy({}, {
     get(_target, method) {
       if (typeof method !== 'string') return undefined;
@@ -345,8 +351,8 @@ const MONGOSH_SANDBOX_SETUP = `
   const createDbProxy = (dbName) => new InternalProxy({}, {
     get(_target, prop) {
       if (typeof prop !== 'string') return undefined;
-      if (prop === 'getSiblingDB') return (name) => createDbProxy(name);
-      if (prop === 'getCollection') return (name) => createCollProxy(dbName, String(name));
+      if (prop === 'getSiblingDB') return (name) => createDbProxy(requireNamespaceName(name));
+      if (prop === 'getCollection') return (name) => createCollProxy(dbName, requireNamespaceName(name));
       if (prop === 'runCommand' || prop === 'adminCommand') return (cmd) => {
         const operation = { dbName: prop === 'adminCommand' ? 'admin' : dbName, op: 'runCommand', args: [cmd], chainOps: [] };
         operations.push(operation);
@@ -376,7 +382,7 @@ const MONGOSH_SANDBOX_SETUP = `
   const NumberLong = function mongoNumberLong(...args) { return marker('NumberLong', args); };
   const NumberInt = function mongoNumberInt(...args) { return marker('NumberInt', args); };
   const NumberDecimal = function mongoNumberDecimal(...args) { return marker('NumberDecimal', args); };
-  const Timestamp = function mongoTimestamp(seconds, increment) { return marker('Timestamp', [seconds, increment]); };
+  const Timestamp = function mongoTimestamp(...args) { return marker('Timestamp', args); };
   const Code = function mongoCode(source, scope) { return marker('Code', [source, scope]); };
   const MinKey = function mongoMinKey() { return marker('MinKey', []); };
   const MaxKey = function mongoMaxKey() { return marker('MaxKey', []); };
@@ -493,12 +499,33 @@ function reviveMongoshValue(value: unknown): unknown {
         return Decimal128.fromString(args[0]);
       case "Timestamp": {
         const spec = args[0];
-        return spec && typeof spec === "object"
-          ? new Timestamp({
-              t: Number((spec as { t?: unknown }).t ?? 0),
-              i: Number((spec as { i?: unknown }).i ?? 0),
-            })
-          : new Timestamp({ t: Number(spec), i: Number(args[1] ?? 0) });
+        const objectForm =
+          spec !== null &&
+          typeof spec === "object" &&
+          Object.getPrototypeOf(spec) === Object.prototype;
+        const t = objectForm ? (spec as { t?: unknown }).t : spec;
+        const i = objectForm
+          ? (spec as { i?: unknown }).i
+          : args.length === 1
+            ? 0
+            : args[1];
+        const uint32 = (part: unknown): part is number =>
+          typeof part === "number" &&
+          Number.isInteger(part) &&
+          part >= 0 &&
+          part <= 0xffffffff;
+        if (
+          (objectForm
+            ? args.length !== 1
+            : args.length < 1 || args.length > 2) ||
+          !uint32(t) ||
+          !uint32(i)
+        ) {
+          throw new Error(
+            "Timestamp requires unsigned 32-bit integer arguments: Timestamp(t, i) or Timestamp({t, i}).",
+          );
+        }
+        return new Timestamp({ t, i });
       }
       case "Code":
         return args[1] && typeof args[1] === "object"
@@ -1843,6 +1870,34 @@ export class MongoDBDriver implements IDBDriver {
 
     const startedAt = Date.now();
     const operations = parseMongoshOperations(trimmed);
+    // Read helpers may default an omitted filter to {}, but doing so for a
+    // mutation can turn a malformed query into a collection-wide write. Check
+    // every mutation before submitting even the first statement in the script.
+    for (const { op, args, chainOps } of operations) {
+      if (
+        chainOps.length > 0 &&
+        !["find", "findOne", "aggregate"].includes(op)
+      ) {
+        throw new Error(
+          `[RapiDB] MongoDB ${op} does not support cursor modifiers. No operations were submitted.`,
+        );
+      }
+      if (
+        !["deleteOne", "deleteMany", "updateOne", "updateMany"].includes(op)
+      ) {
+        continue;
+      }
+      const filter = args[0];
+      if (
+        filter === null ||
+        typeof filter !== "object" ||
+        Object.getPrototypeOf(filter) !== Object.prototype
+      ) {
+        throw new Error(
+          `[RapiDB] MongoDB ${op} filter must be an explicit document. Use {} explicitly to target all documents.`,
+        );
+      }
+    }
     if (
       (options?.readOnly === true || this.config.readOnly === true) &&
       !operations.every(isReadOnlyMongoOperation)
