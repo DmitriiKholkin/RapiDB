@@ -793,6 +793,25 @@ export class ElasticsearchDriver implements IDBDriver {
     const queryParams = this.queryParamsToObject(command.queryParams);
     const [firstSegment, secondSegment, thirdSegment] = command.pathSegments;
 
+    if (
+      command.method === "GET" &&
+      command.pathSegments.length === 2 &&
+      (secondSegment === "_mapping" || secondSegment === "_settings")
+    ) {
+      const params = { index: firstSegment, querystring: queryParams };
+      const response =
+        secondSegment === "_mapping"
+          ? await client.indices.getMapping(params, ...transportArgs)
+          : await client.indices.getSettings(params, ...transportArgs);
+      return this.buildRowsQueryResult(
+        Object.entries(response).map(([index, metadata]) => ({
+          index,
+          ...metadata,
+        })),
+        startedAt,
+      );
+    }
+
     if (command.method === "PUT" && command.pathSegments.length === 1) {
       const response = await client.indices.create(
         {

@@ -18,6 +18,7 @@ function state(driver: RedisDriver) {
 }
 
 class RespServer {
+  handshakeError?: { command: string; message: string };
   readonly sockets = new Set<net.Socket>();
   readonly commands: Array<{
     socket: net.Socket;
@@ -40,6 +41,10 @@ class RespServer {
         if (!parsed) break;
         input = input.subarray(parsed.consumed);
         const args = parsed.args;
+        if (args[0] === this.handshakeError?.command) {
+          socket.write(`-${this.handshakeError.message}\r\n`);
+          continue;
+        }
         if (args[0] === "SELECT") database = Number(args[1]);
         this.commands.push({ socket, database, args });
         if (
@@ -137,13 +142,17 @@ let releaseLookups: Array<() => void>;
 let sockets: net.Socket[];
 let drivers: RedisDriver[];
 
-function makeDriver(connectionTimeoutMs = 2000, tlsConnection = false) {
+function makeDriver(
+  connectionTimeoutMs = 2000,
+  tlsConnection = false,
+  database = 0,
+) {
   const driver = new RedisDriver(
     {
       id: "real-redis",
       name: "Real Redis",
       type: "redis",
-      connectionUri: `${tlsConnection ? "rediss" : "redis"}://127.0.0.1:${port}/0`,
+      connectionUri: `${tlsConnection ? "rediss" : "redis"}://127.0.0.1:${port}/${database}`,
       ...(tlsConnection
         ? { tls: { mode: "requireTrustServerCertificate" as const } }
         : {}),
@@ -446,11 +455,26 @@ describe("B02 real node-redis 6 transport lifecycle", () => {
     expect((await driver.query("GET shared")).rows[0]?.__col_0).toBe("db-0");
   });
 
+  it.each([
+    ["HELLO", "WRONGPASS invalid username-password pair"],
+    ["SELECT", "ERR DB index is out of range"],
+  ])("surfaces a handshake %s error without hiding it behind reconnect timeout", async (command, message) => {
+    server.handshakeError = { command, message };
+    // DB 1 makes node-redis send SELECT during its handshake.
+    const driver = makeDriver(2000, false, 1);
+    await expect(bounded(driver.connect())).rejects.toThrow(message);
+    expect(driver.isConnected()).toBe(false);
+    expect(state(driver).clients.size).toBe(0);
+    server.handshakeError = undefined;
+    await driver.connect();
+    expect(driver.isConnected()).toBe(true);
+  });
+
   it("keeps failed initial connection status false and allows a fresh start after recovery", async () => {
     await server.close();
     const driver = makeDriver(150);
     const opening = driver.connect();
-    const rejected = expect(opening).rejects.toThrow("timed out");
+    const rejected = expect(opening).rejects.toThrow("ECONNREFUSED");
     await vi.waitFor(() => expect(logger.error).toHaveBeenCalled());
     expect(driver.isConnected()).toBe(false);
     await bounded(rejected);

@@ -52,6 +52,21 @@ async function fixture() {
 
 describe("Elasticsearch REST request boundaries (real SDK + HTTP)", () => {
   it.each([
+    "_mapping",
+    "_settings",
+  ])("reads index %s using the named REST resource", async (endpoint) => {
+    const f = await fixture();
+    try {
+      await f.driver.connect();
+      await f.driver.query(`GET /records/${endpoint}?index=production`);
+      const request = f.requests.find((entry) => entry.method === "GET");
+      expect(request?.url.pathname).toBe(`/records/${endpoint}`);
+      expect(request?.url.searchParams.get("index")).toBe("production");
+    } finally {
+      await f.close();
+    }
+  });
+  it.each([
     ["DELETE /records?index=production", "/records"],
     [
       "DELETE /records/_doc/selected?index=production&id=other",

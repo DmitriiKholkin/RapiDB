@@ -418,7 +418,7 @@ const drivers: DriverUnderTest[] = [
     cases: [
       ["bool", "boolean"],
       ["boolean", "boolean"],
-      ["tinyint(1)", "boolean"],
+      ["tinyint(1)", "integer"],
       ["tinyint", "integer"],
       ["smallint", "integer"],
       ["mediumint", "integer"],

@@ -2959,6 +2959,55 @@ describe("QueryPanelController", () => {
     }
   });
 
+  it.each([
+    false,
+    true,
+  ])("retires a lost SQLite session without disconnecting a replacement (replaced=%s)", async (replaced) => {
+    let lost = false;
+    const driver = {
+      isConnected: () => !lost,
+      getAutomaticReconnectBlockReason: () =>
+        lost ? "SQLite session was lost" : undefined,
+      query: vi.fn(async () => {
+        lost = true;
+        throw new Error("SQLite execution stopped");
+      }),
+    };
+    const connectionManager = {
+      getConnection: () => ({ id: "sqlite", type: "sqlite", name: "SQLite" }),
+      getDriverCapabilities: () => ({}),
+      isConnected: () => true,
+      getDriver: () => (lost && replaced ? {} : driver),
+      getQueryRowLimit: () => 100,
+      addToHistory: vi.fn(async () => undefined),
+      disconnectFrom: vi.fn(async () => undefined),
+    };
+    const view = {
+      getActiveConnectionId: () => "sqlite",
+      getInitialConnectionId: () => "sqlite",
+      getLastQueryResult: () => null,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+    await controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText: "SELECT 1", connectionId: "sqlite" },
+    });
+    expect(driver.query).toHaveBeenCalledOnce();
+    expect(connectionManager.disconnectFrom).toHaveBeenCalledTimes(
+      replaced ? 0 : 1,
+    );
+  });
+
   it("cancels and invalidates the owned query on connection switch and disposal", async () => {
     let activeConnectionId = "conn-1";
     let resolveQuery: ((value: unknown) => void) | undefined;

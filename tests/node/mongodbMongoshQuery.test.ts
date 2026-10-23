@@ -113,13 +113,16 @@ function createMockDriver() {
     listCollections: mockListCollections,
   };
 
-  (driver as unknown as { client: unknown; connected: boolean }).client = {
+  const mockClient = {
     db: vi.fn().mockReturnValue(mockDb),
   };
+  (driver as unknown as { client: unknown; connected: boolean }).client =
+    mockClient;
   (driver as unknown as { connected: boolean }).connected = true;
 
   return {
     driver,
+    mockClient,
     mockDb,
     mockCollection,
     mockFind,
@@ -141,6 +144,33 @@ function createMockDriver() {
 }
 
 describe("MongoDBDriver — mongosh query()", () => {
+  it("runs adminCommand against admin even after getSiblingDB", async () => {
+    const { driver, mockClient, mockCommand } = createMockDriver();
+    await driver.query('db.getSiblingDB("app").adminCommand({ ping: 1 })');
+    expect(mockClient.db).toHaveBeenCalledWith("admin");
+    expect(mockCommand).toHaveBeenCalledWith({ ping: 1 });
+  });
+
+  it("supports collection.drop() with the selected database and literal collection name", async () => {
+    const { driver, mockClient, mockCommand } = createMockDriver();
+    await driver.query(
+      'db.getSiblingDB("app").getCollection("audit.logs").drop()',
+    );
+    expect(mockClient.db).toHaveBeenCalledWith("app");
+    expect(mockCommand).toHaveBeenCalledWith({ drop: "audit.logs" });
+  });
+
+  it.each([
+    "db.items.drop()",
+    "db.adminCommand({ dropDatabase: 1 })",
+  ])("blocks %s before SDK execution in read-only mode", async (text) => {
+    const { driver, mockCommand } = createMockDriver();
+    await expect(
+      driver.query(text, undefined, { readOnly: true }),
+    ).rejects.toThrow(/Read-only/);
+    expect(mockCommand).not.toHaveBeenCalled();
+  });
+
   it("executes db.collection.find({})", async () => {
     const { driver, mockFind } = createMockDriver();
     const result = await driver.query("db.users.find({})");
@@ -851,7 +881,7 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
 
   it("throws a descriptive error for unsupported operations", async () => {
     const { driver } = createMockDriver();
-    await expect(driver.query("db.users.drop()")).rejects.toThrow(
+    await expect(driver.query("db.users.unsupported()")).rejects.toThrow(
       /Unsupported mongosh operation/,
     );
   });

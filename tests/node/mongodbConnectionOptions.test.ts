@@ -71,6 +71,33 @@ describe("MongoDBDriver — connect()", () => {
     ]);
   });
 
+  it.each([
+    ["", 900, 900],
+    ["?serverSelectionTimeoutMS=600&connectTimeoutMS=500", 600, 500],
+    ["?serverSelectionTimeoutMS=30000&connectTimeoutMS=0", 900, 900],
+  ])("bounds native connection timeouts while retaining shorter URI values: %s", async (query, selection, connect) => {
+    const driver = new MongoDBDriver(
+      {
+        id: "timeouts",
+        name: "Timeouts",
+        type: "mongodb",
+        connectionUri: `mongodb://localhost/app${query}`,
+      },
+      () => ({
+        connectionTimeoutSeconds: 1,
+        connectionTimeoutMs: 1000,
+        dbOperationTimeoutSeconds: 10,
+        dbOperationTimeoutMs: 10000,
+      }),
+    );
+    await driver.connect();
+    expect(mongoClientMocks.constructorCalls.at(-1)?.options).toMatchObject({
+      serverSelectionTimeoutMS: selection,
+      connectTimeoutMS: connect,
+    });
+    await driver.disconnect();
+  });
+
   it("defaults the database name to admin while preserving authSource in the URI and options", async () => {
     const driver = new MongoDBDriver({
       id: "mongodb-connect-default-database",

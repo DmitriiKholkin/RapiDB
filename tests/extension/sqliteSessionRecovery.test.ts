@@ -124,6 +124,8 @@ describe("SQLite lost session recovery through controller/manager/worker", () =>
     await test.execute("SELECT value FROM kept");
     expect(test.lastResult().rows[0].__col_0).toBe(42);
     const query = vi.spyOn(original, "query");
+    const disconnected = vi.fn();
+    const subscription = test.manager.onDidDisconnect(disconnected);
     test.factory.mockClear();
 
     const running = test.execute(CPU_SUM);
@@ -156,7 +158,9 @@ describe("SQLite lost session recovery through controller/manager/worker", () =>
     }
     expect(query).toHaveBeenCalledTimes(1);
     expect(test.factory).not.toHaveBeenCalled();
-    expect(test.manager.getDriver(test.connection.id)).toBe(original);
+    expect(test.manager.getDriver(test.connection.id)).toBeUndefined();
+    expect(disconnected).toHaveBeenCalledWith(test.connection.id);
+    subscription.dispose();
     expect(test.manager.isConnected(test.connection.id)).toBe(false);
 
     await test.manager.disconnectFrom(test.connection.id);

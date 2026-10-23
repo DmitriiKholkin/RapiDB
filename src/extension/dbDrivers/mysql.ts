@@ -2736,12 +2736,9 @@ export class MySQLDriver extends BaseDBDriver {
   mapTypeCategory(nativeType: string): TypeCategory {
     const ct = nativeType.toLowerCase();
     const base = mysqlTypeName(nativeType);
-    if (
-      base === "bool" ||
-      base === "boolean" ||
-      (base === "tinyint" && /tinyint\s*\(\s*1\s*\)/.test(ct))
-    )
-      return "boolean";
+    // Display width does not restrict TINYINT to 0/1 (including BOOL aliases
+    // reported by MySQL as tinyint(1)). Preserve its integer storage domain.
+    if (base === "bool" || base === "boolean") return "boolean";
     if (
       ["tinyint", "smallint", "mediumint", "int", "integer", "bigint"].includes(
         base,
@@ -2793,12 +2790,8 @@ export class MySQLDriver extends BaseDBDriver {
     nativeType: string,
     _category: TypeCategory,
   ): ValueSemantics {
-    const ct = nativeType.toLowerCase();
     const base = mysqlTypeName(nativeType);
     if (base === "bool" || base === "boolean") return "boolean";
-    if (base === "tinyint" && /tinyint\s*\(\s*1\s*\)/.test(ct)) {
-      return "boolean";
-    }
     if (base === "bit") return "bit";
     return "plain";
   }

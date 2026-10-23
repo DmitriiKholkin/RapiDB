@@ -453,6 +453,20 @@ export class QueryPanelController {
       }
       this.postQueryError(normalized.message, requestToken, resultIdentity);
     } finally {
+      if (
+        queryStarted &&
+        driver.isConnected?.() === false &&
+        driver.getAutomaticReconnectBlockReason?.() &&
+        this.connectionManager.getDriver(connectionId) === driver
+      ) {
+        try {
+          // A cancelled SQLite worker loses session state. Retire the closed
+          // driver so Explorer and the open panels receive the disconnect.
+          await this.connectionManager.disconnectFrom(connectionId);
+        } catch (error) {
+          logger.error("Failed to retire a lost database session", error);
+        }
+      }
       if (queryStarted && changesDiscoverableSchema) {
         this.connectionManager.refreshSchemaCache(connectionId);
       }

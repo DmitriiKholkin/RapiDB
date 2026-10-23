@@ -1434,7 +1434,7 @@ export class ConnectionManager
         case "oracle":
           return new OracleDriver(config, timeoutSettingsProvider);
         case "mongodb":
-          return new MongoDBDriver(config);
+          return new MongoDBDriver(config, timeoutSettingsProvider);
         case "redis":
           return new RedisDriver(config, timeoutSettingsProvider);
         case "elasticsearch":

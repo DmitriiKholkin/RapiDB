@@ -33,6 +33,34 @@ async function withTable(
 }
 
 describe("MySQL TINYINT(1) is an integer storage type, not a boolean constraint", () => {
+  it("inserts and filters negative keys through the Viewer services", async () => {
+    await withTable(async (driver, table, config) => {
+      const manager = {
+        getConnection: () => config,
+        getDriver: () => driver,
+      } as unknown as ConnectionManager;
+      const reader = new TableReadService(manager);
+      const service = new TableMutationService(manager, reader);
+      await service.insertRow(config.id, config.database ?? "", "", table, {
+        id: "-2",
+        payload: "minus-two",
+      });
+      const page = await reader.getPage(
+        config.id,
+        config.database ?? "",
+        "",
+        table,
+        1,
+        25,
+        [{ column: "id", operator: "eq", value: "-2" }],
+      );
+      expect(page.rows).toEqual([{ id: -2, payload: "minus-two" }]);
+      const actual = await driver.query(
+        `SELECT CAST(id AS SIGNED) FROM ${table} WHERE payload = 'minus-two'`,
+      );
+      expect(Number(actual.rows[0].__col_0)).toBe(-2);
+    });
+  });
   it.each([
     undefined,
     10,

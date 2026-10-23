@@ -25,6 +25,29 @@ const column: ColumnTypeMeta = {
 
 describe("MySQL tinyint display width must not change stored values", () => {
   it.each([
+    "tinyint(1)",
+    "tinyint(1) unsigned",
+    "tinyint(4)",
+  ])("uses integer input and filters for %s", (nativeType) => {
+    class MetadataDriver extends MySQLDriver {
+      metadata() {
+        return this.enrichColumn({ ...column, type: nativeType });
+      }
+    }
+    const metadata = new MetadataDriver({
+      id: "meta",
+      name: "meta",
+      type: "mysql",
+    }).metadata();
+    expect(metadata.category).toBe("integer");
+    expect(metadata.valueSemantics).toBe("plain");
+    expect(driver.coerceInputValue("-2", metadata)).toBe("-2");
+    expect(driver.buildFilterCondition(metadata, "eq", "-1", 1)).toEqual({
+      sql: "`id` = ?",
+      params: [-1],
+    });
+  });
+  it.each([
     -128, -2, -1, 0, 1, 2, 127, 255,
   ])("preserves %s through query and table formatting", (value) => {
     const parsed = (

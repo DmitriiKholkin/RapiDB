@@ -323,6 +323,40 @@ describe("TableView persisted state recovery", () => {
     expect(persisted().tableView).toEqual(expected);
   });
 
+  it("applies the latest filter on the first Enter before the debounce expires", () => {
+    vi.useFakeTimers();
+    mountThirdPage();
+    const input = screen.getByLabelText("name filter value");
+    fireEvent.change(input, { target: { value: "Bob" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(lastFetch()).toMatchObject({
+      page: 1,
+      filters: [{ column: "name", operator: "like", value: "Bob" }],
+    });
+    const count = fetches().length;
+    act(() => vi.advanceTimersByTime(DEBOUNCE + 1));
+    expect(fetches()).toHaveLength(count);
+  });
+
+  it("applies both range endpoints on the first Enter", () => {
+    vi.useFakeTimers();
+    mountThirdPage();
+    fireEvent.click(screen.getByLabelText("id filter operator"));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /Between/ }));
+    fireEvent.change(screen.getByLabelText("id filter start"), {
+      target: { value: "12" },
+    });
+    const end = screen.getByLabelText("id filter end");
+    fireEvent.change(end, { target: { value: "30" } });
+    fireEvent.keyDown(end, { key: "Enter" });
+    expect(lastFetch()).toMatchObject({
+      page: 1,
+      filters: expect.arrayContaining([
+        { column: "id", operator: "between", value: ["12", "30"] },
+      ]),
+    });
+  });
+
   it("does not overwrite a pending filter's page intent when an older-filter read commits", () => {
     vi.useFakeTimers();
     const { first, persisted } = mountThirdPage();

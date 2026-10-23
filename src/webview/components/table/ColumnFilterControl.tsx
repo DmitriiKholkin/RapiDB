@@ -359,6 +359,19 @@ export function ColumnFilterControl({
           <input
             aria-label={`${column.name} filter start`}
             value={betweenValue[0]}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" || event.nativeEvent.isComposing)
+                return;
+              event.preventDefault();
+              event.stopPropagation();
+              onChange(
+                {
+                  operator: "between",
+                  value: [event.currentTarget.value, betweenValue[1]],
+                },
+                { applyImmediately: true },
+              );
+            }}
             onChange={(event) =>
               onChange({
                 operator: "between",
@@ -371,6 +384,19 @@ export function ColumnFilterControl({
           <input
             aria-label={`${column.name} filter end`}
             value={betweenValue[1]}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" || event.nativeEvent.isComposing)
+                return;
+              event.preventDefault();
+              event.stopPropagation();
+              onChange(
+                {
+                  operator: "between",
+                  value: [betweenValue[0], event.currentTarget.value],
+                },
+                { applyImmediately: true },
+              );
+            }}
             onChange={(event) =>
               onChange({
                 operator: "between",
@@ -384,6 +410,20 @@ export function ColumnFilterControl({
       ) : (
         <input
           aria-label={`${column.name} filter value`}
+          onKeyDown={(event) => {
+            if (
+              !scalarOperator ||
+              event.key !== "Enter" ||
+              event.nativeEvent.isComposing
+            )
+              return;
+            event.preventDefault();
+            event.stopPropagation();
+            onChange(
+              { operator: scalarOperator, value: event.currentTarget.value },
+              { applyImmediately: true },
+            );
+          }}
           value={
             selectedOperator === "is_null"
               ? "NULL"

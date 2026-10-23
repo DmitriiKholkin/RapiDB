@@ -728,11 +728,12 @@ export class RedisDriver implements IDBDriver {
             ? { servername: tlsServername }
             : {}),
         };
+    let hasBeenReady = false;
     const socketOptions = {
       ...socket,
       signal,
       reconnectStrategy: (retries: number) =>
-        signal.aborted
+        signal.aborted || !hasBeenReady
           ? false
           : Math.min(2 ** retries * 50, 2000) + Math.floor(Math.random() * 200),
     };
@@ -743,6 +744,11 @@ export class RedisDriver implements IDBDriver {
       database,
       username: username || undefined,
       password: this.config.password,
+    });
+    // Surface the original AUTH/SELECT/TLS/TCP error during connection setup.
+    // Once established, retain native reconnects for temporary outages.
+    client.on("ready", () => {
+      hasBeenReady = true;
     });
     client.on("error", (error: unknown) => {
       logger.error("Redis client error", error);

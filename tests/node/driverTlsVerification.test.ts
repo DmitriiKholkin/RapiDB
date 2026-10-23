@@ -532,7 +532,11 @@ describe("Redis native TLS modes and SSH identity", () => {
         expect(fixture.commands).toBeGreaterThan(0);
         expect(fixture.servernames).toContain(identity);
       } else {
-        await expect(driver.connect()).rejects.toBeInstanceOf(Error);
+        await expect(driver.connect()).rejects.toThrow(
+          trusted
+            ? /altnames|certificate.*name|hostname/i
+            : /certificate|issuer|self.signed/i,
+        );
         expect(fixture.commands).toBe(0);
       }
     } finally {

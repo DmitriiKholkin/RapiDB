@@ -55,7 +55,12 @@ import {
   pageRows,
   splitInFilterValues,
 } from "./nosqlUtils";
-import { getQueryRemainingTimeoutMs, throwIfQueryCancelled } from "./timeout";
+import {
+  type DriverTimeoutSettingsProvider,
+  getDefaultDriverTimeoutSettings,
+  getQueryRemainingTimeoutMs,
+  throwIfQueryCancelled,
+} from "./timeout";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -342,8 +347,8 @@ const MONGOSH_SANDBOX_SETUP = `
       if (typeof prop !== 'string') return undefined;
       if (prop === 'getSiblingDB') return (name) => createDbProxy(name);
       if (prop === 'getCollection') return (name) => createCollProxy(dbName, String(name));
-      if (prop === 'runCommand') return (cmd) => {
-        const operation = { dbName, op: 'runCommand', args: [cmd], chainOps: [] };
+      if (prop === 'runCommand' || prop === 'adminCommand') return (cmd) => {
+        const operation = { dbName: prop === 'adminCommand' ? 'admin' : dbName, op: 'runCommand', args: [cmd], chainOps: [] };
         operations.push(operation);
         return createChainProxy(operation);
       };
@@ -1430,11 +1435,47 @@ export class MongoDBDriver implements IDBDriver {
 
   private readonly config: ConnectionConfig;
 
-  constructor(config: ConnectionConfig) {
+  constructor(
+    config: ConnectionConfig,
+    private readonly timeoutSettingsProvider: DriverTimeoutSettingsProvider = getDefaultDriverTimeoutSettings,
+  ) {
     const normalized = normalizeMongoConnectionConfig(config);
     this.config = getSshTcpForwardTransport(config)
       ? { ...normalized, directConnection: config.directConnection }
       : normalized;
+  }
+
+  private connectionTimeoutOptions(uri: string): {
+    serverSelectionTimeoutMS?: number;
+    connectTimeoutMS?: number;
+  } {
+    const timeoutMs = this.timeoutSettingsProvider().connectionTimeoutMs;
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return {};
+    // Let the native driver return its topology/TLS error before the outer
+    // deadline cancels the attempt. Reserve time for its socket cleanup.
+    const budget = Math.max(
+      1,
+      Math.floor(timeoutMs - Math.min(250, timeoutMs / 10)),
+    );
+    const queryIndex = uri.indexOf("?");
+    const options = new URLSearchParams(
+      queryIndex < 0 ? "" : uri.slice(queryIndex + 1),
+    );
+    const bounded = (name: string) => {
+      const entry = [...options].find(
+        ([key]) => key.toLowerCase() === name.toLowerCase(),
+      );
+      if (!entry) return budget;
+      const value = Number(entry[1]);
+      if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+        throw new Error(`MongoDB ${name} must be a non-negative integer.`);
+      }
+      return value === 0 ? budget : Math.min(value, budget);
+    };
+    return {
+      serverSelectionTimeoutMS: bounded("serverSelectionTimeoutMS"),
+      connectTimeoutMS: bounded("connectTimeoutMS"),
+    };
   }
 
   async connect(): Promise<void> {
@@ -1469,6 +1510,7 @@ export class MongoDBDriver implements IDBDriver {
       const tlsIpIdentity = tlsHostname && isIP(tlsHostname) !== 0;
       this.assertConnectionEpoch(epoch);
       client = new MongoClient(uri, {
+        ...this.connectionTimeoutOptions(uri),
         ...(this.config.tls !== undefined
           ? { tls: tlsSettings !== undefined }
           : {}),
@@ -1997,6 +2039,19 @@ export class MongoDBDriver implements IDBDriver {
           : mongoCollection.deleteMany(normalizeCriteria(), ...sdkArgs);
 
       const collectionHandlers: Record<string, () => Promise<QueryResult>> = {
+        drop: async () => {
+          if (opArgs.length > 0) {
+            throw new Error("Collection drop() does not accept arguments.");
+          }
+          const result = await this.requireDb(dbName).command(
+            { drop: collName },
+            ...sdkArgs,
+          );
+          return this.buildMongoSingleRowQueryResult(
+            this.toRow(result),
+            startedAt,
+          );
+        },
         find: async () =>
           this.buildMongoDocumentRowsQueryResult(
             await findDocuments(fetchLimit),
@@ -2135,7 +2190,7 @@ export class MongoDBDriver implements IDBDriver {
       }
 
       throw new Error(
-        `Unsupported mongosh operation: "${op}".\n\nSupported: find, findOne, countDocuments, insertOne, insertMany, updateOne, updateMany, deleteOne, deleteMany, aggregate, runCommand, createCollection, createView, createIndex`,
+        `Unsupported mongosh operation: "${op}".\n\nSupported: find, findOne, countDocuments, insertOne, insertMany, updateOne, updateMany, deleteOne, deleteMany, aggregate, runCommand, adminCommand, createCollection, createView, createIndex, drop`,
       );
     };
 

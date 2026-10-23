@@ -65,6 +65,7 @@ async function withFixture(
 async function connectThroughManager(
   fixture: Fixture,
   fields: Partial<ConnectionConfig> = {},
+  connectionTimeoutSeconds = 15,
 ) {
   const dispose = vi.fn(async () => undefined);
   const createSshRuntime = vi.fn(
@@ -85,9 +86,11 @@ async function connectThroughManager(
       };
     },
   );
+  const store = new FakeConnectionManagerStore();
+  store.setTimeoutSettings({ connectionTimeoutSeconds });
   const manager = new ConnectionManager(
     createExtensionContextStub() as never,
-    new FakeConnectionManagerStore(),
+    store,
     { createSshRuntime },
   );
   try {
@@ -114,6 +117,23 @@ async function connectThroughManager(
 }
 
 describe("MongoDB SSH TLS — real official-driver handshakes", () => {
+  it("retains the certificate error under the configured deadline without URI timeouts", async () => {
+    await withFixture(async (fixture) => {
+      const result = await connectThroughManager(
+        fixture,
+        {
+          connectionUri: "mongodb://db.internal:27017/app",
+          tls: { ...clientTls(), serverNameOverride: "wrong.internal" },
+        },
+        1,
+      );
+      expect(result).toMatchObject({
+        success: false,
+        error: expect.stringMatching(/Hostname\/IP does not match/),
+      });
+      expect(result.error).not.toContain("Database connection timed out");
+    });
+  });
   it("rejects the trusted db.internal certificate at the local address without the original hostname", async () => {
     await withFixture(async (fixture) => {
       const client = new MongoClient(
