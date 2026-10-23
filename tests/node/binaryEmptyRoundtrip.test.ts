@@ -86,16 +86,14 @@ function createTableCellSaver(
       return { affectedRows: 1 };
     });
   } else {
-    vi.spyOn(driver, "query").mockImplementation(async (_sql, params = []) => {
-      persistedValue = params[0];
-      return {
-        columns: [],
-        rows: [],
-        rowCount: 1,
-        affectedRows: 1,
-        executionTimeMs: 0,
-      };
-    });
+    vi.spyOn(driver, "getMutationAtomicityRisk").mockResolvedValue(null);
+    vi.spyOn(driver, "runTransaction").mockImplementation(
+      async (operations) => {
+        expect(operations).toHaveLength(1);
+        expect(operations[0].expectedAffectedRows).toBe(1);
+        persistedValue = operations[0].params?.[0];
+      },
+    );
   }
 
   const manager = {

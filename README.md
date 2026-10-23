@@ -154,6 +154,8 @@ Click any table → the **Table Data Viewer** opens:
 
 Persisted edits are prevalidated against available column metadata before any write. Known unsupported edits fail before the batch is applied; where representation compatibility depends on the stored value, verification runs in the transaction and a mismatch rolls it back. Preview skipping does not bypass validation or verification. Schemaless sampling is not a complete database schema or a guarantee that every value has the sampled type.
 
+SQL table updates must affect exactly one row per edited row; an unexpected count aborts the transaction. This also protects against a cached primary key becoming non-unique after an external schema change. Table updates require rollback support, including temporal-only updates on MySQL; nontransactional engines such as MyISAM are blocked. Oracle catalog lookups preserve the exact identifier spelling, so quoted mixed-case objects do not borrow metadata from uppercase namesakes.
+
 Temporal-value verification is driver-specific: SQL Server and Oracle verify explicitly edited dates/times, while PostgreSQL, MySQL, and SQLite retain their existing temporal verification exceptions. Exact temporal persistence is not guaranteed by this safeguard for those three drivers.
 
 MySQL `TINYINT(1)` is not restricted to boolean storage. Values outside `0`/`1` are preserved in query results, table reads, row keys, and exports rather than converted to booleans.

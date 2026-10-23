@@ -153,6 +153,16 @@ export class TableMutationService {
       return;
     }
     try {
+      const risk = await driver.getMutationAtomicityRisk?.(
+        database,
+        schema,
+        table,
+      );
+      if (risk) {
+        throw new Error(
+          `UPDATE verification requires rollback support. ${risk}`,
+        );
+      }
       assertConnectionWritable(
         this.connectionManager,
         connectionId,
@@ -169,15 +179,11 @@ export class TableMutationService {
         error,
       );
     }
-    const result = await driver.query(operation.sql, operation.params, {
-      database,
-    });
-    const affectedRows = result.affectedRows ?? result.rowCount;
-    if (affectedRows === 0) {
-      throw new Error(
-        "Row not found — the row may have been modified or deleted by another user",
-      );
-    }
+    await driver.runTransaction(
+      [{ ...operation, checkAffectedRows: true, expectedAffectedRows: 1 }],
+      undefined,
+      { database },
+    );
   }
   async insertRow(
     connectionId: string,

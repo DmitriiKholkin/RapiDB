@@ -91,6 +91,7 @@ describe.each([
         sql: executionSql,
         params: [`new ${marker}2`, null, 7, `old ${marker}1`],
         checkAffectedRows: true,
+        expectedAffectedRows: 1,
       },
     ]);
     expect(prepared.plan.previewStatements).toEqual([previewSql]);

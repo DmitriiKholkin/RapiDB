@@ -3,6 +3,7 @@ import type { ConnectionManager } from "../../../src/extension/connectionManager
 import type { IDBDriver } from "../../../src/extension/dbDrivers/types";
 import {
   applyChangesTransactional,
+  executeAtomicSqlApplyPlan,
   executePreparedApplyPlan,
   prepareApplyChangesPlan,
 } from "../../../src/extension/table/tableMutationExecution";
@@ -95,6 +96,89 @@ export function registerTableServiceIntegrationTests(
 
     afterAll(async () => {
       await disposeLiveDriverHarness(harness);
+    });
+
+    it.each([
+      "prepared",
+      "atomic-mixed",
+      "direct",
+    ] as const)("%s rolls back a single-row UPDATE when an external schema change makes its cached key non-unique", async (path) => {
+      const table = `RAPIDB_CARD_${Date.now().toString(36).toUpperCase()}`;
+      const { driver } = harness;
+      const database = harness.databaseName;
+      const schema = harness.schemaName;
+      const target = driver.qualifiedTableName(database, schema, table);
+      const id = driver.quoteIdentifier("id");
+      const value = driver.quoteIdentifier("value");
+      await driver.query(
+        `CREATE TABLE ${target} (${id} INT NOT NULL PRIMARY KEY, ${value} VARCHAR(30))`,
+      );
+      try {
+        const columns = await readService.getColumns(
+          connectionId,
+          database,
+          schema,
+          table,
+        );
+        const prepared = prepareApplyChangesPlan(
+          connectionManager,
+          connectionId,
+          database,
+          schema,
+          table,
+          [{ primaryKeys: { id: 1 }, changes: { value: "changed" } }],
+          columns,
+        );
+        if (!prepared.executable) throw new Error("Expected UPDATE plan");
+        await driver.query(`DROP TABLE ${target}`);
+        await driver.query(
+          `CREATE TABLE ${target} (${id} INT NOT NULL, ${value} VARCHAR(30))`,
+        );
+        await driver.query(`INSERT INTO ${target} VALUES (1, 'first')`);
+        await driver.query(`INSERT INTO ${target} VALUES (1, 'second')`);
+        if (path === "direct") {
+          await expect(
+            mutationService.updateRow(
+              connectionId,
+              database,
+              schema,
+              table,
+              { id: 1 },
+              { value: "changed" },
+            ),
+          ).rejects.toThrow(/affected 2 row\(s\); expected 1/);
+        } else {
+          const result =
+            path === "prepared"
+              ? await executePreparedApplyPlan(connectionManager, prepared.plan)
+              : await executeAtomicSqlApplyPlan(
+                  connectionManager,
+                  prepared.plan,
+                  [
+                    await mutationService.prepareInsertRow(
+                      connectionId,
+                      database,
+                      schema,
+                      table,
+                      { id: 3, value: "third" },
+                    ),
+                  ],
+                );
+          expect(result.success).toBe(false);
+          expect(result.error).toMatch(/affected 2 row\(s\); expected 1/);
+        }
+        const stored = await driver.query(
+          `SELECT ${value} FROM ${target} ORDER BY ${value}`,
+          undefined,
+          { database },
+        );
+        expect(stored.rows.map((row) => row.__col_0)).toEqual([
+          "first",
+          "second",
+        ]);
+      } finally {
+        await driver.query(`DROP TABLE ${target}`);
+      }
     });
 
     it("preserves prototype-named columns in pages and multi-chunk exports", async () => {

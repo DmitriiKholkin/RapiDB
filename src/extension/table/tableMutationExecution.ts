@@ -143,9 +143,7 @@ export async function executeAtomicSqlApplyPlan(
                 database: apply.database,
                 schema: apply.schema,
                 table: apply.table,
-                ...(options.verifications?.length
-                  ? { verification: "UPDATE" as const }
-                  : {}),
+                verification: "UPDATE" as const,
               },
             ]
           : []),
@@ -423,6 +421,9 @@ export function prepareApplyChangesPlan(
       sql: operation.sql,
       params: operation.params,
       checkAffectedRows: true,
+      // Metadata may outlive a key constraint changed by an external client.
+      // Enforce single-row targeting in the transaction, before it can commit.
+      expectedAffectedRows: 1,
     });
     previewStatements.push(
       typeof previewDriver.materializePreviewColumnSql === "function"
@@ -557,9 +558,7 @@ export async function executePreparedApplyPlan(
           database: plan.database,
           schema: plan.schema,
           table: plan.table,
-          ...(options.verifications?.length
-            ? { verification: "UPDATE" as const }
-            : {}),
+          verification: "UPDATE" as const,
         },
       ],
       plan.operations.length,

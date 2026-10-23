@@ -506,6 +506,7 @@ describe("table helpers", () => {
       sql: 'UPDATE public.fixture_rows SET "display_name" = $1 WHERE "id" = $2 AND "display_name" = $3',
       params: ["new", 1, "old"],
       checkAffectedRows: true,
+      expectedAffectedRows: 1,
     });
   });
 

@@ -531,17 +531,17 @@ export function assertTransactionAffectedRows(
   operation: TransactionOperation,
   affectedRows: number,
 ): void {
+  if (operation.checkAffectedRows && affectedRows === 0) {
+    throw new Error(
+      "Row not found — the row may have been modified or deleted by another user",
+    );
+  }
   if (
     operation.expectedAffectedRows !== undefined &&
     affectedRows !== operation.expectedAffectedRows
   ) {
     throw new Error(
       `Mutation affected ${affectedRows} row(s); expected ${operation.expectedAffectedRows}. One or more rows may have been modified or deleted by another user.`,
-    );
-  }
-  if (operation.checkAffectedRows && affectedRows === 0) {
-    throw new Error(
-      "Row not found — the row may have been modified or deleted by another user",
     );
   }
 }

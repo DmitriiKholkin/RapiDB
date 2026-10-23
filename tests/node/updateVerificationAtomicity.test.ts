@@ -298,7 +298,7 @@ describe("verified UPDATE rollback preflight", () => {
       expect([...h.stored]).toEqual([]);
     });
 
-    it(`${path}: respects MySQL's temporal verification opt-out for a single UPDATE`, async () => {
+    it(`${path}: still requires rollback for single-row cardinality when temporal value verification opts out`, async () => {
       const h = harness();
       const temporalColumns: ColumnTypeMeta[] = [
         columns[0],
@@ -315,14 +315,13 @@ describe("verified UPDATE rollback preflight", () => {
       );
       expect(plan.verificationTargets[0].values).toEqual([]);
       const result = await execute(path, h.manager, plan);
-      expect(result.success).toBe(true);
-      expect(h.riskCheck).not.toHaveBeenCalled();
-      expect(h.transaction).toHaveBeenCalledExactlyOnceWith(
-        plan.operations,
-        undefined,
-        { database: "target" },
+      expect(result.success).toBe(false);
+      expect(result.error).toContain(
+        "UPDATE verification requires rollback support",
       );
-      expect(h.events).toEqual(["BEGIN", "UPDATE", "COMMIT"]);
+      expect(h.riskCheck).toHaveBeenCalledOnce();
+      expect(h.transaction).not.toHaveBeenCalled();
+      expect(h.events).toEqual([]);
     });
 
     it(`${path}: blocks multiple MySQL temporal UPDATEs on MyISAM despite the driver's verification opt-out`, async () => {

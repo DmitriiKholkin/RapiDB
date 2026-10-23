@@ -417,11 +417,19 @@ describe("UPDATE service boundary after deferred columns", () => {
           });
           expect(h.driver.query).not.toHaveBeenCalled();
         } else {
-          expect(h.driver.query).toHaveBeenCalledExactlyOnceWith(
-            'UPDATE public."updates" SET "amount" = ? WHERE "id" = ?',
-            ["12.34", 1],
+          expect(h.driver.runTransaction).toHaveBeenCalledExactlyOnceWith(
+            [
+              {
+                sql: 'UPDATE public."updates" SET "amount" = ? WHERE "id" = ?',
+                params: ["12.34", 1],
+                checkAffectedRows: true,
+                expectedAffectedRows: 1,
+              },
+            ],
+            undefined,
             { database: "db" },
           );
+          expect(h.driver.query).not.toHaveBeenCalled();
           expect(h.updateRows).not.toHaveBeenCalled();
         }
         expect(h.driver.checkPersistedEdit).toHaveBeenCalledOnce();
@@ -455,7 +463,7 @@ describe("UPDATE service boundary after deferred columns", () => {
       const h = updateColumnsHarness(route, "public-service");
       const writeError = new Error("Write acknowledgement lost");
       if (route === "driver") h.updateRows.mockRejectedValue(writeError);
-      else h.driver.query.mockRejectedValue(writeError);
+      else h.driver.runTransaction.mockRejectedValue(writeError);
       const pending = h.execute().catch((error: unknown) => error);
       await h.entered.promise;
       h.resolveColumns();
@@ -463,7 +471,7 @@ describe("UPDATE service boundary after deferred columns", () => {
       expect(error).toBe(writeError);
       expect(isMutationNotExecutedError(error)).toBe(false);
       expect(
-        route === "driver" ? h.updateRows : h.driver.query,
+        route === "driver" ? h.updateRows : h.driver.runTransaction,
       ).toHaveBeenCalledOnce();
     });
   }

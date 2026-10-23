@@ -260,7 +260,19 @@ describe("B01 raw persisted-edit prevalidation", () => {
       { id: 2 },
       { amount: "2.34" },
     );
-    expect(s.query).toHaveBeenCalledOnce();
+    expect(s.query).not.toHaveBeenCalled();
+    expect(s.transaction).toHaveBeenCalledExactlyOnceWith(
+      [
+        {
+          sql: expect.stringContaining('"amount" ='),
+          params: ["2.34", 2],
+          checkAffectedRows: true,
+          expectedAffectedRows: 1,
+        },
+      ],
+      undefined,
+      { database: "db" },
+    );
   });
 
   it("keeps unknown NoSQL identity and pseudo keys outside SQL validation", () => {
