@@ -129,7 +129,11 @@ MongoDB updates and deletes require an explicit document filter; use `{}` explic
 
 MongoDB `insertOne`, `insertMany`, `updateOne`, `updateMany`, `deleteOne`, and `deleteMany` helpers do not support an additional options argument. Such calls are rejected before any operation in the script is sent: options such as `collation`, `upsert`, or `ordered` must never be silently ignored. Use `db.runCommand(...)` with explicit native command options when needed.
 
+MongoDB validates supported helper names, cursor limits, find projection/sort shapes, aggregate pipeline arrays, and no-argument helpers before submitting any operation in a script. These helper validation errors cannot follow an earlier delete or insert. Scripts are still not transactions: database/SDK errors can follow successful operations.
+
 Redis query scripts are fully tokenized before the first command is sent. Invalid Unicode escapes and unpaired UTF-16 surrogates are rejected rather than addressing a replacement-character key or partially executing a script with a later parsing error. This validation does not make Redis scripts transactional; server-side errors can still follow successful commands.
+
+Redis structured table edits (hash, list, set, sorted set) reject JSON numeric literals that would lose precision before any replacement is sent. Use quoted strings for exact large integers or decimal member values, such as `{"account":"9007199254740993"}`. Ordinary Redis string values are not interpreted as JSON.
 
 Table exports keep a stable column schema across chunks. CSV uses the declared columns (including empty cells for missing values); a later unexpected column fails the export rather than silently dropping data. JSON applies the same unexpected-column check. Failed exports leave an existing destination file intact.
 

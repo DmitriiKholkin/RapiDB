@@ -625,6 +625,113 @@ function parseMongoshOperations(queryText: string): MongoshOperation[] {
   return operations;
 }
 
+const MONGOSH_SUPPORTED_OPERATIONS = new Set([
+  "find",
+  "findOne",
+  "countDocuments",
+  "insertOne",
+  "insertMany",
+  "updateOne",
+  "updateMany",
+  "deleteOne",
+  "deleteMany",
+  "aggregate",
+  "runCommand",
+  "getCollectionNames",
+  "createCollection",
+  "createView",
+  "createIndex",
+  "drop",
+]);
+
+function validateMongoshOperation({
+  op,
+  args,
+  chainOps,
+}: MongoshOperation): void {
+  if (!MONGOSH_SUPPORTED_OPERATIONS.has(op)) {
+    throw new Error(
+      `Unsupported mongosh operation: "${op}". No operations were submitted.`,
+    );
+  }
+  const argumentCount = MONGODB_MUTATION_ARGUMENT_COUNTS.get(op);
+  if (argumentCount !== undefined && args.length > argumentCount) {
+    // These helpers do not forward options; ignoring collation or upsert can
+    // change which documents are written, not just how results are displayed.
+    throw new Error(
+      `[RapiDB] MongoDB ${op} options are not supported by this helper. Use db.runCommand with explicit command options instead. No operations were submitted.`,
+    );
+  }
+  if (chainOps.length > 0 && !["find", "findOne", "aggregate"].includes(op)) {
+    throw new Error(
+      `[RapiDB] MongoDB ${op} does not support cursor modifiers. No operations were submitted.`,
+    );
+  }
+  if (["deleteOne", "deleteMany", "updateOne", "updateMany"].includes(op)) {
+    const filter = args[0];
+    if (
+      filter === null ||
+      typeof filter !== "object" ||
+      Object.getPrototypeOf(filter) !== Object.prototype
+    ) {
+      throw new Error(
+        `[RapiDB] MongoDB ${op} filter must be an explicit document. Use {} explicitly to target all documents.`,
+      );
+    }
+  }
+
+  const limitOp = chainOps.filter((chain) => chain.op === "limit").at(-1);
+  const requestedLimit = limitOp?.args[0];
+  if (
+    limitOp &&
+    (limitOp.args.length !== 1 ||
+      typeof requestedLimit !== "number" ||
+      !Number.isSafeInteger(requestedLimit) ||
+      requestedLimit < 0)
+  ) {
+    throw new Error(
+      "[RapiDB] MongoDB limit() requires a non-negative safe integer. Negative and fractional limits are not supported.",
+    );
+  }
+  if (op === "aggregate") {
+    if (requestedLimit === 0) {
+      throw new Error(
+        "[RapiDB] MongoDB aggregate().limit() requires a positive safe integer.",
+      );
+    }
+    if (!Array.isArray(args[0])) {
+      throw new Error(
+        "MongoDB aggregate expects a pipeline array as the first argument.",
+      );
+    }
+  }
+  if (op === "find" || op === "findOne") {
+    const projection = args[1];
+    if (
+      projection !== undefined &&
+      projection !== null &&
+      (typeof projection !== "object" || Array.isArray(projection))
+    ) {
+      throw new Error("MongoDB find projection must be an object.");
+    }
+    for (const chain of chainOps) {
+      if (chain.op === "sort") {
+        const sort = chain.args[0];
+        if (sort === null || typeof sort !== "object" || Array.isArray(sort)) {
+          throw new Error("MongoDB find().sort() expects an object.");
+        }
+      }
+    }
+  }
+  if ((op === "drop" || op === "getCollectionNames") && args.length > 0) {
+    throw new Error(
+      op === "drop"
+        ? "Collection drop() does not accept arguments."
+        : "db.getCollectionNames() does not accept arguments.",
+    );
+  }
+}
+
 function pipelineContainsWriteStage(pipeline: unknown[]): boolean {
   return pipeline.some((stage) => {
     if (stage === null || typeof stage !== "object" || Array.isArray(stage)) {
@@ -1901,43 +2008,9 @@ export class MongoDBDriver implements IDBDriver {
 
     const startedAt = Date.now();
     const operations = parseMongoshOperations(trimmed);
-    // Read helpers may default an omitted filter to {}, but doing so for a
-    // mutation can turn a malformed query into a collection-wide write. Check
-    // every mutation before submitting even the first statement in the script.
-    for (const { op, args, chainOps } of operations) {
-      const argumentCount = MONGODB_MUTATION_ARGUMENT_COUNTS.get(op);
-      if (argumentCount !== undefined && args.length > argumentCount) {
-        // These helpers do not forward mongosh options to the SDK. Ignoring
-        // collation can broaden a delete under a collection's default collation;
-        // ignoring upsert/ordered also changes the requested write semantics.
-        throw new Error(
-          `[RapiDB] MongoDB ${op} options are not supported by this helper. Use db.runCommand with explicit command options instead. No operations were submitted.`,
-        );
-      }
-      if (
-        chainOps.length > 0 &&
-        !["find", "findOne", "aggregate"].includes(op)
-      ) {
-        throw new Error(
-          `[RapiDB] MongoDB ${op} does not support cursor modifiers. No operations were submitted.`,
-        );
-      }
-      if (
-        !["deleteOne", "deleteMany", "updateOne", "updateMany"].includes(op)
-      ) {
-        continue;
-      }
-      const filter = args[0];
-      if (
-        filter === null ||
-        typeof filter !== "object" ||
-        Object.getPrototypeOf(filter) !== Object.prototype
-      ) {
-        throw new Error(
-          `[RapiDB] MongoDB ${op} filter must be an explicit document. Use {} explicitly to target all documents.`,
-        );
-      }
-    }
+    // Complete local validation before a preceding destructive statement can
+    // run. This does not make scripts atomic against server-side failures.
+    for (const operation of operations) validateMongoshOperation(operation);
     if (
       (options?.readOnly === true || this.config.readOnly === true) &&
       !operations.every(isReadOnlyMongoOperation)
@@ -1963,24 +2036,7 @@ export class MongoDBDriver implements IDBDriver {
       const { dbName, collName, op, args: opArgs, chainOps } = operation;
 
       const limitOp = chainOps.filter((chain) => chain.op === "limit").at(-1);
-      const requestedLimit = limitOp?.args[0];
-      if (
-        limitOp &&
-        (limitOp.args.length !== 1 ||
-          typeof requestedLimit !== "number" ||
-          !Number.isSafeInteger(requestedLimit) ||
-          requestedLimit < 0)
-      ) {
-        throw new Error(
-          "[RapiDB] MongoDB limit() requires a non-negative safe integer. Negative and fractional limits are not supported.",
-        );
-      }
-      if (op === "aggregate" && requestedLimit === 0) {
-        throw new Error(
-          "[RapiDB] MongoDB aggregate().limit() requires a positive safe integer.",
-        );
-      }
-      const explicitLimit = requestedLimit as number | undefined;
+      const explicitLimit = limitOp?.args[0] as number | undefined;
       const resultLimit = Math.min(
         rowBudget,
         op === "findOne"
@@ -2007,11 +2063,6 @@ export class MongoDBDriver implements IDBDriver {
 
       const dbHandlers: Record<string, () => Promise<QueryResult>> = {
         getCollectionNames: async () => {
-          if (opArgs.length > 0) {
-            throw new Error(
-              "db.getCollectionNames() does not accept arguments.",
-            );
-          }
           const collections = await this.requireDb(dbName)
             .listCollections(
               {},
@@ -2090,13 +2141,6 @@ export class MongoDBDriver implements IDBDriver {
         );
       const findDocuments = async (limitValue: number) => {
         const projectionArg = opArgs[1];
-        if (
-          projectionArg !== undefined &&
-          projectionArg !== null &&
-          (typeof projectionArg !== "object" || Array.isArray(projectionArg))
-        ) {
-          throw new Error("MongoDB find projection must be an object.");
-        }
         const projection = projectionArg
           ? this.normalizeCriteria(projectionArg as Record<string, unknown>)
           : undefined;
@@ -2110,13 +2154,6 @@ export class MongoDBDriver implements IDBDriver {
         for (const chain of chainOps) {
           if (chain.op === "sort") {
             const sort = chain.args[0];
-            if (
-              sort === null ||
-              typeof sort !== "object" ||
-              Array.isArray(sort)
-            ) {
-              throw new Error("MongoDB find().sort() expects an object.");
-            }
             cursor = cursor.sort(sort as NonNullable<FindOptions["sort"]>);
           }
         }
@@ -2135,9 +2172,6 @@ export class MongoDBDriver implements IDBDriver {
 
       const collectionHandlers: Record<string, () => Promise<QueryResult>> = {
         drop: async () => {
-          if (opArgs.length > 0) {
-            throw new Error("Collection drop() does not accept arguments.");
-          }
           const result = await this.requireDb(dbName).command(
             { drop: collName },
             ...sdkArgs,
@@ -2229,11 +2263,6 @@ export class MongoDBDriver implements IDBDriver {
           );
         },
         aggregate: async () => {
-          if (!Array.isArray(opArgs[0])) {
-            throw new Error(
-              "MongoDB aggregate expects a pipeline array as the first argument.",
-            );
-          }
           const pipeline = opArgs[0] as Record<string, unknown>[];
           const boundedPipeline = [...pipeline];
           if (skip > 0) {

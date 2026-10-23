@@ -15,6 +15,7 @@ import {
   resolveConnectionTlsSettings,
 } from "../services/connectionTls";
 import { pMapWithLimit } from "../utils/concurrency";
+import { parseJsonForWrite } from "../utils/jsonWriteSafety";
 import { logger } from "../utils/logger";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import { deleteRowsSequentially, prepareDeleteBatch } from "./deleteOutcomes";
@@ -1308,6 +1309,7 @@ export class RedisDriver implements IDBDriver {
             : this.encodeRedisLuaValue(
                 currentType,
                 update.originalValues?.value,
+                false,
               )
           : "";
         writeMayHaveApplied = true;
@@ -2075,7 +2077,21 @@ export class RedisDriver implements IDBDriver {
     return formatRedisPreviewCommand(plan.command.toUpperCase(), args);
   }
 
-  private encodeRedisLuaValue(redisType: string, value: unknown): string {
+  private encodeRedisLuaValue(
+    redisType: string,
+    value: unknown,
+    validatePrecision = true,
+  ): string {
+    if (["hash", "list", "set", "zset"].includes(redisType)) {
+      // Redis members are strings, but JSON.parse can round a numeric literal
+      // before it is converted to that string. Originals are display snapshots,
+      // not new writes, and must remain usable for optimistic checks/repairs.
+      value = this.parseRedisJsonValue(
+        value,
+        `${redisType} value`,
+        validatePrecision,
+      );
+    }
     switch (redisType) {
       case "hash":
         return JSON.stringify(this.parseRedisHashEntries(value));
@@ -2218,13 +2234,18 @@ export class RedisDriver implements IDBDriver {
     });
   }
 
-  private parseRedisJsonValue(value: unknown, label: string): unknown {
+  private parseRedisJsonValue(
+    value: unknown,
+    label: string,
+    validatePrecision = true,
+  ): unknown {
     if (typeof value !== "string") {
       return value;
     }
     try {
-      return JSON.parse(value);
-    } catch {
+      return validatePrecision ? parseJsonForWrite(value) : JSON.parse(value);
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
       throw new Error(`Redis ${label} must be valid JSON.`);
     }
   }
