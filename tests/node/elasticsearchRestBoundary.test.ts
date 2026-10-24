@@ -52,6 +52,43 @@ async function fixture() {
 
 describe("Elasticsearch REST request boundaries (real SDK + HTTP)", () => {
   it.each([
+    "/records/_doc/..",
+    "/records/_doc/%2e%2e",
+    "/records/_doc/.%2E",
+    "/records/_doc/%2e.",
+    "/records/_doc/.",
+    "/records/_doc\\..",
+    "/records/_doc/selected#ignored",
+    "https://other-cluster/records/_doc/selected",
+    "//other-cluster/records/_doc/selected",
+  ])("rejects paths that can silently change the selected resource: %s", async (path) => {
+    const f = await fixture();
+    try {
+      await f.driver.connect();
+      await expect(
+        f.driver.query(`DELETE /records/_doc/first\nDELETE ${path}`),
+      ).rejects.toThrow(/path/i);
+      expect(f.requests.filter((entry) => entry.method !== "HEAD")).toEqual([]);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("preserves encoded document ID delimiters without treating them as URL syntax", async () => {
+    const f = await fixture();
+    try {
+      await f.driver.connect();
+      await f.driver.query("DELETE /records/_doc/id%2Fpart%23tag%3Fvalue");
+      const request = f.requests.find((entry) => entry.method === "DELETE");
+      expect(request?.url.pathname).toBe(
+        "/records/_doc/id%2Fpart%23tag%3Fvalue",
+      );
+    } finally {
+      await f.close();
+    }
+  });
+
+  it.each([
     "_mapping",
     "_settings",
   ])("reads index %s using the named REST resource", async (endpoint) => {

@@ -1,4 +1,4 @@
-import { Int32, Long } from "mongodb";
+import { BSON, Int32, Long } from "mongodb";
 import { describe, expect, it, vi } from "vitest";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 
@@ -35,6 +35,10 @@ describe("mongosh BSON integer literals preserve the requested value", () => {
     "NumberInt(true)",
     'NumberInt(["42"])',
     'NumberLong("1", "ignored")',
+    "9223372036854775808n",
+    "-9223372036854775809n",
+    "18446744073709551617n",
+    "(2n ** 64n + 1n)",
   ])("rejects %s before any operation in the script is submitted", async (literal) => {
     const { driver, insertOne, deleteOne } = setup();
     await expect(
@@ -44,6 +48,32 @@ describe("mongosh BSON integer literals preserve the requested value", () => {
     ).rejects.toThrow(/integer|range|safe|argument/i);
     expect(insertOne).not.toHaveBeenCalled();
     expect(deleteOne).not.toHaveBeenCalled();
+  });
+
+  it("validates nested bigint values before a preceding mutation", async () => {
+    const { driver, insertOne, deleteOne } = setup();
+    await expect(
+      driver.query(
+        'db.items.deleteOne({_id:"earlier"}); db.items.insertOne({nested:[{amount:18446744073709551617n}]})',
+      ),
+    ).rejects.toThrow(/int64|range/i);
+    expect(insertOne).not.toHaveBeenCalled();
+    expect(deleteOne).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "-9223372036854775808",
+    "9223372036854775807",
+    "9007199254740993",
+    "0",
+  ])("preserves bare bigint %s through real BSON serialization", async (value) => {
+    const { driver, insertOne } = setup();
+    await driver.query(`db.items.insertOne({amount:${value}n})`);
+    const document = insertOne.mock.calls[0][0];
+    const decoded = BSON.deserialize(BSON.serialize(document), {
+      useBigInt64: true,
+    });
+    expect(decoded.amount).toBe(BigInt(value));
   });
 
   it.each([

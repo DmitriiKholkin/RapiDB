@@ -758,6 +758,24 @@ export class ElasticsearchDriver implements IDBDriver {
     const method = match[1].toUpperCase() as ElasticsearchRestMethod;
     const rawPath = match[2];
     const bodyText = commandText.slice(match[0].length).trim();
+    // WHATWG URL parsing removes dot segments and treats backslashes as slashes.
+    // A document DELETE ending in /.. would otherwise become an index DELETE.
+    // Absolute URLs/fragments also silently discard user-specified targeting.
+    const rawSegments = rawPath.split("?", 1)[0].split("/");
+    if (
+      !rawPath.startsWith("/") ||
+      rawPath.startsWith("//") ||
+      /[\\#\p{Cc}]/u.test(rawPath) ||
+      Buffer.from(rawPath, "utf8").toString("utf8") !== rawPath ||
+      rawSegments.some((segment) => {
+        const decoded = decodeURIComponent(segment);
+        return decoded === "." || decoded === "..";
+      })
+    ) {
+      throw new Error(
+        "Elasticsearch REST path must be an absolute path on the current connection, without dot segments, backslashes, fragments, or invalid Unicode. Encode literal document ID delimiters in the path.",
+      );
+    }
     const parsedUrl = new URL(rawPath, "http://rapidb.local");
     const pathSegments = parsedUrl.pathname
       .split("/")

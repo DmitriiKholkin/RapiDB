@@ -104,6 +104,8 @@ DynamoDB native JSON uses the official AWS `AttributeValue` format: `B` and `BS`
 
 Elasticsearch REST scripts validate supported endpoints and body shapes before sending the first request. DELETE requests and non-search GET requests reject JSON bodies instead of silently discarding them: `DELETE /index` deletes the entire index, not documents matching a body filter. Scripts are not transactions; server-side errors can still follow successful mutations.
 
+Elasticsearch REST paths must start with `/` and address the current connection. Absolute URLs, fragments, backslashes, invalid Unicode, and literal or percent-encoded `.` / `..` path segments are rejected before any request in the script. Encode document ID delimiters such as `/`, `#`, and `?` as `%2F`, `%23`, and `%3F`; URL normalization must never turn a document operation into an index operation.
+
 <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-2.png" alt="SQL Editor with results" width="100%" />
 
 <br/>
@@ -122,6 +124,8 @@ Results land in a **virtualized table** - no jank, no browser tab hanging:
 MongoDB `find` and `aggregate` results also have a safety budget. The default sample is 100 documents; requesting more cannot bypass the 10,000-document ceiling, including with `find().limit(0)`. Negative and fractional chain limits are rejected; `aggregate().limit()` requires a positive integer. A probe document detects actual truncation without becoming part of the displayed schema. Exporting a truncated query result requires confirmation and exports only the displayed rows.
 
 MongoDB `NumberInt(...)` and `NumberLong(...)` literals require one integer argument within the signed BSON int32/int64 range. Fractional, malformed, overflowing, and unsafe JavaScript number arguments are rejected before any operation in the script is sent. For exact large integers, use strings such as `NumberLong("9223372036854775807")` or bigint arguments rather than unquoted JavaScript numbers.
+
+Bare JavaScript bigint values must also fit signed BSON int64, including nested fields and computed values. Overflow is rejected before the script starts instead of silently wrapping to a different stored value or row ID. Use `NumberDecimal("...")` or strings for larger exact values.
 
 MongoDB `NumberDecimal(...)` requires exactly one string argument, such as `NumberDecimal("0.123456789012345678901")`. Numeric arguments are rejected before any operation in the script is sent because JavaScript can round them before Decimal128 conversion.
 

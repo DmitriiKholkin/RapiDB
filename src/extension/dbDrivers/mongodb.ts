@@ -188,13 +188,17 @@ const MONGOSH_UNSAFE_PATTERN_RULES: Array<{
 ];
 
 function normalizeMongoshQueryText(queryText: string): string {
-  return queryText
-    .split("\n")
-    .filter((line) => !line.trim().startsWith("//"))
-    .join("\n")
-    .trim()
-    .replace(/;+\s*$/, "")
-    .trim();
+  // The VM already understands comments. Removing comment-looking lines here
+  // also removes stored text inside template literals, changing write filters.
+  const trimmed = queryText.trim();
+  if (
+    trimmed
+      .split(/[\r\n\u2028\u2029]/)
+      .every((line) => !line.trim() || line.trim().startsWith("//"))
+  ) {
+    return "";
+  }
+  return trimmed.replace(/;+\s*$/, "").trim();
 }
 
 function ensureMongoshQueryIsSafe(queryText: string): void {
@@ -470,7 +474,17 @@ function reviveMongoshValue(value: unknown): unknown {
     );
   }
   if (record.kind === "undefined") return undefined;
-  if (record.kind === "bigint") return BigInt(record.value as string);
+  if (record.kind === "bigint") {
+    const integer = BigInt(record.value as string);
+    // BSON writes bare JS bigint as signed int64, silently wrapping overflow
+    // modulo 2^64. Validate even nested values before any script operation runs.
+    if (integer < -9223372036854775808n || integer > 9223372036854775807n) {
+      throw new Error(
+        'MongoDB bigint is outside the signed BSON int64 range. Use NumberDecimal("...") or a string for larger exact values.',
+      );
+    }
+    return integer;
+  }
   if (record.kind === "marker") {
     const args = (record.args ?? []).map(reviveMongoshValue);
     switch (record.value) {

@@ -15,6 +15,7 @@ const child = spawn(
     "tests/node/nosqlLive.test.ts",
     "tests/node/mutationDataSafetyLive.test.ts",
     "tests/node/dynamodbNativeSafety.test.ts",
+    "tests/node/queryTargetSafetyLive.test.ts",
   ],
   {
     stdio: "inherit",
